@@ -61,6 +61,13 @@ class ObservabilityConfig:
 - 通过`IntermediateTensors`在pipeline stages间传递时间信息
 - 见`vllm/worker/model_runner.py:1664-1686`
 
+> 【复核与修订｜ObservabilityConfig】
+> - 复核：在当前代码中（`vllm/config/__init__.py`），`ObservabilityConfig` 的可配置字段主要是 `show_hidden_metrics_for_version`、`otlp_traces_endpoint`、`collect_detailed_traces` 等；`collect_model_forward_time` 与 `collect_model_execute_time` 实际为基于 `collect_detailed_traces` 推导的 `@cached_property`，并非直接的布尔配置项。
+> - 修订建议：
+>   - 文档中不要把 `collect_model_forward_time`/`collect_model_execute_time` 当作直接配置的布尔字段展示；应注明它们由 `collect_detailed_traces`（含 "model"/"worker"/"all"）间接启用。
+>   - 如需增加新的监控相关字段，需：提供默认值与 docstring；在 `engine/arg_utils.py` 通过 `get_kwargs(ObservabilityConfig)` 将其暴露为 CLI；保证通过 `tools/validate_config.py` 的校验。
+>   - 继续沿用现有“时间信息通过 `IntermediateTensors` 传递”的实现路径，以减少侵入。
+
 #### 1.3 IntermediateTensors (`vllm/sequence.py:1094`)
 ```python
 class IntermediateTensors:
@@ -71,6 +78,10 @@ class IntermediateTensors:
     # 可扩展用于传递激活值
 ```
 **优势**：已有跨节点传输机制，可直接扩展
+
+> 【复核与修订｜IntermediateTensors 扩展方式】
+> - 复核：`IntermediateTensors` 为配合 Dynamo/编译路径专门实现，手写 `__init__` 并非普通 dataclass 自动生成。直接向该类新增字段（如 `monitoring_data`）有潜在兼容与性能风险。
+> - 修订建议：不修改类结构与签名，保留原样。需要传递监控相关的小型张量或标量时，复用其 `tensors` 字典命名空间（例如以 `"monitor/..."` 前缀区分）。大体量数据建议走独立通道（异步拷贝至 CPU 并落盘），避免扩大 `IntermediateTensors` 载荷。
 
 #### 1.4 RequestMetrics (`vllm/sequence.py:82`)
 ```python
@@ -375,6 +386,15 @@ class AutoBufferCalculator:
         return base_calc
 ```
 
+> 【复核与修订｜自动 Buffer 计算】
+> - 复核：文中直接读取 `model_config.hidden_size/num_attention_heads/intermediate_size` 在 vLLM 代码中并不通用；应通过 `ModelConfig` 提供的接口/底层 HF config 获取，并考虑并行分片：
+>   - `hidden_dim = model_config.get_hidden_size()`
+>   - `num_heads = model_config.get_num_attention_heads(parallel_config)`
+>   - `head_dim = model_config.get_head_size()`
+>   - `intermediate_dim = getattr(model_config.hf_text_config, "intermediate_size", hidden_dim * 4)`
+>   - `seq_len = model_config.max_model_len`
+> - 注意：`attention_scores/weights` 的内存复杂度为 `O(B * H * L^2)`，在大上下文/高并发下不可行。应默认关闭，或仅在 Debug/小 L、低频采样时启用，并在配置中明确声明性能与显存成本。
+
 ### 2. 动态Buffer管理器
 
 ```python
@@ -490,6 +510,13 @@ class DynamicGPUBuffer:
         
         self.stats.resize_count += 1
 ```
+
+> 【复核与修订｜GPU/CPU 缓冲与传输实现】
+> - 复核：示例使用的 `torch.cuda.allocate_shared_memory` 与 `torch.cuda.caching_allocator_alloc` 并非 PyTorch 公共 Python API；`buffer.view(torch.uint8)` 也不适用于任意张量的字节级复用。本段为伪代码，落地风险高。
+> - 修订建议：
+>   - 初期不实现 GPU 侧环形缓冲，避免额外 VRAM 占用与 OOM 风险；直接在采样点将张量异步拷贝到 pinned CPU 内存（`tensor.to("cpu", non_blocking=True)`，配合自建 CUDA stream 与 `pin_memory=True` 的缓冲）。
+>   - 在 CPU 侧做批量聚合与落盘，降低 I/O 次数；对大张量引入 `max_tensor_bytes` 限制与降采样/截断策略。
+>   - 若确需 GPU 侧聚合，应使用标准 `torch.empty(size, dtype=torch.uint8, device='cuda')` 等可用 API，并显式维护写指针、对齐与越界检查；但不建议作为 P0 功能。
 
 ### 3. 智能配置建议器
 
@@ -844,6 +871,12 @@ class ActivationCollector:
         )
 ```
 
+> 【复核与修订｜Forward Hook 风险与范围控制】
+> - 复核：在大量模块上注册 `forward_hook` 容易降低 `torch.compile`/CUDA Graph 捕获命中率，并引入显著 Python 开销；在使用高性能注意力后端时，全面抓取中间张量也会打断最优内核路径。
+> - 修订建议：
+>   - 优先在模型执行器的关键路径（如 `DecoderLayer` 输出、最后 PP rank 的最终 `hidden_states`）按频率采样，不对所有模块通用挂钩。
+>   - 仅在 Debug/诊断模式下开启更细粒度采样；并对张量大小、层集合与频率进行严格限制。
+
 ### 4. AsyncTransferManager类
 
 ```python
@@ -959,6 +992,12 @@ class AsyncTransferManager:
         # 持久化到磁盘
         self._persist_to_disk(buffer)
 ```
+
+> 【复核与修订｜异步传输实现】
+> - 复核：示例中的 `CPUBuffer`/`TransferTask` 为自定义类型，当前仓库不存在；需要自实现。GPU→CPU 传输应使用 pinned CPU 内存并结合独立 CUDA streams 执行 `non_blocking` 拷贝。
+> - 修订建议：
+>   - 预分配一到两个固定大小的 pinned CPU 缓冲，采用生产者（GPU 异步拷贝）/消费者（后台线程落盘）模型；必要时按批次聚合以减少 I/O。
+>   - 为了不阻塞推理主路径，确保队列满时触发降级（丢弃低优先级样本/减小频率），并记录背压指标。
 
 ### 5. 数据持久化层
 
@@ -1132,6 +1171,10 @@ class ModelRunner:
         return output
 ```
 
+> 【复核与修订｜与 ModelRunner 集成】
+> - 复核：`model_runner.py` 已在 decode 图路径用 `torch.cuda.Event` 记录前向时间并通过 `IntermediateTensors` 传递。加入 `monitor_forward_pass()` 之类的上下文管理器需谨慎，避免影响 CUDA Graph 捕获与并行执行。
+> - 修订建议：P0 阶段仅在“最后 PP rank、模型前向完成后”按采样策略收集末层 `hidden_states` 并异步传输；保持对现有执行路径最小侵入。注意在 `bypass_model_exec` 场景与 KV 传输路径下的兼容。
+
 ### 3. 扩展ObservabilityConfig (`vllm/config/__init__.py`)
 
 ```python
@@ -1152,6 +1195,14 @@ class ObservabilityConfig:
                 self.collect_attention_weights or 
                 self.collect_kv_cache)
 ```
+
+> 【复核与修订｜与现有配置体系的集成】
+> - 复核：当前 `ObservabilityConfig` 通过 `collect_detailed_traces` 控制时间类细粒度追踪；新增字段需与其并存且默认关闭。
+> - 修订建议：新增字段（如 `collect_activations`, `collect_attention_weights`, `collect_kv_cache`, `sampling_frequency`, `sampling_layers`, `max_tensor_bytes`）应：
+>   - 具备默认值与清晰 docstring；
+>   - 在 `engine/arg_utils.py` 用 `get_kwargs(ObservabilityConfig)` 暴露 CLI；
+>   - 通过 `tools/validate_config.py` 校验；
+>   - 在实现上默认仅收集“末层 hidden_states”的轻量级路径，Attention 权重仅在 Debug 标志下启用并注明性能影响。
 
 ### 4. 扩展IntermediateTensors用于监控数据传递
 
@@ -1174,6 +1225,10 @@ class IntermediateTensors:
         """获取所有监控数据"""
         return self.monitoring_data
 ```
+
+> 【复核与修订｜不要修改 IntermediateTensors 结构】
+> - 复核：该类为特殊实现且与 Dynamo/编译相关。直接新增属性（如 `monitoring_data`）存在兼容与性能风险。
+> - 修订建议：维持类定义不变，将监控元数据通过 `tensors` 的命名空间进行传递（例如 `tensors["monitor/model_forward_time"]`），或完全绕开 `IntermediateTensors`，在工作线程侧独立上报与落盘。
 
 ## 实现细节
 
@@ -1257,6 +1312,12 @@ class MemoryOptimizedBuffer:
         return True
 ```
 
+> 【复核与修订｜内存 API 与按字节写入】
+> - 复核：`torch.cuda.caching_allocator_alloc` 不是公开 Python API；对任意张量直接以字节方式写入 GPU 连续缓冲也不可移植且易错。
+> - 修订建议：
+>   - 优先采用“GPU→pinned CPU”的标准异步拷贝管线，避免自研 GPU 侧内存管理。
+>   - 若确需在 GPU 侧做合并，应使用受支持的张量 API（`torch.empty(..., dtype=torch.uint8, device='cuda')`），并对齐/越界检查/生命周期管理全部自管；建议延后到后续阶段。
+
 ### 3. 批处理优化
 
 ```python
@@ -1307,6 +1368,10 @@ class BatchedTransfer:
         self.pending_transfers.clear()
 ```
 
+> 【复核与修订｜dtype 视图与拷贝】
+> - 复核：范例里如使用 `tensor.view(-1, dtype=torch.uint8)` 属于无效用法；跨 dtype 的“字节级视图”需要谨慎，很多张量并不支持无拷贝重解释。
+> - 修订建议：一般不建议在 GPU 侧做这种按字节拼接；若确需，请先在 CPU 侧完成非阻塞拷贝，再用 Python 层进行序列化/分片写入（如 `.pt/.npz`），并保留 dtype/shape 元数据，避免信息丢失与未对齐问题。
+
 ## 配置系统
 
 ### 1. 配置文件格式
@@ -1355,6 +1420,10 @@ monitoring:
     validate_data: false
     verbose_logging: false
 ```
+
+> 【复核与修订｜配置承载与加载路径】
+> - 复核：当前 vLLM 主要通过 `ObservabilityConfig`（`VllmConfig` 的一部分）和 CLI 参数传参；没有默认的 `monitoring_config.yaml` 加载流程。
+> - 修订建议：P0 阶段通过 CLI 开关完成；如需 YAML，需在引擎初始化路径增加解析逻辑与文档，避免与现有配置体系割裂。
 
 ### 2. 环境变量支持
 
@@ -1497,8 +1566,8 @@ class MonitoringBenchmark:
 ### 2. 自动化测试脚本
 
 ```bash
-#!/bin/bash
-# run_monitoring_benchmark.sh
+    #!/bin/bash
+    # run_monitoring_benchmark.sh
 
 # 测试不同模型
 models=("gpt2" "llama-7b" "llama-13b")
@@ -1508,6 +1577,7 @@ for model in "${models[@]}"; do
     echo "Testing model: $model"
     
     # 基线测试
+    # 说明：当前仓库不存在 benchmark_monitoring 模块，需新增脚本
     python -m vllm.benchmarks.benchmark_monitoring \
         --model $model \
         --no-monitoring \
@@ -1577,6 +1647,12 @@ python -m vllm.benchmarks.summary_report \
 - [ ] 添加在线分析功能
 - [ ] 实现分布式监控
 - [ ] 开发可视化工具
+
+> 【推荐最小实现方案（P0）】
+> - 采集范围：仅在“最后 PP rank”按采样频率抓取末层 `hidden_states`，默认关闭；Attention 权重/分数默认不启用，仅在 Debug 小规模场景下开放。
+> - 传输与存储：使用独立 CUDA stream 异步拷贝至 pinned CPU 缓冲，后台线程批量落盘为分片 `.pt/.npz` 文件，携带 shape/dtype/时间戳/层名元数据。
+> - 配置入口：在 `ObservabilityConfig` 增加 `collect_activations`（none|sample|all）、`sampling_frequency`、`sampling_layers`、`max_tensor_bytes` 等；通过 `arg_utils.py` 暴露 CLI，并通过 `tools/validate_config.py` 校验。
+> - 性能边界：在基准中验证吞吐损失 < 5%；当队列积压时自动降级（降低采样频率/丢弃低优先级样本），并导出背压指标。
 
 ## 附录：未来优化方向
 
