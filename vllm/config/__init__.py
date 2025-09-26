@@ -3210,6 +3210,75 @@ class ObservabilityConfig:
             self.collect_detailed_traces[0].split(","))
 
 
+@config
+@dataclass
+class MonitoringConfig:
+    """Configuration for runtime monitoring (MVP real-time sampling).
+
+    Controls layer boundary activation sampling, attention Top‑K extraction,
+    and GPU→CPU data path behavior. Disabled by default and designed to be
+    minimally invasive.
+    """
+
+    enabled: bool = False
+    """Enable monitoring (MVP). Default: disabled."""
+
+    layers: str = "all"
+    """Layer selection: "all", a comma list (e.g. "0,4,8"), or an every-step
+    pattern (e.g. "every:2")."""
+
+    sample_rate: int = 1
+    """Sample every N tokens (decode steps)."""
+
+    topk_k: int = 4
+    """Top‑K size per head for attention introspection."""
+
+    gpu_staging_bytes: int = 3 * 64 * 1024**2
+    """Total bytes for GPU-side staging buffers (e.g. 3×64MB)."""
+
+    staging_trigger_bytes: int = 16 * 1024**2
+    """Trigger size threshold (bytes) to flush a staging batch (typ. 8–32MB)."""
+
+    staging_trigger_ms: int = 3
+    """Trigger time threshold (ms) to flush a staging batch (typ. 2–5ms)."""
+
+    cpu_ring_bytes: int = 2 * 1024**3
+    """Total bytes for CPU pinned ring buffer (e.g. 2GB)."""
+
+    copy_streams: int = 2
+    """Number of CUDA copy streams for D2H transfers (2–4 recommended)."""
+
+    max_d2h_bw_gbps: float = 20.0
+    """Approximate D2H bandwidth cap (GB/s) for rate limiting/telemetry."""
+
+    backpressure_high_watermark: float = 0.7
+    """High watermark (0–1) on ring occupancy to trigger degradation."""
+
+    transport: str = "grpc"
+    """Real-time transport for subscribers: grpc|ws|ipc."""
+
+    def compute_hash(self) -> str:
+        """Monitoring config does not affect compute graph; include a stable
+        hash for reproducibility of runtime settings."""
+        factors: list[Any] = [
+            self.enabled,
+            self.layers,
+            self.sample_rate,
+            self.topk_k,
+            self.gpu_staging_bytes,
+            self.staging_trigger_bytes,
+            self.staging_trigger_ms,
+            self.cpu_ring_bytes,
+            self.copy_streams,
+            self.max_d2h_bw_gbps,
+            self.backpressure_high_watermark,
+            self.transport,
+        ]
+        hash_str = hashlib.md5(str(factors).encode(),
+                               usedforsecurity=False).hexdigest()
+        return hash_str
+
+
 KVProducer = Literal["kv_producer", "kv_both"]
 KVConsumer = Literal["kv_consumer", "kv_both"]
 KVRole = Literal[KVProducer, KVConsumer]
@@ -3340,6 +3409,8 @@ class VllmConfig:
     """Decoding configuration."""
     observability_config: Optional[ObservabilityConfig] = None
     """Observability configuration."""
+    monitoring_config: Optional[MonitoringConfig] = None
+    """Runtime monitoring configuration (MVP real-time sampling)."""
     quant_config: Optional[QuantizationConfig] = None
     """Quantization configuration."""
     compilation_config: CompilationConfig = field(
@@ -3434,6 +3505,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.observability_config:
             vllm_factors.append(self.observability_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.monitoring_config:
+            vllm_factors.append(self.monitoring_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.quant_config:

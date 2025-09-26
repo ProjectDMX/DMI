@@ -1,0 +1,77 @@
+Using device: cuda
+Loading dataset...
+Prepared 343 text samples
+Loading tokenizer and model...
+Tokenizing inputs...
+Built 43 batches (batch size up to 8)
+Fixed sequence length: 128 tokens | total sequences: 343 | tokens per pass: 43904
+Traceback (most recent call last):
+  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 771, in <module>
+    main()
+  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 567, in main
+    benchmark("pytorch_hook_dense", run_hook_dense)
+  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 275, in benchmark
+    stats = time_execution(fn, args.repeats, device)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 170, in time_execution
+    fn()
+  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 563, in run_hook_dense
+    run_hook_variant("pytorch_hook_dense", dense=True)
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 493, in run_hook_variant
+    outputs = model(
+              ^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/models/gpt2/modeling_gpt2.py", line 1062, in forward
+    transformer_outputs = self.transformer(
+                          ^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/models/gpt2/modeling_gpt2.py", line 922, in forward
+    outputs = block(
+              ^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1879, in _call_impl
+    return inner()
+           ^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1827, in inner
+    result = forward_call(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/models/gpt2/modeling_gpt2.py", line 441, in forward
+    feed_forward_hidden_states = self.mlp(hidden_states)
+                                 ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1879, in _call_impl
+    return inner()
+           ^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1827, in inner
+    result = forward_call(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/models/gpt2/modeling_gpt2.py", line 369, in forward
+    hidden_states = self.act(hidden_states)
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/activations.py", line 56, in forward
+    return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+           ~~~~^~~~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 12.00 MiB. GPU 0 has a total capacity of 23.65 GiB of which 5.62 MiB is free. Including non-PyTorch memory, this process has 23.63 GiB memory in use. Of the allocated memory 23.10 GiB is allocated by PyTorch, and 82.42 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

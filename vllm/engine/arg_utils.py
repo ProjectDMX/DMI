@@ -29,10 +29,11 @@ from vllm.config import (BlockSize, CacheConfig, CacheDType, CompilationConfig,
                          KVTransferConfig, LoadConfig, LogprobsMode,
                          LoRAConfig, MambaDType, MMEncoderTPMode, ModelConfig,
                          ModelDType, ModelImpl, MultiModalConfig,
-                         ObservabilityConfig, ParallelConfig, PoolerConfig,
-                         PrefixCachingHashAlgo, RunnerOption, SchedulerConfig,
-                         SchedulerPolicy, SpeculativeConfig, TaskOption,
-                         TokenizerMode, VllmConfig, get_attr_docs, get_field)
+                         ObservabilityConfig, MonitoringConfig, ParallelConfig,
+                         PoolerConfig, PrefixCachingHashAlgo, RunnerOption,
+                         SchedulerConfig, SchedulerPolicy, SpeculativeConfig,
+                         TaskOption, TokenizerMode, VllmConfig, get_attr_docs,
+                         get_field)
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
@@ -459,6 +460,21 @@ class EngineArgs:
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
+    # Monitoring (MVP) CLI fields
+    monitoring: bool = MonitoringConfig.enabled
+    mon_layers: str = MonitoringConfig.layers
+    mon_sample_rate: int = MonitoringConfig.sample_rate
+    mon_topk_k: int = MonitoringConfig.topk_k
+    mon_gpu_staging_bytes: int = MonitoringConfig.gpu_staging_bytes
+    mon_staging_trigger_bytes: int = MonitoringConfig.staging_trigger_bytes
+    mon_staging_trigger_ms: int = MonitoringConfig.staging_trigger_ms
+    mon_cpu_ring_bytes: int = MonitoringConfig.cpu_ring_bytes
+    mon_copy_streams: int = MonitoringConfig.copy_streams
+    mon_max_d2h_bw: float = MonitoringConfig.max_d2h_bw_gbps
+    mon_backpressure_high_watermark: float = \
+        MonitoringConfig.backpressure_high_watermark
+    mon_transport: str = MonitoringConfig.transport
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -830,6 +846,22 @@ class EngineArgs:
         observability_group.add_argument(
             "--collect-detailed-traces",
             **observability_kwargs["collect_detailed_traces"])
+
+        # Monitoring arguments (MVP). Use mon-* prefixed CLI flags.
+        monitoring_kwargs = get_kwargs(MonitoringConfig)
+        monitoring_group = parser.add_argument_group(
+            title="MonitoringConfig",
+            description=MonitoringConfig.__doc__,
+        )
+        # Special casing the boolean enable flag as --monitoring
+        monitoring_group.add_argument("--monitoring",
+                                      **monitoring_kwargs["enabled"])
+        # Other fields are added with --mon-<name>
+        for key, value in monitoring_kwargs.items():
+            if key == "enabled":
+                continue
+            monitoring_group.add_argument(f"--mon-{key.replace('_', '-')}",
+                                          **value)
 
         # Scheduler arguments
         scheduler_kwargs = get_kwargs(SchedulerConfig)
@@ -1395,6 +1427,21 @@ class EngineArgs:
             collect_detailed_traces=self.collect_detailed_traces,
         )
 
+        monitoring_config = MonitoringConfig(
+            enabled=self.monitoring,
+            layers=self.mon_layers,
+            sample_rate=self.mon_sample_rate,
+            topk_k=self.mon_topk_k,
+            gpu_staging_bytes=self.mon_gpu_staging_bytes,
+            staging_trigger_bytes=self.mon_staging_trigger_bytes,
+            staging_trigger_ms=self.mon_staging_trigger_ms,
+            cpu_ring_bytes=self.mon_cpu_ring_bytes,
+            copy_streams=self.mon_copy_streams,
+            max_d2h_bw_gbps=self.mon_max_d2h_bw,
+            backpressure_high_watermark=self.mon_backpressure_high_watermark,
+            transport=self.mon_transport,
+        ) if self.monitoring else None
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1406,6 +1453,7 @@ class EngineArgs:
             load_config=load_config,
             decoding_config=decoding_config,
             observability_config=observability_config,
+            monitoring_config=monitoring_config,
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,

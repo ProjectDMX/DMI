@@ -1,0 +1,30 @@
+Using device: cuda
+Loading dataset...
+Prepared 343 text samples
+Loading tokenizer and model...
+Tokenizing inputs...
+Built 43 batches (batch size up to 8)
+Fixed sequence length: 128 tokens | total sequences: 343 | tokens per pass: 43904
+Validating hook-captured hidden states against HF outputs...
+  hidden batch 0 layer 0 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 1 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 2 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 3 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 4 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 5 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 6 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 7 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 8 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 9 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 10 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 11 shape (8, 128, 768) dtype torch.float32 device cpu
+  hidden batch 0 layer 12 shape (8, 128, 768) dtype torch.float32 device cpu
+Hook-captured hidden states are consistent with HF outputs (shapes and values match).
+
+
+Timing results (seconds and tokens/sec):
+-           baseline: mean=0.3904s stdev=0.0005s token/s=112449.72]
+-       pytorch_hook: mean=0.3829s stdev=0.0010s token/s=114652.02]
+-   pytorch_hook_cpu: mean=0.5179s stdev=0.0633s token/s=84765.85]
+- pytorch_hook_dense: mean=0.3908s stdev=0.0162s token/s=112332.17]
+-       hf_reference: mean=0.3868s stdev=0.0013s token/s=113519.66]
