@@ -3,24 +3,105 @@ Loading dataset...
 Prepared 343 text samples
 Loading tokenizer and model...
 Tokenizing inputs...
-Built 43 batches (batch size up to 8)
+Built 11 batches (batch size up to 32)
 Fixed sequence length: 128 tokens | total sequences: 343 | tokens per pass: 43904
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                               baseline         0.00%       0.000us         0.00%       0.000us       0.000us     372.741ms       101.10%     372.741ms     372.741ms           0 B           0 B           0 B           0 B             1  
+                                            aten::addmm         2.67%      10.002ms         7.32%      27.396ms      51.886us     157.506ms        42.72%     157.506ms     298.307us           0 B           0 B      13.57 GB      13.57 GB           528  
+void cutlass::Kernel2<cutlass_80_simt_sgemm_256x128_...         0.00%       0.000us         0.00%       0.000us       0.000us     109.498ms        29.70%     109.498ms     294.350us           0 B           0 B           0 B           0 B           372  
+                                               aten::mm         0.06%     220.868us         0.16%     598.835us      54.440us      69.817ms        18.94%      69.817ms       6.347ms           0 B           0 B       8.23 GB       8.23 GB            11  
+                                ampere_sgemm_128x128_tn         0.00%       0.000us         0.00%       0.000us       0.000us      69.817ms        18.94%      69.817ms       6.347ms           0 B           0 B           0 B           0 B            11  
+                                ampere_sgemm_128x128_nn         0.00%       0.000us         0.00%       0.000us       0.000us      51.218ms        13.89%      51.218ms     129.338us           0 B           0 B           0 B           0 B           396  
+                                              aten::mul         0.90%       3.362ms         4.36%      16.326ms      30.289us      48.037ms        13.03%      48.037ms      89.122us           0 B           0 B      24.12 GB      24.12 GB           539  
+                                              aten::add         1.26%       4.734ms         6.60%      24.721ms      36.248us      37.104ms        10.06%      37.104ms      54.405us           0 B           0 B      18.21 GB      18.21 GB           682  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      28.683ms         7.78%      28.683ms      70.475us           0 B           0 B           0 B           0 B           407  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      25.044ms         6.79%      25.044ms      61.532us           0 B           0 B           0 B           0 B           407  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      19.353ms         5.25%      19.353ms     146.616us           0 B           0 B           0 B           0 B           132  
+                                              aten::pow         0.31%       1.145ms         0.69%       2.592ms      19.636us      13.650ms         3.70%      13.650ms     103.406us           0 B           0 B       6.03 GB       6.03 GB           132  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      13.650ms         3.70%      13.650ms     103.406us           0 B           0 B           0 B           0 B           132  
+                                            aten::copy_         0.79%       2.939ms         4.25%      15.911ms      29.520us      12.149ms         3.30%      12.149ms      22.539us           0 B           0 B           0 B           0 B           539  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      12.112ms         3.29%      12.112ms      22.940us           0 B           0 B           0 B           0 B           528  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       8.858ms         2.40%       8.858ms      67.104us           0 B           0 B           0 B           0 B           132  
+                                             aten::tanh         0.17%     623.862us         5.63%      21.081ms     159.701us       8.714ms         2.36%       8.714ms      66.017us           0 B           0 B       6.03 GB       6.03 GB           132  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       8.714ms         2.36%       8.714ms      66.017us           0 B           0 B           0 B           0 B           132  
+                                              aten::bmm         1.01%       3.771ms         9.06%      33.900ms     128.408us       8.049ms         2.18%       8.049ms      30.490us           0 B           0 B       4.52 GB       4.52 GB           264  
+                                              aten::div         0.25%     940.949us         0.44%       1.664ms      12.605us       4.856ms         1.32%       4.856ms      36.792us           0 B           0 B       3.01 GB       3.01 GB           132  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 374.305ms
+Self CUDA time total: 368.695ms
+
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                           pytorch_hook         0.00%       0.000us         0.00%       0.000us       0.000us     373.247ms       101.09%     373.247ms     373.247ms           0 B           0 B           0 B           0 B             1  
+                                            aten::addmm         2.63%       9.853ms         5.33%      19.971ms      37.824us     157.645ms        42.70%     157.645ms     298.569us           0 B           0 B      13.57 GB      13.57 GB           528  
+void cutlass::Kernel2<cutlass_80_simt_sgemm_256x128_...         0.00%       0.000us         0.00%       0.000us       0.000us     109.745ms        29.72%     109.745ms     295.014us           0 B           0 B           0 B           0 B           372  
+                                               aten::mm         0.07%     249.842us         0.87%       3.259ms     296.276us      69.892ms        18.93%      69.892ms       6.354ms           0 B           0 B       8.23 GB       8.23 GB            11  
+                                ampere_sgemm_128x128_tn         0.00%       0.000us         0.00%       0.000us       0.000us      69.892ms        18.93%      69.892ms       6.354ms           0 B           0 B           0 B           0 B            11  
+                                ampere_sgemm_128x128_nn         0.00%       0.000us         0.00%       0.000us       0.000us      51.082ms        13.84%      51.082ms     128.995us           0 B           0 B           0 B           0 B           396  
+                                              aten::mul         0.90%       3.371ms         4.94%      18.518ms      34.357us      48.323ms        13.09%      48.323ms      89.653us           0 B           0 B      24.12 GB      24.12 GB           539  
+                                              aten::add         1.21%       4.554ms         4.20%      15.749ms      23.471us      37.303ms        10.10%      37.303ms      55.593us           0 B           0 B      18.21 GB      18.21 GB           671  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      28.727ms         7.78%      28.727ms      70.582us           0 B           0 B           0 B           0 B           407  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      25.121ms         6.80%      25.121ms      63.437us           0 B           0 B           0 B           0 B           396  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      19.596ms         5.31%      19.596ms     148.456us           0 B           0 B           0 B           0 B           132  
+                                              aten::pow         0.29%       1.074ms         0.98%       3.685ms      27.914us      13.939ms         3.78%      13.939ms     105.597us           0 B           0 B       6.03 GB       6.03 GB           132  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      13.939ms         3.78%      13.939ms     105.597us           0 B           0 B           0 B           0 B           132  
+                                            aten::copy_         0.77%       2.885ms         9.13%      34.237ms      63.519us      12.050ms         3.26%      12.050ms      22.357us           0 B           0 B           0 B           0 B           539  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      12.014ms         3.25%      12.014ms      22.754us           0 B           0 B           0 B           0 B           528  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       8.961ms         2.43%       8.961ms      67.884us           0 B           0 B           0 B           0 B           132  
+                                             aten::tanh         0.16%     610.172us         2.25%       8.442ms      63.953us       8.959ms         2.43%       8.959ms      67.873us           0 B           0 B       6.03 GB       6.03 GB           132  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       8.959ms         2.43%       8.959ms      67.873us           0 B           0 B           0 B           0 B           132  
+                                              aten::bmm         0.97%       3.652ms         7.61%      28.519ms     108.028us       8.040ms         2.18%       8.040ms      30.453us           0 B           0 B       4.52 GB       4.52 GB           264  
+                                 ampere_sgemm_128x64_nn         0.00%       0.000us         0.00%       0.000us       0.000us       4.835ms         1.31%       4.835ms     201.470us           0 B           0 B           0 B           0 B            24  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 374.919ms
+Self CUDA time total: 369.207ms
+[W929 16:53:11.797142854 CPUAllocator.cpp:245] Memory block of unknown size was allocated before the profiling started, profiler results will not include the deallocation event
+
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                       pytorch_hook_cpu         0.00%       0.000us         0.00%       0.000us       0.000us        2.516s       111.48%        2.516s        2.516s           0 B           0 B           0 B           0 B             1  
+                                            aten::copy_         0.15%       4.505ms        81.38%        2.387s       2.932ms        1.882s        83.42%        1.882s       2.313ms           0 B           0 B           0 B           0 B           814  
+                       Memcpy DtoH (Device -> Pageable)         0.00%       0.000us         0.00%       0.000us       0.000us        1.870s        82.88%        1.870s       6.801ms           0 B           0 B           0 B           0 B           275  
+                                            aten::addmm         0.34%      10.098ms         0.56%      16.473ms      31.199us     158.719ms         7.03%     158.719ms     300.605us           0 B           0 B      13.57 GB      13.57 GB           528  
+void cutlass::Kernel2<cutlass_80_simt_sgemm_256x128_...         0.00%       0.000us         0.00%       0.000us       0.000us     107.128ms         4.75%     107.128ms     287.977us           0 B           0 B           0 B           0 B           372  
+                                               aten::mm         0.01%     234.220us         0.02%     616.420us      56.038us      86.211ms         3.82%      86.211ms       7.837ms           0 B           0 B       8.23 GB       8.23 GB            11  
+                                ampere_sgemm_128x128_tn         0.00%       0.000us         0.00%       0.000us       0.000us      86.211ms         3.82%      86.211ms       7.837ms           0 B           0 B           0 B           0 B            11  
+                                ampere_sgemm_128x128_nn         0.00%       0.000us         0.00%       0.000us       0.000us      55.027ms         2.44%      55.027ms     138.957us           0 B           0 B           0 B           0 B           396  
+                                              aten::mul         0.11%       3.290ms         0.37%      10.767ms      19.975us      48.229ms         2.14%      48.229ms      89.479us           0 B           0 B      24.12 GB      24.12 GB           539  
+                                              aten::add         0.16%       4.685ms         0.29%       8.624ms      12.852us      36.696ms         1.63%      36.696ms      54.689us           0 B           0 B      18.21 GB      18.21 GB           671  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      28.722ms         1.27%      28.722ms      70.571us           0 B           0 B           0 B           0 B           407  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      24.612ms         1.09%      24.612ms      62.151us           0 B           0 B           0 B           0 B           396  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      19.507ms         0.86%      19.507ms     147.779us           0 B           0 B           0 B           0 B           132  
+                                              aten::pow         0.04%       1.073ms         0.09%       2.657ms      20.127us      13.848ms         0.61%      13.848ms     104.906us           0 B           0 B       6.03 GB       6.03 GB           132  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      13.848ms         0.61%      13.848ms     104.906us           0 B           0 B           0 B           0 B           132  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      12.084ms         0.54%      12.084ms      22.886us           0 B           0 B           0 B           0 B           528  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       8.924ms         0.40%       8.924ms      67.607us           0 B           0 B           0 B           0 B           132  
+                                             aten::tanh         0.02%     615.728us         0.04%       1.043ms       7.905us       8.872ms         0.39%       8.872ms      67.215us           0 B           0 B       6.03 GB       6.03 GB           132  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       8.872ms         0.39%       8.872ms      67.215us           0 B           0 B           0 B           0 B           132  
+                                              aten::bmm         0.12%       3.607ms         0.19%       5.646ms      21.386us       8.221ms         0.36%       8.221ms      31.139us           0 B           0 B       4.52 GB       4.52 GB           264  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 2.933s
+Self CUDA time total: 2.257s
+
 Traceback (most recent call last):
-  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 771, in <module>
+  File "/home/nengneng/AIPrometheus/vllm/Benchmark/gpt2_hidden_state_benchmark.py", line 772, in <module>
     main()
-  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 567, in main
+  File "/home/nengneng/AIPrometheus/vllm/Benchmark/gpt2_hidden_state_benchmark.py", line 567, in main
     benchmark("pytorch_hook_dense", run_hook_dense)
-  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 275, in benchmark
-    stats = time_execution(fn, args.repeats, device)
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 170, in time_execution
+  File "/home/nengneng/AIPrometheus/vllm/Benchmark/gpt2_hidden_state_benchmark.py", line 271, in benchmark
+    profile_once(label, fn, device)
+  File "/home/nengneng/AIPrometheus/vllm/Benchmark/gpt2_hidden_state_benchmark.py", line 197, in profile_once
     fn()
-  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 563, in run_hook_dense
+  File "/home/nengneng/AIPrometheus/vllm/Benchmark/gpt2_hidden_state_benchmark.py", line 563, in run_hook_dense
     run_hook_variant("pytorch_hook_dense", dense=True)
   File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
     return func(*args, **kwargs)
            ^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/AIPrometheus/Benchmark/gpt2_hidden_state_benchmark.py", line 493, in run_hook_variant
+  File "/home/nengneng/AIPrometheus/vllm/Benchmark/gpt2_hidden_state_benchmark.py", line 493, in run_hook_variant
     outputs = model(
               ^^^^^^
   File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
@@ -29,49 +110,16 @@ Traceback (most recent call last):
   File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
     return forward_call(*args, **kwargs)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/models/gpt2/modeling_gpt2.py", line 1062, in forward
-    transformer_outputs = self.transformer(
-                          ^^^^^^^^^^^^^^^^^
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/models/gpt2/modeling_gpt2.py", line 1084, in forward
+    lm_logits = self.lm_head(hidden_states)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
     return self._call_impl(*args, **kwargs)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
     return forward_call(*args, **kwargs)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/models/gpt2/modeling_gpt2.py", line 922, in forward
-    outputs = block(
-              ^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1879, in _call_impl
-    return inner()
-           ^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1827, in inner
-    result = forward_call(*args, **kwargs)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/models/gpt2/modeling_gpt2.py", line 441, in forward
-    feed_forward_hidden_states = self.mlp(hidden_states)
-                                 ^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1879, in _call_impl
-    return inner()
-           ^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1827, in inner
-    result = forward_call(*args, **kwargs)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/models/gpt2/modeling_gpt2.py", line 369, in forward
-    hidden_states = self.act(hidden_states)
-                    ^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/transformers/activations.py", line 56, in forward
-    return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
-           ~~~~^~~~~~~
-torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 12.00 MiB. GPU 0 has a total capacity of 23.65 GiB of which 5.62 MiB is free. Including non-PyTorch memory, this process has 23.63 GiB memory in use. Of the allocated memory 23.10 GiB is allocated by PyTorch, and 82.42 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+  File "/home/nengneng/miniconda3/envs/vllm-p/lib/python3.12/site-packages/torch/nn/modules/linear.py", line 125, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 786.00 MiB. GPU 0 has a total capacity of 23.65 GiB of which 665.62 MiB is free. Including non-PyTorch memory, this process has 22.98 GiB memory in use. Of the allocated memory 22.30 GiB is allocated by PyTorch, and 234.49 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
