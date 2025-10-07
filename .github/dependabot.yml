@@ -1,0 +1,4 @@
+# Disable Dependabot
+# This file exists to prevent Dependabot from creating automatic PRs
+version: 2
+updates: []
