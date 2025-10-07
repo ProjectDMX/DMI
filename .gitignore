@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Results and logs
+results/*/
+!results/.gitkeep
+logs/*.log
+*.pt.trace.json
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Large model files
+*.bin
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+
+# Jupyter
+.ipynb_checkpoints
+
+# Temporary files
+*.tmp
+*.bak
+*~
