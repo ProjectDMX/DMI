@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
-import queue
 import threading
-from typing import Optional, Tuple
+from collections import deque
+from dataclasses import dataclass
+from queue import SimpleQueue
+from typing import Deque, List, Optional, Tuple, Union
 
 import torch
 
@@ -15,6 +17,115 @@ try:  # Optional import to avoid circular dependency at runtime
     from transformer_lens.utils import Slice
 except Exception:  # pragma: no cover - transformer_lens may be absent in some envs
     Slice = None
+
+
+@dataclass
+class _StepWork:
+    """Container holding all monitoring tasks for a single decode step."""
+
+    step_id: int
+    tasks: List[Tuple[MonitoringTask, CacheFuture]]
+
+
+class _StepQueue:
+    """Lightweight single-producer/single-consumer queue backed by a ring buffer."""
+
+    def __init__(self, maxsize: int) -> None:
+        self._maxsize = maxsize if maxsize > 0 else None
+        self._lock = threading.Lock()
+        self._not_empty = threading.Condition(self._lock)
+        self._not_full = threading.Condition(self._lock) if self._maxsize else None
+        self._all_tasks_done = threading.Condition(self._lock)
+        if self._maxsize:
+            self._buffer: Union[List[Optional[_StepWork]], Deque[Optional[_StepWork]]] = [None] * self._maxsize
+            self._head = 0
+            self._tail = 0
+            self._size = 0
+        else:
+            self._buffer = deque()  # type: ignore[assignment]
+        self._unfinished_tasks = 0
+
+    def put(self, item: Union[_StepWork, object]) -> None:
+        with self._lock:
+            if self._maxsize:
+                assert isinstance(self._buffer, list)
+                assert self._not_full is not None
+                while self._size == self._maxsize:
+                    self._not_full.wait()
+                self._buffer[self._tail] = item  # type: ignore[index]
+                self._tail = (self._tail + 1) % self._maxsize
+                self._size += 1
+            else:
+                assert isinstance(self._buffer, deque)
+                self._buffer.append(item)  # type: ignore[arg-type]
+            self._unfinished_tasks += 1
+            self._not_empty.notify()
+
+    def get(self) -> Union[_StepWork, object]:
+        with self._lock:
+            while True:
+                if self._maxsize:
+                    assert isinstance(self._buffer, list)
+                    if self._size:
+                        item = self._buffer[self._head]
+                        self._buffer[self._head] = None
+                        self._head = (self._head + 1) % self._maxsize
+                        self._size -= 1
+                        if self._not_full is not None:
+                            self._not_full.notify()
+                        return item  # type: ignore[return-value]
+                else:
+                    assert isinstance(self._buffer, deque)
+                    if self._buffer:
+                        return self._buffer.popleft()
+                self._not_empty.wait()
+
+    def task_done(self) -> None:
+        with self._lock:
+            if self._unfinished_tasks <= 0:
+                raise ValueError("task_done() called too many times")
+            self._unfinished_tasks -= 1
+            if self._unfinished_tasks == 0:
+                self._all_tasks_done.notify_all()
+
+    def join(self) -> None:
+        with self._lock:
+            while self._unfinished_tasks:
+                self._all_tasks_done.wait()
+
+
+class _SimpleStepQueue:
+    """Wrapper around queue.SimpleQueue providing join/task_done semantics."""
+
+    def __init__(self) -> None:
+        self._queue: SimpleQueue = SimpleQueue()
+        self._lock = threading.Lock()
+        self._all_tasks_done = threading.Condition(self._lock)
+        self._unfinished_tasks = 0
+
+    def put(self, item: Union[_StepWork, object]) -> None:
+        with self._lock:
+            self._unfinished_tasks += 1
+        self._queue.put(item)
+
+    def get(self) -> Union[_StepWork, object]:
+        return self._queue.get()
+
+    def task_done(self) -> None:
+        with self._lock:
+            if self._unfinished_tasks <= 0:
+                raise ValueError("task_done() called too many times")
+            self._unfinished_tasks -= 1
+            if self._unfinished_tasks == 0:
+                self._all_tasks_done.notify_all()
+
+    def join(self) -> None:
+        with self._lock:
+            while self._unfinished_tasks:
+                self._all_tasks_done.wait()
+
+
+_QUEUE_SENTINEL = object()
 
 
 class MonitoringEngine:
@@ -30,7 +141,11 @@ class MonitoringEngine:
         max_coalesce_bytes: int = 256 * 1024 * 1024,
     ) -> None:
         self.async_enabled = async_enabled
-        self._queue: "queue.Queue[Tuple[MonitoringTask, CacheFuture]]" = queue.Queue(maxsize=queue_size or 0)
+        self._debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
+        if queue_size > 0:
+            self._queue: Union[_StepQueue, _SimpleStepQueue] = _StepQueue(queue_size)
+        else:
+            self._queue = _SimpleStepQueue()
         self._stop = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._cache_stream: Optional[torch.cuda.Stream] = None
@@ -39,17 +154,15 @@ class MonitoringEngine:
         self._last_waited_step: Optional[int] = None
         self.cache_dtype = cache_dtype
         self._step_buckets: dict[int, list[Tuple[MonitoringTask, CacheFuture]]] = {}
-        self._sealed_steps: list[int] = []
+        self._sealed_steps: Deque[int] = deque()
         self._delay_steps = max(0, int(delay_steps))
-        self._max_coalesce_bytes = int(max_coalesce_bytes)
         env_max = os.environ.get("MON_ENGINE_MAX_COALESCE_MB")
         if env_max:
             try:
-                self._max_coalesce_bytes = int(env_max) * 1024 * 1024
+                _ = int(env_max) * 1024 * 1024  # retained for backwards compatibility (no longer used)
             except Exception:
                 if self._debug:
                     print(f"[MonEng] invalid MON_ENGINE_MAX_COALESCE_MB={env_max}")
-        self._debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
 
     # ------------------------------------------------------------------
     # Public API
@@ -95,26 +208,28 @@ class MonitoringEngine:
         """Seal the current step: establish stream dependency and enqueue ready steps."""
         if not (self.async_enabled and torch.cuda.is_available()):
             return
+        cache_stream = self._cache_stream
+        if cache_stream is not None:
+            try:
+                cache_stream.wait_stream(torch.cuda.current_stream())
+            except Exception:
+                pass
         with self._lock:
-            # Establish dependency now that producer work for this step has been queued
-            if self._cache_stream is not None:
-                try:
-                    self._cache_stream.wait_stream(torch.cuda.current_stream())
-                except Exception:
-                    pass
             # Mark the just-finished step as sealed
             self._sealed_steps.append(self._current_step_id)
             if self._debug:
                 print(f"[MonEng] end_step sealed step_id={self._current_step_id} sealed_len={len(self._sealed_steps)} delay={self._delay_steps}")
             # Determine which sealed step is ready to process based on delay_steps
             while len(self._sealed_steps) > self._delay_steps:
-                step_to_process = self._sealed_steps.pop(0)
+                step_to_process = self._sealed_steps.popleft()
                 bucket = self._step_buckets.pop(step_to_process, [])
+                if not bucket:
+                    continue
                 if self._debug:
-                    print(f"[MonEng] enqueue step={step_to_process} n_items={len(bucket)}")
-                for item in bucket:
-                    # Enqueue items; worker will coalesce per step upon retrieval
-                    self._queue.put(item)
+                    print(
+                        f"[MonEng] enqueue step={step_to_process} n_items={len(bucket)}"
+                    )
+                self._queue.put(_StepWork(step_to_process, bucket))
 
     def resolve_all(self, timeout: Optional[float] = None) -> None:
         """Block until all queued tasks have been processed."""
@@ -123,23 +238,28 @@ class MonitoringEngine:
             return
         # Flush any sealed-but-not-enqueued steps
         with self._lock:
-            # Enqueue sealed steps
-            for step_id in list(self._sealed_steps):
-                bucket = self._step_buckets.pop(step_id, [])
-                if self._debug:
-                    print(f"[MonEng] resolve_all enqueue sealed step={step_id} n_items={len(bucket)}")
-                for item in bucket:
-                    self._queue.put(item)
+            sealed_ids = list(self._sealed_steps)
             self._sealed_steps.clear()
-            # Enqueue any remaining buckets (eg, if end_step was not reached due to early exit)
-            for step_id, bucket in list(self._step_buckets.items()):
+            for step_id in sealed_ids:
+                bucket = self._step_buckets.pop(step_id, [])
                 if not bucket:
                     continue
                 if self._debug:
-                    print(f"[MonEng] resolve_all enqueue leftover step={step_id} n_items={len(bucket)}")
-                for item in bucket:
-                    self._queue.put(item)
-                self._step_buckets.pop(step_id, None)
+                    print(
+                        f"[MonEng] resolve_all enqueue sealed step={step_id} n_items={len(bucket)}"
+                    )
+                self._queue.put(_StepWork(step_id, bucket))
+
+            remaining_ids = list(self._step_buckets.keys())
+            for step_id in remaining_ids:
+                bucket = self._step_buckets.pop(step_id, [])
+                if not bucket:
+                    continue
+                if self._debug:
+                    print(
+                        f"[MonEng] resolve_all enqueue leftover step={step_id} n_items={len(bucket)}"
+                    )
+                self._queue.put(_StepWork(step_id, bucket))
         self._queue.join()
 
     def close(self) -> None:
@@ -152,7 +272,7 @@ class MonitoringEngine:
             if self._worker is None:
                 return
             self._stop.set()
-            self._queue.put((None, None))  # type: ignore[arg-type]
+            self._queue.put(_QUEUE_SENTINEL)
             self._worker.join()
             self._worker = None
             self._cache_stream = None
@@ -187,54 +307,31 @@ class MonitoringEngine:
         assert self._cache_stream is not None
         if self._debug:
             print("[MonEng] worker started")
-        while not self._stop.is_set():
-            task_item = self._queue.get()
-            if task_item[0] is None:  # type: ignore[index]
-                # mark sentinel done and exit
+        while True:
+            work = self._queue.get()
+            if work is _QUEUE_SENTINEL:
                 self._queue.task_done()
                 if self._debug:
                     print("[MonEng] worker got sentinel, exiting")
                 break
-            # Drain all items currently queued for this step (best-effort grouping)
-            first_task, first_future = task_item  # type: ignore[assignment]
-            step_id = first_task.step_id
-            batch = [(first_task, first_future)]
-            try:
-                # Non-blocking drain of same-step items
-                while True:
-                    t2, f2 = self._queue.get_nowait()
-                    if t2 is None:  # type: ignore
-                        # push back the sentinel and stop
-                        self._queue.put((t2, f2))  # type: ignore
-                        break
-                    if t2.step_id == step_id:
-                        batch.append((t2, f2))
-                    else:
-                        # Not same step, push back and stop draining
-                        self._queue.put((t2, f2))
-                        break
-            except queue.Empty:
-                pass
-
-            # Process batch with coalesced buffers
+            assert isinstance(work, _StepWork)
             try:
                 if self._debug:
-                    print(f"[MonEng] worker processing step={step_id} batch={len(batch)}")
-                self._process_batch_async(batch)
+                    print(
+                        f"[MonEng] worker processing step={work.step_id} batch={len(work.tasks)}"
+                    )
+                self._process_step_work(work)
             except BaseException as exc:  # pragma: no cover
-                for _, fut in batch:
+                for _, fut in work.tasks:
                     fut.set_exception(exc)
             finally:
-                # Mark all batch items as done
-                for _ in batch:
-                    self._queue.task_done()
+                work.tasks.clear()
+                self._queue.task_done()
 
-    def _process_batch_async(self, batch: list[Tuple[MonitoringTask, CacheFuture]]) -> None:
+    def _process_step_work(self, work: _StepWork) -> None:
         assert self._cache_stream is not None
         with torch.cuda.stream(self._cache_stream):
-            # Stream dependency already set at step start. Process each task independently
-            # to avoid the extra D2D memcpy introduced by the large coalesced buffer path.
-            for task, fut in batch:
+            for task, fut in work.tasks:
                 tensor = self._process_task(task)
                 if self.cache_dtype is not None and tensor.dtype != self.cache_dtype:
                     tensor = tensor.to(self.cache_dtype)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple, Union
@@ -83,6 +84,11 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Defer processing by K steps (ring buffer); 0 = no delay",
     )
+    parser.add_argument(
+        "--no-profile",
+        action="store_true",
+        help="Skip profiling and only measure wallclock time (faster, no trace files)",
+    )
 
     args = parser.parse_args()
     if not args.collect_hidden and not args.collect_attention:
@@ -130,6 +136,55 @@ def build_inputs(
     return encoded["input_ids"].to(device)
 
 
+def measure_model(
+    label: str,
+    fn: Callable[[], None],
+    device: torch.device,
+) -> float:
+    """Measure wallclock time without profiling overhead."""
+    import time
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    start = time.perf_counter()
+    fn()
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    return time.perf_counter() - start
+
+
+def measure_async_model(
+    label: str,
+    fn: Callable[[], None],
+    device: torch.device,
+    engine,
+) -> Tuple[float, float]:
+    """Measure wallclock time for async model without profiling overhead."""
+    import time
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    start = time.perf_counter()
+    fn()
+
+    # Only sync the main compute stream, NOT the background cache stream
+    if device.type == "cuda":
+        torch.cuda.current_stream().synchronize()
+
+    main_elapsed = time.perf_counter() - start
+    engine.resolve_all()
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    total_elapsed = time.perf_counter() - start
+    return main_elapsed, total_elapsed
+
+
 def profile_model(
     label: str,
     fn: Callable[[], None],
@@ -157,7 +212,11 @@ def profile_model(
         on_trace_ready=handler,
     ) as prof:
         with record_function(label):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
             fn()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
 
     return time.perf_counter() - wall_time_start
 
@@ -191,6 +250,9 @@ def profile_async_model(
     ) as prof:
         with record_function(label):
             fn()
+        # Sync only main stream before exiting profiler context
+        if device.type == "cuda":
+            torch.cuda.current_stream().synchronize()
 
     main_elapsed = time.perf_counter() - wall_time_start
     engine.resolve_all()
@@ -203,32 +265,17 @@ def profile_async_model(
 def main() -> None:
     args = parse_args()
 
-    if args.nvtx and (not torch.backends.cuda.is_built() or not torch.cuda.is_available()):
-        print("NVTX requested but CUDA support is unavailable; disabling NVTX annotations.")
-        args.nvtx = False
-
     if args.nvtx:
         os.environ.setdefault("TL_ENABLE_NVTX", "1")
 
-    print(f"[debug] args = {args}", flush=True)
     device = pick_device(args.device)
-
-    if device.type == "cpu" and args.dtype != "fp32":
-        print(
-            "CPU execution does not support dtype '",
-            args.dtype,
-            "'. Falling back to fp32 for both models.",
-            sep="",
-        )
-        args.dtype = "fp32"
-
     hf_dtype = map_hf_dtype(args.dtype)
     tl_dtype = map_tl_dtype(args.dtype)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2Model
-    from monitoring import MonitoringEngine
     from transformer_lens import HookedTransformer
+    from monitoring import MonitoringEngine
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     if tokenizer.pad_token is None:
@@ -250,7 +297,6 @@ def main() -> None:
     )
     hf_model.to(device)
     hf_model.eval()
-    print("[stage] Loaded HF AutoModelForCausalLM (gpt2)", flush=True)
 
     # TransformerLens model
     tl_model = HookedTransformer.from_pretrained(
@@ -259,7 +305,6 @@ def main() -> None:
         dtype=tl_dtype,
     )
     tl_model.eval()
-    print("[stage] Loaded TransformerLens HookedTransformer (gpt2)", flush=True)
 
     # Modified Hugging Face GPT-2 with TransformerLens-style hooks
     hf_hooked_model = HookedGPT2Model.from_pretrained(
@@ -269,7 +314,6 @@ def main() -> None:
     )
     hf_hooked_model.to(device)
     hf_hooked_model.eval()
-    print("[stage] Loaded HookedGPT2Model (modified HF)", flush=True)
 
     cache_dtype = None if args.cache_dtype == "none" else map_hf_dtype(args.cache_dtype)
     monitoring_engine = MonitoringEngine(
@@ -476,10 +520,12 @@ def main() -> None:
 
         return step, cleanup
 
-def run_model(step_fn: Callable[[], None]) -> None:
-    with torch.no_grad():
-        for _ in range(args.steps):
-            step_fn()
+    def run_model(step_fn: Callable[[], None]) -> None:
+        with torch.no_grad():
+            for _ in range(args.steps):
+                step_fn()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
 
     def tl_step() -> None:
         tl_model(input_ids, return_type="logits")
@@ -500,48 +546,6 @@ def run_model(step_fn: Callable[[], None]) -> None:
             remove_batch_dim=False,
         )
         # ensure tensors stay on device but release python references promptly
-        cache_dict.clear()
-
-    def hf_hooked_step() -> None:
-        hf_hooked_model(input_ids, use_cache=False)
-
-    def hf_hooked_cache_step() -> None:
-        previous_engine = hf_hooked_model.monitoring_engine
-        hf_hooked_model.monitoring_engine = None
-        def names_filter(name: str) -> bool:
-            lname = name.lower()
-            if args.collect_hidden and args.collect_attention:
-                return True
-            if args.collect_attention:
-                return "attn" in lname
-            return "attn" not in lname
-
-        _, cache_dict = hf_hooked_model.run_with_cache(
-            input_ids,
-            return_cache_object=False,
-            names_filter=names_filter,
-            remove_batch_dim=False,
-        )
-        cache_dict.clear()
-        hf_hooked_model.monitoring_engine = previous_engine
-
-    def hf_hooked_async_cache_step() -> None:
-        monitoring_engine.start_step()
-        def names_filter(name: str) -> bool:
-            lname = name.lower()
-            if args.collect_hidden and args.collect_attention:
-                return True
-            if args.collect_attention:
-                return "attn" in lname
-            return "attn" not in lname
-
-        _, cache_dict = hf_hooked_model.run_with_cache(
-            input_ids,
-            return_cache_object=False,
-            names_filter=names_filter,
-            remove_batch_dim=False,
-        )
-        monitoring_engine.end_step()
         cache_dict.clear()
 
     def hf_step() -> None:
@@ -565,8 +569,49 @@ def run_model(step_fn: Callable[[], None]) -> None:
                 _ = hs
         del outputs
 
+    def hf_hooked_step() -> None:
+        hf_hooked_model(input_ids, use_cache=False)
+
+    def hf_hooked_cache_step() -> None:
+        def names_filter(name: str) -> bool:
+            lname = name.lower()
+            if args.collect_hidden and args.collect_attention:
+                return True
+            if args.collect_attention:
+                return "attn" in lname
+            return "attn" not in lname
+
+        _, cache_dict = hf_hooked_model.run_with_cache(
+            input_ids,
+            names_filter=names_filter,
+            return_cache_object=False,
+            remove_batch_dim=False,
+        )
+        cache_dict.clear()
+
+    def hf_hooked_async_cache_step() -> None:
+        monitoring_engine.start_step()
+        try:
+            def names_filter(name: str) -> bool:
+                lname = name.lower()
+                if args.collect_hidden and args.collect_attention:
+                    return True
+                if args.collect_attention:
+                    return "attn" in lname
+                return "attn" not in lname
+
+            _, cache_dict = hf_hooked_model.run_with_cache(
+                input_ids,
+                names_filter=names_filter,
+                return_cache_object=False,
+                remove_batch_dim=False,
+            )
+        finally:
+            monitoring_engine.end_step()
+        cache_dict.clear()
+
     # Warmup
-    print("[stage] Running warmup iterations...", flush=True)
+    print("Running warmup iterations...")
     with torch.no_grad():
         for _ in range(args.warmup):
             tl_step()
@@ -578,6 +623,8 @@ def run_model(step_fn: Callable[[], None]) -> None:
             hf_hooked_model.monitoring_engine = monitoring_engine
             hf_hooked_async_cache_step()
             hf_hooked_model.monitoring_engine = None
+            if device.type == "cuda":
+                torch.cuda.synchronize()
 
     if monitoring_engine.async_enabled:
         monitoring_engine.resolve_all()
@@ -587,11 +634,28 @@ def run_model(step_fn: Callable[[], None]) -> None:
 
     traces_path = Path(args.profile_dir)
 
-    timings = {}
-
-    print("[run] transformer_lens", flush=True)
-    tl_elapsed = profile_model("transformer_lens", lambda: run_model(tl_step), device, traces_path)
     tokens_processed = args.batch_size * args.sequence_length * args.steps
+    timings: Dict[str, Dict[str, float]] = {}
+
+    if args.no_profile:
+        print("Running benchmarks WITHOUT profiling (pure wallclock time measurement)")
+
+        def run_benchmark(label: str, fn: Callable[[], None]) -> float:
+            return measure_model(label, fn, device)
+
+        def run_async_benchmark(label: str, fn: Callable[[], None], engine) -> Tuple[float, float]:
+            return measure_async_model(label, fn, device, engine)
+
+    else:
+        print("Running benchmarks WITH profiling (trace files will be generated)")
+
+        def run_benchmark(label: str, fn: Callable[[], None]) -> float:
+            return profile_model(label, fn, device, traces_path)
+
+        def run_async_benchmark(label: str, fn: Callable[[], None], engine) -> Tuple[float, float]:
+            return profile_async_model(label, fn, device, traces_path, engine)
+
+    tl_elapsed = run_benchmark("transformer_lens", lambda: run_model(tl_step))
     timings["transformer_lens"] = {
         "duration": tl_elapsed,
         "tokens_per_second": tokens_processed / tl_elapsed if tl_elapsed > 0 else float("inf"),
@@ -600,7 +664,6 @@ def run_model(step_fn: Callable[[], None]) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    print("[run] transformer_lens_cache", flush=True)
     tl_cache_elapsed = profile_model(
         "transformer_lens_cache", lambda: run_model(tl_cache_step), device, traces_path
     )
@@ -614,7 +677,6 @@ def run_model(step_fn: Callable[[], None]) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    print("[run] huggingface", flush=True)
     hf_elapsed = profile_model("huggingface", lambda: run_model(hf_step), device, traces_path)
     timings["huggingface"] = {
         "duration": hf_elapsed,
@@ -624,7 +686,6 @@ def run_model(step_fn: Callable[[], None]) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    print("[run] huggingface_api", flush=True)
     hf_api_elapsed = profile_model(
         "huggingface_api",
         lambda: run_model(hf_api_step),
@@ -641,13 +702,7 @@ def run_model(step_fn: Callable[[], None]) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    print("[run] huggingface_hooked", flush=True)
-    hf_hooked_elapsed = profile_model(
-        "huggingface_hooked",
-        lambda: run_model(hf_hooked_step),
-        device,
-        traces_path,
-    )
+    hf_hooked_elapsed = run_benchmark("huggingface_hooked", lambda: run_model(hf_hooked_step))
     timings["huggingface_hooked"] = {
         "duration": hf_hooked_elapsed,
         "tokens_per_second": tokens_processed / hf_hooked_elapsed
@@ -658,12 +713,8 @@ def run_model(step_fn: Callable[[], None]) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    print("[run] huggingface_hooked_cache", flush=True)
-    hf_hooked_cache_elapsed = profile_model(
-        "huggingface_hooked_cache",
-        lambda: run_model(hf_hooked_cache_step),
-        device,
-        traces_path,
+    hf_hooked_cache_elapsed = run_benchmark(
+        "huggingface_hooked_cache", lambda: run_model(hf_hooked_cache_step)
     )
     timings["huggingface_hooked_cache"] = {
         "duration": hf_hooked_cache_elapsed,
@@ -676,18 +727,13 @@ def run_model(step_fn: Callable[[], None]) -> None:
         torch.cuda.empty_cache()
 
     hf_hooked_model.monitoring_engine = monitoring_engine
-    # Additional async warmup not needed; we already included hf_hooked_async_cache_step
-    # in the generic warmup loop above.
     if monitoring_engine.async_enabled:
         monitoring_engine.resolve_all()
         if device.type == "cuda":
             torch.cuda.synchronize()
-    print("[run] huggingface_hooked_async_cache", flush=True)
-    main_async_elapsed, total_async_elapsed = profile_async_model(
+    main_async_elapsed, total_async_elapsed = run_async_benchmark(
         "huggingface_hooked_async_cache",
         lambda: run_model(hf_hooked_async_cache_step),
-        device,
-        traces_path,
         monitoring_engine,
     )
     timings["huggingface_hooked_async_cache"] = {
@@ -714,13 +760,7 @@ def run_model(step_fn: Callable[[], None]) -> None:
         run_model(hf_hook_step)
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        print("[run] huggingface_hook", flush=True)
-        hf_hook_elapsed = profile_model(
-            "huggingface_hook",
-            lambda: run_model(hf_hook_step),
-            device,
-            traces_path,
-        )
+        hf_hook_elapsed = run_benchmark("huggingface_hook", lambda: run_model(hf_hook_step))
         timings["huggingface_hook"] = {
             "duration": hf_hook_elapsed,
             "tokens_per_second": tokens_processed / hf_hook_elapsed
@@ -742,12 +782,8 @@ def run_model(step_fn: Callable[[], None]) -> None:
         run_model(hf_hook_cpu_step)
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        print("[run] huggingface_hook_cpu", flush=True)
-        hf_hook_cpu_elapsed = profile_model(
-            "huggingface_hook_cpu",
-            lambda: run_model(hf_hook_cpu_step),
-            device,
-            traces_path,
+        hf_hook_cpu_elapsed = run_benchmark(
+            "huggingface_hook_cpu", lambda: run_model(hf_hook_cpu_step)
         )
         timings["huggingface_hook_cpu"] = {
             "duration": hf_hook_cpu_elapsed,
@@ -760,22 +796,50 @@ def run_model(step_fn: Callable[[], None]) -> None:
 
     monitoring_engine.close()
 
+    traces_path.mkdir(parents=True, exist_ok=True)
+    results_file = traces_path / "timing_results.json"
+
+    results_data = {
+        "config": {
+            "batch_size": args.batch_size,
+            "sequence_length": args.sequence_length,
+            "steps": args.steps,
+            "warmup": args.warmup,
+            "device": str(device),
+            "dtype": args.dtype,
+            "collect_hidden": args.collect_hidden,
+            "collect_attention": args.collect_attention,
+            "cache_dtype": args.cache_dtype,
+            "engine_queue_size": args.engine_queue_size,
+            "engine_delay_steps": args.engine_delay_steps,
+            "profiling_enabled": not args.no_profile,
+        },
+        "timings": timings,
+        "total_processed_tokens": tokens_processed,
+    }
+
+    with results_file.open("w") as f:
+        json.dump(results_data, f, indent=2)
+
+    print(f"\nTiming results saved to: {results_file.resolve()}")
+
     print("\nTiming results (seconds and tokens/sec):")
     for label, stats in timings.items():
         if "duration" in stats:
             print(
-                f"- {label:>18}: duration={stats['duration']:.4f}s token/s={stats['tokens_per_second']:.2f}"
+                f"- {label:>30}: duration={stats['duration']:.4f}s token/s={stats['tokens_per_second']:.2f}"
             )
         else:
             print(
-                f"- {label:>18}: main_duration={stats['main_duration']:.4f}s "
-                f"total_duration={stats['total_duration']:.4f}s"
-                f" main_token/s={stats['tokens_per_second_main']:.2f}"
-                f" total_token/s={stats['tokens_per_second_total']:.2f}"
+                f"- {label:>30}: main_duration={stats['main_duration']:.4f}s "
+                f"total_duration={stats['total_duration']:.4f}s "
+                f"main_token/s={stats['tokens_per_second_main']:.2f} "
+                f"total_token/s={stats['tokens_per_second_total']:.2f}"
             )
 
-    print("\nProfiler traces written under:")
-    print(f"  {traces_path.resolve()}")
+    if not args.no_profile:
+        print("\nProfiler traces written under:")
+        print(f"  {traces_path.resolve()}")
     if args.nvtx and device.type == "cuda":
         print("NVTX annotations enabled for TransformerLens hooks (set TL_ENABLE_NVTX=1).")
 

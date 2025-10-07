@@ -67,6 +67,7 @@ def test_monitoring_engine_async_cuda():
     )
 
     future = engine.submit(task)
+    engine.end_step()
     try:
         assert not future.ready()
         result = future.result(timeout=5.0)

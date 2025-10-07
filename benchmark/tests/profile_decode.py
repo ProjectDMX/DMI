@@ -211,8 +211,9 @@ def measure_async_model(
     start = time.perf_counter()
     fn()
 
+    # Only sync the main compute stream, NOT the background cache stream
     if device.type == "cuda":
-        torch.cuda.synchronize()
+        torch.cuda.current_stream().synchronize()
 
     main_elapsed = time.perf_counter() - start
     engine.resolve_all()
@@ -253,6 +254,9 @@ def profile_async_model(
     ) as prof:
         with record_function(label):
             fn()
+        # Sync only main stream before exiting profiler context
+        if device.type == "cuda":
+            torch.cuda.current_stream().synchronize()
 
     main_elapsed = time.perf_counter() - wall_time_start
     engine.resolve_all()

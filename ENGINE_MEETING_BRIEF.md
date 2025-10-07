@@ -11,8 +11,8 @@
   - 专用后台线程 + 低优先级 CUDA 流（减少与主流资源争用）。
   - 步级边界：start_step()/end_step() 封装每一步 decode；主流在 end_step 后用 `cache_stream.wait_stream(producer_stream)` 建立一次性依赖（替换 per‑task 事件）。
   - 任务队列 + 节流：--engine-queue-size 控制 in‑flight；避免瞬时带宽冲击。
-  - K 步延迟：--engine-delay-steps（ring‑buffer 思路），允许后台缓几步再处理，进一步让主流“像没开 hook 一样”。
-  - 合并拷贝（分块）：每步尽量预分配大 buffer，将多个小拷贝合并，减少 kernel/调度开销（可被 MON_ENGINE_MAX_COALESCE_MB 控制分块大小）。
+  - StepWork + RingBuffer：每步打包全部任务一次入队，后台线程一次性处理整步，降低 Python/GIL 开销。
+  - K 步延迟：--engine-delay-steps（环形缓冲），允许后台缓几步再处理，进一步让主流“像没开 hook 一样”。
   - 解决生命周期：对引用的张量保持强引用；仅在 no_grad 下工作（推理场景），减少 detach/record_stream 使用频率。
 
 - Hook 集成与基线
@@ -32,7 +32,7 @@
 
 3) slice/clone 等 CPU 侧整理开销
    - 现象（同步版）：`aten::slice` 等重排算子长期为 Top‑1 开销来源。
-   - 措施：将切片/整理延后到后台流，并引入“合并拷贝”减少许多小 copy/launch 调度。
+   - 措施：将切片/整理延后到后台流；异步版通过 StepWork 批处理减少了 launch/调度。
 
 4) cache_dtype（fp16/bf16）引入额外开销
    - 结论：在当前 decode 设置下，类型转换的代价抵消甚至超过带宽收益，导致更慢。建议默认 `--cache-dtype none`，待更激进的合并拷贝/压缩后再评估。
@@ -51,43 +51,32 @@
   - `hf_modified_hook`: 5.0265s（815 tok/s）
   - `hf_modified_hook_async`: main 4.5728s / total 4.5805s（896/894 tok/s）
 
-主要开销对比（基于 1..4 与 6 轮 trace 聚合）
-- 同步版相对 `hf_modified`：
-  - Top‑1 持续为 `aten::slice`；其次为 `aten::as_strided` 与少量 `addmm/matmul/layer_norm`。
-- 异步版早期（1..4 轮）：
-  - 事件相关（`cudaEventRecordWithFlags`/`cudaStreamIsCapturing`/`cudaStreamWaitEvent`）明显；`record_stream` 与少量 `detach` 也占据开销。
-- 异步版近期（第 6 轮）：
-  - 事件开销消失，取而代之的是 D2D 拷贝（`cudaMemcpyAsync`/`Memcpy DtoD`）成为主要来源；其次是 `addmm/matmul/layer_norm`（受带宽争用影响）。
+主要开销对比（旧 trace 与最新实现对比）
+- 同步版相对 `hf_modified`：Top‑1 仍然是 `aten::slice` 与 `aten::as_strided`（同步路径无法规避）。
+- 异步版（StepWork 之前）：事件 + 大量 D2D 拷贝成为主瓶颈。
+- 异步版（StepWork 之后）：事件与 D2D 拷贝消失，主开销转为 Python 调度（队列/锁）与必要的 `addmm/matmul/layer_norm` 抬头。
 
-这意味着：我们把“同步/事件/细粒度开销”挪到了后台，但后台拷贝的显存带宽竞争开始成为主路径的主要干扰。因此下一步应侧重减小 D2D 拷贝体量和并发对主流的影响。
+结论：我们已经把 GPU 上的额外拷贝消除，下一步重点是继续削减主线程登记成本（批提交、无锁结构、必要时 C++ 扩展），让 main_duration 贴近 `hf_modified_hook` 甚至进一步下降。
 
 下一步计划（从易到难）
-1) 进一步“更不打扰”主流：
-   - 限制后台同时在途拷贝数量；
-   - 维持低优先级流；必要时按 token 大小优先，减少长拷贝对主路径的影响。
-2) 合并拷贝与大 buffer：
-   - 一步一个大 buffer + 偏移表，用更少的大块拷贝替代大量小拷贝；
-   - 动态分块大小（避免 allocator 压力）。
-3) K 步延迟的 ring buffer：
-   - 将后台任务批处理到 K 步后再统一落地，最大化隐藏对主流的影响（以显存换干扰度）。
-4) 降精/压缩（再次评估）：
-   - 当合并拷贝成熟后，重测 fp16/bf16 的净收益；必要时引入轻量量化以进一步减小 D2D 体量。
-5) CUDA Graphs（可选）：
-   - 捕获主前向图，进一步压低 launch/调度开销；hook 的异步逻辑保持图外。
+1) 单步批量提交 + 更轻量的队列（StepWork 已上线，后续继续打磨无锁结构、减少锁争用）。
+2) 如需连续缓冲，再评估“大 buffer 合并拷贝”作为开关选项（默认关闭，避免额外 D2D）。
+3) 更智能的节流：结合 in-flight 限制与任务大小排序，保障主流算子稳定。
+4) 降精/压缩（再次评估）：在需要时引入轻量量化以进一步减小后台工作负载。
+5) CUDA Graphs（可选）：捕获主前向图，进一步压低 launch/调度开销；hook 的异步逻辑保持图外。
 
 如何复现
 - 无延迟异步（对比 main vs total）：
   - `python HF_Prometheus/benchmark/tests/profile_decode.py --batch-size 64 --decode-steps 64 --steps 1 --profile-dir HF_Prometheus/results/HF_modified_decode_async_6 --engine-delay-steps 0 --engine-queue-size 128 --cache-dtype none --collect-hidden --collect-attention`
 - 带延迟=1（诊断）：
-  - `MON_ENGINE_DEBUG=1 MON_ENGINE_MAX_COALESCE_MB=128 python HF_Prometheus/benchmark/tests/profile_decode.py --batch-size 64 --decode-steps 64 --steps 1 --profile-dir HF_Prometheus/results/HF_modified_decode_async_6 --engine-delay-steps 1 --engine-queue-size 128 --cache-dtype none --collect-hidden --collect-attention > HF_Prometheus/logs/debug.out`
+  - `MON_ENGINE_DEBUG=1 python HF_Prometheus/benchmark/tests/profile_decode.py --batch-size 64 --decode-steps 64 --steps 1 --profile-dir HF_Prometheus/results/HF_modified_decode_async_6 --engine-delay-steps 1 --engine-queue-size 128 --cache-dtype none --collect-hidden --collect-attention > HF_Prometheus/logs/debug.out`
 
 可视化材料
 - Notebook：`HF_Prometheus/notebooks/overhead_analysis.ipynb`（已修正为过滤 user_annotation/Trace）。
 - 脚本版：`HF_Prometheus/notebooks/overhead_analysis.py`（支持保存 PNG）。
 
 结论（给老板的话）
-- “同步抓激活”让主路径多了大量 `slice/clone` 等整理开销，直接拖慢 1 倍左右；
-- “异步抓激活”成功把同步/事件开销移出主路径，但目前主要瓶颈变成了后台 D2D 拷贝对主路径带宽/SM 的干扰；
-- 接下来通过“步级合并拷贝 + 限流 + K 步延迟 +（成熟后）降精/压缩”，主路径将更加接近“不开 hook”的 `hf_modified`，用户感知的推理时间会显著降低；
-- 现有方案已具备实验对比基础和可视化支撑，卡死问题定位中，已提供调试日志与守护器思路，预计可在下一轮修正。
-
+- “同步抓激活”带来的整理开销依旧存在，是对照基线。
+- “异步抓激活”现已去掉 per-task 事件与大规模 D2D 拷贝；主路径慢主要是 Python 调度成本，我们已通过 StepWork/RingBuffer 把这块降到最低，并继续优化。
+- 接下来通过批量提交、更轻量的队列、可选的后台压缩，主路径会越来越接近 `hf_modified`。
+- 可视化脚本/Notebook 已就绪，随时可以展示差异；卡死问题也在新架构下得到进一步缓解。

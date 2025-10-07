@@ -33,22 +33,19 @@
 
 1. **Hook 中只登记任务**
    - `save_hook` 不再立刻切片，而是：
-     1. `tensor.detach()`、`record_stream()`。
-     2. `event.record()` 在当前 CUDA stream 上。
-     3. 创建 `MonitoringTask`（包含 tensor、pos_slice、event、hook 名等元信息）。
-     4. 调用 `monitoring_engine.submit(task)`，返回 `CacheFuture` 存入 cache。
+     1. 在 no_grad 场景沿用张量（仅在需要时做 `requires_grad` 防护）。
+     2. 创建 `MonitoringTask`（包含 tensor、pos_slice、hook 名等元信息）。
+     3. 调用 `monitoring_engine.submit(task)`，返回 `CacheFuture` 存入 cache。
 
 2. **Monitoring Engine 异步处理**
    - Engine 内维护：
-     - 任务队列（`queue.Queue`）。
-     - 专用 CUDA stream（例如 `self.cache_stream`）。
+     - StepWork 队列（自建 ring buffer）。
+     - 专用低优先级 CUDA stream。
      - 后台线程 `MonitoringWorker`。
    - Worker 处理流程：
-     1. `task = queue.get()`，遇到哨兵 `None` 退出。
-     2. `with torch.cuda.stream(cache_stream): cache_stream.wait_event(task.event)`。
-     3. 根据 `pos_slice` 执行切片（仅非 identity 时实际调用）。
-     4. 根据配置执行 clone、设备迁移等（未来可扩展）。
-     5. 将结果写回 `CacheFuture`，标记任务完成。
+     1. 取出 StepWork（整步任务），遇到哨兵退出。
+     2. `with torch.cuda.stream(cache_stream): cache_stream.wait_stream(producer_stream)`。
+     3. 遍历任务，按需切片/降精/迁移，串行写回 `CacheFuture`。
 
 3. **CacheFuture / Cache API**
    - cache 条目保存的是 `CacheFuture`，提供：
@@ -60,11 +57,12 @@
    - `run_with_cache` 返回 `(model_out, cache)`；调用方可在需要时通过 `cache.resolve_all()` 等接口同步。
 
 4. **生命周期管理**
-   - Engine 提供 `start()` / `close()`：
-     - `start()` 初始化 stream、线程。
-     - `close()` 推送 `None` 到队列，等待 worker 结束。
-   - `CacheFuture` 对 Engine 持弱引用，避免提前释放。
-   - `run_with_cache` 在 `async_mode=False` 时保持旧行为，兼容已有代码。
+   - Engine 提供 `start_step()` / `end_step()` / `resolve_all()` / `close()`：
+     - `start_step()` 在主流进入 decode / prefill 步时调用，递增步号。
+     - `end_step()` 执行一次 `cache_stream.wait_stream(生产流)` 并将该步所有任务打包入队。
+     - `resolve_all()` 将剩余步补齐入队并阻塞等待后台完成。
+     - `close()` 推送哨兵到队列，回收线程与 CUDA stream。
+   - `run_with_cache(async_enabled=False)` 仍保持旧的同步行为，以兼容既有代码。
 
 ## 代码模块规划
 
@@ -95,35 +93,36 @@
 
 ## 最近迭代（已落地）
 
-- 步级事件聚合：新增 `MonitoringEngine.start_step()`，按 step 聚合依赖，后台流一次等待，移除 per-task 事件/record_stream。
-- wait_stream 优先：在支持的环境下以 `cache_stream.wait_stream(producer_stream)` 代替事件，进一步减少 CUDA runtime 开销。
+- 步级同步：新增 `MonitoringEngine.start_step()` / `end_step()`，按步聚合依赖，后台流一次等待。
+- wait_stream 优先：在支持的环境下以 `cache_stream.wait_stream(producer_stream)` 代替事件，减少 CUDA runtime 开销。
 - 后台流最低优先级：使用 `torch.cuda.Stream(priority=max_pri)` 创建 cache stream，降低对主流的资源干扰。
 - 队列限流（可选）：新增 `--engine-queue-size` CLI，限制待处理任务数量，避免瞬时抢带宽。
 - 可选降精（谨慎）：新增 `--cache-dtype {none,fp32,fp16,bf16}`，仅影响缓存存储。当前 decode 配置下建议保留 `none`，否则转换开销可能大于带宽收益。
+- **StepWork + RingBuffer**：主线程按步打包任务，后台线程一次性处理整步，显著降低 Python/GIL 调度开销。
 
 ## 进行中 / 下一步
 
-- 合并拷贝：按 step 汇总任务，分配连续大 buffer + 偏移表，减少大量小拷贝与分配（已初步在 worker 批处理阶段合并分配并集中拷贝）。
-- K 步延迟（ring buffer）：新增 `--engine-delay-steps`，将封存 step 延迟 K 步后再入队后台处理，进一步降低主流与后台流的竞争。
+- 评估是否以可选策略方式重新提供“大 buffer 合并拷贝”（默认关闭，避免额外 D2D）。
+- 继续削减主线程任务登记成本，必要时考虑 C++/CUDA Hook 输出。
+- 利用 `--engine-delay-steps` 做步级延迟，缓解后台与主流带宽竞争。
+- 增强监控指标，暴露 StepQueue 深度、平均处理时延等数据。
 
 ## 异步处理流程详解
 
 1. **Hook 登记任务（主 stream）**
-   - `HookedRootModule.get_caching_hooks` 生成的 `save_hook` 不直接切片。
-   - 对激活执行 `tensor.detach()` 并 `record_stream()`，随后 `event.record()`。
-   - 构造 `MonitoringTask`（含 tensor、hook 名、`pos_slice`、event 等），交给 `monitoring_engine.submit`。
+   - `HookedRootModule.get_caching_hooks` 生成的 `save_hook` 只做必要的张量守护（grad check）。
+   - 构造 `MonitoringTask`（含 tensor、hook 名、`pos_slice` 等），交给 `monitoring_engine.submit`。
    - `submit` 返回 `CacheFuture`，存入 cache（`cache[hook_name] = future`）。
 
 2. **Engine 排队**
-   - `MonitoringEngine` 将 task 放入线程安全队列。
-   - Worker 线程在后台循环取任务；若处于 CPU 或同步模式，可直接 fallback。 
+   - `MonitoringEngine` 按步收集任务列表，`end_step()` 时打包成 `StepWork`。
+   - `StepWork` 通过 ring buffer 队列交给后台线程；CPU fallback 时仍可直接返回结果。
 
 3. **后台处理（专用 CUDA stream）**
-   - Worker 进入 `with torch.cuda.stream(cache_stream)`，并 `cache_stream.wait_event(task.event)`。
-   - 已改为“步级等待”：通过 `engine.start_step()` 记录一次事件，worker 在当前 step 的首个任务上 wait 一次，后续任务不再重复等待（可替换为 `wait_stream`）。
-   - 读取张量后，根据 `pos_slice` 决定是否执行切片（此时触发 `aten::slice` 但不阻塞主流）。
-   - 未来要扩展的 clone、迁移等操作也在该 stream 串行完成。
-   - 处理结束后调用 `task.resolve(final_tensor)`，并 `queue.task_done()`。
+   - Worker 进入 `with torch.cuda.stream(cache_stream)`，调用 `cache_stream.wait_stream(producer_stream)` 完成步级同步。
+   - 遍历 StepWork 中的任务，根据 `pos_slice` 决定是否执行切片（`Slice.identity` 会跳过）。
+   - 可选执行降精/跨设备迁移等操作，最后将结果写回 `CacheFuture`。
+   - 完成整步后 `queue.task_done()` 并清空 StepWork，释放引用。
 
 4. **使用缓存**
    - cache 项是 `CacheFuture`，调用 `future.ready()` 检查状态，`future.result()` 阻塞直到数据可用。

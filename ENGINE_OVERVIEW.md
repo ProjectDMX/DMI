@@ -64,12 +64,14 @@
 - 效果：
   - 主路径算子（`addmm/matmul/layer_norm`）的抬头幅度降低；
 
-4) 合并拷贝（coalesced copy，初版）
+4) StepWork + RingBuffer（当前实现）
 - 做法：
-  - 同一 step 的任务批量处理；一次或分块分配大 buffer，将各条目拷贝到连续切片，future 指向切片 view；
-  - 限制单块大小（默认 256MB，`MON_ENGINE_MAX_COALESCE_MB` 可调），避免大分配卡顿；
+  - 主线程按步收集 Hook 任务，`end_step()` 时打包成 StepWork；
+  - 使用单生产者/单消费者 ring buffer 传递 StepWork；
+  - 后台线程一次性处理整步任务，串行切片/降精/写回 future。
 - 效果：
-  - `empty/clone/copy_/reshape` 等数量下降，减少 launch/调度成本。
+  - `queue.put/get` 次数骤减，Python/GIL 调度成本显著降低；
+  - 主流时间更稳定，GPU compute 不再被大量排队操作插断。
 
 5) 只计主流时间（用户视角）
 - 做法：
@@ -107,7 +109,7 @@
 ## 如何使用（建议）
 
 - 纯主流时延：`--cache-dtype none`，`--engine-queue-size 128~256`，`--engine-delay-steps 0~1`。
-- 观察异步行为：`MON_ENGINE_DEBUG=1`；必要时 `MON_ENGINE_MAX_COALESCE_MB=128` 控制单块大小。
+- 观察异步行为：`MON_ENGINE_DEBUG=1` 查看 StepWork / 队列日志。
 - 推荐按两步跑：
   1) `delay_steps=0` 验证主线；
   2) 开 `delay_steps=1`，看 main_duration 是否再收敛，若卡住查看 debug 日志的 end_step/enqueue/worker/chunk。
@@ -120,10 +122,10 @@
 
 ## 后续路线（更多优化）
 
-- 更激进的合并拷贝：自定义 kernel 或更少的高效大拷贝，进一步降低 copy_/launch 开销；
-- 更严的节流策略：按 in-flight/大小/优先级调度，保障主流算子稳定；
-- 更长的 K 步延迟（ring buffer），彻底把后台工作与主流错峰；
-- CUDA Graphs 捕获主前向（保持 hook 排队在图外），降低主流调度；
+- 视需求重新提供“大 buffer 合并拷贝”作为可选策略（默认关闭，避免额外 D2D）。
+- 更严的节流策略：按 in-flight/大小/优先级调度，保障主流算子稳定。
+- 更长的 K 步延迟（ring buffer），彻底把后台工作与主流错峰。
+- CUDA Graphs 捕获主前向（保持 hook 排队在图外），降低主流调度。
 - 多 GPU：后台流转移到第二块 GPU（NVLink），完全隔离 compute 与 copy。
 
 ---
@@ -131,7 +133,7 @@
 ## 附录：关键文件与开关
 
 - 引擎代码：
-  - `monitoring/engine.py`（核心逻辑：队列、后台流、步级批处理、合并拷贝）
+  - `monitoring/engine.py`（核心逻辑：StepWork、ring buffer、后台流）
   - `monitoring/task.py`（任务与 Future）
 - Hook 适配：
   - `transformers/src/transformers/models/gpt2_p/hook_points.py`（只在需要时 `detach()`）
@@ -143,6 +145,4 @@
   - `--engine-queue-size N`（建议 64~256）
   - `--engine-delay-steps K`（建议 0~1 起步）
 - 调试与控制：
-  - `MON_ENGINE_DEBUG=1` 打开详细日志
-  - `MON_ENGINE_MAX_COALESCE_MB=128` 控制单块 coalesce 上限
-
+  - `MON_ENGINE_DEBUG=1` 打开 StepWork / 队列详细日志
