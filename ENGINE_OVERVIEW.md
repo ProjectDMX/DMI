@@ -127,6 +127,7 @@
 - 更长的 K 步延迟（ring buffer），彻底把后台工作与主流错峰。
 - CUDA Graphs 捕获主前向（保持 hook 排队在图外），降低主流调度。
 - 多 GPU：后台流转移到第二块 GPU（NVLink），完全隔离 compute 与 copy。
+- **Native 后端计划**：评估并推进 C++/CUDA 重构，把任务调度、队列、生命周期管理移出 Python/GIL，实现真正的无锁异步（详见 `MONITORING_ENGINE_PLAN.md`）。
 
 ---
 
