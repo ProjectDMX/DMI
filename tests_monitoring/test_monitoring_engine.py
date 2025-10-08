@@ -33,6 +33,23 @@ def test_cache_future_waits_for_result():
     thread.join()
 
 
+def test_cache_future_propagates_exception():
+    tensor = torch.ones(2)
+    task = MonitoringTask(name="test", tensor=tensor)
+    future = CacheFuture(task)
+
+    def producer():
+        future.set_exception(RuntimeError("boom"))
+
+    thread = threading.Thread(target=producer)
+    thread.start()
+
+    with pytest.raises(RuntimeError, match="boom"):
+        future.result(timeout=1.0)
+
+    thread.join()
+
+
 def test_monitoring_engine_sync_fallback():
     engine = MonitoringEngine(async_enabled=False)
     tensor = torch.arange(6.0).view(1, 6)
@@ -75,5 +92,26 @@ def test_monitoring_engine_async_cuda():
         assert future.ready()
         assert result.dtype == torch.float16
         assert torch.allclose(result.float(), tensor[0].float(), atol=1e-3, rtol=1e-3)
+    finally:
+        engine.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for pending-step test")
+def test_monitoring_engine_resolve_flushes_pending_step():
+    engine = MonitoringEngine(async_enabled=True)
+
+    tensor = torch.zeros(1, 2, 2, device="cuda")
+    engine.start_step()
+    task = MonitoringTask(
+        name="blocks.0.hook_resid_post",
+        tensor=tensor,
+        metadata={"remove_batch_dim": True, "can_slice": False},
+    )
+
+    future = engine.submit(task)
+    try:
+        engine.resolve_all()
+        result = future.result(timeout=5.0)
+        assert result.shape == (2, 2)
     finally:
         engine.close()
