@@ -37,63 +37,10 @@ def _stream_to_handle(stream: Optional[torch.cuda.Stream]) -> Optional[int]:
         return None
 
 
-def _serialize_slice(slice_obj: Any) -> Dict[str, Any]:
-    if slice_obj is None:
-        return {"mode": "identity"}
+def _serialize_task(task: MonitoringTask) -> tuple[Any, int, bool, bool, Any, Optional[torch.device]]:
+    """Return a tuple payload consumable by the native backend."""
 
-    if Slice is not None and isinstance(slice_obj, Slice):
-        mode = getattr(slice_obj, "mode", "identity")
-        data = getattr(slice_obj, "slice", slice(None))
-    else:
-        mode = "identity"
-        data = slice_obj
-        if isinstance(slice_obj, int):
-            mode = "int"
-        elif isinstance(slice_obj, slice):
-            mode = "slice"
-        elif isinstance(slice_obj, (list, tuple)):
-            mode = "array"
-
-    if mode == "identity":
-        return {"mode": "identity"}
-
-    if mode == "int":
-        return {"mode": "int", "value": int(data)}
-
-    if mode == "slice":
-        return {
-            "mode": "slice",
-            "start": data.start,
-            "stop": data.stop,
-            "step": data.step,
-        }
-
-    if mode == "array":
-        if hasattr(data, "tolist"):
-            values = data.tolist()
-        else:
-            values = list(data)
-        return {"mode": "array", "indices": [int(v) for v in values]}
-
-    # Fallback – treat as identity
-    return {"mode": "identity"}
-
-
-def _serialize_task(task: MonitoringTask) -> Dict[str, Any]:
-    metadata = task.metadata
-    remove_batch_dim = bool(metadata.get("remove_batch_dim"))
-    can_slice = metadata.get("can_slice")
-    if can_slice is None:
-        can_slice = True
-
-    return {
-        "tensor": task.tensor,
-        "slice_dim": int(task.slice_dim),
-        "remove_batch_dim": bool(remove_batch_dim),
-        "can_slice": bool(can_slice),
-        "slice": _serialize_slice(task.pos_slice),
-        "target_device": task.target_device,
-    }
+    return task.native_payload
 
 
 class MonitoringEngine:
@@ -138,6 +85,18 @@ class MonitoringEngine:
                 self._backend = python_backend
                 self._python_backend = python_backend
 
+        # Stats (optional) --------------------------------------------------
+        self._stats_enabled = bool(int(os.environ.get("MON_ENGINE_STATS", "0")))
+        self._stats_hooks = 0
+        self._stats_steps = 0
+        self._stats_tasks = 0
+        self._stats_native_submit_ms = 0.0
+        # Fine-grained Python-side timings (ms)
+        self._stats_py_serialize_ms = 0.0  # building tuple payloads in Python
+        self._stats_py_bind_ms = 0.0       # binding tokens back to futures
+        self._stats_py_resolve_ms = 0.0    # resolve_all + clear overhead
+        self._stats_max_tasks_per_step = 0
+
     # ------------------------------------------------------------------
     # Public API
 
@@ -162,6 +121,8 @@ class MonitoringEngine:
 
         bucket = self._pending_tasks.setdefault(step_id, [])
         bucket.append((task, future))
+        if self._stats_enabled:
+            self._stats_hooks += 1
         if self._debug:
             print(f"[MonEng] submit step={step_id} bucket_size={len(bucket)}")
 
@@ -200,11 +161,36 @@ class MonitoringEngine:
             backend = self._native_backend
             if backend is None:
                 return
-            task_specs = [_serialize_task(task) for task, _ in tasks]
+            # Build tuple payloads (measure serialize cost)
+            if self._stats_enabled:
+                import time
+                _t0 = time.perf_counter()
+                task_specs = [_serialize_task(task) for task, _ in tasks]
+                self._stats_py_serialize_ms += (time.perf_counter() - _t0) * 1000.0
+                if len(tasks) > self._stats_max_tasks_per_step:
+                    self._stats_max_tasks_per_step = len(tasks)
+            else:
+                task_specs = [_serialize_task(task) for task, _ in tasks]
             stream_handle = _stream_to_handle(producer_stream)
-            tokens = backend.submit_step(step_id, task_specs, stream_handle)
-            for token, (_, future) in zip(tokens, tasks):
-                future.bind_backend(backend, token)
+            if self._stats_enabled:
+                import time
+                t0 = time.perf_counter()
+                tokens = backend.submit_step(step_id, task_specs, stream_handle)
+                self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
+            else:
+                tokens = backend.submit_step(step_id, task_specs, stream_handle)
+            if self._stats_enabled:
+                import time
+                _t1 = time.perf_counter()
+                for token, (_, future) in zip(tokens, tasks):
+                    future.bind_backend(backend, token)
+                self._stats_py_bind_ms += (time.perf_counter() - _t1) * 1000.0
+            else:
+                for token, (_, future) in zip(tokens, tasks):
+                    future.bind_backend(backend, token)
+            if self._stats_enabled and tasks:
+                self._stats_steps += 1
+                self._stats_tasks += len(tasks)
             return
 
         backend = self._python_backend
@@ -225,12 +211,37 @@ class MonitoringEngine:
             if self._pending_tasks:
                 for step_id in sorted(self._pending_tasks.keys()):
                     tasks = self._pending_tasks.pop(step_id)
-                    task_specs = [_serialize_task(task) for task, _ in tasks]
-                    tokens = backend.submit_step(step_id, task_specs, None)
-                    for token, (_, future) in zip(tokens, tasks):
-                        future.bind_backend(backend, token)
-            backend.resolve_all()
-            self.clear_completed_results()
+                    if self._stats_enabled:
+                        import time
+                        _t0 = time.perf_counter()
+                        task_specs = [_serialize_task(task) for task, _ in tasks]
+                        self._stats_py_serialize_ms += (time.perf_counter() - _t0) * 1000.0
+                        if len(tasks) > self._stats_max_tasks_per_step:
+                            self._stats_max_tasks_per_step = len(tasks)
+                        t0 = time.perf_counter()
+                        tokens = backend.submit_step(step_id, task_specs, None)
+                        self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
+                        if tasks:
+                            self._stats_steps += 1
+                            self._stats_tasks += len(tasks)
+                        _t1 = time.perf_counter()
+                        for token, (_, future) in zip(tokens, tasks):
+                            future.bind_backend(backend, token)
+                        self._stats_py_bind_ms += (time.perf_counter() - _t1) * 1000.0
+                    else:
+                        task_specs = [_serialize_task(task) for task, _ in tasks]
+                        tokens = backend.submit_step(step_id, task_specs, None)
+                        for token, (_, future) in zip(tokens, tasks):
+                            future.bind_backend(backend, token)
+            if self._stats_enabled:
+                import time
+                _t2 = time.perf_counter()
+                backend.resolve_all()
+                self.clear_completed_results()
+                self._stats_py_resolve_ms += (time.perf_counter() - _t2) * 1000.0
+            else:
+                backend.resolve_all()
+                self.clear_completed_results()
             return
 
         backend = self._python_backend
@@ -249,6 +260,49 @@ class MonitoringEngine:
             backend = self._native_backend
             if backend is None:
                 return
+            if self._stats_enabled:
+                try:
+                    stats = backend.get_stats()
+                except Exception:
+                    stats = None
+                print("[MonEng/Stats] hooks=", self._stats_hooks,
+                      " steps=", self._stats_steps,
+                      " tasks=", self._stats_tasks,
+                      " py_serialize_ms=", round(self._stats_py_serialize_ms, 3),
+                      " py_submit_ms=", round(self._stats_native_submit_ms, 3),
+                      " py_bind_ms=", round(self._stats_py_bind_ms, 3),
+                      " py_resolve_ms=", round(self._stats_py_resolve_ms, 3),
+                      " max_tasks_per_step=", self._stats_max_tasks_per_step)
+                if stats is not None:
+                    try:
+                        # Expect dict with microseconds
+                        print(
+                            "[Native/Stats] steps=", int(stats.get("total_steps", 0)),
+                            " tasks=", int(stats.get("total_tasks", 0)),
+                            " submit_ms=", round(float(stats.get("submit_us", 0.0)) / 1000.0, 3),
+                            " process_ms=", round(float(stats.get("process_us", 0.0)) / 1000.0, 3),
+                        )
+                    except Exception:
+                        pass
+                # Optional: slice mode stats
+                try:
+                    from .task import get_slice_stats  # type: ignore
+                    slice_stats = get_slice_stats()
+                    if slice_stats:
+                        print("[MonEng/SliceStats]", slice_stats)
+                except Exception:
+                    pass
+                # Hook-side stats from TL integration (optional)
+                try:
+                    # The hook module path in this repo
+                    from transformers.models.gpt2_p.hook_points import (  # type: ignore
+                        get_monitoring_hook_stats,
+                    )
+                    hook_stats = get_monitoring_hook_stats()
+                    if hook_stats:
+                        print("[Hook/Stats]", hook_stats)
+                except Exception:
+                    pass
             self.clear_completed_results()
             backend.close()
             self._native_backend = None

@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <atomic>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -84,9 +85,19 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     close();
   }
 
+  py::dict get_stats() {
+    py::dict d;
+    d["total_steps"] = stats_total_steps_.load(std::memory_order_relaxed);
+    d["total_tasks"] = stats_total_tasks_.load(std::memory_order_relaxed);
+    d["submit_us"] = stats_submit_us_.load(std::memory_order_relaxed);
+    d["process_us"] = stats_process_us_.load(std::memory_order_relaxed);
+    return d;
+  }
+
   std::vector<int64_t> submit_step(int64_t step_id,
                                    const py::list& tasks,
                                    std::optional<uint64_t> stream_handle) {
+    auto t0 = std::chrono::steady_clock::now();
     StepWork work;
     work.step_id = step_id;
 
@@ -94,19 +105,11 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     tokens.reserve(tasks.size());
 
     for (auto task_obj : tasks) {
-      auto task_dict = task_obj.cast<py::dict>();
       TaskSpec spec;
-      spec.tensor = task_dict["tensor"].cast<at::Tensor>();
-      spec.slice_dim = task_dict["slice_dim"].cast<int64_t>();
-      spec.remove_batch_dim = task_dict["remove_batch_dim"].cast<bool>();
-      spec.can_slice = task_dict["can_slice"].cast<bool>();
-
-      auto slice_dict = task_dict["slice"].cast<py::dict>();
-      spec.slice = parse_slice(slice_dict);
-
-      py::object device_obj = task_dict["target_device"];
-      if (!device_obj.is_none()) {
-        spec.target_device = device_obj.cast<c10::Device>();
+      if (PyTuple_Check(task_obj.ptr())) {
+        spec = parse_task_tuple(py::reinterpret_borrow<py::tuple>(task_obj));
+      } else {
+        throw std::runtime_error("Native backend expects a tuple task payload");
       }
 
       int64_t token = next_token_++;
@@ -162,6 +165,12 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
       dispatch_step(std::move(item));
     }
 
+    // Stats: count steps/tasks and submit CPU time
+    stats_total_steps_.fetch_add(1, std::memory_order_relaxed);
+    stats_total_tasks_.fetch_add(static_cast<int64_t>(tokens.size()), std::memory_order_relaxed);
+    auto t1 = std::chrono::steady_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    stats_submit_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
     return tokens;
   }
 
@@ -303,19 +312,48 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   }
 
  private:
-  SliceSpec parse_slice(const py::dict& slice_dict) {
+  TaskSpec parse_task_tuple(const py::tuple& task_tuple) {
+    TORCH_CHECK(task_tuple.size() == 6,
+                "Native backend expects task tuple of length 6, got ",
+                task_tuple.size());
+
+    TaskSpec spec;
+    spec.tensor = task_tuple[0].cast<at::Tensor>();
+    spec.slice_dim = task_tuple[1].cast<int64_t>();
+    spec.remove_batch_dim = task_tuple[2].cast<bool>();
+    spec.can_slice = task_tuple[3].cast<bool>();
+
+    spec.slice = parse_slice_tuple(task_tuple[4].cast<py::tuple>());
+
+    py::object device_obj = task_tuple[5];
+    if (!device_obj.is_none()) {
+      spec.target_device = device_obj.cast<c10::Device>();
+    }
+    return spec;
+  }
+
+  SliceSpec parse_slice_tuple(const py::tuple& slice_tuple) {
+    TORCH_CHECK(slice_tuple.size() > 0, "Slice tuple cannot be empty");
     SliceSpec spec;
-    std::string mode = slice_dict["mode"].cast<std::string>();
+    std::string mode = slice_tuple[0].cast<std::string>();
     if (mode == "identity") {
       spec.mode = SliceMode::Identity;
-    } else if (mode == "int") {
+      return spec;
+    }
+
+    if (mode == "int") {
+      TORCH_CHECK(slice_tuple.size() >= 2,
+                  "Slice tuple with mode=int must include value");
       spec.mode = SliceMode::Int;
-      spec.int_value = slice_dict["value"].cast<int64_t>();
-    } else if (mode == "slice") {
+      spec.int_value = slice_tuple[1].cast<int64_t>();
+      return spec;
+    }
+
+    if (mode == "slice") {
       spec.mode = SliceMode::Range;
-      py::object start = slice_dict["start"];
-      py::object stop = slice_dict["stop"];
-      py::object step = slice_dict["step"];
+      py::object start = slice_tuple.size() > 1 ? slice_tuple[1] : py::none();
+      py::object stop = slice_tuple.size() > 2 ? slice_tuple[2] : py::none();
+      py::object step = slice_tuple.size() > 3 ? slice_tuple[3] : py::none();
       if (!start.is_none()) {
         spec.start = start.cast<int64_t>();
       }
@@ -325,11 +363,29 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
       if (!step.is_none()) {
         spec.step = step.cast<int64_t>();
       }
-    } else if (mode == "array") {
-      spec.mode = SliceMode::Array;
-      auto indices = slice_dict["indices"].cast<std::vector<int64_t>>();
-      spec.indices = std::move(indices);
+      return spec;
     }
+
+    if (mode == "array") {
+      spec.mode = SliceMode::Array;
+      if (slice_tuple.size() > 1) {
+        py::object values_obj = slice_tuple[1];
+        if (py::isinstance<py::list>(values_obj)) {
+          spec.indices = values_obj.cast<std::vector<int64_t>>();
+        } else if (py::isinstance<py::tuple>(values_obj)) {
+          auto values_tuple = values_obj.cast<py::tuple>();
+          spec.indices.reserve(values_tuple.size());
+          for (auto item : values_tuple) {
+            spec.indices.push_back(item.cast<int64_t>());
+          }
+        } else if (!values_obj.is_none()) {
+          spec.indices.push_back(values_obj.cast<int64_t>());
+        }
+      }
+      return spec;
+    }
+
+    spec.mode = SliceMode::Identity;
     return spec;
   }
 
@@ -376,6 +432,7 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   }
 
   void process_step(StepWork&& work) {
+    auto t0 = std::chrono::steady_clock::now();
     if (work.event != nullptr) {
       C10_CUDA_CHECK(cudaStreamWaitEvent(cache_stream_.stream(), work.event, 0));
       C10_CUDA_CHECK(cudaEventDestroy(work.event));
@@ -399,6 +456,10 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
 
     // Restore previous stream
     at::cuda::setCurrentCUDAStream(prev_stream);
+
+    auto t1 = std::chrono::steady_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    stats_process_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
   }
 
   at::Tensor run_task(const TaskSpec& spec) {
@@ -522,6 +583,12 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
 
   std::thread worker_;
   std::atomic<bool> closed_{false};
+
+  // Stats ---------------------------------------------------------------
+  std::atomic<int64_t> stats_total_steps_{0};
+  std::atomic<int64_t> stats_total_tasks_{0};
+  std::atomic<int64_t> stats_submit_us_{0};
+  std::atomic<int64_t> stats_process_us_{0};
 };
 
 std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,
@@ -548,7 +615,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("future_result", &monitoring::NativeMonitoringEngine::future_result,
            py::arg("token"), py::arg("timeout") = std::optional<double>())
       .def("close", &monitoring::NativeMonitoringEngine::close)
-      .def("clear_completed_results", &monitoring::NativeMonitoringEngine::clear_completed_results);
+      .def("clear_completed_results", &monitoring::NativeMonitoringEngine::clear_completed_results)
+      .def("get_stats", &monitoring::NativeMonitoringEngine::get_stats);
 
   m.def("create_engine", &monitoring::create_engine,
         py::arg("queue_size"), py::arg("cache_dtype"), py::arg("delay_steps"));
