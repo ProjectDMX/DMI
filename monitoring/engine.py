@@ -87,6 +87,8 @@ class MonitoringEngine:
 
         # Native batch (SoA) aggregation buffers (optional)
         self._native_batch_enabled = bool(int(os.environ.get("MON_NATIVE_BATCH", "0")))
+        # Native builder (C++-side append of hooks) – strongest offload
+        self._native_builder_enabled = bool(int(os.environ.get("MON_NATIVE_BUILDER", "1")))
         self._native_batch: Dict[int, Dict[str, list]] = {}
 
         # Stats (optional) --------------------------------------------------
@@ -178,8 +180,7 @@ class MonitoringEngine:
                         self._stats_steps += 1
                         self._stats_tasks += len(spec.get("tensors", []))
                     else:
-                        backend.submit_step_oa = getattr(backend, "submit_step_soa")
-                        backend.submit_step_oa(step_id, spec, stream_handle)
+                        getattr(backend, "submit_step_soa")(step_id, spec, stream_handle)
                 else:
                     # No tasks actually aggregated; seal to maintain ordering
                     backend.seal_step(step_id, stream_handle)

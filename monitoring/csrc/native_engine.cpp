@@ -403,6 +403,39 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     stats_submit_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
   }
 
+  // Append a hook record directly from Python without pre-encoding; C++ computes
+  // pos_dim/can_slice and parses pos_slice. Tokens are generated at seal time.
+  void append_hook(int64_t step_id,
+                   const std::string& hook_name,
+                   at::Tensor tensor,
+                   bool remove_batch_dim,
+                   py::object pos_slice,
+                   py::object target_device) {
+    TaskSpec spec;
+    spec.tensor = std::move(tensor);
+    spec.remove_batch_dim = remove_batch_dim;
+    spec.slice_dim = deduce_pos_dim(hook_name);
+    spec.can_slice = (spec.slice_dim >= 0) ? (spec.tensor.dim() > spec.slice_dim)
+                                           : (spec.tensor.dim() >= -spec.slice_dim);
+    spec.slice = parse_slice_py(pos_slice);
+    if (!target_device.is_none()) {
+      spec.target_device = target_device.cast<c10::Device>();
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(staging_mutex_);
+      StepWork& work = open_steps_[step_id];
+      work.step_id = step_id;
+      TaskEntry entry;
+      entry.spec = std::move(spec);
+      // token assigned at seal time
+      entry.token = 0;
+      work.tasks.emplace_back(std::move(entry));
+    }
+    pending_tasks_.fetch_add(1, std::memory_order_relaxed);
+    stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   void resolve_all() {
     py::gil_scoped_release release;
 
@@ -541,6 +574,82 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   }
 
  private:
+  // Helpers for builder/append_hook path ------------------------------------------------
+  int64_t deduce_pos_dim(const std::string& name) {
+    auto ends_with = [](const std::string& s, const char* suf) -> bool {
+      size_t n = s.size(); size_t m = std::char_traits<char>::length(suf);
+      return n >= m && s.compare(n - m, m, suf) == 0;
+    };
+    if (ends_with(name, "hook_q") || ends_with(name, "hook_k") || ends_with(name, "hook_v") ||
+        ends_with(name, "hook_z") || ends_with(name, "hook_result")) {
+      return -3;
+    }
+    return -2;
+  }
+
+  SliceSpec parse_slice_py(py::object obj) {
+    SliceSpec spec;
+    if (obj.is_none()) {
+      spec.mode = SliceMode::Identity; return spec;
+    }
+    // int index
+    if (py::isinstance<py::int_>(obj)) {
+      spec.mode = SliceMode::Int; spec.int_value = obj.cast<int64_t>(); return spec;
+    }
+    // python slice
+    if (py::hasattr(obj, "start") && py::hasattr(obj, "stop") && py::hasattr(obj, "step")) {
+      spec.mode = SliceMode::Range;
+      py::object start = obj.attr("start");
+      py::object stop = obj.attr("stop");
+      py::object step = obj.attr("step");
+      if (!start.is_none()) spec.start = start.cast<int64_t>();
+      if (!stop.is_none()) spec.stop = stop.cast<int64_t>();
+      if (!step.is_none()) spec.step = step.cast<int64_t>();
+      return spec;
+    }
+    // list/tuple of indices
+    if (py::isinstance<py::list>(obj) || py::isinstance<py::tuple>(obj)) {
+      spec.mode = SliceMode::Array;
+      if (py::isinstance<py::list>(obj)) {
+        spec.indices = obj.cast<std::vector<int64_t>>();
+      } else {
+        auto tup = obj.cast<py::tuple>();
+        spec.indices.reserve(tup.size());
+        for (auto it : tup) spec.indices.push_back(it.cast<int64_t>());
+      }
+      return spec;
+    }
+    // transformer_lens Slice-like: has 'mode' and 'slice' attributes
+    if (py::hasattr(obj, "mode") && py::hasattr(obj, "slice")) {
+      std::string mode = obj.attr("mode").cast<std::string>();
+      py::object data = obj.attr("slice");
+      if (mode == "identity") { spec.mode = SliceMode::Identity; return spec; }
+      if (mode == "int") { spec.mode = SliceMode::Int; spec.int_value = data.cast<int64_t>(); return spec; }
+      if (mode == "slice") {
+        spec.mode = SliceMode::Range;
+        if (py::hasattr(data, "start")) {
+          py::object start = data.attr("start"); if (!start.is_none()) spec.start = start.cast<int64_t>();
+          py::object stop = data.attr("stop"); if (!stop.is_none()) spec.stop = stop.cast<int64_t>();
+          py::object step = data.attr("step"); if (!step.is_none()) spec.step = step.cast<int64_t>();
+        }
+        return spec;
+      }
+      if (mode == "array") {
+        spec.mode = SliceMode::Array;
+        if (py::isinstance<py::list>(data)) {
+          spec.indices = data.cast<std::vector<int64_t>>();
+        } else if (py::isinstance<py::tuple>(data)) {
+          auto tup = data.cast<py::tuple>();
+          spec.indices.reserve(tup.size());
+          for (auto it : tup) spec.indices.push_back(it.cast<int64_t>());
+        }
+        return spec;
+      }
+    }
+    // Fallback
+    spec.mode = SliceMode::Identity;
+    return spec;
+  }
   TaskSpec parse_task_tuple(const py::tuple& task_tuple) {
     TORCH_CHECK(task_tuple.size() == 6,
                 "Native backend expects task tuple of length 6, got ",
@@ -715,6 +824,15 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
 
     for (auto& entry : work.tasks) {
       try {
+        if (entry.token == 0) {
+          // Assign token lazily for builder/append_hook path
+          entry.token = next_token_++;
+          auto slot = std::make_shared<ResultSlot>();
+          {
+            std::lock_guard<std::mutex> lock(slots_mutex_);
+            slots_.emplace(entry.token, std::move(slot));
+          }
+        }
         at::Tensor result = run_task(entry.spec);
         store_result(entry.token, std::move(result));
       } catch (const c10::Error& err) {
@@ -886,6 +1004,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("step_id"), py::arg("task"))
       .def("seal_step", &monitoring::NativeMonitoringEngine::seal_step,
            py::arg("step_id"), py::arg("stream_handle") = std::optional<uint64_t>())
+      .def("append_hook", &monitoring::NativeMonitoringEngine::append_hook,
+           py::arg("step_id"), py::arg("hook_name"), py::arg("tensor"),
+           py::arg("remove_batch_dim"), py::arg("pos_slice"), py::arg("target_device") = py::none())
       .def("resolve_all", &monitoring::NativeMonitoringEngine::resolve_all)
       .def("future_ready", &monitoring::NativeMonitoringEngine::future_ready)
       .def("future_wait", &monitoring::NativeMonitoringEngine::future_wait,
