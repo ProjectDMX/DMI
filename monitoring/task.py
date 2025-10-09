@@ -198,3 +198,26 @@ class CacheFuture:
             except Exception:
                 # Already retrieved, timed out, or other error - that is fine
                 pass
+
+
+class BackendFuture:
+    """Lightweight future for native backend tokens (no threading.Event).
+
+    This avoids Python-side allocation overhead for the hot path where the
+    native backend manages readiness and results.
+    """
+
+    __slots__ = ("_backend", "_token")
+
+    def __init__(self, backend: Any, token: int) -> None:  # type: ignore[name-defined]
+        self._backend = backend
+        self._token = int(token)
+
+    def ready(self) -> bool:
+        return bool(self._backend.future_ready(self._token))
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        return bool(self._backend.future_wait(self._token, timeout))
+
+    def result(self, timeout: Optional[float] = None) -> torch.Tensor:
+        return self._backend.future_result(self._token, timeout)

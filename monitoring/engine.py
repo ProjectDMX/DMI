@@ -161,36 +161,47 @@ class MonitoringEngine:
             backend = self._native_backend
             if backend is None:
                 return
-            # Build tuple payloads (measure serialize cost)
-            if self._stats_enabled:
-                import time
-                _t0 = time.perf_counter()
-                task_specs = [_serialize_task(task) for task, _ in tasks]
-                self._stats_py_serialize_ms += (time.perf_counter() - _t0) * 1000.0
-                if len(tasks) > self._stats_max_tasks_per_step:
-                    self._stats_max_tasks_per_step = len(tasks)
-            else:
-                task_specs = [_serialize_task(task) for task, _ in tasks]
             stream_handle = _stream_to_handle(producer_stream)
-            if self._stats_enabled:
-                import time
-                t0 = time.perf_counter()
-                tokens = backend.submit_step(step_id, task_specs, stream_handle)
-                self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
+            if tasks:
+                # Build tuple payloads (measure serialize cost) and submit.
+                if self._stats_enabled:
+                    import time
+                    _t0 = time.perf_counter()
+                    task_specs = [_serialize_task(task) for task, _ in tasks]
+                    self._stats_py_serialize_ms += (time.perf_counter() - _t0) * 1000.0
+                    if len(tasks) > self._stats_max_tasks_per_step:
+                        self._stats_max_tasks_per_step = len(tasks)
+                else:
+                    task_specs = [_serialize_task(task) for task, _ in tasks]
+                if self._stats_enabled:
+                    import time
+                    t0 = time.perf_counter()
+                    tokens = backend.submit_step(step_id, task_specs, stream_handle)
+                    self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
+                else:
+                    tokens = backend.submit_step(step_id, task_specs, stream_handle)
+                if self._stats_enabled:
+                    import time
+                    _t1 = time.perf_counter()
+                    for token, (_, future) in zip(tokens, tasks):
+                        future.bind_backend(backend, token)
+                    self._stats_py_bind_ms += (time.perf_counter() - _t1) * 1000.0
+                else:
+                    for token, (_, future) in zip(tokens, tasks):
+                        future.bind_backend(backend, token)
+                if self._stats_enabled and tasks:
+                    self._stats_steps += 1
+                    self._stats_tasks += len(tasks)
             else:
-                tokens = backend.submit_step(step_id, task_specs, stream_handle)
-            if self._stats_enabled:
-                import time
-                _t1 = time.perf_counter()
-                for token, (_, future) in zip(tokens, tasks):
-                    future.bind_backend(backend, token)
-                self._stats_py_bind_ms += (time.perf_counter() - _t1) * 1000.0
-            else:
-                for token, (_, future) in zip(tokens, tasks):
-                    future.bind_backend(backend, token)
-            if self._stats_enabled and tasks:
-                self._stats_steps += 1
-                self._stats_tasks += len(tasks)
+                # No Python-collected tasks for this step: seal the native-built step.
+                if self._stats_enabled:
+                    import time
+                    t0 = time.perf_counter()
+                    backend.seal_step(step_id, stream_handle)
+                    self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
+                    self._stats_steps += 1
+                else:
+                    backend.seal_step(step_id, stream_handle)
             return
 
         backend = self._python_backend

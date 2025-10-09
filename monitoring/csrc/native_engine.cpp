@@ -174,6 +174,85 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     return tokens;
   }
 
+  // Add a single task to an open step (low-overhead path).
+  int64_t add_task(int64_t step_id, const py::tuple& task_tuple) {
+    TaskSpec spec = parse_task_tuple(task_tuple);
+
+    // Allocate token + result slot
+    int64_t token = next_token_++;
+    {
+      auto slot = std::make_shared<ResultSlot>();
+      std::lock_guard<std::mutex> lock(slots_mutex_);
+      slots_.emplace(token, std::move(slot));
+    }
+
+    // Append into open step
+    {
+      std::lock_guard<std::mutex> lock(staging_mutex_);
+      StepWork& work = open_steps_[step_id];
+      work.step_id = step_id;
+
+      TaskEntry entry;
+      entry.spec = std::move(spec);
+      entry.token = token;
+      work.tasks.emplace_back(std::move(entry));
+    }
+
+    pending_tasks_.fetch_add(1, std::memory_order_relaxed);
+    return token;
+  }
+
+  // Seal an open step and dispatch according to delay policy.
+  void seal_step(int64_t step_id, std::optional<uint64_t> stream_handle) {
+    StepWork work;
+    bool has_work = false;
+    {
+      std::lock_guard<std::mutex> lock(staging_mutex_);
+      auto it = open_steps_.find(step_id);
+      if (it != open_steps_.end()) {
+        work = std::move(it->second);
+        open_steps_.erase(it);
+        has_work = true;
+      }
+    }
+
+    if (!has_work) {
+      // No tasks were added for this step. If a stream is provided, just sync an event to
+      // maintain ordering guarantees, then return.
+      if (stream_handle.has_value()) {
+        cudaEvent_t event;
+        C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        cudaStream_t stream = reinterpret_cast<cudaStream_t>(*stream_handle);
+        C10_CUDA_CHECK(cudaEventRecord(event, stream));
+        C10_CUDA_CHECK(cudaEventSynchronize(event));
+        C10_CUDA_CHECK(cudaEventDestroy(event));
+      }
+      return;
+    }
+
+    if (stream_handle.has_value()) {
+      cudaEvent_t event;
+      C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+      cudaStream_t stream = reinterpret_cast<cudaStream_t>(*stream_handle);
+      C10_CUDA_CHECK(cudaEventRecord(event, stream));
+      work.event = event;
+    }
+
+    std::vector<StepWork> ready;
+    {
+      std::lock_guard<std::mutex> lock(staging_mutex_);
+      sealed_steps_.emplace_back(std::move(work));
+      while (static_cast<int64_t>(sealed_steps_.size()) > delay_steps_) {
+        ready.emplace_back(std::move(sealed_steps_.front()));
+        sealed_steps_.pop_front();
+      }
+    }
+
+    for (auto& item : ready) {
+      dispatch_step(std::move(item));
+    }
+  }
+
   void resolve_all() {
     py::gil_scoped_release release;
 
@@ -560,6 +639,8 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   }
 
   std::mutex staging_mutex_;
+  // Open steps being built via add_task before they are sealed.
+  std::unordered_map<int64_t, StepWork> open_steps_;
   std::deque<StepWork> sealed_steps_;
 
   std::mutex queue_mutex_;
@@ -608,6 +689,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                                                                                      "NativeMonitoringEngine")
       .def("submit_step", &monitoring::NativeMonitoringEngine::submit_step,
            py::arg("step_id"), py::arg("tasks"), py::arg("stream_handle") = std::optional<uint64_t>())
+      .def("add_task", &monitoring::NativeMonitoringEngine::add_task,
+           py::arg("step_id"), py::arg("task"))
+      .def("seal_step", &monitoring::NativeMonitoringEngine::seal_step,
+           py::arg("step_id"), py::arg("stream_handle") = std::optional<uint64_t>())
       .def("resolve_all", &monitoring::NativeMonitoringEngine::resolve_all)
       .def("future_ready", &monitoring::NativeMonitoringEngine::future_ready)
       .def("future_wait", &monitoring::NativeMonitoringEngine::future_wait,
