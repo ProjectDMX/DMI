@@ -117,6 +117,65 @@ def _encode_slice(slice_obj: Any) -> SlicePayload:
     return ("identity",)
 
 
+def _encode_slice_native(slice_obj: Any) -> SlicePayload:
+    """Fast int-coded slice encoding for native backend.
+
+    Codes: 0=identity, 1=int, 2=slice, 3=array
+    """
+    if slice_obj is None:
+        if _SLICE_STATS_ENABLED:
+            _slice_stats["identity"] += 1
+        return (0,)
+
+    if Slice is not None and isinstance(slice_obj, Slice):  # pragma: no cover
+        mode = getattr(slice_obj, "mode", "identity")
+        data = getattr(slice_obj, "slice", None)
+        if mode == "identity":
+            if _SLICE_STATS_ENABLED:
+                _slice_stats["identity"] += 1
+            return (0,)
+        if mode == "int":
+            if _SLICE_STATS_ENABLED:
+                _slice_stats["int"] += 1
+            return (1, int(data) if data is not None else 0)
+        if mode == "slice":
+            if isinstance(data, slice):
+                if _SLICE_STATS_ENABLED:
+                    _slice_stats["slice"] += 1
+                return (2, data.start, data.stop, data.step)
+            return (2, None, None, None)
+        if mode == "array":
+            if _SLICE_STATS_ENABLED:
+                _slice_stats["array"] += 1
+            if data is None:
+                values: Tuple[int, ...] = ()
+            elif hasattr(data, "tolist"):
+                values = tuple(int(v) for v in data.tolist())
+            else:
+                values = tuple(int(v) for v in data)
+            return (3, values)
+        if _SLICE_STATS_ENABLED:
+            _slice_stats["identity"] += 1
+        return (0,)
+
+    t = type(slice_obj)
+    if t is int:
+        if _SLICE_STATS_ENABLED:
+            _slice_stats["int"] += 1
+        return (1, int(slice_obj))
+    if t is slice:
+        if _SLICE_STATS_ENABLED:
+            _slice_stats["slice"] += 1
+        return (2, slice_obj.start, slice_obj.stop, slice_obj.step)
+    if t in (list, tuple):
+        if _SLICE_STATS_ENABLED:
+            _slice_stats["array"] += 1
+        return (3, tuple(int(v) for v in slice_obj))
+    if _SLICE_STATS_ENABLED:
+        _slice_stats["identity"] += 1
+    return (0,)
+
+
 class CacheFuture:
     """Future wrapper that supports Python fallback and native backends."""
 

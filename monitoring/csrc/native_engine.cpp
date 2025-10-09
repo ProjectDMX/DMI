@@ -174,8 +174,149 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     return tokens;
   }
 
+  // Submit a step using struct-of-arrays spec to minimize Python overhead.
+  std::vector<int64_t> submit_step_soa(int64_t step_id,
+                                       const py::dict& spec,
+                                       std::optional<uint64_t> stream_handle) {
+    auto t0 = std::chrono::steady_clock::now();
+    StepWork work;
+    work.step_id = step_id;
+
+    // Required fields
+    auto tensors = spec["tensors"].cast<py::list>();
+    auto slice_dims = spec["slice_dims"].cast<py::list>();
+    auto remove_batch = spec["remove_batch"].cast<py::list>();
+    auto can_slice = spec["can_slice"].cast<py::list>();
+    auto slice_modes = spec["slice_modes"].cast<py::list>();
+
+    // Optional fields
+    py::list int_values, slice_starts, slice_stops, slice_steps, indices, target_devices;
+    if (spec.contains("int_values")) int_values = spec["int_values"].cast<py::list>();
+    if (spec.contains("slice_starts")) slice_starts = spec["slice_starts"].cast<py::list>();
+    if (spec.contains("slice_stops")) slice_stops = spec["slice_stops"].cast<py::list>();
+    if (spec.contains("slice_steps")) slice_steps = spec["slice_steps"].cast<py::list>();
+    if (spec.contains("indices")) indices = spec["indices"].cast<py::list>();
+    if (spec.contains("target_devices")) target_devices = spec["target_devices"].cast<py::list>();
+
+    size_t n = tensors.size();
+    TORCH_CHECK(slice_dims.size() == n && remove_batch.size() == n && can_slice.size() == n && slice_modes.size() == n,
+                "submit_step_soa: mismatched list sizes");
+
+    std::vector<int64_t> tokens;
+    tokens.reserve(n);
+    work.tasks.reserve(n);
+
+    for (size_t i = 0; i < n; ++i) {
+      TaskSpec ts;
+      ts.tensor = tensors[i].cast<at::Tensor>();
+      ts.slice_dim = slice_dims[i].cast<int64_t>();
+      ts.remove_batch_dim = remove_batch[i].cast<bool>();
+      ts.can_slice = can_slice[i].cast<bool>();
+
+      int mode = slice_modes[i].cast<int>();
+      switch (mode) {
+        case 0: // identity
+          ts.slice.mode = SliceMode::Identity; break;
+        case 1: // int
+          ts.slice.mode = SliceMode::Int;
+          if (int_values && int_values.size() == n) ts.slice.int_value = int_values[i].cast<int64_t>();
+          break;
+        case 2: { // slice
+          ts.slice.mode = SliceMode::Range;
+          if (slice_starts && slice_starts.size() == n) {
+            py::object o = slice_starts[i]; if (!o.is_none()) ts.slice.start = o.cast<int64_t>();
+          }
+          if (slice_stops && slice_stops.size() == n) {
+            py::object o = slice_stops[i]; if (!o.is_none()) ts.slice.stop = o.cast<int64_t>();
+          }
+          if (slice_steps && slice_steps.size() == n) {
+            py::object o = slice_steps[i]; if (!o.is_none()) ts.slice.step = o.cast<int64_t>();
+          }
+          break;
+        }
+        case 3: { // array
+          ts.slice.mode = SliceMode::Array;
+          if (indices && indices.size() == n) {
+            py::object obj = indices[i];
+            if (py::isinstance<py::tuple>(obj)) {
+              auto tup = obj.cast<py::tuple>();
+              ts.slice.indices.reserve(tup.size());
+              for (auto it : tup) ts.slice.indices.push_back(it.cast<int64_t>());
+            } else if (py::isinstance<py::list>(obj)) {
+              ts.slice.indices = obj.cast<std::vector<int64_t>>();
+            }
+          }
+          break;
+        }
+        default:
+          ts.slice.mode = SliceMode::Identity; break;
+      }
+
+      if (target_devices && target_devices.size() == n) {
+        py::object dev = target_devices[i];
+        if (!dev.is_none()) ts.target_device = dev.cast<c10::Device>();
+      }
+
+      int64_t token = next_token_++;
+      tokens.push_back(token);
+
+      auto slot = std::make_shared<ResultSlot>();
+      {
+        std::lock_guard<std::mutex> lock(slots_mutex_);
+        slots_.emplace(token, std::move(slot));
+      }
+
+      TaskEntry entry; entry.spec = std::move(ts); entry.token = token;
+      work.tasks.emplace_back(std::move(entry));
+    }
+
+    if (work.tasks.empty()) {
+      if (stream_handle.has_value()) {
+        cudaEvent_t event;
+        C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        cudaStream_t stream = reinterpret_cast<cudaStream_t>(*stream_handle);
+        C10_CUDA_CHECK(cudaEventRecord(event, stream));
+        C10_CUDA_CHECK(cudaEventSynchronize(event));
+        C10_CUDA_CHECK(cudaEventDestroy(event));
+      }
+      return tokens;
+    }
+
+    if (stream_handle.has_value()) {
+      cudaEvent_t event;
+      C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+      cudaStream_t stream = reinterpret_cast<cudaStream_t>(*stream_handle);
+      C10_CUDA_CHECK(cudaEventRecord(event, stream));
+      work.event = event;
+    }
+
+    py::gil_scoped_release release;
+
+    pending_tasks_.fetch_add(static_cast<int64_t>(work.tasks.size()), std::memory_order_relaxed);
+
+    std::vector<StepWork> ready;
+    {
+      std::lock_guard<std::mutex> lock(staging_mutex_);
+      sealed_steps_.emplace_back(std::move(work));
+      while (static_cast<int64_t>(sealed_steps_.size()) > delay_steps_) {
+        ready.emplace_back(std::move(sealed_steps_.front()));
+        sealed_steps_.pop_front();
+      }
+    }
+
+    for (auto& item : ready) dispatch_step(std::move(item));
+
+    auto t1 = std::chrono::steady_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    stats_total_steps_.fetch_add(1, std::memory_order_relaxed);
+    stats_total_tasks_.fetch_add(static_cast<int64_t>(n), std::memory_order_relaxed);
+    stats_submit_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
+    return tokens;
+  }
+
   // Add a single task to an open step (low-overhead path).
   int64_t add_task(int64_t step_id, const py::tuple& task_tuple) {
+    auto t_add0 = std::chrono::steady_clock::now();
     TaskSpec spec = parse_task_tuple(task_tuple);
 
     // Allocate token + result slot
@@ -199,11 +340,16 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     }
 
     pending_tasks_.fetch_add(1, std::memory_order_relaxed);
+    stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
+    auto t_add1 = std::chrono::steady_clock::now();
+    auto us_add = std::chrono::duration_cast<std::chrono::microseconds>(t_add1 - t_add0).count();
+    stats_submit_us_.fetch_add(static_cast<int64_t>(us_add), std::memory_order_relaxed);
     return token;
   }
 
   // Seal an open step and dispatch according to delay policy.
   void seal_step(int64_t step_id, std::optional<uint64_t> stream_handle) {
+    auto t0 = std::chrono::steady_clock::now();
     StepWork work;
     bool has_work = false;
     {
@@ -251,6 +397,10 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     for (auto& item : ready) {
       dispatch_step(std::move(item));
     }
+    stats_total_steps_.fetch_add(1, std::memory_order_relaxed);
+    auto t1 = std::chrono::steady_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    stats_submit_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
   }
 
   void resolve_all() {
@@ -414,6 +564,47 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   SliceSpec parse_slice_tuple(const py::tuple& slice_tuple) {
     TORCH_CHECK(slice_tuple.size() > 0, "Slice tuple cannot be empty");
     SliceSpec spec;
+    // Support fast int-coded modes: 0=identity, 1=int, 2=slice, 3=array
+    if (py::isinstance<py::int_>(slice_tuple[0])) {
+      int mode_code = slice_tuple[0].cast<int>();
+      switch (mode_code) {
+        case 0: // identity
+          spec.mode = SliceMode::Identity;
+          return spec;
+        case 1: // int
+          TORCH_CHECK(slice_tuple.size() >= 2, "Slice int mode needs value");
+          spec.mode = SliceMode::Int;
+          spec.int_value = slice_tuple[1].cast<int64_t>();
+          return spec;
+        case 2: { // slice
+          spec.mode = SliceMode::Range;
+          py::object start = slice_tuple.size() > 1 ? slice_tuple[1] : py::none();
+          py::object stop = slice_tuple.size() > 2 ? slice_tuple[2] : py::none();
+          py::object step = slice_tuple.size() > 3 ? slice_tuple[3] : py::none();
+          if (!start.is_none()) spec.start = start.cast<int64_t>();
+          if (!stop.is_none()) spec.stop = stop.cast<int64_t>();
+          if (!step.is_none()) spec.step = step.cast<int64_t>();
+          return spec;
+        }
+        case 3: { // array
+          spec.mode = SliceMode::Array;
+          if (slice_tuple.size() > 1) {
+            py::object values_obj = slice_tuple[1];
+            if (py::isinstance<py::tuple>(values_obj)) {
+              auto values_tuple = values_obj.cast<py::tuple>();
+              spec.indices.reserve(values_tuple.size());
+              for (auto item : values_tuple) spec.indices.push_back(item.cast<int64_t>());
+            } else if (py::isinstance<py::list>(values_obj)) {
+              spec.indices = values_obj.cast<std::vector<int64_t>>();
+            }
+          }
+          return spec;
+        }
+        default:
+          break;
+      }
+    }
+    // Fallback: string-coded modes
     std::string mode = slice_tuple[0].cast<std::string>();
     if (mode == "identity") {
       spec.mode = SliceMode::Identity;
@@ -689,6 +880,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                                                                                      "NativeMonitoringEngine")
       .def("submit_step", &monitoring::NativeMonitoringEngine::submit_step,
            py::arg("step_id"), py::arg("tasks"), py::arg("stream_handle") = std::optional<uint64_t>())
+      .def("submit_step_soa", &monitoring::NativeMonitoringEngine::submit_step_soa,
+           py::arg("step_id"), py::arg("spec"), py::arg("stream_handle") = std::optional<uint64_t>())
       .def("add_task", &monitoring::NativeMonitoringEngine::add_task,
            py::arg("step_id"), py::arg("task"))
       .def("seal_step", &monitoring::NativeMonitoringEngine::seal_step,

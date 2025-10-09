@@ -85,6 +85,10 @@ class MonitoringEngine:
                 self._backend = python_backend
                 self._python_backend = python_backend
 
+        # Native batch (SoA) aggregation buffers (optional)
+        self._native_batch_enabled = bool(int(os.environ.get("MON_NATIVE_BATCH", "0")))
+        self._native_batch: Dict[int, Dict[str, list]] = {}
+
         # Stats (optional) --------------------------------------------------
         self._stats_enabled = bool(int(os.environ.get("MON_ENGINE_STATS", "0")))
         self._stats_hooks = 0
@@ -162,6 +166,25 @@ class MonitoringEngine:
             if backend is None:
                 return
             stream_handle = _stream_to_handle(producer_stream)
+            # Prefer native batch (SoA) if enabled and we have aggregated specs
+            if self._native_batch_enabled and step_id in self._native_batch:
+                spec = self._native_batch.pop(step_id, {})
+                if spec.get("tensors"):
+                    if self._stats_enabled:
+                        import time
+                        t0 = time.perf_counter()
+                        _ = backend.submit_step_soa(step_id, spec, stream_handle)
+                        self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
+                        self._stats_steps += 1
+                        self._stats_tasks += len(spec.get("tensors", []))
+                    else:
+                        backend.submit_step_oa = getattr(backend, "submit_step_soa")
+                        backend.submit_step_oa(step_id, spec, stream_handle)
+                else:
+                    # No tasks actually aggregated; seal to maintain ordering
+                    backend.seal_step(step_id, stream_handle)
+                return
+
             if tasks:
                 # Build tuple payloads (measure serialize cost) and submit.
                 if self._stats_enabled:
