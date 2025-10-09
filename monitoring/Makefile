@@ -1,0 +1,61 @@
+PYTHON ?= python
+CXX ?= g++
+
+TARGET := monitoring_native_backend
+SRC := csrc/native_engine.cpp
+BUILD_DIR := build
+OBJ := $(BUILD_DIR)/native_engine.o
+PROJECT_ROOT := $(abspath $(CURDIR)/..)
+
+EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+TARGET_SO := $(TARGET)$(EXT_SUFFIX)
+LOCAL_TARGET := $(CURDIR)/$(TARGET_SO)
+FINAL_TARGET := $(PROJECT_ROOT)/$(TARGET_SO)
+
+TORCH_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join(f'-I{path}' for path in include_paths()))")
+
+PYTHON_INCLUDE_FLAGS := $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); includes = {paths.get('include'), paths.get('platinclude')}; print(' '.join(f'-I{p}' for p in includes if p))")
+
+CUDA_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; cuda_inc = os.path.join(CUDA_HOME, 'include') if CUDA_HOME else ''; print(f'-I{cuda_inc}' if cuda_inc and os.path.exists(cuda_inc) else '')")
+
+TORCH_LIB_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join(f'-L{path}' for path in library_paths()))")
+
+TORCH_RPATH_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join(f'-Wl,-rpath,{path}' for path in library_paths()))")
+
+CUDA_LIB_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; print(next((f'-L{os.path.join(CUDA_HOME, c)}' for c in ('lib64','lib') if CUDA_HOME and os.path.exists(os.path.join(CUDA_HOME, c))), ''))")
+
+CUDA_RPATH_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; print(next((f'-Wl,-rpath,{os.path.join(CUDA_HOME, c)}' for c in ('lib64','lib') if CUDA_HOME and os.path.exists(os.path.join(CUDA_HOME, c))), ''))")
+
+ABI_FLAG := $(shell $(PYTHON) -c "import torch; print(f'-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}')")
+
+# Pybind11 ABI flags
+PYBIND_FLAGS := $(shell $(PYTHON) -c "import pybind11; print(' '.join([f'-DPYBIND11_COMPILER_TYPE=\\\"{pybind11.get_compiler_type()}\\\"', f'-DPYBIND11_STDLIB=\\\"{pybind11.get_stdlib()}\\\"', f'-DPYBIND11_BUILD_ABI=\\\"{pybind11.get_build_abi()}\\\"']))" 2>/dev/null || echo "")
+
+# Note: MON_DEBUG is now checked at RUNTIME via std::getenv(), not at compile time
+# No need for compile-time -DMON_DEBUG flag
+
+CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
+            -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=$(TARGET) \
+            $(ABI_FLAG) $(PYBIND_FLAGS) \
+            $(TORCH_INCLUDE_FLAGS) $(PYTHON_INCLUDE_FLAGS) $(CUDA_INCLUDE_FLAGS) -Icsrc
+
+LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPATH_FLAGS) \
+           -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -lcudart -lpthread
+
+.PHONY: all build clean
+
+all: $(FINAL_TARGET)
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(OBJ): $(SRC) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(FINAL_TARGET): $(OBJ)
+	$(CXX) -shared $^ -o $(BUILD_DIR)/$(TARGET_SO) $(LDFLAGS)
+	cp $(BUILD_DIR)/$(TARGET_SO) $(LOCAL_TARGET)
+	cp $(BUILD_DIR)/$(TARGET_SO) $(FINAL_TARGET)
+
+clean:
+	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET)

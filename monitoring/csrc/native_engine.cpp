@@ -240,6 +240,37 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     return tensor;
   }
 
+  void clear_completed_results() {
+    std::vector<int64_t> tokens;
+    std::vector<std::shared_ptr<ResultSlot>> slot_refs;
+    {
+      std::lock_guard<std::mutex> lock(slots_mutex_);
+      tokens.reserve(slots_.size());
+      slot_refs.reserve(slots_.size());
+      for (const auto& kv : slots_) {
+        tokens.push_back(kv.first);
+        slot_refs.push_back(kv.second);
+      }
+    }
+
+    std::vector<int64_t> ready_tokens;
+    ready_tokens.reserve(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+      auto& slot = slot_refs[i];
+      std::lock_guard<std::mutex> slot_lock(slot->mutex);
+      if (slot->ready) {
+        ready_tokens.push_back(tokens[i]);
+      }
+    }
+
+    if (!ready_tokens.empty()) {
+      std::lock_guard<std::mutex> lock(slots_mutex_);
+      for (int64_t token : ready_tokens) {
+        slots_.erase(token);
+      }
+    }
+  }
+
   void close() {
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true)) {
@@ -516,7 +547,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("token"), py::arg("timeout") = std::optional<double>())
       .def("future_result", &monitoring::NativeMonitoringEngine::future_result,
            py::arg("token"), py::arg("timeout") = std::optional<double>())
-      .def("close", &monitoring::NativeMonitoringEngine::close);
+      .def("close", &monitoring::NativeMonitoringEngine::close)
+      .def("clear_completed_results", &monitoring::NativeMonitoringEngine::clear_completed_results);
 
   m.def("create_engine", &monitoring::create_engine,
         py::arg("queue_size"), py::arg("cache_dtype"), py::arg("delay_steps"));

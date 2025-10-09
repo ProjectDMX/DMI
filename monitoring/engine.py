@@ -230,6 +230,7 @@ class MonitoringEngine:
                     for token, (_, future) in zip(tokens, tasks):
                         future.bind_backend(backend, token)
             backend.resolve_all()
+            self.clear_completed_results()
             return
 
         backend = self._python_backend
@@ -248,6 +249,7 @@ class MonitoringEngine:
             backend = self._native_backend
             if backend is None:
                 return
+            self.clear_completed_results()
             backend.close()
             self._native_backend = None
             self._backend = None
@@ -259,6 +261,12 @@ class MonitoringEngine:
         backend.close()
         self._python_backend = None
         self._backend = None
+
+    def clear_completed_results(self) -> None:
+        """Clear completed results held by native backend to free memory."""
+
+        if self._using_native_backend and self._native_backend is not None:
+            self._native_backend.clear_completed_results()
 
     # ------------------------------------------------------------------
     # Internal helpers
