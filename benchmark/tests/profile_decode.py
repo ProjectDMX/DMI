@@ -1030,6 +1030,17 @@ def main() -> None:
     if args.nvtx and device.type == "cuda":
         print("NVTX annotations enabled for TransformerLens decode hooks (set TL_ENABLE_NVTX=1).")
 
+    # If engine stats are enabled, also print hook-side stats even for sync baselines.
+    try:
+        import os as _os
+        if bool(int(_os.environ.get("MON_ENGINE_STATS", "0"))):
+            from transformers.models.gpt2_p.hook_points import get_monitoring_hook_stats  # type: ignore
+            _hook_stats = get_monitoring_hook_stats()
+            if _hook_stats:
+                print("[Hook/Stats]", _hook_stats)
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     main()
