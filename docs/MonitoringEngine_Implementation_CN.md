@@ -40,11 +40,48 @@
     - `slots_`：`token → ResultSlot`；
     - 计数与统计：`pending_tasks_`、`next_token_`、`stats_*`。
 
-## 执行流（三种原生路径 + Python 回退）
+## 执行流（四种路径：Native Callback + 三种原生路径 + Python 回退）
 
 记号：S 表示 `start_step()`，E 表示 `end_step()`；`stream` 为当前生产者流（PyTorch 当前 CUDA 流）。
 
-### A. 完全后端化（默认）
+### A. Native Callback（推荐，最优性能）
+
+**环境变量**: `MON_NATIVE_CALLBACK=1`（启用）
+
+1) **注册阶段**（模型初始化时）：
+   - 调用 `create_hook_callback(hook_name, remove_batch, pos_slice, device)` 返回 C++ lambda；
+   - 将 C++ lambda 注册给 PyTorch：`hook_point.register_forward_hook(cpp_function)`；
+   - `HookConfig` 预分配并缓存在 `hook_configs_[hook_name]`。
+
+2) S：引擎调用 `begin_step(step_id)` 更新 `current_step_id_` 原子变量。
+
+3) **每次前向时**（94k 次回调）：
+   - PyTorch 直接调用 C++ lambda（无 Python 解释器开销）；
+   - C++ lambda 执行：
+     ```cpp
+     {
+         py::gil_scoped_release release;  // 释放 GIL
+         if (tensor.requires_grad()) tensor = tensor.detach();
+         engine->append_hook_current_step(*cfg_ptr, std::move(tensor));
+     }
+     ```
+   - `append_hook_current_step()` 读取 `current_step_id_`，直接追加到 `open_steps_[step_id]`；
+   - 仅 `pending_tasks_++`，不分配 token/slot。
+
+4) E：调用 `seal_step(step_id, stream_handle)`：
+   - 从 `open_steps_` 取出 `StepWork`，记录 CUDA event；
+   - 步入 `sealed_steps_`，按 delay 策略触发分发；
+   - 工作线程处理时懒分配 token/slot → `run_task()` → `store_result()`。
+
+**性能特点**：
+- ✅ 消除 94k 次 Python→C++ 边界跨越
+- ✅ GIL 释放，CUDA 操作与主线程并行
+- ✅ HookConfig 预分配，零重复解析
+- ✅ 当前最快实现：0.8s（vs baseline 0.42s）
+
+---
+
+### B. 完全后端化构建器（MON_NATIVE_BUILDER=1）
 
 1) S：引擎仅推进 `step_id`。
 2) 每个 Hook：调用 `append_hook(step_id, hook_name, tensor, remove_batch, pos_slice, device)`：
@@ -55,19 +92,19 @@
    - 步入 `sealed_steps_`，按 delay 策略触发分发；
    - 工作线程处理 `StepWork` 时，懒分配 token/slot → `run_task(TaskSpec)` → `store_result(token, tensor)`。
 
-### B. SoA 批量
+### C. SoA 批量（MON_NATIVE_BATCH=1）
 
 1) S：推进 `step_id`；
 2) 每个 Hook：将 `tensor/flags/slice_mode(idx)/indices 等` 追加到 Python 端 SoA 列容器；
 3) E：调用 `submit_step_soa(step_id, spec_dict, stream_handle)`，一次性构造 `StepWork`，创建所有 slot/token 并分发；
 4) 工作线程按 `TaskSpec` 处理。
 
-### C. 快路径追加（每 hook 一次 add_task）
+### D. 快路径追加（每 hook 一次 add_task）
 
 1) 每个 Hook：`add_task(step_id, tuple)`，返回 token 并立即创建 slot；
 2) E：`seal_step(step_id, stream_handle)` 分发。
 
-### D. 纯 Python 回退
+### E. 纯 Python 回退
 
 1) 每个 Hook：构造 `MonitoringTask`，`engine.submit(task)` 收集到桶中；
 2) E：构建 tuple payload 列表并调用原生 `submit_step`；
@@ -95,25 +132,59 @@
 ## 统计与可观测性
 
 - Python（`engine.py`）：`py_serialize_ms/py_submit_ms/py_bind_ms/py_resolve_ms/max_tasks_per_step`；
-- 原生（`get_stats`）：`total_steps/total_tasks/submit_us/process_us`；
+- 原生（`get_stats`）：`total_steps/total_tasks/submit_us/process_us/callback_us`；
+  - **新增 `callback_us`**：Native Callback 路径的回调总耗时（包含 GIL 释放的 C++ 执行时间）；
 - Hook（`hook_points.py`）：`build_us/submit_us/cache_set_us` 与同步路径的 `sync_*`；
-- 基准脚本（`benchmark/tests/profile_decode.py`）：在 `MON_ENGINE_STATS=1` 时，无论同步/异步都会打印 `[Hook/Stats]`。
+- 基准脚本（`benchmark/tests/profile_decode.py`）：在 `MON_ENGINE_STATS=1` 时，无论同步/异步都会打印 `[Hook/Stats]` 和 `[Native/Stats]`。
 
 ## 性能画像（当前 BS=64, decode_steps=64, 收集 hidden/attn）
 
-- 同步（`hf_modified_hook`）：主时钟 1.05–1.10s；
-- 异步（add_task 快路径）：约 1.07s；
-- 异步（SoA 批量）：约 1.01–1.03s；
-- 异步（完全后端化构建器）：约 0.97–1.02s；
+- **Baseline（无 hook）**：0.42s
+- **同步（`hf_modified_hook`）**：1.05–1.10s (+154%)
+- **异步优化历程**：
+  - 初始异步：1.53s (+264%)
+  - add_task 快路径：1.07s (+155%)
+  - SoA 批量：1.01–1.03s (+140-145%)
+  - 完全后端化构建器：0.97–1.02s (+131-143%)
+  - **Native Callback（当前）**：**0.8s (+90%)** ✨
 
-主要剩余开销：Hook 回调本身的 Python 调度与极少量参数准备（`build_us≈90–110ms`）。提交/解析/后台处理已降至几十毫秒总量级。
+**剩余 0.38s (48%) 差距主要来源**：
+- PyTorch Hook 调度（框架级）：30-50ms
+- Tensor 引用计数与内存管理：20-30ms
+- GPU 带宽竞争（前向+抓取）：100-150ms
+- CUDA 流切换与同步：20-30ms
+- 其他（调度/GC/等）：50-100ms
+
+Native Callback 已将回调开销从 `build_us≈107ms` 降至 `callback_us≈8ms`（**13x 提升**）。进一步优化需要架构级重构（批量 hook、双 GPU 等）。
 
 ## 已知取舍与后续工作
 
-- Hook 回调仍在 Python 中触发（PyTorch 框架级）。要进一步压缩 `build_us`：
-  - 减少 Hook 点数量或按层聚合（线性收益）；
-  - 将 Hook 回调本身替换为原生回调（pybind 注册的原生函数），由 C++ 直接聚合（需要在 TL Hook 注册处做更深入改动）；
-  - 将 SoA `indices` 改为 LongTensor（减少 pybind 小对象）；
+### 已完成 ✅
+- ✅ **Native Callback**：Hook 回调完全在 C++ 执行，消除 Python→C++ 边界（0.8s）
+- ✅ **GIL 释放**：CUDA 操作不持有 GIL，与主线程并行
+- ✅ **HookConfig 预分配**：零重复解析开销
 
-- 已提供稳定的三条原生路径，建议默认 `MON_NATIVE_BUILDER=1`；遇到问题可切到 `MON_NATIVE_BATCH=1` 的 SoA 批量或 `add_task + seal_step` 的快路径。
+### 未来优化方向
+
+#### 优先级 1: 批量 Hook 聚合
+- **目标**：减少 PyTorch hook 调用次数从 94k → 几百次
+- **方法**：每层一个聚合 hook，而非每个 tensor 一个 hook
+- **预期收益**：30-50ms → 5-10ms
+
+#### 优先级 2: 双 GPU 异步采集
+- **目标**：消除 GPU 带宽竞争（100-150ms）
+- **方法**：GPU 0 纯前向，GPU 1 异步抓取（NVLink 传输）
+- **预期收益**：接近 baseline (0.42s)
+
+#### 优先级 3: 流式处理（减少内存占用）
+- **目标**：避免保存完整 tensor，降低 OOM 风险
+- **方法**：立即计算统计量，只保存标量结果
+- **收益**：降低峰值内存占用
+
+### 路径选择建议
+- **推荐**：`MON_NATIVE_CALLBACK=1`（默认，最优性能）
+- **备选**：`MON_NATIVE_BUILDER=1`（完全后端化构建器）
+- **调试**：`MON_NATIVE_BATCH=1`（SoA 批量）或 `add_task + seal_step`（快路径）
+
+**详细文档**：参见 `docs/Native_Callback_Implementation_CN.md`
 
