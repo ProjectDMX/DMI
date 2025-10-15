@@ -59,6 +59,14 @@ struct StepWork {
   cudaEvent_t event{nullptr};
 };
 
+struct HookConfig {
+  std::string name;
+  int64_t pos_dim{-2};
+  bool remove_batch_dim{false};
+  SliceSpec slice;
+  std::optional<c10::Device> target_device;
+};
+
 struct ResultSlot {
   std::mutex mutex;
   std::condition_variable cv;
@@ -91,6 +99,7 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     d["total_tasks"] = stats_total_tasks_.load(std::memory_order_relaxed);
     d["submit_us"] = stats_submit_us_.load(std::memory_order_relaxed);
     d["process_us"] = stats_process_us_.load(std::memory_order_relaxed);
+    d["callback_us"] = stats_callback_us_.load(std::memory_order_relaxed);
     return d;
   }
 
@@ -172,6 +181,14 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     stats_submit_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
     return tokens;
+  }
+
+  void begin_step(int64_t step_id) {
+    current_step_id_.store(step_id, std::memory_order_release);
+  }
+
+  void record_callback_duration(int64_t us) {
+    stats_callback_us_.fetch_add(us, std::memory_order_relaxed);
   }
 
   // Submit a step using struct-of-arrays spec to minimize Python overhead.
@@ -403,6 +420,54 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     stats_submit_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
   }
 
+  py::object create_hook_callback(const std::string& hook_name,
+                                  bool remove_batch_dim,
+                                  py::object pos_slice,
+                                  py::object target_device) {
+    auto config = std::make_unique<HookConfig>();
+    config->name = hook_name;
+    config->pos_dim = deduce_pos_dim(hook_name);
+    config->remove_batch_dim = remove_batch_dim;
+    config->slice = parse_slice_py(std::move(pos_slice));
+    if (!target_device.is_none()) {
+      config->target_device = target_device.cast<c10::Device>();
+    } else {
+      config->target_device.reset();
+    }
+
+    HookConfig* cfg_ptr = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(hook_config_mutex_);
+      auto& entry = hook_configs_[hook_name];
+      if (!entry) {
+        entry = std::make_unique<HookConfig>();
+      }
+      *entry = std::move(*config);
+      cfg_ptr = entry.get();
+    }
+
+    auto engine = shared_from_this();
+    return py::cpp_function(
+        [engine, cfg_ptr](py::args args, py::kwargs /*kwargs*/) -> py::object {
+          if (args.size() == 0) {
+            throw std::runtime_error("Native callback expected tensor argument");
+          }
+          at::Tensor tensor = args[0].cast<at::Tensor>();
+          auto t0 = std::chrono::steady_clock::now();
+          {
+            py::gil_scoped_release release;
+            if (tensor.requires_grad()) {
+              tensor = tensor.detach();
+            }
+            engine->append_hook_current_step(*cfg_ptr, std::move(tensor));
+          }
+          auto t1 = std::chrono::steady_clock::now();
+          auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+          engine->record_callback_duration(us);
+          return py::none();
+        });
+  }
+
   // Append a hook record directly from Python without pre-encoding; C++ computes
   // pos_dim/can_slice and parses pos_slice. Tokens are generated at seal time.
   void append_hook(int64_t step_id,
@@ -574,6 +639,37 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   }
 
  private:
+  void append_hook_current_step(const HookConfig& cfg, at::Tensor tensor) {
+    TaskSpec spec;
+    spec.tensor = std::move(tensor);
+    spec.slice_dim = cfg.pos_dim;
+    spec.remove_batch_dim = cfg.remove_batch_dim;
+    spec.slice = cfg.slice;
+    spec.target_device = cfg.target_device;
+
+    int64_t dim = spec.slice_dim;
+    int64_t tensor_dims = spec.tensor.dim();
+    bool can_slice = true;
+    if (dim >= 0) {
+      can_slice = tensor_dims > dim;
+    } else {
+      can_slice = tensor_dims >= -dim;
+    }
+    spec.can_slice = can_slice;
+
+    int64_t step_id = current_step_id_.load(std::memory_order_acquire);
+
+    std::lock_guard<std::mutex> lock(staging_mutex_);
+    StepWork& work = open_steps_[step_id];
+    work.step_id = step_id;
+    TaskEntry entry;
+    entry.spec = std::move(spec);
+    entry.token = 0;
+    work.tasks.emplace_back(std::move(entry));
+    pending_tasks_.fetch_add(1, std::memory_order_relaxed);
+    stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   // Helpers for builder/append_hook path ------------------------------------------------
   int64_t deduce_pos_dim(const std::string& name) {
     auto ends_with = [](const std::string& s, const char* suf) -> bool {
@@ -952,6 +1048,9 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   std::unordered_map<int64_t, StepWork> open_steps_;
   std::deque<StepWork> sealed_steps_;
 
+  std::mutex hook_config_mutex_;
+  std::unordered_map<std::string, std::unique_ptr<HookConfig>> hook_configs_;
+
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::deque<StepWork> queue_;
@@ -970,6 +1069,7 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   at::cuda::CUDAStream cache_stream_;
   std::optional<at::ScalarType> cache_dtype_;
   int64_t delay_steps_{0};
+  std::atomic<int64_t> current_step_id_{0};
 
   std::thread worker_;
   std::atomic<bool> closed_{false};
@@ -979,6 +1079,7 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   std::atomic<int64_t> stats_total_tasks_{0};
   std::atomic<int64_t> stats_submit_us_{0};
   std::atomic<int64_t> stats_process_us_{0};
+  std::atomic<int64_t> stats_callback_us_{0};
 };
 
 std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,
@@ -998,6 +1099,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                                                                                      "NativeMonitoringEngine")
       .def("submit_step", &monitoring::NativeMonitoringEngine::submit_step,
            py::arg("step_id"), py::arg("tasks"), py::arg("stream_handle") = std::optional<uint64_t>())
+      .def("begin_step", &monitoring::NativeMonitoringEngine::begin_step,
+           py::arg("step_id"))
+      .def("create_hook_callback", &monitoring::NativeMonitoringEngine::create_hook_callback,
+           py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("pos_slice"),
+           py::arg("target_device") = py::none())
       .def("submit_step_soa", &monitoring::NativeMonitoringEngine::submit_step_soa,
            py::arg("step_id"), py::arg("spec"), py::arg("stream_handle") = std::optional<uint64_t>())
       .def("add_task", &monitoring::NativeMonitoringEngine::add_task,

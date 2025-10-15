@@ -75,6 +75,10 @@ class MonitoringEngine:
                 self._backend = native_backend
                 self._native_backend = native_backend
                 self._using_native_backend = True
+                try:
+                    native_backend.begin_step(int(self._current_step_id))  # initialise step tracking
+                except Exception:
+                    pass
             else:
                 python_backend = _PythonBackend(
                     queue_size=queue_size,
@@ -89,6 +93,8 @@ class MonitoringEngine:
         self._native_batch_enabled = bool(int(os.environ.get("MON_NATIVE_BATCH", "0")))
         # Native builder (C++-side append of hooks) – strongest offload
         self._native_builder_enabled = bool(int(os.environ.get("MON_NATIVE_BUILDER", "1")))
+        # Native callback (C++ hook) – eliminates Python hook overhead
+        self._native_callback_enabled = bool(int(os.environ.get("MON_NATIVE_CALLBACK", "0")))
         self._native_batch: Dict[int, Dict[str, list]] = {}
 
         # Stats (optional) --------------------------------------------------
@@ -141,6 +147,10 @@ class MonitoringEngine:
             return
 
         self._current_step_id += 1
+        if self._using_native_backend:
+            backend = self._native_backend
+            if backend is not None:
+                backend.begin_step(int(self._current_step_id))
         if self._debug:
             print(f"[MonEng] start_step -> step_id={self._current_step_id}")
 
@@ -316,6 +326,7 @@ class MonitoringEngine:
                             " tasks=", int(stats.get("total_tasks", 0)),
                             " submit_ms=", round(float(stats.get("submit_us", 0.0)) / 1000.0, 3),
                             " process_ms=", round(float(stats.get("process_us", 0.0)) / 1000.0, 3),
+                            " callback_ms=", round(float(stats.get("callback_us", 0.0)) / 1000.0, 3),
                         )
                     except Exception:
                         pass
