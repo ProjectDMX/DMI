@@ -507,6 +507,22 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
     std::vector<StepWork> ready;
     {
       std::lock_guard<std::mutex> lock(staging_mutex_);
+      for (auto& kv : open_steps_) {
+        if (!kv.second.tasks.empty()) {
+          stats_total_steps_.fetch_add(1, std::memory_order_relaxed);
+          ready.emplace_back(std::move(kv.second));
+        }
+      }
+      open_steps_.clear();
+    }
+
+    for (auto& item : ready) {
+      dispatch_step(std::move(item));
+    }
+
+    ready.clear();
+    {
+      std::lock_guard<std::mutex> lock(staging_mutex_);
       while (!sealed_steps_.empty()) {
         ready.emplace_back(std::move(sealed_steps_.front()));
         sealed_steps_.pop_front();
@@ -577,6 +593,11 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   }
 
   void clear_completed_results() {
+    clear_completed_results_internal();
+  }
+
+ private:
+  void clear_completed_results_internal() {
     std::vector<int64_t> tokens;
     std::vector<std::shared_ptr<ResultSlot>> slot_refs;
     {
@@ -606,6 +627,8 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
       }
     }
   }
+
+ public:
 
   void close() {
     bool expected = false;
@@ -931,10 +954,17 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
         }
         at::Tensor result = run_task(entry.spec);
         store_result(entry.token, std::move(result));
+
+        // CRITICAL FIX: Immediately release the input tensor to free GPU memory
+        // This prevents accumulation of 64 steps × ~12MB = 768MB+ of tensor refs
+        entry.spec.tensor = at::Tensor();  // Release tensor reference
       } catch (const c10::Error& err) {
         store_exception(entry.token, err.what());
+        // Also release on error path
+        entry.spec.tensor = at::Tensor();
       } catch (const std::exception& err) {
         store_exception(entry.token, err.what());
+        entry.spec.tensor = at::Tensor();
       }
     }
 
@@ -1028,6 +1058,9 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   }
 
   void worker_loop() {
+    constexpr int64_t CLEANUP_INTERVAL = 8;  // Clean completed results every 8 steps
+    int64_t steps_since_cleanup = 0;
+
     while (true) {
       StepWork work;
       {
@@ -1040,6 +1073,13 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
         queue_.pop_front();
       }
       process_step(std::move(work));
+
+      // Periodic cleanup to prevent ResultSlot accumulation
+      ++steps_since_cleanup;
+      if (steps_since_cleanup >= CLEANUP_INTERVAL) {
+        clear_completed_results_internal();
+        steps_since_cleanup = 0;
+      }
     }
   }
 
