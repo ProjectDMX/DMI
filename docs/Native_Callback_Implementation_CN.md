@@ -43,7 +43,7 @@ seal_step() → 分发到后台线程处理
 
 ### 2. `create_hook_callback()` - Hook 注册
 
-**位置**: `monitoring/csrc/native_engine.cpp:423-469`
+位置: `monitoring/csrc/native_engine.cpp`（薄封装）
 
 ```cpp
 py::object create_hook_callback(const std::string& hook_name,
@@ -102,7 +102,7 @@ py::object create_hook_callback(const std::string& hook_name,
 
 ### 3. `append_hook_current_step()` - Hook 聚合
 
-**位置**: `monitoring/csrc/native_engine.cpp:642-671`
+位置: `monitoring/csrc/hooks.cpp`
 
 ```cpp
 void append_hook_current_step(const HookConfig& cfg, at::Tensor tensor) {

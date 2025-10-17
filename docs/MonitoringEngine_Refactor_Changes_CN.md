@@ -133,3 +133,50 @@
   - 将 indices 改为 LongTensor 直传，减少 pybind 小对象；
   - 按需减少 Hook 点数量或做层级聚合（线性降低次数）。
 
+---
+
+## 近期更新（代码组织 + 构建 + CPU Offload）
+
+本节记录在原有文档基础上的新增与调整（与行为保持一致，聚焦工程化与可选特性）。
+
+### 1) 头文件瘦身 + PImpl（行为不变）
+- 将原先单文件内联实现改为头/源分离，采用 PImpl 隐藏实现细节：
+  - 对外头文件：`monitoring/csrc/native_engine.h` 仅暴露 API；
+  - 内部实现：`monitoring/csrc/native_engine_internal.h`（内部结构体、私有数据、工具函数声明）。
+- 目的：显著减少头文件依赖与重编译面，增强可维护性；不改变任何外部接口与行为。
+
+### 2) 源码按职责拆分（不过度细分）
+- `monitoring/csrc/native_engine.cpp`：对外类薄封装、`create_hook_callback` 注册薄层；
+- `monitoring/csrc/engine_core.cpp`：队列/后台线程、事件与流同步、`dispatch_step/process_step`、结果存取与周期清理；
+- `monitoring/csrc/api_submit.cpp`：`submit_step/_soa/add_task/seal_step/resolve_all/future_*` 与统计更新；
+- `monitoring/csrc/hooks.cpp`：`append_hook/append_hook_current_step/deduce_pos_dim`；
+- `monitoring/csrc/slice.cpp`：`parse_slice_py/parse_slice_tuple` 与切片工具；
+- `monitoring/csrc/bindings.cpp`：`PYBIND11_MODULE` 与 `create_engine` 工厂。
+
+### 3) 构建与加载优化（可选，不改逻辑）
+- Makefile：
+  - `UNIFIED=1 make`：单 TU 构建（`csrc/unified.cpp`），最大化内联与优化；
+  - `LTO=1 make`：启用链接时优化 `-flto`；
+  - 默认多 TU 构建保持不变。
+- 动态加载器（`monitoring/_native_engine.py`）：
+  - `MON_NATIVE_UNIFIED=1`：仅编译 `unified.cpp`；
+  - `MON_NATIVE_LTO=1`：传递 `-flto` 给编译/链接；
+  - 默认按目录下所有 `.cpp` 源构建。
+
+### 4) 后台流异步 D2H 到 CPU（可选开关）
+- 目的：将 Hook 产物在后台缓存流上异步拷贝到 CPU，减轻显存压力/便于 CPU 侧消费；
+- 行为：
+  - 在 `run_task` 完成“去 batch/切片/降精度”后，如需 Offload：
+    - 若 `MON_NATIVE_PINNED=1`（默认）：分配 CPU pinned 内存并 `non_blocking` 复制；
+    - 否则：`tensor.to(cpu, non_blocking=True, copy=True)`；
+  - 在 `process_step` 中确认 GPU→CPU 拷贝完成（同步当前缓存流）后再 `store_result`，保证 Python 读到的是落地数据；
+  - Future 语义与接口保持不变。
+- 开关：
+  - `MON_NATIVE_TO_CPU=1`：对所有任务执行 D2H；
+  - 任务级：传入 `target_device='cpu'` 仅对指定 Hook 开启；
+  - `MON_NATIVE_PINNED=1/0`：是否使用 pinned 内存（默认 1）。
+- 取舍与说明：
+  - 主计算流不被阻塞（拷贝在独立缓存流上）；
+  - 可能与前向产生带宽竞争（显存/PCIe/NVLink）；
+  - 小量碎片拷贝建议合并或设尺寸阈值（后续可做）；
+  - 未来可将“同步等待”升级为基于事件的就绪判定，进一步减少后台线程等待开销。

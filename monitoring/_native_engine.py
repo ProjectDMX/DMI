@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
+import os
 from typing import Any, Optional
 import importlib.util
 import glob
@@ -55,20 +56,33 @@ def _load_extension() -> Any:
         raise ImportError("torch.utils.cpp_extension is not available")
 
     source_dir = Path(__file__).resolve().parent / "csrc"
-    source_file = source_dir / "native_engine.cpp"
-    if not source_file.exists():
-        raise ImportError("native engine source not found")
+
+    use_unified = bool(int(os.environ.get("MON_NATIVE_UNIFIED", "0")))
+    if use_unified:
+        unified = source_dir / "unified.cpp"
+        if not unified.exists():
+            raise ImportError("unified.cpp not found in csrc")
+        sources = [str(unified)]
+    else:
+        sources = sorted(str(p) for p in source_dir.glob("*.cpp"))
+        if not sources:
+            raise ImportError("native engine source files not found")
 
     extra_cflags = ["-O3"]
     extra_cuda_cflags = ["-O3"]
+    extra_ldflags = []
+    if bool(int(os.environ.get("MON_NATIVE_LTO", "0"))):
+        extra_cflags.append("-flto")
+        extra_ldflags.append("-flto")
 
     try:
         _EXTENSION_MODULE = load_extension(
             name=_EXTENSION_NAME,
-            sources=[str(source_file)],
+            sources=sources,
             extra_cflags=extra_cflags,
             extra_cuda_cflags=extra_cuda_cflags,
             verbose=False,
+            extra_ldflags=extra_ldflags,
         )
     except (RuntimeError, OSError) as exc:  # pragma: no cover - compile failure path
         raise ImportError("failed to build monitoring native backend") from exc

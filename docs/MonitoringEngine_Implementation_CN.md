@@ -27,18 +27,18 @@
     4) 纯 Python：构造 `MonitoringTask`，`engine.submit(task)`；
   - Hook 侧统计（`MON_ENGINE_STATS` 或 `MON_HOOK_STATS`）。
 
-- 原生后端（`monitoring/csrc/native_engine.cpp`）
-  - `SliceSpec`：模式 + 参数，支持 0/1/2/3 整型模式或字符串模式；
-  - `TaskSpec`：输入张量、切片维度/规则、可选目标设备与 dtype；
-  - `TaskEntry`：`TaskSpec + token`；
-  - `StepWork`：步级容器 + 可选 `cudaEvent_t`；
-  - `ResultSlot`：结果/错误/ready/future 同步的条件变量槽。
-  - 数据结构：
-    - `open_steps_`：append_hook/add_task 构建中的步；
-    - `sealed_steps_`：等待分发的步；
-    - `queue_`：工作线程队列；
-    - `slots_`：`token → ResultSlot`；
-    - 计数与统计：`pending_tasks_`、`next_token_`、`stats_*`。
+- 原生后端（C++，头/源分离 + PImpl）
+  - 对外头文件：`monitoring/csrc/native_engine.h`；内部实现：`monitoring/csrc/native_engine_internal.h`；
+  - 源码按职责拆分：
+    - `native_engine.cpp`：对外类薄封装、`create_hook_callback` 注册薄层；
+    - `engine_core.cpp`：队列/后台线程、事件与流同步、`dispatch_step/process_step`、结果存取与周期清理；
+    - `api_submit.cpp`：`submit_step/_soa/add_task/seal_step/resolve_all/future_*` 与统计更新；
+    - `hooks.cpp`：`append_hook/append_hook_current_step/deduce_pos_dim`；
+    - `slice.cpp`：`parse_slice_py/parse_slice_tuple` 与切片工具；
+    - `bindings.cpp`：`PYBIND11_MODULE` 与 `create_engine`。
+  - 数据结构（位于内部实现中）：
+    - `SliceSpec/TaskSpec/TaskEntry/StepWork/ResultSlot/HookConfig`；
+    - `open_steps_/sealed_steps_/queue_/slots_` 等容器，`pending_tasks_/next_token_/stats_*` 等计数。
 
 ## 执行流（四种路径：Native Callback + 三种原生路径 + Python 回退）
 
@@ -119,6 +119,13 @@
   - `seal_step`：同上；
   - 工作线程在 `cache_stream_` 上 set current，结束前恢复之前流。
 
+### （可选）后台流异步 D2H 到 CPU
+- 开关：`MON_NATIVE_TO_CPU=1`（全局）、或任务级 `target_device='cpu'`；
+- pinned 内存：`MON_NATIVE_PINNED=1/0`（默认 1，启用 pinned memory 以保证 `non_blocking` 异步）；
+- 执行顺序：去 batch → 切片 → 降精度 → D2H（在 `cache_stream_` 上）；
+- 正确性：为确保 Python 读取的是落地数据，在 `process_step` 中确认 D2H 已完成后再 `store_result`；
+- 取舍：主计算流不阻塞，但存在带宽竞争；建议仅在需要的 Hook 上开启或结合尺寸阈值（后续可做）。
+
 ## 结果与清理
 
 - `ResultSlot`：`ready/has_error/consumed/tensor` + `cv`；
@@ -163,6 +170,10 @@ Native Callback 已将回调开销从 `build_us≈107ms` 降至 `callback_us≈8
 - ✅ **Native Callback**：Hook 回调完全在 C++ 执行，消除 Python→C++ 边界（0.8s）
 - ✅ **GIL 释放**：CUDA 操作不持有 GIL，与主线程并行
 - ✅ **HookConfig 预分配**：零重复解析开销
+- ✅ **头/源分离 + PImpl**：瘦身头文件、隐藏实现细节，保持行为不变
+- ✅ **源码按职责拆分**：engine_core/api_submit/hooks/slice/bindings，提升可维护性
+- ✅ **构建优化选项**：`UNIFIED=1`（单 TU）、`LTO=1`（-flto）；动态加载器支持 `MON_NATIVE_UNIFIED/MON_NATIVE_LTO`
+- ✅ **（可选）后台流 D2H**：`MON_NATIVE_TO_CPU` + `MON_NATIVE_PINNED`，支持 pinned 异步拷贝至 CPU
 
 ### 未来优化方向
 
@@ -187,4 +198,3 @@ Native Callback 已将回调开销从 `build_us≈107ms` 降至 `callback_us≈8
 - **调试**：`MON_NATIVE_BATCH=1`（SoA 批量）或 `add_task + seal_step`（快路径）
 
 **详细文档**：参见 `docs/Native_Callback_Implementation_CN.md`
-

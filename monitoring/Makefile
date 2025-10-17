@@ -1,10 +1,22 @@
 PYTHON ?= python
 CXX ?= g++
 
+# Optional toggles
+#   UNIFIED=1  -> build single TU (csrc/unified.cpp) for maximum inlining
+#   LTO=1      -> enable link-time optimization (-flto)
+UNIFIED ?= 0
+LTO ?= 0
+
 TARGET := monitoring_native_backend
-SRC := csrc/native_engine.cpp
+SRCS := csrc/native_engine.cpp \
+        csrc/engine_core.cpp \
+        csrc/api_submit.cpp \
+        csrc/hooks.cpp \
+        csrc/slice.cpp \
+        csrc/bindings.cpp
+HEADERS := csrc/native_engine.h csrc/native_engine_internal.h
 BUILD_DIR := build
-OBJ := $(BUILD_DIR)/native_engine.o
+OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 PROJECT_ROOT := $(abspath $(CURDIR)/..)
 
 EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
@@ -49,13 +61,24 @@ all: $(FINAL_TARGET)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(OBJ): $(SRC) | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(FINAL_TARGET): $(OBJ)
+$(FINAL_TARGET): $(OBJS)
 	$(CXX) -shared $^ -o $(BUILD_DIR)/$(TARGET_SO) $(LDFLAGS)
 	cp $(BUILD_DIR)/$(TARGET_SO) $(LOCAL_TARGET)
 	cp $(BUILD_DIR)/$(TARGET_SO) $(FINAL_TARGET)
 
 clean:
 	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET)
+
+# Overrides --------------------------------------------------------------
+ifeq ($(UNIFIED),1)
+SRCS := csrc/unified.cpp
+OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
+endif
+
+ifeq ($(LTO),1)
+CXXFLAGS += -flto
+LDFLAGS += -flto
+endif
