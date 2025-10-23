@@ -14,6 +14,17 @@ from torch.utils.hooks import RemovableHandle
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2Model
 
+try:
+    import torch.cuda.nvtx as nvtx
+    NVTX_AVAILABLE = True
+except ImportError:
+    NVTX_AVAILABLE = False
+    class nvtx:
+        @staticmethod
+        def range_push(msg): pass
+        @staticmethod
+        def range_pop(): pass
+
 from transformer_lens import HookedTransformer
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
 
@@ -208,20 +219,28 @@ def measure_async_model(
     if device.type == "cuda":
         torch.cuda.synchronize()
 
+    nvtx.range_push(f"measure_async_{label}")
     start = time.perf_counter()
+
+    nvtx.range_push(f"async_compute_{label}")
     fn()
+    nvtx.range_pop()  # async_compute
 
     # Only sync the main compute stream, NOT the background cache stream
     if device.type == "cuda":
         torch.cuda.current_stream().synchronize()
 
     main_elapsed = time.perf_counter() - start
+
+    nvtx.range_push(f"async_resolve_all_{label}")
     engine.resolve_all()
+    nvtx.range_pop()  # async_resolve_all
 
     if device.type == "cuda":
         torch.cuda.synchronize()
 
     total_elapsed = time.perf_counter() - start
+    nvtx.range_pop()  # measure_async
     return main_elapsed, total_elapsed
 
 
@@ -244,6 +263,7 @@ def profile_async_model(
 
     import time
 
+    nvtx.range_push(f"profile_async_{label}")
     wall_time_start = time.perf_counter()
     with profile(
         activities=activities,
@@ -253,16 +273,21 @@ def profile_async_model(
         on_trace_ready=handler,
     ) as prof:
         with record_function(label):
+            nvtx.range_push(f"async_compute_{label}")
             fn()
+            nvtx.range_pop()  # async_compute
         # Sync only main stream before exiting profiler context
         if device.type == "cuda":
             torch.cuda.current_stream().synchronize()
 
     main_elapsed = time.perf_counter() - wall_time_start
+    nvtx.range_push(f"async_resolve_all_{label}")
     engine.resolve_all()
+    nvtx.range_pop()  # async_resolve_all
     if device.type == "cuda":
         torch.cuda.synchronize()
     total_elapsed = time.perf_counter() - wall_time_start
+    nvtx.range_pop()  # profile_async
     return main_elapsed, total_elapsed
 
 
@@ -599,6 +624,11 @@ def main() -> None:
             names_filter=names_filter,
         )
         cache_dict.clear()
+        try:
+            if monitoring_engine.async_enabled:
+                monitoring_engine.clear_completed_results()
+        except Exception:
+            pass
         return logits, cache
 
     lm_head = hf_model.lm_head
@@ -657,6 +687,8 @@ def main() -> None:
         return logits, next_past
 
     def hf_modified_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
+        nvtx.range_push("modified_prefill")
+        nvtx.range_push("modified_prefill_forward")
         outputs = hf_hooked_model(
             prefill_tokens,
             use_cache=True,
@@ -664,14 +696,22 @@ def main() -> None:
             output_attentions=False,
             return_dict=True,
         )
+        nvtx.range_pop()  # modified_prefill_forward
+        nvtx.range_push("modified_prefill_post")
         hidden_states = outputs.last_hidden_state
+        nvtx.range_push("modified_prefill_project")
         logits = project_logits(hidden_states)
+        nvtx.range_pop()  # modified_prefill_project
         next_token = greedy_from_logits(logits)
+        nvtx.range_pop()  # modified_prefill_post
         past = outputs.past_key_values
         del hidden_states, logits, outputs
+        nvtx.range_pop()  # modified_prefill
         return past, next_token
 
     def hf_modified_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
+        nvtx.range_push("modified_decode")
+        nvtx.range_push("modified_decode_forward")
         outputs = hf_hooked_model(
             token,
             use_cache=True,
@@ -680,10 +720,16 @@ def main() -> None:
             output_attentions=False,
             return_dict=True,
         )
+        nvtx.range_pop()  # modified_decode_forward
+        nvtx.range_push("modified_decode_post")
         hidden_states = outputs.last_hidden_state
+        nvtx.range_push("modified_decode_project")
         logits = project_logits(hidden_states)
+        nvtx.range_pop()  # modified_decode_project
         next_past = outputs.past_key_values
         del hidden_states, outputs
+        nvtx.range_pop()  # modified_decode_post
+        nvtx.range_pop()  # modified_decode
         return logits, next_past
 
     def hook_names_filter(name: str) -> bool:
@@ -718,6 +764,11 @@ def main() -> None:
                 _ = hs
         past = outputs.past_key_values
         cache_dict.clear()
+        try:
+            if monitoring_engine.async_enabled:
+                monitoring_engine.clear_completed_results()
+        except Exception:
+            pass
         hf_hooked_model.monitoring_engine = previous_engine
         del hidden_states, logits, outputs
         return past, next_token
@@ -746,13 +797,20 @@ def main() -> None:
                 _ = hs
         next_past = outputs.past_key_values
         cache_dict.clear()
+        try:
+            if monitoring_engine.async_enabled:
+                monitoring_engine.clear_completed_results()
+        except Exception:
+            pass
         hf_hooked_model.monitoring_engine = previous_engine
         del hidden_states, outputs
         return logits, next_past
 
     def hf_modified_hook_async_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
+        nvtx.range_push("async_prefill")
         monitoring_engine.start_step()
         try:
+            nvtx.range_push("async_prefill_forward")
             outputs, cache_dict = hf_hooked_model.run_with_cache(
                 prefill_tokens,
                 use_cache=True,
@@ -760,11 +818,16 @@ def main() -> None:
                 output_attentions=args.collect_attention,
                 return_dict=True,
             )
+            nvtx.range_pop()  # async_prefill_forward
         finally:
+            nvtx.range_push("async_prefill_end_step")
             monitoring_engine.end_step()
+            nvtx.range_pop()  # async_prefill_end_step
+        nvtx.range_push("async_prefill_post")
         hidden_states = outputs.last_hidden_state
         logits = project_logits(hidden_states)
         next_token = greedy_from_logits(logits)
+        nvtx.range_pop()  # async_prefill_post
         if args.collect_attention and outputs.attentions is not None:
             for attn in outputs.attentions:
                 _ = attn
@@ -773,12 +836,22 @@ def main() -> None:
                 _ = hs
         past = outputs.past_key_values
         cache_dict.clear()
+        try:
+            if monitoring_engine.async_enabled:
+                monitoring_engine.clear_completed_results()
+        except Exception:
+            pass
         del hidden_states, logits, outputs
+        nvtx.range_pop()  # async_prefill
         return past, next_token
 
     def hf_modified_hook_async_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
+        nvtx.range_push("async_decode")
+        nvtx.range_push("async_decode_start_step")
         monitoring_engine.start_step()
+        nvtx.range_pop()  # async_decode_start_step
         try:
+            nvtx.range_push("async_decode_forward")
             outputs, cache_dict = hf_hooked_model.run_with_cache(
                 token,
                 use_cache=True,
@@ -787,8 +860,12 @@ def main() -> None:
                 output_attentions=args.collect_attention,
                 return_dict=True,
             )
+            nvtx.range_pop()  # async_decode_forward
         finally:
+            nvtx.range_push("async_decode_end_step")
             monitoring_engine.end_step()
+            nvtx.range_pop()  # async_decode_end_step
+        nvtx.range_push("async_decode_post")
         hidden_states = outputs.last_hidden_state
         logits = project_logits(hidden_states)
         if args.collect_attention and outputs.attentions is not None:
@@ -799,20 +876,33 @@ def main() -> None:
                 _ = hs
         next_past = outputs.past_key_values
         cache_dict.clear()
+        try:
+            if monitoring_engine.async_enabled:
+                monitoring_engine.clear_completed_results()
+        except Exception:
+            pass
         del hidden_states, outputs
+        nvtx.range_pop()  # async_decode_post
+        nvtx.range_pop()  # async_decode
         return logits, next_past
 
     def run_decode(prefill_fn, decode_fn, prefill_tokens=prompt_tokens):
         with torch.no_grad():
-            for _ in range(args.steps):
+            for i in range(args.steps):
+                nvtx.range_push(f"benchmark_iter_{i}")
                 run_decode_loop(lambda: prefill_fn(prefill_tokens), decode_fn, args.decode_steps)
+                nvtx.range_pop()  # benchmark_iter_i
 
     def warmup(prefill_fn, decode_fn, prefill_tokens=prompt_tokens):
         if args.warmup <= 0:
             return
+        nvtx.range_push("warmup")
         with torch.no_grad():
-            for _ in range(args.warmup):
+            for i in range(args.warmup):
+                nvtx.range_push(f"warmup_iter_{i}")
                 run_decode_loop(lambda: prefill_fn(prefill_tokens), decode_fn, args.decode_steps)
+                nvtx.range_pop()  # warmup_iter_i
+        nvtx.range_pop()  # warmup
 
     traces_path = Path(args.profile_dir)
 

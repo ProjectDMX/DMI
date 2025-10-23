@@ -130,6 +130,7 @@ struct NativeMonitoringEngine::Impl {
                                  py::object pos_slice,
                                  py::object target_device);
   void append_hook_current_step(const HookConfig& cfg, at::Tensor tensor);
+  int64_t add_task_from_config(const HookConfig& cfg, at::Tensor tensor);
 
   // Internal helpers ----------------------------------------------------
   int64_t deduce_pos_dim(const std::string& name);

@@ -1,6 +1,7 @@
 // Hook callback + builder path
 
 #include "native_engine_internal.h"
+#include "nvtx_shim.h"
 
 namespace monitoring {
 
@@ -8,6 +9,7 @@ HookConfig* NativeMonitoringEngine::Impl::upsert_hook_config(const std::string& 
                                                              bool remove_batch_dim,
                                                              py::object pos_slice,
                                                              py::object target_device) {
+  mon_nvtx_push("MonEng::upsert_hook_config");
   auto config = std::make_unique<HookConfig>();
   config->name = hook_name;
   config->pos_dim = deduce_pos_dim(hook_name);
@@ -27,10 +29,12 @@ HookConfig* NativeMonitoringEngine::Impl::upsert_hook_config(const std::string& 
     *entry = std::move(*config);
     cfg_ptr = entry.get();
   }
+  mon_nvtx_pop();
   return cfg_ptr;
 }
 
 void NativeMonitoringEngine::Impl::append_hook_current_step(const HookConfig& cfg, at::Tensor tensor) {
+  mon_nvtx_push("MonEng::append_hook_current_step");
   TaskSpec spec;
   spec.tensor = std::move(tensor);
   spec.slice_dim = cfg.pos_dim;
@@ -59,6 +63,45 @@ void NativeMonitoringEngine::Impl::append_hook_current_step(const HookConfig& cf
   work.tasks.emplace_back(std::move(entry));
   pending_tasks_.fetch_add(1, std::memory_order_relaxed);
   stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
+  mon_nvtx_pop();
+}
+
+int64_t NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg, at::Tensor tensor) {
+  mon_nvtx_push("MonEng::add_task_from_config");
+  TaskSpec spec;
+  spec.tensor = std::move(tensor);
+  spec.slice_dim = cfg.pos_dim;
+  spec.remove_batch_dim = cfg.remove_batch_dim;
+  spec.slice = cfg.slice;
+  spec.target_device = cfg.target_device;
+
+  int64_t dim = spec.slice_dim;
+  int64_t tensor_dims = spec.tensor.dim();
+  spec.can_slice = (dim >= 0) ? (tensor_dims > dim) : (tensor_dims >= -dim);
+
+  int64_t step_id = current_step_id_.load(std::memory_order_acquire);
+
+  // Allocate token + result slot eagerly
+  int64_t token = next_token_++;
+  {
+    std::lock_guard<std::mutex> lock(slots_mutex_);
+    slots_.emplace(token, std::make_shared<ResultSlot>());
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(staging_mutex_);
+    StepWork& work = open_steps_[step_id];
+    work.step_id = step_id;
+    TaskEntry entry;
+    entry.spec = std::move(spec);
+    entry.token = token;
+    work.tasks.emplace_back(std::move(entry));
+  }
+
+  pending_tasks_.fetch_add(1, std::memory_order_relaxed);
+  stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
+  mon_nvtx_pop();
+  return token;
 }
 
 void NativeMonitoringEngine::Impl::append_hook(int64_t step_id,
@@ -67,6 +110,7 @@ void NativeMonitoringEngine::Impl::append_hook(int64_t step_id,
                                                bool remove_batch_dim,
                                                py::object pos_slice,
                                                py::object target_device) {
+  mon_nvtx_push("MonEng::append_hook");
   TaskSpec spec;
   spec.tensor = std::move(tensor);
   spec.remove_batch_dim = remove_batch_dim;
@@ -89,6 +133,7 @@ void NativeMonitoringEngine::Impl::append_hook(int64_t step_id,
   }
   pending_tasks_.fetch_add(1, std::memory_order_relaxed);
   stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
+  mon_nvtx_pop();
 }
 
 int64_t NativeMonitoringEngine::Impl::deduce_pos_dim(const std::string& name) {
@@ -104,4 +149,3 @@ int64_t NativeMonitoringEngine::Impl::deduce_pos_dim(const std::string& name) {
 }
 
 }  // namespace monitoring
-

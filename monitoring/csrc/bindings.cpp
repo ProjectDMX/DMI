@@ -26,6 +26,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("create_hook_callback", &monitoring::NativeMonitoringEngine::create_hook_callback,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("pos_slice"),
            py::arg("target_device") = py::none())
+      .def("create_hook_callback_with_cache", &monitoring::NativeMonitoringEngine::create_hook_callback_with_cache,
+           py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("pos_slice"),
+           py::arg("target_device") = py::none(), py::arg("cache"))
       .def("submit_step_soa", &monitoring::NativeMonitoringEngine::submit_step_soa,
            py::arg("step_id"), py::arg("spec"), py::arg("stream_handle") = std::optional<uint64_t>())
       .def("add_task", &monitoring::NativeMonitoringEngine::add_task,
@@ -48,4 +51,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("create_engine", &monitoring::create_engine,
         py::arg("queue_size"), py::arg("cache_dtype"), py::arg("delay_steps"));
 }
-

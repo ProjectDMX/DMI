@@ -1,6 +1,7 @@
 // Core execution: dispatch/worker, stream/event sync, result storage.
 
 #include "native_engine_internal.h"
+#include "nvtx_shim.h"
 #include <cstdlib>
 
 namespace monitoring {
@@ -20,6 +21,11 @@ NativeMonitoringEngine::Impl::Impl(int64_t queue_size,
     use_pinned_ = (*v != '0');
   }
   worker_ = std::thread(&NativeMonitoringEngine::Impl::worker_loop, this);
+
+  // Set thread name for profiling tools
+#ifdef __linux__
+  pthread_setname_np(worker_.native_handle(), "MonEngWorker");
+#endif
 }
 
 NativeMonitoringEngine::Impl::~Impl() = default;
@@ -39,10 +45,12 @@ void NativeMonitoringEngine::Impl::remove_slot(int64_t token) {
 }
 
 void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
+  mon_nvtx_push("MonEng::dispatch_step");
   if (work.tasks.empty()) {
     if (work.event != nullptr) {
       C10_CUDA_CHECK(cudaEventDestroy(work.event));
     }
+    mon_nvtx_pop();
     return;
   }
 
@@ -56,6 +64,7 @@ void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
     queue_.push_back(std::move(work));
     lock.unlock();
     queue_cv_.notify_one();
+    mon_nvtx_pop();
     return;
   }
 
@@ -64,9 +73,11 @@ void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
     queue_.push_back(std::move(work));
   }
   queue_cv_.notify_one();
+  mon_nvtx_pop();
 }
 
 void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
+  mon_nvtx_push("MonEng::process_step");
   auto t0 = std::chrono::steady_clock::now();
   if (work.event != nullptr) {
     C10_CUDA_CHECK(cudaStreamWaitEvent(cache_stream_.stream(), work.event, 0));
@@ -77,7 +88,7 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   // Set cache stream as current
   auto prev_stream = at::cuda::getCurrentCUDAStream(cache_stream_.device_index());
   at::cuda::setCurrentCUDAStream(cache_stream_);
-
+  mon_nvtx_push("MonEng::process_tasks");
   for (auto& entry : work.tasks) {
     try {
       if (entry.token == 0) {
@@ -89,7 +100,9 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
           slots_.emplace(entry.token, std::move(slot));
         }
       }
+      mon_nvtx_push("MonEng::run_task");
       at::Tensor result = run_task(entry.spec);
+      mon_nvtx_pop();
       // Ensure async D2H completes before exposing CPU tensor to consumers
       if (result.device().is_cpu() && entry.spec.tensor.defined() && entry.spec.tensor.is_cuda()) {
         C10_CUDA_CHECK(cudaStreamSynchronize(cache_stream_.stream()));
@@ -106,6 +119,7 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
       entry.spec.tensor = at::Tensor();
     }
   }
+  mon_nvtx_pop();
 
   // Restore previous stream
   at::cuda::setCurrentCUDAStream(prev_stream);
@@ -113,6 +127,7 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   auto t1 = std::chrono::steady_clock::now();
   auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
   stats_process_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
+  mon_nvtx_pop();
 }
 
 at::Tensor NativeMonitoringEngine::Impl::run_task(const TaskSpec& spec) {
@@ -192,6 +207,7 @@ at::Tensor NativeMonitoringEngine::Impl::apply_slice(at::Tensor tensor, const Sl
 }
 
 void NativeMonitoringEngine::Impl::store_result(int64_t token, at::Tensor&& tensor) {
+  mon_nvtx_push("MonEng::store_result");
   auto slot = get_slot(token);
   {
     std::lock_guard<std::mutex> lock(slot->mutex);
@@ -201,6 +217,7 @@ void NativeMonitoringEngine::Impl::store_result(int64_t token, at::Tensor&& tens
   slot->cv.notify_all();
   pending_tasks_.fetch_sub(1, std::memory_order_acq_rel);
   pending_cv_.notify_all();
+  mon_nvtx_pop();
 }
 
 void NativeMonitoringEngine::Impl::store_exception(int64_t token, const std::string& error) {
@@ -255,7 +272,9 @@ void NativeMonitoringEngine::Impl::worker_loop() {
     StepWork work;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
+      mon_nvtx_push("MonEng::worker_wait");
       queue_cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+      mon_nvtx_pop();
       if (stop_ && queue_.empty()) {
         break;
       }
@@ -266,10 +285,12 @@ void NativeMonitoringEngine::Impl::worker_loop() {
 
     // Periodic cleanup to prevent ResultSlot accumulation
     ++steps_since_cleanup;
-    if (steps_since_cleanup >= CLEANUP_INTERVAL) {
-      clear_completed_results_internal();
-      steps_since_cleanup = 0;
-    }
+    // if (steps_since_cleanup >= CLEANUP_INTERVAL) {
+    //   mon_nvtx_push("MonEng::cleanup");
+    //   clear_completed_results_internal();
+    //   steps_since_cleanup = 0;
+    //   mon_nvtx_pop();
+    // }
   }
 }
 

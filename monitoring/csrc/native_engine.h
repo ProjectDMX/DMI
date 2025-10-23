@@ -47,6 +47,12 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
                                   bool remove_batch_dim,
                                   py::object pos_slice,
                                   py::object target_device);
+  // Create a Python hook callback that also writes BackendFuture into cache dict
+  py::object create_hook_callback_with_cache(const std::string& hook_name,
+                                             bool remove_batch_dim,
+                                             py::object pos_slice,
+                                             py::object target_device,
+                                             py::dict cache);
 
   // Append a hook record directly (tokens assigned at seal time)
   void append_hook(int64_t step_id,

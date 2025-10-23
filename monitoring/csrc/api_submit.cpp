@@ -1,6 +1,7 @@
 // Public API implementations: submit/add/seal/resolve/future/stats/close
 
 #include "native_engine_internal.h"
+#include "nvtx_shim.h"
 
 namespace monitoring {
 
@@ -27,6 +28,7 @@ void NativeMonitoringEngine::Impl::record_callback_duration(int64_t us) {
 std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step(int64_t step_id,
                                                                const py::list& tasks,
                                                                std::optional<uint64_t> stream_handle) {
+  mon_nvtx_push("MonEng::submit_step");
   auto t0 = std::chrono::steady_clock::now();
   StepWork work;
   work.step_id = step_id;
@@ -66,6 +68,7 @@ std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step(int64_t step_id,
       C10_CUDA_CHECK(cudaEventSynchronize(event));
       C10_CUDA_CHECK(cudaEventDestroy(event));
     }
+    mon_nvtx_pop();
     return tokens;
   }
 
@@ -101,12 +104,14 @@ std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step(int64_t step_id,
   auto t1 = std::chrono::steady_clock::now();
   auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
   stats_submit_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
+  mon_nvtx_pop();
   return tokens;
 }
 
 std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step_soa(int64_t step_id,
                                                                    const py::dict& spec,
                                                                    std::optional<uint64_t> stream_handle) {
+  mon_nvtx_push("MonEng::submit_step_soa");
   auto t0 = std::chrono::steady_clock::now();
   StepWork work;
   work.step_id = step_id;
@@ -208,6 +213,7 @@ std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step_soa(int64_t step_
       C10_CUDA_CHECK(cudaEventSynchronize(event));
       C10_CUDA_CHECK(cudaEventDestroy(event));
     }
+     mon_nvtx_pop();
     return tokens;
   }
 
@@ -240,10 +246,12 @@ std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step_soa(int64_t step_
   stats_total_steps_.fetch_add(1, std::memory_order_relaxed);
   stats_total_tasks_.fetch_add(static_cast<int64_t>(n), std::memory_order_relaxed);
   stats_submit_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
+  mon_nvtx_pop();
   return tokens;
 }
 
 int64_t NativeMonitoringEngine::Impl::add_task(int64_t step_id, const py::tuple& task_tuple) {
+  mon_nvtx_push("MonEng::add_task");
   auto t_add0 = std::chrono::steady_clock::now();
   TaskSpec spec = parse_task_tuple(task_tuple);
 
@@ -272,10 +280,12 @@ int64_t NativeMonitoringEngine::Impl::add_task(int64_t step_id, const py::tuple&
   auto t_add1 = std::chrono::steady_clock::now();
   auto us_add = std::chrono::duration_cast<std::chrono::microseconds>(t_add1 - t_add0).count();
   stats_submit_us_.fetch_add(static_cast<int64_t>(us_add), std::memory_order_relaxed);
+  mon_nvtx_pop();
   return token;
 }
 
 void NativeMonitoringEngine::Impl::seal_step(int64_t step_id, std::optional<uint64_t> stream_handle) {
+  mon_nvtx_push("MonEng::seal_step");
   auto t0 = std::chrono::steady_clock::now();
   StepWork work;
   bool has_work = false;
@@ -298,6 +308,7 @@ void NativeMonitoringEngine::Impl::seal_step(int64_t step_id, std::optional<uint
       C10_CUDA_CHECK(cudaEventSynchronize(event));
       C10_CUDA_CHECK(cudaEventDestroy(event));
     }
+    mon_nvtx_pop();
     return;
   }
 
@@ -326,9 +337,11 @@ void NativeMonitoringEngine::Impl::seal_step(int64_t step_id, std::optional<uint
   auto t1 = std::chrono::steady_clock::now();
   auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
   stats_submit_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
+  mon_nvtx_pop();
 }
 
 void NativeMonitoringEngine::Impl::resolve_all() {
+  mon_nvtx_push("MonEng::resolve_all");
   py::gil_scoped_release release;
 
   std::vector<StepWork> ready;
@@ -362,6 +375,7 @@ void NativeMonitoringEngine::Impl::resolve_all() {
 
   std::unique_lock<std::mutex> lock(pending_mutex_);
   pending_cv_.wait(lock, [&] { return pending_tasks_.load(std::memory_order_acquire) == 0; });
+  mon_nvtx_pop();
 }
 
 bool NativeMonitoringEngine::Impl::future_ready(int64_t token) {
@@ -384,6 +398,7 @@ bool NativeMonitoringEngine::Impl::future_wait(int64_t token, std::optional<doub
 }
 
 at::Tensor NativeMonitoringEngine::Impl::future_result(int64_t token, std::optional<double> timeout) {
+  mon_nvtx_push("MonEng::future_result");
   auto slot = get_slot(token);
   {
     py::gil_scoped_release release;
@@ -403,11 +418,13 @@ at::Tensor NativeMonitoringEngine::Impl::future_result(int64_t token, std::optio
       std::string message = slot->error;
       lock.unlock();
       remove_slot(token);
+      mon_nvtx_pop();
       throw std::runtime_error(message);
     }
 
     if (slot->consumed) {
       at::Tensor tensor = slot->tensor;
+      mon_nvtx_pop();
       return tensor;
     }
 
@@ -416,6 +433,7 @@ at::Tensor NativeMonitoringEngine::Impl::future_result(int64_t token, std::optio
 
   at::Tensor tensor = slot->tensor;
   remove_slot(token);
+  mon_nvtx_pop();
   return tensor;
 }
 
@@ -455,4 +473,3 @@ void NativeMonitoringEngine::Impl::close() {
 }
 
 }  // namespace monitoring
-
