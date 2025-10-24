@@ -180,3 +180,97 @@
   - 可能与前向产生带宽竞争（显存/PCIe/NVLink）；
   - 小量碎片拷贝建议合并或设尺寸阈值（后续可做）；
   - 未来可将“同步等待”升级为基于事件的就绪判定，进一步减少后台线程等待开销。
+
+---
+
+## 2025/Q4 更新：Pinned 复用池 + 全局回调 + 诊断（重要）
+
+本阶段重点：解决 CPU pinned 内存用尽导致的 `cudaHostAlloc` 风暴、每步挂/卸钩子的 CPU 气泡、以及定位 Python/C++ 侧的“空白段”。
+
+### A. Pinned 内存复用池（稳定 D2H 吞吐）
+
+- 背景问题：每任务 `at::empty_like(..., pinned_memory=true)` 会在运行期频繁触发 `cudaHostAlloc`（页锁定），导致后段显著变慢。
+- 方案落地（engine_core）：
+  - 引入尺寸分级的 pinned 池（按 bytes 分桶），acquire→D2H→步末单次 `cudaStreamSynchronize`→pinned→pageable 的 host memcpy→立即归还池块。
+  - 小块阈值（默认 64KB）以下一律 pageable，避免碎片 pinned 与 HostAlloc 抖动。
+  - 统计：`pool_hits/pool_misses/pool_fallbacks/pool_high_watermark_bytes`、`host_memcpy_mb`。
+- 相关环境变量：
+  - `MON_NATIVE_PINPOOL=1`（默认在 `MON_NATIVE_TO_CPU=1 && MON_NATIVE_PINNED=1` 时启用）
+  - `MON_NATIVE_PINPOOL_BINS_KB=256,512,1024,2048,4096,8192`
+  - `MON_NATIVE_PINPOOL_SLOTS_PER_BIN=8`
+  - `MON_NATIVE_PINPOOL_MAX_MB=512`
+  - `MON_NATIVE_PIN_THRESH_BYTES=65536`
+
+### B. 单步同步 + 主机 memcpy 并行（可选）
+
+- 将 per-task 同步改为“每步一次同步”，先批量发起 D2H（非阻塞），步末统一 `cudaStreamSynchronize(cache_stream)`；
+- Host 侧 pinned→pageable 的 memcpy 支持线程池并行（默认关闭）：
+  - `MON_NATIVE_HOST_COPY_THREADS=4`（并发数），`MON_NATIVE_HOST_COPY_QUEUE_SIZE=512`（有界队列，队满回退串行）。
+  - 统计：`host_copy_queue_depth/host_copy_total_tasks/host_copy_total_mb`。
+
+### C. 全局回调（一次注册）+ 每步仅切换启用集 + 批量收集 Futures（避免 per‑hook GIL）
+
+- 旧痛点：`TL::EnableHooks[fwd]` / `TL::ResetHooks` 每步挂/卸导致 CPU 气泡；原生路径若在回调内直接写 Python dict，会引入大量 GIL 获取。
+- 新路径：
+  - 一次性为所有 HookPoint 注册 C++ 回调（`create_global_hook_callback_sig`，is_permanent=True），回调仅“登记任务”与记录 `(name, token)`，不触发 GIL/不写 Python dict；
+  - 每步：
+    - 用 `set_enabled_hooks([...])` 下发启用名集合（由 `names_filter` 决定采集哪些）；
+    - 前向结束后，用 `collect_step_futures_into(step_id, cache_dict)` 一次性把 `{name → BackendFuture(native_backend, token)}` 写入 cache（一次 GIL，批量写入）；
+    - 若本步无临时 hooks（fwd/bwd 为空），跳过 hooks 上下文，避免 `TL::ResetHooks` 每步遍历。
+  - Slice 解析：Python 侧只做“签名元组”编码，C++ 侧 `parse_slice_tuple` 解析，避免每步 Python 解析 slice。
+
+### D. 诊断与 NVTX 覆盖（定位“空白段”）
+
+- C++：
+  - `MonEng::finalize_results`（步末 host memcpy 与归还）、`MonEng::pending_notify`（每次唤醒）、`MonEng::clear_results`（清理扫描耗时）、`MonEng::resolve_wait`（resolve 等待区间）。
+  - 统计：`pending_notifies`、`clear_calls/clear_ms_total/clear_scanned_total/clear_ready_total`。
+- Python：
+  - `MonEng::PyStartStep/MonEng::PyEndStep`（步边界）、`CacheDict::clear`（脚本侧清理）、`TL::BuildCallback[...]`、`TL::RegisterHook[...]`、`TL::EnableHooks[fwd]/[bwd]`、`TL::ResetHooks`（可见每步 add/remove 开销，已通过永久注册规避）。
+- 强制重建扩展：`MON_NATIVE_FORCE_BUILD=1`（绕过旧 .so，现编现载）。
+
+### E. 已修复的问题清单（关键）
+
+1) Pinned 用尽 + `cudaHostAlloc` 风暴 → 引入 pinned 池 + 小块 pageable 回退（已修复）。
+2) per‑task 同步导致串行化 → 改为“每步一次同步”（已修复）。
+3) Host‑copy 线程池的线程生命周期 → 析构/close 中显式 `stop + join`（已修复）。
+4) 小块路径仍 pinned → 小块统一 pageable（已修复）。
+5) `ptr_to_block_id_` 映射提前删除导致回收不稳 → 改为在 `release_pool_block` 时按 block_id 清理（已修复）。
+6) 周期清理被注释 → 每 8 步自动 `clear_completed_results_internal()`（已恢复）。
+7) Python 回调写 cache 的 GIL 热点 → 回调不写 cache；步后一次性收集 Futures（已修复）。
+8) 每步 `EnableHooks/ResetHooks` CPU 气泡 → 永久注册回调 + 无临时 hooks 时跳过上下文（已修复）。
+
+### F. 使用建议与示例命令
+
+- 推荐 profile 命令：
+  ```bash
+  MON_NATIVE_FORCE_BUILD=1 MON_ENGINE_STATS=1 TL_ENABLE_NVTX=1 MON_NATIVE_CALLBACK=1 \
+  nsys profile --output=results/nsight_async_perm --force-overwrite=true \
+    --trace=cuda,nvtx,osrt --sample=cpu --sampling-period=10000000 --cpuctxsw=process-tree \
+    --cuda-memory-usage=true \
+    python benchmark/tests/hf_modified_async_only.py --batch-size 64 --steps 1 --warmup 1 \
+      --collect-hidden --collect-attention --no-profile
+  ```
+- 常用调参：
+  - `MON_NATIVE_HOST_COPY_THREADS=0/1/2/4`：CPU/内存总线干扰可调；
+  - `MON_NATIVE_PINPOOL_MAX_MB=512~1024`：避免池早退；
+  - `MON_NATIVE_PIN_THRESH_BYTES=65536~131072`：小块 pageable；
+  - `--engine-delay-steps 1`：错峰 D2H（需要时）。
+
+### G. 仍存的注意点与后续 TODO
+
+- D2H 与前向的带宽竞争：属于物理资源争用，可通过 `delay_steps/线程池并发/阈值` 调整，或后续引入“最低优先级缓存流”和“步内 in‑flight 限流”（计划中）。
+- 若需要 per‑step 切片/设备/移除 batch 动态变更：将补充 `set_hook_slice(name, slice_tuple)` 等 setter 在步前更新 HookConfig（接口预留）。
+
+---
+
+## 变更总览（文件级，便于追踪）
+
+- C++ 原生后端：
+  - engine_core.cpp：pinned 池 + 单步同步 + host‑copy 线程池 + 统计/NVTX + 析构清理。
+  - native_engine.cpp/hooks.cpp：全局回调、启用集、步后收集 Futures、签名元组式 slice 解析。
+  - bindings.cpp/native_engine.h/native_engine_internal.h：接口与数据结构声明。
+- Python/HF 集成：
+  - transformers/.../hook_points.py：永久回调注册、每步 set_enabled_hooks、步后 collect_step_futures_into、NVTX 覆盖。
+  - monitoring/engine.py：Python start/end step 的 NVTX、Python 侧 clear 的 NVTX。
+  - monitoring/_native_engine.py：`MON_NATIVE_FORCE_BUILD=1` 强制现编现载。
+  - benchmark/tests/hf_modified_async_only.py：`CacheDict::clear` NVTX。
