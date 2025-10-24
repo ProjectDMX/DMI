@@ -150,6 +150,74 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache_sig(const std
       });
 }
 
+py::object NativeMonitoringEngine::create_global_hook_callback_sig(const std::string& hook_name,
+                                                                   bool remove_batch_dim,
+                                                                   py::tuple slice_tuple,
+                                                                   py::object target_device) {
+  // Pre-create and store HookConfig; callback will only append tasks (no Python cache writes)
+  HookConfig* cfg_ptr = impl_->upsert_hook_config_tuple(hook_name, remove_batch_dim,
+                                                        std::move(slice_tuple), std::move(target_device));
+  auto engine = shared_from_this();
+  std::string hook_name_copy = hook_name;
+  return py::cpp_function(
+      [engine, cfg_ptr, hook_name_copy](py::args args, py::kwargs /*kwargs*/) -> py::object {
+        if (args.size() == 0) {
+          throw std::runtime_error("Native callback expected tensor argument");
+        }
+        at::Tensor tensor = args[0].cast<at::Tensor>();
+        auto t0 = std::chrono::steady_clock::now();
+        {
+          py::gil_scoped_release release;
+          if (tensor.requires_grad()) {
+            tensor = tensor.detach();
+          }
+          // Check enabled set
+          bool enabled = false;
+          {
+            std::lock_guard<std::mutex> lk(engine->impl_->enabled_mutex_);
+            enabled = engine->impl_->is_hook_enabled_unlocked(hook_name_copy);
+          }
+          if (enabled) {
+            int64_t token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor));
+            // Record name->token for this step for later collection into Python cache
+            int64_t step_id = engine->impl_->current_step_id_.load(std::memory_order_acquire);
+            engine->impl_->record_step_name_token(step_id, hook_name_copy, token);
+          }
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        engine->record_callback_duration(static_cast<int64_t>(us));
+        return py::none();
+      });
+}
+
+void NativeMonitoringEngine::set_enabled_hooks(py::object names_iterable) {
+  impl_->set_enabled_hooks(std::move(names_iterable));
+}
+
+void NativeMonitoringEngine::collect_step_futures_into(int64_t step_id, py::dict cache) {
+  // Move out name->token pairs for this step
+  std::vector<std::pair<std::string, int64_t>> items;
+  {
+    std::lock_guard<std::mutex> lock(impl_->staging_mutex_);
+    auto it = impl_->step_name_tokens_.find(step_id);
+    if (it != impl_->step_name_tokens_.end()) {
+      items = std::move(it->second);
+      impl_->step_name_tokens_.erase(it);
+    }
+  }
+  if (items.empty()) return;
+  // Create BackendFuture(native_backend, token) and fill into provided cache dict
+  py::object task_mod = py::module::import("monitoring.task");
+  py::object backend_future_cls = task_mod.attr("BackendFuture");
+  for (auto& kv : items) {
+    const std::string& name = kv.first;
+    int64_t token = kv.second;
+    py::object py_future = backend_future_cls(shared_from_this(), py::int_(token));
+    cache[py::str(name.c_str())] = py_future;
+  }
+}
+
 void NativeMonitoringEngine::append_hook(int64_t step_id,
                                          const std::string& hook_name,
                                          at::Tensor tensor,

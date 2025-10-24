@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -153,6 +154,19 @@ struct NativeMonitoringEngine::Impl {
   void store_result(int64_t token, at::Tensor&& tensor);
   void store_exception(int64_t token, const std::string& error);
   void worker_loop();
+
+  // Global-callback support ------------------------------------------------
+  // Enabled hook names for current step (set from Python per run)
+  std::mutex enabled_mutex_;
+  std::unordered_set<std::string> enabled_hooks_;
+  void set_enabled_hooks(py::object names_iterable);
+  bool is_hook_enabled_unlocked(const std::string& name) const {
+    return enabled_hooks_.empty() || enabled_hooks_.count(name) > 0;
+  }
+
+  // Step-local name->token mapping for collect_step_futures
+  std::unordered_map<int64_t, std::vector<std::pair<std::string, int64_t>>> step_name_tokens_;
+  void record_step_name_token(int64_t step_id, const std::string& name, int64_t token);
 
   // Data ----------------------------------------------------------------
   // D2H offload controls

@@ -132,6 +132,25 @@ int64_t NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg
   return token;
 }
 
+void NativeMonitoringEngine::Impl::set_enabled_hooks(py::object names_iterable) {
+  std::lock_guard<std::mutex> lock(enabled_mutex_);
+  enabled_hooks_.clear();
+  if (names_iterable.is_none()) return;
+  for (auto item : names_iterable) {
+    try {
+      std::string name = py::cast<std::string>(item);
+      enabled_hooks_.insert(std::move(name));
+    } catch (...) {
+      // ignore non-string items
+    }
+  }
+}
+
+void NativeMonitoringEngine::Impl::record_step_name_token(int64_t step_id, const std::string& name, int64_t token) {
+  std::lock_guard<std::mutex> lock(staging_mutex_);
+  step_name_tokens_[step_id].emplace_back(name, token);
+}
+
 void NativeMonitoringEngine::Impl::append_hook(int64_t step_id,
                                                const std::string& hook_name,
                                                at::Tensor tensor,

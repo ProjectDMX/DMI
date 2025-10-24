@@ -58,6 +58,12 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
                                                  py::tuple slice_tuple,
                                                  py::object target_device,
                                                  py::dict cache);
+  py::object create_global_hook_callback_sig(const std::string& hook_name,
+                                             bool remove_batch_dim,
+                                             py::tuple slice_tuple,
+                                             py::object target_device);
+  void set_enabled_hooks(py::object names_iterable);
+  void collect_step_futures_into(int64_t step_id, py::dict cache);
 
   // Append a hook record directly (tokens assigned at seal time)
   void append_hook(int64_t step_id,

@@ -32,6 +32,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("create_hook_callback_with_cache_sig", &monitoring::NativeMonitoringEngine::create_hook_callback_with_cache_sig,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
            py::arg("target_device") = py::none(), py::arg("cache"))
+      .def("create_global_hook_callback_sig", &monitoring::NativeMonitoringEngine::create_global_hook_callback_sig,
+           py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
+           py::arg("target_device") = py::none())
+      .def("set_enabled_hooks", &monitoring::NativeMonitoringEngine::set_enabled_hooks,
+           py::arg("enabled_names"))
+      .def("collect_step_futures_into", &monitoring::NativeMonitoringEngine::collect_step_futures_into,
+           py::arg("step_id"), py::arg("cache"))
       .def("submit_step_soa", &monitoring::NativeMonitoringEngine::submit_step_soa,
            py::arg("step_id"), py::arg("spec"), py::arg("stream_handle") = std::optional<uint64_t>())
       .def("add_task", &monitoring::NativeMonitoringEngine::add_task,
