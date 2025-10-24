@@ -25,13 +25,16 @@ def _load_extension() -> Any:
     if _EXTENSION_MODULE is not None:
         return _EXTENSION_MODULE
 
+    force_build = bool(int(os.environ.get("MON_NATIVE_FORCE_BUILD", "0")))
+
     # 1) Prefer a locally built .so in this repo to avoid importing a stale
     #    system-wide module with the same name.
     pkg_dir = Path(__file__).resolve().parent
     repo_root = pkg_dir.parent
-    candidates = []
-    candidates.extend(glob.glob(str(pkg_dir / f"{_EXTENSION_NAME}*.so")))
-    candidates.extend(glob.glob(str(repo_root / f"{_EXTENSION_NAME}*.so")))
+    candidates = [] if force_build else []
+    if not force_build:
+        candidates.extend(glob.glob(str(pkg_dir / f"{_EXTENSION_NAME}*.so")))
+        candidates.extend(glob.glob(str(repo_root / f"{_EXTENSION_NAME}*.so")))
 
     for so_path in candidates:
         try:
@@ -46,11 +49,12 @@ def _load_extension() -> Any:
             pass
 
     # 2) Try to import an installed module by name (may be stale).
-    try:
-        _EXTENSION_MODULE = importlib.import_module(_EXTENSION_NAME)
-        return _EXTENSION_MODULE
-    except ImportError:
-        pass
+    if not force_build:
+        try:
+            _EXTENSION_MODULE = importlib.import_module(_EXTENSION_NAME)
+            return _EXTENSION_MODULE
+        except ImportError:
+            pass
 
     if load_extension is None:
         raise ImportError("torch.utils.cpp_extension is not available")

@@ -129,6 +129,10 @@ struct NativeMonitoringEngine::Impl {
                                  bool remove_batch_dim,
                                  py::object pos_slice,
                                  py::object target_device);
+  HookConfig* upsert_hook_config_tuple(const std::string& hook_name,
+                                       bool remove_batch_dim,
+                                       py::tuple slice_tuple,
+                                       py::object target_device);
   void append_hook_current_step(const HookConfig& cfg, at::Tensor tensor);
   int64_t add_task_from_config(const HookConfig& cfg, at::Tensor tensor);
 
@@ -154,6 +158,77 @@ struct NativeMonitoringEngine::Impl {
   // D2H offload controls
   bool move_to_cpu_{false};
   bool use_pinned_{true};
+
+  // Pinned memory pool (for stable GPU->CPU offload throughput)
+  struct PinnedBlock {
+    at::Tensor buf;              // 1D pinned tensor with element dtype
+    size_t capacity_bytes{0};    // total bytes the block can hold
+    at::ScalarType dtype{at::kByte};
+    bool in_use{false};
+    int64_t id{-1};
+  };
+
+  // Pool controls and state
+  bool enable_pinpool_{false};
+  size_t pinpool_thresh_bytes_{64 * 1024}; // small tensors fallback to pageable
+  size_t pinpool_max_bytes_{512ull * 1024ull * 1024ull}; // total pool cap
+  std::vector<size_t> pinpool_bins_bytes_; // capacity bins in bytes (ascending)
+  int pinpool_slots_per_bin_{8};
+
+  // Storage
+  std::mutex pool_mutex_;
+  std::vector<PinnedBlock> pinpool_blocks_; // all blocks
+  std::unordered_map<void*, int64_t> ptr_to_block_id_; // view.data_ptr() -> block id
+  std::mutex ptr_mutex_;
+  int64_t next_block_id_{1};
+  size_t pinpool_total_bytes_{0};
+
+  // Pool helpers
+  size_t pick_bin_bytes(size_t nbytes);
+  std::pair<at::Tensor, int64_t> acquire_pinned_block(size_t nbytes, at::ScalarType dtype);
+  void release_pool_block(int64_t block_id);
+  int64_t find_pool_block_id(void* ptr);
+
+  // Pool stats
+  std::atomic<int64_t> stats_pool_hits_{0};
+  std::atomic<int64_t> stats_pool_misses_{0};
+  std::atomic<int64_t> stats_pool_high_watermark_bytes_{0};
+  std::atomic<int64_t> stats_pool_fallbacks_{0};
+  std::atomic<int64_t> stats_memcpy_bytes_{0};
+
+  // Diagnostics: pending notify/wake/clear timings
+  std::atomic<int64_t> stats_pending_notifies_{0};
+  std::atomic<int64_t> stats_clear_calls_{0};
+  std::atomic<int64_t> stats_clear_us_{0};
+  std::atomic<int64_t> stats_clear_scanned_{0};
+  std::atomic<int64_t> stats_clear_ready_{0};
+
+  // Host-copy thread pool (optional)
+  struct CopyJob {
+    at::Tensor pinned_tensor; // pinned CPU tensor (from pool) to be copied to pageable
+    int64_t block_id{-1};     // pool block id
+    int64_t token{0};         // result token
+  };
+
+  struct HostCopyThreadPool {
+    std::vector<std::thread> workers_;
+    std::deque<CopyJob> queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::atomic<bool> stop_{false};
+    size_t max_queue_size_{512};
+    // Stats
+    std::atomic<int64_t> queue_depth_{0};
+    std::atomic<int64_t> total_tasks_{0};
+    std::atomic<int64_t> total_bytes_{0};
+  };
+
+  std::unique_ptr<HostCopyThreadPool> host_copy_pool_;
+  bool enable_host_copy_pool_{false};
+  int host_copy_threads_{0};
+
+  void host_copy_worker();
+  void process_copy_job(const CopyJob& job);
 
   std::mutex staging_mutex_;
   std::unordered_map<int64_t, StepWork> open_steps_;

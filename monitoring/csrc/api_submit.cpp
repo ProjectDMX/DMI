@@ -14,6 +14,23 @@ py::dict NativeMonitoringEngine::Impl::get_stats() {
   d["submit_us"] = stats_submit_us_.load(std::memory_order_relaxed);
   d["process_us"] = stats_process_us_.load(std::memory_order_relaxed);
   d["callback_us"] = stats_callback_us_.load(std::memory_order_relaxed);
+  if (enable_pinpool_) {
+    d["pool_hits"] = stats_pool_hits_.load(std::memory_order_relaxed);
+    d["pool_misses"] = stats_pool_misses_.load(std::memory_order_relaxed);
+    d["pool_high_watermark_bytes"] = stats_pool_high_watermark_bytes_.load(std::memory_order_relaxed);
+    d["pool_fallbacks"] = stats_pool_fallbacks_.load(std::memory_order_relaxed);
+    d["host_memcpy_mb"] = static_cast<double>(stats_memcpy_bytes_.load(std::memory_order_relaxed)) / (1024.0 * 1024.0);
+  }
+  d["pending_notifies"] = stats_pending_notifies_.load(std::memory_order_relaxed);
+  d["clear_calls"] = stats_clear_calls_.load(std::memory_order_relaxed);
+  d["clear_ms_total"] = static_cast<double>(stats_clear_us_.load(std::memory_order_relaxed)) / 1000.0;
+  d["clear_scanned_total"] = stats_clear_scanned_.load(std::memory_order_relaxed);
+  d["clear_ready_total"] = stats_clear_ready_.load(std::memory_order_relaxed);
+  if (enable_host_copy_pool_ && host_copy_pool_) {
+    d["host_copy_queue_depth"] = host_copy_pool_->queue_depth_.load(std::memory_order_relaxed);
+    d["host_copy_total_tasks"] = host_copy_pool_->total_tasks_.load(std::memory_order_relaxed);
+    d["host_copy_total_mb"] = static_cast<double>(host_copy_pool_->total_bytes_.load(std::memory_order_relaxed)) / (1024.0 * 1024.0);
+  }
   return d;
 }
 
@@ -374,7 +391,9 @@ void NativeMonitoringEngine::Impl::resolve_all() {
   }
 
   std::unique_lock<std::mutex> lock(pending_mutex_);
+  mon_nvtx_push("MonEng::resolve_wait");
   pending_cv_.wait(lock, [&] { return pending_tasks_.load(std::memory_order_acquire) == 0; });
+  mon_nvtx_pop();
   mon_nvtx_pop();
 }
 
@@ -463,6 +482,19 @@ void NativeMonitoringEngine::Impl::close() {
 
   if (worker_.joinable()) {
     worker_.join();
+  }
+
+  // Stop host-copy pool after draining queued jobs
+  if (host_copy_pool_) {
+    {
+      std::lock_guard<std::mutex> lock(host_copy_pool_->queue_mutex_);
+      host_copy_pool_->stop_.store(true, std::memory_order_relaxed);
+    }
+    host_copy_pool_->queue_cv_.notify_all();
+    for (auto& t : host_copy_pool_->workers_) {
+      if (t.joinable()) t.join();
+    }
+    host_copy_pool_.reset();
   }
 
   // Destroy any remaining result slots to avoid memory leaks.

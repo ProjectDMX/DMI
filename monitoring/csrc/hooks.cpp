@@ -33,6 +33,34 @@ HookConfig* NativeMonitoringEngine::Impl::upsert_hook_config(const std::string& 
   return cfg_ptr;
 }
 
+HookConfig* NativeMonitoringEngine::Impl::upsert_hook_config_tuple(const std::string& hook_name,
+                                                                   bool remove_batch_dim,
+                                                                   py::tuple slice_tuple,
+                                                                   py::object target_device) {
+  mon_nvtx_push("MonEng::upsert_hook_config");
+  auto config = std::make_unique<HookConfig>();
+  config->name = hook_name;
+  config->pos_dim = deduce_pos_dim(hook_name);
+  config->remove_batch_dim = remove_batch_dim;
+  config->slice = parse_slice_tuple(slice_tuple);
+  if (!target_device.is_none()) {
+    config->target_device = target_device.cast<c10::Device>();
+  } else {
+    config->target_device.reset();
+  }
+
+  HookConfig* cfg_ptr = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(hook_config_mutex_);
+    auto& entry = hook_configs_[hook_name];
+    if (!entry) entry = std::make_unique<HookConfig>();
+    *entry = std::move(*config);
+    cfg_ptr = entry.get();
+  }
+  mon_nvtx_pop();
+  return cfg_ptr;
+}
+
 void NativeMonitoringEngine::Impl::append_hook_current_step(const HookConfig& cfg, at::Tensor tensor) {
   mon_nvtx_push("MonEng::append_hook_current_step");
   TaskSpec spec;

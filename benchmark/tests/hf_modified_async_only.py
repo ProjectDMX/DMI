@@ -310,7 +310,9 @@ def main() -> None:
             for hs in outputs.hidden_states:
                 _ = hs
         past = outputs.past_key_values
+        nvtx.range_push("CacheDict::clear")
         cache_dict.clear()
+        nvtx.range_pop()
         try:
             if monitoring_engine.async_enabled:
                 monitoring_engine.clear_completed_results()
@@ -350,7 +352,9 @@ def main() -> None:
             for hs in outputs.hidden_states:
                 _ = hs
         next_past = outputs.past_key_values
+        nvtx.range_push("CacheDict::clear")
         cache_dict.clear()
+        nvtx.range_pop()
         try:
             if monitoring_engine.async_enabled:
                 monitoring_engine.clear_completed_results()

@@ -110,6 +110,46 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache(const std::st
       });
 }
 
+py::object NativeMonitoringEngine::create_hook_callback_with_cache_sig(const std::string& hook_name,
+                                                                       bool remove_batch_dim,
+                                                                       py::tuple slice_tuple,
+                                                                       py::object target_device,
+                                                                       py::dict cache) {
+  HookConfig* cfg_ptr = impl_->upsert_hook_config_tuple(hook_name, remove_batch_dim,
+                                                        std::move(slice_tuple), std::move(target_device));
+  auto engine = shared_from_this();
+  std::string hook_name_copy = hook_name;
+  return py::cpp_function(
+      [engine, cfg_ptr, cache, hook_name_copy](py::args args, py::kwargs /*kwargs*/) -> py::object {
+        if (args.size() == 0) {
+          throw std::runtime_error("Native callback expected tensor argument");
+        }
+        at::Tensor tensor = args[0].cast<at::Tensor>();
+        int64_t token = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        {
+          py::gil_scoped_release release;
+          if (tensor.requires_grad()) {
+            tensor = tensor.detach();
+          }
+          token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor));
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        engine->record_callback_duration(static_cast<int64_t>(us));
+
+        try {
+          py::object task_mod = py::module::import("monitoring.task");
+          py::object backend_future_cls = task_mod.attr("BackendFuture");
+          py::object py_future = backend_future_cls(engine, py::int_(token));
+          cache[py::str(hook_name_copy.c_str())] = py_future;
+        } catch (const std::exception& e) {
+          cache[py::str(hook_name_copy.c_str())] = py::none();
+        }
+        return py::none();
+      });
+}
+
 void NativeMonitoringEngine::append_hook(int64_t step_id,
                                          const std::string& hook_name,
                                          at::Tensor tensor,

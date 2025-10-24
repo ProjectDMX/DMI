@@ -146,6 +146,15 @@ class MonitoringEngine:
         if not (self.async_enabled and torch.cuda.is_available()):
             return
 
+        # Optional NVTX for Python-visible start_step
+        try:
+            from torch.cuda import nvtx as _nvtx  # type: ignore
+        except Exception:
+            _nvtx = None  # type: ignore
+
+        if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+            _nvtx.range_push("MonEng::PyStartStep")
+
         self._current_step_id += 1
         if self._using_native_backend:
             backend = self._native_backend
@@ -154,11 +163,22 @@ class MonitoringEngine:
         if self._debug:
             print(f"[MonEng] start_step -> step_id={self._current_step_id}")
 
+        if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+            _nvtx.range_pop()
+
     def end_step(self) -> None:
         """Seal the current step and hand it to the backend."""
 
         if not (self.async_enabled and torch.cuda.is_available()):
             return
+
+        # Optional NVTX for Python-visible end_step
+        try:
+            from torch.cuda import nvtx as _nvtx  # type: ignore
+        except Exception:
+            _nvtx = None  # type: ignore
+        if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+            _nvtx.range_push("MonEng::PyEndStep")
 
         step_id = self._current_step_id
         tasks = self._pending_tasks.pop(step_id, [])
@@ -236,12 +256,18 @@ class MonitoringEngine:
                     self._stats_steps += 1
                 else:
                     backend.seal_step(step_id, stream_handle)
+            if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+                _nvtx.range_pop()
             return
 
         backend = self._python_backend
         if backend is None:
+            if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+                _nvtx.range_pop()
             return
         backend.submit_step(step_id, tasks, producer_stream)
+        if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+            _nvtx.range_pop()
 
     def resolve_all(self) -> None:
         """Block until all pending tasks have been processed."""
@@ -366,7 +392,19 @@ class MonitoringEngine:
         """Clear completed results held by native backend to free memory."""
 
         if self._using_native_backend and self._native_backend is not None:
-            self._native_backend.clear_completed_results()
+            try:
+                import torch
+                from torch.cuda import nvtx as _nvtx  # type: ignore
+            except Exception:
+                _nvtx = None  # type: ignore
+            if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+                _nvtx.range_push("MonEng::PyClearResults")
+                try:
+                    self._native_backend.clear_completed_results()
+                finally:
+                    _nvtx.range_pop()
+            else:
+                self._native_backend.clear_completed_results()
 
     # ------------------------------------------------------------------
     # Internal helpers
