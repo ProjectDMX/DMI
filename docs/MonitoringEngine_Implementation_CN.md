@@ -198,3 +198,67 @@ Native Callback 已将回调开销从 `build_us≈107ms` 降至 `callback_us≈8
 - **调试**：`MON_NATIVE_BATCH=1`（SoA 批量）或 `add_task + seal_step`（快路径）
 
 **详细文档**：参见 `docs/Native_Callback_Implementation_CN.md`
+
+---
+
+# 2025/Q4 更新：Pinned 复用池 + 全局回调 + 诊断（重要）
+
+本节汇总近期为稳定吞吐、降低 CPU 气泡、增强可观测性而引入的改动与配置。
+
+## A. Pinned 内存复用池（稳定 D2H 吞吐）
+
+- 问题：每任务分配 pinned 会触发大量 `cudaHostAlloc`，后段显著变慢。
+- 方案：引入尺寸分级 pinned 池，流程为 `acquire → D2H → 步末统一同步 → pinned→pageable memcpy → 立即归还`；小块（默认 <64KB）直落 pageable，避免碎片 pinned。
+- 统计：`pool_hits/pool_misses/pool_fallbacks/pool_high_watermark_bytes`、`host_memcpy_mb`。
+- 相关环境变量：
+  - `MON_NATIVE_PINPOOL=1`（默认随 `MON_NATIVE_TO_CPU=1 && MON_NATIVE_PINNED=1` 启用）
+  - `MON_NATIVE_PINPOOL_BINS_KB=256,512,1024,2048,4096,8192`
+  - `MON_NATIVE_PINPOOL_SLOTS_PER_BIN=8`
+  - `MON_NATIVE_PINPOOL_MAX_MB=512`
+  - `MON_NATIVE_PIN_THRESH_BYTES=65536`
+
+## B. 单步同步 + Host 侧 memcpy 并行（可选）
+
+- 将 per‑task 同步改为“每步一次同步”，先批量发起 D2H，再统一 `cudaStreamSynchronize(cache_stream)`；
+- 步末在 Host 侧执行 pinned→pageable memcpy：
+  - 串行（默认）或线程池并行（`MON_NATIVE_HOST_COPY_THREADS=4`、`MON_NATIVE_HOST_COPY_QUEUE_SIZE=512`）；
+  - 统计：`host_copy_queue_depth/host_copy_total_tasks/host_copy_total_mb`。
+
+## C. 全局回调（永久注册）+ 每步仅切换启用集 + 批量收集 Futures
+
+- 为消除每步 `EnableHooks/ResetHooks` 的 CPU 气泡，引入一次性注册 C++ 回调（`create_global_hook_callback_sig` + `is_permanent=True`），回调仅登记任务与记录 `(name, token)`；
+- 每步仅 `set_enabled_hooks([...])` 控制采集范围，前向结束后 `collect_step_futures_into(step_id, cache)` 一次性写入 Python cache（一次 GIL，批量写入，不在回调中写 dict）。
+- 名字正确性：回调捕获稳定 hook_name（如 `blocks.i.attn.hook_q`），最终 cache 的 key 与历史一致。
+
+## D. 诊断与 NVTX 覆盖（定位“空白段”）
+
+- C++：`MonEng::finalize_results / pending_notify / clear_results / resolve_wait`；
+- Python：`MonEng::PyStartStep/MonEng::PyEndStep`、`CacheDict::clear`、`TL::BuildCallback[...]`、`TL::RegisterHook[...]`、`TL::EnableHooks[fwd]/[bwd]`、`TL::ResetHooks`；
+- 强制现编现载：`MON_NATIVE_FORCE_BUILD=1`（避免旧 .so）。
+
+## E. 已修复问题清单
+
+1) Pinned 用尽 + `cudaHostAlloc` 风暴 → 引入 pinned 池，小块 pageable 回退。
+2) per‑task 同步串行化 → 改为步级单次同步。
+3) 线程生命周期 → 析构/close 显式 `stop + join` worker/host‑copy 线程。
+4) 小块路径误用 pinned → 小块统一 pageable。
+5) `ptr_to_block_id_` 映射清理时机 → 在 `release_pool_block` 上按 `block_id` 清理。
+6) 周期清理恢复 → 每 8 步自动清理（避免长期槽累积）。
+7) 回调写 cache 的 GIL 开销 → 回调不写 cache；步后批量写入。
+8) 每步 `EnableHooks/ResetHooks` CPU 气泡 → 永久注册回调、无临时 hooks 时跳过 hooks 上下文。
+
+## F. 运行建议与示例命令
+
+```bash
+MON_NATIVE_FORCE_BUILD=1 MON_ENGINE_STATS=1 TL_ENABLE_NVTX=1 MON_NATIVE_CALLBACK=1 \
+nsys profile --output=results/nsight_async_perm --force-overwrite=true \
+  --trace=cuda,nvtx,osrt --sample=cpu --sampling-period=10000000 --cpuctxsw=process-tree \
+  --cuda-memory-usage=true \
+  python benchmark/tests/hf_modified_async_only.py --batch-size 64 --steps 1 --warmup 1 \
+    --collect-hidden --collect-attention --no-profile
+```
+
+可调参数：
+- `MON_NATIVE_HOST_COPY_THREADS=0/1/2/4`、`MON_NATIVE_HOST_COPY_QUEUE_SIZE=512`
+- `MON_NATIVE_PINPOOL_MAX_MB=512~1024`、`MON_NATIVE_PIN_THRESH_BYTES=65536~131072`
+- `--engine-delay-steps 1`（需要时错峰 D2H）
