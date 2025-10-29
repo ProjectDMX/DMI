@@ -183,10 +183,7 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   struct PendingResult { at::Tensor tensor; int64_t token; int64_t block_id; bool needs_sync; };
   std::vector<PendingResult> results;
   results.reserve(work.tasks.size());
-  // Per-task synchronization mode: if a task performs D2H, we synchronize
-  // the cache stream immediately after launching the copy and immediately
-  // finalize the result (host memcpy + pool release) so pinned blocks can
-  // be reused by subsequent tasks in the same step.
+  bool any_sync = false;
   for (auto& entry : work.tasks) {
     try {
       if (entry.token == 0) {
@@ -202,50 +199,12 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
       at::Tensor result = run_task(entry.spec);
       mon_nvtx_pop();
       bool needs_sync = result.device().is_cpu() && entry.spec.tensor.defined() && entry.spec.tensor.is_cuda();
+      any_sync = any_sync || needs_sync;
       int64_t blk_id = -1;
       if (enable_pinpool_ && result.defined() && result.device().is_cpu()) {
         blk_id = find_pool_block_id(result.data_ptr());
       }
-
-      if (needs_sync) {
-        // Ensure the D2H for this task is completed before proceeding
-        mon_nvtx_push("MonEng::sync_d2h_task");
-        C10_CUDA_CHECK(cudaStreamSynchronize(cache_stream_.stream()));
-        mon_nvtx_pop();
-
-        // Immediately finalize CPU results to free pinned pool blocks
-        if (blk_id >= 0) {
-          // We used a pinned pool block; perform host memcpy and release now
-          CopyJob job{result, blk_id, entry.token};
-          if (enable_host_copy_pool_) {
-            bool enqueued = false;
-            {
-              std::unique_lock<std::mutex> lock(host_copy_pool_->queue_mutex_);
-              if (host_copy_pool_->queue_.size() < host_copy_pool_->max_queue_size_) {
-                host_copy_pool_->queue_.push_back(std::move(job));
-                host_copy_pool_->queue_depth_.fetch_add(1, std::memory_order_relaxed);
-                enqueued = true;
-              }
-            }
-            if (enqueued) {
-              host_copy_pool_->queue_cv_.notify_one();
-            } else {
-              // Backpressure fallback: process inline
-              process_copy_job(job);
-            }
-          } else {
-            process_copy_job(job);
-          }
-          // Do not keep this result in the local vector; it has been stored
-        } else {
-          // No pool block involved (pageable CPU tensor) -> store directly
-          store_result(entry.token, std::move(result));
-        }
-      } else {
-        // No D2H (e.g., GPU result) or CPU result not derived from CUDA tensor.
-        // Defer storing until after we restore previous stream context.
-        results.push_back(PendingResult{std::move(result), entry.token, blk_id, needs_sync});
-      }
+      results.push_back(PendingResult{std::move(result), entry.token, blk_id, needs_sync});
       // Immediately release the input tensor to free GPU memory
       entry.spec.tensor = at::Tensor();
     } catch (const c10::Error& err) {
@@ -258,20 +217,50 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   }
   mon_nvtx_pop();
 
+  // Ensure async D2H completes before exposing CPU tensors: single sync per step
+  if (any_sync) {
+    mon_nvtx_push("MonEng::sync_d2h");
+    C10_CUDA_CHECK(cudaStreamSynchronize(cache_stream_.stream()));
+    mon_nvtx_pop();
+  }
+
   // Restore previous stream
   at::cuda::setCurrentCUDAStream(prev_stream);
 
   // Host memcpy (pinned -> pageable) and store results
   mon_nvtx_push("MonEng::finalize_results");
-  // Most CPU results with pinned blocks were already finalized in the loop.
-  // Only handle deferred items here (e.g., GPU results or already-pageable CPU results).
-  for (auto& pr : results) {
-    if (pr.block_id >= 0 && pr.needs_sync) {
-      // Should not happen: per-task path finalized these.
-      CopyJob job{pr.tensor, pr.block_id, pr.token};
-      process_copy_job(job);
-    } else {
-      store_result(pr.token, std::move(pr.tensor));
+  if (enable_host_copy_pool_) {
+    for (auto& pr : results) {
+      if (pr.block_id >= 0) {
+        // Enqueue copy job or process inline if queue is full
+        CopyJob job{pr.tensor, pr.block_id, pr.token};
+        bool enqueued = false;
+        {
+          std::unique_lock<std::mutex> lock(host_copy_pool_->queue_mutex_);
+          if (host_copy_pool_->queue_.size() < host_copy_pool_->max_queue_size_) {
+            host_copy_pool_->queue_.push_back(std::move(job));
+            host_copy_pool_->queue_depth_.fetch_add(1, std::memory_order_relaxed);
+            enqueued = true;
+          }
+        }
+        if (enqueued) {
+          host_copy_pool_->queue_cv_.notify_one();
+        } else {
+          // Fallback: process in current thread to apply backpressure
+          process_copy_job(job);
+        }
+      } else {
+        store_result(pr.token, std::move(pr.tensor));
+      }
+    }
+  } else {
+    for (auto& pr : results) {
+      if (pr.block_id >= 0) {
+        CopyJob job{pr.tensor, pr.block_id, pr.token};
+        process_copy_job(job);
+      } else {
+        store_result(pr.token, std::move(pr.tensor));
+      }
     }
   }
   mon_nvtx_pop();
