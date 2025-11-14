@@ -302,31 +302,31 @@ at::Tensor NativeMonitoringEngine::Impl::run_task(const TaskSpec& spec) {
   }
   if (want_cpu && tensor.is_cuda()) {
     if (use_pinned_) {
-      // Prefer pool if enabled and above threshold
+      // Always prefer pinned destinations for D2H, regardless of size.
       size_t nbytes = static_cast<size_t>(tensor.nbytes());
       at::ScalarType dt = tensor.scalar_type();
-      if (enable_pinpool_ && nbytes >= pinpool_thresh_bytes_) {
+      if (enable_pinpool_) {
+        // Try the pinned pool first (no size threshold)
         auto got = acquire_pinned_block(nbytes, dt);
         if (got.first.defined()) {
           at::Tensor dst = got.first.view(tensor.sizes());
           dst.copy_(tensor, /*non_blocking=*/true);
           return dst;
         }
-        // Fallback to pageable if pool cannot provide a block (limit hit)
-        tensor = tensor.to(torch::kCPU, /*non_blocking=*/true, /*copy=*/true);
+        // Pool could not provide a block (capacity/pressure) — fall back to direct pinned alloc
+        auto opts = tensor.options().device(torch::kCPU).pinned_memory(true);
+        at::Tensor dst = at::empty_like(tensor, opts);
+        dst.copy_(tensor, /*non_blocking=*/true);
+        tensor = dst;
       } else {
-        if (enable_pinpool_) {
-          // Below threshold: avoid pinned to reduce fragmentation and long-lived pinned usage
-          tensor = tensor.to(torch::kCPU, /*non_blocking=*/true, /*copy=*/true);
-        } else {
-          // Pool disabled, fall back to legacy pinned path
-          auto opts = tensor.options().device(torch::kCPU).pinned_memory(true);
-          at::Tensor dst = at::empty_like(tensor, opts);
-          dst.copy_(tensor, /*non_blocking=*/true);
-          tensor = dst;
-        }
+        // Pool disabled — allocate pinned destination directly
+        auto opts = tensor.options().device(torch::kCPU).pinned_memory(true);
+        at::Tensor dst = at::empty_like(tensor, opts);
+        dst.copy_(tensor, /*non_blocking=*/true);
+        tensor = dst;
       }
     } else {
+      // Pinned off not requested — keep legacy pageable transfer
       tensor = tensor.to(torch::kCPU, /*non_blocking=*/true, /*copy=*/true);
     }
   }
@@ -350,80 +350,91 @@ size_t NativeMonitoringEngine::Impl::pick_bin_bytes(size_t nbytes) {
 }
 
 std::pair<at::Tensor, int64_t> NativeMonitoringEngine::Impl::acquire_pinned_block(size_t nbytes, at::ScalarType dtype) {
-  std::lock_guard<std::mutex> lock(pool_mutex_);
   if (!enable_pinpool_) return {at::Tensor(), -1};
+
   size_t cap = pick_bin_bytes(nbytes);
-  // Try to find a free block with same dtype and sufficient capacity
-  for (auto& blk : pinpool_blocks_) {
-    if (!blk.in_use && blk.dtype == dtype && blk.capacity_bytes >= cap) {
-      blk.in_use = true;
-      stats_pool_hits_.fetch_add(1, std::memory_order_relaxed);
-      // Create a view with requested shape/numel later by caller; here return whole buffer
-      // We will narrow/view outside based on requested sizes, but the copy_ into dst only needs matching numel.
-      // For safety, return a 1D view with element count = nbytes/elem_size
-      size_t elem_size = c10::elementSize(dtype);
-      int64_t numel = static_cast<int64_t>(nbytes / elem_size);
-      at::Tensor view = blk.buf.narrow(0, 0, numel);
-      {
-        std::lock_guard<std::mutex> lk(ptr_mutex_);
-        ptr_to_block_id_[view.data_ptr()] = blk.id;
+  at::Tensor view;
+  int64_t blk_id = -1;
+  void* base_ptr = nullptr;
+
+  {
+    // Minimize time under pool_mutex_; do not nest ptr_mutex_ while holding this lock.
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    // Try to find a free block with same dtype and sufficient capacity
+    for (auto& blk : pinpool_blocks_) {
+      if (!blk.in_use && blk.dtype == dtype && blk.capacity_bytes >= cap) {
+        blk.in_use = true;
+        stats_pool_hits_.fetch_add(1, std::memory_order_relaxed);
+        size_t elem_size = c10::elementSize(dtype);
+        int64_t numel = static_cast<int64_t>(nbytes / elem_size);
+        view = blk.buf.narrow(0, 0, numel);
+        blk_id = blk.id;
+        base_ptr = view.data_ptr();
+        break;
       }
-      return {view, blk.id};
+    }
+
+    if (!view.defined()) {
+      // Can we allocate a new block?
+      if (pinpool_total_bytes_ + cap <= pinpool_max_bytes_) {
+        at::TensorOptions opts = torch::TensorOptions().device(torch::kCPU).pinned_memory(true).dtype(dtype);
+        size_t elem_size = c10::elementSize(dtype);
+        int64_t capacity_elems = static_cast<int64_t>(cap / elem_size);
+        at::Tensor buf = at::empty({capacity_elems}, opts);
+        PinnedBlock blk;
+        blk.buf = buf;
+        blk.capacity_bytes = cap;
+        blk.dtype = dtype;
+        blk.in_use = true;
+        blk.id = next_block_id_++;
+        pinpool_blocks_.push_back(blk);
+        pinpool_total_bytes_ += cap;
+        // Update high watermark
+        int64_t hw = static_cast<int64_t>(pinpool_total_bytes_);
+        int64_t prev = stats_pool_high_watermark_bytes_.load(std::memory_order_relaxed);
+        while (hw > prev && !stats_pool_high_watermark_bytes_.compare_exchange_weak(prev, hw)) {}
+        stats_pool_misses_.fetch_add(1, std::memory_order_relaxed);
+        view = buf.narrow(0, 0, static_cast<int64_t>(nbytes / elem_size));
+        blk_id = blk.id;
+        base_ptr = view.data_ptr();
+      } else {
+        // Pool limit reached: fail
+        stats_pool_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
-  // Can we allocate a new block?
-  if (pinpool_total_bytes_ + cap <= pinpool_max_bytes_) {
-    at::TensorOptions opts = torch::TensorOptions().device(torch::kCPU).pinned_memory(true).dtype(dtype);
-    size_t elem_size = c10::elementSize(dtype);
-    int64_t capacity_elems = static_cast<int64_t>(cap / elem_size);
-    at::Tensor buf = at::empty({capacity_elems}, opts);
-    PinnedBlock blk;
-    blk.buf = buf;
-    blk.capacity_bytes = cap;
-    blk.dtype = dtype;
-    blk.in_use = true;
-    blk.id = next_block_id_++;
-    pinpool_blocks_.push_back(blk);
-    pinpool_total_bytes_ += cap;
-    // Update high watermark
-    int64_t hw = static_cast<int64_t>(pinpool_total_bytes_);
-    int64_t prev = stats_pool_high_watermark_bytes_.load(std::memory_order_relaxed);
-    while (hw > prev && !stats_pool_high_watermark_bytes_.compare_exchange_weak(prev, hw)) {}
-    stats_pool_misses_.fetch_add(1, std::memory_order_relaxed);
-    at::Tensor view = buf.narrow(0, 0, static_cast<int64_t>(nbytes / elem_size));
-    {
-      std::lock_guard<std::mutex> lk(ptr_mutex_);
-      ptr_to_block_id_[view.data_ptr()] = blk.id;
-    }
-    return {view, blk.id};
+
+  if (!view.defined()) {
+    return {at::Tensor(), -1};
   }
-  // Pool limit reached: fail
-  stats_pool_fallbacks_.fetch_add(1, std::memory_order_relaxed);
-  return {at::Tensor(), -1};
+
+  // Record pointer mapping outside pool_mutex_ to reduce nested lock contention
+  {
+    std::lock_guard<std::mutex> lk(ptr_mutex_);
+    ptr_to_block_id_[base_ptr] = blk_id;
+  }
+
+  return {view, blk_id};
 }
 
 void NativeMonitoringEngine::Impl::release_pool_block(int64_t block_id) {
   if (block_id < 0) return;
-  // Clear any ptr mapping associated with this block id
-  {
-    std::lock_guard<std::mutex> lk(ptr_mutex_);
-    for (auto it = ptr_to_block_id_.begin(); it != ptr_to_block_id_.end();) {
-      if (it->second == block_id) {
-        it = ptr_to_block_id_.erase(it);
-      } else {
-        ++it;
-      }
-    }
-  }
-  // Mark block free
+  void* ptr_to_clear = nullptr;
+  // Find block and mark free with minimal critical section.
   {
     std::lock_guard<std::mutex> lock(pool_mutex_);
     for (auto& blk : pinpool_blocks_) {
       if (blk.id == block_id) {
         blk.in_use = false;
+        if (blk.buf.defined()) ptr_to_clear = blk.buf.data_ptr();
         break;
       }
     }
+  }
+  // Erase pointer mapping directly by key (O(log N)) outside pool_mutex_
+  if (ptr_to_clear != nullptr) {
+    std::lock_guard<std::mutex> lk(ptr_mutex_);
+    ptr_to_block_id_.erase(ptr_to_clear);
   }
 }
 
@@ -501,9 +512,26 @@ at::Tensor NativeMonitoringEngine::Impl::apply_slice(at::Tensor tensor, const Sl
       }
     }
     case SliceMode::Array: {
-      auto options = torch::TensorOptions().dtype(torch::kLong).device(tensor.device());
-      at::Tensor idx = torch::tensor(spec.indices, options);
-      return tensor.index_select(dim, idx);
+      // Optional: build index path using pinned host staging to produce
+      // "Memcpy HtoD (Pinned)" instead of pageable in profilers.
+      bool pin_index = false;
+      if (const char* v = std::getenv("MON_NATIVE_PINNED_INDEX")) {
+        pin_index = (*v != '0');
+      }
+      if (pin_index) {
+        // Create a temporary CPU Long tensor from indices, then copy into
+        // a pinned host buffer and transfer to device non-blocking.
+        at::Tensor tmp = torch::tensor(spec.indices, torch::TensorOptions().dtype(torch::kLong));
+        auto host_opts = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU).pinned_memory(true);
+        at::Tensor idx_host = at::empty_like(tmp, host_opts);
+        idx_host.copy_(tmp, /*non_blocking=*/false);
+        at::Tensor idx = idx_host.to(tensor.device(), /*non_blocking=*/true, /*copy=*/true);
+        return tensor.index_select(dim, idx);
+      } else {
+        auto options = torch::TensorOptions().dtype(torch::kLong).device(tensor.device());
+        at::Tensor idx = torch::tensor(spec.indices, options);
+        return tensor.index_select(dim, idx);
+      }
     }
   }
   return tensor;

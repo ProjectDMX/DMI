@@ -239,7 +239,7 @@ def main() -> None:
     prompt_tokens = build_inputs(args.batch_size, args.prefill_tokens, tokenizer, device)
 
     print(
-        f"Using device: {device} | dtype: {args.dtype}"
+        f"Using device: {device} | dtype: {args.dtype} | cache_dtype: {args.cache_dtype}"
         f" | prefill_tokens={args.prefill_tokens} | decode_steps={args.decode_steps}"
         f" | collect_hidden={args.collect_hidden} | collect_attention={args.collect_attention}"
     )
