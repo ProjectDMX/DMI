@@ -229,9 +229,15 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
 
   // Host memcpy (pinned -> pageable) and store results
   mon_nvtx_push("MonEng::finalize_results");
+  // Strategy: Always convert pinned CPU results to pageable to avoid exhausting pinned memory.
+  // Three scenarios for CPU results:
+  // 1. Pool-backed pinned (block_id >= 0): copy to pageable + release pool block
+  // 2. Non-pool pinned (block_id < 0): copy to pageable + auto-release via refcount
+  // 3. Already pageable or GPU: store directly without host copy
   if (enable_host_copy_pool_) {
     for (auto& pr : results) {
-      if (pr.block_id >= 0) {
+      const bool need_repage = pr.tensor.defined() && pr.tensor.device().is_cpu() && pr.tensor.is_pinned();
+      if (need_repage) {
         // Enqueue copy job or process inline if queue is full
         CopyJob job{pr.tensor, pr.block_id, pr.token};
         bool enqueued = false;
@@ -255,7 +261,8 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
     }
   } else {
     for (auto& pr : results) {
-      if (pr.block_id >= 0) {
+      const bool need_repage = pr.tensor.defined() && pr.tensor.device().is_cpu() && pr.tensor.is_pinned();
+      if (need_repage) {
         CopyJob job{pr.tensor, pr.block_id, pr.token};
         process_copy_job(job);
       } else {

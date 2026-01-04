@@ -94,7 +94,7 @@ class MonitoringEngine:
         # Native builder (C++-side append of hooks) – strongest offload
         self._native_builder_enabled = bool(int(os.environ.get("MON_NATIVE_BUILDER", "1")))
         # Native callback (C++ hook) – eliminates Python hook overhead
-        self._native_callback_enabled = bool(int(os.environ.get("MON_NATIVE_CALLBACK", "0")))
+        self._native_callback_enabled = bool(int(os.environ.get("MON_NATIVE_CALLBACK", "1")))
         self._native_batch: Dict[int, Dict[str, list]] = {}
 
         # Stats (optional) --------------------------------------------------

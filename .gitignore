@@ -22,8 +22,7 @@ ENV/
 *.swo
 
 # Results and logs
-results/*/
-!results/.gitkeep
+results/
 logs/*.log
 *.pt.trace.json
 
