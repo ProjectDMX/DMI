@@ -34,8 +34,69 @@ py::dict NativeMonitoringEngine::Impl::get_stats() {
   return d;
 }
 
-void NativeMonitoringEngine::Impl::begin_step(int64_t step_id) {
+void NativeMonitoringEngine::Impl::set_capture_schedule(int64_t step_stride,
+                                                        int64_t step_offset,
+                                                        int64_t warmup_steps,
+                                                        bool capture_prefill,
+                                                        bool capture_decode,
+                                                        int64_t request_stride,
+                                                        int64_t request_offset,
+                                                        int64_t warmup_requests) {
+  schedule_.step_stride = std::max<int64_t>(1, step_stride);
+  schedule_.step_offset = std::max<int64_t>(0, step_offset);
+  schedule_.warmup_steps = std::max<int64_t>(0, warmup_steps);
+  schedule_.capture_prefill = capture_prefill;
+  schedule_.capture_decode = capture_decode;
+  schedule_.request_stride = std::max<int64_t>(1, request_stride);
+  schedule_.request_offset = std::max<int64_t>(0, request_offset);
+  schedule_.warmup_requests = std::max<int64_t>(0, warmup_requests);
+}
+
+bool NativeMonitoringEngine::Impl::should_capture_request(int64_t request_id) const {
+  if (request_id < schedule_.warmup_requests) {
+    return false;
+  }
+  int64_t effective = request_id - schedule_.warmup_requests;
+  if (effective < schedule_.request_offset) {
+    return false;
+  }
+  return ((effective - schedule_.request_offset) % schedule_.request_stride) == 0;
+}
+
+bool NativeMonitoringEngine::Impl::should_capture_step(int64_t step_id, int64_t phase) const {
+  StepPhase step_phase = static_cast<StepPhase>(phase);
+  if (step_phase == StepPhase::kPrefill && !schedule_.capture_prefill) {
+    return false;
+  }
+  if (step_phase == StepPhase::kDecode && !schedule_.capture_decode) {
+    return false;
+  }
+  if (step_id < schedule_.warmup_steps) {
+    return false;
+  }
+  int64_t effective = step_id - schedule_.warmup_steps;
+  if (effective < schedule_.step_offset) {
+    return false;
+  }
+  return ((effective - schedule_.step_offset) % schedule_.step_stride) == 0;
+}
+
+void NativeMonitoringEngine::Impl::update_capture_enabled(int64_t step_id, int64_t phase) {
+  bool req_enabled = request_capture_enabled_.load(std::memory_order_acquire);
+  bool step_enabled = should_capture_step(step_id, phase);
+  capture_enabled_.store(req_enabled && step_enabled, std::memory_order_release);
+}
+
+void NativeMonitoringEngine::Impl::begin_request(int64_t request_id) {
+  current_request_id_.store(request_id, std::memory_order_release);
+  bool enabled = should_capture_request(request_id);
+  request_capture_enabled_.store(enabled, std::memory_order_release);
+}
+
+void NativeMonitoringEngine::Impl::begin_step(int64_t step_id, int64_t phase) {
   current_step_id_.store(step_id, std::memory_order_release);
+  current_phase_.store(phase, std::memory_order_release);
+  update_capture_enabled(step_id, phase);
 }
 
 void NativeMonitoringEngine::Impl::record_callback_duration(int64_t us) {

@@ -28,7 +28,16 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
                                    const py::list& tasks,
                                    std::optional<uint64_t> stream_handle);
 
-  void begin_step(int64_t step_id);
+  void set_capture_schedule(int64_t step_stride,
+                            int64_t step_offset,
+                            int64_t warmup_steps,
+                            bool capture_prefill,
+                            bool capture_decode,
+                            int64_t request_stride,
+                            int64_t request_offset,
+                            int64_t warmup_requests);
+  void begin_request(int64_t request_id);
+  void begin_step(int64_t step_id, int64_t phase);
   void record_callback_duration(int64_t us);
 
   // Struct-of-arrays submit to minimize Python overhead

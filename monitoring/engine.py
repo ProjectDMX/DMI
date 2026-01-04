@@ -18,6 +18,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, 
 import torch
 
 from .task import CacheFuture, MonitoringTask
+from .config import MonitoringConfig
 
 try:  # Optional import to avoid circular dependency at runtime
     from transformer_lens.utils import Slice
@@ -53,11 +54,13 @@ class MonitoringEngine:
         queue_size: int = 0,
         cache_dtype: Optional[torch.dtype] = None,
         delay_steps: int = 0,
+        config: Optional[MonitoringConfig] = None,
     ) -> None:
         self.async_enabled = async_enabled
         self.cache_dtype = cache_dtype
         self._delay_steps = max(0, int(delay_steps))
         self._debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
+        self.config = config
 
         self._current_step_id: int = 0
         self._pending_tasks: Dict[int, List[Tuple[MonitoringTask, CacheFuture]]] = {}
@@ -76,9 +79,11 @@ class MonitoringEngine:
                 self._native_backend = native_backend
                 self._using_native_backend = True
                 try:
-                    native_backend.begin_step(int(self._current_step_id))  # initialise step tracking
+                    native_backend.begin_step(int(self._current_step_id), 0)  # initialise step tracking
                 except Exception:
                     pass
+                if self.config is not None:
+                    self._apply_capture_schedule()
             else:
                 python_backend = _PythonBackend(
                     queue_size=queue_size,
@@ -140,7 +145,7 @@ class MonitoringEngine:
 
         return future
 
-    def start_step(self) -> None:
+    def start_step(self, phase: Optional[str] = None) -> None:
         """Mark the beginning of a decode/prefill step."""
 
         if not (self.async_enabled and torch.cuda.is_available()):
@@ -155,16 +160,45 @@ class MonitoringEngine:
         if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
             _nvtx.range_push("MonEng::PyStartStep")
 
+        phase_code = 0
+        if phase == "prefill":
+            phase_code = 1
+        elif phase == "decode":
+            phase_code = 2
+
         self._current_step_id += 1
         if self._using_native_backend:
             backend = self._native_backend
             if backend is not None:
-                backend.begin_step(int(self._current_step_id))
+                backend.begin_step(int(self._current_step_id), phase_code)
         if self._debug:
             print(f"[MonEng] start_step -> step_id={self._current_step_id}")
 
         if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
             _nvtx.range_pop()
+
+    def begin_request(self, request_id: int) -> None:
+        """Mark the beginning of a request for request-level capture gating."""
+
+        if not (self.async_enabled and torch.cuda.is_available()):
+            return
+        if self._using_native_backend and self._native_backend is not None:
+            self._native_backend.begin_request(int(request_id))
+
+    def _apply_capture_schedule(self) -> None:
+        if not self._native_backend or self.config is None:
+            return
+        schedule = self.config.schedule
+        self._native_backend.set_capture_schedule(
+            int(schedule.step_stride),
+            int(schedule.step_offset),
+            int(schedule.warmup_steps),
+            bool(schedule.capture_prefill),
+            bool(schedule.capture_decode),
+            int(schedule.request_stride),
+            int(schedule.request_offset),
+            int(schedule.warmup_requests),
+        )
 
     def end_step(self) -> None:
         """Seal the current step and hand it to the backend."""

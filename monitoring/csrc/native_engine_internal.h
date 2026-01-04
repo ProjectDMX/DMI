@@ -77,6 +77,24 @@ struct HookConfig {
   std::optional<c10::Device> target_device;
 };
 
+enum class StepPhase : int64_t {
+  kUnknown = 0,
+  kPrefill = 1,
+  kDecode = 2,
+};
+
+struct CaptureSchedule {
+  int64_t step_stride{1};
+  int64_t step_offset{0};
+  int64_t warmup_steps{0};
+  bool capture_prefill{true};
+  bool capture_decode{true};
+
+  int64_t request_stride{1};
+  int64_t request_offset{0};
+  int64_t warmup_requests{0};
+};
+
 struct ResultSlot {
   std::mutex mutex;
   std::condition_variable cv;
@@ -101,7 +119,16 @@ struct NativeMonitoringEngine::Impl {
                                    const py::list& tasks,
                                    std::optional<uint64_t> stream_handle);
 
-  void begin_step(int64_t step_id);
+  void set_capture_schedule(int64_t step_stride,
+                            int64_t step_offset,
+                            int64_t warmup_steps,
+                            bool capture_prefill,
+                            bool capture_decode,
+                            int64_t request_stride,
+                            int64_t request_offset,
+                            int64_t warmup_requests);
+  void begin_request(int64_t request_id);
+  void begin_step(int64_t step_id, int64_t phase);
   void record_callback_duration(int64_t us);
 
   std::vector<int64_t> submit_step_soa(int64_t step_id,
@@ -142,6 +169,12 @@ struct NativeMonitoringEngine::Impl {
   SliceSpec parse_slice_py(py::object obj);
   TaskSpec parse_task_tuple(const py::tuple& task_tuple);
   SliceSpec parse_slice_tuple(const py::tuple& slice_tuple);
+  bool should_capture_request(int64_t request_id) const;
+  bool should_capture_step(int64_t step_id, int64_t phase) const;
+  void update_capture_enabled(int64_t step_id, int64_t phase);
+  bool is_capture_enabled() const {
+    return capture_enabled_.load(std::memory_order_acquire);
+  }
 
   std::shared_ptr<ResultSlot> get_slot(int64_t token);
   void remove_slot(int64_t token);
@@ -270,6 +303,11 @@ struct NativeMonitoringEngine::Impl {
   std::optional<at::ScalarType> cache_dtype_;
   int64_t delay_steps_{0};
   std::atomic<int64_t> current_step_id_{0};
+  std::atomic<int64_t> current_request_id_{0};
+  std::atomic<int64_t> current_phase_{static_cast<int64_t>(StepPhase::kUnknown)};
+  std::atomic<bool> request_capture_enabled_{true};
+  std::atomic<bool> capture_enabled_{true};
+  CaptureSchedule schedule_;
 
   std::thread worker_;
   std::atomic<bool> closed_{false};

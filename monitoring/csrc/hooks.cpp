@@ -63,6 +63,10 @@ HookConfig* NativeMonitoringEngine::Impl::upsert_hook_config_tuple(const std::st
 
 void NativeMonitoringEngine::Impl::append_hook_current_step(const HookConfig& cfg, at::Tensor tensor) {
   mon_nvtx_push("MonEng::append_hook_current_step");
+  if (!is_capture_enabled()) {
+    mon_nvtx_pop();
+    return;
+  }
   TaskSpec spec;
   spec.tensor = std::move(tensor);
   spec.slice_dim = cfg.pos_dim;
@@ -96,6 +100,10 @@ void NativeMonitoringEngine::Impl::append_hook_current_step(const HookConfig& cf
 
 int64_t NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg, at::Tensor tensor) {
   mon_nvtx_push("MonEng::add_task_from_config");
+  if (!is_capture_enabled()) {
+    mon_nvtx_pop();
+    return 0;
+  }
   TaskSpec spec;
   spec.tensor = std::move(tensor);
   spec.slice_dim = cfg.pos_dim;
@@ -158,6 +166,10 @@ void NativeMonitoringEngine::Impl::append_hook(int64_t step_id,
                                                py::object pos_slice,
                                                py::object target_device) {
   mon_nvtx_push("MonEng::append_hook");
+  if (!is_capture_enabled()) {
+    mon_nvtx_pop();
+    return;
+  }
   TaskSpec spec;
   spec.tensor = std::move(tensor);
   spec.remove_batch_dim = remove_batch_dim;

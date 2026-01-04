@@ -21,8 +21,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                                                                                      "NativeMonitoringEngine")
       .def("submit_step", &monitoring::NativeMonitoringEngine::submit_step,
            py::arg("step_id"), py::arg("tasks"), py::arg("stream_handle") = std::optional<uint64_t>())
+      .def("set_capture_schedule", &monitoring::NativeMonitoringEngine::set_capture_schedule,
+           py::arg("step_stride"), py::arg("step_offset"), py::arg("warmup_steps"),
+           py::arg("capture_prefill"), py::arg("capture_decode"),
+           py::arg("request_stride"), py::arg("request_offset"), py::arg("warmup_requests"))
+      .def("begin_request", &monitoring::NativeMonitoringEngine::begin_request,
+           py::arg("request_id"))
       .def("begin_step", &monitoring::NativeMonitoringEngine::begin_step,
-           py::arg("step_id"))
+           py::arg("step_id"), py::arg("phase") = static_cast<int64_t>(monitoring::StepPhase::kUnknown))
       .def("create_hook_callback", &monitoring::NativeMonitoringEngine::create_hook_callback,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("pos_slice"),
            py::arg("target_device") = py::none())

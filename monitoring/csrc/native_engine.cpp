@@ -23,7 +23,23 @@ std::vector<int64_t> NativeMonitoringEngine::submit_step(int64_t step_id,
   return impl_->submit_step(step_id, tasks, stream_handle);
 }
 
-void NativeMonitoringEngine::begin_step(int64_t step_id) { impl_->begin_step(step_id); }
+void NativeMonitoringEngine::set_capture_schedule(int64_t step_stride,
+                                                  int64_t step_offset,
+                                                  int64_t warmup_steps,
+                                                  bool capture_prefill,
+                                                  bool capture_decode,
+                                                  int64_t request_stride,
+                                                  int64_t request_offset,
+                                                  int64_t warmup_requests) {
+  impl_->set_capture_schedule(step_stride, step_offset, warmup_steps, capture_prefill,
+                              capture_decode, request_stride, request_offset, warmup_requests);
+}
+
+void NativeMonitoringEngine::begin_request(int64_t request_id) { impl_->begin_request(request_id); }
+
+void NativeMonitoringEngine::begin_step(int64_t step_id, int64_t phase) {
+  impl_->begin_step(step_id, phase);
+}
 void NativeMonitoringEngine::record_callback_duration(int64_t us) { impl_->record_callback_duration(us); }
 
 std::vector<int64_t> NativeMonitoringEngine::submit_step_soa(int64_t step_id,
@@ -51,6 +67,9 @@ py::object NativeMonitoringEngine::create_hook_callback(const std::string& hook_
       [engine, cfg_ptr](py::args args, py::kwargs /*kwargs*/) -> py::object {
         if (args.size() == 0) {
           throw std::runtime_error("Native callback expected tensor argument");
+        }
+        if (!engine->impl_->is_capture_enabled()) {
+          return py::none();
         }
         at::Tensor tensor = args[0].cast<at::Tensor>();
         auto t0 = std::chrono::steady_clock::now();
@@ -81,6 +100,10 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache(const std::st
       [engine, cfg_ptr, cache, hook_name_copy](py::args args, py::kwargs /*kwargs*/) -> py::object {
         if (args.size() == 0) {
           throw std::runtime_error("Native callback expected tensor argument");
+        }
+        if (!engine->impl_->is_capture_enabled()) {
+          cache[py::str(hook_name_copy.c_str())] = py::none();
+          return py::none();
         }
         at::Tensor tensor = args[0].cast<at::Tensor>();
         int64_t token = 0;
@@ -124,6 +147,10 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache_sig(const std
         if (args.size() == 0) {
           throw std::runtime_error("Native callback expected tensor argument");
         }
+        if (!engine->impl_->is_capture_enabled()) {
+          cache[py::str(hook_name_copy.c_str())] = py::none();
+          return py::none();
+        }
         at::Tensor tensor = args[0].cast<at::Tensor>();
         int64_t token = 0;
         auto t0 = std::chrono::steady_clock::now();
@@ -163,6 +190,9 @@ py::object NativeMonitoringEngine::create_global_hook_callback_sig(const std::st
       [engine, cfg_ptr, hook_name_copy](py::args args, py::kwargs /*kwargs*/) -> py::object {
         if (args.size() == 0) {
           throw std::runtime_error("Native callback expected tensor argument");
+        }
+        if (!engine->impl_->is_capture_enabled()) {
+          return py::none();
         }
         at::Tensor tensor = args[0].cast<at::Tensor>();
         auto t0 = std::chrono::steady_clock::now();
