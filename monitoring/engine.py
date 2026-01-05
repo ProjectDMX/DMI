@@ -61,6 +61,8 @@ class MonitoringEngine:
         self._delay_steps = max(0, int(delay_steps))
         self._debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
         self.config = config
+        self._request_capture_enabled = True
+        self._capture_enabled = True
 
         self._current_step_id: int = 0
         self._pending_tasks: Dict[int, List[Tuple[MonitoringTask, CacheFuture]]] = {}
@@ -161,10 +163,20 @@ class MonitoringEngine:
             _nvtx.range_push("MonEng::PyStartStep")
 
         phase_code = 0
+        phase_name = phase
         if phase == "prefill":
             phase_code = 1
         elif phase == "decode":
             phase_code = 2
+        else:
+            phase_name = "decode"
+
+        if self.config is not None:
+            schedule = self.config.schedule
+            step_enabled = schedule.should_capture_step(self._current_step_id + 1, phase_name)
+            self._capture_enabled = bool(self._request_capture_enabled and step_enabled)
+        else:
+            self._capture_enabled = True
 
         self._current_step_id += 1
         if self._using_native_backend:
@@ -182,8 +194,17 @@ class MonitoringEngine:
 
         if not (self.async_enabled and torch.cuda.is_available()):
             return
+        if self.config is not None:
+            self._request_capture_enabled = bool(
+                self.config.schedule.should_capture_request(int(request_id))
+            )
+        else:
+            self._request_capture_enabled = True
         if self._using_native_backend and self._native_backend is not None:
             self._native_backend.begin_request(int(request_id))
+
+    def is_capture_enabled(self) -> bool:
+        return bool(self._capture_enabled)
 
     def _apply_capture_schedule(self) -> None:
         if not self._native_backend or self.config is None:
