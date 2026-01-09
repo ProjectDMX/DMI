@@ -64,6 +64,9 @@ class HookSelection:
 
         return selected
 
+    def is_full(self) -> bool:
+        return self.mode == "full" and self.include is None and not self.exclude
+
 
 @dataclass
 class CaptureSchedule:

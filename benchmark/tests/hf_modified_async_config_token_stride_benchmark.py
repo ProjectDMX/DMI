@@ -18,7 +18,7 @@ from monitoring.config import CaptureSchedule, HookSelection, MonitoringConfig
 
 
 # EDIT ME: token stride values to test
-TOKEN_STRIDES = [1, 10, 30, 200]
+TOKEN_STRIDES = [1, 10, 30, 400]
 
 
 def parse_args() -> argparse.Namespace:
@@ -267,6 +267,7 @@ def run_config_case(
         config=config,
     )
     hf_hooked_model.monitoring_engine = monitoring_engine
+    init_ms = monitoring_engine.prepare_for_model(hf_hooked_model)
 
     lm_head = hf_model.lm_head
 
@@ -359,6 +360,7 @@ def run_config_case(
     metrics = {
         "main_duration": main_elapsed,
         "total_duration": total_elapsed,
+        "init_ms": init_ms,
         "tokens_per_second_main": total_decoded_tokens / main_elapsed if main_elapsed > 0 else float("inf"),
         "tokens_per_second_total": total_decoded_tokens / total_elapsed if total_elapsed > 0 else float("inf"),
     }
@@ -398,24 +400,43 @@ def main() -> None:
     )
 
     for stride in TOKEN_STRIDES:
-        cfg = MonitoringConfig(
-            hooks=base_hooks,
-            schedule=CaptureSchedule(
-                step_stride=int(stride),
-                step_offset=0,
-                warmup_steps=0,
-                capture_prefill=False,
-                capture_decode=True,
-                request_stride=1,
-                request_offset=0,
-                warmup_requests=0,
-            ),
-        )
+        if stride == 1:
+            # print("hooks is_full:", cfg.hooks.is_full(), "include=", cfg.hooks.include, "exclude=", cfg.hooks.exclude)
+            cfg = MonitoringConfig(
+                hooks=base_hooks,
+                schedule=CaptureSchedule(
+                    step_stride = 1,
+                    step_offset=0,
+                    warmup_steps=0,
+                    capture_prefill=True,
+                    capture_decode=True,
+                    request_stride=1,
+                    request_offset=0,
+                    warmup_requests=0,
+                )   
+            )
+        # print("hooks is_full:", cfg.hooks.is_full(), "include=", cfg.hooks.include, "exclude=", cfg.hooks.exclude)
+        else:
+            cfg = MonitoringConfig(
+                hooks=base_hooks,
+                schedule=CaptureSchedule(
+                    step_stride=int(stride),
+                    step_offset=0,
+                    warmup_steps=0,
+                    capture_prefill=True,
+                    capture_decode=True,
+                    request_stride=1,
+                    request_offset=0,
+                    warmup_requests=0,
+                ),
+            )
+        print("hooks is_full:", cfg.hooks.is_full(), "include=", cfg.hooks.include, "exclude=", cfg.hooks.exclude)
         label = f"token_stride_{stride}"
         results[label] = run_config_case(label, cfg, args, device, dtype, prompt_tokens)
         print(
             f"- {label}: main_duration={results[label]['main_duration']:.4f}s "
             f"total_duration={results[label]['total_duration']:.4f}s "
+            f"init_ms={results[label]['init_ms']:.2f} "
             f"main_token/s={results[label]['tokens_per_second_main']:.2f} "
             f"total_token/s={results[label]['tokens_per_second_total']:.2f}"
         )

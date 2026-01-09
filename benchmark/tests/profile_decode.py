@@ -29,6 +29,7 @@ from transformer_lens import HookedTransformer
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
 
 from monitoring import MonitoringEngine
+from monitoring.config import MonitoringConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -572,8 +573,14 @@ def main() -> None:
         cache_dtype=cache_dtype,
         queue_size=args.engine_queue_size,
         delay_steps=args.engine_delay_steps,
+        config=MonitoringConfig(),
     )
     hf_hooked_model.monitoring_engine = None
+    engine_init_ms = 0.0
+    try:
+        engine_init_ms = monitoring_engine.prepare_for_model(hf_hooked_model)
+    except Exception:
+        engine_init_ms = 0.0
 
     tl_model = HookedTransformer.from_pretrained(
         "gpt2",
@@ -1015,6 +1022,7 @@ def main() -> None:
     timings["hf_modified_hook_async"] = {
         "main_duration": main_async_decode_elapsed,
         "total_duration": total_async_decode_elapsed,
+        "init_ms": engine_init_ms,
         "tokens_per_second_main": total_decoded_tokens / main_async_decode_elapsed
         if main_async_decode_elapsed > 0
         else float("inf"),
@@ -1110,6 +1118,7 @@ def main() -> None:
             print(
                 f"- {label:>18}: main_duration={stats['main_duration']:.4f}s "
                 f"total_duration={stats['total_duration']:.4f}s"
+                f"{' init_ms=' + str(round(stats['init_ms'], 2)) if 'init_ms' in stats else ''}"
                 f" main_token/s={stats['tokens_per_second_main']:.2f}"
                 f" total_token/s={stats['tokens_per_second_total']:.2f}"
             )

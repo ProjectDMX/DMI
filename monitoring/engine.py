@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from queue import SimpleQueue
@@ -63,6 +64,10 @@ class MonitoringEngine:
         self.config = config
         self._request_capture_enabled = True
         self._capture_enabled = True
+        self._hook_cache_config_id: Optional[int] = None
+        self._hook_cache_key: Optional[int] = None
+        self._hook_cache_list: Optional[List[str]] = None
+        self._hook_cache_set: Optional[set[str]] = None
 
         self._current_step_id: int = 0
         self._pending_tasks: Dict[int, List[Tuple[MonitoringTask, CacheFuture]]] = {}
@@ -115,6 +120,7 @@ class MonitoringEngine:
         self._stats_py_bind_ms = 0.0       # binding tokens back to futures
         self._stats_py_resolve_ms = 0.0    # resolve_all + clear overhead
         self._stats_max_tasks_per_step = 0
+        self._last_prepare_ms = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -205,6 +211,66 @@ class MonitoringEngine:
 
     def is_capture_enabled(self) -> bool:
         return bool(self._capture_enabled)
+
+    def prepare_for_model(
+        self,
+        model: Any,
+        *,
+        names_filter: Any = None,
+        device: Optional[torch.device] = None,
+        remove_batch_dim: bool = False,
+        pos_slice: Any = None,
+    ) -> float:
+        """Initialize monitoring hooks for a model and return init time (ms)."""
+
+        start = time.perf_counter()
+        try:
+            if model is not None and hasattr(model, "prepare_monitoring"):
+                model.prepare_monitoring(
+                    names_filter=names_filter,
+                    device=device,
+                    remove_batch_dim=remove_batch_dim,
+                    pos_slice=pos_slice,
+                )
+        finally:
+            self._last_prepare_ms = (time.perf_counter() - start) * 1e3
+        return self._last_prepare_ms
+
+    def get_compiled_hook_names(
+        self,
+        hook_names: Iterable[str],
+        *,
+        cache_key: Optional[int] = None,
+    ) -> Optional[Tuple[List[str], set[str]]]:
+        """Compile and cache enabled hook names based on config.hooks."""
+
+        if self.config is None:
+            return None
+
+        cfg_id = id(self.config)
+        if self._hook_cache_config_id != cfg_id:
+            self._hook_cache_config_id = cfg_id
+            self._hook_cache_key = None
+            self._hook_cache_list = None
+            self._hook_cache_set = None
+
+        if (
+            cache_key is not None
+            and self._hook_cache_key == cache_key
+            and self._hook_cache_list is not None
+            and self._hook_cache_set is not None
+        ):
+            return self._hook_cache_list, self._hook_cache_set
+
+        try:
+            compiled_list = list(self.config.hooks.compile(hook_names))
+        except Exception:
+            return None
+
+        self._hook_cache_key = cache_key
+        self._hook_cache_list = compiled_list
+        self._hook_cache_set = set(compiled_list)
+        return self._hook_cache_list, self._hook_cache_set
 
     def _apply_capture_schedule(self) -> None:
         if not self._native_backend or self.config is None:

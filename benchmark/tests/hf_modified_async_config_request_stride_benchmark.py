@@ -267,6 +267,7 @@ def run_config_case(
         config=config,
     )
     hf_hooked_model.monitoring_engine = monitoring_engine
+    init_ms = monitoring_engine.prepare_for_model(hf_hooked_model)
 
     lm_head = hf_model.lm_head
 
@@ -359,6 +360,7 @@ def run_config_case(
     metrics = {
         "main_duration": main_elapsed,
         "total_duration": total_elapsed,
+        "init_ms": init_ms,
         "tokens_per_second_main": total_decoded_tokens / main_elapsed if main_elapsed > 0 else float("inf"),
         "tokens_per_second_total": total_decoded_tokens / total_elapsed if total_elapsed > 0 else float("inf"),
     }
@@ -416,6 +418,7 @@ def main() -> None:
         print(
             f"- {label}: main_duration={results[label]['main_duration']:.4f}s "
             f"total_duration={results[label]['total_duration']:.4f}s "
+            f"init_ms={results[label]['init_ms']:.2f} "
             f"main_token/s={results[label]['tokens_per_second_main']:.2f} "
             f"total_token/s={results[label]['tokens_per_second_total']:.2f}"
         )
