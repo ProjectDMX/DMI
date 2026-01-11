@@ -73,12 +73,14 @@ git submodule update --init --recursive
 ```bash
 conda env create -f environment.yml
 conda activate proj-dmx
+pip install -e transformers/  # Install local modified transformers
 ```
 
 ### Option 2: Pip
 
 ```bash
 pip install -r requirements.txt
+pip install -e transformers/  # Install local modified transformers
 ```
 
 ### Build C++ Extension
