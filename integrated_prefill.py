@@ -16,7 +16,7 @@ import time
 from transformerlens_interface import put_batch, TransformerLensHandle
 from hostengine import init_host_engine, terminate_host_engine
 
-# PYTHONPATH=<path_to_backend_dmx_repo>:<path_to_host_side_repo>/src:$PYTHONPATH python3 integrated.py clickhouse-driver
+# MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 PYTHONPATH=<path_to_backend_dmx_repo>:<path_to_host_side_repo>/src:$PYTHONPATH python3 integrated_prefill.py clickhouse-driver
 
 
 def make_logits_from_last_hidden_states_and_embeddings(base_model: PreTrainedModel, last_hidden_states):
@@ -88,12 +88,14 @@ def generate_prefill_data(offload_engine, tokenizer, base_model, prompt: str):
     # print(cache_dict['blocks.0.hook_resid_pre'].shape)
 
     engine.clear_completed_results()
-    cache_dict["token_ids"] = token
-    # print(outputs)
+    cache_dict["token_ids"] = token.cpu()
     logits = make_logits_from_last_hidden_states_and_embeddings(hf_hooked_model, outputs["last_hidden_state"])
-    cache_dict["final_logits"] = logits
+    cache_dict["final_logits"] = logits.cpu()
+    # print(outputs)
     # print(type(outputs))
-    print(cache_dict.keys())
+    # print(cache_dict.keys())
+    for key_name, dict_tensor in cache_dict.items():
+        assert dict_tensor.device.type == 'cpu', f"Expected tensor({key_name}) to be on CPU, but got: {dict_tensor.device}"
     return cache_dict
 
 
@@ -170,6 +172,7 @@ if __name__ == "__main__":
     )
 
     engine = MonitoringEngine(async_enabled=device.type == "cuda", config=config)
+    print(f"native: {getattr(engine, '_using_native_backend', False)}")
     
     hf_hooked_model = HookedGPT2Model.from_pretrained(
         model_id,
