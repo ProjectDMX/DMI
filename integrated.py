@@ -16,7 +16,7 @@ import time
 from transformerlens_interface import put_batch, TransformerLensHandle
 from hostengine import init_host_engine, terminate_host_engine
 
-# PYTHONPATH=./monitoring:./transformers/src:<path_to_host_side_repo>/src:$PYTHONPATH python3 integrated.py clickhouse-driver
+# PYTHONPATH=<path_to_backend_dmx_repo>:<path_to_host_side_repo>/src:$PYTHONPATH python3 integrated.py clickhouse-driver
 
 
 def make_logits_from_last_hidden_states_and_embeddings(base_model: PreTrainedModel, last_hidden_states):
