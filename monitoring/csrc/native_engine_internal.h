@@ -205,6 +205,7 @@ struct NativeMonitoringEngine::Impl {
   // D2H offload controls
   bool move_to_cpu_{false};
   bool use_pinned_{true};
+  bool auto_cleanup_{true};
 
   // Pinned memory pool (for stable GPU->CPU offload throughput)
   struct PinnedBlock {

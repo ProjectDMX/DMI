@@ -20,6 +20,9 @@ NativeMonitoringEngine::Impl::Impl(int64_t queue_size,
   if (const char* v = std::getenv("MON_NATIVE_PINNED")) {
     use_pinned_ = (*v != '0');
   }
+  if (const char* v = std::getenv("MON_NATIVE_AUTOCLEAR")) {
+    auto_cleanup_ = (*v != '0');
+  }
 
   // Configure pinned pool (enabled only when pinned offload is in use)
   enable_pinpool_ = false;
@@ -638,7 +641,7 @@ void NativeMonitoringEngine::Impl::worker_loop() {
 
     // Periodic cleanup to prevent ResultSlot accumulation
     ++steps_since_cleanup;
-    if (steps_since_cleanup >= CLEANUP_INTERVAL) {
+    if (auto_cleanup_ && steps_since_cleanup >= CLEANUP_INTERVAL) {
       mon_nvtx_push("MonEng::cleanup");
       clear_completed_results_internal();
       steps_since_cleanup = 0;
