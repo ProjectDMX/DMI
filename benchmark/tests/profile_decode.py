@@ -29,7 +29,13 @@ from transformer_lens import HookedTransformer
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
 
 from monitoring import MonitoringEngine
-from monitoring.config import MonitoringConfig
+from monitoring.config import CaptureSchedule, HookSelection, MonitoringConfig
+
+MINIMAL_MONITORING_HOOKS = [
+    "blocks.0.hook_resid_pre",
+    "blocks.0.hook_attn_out",
+    "blocks.0.hook_mlp_out",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,6 +111,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip profiling and only measure wallclock time (faster, no trace files)",
     )
+    parser.add_argument(
+        "--monitoring-bypass",
+        action="store_true",
+        help="Keep MonitoringEngine hooks active but disable all capture via schedule gating",
+    )
+    parser.add_argument(
+        "--hook-selection",
+        choices=["full", "attention", "mlp", "minimal"],
+        default="full",
+        help="Select which hooks MonitoringEngine enables (minimal keeps just a handful for overhead profiling)",
+    )
 
     args = parser.parse_args()
     if not args.collect_hidden and not args.collect_attention:
@@ -167,13 +184,15 @@ def measure_model(
     if device.type == "cuda":
         torch.cuda.synchronize()
 
+    nvtx.range_push(f"measure_{label}")
     start = time.perf_counter()
     fn()
 
     if device.type == "cuda":
         torch.cuda.synchronize()
-
-    return time.perf_counter() - start
+    elapsed = time.perf_counter() - start
+    nvtx.range_pop()
+    return elapsed
 
 
 def profile_model(
@@ -568,12 +587,31 @@ def main() -> None:
     hf_hooked_model.eval()
 
     cache_dtype = None if args.cache_dtype == "none" else map_hf_dtype(args.cache_dtype)
+    if args.hook_selection == "minimal":
+        hook_selection = HookSelection(mode="custom", include=MINIMAL_MONITORING_HOOKS)
+    else:
+        hook_selection = HookSelection(mode=args.hook_selection)
+
+    if args.monitoring_bypass:
+        schedule = CaptureSchedule(
+            capture_prefill=False,
+            capture_decode=False,
+            request_stride=10**12,
+        )
+    else:
+        schedule = CaptureSchedule()
+
+    monitoring_config = MonitoringConfig(
+        hooks=hook_selection,
+        schedule=schedule,
+    )
+
     monitoring_engine = MonitoringEngine(
         async_enabled=device.type == "cuda",
         cache_dtype=cache_dtype,
         queue_size=args.engine_queue_size,
         delay_steps=args.engine_delay_steps,
-        config=MonitoringConfig(),
+        config=monitoring_config,
     )
     hf_hooked_model.monitoring_engine = None
     engine_init_ms = 0.0
