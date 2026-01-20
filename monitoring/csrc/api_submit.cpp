@@ -14,6 +14,8 @@ py::dict NativeMonitoringEngine::Impl::get_stats() {
   d["submit_us"] = stats_submit_us_.load(std::memory_order_relaxed);
   d["process_us"] = stats_process_us_.load(std::memory_order_relaxed);
   d["callback_us"] = stats_callback_us_.load(std::memory_order_relaxed);
+  d["hook_calls"] = stats_hook_calls_.load(std::memory_order_relaxed);
+  d["hook_enqueued"] = stats_hook_enqueued_.load(std::memory_order_relaxed);
   if (enable_pinpool_) {
     d["pool_hits"] = stats_pool_hits_.load(std::memory_order_relaxed);
     d["pool_misses"] = stats_pool_misses_.load(std::memory_order_relaxed);

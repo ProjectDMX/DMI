@@ -201,7 +201,6 @@ py::object NativeMonitoringEngine::create_global_hook_callback_sig(const std::st
           if (tensor.requires_grad()) {
             tensor = tensor.detach();
           }
-          // Check enabled set
           bool enabled = false;
           {
             std::lock_guard<std::mutex> lk(engine->impl_->enabled_mutex_);
@@ -209,7 +208,6 @@ py::object NativeMonitoringEngine::create_global_hook_callback_sig(const std::st
           }
           if (enabled) {
             int64_t token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor));
-            // Record name->token for this step for later collection into Python cache
             int64_t step_id = engine->impl_->current_step_id_.load(std::memory_order_acquire);
             engine->impl_->record_step_name_token(step_id, hook_name_copy, token);
           }
@@ -219,6 +217,73 @@ py::object NativeMonitoringEngine::create_global_hook_callback_sig(const std::st
         engine->record_callback_duration(static_cast<int64_t>(us));
         return py::none();
       });
+}
+
+py::object NativeMonitoringEngine::register_hook_callback(py::object hook_point,
+                                                          const std::string& hook_name,
+                                                          const std::string& cache_name,
+                                                          bool is_backward,
+                                                          bool remove_batch_dim,
+                                                          py::tuple slice_tuple,
+                                                          py::object target_device,
+                                                          bool prepend) {
+  if (hook_point.is_none()) {
+    throw std::runtime_error("register_hook_callback requires a HookPoint module");
+  }
+
+  auto py_module = hook_point.cast<py::object>();
+  auto handle_attr_name = is_backward ? "register_full_backward_hook" : "register_forward_hook";
+  py::object register_fn = py_module.attr(handle_attr_name);
+
+  HookConfig* cfg_ptr = impl_->upsert_hook_config_tuple(hook_name, remove_batch_dim,
+                                                        std::move(slice_tuple), std::move(target_device));
+  auto engine = shared_from_this();
+  std::string gate_name = hook_name;
+  std::string cache_name_copy = cache_name;
+
+  py::object full_hook = py::cpp_function(
+      [engine, cfg_ptr, gate_name, cache_name_copy, is_backward](py::object /*module*/,
+                                                                py::object /*module_input*/,
+                                                                py::object module_output) -> py::object {
+        py::object tensor_obj;
+        if (is_backward) {
+          if (py::isinstance<py::tuple>(module_output)) {
+            py::tuple tup = module_output.cast<py::tuple>();
+            if (tup.size() == 0) {
+              return py::none();
+            }
+            tensor_obj = tup[0];
+          } else {
+            tensor_obj = module_output;
+          }
+        } else {
+          tensor_obj = module_output;
+        }
+
+        at::Tensor tensor = tensor_obj.cast<at::Tensor>();
+        auto t0 = std::chrono::steady_clock::now();
+        {
+          py::gil_scoped_release release;
+          engine->impl_->process_native_hook(*cfg_ptr, std::move(tensor), gate_name, cache_name_copy);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        engine->record_callback_duration(static_cast<int64_t>(us));
+        return py::none();
+      });
+
+  py::function reg_fn = register_fn.cast<py::function>();
+  py::tuple args(1);
+  args[0] = full_hook;
+  py::object handle;
+  if (prepend) {
+    py::dict kwargs;
+    kwargs["prepend"] = py::bool_(true);
+    handle = reg_fn.call(args.ptr(), kwargs.ptr());
+  } else {
+    handle = reg_fn.call(args.ptr(), nullptr);
+  }
+  return handle;
 }
 
 void NativeMonitoringEngine::set_enabled_hooks(py::object names_iterable) {

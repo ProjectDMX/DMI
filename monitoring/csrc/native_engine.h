@@ -71,6 +71,14 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
                                              bool remove_batch_dim,
                                              py::tuple slice_tuple,
                                              py::object target_device);
+  py::object register_hook_callback(py::object hook_point,
+                                    const std::string& hook_name,
+                                    const std::string& cache_name,
+                                    bool is_backward,
+                                    bool remove_batch_dim,
+                                    py::tuple slice_tuple,
+                                    py::object target_device,
+                                    bool prepend);
   void set_enabled_hooks(py::object names_iterable);
   void collect_step_futures_into(int64_t step_id, py::dict cache);
 

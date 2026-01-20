@@ -18,7 +18,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, 
 
 import torch
 
-from .task import CacheFuture, MonitoringTask
+from .task import CacheFuture, MonitoringTask, _encode_slice_native
 from .config import MonitoringConfig
 
 try:  # Optional import to avoid circular dependency at runtime
@@ -271,6 +271,37 @@ class MonitoringEngine:
         self._hook_cache_list = compiled_list
         self._hook_cache_set = set(compiled_list)
         return self._hook_cache_list, self._hook_cache_set
+
+    def register_native_hook(
+        self,
+        hook_point: Any,
+        hook_name: str,
+        *,
+        cache_name: Optional[str] = None,
+        is_backward: bool = False,
+        remove_batch_dim: bool = False,
+        pos_slice: Any = None,
+        device: Optional[torch.device] = None,
+        prepend: bool = False,
+    ) -> Any:
+        """Register a native callback directly on a HookPoint."""
+
+        if not (self._using_native_backend and self._native_backend is not None):
+            raise RuntimeError("Native backend is not available")
+
+        slice_tuple = _encode_slice_native(pos_slice)
+        target_device = device if device is not None else None
+        cache_label = cache_name or hook_name
+        return self._native_backend.register_hook_callback(
+            hook_point,
+            hook_name,
+            cache_label,
+            bool(is_backward),
+            bool(remove_batch_dim),
+            slice_tuple,
+            target_device,
+            bool(prepend),
+        )
 
     def _apply_capture_schedule(self) -> None:
         if not self._native_backend or self.config is None:

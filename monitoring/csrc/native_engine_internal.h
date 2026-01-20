@@ -163,6 +163,10 @@ struct NativeMonitoringEngine::Impl {
                                        py::object target_device);
   void append_hook_current_step(const HookConfig& cfg, at::Tensor tensor);
   int64_t add_task_from_config(const HookConfig& cfg, at::Tensor tensor);
+  int64_t process_native_hook(const HookConfig& cfg,
+                              at::Tensor tensor,
+                              const std::string& gate_name,
+                              const std::string& cache_name);
 
   // Internal helpers ----------------------------------------------------
   int64_t deduce_pos_dim(const std::string& name);
@@ -319,6 +323,8 @@ struct NativeMonitoringEngine::Impl {
   std::atomic<int64_t> stats_submit_us_{0};
   std::atomic<int64_t> stats_process_us_{0};
   std::atomic<int64_t> stats_callback_us_{0};
+  std::atomic<int64_t> stats_hook_calls_{0};
+  std::atomic<int64_t> stats_hook_enqueued_{0};
 };
 
 }  // namespace monitoring

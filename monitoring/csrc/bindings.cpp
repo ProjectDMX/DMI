@@ -41,6 +41,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("create_global_hook_callback_sig", &monitoring::NativeMonitoringEngine::create_global_hook_callback_sig,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
            py::arg("target_device") = py::none())
+      .def("register_hook_callback", &monitoring::NativeMonitoringEngine::register_hook_callback,
+           py::arg("hook_point"), py::arg("hook_name"), py::arg("cache_name"), py::arg("is_backward"),
+           py::arg("remove_batch_dim"), py::arg("slice_tuple"), py::arg("target_device"),
+           py::arg("prepend") = false)
       .def("set_enabled_hooks", &monitoring::NativeMonitoringEngine::set_enabled_hooks,
            py::arg("enabled_names"))
       .def("collect_step_futures_into", &monitoring::NativeMonitoringEngine::collect_step_futures_into,
