@@ -284,6 +284,30 @@ py::object NativeMonitoringEngine::register_hook_callback(py::object hook_point,
   return reg_fn(full_hook);
 }
 
+py::object NativeMonitoringEngine::create_inline_hook_ticket(const std::string& hook_name,
+                                                             bool remove_batch_dim,
+                                                             py::tuple slice_tuple,
+                                                             py::object target_device) {
+  HookConfig* cfg_ptr = impl_->upsert_hook_config_tuple(hook_name, remove_batch_dim,
+                                                        std::move(slice_tuple), std::move(target_device));
+  return py::capsule(cfg_ptr, "MonHookConfig");
+}
+
+void NativeMonitoringEngine::monitor_inline(py::object ticket,
+                                            const std::string& gate_name,
+                                            const std::string& cache_name,
+                                            at::Tensor tensor) {
+  if (!ticket || ticket.is_none()) {
+    throw std::runtime_error("monitor_inline requires a valid ticket");
+  }
+  py::capsule cap(ticket);
+  auto* cfg_ptr = static_cast<HookConfig*>(cap.get_pointer());
+  if (cfg_ptr == nullptr) {
+    throw std::runtime_error("Invalid inline hook ticket");
+  }
+  impl_->process_native_hook(*cfg_ptr, std::move(tensor), gate_name, cache_name);
+}
+
 void NativeMonitoringEngine::set_enabled_hooks(py::object names_iterable) {
   impl_->set_enabled_hooks(std::move(names_iterable));
 }

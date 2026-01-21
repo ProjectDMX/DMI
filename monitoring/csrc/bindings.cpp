@@ -45,6 +45,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("hook_point"), py::arg("hook_name"), py::arg("cache_name"), py::arg("is_backward"),
            py::arg("remove_batch_dim"), py::arg("slice_tuple"), py::arg("target_device"),
            py::arg("prepend") = false)
+      .def("create_inline_hook_ticket", &monitoring::NativeMonitoringEngine::create_inline_hook_ticket,
+           py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
+           py::arg("target_device") = py::none())
+      .def("monitor_inline", &monitoring::NativeMonitoringEngine::monitor_inline,
+           py::arg("ticket"), py::arg("hook_name"), py::arg("cache_name"), py::arg("tensor"))
       .def("set_enabled_hooks", &monitoring::NativeMonitoringEngine::set_enabled_hooks,
            py::arg("enabled_names"))
       .def("collect_step_futures_into", &monitoring::NativeMonitoringEngine::collect_step_futures_into,

@@ -167,6 +167,14 @@ struct NativeMonitoringEngine::Impl {
                               at::Tensor tensor,
                               const std::string& gate_name,
                               const std::string& cache_name);
+  py::capsule create_inline_hook_ticket(const std::string& hook_name,
+                                        bool remove_batch_dim,
+                                        py::tuple slice_tuple,
+                                        py::object target_device);
+  void monitor_inline(py::capsule ticket,
+                      const std::string& gate_name,
+                      const std::string& cache_name,
+                      at::Tensor tensor);
 
   // Internal helpers ----------------------------------------------------
   int64_t deduce_pos_dim(const std::string& name);

@@ -71,6 +71,14 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
                                              bool remove_batch_dim,
                                              py::tuple slice_tuple,
                                              py::object target_device);
+  py::object create_inline_hook_ticket(const std::string& hook_name,
+                                       bool remove_batch_dim,
+                                       py::tuple slice_tuple,
+                                       py::object target_device = py::none());
+  void monitor_inline(py::object ticket,
+                      const std::string& gate_name,
+                      const std::string& cache_name,
+                      at::Tensor tensor);
   py::object register_hook_callback(py::object hook_point,
                                     const std::string& hook_name,
                                     const std::string& cache_name,

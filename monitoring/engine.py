@@ -303,6 +303,36 @@ class MonitoringEngine:
             bool(prepend),
         )
 
+    def create_inline_hook_ticket(
+        self,
+        hook_name: str,
+        *,
+        remove_batch_dim: bool = False,
+        pos_slice: Any = None,
+        device: Optional[torch.device] = None,
+    ) -> Any:
+        if not (self._using_native_backend and self._native_backend is not None):
+            raise RuntimeError("Native backend is not available")
+        slice_tuple = _encode_slice_native(pos_slice)
+        target_device = device if device is not None else None
+        return self._native_backend.create_inline_hook_ticket(
+            hook_name,
+            bool(remove_batch_dim),
+            slice_tuple,
+            target_device,
+        )
+
+    def monitor_inline_hook(
+        self,
+        ticket: Any,
+        gate_name: str,
+        cache_name: str,
+        tensor: torch.Tensor,
+    ) -> None:
+        if not (self._using_native_backend and self._native_backend is not None):
+            return
+        self._native_backend.monitor_inline(ticket, gate_name, cache_name, tensor)
+
     def _apply_capture_schedule(self) -> None:
         if not self._native_backend or self.config is None:
             return
