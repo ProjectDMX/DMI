@@ -613,12 +613,43 @@ def main() -> None:
         delay_steps=args.engine_delay_steps,
         config=monitoring_config,
     )
-    hf_hooked_model.monitoring_engine = None
+    engine_attached_permanently = bool(args.monitoring_bypass)
+    original_monitoring_engine = hf_hooked_model.monitoring_engine
+    hf_hooked_model.monitoring_engine = monitoring_engine
     engine_init_ms = 0.0
     try:
         engine_init_ms = monitoring_engine.prepare_for_model(hf_hooked_model)
     except Exception:
         engine_init_ms = 0.0
+    finally:
+        if not engine_attached_permanently:
+            hf_hooked_model.monitoring_engine = original_monitoring_engine
+
+    if args.monitoring_bypass:
+        native_backend = getattr(monitoring_engine, "_native_backend", None)
+        native_using = bool(getattr(monitoring_engine, "_using_native_backend", False))
+        native_builder_enabled = bool(getattr(monitoring_engine, "_native_builder_enabled", False))
+        native_callback_enabled = bool(getattr(monitoring_engine, "_native_callback_enabled", False))
+        print(
+            "[Inline Debug] engine native_backend="
+            f"{'yes' if native_backend is not None else 'no'} "
+            f"using={native_using} builder={native_builder_enabled} callback={native_callback_enabled}"
+        )
+        inline_enabled = bool(getattr(hf_hooked_model, "_inline_monitoring_enabled", False))
+        sample_cfg = None
+        sample_name = None
+        for hp_name, hp in hf_hooked_model.hook_dict.items():
+            sample_cfg = getattr(hp, "_monitor_cfg", None)
+            if sample_cfg is not None:
+                sample_name = hp_name
+                break
+        print(
+            "[Inline Debug] enabled="
+            f"{inline_enabled} sample_hook={sample_name if sample_cfg is not None else 'none'} "
+            f"ticket={'yes' if sample_cfg is not None else 'no'}"
+        )
+        if not inline_enabled or sample_cfg is None:
+            raise RuntimeError("Inline monitoring not enabled; cannot run bypass-inline profile.")
 
     tl_model = HookedTransformer.from_pretrained(
         "gpt2",
@@ -787,7 +818,8 @@ def main() -> None:
 
     def hf_modified_hook_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
         previous_engine = hf_hooked_model.monitoring_engine
-        hf_hooked_model.monitoring_engine = None
+        if not engine_attached_permanently:
+            hf_hooked_model.monitoring_engine = None
         outputs, cache_dict = hf_hooked_model.run_with_cache(
             prefill_tokens,
             use_cache=True,
@@ -814,13 +846,15 @@ def main() -> None:
                 monitoring_engine.clear_completed_results()
         except Exception:
             pass
-        hf_hooked_model.monitoring_engine = previous_engine
+        if not engine_attached_permanently:
+            hf_hooked_model.monitoring_engine = previous_engine
         del hidden_states, logits, outputs
         return past, next_token
 
     def hf_modified_hook_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
         previous_engine = hf_hooked_model.monitoring_engine
-        hf_hooked_model.monitoring_engine = None
+        if not engine_attached_permanently:
+            hf_hooked_model.monitoring_engine = None
         outputs, cache_dict = hf_hooked_model.run_with_cache(
             token,
             use_cache=True,
@@ -847,7 +881,8 @@ def main() -> None:
                 monitoring_engine.clear_completed_results()
         except Exception:
             pass
-        hf_hooked_model.monitoring_engine = previous_engine
+        if not engine_attached_permanently:
+            hf_hooked_model.monitoring_engine = previous_engine
         del hidden_states, outputs
         return logits, next_past
 
@@ -1016,35 +1051,36 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    warmup(hf_modified_prefill, hf_modified_decode)
-    hf_modified_elapsed = run_benchmark(
-        "hf_modified",
-        lambda: run_decode(hf_modified_prefill, hf_modified_decode),
-    )
-    timings["hf_modified"] = {
-        "duration": hf_modified_elapsed,
-        "tokens_per_second": total_decoded_tokens / hf_modified_elapsed
-        if hf_modified_elapsed > 0
-        else float("inf"),
-    }
+    if not args.monitoring_bypass:
+        warmup(hf_modified_prefill, hf_modified_decode)
+        hf_modified_elapsed = run_benchmark(
+            "hf_modified",
+            lambda: run_decode(hf_modified_prefill, hf_modified_decode),
+        )
+        timings["hf_modified"] = {
+            "duration": hf_modified_elapsed,
+            "tokens_per_second": total_decoded_tokens / hf_modified_elapsed
+            if hf_modified_elapsed > 0
+            else float("inf"),
+        }
 
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    warmup(hf_modified_hook_prefill, hf_modified_hook_decode)
-    hf_modified_hook_elapsed = run_benchmark(
-        "hf_modified_hook",
-        lambda: run_decode(hf_modified_hook_prefill, hf_modified_hook_decode),
-    )
-    timings["hf_modified_hook"] = {
-        "duration": hf_modified_hook_elapsed,
-        "tokens_per_second": total_decoded_tokens / hf_modified_hook_elapsed
-        if hf_modified_hook_elapsed > 0
-        else float("inf"),
-    }
+        warmup(hf_modified_hook_prefill, hf_modified_hook_decode)
+        hf_modified_hook_elapsed = run_benchmark(
+            "hf_modified_hook",
+            lambda: run_decode(hf_modified_hook_prefill, hf_modified_hook_decode),
+        )
+        timings["hf_modified_hook"] = {
+            "duration": hf_modified_hook_elapsed,
+            "tokens_per_second": total_decoded_tokens / hf_modified_hook_elapsed
+            if hf_modified_hook_elapsed > 0
+            else float("inf"),
+        }
 
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     hf_hooked_model.monitoring_engine = monitoring_engine
     warmup(hf_modified_hook_async_prefill, hf_modified_hook_async_decode)
@@ -1068,7 +1104,8 @@ def main() -> None:
         if total_async_decode_elapsed > 0
         else float("inf"),
     }
-    hf_hooked_model.monitoring_engine = None
+    if not engine_attached_permanently:
+        hf_hooked_model.monitoring_engine = None
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
