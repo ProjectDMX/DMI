@@ -639,7 +639,7 @@ def main() -> None:
         sample_cfg = None
         sample_name = None
         for hp_name, hp in hf_hooked_model.hook_dict.items():
-            sample_cfg = getattr(hp, "_monitor_cfg", None)
+            sample_cfg = getattr(hp, "_monitor_handle", None)
             if sample_cfg is not None:
                 sample_name = hp_name
                 break

@@ -293,6 +293,34 @@ py::object NativeMonitoringEngine::create_inline_hook_ticket(const std::string& 
   return py::capsule(cfg_ptr, "MonHookConfig");
 }
 
+namespace {
+
+void InlineHandleDeleter(PyObject* capsule) {
+  void* ptr = PyCapsule_GetPointer(capsule, kInlineHandleTag);
+  if (ptr != nullptr) {
+    auto* handle = reinterpret_cast<InlineOpHandle*>(ptr);
+    delete handle;
+  }
+}
+
+}  // namespace
+
+py::capsule NativeMonitoringEngine::create_inline_monitor_handle(const std::string& hook_name,
+                                                                 const std::string& cache_name,
+                                                                 bool remove_batch_dim,
+                                                                 py::tuple slice_tuple,
+                                                                 py::object target_device) {
+  HookConfig* cfg_ptr = impl_->upsert_hook_config_tuple(hook_name, remove_batch_dim,
+                                                        std::move(slice_tuple), std::move(target_device));
+  auto inline_handle = std::make_unique<InlineOpHandle>();
+  inline_handle->engine = shared_from_this();
+  inline_handle->config = cfg_ptr;
+  inline_handle->gate_name = hook_name;
+  inline_handle->cache_name = cache_name;
+  auto* raw = inline_handle.release();
+  return py::capsule(raw, kInlineHandleTag, InlineHandleDeleter);
+}
+
 void NativeMonitoringEngine::monitor_inline(py::object ticket,
                                             const std::string& gate_name,
                                             const std::string& cache_name,
@@ -306,6 +334,28 @@ void NativeMonitoringEngine::monitor_inline(py::object ticket,
     throw std::runtime_error("Invalid inline hook ticket");
   }
   impl_->process_native_hook(*cfg_ptr, std::move(tensor), gate_name, cache_name);
+}
+
+at::Tensor monitor_activation(at::Tensor tensor, py::object handle_obj) {
+  if (handle_obj.is_none()) {
+    return tensor;
+  }
+  py::capsule capsule(handle_obj);
+  void* raw_handle = PyCapsule_GetPointer(capsule.ptr(), kInlineHandleTag);
+  auto* raw_ptr = reinterpret_cast<InlineOpHandle*>(raw_handle);
+  if (raw_ptr == nullptr) {
+    throw std::runtime_error("Invalid inline monitor handle");
+  }
+  auto engine = raw_ptr->engine;
+  if (!engine) {
+    return tensor;
+  }
+  {
+    py::gil_scoped_release release;
+    engine->impl_->process_native_hook(*(raw_ptr->config), std::move(tensor),
+                                       raw_ptr->gate_name, raw_ptr->cache_name);
+  }
+  return tensor;
 }
 
 void NativeMonitoringEngine::set_enabled_hooks(py::object names_iterable) {

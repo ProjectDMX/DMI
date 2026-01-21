@@ -77,6 +77,15 @@ struct HookConfig {
   std::optional<c10::Device> target_device;
 };
 
+struct InlineOpHandle {
+  std::shared_ptr<NativeMonitoringEngine> engine;
+  HookConfig* config{nullptr};
+  std::string gate_name;
+  std::string cache_name;
+};
+
+constexpr const char* kInlineHandleTag = "MonInlineHandle";
+
 enum class StepPhase : int64_t {
   kUnknown = 0,
   kPrefill = 1,

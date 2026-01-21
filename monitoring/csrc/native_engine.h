@@ -15,6 +15,8 @@ namespace monitoring {
 
 namespace py = pybind11;
 
+at::Tensor monitor_activation(at::Tensor tensor, py::object handle);
+
 class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitoringEngine> {
  public:
   NativeMonitoringEngine(int64_t queue_size,
@@ -75,6 +77,11 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
                                        bool remove_batch_dim,
                                        py::tuple slice_tuple,
                                        py::object target_device = py::none());
+  py::capsule create_inline_monitor_handle(const std::string& hook_name,
+                                           const std::string& cache_name,
+                                           bool remove_batch_dim,
+                                           py::tuple slice_tuple,
+                                           py::object target_device = py::none());
   void monitor_inline(py::object ticket,
                       const std::string& gate_name,
                       const std::string& cache_name,
@@ -105,6 +112,8 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   at::Tensor future_result(int64_t token, std::optional<double> timeout);
   void clear_completed_results();
   void close();
+
+  friend at::Tensor monitor_activation(at::Tensor tensor, py::object handle);
 
  private:
   struct Impl;

@@ -48,6 +48,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("create_inline_hook_ticket", &monitoring::NativeMonitoringEngine::create_inline_hook_ticket,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
            py::arg("target_device") = py::none())
+      .def("create_inline_monitor_handle", &monitoring::NativeMonitoringEngine::create_inline_monitor_handle,
+           py::arg("hook_name"), py::arg("cache_name"), py::arg("remove_batch_dim"),
+           py::arg("slice_tuple"), py::arg("target_device") = py::none())
       .def("monitor_inline", &monitoring::NativeMonitoringEngine::monitor_inline,
            py::arg("ticket"), py::arg("hook_name"), py::arg("cache_name"), py::arg("tensor"))
       .def("set_enabled_hooks", &monitoring::NativeMonitoringEngine::set_enabled_hooks,
@@ -75,4 +78,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("create_engine", &monitoring::create_engine,
         py::arg("queue_size"), py::arg("cache_dtype"), py::arg("delay_steps"));
+  m.def("monitor_activation", &monitoring::monitor_activation,
+        py::arg("tensor"), py::arg("handle"));
 }

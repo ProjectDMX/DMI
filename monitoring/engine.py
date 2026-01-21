@@ -322,6 +322,28 @@ class MonitoringEngine:
             target_device,
         )
 
+    def create_inline_monitor_handle(
+        self,
+        hook_name: str,
+        cache_name: Optional[str] = None,
+        *,
+        remove_batch_dim: bool = False,
+        pos_slice: Any = None,
+        device: Optional[torch.device] = None,
+    ) -> Any:
+        if not (self._using_native_backend and self._native_backend is not None):
+            raise RuntimeError("Native backend is not available")
+        slice_tuple = _encode_slice_native(pos_slice)
+        target_device = device if device is not None else None
+        cache_label = cache_name or hook_name
+        return self._native_backend.create_inline_monitor_handle(
+            hook_name,
+            cache_label,
+            bool(remove_batch_dim),
+            slice_tuple,
+            target_device,
+        )
+
     def monitor_inline_hook(
         self,
         ticket: Any,
