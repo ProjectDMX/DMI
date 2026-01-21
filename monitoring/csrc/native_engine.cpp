@@ -1,6 +1,7 @@
 // Top-level class thin wrappers and hook callback creation.
 
 #include "native_engine_internal.h"
+#include "nvtx_shim.h"
 
 namespace monitoring {
 
@@ -241,10 +242,12 @@ py::object NativeMonitoringEngine::register_hook_callback(py::object hook_point,
   std::string gate_name = hook_name;
   std::string cache_name_copy = cache_name;
 
+  std::string nvtx_label = std::string("MonEng::Hook[") + gate_name + (is_backward ? ":bwd]" : ":fwd]");
+
   py::object full_hook = py::cpp_function(
-      [engine, cfg_ptr, gate_name, cache_name_copy, is_backward](py::object /*module*/,
-                                                                py::object /*module_input*/,
-                                                                py::object module_output) -> py::object {
+      [engine, cfg_ptr, gate_name, cache_name_copy, is_backward, nvtx_label](py::object /*module*/,
+                                                                            py::object /*module_input*/,
+                                                                            py::object module_output) -> py::object {
         py::object tensor_obj;
         if (is_backward) {
           if (py::isinstance<py::tuple>(module_output)) {
@@ -262,10 +265,12 @@ py::object NativeMonitoringEngine::register_hook_callback(py::object hook_point,
 
         at::Tensor tensor = tensor_obj.cast<at::Tensor>();
         auto t0 = std::chrono::steady_clock::now();
+        mon_nvtx_push(nvtx_label.c_str());
         {
           py::gil_scoped_release release;
           engine->impl_->process_native_hook(*cfg_ptr, std::move(tensor), gate_name, cache_name_copy);
         }
+        mon_nvtx_pop();
         auto t1 = std::chrono::steady_clock::now();
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         engine->record_callback_duration(static_cast<int64_t>(us));
@@ -273,17 +278,10 @@ py::object NativeMonitoringEngine::register_hook_callback(py::object hook_point,
       });
 
   py::function reg_fn = register_fn.cast<py::function>();
-  py::tuple args(1);
-  args[0] = full_hook;
-  py::object handle;
   if (prepend) {
-    py::dict kwargs;
-    kwargs["prepend"] = py::bool_(true);
-    handle = reg_fn.call(args.ptr(), kwargs.ptr());
-  } else {
-    handle = reg_fn.call(args.ptr(), nullptr);
+    return reg_fn(full_hook, py::arg("prepend") = true);
   }
-  return handle;
+  return reg_fn(full_hook);
 }
 
 void NativeMonitoringEngine::set_enabled_hooks(py::object names_iterable) {
