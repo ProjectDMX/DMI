@@ -1,8 +1,9 @@
-"""Prefill + decode profiler benchmark comparing TransformerLens vs Hugging Face GPT-2."""
+"""Prefill + decode profiler benchmark for Hugging Face Qwen3 baselines."""
 
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -12,7 +13,7 @@ from torch.profiler import ProfilerActivity, profile, record_function, tensorboa
 from torch.utils.hooks import RemovableHandle
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2Model
+from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3Model
 
 try:
     import torch.cuda.nvtx as nvtx
@@ -25,16 +26,15 @@ except ImportError:
         @staticmethod
         def range_pop(): pass
 
-from transformer_lens import HookedTransformer
-from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
-
 from monitoring import MonitoringEngine
 from monitoring.config import MonitoringConfig
+
+MODEL_NAME = "Qwen/Qwen3-8B"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Profile GPT-2 prefill + decode across TransformerLens and Hugging Face baselines"
+        description="Profile Qwen3 prefill + decode across Hugging Face baselines"
     )
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size for the run")
     parser.add_argument(
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nvtx",
         action="store_true",
-        help="Enable NVTX annotations inside TransformerLens hooks (sets TL_ENABLE_NVTX=1)",
+        help="Enable NVTX annotations inside hook points (sets TL_ENABLE_NVTX=1)",
     )
     parser.add_argument(
         "--collect-hidden",
@@ -129,14 +129,6 @@ def map_hf_dtype(name: str) -> torch.dtype:
         "bf16": torch.bfloat16,
     }
     return mapping[name]
-
-
-def map_tl_dtype(name: str) -> str:
-    return {
-        "fp32": "float32",
-        "fp16": "float16",
-        "bf16": "bfloat16",
-    }[name]
 
 
 def build_inputs(
@@ -313,10 +305,10 @@ def setup_hf_decode_hook(
     collect_attention: bool,
     move_to_cpu: bool = False,
 ):
-    transformer = getattr(hf_model, "transformer", None)
-    blocks: Optional[Iterable[torch.nn.Module]] = getattr(transformer, "h", None) if transformer else None
+    model = getattr(hf_model, "model", None)
+    blocks: Optional[Iterable[torch.nn.Module]] = getattr(model, "layers", None) if model else None
     if not blocks:
-        raise RuntimeError("Unexpected GPT-2 architecture; transformer blocks not found.")
+        raise RuntimeError("Unexpected Qwen3 architecture; transformer blocks not found.")
 
     num_layers = len(blocks)
     attn_cache: List[Optional[torch.Tensor]] = [None] * num_layers
@@ -343,20 +335,18 @@ def setup_hf_decode_hook(
     extra_hooks: List[RemovableHandle] = []
 
     for idx, block in enumerate(blocks):
-        attn_module = block.attn
+        attn_module = block.self_attn
 
         if collect_attention:
             original_forward = attn_module.forward
 
             def wrapped_forward(*f_args, _orig=original_forward, _idx=idx, **f_kwargs):
-                if collector_enabled:
-                    f_kwargs["output_attentions"] = True
                 outputs = _orig(*f_args, **f_kwargs)
                 if not collector_enabled:
                     return outputs
 
                 if not isinstance(outputs, tuple) or len(outputs) != 2:
-                    raise RuntimeError("Unexpected GPT-2 attention output structure during hook capture.")
+                    raise RuntimeError("Unexpected Qwen3 attention output structure during hook capture.")
 
                 attn_output, attn_probs = outputs
                 attn_output_cache[_idx] = store_tensor(attn_output)
@@ -366,7 +356,25 @@ def setup_hf_decode_hook(
             attn_module.forward = wrapped_forward  # type: ignore[assignment]
             patched_attn.append((attn_module, original_forward))
 
-            def c_attn_hook(
+            def q_norm_hook(
+                module: torch.nn.Module,
+                module_input: Tuple[torch.Tensor, ...],
+                module_output: torch.Tensor,
+                _idx=idx,
+            ) -> None:
+                if collector_enabled:
+                    q_cache[_idx] = store_tensor(module_output.permute(0, 2, 1, 3).contiguous())
+
+            def k_norm_hook(
+                module: torch.nn.Module,
+                module_input: Tuple[torch.Tensor, ...],
+                module_output: torch.Tensor,
+                _idx=idx,
+            ) -> None:
+                if collector_enabled:
+                    k_cache[_idx] = store_tensor(module_output.permute(0, 2, 1, 3).contiguous())
+
+            def v_proj_hook(
                 module: torch.nn.Module,
                 module_input: Tuple[torch.Tensor, ...],
                 module_output: torch.Tensor,
@@ -375,23 +383,18 @@ def setup_hf_decode_hook(
             ) -> None:
                 if not collector_enabled:
                     return
-                q, k, v = module_output.split(_attn.split_size, dim=2)
-                num_heads = _attn.num_heads
+                batch, seq_len, _ = module_output.size()
                 head_dim = _attn.head_dim
+                num_kv_heads = _attn.config.num_key_value_heads
+                v_cache[_idx] = store_tensor(
+                    module_output.view(batch, seq_len, num_kv_heads, head_dim)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
 
-                def reshape(t: torch.Tensor) -> torch.Tensor:
-                    batch, seq_len, _ = t.size()
-                    return store_tensor(
-                        t.view(batch, seq_len, num_heads, head_dim)
-                        .permute(0, 2, 1, 3)
-                        .contiguous()
-                    )
-
-                q_cache[_idx] = reshape(q)
-                k_cache[_idx] = reshape(k)
-                v_cache[_idx] = reshape(v)
-
-            extra_hooks.append(attn_module.c_attn.register_forward_hook(c_attn_hook))
+            extra_hooks.append(attn_module.q_norm.register_forward_hook(q_norm_hook))
+            extra_hooks.append(attn_module.k_norm.register_forward_hook(k_norm_hook))
+            extra_hooks.append(attn_module.v_proj.register_forward_hook(v_proj_hook))
 
         if collect_hidden:
             def block_pre_hook(
@@ -450,8 +453,8 @@ def setup_hf_decode_hook(
 
             extra_hooks.append(block.register_forward_pre_hook(block_pre_hook))
             extra_hooks.append(block.register_forward_hook(block_post_hook))
-            extra_hooks.append(block.ln_1.register_forward_hook(ln1_hook))
-            extra_hooks.append(block.ln_2.register_forward_hook(ln2_hook))
+            extra_hooks.append(block.input_layernorm.register_forward_hook(ln1_hook))
+            extra_hooks.append(block.post_attention_layernorm.register_forward_hook(ln2_hook))
             extra_hooks.append(block.mlp.register_forward_pre_hook(mlp_pre_hook))
             extra_hooks.append(block.mlp.register_forward_hook(mlp_post_hook))
 
@@ -537,9 +540,8 @@ def main() -> None:
 
     device = pick_device(args.device)
     hf_dtype = map_hf_dtype(args.dtype)
-    tl_dtype = map_tl_dtype(args.dtype)
 
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -552,93 +554,22 @@ def main() -> None:
     )
 
     hf_model = AutoModelForCausalLM.from_pretrained(
-        "gpt2",
+        MODEL_NAME,
         attn_implementation="eager",
         torch_dtype=hf_dtype,
     )
     hf_model.to(device)
     hf_model.eval()
 
-    hf_hooked_model = HookedGPT2Model.from_pretrained(
-        "gpt2",
-        attn_implementation="eager",
-        torch_dtype=hf_dtype,
-    )
-    hf_hooked_model.to(device)
-    hf_hooked_model.eval()
-
-    cache_dtype = None if args.cache_dtype == "none" else map_hf_dtype(args.cache_dtype)
-    monitoring_engine = MonitoringEngine(
-        async_enabled=device.type == "cuda",
-        cache_dtype=cache_dtype,
-        queue_size=args.engine_queue_size,
-        delay_steps=args.engine_delay_steps,
-        config=MonitoringConfig(),
-    )
-    hf_hooked_model.monitoring_engine = None
-    engine_init_ms = 0.0
-    try:
-        engine_init_ms = monitoring_engine.prepare_for_model(hf_hooked_model)
-    except Exception:
-        engine_init_ms = 0.0
-
-    tl_model = HookedTransformer.from_pretrained(
-        "gpt2",
-        device=device,
-        dtype=tl_dtype,
-    )
-    tl_model.eval()
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    def tl_prefill(prefill_tensor: torch.Tensor = prompt_tokens) -> Tuple[HookedTransformerKeyValueCache, torch.Tensor]:
-        cache = HookedTransformerKeyValueCache.init_cache(
-            tl_model.cfg, device=device, batch_size=prefill_tensor.size(0)
-        )
-        logits = tl_model(prefill_tensor, return_type="logits", past_kv_cache=cache)
-        token = greedy_from_logits(logits)
-        del logits
-        return cache, token
-
-    def tl_decode(token: torch.Tensor, cache: HookedTransformerKeyValueCache) -> Tuple[torch.Tensor, HookedTransformerKeyValueCache]:
-        logits = tl_model(token, return_type="logits", past_kv_cache=cache)
-        return logits, cache
-
-    def tl_cache_prefill(prefill_tensor: torch.Tensor = prompt_tokens) -> Tuple[HookedTransformerKeyValueCache, torch.Tensor]:
-        cache = HookedTransformerKeyValueCache.init_cache(
-            tl_model.cfg, device=device, batch_size=prefill_tensor.size(0)
-        )
-        logits = tl_model(prefill_tensor, return_type="logits", past_kv_cache=cache)
-        token = greedy_from_logits(logits)
-        del logits
-        return cache, token
-
-    def tl_cache_decode(token: torch.Tensor, cache: HookedTransformerKeyValueCache) -> Tuple[torch.Tensor, HookedTransformerKeyValueCache]:
-        def names_filter(name: str) -> bool:
-            lname = name.lower()
-            if args.collect_hidden and args.collect_attention:
-                return True
-            if args.collect_attention:
-                return "attn" in lname
-            return "attn" not in lname
-
-        logits, cache_dict = tl_model.run_with_cache(
-            token,
-            return_cache_object=False,
-            remove_batch_dim=False,
-            past_kv_cache=cache,
-            names_filter=names_filter,
-        )
-        cache_dict.clear()
-        try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
-        except Exception:
-            pass
-        return logits, cache
-
     lm_head = hf_model.lm_head
+    lm_head_state = {
+        name: param.detach().cpu()
+        for name, param in lm_head.state_dict().items()
+    }
+    lm_head_dtype = next(lm_head.parameters()).dtype
+    lm_head_in_features = lm_head.in_features
+    lm_head_out_features = lm_head.out_features
+    lm_head_has_bias = lm_head.bias is not None
 
     def project_logits(hidden_states: torch.Tensor) -> torch.Tensor:
         return lm_head(hidden_states)
@@ -934,28 +865,6 @@ def main() -> None:
 
         print("Running benchmarks WITH profiling (trace files will be generated)")
 
-    warmup(tl_prefill, tl_decode)
-    tl_elapsed = run_benchmark("transformer_lens", lambda: run_decode(tl_prefill, tl_decode))
-    timings["transformer_lens"] = {
-        "duration": tl_elapsed,
-        "tokens_per_second": total_decoded_tokens / tl_elapsed if tl_elapsed > 0 else float("inf"),
-    }
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    warmup(tl_cache_prefill, tl_cache_decode)
-    tl_cache_elapsed = run_benchmark(
-        "transformer_lens_cache", lambda: run_decode(tl_cache_prefill, tl_cache_decode)
-    )
-    timings["transformer_lens_cache"] = {
-        "duration": tl_cache_elapsed,
-        "tokens_per_second": total_decoded_tokens / tl_cache_elapsed if tl_cache_elapsed > 0 else float("inf"),
-    }
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
     warmup(hf_prefill_fn, hf_decode_fn)
     hf_elapsed = run_benchmark("huggingface", lambda: run_decode(hf_prefill_fn, hf_decode_fn))
     timings["huggingface"] = {
@@ -977,6 +886,85 @@ def main() -> None:
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
+
+    hf_hook_prefill, hf_hook_decode, hf_hook_cleanup = setup_hf_decode_hook(
+        hf_model,
+        collect_hidden=args.collect_hidden,
+        collect_attention=args.collect_attention,
+        move_to_cpu=False,
+    )
+    warmup(hf_hook_prefill, hf_hook_decode)
+    try:
+        hf_hook_elapsed = run_benchmark(
+            "huggingface_hook", lambda: run_decode(hf_hook_prefill, hf_hook_decode)
+        )
+        timings["huggingface_hook"] = {
+            "duration": hf_hook_elapsed,
+            "tokens_per_second": total_decoded_tokens / hf_hook_elapsed if hf_hook_elapsed > 0 else float("inf"),
+        }
+    finally:
+        hf_hook_cleanup()
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    hf_hook_cpu_prefill, hf_hook_cpu_decode, hf_hook_cpu_cleanup = setup_hf_decode_hook(
+        hf_model,
+        collect_hidden=args.collect_hidden,
+        collect_attention=args.collect_attention,
+        move_to_cpu=True,
+    )
+    warmup(hf_hook_cpu_prefill, hf_hook_cpu_decode)
+    try:
+        hf_hook_cpu_elapsed = run_benchmark(
+            "huggingface_hook_cpu",
+            lambda: run_decode(hf_hook_cpu_prefill, hf_hook_cpu_decode),
+        )
+        timings["huggingface_hook_cpu"] = {
+            "duration": hf_hook_cpu_elapsed,
+            "tokens_per_second": total_decoded_tokens / hf_hook_cpu_elapsed if hf_hook_cpu_elapsed > 0 else float("inf"),
+        }
+    finally:
+        hf_hook_cpu_cleanup()
+
+    lm_head = None
+    hf_model.to("cpu")
+    del hf_model
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    hf_hooked_model = HookedQwen3Model.from_pretrained(
+        MODEL_NAME,
+        attn_implementation="eager",
+        torch_dtype=hf_dtype,
+    )
+    hf_hooked_model.to(device)
+    hf_hooked_model.eval()
+    lm_head = torch.nn.Linear(
+        lm_head_in_features,
+        lm_head_out_features,
+        bias=lm_head_has_bias,
+        dtype=lm_head_dtype,
+    )
+    lm_head.load_state_dict(lm_head_state)
+    lm_head.to(device=device, dtype=lm_head_dtype)
+    lm_head.eval()
+
+    cache_dtype = None if args.cache_dtype == "none" else map_hf_dtype(args.cache_dtype)
+    monitoring_engine = MonitoringEngine(
+        async_enabled=device.type == "cuda",
+        cache_dtype=cache_dtype,
+        queue_size=args.engine_queue_size,
+        delay_steps=args.engine_delay_steps,
+        config=MonitoringConfig(),
+    )
+    hf_hooked_model.monitoring_engine = None
+    engine_init_ms = 0.0
+    try:
+        engine_init_ms = monitoring_engine.prepare_for_model(hf_hooked_model)
+    except Exception:
+        engine_init_ms = 0.0
 
     warmup(hf_modified_prefill, hf_modified_decode)
     hf_modified_elapsed = run_benchmark(
@@ -1035,46 +1023,6 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    hf_hook_prefill, hf_hook_decode, hf_hook_cleanup = setup_hf_decode_hook(
-        hf_model,
-        collect_hidden=args.collect_hidden,
-        collect_attention=args.collect_attention,
-        move_to_cpu=False,
-    )
-    warmup(hf_hook_prefill, hf_hook_decode)
-    try:
-        hf_hook_elapsed = run_benchmark(
-            "huggingface_hook", lambda: run_decode(hf_hook_prefill, hf_hook_decode)
-        )
-        timings["huggingface_hook"] = {
-            "duration": hf_hook_elapsed,
-            "tokens_per_second": total_decoded_tokens / hf_hook_elapsed if hf_hook_elapsed > 0 else float("inf"),
-        }
-    finally:
-        hf_hook_cleanup()
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    hf_hook_cpu_prefill, hf_hook_cpu_decode, hf_hook_cpu_cleanup = setup_hf_decode_hook(
-        hf_model,
-        collect_hidden=args.collect_hidden,
-        collect_attention=args.collect_attention,
-        move_to_cpu=True,
-    )
-    warmup(hf_hook_cpu_prefill, hf_hook_cpu_decode)
-    try:
-        hf_hook_cpu_elapsed = run_benchmark(
-            "huggingface_hook_cpu",
-            lambda: run_decode(hf_hook_cpu_prefill, hf_hook_cpu_decode),
-        )
-        timings["huggingface_hook_cpu"] = {
-            "duration": hf_hook_cpu_elapsed,
-            "tokens_per_second": total_decoded_tokens / hf_hook_cpu_elapsed if hf_hook_cpu_elapsed > 0 else float("inf"),
-        }
-    finally:
-        hf_hook_cpu_cleanup()
-
     monitoring_engine.close()
 
     # Save timing results to JSON file
@@ -1127,7 +1075,7 @@ def main() -> None:
         print("\nProfiler traces written under:")
         print(f"  {traces_path.resolve()}")
     if args.nvtx and device.type == "cuda":
-        print("NVTX annotations enabled for TransformerLens decode hooks (set TL_ENABLE_NVTX=1).")
+        print("NVTX annotations enabled for hook point decode paths (set TL_ENABLE_NVTX=1).")
 
     # If engine stats are enabled, also print hook-side stats even for sync baselines.
     try:

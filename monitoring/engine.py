@@ -21,10 +21,7 @@ import torch
 from .task import CacheFuture, MonitoringTask
 from .config import MonitoringConfig
 
-try:  # Optional import to avoid circular dependency at runtime
-    from transformer_lens.utils import Slice
-except Exception:  # pragma: no cover - transformer_lens may be absent in some envs
-    Slice = None
+from .utils import Slice
 
 
 _QUEUE_SENTINEL = object()
@@ -488,9 +485,7 @@ class MonitoringEngine:
                 # Hook-side stats from TL integration (optional)
                 try:
                     # The hook module path in this repo
-                    from transformers.models.gpt2_p.hook_points import (  # type: ignore
-                        get_monitoring_hook_stats,
-                    )
+                    from monitoring.hook_points import get_monitoring_hook_stats
                     hook_stats = get_monitoring_hook_stats()
                     if hook_stats:
                         print("[Hook/Stats]", hook_stats)

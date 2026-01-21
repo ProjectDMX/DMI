@@ -6,11 +6,7 @@ import torch
 
 from monitoring import MonitoringEngine, MonitoringTask
 from monitoring.task import CacheFuture
-
-try:
-    from transformer_lens.utils import Slice
-except Exception:  # pragma: no cover
-    Slice = None
+from monitoring.utils import Slice
 
 
 def test_cache_future_waits_for_result():

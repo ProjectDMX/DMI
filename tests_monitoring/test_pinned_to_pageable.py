@@ -16,11 +16,6 @@ import torch
 from monitoring import MonitoringEngine
 from monitoring.task import MonitoringTask
 
-try:
-    from transformer_lens.utils import Slice
-except Exception:  # pragma: no cover
-    Slice = None
-
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_pinned_to_pageable_no_pool():

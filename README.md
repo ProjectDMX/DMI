@@ -123,7 +123,7 @@ Compares multiple inference approaches (TransformerLens, HuggingFace, HookedGPT2
 
 
 # Basic run
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/tests/profile_decode.py --batch-size 64 --steps 1 --warmup 1 --collect-hidden --collect-attention --no-profile
+MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/tests/profile_decode_qwen3.py --batch-size 1 --steps 1 --warmup 1 --collect-hidden --collect-attention --no-profile --dtype fp8
 
 # With nsight profiling
 MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 TL_ENABLE_NVTX=1 nsys profile --output=your_results_path/xxx --force-overwrite=true --trace=cuda,nvtx,osrt --sample=cpu --sampling-period=1000000 --cpuctxsw=process-tree --cuda-memory-usage=false  python benchmark/tests/profile_decode.py. --profile-dir your_results_dir/xxx. --batch-size 64  --decode-steps 64  --collect-hidden  --collect-attention  --steps 1  --warmup 1  --no-profile

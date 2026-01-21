@@ -10,10 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-try:  # Optional dependency available when transformer_lens is installed
-    from transformer_lens.utils import Slice  # type: ignore
-except Exception:  # pragma: no cover - transformer_lens may be absent
-    Slice = None  # type: ignore[assignment]
+from .utils import Slice
 
 # A lightweight payload that can be consumed directly by the native backend.
 SlicePayload = Tuple[Any, ...]
