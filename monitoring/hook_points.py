@@ -741,6 +741,18 @@ class HookedRootModule(nn.Module):
         except Exception:
             pass
 
+        # Register host_engine DB submission (native backend only).
+        try:
+            engine = self.monitoring_engine
+            if engine is not None and hasattr(engine, "_register_db_step"):
+                input_ids = model_kwargs.get("input_ids") if model_kwargs else None
+                if input_ids is None and model_args:
+                    input_ids = model_args[0]
+                past_key_values = model_kwargs.get("past_key_values") if model_kwargs else None
+                engine._register_db_step(cache_dict, input_ids, past_key_values)
+        except Exception:
+            pass
+
         return model_out, cache_dict
 
     def prepare_monitoring(

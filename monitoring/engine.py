@@ -42,6 +42,18 @@ def _serialize_task(task: MonitoringTask) -> tuple[Any, int, bool, bool, Any, Op
     return task.native_payload
 
 
+@dataclass
+class HostEngineConfig:
+    """Configuration wrapper for dmx_host PipelinedEngine."""
+
+    stages: Sequence[Any]
+    input_handler: Any
+    engine_config: Optional[Any] = None
+    output_handler: Optional[Any] = None
+    logger: Optional[Any] = None
+    start_on_init: bool = True
+
+
 class MonitoringEngine:
     """High-level wrapper that routes monitoring tasks to a backend."""
 
@@ -53,6 +65,9 @@ class MonitoringEngine:
         cache_dtype: Optional[torch.dtype] = None,
         delay_steps: int = 0,
         config: Optional[MonitoringConfig] = None,
+        model_id: Optional[str] = None,
+        host_engine: Optional[Any] = None,
+        db_config: Optional[HostEngineConfig] = None,
     ) -> None:
         self.async_enabled = async_enabled
         self.cache_dtype = cache_dtype
@@ -68,6 +83,11 @@ class MonitoringEngine:
 
         self._current_step_id: int = 0
         self._pending_tasks: Dict[int, List[Tuple[MonitoringTask, CacheFuture]]] = {}
+        self._pending_db_step: Optional[Tuple[Tuple[str, str], int, Dict[str, Any]]] = None
+        self._model_id = model_id
+        self._auto_request_id = 0
+        self._auto_start_token_idx = 0
+        self._auto_active_request_key: Optional[Tuple[str, str]] = None
 
         # Backend references are populated on demand. When a native backend is
         # unavailable we fall back to the Python implementation.
@@ -75,6 +95,10 @@ class MonitoringEngine:
         self._python_backend: Optional[_PythonBackend] = None
         self._native_backend: Optional[Any] = None
         self._using_native_backend = False
+
+        # Host-side DB engine (optional; C++ backend only)
+        self._host_engine: Optional[Any] = None
+        self._host_engine_enabled = False
 
         if async_enabled and torch.cuda.is_available():
             native_backend = _load_native_backend(queue_size, cache_dtype, self._delay_steps)
@@ -97,6 +121,33 @@ class MonitoringEngine:
                 )
                 self._backend = python_backend
                 self._python_backend = python_backend
+
+        if host_engine is not None and db_config is not None:
+            raise ValueError("Provide either host_engine or db_config, not both")
+
+        if host_engine is not None or db_config is not None:
+            if self._model_id is None:
+                raise ValueError("model_id is required when host_engine integration is enabled")
+            self._host_engine = host_engine
+            if self._host_engine is None and db_config is not None:
+                try:
+                    from dmx_host.engine import PipelinedEngine  # type: ignore
+                except Exception as exc:
+                    raise RuntimeError("Failed to import dmx_host engine") from exc
+                self._host_engine = PipelinedEngine(
+                    db_config.stages,
+                    input_handler=db_config.input_handler,
+                    config=db_config.engine_config,
+                    logger=db_config.logger,
+                    output_handler=db_config.output_handler,
+                )
+            if self._host_engine is not None:
+                try:
+                    if db_config is None or db_config.start_on_init:
+                        self._host_engine.start()
+                except Exception as exc:
+                    raise RuntimeError("Failed to start host_engine") from exc
+                self._host_engine_enabled = True
 
         # Native batch (SoA) aggregation buffers (optional)
         self._native_batch_enabled = bool(int(os.environ.get("MON_NATIVE_BATCH", "0")))
@@ -284,6 +335,93 @@ class MonitoringEngine:
             int(schedule.warmup_requests),
         )
 
+    def _register_db_step(
+        self,
+        cache_dict: Dict[str, Any],
+        input_ids: Any,
+        past_key_values: Any,
+    ) -> None:
+        if not self._host_engine_enabled:
+            return
+        if not self._using_native_backend:
+            return
+        if self._model_id is None:
+            return
+        if not self._capture_enabled:
+            return
+
+        # Require native callback path to populate futures in cache_dict.
+        if not (self._native_builder_enabled and self._native_callback_enabled):
+            return
+
+        if input_ids is None or not hasattr(input_ids, "shape"):
+            return
+
+        try:
+            input_shape = tuple(input_ids.shape)
+        except Exception:
+            return
+        if not input_shape:
+            return
+
+        try:
+            token_len = int(input_shape[1]) if len(input_shape) > 1 else int(input_shape[0])
+        except Exception:
+            return
+        if token_len <= 0:
+            return
+
+        if past_key_values is None or self._auto_active_request_key is None:
+            request_id = f"{self._auto_request_id}"
+            self._auto_request_id += 1
+            self._auto_start_token_idx = 0
+            self._auto_active_request_key = (self._model_id, request_id)
+
+        key = self._auto_active_request_key
+        if key is None:
+            return
+
+        start_idx = int(self._auto_start_token_idx)
+        if start_idx < 0:
+            start_idx = 0
+
+        if not isinstance(cache_dict, dict) or not cache_dict:
+            return
+
+        # Filter alias names to avoid duplicate DB entries.
+        filtered: Dict[str, Any] = {
+            k: v
+            for k, v in cache_dict.items()
+            if not k.startswith("h.") and not k.startswith("transformer.")
+        }
+        # Drop entries without future-like result.
+        filtered = {k: v for k, v in filtered.items() if hasattr(v, "result")}
+
+        if not filtered:
+            return
+
+        self._pending_db_step = (key, start_idx, filtered)
+        self._auto_start_token_idx += token_len
+
+    def _submit_pending_db_step(self) -> None:
+        if not self._host_engine_enabled or self._host_engine is None:
+            return
+        if not self._using_native_backend:
+            return
+
+        payload = self._pending_db_step
+        if payload is None:
+            return
+
+        key, start_idx, cache_dict = payload
+        try:
+            self._host_engine.submit([key], [start_idx], [cache_dict])
+        except Exception as exc:
+            if self._debug:
+                print(f"[MonEng] host_engine.submit failed: {exc}")
+        finally:
+            self._pending_db_step = None
+
     def end_step(self) -> None:
         """Seal the current step and hand it to the backend."""
 
@@ -332,6 +470,9 @@ class MonitoringEngine:
                 else:
                     # No tasks actually aggregated; seal to maintain ordering
                     backend.seal_step(step_id, stream_handle)
+                self._submit_pending_db_step()
+                if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+                    _nvtx.range_pop()
                 return
 
             if tasks:
@@ -374,6 +515,7 @@ class MonitoringEngine:
                     self._stats_steps += 1
                 else:
                     backend.seal_step(step_id, stream_handle)
+            self._submit_pending_db_step()
             if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
                 _nvtx.range_pop()
             return
@@ -445,6 +587,14 @@ class MonitoringEngine:
     def close(self) -> None:
         """Tear down backend resources."""
 
+        if self._host_engine is not None and not self._using_native_backend:
+            try:
+                self._host_engine.stop()
+            except Exception:
+                pass
+            self._host_engine = None
+            self._host_engine_enabled = False
+
         if self._using_native_backend:
             backend = self._native_backend
             if backend is None:
@@ -491,6 +641,13 @@ class MonitoringEngine:
                         print("[Hook/Stats]", hook_stats)
                 except Exception:
                     pass
+            if self._host_engine is not None:
+                try:
+                    self._host_engine.stop()
+                except Exception:
+                    pass
+                self._host_engine = None
+                self._host_engine_enabled = False
             self.clear_completed_results()
             backend.close()
             self._native_backend = None
