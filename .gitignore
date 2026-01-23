@@ -25,6 +25,8 @@ ENV/
 results/
 logs/*.log
 *.pt.trace.json
+notebooks/
+test_gpu_mem_leak.py
 
 # System files
 .DS_Store
