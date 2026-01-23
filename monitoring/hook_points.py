@@ -637,6 +637,7 @@ class HookedRootModule(nn.Module):
     def run_with_cache(
         self,
         *model_args: Any,
+        forward_fn: Optional[Callable[..., Any]] = None,
         names_filter: NamesFilter = None,
         device: DeviceType = None,
         remove_batch_dim: bool = False,
@@ -651,6 +652,8 @@ class HookedRootModule(nn.Module):
 
         Args:
             *model_args: Positional arguments for the model.
+            forward_fn (Callable, optional): Override the forward callable used to run the model.
+                Defaults to calling the model instance directly.
             names_filter (NamesFilter, optional): A filter for which activations to cache. Accepts None, str,
                 list of str, or a function that takes a string and returns a bool. Defaults to None, which
                 means cache everything.
@@ -677,6 +680,7 @@ class HookedRootModule(nn.Module):
         """
 
         pos_slice = Slice.unwrap(pos_slice)
+        call_forward = forward_fn if forward_fn is not None else self
 
         # Build hooks list and cache dict (CPU work)
         with _nvtx_range("TL::GetCachingHooks"):
@@ -711,13 +715,13 @@ class HookedRootModule(nn.Module):
             ):
                 # Main forward (and optional backward) on the critical path
                 with _nvtx_range("TL::ModelForward"):
-                    model_out = self(*model_args, **model_kwargs)
+                    model_out = call_forward(*model_args, **model_kwargs)
                     if incl_bwd:
                         model_out.backward()
         else:
             # Forward without transient hook context (native global callback active)
             with _nvtx_range("TL::ModelForward"):
-                model_out = self(*model_args, **model_kwargs)
+                model_out = call_forward(*model_args, **model_kwargs)
                 if incl_bwd:
                     model_out.backward()
 

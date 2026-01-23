@@ -53,7 +53,8 @@ HF_Prometheus/
 │       └── hook_points.py     # HookPoint implementation
 ├── benchmark/
 │   └── tests/             # Performance benchmarks
-└── tests_monitoring/      # Unit tests
+├── example/               # User-facing examples
+└── tests/                 # Unit tests
 ```
 
 
@@ -66,6 +67,9 @@ cd vLLM-Prometheus
 
 # If already cloned without --recursive
 git submodule update --init --recursive
+
+# Ensure nested submodules inside dmx_host are present (clickhouse-cpp)
+git -C dmx_host submodule update --init --recursive
 ```
 
 ### Option 1: Conda (Recommended)
@@ -74,7 +78,7 @@ git submodule update --init --recursive
 conda env create -f environment.yml
 conda activate proj-dmx
 pip install -e transformers/  # Install local modified transformers
-pip install -e dmx_host/
+pip install -e dmx_host/      # Builds clickhouse_client extension
 ```
 
 ### Option 2: Pip
@@ -82,7 +86,7 @@ pip install -e dmx_host/
 ```bash
 pip install -r requirements.txt
 pip install -e transformers/  # Install local modified transformers
-pip install -e dmx_host/
+pip install -e dmx_host/      # Builds clickhouse_client extension
 ```
 
 ### Build C++ Extension
@@ -96,7 +100,26 @@ cd monitoring && make
 
 ## Quick Start
 
-**Refer to [Quick_Start.ipynb](./Quick_Start.ipynb).**
+**Notebook:** [Quick_Start.ipynb](./Quick_Start.ipynb)
+
+### Example: Minimal monitoring (CPU)
+```bash
+python -m example.gpt2_generate_with_monitoring
+```
+### Example: CUDA + ClickHouse pipeline
+Requires running ClickHouse and the dmx_host extension built.
+```bash
+python -m example.gpt2_generate_with_monitoring_db
+```
+
+#### ClickHouse quick check
+```bash
+clickhouse-client --query "SELECT 1"
+```
+
+Optional DB overrides:
+`DMX_DB_HOST`, `DMX_DB_PORT`, `DMX_DB_USER`, `DMX_DB_PASSWORD`,
+`DMX_DB_DATABASE`, `DMX_DB_TABLE`.
 
 
 
@@ -161,4 +184,3 @@ MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/te
 ```
 
 Tests strides: `[1, 2, 5, 100]` - higher stride = skip more requests
-
