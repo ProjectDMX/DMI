@@ -3,6 +3,7 @@
 #include "native_engine_internal.h"
 #include "nvtx_shim.h"
 #include <cstdlib>
+#include <cstdio>
 
 namespace monitoring {
 
@@ -22,6 +23,11 @@ NativeMonitoringEngine::Impl::Impl(int64_t queue_size,
   }
   if (const char* v = std::getenv("MON_NATIVE_AUTOCLEAR")) {
     auto_cleanup_ = (*v != '0');
+  }
+  if (const char* v = std::getenv("MON_NATIVE_STEP_STATS")) {
+    stats_step_log_ = (*v != '0');
+  } else if (const char* v = std::getenv("MON_ENGINE_STATS")) {
+    stats_step_log_ = (*v != '0');
   }
 
   // Configure pinned pool (enabled only when pinned offload is in use)
@@ -140,6 +146,10 @@ void NativeMonitoringEngine::Impl::remove_slot(int64_t token) {
 
 void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
   mon_nvtx_push("MonEng::dispatch_step");
+  if (stats_step_log_) {
+    std::fprintf(stderr, "[Native/Step] step_id=%ld tasks=%zu\n",
+                 static_cast<long>(work.step_id), work.tasks.size());
+  }
   if (work.tasks.empty()) {
     if (work.event != nullptr) {
       C10_CUDA_CHECK(cudaEventDestroy(work.event));

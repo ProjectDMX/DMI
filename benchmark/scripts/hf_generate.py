@@ -1,10 +1,12 @@
 import argparse
 import json
+import math
 import time
 from typing import List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
 
 
 def _load_prompts(path: str) -> List[str]:
@@ -30,7 +32,7 @@ def main() -> None:
     parser.add_argument("--model", default="gpt2")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument("--max-new-tokens", type=int, default=2000)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--json-out", default="")
     args = parser.parse_args()
@@ -41,6 +43,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(args.model, attn_implementation="eager", torch_dtype=torch.float16)
     model.to(device).eval()
@@ -49,8 +52,13 @@ def main() -> None:
     total_tokens = 0
     start = time.perf_counter()
 
+    total_batches = math.ceil(len(prompts) / args.batch_size)
     with torch.no_grad():
-        for batch_idx, batch_prompts in _iter_batches(prompts, args.batch_size):
+        for batch_idx, batch_prompts in tqdm(
+            _iter_batches(prompts, args.batch_size),
+            total=total_batches,
+            desc="hf_generate",
+        ):
             encoded = tokenizer(batch_prompts, return_tensors="pt", padding=True)
             input_ids = encoded["input_ids"].to(device)
             attention_mask = encoded["attention_mask"].to(device)

@@ -1,11 +1,13 @@
 import argparse
 import json
+import math
 import os
 import time
 from typing import List
 
 import torch
 from transformers import AutoTokenizer
+from tqdm import tqdm
 from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
 
 from monitoring import HostEngineConfig, MonitoringConfig, MonitoringEngine
@@ -50,7 +52,7 @@ def _build_db_config():
     cfg.client_side_compress = False
     cfg.client_settings = None
     cfg.create_database_if_missing = True
-    cfg.drop_existing_database = False
+    cfg.drop_existing_database = True
     cfg.index_granularity = 8192
     return cfg
 
@@ -63,7 +65,7 @@ def _build_host_config(db_cfg):
         thread_init_config=None,
         thread_init=dmx_interface.stage_one_thread_init,
         thread_cleanup=dmx_interface.stage_one_thread_cleanup,
-        input_queue=QueueConfig(1, None, None, None, None, 400, None),
+        input_queue=QueueConfig(1, None, None, None, None, 10000000000000000, None),
     )
     try:
         import dmx_host.clickhouse_client as clickhouse_client
@@ -76,7 +78,7 @@ def _build_host_config(db_cfg):
         thread_init_config=db_cfg,
         thread_init=clickhouse_client.clickhouse_init,
         thread_cleanup=clickhouse_client.clickhouse_cleanup,
-        input_queue=QueueConfig(1, None, None, None, None, 400, None),
+        input_queue=QueueConfig(1, None, None, None, None, 10000000000000000, None),
     )
     return HostEngineConfig(
         stages=[stage_one, stage_two],
@@ -91,7 +93,7 @@ def main() -> None:
     parser.add_argument("--model", default="gpt2")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--max-new-tokens", type=int, default=1)
+    parser.add_argument("--max-new-tokens", type=int, default=2000)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--json-out", default="")
     parser.add_argument("--no-db", action="store_true", help="Disable host_engine DB submission.")
@@ -104,7 +106,7 @@ def main() -> None:
     os.environ.setdefault("MON_NATIVE_BATCH", "0")
     # When DB is disabled there is no consumer for futures; enable autoclear to avoid unbounded growth.
     if args.no_db:
-        os.environ["MON_NATIVE_AUTOCLEAR"] = "1"
+        os.environ["MON_NATIVE_AUTOCLEAR"] = "0"
     else:
         # Prevent native backend from clearing futures before host_engine consumes them.
         os.environ.setdefault("MON_NATIVE_AUTOCLEAR", "0")
@@ -143,6 +145,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
 
     per_batch = []
     total_tokens = 0
@@ -150,8 +153,13 @@ def main() -> None:
     loop_end = None
 
     try:
+        total_batches = math.ceil(len(prompts) / args.batch_size)
         with torch.no_grad():
-            for batch_idx, batch_prompts in _iter_batches(prompts, args.batch_size):
+            for batch_idx, batch_prompts in tqdm(
+                _iter_batches(prompts, args.batch_size),
+                total=total_batches,
+                desc="monitoring_generate",
+            ):
                 encoded = tokenizer(batch_prompts, return_tensors="pt", padding=True)
                 input_ids = encoded["input_ids"].to(device)
                 attention_mask = encoded["attention_mask"].to(device)

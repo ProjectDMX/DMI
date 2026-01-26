@@ -90,7 +90,7 @@ def main() -> None:
         async_enabled=True,
         config=cfg,
         model_id=model_id,
-        db_config=host_cfg,
+        # db_config=host_cfg,
     )
 
     model = HookedGPT2LMHeadModel.from_pretrained(

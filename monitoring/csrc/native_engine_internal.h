@@ -319,6 +319,7 @@ struct NativeMonitoringEngine::Impl {
   std::atomic<int64_t> stats_submit_us_{0};
   std::atomic<int64_t> stats_process_us_{0};
   std::atomic<int64_t> stats_callback_us_{0};
+  bool stats_step_log_{false};
 };
 
 }  // namespace monitoring
