@@ -586,6 +586,9 @@ class MonitoringEngine:
 
     def close(self) -> None:
         """Tear down backend resources."""
+        _debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
+        if _debug:
+            print("[MonEng] close() called")
 
         if self._host_engine is not None and not self._using_native_backend:
             try:
@@ -648,8 +651,14 @@ class MonitoringEngine:
                     pass
                 self._host_engine = None
                 self._host_engine_enabled = False
+            if _debug:
+                print("[MonEng] calling clear_completed_results()")
             self.clear_completed_results()
+            if _debug:
+                print("[MonEng] calling backend.close()")
             backend.close()
+            if _debug:
+                print("[MonEng] backend.close() returned")
             self._native_backend = None
             self._backend = None
             return

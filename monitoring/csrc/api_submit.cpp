@@ -542,6 +542,7 @@ void NativeMonitoringEngine::Impl::close() {
   queue_cv_.notify_all();
 
   if (worker_.joinable()) {
+    py::gil_scoped_release release;
     worker_.join();
   }
 
@@ -552,8 +553,11 @@ void NativeMonitoringEngine::Impl::close() {
       host_copy_pool_->stop_.store(true, std::memory_order_relaxed);
     }
     host_copy_pool_->queue_cv_.notify_all();
-    for (auto& t : host_copy_pool_->workers_) {
-      if (t.joinable()) t.join();
+    {
+      py::gil_scoped_release release;
+      for (auto& t : host_copy_pool_->workers_) {
+        if (t.joinable()) t.join();
+      }
     }
     host_copy_pool_.reset();
   }
