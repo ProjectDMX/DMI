@@ -105,7 +105,6 @@ def main() -> None:
         "per_batch": per_batch,
     }
 
-    print(json.dumps(result, indent=2))
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as handle:
             json.dump(result, handle, indent=2)

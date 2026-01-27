@@ -61,7 +61,7 @@ class MonitoringEngine:
         self,
         *,
         async_enabled: bool = True,
-        queue_size: int = 50,
+        queue_size: int = 0,
         cache_dtype: Optional[torch.dtype] = None,
         delay_steps: int = 0,
         config: Optional[MonitoringConfig] = None,

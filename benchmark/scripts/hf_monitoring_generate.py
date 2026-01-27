@@ -164,8 +164,6 @@ def main() -> None:
                 input_ids = encoded["input_ids"].to(device)
                 attention_mask = encoded["attention_mask"].to(device)
 
-                # if device.type == "cuda":
-                #     torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 _ = generate_with_monitoring(
                     model,
@@ -175,8 +173,6 @@ def main() -> None:
                     do_sample=args.do_sample,
                     pad_token_id=tokenizer.pad_token_id,
                 )
-                # if device.type == "cuda":
-                #     torch.cuda.synchronize()
                 t1 = time.perf_counter()
 
                 batch_seconds = t1 - t0
@@ -214,7 +210,6 @@ def main() -> None:
         "per_batch": per_batch,
     }
 
-    print(json.dumps(result, indent=2))
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as handle:
             json.dump(result, handle, indent=2)

@@ -6,9 +6,19 @@ import sys
 import time
 
 
-def _run_script(script: str, args: list[str]) -> None:
-    cmd = [sys.executable, script] + args
-    subprocess.run(cmd, check=True)
+def _run_script(script: str, args: list[str]) -> dict:
+    import tempfile
+    # Use temp file to capture JSON result
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        tmp_path = f.name
+    try:
+        cmd = [sys.executable, script] + args + ["--json-out", tmp_path]
+        subprocess.run(cmd, check=True)
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def _detect_clickhouse_pid() -> str:
@@ -96,8 +106,6 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     tag = args.tag or time.strftime("%Y%m%d_%H%M%S")
 
-    hf_json = os.path.join(args.out_dir, f"hf_{tag}.json")
-    mon_json = os.path.join(args.out_dir, f"monitoring_{tag}.json")
     summary_json = os.path.join(args.out_dir, f"summary_{tag}.json")
     gpu_csv_hf = os.path.join(args.out_dir, f"gpu_mem_hf_{tag}.csv")
     cpu_csv_hf = os.path.join(args.out_dir, f"cpu_mem_hf_{tag}.csv")
@@ -129,47 +137,67 @@ def main() -> None:
         )
         try:
             hf_start_ts = _now_epoch()
-            _run_script("benchmark/scripts/hf_generate.py", common_args + ["--json-out", hf_json])
+            hf_result = _run_script("benchmark/scripts/hf_generate.py", common_args)
             hf_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
     else:
         hf_start_ts = _now_epoch()
-        _run_script("benchmark/scripts/hf_generate.py", common_args + ["--json-out", hf_json])
+        hf_result = _run_script("benchmark/scripts/hf_generate.py", common_args)
         hf_end_ts = _now_epoch()
 
-    mon_args = common_args + ["--json-out", mon_json]
-    if args.no_db:
-        mon_args.append("--no-db")
+    # Run monitoring with DB (unless --no-db is specified)
+    mon_result = None
+    mon_start_ts = None
+    mon_end_ts = None
+    if not args.no_db:
+        mon_args = common_args[:]
+        if args.monitor_mem:
+            extra_pids = args.cpu_extra_pids
+            if not args.no_clickhouse_pid:
+                clickhouse_pid = _detect_clickhouse_pid()
+                if clickhouse_pid:
+                    extra_pids = f"{extra_pids},{clickhouse_pid}" if extra_pids else clickhouse_pid
+            procs = _start_monitors(
+                gpu_csv_mon,
+                cpu_csv_mon,
+                args.mem_interval,
+                args.gpu_id,
+                extra_pids,
+            )
+            try:
+                mon_start_ts = _now_epoch()
+                mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args)
+                mon_end_ts = _now_epoch()
+            finally:
+                _stop_monitors(procs)
+        else:
+            mon_start_ts = _now_epoch()
+            mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args)
+            mon_end_ts = _now_epoch()
 
+    # Run monitoring with --no-db
+    gpu_csv_mon_nodb = os.path.join(args.out_dir, f"gpu_mem_monitoring_nodb_{tag}.csv")
+    cpu_csv_mon_nodb = os.path.join(args.out_dir, f"cpu_mem_monitoring_nodb_{tag}.csv")
+    mon_nodb_args = common_args[:] + ["--no-db"]
     if args.monitor_mem:
-        extra_pids = args.cpu_extra_pids
-        if not args.no_clickhouse_pid:
-            clickhouse_pid = _detect_clickhouse_pid()
-            if clickhouse_pid:
-                extra_pids = f"{extra_pids},{clickhouse_pid}" if extra_pids else clickhouse_pid
         procs = _start_monitors(
-            gpu_csv_mon,
-            cpu_csv_mon,
+            gpu_csv_mon_nodb,
+            cpu_csv_mon_nodb,
             args.mem_interval,
             args.gpu_id,
-            extra_pids,
+            args.cpu_extra_pids,  # No clickhouse PID needed for no-db
         )
         try:
-            mon_start_ts = _now_epoch()
-            _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args)
-            mon_end_ts = _now_epoch()
+            mon_nodb_start_ts = _now_epoch()
+            mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args)
+            mon_nodb_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
     else:
-        mon_start_ts = _now_epoch()
-        _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args)
-        mon_end_ts = _now_epoch()
-
-    with open(hf_json, "r", encoding="utf-8") as handle:
-        hf_result = json.load(handle)
-    with open(mon_json, "r", encoding="utf-8") as handle:
-        mon_result = json.load(handle)
+        mon_nodb_start_ts = _now_epoch()
+        mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args)
+        mon_nodb_end_ts = _now_epoch()
 
     summary = {
         "tag": tag,
@@ -183,21 +211,24 @@ def main() -> None:
         "hf_end_ts": hf_end_ts,
         "monitoring_start_ts": mon_start_ts,
         "monitoring_end_ts": mon_end_ts,
+        "monitoring_nodb_start_ts": mon_nodb_start_ts,
+        "monitoring_nodb_end_ts": mon_nodb_end_ts,
         "hf": hf_result,
         "monitoring": mon_result,
+        "monitoring_nodb": mon_nodb_result,
     }
 
     with open(summary_json, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 
-    print(f"hf result: {hf_json}")
-    print(f"monitoring result: {mon_json}")
-    print(f"summary: {summary_json}")
-    if args.monitor_mem:
-        print(f"hf gpu mem: {gpu_csv_hf}")
-        print(f"hf cpu mem: {cpu_csv_hf}")
-        print(f"monitoring gpu mem: {gpu_csv_mon}")
-        print(f"monitoring cpu mem: {cpu_csv_mon}")
+    # print(f"hf result: {hf_json}")
+    # print(f"monitoring result: {mon_json}")
+    # print(f"summary: {summary_json}")
+    # if args.monitor_mem:
+    #     print(f"hf gpu mem: {gpu_csv_hf}")
+    #     print(f"hf cpu mem: {cpu_csv_hf}")
+    #     print(f"monitoring gpu mem: {gpu_csv_mon}")
+    #     print(f"monitoring cpu mem: {cpu_csv_mon}")
 
 
 if __name__ == "__main__":
