@@ -52,7 +52,7 @@ CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused
             $(TORCH_INCLUDE_FLAGS) $(PYTHON_INCLUDE_FLAGS) $(CUDA_INCLUDE_FLAGS) -Icsrc
 
 LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPATH_FLAGS) \
-           -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -lcudart -lpthread
+           -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -lcudart -lpthread $(LDFLAGS_EXTRA)
 
 .PHONY: all build clean
 
@@ -87,5 +87,7 @@ endif
 # library thanks to nvtx_shim.h providing no-op stubs if headers/libs are absent.
 NVTX ?= 0
 ifeq ($(NVTX),1)
-LDFLAGS += -lnvToolsExt
+    CXXFLAGS += -DMON_USE_NVTX=1
+    CXXFLAGS += -I/usr/local/cuda-13.0/targets/x86_64-linux/include/nvtx3
+    LDFLAGS += -lnvToolsExt
 endif

@@ -2,6 +2,7 @@
 
 #include "native_engine_internal.h"
 #include "nvtx_shim.h"
+#include <cstdio>
 
 namespace monitoring {
 
@@ -350,11 +351,15 @@ at::Tensor monitor_activation(at::Tensor tensor, py::object handle_obj) {
   if (!engine) {
     return tensor;
   }
+  const std::string& hook_name = raw_ptr->gate_name;
+  std::string label = "TL::NativeInlineHook[" + hook_name + "]";
+  mon_nvtx_push(label.c_str());
   {
     py::gil_scoped_release release;
-    engine->impl_->process_native_hook(*(raw_ptr->config), std::move(tensor),
+    engine->impl_->process_native_hook(*(raw_ptr->config), tensor,
                                        raw_ptr->gate_name, raw_ptr->cache_name);
   }
+  mon_nvtx_pop();
   return tensor;
 }
 

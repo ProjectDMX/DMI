@@ -1051,36 +1051,35 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    if not args.monitoring_bypass:
-        warmup(hf_modified_prefill, hf_modified_decode)
-        hf_modified_elapsed = run_benchmark(
-            "hf_modified",
-            lambda: run_decode(hf_modified_prefill, hf_modified_decode),
-        )
-        timings["hf_modified"] = {
-            "duration": hf_modified_elapsed,
-            "tokens_per_second": total_decoded_tokens / hf_modified_elapsed
-            if hf_modified_elapsed > 0
-            else float("inf"),
-        }
+    warmup(hf_modified_prefill, hf_modified_decode)
+    hf_modified_elapsed = run_benchmark(
+        "hf_modified",
+        lambda: run_decode(hf_modified_prefill, hf_modified_decode),
+    )
+    timings["hf_modified"] = {
+        "duration": hf_modified_elapsed,
+        "tokens_per_second": total_decoded_tokens / hf_modified_elapsed
+        if hf_modified_elapsed > 0
+        else float("inf"),
+    }
 
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-        warmup(hf_modified_hook_prefill, hf_modified_hook_decode)
-        hf_modified_hook_elapsed = run_benchmark(
-            "hf_modified_hook",
-            lambda: run_decode(hf_modified_hook_prefill, hf_modified_hook_decode),
-        )
-        timings["hf_modified_hook"] = {
-            "duration": hf_modified_hook_elapsed,
-            "tokens_per_second": total_decoded_tokens / hf_modified_hook_elapsed
-            if hf_modified_hook_elapsed > 0
-            else float("inf"),
-        }
+    warmup(hf_modified_hook_prefill, hf_modified_hook_decode)
+    hf_modified_hook_elapsed = run_benchmark(
+        "hf_modified_hook",
+        lambda: run_decode(hf_modified_hook_prefill, hf_modified_hook_decode),
+    )
+    timings["hf_modified_hook"] = {
+        "duration": hf_modified_hook_elapsed,
+        "tokens_per_second": total_decoded_tokens / hf_modified_hook_elapsed
+        if hf_modified_hook_elapsed > 0
+        else float("inf"),
+    }
 
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     hf_hooked_model.monitoring_engine = monitoring_engine
     warmup(hf_modified_hook_async_prefill, hf_modified_hook_async_decode)
