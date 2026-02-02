@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -35,6 +36,23 @@ def _iter_batches(items: List[str], batch_size: int):
         yield idx // batch_size, items[idx : idx + batch_size]
 
 
+@contextlib.contextmanager
+def _nvtx_range(name: str):
+    try:
+        if not torch.cuda.is_available():
+            yield
+            return
+        from torch.cuda import nvtx  # type: ignore
+    except Exception:
+        yield
+        return
+    nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        nvtx.range_pop()
+
+
 def _build_db_config():
     try:
         import dmx_host.clickhouse_client as clickhouse_client
@@ -65,7 +83,7 @@ def _build_host_config(db_cfg):
         thread_init_config=None,
         thread_init=dmx_interface.stage_one_thread_init,
         thread_cleanup=dmx_interface.stage_one_thread_cleanup,
-        input_queue=QueueConfig(1, None, None, None, None, 10000000000000000, None),
+        input_queue=QueueConfig(1, None, None, 10, None, None, None),
     )
     try:
         import dmx_host.clickhouse_client as clickhouse_client
@@ -78,12 +96,12 @@ def _build_host_config(db_cfg):
         thread_init_config=db_cfg,
         thread_init=clickhouse_client.clickhouse_init,
         thread_cleanup=clickhouse_client.clickhouse_cleanup,
-        input_queue=QueueConfig(1, None, None, None, None, 10000000000000000, None),
+        input_queue=QueueConfig(100, None, 1.0, None, None, None, None),
     )
     return HostEngineConfig(
         stages=[stage_one, stage_two],
         input_handler=dmx_interface.input_handler_v1,
-        engine_config=EngineConfig(),
+        engine_config=EngineConfig(enable_stats=True, enable_timing=True),
     )
 
 
@@ -151,10 +169,13 @@ def main() -> None:
     total_tokens = 0
     start = time.perf_counter()
     loop_end = None
+    host_timings = None
 
     try:
         total_batches = math.ceil(len(prompts) / args.batch_size)
-        with torch.no_grad():
+        use_nvtx = os.environ.get("BENCH_NVTX", "0") == "1"
+        nvtx_ctx = _nvtx_range("monitoring_generate") if use_nvtx else contextlib.nullcontext()
+        with nvtx_ctx, torch.no_grad():
             for batch_idx, batch_prompts in tqdm(
                 _iter_batches(prompts, args.batch_size),
                 total=total_batches,
@@ -189,6 +210,11 @@ def main() -> None:
                 )
         loop_end = time.perf_counter()
     finally:
+        if engine._host_engine is not None:
+            try:
+                host_timings = engine._host_engine.timings()
+            except Exception:
+                host_timings = None
         engine.close()
 
     if loop_end is None:
@@ -209,6 +235,20 @@ def main() -> None:
         "tokens_per_s": total_tokens / total_seconds if total_seconds > 0 else None,
         "per_batch": per_batch,
     }
+    if host_timings:
+        result["host_engine_timings"] = host_timings
+        ingest = host_timings.get("ingest", {})
+        if ingest:
+            print(
+                "[HostEng/Timing] input_handler_s=",
+                round(float(ingest.get("input_handler_s", 0.0)), 6),
+                " enqueue_s=",
+                round(float(ingest.get("enqueue_s", 0.0)), 6),
+                " input_handler_avg_s=",
+                round(float(ingest.get("input_handler_avg_s", 0.0)), 6),
+                " enqueue_avg_s=",
+                round(float(ingest.get("enqueue_avg_s", 0.0)), 6),
+            )
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as handle:

@@ -46,3 +46,7 @@ Thumbs.db
 *.tmp
 *.bak
 *~
+
+# Benchmark outputs
+benchmark/figures/
+*.nsys-rep
