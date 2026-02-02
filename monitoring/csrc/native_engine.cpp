@@ -40,6 +40,7 @@ void NativeMonitoringEngine::begin_request(int64_t request_id) { impl_->begin_re
 void NativeMonitoringEngine::begin_step(int64_t step_id, int64_t phase) {
   impl_->begin_step(step_id, phase);
 }
+
 void NativeMonitoringEngine::record_callback_duration(int64_t us) { impl_->record_callback_duration(us); }
 
 std::vector<int64_t> NativeMonitoringEngine::submit_step_soa(int64_t step_id,
@@ -119,14 +120,10 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache(const std::st
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         engine->record_callback_duration(static_cast<int64_t>(us));
 
-        // Write BackendFuture(native_backend, token) into the provided cache dict
+        // Fill cache with the native C++ BackendFuture.
         try {
-          py::object task_mod = py::module::import("monitoring.task");
-          py::object backend_future_cls = task_mod.attr("BackendFuture");
-          py::object py_future = backend_future_cls(engine, py::int_(token));
-          cache[py::str(hook_name_copy.c_str())] = py_future;
-        } catch (const std::exception& e) {
-          // Fallback: leave cache entry as None on error
+          cache[py::str(hook_name_copy.c_str())] = py::cast(BackendFuture(engine, token));
+        } catch (...) {
           cache[py::str(hook_name_copy.c_str())] = py::none();
         }
         return py::none();
@@ -165,12 +162,10 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache_sig(const std
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         engine->record_callback_duration(static_cast<int64_t>(us));
 
+        // Fill cache with the native C++ BackendFuture.
         try {
-          py::object task_mod = py::module::import("monitoring.task");
-          py::object backend_future_cls = task_mod.attr("BackendFuture");
-          py::object py_future = backend_future_cls(engine, py::int_(token));
-          cache[py::str(hook_name_copy.c_str())] = py_future;
-        } catch (const std::exception& e) {
+          cache[py::str(hook_name_copy.c_str())] = py::cast(BackendFuture(engine, token));
+        } catch (...) {
           cache[py::str(hook_name_copy.c_str())] = py::none();
         }
         return py::none();
@@ -237,14 +232,17 @@ void NativeMonitoringEngine::collect_step_futures_into(int64_t step_id, py::dict
     }
   }
   if (items.empty()) return;
-  // Create BackendFuture(native_backend, token) and fill into provided cache dict
-  py::object task_mod = py::module::import("monitoring.task");
-  py::object backend_future_cls = task_mod.attr("BackendFuture");
+
+  // Fill cache dict with native C++ BackendFuture objects.
+  auto engine = shared_from_this();
   for (auto& kv : items) {
     const std::string& name = kv.first;
     int64_t token = kv.second;
-    py::object py_future = backend_future_cls(shared_from_this(), py::int_(token));
-    cache[py::str(name.c_str())] = py_future;
+    try {
+      cache[py::str(name.c_str())] = py::cast(BackendFuture(engine, token));
+    } catch (...) {
+      cache[py::str(name.c_str())] = py::none();
+    }
   }
 }
 
@@ -263,8 +261,11 @@ bool NativeMonitoringEngine::future_ready(int64_t token) { return impl_->future_
 bool NativeMonitoringEngine::future_wait(int64_t token, std::optional<double> timeout) {
   return impl_->future_wait(token, timeout);
 }
-at::Tensor NativeMonitoringEngine::future_result(int64_t token, std::optional<double> timeout) {
-  return impl_->future_result(token, timeout);
+
+at::Tensor NativeMonitoringEngine::future_result(int64_t token,
+                                                 std::optional<double> timeout,
+                                                 bool called_from_cpp) {
+  return impl_->future_result(token, timeout, called_from_cpp);
 }
 void NativeMonitoringEngine::clear_completed_results() { impl_->clear_completed_results(); }
 void NativeMonitoringEngine::close() {

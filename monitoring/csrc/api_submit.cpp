@@ -477,18 +477,32 @@ bool NativeMonitoringEngine::Impl::future_wait(int64_t token, std::optional<doub
   return true;
 }
 
-at::Tensor NativeMonitoringEngine::Impl::future_result(int64_t token, std::optional<double> timeout) {
+at::Tensor NativeMonitoringEngine::Impl::future_result(int64_t token,
+                                                       std::optional<double> timeout,
+                                                       bool called_from_cpp /* = false */ ) {
   mon_nvtx_push("MonEng::future_result");
   auto slot = get_slot(token);
   {
-    py::gil_scoped_release release;
+    // Python-facing calls: release GIL while waiting.
+    // C++ calls: do NOT touch GIL or Python exception APIs.
+    std::unique_ptr<py::gil_scoped_release> gil_release;
+    if (!called_from_cpp) {
+      gil_release = std::make_unique<py::gil_scoped_release>();
+    }
+
     std::unique_lock<std::mutex> lock(slot->mutex);
     if (timeout.has_value()) {
       if (!slot->cv.wait_for(lock,
                              std::chrono::duration<double>(*timeout),
                              [&] { return slot->ready; })) {
-        PyErr_SetString(PyExc_TimeoutError, "Future timed out before data was ready");
-        throw py::error_already_set();
+        if (!called_from_cpp) {
+          // Re-acquire the GIL before touching Python exception state.
+          gil_release.reset();
+          PyErr_SetString(PyExc_TimeoutError,
+                          "Future timed out before data was ready");
+          throw py::error_already_set();
+        }
+        throw std::runtime_error("Future timed out before data was ready");
       }
     } else {
       slot->cv.wait(lock, [&] { return slot->ready; });
