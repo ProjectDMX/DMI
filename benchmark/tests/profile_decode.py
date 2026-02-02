@@ -28,7 +28,8 @@ except ImportError:
 from transformer_lens import HookedTransformer
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
 
-from monitoring import MonitoringEngine
+from monitoring import GraphSafeEngine, GraphSlotConsumer, MonitoringEngine
+from monitoring.engine import _PythonBackend
 from monitoring.config import CaptureSchedule, HookSelection, MonitoringConfig
 
 MINIMAL_MONITORING_HOOKS = [
@@ -122,6 +123,12 @@ def parse_args() -> argparse.Namespace:
         default="full",
         help="Select which hooks MonitoringEngine enables (minimal keeps just a handful for overhead profiling)",
     )
+    parser.add_argument(
+        "--monitoring-mode",
+        choices=["legacy", "graph"],
+        default="legacy",
+        help="Choose legacy MonitoringEngine or graph-safe engine.",
+    )
 
     args = parser.parse_args()
     if not args.collect_hidden and not args.collect_attention:
@@ -130,6 +137,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--prefill-tokens must be >= 1")
     if args.decode_steps < 1:
         parser.error("--decode-steps must be >= 1")
+    if args.monitoring_mode == "graph" and args.monitoring_bypass:
+        parser.error("--monitoring-mode graph cannot be combined with --monitoring-bypass")
     return args
 
 
@@ -309,6 +318,122 @@ def profile_async_model(
     total_elapsed = time.perf_counter() - wall_time_start
     nvtx.range_pop()  # profile_async
     return main_elapsed, total_elapsed
+
+
+class HFGraphDecodeRunner:
+    """Capture and replay Hooked GPT-2 decode steps inside a CUDA graph."""
+
+    def __init__(
+        self,
+        model,
+        project_logits_fn: Callable[[torch.Tensor], torch.Tensor],
+        engine,
+        args,
+        token_template: torch.Tensor,
+        past_template: Tuple,
+    ) -> None:
+        self.model = model
+        self.project_logits_fn = project_logits_fn
+        self.engine = engine
+        self.args = args
+        self.graph = torch.cuda.CUDAGraph()
+        self.captured = False
+        self.static_token = torch.empty_like(token_template)
+        self.static_past = tuple(
+            (torch.empty_like(layer[0]), torch.empty_like(layer[1]))
+            for layer in past_template
+        )
+        self.capture_shape = [layer[0].size() for layer in past_template]
+        self.past_proxy = tuple((buf_k, buf_v) for (buf_k, buf_v) in self.static_past)
+        self.graph_outputs = None
+        self.graph_logits = None
+
+    def run(self, token: torch.Tensor, past: Tuple) -> Tuple[torch.Tensor, Tuple]:
+        if not self.captured:
+            self._copy_token(token)
+            self._copy_past(past)
+            return self._capture_graph_step()
+        self._copy_token(token)
+        if past is not self.past_proxy:
+            self._copy_past(past)
+        return self._replay_graph_step()
+
+    def _copy_token(self, token: torch.Tensor) -> None:
+        self.static_token.copy_(token)
+
+    def _copy_past(self, past: Tuple) -> None:
+        for (dst_k, dst_v), (src_k, src_v) in zip(self.static_past, past):
+            if dst_k.shape != src_k.shape:
+                dst_k.resize_(src_k.shape)
+            if dst_v.shape != src_v.shape:
+                dst_v.resize_(src_v.shape)
+            dst_k.copy_(src_k)
+            dst_v.copy_(src_v)
+
+    def _capture_graph_step(self) -> Tuple[torch.Tensor, Tuple]:
+        torch.cuda.synchronize()
+        if self.engine is not None:
+            self.engine.start_step()
+        try:
+            with torch.cuda.graph(self.graph):
+                outputs = self.model(
+                    self.static_token,
+                    use_cache=True,
+                    past_key_values=self.static_past,
+                    output_hidden_states=self.args.collect_hidden,
+                    output_attentions=self.args.collect_attention,
+                    return_dict=True,
+                )
+                hidden_states = outputs.last_hidden_state
+                logits = self.project_logits_fn(hidden_states)
+                self.graph_outputs = outputs
+                self.graph_logits = logits
+                if self.engine is not None:
+                    self.engine.finalize_capture()
+            self.captured = True
+        finally:
+            if self.engine is not None:
+                self.engine.end_step()
+        return self._post_run()
+
+    def _replay_graph_step(self) -> Tuple[torch.Tensor, Tuple]:
+        if self.engine is not None:
+            self.engine.start_step()
+        try:
+            self.graph.replay()
+        finally:
+            if self.engine is not None:
+                self.engine.end_step()
+        return self._post_run()
+
+    def _post_run(self) -> Tuple[torch.Tensor, Tuple]:
+        outputs = self.graph_outputs
+        if outputs is None or self.graph_logits is None:
+            raise RuntimeError("Graph runner outputs not initialized.")
+        if self.args.collect_attention and outputs.attentions is not None:
+            for attn in outputs.attentions:
+                _ = attn
+        if self.args.collect_hidden and outputs.hidden_states is not None:
+            for hs in outputs.hidden_states:
+                _ = hs
+        self._copy_outputs_to_inputs(outputs)
+        return self.graph_logits, self.past_proxy
+
+    def _copy_outputs_to_inputs(self, outputs) -> None:
+        next_past = outputs.past_key_values
+        for (dst_k, dst_v), (src_k, src_v) in zip(self.static_past, next_past):
+            if dst_k.shape != src_k.shape:
+                dst_k.resize_(src_k.shape)
+            if dst_v.shape != src_v.shape:
+                dst_v.resize_(src_v.shape)
+            dst_k.copy_(src_k)
+            dst_v.copy_(src_v)
+
+    def reset_capture(self) -> None:
+        self.graph = torch.cuda.CUDAGraph()
+        self.captured = False
+        self.graph_outputs = None
+        self.graph_logits = None
 
 
 def greedy_from_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -606,26 +731,39 @@ def main() -> None:
         schedule=schedule,
     )
 
-    monitoring_engine = MonitoringEngine(
-        async_enabled=device.type == "cuda",
-        cache_dtype=cache_dtype,
-        queue_size=args.engine_queue_size,
-        delay_steps=args.engine_delay_steps,
-        config=monitoring_config,
-    )
-    engine_attached_permanently = bool(args.monitoring_bypass)
+    graph_consumer = None
+    if args.monitoring_mode == "graph":
+        monitoring_engine = GraphSafeEngine(
+            config=monitoring_config,
+            module_filter=lambda name, module: True,
+            max_slots=4096,
+            device=device,
+        )
+        graph_consumer = GraphSlotConsumer(delay_steps=args.engine_delay_steps)
+        monitoring_engine.attach_consumer(graph_consumer)
+    else:
+        monitoring_engine = MonitoringEngine(
+            async_enabled=device.type == "cuda",
+            cache_dtype=cache_dtype,
+            queue_size=args.engine_queue_size,
+            delay_steps=args.engine_delay_steps,
+            config=monitoring_config,
+        )
+    attach_to_model = args.monitoring_mode != "graph"
+    engine_attached_permanently = bool(args.monitoring_bypass and attach_to_model)
     original_monitoring_engine = hf_hooked_model.monitoring_engine
-    hf_hooked_model.monitoring_engine = monitoring_engine
+    if attach_to_model:
+        hf_hooked_model.monitoring_engine = monitoring_engine
     engine_init_ms = 0.0
     try:
         engine_init_ms = monitoring_engine.prepare_for_model(hf_hooked_model)
     except Exception:
         engine_init_ms = 0.0
     finally:
-        if not engine_attached_permanently:
+        if attach_to_model and not engine_attached_permanently:
             hf_hooked_model.monitoring_engine = original_monitoring_engine
 
-    if args.monitoring_bypass:
+    if args.monitoring_bypass and args.monitoring_mode != "graph":
         native_backend = getattr(monitoring_engine, "_native_backend", None)
         native_using = bool(getattr(monitoring_engine, "_using_native_backend", False))
         native_builder_enabled = bool(getattr(monitoring_engine, "_native_builder_enabled", False))
@@ -650,6 +788,26 @@ def main() -> None:
         )
         if not inline_enabled or sample_cfg is None:
             raise RuntimeError("Inline monitoring not enabled; cannot run bypass-inline profile.")
+
+    def process_monitoring_results(wait: bool = False) -> None:
+        nonlocal graph_runner
+        if args.monitoring_mode == "graph":
+            if graph_runner is None or not graph_runner.captured:
+                return
+            monitoring_engine.clear_completed_results()
+            return
+        if monitoring_engine.async_enabled:
+            monitoring_engine.clear_completed_results()
+
+    def resolve_monitoring_results() -> None:
+        nonlocal graph_runner
+        if args.monitoring_mode == "graph":
+            if graph_runner is None or not graph_runner.captured:
+                return
+            monitoring_engine.resolve_all()
+            return
+        if monitoring_engine.async_enabled:
+            monitoring_engine.resolve_all()
 
     tl_model = HookedTransformer.from_pretrained(
         "gpt2",
@@ -701,8 +859,7 @@ def main() -> None:
         )
         cache_dict.clear()
         try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
+            process_monitoring_results()
         except Exception:
             pass
         return logits, cache
@@ -711,6 +868,9 @@ def main() -> None:
 
     def project_logits(hidden_states: torch.Tensor) -> torch.Tensor:
         return lm_head(hidden_states)
+
+    graph_runner: Optional[HFGraphDecodeRunner] = None
+    graph_forward_runner: Optional[HFGraphDecodeRunner] = None
 
     def hf_prefill_fn(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
         outputs = hf_model(
@@ -842,8 +1002,7 @@ def main() -> None:
         past = outputs.past_key_values
         cache_dict.clear()
         try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
+            process_monitoring_results()
         except Exception:
             pass
         if not engine_attached_permanently:
@@ -877,8 +1036,7 @@ def main() -> None:
         next_past = outputs.past_key_values
         cache_dict.clear()
         try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
+            process_monitoring_results()
         except Exception:
             pass
         if not engine_attached_permanently:
@@ -887,6 +1045,39 @@ def main() -> None:
         return logits, next_past
 
     def hf_modified_hook_async_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
+        nonlocal graph_runner
+        if args.monitoring_mode == "graph":
+            nvtx.range_push("async_prefill")
+            outputs = hf_hooked_model(
+                prefill_tokens,
+                use_cache=True,
+                output_hidden_states=args.collect_hidden,
+                output_attentions=args.collect_attention,
+                return_dict=True,
+            )
+            hidden_states = outputs.last_hidden_state
+            logits = project_logits(hidden_states)
+            next_token = greedy_from_logits(logits)
+            if args.collect_attention and outputs.attentions is not None:
+                for attn in outputs.attentions:
+                    _ = attn
+            if args.collect_hidden and outputs.hidden_states is not None:
+                for hs in outputs.hidden_states:
+                    _ = hs
+            past = outputs.past_key_values
+            if graph_runner is None:
+                graph_runner = HFGraphDecodeRunner(
+                    hf_hooked_model,
+                    project_logits,
+                    monitoring_engine,
+                    args,
+                    next_token,
+                    past,
+                )
+            del hidden_states, logits, outputs
+            nvtx.range_pop()  # async_prefill
+            return past, next_token
+
         nvtx.range_push("async_prefill")
         monitoring_engine.start_step()
         try:
@@ -917,8 +1108,7 @@ def main() -> None:
         past = outputs.past_key_values
         cache_dict.clear()
         try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
+            process_monitoring_results()
         except Exception:
             pass
         del hidden_states, logits, outputs
@@ -926,6 +1116,19 @@ def main() -> None:
         return past, next_token
 
     def hf_modified_hook_async_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
+        nonlocal graph_runner
+        if args.monitoring_mode == "graph":
+            if graph_runner is None:
+                raise RuntimeError("Graph decode runner is not initialized.")
+            nvtx.range_push("async_decode")
+            logits, next_past = graph_runner.run(token, past_key_values)
+            try:
+                process_monitoring_results()
+            except Exception:
+                pass
+            nvtx.range_pop()  # async_decode
+            return logits, next_past
+
         nvtx.range_push("async_decode")
         nvtx.range_push("async_decode_start_step")
         monitoring_engine.start_step()
@@ -957,14 +1160,46 @@ def main() -> None:
         next_past = outputs.past_key_values
         cache_dict.clear()
         try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
+            process_monitoring_results()
         except Exception:
             pass
         del hidden_states, outputs
         nvtx.range_pop()  # async_decode_post
         nvtx.range_pop()  # async_decode
         return logits, next_past
+
+    def hf_graph_only_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
+        nonlocal graph_forward_runner
+        nvtx.range_push("graph_prefill")
+        outputs = hf_hooked_model(
+            prefill_tokens,
+            use_cache=True,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=True,
+        )
+        hidden_states = outputs.last_hidden_state
+        logits = project_logits(hidden_states)
+        next_token = greedy_from_logits(logits)
+        past = outputs.past_key_values
+        if graph_forward_runner is None:
+            graph_forward_runner = HFGraphDecodeRunner(
+                hf_hooked_model,
+                project_logits,
+                None,
+                args,
+                next_token,
+                past,
+            )
+        del hidden_states, logits, outputs
+        nvtx.range_pop()  # graph_prefill
+        return past, next_token
+
+    def hf_graph_only_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
+        nonlocal graph_forward_runner
+        if graph_forward_runner is None:
+            raise RuntimeError("Graph baseline runner not initialized.")
+        return graph_forward_runner.run(token, past_key_values)
 
     def run_decode(prefill_fn, decode_fn, prefill_tokens=prompt_tokens):
         with torch.no_grad():
@@ -974,6 +1209,8 @@ def main() -> None:
                 nvtx.range_pop()  # benchmark_iter_i
 
     def warmup(prefill_fn, decode_fn, prefill_tokens=prompt_tokens):
+        nonlocal graph_runner
+        nonlocal graph_forward_runner
         if args.warmup <= 0:
             return
         nvtx.range_push("warmup")
@@ -983,6 +1220,10 @@ def main() -> None:
                 run_decode_loop(lambda: prefill_fn(prefill_tokens), decode_fn, args.decode_steps)
                 nvtx.range_pop()  # warmup_iter_i
         nvtx.range_pop()  # warmup
+        if args.monitoring_mode == "graph" and graph_runner is not None:
+            graph_runner.reset_capture()
+        if args.monitoring_mode == "graph" and graph_forward_runner is not None:
+            graph_forward_runner.reset_capture()
 
     traces_path = Path(args.profile_dir)
 
@@ -1066,6 +1307,21 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    if args.monitoring_mode == "graph":
+        warmup(hf_graph_only_prefill, hf_graph_only_decode)
+        hf_graph_elapsed = run_benchmark(
+            "hf_modified_graph",
+            lambda: run_decode(hf_graph_only_prefill, hf_graph_only_decode),
+        )
+        timings["hf_modified_graph"] = {
+            "duration": hf_graph_elapsed,
+            "tokens_per_second": total_decoded_tokens / hf_graph_elapsed
+            if hf_graph_elapsed > 0
+            else float("inf"),
+        }
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     warmup(hf_modified_hook_prefill, hf_modified_hook_decode)
     hf_modified_hook_elapsed = run_benchmark(
         "hf_modified_hook",
@@ -1081,12 +1337,12 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    hf_hooked_model.monitoring_engine = monitoring_engine
+    if attach_to_model:
+        hf_hooked_model.monitoring_engine = monitoring_engine
     warmup(hf_modified_hook_async_prefill, hf_modified_hook_async_decode)
-    if monitoring_engine.async_enabled:
-        monitoring_engine.resolve_all()
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+    resolve_monitoring_results()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     main_async_decode_elapsed, total_async_decode_elapsed = run_async_benchmark(
         "hf_modified_hook_async",
         lambda: run_decode(hf_modified_hook_async_prefill, hf_modified_hook_async_decode),
@@ -1103,7 +1359,7 @@ def main() -> None:
         if total_async_decode_elapsed > 0
         else float("inf"),
     }
-    if not engine_attached_permanently:
+    if attach_to_model and not engine_attached_permanently:
         hf_hooked_model.monitoring_engine = None
 
     if device.type == "cuda":
