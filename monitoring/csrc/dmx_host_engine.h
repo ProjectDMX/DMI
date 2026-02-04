@@ -10,7 +10,7 @@ class DMXHostEngine : public PipelinedEngine<dmx_host_queue_item, uint64_t, 2, Q
 NoOutputHandler<dmx_host_queue_item> >{
 public:
     DMXHostEngine(std::array<StageConfig, 2> two_stages): 
-    PipelinedEngine (two_stages, EngineConfig{}, NoOutputHandler<dmx_host_queue_item>{}){
+    PipelinedEngine (two_stages, EngineConfig{}){
     }
     void submit(std::vector<std::vector<std::string> > keys, std::vector<int32_t> start_token_idxs, 
     std::vector<std::map<std::string, monitoring::BackendFuture> > cache_dicts){

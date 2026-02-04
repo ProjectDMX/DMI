@@ -62,7 +62,7 @@ LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPAT
 
 # ---- ClickHouse C++ client (override if your lib name/path differs) ----
 CLICKHOUSE_INCLUDE ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp)
-CLICKHOUSE_LIBDIR  ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/clickhouse)
+CLICKHOUSE_LIB_DIR  ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/clickhouse)
 CLICKHOUSE_LIBS    ?= -lclickhouse-cpp-lib
 
 ifneq ($(CLICKHOUSE_INCLUDE),)

@@ -32,7 +32,7 @@ std::optional<std::vector<dmx_host_queue_item>> ProcessFutureStage::ProcessFutur
         new_row.push_back(parsed_act_name);
         new_row.push_back(layer_no);
         new_row.push_back(start_token_idx);
-        int64_t delta_len = get_delta_token_len(tensor.sizes(), parsed_act_name);
+        int64_t delta_len = get_delta_token_len(tensor.sizes().vec(), parsed_act_name);
         int32_t delta_len_32 = 0;
         if (delta_len > std::numeric_limits<int32_t>::max() || 
             delta_len < std::numeric_limits<int32_t>::min()) {

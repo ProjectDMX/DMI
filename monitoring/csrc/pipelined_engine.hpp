@@ -535,7 +535,7 @@ class PipelinedEngine
     const bool have_deadline = timeout.has_value();
     if (have_deadline) {
       if (timeout->count() < 0.0) throw std::invalid_argument("timeout must be >= 0");
-      end_at = Clock::now() + *timeout;
+      end_at = Clock::now() + std::chrono::duration_cast<Clock::duration>(*timeout);
     }
 
     for (std::size_t stage_idx = 0; stage_idx < NumStages; ++stage_idx) {
@@ -1033,7 +1033,7 @@ class PipelinedEngine
     const bool have_deadline = timeout.has_value();
     if (have_deadline) {
       if (timeout->count() < 0.0) throw std::invalid_argument("timeout must be >= 0");
-      end_at = Clock::now() + *timeout;
+      end_at = Clock::now() + std::chrono::duration_cast<Clock::duration>(*timeout);
     }
 
     {
@@ -1117,15 +1117,16 @@ class PipelinedEngine
                               std::uint64_t batches,
                               std::uint64_t items_in,
                               std::uint64_t items_out) {
-    if constexpr (!EnableEngineProfiling) return;
-    const auto* pcfg = prof_cfg_ptr_();
-    auto& prof_opt = prof_storage_();
-    if (!pcfg || !pcfg->enable_stats || !prof_opt) return;
-    std::lock_guard<std::mutex> lk(prof_mu_);
-    auto& ss = prof_opt->stage_by_stage[stage_idx];
-    ss.batches += batches;
-    ss.items_in += items_in;
-    ss.items_out += items_out;
+    if constexpr (EnableEngineProfiling) {
+      const auto* pcfg = prof_cfg_ptr_();
+      auto& prof_opt = prof_storage_();
+      if (!pcfg || !pcfg->enable_stats || !prof_opt) return;
+      std::lock_guard<std::mutex> lk(prof_mu_);
+      auto& ss = prof_opt->stage_by_stage[stage_idx];
+      ss.batches += batches;
+      ss.items_in += items_in;
+      ss.items_out += items_out;
+    }
   }
 
   void prof_stage_add_(std::size_t stage_idx,
@@ -1133,53 +1134,57 @@ class PipelinedEngine
                        std::uint64_t deq_timeouts,
                        double deq_s,
                        double deq_idle_s) {
-    if constexpr (!EnableEngineProfiling) return;
-    const auto* pcfg = prof_cfg_ptr_();
-    auto& prof_opt = prof_storage_();
-    if (!pcfg || !pcfg->enable_stats || !prof_opt) return;
-    std::lock_guard<std::mutex> lk(prof_mu_);
-    auto& ss = prof_opt->stage_by_stage[stage_idx];
-    ss.dequeue_calls += deq_calls;
-    ss.dequeue_timeouts += deq_timeouts;
-    ss.dequeue_s += deq_s;
-    ss.dequeue_idle_s += deq_idle_s;
+    if constexpr (EnableEngineProfiling) {
+      const auto* pcfg = prof_cfg_ptr_();
+      auto& prof_opt = prof_storage_();
+      if (!pcfg || !pcfg->enable_stats || !prof_opt) return;
+      std::lock_guard<std::mutex> lk(prof_mu_);
+      auto& ss = prof_opt->stage_by_stage[stage_idx];
+      ss.dequeue_calls += deq_calls;
+      ss.dequeue_timeouts += deq_timeouts;
+      ss.dequeue_s += deq_s;
+      ss.dequeue_idle_s += deq_idle_s;
+    }
   }
 
   void prof_stage_proc_(std::size_t stage_idx, std::uint64_t proc_calls, double proc_s) {
-    if constexpr (!EnableEngineProfiling) return;
-    const auto* pcfg = prof_cfg_ptr_();
-    auto& prof_opt = prof_storage_();
-    if (!pcfg || !pcfg->enable_stats || !prof_opt) return;
-    std::lock_guard<std::mutex> lk(prof_mu_);
-    auto& ss = prof_opt->stage_by_stage[stage_idx];
-    ss.process_calls += proc_calls;
-    ss.process_s += proc_s;
+    if constexpr (EnableEngineProfiling) {
+      const auto* pcfg = prof_cfg_ptr_();
+      auto& prof_opt = prof_storage_();
+      if (!pcfg || !pcfg->enable_stats || !prof_opt) return;
+      std::lock_guard<std::mutex> lk(prof_mu_);
+      auto& ss = prof_opt->stage_by_stage[stage_idx];
+      ss.process_calls += proc_calls;
+      ss.process_s += proc_s;
+    }
   }
 
   void prof_stage_enq_(std::size_t stage_idx, std::uint64_t enq_calls, double enq_s) {
-    if constexpr (!EnableEngineProfiling) return;
-    const auto* pcfg = prof_cfg_ptr_();
-    auto& prof_opt = prof_storage_();
-    if (!pcfg || !pcfg->enable_stats || !prof_opt) return;
-    std::lock_guard<std::mutex> lk(prof_mu_);
-    auto& ss = prof_opt->stage_by_stage[stage_idx];
-    ss.enqueue_calls += enq_calls;
-    ss.enqueue_s += enq_s;
+    if constexpr (EnableEngineProfiling) {
+      const auto* pcfg = prof_cfg_ptr_();
+      auto& prof_opt = prof_storage_();
+      if (!pcfg || !pcfg->enable_stats || !prof_opt) return;
+      std::lock_guard<std::mutex> lk(prof_mu_);
+      auto& ss = prof_opt->stage_by_stage[stage_idx];
+      ss.enqueue_calls += enq_calls;
+      ss.enqueue_s += enq_s;
+    }
   }
 
   void prof_stage_out_(std::size_t stage_idx,
                        std::uint64_t out_calls,
                        std::uint64_t out_items,
                        double out_s) {
-    if constexpr (!EnableEngineProfiling) return;
-    const auto* pcfg = prof_cfg_ptr_();
-    auto& prof_opt = prof_storage_();
-    if (!pcfg || !pcfg->enable_stats || !prof_opt) return;
-    std::lock_guard<std::mutex> lk(prof_mu_);
-    auto& ss = prof_opt->stage_by_stage[stage_idx];
-    ss.output_calls += out_calls;
-    ss.output_items += out_items;
-    ss.output_s += out_s;
+    if constexpr (EnableEngineProfiling) {
+      const auto* pcfg = prof_cfg_ptr_();
+      auto& prof_opt = prof_storage_();
+      if (!pcfg || !pcfg->enable_stats || !prof_opt) return;
+      std::lock_guard<std::mutex> lk(prof_mu_);
+      auto& ss = prof_opt->stage_by_stage[stage_idx];
+      ss.output_calls += out_calls;
+      ss.output_items += out_items;
+      ss.output_s += out_s;
+    }
   }
 
  private:
