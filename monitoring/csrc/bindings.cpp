@@ -162,6 +162,62 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using StageConfig = DMXHostEngine::StageConfig;
   using ThreadFailure = DMXHostEngine::ThreadFailure;
   using QueueT = DMXHostEngine::QueueT;
+  using QueueConfig = DMXHostEngine::QueueConfig;
+  using EnqueuePolicy = DMXHostEngine::EnqueuePolicy;
+  using Duration = DMXHostEngine::Duration;
+
+  py::enum_<dmx_host::OnFullPolicy>(m, "OnFullPolicy")
+      .value("RAISE", dmx_host::OnFullPolicy::RAISE)
+      .value("DROP", dmx_host::OnFullPolicy::DROP)
+      .value("RETRY", dmx_host::OnFullPolicy::RETRY)
+      .value("ABORT", dmx_host::OnFullPolicy::ABORT)
+      .export_values();
+
+  py::enum_<dmx_host::OnClosedPolicy>(m, "OnClosedPolicy")
+      .value("RAISE", dmx_host::OnClosedPolicy::RAISE)
+      .value("DROP", dmx_host::OnClosedPolicy::DROP)
+      .export_values();
+
+  py::class_<QueueConfig>(m, "QueueConfig")
+      .def(py::init<>())
+      .def_readwrite("min_batch_items", &QueueConfig::min_batch_items)
+      .def_readwrite("min_batch_size", &QueueConfig::min_batch_size)
+      .def_property(
+          "max_linger_s",
+          [](const QueueConfig& q) -> std::optional<double> {
+            if (!q.max_linger) return std::nullopt;
+            return q.max_linger->count();
+          },
+          [](QueueConfig& q, std::optional<double> v) {
+            if (v) q.max_linger = Duration(*v);
+            else q.max_linger.reset();
+          })
+      .def_readwrite("max_batch_items", &QueueConfig::max_batch_items)
+      .def_readwrite("max_batch_size", &QueueConfig::max_batch_size)
+      .def_readwrite("high_watermark_items", &QueueConfig::high_watermark_items)
+      .def_readwrite("high_watermark_size", &QueueConfig::high_watermark_size);
+
+  py::class_<EnqueuePolicy>(m, "EnqueuePolicy")
+      .def(py::init<>())
+      .def_readwrite("block", &EnqueuePolicy::block)
+      .def_property(
+          "timeout_s",
+          [](const EnqueuePolicy& p) -> std::optional<double> {
+            if (!p.timeout) return std::nullopt;
+            return p.timeout->count();
+          },
+          [](EnqueuePolicy& p, std::optional<double> v) {
+            if (v) p.timeout = Duration(*v);
+            else p.timeout.reset();
+          })
+      .def_readwrite("on_full", &EnqueuePolicy::on_full)
+      .def_readwrite("max_retries", &EnqueuePolicy::max_retries)
+      .def_property(
+          "retry_backoff_s",
+          [](const EnqueuePolicy& p) { return p.retry_backoff.count(); },
+          [](EnqueuePolicy& p, double v) { p.retry_backoff = Duration(v); })
+      .def_readwrite("on_closed", &EnqueuePolicy::on_closed)
+      .def_readwrite("drop_if_stopping", &EnqueuePolicy::drop_if_stopping);
 
   py::class_<ThreadFailure>(m, "ThreadFailure")
       .def_readonly("stage", &ThreadFailure::stage)
@@ -174,6 +230,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(py::init<>())
       .def_readwrite("name", &StageConfig::name)
       .def_readwrite("parallelism", &StageConfig::parallelism)
+      .def_readwrite("input_queue", &StageConfig::input_queue)
+      .def_readwrite("ingress_policy", &StageConfig::ingress_policy)
       .def_property(
           "thread_name_prefix",
           [](const StageConfig& s) { return s.thread_name_prefix; },

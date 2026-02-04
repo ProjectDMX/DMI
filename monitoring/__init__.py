@@ -9,6 +9,10 @@ _NATIVE_EXPORTS = (
     "DMXHostEngine",
     "ClickHouseClientConfig",
     "ThreadFailure",
+    "QueueConfig",
+    "EnqueuePolicy",
+    "OnFullPolicy",
+    "OnClosedPolicy",
 )
 
 def __getattr__(name: str):

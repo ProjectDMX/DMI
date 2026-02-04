@@ -21,11 +21,25 @@ _EXTENSION_NAME = "monitoring_native_backend"
 _EXTENSION_MODULE: Optional[Any] = None
 
 
+BASE_DIR = Path(__file__).resolve().parent
+
+def get_env_path(var_name, relative_path_str):
+    val = os.environ.get(var_name)
+    if val is None:
+        # Join the file's dir with the relative path and make it absolute
+        return str((BASE_DIR / relative_path_str).resolve())
+    return val
+
+
 _NATIVE_EXPORTS = (
     "StageConfig",
     "DMXHostEngine",
     "ClickHouseClientConfig",
     "ThreadFailure",
+    "QueueConfig",
+    "EnqueuePolicy",
+    "OnFullPolicy",
+    "OnClosedPolicy",
 )
 
 
@@ -93,18 +107,16 @@ def _load_extension() -> Any:
     # CLICKHOUSE_INCLUDE: path to headers (e.g. /usr/local/include)
     # CLICKHOUSE_LIB_DIR: path to libs    (e.g. /usr/local/lib)
     # CLICKHOUSE_LIBS:    link flags      (default: -lclickhouse-cpp-lib)
-    ch_include = os.environ.get("CLICKHOUSE_INCLUDE", "").strip()
+    ch_include = get_env_path("CLICKHOUSE_INCLUDE", "../libs/clickhouse-cpp")
     if ch_include:
         extra_cflags.append(f"-I{ch_include}")
         extra_cuda_cflags.append(f"-I{ch_include}")
 
-    ch_lib_dir = os.environ.get("CLICKHOUSE_LIB_DIR", "").strip()
+    ch_lib_dir = get_env_path("CLICKHOUSE_LIB_DIR", "../libs/clickhouse-cpp/build/clickhouse")
     if ch_lib_dir:
         extra_ldflags.extend([f"-L{ch_lib_dir}", f"-Wl,-rpath,{ch_lib_dir}"])
 
-    ch_libs_env = os.environ.get("CLICKHOUSE_LIBS")
-    ch_libs = "-lclickhouse-cpp-lib" if ch_libs_env is None else ch_libs_env
-    ch_libs = ch_libs.strip()
+    ch_libs = os.environ.get("CLICKHOUSE_LIBS", "-lclickhouse-cpp-lib").strip()
     if ch_libs:
         extra_ldflags.extend(shlex.split(ch_libs))
 

@@ -44,13 +44,19 @@ def _serialize_task(task: MonitoringTask) -> tuple[Any, int, bool, bool, Any, Op
 
 @dataclass
 class HostEngineConfig:
-    """Configuration wrapper for dmx_host PipelinedEngine."""
+    """Configuration wrapper for the native DMXHostEngine pipeline.
+
+    The DMXHostEngine lives in the native monitoring extension and is used to
+    post-process per-step BackendFuture objects (e.g. wait on them, then write
+    results to ClickHouse).
+
+    Notes:
+      - This path requires the native monitoring backend (CUDA +
+        monitoring_native_backend extension).
+      - The engine currently expects exactly **two** stages.
+    """
 
     stages: Sequence[Any]
-    input_handler: Any
-    engine_config: Optional[Any] = None
-    output_handler: Optional[Any] = None
-    logger: Optional[Any] = None
     start_on_init: bool = True
 
 
@@ -128,19 +134,26 @@ class MonitoringEngine:
         if host_engine is not None or db_config is not None:
             if self._model_id is None:
                 raise ValueError("model_id is required when host_engine integration is enabled")
+            if not self._using_native_backend:
+                raise RuntimeError(
+                    "DMXHostEngine integration requires the native monitoring backend "
+                    "(CUDA + monitoring_native_backend extension)"
+                )
             self._host_engine = host_engine
             if self._host_engine is None and db_config is not None:
                 try:
-                    from dmx_host.engine import PipelinedEngine  # type: ignore
+                    from . import _native_engine
+                    DMXHostEngine = _native_engine.DMXHostEngine  # type: ignore[attr-defined]
                 except Exception as exc:
-                    raise RuntimeError("Failed to import dmx_host engine") from exc
-                self._host_engine = PipelinedEngine(
-                    db_config.stages,
-                    input_handler=db_config.input_handler,
-                    config=db_config.engine_config,
-                    logger=db_config.logger,
-                    output_handler=db_config.output_handler,
-                )
+                    raise RuntimeError("Failed to import native DMXHostEngine") from exc
+                stages = tuple(db_config.stages)
+                if len(stages) != 2:
+                    raise ValueError("db_config.stages must contain exactly 2 StageConfig objects")
+
+                try:
+                    self._host_engine = DMXHostEngine(stages)  # type: ignore[call-arg]
+                except Exception as exc:
+                    raise RuntimeError("Failed to construct DMXHostEngine") from exc
             if self._host_engine is not None:
                 try:
                     if db_config is None or db_config.start_on_init:
