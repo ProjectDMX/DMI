@@ -7,6 +7,16 @@ name = "hf-prometheus"
 version = "0.1.0"
 description = "LLM monitoring with HuggingFace Transformers"
 requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+monitoring = ["csrc/*.cpp", "csrc/*.h", "csrc/*.hpp", "Makefile"]
 
 [tool.setuptools.packages.find]
 include = ["monitoring*", "benchmark*"]

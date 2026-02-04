@@ -1,6 +1,10 @@
 // Pybind11 module + factory
 
 #include "native_engine_internal.h"
+#include "clickhouse_client.h"
+// dmx_host pipeline
+#include "dmx_host_engine.h"
+#include "future_process.h"
 
 namespace monitoring {
 
@@ -88,4 +92,150 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("create_engine", &monitoring::create_engine,
         py::arg("queue_size"), py::arg("cache_dtype"), py::arg("delay_steps"));
+
+  // ---- ClickHouseClientConfig (config only; stage is C++-only) ----
+  py::class_<dmx_host::ClickHouseClientConfig>(m, "ClickHouseClientConfig")
+      .def(py::init<>())
+
+      .def_readwrite("host", &dmx_host::ClickHouseClientConfig::host)
+      .def_readwrite("port", &dmx_host::ClickHouseClientConfig::port)
+      .def_readwrite("username", &dmx_host::ClickHouseClientConfig::username)
+      .def_readwrite("password", &dmx_host::ClickHouseClientConfig::password)
+      .def_readwrite("database", &dmx_host::ClickHouseClientConfig::database)
+      .def_readwrite("table", &dmx_host::ClickHouseClientConfig::table)
+      .def_readwrite("secure", &dmx_host::ClickHouseClientConfig::secure)
+
+      .def_readwrite("create_database_if_missing",
+                     &dmx_host::ClickHouseClientConfig::create_database_if_missing)
+      .def_readwrite("drop_existing_database",
+                     &dmx_host::ClickHouseClientConfig::drop_existing_database)
+      .def_readwrite("client_side_compress",
+                     &dmx_host::ClickHouseClientConfig::client_side_compress)
+      .def_readwrite("index_granularity",
+                     &dmx_host::ClickHouseClientConfig::index_granularity)
+
+      // Expose client_settings as a dict, store internally as unordered_map<string, variant<...>>.
+      // This avoids requiring <pybind11/stl_variant.h>.
+      .def_property(
+          "client_settings",
+          [](const dmx_host::ClickHouseClientConfig& self) {
+            py::dict d;
+            for (const auto& kv : self.client_settings) {
+              const auto& key = kv.first;
+              const auto& val = kv.second;
+              if (std::holds_alternative<bool>(val)) {
+                d[py::str(key)] = py::bool_(std::get<bool>(val));
+              } else if (std::holds_alternative<std::int64_t>(val)) {
+                d[py::str(key)] = py::int_(std::get<std::int64_t>(val));
+              } else {
+                d[py::str(key)] = py::str(std::get<std::string>(val));
+              }
+            }
+            return d;
+          },
+          [](dmx_host::ClickHouseClientConfig& self, py::object obj) {
+            self.client_settings.clear();
+            if (obj.is_none()) return;
+
+            py::dict d = obj.cast<py::dict>();
+            for (auto item : d) {
+              std::string key = py::cast<std::string>(item.first);
+              py::handle v = item.second;
+
+              // bool must be checked before int (Python bool is an int subclass)
+              if (py::isinstance<py::bool_>(v)) {
+                self.client_settings.emplace(std::move(key), py::cast<bool>(v));
+              } else if (py::isinstance<py::int_>(v)) {
+                self.client_settings.emplace(
+                    std::move(key),
+                    static_cast<std::int64_t>(py::cast<long long>(v)));
+              } else if (py::isinstance<py::str>(v)) {
+                self.client_settings.emplace(std::move(key), py::cast<std::string>(v));
+              } else {
+                throw py::type_error("client_settings values must be bool/int/str (or None)");
+              }
+            }
+          });
+
+  // ---- dmx_host StageConfig + DMXHostEngine ----
+  using DMXHostEngine = dmx_host::DMXHostEngine;
+  using StageConfig = DMXHostEngine::StageConfig;
+  using ThreadFailure = DMXHostEngine::ThreadFailure;
+  using QueueT = DMXHostEngine::QueueT;
+
+  py::class_<ThreadFailure>(m, "ThreadFailure")
+      .def_readonly("stage", &ThreadFailure::stage)
+      .def_readonly("thread_name", &ThreadFailure::thread_name)
+      .def_readonly("where", &ThreadFailure::where)
+      .def_readonly("exc_type", &ThreadFailure::exc_type)
+      .def_readonly("exc_what", &ThreadFailure::exc_what);
+
+  py::class_<StageConfig>(m, "StageConfig")
+      .def(py::init<>())
+      .def_readwrite("name", &StageConfig::name)
+      .def_readwrite("parallelism", &StageConfig::parallelism)
+      .def_property(
+          "thread_name_prefix",
+          [](const StageConfig& s) { return s.thread_name_prefix; },
+          [](StageConfig& s, std::optional<std::string> v) { s.thread_name_prefix = std::move(v); })
+      // Stage 1: ProcessFuture
+      .def_static(
+          "process_future",
+          [](int parallelism, std::string name) {
+            StageConfig cfg;
+            cfg.name = std::move(name);
+            cfg.parallelism = parallelism;
+            cfg.process_fn = [](std::vector<dmx_host::dmx_host_queue_item> batch, QueueT* next_q) {
+              return dmx_host::ProcessFutureStage::ProcessFn<QueueT>(std::move(batch), next_q);
+            };
+            cfg.thread_init = &dmx_host::ProcessFutureStage::ThreadInitAny;
+            cfg.thread_cleanup = &dmx_host::ProcessFutureStage::ThreadCleanupAny;
+            return cfg;
+          },
+          py::arg("parallelism") = 1,
+          py::arg("name") = "process_future")
+      // Stage 2: ClickHouse insert (this is where thread_init_config matters)
+      .def_static(
+          "clickhouse_insert",
+          [](const dmx_host::ClickHouseClientConfig& ch_cfg, int parallelism, std::string name) {
+            StageConfig cfg;
+            cfg.name = std::move(name);
+            cfg.parallelism = parallelism;
+            cfg.process_fn = [](std::vector<dmx_host::dmx_host_queue_item> batch, QueueT* next_q) {
+              return dmx_host::ClickHouseInsertStage::ProcessFn<QueueT>(std::move(batch), next_q);
+            };
+            // Stored by value in std::any; ClickHouseInsertStage::ThreadInitAny will any_cast it.
+            cfg.thread_init_config = ch_cfg;
+            cfg.thread_init = &dmx_host::ClickHouseInsertStage::ThreadInitAny;
+            cfg.thread_cleanup = &dmx_host::ClickHouseInsertStage::ThreadCleanupAny;
+            return cfg;
+          },
+          py::arg("clickhouse_config"),
+          py::arg("parallelism") = 1,
+          py::arg("name") = "clickhouse_insert");
+
+  py::class_<DMXHostEngine, std::shared_ptr<DMXHostEngine>>(m, "DMXHostEngine")
+      .def(py::init<std::array<StageConfig, 2>>(), py::arg("stages"))
+      .def("start", &DMXHostEngine::start)
+      .def("stop",
+           [](DMXHostEngine& self, bool graceful, std::optional<double> timeout_s) {
+             if (timeout_s) {
+               return self.stop(graceful, DMXHostEngine::Duration(*timeout_s));
+             }
+             return self.stop(graceful, std::nullopt);
+           },
+           py::arg("graceful") = true,
+           py::arg("timeout_s") = std::optional<double>())
+      .def("close_input", &DMXHostEngine::close_input)
+      .def("request_abort", &DMXHostEngine::request_abort)
+      .def("join",
+           [](DMXHostEngine& self, std::optional<double> timeout_s) {
+             if (timeout_s) return self.join(DMXHostEngine::Duration(*timeout_s));
+             return self.join(std::nullopt);
+           },
+           py::arg("timeout_s") = std::optional<double>())
+      .def("failures", &DMXHostEngine::failures)
+      .def("raise_if_failed", &DMXHostEngine::raise_if_failed)
+      .def("submit", &DMXHostEngine::submit,
+           py::arg("keys"), py::arg("start_token_idxs"), py::arg("cache_dicts"));
 }

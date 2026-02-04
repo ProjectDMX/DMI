@@ -6,5 +6,9 @@
 #include "api_submit.cpp"
 #include "hooks.cpp"
 #include "slice.cpp"
+// dmx_host pipeline bits
+#include "dmx_host_utils.cpp"
+#include "future_process.cpp"
+#include "clickhouse_client.cpp"
 #include "bindings.cpp"
 
