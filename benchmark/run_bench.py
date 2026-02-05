@@ -6,14 +6,14 @@ import sys
 import time
 
 
-def _run_script(script: str, args: list[str]) -> dict:
+def _run_script(script: str, args: list[str], env: dict[str, str] | None = None) -> dict:
     import tempfile
     # Use temp file to capture JSON result
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
         tmp_path = f.name
     try:
         cmd = [sys.executable, script] + args + ["--json-out", tmp_path]
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=env)
         with open(tmp_path, "r", encoding="utf-8") as f:
             return json.load(f)
     finally:
@@ -87,7 +87,7 @@ def main() -> None:
     parser.add_argument("--model", default="gpt2")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--out-dir", default="benchmark/results")
     parser.add_argument("--tag", default="")
@@ -96,6 +96,7 @@ def main() -> None:
     parser.add_argument("--mem-interval", type=float, default=0.1)
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--cpu-extra-pids", default="")
+    parser.add_argument("--nvtx", action="store_true")
     parser.add_argument(
         "--no-clickhouse-pid",
         action="store_true",
@@ -127,6 +128,11 @@ def main() -> None:
     if args.do_sample:
         common_args.append("--do-sample")
 
+    base_env = os.environ.copy()
+    if args.nvtx:
+        base_env["BENCH_NVTX"] = "1"
+        base_env.setdefault("TL_ENABLE_NVTX", "1")
+
     if args.monitor_mem:
         procs = _start_monitors(
             gpu_csv_hf,
@@ -137,13 +143,13 @@ def main() -> None:
         )
         try:
             hf_start_ts = _now_epoch()
-            hf_result = _run_script("benchmark/scripts/hf_generate.py", common_args)
+            hf_result = _run_script("benchmark/scripts/hf_generate.py", common_args, env=base_env)
             hf_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
     else:
         hf_start_ts = _now_epoch()
-        hf_result = _run_script("benchmark/scripts/hf_generate.py", common_args)
+        hf_result = _run_script("benchmark/scripts/hf_generate.py", common_args, env=base_env)
         hf_end_ts = _now_epoch()
 
     # Run monitoring with DB (unless --no-db is specified)
@@ -165,16 +171,16 @@ def main() -> None:
                 args.gpu_id,
                 extra_pids,
             )
-            try:
-                mon_start_ts = _now_epoch()
-                mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args)
-                mon_end_ts = _now_epoch()
-            finally:
-                _stop_monitors(procs)
-        else:
+        try:
             mon_start_ts = _now_epoch()
-            mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args)
+            mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
             mon_end_ts = _now_epoch()
+        finally:
+            _stop_monitors(procs)
+    else:
+        mon_start_ts = _now_epoch()
+        mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
+        mon_end_ts = _now_epoch()
 
     # Run monitoring with --no-db
     gpu_csv_mon_nodb = os.path.join(args.out_dir, f"gpu_mem_monitoring_nodb_{tag}.csv")
@@ -190,13 +196,13 @@ def main() -> None:
         )
         try:
             mon_nodb_start_ts = _now_epoch()
-            mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args)
+            mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args, env=base_env)
             mon_nodb_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
     else:
         mon_nodb_start_ts = _now_epoch()
-        mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args)
+        mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args, env=base_env)
         mon_nodb_end_ts = _now_epoch()
 
     summary = {

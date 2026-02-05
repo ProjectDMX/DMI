@@ -182,6 +182,9 @@ class MonitoringEngine:
         self._stats_py_resolve_ms = 0.0    # resolve_all + clear overhead
         self._stats_max_tasks_per_step = 0
         self._last_prepare_ms = 0.0
+        self._stats_endstep_ms_total = 0.0
+        self._stats_endstep_calls = 0
+        self._stats_endstep_ms_max = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -466,6 +469,10 @@ class MonitoringEngine:
             backend = self._native_backend
             if backend is None:
                 return
+            _t_end0 = None
+            if self._stats_enabled:
+                import time
+                _t_end0 = time.perf_counter()
             stream_handle = _stream_to_handle(producer_stream)
             # Prefer native batch (SoA) if enabled and we have aggregated specs
             if self._native_batch_enabled and step_id in self._native_batch:
@@ -486,6 +493,12 @@ class MonitoringEngine:
                 self._submit_pending_db_step()
                 if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
                     _nvtx.range_pop()
+                if _t_end0 is not None:
+                    _dt = (time.perf_counter() - _t_end0) * 1000.0
+                    self._stats_endstep_ms_total += _dt
+                    self._stats_endstep_calls += 1
+                    if _dt > self._stats_endstep_ms_max:
+                        self._stats_endstep_ms_max = _dt
                 return
 
             if tasks:
@@ -531,6 +544,12 @@ class MonitoringEngine:
             self._submit_pending_db_step()
             if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
                 _nvtx.range_pop()
+            if _t_end0 is not None:
+                _dt = (time.perf_counter() - _t_end0) * 1000.0
+                self._stats_endstep_ms_total += _dt
+                self._stats_endstep_calls += 1
+                if _dt > self._stats_endstep_ms_max:
+                    self._stats_endstep_ms_max = _dt
             return
 
         backend = self._python_backend
@@ -541,6 +560,18 @@ class MonitoringEngine:
         backend.submit_step(step_id, tasks, producer_stream)
         if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
             _nvtx.range_pop()
+        if self._stats_enabled:
+            import time
+            _dt = 0.0
+            try:
+                _dt = (time.perf_counter() - _t_end0) * 1000.0  # type: ignore[name-defined]
+            except Exception:
+                _dt = 0.0
+            if _dt:
+                self._stats_endstep_ms_total += _dt
+                self._stats_endstep_calls += 1
+                if _dt > self._stats_endstep_ms_max:
+                    self._stats_endstep_ms_max = _dt
 
     def resolve_all(self) -> None:
         """Block until all pending tasks have been processed."""
@@ -628,6 +659,15 @@ class MonitoringEngine:
                       " py_submit_ms=", round(self._stats_native_submit_ms, 3),
                       " py_bind_ms=", round(self._stats_py_bind_ms, 3),
                       " py_resolve_ms=", round(self._stats_py_resolve_ms, 3),
+                      " end_step_ms=", round(self._stats_endstep_ms_total, 3),
+                      " end_step_avg_ms=",
+                      round(
+                          (self._stats_endstep_ms_total / self._stats_endstep_calls)
+                          if self._stats_endstep_calls
+                          else 0.0,
+                          3,
+                      ),
+                      " end_step_max_ms=", round(self._stats_endstep_ms_max, 3),
                       " max_tasks_per_step=", self._stats_max_tasks_per_step)
                 if stats is not None:
                     try:

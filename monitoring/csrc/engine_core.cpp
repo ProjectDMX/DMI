@@ -146,10 +146,10 @@ void NativeMonitoringEngine::Impl::remove_slot(int64_t token) {
 
 void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
   mon_nvtx_push("MonEng::dispatch_step");
-  if (stats_step_log_) {
-    std::fprintf(stderr, "[Native/Step] step_id=%ld tasks=%zu\n",
-                 static_cast<long>(work.step_id), work.tasks.size());
-  }
+  // if (stats_step_log_) {
+  //   std::fprintf(stderr, "[Native/Step] step_id=%ld tasks=%zu\n",
+  //                static_cast<long>(work.step_id), work.tasks.size());
+  // }
   if (work.tasks.empty()) {
     if (work.event != nullptr) {
       C10_CUDA_CHECK(cudaEventDestroy(work.event));

@@ -1,6 +1,8 @@
 import argparse
+import contextlib
 import json
 import math
+import os
 import time
 from typing import List
 
@@ -24,6 +26,23 @@ def _load_prompts(path: str) -> List[str]:
 def _iter_batches(items: List[str], batch_size: int):
     for idx in range(0, len(items), batch_size):
         yield idx // batch_size, items[idx : idx + batch_size]
+
+
+@contextlib.contextmanager
+def _nvtx_range(name: str):
+    try:
+        if not torch.cuda.is_available():
+            yield
+            return
+        from torch.cuda import nvtx  # type: ignore
+    except Exception:
+        yield
+        return
+    nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        nvtx.range_pop()
 
 
 def main() -> None:
@@ -53,7 +72,9 @@ def main() -> None:
     start = time.perf_counter()
 
     total_batches = math.ceil(len(prompts) / args.batch_size)
-    with torch.no_grad():
+    use_nvtx = os.environ.get("BENCH_NVTX", "0") == "1"
+    nvtx_ctx = _nvtx_range("hf_generate") if use_nvtx else contextlib.nullcontext()
+    with nvtx_ctx, torch.no_grad():
         for batch_idx, batch_prompts in tqdm(
             _iter_batches(prompts, args.batch_size),
             total=total_batches,
