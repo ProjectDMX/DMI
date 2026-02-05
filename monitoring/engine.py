@@ -605,6 +605,7 @@ class MonitoringEngine:
 
         if self._host_engine is not None and not self._using_native_backend:
             try:
+                self._python_backend.resolve_all()
                 self._host_engine.stop()
             except Exception:
                 pass
@@ -659,6 +660,7 @@ class MonitoringEngine:
                     pass
             if self._host_engine is not None:
                 try:
+                    backend.resolve_all()
                     self._host_engine.stop()
                 except Exception:
                     pass

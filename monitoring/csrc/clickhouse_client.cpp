@@ -1,6 +1,9 @@
 // clickhouse_client.cpp
 #include "clickhouse_client.h"
+// For DMXHostEngine::QueueT (the queue type actually used in bindings.cpp)
+#include "dmx_host_engine.h"
 
+#include <iostream>
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -446,5 +449,11 @@ void ClickHouseInsertStage::InsertBatch(std::vector<dmx_host_queue_item>&& batch
 
   client.Insert(fq_table, block);
 }
+
+// Force emission of the specialization referenced from bindings.cpp:
+template std::optional<std::vector<dmx_host_queue_item>>
+ClickHouseInsertStage::ProcessFn<DMXHostEngine::QueueT>(
+    std::vector<dmx_host_queue_item>,
+    DMXHostEngine::QueueT*);
 
 }  // namespace dmx_host

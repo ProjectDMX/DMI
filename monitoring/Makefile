@@ -73,6 +73,11 @@ LDFLAGS += -L$(CLICKHOUSE_LIB_DIR) -Wl,-rpath,$(CLICKHOUSE_LIB_DIR)
 endif
 LDFLAGS += $(CLICKHOUSE_LIBS)
 
+CONDA_PREFIX ?= $(shell $(PYTHON) -c "import os; print(os.environ.get('CONDA_PREFIX',''))")
+ifneq ($(CONDA_PREFIX),)
+CXXFLAGS += -I$(CONDA_PREFIX)/include
+LDFLAGS  += -L$(CONDA_PREFIX)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib
+endif
 
 .PHONY: all build clean
 

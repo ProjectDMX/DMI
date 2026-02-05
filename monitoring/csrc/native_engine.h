@@ -107,6 +107,8 @@ class BackendFuture {
   BackendFuture(std::shared_ptr<NativeMonitoringEngine> backend, int64_t token)
       : backend_(backend), token_(token) {}
 
+  int64_t token() const { return token_; }
+
   bool ready() const { return backend_->future_ready(token_); }
 
   bool wait(std::optional<double> timeout = std::optional<double>()) const {

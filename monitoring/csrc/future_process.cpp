@@ -1,4 +1,8 @@
 #include "future_process.h"
+#include "batching_queue.hpp"   // WatermarkBatchingQueue
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
 
 namespace dmx_host {
 thread_local int worker_id;
@@ -47,9 +51,16 @@ std::optional<std::vector<dmx_host_queue_item>> ProcessFutureStage::ProcessFutur
         int32_t end_token_idx = start_token_idx + delta_len_32;
         new_row.push_back(end_token_idx);
         new_row.push_back(tensor);
-        next_q.enqueue(dmx_host_queue_item(new_row, tensor.nbytes()));
+        next_q->enqueue(dmx_host_queue_item(std::move(new_row), tensor.nbytes()));
     }
     return std::nullopt;
 }
+
+// Force emission of the specialization that bindings.cpp calls (QueueT == WatermarkBatchingQueue<...>).
+template std::optional<std::vector<dmx_host_queue_item> >
+ProcessFutureStage::ProcessFuture<WatermarkBatchingQueue<dmx_host_queue_item, uint64_t, false, false, false>
+>(std::vector<dmx_host_queue_item>&&,
+  WatermarkBatchingQueue<dmx_host_queue_item, uint64_t, false, false, false>*);
+
 
 }
