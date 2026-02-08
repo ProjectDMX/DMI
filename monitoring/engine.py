@@ -633,7 +633,7 @@ class MonitoringEngine:
         _debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
         if _debug:
             print("[MonEng] close() called")
-
+        self.resolve_all()
         if self._host_engine is not None and not self._using_native_backend:
             try:
                 self._python_backend.resolve_all()

@@ -25,6 +25,8 @@ from monitoring import (
 from monitoring.config import CaptureSchedule, HookSelection
 from monitoring.generate import generate_with_monitoring
 
+# torch.set_num_threads(1)
+# torch.set_num_interop_threads(1)
 
 def _load_prompts(path: str) -> List[str]:
     prompts: List[str] = []
@@ -100,7 +102,7 @@ def _build_host_config(db_cfg: ClickHouseClientConfig) -> HostEngineConfig:
     # Stage 1: wait on BackendFuture + parse payloads
     stage_one = StageConfig.process_future(parallelism=1, name="process_future")
     # Stage 2: insert into ClickHouse
-    stage_two = StageConfig.clickhouse_insert(db_cfg, parallelism=1, name="clickhouse_insert")
+    stage_two = StageConfig.clickhouse_insert(db_cfg, parallelism=10, name="clickhouse_insert")
 
     stage_one.input_queue = _build_queue_config()
     stage_two.input_queue = _build_queue_config()
@@ -131,8 +133,8 @@ def main() -> None:
     os.environ.setdefault("MON_NATIVE_BATCH", "0")
 
     if args.no_db:
-        # No host engine consumer => enable auto-cleanup so futures don't accumulate.
-        os.environ["MON_NATIVE_AUTOCLEAR"] = "1"
+        # No DB path: disable auto-cleanup; we'll clear once after the run.
+        os.environ["MON_NATIVE_AUTOCLEAR"] = "0"
     else:
         # Prevent native backend from clearing futures before host_engine consumes them.
         os.environ["MON_NATIVE_AUTOCLEAR"] = "0"
@@ -216,19 +218,28 @@ def main() -> None:
                         "tokens": batch_tokens,
                         "tokens_per_s": batch_tokens / batch_seconds if batch_seconds > 0 else None,
                     }
-                )
+                )   
         loop_end = time.perf_counter()
+        engine.resolve_all()
+        t_r_ed = time.perf_counter()
     finally:
         if engine._host_engine is not None:
             try:
                 host_timings = engine._host_engine.timings()
             except Exception:
                 host_timings = None
+        if args.no_db:
+            try:
+                engine.resolve_all()
+                engine.clear_completed_results()
+            except Exception:
+                pass
         engine.close()
 
     if loop_end is None:
         loop_end = time.perf_counter()
     total_seconds = time.perf_counter() - start
+    total_to_cpu = t_r_ed - start
     main_seconds = loop_end - start
     result = {
         "backend": "monitoring",
@@ -239,6 +250,7 @@ def main() -> None:
         "max_new_tokens": args.max_new_tokens,
         "do_sample": args.do_sample,
         "main_seconds": main_seconds,
+        "to_cpu_seconds": total_to_cpu,
         "total_seconds": total_seconds,
         "total_tokens": total_tokens,
         "tokens_per_s": total_tokens / total_seconds if total_seconds > 0 else None,
