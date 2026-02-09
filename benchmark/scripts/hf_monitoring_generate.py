@@ -131,6 +131,10 @@ def main() -> None:
     os.environ.setdefault("MON_NATIVE_CALLBACK", "1")
     os.environ.setdefault("MON_NATIVE_BUILDER", "1")
     os.environ.setdefault("MON_NATIVE_BATCH", "0")
+    # Enable pinned and memcpy pool.
+    os.environ.setdefault("MON_NATIVE_PINNED", "1")
+    os.environ.setdefault("MON_NATIVE_PINPOOL", "1")
+    os.environ.setdefault("MON_NATIVE_HOST_COPY_THREADS", "5")
 
     if args.no_db:
         # No DB path: disable auto-cleanup; we'll clear once after the run.

@@ -79,6 +79,19 @@ CXXFLAGS += -I$(CONDA_PREFIX)/include
 LDFLAGS  += -L$(CONDA_PREFIX)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib
 endif
 
+
+# venv/virtualenv support (adds include/lib paths for the active interpreter)
+VENV_PREFIX ?= $(shell $(PYTHON) -c "import sys; in_venv = (getattr(sys,'base_prefix',sys.prefix) != sys.prefix) or hasattr(sys,'real_prefix'); print(sys.prefix if in_venv else '')")
+ifneq ($(VENV_PREFIX),)
+CXXFLAGS += -I$(VENV_PREFIX)/include
+ifneq ($(wildcard $(VENV_PREFIX)/lib64),)
+LDFLAGS  += -L$(VENV_PREFIX)/lib64 -Wl,-rpath,$(VENV_PREFIX)/lib64
+endif
+ifneq ($(wildcard $(VENV_PREFIX)/lib),)
+LDFLAGS  += -L$(VENV_PREFIX)/lib -Wl,-rpath,$(VENV_PREFIX)/lib
+endif
+endif
+
 .PHONY: all build clean
 
 all: $(FINAL_TARGET)
