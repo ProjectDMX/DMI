@@ -148,7 +148,7 @@ struct NativeMonitoringEngine::Impl {
   void resolve_all();
   bool future_ready(int64_t token);
   bool future_wait(int64_t token, std::optional<double> timeout);
-  at::Tensor future_result(int64_t token, std::optional<double> timeout);
+  at::Tensor future_result(int64_t token, std::optional<double> timeout, bool called_from_cpp = false);
   void clear_completed_results();
   void close();
 

@@ -6,7 +6,7 @@ import threading
 from dataclasses import dataclass, field
 from collections import Counter
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import torch
 
@@ -256,24 +256,51 @@ class CacheFuture:
                 pass
 
 
-class BackendFuture:
-    """Lightweight future for native backend tokens (no threading.Event).
+# -----------------------------------------------------------------------------
+# Native BackendFuture
+# -----------------------------------------------------------------------------
 
-    This avoids Python-side allocation overhead for the hot path where the
-    native backend manages readiness and results.
-    """
 
-    __slots__ = ("_backend", "_token")
+if TYPE_CHECKING:  # pragma: no cover
+    from typing import Protocol
 
-    def __init__(self, backend: Any, token: int) -> None:  # type: ignore[name-defined]
-        self._backend = backend
-        self._token = int(token)
+    class BackendFuture(Protocol):
+        def __init__(self, backend: Any, token: int) -> None: ...
+        def ready(self) -> bool: ...
+        def wait(self, timeout: Optional[float] = None) -> bool: ...
+        def result(
+            self, timeout: Optional[float] = None, *, called_from_cpp: bool = False
+        ) -> torch.Tensor: ...
 
-    def ready(self) -> bool:
-        return bool(self._backend.future_ready(self._token))
 
-    def wait(self, timeout: Optional[float] = None) -> bool:
-        return bool(self._backend.future_wait(self._token, timeout))
+_BACKENDFUTURE_CLS: Optional[type] = None
 
-    def result(self, timeout: Optional[float] = None) -> torch.Tensor:
-        return self._backend.future_result(self._token, timeout)
+
+def _load_backendfuture_cls() -> type:
+    global _BACKENDFUTURE_CLS
+    if _BACKENDFUTURE_CLS is not None:
+        return _BACKENDFUTURE_CLS
+
+    # Lazy import so importing monitoring.task does not eagerly build/load the extension.
+    from . import _native_engine
+
+    mod = _native_engine._load_extension()
+    cls = getattr(mod, "BackendFuture", None)
+    if cls is None:
+        raise ImportError("Native extension does not export BackendFuture")
+
+    _BACKENDFUTURE_CLS = cls
+    # Cache for future `from monitoring.task import BackendFuture` in hot paths.
+    globals()["BackendFuture"] = cls
+    return cls
+
+
+def __getattr__(name: str):
+    if name == "BackendFuture":
+        return _load_backendfuture_cls()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    # Make BackendFuture visible to dir() / IDEs even before it's resolved.
+    return sorted(list(globals().keys()) + ["BackendFuture"])

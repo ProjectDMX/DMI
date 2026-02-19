@@ -86,13 +86,42 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   void resolve_all();
   bool future_ready(int64_t token);
   bool future_wait(int64_t token, std::optional<double> timeout);
-  at::Tensor future_result(int64_t token, std::optional<double> timeout);
+  at::Tensor future_result(int64_t token, std::optional<double> timeout, bool called_from_cpp = false);
   void clear_completed_results();
   void close();
 
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+};
+
+
+
+// Lightweight future wrapper for native backend tokens.
+// Implemented in C++ for low Python overhead while exposing the same interface:
+//   ready() -> bool
+//   wait(timeout: Optional[float] = None) -> bool
+//   result(timeout: Optional[float] = None) -> torch.Tensor
+class BackendFuture {
+ public:
+  BackendFuture(std::shared_ptr<NativeMonitoringEngine> backend, int64_t token)
+      : backend_(backend), token_(token) {}
+
+  int64_t token() const { return token_; }
+
+  bool ready() const { return backend_->future_ready(token_); }
+
+  bool wait(std::optional<double> timeout = std::optional<double>()) const {
+    return backend_->future_wait(token_, timeout);
+  }
+
+  at::Tensor result(std::optional<double> timeout = std::optional<double>(), bool called_from_cpp = false) const {
+    return backend_->future_result(token_, timeout, called_from_cpp);
+  }
+
+ private:
+  std::shared_ptr<NativeMonitoringEngine> backend_;
+  int64_t token_{0};
 };
 
 std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,

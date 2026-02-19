@@ -1,6 +1,10 @@
 // Pybind11 module + factory
 
 #include "native_engine_internal.h"
+#include "clickhouse_client.h"
+// dmx_host pipeline
+#include "dmx_host_engine.h"
+#include "future_process.h"
 
 namespace monitoring {
 
@@ -17,10 +21,11 @@ std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,
 }  // namespace monitoring
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  py::class_<monitoring::NativeMonitoringEngine, std::shared_ptr<monitoring::NativeMonitoringEngine>>(m,
-                                                                                                     "NativeMonitoringEngine")
+  py::class_<monitoring::NativeMonitoringEngine,
+             std::shared_ptr<monitoring::NativeMonitoringEngine>>(m, "NativeMonitoringEngine")
       .def("submit_step", &monitoring::NativeMonitoringEngine::submit_step,
-           py::arg("step_id"), py::arg("tasks"), py::arg("stream_handle") = std::optional<uint64_t>())
+           py::arg("step_id"), py::arg("tasks"),
+           py::arg("stream_handle") = std::optional<uint64_t>())
       .def("set_capture_schedule", &monitoring::NativeMonitoringEngine::set_capture_schedule,
            py::arg("step_stride"), py::arg("step_offset"), py::arg("warmup_steps"),
            py::arg("capture_prefill"), py::arg("capture_decode"),
@@ -28,42 +33,271 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("begin_request", &monitoring::NativeMonitoringEngine::begin_request,
            py::arg("request_id"))
       .def("begin_step", &monitoring::NativeMonitoringEngine::begin_step,
-           py::arg("step_id"), py::arg("phase") = static_cast<int64_t>(monitoring::StepPhase::kUnknown))
+           py::arg("step_id"),
+           py::arg("phase") = static_cast<int64_t>(monitoring::StepPhase::kUnknown))
       .def("create_hook_callback", &monitoring::NativeMonitoringEngine::create_hook_callback,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("pos_slice"),
            py::arg("target_device") = py::none())
-      .def("create_hook_callback_with_cache", &monitoring::NativeMonitoringEngine::create_hook_callback_with_cache,
+      .def("create_hook_callback_with_cache",
+           &monitoring::NativeMonitoringEngine::create_hook_callback_with_cache,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("pos_slice"),
            py::arg("target_device") = py::none(), py::arg("cache"))
-      .def("create_hook_callback_with_cache_sig", &monitoring::NativeMonitoringEngine::create_hook_callback_with_cache_sig,
+      .def("create_hook_callback_with_cache_sig",
+           &monitoring::NativeMonitoringEngine::create_hook_callback_with_cache_sig,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
            py::arg("target_device") = py::none(), py::arg("cache"))
-      .def("create_global_hook_callback_sig", &monitoring::NativeMonitoringEngine::create_global_hook_callback_sig,
+      .def("create_global_hook_callback_sig",
+           &monitoring::NativeMonitoringEngine::create_global_hook_callback_sig,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
            py::arg("target_device") = py::none())
       .def("set_enabled_hooks", &monitoring::NativeMonitoringEngine::set_enabled_hooks,
            py::arg("enabled_names"))
-      .def("collect_step_futures_into", &monitoring::NativeMonitoringEngine::collect_step_futures_into,
+      .def("collect_step_futures_into",
+           &monitoring::NativeMonitoringEngine::collect_step_futures_into,
            py::arg("step_id"), py::arg("cache"))
       .def("submit_step_soa", &monitoring::NativeMonitoringEngine::submit_step_soa,
-           py::arg("step_id"), py::arg("spec"), py::arg("stream_handle") = std::optional<uint64_t>())
+           py::arg("step_id"), py::arg("spec"),
+           py::arg("stream_handle") = std::optional<uint64_t>())
       .def("add_task", &monitoring::NativeMonitoringEngine::add_task,
            py::arg("step_id"), py::arg("task"))
       .def("seal_step", &monitoring::NativeMonitoringEngine::seal_step,
-           py::arg("step_id"), py::arg("stream_handle") = std::optional<uint64_t>())
+           py::arg("step_id"),
+           py::arg("stream_handle") = std::optional<uint64_t>())
       .def("append_hook", &monitoring::NativeMonitoringEngine::append_hook,
            py::arg("step_id"), py::arg("hook_name"), py::arg("tensor"),
-           py::arg("remove_batch_dim"), py::arg("pos_slice"), py::arg("target_device") = py::none())
+           py::arg("remove_batch_dim"), py::arg("pos_slice"),
+           py::arg("target_device") = py::none())
       .def("resolve_all", &monitoring::NativeMonitoringEngine::resolve_all)
-      .def("future_ready", &monitoring::NativeMonitoringEngine::future_ready)
+      .def("future_ready", &monitoring::NativeMonitoringEngine::future_ready,
+           py::arg("token"))
       .def("future_wait", &monitoring::NativeMonitoringEngine::future_wait,
            py::arg("token"), py::arg("timeout") = std::optional<double>())
       .def("future_result", &monitoring::NativeMonitoringEngine::future_result,
-           py::arg("token"), py::arg("timeout") = std::optional<double>())
+           py::arg("token"), py::arg("timeout") = std::optional<double>(),
+           py::arg("called_from_cpp") = false)
       .def("close", &monitoring::NativeMonitoringEngine::close)
       .def("clear_completed_results", &monitoring::NativeMonitoringEngine::clear_completed_results)
       .def("get_stats", &monitoring::NativeMonitoringEngine::get_stats);
 
+  // C++ BackendFuture class exposed to Python with the same interface as before.
+  py::class_<monitoring::BackendFuture>(m, "BackendFuture")
+      .def(py::init<std::shared_ptr<monitoring::NativeMonitoringEngine>, int64_t>(),
+           py::arg("backend"), py::arg("token"))
+      .def("ready", &monitoring::BackendFuture::ready)
+      .def("wait", &monitoring::BackendFuture::wait,
+           py::arg("timeout") = std::optional<double>())
+      .def("result", &monitoring::BackendFuture::result,
+           py::arg("timeout") = std::optional<double>(),
+           py::arg("called_from_cpp") = false);
+
   m.def("create_engine", &monitoring::create_engine,
         py::arg("queue_size"), py::arg("cache_dtype"), py::arg("delay_steps"));
+
+  // ---- ClickHouseClientConfig (config only; stage is C++-only) ----
+  py::class_<dmx_host::ClickHouseClientConfig>(m, "ClickHouseClientConfig")
+      .def(py::init<>())
+
+      .def_readwrite("host", &dmx_host::ClickHouseClientConfig::host)
+      .def_readwrite("port", &dmx_host::ClickHouseClientConfig::port)
+      .def_readwrite("username", &dmx_host::ClickHouseClientConfig::username)
+      .def_readwrite("password", &dmx_host::ClickHouseClientConfig::password)
+      .def_readwrite("database", &dmx_host::ClickHouseClientConfig::database)
+      .def_readwrite("table", &dmx_host::ClickHouseClientConfig::table)
+      .def_readwrite("secure", &dmx_host::ClickHouseClientConfig::secure)
+
+      .def_readwrite("create_database_if_missing",
+                     &dmx_host::ClickHouseClientConfig::create_database_if_missing)
+      .def_readwrite("drop_existing_database",
+                     &dmx_host::ClickHouseClientConfig::drop_existing_database)
+      .def_readwrite("client_side_compress",
+                     &dmx_host::ClickHouseClientConfig::client_side_compress)
+      .def_readwrite("index_granularity",
+                     &dmx_host::ClickHouseClientConfig::index_granularity)
+
+      // Expose client_settings as a dict, store internally as unordered_map<string, variant<...>>.
+      // This avoids requiring <pybind11/stl_variant.h>.
+      .def_property(
+          "client_settings",
+          [](const dmx_host::ClickHouseClientConfig& self) {
+            py::dict d;
+            for (const auto& kv : self.client_settings) {
+              const auto& key = kv.first;
+              const auto& val = kv.second;
+              if (std::holds_alternative<bool>(val)) {
+                d[py::str(key)] = py::bool_(std::get<bool>(val));
+              } else if (std::holds_alternative<std::int64_t>(val)) {
+                d[py::str(key)] = py::int_(std::get<std::int64_t>(val));
+              } else {
+                d[py::str(key)] = py::str(std::get<std::string>(val));
+              }
+            }
+            return d;
+          },
+          [](dmx_host::ClickHouseClientConfig& self, py::object obj) {
+            self.client_settings.clear();
+            if (obj.is_none()) return;
+
+            py::dict d = obj.cast<py::dict>();
+            for (auto item : d) {
+              std::string key = py::cast<std::string>(item.first);
+              py::handle v = item.second;
+
+              // bool must be checked before int (Python bool is an int subclass)
+              if (py::isinstance<py::bool_>(v)) {
+                self.client_settings.emplace(std::move(key), py::cast<bool>(v));
+              } else if (py::isinstance<py::int_>(v)) {
+                self.client_settings.emplace(
+                    std::move(key),
+                    static_cast<std::int64_t>(py::cast<long long>(v)));
+              } else if (py::isinstance<py::str>(v)) {
+                self.client_settings.emplace(std::move(key), py::cast<std::string>(v));
+              } else {
+                throw py::type_error("client_settings values must be bool/int/str (or None)");
+              }
+            }
+          });
+
+  // ---- dmx_host StageConfig + DMXHostEngine ----
+  using DMXHostEngine = dmx_host::DMXHostEngine;
+  using StageConfig = DMXHostEngine::StageConfig;
+  using ThreadFailure = DMXHostEngine::ThreadFailure;
+  using QueueT = DMXHostEngine::QueueT;
+  using QueueConfig = DMXHostEngine::QueueConfig;
+  using EnqueuePolicy = DMXHostEngine::EnqueuePolicy;
+  using Duration = DMXHostEngine::Duration;
+
+  py::enum_<dmx_host::OnFullPolicy>(m, "OnFullPolicy")
+      .value("RAISE", dmx_host::OnFullPolicy::RAISE)
+      .value("DROP", dmx_host::OnFullPolicy::DROP)
+      .value("RETRY", dmx_host::OnFullPolicy::RETRY)
+      .value("ABORT", dmx_host::OnFullPolicy::ABORT)
+      .export_values();
+
+  py::enum_<dmx_host::OnClosedPolicy>(m, "OnClosedPolicy")
+      .value("RAISE", dmx_host::OnClosedPolicy::RAISE)
+      .value("DROP", dmx_host::OnClosedPolicy::DROP)
+      .export_values();
+
+  py::class_<QueueConfig>(m, "QueueConfig")
+      .def(py::init<>())
+      .def_readwrite("min_batch_items", &QueueConfig::min_batch_items)
+      .def_readwrite("min_batch_size", &QueueConfig::min_batch_size)
+      .def_property(
+          "max_linger_s",
+          [](const QueueConfig& q) -> std::optional<double> {
+            if (!q.max_linger) return std::nullopt;
+            return q.max_linger->count();
+          },
+          [](QueueConfig& q, std::optional<double> v) {
+            if (v) q.max_linger = Duration(*v);
+            else q.max_linger.reset();
+          })
+      .def_readwrite("max_batch_items", &QueueConfig::max_batch_items)
+      .def_readwrite("max_batch_size", &QueueConfig::max_batch_size)
+      .def_readwrite("high_watermark_items", &QueueConfig::high_watermark_items)
+      .def_readwrite("high_watermark_size", &QueueConfig::high_watermark_size);
+
+  py::class_<EnqueuePolicy>(m, "EnqueuePolicy")
+      .def(py::init<>())
+      .def_readwrite("block", &EnqueuePolicy::block)
+      .def_property(
+          "timeout_s",
+          [](const EnqueuePolicy& p) -> std::optional<double> {
+            if (!p.timeout) return std::nullopt;
+            return p.timeout->count();
+          },
+          [](EnqueuePolicy& p, std::optional<double> v) {
+            if (v) p.timeout = Duration(*v);
+            else p.timeout.reset();
+          })
+      .def_readwrite("on_full", &EnqueuePolicy::on_full)
+      .def_readwrite("max_retries", &EnqueuePolicy::max_retries)
+      .def_property(
+          "retry_backoff_s",
+          [](const EnqueuePolicy& p) { return p.retry_backoff.count(); },
+          [](EnqueuePolicy& p, double v) { p.retry_backoff = Duration(v); })
+      .def_readwrite("on_closed", &EnqueuePolicy::on_closed)
+      .def_readwrite("drop_if_stopping", &EnqueuePolicy::drop_if_stopping);
+
+  py::class_<ThreadFailure>(m, "ThreadFailure")
+      .def_readonly("stage", &ThreadFailure::stage)
+      .def_readonly("thread_name", &ThreadFailure::thread_name)
+      .def_readonly("where", &ThreadFailure::where)
+      .def_readonly("exc_type", &ThreadFailure::exc_type)
+      .def_readonly("exc_what", &ThreadFailure::exc_what);
+
+  py::class_<StageConfig>(m, "StageConfig")
+      .def(py::init<>())
+      .def_readwrite("name", &StageConfig::name)
+      .def_readwrite("parallelism", &StageConfig::parallelism)
+      .def_readwrite("input_queue", &StageConfig::input_queue)
+      .def_readwrite("ingress_policy", &StageConfig::ingress_policy)
+      .def_property(
+          "thread_name_prefix",
+          [](const StageConfig& s) { return s.thread_name_prefix; },
+          [](StageConfig& s, std::optional<std::string> v) { s.thread_name_prefix = std::move(v); })
+      // Stage 1: ProcessFuture
+      .def_static(
+          "process_future",
+          [](int parallelism, std::string name) {
+            StageConfig cfg;
+            cfg.name = std::move(name);
+            cfg.parallelism = parallelism;
+            cfg.process_fn = [](std::vector<dmx_host::dmx_host_queue_item> batch, QueueT* next_q) {
+              return dmx_host::ProcessFutureStage::ProcessFn<QueueT>(std::move(batch), next_q);
+            };
+            cfg.thread_init = &dmx_host::ProcessFutureStage::ThreadInitAny;
+            cfg.thread_cleanup = &dmx_host::ProcessFutureStage::ThreadCleanupAny;
+            return cfg;
+          },
+          py::arg("parallelism") = 1,
+          py::arg("name") = "process_future")
+      // Stage 2: ClickHouse insert (this is where thread_init_config matters)
+      .def_static(
+          "clickhouse_insert",
+          [](const dmx_host::ClickHouseClientConfig& ch_cfg, int parallelism, std::string name) {
+            StageConfig cfg;
+            cfg.name = std::move(name);
+            cfg.parallelism = parallelism;
+            cfg.process_fn = [](std::vector<dmx_host::dmx_host_queue_item> batch, QueueT* next_q) {
+              return dmx_host::ClickHouseInsertStage::ProcessFn<QueueT>(std::move(batch), next_q);
+            };
+            // Stored by value in std::any; ClickHouseInsertStage::ThreadInitAny will any_cast it.
+            cfg.thread_init_config = ch_cfg;
+            cfg.thread_init = &dmx_host::ClickHouseInsertStage::ThreadInitAny;
+            cfg.thread_cleanup = &dmx_host::ClickHouseInsertStage::ThreadCleanupAny;
+            return cfg;
+          },
+          py::arg("clickhouse_config"),
+          py::arg("parallelism") = 1,
+          py::arg("name") = "clickhouse_insert");
+
+  py::class_<DMXHostEngine, std::shared_ptr<DMXHostEngine>>(m, "DMXHostEngine")
+      .def(py::init<std::array<StageConfig, 2>>(), py::arg("stages"))
+      .def("start", &DMXHostEngine::start)
+      .def("stop",
+           [](DMXHostEngine& self, bool graceful, std::optional<double> timeout_s) {
+             if (timeout_s) {
+               return self.stop(graceful, DMXHostEngine::Duration(*timeout_s));
+             }
+             return self.stop(graceful, std::nullopt);
+           },
+           py::arg("graceful") = true,
+           py::arg("timeout_s") = std::optional<double>(), 
+           py::call_guard<py::gil_scoped_release>())
+           
+      .def("close_input", &DMXHostEngine::close_input)
+      .def("request_abort", &DMXHostEngine::request_abort)
+      .def("join",
+           [](DMXHostEngine& self, std::optional<double> timeout_s) {
+             if (timeout_s) return self.join(DMXHostEngine::Duration(*timeout_s));
+             return self.join(std::nullopt);
+           },
+           py::arg("timeout_s") = std::optional<double>(), 
+           py::call_guard<py::gil_scoped_release>())
+      .def("failures", &DMXHostEngine::failures)
+      .def("raise_if_failed", &DMXHostEngine::raise_if_failed)
+      .def("submit", &DMXHostEngine::submit,
+           py::arg("keys"), py::arg("start_token_idxs"), py::arg("cache_dicts"),
+           py::call_guard<py::gil_scoped_release>());
 }

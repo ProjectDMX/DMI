@@ -1,23 +1,26 @@
 import os
+
 import torch
 from transformers import AutoTokenizer
 from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
 
-from monitoring import HostEngineConfig, MonitoringConfig, MonitoringEngine
+from monitoring import (
+    ClickHouseClientConfig,
+    EnqueuePolicy,
+    HostEngineConfig,
+    MonitoringConfig,
+    MonitoringEngine,
+    OnClosedPolicy,
+    OnFullPolicy,
+    QueueConfig,
+    StageConfig,
+)
 from monitoring.config import CaptureSchedule, HookSelection
 from monitoring.generate import generate_with_monitoring
 
-from dmx_host.engine import EngineConfig, QueueConfig, StageConfig
-import dmx_host.dmx_interface as dmx_interface
 
-
-def _build_db_config():
-    try:
-        import dmx_host.clickhouse_client as clickhouse_client
-    except Exception:
-        import clickhouse_client  # type: ignore
-
-    cfg = clickhouse_client.ClickHouseClientConfig()
+def _build_db_config() -> ClickHouseClientConfig:
+    cfg = ClickHouseClientConfig()
     cfg.host = os.environ.get("DMX_DB_HOST", "localhost")
     cfg.port = int(os.environ.get("DMX_DB_PORT", "9000"))
     cfg.username = os.environ.get("DMX_DB_USER", "default")
@@ -33,35 +36,33 @@ def _build_db_config():
     return cfg
 
 
-def _build_host_config(db_cfg):
-    stage_one = StageConfig(
-        name="stage_one",
-        parallelism=1,
-        process_fn=dmx_interface.stage_one_parsing_and_wait,
-        thread_init_config=None,
-        thread_init=dmx_interface.stage_one_thread_init,
-        thread_cleanup=dmx_interface.stage_one_thread_cleanup,
-        input_queue=QueueConfig(1, None, None, None, None, 400, None),
-    )
-    try:
-        import dmx_host.clickhouse_client as clickhouse_client
-    except Exception:
-        import clickhouse_client  # type: ignore
-    stage_two = StageConfig(
-        name="stage_two",
-        parallelism=1,
-        process_fn=clickhouse_client.clickhouse_insert,
-        thread_init_config=db_cfg,
-        thread_init=clickhouse_client.clickhouse_init,
-        thread_cleanup=clickhouse_client.clickhouse_cleanup,
-        input_queue=QueueConfig(1, None, None, None, None, 400, None),
-    )
-    return HostEngineConfig(
-        stages=[stage_one, stage_two],
-        input_handler=dmx_interface.input_handler_v1,
-        engine_config=EngineConfig(),
-    )
+def _build_queue_config(*, high_watermark_items: int = 400) -> QueueConfig:
+    q = QueueConfig()
+    q.min_batch_items = 1
+    q.high_watermark_items = int(high_watermark_items)
+    return q
 
+
+def _build_ingress_policy() -> EnqueuePolicy:
+    p = EnqueuePolicy()
+    p.block = False
+    p.on_full = OnFullPolicy.RAISE
+    p.on_closed = OnClosedPolicy.RAISE
+    return p
+
+
+def _build_host_config(db_cfg: ClickHouseClientConfig) -> HostEngineConfig:
+    stage_one = StageConfig.process_future(parallelism=1, name="process_future")
+    stage_two = StageConfig.clickhouse_insert(db_cfg, parallelism=1, name="clickhouse_insert")
+
+    stage_one.input_queue = _build_queue_config(high_watermark_items=400)
+    stage_two.input_queue = _build_queue_config(high_watermark_items=400)
+
+    ingress = _build_ingress_policy()
+    stage_one.ingress_policy = ingress
+    stage_two.ingress_policy = ingress
+
+    return HostEngineConfig(stages=[stage_one, stage_two])
 
 def main() -> None:
     # Native backend must be enabled for DB futures.
@@ -90,7 +91,7 @@ def main() -> None:
         async_enabled=True,
         config=cfg,
         model_id=model_id,
-        # db_config=host_cfg,
+        db_config=host_cfg,
     )
 
     model = HookedGPT2LMHeadModel.from_pretrained(

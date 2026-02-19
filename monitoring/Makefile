@@ -13,8 +13,13 @@ SRCS := csrc/native_engine.cpp \
         csrc/api_submit.cpp \
         csrc/hooks.cpp \
         csrc/slice.cpp \
-        csrc/bindings.cpp
-HEADERS := csrc/native_engine.h csrc/native_engine_internal.h
+        csrc/bindings.cpp \
+        csrc/dmx_host_utils.cpp \
+        csrc/future_process.cpp \
+        csrc/clickhouse_client.cpp
+HEADERS := csrc/native_engine.h csrc/native_engine_internal.h \
+csrc/pipelined_engine.hpp csrc/dmx_host_utils.h csrc/future_process.h \
+           csrc/clickhouse_client.h csrc/dmx_host_engine.h
 BUILD_DIR := build
 OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 PROJECT_ROOT := $(abspath $(CURDIR)/..)
@@ -53,6 +58,39 @@ CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused
 
 LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPATH_FLAGS) \
            -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -lcudart -lpthread
+
+
+# ---- ClickHouse C++ client (override if your lib name/path differs) ----
+CLICKHOUSE_INCLUDE ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp)
+CLICKHOUSE_LIB_DIR  ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/clickhouse)
+CLICKHOUSE_LIBS    ?= -lclickhouse-cpp-lib
+
+ifneq ($(CLICKHOUSE_INCLUDE),)
+CXXFLAGS += -I$(CLICKHOUSE_INCLUDE)
+endif
+ifneq ($(CLICKHOUSE_LIB_DIR),)
+LDFLAGS += -L$(CLICKHOUSE_LIB_DIR) -Wl,-rpath,$(CLICKHOUSE_LIB_DIR)
+endif
+LDFLAGS += $(CLICKHOUSE_LIBS)
+
+CONDA_PREFIX ?= $(shell $(PYTHON) -c "import os; print(os.environ.get('CONDA_PREFIX',''))")
+ifneq ($(CONDA_PREFIX),)
+CXXFLAGS += -I$(CONDA_PREFIX)/include
+LDFLAGS  += -L$(CONDA_PREFIX)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib
+endif
+
+
+# venv/virtualenv support (adds include/lib paths for the active interpreter)
+VENV_PREFIX ?= $(shell $(PYTHON) -c "import sys; in_venv = (getattr(sys,'base_prefix',sys.prefix) != sys.prefix) or hasattr(sys,'real_prefix'); print(sys.prefix if in_venv else '')")
+ifneq ($(VENV_PREFIX),)
+CXXFLAGS += -I$(VENV_PREFIX)/include
+ifneq ($(wildcard $(VENV_PREFIX)/lib64),)
+LDFLAGS  += -L$(VENV_PREFIX)/lib64 -Wl,-rpath,$(VENV_PREFIX)/lib64
+endif
+ifneq ($(wildcard $(VENV_PREFIX)/lib),)
+LDFLAGS  += -L$(VENV_PREFIX)/lib -Wl,-rpath,$(VENV_PREFIX)/lib
+endif
+endif
 
 .PHONY: all build clean
 
