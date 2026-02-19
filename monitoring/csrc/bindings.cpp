@@ -283,7 +283,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              return self.stop(graceful, std::nullopt);
            },
            py::arg("graceful") = true,
-           py::arg("timeout_s") = std::optional<double>())
+           py::arg("timeout_s") = std::optional<double>(), 
+           py::call_guard<py::gil_scoped_release>())
+           
       .def("close_input", &DMXHostEngine::close_input)
       .def("request_abort", &DMXHostEngine::request_abort)
       .def("join",
@@ -291,9 +293,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              if (timeout_s) return self.join(DMXHostEngine::Duration(*timeout_s));
              return self.join(std::nullopt);
            },
-           py::arg("timeout_s") = std::optional<double>())
+           py::arg("timeout_s") = std::optional<double>(), 
+           py::call_guard<py::gil_scoped_release>())
       .def("failures", &DMXHostEngine::failures)
       .def("raise_if_failed", &DMXHostEngine::raise_if_failed)
       .def("submit", &DMXHostEngine::submit,
-           py::arg("keys"), py::arg("start_token_idxs"), py::arg("cache_dicts"));
+           py::arg("keys"), py::arg("start_token_idxs"), py::arg("cache_dicts"),
+           py::call_guard<py::gil_scoped_release>());
 }

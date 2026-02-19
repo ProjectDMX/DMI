@@ -224,7 +224,6 @@ def main() -> None:
                     }
                 )   
         loop_end = time.perf_counter()
-        engine.resolve_all()
         t_r_ed = time.perf_counter()
     finally:
         if engine._host_engine is not None:
@@ -234,7 +233,6 @@ def main() -> None:
                 host_timings = None
         if args.no_db:
             try:
-                engine.resolve_all()
                 engine.clear_completed_results()
             except Exception:
                 pass
