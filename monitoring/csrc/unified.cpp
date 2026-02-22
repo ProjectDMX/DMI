@@ -6,5 +6,6 @@
 #include "api_submit.cpp"
 #include "hooks.cpp"
 #include "slice.cpp"
+#include "graph_native_delegate.cpp"
+#include "graph_shadow_parser.cpp"
 #include "bindings.cpp"
-

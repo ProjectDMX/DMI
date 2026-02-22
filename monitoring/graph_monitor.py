@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -17,6 +18,13 @@ ModuleFilter = Callable[[str, nn.Module], bool]
 class SlotInfo:
     slot_id: int
     module_name: str
+
+
+@dataclass
+class _StepSnapshot:
+    step_id: int
+    event: torch.cuda.Event
+    buffer: torch.Tensor
 
 
 class GraphMonitor:
@@ -40,21 +48,23 @@ class GraphMonitor:
         self._gpu_buffer = torch.empty(
             max_slots * METADATA_BYTES, dtype=torch.uint8, device=device
         )
-        self._host_buffer = torch.empty(
+        self._host_template = torch.empty(
             max_slots * METADATA_BYTES, dtype=torch.uint8, pin_memory=True
         )
+        self._latest_snapshot = self._allocate_snapshot()
         self._module_filter = module_filter
         self._slot_mapping: Dict[int, SlotInfo] = {}
         self._module_to_slot: Dict[nn.Module, int] = {}
         self._handles: List[torch.utils.hooks.RemovableHandle] = []
         self._capture_anchors: List[torch.Tensor] = []
-        self._step_event = torch.cuda.Event(enable_timing=False, blocking=False)
+        self._pending_steps: Deque[_StepSnapshot] = deque()
         self._register_hooks(model)
 
     def close(self) -> None:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+        self._pending_steps.clear()
 
     def _register_hooks(self, model: nn.Module) -> None:
         slot_id = 0
@@ -102,30 +112,63 @@ class GraphMonitor:
             return None
         return None
 
+    def _allocate_snapshot(self) -> torch.Tensor:
+        return torch.empty(
+            self._host_template.size(),
+            dtype=self._host_template.dtype,
+            pin_memory=True,
+        )
+
     def finalize_capture(self) -> None:
         if self._capture_anchors:
             self._ops.sink(self._capture_anchors)
             self._capture_anchors.clear()
-        self._host_buffer.copy_(self._gpu_buffer, non_blocking=True)
+        self.refresh_metadata()
 
-    def on_step_end(self, stream: Optional[torch.cuda.Stream] = None) -> None:
-        stream = stream or torch.cuda.current_stream()
-        self._step_event.record(stream)
+    def refresh_metadata(self) -> None:
+        """Copy latest metadata from GPU buffer into snapshot template."""
+        self._latest_snapshot.copy_(self._gpu_buffer, non_blocking=True)
+
+    def on_step_end(self, step_id: int, stream: Optional[torch.cuda.Stream] = None) -> None:
+        if stream is None:
+            stream = torch.cuda.current_stream(device=self._device)
+        snapshot = self._allocate_snapshot()
+        with torch.cuda.stream(stream):
+            snapshot.copy_(self._gpu_buffer, non_blocking=True)
+        event = torch.cuda.Event(enable_timing=False, blocking=False)
+        event.record(stream)
+        self._pending_steps.append(_StepSnapshot(step_id=step_id, event=event, buffer=snapshot))
+        self._latest_snapshot = snapshot
 
     def is_step_ready(self) -> bool:
-        return self._step_event.query()
+        if not self._pending_steps:
+            return False
+        return self._pending_steps[0].event.query()
 
     def wait_for_step(self) -> None:
-        self._step_event.synchronize()
+        if not self._pending_steps:
+            return
+        self._pending_steps[0].event.synchronize()
+
+    def pop_ready_step(self, *, wait: bool = False) -> Optional[Tuple[int, torch.Tensor]]:
+        if not self._pending_steps:
+            return None
+        entry = self._pending_steps[0]
+        if wait:
+            entry.event.synchronize()
+        elif not entry.event.query():
+            return None
+        self._pending_steps.popleft()
+        return entry.step_id, entry.buffer
 
     def get_slot_mapping(self) -> Dict[int, SlotInfo]:
         return dict(self._slot_mapping)
 
     def metadata_buffer(self) -> torch.Tensor:
-        return self._host_buffer
+        return self._latest_snapshot
 
     def metadata_view(self) -> torch.Tensor:
-        return self._host_buffer.view(-1, METADATA_BYTES)
+        return self._latest_snapshot.view(-1, METADATA_BYTES)
 
     def num_slots(self) -> int:
         return len(self._slot_mapping)

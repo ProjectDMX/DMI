@@ -64,9 +64,9 @@ def test_graph_monitor_capture_and_replay_metadata():
     expected_device = torch.cuda.current_device()
     prev_ptr = None
     try:
-        for _ in range(3):
+        for step in range(1, 4):
             graph.replay()
-            monitor.on_step_end(capture_stream)
+            monitor.on_step_end(step, capture_stream)
             monitor.wait_for_step()
 
             slot0 = _parse_slot(monitor.metadata_buffer(), 0)

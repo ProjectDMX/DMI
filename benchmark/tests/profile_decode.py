@@ -28,9 +28,10 @@ except ImportError:
 from transformer_lens import HookedTransformer
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
 
-from monitoring import GraphSafeEngine, GraphSlotConsumer, MonitoringEngine
+from monitoring import GraphSafeEngine, GraphSlotConsumer, MonitoringEngine, _native_engine
 from monitoring.engine import _PythonBackend
 from monitoring.config import CaptureSchedule, HookSelection, MonitoringConfig
+from monitoring.monitor_native import create_graph_delegate
 
 MINIMAL_MONITORING_HOOKS = [
     "blocks.0.hook_resid_pre",
@@ -129,6 +130,12 @@ def parse_args() -> argparse.Namespace:
         default="legacy",
         help="Choose legacy MonitoringEngine or graph-safe engine.",
     )
+    parser.add_argument(
+        "--graph-copy-mode",
+        choices=["disabled", "sync"],
+        default="disabled",
+        help="Graph mode: disabled=metadata only, sync=enable native delegate copy.",
+    )
 
     args = parser.parse_args()
     if not args.collect_hidden and not args.collect_attention:
@@ -139,6 +146,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--decode-steps must be >= 1")
     if args.monitoring_mode == "graph" and args.monitoring_bypass:
         parser.error("--monitoring-mode graph cannot be combined with --monitoring-bypass")
+    if args.monitoring_mode != "graph" and args.graph_copy_mode != "disabled":
+        parser.error("--graph-copy-mode only applies when --monitoring-mode graph is selected")
     return args
 
 
@@ -732,6 +741,7 @@ def main() -> None:
     )
 
     graph_consumer = None
+    graph_native_backend = None
     if args.monitoring_mode == "graph":
         monitoring_engine = GraphSafeEngine(
             config=monitoring_config,
@@ -741,6 +751,15 @@ def main() -> None:
         )
         graph_consumer = GraphSlotConsumer(delay_steps=args.engine_delay_steps)
         monitoring_engine.attach_consumer(graph_consumer)
+        if args.graph_copy_mode == "sync":
+            graph_native_backend = _native_engine.create_engine(
+                queue_size=args.engine_queue_size,
+                cache_dtype=cache_dtype,
+                delay_steps=args.engine_delay_steps,
+            )
+            graph_delegate = create_graph_delegate(graph_native_backend)
+            monitoring_engine.attach_backend_delegate(graph_delegate)
+            print("[GraphDebug] Graph delegate attached (sync copy enabled)")
     else:
         monitoring_engine = MonitoringEngine(
             async_enabled=device.type == "cuda",
@@ -794,7 +813,13 @@ def main() -> None:
         if args.monitoring_mode == "graph":
             if graph_runner is None or not graph_runner.captured:
                 return
-            monitoring_engine.clear_completed_results()
+            if wait:
+                drained = False
+                while not drained:
+                    drained = monitoring_engine.drain_ready_results(wait=True)
+            else:
+                while monitoring_engine.drain_ready_results(wait=False):
+                    pass
             return
         if monitoring_engine.async_enabled:
             monitoring_engine.clear_completed_results()
@@ -1123,7 +1148,7 @@ def main() -> None:
             nvtx.range_push("async_decode")
             logits, next_past = graph_runner.run(token, past_key_values)
             try:
-                process_monitoring_results()
+                process_monitoring_results(wait=True)
             except Exception:
                 pass
             nvtx.range_pop()  # async_decode
@@ -1405,7 +1430,18 @@ def main() -> None:
     finally:
         hf_hook_cpu_cleanup()
 
+    if graph_native_backend is not None:
+        try:
+            stats = graph_native_backend.get_stats()
+            print("[GraphDebug] Native backend stats:", stats)
+        except Exception:
+            pass
     monitoring_engine.close()
+    if graph_native_backend is not None:
+        try:
+            graph_native_backend.close()
+        except Exception:
+            pass
 
     # Save timing results to JSON file
     import json

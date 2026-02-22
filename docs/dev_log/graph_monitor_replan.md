@@ -127,3 +127,146 @@
      3. 更新 `GraphSlotConsumer`，在 delegate 模式下把 step id、delay 配置传递给 backend，保持与 legacy 行为一致。  
      4. 编写 e2e 验证脚本：在 graph 模式下启用 delegate，跑 benchmark 并使用 Nsight 检查 D2H/D2D copy 是否出现，与 legacy 输出对比。  
      5. 完成后更新文档，说明 graph 模式支持 metadata-only 或 delegate-copy 两种模式，以及如何配置切换。
+
+## 10. C++ Native Backend 行为调查
+
+> 参考 `monitoring/csrc/native_engine*.{h,cpp}`、`monitoring/task.py`：该实现仍是 graph delegate 需要对接的核心后端。
+
+- **任务构造**：  
+  - Python hook 通过 `MonitoringTask.native_payload` 或 native builder (`append_hook_current_step`) 构建 `TaskSpec`。  
+  - `submit_step`/`submit_step_soa` 将任务与 `step_id` 封装进 `StepWork`；`seal_step` 会附带 step event（`cudaEvent_t`）用于和主 forward stream 同步。  
+  - `delay_steps_` 逻辑在 `seal_step` 中实现，确保 step 可根据策略延迟入队。
+
+- **Worker 线程** (`monitoring/csrc/engine_core.cpp`)：  
+  - 独立线程（`MonEngWorker`）消费 `StepWork`，在单独的 `cache_stream_` 上运行所有任务。  
+  - 每个任务经 `run_task` 执行 remove_batch、slice、dtype cast、`target_device` 迁移；当需要 GPU→CPU 时在 `cache_stream_` 异步 `copy_`。  
+  - Step 层面仅同步一次 `cudaStreamSynchronize(cache_stream_)`，之后再将结果写入 `ResultSlot`。
+
+- **内存/拷贝策略**：  
+  - `MON_NATIVE_TO_CPU`/`MON_NATIVE_PINNED` 控制是否默认搬到 CPU 以及是否使用 pinned 内存。  
+  - `MON_NATIVE_PINPOOL*` 配置 struct-of-arrays 的 pinned pool，`acquire_pinned_block`/`release_pinned_block` 避免频繁 malloc。  
+  - `MON_NATIVE_HOST_COPY_THREADS` 启用 host 复制线程池，把 pinned tensor 异步 memcpy 到 pageable。
+
+- **SoA / builder**：  
+  - `submit_step_soa` 支持 struct-of-arrays (`spec["tensors"]`, `"slice_dims"`, `"remove_batch"` 等)，`native_batch` 路径就是为了喂这个接口。  
+  - builder 回调 (`create_global_hook_callback_sig`) 在 Capturing 阶段一次性注册 slice/device；运行时只 append tensor，提高 hook 端效率。
+
+- **Capture schedule / gating**：  
+  - `set_capture_schedule`, `begin_request`, `begin_step` 控制 `capture_enabled_`。hook 回调首先判断该原子量，未命中 schedule 时直接返回。  
+  - Graph delegate 仍需沿用这些 API，保证 capture 频率与 Legacy 一致。
+
+- **Future / 清理**：  
+  - 每个任务会注册 `ResultSlot`，通过 `future_wait/result` 暴露给 Python；`resolve_all`、`clear_completed_results` 处理 backlog 并在关闭时清理线程。  
+  - graph delegate 要求仍使用这些接口，以便现有 `BackendFuture`、`MonitoringEngine` 逻辑无缝复用。
+
+## 11. Graph → Native Backend（同步版）实施计划
+
+> 新目标：把 shadow block 的解析 / SoA 填充 / 任务提交全部下沉到 C++，Python 只负责把 metadata buffer 和 step 事件交过去。
+
+1. **C++ ShadowBlock Parser**  
+   - 在 `monitoring/csrc` 侧新增 helper（或扩展 `graphmonitor_ops`），直接接收 metadata tensor（shadow block）并输出 native backend 可消费的 `TaskSpec`/SoA 结构。  
+   - 解析逻辑：C++ 遍历 slot 行、创建 alias view、推断 slice_dim/pos_dim、填写 remove_batch/can_slice 等字段，完全避免 Python 端逐项 `alias_tensor` 的开销。
+
+2. **C++ Graph Delegate**  
+   - 新建 `GraphNativeDelegate`（C++ 实现 + pybind 暴露），接口为 `submit_and_resolve(step_id, metadata_tensor, stream_handle)`。  
+   - 内部流程：`parse_shadow_block` → `submit_step_soa` → `seal_step(stream_handle)` → `resolve_all(true)`；过程中直接把 alias tensor append 到 native backend 内部队列。  
+   - 若解析/提交失败，抛出异常让 Python fallback 到 metadata-only 模式。
+
+3. **GraphSafeEngine → Delegate 连接**  
+   - Python 仅需把 metadata view、ready step id、对应 `cudaStream` 句柄传入 delegate。  
+   - 删除/精简 Python 侧 `_build_native_batch`、`_alias_tensor` 等逻辑，转而调用 `GraphNativeDelegate` 的 C++ 路径。  
+   - `end_step()` 仍记录 sink event；stream handle 透传给 delegate 供 `seal_step` 使用。
+
+4. **Benchmark/CLI**
+   - `profile_decode.py` 增加 `--graph-copy-mode {sync,disabled}`，当选择 sync 时实例化 C++ delegate 并传给 `GraphSafeEngine`。  
+   - Benchmark 验证 Graph 模式 + delegate 能看到真实的 D2H/D2D copy，并对比 legacy async 的吞吐。
+
+5. **验证/测试**
+   - C++ 单元：ShadowBlock parser 的 shape/stride/alias 生命周期测试；`submit_and_resolve` 异常路径。  
+   - Python 端集成：`tests_monitoring/test_graph_delegate.py` 更新为调用 C++ delegate；Nsight trace 证明 copy 在 Graph replay 之后同步完成。  
+   - 文档更新当前限制：仅支持同步 copy，异步/backpressure 参考第 12 节。
+
+> 完成上述步骤后，GraphSafeEngine 的 graph 模式即可完全依赖 C++ 解析与 native backend 队列，消除 Python 热路径。
+
+### 11.1 单 Graph 同步版落地步骤（当前阶段）
+
+1. **GraphMonitor 事件与 metadata 队列**
+   - `on_step_end()` 不再覆盖单一 `_step_event`；改为为每个 step 创建独立的 `cudaEvent_t`，并将 `(step_id, event)` 追加到 deque。  
+   - 同步阻塞模式下，如果 step t 结束后立刻 `wait=True`，仍会等待该 event 完成；若暂时未等待，也必须保留 event，直到下一次消费。
+
+2. **GraphSafeEngine 收集逻辑**
+   - `collect_results(wait=False)` 遍历队首事件，只有当队首 ready 时才解析该 step 的 metadata；一旦消费，就 pop 出队并记录 snapshot、stream handle。
+   - `collect_results(wait=True)` 在队首事件未 ready 时阻塞，保证“步 t 结束后可立即同步复制”。  
+   - `drain_ready_results()` / `resolve_all()` 基于上述队列实现，确保不会遗漏任一步骤。
+
+3. **Decode 循环集成**
+   - 在 `HFGraphDecodeRunner` 的 replay 路径里，step 结束后调用 `process_monitoring_results(wait=True)`，同步等待当前 step 的 copy 完成，再进入下一 step。  
+   - Warmup、prefill 与 benchmark 代码也按此方式调用，保证单 Graph 同步版每步都能稳定复制；后续切换到异步/双 graph 时，只需调整 `wait` 模式或调用频率。
+
+4. **日志与验证**
+   - 保留 `[GraphDebug] delegate submit…` 输出，确认每一步都被提交。  
+   - Nsight 中应看到 decode 每步 forward 后紧跟 D2H，无大段 `cudaStreamSynchronize`；`graph_native_backend.get_stats()` 的 `total_steps` 应与 decode 步数一致。
+
+> 依据单 Graph 的限制：“下一步 replay 会覆盖上一步 tensor”；因此同步版必须在每步 forward/`end_step` 后立即消费事件并复制，不能指望保存旧 tensor。此实现为后续双 graph / staging buffer 的异步方案打底。
+
+## 12. Future Work：双 Graph / 双缓冲并行
+
+> 目的：解决“Graph replay 写回固定地址”导致的 forward 与 D2H copy 互斥问题，让 step t 的 copy 与 step t+1 的 forward 真正并发。
+
+- **问题现状**：单 Graph capture 情况下，每次 replay 都会把激活写回 capture 时的同一显存地址；即便 host 侧 alias 了 tensor，也无法阻止下一步 kernel 立即覆盖这块内存，因此 GraphSafeEngine 只能在复制完成后再启动下一次 replay。
+- **候选方案：双 Graph 轮换**  
+  - 分别 capture `GraphExec[0]` 与 `GraphExec[1]`，在 capture 过程中让 allocator 在 clean state 下依次分配两套 buffer；依赖 `_capture_anchors + sink` 让两套 graph 的激活在 replay 完成前不会互相复用。  
+  - runtime 以 step parity 选择 graph：奇数步 replay graph 0，同时复制 graph 1 的结果；偶数步反之。这样 copy stream 永远读的是“上一套 graph”的 buffer，避免与当前 forward 写同一地址。
+- **替代方案：双 staging buffer**  
+  - 保持单 graph，但在 capture 中每个监控点先 copy 到 staging buffer（A/B 双份），GraphSafeEngine/后端只访问 staging buffer。  
+  - 需要在 graph capture 里插入 `record -> copy_to_buffer[current]` 节点，并让 sink kernel 引用 staging buffer，以保证 buffer 生命周期覆盖到 host copy 结束。
+- **实现要点**  
+  1. capture 前清理 allocator（empty cache + 预热）确保两套 graph 拿到可预测的地址。  
+  2. 每套 graph capture 完成后立即固定 `_capture_anchors`，避免内存被复用；GraphSafeEngine 要维护 per-graph sink event。  
+  3. backend 需要知道当前消费的是哪一套 buffer，以便在 `seal_step(step_id, stream_handle)` 时等待正确的 event。  
+  4. 在文档与 benchmark CLI 中暴露配置（`--graph-double-buffer`），供未来实验开启。
+- **风险/成本**：显存消耗翻倍、capture 时间增加；需要验证对大模型能否容忍。若不可行，可考虑混合策略（prefill 阶段单 graph，decode 阶段双 graph）或仅对热点 hook 使用双缓冲。
+
+> 在完成 delegate 回接后，这一章节将作为下一阶段性能优化的探索方向，帮助我们重新获得 legacy 异步 copy 的吞吐优势。
+
+## 13. Future Work：基于内存伪装的双 Graph 乒乓架构（零拷贝）
+
+> 方案一 Design A – Dual-Graph Ping-Pong Orchestration（Zero-Copy）  
+> 目标：通过“原地生产”思路，让监控 tensor 在 capture/replay 阶段直接写入预留 slot，彻底消除 D2D 拷贝和 allocator 碎片。
+
+1. **内存拓扑**  
+   - **瞬态共享池（Transient Shared Pool）**：存放所有无需保留的中间量（LN、MatMul buffer 等）；Graph α/β 共用同一个 mempool，因计算拓扑一致可实现 100% 复用。  
+   - **持久化乒乓槽（Persistent Ping-Pong Slots）**：为需要监控的 tensor 额外预分配两组物理地址 `Slotset A/B`，完全与共享池隔离。
+
+2. **执行流**  
+   - **Step 2t / Graph α**：瞬态变量写入共享池；被监控的 tensor 直接产出在 `Slotset A`。Replay 结束后，pool 数据可立即复用，`Slotset A` 保留给 backend 异步读取。  
+   - **Step 2t+1 / Graph β**：共享池复用原地址（覆盖写）；监控 tensor 写入 `Slotset B`。此时 backend 可并行消费 `Slotset A`，实现 compute / I/O overlap。  
+   - Graph capture 前需切分好 mempool 与 slot，Graph replay 时按 step parity 切换 slot，sink/event 机制保证 Slotset 生命周期。
+
+3. **优势**  
+   - **True Zero-Copy**：监控数据“出生即在 slot”，HBM 不再承受额外 D2D；只需 sink/event 保障生命周期。  
+   - **Allocator 无碎片**：共享池里不再混入持久化 tensor，Graph α/β 可以轮流完全复用该 pool。  
+   - **完美并发**：当 Graph α 在共享池上运行时，backend 正读 `Slotset B`；下一步反之，forward 与 copy 无需互相等待。
+
+> 实现难点在于：需要对模型 forward 层级的算子做“输出地址劫持”，确保所有被监控 tensor 的 storage 绑定到 slot，而其它临时激活始终走共享池。待 delegate 模式稳定后，可评估对核心模块（Attention/MLP）改写或自定义 kernel 的代价，逐步验证该方案的可行性。
+
+## 14. Future Work：基于融合内核的异步流水线架构（D2D）
+
+> 方案二 Design B – Fused Post-Hoc Copy Pipeline（非侵入式快照）  
+> 思路：保持模型现有的内存布局，通过图末尾的融合 kernel 将监控 tensor 聚合到 staging buffer，再异步回传。
+
+1. **内存拓扑**  
+   - **单体激活池（Monolithic Activation Pool）**：模型所有中间量（含监控/非监控）仍由 PyTorch allocator 统一管理，step 结束即视为脏数据，可被下次 replay 覆盖。  
+   - **暂存环形缓冲区（Staging Ring Buffer）**：独立显存区域，用作“快照”容器；按帧（step）循环使用，供后台 D2H/D2D 消费。
+
+2. **执行流**  
+   - **阶段 I – Compute**：单个 CUDA Graph 完成 forward，所有 tensor 写入激活池，无需定制 allocator。  
+   - **阶段 II – Fused Gather**：在 Graph 末尾加入自定义 gather kernel，读取激活池中散布的目标 tensor，按 Struct-of-Arrays 方式打包到 staging buffer 当前帧；kernel 需等待 compute stream 完结后启动，以避免读写冲突。  
+   - **阶段 III – Async D2H/D2D**：通过独立 stream 将 staging buffer 的内容搬到 CPU 或其它设备，实现 compute / I/O 的流水并行；下一 step 可立即启动，唯一共享资源是 HBM 带宽。
+
+3. **特性评估**  
+   - **兼容性**：无需修改模型算子或输出地址，只需在 Graph capture 阶段追加一个 gather kernel；对于 Transformer/HF 等通用模型改动较小。  
+   - **可扩展性**：staging buffer 只存真正需要的 tensor，显存成本与监控量成正比；ring buffer 可配置帧数以支撑多个未完成的异步 copy。  
+   - **性能权衡**：引入额外 D2D 读写，HBM 带宽成瓶颈；当监控数据量大时，Latency 会线性上升。可通过压缩/采样/分批 gather 缓解。
+
+> 该方案适用于“希望保持模型实现无侵入，却需要一定程度 async copy”的情境。后续可探索：gather kernel 如何与 `GraphMonitor` slot metadata 对齐、如何将 gather 阶段与 SoA aggregation 融合、以及如何在 Nsight 中观察到明确的 copy stream。

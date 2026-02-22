@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 
@@ -26,4 +26,28 @@ def monitor_activation(tensor: torch.Tensor, handle: Any) -> torch.Tensor:
     return ext.monitor_activation(tensor, handle)
 
 
-__all__ = ["monitor_activation"]
+def parse_shadow_block(
+    metadata: torch.Tensor,
+    slot_ids: Sequence[int],
+    hook_names: Sequence[str],
+):
+    """Parse graph shadow metadata into a native backend SoA spec."""
+
+    if len(slot_ids) != len(hook_names):
+        raise ValueError("slot_ids and hook_names must have the same length")
+    ext = _get_extension()
+    slot_list = [int(idx) for idx in slot_ids]
+    name_list = [str(name) for name in hook_names]
+    return ext.parse_shadow_block(metadata, slot_list, name_list)
+
+
+def create_graph_delegate(backend):
+    """Instantiate the native Graph delegate."""
+
+    if backend is None:
+        raise ValueError("backend must not be None")
+    ext = _get_extension()
+    return ext.GraphNativeDelegate(backend)
+
+
+__all__ = ["monitor_activation", "parse_shadow_block", "create_graph_delegate"]

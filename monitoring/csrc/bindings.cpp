@@ -1,6 +1,7 @@
 // Pybind11 module + factory
 
 #include "native_engine_internal.h"
+#include "graph_native_delegate.h"
 
 namespace monitoring {
 
@@ -13,6 +14,14 @@ std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,
   }
   return std::make_shared<NativeMonitoringEngine>(queue_size, dtype, delay_steps);
 }
+
+py::dict parse_shadow_block(const at::Tensor& metadata,
+                            const std::vector<int64_t>& slot_ids,
+                            const std::vector<std::string>& hook_names);
+
+class GraphNativeDelegate;
+std::shared_ptr<GraphNativeDelegate> create_graph_delegate(
+    const std::shared_ptr<NativeMonitoringEngine>& backend);
 
 }  // namespace monitoring
 
@@ -76,8 +85,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("clear_completed_results", &monitoring::NativeMonitoringEngine::clear_completed_results)
       .def("get_stats", &monitoring::NativeMonitoringEngine::get_stats);
 
+  py::class_<monitoring::GraphNativeDelegate, std::shared_ptr<monitoring::GraphNativeDelegate>>(m,
+                                                                                                "GraphNativeDelegate")
+      .def(py::init<const std::shared_ptr<monitoring::NativeMonitoringEngine>&>(),
+           py::arg("backend"))
+      .def("submit_and_resolve", &monitoring::GraphNativeDelegate::submit_and_resolve,
+           py::arg("step_id"), py::arg("metadata"), py::arg("slot_ids"),
+           py::arg("hook_names"), py::arg("stream_handle") = std::optional<uint64_t>());
+
   m.def("create_engine", &monitoring::create_engine,
         py::arg("queue_size"), py::arg("cache_dtype"), py::arg("delay_steps"));
   m.def("monitor_activation", &monitoring::monitor_activation,
         py::arg("tensor"), py::arg("handle"));
+  m.def("parse_shadow_block", &monitoring::parse_shadow_block,
+        py::arg("metadata"), py::arg("slot_ids"), py::arg("hook_names"));
+  m.def("create_graph_delegate", &monitoring::create_graph_delegate,
+        py::arg("backend"));
 }

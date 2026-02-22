@@ -3,18 +3,32 @@ from __future__ import annotations
 import struct
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, TYPE_CHECKING, Protocol
 
 import torch
 import torch.nn as nn
 
 from .config import MonitoringConfig
 from .graph_monitor import GraphMonitor, ModuleFilter, SlotInfo, METADATA_BYTES
-from .task import CacheFuture, MonitoringTask
 
 if TYPE_CHECKING:
     from .graph_consumer import GraphSlotConsumer
 _METADATA_STRUCT = struct.Struct("<Qqqqqqqqqiii44s")
+_METADATA_STRUCT = struct.Struct("<Qqqqqqqqqiii44s")
+
+
+class GraphDelegate(Protocol):
+    """Protocol describing the minimal delegate interface."""
+
+    def submit_and_resolve(
+        self,
+        step_id: int,
+        metadata: torch.Tensor,
+        slot_ids: Sequence[int],
+        hook_names: Sequence[str],
+        stream_handle: Optional[int],
+    ) -> None:
+        ...
 
 
 @dataclass(frozen=True)
@@ -42,6 +56,7 @@ class GraphSafeEngine:
         module_filter: Optional[ModuleFilter] = None,
         max_slots: int = 4096,
         device: Optional[torch.device] = None,
+        delegate: Optional[GraphDelegate] = None,
     ) -> None:
         self.config = config
         self._module_filter = module_filter
@@ -54,11 +69,14 @@ class GraphSafeEngine:
         self._monitor: Optional[GraphMonitor] = None
         self._slot_mapping: Dict[int, SlotInfo] = {}
         self._step_event_stream: Optional[torch.cuda.Stream] = None
+        self._step_streams: Dict[int, Optional[torch.cuda.Stream]] = {}
+        self._delegate: Optional[GraphDelegate] = delegate
+        self._delegate_disabled = False
+        self._metadata_snapshots: Dict[int, torch.Tensor] = {}
 
         self._request_capture_enabled = True
         self._capture_enabled = True
         self._current_step_id = 0
-        self._last_ready_step_id = 0
         self._prepare_ms = 0.0
         self._consumer: Optional["GraphSlotConsumer"] = None
 
@@ -69,6 +87,8 @@ class GraphSafeEngine:
         if self._monitor is not None:
             self._monitor.close()
             self._monitor = None
+        self._step_streams.clear()
+        self._metadata_snapshots.clear()
 
     def prepare_for_model(
         self,
@@ -131,23 +151,37 @@ class GraphSafeEngine:
             except Exception:
                 stream = None
         if stream is not None:
-            self._monitor.on_step_end(stream)
+            self._monitor.on_step_end(self._current_step_id, stream)
             self._step_event_stream = stream
         else:
-            self._monitor.on_step_end(None)
-        self._last_ready_step_id = self._current_step_id
+            self._monitor.on_step_end(self._current_step_id, None)
+        if self._delegate is not None and not self._delegate_disabled:
+            self._step_streams[self._current_step_id] = stream
 
     def is_capture_enabled(self) -> bool:
         return bool(self._capture_enabled)
 
     # Legacy compatibility
+    def drain_ready_results(self, *, wait: bool = False) -> bool:
+        """Collect and submit any ready slots. Returns True if progress was made."""
+
+        slots = self._collect_and_consume(wait=wait)
+        if not slots:
+            return False
+        self._submit_to_delegate(slots)
+        return True
+
     def resolve_all(self) -> None:
         slots = self._collect_and_consume(wait=True)
         if self._consumer is not None:
-            self._consumer.flush_ready()
+            flushed = self._consumer.flush_ready()
+            if flushed:
+                self._submit_to_delegate(flushed)
+        if slots:
+            self._submit_to_delegate(slots)
 
     def clear_completed_results(self) -> None:
-        self._collect_and_consume(wait=False)
+        self.drain_ready_results(wait=False)
 
     # ------------------------------------------------------------------
     # Data access
@@ -155,14 +189,14 @@ class GraphSafeEngine:
     def collect_results(self, *, wait: bool = False) -> List[GraphSlotResult]:
         if self._monitor is None or not self._slot_mapping:
             return []
-        if wait:
-            self._monitor.wait_for_step()
-        elif not self._monitor.is_step_ready():
+
+        ready = self._monitor.pop_ready_step(wait=wait)
+        if ready is None:
             return []
 
-        view = self._monitor.metadata_view()
+        ready_step, buffer = ready
+        view = buffer.view(-1, METADATA_BYTES)
         results: List[GraphSlotResult] = []
-        ready_step = self._last_ready_step_id
         for slot_id, info in self._slot_mapping.items():
             if slot_id >= view.shape[0]:
                 continue
@@ -183,6 +217,8 @@ class GraphSafeEngine:
                     device_index=device_idx,
                 )
             )
+        if self._delegate is not None and not self._delegate_disabled and results:
+            self._metadata_snapshots[ready_step] = view
         return results
 
     def consume_with(
@@ -200,6 +236,15 @@ class GraphSafeEngine:
 
     def attach_consumer(self, consumer: "GraphSlotConsumer") -> None:
         self._consumer = consumer
+
+    def attach_backend_delegate(self, delegate: Optional[GraphDelegate]) -> None:
+        """Attach or replace the backend delegate for graph capture."""
+
+        self._delegate = delegate
+        self._delegate_disabled = False
+        if delegate is None:
+            self._step_streams.clear()
+            self._metadata_snapshots.clear()
 
     # ------------------------------------------------------------------
 
@@ -240,6 +285,52 @@ class GraphSafeEngine:
             return True
 
         return combined
+
+    # ------------------------------------------------------------------
+    # Delegate + alias helpers
+
+    def _submit_to_delegate(self, slots: Sequence[GraphSlotResult]) -> None:
+        if not slots or self._delegate is None or self._delegate_disabled:
+            return
+
+        by_step: Dict[int, List[GraphSlotResult]] = {}
+        for slot in slots:
+            by_step.setdefault(slot.step_id, []).append(slot)
+
+        for step_id, step_slots in by_step.items():
+            stream = self._step_streams.pop(step_id, None)
+            if stream is None:
+                stream = self._step_event_stream
+            metadata = self._metadata_snapshots.pop(step_id, None)
+            if metadata is None:
+                continue
+            stream_handle = _stream_to_handle(stream)
+            try:
+                slot_ids = [slot.slot_id for slot in step_slots]
+                hook_names = [slot.name for slot in step_slots]
+                if not slot_ids:
+                    continue
+                self._delegate.submit_and_resolve(
+                    step_id,
+                    metadata,
+                    slot_ids,
+                    hook_names,
+                    stream_handle,
+                )
+            except Exception:
+                self._delegate_disabled = True
+                self._step_streams.clear()
+                self._metadata_snapshots.clear()
+                raise
+
+
+def _stream_to_handle(stream: Optional[torch.cuda.Stream]) -> Optional[int]:
+    if stream is None:
+        return None
+    try:
+        return int(stream.cuda_stream)
+    except AttributeError:
+        return None
 
 
 def _decode_metadata_row(row: torch.Tensor) -> Optional[Tuple[Tuple[int, ...], Tuple[int, ...], int, int, int, int]]:
