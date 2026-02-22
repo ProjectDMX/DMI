@@ -24,6 +24,11 @@ ENV/
 # Results and logs
 results/
 logs/*.log
+*.log
+
+# Debug / temp scripts
+check_slot_order.py
+benchmark/scripts/hf_monitoring_generate.py
 *.pt.trace.json
 notebooks/
 test_gpu_mem_leak.py
