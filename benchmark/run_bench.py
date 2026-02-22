@@ -101,7 +101,7 @@ def main() -> None:
     parser.add_argument(
         "--monitor-extra-args",
         default="",
-        help="Extra CLI args passed through to benchmark/scripts/hf_monitoring_generate_original.py",
+        help="Extra CLI args passed through to benchmark/scripts/hf_monitoring_generate.py",
     )
     parser.add_argument(
         "--no-clickhouse-pid",
@@ -180,14 +180,14 @@ def main() -> None:
             )
         try:
             mon_start_ts = _now_epoch()
-            mon_result = _run_script("benchmark/scripts/hf_monitoring_generate_original.py", mon_args, env=base_env)
+            mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
             mon_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
     else:
         mon_args = common_args[:] + monitor_extra_args + ["--no-db"]
         mon_start_ts = _now_epoch()
-        mon_result = _run_script("benchmark/scripts/hf_monitoring_generate_original.py", mon_args, env=base_env)
+        mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
         mon_end_ts = _now_epoch()
 
     # Run monitoring with --no-db
@@ -204,13 +204,13 @@ def main() -> None:
         )
         try:
             mon_nodb_start_ts = _now_epoch()
-            mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate_original.py", mon_nodb_args, env=base_env)
+            mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args, env=base_env)
             mon_nodb_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
     else:
         mon_nodb_start_ts = _now_epoch()
-        mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate_original.py", mon_nodb_args, env=base_env)
+        mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args, env=base_env)
         mon_nodb_end_ts = _now_epoch()
 
     summary = {
