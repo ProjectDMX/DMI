@@ -1,9 +1,18 @@
 // Core execution: dispatch/worker, stream/event sync, result storage.
 
 #include "native_engine_internal.h"
+#include "engine_utils.h"
 #include "nvtx_shim.h"
 #include <cstdlib>
 #include <cstdio>
+#include <limits>
+
+#if __has_include(<c10/cuda/CUDACachingAllocator.h>)
+#include <c10/cuda/CUDACachingAllocator.h>
+#define MON_HAS_CUDA_ALLOCATOR_STATS 1
+#else
+#define MON_HAS_CUDA_ALLOCATOR_STATS 0
+#endif
 
 namespace monitoring {
 
@@ -144,12 +153,96 @@ void NativeMonitoringEngine::Impl::remove_slot(int64_t token) {
   slots_.erase(token);
 }
 
+bool NativeMonitoringEngine::Impl::maybe_refresh_memory_stats(int device_index) {
+  if (!congestion_cap_enabled_) {
+    return false;
+  }
+  if (device_index < 0) {
+    return false;
+  }
+  int64_t tick = memory_stats_refresh_tick_.fetch_add(1, std::memory_order_relaxed) + 1;
+  bool has_cached = last_total_mem_bytes_.load(std::memory_order_relaxed) > 0;
+  if (has_cached && (tick % std::max<int64_t>(1, memory_stats_refresh_interval_)) != 0) {
+    return false;
+  }
+
+  int prev_device = 0;
+  cudaError_t get_dev_err = cudaGetDevice(&prev_device);
+  if (get_dev_err != cudaSuccess) {
+    prev_device = device_index;
+  }
+  bool switched = (prev_device != device_index);
+  if (switched) {
+    cudaError_t set_err = cudaSetDevice(device_index);
+    if (set_err != cudaSuccess) {
+      return false;
+    }
+  }
+
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  cudaError_t mem_err = cudaMemGetInfo(&free_bytes, &total_bytes);
+
+  int64_t allocated_bytes = 0;
+  int64_t reserved_bytes = 0;
+#if MON_HAS_CUDA_ALLOCATOR_STATS
+  if (mem_err == cudaSuccess) {
+    try {
+      auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(static_cast<c10::DeviceIndex>(device_index));
+      constexpr size_t kAgg = static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE);
+      allocated_bytes = stats.allocated_bytes[kAgg].current;
+      reserved_bytes = stats.reserved_bytes[kAgg].current;
+    } catch (...) {
+      allocated_bytes = 0;
+      reserved_bytes = 0;
+    }
+  }
+#endif
+
+  if (switched) {
+    (void)cudaSetDevice(prev_device);
+  }
+  if (mem_err != cudaSuccess) {
+    return false;
+  }
+  if (reserved_bytes < allocated_bytes) {
+    reserved_bytes = allocated_bytes;
+  }
+
+  last_driver_free_bytes_.store(static_cast<int64_t>(free_bytes), std::memory_order_relaxed);
+  last_total_mem_bytes_.store(static_cast<int64_t>(total_bytes), std::memory_order_relaxed);
+  last_allocated_bytes_.store(allocated_bytes, std::memory_order_relaxed);
+  last_reserved_bytes_.store(reserved_bytes, std::memory_order_relaxed);
+  return true;
+}
+
+int64_t NativeMonitoringEngine::Impl::compute_allowed_inflight_bytes(int device_index) {
+  if (!congestion_cap_enabled_) {
+    return std::numeric_limits<int64_t>::max();
+  }
+
+  (void)maybe_refresh_memory_stats(device_index);
+
+  const int64_t total_bytes = last_total_mem_bytes_.load(std::memory_order_relaxed);
+  if (total_bytes <= 0) {
+    return std::numeric_limits<int64_t>::max();
+  }
+
+  const int64_t driver_free_bytes = last_driver_free_bytes_.load(std::memory_order_relaxed);
+  const int64_t allocated_bytes = std::max<int64_t>(0, last_allocated_bytes_.load(std::memory_order_relaxed));
+  const int64_t reserved_bytes = std::max<int64_t>(allocated_bytes, last_reserved_bytes_.load(std::memory_order_relaxed));
+
+  const int64_t hard_cap_bytes =
+      std::max<int64_t>(0, static_cast<int64_t>(static_cast<double>(total_bytes) * congestion_cap_ratio_));
+  const int64_t reclaimable_bytes = std::max<int64_t>(0, reserved_bytes - allocated_bytes);
+  const int64_t effective_free_bytes =
+      std::max<int64_t>(0, driver_free_bytes + reclaimable_bytes - driver_guard_bytes_);
+  const int64_t cap_remaining_bytes = std::max<int64_t>(0, hard_cap_bytes - allocated_bytes);
+  return std::max<int64_t>(0, std::min<int64_t>(cap_remaining_bytes, effective_free_bytes));
+}
+
 void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
   mon_nvtx_push("MonEng::dispatch_step");
-  // if (stats_step_log_) {
-  //   std::fprintf(stderr, "[Native/Step] step_id=%ld tasks=%zu\n",
-  //                static_cast<long>(work.step_id), work.tasks.size());
-  // }
   if (work.tasks.empty()) {
     if (work.event != nullptr) {
       C10_CUDA_CHECK(cudaEventDestroy(work.event));
@@ -158,15 +251,40 @@ void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
     return;
   }
 
+  if (congestion_cap_enabled_ && work.bytes > 0) {
+    int device_index = -1;
+    for (const auto& task : work.tasks) {
+      if (task.spec.tensor.defined() && task.spec.tensor.is_cuda()) {
+        device_index = task.spec.tensor.get_device();
+        break;
+      }
+    }
+    if (device_index >= 0) {
+      const int64_t allowed = compute_allowed_inflight_bytes(device_index);
+      const int64_t current = inflight_bytes_.load(std::memory_order_relaxed);
+      if (allowed <= 0 || current + work.bytes > allowed) {
+        process_step(std::move(work));
+        mon_nvtx_pop();
+        return;
+      }
+    }
+  }
+
   if (max_queue_size_ > 0) {
     std::unique_lock<std::mutex> lock(queue_mutex_);
     if (!stop_ && queue_.size() >= max_queue_size_) {
       lock.unlock();
       process_step(std::move(work));
+      mon_nvtx_pop();
       return;
+    }
+    if (work.bytes > 0) {
+      work.counted_inflight = true;
+      inflight_bytes_.fetch_add(work.bytes, std::memory_order_relaxed);
     }
     queue_.push_back(std::move(work));
     lock.unlock();
+
     queue_cv_.notify_one();
     mon_nvtx_pop();
     return;
@@ -174,7 +292,12 @@ void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
 
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (work.bytes > 0) {
+      work.counted_inflight = true;
+      inflight_bytes_.fetch_add(work.bytes, std::memory_order_relaxed);
+    }
     queue_.push_back(std::move(work));
+
   }
   queue_cv_.notify_one();
   mon_nvtx_pop();
@@ -182,7 +305,6 @@ void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
 
 void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   mon_nvtx_push("MonEng::process_step");
-  auto t0 = std::chrono::steady_clock::now();
   if (work.event != nullptr) {
     C10_CUDA_CHECK(cudaStreamWaitEvent(cache_stream_.stream(), work.event, 0));
     C10_CUDA_CHECK(cudaEventDestroy(work.event));
@@ -285,9 +407,13 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   }
   mon_nvtx_pop();
 
-  auto t1 = std::chrono::steady_clock::now();
-  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-  stats_process_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
+  if (work.counted_inflight && work.bytes > 0) {
+    int64_t prev = inflight_bytes_.fetch_sub(work.bytes, std::memory_order_relaxed);
+    if (prev < work.bytes) {
+      inflight_bytes_.store(0, std::memory_order_relaxed);
+    }
+  }
+
   mon_nvtx_pop();
 }
 
@@ -314,7 +440,6 @@ at::Tensor NativeMonitoringEngine::Impl::run_task(const TaskSpec& spec) {
   if (cache_dtype_.has_value() && tensor.scalar_type() != *cache_dtype_) {
     tensor = tensor.to(*cache_dtype_, /*non_blocking=*/true, /*copy=*/false);
   }
-
   // Optional D2H offload on current cache stream
   bool want_cpu = move_to_cpu_;
   if (spec.target_device.has_value() && spec.target_device->is_cpu()) {
@@ -332,7 +457,7 @@ at::Tensor NativeMonitoringEngine::Impl::run_task(const TaskSpec& spec) {
           at::Tensor dst = got.first.view(tensor.sizes());
           dst.copy_(tensor, /*non_blocking=*/true);
           return dst;
-        }
+        }        
         // Pool could not provide a block (capacity/pressure) — fall back to direct pinned alloc
         auto opts = tensor.options().device(torch::kCPU).pinned_memory(true);
         at::Tensor dst = at::empty_like(tensor, opts);
@@ -350,7 +475,6 @@ at::Tensor NativeMonitoringEngine::Impl::run_task(const TaskSpec& spec) {
       tensor = tensor.to(torch::kCPU, /*non_blocking=*/true, /*copy=*/true);
     }
   }
-
   return tensor;
 }
 
@@ -592,7 +716,6 @@ void NativeMonitoringEngine::Impl::store_exception(int64_t token, const std::str
 
 void NativeMonitoringEngine::Impl::clear_completed_results_internal() {
   mon_nvtx_push("MonEng::clear_results");
-  auto t0 = std::chrono::steady_clock::now();
   std::vector<int64_t> tokens;
   std::vector<std::shared_ptr<ResultSlot>> slot_refs;
   {
@@ -621,19 +744,13 @@ void NativeMonitoringEngine::Impl::clear_completed_results_internal() {
       slots_.erase(token);
     }
   }
-  auto t1 = std::chrono::steady_clock::now();
-  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
   stats_clear_calls_.fetch_add(1, std::memory_order_relaxed);
-  stats_clear_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
   stats_clear_scanned_.fetch_add(static_cast<int64_t>(tokens.size()), std::memory_order_relaxed);
   stats_clear_ready_.fetch_add(static_cast<int64_t>(ready_tokens.size()), std::memory_order_relaxed);
   mon_nvtx_pop();
 }
 
 void NativeMonitoringEngine::Impl::worker_loop() {
-  constexpr int64_t CLEANUP_INTERVAL = 8;  // Clean completed results every 8 steps
-  int64_t steps_since_cleanup = 0;
-
   while (true) {
     StepWork work;
     {
@@ -641,22 +758,13 @@ void NativeMonitoringEngine::Impl::worker_loop() {
       mon_nvtx_push("MonEng::worker_wait");
       queue_cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
       mon_nvtx_pop();
-      if (stop_ && queue_.empty()) {
-        break;
-      }
-      work = std::move(queue_.front());
-      queue_.pop_front();
+    if (stop_ && queue_.empty()) {
+      break;
     }
-    process_step(std::move(work));
-
-    // Periodic cleanup to prevent ResultSlot accumulation
-    ++steps_since_cleanup;
-    if (auto_cleanup_ && steps_since_cleanup >= CLEANUP_INTERVAL) {
-      mon_nvtx_push("MonEng::cleanup");
-      clear_completed_results_internal();
-      steps_since_cleanup = 0;
-      mon_nvtx_pop();
+    work = std::move(queue_.front());
+    queue_.pop_front();
     }
+  process_step(std::move(work));
   }
 }
 

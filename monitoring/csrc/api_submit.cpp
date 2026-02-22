@@ -1,6 +1,7 @@
 // Public API implementations: submit/add/seal/resolve/future/stats/close
 
 #include "native_engine_internal.h"
+#include "engine_utils.h"
 #include "nvtx_shim.h"
 
 namespace monitoring {
@@ -22,6 +23,13 @@ py::dict NativeMonitoringEngine::Impl::get_stats() {
     d["host_memcpy_mb"] = static_cast<double>(stats_memcpy_bytes_.load(std::memory_order_relaxed)) / (1024.0 * 1024.0);
   }
   d["pending_notifies"] = stats_pending_notifies_.load(std::memory_order_relaxed);
+  d["inflight_bytes"] = inflight_bytes_.load(std::memory_order_relaxed);
+  d["cap_enabled"] = congestion_cap_enabled_;
+  d["cap_ratio"] = congestion_cap_ratio_;
+  d["driver_guard_bytes"] = driver_guard_bytes_;
+  d["driver_free_bytes"] = last_driver_free_bytes_.load(std::memory_order_relaxed);
+  d["allocator_allocated_bytes"] = last_allocated_bytes_.load(std::memory_order_relaxed);
+  d["allocator_reserved_bytes"] = last_reserved_bytes_.load(std::memory_order_relaxed);
   d["clear_calls"] = stats_clear_calls_.load(std::memory_order_relaxed);
   d["clear_ms_total"] = static_cast<double>(stats_clear_us_.load(std::memory_order_relaxed)) / 1000.0;
   d["clear_scanned_total"] = stats_clear_scanned_.load(std::memory_order_relaxed);
@@ -103,6 +111,19 @@ void NativeMonitoringEngine::Impl::record_callback_duration(int64_t us) {
   stats_callback_us_.fetch_add(us, std::memory_order_relaxed);
 }
 
+void NativeMonitoringEngine::Impl::set_partial_seal_config(bool enabled,
+                                                           int64_t chunk_bytes,
+                                                           bool cap_enabled,
+                                                           double cap_ratio,
+                                                           int64_t driver_guard_mb) {
+  partial_seal_enabled_ = enabled;
+  partial_seal_chunk_bytes_ = std::max<int64_t>(0, chunk_bytes);
+  congestion_cap_enabled_ = cap_enabled;
+  congestion_cap_ratio_ = clamp_ratio(cap_ratio);
+  driver_guard_bytes_ = mb_to_bytes(driver_guard_mb);
+  memory_stats_refresh_tick_.store(0, std::memory_order_release);
+}
+
 std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step(int64_t step_id,
                                                                const py::list& tasks,
                                                                std::optional<uint64_t> stream_handle) {
@@ -110,6 +131,7 @@ std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step(int64_t step_id,
   auto t0 = std::chrono::steady_clock::now();
   StepWork work;
   work.step_id = step_id;
+  work.final_chunk = true;
 
   std::vector<int64_t> tokens;
   tokens.reserve(tasks.size());
@@ -134,6 +156,7 @@ std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step(int64_t step_id,
     TaskEntry entry;
     entry.spec = std::move(spec);
     entry.token = token;
+    work.bytes += estimate_task_bytes(entry.spec);
     work.tasks.emplace_back(std::move(entry));
   }
 
@@ -193,6 +216,7 @@ std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step_soa(int64_t step_
   auto t0 = std::chrono::steady_clock::now();
   StepWork work;
   work.step_id = step_id;
+  work.final_chunk = true;
 
   // Required fields
   auto tensors = spec["tensors"].cast<py::list>();
@@ -278,7 +302,10 @@ std::vector<int64_t> NativeMonitoringEngine::Impl::submit_step_soa(int64_t step_
       slots_.emplace(token, std::move(slot));
     }
 
-    TaskEntry entry; entry.spec = std::move(ts); entry.token = token;
+    TaskEntry entry;
+    entry.spec = std::move(ts);
+    entry.token = token;
+    work.bytes += estimate_task_bytes(entry.spec);
     work.tasks.emplace_back(std::move(entry));
   }
 
@@ -341,20 +368,12 @@ int64_t NativeMonitoringEngine::Impl::add_task(int64_t step_id, const py::tuple&
     slots_.emplace(token, std::move(slot));
   }
 
-  // Append into open step
-  {
-    std::lock_guard<std::mutex> lock(staging_mutex_);
-    StepWork& work = open_steps_[step_id];
-    work.step_id = step_id;
-
-    TaskEntry entry;
-    entry.spec = std::move(spec);
-    entry.token = token;
-    work.tasks.emplace_back(std::move(entry));
-  }
-
+  TaskEntry entry;
+  entry.spec = std::move(spec);
+  entry.token = token;
   pending_tasks_.fetch_add(1, std::memory_order_relaxed);
   stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
+  append_task_entry_and_maybe_seal(step_id, std::move(entry));
   auto t_add1 = std::chrono::steady_clock::now();
   auto us_add = std::chrono::duration_cast<std::chrono::microseconds>(t_add1 - t_add0).count();
   stats_submit_us_.fetch_add(static_cast<int64_t>(us_add), std::memory_order_relaxed);
@@ -365,19 +384,13 @@ int64_t NativeMonitoringEngine::Impl::add_task(int64_t step_id, const py::tuple&
 void NativeMonitoringEngine::Impl::seal_step(int64_t step_id, std::optional<uint64_t> stream_handle) {
   mon_nvtx_push("MonEng::seal_step");
   auto t0 = std::chrono::steady_clock::now();
-  StepWork work;
-  bool has_work = false;
+  std::optional<StepWork> maybe_work;
   {
     std::lock_guard<std::mutex> lock(staging_mutex_);
-    auto it = open_steps_.find(step_id);
-    if (it != open_steps_.end()) {
-      work = std::move(it->second);
-      open_steps_.erase(it);
-      has_work = true;
-    }
+    maybe_work = maybe_cut_open_step_chunk_locked(step_id, /*force_tail=*/true);
   }
 
-  if (!has_work) {
+  if (!maybe_work.has_value()) {
     if (stream_handle.has_value()) {
       cudaEvent_t event;
       C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
@@ -389,6 +402,7 @@ void NativeMonitoringEngine::Impl::seal_step(int64_t step_id, std::optional<uint
     mon_nvtx_pop();
     return;
   }
+  StepWork work = std::move(*maybe_work);
 
   if (stream_handle.has_value()) {
     cudaEvent_t event;
@@ -427,6 +441,7 @@ void NativeMonitoringEngine::Impl::resolve_all() {
     std::lock_guard<std::mutex> lock(staging_mutex_);
     for (auto& kv : open_steps_) {
       if (!kv.second.tasks.empty()) {
+        kv.second.final_chunk = true;
         stats_total_steps_.fetch_add(1, std::memory_order_relaxed);
         ready.emplace_back(std::move(kv.second));
       }
@@ -464,9 +479,14 @@ bool NativeMonitoringEngine::Impl::future_ready(int64_t token) {
   return slot->ready;
 }
 
-bool NativeMonitoringEngine::Impl::future_wait(int64_t token, std::optional<double> timeout) {
+bool NativeMonitoringEngine::Impl::future_wait(int64_t token,
+                                               std::optional<double> timeout,
+                                               bool called_from_cpp /* = false */ ) {
   auto slot = get_slot(token);
-  py::gil_scoped_release release;
+  std::unique_ptr<py::gil_scoped_release> gil_release;
+  if (!called_from_cpp) {
+    gil_release = std::make_unique<py::gil_scoped_release>();
+  }
   std::unique_lock<std::mutex> lock(slot->mutex);
   if (timeout.has_value()) {
     return slot->cv.wait_for(lock,

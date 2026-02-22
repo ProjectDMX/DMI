@@ -35,6 +35,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("begin_step", &monitoring::NativeMonitoringEngine::begin_step,
            py::arg("step_id"),
            py::arg("phase") = static_cast<int64_t>(monitoring::StepPhase::kUnknown))
+      .def("set_partial_seal_config",
+           &monitoring::NativeMonitoringEngine::set_partial_seal_config,
+           py::arg("enabled"),
+           py::arg("chunk_bytes"),
+           py::arg("cap_enabled"),
+           py::arg("cap_ratio"),
+           py::arg("driver_guard_mb"))
       .def("create_hook_callback", &monitoring::NativeMonitoringEngine::create_hook_callback,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("pos_slice"),
            py::arg("target_device") = py::none())
@@ -71,7 +78,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("future_ready", &monitoring::NativeMonitoringEngine::future_ready,
            py::arg("token"))
       .def("future_wait", &monitoring::NativeMonitoringEngine::future_wait,
-           py::arg("token"), py::arg("timeout") = std::optional<double>())
+           py::arg("token"), py::arg("timeout") = std::optional<double>(),
+           py::arg("called_from_cpp") = false)
       .def("future_result", &monitoring::NativeMonitoringEngine::future_result,
            py::arg("token"), py::arg("timeout") = std::optional<double>(),
            py::arg("called_from_cpp") = false)
@@ -85,13 +93,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("backend"), py::arg("token"))
       .def("ready", &monitoring::BackendFuture::ready)
       .def("wait", &monitoring::BackendFuture::wait,
-           py::arg("timeout") = std::optional<double>())
+           py::arg("timeout") = std::optional<double>(),
+           py::arg("called_from_cpp") = false)
       .def("result", &monitoring::BackendFuture::result,
            py::arg("timeout") = std::optional<double>(),
            py::arg("called_from_cpp") = false);
 
   m.def("create_engine", &monitoring::create_engine,
         py::arg("queue_size"), py::arg("cache_dtype"), py::arg("delay_steps"));
+
 
   // ---- ClickHouseClientConfig (config only; stage is C++-only) ----
   py::class_<dmx_host::ClickHouseClientConfig>(m, "ClickHouseClientConfig")
@@ -283,9 +293,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              return self.stop(graceful, std::nullopt);
            },
            py::arg("graceful") = true,
-           py::arg("timeout_s") = std::optional<double>(), 
+           py::arg("timeout_s") = std::optional<double>(),
            py::call_guard<py::gil_scoped_release>())
-           
       .def("close_input", &DMXHostEngine::close_input)
       .def("request_abort", &DMXHostEngine::request_abort)
       .def("join",
@@ -293,7 +302,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              if (timeout_s) return self.join(DMXHostEngine::Duration(*timeout_s));
              return self.join(std::nullopt);
            },
-           py::arg("timeout_s") = std::optional<double>(), 
+           py::arg("timeout_s") = std::optional<double>(),
            py::call_guard<py::gil_scoped_release>())
       .def("failures", &DMXHostEngine::failures)
       .def("raise_if_failed", &DMXHostEngine::raise_if_failed)

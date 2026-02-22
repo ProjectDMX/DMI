@@ -516,7 +516,6 @@ class PipelinedEngine
 
   bool stop(bool graceful = true, std::optional<Duration> timeout = std::nullopt) {
     if (!graceful) return abort(timeout);
-
     close_input();
     const bool ok = join(timeout);
     if (ok) {

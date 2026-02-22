@@ -17,6 +17,7 @@ from monitoring import (
     HostEngineConfig,
     MonitoringConfig,
     MonitoringEngine,
+    NativePartialSealConfig,
     OnClosedPolicy,
     OnFullPolicy,
     QueueConfig,
@@ -152,6 +153,7 @@ def main() -> None:
     cfg = MonitoringConfig(
         hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
+        native_partial_seal=NativePartialSealConfig(),
     )
 
     host_cfg = None
@@ -222,9 +224,8 @@ def main() -> None:
                         "tokens": batch_tokens,
                         "tokens_per_s": batch_tokens / batch_seconds if batch_seconds > 0 else None,
                     }
-                )   
+                )
         loop_end = time.perf_counter()
-        t_r_ed = time.perf_counter()
     finally:
         if engine._host_engine is not None:
             try:
@@ -241,7 +242,7 @@ def main() -> None:
     if loop_end is None:
         loop_end = time.perf_counter()
     total_seconds = time.perf_counter() - start
-    total_to_cpu = t_r_ed - start
+    total_to_cpu = loop_end - start
     main_seconds = loop_end - start
     result = {
         "backend": "monitoring",

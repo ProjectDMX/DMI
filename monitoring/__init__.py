@@ -1,7 +1,7 @@
 """Monitoring engine package for asynchronous hook processing."""
 
 from .engine import MonitoringEngine, HostEngineConfig
-from .config import CaptureSchedule, HookSelection, MonitoringConfig
+from .config import CaptureSchedule, HookSelection, MonitoringConfig, NativePartialSealConfig
 from .task import CacheFuture, MonitoringTask
 
 _NATIVE_EXPORTS = (
@@ -29,6 +29,7 @@ __all__ = [
     "CacheFuture",
     "CaptureSchedule",
     "HookSelection",
+    "NativePartialSealConfig",
     "MonitoringConfig",
     *_NATIVE_EXPORTS,
 ]

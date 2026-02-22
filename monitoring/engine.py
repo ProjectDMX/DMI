@@ -118,6 +118,7 @@ class MonitoringEngine:
                     pass
                 if self.config is not None:
                     self._apply_capture_schedule()
+                    self._apply_native_runtime_config()
             else:
                 python_backend = _PythonBackend(
                     queue_size=queue_size,
@@ -349,6 +350,21 @@ class MonitoringEngine:
             int(schedule.request_stride),
             int(schedule.request_offset),
             int(schedule.warmup_requests),
+        )
+
+    def _apply_native_runtime_config(self) -> None:
+        if not self._native_backend or self.config is None:
+            return
+        cfg = self.config.native_partial_seal
+        setter = getattr(self._native_backend, "set_partial_seal_config", None)
+        if setter is None:
+            return
+        setter(
+            bool(cfg.enabled),
+            int(cfg.chunk_bytes),
+            bool(cfg.cap_enabled),
+            float(cfg.cap_ratio),
+            int(cfg.driver_guard_mb),
         )
 
     def _register_db_step(
@@ -633,7 +649,6 @@ class MonitoringEngine:
         _debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
         if _debug:
             print("[MonEng] close() called")
-        self.resolve_all()
         if self._host_engine is not None and not self._using_native_backend:
             try:
                 self._python_backend.resolve_all()
@@ -700,7 +715,6 @@ class MonitoringEngine:
                     pass
             if self._host_engine is not None:
                 try:
-                    backend.resolve_all()
                     self._host_engine.stop()
                 except Exception:
                     pass

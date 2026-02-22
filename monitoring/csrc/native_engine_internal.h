@@ -67,6 +67,9 @@ struct StepWork {
   int64_t step_id{0};
   std::vector<TaskEntry> tasks;
   cudaEvent_t event{nullptr};
+  int64_t bytes{0};
+  bool counted_inflight{false};
+  bool final_chunk{false};
 };
 
 struct HookConfig {
@@ -130,6 +133,11 @@ struct NativeMonitoringEngine::Impl {
   void begin_request(int64_t request_id);
   void begin_step(int64_t step_id, int64_t phase);
   void record_callback_duration(int64_t us);
+  void set_partial_seal_config(bool enabled,
+                               int64_t chunk_bytes,
+                               bool cap_enabled,
+                               double cap_ratio,
+                               int64_t driver_guard_mb);
 
   std::vector<int64_t> submit_step_soa(int64_t step_id,
                                        const py::dict& spec,
@@ -147,7 +155,7 @@ struct NativeMonitoringEngine::Impl {
 
   void resolve_all();
   bool future_ready(int64_t token);
-  bool future_wait(int64_t token, std::optional<double> timeout);
+  bool future_wait(int64_t token, std::optional<double> timeout, bool called_from_cpp = false);
   at::Tensor future_result(int64_t token, std::optional<double> timeout, bool called_from_cpp = false);
   void clear_completed_results();
   void close();
@@ -162,13 +170,18 @@ struct NativeMonitoringEngine::Impl {
                                        py::tuple slice_tuple,
                                        py::object target_device);
   void append_hook_current_step(const HookConfig& cfg, at::Tensor tensor);
-  int64_t add_task_from_config(const HookConfig& cfg, at::Tensor tensor);
+  int64_t add_task_from_config(const HookConfig& cfg, at::Tensor tensor, int64_t step_id);
 
   // Internal helpers ----------------------------------------------------
   int64_t deduce_pos_dim(const std::string& name);
   SliceSpec parse_slice_py(py::object obj);
   TaskSpec parse_task_tuple(const py::tuple& task_tuple);
   SliceSpec parse_slice_tuple(const py::tuple& slice_tuple);
+  void append_task_entry_and_maybe_seal(int64_t step_id, TaskEntry&& entry);
+  int64_t estimate_task_bytes(const TaskSpec& spec) const;
+  std::optional<StepWork> maybe_cut_open_step_chunk_locked(int64_t step_id, bool force_tail = false);
+  bool maybe_refresh_memory_stats(int device_index);
+  int64_t compute_allowed_inflight_bytes(int device_index);
   bool should_capture_request(int64_t request_id) const;
   bool should_capture_step(int64_t step_id, int64_t phase) const;
   void update_capture_enabled(int64_t step_id, int64_t phase);
@@ -281,6 +294,20 @@ struct NativeMonitoringEngine::Impl {
   std::mutex staging_mutex_;
   std::unordered_map<int64_t, StepWork> open_steps_;
   std::deque<StepWork> sealed_steps_;
+
+  // Partial seal + congestion controls
+  bool partial_seal_enabled_{true};
+  int64_t partial_seal_chunk_bytes_{64 * 1024 * 1024};
+  bool congestion_cap_enabled_{false};
+  double congestion_cap_ratio_{0.8};
+  int64_t driver_guard_bytes_{1024ll * 1024ll * 1024ll};
+  std::atomic<int64_t> inflight_bytes_{0};
+  int64_t memory_stats_refresh_interval_{8};
+  std::atomic<int64_t> memory_stats_refresh_tick_{0};
+  std::atomic<int64_t> last_total_mem_bytes_{0};
+  std::atomic<int64_t> last_driver_free_bytes_{0};
+  std::atomic<int64_t> last_allocated_bytes_{0};
+  std::atomic<int64_t> last_reserved_bytes_{0};
 
   std::mutex hook_config_mutex_;
   std::unordered_map<std::string, std::unique_ptr<HookConfig>> hook_configs_;

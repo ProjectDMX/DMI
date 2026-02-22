@@ -10,6 +10,7 @@ LTO ?= 0
 TARGET := monitoring_native_backend
 SRCS := csrc/native_engine.cpp \
         csrc/engine_core.cpp \
+        csrc/engine_utils.cpp \
         csrc/api_submit.cpp \
         csrc/hooks.cpp \
         csrc/slice.cpp \
@@ -64,14 +65,20 @@ LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPAT
 CLICKHOUSE_INCLUDE ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp)
 CLICKHOUSE_LIB_DIR  ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/clickhouse)
 CLICKHOUSE_LIBS    ?= -lclickhouse-cpp-lib
+CLICKHOUSE_CONTRIB  ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/contrib)
 
 ifneq ($(CLICKHOUSE_INCLUDE),)
-CXXFLAGS += -I$(CLICKHOUSE_INCLUDE)
+CXXFLAGS += -I$(CLICKHOUSE_INCLUDE) -I$(CLICKHOUSE_INCLUDE)/contrib/absl
 endif
 ifneq ($(CLICKHOUSE_LIB_DIR),)
 LDFLAGS += -L$(CLICKHOUSE_LIB_DIR) -Wl,-rpath,$(CLICKHOUSE_LIB_DIR)
 endif
 LDFLAGS += $(CLICKHOUSE_LIBS)
+# clickhouse-cpp transitive deps (static libs built by its cmake)
+LDFLAGS += -L$(CLICKHOUSE_CONTRIB)/lz4/lz4 -llz4 \
+           -L$(CLICKHOUSE_CONTRIB)/cityhash/cityhash -lcityhash \
+           -L$(CLICKHOUSE_CONTRIB)/absl/absl -labsl_int128 \
+           -L$(CLICKHOUSE_CONTRIB)/zstd/zstd -lzstdstatic
 
 CONDA_PREFIX ?= $(shell $(PYTHON) -c "import os; print(os.environ.get('CONDA_PREFIX',''))")
 ifneq ($(CONDA_PREFIX),)

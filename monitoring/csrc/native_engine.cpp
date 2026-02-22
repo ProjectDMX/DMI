@@ -17,6 +17,7 @@ NativeMonitoringEngine::~NativeMonitoringEngine() {
 
 py::dict NativeMonitoringEngine::get_stats() { return impl_->get_stats(); }
 
+
 std::vector<int64_t> NativeMonitoringEngine::submit_step(int64_t step_id,
                                                          const py::list& tasks,
                                                          std::optional<uint64_t> stream_handle) {
@@ -42,6 +43,14 @@ void NativeMonitoringEngine::begin_step(int64_t step_id, int64_t phase) {
 }
 
 void NativeMonitoringEngine::record_callback_duration(int64_t us) { impl_->record_callback_duration(us); }
+
+void NativeMonitoringEngine::set_partial_seal_config(bool enabled,
+                                                     int64_t chunk_bytes,
+                                                     bool cap_enabled,
+                                                     double cap_ratio,
+                                                     int64_t driver_guard_mb) {
+  impl_->set_partial_seal_config(enabled, chunk_bytes, cap_enabled, cap_ratio, driver_guard_mb);
+}
 
 std::vector<int64_t> NativeMonitoringEngine::submit_step_soa(int64_t step_id,
                                                              const py::dict& spec,
@@ -114,7 +123,8 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache(const std::st
           if (tensor.requires_grad()) {
             tensor = tensor.detach();
           }
-          token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor));
+          const int64_t step_id = engine->impl_->current_step_id_.load(std::memory_order_acquire);
+          token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor), step_id);
         }
         auto t1 = std::chrono::steady_clock::now();
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -156,7 +166,8 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache_sig(const std
           if (tensor.requires_grad()) {
             tensor = tensor.detach();
           }
-          token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor));
+          const int64_t step_id = engine->impl_->current_step_id_.load(std::memory_order_acquire);
+          token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor), step_id);
         }
         auto t1 = std::chrono::steady_clock::now();
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -203,9 +214,9 @@ py::object NativeMonitoringEngine::create_global_hook_callback_sig(const std::st
             enabled = engine->impl_->is_hook_enabled_unlocked(hook_name_copy);
           }
           if (enabled) {
-            int64_t token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor));
+            const int64_t step_id = engine->impl_->current_step_id_.load(std::memory_order_acquire);
+            int64_t token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor), step_id);
             // Record name->token for this step for later collection into Python cache
-            int64_t step_id = engine->impl_->current_step_id_.load(std::memory_order_acquire);
             engine->impl_->record_step_name_token(step_id, hook_name_copy, token);
           }
         }
@@ -258,8 +269,10 @@ void NativeMonitoringEngine::append_hook(int64_t step_id,
 
 void NativeMonitoringEngine::resolve_all() { impl_->resolve_all(); }
 bool NativeMonitoringEngine::future_ready(int64_t token) { return impl_->future_ready(token); }
-bool NativeMonitoringEngine::future_wait(int64_t token, std::optional<double> timeout) {
-  return impl_->future_wait(token, timeout);
+bool NativeMonitoringEngine::future_wait(int64_t token,
+                                         std::optional<double> timeout,
+                                         bool called_from_cpp) {
+  return impl_->future_wait(token, timeout, called_from_cpp);
 }
 
 at::Tensor NativeMonitoringEngine::future_result(int64_t token,

@@ -40,6 +40,7 @@ _NATIVE_EXPORTS = (
     "EnqueuePolicy",
     "OnFullPolicy",
     "OnClosedPolicy",
+    "consume_backend_futures_cpp",
 )
 
 

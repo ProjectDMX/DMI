@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -98,6 +99,11 @@ def main() -> None:
     parser.add_argument("--cpu-extra-pids", default="")
     parser.add_argument("--nvtx", action="store_true")
     parser.add_argument(
+        "--monitor-extra-args",
+        default="",
+        help="Extra CLI args passed through to benchmark/scripts/hf_monitoring_generate_original.py",
+    )
+    parser.add_argument(
         "--no-clickhouse-pid",
         action="store_true",
         help="Do not auto-include clickhouse-server PID in CPU RSS sampling.",
@@ -127,6 +133,7 @@ def main() -> None:
     ]
     if args.do_sample:
         common_args.append("--do-sample")
+    monitor_extra_args = shlex.split(args.monitor_extra_args) if args.monitor_extra_args else []
 
     base_env = os.environ.copy()
     if args.nvtx:
@@ -157,7 +164,7 @@ def main() -> None:
     mon_start_ts = None
     mon_end_ts = None
     if not args.no_db:
-        mon_args = common_args[:]
+        mon_args = common_args[:] + monitor_extra_args
         if args.monitor_mem:
             extra_pids = args.cpu_extra_pids
             if not args.no_clickhouse_pid:
@@ -173,19 +180,20 @@ def main() -> None:
             )
         try:
             mon_start_ts = _now_epoch()
-            mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
+            mon_result = _run_script("benchmark/scripts/hf_monitoring_generate_original.py", mon_args, env=base_env)
             mon_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
     else:
+        mon_args = common_args[:] + monitor_extra_args + ["--no-db"]
         mon_start_ts = _now_epoch()
-        mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
+        mon_result = _run_script("benchmark/scripts/hf_monitoring_generate_original.py", mon_args, env=base_env)
         mon_end_ts = _now_epoch()
 
     # Run monitoring with --no-db
     gpu_csv_mon_nodb = os.path.join(args.out_dir, f"gpu_mem_monitoring_nodb_{tag}.csv")
     cpu_csv_mon_nodb = os.path.join(args.out_dir, f"cpu_mem_monitoring_nodb_{tag}.csv")
-    mon_nodb_args = common_args[:] + ["--no-db"]
+    mon_nodb_args = common_args[:] + monitor_extra_args + ["--no-db"]
     if args.monitor_mem:
         procs = _start_monitors(
             gpu_csv_mon_nodb,
@@ -196,13 +204,13 @@ def main() -> None:
         )
         try:
             mon_nodb_start_ts = _now_epoch()
-            mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args, env=base_env)
+            mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate_original.py", mon_nodb_args, env=base_env)
             mon_nodb_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
     else:
         mon_nodb_start_ts = _now_epoch()
-        mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args, env=base_env)
+        mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate_original.py", mon_nodb_args, env=base_env)
         mon_nodb_end_ts = _now_epoch()
 
     summary = {
