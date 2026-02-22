@@ -2,6 +2,7 @@
 // Compile this file alone to include all implementation parts.
 
 #include "native_engine.cpp"
+#include "engine_utils.cpp"
 #include "engine_core.cpp"
 #include "api_submit.cpp"
 #include "hooks.cpp"
@@ -11,4 +12,3 @@
 #include "future_process.cpp"
 #include "clickhouse_client.cpp"
 #include "bindings.cpp"
-

@@ -1,9 +1,82 @@
 // Hook callback + builder path
 
 #include "native_engine_internal.h"
+#include "engine_utils.h"
 #include "nvtx_shim.h"
 
 namespace monitoring {
+
+int64_t NativeMonitoringEngine::Impl::estimate_task_bytes(const TaskSpec& spec) const {
+  return tensor_nbytes(spec.tensor);
+}
+
+std::optional<StepWork> NativeMonitoringEngine::Impl::maybe_cut_open_step_chunk_locked(int64_t step_id,
+                                                                                        bool force_tail) {
+  auto it = open_steps_.find(step_id);
+  if (it == open_steps_.end()) {
+    return std::nullopt;
+  }
+
+  StepWork& open = it->second;
+  if (open.tasks.empty()) {
+    if (force_tail) {
+      open_steps_.erase(it);
+    }
+    return std::nullopt;
+  }
+
+  bool should_cut = force_tail;
+  if (!should_cut && partial_seal_enabled_ && partial_seal_chunk_bytes_ > 0) {
+    should_cut = open.bytes >= partial_seal_chunk_bytes_;
+  }
+  if (!should_cut) {
+    return std::nullopt;
+  }
+
+  StepWork chunk;
+  chunk.step_id = step_id;
+  chunk.tasks = std::move(open.tasks);
+  chunk.bytes = open.bytes;
+  chunk.final_chunk = force_tail;
+  open.bytes = 0;
+  open_steps_.erase(it);
+  return chunk;
+}
+
+void NativeMonitoringEngine::Impl::append_task_entry_and_maybe_seal(int64_t step_id, TaskEntry&& entry) {
+  std::optional<StepWork> ready_chunk;
+  {
+    std::lock_guard<std::mutex> lock(staging_mutex_);
+    StepWork& open = open_steps_[step_id];
+    open.step_id = step_id;
+    open.tasks.emplace_back(std::move(entry));
+    open.bytes += estimate_task_bytes(open.tasks.back().spec);
+    ready_chunk = maybe_cut_open_step_chunk_locked(step_id, /*force_tail=*/false);
+  }
+
+  if (!ready_chunk.has_value()) {
+    return;
+  }
+
+  // Mid-forward chunk: record producer-stream event so processing on cache stream
+  // observes correct ordering before touching GPU tensors.
+  int device_index = -1;
+  for (const auto& task : ready_chunk->tasks) {
+    if (task.spec.tensor.defined() && task.spec.tensor.is_cuda()) {
+      device_index = task.spec.tensor.get_device();
+      break;
+    }
+  }
+  if (device_index >= 0) {
+    cudaEvent_t event;
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    auto stream = at::cuda::getCurrentCUDAStream(device_index);
+    C10_CUDA_CHECK(cudaEventRecord(event, stream.stream()));
+    ready_chunk->event = event;
+  }
+
+  dispatch_step(std::move(*ready_chunk));
+}
 
 HookConfig* NativeMonitoringEngine::Impl::upsert_hook_config(const std::string& hook_name,
                                                              bool remove_batch_dim,
@@ -85,20 +158,18 @@ void NativeMonitoringEngine::Impl::append_hook_current_step(const HookConfig& cf
   spec.can_slice = can_slice;
 
   int64_t step_id = current_step_id_.load(std::memory_order_acquire);
-
-  std::lock_guard<std::mutex> lock(staging_mutex_);
-  StepWork& work = open_steps_[step_id];
-  work.step_id = step_id;
   TaskEntry entry;
   entry.spec = std::move(spec);
   entry.token = 0;  // token assigned at process time
-  work.tasks.emplace_back(std::move(entry));
   pending_tasks_.fetch_add(1, std::memory_order_relaxed);
   stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
+  append_task_entry_and_maybe_seal(step_id, std::move(entry));
   mon_nvtx_pop();
 }
 
-int64_t NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg, at::Tensor tensor) {
+int64_t NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg,
+                                                           at::Tensor tensor,
+                                                           int64_t step_id) {
   mon_nvtx_push("MonEng::add_task_from_config");
   if (!is_capture_enabled()) {
     mon_nvtx_pop();
@@ -115,8 +186,6 @@ int64_t NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg
   int64_t tensor_dims = spec.tensor.dim();
   spec.can_slice = (dim >= 0) ? (tensor_dims > dim) : (tensor_dims >= -dim);
 
-  int64_t step_id = current_step_id_.load(std::memory_order_acquire);
-
   // Allocate token + result slot eagerly
   int64_t token = next_token_++;
   {
@@ -124,18 +193,12 @@ int64_t NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg
     slots_.emplace(token, std::make_shared<ResultSlot>());
   }
 
-  {
-    std::lock_guard<std::mutex> lock(staging_mutex_);
-    StepWork& work = open_steps_[step_id];
-    work.step_id = step_id;
-    TaskEntry entry;
-    entry.spec = std::move(spec);
-    entry.token = token;
-    work.tasks.emplace_back(std::move(entry));
-  }
-
+  TaskEntry entry;
+  entry.spec = std::move(spec);
+  entry.token = token;
   pending_tasks_.fetch_add(1, std::memory_order_relaxed);
   stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
+  append_task_entry_and_maybe_seal(step_id, std::move(entry));
   mon_nvtx_pop();
   return token;
 }
@@ -181,17 +244,12 @@ void NativeMonitoringEngine::Impl::append_hook(int64_t step_id,
     spec.target_device = target_device.cast<c10::Device>();
   }
 
-  {
-    std::lock_guard<std::mutex> lock(staging_mutex_);
-    StepWork& work = open_steps_[step_id];
-    work.step_id = step_id;
-    TaskEntry entry;
-    entry.spec = std::move(spec);
-    entry.token = 0; // token assigned at process/dispatch
-    work.tasks.emplace_back(std::move(entry));
-  }
+  TaskEntry entry;
+  entry.spec = std::move(spec);
+  entry.token = 0; // token assigned at process/dispatch
   pending_tasks_.fetch_add(1, std::memory_order_relaxed);
   stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
+  append_task_entry_and_maybe_seal(step_id, std::move(entry));
   mon_nvtx_pop();
 }
 

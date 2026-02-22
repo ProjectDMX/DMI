@@ -39,6 +39,11 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   void begin_request(int64_t request_id);
   void begin_step(int64_t step_id, int64_t phase);
   void record_callback_duration(int64_t us);
+  void set_partial_seal_config(bool enabled,
+                               int64_t chunk_bytes,
+                               bool cap_enabled,
+                               double cap_ratio,
+                               int64_t driver_guard_mb);
 
   // Struct-of-arrays submit to minimize Python overhead
   std::vector<int64_t> submit_step_soa(int64_t step_id,
@@ -85,7 +90,7 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   // Synchronization / futures
   void resolve_all();
   bool future_ready(int64_t token);
-  bool future_wait(int64_t token, std::optional<double> timeout);
+  bool future_wait(int64_t token, std::optional<double> timeout, bool called_from_cpp = false);
   at::Tensor future_result(int64_t token, std::optional<double> timeout, bool called_from_cpp = false);
   void clear_completed_results();
   void close();
@@ -111,8 +116,8 @@ class BackendFuture {
 
   bool ready() const { return backend_->future_ready(token_); }
 
-  bool wait(std::optional<double> timeout = std::optional<double>()) const {
-    return backend_->future_wait(token_, timeout);
+  bool wait(std::optional<double> timeout = std::optional<double>(), bool called_from_cpp = false) const {
+    return backend_->future_wait(token_, timeout, called_from_cpp);
   }
 
   at::Tensor result(std::optional<double> timeout = std::optional<double>(), bool called_from_cpp = false) const {

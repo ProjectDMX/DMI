@@ -116,11 +116,31 @@ class CaptureSchedule:
 
 
 @dataclass
+class NativePartialSealConfig:
+    """Runtime controls for native partial-seal and memory-based backpressure."""
+
+    enabled: bool = True
+    chunk_bytes: int = 64 * 1024 * 1024
+    cap_enabled: bool = False
+    cap_ratio: float = 0.8
+    driver_guard_mb: int = 1024
+
+    def __post_init__(self) -> None:
+        if self.chunk_bytes < 0:
+            raise ValueError("chunk_bytes must be >= 0.")
+        if not (0.0 < self.cap_ratio <= 1.0):
+            raise ValueError("cap_ratio must be in (0, 1].")
+        if self.driver_guard_mb < 0:
+            raise ValueError("driver_guard_mb must be >= 0.")
+
+
+@dataclass
 class MonitoringConfig:
     """Bundle hook selection and capture schedule for the monitoring engine."""
 
     hooks: HookSelection = field(default_factory=HookSelection)
     schedule: CaptureSchedule = field(default_factory=CaptureSchedule)
+    native_partial_seal: NativePartialSealConfig = field(default_factory=NativePartialSealConfig)
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-friendly representation for native backend handoff."""
@@ -140,5 +160,12 @@ class MonitoringConfig:
                 "request_stride": self.schedule.request_stride,
                 "request_offset": self.schedule.request_offset,
                 "warmup_requests": self.schedule.warmup_requests,
+            },
+            "native_partial_seal": {
+                "enabled": self.native_partial_seal.enabled,
+                "chunk_bytes": self.native_partial_seal.chunk_bytes,
+                "cap_enabled": self.native_partial_seal.cap_enabled,
+                "cap_ratio": self.native_partial_seal.cap_ratio,
+                "driver_guard_mb": self.native_partial_seal.driver_guard_mb,
             },
         }

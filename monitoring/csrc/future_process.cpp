@@ -6,6 +6,8 @@
 
 namespace dmx_host {
 thread_local int worker_id;
+
+
 void ProcessFutureStage::ThreadInit(int thread_idx){
     worker_id = thread_idx;
 }
