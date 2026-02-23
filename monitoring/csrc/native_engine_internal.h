@@ -170,7 +170,7 @@ struct NativeMonitoringEngine::Impl {
                                        py::tuple slice_tuple,
                                        py::object target_device);
   void append_hook_current_step(const HookConfig& cfg, at::Tensor tensor);
-  int64_t add_task_from_config(const HookConfig& cfg, at::Tensor tensor, int64_t step_id);
+  std::pair<int64_t, int64_t> add_task_from_config(const HookConfig& cfg, at::Tensor tensor, int64_t step_id);
 
   // Internal helpers ----------------------------------------------------
   int64_t deduce_pos_dim(const std::string& name);
@@ -211,8 +211,8 @@ struct NativeMonitoringEngine::Impl {
   }
 
   // Step-local name->token mapping for collect_step_futures
-  std::unordered_map<int64_t, std::vector<std::pair<std::string, int64_t>>> step_name_tokens_;
-  void record_step_name_token(int64_t step_id, const std::string& name, int64_t token);
+  std::unordered_map<int64_t, std::vector<std::pair<std::string, std::pair<int64_t, int64_t> >>> step_name_tokens_;
+  void record_step_name_token(int64_t step_id, const std::string& name, int64_t token, int64_t task_size);
 
   // Data ----------------------------------------------------------------
   // D2H offload controls

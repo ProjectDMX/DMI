@@ -117,6 +117,7 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache(const std::st
         }
         at::Tensor tensor = args[0].cast<at::Tensor>();
         int64_t token = 0;
+        int64_t task_size = 0;
         auto t0 = std::chrono::steady_clock::now();
         {
           py::gil_scoped_release release;
@@ -124,7 +125,9 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache(const std::st
             tensor = tensor.detach();
           }
           const int64_t step_id = engine->impl_->current_step_id_.load(std::memory_order_acquire);
-          token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor), step_id);
+          std::pair<int64_t, int64_t> task_add_pair = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor), step_id);
+          token = task_add_pair.first;
+          task_size = task_add_pair.second;
         }
         auto t1 = std::chrono::steady_clock::now();
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -132,7 +135,7 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache(const std::st
 
         // Fill cache with the native C++ BackendFuture.
         try {
-          cache[py::str(hook_name_copy.c_str())] = py::cast(BackendFuture(engine, token));
+          cache[py::str(hook_name_copy.c_str())] = py::cast(BackendFuture(engine, token, task_size));
         } catch (...) {
           cache[py::str(hook_name_copy.c_str())] = py::none();
         }
@@ -160,6 +163,7 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache_sig(const std
         }
         at::Tensor tensor = args[0].cast<at::Tensor>();
         int64_t token = 0;
+        int64_t task_size = 0;
         auto t0 = std::chrono::steady_clock::now();
         {
           py::gil_scoped_release release;
@@ -167,7 +171,9 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache_sig(const std
             tensor = tensor.detach();
           }
           const int64_t step_id = engine->impl_->current_step_id_.load(std::memory_order_acquire);
-          token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor), step_id);
+          std::pair<int64_t, int64_t> task_add_pair = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor), step_id);
+          token = task_add_pair.first;
+          task_size = task_add_pair.second;
         }
         auto t1 = std::chrono::steady_clock::now();
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -175,7 +181,7 @@ py::object NativeMonitoringEngine::create_hook_callback_with_cache_sig(const std
 
         // Fill cache with the native C++ BackendFuture.
         try {
-          cache[py::str(hook_name_copy.c_str())] = py::cast(BackendFuture(engine, token));
+          cache[py::str(hook_name_copy.c_str())] = py::cast(BackendFuture(engine, token, task_size));
         } catch (...) {
           cache[py::str(hook_name_copy.c_str())] = py::none();
         }
@@ -215,9 +221,11 @@ py::object NativeMonitoringEngine::create_global_hook_callback_sig(const std::st
           }
           if (enabled) {
             const int64_t step_id = engine->impl_->current_step_id_.load(std::memory_order_acquire);
-            int64_t token = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor), step_id);
+            std::pair<int64_t, int64_t> task_add_pair = engine->impl_->add_task_from_config(*cfg_ptr, std::move(tensor), step_id);
+            int64_t token = task_add_pair.first;
+            int64_t task_size = task_add_pair.second;
             // Record name->token for this step for later collection into Python cache
-            engine->impl_->record_step_name_token(step_id, hook_name_copy, token);
+            engine->impl_->record_step_name_token(step_id, hook_name_copy, token, task_size);
           }
         }
         auto t1 = std::chrono::steady_clock::now();
@@ -248,9 +256,11 @@ void NativeMonitoringEngine::collect_step_futures_into(int64_t step_id, py::dict
   auto engine = shared_from_this();
   for (auto& kv : items) {
     const std::string& name = kv.first;
-    int64_t token = kv.second;
+    std::pair<int64_t, int64_t> task_add_pair = kv.second;
+    int64_t token = task_add_pair.first;
+    int64_t task_size = task_add_pair.second;
     try {
-      cache[py::str(name.c_str())] = py::cast(BackendFuture(engine, token));
+      cache[py::str(name.c_str())] = py::cast(BackendFuture(engine, token, task_size));
     } catch (...) {
       cache[py::str(name.c_str())] = py::none();
     }

@@ -91,8 +91,7 @@ namespace dmx_host{
                 fr.push_back(start_token_idxs[i]);
                 fr.push_back(name);
                 fr.push_back(t_future);
-                //Current count as 1. Use count to cap queue.
-                dmx_host_queue_item out_item(fr, 1);
+                dmx_host_queue_item out_item(fr, t_future.size());
                 outputs.push_back(out_item);
             }
         }
