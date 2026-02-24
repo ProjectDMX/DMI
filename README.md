@@ -1,4 +1,45 @@
-# Proj-dmx (Huggineface/transformers)
+<!--
+New open-source style intro (DMI) is added below.
+Original README content is preserved and kept after the new sections.
+-->
+
+<!-- # DMI (Deep Model Inspection) -->
+
+<p align="center">
+  <img src="./Figures/f20e2340-3411-4d49-8979-0a7214d3db4b.png" alt="DMI logo" width="400" />
+</p>
+
+<p align="center">
+  <strong>Built for real-time visibility into LLM inference</strong>
+</p>
+
+**Project-DMI** is an open-source LLM monitoring toolkit for LLM inference.  
+It helps you inspect any internal model states (activations, attention, logits, KV cache) during real LLM inference, with a high-performance C++ backend and async data pipeline.
+
+## About
+
+DMI is built for engineers and researchers who need to understand what happens *inside* a model while it runs.
+
+Instead of only looking at final outputs or manually adding hooks, DMI lets you:
+- **Attach** hook points to internal layers wherever you want,
+- **Fast capture** internal states with minimal inference interruption,
+- **Persist** the data to DB (Disk/In-memory) for large-scale analysis with **Visualization**.
+
+The goal is practical model debugging and inspection with minimal overhead.
+
+## Key Features
+
+- 🔍 **Deep Internal Inspection**: Capture any internal model states as you want.
+- ⚙️ **Configurable Capture Control**: Per-step and per-request sampling with flexible hook selection.
+- 🚀 **Fast Monitoring Engine for Data Transfer**: C++-powered, high-throughput data movement for inference-time capture.
+- 🗄️ **Host Engine for Persistence & Visualization**: Built-in database pipeline to persist captured data, with ready-to-inspect visualization dashboards.
+- 🧩 **Seamless Hugging Face API Integration**: Works with familiar HF `generate` APIs.
+
+---
+
+<!-- Original README starts here (preserved) -->
+
+<!-- # Proj-dmx (Huggineface/transformers)
 
 **Prototype of Proj-dmx on HF/transformers library.** A white-box observability system for LLM inference. Capture and analyze internal model states (activations, attention weights, KV cache) with minimal performance overhead.
 
@@ -183,4 +224,4 @@ Measures performance impact of different `request_stride` values:
 MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/tests/hf_modified_async_config_request_stride_benchmark.py --batch-size 64 --steps 10 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention —no-profile
 ```
 
-Tests strides: `[1, 2, 5, 100]` - higher stride = skip more requests
+Tests strides: `[1, 2, 5, 100]` - higher stride = skip more requests -->
