@@ -17,7 +17,12 @@
 
 namespace dmx_host{
 
-using FutureProcessValue = std::variant<std::string, int32_t, monitoring::BackendFuture>;
+using FutureProcessValue = std::variant<
+    std::string,
+    int32_t,
+    std::vector<std::string>,
+    std::vector<std::pair<int32_t, int32_t>>,
+    monitoring::BackendFuture>;
 using FutureProcessRow = std::vector<FutureProcessValue>;
 
 // Input cell types for a row.
@@ -67,7 +72,11 @@ std::pair<int32_t, std::string> parse_internal_id(const std::string& internal_id
  */
 int64_t get_delta_token_len(const std::vector<int64_t>& shape, const std::string& act_name);
 
-std::vector<dmx_host_queue_item> input_handler_v1(std::vector<std::vector<std::string> > keys, std::vector<int32_t> start_token_idxs, 
-    std::vector<std::map<std::string, monitoring::BackendFuture> > cache_dicts);
+std::vector<dmx_host_queue_item> input_handler_v1(
+    const std::string& model_id,
+    int32_t shard_rank,
+    const std::vector<std::vector<std::string>>& request_ids,
+    const std::vector<std::vector<std::pair<int32_t, int32_t>>>& token_range_per_request,
+    const std::vector<std::map<std::string, monitoring::BackendFuture>>& cache_dicts);
 }
 #endif

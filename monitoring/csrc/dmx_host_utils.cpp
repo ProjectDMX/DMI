@@ -72,27 +72,34 @@ namespace dmx_host{
         }
     }
 
-    std::vector<dmx_host_queue_item> input_handler_v1(std::vector<std::vector<std::string> > keys, std::vector<int32_t> start_token_idxs, 
-    std::vector<std::map<std::string, monitoring::BackendFuture> > cache_dicts){
+    std::vector<dmx_host_queue_item> input_handler_v1(
+        const std::string& model_id,
+        int32_t shard_rank,
+        const std::vector<std::vector<std::string>>& request_ids,
+        const std::vector<std::vector<std::pair<int32_t, int32_t>>>& token_range_per_request,
+        const std::vector<std::map<std::string, monitoring::BackendFuture>>& cache_dicts) {
         std::vector<dmx_host_queue_item> outputs;
-        size_t key_cnt = keys.size();
-        if(key_cnt != start_token_idxs.size() || cache_dicts.size() != key_cnt){
-            throw std::runtime_error("In input_handler_v1, keys.size(), start_token_idxs.size(), cache_dicts.size() don't match.");
+        const size_t step_cnt = request_ids.size();
+        if (step_cnt != token_range_per_request.size() || step_cnt != cache_dicts.size()) {
+            throw std::runtime_error(
+                "In input_handler_v1, request_ids.size(), token_range_per_request.size(), "
+                "cache_dicts.size() do not match.");
         }
-        for(size_t i = 0; i < key_cnt; ++i){
-            if(keys[i].size() != 2){
-                throw std::runtime_error("In input_handler_v1, every key should be (model_id, request_id)");
+        for (size_t i = 0; i < step_cnt; ++i) {
+            if (request_ids[i].size() != token_range_per_request[i].size()) {
+                throw std::runtime_error(
+                    "In input_handler_v1, request_ids[i].size() != token_range_per_request[i].size().");
             }
-            size_t tcnt = cache_dicts[i].size();
             for (const auto& [name, t_future] : cache_dicts[i]) {
                 FutureProcessRow fr;
-                fr.push_back(keys[i][0]);
-                fr.push_back(keys[i][1]);
-                fr.push_back(start_token_idxs[i]);
+                fr.push_back(model_id);
+                fr.push_back(shard_rank);
+                fr.push_back(request_ids[i]);
+                fr.push_back(token_range_per_request[i]);
                 fr.push_back(name);
                 fr.push_back(t_future);
-                //Current count as 1. Use count to cap queue.
-                dmx_host_queue_item out_item(fr, 1);
+                // Use BackendFuture reported task bytes as queue budget unit.
+                dmx_host_queue_item out_item(fr, t_future.size());
                 outputs.push_back(out_item);
             }
         }

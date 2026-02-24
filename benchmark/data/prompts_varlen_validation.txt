@@ -1,0 +1,10 @@
+hi
+hello world
+Summarize this sentence in three words.
+Write one short line about databases.
+What is 2+2?
+Explain CUDA stream overlap in simple terms.
+List three fruits.
+Generate a tiny haiku about code.
+The quick brown fox jumps over the lazy dog.
+Why can asynchronous pipelines improve throughput?

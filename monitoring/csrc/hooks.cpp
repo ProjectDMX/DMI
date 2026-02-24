@@ -167,13 +167,13 @@ void NativeMonitoringEngine::Impl::append_hook_current_step(const HookConfig& cf
   mon_nvtx_pop();
 }
 
-int64_t NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg,
+std::pair<int64_t, int64_t> NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg,
                                                            at::Tensor tensor,
                                                            int64_t step_id) {
   mon_nvtx_push("MonEng::add_task_from_config");
   if (!is_capture_enabled()) {
     mon_nvtx_pop();
-    return 0;
+    return std::pair<int64_t, int64_t>(0, 0);
   }
   TaskSpec spec;
   spec.tensor = std::move(tensor);
@@ -181,6 +181,7 @@ int64_t NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg
   spec.remove_batch_dim = cfg.remove_batch_dim;
   spec.slice = cfg.slice;
   spec.target_device = cfg.target_device;
+  int64_t task_bytes = estimate_task_bytes(spec);
 
   int64_t dim = spec.slice_dim;
   int64_t tensor_dims = spec.tensor.dim();
@@ -200,7 +201,7 @@ int64_t NativeMonitoringEngine::Impl::add_task_from_config(const HookConfig& cfg
   stats_total_tasks_.fetch_add(1, std::memory_order_relaxed);
   append_task_entry_and_maybe_seal(step_id, std::move(entry));
   mon_nvtx_pop();
-  return token;
+  return std::pair<int64_t, int64_t> (token, task_bytes);
 }
 
 void NativeMonitoringEngine::Impl::set_enabled_hooks(py::object names_iterable) {
@@ -217,9 +218,9 @@ void NativeMonitoringEngine::Impl::set_enabled_hooks(py::object names_iterable) 
   }
 }
 
-void NativeMonitoringEngine::Impl::record_step_name_token(int64_t step_id, const std::string& name, int64_t token) {
+void NativeMonitoringEngine::Impl::record_step_name_token(int64_t step_id, const std::string& name, int64_t token, int64_t task_size) {
   std::lock_guard<std::mutex> lock(staging_mutex_);
-  step_name_tokens_[step_id].emplace_back(name, token);
+  step_name_tokens_[step_id].emplace_back(name, std::pair<int64_t, int64_t>(token, task_size));
 }
 
 void NativeMonitoringEngine::Impl::append_hook(int64_t step_id,

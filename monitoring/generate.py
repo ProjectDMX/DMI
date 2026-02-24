@@ -23,6 +23,12 @@ def _install_monitoring_forward(model: Any) -> None:
     def monitored_forward(*f_args: Any, **f_kwargs: Any):
         engine = getattr(model, "monitoring_engine", None)
         phase = "prefill" if f_kwargs.get("past_key_values") is None else "decode"
+        try:
+            input_ids = f_kwargs.get("input_ids")
+            if hasattr(input_ids, "dim") and int(input_ids.dim()) >= 2 and int(input_ids.shape[1]) > 1:
+                phase = "prefill"
+        except Exception:
+            pass
         if engine is not None:
             engine.start_step(phase=phase)
         try:

@@ -91,6 +91,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<monitoring::BackendFuture>(m, "BackendFuture")
       .def(py::init<std::shared_ptr<monitoring::NativeMonitoringEngine>, int64_t>(),
            py::arg("backend"), py::arg("token"))
+      .def("size", &monitoring::BackendFuture::size)
       .def("ready", &monitoring::BackendFuture::ready)
       .def("wait", &monitoring::BackendFuture::wait,
            py::arg("timeout") = std::optional<double>(),
@@ -307,6 +308,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("failures", &DMXHostEngine::failures)
       .def("raise_if_failed", &DMXHostEngine::raise_if_failed)
       .def("submit", &DMXHostEngine::submit,
-           py::arg("keys"), py::arg("start_token_idxs"), py::arg("cache_dicts"),
-           py::call_guard<py::gil_scoped_release>());
+          py::arg("model_id"), py::arg("shard_rank"),
+          py::arg("request_ids"), py::arg("token_range_per_request"),
+          py::arg("cache_dicts"),
+          py::call_guard<py::gil_scoped_release>());
 }

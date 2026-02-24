@@ -13,7 +13,6 @@
 #include <string_view>
 #include <utility>
 
-
 #include <clickhouse/columns/array.h>
 #include <clickhouse/columns/string.h>
 #include <clickhouse/columns/numeric.h>
@@ -252,6 +251,7 @@ void RunSchemaInitOnce(const ClickHouseClientConfig& cfg, const clickhouse::Clie
       << QuoteIdent("request_id") << " String, "
       << QuoteIdent("act_name") << " String, "
       << QuoteIdent("layer_no") << " Int32, "
+      << QuoteIdent("shard_rank") << " Int32, "
       << QuoteIdent("start_token_idx") << " Int32, "
       << QuoteIdent("end_token_idx") << " Int32, "
       << QuoteIdent("dtype") << " String, "
@@ -263,6 +263,7 @@ void RunSchemaInitOnce(const ClickHouseClientConfig& cfg, const clickhouse::Clie
       << QuoteIdent("request_id") << ", "
       << QuoteIdent("act_name") << ", "
       << QuoteIdent("layer_no") << ", "
+      << QuoteIdent("shard_rank") << ", "
       << QuoteIdent("start_token_idx") << ", "
       << QuoteIdent("end_token_idx")
       << ") "
@@ -271,6 +272,7 @@ void RunSchemaInitOnce(const ClickHouseClientConfig& cfg, const clickhouse::Clie
       << QuoteIdent("request_id") << ", "
       << QuoteIdent("act_name") << ", "
       << QuoteIdent("layer_no") << ", "
+      << QuoteIdent("shard_rank") << ", "
       << QuoteIdent("start_token_idx") << ", "
       << QuoteIdent("end_token_idx")
       << ") "
@@ -286,6 +288,7 @@ struct StagedRow {
   std::string request_id;
   std::string act_name;
   int32_t layer_no = 0;
+  int32_t shard_rank = 0;
   int32_t start_token_idx = 0;
   int32_t end_token_idx = 0;
 
@@ -297,9 +300,12 @@ struct StagedRow {
 };
 
 StagedRow StageOneRow(ClickHouseRow&& row) {
-  // Contract: exactly 7 fields
-  if (row.size() != 7) {
-    throw std::invalid_argument("ClickHouseRow must have exactly 7 cells: [model_id,request_id,act_name,layer,start,end,tensor]");
+  // Contract: exactly 8 fields.
+  // [model_id, request_id, act_name, layer_no, shard_rank, start_token_idx, end_token_idx, tensor]
+  if (row.size() != 8) {
+    throw std::invalid_argument(
+        "ClickHouseRow must have exactly 8 cells: "
+        "[model_id,request_id,act_name,layer_no,shard_rank,start_token_idx,end_token_idx,tensor]");
   }
 
   StagedRow r;
@@ -307,11 +313,11 @@ StagedRow StageOneRow(ClickHouseRow&& row) {
   r.request_id = TakeString(std::move(row[1]), "request_id");
   r.act_name = TakeString(std::move(row[2]), "act_name");
   r.layer_no = TakeInt32(std::move(row[3]), "layer_no");
-  r.start_token_idx = TakeInt32(std::move(row[4]), "start_token_idx");
-  r.end_token_idx = TakeInt32(std::move(row[5]), "end_token_idx");
+  r.shard_rank = TakeInt32(std::move(row[4]), "shard_rank");
+  r.start_token_idx = TakeInt32(std::move(row[5]), "start_token_idx");
+  r.end_token_idx = TakeInt32(std::move(row[6]), "end_token_idx");
 
-
-  at::Tensor t = TakeTensor(std::move(row[6]), "tensor");
+  at::Tensor t = TakeTensor(std::move(row[7]), "tensor");
 
   EncodedTensor enc = EncodeTensorToColumns(t);
   r.dtype = std::move(enc.dtype);
@@ -401,6 +407,7 @@ void ClickHouseInsertStage::InsertBatch(std::vector<dmx_host_queue_item>&& batch
   auto col_request_id = std::make_shared<clickhouse::ColumnString>();
   auto col_act_name = std::make_shared<clickhouse::ColumnString>();
   auto col_layer_no = std::make_shared<clickhouse::ColumnInt32>();
+  auto col_shard_rank = std::make_shared<clickhouse::ColumnInt32>();
   auto col_start_token_idx = std::make_shared<clickhouse::ColumnInt32>();
   auto col_end_token_idx = std::make_shared<clickhouse::ColumnInt32>();
 
@@ -421,6 +428,7 @@ void ClickHouseInsertStage::InsertBatch(std::vector<dmx_host_queue_item>&& batch
     col_act_name->Append(r.act_name);
 
     col_layer_no->Append(r.layer_no);
+    col_shard_rank->Append(r.shard_rank);
     col_start_token_idx->Append(r.start_token_idx);
     col_end_token_idx->Append(r.end_token_idx);
 
@@ -441,6 +449,7 @@ void ClickHouseInsertStage::InsertBatch(std::vector<dmx_host_queue_item>&& batch
   block.AppendColumn("request_id", col_request_id);
   block.AppendColumn("act_name", col_act_name);
   block.AppendColumn("layer_no", col_layer_no);
+  block.AppendColumn("shard_rank", col_shard_rank);
   block.AppendColumn("start_token_idx", col_start_token_idx);
   block.AppendColumn("end_token_idx", col_end_token_idx);
   block.AppendColumn("dtype", col_dtype);
