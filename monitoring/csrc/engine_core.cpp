@@ -187,6 +187,7 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   std::vector<PendingResult> results;
   results.reserve(work.tasks.size());
   bool any_sync = false;
+
   for (auto& entry : work.tasks) {
     try {
       if (entry.token == 0) {
@@ -320,7 +321,12 @@ at::Tensor NativeMonitoringEngine::Impl::run_task(const TaskSpec& spec) {
         auto got = acquire_pinned_block(nbytes, dt);
         if (got.first.defined()) {
           at::Tensor dst = got.first.view(tensor.sizes());
-          dst.copy_(tensor, /*non_blocking=*/true);
+          try {
+            dst.copy_(tensor, /*non_blocking=*/true);
+          } catch (...) {
+            release_pool_block(got.second);
+            throw;
+          }
           return dst;
         }
         // Pool could not provide a block (capacity/pressure) — fall back to direct pinned alloc
@@ -556,11 +562,13 @@ void NativeMonitoringEngine::Impl::store_result(int64_t token, at::Tensor&& tens
     slot->ready = true;
   }
   slot->cv.notify_all();
-  pending_tasks_.fetch_sub(1, std::memory_order_acq_rel);
-  mon_nvtx_push("MonEng::pending_notify");
-  pending_cv_.notify_all();
-  stats_pending_notifies_.fetch_add(1, std::memory_order_relaxed);
-  mon_nvtx_pop();
+  int64_t remaining = pending_tasks_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+  if (remaining == 0) {
+    mon_nvtx_push("MonEng::pending_notify");
+    pending_cv_.notify_all();
+    stats_pending_notifies_.fetch_add(1, std::memory_order_relaxed);
+    mon_nvtx_pop();
+  }
   mon_nvtx_pop();
 }
 
@@ -573,11 +581,13 @@ void NativeMonitoringEngine::Impl::store_exception(int64_t token, const std::str
     slot->ready = true;
   }
   slot->cv.notify_all();
-  pending_tasks_.fetch_sub(1, std::memory_order_acq_rel);
-  mon_nvtx_push("MonEng::pending_notify");
-  pending_cv_.notify_all();
-  stats_pending_notifies_.fetch_add(1, std::memory_order_relaxed);
-  mon_nvtx_pop();
+  int64_t remaining = pending_tasks_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+  if (remaining == 0) {
+    mon_nvtx_push("MonEng::pending_notify");
+    pending_cv_.notify_all();
+    stats_pending_notifies_.fetch_add(1, std::memory_order_relaxed);
+    mon_nvtx_pop();
+  }
 }
 
 void NativeMonitoringEngine::Impl::clear_completed_results_internal() {

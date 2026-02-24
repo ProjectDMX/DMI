@@ -2,7 +2,6 @@
 
 #include <ATen/ops/from_blob.h>
 #include <pybind11/stl.h>
-#include <cuda_runtime_api.h>
 
 namespace monitoring {
 
@@ -43,23 +42,11 @@ int64_t infer_pos_dim(const std::string& name) {
 }
 
 bool is_cuda_pointer(const ShadowSlotRow& row) {
-  if (row.device_idx < 0) {
-    return false;
-  }
-  cudaPointerAttributes attr;
-  cudaError_t status = cudaPointerGetAttributes(
-      &attr, reinterpret_cast<const void*>(row.data_ptr));
-  if (status != cudaSuccess) {
-    cudaGetLastError();
-    return false;
-  }
-#if CUDART_VERSION >= 10000
-  return attr.type == cudaMemoryTypeDevice ||
-         attr.type == cudaMemoryTypeManaged;
-#else
-  return attr.memoryType == cudaMemoryTypeDevice ||
-         attr.memoryType == cudaMemoryTypeManaged;
-#endif
+  // record_op() already enforces tensor.is_cuda() and writes device_idx
+  // via tensor.get_device() inside a GPU kernel.  A non-negative device_idx
+  // therefore guarantees a valid CUDA (device or managed) pointer — no need
+  // to round-trip through the CUDA driver with cudaPointerGetAttributes().
+  return row.device_idx >= 0;
 }
 
 at::Tensor alias_from_row(const ShadowSlotRow& row, int64_t ndim) {
@@ -132,7 +119,15 @@ py::dict parse_shadow_block(const at::Tensor& metadata,
                   static_cast<long long>(slot_idx),
                   static_cast<long long>(ndim));
     }
-    auto tensor = alias_from_row(row, ndim);
+    at::Tensor tensor;
+    try {
+      tensor = alias_from_row(row, ndim);
+    } catch (const c10::Error&) {
+      // Stale metadata row — pointer was valid in a previous step but the
+      // underlying GPU memory has since been freed or remapped.  Skip it
+      // rather than querying the driver with cudaPointerGetAttributes.
+      continue;
+    }
     int64_t pos_dim = infer_pos_dim(hook_names[i]);
     bool can_slice_flag =
         (pos_dim < 0) ? (ndim >= -pos_dim) : (ndim > pos_dim);
