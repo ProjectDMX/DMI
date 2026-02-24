@@ -10,6 +10,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
+from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
 
 from monitoring import (
     ClickHouseClientConfig,
@@ -25,6 +26,15 @@ from monitoring import (
 )
 from monitoring.config import CaptureSchedule, HookSelection
 from monitoring.generate import generate_with_monitoring
+
+_MODEL_ALIASES = {
+    # Convenience alias used in benchmark CLI.
+    "qwen3": "Qwen/Qwen3-4B",
+}
+
+
+def _resolve_model_id(model: str) -> str:
+    return _MODEL_ALIASES.get(model.lower(), model)
 
 # torch.set_num_threads(1)
 # torch.set_num_interop_threads(1)
@@ -103,7 +113,7 @@ def _build_host_config(db_cfg: ClickHouseClientConfig) -> HostEngineConfig:
     # Stage 1: wait on BackendFuture + parse payloads
     stage_one = StageConfig.process_future(parallelism=1, name="process_future")
     # Stage 2: insert into ClickHouse
-    stage_two = StageConfig.clickhouse_insert(db_cfg, parallelism=10, name="clickhouse_insert")
+    stage_two = StageConfig.clickhouse_insert(db_cfg, parallelism=1, name="clickhouse_insert")
 
     stage_one.input_queue = _build_queue_config()
     stage_two.input_queue = _build_queue_config()
@@ -118,7 +128,7 @@ def _build_host_config(db_cfg: ClickHouseClientConfig) -> HostEngineConfig:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Monitoring generate benchmark")
     parser.add_argument("--prompts", default="benchmark/data/prompts.txt")
-    parser.add_argument("--model", default="gpt2")
+    parser.add_argument("--model", default="qwen3")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=2000)
@@ -126,6 +136,7 @@ def main() -> None:
     parser.add_argument("--json-out", default="")
     parser.add_argument("--no-db", action="store_true", help="Disable host_engine DB submission.")
     args = parser.parse_args()
+    model_id = _resolve_model_id(args.model)
 
     # Native backend must be enabled for MonitoringEngine + (optional) DB futures.
     os.environ.setdefault("MON_NATIVE_TO_CPU", "1")
@@ -151,9 +162,18 @@ def main() -> None:
     device = torch.device(args.device)
 
     cfg = MonitoringConfig(
-        hooks=HookSelection(mode="full"),
+        hooks=HookSelection(
+            mode="full",
+            # include=['final_logits']
+        ),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
-        native_partial_seal=NativePartialSealConfig(),
+        native_partial_seal=NativePartialSealConfig(
+            enabled=True,
+            chunk_bytes=64 * 1024 * 1024,
+            cap_enabled=True,
+            cap_ratio=0.8,
+            driver_guard_mb=1024,
+        ),
     )
 
     host_cfg = None
@@ -164,12 +184,15 @@ def main() -> None:
     engine = MonitoringEngine(
         async_enabled=True,
         config=cfg,
-        model_id=args.model,
+        model_id=model_id,
         db_config=host_cfg,
     )
 
-    model = HookedGPT2LMHeadModel.from_pretrained(
-        args.model,
+    # For Qwen3, switching to HookedQwen3ForCausalLM is enough to run the same
+    # monitoring + generate pipeline; no extra benchmark-side logic is required.
+    model_cls = HookedQwen3ForCausalLM if "qwen3" in model_id.lower() else HookedGPT2LMHeadModel
+    model = model_cls.from_pretrained(
+        model_id,
         attn_implementation="eager",
         torch_dtype=torch.float16,
     )
@@ -177,7 +200,7 @@ def main() -> None:
     model.monitoring_engine = engine
     engine.prepare_for_model(model)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
@@ -246,7 +269,7 @@ def main() -> None:
     main_seconds = loop_end - start
     result = {
         "backend": "monitoring",
-        "model": args.model,
+        "model": model_id,
         "device": str(device),
         "prompts": len(prompts),
         "batch_size": args.batch_size,

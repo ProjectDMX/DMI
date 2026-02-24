@@ -10,6 +10,15 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
+_MODEL_ALIASES = {
+    # Convenience alias used in benchmark CLI.
+    "qwen3": "Qwen/Qwen3-4B",
+}
+
+
+def _resolve_model_id(model: str) -> str:
+    return _MODEL_ALIASES.get(model.lower(), model)
+
 
 def _load_prompts(path: str) -> List[str]:
     prompts: List[str] = []
@@ -55,16 +64,17 @@ def main() -> None:
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--json-out", default="")
     args = parser.parse_args()
+    model_id = _resolve_model_id(args.model)
 
     prompts = _load_prompts(args.prompts)
     device = torch.device(args.device)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, attn_implementation="eager", torch_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained(model_id, attn_implementation="eager", torch_dtype=torch.float16)
     model.to(device).eval()
 
     per_batch = []
@@ -114,7 +124,7 @@ def main() -> None:
     total_seconds = time.perf_counter() - start
     result = {
         "backend": "hf",
-        "model": args.model,
+        "model": model_id,
         "device": str(device),
         "prompts": len(prompts),
         "batch_size": args.batch_size,
