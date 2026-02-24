@@ -6,13 +6,14 @@
 
 namespace dmx_host {
 thread_local int worker_id;
-
+thread_local int contiguous_introduced_copy = 0;
 
 void ProcessFutureStage::ThreadInit(int thread_idx){
     worker_id = thread_idx;
+    contiguous_introduced_copy = 0;
 }
 void ProcessFutureStage::ThreadCleanup() noexcept{
-
+    std::cout << "worker " << worker_id << " in future_process introduced " << contiguous_introduced_copy << " tensor copies due to non-contiguous" << std::endl;
 }
 
 template <typename QueueT>
@@ -20,40 +21,78 @@ std::optional<std::vector<dmx_host_queue_item>> ProcessFutureStage::ProcessFutur
     //In this function, push as soon as possible, do not return to engine for pushing.
     for (const auto& r : batch) {
         const auto& future_row = std::get<FutureProcessRow>(r.core);
-        if(future_row.size() != 5){
-            throw std::invalid_argument("FutureProcessRow must have exactly 5 cells: [model_id,request_id,start,act_name,tensor_future]");
+        if(future_row.size() != 6){
+            throw std::invalid_argument("FutureProcessRow must have exactly 6 cells: [model_id,shard_rank,request_ids,token_range_per_request,act_name,tensor_future]");
         }
         std::string model_id = std::get<std::string>(future_row[0]);
-        std::string request_id = std::get<std::string>(future_row[1]);
-        int32_t start_token_idx = std::get<int32_t>(future_row[2]);
-        std::string act_name = std::get<std::string>(future_row[3]);
-        monitoring::BackendFuture backend_future = std::get<monitoring::BackendFuture>(future_row[4]);
+        int32_t shard_rank = std::get<int32_t> (future_row[1]);
+        const std::vector<std::string>& request_ids = std::get<std::vector< std::string> >(future_row[2]);
+        const std::vector<std::pair<int32_t, int32_t> >& token_range_per_request = std::get<std::vector<std::pair<int32_t, int32_t> > > (future_row[3]);
+        std::string act_name = std::get<std::string>(future_row[4]);
+        monitoring::BackendFuture backend_future = std::get<monitoring::BackendFuture>(future_row[5]);
         auto parsed_pair = parse_internal_id(act_name);
         int32_t layer_no = parsed_pair.first;
         std::string parsed_act_name = parsed_pair.second;
         at::Tensor tensor = backend_future.result(std::optional<double>(), true);
-        ClickHouseRow new_row;
-        new_row.push_back(model_id);
-        new_row.push_back(request_id);
-        new_row.push_back(parsed_act_name);
-        new_row.push_back(layer_no);
-        new_row.push_back(start_token_idx);
-        int64_t delta_len = get_delta_token_len(tensor.sizes().vec(), parsed_act_name);
-        int32_t delta_len_32 = 0;
-        if (delta_len > std::numeric_limits<int32_t>::max() || 
-            delta_len < std::numeric_limits<int32_t>::min()) {
-            // Handle error: value is too big!
-            throw std::overflow_error("Value too large for int32_t");
-        } else {
-            delta_len_32 = static_cast<int32_t>(delta_len);
+        for (int64_t i = 0; i < tensor.size(0); ++i) {
+            at::Tensor slice = tensor[i]; 
+            ClickHouseRow new_row;
+            std::string request_id = request_ids[i];
+            std::pair<int32_t, int32_t> token_range = token_range_per_request[i];
+            int32_t start_token_idx = token_range.first;
+            int32_t end_token_idx = token_range.second;
+            int32_t eff_token_len = token_end_idx - token_start_idx;
+            
+           if(eff_token_len > 0){
+                // NOTE: Drop some tokens if not dropped at GPU side.
+                auto ends_with = [](const std::string& s, const std::string& suf) -> bool {
+                    return s.size() >= suf.size() &&
+                        s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+                };
+
+                const bool is_attn =
+                    ends_with(parsed_act_name, "attn.hook_attn_scores") ||
+                    ends_with(parsed_act_name, "attn.hook_pattern");
+
+                bool did_slice = false;
+
+                // delta token length (batch dim already removed in slice)
+                const int64_t token_dim = is_attn ? ((slice.dim() >= 2) ? (slice.dim() - 2) : 0) : 0;
+                const int64_t delta_token_len = (slice.defined() && slice.dim() > token_dim) ? slice.size(token_dim) : 0;
+
+                if (delta_token_len > static_cast<int64_t>(eff_token_len)) {
+                    slice = slice.narrow(/*dim=*/token_dim, /*start=*/0,
+                                        /*length=*/static_cast<int64_t>(eff_token_len));
+                    did_slice = true;
+                }
+
+                if (is_attn && slice.defined() && slice.dim() >= 2) {
+                    const int64_t key_dim = slice.dim() - 1;
+                    const int64_t want_k  = static_cast<int64_t>(end_token_idx);
+                    if (want_k >= 0 && slice.size(key_dim) > want_k) {
+                        slice = slice.narrow(/*dim=*/key_dim, /*start=*/0, /*length=*/want_k);
+                        did_slice = true;
+                    }
+                }
+
+                if (did_slice) {
+                    bool is_non_contiguous = !slice.is_contiguous();
+                    slice = slice.contiguous();
+                    if(is_non_contiguous){
+                        contiguous_introduced_copy++;
+                    }
+                }
+                new_row.push_back(model_id);
+                new_row.push_back(request_id);
+                new_row.push_back(parsed_act_name);
+                new_row.push_back(layer_no);
+                new_row.push_back(shard_rank);
+                new_row.push_back(start_token_idx);
+                new_row.push_back(end_token_idx);
+                new_row.push_back(slice);
+                next_q->enqueue(dmx_host_queue_item(std::move(new_row), slice.nbytes()));
+           }
         }
-        if (delta_len < 0){
-            throw std::overflow_error("Value < 0 for get_delta_token_len");
-        }
-        int32_t end_token_idx = start_token_idx + delta_len_32;
-        new_row.push_back(end_token_idx);
-        new_row.push_back(tensor);
-        next_q->enqueue(dmx_host_queue_item(std::move(new_row), tensor.nbytes()));
     }
     return std::nullopt;
 }

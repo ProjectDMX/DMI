@@ -72,23 +72,25 @@ namespace dmx_host{
         }
     }
 
-    std::vector<dmx_host_queue_item> input_handler_v1(std::vector<std::vector<std::string> > keys, std::vector<int32_t> start_token_idxs, 
-    std::vector<std::map<std::string, monitoring::BackendFuture> > cache_dicts){
+    std::vector<dmx_host_queue_item> input_handler_v1(std::string model_id, int32_t shard_rank, 
+        std::vector<std::vector<std::string>> request_ids, 
+        std::vector<std::vector<std::pair<int32_t, int32_t> > > token_range_per_request, 
+        std::vector< std::map<std::string, monitoring::BackendFuture> >  cache_dicts){
         std::vector<dmx_host_queue_item> outputs;
-        size_t key_cnt = keys.size();
-        if(key_cnt != start_token_idxs.size() || cache_dicts.size() != key_cnt){
-            throw std::runtime_error("In input_handler_v1, keys.size(), start_token_idxs.size(), cache_dicts.size() don't match.");
+
+        if(token_range_per_request.size() != cache_dicts.size()){
+            throw std::runtime_error("In input_handler_v1, token_range_per_request.size(), cache_dicts.size() don't match.");
         }
-        for(size_t i = 0; i < key_cnt; ++i){
-            if(keys[i].size() != 2){
-                throw std::runtime_error("In input_handler_v1, every key should be (model_id, request_id)");
-            }
+        size_t number_of_batches = cache_dicts.size();
+        for(size_t i = 0; i < number_of_batches; ++i){
             size_t tcnt = cache_dicts[i].size();
+            // requst_id vector and token_range vector
             for (const auto& [name, t_future] : cache_dicts[i]) {
                 FutureProcessRow fr;
-                fr.push_back(keys[i][0]);
-                fr.push_back(keys[i][1]);
-                fr.push_back(start_token_idxs[i]);
+                fr.push_back(model_id);
+                fr.push_back(shard_rank);
+                fr.push_back(std::move(request_ids[i]));
+                fr.push_back(std::move(token_range_per_request[i]));
                 fr.push_back(name);
                 fr.push_back(t_future);
                 dmx_host_queue_item out_item(fr, t_future.size());

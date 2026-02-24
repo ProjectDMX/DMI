@@ -12,9 +12,13 @@ public:
     DMXHostEngine(std::array<StageConfig, 2> two_stages): 
     PipelinedEngine (two_stages, EngineConfig{}){
     }
-    void submit(std::vector<std::vector<std::string> > keys, std::vector<int32_t> start_token_idxs, 
-    std::vector<std::map<std::string, monitoring::BackendFuture> > cache_dicts){
-        submit_items(input_handler_v1(keys, start_token_idxs, cache_dicts));
+
+    // submit a batch of runs(batch of batch).
+    void submit(std::string model_id, int32_t shard_rank, 
+        std::vector< std::vector<std::string> > request_ids,
+        std::vector<std::vector<std::pair<int32_t, int32_t> > > token_range_per_request, 
+        std::vector< std::map<std::string, monitoring::BackendFuture> > > cache_dicts){
+            submit_items(input_handler_v1(model_id, shard_rank, request_ids, token_range_per_request, cache_dicts));
     }
 };
 
