@@ -93,7 +93,6 @@ class MonitoringEngine:
             Tuple[str, int, List[str], List[Tuple[int, int]], Dict[str, Any]]
         ] = None
         self._model_id = model_id
-        self._db_state_lock = threading.Lock()
         self._auto_batch_group_id = 0
         self._active_batch_request_ids: Optional[List[str]] = None
         self._active_batch_start_idx_per_request: Optional[List[int]] = None
@@ -433,102 +432,101 @@ class MonitoringEngine:
         except Exception:
             pass
 
-        with self._db_state_lock:
-            current_ids = self._active_batch_request_ids
-            need_reset = (
-                is_prefill
-                or current_ids is None
-                or len(current_ids) != batch_size
-            )
-            if need_reset:
-                gid = int(self._auto_batch_group_id)
-                self._auto_batch_group_id += 1
-                self._active_batch_request_ids = [f"{gid}:{i}" for i in range(batch_size)]
-                self._active_batch_start_idx_per_request = [0] * batch_size
-                self._active_batch_finished_per_request = [False] * batch_size
-                if not is_prefill and self._debug:
-                    print(
-                        "[MonEng] _register_db_step decode-path fallback init/reset "
-                        f"(batch_size={batch_size})"
-                    )
+        current_ids = self._active_batch_request_ids
+        need_reset = (
+            is_prefill
+            or current_ids is None
+            or len(current_ids) != batch_size
+        )
+        if need_reset:
+            gid = int(self._auto_batch_group_id)
+            self._auto_batch_group_id += 1
+            self._active_batch_request_ids = [f"{gid}:{i}" for i in range(batch_size)]
+            self._active_batch_start_idx_per_request = [0] * batch_size
+            self._active_batch_finished_per_request = [False] * batch_size
+            if not is_prefill and self._debug:
+                print(
+                    "[MonEng] _register_db_step decode-path fallback init/reset "
+                    f"(batch_size={batch_size})"
+                )
 
-            req_ids = self._active_batch_request_ids
-            starts = self._active_batch_start_idx_per_request
-            finished = self._active_batch_finished_per_request
-            if req_ids is None or starts is None or finished is None:
+        req_ids = self._active_batch_request_ids
+        starts = self._active_batch_start_idx_per_request
+        finished = self._active_batch_finished_per_request
+        if req_ids is None or starts is None or finished is None:
+            return
+
+        token_ranges: List[Tuple[int, int]] = []
+        if is_prefill:
+            if attention_mask is None or not hasattr(attention_mask, "dim"):
+                if self._debug:
+                    print("[MonEng] skip db step: prefill requires attention_mask [B, L]")
                 return
-
-            token_ranges: List[Tuple[int, int]] = []
-            if is_prefill:
-                if attention_mask is None or not hasattr(attention_mask, "dim"):
-                    if self._debug:
-                        print("[MonEng] skip db step: prefill requires attention_mask [B, L]")
-                    return
-                if int(attention_mask.dim()) != 2:
-                    if self._debug:
-                        print("[MonEng] skip db step: prefill requires 2D attention_mask [B, L]")
-                    return
+            if int(attention_mask.dim()) != 2:
+                if self._debug:
+                    print("[MonEng] skip db step: prefill requires 2D attention_mask [B, L]")
+                return
+            try:
+                lengths = attention_mask.sum(dim=1).tolist()
+            except Exception:
+                if self._debug:
+                    print("[MonEng] skip db step: failed to compute lengths from attention_mask")
+                return
+            if len(lengths) != batch_size:
+                if self._debug:
+                    print("[MonEng] skip db step: attention_mask batch mismatch")
+                return
+            for i in range(batch_size):
+                start_i = int(starts[i])
+                delta_i = int(lengths[i])
+                if delta_i < 0:
+                    delta_i = 0
+                end_i = start_i + delta_i
+                token_ranges.append((start_i, end_i))
+                starts[i] = end_i
+        else:
+            # Base heuristic: when decode input token is EOS/PAD-like, stop advancing this request.
+            eos_or_pad_ids: set[int] = set()
+            eos_token_id = getattr(self.config, "eos_token_id", None) if self.config is not None else None
+            pad_token_id = getattr(self.config, "pad_token_id", None) if self.config is not None else None
+            if eos_token_id is not None:
+                if isinstance(eos_token_id, (list, tuple, set)):
+                    eos_or_pad_ids.update(int(v) for v in eos_token_id)
+                else:
+                    eos_or_pad_ids.add(int(eos_token_id))
+            if pad_token_id is not None:
+                eos_or_pad_ids.add(int(pad_token_id))
+            last_ids = None
+            if eos_or_pad_ids:
                 try:
-                    lengths = attention_mask.sum(dim=1).tolist()
+                    last_ids = input_ids[:, -1]
                 except Exception:
-                    if self._debug:
-                        print("[MonEng] skip db step: failed to compute lengths from attention_mask")
-                    return
-                if len(lengths) != batch_size:
-                    if self._debug:
-                        print("[MonEng] skip db step: attention_mask batch mismatch")
-                    return
-                for i in range(batch_size):
-                    start_i = int(starts[i])
-                    delta_i = int(lengths[i])
-                    if delta_i < 0:
-                        delta_i = 0
-                    end_i = start_i + delta_i
+                    last_ids = None
+
+            for i in range(batch_size):
+                start_i = int(starts[i])
+                is_finished = bool(finished[i])
+                if (not is_finished) and (last_ids is not None):
+                    try:
+                        if int(last_ids[i]) in eos_or_pad_ids:
+                            is_finished = True
+                    except Exception:
+                        pass
+                if is_finished:
+                    token_ranges.append((start_i, start_i))
+                    finished[i] = True
+                else:
+                    end_i = start_i + 1
                     token_ranges.append((start_i, end_i))
                     starts[i] = end_i
-            else:
-                # Base heuristic: when decode input token is EOS/PAD-like, stop advancing this request.
-                eos_or_pad_ids: set[int] = set()
-                eos_token_id = getattr(self.config, "eos_token_id", None) if self.config is not None else None
-                pad_token_id = getattr(self.config, "pad_token_id", None) if self.config is not None else None
-                if eos_token_id is not None:
-                    if isinstance(eos_token_id, (list, tuple, set)):
-                        eos_or_pad_ids.update(int(v) for v in eos_token_id)
-                    else:
-                        eos_or_pad_ids.add(int(eos_token_id))
-                if pad_token_id is not None:
-                    eos_or_pad_ids.add(int(pad_token_id))
-                last_ids = None
-                if eos_or_pad_ids:
-                    try:
-                        last_ids = input_ids[:, -1]
-                    except Exception:
-                        last_ids = None
 
-                for i in range(batch_size):
-                    start_i = int(starts[i])
-                    is_finished = bool(finished[i])
-                    if (not is_finished) and (last_ids is not None):
-                        try:
-                            if int(last_ids[i]) in eos_or_pad_ids:
-                                is_finished = True
-                        except Exception:
-                            pass
-                    if is_finished:
-                        token_ranges.append((start_i, start_i))
-                        finished[i] = True
-                    else:
-                        end_i = start_i + 1
-                        token_ranges.append((start_i, end_i))
-                        starts[i] = end_i
-
-            self._pending_db_step = (
-                str(self._model_id),
-                0,  # shard_rank reserved for future TP/distributed.
-                list(req_ids),
-                token_ranges,
-                filtered,
-            )
+        self._pending_db_step = (
+            str(self._model_id),
+            0,  # shard_rank reserved for future TP/distributed.
+            list(req_ids),
+            token_ranges,
+            filtered,
+        )
 
     def _submit_pending_db_step(self) -> None:
         if not self._host_engine_enabled or self._host_engine is None:
@@ -536,24 +534,23 @@ class MonitoringEngine:
         if not self._using_native_backend:
             return
 
-        with self._db_state_lock:
-            payload = self._pending_db_step
-            if payload is None:
-                return
-            model_id, shard_rank, req_ids, token_ranges, cache_dict = payload
-            try:
-                self._host_engine.submit(
-                    model_id,
-                    int(shard_rank),
-                    [req_ids],       # N=1 in V1
-                    [token_ranges],  # N=1 in V1
-                    [cache_dict],    # N=1 in V1
-                )
-            except Exception as exc:
-                if self._debug:
-                    print(f"[MonEng] host_engine.submit failed: {exc}")
-            finally:
-                self._pending_db_step = None
+        payload = self._pending_db_step
+        if payload is None:
+            return
+        model_id, shard_rank, req_ids, token_ranges, cache_dict = payload
+        try:
+            self._host_engine.submit(
+                model_id,
+                int(shard_rank),
+                [req_ids],       # N=1 in V1
+                [token_ranges],  # N=1 in V1
+                [cache_dict],    # N=1 in V1
+            )
+        except Exception as exc:
+            if self._debug:
+                print(f"[MonEng] host_engine.submit failed: {exc}")
+        finally:
+            self._pending_db_step = None
 
     def end_step(self) -> None:
         """Seal the current step and hand it to the backend."""
@@ -750,11 +747,10 @@ class MonitoringEngine:
         _debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
         if _debug:
             print("[MonEng] close() called")
-        with self._db_state_lock:
-            self._pending_db_step = None
-            self._active_batch_request_ids = None
-            self._active_batch_start_idx_per_request = None
-            self._active_batch_finished_per_request = None
+        self._pending_db_step = None
+        self._active_batch_request_ids = None
+        self._active_batch_start_idx_per_request = None
+        self._active_batch_finished_per_request = None
         if self._host_engine is not None and not self._using_native_backend:
             try:
                 self._python_backend.resolve_all()
