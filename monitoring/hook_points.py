@@ -752,8 +752,9 @@ class HookedRootModule(nn.Module):
                 input_ids = model_kwargs.get("input_ids") if model_kwargs else None
                 if input_ids is None and model_args:
                     input_ids = model_args[0]
+                attention_mask = model_kwargs.get("attention_mask") if model_kwargs else None
                 past_key_values = model_kwargs.get("past_key_values") if model_kwargs else None
-                engine._register_db_step(cache_dict, input_ids, past_key_values)
+                engine._register_db_step(cache_dict, input_ids, attention_mask, past_key_values)
         except Exception:
             pass
 

@@ -241,7 +241,7 @@ void NativeMonitoringEngine::set_enabled_hooks(py::object names_iterable) {
 
 void NativeMonitoringEngine::collect_step_futures_into(int64_t step_id, py::dict cache) {
   // Move out name->token pairs for this step
-  std::vector<std::pair<std::string, int64_t>> items;
+  std::vector<std::pair<std::string, std::pair<int64_t, int64_t>>> items;
   {
     std::lock_guard<std::mutex> lock(impl_->staging_mutex_);
     auto it = impl_->step_name_tokens_.find(step_id);

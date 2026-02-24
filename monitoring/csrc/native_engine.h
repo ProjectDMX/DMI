@@ -109,7 +109,9 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
 //   result(timeout: Optional[float] = None) -> torch.Tensor
 class BackendFuture {
  public:
-  BackendFuture(std::shared_ptr<NativeMonitoringEngine> backend, int64_t token, int64_t task_size)
+  BackendFuture(std::shared_ptr<NativeMonitoringEngine> backend,
+                int64_t token,
+                int64_t task_size = 0)
       : backend_(backend), token_(token), task_size_(task_size) {}
 
   int64_t token() const { return token_; }

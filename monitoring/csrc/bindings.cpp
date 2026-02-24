@@ -91,6 +91,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<monitoring::BackendFuture>(m, "BackendFuture")
       .def(py::init<std::shared_ptr<monitoring::NativeMonitoringEngine>, int64_t>(),
            py::arg("backend"), py::arg("token"))
+      .def("size", &monitoring::BackendFuture::size)
       .def("ready", &monitoring::BackendFuture::ready)
       .def("wait", &monitoring::BackendFuture::wait,
            py::arg("timeout") = std::optional<double>(),

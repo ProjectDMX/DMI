@@ -173,7 +173,7 @@ std::pair<int64_t, int64_t> NativeMonitoringEngine::Impl::add_task_from_config(c
   mon_nvtx_push("MonEng::add_task_from_config");
   if (!is_capture_enabled()) {
     mon_nvtx_pop();
-    return 0;
+    return std::pair<int64_t, int64_t>(0, 0);
   }
   TaskSpec spec;
   spec.tensor = std::move(tensor);

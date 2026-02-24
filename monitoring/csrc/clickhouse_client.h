@@ -52,14 +52,15 @@ struct ClickHouseClientConfig {
  * - clickhouse-cpp Client is NOT thread-safe -> we keep a thread_local Client.
  * - call ThreadInit once per worker thread, and ThreadCleanup at thread end.
  *
- * Row format (exactly 7 cells):
+ * Row format (exactly 8 cells):
  *   0 model_id (string)
  *   1 request_id (string)
  *   2 act_name (string)
- *   3 layer_no (string containing int32)
- *   4 start_token_idx (string containing int32)
- *   5 end_token_idx (string containing int32)
- *   6 tensor (at::Tensor)
+ *   3 layer_no (int32)
+ *   4 shard_rank (int32)
+ *   5 start_token_idx (int32)
+ *   6 end_token_idx (int32)
+ *   7 tensor (at::Tensor)
  *
  * The stage derives CH columns:
  *   dtype: String

@@ -300,7 +300,7 @@ struct StagedRow {
 };
 
 StagedRow StageOneRow(ClickHouseRow&& row) {
-  // Contract (from future_process.cpp): exactly 8 fields
+  // Contract: exactly 8 fields.
   // [model_id, request_id, act_name, layer_no, shard_rank, start_token_idx, end_token_idx, tensor]
   if (row.size() != 8) {
     throw std::invalid_argument(
