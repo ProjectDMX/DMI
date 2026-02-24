@@ -85,7 +85,7 @@ def _now_epoch() -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run HF vs monitoring benchmarks")
     parser.add_argument("--prompts", default="benchmark/data/prompts.txt")
-    parser.add_argument("--model", default="gpt2")
+    parser.add_argument("--model", default="qwen3")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=1)
