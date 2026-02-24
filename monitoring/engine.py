@@ -423,7 +423,15 @@ class MonitoringEngine:
         if not filtered:
             return
 
+        # Prefer shape-based prefill detection because some HF cache modes may pass
+        # non-None past_key_values even on the first forward of a new generate() call.
         is_prefill = past_key_values is None
+        try:
+            if hasattr(input_ids, "dim") and int(input_ids.dim()) >= 2:
+                if int(input_ids.shape[1]) > 1:
+                    is_prefill = True
+        except Exception:
+            pass
 
         with self._db_state_lock:
             current_ids = self._active_batch_request_ids
@@ -479,15 +487,6 @@ class MonitoringEngine:
                     token_ranges.append((start_i, end_i))
                     starts[i] = end_i
             else:
-                for i in range(batch_size):
-                    start_i = int(starts[i])
-                    if bool(finished[i]):
-                        token_ranges.append((start_i, start_i))
-                    else:
-                        end_i = start_i + 1
-                        token_ranges.append((start_i, end_i))
-                        starts[i] = end_i
-
                 # Base heuristic: when decode input token is EOS/PAD-like, stop advancing this request.
                 eos_or_pad_ids: set[int] = set()
                 eos_token_id = getattr(self.config, "eos_token_id", None) if self.config is not None else None
@@ -499,14 +498,29 @@ class MonitoringEngine:
                         eos_or_pad_ids.add(int(eos_token_id))
                 if pad_token_id is not None:
                     eos_or_pad_ids.add(int(pad_token_id))
+                last_ids = None
                 if eos_or_pad_ids:
                     try:
                         last_ids = input_ids[:, -1]
-                        for i in range(batch_size):
-                            if not finished[i] and int(last_ids[i]) in eos_or_pad_ids:
-                                finished[i] = True
                     except Exception:
-                        pass
+                        last_ids = None
+
+                for i in range(batch_size):
+                    start_i = int(starts[i])
+                    is_finished = bool(finished[i])
+                    if (not is_finished) and (last_ids is not None):
+                        try:
+                            if int(last_ids[i]) in eos_or_pad_ids:
+                                is_finished = True
+                        except Exception:
+                            pass
+                    if is_finished:
+                        token_ranges.append((start_i, start_i))
+                        finished[i] = True
+                    else:
+                        end_i = start_i + 1
+                        token_ranges.append((start_i, end_i))
+                        starts[i] = end_i
 
             self._pending_db_step = (
                 str(self._model_id),
