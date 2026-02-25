@@ -80,6 +80,7 @@ class MonitoringEngine:
         self._delay_steps = max(0, int(delay_steps))
         self._debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
         self.config = config
+        self._no_strip = False if config is None else config.no_strip
         self._request_capture_enabled = True
         self._capture_enabled = True
         self._hook_cache_config_id: Optional[int] = None
@@ -467,7 +468,7 @@ class MonitoringEngine:
                     print("[MonEng] skip db step: prefill requires 2D attention_mask [B, L]")
                 return
             try:
-                lengths = attention_mask.sum(dim=1).tolist()
+                lengths = attention_mask.sum(dim=1).tolist() if not self._no_strip else [attention_mask.shape[1]] * attention_mask.shape[0]
             except Exception:
                 if self._debug:
                     print("[MonEng] skip db step: failed to compute lengths from attention_mask")
@@ -513,9 +514,11 @@ class MonitoringEngine:
                     except Exception:
                         pass
                 if is_finished:
-                    token_ranges.append((start_i, start_i))
                     finished[i] = True
+                if is_finished and not self._no_strip:
+                    token_ranges.append((start_i, start_i))
                 else:
+                    # Not finished or no strip.
                     end_i = start_i + 1
                     token_ranges.append((start_i, end_i))
                     starts[i] = end_i

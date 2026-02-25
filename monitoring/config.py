@@ -141,6 +141,7 @@ class MonitoringConfig:
     hooks: HookSelection = field(default_factory=HookSelection)
     schedule: CaptureSchedule = field(default_factory=CaptureSchedule)
     native_partial_seal: NativePartialSealConfig = field(default_factory=NativePartialSealConfig)
+    no_strip: bool = field(default=False)
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-friendly representation for native backend handoff."""
