@@ -45,7 +45,6 @@ def test_cpp_future_result_with_end_step_flow(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("MON_NATIVE_TO_CPU", "1")
     monkeypatch.setenv("MON_NATIVE_PINNED", "1")
     monkeypatch.setenv("MON_NATIVE_PINPOOL", "1")
-    monkeypatch.setenv("MON_NATIVE_AUTOCLEAR", "0")
 
     engine = MonitoringEngine(async_enabled=True)
     device = torch.device("cuda")
@@ -104,7 +103,6 @@ def test_cpp_backendfuture_result_does_not_block_engine_close(
     monkeypatch.setenv("MON_NATIVE_TO_CPU", "1")
     monkeypatch.setenv("MON_NATIVE_PINNED", "1")
     monkeypatch.setenv("MON_NATIVE_PINPOOL", "1")
-    monkeypatch.setenv("MON_NATIVE_AUTOCLEAR", "0")
 
     engine = MonitoringEngine(async_enabled=True)
     device = torch.device("cuda")

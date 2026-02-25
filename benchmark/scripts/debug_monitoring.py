@@ -8,7 +8,6 @@ os.environ["MON_NATIVE_TO_CPU"] = "1"
 os.environ["MON_NATIVE_CALLBACK"] = "1"
 os.environ["MON_NATIVE_BUILDER"] = "1"
 os.environ["MON_NATIVE_BATCH"] = "0"
-os.environ["MON_NATIVE_AUTOCLEAR"] = "1"
 
 import torch
 print("[DEBUG] torch imported")

@@ -148,13 +148,6 @@ def main() -> None:
     os.environ.setdefault("MON_NATIVE_PINPOOL", "1")
     os.environ.setdefault("MON_NATIVE_HOST_COPY_THREADS", "5")
 
-    if args.no_db:
-        # No DB path: disable auto-cleanup; we'll clear once after the run.
-        os.environ["MON_NATIVE_AUTOCLEAR"] = "0"
-    else:
-        # Prevent native backend from clearing futures before host_engine consumes them.
-        os.environ["MON_NATIVE_AUTOCLEAR"] = "0"
-
     if not torch.cuda.is_available():
         raise RuntimeError("Monitoring benchmark requires CUDA + native backend.")
 

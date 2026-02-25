@@ -95,7 +95,6 @@ def test_generate_and_forward_collect_cpp_futures_and_consume_results(monkeypatc
     monkeypatch.setenv("MON_NATIVE_TO_CPU", "1")
     monkeypatch.setenv("MON_NATIVE_PINNED", "1")
     monkeypatch.setenv("MON_NATIVE_PINPOOL", "1")
-    monkeypatch.setenv("MON_NATIVE_AUTOCLEAR", "0")
     monkeypatch.setenv("MON_NATIVE_BUILDER", "1")
     monkeypatch.setenv("MON_NATIVE_CALLBACK", "1")
     monkeypatch.setenv("MON_NATIVE_BATCH", "0")

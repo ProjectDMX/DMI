@@ -218,7 +218,6 @@ struct NativeMonitoringEngine::Impl {
   // D2H offload controls
   bool move_to_cpu_{false};
   bool use_pinned_{true};
-  bool auto_cleanup_{true};
 
   // Pinned memory pool (for stable GPU->CPU offload throughput)
   struct PinnedBlock {
@@ -231,10 +230,8 @@ struct NativeMonitoringEngine::Impl {
 
   // Pool controls and state
   bool enable_pinpool_{false};
-  size_t pinpool_thresh_bytes_{64 * 1024}; // small tensors fallback to pageable
   size_t pinpool_max_bytes_{512ull * 1024ull * 1024ull}; // total pool cap
   std::vector<size_t> pinpool_bins_bytes_; // capacity bins in bytes (ascending)
-  int pinpool_slots_per_bin_{8};
 
   // Storage
   std::mutex pool_mutex_;
@@ -346,7 +343,6 @@ struct NativeMonitoringEngine::Impl {
   std::atomic<int64_t> stats_submit_us_{0};
   std::atomic<int64_t> stats_process_us_{0};
   std::atomic<int64_t> stats_callback_us_{0};
-  bool stats_step_log_{false};
 };
 
 }  // namespace monitoring
