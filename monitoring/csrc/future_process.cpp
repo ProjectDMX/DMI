@@ -95,8 +95,8 @@ std::optional<std::vector<dmx_host_queue_item>> ProcessFutureStage::ProcessFutur
             /**
              * @brief 
              * Assumption: huggingface generate().
-             * 1. For prefill batch, always left-padded.
-             * 2. For decode batch, one request is all effective or all not.
+             * 1. For prefill, always left-padded.
+             * 2. For decoding, append tokens to right, only PAD again after finishes.
              * 3. One batch is all prefill or all decode.
              * ==> So always suffix.
              */
