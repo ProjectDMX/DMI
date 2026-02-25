@@ -276,7 +276,6 @@ def main() -> None:
     os.environ.setdefault("MON_NATIVE_PINNED", "1")
     os.environ.setdefault("MON_NATIVE_PINPOOL", "1")
     os.environ.setdefault("MON_NATIVE_HOST_COPY_THREADS", "4")
-    os.environ.setdefault("MON_NATIVE_AUTOCLEAR", "0")
 
     prompts = _load_prompts(args.prompts)
     device = torch.device(args.device)

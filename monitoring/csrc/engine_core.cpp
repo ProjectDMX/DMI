@@ -30,14 +30,6 @@ NativeMonitoringEngine::Impl::Impl(int64_t queue_size,
   if (const char* v = std::getenv("MON_NATIVE_PINNED")) {
     use_pinned_ = (*v != '0');
   }
-  if (const char* v = std::getenv("MON_NATIVE_AUTOCLEAR")) {
-    auto_cleanup_ = (*v != '0');
-  }
-  if (const char* v = std::getenv("MON_NATIVE_STEP_STATS")) {
-    stats_step_log_ = (*v != '0');
-  } else if (const char* v = std::getenv("MON_ENGINE_STATS")) {
-    stats_step_log_ = (*v != '0');
-  }
 
   // Configure pinned pool (enabled only when pinned offload is in use)
   enable_pinpool_ = false;
@@ -73,17 +65,9 @@ NativeMonitoringEngine::Impl::Impl(int64_t queue_size,
                                8ull * 1024ull * 1024ull};
       }
     }
-    if (const char* v = std::getenv("MON_NATIVE_PINPOOL_SLOTS_PER_BIN")) {
-      int slots = std::atoi(v);
-      if (slots > 0) pinpool_slots_per_bin_ = slots;
-    }
     if (const char* v = std::getenv("MON_NATIVE_PINPOOL_MAX_MB")) {
       size_t mb = static_cast<size_t>(std::strtoull(v, nullptr, 10));
       if (mb > 0) pinpool_max_bytes_ = mb * 1024ull * 1024ull;
-    }
-    if (const char* v = std::getenv("MON_NATIVE_PIN_THRESH_BYTES")) {
-      size_t th = static_cast<size_t>(std::strtoull(v, nullptr, 10));
-      if (th > 0) pinpool_thresh_bytes_ = th;
     }
   }
 

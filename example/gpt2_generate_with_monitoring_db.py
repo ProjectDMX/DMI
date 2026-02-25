@@ -70,8 +70,6 @@ def main() -> None:
     os.environ.setdefault("MON_NATIVE_CALLBACK", "1")
     os.environ.setdefault("MON_NATIVE_BUILDER", "1")
     os.environ.setdefault("MON_NATIVE_BATCH", "0")
-    # Prevent native backend from clearing futures before host_engine consumes them.
-    os.environ.setdefault("MON_NATIVE_AUTOCLEAR", "0")
 
     if not torch.cuda.is_available():
         raise RuntimeError("This example requires CUDA + native backend.")
