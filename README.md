@@ -18,7 +18,7 @@ It helps you inspect any internal model states (activations, attention, logits, 
 
 ## About
 
-DMI is built for engineers and researchers who need to understand what happens *inside* a model while it runs.
+DMI is built for engineers and researchers who need to understand what happens *inside* a model while it runs. DMI includes **Shadow Block**, a unique GPU-resident hook system for CUDA-Graph-friendly monitored inference at high speed.
 
 Instead of only looking at final outputs or manually adding hooks, DMI lets you:
 - **Attach** hook points to internal layers wherever you want,
@@ -31,9 +31,78 @@ The goal is practical model debugging and inspection with minimal overhead.
 
 - 🔍 **Deep Internal Inspection**: Capture any internal model states as you want.
 - ⚙️ **Configurable Capture Control**: Per-step and per-request sampling with flexible hook selection.
+- ⚡ **GPU-Resident Hook System***: We introduced **Shadow Block**, a system-level kernel innovation for CUDA-Graph-friendly monitored inference at high speed.
 - 🚀 **Fast Monitoring Engine for Data Transfer**: C++-powered, high-throughput data movement for inference-time capture.
 - 🗄️ **Host Engine for Persistence & Visualization**: Built-in database pipeline to persist captured data, with ready-to-inspect visualization dashboards.
-- 🧩 **Seamless Hugging Face API Integration**: Works with familiar HF `generate` APIs.
+- 🧩 **Seamless Hugging Face API Integration**: Works with familiar HF `generate` APIs and natively supports HF parallel inference strategies (e.g., TP/PP workflows).
+
+\* In active integration; this direction is included as part of DMI's core roadmap.
+
+## Installation
+
+### 1) Clone repository + submodules
+
+```bash
+git clone --recursive <your-repo-url>
+cd HF_Prometheus
+
+# If already cloned without --recursive
+git submodule update --init --recursive
+```
+
+Current required submodules in this repo:
+- `transformers/`
+- `libs/clickhouse-cpp/`
+
+### 2) Create Python environment
+
+```bash
+conda env create -f environment.yml
+conda activate proj-dmx
+```
+
+### 3) Install Python packages
+
+```bash
+pip install -e .
+pip install -e transformers/
+```
+
+### 4) Build native dependencies
+
+Build ClickHouse C++ client (required by the monitoring extension link stage):
+
+```bash
+cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build libs/clickhouse-cpp/build -j
+```
+
+Build DMI native backend:
+
+```bash
+make -C monitoring -j
+# or simply: make
+```
+
+## Quick Start
+
+Supported model architectures (current):
+- `gpt2`
+- `qwen3`
+
+We provide runnable example scripts in `benchmark/scripts/`:
+
+- `benchmark/scripts/hf_generate.py` (HF baseline inference)
+- `benchmark/scripts/hf_monitoring_generate.py` (DMI monitored inference)
+
+
+
+Example runs:
+
+```bash
+python benchmark/scripts/hf_generate.py --model gpt2 --device cuda --batch-size 8 --max-new-tokens 16
+python benchmark/scripts/hf_monitoring_generate.py --model qwen3 --device cuda --batch-size 8 --max-new-tokens 16 --no-db
+```
 
 ---
 
