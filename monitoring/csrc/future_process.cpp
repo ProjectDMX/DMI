@@ -92,6 +92,14 @@ std::optional<std::vector<dmx_host_queue_item>> ProcessFutureStage::ProcessFutur
             if (eff_token_len <= 0) {
                 continue;
             }
+            /**
+             * @brief 
+             * Assumption: huggingface generate().
+             * 1. For prefill batch, always left-padded.
+             * 2. For decode batch, one request is all effective or all not.
+             * 3. One batch is all prefill or all decode.
+             * ==> So always suffix.
+             */
 
             at::Tensor slice = tensor.select(0, static_cast<int64_t>(j));
             bool did_slice = false;
@@ -102,7 +110,9 @@ std::optional<std::vector<dmx_host_queue_item>> ProcessFutureStage::ProcessFutur
                 (slice.defined() && slice.dim() > token_dim) ? slice.size(token_dim) : 0;
 
             if (delta_token_len > static_cast<int64_t>(eff_token_len)) {
-                slice = slice.narrow(/*dim=*/token_dim, /*start=*/0,
+                // Always suffix.
+                int64_t skip_first = delta_token_len - static_cast<int64_t>(eff_token_len);
+                slice = slice.narrow(/*dim=*/token_dim, /*start=*/skip_first,
                                      /*length=*/static_cast<int64_t>(eff_token_len));
                 did_slice = true;
             }
@@ -111,7 +121,8 @@ std::optional<std::vector<dmx_host_queue_item>> ProcessFutureStage::ProcessFutur
                 const int64_t key_dim = slice.dim() - 1;
                 const int64_t want_k = static_cast<int64_t>(end_token_idx);
                 if (want_k >= 0 && slice.size(key_dim) > want_k) {
-                    slice = slice.narrow(/*dim=*/key_dim, /*start=*/0, /*length=*/want_k);
+                    int64_t skip_first = slice.size(key_dim) - want_k;
+                    slice = slice.narrow(/*dim=*/key_dim, /*start=*/skip_first, /*length=*/want_k);
                     did_slice = true;
                 }
             }
