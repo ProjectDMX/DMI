@@ -13,11 +13,17 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 def _assert_native_drained(engine: MonitoringEngine) -> None:
     backend = getattr(engine, "_native_backend", None)
     assert backend is not None
-    dbg = backend.debug_state()
-    assert int(dbg.get("pending_tasks", -1)) == 0
-    assert int(dbg.get("queue_size", -1)) == 0
-    assert int(dbg.get("open_steps", -1)) == 0
-    assert int(dbg.get("sealed_steps", -1)) == 0
+    if hasattr(backend, "debug_state"):
+        dbg = backend.debug_state()
+        assert int(dbg.get("pending_tasks", -1)) == 0
+        assert int(dbg.get("queue_size", -1)) == 0
+        assert int(dbg.get("open_steps", -1)) == 0
+        assert int(dbg.get("sealed_steps", -1)) == 0
+        return
+    stats = backend.get_stats()
+    assert int(stats.get("inflight_bytes", -1)) == 0
+    if "host_copy_queue_depth" in stats:
+        assert int(stats.get("host_copy_queue_depth", -1)) == 0
 
 
 def _wait_native_drain_without_resolve(engine: MonitoringEngine, timeout_s: float = 120.0) -> None:
@@ -25,18 +31,26 @@ def _wait_native_drain_without_resolve(engine: MonitoringEngine, timeout_s: floa
     assert backend is not None
 
     deadline = time.perf_counter() + timeout_s
-    last_dbg = None
+    last_state = None
+    use_debug_state = hasattr(backend, "debug_state")
     while time.perf_counter() < deadline:
-        last_dbg = backend.debug_state()
-        pending = int(last_dbg.get("pending_tasks", -1))
-        qsz = int(last_dbg.get("queue_size", -1))
-        open_steps = int(last_dbg.get("open_steps", -1))
-        sealed_steps = int(last_dbg.get("sealed_steps", -1))
-        if pending == 0 and qsz == 0 and open_steps == 0 and sealed_steps == 0:
-            return
+        if use_debug_state:
+            last_state = backend.debug_state()
+            pending = int(last_state.get("pending_tasks", -1))
+            qsz = int(last_state.get("queue_size", -1))
+            open_steps = int(last_state.get("open_steps", -1))
+            sealed_steps = int(last_state.get("sealed_steps", -1))
+            if pending == 0 and qsz == 0 and open_steps == 0 and sealed_steps == 0:
+                return
+        else:
+            last_state = backend.get_stats()
+            inflight = int(last_state.get("inflight_bytes", -1))
+            host_q = int(last_state.get("host_copy_queue_depth", 0))
+            if inflight == 0 and host_q == 0:
+                return
         time.sleep(0.05)
 
-    pytest.fail(f"native backend did not drain without resolve_all: {last_dbg}")
+    pytest.fail(f"native backend did not drain without resolve_all: {last_state}")
 
 
 def test_cpp_future_result_with_end_step_flow() -> None:

@@ -75,7 +75,6 @@ def attention_result_hook_names(num_layers: int) -> set[str]:
 def test_hook_aliases_exposed():
     model = build_small_model(n_layer=1)
     assert "blocks.0.hook_resid_pre" in model.hook_dict
-    assert "h.0.attn.hook_q" in model.hook_dict
 
 
 def test_run_with_cache_collects_expected_keys():

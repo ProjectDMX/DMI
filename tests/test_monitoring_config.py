@@ -90,7 +90,22 @@ def test_monitoring_config_default_debug_false():
     assert cfg.as_dict()["debug"] is False
 
 
-def test_apply_native_runtime_config_calls_backend_setter():
+def test_apply_native_runtime_config_calls_backend_setter(monkeypatch):
+    class _DummyBackend:
+        def __init__(self):
+            self.args = None
+
+        def begin_step(self, step_id: int, phase_code: int) -> None:
+            return None
+
+        def set_capture_schedule(self, *args):
+            return None
+
+        def set_partial_seal_config(self, *args):
+            self.args = args
+
+    monkeypatch.setattr("monitoring.engine._load_native_backend", lambda *args, **kwargs: _DummyBackend())
+
     cfg = MonitoringConfig(
         native_partial_seal=NativePartialSealConfig(
             enabled=False,
@@ -100,16 +115,8 @@ def test_apply_native_runtime_config_calls_backend_setter():
             driver_guard_mb=256,
         )
     )
-    engine = MonitoringEngine(async_enabled=False, config=cfg)
-
-    class _DummyBackend:
-        def __init__(self):
-            self.args = None
-
-        def set_partial_seal_config(self, *args):
-            self.args = args
-
-    backend = _DummyBackend()
-    engine._native_backend = backend
+    engine = MonitoringEngine(async_enabled=True, config=cfg)
+    backend = engine._native_backend
+    assert backend is not None
     engine._apply_native_runtime_config()
     assert backend.args == (False, 8 * 1024 * 1024, True, 0.75, 256)

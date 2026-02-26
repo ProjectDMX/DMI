@@ -1,113 +1,111 @@
-import threading
-import time
-
 import pytest
 import torch
 
 from monitoring import MonitoringEngine, MonitoringTask
 from monitoring.task import CacheFuture
-from monitoring.utils import Slice
 
 
-def test_cache_future_waits_for_result():
-    tensor = torch.ones(2)
-    task = MonitoringTask(name="test", tensor=tensor)
+class _DummyNativeBackend:
+    def __init__(self):
+        self._next_token = 1
+        self._results = {}
+        self.partial_seal_args = None
+
+    def begin_step(self, step_id: int, phase_code: int) -> None:
+        return None
+
+    def begin_request(self, request_id: int) -> None:
+        return None
+
+    def set_capture_schedule(self, *args):
+        return None
+
+    def set_partial_seal_config(self, *args):
+        self.partial_seal_args = args
+
+    def submit_step(self, step_id, task_specs, stream_handle):
+        tokens = []
+        for spec in task_specs:
+            token = self._next_token
+            self._next_token += 1
+            tensor = spec[0]
+            self._results[token] = tensor.detach().cpu()
+            tokens.append(token)
+        return tokens
+
+    def seal_step(self, step_id, stream_handle):
+        return None
+
+    def resolve_all(self):
+        return None
+
+    def clear_completed_results(self):
+        return None
+
+    def close(self):
+        return None
+
+    def future_ready(self, token: int) -> bool:
+        return token in self._results
+
+    def future_wait(self, token: int, timeout=None) -> bool:
+        return token in self._results
+
+    def future_result(self, token: int, timeout=None):
+        return self._results.pop(token)
+
+
+def _patch_native_loader(monkeypatch):
+    def _loader(*args, **kwargs):
+        return _DummyNativeBackend()
+
+    monkeypatch.setattr("monitoring.engine._load_native_backend", _loader)
+
+
+def test_cache_future_requires_backend_binding():
+    task = MonitoringTask(name="test", tensor=torch.ones(2))
     future = CacheFuture(task)
 
-    def producer():
-        time.sleep(0.05)
-        future.set_result(tensor * 2)
-
-    thread = threading.Thread(target=producer)
-    thread.start()
-
-    assert not future.ready()
-    result = future.result(timeout=1.0)
-    assert future.ready()
-    assert torch.equal(result, tensor * 2)
-
-    thread.join()
+    assert future.ready() is False
+    with pytest.raises(RuntimeError, match="not bound"):
+        future.result(timeout=0.1)
+    with pytest.raises(RuntimeError, match="not bound"):
+        future.wait(timeout=0.1)
 
 
-def test_cache_future_propagates_exception():
-    tensor = torch.ones(2)
-    task = MonitoringTask(name="test", tensor=tensor)
+def test_cache_future_reads_from_native_backend():
+    task = MonitoringTask(name="test", tensor=torch.ones(2))
     future = CacheFuture(task)
 
-    def producer():
-        future.set_exception(RuntimeError("boom"))
+    backend = _DummyNativeBackend()
+    backend._results[7] = torch.tensor([3.0, 4.0])
+    future.bind_backend(backend, 7)
 
-    thread = threading.Thread(target=producer)
-    thread.start()
-
-    with pytest.raises(RuntimeError, match="boom"):
-        future.result(timeout=1.0)
-
-    thread.join()
-
-
-def test_monitoring_engine_sync_fallback():
-    engine = MonitoringEngine(async_enabled=False)
-    tensor = torch.arange(6.0).view(1, 6)
-    task = MonitoringTask(
-        name="blocks.0.hook_resid_pre",
-        tensor=tensor,
-        metadata={"remove_batch_dim": True, "can_slice": True},
-    )
-
-    future = engine.submit(task)
-    engine.end_step()
-    assert future.ready()
-    result = future.result()
-    assert torch.equal(result, tensor[0])
+    assert future.ready() is True
+    out = future.result(timeout=1.0)
+    assert torch.equal(out, torch.tensor([3.0, 4.0]))
+    # Second call should use cached tensor.
+    out2 = future.result(timeout=1.0)
+    assert torch.equal(out2, out)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for async monitoring test")
-def test_monitoring_engine_async_cuda():
-    engine = MonitoringEngine(async_enabled=True, cache_dtype=torch.float16)
-
-    tensor = torch.arange(12, dtype=torch.float32, device="cuda").view(1, 3, 4)
-    slice_obj = Slice(None) if Slice is not None else None
-
-    engine.start_step()
-    task = MonitoringTask(
-        name="blocks.0.hook_resid_mid",
-        tensor=tensor,
-        pos_slice=slice_obj,
-        slice_dim=-2,
-        metadata={"remove_batch_dim": True, "can_slice": True},
-        target_device=tensor.device,
-    )
-
-    future = engine.submit(task)
-    engine.end_step()
-    try:
-        assert not future.ready()
-        result = future.result(timeout=5.0)
-        engine.resolve_all()
-        assert future.ready()
-        assert result.dtype == torch.float16
-        assert torch.allclose(result.float(), tensor[0].float(), atol=1e-3, rtol=1e-3)
-    finally:
-        engine.close()
+def test_monitoring_engine_rejects_async_disabled():
+    with pytest.raises(RuntimeError, match="async_enabled=False"):
+        MonitoringEngine(async_enabled=False)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for pending-step test")
-def test_monitoring_engine_resolve_flushes_pending_step():
+def test_monitoring_engine_requires_native_backend(monkeypatch):
+    monkeypatch.setattr("monitoring.engine._load_native_backend", lambda *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="Failed to initialize native monitoring backend"):
+        MonitoringEngine(async_enabled=True)
+
+
+def test_monitoring_engine_submit_rejects_cpu_tensor(monkeypatch):
+    _patch_native_loader(monkeypatch)
     engine = MonitoringEngine(async_enabled=True)
-
-    tensor = torch.zeros(1, 2, 2, device="cuda")
-    engine.start_step()
-    task = MonitoringTask(
-        name="blocks.0.hook_resid_post",
-        tensor=tensor,
-        metadata={"remove_batch_dim": True, "can_slice": False},
-    )
-
-    future = engine.submit(task)
     try:
-        engine.resolve_all()
-        result = future.result(timeout=5.0)
-        assert result.shape == (2, 2)
+        task = MonitoringTask(name="blocks.0.hook_resid_pre", tensor=torch.ones(2))
+        with pytest.raises(RuntimeError, match="must be CUDA"):
+            engine.submit(task)
     finally:
         engine.close()
