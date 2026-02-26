@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 from pathlib import Path
 import os
-import shlex
 from typing import Any, Optional
 import importlib.util
 import glob
@@ -22,13 +21,9 @@ _EXTENSION_MODULE: Optional[Any] = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
-
-def get_env_path(var_name, relative_path_str):
-    val = os.environ.get(var_name)
-    if val is None:
-        # Join the file's dir with the relative path and make it absolute
-        return str((BASE_DIR / relative_path_str).resolve())
-    return val
+REPO_ROOT = BASE_DIR.parent
+CLICKHOUSE_ROOT = (REPO_ROOT / "libs" / "clickhouse-cpp").resolve()
+CLICKHOUSE_LIB_DIR = (CLICKHOUSE_ROOT / "build" / "clickhouse").resolve()
 
 
 _NATIVE_EXPORTS = (
@@ -104,22 +99,11 @@ def _load_extension() -> Any:
         extra_ldflags.append("-flto")
 
 
-    # ---- ClickHouse C++ client (matches Makefile env knobs) ----
-    # CLICKHOUSE_INCLUDE: path to headers (e.g. /usr/local/include)
-    # CLICKHOUSE_LIB_DIR: path to libs    (e.g. /usr/local/lib)
-    # CLICKHOUSE_LIBS:    link flags      (default: -lclickhouse-cpp-lib)
-    ch_include = get_env_path("CLICKHOUSE_INCLUDE", "../libs/clickhouse-cpp")
-    if ch_include:
-        extra_cflags.append(f"-I{ch_include}")
-        extra_cuda_cflags.append(f"-I{ch_include}")
-
-    ch_lib_dir = get_env_path("CLICKHOUSE_LIB_DIR", "../libs/clickhouse-cpp/build/clickhouse")
-    if ch_lib_dir:
-        extra_ldflags.extend([f"-L{ch_lib_dir}", f"-Wl,-rpath,{ch_lib_dir}"])
-
-    ch_libs = os.environ.get("CLICKHOUSE_LIBS", "-lclickhouse-cpp-lib").strip()
-    if ch_libs:
-        extra_ldflags.extend(shlex.split(ch_libs))
+    # ---- ClickHouse C++ client (fixed in-repo paths) ----
+    extra_cflags.append(f"-I{CLICKHOUSE_ROOT}")
+    extra_cuda_cflags.append(f"-I{CLICKHOUSE_ROOT}")
+    extra_ldflags.extend([f"-L{CLICKHOUSE_LIB_DIR}", f"-Wl,-rpath,{CLICKHOUSE_LIB_DIR}"])
+    extra_ldflags.append("-lclickhouse-cpp-lib")
 
     try:
         _EXTENSION_MODULE = load_extension(
