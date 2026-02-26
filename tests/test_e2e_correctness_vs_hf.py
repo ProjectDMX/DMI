@@ -1,5 +1,5 @@
 # tests/test_e2e_correctness_vs_hf.py
-
+# PYTHONPATH=./:./monitoring:$PYTHONPATH E2E_PRINT_TEXT=1 E2E_HF_DROP_LAST_TOKEN=1 E2E_PRINT_TOPK_LOGITS=1 pytest -q -s tests/test_e2e_correctness_vs_hf.py
 """E2E correctness test: monitoring DB vs HuggingFace Transformers (HF-driven ground truth).
 
 This test runs the repo monitoring pipeline end-to-end (native backend + host engine + ClickHouse),
