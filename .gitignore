@@ -55,3 +55,7 @@ Thumbs.db
 # Benchmark outputs
 benchmark/figures/
 *.nsys-rep
+
+# Node.js
+node_modules/
+package-lock.json
