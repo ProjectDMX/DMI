@@ -81,18 +81,27 @@ def _wait_native_drain_without_resolve(engine: MonitoringEngine, timeout_s: floa
     backend = getattr(engine, "_native_backend", None)
     assert backend is not None
     deadline = time.perf_counter() + timeout_s
-    last_dbg = None
+    last_state = None
+    use_debug_state = hasattr(backend, "debug_state")
     while time.perf_counter() < deadline:
-        last_dbg = backend.debug_state()
-        if (
-            int(last_dbg.get("pending_tasks", -1)) == 0
-            and int(last_dbg.get("queue_size", -1)) == 0
-            and int(last_dbg.get("open_steps", -1)) == 0
-            and int(last_dbg.get("sealed_steps", -1)) == 0
-        ):
-            return
+        if use_debug_state:
+            last_state = backend.debug_state()
+            if (
+                int(last_state.get("pending_tasks", -1)) == 0
+                and int(last_state.get("queue_size", -1)) == 0
+                and int(last_state.get("open_steps", -1)) == 0
+                and int(last_state.get("sealed_steps", -1)) == 0
+            ):
+                return
+        else:
+            last_state = backend.get_stats()
+            if (
+                int(last_state.get("inflight_bytes", -1)) == 0
+                and int(last_state.get("host_copy_queue_depth", 0)) == 0
+            ):
+                return
         time.sleep(0.05)
-    pytest.fail(f"native backend did not drain without resolve_all: {last_dbg}")
+    pytest.fail(f"native backend did not drain without resolve_all: {last_state}")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
