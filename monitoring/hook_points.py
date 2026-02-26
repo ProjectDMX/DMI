@@ -980,12 +980,8 @@ class HookedRootModule(nn.Module):
                     pos_dim = -2
 
                 if engine is not None and not is_backward:
-                    if native_callback_active:
-                        cache[hook_name] = None
-                        return
-                    raise RuntimeError(
-                        "MonitoringEngine native callback backend is required; Python fallback path was removed"
-                    )
+                    cache[hook_name] = None
+                    return
 
                 # sync build（进入同步分支到移动前的轻量准备）
                 t_sb0 = time.perf_counter() if _hook_stats_enabled() else None
