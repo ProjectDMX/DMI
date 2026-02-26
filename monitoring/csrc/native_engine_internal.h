@@ -112,7 +112,11 @@ struct NativeMonitoringEngine::Impl {
   // Lifecycle
   Impl(int64_t queue_size,
        std::optional<at::ScalarType> cache_dtype,
-       int64_t delay_steps);
+       int64_t delay_steps,
+       const std::vector<int64_t>& pinpool_bins_kb,
+       int64_t pinpool_max_mb,
+       int64_t host_copy_threads,
+       int64_t host_copy_queue_size);
   ~Impl();
 
   // Public API (mirrors NativeMonitoringEngine)
@@ -138,10 +142,6 @@ struct NativeMonitoringEngine::Impl {
                                bool cap_enabled,
                                double cap_ratio,
                                int64_t driver_guard_mb);
-
-  std::vector<int64_t> submit_step_soa(int64_t step_id,
-                                       const py::dict& spec,
-                                       std::optional<uint64_t> stream_handle);
 
   int64_t add_task(int64_t step_id, const py::tuple& task_tuple);
   void seal_step(int64_t step_id, std::optional<uint64_t> stream_handle);
@@ -215,10 +215,6 @@ struct NativeMonitoringEngine::Impl {
   void record_step_name_token(int64_t step_id, const std::string& name, int64_t token, int64_t task_size);
 
   // Data ----------------------------------------------------------------
-  // D2H offload controls
-  bool move_to_cpu_{false};
-  bool use_pinned_{true};
-
   // Pinned memory pool (for stable GPU->CPU offload throughput)
   struct PinnedBlock {
     at::Tensor buf;              // 1D pinned tensor with element dtype
@@ -229,7 +225,6 @@ struct NativeMonitoringEngine::Impl {
   };
 
   // Pool controls and state
-  bool enable_pinpool_{false};
   size_t pinpool_max_bytes_{512ull * 1024ull * 1024ull}; // total pool cap
   std::vector<size_t> pinpool_bins_bytes_; // capacity bins in bytes (ascending)
 

@@ -235,13 +235,11 @@ Optional DB overrides:
 
 ## Run Benchmark
 
-## Environment Variables for Benchmarks
+## Benchmark Runtime Config
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MON_NATIVE_CALLBACK` | `1` | Use C++ callbacks (faster) |
-| `MON_NATIVE_BATCH` | `1` | Batch hook submissions |
-| `MON_NATIVE_TO_CPU` | `1` | Enable async GPU→CPU transfer |
+- Runtime env toggles under `MON_NATIVE_*` are removed.
+- Use `MonitoringConfig` for runtime tuning (`advance.*`) and debug behavior (`debug`).
+- For benchmark scripts that expose it, use `--nvtx` to enable debug/NVTX (`MonitoringConfig.debug=True`).
 
 ### Args
 ```bash
@@ -257,10 +255,10 @@ Compares multiple inference approaches (TransformerLens, HuggingFace, HookedGPT2
 
 
 # Basic run
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python -m benchmark.tests.profile_decode_qwen3 --batch-size 1 --steps 1 --warmup 1 --collect-hidden --collect-attention --no-profile --dtype fp16
+python -m benchmark.tests.profile_decode_qwen3 --batch-size 1 --steps 1 --warmup 1 --collect-hidden --collect-attention --no-profile --dtype fp16
 
 # With nsight profiling
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 TL_ENABLE_NVTX=1 nsys profile --output=your_results_path/xxx --force-overwrite=true --trace=cuda,nvtx,osrt --sample=cpu --sampling-period=1000000 --cpuctxsw=process-tree --cuda-memory-usage=false  python benchmark/tests/profile_decode.py. --profile-dir your_results_dir/xxx. --batch-size 64  --decode-steps 64  --collect-hidden  --collect-attention  --steps 1  --warmup 1  --no-profile
+nsys profile --output=your_results_path/xxx --force-overwrite=true --trace=cuda,nvtx,osrt --sample=cpu --sampling-period=1000000 --cpuctxsw=process-tree --cuda-memory-usage=false python -m benchmark.tests.profile_decode --profile-dir your_results_dir/xxx --batch-size 64 --decode-steps 64 --collect-hidden --collect-attention --steps 1 --warmup 1 --no-profile --nvtx
 
 **Tested configurations:**
 - `transformer_lens` / `transformer_lens_cache` - Original TransformerLens
@@ -272,7 +270,7 @@ MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 TL_ENABLE_NVTX=1 nsys profile --output
 Tests different MonitoringConfig settings (full capture vs sampled):
 
 ```bash
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/tests/hf_modified_async_config_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
+python benchmark/tests/hf_modified_async_config_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
 ```
 
 ### hf_modified_async_config_token_stride_benchmark.py - Token Stride Impact
@@ -280,7 +278,7 @@ MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/te
 Measures performance impact of different `step_stride` values:
 
 ```bash
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/tests/hf_modified_async_config_token_stride_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
+python benchmark/tests/hf_modified_async_config_token_stride_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
 ```
 
 Tests strides: `[1, 10, 30, 400]` - higher stride = fewer captures = faster
@@ -290,7 +288,7 @@ Tests strides: `[1, 10, 30, 400]` - higher stride = fewer captures = faster
 Measures performance impact of different `request_stride` values:
 
 ```bash
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/tests/hf_modified_async_config_request_stride_benchmark.py --batch-size 64 --steps 10 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention —no-profile
+python benchmark/tests/hf_modified_async_config_request_stride_benchmark.py --batch-size 64 --steps 10 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention --no-profile
 ```
 
 Tests strides: `[1, 2, 5, 100]` - higher stride = skip more requests -->

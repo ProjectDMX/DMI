@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from collections import Counter
-import os
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import torch
@@ -15,13 +13,6 @@ from .utils import Slice
 # A lightweight payload that can be consumed directly by the native backend.
 SlicePayload = Tuple[Any, ...]
 NativePayload = Tuple[object, int, bool, bool, SlicePayload, Optional[torch.device]]
-
-# Optional slice mode statistics (guarded by env var)
-_SLICE_STATS_ENABLED = bool(int(os.environ.get("MON_ENGINE_SLICE_STATS", "0")))
-_slice_stats: Counter[str] = Counter()
-
-def get_slice_stats() -> Dict[str, int]:
-    return dict(_slice_stats)
 
 
 @dataclass
@@ -59,30 +50,20 @@ def _encode_slice(slice_obj: Any) -> SlicePayload:
     """Encode slice metadata into a compact tuple for native consumption."""
 
     if slice_obj is None:
-        if _SLICE_STATS_ENABLED:
-            _slice_stats["identity"] += 1
         return ("identity",)
 
     if Slice is not None and isinstance(slice_obj, Slice):  # pragma: no cover - optional path
         mode = getattr(slice_obj, "mode", "identity")
         data = getattr(slice_obj, "slice", None)
         if mode == "identity":
-            if _SLICE_STATS_ENABLED:
-                _slice_stats["identity"] += 1
             return ("identity",)
         if mode == "int":
-            if _SLICE_STATS_ENABLED:
-                _slice_stats["int"] += 1
             return ("int", int(data) if data is not None else 0)
         if mode == "slice":
             if isinstance(data, slice):
-                if _SLICE_STATS_ENABLED:
-                    _slice_stats["slice"] += 1
                 return ("slice", data.start, data.stop, data.step)
             return ("slice", None, None, None)
         if mode == "array":
-            if _SLICE_STATS_ENABLED:
-                _slice_stats["array"] += 1
             if data is None:
                 values: Tuple[int, ...] = ()
             elif hasattr(data, "tolist"):
@@ -95,22 +76,14 @@ def _encode_slice(slice_obj: Any) -> SlicePayload:
     slice_type = type(slice_obj)
 
     if slice_type is int:
-        if _SLICE_STATS_ENABLED:
-            _slice_stats["int"] += 1
         return ("int", int(slice_obj))
 
     if slice_type is slice:
-        if _SLICE_STATS_ENABLED:
-            _slice_stats["slice"] += 1
         return ("slice", slice_obj.start, slice_obj.stop, slice_obj.step)
 
     if slice_type in (list, tuple):
-        if _SLICE_STATS_ENABLED:
-            _slice_stats["array"] += 1
         return ("array", tuple(int(v) for v in slice_obj))
 
-    if _SLICE_STATS_ENABLED:
-        _slice_stats["identity"] += 1
     return ("identity",)
 
 
@@ -120,30 +93,20 @@ def _encode_slice_native(slice_obj: Any) -> SlicePayload:
     Codes: 0=identity, 1=int, 2=slice, 3=array
     """
     if slice_obj is None:
-        if _SLICE_STATS_ENABLED:
-            _slice_stats["identity"] += 1
         return (0,)
 
     if Slice is not None and isinstance(slice_obj, Slice):  # pragma: no cover
         mode = getattr(slice_obj, "mode", "identity")
         data = getattr(slice_obj, "slice", None)
         if mode == "identity":
-            if _SLICE_STATS_ENABLED:
-                _slice_stats["identity"] += 1
             return (0,)
         if mode == "int":
-            if _SLICE_STATS_ENABLED:
-                _slice_stats["int"] += 1
             return (1, int(data) if data is not None else 0)
         if mode == "slice":
             if isinstance(data, slice):
-                if _SLICE_STATS_ENABLED:
-                    _slice_stats["slice"] += 1
                 return (2, data.start, data.stop, data.step)
             return (2, None, None, None)
         if mode == "array":
-            if _SLICE_STATS_ENABLED:
-                _slice_stats["array"] += 1
             if data is None:
                 values: Tuple[int, ...] = ()
             elif hasattr(data, "tolist"):
@@ -151,25 +114,15 @@ def _encode_slice_native(slice_obj: Any) -> SlicePayload:
             else:
                 values = tuple(int(v) for v in data)
             return (3, values)
-        if _SLICE_STATS_ENABLED:
-            _slice_stats["identity"] += 1
         return (0,)
 
     t = type(slice_obj)
     if t is int:
-        if _SLICE_STATS_ENABLED:
-            _slice_stats["int"] += 1
         return (1, int(slice_obj))
     if t is slice:
-        if _SLICE_STATS_ENABLED:
-            _slice_stats["slice"] += 1
         return (2, slice_obj.start, slice_obj.stop, slice_obj.step)
     if t in (list, tuple):
-        if _SLICE_STATS_ENABLED:
-            _slice_stats["array"] += 1
         return (3, tuple(int(v) for v in slice_obj))
-    if _SLICE_STATS_ENABLED:
-        _slice_stats["identity"] += 1
     return (0,)
 
 

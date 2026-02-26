@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import os
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -70,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nvtx",
         action="store_true",
-        help="Enable NVTX annotations inside hook points (sets TL_ENABLE_NVTX=1)",
+        help="Enable NVTX annotations inside hook points (enables MonitoringConfig.debug)",
     )
     parser.add_argument(
         "--collect-hidden",
@@ -535,9 +534,6 @@ def setup_hf_decode_hook(
 def main() -> None:
     args = parse_args()
 
-    if args.nvtx:
-        os.environ.setdefault("TL_ENABLE_NVTX", "1")
-
     device = pick_device(args.device)
     hf_dtype = map_hf_dtype(args.dtype)
 
@@ -957,7 +953,7 @@ def main() -> None:
         cache_dtype=cache_dtype,
         queue_size=args.engine_queue_size,
         delay_steps=args.engine_delay_steps,
-        config=MonitoringConfig(),
+        config=MonitoringConfig(debug=args.nvtx),
     )
     hf_hooked_model.monitoring_engine = None
     engine_init_ms = 0.0
@@ -1075,12 +1071,10 @@ def main() -> None:
         print("\nProfiler traces written under:")
         print(f"  {traces_path.resolve()}")
     if args.nvtx and device.type == "cuda":
-        print("NVTX annotations enabled for hook point decode paths (set TL_ENABLE_NVTX=1).")
+        print("NVTX annotations enabled for hook point decode paths (MonitoringConfig.debug=True).")
 
-    # If engine stats are enabled, also print hook-side stats even for sync baselines.
     try:
-        import os as _os
-        if bool(int(_os.environ.get("MON_ENGINE_STATS", "0"))):
+        if args.nvtx:
             from monitoring.hook_points import get_monitoring_hook_stats
             _hook_stats = get_monitoring_hook_stats()
             if _hook_stats:

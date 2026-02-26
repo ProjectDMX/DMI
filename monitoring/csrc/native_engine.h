@@ -19,7 +19,11 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
  public:
   NativeMonitoringEngine(int64_t queue_size,
                          std::optional<at::ScalarType> cache_dtype,
-                         int64_t delay_steps);
+                         int64_t delay_steps,
+                         const std::vector<int64_t>& pinpool_bins_kb,
+                         int64_t pinpool_max_mb,
+                         int64_t host_copy_threads,
+                         int64_t host_copy_queue_size);
   ~NativeMonitoringEngine();
 
   py::dict get_stats();
@@ -44,11 +48,6 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
                                bool cap_enabled,
                                double cap_ratio,
                                int64_t driver_guard_mb);
-
-  // Struct-of-arrays submit to minimize Python overhead
-  std::vector<int64_t> submit_step_soa(int64_t step_id,
-                                       const py::dict& spec,
-                                       std::optional<uint64_t> stream_handle);
 
   // Low-overhead single task append
   int64_t add_task(int64_t step_id, const py::tuple& task_tuple);
@@ -135,7 +134,11 @@ class BackendFuture {
 
 std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,
                                                       py::object cache_dtype,
-                                                      int64_t delay_steps);
+                                                      int64_t delay_steps,
+                                                      const std::vector<int64_t>& pinpool_bins_kb,
+                                                      int64_t pinpool_max_mb,
+                                                      int64_t host_copy_threads,
+                                                      int64_t host_copy_queue_size);
 
 }  // namespace monitoring
 

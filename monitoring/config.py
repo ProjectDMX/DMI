@@ -135,12 +135,36 @@ class NativePartialSealConfig:
 
 
 @dataclass
+class AdvanceConfig:
+    """Advanced native runtime controls."""
+
+    pinpool_bins_kb: Sequence[int] = (256, 512, 1024, 2048, 4096, 8192)
+    pinpool_max_mb: int = 512
+    host_copy_threads: int = 0
+    host_copy_queue_size: int = 512
+
+    def __post_init__(self) -> None:
+        bins = tuple(int(v) for v in self.pinpool_bins_kb if int(v) > 0)
+        if not bins:
+            raise ValueError("pinpool_bins_kb must contain at least one positive integer.")
+        if self.pinpool_max_mb <= 0:
+            raise ValueError("pinpool_max_mb must be > 0.")
+        if self.host_copy_threads < 0:
+            raise ValueError("host_copy_threads must be >= 0.")
+        if self.host_copy_queue_size <= 0:
+            raise ValueError("host_copy_queue_size must be > 0.")
+        self.pinpool_bins_kb = bins
+
+
+@dataclass
 class MonitoringConfig:
     """Bundle hook selection and capture schedule for the monitoring engine."""
 
     hooks: HookSelection = field(default_factory=HookSelection)
     schedule: CaptureSchedule = field(default_factory=CaptureSchedule)
     native_partial_seal: NativePartialSealConfig = field(default_factory=NativePartialSealConfig)
+    advance: AdvanceConfig = field(default_factory=AdvanceConfig)
+    debug: bool = False
     no_strip: bool = field(default=False)
 
     def as_dict(self) -> dict[str, object]:
@@ -169,4 +193,12 @@ class MonitoringConfig:
                 "cap_ratio": self.native_partial_seal.cap_ratio,
                 "driver_guard_mb": self.native_partial_seal.driver_guard_mb,
             },
+            "advance": {
+                "pinpool_bins_kb": list(self.advance.pinpool_bins_kb),
+                "pinpool_max_mb": self.advance.pinpool_max_mb,
+                "host_copy_threads": self.advance.host_copy_threads,
+                "host_copy_queue_size": self.advance.host_copy_queue_size,
+            },
+            "debug": bool(self.debug),
+            "no_strip": bool(self.no_strip),
         }

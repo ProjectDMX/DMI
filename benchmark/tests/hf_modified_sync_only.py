@@ -160,10 +160,6 @@ def run_decode_loop(
 def main() -> None:
     args = parse_args()
 
-    if args.nvtx:
-        import os
-        os.environ.setdefault("TL_ENABLE_NVTX", "1")
-
     device = pick_device(args.device)
     dtype = map_dtype(args.dtype)
 
@@ -328,7 +324,7 @@ def main() -> None:
     if not args.no_profile:
         print(f"\nProfiler traces written under: {traces_path.resolve()}")
     if args.nvtx and device.type == "cuda":
-        print("NVTX annotations enabled (set TL_ENABLE_NVTX=1).")
+        print("NVTX annotations enabled (MonitoringConfig.debug=True).")
 
 
 if __name__ == "__main__":

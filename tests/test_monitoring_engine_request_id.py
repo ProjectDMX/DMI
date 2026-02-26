@@ -48,8 +48,6 @@ def _build_engine_for_db_step_unit() -> tuple[MonitoringEngine, _DummyHostEngine
     engine._host_engine_enabled = True
     engine._using_native_backend = True
     engine._capture_enabled = True
-    engine._native_builder_enabled = True
-    engine._native_callback_enabled = True
     return engine, host
 
 

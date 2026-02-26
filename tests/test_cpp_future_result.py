@@ -1,4 +1,3 @@
-import os
 import time
 
 import pytest
@@ -40,12 +39,7 @@ def _wait_native_drain_without_resolve(engine: MonitoringEngine, timeout_s: floa
     pytest.fail(f"native backend did not drain without resolve_all: {last_dbg}")
 
 
-def test_cpp_future_result_with_end_step_flow(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Use the default async offload path to better match real runs.
-    monkeypatch.setenv("MON_NATIVE_TO_CPU", "1")
-    monkeypatch.setenv("MON_NATIVE_PINNED", "1")
-    monkeypatch.setenv("MON_NATIVE_PINPOOL", "1")
-
+def test_cpp_future_result_with_end_step_flow() -> None:
     engine = MonitoringEngine(async_enabled=True)
     device = torch.device("cuda")
 
@@ -97,13 +91,7 @@ def test_cpp_future_result_with_end_step_flow(monkeypatch: pytest.MonkeyPatch) -
         engine.close()
 
 
-def test_cpp_backendfuture_result_does_not_block_engine_close(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("MON_NATIVE_TO_CPU", "1")
-    monkeypatch.setenv("MON_NATIVE_PINNED", "1")
-    monkeypatch.setenv("MON_NATIVE_PINPOOL", "1")
-
+def test_cpp_backendfuture_result_does_not_block_engine_close() -> None:
     engine = MonitoringEngine(async_enabled=True)
     device = torch.device("cuda")
 

@@ -8,7 +8,6 @@ arrives we retain a Python fallback that mirrors the established behaviour.
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from collections import deque
@@ -19,7 +18,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, 
 import torch
 
 from .task import CacheFuture, MonitoringTask
-from .config import MonitoringConfig
+from .config import AdvanceConfig, MonitoringConfig
 
 from .utils import Slice
 
@@ -78,8 +77,9 @@ class MonitoringEngine:
         self.async_enabled = async_enabled
         self.cache_dtype = cache_dtype
         self._delay_steps = max(0, int(delay_steps))
-        self._debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
         self.config = config
+        self._debug_enabled = bool(self.config.debug) if self.config is not None else False
+        self._nvtx_enabled = self._debug_enabled
         self._no_strip = False if config is None else config.no_strip
         self._request_capture_enabled = True
         self._capture_enabled = True
@@ -87,6 +87,7 @@ class MonitoringEngine:
         self._hook_cache_key: Optional[int] = None
         self._hook_cache_list: Optional[List[str]] = None
         self._hook_cache_set: Optional[set[str]] = None
+        self._sync_hook_debug_flag()
 
         self._current_step_id: int = 0
         self._pending_tasks: Dict[int, List[Tuple[MonitoringTask, CacheFuture]]] = {}
@@ -111,7 +112,13 @@ class MonitoringEngine:
         self._host_engine_enabled = False
 
         if async_enabled and torch.cuda.is_available():
-            native_backend = _load_native_backend(queue_size, cache_dtype, self._delay_steps)
+            advance_cfg = self.config.advance if self.config is not None else AdvanceConfig()
+            native_backend = _load_native_backend(
+                queue_size,
+                cache_dtype,
+                self._delay_steps,
+                advance_cfg,
+            )
             if native_backend is not None:
                 self._backend = native_backend
                 self._native_backend = native_backend
@@ -128,7 +135,6 @@ class MonitoringEngine:
                     queue_size=queue_size,
                     cache_dtype=cache_dtype,
                     delay_steps=self._delay_steps,
-                    debug=self._debug,
                 )
                 self._backend = python_backend
                 self._python_backend = python_backend
@@ -167,16 +173,8 @@ class MonitoringEngine:
                     raise RuntimeError("Failed to start host_engine") from exc
                 self._host_engine_enabled = True
 
-        # Native batch (SoA) aggregation buffers (optional)
-        self._native_batch_enabled = bool(int(os.environ.get("MON_NATIVE_BATCH", "0")))
-        # Native builder (C++-side append of hooks) – strongest offload
-        self._native_builder_enabled = bool(int(os.environ.get("MON_NATIVE_BUILDER", "1")))
-        # Native callback (C++ hook) – eliminates Python hook overhead
-        self._native_callback_enabled = bool(int(os.environ.get("MON_NATIVE_CALLBACK", "1")))
-        self._native_batch: Dict[int, Dict[str, list]] = {}
-
         # Stats (optional) --------------------------------------------------
-        self._stats_enabled = bool(int(os.environ.get("MON_ENGINE_STATS", "0")))
+        self._stats_enabled = self._debug_enabled
         self._stats_hooks = 0
         self._stats_steps = 0
         self._stats_tasks = 0
@@ -217,8 +215,6 @@ class MonitoringEngine:
         bucket.append((task, future))
         if self._stats_enabled:
             self._stats_hooks += 1
-        if self._debug:
-            print(f"[MonEng] submit step={step_id} bucket_size={len(bucket)}")
 
         return future
 
@@ -234,7 +230,7 @@ class MonitoringEngine:
         except Exception:
             _nvtx = None  # type: ignore
 
-        if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+        if _nvtx is not None and self._nvtx_enabled:
             _nvtx.range_push("MonEng::PyStartStep")
 
         phase_code = 0
@@ -258,10 +254,8 @@ class MonitoringEngine:
             backend = self._native_backend
             if backend is not None:
                 backend.begin_step(int(self._current_step_id), phase_code)
-        if self._debug:
-            print(f"[MonEng] start_step -> step_id={self._current_step_id}")
 
-        if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+        if _nvtx is not None and self._nvtx_enabled:
             _nvtx.range_pop()
 
     def begin_request(self, request_id: int) -> None:
@@ -356,6 +350,18 @@ class MonitoringEngine:
             int(schedule.warmup_requests),
         )
 
+    def _sync_hook_debug_flag(self) -> None:
+        """Propagate debug mode to hook_points module without hard import coupling."""
+
+        try:
+            from . import hook_points  # local import to avoid import cycle at module load
+
+            setter = getattr(hook_points, "set_monitoring_debug", None)
+            if setter is not None:
+                setter(self._debug_enabled)
+        except Exception:
+            pass
+
     def _apply_native_runtime_config(self) -> None:
         if not self._native_backend or self.config is None:
             return
@@ -385,10 +391,6 @@ class MonitoringEngine:
         if self._model_id is None:
             return
         if not self._capture_enabled:
-            return
-
-        # Require native callback path to populate futures in cache_dict.
-        if not (self._native_builder_enabled and self._native_callback_enabled):
             return
 
         if input_ids is None or not hasattr(input_ids, "shape"):
@@ -445,11 +447,6 @@ class MonitoringEngine:
             self._active_batch_request_ids = [f"{gid}:{i}" for i in range(batch_size)]
             self._active_batch_start_idx_per_request = [0] * batch_size
             self._active_batch_finished_per_request = [False] * batch_size
-            if not is_prefill and self._debug:
-                print(
-                    "[MonEng] _register_db_step decode-path fallback init/reset "
-                    f"(batch_size={batch_size})"
-                )
 
         req_ids = self._active_batch_request_ids
         starts = self._active_batch_start_idx_per_request
@@ -460,22 +457,14 @@ class MonitoringEngine:
         token_ranges: List[Tuple[int, int]] = []
         if is_prefill:
             if attention_mask is None or not hasattr(attention_mask, "dim"):
-                if self._debug:
-                    print("[MonEng] skip db step: prefill requires attention_mask [B, L]")
                 return
             if int(attention_mask.dim()) != 2:
-                if self._debug:
-                    print("[MonEng] skip db step: prefill requires 2D attention_mask [B, L]")
                 return
             try:
                 lengths = attention_mask.sum(dim=1).tolist() if not self._no_strip else [attention_mask.shape[1]] * attention_mask.shape[0]
             except Exception:
-                if self._debug:
-                    print("[MonEng] skip db step: failed to compute lengths from attention_mask")
                 return
             if len(lengths) != batch_size:
-                if self._debug:
-                    print("[MonEng] skip db step: attention_mask batch mismatch")
                 return
             for i in range(batch_size):
                 start_i = int(starts[i])
@@ -549,9 +538,8 @@ class MonitoringEngine:
                 [token_ranges],  # N=1 in V1
                 [cache_dict],    # N=1 in V1
             )
-        except Exception as exc:
-            if self._debug:
-                print(f"[MonEng] host_engine.submit failed: {exc}")
+        except Exception:
+            pass
         finally:
             self._pending_db_step = None
 
@@ -566,16 +554,11 @@ class MonitoringEngine:
             from torch.cuda import nvtx as _nvtx  # type: ignore
         except Exception:
             _nvtx = None  # type: ignore
-        if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+        if _nvtx is not None and self._nvtx_enabled:
             _nvtx.range_push("MonEng::PyEndStep")
 
         step_id = self._current_step_id
         tasks = self._pending_tasks.pop(step_id, [])
-
-        if self._debug:
-            print(
-                f"[MonEng] end_step step_id={step_id} tasks={len(tasks)} delay={self._delay_steps}"
-            )
 
         try:
             producer_stream = torch.cuda.current_stream()
@@ -591,32 +574,6 @@ class MonitoringEngine:
                 import time
                 _t_end0 = time.perf_counter()
             stream_handle = _stream_to_handle(producer_stream)
-            # Prefer native batch (SoA) if enabled and we have aggregated specs
-            if self._native_batch_enabled and step_id in self._native_batch:
-                spec = self._native_batch.pop(step_id, {})
-                if spec.get("tensors"):
-                    if self._stats_enabled:
-                        import time
-                        t0 = time.perf_counter()
-                        _ = backend.submit_step_soa(step_id, spec, stream_handle)
-                        self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
-                        self._stats_steps += 1
-                        self._stats_tasks += len(spec.get("tensors", []))
-                    else:
-                        getattr(backend, "submit_step_soa")(step_id, spec, stream_handle)
-                else:
-                    # No tasks actually aggregated; seal to maintain ordering
-                    backend.seal_step(step_id, stream_handle)
-                self._submit_pending_db_step()
-                if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
-                    _nvtx.range_pop()
-                if _t_end0 is not None:
-                    _dt = (time.perf_counter() - _t_end0) * 1000.0
-                    self._stats_endstep_ms_total += _dt
-                    self._stats_endstep_calls += 1
-                    if _dt > self._stats_endstep_ms_max:
-                        self._stats_endstep_ms_max = _dt
-                return
 
             if tasks:
                 # Build tuple payloads (measure serialize cost) and submit.
@@ -659,7 +616,7 @@ class MonitoringEngine:
                 else:
                     backend.seal_step(step_id, stream_handle)
             self._submit_pending_db_step()
-            if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+            if _nvtx is not None and self._nvtx_enabled:
                 _nvtx.range_pop()
             if _t_end0 is not None:
                 _dt = (time.perf_counter() - _t_end0) * 1000.0
@@ -671,11 +628,11 @@ class MonitoringEngine:
 
         backend = self._python_backend
         if backend is None:
-            if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+            if _nvtx is not None and self._nvtx_enabled:
                 _nvtx.range_pop()
             return
         backend.submit_step(step_id, tasks, producer_stream)
-        if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+        if _nvtx is not None and self._nvtx_enabled:
             _nvtx.range_pop()
         if self._stats_enabled:
             import time
@@ -747,9 +704,6 @@ class MonitoringEngine:
 
     def close(self) -> None:
         """Tear down backend resources."""
-        _debug = bool(int(os.environ.get("MON_ENGINE_DEBUG", "0")))
-        if _debug:
-            print("[MonEng] close() called")
         self._pending_db_step = None
         self._active_batch_request_ids = None
         self._active_batch_start_idx_per_request = None
@@ -803,15 +757,6 @@ class MonitoringEngine:
                         pass
                 # Optional: slice mode stats
                 try:
-                    from .task import get_slice_stats  # type: ignore
-                    slice_stats = get_slice_stats()
-                    if slice_stats:
-                        print("[MonEng/SliceStats]", slice_stats)
-                except Exception:
-                    pass
-                # Hook-side stats from TL integration (optional)
-                try:
-                    # The hook module path in this repo
                     from monitoring.hook_points import get_monitoring_hook_stats
                     hook_stats = get_monitoring_hook_stats()
                     if hook_stats:
@@ -825,14 +770,8 @@ class MonitoringEngine:
                     pass
                 self._host_engine = None
                 self._host_engine_enabled = False
-            if _debug:
-                print("[MonEng] calling clear_completed_results()")
             self.clear_completed_results()
-            if _debug:
-                print("[MonEng] calling backend.close()")
             backend.close()
-            if _debug:
-                print("[MonEng] backend.close() returned")
             self._native_backend = None
             self._backend = None
             return
@@ -849,11 +788,10 @@ class MonitoringEngine:
 
         if self._using_native_backend and self._native_backend is not None:
             try:
-                import torch
                 from torch.cuda import nvtx as _nvtx  # type: ignore
             except Exception:
                 _nvtx = None  # type: ignore
-            if _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))):
+            if _nvtx is not None and self._nvtx_enabled:
                 _nvtx.range_push("MonEng::PyClearResults")
                 try:
                     self._native_backend.clear_completed_results()
@@ -885,6 +823,7 @@ def _load_native_backend(
     queue_size: int,
     cache_dtype: Optional[torch.dtype],
     delay_steps: int,
+    advance: AdvanceConfig,
 ) -> Optional[Any]:
     """Attempt to load the native backend extension.
 
@@ -902,6 +841,10 @@ def _load_native_backend(
             queue_size=queue_size,
             cache_dtype=cache_dtype,
             delay_steps=delay_steps,
+            pinpool_bins_kb=list(advance.pinpool_bins_kb),
+            pinpool_max_mb=int(advance.pinpool_max_mb),
+            host_copy_threads=int(advance.host_copy_threads),
+            host_copy_queue_size=int(advance.host_copy_queue_size),
         )
     except Exception:
         return None
@@ -1024,10 +967,8 @@ class _PythonBackend:
         queue_size: int,
         cache_dtype: Optional[torch.dtype],
         delay_steps: int,
-        debug: bool,
     ) -> None:
         self.cache_dtype = cache_dtype
-        self._debug = debug
         self._delay_steps = delay_steps
 
         if queue_size > 0:
@@ -1057,17 +998,13 @@ class _PythonBackend:
             self._step_buckets[step_id] = tasks_list
             self._sealed_steps.append(step_id)
 
-        if not tasks_list and self._debug:
-            print(f"[MonEng/Py] sealed empty step={step_id}")
-
         if tasks_list:
             self._ensure_started()
             if self._cache_stream is not None and producer_stream is not None:
                 try:
                     self._cache_stream.wait_stream(producer_stream)
                 except Exception:
-                    if self._debug:
-                        print(f"[MonEng/Py] wait_stream failed for step={step_id}")
+                    pass
 
         self._enqueue_ready_steps()
 
@@ -1113,8 +1050,6 @@ class _PythonBackend:
                 daemon=True,
             )
             self._worker.start()
-            if self._debug:
-                print("[MonEng/Py] worker started")
 
     def _enqueue_ready_steps(self) -> None:
         with self._lock:
@@ -1123,8 +1058,6 @@ class _PythonBackend:
                 tasks = self._step_buckets.pop(step_id, [])
                 if not tasks:
                     continue
-                if self._debug:
-                    print(f"[MonEng/Py] enqueue step={step_id} tasks={len(tasks)}")
                 self._queue.put(_StepWork(step_id, tasks))
 
     def _enqueue_all_steps(self) -> None:
@@ -1143,8 +1076,6 @@ class _PythonBackend:
             work = self._queue.get()
             if work is _QUEUE_SENTINEL:
                 self._queue.task_done()
-                if self._debug:
-                    print("[MonEng/Py] worker exiting")
                 break
 
             assert isinstance(work, _StepWork)

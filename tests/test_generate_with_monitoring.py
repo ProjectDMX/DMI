@@ -91,14 +91,7 @@ def _wait_native_drain_without_resolve(engine: MonitoringEngine, timeout_s: floa
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_generate_and_forward_collect_cpp_futures_and_consume_results(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("MON_NATIVE_TO_CPU", "1")
-    monkeypatch.setenv("MON_NATIVE_PINNED", "1")
-    monkeypatch.setenv("MON_NATIVE_PINPOOL", "1")
-    monkeypatch.setenv("MON_NATIVE_BUILDER", "1")
-    monkeypatch.setenv("MON_NATIVE_CALLBACK", "1")
-    monkeypatch.setenv("MON_NATIVE_BATCH", "0")
-
+def test_generate_and_forward_collect_cpp_futures_and_consume_results():
     model = _build_small_lm().to("cuda").eval()
     cfg = MonitoringConfig(hooks=HookSelection(mode="full"))
     engine = MonitoringEngine(async_enabled=True, config=cfg)

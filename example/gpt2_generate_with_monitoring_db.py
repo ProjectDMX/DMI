@@ -51,8 +51,8 @@ def _build_ingress_policy() -> EnqueuePolicy:
     return p
 
 
-def _build_host_config(db_cfg: ClickHouseClientConfig) -> HostEngineConfig:
-    stage_one = StageConfig.process_future(parallelism=1, name="process_future")
+def _build_host_config(db_cfg: ClickHouseClientConfig, *, debug: bool = False) -> HostEngineConfig:
+    stage_one = StageConfig.process_future(parallelism=1, name="process_future", debug=bool(debug))
     stage_two = StageConfig.clickhouse_insert(db_cfg, parallelism=1, name="clickhouse_insert")
 
     stage_one.input_queue = _build_queue_config(high_watermark_items=400)
@@ -65,12 +65,6 @@ def _build_host_config(db_cfg: ClickHouseClientConfig) -> HostEngineConfig:
     return HostEngineConfig(stages=[stage_one, stage_two])
 
 def main() -> None:
-    # Native backend must be enabled for DB futures.
-    os.environ.setdefault("MON_NATIVE_TO_CPU", "1")
-    os.environ.setdefault("MON_NATIVE_CALLBACK", "1")
-    os.environ.setdefault("MON_NATIVE_BUILDER", "1")
-    os.environ.setdefault("MON_NATIVE_BATCH", "0")
-
     if not torch.cuda.is_available():
         raise RuntimeError("This example requires CUDA + native backend.")
 
@@ -84,7 +78,7 @@ def main() -> None:
     )
 
     db_cfg = _build_db_config()
-    host_cfg = _build_host_config(db_cfg)
+    host_cfg = _build_host_config(db_cfg, debug=bool(cfg.debug))
     engine = MonitoringEngine(
         async_enabled=True,
         config=cfg,

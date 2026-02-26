@@ -10,6 +10,7 @@ from transformers import AutoTokenizer, LogitsProcessor
 from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
 
 from monitoring import (
+    AdvanceConfig,
     ClickHouseClientConfig,
     EnqueuePolicy,
     HostEngineConfig,
@@ -92,8 +93,8 @@ def _build_ingress_policy() -> EnqueuePolicy:
     return p
 
 
-def _build_host_config(db_cfg: ClickHouseClientConfig) -> HostEngineConfig:
-    stage_one = StageConfig.process_future(parallelism=1, name="process_future")
+def _build_host_config(db_cfg: ClickHouseClientConfig, *, debug: bool = False) -> HostEngineConfig:
+    stage_one = StageConfig.process_future(parallelism=1, name="process_future", debug=bool(debug))
     stage_two = StageConfig.clickhouse_insert(db_cfg, parallelism=1, name="clickhouse_insert")
     stage_one.input_queue = _build_queue_config()
     stage_two.input_queue = _build_queue_config()
@@ -269,14 +270,6 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this validation script.")
 
-    os.environ.setdefault("MON_NATIVE_TO_CPU", "1")
-    os.environ.setdefault("MON_NATIVE_CALLBACK", "1")
-    os.environ.setdefault("MON_NATIVE_BUILDER", "1")
-    os.environ.setdefault("MON_NATIVE_BATCH", "0")
-    os.environ.setdefault("MON_NATIVE_PINNED", "1")
-    os.environ.setdefault("MON_NATIVE_PINPOOL", "1")
-    os.environ.setdefault("MON_NATIVE_HOST_COPY_THREADS", "4")
-
     prompts = _load_prompts(args.prompts)
     device = torch.device(args.device)
 
@@ -307,13 +300,14 @@ def main() -> None:
             cap_ratio=0.8,
             driver_guard_mb=1024,
         ),
+        advance=AdvanceConfig(host_copy_threads=4),
     )
     # Enable decode-finished tracking in engine._register_db_step.
     cfg.eos_token_id = int(tokenizer.eos_token_id)
     cfg.pad_token_id = int(tokenizer.pad_token_id)
 
     db_cfg = _build_db_config(drop_existing=(not args.keep_existing_db))
-    host_cfg = _build_host_config(db_cfg)
+    host_cfg = _build_host_config(db_cfg, debug=bool(cfg.debug))
 
     engine = MonitoringEngine(
         async_enabled=True,

@@ -7,12 +7,17 @@
 namespace dmx_host {
 thread_local int worker_id;
 thread_local int contiguous_introduced_copy = 0;
+thread_local bool contiguous_copy_debug_log = false;
 
-void ProcessFutureStage::ThreadInit(int thread_idx){
+void ProcessFutureStage::ThreadInit(int thread_idx, bool debug_log){
     worker_id = thread_idx;
     contiguous_introduced_copy = 0;
+    contiguous_copy_debug_log = debug_log;
 }
 void ProcessFutureStage::ThreadCleanup() noexcept{
+    if (!contiguous_copy_debug_log) {
+        return;
+    }
     std::cout << "worker " << worker_id
               << " in future_process introduced "
               << contiguous_introduced_copy

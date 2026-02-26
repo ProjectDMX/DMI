@@ -138,7 +138,6 @@ def main() -> None:
     base_env = os.environ.copy()
     if args.nvtx:
         base_env["BENCH_NVTX"] = "1"
-        base_env.setdefault("TL_ENABLE_NVTX", "1")
 
     if args.monitor_mem:
         procs = _start_monitors(
