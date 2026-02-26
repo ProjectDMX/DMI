@@ -90,7 +90,7 @@ def test_host_copy_threads_zero_vs_parallel_consistent() -> None:
 
     base = torch.arange(64 * 128, dtype=torch.float32, device="cuda").reshape(64, 128)
 
-    def run_once(host_copy_threads: int) -> list[torch.Tensor]:
+    def run_once(host_copy_threads: int) -> tuple[list[torch.Tensor], dict]:
         cfg = MonitoringConfig(
             advance=AdvanceConfig(
                 host_copy_threads=host_copy_threads,
@@ -106,12 +106,22 @@ def test_host_copy_threads_zero_vs_parallel_consistent() -> None:
                 assert result.device.type == "cpu"
                 assert not result.is_pinned()
                 outputs.append(result)
+
+            backend = engine._native_backend
+            assert backend is not None
+            stats = backend.get_stats()
+            pool_hits = int(stats.get("pool_hits", 0))
+            pool_misses = int(stats.get("pool_misses", 0))
+            host_memcpy_mb = float(stats.get("host_memcpy_mb", 0.0))
+
+            assert pool_hits + pool_misses > 0
+            assert host_memcpy_mb > 0.0
         finally:
             engine.close()
-        return outputs
+        return outputs, stats
 
-    serial_outputs = run_once(host_copy_threads=0)
-    parallel_outputs = run_once(host_copy_threads=2)
+    serial_outputs, _ = run_once(host_copy_threads=0)
+    parallel_outputs, _ = run_once(host_copy_threads=2)
 
     assert len(serial_outputs) == len(parallel_outputs) == 5
     for serial, parallel in zip(serial_outputs, parallel_outputs):
@@ -144,7 +154,7 @@ def test_vmpin_growth_bounded_under_long_run() -> None:
         vmpin_after_kb = _read_vmpin_kb()
         vmpin_growth_mb = (vmpin_after_kb - vmpin_before_kb) / 1024.0
 
-        # Allow moderate one-time growth, but reject unbounded increase.
-        assert vmpin_growth_mb < 64.0, f"VmPin growth too high: {vmpin_growth_mb:.2f} MB"
+        # Allow moderate one-time growth, but reject sustained growth.
+        assert vmpin_growth_mb < 16.0, f"VmPin growth too high: {vmpin_growth_mb:.2f} MB"
     finally:
         engine.close()
