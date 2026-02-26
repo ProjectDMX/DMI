@@ -49,9 +49,6 @@ ABI_FLAG := $(shell $(PYTHON) -c "import torch; print(f'-D_GLIBCXX_USE_CXX11_ABI
 # Pybind11 ABI flags
 PYBIND_FLAGS := $(shell $(PYTHON) -c "import pybind11; print(' '.join([f'-DPYBIND11_COMPILER_TYPE=\\\"{pybind11.get_compiler_type()}\\\"', f'-DPYBIND11_STDLIB=\\\"{pybind11.get_stdlib()}\\\"', f'-DPYBIND11_BUILD_ABI=\\\"{pybind11.get_build_abi()}\\\"']))" 2>/dev/null || echo "")
 
-# Note: MON_DEBUG is now checked at RUNTIME via std::getenv(), not at compile time
-# No need for compile-time -DMON_DEBUG flag
-
 CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
             -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=$(TARGET) \
             $(ABI_FLAG) $(PYBIND_FLAGS) \
@@ -61,11 +58,11 @@ LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPAT
            -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -lcudart -lpthread
 
 
-# ---- ClickHouse C++ client (override if your lib name/path differs) ----
-CLICKHOUSE_INCLUDE ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp)
-CLICKHOUSE_LIB_DIR  ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/clickhouse)
-CLICKHOUSE_LIBS    ?= -lclickhouse-cpp-lib
-CLICKHOUSE_CONTRIB  ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/contrib)
+# ---- ClickHouse C++ client (fixed in-repo paths) ----
+CLICKHOUSE_INCLUDE := $(abspath $(CURDIR)/../libs/clickhouse-cpp)
+CLICKHOUSE_LIB_DIR := $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/clickhouse)
+CLICKHOUSE_LIBS    := -lclickhouse-cpp-lib
+CLICKHOUSE_CONTRIB := $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/contrib)
 
 ifneq ($(CLICKHOUSE_INCLUDE),)
 CXXFLAGS += -I$(CLICKHOUSE_INCLUDE) -I$(CLICKHOUSE_INCLUDE)/contrib/absl
