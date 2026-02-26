@@ -4,6 +4,10 @@
 Two reference modes:
   - ROL (manual KV-cache rollout): full [T, vocab] logits, hidden states, attn patterns.
   - GEN (hf generate()): token_ids + decode-only output_scores.
+
+NOTE:
+  - tests/correctness/tensor_utils.py no longer exists.
+  - Attention-matrix stitching now uses monitoring.segment_merger.merge_segments().
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from .tensor_utils import _AttnMatrixSegments
+from monitoring.segment_merger import merge_segments
 
 
 # ---------------------------------------------------------------------------
@@ -24,15 +28,15 @@ from .tensor_utils import _AttnMatrixSegments
 
 @dataclass
 class _HFRef:
-    token_ids: torch.Tensor        # [T] cpu long
-    final_logits: torch.Tensor     # [T, vocab] cpu
-    hidden_states: List[torch.Tensor]   # [n_layer+1] each [T, d] cpu
-    attn_pattern: List[torch.Tensor]    # [n_layer] each [H, T, T] cpu
+    token_ids: torch.Tensor  # [T] cpu long
+    final_logits: torch.Tensor  # [T, vocab] cpu
+    hidden_states: List[torch.Tensor]  # [n_layer+1] each [T, d] cpu
+    attn_pattern: List[torch.Tensor]  # [n_layer] each [H, T, T] cpu
 
 
 @dataclass
 class _HFGenRef:
-    token_ids: torch.Tensor     # [T] cpu long (prompt + generated)
+    token_ids: torch.Tensor  # [T] cpu long (prompt + generated)
     # generate() exposes per-step scores for generated tokens only.
     # scores[s] is the distribution used to pick generated token at step s (0-indexed),
     # shape [vocab] on CPU.
@@ -137,7 +141,7 @@ def _hf_generate_collect_scores_batched(
         for s in gen_out.scores:
             scores_steps.append(s.detach().cpu())
 
-    prompt_lens_t = attn.sum(dim=1)   # [B]
+    prompt_lens_t = attn.sum(dim=1)  # [B]
     pad_lens_t = Pmax - prompt_lens_t  # [B]
     prompt_lens = prompt_lens_t.detach().cpu().tolist()
     pad_lens = pad_lens_t.detach().cpu().tolist()
@@ -148,7 +152,7 @@ def _hf_generate_collect_scores_batched(
         _ = int(prompt_lens[b])  # used implicitly by slicing
 
         prompt_tok = seqs[b, pad_len:Pmax]  # [prompt_len]
-        gen_tok_full = seqs[b, Pmax:]       # [G]
+        gen_tok_full = seqs[b, Pmax:]  # [G]
         gen_len = int(gen_tok_full.numel())
         if gen_len > 0:
             eos_hits = (gen_tok_full == int(eos_token_id)).nonzero(as_tuple=False)
@@ -248,8 +252,10 @@ def _hf_greedy_rollout_collect_all_batched(
             per_layer_a: List[List[torch.Tensor]] = []
             for l in range(n_attn):
                 a0 = out.attentions[l][b]
+                # normalize possible shapes: [1,H,T,T] -> [H,T,T]
                 if a0.ndim == 4 and a0.shape[0] == 1:
                     a0 = a0.squeeze(0)
+                # strip left-pad in both query and key dims
                 a0 = a0[:, pad_len:, pad_len:].detach().cpu()
                 per_layer_a.append([a0])
             attn_chunks_by_row_by_layer.append(per_layer_a)
@@ -292,15 +298,17 @@ def _hf_greedy_rollout_collect_all_batched(
             if int(prev_unfinished[b].item()) != 1:
                 continue
 
+            # logits
             sl = cur_out.logits[b]
-            if sl.ndim == 2 and sl.shape[0] == 1:
-                pass
-            elif sl.ndim == 1:
+            if sl.ndim == 1:
                 sl = sl.unsqueeze(0)
+            elif sl.ndim == 2 and sl.shape[0] == 1:
+                pass
             else:
                 sl = sl.view(1, -1)
             logits_chunks_by_row[b].append(sl.detach().cpu())
 
+            # hidden states
             if want_hidden_states and cur_out.hidden_states is not None:
                 for l, hs in enumerate(cur_out.hidden_states):
                     hsb = hs[b]
@@ -308,12 +316,15 @@ def _hf_greedy_rollout_collect_all_batched(
                         hsb = hsb.unsqueeze(0)
                     hidden_chunks_by_row_by_layer[b][l].append(hsb.detach().cpu())
 
+            # attentions
             if want_attentions and cur_out.attentions is not None:
                 pad_len = int(pad_lens[b])
                 for l, a in enumerate(cur_out.attentions):
                     ab = a[b]
+                    # normalize [H, K] -> [H, 1, K]
                     if ab.ndim == 2:
                         ab = ab.unsqueeze(1)
+                    # strip left-pad on key dim
                     ab = ab[..., pad_len:]
                     attn_chunks_by_row_by_layer[b][l].append(ab.detach().cpu())
 
@@ -326,12 +337,14 @@ def _hf_greedy_rollout_collect_all_batched(
     for b in range(B):
         tok = torch.tensor(seq_ids[b], dtype=torch.long, device="cpu")
 
+        # logits: concat time
         lchunks = logits_chunks_by_row[b]
         lnorm: List[torch.Tensor] = []
         for t in lchunks:
             lnorm.append(t if t.ndim == 2 else t.unsqueeze(0))
         flog = torch.cat(lnorm, dim=0)
 
+        # hidden states: per layer concat time
         hfull: List[torch.Tensor] = []
         if hidden_chunks_by_row_by_layer[b]:
             for per_layer in hidden_chunks_by_row_by_layer[b]:
@@ -340,13 +353,19 @@ def _hf_greedy_rollout_collect_all_batched(
                     nn.append(t if t.ndim == 2 else t.unsqueeze(0))
                 hfull.append(torch.cat(nn, dim=0))
 
+        # attentions: per layer stitch growing [H, dq, Tk] segments -> [H, T, T]
         afull: List[torch.Tensor] = []
         if attn_chunks_by_row_by_layer[b]:
             for per_layer in attn_chunks_by_row_by_layer[b]:
-                mgr = _AttnMatrixSegments(fill_value=0.0)
-                mgr.extend(per_layer)
-                afull.append(mgr.read_and_merge())
+                # monitoring.segment_merger implements the same "pad keys then concat queries" logic
+                # used for offloaded attention matrices.
+                merged = merge_segments(per_layer, "blocks.attn.hook_pattern")
+                if merged is None:
+                    merged = torch.empty((0,), dtype=torch.float32)
+                afull.append(merged)
 
-        out_refs.append(_HFRef(token_ids=tok, final_logits=flog, hidden_states=hfull, attn_pattern=afull))
+        out_refs.append(
+            _HFRef(token_ids=tok, final_logits=flog, hidden_states=hfull, attn_pattern=afull)
+        )
 
     return out_refs

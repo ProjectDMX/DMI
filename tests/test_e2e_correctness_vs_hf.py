@@ -1,5 +1,5 @@
-# tests/test_e2e_correctness_vs_hf.py
-# PYTHONPATH=./:./monitoring:$PYTHONPATH E2E_PRINT_TEXT=1 E2E_HF_DROP_LAST_TOKEN=1 E2E_PRINT_TOPK_LOGITS=1 pytest -q -s tests/test_e2e_correctness_vs_hf.py
+# tests/test_e2e_correctness_hf.py
+# PYTHONPATH=./:./monitoring:$PYTHONPATH E2E_PRINT_TEXT=1 E2E_HF_DROP_LAST_TOKEN=1 E2E_PRINT_TOPK_LOGITS=1 pytest -q -s tests/test_e2e_correctness_hf.py
 """E2E correctness test: monitoring DB vs HuggingFace Transformers (HF-driven ground truth).
 
 This test runs the repo monitoring pipeline end-to-end (native backend + host engine + ClickHouse),
@@ -49,33 +49,12 @@ DB offloaded tensors DO NOT have batch dim now:
   - attn pattern/scores:       [n_heads, Tq, Tk]
   - final_logits:              [R, vocab] or [vocab]  (R is often full sequence length)
 
-What we compare (HF-available / reconstructible)
------------------------------------------------------------------------
-Given DB token_ids per request, we run an HF incremental rollout and compare:
-
-  - token_ids:
-      * HF rollout token_ids must equal DB token_ids for that request.
-      * HF generate() token_ids must equal DB token_ids for that request.
-  - final_logits:
-      * Compare DB logits rows for the final sequence (length T) to HF rollout logits [T, vocab].
-      * Also print GEN top-k logits where available (decode-step scores).
-  - GPT2-like only (transformer.wte/wpe/ln_f exist):
-      * hook_embed:    wte(token_ids)
-      * hook_pos_embed wpe(position_ids) with positions 0..T-1
-      * hook_final_ln  ln_f(last_hidden_state)  -- TODO: see issue #<tbd>
-  - attentions:
-      * blocks.attn.hook_pattern compare to HF attentions (probabilities) stitched to [H, T, T]
-  - hidden states:
-      * blocks.hook_resid_pre  compare to HF hidden_states[layer] stitched to [T, d]
-      * blocks.hook_resid_post compare to HF hidden_states[layer+1] stitched to [T, d]
-
 Env vars
 -----------------------------------------------------------------------
   - E2E_BATCH_SIZE (default 4)
   - E2E_MAX_NEW_TOKENS (default 8)
   - E2E_MODEL (default "gpt2"; "qwen3" alias supported)
   - E2E_CHUNK_BYTES (default 262144)
-  - E2E_NO_DB (default 0)
 
   - E2E_PRINT_TEXT (default 0): if 1, print decoded text from DB token_ids and from HF rollout + HF generate().
   - E2E_HF_DROP_LAST_TOKEN (default 0): if 1, drop the last token (and aligned tensors) from HF refs before compares.
@@ -96,8 +75,10 @@ from typing import Dict, List, Tuple
 import pytest
 import torch
 
-from tests.correctness.db_reader import _ClickHouseReader, _DBConfig
-from tests.correctness.hf_reference import (
+from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
+from monitoring.segment_merger import merge_segments, parse_internal_id
+
+from .hf_reference import (
     _HFGenRef,
     _HFRef,
     _hf_generate_collect_scores_batched,
@@ -105,11 +86,6 @@ from tests.correctness.hf_reference import (
     _parse_request_id,
     _positions_for_unpadded,
     _strip_left_pad,
-)
-from tests.correctness.tensor_utils import (
-    bitwise_equal,
-    get_num_layers_from_config,
-    merge_segments,
 )
 
 # ---------------------------------------------------------------------------
@@ -124,12 +100,64 @@ def _resolve_model_id(model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Small utils (inlined to avoid test-only deps)
+# ---------------------------------------------------------------------------
+
+
+def bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Exact bitwise equality (treats NaNs as equal if their payload bits match)."""
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    if a.numel() == 0:
+        return True
+    a8 = a.cpu().contiguous().view(torch.uint8)
+    b8 = b.cpu().contiguous().view(torch.uint8)
+    return torch.equal(a8, b8)
+
+
+def get_num_layers_from_config(hf_model) -> int:
+    cfg = getattr(hf_model, "config", None)
+    if cfg is None:
+        raise ValueError("HF model has no .config; cannot determine num_layers")
+
+    for attr in ("num_hidden_layers", "n_layer", "num_layers", "n_layers"):
+        if hasattr(cfg, attr):
+            return int(getattr(cfg, attr))
+
+    # Some models nest text config (e.g., multi-modal wrappers)
+    for sub in ("text_config", "model_config", "llm_config"):
+        subcfg = getattr(cfg, sub, None)
+        if subcfg is None:
+            continue
+        for attr in ("num_hidden_layers", "n_layer", "num_layers", "n_layers"):
+            if hasattr(subcfg, attr):
+                return int(getattr(subcfg, attr))
+
+    raise ValueError(f"Could not infer num_layers from config type={type(cfg)!r}")
+
+
+def _canon_layer_and_act(act_name_raw: str, layer_no_raw: int) -> Tuple[int, str]:
+    """Handle both schemas:
+    - (layer_no, act_name) stored separately, act_name like 'blocks.attn.hook_pattern'
+    - act_name stored as internal_id 'blocks.<L>.attn.hook_pattern' with layer_no possibly -1
+    """
+    try:
+        layer_from_act, act = parse_internal_id(act_name_raw)
+        if layer_from_act != -1:
+            return int(layer_from_act), str(act)
+    except Exception:
+        # parse_internal_id is intentionally strict (expects 'blocks.<int>...'); fall back.
+        pass
+    return int(layer_no_raw), str(act_name_raw)
+
+
+# ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA + native backend required")
-def test_e2e_correctness_vs_hf(subtests) -> None:
+def test_e2e_correctness_hf(subtests) -> None:
     try:
         import clickhouse_driver  # noqa: F401
     except Exception:
@@ -166,8 +194,9 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
     batch_size = int(os.environ.get("E2E_BATCH_SIZE", "4"))
     if batch_size < 1:
         raise ValueError("E2E_BATCH_SIZE must be >= 1")
+
     max_new_tokens = int(os.environ.get("E2E_MAX_NEW_TOKENS", "8"))
-    model_id = _resolve_model_id(os.environ.get("E2E_MODEL", "gpt2"))
+    hf_model_id = _resolve_model_id(os.environ.get("E2E_MODEL", "gpt2"))
     chunk_bytes = int(os.environ.get("E2E_CHUNK_BYTES", str(256 * 1024)))
 
     print_text = int(os.environ.get("E2E_PRINT_TEXT", "0")) == 1
@@ -183,7 +212,7 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
     # Tokenizer + prompts
     # -----------------------------------------------------------------------
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
@@ -227,7 +256,7 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
         mon_cfg.pad_token_id = pad_id
 
     # -----------------------------------------------------------------------
-    # ClickHouse config
+    # ClickHouse config (for the monitored run)
     # -----------------------------------------------------------------------
 
     db_cfg_native = ClickHouseClientConfig()
@@ -252,13 +281,13 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
     # Monitored run
     # -----------------------------------------------------------------------
 
-    unique_model_id = f"e2e_correctness_vs_hf::{uuid.uuid4().hex}"[:120]
+    unique_run_model_id = f"e2e_correctness_hf::{uuid.uuid4().hex}"[:120]
     engine = MonitoringEngine(
-        async_enabled=True, config=mon_cfg, model_id=unique_model_id, db_config=host_cfg
+        async_enabled=True, config=mon_cfg, model_id=unique_run_model_id, db_config=host_cfg
     )
 
-    model_cls = HookedQwen3ForCausalLM if "qwen3" in model_id.lower() else HookedGPT2LMHeadModel
-    mon_model = model_cls.from_pretrained(model_id, attn_implementation="eager", torch_dtype=torch.float16)
+    model_cls = HookedQwen3ForCausalLM if "qwen3" in hf_model_id.lower() else HookedGPT2LMHeadModel
+    mon_model = model_cls.from_pretrained(hf_model_id, attn_implementation="eager", torch_dtype=torch.float16)
     mon_model.to(device).eval()
     mon_model.monitoring_engine = engine
     engine.prepare_for_model(mon_model)
@@ -279,34 +308,49 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
         engine.close()
 
     # -----------------------------------------------------------------------
-    # Read DB
+    # Read DB (monitoring.clickhouse_reader + monitoring.segment_merger)
     # -----------------------------------------------------------------------
 
-    reader = _ClickHouseReader(
-        _DBConfig(
-            host=str(db_cfg_native.host),
-            port=int(db_cfg_native.port),
-            username=str(db_cfg_native.username),
-            password=str(db_cfg_native.password),
-            database=str(db_cfg_native.database),
-            table=str(db_cfg_native.table),
-            secure=bool(getattr(db_cfg_native, "secure", False)),
-        )
+    ch = CHClickhouseDriverReadOnly(
+        host=str(db_cfg_native.host),
+        port=int(db_cfg_native.port),
+        username=str(db_cfg_native.username),
+        password=str(db_cfg_native.password),
+        database=str(db_cfg_native.database),
+        table=str(db_cfg_native.table),
+        secure=bool(getattr(db_cfg_native, "secure", False)),
+        client_settings=getattr(db_cfg_native, "client_settings", None),
+        decode_strings=True,
     )
-    rows = reader.fetch_all_rows_for_model(model_id=unique_model_id)
+    try:
+        # With strings_as_bytes=1, String params should be bytes for exact matching.
+        rows = ch.prefix_get((unique_run_model_id.encode("utf-8"),), return_full_key_tuple=True)
+    finally:
+        ch.close()
+
     if not rows:
-        pytest.fail(f"No rows found in ClickHouse for model_id={unique_model_id}")
+        pytest.fail(f"No rows found in ClickHouse for model_id={unique_run_model_id}")
+
+    # If multiple shard_ranks are present, pick rank 0 if available, else the minimum.
+    shard_ranks = sorted({int(key[4]) for key, _t in rows})
+    chosen_shard_rank = 0 if 0 in shard_ranks else (shard_ranks[0] if shard_ranks else 0)
+    rows = [(k, t) for (k, t) in rows if int(k[4]) == chosen_shard_rank]
 
     grouped: Dict[str, Dict[Tuple[int, str], List[Tuple[int, int, torch.Tensor]]]] = {}
-    for req_id, act_name, layer_no, s, e, _shard_rank, vals in rows:
-        t = reader.decode_tensor(vals).cpu()
-        grouped.setdefault(req_id, {}).setdefault((int(layer_no), str(act_name)), []).append((int(s), int(e), t))
+    for full_key, t_raw in rows:
+        # full_key = (model_id, request_id, act_name, layer_no, shard_rank, start_token_idx, end_token_idx)
+        _model_id, req_id, act_name_raw, layer_no_raw, _shard_rank, s, e = full_key
+
+        layer_no, act_name = _canon_layer_and_act(str(act_name_raw), int(layer_no_raw))
+
+        t = t_raw.detach().cpu()
+        grouped.setdefault(str(req_id), {}).setdefault((layer_no, act_name), []).append(
+            (int(s), int(e), t)
+        )
 
     request_ids = sorted(grouped.keys(), key=_parse_request_id)
 
-    def _sort_chunks(
-        chunks: List[Tuple[int, int, torch.Tensor]]
-    ) -> List[Tuple[int, int, torch.Tensor]]:
+    def _sort_chunks(chunks: List[Tuple[int, int, torch.Tensor]]) -> List[Tuple[int, int, torch.Tensor]]:
         return sorted(chunks, key=lambda x: (x[0], x[1]))
 
     def _validate_contiguous(
@@ -362,16 +406,14 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
         prompt_len_by_req[req_id] = plen0
 
     if len(seen_group_ids) != 1:
-        raise AssertionError(
-            f"expected exactly one group_id for this test run, got {sorted(seen_group_ids)}"
-        )
+        raise AssertionError(f"expected exactly one group_id for this test run, got {sorted(seen_group_ids)}")
 
     # -----------------------------------------------------------------------
     # Build HF references (no assertions here)
     # -----------------------------------------------------------------------
 
     hf_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
+        hf_model_id,
         attn_implementation="eager",
         torch_dtype=torch.float16,
     ).to(device).eval()
@@ -454,7 +496,7 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
             gen_prompt = gen_ref.token_ids[:plen]
             gen_gen = gen_ref.token_ids[plen:]
 
-            print(f"\n=== {req_id} (local_index={i}) ===")
+            print(f"\n=== {req_id} (local_index={i}, shard_rank={chosen_shard_rank}) ===")
             print(f"DB:  prompt_tokens={plen} generated_tokens={int(db_gen.numel())} total_tokens={int(db_seq.numel())}")
             print(f"DB PROMPT:    {_decode(db_prompt)!r}")
             print(f"DB GENERATED: {_decode(db_gen)!r}")
@@ -513,7 +555,7 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
         # --- final_logits ---
         logits_chunks_raw = hooks_map.get((-1, "final_logits"), [])
         if logits_chunks_raw:
-            lchunks = _sort_chunks(logits_chunks_raw)
+            lchunks = sorted(logits_chunks_raw, key=lambda x: (x[0], x[1]))
             db_logits_full = merge_segments([t for _, _, t in lchunks], "final_logits")
             if db_logits_full.ndim == 1:
                 db_logits_full = db_logits_full.unsqueeze(0)
@@ -522,7 +564,7 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
             vocab_db = int(db_slice.shape[1])
 
             if print_topk_logits:
-                print(f"\n=== TOP{topk_k} LOGITS {req_id} (local_index={i}) ===")
+                print(f"\n=== TOP{topk_k} LOGITS {req_id} (local_index={i}, shard_rank={chosen_shard_rank}) ===")
                 print(f"seq_len={seq_len} vocab={vocab_db}")
                 db_topv, db_topi = torch.topk(db_slice.float(), k=topk_k, dim=-1)
                 rol_topv, rol_topi = torch.topk(rol_slice.float(), k=topk_k, dim=-1)
@@ -553,9 +595,7 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
                     flat_idx = int(diff.view(-1).argmax().item())
                     r = flat_idx // vocab_db
                     c = flat_idx % vocab_db
-                    pytest.fail(
-                        f"final_logits mismatch (max_abs={max_abs}) at row={r} vocab_idx={c}"
-                    )
+                    pytest.fail(f"final_logits mismatch (max_abs={max_abs}) at row={r} vocab_idx={c}")
 
         # --- hook_embed / hook_pos_embed (GPT2-like) ---
         if (
@@ -569,7 +609,7 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
             emb = wte(ids).detach().cpu()       # [T, d]
             pos_emb = wpe(pos).detach().cpu()   # [T, d]
 
-            chunks = _sort_chunks(hooks_map[(-1, "hook_embed")])
+            chunks = sorted(hooks_map[(-1, "hook_embed")], key=lambda x: (x[0], x[1]))
             _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} hook_embed")
             db_t = merge_segments([t for _, _, t in chunks], "hook_embed")
             with subtests.test(msg=f"{req_id}/hook_embed"):
@@ -580,7 +620,7 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
                     f"hook_embed mismatch (max_abs={float((db_t.float() - emb.float()).abs().max().item())})"
                 )
 
-            chunks = _sort_chunks(hooks_map[(-1, "hook_pos_embed")])
+            chunks = sorted(hooks_map[(-1, "hook_pos_embed")], key=lambda x: (x[0], x[1]))
             _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} hook_pos_embed")
             db_t = merge_segments([t for _, _, t in chunks], "hook_pos_embed")
             with subtests.test(msg=f"{req_id}/hook_pos_embed"):
@@ -592,32 +632,26 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
                 )
 
         # --- hook_final_ln (GPT2-like) ---
-        # TODO: hook_final_ln comparison skipped — needs investigation.
-        # Track at: https://github.com/ProjectDMX/Project-DMI/issues (open a follow-up issue)
+        # TODO: hook_final_ln comparison skipped.
 
         # --- per-layer: attention pattern + resid_pre/post ---
         n_layers = len(ref.attn_pattern) if ref.attn_pattern else 0
-        # Sanity check: layer count from model config must match HF rollout output
         assert n_layers == num_layers, (
-            f"{req_id}: attn_pattern layer count mismatch: "
-            f"rollout={n_layers} config={num_layers}"
+            f"{req_id}: attn_pattern layer count mismatch: rollout={n_layers} config={num_layers}"
         )
 
         for layer_no in range(n_layers):
             key = (layer_no, "blocks.attn.hook_pattern")
             if key in hooks_map:
                 pat = ref.attn_pattern[layer_no]  # [H, T, T]
-                chunks = _sort_chunks(hooks_map[key])
-                _validate_contiguous(
-                    chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} pattern"
-                )
+                chunks = sorted(hooks_map[key], key=lambda x: (x[0], x[1]))
+                _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} pattern")
                 db_t = merge_segments([t for _, _, t in chunks], "blocks.attn.hook_pattern")
                 if db_t.ndim == 4 and db_t.shape[0] == 1:
                     db_t = db_t.squeeze(0)
                 with subtests.test(msg=f"{req_id}/layer{layer_no}/attn_pattern"):
                     assert tuple(db_t.shape) == tuple(pat.shape), (
-                        f"pattern shape mismatch layer={layer_no} "
-                        f"db={tuple(db_t.shape)} hf={tuple(pat.shape)}"
+                        f"pattern shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(pat.shape)}"
                     )
                     assert bitwise_equal(db_t, pat), (
                         f"pattern mismatch layer={layer_no} "
@@ -625,17 +659,14 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
                     )
 
             key = (layer_no, "blocks.hook_resid_pre")
-            if key in hooks_map and ref.hidden_states and layer_no < num_layers:
+            if key in hooks_map and ref.hidden_states and layer_no < len(ref.hidden_states):
                 hs = ref.hidden_states[layer_no]  # [T, d]
-                chunks = _sort_chunks(hooks_map[key])
-                _validate_contiguous(
-                    chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} resid_pre"
-                )
+                chunks = sorted(hooks_map[key], key=lambda x: (x[0], x[1]))
+                _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} resid_pre")
                 db_t = merge_segments([t for _, _, t in chunks], "blocks.hook_resid_pre")
                 with subtests.test(msg=f"{req_id}/layer{layer_no}/resid_pre"):
                     assert tuple(db_t.shape) == tuple(hs.shape), (
-                        f"resid_pre shape mismatch layer={layer_no} "
-                        f"db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
+                        f"resid_pre shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
                     )
                     assert bitwise_equal(db_t, hs), (
                         f"resid_pre mismatch layer={layer_no} "
@@ -643,21 +674,17 @@ def test_e2e_correctness_vs_hf(subtests) -> None:
                     )
 
             key = (layer_no, "blocks.hook_resid_post")
-            # resid_post at layer L corresponds to hidden_states[L+1] (post-layer output).
-            # hidden_states has n_layer+1 entries: [input_embed, after_layer_0, ..., after_layer_N-1]
-            # All layers are valid; the original (layer_no + 1) < num_layers guard was wrong
-            # (it silently skipped the last layer). Use len(ref.hidden_states) as the bound.
-            if key in hooks_map and ref.hidden_states and (layer_no + 1) < num_layers:
+            # len(ref.hidden_states) == n_layers + 1
+            # here we skip the last one, because that is not a full layer, just after 
+            # the final_ln
+            if key in hooks_map and ref.hidden_states and (layer_no + 1) < n_layers:
                 hs = ref.hidden_states[layer_no + 1]  # [T, d]
-                chunks = _sort_chunks(hooks_map[key])
-                _validate_contiguous(
-                    chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} resid_post"
-                )
+                chunks = sorted(hooks_map[key], key=lambda x: (x[0], x[1]))
+                _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} resid_post")
                 db_t = merge_segments([t for _, _, t in chunks], "blocks.hook_resid_post")
                 with subtests.test(msg=f"{req_id}/layer{layer_no}/resid_post"):
                     assert tuple(db_t.shape) == tuple(hs.shape), (
-                        f"resid_post shape mismatch layer={layer_no} "
-                        f"db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
+                        f"resid_post shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
                     )
                     assert bitwise_equal(db_t, hs), (
                         f"resid_post mismatch layer={layer_no} "
