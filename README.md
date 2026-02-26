@@ -240,6 +240,7 @@ Optional DB overrides:
 - Runtime env toggles under `MON_NATIVE_*` are removed.
 - Use `MonitoringConfig` for runtime tuning (`advance.*`) and debug behavior (`debug`).
 - For benchmark scripts that expose it, use `--nvtx` to enable debug/NVTX (`MonitoringConfig.debug=True`).
+- Policy: new runtime behavior knobs must be added via config fields, not new environment variables.
 
 ### Args
 ```bash
