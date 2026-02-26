@@ -11,7 +11,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile, record_function, tensorboard_trace_handler
 from torch.utils.hooks import RemovableHandle
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
 from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2Model
 
 try:
@@ -126,9 +126,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--monitoring-mode",
-        choices=["legacy", "graph"],
+        choices=["legacy", "graph", "compile"],
         default="legacy",
-        help="Choose legacy MonitoringEngine or graph-safe engine.",
+        help="Choose legacy MonitoringEngine, graph-safe engine, or torch.compile engine.",
     )
     parser.add_argument(
         "--graph-copy-mode",
@@ -144,10 +144,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--prefill-tokens must be >= 1")
     if args.decode_steps < 1:
         parser.error("--decode-steps must be >= 1")
-    if args.monitoring_mode == "graph" and args.monitoring_bypass:
-        parser.error("--monitoring-mode graph cannot be combined with --monitoring-bypass")
-    if args.monitoring_mode != "graph" and args.graph_copy_mode != "disabled":
-        parser.error("--graph-copy-mode only applies when --monitoring-mode graph is selected")
+    if args.monitoring_mode in ("graph", "compile") and args.monitoring_bypass:
+        parser.error("--monitoring-mode graph/compile cannot be combined with --monitoring-bypass")
+    if args.monitoring_mode not in ("graph", "compile") and args.graph_copy_mode != "disabled":
+        parser.error("--graph-copy-mode only applies when --monitoring-mode graph or compile is selected")
     return args
 
 
@@ -443,6 +443,70 @@ class HFGraphDecodeRunner:
         self.captured = False
         self.graph_outputs = None
         self.graph_logits = None
+
+
+class TorchCompileDecodeRunner:
+    """Decode runner using torch.compile(mode='reduce-overhead') + StaticCache.
+
+    StaticCache uses index_copy_() in-place (no torch.cat), enabling full
+    CUDA Graph coverage without partial graph breaks.
+    """
+
+    def __init__(
+        self,
+        model,
+        project_logits_fn: Callable[[torch.Tensor], torch.Tensor],
+        engine,
+        args,
+        *,
+        max_cache_len: int = 256,
+    ) -> None:
+        self.model = model
+        self.project_logits_fn = project_logits_fn
+        self.engine = engine
+        self.args = args
+        self.captured = True  # torch.compile manages capture internally
+        self._max_cache_len = max_cache_len
+        self._cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
+        self._next_cache_pos = 0
+
+        self._compiled_forward = torch.compile(
+            self._forward_step,
+            mode="reduce-overhead",
+            fullgraph=False,
+        )
+
+    def _forward_step(
+        self, token: torch.Tensor, cache, cache_position: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = self.model(
+            token,
+            use_cache=True,
+            past_key_values=cache,
+            cache_position=cache_position,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=True,
+        )
+        return self.project_logits_fn(outputs.last_hidden_state)
+
+    def run(self, token: torch.Tensor, past=None) -> Tuple[torch.Tensor, object]:
+        """Run one compiled decode step. past argument ignored (cache managed internally)."""
+        cache_position = torch.tensor(
+            [self._next_cache_pos], device=token.device, dtype=torch.long,
+        )
+        torch.compiler.cudagraph_mark_step_begin()
+        logits = self._compiled_forward(token, self._cache, cache_position)
+        self._next_cache_pos += 1
+        return logits, self._cache
+
+    def reset_cache(self) -> None:
+        """Reset cache for new sequence (preserve tensor addresses for CUDA Graph reuse)."""
+        self._cache.reset()
+        self._next_cache_pos = 0
+
+    def reset_capture(self) -> None:
+        pass
 
 
 def greedy_from_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -742,12 +806,14 @@ def main() -> None:
 
     graph_consumer = None
     graph_native_backend = None
-    if args.monitoring_mode == "graph":
+    if args.monitoring_mode in ("graph", "compile"):
+        graph_mode = "compile" if args.monitoring_mode == "compile" else "manual"
         monitoring_engine = GraphSafeEngine(
             config=monitoring_config,
             module_filter=lambda name, module: True,
             max_slots=4096,
             device=device,
+            graph_mode=graph_mode,
         )
         graph_consumer = GraphSlotConsumer(delay_steps=args.engine_delay_steps)
         monitoring_engine.attach_consumer(graph_consumer)
@@ -768,7 +834,7 @@ def main() -> None:
             delay_steps=args.engine_delay_steps,
             config=monitoring_config,
         )
-    attach_to_model = args.monitoring_mode != "graph"
+    attach_to_model = args.monitoring_mode not in ("graph", "compile")
     engine_attached_permanently = bool(args.monitoring_bypass and attach_to_model)
     original_monitoring_engine = hf_hooked_model.monitoring_engine
     if attach_to_model:
@@ -782,7 +848,7 @@ def main() -> None:
         if attach_to_model and not engine_attached_permanently:
             hf_hooked_model.monitoring_engine = original_monitoring_engine
 
-    if args.monitoring_bypass and args.monitoring_mode != "graph":
+    if args.monitoring_bypass and args.monitoring_mode not in ("graph", "compile"):
         native_backend = getattr(monitoring_engine, "_native_backend", None)
         native_using = bool(getattr(monitoring_engine, "_using_native_backend", False))
         native_builder_enabled = bool(getattr(monitoring_engine, "_native_builder_enabled", False))
@@ -809,9 +875,10 @@ def main() -> None:
             raise RuntimeError("Inline monitoring not enabled; cannot run bypass-inline profile.")
 
     def process_monitoring_results(wait: bool = False) -> None:
-        nonlocal graph_runner
-        if args.monitoring_mode == "graph":
-            if graph_runner is None or not graph_runner.captured:
+        nonlocal graph_runner, compile_runner
+        if args.monitoring_mode in ("graph", "compile"):
+            runner = compile_runner if args.monitoring_mode == "compile" else graph_runner
+            if runner is None or not runner.captured:
                 return
             if wait:
                 drained = False
@@ -825,9 +892,10 @@ def main() -> None:
             monitoring_engine.clear_completed_results()
 
     def resolve_monitoring_results() -> None:
-        nonlocal graph_runner
-        if args.monitoring_mode == "graph":
-            if graph_runner is None or not graph_runner.captured:
+        nonlocal graph_runner, compile_runner
+        if args.monitoring_mode in ("graph", "compile"):
+            runner = compile_runner if args.monitoring_mode == "compile" else graph_runner
+            if runner is None or not runner.captured:
                 return
             monitoring_engine.resolve_all()
             return
@@ -896,6 +964,7 @@ def main() -> None:
 
     graph_runner: Optional[HFGraphDecodeRunner] = None
     graph_forward_runner: Optional[HFGraphDecodeRunner] = None
+    compile_runner: Optional[TorchCompileDecodeRunner] = None
 
     def hf_prefill_fn(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
         outputs = hf_model(
@@ -1070,7 +1139,33 @@ def main() -> None:
         return logits, next_past
 
     def hf_modified_hook_async_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
-        nonlocal graph_runner
+        nonlocal graph_runner, compile_runner
+        if args.monitoring_mode == "compile":
+            nvtx.range_push("compile_prefill")
+            if compile_runner is None:
+                compile_runner = TorchCompileDecodeRunner(
+                    hf_hooked_model,
+                    project_logits,
+                    monitoring_engine,
+                    args,
+                    max_cache_len=args.prefill_tokens + args.decode_steps + 16,
+                )
+            compile_runner.reset_cache()
+            outputs = hf_hooked_model(
+                prefill_tokens,
+                use_cache=True,
+                past_key_values=compile_runner._cache,
+                output_hidden_states=False,
+                output_attentions=False,
+                return_dict=True,
+            )
+            compile_runner._next_cache_pos = prefill_tokens.shape[1]
+            hidden_states = outputs.last_hidden_state
+            logits = project_logits(hidden_states)
+            next_token = greedy_from_logits(logits)
+            del hidden_states, logits, outputs
+            nvtx.range_pop()  # compile_prefill
+            return compile_runner._cache, next_token
         if args.monitoring_mode == "graph":
             nvtx.range_push("async_prefill")
             outputs = hf_hooked_model(
@@ -1141,7 +1236,22 @@ def main() -> None:
         return past, next_token
 
     def hf_modified_hook_async_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
-        nonlocal graph_runner
+        nonlocal graph_runner, compile_runner
+        if args.monitoring_mode == "compile":
+            if compile_runner is None:
+                raise RuntimeError("Compile decode runner is not initialized.")
+            nvtx.range_push("compile_decode")
+            monitoring_engine.start_step()
+            try:
+                logits, next_past = compile_runner.run(token, past_key_values)
+            finally:
+                monitoring_engine.end_step()
+            try:
+                process_monitoring_results(wait=True)
+            except Exception as _e:
+                print(f"[compile_decode] drain exception: {type(_e).__name__}: {_e}")
+            nvtx.range_pop()  # compile_decode
+            return logits, next_past
         if args.monitoring_mode == "graph":
             if graph_runner is None:
                 raise RuntimeError("Graph decode runner is not initialized.")

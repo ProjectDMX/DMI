@@ -37,12 +37,16 @@ class GraphMonitor:
         max_slots: int = 2048,
         module_filter: Optional[ModuleFilter] = None,
         device: Optional[torch.device] = None,
+        graph_mode: str = "manual",
     ) -> None:
+        if graph_mode not in ("manual", "compile"):
+            raise ValueError(f"graph_mode must be 'manual' or 'compile', got {graph_mode!r}")
         if device is None:
             device = torch.device("cuda")
         if device.type != "cuda":
             raise ValueError("GraphMonitor currently supports CUDA devices only.")
         self._device = device
+        self._graph_mode = graph_mode
         self._max_slots = max_slots
         self._ops = load_graph_monitor_ops()
         self._gpu_buffer = torch.empty(
@@ -57,6 +61,7 @@ class GraphMonitor:
         self._module_to_slot: Dict[nn.Module, int] = {}
         self._handles: List[torch.utils.hooks.RemovableHandle] = []
         self._capture_anchors: List[torch.Tensor] = []
+        self._inline_attrs: Dict[nn.Module, List[str]] = {}
         self._pending_steps: Deque[_StepSnapshot] = deque()
         self._register_hooks(model)
 
@@ -64,26 +69,67 @@ class GraphMonitor:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+        # Clean up inline compile-mode attributes from parent modules
+        for parent, attrs in self._inline_attrs.items():
+            for attr in attrs:
+                if hasattr(parent, attr):
+                    delattr(parent, attr)
+        self._inline_attrs.clear()
         self._pending_steps.clear()
 
     def _register_hooks(self, model: nn.Module) -> None:
+        # Build parent lookup for inline compile mode
+        parent_map: Dict[str, nn.Module] = {"": model}
+        for name, mod in model.named_modules():
+            if name:
+                parent_map[name] = mod
+
         slot_id = 0
-        for name, module in model.named_modules():
-            if name == "":
-                continue
+        # Prefer hook_dict (HookPoint modules only) over full named_modules()
+        hook_dict = getattr(model, 'hook_dict', None)
+        if hook_dict is not None:
+            hook_iter: Iterable[Tuple[str, nn.Module]] = hook_dict.items()
+        else:
+            hook_iter = (
+                (n, m) for n, m in model.named_modules() if n
+            )
+        for name, module in hook_iter:
             if module in self._module_to_slot:
                 continue
             if self._module_filter is not None and not self._module_filter(name, module):
                 continue
             if slot_id >= self._max_slots:
                 break
+            # Compile mode with inline monitoring: set _mon_buf / _mon_slot_* on parent
+            if self._graph_mode == "compile" and hasattr(module, "monitor_activation"):
+                parts = name.rsplit(".", 1)
+                parent_name = parts[0] if len(parts) > 1 else ""
+                attr_name = parts[-1]  # e.g. "hook_ln1"
+                parent = parent_map.get(parent_name)
+                if parent is not None:
+                    slot_attr = f"_mon_slot_{attr_name}"
+                    parent._mon_buf = self._gpu_buffer
+                    setattr(parent, slot_attr, slot_id)
+                    # Track for cleanup
+                    if parent not in self._inline_attrs:
+                        self._inline_attrs[parent] = ["_mon_buf"]
+                    if slot_attr not in self._inline_attrs[parent]:
+                        self._inline_attrs[parent].append(slot_attr)
+            else:
+                handle = module.register_forward_hook(self._make_hook(slot_id))
+                self._handles.append(handle)
             self._module_to_slot[module] = slot_id
             self._slot_mapping[slot_id] = SlotInfo(slot_id=slot_id, module_name=name)
-            handle = module.register_forward_hook(self._make_hook(slot_id))
-            self._handles.append(handle)
             slot_id += 1
 
     def _make_hook(self, slot_id: int) -> Callable[..., None]:
+        if self._graph_mode == "compile":
+            return self._make_compile_hook(slot_id)
+        return self._make_manual_hook(slot_id)
+
+    def _make_manual_hook(self, slot_id: int) -> Callable[..., None]:
+        """Hook for manual CUDA Graph capture mode."""
+
         def hook(module: nn.Module, inputs, output) -> None:
             tensor = self._extract_tensor(output)
             if tensor is None or not tensor.is_cuda:
@@ -91,6 +137,24 @@ class GraphMonitor:
             self._ops.record(tensor, self._gpu_buffer, slot_id)
             if torch.cuda.is_current_stream_capturing():
                 self._capture_anchors.append(tensor)
+
+        return hook
+
+    def _make_compile_hook(self, slot_id: int) -> Callable[..., None]:
+        """Hook for torch.compile(mode='reduce-overhead') mode.
+
+        Calls record() and sink() as custom ops that Dynamo traces into the
+        compiled graph.  No capture detection or anchor collection needed.
+        """
+        ops = self._ops
+        gpu_buffer = self._gpu_buffer
+
+        def hook(module: nn.Module, inputs, output) -> None:
+            tensor = self._extract_tensor(output)
+            if tensor is None or not tensor.is_cuda:
+                return
+            ops.record(tensor, gpu_buffer, slot_id)
+            ops.sink([tensor])
 
         return hook
 
@@ -119,7 +183,21 @@ class GraphMonitor:
             pin_memory=True,
         )
 
+    def clear_gpu_buffer(self, stream: Optional[torch.cuda.Stream] = None) -> None:
+        """Zero shadow buffer so unfired hooks produce data_ptr=0 (skipped by parser).
+
+        Must run on the same stream as the preceding on_step_end() to ensure
+        the D2H snapshot copy completes before the buffer is cleared.
+        """
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                self._gpu_buffer.zero_()
+        else:
+            self._gpu_buffer.zero_()
+
     def finalize_capture(self) -> None:
+        if self._graph_mode == "compile":
+            return  # sink() already called per-hook inside the compiled graph
         if self._capture_anchors:
             self._ops.sink(self._capture_anchors)
             self._capture_anchors.clear()

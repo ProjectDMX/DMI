@@ -296,6 +296,11 @@ struct NativeMonitoringEngine::Impl {
   bool enable_host_copy_pool_{false};
   int host_copy_threads_{0};
 
+  // Gather-based H2H: single contiguous memcpy instead of per-tensor dispatch
+  bool enable_gather_h2h_{false};
+  std::atomic<int64_t> stats_gather_h2h_bytes_{0};
+  std::atomic<int64_t> stats_gather_h2h_calls_{0};
+
   void host_copy_worker();
   void process_copy_job(const CopyJob& job);
 

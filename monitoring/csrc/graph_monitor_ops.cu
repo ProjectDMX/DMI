@@ -123,4 +123,9 @@ TORCH_LIBRARY_IMPL(graphmonitor_ops, CUDA, m) {
   m.impl("alias_tensor", &vllm::alias_tensor);
 }
 
+TORCH_LIBRARY_IMPL(graphmonitor_ops, Meta, m) {
+  m.impl("record", [](const at::Tensor&, const at::Tensor&, int64_t) {});
+  m.impl("sink", [](const std::vector<at::Tensor>&) {});
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

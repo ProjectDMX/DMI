@@ -3,6 +3,7 @@
 #include "native_engine_internal.h"
 #include "nvtx_shim.h"
 #include <cstdlib>
+#include <cstring>
 
 namespace monitoring {
 
@@ -70,6 +71,11 @@ NativeMonitoringEngine::Impl::Impl(int64_t queue_size,
       size_t th = static_cast<size_t>(std::strtoull(v, nullptr, 10));
       if (th > 0) pinpool_thresh_bytes_ = th;
     }
+  }
+
+  // Gather-based H2H: single contiguous buffer instead of per-tensor alloc+memcpy
+  if (const char* v = std::getenv("MON_NATIVE_GATHER_H2H")) {
+    enable_gather_h2h_ = (*v == '1');
   }
 
   // Host-copy pool configuration (optional parallel memcpy)
@@ -238,7 +244,74 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   // 1. Pool-backed pinned (block_id >= 0): copy to pageable + release pool block
   // 2. Non-pool pinned (block_id < 0): copy to pageable + auto-release via refcount
   // 3. Already pageable or GPU: store directly without host copy
-  if (enable_host_copy_pool_) {
+
+  if (enable_gather_h2h_) {
+    // ---- Gather path: single contiguous buffer for all pinned H2H copies ----
+    // Collect metadata for all pinned results needing repage
+    struct GatherEntry {
+      size_t offset;
+      at::Tensor pinned;
+      int64_t block_id;
+      int64_t token;
+      c10::IntArrayRef sizes;
+      c10::IntArrayRef strides;
+      at::ScalarType dtype;
+    };
+    size_t total_bytes = 0;
+    std::vector<GatherEntry> gather_list;
+    gather_list.reserve(results.size());
+
+    for (auto& pr : results) {
+      const bool need_repage = pr.tensor.defined() && pr.tensor.device().is_cpu() && pr.tensor.is_pinned();
+      if (need_repage) {
+        size_t nbytes = static_cast<size_t>(pr.tensor.nbytes());
+        gather_list.push_back(GatherEntry{
+            total_bytes, pr.tensor, pr.block_id, pr.token,
+            pr.tensor.sizes(), pr.tensor.strides(), pr.tensor.scalar_type()});
+        total_bytes += nbytes;
+      } else {
+        store_result(pr.token, std::move(pr.tensor));
+      }
+    }
+
+    if (!gather_list.empty()) {
+      mon_nvtx_push("MonEng::gather_h2h");
+      // Single pageable allocation for all pinned tensors
+      at::Tensor contig_buf = at::empty(
+          {static_cast<int64_t>(total_bytes)},
+          at::TensorOptions().dtype(at::kByte).device(torch::kCPU).pinned_memory(false));
+      uint8_t* base = contig_buf.data_ptr<uint8_t>();
+
+      // Sequential memcpy into contiguous buffer (cache-friendly linear write)
+      for (auto& entry : gather_list) {
+        std::memcpy(base + entry.offset,
+                     entry.pinned.data_ptr(),
+                     static_cast<size_t>(entry.pinned.nbytes()));
+      }
+
+      // Create views backed by contig_buf, release pool blocks, store results
+      for (auto& entry : gather_list) {
+        // Capture contig_buf by value in deleter to prevent early free;
+        // all views share the refcount of the contiguous buffer.
+        at::Tensor view = at::from_blob(
+            base + entry.offset,
+            entry.sizes,
+            entry.strides,
+            /*deleter=*/[buf_ref = contig_buf](void*) { (void)buf_ref; },
+            at::TensorOptions().dtype(entry.dtype).device(torch::kCPU));
+        if (entry.block_id >= 0) {
+          release_pool_block(entry.block_id);
+        }
+        store_result(entry.token, std::move(view));
+      }
+
+      stats_gather_h2h_bytes_.fetch_add(static_cast<int64_t>(total_bytes), std::memory_order_relaxed);
+      stats_gather_h2h_calls_.fetch_add(1, std::memory_order_relaxed);
+      stats_memcpy_bytes_.fetch_add(static_cast<int64_t>(total_bytes), std::memory_order_relaxed);
+      mon_nvtx_pop();
+    }
+  } else if (enable_host_copy_pool_) {
+    // ---- Per-tensor thread-pool path ----
     for (auto& pr : results) {
       const bool need_repage = pr.tensor.defined() && pr.tensor.device().is_cpu() && pr.tensor.is_pinned();
       if (need_repage) {
@@ -264,6 +337,7 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
       }
     }
   } else {
+    // ---- Per-tensor inline path ----
     for (auto& pr : results) {
       const bool need_repage = pr.tensor.defined() && pr.tensor.device().is_cpu() && pr.tensor.is_pinned();
       if (need_repage) {

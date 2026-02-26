@@ -33,6 +33,10 @@ py::dict NativeMonitoringEngine::Impl::get_stats() {
     d["host_copy_total_tasks"] = host_copy_pool_->total_tasks_.load(std::memory_order_relaxed);
     d["host_copy_total_mb"] = static_cast<double>(host_copy_pool_->total_bytes_.load(std::memory_order_relaxed)) / (1024.0 * 1024.0);
   }
+  if (enable_gather_h2h_) {
+    d["gather_h2h_mb"] = static_cast<double>(stats_gather_h2h_bytes_.load(std::memory_order_relaxed)) / (1024.0 * 1024.0);
+    d["gather_h2h_calls"] = stats_gather_h2h_calls_.load(std::memory_order_relaxed);
+  }
   return d;
 }
 

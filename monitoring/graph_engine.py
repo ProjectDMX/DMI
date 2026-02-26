@@ -153,11 +153,20 @@ class GraphSafeEngine:
                 stream = torch.cuda.current_stream(device=self._device)
             except Exception:
                 stream = None
+        # Snapshot current metadata, then optionally zero the GPU buffer so
+        # stale slots from manual CUDA Graph replay produce data_ptr=0.
+        # Skip in compile mode: zero_() invalidates torch.compile's CUDA Graph
+        # state, and compile mode re-executes all traced record() ops each step
+        # so there are no stale slots.
         if stream is not None:
             self._monitor.on_step_end(self._current_step_id, stream)
+            # if self._graph_mode == "manual":
+            #     self._monitor.clear_gpu_buffer(stream)
             self._step_event_stream = stream
         else:
             self._monitor.on_step_end(self._current_step_id, None)
+            # if self._graph_mode == "manual":
+            #     self._monitor.clear_gpu_buffer()
         if self._delegate is not None and not self._delegate_disabled:
             self._step_streams[self._current_step_id] = stream
 
