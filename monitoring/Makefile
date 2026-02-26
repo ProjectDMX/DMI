@@ -62,7 +62,7 @@ LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPAT
 CLICKHOUSE_INCLUDE := $(abspath $(CURDIR)/../libs/clickhouse-cpp)
 CLICKHOUSE_LIB_DIR := $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/clickhouse)
 CLICKHOUSE_LIBS    := -lclickhouse-cpp-lib
-CLICKHOUSE_CONTRIB  ?= $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/contrib)
+CLICKHOUSE_CONTRIB := $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/contrib)
 
 ifneq ($(CLICKHOUSE_INCLUDE),)
 CXXFLAGS += -I$(CLICKHOUSE_INCLUDE) -I$(CLICKHOUSE_INCLUDE)/contrib/absl
