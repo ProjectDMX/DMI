@@ -177,6 +177,12 @@ def _to_bytes(v: Any) -> bytes:
         return v.encode("utf-8", errors="surrogateescape")
     raise TypeError(f"expected bytes-like, got {type(v)!r}")
 
+def bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    a = a.detach().cpu().contiguous()
+    b = b.detach().cpu().contiguous()
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 def torch_decode_v1(meta: BytesLike, payload: Any) -> torch.Tensor:
     meta_b = _to_bytes(meta)
@@ -1023,12 +1029,12 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
 
         # Token equality checks against DB
         db_seq = db_token_ids_by_req[req_id].to(torch.long)
-        if not torch.equal(ref.token_ids, db_seq):
+        if not bitwise_equal(ref.token_ids, db_seq):
             raise AssertionError(
                 f"{req_id}: HF rollout tokens != DB token_ids "
                 f"(hf_len={int(ref.token_ids.numel())} db_len={int(db_seq.numel())})"
             )
-        if not torch.equal(gen_ref.token_ids, db_seq):
+        if not bitwise_equal(gen_ref.token_ids, db_seq):
             raise AssertionError(
                 f"{req_id}: HF generate tokens != DB token_ids "
                 f"(hf_len={int(gen_ref.token_ids.numel())} db_len={int(db_seq.numel())})"
@@ -1153,7 +1159,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
                     print("  GEN: <n/a>")
 
         # Keep strict compare for DB vs ROL logits (currently optional)
-        if not torch.equal(db_slice, rol_slice):
+        if not bitwise_equal(db_slice, rol_slice):
             diff = (db_slice.float() - rol_slice.float()).abs()
             max_abs = float(diff.max().item())
             flat_idx = int(diff.view(-1).argmax().item())
@@ -1179,7 +1185,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
             db_t = merge_segments([t for _, _, t in chunks], "hook_embed")
             if tuple(db_t.shape) != tuple(emb.shape):
                 raise AssertionError(f"{req_id}: hook_embed shape mismatch db={tuple(db_t.shape)} hf={tuple(emb.shape)}")
-            if not torch.equal(db_t, emb):
+            if not bitwise_equal(db_t, emb):
                 max_abs = float((db_t.float() - emb.float()).abs().max().item())
                 raise AssertionError(f"{req_id}: hook_embed mismatch (max_abs={max_abs})")
 
@@ -1190,7 +1196,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
                 raise AssertionError(
                     f"{req_id}: hook_pos_embed shape mismatch db={tuple(db_t.shape)} hf={tuple(pos_emb.shape)}"
                 )
-            if not torch.equal(db_t, pos_emb):
+            if not bitwise_equal(db_t, pos_emb):
                 max_abs = float((db_t.float() - pos_emb.float()).abs().max().item())
                 raise AssertionError(f"{req_id}: hook_pos_embed mismatch (max_abs={max_abs})")
 
@@ -1204,7 +1210,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
             db_t = merge_segments([t for _, _, t in chunks], "hook_final_ln")
             if tuple(db_t.shape) != tuple(fin.shape):
                 raise AssertionError(f"{req_id}: hook_final_ln shape mismatch db={tuple(db_t.shape)} hf={tuple(fin.shape)}")
-            if not torch.equal(db_t, fin):
+            if not bitwise_equal(db_t, fin):
                 max_abs = float((db_t.float() - fin.float()).abs().max().item())
                 raise AssertionError(f"{req_id}: hook_final_ln mismatch (max_abs={max_abs})")
         """
@@ -1225,7 +1231,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
                     raise AssertionError(
                         f"{req_id}: pattern shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(pat.shape)}"
                     )
-                if not torch.equal(db_t, pat):
+                if not bitwise_equal(db_t, pat):
                     max_abs = float((db_t.float() - pat.float()).abs().max().item())
                     raise AssertionError(f"{req_id}: pattern mismatch layer={layer_no} (max_abs={max_abs})")
 
@@ -1239,7 +1245,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
                     raise AssertionError(
                         f"{req_id}: resid_pre shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
                     )
-                if not torch.equal(db_t, hs):
+                if not bitwise_equal(db_t, hs):
                     max_abs = float((db_t.float() - hs.float()).abs().max().item())
                     raise AssertionError(f"{req_id}: resid_pre mismatch layer={layer_no} (max_abs={max_abs})")
 
@@ -1255,6 +1261,6 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
                     raise AssertionError(
                         f"{req_id}: resid_post shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
                     )
-                if not torch.equal(db_t, hs):
+                if not bitwise_equal(db_t, hs):
                     max_abs = float((db_t.float() - hs.float()).abs().max().item())
                     raise AssertionError(f"{req_id}: resid_post mismatch layer={layer_no} (max_abs={max_abs})")
