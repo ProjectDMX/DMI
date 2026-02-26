@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -69,7 +69,6 @@ class GraphMonitor:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
-        # Clean up inline compile-mode attributes from parent modules
         for parent, attrs in self._inline_attrs.items():
             for attr in attrs:
                 if hasattr(parent, attr):
@@ -78,48 +77,39 @@ class GraphMonitor:
         self._pending_steps.clear()
 
     def _register_hooks(self, model: nn.Module) -> None:
-        # Build parent lookup for inline compile mode
         parent_map: Dict[str, nn.Module] = {"": model}
         for name, mod in model.named_modules():
             if name:
                 parent_map[name] = mod
 
         slot_id = 0
-        # Prefer hook_dict (HookPoint modules only) over full named_modules()
-        hook_dict = getattr(model, 'hook_dict', None)
-        if hook_dict is not None:
-            hook_iter: Iterable[Tuple[str, nn.Module]] = hook_dict.items()
-        else:
-            hook_iter = (
-                (n, m) for n, m in model.named_modules() if n
-            )
-        for name, module in hook_iter:
+        for name, module in model.named_modules():
+            if name == "":
+                continue
             if module in self._module_to_slot:
                 continue
             if self._module_filter is not None and not self._module_filter(name, module):
                 continue
             if slot_id >= self._max_slots:
                 break
-            # Compile mode with inline monitoring: set _mon_buf / _mon_slot_* on parent
+            self._module_to_slot[module] = slot_id
+            self._slot_mapping[slot_id] = SlotInfo(slot_id=slot_id, module_name=name)
+            handle = module.register_forward_hook(self._make_hook(slot_id))
+            self._handles.append(handle)
+            # In compile mode, also set inline attrs so _mon_record() works
             if self._graph_mode == "compile" and hasattr(module, "monitor_activation"):
                 parts = name.rsplit(".", 1)
                 parent_name = parts[0] if len(parts) > 1 else ""
-                attr_name = parts[-1]  # e.g. "hook_ln1"
+                attr_name = parts[-1]
                 parent = parent_map.get(parent_name)
                 if parent is not None:
                     slot_attr = f"_mon_slot_{attr_name}"
                     parent._mon_buf = self._gpu_buffer
                     setattr(parent, slot_attr, slot_id)
-                    # Track for cleanup
                     if parent not in self._inline_attrs:
                         self._inline_attrs[parent] = ["_mon_buf"]
                     if slot_attr not in self._inline_attrs[parent]:
                         self._inline_attrs[parent].append(slot_attr)
-            else:
-                handle = module.register_forward_hook(self._make_hook(slot_id))
-                self._handles.append(handle)
-            self._module_to_slot[module] = slot_id
-            self._slot_mapping[slot_id] = SlotInfo(slot_id=slot_id, module_name=name)
             slot_id += 1
 
     def _make_hook(self, slot_id: int) -> Callable[..., None]:

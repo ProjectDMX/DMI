@@ -810,7 +810,7 @@ def main() -> None:
         graph_mode = "compile" if args.monitoring_mode == "compile" else "manual"
         monitoring_engine = GraphSafeEngine(
             config=monitoring_config,
-            module_filter=lambda name, module: True,
+            module_filter=lambda name, module: hasattr(module, "monitor_activation"),
             max_slots=4096,
             device=device,
             graph_mode=graph_mode,
