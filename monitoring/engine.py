@@ -1,29 +1,15 @@
-"""Monitoring engine wrapper with Python fallback backend.
-
-This module defines a thin Python-fronted MonitoringEngine that aggregates
-per-step tasks and delegates all heavy lifting to a backend implementation.
-In production the backend will be a native C++/CUDA extension; until that
-arrives we retain a Python fallback that mirrors the established behaviour.
-"""
+"""Monitoring engine wrapper backed only by the native C++/CUDA engine."""
 
 from __future__ import annotations
 
-import threading
 import time
-from collections import deque
 from dataclasses import dataclass
-from queue import SimpleQueue
-from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
-from .task import CacheFuture, MonitoringTask
 from .config import AdvanceConfig, MonitoringConfig
-
-from .utils import Slice
-
-
-_QUEUE_SENTINEL = object()
+from .task import CacheFuture, MonitoringTask
 
 
 def _stream_to_handle(stream: Optional[torch.cuda.Stream]) -> Optional[int]:
@@ -60,7 +46,7 @@ class HostEngineConfig:
 
 
 class MonitoringEngine:
-    """High-level wrapper that routes monitoring tasks to a backend."""
+    """High-level wrapper that routes monitoring tasks to native backend."""
 
     def __init__(
         self,
@@ -100,10 +86,7 @@ class MonitoringEngine:
         self._active_batch_start_idx_per_request: Optional[List[int]] = None
         self._active_batch_finished_per_request: Optional[List[bool]] = None
 
-        # Backend references are populated on demand. When a native backend is
-        # unavailable we fall back to the Python implementation.
-        self._backend: Optional[Any] = None
-        self._python_backend: Optional[_PythonBackend] = None
+        # Native backend only.
         self._native_backend: Optional[Any] = None
         self._using_native_backend = False
 
@@ -111,33 +94,33 @@ class MonitoringEngine:
         self._host_engine: Optional[Any] = None
         self._host_engine_enabled = False
 
-        if async_enabled and torch.cuda.is_available():
-            advance_cfg = self.config.advance if self.config is not None else AdvanceConfig()
-            native_backend = _load_native_backend(
-                queue_size,
-                cache_dtype,
-                self._delay_steps,
-                advance_cfg,
+        if not self.async_enabled:
+            raise RuntimeError(
+                "MonitoringEngine no longer supports async_enabled=False; Python backend was removed"
             )
-            if native_backend is not None:
-                self._backend = native_backend
-                self._native_backend = native_backend
-                self._using_native_backend = True
-                try:
-                    native_backend.begin_step(int(self._current_step_id), 0)  # initialise step tracking
-                except Exception:
-                    pass
-                if self.config is not None:
-                    self._apply_capture_schedule()
-                    self._apply_native_runtime_config()
-            else:
-                python_backend = _PythonBackend(
-                    queue_size=queue_size,
-                    cache_dtype=cache_dtype,
-                    delay_steps=self._delay_steps,
-                )
-                self._backend = python_backend
-                self._python_backend = python_backend
+
+        advance_cfg = self.config.advance if self.config is not None else AdvanceConfig()
+        native_backend = _load_native_backend(
+            queue_size,
+            cache_dtype,
+            self._delay_steps,
+            advance_cfg,
+        )
+        if native_backend is None:
+            raise RuntimeError(
+                "Failed to initialize native monitoring backend; "
+                "Python backend fallback has been removed"
+            )
+        self._native_backend = native_backend
+        self._using_native_backend = True
+
+        try:
+            native_backend.begin_step(int(self._current_step_id), 0)  # initialize step tracking
+        except Exception:
+            pass
+        if self.config is not None:
+            self._apply_capture_schedule()
+            self._apply_native_runtime_config()
 
         if host_engine is not None and db_config is not None:
             raise ValueError("Provide either host_engine or db_config, not both")
@@ -145,15 +128,11 @@ class MonitoringEngine:
         if host_engine is not None or db_config is not None:
             if self._model_id is None:
                 raise ValueError("model_id is required when host_engine integration is enabled")
-            if not self._using_native_backend:
-                raise RuntimeError(
-                    "DMXHostEngine integration requires the native monitoring backend "
-                    "(CUDA + monitoring_native_backend extension)"
-                )
             self._host_engine = host_engine
             if self._host_engine is None and db_config is not None:
                 try:
                     from . import _native_engine
+
                     DMXHostEngine = _native_engine.DMXHostEngine  # type: ignore[attr-defined]
                 except Exception as exc:
                     raise RuntimeError("Failed to import native DMXHostEngine") from exc
@@ -181,8 +160,8 @@ class MonitoringEngine:
         self._stats_native_submit_ms = 0.0
         # Fine-grained Python-side timings (ms)
         self._stats_py_serialize_ms = 0.0  # building tuple payloads in Python
-        self._stats_py_bind_ms = 0.0       # binding tokens back to futures
-        self._stats_py_resolve_ms = 0.0    # resolve_all + clear overhead
+        self._stats_py_bind_ms = 0.0  # binding tokens back to futures
+        self._stats_py_resolve_ms = 0.0  # resolve_all + clear overhead
         self._stats_max_tasks_per_step = 0
         self._last_prepare_ms = 0.0
         self._stats_endstep_ms_total = 0.0
@@ -193,20 +172,16 @@ class MonitoringEngine:
     # Public API
 
     def submit(self, task: MonitoringTask) -> CacheFuture:
-        """Register a monitoring task and queue it for processing."""
+        """Register a monitoring task for native backend processing."""
+
+        if not task.is_cuda():
+            raise RuntimeError("MonitoringTask tensor must be CUDA in C++-only mode")
+
+        backend = self._native_backend
+        if backend is None:
+            raise RuntimeError("Native monitoring backend is not initialized")
 
         future = CacheFuture(task)
-
-        if not self._should_process_async(task):
-            try:
-                result = _process_task_sync(task, cache_dtype=self.cache_dtype)
-            except BaseException as exc:  # pragma: no cover - diagnostics path
-                future.set_exception(exc)
-            else:
-                future.set_result(result)
-            return future
-
-        assert self._backend is not None  # backend must exist in async path
 
         step_id = self._current_step_id
         task.step_id = step_id
@@ -221,7 +196,8 @@ class MonitoringEngine:
     def start_step(self, phase: Optional[str] = None) -> None:
         """Mark the beginning of a decode/prefill step."""
 
-        if not (self.async_enabled and torch.cuda.is_available()):
+        backend = self._native_backend
+        if backend is None:
             return
 
         # Optional NVTX for Python-visible start_step
@@ -250,10 +226,7 @@ class MonitoringEngine:
             self._capture_enabled = True
 
         self._current_step_id += 1
-        if self._using_native_backend:
-            backend = self._native_backend
-            if backend is not None:
-                backend.begin_step(int(self._current_step_id), phase_code)
+        backend.begin_step(int(self._current_step_id), phase_code)
 
         if _nvtx is not None and self._nvtx_enabled:
             _nvtx.range_pop()
@@ -261,16 +234,16 @@ class MonitoringEngine:
     def begin_request(self, request_id: int) -> None:
         """Mark the beginning of a request for request-level capture gating."""
 
-        if not (self.async_enabled and torch.cuda.is_available()):
-            return
         if self.config is not None:
             self._request_capture_enabled = bool(
                 self.config.schedule.should_capture_request(int(request_id))
             )
         else:
             self._request_capture_enabled = True
-        if self._using_native_backend and self._native_backend is not None:
-            self._native_backend.begin_request(int(request_id))
+
+        backend = self._native_backend
+        if backend is not None:
+            backend.begin_request(int(request_id))
 
     def is_capture_enabled(self) -> bool:
         return bool(self._capture_enabled)
@@ -386,8 +359,6 @@ class MonitoringEngine:
     ) -> None:
         if not self._host_engine_enabled:
             return
-        if not self._using_native_backend:
-            return
         if self._model_id is None:
             return
         if not self._capture_enabled:
@@ -436,11 +407,7 @@ class MonitoringEngine:
             pass
 
         current_ids = self._active_batch_request_ids
-        need_reset = (
-            is_prefill
-            or current_ids is None
-            or len(current_ids) != batch_size
-        )
+        need_reset = is_prefill or current_ids is None or len(current_ids) != batch_size
         if need_reset:
             gid = int(self._auto_batch_group_id)
             self._auto_batch_group_id += 1
@@ -461,7 +428,11 @@ class MonitoringEngine:
             if int(attention_mask.dim()) != 2:
                 return
             try:
-                lengths = attention_mask.sum(dim=1).tolist() if not self._no_strip else [attention_mask.shape[1]] * attention_mask.shape[0]
+                lengths = (
+                    attention_mask.sum(dim=1).tolist()
+                    if not self._no_strip
+                    else [attention_mask.shape[1]] * attention_mask.shape[0]
+                )
             except Exception:
                 return
             if len(lengths) != batch_size:
@@ -523,8 +494,6 @@ class MonitoringEngine:
     def _submit_pending_db_step(self) -> None:
         if not self._host_engine_enabled or self._host_engine is None:
             return
-        if not self._using_native_backend:
-            return
 
         payload = self._pending_db_step
         if payload is None:
@@ -534,9 +503,9 @@ class MonitoringEngine:
             self._host_engine.submit(
                 model_id,
                 int(shard_rank),
-                [req_ids],       # N=1 in V1
+                [req_ids],  # N=1 in V1
                 [token_ranges],  # N=1 in V1
-                [cache_dict],    # N=1 in V1
+                [cache_dict],  # N=1 in V1
             )
         except Exception:
             pass
@@ -544,9 +513,10 @@ class MonitoringEngine:
             self._pending_db_step = None
 
     def end_step(self) -> None:
-        """Seal the current step and hand it to the backend."""
+        """Seal the current step and hand it to the native backend."""
 
-        if not (self.async_enabled and torch.cuda.is_available()):
+        backend = self._native_backend
+        if backend is None:
             return
 
         # Optional NVTX for Python-visible end_step
@@ -565,228 +535,187 @@ class MonitoringEngine:
         except RuntimeError:
             producer_stream = None
 
-        if self._using_native_backend:
-            backend = self._native_backend
-            if backend is None:
-                return
-            _t_end0 = None
-            if self._stats_enabled:
-                import time
-                _t_end0 = time.perf_counter()
-            stream_handle = _stream_to_handle(producer_stream)
+        _t_end0 = None
+        if self._stats_enabled:
+            _t_end0 = time.perf_counter()
+        stream_handle = _stream_to_handle(producer_stream)
 
-            if tasks:
-                # Build tuple payloads (measure serialize cost) and submit.
+        if tasks:
+            # Build tuple payloads (measure serialize cost) and submit.
+            if self._stats_enabled:
+                _t0 = time.perf_counter()
+                task_specs = [_serialize_task(task) for task, _ in tasks]
+                self._stats_py_serialize_ms += (time.perf_counter() - _t0) * 1000.0
+                if len(tasks) > self._stats_max_tasks_per_step:
+                    self._stats_max_tasks_per_step = len(tasks)
+            else:
+                task_specs = [_serialize_task(task) for task, _ in tasks]
+            if self._stats_enabled:
+                t0 = time.perf_counter()
+                tokens = backend.submit_step(step_id, task_specs, stream_handle)
+                self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
+            else:
+                tokens = backend.submit_step(step_id, task_specs, stream_handle)
+            if self._stats_enabled:
+                _t1 = time.perf_counter()
+                for token, (_, future) in zip(tokens, tasks):
+                    future.bind_backend(backend, token)
+                self._stats_py_bind_ms += (time.perf_counter() - _t1) * 1000.0
+            else:
+                for token, (_, future) in zip(tokens, tasks):
+                    future.bind_backend(backend, token)
+            if self._stats_enabled:
+                self._stats_steps += 1
+                self._stats_tasks += len(tasks)
+        else:
+            # No Python-collected tasks for this step: seal the native-built step.
+            if self._stats_enabled:
+                t0 = time.perf_counter()
+                backend.seal_step(step_id, stream_handle)
+                self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
+                self._stats_steps += 1
+            else:
+                backend.seal_step(step_id, stream_handle)
+        self._submit_pending_db_step()
+        if _nvtx is not None and self._nvtx_enabled:
+            _nvtx.range_pop()
+        if _t_end0 is not None:
+            _dt = (time.perf_counter() - _t_end0) * 1000.0
+            self._stats_endstep_ms_total += _dt
+            self._stats_endstep_calls += 1
+            if _dt > self._stats_endstep_ms_max:
+                self._stats_endstep_ms_max = _dt
+
+    def resolve_all(self) -> None:
+        """Block until all pending tasks have been processed."""
+
+        backend = self._native_backend
+        if backend is None:
+            return
+
+        if self._pending_tasks:
+            for step_id in sorted(self._pending_tasks.keys()):
+                tasks = self._pending_tasks.pop(step_id)
                 if self._stats_enabled:
-                    import time
                     _t0 = time.perf_counter()
                     task_specs = [_serialize_task(task) for task, _ in tasks]
                     self._stats_py_serialize_ms += (time.perf_counter() - _t0) * 1000.0
                     if len(tasks) > self._stats_max_tasks_per_step:
                         self._stats_max_tasks_per_step = len(tasks)
-                else:
-                    task_specs = [_serialize_task(task) for task, _ in tasks]
-                if self._stats_enabled:
-                    import time
                     t0 = time.perf_counter()
-                    tokens = backend.submit_step(step_id, task_specs, stream_handle)
+                    tokens = backend.submit_step(step_id, task_specs, None)
                     self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
-                else:
-                    tokens = backend.submit_step(step_id, task_specs, stream_handle)
-                if self._stats_enabled:
-                    import time
+                    if tasks:
+                        self._stats_steps += 1
+                        self._stats_tasks += len(tasks)
                     _t1 = time.perf_counter()
                     for token, (_, future) in zip(tokens, tasks):
                         future.bind_backend(backend, token)
                     self._stats_py_bind_ms += (time.perf_counter() - _t1) * 1000.0
                 else:
+                    task_specs = [_serialize_task(task) for task, _ in tasks]
+                    tokens = backend.submit_step(step_id, task_specs, None)
                     for token, (_, future) in zip(tokens, tasks):
                         future.bind_backend(backend, token)
-                if self._stats_enabled and tasks:
-                    self._stats_steps += 1
-                    self._stats_tasks += len(tasks)
-            else:
-                # No Python-collected tasks for this step: seal the native-built step.
-                if self._stats_enabled:
-                    import time
-                    t0 = time.perf_counter()
-                    backend.seal_step(step_id, stream_handle)
-                    self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
-                    self._stats_steps += 1
-                else:
-                    backend.seal_step(step_id, stream_handle)
-            self._submit_pending_db_step()
-            if _nvtx is not None and self._nvtx_enabled:
-                _nvtx.range_pop()
-            if _t_end0 is not None:
-                _dt = (time.perf_counter() - _t_end0) * 1000.0
-                self._stats_endstep_ms_total += _dt
-                self._stats_endstep_calls += 1
-                if _dt > self._stats_endstep_ms_max:
-                    self._stats_endstep_ms_max = _dt
-            return
-
-        backend = self._python_backend
-        if backend is None:
-            if _nvtx is not None and self._nvtx_enabled:
-                _nvtx.range_pop()
-            return
-        backend.submit_step(step_id, tasks, producer_stream)
-        if _nvtx is not None and self._nvtx_enabled:
-            _nvtx.range_pop()
         if self._stats_enabled:
-            import time
-            _dt = 0.0
-            try:
-                _dt = (time.perf_counter() - _t_end0) * 1000.0  # type: ignore[name-defined]
-            except Exception:
-                _dt = 0.0
-            if _dt:
-                self._stats_endstep_ms_total += _dt
-                self._stats_endstep_calls += 1
-                if _dt > self._stats_endstep_ms_max:
-                    self._stats_endstep_ms_max = _dt
-
-    def resolve_all(self) -> None:
-        """Block until all pending tasks have been processed."""
-
-        if not self.async_enabled:
-            return
-
-        if self._using_native_backend:
-            backend = self._native_backend
-            if backend is None:
-                return
-            if self._pending_tasks:
-                for step_id in sorted(self._pending_tasks.keys()):
-                    tasks = self._pending_tasks.pop(step_id)
-                    if self._stats_enabled:
-                        import time
-                        _t0 = time.perf_counter()
-                        task_specs = [_serialize_task(task) for task, _ in tasks]
-                        self._stats_py_serialize_ms += (time.perf_counter() - _t0) * 1000.0
-                        if len(tasks) > self._stats_max_tasks_per_step:
-                            self._stats_max_tasks_per_step = len(tasks)
-                        t0 = time.perf_counter()
-                        tokens = backend.submit_step(step_id, task_specs, None)
-                        self._stats_native_submit_ms += (time.perf_counter() - t0) * 1000.0
-                        if tasks:
-                            self._stats_steps += 1
-                            self._stats_tasks += len(tasks)
-                        _t1 = time.perf_counter()
-                        for token, (_, future) in zip(tokens, tasks):
-                            future.bind_backend(backend, token)
-                        self._stats_py_bind_ms += (time.perf_counter() - _t1) * 1000.0
-                    else:
-                        task_specs = [_serialize_task(task) for task, _ in tasks]
-                        tokens = backend.submit_step(step_id, task_specs, None)
-                        for token, (_, future) in zip(tokens, tasks):
-                            future.bind_backend(backend, token)
-            if self._stats_enabled:
-                import time
-                _t2 = time.perf_counter()
-                backend.resolve_all()
-                self.clear_completed_results()
-                self._stats_py_resolve_ms += (time.perf_counter() - _t2) * 1000.0
-            else:
-                backend.resolve_all()
-                self.clear_completed_results()
-            return
-
-        backend = self._python_backend
-        if backend is None:
-            return
-        if self._pending_tasks:
-            for step_id in sorted(self._pending_tasks.keys()):
-                tasks = self._pending_tasks.pop(step_id)
-                backend.submit_step(step_id, tasks, None)
-        backend.resolve_all()
+            _t2 = time.perf_counter()
+            backend.resolve_all()
+            self.clear_completed_results()
+            self._stats_py_resolve_ms += (time.perf_counter() - _t2) * 1000.0
+        else:
+            backend.resolve_all()
+            self.clear_completed_results()
 
     def close(self) -> None:
         """Tear down backend resources."""
+
         self._pending_db_step = None
         self._active_batch_request_ids = None
         self._active_batch_start_idx_per_request = None
         self._active_batch_finished_per_request = None
-        if self._host_engine is not None and not self._using_native_backend:
+
+        backend = self._native_backend
+        if backend is None:
+            return
+
+        if self._stats_enabled:
             try:
-                self._python_backend.resolve_all()
+                stats = backend.get_stats()
+            except Exception:
+                stats = None
+            print(
+                "[MonEng/Stats] hooks=",
+                self._stats_hooks,
+                " steps=",
+                self._stats_steps,
+                " tasks=",
+                self._stats_tasks,
+                " py_serialize_ms=",
+                round(self._stats_py_serialize_ms, 3),
+                " py_submit_ms=",
+                round(self._stats_native_submit_ms, 3),
+                " py_bind_ms=",
+                round(self._stats_py_bind_ms, 3),
+                " py_resolve_ms=",
+                round(self._stats_py_resolve_ms, 3),
+                " end_step_ms=",
+                round(self._stats_endstep_ms_total, 3),
+                " end_step_avg_ms=",
+                round(
+                    (self._stats_endstep_ms_total / self._stats_endstep_calls)
+                    if self._stats_endstep_calls
+                    else 0.0,
+                    3,
+                ),
+                " end_step_max_ms=",
+                round(self._stats_endstep_ms_max, 3),
+                " max_tasks_per_step=",
+                self._stats_max_tasks_per_step,
+            )
+            if stats is not None:
+                try:
+                    # Expect dict with microseconds
+                    print(
+                        "[Native/Stats] steps=",
+                        int(stats.get("total_steps", 0)),
+                        " tasks=",
+                        int(stats.get("total_tasks", 0)),
+                        " submit_ms=",
+                        round(float(stats.get("submit_us", 0.0)) / 1000.0, 3),
+                        " process_ms=",
+                        round(float(stats.get("process_us", 0.0)) / 1000.0, 3),
+                        " callback_ms=",
+                        round(float(stats.get("callback_us", 0.0)) / 1000.0, 3),
+                    )
+                except Exception:
+                    pass
+            # Optional: slice mode stats
+            try:
+                from monitoring.hook_points import get_monitoring_hook_stats
+
+                hook_stats = get_monitoring_hook_stats()
+                if hook_stats:
+                    print("[Hook/Stats]", hook_stats)
+            except Exception:
+                pass
+
+        if self._host_engine is not None:
+            try:
                 self._host_engine.stop()
             except Exception:
                 pass
             self._host_engine = None
             self._host_engine_enabled = False
 
-        if self._using_native_backend:
-            backend = self._native_backend
-            if backend is None:
-                return
-            if self._stats_enabled:
-                try:
-                    stats = backend.get_stats()
-                except Exception:
-                    stats = None
-                print("[MonEng/Stats] hooks=", self._stats_hooks,
-                      " steps=", self._stats_steps,
-                      " tasks=", self._stats_tasks,
-                      " py_serialize_ms=", round(self._stats_py_serialize_ms, 3),
-                      " py_submit_ms=", round(self._stats_native_submit_ms, 3),
-                      " py_bind_ms=", round(self._stats_py_bind_ms, 3),
-                      " py_resolve_ms=", round(self._stats_py_resolve_ms, 3),
-                      " end_step_ms=", round(self._stats_endstep_ms_total, 3),
-                      " end_step_avg_ms=",
-                      round(
-                          (self._stats_endstep_ms_total / self._stats_endstep_calls)
-                          if self._stats_endstep_calls
-                          else 0.0,
-                          3,
-                      ),
-                      " end_step_max_ms=", round(self._stats_endstep_ms_max, 3),
-                      " max_tasks_per_step=", self._stats_max_tasks_per_step)
-                if stats is not None:
-                    try:
-                        # Expect dict with microseconds
-                        print(
-                            "[Native/Stats] steps=", int(stats.get("total_steps", 0)),
-                            " tasks=", int(stats.get("total_tasks", 0)),
-                            " submit_ms=", round(float(stats.get("submit_us", 0.0)) / 1000.0, 3),
-                            " process_ms=", round(float(stats.get("process_us", 0.0)) / 1000.0, 3),
-                            " callback_ms=", round(float(stats.get("callback_us", 0.0)) / 1000.0, 3),
-                        )
-                    except Exception:
-                        pass
-                # Optional: slice mode stats
-                try:
-                    from monitoring.hook_points import get_monitoring_hook_stats
-                    hook_stats = get_monitoring_hook_stats()
-                    if hook_stats:
-                        print("[Hook/Stats]", hook_stats)
-                except Exception:
-                    pass
-            if self._host_engine is not None:
-                try:
-                    self._host_engine.stop()
-                except Exception:
-                    pass
-                self._host_engine = None
-                self._host_engine_enabled = False
-            self.clear_completed_results()
-            backend.close()
-            self._native_backend = None
-            self._backend = None
-            return
-
-        backend = self._python_backend
-        if backend is None:
-            return
+        self.clear_completed_results()
         backend.close()
-        self._python_backend = None
-        self._backend = None
+        self._native_backend = None
+        self._using_native_backend = False
 
     def clear_completed_results(self) -> None:
         """Clear completed results held by native backend to free memory."""
 
-        if self._using_native_backend and self._native_backend is not None:
+        if self._native_backend is not None:
             try:
                 from torch.cuda import nvtx as _nvtx  # type: ignore
             except Exception:
@@ -800,23 +729,9 @@ class MonitoringEngine:
             else:
                 self._native_backend.clear_completed_results()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-
-    def _should_process_async(self, task: MonitoringTask) -> bool:
-        if not self.async_enabled:
-            return False
-        if not torch.cuda.is_available():
-            return False
-        if not task.is_cuda():
-            return False
-        if self._backend is None:
-            return False
-        return True
-
 
 # ---------------------------------------------------------------------------
-# Backend loaders
+# Backend loader
 
 
 def _load_native_backend(
@@ -825,14 +740,10 @@ def _load_native_backend(
     delay_steps: int,
     advance: AdvanceConfig,
 ) -> Optional[Any]:
-    """Attempt to load the native backend extension.
-
-    Returns None when the extension is unavailable. The actual native backend
-    will be implemented in subsequent phases; this loader prepares the hook.
-    """
+    """Attempt to load the native backend extension."""
 
     try:
-        from . import _native_engine  # pragma: no cover - module absent today
+        from . import _native_engine
     except Exception:
         return None
 
@@ -848,294 +759,6 @@ def _load_native_backend(
         )
     except Exception:
         return None
-
-
-# ---------------------------------------------------------------------------
-# Python fallback backend (mirrors existing behaviour)
-
-
-@dataclass
-class _StepWork:
-    step_id: int
-    tasks: List[Tuple[MonitoringTask, CacheFuture]]
-
-
-class _StepQueue:
-    """Single-producer/single-consumer queue with optional max size."""
-
-    def __init__(self, maxsize: int) -> None:
-        self._maxsize = maxsize if maxsize > 0 else None
-        self._lock = threading.Lock()
-        self._not_empty = threading.Condition(self._lock)
-        self._not_full = threading.Condition(self._lock) if self._maxsize else None
-        if self._maxsize:
-            self._buffer: Union[List[Optional[_StepWork]], Deque[Optional[_StepWork]]] = [None] * self._maxsize
-            self._head = 0
-            self._tail = 0
-            self._size = 0
-        else:
-            self._buffer = deque()  # type: ignore[assignment]
-        self._unfinished_tasks = 0
-        self._all_tasks_done = threading.Condition(self._lock)
-
-    def put(self, item: Union[_StepWork, object]) -> None:
-        with self._lock:
-            if self._maxsize:
-                assert isinstance(self._buffer, list)
-                assert self._not_full is not None
-                while self._size == self._maxsize:
-                    self._not_full.wait()
-                self._buffer[self._tail] = item  # type: ignore[index]
-                self._tail = (self._tail + 1) % self._maxsize
-                self._size += 1
-            else:
-                assert isinstance(self._buffer, deque)
-                self._buffer.append(item)  # type: ignore[arg-type]
-            self._unfinished_tasks += 1
-            self._not_empty.notify()
-
-    def get(self) -> Union[_StepWork, object]:
-        with self._lock:
-            while True:
-                if self._maxsize:
-                    assert isinstance(self._buffer, list)
-                    if self._size:
-                        item = self._buffer[self._head]
-                        self._buffer[self._head] = None
-                        self._head = (self._head + 1) % self._maxsize
-                        self._size -= 1
-                        if self._not_full is not None:
-                            self._not_full.notify()
-                        return item  # type: ignore[return-value]
-                else:
-                    assert isinstance(self._buffer, deque)
-                    if self._buffer:
-                        return self._buffer.popleft()
-                self._not_empty.wait()
-
-    def task_done(self) -> None:
-        with self._lock:
-            if self._unfinished_tasks <= 0:
-                raise ValueError("task_done() called too many times")
-            self._unfinished_tasks -= 1
-            if self._unfinished_tasks == 0:
-                self._all_tasks_done.notify_all()
-
-    def join(self) -> None:
-        with self._lock:
-            while self._unfinished_tasks:
-                self._all_tasks_done.wait()
-
-
-class _SimpleStepQueue:
-    """queue.SimpleQueue wrapper that adds join semantics."""
-
-    def __init__(self) -> None:
-        self._queue: SimpleQueue = SimpleQueue()
-        self._lock = threading.Lock()
-        self._all_tasks_done = threading.Condition(self._lock)
-        self._unfinished_tasks = 0
-
-    def put(self, item: Union[_StepWork, object]) -> None:
-        with self._lock:
-            self._unfinished_tasks += 1
-        self._queue.put(item)
-
-    def get(self) -> Union[_StepWork, object]:
-        return self._queue.get()
-
-    def task_done(self) -> None:
-        with self._lock:
-            if self._unfinished_tasks <= 0:
-                raise ValueError("task_done() called too many times")
-            self._unfinished_tasks -= 1
-            if self._unfinished_tasks == 0:
-                self._all_tasks_done.notify_all()
-
-    def join(self) -> None:
-        with self._lock:
-            while self._unfinished_tasks:
-                self._all_tasks_done.wait()
-
-
-class _PythonBackend:
-    """Existing Python implementation retained as fallback."""
-
-    def __init__(
-        self,
-        *,
-        queue_size: int,
-        cache_dtype: Optional[torch.dtype],
-        delay_steps: int,
-    ) -> None:
-        self.cache_dtype = cache_dtype
-        self._delay_steps = delay_steps
-
-        if queue_size > 0:
-            self._queue: Union[_StepQueue, _SimpleStepQueue] = _StepQueue(queue_size)
-        else:
-            self._queue = _SimpleStepQueue()
-
-        self._worker: Optional[threading.Thread] = None
-        self._cache_stream: Optional[torch.cuda.Stream] = None
-        self._stop_event = threading.Event()
-
-        self._sealed_steps: Deque[int] = deque()
-        self._step_buckets: Dict[int, List[Tuple[MonitoringTask, CacheFuture]]] = {}
-        self._lock = threading.Lock()
-
-    # BackendProtocol ------------------------------------------------------------------
-
-    def submit_step(
-        self,
-        step_id: int,
-        tasks: Iterable[Tuple[MonitoringTask, CacheFuture]],
-        producer_stream: Optional[torch.cuda.Stream],
-    ) -> None:
-        tasks_list = list(tasks)
-
-        with self._lock:
-            self._step_buckets[step_id] = tasks_list
-            self._sealed_steps.append(step_id)
-
-        if tasks_list:
-            self._ensure_started()
-            if self._cache_stream is not None and producer_stream is not None:
-                try:
-                    self._cache_stream.wait_stream(producer_stream)
-                except Exception:
-                    pass
-
-        self._enqueue_ready_steps()
-
-    def resolve_all(self) -> None:
-        self._enqueue_all_steps()
-        self._queue.join()
-
-    def close(self) -> None:
-        with self._lock:
-            if self._worker is None:
-                return
-            self._stop_event.set()
-            self._queue.put(_QUEUE_SENTINEL)
-            worker = self._worker
-            self._worker = None
-            cache_stream = self._cache_stream
-            self._cache_stream = None
-
-        if worker is not None:
-            worker.join()
-
-        if cache_stream is not None:
-            del cache_stream
-
-        self._stop_event.clear()
-
-    # Internal helpers ----------------------------------------------------------------
-
-    def _ensure_started(self) -> None:
-        if self._worker is not None:
-            return
-        with self._lock:
-            if self._worker is not None:
-                return
-            try:
-                _, max_pri = torch.cuda.priority_range()
-                self._cache_stream = torch.cuda.Stream(priority=max_pri)
-            except Exception:
-                self._cache_stream = torch.cuda.Stream()
-            self._worker = threading.Thread(
-                target=self._worker_loop,
-                name="monitoring-engine",
-                daemon=True,
-            )
-            self._worker.start()
-
-    def _enqueue_ready_steps(self) -> None:
-        with self._lock:
-            while len(self._sealed_steps) > self._delay_steps:
-                step_id = self._sealed_steps.popleft()
-                tasks = self._step_buckets.pop(step_id, [])
-                if not tasks:
-                    continue
-                self._queue.put(_StepWork(step_id, tasks))
-
-    def _enqueue_all_steps(self) -> None:
-        with self._lock:
-            while self._sealed_steps:
-                step_id = self._sealed_steps.popleft()
-                tasks = self._step_buckets.pop(step_id, [])
-                if not tasks:
-                    continue
-                self._queue.put(_StepWork(step_id, tasks))
-
-    def _worker_loop(self) -> None:
-        assert self._cache_stream is not None
-        cache_stream = self._cache_stream
-        while True:
-            work = self._queue.get()
-            if work is _QUEUE_SENTINEL:
-                self._queue.task_done()
-                break
-
-            assert isinstance(work, _StepWork)
-            try:
-                with torch.cuda.stream(cache_stream):
-                    for task, future in work.tasks:
-                        tensor = _process_task_sync(task, cache_dtype=self.cache_dtype)
-                        future.set_result(tensor)
-            except BaseException as exc:  # pragma: no cover - propagate diag
-                for _, future in work.tasks:
-                    future.set_exception(exc)
-            finally:
-                work.tasks.clear()
-                self._queue.task_done()
-
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-
-
-def _process_task_sync(
-    task: MonitoringTask,
-    *,
-    cache_dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    tensor = task.tensor
-
-    if task.target_device is not None and tensor.device != task.target_device:
-        tensor = tensor.to(task.target_device, non_blocking=True)
-
-    if task.metadata.get("remove_batch_dim"):
-        tensor = tensor[0]
-
-    can_slice = task.metadata.get("can_slice")
-    if can_slice is None:
-        can_slice = True
-
-    if task.pos_slice is not None and can_slice:
-        tensor = _apply_pos_slice(tensor, task)
-
-    if cache_dtype is not None and tensor.dtype != cache_dtype:
-        tensor = tensor.to(cache_dtype)
-
-    return tensor
-
-
-def _apply_pos_slice(tensor: torch.Tensor, task: MonitoringTask) -> torch.Tensor:
-    slice_obj = task.pos_slice
-    if slice_obj is None:
-        return tensor
-
-    if Slice is not None and isinstance(slice_obj, Slice):
-        if getattr(slice_obj, "mode", None) == "identity":
-            return tensor
-        return slice_obj.apply(tensor, dim=task.slice_dim)
-
-    if hasattr(slice_obj, "apply"):
-        return slice_obj.apply(tensor, dim=task.slice_dim)
-
-    return tensor[(slice_obj,)]  # pragma: no cover - defensive fallback
 
 
 __all__ = ["MonitoringEngine"]

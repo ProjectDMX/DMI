@@ -25,15 +25,13 @@ def _build_small_lm() -> HookedGPT2LMHeadModel:
 
 def test_generate_with_monitoring_calls_run_with_cache():
     model = _build_small_lm()
-    cfg = MonitoringConfig(hooks=HookSelection(mode="custom", include=["final_logits"]))
-    engine = MonitoringEngine(async_enabled=False, config=cfg)
-    model.monitoring_engine = engine
 
     calls = {"count": 0}
     orig_run_with_cache = model.run_with_cache
 
     def wrapped_run_with_cache(*args, **kwargs):
         calls["count"] += 1
+        kwargs.setdefault("names_filter", "final_logits")
         return orig_run_with_cache(*args, **kwargs)
 
     model.run_with_cache = wrapped_run_with_cache  # type: ignore[assignment]
@@ -57,6 +55,13 @@ def test_generate_with_monitoring_calls_run_with_cache():
 def test_generate_with_monitoring_preserves_forward_signature():
     model = _build_small_lm()
     orig_sig = inspect.signature(model.forward)
+    orig_run_with_cache = model.run_with_cache
+
+    def wrapped_run_with_cache(*args, **kwargs):
+        kwargs.setdefault("names_filter", "final_logits")
+        return orig_run_with_cache(*args, **kwargs)
+
+    model.run_with_cache = wrapped_run_with_cache  # type: ignore[assignment]
 
     _ = generate_with_monitoring(
         model,

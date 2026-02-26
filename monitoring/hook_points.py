@@ -7,7 +7,7 @@ Helpers to access activations in models.
 
 import logging
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,7 +22,6 @@ from torch import Tensor
 from .utils import Slice, SliceInput
 
 from .engine import MonitoringEngine
-from .task import MonitoringTask
 
 try:
     from torch.cuda import nvtx as _nvtx
@@ -48,16 +47,6 @@ def _hook_stats_enabled() -> bool:
 
 # Global accumulators for lightweight hook-side profiling (microseconds)
 _hook_total_calls = 0
-_hook_submit_calls = 0
-
-_hook_build_us = 0.0        # MonitoringTask + metadata build
-_hook_submit_us = 0.0       # engine.submit(task)
-_hook_cache_set_us = 0.0    # cache[...] assignment
-
-_per_hook_counts: Counter[str] = Counter()
-_per_hook_build_us = defaultdict(float)
-_per_hook_submit_us = defaultdict(float)
-_per_hook_cache_us = defaultdict(float)
 
 # For synchronous path diagnostics
 _sync_build_us = 0.0
@@ -73,21 +62,12 @@ def get_monitoring_hook_stats() -> dict:
     """Return aggregated hook-side profiling stats (cheap to call)."""
     return {
         "total_calls": _hook_total_calls,
-        "submit_calls": _hook_submit_calls,
-        "build_us": int(_hook_build_us),
-        "submit_us": int(_hook_submit_us),
-        "cache_set_us": int(_hook_cache_set_us),
         "sync_build_us": int(_sync_build_us),
         "sync_move_us": int(_sync_move_us),
         "sync_remove_batch_us": int(_sync_remove_batch_us),
         "sync_slice_us": int(_sync_slice_us),
         "sync_cache_set_us": int(_sync_cache_set_us),
         "per_hook_top": {
-            # Top offenders by build/submit/slice
-            "counts": _per_hook_counts.most_common(10),
-            "build_us": sorted(_per_hook_build_us.items(), key=lambda kv: -kv[1])[:10],
-            "submit_us": sorted(_per_hook_submit_us.items(), key=lambda kv: -kv[1])[:10],
-            "cache_us": sorted(_per_hook_cache_us.items(), key=lambda kv: -kv[1])[:10],
             "sync_build_us": sorted(_per_hook_sync_build_us.items(), key=lambda kv: -kv[1])[:10],
             "sync_move_us": sorted(_per_hook_sync_move_us.items(), key=lambda kv: -kv[1])[:10],
             "sync_slice_us": sorted(_per_hook_sync_slice_us.items(), key=lambda kv: -kv[1])[:10],
@@ -961,6 +941,10 @@ class HookedRootModule(nn.Module):
             native_backend = getattr(engine, "_native_backend", None)
             native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
         native_callback_active = native_using
+        if engine is not None and not native_callback_active:
+            raise RuntimeError(
+                "MonitoringEngine native callback backend is required; Python fallback path was removed"
+            )
 
         def save_hook(tensor: Tensor, hook: HookPoint, is_backward: bool = False):
             # for attention heads the pos dimension is the third from last
@@ -976,8 +960,7 @@ class HookedRootModule(nn.Module):
 
             range_label = f"TL::Cache[{hook_name}]"
             with _nvtx_range(range_label):
-                global _hook_total_calls, _hook_submit_calls
-                global _hook_build_us, _hook_submit_us, _hook_cache_set_us
+                global _hook_total_calls
                 global _sync_build_us, _sync_move_us, _sync_remove_batch_us, _sync_slice_us, _sync_cache_set_us
                 _hook_total_calls += 1 if _hook_stats_enabled() else 0
 
@@ -1000,42 +983,9 @@ class HookedRootModule(nn.Module):
                     if native_callback_active:
                         cache[hook_name] = None
                         return
-                    # Fallback to Python engine.submit if native backend is not available
-                    if _hook_stats_enabled():
-                        t0 = time.perf_counter()
-                    metadata = {
-                        "remove_batch_dim": remove_batch_dim,
-                        "can_slice": tensor.dim() >= -pos_dim,
-                    }
-                    task = MonitoringTask(
-                        name=hook_name,
-                        tensor=resid_stream,
-                        pos_slice=pos_slice,
-                        slice_dim=pos_dim,
-                        event=None,
-                        metadata=metadata,
-                        target_device=device if device is not None else None,
+                    raise RuntimeError(
+                        "MonitoringEngine native callback backend is required; Python fallback path was removed"
                     )
-                    if _hook_stats_enabled():
-                        t1 = time.perf_counter()
-                        _hook_build_us += (t1 - t0) * 1e6
-                        _per_hook_build_us[hook_name] += (t1 - t0) * 1e6
-                        _per_hook_counts[hook_name] += 1
-                        _hook_submit_calls += 1
-                        t2 = time.perf_counter()
-                        future = engine.submit(task)
-                        t3 = time.perf_counter()
-                        _hook_submit_us += (t3 - t2) * 1e6
-                        _per_hook_submit_us[hook_name] += (t3 - t2) * 1e6
-                        t4 = time.perf_counter()
-                        cache[hook_name] = future
-                        t5 = time.perf_counter()
-                        _hook_cache_set_us += (t5 - t4) * 1e6
-                        _per_hook_cache_us[hook_name] += (t5 - t4) * 1e6
-                    else:
-                        future = engine.submit(task)
-                        cache[hook_name] = future
-                    return
 
                 # sync build（进入同步分支到移动前的轻量准备）
                 t_sb0 = time.perf_counter() if _hook_stats_enabled() else None

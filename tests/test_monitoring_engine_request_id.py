@@ -39,14 +39,22 @@ class _DummyHostEngine:
         )
 
 
-def _build_engine_for_db_step_unit() -> tuple[MonitoringEngine, _DummyHostEngine]:
-    engine = MonitoringEngine(async_enabled=False, model_id="unit-test-model")
+class _DummyNativeBackend:
+    def begin_step(self, step_id: int, phase_code: int) -> None:
+        return None
+
+
+def _build_engine_for_db_step_unit(monkeypatch) -> tuple[MonitoringEngine, _DummyHostEngine]:
+    monkeypatch.setattr(
+        "monitoring.engine._load_native_backend",
+        lambda *args, **kwargs: _DummyNativeBackend(),
+    )
+    engine = MonitoringEngine(async_enabled=True, model_id="unit-test-model")
     host = _DummyHostEngine()
 
-    # Unit-test mode: bypass backend initialization and validate only Python DB-step logic.
+    # Unit-test mode: validate Python DB-step logic with a no-op native backend.
     engine._host_engine = host
     engine._host_engine_enabled = True
-    engine._using_native_backend = True
     engine._capture_enabled = True
     return engine, host
 
@@ -62,8 +70,8 @@ def _submit_step(
     engine._submit_pending_db_step()
 
 
-def test_request_id_reset_on_prefill_and_batch_change() -> None:
-    engine, host = _build_engine_for_db_step_unit()
+def test_request_id_reset_on_prefill_and_batch_change(monkeypatch) -> None:
+    engine, host = _build_engine_for_db_step_unit(monkeypatch)
 
     cache_dict = {
         "final_logits": _DummyFuture(),
@@ -123,8 +131,8 @@ def test_request_id_reset_on_prefill_and_batch_change() -> None:
     assert ranges2 == [[(0, 4), (0, 2)]]
 
 
-def test_request_id_eos_finished_stops_decode_growth() -> None:
-    engine, host = _build_engine_for_db_step_unit()
+def test_request_id_eos_finished_stops_decode_growth(monkeypatch) -> None:
+    engine, host = _build_engine_for_db_step_unit(monkeypatch)
     cfg = MonitoringConfig()
     cfg.eos_token_id = 99
     cfg.pad_token_id = 0
