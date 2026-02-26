@@ -80,6 +80,7 @@ class MonitoringEngine:
         self.config = config
         self._debug_enabled = bool(self.config.debug) if self.config is not None else False
         self._nvtx_enabled = self._debug_enabled
+        self._no_strip = False if config is None else config.no_strip
         self._request_capture_enabled = True
         self._capture_enabled = True
         self._hook_cache_config_id: Optional[int] = None
@@ -460,7 +461,7 @@ class MonitoringEngine:
             if int(attention_mask.dim()) != 2:
                 return
             try:
-                lengths = attention_mask.sum(dim=1).tolist()
+                lengths = attention_mask.sum(dim=1).tolist() if not self._no_strip else [attention_mask.shape[1]] * attention_mask.shape[0]
             except Exception:
                 return
             if len(lengths) != batch_size:
@@ -502,9 +503,11 @@ class MonitoringEngine:
                     except Exception:
                         pass
                 if is_finished:
-                    token_ranges.append((start_i, start_i))
                     finished[i] = True
+                if is_finished and not self._no_strip:
+                    token_ranges.append((start_i, start_i))
                 else:
+                    # Not finished or no strip.
                     end_i = start_i + 1
                     token_ranges.append((start_i, end_i))
                     starts[i] = end_i

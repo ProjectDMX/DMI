@@ -165,6 +165,7 @@ class MonitoringConfig:
     native_partial_seal: NativePartialSealConfig = field(default_factory=NativePartialSealConfig)
     advance: AdvanceConfig = field(default_factory=AdvanceConfig)
     debug: bool = False
+    no_strip: bool = field(default=False)
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-friendly representation for native backend handoff."""
@@ -199,4 +200,5 @@ class MonitoringConfig:
                 "host_copy_queue_size": self.advance.host_copy_queue_size,
             },
             "debug": bool(self.debug),
+            "no_strip": bool(self.no_strip),
         }
