@@ -13,6 +13,7 @@ from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
 from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
 
 from monitoring import (
+    AdvanceConfig,
     ClickHouseClientConfig,
     EnqueuePolicy,
     HostEngineConfig,
@@ -109,9 +110,9 @@ def _build_ingress_policy() -> EnqueuePolicy:
     return p
 
 
-def _build_host_config(db_cfg: ClickHouseClientConfig) -> HostEngineConfig:
+def _build_host_config(db_cfg: ClickHouseClientConfig, *, debug: bool = False) -> HostEngineConfig:
     # Stage 1: wait on BackendFuture + parse payloads
-    stage_one = StageConfig.process_future(parallelism=1, name="process_future")
+    stage_one = StageConfig.process_future(parallelism=1, name="process_future", debug=bool(debug))
     # Stage 2: insert into ClickHouse
     stage_two = StageConfig.clickhouse_insert(db_cfg, parallelism=1, name="clickhouse_insert")
 
@@ -138,16 +139,6 @@ def main() -> None:
     args = parser.parse_args()
     model_id = _resolve_model_id(args.model)
 
-    # Native backend must be enabled for MonitoringEngine + (optional) DB futures.
-    os.environ.setdefault("MON_NATIVE_TO_CPU", "1")
-    os.environ.setdefault("MON_NATIVE_CALLBACK", "1")
-    os.environ.setdefault("MON_NATIVE_BUILDER", "1")
-    os.environ.setdefault("MON_NATIVE_BATCH", "0")
-    # Enable pinned and memcpy pool.
-    os.environ.setdefault("MON_NATIVE_PINNED", "1")
-    os.environ.setdefault("MON_NATIVE_PINPOOL", "1")
-    os.environ.setdefault("MON_NATIVE_HOST_COPY_THREADS", "5")
-
     if not torch.cuda.is_available():
         raise RuntimeError("Monitoring benchmark requires CUDA + native backend.")
 
@@ -167,12 +158,14 @@ def main() -> None:
             cap_ratio=0.8,
             driver_guard_mb=1024,
         ),
+        advance=AdvanceConfig(host_copy_threads=0),
+        debug=os.environ.get("BENCH_NVTX", "0") == "1",
     )
 
     host_cfg = None
     if not args.no_db:
         db_cfg = _build_db_config()
-        host_cfg = _build_host_config(db_cfg)
+        host_cfg = _build_host_config(db_cfg, debug=bool(cfg.debug))
 
     engine = MonitoringEngine(
         async_enabled=True,

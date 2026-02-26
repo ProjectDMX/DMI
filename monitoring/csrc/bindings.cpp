@@ -10,12 +10,23 @@ namespace monitoring {
 
 std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,
                                                       py::object cache_dtype,
-                                                      int64_t delay_steps) {
+                                                      int64_t delay_steps,
+                                                      const std::vector<int64_t>& pinpool_bins_kb,
+                                                      int64_t pinpool_max_mb,
+                                                      int64_t host_copy_threads,
+                                                      int64_t host_copy_queue_size) {
   std::optional<at::ScalarType> dtype;
   if (!cache_dtype.is_none()) {
     dtype = cache_dtype.cast<at::ScalarType>();
   }
-  return std::make_shared<NativeMonitoringEngine>(queue_size, dtype, delay_steps);
+  return std::make_shared<NativeMonitoringEngine>(
+      queue_size,
+      dtype,
+      delay_steps,
+      pinpool_bins_kb,
+      pinpool_max_mb,
+      host_copy_threads,
+      host_copy_queue_size);
 }
 
 }  // namespace monitoring
@@ -62,9 +73,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("collect_step_futures_into",
            &monitoring::NativeMonitoringEngine::collect_step_futures_into,
            py::arg("step_id"), py::arg("cache"))
-      .def("submit_step_soa", &monitoring::NativeMonitoringEngine::submit_step_soa,
-           py::arg("step_id"), py::arg("spec"),
-           py::arg("stream_handle") = std::optional<uint64_t>())
       .def("add_task", &monitoring::NativeMonitoringEngine::add_task,
            py::arg("step_id"), py::arg("task"))
       .def("seal_step", &monitoring::NativeMonitoringEngine::seal_step,
@@ -101,7 +109,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("called_from_cpp") = false);
 
   m.def("create_engine", &monitoring::create_engine,
-        py::arg("queue_size"), py::arg("cache_dtype"), py::arg("delay_steps"));
+        py::arg("queue_size"),
+        py::arg("cache_dtype"),
+        py::arg("delay_steps"),
+        py::arg("pinpool_bins_kb") = std::vector<int64_t>{256, 512, 1024, 2048, 4096, 8192},
+        py::arg("pinpool_max_mb") = 512,
+        py::arg("host_copy_threads") = 0,
+        py::arg("host_copy_queue_size") = 512);
 
 
   // ---- ClickHouseClientConfig (config only; stage is C++-only) ----
@@ -250,19 +264,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       // Stage 1: ProcessFuture
       .def_static(
           "process_future",
-          [](int parallelism, std::string name) {
+          [](int parallelism, std::string name, bool debug) {
             StageConfig cfg;
             cfg.name = std::move(name);
             cfg.parallelism = parallelism;
             cfg.process_fn = [](std::vector<dmx_host::dmx_host_queue_item> batch, QueueT* next_q) {
               return dmx_host::ProcessFutureStage::ProcessFn<QueueT>(std::move(batch), next_q);
             };
+            cfg.thread_init_config = debug;
             cfg.thread_init = &dmx_host::ProcessFutureStage::ThreadInitAny;
             cfg.thread_cleanup = &dmx_host::ProcessFutureStage::ThreadCleanupAny;
             return cfg;
           },
           py::arg("parallelism") = 1,
-          py::arg("name") = "process_future")
+          py::arg("name") = "process_future",
+          py::arg("debug") = false)
       // Stage 2: ClickHouse insert (this is where thread_init_config matters)
       .def_static(
           "clickhouse_insert",

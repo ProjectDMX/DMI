@@ -6,7 +6,6 @@ Helpers to access activations in models.
 """
 
 import logging
-import os
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
@@ -30,10 +29,22 @@ try:
 except Exception:  # pragma: no cover - nvtx not always available
     _nvtx = None
 
-_NVTX_ENABLED = bool(int(os.environ.get("TL_ENABLE_NVTX", "0"))) and _nvtx is not None
-_HOOK_STATS_ENABLED = bool(int(os.environ.get("MON_ENGINE_STATS", "0"))) or bool(
-    int(os.environ.get("MON_HOOK_STATS", "0"))
-)
+_MONITORING_DEBUG = False
+
+
+def set_monitoring_debug(enabled: bool) -> None:
+    """Set shared debug mode for hook-side NVTX/stat paths."""
+
+    global _MONITORING_DEBUG
+    _MONITORING_DEBUG = bool(enabled)
+
+
+def _nvtx_enabled() -> bool:
+    return bool(_MONITORING_DEBUG and _nvtx is not None)
+
+
+def _hook_stats_enabled() -> bool:
+    return bool(_MONITORING_DEBUG)
 
 # Global accumulators for lightweight hook-side profiling (microseconds)
 _hook_total_calls = 0
@@ -86,7 +97,7 @@ def get_monitoring_hook_stats() -> dict:
 
 @contextmanager
 def _nvtx_range(message: str):
-    if _NVTX_ENABLED:
+    if _nvtx_enabled():
         _nvtx.range_push(message)
         try:
             yield
@@ -190,7 +201,7 @@ class HookPoint(nn.Module):
             from torch.cuda import nvtx as _nvtx  # type: ignore
         except Exception:
             _nvtx = None  # type: ignore
-        nvtx_enabled = _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0")))
+        nvtx_enabled = _nvtx_enabled()
         if nvtx_enabled:
             hk = self.name or "unnamed"
             _nvtx.range_push(f"TL::RegisterHook[{hk}:{dir}]")
@@ -348,7 +359,7 @@ class HookedRootModule(nn.Module):
             from torch.cuda import nvtx as _nvtx  # type: ignore
         except Exception:
             _nvtx = None  # type: ignore
-        nvtx_enabled = _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0")))
+        nvtx_enabled = _nvtx_enabled()
         if nvtx_enabled:
             _nvtx.range_push("TL::ResetHooks")
         if clear_contexts:
@@ -520,7 +531,7 @@ class HookedRootModule(nn.Module):
                 from torch.cuda import nvtx as _nvtx  # type: ignore
             except Exception:
                 _nvtx = None  # type: ignore
-            nvtx_enabled = _nvtx is not None and bool(int(os.environ.get("TL_ENABLE_NVTX", "0")))
+            nvtx_enabled = _nvtx_enabled()
             if nvtx_enabled:
                 _nvtx.range_push("TL::EnableHooks[fwd]")
             for name, hook in fwd_hooks:
@@ -698,9 +709,7 @@ class HookedRootModule(nn.Module):
             engine = self.monitoring_engine
             native_backend = getattr(engine, "_native_backend", None) if engine is not None else None
             native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
-            native_builder_enabled = bool(getattr(engine, "_native_builder_enabled", False))
-            native_callback_enabled = bool(getattr(engine, "_native_callback_enabled", False))
-            native_callback_active = native_using and native_builder_enabled and native_callback_enabled
+            native_callback_active = native_using
             if native_callback_active and not fwd and not bwd:
                 use_ctx = False
         except Exception:
@@ -733,10 +742,7 @@ class HookedRootModule(nn.Module):
                     return model_out, cache_dict
                 native_backend = getattr(engine, "_native_backend", None)
                 native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
-                native_builder_enabled = bool(getattr(engine, "_native_builder_enabled", False))
-                native_batch_enabled = bool(getattr(engine, "_native_batch_enabled", False))
-                native_callback_enabled = bool(getattr(engine, "_native_callback_enabled", False))
-                native_callback_active = native_using and native_builder_enabled and native_callback_enabled
+                native_callback_active = native_using
                 if native_callback_active and native_backend is not None:
                     # Bulk fill Python cache with BackendFutures for this step
                     with _nvtx_range("MonEng::CollectFutures"):
@@ -776,9 +782,7 @@ class HookedRootModule(nn.Module):
 
         native_backend = getattr(engine, "_native_backend", None)
         native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
-        native_builder_enabled = bool(getattr(engine, "_native_builder_enabled", False))
-        native_callback_enabled = bool(getattr(engine, "_native_callback_enabled", False))
-        native_callback_active = native_using and native_builder_enabled and native_callback_enabled
+        native_callback_active = native_using
         if not native_callback_active or native_backend is None:
             return
 
@@ -953,19 +957,10 @@ class HookedRootModule(nn.Module):
 
         native_backend = None
         native_using = False
-        native_builder_enabled = False
-        native_batch_enabled = False
-        native_callback_enabled = False
         if engine is not None:
             native_backend = getattr(engine, "_native_backend", None)
             native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
-            native_builder_enabled = bool(getattr(engine, "_native_builder_enabled", False))
-            native_batch_enabled = bool(getattr(engine, "_native_batch_enabled", False))
-            native_callback_enabled = bool(getattr(engine, "_native_callback_enabled", False))
-
-        native_callback_active = native_using and native_builder_enabled and native_callback_enabled
-        native_batch_active = native_using and native_batch_enabled and not native_callback_active
-        native_builder_python = native_using and native_builder_enabled and not native_callback_active
+        native_callback_active = native_using
 
         def save_hook(tensor: Tensor, hook: HookPoint, is_backward: bool = False):
             # for attention heads the pos dimension is the third from last
@@ -984,7 +979,7 @@ class HookedRootModule(nn.Module):
                 global _hook_total_calls, _hook_submit_calls
                 global _hook_build_us, _hook_submit_us, _hook_cache_set_us
                 global _sync_build_us, _sync_move_us, _sync_remove_batch_us, _sync_slice_us, _sync_cache_set_us
-                _hook_total_calls += 1 if _HOOK_STATS_ENABLED else 0
+                _hook_total_calls += 1 if _hook_stats_enabled() else 0
 
                 resid_stream = tensor.detach() if tensor.requires_grad else tensor
 
@@ -1005,125 +1000,8 @@ class HookedRootModule(nn.Module):
                     if native_callback_active:
                         cache[hook_name] = None
                         return
-                    if native_builder_python and native_backend is not None:
-                        # Fully offload: C++ computes pos_dim/can_slice/slice parse and appends
-                        if _HOOK_STATS_ENABLED:
-                            t0 = time.perf_counter()
-                        rb = bool(remove_batch_dim)
-                        native_backend.append_hook(int(engine._current_step_id), hook_name, resid_stream, rb, pos_slice, device if device is not None else None)
-                        if _HOOK_STATS_ENABLED:
-                            t1 = time.perf_counter()
-                            _hook_build_us += (t1 - t0) * 1e6
-                            _per_hook_build_us[hook_name] += (t1 - t0) * 1e6
-                            _per_hook_counts[hook_name] += 1
-                        cache[hook_name] = None
-                        return
-                    if native_batch_active and native_backend is not None:
-                        # Aggregate into engine's SoA buffers for per-step batch submit.
-                        from monitoring.task import _encode_slice_native  # type: ignore
-                        if _HOOK_STATS_ENABLED:
-                            t0 = time.perf_counter()
-                        rb = bool(remove_batch_dim)
-                        cs = bool(tensor.dim() >= -pos_dim)
-                        slice_tuple = _encode_slice_native(pos_slice)
-                        mode = int(slice_tuple[0])
-                        if not hasattr(engine, "_native_batch"):
-                            engine._native_batch = {}
-                        step_id_i = int(engine._current_step_id)
-                        agg = engine._native_batch.get(step_id_i)
-                        if agg is None:
-                            agg = {
-                                "tensors": [],
-                                "slice_dims": [],
-                                "remove_batch": [],
-                                "can_slice": [],
-                                "slice_modes": [],
-                                # Optional columns are created on demand only
-                                # to avoid per-hook overhead when always identity.
-                                "target_devices": [],
-                            }
-                            engine._native_batch[step_id_i] = agg
-                        a_t = agg["tensors"].append
-                        a_d = agg["slice_dims"].append
-                        a_rb = agg["remove_batch"].append
-                        a_cs = agg["can_slice"].append
-                        a_sm = agg["slice_modes"].append
-                        a_t(resid_stream)
-                        a_d(int(pos_dim))
-                        a_rb(rb)
-                        a_cs(cs)
-                        a_sm(mode)
-                        if mode == 1:
-                            iv = agg.get("int_values")
-                            if iv is None:
-                                iv = agg["int_values"] = []
-                            iv.append(int(slice_tuple[1]))
-                        elif mode == 2:
-                            ss = agg.get("slice_starts")
-                            sp = agg.get("slice_stops")
-                            st = agg.get("slice_steps")
-                            if ss is None:
-                                ss = agg["slice_starts"] = []
-                                sp = agg["slice_stops"] = []
-                                st = agg["slice_steps"] = []
-                            ss.append(slice_tuple[1])
-                            sp.append(slice_tuple[2])
-                            st.append(slice_tuple[3])
-                        elif mode == 3:
-                            ind = agg.get("indices")
-                            if ind is None:
-                                ind = agg["indices"] = []
-                            ind.append(slice_tuple[1])
-                        agg["target_devices"].append(device if device is not None else None)
-                        if _HOOK_STATS_ENABLED:
-                            t1 = time.perf_counter()
-                            _hook_build_us += (t1 - t0) * 1e6
-                            _per_hook_build_us[hook_name] += (t1 - t0) * 1e6
-                            _per_hook_counts[hook_name] += 1
-                        cache[hook_name] = None
-                        return
-                    if native_using and native_backend is not None and not native_batch_active and not native_builder_python:
-                        # Build compact tuple payload compatible with native backend
-                        from monitoring.task import _encode_slice_native  # type: ignore
-                        from monitoring.task import BackendFuture  # type: ignore
-                        if _HOOK_STATS_ENABLED:
-                            t0 = time.perf_counter()
-                        metadata = {
-                            "remove_batch_dim": remove_batch_dim,
-                            "can_slice": tensor.dim() >= -pos_dim,
-                        }
-                        slice_tuple = _encode_slice_native(pos_slice)
-                        target_dev = device if device is not None else None
-                        task_tuple = (
-                            resid_stream,
-                            int(pos_dim),
-                            bool(metadata["remove_batch_dim"]),
-                            bool(metadata["can_slice"]),
-                            slice_tuple,
-                            target_dev,
-                        )
-                        if _HOOK_STATS_ENABLED:
-                            t1 = time.perf_counter()
-                            _hook_build_us += (t1 - t0) * 1e6
-                            _per_hook_build_us[hook_name] += (t1 - t0) * 1e6
-                            _per_hook_counts[hook_name] += 1
-                            _hook_submit_calls += 1
-                            t2 = time.perf_counter()
-                            token = native_backend.add_task(int(engine._current_step_id), task_tuple)
-                            t3 = time.perf_counter()
-                            _hook_submit_us += (t3 - t2) * 1e6
-                            _per_hook_submit_us[hook_name] += (t3 - t2) * 1e6
-                            t4 = time.perf_counter()
-                            cache[hook_name] = BackendFuture(native_backend, token)
-                            t5 = time.perf_counter()
-                            _hook_cache_set_us += (t5 - t4) * 1e6
-                            _per_hook_cache_us[hook_name] += (t5 - t4) * 1e6
-                        else:
-                            token = native_backend.add_task(int(engine._current_step_id), task_tuple)
-                            cache[hook_name] = BackendFuture(native_backend, token)
-                        return
                     # Fallback to Python engine.submit if native backend is not available
-                    if _HOOK_STATS_ENABLED:
+                    if _hook_stats_enabled():
                         t0 = time.perf_counter()
                     metadata = {
                         "remove_batch_dim": remove_batch_dim,
@@ -1138,7 +1016,7 @@ class HookedRootModule(nn.Module):
                         metadata=metadata,
                         target_device=device if device is not None else None,
                     )
-                    if _HOOK_STATS_ENABLED:
+                    if _hook_stats_enabled():
                         t1 = time.perf_counter()
                         _hook_build_us += (t1 - t0) * 1e6
                         _per_hook_build_us[hook_name] += (t1 - t0) * 1e6
@@ -1160,10 +1038,10 @@ class HookedRootModule(nn.Module):
                     return
 
                 # sync build（进入同步分支到移动前的轻量准备）
-                t_sb0 = time.perf_counter() if _HOOK_STATS_ENABLED else None
-                t_mv0 = time.perf_counter() if _HOOK_STATS_ENABLED else None
+                t_sb0 = time.perf_counter() if _hook_stats_enabled() else None
+                t_mv0 = time.perf_counter() if _hook_stats_enabled() else None
                 resid_stream = resid_stream.to(device)
-                if _HOOK_STATS_ENABLED:
+                if _hook_stats_enabled():
                     if t_sb0 is not None:
                         sb_us = (t_mv0 - t_sb0) * 1e6 if t_mv0 is not None else 0.0
                         _sync_build_us += sb_us
@@ -1172,21 +1050,21 @@ class HookedRootModule(nn.Module):
                     _sync_move_us += mv_us
                     _per_hook_sync_move_us[hook_name] += mv_us
                 if remove_batch_dim:
-                    t_rm0 = time.perf_counter() if _HOOK_STATS_ENABLED else None
+                    t_rm0 = time.perf_counter() if _hook_stats_enabled() else None
                     resid_stream = resid_stream[0]
-                    if _HOOK_STATS_ENABLED:
+                    if _hook_stats_enabled():
                         _sync_remove_batch_us += (time.perf_counter() - t_rm0) * 1e6
 
                 if (
                     tensor.dim() >= -pos_dim
                 ):  # check if the residual stream has a pos dimension before trying to slice
-                    t_sl0 = time.perf_counter() if _HOOK_STATS_ENABLED else None
+                    t_sl0 = time.perf_counter() if _hook_stats_enabled() else None
                     resid_stream = pos_slice.apply(resid_stream, dim=pos_dim)
-                    if _HOOK_STATS_ENABLED:
+                    if _hook_stats_enabled():
                         sl_us = (time.perf_counter() - t_sl0) * 1e6
                         _sync_slice_us += sl_us
                         _per_hook_sync_slice_us[hook_name] += sl_us
-                if _HOOK_STATS_ENABLED:
+                if _hook_stats_enabled():
                     t_c0 = time.perf_counter()
                     cache[hook_name] = resid_stream
                     _sync_cache_set_us += (time.perf_counter() - t_c0) * 1e6

@@ -223,10 +223,6 @@ def run_decode_loop(
 def main() -> None:
     args = parse_args()
 
-    if args.nvtx:
-        import os
-        os.environ.setdefault("TL_ENABLE_NVTX", "1")
-
     device = pick_device(args.device)
     dtype = map_dtype(args.dtype)
 

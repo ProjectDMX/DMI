@@ -1,13 +1,5 @@
 """Debug script to identify where monitoring hangs."""
-import os
 import sys
-
-# Enable debug output
-os.environ["MON_ENGINE_DEBUG"] = "1"
-os.environ["MON_NATIVE_TO_CPU"] = "1"
-os.environ["MON_NATIVE_CALLBACK"] = "1"
-os.environ["MON_NATIVE_BUILDER"] = "1"
-os.environ["MON_NATIVE_BATCH"] = "0"
 
 import torch
 print("[DEBUG] torch imported")
@@ -31,6 +23,7 @@ def main():
     cfg = MonitoringConfig(
         hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
+        debug=True,
     )
     engine = MonitoringEngine(
         async_enabled=True,

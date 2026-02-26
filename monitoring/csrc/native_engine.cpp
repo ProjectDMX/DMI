@@ -8,8 +8,19 @@ namespace py = pybind11;
 
 NativeMonitoringEngine::NativeMonitoringEngine(int64_t queue_size,
                                                std::optional<at::ScalarType> cache_dtype,
-                                               int64_t delay_steps)
-    : impl_(std::make_unique<Impl>(queue_size, cache_dtype, delay_steps)) {}
+                                               int64_t delay_steps,
+                                               const std::vector<int64_t>& pinpool_bins_kb,
+                                               int64_t pinpool_max_mb,
+                                               int64_t host_copy_threads,
+                                               int64_t host_copy_queue_size)
+    : impl_(std::make_unique<Impl>(
+          queue_size,
+          cache_dtype,
+          delay_steps,
+          pinpool_bins_kb,
+          pinpool_max_mb,
+          host_copy_threads,
+          host_copy_queue_size)) {}
 
 NativeMonitoringEngine::~NativeMonitoringEngine() {
   close();
@@ -50,12 +61,6 @@ void NativeMonitoringEngine::set_partial_seal_config(bool enabled,
                                                      double cap_ratio,
                                                      int64_t driver_guard_mb) {
   impl_->set_partial_seal_config(enabled, chunk_bytes, cap_enabled, cap_ratio, driver_guard_mb);
-}
-
-std::vector<int64_t> NativeMonitoringEngine::submit_step_soa(int64_t step_id,
-                                                             const py::dict& spec,
-                                                             std::optional<uint64_t> stream_handle) {
-  return impl_->submit_step_soa(step_id, spec, stream_handle);
 }
 
 int64_t NativeMonitoringEngine::add_task(int64_t step_id, const py::tuple& task_tuple) {

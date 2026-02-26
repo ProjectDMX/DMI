@@ -8,7 +8,7 @@ namespace dmx_host{
 
 class ProcessFutureStage final {
  public:
-  static void ThreadInit(int thread_idx);
+  static void ThreadInit(int thread_idx, bool debug_log);
   static void ThreadCleanup() noexcept;
 
   template <typename QueueT>
@@ -16,7 +16,11 @@ class ProcessFutureStage final {
 
   // Engine-compatible wrappers:
   static inline void ThreadInitAny(int thread_idx, const std::any& cfg_any) {
-    ThreadInit(thread_idx);
+    bool debug_log = false;
+    if (const bool* debug_ptr = std::any_cast<bool>(&cfg_any)) {
+      debug_log = *debug_ptr;
+    }
+    ThreadInit(thread_idx, debug_log);
   }
 
   static inline void ThreadCleanupAny() noexcept { ThreadCleanup(); }

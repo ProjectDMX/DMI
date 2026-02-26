@@ -140,9 +140,22 @@ def create_engine(
     queue_size: int,
     cache_dtype: Optional[torch.dtype],
     delay_steps: int,
+    *,
+    pinpool_bins_kb: list[int] | tuple[int, ...] = (256, 512, 1024, 2048, 4096, 8192),
+    pinpool_max_mb: int = 512,
+    host_copy_threads: int = 0,
+    host_copy_queue_size: int = 512,
 ):
     module = _load_extension()
-    return module.create_engine(queue_size, cache_dtype, delay_steps)
+    return module.create_engine(
+        queue_size,
+        cache_dtype,
+        delay_steps,
+        pinpool_bins_kb,
+        pinpool_max_mb,
+        host_copy_threads,
+        host_copy_queue_size,
+    )
 
 
 def __getattr__(name: str) -> Any:
