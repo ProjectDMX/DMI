@@ -1153,7 +1153,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
                     print("  GEN: <n/a>")
 
         # Keep strict compare for DB vs ROL logits (currently optional)
-        if not torch.allclose(db_slice.float(), rol_slice.float(), atol=1e-3, rtol=1e-3):
+        if not torch.equal(db_slice, rol_slice):
             diff = (db_slice.float() - rol_slice.float()).abs()
             max_abs = float(diff.max().item())
             flat_idx = int(diff.view(-1).argmax().item())
@@ -1179,7 +1179,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
             db_t = merge_segments([t for _, _, t in chunks], "hook_embed")
             if tuple(db_t.shape) != tuple(emb.shape):
                 raise AssertionError(f"{req_id}: hook_embed shape mismatch db={tuple(db_t.shape)} hf={tuple(emb.shape)}")
-            if not torch.allclose(db_t.float(), emb.float(), atol=1e-3, rtol=1e-3):
+            if not torch.equal(db_t, emb):
                 max_abs = float((db_t.float() - emb.float()).abs().max().item())
                 raise AssertionError(f"{req_id}: hook_embed mismatch (max_abs={max_abs})")
 
@@ -1190,7 +1190,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
                 raise AssertionError(
                     f"{req_id}: hook_pos_embed shape mismatch db={tuple(db_t.shape)} hf={tuple(pos_emb.shape)}"
                 )
-            if not torch.allclose(db_t.float(), pos_emb.float(), atol=1e-3, rtol=1e-3):
+            if not torch.equal(db_t, pos_emb):
                 max_abs = float((db_t.float() - pos_emb.float()).abs().max().item())
                 raise AssertionError(f"{req_id}: hook_pos_embed mismatch (max_abs={max_abs})")
 
@@ -1204,7 +1204,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
             db_t = merge_segments([t for _, _, t in chunks], "hook_final_ln")
             if tuple(db_t.shape) != tuple(fin.shape):
                 raise AssertionError(f"{req_id}: hook_final_ln shape mismatch db={tuple(db_t.shape)} hf={tuple(fin.shape)}")
-            if not torch.allclose(db_t.float(), fin.float(), atol=1e-3, rtol=1e-3):
+            if not torch.equal(db_t, fin):
                 max_abs = float((db_t.float() - fin.float()).abs().max().item())
                 raise AssertionError(f"{req_id}: hook_final_ln mismatch (max_abs={max_abs})")
         """
@@ -1225,7 +1225,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
                     raise AssertionError(
                         f"{req_id}: pattern shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(pat.shape)}"
                     )
-                if not torch.allclose(db_t.float(), pat.float(), atol=1e-3, rtol=1e-3):
+                if not torch.equal(db_t, pat):
                     max_abs = float((db_t.float() - pat.float()).abs().max().item())
                     raise AssertionError(f"{req_id}: pattern mismatch layer={layer_no} (max_abs={max_abs})")
 
@@ -1239,7 +1239,7 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
                     raise AssertionError(
                         f"{req_id}: resid_pre shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
                     )
-                if not torch.allclose(db_t.float(), hs.float(), atol=1e-3, rtol=1e-3):
+                if not torch.equal(db_t, hs):
                     max_abs = float((db_t.float() - hs.float()).abs().max().item())
                     raise AssertionError(f"{req_id}: resid_pre mismatch layer={layer_no} (max_abs={max_abs})")
 
@@ -1255,6 +1255,6 @@ def test_e2e_correctness_vs_hf(monkeypatch: pytest.MonkeyPatch) -> None:
                     raise AssertionError(
                         f"{req_id}: resid_post shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
                     )
-                if not torch.allclose(db_t.float(), hs.float(), atol=1e-3, rtol=1e-3):
+                if not torch.equal(db_t, hs):
                     max_abs = float((db_t.float() - hs.float()).abs().max().item())
                     raise AssertionError(f"{req_id}: resid_post mismatch layer={layer_no} (max_abs={max_abs})")
