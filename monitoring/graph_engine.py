@@ -96,8 +96,7 @@ class GraphSafeEngine:
         # degenerates to step_id % 2 (backward compatible).
         self._monitor_interval = max(1, monitor_interval)
         self._mon_frame = 0
-        self._pending_d2h = False
-        self._pending_d2h_frame = 0
+        self._d2h_ever_submitted = False
         self._d2h_in_flight: Dict[int, bool] = {0: False, 1: False}
 
         if graph_mode == "dual_compile":
@@ -176,29 +175,11 @@ class GraphSafeEngine:
     def collect_dual_frame_results(self, *, wait: bool = False) -> Optional[Dict[int, torch.Tensor]]:
         """Collect D2H results for a completed frame.
 
-        Checks both frames for in-flight D2H. If ``wait=True`` and there
-        is a pending (deferred but not yet submitted) D2H, it is flushed
-        synchronously so results are always available after the last step.
-
+        Checks both frames for in-flight D2H.
         Returns {slot_id: cpu_tensor} or None if nothing is ready.
         """
         if not self._dual_frame_ready:
             return None
-
-        # Flush pending D2H that was deferred but never triggered
-        # (happens when collect is called after the last end_step
-        # without a subsequent start_step to trigger it).
-        if self._pending_d2h and wait:
-            d2h_frame = self._pending_d2h_frame
-            torch.cuda.synchronize()  # ensure forward completed
-            with torch.cuda.stream(self._copy_stream):
-                for sid, alias in self._frame_aliases[d2h_frame].items():
-                    self._pinned_buffers[d2h_frame][sid].copy_(
-                        alias, non_blocking=True
-                    )
-                self._d2h_events[d2h_frame].record(self._copy_stream)
-            self._d2h_in_flight[d2h_frame] = True
-            self._pending_d2h = False
 
         # Find a frame with in-flight D2H
         for frame in (0, 1):
@@ -239,28 +220,14 @@ class GraphSafeEngine:
 
             fwd_stream = torch.cuda.current_stream(self._device)
 
-            # ① Record pre_fwd_event BEFORE barrier and D2H submission.
-            #    Marks fwd_stream position = forward(t-1) completion.
-            #    Must precede the barrier so copy_stream doesn't
-            #    indirectly wait for itself (deadlock/serialization).
+            # Record pre_fwd_event BEFORE barrier.
+            # Marks fwd_stream position = forward(t-1) completion.
+            # Must precede the barrier so copy_stream doesn't
+            # indirectly wait for itself (deadlock/serialization).
             self._pre_fwd_event.record(fwd_stream)
 
-            # ② Trigger deferred D2H (from previous monitored step).
-            #    Submitted to copy_stream → overlaps with upcoming forward.
-            if self._pending_d2h:
-                d2h_frame = self._pending_d2h_frame
-                self._copy_stream.wait_event(self._pre_fwd_event)
-                with torch.cuda.stream(self._copy_stream):
-                    for sid, alias in self._frame_aliases[d2h_frame].items():
-                        self._pinned_buffers[d2h_frame][sid].copy_(
-                            alias, non_blocking=True
-                        )
-                    self._d2h_events[d2h_frame].record(self._copy_stream)
-                self._d2h_in_flight[d2h_frame] = True
-                self._pending_d2h = False
-
-            # ③ GPU barrier: protect frame data from being overwritten
-            #    while D2H is still reading from the same frame.
+            # GPU barrier: protect frame data from being overwritten
+            # while D2H is still reading from the same frame.
             if self._d2h_in_flight[frame]:
                 fwd_stream.wait_event(self._d2h_events[frame])
                 self._d2h_in_flight[frame] = False
@@ -294,16 +261,34 @@ class GraphSafeEngine:
             self._step_streams[self._current_step_id] = stream
 
     def _dual_frame_end_step(self, stream: Optional[torch.cuda.Stream]) -> None:
-        """Defer D2H on monitored steps and flip _mon_frame.
+        """D2H the previous frame on copy_stream, then flip _mon_frame.
 
-        D2H is NOT submitted here — it's deferred to next step's
-        start_step so that D2H overlaps with the upcoming forward on GPU.
+        copy_stream.wait_event(pre_fwd_event) ensures D2H starts only after
+        forward(t-1) completes on fwd_stream.  pre_fwd_event was recorded
+        at start_step BEFORE forward(t), so copy_stream sees only work up
+        to forward(t-1) — allowing D2H to overlap with forward(t) on GPU.
         """
         is_monitored = (self._current_step_id % self._monitor_interval) == 0
-        if is_monitored:
-            self._pending_d2h = True
-            self._pending_d2h_frame = self._mon_frame
-            self._mon_frame = 1 - self._mon_frame  # FLIP
+        if not is_monitored:
+            return
+
+        # D2H the PREVIOUS frame (1 - _mon_frame).  Current frame was just
+        # written by this step's forward; pre_fwd_event predates it, so
+        # copying the current frame would race.  Skip the very first
+        # monitored step (no previous data to copy).
+        prev_frame = 1 - self._mon_frame
+        if self._d2h_ever_submitted:
+            self._copy_stream.wait_event(self._pre_fwd_event)
+            with torch.cuda.stream(self._copy_stream):
+                for sid, alias in self._frame_aliases[prev_frame].items():
+                    self._pinned_buffers[prev_frame][sid].copy_(
+                        alias, non_blocking=True
+                    )
+                self._d2h_events[prev_frame].record(self._copy_stream)
+            self._d2h_in_flight[prev_frame] = True
+
+        self._d2h_ever_submitted = True
+        self._mon_frame = 1 - self._mon_frame  # FLIP
 
     def is_capture_enabled(self) -> bool:
         return bool(self._capture_enabled)

@@ -131,6 +131,12 @@ def parse_args() -> argparse.Namespace:
         help="Choose legacy MonitoringEngine, graph-safe engine, torch.compile engine, or dual-frame compile engine.",
     )
     parser.add_argument(
+        "--monitor-interval",
+        type=int,
+        default=1,
+        help="Monitor every N-th decode step (skip-step monitoring). 1=every step, 2=every other step, etc.",
+    )
+    parser.add_argument(
         "--graph-copy-mode",
         choices=["disabled", "sync"],
         default="disabled",
@@ -884,6 +890,7 @@ def main() -> None:
             max_slots=4096,
             device=device,
             graph_mode=graph_mode,
+            monitor_interval=args.monitor_interval,
         )
         graph_consumer = GraphSlotConsumer(delay_steps=args.engine_delay_steps)
         monitoring_engine.attach_consumer(graph_consumer)
