@@ -126,9 +126,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--monitoring-mode",
-        choices=["legacy", "graph", "compile"],
+        choices=["legacy", "graph", "compile", "dual_compile"],
         default="legacy",
-        help="Choose legacy MonitoringEngine, graph-safe engine, or torch.compile engine.",
+        help="Choose legacy MonitoringEngine, graph-safe engine, torch.compile engine, or dual-frame compile engine.",
     )
     parser.add_argument(
         "--graph-copy-mode",
@@ -144,10 +144,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--prefill-tokens must be >= 1")
     if args.decode_steps < 1:
         parser.error("--decode-steps must be >= 1")
-    if args.monitoring_mode in ("graph", "compile") and args.monitoring_bypass:
-        parser.error("--monitoring-mode graph/compile cannot be combined with --monitoring-bypass")
-    if args.monitoring_mode not in ("graph", "compile") and args.graph_copy_mode != "disabled":
-        parser.error("--graph-copy-mode only applies when --monitoring-mode graph or compile is selected")
+    if args.monitoring_mode in ("graph", "compile", "dual_compile") and args.monitoring_bypass:
+        parser.error("--monitoring-mode graph/compile/dual_compile cannot be combined with --monitoring-bypass")
+    if args.monitoring_mode not in ("graph", "compile", "dual_compile") and args.graph_copy_mode != "disabled":
+        parser.error("--graph-copy-mode only applies when --monitoring-mode graph, compile, or dual_compile is selected")
     return args
 
 
@@ -509,6 +509,76 @@ class TorchCompileDecodeRunner:
         pass
 
 
+class DualCompileDecodeRunner:
+    """Decode runner with dual-frame forward/D2H pipelining (Design C)."""
+
+    def __init__(
+        self,
+        model,
+        project_logits_fn: Callable[[torch.Tensor], torch.Tensor],
+        engine,
+        args,
+        *,
+        max_cache_len: int = 256,
+    ) -> None:
+        self.model = model
+        self.project_logits_fn = project_logits_fn
+        self.engine = engine  # GraphSafeEngine with graph_mode="dual_compile"
+        self.args = args
+        self.captured = False
+        self._cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
+        self._next_cache_pos = 0
+        self._compiled_forward = torch.compile(
+            self._forward_step, mode="reduce-overhead", fullgraph=False,
+        )
+
+    def _forward_step(
+        self, token: torch.Tensor, cache, cache_position: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = self.model(
+            token,
+            use_cache=True,
+            past_key_values=cache,
+            cache_position=cache_position,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=True,
+        )
+        return self.project_logits_fn(outputs.last_hidden_state)
+
+    def warmup(self, token: torch.Tensor, warmup_steps: int = 4) -> None:
+        """Exercise both frames to trigger compilation + CUDA Graph capture."""
+        cache_position = torch.tensor([0], device=token.device, dtype=torch.long)
+        for frame in (0, 1):
+            self.engine.set_frame(frame)
+            for _ in range(warmup_steps):
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    self._compiled_forward(token, self._cache, cache_position)
+            torch.cuda.synchronize()
+
+        self.engine.finalize_dual_frame()
+        self._cache.reset()
+        self._next_cache_pos = 0
+        self.captured = True
+
+    def run(self, token: torch.Tensor, past=None) -> Tuple[torch.Tensor, object]:
+        cache_position = torch.tensor(
+            [self._next_cache_pos], device=token.device, dtype=torch.long,
+        )
+        torch.compiler.cudagraph_mark_step_begin()
+        logits = self._compiled_forward(token, self._cache, cache_position)
+        self._next_cache_pos += 1
+        return logits, self._cache
+
+    def reset_cache(self) -> None:
+        self._cache.reset()
+        self._next_cache_pos = 0
+
+    def reset_capture(self) -> None:
+        pass
+
+
 def greedy_from_logits(logits: torch.Tensor) -> torch.Tensor:
     return torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
 
@@ -806,8 +876,8 @@ def main() -> None:
 
     graph_consumer = None
     graph_native_backend = None
-    if args.monitoring_mode in ("graph", "compile"):
-        graph_mode = "compile" if args.monitoring_mode == "compile" else "manual"
+    if args.monitoring_mode in ("graph", "compile", "dual_compile"):
+        graph_mode = {"compile": "compile", "dual_compile": "dual_compile"}.get(args.monitoring_mode, "manual")
         monitoring_engine = GraphSafeEngine(
             config=monitoring_config,
             module_filter=lambda name, module: hasattr(module, "monitor_activation"),
@@ -834,7 +904,7 @@ def main() -> None:
             delay_steps=args.engine_delay_steps,
             config=monitoring_config,
         )
-    attach_to_model = args.monitoring_mode not in ("graph", "compile")
+    attach_to_model = args.monitoring_mode not in ("graph", "compile", "dual_compile")
     engine_attached_permanently = bool(args.monitoring_bypass and attach_to_model)
     original_monitoring_engine = hf_hooked_model.monitoring_engine
     if attach_to_model:
@@ -848,7 +918,7 @@ def main() -> None:
         if attach_to_model and not engine_attached_permanently:
             hf_hooked_model.monitoring_engine = original_monitoring_engine
 
-    if args.monitoring_bypass and args.monitoring_mode not in ("graph", "compile"):
+    if args.monitoring_bypass and args.monitoring_mode not in ("graph", "compile", "dual_compile"):
         native_backend = getattr(monitoring_engine, "_native_backend", None)
         native_using = bool(getattr(monitoring_engine, "_using_native_backend", False))
         native_builder_enabled = bool(getattr(monitoring_engine, "_native_builder_enabled", False))
@@ -875,7 +945,13 @@ def main() -> None:
             raise RuntimeError("Inline monitoring not enabled; cannot run bypass-inline profile.")
 
     def process_monitoring_results(wait: bool = False) -> None:
-        nonlocal graph_runner, compile_runner
+        nonlocal graph_runner, compile_runner, dual_compile_runner
+        if args.monitoring_mode == "dual_compile":
+            if dual_compile_runner is None or not dual_compile_runner.captured:
+                return
+            # dual_compile: D2H is handled by engine start_step/end_step
+            monitoring_engine.collect_dual_frame_results(wait=wait)
+            return
         if args.monitoring_mode in ("graph", "compile"):
             runner = compile_runner if args.monitoring_mode == "compile" else graph_runner
             if runner is None or not runner.captured:
@@ -892,7 +968,12 @@ def main() -> None:
             monitoring_engine.clear_completed_results()
 
     def resolve_monitoring_results() -> None:
-        nonlocal graph_runner, compile_runner
+        nonlocal graph_runner, compile_runner, dual_compile_runner
+        if args.monitoring_mode == "dual_compile":
+            if dual_compile_runner is None or not dual_compile_runner.captured:
+                return
+            monitoring_engine.collect_dual_frame_results(wait=True)
+            return
         if args.monitoring_mode in ("graph", "compile"):
             runner = compile_runner if args.monitoring_mode == "compile" else graph_runner
             if runner is None or not runner.captured:
@@ -965,6 +1046,7 @@ def main() -> None:
     graph_runner: Optional[HFGraphDecodeRunner] = None
     graph_forward_runner: Optional[HFGraphDecodeRunner] = None
     compile_runner: Optional[TorchCompileDecodeRunner] = None
+    dual_compile_runner: Optional[DualCompileDecodeRunner] = None
 
     def hf_prefill_fn(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
         outputs = hf_model(
@@ -1139,7 +1221,36 @@ def main() -> None:
         return logits, next_past
 
     def hf_modified_hook_async_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
-        nonlocal graph_runner, compile_runner
+        nonlocal graph_runner, compile_runner, dual_compile_runner
+        if args.monitoring_mode == "dual_compile":
+            nvtx.range_push("dual_compile_prefill")
+            if dual_compile_runner is None:
+                dual_compile_runner = DualCompileDecodeRunner(
+                    hf_hooked_model,
+                    project_logits,
+                    monitoring_engine,
+                    args,
+                    max_cache_len=args.prefill_tokens + args.decode_steps + 16,
+                )
+            dual_compile_runner.reset_cache()
+            # Eager prefill (no compile) to populate cache
+            outputs = hf_hooked_model(
+                prefill_tokens,
+                use_cache=True,
+                past_key_values=dual_compile_runner._cache,
+                output_hidden_states=False,
+                output_attentions=False,
+                return_dict=True,
+            )
+            dual_compile_runner._next_cache_pos = prefill_tokens.shape[1]
+            hidden_states = outputs.last_hidden_state
+            logits = project_logits(hidden_states)
+            next_token = greedy_from_logits(logits)
+            if not dual_compile_runner.captured:
+                dual_compile_runner.warmup(next_token)
+            del hidden_states, logits, outputs
+            nvtx.range_pop()  # dual_compile_prefill
+            return dual_compile_runner._cache, next_token
         if args.monitoring_mode == "compile":
             nvtx.range_push("compile_prefill")
             if compile_runner is None:
@@ -1236,7 +1347,22 @@ def main() -> None:
         return past, next_token
 
     def hf_modified_hook_async_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
-        nonlocal graph_runner, compile_runner
+        nonlocal graph_runner, compile_runner, dual_compile_runner
+        if args.monitoring_mode == "dual_compile":
+            if dual_compile_runner is None:
+                raise RuntimeError("Dual compile decode runner is not initialized.")
+            nvtx.range_push("dual_compile_decode")
+            monitoring_engine.start_step()
+            try:
+                logits, next_past = dual_compile_runner.run(token, past_key_values)
+            finally:
+                monitoring_engine.end_step()
+            try:
+                process_monitoring_results(wait=False)
+            except Exception as _e:
+                print(f"[dual_compile_decode] drain exception: {type(_e).__name__}: {_e}")
+            nvtx.range_pop()  # dual_compile_decode
+            return logits, next_past
         if args.monitoring_mode == "compile":
             if compile_runner is None:
                 raise RuntimeError("Compile decode runner is not initialized.")

@@ -2,6 +2,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
+#include <mutex>
+#include <vector>
 
 namespace vllm {
 
@@ -110,22 +112,141 @@ at::Tensor alias_tensor(
   return tensor;
 }
 
+// --- Per-slot D2H event barrier for inline wait inside CUDA Graph ---
+// wait_d2h() uses cudaEventWaitExternal so the wait is captured as an
+// event-wait node in the graph.  On every replay the node checks the
+// *current* state of the external event (recorded on copy_stream).
+#ifndef cudaEventWaitExternal
+#define cudaEventWaitExternal 0x2
+#endif
+
+static constexpr int kMaxD2HEvents = 8192;  // 2 frames × 4096 max_slots
+static cudaEvent_t g_d2h_events[kMaxD2HEvents];
+static int g_d2h_event_count = 0;
+
+void init_d2h_events_op(int64_t num_events) {
+  TORCH_CHECK(num_events > 0 && num_events <= kMaxD2HEvents,
+              "num_events must be in [1, ", kMaxD2HEvents, "], got ", num_events);
+  // Destroy any existing events first
+  for (int i = 0; i < g_d2h_event_count; i++) {
+    cudaEventDestroy(g_d2h_events[i]);
+  }
+  g_d2h_event_count = 0;
+  for (int64_t i = 0; i < num_events; i++) {
+    AT_CUDA_CHECK(cudaEventCreateWithFlags(
+        &g_d2h_events[i], cudaEventDisableTiming));
+  }
+  g_d2h_event_count = static_cast<int>(num_events);
+}
+
+void wait_d2h_op(const at::Tensor& buf, int64_t slot_id) {
+  TORCH_CHECK(slot_id >= 0 && slot_id < g_d2h_event_count,
+              "wait_d2h: slot_id ", slot_id,
+              " out of range [0, ", g_d2h_event_count, ")");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  // Detect stream capture mode: external events require special flag
+  cudaStreamCaptureStatus capture_status;
+  AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+  unsigned int flags = (capture_status != cudaStreamCaptureStatusNone)
+      ? cudaEventWaitExternal : 0;
+  AT_CUDA_CHECK(cudaStreamWaitEvent(stream, g_d2h_events[slot_id], flags));
+}
+
+void record_d2h_event_op(int64_t slot_id) {
+  TORCH_CHECK(slot_id >= 0 && slot_id < g_d2h_event_count,
+              "record_d2h_event: slot_id ", slot_id,
+              " out of range [0, ", g_d2h_event_count, ")");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_CUDA_CHECK(cudaEventRecord(g_d2h_events[slot_id], stream));
+}
+
+void destroy_d2h_events_op() {
+  for (int i = 0; i < g_d2h_event_count; i++) {
+    cudaEventDestroy(g_d2h_events[i]);
+  }
+  g_d2h_event_count = 0;
+}
+
+// --- Design C: held_tensors for cross-graph address isolation ---
+// During recording, sink_hold() pushes real at::Tensor refs here, keeping
+// allocator refcount > 0.  After both graphs are recorded,
+// clear_held_tensors() releases everything (addresses are baked into graphs).
+static std::vector<at::Tensor> g_held_tensors[2];
+static std::mutex g_held_mutex;
+
+void sink_hold_op(const std::vector<at::Tensor>& tensors, int64_t frame) {
+  if (tensors.empty()) return;
+  TORCH_CHECK(frame == 0 || frame == 1,
+              "sink_hold frame must be 0 or 1, got ", frame);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  for (const auto& tensor : tensors) {
+    if (!tensor.defined()) continue;
+    TORCH_CHECK(tensor.is_cuda(), "sink_hold() expects CUDA tensors.");
+    // GPU side: dummy kernel (same as sink) — creates data dependency in graph
+    sink_kernel<<<1, 1, 0, stream>>>(
+        reinterpret_cast<uint64_t>(tensor.data_ptr()));
+    // C++ side: hold real at::Tensor ref to keep allocator refcount > 0.
+    // This host code only runs during recording/eager, NOT during graph replay.
+    std::lock_guard<std::mutex> lock(g_held_mutex);
+    g_held_tensors[frame].push_back(tensor);
+  }
+  AT_CUDA_CHECK(cudaGetLastError());
+}
+
+void clear_held_tensors_op() {
+  std::lock_guard<std::mutex> lock(g_held_mutex);
+  g_held_tensors[0].clear();
+  g_held_tensors[0].shrink_to_fit();
+  g_held_tensors[1].clear();
+  g_held_tensors[1].shrink_to_fit();
+}
+
+int64_t held_tensors_count_op(int64_t frame) {
+  TORCH_CHECK(frame == 0 || frame == 1,
+              "held_tensors_count frame must be 0 or 1, got ", frame);
+  std::lock_guard<std::mutex> lock(g_held_mutex);
+  return static_cast<int64_t>(g_held_tensors[frame].size());
+}
+
 }  // namespace vllm
 
 TORCH_LIBRARY(graphmonitor_ops, m) {
-  m.def("record(Tensor tensor, Tensor buffer, int slot_id) -> ()");
+  m.def("record(Tensor tensor, Tensor(a!) buffer, int slot_id) -> ()");
   m.def("sink(Tensor[] tensors) -> ()");
+  m.def("alias_tensor(int data_ptr, int[] sizes, int[] strides, int dtype_id, int device_index) -> Tensor");
+  m.def("sink_hold(Tensor[] tensors, int frame) -> ()");
+  m.def("clear_held_tensors() -> ()");
+  m.def("held_tensors_count(int frame) -> int");
+  // Per-slot D2H event barrier ops
+  m.def("init_d2h_events(int num_events) -> ()");
+  m.def("wait_d2h(Tensor(a!) buffer, int slot_id) -> ()");
+  m.def("record_d2h_event(int slot_id) -> ()");
+  m.def("destroy_d2h_events() -> ()");
 }
 
 TORCH_LIBRARY_IMPL(graphmonitor_ops, CUDA, m) {
   m.impl("record", &vllm::record_op);
   m.impl("sink", &vllm::sink_op);
-  m.impl("alias_tensor", &vllm::alias_tensor);
+  m.impl("sink_hold", &vllm::sink_hold_op);
+  m.impl("wait_d2h", &vllm::wait_d2h_op);
 }
 
 TORCH_LIBRARY_IMPL(graphmonitor_ops, Meta, m) {
   m.impl("record", [](const at::Tensor&, const at::Tensor&, int64_t) {});
   m.impl("sink", [](const std::vector<at::Tensor>&) {});
+  m.impl("sink_hold", [](const std::vector<at::Tensor>&, int64_t) {});
+  m.impl("wait_d2h", [](const at::Tensor&, int64_t) {});
+}
+
+// Ops with no tensor args cannot be dispatched by device.
+// Register as CompositeImplicitAutograd (fallback for all backends).
+TORCH_LIBRARY_IMPL(graphmonitor_ops, CompositeImplicitAutograd, m) {
+  m.impl("alias_tensor", &vllm::alias_tensor);
+  m.impl("clear_held_tensors", &vllm::clear_held_tensors_op);
+  m.impl("held_tensors_count", &vllm::held_tensors_count_op);
+  m.impl("init_d2h_events", &vllm::init_d2h_events_op);
+  m.impl("record_d2h_event", &vllm::record_d2h_event_op);
+  m.impl("destroy_d2h_events", &vllm::destroy_d2h_events_op);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

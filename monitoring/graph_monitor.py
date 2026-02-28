@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import struct
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,7 @@ import torch.nn as nn
 from .graph_ops import load_graph_monitor_ops
 
 METADATA_BYTES = 128
+_METADATA_STRUCT = struct.Struct("<Qqqqqqqqqiii44s")
 
 ModuleFilter = Callable[[str, nn.Module], bool]
 
@@ -39,8 +41,8 @@ class GraphMonitor:
         device: Optional[torch.device] = None,
         graph_mode: str = "manual",
     ) -> None:
-        if graph_mode not in ("manual", "compile"):
-            raise ValueError(f"graph_mode must be 'manual' or 'compile', got {graph_mode!r}")
+        if graph_mode not in ("manual", "compile", "dual_compile"):
+            raise ValueError(f"graph_mode must be 'manual', 'compile', or 'dual_compile', got {graph_mode!r}")
         if device is None:
             device = torch.device("cuda")
         if device.type != "cuda":
@@ -49,11 +51,13 @@ class GraphMonitor:
         self._graph_mode = graph_mode
         self._max_slots = max_slots
         self._ops = load_graph_monitor_ops()
+        # dual_compile: 2x buffer for ping-pong frames
+        buf_multiplier = 2 if graph_mode == "dual_compile" else 1
         self._gpu_buffer = torch.empty(
-            max_slots * METADATA_BYTES, dtype=torch.uint8, device=device
+            buf_multiplier * max_slots * METADATA_BYTES, dtype=torch.uint8, device=device
         )
         self._host_template = torch.empty(
-            max_slots * METADATA_BYTES, dtype=torch.uint8, pin_memory=True
+            buf_multiplier * max_slots * METADATA_BYTES, dtype=torch.uint8, pin_memory=True
         )
         self._latest_snapshot = self._allocate_snapshot()
         self._module_filter = module_filter
@@ -63,6 +67,8 @@ class GraphMonitor:
         self._capture_anchors: List[torch.Tensor] = []
         self._inline_attrs: Dict[nn.Module, List[str]] = {}
         self._pending_steps: Deque[_StepSnapshot] = deque()
+        self._num_monitored_slots = 0
+        self._frame_parents: List[nn.Module] = []
         self._register_hooks(model)
 
     def close(self) -> None:
@@ -74,6 +80,10 @@ class GraphMonitor:
                 if hasattr(parent, attr):
                     delattr(parent, attr)
         self._inline_attrs.clear()
+        for parent in self._frame_parents:
+            if hasattr(parent, "_mon_frame_offset"):
+                delattr(parent, "_mon_frame_offset")
+        self._frame_parents.clear()
         self._pending_steps.clear()
 
     def _register_hooks(self, model: nn.Module) -> None:
@@ -83,6 +93,7 @@ class GraphMonitor:
                 parent_map[name] = mod
 
         slot_id = 0
+        seen_parents: Dict[nn.Module, bool] = {}
         for name, module in model.named_modules():
             if name == "":
                 continue
@@ -94,10 +105,12 @@ class GraphMonitor:
                 break
             self._module_to_slot[module] = slot_id
             self._slot_mapping[slot_id] = SlotInfo(slot_id=slot_id, module_name=name)
-            handle = module.register_forward_hook(self._make_hook(slot_id))
-            self._handles.append(handle)
-            # In compile mode, also set inline attrs so _mon_record() works
-            if self._graph_mode == "compile" and hasattr(module, "monitor_activation"):
+            # dual_compile: no forward hooks (they receive FakeTensors under torch.compile)
+            if self._graph_mode != "dual_compile":
+                handle = module.register_forward_hook(self._make_hook(slot_id))
+                self._handles.append(handle)
+            # In compile/dual_compile mode, set inline attrs so _mon_record() works
+            if self._graph_mode in ("compile", "dual_compile") and hasattr(module, "monitor_activation"):
                 parts = name.rsplit(".", 1)
                 parent_name = parts[0] if len(parts) > 1 else ""
                 attr_name = parts[-1]
@@ -110,10 +123,16 @@ class GraphMonitor:
                         self._inline_attrs[parent] = ["_mon_buf"]
                     if slot_attr not in self._inline_attrs[parent]:
                         self._inline_attrs[parent].append(slot_attr)
+                    # dual_compile: set _mon_frame_offset on parents
+                    if self._graph_mode == "dual_compile" and parent not in seen_parents:
+                        parent._mon_frame_offset = 0
+                        self._frame_parents.append(parent)
+                        seen_parents[parent] = True
             slot_id += 1
+        self._num_monitored_slots = slot_id
 
     def _make_hook(self, slot_id: int) -> Callable[..., None]:
-        if self._graph_mode == "compile":
+        if self._graph_mode in ("compile", "dual_compile"):
             return self._make_compile_hook(slot_id)
         return self._make_manual_hook(slot_id)
 
@@ -186,8 +205,8 @@ class GraphMonitor:
             self._gpu_buffer.zero_()
 
     def finalize_capture(self) -> None:
-        if self._graph_mode == "compile":
-            return  # sink() already called per-hook inside the compiled graph
+        if self._graph_mode in ("compile", "dual_compile"):
+            return  # compile modes: record() is inline / per-hook inside compiled graph
         if self._capture_anchors:
             self._ops.sink(self._capture_anchors)
             self._capture_anchors.clear()
@@ -240,3 +259,66 @@ class GraphMonitor:
 
     def num_slots(self) -> int:
         return len(self._slot_mapping)
+
+    # ------------------------------------------------------------------
+    # dual_compile helpers
+
+    @property
+    def num_monitored_slots(self) -> int:
+        return self._num_monitored_slots
+
+    def set_frame(self, frame: int) -> None:
+        """Set frame offset on all parent modules. Dynamo guards on the int value."""
+        assert self._graph_mode == "dual_compile"
+        offset = frame * self._num_monitored_slots
+        for parent in self._frame_parents:
+            parent._mon_frame_offset = offset
+
+    def parse_frame_metadata(self, frame: int) -> Dict[int, dict]:
+        """Parse metadata for one frame from GPU buffer (synchronous)."""
+        torch.cuda.synchronize()
+        host = self._gpu_buffer.cpu()
+        offset = frame * self._num_monitored_slots
+        result: Dict[int, dict] = {}
+        for slot_id in self._slot_mapping:
+            global_slot = slot_id + offset
+            row = _parse_metadata_row(host, global_slot)
+            if row is not None:
+                result[slot_id] = row
+        return result
+
+    def create_frame_aliases(self, frame: int) -> Dict[int, torch.Tensor]:
+        """Create from_blob alias tensors for one frame (one-time at warmup)."""
+        parsed = self.parse_frame_metadata(frame)
+        aliases: Dict[int, torch.Tensor] = {}
+        for slot_id, meta in parsed.items():
+            aliases[slot_id] = self._ops.alias_tensor(
+                meta["data_ptr"],
+                list(meta["shape"]),
+                list(meta["stride"]),
+                meta["dtype_id"],
+                meta["device_idx"],
+            )
+        return aliases
+
+
+def _parse_metadata_row(host: torch.Tensor, slot_id: int) -> Optional[dict]:
+    """Parse a single 128B metadata row from a CPU buffer."""
+    start = slot_id * METADATA_BYTES
+    end = start + METADATA_BYTES
+    if end > host.numel():
+        return None
+    slot_bytes = host[start:end].contiguous().numpy().tobytes()
+    fields = _METADATA_STRUCT.unpack(slot_bytes)
+    data_ptr = fields[0]
+    ndim = fields[9]
+    if data_ptr == 0 or ndim <= 0:
+        return None
+    return {
+        "data_ptr": data_ptr,
+        "shape": list(fields[1:5][:ndim]),
+        "stride": list(fields[5:9][:ndim]),
+        "ndim": ndim,
+        "dtype_id": fields[10],
+        "device_idx": fields[11],
+    }
