@@ -59,6 +59,7 @@ class GraphSafeEngine:
         delegate: Optional[GraphDelegate] = None,
         graph_mode: str = "manual",
         monitor_interval: int = 1,
+        d2h_repeat: int = 1,
     ) -> None:
         self.config = config
         self._module_filter = module_filter
@@ -91,10 +92,12 @@ class GraphSafeEngine:
         self._frame_aliases: Dict[int, Dict[int, torch.Tensor]] = {}
         self._pinned_buffers: Dict[int, Dict[int, torch.Tensor]] = {}
 
-        # Skip-step monitoring: _mon_frame flips at end of each monitored step.
-        # All steps use _mon_frame as their frame. With interval=1 this
-        # degenerates to step_id % 2 (backward compatible).
+        # Skip-step monitoring: _mon_frame flips at START of each monitored step.
+        # D2H copies the PREVIOUS frame (1 - _mon_frame) at end of monitored step.
+        # pre_fwd_event (recorded before forward) lets D2H overlap with forward.
+        # Skip steps keep the same frame → never conflict with in-flight D2H.
         self._monitor_interval = max(1, monitor_interval)
+        self._d2h_repeat = max(1, d2h_repeat)
         self._mon_frame = 0
         self._d2h_ever_submitted = False
         self._d2h_in_flight: Dict[int, bool] = {0: False, 1: False}
@@ -161,15 +164,27 @@ class GraphSafeEngine:
         self._copy_stream = torch.cuda.Stream(device=self._device)
         self._pre_fwd_event = torch.cuda.Event()
 
+        # Pre-build ordered src/dst lists for batch_d2h C++ op.
+        self._d2h_src_lists: Dict[int, List[torch.Tensor]] = {}
+        self._d2h_dst_lists: Dict[int, List[torch.Tensor]] = {}
+
         for frame in (0, 1):
             self._d2h_events[frame] = torch.cuda.Event()
             self._frame_aliases[frame] = self._monitor.create_frame_aliases(frame)
             # Pre-allocate pinned host buffers
             pinned: Dict[int, torch.Tensor] = {}
+            src_list: List[torch.Tensor] = []
+            dst_list: List[torch.Tensor] = []
             for slot_id, alias in self._frame_aliases[frame].items():
-                pinned[slot_id] = torch.empty_like(alias, device="cpu", pin_memory=True)
+                pin = torch.empty_like(alias, device="cpu", pin_memory=True)
+                pinned[slot_id] = pin
+                src_list.append(alias.contiguous())
+                dst_list.append(pin)
             self._pinned_buffers[frame] = pinned
+            self._d2h_src_lists[frame] = src_list
+            self._d2h_dst_lists[frame] = dst_list
 
+        self._batch_d2h = self._monitor._ops.batch_d2h
         self._dual_frame_ready = True
 
     def collect_dual_frame_results(self, *, wait: bool = False) -> Optional[Dict[int, torch.Tensor]]:
@@ -215,6 +230,12 @@ class GraphSafeEngine:
         self._current_step_id = next_step
 
         if self._graph_mode == "dual_compile" and self._dual_frame_ready:
+            # Flip at start of monitored steps so that skip steps keep
+            # the same frame and never conflict with in-flight D2H.
+            is_monitored = (self._current_step_id % self._monitor_interval) == 0
+            if is_monitored:
+                self._mon_frame = 1 - self._mon_frame
+
             frame = self._mon_frame
             self._monitor.set_frame(frame)
 
@@ -226,8 +247,9 @@ class GraphSafeEngine:
             # indirectly wait for itself (deadlock/serialization).
             self._pre_fwd_event.record(fwd_stream)
 
-            # GPU barrier: protect frame data from being overwritten
-            # while D2H is still reading from the same frame.
+            # GPU barrier: protect frame from being overwritten while
+            # D2H is still reading it.  With flip-at-start, barrier
+            # fires at monitored steps only (interval steps after D2H).
             if self._d2h_in_flight[frame]:
                 fwd_stream.wait_event(self._d2h_events[frame])
                 self._d2h_in_flight[frame] = False
@@ -261,34 +283,38 @@ class GraphSafeEngine:
             self._step_streams[self._current_step_id] = stream
 
     def _dual_frame_end_step(self, stream: Optional[torch.cuda.Stream]) -> None:
-        """D2H the previous frame on copy_stream, then flip _mon_frame.
+        """D2H the previous frame on copy_stream (no flip — flip was at start).
 
         copy_stream.wait_event(pre_fwd_event) ensures D2H starts only after
         forward(t-1) completes on fwd_stream.  pre_fwd_event was recorded
         at start_step BEFORE forward(t), so copy_stream sees only work up
-        to forward(t-1) — allowing D2H to overlap with forward(t) on GPU.
+        to forward(t-1) — allowing D2H(prev_frame) to overlap with
+        forward(t, curr_frame) on the GPU.
         """
         is_monitored = (self._current_step_id % self._monitor_interval) == 0
         if not is_monitored:
             return
 
-        # D2H the PREVIOUS frame (1 - _mon_frame).  Current frame was just
-        # written by this step's forward; pre_fwd_event predates it, so
-        # copying the current frame would race.  Skip the very first
-        # monitored step (no previous data to copy).
-        prev_frame = 1 - self._mon_frame
-        if self._d2h_ever_submitted:
-            self._copy_stream.wait_event(self._pre_fwd_event)
-            with torch.cuda.stream(self._copy_stream):
-                for sid, alias in self._frame_aliases[prev_frame].items():
-                    self._pinned_buffers[prev_frame][sid].copy_(
-                        alias, non_blocking=True
-                    )
-                self._d2h_events[prev_frame].record(self._copy_stream)
-            self._d2h_in_flight[prev_frame] = True
+        if not self._d2h_ever_submitted:
+            # First monitored step: prev_frame has only warmup data; skip.
+            self._d2h_ever_submitted = True
+            return
 
-        self._d2h_ever_submitted = True
-        self._mon_frame = 1 - self._mon_frame  # FLIP
+        # D2H the PREVIOUS frame (1 - _mon_frame).  The flip already
+        # happened at start_step, so prev_frame is the frame used by
+        # the preceding monitored cycle.
+        prev_frame = 1 - self._mon_frame
+        self._copy_stream.wait_event(self._pre_fwd_event)
+        with torch.cuda.stream(self._copy_stream):
+            # Single C++ call replaces N Python copy_() calls.
+            # Eliminates ~30μs/call Python dispatch overhead.
+            for _ in range(self._d2h_repeat):
+                self._batch_d2h(
+                    self._d2h_dst_lists[prev_frame],
+                    self._d2h_src_lists[prev_frame],
+                )
+            self._d2h_events[prev_frame].record(self._copy_stream)
+        self._d2h_in_flight[prev_frame] = True
 
     def is_capture_enabled(self) -> bool:
         return bool(self._capture_enabled)

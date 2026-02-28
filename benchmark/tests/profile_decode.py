@@ -137,6 +137,12 @@ def parse_args() -> argparse.Namespace:
         help="Monitor every N-th decode step (skip-step monitoring). 1=every step, 2=every other step, etc.",
     )
     parser.add_argument(
+        "--d2h-repeat",
+        type=int,
+        default=1,
+        help="Repeat each D2H copy N times to simulate heavier D2H load (testing only).",
+    )
+    parser.add_argument(
         "--graph-copy-mode",
         choices=["disabled", "sync"],
         default="disabled",
@@ -891,6 +897,7 @@ def main() -> None:
             device=device,
             graph_mode=graph_mode,
             monitor_interval=args.monitor_interval,
+            d2h_repeat=args.d2h_repeat,
         )
         graph_consumer = GraphSlotConsumer(delay_steps=args.engine_delay_steps)
         monitoring_engine.attach_consumer(graph_consumer)

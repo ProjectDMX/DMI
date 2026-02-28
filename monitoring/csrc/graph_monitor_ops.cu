@@ -208,6 +208,31 @@ int64_t held_tensors_count_op(int64_t frame) {
   return static_cast<int64_t>(g_held_tensors[frame].size());
 }
 
+// --- Batched D2H: single C++ call replaces N Python copy_() calls ---
+// Eliminates ~30μs/call Python dispatch overhead.  Each pair is a
+// (dst_pinned_cpu, src_gpu) copy issued via cudaMemcpyAsync on the
+// current stream.
+void batch_d2h_op(const std::vector<at::Tensor>& dst_list,
+                  const std::vector<at::Tensor>& src_list) {
+  TORCH_CHECK(dst_list.size() == src_list.size(),
+              "batch_d2h: dst and src lists must have same length");
+  if (dst_list.empty()) return;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  for (size_t i = 0; i < src_list.size(); i++) {
+    const auto& src = src_list[i];
+    const auto& dst = dst_list[i];
+    TORCH_CHECK(src.is_cuda(), "batch_d2h: src[", i, "] must be CUDA");
+    TORCH_CHECK(!dst.is_cuda(), "batch_d2h: dst[", i, "] must be CPU");
+    TORCH_CHECK(src.is_contiguous() && dst.is_contiguous(),
+                "batch_d2h: tensors must be contiguous");
+    TORCH_CHECK(src.nbytes() == dst.nbytes(),
+                "batch_d2h: size mismatch at index ", i);
+    AT_CUDA_CHECK(cudaMemcpyAsync(
+        dst.data_ptr(), src.data_ptr(), src.nbytes(),
+        cudaMemcpyDeviceToHost, stream));
+  }
+}
+
 }  // namespace vllm
 
 TORCH_LIBRARY(graphmonitor_ops, m) {
@@ -217,6 +242,8 @@ TORCH_LIBRARY(graphmonitor_ops, m) {
   m.def("sink_hold(Tensor[] tensors, int frame) -> ()");
   m.def("clear_held_tensors() -> ()");
   m.def("held_tensors_count(int frame) -> int");
+  // Batched D2H: single C++ call for N async copies
+  m.def("batch_d2h(Tensor[] dst_list, Tensor[] src_list) -> ()");
   // Per-slot D2H event barrier ops
   m.def("init_d2h_events(int num_events) -> ()");
   m.def("wait_d2h(Tensor(a!) buffer, int slot_id) -> ()");
@@ -242,6 +269,7 @@ TORCH_LIBRARY_IMPL(graphmonitor_ops, Meta, m) {
 // Register as CompositeImplicitAutograd (fallback for all backends).
 TORCH_LIBRARY_IMPL(graphmonitor_ops, CompositeImplicitAutograd, m) {
   m.impl("alias_tensor", &vllm::alias_tensor);
+  m.impl("batch_d2h", &vllm::batch_d2h_op);
   m.impl("clear_held_tensors", &vllm::clear_held_tensors_op);
   m.impl("held_tensors_count", &vllm::held_tensors_count_op);
   m.impl("init_d2h_events", &vllm::init_d2h_events_op);
