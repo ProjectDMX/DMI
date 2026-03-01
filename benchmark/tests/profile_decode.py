@@ -521,6 +521,47 @@ class TorchCompileDecodeRunner:
         pass
 
 
+class HFCompileDecodeRunner:
+    """Decode runner for vanilla GPT2LMHeadModel with torch.compile + StaticCache."""
+
+    def __init__(self, model, *, max_cache_len: int = 256) -> None:
+        self.model = model
+        self.captured = True  # torch.compile manages capture internally
+        self._cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
+        self._next_cache_pos = 0
+        self._compiled_forward = torch.compile(
+            self._forward_step, mode="reduce-overhead", fullgraph=False,
+        )
+
+    def _forward_step(
+        self, token: torch.Tensor, cache, cache_position: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = self.model(
+            token,
+            use_cache=True,
+            past_key_values=cache,
+            cache_position=cache_position,
+            return_dict=True,
+        )
+        return outputs.logits
+
+    def run(self, token: torch.Tensor, past=None) -> Tuple[torch.Tensor, object]:
+        cache_position = torch.tensor(
+            [self._next_cache_pos], device=token.device, dtype=torch.long,
+        )
+        torch.compiler.cudagraph_mark_step_begin()
+        logits = self._compiled_forward(token, self._cache, cache_position)
+        self._next_cache_pos += 1
+        return logits, self._cache
+
+    def reset_cache(self) -> None:
+        self._cache.reset()
+        self._next_cache_pos = 0
+
+    def reset_capture(self) -> None:
+        pass
+
+
 class DualCompileDecodeRunner:
     """Decode runner with dual-frame forward/D2H pipelining (Design C)."""
 
@@ -1061,6 +1102,8 @@ def main() -> None:
     graph_forward_runner: Optional[HFGraphDecodeRunner] = None
     compile_runner: Optional[TorchCompileDecodeRunner] = None
     dual_compile_runner: Optional[DualCompileDecodeRunner] = None
+    hf_compile_runner: Optional[HFCompileDecodeRunner] = None
+    overhead_runner: Optional[TorchCompileDecodeRunner] = None
 
     def hf_prefill_fn(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
         outputs = hf_model(
@@ -1089,150 +1132,58 @@ def main() -> None:
         del outputs
         return logits, next_past
 
-    def hf_api_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
-        return hf_prefill_fn(prefill_tokens)
-
-    def hf_api_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
+    def hf_torch_compile_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[object, torch.Tensor]:
+        nonlocal hf_compile_runner
+        if hf_compile_runner is None:
+            hf_compile_runner = HFCompileDecodeRunner(
+                hf_model, max_cache_len=args.prefill_tokens + args.decode_steps + 16,
+            )
+        hf_compile_runner.reset_cache()
         outputs = hf_model(
-            token,
+            prefill_tokens,
             use_cache=True,
-            past_key_values=past_key_values,
-            output_hidden_states=args.collect_hidden,
-            output_attentions=args.collect_attention,
+            past_key_values=hf_compile_runner._cache,
             return_dict=True,
         )
-        if args.collect_attention and outputs.attentions is not None:
-            for attn in outputs.attentions:
-                _ = attn
-        if args.collect_hidden and outputs.hidden_states is not None:
-            for hs in outputs.hidden_states:
-                _ = hs
-        logits = outputs.logits
-        next_past = outputs.past_key_values
+        hf_compile_runner._next_cache_pos = prefill_tokens.shape[1]
+        next_token = greedy_from_logits(outputs.logits)
         del outputs
-        return logits, next_past
+        return hf_compile_runner._cache, next_token
 
-    def hf_modified_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
-        nvtx.range_push("modified_prefill")
-        nvtx.range_push("modified_prefill_forward")
+    def hf_torch_compile_decode(token: torch.Tensor, past_key_values) -> Tuple[torch.Tensor, object]:
+        nonlocal hf_compile_runner
+        if hf_compile_runner is None:
+            raise RuntimeError("HF compile runner not initialized.")
+        return hf_compile_runner.run(token, past_key_values)
+
+    def hf_overhead_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[object, torch.Tensor]:
+        nonlocal overhead_runner
+        if overhead_runner is None:
+            overhead_runner = TorchCompileDecodeRunner(
+                hf_hooked_model, project_logits, None, args,
+                max_cache_len=args.prefill_tokens + args.decode_steps + 16,
+            )
+        overhead_runner.reset_cache()
         outputs = hf_hooked_model(
             prefill_tokens,
             use_cache=True,
+            past_key_values=overhead_runner._cache,
             output_hidden_states=False,
             output_attentions=False,
             return_dict=True,
         )
-        nvtx.range_pop()  # modified_prefill_forward
-        nvtx.range_push("modified_prefill_post")
-        hidden_states = outputs.last_hidden_state
-        nvtx.range_push("modified_prefill_project")
-        logits = project_logits(hidden_states)
-        nvtx.range_pop()  # modified_prefill_project
-        next_token = greedy_from_logits(logits)
-        nvtx.range_pop()  # modified_prefill_post
-        past = outputs.past_key_values
-        del hidden_states, logits, outputs
-        nvtx.range_pop()  # modified_prefill
-        return past, next_token
-
-    def hf_modified_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
-        nvtx.range_push("modified_decode")
-        nvtx.range_push("modified_decode_forward")
-        outputs = hf_hooked_model(
-            token,
-            use_cache=True,
-            past_key_values=past_key_values,
-            output_hidden_states=False,
-            output_attentions=False,
-            return_dict=True,
-        )
-        nvtx.range_pop()  # modified_decode_forward
-        nvtx.range_push("modified_decode_post")
-        hidden_states = outputs.last_hidden_state
-        nvtx.range_push("modified_decode_project")
-        logits = project_logits(hidden_states)
-        nvtx.range_pop()  # modified_decode_project
-        next_past = outputs.past_key_values
-        del hidden_states, outputs
-        nvtx.range_pop()  # modified_decode_post
-        nvtx.range_pop()  # modified_decode
-        return logits, next_past
-
-    def hook_names_filter(name: str) -> bool:
-        lname = name.lower()
-        if args.collect_hidden and args.collect_attention:
-            return True
-        if args.collect_attention:
-            return "attn" in lname
-        return "attn" not in lname
-
-    def hf_modified_hook_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
-        previous_engine = hf_hooked_model.monitoring_engine
-        if not engine_attached_permanently:
-            hf_hooked_model.monitoring_engine = None
-        outputs, cache_dict = hf_hooked_model.run_with_cache(
-            prefill_tokens,
-            use_cache=True,
-            output_hidden_states=args.collect_hidden,
-            output_attentions=args.collect_attention,
-            return_dict=True,
-            names_filter=hook_names_filter,
-            return_cache_object=False,
-            remove_batch_dim=False,
-        )
+        overhead_runner._next_cache_pos = prefill_tokens.shape[1]
         hidden_states = outputs.last_hidden_state
         logits = project_logits(hidden_states)
         next_token = greedy_from_logits(logits)
-        if args.collect_attention and outputs.attentions is not None:
-            for attn in outputs.attentions:
-                _ = attn
-        if args.collect_hidden and outputs.hidden_states is not None:
-            for hs in outputs.hidden_states:
-                _ = hs
-        past = outputs.past_key_values
-        cache_dict.clear()
-        try:
-            process_monitoring_results()
-        except Exception:
-            pass
-        if not engine_attached_permanently:
-            hf_hooked_model.monitoring_engine = previous_engine
         del hidden_states, logits, outputs
-        return past, next_token
+        return overhead_runner._cache, next_token
 
-    def hf_modified_hook_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
-        previous_engine = hf_hooked_model.monitoring_engine
-        if not engine_attached_permanently:
-            hf_hooked_model.monitoring_engine = None
-        outputs, cache_dict = hf_hooked_model.run_with_cache(
-            token,
-            use_cache=True,
-            past_key_values=past_key_values,
-            output_hidden_states=args.collect_hidden,
-            output_attentions=args.collect_attention,
-            return_dict=True,
-            names_filter=hook_names_filter,
-            return_cache_object=False,
-            remove_batch_dim=False,
-        )
-        hidden_states = outputs.last_hidden_state
-        logits = project_logits(hidden_states)
-        if args.collect_attention and outputs.attentions is not None:
-            for attn in outputs.attentions:
-                _ = attn
-        if args.collect_hidden and outputs.hidden_states is not None:
-            for hs in outputs.hidden_states:
-                _ = hs
-        next_past = outputs.past_key_values
-        cache_dict.clear()
-        try:
-            process_monitoring_results()
-        except Exception:
-            pass
-        if not engine_attached_permanently:
-            hf_hooked_model.monitoring_engine = previous_engine
-        del hidden_states, outputs
-        return logits, next_past
+    def hf_overhead_decode(token: torch.Tensor, past_key_values) -> Tuple[torch.Tensor, object]:
+        nonlocal overhead_runner
+        if overhead_runner is None:
+            raise RuntimeError("Overhead runner not initialized.")
+        return overhead_runner.run(token, past_key_values)
 
     def hf_modified_hook_async_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
         nonlocal graph_runner, compile_runner, dual_compile_runner
@@ -1555,27 +1506,27 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    warmup(hf_api_prefill, hf_api_decode)
-    hf_api_elapsed = run_benchmark(
-        "huggingface_api", lambda: run_decode(hf_api_prefill, hf_api_decode)
+    warmup(hf_torch_compile_prefill, hf_torch_compile_decode)
+    hf_compile_elapsed = run_benchmark(
+        "hf_torch_compile", lambda: run_decode(hf_torch_compile_prefill, hf_torch_compile_decode)
     )
-    timings["huggingface_api"] = {
-        "duration": hf_api_elapsed,
-        "tokens_per_second": total_decoded_tokens / hf_api_elapsed if hf_api_elapsed > 0 else float("inf"),
+    timings["hf_torch_compile"] = {
+        "duration": hf_compile_elapsed,
+        "tokens_per_second": total_decoded_tokens / hf_compile_elapsed if hf_compile_elapsed > 0 else float("inf"),
     }
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    warmup(hf_modified_prefill, hf_modified_decode)
-    hf_modified_elapsed = run_benchmark(
-        "hf_modified",
-        lambda: run_decode(hf_modified_prefill, hf_modified_decode),
+    warmup(hf_overhead_prefill, hf_overhead_decode)
+    hf_overhead_elapsed = run_benchmark(
+        "hf_modified_overhead",
+        lambda: run_decode(hf_overhead_prefill, hf_overhead_decode),
     )
-    timings["hf_modified"] = {
-        "duration": hf_modified_elapsed,
-        "tokens_per_second": total_decoded_tokens / hf_modified_elapsed
-        if hf_modified_elapsed > 0
+    timings["hf_modified_overhead"] = {
+        "duration": hf_overhead_elapsed,
+        "tokens_per_second": total_decoded_tokens / hf_overhead_elapsed
+        if hf_overhead_elapsed > 0
         else float("inf"),
     }
 
@@ -1596,21 +1547,6 @@ def main() -> None:
         }
         if device.type == "cuda":
             torch.cuda.empty_cache()
-
-    warmup(hf_modified_hook_prefill, hf_modified_hook_decode)
-    hf_modified_hook_elapsed = run_benchmark(
-        "hf_modified_hook",
-        lambda: run_decode(hf_modified_hook_prefill, hf_modified_hook_decode),
-    )
-    timings["hf_modified_hook"] = {
-        "duration": hf_modified_hook_elapsed,
-        "tokens_per_second": total_decoded_tokens / hf_modified_hook_elapsed
-        if hf_modified_hook_elapsed > 0
-        else float("inf"),
-    }
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
 
     if attach_to_model:
         hf_hooked_model.monitoring_engine = monitoring_engine
@@ -1636,27 +1572,6 @@ def main() -> None:
     }
     if attach_to_model and not engine_attached_permanently:
         hf_hooked_model.monitoring_engine = None
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    hf_hook_prefill, hf_hook_decode, hf_hook_cleanup = setup_hf_decode_hook(
-        hf_model,
-        collect_hidden=args.collect_hidden,
-        collect_attention=args.collect_attention,
-        move_to_cpu=False,
-    )
-    warmup(hf_hook_prefill, hf_hook_decode)
-    try:
-        hf_hook_elapsed = run_benchmark(
-            "huggingface_hook", lambda: run_decode(hf_hook_prefill, hf_hook_decode)
-        )
-        timings["huggingface_hook"] = {
-            "duration": hf_hook_elapsed,
-            "tokens_per_second": total_decoded_tokens / hf_hook_elapsed if hf_hook_elapsed > 0 else float("inf"),
-        }
-    finally:
-        hf_hook_cleanup()
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
