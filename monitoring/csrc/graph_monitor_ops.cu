@@ -293,6 +293,38 @@ void batched_d2h_sm_op(
     AT_CUDA_CHECK(cudaGetLastError());
 }
 
+// --- Batched D2H via raw pointers: avoids O(N) Python→C++ tensor list overhead ---
+// src_ptrs/dst_ptrs/byte_sizes are CPU int64 tensors containing raw addresses and sizes.
+// Internally loops cudaMemcpyAsync on the current stream (DMA Copy Engine).
+void batch_d2h_ptrs_op(
+    const at::Tensor& src_ptrs,
+    const at::Tensor& dst_ptrs,
+    const at::Tensor& byte_sizes,
+    int64_t n
+) {
+    if (n <= 0) return;
+    TORCH_CHECK(!src_ptrs.is_cuda() && src_ptrs.dtype() == at::kLong,
+                "batch_d2h_ptrs: src_ptrs must be CPU int64 tensor");
+    TORCH_CHECK(!dst_ptrs.is_cuda() && dst_ptrs.dtype() == at::kLong,
+                "batch_d2h_ptrs: dst_ptrs must be CPU int64 tensor");
+    TORCH_CHECK(!byte_sizes.is_cuda() && byte_sizes.dtype() == at::kLong,
+                "batch_d2h_ptrs: byte_sizes must be CPU int64 tensor");
+    TORCH_CHECK(n <= src_ptrs.numel() && n <= dst_ptrs.numel() && n <= byte_sizes.numel(),
+                "batch_d2h_ptrs: n exceeds descriptor length");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int64_t* sp = src_ptrs.data_ptr<int64_t>();
+    const int64_t* dp = dst_ptrs.data_ptr<int64_t>();
+    const int64_t* sz = byte_sizes.data_ptr<int64_t>();
+    for (int64_t i = 0; i < n; i++) {
+        AT_CUDA_CHECK(cudaMemcpyAsync(
+            reinterpret_cast<void*>(dp[i]),
+            reinterpret_cast<const void*>(sp[i]),
+            static_cast<size_t>(sz[i]),
+            cudaMemcpyDeviceToHost, stream));
+    }
+}
+
 }  // namespace vllm
 
 TORCH_LIBRARY(graphmonitor_ops, m) {
@@ -306,6 +338,8 @@ TORCH_LIBRARY(graphmonitor_ops, m) {
   m.def("batch_d2h(Tensor[] dst_list, Tensor[] src_list) -> ()");
   // Batched D2H SM kernel: single kernel launch, descriptor-based
   m.def("batched_d2h_sm(Tensor src_ptrs, Tensor dst_ptrs, Tensor byte_sizes, int n_active) -> ()");
+  // Batched D2H via raw pointers: CPU int64 tensors, DMA engine
+  m.def("batch_d2h_ptrs(Tensor src_ptrs, Tensor dst_ptrs, Tensor byte_sizes, int n) -> ()");
   // Per-slot D2H event barrier ops
   m.def("init_d2h_events(int num_events) -> ()");
   m.def("wait_d2h(Tensor(a!) buffer, int slot_id) -> ()");
@@ -333,6 +367,7 @@ TORCH_LIBRARY_IMPL(graphmonitor_ops, CompositeImplicitAutograd, m) {
   m.impl("alias_tensor", &vllm::alias_tensor);
   m.impl("batch_d2h", &vllm::batch_d2h_op);
   m.impl("batched_d2h_sm", &vllm::batched_d2h_sm_op);
+  m.impl("batch_d2h_ptrs", &vllm::batch_d2h_ptrs_op);
   m.impl("clear_held_tensors", &vllm::clear_held_tensors_op);
   m.impl("held_tensors_count", &vllm::held_tensors_count_op);
   m.impl("init_d2h_events", &vllm::init_d2h_events_op);

@@ -1601,6 +1601,37 @@ def main() -> None:
     if attach_to_model and not engine_attached_permanently:
         hf_hooked_model.monitoring_engine = None
 
+    # Selective monitoring: only hook_resid_post (n_layer hooks instead of all)
+    if args.monitoring_mode == "dual_compile" and dual_compile_runner is not None:
+        selected = monitoring_engine.select_hooks(["hook_resid_post"])
+        print(f"  selective monitoring: {len(selected)} hooks (hook_resid_post only)")
+        if attach_to_model:
+            hf_hooked_model.monitoring_engine = monitoring_engine
+        warmup(hf_modified_hook_async_prefill, hf_modified_hook_async_decode)
+        resolve_monitoring_results()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        main_sel_elapsed, total_sel_elapsed = run_async_benchmark(
+            "hf_modified_hook_selective",
+            lambda: run_decode(hf_modified_hook_async_prefill, hf_modified_hook_async_decode),
+            monitoring_engine,
+        )
+        timings["hf_modified_hook_selective"] = {
+            "main_duration": main_sel_elapsed,
+            "total_duration": total_sel_elapsed,
+            "num_hooks": len(selected),
+            "tokens_per_second_main": total_decoded_tokens / main_sel_elapsed
+            if main_sel_elapsed > 0
+            else float("inf"),
+            "tokens_per_second_total": total_decoded_tokens / total_sel_elapsed
+            if total_sel_elapsed > 0
+            else float("inf"),
+        }
+        # Restore full monitoring for subsequent benchmarks
+        monitoring_engine.select_hooks(None)
+        if attach_to_model and not engine_attached_permanently:
+            hf_hooked_model.monitoring_engine = None
+
     # Overhead benchmark: same compiled graph as async, but no D2H (no start_step/end_step)
     # Runs after async so dual_compile_runner is already warmed up
     if args.monitoring_mode == "dual_compile" and dual_compile_runner is not None:

@@ -47,12 +47,18 @@ class GraphSlotResult:
 
 
 class BatchedD2HDescriptor:
-    """Manages D2H tensor lists with selective mask support.
+    """Manages D2H with selective hook mask and per-request slicing.
 
-    Holds pre-built (src_list, dst_list) for each frame.  update_mask()
-    rebuilds lists with only active slots — call when the monitored hook
-    set changes (e.g. request exit).  launch() issues a single C++ call
-    that loops over cudaMemcpyAsync (DMA Copy Engine, no SM contention).
+    Two independent selection dimensions:
+    - update_mask(active_slots): which hooks to D2H
+    - update_requests(slot_requests): which batch requests per hook
+
+    When per-request mode is active, build phase uses tensor slicing for
+    bounds checking, then extracts raw data_ptr integers.  launch() passes
+    packed int64 CPU tensors to batch_d2h_ptrs (O(1) Python→C++ crossing).
+
+    When in full-batch mode (no per-request), uses the original tensor-list
+    path via batch_d2h.
     """
 
     def __init__(
@@ -66,35 +72,146 @@ class BatchedD2HDescriptor:
         self._all_pinned = pinned_buffers
         self._ops = ops
         self._device = device
-        # Per-frame: (src_list, dst_list) for batch_d2h C++ op
+        self._active_slots: Optional[Set[int]] = None
+        # Per-slot request sets: slot_id → set of request indices (None = full batch)
+        self._slot_requests: Dict[int, Optional[Set[int]]] = {}
+        self._per_request_mode = False
+        # Full-batch mode: (src_list, dst_list) of tensors
         self._frame_lists: Dict[int, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
-        for frame in (0, 1):
-            self._rebuild(frame, active_slots=None)
+        # Per-request mode: packed int64 pointer tensors
+        self._ptr_tensors: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = {}
+        self._rebuild_all()
 
     def update_mask(self, active_slots: Optional[Set[int]] = None) -> None:
-        """Rebuild D2H lists with only the given active slots.
+        """Select which hooks to D2H. None = all. Off critical path."""
+        self._active_slots = active_slots
+        self._rebuild_all()
 
-        Call when the monitored hook set changes (not on the step critical
-        path).  Pass None to activate all slots.
+    def update_requests(
+        self,
+        slot_requests: Optional[Dict[int, Optional[Set[int]]]] = None,
+    ) -> None:
+        """Set per-slot request selection for D2H.
+
+        Args:
+            slot_requests: {slot_id: set_of_request_indices} or
+                           {slot_id: None} for full batch on that slot.
+                           Pass None to disable per-request mode (all full batch).
         """
-        for frame in (0, 1):
-            self._rebuild(frame, active_slots)
+        if slot_requests is None:
+            self._slot_requests.clear()
+            self._per_request_mode = False
+        else:
+            self._slot_requests = dict(slot_requests)
+            self._per_request_mode = any(v is not None for v in slot_requests.values())
+        self._rebuild_all()
 
-    def _rebuild(self, frame: int, active_slots: Optional[Set[int]]) -> None:
+    def _rebuild_all(self) -> None:
+        if self._per_request_mode:
+            self._frame_lists.clear()
+            for frame in (0, 1):
+                self._rebuild_ptrs(frame)
+        else:
+            self._ptr_tensors.clear()
+            for frame in (0, 1):
+                self._rebuild_full(frame)
+
+    def _rebuild_full(self, frame: int) -> None:
+        """Build tensor lists for full-batch D2H (original path)."""
         src_list: List[torch.Tensor] = []
         dst_list: List[torch.Tensor] = []
         for slot_id, alias in self._all_aliases[frame].items():
-            if active_slots is not None and slot_id not in active_slots:
+            if self._active_slots is not None and slot_id not in self._active_slots:
                 continue
             src_list.append(alias.contiguous())
             dst_list.append(self._all_pinned[frame][slot_id])
         self._frame_lists[frame] = (src_list, dst_list)
 
+    def _rebuild_ptrs(self, frame: int) -> None:
+        """Build raw pointer arrays for per-request D2H.
+
+        Uses tensor slicing for bounds checking, then extracts data_ptr.
+        Adjacent requests are coalesced into range slices to reduce DMA count.
+        """
+        src_ptrs: List[int] = []
+        dst_ptrs: List[int] = []
+        sizes: List[int] = []
+        for slot_id, alias in self._all_aliases[frame].items():
+            if self._active_slots is not None and slot_id not in self._active_slots:
+                continue
+            reqs = self._slot_requests.get(slot_id)
+            if reqs is None:
+                # Full batch for this slot
+                src_ptrs.append(alias.data_ptr())
+                dst_ptrs.append(self._all_pinned[frame][slot_id].data_ptr())
+                sizes.append(alias.nbytes)
+                continue
+            if not reqs:
+                continue
+            pinned = self._all_pinned[frame][slot_id]
+            # Coalesce adjacent requests into ranges
+            for rng_start, rng_end in _coalesce_requests(sorted(reqs), alias):
+                # Tensor slice for bounds check (off critical path)
+                src_slice = alias[rng_start : rng_end + 1]
+                dst_slice = pinned[rng_start : rng_end + 1]
+                src_ptrs.append(src_slice.data_ptr())
+                dst_ptrs.append(dst_slice.data_ptr())
+                sizes.append(src_slice.nbytes)
+        n = len(src_ptrs)
+        if n > 0:
+            self._ptr_tensors[frame] = (
+                torch.tensor(src_ptrs, dtype=torch.int64),
+                torch.tensor(dst_ptrs, dtype=torch.int64),
+                torch.tensor(sizes, dtype=torch.int64),
+                n,
+            )
+        else:
+            self._ptr_tensors[frame] = (
+                torch.empty(0, dtype=torch.int64),
+                torch.empty(0, dtype=torch.int64),
+                torch.empty(0, dtype=torch.int64),
+                0,
+            )
+
     def launch(self, frame: int) -> None:
         """Issue batched D2H on the current CUDA stream (DMA Copy Engine)."""
-        src_list, dst_list = self._frame_lists[frame]
-        if src_list:
-            self._ops.batch_d2h(dst_list, src_list)
+        if self._per_request_mode:
+            sp, dp, sz, n = self._ptr_tensors[frame]
+            if n > 0:
+                self._ops.batch_d2h_ptrs(sp, dp, sz, n)
+        else:
+            src_list, dst_list = self._frame_lists[frame]
+            if src_list:
+                self._ops.batch_d2h(dst_list, src_list)
+
+
+def _coalesce_requests(
+    sorted_reqs: List[int], alias: torch.Tensor
+) -> List[Tuple[int, int]]:
+    """Merge adjacent request indices into (start, end) ranges.
+
+    Merges when the gap bytes between two requests is less than one
+    cudaMemcpyAsync launch overhead (~1.5μs × 25GB/s PCIe ≈ 37.5KB).
+    """
+    if not sorted_reqs:
+        return []
+    batch_size = alias.shape[0]
+    stride_bytes = alias.stride(0) * alias.element_size()
+    threshold_bytes = 37500  # break-even: 1.5μs launch × 25 GB/s PCIe
+    segments: List[Tuple[int, int]] = []
+    seg_start = sorted_reqs[0]
+    seg_end = sorted_reqs[0]
+    assert seg_start < batch_size, f"request {seg_start} >= batch_size {batch_size}"
+    for r in sorted_reqs[1:]:
+        assert r < batch_size, f"request {r} >= batch_size {batch_size}"
+        gap_bytes = (r - seg_end - 1) * stride_bytes
+        if gap_bytes <= threshold_bytes:
+            seg_end = r
+        else:
+            segments.append((seg_start, seg_end))
+            seg_start = seg_end = r
+    segments.append((seg_start, seg_end))
+    return segments
 
 
 class GraphSafeEngine:
@@ -227,6 +344,81 @@ class GraphSafeEngine:
         """
         if self._d2h_desc is not None:
             self._d2h_desc.update_mask(active_slots)
+
+    def select_hooks(
+        self,
+        patterns: "Optional[Union[List[str], Dict[str, Optional[Set[int]]]]]" = None,
+        *,
+        requests: Optional[Set[int]] = None,
+    ) -> Set[int]:
+        """Select which hooks (and optionally which requests) to D2H.
+
+        Args:
+            patterns: Hook selection. Can be:
+                - None: activate all hooks, clear per-request selection
+                - List[str]: substrings to match hook names (all share `requests`)
+                - Dict[str, Optional[Set[int]]]: pattern → per-hook request set
+                  (None value = full batch for matching hooks)
+            requests: Shared request set for List[str] form. Ignored for dict form.
+                      None = full batch.
+
+        Returns:
+            Set of active slot_ids.
+
+        Examples:
+            engine.select_hooks(["hook_resid_post"])
+            engine.select_hooks(["hook_resid_post"], requests={2, 15, 46})
+            engine.select_hooks({
+                "hook_resid_post": {2, 15, 46},
+                "hook_pattern": set(range(2, 11)),
+            })
+            engine.select_hooks(None)  # restore all
+        """
+        if patterns is None:
+            self.update_d2h_mask(None)
+            self.update_d2h_requests(None)
+            return set(self._slot_mapping.keys())
+
+        if isinstance(patterns, dict):
+            # Dict form: pattern → per-hook request set
+            active: Set[int] = set()
+            slot_requests: Dict[int, Optional[Set[int]]] = {}
+            for pattern, req_set in patterns.items():
+                for info in self._slot_mapping.values():
+                    if pattern in info.module_name:
+                        active.add(info.slot_id)
+                        slot_requests[info.slot_id] = req_set
+            self.update_d2h_mask(active)
+            self.update_d2h_requests(slot_requests if slot_requests else None)
+            return active
+        else:
+            # List form: all matched hooks share the same request set
+            active = {
+                info.slot_id
+                for info in self._slot_mapping.values()
+                if any(p in info.module_name for p in patterns)
+            }
+            self.update_d2h_mask(active)
+            if requests is not None:
+                slot_requests = {sid: requests for sid in active}
+                self.update_d2h_requests(slot_requests)
+            else:
+                self.update_d2h_requests(None)
+            return active
+
+    def update_d2h_requests(
+        self,
+        slot_requests: Optional[Dict[int, Optional[Set[int]]]] = None,
+    ) -> None:
+        """Set per-slot request selection for D2H.
+
+        Args:
+            slot_requests: {slot_id: set_of_request_indices} or None.
+                           Per-slot None value = full batch for that slot.
+                           Pass None to disable per-request mode entirely.
+        """
+        if self._d2h_desc is not None:
+            self._d2h_desc.update_requests(slot_requests)
 
     def finalize_dual_frame(self) -> None:
         """After warmup: parse metadata, create aliases, setup D2H infrastructure."""
