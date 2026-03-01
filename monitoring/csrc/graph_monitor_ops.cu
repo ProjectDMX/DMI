@@ -208,10 +208,7 @@ int64_t held_tensors_count_op(int64_t frame) {
   return static_cast<int64_t>(g_held_tensors[frame].size());
 }
 
-// --- Batched D2H: single C++ call replaces N Python copy_() calls ---
-// Eliminates ~30μs/call Python dispatch overhead.  Each pair is a
-// (dst_pinned_cpu, src_gpu) copy issued via cudaMemcpyAsync on the
-// current stream.
+// --- Batched D2H (legacy): C++ loop of cudaMemcpyAsync ---
 void batch_d2h_op(const std::vector<at::Tensor>& dst_list,
                   const std::vector<at::Tensor>& src_list) {
   TORCH_CHECK(dst_list.size() == src_list.size(),
@@ -233,6 +230,69 @@ void batch_d2h_op(const std::vector<at::Tensor>& dst_list,
   }
 }
 
+// --- Batched D2H SM kernel: single launch copies all tensors ---
+// SM threads write directly to mapped pinned host memory via PCIe
+// Write-Combining (UVA).  One block per tensor, vectorized uint4 (16B)
+// coalesced access.  Much faster than N cudaMemcpyAsync calls for many
+// small tensors because it avoids per-copy DMA descriptor setup.
+static constexpr int kD2HBlockSize = 256;
+
+__global__ void batched_d2h_kernel(
+    const int64_t* __restrict__ src_ptrs,
+    const int64_t* __restrict__ dst_ptrs,
+    const int64_t* __restrict__ byte_sizes,
+    int n
+) {
+    const int idx = blockIdx.x;
+    if (idx >= n) return;
+
+    const char* src = reinterpret_cast<const char*>(src_ptrs[idx]);
+    char* dst = reinterpret_cast<char*>(dst_ptrs[idx]);
+    const int64_t size = byte_sizes[idx];
+
+    // Vectorized path: 16-byte chunks via uint4
+    const int64_t vec_count = size / 16;
+    const uint4* src4 = reinterpret_cast<const uint4*>(src);
+    uint4* dst4 = reinterpret_cast<uint4*>(dst);
+    for (int64_t i = threadIdx.x; i < vec_count; i += blockDim.x) {
+        dst4[i] = src4[i];
+    }
+
+    // Handle remainder bytes (< 16B)
+    const int64_t vec_bytes = vec_count * 16;
+    if (threadIdx.x == 0) {
+        for (int64_t i = vec_bytes; i < size; i++) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+void batched_d2h_sm_op(
+    const at::Tensor& src_ptrs,
+    const at::Tensor& dst_ptrs,
+    const at::Tensor& byte_sizes,
+    int64_t n_active
+) {
+    if (n_active <= 0) return;
+    TORCH_CHECK(src_ptrs.is_cuda() && src_ptrs.dtype() == at::kLong,
+                "batched_d2h_sm: src_ptrs must be CUDA int64 tensor");
+    TORCH_CHECK(dst_ptrs.is_cuda() && dst_ptrs.dtype() == at::kLong,
+                "batched_d2h_sm: dst_ptrs must be CUDA int64 tensor");
+    TORCH_CHECK(byte_sizes.is_cuda() && byte_sizes.dtype() == at::kLong,
+                "batched_d2h_sm: byte_sizes must be CUDA int64 tensor");
+    TORCH_CHECK(n_active <= src_ptrs.numel(),
+                "batched_d2h_sm: n_active exceeds descriptor length");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    batched_d2h_kernel<<<static_cast<int>(n_active), kD2HBlockSize, 0, stream>>>(
+        src_ptrs.data_ptr<int64_t>(),
+        dst_ptrs.data_ptr<int64_t>(),
+        byte_sizes.data_ptr<int64_t>(),
+        static_cast<int>(n_active)
+    );
+    AT_CUDA_CHECK(cudaGetLastError());
+}
+
 }  // namespace vllm
 
 TORCH_LIBRARY(graphmonitor_ops, m) {
@@ -242,8 +302,10 @@ TORCH_LIBRARY(graphmonitor_ops, m) {
   m.def("sink_hold(Tensor[] tensors, int frame) -> ()");
   m.def("clear_held_tensors() -> ()");
   m.def("held_tensors_count(int frame) -> int");
-  // Batched D2H: single C++ call for N async copies
+  // Batched D2H: single C++ call for N async copies (legacy, DMA-based)
   m.def("batch_d2h(Tensor[] dst_list, Tensor[] src_list) -> ()");
+  // Batched D2H SM kernel: single kernel launch, descriptor-based
+  m.def("batched_d2h_sm(Tensor src_ptrs, Tensor dst_ptrs, Tensor byte_sizes, int n_active) -> ()");
   // Per-slot D2H event barrier ops
   m.def("init_d2h_events(int num_events) -> ()");
   m.def("wait_d2h(Tensor(a!) buffer, int slot_id) -> ()");
@@ -270,6 +332,7 @@ TORCH_LIBRARY_IMPL(graphmonitor_ops, Meta, m) {
 TORCH_LIBRARY_IMPL(graphmonitor_ops, CompositeImplicitAutograd, m) {
   m.impl("alias_tensor", &vllm::alias_tensor);
   m.impl("batch_d2h", &vllm::batch_d2h_op);
+  m.impl("batched_d2h_sm", &vllm::batched_d2h_sm_op);
   m.impl("clear_held_tensors", &vllm::clear_held_tensors_op);
   m.impl("held_tensors_count", &vllm::held_tensors_count_op);
   m.impl("init_d2h_events", &vllm::init_d2h_events_op);

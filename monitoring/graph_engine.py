@@ -46,6 +46,57 @@ class GraphSlotResult:
     device_index: int
 
 
+class BatchedD2HDescriptor:
+    """Manages D2H tensor lists with selective mask support.
+
+    Holds pre-built (src_list, dst_list) for each frame.  update_mask()
+    rebuilds lists with only active slots — call when the monitored hook
+    set changes (e.g. request exit).  launch() issues a single C++ call
+    that loops over cudaMemcpyAsync (DMA Copy Engine, no SM contention).
+    """
+
+    def __init__(
+        self,
+        frame_aliases: Dict[int, Dict[int, torch.Tensor]],
+        pinned_buffers: Dict[int, Dict[int, torch.Tensor]],
+        ops: Any,
+        device: torch.device,
+    ) -> None:
+        self._all_aliases = frame_aliases
+        self._all_pinned = pinned_buffers
+        self._ops = ops
+        self._device = device
+        # Per-frame: (src_list, dst_list) for batch_d2h C++ op
+        self._frame_lists: Dict[int, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
+        for frame in (0, 1):
+            self._rebuild(frame, active_slots=None)
+
+    def update_mask(self, active_slots: Optional[Set[int]] = None) -> None:
+        """Rebuild D2H lists with only the given active slots.
+
+        Call when the monitored hook set changes (not on the step critical
+        path).  Pass None to activate all slots.
+        """
+        for frame in (0, 1):
+            self._rebuild(frame, active_slots)
+
+    def _rebuild(self, frame: int, active_slots: Optional[Set[int]]) -> None:
+        src_list: List[torch.Tensor] = []
+        dst_list: List[torch.Tensor] = []
+        for slot_id, alias in self._all_aliases[frame].items():
+            if active_slots is not None and slot_id not in active_slots:
+                continue
+            src_list.append(alias.contiguous())
+            dst_list.append(self._all_pinned[frame][slot_id])
+        self._frame_lists[frame] = (src_list, dst_list)
+
+    def launch(self, frame: int) -> None:
+        """Issue batched D2H on the current CUDA stream (DMA Copy Engine)."""
+        src_list, dst_list = self._frame_lists[frame]
+        if src_list:
+            self._ops.batch_d2h(dst_list, src_list)
+
+
 class GraphSafeEngine:
     """Step-oriented monitoring engine backed by GraphMonitor metadata."""
 
@@ -91,6 +142,7 @@ class GraphSafeEngine:
         self._d2h_events: Dict[int, torch.cuda.Event] = {}
         self._frame_aliases: Dict[int, Dict[int, torch.Tensor]] = {}
         self._pinned_buffers: Dict[int, Dict[int, torch.Tensor]] = {}
+        self._d2h_desc: Optional[BatchedD2HDescriptor] = None
 
         # Skip-step monitoring: _mon_frame flips at START of each monitored step.
         # D2H copies the PREVIOUS frame (1 - _mon_frame) at end of monitored step.
@@ -166,6 +218,16 @@ class GraphSafeEngine:
         if self._monitor is not None:
             self._monitor.enable_record()
 
+    def update_d2h_mask(self, active_slots: Optional[Set[int]] = None) -> None:
+        """Update which slots are copied during D2H.
+
+        Call when the monitored hook set changes (e.g. request exit).
+        Not on the step critical path (~0.01ms).
+        Pass None to activate all slots.
+        """
+        if self._d2h_desc is not None:
+            self._d2h_desc.update_mask(active_slots)
+
     def finalize_dual_frame(self) -> None:
         """After warmup: parse metadata, create aliases, setup D2H infrastructure."""
         assert self._graph_mode == "dual_compile"
@@ -174,27 +236,22 @@ class GraphSafeEngine:
         self._copy_stream = torch.cuda.Stream(device=self._device)
         self._pre_fwd_event = torch.cuda.Event()
 
-        # Pre-build ordered src/dst lists for batch_d2h C++ op.
-        self._d2h_src_lists: Dict[int, List[torch.Tensor]] = {}
-        self._d2h_dst_lists: Dict[int, List[torch.Tensor]] = {}
-
         for frame in (0, 1):
             self._d2h_events[frame] = torch.cuda.Event()
             self._frame_aliases[frame] = self._monitor.create_frame_aliases(frame)
             # Pre-allocate pinned host buffers
             pinned: Dict[int, torch.Tensor] = {}
-            src_list: List[torch.Tensor] = []
-            dst_list: List[torch.Tensor] = []
             for slot_id, alias in self._frame_aliases[frame].items():
-                pin = torch.empty_like(alias, device="cpu", pin_memory=True)
-                pinned[slot_id] = pin
-                src_list.append(alias.contiguous())
-                dst_list.append(pin)
+                pinned[slot_id] = torch.empty_like(alias, device="cpu", pin_memory=True)
             self._pinned_buffers[frame] = pinned
-            self._d2h_src_lists[frame] = src_list
-            self._d2h_dst_lists[frame] = dst_list
 
-        self._batch_d2h = self._monitor._ops.batch_d2h
+        # Build batched D2H descriptor (SM kernel, single launch)
+        self._d2h_desc = BatchedD2HDescriptor(
+            self._frame_aliases,
+            self._pinned_buffers,
+            self._monitor._ops,
+            self._device,
+        )
         self._dual_frame_ready = True
 
     def collect_dual_frame_results(self, *, wait: bool = False) -> Optional[Dict[int, torch.Tensor]]:
@@ -316,13 +373,9 @@ class GraphSafeEngine:
         prev_frame = 1 - self._mon_frame
         self._copy_stream.wait_event(self._pre_fwd_event)
         with torch.cuda.stream(self._copy_stream):
-            # Single C++ call replaces N Python copy_() calls.
-            # Eliminates ~30μs/call Python dispatch overhead.
+            # Single SM kernel launch copies all active tensors to pinned host.
             for _ in range(self._d2h_repeat):
-                self._batch_d2h(
-                    self._d2h_dst_lists[prev_frame],
-                    self._d2h_src_lists[prev_frame],
-                )
+                self._d2h_desc.launch(prev_frame)
             self._d2h_events[prev_frame].record(self._copy_stream)
         self._d2h_in_flight[prev_frame] = True
 

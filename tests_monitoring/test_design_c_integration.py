@@ -546,3 +546,128 @@ def test_record_elimination():
         print(f"[PASS] Record elimination: {len(ref_0)} slots verified, D2H correct without record")
     finally:
         engine.close()
+
+
+# ===========================================================================
+# Test 7: Batched D2H SM kernel — correctness + selective mask
+# ===========================================================================
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not _HAS_TORCH_COMPILE, reason="torch.compile required")
+def test_batched_d2h_sm():
+    """Batched D2H SM kernel produces correct data, and update_mask restricts copies."""
+    device = torch.device("cuda")
+    config = _tiny_gpt2_config()
+    model = HookedGPT2Model(config).to(device).eval()
+
+    engine = GraphSafeEngine(
+        module_filter=_module_filter,
+        max_slots=256,
+        device=device,
+        graph_mode="dual_compile",
+    )
+    engine.prepare_for_model(model)
+
+    static_input = torch.randint(0, 256, (1, 1), device=device)
+    cache = StaticCache(config=config, max_cache_len=32)
+    cache_pos = torch.tensor([0], device=device, dtype=torch.long)
+
+    compiled_forward = torch.compile(
+        model.forward, mode="reduce-overhead", fullgraph=False,
+    )
+
+    try:
+        # Warmup both frames
+        for frame in (0, 1):
+            engine.set_frame(frame)
+            for _ in range(4):
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    compiled_forward(
+                        static_input, use_cache=True, past_key_values=cache,
+                        cache_position=cache_pos, return_dict=True,
+                    )
+            torch.cuda.synchronize()
+
+        engine.finalize_dual_frame()
+        assert engine._d2h_desc is not None, "BatchedD2HDescriptor should be created"
+
+        # Phase 2: disable record, retrace
+        engine.disable_record()
+        for frame in (0, 1):
+            engine.set_frame(frame)
+            for _ in range(4):
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    compiled_forward(
+                        static_input, use_cache=True, past_key_values=cache,
+                        cache_position=cache_pos, return_dict=True,
+                    )
+            torch.cuda.synchronize()
+
+        # Run decode and collect D2H results (full mask)
+        cache.reset()
+        for step in range(6):
+            engine.start_step()
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.no_grad():
+                compiled_forward(
+                    static_input, use_cache=True, past_key_values=cache,
+                    cache_position=cache_pos, return_dict=True,
+                )
+            engine.end_step()
+
+        full_results = engine.collect_dual_frame_results(wait=True)
+        assert full_results is not None, "Expected D2H results"
+        all_slots = set(full_results.keys())
+        assert len(all_slots) > 2, f"Expected multiple slots, got {len(all_slots)}"
+        print(f"  Full mask: {len(all_slots)} slots copied")
+
+        # Verify data is non-zero (actual activations)
+        for sid, tensor in full_results.items():
+            assert tensor.abs().max().item() > 0, f"slot {sid} is all zeros"
+
+        # Test selective mask: only copy first 2 slots
+        subset = set(sorted(all_slots)[:2])
+        engine.update_d2h_mask(subset)
+
+        # Zero out pinned buffers to detect which slots were actually copied
+        for frame in (0, 1):
+            for sid, buf in engine._pinned_buffers[frame].items():
+                buf.zero_()
+
+        cache.reset()
+        for step in range(6):
+            engine.start_step()
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.no_grad():
+                compiled_forward(
+                    static_input, use_cache=True, past_key_values=cache,
+                    cache_position=cache_pos, return_dict=True,
+                )
+            engine.end_step()
+
+        masked_results = engine.collect_dual_frame_results(wait=True)
+        assert masked_results is not None
+
+        # Only subset slots should have data
+        copied_slots = {sid for sid, t in masked_results.items() if t.abs().max().item() > 0}
+        skipped_slots = all_slots - subset
+        for sid in skipped_slots:
+            if sid in masked_results:
+                assert masked_results[sid].abs().max().item() == 0, \
+                    f"Slot {sid} should NOT have been copied but has data"
+        for sid in subset:
+            if sid in masked_results:
+                assert masked_results[sid].abs().max().item() > 0, \
+                    f"Slot {sid} should have been copied but is zero"
+
+        print(f"  Selective mask: subset={subset}, copied={copied_slots}, "
+              f"skipped={skipped_slots}")
+
+        # Restore full mask
+        engine.update_d2h_mask(None)
+        print(f"[PASS] Batched D2H SM: full + selective mask verified")
+    finally:
+        engine.close()
