@@ -156,6 +156,16 @@ class GraphSafeEngine:
         if self._monitor is not None:
             self._monitor.set_frame(frame)
 
+    def disable_record(self) -> None:
+        """Disable ops.record() on model (set _mon_buf=None). Call after finalize_dual_frame."""
+        if self._monitor is not None:
+            self._monitor.disable_record()
+
+    def enable_record(self) -> None:
+        """Re-enable ops.record() on model (restore _mon_buf)."""
+        if self._monitor is not None:
+            self._monitor.enable_record()
+
     def finalize_dual_frame(self) -> None:
         """After warmup: parse metadata, create aliases, setup D2H infrastructure."""
         assert self._graph_mode == "dual_compile"

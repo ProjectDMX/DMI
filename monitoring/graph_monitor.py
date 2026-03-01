@@ -274,6 +274,24 @@ class GraphMonitor:
         for parent in self._frame_parents:
             parent._mon_frame_offset = offset
 
+    def disable_record(self) -> None:
+        """Clear _mon_buf on all parent modules so ops.record() is skipped.
+
+        Dynamo re-traces to produce CUDA Graphs without record kernels.
+        _mon_frame_offset is preserved so Dynamo still creates separate
+        graphs per frame (address isolation for ping-pong D2H).
+        """
+        assert self._graph_mode == "dual_compile"
+        for parent, attrs in self._inline_attrs.items():
+            if hasattr(parent, "_mon_buf"):
+                parent._mon_buf = None
+
+    def enable_record(self) -> None:
+        """Restore _mon_buf on all parent modules (re-enables ops.record())."""
+        assert self._graph_mode == "dual_compile"
+        for parent, attrs in self._inline_attrs.items():
+            parent._mon_buf = self._gpu_buffer
+
     def parse_frame_metadata(self, frame: int) -> Dict[int, dict]:
         """Parse metadata for one frame from GPU buffer (synchronous)."""
         torch.cuda.synchronize()

@@ -600,8 +600,10 @@ class DualCompileDecodeRunner:
         return self.project_logits_fn(outputs.last_hidden_state)
 
     def warmup(self, token: torch.Tensor, warmup_steps: int = 4) -> None:
-        """Exercise both frames to trigger compilation + CUDA Graph capture."""
+        """4-graph warmup: discover metadata with record, then capture production graphs without."""
         cache_position = torch.tensor([0], device=token.device, dtype=torch.long)
+
+        # Phase 1: trace with ops.record() to discover tensor metadata
         for frame in (0, 1):
             self.engine.set_frame(frame)
             for _ in range(warmup_steps):
@@ -610,7 +612,19 @@ class DualCompileDecodeRunner:
                     self._compiled_forward(token, self._cache, cache_position)
             torch.cuda.synchronize()
 
+        # Parse metadata and create alias tensors from discovered addresses
         self.engine.finalize_dual_frame()
+
+        # Phase 2: disable record, re-trace production graphs (no record kernels)
+        self.engine.disable_record()
+        for frame in (0, 1):
+            self.engine.set_frame(frame)
+            for _ in range(warmup_steps):
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    self._compiled_forward(token, self._cache, cache_position)
+            torch.cuda.synchronize()
+
         self._cache.reset()
         self._next_cache_pos = 0
         self.captured = True
@@ -1103,7 +1117,7 @@ def main() -> None:
     compile_runner: Optional[TorchCompileDecodeRunner] = None
     dual_compile_runner: Optional[DualCompileDecodeRunner] = None
     hf_compile_runner: Optional[HFCompileDecodeRunner] = None
-    overhead_runner: Optional[TorchCompileDecodeRunner] = None
+    hooked_compile_runner: Optional[TorchCompileDecodeRunner] = None
 
     def hf_prefill_fn(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
         outputs = hf_model(
@@ -1156,34 +1170,63 @@ def main() -> None:
             raise RuntimeError("HF compile runner not initialized.")
         return hf_compile_runner.run(token, past_key_values)
 
-    def hf_overhead_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[object, torch.Tensor]:
-        nonlocal overhead_runner
-        if overhead_runner is None:
-            overhead_runner = TorchCompileDecodeRunner(
+    def hooked_compile_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[object, torch.Tensor]:
+        nonlocal hooked_compile_runner
+        if hooked_compile_runner is None:
+            hooked_compile_runner = TorchCompileDecodeRunner(
                 hf_hooked_model, project_logits, None, args,
                 max_cache_len=args.prefill_tokens + args.decode_steps + 16,
             )
-        overhead_runner.reset_cache()
+        hooked_compile_runner.reset_cache()
         outputs = hf_hooked_model(
             prefill_tokens,
             use_cache=True,
-            past_key_values=overhead_runner._cache,
+            past_key_values=hooked_compile_runner._cache,
             output_hidden_states=False,
             output_attentions=False,
             return_dict=True,
         )
-        overhead_runner._next_cache_pos = prefill_tokens.shape[1]
+        hooked_compile_runner._next_cache_pos = prefill_tokens.shape[1]
         hidden_states = outputs.last_hidden_state
         logits = project_logits(hidden_states)
         next_token = greedy_from_logits(logits)
         del hidden_states, logits, outputs
-        return overhead_runner._cache, next_token
+        return hooked_compile_runner._cache, next_token
+
+    def hooked_compile_decode(token: torch.Tensor, past_key_values) -> Tuple[torch.Tensor, object]:
+        nonlocal hooked_compile_runner
+        if hooked_compile_runner is None:
+            raise RuntimeError("Hooked compile runner not initialized.")
+        return hooked_compile_runner.run(token, past_key_values)
+
+    def hf_overhead_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[object, torch.Tensor]:
+        """Reuse the dual_compile_runner but skip engine lifecycle (no D2H).
+        Must be called AFTER hf_modified_hook_async warmup so runner exists."""
+        nonlocal dual_compile_runner
+        if dual_compile_runner is None:
+            raise RuntimeError("Overhead benchmark requires dual_compile_runner (run async first)")
+        dual_compile_runner.reset_cache()
+        outputs = hf_hooked_model(
+            prefill_tokens,
+            use_cache=True,
+            past_key_values=dual_compile_runner._cache,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=True,
+        )
+        dual_compile_runner._next_cache_pos = prefill_tokens.shape[1]
+        hidden_states = outputs.last_hidden_state
+        logits = project_logits(hidden_states)
+        next_token = greedy_from_logits(logits)
+        del hidden_states, logits, outputs
+        return dual_compile_runner._cache, next_token
 
     def hf_overhead_decode(token: torch.Tensor, past_key_values) -> Tuple[torch.Tensor, object]:
-        nonlocal overhead_runner
-        if overhead_runner is None:
+        """Same compiled graph as async, but no start_step/end_step."""
+        nonlocal dual_compile_runner
+        if dual_compile_runner is None:
             raise RuntimeError("Overhead runner not initialized.")
-        return overhead_runner.run(token, past_key_values)
+        return dual_compile_runner.run(token, past_key_values)
 
     def hf_modified_hook_async_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
         nonlocal graph_runner, compile_runner, dual_compile_runner
@@ -1518,21 +1561,6 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    warmup(hf_overhead_prefill, hf_overhead_decode)
-    hf_overhead_elapsed = run_benchmark(
-        "hf_modified_overhead",
-        lambda: run_decode(hf_overhead_prefill, hf_overhead_decode),
-    )
-    timings["hf_modified_overhead"] = {
-        "duration": hf_overhead_elapsed,
-        "tokens_per_second": total_decoded_tokens / hf_overhead_elapsed
-        if hf_overhead_elapsed > 0
-        else float("inf"),
-    }
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
     if args.monitoring_mode == "graph":
         warmup(hf_graph_only_prefill, hf_graph_only_decode)
         hf_graph_elapsed = run_benchmark(
@@ -1572,6 +1600,36 @@ def main() -> None:
     }
     if attach_to_model and not engine_attached_permanently:
         hf_hooked_model.monitoring_engine = None
+
+    # Overhead benchmark: same compiled graph as async, but no D2H (no start_step/end_step)
+    # Runs after async so dual_compile_runner is already warmed up
+    if args.monitoring_mode == "dual_compile" and dual_compile_runner is not None:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        warmup(hf_overhead_prefill, hf_overhead_decode)
+        hf_overhead_elapsed = run_benchmark(
+            "hf_modified_overhead",
+            lambda: run_decode(hf_overhead_prefill, hf_overhead_decode),
+        )
+        timings["hf_modified_overhead"] = {
+            "duration": hf_overhead_elapsed,
+            "tokens_per_second": total_decoded_tokens / hf_overhead_elapsed
+            if hf_overhead_elapsed > 0
+            else float("inf"),
+        }
+
+    # hooked_compile: HookedGPT2Model + torch.compile, no monitoring
+    # Runs after dual_compile engine so cudagraph_trees=False is already set
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    warmup(hooked_compile_prefill, hooked_compile_decode)
+    hooked_compile_elapsed = run_benchmark(
+        "hooked_compile", lambda: run_decode(hooked_compile_prefill, hooked_compile_decode)
+    )
+    timings["hooked_compile"] = {
+        "duration": hooked_compile_elapsed,
+        "tokens_per_second": total_decoded_tokens / hooked_compile_elapsed if hooked_compile_elapsed > 0 else float("inf"),
+    }
 
     if device.type == "cuda":
         torch.cuda.empty_cache()

@@ -436,3 +436,113 @@ def test_backward_compat_compile_mode():
         print(f"[PASS] Backward compat: compile mode works with {len(results)} slots")
     finally:
         engine.close()
+
+
+# ===========================================================================
+# Test 6: Record elimination — disable_record after warmup
+# ===========================================================================
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not _HAS_TORCH_COMPILE, reason="torch.compile required")
+def test_record_elimination():
+    """After disable_record(), production graphs should have no record kernels
+    but D2H via aliases must still produce correct data."""
+    device = torch.device("cuda")
+    config = _tiny_gpt2_config()
+    model = HookedGPT2Model(config).to(device).eval()
+
+    engine = GraphSafeEngine(
+        module_filter=_module_filter,
+        max_slots=256,
+        device=device,
+        graph_mode="dual_compile",
+    )
+    engine.prepare_for_model(model)
+
+    static_input = torch.randint(0, 256, (1, 1), device=device)
+    cache = StaticCache(config=config, max_cache_len=32)
+    cache_pos = torch.tensor([0], device=device, dtype=torch.long)
+
+    compiled_forward = torch.compile(
+        model.forward, mode="reduce-overhead", fullgraph=False,
+    )
+
+    try:
+        # Phase 1: warmup WITH record (metadata discovery)
+        for frame in (0, 1):
+            engine.set_frame(frame)
+            for _ in range(4):
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    compiled_forward(
+                        static_input, use_cache=True, past_key_values=cache,
+                        cache_position=cache_pos, return_dict=True,
+                    )
+            torch.cuda.synchronize()
+
+        engine.finalize_dual_frame()
+        assert engine._dual_frame_ready
+
+        # Collect reference data WITH record
+        cache.reset()
+        engine._monitor.set_frame(0)
+        torch.compiler.cudagraph_mark_step_begin()
+        with torch.no_grad():
+            compiled_forward(
+                static_input, use_cache=True, past_key_values=cache,
+                cache_position=cache_pos, return_dict=True,
+            )
+        torch.cuda.synchronize()
+        ref_0 = {sid: alias.cpu().clone() for sid, alias in engine._frame_aliases[0].items()}
+
+        # Phase 2: disable record, retrace production graphs
+        engine.disable_record()
+
+        # Verify _mon_buf cleared
+        for parent in engine._monitor._frame_parents:
+            assert parent._mon_buf is None, "_mon_buf should be None after disable_record"
+            assert hasattr(parent, "_mon_frame_offset"), "_mon_frame_offset must be preserved"
+
+        # Retrace both frames WITHOUT record
+        for frame in (0, 1):
+            engine.set_frame(frame)
+            for _ in range(4):
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    compiled_forward(
+                        static_input, use_cache=True, past_key_values=cache,
+                        cache_position=cache_pos, return_dict=True,
+                    )
+            torch.cuda.synchronize()
+
+        # Run production decode loop (no record kernels in graph)
+        cache.reset()
+        for step in range(6):
+            engine.start_step()
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.no_grad():
+                compiled_forward(
+                    static_input, use_cache=True, past_key_values=cache,
+                    cache_position=cache_pos, return_dict=True,
+                )
+            engine.end_step()
+
+        # Collect D2H results — aliases still valid because addresses are fixed
+        results = engine.collect_dual_frame_results(wait=True)
+        assert results is not None, "Expected D2H results after record elimination"
+        assert len(results) > 0, "Expected at least one slot"
+
+        # Verify data matches reference (same input → same activations)
+        errors = []
+        for sid in ref_0:
+            if sid not in results:
+                continue
+            if not torch.allclose(results[sid], ref_0[sid], atol=1e-4):
+                diff = torch.max(torch.abs(results[sid] - ref_0[sid])).item()
+                errors.append(f"slot {sid}: max_diff={diff:.6f}")
+
+        assert len(errors) == 0, "D2H mismatch after record elimination:\n" + "\n".join(errors)
+        print(f"[PASS] Record elimination: {len(ref_0)} slots verified, D2H correct without record")
+    finally:
+        engine.close()
