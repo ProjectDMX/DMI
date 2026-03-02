@@ -135,6 +135,10 @@ struct NativeMonitoringEngine::Impl {
                                    const py::list& tasks,
                                    std::optional<uint64_t> stream_handle);
 
+  std::vector<int64_t> submit_step_soa(int64_t step_id,
+                                       const py::dict& spec,
+                                       std::optional<uint64_t> stream_handle);
+
   void set_capture_schedule(int64_t step_stride,
                             int64_t step_offset,
                             int64_t warmup_steps,

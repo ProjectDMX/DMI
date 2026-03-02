@@ -34,6 +34,11 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
                                    const py::list& tasks,
                                    std::optional<uint64_t> stream_handle);
 
+  // Graph-safe fast path: accepts SOA dict from parse_shadow_block() directly.
+  std::vector<int64_t> submit_step_soa(int64_t step_id,
+                                       const py::dict& spec,
+                                       std::optional<uint64_t> stream_handle);
+
   void set_capture_schedule(int64_t step_stride,
                             int64_t step_offset,
                             int64_t warmup_steps,

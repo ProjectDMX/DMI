@@ -30,7 +30,6 @@ void GraphNativeDelegate::submit_and_resolve(
     return;
   }
   backend_->submit_step_soa(step_id, spec, stream_handle);
-  backend_->seal_step(step_id, stream_handle);
   backend_->resolve_all();
 }
 

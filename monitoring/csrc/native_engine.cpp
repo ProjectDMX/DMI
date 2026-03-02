@@ -37,6 +37,12 @@ std::vector<int64_t> NativeMonitoringEngine::submit_step(int64_t step_id,
   return impl_->submit_step(step_id, tasks, stream_handle);
 }
 
+std::vector<int64_t> NativeMonitoringEngine::submit_step_soa(int64_t step_id,
+                                                              const py::dict& spec,
+                                                              std::optional<uint64_t> stream_handle) {
+  return impl_->submit_step_soa(step_id, spec, stream_handle);
+}
+
 void NativeMonitoringEngine::set_capture_schedule(int64_t step_stride,
                                                   int64_t step_offset,
                                                   int64_t warmup_steps,

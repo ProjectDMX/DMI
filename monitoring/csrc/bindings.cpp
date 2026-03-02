@@ -94,6 +94,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("collect_step_futures_into",
            &monitoring::NativeMonitoringEngine::collect_step_futures_into,
            py::arg("step_id"), py::arg("cache"))
+      .def("submit_step_soa", &monitoring::NativeMonitoringEngine::submit_step_soa,
+           py::arg("step_id"), py::arg("spec"), py::arg("stream_handle") = std::optional<uint64_t>())
       .def("add_task", &monitoring::NativeMonitoringEngine::add_task,
            py::arg("step_id"), py::arg("task"))
       .def("seal_step", &monitoring::NativeMonitoringEngine::seal_step,

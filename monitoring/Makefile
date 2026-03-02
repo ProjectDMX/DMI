@@ -14,12 +14,15 @@ SRCS := csrc/native_engine.cpp \
         csrc/api_submit.cpp \
         csrc/hooks.cpp \
         csrc/slice.cpp \
+        csrc/graph_native_delegate.cpp \
+        csrc/graph_shadow_parser.cpp \
         csrc/bindings.cpp \
         csrc/dmx_host_utils.cpp \
         csrc/future_process.cpp \
         csrc/clickhouse_client.cpp
 HEADERS := csrc/native_engine.h csrc/native_engine_internal.h \
-csrc/pipelined_engine.hpp csrc/dmx_host_utils.h csrc/future_process.h \
+           csrc/graph_native_delegate.h \
+           csrc/pipelined_engine.hpp csrc/dmx_host_utils.h csrc/future_process.h \
            csrc/clickhouse_client.h csrc/dmx_host_engine.h
 BUILD_DIR := build
 OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
