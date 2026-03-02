@@ -1,3 +1,6 @@
 [submodule "transformers"]
 	path = transformers
 	url = git@github.com:Samfisheryu/transformers.git
+[submodule "libs/clickhouse-cpp"]
+	path = libs/clickhouse-cpp
+	url = git@github.com:ClickHouse/clickhouse-cpp.git

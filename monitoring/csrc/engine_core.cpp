@@ -1,76 +1,52 @@
 // Core execution: dispatch/worker, stream/event sync, result storage.
 
 #include "native_engine_internal.h"
+#include "engine_utils.h"
 #include "nvtx_shim.h"
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <limits>
+
+#if __has_include(<c10/cuda/CUDACachingAllocator.h>)
+#include <c10/cuda/CUDACachingAllocator.h>
+#define MON_HAS_CUDA_ALLOCATOR_STATS 1
+#else
+#define MON_HAS_CUDA_ALLOCATOR_STATS 0
+#endif
 
 namespace monitoring {
 
 NativeMonitoringEngine::Impl::Impl(int64_t queue_size,
                                    std::optional<at::ScalarType> cache_dtype,
-                                   int64_t delay_steps)
+                                   int64_t delay_steps,
+                                   const std::vector<int64_t>& pinpool_bins_kb,
+                                   int64_t pinpool_max_mb,
+                                   int64_t host_copy_threads,
+                                   int64_t host_copy_queue_size)
     : max_queue_size_(queue_size > 0 ? static_cast<size_t>(queue_size) : 0),
       cache_stream_(at::cuda::getStreamFromPool(/*isHighPriority=*/false)),
       cache_dtype_(cache_dtype),
       delay_steps_(delay_steps > 0 ? delay_steps : 0) {
-  // Runtime controls for D2H offload (single-stream version)
-  if (const char* v = std::getenv("MON_NATIVE_TO_CPU")) {
-    move_to_cpu_ = (*v == '1');
-  }
-  if (const char* v = std::getenv("MON_NATIVE_PINNED")) {
-    use_pinned_ = (*v != '0');
-  }
-  if (const char* v = std::getenv("MON_NATIVE_AUTOCLEAR")) {
-    auto_cleanup_ = (*v != '0');
-  }
-
-  // Configure pinned pool (enabled only when pinned offload is in use)
-  enable_pinpool_ = false;
-  if (use_pinned_ && move_to_cpu_) {
-    // Default bins (bytes)
-    pinpool_bins_bytes_ = {256ull * 1024ull, 512ull * 1024ull, 1024ull * 1024ull,
-                           2ull * 1024ull * 1024ull, 4ull * 1024ull * 1024ull,
-                           8ull * 1024ull * 1024ull};
-    // Parse env vars
-    if (const char* v = std::getenv("MON_NATIVE_PINPOOL")) {
-      enable_pinpool_ = (*v != '0');
-    } else {
-      enable_pinpool_ = true; // default on when pinned offload is used
-    }
-    if (const char* v = std::getenv("MON_NATIVE_PINPOOL_BINS_KB")) {
-      // format: 256,512,1024,2048
-      pinpool_bins_bytes_.clear();
-      std::string s(v);
-      size_t start = 0;
-      while (start < s.size()) {
-        size_t comma = s.find(',', start);
-        std::string tok = (comma == std::string::npos) ? s.substr(start) : s.substr(start, comma - start);
-        if (!tok.empty()) {
-          size_t kb = static_cast<size_t>(std::strtoull(tok.c_str(), nullptr, 10));
-          if (kb > 0) pinpool_bins_bytes_.push_back(kb * 1024ull);
-        }
-        if (comma == std::string::npos) break;
-        start = comma + 1;
-      }
-      if (pinpool_bins_bytes_.empty()) {
-        pinpool_bins_bytes_ = {256ull * 1024ull, 512ull * 1024ull, 1024ull * 1024ull,
-                               2ull * 1024ull * 1024ull, 4ull * 1024ull * 1024ull,
-                               8ull * 1024ull * 1024ull};
+  // D2H offload + pinned + pinpool are now fixed-on behavior.
+  pinpool_bins_bytes_ = {256ull * 1024ull, 512ull * 1024ull, 1024ull * 1024ull,
+                         2ull * 1024ull * 1024ull, 4ull * 1024ull * 1024ull,
+                         8ull * 1024ull * 1024ull};
+  if (!pinpool_bins_kb.empty()) {
+    pinpool_bins_bytes_.clear();
+    for (int64_t kb : pinpool_bins_kb) {
+      if (kb > 0) {
+        pinpool_bins_bytes_.push_back(static_cast<size_t>(kb) * 1024ull);
       }
     }
-    if (const char* v = std::getenv("MON_NATIVE_PINPOOL_SLOTS_PER_BIN")) {
-      int slots = std::atoi(v);
-      if (slots > 0) pinpool_slots_per_bin_ = slots;
+    if (pinpool_bins_bytes_.empty()) {
+      pinpool_bins_bytes_ = {256ull * 1024ull, 512ull * 1024ull, 1024ull * 1024ull,
+                             2ull * 1024ull * 1024ull, 4ull * 1024ull * 1024ull,
+                             8ull * 1024ull * 1024ull};
     }
-    if (const char* v = std::getenv("MON_NATIVE_PINPOOL_MAX_MB")) {
-      size_t mb = static_cast<size_t>(std::strtoull(v, nullptr, 10));
-      if (mb > 0) pinpool_max_bytes_ = mb * 1024ull * 1024ull;
-    }
-    if (const char* v = std::getenv("MON_NATIVE_PIN_THRESH_BYTES")) {
-      size_t th = static_cast<size_t>(std::strtoull(v, nullptr, 10));
-      if (th > 0) pinpool_thresh_bytes_ = th;
-    }
+  }
+  if (pinpool_max_mb > 0) {
+    pinpool_max_bytes_ = static_cast<size_t>(pinpool_max_mb) * 1024ull * 1024ull;
   }
 
   // Gather-based H2H: single contiguous buffer instead of per-tensor alloc+memcpy
@@ -79,19 +55,16 @@ NativeMonitoringEngine::Impl::Impl(int64_t queue_size,
   }
 
   // Host-copy pool configuration (optional parallel memcpy)
-  if (const char* v = std::getenv("MON_NATIVE_HOST_COPY_THREADS")) {
-    host_copy_threads_ = std::atoi(v);
-    if (host_copy_threads_ > 0) {
-      enable_host_copy_pool_ = true;
-      host_copy_pool_ = std::make_unique<HostCopyThreadPool>();
-      if (const char* qv = std::getenv("MON_NATIVE_HOST_COPY_QUEUE_SIZE")) {
-        size_t q = static_cast<size_t>(std::strtoull(qv, nullptr, 10));
-        if (q > 0) host_copy_pool_->max_queue_size_ = q;
-      }
-      // Spawn workers
-      for (int i = 0; i < host_copy_threads_; ++i) {
-        host_copy_pool_->workers_.emplace_back(&NativeMonitoringEngine::Impl::host_copy_worker, this);
-      }
+  host_copy_threads_ = host_copy_threads > 0 ? static_cast<int>(host_copy_threads) : 0;
+  if (host_copy_threads_ > 0) {
+    enable_host_copy_pool_ = true;
+    host_copy_pool_ = std::make_unique<HostCopyThreadPool>();
+    if (host_copy_queue_size > 0) {
+      host_copy_pool_->max_queue_size_ = static_cast<size_t>(host_copy_queue_size);
+    }
+    // Spawn workers
+    for (int i = 0; i < host_copy_threads_; ++i) {
+      host_copy_pool_->workers_.emplace_back(&NativeMonitoringEngine::Impl::host_copy_worker, this);
     }
   }
   worker_ = std::thread(&NativeMonitoringEngine::Impl::worker_loop, this);
@@ -144,6 +117,94 @@ void NativeMonitoringEngine::Impl::remove_slot(int64_t token) {
   slots_.erase(token);
 }
 
+bool NativeMonitoringEngine::Impl::maybe_refresh_memory_stats(int device_index) {
+  if (!congestion_cap_enabled_) {
+    return false;
+  }
+  if (device_index < 0) {
+    return false;
+  }
+  int64_t tick = memory_stats_refresh_tick_.fetch_add(1, std::memory_order_relaxed) + 1;
+  bool has_cached = last_total_mem_bytes_.load(std::memory_order_relaxed) > 0;
+  if (has_cached && (tick % std::max<int64_t>(1, memory_stats_refresh_interval_)) != 0) {
+    return false;
+  }
+
+  int prev_device = 0;
+  cudaError_t get_dev_err = cudaGetDevice(&prev_device);
+  if (get_dev_err != cudaSuccess) {
+    prev_device = device_index;
+  }
+  bool switched = (prev_device != device_index);
+  if (switched) {
+    cudaError_t set_err = cudaSetDevice(device_index);
+    if (set_err != cudaSuccess) {
+      return false;
+    }
+  }
+
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  cudaError_t mem_err = cudaMemGetInfo(&free_bytes, &total_bytes);
+
+  int64_t allocated_bytes = 0;
+  int64_t reserved_bytes = 0;
+#if MON_HAS_CUDA_ALLOCATOR_STATS
+  if (mem_err == cudaSuccess) {
+    try {
+      auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(static_cast<c10::DeviceIndex>(device_index));
+      constexpr size_t kAgg = static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE);
+      allocated_bytes = stats.allocated_bytes[kAgg].current;
+      reserved_bytes = stats.reserved_bytes[kAgg].current;
+    } catch (...) {
+      allocated_bytes = 0;
+      reserved_bytes = 0;
+    }
+  }
+#endif
+
+  if (switched) {
+    (void)cudaSetDevice(prev_device);
+  }
+  if (mem_err != cudaSuccess) {
+    return false;
+  }
+  if (reserved_bytes < allocated_bytes) {
+    reserved_bytes = allocated_bytes;
+  }
+
+  last_driver_free_bytes_.store(static_cast<int64_t>(free_bytes), std::memory_order_relaxed);
+  last_total_mem_bytes_.store(static_cast<int64_t>(total_bytes), std::memory_order_relaxed);
+  last_allocated_bytes_.store(allocated_bytes, std::memory_order_relaxed);
+  last_reserved_bytes_.store(reserved_bytes, std::memory_order_relaxed);
+  return true;
+}
+
+int64_t NativeMonitoringEngine::Impl::compute_allowed_inflight_bytes(int device_index) {
+  if (!congestion_cap_enabled_) {
+    return std::numeric_limits<int64_t>::max();
+  }
+
+  (void)maybe_refresh_memory_stats(device_index);
+
+  const int64_t total_bytes = last_total_mem_bytes_.load(std::memory_order_relaxed);
+  if (total_bytes <= 0) {
+    return std::numeric_limits<int64_t>::max();
+  }
+
+  const int64_t driver_free_bytes = last_driver_free_bytes_.load(std::memory_order_relaxed);
+  const int64_t allocated_bytes = std::max<int64_t>(0, last_allocated_bytes_.load(std::memory_order_relaxed));
+  const int64_t reserved_bytes = std::max<int64_t>(allocated_bytes, last_reserved_bytes_.load(std::memory_order_relaxed));
+
+  const int64_t hard_cap_bytes =
+      std::max<int64_t>(0, static_cast<int64_t>(static_cast<double>(total_bytes) * congestion_cap_ratio_));
+  const int64_t reclaimable_bytes = std::max<int64_t>(0, reserved_bytes - allocated_bytes);
+  const int64_t effective_free_bytes =
+      std::max<int64_t>(0, driver_free_bytes + reclaimable_bytes - driver_guard_bytes_);
+  const int64_t cap_remaining_bytes = std::max<int64_t>(0, hard_cap_bytes - allocated_bytes);
+  return std::max<int64_t>(0, std::min<int64_t>(cap_remaining_bytes, effective_free_bytes));
+}
+
 void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
   mon_nvtx_push("MonEng::dispatch_step");
   if (work.tasks.empty()) {
@@ -154,15 +215,40 @@ void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
     return;
   }
 
+  if (congestion_cap_enabled_ && work.bytes > 0) {
+    int device_index = -1;
+    for (const auto& task : work.tasks) {
+      if (task.spec.tensor.defined() && task.spec.tensor.is_cuda()) {
+        device_index = task.spec.tensor.get_device();
+        break;
+      }
+    }
+    if (device_index >= 0) {
+      const int64_t allowed = compute_allowed_inflight_bytes(device_index);
+      const int64_t current = inflight_bytes_.load(std::memory_order_relaxed);
+      if (allowed <= 0 || current + work.bytes > allowed) {
+        process_step(std::move(work));
+        mon_nvtx_pop();
+        return;
+      }
+    }
+  }
+
   if (max_queue_size_ > 0) {
     std::unique_lock<std::mutex> lock(queue_mutex_);
     if (!stop_ && queue_.size() >= max_queue_size_) {
       lock.unlock();
       process_step(std::move(work));
+      mon_nvtx_pop();
       return;
+    }
+    if (work.bytes > 0) {
+      work.counted_inflight = true;
+      inflight_bytes_.fetch_add(work.bytes, std::memory_order_relaxed);
     }
     queue_.push_back(std::move(work));
     lock.unlock();
+
     queue_cv_.notify_one();
     mon_nvtx_pop();
     return;
@@ -170,7 +256,12 @@ void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
 
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (work.bytes > 0) {
+      work.counted_inflight = true;
+      inflight_bytes_.fetch_add(work.bytes, std::memory_order_relaxed);
+    }
     queue_.push_back(std::move(work));
+
   }
   queue_cv_.notify_one();
   mon_nvtx_pop();
@@ -178,7 +269,6 @@ void NativeMonitoringEngine::Impl::dispatch_step(StepWork&& work) {
 
 void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   mon_nvtx_push("MonEng::process_step");
-  auto t0 = std::chrono::steady_clock::now();
   if (work.event != nullptr) {
     C10_CUDA_CHECK(cudaStreamWaitEvent(cache_stream_.stream(), work.event, 0));
     C10_CUDA_CHECK(cudaEventDestroy(work.event));
@@ -211,7 +301,7 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
       bool needs_sync = result.device().is_cpu() && entry.spec.tensor.defined() && entry.spec.tensor.is_cuda();
       any_sync = any_sync || needs_sync;
       int64_t blk_id = -1;
-      if (enable_pinpool_ && result.defined() && result.device().is_cpu()) {
+      if (result.defined() && result.device().is_cpu()) {
         blk_id = find_pool_block_id(result.data_ptr());
       }
       results.push_back(PendingResult{std::move(result), entry.token, blk_id, needs_sync});
@@ -350,9 +440,13 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   }
   mon_nvtx_pop();
 
-  auto t1 = std::chrono::steady_clock::now();
-  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-  stats_process_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
+  if (work.counted_inflight && work.bytes > 0) {
+    int64_t prev = inflight_bytes_.fetch_sub(work.bytes, std::memory_order_relaxed);
+    if (prev < work.bytes) {
+      inflight_bytes_.store(0, std::memory_order_relaxed);
+    }
+  }
+
   mon_nvtx_pop();
 }
 
@@ -380,47 +474,28 @@ at::Tensor NativeMonitoringEngine::Impl::run_task(const TaskSpec& spec) {
     tensor = tensor.to(*cache_dtype_, /*non_blocking=*/true, /*copy=*/false);
   }
 
-  // Optional D2H offload on current cache stream
-  bool want_cpu = move_to_cpu_;
-  if (spec.target_device.has_value() && spec.target_device->is_cpu()) {
-    want_cpu = true;
-  }
-  if (want_cpu && tensor.is_cuda()) {
-    if (use_pinned_) {
-      // Always prefer pinned destinations for D2H, regardless of size.
-      size_t nbytes = static_cast<size_t>(tensor.nbytes());
-      at::ScalarType dt = tensor.scalar_type();
-      if (enable_pinpool_) {
-        // Try the pinned pool first (no size threshold)
-        auto got = acquire_pinned_block(nbytes, dt);
-        if (got.first.defined()) {
-          at::Tensor dst = got.first.view(tensor.sizes());
-          try {
-            dst.copy_(tensor, /*non_blocking=*/true);
-          } catch (...) {
-            release_pool_block(got.second);
-            throw;
-          }
-          return dst;
-        }
-        // Pool could not provide a block (capacity/pressure) — fall back to direct pinned alloc
-        auto opts = tensor.options().device(torch::kCPU).pinned_memory(true);
-        at::Tensor dst = at::empty_like(tensor, opts);
+  // D2H offload is fixed-on with pinned pool + pinned fallback.
+  if (tensor.is_cuda()) {
+    size_t nbytes = static_cast<size_t>(tensor.nbytes());
+    at::ScalarType dt = tensor.scalar_type();
+    // Try the pinned pool first (no size threshold).
+    auto got = acquire_pinned_block(nbytes, dt);
+    if (got.first.defined()) {
+      at::Tensor dst = got.first.view(tensor.sizes());
+      try {
         dst.copy_(tensor, /*non_blocking=*/true);
-        tensor = dst;
-      } else {
-        // Pool disabled — allocate pinned destination directly
-        auto opts = tensor.options().device(torch::kCPU).pinned_memory(true);
-        at::Tensor dst = at::empty_like(tensor, opts);
-        dst.copy_(tensor, /*non_blocking=*/true);
-        tensor = dst;
+      } catch (...) {
+        release_pool_block(got.second);
+        throw;
       }
-    } else {
-      // Pinned off not requested — keep legacy pageable transfer
-      tensor = tensor.to(torch::kCPU, /*non_blocking=*/true, /*copy=*/true);
+      return dst;
     }
+    // Pool could not provide a block (capacity/pressure) — direct pinned alloc.
+    auto opts = tensor.options().device(torch::kCPU).pinned_memory(true);
+    at::Tensor dst = at::empty_like(tensor, opts);
+    dst.copy_(tensor, /*non_blocking=*/true);
+    tensor = dst;
   }
-
   return tensor;
 }
 
@@ -440,8 +515,6 @@ size_t NativeMonitoringEngine::Impl::pick_bin_bytes(size_t nbytes) {
 }
 
 std::pair<at::Tensor, int64_t> NativeMonitoringEngine::Impl::acquire_pinned_block(size_t nbytes, at::ScalarType dtype) {
-  if (!enable_pinpool_) return {at::Tensor(), -1};
-
   size_t cap = pick_bin_bytes(nbytes);
   at::Tensor view;
   int64_t blk_id = -1;
@@ -602,26 +675,9 @@ at::Tensor NativeMonitoringEngine::Impl::apply_slice(at::Tensor tensor, const Sl
       }
     }
     case SliceMode::Array: {
-      // Optional: build index path using pinned host staging to produce
-      // "Memcpy HtoD (Pinned)" instead of pageable in profilers.
-      bool pin_index = false;
-      if (const char* v = std::getenv("MON_NATIVE_PINNED_INDEX")) {
-        pin_index = (*v != '0');
-      }
-      if (pin_index) {
-        // Create a temporary CPU Long tensor from indices, then copy into
-        // a pinned host buffer and transfer to device non-blocking.
-        at::Tensor tmp = torch::tensor(spec.indices, torch::TensorOptions().dtype(torch::kLong));
-        auto host_opts = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU).pinned_memory(true);
-        at::Tensor idx_host = at::empty_like(tmp, host_opts);
-        idx_host.copy_(tmp, /*non_blocking=*/false);
-        at::Tensor idx = idx_host.to(tensor.device(), /*non_blocking=*/true, /*copy=*/true);
-        return tensor.index_select(dim, idx);
-      } else {
-        auto options = torch::TensorOptions().dtype(torch::kLong).device(tensor.device());
-        at::Tensor idx = torch::tensor(spec.indices, options);
-        return tensor.index_select(dim, idx);
-      }
+      auto options = torch::TensorOptions().dtype(torch::kLong).device(tensor.device());
+      at::Tensor idx = torch::tensor(spec.indices, options);
+      return tensor.index_select(dim, idx);
     }
   }
   return tensor;
@@ -666,7 +722,6 @@ void NativeMonitoringEngine::Impl::store_exception(int64_t token, const std::str
 
 void NativeMonitoringEngine::Impl::clear_completed_results_internal() {
   mon_nvtx_push("MonEng::clear_results");
-  auto t0 = std::chrono::steady_clock::now();
   std::vector<int64_t> tokens;
   std::vector<std::shared_ptr<ResultSlot>> slot_refs;
   {
@@ -695,19 +750,13 @@ void NativeMonitoringEngine::Impl::clear_completed_results_internal() {
       slots_.erase(token);
     }
   }
-  auto t1 = std::chrono::steady_clock::now();
-  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
   stats_clear_calls_.fetch_add(1, std::memory_order_relaxed);
-  stats_clear_us_.fetch_add(static_cast<int64_t>(us), std::memory_order_relaxed);
   stats_clear_scanned_.fetch_add(static_cast<int64_t>(tokens.size()), std::memory_order_relaxed);
   stats_clear_ready_.fetch_add(static_cast<int64_t>(ready_tokens.size()), std::memory_order_relaxed);
   mon_nvtx_pop();
 }
 
 void NativeMonitoringEngine::Impl::worker_loop() {
-  constexpr int64_t CLEANUP_INTERVAL = 8;  // Clean completed results every 8 steps
-  int64_t steps_since_cleanup = 0;
-
   while (true) {
     StepWork work;
     {
@@ -715,22 +764,13 @@ void NativeMonitoringEngine::Impl::worker_loop() {
       mon_nvtx_push("MonEng::worker_wait");
       queue_cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
       mon_nvtx_pop();
-      if (stop_ && queue_.empty()) {
-        break;
-      }
-      work = std::move(queue_.front());
-      queue_.pop_front();
+    if (stop_ && queue_.empty()) {
+      break;
     }
-    process_step(std::move(work));
-
-    // Periodic cleanup to prevent ResultSlot accumulation
-    ++steps_since_cleanup;
-    if (auto_cleanup_ && steps_since_cleanup >= CLEANUP_INTERVAL) {
-      mon_nvtx_push("MonEng::cleanup");
-      clear_completed_results_internal();
-      steps_since_cleanup = 0;
-      mon_nvtx_pop();
+    work = std::move(queue_.front());
+    queue_.pop_front();
     }
+  process_step(std::move(work));
   }
 }
 

@@ -24,7 +24,14 @@ ENV/
 # Results and logs
 results/
 logs/*.log
+*.log
+
+# Debug / temp scripts
+check_slot_order.py
+benchmark/scripts/hf_monitoring_generate.py
 *.pt.trace.json
+notebooks/
+test_gpu_mem_leak.py
 
 # System files
 .DS_Store
@@ -47,3 +54,11 @@ Thumbs.db
 
 # Local torch extension builds
 monitoring/.torch_extensions/
+
+# Benchmark outputs
+benchmark/figures/
+*.nsys-rep
+
+# Node.js
+node_modules/
+package-lock.json

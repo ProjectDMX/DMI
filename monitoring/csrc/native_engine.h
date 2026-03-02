@@ -21,7 +21,11 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
  public:
   NativeMonitoringEngine(int64_t queue_size,
                          std::optional<at::ScalarType> cache_dtype,
-                         int64_t delay_steps);
+                         int64_t delay_steps,
+                         const std::vector<int64_t>& pinpool_bins_kb,
+                         int64_t pinpool_max_mb,
+                         int64_t host_copy_threads,
+                         int64_t host_copy_queue_size);
   ~NativeMonitoringEngine();
 
   py::dict get_stats();
@@ -41,11 +45,11 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   void begin_request(int64_t request_id);
   void begin_step(int64_t step_id, int64_t phase);
   void record_callback_duration(int64_t us);
-
-  // Struct-of-arrays submit to minimize Python overhead
-  std::vector<int64_t> submit_step_soa(int64_t step_id,
-                                       const py::dict& spec,
-                                       std::optional<uint64_t> stream_handle);
+  void set_partial_seal_config(bool enabled,
+                               int64_t chunk_bytes,
+                               bool cap_enabled,
+                               double cap_ratio,
+                               int64_t driver_guard_mb);
 
   // Low-overhead single task append
   int64_t add_task(int64_t step_id, const py::tuple& task_tuple);
@@ -108,8 +112,8 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   // Synchronization / futures
   void resolve_all();
   bool future_ready(int64_t token);
-  bool future_wait(int64_t token, std::optional<double> timeout);
-  at::Tensor future_result(int64_t token, std::optional<double> timeout);
+  bool future_wait(int64_t token, std::optional<double> timeout, bool called_from_cpp = false);
+  at::Tensor future_result(int64_t token, std::optional<double> timeout, bool called_from_cpp = false);
   void clear_completed_results();
   void close();
 
@@ -120,9 +124,46 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   std::unique_ptr<Impl> impl_;
 };
 
+
+
+// Lightweight future wrapper for native backend tokens.
+// Implemented in C++ for low Python overhead while exposing the same interface:
+//   ready() -> bool
+//   wait(timeout: Optional[float] = None) -> bool
+//   result(timeout: Optional[float] = None) -> torch.Tensor
+class BackendFuture {
+ public:
+  BackendFuture(std::shared_ptr<NativeMonitoringEngine> backend,
+                int64_t token,
+                int64_t task_size = 0)
+      : backend_(backend), token_(token), task_size_(task_size) {}
+
+  int64_t token() const { return token_; }
+  int64_t size() const {return task_size_; }
+
+  bool ready() const { return backend_->future_ready(token_); }
+
+  bool wait(std::optional<double> timeout = std::optional<double>(), bool called_from_cpp = false) const {
+    return backend_->future_wait(token_, timeout, called_from_cpp);
+  }
+
+  at::Tensor result(std::optional<double> timeout = std::optional<double>(), bool called_from_cpp = false) const {
+    return backend_->future_result(token_, timeout, called_from_cpp);
+  }
+
+ private:
+  std::shared_ptr<NativeMonitoringEngine> backend_;
+  int64_t token_{0};
+  int64_t task_size_{0};
+};
+
 std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,
                                                       py::object cache_dtype,
-                                                      int64_t delay_steps);
+                                                      int64_t delay_steps,
+                                                      const std::vector<int64_t>& pinpool_bins_kb,
+                                                      int64_t pinpool_max_mb,
+                                                      int64_t host_copy_threads,
+                                                      int64_t host_copy_queue_size);
 
 }  // namespace monitoring
 

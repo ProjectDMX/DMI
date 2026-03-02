@@ -4,6 +4,6 @@ rootdir: /home/nengneng/AIPrometheus/HF_Prometheus
 plugins: typeguard-4.4.4, jaxtyping-0.3.3, anyio-4.11.0
 collected 2 items
 
-tests_gpt2_p/test_gpt2_parity.py ..                                      [100%]
+tests/test_gpt2_parity.py ..                                      [100%]
 
 ============================== 2 passed in 5.44s ===============================

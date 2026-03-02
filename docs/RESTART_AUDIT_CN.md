@@ -36,18 +36,18 @@
 - API：submit_step/add_task/seal_step/SoA/回调/future：`HF_Prometheus/monitoring/csrc/native_engine.h`，`HF_Prometheus/monitoring/csrc/bindings.cpp`
 - 事件同步、低优先级流、delay‑steps、队列与背压：`HF_Prometheus/monitoring/csrc/engine_core.cpp`
 - CPU offload、pinned pool、统计：`HF_Prometheus/monitoring/csrc/engine_core.cpp`，`HF_Prometheus/monitoring/csrc/api_submit.cpp`
-- Pinned→pageable 结果测试：`HF_Prometheus/tests_monitoring/test_pinned_to_pageable.py`
+- Pinned→pageable 结果测试：`HF_Prometheus/tests/test_pinned_to_pageable.py`
 
 2) **GPT‑2 Hooked 模型 + Hook 点**
 - HookPoint 注入、HookedGPT2Model 与 alias：`HF_Prometheus/transformers/src/transformers/models/gpt2_p/modeling_gpt2.py`
 - run_with_cache 与多种 hook 采集路径：`HF_Prometheus/transformers/src/transformers/models/gpt2_p/hook_points.py`
-- 与 TransformerLens hook 对齐测试：`HF_Prometheus/tests_gpt2_p/test_hooked_gpt2.py`
+- 与 TransformerLens hook 对齐测试：`HF_Prometheus/tests/test_hooked_gpt2.py`
 
 3) **MonitoringEngine（Python 临时封装/回退）**
 - async 开关、start/end step、resolve/close、统计：`HF_Prometheus/monitoring/engine.py`
 - 任务结构/切片编码/Future：`HF_Prometheus/monitoring/task.py`
 - Python fallback worker：`HF_Prometheus/monitoring/engine.py`
-- 异步/同步路径测试：`HF_Prometheus/tests_monitoring/test_monitoring_engine.py`
+- 异步/同步路径测试：`HF_Prometheus/tests/test_monitoring_engine.py`
 
 4) **Benchmark 与 Profiling**
 - HF/TL 基线 + hook 开销对比：`HF_Prometheus/benchmark/tests/profile_decode.py`，`HF_Prometheus/benchmark/tests/profile_inference.py`
@@ -98,7 +98,7 @@
 5) **测试依赖 GPU/网络**
 - 多数测试 `skipif(cuda)`，parity 依赖 `from_pretrained("gpt2")`。
 - 风险：CI 覆盖不足或不可复现。
-- 证据：`HF_Prometheus/tests_monitoring/test_monitoring_engine.py`，`HF_Prometheus/tests_gpt2_p/test_gpt2_parity.py`
+- 证据：`HF_Prometheus/tests/test_monitoring_engine.py`，`HF_Prometheus/tests/test_gpt2_parity.py`
 
 6) **预编译产物加载风险**
 - loader 优先加载仓库内 .so，可能加载旧/不匹配产物。
@@ -178,11 +178,11 @@
 - CUDA/编译链依赖：native backend 依赖 `torch.utils.cpp_extension`、CUDA 工具链与编译器；缺失会导致无法构建或回退路径异常（证据：`HF_Prometheus/monitoring/_native_engine.py`，`HF_Prometheus/monitoring/Makefile`）。  
 - 预编译 .so 优先加载：加载逻辑优先使用仓库内 .so，可能与当前环境 ABI 不匹配（证据：`HF_Prometheus/monitoring/_native_engine.py`，仓库内 `monitoring_native_backend.cpython-310-x86_64-linux-gnu.so`）。  
 - 运行依赖库：benchmark 依赖 `GPUtil/psutil/numpy` 与 `transformer_lens`，缺失会报错（证据：`HF_Prometheus/benchmark/core/metrics.py`，`HF_Prometheus/benchmark/core/base_benchmark.py`）。  
-- 网络依赖：测试与基准中 `from_pretrained("gpt2")` 需要网络或本地缓存（证据：`HF_Prometheus/tests_gpt2_p/test_gpt2_parity.py`，`HF_Prometheus/benchmark/tests/profile_decode.py`）。  
+- 网络依赖：测试与基准中 `from_pretrained("gpt2")` 需要网络或本地缓存（证据：`HF_Prometheus/tests/test_gpt2_parity.py`，`HF_Prometheus/benchmark/tests/profile_decode.py`）。  
 
 ### 3) 测试与可观测性（缺口与补建议）
 
-- GPU 依赖测试占比高，CPU 覆盖弱：`tests_monitoring` 多数 `skipif(cuda)`；缺少 CPU fallback 的端到端测试（证据：`HF_Prometheus/tests_monitoring/test_monitoring_engine.py`）。  
+- GPU 依赖测试占比高，CPU 覆盖弱：`tests` 多数 `skipif(cuda)`；缺少 CPU fallback 的端到端测试（证据：`HF_Prometheus/tests/test_monitoring_engine.py`）。  
 - native callback 默认与性能指标缺乏自动验证：存在性能宣称但缺 CI 或基准回归门槛（证据：`HF_Prometheus/docs/backup/Native_Callback_Implementation_CN.md` vs 代码默认开关）。  
 - 建议补：  
   1) CPU fallback 的 smoke test（MonitoringEngine + HookedGPT2Model，验证 cache keys/shape）。  

@@ -1,4 +1,114 @@
-# Proj-dmx (Huggineface/transformers)
+<!--
+New open-source style intro (DMI) is added below.
+Original README content is preserved and kept after the new sections.
+-->
+
+<!-- # DMI (Deep Model Inspection) -->
+
+<p align="center">
+  <img src="./Figures/f20e2340-3411-4d49-8979-0a7214d3db4b.png" alt="DMI logo" width="400" />
+</p>
+
+<p align="center">
+  <strong>Built for real-time visibility into LLM inference</strong>
+</p>
+
+**Project-DMI** is an open-source LLM monitoring toolkit for LLM inference.  
+It helps you inspect any internal model states (activations, attention, logits, KV cache) during real LLM inference, with a high-performance C++ backend and async data pipeline.
+
+## About
+
+DMI is built for engineers and researchers who need to understand what happens *inside* a model while it runs. DMI includes **Shadow Block**, a unique GPU-resident hook system for CUDA-Graph-friendly monitored inference at high speed.
+
+Instead of only looking at final outputs or manually adding hooks, DMI lets you:
+- **Attach** hook points to internal layers wherever you want,
+- **Fast capture** internal states with minimal inference interruption,
+- **Persist** the data to DB (Disk/In-memory) for large-scale analysis with **Visualization**.
+
+The goal is practical model debugging and inspection with minimal overhead.
+
+## Key Features
+
+- 🔍 **Deep Internal Inspection**: Capture any internal model states as you want.
+- ⚙️ **Configurable Capture Control**: Per-step and per-request sampling with flexible hook selection.
+- ⚡ **GPU-Resident Hook System***: We introduced **Shadow Block**, a system-level kernel innovation for CUDA-Graph-friendly monitored inference at high speed.
+- 🚀 **Fast Monitoring Engine for Data Transfer**: C++-powered, high-throughput data movement for inference-time capture.
+- 🗄️ **Host Engine for Persistence & Visualization**: Built-in database pipeline to persist captured data, with ready-to-inspect visualization dashboards.
+- 🧩 **Seamless Hugging Face API Integration**: Works with familiar HF `generate` APIs and natively supports HF parallel inference strategies (e.g., TP/PP workflows).
+
+\* In active integration; this direction is included as part of DMI's core roadmap.
+
+## Installation
+
+### 1) Clone repository + submodules
+
+```bash
+git clone --recursive <your-repo-url>
+cd HF_Prometheus
+
+# If already cloned without --recursive
+git submodule update --init --recursive
+```
+
+Current required submodules in this repo:
+- `transformers/`
+- `libs/clickhouse-cpp/`
+
+### 2) Create Python environment
+
+```bash
+conda env create -f environment.yml
+conda activate proj-dmx
+```
+
+### 3) Install Python packages
+
+```bash
+pip install -e .
+pip install -e transformers/
+```
+
+### 4) Build native dependencies
+
+Build ClickHouse C++ client (required by the monitoring extension link stage):
+
+```bash
+cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build libs/clickhouse-cpp/build -j
+```
+
+Build DMI native backend:
+
+```bash
+make -C monitoring -j
+# or simply: make
+```
+
+## Quick Start
+
+Supported model architectures (current):
+- `gpt2`
+- `qwen3`
+
+We provide runnable example scripts in `benchmark/scripts/`:
+
+- `benchmark/scripts/hf_generate.py` (HF baseline inference)
+- `benchmark/scripts/hf_monitoring_generate.py` (DMI monitored inference)
+
+
+
+Example runs:
+
+```bash
+python benchmark/scripts/hf_generate.py --model gpt2 --device cuda --batch-size 8 --max-new-tokens 16
+python benchmark/scripts/hf_monitoring_generate.py --model qwen3 --device cuda --batch-size 8 --max-new-tokens 16 --no-db
+```
+
+---
+
+<!-- Original README starts here (preserved) -->
+
+<!-- # Proj-dmx (Huggineface/transformers)
 
 **Prototype of Proj-dmx on HF/transformers library.** A white-box observability system for LLM inference. Capture and analyze internal model states (activations, attention weights, KV cache) with minimal performance overhead.
 
@@ -53,7 +163,8 @@ HF_Prometheus/
 │       └── hook_points.py     # HookPoint implementation
 ├── benchmark/
 │   └── tests/             # Performance benchmarks
-└── tests_monitoring/      # Unit tests
+├── example/               # User-facing examples
+└── tests/                 # Unit tests
 ```
 
 
@@ -66,6 +177,9 @@ cd vLLM-Prometheus
 
 # If already cloned without --recursive
 git submodule update --init --recursive
+
+# Ensure nested submodules inside dmx_host are present (clickhouse-cpp)
+git -C dmx_host submodule update --init --recursive
 ```
 
 ### Option 1: Conda (Recommended)
@@ -74,6 +188,7 @@ git submodule update --init --recursive
 conda env create -f environment.yml
 conda activate proj-dmx
 pip install -e transformers/  # Install local modified transformers
+pip install -e dmx_host/      # Builds clickhouse_client extension
 ```
 
 ### Option 2: Pip
@@ -81,6 +196,7 @@ pip install -e transformers/  # Install local modified transformers
 ```bash
 pip install -r requirements.txt
 pip install -e transformers/  # Install local modified transformers
+pip install -e dmx_host/      # Builds clickhouse_client extension
 ```
 
 ### Build C++ Extension
@@ -94,19 +210,37 @@ cd monitoring && make
 
 ## Quick Start
 
-**Refer to [Quick_Start.ipynb](./Quick_Start.ipynb).**
+**Notebook:** [Quick_Start.ipynb](./Quick_Start.ipynb)
+
+### Example: Minimal monitoring (CPU)
+```bash
+python -m example.gpt2_generate_with_monitoring
+```
+### Example: CUDA + ClickHouse pipeline
+Requires running ClickHouse and the dmx_host extension built.
+```bash
+python -m example.gpt2_generate_with_monitoring_db
+```
+
+#### ClickHouse quick check
+```bash
+clickhouse-client --query "SELECT 1"
+```
+
+Optional DB overrides:
+`DMX_DB_HOST`, `DMX_DB_PORT`, `DMX_DB_USER`, `DMX_DB_PASSWORD`,
+`DMX_DB_DATABASE`, `DMX_DB_TABLE`.
 
 
 
 ## Run Benchmark
 
-## Environment Variables for Benchmarks
+## Benchmark Runtime Config
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MON_NATIVE_CALLBACK` | `1` | Use C++ callbacks (faster) |
-| `MON_NATIVE_BATCH` | `1` | Batch hook submissions |
-| `MON_NATIVE_TO_CPU` | `1` | Enable async GPU→CPU transfer |
+- Runtime env toggles under `MON_NATIVE_*` are removed.
+- Use `MonitoringConfig` for runtime tuning (`advance.*`) and debug behavior (`debug`).
+- For benchmark scripts that expose it, use `--nvtx` to enable debug/NVTX (`MonitoringConfig.debug=True`).
+- Policy: new runtime behavior knobs must be added via config fields, not new environment variables.
 
 ### Args
 ```bash
@@ -119,15 +253,13 @@ decode-steps: decode token length
 
 Compares multiple inference approaches (TransformerLens, HuggingFace, HookedGPT2Model) with profiling support:
 
-```bash
 
 
 # Basic run
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/tests/profile_decode.py --batch-size 64 --steps 1 --warmup 1 --collect-hidden --collect-attention --no-profile
+python -m benchmark.tests.profile_decode_qwen3 --batch-size 1 --steps 1 --warmup 1 --collect-hidden --collect-attention --no-profile --dtype fp16
 
 # With nsight profiling
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 TL_ENABLE_NVTX=1 nsys profile --output=your_results_path/xxx --force-overwrite=true --trace=cuda,nvtx,osrt --sample=cpu --sampling-period=1000000 --cpuctxsw=process-tree --cuda-memory-usage=false  python benchmark/tests/profile_decode.py. --profile-dir your_results_dir/xxx. --batch-size 64  --decode-steps 64  --collect-hidden  --collect-attention  --steps 1  --warmup 1  --no-profile
-```
+nsys profile --output=your_results_path/xxx --force-overwrite=true --trace=cuda,nvtx,osrt --sample=cpu --sampling-period=1000000 --cpuctxsw=process-tree --cuda-memory-usage=false python -m benchmark.tests.profile_decode --profile-dir your_results_dir/xxx --batch-size 64 --decode-steps 64 --collect-hidden --collect-attention --steps 1 --warmup 1 --no-profile --nvtx
 
 **Tested configurations:**
 - `transformer_lens` / `transformer_lens_cache` - Original TransformerLens
@@ -139,7 +271,7 @@ MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 TL_ENABLE_NVTX=1 nsys profile --output
 Tests different MonitoringConfig settings (full capture vs sampled):
 
 ```bash
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/tests/hf_modified_async_config_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
+python benchmark/tests/hf_modified_async_config_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
 ```
 
 ### hf_modified_async_config_token_stride_benchmark.py - Token Stride Impact
@@ -147,7 +279,7 @@ MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/te
 Measures performance impact of different `step_stride` values:
 
 ```bash
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/tests/hf_modified_async_config_token_stride_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
+python benchmark/tests/hf_modified_async_config_token_stride_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
 ```
 
 Tests strides: `[1, 10, 30, 400]` - higher stride = fewer captures = faster
@@ -157,8 +289,7 @@ Tests strides: `[1, 10, 30, 400]` - higher stride = fewer captures = faster
 Measures performance impact of different `request_stride` values:
 
 ```bash
-MON_NATIVE_TO_CPU=1 MON_NATIVE_CALLBACK=1 MON_NATIVE_BATCH=1 python benchmark/tests/hf_modified_async_config_request_stride_benchmark.py --batch-size 64 --steps 10 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention —no-profile
+python benchmark/tests/hf_modified_async_config_request_stride_benchmark.py --batch-size 64 --steps 10 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention --no-profile
 ```
 
-Tests strides: `[1, 2, 5, 100]` - higher stride = skip more requests
-
+Tests strides: `[1, 2, 5, 100]` - higher stride = skip more requests -->

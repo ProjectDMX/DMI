@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple, Union
 
@@ -54,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nvtx",
         action="store_true",
-        help="Enable NVTX annotations inside TransformerLens hooks (sets TL_ENABLE_NVTX=1)",
+        help="Enable NVTX annotations inside TransformerLens hooks (enables MonitoringConfig.debug)",
     )
     parser.add_argument(
         "--collect-hidden",
@@ -265,9 +264,6 @@ def profile_async_model(
 def main() -> None:
     args = parse_args()
 
-    if args.nvtx:
-        os.environ.setdefault("TL_ENABLE_NVTX", "1")
-
     device = pick_device(args.device)
     hf_dtype = map_hf_dtype(args.dtype)
     tl_dtype = map_tl_dtype(args.dtype)
@@ -276,6 +272,7 @@ def main() -> None:
     from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2Model
     from transformer_lens import HookedTransformer
     from monitoring import MonitoringEngine
+    from monitoring.config import MonitoringConfig
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     if tokenizer.pad_token is None:
@@ -321,6 +318,7 @@ def main() -> None:
         cache_dtype=cache_dtype,
         queue_size=args.engine_queue_size,
         delay_steps=args.engine_delay_steps,
+        config=MonitoringConfig(debug=args.nvtx),
     )
     hf_hooked_model.monitoring_engine = None
 
@@ -841,7 +839,7 @@ def main() -> None:
         print("\nProfiler traces written under:")
         print(f"  {traces_path.resolve()}")
     if args.nvtx and device.type == "cuda":
-        print("NVTX annotations enabled for TransformerLens hooks (set TL_ENABLE_NVTX=1).")
+        print("NVTX annotations enabled for TransformerLens hooks (MonitoringConfig.debug=True).")
 
 
 if __name__ == "__main__":
