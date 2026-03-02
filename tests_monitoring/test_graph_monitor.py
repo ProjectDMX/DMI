@@ -139,6 +139,7 @@ def test_graph_safe_engine_collect_results():
 @pytest.mark.skipif(not _HAS_TORCH_COMPILE, reason="torch.compile not available")
 def test_graph_monitor_compile_mode_metadata():
     """Compile-mode hooks write correct metadata via torch.compile."""
+    torch._dynamo.reset()
     device = torch.device("cuda")
     model = TinyMLP().to(device).eval()
     monitor = GraphMonitor(
@@ -194,6 +195,7 @@ def test_graph_monitor_compile_mode_metadata():
 @pytest.mark.skipif(not _HAS_TORCH_COMPILE, reason="torch.compile not available")
 def test_graph_safe_engine_compile_mode():
     """End-to-end: compile mode + GraphSafeEngine collect_results."""
+    torch._dynamo.reset()
     device = torch.device("cuda")
     model = TinyMLP().to(device).eval()
     engine = GraphSafeEngine(

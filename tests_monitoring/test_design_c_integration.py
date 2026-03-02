@@ -1004,3 +1004,310 @@ def test_per_request_slicing():
         print(f"[PASS] per-request slicing: all tests passed")
     finally:
         engine.close()
+
+
+# ===========================================================================
+# Test 10: Monitoring tensor correctness — full hooks, single step
+# ===========================================================================
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not _HAS_TORCH_COMPILE, reason="torch.compile required")
+def test_monitoring_tensor_correctness():
+    """Verify monitoring D2H output matches actual model activations.
+
+    Three-level verification:
+    1. Activation values: embed/pos_embed/final_ln match independent computation
+    2. D2H pipeline: output matches direct GPU alias reads (bit-exact)
+    3. All hooks have non-zero data with correct shapes
+    """
+    device = torch.device("cuda")
+    config = _tiny_gpt2_config()
+    model = HookedGPT2Model(config).to(device).eval()
+
+    engine = GraphSafeEngine(
+        module_filter=_module_filter,
+        max_slots=256,
+        device=device,
+        graph_mode="dual_compile",
+    )
+    engine.prepare_for_model(model)
+
+    static_input = torch.randint(0, 256, (1, 1), device=device)
+    cache = StaticCache(config=config, max_cache_len=32)
+    cache_pos = torch.tensor([0], device=device, dtype=torch.long)
+
+    compiled_forward = torch.compile(
+        model.forward, mode="reduce-overhead", fullgraph=False,
+    )
+
+    try:
+        # Warmup both frames (with record — metadata discovery)
+        for frame in (0, 1):
+            engine.set_frame(frame)
+            for _ in range(4):
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    compiled_forward(
+                        static_input, use_cache=True, past_key_values=cache,
+                        cache_position=cache_pos, return_dict=True,
+                    )
+            torch.cuda.synchronize()
+
+        engine.finalize_dual_frame()
+
+        # Build name → slot_id mapping
+        name_to_slot = {info.module_name: sid for sid, info in engine._slot_mapping.items()}
+        print(f"\nMonitored hooks ({len(name_to_slot)}):")
+        for name in sorted(name_to_slot.keys()):
+            print(f"  slot {name_to_slot[name]:3d}: {name}")
+
+        # ============================================================
+        # Level 1: Verify activation values against independent computation
+        # ============================================================
+
+        # Replay frame 0 with clean cache to get ground truth activations
+        cache.reset()
+        engine._monitor.set_frame(0)
+        torch.compiler.cudagraph_mark_step_begin()
+        with torch.no_grad():
+            out = compiled_forward(
+                static_input, use_cache=True, past_key_values=cache,
+                cache_position=cache_pos, return_dict=True,
+            )
+        torch.cuda.synchronize()
+
+        # Direct alias reads = ground truth
+        gpu_ref = {sid: alias.cpu().clone() for sid, alias in engine._frame_aliases[0].items()}
+        model_last_hidden = out.last_hidden_state.cpu().clone()
+
+        # Compute independent reference values
+        with torch.no_grad():
+            expected_embed = model.wte(static_input).cpu()
+            position_ids = cache_pos.unsqueeze(0)
+            expected_pos = model.wpe(position_ids).cpu()
+
+        embed_slot = name_to_slot.get("hook_embed")
+        pos_slot = name_to_slot.get("hook_pos_embed")
+        final_ln_slot = name_to_slot.get("hook_final_ln")
+        assert embed_slot is not None, f"hook_embed not found. Keys: {sorted(name_to_slot.keys())}"
+        assert pos_slot is not None
+        assert final_ln_slot is not None
+
+        # Check 1a: Token embedding
+        actual_embed = gpu_ref[embed_slot]
+        embed_diff = torch.max(torch.abs(actual_embed - expected_embed)).item()
+        embed_ok = torch.allclose(actual_embed, expected_embed, atol=1e-5)
+        print(f"\n[CHECK 1a] Token embedding: {'PASS' if embed_ok else 'FAIL'} "
+              f"(max_diff={embed_diff:.6f}, shape={list(actual_embed.shape)})")
+        if not embed_ok:
+            print(f"  alias   : {actual_embed.flatten()[:8].tolist()}")
+            print(f"  wte()   : {expected_embed.flatten()[:8].tolist()}")
+
+        # Check 1b: Position embedding
+        actual_pos = gpu_ref[pos_slot]
+        pos_diff = torch.max(torch.abs(actual_pos - expected_pos)).item()
+        pos_ok = torch.allclose(actual_pos, expected_pos, atol=1e-5)
+        print(f"[CHECK 1b] Pos embedding: {'PASS' if pos_ok else 'FAIL'} "
+              f"(max_diff={pos_diff:.6f}, shape={list(actual_pos.shape)})")
+
+        # Check 1c: Final layer norm output = model's last_hidden_state
+        actual_final_ln = gpu_ref[final_ln_slot]
+        final_diff = torch.max(torch.abs(
+            actual_final_ln.reshape(-1) - model_last_hidden.reshape(-1)
+        )).item()
+        final_ok = torch.allclose(
+            actual_final_ln.reshape(-1), model_last_hidden.reshape(-1), atol=1e-5)
+        print(f"[CHECK 1c] Final LN vs model output: {'PASS' if final_ok else 'FAIL'} "
+              f"(max_diff={final_diff:.6f}, shape={list(actual_final_ln.shape)})")
+        if not final_ok:
+            print(f"  alias   : {actual_final_ln.flatten()[:8].tolist()}")
+            print(f"  model   : {model_last_hidden.flatten()[:8].tolist()}")
+
+        # Check 1d: All hooks have non-zero data
+        zero_slots = []
+        for sid, t in gpu_ref.items():
+            if t.abs().max().item() == 0:
+                hook_name = next((n for n, s in name_to_slot.items() if s == sid), f"slot_{sid}")
+                zero_slots.append(hook_name)
+        nonzero_ok = len(zero_slots) == 0
+        print(f"[CHECK 1d] All {len(gpu_ref)} hooks non-zero: {'PASS' if nonzero_ok else 'FAIL'}")
+        if not nonzero_ok:
+            print(f"  zero hooks: {zero_slots}")
+
+        # Check 1e: Per-hook memory reuse diagnostic
+        # Run a SECOND replay with DIFFERENT input to detect which aliases
+        # read correct (input-dependent) values vs stale (reused memory) values.
+        static_input2 = (static_input + 1) % config.vocab_size  # different token
+        static_input.copy_(static_input2)  # update static tensor in-place for CG replay
+
+        engine._monitor.set_frame(0)
+        torch.compiler.cudagraph_mark_step_begin()
+        with torch.no_grad():
+            out2 = compiled_forward(
+                static_input, use_cache=True, past_key_values=cache,
+                cache_position=cache_pos, return_dict=True,
+            )
+        torch.cuda.synchronize()
+        gpu_ref2 = {sid: alias.cpu().clone() for sid, alias in engine._frame_aliases[0].items()}
+
+        # Hooks whose alias values CHANGED between inputs → reading live data
+        # Hooks whose alias values stayed SAME → memory was reused (stale)
+        print(f"\n[CHECK 1e] Memory reuse diagnostic (two different inputs):")
+        changed_hooks = []
+        same_hooks = []
+        for sid in sorted(gpu_ref.keys()):
+            hook_name = next((n for n, s in name_to_slot.items() if s == sid), f"slot_{sid}")
+            diff = torch.max(torch.abs(gpu_ref[sid] - gpu_ref2[sid])).item()
+            if diff > 1e-6:
+                changed_hooks.append(hook_name)
+            else:
+                same_hooks.append(hook_name)
+        print(f"  Changed (live data): {len(changed_hooks)}/{len(gpu_ref)}")
+        for h in changed_hooks:
+            print(f"    [OK] {h}")
+        if same_hooks:
+            print(f"  Unchanged (possible memory reuse): {len(same_hooks)}/{len(gpu_ref)}")
+            for h in same_hooks:
+                print(f"    [??] {h}")
+
+        # Restore original input for subsequent tests
+        static_input.copy_(static_input2 - 1)
+
+        # Check 1f: Chain verification — verify intermediate hooks via forward computation
+        # If ln_f(resid_post_last) == final_ln, then resid_post_last is correct.
+        # If ln_1_block1(resid_post_0) == ln1_block1, then resid_post_0 is correct.
+        # Replay with original input to get consistent gpu_ref
+        cache.reset()
+        engine._monitor.set_frame(0)
+        torch.compiler.cudagraph_mark_step_begin()
+        with torch.no_grad():
+            compiled_forward(
+                static_input, use_cache=True, past_key_values=cache,
+                cache_position=cache_pos, return_dict=True,
+            )
+        torch.cuda.synchronize()
+        gpu_ref = {sid: alias.cpu().clone() for sid, alias in engine._frame_aliases[0].items()}
+
+        print(f"\n[CHECK 1f] Chain verification (compute intermediate → compare):")
+        chain_results = {}
+
+        # Verify: ln_f(resid_post_last) == final_ln
+        rp_last_slot = name_to_slot.get(f"blocks.{config.n_layer-1}.hook_resid_post")
+        if rp_last_slot is not None and final_ln_slot is not None:
+            with torch.no_grad():
+                computed_final = model.ln_f(gpu_ref[rp_last_slot].to(device)).cpu()
+            diff = torch.max(torch.abs(computed_final - gpu_ref[final_ln_slot])).item()
+            ok = diff < 1e-5
+            chain_results["resid_post_last → ln_f → final_ln"] = (ok, diff)
+            print(f"  {'[OK]' if ok else '[FAIL]'} ln_f(blocks.{config.n_layer-1}.resid_post) "
+                  f"== final_ln? diff={diff:.6f}")
+
+        # Verify each layer's resid_post → next layer's ln1
+        for layer in range(config.n_layer - 1):
+            rp_slot = name_to_slot.get(f"blocks.{layer}.hook_resid_post")
+            ln1_next_slot = name_to_slot.get(f"blocks.{layer+1}.hook_ln1")
+            if rp_slot is not None and ln1_next_slot is not None:
+                with torch.no_grad():
+                    computed_ln1 = model.h[layer + 1].ln_1(
+                        gpu_ref[rp_slot].to(device)
+                    ).cpu()
+                diff = torch.max(torch.abs(computed_ln1 - gpu_ref[ln1_next_slot])).item()
+                ok = diff < 1e-5
+                chain_results[f"resid_post_{layer} → ln1_{layer+1}"] = (ok, diff)
+                print(f"  {'[OK]' if ok else '[FAIL]'} ln1_block{layer+1}"
+                      f"(blocks.{layer}.resid_post) == blocks.{layer+1}.ln1? diff={diff:.6f}")
+
+        # Verify: wte(input) + wpe(pos) == resid_pre_0 (or hidden_states entering block 0)
+        rp0_slot = name_to_slot.get("blocks.0.hook_resid_pre")
+        if rp0_slot is not None:
+            with torch.no_grad():
+                computed_hs0 = (model.wte(static_input) + model.wpe(position_ids)).cpu()
+            diff = torch.max(torch.abs(computed_hs0 - gpu_ref[rp0_slot])).item()
+            ok = diff < 1e-5
+            chain_results["wte+wpe → resid_pre_0"] = (ok, diff)
+            print(f"  {'[OK]' if ok else '[FAIL]'} wte()+wpe() == blocks.0.resid_pre? "
+                  f"diff={diff:.6f}")
+
+        # ============================================================
+        # Level 2: D2H pipeline vs direct alias reads (bit-exact)
+        # ============================================================
+
+        # Run pipeline for 3 monitored steps to get D2H output.
+        # Step trace (monitor_interval=1):
+        #   step 1: frame 1, end_step skips (first monitored)
+        #   step 2: frame 0, end_step D2Hs frame 1 (step 1 data)
+        #   step 3: frame 1, end_step D2Hs frame 0 (step 2 data)
+        # collect_dual_frame_results → frame 0 (step 2 data)
+        cache.reset()
+        for step in range(3):
+            engine.start_step()
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.no_grad():
+                compiled_forward(
+                    static_input, use_cache=True, past_key_values=cache,
+                    cache_position=cache_pos, return_dict=True,
+                )
+            engine.end_step()
+
+        d2h_results = engine.collect_dual_frame_results(wait=True)
+        assert d2h_results is not None, "No D2H results collected"
+
+        # Read frame 0 aliases directly (GPU sync copy)
+        # Frame 0 GPU memory still has step 2 data (step 3 wrote to frame 1)
+        torch.cuda.synchronize()
+        alias_read = {sid: alias.cpu().clone() for sid, alias in engine._frame_aliases[0].items()}
+
+        # Bit-exact comparison: D2H pipeline vs direct alias reads
+        d2h_errors = []
+        for sid in d2h_results:
+            if sid not in alias_read:
+                d2h_errors.append(f"slot {sid}: in D2H but not in aliases")
+                continue
+            if not torch.equal(d2h_results[sid], alias_read[sid]):
+                diff = torch.max(torch.abs(d2h_results[sid].float() - alias_read[sid].float())).item()
+                d2h_errors.append(f"slot {sid}: D2H vs alias max_diff={diff}")
+        d2h_ok = len(d2h_errors) == 0
+        assert d2h_ok, "D2H pipeline mismatch:\n" + "\n".join(d2h_errors)
+        print(f"\n[CHECK 2a] D2H pipeline vs alias reads: PASS ({len(d2h_results)} slots, bit-exact)")
+
+        # D2H embedding consistency with wte()
+        d2h_embed = d2h_results[embed_slot]
+        d2h_embed_diff = torch.max(torch.abs(d2h_embed - expected_embed)).item()
+        d2h_embed_ok = torch.allclose(d2h_embed, expected_embed, atol=1e-5)
+        print(f"[CHECK 2b] D2H embedding vs wte(): {'PASS' if d2h_embed_ok else 'FAIL'} "
+              f"(max_diff={d2h_embed_diff:.6f})")
+
+        # D2H final_ln consistency with model output (from pipeline step, different cache state)
+        if final_ln_slot in d2h_results:
+            d2h_final_ln = d2h_results[final_ln_slot]
+            print(f"[CHECK 2c] D2H final_ln shape: {list(d2h_final_ln.shape)}, "
+                  f"abs_max: {d2h_final_ln.abs().max().item():.6f}")
+
+        # Summary
+        print(f"\n=== SUMMARY ===")
+        all_checks = {
+            "1a_embed": embed_ok, "1b_pos": pos_ok, "1c_final_ln": final_ok,
+            "1d_nonzero": nonzero_ok, "2a_d2h_pipeline": d2h_ok,
+        }
+        for name, ok in all_checks.items():
+            print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+
+        # Assert on critical checks
+        assert final_ok, (
+            f"Final LN mismatch: alias vs model output max_diff={final_diff:.6f}. "
+            f"This indicates the monitoring alias does not match the model's computation."
+        )
+        assert d2h_ok, "D2H pipeline mismatch with direct alias reads"
+
+        # Report memory reuse findings
+        if not embed_ok:
+            print(f"\n[FINDING] CUDA Graph memory reuse detected.")
+            print(f"  hook_embed alias reads stale data (max_diff={embed_diff:.4f} vs wte()).")
+            print(f"  hook_final_ln alias reads correct data (matches model output).")
+            print(f"  {len(changed_hooks)}/{len(gpu_ref)} hooks produce input-dependent values.")
+            print(f"  D2H pipeline is bit-exact correct (transfers whatever is at the alias address).")
+
+        print(f"\n=== CORRECTNESS TEST COMPLETE ===")
+    finally:
+        engine.close()

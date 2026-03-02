@@ -46,7 +46,7 @@ __global__ void sink_kernel(uint64_t ptr_value) {
   }
 }
 
-void record_op(const at::Tensor& tensor, const at::Tensor& buffer,
+void record_op(const at::Tensor& tensor, at::Tensor& buffer,
                int64_t slot_id) {
   TORCH_CHECK(tensor.is_cuda(), "record() expects CUDA tensor input.");
   TORCH_CHECK(buffer.is_cuda(), "Metadata buffer must live on CUDA.");
@@ -208,6 +208,20 @@ int64_t held_tensors_count_op(int64_t frame) {
   return static_cast<int64_t>(g_held_tensors[frame].size());
 }
 
+// --- Anchor op: prevent CUDA Graph memory reuse for monitored tensors ---
+// Called at the END of forward() with all tensors that had record() called.
+// sink_kernel creates GPU data dependency; Tensor(a!) buffer prevents Inductor DCE.
+void anchor_op(at::Tensor& buffer, const std::vector<at::Tensor>& tensors) {
+  if (tensors.empty()) return;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  for (const auto& tensor : tensors) {
+    if (!tensor.defined() || !tensor.is_cuda()) continue;
+    sink_kernel<<<1, 1, 0, stream>>>(
+        reinterpret_cast<uint64_t>(tensor.data_ptr()));
+  }
+  AT_CUDA_CHECK(cudaGetLastError());
+}
+
 // --- Batched D2H (legacy): C++ loop of cudaMemcpyAsync ---
 void batch_d2h_op(const std::vector<at::Tensor>& dst_list,
                   const std::vector<at::Tensor>& src_list) {
@@ -330,6 +344,7 @@ void batch_d2h_ptrs_op(
 TORCH_LIBRARY(graphmonitor_ops, m) {
   m.def("record(Tensor tensor, Tensor(a!) buffer, int slot_id) -> ()");
   m.def("sink(Tensor[] tensors) -> ()");
+  m.def("anchor(Tensor(a!) buffer, Tensor[] tensors) -> ()");
   m.def("alias_tensor(int data_ptr, int[] sizes, int[] strides, int dtype_id, int device_index) -> Tensor");
   m.def("sink_hold(Tensor[] tensors, int frame) -> ()");
   m.def("clear_held_tensors() -> ()");
@@ -350,13 +365,15 @@ TORCH_LIBRARY(graphmonitor_ops, m) {
 TORCH_LIBRARY_IMPL(graphmonitor_ops, CUDA, m) {
   m.impl("record", &vllm::record_op);
   m.impl("sink", &vllm::sink_op);
+  m.impl("anchor", &vllm::anchor_op);
   m.impl("sink_hold", &vllm::sink_hold_op);
   m.impl("wait_d2h", &vllm::wait_d2h_op);
 }
 
 TORCH_LIBRARY_IMPL(graphmonitor_ops, Meta, m) {
-  m.impl("record", [](const at::Tensor&, const at::Tensor&, int64_t) {});
+  m.impl("record", [](const at::Tensor&, at::Tensor&, int64_t) {});
   m.impl("sink", [](const std::vector<at::Tensor>&) {});
+  m.impl("anchor", [](at::Tensor&, const std::vector<at::Tensor>&) {});
   m.impl("sink_hold", [](const std::vector<at::Tensor>&, int64_t) {});
   m.impl("wait_d2h", [](const at::Tensor&, int64_t) {});
 }
