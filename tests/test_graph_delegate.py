@@ -15,7 +15,7 @@ def test_alias_tensor_matches_source():
     tensor = torch.arange(0, 16, device=device, dtype=torch.float32).view(4, 4)
 
     torch.ops.graphmonitor_ops.record(tensor, monitor._gpu_buffer, 0)
-    monitor._host_buffer.copy_(monitor._gpu_buffer, non_blocking=False)
+    monitor._latest_snapshot.copy_(monitor._gpu_buffer, non_blocking=False)
     metadata = monitor.metadata_view().clone()
     decoded = _decode_metadata_row(metadata[0])
     assert decoded is not None
@@ -49,7 +49,7 @@ def test_parse_shadow_block_helper():
     tensor = torch.randn(2, 3, 5, device=device)
 
     torch.ops.graphmonitor_ops.record(tensor, monitor._gpu_buffer, 0)
-    monitor._host_buffer.copy_(monitor._gpu_buffer, non_blocking=False)
+    monitor._latest_snapshot.copy_(monitor._gpu_buffer, non_blocking=False)
     metadata = monitor.metadata_view()
     spec = parse_shadow_block(metadata, [0], ["identity"])
     assert "tensors" in spec
@@ -69,7 +69,7 @@ def test_graph_native_delegate_submit():
     monitor = GraphMonitor(model, max_slots=1)
     tensor = torch.randn(2, 3, device=device)
     torch.ops.graphmonitor_ops.record(tensor, monitor._gpu_buffer, 0)
-    monitor._host_buffer.copy_(monitor._gpu_buffer, non_blocking=False)
+    monitor._latest_snapshot.copy_(monitor._gpu_buffer, non_blocking=False)
     metadata = monitor.metadata_view()
 
     backend = _native_engine.create_engine(queue_size=8, cache_dtype=None, delay_steps=0)
@@ -90,8 +90,9 @@ def test_delegate_submits_tasks(monkeypatch):
     model = torch.nn.Identity().to(device)
     monitor = GraphMonitor(model, max_slots=1)
     torch.ops.graphmonitor_ops.record(tensor, monitor._gpu_buffer, 0)
-    monitor._host_buffer.copy_(monitor._gpu_buffer, non_blocking=False)
-    row = monitor.metadata_view()[0]
+    monitor._latest_snapshot.copy_(monitor._gpu_buffer, non_blocking=False)
+    metadata = monitor.metadata_view()
+    row = metadata[0]
     decoded = _decode_metadata_row(row)
     assert decoded is not None
     shape, stride, ndim, dtype_id, device_idx, data_ptr = decoded

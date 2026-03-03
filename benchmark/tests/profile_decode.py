@@ -29,7 +29,6 @@ from transformer_lens import HookedTransformer
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
 
 from monitoring import GraphSafeEngine, GraphSlotConsumer, MonitoringEngine, _native_engine
-from monitoring.engine import _PythonBackend
 from monitoring.config import CaptureSchedule, HookSelection, MonitoringConfig
 from monitoring.monitor_native import create_graph_delegate
 
