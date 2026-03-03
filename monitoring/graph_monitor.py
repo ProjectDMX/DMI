@@ -92,11 +92,17 @@ class GraphMonitor:
             if name:
                 parent_map[name] = mod
 
+        # Use hook_dict for canonical hook names (no aliases, no transformer. prefix).
+        # Falls back to named_modules() for models without hook_dict.
+        hook_source = getattr(model, "hook_dict", None)
+        if hook_source is not None:
+            hook_iter = hook_source.items()
+        else:
+            hook_iter = ((n, m) for n, m in model.named_modules() if n)
+
         slot_id = 0
         seen_parents: Dict[nn.Module, bool] = {}
-        for name, module in model.named_modules():
-            if name == "":
-                continue
+        for name, module in hook_iter:
             if module in self._module_to_slot:
                 continue
             if self._module_filter is not None and not self._module_filter(name, module):
@@ -110,7 +116,7 @@ class GraphMonitor:
                 handle = module.register_forward_hook(self._make_hook(slot_id))
                 self._handles.append(handle)
             # In compile/dual_compile mode, set inline attrs so _mon_record() works
-            if self._graph_mode in ("compile", "dual_compile") and hasattr(module, "monitor_activation"):
+            if self._graph_mode in ("compile", "dual_compile"):
                 parts = name.rsplit(".", 1)
                 parent_name = parts[0] if len(parts) > 1 else ""
                 attr_name = parts[-1]
