@@ -96,6 +96,24 @@ LDFLAGS  += -L$(VENV_PREFIX)/lib -Wl,-rpath,$(VENV_PREFIX)/lib
 endif
 endif
 
+# ---- CUDA kernel compilation (nvcc) ----------------------------------------
+NVCC    ?= /usr/local/cuda/bin/nvcc
+SM_ARCH ?= native
+
+NVCCFLAGS := \
+    -std=c++17 \
+    -arch=$(SM_ARCH) \
+    -O2 \
+    -Xcompiler -fPIC \
+    $(ABI_FLAG) \
+    $(CUDA_INCLUDE_FLAGS) \
+    -Icsrc
+
+RING_SRCS := csrc/ring/producer.cu
+RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
+
+OBJS += $(RING_OBJS)
+
 .PHONY: all build clean
 
 all: $(FINAL_TARGET)
@@ -105,6 +123,10 @@ $(BUILD_DIR):
 
 $(BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ring/%.o: csrc/ring/%.cu | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 $(FINAL_TARGET): $(OBJS)
 	$(CXX) -shared $^ -o $(BUILD_DIR)/$(TARGET_SO) $(LDFLAGS)

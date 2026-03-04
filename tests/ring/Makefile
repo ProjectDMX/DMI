@@ -2,9 +2,6 @@ NVCC     ?= /usr/local/cuda/bin/nvcc
 SM_ARCH  ?= native
 CXX_STD  ?= c++17
 BUILD    := build
-TARGET   := $(BUILD)/test_rings
-
-SRCS     := test_rings.cu
 INCLUDES := -I../.. -I../../monitoring/csrc
 
 NVCC_FLAGS := \
@@ -14,23 +11,33 @@ NVCC_FLAGS := \
     -Xcompiler -Wall \
     -Xcompiler -Wextra \
     -Xcompiler -Wno-unused-parameter \
+    -lineinfo \
     $(INCLUDES)
 
-# Enable debug info (optional; comment out for pure perf builds).
-NVCC_FLAGS += -lineinfo
+TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer
 
-.PHONY: all run clean
+.PHONY: all test_rings test_producer run clean
 
-all: $(TARGET)
+all: $(TARGETS)
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(TARGET): $(SRCS) | $(BUILD)
+$(BUILD)/test_rings: test_rings.cu | $(BUILD)
 	$(NVCC) $(NVCC_FLAGS) $< -o $@
 
-run: $(TARGET)
-	$(TARGET)
+$(BUILD)/test_producer: test_producer.cu | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) $< -o $@
+
+test_rings: $(BUILD)/test_rings
+	$(BUILD)/test_rings
+
+test_producer: $(BUILD)/test_producer
+	$(BUILD)/test_producer
+
+run: all
+	$(BUILD)/test_rings
+	$(BUILD)/test_producer
 
 clean:
 	rm -rf $(BUILD)
