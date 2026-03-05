@@ -33,7 +33,6 @@
 
 #include "ring_state.h"
 #include "payload_ring.cuh"
-#include "task_ring.cuh"
 
 namespace ring {
 
@@ -52,7 +51,7 @@ struct alignas(16) ProducerShmem {
 };
 
 // ---------------------------------------------------------------------------
-// producer_kernel
+// producer_kernel — declaration only; definition in producer.cu.
 // ---------------------------------------------------------------------------
 __global__ void producer_kernel(
     RingState       ring,
@@ -60,182 +59,43 @@ __global__ void producer_kernel(
     uint64_t        src_bytes,
     uint64_t        logical_task_id,
     uint32_t        hook_type,
-    uint32_t        hook_id)
-{
-    __shared__ ProducerShmem sh;
-
-    const uint64_t chunk_sz = ring.cfg.chunk_bytes;
-    const uint64_t n_chunks = (src_bytes == 0)
-                              ? 1
-                              : (src_bytes + chunk_sz - 1) / chunk_sz;
-
-    // Thread 0 owns the ring head counters; other threads read them from shmem.
-    uint64_t task_head    = 0;
-    uint64_t payload_head = 0;
-    if (threadIdx.x == 0) {
-        task_head    = *ring.task_head;
-        payload_head = *ring.payload_head;
-    }
-
-    for (uint64_t ci = 0; ci < n_chunks; ++ci) {
-        const uint64_t chunk_off  = ci * chunk_sz;
-        const uint64_t this_chunk = (src_bytes == 0) ? 0
-                                    : (ci + 1 < n_chunks ? chunk_sz
-                                                         : src_bytes - chunk_off);
-
-        // ----------------------------------------------------------------
-        // Phase 1: thread 0 — backpressure + span reservation
-        // ----------------------------------------------------------------
-        if (threadIdx.x == 0) {
-            bool dropped = false;
-
-            if (ring.cfg.wait_policy == WaitPolicy::INFINITE) {
-                while (task_free_slots(task_head, *ring.task_tail, ring.task_cap) < 1 ||
-                       payload_free_bytes(payload_head, *ring.payload_tail,
-                                          ring.payload_cap) < this_chunk)
-                {
-#if __CUDA_ARCH__ >= 700
-                    __nanosleep(128);
-#endif
-                }
-            } else {
-                uint64_t hb_snap = *ring.consumer_heartbeat;
-                uint64_t deadline = clock64() + ring.cfg.no_progress_timeout_cycles;
-
-                while (task_free_slots(task_head, *ring.task_tail, ring.task_cap) < 1 ||
-                       payload_free_bytes(payload_head, *ring.payload_tail,
-                                          ring.payload_cap) < this_chunk)
-                {
-                    uint64_t hb_now = *ring.consumer_heartbeat;
-                    if (hb_now != hb_snap) {
-                        hb_snap  = hb_now;
-                        deadline = clock64() + ring.cfg.no_progress_timeout_cycles;
-                    } else if (static_cast<int64_t>(clock64() - deadline) > 0) {
-                        dropped = true;
-                        break;
-                    }
-#if __CUDA_ARCH__ >= 700
-                    __nanosleep(128);
-#endif
-                }
-            }
-
-            sh.dropped      = dropped ? 1 : 0;
-            sh.task_head    = task_head;
-            sh.payload_head = payload_head;
-            sh.spans        = dropped ? TwoSpan{0, 0, 0, 0}
-                                      : payload_compute_spans(payload_head,
-                                                              ring.payload_cap,
-                                                              this_chunk);
-        }
-
-        __syncthreads();  // broadcast shmem to all threads
-
-        if (sh.dropped) {
-            // Thread 0 publishes DROP marker; others just exit this iteration.
-            if (threadIdx.x == 0 &&
-                ring.cfg.drop_reporting == DropReporting::DROP_TASK &&
-                task_free_slots(task_head, *ring.task_tail, ring.task_cap) >= 1)
-            {
-                uint32_t drop_flags = TASK_FLAG_IS_DROP | TASK_FLAG_IS_LAST;
-                if (ci == 0) drop_flags |= TASK_FLAG_IS_FIRST;
-
-                TaskEntry drop{};
-                drop.seq_no             = task_head;
-                drop.logical_task_id    = logical_task_id;
-                drop.chunk_offset_bytes = chunk_off;
-                drop.tensor_total_bytes = src_bytes;
-                drop.chunk_idx          = static_cast<uint32_t>(ci);
-                drop.hook_type          = hook_type;
-                drop.hook_id            = hook_id;
-                drop.flags              = drop_flags;
-                drop.reason             = DROP_REASON_TIMEOUT_NO_PROGRESS;
-
-                task_publish(ring.task_entries, ring.task_cap, task_head, drop);
-                ++task_head;
-                *ring.task_head = task_head;
-            }
-            break;
-        }
-
-        // ----------------------------------------------------------------
-        // Phase 2: all threads — cooperative D2D copy (grid-stride)
-        //
-        // Access pattern: thread T writes bytes T, T+blockDim, T+2*blockDim, …
-        // → consecutive threads access consecutive bytes → coalesced 128-byte
-        //   transactions → near-peak HBM bandwidth.
-        //
-        // After writing, every thread calls __threadfence() so its stores are
-        // globally visible before thread 0 publishes ready_seq in phase 3.
-        // ----------------------------------------------------------------
-        const TwoSpan&  spans   = sh.spans;
-        const uint8_t*  src_ptr = src + chunk_off;
-
-        for (uint64_t i = threadIdx.x; i < spans.len1; i += blockDim.x)
-            ring.payload_buf[spans.off1 + i] = src_ptr[i];
-
-        for (uint64_t i = threadIdx.x; i < spans.len2; i += blockDim.x)
-            ring.payload_buf[spans.off2 + i] = src_ptr[spans.len1 + i];
-
-        // Each thread fences its own global stores system-wide.
-        __threadfence();
-
-        __syncthreads();  // thread 0 waits for all threads' fences
-
-        // ----------------------------------------------------------------
-        // Phase 3: thread 0 — publish TaskEntry
-        //
-        // task_publish writes entry fields, __threadfence(), ready_seq.
-        // That second threadfence orders the entry-field writes relative to
-        // ready_seq; the per-thread fences above order payload writes.
-        // ----------------------------------------------------------------
-        if (threadIdx.x == 0) {
-            uint32_t flags = 0;
-            if (ci == 0)            flags |= TASK_FLAG_IS_FIRST;
-            if (ci == n_chunks - 1) flags |= TASK_FLAG_IS_LAST;
-
-            payload_advance_head(payload_head, this_chunk);
-
-            TaskEntry entry{};
-            entry.seq_no             = task_head;
-            entry.logical_task_id    = logical_task_id;
-            entry.chunk_offset_bytes = chunk_off;
-            entry.tensor_total_bytes = src_bytes;
-            entry.payload_off1       = spans.off1;
-            entry.payload_len1       = spans.len1;
-            entry.payload_off2       = spans.off2;
-            entry.payload_len2       = spans.len2;
-            entry.chunk_idx          = static_cast<uint32_t>(ci);
-            entry.hook_type          = hook_type;
-            entry.hook_id            = hook_id;
-            entry.flags              = flags;
-            entry.reason             = DROP_REASON_NONE;
-
-            task_publish(ring.task_entries, ring.task_cap, task_head, entry);
-            ++task_head;
-            *ring.task_head    = task_head;
-            *ring.payload_head = payload_head;
-        }
-
-        __syncthreads();  // keep all threads in sync for next iteration
-    }
-}
+    uint32_t        hook_id);
 
 // ---------------------------------------------------------------------------
-// launch_producer — host-side launcher.
+// Host-side launchers — defined in producer.cu (not inline) so they are
+// exported as symbols for cross-TU linking.
 // ---------------------------------------------------------------------------
-inline void launch_producer(
+void launch_producer(
     const RingState& ring,
     const uint8_t*   d_src,
     uint64_t         src_bytes,
     uint64_t         logical_task_id,
     uint32_t         hook_type,
     uint32_t         hook_id,
-    cudaStream_t     stream = 0)
-{
-    producer_kernel<<<1, PRODUCER_BLOCK_DIM, 0, stream>>>(
-        ring, d_src, src_bytes, logical_task_id, hook_type, hook_id);
-}
+    cudaStream_t     stream = 0);
+
+// Launch producer kernel then enqueue a host callback on the same stream.
+//
+// Graph-capture semantics: the hostfunc becomes a graph node that fires after
+// the producer kernel.  To avoid blocking the forward pass, callers should
+// either:
+//   (a) use a side stream for the producer kernel + hostfunc (with an event
+//       recording the tensor-ready point on the main stream), so the forward
+//       pass continues unblocked; or
+//   (b) accept the ~1 µs callback overhead per hooked tensor on the main
+//       stream (callback just signals a CV and returns immediately).
+//
+// `notify_fn` / `notify_arg` are typically DrainThread::hostfunc_cb / &dt.
+void launch_producer_with_notify(
+    const RingState& ring,
+    const uint8_t*   d_src,
+    uint64_t         src_bytes,
+    uint64_t         logical_task_id,
+    uint32_t         hook_type,
+    uint32_t         hook_id,
+    cudaHostFn_t     notify_fn,
+    void*            notify_arg,
+    cudaStream_t     stream = 0);
 
 }  // namespace ring
 

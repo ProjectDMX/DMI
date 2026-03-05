@@ -94,6 +94,10 @@ class MonitoringEngine:
         self._host_engine: Optional[Any] = None
         self._host_engine_enabled = False
 
+        # Ring transport (replaces NativeMonitoringEngine D2H when active)
+        self._ring_transport: Optional[Any] = None
+        self._using_ring_transport = False
+
         if not self.async_enabled:
             raise RuntimeError(
                 "MonitoringEngine no longer supports async_enabled=False; Python backend was removed"
@@ -137,11 +141,11 @@ class MonitoringEngine:
                 except Exception as exc:
                     raise RuntimeError("Failed to import native DMXHostEngine") from exc
                 stages = tuple(db_config.stages)
-                if len(stages) != 2:
-                    raise ValueError("db_config.stages must contain exactly 2 StageConfig objects")
+                if len(stages) != 1:
+                    raise ValueError("db_config.stages must contain exactly 1 StageConfig object (clickhouse_insert)")
 
                 try:
-                    self._host_engine = DMXHostEngine(stages)  # type: ignore[call-arg]
+                    self._host_engine = DMXHostEngine(stages[0])  # type: ignore[call-arg]
                 except Exception as exc:
                     raise RuntimeError("Failed to construct DMXHostEngine") from exc
             if self._host_engine is not None:
@@ -167,6 +171,167 @@ class MonitoringEngine:
         self._stats_endstep_ms_total = 0.0
         self._stats_endstep_calls = 0
         self._stats_endstep_ms_max = 0.0
+
+    # ------------------------------------------------------------------
+    # Ring transport API
+
+    def enable_ring_transport(self, ring_config: Any) -> None:
+        """Switch to ring-based D2H transport.
+
+        Creates a RingEngine with the C++ host engine as the submit target so
+        tensor reconstruction, slicing, and DB submission all happen in C++
+        without the GIL.
+
+        Args:
+            ring_config: A _native_engine.RingConfig instance.
+        """
+        from . import ring_transport as _rt
+        from . import _native_engine  # type: ignore[attr-defined]
+
+        # Pass the DMXHostEngine C++ object directly; RingEngine builds a
+        # SubmitFn that calls submit_direct without touching Python/GIL.
+        # Pass None for null/benchmark mode (no DB writes).
+        host_cpp = None
+        if self._host_engine is not None and isinstance(
+            self._host_engine, _native_engine.DMXHostEngine
+        ):
+            host_cpp = self._host_engine
+
+        ring_engine = _native_engine.RingEngine(ring_config, host_cpp)
+
+        ring_engine.init()
+        ring_engine.start()
+
+        transport = _rt.RingTransport(ring_engine)
+        self._ring_engine = ring_engine
+        self._ring_transport = transport
+        self._using_ring_transport = True
+        _rt.activate(transport)
+
+    def _prepare_ring_step(self, input_ids: Any, attention_mask: Any, past_key_values: Any) -> None:
+        """Precompute per-step batch context and set it on the ring transport.
+
+        Called before the forward pass so ring hooks (firing during forward)
+        can push correctly-keyed FIFO entries.
+        """
+        if not self._using_ring_transport or self._ring_transport is None:
+            return
+        if not self._capture_enabled:
+            self._ring_transport.set_step_context(
+                model_id=self._model_id or "",
+                shard_rank=0,
+                req_ids=[],
+                token_ranges=[],
+                capture_enabled=False,
+            )
+            return
+        if self._model_id is None:
+            return
+        if input_ids is None or not hasattr(input_ids, "shape"):
+            return
+        try:
+            input_shape = tuple(input_ids.shape)
+        except Exception:
+            return
+        if not input_shape:
+            return
+        try:
+            batch_size = int(input_shape[0])
+        except Exception:
+            return
+        if batch_size <= 0:
+            return
+
+        is_prefill = past_key_values is None
+        try:
+            if hasattr(input_ids, "dim") and int(input_ids.dim()) >= 2:
+                if int(input_ids.shape[1]) > 1:
+                    is_prefill = True
+        except Exception:
+            pass
+
+        current_ids = self._active_batch_request_ids
+        need_reset = is_prefill or current_ids is None or len(current_ids) != batch_size
+        if need_reset:
+            gid = int(self._auto_batch_group_id)
+            self._auto_batch_group_id += 1
+            self._active_batch_request_ids = [f"{gid}:{i}" for i in range(batch_size)]
+            self._active_batch_start_idx_per_request = [0] * batch_size
+            self._active_batch_finished_per_request = [False] * batch_size
+
+        req_ids = self._active_batch_request_ids
+        starts = self._active_batch_start_idx_per_request
+        finished = self._active_batch_finished_per_request
+        if req_ids is None or starts is None or finished is None:
+            return
+
+        token_ranges: List[Tuple[int, int]] = []
+        if is_prefill:
+            if attention_mask is None or not hasattr(attention_mask, "dim"):
+                return
+            if int(attention_mask.dim()) != 2:
+                return
+            try:
+                lengths = (
+                    attention_mask.sum(dim=1).tolist()
+                    if not self._no_strip
+                    else [attention_mask.shape[1]] * attention_mask.shape[0]
+                )
+            except Exception:
+                return
+            if len(lengths) != batch_size:
+                return
+            for i in range(batch_size):
+                start_i = int(starts[i])
+                delta_i = int(lengths[i])
+                if delta_i < 0:
+                    delta_i = 0
+                end_i = start_i + delta_i
+                token_ranges.append((start_i, end_i))
+                starts[i] = end_i
+        else:
+            eos_or_pad_ids: set[int] = set()
+            eos_token_id = getattr(self.config, "eos_token_id", None) if self.config is not None else None
+            pad_token_id = getattr(self.config, "pad_token_id", None) if self.config is not None else None
+            if eos_token_id is not None:
+                if isinstance(eos_token_id, (list, tuple, set)):
+                    eos_or_pad_ids.update(int(v) for v in eos_token_id)
+                else:
+                    eos_or_pad_ids.add(int(eos_token_id))
+            if pad_token_id is not None:
+                eos_or_pad_ids.add(int(pad_token_id))
+            last_ids = None
+            if eos_or_pad_ids:
+                try:
+                    last_ids = input_ids[:, -1]
+                except Exception:
+                    last_ids = None
+
+            for i in range(batch_size):
+                start_i = int(starts[i])
+                is_finished = bool(finished[i])
+                if (not is_finished) and (last_ids is not None):
+                    try:
+                        if int(last_ids[i]) in eos_or_pad_ids:
+                            is_finished = True
+                    except Exception:
+                        pass
+                if is_finished:
+                    finished[i] = True
+                if is_finished and not self._no_strip:
+                    token_ranges.append((start_i, start_i))
+                else:
+                    end_i = start_i + 1
+                    token_ranges.append((start_i, end_i))
+                    starts[i] = end_i
+
+        self._ring_transport.set_step_context(
+            model_id=str(self._model_id),
+            shard_rank=0,
+            req_ids=list(req_ids),
+            token_ranges=token_ranges,
+            capture_enabled=True,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -357,6 +522,9 @@ class MonitoringEngine:
         attention_mask: Any,
         past_key_values: Any,
     ) -> None:
+        # Ring transport handles DB submission via drain callback; skip here.
+        if self._using_ring_transport:
+            return
         if not self._host_engine_enabled:
             return
         if self._model_id is None:
@@ -492,6 +660,8 @@ class MonitoringEngine:
         )
 
     def _submit_pending_db_step(self) -> None:
+        if self._using_ring_transport:
+            return
         if not self._host_engine_enabled or self._host_engine is None:
             return
 
@@ -698,6 +868,22 @@ class MonitoringEngine:
                     print("[Hook/Stats]", hook_stats)
             except Exception:
                 pass
+
+        if self._using_ring_transport:
+            try:
+                ring_engine = getattr(self, "_ring_engine", None)
+                if ring_engine is not None:
+                    ring_engine.stop()
+            except Exception:
+                pass
+            try:
+                from . import ring_transport as _rt
+                _rt.deactivate()
+            except Exception:
+                pass
+            self._ring_transport = None
+            self._ring_engine = None
+            self._using_ring_transport = False
 
         if self._host_engine is not None:
             try:

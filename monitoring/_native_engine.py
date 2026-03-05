@@ -26,6 +26,8 @@ _NATIVE_EXPORTS = (
     "OnFullPolicy",
     "OnClosedPolicy",
     "consume_backend_futures_cpp",
+    "RingConfig",
+    "RingEngine",
 )
 
 

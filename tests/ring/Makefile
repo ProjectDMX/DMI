@@ -14,9 +14,13 @@ NVCC_FLAGS := \
     -lineinfo \
     $(INCLUDES)
 
-TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer
+PRODUCER_CU  := ../../monitoring/csrc/ring/producer.cu
+DRAIN_SRCS   := ../../monitoring/csrc/ring/drain_thread.cpp \
+                ../../monitoring/csrc/ring/chunk_assembler.cpp
 
-.PHONY: all test_rings test_producer run clean
+TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer $(BUILD)/test_ring_engine
+
+.PHONY: all test_rings test_producer test_ring_engine run clean
 
 all: $(TARGETS)
 
@@ -26,8 +30,11 @@ $(BUILD):
 $(BUILD)/test_rings: test_rings.cu | $(BUILD)
 	$(NVCC) $(NVCC_FLAGS) $< -o $@
 
-$(BUILD)/test_producer: test_producer.cu | $(BUILD)
-	$(NVCC) $(NVCC_FLAGS) $< -o $@
+$(BUILD)/test_producer: test_producer.cu $(PRODUCER_CU) | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) $^ -o $@
+
+$(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRCS) | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -lpthread $^ -o $@
 
 test_rings: $(BUILD)/test_rings
 	$(BUILD)/test_rings
@@ -35,9 +42,13 @@ test_rings: $(BUILD)/test_rings
 test_producer: $(BUILD)/test_producer
 	$(BUILD)/test_producer
 
+test_ring_engine: $(BUILD)/test_ring_engine
+	$(BUILD)/test_ring_engine
+
 run: all
 	$(BUILD)/test_rings
 	$(BUILD)/test_producer
+	$(BUILD)/test_ring_engine
 
 clean:
 	rm -rf $(BUILD)

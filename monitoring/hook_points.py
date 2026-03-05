@@ -236,6 +236,16 @@ class HookPoint(nn.Module):
         self.ctx = {}
 
     def forward(self, x: Tensor) -> Tensor:
+        # Ring transport capture: if active and tensor is on GPU, offload async.
+        # This runs for every HookPoint in every model without model-file changes.
+        if self.name is not None:
+            try:
+                from . import ring_transport as _rt
+                transport = _rt._active_transport
+                if transport is not None:
+                    transport.capture_tensor(x, self.name)
+            except Exception:
+                pass
         return x
 
     def layer(self):
@@ -673,6 +683,19 @@ class HookedRootModule(nn.Module):
         pos_slice = Slice.unwrap(pos_slice)
         call_forward = forward_fn if forward_fn is not None else self
 
+        # Ring transport: precompute batch context before forward pass.
+        try:
+            engine = self.monitoring_engine
+            if engine is not None and getattr(engine, "_using_ring_transport", False):
+                input_ids = model_kwargs.get("input_ids") if model_kwargs else None
+                if input_ids is None and model_args:
+                    input_ids = model_args[0]
+                attention_mask = model_kwargs.get("attention_mask") if model_kwargs else None
+                past_key_values = model_kwargs.get("past_key_values") if model_kwargs else None
+                engine._prepare_ring_step(input_ids, attention_mask, past_key_values)
+        except Exception:
+            pass
+
         # Build hooks list and cache dict (CPU work)
         with _nvtx_range("TL::GetCachingHooks"):
             cache_dict, fwd, bwd = self.get_caching_hooks(
@@ -722,6 +745,9 @@ class HookedRootModule(nn.Module):
                     return model_out, cache_dict
                 native_backend = getattr(engine, "_native_backend", None)
                 native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
+                # In ring mode, ring transport handles all captures; skip native backend work.
+                if getattr(engine, "_using_ring_transport", False):
+                    native_using = False
                 native_callback_active = native_using
                 if native_callback_active and native_backend is not None:
                     # Bulk fill Python cache with BackendFutures for this step
@@ -762,6 +788,9 @@ class HookedRootModule(nn.Module):
 
         native_backend = getattr(engine, "_native_backend", None)
         native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
+        # In ring mode, ring transport handles all captures; skip native backend work.
+        if getattr(engine, "_using_ring_transport", False):
+            native_using = False
         native_callback_active = native_using
         if not native_callback_active or native_backend is None:
             return
@@ -940,11 +969,15 @@ class HookedRootModule(nn.Module):
         if engine is not None:
             native_backend = getattr(engine, "_native_backend", None)
             native_using = bool(getattr(engine, "_using_native_backend", False) and native_backend is not None)
+            # In ring mode, ring transport handles all captures; skip native backend work.
+            if getattr(engine, "_using_ring_transport", False):
+                native_using = False
         native_callback_active = native_using
         if engine is not None and not native_callback_active:
-            raise RuntimeError(
-                "MonitoringEngine native callback backend is required; Python fallback path was removed"
-            )
+            if not getattr(engine, "_using_ring_transport", False):
+                raise RuntimeError(
+                    "MonitoringEngine native callback backend is required; Python fallback path was removed"
+                )
 
         def save_hook(tensor: Tensor, hook: HookPoint, is_backward: bool = False):
             # for attention heads the pos dimension is the third from last
@@ -1050,6 +1083,10 @@ class HookedRootModule(nn.Module):
                         self._native_enabled_hooks_key = enabled_key
                     except Exception:
                         pass
+
+        if engine is not None and getattr(engine, "_using_ring_transport", False):
+            # Ring transport captures via HookPoint.forward(); no per-step hooks needed.
+            return cache, fwd_hooks, bwd_hooks
 
         if native_callback_active and native_backend is not None:
             # Permanent registration path: register global callback once for all hook points

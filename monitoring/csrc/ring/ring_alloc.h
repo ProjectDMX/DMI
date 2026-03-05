@@ -1,8 +1,8 @@
 // ring/ring_alloc.h — CPU-side RAII owner of all ring device memory.
 //
 // AllocatedRing allocates and initialises all buffers for one ring pair:
-//   - task entry array          (cudaMalloc — device-only)
-//   - payload byte buffer       (cudaMalloc — device-only)
+//   - task entry array          (cudaMallocManaged — GPU writes, CPU drain reads)
+//   - payload byte buffer       (cudaMalloc — device-only, D2H via copy engine)
 //   - head/tail counters        (cudaMallocManaged — GPU writes, CPU reads)
 //   - consumer_heartbeat        (cudaMallocManaged — CPU writes, GPU reads)
 //
@@ -58,9 +58,9 @@ private:
     }
 
     void allocate() {
-        chk(cudaMalloc(&state_.task_entries,
-                       cfg_.task_ring_entries * sizeof(TaskEntry)),
-            "cudaMalloc task_entries");
+        chk(cudaMallocManaged(&state_.task_entries,
+                              cfg_.task_ring_entries * sizeof(TaskEntry)),
+            "cudaMallocManaged task_entries");
         chk(cudaMalloc(&state_.payload_buf, cfg_.payload_ring_bytes),
             "cudaMalloc payload_buf");
 

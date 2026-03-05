@@ -173,6 +173,7 @@ def test_e2e_correctness_hf(subtests) -> None:
         )
         from monitoring._native_engine import (  # type: ignore
             ClickHouseClientConfig,
+            RingConfig,
             StageConfig,
         )
         from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
@@ -273,9 +274,15 @@ def test_e2e_correctness_hf(subtests) -> None:
     db_cfg_native.drop_existing_database = True
     db_cfg_native.index_granularity = 8192
 
-    stage_one = StageConfig.process_future(parallelism=1, name="process_future")
-    stage_two = StageConfig.clickhouse_insert(db_cfg_native, parallelism=10, name="clickhouse_insert")
-    host_cfg = HostEngineConfig(stages=[stage_one, stage_two])
+    insert_stage = StageConfig.clickhouse_insert(db_cfg_native, parallelism=10, name="clickhouse_insert")
+    host_cfg = HostEngineConfig(stages=[insert_stage])
+
+    # Ring engine config (ring transport replaces NativeMonitoringEngine D2H)
+    ring_cfg = RingConfig()
+    ring_cfg.task_ring_entries = 1024
+    ring_cfg.payload_ring_bytes = 4 * 1024 * 1024 * 1024  # 4 GB
+    ring_cfg.chunk_bytes = 4 * 1024 * 1024                # 4 MB chunks
+    ring_cfg.pinned_pool_bytes = 4 * 1024 * 1024 * 1024  # 4 GB pinned ring
 
     # -----------------------------------------------------------------------
     # Monitored run
@@ -285,6 +292,7 @@ def test_e2e_correctness_hf(subtests) -> None:
     engine = MonitoringEngine(
         async_enabled=True, config=mon_cfg, model_id=unique_run_model_id, db_config=host_cfg
     )
+    engine.enable_ring_transport(ring_cfg)
 
     model_cls = HookedQwen3ForCausalLM if "qwen3" in hf_model_id.lower() else HookedGPT2LMHeadModel
     mon_model = model_cls.from_pretrained(hf_model_id, attn_implementation="eager", torch_dtype=torch.float16)
@@ -420,6 +428,8 @@ def test_e2e_correctness_hf(subtests) -> None:
     # Optional modules for GPT2-like reconstructions
     wte = getattr(getattr(hf_model, "transformer", None), "wte", None)
     wpe = getattr(getattr(hf_model, "transformer", None), "wpe", None)
+    # Qwen3-like: embed_tokens on model sub-module (no separate pos embed)
+    embed_tokens = getattr(getattr(hf_model, "model", None), "embed_tokens", None)
 
     # Compute num_layers once (used in per-layer comparison loop below)
     num_layers = get_num_layers_from_config(hf_model)
@@ -596,7 +606,7 @@ def test_e2e_correctness_hf(subtests) -> None:
                     c = flat_idx % vocab_db
                     pytest.fail(f"final_logits mismatch (max_abs={max_abs}) at row={r} vocab_idx={c}")
 
-        # --- hook_embed / hook_pos_embed (GPT2-like) ---
+        # --- hook_embed / hook_pos_embed (GPT2-like: both wte and wpe) ---
         if (
             wte is not None
             and wpe is not None
@@ -630,22 +640,46 @@ def test_e2e_correctness_hf(subtests) -> None:
                     f"hook_pos_embed mismatch (max_abs={float((db_t.float() - pos_emb.float()).abs().max().item())})"
                 )
 
-        # --- hook_final_ln (GPT2-like) ---
+        # --- hook_embed only (Qwen3-like: RoPE, no separate pos embed) ---
+        elif (
+            embed_tokens is not None
+            and wpe is None
+            and (-1, "hook_embed") in hooks_map
+        ):
+            emb = embed_tokens(seq.to(device)).detach().cpu()  # [T, d]
+            chunks = sorted(hooks_map[(-1, "hook_embed")], key=lambda x: (x[0], x[1]))
+            _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} hook_embed")
+            db_t = merge_segments([t for _, _, t in chunks], "hook_embed")
+            with subtests.test(msg=f"{req_id}/hook_embed"):
+                assert tuple(db_t.shape) == tuple(emb.shape), (
+                    f"hook_embed shape mismatch db={tuple(db_t.shape)} hf={tuple(emb.shape)}"
+                )
+                assert bitwise_equal(db_t, emb), (
+                    f"hook_embed mismatch (max_abs={float((db_t.float() - emb.float()).abs().max().item())})"
+                )
+
+        # --- hook_final_ln ---
         # TODO: hook_final_ln comparison skipped.
 
         # --- per-layer: attention pattern + resid_pre/post ---
+        # Support both GPT-2 naming (blocks.attn.hook_pattern, blocks.hook_resid_*)
+        # and Qwen3 naming (layers.self_attn.hook_pattern, layers.hook_resid_*)
+        _ATTN_PATTERN_KEYS = ("blocks.attn.hook_pattern", "layers.self_attn.hook_pattern")
+        _RESID_PRE_KEYS = ("blocks.hook_resid_pre", "layers.hook_resid_pre")
+        _RESID_POST_KEYS = ("blocks.hook_resid_post", "layers.hook_resid_post")
+
         n_layers = len(ref.attn_pattern) if ref.attn_pattern else 0
         assert n_layers == num_layers, (
             f"{req_id}: attn_pattern layer count mismatch: rollout={n_layers} config={num_layers}"
         )
 
         for layer_no in range(n_layers):
-            key = (layer_no, "blocks.attn.hook_pattern")
-            if key in hooks_map:
+            key = next(((layer_no, k) for k in _ATTN_PATTERN_KEYS if (layer_no, k) in hooks_map), None)
+            if key is not None:
                 pat = ref.attn_pattern[layer_no]  # [H, T, T]
                 chunks = sorted(hooks_map[key], key=lambda x: (x[0], x[1]))
                 _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} pattern")
-                db_t = merge_segments([t for _, _, t in chunks], "blocks.attn.hook_pattern")
+                db_t = merge_segments([t for _, _, t in chunks], key[1])
                 if db_t.ndim == 4 and db_t.shape[0] == 1:
                     db_t = db_t.squeeze(0)
                 with subtests.test(msg=f"{req_id}/layer{layer_no}/attn_pattern"):
@@ -657,12 +691,12 @@ def test_e2e_correctness_hf(subtests) -> None:
                         f"(max_abs={float((db_t.float() - pat.float()).abs().max().item())})"
                     )
 
-            key = (layer_no, "blocks.hook_resid_pre")
-            if key in hooks_map and ref.hidden_states and layer_no < len(ref.hidden_states):
+            key = next(((layer_no, k) for k in _RESID_PRE_KEYS if (layer_no, k) in hooks_map), None)
+            if key is not None and ref.hidden_states and layer_no < len(ref.hidden_states):
                 hs = ref.hidden_states[layer_no]  # [T, d]
                 chunks = sorted(hooks_map[key], key=lambda x: (x[0], x[1]))
                 _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} resid_pre")
-                db_t = merge_segments([t for _, _, t in chunks], "blocks.hook_resid_pre")
+                db_t = merge_segments([t for _, _, t in chunks], key[1])
                 with subtests.test(msg=f"{req_id}/layer{layer_no}/resid_pre"):
                     assert tuple(db_t.shape) == tuple(hs.shape), (
                         f"resid_pre shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
@@ -672,15 +706,15 @@ def test_e2e_correctness_hf(subtests) -> None:
                         f"(max_abs={float((db_t.float() - hs.float()).abs().max().item())})"
                     )
 
-            key = (layer_no, "blocks.hook_resid_post")
+            key = next(((layer_no, k) for k in _RESID_POST_KEYS if (layer_no, k) in hooks_map), None)
             # len(ref.hidden_states) == n_layers + 1
-            # here we skip the last one, because that is not a full layer, just after 
+            # here we skip the last one, because that is not a full layer, just after
             # the final_ln
-            if key in hooks_map and ref.hidden_states and (layer_no + 1) < n_layers:
+            if key is not None and ref.hidden_states and (layer_no + 1) < n_layers:
                 hs = ref.hidden_states[layer_no + 1]  # [T, d]
                 chunks = sorted(hooks_map[key], key=lambda x: (x[0], x[1]))
                 _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} resid_post")
-                db_t = merge_segments([t for _, _, t in chunks], "blocks.hook_resid_post")
+                db_t = merge_segments([t for _, _, t in chunks], key[1])
                 with subtests.test(msg=f"{req_id}/layer{layer_no}/resid_post"):
                     assert tuple(db_t.shape) == tuple(hs.shape), (
                         f"resid_post shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"

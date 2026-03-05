@@ -17,7 +17,9 @@ SRCS := csrc/native_engine.cpp \
         csrc/bindings.cpp \
         csrc/dmx_host_utils.cpp \
         csrc/future_process.cpp \
-        csrc/clickhouse_client.cpp
+        csrc/clickhouse_client.cpp \
+        csrc/ring/drain_thread.cpp \
+        csrc/ring/chunk_assembler.cpp
 HEADERS := csrc/native_engine.h csrc/native_engine_internal.h \
 csrc/pipelined_engine.hpp csrc/dmx_host_utils.h csrc/future_process.h \
            csrc/clickhouse_client.h csrc/dmx_host_engine.h
@@ -107,9 +109,13 @@ NVCCFLAGS := \
     -Xcompiler -fPIC \
     $(ABI_FLAG) \
     $(CUDA_INCLUDE_FLAGS) \
+    $(TORCH_INCLUDE_FLAGS) \
+    $(PYTHON_INCLUDE_FLAGS) \
     -Icsrc
 
-RING_SRCS := csrc/ring/producer.cu
+RING_SRCS := csrc/ring/producer.cu \
+             csrc/ring/ring_engine.cu \
+             csrc/ring/ring_engine_py.cu
 RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
 
 OBJS += $(RING_OBJS)
@@ -122,6 +128,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ring/%.o: csrc/ring/%.cu | $(BUILD_DIR)

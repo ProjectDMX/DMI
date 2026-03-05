@@ -61,9 +61,8 @@ struct RingConfig {
     // Default: ~400 ms at 2.5 GHz.
     uint64_t no_progress_timeout_cycles = 1'000'000'000ULL;
 
-    // Pinned host buffer pool sizing.
-    uint64_t pinned_pool_blocks = 8;
-    uint64_t pinned_pool_bytes  = 256ULL * 1024 * 1024;  // 256 MiB total pool
+    // Pinned host ring buffer size (shared across all in-flight chunks).
+    uint64_t pinned_pool_bytes  = 256ULL * 1024 * 1024;  // 256 MiB
 
     // What to emit when a logical task is dropped (see DropReporting).
     DropReporting drop_reporting = DropReporting::DROP_TASK;

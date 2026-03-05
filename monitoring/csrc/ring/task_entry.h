@@ -4,6 +4,7 @@
 // host-only and device-compiled translation units.
 
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace ring {

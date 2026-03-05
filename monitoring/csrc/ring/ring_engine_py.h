@@ -1,0 +1,87 @@
+// ring/ring_engine_py.h — Plain C++ interface for RingEngine, usable from g++.
+//
+// All CUDA/ATen details are hidden behind a pimpl so bindings.cpp (compiled
+// with g++) can include this header without needing CUDA or nvcc compilation.
+//
+// Implementation is in ring_engine_py.cu (compiled with nvcc).
+
+#pragma once
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+
+#include "ring/tensor_meta.h"   // TensorMeta, TensorMetaFifo
+
+// Forward-declare at::Tensor so SubmitFn can use it without including ATen here.
+namespace at { class Tensor; }
+
+namespace ring_py {
+
+// Plain C++ mirror of ring::RingConfig — no CUDA types.
+struct RingConfig {
+    uint32_t task_ring_entries          = 1024;
+    uint64_t payload_ring_bytes         = 256ULL * 1024 * 1024;
+    uint64_t chunk_bytes                = 64ULL * 1024 * 1024;
+    uint64_t pinned_pool_bytes          = 256ULL * 1024 * 1024;
+    // 0 = INFINITE (spin, backpressure), 1 = TIMEOUT_DROP
+    int      wait_policy                = 0;
+    uint64_t no_progress_timeout_cycles = 1'000'000'000ULL;
+    // 0 = COUNTER_ONLY, 1 = DROP_TASK (emit a drop entry to the callback)
+    int      drop_reporting             = 1;
+};
+
+// Called by the callback thread for each per-request tensor slice.
+// Runs without the GIL — all arguments are C++ types.
+using SubmitFn = std::function<void(
+    const std::string& model_id,
+    int32_t            shard_rank,
+    const std::string& req_id,
+    const std::string& act_name,
+    int32_t            layer_no,
+    int32_t            start_token,
+    int32_t            end_token,
+    at::Tensor         slice)>;
+
+// Opaque RAII engine.  All CUDA/ATen details hidden behind the pimpl.
+class RingEnginePy {
+public:
+    // submit_fn: called for each per-request slice after assembly.
+    //   Pass an empty SubmitFn{} for null/benchmark mode (no DB writes).
+    explicit RingEnginePy(RingConfig cfg, SubmitFn submit_fn);
+    ~RingEnginePy();
+
+    RingEnginePy(const RingEnginePy&)            = delete;
+    RingEnginePy& operator=(const RingEnginePy&) = delete;
+
+    // Initialise GPU buffers.  Call once before start().
+    // stream_handle: raw cudaStream_t cast to uint64_t (0 = default stream).
+    void init(uint64_t stream_handle = 0);
+
+    void start();
+    void stop();   // blocks until drain thread has flushed and exited
+
+    // Push metadata for the next tensor about to be hooked.
+    // Must be called before hook() so the FIFO pop order matches arrival order.
+    void push_meta(TensorMeta meta);
+
+    // Undo the last push_meta (called if hook() throws after push_meta).
+    void pop_last_meta();
+
+    // Launch the producer kernel + hostfunc for one tensor.
+    //   d_ptr          — CUDA device pointer cast to uint64_t
+    //   nbytes         — tensor byte size
+    //   logical_task_id — opaque user ID (unused by current pipeline; pass 0)
+    //   hook_type/id   — user-defined classification fields
+    //   stream_handle  — raw cudaStream_t cast to uint64_t
+    void hook(uint64_t d_ptr, uint64_t nbytes,
+              uint64_t logical_task_id,
+              uint32_t hook_type, uint32_t hook_id,
+              uint64_t stream_handle);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace ring_py

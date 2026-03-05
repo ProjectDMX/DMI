@@ -4,7 +4,9 @@
 #include "clickhouse_client.h"
 // dmx_host pipeline
 #include "dmx_host_engine.h"
-#include "future_process.h"
+// ring offload engine
+#include "ring/ring_engine_py.h"
+#include <ATen/cuda/CUDAContext.h>
 
 namespace monitoring {
 
@@ -261,25 +263,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "thread_name_prefix",
           [](const StageConfig& s) { return s.thread_name_prefix; },
           [](StageConfig& s, std::optional<std::string> v) { s.thread_name_prefix = std::move(v); })
-      // Stage 1: ProcessFuture
-      .def_static(
-          "process_future",
-          [](int parallelism, std::string name, bool debug) {
-            StageConfig cfg;
-            cfg.name = std::move(name);
-            cfg.parallelism = parallelism;
-            cfg.process_fn = [](std::vector<dmx_host::dmx_host_queue_item> batch, QueueT* next_q) {
-              return dmx_host::ProcessFutureStage::ProcessFn<QueueT>(std::move(batch), next_q);
-            };
-            cfg.thread_init_config = debug;
-            cfg.thread_init = &dmx_host::ProcessFutureStage::ThreadInitAny;
-            cfg.thread_cleanup = &dmx_host::ProcessFutureStage::ThreadCleanupAny;
-            return cfg;
-          },
-          py::arg("parallelism") = 1,
-          py::arg("name") = "process_future",
-          py::arg("debug") = false)
-      // Stage 2: ClickHouse insert (this is where thread_init_config matters)
+      // ClickHouse insert stage (the only stage in DMXHostEngine)
       .def_static(
           "clickhouse_insert",
           [](const dmx_host::ClickHouseClientConfig& ch_cfg, int parallelism, std::string name) {
@@ -300,7 +284,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("name") = "clickhouse_insert");
 
   py::class_<DMXHostEngine, std::shared_ptr<DMXHostEngine>>(m, "DMXHostEngine")
-      .def(py::init<std::array<StageConfig, 2>>(), py::arg("stages"))
+      .def(py::init<StageConfig>(), py::arg("insert_stage"))
       .def("start", &DMXHostEngine::start)
       .def("stop",
            [](DMXHostEngine& self, bool graceful, std::optional<double> timeout_s) {
@@ -323,9 +307,118 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("failures", &DMXHostEngine::failures)
       .def("raise_if_failed", &DMXHostEngine::raise_if_failed)
-      .def("submit", &DMXHostEngine::submit,
-          py::arg("model_id"), py::arg("shard_rank"),
-          py::arg("request_ids"), py::arg("token_range_per_request"),
-          py::arg("cache_dicts"),
-          py::call_guard<py::gil_scoped_release>());
+      // Submit a pre-formatted ClickHouseRow directly to the insert stage.
+      // Called from the ring transport drain callback after format processing.
+      .def("submit_direct",
+           [](DMXHostEngine& self,
+              const std::string& model_id, int32_t shard_rank,
+              const std::string& req_id, const std::string& act_name,
+              int32_t layer_no, int32_t start_token, int32_t end_token,
+              at::Tensor tensor) {
+             at::Tensor t = tensor.is_contiguous() ? tensor : tensor.contiguous();
+             uint64_t nbytes = static_cast<uint64_t>(t.nbytes());
+             dmx_host::ClickHouseRow row;
+             row.push_back(model_id);
+             row.push_back(req_id);
+             row.push_back(act_name);
+             row.push_back(layer_no);
+             row.push_back(shard_rank);
+             row.push_back(start_token);
+             row.push_back(end_token);
+             row.push_back(std::move(t));
+             self.submit_direct(std::move(row), nbytes);
+           },
+           py::arg("model_id"), py::arg("shard_rank"),
+           py::arg("req_id"), py::arg("act_name"),
+           py::arg("layer_no"), py::arg("start_token"), py::arg("end_token"),
+           py::arg("tensor"),
+           py::call_guard<py::gil_scoped_release>());
+
+  // -------------------------------------------------------------------------
+  // Ring offload engine
+  // -------------------------------------------------------------------------
+  py::class_<ring_py::RingConfig>(m, "RingConfig")
+      .def(py::init<>())
+      .def_readwrite("task_ring_entries",         &ring_py::RingConfig::task_ring_entries)
+      .def_readwrite("payload_ring_bytes",        &ring_py::RingConfig::payload_ring_bytes)
+      .def_readwrite("chunk_bytes",               &ring_py::RingConfig::chunk_bytes)
+      .def_readwrite("pinned_pool_bytes",         &ring_py::RingConfig::pinned_pool_bytes)
+      .def_readwrite("wait_policy",               &ring_py::RingConfig::wait_policy)
+      .def_readwrite("no_progress_timeout_cycles",&ring_py::RingConfig::no_progress_timeout_cycles)
+      .def_readwrite("drop_reporting",            &ring_py::RingConfig::drop_reporting);
+
+  py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
+      .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
+             // Build a C++ SubmitFn from the DMXHostEngine shared_ptr.
+             // The callback runs from the C++ callback thread without the GIL.
+             ring_py::SubmitFn submit_fn;
+             if (!host_engine_obj.is_none()) {
+                 auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
+                 submit_fn = [host](const std::string& model_id, int32_t shard_rank,
+                                    const std::string& req_id, const std::string& act_name,
+                                    int32_t layer_no, int32_t start_token, int32_t end_token,
+                                    at::Tensor slice) {
+                     dmx_host::ClickHouseRow row;
+                     row.emplace_back(model_id);
+                     row.emplace_back(req_id);
+                     row.emplace_back(act_name);
+                     row.emplace_back(layer_no);
+                     row.emplace_back(shard_rank);
+                     row.emplace_back(start_token);
+                     row.emplace_back(end_token);
+                     uint64_t nbytes = static_cast<uint64_t>(slice.nbytes());
+                     row.emplace_back(std::move(slice));
+                     host->submit_direct(std::move(row), nbytes);
+                 };
+             }
+             return std::make_shared<ring_py::RingEnginePy>(
+                 std::move(cfg), std::move(submit_fn));
+           }),
+           py::arg("config"), py::arg("host_engine") = py::none())
+      .def("init",  &ring_py::RingEnginePy::init,
+           py::arg("stream_handle") = uint64_t{0})
+      .def("start", &ring_py::RingEnginePy::start)
+      .def("stop",  &ring_py::RingEnginePy::stop,
+           py::call_guard<py::gil_scoped_release>())
+      // Low-level hook: d_ptr and stream_handle are raw CUDA pointers as ints.
+      .def("hook",
+           &ring_py::RingEnginePy::hook,
+           py::arg("d_ptr"), py::arg("nbytes"),
+           py::arg("logical_task_id"),
+           py::arg("hook_type") = uint32_t{0},
+           py::arg("hook_id")   = uint32_t{0},
+           py::arg("stream_handle") = uint64_t{0},
+           py::call_guard<py::gil_scoped_release>())
+      // Push metadata for the next tensor before calling hook().
+      .def("push_meta",
+           [](ring_py::RingEnginePy& self,
+              const std::string& hook_name,
+              const std::string& model_id,
+              int32_t shard_rank,
+              py::list req_ids_py,
+              py::list token_ranges_py,
+              py::list shape_py,
+              py::object dtype_obj) {
+               ring_py::TensorMeta meta;
+               meta.hook_name  = hook_name;
+               meta.model_id   = model_id;
+               meta.shard_rank = shard_rank;
+               meta.dtype      = static_cast<int>(dtype_obj.cast<at::ScalarType>());
+               for (auto h : shape_py)
+                   meta.shape.push_back(py::cast<int64_t>(h));
+               for (size_t i = 0; i < static_cast<size_t>(py::len(req_ids_py)); ++i) {
+                   ring_py::RequestMeta rm;
+                   rm.req_id      = py::cast<std::string>(req_ids_py[i]);
+                   py::tuple tr   = token_ranges_py[i].cast<py::tuple>();
+                   rm.start_token = py::cast<int32_t>(tr[0]);
+                   rm.end_token   = py::cast<int32_t>(tr[1]);
+                   meta.requests.push_back(std::move(rm));
+               }
+               self.push_meta(std::move(meta));
+           },
+           py::arg("hook_name"), py::arg("model_id"), py::arg("shard_rank"),
+           py::arg("req_ids"), py::arg("token_ranges"),
+           py::arg("shape"), py::arg("dtype"))
+      .def("pop_last_meta", &ring_py::RingEnginePy::pop_last_meta,
+           py::call_guard<py::gil_scoped_release>());
 }

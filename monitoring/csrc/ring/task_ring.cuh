@@ -179,4 +179,40 @@ __device__ inline void task_release(
 
 #endif  // __CUDACC__
 
+// ---------------------------------------------------------------------------
+// CPU-side consumer helpers — usable from host C++ compiled with g++ or with
+// nvcc's host-compilation phase.  Use GCC/Clang __atomic builtins for
+// acquire/release ordering on managed memory written by the GPU producer.
+// ---------------------------------------------------------------------------
+
+// task_cpu_ready — non-blocking: returns true if slot `tail` has been
+// published by the GPU producer.  An acquire load ensures that, if true,
+// all subsequent CPU reads of the entry's data fields are ordered after
+// the ready_seq observation.
+inline bool task_cpu_ready(
+    const TaskEntry* entries,
+    uint64_t         capacity,
+    uint64_t         tail)
+{
+    const uint64_t  idx = tail % capacity;
+    const uint64_t* rs  =
+        reinterpret_cast<const uint64_t*>(&entries[idx].ready_seq);
+    return __atomic_load_n(rs, __ATOMIC_ACQUIRE) == tail;
+}
+
+// task_release_cpu — reset slot `tail` to SENTINEL so the producer can
+// reuse the slot once task_tail advances past it.  A release store ensures
+// all prior CPU reads of the entry's data fields are ordered before the
+// sentinel write (i.e., the sentinel is not visible before the reads).
+inline void task_release_cpu(
+    TaskEntry* entries,
+    uint64_t   capacity,
+    uint64_t   tail)
+{
+    const uint64_t idx = tail % capacity;
+    uint64_t*      rs  =
+        reinterpret_cast<uint64_t*>(&entries[idx].ready_seq);
+    __atomic_store_n(rs, READY_SEQ_SENTINEL, __ATOMIC_RELEASE);
+}
+
 }  // namespace ring
