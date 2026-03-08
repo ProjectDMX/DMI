@@ -1,19 +1,24 @@
-"""Ring-transport benchmark (detailed).
+"""Ring-transport benchmark.
 
 Compares three modes:
   baseline  — plain HF generate, no monitoring
   ring_null — ring transport active (GPU→CPU transfer), null sink (no DB write)
   ring_db   — ring transport + ClickHouse ingestion
 
-Reports:
-  - Per-step forward-pass latency (prefill step 0, decode steps 1..N)
-  - Close breakdown: ring drain vs DB drain
-  - Data volume estimate (hooks * bytes/hook)
-  - Side-by-side summary across modes
+Per-step (prefill vs decode) timing is intentionally NOT reported here.
+Inserting a GPU sync barrier between every step breaks CUDA-graph pipelining
+and makes per-step numbers unreliable.  Instead, run dedicated prefill /
+decode benchmarks using the appropriate --prompt-len / --max-new-tokens flags:
+
+  Prefill:  --prompt-len N --max-new-tokens 1
+  Decode:   --prompt-len 1 --max-new-tokens N
+
+Each run reports total wall time (ms) and throughput (tok/s).
+For prefill, tok/s counts prompt tokens processed (batch * prompt_len).
+For decode,  tok/s counts new tokens generated  (batch * max_new_tokens).
 
 Usage:
-  python -m benchmark.bench_ring_transport --model qwen3 --modes baseline,ring_null,ring_db
-  python -m benchmark.bench_ring_transport --model gpt2  --modes baseline,ring_null
+  python -m benchmark.bench_ring_transport --model qwen3 --modes baseline,ring_null
 """
 
 from __future__ import annotations
@@ -29,45 +34,12 @@ import torch
 
 
 # ---------------------------------------------------------------------------
-# Step-level timing wrapper
-# ---------------------------------------------------------------------------
-
-class _StepTimer:
-    """Patches model.forward to record per-call GPU-synced wall times."""
-
-    def __init__(self, model) -> None:
-        self._model = model
-        self._orig  = model.forward
-        self.times_ms: List[float] = []
-        timer = self
-
-        def _timed(*args, **kwargs):
-            torch.cuda.synchronize()
-            t0  = time.perf_counter()
-            out = timer._orig(*args, **kwargs)
-            torch.cuda.synchronize()
-            timer.times_ms.append((time.perf_counter() - t0) * 1000.0)
-            return out
-
-        model.forward = _timed
-
-    def restore(self) -> None:
-        self._model.forward = self._orig
-
-    def reset(self) -> None:
-        self.times_ms.clear()
-
-
-# ---------------------------------------------------------------------------
 # Timed close: ring drain vs DB drain
 # ---------------------------------------------------------------------------
 
 def _timed_close(engine) -> Dict[str, float]:
-    """Stop ring engine, host engine, and remaining engine resources
-    separately, returning wall-time ms for each phase."""
     result = {"ring_ms": 0.0, "db_ms": 0.0, "cleanup_ms": 0.0}
 
-    # Phase 1: ring engine drain (GPU→CPU pipeline)
     ring_engine = getattr(engine, "_ring_engine", None)
     if ring_engine is not None:
         t0 = time.perf_counter()
@@ -77,7 +49,6 @@ def _timed_close(engine) -> Dict[str, float]:
             pass
         result["ring_ms"] = (time.perf_counter() - t0) * 1000.0
 
-    # Phase 2: DB pipeline drain (ClickHouse insert queue)
     host_engine = getattr(engine, "_host_engine", None)
     if host_engine is not None:
         t0 = time.perf_counter()
@@ -87,10 +58,9 @@ def _timed_close(engine) -> Dict[str, float]:
             pass
         result["db_ms"] = (time.perf_counter() - t0) * 1000.0
 
-    # Phase 3: remaining cleanup (native backend, deactivate ring transport)
     t0 = time.perf_counter()
     try:
-        engine.close()   # ring/host already stopped; this is fast cleanup
+        engine.close()
     except Exception:
         pass
     result["cleanup_ms"] = (time.perf_counter() - t0) * 1000.0
@@ -103,15 +73,14 @@ def _timed_close(engine) -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 
 class _NullHostEngine:
-    """Drop-all sink: satisfies the host-engine API but discards every tensor."""
-    def start(self)                         -> None:  pass
-    def stop(self, *a, **kw)                -> None:  pass
-    def join(self, *a, **kw)                -> bool:  return True
-    def close_input(self)                   -> None:  pass
-    def request_abort(self)                 -> None:  pass
-    def failures(self)                      -> list:  return []
-    def raise_if_failed(self)               -> None:  pass
-    def submit_direct(self, *a, **kw)       -> None:  pass
+    def start(self)                   -> None:  pass
+    def stop(self, *a, **kw)          -> None:  pass
+    def join(self, *a, **kw)          -> bool:  return True
+    def close_input(self)             -> None:  pass
+    def request_abort(self)           -> None:  pass
+    def failures(self)                -> list:  return []
+    def raise_if_failed(self)         -> None:  pass
+    def submit_direct(self, *a, **kw) -> None:  pass
 
 
 # ---------------------------------------------------------------------------
@@ -120,27 +89,24 @@ class _NullHostEngine:
 
 @dataclass
 class BenchConfig:
-    # Workload
     model: str = "gpt2"
     batch_size: int = 4
     prompt_len: int = 32
     max_new_tokens: int = 16
     warmup: int = 1
     iters: int = 3
-    modes: List[str] = field(default_factory=lambda: ["baseline", "ring_null", "ring_db"])
+    modes: List[str] = field(default_factory=lambda: ["baseline", "ring_null"])
+    cuda_graphs: bool = False
 
-    # Ring engine
     ring_task_entries: int = 65536
     ring_payload_mb: int = 4096
     ring_chunk_kb: int = 4096
     ring_pinned_mb: int = 4096
 
-    # ClickHouse stage
     ch_parallelism: int = 10
     ch_queue_max_items: int = 1024
     ch_queue_max_size_mb: int = 2048
 
-    # DB connection
     db_host: str = "localhost"
     db_port: int = 9000
     db_user: str = "default"
@@ -203,10 +169,10 @@ def _make_db_engine(cfg: BenchConfig, model_id: str):
 
     stage = StageConfig.clickhouse_insert(ch, parallelism=cfg.ch_parallelism, name="ch_insert")
     q = stage.input_queue
-    q.max_batch_items       = cfg.ch_queue_max_items
-    q.high_watermark_items  = cfg.ch_queue_max_items
-    q.max_batch_size        = cfg.ch_queue_max_size_mb * 1024 * 1024
-    q.high_watermark_size   = cfg.ch_queue_max_size_mb * 1024 * 1024
+    q.max_batch_items      = cfg.ch_queue_max_items
+    q.high_watermark_items = cfg.ch_queue_max_items
+    q.max_batch_size       = cfg.ch_queue_max_size_mb * 1024 * 1024
+    q.high_watermark_size  = cfg.ch_queue_max_size_mb * 1024 * 1024
 
     engine = MonitoringEngine(
         async_enabled=True, config=_make_monitoring_cfg(cfg),
@@ -229,21 +195,23 @@ def _make_inputs(tokenizer, cfg: BenchConfig, device: torch.device):
 
 
 # ---------------------------------------------------------------------------
-# Per-iteration runner
+# Per-iteration runner — returns total wall time only
 # ---------------------------------------------------------------------------
 
-def _run_one(model, timer: _StepTimer, input_ids, attention_mask,
+def _run_one(model, input_ids, attention_mask,
              cfg: BenchConfig, eos_id: int, pad_id: int,
-             use_monitoring: bool) -> Tuple[float, List[float]]:
-    """Run one generate() and return (total_wall_ms, step_times_ms)."""
+             use_monitoring: bool) -> float:
+    """Run one generate() and return total wall time in ms."""
     from monitoring.generate import generate_with_monitoring  # type: ignore
 
-    # logits_to_keep is only supported by GPT-2 variant in this repo
     extra = {}
     if hasattr(model.config, "n_layer"):
         extra["logits_to_keep"] = 0
+    if cfg.cuda_graphs:
+        extra["cache_implementation"] = "static"
 
-    timer.reset()
+    # cudaDeviceSynchronize — wait for any leftover GPU work before the timer
+    # starts (including drain-thread D2H from a previous iteration).
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -258,27 +226,11 @@ def _run_one(model, timer: _StepTimer, input_ids, attention_mask,
             model.generate(
                 input_ids=input_ids, attention_mask=attention_mask,
                 max_new_tokens=cfg.max_new_tokens, do_sample=False,
-                pad_token_id=pad_id, eos_token_id=eos_id,
+                pad_token_id=pad_id, eos_token_id=eos_id, **extra,
             )
 
     torch.cuda.synchronize()
-    total_ms = (time.perf_counter() - t0) * 1000.0
-    return total_ms, list(timer.times_ms)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _fmt_ms(v: float) -> str:
-    return f"{v:7.1f} ms"
-
-def _step_stats(times: List[float]) -> str:
-    if not times:
-        return "n/a"
-    if len(times) == 1:
-        return f"{times[0]:.1f} ms"
-    return f"mean={statistics.mean(times):.1f}  std={statistics.stdev(times):.1f}  min={min(times):.1f}  max={max(times):.1f} ms"
+    return (time.perf_counter() - t0) * 1000.0
 
 
 # ---------------------------------------------------------------------------
@@ -286,15 +238,20 @@ def _step_stats(times: List[float]) -> str:
 # ---------------------------------------------------------------------------
 
 def _run_mode(mode: str, model, input_ids, attention_mask,
-              cfg: BenchConfig, eos_id: int, pad_id: int,
-              timer: _StepTimer) -> dict:
+              cfg: BenchConfig, eos_id: int, pad_id: int) -> dict:
 
     use_monitoring = mode != "baseline"
-    tokens_out = cfg.batch_size * cfg.max_new_tokens
+    # For prefill benchmark (max_new_tokens=1): count prompt tokens processed.
+    # For decode benchmark (prompt_len=1):      count new tokens generated.
+    # For mixed (prompt_len>1, max_new_tokens>1): count new tokens generated.
+    if cfg.max_new_tokens == 1:
+        tokens_out = cfg.batch_size * cfg.prompt_len   # prefill-mode: prompt throughput
+    else:
+        tokens_out = cfg.batch_size * cfg.max_new_tokens
 
-    print(f"\n{'='*64}")
+    print(f"\n{'='*60}")
     print(f"  Mode: {mode}")
-    print(f"{'='*64}")
+    print(f"{'='*60}")
 
     engine = None
     if mode == "ring_null":
@@ -311,83 +268,63 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         model.monitoring_engine = None
 
     try:
-        # Warmup
+        # Warmup — null mode so producer kernels fire (same CUDA graph topology)
+        # but the kernel body is a no-op; ring buffer and drain pipeline are idle.
         print(f"  Warming up ({cfg.warmup} iter)...", flush=True)
+        ring_engine    = getattr(engine, "_ring_engine",    None)
+        ring_transport = getattr(engine, "_ring_transport", None)
+        if ring_engine is not None:
+            ring_engine.set_null_mode(True)
+        if ring_transport is not None:
+            ring_transport.null_offload = True
         for _ in range(cfg.warmup):
-            _run_one(model, timer, input_ids, attention_mask,
+            _run_one(model, input_ids, attention_mask,
                      cfg, eos_id, pad_id, use_monitoring)
+        if ring_engine is not None:
+            ring_engine.set_null_mode(False)
+        if ring_transport is not None:
+            ring_transport.null_offload = False
 
         # Measured iterations
-        all_total_ms: List[float]         = []
-        all_prefill_ms: List[float]        = []
-        all_decode_ms: List[List[float]]   = []  # per-iter list of decode step times
-        all_close: List[Dict[str, float]]  = []
+        all_total_ms: List[float] = []
+        close_t: Dict[str, float] = {"ring_ms": 0.0, "db_ms": 0.0, "cleanup_ms": 0.0}
 
         for i in range(cfg.iters):
-            total_ms, steps = _run_one(model, timer, input_ids, attention_mask,
-                                       cfg, eos_id, pad_id, use_monitoring)
-
-            prefill_ms = steps[0]  if steps else 0.0
-            decode_ms  = steps[1:] if steps else []
-
-            # Per-iter close (re-create engine for ring modes so close is fresh each iter)
-            close_t: Dict[str, float] = {"ring_ms": 0.0, "db_ms": 0.0, "cleanup_ms": 0.0}
-            if engine is not None and i == cfg.iters - 1:
-                # Only close on the last iter; keep engine alive between iters
-                close_t = _timed_close(engine)
-                engine = None
-
+            total_ms = _run_one(model, input_ids, attention_mask,
+                                cfg, eos_id, pad_id, use_monitoring)
             all_total_ms.append(total_ms)
-            all_prefill_ms.append(prefill_ms)
-            all_decode_ms.append(decode_ms)
-            all_close.append(close_t)
-
-            decode_mean = statistics.mean(decode_ms) if decode_ms else 0.0
             print(f"  iter {i+1:2d}:  total={total_ms:7.1f} ms  "
-                  f"prefill={prefill_ms:6.1f} ms  "
-                  f"decode/step={decode_mean:6.1f} ms  "
-                  f"({tokens_out/total_ms*1000:.1f} tok/s)",
+                  f"({tokens_out / total_ms * 1000:.1f} tok/s)",
                   flush=True)
 
-        # Close timing (from last iter)
-        ct = all_close[-1]
-        ring_ms    = ct["ring_ms"]
-        db_ms      = ct["db_ms"]
-        cleanup_ms = ct["cleanup_ms"]
+        # Close on last iter
+        if engine is not None:
+            close_t = _timed_close(engine)
+            engine = None
+
+        ring_ms    = close_t["ring_ms"]
+        db_ms      = close_t["db_ms"]
+        cleanup_ms = close_t["cleanup_ms"]
         print(f"\n  Close breakdown:")
-        print(f"    ring drain  : {_fmt_ms(ring_ms)}")
-        print(f"    db drain    : {_fmt_ms(db_ms)}")
-        print(f"    cleanup     : {_fmt_ms(cleanup_ms)}")
-        print(f"    total       : {_fmt_ms(ring_ms + db_ms + cleanup_ms)}")
+        print(f"    ring drain  : {ring_ms:7.1f} ms")
+        print(f"    db drain    : {db_ms:7.1f} ms")
+        print(f"    cleanup     : {cleanup_ms:7.1f} ms")
 
-        # Step-level summary
-        flat_decode = [t for ts in all_decode_ms for t in ts]
-        print(f"\n  Step latency summary ({cfg.iters} iters):")
-        print(f"    prefill (step 0) : {_step_stats(all_prefill_ms)}")
-        print(f"    decode  (steps 1+): {_step_stats(flat_decode)}")
-
-        # Generate summary
         mean_t = statistics.mean(all_total_ms)
         std_t  = statistics.stdev(all_total_ms) if len(all_total_ms) > 1 else 0.0
-        print(f"\n  Generate summary:")
-        print(f"    mean={mean_t:.1f} ms  std={std_t:.1f} ms  "
-              f"min={min(all_total_ms):.1f} ms  max={max(all_total_ms):.1f} ms")
-        print(f"    throughput: {tokens_out / mean_t * 1000:.1f} tok/s")
+        print(f"\n  Summary:  mean={mean_t:.1f} ms  std={std_t:.1f} ms  "
+              f"min={min(all_total_ms):.1f}  max={max(all_total_ms):.1f}  "
+              f"throughput={tokens_out / mean_t * 1000:.1f} tok/s")
 
         return {
-            "mode":           mode,
-            "gen_mean_ms":    mean_t,
-            "gen_std_ms":     std_t,
-            "gen_min_ms":     min(all_total_ms),
-            "gen_max_ms":     max(all_total_ms),
-            "throughput":     tokens_out / mean_t * 1000,
-            "prefill_mean_ms": statistics.mean(all_prefill_ms),
-            "prefill_std_ms":  statistics.stdev(all_prefill_ms) if len(all_prefill_ms) > 1 else 0.0,
-            "decode_mean_ms":  statistics.mean(flat_decode) if flat_decode else 0.0,
-            "decode_std_ms":   statistics.stdev(flat_decode) if len(flat_decode) > 1 else 0.0,
-            "close_ring_ms":  ring_ms,
-            "close_db_ms":    db_ms,
-            "close_total_ms": ring_ms + db_ms + cleanup_ms,
+            "mode":          mode,
+            "mean_ms":       mean_t,
+            "std_ms":        std_t,
+            "min_ms":        min(all_total_ms),
+            "max_ms":        max(all_total_ms),
+            "throughput":    tokens_out / mean_t * 1000,
+            "close_ring_ms": ring_ms,
+            "close_db_ms":   db_ms,
         }
 
     finally:
@@ -400,48 +337,12 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
 
 
 # ---------------------------------------------------------------------------
-# Data volume estimate
-# ---------------------------------------------------------------------------
-
-def _estimate_data_volume(model, cfg: BenchConfig) -> str:
-    """Rough estimate of bytes captured per generate call."""
-    try:
-        hf_cfg = model.config
-        # Try common attribute names for layers / hidden dim
-        n_layers  = next((getattr(hf_cfg, a) for a in
-                          ("num_hidden_layers", "n_layer", "num_layers") if hasattr(hf_cfg, a)), None)
-        d_model   = next((getattr(hf_cfg, a) for a in
-                          ("hidden_size", "n_embd", "d_model") if hasattr(hf_cfg, a)), None)
-        n_heads   = next((getattr(hf_cfg, a) for a in
-                          ("num_attention_heads", "n_head") if hasattr(hf_cfg, a)), None)
-        if n_layers is None or d_model is None:
-            return "unknown"
-
-        B  = cfg.batch_size
-        T  = cfg.prompt_len + cfg.max_new_tokens   # rough total tokens
-        N  = cfg.max_new_tokens + 1                # forward passes (1 prefill + N decode)
-        bw = 2                                     # float16
-
-        # Main residual stream hooks: ~6 per layer × [B, T_step, d_model]
-        # Attention hooks: pattern [B, n_heads, T, T] + scores [B, n_heads, T, T]
-        # Rough: 20 hooks/layer with average tensor size ~ B * avg_seq * d_model * bw
-        avg_seq   = (cfg.prompt_len + cfg.prompt_len // 2)  # prefill heavy
-        bytes_per_layer_per_step = 20 * B * avg_seq * d_model * bw
-        total = n_layers * N * bytes_per_layer_per_step
-        if total < 1024**3:
-            return f"~{total / 1024**2:.0f} MB"
-        return f"~{total / 1024**3:.2f} GB"
-    except Exception:
-        return "unknown"
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def _parse_args() -> BenchConfig:
     p = argparse.ArgumentParser(
-        description="Ring-transport detailed benchmark",
+        description="Ring-transport benchmark",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     g = p.add_argument_group("Workload")
@@ -451,10 +352,11 @@ def _parse_args() -> BenchConfig:
     g.add_argument("--max-new-tokens",  type=int, default=16)
     g.add_argument("--warmup",          type=int, default=1)
     g.add_argument("--iters",           type=int, default=3)
-    g.add_argument("--modes",           default="baseline,ring_null,ring_db")
+    g.add_argument("--modes",           default="baseline,ring_null")
+    g.add_argument("--cuda-graphs",     action="store_true")
 
     g = p.add_argument_group("Ring engine")
-    g.add_argument("--ring-task-entries", type=int, default=1024)
+    g.add_argument("--ring-task-entries", type=int, default=65536)
     g.add_argument("--ring-payload-mb",   type=int, default=4096)
     g.add_argument("--ring-chunk-kb",     type=int, default=4096)
     g.add_argument("--ring-pinned-mb",    type=int, default=4096)
@@ -477,6 +379,7 @@ def _parse_args() -> BenchConfig:
         model=ns.model, batch_size=ns.batch_size, prompt_len=ns.prompt_len,
         max_new_tokens=ns.max_new_tokens, warmup=ns.warmup, iters=ns.iters,
         modes=[m.strip() for m in ns.modes.split(",")],
+        cuda_graphs=bool(ns.cuda_graphs),
         ring_task_entries=ns.ring_task_entries, ring_payload_mb=ns.ring_payload_mb,
         ring_chunk_kb=ns.ring_chunk_kb, ring_pinned_mb=ns.ring_pinned_mb,
         ch_parallelism=ns.ch_parallelism, ch_queue_max_items=ns.ch_queue_max_items,
@@ -502,12 +405,18 @@ def main() -> None:
         if m not in valid:
             raise SystemExit(f"Unknown mode {m!r}. Valid: {sorted(valid)}")
 
+    workload = ("prefill-only" if cfg.max_new_tokens == 1
+                else "decode-only" if cfg.prompt_len == 1
+                else "mixed")
     print(f"Model        : {model_id}")
-    print(f"Batch / Toks : {cfg.batch_size} x {cfg.prompt_len} prompt + {cfg.max_new_tokens} new")
+    print(f"Workload     : {workload}  "
+          f"(batch={cfg.batch_size}  prompt={cfg.prompt_len}  new={cfg.max_new_tokens})")
     print(f"Warmup/Iters : {cfg.warmup} / {cfg.iters}")
     print(f"Modes        : {cfg.modes}")
-    print(f"Ring buffers : GPU payload={cfg.ring_payload_mb} MB  "
-          f"CPU pinned={cfg.ring_pinned_mb} MB  chunk={cfg.ring_chunk_kb} KB")
+    print(f"CUDA graphs  : {'yes (torch.compile + static cache)' if cfg.cuda_graphs else 'no'}")
+    print(f"Ring buffers : payload={cfg.ring_payload_mb} MB  "
+          f"pinned={cfg.ring_pinned_mb} MB  "
+          f"tasks={cfg.ring_task_entries}  chunk={cfg.ring_chunk_kb} KB")
 
     from transformers import AutoTokenizer  # type: ignore
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -537,69 +446,55 @@ def main() -> None:
 
     model.to(device).eval()
 
-    data_vol = _estimate_data_volume(model, cfg)
-    print(f"Estimated data volume per generate call: {data_vol}")
-
-    timer = _StepTimer(model)
+    if cfg.cuda_graphs:
+        print("Compiling with torch.compile(mode='reduce-overhead')...", flush=True)
+        model = torch.compile(model, mode="reduce-overhead")
+        print("  done.", flush=True)
 
     results = []
     for mode in cfg.modes:
         r = _run_mode(mode, model, input_ids, attention_mask,
-                      cfg, eos_id, pad_id, timer)
+                      cfg, eos_id, pad_id)
         if r is not None:
             results.append(r)
-
-    timer.restore()
 
     # -----------------------------------------------------------------------
     # Summary table
     # -----------------------------------------------------------------------
-    W = 80
+    W = 76
     print(f"\n{'='*W}")
-    print(f"{'SUMMARY':^{W}}")
+    print(f"{'SUMMARY  —  ' + workload + ('  (CUDA graphs)' if cfg.cuda_graphs else '  (eager)'):^{W}}")
     print(f"{'='*W}")
-
-    tokens_out = cfg.batch_size * cfg.max_new_tokens
-    col = 14
-    h1 = f"{'mode':<12}  {'gen mean':>9}  {'± std':>7}  {'prefill':>8}  {'decode/step':>11}  {'tok/s':>7}  {'close ring':>10}  {'close db':>9}"
-    print(h1)
+    print(f"{'mode':<12}  {'mean':>8}  {'±std':>6}  {'min':>7}  {'max':>7}  "
+          f"{'tok/s':>7}  {'ring drain':>10}  {'db drain':>8}")
     print("-" * W)
     for r in results:
-        print(
-            f"{r['mode']:<12}  "
-            f"{r['gen_mean_ms']:>8.1f}ms  "
-            f"{r['gen_std_ms']:>6.1f}ms  "
-            f"{r['prefill_mean_ms']:>7.1f}ms  "
-            f"{r['decode_mean_ms']:>10.1f}ms  "
-            f"{r['throughput']:>7.1f}  "
-            f"{r['close_ring_ms']:>9.1f}ms  "
-            f"{r['close_db_ms']:>8.1f}ms"
-        )
+        print(f"{r['mode']:<12}  "
+              f"{r['mean_ms']:>7.1f}ms  "
+              f"{r['std_ms']:>5.1f}ms  "
+              f"{r['min_ms']:>6.1f}ms  "
+              f"{r['max_ms']:>6.1f}ms  "
+              f"{r['throughput']:>7.1f}  "
+              f"{r['close_ring_ms']:>9.1f}ms  "
+              f"{r['close_db_ms']:>7.1f}ms")
 
-    # Overhead breakdown
+    print()
     baseline  = next((r for r in results if r["mode"] == "baseline"),  None)
     ring_null = next((r for r in results if r["mode"] == "ring_null"), None)
     ring_db   = next((r for r in results if r["mode"] == "ring_db"),   None)
 
-    print()
     if baseline and ring_null:
-        ov = ring_null["gen_mean_ms"] - baseline["gen_mean_ms"]
-        print(f"  ring_null overhead vs baseline  : {ov:+.1f} ms/iter  "
-              f"({ov / baseline['gen_mean_ms'] * 100:+.1f}%)  "
-              f"[transport cost, no DB]")
+        ov = ring_null["mean_ms"] - baseline["mean_ms"]
+        print(f"  ring_null vs baseline : {ov:+.1f} ms  "
+              f"({ov / baseline['mean_ms'] * 100:+.1f}%)  [transport, no DB]")
     if ring_null and ring_db:
-        ov = ring_db["gen_mean_ms"] - ring_null["gen_mean_ms"]
-        db_close = ring_db["close_db_ms"] - ring_null["close_db_ms"]
-        print(f"  ring_db  overhead vs ring_null  : {ov:+.1f} ms/iter  "
-              f"({ov / ring_null['gen_mean_ms'] * 100:+.1f}%)  "
-              f"[DB write cost on critical path]")
-        print(f"  ring_db  extra close vs ring_null: {db_close:+.1f} ms  "
-              f"[DB queue drain after generate]")
+        ov = ring_db["mean_ms"] - ring_null["mean_ms"]
+        print(f"  ring_db   vs ring_null: {ov:+.1f} ms  "
+              f"({ov / ring_null['mean_ms'] * 100:+.1f}%)  [DB write overhead]")
     if baseline and ring_db:
-        ov = ring_db["gen_mean_ms"] - baseline["gen_mean_ms"]
-        print(f"  ring_db  overhead vs baseline   : {ov:+.1f} ms/iter  "
-              f"({ov / baseline['gen_mean_ms'] * 100:+.1f}%)  "
-              f"[total monitoring overhead]")
+        ov = ring_db["mean_ms"] - baseline["mean_ms"]
+        print(f"  ring_db   vs baseline : {ov:+.1f} ms  "
+              f"({ov / baseline['mean_ms'] * 100:+.1f}%)  [total monitoring overhead]")
 
 
 if __name__ == "__main__":

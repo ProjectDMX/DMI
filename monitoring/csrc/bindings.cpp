@@ -420,5 +420,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("req_ids"), py::arg("token_ranges"),
            py::arg("shape"), py::arg("dtype"))
       .def("pop_last_meta", &ring_py::RingEnginePy::pop_last_meta,
+           py::call_guard<py::gil_scoped_release>())
+      // Flush barrier: block until all ring data on `stream_handle` has been
+      // fully drained and all on_tensor callbacks have returned.
+      // Does NOT stop or restart the engine.
+      .def("flush",
+           &ring_py::RingEnginePy::flush,
+           py::arg("stream_handle") = uint64_t{0},
+           py::call_guard<py::gil_scoped_release>())
+      // Enable/disable null mode: same kernel launch, no ring writes.
+      // Call outside CUDA graph capture; use for warmup so graph topology
+      // matches real capture runs.
+      .def("set_null_mode",
+           &ring_py::RingEnginePy::set_null_mode,
+           py::arg("enabled"),
            py::call_guard<py::gil_scoped_release>());
 }

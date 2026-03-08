@@ -11,14 +11,16 @@
 #include <ATen/ATen.h>
 #include <cstring>
 
-// Forward-declare the launcher so we don't pull in producer.cuh (which
-// defines producer_kernel as a __global__ function, causing duplicate-symbol
-// errors when both producer.cu and this TU are linked into the same .so).
+// Forward-declare symbols from producer.cu so we don't pull in producer.cuh
+// (which defines producer_kernel as a __global__ function, causing
+// duplicate-symbol errors when both producer.cu and this TU are linked into
+// the same .so).
 namespace ring {
 void launch_producer_with_notify(
     const RingState& ring, const uint8_t* d_src, uint64_t src_bytes,
     uint64_t logical_task_id, uint32_t hook_type, uint32_t hook_id,
     cudaHostFn_t notify_fn, void* notify_arg, cudaStream_t stream);
+void set_ring_null_mode(bool enabled);
 }  // namespace ring
 
 namespace ring_py {
@@ -171,6 +173,36 @@ void RingEnginePy::init(uint64_t stream_handle) {
 
 void RingEnginePy::start() { impl_->engine.start(); }
 void RingEnginePy::stop()  { impl_->engine.stop();  }
+
+void RingEnginePy::flush(uint64_t stream_handle) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+
+    // Phase 1: wait for all producer kernels on this stream (and their
+    // cudaLaunchHostFunc callbacks) to complete.  After this, task_head
+    // reflects all tasks that will ever be submitted from this stream.
+    cudaStreamSynchronize(stream);
+
+    // Phase 2: read the drain target.
+    const uint64_t target = __atomic_load_n(
+        impl_->engine.ring_state().task_head, __ATOMIC_ACQUIRE);
+
+    if (target == 0) return;  // nothing was ever submitted
+
+    // Wake the drain thread in case it is sleeping (it may not have seen the
+    // last hostfunc notification yet due to scheduling).
+    impl_->engine.drain_thread().notify();
+
+    // Phase 3: wait for all D2H copies + assembler calls up to `target`.
+    impl_->engine.drain_thread().wait_until_completed(target);
+
+    // Phase 4: wait for the callback thread to finish all on_tensor calls
+    // that were enqueued as a result of the drained chunks.
+    impl_->engine.wait_callbacks_empty();
+}
+
+void RingEnginePy::set_null_mode(bool enabled) {
+    ring::set_ring_null_mode(enabled);
+}
 
 void RingEnginePy::push_meta(TensorMeta meta) {
     impl_->fifo.push(std::move(meta));

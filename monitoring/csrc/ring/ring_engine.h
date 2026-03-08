@@ -49,6 +49,10 @@ public:
     void start();
     void stop();
 
+    // Block until the callback queue is empty and the callback thread is idle.
+    // Used by flush() to ensure all on_tensor callbacks have completed.
+    void wait_callbacks_empty();
+
     RingState&   ring_state()    { return ring_.state(); }
     DrainThread& drain_thread()  { return *drain_; }
 
@@ -68,6 +72,7 @@ private:
     std::queue<AssembledTensor> cb_queue_;
     std::atomic<bool>       cb_running_{false};
     std::thread             cb_thread_;
+    bool                    cb_busy_{false};  // true while cb_ is being called
 
     void cb_loop();
 };

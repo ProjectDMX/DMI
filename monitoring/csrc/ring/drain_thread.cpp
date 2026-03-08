@@ -187,7 +187,23 @@ void DrainThread::poll_completed() {
         // the pinned data to pageable memory, not here.
         cb_(std::move(pc.meta));
         pending_.pop_front();
+
+        // Advance flush barrier counter and wake any flush waiter.
+        completed_local_.fetch_add(1, std::memory_order_release);
+        flush_cv_.notify_all();
     }
+}
+
+// ---------------------------------------------------------------------------
+void DrainThread::wait_until_completed(uint64_t target) {
+    // Fast path: already done.
+    if (completed_local_.load(std::memory_order_acquire) >= target) return;
+    // Slow path: sleep on flush_cv_ until target reached or engine stops.
+    std::unique_lock<std::mutex> lk(flush_mu_);
+    flush_cv_.wait(lk, [&] {
+        return completed_local_.load(std::memory_order_relaxed) >= target
+               || !running_.load(std::memory_order_relaxed);
+    });
 }
 
 }  // namespace ring

@@ -61,6 +61,25 @@ public:
     void start();
     void stop();   // blocks until drain thread has flushed and exited
 
+    // Enable/disable null mode.  When enabled, producer_kernel launches with
+    // the same parameters but returns immediately (no ring writes, no FIFO
+    // consumption).  Call this outside any CUDA graph capture region.
+    // Use for warmup iterations so graph topology matches the real capture.
+    void set_null_mode(bool enabled);
+
+    // Flush barrier: block until all ring data enqueued on `stream_handle`
+    // (before this call) has been fully drained and all on_tensor callbacks
+    // have returned.  Does NOT stop or restart the engine.
+    //
+    // Caller must ensure that all producer kernels for the tensors they want
+    // to wait on were launched on `stream_handle` (or a stream serialised
+    // before it).  Internally:
+    //   1. cudaStreamSynchronize(stream) — ensures GPU kernels + hostfuncs done
+    //   2. Reads task_head (stable after sync) as the drain target
+    //   3. Wakes the drain thread and waits for all D2H copies + assembler calls
+    //   4. Waits for the callback thread queue to empty (all on_tensor done)
+    void flush(uint64_t stream_handle = 0);
+
     // Push metadata for the next tensor about to be hooked.
     // Must be called before hook() so the FIFO pop order matches arrival order.
     void push_meta(TensorMeta meta);

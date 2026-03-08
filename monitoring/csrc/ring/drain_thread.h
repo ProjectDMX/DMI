@@ -68,6 +68,11 @@ public:
     // Called from the CUDA host-function callback to wake the drain thread.
     void notify();
 
+    // Block until at least `target` chunks have completed D2H and their
+    // assembler callback has been invoked.  Call after cudaStreamSynchronize
+    // so that `target` (= *ring.task_head) is stable.
+    void wait_until_completed(uint64_t target);
+
     // Static shim suitable for cudaLaunchHostFunc / cudaHostFn_t.
     static void CUDART_CB hostfunc_cb(void* arg);
 
@@ -98,6 +103,12 @@ private:
     // managed memory and avoids LOCK-prefix atomics on PCIe-mapped pages.
     uint64_t                 task_tail_local_{0};
     uint64_t                 heartbeat_local_{0};
+
+    // Flush barrier: counts chunks that have completed D2H + assembler call.
+    // Written only by the drain thread; read by wait_until_completed().
+    std::atomic<uint64_t>    completed_local_{0};
+    std::mutex               flush_mu_;
+    std::condition_variable  flush_cv_;
 
     void loop();
     void drain_ready();

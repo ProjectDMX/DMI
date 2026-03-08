@@ -86,6 +86,12 @@ void launch_producer(
 //       stream (callback just signals a CV and returns immediately).
 //
 // `notify_fn` / `notify_arg` are typically DrainThread::hostfunc_cb / &dt.
+// Set/clear the device-side null mode flag.  When enabled, producer_kernel
+// launches with the same parameters but returns immediately (no ring writes).
+// Must be called outside any CUDA graph capture region.  Blocks until the
+// symbol write is visible to subsequent kernel launches.
+void set_ring_null_mode(bool enabled);
+
 void launch_producer_with_notify(
     const RingState& ring,
     const uint8_t*   d_src,

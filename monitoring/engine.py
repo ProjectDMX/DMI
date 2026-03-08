@@ -175,7 +175,9 @@ class MonitoringEngine:
     # ------------------------------------------------------------------
     # Ring transport API
 
-    def enable_ring_transport(self, ring_config: Any) -> None:
+    def enable_ring_transport(
+        self, ring_config: Any, model_shape: Optional[Any] = None
+    ) -> None:
         """Switch to ring-based D2H transport.
 
         Creates a RingEngine with the C++ host engine as the submit target so
@@ -183,7 +185,11 @@ class MonitoringEngine:
         without the GIL.
 
         Args:
-            ring_config: A _native_engine.RingConfig instance.
+            ring_config:  A _native_engine.RingConfig instance.
+            model_shape:  Optional ModelShapeConfig for analytical shape computation.
+                          When provided, the new CUDA-graph-compatible forward-hook
+                          path is activated.  If None, shape is auto-detected from
+                          model.config in _install_monitoring_forward.
         """
         from . import ring_transport as _rt
         from . import _native_engine  # type: ignore[attr-defined]
@@ -203,6 +209,8 @@ class MonitoringEngine:
         ring_engine.start()
 
         transport = _rt.RingTransport(ring_engine)
+        if model_shape is not None:
+            transport.set_model_cfg(model_shape)
         self._ring_engine = ring_engine
         self._ring_transport = transport
         self._using_ring_transport = True

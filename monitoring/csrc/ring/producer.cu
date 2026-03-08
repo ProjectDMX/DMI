@@ -10,6 +10,19 @@
 namespace ring {
 
 // ---------------------------------------------------------------------------
+// Null-mode device flag.
+// When true, producer_kernel returns immediately without touching the ring.
+// Kernel is still launched with the same <<<1, PRODUCER_BLOCK_DIM>>> so that
+// CUDA graph topology is identical between null (warmup) and real (capture) runs.
+// Set via set_ring_null_mode() — always call this outside any graph capture region.
+// ---------------------------------------------------------------------------
+__device__ bool g_ring_null_mode = false;
+
+void set_ring_null_mode(bool enabled) {
+    cudaMemcpyToSymbol(g_ring_null_mode, &enabled, sizeof(bool));
+}
+
+// ---------------------------------------------------------------------------
 // producer_kernel definition
 // ---------------------------------------------------------------------------
 __global__ void producer_kernel(
@@ -20,6 +33,8 @@ __global__ void producer_kernel(
     uint32_t        hook_type,
     uint32_t        hook_id)
 {
+    if (g_ring_null_mode) return;  // null/warmup mode: same launch, no ring writes
+
     __shared__ ProducerShmem sh;
 
     const uint64_t chunk_sz = ring.cfg.chunk_bytes;

@@ -70,13 +70,29 @@ void RingEngine::cb_loop() {
             if (cb_queue_.empty()) break;  // stopped and queue drained
             t = std::move(cb_queue_.front());
             cb_queue_.pop();
+            cb_busy_ = true;
         }
         try {
-            cb_(std::move(t));  // may block for GIL — drain loop is unaffected
+            cb_(std::move(t));  // GIL-free: pure C++ ATen ops + submit_direct.
+            // Decoupled here so variable-latency work (ATen alloc, memcpy,
+            // per-request slicing) does not stall the drain thread's
+            // task-slot freeing critical path.
         } catch (...) {
             // swallow — cannot propagate from background thread
         }
+        {
+            std::lock_guard<std::mutex> lk(cb_mu_);
+            cb_busy_ = false;
+        }
+        cb_cv_.notify_all();  // wake wait_callbacks_empty() if waiting
     }
+}
+
+void RingEngine::wait_callbacks_empty() {
+    std::unique_lock<std::mutex> lk(cb_mu_);
+    cb_cv_.wait(lk, [this] {
+        return (cb_queue_.empty() && !cb_busy_) || !cb_running_.load();
+    });
 }
 
 }  // namespace ring
