@@ -54,7 +54,8 @@ PYBIND_FLAGS := $(shell $(PYTHON) -c "import pybind11; print(' '.join([f'-DPYBIN
 CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
             -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=$(TARGET) \
             $(ABI_FLAG) $(PYBIND_FLAGS) \
-            $(TORCH_INCLUDE_FLAGS) $(PYTHON_INCLUDE_FLAGS) $(CUDA_INCLUDE_FLAGS) -Icsrc
+            $(TORCH_INCLUDE_FLAGS) $(PYTHON_INCLUDE_FLAGS) $(CUDA_INCLUDE_FLAGS) -Icsrc \
+            -MMD -MP
 
 LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPATH_FLAGS) \
            -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -lcudart -lpthread
@@ -133,7 +134,7 @@ $(BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/ring/%.o: csrc/ring/%.cu | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+	$(NVCC) $(NVCCFLAGS) -MMD -MP -MF $(@:.o=.d) -c $< -o $@
 
 $(FINAL_TARGET): $(OBJS)
 	$(CXX) -shared $^ -o $(BUILD_DIR)/$(TARGET_SO) $(LDFLAGS)
@@ -160,3 +161,8 @@ NVTX ?= 0
 ifeq ($(NVTX),1)
 LDFLAGS += -lnvToolsExt
 endif
+
+# Automatic header dependency tracking.
+# -MMD -MP (g++) and -MMD -MF (nvcc) above generate .d files alongside .o files.
+# Including them here makes make rebuild any .o whose headers have changed.
+-include $(wildcard $(BUILD_DIR)/*.d $(BUILD_DIR)/ring/*.d)

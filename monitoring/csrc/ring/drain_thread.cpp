@@ -16,7 +16,10 @@ DrainThread::DrainThread(RingState& rs, PinnedPool& pool, DrainCallback cb)
 {
     if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess)
         throw std::runtime_error("DrainThread: cudaStreamCreate failed");
-    payload_tail_local_ = *ring_.payload_tail;
+    // Local counters start at 0, matching AllocatedRing::init() which zeros
+    // all ring counters before start() is called. Reading ring_.payload_tail
+    // or ring_.task_tail here would require a PCIe round-trip (counters are
+    // now GPU HBM); rely on the init() contract instead.
 }
 
 DrainThread::~DrainThread() noexcept {
@@ -81,9 +84,11 @@ void DrainThread::loop() {
 // ---------------------------------------------------------------------------
 void DrainThread::drain_ready() {
     while (true) {
-        const uint64_t tail = __atomic_load_n(ring_.task_tail, __ATOMIC_ACQUIRE);
-        const uint64_t head = __atomic_load_n(ring_.task_head, __ATOMIC_ACQUIRE);
-        if (tail == head) break;  // ring empty
+        // task_tail_local_ is the authoritative tail: this thread is the sole
+        // writer of ring_.task_tail. No need to re-read from GPU HBM.
+        // task_head is no longer read: task_cpu_ready() returns false on an
+        // empty ring (ready_seq == SENTINEL), which terminates the loop.
+        const uint64_t tail = task_tail_local_;
 
         if (!task_cpu_ready(ring_.task_entries, ring_.task_cap, tail)) break;
 
@@ -142,11 +147,18 @@ void DrainThread::drain_ready() {
 
         // Release the task slot so the producer can reuse it.
         // payload_tail is advanced later (after D2H completes).
+        // Reset ready_seq to SENTINEL BEFORE advancing task_tail.
+        // Ordering guarantee: producer sees the slot as free (task_tail++)
+        // only after the slot is clean, preventing it from reusing a slot
+        // whose ready_seq still signals "ready" to any late reader.
         task_release_cpu(ring_.task_entries, ring_.task_cap, tail);
-        __atomic_store_n(ring_.task_tail, tail + 1, __ATOMIC_RELEASE);
+        __atomic_store_n(ring_.task_tail, ++task_tail_local_, __ATOMIC_RELEASE);
 
-        // Update heartbeat so the producer's timeout watchdog sees progress.
-        __atomic_fetch_add(ring_.consumer_heartbeat, 1u, __ATOMIC_RELEASE);
+        // Plain store (not fetch_add): drain thread is the sole writer of
+        // consumer_heartbeat. Avoids LOCK-prefix atomics on PCIe-mapped
+        // GPU HBM pages, which may not support hardware atomics from CPU.
+        __atomic_store_n(ring_.consumer_heartbeat, ++heartbeat_local_,
+                         __ATOMIC_RELEASE);
 
         pending_.push_back(std::move(pc));
     }

@@ -93,6 +93,11 @@ private:
 
     std::deque<PendingChunk> pending_;
     uint64_t                 payload_tail_local_{0};
+    // Local counters — drain thread is the sole writer of task_tail and
+    // consumer_heartbeat; tracking locally avoids PCIe reads of GPU-HBM
+    // managed memory and avoids LOCK-prefix atomics on PCIe-mapped pages.
+    uint64_t                 task_tail_local_{0};
+    uint64_t                 heartbeat_local_{0};
 
     void loop();
     void drain_ready();

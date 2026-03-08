@@ -41,6 +41,22 @@ public:
         *state_.payload_head       = 0;
         *state_.payload_tail       = 0;
         *state_.consumer_heartbeat = 0;
+        // Trigger page migration: move counter pages to GPU HBM and
+        // task_entry pages to CPU RAM, then synchronise to ensure the
+        // migrations complete before any kernel or drain thread runs.
+        // CUDA 12 cudaMemPrefetchAsync_v2: (ptr, size, location, flags, stream).
+        int dev = 0;
+        cudaGetDevice(&dev);
+        const size_t          entries_sz = cfg_.task_ring_entries * sizeof(TaskEntry);
+        const cudaMemLocation gpu_loc    = {cudaMemLocationTypeDevice, dev};
+        const cudaMemLocation cpu_loc    = {cudaMemLocationTypeHost,   0};
+        cudaMemPrefetchAsync(state_.task_entries, entries_sz,  cpu_loc, 0, stream);
+        cudaMemPrefetchAsync(state_.task_head,          sizeof(uint64_t), gpu_loc, 0, stream);
+        cudaMemPrefetchAsync(state_.task_tail,          sizeof(uint64_t), gpu_loc, 0, stream);
+        cudaMemPrefetchAsync(state_.payload_head,       sizeof(uint64_t), gpu_loc, 0, stream);
+        cudaMemPrefetchAsync(state_.payload_tail,       sizeof(uint64_t), gpu_loc, 0, stream);
+        cudaMemPrefetchAsync(state_.consumer_heartbeat, sizeof(uint64_t), gpu_loc, 0, stream);
+        chk(cudaDeviceSynchronize(), "cudaDeviceSynchronize after prefetch");
     }
 
     RingState&       state()        { return state_; }
@@ -58,8 +74,8 @@ private:
     }
 
     void allocate() {
-        chk(cudaMallocManaged(&state_.task_entries,
-                              cfg_.task_ring_entries * sizeof(TaskEntry)),
+        const size_t entries_sz = cfg_.task_ring_entries * sizeof(TaskEntry);
+        chk(cudaMallocManaged(&state_.task_entries, entries_sz),
             "cudaMallocManaged task_entries");
         chk(cudaMalloc(&state_.payload_buf, cfg_.payload_ring_bytes),
             "cudaMalloc payload_buf");
@@ -76,6 +92,40 @@ private:
         state_.task_cap    = cfg_.task_ring_entries;
         state_.payload_cap = cfg_.payload_ring_bytes;
         state_.cfg         = cfg_;
+
+        // Move the 5 counters to GPU HBM so the producer reads them at L2/HBM
+        // speed instead of paying ~2 µs PCIe non-posted read latency each.
+        // CPU writes (drain thread) are posted writes (fire-and-forget).
+        //
+        // CUDA 12 uses cudaMemLocation struct (cudaMemAdvise_v2 ABI).
+        int dev = 0;
+        chk(cudaGetDevice(&dev), "cudaGetDevice");
+        const cudaMemLocation gpu_loc  = {cudaMemLocationTypeDevice, dev};
+        const cudaMemLocation cpu_loc  = {cudaMemLocationTypeHost,   0};
+        auto advise_gpu = [&](void* ptr) {
+            chk(cudaMemAdvise(ptr, sizeof(uint64_t),
+                              cudaMemAdviseSetPreferredLocation, gpu_loc),
+                "cudaMemAdvise SetPreferredLocation counter");
+            chk(cudaMemAdvise(ptr, sizeof(uint64_t),
+                              cudaMemAdviseSetAccessedBy, gpu_loc),
+                "cudaMemAdvise SetAccessedBy counter");
+        };
+        advise_gpu(state_.task_head);
+        advise_gpu(state_.task_tail);
+        advise_gpu(state_.payload_head);
+        advise_gpu(state_.payload_tail);
+        advise_gpu(state_.consumer_heartbeat);
+
+        // Keep task_entries on CPU RAM so the drain thread polls ready_seq
+        // via fast local DRAM rather than PCIe.  The producer (GPU) accesses
+        // them via PCIe posted writes — acceptable because GPU writes are
+        // fire-and-forget (no stall).
+        chk(cudaMemAdvise(state_.task_entries, entries_sz,
+                          cudaMemAdviseSetPreferredLocation, cpu_loc),
+            "cudaMemAdvise SetPreferredLocation task_entries CPU");
+        chk(cudaMemAdvise(state_.task_entries, entries_sz,
+                          cudaMemAdviseSetAccessedBy, gpu_loc),
+            "cudaMemAdvise SetAccessedBy task_entries GPU");
     }
 
     void free_all() noexcept {
