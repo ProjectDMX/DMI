@@ -106,13 +106,14 @@ def _install_monitoring_forward(model: Any) -> None:
         except Exception:
             pass
 
-        if engine is not None:
+        using_ring = engine is not None and getattr(engine, "_using_ring_transport", False)
+        if engine is not None and not using_ring:
             engine.start_step(phase=phase)
 
         try:
             return orig_forward(*f_args, **f_kwargs)
         finally:
-            if engine is not None:
+            if engine is not None and not using_ring:
                 engine.end_step()
 
     try:

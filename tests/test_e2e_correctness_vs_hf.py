@@ -934,11 +934,16 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     request_ids = sorted(grouped.keys(), key=_parse_request_id)
 
     # -----------------------------------------------------------------------
-    # HF reference (no compile — plain eager generate)
+    # HF reference (no compile — plain eager generate + rollout)
     # -----------------------------------------------------------------------
     hf_model = AutoModelForCausalLM.from_pretrained(
         hf_model_id, attn_implementation="eager", torch_dtype=torch.float16,
     ).to(device).eval()
+
+    wte         = getattr(getattr(hf_model, "transformer", None), "wte", None)
+    wpe         = getattr(getattr(hf_model, "transformer", None), "wpe", None)
+    embed_tokens = getattr(getattr(hf_model, "model", None), "embed_tokens", None)
+    num_layers  = get_num_layers_from_config(hf_model)
 
     hf_gens_batch = _hf_generate_collect_scores_batched(
         hf_model=hf_model,
@@ -950,53 +955,215 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
         device=device,
     )
 
+    hf_refs_batch = _hf_greedy_rollout_collect_all_batched(
+        hf_model=hf_model,
+        input_ids_batch=input_ids,
+        attention_mask_batch=attention_mask,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=eos_id,
+        pad_token_id=pad_id,
+        device=device,
+        want_hidden_states=True,
+        want_attentions=False,  # attn_pattern shape incompatible with static-cache decode
+    )
+
     # -----------------------------------------------------------------------
-    # Per-request assertions
+    # Pre-loop: build per-request dicts and safety-check token_ids
     # -----------------------------------------------------------------------
     local_index_by_req: Dict[str, int] = {}
+    prompt_len_by_req:  Dict[str, int] = {}
+    db_token_ids_by_req: Dict[str, torch.Tensor] = {}
+
     for req_id in request_ids:
-        group_id, local_i = _parse_request_id(req_id)
+        _gid, local_i = _parse_request_id(req_id)
         local_index_by_req[req_id] = local_i
 
-    for req_id in sorted(request_ids, key=_parse_request_id):
+    req_order = sorted(request_ids, key=_parse_request_id)
+
+    for req_id in req_order:
         local_i   = local_index_by_req[req_id]
         hooks_map = grouped[req_id]
-        gen_ref   = hf_gens_batch[local_i]
         prompt0   = hf_initial_prompt_tokens[local_i]
         plen      = int(prompt0.numel())
-
-        if hf_drop_last_token and gen_ref.token_ids.numel() > 0:
-            new_seq     = gen_ref.token_ids[:-1]
-            new_gen_len = max(0, int(new_seq.numel()) - plen)
-            gen_ref = _HFGenRef(token_ids=new_seq, scores=gen_ref.scores[:new_gen_len])
-
-        # --- token_ids present and complete ---
-        with subtests.test(msg=f"{req_id}/cuda_graph/token_ids_present"):
-            assert (-1, "token_ids") in hooks_map, (
-                f"{req_id}: DB missing token_ids under CUDA graphs"
-            )
+        prompt_len_by_req[req_id] = plen
 
         if (-1, "token_ids") not in hooks_map:
-            continue
+            raise AssertionError(f"{req_id}: DB missing token_ids under CUDA graphs")
 
         tok_chunks = sorted(hooks_map[(-1, "token_ids")], key=lambda x: (x[0], x[1]))
         db_tok = merge_segments([t for _, _, t in tok_chunks], "token_ids").to(torch.long)
         if db_tok.ndim != 1:
             db_tok = db_tok.view(-1)
 
-        # Prompt prefix safety check
+        if db_tok.numel() < plen or not torch.equal(db_tok[:plen], prompt0):
+            raise AssertionError(
+                f"{req_id}: DB token_ids prompt prefix mismatch under CUDA graphs "
+                f"(plen={plen} db_len={db_tok.numel()})"
+            )
+        db_token_ids_by_req[req_id] = db_tok.cpu()
+
+    def _sort_chunks(chunks):
+        return sorted(chunks, key=lambda x: (x[0], x[1]))
+
+    def _validate_contiguous(chunks_sorted, expected_end, ctx):
+        if not chunks_sorted:
+            raise AssertionError(f"{ctx}: no chunks")
+        if chunks_sorted[0][0] != 0:
+            raise AssertionError(f"{ctx}: first chunk start={chunks_sorted[0][0]} expected 0")
+        prev_end = chunks_sorted[0][1]
+        for s2, e2, _t in chunks_sorted[1:]:
+            if s2 != prev_end:
+                raise AssertionError(f"{ctx}: non-contiguous chunks start={s2} prev_end={prev_end}")
+            prev_end = e2
+        if prev_end != expected_end:
+            raise AssertionError(f"{ctx}: coverage end={prev_end} expected_end={expected_end}")
+
+    # -----------------------------------------------------------------------
+    # Per-request assertions (full verification)
+    # -----------------------------------------------------------------------
+    _RESID_PRE_KEYS  = ("blocks.hook_resid_pre",  "layers.hook_resid_pre")
+    _RESID_POST_KEYS = ("blocks.hook_resid_post", "layers.hook_resid_post")
+
+    for req_id in req_order:
+        local_i   = local_index_by_req[req_id]
+        hooks_map = grouped[req_id]
+        plen      = prompt_len_by_req[req_id]
+        prompt0   = hf_initial_prompt_tokens[local_i]
+
+        db_tok  = db_token_ids_by_req[req_id]
+        seq_len = int(db_tok.numel())
+
+        gen_ref = hf_gens_batch[local_i]
+        ref     = hf_refs_batch[local_i]
+
+        if hf_drop_last_token:
+            if gen_ref.token_ids.numel() > 0:
+                new_seq     = gen_ref.token_ids[:-1]
+                new_gen_len = max(0, int(new_seq.numel()) - plen)
+                gen_ref = _HFGenRef(token_ids=new_seq, scores=gen_ref.scores[:new_gen_len])
+            if ref.token_ids.numel() > 0:
+                T = int(ref.token_ids.numel())
+                ref = _HFRef(
+                    token_ids=ref.token_ids[:-1],
+                    final_logits=ref.final_logits[:-1, :],
+                    hidden_states=[h[:-1, :] for h in ref.hidden_states],
+                    attn_pattern=[],
+                )
+
+        # --- token_ids ---
+        with subtests.test(msg=f"{req_id}/cuda_graph/token_ids_present"):
+            assert (-1, "token_ids") in hooks_map, f"{req_id}: DB missing token_ids"
+
         with subtests.test(msg=f"{req_id}/cuda_graph/prompt_prefix"):
             assert db_tok.numel() >= plen and torch.equal(db_tok[:plen], prompt0), (
-                f"{req_id}: DB token_ids prompt prefix mismatch under CUDA graphs"
+                f"{req_id}: prompt prefix mismatch"
             )
 
-        # The key correctness check: DB must cover the full generated sequence.
-        # With the CUDA-graph bug only the capture-step tokens arrive; the DB
-        # sequence is far shorter than what HF generate produced.
-        hf_seq = gen_ref.token_ids  # cpu long
         with subtests.test(msg=f"{req_id}/cuda_graph/token_ids_match_hf"):
-            assert bitwise_equal(db_tok, hf_seq), (
+            assert bitwise_equal(db_tok, gen_ref.token_ids), (
                 f"{req_id}: DB token_ids do not match HF generate() under CUDA graphs. "
-                f"db_len={db_tok.numel()} hf_len={hf_seq.numel()} "
+                f"db_len={db_tok.numel()} hf_len={gen_ref.token_ids.numel()} "
                 f"(if db_len << hf_len the CUDA-graph monitoring bug is present)"
             )
+
+        with subtests.test(msg=f"{req_id}/cuda_graph/token_ids_rol"):
+            assert bitwise_equal(db_tok, ref.token_ids), (
+                f"{req_id}: DB token_ids do not match HF rollout. "
+                f"db_len={db_tok.numel()} hf_len={ref.token_ids.numel()}"
+            )
+
+        # --- final_logits / resid_pre / resid_post ---
+        # torch.compile + static cache produces slightly different fp16 values than
+        # eager standard KV-cache (kernel fusion changes fp16 operation order).
+        # Use allclose instead of bitwise_equal when comparing compiled model output
+        # against HF eager reference.  hook_embed is bitwise-identical (table lookup).
+        _COMPILED_ATOL = 0.5  # fp16 compile-induced rounding; real transport errors are >> 1
+
+        logits_chunks_raw = hooks_map.get((-1, "final_logits"), [])
+        if logits_chunks_raw:
+            lchunks   = _sort_chunks(logits_chunks_raw)
+            db_logits = merge_segments([t for _, _, t in lchunks], "final_logits")
+            if db_logits.ndim == 1:
+                db_logits = db_logits.unsqueeze(0)
+            # Compare the overlapping suffix: static-cache may capture 1 fewer prefill
+            # logit row than the rollout (logits_to_keep differs between modes).
+            n = min(int(db_logits.shape[0]), int(ref.final_logits.shape[0]), seq_len)
+            db_slice  = db_logits[-n:, :]
+            rol_slice = ref.final_logits[ref.final_logits.shape[0] - n:, :]
+            with subtests.test(msg=f"{req_id}/cuda_graph/final_logits"):
+                assert n > 0, f"final_logits: no overlapping rows (db={db_logits.shape[0]} ref={ref.final_logits.shape[0]})"
+                assert db_slice.shape[1] == rol_slice.shape[1], (
+                    f"final_logits vocab mismatch db={db_slice.shape[1]} hf={rol_slice.shape[1]}"
+                )
+                if not torch.allclose(db_slice.float(), rol_slice.float(), atol=_COMPILED_ATOL, rtol=0.0):
+                    diff = (db_slice.float() - rol_slice.float()).abs()
+                    max_abs = float(diff.max().item())
+                    vocab_db = int(db_slice.shape[1])
+                    flat_idx = int(diff.view(-1).argmax().item())
+                    pytest.fail(
+                        f"final_logits mismatch max_abs={max_abs} > atol={_COMPILED_ATOL} at "
+                        f"row={flat_idx // vocab_db} vocab_idx={flat_idx % vocab_db}"
+                    )
+
+        # --- hook_embed (bitwise: embedding lookup has no arithmetic) ---
+        seq = db_tok.to(device)
+        if wte is not None and wpe is not None and (-1, "hook_embed") in hooks_map:
+            emb    = wte(seq).detach().cpu()
+            chunks = _sort_chunks(hooks_map[(-1, "hook_embed")])
+            _validate_contiguous(chunks, seq_len, f"{req_id} hook_embed")
+            db_t   = merge_segments([t for _, _, t in chunks], "hook_embed")
+            with subtests.test(msg=f"{req_id}/cuda_graph/hook_embed"):
+                assert tuple(db_t.shape) == tuple(emb.shape), (
+                    f"hook_embed shape mismatch db={tuple(db_t.shape)} hf={tuple(emb.shape)}"
+                )
+                assert bitwise_equal(db_t, emb), (
+                    f"hook_embed mismatch max_abs={float((db_t.float()-emb.float()).abs().max().item())}"
+                )
+        elif embed_tokens is not None and wpe is None and (-1, "hook_embed") in hooks_map:
+            emb    = embed_tokens(seq).detach().cpu()
+            chunks = _sort_chunks(hooks_map[(-1, "hook_embed")])
+            _validate_contiguous(chunks, seq_len, f"{req_id} hook_embed")
+            db_t   = merge_segments([t for _, _, t in chunks], "hook_embed")
+            with subtests.test(msg=f"{req_id}/cuda_graph/hook_embed"):
+                assert tuple(db_t.shape) == tuple(emb.shape), (
+                    f"hook_embed shape mismatch db={tuple(db_t.shape)} hf={tuple(emb.shape)}"
+                )
+                assert bitwise_equal(db_t, emb), (
+                    f"hook_embed mismatch max_abs={float((db_t.float()-emb.float()).abs().max().item())}"
+                )
+
+        # --- per-layer: resid_pre / resid_post ---
+        # attn_pattern skipped: static-cache decode produces [H, 1, kv_len] per step
+        # (kv_len grows each step), incompatible with rollout's [H, T, T].
+        for layer_no in range(num_layers):
+            key = next(((layer_no, k) for k in _RESID_PRE_KEYS if (layer_no, k) in hooks_map), None)
+            if key is not None and ref.hidden_states and layer_no < len(ref.hidden_states):
+                hs     = ref.hidden_states[layer_no]
+                chunks = _sort_chunks(hooks_map[key])
+                _validate_contiguous(chunks, seq_len, f"{req_id} layer{layer_no} resid_pre")
+                db_t   = merge_segments([t for _, _, t in chunks], key[1])
+                with subtests.test(msg=f"{req_id}/cuda_graph/layer{layer_no}/resid_pre"):
+                    assert tuple(db_t.shape) == tuple(hs.shape), (
+                        f"resid_pre shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
+                    )
+                    if not torch.allclose(db_t.float(), hs.float(), atol=_COMPILED_ATOL, rtol=0.0):
+                        pytest.fail(
+                            f"resid_pre mismatch layer={layer_no} "
+                            f"max_abs={float((db_t.float()-hs.float()).abs().max().item())} > atol={_COMPILED_ATOL}"
+                        )
+
+            key = next(((layer_no, k) for k in _RESID_POST_KEYS if (layer_no, k) in hooks_map), None)
+            if key is not None and ref.hidden_states and (layer_no + 1) < num_layers:
+                hs     = ref.hidden_states[layer_no + 1]
+                chunks = _sort_chunks(hooks_map[key])
+                _validate_contiguous(chunks, seq_len, f"{req_id} layer{layer_no} resid_post")
+                db_t   = merge_segments([t for _, _, t in chunks], key[1])
+                with subtests.test(msg=f"{req_id}/cuda_graph/layer{layer_no}/resid_post"):
+                    assert tuple(db_t.shape) == tuple(hs.shape), (
+                        f"resid_post shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
+                    )
+                    if not torch.allclose(db_t.float(), hs.float(), atol=_COMPILED_ATOL, rtol=0.0):
+                        pytest.fail(
+                            f"resid_post mismatch layer={layer_no} "
+                            f"max_abs={float((db_t.float()-hs.float()).abs().max().item())} > atol={_COMPILED_ATOL}"
+                        )

@@ -282,7 +282,6 @@ class RingTransport:
         self._current_shard_rank: int = 0
         self._current_req_ids: Optional[List[str]] = None
         self._current_token_ranges: Optional[List[Tuple[int, int]]] = None
-        self._capture_enabled: bool = False
 
         # When True: push_meta / capture_tensor meta pushes are skipped so the
         # FIFO stays empty.  ring_producer_op still calls _ring_engine.hook()
@@ -305,14 +304,12 @@ class RingTransport:
         shard_rank: int,
         req_ids: List[str],
         token_ranges: List[Tuple[int, int]],
-        capture_enabled: bool = True,
     ) -> None:
         """Called before each forward pass to provide per-step batch metadata."""
         self._current_model_id = model_id
         self._current_shard_rank = shard_rank
         self._current_req_ids = req_ids
         self._current_token_ranges = token_ranges
-        self._capture_enabled = capture_enabled
 
     def set_model_cfg(self, cfg: ModelShapeConfig) -> None:
         """Set the model shape config for analytical shape computation."""
@@ -360,8 +357,6 @@ class RingTransport:
         this path regardless of _using_forward_hooks.
         """
         if hook_name in self._forward_hook_names:
-            return
-        if not self._capture_enabled:
             return
         if self.null_offload:
             return  # kernel still launched by ring_producer_op; skip meta here

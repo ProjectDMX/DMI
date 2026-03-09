@@ -224,15 +224,6 @@ class MonitoringEngine:
         """
         if not self._using_ring_transport or self._ring_transport is None:
             return
-        if not self._capture_enabled:
-            self._ring_transport.set_step_context(
-                model_id=self._model_id or "",
-                shard_rank=0,
-                req_ids=[],
-                token_ranges=[],
-                capture_enabled=False,
-            )
-            return
         if self._model_id is None:
             return
         if input_ids is None or not hasattr(input_ids, "shape"):
@@ -363,7 +354,6 @@ class MonitoringEngine:
             shard_rank=0,
             req_ids=list(req_ids),
             token_ranges=token_ranges,
-            capture_enabled=True,
         )
 
     # ------------------------------------------------------------------
