@@ -132,38 +132,47 @@ class HookSpec:
 
 
 # ---------------------------------------------------------------------------
-# Module-level active transport — must be defined before ring_producer_op
+# Module-level active transport
 # ---------------------------------------------------------------------------
 
 _active_transport: Optional["RingTransport"] = None
 
 
 # ---------------------------------------------------------------------------
-# ring_producer_op — torch.library custom op (CUDA-graph-capturable)
+# register_fake for ring::producer C++ op
+#
+# ring::producer is registered via C++ TORCH_LIBRARY (ring_torch_op.cpp) with
+# schema  Tensor(a!) -> Tensor(a!).  The fake impl is required for torch.compile
+# shape propagation.  We register it after ensuring the .so is loaded.
 # ---------------------------------------------------------------------------
+try:
+    from . import _native_engine as _ne
+    _ne._load_extension()  # ensure .so is loaded → registers ring::producer
 
-@torch.library.custom_op("ring::producer", mutates_args=())
-def ring_producer_op(tensor: torch.Tensor, hook_type: int, hook_id: int) -> None:
-    """Launch the ring producer kernel for a monitored tensor.
+    @torch.library.register_fake("ring::producer")
+    def _ring_producer_fake(
+        tensor: torch.Tensor, hook_type: int, hook_id: int
+    ) -> None:
+        # Void schema: op is a pure side-effect (kernel launch), no output.
+        # Marked effectful via _register_effectful_op so FX/inductor cannot DCE
+        # the node even when its return value is unused.
+        return None
 
-    Dynamo captures this as a single graph node — no graph break.
-    pre_push_all_metas() must have been called for this hook in FIFO order
-    before the forward pass so the drain thread can match meta ↔ data.
-    """
-    transport = _active_transport
-    if transport is None:
-        return
-    if not tensor.is_cuda or not tensor.is_contiguous():
-        return
-    stream = torch.cuda.current_stream(tensor.device.index).cuda_stream
-    transport._ring_engine.hook(
-        tensor.data_ptr(), tensor.nbytes, 0, hook_type, hook_id, stream
-    )
+    # Mark ring::producer as an ordered side-effect so torch.compile/inductor
+    # preserves the node in the FX graph (prevents DCE on [num_users=0] nodes).
+    try:
+        from torch._higher_order_ops.effects import (
+            _register_effectful_op, _EffectType,
+        )
+        _register_effectful_op(
+            torch.ops.ring.producer.default, _EffectType.ORDERED
+        )
+    except Exception:
+        pass  # older PyTorch without _EffectType; effectful path unavailable
 
-
-@ring_producer_op.register_fake
-def _ring_producer_op_fake(tensor: torch.Tensor, hook_type: int, hook_id: int) -> None:
-    pass  # no output tensor; side-effect only
+    del _ne
+except Exception:
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -225,15 +234,15 @@ def _compute_hook_shape(
 # ---------------------------------------------------------------------------
 
 def _make_ring_hook(hook_type: int, hook_id: int):
-    """Return a PyTorch register_forward_hook callable for a HookPoint."""
+    """Return a PyTorch register_forward_hook callable for a HookPoint.
+
+    No-op: ring::producer is now called directly inside HookPoint.forward()
+    via torch.ops.ring.producer (C++ TORCH_LIBRARY, captured in CUDA graph).
+    This hook is kept so _forward_hook_names remains populated and
+    capture_tensor() correctly skips hooks handled by HookPoint.forward().
+    """
     def _hook(module: nn.Module, inp: Any, output: Any) -> None:
-        if isinstance(output, torch.Tensor):
-            # Call .contiguous() unconditionally (no Python branch on tensor
-            # state) so this hook is CUDA-graph-capturable.  For tensors that
-            # are already contiguous .contiguous() returns self with no copy.
-            # Non-contiguous tensors (e.g. hook_z after attn_output.transpose)
-            # get a D2D copy baked into the graph, keeping the FIFO in sync.
-            ring_producer_op(output.contiguous(), hook_type, hook_id)
+        pass
     return _hook
 
 
@@ -394,11 +403,21 @@ class RingTransport:
 def activate(transport: RingTransport) -> None:
     global _active_transport
     _active_transport = transport
+    try:
+        from . import _native_engine as _ne
+        _ne.ring_set_active_engine(transport._ring_engine)
+    except Exception:
+        pass  # .so not built or binding unavailable; CUDA graph path skipped
 
 
 def deactivate() -> None:
     global _active_transport
     _active_transport = None
+    try:
+        from . import _native_engine as _ne
+        _ne.ring_clear_active_engine()
+    except Exception:
+        pass
 
 
 def get_active() -> Optional[RingTransport]:

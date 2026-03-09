@@ -135,7 +135,25 @@ class HookPoint(nn.Module):
 
         # A variable giving the hook's name (from the perspective of the root
         # module) - this is set by the root module at setup.
-        self.name: Optional[str] = None
+        self._name: Optional[str] = None
+
+        # ring_producer_op dispatch keys — set when self.name is assigned.
+        # Stored as plain ints so torch.compile treats them as compile-time
+        # constants and bakes them directly into the captured CUDA graph.
+        self._ring_hook_type: int = 0
+        self._ring_hook_id: int = 0
+
+    @property
+    def name(self) -> Optional[str]:
+        return self._name
+
+    @name.setter
+    def name(self, value: Optional[str]) -> None:
+        object.__setattr__(self, "_name", value)
+        if value is not None:
+            from .ring_transport import _hook_type_from_name, _hook_id_from_name
+            object.__setattr__(self, "_ring_hook_type", _hook_type_from_name(value))
+            object.__setattr__(self, "_ring_hook_id", _hook_id_from_name(value))
 
     def add_perma_hook(self, hook: HookFunction, dir: Literal["fwd", "bwd"] = "fwd") -> None:
         self.add_hook(hook, dir=dir, is_permanent=True)
@@ -236,16 +254,24 @@ class HookPoint(nn.Module):
         self.ctx = {}
 
     def forward(self, x: Tensor) -> Tensor:
-        # Ring transport capture: if active and tensor is on GPU, offload async.
-        # This runs for every HookPoint in every model without model-file changes.
-        if self.name is not None:
-            try:
-                from . import ring_transport as _rt
-                transport = _rt._active_transport
-                if transport is not None:
-                    transport.capture_tensor(x, self.name)
-            except Exception:
-                pass
+        # Ring transport capture via C++ TORCH_LIBRARY op.
+        # Only call ring.producer when a RingTransport is active.  Without this
+        # guard, HF's internal auto-compile (mode="reduce-overhead") would
+        # capture ring.producer in its CUDA graph, allocate a stale output
+        # buffer (due to schema semantics), and produce wrong tokens each step.
+        #
+        # We call ring.producer(x_cont) for the side-effect (launching the
+        # producer kernel into the CUDA graph) but return the ORIGINAL x, not
+        # the ring.producer output.  This prevents the stale-buffer bug:
+        # x is always the graph-runner-updated input; x_cont (contiguous copy)
+        # is what the kernel reads — when x is already contiguous, inductor
+        # optimises the copy away so x_cont IS x (same buffer, no stale data).
+        if self._name is not None and x.is_cuda:
+            from .ring_transport import _active_transport
+            if _active_transport is not None:
+                x_cont = x.contiguous()
+                torch.ops.ring.producer(
+                    x_cont, self._ring_hook_type, self._ring_hook_id)
         return x
 
     def layer(self):

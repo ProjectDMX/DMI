@@ -46,6 +46,8 @@ def _filter_specs(all_specs: List, engine: Any) -> List:
         return all_specs
 
 
+
+
 def _install_monitoring_forward(model: Any) -> None:
     """Install monitored_forward wrapper and (if possible) ring forward hooks."""
     from . import ring_transport
@@ -74,6 +76,7 @@ def _install_monitoring_forward(model: Any) -> None:
                 print(f"[ring] install_ring_hooks: all={len(all_specs)} active={len(active_specs)}"
                       f" model_cfg={transport._model_cfg is not None}")
 
+
     # --- monitored_forward wrapper ---
     wrapper = getattr(model, "_monitoring_forward_wrapper", None)
     current_forward = model.forward
@@ -90,8 +93,7 @@ def _install_monitoring_forward(model: Any) -> None:
 
     @functools.wraps(orig_forward)
     def monitored_forward(*f_args: Any, **f_kwargs: Any):
-        engine    = getattr(model, "monitoring_engine", None)
-        transport = ring_transport.get_active()
+        engine = getattr(model, "monitoring_engine", None)
 
         # Phase detection (Python, outside compiled region)
         phase = "prefill" if f_kwargs.get("past_key_values") is None else "decode"
@@ -108,30 +110,7 @@ def _install_monitoring_forward(model: Any) -> None:
             engine.start_step(phase=phase)
 
         try:
-            # Set per-step ring context (req_ids, token_ranges, etc.)
-            if engine is not None and getattr(engine, "_using_ring_transport", False):
-                input_ids_val   = f_kwargs.get("input_ids")
-                attention_mask  = f_kwargs.get("attention_mask")
-                past_key_values = f_kwargs.get("past_key_values")
-                engine._prepare_ring_step(input_ids_val, attention_mask, past_key_values)
-
-            # Pre-push metadata for all active hooks (new path only)
-            if (transport is not None
-                    and transport._using_forward_hooks
-                    and transport._model_cfg is not None
-                    and transport._capture_enabled
-                    and transport._current_req_ids is not None
-                    and transport._current_model_id is not None):
-                input_ids_val   = f_kwargs.get("input_ids")
-                past_key_values = f_kwargs.get("past_key_values")
-                if input_ids_val is not None and hasattr(input_ids_val, "shape"):
-                    batch  = int(input_ids_val.shape[0])
-                    q_len  = int(input_ids_val.shape[1])
-                    kv_dim = ring_transport._get_kv_dim(past_key_values, q_len)
-                    transport.pre_push_all_metas(batch, q_len, kv_dim)
-
             return orig_forward(*f_args, **f_kwargs)
-
         finally:
             if engine is not None:
                 engine.end_step()
@@ -151,7 +130,7 @@ def _uninstall_monitoring_forward(model: Any) -> None:
     """Remove ring forward hooks and restore original model.forward."""
     from . import ring_transport
 
-    # Remove register_forward_hook handles
+    # Remove register_forward_hook handles (ring producer hooks on submodules)
     for h in getattr(model, "_ring_hook_handles", []):
         try:
             h.remove()
@@ -174,6 +153,69 @@ def _uninstall_monitoring_forward(model: Any) -> None:
         model._monitoring_forward_wrapper  = None
 
 
+def _install_prepare_wrapper(model: Any) -> None:
+    """Wrap prepare_inputs_for_generation to push ring FIFO metas before every forward.
+
+    This is the CUDA-graph-compatible injection point: HF calls
+    prepare_inputs_for_generation at Python level before every model_forward,
+    including during CUDA graph replay (where monitored_forward is NOT called).
+    """
+    from . import ring_transport
+
+    orig_prepare = getattr(model, "prepare_inputs_for_generation", None)
+    if orig_prepare is None:
+        return
+    # Already wrapped.
+    if getattr(model, "_monitoring_orig_prepare", None) is not None:
+        return
+
+    @functools.wraps(orig_prepare)
+    def _prepare_wrapper(*args: Any, **kwargs: Any) -> Any:
+        model_inputs = orig_prepare(*args, **kwargs)
+
+        engine    = getattr(model, "monitoring_engine", None)
+        transport = ring_transport.get_active()
+
+        if (engine is not None
+                and getattr(engine, "_using_ring_transport", False)
+                and transport is not None
+                and transport._using_forward_hooks):
+            if isinstance(model_inputs, dict):
+                input_ids_val   = model_inputs.get("input_ids")
+                attention_mask  = model_inputs.get("attention_mask")
+                past_key_values = model_inputs.get("past_key_values")
+                cache_position  = model_inputs.get("cache_position")
+            else:
+                input_ids_val   = None
+                attention_mask  = None
+                past_key_values = None
+                cache_position  = None
+
+            engine._prepare_ring_step(input_ids_val, attention_mask, past_key_values, cache_position=cache_position)
+
+            if input_ids_val is not None and hasattr(input_ids_val, "shape"):
+                try:
+                    batch  = int(input_ids_val.shape[0])
+                    q_len  = int(input_ids_val.shape[1])
+                    kv_dim = ring_transport._get_kv_dim(past_key_values, q_len)
+                    transport.pre_push_all_metas(batch, q_len, kv_dim)
+                except Exception:
+                    pass
+
+        return model_inputs
+
+    model._monitoring_orig_prepare         = orig_prepare
+    model.prepare_inputs_for_generation    = _prepare_wrapper
+
+
+def _uninstall_prepare_wrapper(model: Any) -> None:
+    """Restore the original prepare_inputs_for_generation."""
+    orig = getattr(model, "_monitoring_orig_prepare", None)
+    if orig is not None:
+        model.prepare_inputs_for_generation = orig
+        model._monitoring_orig_prepare      = None
+
+
 def generate_with_monitoring(model: Any, *args: Any, **kwargs: Any):
     """Run HF generate() with ring-transport monitoring hooks active.
 
@@ -184,8 +226,29 @@ def generate_with_monitoring(model: Any, *args: Any, **kwargs: Any):
         model = torch.compile(model, mode="reduce-overhead")
         generate_with_monitoring(model, ..., cache_implementation="static")
     """
-    _install_monitoring_forward(model)
+    # When model is a torch.compile OptimizedModule, model.generate is a
+    # bound method of _orig_mod (the inner uncompiled model).  Inside
+    # generate, self(**model_inputs) calls _orig_mod.forward, not the
+    # compiled wrapper forward.  We must therefore:
+    #   1. Install monitored_forward on _orig_mod.forward.
+    #   2. Copy monitoring_engine from the OptimizedModule to _orig_mod
+    #      because monitored_forward's closure looks up engine via model.
+    target = getattr(model, "_orig_mod", model)
+    _restore_engine: Any = None
+    if target is not model:
+        outer_engine = getattr(model, "monitoring_engine", None)
+        _restore_engine = getattr(target, "monitoring_engine", None)
+        if outer_engine is not None:
+            target.monitoring_engine = outer_engine
+    _install_monitoring_forward(target)
+    # Wrap prepare_inputs_for_generation so ring FIFO metas are pushed before
+    # every model_forward — including CUDA graph replay steps where
+    # monitored_forward's Python body is never executed.
+    _install_prepare_wrapper(target)
     try:
         return model.generate(*args, **kwargs)
     finally:
-        _uninstall_monitoring_forward(model)
+        _uninstall_monitoring_forward(target)
+        _uninstall_prepare_wrapper(target)
+        if target is not model:
+            target.monitoring_engine = _restore_engine

@@ -723,3 +723,280 @@ def test_e2e_correctness_hf(subtests) -> None:
                         f"resid_post mismatch layer={layer_no} "
                         f"(max_abs={float((db_t.float() - hs.float()).abs().max().item())})"
                     )
+
+
+# ---------------------------------------------------------------------------
+# CUDA-graph correctness test
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA + native backend required")
+def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
+    """Same as test_e2e_correctness_hf but with torch.compile + static KV cache (CUDA graphs).
+
+    This test specifically validates that monitoring captures ALL decode steps, not just the
+    CUDA graph capture step.  With the current ring_producer_op Python-dispatch bug the test
+    will fail because only 1 of N decode steps is monitored.
+
+    Run with:
+        E2E_HF_DROP_LAST_TOKEN=1 pytest -q -s tests/test_e2e_correctness_vs_hf.py::test_e2e_correctness_hf_cuda_graphs
+    """
+    try:
+        import clickhouse_driver  # noqa: F401
+    except Exception:
+        pytest.skip("clickhouse-driver is required")
+
+    try:
+        from monitoring import (  # type: ignore
+            AdvanceConfig,
+            HostEngineConfig,
+            MonitoringConfig,
+            MonitoringEngine,
+            NativePartialSealConfig,
+        )
+        from monitoring._native_engine import (  # type: ignore
+            ClickHouseClientConfig,
+            RingConfig,
+            StageConfig,
+        )
+        from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
+        from monitoring.generate import generate_with_monitoring  # type: ignore
+    except Exception as exc:
+        pytest.skip(f"monitoring native extension not available: {exc}")
+
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel  # type: ignore
+        from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM  # type: ignore
+    except Exception as exc:
+        pytest.skip(f"transformers or Hooked* classes not available: {exc}")
+
+    # -----------------------------------------------------------------------
+    # Config — fixed small values to keep the test fast
+    # -----------------------------------------------------------------------
+    batch_size       = int(os.environ.get("E2E_BATCH_SIZE",         "4"))
+    max_new_tokens   = int(os.environ.get("E2E_MAX_NEW_TOKENS",     "8"))
+    hf_model_id      = os.environ.get("E2E_MODEL", "gpt2")
+    hf_model_id      = _MODEL_ALIASES.get(hf_model_id.lower(), hf_model_id)
+    chunk_bytes      = int(os.environ.get("E2E_CHUNK_BYTES", str(256 * 1024)))
+    hf_drop_last_token = bool(int(os.environ.get("E2E_HF_DROP_LAST_TOKEN", "0")))
+
+    device = torch.device("cuda")
+
+    # -----------------------------------------------------------------------
+    # Tokenizer + prompts
+    # -----------------------------------------------------------------------
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
+    eos_id = int(tokenizer.eos_token_id)
+    pad_id = int(tokenizer.pad_token_id)
+
+    prompts = [("Hello " * (i + 1)).strip() for i in range(batch_size)]
+    encoded = tokenizer(prompts, return_tensors="pt", padding=True)
+    input_ids      = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+
+    hf_initial_prompt_tokens: List[torch.Tensor] = []
+    for j in range(batch_size):
+        hf_initial_prompt_tokens.append(
+            _strip_left_pad(
+                input_ids[j].detach().cpu(),
+                attention_mask[j].detach().cpu(),
+            ).to(torch.long)
+        )
+
+    # -----------------------------------------------------------------------
+    # Monitoring + DB config
+    # -----------------------------------------------------------------------
+    mon_cfg = MonitoringConfig(
+        hooks=HookSelection(mode="full"),
+        schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
+        native_partial_seal=NativePartialSealConfig(
+            enabled=True,
+            chunk_bytes=int(chunk_bytes),
+            cap_enabled=True,
+            cap_ratio=0.8,
+            driver_guard_mb=1024,
+        ),
+        advance=AdvanceConfig(),
+    )
+
+    db_cfg_native = ClickHouseClientConfig()
+    db_cfg_native.host     = os.environ.get("DMX_DB_HOST",     "localhost")
+    db_cfg_native.port     = int(os.environ.get("DMX_DB_PORT", "9000"))
+    db_cfg_native.username = os.environ.get("DMX_DB_USER",     "default")
+    db_cfg_native.password = os.environ.get("DMX_DB_PASSWORD", "")
+    db_cfg_native.database = os.environ.get("DMX_DB_DATABASE", "default")
+    db_cfg_native.table    = os.environ.get("DMX_DB_TABLE",    "offload")
+    db_cfg_native.secure                   = False
+    db_cfg_native.client_side_compress     = "none"
+    db_cfg_native.client_settings          = None
+    db_cfg_native.create_database_if_missing = True
+    db_cfg_native.drop_existing_database   = True
+    db_cfg_native.index_granularity        = 8192
+
+    insert_stage = StageConfig.clickhouse_insert(db_cfg_native, parallelism=10, name="clickhouse_insert")
+    host_cfg     = HostEngineConfig(stages=[insert_stage])
+
+    ring_cfg = RingConfig()
+    ring_cfg.task_ring_entries  = 1024
+    ring_cfg.payload_ring_bytes = 4 * 1024 * 1024 * 1024
+    ring_cfg.chunk_bytes        = 4 * 1024 * 1024
+    ring_cfg.pinned_pool_bytes  = 4 * 1024 * 1024 * 1024
+
+    # -----------------------------------------------------------------------
+    # Monitored model — compiled with torch.compile + static cache (CUDA graphs)
+    # -----------------------------------------------------------------------
+    unique_run_model_id = f"e2e_cuda_graphs::{uuid.uuid4().hex}"[:120]
+    engine = MonitoringEngine(
+        async_enabled=True, config=mon_cfg,
+        model_id=unique_run_model_id, db_config=host_cfg,
+    )
+    engine.enable_ring_transport(ring_cfg)
+
+    model_cls = HookedQwen3ForCausalLM if "qwen3" in hf_model_id.lower() else HookedGPT2LMHeadModel
+    mon_model = model_cls.from_pretrained(
+        hf_model_id, attn_implementation="eager", torch_dtype=torch.float16,
+    )
+    mon_model.to(device).eval()
+
+    # Compile BEFORE attaching the monitoring engine so torch.compile sees the
+    # original forward.  Monitoring hooks are then installed per generate call.
+    mon_model = torch.compile(mon_model, mode="reduce-overhead")
+
+    mon_model.monitoring_engine = engine
+    engine.prepare_for_model(mon_model)
+
+    try:
+        with torch.no_grad():
+            gen_out = generate_with_monitoring(
+                mon_model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=pad_id,
+                eos_token_id=eos_id,
+                cache_implementation="static",  # enables CUDA graph capture in HF
+            )
+    finally:
+        engine.close()
+
+    # Build per-request reference sequences from the generate() output.
+    # We use the compiled model's own output as the reference — this avoids
+    # any comparison against a different model that may compute different
+    # values under static cache or torch.compile.
+    gen_out_cpu = gen_out.detach().cpu().long()  # [batch, total_len]
+    ref_seqs: List[torch.Tensor] = []
+    for j in range(batch_size):
+        seq = _strip_left_pad(gen_out_cpu[j], (gen_out_cpu[j] != pad_id).long())
+        ref_seqs.append(seq)
+
+    # -----------------------------------------------------------------------
+    # Read DB
+    # -----------------------------------------------------------------------
+    from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
+    from monitoring.segment_merger import merge_segments, parse_internal_id
+
+    ch = CHClickhouseDriverReadOnly(
+        host=str(db_cfg_native.host),
+        port=int(db_cfg_native.port),
+        username=str(db_cfg_native.username),
+        password=str(db_cfg_native.password),
+        database=str(db_cfg_native.database),
+        table=str(db_cfg_native.table),
+        secure=bool(getattr(db_cfg_native, "secure", False)),
+        client_settings=getattr(db_cfg_native, "client_settings", None),
+        decode_strings=True,
+    )
+    try:
+        rows = ch.prefix_get((unique_run_model_id,), return_full_key_tuple=True)
+    finally:
+        ch.close()
+
+    if not rows:
+        pytest.fail(f"No rows found in ClickHouse for model_id={unique_run_model_id!r}. "
+                    "This means monitoring produced no output at all under CUDA graphs.")
+
+    shard_ranks  = sorted({int(key[4]) for key, _t in rows})
+    chosen_shard = 0 if 0 in shard_ranks else shard_ranks[0]
+    rows = [(k, t) for (k, t) in rows if int(k[4]) == chosen_shard]
+
+    grouped: Dict[str, Dict[Tuple[int, str], List[Tuple[int, int, torch.Tensor]]]] = {}
+    for full_key, t_raw in rows:
+        _model_id, req_id, act_name_raw, layer_no_raw, _shard, s, e = full_key
+        layer_no, act_name = _canon_layer_and_act(str(act_name_raw), int(layer_no_raw))
+        grouped.setdefault(str(req_id), {}).setdefault(
+            (layer_no, act_name), []
+        ).append((int(s), int(e), t_raw.detach().cpu()))
+
+    request_ids = sorted(grouped.keys(), key=_parse_request_id)
+
+    # -----------------------------------------------------------------------
+    # HF reference (no compile — plain eager generate)
+    # -----------------------------------------------------------------------
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        hf_model_id, attn_implementation="eager", torch_dtype=torch.float16,
+    ).to(device).eval()
+
+    hf_gens_batch = _hf_generate_collect_scores_batched(
+        hf_model=hf_model,
+        input_ids_batch=input_ids,
+        attention_mask_batch=attention_mask,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=eos_id,
+        pad_token_id=pad_id,
+        device=device,
+    )
+
+    # -----------------------------------------------------------------------
+    # Per-request assertions
+    # -----------------------------------------------------------------------
+    local_index_by_req: Dict[str, int] = {}
+    for req_id in request_ids:
+        group_id, local_i = _parse_request_id(req_id)
+        local_index_by_req[req_id] = local_i
+
+    for req_id in sorted(request_ids, key=_parse_request_id):
+        local_i   = local_index_by_req[req_id]
+        hooks_map = grouped[req_id]
+        gen_ref   = hf_gens_batch[local_i]
+        prompt0   = hf_initial_prompt_tokens[local_i]
+        plen      = int(prompt0.numel())
+
+        if hf_drop_last_token and gen_ref.token_ids.numel() > 0:
+            new_seq     = gen_ref.token_ids[:-1]
+            new_gen_len = max(0, int(new_seq.numel()) - plen)
+            gen_ref = _HFGenRef(token_ids=new_seq, scores=gen_ref.scores[:new_gen_len])
+
+        # --- token_ids present and complete ---
+        with subtests.test(msg=f"{req_id}/cuda_graph/token_ids_present"):
+            assert (-1, "token_ids") in hooks_map, (
+                f"{req_id}: DB missing token_ids under CUDA graphs"
+            )
+
+        if (-1, "token_ids") not in hooks_map:
+            continue
+
+        tok_chunks = sorted(hooks_map[(-1, "token_ids")], key=lambda x: (x[0], x[1]))
+        db_tok = merge_segments([t for _, _, t in tok_chunks], "token_ids").to(torch.long)
+        if db_tok.ndim != 1:
+            db_tok = db_tok.view(-1)
+
+        # Prompt prefix safety check
+        with subtests.test(msg=f"{req_id}/cuda_graph/prompt_prefix"):
+            assert db_tok.numel() >= plen and torch.equal(db_tok[:plen], prompt0), (
+                f"{req_id}: DB token_ids prompt prefix mismatch under CUDA graphs"
+            )
+
+        # The key correctness check: DB must cover the full generated sequence.
+        # With the CUDA-graph bug only the capture-step tokens arrive; the DB
+        # sequence is far shorter than what HF generate produced.
+        hf_seq = gen_ref.token_ids  # cpu long
+        with subtests.test(msg=f"{req_id}/cuda_graph/token_ids_match_hf"):
+            assert bitwise_equal(db_tok, hf_seq), (
+                f"{req_id}: DB token_ids do not match HF generate() under CUDA graphs. "
+                f"db_len={db_tok.numel()} hf_len={hf_seq.numel()} "
+                f"(if db_len << hf_len the CUDA-graph monitoring bug is present)"
+            )

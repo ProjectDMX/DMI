@@ -28,6 +28,8 @@ _NATIVE_EXPORTS = (
     "consume_backend_futures_cpp",
     "RingConfig",
     "RingEngine",
+    "ring_set_active_engine",
+    "ring_clear_active_engine",
 )
 
 

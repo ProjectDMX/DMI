@@ -19,7 +19,8 @@ SRCS := csrc/native_engine.cpp \
         csrc/future_process.cpp \
         csrc/clickhouse_client.cpp \
         csrc/ring/drain_thread.cpp \
-        csrc/ring/chunk_assembler.cpp
+        csrc/ring/chunk_assembler.cpp \
+        csrc/ring/ring_torch_op.cpp
 HEADERS := csrc/native_engine.h csrc/native_engine_internal.h \
 csrc/pipelined_engine.hpp csrc/dmx_host_utils.h csrc/future_process.h \
            csrc/clickhouse_client.h csrc/dmx_host_engine.h

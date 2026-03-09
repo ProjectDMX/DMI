@@ -216,7 +216,7 @@ class MonitoringEngine:
         self._using_ring_transport = True
         _rt.activate(transport)
 
-    def _prepare_ring_step(self, input_ids: Any, attention_mask: Any, past_key_values: Any) -> None:
+    def _prepare_ring_step(self, input_ids: Any, attention_mask: Any, past_key_values: Any, cache_position: Any = None) -> None:
         """Precompute per-step batch context and set it on the ring transport.
 
         Called before the forward pass so ring hooks (firing during forward)
@@ -250,13 +250,19 @@ class MonitoringEngine:
         if batch_size <= 0:
             return
 
-        is_prefill = past_key_values is None
-        try:
-            if hasattr(input_ids, "dim") and int(input_ids.dim()) >= 2:
-                if int(input_ids.shape[1]) > 1:
-                    is_prefill = True
-        except Exception:
-            pass
+        if cache_position is not None:
+            try:
+                is_prefill = int(cache_position[0]) == 0
+            except Exception:
+                is_prefill = past_key_values is None
+        else:
+            is_prefill = past_key_values is None
+            try:
+                if hasattr(input_ids, "dim") and int(input_ids.dim()) >= 2:
+                    if int(input_ids.shape[1]) > 1:
+                        is_prefill = True
+            except Exception:
+                pass
 
         current_ids = self._active_batch_request_ids
         need_reset = is_prefill or current_ids is None or len(current_ids) != batch_size
@@ -273,18 +279,37 @@ class MonitoringEngine:
         if req_ids is None or starts is None or finished is None:
             return
 
+        if isinstance(attention_mask, dict):
+            assert "full_attention" in attention_mask, f"attention_mask dict missing 'full_attention' key: {list(attention_mask.keys())}"
+            attention_mask = attention_mask["full_attention"]
+
         token_ranges: List[Tuple[int, int]] = []
         if is_prefill:
             if attention_mask is None or not hasattr(attention_mask, "dim"):
                 return
-            if int(attention_mask.dim()) != 2:
-                return
             try:
-                lengths = (
-                    attention_mask.sum(dim=1).tolist()
-                    if not self._no_strip
-                    else [attention_mask.shape[1]] * attention_mask.shape[0]
-                )
+                ndim = int(attention_mask.dim())
+                if ndim == 2:
+                    # Standard 2D mask [batch, seq_len]
+                    lengths = (
+                        attention_mask.sum(dim=1).tolist()
+                        if not self._no_strip
+                        else [attention_mask.shape[1]] * attention_mask.shape[0]
+                    )
+                elif ndim == 4 and len(input_shape) >= 2 and int(input_shape[1]) > 0:
+                    # 4D causal mask [batch, 1, q_len, kv_dim] — used by static-cache generate.
+                    # Values: 0.0 = attend, large negative = masked (NOT integer 0/1).
+                    # Count non-masked positions among the first q_len key slots using the
+                    # last query row (most permissive for left-padded causal sequences).
+                    q_len_mask = int(input_shape[1])
+                    lengths = (
+                        (attention_mask[:, 0, -1, :q_len_mask] >= 0.0).sum(dim=-1).long().tolist()
+                        if not self._no_strip
+                        else [q_len_mask] * int(attention_mask.shape[0])
+                    )
+                else:
+                    return
+                lengths = [int(v) for v in lengths]
             except Exception:
                 return
             if len(lengths) != batch_size:

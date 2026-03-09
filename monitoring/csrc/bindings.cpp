@@ -6,6 +6,7 @@
 #include "dmx_host_engine.h"
 // ring offload engine
 #include "ring/ring_engine_py.h"
+#include "ring/ring_torch_op.h"
 #include <ATen/cuda/CUDAContext.h>
 
 namespace monitoring {
@@ -435,4 +436,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),
            py::call_guard<py::gil_scoped_release>());
+
+  // Register the active ring engine pointer so C++ ring_producer_impl can
+  // call it during CUDA graph capture.  The raw pointer is valid as long as
+  // Python holds the shared_ptr (i.e. while the RingTransport is active).
+  m.def("ring_set_active_engine",
+        [](std::shared_ptr<ring_py::RingEnginePy> engine) {
+            ring_set_active_engine(engine.get());
+        },
+        py::arg("engine"));
+
+  m.def("ring_clear_active_engine",
+        []() { ring_set_active_engine(nullptr); });
 }
