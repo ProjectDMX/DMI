@@ -346,7 +346,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("pinned_pool_bytes",         &ring_py::RingConfig::pinned_pool_bytes)
       .def_readwrite("wait_policy",               &ring_py::RingConfig::wait_policy)
       .def_readwrite("no_progress_timeout_cycles",&ring_py::RingConfig::no_progress_timeout_cycles)
-      .def_readwrite("drop_reporting",            &ring_py::RingConfig::drop_reporting);
+      .def_readwrite("drop_reporting",            &ring_py::RingConfig::drop_reporting)
+      .def_readwrite("drain_poll_timeout_us",     &ring_py::RingConfig::drain_poll_timeout_us)
+      .def_readwrite("drain_notify_on_forward",   &ring_py::RingConfig::drain_notify_on_forward);
 
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {

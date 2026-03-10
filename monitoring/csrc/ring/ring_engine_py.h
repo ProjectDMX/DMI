@@ -29,6 +29,10 @@ struct RingConfig {
     uint64_t no_progress_timeout_cycles = 1'000'000'000ULL;
     // 0 = COUNTER_ONLY, 1 = DROP_TASK (emit a drop entry to the callback)
     int      drop_reporting             = 1;
+    // Drain thread poll timeout in µs (0 = no timeout, infinite wait).
+    uint64_t drain_poll_timeout_us      = 0;
+    // Whether to call notify_drain() before each forward pass from Python.
+    bool     drain_notify_on_forward    = true;
 };
 
 // Called by the callback thread for each per-request tensor slice.

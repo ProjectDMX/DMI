@@ -66,6 +66,17 @@ struct RingConfig {
 
     // What to emit when a logical task is dropped (see DropReporting).
     DropReporting drop_reporting = DropReporting::DROP_TASK;
+
+    // Drain thread poll timeout in microseconds.  0 = no timeout (infinite wait,
+    // drain only when explicitly notified or at stop()).
+    // WARNING: if both drain_poll_timeout_us == 0 and drain_notify_on_forward
+    // == false, the drain thread will never wake during generation.  The ring
+    // must be large enough to hold all data until stop(), or the producer will
+    // deadlock on backpressure.
+    uint64_t drain_poll_timeout_us = 0;
+
+    // Whether to call notify_drain() before each forward pass from Python.
+    bool drain_notify_on_forward = true;
 };
 
 }  // namespace ring

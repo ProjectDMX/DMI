@@ -37,7 +37,8 @@ offset 80  hook_id             uint32  hook identifier
 offset 84  flags               uint32  TASK_FLAG_IS_FIRST | IS_LAST | IS_DROP
 offset 88  reason              uint32  DROP_REASON_* (drop entries only)
 offset 92  _pad0               uint32
-offset 96  _padding[32]        uint8   explicit padding to 128 bytes
+offset 96  payload_alloc_bytes uint64  aligned allocation size (>= len1+len2, for payload_tail release)
+offset 104 _padding[24]        uint8   explicit padding to 128 bytes
 ```
 
 ### PayloadRingState (logical view)
@@ -76,7 +77,7 @@ The producer is a CUDA custom op inserted as a post-op node in the model graph.
 
 3. **Copy data** — issue `cudaMemcpyAsync` (D2D) into `payload_buf[off1..off1+len1]` and, if `len2 > 0`, into `payload_buf[0..len2]`.
 
-4. **Advance payload_head** — `payload_head += len1 + len2`.
+4. **Advance payload_head** — `payload_head += align_up(chunk_bytes, 16)`.  All allocations are rounded up to 16-byte alignment so that D2D copies can use vectorized `uint4` loads/stores.  The aligned size is stored in `TaskEntry::payload_alloc_bytes`.
 
 5. **Fill TaskEntry fields** — write `seq_no`, `logical_task_id`, spans, flags, etc.
 
@@ -108,7 +109,7 @@ The drain loop runs outside the CUDA graph on a dedicated stream or host thread.
 
 5. **D2H transfer** — issue async `cudaMemcpyAsync` from `payload_buf[off1..off1+len1]` (and span 2 if `len2 > 0`) to the pinned staging buffer.
 
-6. **Advance payload_tail** — `payload_tail += len1 + len2` (after D2H is launched; D2H may still be in-flight).
+6. **Advance payload_tail** — `payload_tail += payload_alloc_bytes` (after D2H is launched; D2H may still be in-flight).  `payload_alloc_bytes` is the aligned allocation size (≥ `len1 + len2`) to keep payload offsets aligned for vectorized D2D copies.
 
 7. **Release slot** — write `ready_seq = READY_SEQ_SENTINEL`, then `__threadfence()`.
 
@@ -197,20 +198,20 @@ captured as a **host node**, causing ~18 μs GPU→CPU→GPU round-trip per hook
 per graph replay (see `ring_overhead.md` for measured data).
 
 Instead, the CUDA graph path uses `hook_no_notify()` (producer kernel only,
-no hostfunc).  The drain thread may sleep through the entire `generate()` call.
-All ring data is flushed at `stop()` time: the drain thread's final cleanup
-loop calls `drain_ready()` → `cudaStreamSynchronize` → `poll_completed()`
-until all task entries are processed.
+no hostfunc).  The drain thread uses two mechanisms for streaming drain:
 
-Optional mechanisms for streaming drain during generation (not currently active):
-
-1. **`notify_drain()`** — can be called from Python after each forward pass.
+1. **`notify_drain()`** — called from Python in `_prepare_wrapper()` before
+   each forward pass.  Wakes the drain thread for the *previous* step's data.
    Non-blocking (~100 ns): sets a flag and signals the drain thread's CV.
 
-2. **`wait_for` timeout** — the drain thread can use `cv_.wait_for()` instead
-   of `cv_.wait()` to poll periodically.  Task entries are in managed memory
-   preferred on CPU, so polling `task_cpu_ready()` is a local DRAM read — no
-   PCIe traffic.
+2. **`cv_.wait_for` timeout (500 µs)** — safety net for the last step of
+   generation (no subsequent `_prepare_wrapper` call) and gaps between
+   `generate()` calls.  Task entries are in managed memory preferred on CPU,
+   so polling `task_cpu_ready()` is a local DRAM read — no PCIe traffic.
+
+A final flush loop at `stop()` calls `drain_ready()` → `cudaStreamSynchronize`
+→ `poll_completed()` until all task entries are processed, handling any
+stragglers.
 
 ### Effectful op and CUDA graph capture
 

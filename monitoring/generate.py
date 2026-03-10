@@ -181,6 +181,10 @@ def _install_prepare_wrapper(model: Any) -> None:
                 and getattr(engine, "_using_ring_transport", False)
                 and transport is not None
                 and transport._using_forward_hooks):
+            # Wake drain thread for the previous step's data.
+            if transport.drain_notify_on_forward:
+                transport._ring_engine.notify_drain()
+
             if isinstance(model_inputs, dict):
                 input_ids_val   = model_inputs.get("input_ids")
                 attention_mask  = model_inputs.get("attention_mask")

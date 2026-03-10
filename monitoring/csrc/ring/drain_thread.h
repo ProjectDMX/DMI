@@ -59,7 +59,9 @@ using DrainCallback = std::function<void(DrainedChunk&&)>;
 
 class DrainThread {
 public:
-    DrainThread(RingState& rs, PinnedPool& pool, DrainCallback cb);
+    // poll_timeout_us: 0 = infinite wait (only wake on notify/stop).
+    DrainThread(RingState& rs, PinnedPool& pool, DrainCallback cb,
+                uint64_t poll_timeout_us = 0);
     ~DrainThread() noexcept;
 
     DrainThread(const DrainThread&)            = delete;
@@ -106,6 +108,7 @@ private:
     // managed memory and avoids LOCK-prefix atomics on PCIe-mapped pages.
     uint64_t                 task_tail_local_{0};
     uint64_t                 heartbeat_local_{0};
+    uint64_t                 poll_timeout_us_{0};  // 0 = infinite wait
 
     // Flush barrier: counts chunks that have completed D2H + assembler call.
     // Written only by the drain thread; read by wait_until_completed().

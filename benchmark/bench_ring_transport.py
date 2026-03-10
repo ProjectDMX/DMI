@@ -103,6 +103,8 @@ class BenchConfig:
     ring_payload_mb: int = 4096
     ring_chunk_kb: int = 4096
     ring_pinned_mb: int = 4096
+    drain_poll_timeout_us: int = 0
+    drain_notify_on_forward: bool = True
 
     ch_parallelism: int = 10
     ch_queue_max_items: int = 1024
@@ -127,6 +129,8 @@ def _make_ring_cfg(cfg: BenchConfig):
     rc.payload_ring_bytes = cfg.ring_payload_mb * 1024 * 1024
     rc.chunk_bytes        = cfg.ring_chunk_kb   * 1024
     rc.pinned_pool_bytes  = cfg.ring_pinned_mb  * 1024 * 1024
+    rc.drain_poll_timeout_us   = cfg.drain_poll_timeout_us
+    rc.drain_notify_on_forward = cfg.drain_notify_on_forward
     return rc
 
 
@@ -362,6 +366,10 @@ def _parse_args() -> BenchConfig:
     g.add_argument("--ring-payload-mb",   type=int, default=4096)
     g.add_argument("--ring-chunk-kb",     type=int, default=4096)
     g.add_argument("--ring-pinned-mb",    type=int, default=4096)
+    g.add_argument("--drain-poll-timeout-us", type=int, default=0,
+                   help="Drain thread poll timeout in µs (0 = no timeout)")
+    g.add_argument("--no-drain-notify", action="store_true",
+                   help="Disable notify_drain() before each forward pass")
 
     g = p.add_argument_group("ClickHouse stage")
     g.add_argument("--ch-parallelism",       type=int, default=10)
@@ -384,6 +392,8 @@ def _parse_args() -> BenchConfig:
         cuda_graphs=bool(ns.cuda_graphs),
         ring_task_entries=ns.ring_task_entries, ring_payload_mb=ns.ring_payload_mb,
         ring_chunk_kb=ns.ring_chunk_kb, ring_pinned_mb=ns.ring_pinned_mb,
+        drain_poll_timeout_us=ns.drain_poll_timeout_us,
+        drain_notify_on_forward=not ns.no_drain_notify,
         ch_parallelism=ns.ch_parallelism, ch_queue_max_items=ns.ch_queue_max_items,
         ch_queue_max_size_mb=ns.ch_queue_max_size_mb,
         db_host=ns.db_host, db_port=ns.db_port, db_user=ns.db_user,

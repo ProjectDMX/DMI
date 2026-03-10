@@ -36,9 +36,21 @@ RingEngine::RingEngine(const RingConfig& cfg, TensorCallback cb)
             cb_cv_.notify_one();
         });
 
+    if (cfg_.drain_poll_timeout_us == 0 && !cfg_.drain_notify_on_forward) {
+        fprintf(stderr, "[ring_engine] WARNING: drain_poll_timeout_us=0 and "
+                "drain_notify_on_forward=false — drain thread will only flush "
+                "at stop(). Ring must hold all data or producer will deadlock.\n");
+    } else if (cfg_.drain_poll_timeout_us == 0 && cfg_.drain_notify_on_forward) {
+        fprintf(stderr, "[ring_engine] NOTE: drain_poll_timeout_us=0 with "
+                "drain_notify_on_forward=true — drain wakes once per forward. "
+                "Ring and task queue must hold at least one full forward pass "
+                "(all hooks) or producer will stall on backpressure.\n");
+    }
+
     drain_ = std::make_unique<DrainThread>(
         ring_.state(), pool_,
-        [this](DrainedChunk&& c) { assembler_->push(std::move(c)); });
+        [this](DrainedChunk&& c) { assembler_->push(std::move(c)); },
+        cfg_.drain_poll_timeout_us);
 }
 
 void RingEngine::init(cudaStream_t stream) {

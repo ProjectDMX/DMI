@@ -5,14 +5,16 @@
 #include "task_ring.cuh"   // task_cpu_ready, task_release_cpu (CPU-side helpers)
 #include "task_entry.h"    // TASK_FLAG_IS_DROP
 
+#include <chrono>
 #include <ctime>
 #include <stdexcept>
 
 namespace ring {
 
 // ---------------------------------------------------------------------------
-DrainThread::DrainThread(RingState& rs, PinnedPool& pool, DrainCallback cb)
-    : ring_(rs), pool_(pool), cb_(std::move(cb))
+DrainThread::DrainThread(RingState& rs, PinnedPool& pool, DrainCallback cb,
+                         uint64_t poll_timeout_us)
+    : ring_(rs), pool_(pool), cb_(std::move(cb)), poll_timeout_us_(poll_timeout_us)
 {
     if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess)
         throw std::runtime_error("DrainThread: cudaStreamCreate failed");
@@ -64,14 +66,19 @@ void DrainThread::loop() {
         drain_ready();
 
         if (pending_.empty()) {
-            // No in-flight copies: sleep until notified.
-            // In the CUDA graph path (hook_no_notify), Python calls
-            // notify_drain() after each forward pass.  In the eager path,
-            // cudaLaunchHostFunc calls notify() per hook.
+            // No in-flight copies: wait for notification or timeout.
+            // Python calls notify_drain() before each forward pass (wakes us
+            // for the previous step's data).  The timeout is a safety net for
+            // the last step or gaps between generate() calls.
             std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [this] {
+            auto pred = [this] {
                 return notified_ || !running_.load(std::memory_order_relaxed);
-            });
+            };
+            if (poll_timeout_us_ > 0) {
+                cv_.wait_for(lk, std::chrono::microseconds(poll_timeout_us_), pred);
+            } else {
+                cv_.wait(lk, pred);
+            }
             notified_ = false;
         } else {
             // D2H copies in flight: yield briefly and keep polling.
@@ -121,7 +128,9 @@ void DrainThread::drain_ready() {
         const uint64_t total_len = ec.payload_len1 + ec.payload_len2;
 
         PendingChunk pc{};
-        pc.payload_bytes = is_drop ? 0 : total_len;
+        // Release the aligned allocation size (may be > total_len due to
+        // PAYLOAD_ALIGN padding in the producer).
+        pc.payload_bytes = is_drop ? 0 : ec.payload_alloc_bytes;
         pc.meta = {
             nullptr,           // pinned — filled below for data chunks
             total_len,

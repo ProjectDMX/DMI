@@ -43,6 +43,14 @@ void diag_print_hook_counters() {
     DIAG_PRINT_ARRAY("writes",   g_diag_hook_writes);
 }
 
+// Payload allocation alignment (bytes).  Every reservation is rounded up to
+// this so that D2D copies can use vectorized uint4 (16-byte) loads/stores.
+static constexpr uint64_t PAYLOAD_ALIGN = 16;
+
+__device__ __host__ inline uint64_t align_up(uint64_t x, uint64_t a) {
+    return (x + a - 1) & ~(a - 1);
+}
+
 // ---------------------------------------------------------------------------
 // Null-mode device flag.
 // When true, producer_kernel returns immediately without touching the ring.
@@ -94,6 +102,9 @@ __global__ void producer_kernel(
         const uint64_t this_chunk = (src_bytes == 0) ? 0
                                     : (ci + 1 < n_chunks ? chunk_sz
                                                          : src_bytes - chunk_off);
+        // Round up to PAYLOAD_ALIGN so every span starts at an aligned offset,
+        // enabling vectorized uint4 D2D copies.
+        const uint64_t alloc_chunk = align_up(this_chunk, PAYLOAD_ALIGN);
 
         // Phase 1: thread 0 — backpressure + span reservation
         if (threadIdx.x == 0) {
@@ -108,7 +119,7 @@ __global__ void producer_kernel(
             if (ring.cfg.wait_policy == WaitPolicy::INFINITE) {
                 while (task_free_slots(task_head, *task_tail_v, ring.task_cap) < 1 ||
                        payload_free_bytes(payload_head, *payload_tail_v,
-                                          ring.payload_cap) < this_chunk)
+                                          ring.payload_cap) < alloc_chunk)
                 {
 #if __CUDA_ARCH__ >= 700
                     __nanosleep(128);
@@ -120,7 +131,7 @@ __global__ void producer_kernel(
 
                 while (task_free_slots(task_head, *task_tail_v, ring.task_cap) < 1 ||
                        payload_free_bytes(payload_head, *payload_tail_v,
-                                          ring.payload_cap) < this_chunk)
+                                          ring.payload_cap) < alloc_chunk)
                 {
                     uint64_t hb_now = *hb_v;
                     if (hb_now != hb_snap) {
@@ -139,10 +150,12 @@ __global__ void producer_kernel(
             sh.dropped      = dropped ? 1 : 0;
             sh.task_head    = task_head;
             sh.payload_head = payload_head;
+            // Reserve aligned size; spans.off1 is always PAYLOAD_ALIGN-aligned
+            // because payload_head is kept aligned.
             sh.spans        = dropped ? TwoSpan{0, 0, 0, 0}
                                       : payload_compute_spans(payload_head,
                                                               ring.payload_cap,
-                                                              this_chunk);
+                                                              alloc_chunk);
         }
 
         __syncthreads();
@@ -175,15 +188,49 @@ __global__ void producer_kernel(
             break;
         }
 
-        // Phase 2: all threads — cooperative D2D copy (grid-stride)
+        // Phase 2: all threads — cooperative D2D copy (grid-stride, vectorized)
+        //
+        // Payload offsets are always PAYLOAD_ALIGN-aligned (payload_head is
+        // kept aligned, payload_cap must be a multiple of PAYLOAD_ALIGN).
+        // Source tensors from PyTorch are 256-byte aligned (cudaMalloc).
+        // So both src and dst are 16-byte aligned → safe to use uint4.
         const TwoSpan&  spans   = sh.spans;
         const uint8_t*  src_ptr = src + chunk_off;
 
-        for (uint64_t i = threadIdx.x; i < spans.len1; i += blockDim.x)
-            ring.payload_buf[spans.off1 + i] = src_ptr[i];
+        // --- Span 1: copy this_chunk bytes (spans.len1 may include padding) ---
+        // Only the first span can contain actual data up to this_chunk bytes.
+        // spans was computed for alloc_chunk; actual data in span1 is
+        // min(this_chunk, spans.len1).
+        {
+            const uint64_t copy1 = (this_chunk < spans.len1) ? this_chunk : spans.len1;
+            const uint64_t n16 = copy1 / 16;
+            const uint64_t tail1 = copy1 - n16 * 16;
+            const uint4* s4 = reinterpret_cast<const uint4*>(src_ptr);
+            uint4*       d4 = reinterpret_cast<uint4*>(ring.payload_buf + spans.off1);
+            for (uint64_t i = threadIdx.x; i < n16; i += blockDim.x)
+                d4[i] = s4[i];
+            const uint64_t tb = n16 * 16;
+            for (uint64_t i = threadIdx.x; i < tail1; i += blockDim.x)
+                ring.payload_buf[spans.off1 + tb + i] = src_ptr[tb + i];
+        }
 
-        for (uint64_t i = threadIdx.x; i < spans.len2; i += blockDim.x)
-            ring.payload_buf[spans.off2 + i] = src_ptr[spans.len1 + i];
+        // --- Span 2 (wrap region): remaining actual data ---
+        {
+            // Data in span2 = this_chunk - min(this_chunk, spans.len1)
+            const uint64_t data_in_span1 = (this_chunk < spans.len1) ? this_chunk : spans.len1;
+            const uint64_t copy2 = this_chunk - data_in_span1;
+            if (copy2 > 0) {
+                const uint64_t n16 = copy2 / 16;
+                const uint64_t tail2 = copy2 - n16 * 16;
+                const uint4* s4 = reinterpret_cast<const uint4*>(src_ptr + data_in_span1);
+                uint4*       d4 = reinterpret_cast<uint4*>(ring.payload_buf + spans.off2);
+                for (uint64_t i = threadIdx.x; i < n16; i += blockDim.x)
+                    d4[i] = s4[i];
+                const uint64_t tb = n16 * 16;
+                for (uint64_t i = threadIdx.x; i < tail2; i += blockDim.x)
+                    ring.payload_buf[spans.off2 + tb + i] = src_ptr[data_in_span1 + tb + i];
+            }
+        }
 
         __threadfence();
         __syncthreads();
@@ -194,7 +241,12 @@ __global__ void producer_kernel(
             if (ci == 0)            flags |= TASK_FLAG_IS_FIRST;
             if (ci == n_chunks - 1) flags |= TASK_FLAG_IS_LAST;
 
-            payload_advance_head(payload_head, this_chunk);
+            // Advance head by aligned amount (keeps payload_head aligned)
+            payload_advance_head(payload_head, alloc_chunk);
+
+            // Compute actual data lengths per span for the consumer D2H copy.
+            const uint64_t data_in_span1 = (this_chunk < spans.len1) ? this_chunk : spans.len1;
+            const uint64_t data_in_span2 = this_chunk - data_in_span1;
 
             TaskEntry entry{};
             entry.seq_no             = task_head;
@@ -202,9 +254,10 @@ __global__ void producer_kernel(
             entry.chunk_offset_bytes = chunk_off;
             entry.tensor_total_bytes = src_bytes;
             entry.payload_off1       = spans.off1;
-            entry.payload_len1       = spans.len1;
+            entry.payload_len1       = data_in_span1;
             entry.payload_off2       = spans.off2;
-            entry.payload_len2       = spans.len2;
+            entry.payload_len2       = data_in_span2;
+            entry.payload_alloc_bytes = alloc_chunk;
             entry.chunk_idx          = static_cast<uint32_t>(ci);
             entry.hook_type          = hook_type;
             entry.hook_id            = hook_id;

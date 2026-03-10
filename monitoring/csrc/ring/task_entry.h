@@ -73,8 +73,11 @@ struct alignas(128) TaskEntry {
     uint32_t reason;              //  4 B  offset  88  DROP_REASON_* (drop entries only)
     uint32_t _pad0;               //  4 B  offset  92
 
+    // -- payload allocation (may be > len1+len2 due to alignment padding) --
+    uint64_t payload_alloc_bytes; //  8 B  offset  96  bytes to release from payload ring
+
     // -- explicit padding to reach 128 bytes --
-    uint8_t  _padding[32];        // 32 B  offset  96
+    uint8_t  _padding[24];        // 24 B  offset 104
                                   //       total  128 B
 };
 
@@ -96,5 +99,6 @@ static_assert(offsetof(TaskEntry, hook_type)          == 76);
 static_assert(offsetof(TaskEntry, hook_id)            == 80);
 static_assert(offsetof(TaskEntry, flags)              == 84);
 static_assert(offsetof(TaskEntry, reason)             == 88);
+static_assert(offsetof(TaskEntry, payload_alloc_bytes) == 96);
 
 }  // namespace ring

@@ -164,6 +164,8 @@ static ring::RingConfig convert(const RingConfig& c) {
     r.wait_policy                 = static_cast<ring::WaitPolicy>(c.wait_policy);
     r.no_progress_timeout_cycles  = c.no_progress_timeout_cycles;
     r.drop_reporting              = static_cast<ring::DropReporting>(c.drop_reporting);
+    r.drain_poll_timeout_us       = c.drain_poll_timeout_us;
+    r.drain_notify_on_forward     = c.drain_notify_on_forward;
     return r;
 }
 
