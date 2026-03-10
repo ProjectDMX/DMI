@@ -7,6 +7,7 @@
 #include "ring/drain_thread.h"
 #include "ring/ring_state.h"
 #include "ring/tensor_meta.h"
+#include "ring/ring_torch_op.h"
 
 #include <ATen/ATen.h>
 #include <cstring>
@@ -179,10 +180,12 @@ void RingEnginePy::init(uint64_t stream_handle) {
 
 void RingEnginePy::start() {
     ring::diag_reset_hook_counters();
+    ring_diag_reset_host_counters();
     impl_->engine.start();
 }
 void RingEnginePy::stop()  {
     impl_->engine.stop();
+    ring_diag_print_host_counters();
     ring::diag_print_hook_counters();
 }
 

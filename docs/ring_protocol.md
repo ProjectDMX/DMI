@@ -238,40 +238,59 @@ Since `seq_no` is a monotonically increasing 64-bit counter, collision with SENT
 
 ---
 
-## Known Issue: Inductor DCE of Q/K/V Producer Calls (CUDA Graphs)
+## Inductor DCE of Q/K/V Producer Calls (CUDA Graphs)
 
-**Status**: Open (confirmed 2026-03-10)
+**Status**: Root cause found, fix identified (2026-03-10)
 
-### Problem
+### Root Cause
 
-When `torch.compile(mode="reduce-overhead")` is used, PyTorch's inductor backend eliminates `ring::producer` calls for hook types **Q (6)**, **K (7)**, and **V (8)** during compiled decode steps. These hooks' input tensors are intermediate attention values (`hook_q`, `hook_k`, `hook_v`) that inductor determines have no downstream consumers — the void producer op's side-effect is not respected at the inductor IR level.
+Q/K/V tensors are **non-contiguous views** of the QKV projection output (e.g.
+shape `[1, 4, 12, 64]`, strides `(9216, 2304, 64, 1)`).  In `HookPoint.forward()`:
 
-### Impact
+```python
+x_cont = x.contiguous()          # creates NEW buffer for non-contiguous x
+torch.ops.ring.producer(x_cont)  # void, no return
+return x                          # original x returned, x_cont unused elsewhere
+```
 
-The `TensorMetaFifo` (FIFO matching between pre-pushed metadata and ring-drained entries) desyncs:
+Inductor sees `x_cont` feeds only a void op with no downstream dependency →
+eliminates both the `.contiguous()` copy and the `ring::producer` call.
 
-- `pre_push_all_metas()` pushes metadata for all 185 hooks per step (GPT-2, 12 layers)
-- Only 149 entries arrive per compiled decode step (36 Q/K/V calls eliminated)
-- 252 orphaned metas (3 types × 12 layers × 7 compiled steps) shift all FIFO pops
-- Result: metadata paired with wrong tensor data → corrupt DB entries
+All other hooks are inherently contiguous → `.contiguous()` is a no-op →
+`x_cont IS x` → buffer has downstream model consumers → inductor cannot DCE.
 
-### Confirmed via Device-Side Counters
+### Mechanism
+
+The DCE happens at **compile time**, before any CUDA graph capture:
+
+1. `torch.compile` traces the decode function and hands the FX graph to inductor
+2. Inductor sees Q/K/V `.contiguous()` creates an isolated buffer
+3. That buffer's only consumer is the void `ring::producer` → DCE eliminates both
+4. The compiled decode function no longer contains Q/K/V producer calls
+5. CUDA graph warmup/capture/replay all run compiled code — no Q/K/V
+
+Prefill is a separate compilation (different input shape, Q/K/V are contiguous
+at `q_len > 1`) that retains all 185 hooks.
+
+### Fix
+
+Return `x_cont` instead of `x` from `HookPoint.forward()`:
+
+```python
+x_cont = x.contiguous()
+torch.ops.ring.producer(x_cont, hook_type, hook_id)
+return x_cont   # x_cont is live → inductor cannot DCE
+```
+
+For contiguous hooks: no change (`x_cont IS x`).  For Q/K/V: adds a copy
+into the data path but preserves the producer call in the compiled graph.
+
+### Evidence (GPT-2, batch=4, 8 steps, 12 layers)
+
+Both host (`ring_producer_impl`) and device (`producer_kernel`) counters agree:
 
 ```
 Eager mode:    all types 96 or 8 → total=1480 (correct)
 CUDA graph:    Q=12 K=12 V=12 (prefill only), others unchanged → total=1228
 Missing:       252 = 1480 - 1228 = 3 × 12 × 7
 ```
-
-### DCE Prevention Approaches
-
-| Approach | FX DCE | Inductor DCE | CUDA Graphs |
-|----------|--------|--------------|-------------|
-| `_side_effectful_functions.add()` | ✅ Prevented | ❌ Still eliminated | ✅ Work |
-| `_register_effectful_op(ORDERED)` | ✅ Prevented | ✅ Prevented | ❌ Broken (effect token mutation) |
-
-### Potential Fixes
-
-1. **Prevent inductor DCE without breaking CUDA graphs** — find an inductor-level annotation or custom lowering that preserves the op node without introducing a mutable effect token
-2. **Keyed matching** — replace `TensorMetaFifo` with a `TensorMetaStore` keyed by `(hook_type, hook_id)` from `AssembledTensor`; unmatched metas are harmlessly skipped
-3. **Selective meta push** — skip pushing metas for Q/K/V under CUDA graph mode (accepts loss of Q/K/V monitoring data)

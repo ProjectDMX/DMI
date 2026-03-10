@@ -8,22 +8,44 @@
 // args are re-used — this pointer is never read.
 static ring_py::RingEnginePy* g_active_engine = nullptr;
 
+// Host-side call counter per hook_type (diagnostic)
+#include <cstdio>
+#include <atomic>
+#define HOST_HOOK_MAX 32
+static std::atomic<uint64_t> g_host_calls[HOST_HOOK_MAX] = {};
+
+void ring_diag_reset_host_counters() {
+    for (int i = 0; i < HOST_HOOK_MAX; ++i) g_host_calls[i].store(0);
+}
+
+void ring_diag_print_host_counters() {
+    uint64_t total = 0;
+    fprintf(stderr, "[ring_torch_op] host calls:");
+    for (int i = 0; i < HOST_HOOK_MAX; ++i) {
+        uint64_t v = g_host_calls[i].load();
+        if (v) { fprintf(stderr, " %d=%lu", i, v); total += v; }
+    }
+    fprintf(stderr, "  total=%lu\n", total);
+}
+
 void ring_set_active_engine(ring_py::RingEnginePy* e) {
     g_active_engine = e;
 }
 
 // Side-effect op: launches producer kernel to copy tensor bytes into ring
-// buffer.  Void return + _register_effectful_op prevents DCE.
+// buffer.  Void return + _register_effectful_op prevents DCE at FX level.
+// HookPoint.forward() returns x_cont (not original x) so inductor cannot
+// DCE the .contiguous() copy + producer call for non-contiguous tensors.
 //
-// Uses hook_no_notify() — the producer kernel only, no cudaLaunchHostFunc.
-// The hostfunc callback (used by the legacy non-graph path to wake the drain
-// thread) would be captured as a host node in the CUDA graph, causing an
-// ~18μs GPU→CPU→GPU round-trip per hook per decode step.  The drain thread
-// is instead notified via flush() at the end of each forward pass.
+// Uses hook_no_notify() — producer kernel only, no cudaLaunchHostFunc.
 void ring_producer_impl(
     const at::Tensor& tensor, int64_t hook_type, int64_t hook_id)
 {
-    if (g_active_engine && tensor.is_cuda() && tensor.is_contiguous()) {
+    if (!g_active_engine) return;
+    if (hook_type >= 0 && hook_type < HOST_HOOK_MAX)
+        g_host_calls[hook_type].fetch_add(1);
+
+    if (tensor.is_cuda() && tensor.is_contiguous()) {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
         g_active_engine->hook_no_notify(
             reinterpret_cast<uint64_t>(tensor.data_ptr()),

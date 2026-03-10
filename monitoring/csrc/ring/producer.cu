@@ -12,22 +12,35 @@ namespace ring {
 
 // --- Per-hook-type diagnostic counters (device side) ---
 #define HOOK_TYPE_MAX 32
-__device__ unsigned long long g_diag_hook_writes[HOOK_TYPE_MAX];
+__device__ unsigned long long g_diag_hook_writes[HOOK_TYPE_MAX];    // phase 3: published
+__device__ unsigned long long g_diag_hook_entered[HOOK_TYPE_MAX];   // kernel entry (before null check)
+__device__ unsigned long long g_diag_hook_active[HOOK_TYPE_MAX];    // after null check (real work)
+__device__ unsigned long long g_diag_hook_dropped[HOOK_TYPE_MAX];   // drop path
 
 void diag_reset_hook_counters() {
     unsigned long long zeros[HOOK_TYPE_MAX] = {};
-    cudaMemcpyToSymbol(g_diag_hook_writes, zeros, sizeof(zeros));
+    cudaMemcpyToSymbol(g_diag_hook_writes,  zeros, sizeof(zeros));
+    cudaMemcpyToSymbol(g_diag_hook_entered, zeros, sizeof(zeros));
+    cudaMemcpyToSymbol(g_diag_hook_active,  zeros, sizeof(zeros));
+    cudaMemcpyToSymbol(g_diag_hook_dropped, zeros, sizeof(zeros));
 }
 
+#define DIAG_PRINT_ARRAY(label, sym) do { \
+    unsigned long long h[HOOK_TYPE_MAX]; \
+    cudaMemcpyFromSymbol(h, sym, sizeof(h)); \
+    unsigned long long total = 0; \
+    fprintf(stderr, "[producer diag] %s:", label); \
+    for (int i = 0; i < HOOK_TYPE_MAX; ++i) { \
+        if (h[i]) { fprintf(stderr, " %d=%llu", i, h[i]); total += h[i]; } \
+    } \
+    fprintf(stderr, "  total=%llu\n", total); \
+} while(0)
+
 void diag_print_hook_counters() {
-    unsigned long long h[HOOK_TYPE_MAX];
-    cudaMemcpyFromSymbol(h, g_diag_hook_writes, sizeof(h));
-    unsigned long long total = 0;
-    fprintf(stderr, "[producer diag] writes per hook_type:");
-    for (int i = 0; i < HOOK_TYPE_MAX; ++i) {
-        if (h[i]) { fprintf(stderr, " %d=%llu", i, h[i]); total += h[i]; }
-    }
-    fprintf(stderr, "  total=%llu\n", total);
+    DIAG_PRINT_ARRAY("entered",  g_diag_hook_entered);
+    DIAG_PRINT_ARRAY("active",   g_diag_hook_active);
+    DIAG_PRINT_ARRAY("dropped",  g_diag_hook_dropped);
+    DIAG_PRINT_ARRAY("writes",   g_diag_hook_writes);
 }
 
 // ---------------------------------------------------------------------------
@@ -54,7 +67,13 @@ __global__ void producer_kernel(
     uint32_t        hook_type,
     uint32_t        hook_id)
 {
+    if (threadIdx.x == 0 && hook_type < HOOK_TYPE_MAX)
+        atomicAdd(&g_diag_hook_entered[hook_type], 1ULL);
+
     if (g_ring_null_mode) return;  // null/warmup mode: same launch, no ring writes
+
+    if (threadIdx.x == 0 && hook_type < HOOK_TYPE_MAX)
+        atomicAdd(&g_diag_hook_active[hook_type], 1ULL);
 
     __shared__ ProducerShmem sh;
 
@@ -129,6 +148,8 @@ __global__ void producer_kernel(
         __syncthreads();
 
         if (sh.dropped) {
+            if (threadIdx.x == 0 && hook_type < HOOK_TYPE_MAX)
+                atomicAdd(&g_diag_hook_dropped[hook_type], 1ULL);
             if (threadIdx.x == 0 &&
                 ring.cfg.drop_reporting == DropReporting::DROP_TASK &&
                 task_free_slots(task_head, *ring.task_tail, ring.task_cap) >= 1)

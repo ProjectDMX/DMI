@@ -259,14 +259,17 @@ class HookPoint(nn.Module):
         # guard, HF's internal auto-compile (mode="reduce-overhead") would
         # capture ring.producer in its CUDA graph.
         #
-        # We call ring.producer(x_cont) for the side-effect (launching the
-        # producer kernel into the CUDA graph) but return the ORIGINAL x.
+        # We return x_cont (not the original x) so that x_cont has downstream
+        # consumers in the model.  This prevents inductor from DCE'ing the
+        # .contiguous() copy + ring.producer call for non-contiguous tensors
+        # (Q/K/V views from QKV projection split).
         if self._name is not None and x.is_cuda:
             from .ring_transport import _active_transport
             if _active_transport is not None:
                 x_cont = x.contiguous()
                 torch.ops.ring.producer(
                     x_cont, self._ring_hook_type, self._ring_hook_id)
+                return x_cont
         return x
 
     def layer(self):
