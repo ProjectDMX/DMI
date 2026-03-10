@@ -257,15 +257,10 @@ class HookPoint(nn.Module):
         # Ring transport capture via C++ TORCH_LIBRARY op.
         # Only call ring.producer when a RingTransport is active.  Without this
         # guard, HF's internal auto-compile (mode="reduce-overhead") would
-        # capture ring.producer in its CUDA graph, allocate a stale output
-        # buffer (due to schema semantics), and produce wrong tokens each step.
+        # capture ring.producer in its CUDA graph.
         #
         # We call ring.producer(x_cont) for the side-effect (launching the
-        # producer kernel into the CUDA graph) but return the ORIGINAL x, not
-        # the ring.producer output.  This prevents the stale-buffer bug:
-        # x is always the graph-runner-updated input; x_cont (contiguous copy)
-        # is what the kernel reads — when x is already contiguous, inductor
-        # optimises the copy away so x_cont IS x (same buffer, no stale data).
+        # producer kernel into the CUDA graph) but return the ORIGINAL x.
         if self._name is not None and x.is_cuda:
             from .ring_transport import _active_transport
             if _active_transport is not None:

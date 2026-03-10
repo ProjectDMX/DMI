@@ -4,8 +4,11 @@
 // Lifecycle:
 //   DrainThread dt(ring_state, pool, callback);
 //   dt.start();
-//   // ... GPU producer kernels run, each followed by cudaLaunchHostFunc
-//   //     calling DrainThread::hostfunc_cb(&dt) to wake the drain thread ...
+//   // ... GPU producer kernels run ...
+//   // Wake-up options (at least one required):
+//   //   a. cudaLaunchHostFunc → hostfunc_cb(&dt)  (eager / non-graph path)
+//   //   b. dt.notify() from Python after each forward pass  (CUDA graph path)
+//   //   c. 500μs timeout fallback  (safety net)
 //   dt.stop();
 //
 // Per-chunk protocol:

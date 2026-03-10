@@ -6,8 +6,29 @@
 #include "producer.cuh"
 #include "payload_ring.cuh"
 #include "task_ring.cuh"
+#include <cstdio>
 
 namespace ring {
+
+// --- Per-hook-type diagnostic counters (device side) ---
+#define HOOK_TYPE_MAX 32
+__device__ unsigned long long g_diag_hook_writes[HOOK_TYPE_MAX];
+
+void diag_reset_hook_counters() {
+    unsigned long long zeros[HOOK_TYPE_MAX] = {};
+    cudaMemcpyToSymbol(g_diag_hook_writes, zeros, sizeof(zeros));
+}
+
+void diag_print_hook_counters() {
+    unsigned long long h[HOOK_TYPE_MAX];
+    cudaMemcpyFromSymbol(h, g_diag_hook_writes, sizeof(h));
+    unsigned long long total = 0;
+    fprintf(stderr, "[producer diag] writes per hook_type:");
+    for (int i = 0; i < HOOK_TYPE_MAX; ++i) {
+        if (h[i]) { fprintf(stderr, " %d=%llu", i, h[i]); total += h[i]; }
+    }
+    fprintf(stderr, "  total=%llu\n", total);
+}
 
 // ---------------------------------------------------------------------------
 // Null-mode device flag.
@@ -171,6 +192,8 @@ __global__ void producer_kernel(
 
             task_publish(ring.task_entries, ring.task_cap, task_head, entry);
             ++task_head;
+            if (hook_type < HOOK_TYPE_MAX)
+                atomicAdd(&g_diag_hook_writes[hook_type], 1ULL);
             *ring.task_head    = task_head;
             *ring.payload_head = payload_head;
         }

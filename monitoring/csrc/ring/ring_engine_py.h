@@ -98,6 +98,26 @@ public:
               uint32_t hook_type, uint32_t hook_id,
               uint64_t stream_handle);
 
+    // Launch producer kernel WITHOUT the hostfunc notification.
+    // Use this from ring_torch_op.cpp (CUDA graph path) where the hostfunc
+    // would be captured as a host node causing ~18μs GPU→CPU→GPU round-trip
+    // per hook per decode step.  The drain thread is notified separately
+    // via notify_drain() after each forward pass.
+    void hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
+                        uint64_t logical_task_id,
+                        uint32_t hook_type, uint32_t hook_id,
+                        uint64_t stream_handle);
+
+    // Lightweight wake-up for the drain thread.  Non-blocking: sets a flag
+    // and signals the condition variable so the drain thread starts
+    // processing any tasks that have landed in the ring.
+    //
+    // Call this from Python after each forward pass (outside the CUDA graph)
+    // so ring data is streamed out during generation rather than batched at
+    // stop() time.  Without this, the drain thread sleeps indefinitely when
+    // hook_no_notify() is used (no cudaLaunchHostFunc to wake it).
+    void notify_drain();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

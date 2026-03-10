@@ -1,9 +1,10 @@
 """Ring-transport benchmark.
 
-Compares three modes:
-  baseline  — plain HF generate, no monitoring
-  ring_null — ring transport active (GPU→CPU transfer), null sink (no DB write)
-  ring_db   — ring transport + ClickHouse ingestion
+Compares four modes:
+  baseline         — plain HF generate, no monitoring
+  ring_kernels_only— ring transport active, producer kernels fire but do zero work (null_mode on)
+  ring_null        — ring transport active (GPU→CPU transfer), null sink (no DB write)
+  ring_db          — ring transport + ClickHouse ingestion
 
 Per-step (prefill vs decode) timing is intentionally NOT reported here.
 Inserting a GPU sync barrier between every step breaks CUDA-graph pipelining
@@ -254,7 +255,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
     print(f"{'='*60}")
 
     engine = None
-    if mode == "ring_null":
+    if mode in ("ring_null", "ring_kernels_only"):
         model_id = f"bench::{mode}::{uuid.uuid4().hex[:8]}"
         engine = _make_null_engine(cfg, model_id)
         model.monitoring_engine = engine
@@ -280,10 +281,11 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         for _ in range(cfg.warmup):
             _run_one(model, input_ids, attention_mask,
                      cfg, eos_id, pad_id, use_monitoring)
-        if ring_engine is not None:
-            ring_engine.set_null_mode(False)
-        if ring_transport is not None:
-            ring_transport.null_offload = False
+        if mode != "ring_kernels_only":
+            if ring_engine is not None:
+                ring_engine.set_null_mode(False)
+            if ring_transport is not None:
+                ring_transport.null_offload = False
 
         # Measured iterations
         all_total_ms: List[float] = []
@@ -400,7 +402,7 @@ def main() -> None:
         raise SystemExit("CUDA required")
 
     device = torch.device("cuda")
-    valid = {"baseline", "ring_null", "ring_db"}
+    valid = {"baseline", "ring_kernels_only", "ring_null", "ring_db"}
     for m in cfg.modes:
         if m not in valid:
             raise SystemExit(f"Unknown mode {m!r}. Valid: {sorted(valid)}")

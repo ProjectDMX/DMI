@@ -279,7 +279,7 @@ def test_e2e_correctness_hf(subtests) -> None:
 
     # Ring engine config (ring transport replaces NativeMonitoringEngine D2H)
     ring_cfg = RingConfig()
-    ring_cfg.task_ring_entries = 1024
+    ring_cfg.task_ring_entries = 16384
     ring_cfg.payload_ring_bytes = 4 * 1024 * 1024 * 1024  # 4 GB
     ring_cfg.chunk_bytes = 4 * 1024 * 1024                # 4 MB chunks
     ring_cfg.pinned_pool_bytes = 4 * 1024 * 1024 * 1024  # 4 GB pinned ring
@@ -840,7 +840,7 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     host_cfg     = HostEngineConfig(stages=[insert_stage])
 
     ring_cfg = RingConfig()
-    ring_cfg.task_ring_entries  = 1024
+    ring_cfg.task_ring_entries  = 16384
     ring_cfg.payload_ring_bytes = 4 * 1024 * 1024 * 1024
     ring_cfg.chunk_bytes        = 4 * 1024 * 1024
     ring_cfg.pinned_pool_bytes  = 4 * 1024 * 1024 * 1024
@@ -915,6 +915,7 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     finally:
         ch.close()
 
+    print(f"\n[DEBUG] Total DB rows: {len(rows)}")
     if not rows:
         pytest.fail(f"No rows found in ClickHouse for model_id={unique_run_model_id!r}. "
                     "This means monitoring produced no output at all under CUDA graphs.")
@@ -932,6 +933,23 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
         ).append((int(s), int(e), t_raw.detach().cpu()))
 
     request_ids = sorted(grouped.keys(), key=_parse_request_id)
+
+    # DEBUG: show per-request hook chunk counts
+    from collections import Counter
+    hook_totals = Counter()
+    for rid in request_ids:
+        hooks_map = grouped[rid]
+        for (layer, hname), chunks in hooks_map.items():
+            hook_totals[hname] += len(chunks)
+    print(f"[DEBUG] Hook totals across all requests:")
+    for hname in ['token_ids', 'hook_embed', 'hook_pos_embed', 'blocks.0.hook_resid_pre', 'blocks.11.hook_resid_post', 'hook_final_ln', 'final_logits']:
+        print(f"  {hname}: {hook_totals.get(hname, 0)} chunks")
+    rid = request_ids[0]
+    hooks_map = grouped[rid]
+    print(f"[DEBUG] All hooks for {rid}:")
+    for (layer, hname) in sorted(hooks_map.keys()):
+        chunks = hooks_map[(layer, hname)]
+        print(f"  ({layer},{hname}): {len(chunks)} chunks")
 
     # -----------------------------------------------------------------------
     # HF reference (no compile — plain eager generate + rollout)

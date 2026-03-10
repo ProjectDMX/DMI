@@ -435,6 +435,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_null_mode",
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),
+           py::call_guard<py::gil_scoped_release>())
+      // Lightweight wake-up for the drain thread (non-blocking).
+      // Call after each forward pass when using hook_no_notify() (CUDA graph path).
+      .def("notify_drain",
+           &ring_py::RingEnginePy::notify_drain,
            py::call_guard<py::gil_scoped_release>());
 
   // Register the active ring engine pointer so C++ ring_producer_impl can

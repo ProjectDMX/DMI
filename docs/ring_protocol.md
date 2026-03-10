@@ -188,6 +188,44 @@ The producer post-op must be **capture-safe**:
 
 The drain loop and host pipeline run **outside** the captured graph on their own streams/threads and are not subject to capture constraints.
 
+### Drain thread wake-up in CUDA graph mode
+
+In the non-graph (eager) path, each producer kernel is followed by a
+`cudaLaunchHostFunc` that calls `drain_thread.notify()` to wake the drain
+thread.  This cannot be used in CUDA graphs because `cudaLaunchHostFunc` is
+captured as a **host node**, causing ~18 μs GPU→CPU→GPU round-trip per hook
+per graph replay (see `ring_overhead.md` for measured data).
+
+Instead, the CUDA graph path uses `hook_no_notify()` (producer kernel only,
+no hostfunc).  The drain thread may sleep through the entire `generate()` call.
+All ring data is flushed at `stop()` time: the drain thread's final cleanup
+loop calls `drain_ready()` → `cudaStreamSynchronize` → `poll_completed()`
+until all task entries are processed.
+
+Optional mechanisms for streaming drain during generation (not currently active):
+
+1. **`notify_drain()`** — can be called from Python after each forward pass.
+   Non-blocking (~100 ns): sets a flag and signals the drain thread's CV.
+
+2. **`wait_for` timeout** — the drain thread can use `cv_.wait_for()` instead
+   of `cv_.wait()` to poll periodically.  Task entries are in managed memory
+   preferred on CPU, so polling `task_cpu_ready()` is a local DRAM read — no
+   PCIe traffic.
+
+### Effectful op and CUDA graph capture
+
+`ring::producer` is registered as an effectful op (`_register_effectful_op`
+with `_EffectType.ORDERED`) to prevent dead-code elimination by inductor.
+This wraps the op in a `with_effects` HOP that threads an effect token
+(zero-element tensor) as input→output.
+
+With `torch.compile(mode="reduce-overhead")`, the cudagraph tree runtime
+logs `"skipping cudagraphs due to mutated inputs"` on the first warmup
+invocation because the effect token isn't yet a cudagraph-recorded tensor.
+This is **harmless** — the runtime falls back to eager only for warmup,
+then uses CUDA graphs for all subsequent calls once the token is recognized
+as a cudagraph-managed tensor.
+
 ---
 
 ## Sequence Guard Invariant
@@ -197,3 +235,43 @@ The drain loop and host pipeline run **outside** the captured graph on their own
 `ready_seq = seq_no` (any other value) means the producer has published the entry with that sequence number and all other fields are valid.
 
 Since `seq_no` is a monotonically increasing 64-bit counter, collision with SENTINEL would require ~5.8×10^11 years at 10^9 slots/second.  No wraparound guard is necessary.
+
+---
+
+## Known Issue: Inductor DCE of Q/K/V Producer Calls (CUDA Graphs)
+
+**Status**: Open (confirmed 2026-03-10)
+
+### Problem
+
+When `torch.compile(mode="reduce-overhead")` is used, PyTorch's inductor backend eliminates `ring::producer` calls for hook types **Q (6)**, **K (7)**, and **V (8)** during compiled decode steps. These hooks' input tensors are intermediate attention values (`hook_q`, `hook_k`, `hook_v`) that inductor determines have no downstream consumers — the void producer op's side-effect is not respected at the inductor IR level.
+
+### Impact
+
+The `TensorMetaFifo` (FIFO matching between pre-pushed metadata and ring-drained entries) desyncs:
+
+- `pre_push_all_metas()` pushes metadata for all 185 hooks per step (GPT-2, 12 layers)
+- Only 149 entries arrive per compiled decode step (36 Q/K/V calls eliminated)
+- 252 orphaned metas (3 types × 12 layers × 7 compiled steps) shift all FIFO pops
+- Result: metadata paired with wrong tensor data → corrupt DB entries
+
+### Confirmed via Device-Side Counters
+
+```
+Eager mode:    all types 96 or 8 → total=1480 (correct)
+CUDA graph:    Q=12 K=12 V=12 (prefill only), others unchanged → total=1228
+Missing:       252 = 1480 - 1228 = 3 × 12 × 7
+```
+
+### DCE Prevention Approaches
+
+| Approach | FX DCE | Inductor DCE | CUDA Graphs |
+|----------|--------|--------------|-------------|
+| `_side_effectful_functions.add()` | ✅ Prevented | ❌ Still eliminated | ✅ Work |
+| `_register_effectful_op(ORDERED)` | ✅ Prevented | ✅ Prevented | ❌ Broken (effect token mutation) |
+
+### Potential Fixes
+
+1. **Prevent inductor DCE without breaking CUDA graphs** — find an inductor-level annotation or custom lowering that preserves the op node without introducing a mutable effect token
+2. **Keyed matching** — replace `TensorMetaFifo` with a `TensorMetaStore` keyed by `(hook_type, hook_id)` from `AssembledTensor`; unmatched metas are harmlessly skipped
+3. **Selective meta push** — skip pushing metas for Q/K/V under CUDA graph mode (accepts loss of Q/K/V monitoring data)

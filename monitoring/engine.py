@@ -349,6 +349,9 @@ class MonitoringEngine:
                     token_ranges.append((start_i, end_i))
                     starts[i] = end_i
 
+        import os
+        if os.environ.get("RING_DEBUG_STEP"):
+            print(f"[ring_step] prefill={is_prefill} token_ranges={token_ranges} finished={list(finished)}")
         self._ring_transport.set_step_context(
             model_id=str(self._model_id),
             shard_rank=0,

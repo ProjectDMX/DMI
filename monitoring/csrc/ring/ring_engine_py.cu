@@ -20,7 +20,13 @@ void launch_producer_with_notify(
     const RingState& ring, const uint8_t* d_src, uint64_t src_bytes,
     uint64_t logical_task_id, uint32_t hook_type, uint32_t hook_id,
     cudaHostFn_t notify_fn, void* notify_arg, cudaStream_t stream);
+void launch_producer(
+    const RingState& ring, const uint8_t* d_src, uint64_t src_bytes,
+    uint64_t logical_task_id, uint32_t hook_type, uint32_t hook_id,
+    cudaStream_t stream);
 void set_ring_null_mode(bool enabled);
+void diag_reset_hook_counters();
+void diag_print_hook_counters();
 }  // namespace ring
 
 namespace ring_py {
@@ -171,8 +177,14 @@ void RingEnginePy::init(uint64_t stream_handle) {
     impl_->engine.init(reinterpret_cast<cudaStream_t>(stream_handle));
 }
 
-void RingEnginePy::start() { impl_->engine.start(); }
-void RingEnginePy::stop()  { impl_->engine.stop();  }
+void RingEnginePy::start() {
+    ring::diag_reset_hook_counters();
+    impl_->engine.start();
+}
+void RingEnginePy::stop()  {
+    impl_->engine.stop();
+    ring::diag_print_hook_counters();
+}
 
 void RingEnginePy::flush(uint64_t stream_handle) {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
@@ -225,6 +237,22 @@ void RingEnginePy::hook(uint64_t d_ptr, uint64_t nbytes,
         ring::DrainThread::hostfunc_cb,
         &impl_->engine.drain_thread(),
         reinterpret_cast<cudaStream_t>(stream_handle));
+}
+
+void RingEnginePy::hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
+                                  uint64_t logical_task_id,
+                                  uint32_t hook_type, uint32_t hook_id,
+                                  uint64_t stream_handle)
+{
+    ring::launch_producer(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr),
+        nbytes, logical_task_id, hook_type, hook_id,
+        reinterpret_cast<cudaStream_t>(stream_handle));
+}
+
+void RingEnginePy::notify_drain() {
+    impl_->engine.drain_thread().notify();
 }
 
 }  // namespace ring_py

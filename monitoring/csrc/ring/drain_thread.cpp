@@ -65,6 +65,9 @@ void DrainThread::loop() {
 
         if (pending_.empty()) {
             // No in-flight copies: sleep until notified.
+            // In the CUDA graph path (hook_no_notify), Python calls
+            // notify_drain() after each forward pass.  In the eager path,
+            // cudaLaunchHostFunc calls notify() per hook.
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [this] {
                 return notified_ || !running_.load(std::memory_order_relaxed);
@@ -76,9 +79,27 @@ void DrainThread::loop() {
             nanosleep(&ts, nullptr);
         }
     }
-    // Final drain: pick up any chunks whose D2H completed after stop().
-    cudaStreamSynchronize(stream_);
-    poll_completed();
+    // Final drain: process all remaining task entries and complete D2H copies.
+    // When hook_no_notify() is used (CUDA graph path) and no explicit
+    // notify/timeout fired, the drain thread may have slept through the
+    // entire generate() call.  This loop ensures stop() flushes everything.
+    // Ensure all GPU work (including CUDA graph replay) has completed before
+    // draining.  Without this, the last graph replay's producer kernels may
+    // still be in-flight, leaving task entries with ready_seq == SENTINEL.
+    cudaDeviceSynchronize();
+    uint64_t flush_total = 0;
+    for (;;) {
+        uint64_t before = task_tail_local_;
+        drain_ready();
+        flush_total += (task_tail_local_ - before);
+        cudaStreamSynchronize(stream_);
+        poll_completed();
+        if (pending_.empty() &&
+            !task_cpu_ready(ring_.task_entries, ring_.task_cap, task_tail_local_))
+            break;
+    }
+    fprintf(stderr, "[drain_thread] flush: drained %lu entries, final tail=%lu\n",
+            flush_total, task_tail_local_);
 }
 
 // ---------------------------------------------------------------------------
