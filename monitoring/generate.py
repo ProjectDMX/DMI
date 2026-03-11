@@ -21,6 +21,11 @@ def _install_monitoring_forward(model: Any) -> None:
 
     @functools.wraps(orig_forward)
     def monitored_forward(*f_args: Any, **f_kwargs: Any):
+        # Guard: if re-entered from run_with_cache → self(), just call orig_forward
+        fwd_fn = f_kwargs.pop("forward_fn", None)
+        if fwd_fn is not None:
+            return fwd_fn(*f_args, **f_kwargs)
+
         engine = getattr(model, "monitoring_engine", None)
         phase = "prefill" if f_kwargs.get("past_key_values") is None else "decode"
         try:

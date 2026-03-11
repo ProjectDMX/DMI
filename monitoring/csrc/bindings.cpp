@@ -1,6 +1,7 @@
 // Pybind11 module + factory
 
 #include "native_engine_internal.h"
+#include "graph_native_delegate.h"
 #include "clickhouse_client.h"
 // dmx_host pipeline
 #include "dmx_host_engine.h"
@@ -28,6 +29,14 @@ std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,
       host_copy_threads,
       host_copy_queue_size);
 }
+
+py::dict parse_shadow_block(const at::Tensor& metadata,
+                            const std::vector<int64_t>& slot_ids,
+                            const std::vector<std::string>& hook_names);
+
+class GraphNativeDelegate;
+std::shared_ptr<GraphNativeDelegate> create_graph_delegate(
+    const std::shared_ptr<NativeMonitoringEngine>& backend);
 
 }  // namespace monitoring
 
@@ -68,11 +77,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &monitoring::NativeMonitoringEngine::create_global_hook_callback_sig,
            py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
            py::arg("target_device") = py::none())
+      .def("register_hook_callback", &monitoring::NativeMonitoringEngine::register_hook_callback,
+           py::arg("hook_point"), py::arg("hook_name"), py::arg("cache_name"), py::arg("is_backward"),
+           py::arg("remove_batch_dim"), py::arg("slice_tuple"), py::arg("target_device"),
+           py::arg("prepend") = false)
+      .def("create_inline_hook_ticket", &monitoring::NativeMonitoringEngine::create_inline_hook_ticket,
+           py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
+           py::arg("target_device") = py::none())
+      .def("create_inline_monitor_handle", &monitoring::NativeMonitoringEngine::create_inline_monitor_handle,
+           py::arg("hook_name"), py::arg("cache_name"), py::arg("remove_batch_dim"),
+           py::arg("slice_tuple"), py::arg("target_device") = py::none())
+      .def("monitor_inline", &monitoring::NativeMonitoringEngine::monitor_inline,
+           py::arg("ticket"), py::arg("hook_name"), py::arg("cache_name"), py::arg("tensor"))
       .def("set_enabled_hooks", &monitoring::NativeMonitoringEngine::set_enabled_hooks,
            py::arg("enabled_names"))
       .def("collect_step_futures_into",
            &monitoring::NativeMonitoringEngine::collect_step_futures_into,
            py::arg("step_id"), py::arg("cache"))
+      .def("submit_step_soa", &monitoring::NativeMonitoringEngine::submit_step_soa,
+           py::arg("step_id"), py::arg("spec"), py::arg("stream_handle") = std::optional<uint64_t>())
       .def("add_task", &monitoring::NativeMonitoringEngine::add_task,
            py::arg("step_id"), py::arg("task"))
       .def("seal_step", &monitoring::NativeMonitoringEngine::seal_step,
@@ -94,6 +117,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("close", &monitoring::NativeMonitoringEngine::close)
       .def("clear_completed_results", &monitoring::NativeMonitoringEngine::clear_completed_results)
       .def("get_stats", &monitoring::NativeMonitoringEngine::get_stats);
+
+  py::class_<monitoring::GraphNativeDelegate, std::shared_ptr<monitoring::GraphNativeDelegate>>(m,
+                                                                                                "GraphNativeDelegate")
+      .def(py::init<const std::shared_ptr<monitoring::NativeMonitoringEngine>&>(),
+           py::arg("backend"))
+      .def("submit_and_resolve", &monitoring::GraphNativeDelegate::submit_and_resolve,
+           py::arg("step_id"), py::arg("metadata"), py::arg("slot_ids"),
+           py::arg("hook_names"), py::arg("stream_handle") = std::optional<uint64_t>());
+
+  m.def("monitor_activation", &monitoring::monitor_activation,
+        py::arg("tensor"), py::arg("handle"));
+  m.def("parse_shadow_block", &monitoring::parse_shadow_block,
+        py::arg("metadata"), py::arg("slot_ids"), py::arg("hook_names"));
+  m.def("create_graph_delegate", &monitoring::create_graph_delegate,
+        py::arg("backend"));
+
 
   // C++ BackendFuture class exposed to Python with the same interface as before.
   py::class_<monitoring::BackendFuture>(m, "BackendFuture")

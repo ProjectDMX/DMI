@@ -204,6 +204,36 @@ std::pair<int64_t, int64_t> NativeMonitoringEngine::Impl::add_task_from_config(c
   return std::pair<int64_t, int64_t> (token, task_bytes);
 }
 
+int64_t NativeMonitoringEngine::Impl::process_native_hook(const HookConfig& cfg,
+                                                          at::Tensor tensor,
+                                                          const std::string& gate_name,
+                                                          const std::string& cache_name) {
+  stats_hook_calls_.fetch_add(1, std::memory_order_relaxed);
+  if (!is_capture_enabled()) {
+    return 0;
+  }
+  bool enabled = false;
+  {
+    std::lock_guard<std::mutex> lock(enabled_mutex_);
+    enabled = is_hook_enabled_unlocked(gate_name);
+  }
+  if (!enabled) {
+    return 0;
+  }
+  if (tensor.requires_grad()) {
+    tensor = tensor.detach();
+  }
+  int64_t step_id = current_step_id_.load(std::memory_order_acquire);
+  auto task_add_pair = add_task_from_config(cfg, std::move(tensor), step_id);
+  int64_t token = task_add_pair.first;
+  int64_t task_size = task_add_pair.second;
+  if (token != 0) {
+    stats_hook_enqueued_.fetch_add(1, std::memory_order_relaxed);
+    record_step_name_token(step_id, cache_name, token, task_size);
+  }
+  return token;
+}
+
 void NativeMonitoringEngine::Impl::set_enabled_hooks(py::object names_iterable) {
   std::lock_guard<std::mutex> lock(enabled_mutex_);
   enabled_hooks_.clear();

@@ -99,6 +99,10 @@ def _resolve_model_id(model: str) -> str:
     return _MODEL_ALIASES.get(model.lower(), model)
 
 
+def _graph_module_filter(name, module) -> bool:
+    return hasattr(module, "monitor_activation")
+
+
 # ---------------------------------------------------------------------------
 # Small utils (inlined to avoid test-only deps)
 # ---------------------------------------------------------------------------
@@ -113,6 +117,31 @@ def bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     a8 = a.cpu().contiguous().view(torch.uint8)
     b8 = b.cpu().contiguous().view(torch.uint8)
     return torch.equal(a8, b8)
+
+
+def _max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
+    if a.shape != b.shape or a.numel() == 0:
+        return float("nan")
+    af = a.float()
+    bf = b.float()
+    finite = torch.isfinite(af) & torch.isfinite(bf)
+    if not bool(finite.any().item()):
+        return float("nan")
+    return float((af[finite] - bf[finite]).abs().max().item())
+
+
+def _diff_summary(a: torch.Tensor, b: torch.Tensor) -> str:
+    if a.shape != b.shape:
+        return f"shape_mismatch db={tuple(a.shape)} ref={tuple(b.shape)}"
+    a_nan = int(torch.isnan(a).sum().item()) if a.is_floating_point() else 0
+    b_nan = int(torch.isnan(b).sum().item()) if b.is_floating_point() else 0
+    return f"max_abs={_max_abs_diff(a, b)} db_nan={a_nan} ref_nan={b_nan}"
+
+
+def _allclose_equal(a: torch.Tensor, b: torch.Tensor, *, atol: float, rtol: float) -> bool:
+    if a.shape != b.shape:
+        return False
+    return torch.allclose(a.float(), b.float(), atol=atol, rtol=rtol, equal_nan=True)
 
 
 def get_num_layers_from_config(hf_model) -> int:
@@ -158,6 +187,13 @@ def _canon_layer_and_act(act_name_raw: str, layer_no_raw: int) -> Tuple[int, str
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA + native backend required")
 def test_e2e_correctness_hf(subtests) -> None:
+    monitoring_mode = os.environ.get("E2E_MONITORING_MODE", "legacy").strip().lower()
+    if monitoring_mode == "dual_compile":
+        _test_e2e_correctness_hf_dual_compile(subtests)
+        return
+    if monitoring_mode != "legacy":
+        pytest.skip(f"Unsupported E2E_MONITORING_MODE={monitoring_mode!r}")
+
     try:
         import clickhouse_driver  # noqa: F401
     except Exception:
@@ -689,3 +725,358 @@ def test_e2e_correctness_hf(subtests) -> None:
                         f"resid_post mismatch layer={layer_no} "
                         f"(max_abs={float((db_t.float() - hs.float()).abs().max().item())})"
                     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA + torch.compile required")
+def _test_e2e_correctness_hf_dual_compile(subtests) -> None:
+    try:
+        from monitoring import GraphSafeEngine  # type: ignore
+        from monitoring.config import CaptureSchedule, HookSelection, MonitoringConfig  # type: ignore
+        from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
+        from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2Model  # type: ignore
+    except Exception as exc:
+        pytest.skip(f"dual_compile deps not available: {exc}")
+
+    batch_size = int(os.environ.get("E2E_BATCH_SIZE", "4"))
+    max_new_tokens = int(os.environ.get("E2E_MAX_NEW_TOKENS", "8"))
+    hf_model_id = _resolve_model_id(os.environ.get("E2E_MODEL", "gpt2"))
+    print_text = int(os.environ.get("E2E_PRINT_TEXT", "0")) == 1
+    print_hook_shapes = int(os.environ.get("E2E_PRINT_HOOK_SHAPES", "0")) == 1
+    print_hook_rows = int(os.environ.get("E2E_PRINT_HOOK_ROWS", "0")) == 1
+    hf_drop_last_token = int(os.environ.get("E2E_HF_DROP_LAST_TOKEN", "0")) == 1
+    dual_keep_record = int(os.environ.get("E2E_DUAL_KEEP_RECORD", "0")) == 1
+    dual_atol = float(os.environ.get("E2E_DUAL_ATOL", "0.2"))
+    dual_rtol = float(os.environ.get("E2E_DUAL_RTOL", "1e-3"))
+
+    if "qwen3" in hf_model_id.lower():
+        pytest.skip("dual_compile correctness path currently supports GPT-2 only")
+    if max_new_tokens < 2:
+        pytest.skip("dual_compile correctness path requires E2E_MAX_NEW_TOKENS >= 2")
+    if not hasattr(torch, "compile"):
+        pytest.skip("torch.compile is required")
+
+    device = torch.device("cuda")
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
+    eos_id = int(tokenizer.eos_token_id)
+    pad_id = int(tokenizer.pad_token_id)
+
+    prompt_text = os.environ.get("E2E_PROMPT", "Hello world")
+    prompts = [prompt_text] * batch_size
+    encoded = tokenizer(prompts, return_tensors="pt", padding=True)
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    prompt_len = int(attention_mask[0].sum().item())
+
+    mon_cfg = MonitoringConfig(
+        hooks=HookSelection(mode="full"),
+        schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
+    )
+
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        hf_model_id,
+        attn_implementation="eager",
+        torch_dtype=torch.float16,
+    ).to(device).eval()
+    mon_model = HookedGPT2Model.from_pretrained(
+        hf_model_id,
+        attn_implementation="eager",
+        torch_dtype=torch.float16,
+    ).to(device).eval()
+    engine = GraphSafeEngine(
+        config=mon_cfg,
+        module_filter=_graph_module_filter,
+        max_slots=4096,
+        device=device,
+        graph_mode="dual_compile",
+    )
+    engine.prepare_for_model(mon_model)
+
+    slot_map = {sid: info.module_name for sid, info in engine.get_slot_mapping().items()}
+    lm_head = hf_model.lm_head
+    n_layers = get_num_layers_from_config(hf_model)
+    wanted_suffixes = {"hook_embed", "hook_final_ln"}
+    for layer_no in range(n_layers):
+        wanted_suffixes.add(f"blocks.{layer_no}.hook_resid_pre")
+        if (layer_no + 1) < n_layers:
+            wanted_suffixes.add(f"blocks.{layer_no}.hook_resid_post")
+
+    def _project_logits(hidden_states: torch.Tensor) -> torch.Tensor:
+        return lm_head(hidden_states)
+
+    def _forward_step(token: torch.Tensor, cache, cache_position: torch.Tensor) -> torch.Tensor:
+        outputs = mon_model(
+            token,
+            use_cache=True,
+            past_key_values=cache,
+            cache_position=cache_position,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=True,
+        )
+        return _project_logits(outputs.last_hidden_state)
+
+    compiled_forward = torch.compile(_forward_step, mode="reduce-overhead", fullgraph=False)
+    max_cache_len = prompt_len + max_new_tokens + 8
+    cache = StaticCache(config=mon_model.config, max_cache_len=max_cache_len)
+
+    def _prefill_into(cache_obj) -> torch.Tensor:
+        cache_obj.reset()
+        outputs = mon_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            past_key_values=cache_obj,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=True,
+        )
+        return torch.argmax(_project_logits(outputs.last_hidden_state)[:, -1, :], dim=-1, keepdim=True)
+
+    try:
+        for frame in (0, 1):
+            engine.disable_record()
+            token0 = _prefill_into(cache)
+            engine.enable_record()
+            engine.set_frame(frame)
+            cache_pos = torch.tensor([prompt_len], device=device, dtype=torch.long)
+            for _ in range(4):
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    compiled_forward(token0, cache, cache_pos)
+            torch.cuda.synchronize()
+
+        engine.finalize_dual_frame()
+        engine.select_hooks(sorted(wanted_suffixes))
+        if not dual_keep_record:
+            engine.disable_record()
+
+            for frame in (0, 1):
+                token0 = _prefill_into(cache)
+                engine.set_frame(frame)
+                cache_pos = torch.tensor([prompt_len], device=device, dtype=torch.long)
+                for _ in range(4):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    with torch.no_grad():
+                        compiled_forward(token0, cache, cache_pos)
+                torch.cuda.synchronize()
+
+        current_token = _prefill_into(cache)
+        generated_tokens: List[torch.Tensor] = [current_token.detach().cpu()]
+        collected_steps: Dict[int, Dict[int, torch.Tensor]] = {}
+
+        total_decode_steps = max_new_tokens
+        for step_idx in range(total_decode_steps):
+            engine.start_step()
+            cache_pos = torch.tensor([prompt_len + step_idx], device=device, dtype=torch.long)
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.no_grad():
+                logits = compiled_forward(current_token, cache, cache_pos)
+            engine.end_step()
+
+            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            if step_idx < max_new_tokens - 1:
+                generated_tokens.append(next_token.detach().cpu())
+            current_token = next_token
+
+            ready = engine.collect_dual_frame_results(wait=(step_idx >= 1))
+            if ready is not None and 0 <= (step_idx - 1) < (max_new_tokens - 1):
+                collected_steps[step_idx - 1] = {
+                    int(slot_id): tensor.detach().cpu()
+                    for slot_id, tensor in ready.items()
+                }
+                if print_hook_shapes:
+                    shape_dump = {
+                        slot_map.get(int(slot_id), f"slot_{slot_id}"): tuple(tensor.shape)
+                        for slot_id, tensor in ready.items()
+                        if slot_map.get(int(slot_id)) in wanted_suffixes
+                    }
+                    print(f"DUAL READY step={step_idx - 1} shapes={shape_dump}")
+
+        if len(collected_steps) != max_new_tokens - 1:
+            raise AssertionError(
+                f"dual_compile collected {len(collected_steps)} decode steps, "
+                f"expected {max_new_tokens - 1}"
+            )
+    finally:
+        engine.close()
+
+    def _compiled_hf_decode_refs() -> Tuple[List[torch.Tensor], List[List[torch.Tensor]]]:
+        ref_cache = StaticCache(config=hf_model.config, max_cache_len=max_cache_len)
+
+        def _hf_prefill_into(cache_obj: StaticCache) -> torch.Tensor:
+            cache_obj.reset()
+            outputs = hf_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+                past_key_values=cache_obj,
+                output_hidden_states=False,
+                output_attentions=False,
+                return_dict=True,
+                logits_to_keep=0,
+            )
+            return torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+
+        def _hf_forward_step(token: torch.Tensor, cache, cache_position: torch.Tensor):
+            outputs = hf_model(
+                token,
+                use_cache=True,
+                past_key_values=cache,
+                cache_position=cache_position,
+                output_hidden_states=True,
+                output_attentions=False,
+                return_dict=True,
+            )
+            return outputs.logits, tuple(outputs.hidden_states)
+
+        compiled_hf_forward = torch.compile(_hf_forward_step, mode="reduce-overhead", fullgraph=False)
+        token = _hf_prefill_into(ref_cache)
+        generated: List[torch.Tensor] = [token.detach().cpu()]
+        step_hidden_states: List[List[torch.Tensor]] = []
+
+        for step_idx in range(max_new_tokens):
+            cache_pos = torch.tensor([prompt_len + step_idx], device=device, dtype=torch.long)
+            torch.compiler.cudagraph_mark_step_begin()
+            logits, hidden_states = compiled_hf_forward(token, ref_cache, cache_pos)
+            step_hidden_states.append([h.detach().cpu() for h in hidden_states])
+            token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            if step_idx < max_new_tokens - 1:
+                generated.append(token.detach().cpu())
+
+        return generated, step_hidden_states
+
+    hf_compiled_generated_tokens, hf_compiled_step_hidden = _compiled_hf_decode_refs()
+
+    def _decode(ids: torch.Tensor) -> str:
+        return tokenizer.decode(ids.tolist(), skip_special_tokens=False)
+
+    monitor_token_ids_by_req: Dict[str, torch.Tensor] = {}
+    hf_compiled_token_ids_by_req: Dict[str, torch.Tensor] = {}
+    compared_generated_tokens = generated_tokens[:-1] if hf_drop_last_token else generated_tokens
+    compared_hf_generated_tokens = (
+        hf_compiled_generated_tokens[:-1] if hf_drop_last_token else hf_compiled_generated_tokens
+    )
+    for i in range(batch_size):
+        req_id = f"0:{i}"
+        prompt_tok = _strip_left_pad(input_ids[i].detach().cpu(), attention_mask[i].detach().cpu()).to(torch.long)
+        mon_seq = torch.cat(
+            [
+                prompt_tok,
+                torch.cat([t[i].view(-1).to(torch.long) for t in compared_generated_tokens], dim=0),
+            ],
+            dim=0,
+        )
+        monitor_token_ids_by_req[req_id] = mon_seq
+        hf_compiled_token_ids_by_req[req_id] = torch.cat(
+            [
+                prompt_tok,
+                torch.cat([t[i].view(-1).to(torch.long) for t in compared_hf_generated_tokens], dim=0),
+            ],
+            dim=0,
+        )
+
+    if print_text:
+        for i in range(batch_size):
+            req_id = f"0:{i}"
+            print(f"\n=== {req_id} (dual_compile) ===")
+            print(f"MON FULL: {_decode(monitor_token_ids_by_req[req_id])!r}")
+            print(f"HF COMPILED FULL: {_decode(hf_compiled_token_ids_by_req[req_id])!r}")
+
+    # Token sequence correctness: dual_compile path should match the compiled HF baseline.
+    for i in range(batch_size):
+        req_id = f"0:{i}"
+        with subtests.test(msg=f"{req_id}/token_ids_compiled_hf_dual_compile"):
+            assert bitwise_equal(monitor_token_ids_by_req[req_id], hf_compiled_token_ids_by_req[req_id])
+
+    mon_positions = len(collected_steps)
+    wte = mon_model.wte
+
+    per_req_step_tensors: Dict[str, Dict[str, List[torch.Tensor]]] = {
+        f"0:{i}": {} for i in range(batch_size)
+    }
+
+    for step_idx in range(mon_positions):
+        ready = collected_steps[step_idx]
+        for slot_id, tensor in ready.items():
+            name = slot_map.get(slot_id)
+            if name not in wanted_suffixes:
+                continue
+            for i in range(batch_size):
+                req_id = f"0:{i}"
+                per_req_step_tensors[req_id].setdefault(name, []).append(tensor[i].detach().cpu())
+
+    for i in range(batch_size):
+        req_id = f"0:{i}"
+        decode_tok = torch.cat(
+            [t[i].view(-1).to(torch.long) for t in hf_compiled_generated_tokens[:mon_positions]],
+            dim=0,
+        )
+        expected_embed = wte(decode_tok.to(device)).detach().cpu()
+        embed_list = per_req_step_tensors[req_id].get("hook_embed", [])
+        with subtests.test(msg=f"{req_id}/hook_embed_dual_compile"):
+            assert len(embed_list) == mon_positions
+            db_t = torch.cat([t if t.ndim == 2 else t.view(1, -1) for t in embed_list], dim=0)
+            if print_hook_rows:
+                same_as_first = [
+                    bitwise_equal(db_t[j].view(1, -1), db_t[0].view(1, -1))
+                    for j in range(db_t.shape[0])
+                ]
+                ref_same_as_first = [
+                    bitwise_equal(expected_embed[j].view(1, -1), expected_embed[0].view(1, -1))
+                    for j in range(expected_embed.shape[0])
+                ]
+                print(
+                    f"HOOK_EMBED_ROWS req={req_id} db_shape={tuple(db_t.shape)} "
+                    f"ref_shape={tuple(expected_embed.shape)} db_same_as_row0={same_as_first} "
+                    f"ref_same_as_row0={ref_same_as_first}"
+                )
+            assert _allclose_equal(db_t, expected_embed, atol=dual_atol, rtol=dual_rtol), (
+                f"hook_embed mismatch (atol={dual_atol} rtol={dual_rtol} "
+                f"{_diff_summary(db_t, expected_embed)})"
+            )
+
+        final_ln_list = per_req_step_tensors[req_id].get("hook_final_ln", [])
+        if final_ln_list:
+            expected_final_ln = torch.cat(
+                [step_hidden[-1][i] for step_hidden in hf_compiled_step_hidden[:mon_positions]],
+                dim=0,
+            )
+            with subtests.test(msg=f"{req_id}/hook_final_ln_dual_compile"):
+                db_t = torch.cat([t if t.ndim == 2 else t.view(1, -1) for t in final_ln_list], dim=0)
+                assert _allclose_equal(db_t, expected_final_ln, atol=dual_atol, rtol=dual_rtol), (
+                    f"hook_final_ln mismatch (atol={dual_atol} rtol={dual_rtol} "
+                    f"{_diff_summary(db_t, expected_final_ln)})"
+                )
+
+        for layer_no in range(n_layers):
+            name = f"blocks.{layer_no}.hook_resid_pre"
+            items = per_req_step_tensors[req_id].get(name, [])
+            if items:
+                expected = torch.cat(
+                    [step_hidden[layer_no][i] for step_hidden in hf_compiled_step_hidden[:mon_positions]],
+                    dim=0,
+                )
+                with subtests.test(msg=f"{req_id}/{name}/dual_compile"):
+                    db_t = torch.cat([t if t.ndim == 2 else t.view(1, -1) for t in items], dim=0)
+                    assert _allclose_equal(db_t, expected, atol=dual_atol, rtol=dual_rtol), (
+                        f"{name} mismatch (atol={dual_atol} rtol={dual_rtol} "
+                        f"{_diff_summary(db_t, expected)})"
+                    )
+
+            if (layer_no + 1) < n_layers:
+                name = f"blocks.{layer_no}.hook_resid_post"
+                items = per_req_step_tensors[req_id].get(name, [])
+                if items:
+                    expected = torch.cat(
+                        [step_hidden[layer_no + 1][i] for step_hidden in hf_compiled_step_hidden[:mon_positions]],
+                        dim=0,
+                    )
+                    with subtests.test(msg=f"{req_id}/{name}/dual_compile"):
+                        db_t = torch.cat([t if t.ndim == 2 else t.view(1, -1) for t in items], dim=0)
+                        assert _allclose_equal(db_t, expected, atol=dual_atol, rtol=dual_rtol), (
+                            f"{name} mismatch (atol={dual_atol} rtol={dual_rtol} "
+                            f"{_diff_summary(db_t, expected)})"
+                        )

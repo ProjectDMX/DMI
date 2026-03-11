@@ -15,6 +15,8 @@ namespace monitoring {
 
 namespace py = pybind11;
 
+at::Tensor monitor_activation(at::Tensor tensor, py::object handle);
+
 class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitoringEngine> {
  public:
   NativeMonitoringEngine(int64_t queue_size,
@@ -31,6 +33,11 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   std::vector<int64_t> submit_step(int64_t step_id,
                                    const py::list& tasks,
                                    std::optional<uint64_t> stream_handle);
+
+  // Graph-safe fast path: accepts SOA dict from parse_shadow_block() directly.
+  std::vector<int64_t> submit_step_soa(int64_t step_id,
+                                       const py::dict& spec,
+                                       std::optional<uint64_t> stream_handle);
 
   void set_capture_schedule(int64_t step_stride,
                             int64_t step_offset,
@@ -75,6 +82,27 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
                                              bool remove_batch_dim,
                                              py::tuple slice_tuple,
                                              py::object target_device);
+  py::object create_inline_hook_ticket(const std::string& hook_name,
+                                       bool remove_batch_dim,
+                                       py::tuple slice_tuple,
+                                       py::object target_device = py::none());
+  py::capsule create_inline_monitor_handle(const std::string& hook_name,
+                                           const std::string& cache_name,
+                                           bool remove_batch_dim,
+                                           py::tuple slice_tuple,
+                                           py::object target_device = py::none());
+  void monitor_inline(py::object ticket,
+                      const std::string& gate_name,
+                      const std::string& cache_name,
+                      at::Tensor tensor);
+  py::object register_hook_callback(py::object hook_point,
+                                    const std::string& hook_name,
+                                    const std::string& cache_name,
+                                    bool is_backward,
+                                    bool remove_batch_dim,
+                                    py::tuple slice_tuple,
+                                    py::object target_device,
+                                    bool prepend);
   void set_enabled_hooks(py::object names_iterable);
   void collect_step_futures_into(int64_t step_id, py::dict cache);
 
@@ -93,6 +121,8 @@ class NativeMonitoringEngine : public std::enable_shared_from_this<NativeMonitor
   at::Tensor future_result(int64_t token, std::optional<double> timeout, bool called_from_cpp = false);
   void clear_completed_results();
   void close();
+
+  friend at::Tensor monitor_activation(at::Tensor tensor, py::object handle);
 
  private:
   struct Impl;

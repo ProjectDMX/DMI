@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -10,7 +11,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile, record_function, tensorboard_trace_handler
 from torch.utils.hooks import RemovableHandle
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
 from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2Model
 
 try:
@@ -27,8 +28,15 @@ except ImportError:
 from transformer_lens import HookedTransformer
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCache
 
-from monitoring import MonitoringEngine
-from monitoring.config import MonitoringConfig
+from monitoring import GraphSafeEngine, GraphSlotConsumer, MonitoringEngine, _native_engine
+from monitoring.config import CaptureSchedule, HookSelection, MonitoringConfig
+from monitoring.monitor_native import create_graph_delegate
+
+MINIMAL_MONITORING_HOOKS = [
+    "blocks.0.hook_resid_pre",
+    "blocks.0.hook_attn_out",
+    "blocks.0.hook_mlp_out",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nvtx",
         action="store_true",
-        help="Enable NVTX annotations inside TransformerLens hooks (enables MonitoringConfig.debug)",
+        help="Enable NVTX annotations inside TransformerLens hooks (sets TL_ENABLE_NVTX=1)",
     )
     parser.add_argument(
         "--collect-hidden",
@@ -104,6 +112,41 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip profiling and only measure wallclock time (faster, no trace files)",
     )
+    parser.add_argument(
+        "--monitoring-bypass",
+        action="store_true",
+        help="Keep MonitoringEngine hooks active but disable all capture via schedule gating",
+    )
+    parser.add_argument(
+        "--hook-selection",
+        choices=["full", "attention", "mlp", "minimal"],
+        default="full",
+        help="Select which hooks MonitoringEngine enables (minimal keeps just a handful for overhead profiling)",
+    )
+    parser.add_argument(
+        "--monitoring-mode",
+        choices=["legacy", "graph", "compile", "dual_compile"],
+        default="legacy",
+        help="Choose legacy MonitoringEngine, graph-safe engine, torch.compile engine, or dual-frame compile engine.",
+    )
+    parser.add_argument(
+        "--monitor-interval",
+        type=int,
+        default=1,
+        help="Monitor every N-th decode step (skip-step monitoring). 1=every step, 2=every other step, etc.",
+    )
+    parser.add_argument(
+        "--d2h-repeat",
+        type=int,
+        default=1,
+        help="Repeat each D2H copy N times to simulate heavier D2H load (testing only).",
+    )
+    parser.add_argument(
+        "--graph-copy-mode",
+        choices=["disabled", "sync"],
+        default="disabled",
+        help="Graph mode: disabled=metadata only, sync=enable native delegate copy.",
+    )
 
     args = parser.parse_args()
     if not args.collect_hidden and not args.collect_attention:
@@ -112,6 +155,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--prefill-tokens must be >= 1")
     if args.decode_steps < 1:
         parser.error("--decode-steps must be >= 1")
+    if args.monitoring_mode in ("graph", "compile", "dual_compile") and args.monitoring_bypass:
+        parser.error("--monitoring-mode graph/compile/dual_compile cannot be combined with --monitoring-bypass")
+    if args.monitoring_mode not in ("graph", "compile", "dual_compile") and args.graph_copy_mode != "disabled":
+        parser.error("--graph-copy-mode only applies when --monitoring-mode graph, compile, or dual_compile is selected")
     return args
 
 
@@ -166,13 +213,15 @@ def measure_model(
     if device.type == "cuda":
         torch.cuda.synchronize()
 
+    nvtx.range_push(f"measure_{label}")
     start = time.perf_counter()
     fn()
 
     if device.type == "cuda":
         torch.cuda.synchronize()
-
-    return time.perf_counter() - start
+    elapsed = time.perf_counter() - start
+    nvtx.range_pop()
+    return elapsed
 
 
 def profile_model(
@@ -289,6 +338,311 @@ def profile_async_model(
     total_elapsed = time.perf_counter() - wall_time_start
     nvtx.range_pop()  # profile_async
     return main_elapsed, total_elapsed
+
+
+class HFGraphDecodeRunner:
+    """Capture and replay Hooked GPT-2 decode steps inside a CUDA graph."""
+
+    def __init__(
+        self,
+        model,
+        project_logits_fn: Callable[[torch.Tensor], torch.Tensor],
+        engine,
+        args,
+        token_template: torch.Tensor,
+        past_template: Tuple,
+    ) -> None:
+        self.model = model
+        self.project_logits_fn = project_logits_fn
+        self.engine = engine
+        self.args = args
+        self.graph = torch.cuda.CUDAGraph()
+        self.captured = False
+        self.static_token = torch.empty_like(token_template)
+        self.static_past = tuple(
+            (torch.empty_like(layer[0]), torch.empty_like(layer[1]))
+            for layer in past_template
+        )
+        self.capture_shape = [layer[0].size() for layer in past_template]
+        self.past_proxy = tuple((buf_k, buf_v) for (buf_k, buf_v) in self.static_past)
+        self.graph_outputs = None
+        self.graph_logits = None
+
+    def run(self, token: torch.Tensor, past: Tuple) -> Tuple[torch.Tensor, Tuple]:
+        if not self.captured:
+            self._copy_token(token)
+            self._copy_past(past)
+            return self._capture_graph_step()
+        self._copy_token(token)
+        if past is not self.past_proxy:
+            self._copy_past(past)
+        return self._replay_graph_step()
+
+    def _copy_token(self, token: torch.Tensor) -> None:
+        self.static_token.copy_(token)
+
+    def _copy_past(self, past: Tuple) -> None:
+        for (dst_k, dst_v), (src_k, src_v) in zip(self.static_past, past):
+            if dst_k.shape != src_k.shape:
+                dst_k.resize_(src_k.shape)
+            if dst_v.shape != src_v.shape:
+                dst_v.resize_(src_v.shape)
+            dst_k.copy_(src_k)
+            dst_v.copy_(src_v)
+
+    def _capture_graph_step(self) -> Tuple[torch.Tensor, Tuple]:
+        torch.cuda.synchronize()
+        if self.engine is not None:
+            self.engine.start_step()
+        try:
+            with torch.cuda.graph(self.graph):
+                outputs = self.model(
+                    self.static_token,
+                    use_cache=True,
+                    past_key_values=self.static_past,
+                    output_hidden_states=self.args.collect_hidden,
+                    output_attentions=self.args.collect_attention,
+                    return_dict=True,
+                )
+                hidden_states = outputs.last_hidden_state
+                logits = self.project_logits_fn(hidden_states)
+                self.graph_outputs = outputs
+                self.graph_logits = logits
+                if self.engine is not None:
+                    self.engine.finalize_capture()
+            self.captured = True
+        finally:
+            if self.engine is not None:
+                self.engine.end_step()
+        return self._post_run()
+
+    def _replay_graph_step(self) -> Tuple[torch.Tensor, Tuple]:
+        if self.engine is not None:
+            self.engine.start_step()
+        try:
+            self.graph.replay()
+        finally:
+            if self.engine is not None:
+                self.engine.end_step()
+        return self._post_run()
+
+    def _post_run(self) -> Tuple[torch.Tensor, Tuple]:
+        outputs = self.graph_outputs
+        if outputs is None or self.graph_logits is None:
+            raise RuntimeError("Graph runner outputs not initialized.")
+        if self.args.collect_attention and outputs.attentions is not None:
+            for attn in outputs.attentions:
+                _ = attn
+        if self.args.collect_hidden and outputs.hidden_states is not None:
+            for hs in outputs.hidden_states:
+                _ = hs
+        self._copy_outputs_to_inputs(outputs)
+        return self.graph_logits, self.past_proxy
+
+    def _copy_outputs_to_inputs(self, outputs) -> None:
+        next_past = outputs.past_key_values
+        for (dst_k, dst_v), (src_k, src_v) in zip(self.static_past, next_past):
+            if dst_k.shape != src_k.shape:
+                dst_k.resize_(src_k.shape)
+            if dst_v.shape != src_v.shape:
+                dst_v.resize_(src_v.shape)
+            dst_k.copy_(src_k)
+            dst_v.copy_(src_v)
+
+    def reset_capture(self) -> None:
+        self.graph = torch.cuda.CUDAGraph()
+        self.captured = False
+        self.graph_outputs = None
+        self.graph_logits = None
+
+
+class TorchCompileDecodeRunner:
+    """Decode runner using torch.compile(mode='reduce-overhead') + StaticCache.
+
+    StaticCache uses index_copy_() in-place (no torch.cat), enabling full
+    CUDA Graph coverage without partial graph breaks.
+    """
+
+    def __init__(
+        self,
+        model,
+        project_logits_fn: Callable[[torch.Tensor], torch.Tensor],
+        engine,
+        args,
+        *,
+        max_cache_len: int = 256,
+    ) -> None:
+        self.model = model
+        self.project_logits_fn = project_logits_fn
+        self.engine = engine
+        self.args = args
+        self.captured = True  # torch.compile manages capture internally
+        self._max_cache_len = max_cache_len
+        self._cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
+        self._next_cache_pos = 0
+
+        self._compiled_forward = torch.compile(
+            self._forward_step,
+            mode="reduce-overhead",
+            fullgraph=False,
+        )
+
+    def _forward_step(
+        self, token: torch.Tensor, cache, cache_position: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = self.model(
+            token,
+            use_cache=True,
+            past_key_values=cache,
+            cache_position=cache_position,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=True,
+        )
+        return self.project_logits_fn(outputs.last_hidden_state)
+
+    def run(self, token: torch.Tensor, past=None) -> Tuple[torch.Tensor, object]:
+        """Run one compiled decode step. past argument ignored (cache managed internally)."""
+        cache_position = torch.tensor(
+            [self._next_cache_pos], device=token.device, dtype=torch.long,
+        )
+        torch.compiler.cudagraph_mark_step_begin()
+        logits = self._compiled_forward(token, self._cache, cache_position)
+        self._next_cache_pos += 1
+        return logits, self._cache
+
+    def reset_cache(self) -> None:
+        """Reset cache for new sequence (preserve tensor addresses for CUDA Graph reuse)."""
+        self._cache.reset()
+        self._next_cache_pos = 0
+
+    def reset_capture(self) -> None:
+        pass
+
+
+class HFCompileDecodeRunner:
+    """Decode runner for vanilla GPT2LMHeadModel with torch.compile + StaticCache."""
+
+    def __init__(self, model, *, max_cache_len: int = 256) -> None:
+        self.model = model
+        self.captured = True  # torch.compile manages capture internally
+        self._cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
+        self._next_cache_pos = 0
+        self._compiled_forward = torch.compile(
+            self._forward_step, mode="reduce-overhead", fullgraph=False,
+        )
+
+    def _forward_step(
+        self, token: torch.Tensor, cache, cache_position: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = self.model(
+            token,
+            use_cache=True,
+            past_key_values=cache,
+            cache_position=cache_position,
+            return_dict=True,
+        )
+        return outputs.logits
+
+    def run(self, token: torch.Tensor, past=None) -> Tuple[torch.Tensor, object]:
+        cache_position = torch.tensor(
+            [self._next_cache_pos], device=token.device, dtype=torch.long,
+        )
+        torch.compiler.cudagraph_mark_step_begin()
+        logits = self._compiled_forward(token, self._cache, cache_position)
+        self._next_cache_pos += 1
+        return logits, self._cache
+
+    def reset_cache(self) -> None:
+        self._cache.reset()
+        self._next_cache_pos = 0
+
+    def reset_capture(self) -> None:
+        pass
+
+
+class DualCompileDecodeRunner:
+    """Decode runner with dual-frame forward/D2H pipelining (Design C)."""
+
+    def __init__(
+        self,
+        model,
+        project_logits_fn: Callable[[torch.Tensor], torch.Tensor],
+        engine,
+        args,
+        *,
+        max_cache_len: int = 256,
+    ) -> None:
+        self.model = model
+        self.project_logits_fn = project_logits_fn
+        self.engine = engine  # GraphSafeEngine with graph_mode="dual_compile"
+        self.args = args
+        self.captured = False
+        self._cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
+        self._next_cache_pos = 0
+        self._compiled_forward = torch.compile(
+            self._forward_step, mode="reduce-overhead", fullgraph=False,
+        )
+
+    def _forward_step(
+        self, token: torch.Tensor, cache, cache_position: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = self.model(
+            token,
+            use_cache=True,
+            past_key_values=cache,
+            cache_position=cache_position,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=True,
+        )
+        return self.project_logits_fn(outputs.last_hidden_state)
+
+    def warmup(self, token: torch.Tensor, warmup_steps: int = 4) -> None:
+        """4-graph warmup: discover metadata with record, then capture production graphs without."""
+        cache_position = torch.tensor([0], device=token.device, dtype=torch.long)
+
+        # Phase 1: trace with ops.record() to discover tensor metadata
+        for frame in (0, 1):
+            self.engine.set_frame(frame)
+            for _ in range(warmup_steps):
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    self._compiled_forward(token, self._cache, cache_position)
+            torch.cuda.synchronize()
+
+        # Parse metadata and create alias tensors from discovered addresses
+        self.engine.finalize_dual_frame()
+
+        # Phase 2: disable record, re-trace production graphs (no record kernels)
+        self.engine.disable_record()
+        for frame in (0, 1):
+            self.engine.set_frame(frame)
+            for _ in range(warmup_steps):
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    self._compiled_forward(token, self._cache, cache_position)
+            torch.cuda.synchronize()
+
+        self._cache.reset()
+        self._next_cache_pos = 0
+        self.captured = True
+
+    def run(self, token: torch.Tensor, past=None) -> Tuple[torch.Tensor, object]:
+        cache_position = torch.tensor(
+            [self._next_cache_pos], device=token.device, dtype=torch.long,
+        )
+        torch.compiler.cudagraph_mark_step_begin()
+        logits = self._compiled_forward(token, self._cache, cache_position)
+        self._next_cache_pos += 1
+        return logits, self._cache
+
+    def reset_cache(self) -> None:
+        self._cache.reset()
+        self._next_cache_pos = 0
+
+    def reset_capture(self) -> None:
+        pass
 
 
 def greedy_from_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -531,6 +885,9 @@ def setup_hf_decode_hook(
 def main() -> None:
     args = parse_args()
 
+    if args.nvtx:
+        os.environ.setdefault("TL_ENABLE_NVTX", "1")
+
     device = pick_device(args.device)
     hf_dtype = map_hf_dtype(args.dtype)
     tl_dtype = map_tl_dtype(args.dtype)
@@ -564,19 +921,135 @@ def main() -> None:
     hf_hooked_model.eval()
 
     cache_dtype = None if args.cache_dtype == "none" else map_hf_dtype(args.cache_dtype)
-    monitoring_engine = MonitoringEngine(
-        async_enabled=device.type == "cuda",
-        cache_dtype=cache_dtype,
-        queue_size=args.engine_queue_size,
-        delay_steps=args.engine_delay_steps,
-        config=MonitoringConfig(debug=args.nvtx),
+    if args.hook_selection == "minimal":
+        hook_selection = HookSelection(mode="custom", include=MINIMAL_MONITORING_HOOKS)
+    else:
+        hook_selection = HookSelection(mode=args.hook_selection)
+
+    if args.monitoring_bypass:
+        schedule = CaptureSchedule(
+            capture_prefill=False,
+            capture_decode=False,
+            request_stride=10**12,
+        )
+    else:
+        schedule = CaptureSchedule()
+
+    monitoring_config = MonitoringConfig(
+        hooks=hook_selection,
+        schedule=schedule,
     )
-    hf_hooked_model.monitoring_engine = None
+
+    graph_consumer = None
+    graph_native_backend = None
+    if args.monitoring_mode in ("graph", "compile", "dual_compile"):
+        graph_mode = {"compile": "compile", "dual_compile": "dual_compile"}.get(args.monitoring_mode, "manual")
+        monitoring_engine = GraphSafeEngine(
+            config=monitoring_config,
+            module_filter=lambda name, module: hasattr(module, "monitor_activation"),
+            max_slots=4096,
+            device=device,
+            graph_mode=graph_mode,
+            monitor_interval=args.monitor_interval,
+            d2h_repeat=args.d2h_repeat,
+        )
+        graph_consumer = GraphSlotConsumer(delay_steps=args.engine_delay_steps)
+        monitoring_engine.attach_consumer(graph_consumer)
+        if args.graph_copy_mode == "sync":
+            graph_native_backend = _native_engine.create_engine(
+                queue_size=args.engine_queue_size,
+                cache_dtype=cache_dtype,
+                delay_steps=args.engine_delay_steps,
+            )
+            graph_delegate = create_graph_delegate(graph_native_backend)
+            monitoring_engine.attach_backend_delegate(graph_delegate)
+            print("[GraphDebug] Graph delegate attached (sync copy enabled)")
+    else:
+        monitoring_engine = MonitoringEngine(
+            async_enabled=device.type == "cuda",
+            cache_dtype=cache_dtype,
+            queue_size=args.engine_queue_size,
+            delay_steps=args.engine_delay_steps,
+            config=monitoring_config,
+        )
+    attach_to_model = args.monitoring_mode not in ("graph", "compile", "dual_compile")
+    engine_attached_permanently = bool(args.monitoring_bypass and attach_to_model)
+    original_monitoring_engine = hf_hooked_model.monitoring_engine
+    if attach_to_model:
+        hf_hooked_model.monitoring_engine = monitoring_engine
     engine_init_ms = 0.0
     try:
         engine_init_ms = monitoring_engine.prepare_for_model(hf_hooked_model)
     except Exception:
         engine_init_ms = 0.0
+    finally:
+        if attach_to_model and not engine_attached_permanently:
+            hf_hooked_model.monitoring_engine = original_monitoring_engine
+
+    if args.monitoring_bypass and args.monitoring_mode not in ("graph", "compile", "dual_compile"):
+        native_backend = getattr(monitoring_engine, "_native_backend", None)
+        native_using = bool(getattr(monitoring_engine, "_using_native_backend", False))
+        native_builder_enabled = bool(getattr(monitoring_engine, "_native_builder_enabled", False))
+        native_callback_enabled = bool(getattr(monitoring_engine, "_native_callback_enabled", False))
+        print(
+            "[Inline Debug] engine native_backend="
+            f"{'yes' if native_backend is not None else 'no'} "
+            f"using={native_using} builder={native_builder_enabled} callback={native_callback_enabled}"
+        )
+        inline_enabled = bool(getattr(hf_hooked_model, "_inline_monitoring_enabled", False))
+        sample_cfg = None
+        sample_name = None
+        for hp_name, hp in hf_hooked_model.hook_dict.items():
+            sample_cfg = getattr(hp, "_monitor_handle", None)
+            if sample_cfg is not None:
+                sample_name = hp_name
+                break
+        print(
+            "[Inline Debug] enabled="
+            f"{inline_enabled} sample_hook={sample_name if sample_cfg is not None else 'none'} "
+            f"ticket={'yes' if sample_cfg is not None else 'no'}"
+        )
+        if not inline_enabled or sample_cfg is None:
+            raise RuntimeError("Inline monitoring not enabled; cannot run bypass-inline profile.")
+
+    def process_monitoring_results(wait: bool = False) -> None:
+        nonlocal graph_runner, compile_runner, dual_compile_runner
+        if args.monitoring_mode == "dual_compile":
+            if dual_compile_runner is None or not dual_compile_runner.captured:
+                return
+            # dual_compile: D2H is handled by engine start_step/end_step
+            monitoring_engine.collect_dual_frame_results(wait=wait)
+            return
+        if args.monitoring_mode in ("graph", "compile"):
+            runner = compile_runner if args.monitoring_mode == "compile" else graph_runner
+            if runner is None or not runner.captured:
+                return
+            if wait:
+                drained = False
+                while not drained:
+                    drained = monitoring_engine.drain_ready_results(wait=True)
+            else:
+                while monitoring_engine.drain_ready_results(wait=False):
+                    pass
+            return
+        if monitoring_engine.async_enabled:
+            monitoring_engine.clear_completed_results()
+
+    def resolve_monitoring_results() -> None:
+        nonlocal graph_runner, compile_runner, dual_compile_runner
+        if args.monitoring_mode == "dual_compile":
+            if dual_compile_runner is None or not dual_compile_runner.captured:
+                return
+            monitoring_engine.collect_dual_frame_results(wait=True)
+            return
+        if args.monitoring_mode in ("graph", "compile"):
+            runner = compile_runner if args.monitoring_mode == "compile" else graph_runner
+            if runner is None or not runner.captured:
+                return
+            monitoring_engine.resolve_all()
+            return
+        if monitoring_engine.async_enabled:
+            monitoring_engine.resolve_all()
 
     tl_model = HookedTransformer.from_pretrained(
         "gpt2",
@@ -628,8 +1101,7 @@ def main() -> None:
         )
         cache_dict.clear()
         try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
+            process_monitoring_results()
         except Exception:
             pass
         return logits, cache
@@ -638,6 +1110,13 @@ def main() -> None:
 
     def project_logits(hidden_states: torch.Tensor) -> torch.Tensor:
         return lm_head(hidden_states)
+
+    graph_runner: Optional[HFGraphDecodeRunner] = None
+    graph_forward_runner: Optional[HFGraphDecodeRunner] = None
+    compile_runner: Optional[TorchCompileDecodeRunner] = None
+    dual_compile_runner: Optional[DualCompileDecodeRunner] = None
+    hf_compile_runner: Optional[HFCompileDecodeRunner] = None
+    hooked_compile_runner: Optional[TorchCompileDecodeRunner] = None
 
     def hf_prefill_fn(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
         outputs = hf_model(
@@ -666,150 +1145,177 @@ def main() -> None:
         del outputs
         return logits, next_past
 
-    def hf_api_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
-        return hf_prefill_fn(prefill_tokens)
-
-    def hf_api_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
+    def hf_torch_compile_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[object, torch.Tensor]:
+        nonlocal hf_compile_runner
+        if hf_compile_runner is None:
+            hf_compile_runner = HFCompileDecodeRunner(
+                hf_model, max_cache_len=args.prefill_tokens + args.decode_steps + 16,
+            )
+        hf_compile_runner.reset_cache()
         outputs = hf_model(
-            token,
+            prefill_tokens,
             use_cache=True,
-            past_key_values=past_key_values,
-            output_hidden_states=args.collect_hidden,
-            output_attentions=args.collect_attention,
+            past_key_values=hf_compile_runner._cache,
             return_dict=True,
         )
-        if args.collect_attention and outputs.attentions is not None:
-            for attn in outputs.attentions:
-                _ = attn
-        if args.collect_hidden and outputs.hidden_states is not None:
-            for hs in outputs.hidden_states:
-                _ = hs
-        logits = outputs.logits
-        next_past = outputs.past_key_values
+        hf_compile_runner._next_cache_pos = prefill_tokens.shape[1]
+        next_token = greedy_from_logits(outputs.logits)
         del outputs
-        return logits, next_past
+        return hf_compile_runner._cache, next_token
 
-    def hf_modified_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
-        nvtx.range_push("modified_prefill")
-        nvtx.range_push("modified_prefill_forward")
+    def hf_torch_compile_decode(token: torch.Tensor, past_key_values) -> Tuple[torch.Tensor, object]:
+        nonlocal hf_compile_runner
+        if hf_compile_runner is None:
+            raise RuntimeError("HF compile runner not initialized.")
+        return hf_compile_runner.run(token, past_key_values)
+
+    def hooked_compile_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[object, torch.Tensor]:
+        nonlocal hooked_compile_runner
+        if hooked_compile_runner is None:
+            hooked_compile_runner = TorchCompileDecodeRunner(
+                hf_hooked_model, project_logits, None, args,
+                max_cache_len=args.prefill_tokens + args.decode_steps + 16,
+            )
+        hooked_compile_runner.reset_cache()
         outputs = hf_hooked_model(
             prefill_tokens,
             use_cache=True,
+            past_key_values=hooked_compile_runner._cache,
             output_hidden_states=False,
             output_attentions=False,
             return_dict=True,
         )
-        nvtx.range_pop()  # modified_prefill_forward
-        nvtx.range_push("modified_prefill_post")
+        hooked_compile_runner._next_cache_pos = prefill_tokens.shape[1]
         hidden_states = outputs.last_hidden_state
-        nvtx.range_push("modified_prefill_project")
         logits = project_logits(hidden_states)
-        nvtx.range_pop()  # modified_prefill_project
         next_token = greedy_from_logits(logits)
-        nvtx.range_pop()  # modified_prefill_post
-        past = outputs.past_key_values
         del hidden_states, logits, outputs
-        nvtx.range_pop()  # modified_prefill
-        return past, next_token
+        return hooked_compile_runner._cache, next_token
 
-    def hf_modified_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
-        nvtx.range_push("modified_decode")
-        nvtx.range_push("modified_decode_forward")
+    def hooked_compile_decode(token: torch.Tensor, past_key_values) -> Tuple[torch.Tensor, object]:
+        nonlocal hooked_compile_runner
+        if hooked_compile_runner is None:
+            raise RuntimeError("Hooked compile runner not initialized.")
+        return hooked_compile_runner.run(token, past_key_values)
+
+    def hf_overhead_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[object, torch.Tensor]:
+        """Reuse the dual_compile_runner but skip engine lifecycle (no D2H).
+        Must be called AFTER hf_modified_hook_async warmup so runner exists."""
+        nonlocal dual_compile_runner
+        if dual_compile_runner is None:
+            raise RuntimeError("Overhead benchmark requires dual_compile_runner (run async first)")
+        dual_compile_runner.reset_cache()
         outputs = hf_hooked_model(
-            token,
+            prefill_tokens,
             use_cache=True,
-            past_key_values=past_key_values,
+            past_key_values=dual_compile_runner._cache,
             output_hidden_states=False,
             output_attentions=False,
             return_dict=True,
         )
-        nvtx.range_pop()  # modified_decode_forward
-        nvtx.range_push("modified_decode_post")
-        hidden_states = outputs.last_hidden_state
-        nvtx.range_push("modified_decode_project")
-        logits = project_logits(hidden_states)
-        nvtx.range_pop()  # modified_decode_project
-        next_past = outputs.past_key_values
-        del hidden_states, outputs
-        nvtx.range_pop()  # modified_decode_post
-        nvtx.range_pop()  # modified_decode
-        return logits, next_past
-
-    def hook_names_filter(name: str) -> bool:
-        lname = name.lower()
-        if args.collect_hidden and args.collect_attention:
-            return True
-        if args.collect_attention:
-            return "attn" in lname
-        return "attn" not in lname
-
-    def hf_modified_hook_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
-        previous_engine = hf_hooked_model.monitoring_engine
-        hf_hooked_model.monitoring_engine = None
-        outputs, cache_dict = hf_hooked_model.run_with_cache(
-            prefill_tokens,
-            use_cache=True,
-            output_hidden_states=args.collect_hidden,
-            output_attentions=args.collect_attention,
-            return_dict=True,
-            names_filter=hook_names_filter,
-            return_cache_object=False,
-            remove_batch_dim=False,
-        )
+        dual_compile_runner._next_cache_pos = prefill_tokens.shape[1]
         hidden_states = outputs.last_hidden_state
         logits = project_logits(hidden_states)
         next_token = greedy_from_logits(logits)
-        if args.collect_attention and outputs.attentions is not None:
-            for attn in outputs.attentions:
-                _ = attn
-        if args.collect_hidden and outputs.hidden_states is not None:
-            for hs in outputs.hidden_states:
-                _ = hs
-        past = outputs.past_key_values
-        cache_dict.clear()
-        try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
-        except Exception:
-            pass
-        hf_hooked_model.monitoring_engine = previous_engine
         del hidden_states, logits, outputs
-        return past, next_token
+        return dual_compile_runner._cache, next_token
 
-    def hf_modified_hook_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
-        previous_engine = hf_hooked_model.monitoring_engine
-        hf_hooked_model.monitoring_engine = None
-        outputs, cache_dict = hf_hooked_model.run_with_cache(
-            token,
-            use_cache=True,
-            past_key_values=past_key_values,
-            output_hidden_states=args.collect_hidden,
-            output_attentions=args.collect_attention,
-            return_dict=True,
-            names_filter=hook_names_filter,
-            return_cache_object=False,
-            remove_batch_dim=False,
-        )
-        hidden_states = outputs.last_hidden_state
-        logits = project_logits(hidden_states)
-        if args.collect_attention and outputs.attentions is not None:
-            for attn in outputs.attentions:
-                _ = attn
-        if args.collect_hidden and outputs.hidden_states is not None:
-            for hs in outputs.hidden_states:
-                _ = hs
-        next_past = outputs.past_key_values
-        cache_dict.clear()
-        try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
-        except Exception:
-            pass
-        hf_hooked_model.monitoring_engine = previous_engine
-        del hidden_states, outputs
-        return logits, next_past
+    def hf_overhead_decode(token: torch.Tensor, past_key_values) -> Tuple[torch.Tensor, object]:
+        """Same compiled graph as async, but no start_step/end_step."""
+        nonlocal dual_compile_runner
+        if dual_compile_runner is None:
+            raise RuntimeError("Overhead runner not initialized.")
+        return dual_compile_runner.run(token, past_key_values)
 
     def hf_modified_hook_async_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
+        nonlocal graph_runner, compile_runner, dual_compile_runner
+        if args.monitoring_mode == "dual_compile":
+            nvtx.range_push("dual_compile_prefill")
+            if dual_compile_runner is None:
+                dual_compile_runner = DualCompileDecodeRunner(
+                    hf_hooked_model,
+                    project_logits,
+                    monitoring_engine,
+                    args,
+                    max_cache_len=args.prefill_tokens + args.decode_steps + 16,
+                )
+            dual_compile_runner.reset_cache()
+            # Eager prefill (no compile) to populate cache
+            outputs = hf_hooked_model(
+                prefill_tokens,
+                use_cache=True,
+                past_key_values=dual_compile_runner._cache,
+                output_hidden_states=False,
+                output_attentions=False,
+                return_dict=True,
+            )
+            dual_compile_runner._next_cache_pos = prefill_tokens.shape[1]
+            hidden_states = outputs.last_hidden_state
+            logits = project_logits(hidden_states)
+            next_token = greedy_from_logits(logits)
+            if not dual_compile_runner.captured:
+                dual_compile_runner.warmup(next_token)
+            del hidden_states, logits, outputs
+            nvtx.range_pop()  # dual_compile_prefill
+            return dual_compile_runner._cache, next_token
+        if args.monitoring_mode == "compile":
+            nvtx.range_push("compile_prefill")
+            if compile_runner is None:
+                compile_runner = TorchCompileDecodeRunner(
+                    hf_hooked_model,
+                    project_logits,
+                    monitoring_engine,
+                    args,
+                    max_cache_len=args.prefill_tokens + args.decode_steps + 16,
+                )
+            compile_runner.reset_cache()
+            outputs = hf_hooked_model(
+                prefill_tokens,
+                use_cache=True,
+                past_key_values=compile_runner._cache,
+                output_hidden_states=False,
+                output_attentions=False,
+                return_dict=True,
+            )
+            compile_runner._next_cache_pos = prefill_tokens.shape[1]
+            hidden_states = outputs.last_hidden_state
+            logits = project_logits(hidden_states)
+            next_token = greedy_from_logits(logits)
+            del hidden_states, logits, outputs
+            nvtx.range_pop()  # compile_prefill
+            return compile_runner._cache, next_token
+        if args.monitoring_mode == "graph":
+            nvtx.range_push("async_prefill")
+            outputs = hf_hooked_model(
+                prefill_tokens,
+                use_cache=True,
+                output_hidden_states=args.collect_hidden,
+                output_attentions=args.collect_attention,
+                return_dict=True,
+            )
+            hidden_states = outputs.last_hidden_state
+            logits = project_logits(hidden_states)
+            next_token = greedy_from_logits(logits)
+            if args.collect_attention and outputs.attentions is not None:
+                for attn in outputs.attentions:
+                    _ = attn
+            if args.collect_hidden and outputs.hidden_states is not None:
+                for hs in outputs.hidden_states:
+                    _ = hs
+            past = outputs.past_key_values
+            if graph_runner is None:
+                graph_runner = HFGraphDecodeRunner(
+                    hf_hooked_model,
+                    project_logits,
+                    monitoring_engine,
+                    args,
+                    next_token,
+                    past,
+                )
+            del hidden_states, logits, outputs
+            nvtx.range_pop()  # async_prefill
+            return past, next_token
+
         nvtx.range_push("async_prefill")
         monitoring_engine.start_step()
         try:
@@ -840,8 +1346,7 @@ def main() -> None:
         past = outputs.past_key_values
         cache_dict.clear()
         try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
+            process_monitoring_results()
         except Exception:
             pass
         del hidden_states, logits, outputs
@@ -849,6 +1354,49 @@ def main() -> None:
         return past, next_token
 
     def hf_modified_hook_async_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
+        nonlocal graph_runner, compile_runner, dual_compile_runner
+        if args.monitoring_mode == "dual_compile":
+            if dual_compile_runner is None:
+                raise RuntimeError("Dual compile decode runner is not initialized.")
+            nvtx.range_push("dual_compile_decode")
+            monitoring_engine.start_step()
+            try:
+                logits, next_past = dual_compile_runner.run(token, past_key_values)
+            finally:
+                monitoring_engine.end_step()
+            try:
+                process_monitoring_results(wait=False)
+            except Exception as _e:
+                print(f"[dual_compile_decode] drain exception: {type(_e).__name__}: {_e}")
+            nvtx.range_pop()  # dual_compile_decode
+            return logits, next_past
+        if args.monitoring_mode == "compile":
+            if compile_runner is None:
+                raise RuntimeError("Compile decode runner is not initialized.")
+            nvtx.range_push("compile_decode")
+            monitoring_engine.start_step()
+            try:
+                logits, next_past = compile_runner.run(token, past_key_values)
+            finally:
+                monitoring_engine.end_step()
+            try:
+                process_monitoring_results(wait=True)
+            except Exception as _e:
+                print(f"[compile_decode] drain exception: {type(_e).__name__}: {_e}")
+            nvtx.range_pop()  # compile_decode
+            return logits, next_past
+        if args.monitoring_mode == "graph":
+            if graph_runner is None:
+                raise RuntimeError("Graph decode runner is not initialized.")
+            nvtx.range_push("async_decode")
+            logits, next_past = graph_runner.run(token, past_key_values)
+            try:
+                process_monitoring_results(wait=True)
+            except Exception:
+                pass
+            nvtx.range_pop()  # async_decode
+            return logits, next_past
+
         nvtx.range_push("async_decode")
         nvtx.range_push("async_decode_start_step")
         monitoring_engine.start_step()
@@ -880,14 +1428,46 @@ def main() -> None:
         next_past = outputs.past_key_values
         cache_dict.clear()
         try:
-            if monitoring_engine.async_enabled:
-                monitoring_engine.clear_completed_results()
+            process_monitoring_results()
         except Exception:
             pass
         del hidden_states, outputs
         nvtx.range_pop()  # async_decode_post
         nvtx.range_pop()  # async_decode
         return logits, next_past
+
+    def hf_graph_only_prefill(prefill_tokens: torch.Tensor = prompt_tokens) -> Tuple[Tuple, torch.Tensor]:
+        nonlocal graph_forward_runner
+        nvtx.range_push("graph_prefill")
+        outputs = hf_hooked_model(
+            prefill_tokens,
+            use_cache=True,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=True,
+        )
+        hidden_states = outputs.last_hidden_state
+        logits = project_logits(hidden_states)
+        next_token = greedy_from_logits(logits)
+        past = outputs.past_key_values
+        if graph_forward_runner is None:
+            graph_forward_runner = HFGraphDecodeRunner(
+                hf_hooked_model,
+                project_logits,
+                None,
+                args,
+                next_token,
+                past,
+            )
+        del hidden_states, logits, outputs
+        nvtx.range_pop()  # graph_prefill
+        return past, next_token
+
+    def hf_graph_only_decode(token: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
+        nonlocal graph_forward_runner
+        if graph_forward_runner is None:
+            raise RuntimeError("Graph baseline runner not initialized.")
+        return graph_forward_runner.run(token, past_key_values)
 
     def run_decode(prefill_fn, decode_fn, prefill_tokens=prompt_tokens):
         with torch.no_grad():
@@ -897,6 +1477,8 @@ def main() -> None:
                 nvtx.range_pop()  # benchmark_iter_i
 
     def warmup(prefill_fn, decode_fn, prefill_tokens=prompt_tokens):
+        nonlocal graph_runner
+        nonlocal graph_forward_runner
         if args.warmup <= 0:
             return
         nvtx.range_push("warmup")
@@ -906,6 +1488,10 @@ def main() -> None:
                 run_decode_loop(lambda: prefill_fn(prefill_tokens), decode_fn, args.decode_steps)
                 nvtx.range_pop()  # warmup_iter_i
         nvtx.range_pop()  # warmup
+        if args.monitoring_mode == "graph" and graph_runner is not None:
+            graph_runner.reset_capture()
+        if args.monitoring_mode == "graph" and graph_forward_runner is not None:
+            graph_forward_runner.reset_capture()
 
     traces_path = Path(args.profile_dir)
 
@@ -962,54 +1548,39 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    warmup(hf_api_prefill, hf_api_decode)
-    hf_api_elapsed = run_benchmark(
-        "huggingface_api", lambda: run_decode(hf_api_prefill, hf_api_decode)
+    warmup(hf_torch_compile_prefill, hf_torch_compile_decode)
+    hf_compile_elapsed = run_benchmark(
+        "hf_torch_compile", lambda: run_decode(hf_torch_compile_prefill, hf_torch_compile_decode)
     )
-    timings["huggingface_api"] = {
-        "duration": hf_api_elapsed,
-        "tokens_per_second": total_decoded_tokens / hf_api_elapsed if hf_api_elapsed > 0 else float("inf"),
+    timings["hf_torch_compile"] = {
+        "duration": hf_compile_elapsed,
+        "tokens_per_second": total_decoded_tokens / hf_compile_elapsed if hf_compile_elapsed > 0 else float("inf"),
     }
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    warmup(hf_modified_prefill, hf_modified_decode)
-    hf_modified_elapsed = run_benchmark(
-        "hf_modified",
-        lambda: run_decode(hf_modified_prefill, hf_modified_decode),
-    )
-    timings["hf_modified"] = {
-        "duration": hf_modified_elapsed,
-        "tokens_per_second": total_decoded_tokens / hf_modified_elapsed
-        if hf_modified_elapsed > 0
-        else float("inf"),
-    }
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    warmup(hf_modified_hook_prefill, hf_modified_hook_decode)
-    hf_modified_hook_elapsed = run_benchmark(
-        "hf_modified_hook",
-        lambda: run_decode(hf_modified_hook_prefill, hf_modified_hook_decode),
-    )
-    timings["hf_modified_hook"] = {
-        "duration": hf_modified_hook_elapsed,
-        "tokens_per_second": total_decoded_tokens / hf_modified_hook_elapsed
-        if hf_modified_hook_elapsed > 0
-        else float("inf"),
-    }
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    hf_hooked_model.monitoring_engine = monitoring_engine
-    warmup(hf_modified_hook_async_prefill, hf_modified_hook_async_decode)
-    if monitoring_engine.async_enabled:
-        monitoring_engine.resolve_all()
+    if args.monitoring_mode == "graph":
+        warmup(hf_graph_only_prefill, hf_graph_only_decode)
+        hf_graph_elapsed = run_benchmark(
+            "hf_modified_graph",
+            lambda: run_decode(hf_graph_only_prefill, hf_graph_only_decode),
+        )
+        timings["hf_modified_graph"] = {
+            "duration": hf_graph_elapsed,
+            "tokens_per_second": total_decoded_tokens / hf_graph_elapsed
+            if hf_graph_elapsed > 0
+            else float("inf"),
+        }
         if device.type == "cuda":
-            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+    if attach_to_model:
+        hf_hooked_model.monitoring_engine = monitoring_engine
+    warmup(hf_modified_hook_async_prefill, hf_modified_hook_async_decode)
+    resolve_monitoring_results()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     main_async_decode_elapsed, total_async_decode_elapsed = run_async_benchmark(
         "hf_modified_hook_async",
         lambda: run_decode(hf_modified_hook_async_prefill, hf_modified_hook_async_decode),
@@ -1026,28 +1597,69 @@ def main() -> None:
         if total_async_decode_elapsed > 0
         else float("inf"),
     }
-    hf_hooked_model.monitoring_engine = None
+    if attach_to_model and not engine_attached_permanently:
+        hf_hooked_model.monitoring_engine = None
 
+    # Selective monitoring: only hook_resid_post (n_layer hooks instead of all)
+    if args.monitoring_mode == "dual_compile" and dual_compile_runner is not None:
+        selected = monitoring_engine.select_hooks(["hook_resid_post"])
+        print(f"  selective monitoring: {len(selected)} hooks (hook_resid_post only)")
+        if attach_to_model:
+            hf_hooked_model.monitoring_engine = monitoring_engine
+        warmup(hf_modified_hook_async_prefill, hf_modified_hook_async_decode)
+        resolve_monitoring_results()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        main_sel_elapsed, total_sel_elapsed = run_async_benchmark(
+            "hf_modified_hook_selective",
+            lambda: run_decode(hf_modified_hook_async_prefill, hf_modified_hook_async_decode),
+            monitoring_engine,
+        )
+        timings["hf_modified_hook_selective"] = {
+            "main_duration": main_sel_elapsed,
+            "total_duration": total_sel_elapsed,
+            "num_hooks": len(selected),
+            "tokens_per_second_main": total_decoded_tokens / main_sel_elapsed
+            if main_sel_elapsed > 0
+            else float("inf"),
+            "tokens_per_second_total": total_decoded_tokens / total_sel_elapsed
+            if total_sel_elapsed > 0
+            else float("inf"),
+        }
+        # Restore full monitoring for subsequent benchmarks
+        monitoring_engine.select_hooks(None)
+        if attach_to_model and not engine_attached_permanently:
+            hf_hooked_model.monitoring_engine = None
+
+    # Overhead benchmark: same compiled graph as async, but no D2H (no start_step/end_step)
+    # Runs after async so dual_compile_runner is already warmed up
+    if args.monitoring_mode == "dual_compile" and dual_compile_runner is not None:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        warmup(hf_overhead_prefill, hf_overhead_decode)
+        hf_overhead_elapsed = run_benchmark(
+            "hf_modified_overhead",
+            lambda: run_decode(hf_overhead_prefill, hf_overhead_decode),
+        )
+        timings["hf_modified_overhead"] = {
+            "duration": hf_overhead_elapsed,
+            "tokens_per_second": total_decoded_tokens / hf_overhead_elapsed
+            if hf_overhead_elapsed > 0
+            else float("inf"),
+        }
+
+    # hooked_compile: HookedGPT2Model + torch.compile, no monitoring
+    # Runs after dual_compile engine so cudagraph_trees=False is already set
     if device.type == "cuda":
         torch.cuda.empty_cache()
-
-    hf_hook_prefill, hf_hook_decode, hf_hook_cleanup = setup_hf_decode_hook(
-        hf_model,
-        collect_hidden=args.collect_hidden,
-        collect_attention=args.collect_attention,
-        move_to_cpu=False,
+    warmup(hooked_compile_prefill, hooked_compile_decode)
+    hooked_compile_elapsed = run_benchmark(
+        "hooked_compile", lambda: run_decode(hooked_compile_prefill, hooked_compile_decode)
     )
-    warmup(hf_hook_prefill, hf_hook_decode)
-    try:
-        hf_hook_elapsed = run_benchmark(
-            "huggingface_hook", lambda: run_decode(hf_hook_prefill, hf_hook_decode)
-        )
-        timings["huggingface_hook"] = {
-            "duration": hf_hook_elapsed,
-            "tokens_per_second": total_decoded_tokens / hf_hook_elapsed if hf_hook_elapsed > 0 else float("inf"),
-        }
-    finally:
-        hf_hook_cleanup()
+    timings["hooked_compile"] = {
+        "duration": hooked_compile_elapsed,
+        "tokens_per_second": total_decoded_tokens / hooked_compile_elapsed if hooked_compile_elapsed > 0 else float("inf"),
+    }
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -1071,7 +1683,18 @@ def main() -> None:
     finally:
         hf_hook_cpu_cleanup()
 
+    if graph_native_backend is not None:
+        try:
+            stats = graph_native_backend.get_stats()
+            print("[GraphDebug] Native backend stats:", stats)
+        except Exception:
+            pass
     monitoring_engine.close()
+    if graph_native_backend is not None:
+        try:
+            graph_native_backend.close()
+        except Exception:
+            pass
 
     # Save timing results to JSON file
     import json
@@ -1123,11 +1746,13 @@ def main() -> None:
         print("\nProfiler traces written under:")
         print(f"  {traces_path.resolve()}")
     if args.nvtx and device.type == "cuda":
-        print("NVTX annotations enabled for TransformerLens decode hooks (MonitoringConfig.debug=True).")
+        print("NVTX annotations enabled for TransformerLens decode hooks (set TL_ENABLE_NVTX=1).")
 
+    # If engine stats are enabled, also print hook-side stats even for sync baselines.
     try:
-        if args.nvtx:
-            from monitoring.hook_points import get_monitoring_hook_stats
+        import os as _os
+        if bool(int(_os.environ.get("MON_ENGINE_STATS", "0"))):
+            from transformers.models.gpt2_p.hook_points import get_monitoring_hook_stats  # type: ignore
             _hook_stats = get_monitoring_hook_stats()
             if _hook_stats:
                 print("[Hook/Stats]", _hook_stats)

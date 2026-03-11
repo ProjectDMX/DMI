@@ -9,7 +9,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 
 from .config import AdvanceConfig, MonitoringConfig
-from .task import CacheFuture, MonitoringTask
+from .task import CacheFuture, MonitoringTask, _encode_slice_native
+
+try:  # Optional import to avoid circular dependency at runtime
+    from transformer_lens.utils import Slice
+except Exception:  # pragma: no cover - transformer_lens may be absent in some envs
+    Slice = None
 
 
 def _stream_to_handle(stream: Optional[torch.cuda.Stream]) -> Optional[int]:
@@ -307,6 +312,89 @@ class MonitoringEngine:
         self._hook_cache_list = compiled_list
         self._hook_cache_set = set(compiled_list)
         return self._hook_cache_list, self._hook_cache_set
+
+    def register_native_hook(
+        self,
+        hook_point: Any,
+        hook_name: str,
+        *,
+        cache_name: Optional[str] = None,
+        is_backward: bool = False,
+        remove_batch_dim: bool = False,
+        pos_slice: Any = None,
+        device: Optional[torch.device] = None,
+        prepend: bool = False,
+    ) -> Any:
+        """Register a native callback directly on a HookPoint."""
+
+        if not (self._using_native_backend and self._native_backend is not None):
+            raise RuntimeError("Native backend is not available")
+
+        slice_tuple = _encode_slice_native(pos_slice)
+        target_device = device if device is not None else None
+        cache_label = cache_name or hook_name
+        return self._native_backend.register_hook_callback(
+            hook_point,
+            hook_name,
+            cache_label,
+            bool(is_backward),
+            bool(remove_batch_dim),
+            slice_tuple,
+            target_device,
+            bool(prepend),
+        )
+
+    def create_inline_hook_ticket(
+        self,
+        hook_name: str,
+        *,
+        remove_batch_dim: bool = False,
+        pos_slice: Any = None,
+        device: Optional[torch.device] = None,
+    ) -> Any:
+        if not (self._using_native_backend and self._native_backend is not None):
+            raise RuntimeError("Native backend is not available")
+        slice_tuple = _encode_slice_native(pos_slice)
+        target_device = device if device is not None else None
+        return self._native_backend.create_inline_hook_ticket(
+            hook_name,
+            bool(remove_batch_dim),
+            slice_tuple,
+            target_device,
+        )
+
+    def create_inline_monitor_handle(
+        self,
+        hook_name: str,
+        cache_name: Optional[str] = None,
+        *,
+        remove_batch_dim: bool = False,
+        pos_slice: Any = None,
+        device: Optional[torch.device] = None,
+    ) -> Any:
+        if not (self._using_native_backend and self._native_backend is not None):
+            raise RuntimeError("Native backend is not available")
+        slice_tuple = _encode_slice_native(pos_slice)
+        target_device = device if device is not None else None
+        cache_label = cache_name or hook_name
+        return self._native_backend.create_inline_monitor_handle(
+            hook_name,
+            cache_label,
+            bool(remove_batch_dim),
+            slice_tuple,
+            target_device,
+        )
+
+    def monitor_inline_hook(
+        self,
+        ticket: Any,
+        gate_name: str,
+        cache_name: str,
+        tensor: torch.Tensor,
+    ) -> None:
+        if not (self._using_native_backend and self._native_backend is not None):
+            return
+        self._native_backend.monitor_inline(ticket, gate_name, cache_name, tensor)
 
     def _apply_capture_schedule(self) -> None:
         if not self._native_backend or self.config is None:

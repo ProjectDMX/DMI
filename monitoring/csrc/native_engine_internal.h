@@ -80,6 +80,15 @@ struct HookConfig {
   std::optional<c10::Device> target_device;
 };
 
+struct InlineOpHandle {
+  std::shared_ptr<NativeMonitoringEngine> engine;
+  HookConfig* config{nullptr};
+  std::string gate_name;
+  std::string cache_name;
+};
+
+constexpr const char* kInlineHandleTag = "MonInlineHandle";
+
 enum class StepPhase : int64_t {
   kUnknown = 0,
   kPrefill = 1,
@@ -126,6 +135,10 @@ struct NativeMonitoringEngine::Impl {
                                    const py::list& tasks,
                                    std::optional<uint64_t> stream_handle);
 
+  std::vector<int64_t> submit_step_soa(int64_t step_id,
+                                       const py::dict& spec,
+                                       std::optional<uint64_t> stream_handle);
+
   void set_capture_schedule(int64_t step_stride,
                             int64_t step_offset,
                             int64_t warmup_steps,
@@ -171,6 +184,18 @@ struct NativeMonitoringEngine::Impl {
                                        py::object target_device);
   void append_hook_current_step(const HookConfig& cfg, at::Tensor tensor);
   std::pair<int64_t, int64_t> add_task_from_config(const HookConfig& cfg, at::Tensor tensor, int64_t step_id);
+  int64_t process_native_hook(const HookConfig& cfg,
+                              at::Tensor tensor,
+                              const std::string& gate_name,
+                              const std::string& cache_name);
+  py::capsule create_inline_hook_ticket(const std::string& hook_name,
+                                        bool remove_batch_dim,
+                                        py::tuple slice_tuple,
+                                        py::object target_device);
+  void monitor_inline(py::capsule ticket,
+                      const std::string& gate_name,
+                      const std::string& cache_name,
+                      at::Tensor tensor);
 
   // Internal helpers ----------------------------------------------------
   int64_t deduce_pos_dim(const std::string& name);
@@ -280,6 +305,11 @@ struct NativeMonitoringEngine::Impl {
   bool enable_host_copy_pool_{false};
   int host_copy_threads_{0};
 
+  // Gather-based H2H: single contiguous memcpy instead of per-tensor dispatch
+  bool enable_gather_h2h_{false};
+  std::atomic<int64_t> stats_gather_h2h_bytes_{0};
+  std::atomic<int64_t> stats_gather_h2h_calls_{0};
+
   void host_copy_worker();
   void process_copy_job(const CopyJob& job);
 
@@ -338,6 +368,8 @@ struct NativeMonitoringEngine::Impl {
   std::atomic<int64_t> stats_submit_us_{0};
   std::atomic<int64_t> stats_process_us_{0};
   std::atomic<int64_t> stats_callback_us_{0};
+  std::atomic<int64_t> stats_hook_calls_{0};
+  std::atomic<int64_t> stats_hook_enqueued_{0};
 };
 
 }  // namespace monitoring

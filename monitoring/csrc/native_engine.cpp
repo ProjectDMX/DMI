@@ -1,6 +1,8 @@
 // Top-level class thin wrappers and hook callback creation.
 
 #include "native_engine_internal.h"
+#include "nvtx_shim.h"
+#include <cstdio>
 
 namespace monitoring {
 
@@ -33,6 +35,12 @@ std::vector<int64_t> NativeMonitoringEngine::submit_step(int64_t step_id,
                                                          const py::list& tasks,
                                                          std::optional<uint64_t> stream_handle) {
   return impl_->submit_step(step_id, tasks, stream_handle);
+}
+
+std::vector<int64_t> NativeMonitoringEngine::submit_step_soa(int64_t step_id,
+                                                              const py::dict& spec,
+                                                              std::optional<uint64_t> stream_handle) {
+  return impl_->submit_step_soa(step_id, spec, stream_handle);
 }
 
 void NativeMonitoringEngine::set_capture_schedule(int64_t step_stride,
@@ -218,7 +226,6 @@ py::object NativeMonitoringEngine::create_global_hook_callback_sig(const std::st
           if (tensor.requires_grad()) {
             tensor = tensor.detach();
           }
-          // Check enabled set
           bool enabled = false;
           {
             std::lock_guard<std::mutex> lk(engine->impl_->enabled_mutex_);
@@ -238,6 +245,148 @@ py::object NativeMonitoringEngine::create_global_hook_callback_sig(const std::st
         engine->record_callback_duration(static_cast<int64_t>(us));
         return py::none();
       });
+}
+
+py::object NativeMonitoringEngine::register_hook_callback(py::object hook_point,
+                                                          const std::string& hook_name,
+                                                          const std::string& cache_name,
+                                                          bool is_backward,
+                                                          bool remove_batch_dim,
+                                                          py::tuple slice_tuple,
+                                                          py::object target_device,
+                                                          bool prepend) {
+  if (hook_point.is_none()) {
+    throw std::runtime_error("register_hook_callback requires a HookPoint module");
+  }
+
+  auto py_module = hook_point.cast<py::object>();
+  auto handle_attr_name = is_backward ? "register_full_backward_hook" : "register_forward_hook";
+  py::object register_fn = py_module.attr(handle_attr_name);
+
+  HookConfig* cfg_ptr = impl_->upsert_hook_config_tuple(hook_name, remove_batch_dim,
+                                                        std::move(slice_tuple), std::move(target_device));
+  auto engine = shared_from_this();
+  std::string gate_name = hook_name;
+  std::string cache_name_copy = cache_name;
+
+  std::string nvtx_label = std::string("MonEng::Hook[") + gate_name + (is_backward ? ":bwd]" : ":fwd]");
+
+  py::object full_hook = py::cpp_function(
+      [engine, cfg_ptr, gate_name, cache_name_copy, is_backward, nvtx_label](py::object /*module*/,
+                                                                            py::object /*module_input*/,
+                                                                            py::object module_output) -> py::object {
+        py::object tensor_obj;
+        if (is_backward) {
+          if (py::isinstance<py::tuple>(module_output)) {
+            py::tuple tup = module_output.cast<py::tuple>();
+            if (tup.size() == 0) {
+              return py::none();
+            }
+            tensor_obj = tup[0];
+          } else {
+            tensor_obj = module_output;
+          }
+        } else {
+          tensor_obj = module_output;
+        }
+
+        at::Tensor tensor = tensor_obj.cast<at::Tensor>();
+        auto t0 = std::chrono::steady_clock::now();
+        mon_nvtx_push(nvtx_label.c_str());
+        {
+          py::gil_scoped_release release;
+          engine->impl_->process_native_hook(*cfg_ptr, std::move(tensor), gate_name, cache_name_copy);
+        }
+        mon_nvtx_pop();
+        auto t1 = std::chrono::steady_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        engine->record_callback_duration(static_cast<int64_t>(us));
+        return py::none();
+      });
+
+  py::function reg_fn = register_fn.cast<py::function>();
+  if (prepend) {
+    return reg_fn(full_hook, py::arg("prepend") = true);
+  }
+  return reg_fn(full_hook);
+}
+
+py::object NativeMonitoringEngine::create_inline_hook_ticket(const std::string& hook_name,
+                                                             bool remove_batch_dim,
+                                                             py::tuple slice_tuple,
+                                                             py::object target_device) {
+  HookConfig* cfg_ptr = impl_->upsert_hook_config_tuple(hook_name, remove_batch_dim,
+                                                        std::move(slice_tuple), std::move(target_device));
+  return py::capsule(cfg_ptr, "MonHookConfig");
+}
+
+namespace {
+
+void InlineHandleDeleter(PyObject* capsule) {
+  void* ptr = PyCapsule_GetPointer(capsule, kInlineHandleTag);
+  if (ptr != nullptr) {
+    auto* handle = reinterpret_cast<InlineOpHandle*>(ptr);
+    delete handle;
+  }
+}
+
+}  // namespace
+
+py::capsule NativeMonitoringEngine::create_inline_monitor_handle(const std::string& hook_name,
+                                                                 const std::string& cache_name,
+                                                                 bool remove_batch_dim,
+                                                                 py::tuple slice_tuple,
+                                                                 py::object target_device) {
+  HookConfig* cfg_ptr = impl_->upsert_hook_config_tuple(hook_name, remove_batch_dim,
+                                                        std::move(slice_tuple), std::move(target_device));
+  auto inline_handle = std::make_unique<InlineOpHandle>();
+  inline_handle->engine = shared_from_this();
+  inline_handle->config = cfg_ptr;
+  inline_handle->gate_name = hook_name;
+  inline_handle->cache_name = cache_name;
+  auto* raw = inline_handle.release();
+  return py::capsule(raw, kInlineHandleTag, InlineHandleDeleter);
+}
+
+void NativeMonitoringEngine::monitor_inline(py::object ticket,
+                                            const std::string& gate_name,
+                                            const std::string& cache_name,
+                                            at::Tensor tensor) {
+  if (!ticket || ticket.is_none()) {
+    throw std::runtime_error("monitor_inline requires a valid ticket");
+  }
+  py::capsule cap(ticket);
+  auto* cfg_ptr = static_cast<HookConfig*>(cap.get_pointer());
+  if (cfg_ptr == nullptr) {
+    throw std::runtime_error("Invalid inline hook ticket");
+  }
+  impl_->process_native_hook(*cfg_ptr, std::move(tensor), gate_name, cache_name);
+}
+
+at::Tensor monitor_activation(at::Tensor tensor, py::object handle_obj) {
+  if (handle_obj.is_none()) {
+    return tensor;
+  }
+  py::capsule capsule(handle_obj);
+  void* raw_handle = PyCapsule_GetPointer(capsule.ptr(), kInlineHandleTag);
+  auto* raw_ptr = reinterpret_cast<InlineOpHandle*>(raw_handle);
+  if (raw_ptr == nullptr) {
+    throw std::runtime_error("Invalid inline monitor handle");
+  }
+  auto engine = raw_ptr->engine;
+  if (!engine) {
+    return tensor;
+  }
+  const std::string& hook_name = raw_ptr->gate_name;
+  std::string label = "TL::NativeInlineHook[" + hook_name + "]";
+  mon_nvtx_push(label.c_str());
+  {
+    py::gil_scoped_release release;
+    engine->impl_->process_native_hook(*(raw_ptr->config), tensor,
+                                       raw_ptr->gate_name, raw_ptr->cache_name);
+  }
+  mon_nvtx_pop();
+  return tensor;
 }
 
 void NativeMonitoringEngine::set_enabled_hooks(py::object names_iterable) {

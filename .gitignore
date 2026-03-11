@@ -52,6 +52,9 @@ Thumbs.db
 *.bak
 *~
 
+# Local torch extension builds
+monitoring/.torch_extensions/
+
 # Benchmark outputs
 benchmark/figures/
 *.nsys-rep

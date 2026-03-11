@@ -6,17 +6,20 @@
 
 #include <stdint.h>
 
-#if defined(__has_include)
-#  if __has_include(<nvToolsExt.h>)
+#if defined(MON_USE_NVTX) && (MON_USE_NVTX == 1)
+#  if defined(__has_include)
+#    if __has_include(<nvToolsExt.h>)
+#      include <nvToolsExt.h>
+#      define MON_NVTX_ENABLED 1
+#    else
+#      error "NVTX=1 was requested but nvToolsExt.h was not found in include path!"
+#    endif
+#  else
 #    include <nvToolsExt.h>
 #    define MON_NVTX_ENABLED 1
-#  else
-#    define MON_NVTX_ENABLED 0
 #  endif
 #else
-// Fallback: assume present on CUDA-enabled systems
-#  include <nvToolsExt.h>
-#  define MON_NVTX_ENABLED 1
+#  define MON_NVTX_ENABLED 0
 #endif
 
 #include <pthread.h>

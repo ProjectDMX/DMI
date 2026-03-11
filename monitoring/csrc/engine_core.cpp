@@ -3,6 +3,8 @@
 #include "native_engine_internal.h"
 #include "engine_utils.h"
 #include "nvtx_shim.h"
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <limits>
 
@@ -45,6 +47,11 @@ NativeMonitoringEngine::Impl::Impl(int64_t queue_size,
   }
   if (pinpool_max_mb > 0) {
     pinpool_max_bytes_ = static_cast<size_t>(pinpool_max_mb) * 1024ull * 1024ull;
+  }
+
+  // Gather-based H2H: single contiguous buffer instead of per-tensor alloc+memcpy
+  if (const char* v = std::getenv("MON_NATIVE_GATHER_H2H")) {
+    enable_gather_h2h_ = (*v == '1');
   }
 
   // Host-copy pool configuration (optional parallel memcpy)
@@ -276,6 +283,7 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   std::vector<PendingResult> results;
   results.reserve(work.tasks.size());
   bool any_sync = false;
+
   for (auto& entry : work.tasks) {
     try {
       if (entry.token == 0) {
@@ -326,7 +334,74 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
   // 1. Pool-backed pinned (block_id >= 0): copy to pageable + release pool block
   // 2. Non-pool pinned (block_id < 0): copy to pageable + auto-release via refcount
   // 3. Already pageable or GPU: store directly without host copy
-  if (enable_host_copy_pool_) {
+
+  if (enable_gather_h2h_) {
+    // ---- Gather path: single contiguous buffer for all pinned H2H copies ----
+    // Collect metadata for all pinned results needing repage
+    struct GatherEntry {
+      size_t offset;
+      at::Tensor pinned;
+      int64_t block_id;
+      int64_t token;
+      c10::IntArrayRef sizes;
+      c10::IntArrayRef strides;
+      at::ScalarType dtype;
+    };
+    size_t total_bytes = 0;
+    std::vector<GatherEntry> gather_list;
+    gather_list.reserve(results.size());
+
+    for (auto& pr : results) {
+      const bool need_repage = pr.tensor.defined() && pr.tensor.device().is_cpu() && pr.tensor.is_pinned();
+      if (need_repage) {
+        size_t nbytes = static_cast<size_t>(pr.tensor.nbytes());
+        gather_list.push_back(GatherEntry{
+            total_bytes, pr.tensor, pr.block_id, pr.token,
+            pr.tensor.sizes(), pr.tensor.strides(), pr.tensor.scalar_type()});
+        total_bytes += nbytes;
+      } else {
+        store_result(pr.token, std::move(pr.tensor));
+      }
+    }
+
+    if (!gather_list.empty()) {
+      mon_nvtx_push("MonEng::gather_h2h");
+      // Single pageable allocation for all pinned tensors
+      at::Tensor contig_buf = at::empty(
+          {static_cast<int64_t>(total_bytes)},
+          at::TensorOptions().dtype(at::kByte).device(torch::kCPU).pinned_memory(false));
+      uint8_t* base = contig_buf.data_ptr<uint8_t>();
+
+      // Sequential memcpy into contiguous buffer (cache-friendly linear write)
+      for (auto& entry : gather_list) {
+        std::memcpy(base + entry.offset,
+                     entry.pinned.data_ptr(),
+                     static_cast<size_t>(entry.pinned.nbytes()));
+      }
+
+      // Create views backed by contig_buf, release pool blocks, store results
+      for (auto& entry : gather_list) {
+        // Capture contig_buf by value in deleter to prevent early free;
+        // all views share the refcount of the contiguous buffer.
+        at::Tensor view = at::from_blob(
+            base + entry.offset,
+            entry.sizes,
+            entry.strides,
+            /*deleter=*/[buf_ref = contig_buf](void*) { (void)buf_ref; },
+            at::TensorOptions().dtype(entry.dtype).device(torch::kCPU));
+        if (entry.block_id >= 0) {
+          release_pool_block(entry.block_id);
+        }
+        store_result(entry.token, std::move(view));
+      }
+
+      stats_gather_h2h_bytes_.fetch_add(static_cast<int64_t>(total_bytes), std::memory_order_relaxed);
+      stats_gather_h2h_calls_.fetch_add(1, std::memory_order_relaxed);
+      stats_memcpy_bytes_.fetch_add(static_cast<int64_t>(total_bytes), std::memory_order_relaxed);
+      mon_nvtx_pop();
+    }
+  } else if (enable_host_copy_pool_) {
+    // ---- Per-tensor thread-pool path ----
     for (auto& pr : results) {
       const bool need_repage = pr.tensor.defined() && pr.tensor.device().is_cpu() && pr.tensor.is_pinned();
       if (need_repage) {
@@ -352,6 +427,7 @@ void NativeMonitoringEngine::Impl::process_step(StepWork&& work) {
       }
     }
   } else {
+    // ---- Per-tensor inline path ----
     for (auto& pr : results) {
       const bool need_repage = pr.tensor.defined() && pr.tensor.device().is_cpu() && pr.tensor.is_pinned();
       if (need_repage) {
@@ -397,6 +473,7 @@ at::Tensor NativeMonitoringEngine::Impl::run_task(const TaskSpec& spec) {
   if (cache_dtype_.has_value() && tensor.scalar_type() != *cache_dtype_) {
     tensor = tensor.to(*cache_dtype_, /*non_blocking=*/true, /*copy=*/false);
   }
+
   // D2H offload is fixed-on with pinned pool + pinned fallback.
   if (tensor.is_cuda()) {
     size_t nbytes = static_cast<size_t>(tensor.nbytes());
@@ -405,7 +482,12 @@ at::Tensor NativeMonitoringEngine::Impl::run_task(const TaskSpec& spec) {
     auto got = acquire_pinned_block(nbytes, dt);
     if (got.first.defined()) {
       at::Tensor dst = got.first.view(tensor.sizes());
-      dst.copy_(tensor, /*non_blocking=*/true);
+      try {
+        dst.copy_(tensor, /*non_blocking=*/true);
+      } catch (...) {
+        release_pool_block(got.second);
+        throw;
+      }
       return dst;
     }
     // Pool could not provide a block (capacity/pressure) — direct pinned alloc.
@@ -610,11 +692,13 @@ void NativeMonitoringEngine::Impl::store_result(int64_t token, at::Tensor&& tens
     slot->ready = true;
   }
   slot->cv.notify_all();
-  pending_tasks_.fetch_sub(1, std::memory_order_acq_rel);
-  mon_nvtx_push("MonEng::pending_notify");
-  pending_cv_.notify_all();
-  stats_pending_notifies_.fetch_add(1, std::memory_order_relaxed);
-  mon_nvtx_pop();
+  int64_t remaining = pending_tasks_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+  if (remaining == 0) {
+    mon_nvtx_push("MonEng::pending_notify");
+    pending_cv_.notify_all();
+    stats_pending_notifies_.fetch_add(1, std::memory_order_relaxed);
+    mon_nvtx_pop();
+  }
   mon_nvtx_pop();
 }
 
@@ -627,11 +711,13 @@ void NativeMonitoringEngine::Impl::store_exception(int64_t token, const std::str
     slot->ready = true;
   }
   slot->cv.notify_all();
-  pending_tasks_.fetch_sub(1, std::memory_order_acq_rel);
-  mon_nvtx_push("MonEng::pending_notify");
-  pending_cv_.notify_all();
-  stats_pending_notifies_.fetch_add(1, std::memory_order_relaxed);
-  mon_nvtx_pop();
+  int64_t remaining = pending_tasks_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+  if (remaining == 0) {
+    mon_nvtx_push("MonEng::pending_notify");
+    pending_cv_.notify_all();
+    stats_pending_notifies_.fetch_add(1, std::memory_order_relaxed);
+    mon_nvtx_pop();
+  }
 }
 
 void NativeMonitoringEngine::Impl::clear_completed_results_internal() {

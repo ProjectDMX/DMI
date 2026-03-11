@@ -7,6 +7,8 @@
 #include "api_submit.cpp"
 #include "hooks.cpp"
 #include "slice.cpp"
+#include "graph_native_delegate.cpp"
+#include "graph_shadow_parser.cpp"
 // dmx_host pipeline bits
 #include "dmx_host_utils.cpp"
 #include "future_process.cpp"

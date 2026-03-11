@@ -1,6 +1,9 @@
 """Monitoring engine package for asynchronous hook processing."""
 
 from .engine import MonitoringEngine, HostEngineConfig
+from .graph_engine import GraphSafeEngine, GraphSlotResult
+from .graph_consumer import GraphSlotConsumer
+from .graph_monitor import GraphMonitor, SlotInfo
 from .config import AdvanceConfig, CaptureSchedule, HookSelection, MonitoringConfig, NativePartialSealConfig
 from .task import CacheFuture, MonitoringTask
 
@@ -24,6 +27,11 @@ def __getattr__(name: str):
 
 __all__ = [
     "MonitoringEngine",
+    "GraphSafeEngine",
+    "GraphSlotConsumer",
+    "GraphSlotResult",
+    "GraphMonitor",
+    "SlotInfo",
     "HostEngineConfig",
     "MonitoringTask",
     "CacheFuture",
