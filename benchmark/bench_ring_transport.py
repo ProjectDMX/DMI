@@ -105,6 +105,12 @@ class BenchConfig:
     ring_pinned_mb: int = 4096
     drain_poll_timeout_us: int = 0
     drain_notify_on_forward: bool = True
+    drain_flush_task_ratio: float = 0.0
+    drain_flush_payload_ratio: float = 0.0
+    drain_flush_entry_threshold: int = 0
+    drain_flush_byte_threshold: int = 0
+    bypass_budget_mb: int = 256
+    clone_slices: bool = False
 
     ch_parallelism: int = 10
     ch_queue_max_items: int = 1024
@@ -128,9 +134,17 @@ def _make_ring_cfg(cfg: BenchConfig):
     rc.task_ring_entries  = cfg.ring_task_entries
     rc.payload_ring_bytes = cfg.ring_payload_mb * 1024 * 1024
     rc.chunk_bytes        = cfg.ring_chunk_kb   * 1024
-    rc.pinned_pool_bytes  = cfg.ring_pinned_mb  * 1024 * 1024
-    rc.drain_poll_timeout_us   = cfg.drain_poll_timeout_us
-    rc.drain_notify_on_forward = cfg.drain_notify_on_forward
+    rc.pinned_staging_bytes  = cfg.ring_pinned_mb  * 1024 * 1024
+    rc.drain_poll_timeout_us       = cfg.drain_poll_timeout_us
+    rc.drain_notify_on_forward     = cfg.drain_notify_on_forward
+    rc.drain_flush_task_ratio      = cfg.drain_flush_task_ratio
+    rc.drain_flush_payload_ratio   = cfg.drain_flush_payload_ratio
+    rc.drain_flush_entry_threshold = cfg.drain_flush_entry_threshold
+    rc.drain_flush_byte_threshold  = cfg.drain_flush_byte_threshold
+    rc.bypass_budget_bytes         = cfg.bypass_budget_mb * 1024 * 1024
+    rc.clone_slices                = cfg.clone_slices
+    rc.insert_queue_max_bytes      = cfg.ch_queue_max_size_mb * 1024 * 1024
+    rc.insert_queue_max_items      = cfg.ch_queue_max_items
     return rc
 
 
@@ -361,20 +375,43 @@ def _parse_args() -> BenchConfig:
     g.add_argument("--modes",           default="baseline,ring_null")
     g.add_argument("--cuda-graphs",     action="store_true")
 
-    g = p.add_argument_group("Ring engine")
-    g.add_argument("--ring-task-entries", type=int, default=65536)
-    g.add_argument("--ring-payload-mb",   type=int, default=4096)
-    g.add_argument("--ring-chunk-kb",     type=int, default=4096)
-    g.add_argument("--ring-pinned-mb",    type=int, default=4096)
+    g = p.add_argument_group("Ring engine — GPU buffers")
+    g.add_argument("--ring-task-entries", type=int, default=65536,
+                   help="Task ring slot count")
+    g.add_argument("--ring-payload-mb",   type=int, default=4096,
+                   help="GPU payload ring size (MiB)")
+    g.add_argument("--ring-chunk-kb",     type=int, default=4096,
+                   help="Max chunk size (KiB)")
+    g.add_argument("--ring-pinned-mb",    type=int, default=4096,
+                   help="Pinned staging ring size (MiB, 0 = payload size)")
+
+    g = p.add_argument_group("Ring engine — drain thread")
     g.add_argument("--drain-poll-timeout-us", type=int, default=0,
                    help="Drain thread poll timeout in µs (0 = no timeout)")
     g.add_argument("--no-drain-notify", action="store_true",
                    help="Disable notify_drain() before each forward pass")
+    g.add_argument("--drain-flush-task-ratio",    type=float, default=0.0,
+                   help="Flush at N%% task ring usage (0 = disabled)")
+    g.add_argument("--drain-flush-payload-ratio", type=float, default=0.0,
+                   help="Flush at N%% payload ring usage (0 = disabled)")
+    g.add_argument("--drain-flush-entry-threshold", type=int, default=0,
+                   help="Flush after N entries ready (0 = disabled)")
+    g.add_argument("--drain-flush-byte-threshold",  type=int, default=0,
+                   help="Flush after N payload bytes ready (0 = disabled)")
+
+    g = p.add_argument_group("Ring engine — bypass / p2p")
+    g.add_argument("--bypass-budget-mb", type=int, default=256,
+                   help="Large tensor bypass budget (MiB)")
+    g.add_argument("--clone-slices", action="store_true",
+                   help="Clone per-request slices before submit")
 
     g = p.add_argument_group("ClickHouse stage")
-    g.add_argument("--ch-parallelism",       type=int, default=10)
-    g.add_argument("--ch-queue-max-items",   type=int, default=1024)
-    g.add_argument("--ch-queue-max-size-mb", type=int, default=2048)
+    g.add_argument("--ch-parallelism",       type=int, default=10,
+                   help="Insert thread parallelism")
+    g.add_argument("--ch-queue-max-items",   type=int, default=1024,
+                   help="Insert queue item limit")
+    g.add_argument("--ch-queue-max-size-mb", type=int, default=2048,
+                   help="Insert queue byte limit (MiB)")
 
     g = p.add_argument_group("ClickHouse connection")
     g.add_argument("--db-host",     default="localhost")
@@ -394,6 +431,12 @@ def _parse_args() -> BenchConfig:
         ring_chunk_kb=ns.ring_chunk_kb, ring_pinned_mb=ns.ring_pinned_mb,
         drain_poll_timeout_us=ns.drain_poll_timeout_us,
         drain_notify_on_forward=not ns.no_drain_notify,
+        drain_flush_task_ratio=ns.drain_flush_task_ratio,
+        drain_flush_payload_ratio=ns.drain_flush_payload_ratio,
+        drain_flush_entry_threshold=ns.drain_flush_entry_threshold,
+        drain_flush_byte_threshold=ns.drain_flush_byte_threshold,
+        bypass_budget_mb=ns.bypass_budget_mb,
+        clone_slices=bool(ns.clone_slices),
         ch_parallelism=ns.ch_parallelism, ch_queue_max_items=ns.ch_queue_max_items,
         ch_queue_max_size_mb=ns.ch_queue_max_size_mb,
         db_host=ns.db_host, db_port=ns.db_port, db_user=ns.db_user,

@@ -37,8 +37,12 @@ offset 80  hook_id             uint32  hook identifier
 offset 84  flags               uint32  TASK_FLAG_IS_FIRST | IS_LAST | IS_DROP
 offset 88  reason              uint32  DROP_REASON_* (drop entries only)
 offset 92  _pad0               uint32
-offset 96  payload_alloc_bytes uint64  aligned allocation size (>= len1+len2, for payload_tail release)
-offset 104 _padding[24]        uint8   explicit padding to 128 bytes
+offset  96 payload_alloc_bytes        uint64  aligned allocation size (>= len1+len2, for payload_tail release)
+offset 104 tensor_total_padded_bytes  uint64  total padded bytes across all chunks (valid on IS_FIRST)
+                                               = (N-1)*chunk_bytes + align_up(last_chunk, 16)
+                                               where N = ceil(tensor_total_bytes / chunk_bytes)
+                                               Used by drain thread for large-tensor bypass decision.
+offset 112 _padding[16]               uint8   explicit padding to 128 bytes
 ```
 
 ### PayloadRingState (logical view)
@@ -78,6 +82,12 @@ The producer is a CUDA custom op inserted as a post-op node in the model graph.
 3. **Copy data** — issue `cudaMemcpyAsync` (D2D) into `payload_buf[off1..off1+len1]` and, if `len2 > 0`, into `payload_buf[0..len2]`.
 
 4. **Advance payload_head** — `payload_head += align_up(chunk_bytes, 16)`.  All allocations are rounded up to 16-byte alignment so that D2D copies can use vectorized `uint4` loads/stores.  The aligned size is stored in `TaskEntry::payload_alloc_bytes`.
+
+   **Alignment guarantee for uint4 (16-byte) loads/stores:**  Both the source and destination virtual addresses must be 16-byte aligned.
+
+   - **Destination (`payload_buf + offset`)**: `payload_buf` is allocated via `cudaMalloc`, which is *"guaranteed to be aligned to at least 256 bytes"* ([CUDA C++ Best Practices Guide §10.2.1.2](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/)).  `payload_head` starts at 0 and is only ever advanced by `align_up(chunk_bytes, 16)`, so every offset is a multiple of 16.  This requires `payload_ring_bytes` (the capacity) to also be a multiple of 16, so that wrap offsets (`offset % payload_ring_bytes`) preserve alignment.
+
+   - **Source (`src + chunk_off`)**: PyTorch tensor data comes from the CUDA caching allocator, which sub-allocates from `cudaMalloc` blocks at 512-byte aligned boundaries.  `chunk_off = chunk_idx * chunk_bytes`, so this is 16-byte aligned **only if `chunk_bytes` is a multiple of 16**.  This is a configuration requirement: `RingConfig::chunk_bytes` must be a multiple of 16.
 
 5. **Fill TaskEntry fields** — write `seq_no`, `logical_task_id`, spans, flags, etc.
 

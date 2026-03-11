@@ -3,54 +3,59 @@
 
 #include "ring_engine.h"
 
+#include <stdexcept>
+
 namespace ring {
 
-RingEngine::~RingEngine() noexcept {
-    // Stop drain thread first: it calls assembler_ → cb_ → cb_queue_.
-    // Must happen before cb_mu_/cb_queue_/cb_cv_ member destructors run
-    // (drain_ is declared before them so its destructor runs after them,
-    //  but we must stop the thread while they are still alive).
-    if (drain_) drain_->stop();
-    // Now stop callback thread: no more items will be pushed to cb_queue_.
-    if (cb_thread_.joinable()) {
-        cb_running_.store(false);
-        cb_cv_.notify_all();
-        cb_thread_.join();
-    }
-}
-
-RingEngine::RingEngine(const RingConfig& cfg, TensorCallback cb)
-    : cfg_(cfg), ring_(cfg), cb_(std::move(cb))
+RingEngine::RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
+                       SubmitFn submit_fn)
+    : cfg_(cfg), ring_(cfg)
 {
-    pool_.init(cfg.pinned_pool_bytes);
+    // --- Validate config constraints ---
 
-    // Push assembled tensors to the callback queue instead of calling cb_ directly.
-    // This decouples the Python on_tensor callback (which needs the GIL) from the
-    // drain thread, preventing GIL stalls from blocking task-slot freeing.
-    assembler_ = std::make_unique<ChunkAssembler>(pool_,
-        [this](AssembledTensor&& t) {
-            {
-                std::lock_guard<std::mutex> lk(cb_mu_);
-                cb_queue_.push(std::move(t));
-            }
-            cb_cv_.notify_one();
-        });
+    if (cfg_.chunk_bytes % PAYLOAD_ALIGN != 0) {
+        throw std::runtime_error("RingConfig: chunk_bytes must be a multiple of "
+                                 "PAYLOAD_ALIGN (uint4 source alignment)");
+    }
+    if (cfg_.payload_ring_bytes % PAYLOAD_ALIGN != 0) {
+        throw std::runtime_error("RingConfig: payload_ring_bytes must be a multiple of "
+                                 "PAYLOAD_ALIGN (wrap offset alignment)");
+    }
+    if (cfg_.chunk_bytes > cfg_.payload_ring_bytes) {
+        throw std::runtime_error("RingConfig: chunk_bytes must be <= payload_ring_bytes "
+                                 "(one chunk must always fit in GPU ring)");
+    }
+
+    // payload_buf is allocated by cudaMalloc which guarantees >= 256-byte
+    // alignment (CUDA Best Practices Guide §10.2.1.2).  Assert this so that
+    // all payload offsets (multiples of PAYLOAD_ALIGN) produce aligned addresses.
+    auto* buf = ring_.state().payload_buf;
+    if (reinterpret_cast<uintptr_t>(buf) % PAYLOAD_ALIGN != 0) {
+        throw std::runtime_error("RingEngine: payload_buf is not PAYLOAD_ALIGN-aligned "
+                                 "(unexpected: cudaMalloc guarantees >= 256-byte alignment)");
+    }
+
+    const uint64_t staging_bytes = cfg.effective_staging_bytes();
+    staging_.init(staging_bytes);
 
     if (cfg_.drain_poll_timeout_us == 0 && !cfg_.drain_notify_on_forward) {
         fprintf(stderr, "[ring_engine] WARNING: drain_poll_timeout_us=0 and "
                 "drain_notify_on_forward=false — drain thread will only flush "
                 "at stop(). Ring must hold all data or producer will deadlock.\n");
-    } else if (cfg_.drain_poll_timeout_us == 0 && cfg_.drain_notify_on_forward) {
-        fprintf(stderr, "[ring_engine] NOTE: drain_poll_timeout_us=0 with "
-                "drain_notify_on_forward=true — drain wakes once per forward. "
-                "Ring and task queue must hold at least one full forward pass "
-                "(all hooks) or producer will stall on backpressure.\n");
     }
 
-    drain_ = std::make_unique<DrainThread>(
-        ring_.state(), pool_,
-        [this](DrainedChunk&& c) { assembler_->push(std::move(c)); },
-        cfg_.drain_poll_timeout_us);
+    drain_ = std::make_unique<DrainThread>(ring_.state(), staging_, cfg_);
+    p2p_   = std::make_unique<P2PThread>(*drain_, fifo, cfg_, std::move(submit_fn));
+}
+
+RingEngine::~RingEngine() noexcept {
+    // Drain thread final-flushes all GPU entries into the task queue, then
+    // joins.  Only after that do we signal p2p to finish remaining tasks.
+    if (drain_) {
+        drain_->stop();
+        drain_->signal_p2p_stop();
+    }
+    if (p2p_) p2p_->stop();
 }
 
 void RingEngine::init(cudaStream_t stream) {
@@ -58,53 +63,14 @@ void RingEngine::init(cudaStream_t stream) {
 }
 
 void RingEngine::start() {
-    cb_running_.store(true);
-    cb_thread_ = std::thread([this] { cb_loop(); });
     drain_->start();
+    p2p_->start();
 }
 
 void RingEngine::stop() {
-    drain_->stop();  // blocks until drain thread done + all assembler calls queued
-    // Signal callback thread to stop after draining remaining items
-    cb_running_.store(false);
-    cb_cv_.notify_all();
-    if (cb_thread_.joinable()) cb_thread_.join();
-}
-
-void RingEngine::cb_loop() {
-    while (true) {
-        AssembledTensor t;
-        {
-            std::unique_lock<std::mutex> lk(cb_mu_);
-            cb_cv_.wait(lk, [this] {
-                return !cb_queue_.empty() || !cb_running_.load();
-            });
-            if (cb_queue_.empty()) break;  // stopped and queue drained
-            t = std::move(cb_queue_.front());
-            cb_queue_.pop();
-            cb_busy_ = true;
-        }
-        try {
-            cb_(std::move(t));  // GIL-free: pure C++ ATen ops + submit_direct.
-            // Decoupled here so variable-latency work (ATen alloc, memcpy,
-            // per-request slicing) does not stall the drain thread's
-            // task-slot freeing critical path.
-        } catch (...) {
-            // swallow — cannot propagate from background thread
-        }
-        {
-            std::lock_guard<std::mutex> lk(cb_mu_);
-            cb_busy_ = false;
-        }
-        cb_cv_.notify_all();  // wake wait_callbacks_empty() if waiting
-    }
-}
-
-void RingEngine::wait_callbacks_empty() {
-    std::unique_lock<std::mutex> lk(cb_mu_);
-    cb_cv_.wait(lk, [this] {
-        return (cb_queue_.empty() && !cb_busy_) || !cb_running_.load();
-    });
+    drain_->stop();            // final-flush all GPU entries → task queue, then join
+    drain_->signal_p2p_stop(); // no more tasks will be pushed; tell p2p to finish
+    p2p_->stop();              // p2p processes remaining tasks, then joins
 }
 
 }  // namespace ring

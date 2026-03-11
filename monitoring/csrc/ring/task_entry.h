@@ -13,9 +13,10 @@ namespace ring {
 // Flag bits — TaskEntry::flags
 // ---------------------------------------------------------------------------
 enum : uint32_t {
-    TASK_FLAG_IS_FIRST = 1u << 0,  // first chunk of a logical task
-    TASK_FLAG_IS_LAST  = 1u << 1,  // last chunk (may also be FIRST on single-chunk tasks)
-    TASK_FLAG_IS_DROP  = 1u << 2,  // drop marker: no payload, consumer should discard
+    TASK_FLAG_IS_FIRST     = 1u << 0,  // first chunk of a logical task
+    TASK_FLAG_IS_LAST      = 1u << 1,  // last chunk (may also be FIRST on single-chunk tasks)
+    TASK_FLAG_IS_DROP      = 1u << 2,  // drop marker: no payload, consumer should discard
+    TASK_FLAG_LARGE_TENSOR = 1u << 3,  // bypass pinned staging (tensor > staging capacity)
 };
 
 // ---------------------------------------------------------------------------
@@ -76,8 +77,14 @@ struct alignas(128) TaskEntry {
     // -- payload allocation (may be > len1+len2 due to alignment padding) --
     uint64_t payload_alloc_bytes; //  8 B  offset  96  bytes to release from payload ring
 
+    // -- total padded bytes across all chunks (valid on IS_FIRST) --
+    // = (N-1)*chunk_bytes + align_up(last_chunk, 16)
+    // where N = ceil(tensor_total_bytes / chunk_bytes).
+    // Used by drain thread for large-tensor bypass decision.
+    uint64_t tensor_total_padded_bytes; // 8 B offset 104
+
     // -- explicit padding to reach 128 bytes --
-    uint8_t  _padding[24];        // 24 B  offset 104
+    uint8_t  _padding[16];        // 16 B  offset 112
                                   //       total  128 B
 };
 
@@ -99,6 +106,7 @@ static_assert(offsetof(TaskEntry, hook_type)          == 76);
 static_assert(offsetof(TaskEntry, hook_id)            == 80);
 static_assert(offsetof(TaskEntry, flags)              == 84);
 static_assert(offsetof(TaskEntry, reason)             == 88);
-static_assert(offsetof(TaskEntry, payload_alloc_bytes) == 96);
+static_assert(offsetof(TaskEntry, payload_alloc_bytes)        == 96);
+static_assert(offsetof(TaskEntry, tensor_total_padded_bytes) == 104);
 
 }  // namespace ring

@@ -43,9 +43,7 @@ void diag_print_hook_counters() {
     DIAG_PRINT_ARRAY("writes",   g_diag_hook_writes);
 }
 
-// Payload allocation alignment (bytes).  Every reservation is rounded up to
-// this so that D2D copies can use vectorized uint4 (16-byte) loads/stores.
-static constexpr uint64_t PAYLOAD_ALIGN = 16;
+// PAYLOAD_ALIGN is defined in ring_config.h (included via producer.cuh → ring_state.h).
 
 __device__ __host__ inline uint64_t align_up(uint64_t x, uint64_t a) {
     return (x + a - 1) & ~(a - 1);
@@ -263,6 +261,20 @@ __global__ void producer_kernel(
             entry.hook_id            = hook_id;
             entry.flags              = flags;
             entry.reason             = DROP_REASON_NONE;
+
+            // Compute tensor_total_padded_bytes on IS_FIRST.
+            // = (N-1)*chunk_bytes + align_up(last_chunk, 16)
+            if (ci == 0) {
+                if (src_bytes == 0) {
+                    entry.tensor_total_padded_bytes = 0;
+                } else {
+                    uint64_t last_chunk_sz = src_bytes - (n_chunks - 1) * chunk_sz;
+                    entry.tensor_total_padded_bytes =
+                        (n_chunks - 1) * chunk_sz + align_up(last_chunk_sz, PAYLOAD_ALIGN);
+                }
+            } else {
+                entry.tensor_total_padded_bytes = 0;
+            }
 
             task_publish(ring.task_entries, ring.task_cap, task_head, entry);
             ++task_head;

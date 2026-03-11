@@ -15,10 +15,15 @@ NVCC_FLAGS := \
     $(INCLUDES)
 
 PRODUCER_CU  := ../../monitoring/csrc/ring/producer.cu
-DRAIN_SRCS   := ../../monitoring/csrc/ring/drain_thread.cpp \
-                ../../monitoring/csrc/ring/chunk_assembler.cpp
+DRAIN_SRC    := ../../monitoring/csrc/ring/drain_thread.cpp
 
-TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer $(BUILD)/test_ring_engine $(BUILD)/test_null_mode
+# test_ring_engine needs ATen headers + libtorch for DrainTask (contains at::Tensor).
+# Use torch.utils.cmake_prefix_path to locate them.  The Python E2E tests
+# (tests/test_e2e_correctness_vs_hf.py) cover the full pipeline including p2p.
+TORCH_INC := $(shell python -c "import torch; print(torch.utils.cmake_prefix_path + '/../../include')" 2>/dev/null)
+TORCH_LIB := $(shell python -c "import torch; print(torch.utils.cmake_prefix_path + '/../../lib')" 2>/dev/null)
+
+TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer $(BUILD)/test_ring_engine
 
 .PHONY: all test_rings test_producer test_ring_engine run clean
 
@@ -33,8 +38,8 @@ $(BUILD)/test_rings: test_rings.cu | $(BUILD)
 $(BUILD)/test_producer: test_producer.cu $(PRODUCER_CU) | $(BUILD)
 	$(NVCC) $(NVCC_FLAGS) $^ -o $@
 
-$(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRCS) | $(BUILD)
-	$(NVCC) $(NVCC_FLAGS) -lpthread $^ -o $@
+$(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRC) | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -I$(TORCH_INC) -I$(TORCH_INC)/torch/csrc/api/include -L$(TORCH_LIB) -Xlinker -rpath,$(TORCH_LIB) -ltorch -ltorch_cpu -lc10 -lpthread $^ -o $@
 
 test_rings: $(BUILD)/test_rings
 	$(BUILD)/test_rings
@@ -42,20 +47,13 @@ test_rings: $(BUILD)/test_rings
 test_producer: $(BUILD)/test_producer
 	$(BUILD)/test_producer
 
-$(BUILD)/test_null_mode: test_null_mode.cu $(PRODUCER_CU) $(DRAIN_SRCS) | $(BUILD)
-	$(NVCC) $(NVCC_FLAGS) -lpthread $^ -o $@
-
 test_ring_engine: $(BUILD)/test_ring_engine
 	$(BUILD)/test_ring_engine
-
-test_null_mode: $(BUILD)/test_null_mode
-	$(BUILD)/test_null_mode
 
 run: all
 	$(BUILD)/test_rings
 	$(BUILD)/test_producer
 	$(BUILD)/test_ring_engine
-	$(BUILD)/test_null_mode
 
 clean:
 	rm -rf $(BUILD)

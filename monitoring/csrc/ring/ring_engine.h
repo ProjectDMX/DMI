@@ -2,79 +2,52 @@
 //
 // RingEngine owns:
 //   AllocatedRing    — GPU ring buffers (task entries + payload buffer)
-//   PinnedPool       — pinned host buffers for D2H copies
-//   ChunkAssembler   — reassembles multi-chunk tensors
-//   DrainThread      — CPU thread: drains ready entries, issues D2H copies
+//   PinnedStaging    — pinned host staging ring for batch D2H
+//   DrainThread      — CPU thread: scans GPU entries, batch D2H, pushes to task queue
+//   P2PThread        — CPU thread: pinned→pageable copy, metadata, slicing, submit
 //
 // Typical usage:
-//   RingEngine engine(cfg, [](AssembledTensor&& t) { /* process t */ });
+//   RingEngine engine(cfg, fifo, submit_fn);
 //   engine.init();
 //   engine.start();
-//
 //   // In GPU hook / custom op:
-//   launch_producer_with_notify(engine.ring_state(), d_src, bytes, id,
-//                               hook_type, hook_id,
-//                               DrainThread::hostfunc_cb,
-//                               &engine.drain_thread(), stream);
-//
-//   engine.stop();  // waits for in-flight D2H to complete
+//   launch_producer(engine.ring_state(), d_src, bytes, id,
+//                   hook_type, hook_id, stream);
+//   engine.stop();
 
 #pragma once
 #include "ring_alloc.h"
-#include "pinned_pool.h"
-#include "chunk_assembler.h"
+#include "pinned_staging.h"
 #include "drain_thread.h"
+#include "p2p_thread.h"
+#include "tensor_meta.h"
 
-#include <atomic>
-#include <condition_variable>
 #include <memory>
-#include <mutex>
-#include <queue>
-#include <thread>
 
 namespace ring {
 
 class RingEngine {
 public:
-    RingEngine(const RingConfig& cfg, TensorCallback cb);
+    RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
+               SubmitFn submit_fn);
     ~RingEngine() noexcept;
 
     RingEngine(const RingEngine&)            = delete;
     RingEngine& operator=(const RingEngine&) = delete;
 
-    // Initialise GPU buffers (memset SENTINEL, zero counters).
-    // Call once before start() and before any graph capture.
     void init(cudaStream_t stream = 0);
-
     void start();
     void stop();
-
-    // Block until the callback queue is empty and the callback thread is idle.
-    // Used by flush() to ensure all on_tensor callbacks have completed.
-    void wait_callbacks_empty();
 
     RingState&   ring_state()    { return ring_.state(); }
     DrainThread& drain_thread()  { return *drain_; }
 
 private:
-    RingConfig    cfg_;
-    AllocatedRing ring_;
-    PinnedPool    pool_;
-    TensorCallback cb_;
-    std::unique_ptr<ChunkAssembler> assembler_;
-    std::unique_ptr<DrainThread>    drain_;
-
-    // Callback thread: decouples Python on_tensor (GIL) from the drain loop.
-    // The drain thread pushes assembled tensors here; this thread calls cb_.
-    // This prevents GIL contention from stalling drain_ready() / task slot freeing.
-    std::mutex              cb_mu_;
-    std::condition_variable cb_cv_;
-    std::queue<AssembledTensor> cb_queue_;
-    std::atomic<bool>       cb_running_{false};
-    std::thread             cb_thread_;
-    bool                    cb_busy_{false};  // true while cb_ is being called
-
-    void cb_loop();
+    RingConfig      cfg_;
+    AllocatedRing   ring_;
+    PinnedStaging   staging_;
+    std::unique_ptr<DrainThread>  drain_;
+    std::unique_ptr<P2PThread>    p2p_;
 };
 
 }  // namespace ring

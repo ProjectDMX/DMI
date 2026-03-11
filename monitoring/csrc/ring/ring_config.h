@@ -8,6 +8,12 @@
 
 namespace ring {
 
+// Payload allocation alignment (bytes).  Every reservation is rounded up to
+// this so that D2D copies can use vectorized uint4 (16-byte) loads/stores.
+// Used by: producer (D2D alignment), drain thread (staging alignment),
+//          config validation (chunk_bytes % PAYLOAD_ALIGN == 0).
+static constexpr uint64_t PAYLOAD_ALIGN = 16;
+
 // ---------------------------------------------------------------------------
 // WaitPolicy — how the producer handles ring-full backpressure.
 // ---------------------------------------------------------------------------
@@ -37,6 +43,24 @@ enum class DropReporting : uint32_t {
 };
 
 // ---------------------------------------------------------------------------
+// DrainFlushConfig — controls when the batch drain thread flushes pending
+// entries to host.  Force flush at 100% capacity is always active.
+// ---------------------------------------------------------------------------
+struct DrainFlushConfig {
+    // Ratio thresholds (fraction of capacity; 0.0 = disabled)
+    float task_ratio     = 0.0f;   // flush at N% task queue usage
+    float payload_ratio  = 0.0f;   // flush at N% payload ring usage
+
+    // Absolute thresholds (0 = disabled)
+    uint64_t entry_threshold = 0;  // flush after N entries ready
+    uint64_t byte_threshold  = 0;  // flush after N payload bytes ready
+
+    // Force flush is always active:
+    //   pending_entries >= task_cap  OR  pending_bytes >= payload_cap
+    // This prevents deadlock.
+};
+
+// ---------------------------------------------------------------------------
 // RingConfig — all tunable parameters.
 // ---------------------------------------------------------------------------
 struct RingConfig {
@@ -61,8 +85,10 @@ struct RingConfig {
     // Default: ~400 ms at 2.5 GHz.
     uint64_t no_progress_timeout_cycles = 1'000'000'000ULL;
 
-    // Pinned host ring buffer size (shared across all in-flight chunks).
-    uint64_t pinned_pool_bytes  = 256ULL * 1024 * 1024;  // 256 MiB
+    // Pinned staging ring size. 0 = default to payload_ring_bytes.
+    // The bypass guard (tensor_total_padded_bytes > staging_capacity)
+    // prevents deadlock regardless of the ratio to payload_ring_bytes.
+    uint64_t pinned_staging_bytes = 0;
 
     // What to emit when a logical task is dropped (see DropReporting).
     DropReporting drop_reporting = DropReporting::DROP_TASK;
@@ -77,6 +103,31 @@ struct RingConfig {
 
     // Whether to call notify_drain() before each forward pass from Python.
     bool drain_notify_on_forward = true;
+
+    // Batch drain flush rules.
+    DrainFlushConfig drain_flush;
+
+    // Bypass path: max bytes of bypass tensors queued between drain
+    // and p2p threads. One tensor is always allowed even if it exceeds
+    // this budget (prevents single-large-tensor deadlock).
+    uint64_t bypass_budget_bytes = 256ULL * 1024 * 1024;  // 256 MiB
+
+    // Clone per-request slices before submitting to host engine.
+    // When true (and batch_size > 1), each slice is cloned so the full
+    // tensor can be freed immediately. When false, slices are views
+    // that keep the full tensor alive until consumed.
+    bool clone_slices = false;
+
+    // ClickHouse insert queue limits (host engine).
+    // P2p thread blocks on submit_direct() when queue is full.
+    uint64_t insert_queue_max_bytes = 512ULL * 1024 * 1024;  // 512 MiB
+    uint64_t insert_queue_max_items = 4096;
+
+    // Effective staging capacity (resolved at init time).
+    // If pinned_staging_bytes == 0, defaults to payload_ring_bytes.
+    uint64_t effective_staging_bytes() const {
+        return pinned_staging_bytes > 0 ? pinned_staging_bytes : payload_ring_bytes;
+    }
 };
 
 }  // namespace ring

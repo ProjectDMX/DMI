@@ -118,6 +118,8 @@ __device__ inline void task_publish(
     slot.flags              = src.flags;
     slot.reason             = src.reason;
     slot._pad0              = 0;
+    slot.payload_alloc_bytes        = src.payload_alloc_bytes;
+    slot.tensor_total_padded_bytes  = src.tensor_total_padded_bytes;
 
     // Release fence: all stores above must be visible before ready_seq.
     __threadfence();

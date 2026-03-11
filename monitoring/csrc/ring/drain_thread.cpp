@@ -1,36 +1,28 @@
-// ring/drain_thread.cpp — CPU drain thread implementation.
+// ring/drain_thread.cpp — Batch drain thread implementation.
 // Compiled with g++ (not nvcc); uses CUDA runtime C API via -lcudart.
 
 #include "drain_thread.h"
-#include "task_ring.cuh"   // task_cpu_ready, task_release_cpu (CPU-side helpers)
-#include "task_entry.h"    // TASK_FLAG_IS_DROP
+#include "task_ring.cuh"   // task_cpu_ready, task_release_cpu
+#include "task_entry.h"
 
+#include <ATen/ATen.h>
 #include <chrono>
-#include <ctime>
+#include <cstring>
 #include <stdexcept>
 
 namespace ring {
 
 // ---------------------------------------------------------------------------
-DrainThread::DrainThread(RingState& rs, PinnedPool& pool, DrainCallback cb,
-                         uint64_t poll_timeout_us)
-    : ring_(rs), pool_(pool), cb_(std::move(cb)), poll_timeout_us_(poll_timeout_us)
+DrainThread::DrainThread(RingState& rs, PinnedStaging& staging,
+                         const RingConfig& cfg)
+    : ring_(rs), staging_(staging), cfg_(cfg)
 {
     if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess)
         throw std::runtime_error("DrainThread: cudaStreamCreate failed");
-    // Local counters start at 0, matching AllocatedRing::init() which zeros
-    // all ring counters before start() is called. Reading ring_.payload_tail
-    // or ring_.task_tail here would require a PCIe round-trip (counters are
-    // now GPU HBM); rely on the init() contract instead.
 }
 
 DrainThread::~DrainThread() noexcept {
     stop();
-    // Clean up any pending events/buffers that weren't drained before stop.
-    for (auto& pc : pending_) {
-        if (pc.event)       cudaEventDestroy(pc.event);
-        if (pc.alloc_bytes) pool_.free(pc.alloc_bytes);
-    }
     cudaStreamDestroy(stream_);
 }
 
@@ -42,7 +34,10 @@ void DrainThread::start() {
 
 void DrainThread::stop() {
     if (!running_.exchange(false)) return;
-    cv_.notify_all();
+    cv_.notify_all();       // wake drain thread from sleep to enter final flush
+    // Do NOT notify pop_cv_ here — the final flush in loop() may push more
+    // tasks.  The p2p thread is signalled separately via signal_p2p_stop()
+    // after drain thread join completes.
     if (thread_.joinable()) thread_.join();
 }
 
@@ -60,180 +55,419 @@ void DrainThread::notify() {
 }
 
 // ---------------------------------------------------------------------------
+// Task queue interface for p2p thread
+// ---------------------------------------------------------------------------
+uint64_t DrainThread::wait_for_tasks() {
+    std::unique_lock<std::mutex> lk(pop_mu_);
+    pop_cv_.wait(lk, [this] {
+        return can_pop_count_ > 0 || p2p_stop_requested_;
+    });
+    uint64_t n = can_pop_count_;
+    can_pop_count_ = 0;
+    return n;
+}
+
+void DrainThread::signal_p2p_stop() {
+    {
+        std::lock_guard<std::mutex> lk(pop_mu_);
+        p2p_stop_requested_ = true;
+    }
+    pop_cv_.notify_all();
+}
+
+void DrainThread::pop_tasks(uint64_t n, std::vector<DrainTask>& out) {
+    out.clear();
+    out.reserve(n);
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    for (uint64_t i = 0; i < n; ++i) {
+        out.push_back(std::move(task_queue_.front()));
+        task_queue_.pop_front();
+    }
+}
+
+void DrainThread::notify_staging_freed_bytes(uint64_t nbytes) {
+    {
+        std::lock_guard<std::mutex> lk(staging_mu_);
+        staging_.advance_tail(nbytes);
+    }
+    staging_cv_.notify_one();
+}
+
+void DrainThread::notify_bypass_freed() {
+    bypass_cv_.notify_one();
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
 void DrainThread::loop() {
     while (running_.load(std::memory_order_relaxed)) {
-        poll_completed();
-        drain_ready();
+        scan_ready();
 
-        if (pending_.empty()) {
-            // No in-flight copies: wait for notification or timeout.
-            // Python calls notify_drain() before each forward pass (wakes us
-            // for the previous step's data).  The timeout is a safety net for
-            // the last step or gaps between generate() calls.
+        if (should_flush()) {
+            batch_flush();
+        }
+
+        if (pending_entries_ == 0) {
+            // No entries scanned: sleep until GPU produces something.
             std::unique_lock<std::mutex> lk(mu_);
             auto pred = [this] {
                 return notified_ || !running_.load(std::memory_order_relaxed);
             };
-            if (poll_timeout_us_ > 0) {
-                cv_.wait_for(lk, std::chrono::microseconds(poll_timeout_us_), pred);
+            if (cfg_.drain_poll_timeout_us > 0) {
+                cv_.wait_for(lk, std::chrono::microseconds(cfg_.drain_poll_timeout_us), pred);
             } else {
                 cv_.wait(lk, pred);
             }
             notified_ = false;
         } else {
-            // D2H copies in flight: yield briefly and keep polling.
-            struct timespec ts{0, 1000};  // 1 µs
+            // Entries scanned but flush threshold not met yet (e.g. last
+            // tensor incomplete — waiting for its IS_LAST chunk to arrive
+            // from the GPU).  Yield briefly to avoid busy-spinning.
+            struct timespec ts{0, 1000};  // 1 us
             nanosleep(&ts, nullptr);
         }
     }
-    // Final drain: process all remaining task entries and complete D2H copies.
-    // When hook_no_notify() is used (CUDA graph path) and no explicit
-    // notify/timeout fired, the drain thread may have slept through the
-    // entire generate() call.  This loop ensures stop() flushes everything.
-    // Ensure all GPU work (including CUDA graph replay) has completed before
-    // draining.  Without this, the last graph replay's producer kernels may
-    // still be in-flight, leaving task entries with ready_seq == SENTINEL.
+
+    // Final flush: drain all remaining entries.
     cudaDeviceSynchronize();
-    uint64_t flush_total = 0;
     for (;;) {
-        uint64_t before = task_tail_local_;
-        drain_ready();
-        flush_total += (task_tail_local_ - before);
-        cudaStreamSynchronize(stream_);
-        poll_completed();
-        if (pending_.empty() &&
-            !task_cpu_ready(ring_.task_entries, ring_.task_cap, task_tail_local_))
+        scan_ready();
+        if (pending_entries_ == 0) break;
+        if (last_complete_idx_ < 0) {
+            fprintf(stderr, "[drain_thread] WARNING: %lu incomplete entries at shutdown\n",
+                    (unsigned long)pending_entries_);
             break;
+        }
+        batch_flush();
     }
-    fprintf(stderr, "[drain_thread] flush: drained %lu entries, final tail=%lu\n",
-            flush_total, task_tail_local_);
+    fprintf(stderr, "[drain_thread] final tail=%lu\n", (unsigned long)task_tail_local_);
 }
 
 // ---------------------------------------------------------------------------
-void DrainThread::drain_ready() {
+// scan_ready — scan GPU task queue for ready entries.
+//
+// Maintains flushable_bytes_ / flushable_entries_ incrementally:
+// - Every scanned entry's payload_alloc_bytes is added to a running sum
+//   (scan_bytes_accum_).
+// - When an IS_LAST entry is seen, we snapshot the running sum and entry
+//   count as flushable_bytes_ / flushable_entries_.
+// - After batch_flush(), the flushed portion is subtracted (see batch_flush).
+// ---------------------------------------------------------------------------
+void DrainThread::scan_ready() {
+    const uint64_t task_cap = ring_.task_cap;
+
     while (true) {
-        // task_tail_local_ is the authoritative tail: this thread is the sole
-        // writer of ring_.task_tail. No need to re-read from GPU HBM.
-        // task_head is no longer read: task_cpu_ready() returns false on an
-        // empty ring (ready_seq == SENTINEL), which terminates the loop.
-        const uint64_t tail = task_tail_local_;
+        // Stop if entire ring scanned (cannot read further without wrapping
+        // into unreleased slots).
+        if (pending_entries_ >= task_cap) break;
 
-        if (!task_cpu_ready(ring_.task_entries, ring_.task_cap, tail)) break;
+        if (!task_cpu_ready(ring_.task_entries, task_cap, visible_head_)) break;
 
-        // Copy all needed fields out of the slot before releasing it.
-        const uint64_t idx = tail % ring_.task_cap;
-        const TaskEntry ec  = ring_.task_entries[idx];  // full copy
+        const uint64_t idx = visible_head_ % task_cap;
+        TaskEntry ec = ring_.task_entries[idx];  // full copy from managed memory
 
-        const bool     is_drop   = (ec.flags & TASK_FLAG_IS_DROP) != 0;
-        const uint64_t total_len = ec.payload_len1 + ec.payload_len2;
-
-        PendingChunk pc{};
-        // Release the aligned allocation size (may be > total_len due to
-        // PAYLOAD_ALIGN padding in the producer).
-        pc.payload_bytes = is_drop ? 0 : ec.payload_alloc_bytes;
-        pc.meta = {
-            nullptr,           // pinned — filled below for data chunks
-            total_len,
-            0,                 // alloc_bytes — filled below for data chunks
-            ec.logical_task_id,
-            ec.chunk_offset_bytes,
-            ec.tensor_total_bytes,
-            ec.chunk_idx,
-            ec.flags,
-            ec.hook_type,
-            ec.hook_id,
-            ec.reason,
-        };
-
-        if (!is_drop && total_len > 0) {
-            uint64_t alloc_bytes = 0;
-            pc.pinned = pool_.alloc(total_len, alloc_bytes);
-            if (pc.pinned == nullptr) {
-                // Pinned ring full — stop draining; poll_completed() will free space.
-                break;
+        // Large tensor detection: if IS_FIRST with tensor > staging capacity.
+        // Must flush pending complete tensors first: the p2p thread expects
+        // tasks in FIFO order, and the large tensor bypass processes entries
+        // inline (not via staging), so earlier staged tensors must be pushed
+        // to the task queue before the bypass tensor.
+        if ((ec.flags & TASK_FLAG_IS_FIRST) &&
+            !(ec.flags & TASK_FLAG_IS_DROP) &&
+            ec.tensor_total_padded_bytes > staging_.capacity())
+        {
+            if (last_complete_idx_ >= 0) {
+                batch_flush();
             }
-            pc.alloc_bytes      = alloc_bytes;
-            pc.meta.pinned      = pc.pinned;
-            pc.meta.alloc_bytes = alloc_bytes;
+            handle_large_tensor();
+            continue;  // Re-enter scan loop
+        }
 
-            cudaMemcpyAsync(pc.pinned,
+        scanned_.push_back(ec);
+        pending_entries_++;
+        if (!(ec.flags & TASK_FLAG_IS_DROP)) {
+            uint64_t ab = ec.payload_alloc_bytes;
+            pending_bytes_ += ab;
+            scan_bytes_accum_ += ab;
+        }
+        visible_head_++;
+
+        if (ec.flags & TASK_FLAG_IS_LAST) {
+            last_complete_idx_ = static_cast<int64_t>(scanned_.size()) - 1;
+            // Snapshot running sums as flushable
+            flushable_bytes_   = scan_bytes_accum_;
+            flushable_entries_ = static_cast<uint64_t>(scanned_.size());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// should_flush — check if any flush condition is met.
+// Uses pre-computed flushable_bytes_ / flushable_entries_ (no loop).
+// ---------------------------------------------------------------------------
+bool DrainThread::should_flush() const {
+    if (last_complete_idx_ < 0) return false;
+
+    const uint64_t fe = flushable_entries_;
+    const uint64_t fb = flushable_bytes_;
+    const uint64_t task_cap    = ring_.task_cap;
+    const uint64_t payload_cap = ring_.payload_cap;
+    const auto& fc = cfg_.drain_flush;
+
+    // 1. Force: entry full
+    if (fe >= task_cap) return true;
+    // 2. Force: payload full
+    if (fb >= payload_cap) return true;
+    // 3. Task ratio
+    if (fc.task_ratio > 0.0f &&
+        fe >= static_cast<uint64_t>(fc.task_ratio * task_cap)) return true;
+    // 4. Payload ratio
+    if (fc.payload_ratio > 0.0f &&
+        fb >= static_cast<uint64_t>(fc.payload_ratio * payload_cap)) return true;
+    // 5. Entry threshold
+    if (fc.entry_threshold > 0 && fe >= fc.entry_threshold) return true;
+    // 6. Byte threshold
+    if (fc.byte_threshold > 0 && fb >= fc.byte_threshold) return true;
+
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// batch_flush — D2H copy + release GPU + push tasks + notify p2p.
+// Uses pre-computed flushable_bytes_ / flushable_entries_ (no loop to sum).
+// ---------------------------------------------------------------------------
+void DrainThread::batch_flush() {
+    const uint64_t flush_count = flushable_entries_;
+    const uint64_t flush_bytes = flushable_bytes_;
+
+    // --- 1. Backpressure: wait for staging space ---
+    if (flush_bytes > 0) {
+        std::unique_lock<std::mutex> lk(staging_mu_);
+        staging_cv_.wait(lk, [&] {
+            return staging_.free_bytes() >= flush_bytes;
+        });
+    }
+
+    // --- 2. Batch D2H (separate CUDA stream) ---
+    // GPU payload region: [payload_tail_local_, +flush_bytes) in circular buffer.
+    // Staging destination: [staging_.head(), +flush_bytes) in circular buffer.
+    if (flush_bytes > 0) {
+        const uint64_t gpu_cap    = ring_.payload_cap;
+        const uint64_t stg_cap    = staging_.capacity();
+        uint64_t gpu_cursor = payload_tail_local_ % gpu_cap;
+        uint64_t stg_cursor = staging_.head() % stg_cap;
+        uint64_t remaining  = flush_bytes;
+
+        while (remaining > 0) {
+            uint64_t gpu_avail = gpu_cap - gpu_cursor;
+            uint64_t stg_avail = stg_cap - stg_cursor;
+            uint64_t chunk = std::min({remaining, gpu_avail, stg_avail});
+
+            cudaMemcpyAsync(staging_.base() + stg_cursor,
+                            ring_.payload_buf + gpu_cursor,
+                            chunk, cudaMemcpyDeviceToHost, stream_);
+
+            remaining  -= chunk;
+            gpu_cursor  = (gpu_cursor + chunk) % gpu_cap;
+            stg_cursor  = (stg_cursor + chunk) % stg_cap;
+        }
+    }
+
+    // --- 3. cudaStreamSynchronize (D2H stream) ---
+    if (flush_bytes > 0) {
+        cudaStreamSynchronize(stream_);
+    }
+
+    // --- 4. Release GPU resources (flushed entries only) ---
+    uint64_t released_payload = 0;
+    for (uint64_t i = 0; i < flush_count; ++i) {
+        task_release_cpu(ring_.task_entries, ring_.task_cap, task_tail_local_);
+        ++task_tail_local_;
+
+        if (!(scanned_[i].flags & TASK_FLAG_IS_DROP)) {
+            released_payload += scanned_[i].payload_alloc_bytes;
+        }
+    }
+    __atomic_store_n(ring_.task_tail, task_tail_local_, __ATOMIC_RELEASE);
+    if (released_payload > 0) {
+        payload_tail_local_ += released_payload;
+        __atomic_store_n(ring_.payload_tail, payload_tail_local_, __ATOMIC_RELEASE);
+    }
+    ++heartbeat_local_;
+    __atomic_store_n(ring_.consumer_heartbeat, heartbeat_local_, __ATOMIC_RELEASE);
+
+    // --- 5. Construct and push DrainTasks ---
+    uint64_t cumulative = 0;
+    const uint64_t staging_batch_start = staging_.head();
+
+    for (uint64_t i = 0; i < flush_count; ++i) {
+        const TaskEntry& ec = scanned_[i];
+        DrainTask task{};
+        task.logical_task_id    = ec.logical_task_id;
+        task.chunk_offset_bytes = ec.chunk_offset_bytes;
+        task.tensor_total_bytes = ec.tensor_total_bytes;
+        task.hook_type          = ec.hook_type;
+        task.hook_id            = ec.hook_id;
+        task.flags              = ec.flags;
+        task.alloc_bytes        = (ec.flags & TASK_FLAG_IS_DROP) ? 0 : ec.payload_alloc_bytes;
+
+        if (!(ec.flags & TASK_FLAG_IS_DROP) && (ec.payload_len1 + ec.payload_len2) > 0) {
+            uint64_t data_len = ec.payload_len1 + ec.payload_len2;
+            uint64_t staging_logical = staging_batch_start + cumulative;
+            uint64_t staging_phys = staging_logical % staging_.capacity();
+
+            task.data_ptr1 = staging_.base() + staging_phys;
+            if (staging_phys + data_len <= staging_.capacity()) {
+                task.data_len1 = data_len;
+                task.data_ptr2 = nullptr;
+                task.data_len2 = 0;
+            } else {
+                task.data_len1 = staging_.capacity() - staging_phys;
+                task.data_ptr2 = staging_.base();  // wrap to start
+                task.data_len2 = data_len - task.data_len1;
+            }
+            cumulative += ec.payload_alloc_bytes;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(queue_mu_);
+            task_queue_.push_back(std::move(task));
+        }
+
+        if (ec.flags & TASK_FLAG_IS_LAST) {
+            {
+                std::lock_guard<std::mutex> lk(pop_mu_);
+                can_pop_count_ += pending_incomplete_cnt_ + 1;
+            }
+            pop_cv_.notify_one();
+            pending_incomplete_cnt_ = 0;
+        } else {
+            pending_incomplete_cnt_++;
+        }
+    }
+
+    // --- 6. Advance staging head + trim scanned state ---
+    staging_.advance_head(flush_bytes);
+
+    for (uint64_t i = 0; i < flush_count; ++i) {
+        scanned_.pop_front();
+    }
+    pending_entries_ -= flush_count;
+    pending_bytes_   -= flush_bytes;
+
+    // Reset incremental counters: subtract flushed portion.
+    // scan_bytes_accum_ tracks bytes scanned since last flush.
+    // After flush, only trailing incomplete entries remain.
+    scan_bytes_accum_ -= flush_bytes;
+    flushable_bytes_   = 0;
+    flushable_entries_ = 0;
+    last_complete_idx_ = -1;
+
+    // Re-scan remaining entries for any IS_LAST
+    uint64_t reaccum = 0;
+    for (size_t i = 0; i < scanned_.size(); ++i) {
+        if (!(scanned_[i].flags & TASK_FLAG_IS_DROP)) {
+            reaccum += scanned_[i].payload_alloc_bytes;
+        }
+        if (scanned_[i].flags & TASK_FLAG_IS_LAST) {
+            last_complete_idx_ = static_cast<int64_t>(i);
+            flushable_bytes_   = reaccum;
+            flushable_entries_ = static_cast<uint64_t>(i + 1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// handle_large_tensor — bypass staging, D2H directly into pageable memory
+// ---------------------------------------------------------------------------
+void DrainThread::handle_large_tensor() {
+    // The IS_FIRST entry is at visible_head_ (already confirmed ready)
+    const uint64_t idx0 = visible_head_ % ring_.task_cap;
+    TaskEntry first_entry = ring_.task_entries[idx0];
+
+    const uint64_t total_bytes = first_entry.tensor_total_bytes;
+
+    // ATen allocate pageable tensor
+    auto tensor = at::empty({static_cast<int64_t>(total_bytes)},
+                            at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+    uint8_t* dst = tensor.data_ptr<uint8_t>();
+
+    uint64_t task_id   = first_entry.logical_task_id;
+    uint32_t hook_type = first_entry.hook_type;
+    uint32_t hook_id   = first_entry.hook_id;
+
+    // Process entries one at a time until IS_LAST
+    bool done = false;
+    while (!done) {
+        while (!task_cpu_ready(ring_.task_entries, ring_.task_cap, visible_head_)) {
+            struct timespec ts{0, 1000};  // 1 us
+            nanosleep(&ts, nullptr);
+        }
+
+        const uint64_t idx = visible_head_ % ring_.task_cap;
+        TaskEntry ec = ring_.task_entries[idx];
+
+        if (ec.payload_len1 > 0) {
+            cudaMemcpyAsync(dst + ec.chunk_offset_bytes,
                             ring_.payload_buf + ec.payload_off1,
                             ec.payload_len1,
                             cudaMemcpyDeviceToHost, stream_);
-            if (ec.payload_len2 > 0) {
-                cudaMemcpyAsync(pc.pinned + ec.payload_len1,
-                                ring_.payload_buf + ec.payload_off2,
-                                ec.payload_len2,
-                                cudaMemcpyDeviceToHost, stream_);
-            }
-
-            cudaEvent_t ev;
-            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
-            cudaEventRecord(ev, stream_);
-            pc.event = ev;
         }
-        // For drop entries: pc.event = nullptr, pc.pinned = nullptr.
-        // They are treated as immediately complete in poll_completed().
+        if (ec.payload_len2 > 0) {
+            cudaMemcpyAsync(dst + ec.chunk_offset_bytes + ec.payload_len1,
+                            ring_.payload_buf + ec.payload_off2,
+                            ec.payload_len2,
+                            cudaMemcpyDeviceToHost, stream_);
+        }
 
-        // Release the task slot so the producer can reuse it.
-        // payload_tail is advanced later (after D2H completes).
-        // Reset ready_seq to SENTINEL BEFORE advancing task_tail.
-        // Ordering guarantee: producer sees the slot as free (task_tail++)
-        // only after the slot is clean, preventing it from reusing a slot
-        // whose ready_seq still signals "ready" to any late reader.
-        task_release_cpu(ring_.task_entries, ring_.task_cap, tail);
-        __atomic_store_n(ring_.task_tail, ++task_tail_local_, __ATOMIC_RELEASE);
+        // Release GPU task slot + payload per-entry (allows producer to reuse)
+        task_release_cpu(ring_.task_entries, ring_.task_cap, visible_head_);
+        ++task_tail_local_;
+        __atomic_store_n(ring_.task_tail, task_tail_local_, __ATOMIC_RELEASE);
 
-        // Plain store (not fetch_add): drain thread is the sole writer of
-        // consumer_heartbeat. Avoids LOCK-prefix atomics on PCIe-mapped
-        // GPU HBM pages, which may not support hardware atomics from CPU.
-        __atomic_store_n(ring_.consumer_heartbeat, ++heartbeat_local_,
-                         __ATOMIC_RELEASE);
+        if (ec.payload_alloc_bytes > 0) {
+            payload_tail_local_ += ec.payload_alloc_bytes;
+            __atomic_store_n(ring_.payload_tail, payload_tail_local_, __ATOMIC_RELEASE);
+        }
+        ++heartbeat_local_;
+        __atomic_store_n(ring_.consumer_heartbeat, heartbeat_local_, __ATOMIC_RELEASE);
 
-        pending_.push_back(std::move(pc));
+        visible_head_++;
+        done = (ec.flags & TASK_FLAG_IS_LAST) != 0;
     }
-}
 
-// ---------------------------------------------------------------------------
-void DrainThread::poll_completed() {
-    while (!pending_.empty()) {
-        PendingChunk& pc = pending_.front();
+    cudaStreamSynchronize(stream_);
 
-        if (pc.event != nullptr) {
-            cudaError_t status = cudaEventQuery(pc.event);
-            if (status == cudaErrorNotReady) break;  // head not done, stop
-            cudaEventDestroy(pc.event);
-            pc.event = nullptr;
-        }
-
-        // Advance payload_tail (frees payload ring space for the producer).
-        if (pc.payload_bytes > 0) {
-            payload_tail_local_ += pc.payload_bytes;
-            __atomic_store_n(ring_.payload_tail,
-                             payload_tail_local_, __ATOMIC_RELEASE);
-        }
-
-        // Note: pool_.free() is called by the chunk assembler after it copies
-        // the pinned data to pageable memory, not here.
-        cb_(std::move(pc.meta));
-        pending_.pop_front();
-
-        // Advance flush barrier counter and wake any flush waiter.
-        completed_local_.fetch_add(1, std::memory_order_release);
-        flush_cv_.notify_all();
+    // Bypass backpressure
+    {
+        std::unique_lock<std::mutex> lk(bypass_mu_);
+        bypass_cv_.wait(lk, [&] {
+            return in_flight_bypass_bytes_ == 0 ||
+                   in_flight_bypass_bytes_ + total_bytes <= cfg_.bypass_budget_bytes;
+        });
+        in_flight_bypass_bytes_ += total_bytes;
     }
-}
 
-// ---------------------------------------------------------------------------
-void DrainThread::wait_until_completed(uint64_t target) {
-    // Fast path: already done.
-    if (completed_local_.load(std::memory_order_acquire) >= target) return;
-    // Slow path: sleep on flush_cv_ until target reached or engine stops.
-    std::unique_lock<std::mutex> lk(flush_mu_);
-    flush_cv_.wait(lk, [&] {
-        return completed_local_.load(std::memory_order_relaxed) >= target
-               || !running_.load(std::memory_order_relaxed);
-    });
+    // Construct ONE DrainTask
+    DrainTask task{};
+    task.logical_task_id    = task_id;
+    task.chunk_offset_bytes = 0;
+    task.tensor_total_bytes = total_bytes;
+    task.hook_type          = hook_type;
+    task.hook_id            = hook_id;
+    task.flags              = TASK_FLAG_IS_FIRST | TASK_FLAG_IS_LAST | TASK_FLAG_LARGE_TENSOR;
+    task.alloc_bytes        = 0;
+    task.large_tensor       = std::move(tensor);
+
+    {
+        std::lock_guard<std::mutex> lk(queue_mu_);
+        task_queue_.push_back(std::move(task));
+    }
+    {
+        std::lock_guard<std::mutex> lk(pop_mu_);
+        can_pop_count_ += 1;
+    }
+    pop_cv_.notify_one();
 }
 
 }  // namespace ring

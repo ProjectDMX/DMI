@@ -152,6 +152,46 @@ def _canon_layer_and_act(act_name_raw: str, layer_no_raw: int) -> Tuple[int, str
 
 
 # ---------------------------------------------------------------------------
+# Ring + host engine configuration (env-var driven)
+# ---------------------------------------------------------------------------
+
+def _make_ring_cfg():
+    """Build RingConfig from E2E_RING_* environment variables."""
+    from monitoring._native_engine import RingConfig  # type: ignore
+    rc = RingConfig()
+    rc.task_ring_entries          = int(os.environ.get("E2E_RING_TASK_ENTRIES", "16384"))
+    rc.payload_ring_bytes         = int(os.environ.get("E2E_RING_PAYLOAD_BYTES", str(4 * 1024**3)))
+    rc.chunk_bytes                = int(os.environ.get("E2E_RING_CHUNK_BYTES", str(4 * 1024**2)))
+    rc.pinned_staging_bytes       = int(os.environ.get("E2E_RING_PINNED_BYTES", str(4 * 1024**3)))
+    rc.drain_poll_timeout_us      = int(os.environ.get("E2E_DRAIN_POLL_TIMEOUT_US", "0"))
+    rc.drain_notify_on_forward    = int(os.environ.get("E2E_DRAIN_NOTIFY_ON_FORWARD", "1")) != 0
+    rc.drain_flush_task_ratio     = float(os.environ.get("E2E_DRAIN_FLUSH_TASK_RATIO", "0.0"))
+    rc.drain_flush_payload_ratio  = float(os.environ.get("E2E_DRAIN_FLUSH_PAYLOAD_RATIO", "0.0"))
+    rc.drain_flush_entry_threshold = int(os.environ.get("E2E_DRAIN_FLUSH_ENTRY_THRESHOLD", "0"))
+    rc.drain_flush_byte_threshold  = int(os.environ.get("E2E_DRAIN_FLUSH_BYTE_THRESHOLD", "0"))
+    rc.bypass_budget_bytes        = int(os.environ.get("E2E_BYPASS_BUDGET_BYTES", str(256 * 1024**2)))
+    rc.clone_slices               = int(os.environ.get("E2E_CLONE_SLICES", "0")) != 0
+    rc.insert_queue_max_bytes     = int(os.environ.get("E2E_INSERT_QUEUE_MAX_BYTES", str(512 * 1024**2)))
+    rc.insert_queue_max_items     = int(os.environ.get("E2E_INSERT_QUEUE_MAX_ITEMS", "4096"))
+    return rc
+
+
+def _make_host_cfg(db_cfg_native):
+    """Build HostEngineConfig with clickhouse insert stage from env vars."""
+    from monitoring import HostEngineConfig  # type: ignore
+    from monitoring._native_engine import StageConfig  # type: ignore
+    parallelism = int(os.environ.get("E2E_CH_PARALLELISM", "10"))
+    stage = StageConfig.clickhouse_insert(db_cfg_native, parallelism=parallelism,
+                                          name="clickhouse_insert")
+    q = stage.input_queue
+    q.max_batch_items      = int(os.environ.get("E2E_CH_QUEUE_MAX_ITEMS", "1024"))
+    q.high_watermark_items = q.max_batch_items
+    q.max_batch_size       = int(os.environ.get("E2E_CH_QUEUE_MAX_BYTES", str(2048 * 1024**2)))
+    q.high_watermark_size  = q.max_batch_size
+    return HostEngineConfig(stages=[stage])
+
+
+# ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
 
@@ -166,16 +206,11 @@ def test_e2e_correctness_hf(subtests) -> None:
     try:
         from monitoring import (  # type: ignore
             AdvanceConfig,
-            HostEngineConfig,
             MonitoringConfig,
             MonitoringEngine,
             NativePartialSealConfig,
         )
-        from monitoring._native_engine import (  # type: ignore
-            ClickHouseClientConfig,
-            RingConfig,
-            StageConfig,
-        )
+        from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
         from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
         from monitoring.generate import generate_with_monitoring  # type: ignore
     except Exception as exc:
@@ -274,15 +309,8 @@ def test_e2e_correctness_hf(subtests) -> None:
     db_cfg_native.drop_existing_database = True
     db_cfg_native.index_granularity = 8192
 
-    insert_stage = StageConfig.clickhouse_insert(db_cfg_native, parallelism=10, name="clickhouse_insert")
-    host_cfg = HostEngineConfig(stages=[insert_stage])
-
-    # Ring engine config (ring transport replaces NativeMonitoringEngine D2H)
-    ring_cfg = RingConfig()
-    ring_cfg.task_ring_entries = 16384
-    ring_cfg.payload_ring_bytes = 4 * 1024 * 1024 * 1024  # 4 GB
-    ring_cfg.chunk_bytes = 4 * 1024 * 1024                # 4 MB chunks
-    ring_cfg.pinned_pool_bytes = 4 * 1024 * 1024 * 1024  # 4 GB pinned ring
+    host_cfg = _make_host_cfg(db_cfg_native)
+    ring_cfg = _make_ring_cfg()
 
     # -----------------------------------------------------------------------
     # Monitored run
@@ -748,16 +776,11 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     try:
         from monitoring import (  # type: ignore
             AdvanceConfig,
-            HostEngineConfig,
             MonitoringConfig,
             MonitoringEngine,
             NativePartialSealConfig,
         )
-        from monitoring._native_engine import (  # type: ignore
-            ClickHouseClientConfig,
-            RingConfig,
-            StageConfig,
-        )
+        from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
         from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
         from monitoring.generate import generate_with_monitoring  # type: ignore
     except Exception as exc:
@@ -836,14 +859,8 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     db_cfg_native.drop_existing_database   = True
     db_cfg_native.index_granularity        = 8192
 
-    insert_stage = StageConfig.clickhouse_insert(db_cfg_native, parallelism=10, name="clickhouse_insert")
-    host_cfg     = HostEngineConfig(stages=[insert_stage])
-
-    ring_cfg = RingConfig()
-    ring_cfg.task_ring_entries  = 16384
-    ring_cfg.payload_ring_bytes = 4 * 1024 * 1024 * 1024
-    ring_cfg.chunk_bytes        = 4 * 1024 * 1024
-    ring_cfg.pinned_pool_bytes  = 4 * 1024 * 1024 * 1024
+    host_cfg = _make_host_cfg(db_cfg_native)
+    ring_cfg = _make_ring_cfg()
 
     # -----------------------------------------------------------------------
     # Monitored model — compiled with torch.compile + static cache (CUDA graphs)

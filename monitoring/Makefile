@@ -19,11 +19,16 @@ SRCS := csrc/native_engine.cpp \
         csrc/future_process.cpp \
         csrc/clickhouse_client.cpp \
         csrc/ring/drain_thread.cpp \
-        csrc/ring/chunk_assembler.cpp \
+        csrc/ring/p2p_thread.cpp \
         csrc/ring/ring_torch_op.cpp
 HEADERS := csrc/native_engine.h csrc/native_engine_internal.h \
-csrc/pipelined_engine.hpp csrc/dmx_host_utils.h csrc/future_process.h \
-           csrc/clickhouse_client.h csrc/dmx_host_engine.h
+           csrc/pipelined_engine.hpp csrc/dmx_host_utils.h csrc/future_process.h \
+           csrc/clickhouse_client.h csrc/dmx_host_engine.h \
+           csrc/ring/ring_config.h csrc/ring/ring_state.h csrc/ring/ring_alloc.h \
+           csrc/ring/task_entry.h csrc/ring/drain_task.h csrc/ring/drain_thread.h \
+           csrc/ring/p2p_thread.h csrc/ring/pinned_staging.h \
+           csrc/ring/ring_engine.h csrc/ring/ring_engine_py.h \
+           csrc/ring/ring_torch_op.h csrc/ring/tensor_meta.h
 BUILD_DIR := build
 OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 PROJECT_ROOT := $(abspath $(CURDIR)/..)

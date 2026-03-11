@@ -171,6 +171,12 @@ class HookPoint(nn.Module):
         Change it into PyTorch hook format (this includes input and output,
         which are the same for a HookPoint)
         If prepend is True, add this hook before all other hooks
+
+        NOTE: These are user-provided Python callback hooks, unrelated to ring
+        transport.  They will NOT fire during CUDA graph replay (only the
+        captured GPU kernels replay; Python hooks run only during eager or
+        capture).  Ring transport data capture uses torch.ops.ring.producer
+        called directly in HookPoint.forward(), not these hooks.
         """
 
         def full_hook(

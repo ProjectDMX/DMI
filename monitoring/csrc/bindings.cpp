@@ -343,12 +343,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("task_ring_entries",         &ring_py::RingConfig::task_ring_entries)
       .def_readwrite("payload_ring_bytes",        &ring_py::RingConfig::payload_ring_bytes)
       .def_readwrite("chunk_bytes",               &ring_py::RingConfig::chunk_bytes)
-      .def_readwrite("pinned_pool_bytes",         &ring_py::RingConfig::pinned_pool_bytes)
+      .def_readwrite("pinned_staging_bytes",      &ring_py::RingConfig::pinned_staging_bytes)
       .def_readwrite("wait_policy",               &ring_py::RingConfig::wait_policy)
       .def_readwrite("no_progress_timeout_cycles",&ring_py::RingConfig::no_progress_timeout_cycles)
       .def_readwrite("drop_reporting",            &ring_py::RingConfig::drop_reporting)
       .def_readwrite("drain_poll_timeout_us",     &ring_py::RingConfig::drain_poll_timeout_us)
-      .def_readwrite("drain_notify_on_forward",   &ring_py::RingConfig::drain_notify_on_forward);
+      .def_readwrite("drain_notify_on_forward",   &ring_py::RingConfig::drain_notify_on_forward)
+      .def_readwrite("drain_flush_task_ratio",     &ring_py::RingConfig::drain_flush_task_ratio)
+      .def_readwrite("drain_flush_payload_ratio",  &ring_py::RingConfig::drain_flush_payload_ratio)
+      .def_readwrite("drain_flush_entry_threshold", &ring_py::RingConfig::drain_flush_entry_threshold)
+      .def_readwrite("drain_flush_byte_threshold",  &ring_py::RingConfig::drain_flush_byte_threshold)
+      .def_readwrite("bypass_budget_bytes",       &ring_py::RingConfig::bypass_budget_bytes)
+      .def_readwrite("clone_slices",              &ring_py::RingConfig::clone_slices)
+      .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
+      .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
 
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {

@@ -1,67 +1,33 @@
-// ring/drain_thread.h — CPU drain thread: reads published TaskEntries from the
-// ring and issues async D2H copies into pinned pool buffers.
+// ring/drain_thread.h — Batch drain thread: scans GPU task ring, issues batch
+// D2H copies into a pinned staging ring, pushes DrainTasks to a locked queue
+// for the p2p thread.
 //
 // Lifecycle:
-//   DrainThread dt(ring_state, pool, callback);
+//   DrainThread dt(ring_state, staging, cfg);
 //   dt.start();
 //   // ... GPU producer kernels run ...
-//   // Wake-up options (at least one required):
-//   //   a. cudaLaunchHostFunc → hostfunc_cb(&dt)  (eager / non-graph path)
-//   //   b. dt.notify() from Python after each forward pass  (CUDA graph path)
-//   //   c. 500μs timeout fallback  (safety net)
-//   dt.stop();
-//
-// Per-chunk protocol:
-//   1. hostfunc_cb() signals the CV; drain thread wakes.
-//   2. drain_ready(): for each consecutive ready TaskEntry:
-//        a. Check ready_seq via task_cpu_ready() (acquire load).
-//        b. Copy entry metadata; issue cudaMemcpyAsync D2H into pinned buffer.
-//        c. Record cudaEvent.
-//        d. task_release_cpu() + advance task_tail (frees the task slot).
-//        e. Push PendingChunk onto pending_ deque.
-//   3. poll_completed(): for each event at the head of pending_:
-//        a. cudaEventQuery — if done, advance payload_tail, invoke callback.
-//        b. Stop at the first non-completed entry (FIFO order preserved).
-//
-// payload_tail is advanced only after D2H completes so the GPU producer never
-// sees payload bytes as free before the CPU has copied them out.
+//   dt.stop();   // final flush
 
 #pragma once
 #include "ring_state.h"
-#include "pinned_pool.h"
+#include "ring_config.h"
+#include "pinned_staging.h"
+#include "drain_task.h"
+#include "task_entry.h"
 
 #include <cuda_runtime.h>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
-#include <functional>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace ring {
 
-// Metadata delivered to the callback for each completed D2H chunk.
-struct DrainedChunk {
-    uint8_t*  pinned;              // pinned buffer start; valid until pool.free(alloc_bytes)
-    uint64_t  len;                 // bytes of tensor data in pinned (len1 + len2)
-    uint64_t  alloc_bytes;         // bytes to return to the pinned ring via pool.free()
-    uint64_t  logical_task_id;
-    uint64_t  chunk_offset_bytes;
-    uint64_t  tensor_total_bytes;
-    uint32_t  chunk_idx;
-    uint32_t  flags;
-    uint32_t  hook_type;
-    uint32_t  hook_id;
-    uint32_t  reason;
-};
-
-using DrainCallback = std::function<void(DrainedChunk&&)>;
-
 class DrainThread {
 public:
-    // poll_timeout_us: 0 = infinite wait (only wake on notify/stop).
-    DrainThread(RingState& rs, PinnedPool& pool, DrainCallback cb,
-                uint64_t poll_timeout_us = 0);
+    DrainThread(RingState& rs, PinnedStaging& staging, const RingConfig& cfg);
     ~DrainThread() noexcept;
 
     DrainThread(const DrainThread&)            = delete;
@@ -70,30 +36,43 @@ public:
     void start();
     void stop();
 
-    // Called from the CUDA host-function callback to wake the drain thread.
+    // Wake the drain thread (non-blocking).
     void notify();
 
-    // Block until at least `target` chunks have completed D2H and their
-    // assembler callback has been invoked.  Call after cudaStreamSynchronize
-    // so that `target` (= *ring.task_head) is stable.
-    void wait_until_completed(uint64_t target);
-
-    // Static shim suitable for cudaLaunchHostFunc / cudaHostFn_t.
+    // Static shim for cudaLaunchHostFunc / cudaHostFn_t.
     static void CUDART_CB hostfunc_cb(void* arg);
 
-private:
-    struct PendingChunk {
-        cudaEvent_t event;          // nullptr for drop entries (no D2H)
-        uint8_t*    pinned;         // nullptr for drop entries
-        uint64_t    payload_bytes;  // bytes to return to payload ring on completion
-        uint64_t    alloc_bytes;    // bytes to return to pinned ring via pool.free()
-        DrainedChunk meta;
-    };
+    // --- Task queue interface (drain → p2p) ---
 
-    RingState&    ring_;
-    PinnedPool&   pool_;
-    DrainCallback cb_;
-    cudaStream_t  stream_{};
+    // Wait until can_pop_count > 0 or p2p_stop_requested. Returns number of
+    // tasks to pop.  Sets can_pop_count_ to 0 under lock.
+    uint64_t wait_for_tasks();
+
+    // Pop exactly n tasks from the front of the queue into `out`.
+    void pop_tasks(uint64_t n, std::vector<DrainTask>& out);
+
+    // Signal the p2p thread to exit (called after drain thread has joined,
+    // guaranteeing no more tasks will be pushed).
+    void signal_p2p_stop();
+
+    // Release staging bytes and notify drain thread that staging space has been freed.
+    void notify_staging_freed_bytes(uint64_t nbytes);
+
+    // Notify drain thread that bypass budget has been freed.
+    void notify_bypass_freed();
+
+    // --- Bypass backpressure interface ---
+    std::mutex&              bypass_mu()  { return bypass_mu_; }
+    std::condition_variable& bypass_cv()  { return bypass_cv_; }
+    uint64_t& in_flight_bypass_bytes()    { return in_flight_bypass_bytes_; }
+
+    bool is_running() const { return running_.load(std::memory_order_relaxed); }
+
+private:
+    RingState&      ring_;
+    PinnedStaging&  staging_;
+    RingConfig      cfg_;
+    cudaStream_t    stream_{};
 
     std::thread             thread_;
     std::mutex              mu_;
@@ -101,24 +80,46 @@ private:
     std::atomic<bool>       running_{false};
     bool                    notified_{false};
 
-    std::deque<PendingChunk> pending_;
-    uint64_t                 payload_tail_local_{0};
-    // Local counters — drain thread is the sole writer of task_tail and
-    // consumer_heartbeat; tracking locally avoids PCIe reads of GPU-HBM
-    // managed memory and avoids LOCK-prefix atomics on PCIe-mapped pages.
-    uint64_t                 task_tail_local_{0};
-    uint64_t                 heartbeat_local_{0};
-    uint64_t                 poll_timeout_us_{0};  // 0 = infinite wait
+    // Scan progress (CPU-local to drain thread)
+    uint64_t                visible_head_{0};
+    uint64_t                pending_entries_{0};
+    uint64_t                pending_bytes_{0};
+    std::deque<TaskEntry>   scanned_;
+    int64_t                 last_complete_idx_{-1};
 
-    // Flush barrier: counts chunks that have completed D2H + assembler call.
-    // Written only by the drain thread; read by wait_until_completed().
-    std::atomic<uint64_t>    completed_local_{0};
-    std::mutex               flush_mu_;
-    std::condition_variable  flush_cv_;
+    // Incremental flush-size tracking (avoids re-summing on every should_flush)
+    uint64_t                scan_bytes_accum_{0};   // running sum of alloc_bytes for all scanned entries
+    uint64_t                flushable_bytes_{0};    // sum of alloc_bytes for entries [0..last_complete_idx_]
+    uint64_t                flushable_entries_{0};  // last_complete_idx_ + 1
+
+    // Local mirrors of managed-memory counters
+    uint64_t                payload_tail_local_{0};
+    uint64_t                task_tail_local_{0};
+    uint64_t                heartbeat_local_{0};
+
+    // Task queue (drain → p2p)
+    std::deque<DrainTask>   task_queue_;
+    std::mutex              queue_mu_;
+    uint64_t                can_pop_count_{0};
+    std::mutex              pop_mu_;
+    std::condition_variable pop_cv_;
+    bool                    p2p_stop_requested_{false};
+    uint64_t                pending_incomplete_cnt_{0};
+
+    // Staging backpressure
+    std::mutex              staging_mu_;
+    std::condition_variable staging_cv_;
+
+    // Bypass backpressure
+    uint64_t                in_flight_bypass_bytes_{0};
+    std::mutex              bypass_mu_;
+    std::condition_variable bypass_cv_;
 
     void loop();
-    void drain_ready();
-    void poll_completed();
+    void scan_ready();
+    bool should_flush() const;
+    void batch_flush();
+    void handle_large_tensor();
 };
 
 }  // namespace ring

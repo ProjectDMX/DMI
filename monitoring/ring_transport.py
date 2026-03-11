@@ -236,10 +236,13 @@ def _compute_hook_shape(
 def _make_ring_hook(hook_type: int, hook_id: int):
     """Return a PyTorch register_forward_hook callable for a HookPoint.
 
-    No-op: ring::producer is now called directly inside HookPoint.forward()
-    via torch.ops.ring.producer (C++ TORCH_LIBRARY, captured in CUDA graph).
-    This hook is kept so _forward_hook_names remains populated and
-    capture_tensor() correctly skips hooks handled by HookPoint.forward().
+    Legacy / no-op: ring::producer is now called directly inside
+    HookPoint.forward() via torch.ops.ring.producer (C++ TORCH_LIBRARY,
+    captured in CUDA graph).  This hook is kept so _forward_hook_names
+    remains populated and capture_tensor() correctly skips hooks handled
+    by HookPoint.forward().  The actual GPU→ring data path is entirely
+    in the C++ producer kernel; these Python hooks are never invoked for
+    ring transport data capture.
     """
     def _hook(module: nn.Module, inp: Any, output: Any) -> None:
         pass
@@ -248,6 +251,10 @@ def _make_ring_hook(hook_type: int, hook_id: int):
 
 def install_ring_hooks(specs: List[HookSpec], handles_out: List) -> None:
     """Register ring producer forward hooks on each spec's module.
+
+    Legacy: these hooks are no-ops (see _make_ring_hook).  They exist only
+    to populate _forward_hook_names so capture_tensor() skips hooks that
+    HookPoint.forward() handles via torch.ops.ring.producer.
 
     handles_out receives the RemovableHandle for each hook so callers
     can remove them later via handle.remove().
@@ -295,8 +302,8 @@ class RingTransport:
         self._active_specs: List[HookSpec] = []
         self._using_forward_hooks: bool = False
         # Names of hooks handled by register_forward_hook (populated at install time).
-        # capture_tensor() skips only these, letting other HookPoints (e.g. token_ids,
-        # final_logits) still go through the legacy path.
+        # capture_tensor() skips these; any HookPoint whose name is not in this set
+        # falls through to the legacy capture_tensor() path.
         self._forward_hook_names: set = set()
 
     def set_step_context(
@@ -352,10 +359,12 @@ class RingTransport:
     def capture_tensor(self, tensor: torch.Tensor, hook_name: str) -> None:
         """Legacy capture path: called from HookPoint.forward().
 
-        Skipped for hooks that are covered by register_forward_hook (i.e. hooks
-        whose names appear in _forward_hook_names).  Hooks absent from
-        _forward_hook_names (e.g. token_ids, final_logits) still go through
-        this path regardless of _using_forward_hooks.
+        Not used by the primary ring transport path.  When ring transport is
+        active with forward hooks installed, all hooks in _forward_hook_names
+        (including token_ids and final_logits) are handled by
+        torch.ops.ring.producer inside HookPoint.forward(), so this method
+        returns early on the _forward_hook_names check.  It remains as a
+        fallback for any HookPoint not covered by install_ring_hooks.
         """
         if hook_name in self._forward_hook_names:
             return

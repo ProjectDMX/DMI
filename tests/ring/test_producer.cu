@@ -211,10 +211,12 @@ static void test_wrap()
     ar.init();
 
     // Simulate a ring state where physical head is near the end.
-    // head=3900, tail=3584: free = 4096 - (3900-3584) = 3780 >= 512.
-    // Physical head position: 3900 % 4096 = 3900.
-    // bytes_to_end = 4096 - 3900 = 196 → two spans: len1=196, len2=316.
-    const uint64_t head       = 3900;
+    // head and tail must be PAYLOAD_ALIGN-aligned (16 bytes) since
+    // vectorized uint4 D2D copies require aligned offsets.
+    // head=3904, tail=3584: free = 4096 - (3904-3584) = 3776 >= 512.
+    // Physical head position: 3904 % 4096 = 3904.
+    // bytes_to_end = 4096 - 3904 = 192 → two spans: len1=192, len2=320.
+    const uint64_t head       = 3904;
     const uint64_t tail       = 3584;
     const uint64_t src_bytes  = 512;
     *ar.state().payload_head  = head;
@@ -228,7 +230,7 @@ static void test_wrap()
     auto entries = read_entries(ar.state().task_entries, cfg.task_ring_entries);
     const auto& e = entries[0];
 
-    uint64_t bytes_to_end = 4096 - (head % 4096);  // 196
+    uint64_t bytes_to_end = 4096 - (head % 4096);  // 192
     ASSERT(e.payload_len1 == bytes_to_end);
     ASSERT(e.payload_len2 == src_bytes - bytes_to_end);
     ASSERT(e.payload_off1 == head % 4096);
@@ -295,9 +297,10 @@ static void test_data_correctness_wrap()
     ring::AllocatedRing ar(cfg);
     ar.init();
 
-    // Same setup as test_wrap: head=3900, tail=3584 → two-span (196 + 316).
+    // Same setup as test_wrap: head=3904, tail=3584 → two-span (192 + 320).
+    // head must be PAYLOAD_ALIGN-aligned (16 bytes) for vectorized uint4 copies.
     const uint64_t src_bytes  = 512;
-    *ar.state().payload_head  = 3900;
+    *ar.state().payload_head  = 3904;
     *ar.state().payload_tail  = 3584;
 
     uint8_t* d_src = make_src(src_bytes);
@@ -349,10 +352,10 @@ static void test_timeout_drop()
     ring::AllocatedRing ar(cfg);
     ar.init();
 
-    // Simulate a nearly-full payload ring: only 4 bytes free.
-    // The producer needs 512 bytes but only 4 are available.
+    // Simulate a nearly-full payload ring: only 16 bytes free.
+    // The producer needs 512 bytes but only 16 are available.
     // consumer_heartbeat stays 0 → no progress → timeout.
-    *ar.state().payload_head = cfg.payload_ring_bytes - 4;
+    *ar.state().payload_head = cfg.payload_ring_bytes - 16;
     *ar.state().payload_tail = 0;
     // task ring is empty (head=tail=0), so 1 task slot is available for DROP.
 

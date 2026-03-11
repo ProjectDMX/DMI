@@ -52,7 +52,11 @@ def _install_monitoring_forward(model: Any) -> None:
     """Install monitored_forward wrapper and (if possible) ring forward hooks."""
     from . import ring_transport
 
-    # --- Forward hooks (new CUDA-graph-compatible path) ---
+    # --- Forward hooks (legacy registration for _forward_hook_names) ---
+    # These register_forward_hook calls are no-ops for ring transport data
+    # capture.  The actual producer kernel is called inside HookPoint.forward()
+    # via torch.ops.ring.producer.  The hooks here only serve to populate
+    # transport._forward_hook_names so capture_tensor() skips those hooks.
     transport = ring_transport.get_active()
     if transport is not None and hasattr(model, "get_hook_specs"):
         # Auto-detect model shape if not already set
@@ -131,7 +135,8 @@ def _uninstall_monitoring_forward(model: Any) -> None:
     """Remove ring forward hooks and restore original model.forward."""
     from . import ring_transport
 
-    # Remove register_forward_hook handles (ring producer hooks on submodules)
+    # Remove register_forward_hook handles (legacy no-op hooks on submodules;
+    # see _make_ring_hook in ring_transport.py)
     for h in getattr(model, "_ring_hook_handles", []):
         try:
             h.remove()
