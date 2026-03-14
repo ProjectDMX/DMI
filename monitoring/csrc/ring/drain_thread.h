@@ -92,6 +92,14 @@ private:
     uint64_t                flushable_bytes_{0};    // sum of alloc_bytes for entries [0..last_complete_idx_]
     uint64_t                flushable_entries_{0};  // last_complete_idx_ + 1
 
+    // Capped flush tracking: largest prefix of complete tensors that fits in staging
+    uint64_t                capped_flush_bytes_{0};
+    uint64_t                capped_flush_entries_{0};
+
+    // Timestamp of when the first complete tensor became pending (for timeout flush)
+    std::chrono::steady_clock::time_point first_complete_time_{};
+    bool                    has_complete_time_{false};
+
     // Local mirrors of managed-memory counters
     uint64_t                payload_tail_local_{0};
     uint64_t                task_tail_local_{0};

@@ -40,6 +40,7 @@ struct RingConfig {
     float    drain_flush_payload_ratio  = 0.0f;
     uint64_t drain_flush_entry_threshold = 0;
     uint64_t drain_flush_byte_threshold  = 0;
+    uint64_t drain_flush_timeout_us      = 0;
     // Bypass budget for large tensors (bytes).
     uint64_t bypass_budget_bytes        = 256ULL * 1024 * 1024;
     // Clone per-request slices (see plan.md CPU Memory Budget section).

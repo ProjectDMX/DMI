@@ -101,11 +101,46 @@ void DrainThread::notify_bypass_freed() {
 // Main loop
 // ---------------------------------------------------------------------------
 void DrainThread::loop() {
+    uint64_t loop_iter = 0;
+    uint64_t last_log_iter = 0;
+    auto last_log_time = std::chrono::steady_clock::now();
+
     while (running_.load(std::memory_order_relaxed)) {
+        ++loop_iter;
+        uint64_t pre_pending = pending_entries_;
         scan_ready();
+        uint64_t post_pending = pending_entries_;
 
         if (should_flush()) {
+            fprintf(stderr, "[drain_diag] iter=%lu flush: entries=%lu bytes=%lu tail=%lu\n",
+                    (unsigned long)loop_iter, (unsigned long)flushable_entries_,
+                    (unsigned long)flushable_bytes_, (unsigned long)task_tail_local_);
             batch_flush();
+        }
+
+        // Periodic diagnostic: if >2s since last log, report state
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count();
+        if (elapsed > 2000) {
+            fprintf(stderr, "[drain_diag] STALL? iter=%lu pending=%lu scanned_new=%lu "
+                    "last_complete_idx=%ld visible_head=%lu task_tail=%lu "
+                    "staging_free=%lu staging_cap=%lu "
+                    "flushable_entries=%lu flushable_bytes=%lu "
+                    "task_cap=%lu payload_cap=%lu should_flush=%d\n",
+                    (unsigned long)loop_iter,
+                    (unsigned long)pending_entries_,
+                    (unsigned long)(post_pending - pre_pending),
+                    (long)last_complete_idx_,
+                    (unsigned long)visible_head_,
+                    (unsigned long)task_tail_local_,
+                    (unsigned long)staging_.free_bytes(),
+                    (unsigned long)staging_.capacity(),
+                    (unsigned long)flushable_entries_,
+                    (unsigned long)flushable_bytes_,
+                    (unsigned long)ring_.task_cap,
+                    (unsigned long)ring_.payload_cap,
+                    (int)should_flush());
+            last_log_time = now;
         }
 
         if (pending_entries_ == 0) {
@@ -197,6 +232,16 @@ void DrainThread::scan_ready() {
             // Snapshot running sums as flushable
             flushable_bytes_   = scan_bytes_accum_;
             flushable_entries_ = static_cast<uint64_t>(scanned_.size());
+            // Update capped counters if this prefix still fits in staging
+            if (scan_bytes_accum_ <= staging_.capacity()) {
+                capped_flush_bytes_   = scan_bytes_accum_;
+                capped_flush_entries_ = static_cast<uint64_t>(scanned_.size());
+            }
+            // Record when the first complete tensor became pending
+            if (!has_complete_time_) {
+                first_complete_time_ = std::chrono::steady_clock::now();
+                has_complete_time_ = true;
+            }
         }
     }
 }
@@ -228,6 +273,12 @@ bool DrainThread::should_flush() const {
     if (fc.entry_threshold > 0 && fe >= fc.entry_threshold) return true;
     // 6. Byte threshold
     if (fc.byte_threshold > 0 && fb >= fc.byte_threshold) return true;
+    // 7. Timeout: complete tensor pending longer than timeout_us
+    if (fc.timeout_us > 0 && has_complete_time_) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - first_complete_time_).count();
+        if (static_cast<uint64_t>(elapsed) >= fc.timeout_us) return true;
+    }
 
     return false;
 }
@@ -237,20 +288,51 @@ bool DrainThread::should_flush() const {
 // Uses pre-computed flushable_bytes_ / flushable_entries_ (no loop to sum).
 // ---------------------------------------------------------------------------
 void DrainThread::batch_flush() {
-    const uint64_t flush_count = flushable_entries_;
-    const uint64_t flush_bytes = flushable_bytes_;
+    const uint64_t flush_count = capped_flush_entries_;
+    const uint64_t flush_bytes = capped_flush_bytes_;
+
+    fprintf(stderr, "[drain_diag] batch_flush enter: capped_entries=%lu capped_bytes=%lu "
+            "flushable_entries=%lu flushable_bytes=%lu staging_free=%lu staging_cap=%lu\n",
+            (unsigned long)flush_count, (unsigned long)flush_bytes,
+            (unsigned long)flushable_entries_, (unsigned long)flushable_bytes_,
+            (unsigned long)staging_.free_bytes(), (unsigned long)staging_.capacity());
 
     // --- 1. Backpressure: wait for staging space ---
     if (flush_bytes > 0) {
+        uint64_t free_before = staging_.free_bytes();
+        if (free_before < flush_bytes) {
+            fprintf(stderr, "[drain_diag] staging backpressure: need=%lu free=%lu cap=%lu\n",
+                    (unsigned long)flush_bytes, (unsigned long)free_before,
+                    (unsigned long)staging_.capacity());
+        }
         std::unique_lock<std::mutex> lk(staging_mu_);
         staging_cv_.wait(lk, [&] {
             return staging_.free_bytes() >= flush_bytes;
         });
+        fprintf(stderr, "[drain_diag] staging backpressure resolved\n");
+        fflush(stderr);
     }
 
     // --- 2. Batch D2H (separate CUDA stream) ---
     // GPU payload region: [payload_tail_local_, +flush_bytes) in circular buffer.
     // Staging destination: [staging_.head(), +flush_bytes) in circular buffer.
+    if (flush_bytes > 0) {
+        // Log memory type of src (payload_buf) and dst (staging)
+        {
+            cudaPointerAttributes src_attr{}, dst_attr{};
+            cudaPointerGetAttributes(&src_attr, ring_.payload_buf);
+            cudaPointerGetAttributes(&dst_attr, staging_.base());
+            // type: 0=unregistered, 1=host, 2=device, 3=managed
+            fprintf(stderr, "[drain_diag] memcpy src type=%d device=%d ptr=%p | "
+                    "dst type=%d device=%d ptr=%p\n",
+                    (int)src_attr.type, src_attr.device, (void*)ring_.payload_buf,
+                    (int)dst_attr.type, dst_attr.device, (void*)staging_.base());
+            fflush(stderr);
+        }
+    }
+    fprintf(stderr, "[drain_diag] step2: PRE cudaMemcpyAsync flush_bytes=%lu\n",
+            (unsigned long)flush_bytes);
+    fflush(stderr);
     if (flush_bytes > 0) {
         const uint64_t gpu_cap    = ring_.payload_cap;
         const uint64_t stg_cap    = staging_.capacity();
@@ -259,13 +341,17 @@ void DrainThread::batch_flush() {
         uint64_t remaining  = flush_bytes;
 
         while (remaining > 0) {
+            
             uint64_t gpu_avail = gpu_cap - gpu_cursor;
             uint64_t stg_avail = stg_cap - stg_cursor;
             uint64_t chunk = std::min({remaining, gpu_avail, stg_avail});
-
+            fprintf(stderr, "[drain_diag] step2: Just before one cudaMemcpyAsync\n");
+            fflush(stderr);
             cudaMemcpyAsync(staging_.base() + stg_cursor,
                             ring_.payload_buf + gpu_cursor,
                             chunk, cudaMemcpyDeviceToHost, stream_);
+            fprintf(stderr, "[drain_diag] step2: Just after one cudaMemcpyAsync\n");
+            fflush(stderr);
 
             remaining  -= chunk;
             gpu_cursor  = (gpu_cursor + chunk) % gpu_cap;
@@ -273,9 +359,16 @@ void DrainThread::batch_flush() {
         }
     }
 
+    fprintf(stderr, "[drain_diag] step2: POST cudaMemcpyAsync\n");
+    fflush(stderr);
+
     // --- 3. cudaStreamSynchronize (D2H stream) ---
     if (flush_bytes > 0) {
+        fprintf(stderr, "[drain_diag] step3: PRE cudaStreamSync\n");
+        fflush(stderr);
         cudaStreamSynchronize(stream_);
+        fprintf(stderr, "[drain_diag] step3: POST cudaStreamSync\n");
+        fflush(stderr);
     }
 
     // --- 4. Release GPU resources (flushed entries only) ---
@@ -361,7 +454,10 @@ void DrainThread::batch_flush() {
     scan_bytes_accum_ -= flush_bytes;
     flushable_bytes_   = 0;
     flushable_entries_ = 0;
+    capped_flush_bytes_   = 0;
+    capped_flush_entries_ = 0;
     last_complete_idx_ = -1;
+    has_complete_time_ = false;
 
     // Re-scan remaining entries for any IS_LAST
     uint64_t reaccum = 0;
@@ -373,14 +469,29 @@ void DrainThread::batch_flush() {
             last_complete_idx_ = static_cast<int64_t>(i);
             flushable_bytes_   = reaccum;
             flushable_entries_ = static_cast<uint64_t>(i + 1);
+            if (reaccum <= staging_.capacity()) {
+                capped_flush_bytes_   = reaccum;
+                capped_flush_entries_ = static_cast<uint64_t>(i + 1);
+            }
+            if (!has_complete_time_) {
+                first_complete_time_ = std::chrono::steady_clock::now();
+                has_complete_time_ = true;
+            }
         }
     }
+
+    fprintf(stderr, "[drain_diag] batch_flush done: remaining_scanned=%lu remaining_pending=%lu "
+            "new_flushable_entries=%lu new_capped_entries=%lu\n",
+            (unsigned long)scanned_.size(), (unsigned long)pending_entries_,
+            (unsigned long)flushable_entries_, (unsigned long)capped_flush_entries_);
 }
 
 // ---------------------------------------------------------------------------
 // handle_large_tensor — bypass staging, D2H directly into pageable memory
 // ---------------------------------------------------------------------------
 void DrainThread::handle_large_tensor() {
+    fprintf(stderr, "[drain_diag] handle_large_tensor: visible_head=%lu\n",
+            (unsigned long)visible_head_);
     // The IS_FIRST entry is at visible_head_ (already confirmed ready)
     const uint64_t idx0 = visible_head_ % ring_.task_cap;
     TaskEntry first_entry = ring_.task_entries[idx0];

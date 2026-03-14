@@ -353,6 +353,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("drain_flush_payload_ratio",  &ring_py::RingConfig::drain_flush_payload_ratio)
       .def_readwrite("drain_flush_entry_threshold", &ring_py::RingConfig::drain_flush_entry_threshold)
       .def_readwrite("drain_flush_byte_threshold",  &ring_py::RingConfig::drain_flush_byte_threshold)
+      .def_readwrite("drain_flush_timeout_us",     &ring_py::RingConfig::drain_flush_timeout_us)
       .def_readwrite("bypass_budget_bytes",       &ring_py::RingConfig::bypass_budget_bytes)
       .def_readwrite("clone_slices",              &ring_py::RingConfig::clone_slices)
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)

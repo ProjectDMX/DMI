@@ -55,6 +55,14 @@ struct DrainFlushConfig {
     uint64_t entry_threshold = 0;  // flush after N entries ready
     uint64_t byte_threshold  = 0;  // flush after N payload bytes ready
 
+    // Time-based flush: if a complete tensor has been pending for longer
+    // than this many microseconds, flush unconditionally.  0 = disabled.
+    // WARNING: if this is set but drain_poll_timeout_us == 0 and
+    // drain_notify_on_forward == false, the drain thread may never wake
+    // to check the timeout.  If this is smaller than drain_poll_timeout_us,
+    // the effective resolution is limited to drain_poll_timeout_us.
+    uint64_t timeout_us = 0;
+
     // Force flush is always active:
     //   pending_entries >= task_cap  OR  pending_bytes >= payload_cap
     // This prevents deadlock.

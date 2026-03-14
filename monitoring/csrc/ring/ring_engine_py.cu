@@ -52,6 +52,7 @@ static ring::RingConfig convert(const RingConfig& c) {
     r.drain_flush.payload_ratio   = c.drain_flush_payload_ratio;
     r.drain_flush.entry_threshold = c.drain_flush_entry_threshold;
     r.drain_flush.byte_threshold  = c.drain_flush_byte_threshold;
+    r.drain_flush.timeout_us      = c.drain_flush_timeout_us;
     r.bypass_budget_bytes         = c.bypass_budget_bytes;
     r.clone_slices                = c.clone_slices;
     r.insert_queue_max_bytes      = c.insert_queue_max_bytes;

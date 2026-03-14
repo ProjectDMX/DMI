@@ -109,6 +109,7 @@ class BenchConfig:
     drain_flush_payload_ratio: float = 0.0
     drain_flush_entry_threshold: int = 0
     drain_flush_byte_threshold: int = 0
+    drain_flush_timeout_us: int = 0
     bypass_budget_mb: int = 256
     clone_slices: bool = False
 
@@ -141,6 +142,7 @@ def _make_ring_cfg(cfg: BenchConfig):
     rc.drain_flush_payload_ratio   = cfg.drain_flush_payload_ratio
     rc.drain_flush_entry_threshold = cfg.drain_flush_entry_threshold
     rc.drain_flush_byte_threshold  = cfg.drain_flush_byte_threshold
+    rc.drain_flush_timeout_us      = cfg.drain_flush_timeout_us
     rc.bypass_budget_bytes         = cfg.bypass_budget_mb * 1024 * 1024
     rc.clone_slices                = cfg.clone_slices
     rc.insert_queue_max_bytes      = cfg.ch_queue_max_size_mb * 1024 * 1024
@@ -398,6 +400,8 @@ def _parse_args() -> BenchConfig:
                    help="Flush after N entries ready (0 = disabled)")
     g.add_argument("--drain-flush-byte-threshold",  type=int, default=0,
                    help="Flush after N payload bytes ready (0 = disabled)")
+    g.add_argument("--drain-flush-timeout-us",     type=int, default=0,
+                   help="Flush after complete tensor pending N us (0 = disabled)")
 
     g = p.add_argument_group("Ring engine — bypass / p2p")
     g.add_argument("--bypass-budget-mb", type=int, default=256,
@@ -435,6 +439,7 @@ def _parse_args() -> BenchConfig:
         drain_flush_payload_ratio=ns.drain_flush_payload_ratio,
         drain_flush_entry_threshold=ns.drain_flush_entry_threshold,
         drain_flush_byte_threshold=ns.drain_flush_byte_threshold,
+        drain_flush_timeout_us=ns.drain_flush_timeout_us,
         bypass_budget_mb=ns.bypass_budget_mb,
         clone_slices=bool(ns.clone_slices),
         ch_parallelism=ns.ch_parallelism, ch_queue_max_items=ns.ch_queue_max_items,

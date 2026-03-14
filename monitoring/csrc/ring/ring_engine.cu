@@ -44,6 +44,22 @@ RingEngine::RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
                 "at stop(). Ring must hold all data or producer will deadlock.\n");
     }
 
+    if (cfg_.drain_flush.timeout_us > 0) {
+        if (cfg_.drain_poll_timeout_us == 0) {
+            fprintf(stderr, "[ring_engine] WARNING: drain_flush.timeout_us=%lu but "
+                    "drain_poll_timeout_us=0 — drain thread does not poll, so "
+                    "timeout check only runs on notify_on_forward wake-ups "
+                    "(or never if that is also disabled).\n",
+                    (unsigned long)cfg_.drain_flush.timeout_us);
+        } else if (cfg_.drain_flush.timeout_us < cfg_.drain_poll_timeout_us) {
+            fprintf(stderr, "[ring_engine] WARNING: drain_flush.timeout_us=%lu < "
+                    "drain_poll_timeout_us=%lu — effective resolution limited to "
+                    "drain_poll_timeout_us.\n",
+                    (unsigned long)cfg_.drain_flush.timeout_us,
+                    (unsigned long)cfg_.drain_poll_timeout_us);
+        }
+    }
+
     drain_ = std::make_unique<DrainThread>(ring_.state(), staging_, cfg_);
     p2p_   = std::make_unique<P2PThread>(*drain_, fifo, cfg_, std::move(submit_fn));
 }

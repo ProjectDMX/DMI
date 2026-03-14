@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -115,6 +115,7 @@ def _hf_generate_collect_scores_batched(
     eos_token_id: int,
     pad_token_id: int,
     device: torch.device,
+    cache_implementation: Optional[str] = None,
 ) -> List[_HFGenRef]:
     """Run HF generate() ONCE on the full padded batch; return per-row (unpadded, EOS-trimmed) refs."""
     hf_model.eval()
@@ -123,7 +124,7 @@ def _hf_generate_collect_scores_batched(
 
     B, Pmax = input_ids.shape
 
-    gen_out = hf_model.generate(
+    gen_kwargs: Dict[str, Any] = dict(
         input_ids=input_ids,
         attention_mask=attn,
         max_new_tokens=max_new_tokens,
@@ -134,6 +135,10 @@ def _hf_generate_collect_scores_batched(
         output_scores=True,
         logits_to_keep=0,
     )
+    if cache_implementation is not None:
+        gen_kwargs["cache_implementation"] = cache_implementation
+
+    gen_out = hf_model.generate(**gen_kwargs)
 
     seqs = gen_out.sequences.detach().cpu().to(torch.long)  # [B, Pmax+G]
     scores_steps: List[torch.Tensor] = []
