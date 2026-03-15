@@ -243,8 +243,12 @@ def _compute_hook_shape(
         return [batch, q_len, cfg.num_heads, cfg.head_dim]
     if hook_type in (HOOK_TYPE_K, HOOK_TYPE_V):
         return [batch, q_len, cfg.num_kv_heads, cfg.head_dim]
-    if hook_type in (HOOK_TYPE_Z, HOOK_TYPE_RESULT):
+    if hook_type == HOOK_TYPE_Z:
         return [batch, q_len, cfg.num_heads, cfg.head_dim]
+    if hook_type == HOOK_TYPE_RESULT:
+        # hook_result is after o_proj → shape is [B, q_len, hidden_dim],
+        # not [B, q_len, num_heads, head_dim] (differs on GQA models).
+        return [batch, q_len, cfg.hidden_dim]
     if hook_type in (HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN):
         return [batch, cfg.num_heads, q_len, kv_dim]
     if hook_type == HOOK_TYPE_TOKEN_IDS:
