@@ -81,6 +81,7 @@ from monitoring.segment_merger import merge_segments, parse_internal_id
 from .hf_reference import (
     _HFGenRef,
     _HFRef,
+    _hf_generate_collect_hidden_states_batched,
     _hf_generate_collect_scores_batched,
     _hf_greedy_rollout_collect_all_batched,
     _parse_request_id,
@@ -235,7 +236,8 @@ def test_e2e_correctness_hf(subtests) -> None:
     chunk_bytes = int(os.environ.get("E2E_CHUNK_BYTES", str(256 * 1024)))
 
     print_text = int(os.environ.get("E2E_PRINT_TEXT", "0")) == 1
-    hf_drop_last_token = int(os.environ.get("E2E_HF_DROP_LAST_TOKEN", "0")) == 1
+    # E2E_HF_DROP_LAST_TOKEN is no longer needed: both monitored and HF reference
+    # use generate(), so they produce the same number of tokens/hidden states.
     print_topk_logits = int(os.environ.get("E2E_PRINT_TOPK_LOGITS", "0")) == 1
     topk_k = int(os.environ.get("E2E_PRINT_TOPK_LOGITS_K", "5"))
     if topk_k < 1:
@@ -463,7 +465,7 @@ def test_e2e_correctness_hf(subtests) -> None:
 
     req_order = sorted(request_ids, key=_parse_request_id)
 
-    hf_refs_batch = _hf_greedy_rollout_collect_all_batched(
+    hf_refs_batch = _hf_generate_collect_hidden_states_batched(
         hf_model=hf_model,
         input_ids_batch=input_ids,
         attention_mask_batch=attention_mask,
@@ -471,8 +473,6 @@ def test_e2e_correctness_hf(subtests) -> None:
         eos_token_id=eos_id,
         pad_token_id=pad_id,
         device=device,
-        want_hidden_states=True,
-        want_attentions=True,
     )
     hf_gens_batch = _hf_generate_collect_scores_batched(
         hf_model=hf_model,
@@ -501,24 +501,6 @@ def test_e2e_correctness_hf(subtests) -> None:
 
         ref = hf_refs_batch[i]
         gen_ref = hf_gens_batch[i]
-
-        if hf_drop_last_token:
-            if int(ref.token_ids.numel()) > 0:
-                T = int(ref.token_ids.numel())
-                ref = _HFRef(
-                    token_ids=ref.token_ids[:-1],
-                    final_logits=ref.final_logits[:-1, :],
-                    hidden_states=[h[:-1, :] for h in ref.hidden_states],
-                    attn_pattern=[a[:, : T - 1, : T - 1] for a in ref.attn_pattern],
-                )
-            if int(gen_ref.token_ids.numel()) > 0:
-                P = int(plen)
-                new_seq = gen_ref.token_ids[:-1]
-                new_gen_len = max(0, int(new_seq.numel()) - P)
-                gen_ref = _HFGenRef(
-                    token_ids=new_seq,
-                    scores=gen_ref.scores[:new_gen_len],
-                )
 
         hf_ref_by_req[req_id] = ref
         hf_gen_by_req[req_id] = gen_ref
@@ -595,8 +577,15 @@ def test_e2e_correctness_hf(subtests) -> None:
             db_logits_full = merge_segments([t for _, _, t in lchunks], "final_logits")
             if db_logits_full.ndim == 1:
                 db_logits_full = db_logits_full.unsqueeze(0)
-            db_slice = db_logits_full[-seq_len:, :]
-            rol_slice = ref.final_logits[:seq_len, :]
+            # ref.final_logits is decode-only scores from generate():
+            # ref[s] = logits at position (prompt_len - 1 + s).
+            # Align with DB logits by position.
+            n_ref = int(ref.final_logits.shape[0])
+            start = prompt_len - 1
+            end = min(start + n_ref, int(db_logits_full.shape[0]))
+            n = end - start
+            db_slice = db_logits_full[start:end, :]
+            rol_slice = ref.final_logits[:n, :]
             vocab_db = int(db_slice.shape[1])
 
             if print_topk_logits:
@@ -800,7 +789,8 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     hf_model_id      = os.environ.get("E2E_MODEL", "gpt2")
     hf_model_id      = _MODEL_ALIASES.get(hf_model_id.lower(), hf_model_id)
     chunk_bytes      = int(os.environ.get("E2E_CHUNK_BYTES", str(256 * 1024)))
-    hf_drop_last_token = bool(int(os.environ.get("E2E_HF_DROP_LAST_TOKEN", "0")))
+    # E2E_HF_DROP_LAST_TOKEN is no longer needed: both monitored and HF reference
+    # use generate(), so they produce the same number of tokens/hidden states.
 
     device = torch.device("cuda")
 
@@ -895,6 +885,8 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
                 pad_token_id=pad_id,
                 eos_token_id=eos_id,
                 cache_implementation="static",  # enables CUDA graph capture in HF
+                # logits_to_keep defaults to 1 (HF generate auto-sets it).
+                # _compute_hook_shape handles this via logits_to_keep param.
             )
     finally:
         engine.close()
@@ -968,28 +960,20 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
         print(f"  ({layer},{hname}): {len(chunks)} chunks")
 
     # -----------------------------------------------------------------------
-    # HF reference — compiled (same torch.compile + reduce-overhead as monitored)
+    # HF reference — compiled manual rollout with StaticCache.
+    # Uses torch.compile(mode="reduce-overhead", fullgraph=False) on the
+    # decode step + cudagraph_mark_step_begin() + immediate .detach().cpu()
+    # to clone hidden states before CUDA graph buffers are overwritten.
+    # (generate() can't do this — see Bug 11 in debug.log)
     # -----------------------------------------------------------------------
     hf_model = AutoModelForCausalLM.from_pretrained(
         hf_model_id, attn_implementation="eager", torch_dtype=torch.float16,
     ).to(device).eval()
-    hf_model = torch.compile(hf_model, mode="reduce-overhead")
 
     wte         = getattr(getattr(hf_model, "transformer", None), "wte", None)
     wpe         = getattr(getattr(hf_model, "transformer", None), "wpe", None)
     embed_tokens = getattr(getattr(hf_model, "model", None), "embed_tokens", None)
     num_layers  = get_num_layers_from_config(hf_model)
-
-    hf_gens_batch = _hf_generate_collect_scores_batched(
-        hf_model=hf_model,
-        input_ids_batch=input_ids,
-        attention_mask_batch=attention_mask,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=eos_id,
-        pad_token_id=pad_id,
-        device=device,
-        cache_implementation="static",
-    )
 
     hf_refs_batch = _hf_greedy_rollout_collect_all_batched(
         hf_model=hf_model,
@@ -1000,7 +984,8 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
         pad_token_id=pad_id,
         device=device,
         want_hidden_states=True,
-        want_attentions=False,  # attn_pattern shape incompatible with static-cache decode
+        want_attentions=True,
+        compiled=True,
     )
 
     # -----------------------------------------------------------------------
@@ -1069,22 +1054,7 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
         db_tok  = db_token_ids_by_req[req_id]
         seq_len = int(db_tok.numel())
 
-        gen_ref = hf_gens_batch[local_i]
         ref     = hf_refs_batch[local_i]
-
-        if hf_drop_last_token:
-            if gen_ref.token_ids.numel() > 0:
-                new_seq     = gen_ref.token_ids[:-1]
-                new_gen_len = max(0, int(new_seq.numel()) - plen)
-                gen_ref = _HFGenRef(token_ids=new_seq, scores=gen_ref.scores[:new_gen_len])
-            if ref.token_ids.numel() > 0:
-                T = int(ref.token_ids.numel())
-                ref = _HFRef(
-                    token_ids=ref.token_ids[:-1],
-                    final_logits=ref.final_logits[:-1, :],
-                    hidden_states=[h[:-1, :] for h in ref.hidden_states],
-                    attn_pattern=[],
-                )
 
         # --- token_ids ---
         with subtests.test(msg=f"{req_id}/cuda_graph/token_ids_present"):
@@ -1096,21 +1066,15 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
             )
 
         with subtests.test(msg=f"{req_id}/cuda_graph/token_ids_match_hf"):
-            assert bitwise_equal(db_tok, gen_ref.token_ids), (
+            assert bitwise_equal(db_tok, ref.token_ids), (
                 f"{req_id}: DB token_ids do not match HF generate() under CUDA graphs. "
-                f"db_len={db_tok.numel()} hf_len={gen_ref.token_ids.numel()} "
+                f"db_len={db_tok.numel()} hf_len={ref.token_ids.numel()} "
                 f"(if db_len << hf_len the CUDA-graph monitoring bug is present)"
             )
 
-        with subtests.test(msg=f"{req_id}/cuda_graph/token_ids_rol"):
-            assert bitwise_equal(db_tok, ref.token_ids), (
-                f"{req_id}: DB token_ids do not match HF rollout. "
-                f"db_len={db_tok.numel()} hf_len={ref.token_ids.numel()}"
-            )
-
         # --- final_logits / resid_pre / resid_post ---
-        # Both monitored model and HF reference are compiled (reduce-overhead).
-        # Expect bitwise match; fall back to allclose with warning if not.
+        # HF reference is uncompiled; monitored model is compiled (reduce-overhead).
+        # Fall back to allclose if not bitwise equal.
         _COMPILED_ATOL = 0.5  # safety net: real transport errors are >> 1
 
         def _assert_close_or_bitwise(db_t, ref_t, label):
@@ -1136,11 +1100,14 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
             db_logits = merge_segments([t for _, _, t in lchunks], "final_logits")
             if db_logits.ndim == 1:
                 db_logits = db_logits.unsqueeze(0)
-            # Compare the overlapping suffix: static-cache may capture 1 fewer prefill
-            # logit row than the rollout (logits_to_keep differs between modes).
-            n = min(int(db_logits.shape[0]), int(ref.final_logits.shape[0]), seq_len)
-            db_slice  = db_logits[-n:, :]
-            rol_slice = ref.final_logits[ref.final_logits.shape[0] - n:, :]
+            # ref.final_logits is decode-only scores from generate():
+            # ref[s] = logits at position (plen - 1 + s).
+            n_ref = int(ref.final_logits.shape[0])
+            start = plen - 1
+            end = min(start + n_ref, int(db_logits.shape[0]))
+            n = end - start
+            db_slice  = db_logits[start:end, :]
+            rol_slice = ref.final_logits[:n, :]
             with subtests.test(msg=f"{req_id}/cuda_graph/final_logits"):
                 assert n > 0, f"final_logits: no overlapping rows (db={db_logits.shape[0]} ref={ref.final_logits.shape[0]})"
                 assert db_slice.shape[1] == rol_slice.shape[1], (
@@ -1198,3 +1165,255 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
                         f"resid_post shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
                     )
                     _assert_close_or_bitwise(db_t, hs, f"{req_id} layer{layer_no} resid_post")
+
+
+# ---------------------------------------------------------------------------
+# Test: CUDA-graph monitored DB vs uncompiled eager HF reference
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA + native backend required")
+def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
+    """Compare monitoring DB (captured under CUDA graphs) against uncompiled eager HF.
+
+    The monitored model runs with torch.compile + StaticCache (CUDA graphs).
+    The reference model is uncompiled with DynamicCache (eager rollout).
+    Compiled vs uncompiled may produce different token sequences after a few
+    decode steps, so we compare the overlapping token prefix and hidden states
+    within that prefix using relaxed tolerance.
+
+    Run with:
+        CUDA_MODULE_LOADING=EAGER python -m pytest tests/test_e2e_correctness_vs_hf.py::test_e2e_cuda_graphs_vs_eager_hf -s
+    """
+    try:
+        import clickhouse_driver  # noqa: F401
+    except Exception:
+        pytest.skip("clickhouse-driver is required")
+
+    try:
+        from monitoring import (  # type: ignore
+            AdvanceConfig,
+            MonitoringConfig,
+            MonitoringEngine,
+            NativePartialSealConfig,
+        )
+        from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
+        from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
+        from monitoring.generate import generate_with_monitoring  # type: ignore
+    except Exception as exc:
+        pytest.skip(f"monitoring native extension not available: {exc}")
+
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel  # type: ignore
+        from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM  # type: ignore
+    except Exception as exc:
+        pytest.skip(f"transformers or Hooked* classes not available: {exc}")
+
+    batch_size     = int(os.environ.get("E2E_BATCH_SIZE", "4"))
+    max_new_tokens = int(os.environ.get("E2E_MAX_NEW_TOKENS", "8"))
+    hf_model_id    = _resolve_model_id(os.environ.get("E2E_MODEL", "gpt2"))
+    chunk_bytes    = int(os.environ.get("E2E_CHUNK_BYTES", str(256 * 1024)))
+    device = torch.device("cuda")
+
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
+    eos_id = int(tokenizer.eos_token_id)
+    pad_id = int(tokenizer.pad_token_id)
+
+    prompts = [("Hello " * (i + 1)).strip() for i in range(batch_size)]
+    encoded = tokenizer(prompts, return_tensors="pt", padding=True)
+    input_ids      = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+
+    hf_initial_prompt_tokens: List[torch.Tensor] = []
+    for j in range(batch_size):
+        hf_initial_prompt_tokens.append(
+            _strip_left_pad(input_ids[j].detach().cpu(), attention_mask[j].detach().cpu()).to(torch.long)
+        )
+
+    # --- Monitoring config + DB ---
+    mon_cfg = MonitoringConfig(
+        hooks=HookSelection(mode="full"),
+        schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
+        native_partial_seal=NativePartialSealConfig(
+            enabled=True, chunk_bytes=int(chunk_bytes),
+            cap_enabled=True, cap_ratio=0.8, driver_guard_mb=1024,
+        ),
+        advance=AdvanceConfig(),
+    )
+
+    db_cfg_native = ClickHouseClientConfig()
+    db_cfg_native.host     = os.environ.get("DMX_DB_HOST", "localhost")
+    db_cfg_native.port     = int(os.environ.get("DMX_DB_PORT", "9000"))
+    db_cfg_native.username = os.environ.get("DMX_DB_USER", "default")
+    db_cfg_native.password = os.environ.get("DMX_DB_PASSWORD", "")
+    db_cfg_native.database = os.environ.get("DMX_DB_DATABASE", "default")
+    db_cfg_native.table    = os.environ.get("DMX_DB_TABLE", "offload")
+    db_cfg_native.secure                   = False
+    db_cfg_native.client_side_compress     = "none"
+    db_cfg_native.client_settings          = None
+    db_cfg_native.create_database_if_missing = True
+    db_cfg_native.drop_existing_database   = True
+    db_cfg_native.index_granularity        = 8192
+
+    host_cfg = _make_host_cfg(db_cfg_native)
+    ring_cfg = _make_ring_cfg()
+
+    # --- Monitored model (compiled, CUDA graphs) ---
+    unique_run_model_id = f"e2e_cg_vs_eager::{uuid.uuid4().hex}"[:120]
+    engine = MonitoringEngine(
+        async_enabled=True, config=mon_cfg,
+        model_id=unique_run_model_id, db_config=host_cfg,
+    )
+    engine.enable_ring_transport(ring_cfg)
+
+    model_cls = HookedQwen3ForCausalLM if "qwen3" in hf_model_id.lower() else HookedGPT2LMHeadModel
+    mon_model = model_cls.from_pretrained(
+        hf_model_id, attn_implementation="eager", torch_dtype=torch.float16,
+    ).to(device).eval()
+    mon_model = torch.compile(mon_model, mode="reduce-overhead")
+    mon_model.monitoring_engine = engine
+    engine.prepare_for_model(mon_model)
+
+    try:
+        with torch.no_grad():
+            generate_with_monitoring(
+                mon_model,
+                input_ids=input_ids, attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=pad_id, eos_token_id=eos_id,
+                cache_implementation="static",
+            )
+    finally:
+        engine.close()
+
+    # --- Read DB ---
+    ch = CHClickhouseDriverReadOnly(
+        host=str(db_cfg_native.host), port=int(db_cfg_native.port),
+        username=str(db_cfg_native.username), password=str(db_cfg_native.password),
+        database=str(db_cfg_native.database), table=str(db_cfg_native.table),
+        secure=False, client_settings=None, decode_strings=True,
+    )
+    try:
+        rows = ch.prefix_get((unique_run_model_id,), return_full_key_tuple=True)
+    finally:
+        ch.close()
+
+    assert rows, f"No DB rows for model_id={unique_run_model_id!r}"
+
+    shard_ranks  = sorted({int(key[4]) for key, _t in rows})
+    chosen_shard = 0 if 0 in shard_ranks else shard_ranks[0]
+    rows = [(k, t) for (k, t) in rows if int(k[4]) == chosen_shard]
+
+    grouped: Dict[str, Dict[Tuple[int, str], List[Tuple[int, int, torch.Tensor]]]] = {}
+    for full_key, t_raw in rows:
+        _model_id, req_id, act_name_raw, layer_no_raw, _shard, s, e = full_key
+        layer_no, act_name = _canon_layer_and_act(str(act_name_raw), int(layer_no_raw))
+        grouped.setdefault(str(req_id), {}).setdefault(
+            (layer_no, act_name), []
+        ).append((int(s), int(e), t_raw.detach().cpu()))
+
+    request_ids = sorted(grouped.keys(), key=_parse_request_id)
+
+    # Build DB token_ids
+    db_token_ids_by_req: Dict[str, torch.Tensor] = {}
+    prompt_len_by_req: Dict[str, int] = {}
+    local_index_by_req: Dict[str, int] = {}
+    for req_id in request_ids:
+        _gid, local_i = _parse_request_id(req_id)
+        local_index_by_req[req_id] = local_i
+        hooks_map = grouped[req_id]
+        tok_chunks = sorted(hooks_map[(-1, "token_ids")], key=lambda x: (x[0], x[1]))
+        db_tok = merge_segments([t for _, _, t in tok_chunks], "token_ids").to(torch.long)
+        if db_tok.ndim != 1:
+            db_tok = db_tok.view(-1)
+        db_token_ids_by_req[req_id] = db_tok.cpu()
+        prompt_len_by_req[req_id] = int(hf_initial_prompt_tokens[local_i].numel())
+
+    # --- Eager HF reference (uncompiled, DynamicCache) ---
+    hf_eager = AutoModelForCausalLM.from_pretrained(
+        hf_model_id, attn_implementation="eager", torch_dtype=torch.float16,
+    ).to(device).eval()
+    num_layers = get_num_layers_from_config(hf_eager)
+
+    hf_eager_refs = _hf_greedy_rollout_collect_all_batched(
+        hf_model=hf_eager,
+        input_ids_batch=input_ids,
+        attention_mask_batch=attention_mask,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=eos_id,
+        pad_token_id=pad_id,
+        device=device,
+        want_hidden_states=True,
+        want_attentions=True,
+    )
+
+    # --- Comparisons ---
+    _EAGER_ATOL = 0.5
+    _RESID_PRE_KEYS  = ("blocks.hook_resid_pre",  "layers.hook_resid_pre")
+    _RESID_POST_KEYS = ("blocks.hook_resid_post", "layers.hook_resid_post")
+
+    def _sort_chunks(chunks):
+        return sorted(chunks, key=lambda x: (x[0], x[1]))
+
+    for req_id in sorted(request_ids, key=_parse_request_id):
+        local_i  = local_index_by_req[req_id]
+        hooks_map = grouped[req_id]
+        plen     = prompt_len_by_req[req_id]
+        db_tok   = db_token_ids_by_req[req_id]
+        eref     = hf_eager_refs[local_i]
+
+        # Find matching token prefix (compiled vs eager may diverge)
+        min_len = min(int(db_tok.numel()), int(eref.token_ids.numel()))
+        match_len = 0
+        for t in range(min_len):
+            if db_tok[t] != eref.token_ids[t]:
+                break
+            match_len = t + 1
+
+        with subtests.test(msg=f"{req_id}/cg_vs_eager/token_prefix"):
+            assert match_len >= plen, (
+                f"compiled/eager diverge within prompt (match_len={match_len} plen={plen})"
+            )
+            print(f"  {req_id}: token match_len={match_len} / db={db_tok.numel()} eager={eref.token_ids.numel()}")
+
+        if match_len <= 0 or not eref.hidden_states:
+            continue
+
+        # Compare hidden states over matching prefix
+        for layer_no in range(num_layers):
+            key = next(((layer_no, k) for k in _RESID_PRE_KEYS if (layer_no, k) in hooks_map), None)
+            if key is not None and layer_no < len(eref.hidden_states):
+                hs_eager = eref.hidden_states[layer_no][:match_len, :]
+                chunks = _sort_chunks(hooks_map[key])
+                db_t = merge_segments([t for _, _, t in chunks], key[1])[:match_len, :]
+                with subtests.test(msg=f"{req_id}/cg_vs_eager/layer{layer_no}/resid_pre"):
+                    assert db_t.shape == hs_eager.shape, (
+                        f"shape mismatch db={db_t.shape} eager={hs_eager.shape}"
+                    )
+                    diff = (db_t.float() - hs_eager.float()).abs()
+                    max_abs = float(diff.max().item())
+                    assert max_abs <= _EAGER_ATOL, (
+                        f"resid_pre layer={layer_no} max_abs_diff={max_abs:.6f} > atol={_EAGER_ATOL}"
+                    )
+
+            key = next(((layer_no, k) for k in _RESID_POST_KEYS if (layer_no, k) in hooks_map), None)
+            # hidden_states has n_layers+1 entries: [embed, layer0, ..., layer_{n-1}, final_ln]
+            # resid_post for layer L maps to hidden_states[L+1], but the last entry is
+            # post-final-LN (not a layer resid_post), so skip the last layer.
+            if key is not None and (layer_no + 1) < num_layers:
+                hs_eager = eref.hidden_states[layer_no + 1][:match_len, :]
+                chunks = _sort_chunks(hooks_map[key])
+                db_t = merge_segments([t for _, _, t in chunks], key[1])[:match_len, :]
+                with subtests.test(msg=f"{req_id}/cg_vs_eager/layer{layer_no}/resid_post"):
+                    assert db_t.shape == hs_eager.shape, (
+                        f"shape mismatch db={db_t.shape} eager={hs_eager.shape}"
+                    )
+                    diff = (db_t.float() - hs_eager.float()).abs()
+                    max_abs = float(diff.max().item())
+                    assert max_abs <= _EAGER_ATOL, (
+                        f"resid_post layer={layer_no} max_abs_diff={max_abs:.6f} > atol={_EAGER_ATOL}"
+                    )

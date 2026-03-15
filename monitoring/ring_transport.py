@@ -179,21 +179,36 @@ except Exception:
 # kv_dim computation — cache-type-aware, called before each forward
 # ---------------------------------------------------------------------------
 
-def _get_kv_dim(past_key_values: Any, q_len: int) -> int:
-    """Return the key-sequence dimension for shape computation.
+def _get_kv_dim(past_key_values: Any, q_len: int, is_static: bool = False) -> int:
+    """Return the PHYSICAL key-sequence dimension for shape computation.
 
-    - None (prefill, no cache):  kv_dim = q_len
-    - StaticCache:               kv_dim = max_seq_len (full pre-allocated buffer)
-    - DynamicCache or other:     kv_dim = existing_len + q_len
+    Returns the actual kv_dim that the attention kernel sees, not the logical
+    sequence length.  This matters for static/sliding/hybrid caches where
+    kv_dim = max_cache_len (fixed pre-allocated buffer), not the current
+    token position.
+
+    ASSUMPTION: hooked attention tensors (attn_scores, pattern) have shape
+    [batch, heads, q_len, kv_dim] where kv_dim equals the physical cache
+    dimension.  This is deterministic given the same input size and cache
+    config — required for correct FIFO metadata matching.
+
+    Args:
+        past_key_values: cache object (StaticCache, DynamicCache, or None)
+        q_len: query sequence length for this forward step
+        is_static: True if cache has fixed physical size (StaticCache,
+            SlidingWindowCache, HybridCache).  Caller detects via
+            hasattr(past_key_values, 'max_cache_len').
     """
     if past_key_values is None:
         return q_len
-    try:
-        from transformers.cache_utils import StaticCache
-        if isinstance(past_key_values, StaticCache):
-            return past_key_values.key_cache[0].shape[-2]
-    except Exception:
-        pass
+    if is_static:
+        # Static/sliding/hybrid cache: kv_dim = physical cache size.
+        # The attention kernel always sees the full buffer (masked).
+        try:
+            return int(past_key_values.max_cache_len)
+        except Exception:
+            pass
+    # Dynamic cache: kv_dim = logical length after this step
     try:
         return past_key_values.get_seq_length() + q_len
     except Exception:
@@ -210,8 +225,18 @@ def _compute_hook_shape(
     batch: int,
     q_len: int,
     kv_dim: int,
+    logits_to_keep: int = 0,
 ) -> List[int]:
-    """Return expected tensor shape for a given hook type and step dimensions."""
+    """Return expected tensor shape for a given hook type and step dimensions.
+
+    ASSUMPTION: hooked tensors have deterministic shapes given the same
+    (batch, q_len, kv_dim, logits_to_keep) and model config.  This is
+    guaranteed by the model architecture.
+
+    Args:
+        logits_to_keep: HF generate() default is 1 (only last token logits).
+            0 means keep all (q_len).
+    """
     if hook_type in _HIDDEN_DIM_TYPES:
         return [batch, q_len, cfg.hidden_dim]
     if hook_type == HOOK_TYPE_Q:
@@ -225,7 +250,11 @@ def _compute_hook_shape(
     if hook_type == HOOK_TYPE_TOKEN_IDS:
         return [batch, q_len]
     if hook_type == HOOK_TYPE_FINAL_LOGITS:
-        return [batch, q_len, cfg.vocab_size] if cfg.vocab_size > 0 else []
+        # HF generate() sets logits_to_keep=1 by default (only last token
+        # needed for next-token prediction).  The actual tensor shape is
+        # [batch, 1, vocab], not [batch, q_len, vocab].
+        logits_q = min(q_len, logits_to_keep) if logits_to_keep > 0 else q_len
+        return [batch, logits_q, cfg.vocab_size] if cfg.vocab_size > 0 else []
     return []  # unknown type — push_meta skipped
 
 
@@ -322,7 +351,8 @@ class RingTransport:
         """Set the model shape config for analytical shape computation."""
         self._model_cfg = cfg
 
-    def pre_push_all_metas(self, batch: int, q_len: int, kv_dim: int) -> None:
+    def pre_push_all_metas(self, batch: int, q_len: int, kv_dim: int,
+                           logits_to_keep: int = 0) -> None:
         """Push C++ FIFO metadata for all active specs before orig_forward.
 
         Called in the same order as install_ring_hooks() so FIFO pop order
@@ -340,7 +370,8 @@ class RingTransport:
 
         for spec in self._active_specs:
             shape = _compute_hook_shape(
-                spec.hook_type, self._model_cfg, batch, q_len, kv_dim
+                spec.hook_type, self._model_cfg, batch, q_len, kv_dim,
+                logits_to_keep=logits_to_keep,
             )
             if not shape:
                 continue

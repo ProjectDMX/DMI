@@ -206,7 +206,10 @@ def _install_prepare_wrapper(model: Any) -> None:
                 try:
                     batch  = int(input_ids_val.shape[0])
                     q_len  = int(input_ids_val.shape[1])
-                    kv_dim = ring_transport._get_kv_dim(past_key_values, q_len)
+                    is_static = past_key_values is not None and hasattr(past_key_values, 'max_cache_len')
+                    kv_dim = ring_transport._get_kv_dim(past_key_values, q_len, is_static=is_static)
+                    # HF generate() sets logits_to_keep=1 by default
+                    logits_to_keep = int(model_inputs.get("logits_to_keep", 0)) if isinstance(model_inputs, dict) else 0
 
                     # Compute per-hook tensor byte sizes for condition granting
                     import torch
@@ -215,7 +218,8 @@ def _install_prepare_wrapper(model: Any) -> None:
                     if model_cfg is not None:
                         for spec in transport._active_specs:
                             shape = ring_transport._compute_hook_shape(
-                                spec.hook_type, model_cfg, batch, q_len, kv_dim)
+                                spec.hook_type, model_cfg, batch, q_len, kv_dim,
+                                logits_to_keep=logits_to_keep)
                             if shape:
                                 dtype = spec.dtype if spec.dtype is not None else model_cfg.dtype
                                 elem_size = torch._utils._element_size(dtype)
@@ -234,7 +238,8 @@ def _install_prepare_wrapper(model: Any) -> None:
                             hook_byte_sizes, stream_handle)
 
                     # Push FIFO metadata for p2p thread
-                    transport.pre_push_all_metas(batch, q_len, kv_dim)
+                    transport.pre_push_all_metas(batch, q_len, kv_dim,
+                                                logits_to_keep=logits_to_keep)
                 except Exception:
                     pass
 
