@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "ring/tensor_meta.h"   // TensorMeta, TensorMetaFifo
 
@@ -22,20 +23,9 @@ namespace ring_py {
 struct RingConfig {
     uint32_t task_ring_entries          = 1024;
     uint64_t payload_ring_bytes         = 256ULL * 1024 * 1024;
-    uint64_t chunk_bytes                = 64ULL * 1024 * 1024;
-    // Pinned staging ring size. 0 = default to payload_ring_bytes.
     uint64_t pinned_staging_bytes       = 0;
-    // 0 = INFINITE (spin, backpressure), 1 = TIMEOUT_DROP
-    int      wait_policy                = 0;
-    uint64_t no_progress_timeout_cycles = 1'000'000'000ULL;
-    // 0 = COUNTER_ONLY, 1 = DROP_TASK (emit a drop entry to the callback)
-    int      drop_reporting             = 1;
-    // Drain thread poll timeout in µs (0 = no timeout, infinite wait).
-    uint64_t drain_poll_timeout_us      = 0;
-    // Whether to call notify_drain() before each forward pass from Python.
-    bool     drain_notify_on_forward    = true;
-    // Drain flush thresholds (see DrainFlushConfig in ring_config.h).
-    // All 0 = flush only at 100% capacity or stop().
+    uint64_t drain_poll_timeout_us      = 100;
+    // Drain flush thresholds
     float    drain_flush_task_ratio     = 0.0f;
     float    drain_flush_payload_ratio  = 0.0f;
     uint64_t drain_flush_entry_threshold = 0;
@@ -43,15 +33,14 @@ struct RingConfig {
     uint64_t drain_flush_timeout_us      = 0;
     // Bypass budget for large tensors (bytes).
     uint64_t bypass_budget_bytes        = 256ULL * 1024 * 1024;
-    // Clone per-request slices (see plan.md CPU Memory Budget section).
+    // Clone per-request slices
     bool     clone_slices               = false;
-    // ClickHouse insert queue limits (host engine).
+    // ClickHouse insert queue limits
     uint64_t insert_queue_max_bytes     = 512ULL * 1024 * 1024;
     uint64_t insert_queue_max_items     = 4096;
 };
 
 // Called by the p2p thread for each per-request tensor slice.
-// Runs without the GIL — all arguments are C++ types.
 using SubmitFn = std::function<void(
     const std::string& model_id,
     int32_t            shard_rank,
@@ -62,49 +51,39 @@ using SubmitFn = std::function<void(
     int32_t            end_token,
     at::Tensor         slice)>;
 
-// Opaque RAII engine.  All CUDA/ATen details hidden behind the pimpl.
+// Opaque RAII engine.
 class RingEnginePy {
 public:
-    // submit_fn: called for each per-request slice after assembly.
-    //   Pass an empty SubmitFn{} for null/benchmark mode (no DB writes).
     explicit RingEnginePy(RingConfig cfg, SubmitFn submit_fn);
     ~RingEnginePy();
 
     RingEnginePy(const RingEnginePy&)            = delete;
     RingEnginePy& operator=(const RingEnginePy&) = delete;
 
-    // Initialise GPU buffers.  Call once before start().
-    // stream_handle: raw cudaStream_t cast to uint64_t (0 = default stream).
     void init(uint64_t stream_handle = 0);
-
     void start();
-    void stop();   // blocks until drain + p2p threads have flushed and exited
+    void stop();
 
-    // Enable/disable null mode.  When enabled, producer_kernel launches with
-    // the same parameters but returns immediately (no ring writes, no FIFO
-    // consumption).  Call this outside any CUDA graph capture region.
+    // Allocate condition tensor after hook count is known.
+    void init_hooks(uint32_t num_hooks);
+
+    // Prepare forward: compute condition grants, enqueue H2D on main stream.
+    // Runs on Python thread (GIL released).  Non-blocking, no sync.
+    void prepare_forward(const std::vector<uint64_t>& hook_tensor_bytes,
+                         uint64_t stream_handle);
+
+    // Enable/disable null mode (same kernel launch, no ring writes).
     void set_null_mode(bool enabled);
-
-    // Flush barrier: block until all ring data enqueued on `stream_handle`
-    // has been fully drained and all p2p processing has completed.
-    void flush(uint64_t stream_handle = 0);
 
     // Push metadata for the next tensor about to be hooked.
     void push_meta(TensorMeta meta);
-
-    // Undo the last push_meta (called if hook() throws after push_meta).
     void pop_last_meta();
 
-    // Launch the producer kernel + hostfunc for one tensor.
-    void hook(uint64_t d_ptr, uint64_t nbytes,
-              uint64_t logical_task_id,
-              uint32_t hook_type, uint32_t hook_id,
-              uint64_t stream_handle);
-
-    // Launch producer kernel WITHOUT the hostfunc notification.
+    // Launch producer kernel with condition tensor gating.
+    // Inserts cudaStreamWaitValue32 before kernel, and for large tensors
+    // also inserts post-kernel wait for condition == 0 (ack).
     void hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
-                        uint64_t logical_task_id,
-                        uint32_t hook_type, uint32_t hook_id,
+                        uint32_t hook_type,
                         uint64_t stream_handle);
 
     // Lightweight wake-up for the drain thread.

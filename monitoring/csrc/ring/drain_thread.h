@@ -1,12 +1,18 @@
-// ring/drain_thread.h — Batch drain thread: scans GPU task ring, issues batch
-// D2H copies into a pinned staging ring, pushes DrainTasks to a locked queue
-// for the p2p thread.
+// ring/drain_thread.h — Batch drain thread with condition tensor management.
 //
-// Lifecycle:
-//   DrainThread dt(ring_state, staging, cfg);
-//   dt.start();
-//   // ... GPU producer kernels run ...
-//   dt.stop();   // final flush
+// Concurrency model: Optimistic Concurrency Control (OCC).
+//   1. prepare_forward (Python thread): grants based on committed tail
+//      (conservative), enqueues H2D on main stream — no sync, no blocking.
+//   2. Forward runs (GPU): producers write to ring, kernels reset conditions.
+//   3. Drain re-checks forward_start_seq_ after D2H sync — validation phase.
+//   4. Re-grant if prepare_forward leaked in — compensation (monotonic, safe).
+//
+// mgmt_mu_ protects all shared management state.  prepare_forward and the
+// drain loop both acquire it for state updates.  Stream ops (D2H, H2D)
+// happen outside the lock.
+//
+// GIL note: prepare_forward is called with GIL released
+// (py::call_guard<py::gil_scoped_release> in bindings).
 
 #pragma once
 #include "ring_state.h"
@@ -36,32 +42,23 @@ public:
     void start();
     void stop();
 
-    // Wake the drain thread (non-blocking).
+    void set_condition(uint32_t* d_cond, uint32_t* h_cond, uint32_t num_hooks);
+
+    // Runs on Python thread (GIL released).  Computes conditions under
+    // mgmt_mu_, enqueues H2D on main_stream.  Non-blocking, no sync.
+    void prepare_forward(const std::vector<uint64_t>& hook_tensor_bytes,
+                         cudaStream_t main_stream);
+
     void notify();
 
-    // Static shim for cudaLaunchHostFunc / cudaHostFn_t.
-    static void CUDART_CB hostfunc_cb(void* arg);
-
-    // --- Task queue interface (drain → p2p) ---
-
-    // Wait until can_pop_count > 0 or p2p_stop_requested. Returns number of
-    // tasks to pop.  Sets can_pop_count_ to 0 under lock.
+    // Task queue interface (drain → p2p)
     uint64_t wait_for_tasks();
-
-    // Pop exactly n tasks from the front of the queue into `out`.
     void pop_tasks(uint64_t n, std::vector<DrainTask>& out);
-
-    // Signal the p2p thread to exit (called after drain thread has joined,
-    // guaranteeing no more tasks will be pushed).
     void signal_p2p_stop();
 
-    // Release staging bytes and notify drain thread that staging space has been freed.
     void notify_staging_freed_bytes(uint64_t nbytes);
-
-    // Notify drain thread that bypass budget has been freed.
     void notify_bypass_freed();
 
-    // --- Bypass backpressure interface ---
     std::mutex&              bypass_mu()  { return bypass_mu_; }
     std::condition_variable& bypass_cv()  { return bypass_cv_; }
     uint64_t& in_flight_bypass_bytes()    { return in_flight_bypass_bytes_; }
@@ -80,54 +77,76 @@ private:
     std::atomic<bool>       running_{false};
     bool                    notified_{false};
 
-    // Scan progress (CPU-local to drain thread)
+    // ---- mgmt_mu_ protects all state below this line ----
+    std::mutex              mgmt_mu_;
+
+    uint32_t*               d_condition_{nullptr};
+    uint32_t*               h_condition_{nullptr};
+    uint32_t                num_hooks_{0};
+
+    std::vector<uint64_t>   hook_tensor_bytes_;
+
     uint64_t                visible_head_{0};
     uint64_t                pending_entries_{0};
     uint64_t                pending_bytes_{0};
     std::deque<TaskEntry>   scanned_;
-    int64_t                 last_complete_idx_{-1};
 
-    // Incremental flush-size tracking (avoids re-summing on every should_flush)
-    uint64_t                scan_bytes_accum_{0};   // running sum of alloc_bytes for all scanned entries
-    uint64_t                flushable_bytes_{0};    // sum of alloc_bytes for entries [0..last_complete_idx_]
-    uint64_t                flushable_entries_{0};  // last_complete_idx_ + 1
+    uint64_t                cpu_task_head_{0};
+    uint64_t                cpu_payload_head_{0};
+    uint64_t                cpu_task_tail_{0};
+    uint64_t                cpu_payload_tail_{0};           // pending
+    uint64_t                cpu_payload_tail_committed_{0}; // safe after D2H
 
-    // Capped flush tracking: largest prefix of complete tensors that fits in staging
-    uint64_t                capped_flush_bytes_{0};
-    uint64_t                capped_flush_entries_{0};
+    uint64_t                forward_start_seq_{0};
+    uint64_t                old_pending_{0};
 
-    // Timestamp of when the first complete tensor became pending (for timeout flush)
+    uint64_t                granted_count_{0};
+    uint64_t                blocked_count_{0};
+    uint64_t                scanned_complete_{0};
+    uint32_t                next_ungrant_idx_{0};
+    uint32_t                drain_hook_idx_{0};
+
+    uint32_t                dirty_lo_{0};
+    uint32_t                dirty_hi_{0};
+    bool                    dirty_{false};
+
     std::chrono::steady_clock::time_point first_complete_time_{};
     bool                    has_complete_time_{false};
+    // ---- end mgmt_mu_ protected state ----
 
-    // Local mirrors of managed-memory counters
-    uint64_t                payload_tail_local_{0};
-    uint64_t                task_tail_local_{0};
-    uint64_t                heartbeat_local_{0};
-
-    // Task queue (drain → p2p)
     std::deque<DrainTask>   task_queue_;
     std::mutex              queue_mu_;
     uint64_t                can_pop_count_{0};
     std::mutex              pop_mu_;
     std::condition_variable pop_cv_;
     bool                    p2p_stop_requested_{false};
-    uint64_t                pending_incomplete_cnt_{0};
 
-    // Staging backpressure
     std::mutex              staging_mu_;
     std::condition_variable staging_cv_;
 
-    // Bypass backpressure
     uint64_t                in_flight_bypass_bytes_{0};
     std::mutex              bypass_mu_;
     std::condition_variable bypass_cv_;
 
     void loop();
+
+    // Called under mgmt_mu_:
     void scan_ready();
     bool should_flush() const;
-    void batch_flush();
+    void flush_state_update(uint64_t flush_count, uint64_t flush_bytes);
+    void grant_next_hooks();
     void handle_large_tensor();
+
+    void mark_dirty(uint32_t idx);
+    void enqueue_conditions_h2d();  // on drain stream_
+    void sync_stream();
+    void enqueue_d2h(uint64_t flush_bytes);
+
+    // Split into two: submit_to_p2p pushes DrainTasks to the p2p queue
+    // (uses queue_mu_/pop_mu_, NOT mgmt_mu_).  trim_scanned updates
+    // scanned_/pending state (caller MUST hold mgmt_mu_).
+    void submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes);
+    void trim_scanned(uint64_t flush_count, uint64_t flush_bytes);
 };
 
 }  // namespace ring

@@ -75,6 +75,8 @@ def _install_monitoring_forward(model: Any) -> None:
             transport._using_forward_hooks = True
             transport._forward_hook_names  = {s.name for s in active_specs}
             model._ring_hook_handles       = handles
+            # Allocate condition tensor now that hook count is known
+            transport._ring_engine.init_hooks(len(active_specs))
             import os
             if os.environ.get("RING_DEBUG_SPECS"):
                 print(f"[ring] install_ring_hooks: all={len(all_specs)} active={len(active_specs)}"
@@ -186,9 +188,6 @@ def _install_prepare_wrapper(model: Any) -> None:
                 and getattr(engine, "_using_ring_transport", False)
                 and transport is not None
                 and transport._using_forward_hooks):
-            # Wake drain thread for the previous step's data.
-            if transport.drain_notify_on_forward:
-                transport._ring_engine.notify_drain()
 
             if isinstance(model_inputs, dict):
                 input_ids_val   = model_inputs.get("input_ids")
@@ -208,6 +207,33 @@ def _install_prepare_wrapper(model: Any) -> None:
                     batch  = int(input_ids_val.shape[0])
                     q_len  = int(input_ids_val.shape[1])
                     kv_dim = ring_transport._get_kv_dim(past_key_values, q_len)
+
+                    # Compute per-hook tensor byte sizes for condition granting
+                    import torch
+                    hook_byte_sizes = []
+                    model_cfg = transport._model_cfg
+                    if model_cfg is not None:
+                        for spec in transport._active_specs:
+                            shape = ring_transport._compute_hook_shape(
+                                spec.hook_type, model_cfg, batch, q_len, kv_dim)
+                            if shape:
+                                dtype = spec.dtype if spec.dtype is not None else model_cfg.dtype
+                                elem_size = torch._utils._element_size(dtype)
+                                nbytes = elem_size
+                                for d in shape:
+                                    nbytes *= d
+                                hook_byte_sizes.append(nbytes)
+                            else:
+                                hook_byte_sizes.append(0)
+
+                    # Prepare forward: compute condition grants, enqueue
+                    # H2D on main stream (non-blocking, no sync).
+                    if hook_byte_sizes:
+                        stream_handle = torch.cuda.current_stream().cuda_stream
+                        transport._ring_engine.prepare_forward(
+                            hook_byte_sizes, stream_handle)
+
+                    # Push FIFO metadata for p2p thread
                     transport.pre_push_all_metas(batch, q_len, kv_dim)
                 except Exception:
                     pass

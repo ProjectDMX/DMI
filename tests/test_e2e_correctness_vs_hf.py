@@ -161,10 +161,8 @@ def _make_ring_cfg():
     rc = RingConfig()
     rc.task_ring_entries          = int(os.environ.get("E2E_RING_TASK_ENTRIES", "16384"))
     rc.payload_ring_bytes         = int(os.environ.get("E2E_RING_PAYLOAD_BYTES", str(4 * 1024**3)))
-    rc.chunk_bytes                = int(os.environ.get("E2E_RING_CHUNK_BYTES", str(4 * 1024**2)))
     rc.pinned_staging_bytes       = int(os.environ.get("E2E_RING_PINNED_BYTES", str(4 * 1024**3)))
-    rc.drain_poll_timeout_us      = int(os.environ.get("E2E_DRAIN_POLL_TIMEOUT_US", "0"))
-    rc.drain_notify_on_forward    = int(os.environ.get("E2E_DRAIN_NOTIFY_ON_FORWARD", "1")) != 0
+    rc.drain_poll_timeout_us      = int(os.environ.get("E2E_DRAIN_POLL_TIMEOUT_US", "100"))
     rc.drain_flush_task_ratio     = float(os.environ.get("E2E_DRAIN_FLUSH_TASK_RATIO", "0.0"))
     rc.drain_flush_payload_ratio  = float(os.environ.get("E2E_DRAIN_FLUSH_PAYLOAD_RATIO", "0.0"))
     rc.drain_flush_entry_threshold = int(os.environ.get("E2E_DRAIN_FLUSH_ENTRY_THRESHOLD", "0"))

@@ -208,8 +208,7 @@ class MonitoringEngine:
         ring_engine.init()
         ring_engine.start()
 
-        transport = _rt.RingTransport(ring_engine,
-                                      drain_notify_on_forward=ring_config.drain_notify_on_forward)
+        transport = _rt.RingTransport(ring_engine)
         if model_shape is not None:
             transport.set_model_cfg(model_shape)
         self._ring_engine = ring_engine

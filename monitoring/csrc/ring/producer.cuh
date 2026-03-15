@@ -1,32 +1,23 @@
-// ring/producer.cuh — Multi-thread GPU producer kernel.
+// ring/producer.cuh — GPU producer kernel.
 //
 // producer_kernel uses a single block with PRODUCER_BLOCK_DIM threads.
-// Each chunk is processed in three sequential phases on the same block:
 //
-//   Phase 1 — thread 0 only:
-//     Spin-wait for space (backpressure), compute two-span reservation,
-//     broadcast span descriptors via shared memory.
+// Normal path (large_bypass=false):
+//   Phase 1 — thread 0: compute two-span reservation, broadcast via shmem.
+//   Phase 2 — all threads: grid-stride D2D copy into payload_buf spans.
+//   Phase 3 — thread 0: publish TaskEntry, advance heads,
+//             write d_condition[hook_idx] = 0 (device-side reset).
 //
-//   Phase 2 — all threads cooperate:
-//     Grid-stride D2D copy of chunk data into payload_buf spans.
-//     Every thread calls __threadfence() after its stores so its writes
-//     are globally visible before phase 3.
+// Large bypass path (large_bypass=true):
+//   Thread 0 only: publish TaskEntry with device_src_ptr, advance task_head,
+//   write d_condition[hook_idx] = 1 (kernel done, pending drain ack).
+//   No D2D copy, no payload consumed.
 //
-//   Phase 3 — thread 0 only:
-//     Publish TaskEntry: write metadata fields, __threadfence(), write
-//     ready_seq = seq_no (the signal the consumer spins on).
+// The kernel never spins.  Backpressure is handled by cuStreamWaitValue32
+// on the condition tensor BEFORE the kernel is launched (host side).
+// After the kernel, all conditions are either 0 (normal) or 1 (large).
 //
-// Correctness note on __threadfence():
-//   In CUDA, __threadfence() only makes the CALLING thread's stores visible
-//   system-wide.  For the consumer to see all copy threads' payload writes
-//   before it reads them (after observing ready_seq), EVERY copy thread must
-//   call __threadfence() before __syncthreads() hands control back to thread 0.
-//   Thread 0's __threadfence() inside task_publish is then a second fence that
-//   orders the entry-field writes relative to ready_seq — it does NOT substitute
-//   for the per-thread fences in phase 2.
-//
-// Capture-safe: all device pointers in `ring` must be preallocated before
-// graph capture.  No dynamic allocation, no host callbacks.
+// Capture-safe: all device pointers must be preallocated before graph capture.
 
 #pragma once
 #ifdef __CUDACC__
@@ -36,72 +27,36 @@
 
 namespace ring {
 
-// Number of threads per block.  256 gives good occupancy on Ampere/Ada while
-// keeping register pressure manageable.  Must be a multiple of warp size (32).
 static constexpr uint32_t PRODUCER_BLOCK_DIM = 256;
 
-// ---------------------------------------------------------------------------
-// Shared-memory descriptor broadcast from thread 0 to all copy threads.
-// ---------------------------------------------------------------------------
+// Condition values: see COND_* constants in ring_config.h.
+
 struct alignas(16) ProducerShmem {
-    TwoSpan  spans;         // payload reservation for this chunk
-    uint64_t task_head;     // seq_no / slot index for this entry
-    uint64_t payload_head;  // payload head after this reservation
-    int      dropped;       // 1 if timeout-drop occurred
+    TwoSpan  spans;
+    uint64_t task_head;
+    uint64_t payload_head;
 };
 
-// ---------------------------------------------------------------------------
-// producer_kernel — declaration only; definition in producer.cu.
-// ---------------------------------------------------------------------------
 __global__ void producer_kernel(
     RingState       ring,
     const uint8_t*  src,
     uint64_t        src_bytes,
-    uint64_t        logical_task_id,
-    uint32_t        hook_type,
-    uint32_t        hook_id);
+    uint32_t        hook_type,      // diagnostics only
+    bool            large_bypass,
+    uint32_t*       d_condition,    // condition tensor (device memory)
+    uint32_t        hook_idx);      // index into d_condition
 
-// ---------------------------------------------------------------------------
-// Host-side launchers — defined in producer.cu (not inline) so they are
-// exported as symbols for cross-TU linking.
-// ---------------------------------------------------------------------------
 void launch_producer(
     const RingState& ring,
     const uint8_t*   d_src,
     uint64_t         src_bytes,
-    uint64_t         logical_task_id,
     uint32_t         hook_type,
-    uint32_t         hook_id,
+    bool             large_bypass,
+    uint32_t*        d_condition,
+    uint32_t         hook_idx,
     cudaStream_t     stream = 0);
 
-// Launch producer kernel then enqueue a host callback on the same stream.
-//
-// Graph-capture semantics: the hostfunc becomes a graph node that fires after
-// the producer kernel.  To avoid blocking the forward pass, callers should
-// either:
-//   (a) use a side stream for the producer kernel + hostfunc (with an event
-//       recording the tensor-ready point on the main stream), so the forward
-//       pass continues unblocked; or
-//   (b) accept the ~1 µs callback overhead per hooked tensor on the main
-//       stream (callback just signals a CV and returns immediately).
-//
-// `notify_fn` / `notify_arg` are typically DrainThread::hostfunc_cb / &dt.
-// Set/clear the device-side null mode flag.  When enabled, producer_kernel
-// launches with the same parameters but returns immediately (no ring writes).
-// Must be called outside any CUDA graph capture region.  Blocks until the
-// symbol write is visible to subsequent kernel launches.
 void set_ring_null_mode(bool enabled);
-
-void launch_producer_with_notify(
-    const RingState& ring,
-    const uint8_t*   d_src,
-    uint64_t         src_bytes,
-    uint64_t         logical_task_id,
-    uint32_t         hook_type,
-    uint32_t         hook_id,
-    cudaHostFn_t     notify_fn,
-    void*            notify_arg,
-    cudaStream_t     stream = 0);
 
 }  // namespace ring
 

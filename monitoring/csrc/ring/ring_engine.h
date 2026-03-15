@@ -1,19 +1,4 @@
 // ring/ring_engine.h — Top-level RAII engine combining all ring components.
-//
-// RingEngine owns:
-//   AllocatedRing    — GPU ring buffers (task entries + payload buffer)
-//   PinnedStaging    — pinned host staging ring for batch D2H
-//   DrainThread      — CPU thread: scans GPU entries, batch D2H, pushes to task queue
-//   P2PThread        — CPU thread: pinned→pageable copy, metadata, slicing, submit
-//
-// Typical usage:
-//   RingEngine engine(cfg, fifo, submit_fn);
-//   engine.init();
-//   engine.start();
-//   // In GPU hook / custom op:
-//   launch_producer(engine.ring_state(), d_src, bytes, id,
-//                   hook_type, hook_id, stream);
-//   engine.stop();
 
 #pragma once
 #include "ring_alloc.h"
@@ -23,6 +8,7 @@
 #include "tensor_meta.h"
 
 #include <memory>
+#include <vector>
 
 namespace ring {
 
@@ -39,8 +25,20 @@ public:
     void start();
     void stop();
 
+    // Allocate condition tensor after hook count is known.
+    // Must be called before CUDA graph capture.
+    void init_hooks(uint32_t num_hooks);
+
+    // prepare_forward is called directly on DrainThread from
+    // RingEnginePy::prepare_forward (ring_engine_py.cu).  It runs on the
+    // Python thread, not the drain thread.  No RingEngine wrapper needed.
+
     RingState&   ring_state()    { return ring_.state(); }
     DrainThread& drain_thread()  { return *drain_; }
+
+    uint32_t* d_condition()      { return ring_.d_condition(); }
+    uint32_t  num_hooks() const  { return ring_.num_hooks(); }
+    uint64_t  payload_cap() const { return cfg_.payload_ring_bytes; }
 
 private:
     RingConfig      cfg_;

@@ -342,13 +342,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(py::init<>())
       .def_readwrite("task_ring_entries",         &ring_py::RingConfig::task_ring_entries)
       .def_readwrite("payload_ring_bytes",        &ring_py::RingConfig::payload_ring_bytes)
-      .def_readwrite("chunk_bytes",               &ring_py::RingConfig::chunk_bytes)
       .def_readwrite("pinned_staging_bytes",      &ring_py::RingConfig::pinned_staging_bytes)
-      .def_readwrite("wait_policy",               &ring_py::RingConfig::wait_policy)
-      .def_readwrite("no_progress_timeout_cycles",&ring_py::RingConfig::no_progress_timeout_cycles)
-      .def_readwrite("drop_reporting",            &ring_py::RingConfig::drop_reporting)
       .def_readwrite("drain_poll_timeout_us",     &ring_py::RingConfig::drain_poll_timeout_us)
-      .def_readwrite("drain_notify_on_forward",   &ring_py::RingConfig::drain_notify_on_forward)
       .def_readwrite("drain_flush_task_ratio",     &ring_py::RingConfig::drain_flush_task_ratio)
       .def_readwrite("drain_flush_payload_ratio",  &ring_py::RingConfig::drain_flush_payload_ratio)
       .def_readwrite("drain_flush_entry_threshold", &ring_py::RingConfig::drain_flush_entry_threshold)
@@ -361,8 +356,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
-             // Build a C++ SubmitFn from the DMXHostEngine shared_ptr.
-             // The callback runs from the C++ callback thread without the GIL.
              ring_py::SubmitFn submit_fn;
              if (!host_engine_obj.is_none()) {
                  auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
@@ -392,16 +385,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("start", &ring_py::RingEnginePy::start)
       .def("stop",  &ring_py::RingEnginePy::stop,
            py::call_guard<py::gil_scoped_release>())
-      // Low-level hook: d_ptr and stream_handle are raw CUDA pointers as ints.
-      .def("hook",
-           &ring_py::RingEnginePy::hook,
-           py::arg("d_ptr"), py::arg("nbytes"),
-           py::arg("logical_task_id"),
-           py::arg("hook_type") = uint32_t{0},
-           py::arg("hook_id")   = uint32_t{0},
-           py::arg("stream_handle") = uint64_t{0},
+      .def("init_hooks", &ring_py::RingEnginePy::init_hooks,
+           py::arg("num_hooks"),
            py::call_guard<py::gil_scoped_release>())
-      // Push metadata for the next tensor before calling hook().
+      // GIL held throughout (no py::call_guard<py::gil_scoped_release>):
+      // - Lambda accesses py::list (needs GIL for iteration + dec_ref).
+      // - Single Python thread in inference → holding GIL has zero cost.
+      // - Drain thread is pure C++ (never acquires GIL) → no deadlock.
+      .def("prepare_forward",
+           [](ring_py::RingEnginePy& self, py::list sizes_py, uint64_t stream) {
+               std::vector<uint64_t> sizes;
+               sizes.reserve(py::len(sizes_py));
+               for (auto h : sizes_py)
+                   sizes.push_back(py::cast<uint64_t>(h));
+               self.prepare_forward(sizes, stream);
+           },
+           py::arg("hook_tensor_bytes"),
+           py::arg("stream_handle") = uint64_t{0})
       .def("push_meta",
            [](ring_py::RingEnginePy& self,
               const std::string& hook_name,
@@ -433,22 +433,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("shape"), py::arg("dtype"))
       .def("pop_last_meta", &ring_py::RingEnginePy::pop_last_meta,
            py::call_guard<py::gil_scoped_release>())
-      // Flush barrier: block until all ring data on `stream_handle` has been
-      // fully drained and all on_tensor callbacks have returned.
-      // Does NOT stop or restart the engine.
-      .def("flush",
-           &ring_py::RingEnginePy::flush,
-           py::arg("stream_handle") = uint64_t{0},
-           py::call_guard<py::gil_scoped_release>())
-      // Enable/disable null mode: same kernel launch, no ring writes.
-      // Call outside CUDA graph capture; use for warmup so graph topology
-      // matches real capture runs.
       .def("set_null_mode",
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),
            py::call_guard<py::gil_scoped_release>())
-      // Lightweight wake-up for the drain thread (non-blocking).
-      // Call after each forward pass when using hook_no_notify() (CUDA graph path).
       .def("notify_drain",
            &ring_py::RingEnginePy::notify_drain,
            py::call_guard<py::gil_scoped_release>());

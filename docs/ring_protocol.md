@@ -1,188 +1,130 @@
 # Ring Offload Protocol
 
-Publish/consume protocol, strict vs timeout-drop semantics, and chunking + reassembly contract for the CUDA-graph-safe LLM internal-state offload system.
+Condition-tensor-gated, deadlock-free publish/consume protocol for
+the CUDA-graph-safe LLM internal-state offload system.  One tensor =
+one task entry (no chunking).
 
 ---
 
 ## Overview
 
-The offload pipeline uses two preallocated GPU rings to move LLM internal tensors from device to host without host synchronisation inside a CUDA graph:
+The offload pipeline uses two preallocated GPU rings plus a condition
+tensor to move LLM internal tensors from device to host:
 
-| Ring | Role |
+| Component | Role |
 |------|------|
-| **Task ring** (control ring) | Fixed-size FIFO of `TaskEntry` structs; carries metadata and payload descriptors |
-| **Payload ring** (byte ring) | Circular byte buffer; holds the raw tensor bytes |
+| **Task ring** (control ring) | Fixed-size FIFO of `TaskEntry` structs (64B each); carries metadata and payload descriptors |
+| **Payload ring** (byte ring) | Circular byte buffer; holds the raw tensor bytes (D2D from model tensors) |
+| **Condition tensor** | `uint32[]` on GPU; gates producer kernels via `cuStreamWaitValue32` |
 
-Both rings are preallocated before graph capture and remain at fixed device addresses throughout.
+All are preallocated before graph capture and remain at fixed device addresses.
+
+**Requires `CUDA_MODULE_LOADING=EAGER`** (set before process start).
+`cuStreamWaitValue32` deadlocks with CUDA 12.2+ lazy module loading.
 
 ---
 
 ## Data Structures
 
-### TaskEntry (128 bytes, 128-byte aligned)
+### TaskEntry (64 bytes, 64-byte aligned)
+
+One CPU cache line.  Managed memory preferred on CPU (drain thread polls
+via fast local DRAM read; GPU writes via PCIe posted writes).
 
 ```
 offset  0  ready_seq           uint64  sequence guard (SENTINEL until published)
-offset  8  seq_no              uint64  monotonic slot index at publish time
-offset 16  logical_task_id     uint64  packed {hook_id, chunk_seq, tensor_idx}
-offset 24  chunk_offset_bytes  uint64  byte offset of this chunk in the logical tensor
-offset 32  tensor_total_bytes  uint64  total logical tensor bytes (valid on IS_FIRST)
-offset 40  payload_off1        uint64  first payload span offset in payload_buf
-offset 48  payload_len1        uint64  first payload span length
-offset 56  payload_off2        uint64  second payload span offset (0 if single span)
-offset 64  payload_len2        uint64  second payload span length (0 if single span)
-offset 72  chunk_idx           uint32  chunk index within logical task
-offset 76  hook_type           uint32  hook classification
-offset 80  hook_id             uint32  hook identifier
-offset 84  flags               uint32  TASK_FLAG_IS_FIRST | IS_LAST | IS_DROP
-offset 88  reason              uint32  DROP_REASON_* (drop entries only)
-offset 92  _pad0               uint32
-offset  96 payload_alloc_bytes        uint64  aligned allocation size (>= len1+len2, for payload_tail release)
-offset 104 tensor_total_padded_bytes  uint64  total padded bytes across all chunks (valid on IS_FIRST)
-                                               = (N-1)*chunk_bytes + align_up(last_chunk, 16)
-                                               where N = ceil(tensor_total_bytes / chunk_bytes)
-                                               Used by drain thread for large-tensor bypass decision.
-offset 112 _padding[16]               uint8   explicit padding to 128 bytes
+offset  8  tensor_total_bytes  uint64  raw tensor bytes
+offset 16  payload_off1        uint64  first payload span offset in payload_buf
+offset 24  payload_len1        uint64  first payload span length
+offset 32  payload_off2        uint64  second payload span offset (0 if single span)
+offset 40  payload_len2        uint64  second payload span length (0 if single span)
+offset 48  device_src_ptr      ptr     large tensor bypass: device source pointer (null for normal)
+offset 56  _padding[8]         uint8   padding to 64 bytes
 ```
+
+Large tensor bypass: `device_src_ptr != nullptr`.  Drain D2H's directly
+from this pointer.  Padded allocation size derived: `align_up(tensor_total_bytes, 16)`.
+
+### Condition Tensor Values
+
+| Value | Name | Written by | Meaning |
+|---|---|---|---|
+| 0 | `COND_RESET` | kernel (normal) | Done, ready for next forward |
+| 1 | `COND_PENDING` | kernel (large bypass) | Kernel done, drain must D2H + ack to 0 |
+| 3 | `COND_GRANT_TASK_ONLY` | drain / prepare_forward | Large tensor: task slot available |
+| 4 | `COND_GRANT_FULL` | drain / prepare_forward | Normal tensor: task slot + ring space |
 
 ### PayloadRingState (logical view)
 
 ```
 payload_buf[payload_ring_bytes]  — circular byte buffer in device memory
-payload_head                     — uint64, producer's next write position (unwrapped)
-payload_tail                     — uint64, consumer's oldest live byte (unwrapped)
+payload_head                     — uint64, managed memory (GPU-preferred), producer writes
+payload_tail                     — CPU-only shadow (cpu_payload_tail_), NOT in GPU memory
 ```
 
 Free bytes = `payload_ring_bytes - (payload_head - payload_tail)`.
-
 Physical offset = `logical_position % payload_ring_bytes`.
 
-### Consumer Progress Signal
-
-```
-consumer_heartbeat / last_released_seq  — uint64 in device memory
-```
-
-Updated by the consumer whenever `task_tail` advances.  The producer reads this to detect liveness in TIMEOUT_DROP mode.
+Tail pointers are CPU-only shadows in the drain thread.  The producer
+kernel never reads tail — it is gated by the condition tensor instead.
 
 ---
 
-## Publish Protocol (producer → consumer)
+## Publish Protocol (producer kernel)
 
-The producer is a CUDA custom op inserted as a post-op node in the model graph.
+The producer kernel never spins.  Backpressure is handled by
+`cuStreamWaitValue32` on the condition tensor BEFORE the kernel is
+launched (host side, in `hook_no_notify`).
 
-### For each chunk of a logical task:
+### Normal path (tensor fits in ring):
 
-1. **Check space** — spin (or drop) until:
-   - `task_free_slots(head, tail, cap) >= 1`
-   - `payload_free_bytes(phead, ptail, pcap) >= chunk_bytes`
+1. **Host: cuStreamWaitValue32** — `wait(d_condition[hook_idx] >= 4)`
+2. **Kernel: compute payload spans** — `payload_compute_spans(phead, pcap, alloc_bytes)`
+3. **Kernel: D2D copy** — vectorized `uint4` copy into `payload_buf` spans
+4. **Kernel: publish TaskEntry** — `__threadfence()` then `ready_seq = seq_no`
+5. **Kernel: advance heads** — `task_head++`, `payload_head += alloc_bytes`
+6. **Kernel: reset condition** — `d_condition[hook_idx] = COND_RESET (0)`
 
-2. **Compute payload spans** — call `payload_compute_spans(phead, pcap, chunk_bytes)` to get a `TwoSpan {off1, len1, off2, len2}`.  If `len2 == 0` the reservation is contiguous; otherwise it wraps.
+### Large bypass path (tensor exceeds ring):
 
-3. **Copy data** — issue `cudaMemcpyAsync` (D2D) into `payload_buf[off1..off1+len1]` and, if `len2 > 0`, into `payload_buf[0..len2]`.
-
-4. **Advance payload_head** — `payload_head += align_up(chunk_bytes, 16)`.  All allocations are rounded up to 16-byte alignment so that D2D copies can use vectorized `uint4` loads/stores.  The aligned size is stored in `TaskEntry::payload_alloc_bytes`.
-
-   **Alignment guarantee for uint4 (16-byte) loads/stores:**  Both the source and destination virtual addresses must be 16-byte aligned.
-
-   - **Destination (`payload_buf + offset`)**: `payload_buf` is allocated via `cudaMalloc`, which is *"guaranteed to be aligned to at least 256 bytes"* ([CUDA C++ Best Practices Guide §10.2.1.2](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/)).  `payload_head` starts at 0 and is only ever advanced by `align_up(chunk_bytes, 16)`, so every offset is a multiple of 16.  This requires `payload_ring_bytes` (the capacity) to also be a multiple of 16, so that wrap offsets (`offset % payload_ring_bytes`) preserve alignment.
-
-   - **Source (`src + chunk_off`)**: PyTorch tensor data comes from the CUDA caching allocator, which sub-allocates from `cudaMalloc` blocks at 512-byte aligned boundaries.  `chunk_off = chunk_idx * chunk_bytes`, so this is 16-byte aligned **only if `chunk_bytes` is a multiple of 16**.  This is a configuration requirement: `RingConfig::chunk_bytes` must be a multiple of 16.
-
-5. **Fill TaskEntry fields** — write `seq_no`, `logical_task_id`, spans, flags, etc.
-
-6. **Publish** — `__threadfence()` then write `ready_seq = seq_no`.
-
-7. **Advance task_head** — `task_head++`.
-
-### DROP marker (TIMEOUT_DROP mode):
-
-- Producer does NOT advance `task_head` or `payload_head` until space is confirmed.
-- On timeout, publish a `TaskEntry` with `TASK_FLAG_IS_DROP` set and `payload_len1 = payload_len2 = 0`.
-- No payload space is reserved; head pointers are not rolled back (rollback-free by design).
+1. **Host: cuStreamWaitValue32** — `wait(d_condition[hook_idx] >= 3)`
+2. **Kernel: set condition** — `d_condition[hook_idx] = COND_PENDING (1)` **BEFORE task_publish** (race prevention: drain must see PENDING before the entry)
+3. **Kernel: publish TaskEntry** — `device_src_ptr = src`, no D2D, no payload
+4. **Kernel: advance task_head** — `task_head++` (no payload_head advance)
+5. **Host: cuStreamWaitValue32** — `wait(d_condition[hook_idx] == 0)` (drain ack)
 
 ---
 
-## Consume Protocol (consumer → host)
+## Consume Protocol (drain thread)
 
-The drain loop runs outside the CUDA graph on a dedicated stream or host thread.
+The drain thread runs outside the CUDA graph.  Uses `mgmt_mu_` lock for
+state management.  Stream ops (D2H, H2D) happen outside the lock.
 
-### For each slot:
+### prepare_forward (Python thread, before each forward):
 
-1. **Spin-wait** — loop reading `volatile entries[tail % cap].ready_seq` until it equals `tail`.
+1. **Lock mgmt_mu_** — reclassify old entries, reset per-forward state
+2. **Compute conditions** — grant hooks based on available resources (committed payload tail)
+3. **Enqueue H2D** — condition delta `[0, N)` on main stream (no sync)
+4. **Unlock** — return, forward starts
 
-2. **Acquire fence** — `__threadfence()` to ensure entry data fields are visible.
+### Drain loop (scan + flush):
 
-3. **Read entry** — copy relevant fields (`logical_task_id`, spans, flags, etc.) to local registers.
+1. **Lock mgmt_mu_** — `scan_ready()` polls task_entries (CPU DRAM read), classify old/current
+2. **should_flush()** — forced flush when `scanned_complete_ == granted_count_ && blocked_count_ > 0`
+3. **flush_state_update** — release task slots, advance tails, `grant_next_hooks()`
+4. **Unlock** — stream ops outside lock
+5. **D2H payload** — `cudaMemcpyAsync(staging ← payload_buf, drain_stream)`
+6. **H2D conditions** — delta only `[N, N+K)` on drain stream (after D2H, ordered)
+7. **Sync** — one `cudaStreamSynchronize` for both
+8. **OCC re-check** — lock, update `committed_tail`, re-grant if `prepare_forward` leaked in
+9. **Push tasks** — `submit_to_p2p()` + `trim_scanned()` (separate to avoid mgmt_mu_ self-deadlock)
 
-4. **Check IS_DROP** — if set, increment drop counter and skip to step 7.
+### Large tensor handling (inline in scan_ready):
 
-5. **D2H transfer** — issue async `cudaMemcpyAsync` from `payload_buf[off1..off1+len1]` (and span 2 if `len2 > 0`) to the pinned staging buffer.
-
-6. **Advance payload_tail** — `payload_tail += payload_alloc_bytes` (after D2H is launched; D2H may still be in-flight).  `payload_alloc_bytes` is the aligned allocation size (≥ `len1 + len2`) to keep payload offsets aligned for vectorized D2D copies.
-
-7. **Release slot** — write `ready_seq = READY_SEQ_SENTINEL`, then `__threadfence()`.
-
-8. **Advance task_tail** — `task_tail++`.
-
-9. **Update heartbeat** — write `consumer_heartbeat = task_tail` (producer reads this).
-
----
-
-## Backpressure Modes
-
-### Strict (INFINITE) — default
-
-Producer spins in a device-side loop until both:
-- At least one task slot is free: `task_free_slots(...) >= 1`
-- At least `chunk_bytes` payload bytes are free: `payload_free_bytes(...) >= chunk_bytes`
-
-**No timeout, no drop.**  Safe for steady-state operation when the consumer is alive and draining faster than the producer fills.
-
-### Timeout-drop (TIMEOUT_DROP)
-
-Producer reads `consumer_heartbeat` at the start of each backpressure loop iteration.  If the value has not changed for `no_progress_timeout_cycles` GPU cycles (measured with `clock64()`), the logical task is abandoned:
-
-1. Do NOT advance `task_head` or `payload_head` (rollback-free: nothing was committed).
-2. If `drop_reporting == DROP_TASK`: publish a DROP marker entry (one task slot, zero payload).
-3. Increment `dropped_timeout_count`.
-4. Return without writing the tensor.
-
-**Key invariant**: the producer never leaves partially-written spans in the ring.  Either the full chunk is committed and published, or nothing is committed.
-
----
-
-## Task Splitting and Chunking
-
-Task splitting is enabled by default.  One logical tensor → N `TaskEntry` chunks.
-
-### Chunk sizing
-
-`chunk_bytes` (default 64 MiB) caps each chunk.  This ensures the producer never needs more than `chunk_bytes` of payload space at once — even if `tensor_total_bytes >> payload_ring_bytes`.
-
-### Multi-chunk sequencing
-
-For a logical tensor of total size T split into N chunks:
-- Chunk 0: `IS_FIRST`, `chunk_offset_bytes = 0`, `tensor_total_bytes = T`
-- Chunks 1…N-2: neither IS_FIRST nor IS_LAST
-- Chunk N-1: `IS_LAST`, `chunk_offset_bytes = (N-1) * chunk_bytes`
-
-`logical_task_id` is the same across all chunks.  `chunk_idx` is the 0-based chunk number.
-
-### Giant tensor streaming (tensor_total_bytes > payload_ring_bytes)
-
-The producer emits chunk 0, then waits (in strict mode) for the consumer to free payload space before emitting chunk 1, and so on.  This allows tensors of unbounded size to be streamed through a fixed-size ring without deadlock, provided the consumer keeps draining.
-
----
-
-## Reassembly (host pipeline)
-
-The CPU worker thread reassembles chunks into a contiguous pageable tensor:
-
-1. On `IS_FIRST`: allocate a pageable buffer of `tensor_total_bytes` bytes.
-2. For each chunk: `memcpy(dst + chunk_offset_bytes, pinned_src, chunk_len)`.
-3. On `IS_LAST`: deliver the completed tensor to the user callback/queue.
-4. On DROP: discard any partial reassembly state for that `logical_task_id`.
+Flush pending normal entries first (FIFO ordering), then:
+1. `cudaMemcpyAsync` D2H from `device_src_ptr` to pageable buffer
+2. Ack: `h_condition_[hook_idx] = COND_RESET`, H2D, sync
+3. Push bypass DrainTask to p2p thread
 
 ---
 
@@ -192,12 +134,13 @@ The producer post-op must be **capture-safe**:
 
 | Requirement | How enforced |
 |-------------|--------------|
-| No allocation during capture | All buffers (rings, pinned pool) preallocated before first capture |
-| No event creation during capture | Events preallocated; event handles are stable pointers |
+| No allocation during capture | All buffers (rings, condition tensor) preallocated via `init_hooks()` |
 | No host synchronisation | No `cudaDeviceSynchronize` / `cudaStreamSynchronize` in captured code |
-| Stable pointers | Ring buffer device addresses never change after allocation |
+| Stable pointers | Ring buffer + condition tensor addresses fixed after allocation |
+| `cuStreamWaitValue32` captured | Wait address + threshold baked into graph nodes |
+| `CUDA_MODULE_LOADING=EAGER` | Prevents lazy loading deadlock with captured wait nodes |
 
-The drain loop and host pipeline run **outside** the captured graph on their own streams/threads and are not subject to capture constraints.
+The drain loop and host pipeline run **outside** the captured graph.
 
 ### Drain thread wake-up in CUDA graph mode
 

@@ -281,9 +281,8 @@ class RingTransport:
         _using_forward_hooks=False makes capture_tensor active.
     """
 
-    def __init__(self, ring_engine: Any, drain_notify_on_forward: bool = True) -> None:
+    def __init__(self, ring_engine: Any) -> None:
         self._ring_engine = ring_engine
-        self.drain_notify_on_forward = drain_notify_on_forward
 
         # Current step context — set before each forward pass
         self._current_model_id: Optional[str] = None

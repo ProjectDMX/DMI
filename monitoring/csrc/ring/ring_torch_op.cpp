@@ -37,7 +37,7 @@ void ring_set_active_engine(ring_py::RingEnginePy* e) {
 // HookPoint.forward() returns x_cont (not original x) so inductor cannot
 // DCE the .contiguous() copy + producer call for non-contiguous tensors.
 //
-// Uses hook_no_notify() — producer kernel only, no cudaLaunchHostFunc.
+// Uses hook_no_notify() — condition-gated producer kernel launch.
 void ring_producer_impl(
     const at::Tensor& tensor, int64_t hook_type, int64_t hook_id)
 {
@@ -50,9 +50,7 @@ void ring_producer_impl(
         g_active_engine->hook_no_notify(
             reinterpret_cast<uint64_t>(tensor.data_ptr()),
             static_cast<uint64_t>(tensor.nbytes()),
-            0,
             static_cast<uint32_t>(hook_type),
-            static_cast<uint32_t>(hook_id),
             reinterpret_cast<uint64_t>(stream.stream())
         );
     }

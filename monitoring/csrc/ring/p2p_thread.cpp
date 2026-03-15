@@ -38,7 +38,6 @@ static bool is_attn_hook(const std::string& act_name) {
     return ends_with("attn.hook_attn_scores") || ends_with("attn.hook_pattern");
 }
 
-// Slice tensor for a single request.
 static at::Tensor slice_for_request(
     const at::Tensor& tensor,
     int    batch_idx,
@@ -51,7 +50,6 @@ static at::Tensor slice_for_request(
 
     at::Tensor s = tensor.select(0, batch_idx);
 
-    // Token-dimension narrowing (strip left padding; "always suffix" convention)
     int token_dim = (is_attn && s.dim() >= 2) ? (s.dim() - 2) : 0;
     if (s.dim() > token_dim) {
         int64_t delta = s.size(token_dim);
@@ -61,7 +59,6 @@ static at::Tensor slice_for_request(
         }
     }
 
-    // Attention key-dimension narrowing
     if (is_attn && s.dim() >= 2) {
         int key_dim = s.dim() - 1;
         int64_t want_k = static_cast<int64_t>(end_token);
@@ -89,7 +86,6 @@ void P2PThread::start() {
 }
 
 void P2PThread::stop() {
-    // drain_.stop() must be called before p2p stop to signal shutdown.
     if (thread_.joinable()) thread_.join();
 }
 
@@ -97,7 +93,7 @@ void P2PThread::stop() {
 void P2PThread::loop() {
     while (true) {
         uint64_t n = drain_.wait_for_tasks();
-        if (n == 0) break;  // only returns 0 when p2p_stop_requested (after drain joined)
+        if (n == 0) break;
 
         std::vector<DrainTask> local;
         drain_.pop_tasks(n, local);
@@ -107,19 +103,10 @@ void P2PThread::loop() {
 
 // ---------------------------------------------------------------------------
 void P2PThread::process(std::vector<DrainTask>& tasks) {
-    size_t i = 0;
-    while (i < tasks.size()) {
+    for (size_t i = 0; i < tasks.size(); ++i) {
         DrainTask& task = tasks[i];
 
-        if (task.flags & TASK_FLAG_IS_DROP) {
-            // Drop marker — pop metadata to keep FIFO in sync, then skip
-            ring_py::TensorMeta discard;
-            fifo_.pop(discard);
-            i++;
-            continue;
-        }
-
-        if (task.flags & TASK_FLAG_LARGE_TENSOR) {
+        if (task.large_tensor.defined()) {
             // Large tensor — already in pageable memory
             at::Tensor tensor = std::move(task.large_tensor);
             do_post_processing(tensor, task);
@@ -130,67 +117,46 @@ void P2PThread::process(std::vector<DrainTask>& tasks) {
                 drain_.in_flight_bypass_bytes() -= task.tensor_total_bytes;
             }
             drain_.notify_bypass_freed();
-            i++;
             continue;
         }
 
-        // Normal tensor: IS_FIRST must be set
+        // Normal tensor: copy from pinned staging to pageable
         uint64_t total_bytes = task.tensor_total_bytes;
-        const DrainTask& first_task = task;
 
-        // ATen allocate flat pageable tensor
         auto tensor = at::empty({static_cast<int64_t>(total_bytes)},
                                 at::TensorOptions().dtype(at::kByte).device(at::kCPU));
         uint8_t* dst = tensor.data_ptr<uint8_t>();
 
-        // Copy all entries for this tensor
-        uint64_t staging_release_total = 0;
-        while (true) {
-            DrainTask& t = tasks[i];
-
-            // Copy from pinned staging (1-2 memcpy for ring wrap)
-            if (t.data_len1 > 0) {
-                std::memcpy(dst + t.chunk_offset_bytes, t.data_ptr1, t.data_len1);
-            }
-            if (t.data_len2 > 0) {
-                std::memcpy(dst + t.chunk_offset_bytes + t.data_len1,
-                            t.data_ptr2, t.data_len2);
-            }
-
-            staging_release_total += t.alloc_bytes;
-            bool is_last = (t.flags & TASK_FLAG_IS_LAST) != 0;
-            i++;
-            if (is_last) break;
+        if (task.data_len1 > 0) {
+            std::memcpy(dst, task.data_ptr1, task.data_len1);
+        }
+        if (task.data_len2 > 0) {
+            std::memcpy(dst + task.data_len1, task.data_ptr2, task.data_len2);
         }
 
-        // Release staging space for this tensor (advances tail under lock, notifies drain)
-        if (staging_release_total > 0) {
-            drain_.notify_staging_freed_bytes(staging_release_total);
+        // Release staging space
+        if (task.alloc_bytes > 0) {
+            drain_.notify_staging_freed_bytes(task.alloc_bytes);
         }
 
-        // Post-processing (no locks held, staging freed)
-        // Use first_task (captured before the loop advanced i)
-        do_post_processing(tensor, first_task);
+        do_post_processing(tensor, task);
     }
 }
 
 // ---------------------------------------------------------------------------
 void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_task) {
-    // Pop metadata from TensorMetaFifo (C++ FIFO, GIL-free)
     ring_py::TensorMeta meta;
     if (!fifo_.pop(meta)) return;
 
     if (meta.shape.empty() || first_task.tensor_total_bytes == 0) return;
     if (!submit_fn_) return;
 
-    // Reshape flat byte tensor to typed tensor
     auto dtype = static_cast<at::ScalarType>(meta.dtype);
     int64_t elem_size = at::elementSize(dtype);
     int64_t expected_elems = 1;
     for (auto d : meta.shape) expected_elems *= d;
     int64_t expected_bytes = expected_elems * elem_size;
 
-    // Guard against shape/dtype mismatch (before reshape to avoid crash)
     if (static_cast<uint64_t>(expected_bytes) != first_task.tensor_total_bytes) {
         fprintf(stderr, "[p2p] WARN: shape/bytes mismatch: expected=%ld actual=%lu hook=%s\n",
                 (long)expected_bytes, (unsigned long)first_task.tensor_total_bytes,
@@ -214,7 +180,6 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
             req.start_token, req.end_token, is_attn);
         if (!slice.defined()) continue;
 
-        // Always make contiguous: narrow() may return non-contiguous
         slice = slice.contiguous();
         if (should_clone) {
             slice = slice.clone();
@@ -226,7 +191,6 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
                        req.start_token, req.end_token,
                        std::move(slice));
         } catch (...) {
-            // Swallow: cannot propagate from background thread.
         }
     }
 }

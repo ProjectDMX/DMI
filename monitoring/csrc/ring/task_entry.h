@@ -2,6 +2,11 @@
 //
 // This header is plain C++ (no CUDA required) so it can be included from both
 // host-only and device-compiled translation units.
+//
+// One tensor = one task entry.  No chunking.
+// Large tensor bypass: device_src_ptr != nullptr.
+// Hook identity is derived from forward-pass order via the TensorMetaFifo.
+// Padded allocation size is derived: align_up(tensor_total_bytes, 16).
 
 #pragma once
 #include <cstddef>
@@ -10,103 +15,55 @@
 namespace ring {
 
 // ---------------------------------------------------------------------------
-// Flag bits — TaskEntry::flags
-// ---------------------------------------------------------------------------
-enum : uint32_t {
-    TASK_FLAG_IS_FIRST     = 1u << 0,  // first chunk of a logical task
-    TASK_FLAG_IS_LAST      = 1u << 1,  // last chunk (may also be FIRST on single-chunk tasks)
-    TASK_FLAG_IS_DROP      = 1u << 2,  // drop marker: no payload, consumer should discard
-    TASK_FLAG_LARGE_TENSOR = 1u << 3,  // bypass pinned staging (tensor > staging capacity)
-};
-
-// ---------------------------------------------------------------------------
-// Reason codes for DROP entries (TaskEntry::reason)
-// ---------------------------------------------------------------------------
-enum : uint32_t {
-    DROP_REASON_NONE                = 0,
-    DROP_REASON_TIMEOUT_NO_PROGRESS = 1,  // producer timed out waiting for consumer progress
-};
-
-// ---------------------------------------------------------------------------
 // Sentinel value for ready_seq — indicates slot has not been published yet.
 //
 // Publish protocol:
 //   producer: write all data fields → __threadfence() → write ready_seq = seq_no
-//   consumer: spin until volatile_read(ready_seq) == expected_seq_no → __threadfence()
-//
-// NOTE: seq_no is a monotonically increasing 64-bit counter. Collision with
-// SENTINEL (2^64-1) would require ~5.8×10^11 years at 1 billion ops/sec.
+//   consumer: poll until __atomic_load_n(ready_seq) == expected → read fields
 // ---------------------------------------------------------------------------
 static constexpr uint64_t READY_SEQ_SENTINEL = ~uint64_t(0);
 
 // ---------------------------------------------------------------------------
 // TaskEntry — one slot in the fixed-size task/control ring.
 //
-// alignas(128) places each entry on its own cache-line pair, which prevents
-// false sharing between adjacent slots and keeps the ready_seq field isolated.
+// alignas(64) = one CPU cache line.  Entries are in CPU-preferred managed
+// memory so the drain thread polls ready_seq via fast local DRAM reads.
+// GPU producer writes via PCIe posted writes (fire-and-forget).
 //
-// Field order: heavy 64-bit fields first, then 32-bit fields, then padding.
-// ready_seq is the only ordering signal; all other fields are data.
+// Large tensor bypass: device_src_ptr != nullptr → payload fields are zero,
+// drain thread issues D2H directly from device_src_ptr.
 // ---------------------------------------------------------------------------
-struct alignas(128) TaskEntry {
+struct alignas(64) TaskEntry {
     // -- sequence guard (written LAST by producer, read FIRST by consumer) --
-    uint64_t ready_seq;           //  8 B  offset   0
+    uint64_t ready_seq;                //  8 B  offset   0
 
-    // -- identity --
-    uint64_t seq_no;              //  8 B  offset   8  slot index at publish time
-    uint64_t logical_task_id;     //  8 B  offset  16  packed {hook_id, seq_no, tensor_idx}
+    // -- tensor metadata --
+    uint64_t tensor_total_bytes;       //  8 B  offset   8
 
-    // -- chunking --
-    uint64_t chunk_offset_bytes;  //  8 B  offset  24  byte offset of chunk within logical tensor
-    uint64_t tensor_total_bytes;  //  8 B  offset  32  total logical tensor bytes (valid on IS_FIRST)
+    // -- two-span payload descriptor (zero for large tensor bypass) --
+    uint64_t payload_off1;             //  8 B  offset  16
+    uint64_t payload_len1;             //  8 B  offset  24
+    uint64_t payload_off2;             //  8 B  offset  32
+    uint64_t payload_len2;             //  8 B  offset  40
 
-    // -- two-span payload descriptor (off2/len2 == 0 means single span) --
-    uint64_t payload_off1;        //  8 B  offset  40
-    uint64_t payload_len1;        //  8 B  offset  48
-    uint64_t payload_off2;        //  8 B  offset  56
-    uint64_t payload_len2;        //  8 B  offset  64
+    // -- large tensor bypass: device source pointer (null for normal) --
+    const uint8_t* device_src_ptr;     //  8 B  offset  48
 
-    // -- 32-bit fields --
-    uint32_t chunk_idx;           //  4 B  offset  72
-    uint32_t hook_type;           //  4 B  offset  76
-    uint32_t hook_id;             //  4 B  offset  80
-    uint32_t flags;               //  4 B  offset  84  TASK_FLAG_*
-    uint32_t reason;              //  4 B  offset  88  DROP_REASON_* (drop entries only)
-    uint32_t _pad0;               //  4 B  offset  92
-
-    // -- payload allocation (may be > len1+len2 due to alignment padding) --
-    uint64_t payload_alloc_bytes; //  8 B  offset  96  bytes to release from payload ring
-
-    // -- total padded bytes across all chunks (valid on IS_FIRST) --
-    // = (N-1)*chunk_bytes + align_up(last_chunk, 16)
-    // where N = ceil(tensor_total_bytes / chunk_bytes).
-    // Used by drain thread for large-tensor bypass decision.
-    uint64_t tensor_total_padded_bytes; // 8 B offset 104
-
-    // -- explicit padding to reach 128 bytes --
-    uint8_t  _padding[16];        // 16 B  offset 112
-                                  //       total  128 B
+    // -- padding --
+    uint8_t  _padding[8];              //  8 B  offset  56
+                                       //       total   64 B
 };
 
-static_assert(sizeof(TaskEntry)  == 128,
-    "TaskEntry must be exactly 128 bytes; adjust _padding if fields change");
-static_assert(alignof(TaskEntry) == 128,
-    "TaskEntry must be 128-byte aligned");
+static_assert(sizeof(TaskEntry)  == 64,
+    "TaskEntry must be exactly 64 bytes; adjust _padding if fields change");
+static_assert(alignof(TaskEntry) == 64,
+    "TaskEntry must be 64-byte aligned (one CPU cache line)");
 static_assert(offsetof(TaskEntry, ready_seq)          ==  0);
-static_assert(offsetof(TaskEntry, seq_no)             ==  8);
-static_assert(offsetof(TaskEntry, logical_task_id)    == 16);
-static_assert(offsetof(TaskEntry, chunk_offset_bytes) == 24);
-static_assert(offsetof(TaskEntry, tensor_total_bytes) == 32);
-static_assert(offsetof(TaskEntry, payload_off1)       == 40);
-static_assert(offsetof(TaskEntry, payload_len1)       == 48);
-static_assert(offsetof(TaskEntry, payload_off2)       == 56);
-static_assert(offsetof(TaskEntry, payload_len2)       == 64);
-static_assert(offsetof(TaskEntry, chunk_idx)          == 72);
-static_assert(offsetof(TaskEntry, hook_type)          == 76);
-static_assert(offsetof(TaskEntry, hook_id)            == 80);
-static_assert(offsetof(TaskEntry, flags)              == 84);
-static_assert(offsetof(TaskEntry, reason)             == 88);
-static_assert(offsetof(TaskEntry, payload_alloc_bytes)        == 96);
-static_assert(offsetof(TaskEntry, tensor_total_padded_bytes) == 104);
+static_assert(offsetof(TaskEntry, tensor_total_bytes) ==  8);
+static_assert(offsetof(TaskEntry, payload_off1)       == 16);
+static_assert(offsetof(TaskEntry, payload_len1)       == 24);
+static_assert(offsetof(TaskEntry, payload_off2)       == 32);
+static_assert(offsetof(TaskEntry, payload_len2)       == 40);
+static_assert(offsetof(TaskEntry, device_src_ptr)     == 48);
 
 }  // namespace ring
