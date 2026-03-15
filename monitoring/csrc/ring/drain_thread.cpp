@@ -106,8 +106,10 @@ void DrainThread::prepare_forward(
 {
     std::lock_guard<std::mutex> lk(mgmt_mu_);
 
-    // Reclassify: previous forward's "current" entries become "old"
-    old_pending_ += scanned_complete_;
+    // Reclassify: all current-forward entries still in scanned_ become "old".
+    // Use (pending - old) not scanned_complete_ — scanned_complete_ is
+    // monotonic (total ever scanned) and may exceed entries still in queue.
+    old_pending_ = pending_entries_;  // all entries in queue are now old
     scanned_complete_ = 0;
 
     forward_start_seq_ = cpu_task_head_;
@@ -131,9 +133,11 @@ void DrainThread::prepare_forward(
     for (uint32_t i = 0; i < num; ++i) {
         uint64_t raw_bytes    = hook_tensor_bytes_[i];
         uint64_t padded_bytes = align_up(raw_bytes, PAYLOAD_ALIGN);
-        bool fits_in_ring     = (padded_bytes <= ring_.payload_cap);
+        // Bypass if tensor exceeds either ring or staging capacity.
+        bool fits_normal      = (padded_bytes <= ring_.payload_cap) &&
+                                (padded_bytes <= staging_.capacity());
 
-        if (fits_in_ring) {
+        if (fits_normal) {
             if (available_tasks >= 1 && available_payload >= padded_bytes) {
                 h_condition_[i] = COND_GRANT_FULL; mark_dirty(i);
                 available_tasks   -= 1;
@@ -471,35 +475,30 @@ void DrainThread::scan_ready() {
 
         if (ec.device_src_ptr != nullptr) {
             // Large tensor — see INVARIANT above.
-            if (pending_entries_ > 0) {
+            // Must flush ALL pending normal entries to maintain FIFO ordering
+            // with the TensorMeta FIFO.  Loop until scanned_ is empty.
+            while (pending_entries_ > 0) {
                 uint64_t fc = 0, fb = 0;
                 for (size_t i = 0; i < scanned_.size(); ++i) {
                     uint64_t ab = align_up(scanned_[i].tensor_total_bytes, PAYLOAD_ALIGN);
                     if (fb + ab > staging_.capacity()) break;
                     fb += ab; fc++;
                 }
-                if (fc > 0) {
-                    RING_DBG("[scan_ready inline] flushing %lu entries %lu bytes before large tensor\n",
-                            (unsigned long)fc, (unsigned long)fb);
+                if (fc == 0) break;
+                RING_DBG("[scan_ready inline] flushing %lu/%lu entries before large tensor\n",
+                        (unsigned long)fc, (unsigned long)pending_entries_);
 
-                    flush_state_update(fc, fb);
-                    {
-                        std::unique_lock<std::mutex> lk(staging_mu_);
-                        staging_cv_.wait(lk, [&] { return staging_.free_bytes() >= fb; });
-                    }
-                    enqueue_d2h(fb);
-                    RING_DBG("[scan_ready inline] D2H enqueued, enqueueing H2D\n");
-
-                    enqueue_conditions_h2d();
-                    RING_DBG("[scan_ready inline] syncing\n");
-
-                    sync_stream();
-                    RING_DBG("[scan_ready inline] synced OK\n");
-
-                    cpu_payload_tail_committed_ = cpu_payload_tail_;
-                    submit_to_p2p(fc, fb);
-                    trim_scanned(fc, fb);  // already under mgmt_mu_
+                flush_state_update(fc, fb);
+                {
+                    std::unique_lock<std::mutex> lk(staging_mu_);
+                    staging_cv_.wait(lk, [&] { return staging_.free_bytes() >= fb; });
                 }
+                enqueue_d2h(fb);
+                enqueue_conditions_h2d();
+                sync_stream();
+                cpu_payload_tail_committed_ = cpu_payload_tail_;
+                submit_to_p2p(fc, fb);
+                trim_scanned(fc, fb);  // already under mgmt_mu_
             }
             RING_DBG("[scan_ready] handling large tensor at visible_head=%lu\n",
                     (unsigned long)visible_head_);
@@ -601,9 +600,11 @@ void DrainThread::grant_next_hooks() {
     for (uint32_t i = next_ungrant_idx_; i < num; ++i) {
         uint64_t raw_bytes    = hook_tensor_bytes_[i];
         uint64_t padded_bytes = align_up(raw_bytes, PAYLOAD_ALIGN);
-        bool fits_in_ring     = (padded_bytes <= ring_.payload_cap);
+        // Bypass if tensor exceeds either ring or staging capacity.
+        bool fits_normal      = (padded_bytes <= ring_.payload_cap) &&
+                                (padded_bytes <= staging_.capacity());
 
-        if (fits_in_ring) {
+        if (fits_normal) {
             if (available_tasks >= 1 && available_payload >= padded_bytes) {
                 h_condition_[i] = COND_GRANT_FULL; mark_dirty(i);
                 available_tasks   -= 1;

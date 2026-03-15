@@ -39,6 +39,7 @@ public:
     uint32_t* d_condition()      { return ring_.d_condition(); }
     uint32_t  num_hooks() const  { return ring_.num_hooks(); }
     uint64_t  payload_cap() const { return cfg_.payload_ring_bytes; }
+    uint64_t  staging_cap() const { return staging_.capacity(); }
 
 private:
     RingConfig      cfg_;

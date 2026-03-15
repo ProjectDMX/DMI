@@ -101,10 +101,8 @@ class BenchConfig:
 
     ring_task_entries: int = 65536
     ring_payload_mb: int = 4096
-    ring_chunk_kb: int = 4096
     ring_pinned_mb: int = 4096
-    drain_poll_timeout_us: int = 0
-    drain_notify_on_forward: bool = True
+    drain_poll_timeout_us: int = 100
     drain_flush_task_ratio: float = 0.0
     drain_flush_payload_ratio: float = 0.0
     drain_flush_entry_threshold: int = 0
@@ -134,10 +132,8 @@ def _make_ring_cfg(cfg: BenchConfig):
     rc = RingConfig()
     rc.task_ring_entries  = cfg.ring_task_entries
     rc.payload_ring_bytes = cfg.ring_payload_mb * 1024 * 1024
-    rc.chunk_bytes        = cfg.ring_chunk_kb   * 1024
     rc.pinned_staging_bytes  = cfg.ring_pinned_mb  * 1024 * 1024
     rc.drain_poll_timeout_us       = cfg.drain_poll_timeout_us
-    rc.drain_notify_on_forward     = cfg.drain_notify_on_forward
     rc.drain_flush_task_ratio      = cfg.drain_flush_task_ratio
     rc.drain_flush_payload_ratio   = cfg.drain_flush_payload_ratio
     rc.drain_flush_entry_threshold = cfg.drain_flush_entry_threshold
@@ -157,7 +153,7 @@ def _make_monitoring_cfg(cfg: BenchConfig):
         hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
         native_partial_seal=NativePartialSealConfig(
-            enabled=True, chunk_bytes=cfg.ring_chunk_kb * 1024,
+            enabled=True, chunk_bytes=256 * 1024,  # native engine partial seal
             cap_enabled=True, cap_ratio=0.8, driver_guard_mb=1024,
         ),
         advance=AdvanceConfig(),
@@ -382,16 +378,12 @@ def _parse_args() -> BenchConfig:
                    help="Task ring slot count")
     g.add_argument("--ring-payload-mb",   type=int, default=4096,
                    help="GPU payload ring size (MiB)")
-    g.add_argument("--ring-chunk-kb",     type=int, default=4096,
-                   help="Max chunk size (KiB)")
     g.add_argument("--ring-pinned-mb",    type=int, default=4096,
                    help="Pinned staging ring size (MiB, 0 = payload size)")
 
     g = p.add_argument_group("Ring engine — drain thread")
-    g.add_argument("--drain-poll-timeout-us", type=int, default=0,
-                   help="Drain thread poll timeout in µs (0 = no timeout)")
-    g.add_argument("--no-drain-notify", action="store_true",
-                   help="Disable notify_drain() before each forward pass")
+    g.add_argument("--drain-poll-timeout-us", type=int, default=100,
+                   help="Drain thread poll timeout in µs (must be > 0)")
     g.add_argument("--drain-flush-task-ratio",    type=float, default=0.0,
                    help="Flush at N%% task ring usage (0 = disabled)")
     g.add_argument("--drain-flush-payload-ratio", type=float, default=0.0,
@@ -432,9 +424,8 @@ def _parse_args() -> BenchConfig:
         modes=[m.strip() for m in ns.modes.split(",")],
         cuda_graphs=bool(ns.cuda_graphs),
         ring_task_entries=ns.ring_task_entries, ring_payload_mb=ns.ring_payload_mb,
-        ring_chunk_kb=ns.ring_chunk_kb, ring_pinned_mb=ns.ring_pinned_mb,
+        ring_pinned_mb=ns.ring_pinned_mb,
         drain_poll_timeout_us=ns.drain_poll_timeout_us,
-        drain_notify_on_forward=not ns.no_drain_notify,
         drain_flush_task_ratio=ns.drain_flush_task_ratio,
         drain_flush_payload_ratio=ns.drain_flush_payload_ratio,
         drain_flush_entry_threshold=ns.drain_flush_entry_threshold,
@@ -476,7 +467,7 @@ def main() -> None:
     print(f"CUDA graphs  : {'yes (torch.compile + static cache)' if cfg.cuda_graphs else 'no'}")
     print(f"Ring buffers : payload={cfg.ring_payload_mb} MB  "
           f"pinned={cfg.ring_pinned_mb} MB  "
-          f"tasks={cfg.ring_task_entries}  chunk={cfg.ring_chunk_kb} KB")
+          f"tasks={cfg.ring_task_entries}")
 
     from transformers import AutoTokenizer  # type: ignore
     tokenizer = AutoTokenizer.from_pretrained(model_id)

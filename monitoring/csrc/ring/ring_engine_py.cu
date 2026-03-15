@@ -122,7 +122,9 @@ void RingEnginePy::hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
 
     uint64_t padded = ring::align_up(nbytes, ring::PAYLOAD_ALIGN);
     uint64_t payload_cap = impl_->engine.payload_cap();
-    bool large_bypass = (padded > payload_cap);
+    uint64_t staging_cap = impl_->engine.staging_cap();
+    // Bypass ring+staging if tensor exceeds EITHER buffer.
+    bool large_bypass = (padded > payload_cap) || (padded > staging_cap);
 
     uint32_t* d_cond = impl_->engine.d_condition();
     CUstream cu_stream = reinterpret_cast<CUstream>(stream);
