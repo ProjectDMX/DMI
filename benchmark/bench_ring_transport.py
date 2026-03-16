@@ -98,6 +98,10 @@ class BenchConfig:
     iters: int = 3
     modes: List[str] = field(default_factory=lambda: ["baseline", "ring_null"])
     cuda_graphs: bool = False
+    logits_to_keep: int = 0  # 0 = keep all, 1 = last position only (HF default)
+    hf_offload_hidden_states: bool = False
+    hf_offload_attentions: bool = False
+    hf_offload_logits: bool = False
 
     ring_task_entries: int = 65536
     ring_payload_mb: int = 4096
@@ -222,8 +226,7 @@ def _run_one(model, input_ids, attention_mask,
     from monitoring.generate import generate_with_monitoring  # type: ignore
 
     extra = {}
-    if hasattr(model.config, "n_layer"):
-        extra["logits_to_keep"] = 0
+    extra["logits_to_keep"] = cfg.logits_to_keep
     if cfg.cuda_graphs:
         extra["cache_implementation"] = "static"
 
@@ -249,91 +252,6 @@ def _run_one(model, input_ids, attention_mask,
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) * 1000.0
 
-
-def _run_one_hf_offload(model, input_ids, attention_mask,
-                         cfg: BenchConfig, eos_id: int, pad_id: int,
-                         static_cache=None,
-                         use_cuda_graphs: bool = False) -> float:
-    """Manual decode loop: forward + output_hidden_states + detach().cpu() every step.
-
-    When use_cuda_graphs=True, uses StaticCache + cudagraph_mark_step_begin().
-    Model is already compiled (if cuda_graphs) — no double compilation.
-    When False, uses DynamicCache with standard KV cache growth.
-    """
-    B = input_ids.shape[0]
-    device = input_ids.device
-
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-
-    with torch.no_grad():
-        if use_cuda_graphs:
-            # Prefill with StaticCache
-            cache = static_cache
-            cache.reset()
-            cache_position = torch.arange(input_ids.shape[1], device=device)
-
-            out = model(
-                input_ids=input_ids, attention_mask=attention_mask,
-                cache_position=cache_position, past_key_values=cache,
-                use_cache=True, output_hidden_states=True,
-                output_attentions=True, return_dict=True,
-            )
-        else:
-            # Prefill with DynamicCache
-            out = model(
-                input_ids=input_ids, attention_mask=attention_mask,
-                use_cache=True, output_hidden_states=True,
-                output_attentions=True, return_dict=True,
-            )
-            past = out.past_key_values
-
-        # Clone prefill outputs
-        for hs in out.hidden_states:
-            hs.detach().cpu()
-        if out.attentions:
-            for a in out.attentions:
-                a.detach().cpu()
-        out.logits.detach().cpu()
-
-        current_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        attn = torch.cat([attention_mask,
-                          torch.ones((B, 1), device=device, dtype=attention_mask.dtype)], dim=1)
-
-        # Decode loop
-        for step in range(cfg.max_new_tokens - 1):
-            if use_cuda_graphs:
-                cache_position = cache_position[-1:] + 1
-                torch.compiler.cudagraph_mark_step_begin()
-                out = model(
-                    input_ids=current_token, attention_mask=attn,
-                    cache_position=cache_position, past_key_values=static_cache,
-                    use_cache=True, output_hidden_states=True,
-                    output_attentions=True, return_dict=True,
-                )
-            else:
-                out = model(
-                    input_ids=current_token, attention_mask=attn,
-                    past_key_values=past, use_cache=True,
-                    output_hidden_states=True, output_attentions=True,
-                    return_dict=True,
-                )
-                past = out.past_key_values
-
-            # Clone ALL outputs immediately
-            for hs in out.hidden_states:
-                hs.detach().cpu()
-            if out.attentions:
-                for a in out.attentions:
-                    a.detach().cpu()
-            out.logits.detach().cpu()
-
-            current_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            attn = torch.cat([attn,
-                              torch.ones((B, 1), device=device, dtype=attn.dtype)], dim=1)
-
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t0) * 1000.0
 
 
 # ---------------------------------------------------------------------------
@@ -373,14 +291,23 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         B, Pmax = input_ids.shape
         max_cache_len = Pmax + cfg.max_new_tokens + 4
 
+        want_hs   = cfg.hf_offload_hidden_states
+        want_attn = cfg.hf_offload_attentions
+        want_log  = cfg.hf_offload_logits
+        print(f"  offload: hidden_states={want_hs} attentions={want_attn} logits={want_log}",
+              flush=True)
+
         def _hf_prefill(cache_obj):
             cache_obj.reset()
             cache_pos = torch.arange(Pmax, device=input_ids.device)
             out = hf_model(
                 input_ids=input_ids, attention_mask=attention_mask,
                 cache_position=cache_pos, past_key_values=cache_obj,
-                use_cache=True, output_hidden_states=True,
-                output_attentions=True, return_dict=True,
+                use_cache=True,
+                output_hidden_states=want_hs,
+                output_attentions=want_attn,
+                return_dict=True,
+                logits_to_keep=cfg.logits_to_keep,
             )
             return out
 
@@ -388,10 +315,14 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
             out = hf_model(
                 token, use_cache=True, past_key_values=cache,
                 cache_position=cache_position,
-                output_hidden_states=True, output_attentions=True,
+                output_hidden_states=want_hs,
+                output_attentions=want_attn,
                 return_dict=True,
+                logits_to_keep=cfg.logits_to_keep,
             )
-            return out.logits, tuple(out.hidden_states), tuple(out.attentions) if out.attentions else ()
+            hs = tuple(out.hidden_states) if want_hs and out.hidden_states else ()
+            at = tuple(out.attentions) if want_attn and out.attentions else ()
+            return out.logits, hs, at
 
         if cfg.cuda_graphs:
             compiled_decode = torch.compile(
@@ -410,12 +341,14 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
             with torch.no_grad():
                 # Prefill (uncompiled)
                 out = _hf_prefill(cache)
-                for hs in out.hidden_states:
-                    hs.detach().cpu()
-                if out.attentions:
+                if want_hs and out.hidden_states:
+                    for hs in out.hidden_states:
+                        hs.detach().cpu()
+                if want_attn and out.attentions:
                     for a in out.attentions:
                         a.detach().cpu()
-                out.logits.detach().cpu()
+                if want_log:
+                    out.logits.detach().cpu()
 
                 token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 cache_pos = torch.tensor([Pmax], device=input_ids.device, dtype=torch.long)
@@ -426,11 +359,14 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
                     logits, hidden_states, attentions = compiled_decode(
                         token, cache, cache_pos)
                     # Clone immediately
-                    for hs in hidden_states:
-                        hs.detach().cpu()
-                    for a in attentions:
-                        a.detach().cpu()
-                    logits.detach().cpu()
+                    if want_hs:
+                        for hs in hidden_states:
+                            hs.detach().cpu()
+                    if want_attn:
+                        for a in attentions:
+                            a.detach().cpu()
+                    if want_log:
+                        logits.detach().cpu()
 
                     token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
                     cache_pos = cache_pos + 1
@@ -591,6 +527,16 @@ def _parse_args() -> BenchConfig:
     g.add_argument("--iters",           type=int, default=3)
     g.add_argument("--modes",           default="baseline,ring_null")
     g.add_argument("--cuda-graphs",     action="store_true")
+    g.add_argument("--logits-to-keep",  type=int, default=0,
+                   help="0=keep all logits, 1=last position only (HF default)")
+    g.add_argument("--hf-offload-hidden-states", action="store_true",
+                   help="hf_offload: output + .cpu() hidden_states")
+    g.add_argument("--hf-offload-attentions",    action="store_true",
+                   help="hf_offload: output + .cpu() attentions")
+    g.add_argument("--hf-offload-logits",        action="store_true",
+                   help="hf_offload: .cpu() logits")
+    g.add_argument("--hf-offload-all",           action="store_true",
+                   help="hf_offload: shorthand for all three above")
 
     g = p.add_argument_group("Ring engine — GPU buffers")
     g.add_argument("--ring-task-entries", type=int, default=65536,
@@ -642,6 +588,10 @@ def _parse_args() -> BenchConfig:
         max_new_tokens=ns.max_new_tokens, warmup=ns.warmup, iters=ns.iters,
         modes=[m.strip() for m in ns.modes.split(",")],
         cuda_graphs=bool(ns.cuda_graphs),
+        logits_to_keep=ns.logits_to_keep,
+        hf_offload_hidden_states=bool(ns.hf_offload_hidden_states or ns.hf_offload_all),
+        hf_offload_attentions=bool(ns.hf_offload_attentions or ns.hf_offload_all),
+        hf_offload_logits=bool(ns.hf_offload_logits or ns.hf_offload_all),
         ring_task_entries=ns.ring_task_entries, ring_payload_mb=ns.ring_payload_mb,
         ring_pinned_mb=ns.ring_pinned_mb,
         drain_poll_timeout_us=ns.drain_poll_timeout_us,
