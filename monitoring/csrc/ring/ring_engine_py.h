@@ -77,6 +77,7 @@ public:
 
     // Push metadata for the next tensor about to be hooked.
     void push_meta(TensorMeta meta);
+    void push_all_metas(const std::vector<TensorMeta>& metas);
     void pop_last_meta();
 
     // Launch producer kernel with condition tensor gating.

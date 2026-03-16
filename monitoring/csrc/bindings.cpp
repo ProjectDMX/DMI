@@ -433,6 +433,48 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("shape"), py::arg("dtype"))
       .def("pop_last_meta", &ring_py::RingEnginePy::pop_last_meta,
            py::call_guard<py::gil_scoped_release>())
+      .def("push_all_metas",
+           [](ring_py::RingEnginePy& self,
+              py::list hook_names_py,
+              py::list shapes_py,
+              py::list dtypes_py,
+              const std::string& model_id,
+              int32_t shard_rank,
+              py::list req_ids_py,
+              py::list token_ranges_py) {
+               // Build shared request metadata once
+               std::vector<ring_py::RequestMeta> shared_requests;
+               for (size_t i = 0; i < static_cast<size_t>(py::len(req_ids_py)); ++i) {
+                   ring_py::RequestMeta rm;
+                   rm.req_id      = py::cast<std::string>(req_ids_py[i]);
+                   py::tuple tr   = token_ranges_py[i].cast<py::tuple>();
+                   rm.start_token = py::cast<int32_t>(tr[0]);
+                   rm.end_token   = py::cast<int32_t>(tr[1]);
+                   shared_requests.push_back(std::move(rm));
+               }
+               // Build all metas
+               size_t n = static_cast<size_t>(py::len(hook_names_py));
+               std::vector<ring_py::TensorMeta> metas;
+               metas.reserve(n);
+               for (size_t i = 0; i < n; ++i) {
+                   ring_py::TensorMeta meta;
+                   meta.hook_name  = py::cast<std::string>(hook_names_py[i]);
+                   meta.model_id   = model_id;
+                   meta.shard_rank = shard_rank;
+                   meta.dtype      = static_cast<int>(dtypes_py[i].cast<at::ScalarType>());
+                   meta.requests   = shared_requests;
+                   py::list shape  = shapes_py[i].cast<py::list>();
+                   for (auto d : shape)
+                       meta.shape.push_back(py::cast<int64_t>(d));
+                   metas.push_back(std::move(meta));
+               }
+               // Release GIL for the actual FIFO pushes
+               py::gil_scoped_release release;
+               self.push_all_metas(metas);
+           },
+           py::arg("hook_names"), py::arg("shapes"), py::arg("dtypes"),
+           py::arg("model_id"), py::arg("shard_rank"),
+           py::arg("req_ids"), py::arg("token_ranges"))
       .def("set_null_mode",
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),

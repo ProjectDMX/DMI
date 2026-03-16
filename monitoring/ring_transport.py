@@ -372,6 +372,9 @@ class RingTransport:
         if self._current_req_ids is None or self._current_token_ranges is None:
             return
 
+        hook_names = []
+        shapes = []
+        dtypes = []
         for spec in self._active_specs:
             shape = _compute_hook_shape(
                 spec.hook_type, self._model_cfg, batch, q_len, kv_dim,
@@ -380,14 +383,17 @@ class RingTransport:
             if not shape:
                 continue
             dtype = spec.dtype if spec.dtype is not None else self._model_cfg.dtype
-            self._ring_engine.push_meta(
-                spec.name,
+            hook_names.append(spec.name)
+            shapes.append(shape)
+            dtypes.append(dtype)
+
+        if hook_names:
+            self._ring_engine.push_all_metas(
+                hook_names, shapes, dtypes,
                 self._current_model_id,
                 self._current_shard_rank,
                 list(self._current_req_ids),
                 list(self._current_token_ranges),
-                shape,
-                dtype,
             )
 
     def capture_tensor(self, tensor: torch.Tensor, hook_name: str) -> None:

@@ -97,6 +97,11 @@ void RingEnginePy::push_meta(TensorMeta meta) {
     impl_->fifo.push(std::move(meta));
 }
 
+void RingEnginePy::push_all_metas(const std::vector<TensorMeta>& metas) {
+    for (auto& m : metas)
+        impl_->fifo.push(m);
+}
+
 void RingEnginePy::pop_last_meta() {
     TensorMeta discard;
     impl_->fifo.pop_last(discard);
