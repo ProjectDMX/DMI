@@ -15,8 +15,6 @@
 // Forward-declare symbols from producer.cu
 namespace ring {
 void set_ring_null_mode(bool enabled);
-void diag_reset_hook_counters();
-void diag_print_hook_counters();
 }  // namespace ring
 
 namespace ring_py {
@@ -63,7 +61,6 @@ void RingEnginePy::init(uint64_t stream_handle) {
 }
 
 void RingEnginePy::start() {
-    ring::diag_reset_hook_counters();
     ring_diag_reset_host_counters();
     impl_->engine.start();
 }
@@ -72,7 +69,6 @@ void RingEnginePy::stop() {
     impl_->engine.stop();
 #if RING_DEBUG
     ring_diag_print_host_counters();
-    ring::diag_print_hook_counters();
 #endif
 }
 
@@ -90,6 +86,11 @@ void RingEnginePy::prepare_forward(const std::vector<uint64_t>& hook_tensor_byte
 
 void RingEnginePy::set_null_mode(bool enabled) {
     ring::set_ring_null_mode(enabled);
+    // Also tell drain thread so prepare_forward grants unconditionally
+    // in null mode (avoids capacity deadlock with large batches).
+    // When turning off, reset all conditions to 0 on the main stream.
+    cudaStream_t main_stream = nullptr;  // default stream
+    impl_->engine.drain_thread().set_null_mode(enabled, main_stream);
 }
 
 void RingEnginePy::push_meta(TensorMeta meta) {

@@ -18,39 +18,8 @@
 #include "payload_ring.cuh"
 #include "task_ring.cuh"
 #include "ring_config.h"
-#include <cstdio>
 
 namespace ring {
-
-// --- Per-hook-type diagnostic counters (device side) ---
-#define HOOK_TYPE_MAX 32
-__device__ unsigned long long g_diag_hook_writes[HOOK_TYPE_MAX];
-__device__ unsigned long long g_diag_hook_entered[HOOK_TYPE_MAX];
-__device__ unsigned long long g_diag_hook_active[HOOK_TYPE_MAX];
-
-void diag_reset_hook_counters() {
-    unsigned long long zeros[HOOK_TYPE_MAX] = {};
-    cudaMemcpyToSymbol(g_diag_hook_writes,  zeros, sizeof(zeros));
-    cudaMemcpyToSymbol(g_diag_hook_entered, zeros, sizeof(zeros));
-    cudaMemcpyToSymbol(g_diag_hook_active,  zeros, sizeof(zeros));
-}
-
-#define DIAG_PRINT_ARRAY(label, sym) do { \
-    unsigned long long h[HOOK_TYPE_MAX]; \
-    cudaMemcpyFromSymbol(h, sym, sizeof(h)); \
-    unsigned long long total = 0; \
-    fprintf(stderr, "[producer diag] %s:", label); \
-    for (int i = 0; i < HOOK_TYPE_MAX; ++i) { \
-        if (h[i]) { fprintf(stderr, " %d=%llu", i, h[i]); total += h[i]; } \
-    } \
-    fprintf(stderr, "  total=%llu\n", total); \
-} while(0)
-
-void diag_print_hook_counters() {
-    DIAG_PRINT_ARRAY("entered",  g_diag_hook_entered);
-    DIAG_PRINT_ARRAY("active",   g_diag_hook_active);
-    DIAG_PRINT_ARRAY("writes",   g_diag_hook_writes);
-}
 
 __device__ bool g_ring_null_mode = false;
 
@@ -92,13 +61,7 @@ __global__ void producer_kernel(
     uint32_t*       d_condition,
     uint32_t        hook_idx)
 {
-    if (threadIdx.x == 0 && hook_type < HOOK_TYPE_MAX)
-        atomicAdd(&g_diag_hook_entered[hook_type], 1ULL);
-
     if (g_ring_null_mode) return;
-
-    if (threadIdx.x == 0 && hook_type < HOOK_TYPE_MAX)
-        atomicAdd(&g_diag_hook_active[hook_type], 1ULL);
 
     // --- Large tensor bypass ---
     if (large_bypass) {
@@ -119,9 +82,6 @@ __global__ void producer_kernel(
 
             task_publish(ring.task_entries, ring.task_cap, task_head, entry);
             *ring.task_head = task_head + 1;
-
-            if (hook_type < HOOK_TYPE_MAX)
-                atomicAdd(&g_diag_hook_writes[hook_type], 1ULL);
         }
         return;
     }
@@ -181,14 +141,8 @@ __global__ void producer_kernel(
         *ring.task_head    = task_head + 1;
         *ring.payload_head = payload_head;
 
-        // Device-side condition reset (AFTER publish is fine for normal path:
-        // nobody reads this condition until the next forward, which starts
-        // after the graph completes — implicit global visibility).
         if (d_condition)
             d_condition[hook_idx] = COND_RESET;
-
-        if (hook_type < HOOK_TYPE_MAX)
-            atomicAdd(&g_diag_hook_writes[hook_type], 1ULL);
     }
 }
 

@@ -43,6 +43,7 @@ public:
     void stop();
 
     void set_condition(uint32_t* d_cond, uint32_t* h_cond, uint32_t num_hooks);
+    void set_null_mode(bool enabled, cudaStream_t main_stream);
 
     // Runs on Python thread (GIL released).  Computes conditions under
     // mgmt_mu_, enqueues H2D on main_stream.  Non-blocking, no sync.
@@ -109,6 +110,7 @@ private:
     uint32_t                dirty_lo_{0};
     uint32_t                dirty_hi_{0};
     bool                    dirty_{false};
+    bool                    null_mode_{false};
 
     std::chrono::steady_clock::time_point first_complete_time_{};
     bool                    has_complete_time_{false};

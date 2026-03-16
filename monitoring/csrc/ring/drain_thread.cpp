@@ -92,6 +92,20 @@ void DrainThread::notify() {
 // simplifies reasoning about dirty flag ownership.
 //
 // Uses committed payload tail (only space confirmed safe after D2H) for
+// ---------------------------------------------------------------------------
+void DrainThread::set_null_mode(bool enabled, cudaStream_t main_stream) {
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
+    null_mode_ = enabled;
+    if (!enabled && d_condition_ && h_condition_ && num_hooks_ > 0) {
+        // Turning OFF null_mode: reset all conditions to COND_RESET (0)
+        // so prepare_forward returns to normal capacity-checked granting.
+        std::memset(h_condition_, 0, num_hooks_ * sizeof(uint32_t));
+        cudaMemcpyAsync(d_condition_, h_condition_,
+                        num_hooks_ * sizeof(uint32_t),
+                        cudaMemcpyHostToDevice, main_stream);
+    }
+}
+
 // conservative grants.  The drain's OCC re-check after sync will re-grant
 // blocked hooks with newly freed resources.
 //
@@ -121,51 +135,61 @@ void DrainThread::prepare_forward(
     has_complete_time_  = false;
     dirty_              = false;
 
-    // Use committed tail for safety (only space where D2H confirmed done).
-    // If the drain is mid-D2H, committed < pending → conservative grants.
-    // The drain's OCC re-check will re-grant after sync updates committed.
-    uint64_t available_tasks   = ring_.task_cap - (cpu_task_head_ - cpu_task_tail_);
-    uint64_t available_payload = ring_.payload_cap - (cpu_payload_head_ - cpu_payload_tail_committed_);
-
     uint32_t num = static_cast<uint32_t>(hook_tensor_bytes_.size());
     if (num > num_hooks_) num = num_hooks_;
 
-    for (uint32_t i = 0; i < num; ++i) {
-        uint64_t raw_bytes    = hook_tensor_bytes_[i];
-        uint64_t padded_bytes = align_up(raw_bytes, PAYLOAD_ALIGN);
-        // Bypass if tensor exceeds either ring or staging capacity.
-        bool fits_normal      = (padded_bytes <= ring_.payload_cap) &&
-                                (padded_bytes <= staging_.capacity());
+    if (null_mode_) {
+        // Null mode: grant everything unconditionally (producer kernels
+        // are no-ops, no ring/staging space consumed).
+        for (uint32_t i = 0; i < num; ++i) {
+            h_condition_[i] = COND_GRANT_FULL; mark_dirty(i);
+            granted_count_++;
+        }
+        next_ungrant_idx_ = num;
+    } else {
+        // Use committed tail for safety (only space where D2H confirmed done).
+        // If the drain is mid-D2H, committed < pending → conservative grants.
+        // The drain's OCC re-check will re-grant after sync updates committed.
+        uint64_t available_tasks   = ring_.task_cap - (cpu_task_head_ - cpu_task_tail_);
+        uint64_t available_payload = ring_.payload_cap - (cpu_payload_head_ - cpu_payload_tail_committed_);
 
-        if (fits_normal) {
-            if (available_tasks >= 1 && available_payload >= padded_bytes) {
-                h_condition_[i] = COND_GRANT_FULL; mark_dirty(i);
-                available_tasks   -= 1;
-                available_payload -= padded_bytes;
-                cpu_task_head_    += 1;
-                cpu_payload_head_ += padded_bytes;
-                granted_count_++;
+        for (uint32_t i = 0; i < num; ++i) {
+            uint64_t raw_bytes    = hook_tensor_bytes_[i];
+            uint64_t padded_bytes = align_up(raw_bytes, PAYLOAD_ALIGN);
+            // Bypass if tensor exceeds either ring or staging capacity.
+            bool fits_normal      = (padded_bytes <= ring_.payload_cap) &&
+                                    (padded_bytes <= staging_.capacity());
+
+            if (fits_normal) {
+                if (available_tasks >= 1 && available_payload >= padded_bytes) {
+                    h_condition_[i] = COND_GRANT_FULL; mark_dirty(i);
+                    available_tasks   -= 1;
+                    available_payload -= padded_bytes;
+                    cpu_task_head_    += 1;
+                    cpu_payload_head_ += padded_bytes;
+                    granted_count_++;
+                } else {
+                    // Must break: grants must be a contiguous prefix [0, N) so
+                    // the H2D dirty range doesn't include stale values for
+                    // skipped hooks, and doesn't overlap with drain's range.
+                    blocked_count_ += (num - i);
+                    break;
+                }
             } else {
-                // Must break: grants must be a contiguous prefix [0, N) so
-                // the H2D dirty range doesn't include stale values for
-                // skipped hooks, and doesn't overlap with drain's range.
-                blocked_count_ += (num - i);
-                break;
-            }
-        } else {
-            if (available_tasks >= 1) {
-                h_condition_[i] = COND_GRANT_TASK_ONLY; mark_dirty(i);
-                available_tasks -= 1;
-                cpu_task_head_  += 1;
-                granted_count_++;
-            } else {
-                blocked_count_ += (num - i);
-                break;
+                if (available_tasks >= 1) {
+                    h_condition_[i] = COND_GRANT_TASK_ONLY; mark_dirty(i);
+                    available_tasks -= 1;
+                    cpu_task_head_  += 1;
+                    granted_count_++;
+                } else {
+                    blocked_count_ += (num - i);
+                    break;
+                }
             }
         }
-    }
 
-    next_ungrant_idx_ = static_cast<uint32_t>(granted_count_);
+        next_ungrant_idx_ = static_cast<uint32_t>(granted_count_);
+    }
 
     RING_DBG("[prepare_forward] num_hooks=%u granted=%lu blocked=%lu "
             "next_ungrant=%u avail_tasks=%lu avail_payload=%lu "
