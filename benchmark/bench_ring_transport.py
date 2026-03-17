@@ -185,7 +185,7 @@ def _make_db_engine(cfg: BenchConfig, model_id: str):
     ch.secure = False;  ch.client_side_compress = "none"
     ch.client_settings = None
     ch.create_database_if_missing = True
-    ch.drop_existing_database = False
+    ch.drop_existing_database = True
     ch.index_granularity = 8192
 
     stage = StageConfig.clickhouse_insert(ch, parallelism=cfg.ch_parallelism, name="ch_insert")

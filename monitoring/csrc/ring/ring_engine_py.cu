@@ -173,7 +173,6 @@ void RingEnginePy::hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
 
     if (large_bypass && d_cond && hook_idx < impl_->engine.num_hooks()) {
         CUdeviceptr addr = reinterpret_cast<CUdeviceptr>(d_cond + hook_idx);
-        // Wait for drain to D2H and ack (condition == 0)
         cuStreamWaitValue32(cu_stream, addr,
                             ring::COND_RESET,
                             CU_STREAM_WAIT_VALUE_EQ);

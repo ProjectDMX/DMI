@@ -183,11 +183,11 @@ def _install_prepare_wrapper(model: Any) -> None:
 
     @functools.wraps(orig_prepare)
     def _prepare_wrapper(*args: Any, **kwargs: Any) -> Any:
-        import time as _time
-        t_start = _time.perf_counter()
+        # PROFILING import time as _time
+        # PROFILING t_start = _time.perf_counter()
 
         model_inputs = orig_prepare(*args, **kwargs)
-        t_orig = _time.perf_counter()
+        # PROFILING t_orig = _time.perf_counter()
 
         engine    = getattr(model, "monitoring_engine", None)
         transport = ring_transport.get_active()
@@ -209,7 +209,7 @@ def _install_prepare_wrapper(model: Any) -> None:
                 cache_position  = None
 
             engine._prepare_ring_step(input_ids_val, attention_mask, past_key_values, cache_position=cache_position)
-            t_ring_step = _time.perf_counter()
+            # PROFILING t_ring_step = _time.perf_counter()
 
             if input_ids_val is not None and hasattr(input_ids_val, "shape"):
                 try:
@@ -238,7 +238,7 @@ def _install_prepare_wrapper(model: Any) -> None:
                                 hook_byte_sizes.append(nbytes)
                             else:
                                 hook_byte_sizes.append(0)
-                    t_shape = _time.perf_counter()
+                    # PROFILING t_shape = _time.perf_counter()
 
                     # Prepare forward: compute condition grants, enqueue
                     # H2D on main stream (non-blocking, no sync).
@@ -246,28 +246,28 @@ def _install_prepare_wrapper(model: Any) -> None:
                         stream_handle = torch.cuda.current_stream().cuda_stream
                         transport._ring_engine.prepare_forward(
                             hook_byte_sizes, stream_handle)
-                    t_prepare = _time.perf_counter()
+                    # PROFILING t_prepare = _time.perf_counter()
 
                     # Push FIFO metadata for p2p thread
                     transport.pre_push_all_metas(batch, q_len, kv_dim,
                                                 logits_to_keep=logits_to_keep)
-                    t_meta = _time.perf_counter()
+                    # PROFILING t_meta = _time.perf_counter()
 
-                    _prepare_profile_times.append({
-                        "orig_prepare": (t_orig - t_start) * 1000,
-                        "ring_step": (t_ring_step - t_orig) * 1000,
-                        "shape_compute": (t_shape - t_ring_step) * 1000,
-                        "prepare_forward": (t_prepare - t_shape) * 1000,
-                        "push_metas": (t_meta - t_prepare) * 1000,
-                        "total": (t_meta - t_start) * 1000,
-                    })
+                    # PROFILING _prepare_profile_times.append({
+                    # PROFILING     "orig_prepare": (t_orig - t_start) * 1000,
+                    # PROFILING     "ring_step": (t_ring_step - t_orig) * 1000,
+                    # PROFILING     "shape_compute": (t_shape - t_ring_step) * 1000,
+                    # PROFILING     "prepare_forward": (t_prepare - t_shape) * 1000,
+                    # PROFILING     "push_metas": (t_meta - t_prepare) * 1000,
+                    # PROFILING     "total": (t_meta - t_start) * 1000,
+                    # PROFILING })
                 except Exception:
                     pass
-        else:
-            _prepare_profile_times.append({
-                "orig_prepare": (t_orig - t_start) * 1000,
-                "total": (_time.perf_counter() - t_start) * 1000,
-            })
+        # PROFILING else:
+        # PROFILING     _prepare_profile_times.append({
+        # PROFILING         "orig_prepare": (t_orig - t_start) * 1000,
+        # PROFILING         "total": (_time.perf_counter() - t_start) * 1000,
+        # PROFILING     })
 
         return model_inputs
 
