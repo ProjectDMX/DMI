@@ -378,6 +378,10 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         for _ in range(cfg.warmup):
             _run_one_offload()
 
+        torch.cuda.synchronize()
+        time.sleep(2)
+        print("  -- warmup done, starting measured iters --", flush=True)
+
         all_total_ms: List[float] = []
         for i in range(cfg.iters):
             total_ms = _run_one_offload()
@@ -433,6 +437,10 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
                 ring_engine.set_null_mode(False)
             if ring_transport is not None:
                 ring_transport.null_offload = False
+
+        torch.cuda.synchronize()
+        time.sleep(2)
+        print("  -- warmup done, starting measured iters --", flush=True)
 
         # Measured iterations
         all_total_ms: List[float] = []

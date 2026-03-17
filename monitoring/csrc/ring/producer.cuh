@@ -1,16 +1,16 @@
 // ring/producer.cuh — GPU producer kernel.
 //
-// producer_kernel uses a single block with PRODUCER_BLOCK_DIM threads.
+// Dynamic-dispatch multi-block producer.  launch_producer picks the grid size
+// based on src_bytes at call time; under CUDA graphs this decision is baked
+// into the recorded graph so replay has zero host-side dispatch cost.
 //
 // Normal path (large_bypass=false):
-//   Phase 1 — thread 0: compute two-span reservation, broadcast via shmem.
-//   Phase 2 — all threads: grid-stride D2D copy into payload_buf spans.
-//   Phase 3 — thread 0: publish TaskEntry, advance heads,
-//             write d_condition[hook_idx] = 0 (device-side reset).
+//   Phase 1 — all blocks: grid-stride D2D copy into payload_buf spans.
+//   Phase 2 — last block to finish (atomicAdd counter): publish TaskEntry,
+//             advance heads.
 //
 // Large bypass path (large_bypass=true):
-//   Thread 0 only: publish TaskEntry with device_src_ptr, advance task_head,
-//   write d_condition[hook_idx] = 1 (kernel done, pending drain ack).
+//   Block 0, thread 0 only: publish TaskEntry with device_src_ptr.
 //   No D2D copy, no payload consumed.
 //
 // The kernel never spins.  Backpressure is handled by cuStreamWaitValue32
@@ -29,13 +29,18 @@ namespace ring {
 
 static constexpr uint32_t PRODUCER_BLOCK_DIM = 256;
 
-// Condition values: see COND_* constants in ring_config.h.
+// Size-tier thresholds for grid selection (bytes).
+static constexpr uint64_t TIER1_THRESHOLD =   64 * 1024;       //  64 KB
+static constexpr uint64_t TIER2_THRESHOLD =  4 * 1024 * 1024;  //   4 MB
+static constexpr uint64_t TIER3_THRESHOLD = 32 * 1024 * 1024;  //  32 MB
 
-struct alignas(16) ProducerShmem {
-    TwoSpan  spans;
-    uint64_t task_head;
-    uint64_t payload_head;
-};
+// Block counts per tier.
+static constexpr uint32_t TIER0_BLOCKS =  1;  // ≤ 64 KB
+static constexpr uint32_t TIER1_BLOCKS =  4;  // ≤ 4 MB
+static constexpr uint32_t TIER2_BLOCKS = 16;  // ≤ 32 MB
+static constexpr uint32_t TIER3_BLOCKS = 64;  // > 32 MB
+
+// Condition values: see COND_* constants in ring_config.h.
 
 __global__ void producer_kernel(
     RingState       ring,
