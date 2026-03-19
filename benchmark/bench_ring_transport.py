@@ -9,14 +9,14 @@ Compares four modes:
 Per-step (prefill vs decode) timing is intentionally NOT reported here.
 Inserting a GPU sync barrier between every step breaks CUDA-graph pipelining
 and makes per-step numbers unreliable.  Instead, run dedicated prefill /
-decode benchmarks using the appropriate --prompt-len / --max-new-tokens flags:
+decode benchmarks using the appropriate --prefill-len / --decode-len flags:
 
-  Prefill:  --prompt-len N --max-new-tokens 1
-  Decode:   --prompt-len 1 --max-new-tokens N
+  Prefill:  --prefill-len N --decode-len 1
+  Decode:   --prefill-len 1 --decode-len N
 
 Each run reports total wall time (ms) and throughput (tok/s).
-For prefill, tok/s counts prompt tokens processed (batch * prompt_len).
-For decode,  tok/s counts new tokens generated  (batch * max_new_tokens).
+For prefill, tok/s counts prompt tokens processed (batch * prefill_len).
+For decode,  tok/s counts new tokens generated  (batch * decode_len).
 
 Usage:
   python -m benchmark.bench_ring_transport --model qwen3 --modes baseline,ring_null
@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import statistics
 import time
 import uuid
@@ -92,8 +93,8 @@ class _NullHostEngine:
 class BenchConfig:
     model: str = "gpt2"
     batch_size: int = 4
-    prompt_len: int = 32
-    max_new_tokens: int = 16
+    prefill_len: int = 32
+    decode_len: int = 16
     warmup: int = 1
     iters: int = 3
     modes: List[str] = field(default_factory=lambda: ["baseline", "ring_null"])
@@ -102,6 +103,8 @@ class BenchConfig:
     hf_offload_hidden_states: bool = False
     hf_offload_attentions: bool = False
     hf_offload_logits: bool = False
+
+    csv_path: Optional[str] = None
 
     ring_task_entries: int = 65536
     ring_payload_mb: int = 4096
@@ -209,7 +212,7 @@ def _make_db_engine(cfg: BenchConfig, model_id: str):
 
 def _make_inputs(tokenizer, cfg: BenchConfig, device: torch.device):
     ids = tokenizer.encode("The quick brown fox jumps over the lazy dog. " * 20)
-    ids = ids[:cfg.prompt_len]
+    ids = ids[:cfg.prefill_len]
     rows = [torch.tensor(ids, dtype=torch.long) for _ in range(cfg.batch_size)]
     input_ids = torch.stack(rows).to(device)
     return input_ids, torch.ones_like(input_ids)
@@ -219,10 +222,30 @@ def _make_inputs(tokenizer, cfg: BenchConfig, device: torch.device):
 # Per-iteration runner — returns total wall time only
 # ---------------------------------------------------------------------------
 
+@dataclass
+class RunResult:
+    total_ms: float
+    prefill_ms: float
+    decode_ms: float
+    decode_steps: int
+
+
 def _run_one(model, input_ids, attention_mask,
              cfg: BenchConfig, eos_id: int, pad_id: int,
-             use_monitoring: bool) -> float:
-    """Run one generate() and return total wall time in ms."""
+             use_monitoring: bool) -> RunResult:
+    """Run one generate() and return timing breakdown.
+
+    Per-step timing relies on Python-side ``time.perf_counter()`` recorded at
+    the start of each generate step (inside ``prepare_inputs_for_generation``).
+    This is accurate because HF's generate loop unconditionally executes::
+
+        this_peer_finished = unfinished_sequences.max() == 0
+
+    at the end of every step (transformers/generation/utils.py), which transfers
+    a GPU scalar to CPU and forces an implicit cudaStreamSynchronize.  By the
+    time the next ``prepare_inputs_for_generation`` call begins, all GPU work
+    from the previous step has completed.
+    """
     from monitoring.generate import generate_with_monitoring  # type: ignore
 
     extra = {}
@@ -230,27 +253,58 @@ def _run_one(model, input_ids, attention_mask,
     if cfg.cuda_graphs:
         extra["cache_implementation"] = "static"
 
-    # cudaDeviceSynchronize — wait for any leftover GPU work before the timer
-    # starts (including drain-thread D2H from a previous iteration).
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    # Wrap prepare_inputs_for_generation to record per-step timestamps.
+    # This is the first line of each step in HF's generate() loop.
+    step_timestamps: List[float] = []
+    orig_prepare = model.prepare_inputs_for_generation
 
-    with torch.no_grad():
-        if use_monitoring:
-            generate_with_monitoring(
-                model, input_ids=input_ids, attention_mask=attention_mask,
-                max_new_tokens=cfg.max_new_tokens, do_sample=False,
-                pad_token_id=pad_id, eos_token_id=eos_id, **extra,
-            )
-        else:
-            model.generate(
-                input_ids=input_ids, attention_mask=attention_mask,
-                max_new_tokens=cfg.max_new_tokens, do_sample=False,
-                pad_token_id=pad_id, eos_token_id=eos_id, **extra,
-            )
+    @functools.wraps(orig_prepare)
+    def _timed_prepare(*args, **kwargs):
+        step_timestamps.append(time.perf_counter())
+        return orig_prepare(*args, **kwargs)
 
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t0) * 1000.0
+    model.prepare_inputs_for_generation = _timed_prepare
+
+    try:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        with torch.no_grad():
+            if use_monitoring:
+                generate_with_monitoring(
+                    model, input_ids=input_ids, attention_mask=attention_mask,
+                    max_new_tokens=cfg.decode_len,
+                    min_new_tokens=cfg.decode_len,
+                    do_sample=False,
+                    pad_token_id=pad_id, eos_token_id=eos_id, **extra,
+                )
+            else:
+                model.generate(
+                    input_ids=input_ids, attention_mask=attention_mask,
+                    max_new_tokens=cfg.decode_len,
+                    min_new_tokens=cfg.decode_len,
+                    do_sample=False,
+                    pad_token_id=pad_id, eos_token_id=eos_id, **extra,
+                )
+
+        torch.cuda.synchronize()
+        t_end = time.perf_counter()
+    finally:
+        model.prepare_inputs_for_generation = orig_prepare
+
+    total_ms = (t_end - t0) * 1000.0
+    # timestamps: [prefill_start, decode_step_1, decode_step_2, ...]
+    if len(step_timestamps) >= 2:
+        prefill_ms = (step_timestamps[1] - step_timestamps[0]) * 1000.0
+        decode_ms = (t_end - step_timestamps[1]) * 1000.0
+        decode_steps = len(step_timestamps) - 1
+    else:
+        prefill_ms = total_ms
+        decode_ms = 0.0
+        decode_steps = 0
+
+    return RunResult(total_ms=total_ms, prefill_ms=prefill_ms,
+                     decode_ms=decode_ms, decode_steps=decode_steps)
 
 
 
@@ -262,13 +316,6 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
               cfg: BenchConfig, eos_id: int, pad_id: int) -> dict:
 
     use_monitoring = mode not in ("baseline", "hf_offload")
-    # For prefill benchmark (max_new_tokens=1): count prompt tokens processed.
-    # For decode benchmark (prompt_len=1):      count new tokens generated.
-    # For mixed (prompt_len>1, max_new_tokens>1): count new tokens generated.
-    if cfg.max_new_tokens == 1:
-        tokens_out = cfg.batch_size * cfg.prompt_len   # prefill-mode: prompt throughput
-    else:
-        tokens_out = cfg.batch_size * cfg.max_new_tokens
 
     print(f"\n{'='*60}")
     print(f"  Mode: {mode}")
@@ -289,7 +336,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         ).to(input_ids.device).eval()
 
         B, Pmax = input_ids.shape
-        max_cache_len = Pmax + cfg.max_new_tokens + 4
+        max_cache_len = Pmax + cfg.decode_len + 4
 
         want_hs   = cfg.hf_offload_hidden_states
         want_attn = cfg.hf_offload_attentions
@@ -330,7 +377,15 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         else:
             compiled_decode = _hf_decode_step
 
-        def _run_one_offload():
+        def _run_one_offload() -> RunResult:
+            """Manual prefill + decode loop with per-step timing.
+
+            HF's generate() forces an implicit CPU sync every step via
+            ``unfinished_sequences.max() == 0`` (GPU scalar -> CPU).  This
+            manual loop does not have that, so we add an explicit
+            ``token.max().item()`` after each step to match the same sync
+            behavior and ensure Python-side timestamps are accurate.
+            """
             cache = StaticCache(
                 config=hf_model.config, batch_size=B,
                 max_cache_len=max_cache_len, device=input_ids.device,
@@ -351,10 +406,14 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
                     out.logits.detach().cpu()
 
                 token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                # Force CPU sync to match HF generate()'s implicit sync
+                token.max().item()
                 cache_pos = torch.tensor([Pmax], device=input_ids.device, dtype=torch.long)
 
+                t_decode_start = time.perf_counter()
+
                 # Decode
-                for step in range(cfg.max_new_tokens - 1):
+                for step in range(cfg.decode_len - 1):
                     torch.compiler.cudagraph_mark_step_begin()
                     logits, hidden_states, attentions = compiled_decode(
                         token, cache, cache_pos)
@@ -369,10 +428,19 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
                         logits.detach().cpu()
 
                     token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                    # Force CPU sync to match HF generate()'s implicit
+                    # ``this_peer_finished = unfinished_sequences.max() == 0``
+                    token.max().item()
                     cache_pos = cache_pos + 1
 
             torch.cuda.synchronize()
-            return (time.perf_counter() - t0) * 1000.0
+            t_end = time.perf_counter()
+            total_ms = (t_end - t0) * 1000.0
+            prefill_ms = (t_decode_start - t0) * 1000.0
+            decode_ms = (t_end - t_decode_start) * 1000.0
+            decode_steps = cfg.decode_len - 1
+            return RunResult(total_ms=total_ms, prefill_ms=prefill_ms,
+                             decode_ms=decode_ms, decode_steps=decode_steps)
 
         print(f"  Warming up ({cfg.warmup} iter)...", flush=True)
         for _ in range(cfg.warmup):
@@ -382,26 +450,39 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         time.sleep(2)
         print("  -- warmup done, starting measured iters --", flush=True)
 
-        all_total_ms: List[float] = []
+        all_runs: List[RunResult] = []
         for i in range(cfg.iters):
-            total_ms = _run_one_offload()
-            all_total_ms.append(total_ms)
-            print(f"  iter {i+1:2d}:  total={total_ms:7.1f} ms  "
-                  f"({tokens_out / total_ms * 1000:.1f} tok/s)", flush=True)
+            r = _run_one_offload()
+            all_runs.append(r)
+            tpot = r.decode_ms / r.decode_steps if r.decode_steps > 0 else 0.0
+            print(f"  iter {i+1:2d}:  total={r.total_ms:7.1f} ms  "
+                  f"prefill={r.prefill_ms:.1f} ms  "
+                  f"decode={r.decode_ms:.1f} ms  "
+                  f"TPOT={tpot:.2f} ms", flush=True)
 
-        mean_t = statistics.mean(all_total_ms)
-        std_t  = statistics.stdev(all_total_ms) if len(all_total_ms) > 1 else 0.0
-        print(f"\n  Summary:  mean={mean_t:.1f} ms  std={std_t:.1f} ms  "
-              f"min={min(all_total_ms):.1f}  max={max(all_total_ms):.1f}  "
-              f"throughput={tokens_out / mean_t * 1000:.1f} tok/s")
+        mean_t = statistics.mean([r.total_ms for r in all_runs])
+        std_t  = statistics.stdev([r.total_ms for r in all_runs]) if len(all_runs) > 1 else 0.0
+        mean_prefill = statistics.mean([r.prefill_ms for r in all_runs])
+        mean_decode  = statistics.mean([r.decode_ms for r in all_runs])
+        mean_steps   = statistics.mean([r.decode_steps for r in all_runs])
+        mean_tpot    = mean_decode / mean_steps if mean_steps > 0 else 0.0
+        decode_throughput = (cfg.batch_size * mean_steps / mean_decode * 1000) if mean_decode > 0 else 0.0
+        print(f"\n  Summary:  total={mean_t:.1f} ms  std={std_t:.1f} ms  "
+              f"prefill={mean_prefill:.1f} ms  "
+              f"decode={mean_decode:.1f} ms  "
+              f"TPOT={mean_tpot:.2f} ms  "
+              f"decode_throughput={decode_throughput:.1f} tok/s")
 
         del hf_model, compiled_decode
         torch.cuda.empty_cache()
 
         return {
             "mode": mode, "mean_ms": mean_t, "std_ms": std_t,
-            "min_ms": min(all_total_ms), "max_ms": max(all_total_ms),
-            "throughput": tokens_out / mean_t * 1000,
+            "min_ms": min(r.total_ms for r in all_runs),
+            "max_ms": max(r.total_ms for r in all_runs),
+            "decode_throughput": decode_throughput,
+            "prefill_ms": mean_prefill, "decode_ms": mean_decode,
+            "tpot_ms": mean_tpot,
             "close_ring_ms": 0.0, "close_db_ms": 0.0,
         }
 
@@ -443,15 +524,18 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         print("  -- warmup done, starting measured iters --", flush=True)
 
         # Measured iterations
-        all_total_ms: List[float] = []
+        all_runs: List[RunResult] = []
         close_t: Dict[str, float] = {"ring_ms": 0.0, "db_ms": 0.0, "cleanup_ms": 0.0}
 
         for i in range(cfg.iters):
-            total_ms = _run_one(model, input_ids, attention_mask,
-                                cfg, eos_id, pad_id, use_monitoring)
-            all_total_ms.append(total_ms)
-            print(f"  iter {i+1:2d}:  total={total_ms:7.1f} ms  "
-                  f"({tokens_out / total_ms * 1000:.1f} tok/s)",
+            r = _run_one(model, input_ids, attention_mask,
+                         cfg, eos_id, pad_id, use_monitoring)
+            all_runs.append(r)
+            tpot = r.decode_ms / r.decode_steps if r.decode_steps > 0 else 0.0
+            print(f"  iter {i+1:2d}:  total={r.total_ms:7.1f} ms  "
+                  f"prefill={r.prefill_ms:.1f} ms  "
+                  f"decode={r.decode_ms:.1f} ms  "
+                  f"TPOT={tpot:.2f} ms",
                   flush=True)
 
         # Close on last iter
@@ -467,11 +551,18 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         print(f"    db drain    : {db_ms:7.1f} ms")
         print(f"    cleanup     : {cleanup_ms:7.1f} ms")
 
-        mean_t = statistics.mean(all_total_ms)
-        std_t  = statistics.stdev(all_total_ms) if len(all_total_ms) > 1 else 0.0
-        print(f"\n  Summary:  mean={mean_t:.1f} ms  std={std_t:.1f} ms  "
-              f"min={min(all_total_ms):.1f}  max={max(all_total_ms):.1f}  "
-              f"throughput={tokens_out / mean_t * 1000:.1f} tok/s")
+        mean_t = statistics.mean([r.total_ms for r in all_runs])
+        std_t  = statistics.stdev([r.total_ms for r in all_runs]) if len(all_runs) > 1 else 0.0
+        mean_prefill = statistics.mean([r.prefill_ms for r in all_runs])
+        mean_decode  = statistics.mean([r.decode_ms for r in all_runs])
+        mean_steps   = statistics.mean([r.decode_steps for r in all_runs])
+        mean_tpot    = mean_decode / mean_steps if mean_steps > 0 else 0.0
+        decode_throughput = (cfg.batch_size * mean_steps / mean_decode * 1000) if mean_decode > 0 else 0.0
+        print(f"\n  Summary:  total={mean_t:.1f} ms  std={std_t:.1f} ms  "
+              f"prefill={mean_prefill:.1f} ms  "
+              f"decode={mean_decode:.1f} ms  "
+              f"TPOT={mean_tpot:.2f} ms  "
+              f"decode_throughput={decode_throughput:.1f} tok/s")
 
         # Print prepare_wrapper profiling if available
         try:
@@ -480,8 +571,8 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         except ImportError:
             times_list = None
         if times_list:
-            # Skip warmup entries (first max_new_tokens+1 calls)
-            skip = cfg.warmup * (cfg.max_new_tokens + 1)
+            # Skip warmup entries (first decode_len+1 calls)
+            skip = cfg.warmup * (cfg.decode_len + 1)
             measured = times_list[skip:]
             if measured:
                 keys = list(measured[0].keys())
@@ -498,14 +589,17 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
             times_list.clear()
 
         return {
-            "mode":          mode,
-            "mean_ms":       mean_t,
-            "std_ms":        std_t,
-            "min_ms":        min(all_total_ms),
-            "max_ms":        max(all_total_ms),
-            "throughput":    tokens_out / mean_t * 1000,
-            "close_ring_ms": ring_ms,
-            "close_db_ms":   db_ms,
+            "mode":               mode,
+            "mean_ms":            mean_t,
+            "std_ms":             std_t,
+            "min_ms":             min(r.total_ms for r in all_runs),
+            "max_ms":             max(r.total_ms for r in all_runs),
+            "decode_throughput":  decode_throughput,
+            "prefill_ms":         mean_prefill,
+            "decode_ms":          mean_decode,
+            "tpot_ms":            mean_tpot,
+            "close_ring_ms":      ring_ms,
+            "close_db_ms":        db_ms,
         }
 
     finally:
@@ -529,8 +623,8 @@ def _parse_args() -> BenchConfig:
     g = p.add_argument_group("Workload")
     g.add_argument("--model",           default="gpt2")
     g.add_argument("--batch-size",      type=int, default=4)
-    g.add_argument("--prompt-len",      type=int, default=32)
-    g.add_argument("--max-new-tokens",  type=int, default=16)
+    g.add_argument("--prefill-len",     type=int, default=32)
+    g.add_argument("--decode-len",     type=int, default=16)
     g.add_argument("--warmup",          type=int, default=1)
     g.add_argument("--iters",           type=int, default=3)
     g.add_argument("--modes",           default="baseline,ring_null")
@@ -582,6 +676,10 @@ def _parse_args() -> BenchConfig:
     g.add_argument("--ch-queue-max-size-mb", type=int, default=2048,
                    help="Insert queue byte limit (MiB)")
 
+    g = p.add_argument_group("Output")
+    g.add_argument("--csv", default=None, metavar="FILE",
+                   help="Append results as CSV rows (creates file with header if missing)")
+
     g = p.add_argument_group("ClickHouse connection")
     g.add_argument("--db-host",     default="localhost")
     g.add_argument("--db-port",     type=int, default=9000)
@@ -592,11 +690,12 @@ def _parse_args() -> BenchConfig:
 
     ns = p.parse_args()
     return BenchConfig(
-        model=ns.model, batch_size=ns.batch_size, prompt_len=ns.prompt_len,
-        max_new_tokens=ns.max_new_tokens, warmup=ns.warmup, iters=ns.iters,
+        model=ns.model, batch_size=ns.batch_size, prefill_len=ns.prefill_len,
+        decode_len=ns.decode_len, warmup=ns.warmup, iters=ns.iters,
         modes=[m.strip() for m in ns.modes.split(",")],
         cuda_graphs=bool(ns.cuda_graphs),
         logits_to_keep=ns.logits_to_keep,
+        csv_path=ns.csv,
         hf_offload_hidden_states=bool(ns.hf_offload_hidden_states or ns.hf_offload_all),
         hf_offload_attentions=bool(ns.hf_offload_attentions or ns.hf_offload_all),
         hf_offload_logits=bool(ns.hf_offload_logits or ns.hf_offload_all),
@@ -633,12 +732,12 @@ def main() -> None:
         if m not in valid:
             raise SystemExit(f"Unknown mode {m!r}. Valid: {sorted(valid)}")
 
-    workload = ("prefill-only" if cfg.max_new_tokens == 1
-                else "decode-only" if cfg.prompt_len == 1
+    workload = ("prefill-only" if cfg.decode_len == 1
+                else "decode-only" if cfg.prefill_len == 1
                 else "mixed")
     print(f"Model        : {model_id}")
     print(f"Workload     : {workload}  "
-          f"(batch={cfg.batch_size}  prompt={cfg.prompt_len}  new={cfg.max_new_tokens})")
+          f"(batch={cfg.batch_size}  prefill={cfg.prefill_len}  decode={cfg.decode_len})")
     print(f"Warmup/Iters : {cfg.warmup} / {cfg.iters}")
     print(f"Modes        : {cfg.modes}")
     print(f"CUDA graphs  : {'yes (torch.compile + static cache)' if cfg.cuda_graphs else 'no'}")
@@ -730,20 +829,20 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # Summary table
     # -----------------------------------------------------------------------
-    W = 76
+    W = 110
     print(f"\n{'='*W}")
     print(f"{'SUMMARY  —  ' + workload + ('  (CUDA graphs)' if cfg.cuda_graphs else '  (eager)'):^{W}}")
     print(f"{'='*W}")
-    print(f"{'mode':<12}  {'mean':>8}  {'±std':>6}  {'min':>7}  {'max':>7}  "
-          f"{'tok/s':>7}  {'ring drain':>10}  {'db drain':>8}")
+    print(f"{'mode':<12}  {'total':>8}  {'prefill':>9}  {'decode':>9}  "
+          f"{'TPOT':>8}  {'dec tok/s':>9}  {'ring drain':>10}  {'db drain':>8}")
     print("-" * W)
     for r in results:
         print(f"{r['mode']:<12}  "
               f"{r['mean_ms']:>7.1f}ms  "
-              f"{r['std_ms']:>5.1f}ms  "
-              f"{r['min_ms']:>6.1f}ms  "
-              f"{r['max_ms']:>6.1f}ms  "
-              f"{r['throughput']:>7.1f}  "
+              f"{r['prefill_ms']:>8.1f}ms  "
+              f"{r['decode_ms']:>8.1f}ms  "
+              f"{r['tpot_ms']:>7.2f}ms  "
+              f"{r['decode_throughput']:>9.1f}  "
               f"{r['close_ring_ms']:>9.1f}ms  "
               f"{r['close_db_ms']:>7.1f}ms")
 
@@ -764,6 +863,23 @@ def main() -> None:
         ov = ring_db["mean_ms"] - baseline["mean_ms"]
         print(f"  ring_db   vs baseline : {ov:+.1f} ms  "
               f"({ov / baseline['mean_ms'] * 100:+.1f}%)  [total monitoring overhead]")
+
+    # -----------------------------------------------------------------------
+    # CSV output
+    # -----------------------------------------------------------------------
+    if cfg.csv_path and results:
+        import os
+        write_header = not os.path.exists(cfg.csv_path)
+        with open(cfg.csv_path, "a") as f:
+            if write_header:
+                f.write("batch-size,prefill-length,decode-length,mode,cuda-graph,"
+                        "prefill(ms),decode(ms),TPOT(ms),decode-throughput(tok/s)\n")
+            for r in results:
+                f.write(f"{cfg.batch_size},{cfg.prefill_len},{cfg.decode_len},"
+                        f"{r['mode']},{cfg.cuda_graphs},"
+                        f"{r['prefill_ms']:.1f},{r['decode_ms']:.1f},"
+                        f"{r['tpot_ms']:.2f},{r['decode_throughput']:.1f}\n")
+        print(f"\nCSV {'created' if write_header else 'appended'}: {cfg.csv_path}")
 
 
 if __name__ == "__main__":
