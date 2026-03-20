@@ -1,18 +1,15 @@
-// ring/drain_thread.h — Batch drain thread with condition tensor management.
+// ring/drain_thread.h -- Batch drain thread (no condition tensor / backpressure).
 //
-// Concurrency model: Optimistic Concurrency Control (OCC).
-//   1. prepare_forward (Python thread): grants based on committed tail
-//      (conservative), enqueues H2D on main stream — no sync, no blocking.
-//   2. Forward runs (GPU): producers write to ring, kernels reset conditions.
-//   3. Drain re-checks forward_start_seq_ after D2H sync — validation phase.
-//   4. Re-grant if prepare_forward leaked in — compensation (monotonic, safe).
+// The drain thread scans GPU task entries, batches D2H copies via the staging
+// ring, and submits completed tasks to the p2p thread for slicing and DB
+// insertion.
 //
-// mgmt_mu_ protects all shared management state.  prepare_forward and the
-// drain loop both acquire it for state updates.  Stream ops (D2H, H2D)
-// happen outside the lock.
+// Space is guaranteed by the pre-forward capacity check in Python.  No
+// cuStreamWaitValue32, no condition tensor, no large-tensor bypass.
 //
-// GIL note: prepare_forward is called with GIL released
-// (py::call_guard<py::gil_scoped_release> in bindings).
+// mgmt_mu_ protects all shared management state.
+//
+// GIL note: force_flush_and_wait is called with GIL released.
 
 #pragma once
 #include "ring_state.h"
@@ -42,29 +39,34 @@ public:
     void start();
     void stop();
 
-    void set_condition(uint32_t* d_cond, uint32_t* h_cond, uint32_t num_hooks);
-    void set_null_mode(bool enabled, cudaStream_t main_stream);
-
-    // Runs on Python thread (GIL released).  Computes conditions under
-    // mgmt_mu_, enqueues H2D on main_stream.  Non-blocking, no sync.
-    void prepare_forward(const std::vector<uint64_t>& hook_tensor_bytes,
-                         cudaStream_t main_stream);
-
     void notify();
 
-    // Task queue interface (drain → p2p)
+    // Request the drain thread to flush all pending entries, then block
+    // until it finishes.  Caller must have done cudaStreamSynchronize on
+    // the main stream first so all GPU writes are visible.
+    void force_flush_and_wait();
+
+    // Submit a CPU-direct tensor to drain -> p2p pipeline.
+    // The tensor is already in pageable CPU memory; skips D2H and staging.
+    void submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes);
+
+    // Task queue interface (drain -> p2p)
     uint64_t wait_for_tasks();
     void pop_tasks(uint64_t n, std::vector<DrainTask>& out);
     void signal_p2p_stop();
 
     void notify_staging_freed_bytes(uint64_t nbytes);
-    void notify_bypass_freed();
-
-    std::mutex&              bypass_mu()  { return bypass_mu_; }
-    std::condition_variable& bypass_cv()  { return bypass_cv_; }
-    uint64_t& in_flight_bypass_bytes()    { return in_flight_bypass_bytes_; }
 
     bool is_running() const { return running_.load(std::memory_order_relaxed); }
+
+    // Capacity query accessors (called from RingEnginePy::prepare_step).
+    uint64_t cpu_payload_head() const;
+    uint64_t cpu_payload_tail_committed() const;
+
+    // Pre-allocate ring space for the next step's producer kernels.
+    // Advances cpu_payload_head_ and cpu_task_head_ under mgmt_mu_.
+    // Called from prepare_step after confirming space is available.
+    void reserve(uint64_t payload_bytes, uint32_t num_tasks);
 
 private:
     RingState&      ring_;
@@ -81,12 +83,6 @@ private:
     // ---- mgmt_mu_ protects all state below this line ----
     std::mutex              mgmt_mu_;
 
-    uint32_t*               d_condition_{nullptr};
-    uint32_t*               h_condition_{nullptr};
-    uint32_t                num_hooks_{0};
-
-    std::vector<uint64_t>   hook_tensor_bytes_;
-
     uint64_t                visible_head_{0};
     uint64_t                pending_entries_{0};
     uint64_t                pending_bytes_{0};
@@ -98,23 +94,14 @@ private:
     uint64_t                cpu_payload_tail_{0};           // pending
     uint64_t                cpu_payload_tail_committed_{0}; // safe after D2H
 
-    uint64_t                forward_start_seq_{0};
-    uint64_t                old_pending_{0};
-
-    uint64_t                granted_count_{0};
-    uint64_t                blocked_count_{0};
-    uint64_t                scanned_complete_{0};
-    uint32_t                next_ungrant_idx_{0};
-    uint32_t                drain_hook_idx_{0};
-
-    uint32_t                dirty_lo_{0};
-    uint32_t                dirty_hi_{0};
-    bool                    dirty_{false};
-    bool                    null_mode_{false};
-
     std::chrono::steady_clock::time_point first_complete_time_{};
     bool                    has_complete_time_{false};
     // ---- end mgmt_mu_ protected state ----
+
+    // Force-flush signalling (Python thread -> drain thread)
+    bool                    flush_requested_{false};  // guarded by mu_
+    bool                    flush_done_{false};        // guarded by mu_
+    std::condition_variable flush_done_cv_;
 
     std::deque<DrainTask>   task_queue_;
     std::mutex              queue_mu_;
@@ -126,21 +113,17 @@ private:
     std::mutex              staging_mu_;
     std::condition_variable staging_cv_;
 
-    uint64_t                in_flight_bypass_bytes_{0};
-    std::mutex              bypass_mu_;
-    std::condition_variable bypass_cv_;
-
     void loop();
+
+    // Drain all pending entries -- called by the drain thread when
+    // flush_requested_ is set.  Flushes repeatedly until empty.
+    void do_full_flush();
 
     // Called under mgmt_mu_:
     void scan_ready();
     bool should_flush() const;
     void flush_state_update(uint64_t flush_count, uint64_t flush_bytes);
-    void grant_next_hooks();
-    void handle_large_tensor();
 
-    void mark_dirty(uint32_t idx);
-    void enqueue_conditions_h2d();  // on drain stream_
     void sync_stream();
     void enqueue_d2h(uint64_t flush_bytes);
 

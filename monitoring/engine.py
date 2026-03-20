@@ -288,7 +288,7 @@ class MonitoringEngine:
                         else [attention_mask.shape[1]] * attention_mask.shape[0]
                     )
                 elif ndim == 4 and len(input_shape) >= 2 and int(input_shape[1]) > 0:
-                    # 4D causal mask [batch, 1, q_len, kv_dim] — used by static-cache generate.
+                    # 4D causal mask [batch, 1, q_len, kv_dim] -- used by static-cache generate.
                     # Values: 0.0 = attend, large negative = masked (NOT integer 0/1).
                     # Count non-masked positions among the first q_len key slots using the
                     # last query row (most permissive for left-padded causal sequences).

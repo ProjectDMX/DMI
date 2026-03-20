@@ -1,4 +1,4 @@
-// ring/pinned_staging.h — Pre-allocated pinned host ring buffer for batch D2H.
+// ring/pinned_staging.h -- Pre-allocated pinned host ring buffer for batch D2H.
 //
 // Used by the drain thread (advances head after batch D2H) and the p2p thread
 // (advances tail after copying to pageable memory).

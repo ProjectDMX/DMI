@@ -1,4 +1,4 @@
-// ring/task_ring.cuh — Task/control ring device operations.
+// ring/task_ring.cuh -- Task/control ring device operations.
 //
 // The task ring is a fixed-size FIFO of TaskEntry slots.  A 64-bit counter
 // tracks the producer's position:
@@ -12,14 +12,14 @@
 //
 // Publish protocol (producer):
 //   1. Write all TaskEntry data fields at slot (head % capacity).
-//   2. __threadfence() — ensures data is visible before ready_seq.
+//   2. __threadfence() -- ensures data is visible before ready_seq.
 //   3. Write ready_seq = head  (the slot's logical sequence number).
 //   4. Increment head.
 //
 // Consume protocol (CPU consumer):
 //   1. Poll until __atomic_load_n(entries[tail % cap].ready_seq) == tail.
 //   2. Read entry fields (acquire ordering from the atomic load).
-//   3. Process (D2H, staging, …).
+//   3. Process (D2H, staging, ...).
 //   4. Reset entries[tail % cap].ready_seq = READY_SEQ_SENTINEL.
 //   5. Increment tail (CPU-only shadow).
 //
@@ -39,7 +39,7 @@
 namespace ring {
 
 // ---------------------------------------------------------------------------
-// task_free_slots — available task slots the producer may claim.
+// task_free_slots -- available task slots the producer may claim.
 // ---------------------------------------------------------------------------
 #ifdef __CUDACC__
 __host__ __device__
@@ -56,10 +56,10 @@ inline uint64_t task_free_slots(
 #ifdef __CUDACC__
 
 // ---------------------------------------------------------------------------
-// task_ring_init — initialise a device-side task ring.
+// task_ring_init -- initialise a device-side task ring.
 //
 // Sets every byte in the entry array to 0xFF, which gives:
-//   ready_seq = READY_SEQ_SENTINEL (0xFFFF…)  — slot not published
+//   ready_seq = READY_SEQ_SENTINEL (0xFFFF...)  -- slot not published
 // ---------------------------------------------------------------------------
 inline void task_ring_init(TaskEntry* d_entries, uint64_t capacity,
                            cudaStream_t stream = 0)
@@ -70,7 +70,7 @@ inline void task_ring_init(TaskEntry* d_entries, uint64_t capacity,
 }
 
 // ---------------------------------------------------------------------------
-// task_publish — write a TaskEntry and publish it to the consumer.
+// task_publish -- write a TaskEntry and publish it to the consumer.
 //
 // Copies all non-ready_seq fields from `src` into the slot at `seq_no %
 // capacity`, issues a __threadfence() to enforce write ordering, then writes
@@ -91,7 +91,6 @@ __device__ inline void task_publish(
     slot.payload_len1       = src.payload_len1;
     slot.payload_off2       = src.payload_off2;
     slot.payload_len2       = src.payload_len2;
-    slot.device_src_ptr     = src.device_src_ptr;
 
     // Release fence: all stores above must be visible before ready_seq.
     __threadfence();
@@ -101,7 +100,7 @@ __device__ inline void task_publish(
 }
 
 // ---------------------------------------------------------------------------
-// task_release — consumer: mark slot `tail` as free for reuse (device-side).
+// task_release -- consumer: mark slot `tail` as free for reuse (device-side).
 // ---------------------------------------------------------------------------
 __device__ inline void task_release(
     TaskEntry* entries,
@@ -117,10 +116,10 @@ __device__ inline void task_release(
 #endif  // __CUDACC__
 
 // ---------------------------------------------------------------------------
-// CPU-side consumer helpers — usable from host C++ compiled with g++ or nvcc.
+// CPU-side consumer helpers -- usable from host C++ compiled with g++ or nvcc.
 // ---------------------------------------------------------------------------
 
-// task_cpu_ready — non-blocking: returns true if slot `tail` has been
+// task_cpu_ready -- non-blocking: returns true if slot `tail` has been
 // published by the GPU producer.
 inline bool task_cpu_ready(
     const TaskEntry* entries,
@@ -133,7 +132,7 @@ inline bool task_cpu_ready(
     return __atomic_load_n(rs, __ATOMIC_ACQUIRE) == tail;
 }
 
-// task_release_cpu — reset slot `tail` to SENTINEL so the producer can
+// task_release_cpu -- reset slot `tail` to SENTINEL so the producer can
 // reuse the slot.
 inline void task_release_cpu(
     TaskEntry* entries,

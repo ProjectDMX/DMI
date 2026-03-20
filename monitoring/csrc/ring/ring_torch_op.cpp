@@ -5,7 +5,7 @@
 // Active ring engine pointer. Set via ring_set_active_engine() from Python
 // activate()/deactivate(). Accessed only during CUDA graph CAPTURE (when this
 // C++ impl body runs). During graph REPLAY only the captured cudaLaunchKernel
-// args are re-used — this pointer is never read.
+// args are re-used -- this pointer is never read.
 static ring_py::RingEnginePy* g_active_engine = nullptr;
 
 // Host-side call counter per hook_type (diagnostic)
@@ -37,7 +37,7 @@ void ring_set_active_engine(ring_py::RingEnginePy* e) {
 // HookPoint.forward() returns x_cont (not original x) so inductor cannot
 // DCE the .contiguous() copy + producer call for non-contiguous tensors.
 //
-// Uses hook_no_notify() — condition-gated producer kernel launch.
+// Uses hook_no_notify() -- unconditional producer kernel launch.
 void ring_producer_impl(
     const at::Tensor& tensor, int64_t hook_type, int64_t hook_id)
 {

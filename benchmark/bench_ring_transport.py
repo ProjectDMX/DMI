@@ -1,10 +1,10 @@
 """Ring-transport benchmark.
 
 Compares four modes:
-  baseline         — plain HF generate, no monitoring
-  ring_kernels_only— ring transport active, producer kernels fire but do zero work (null_mode on)
-  ring_null        — ring transport active (GPU→CPU transfer), null sink (no DB write)
-  ring_db          — ring transport + ClickHouse ingestion
+  baseline         -- plain HF generate, no monitoring
+  ring_kernels_only-- ring transport active, producer kernels fire but do zero work (null_mode on)
+  ring_null        -- ring transport active (GPU->CPU transfer), null sink (no DB write)
+  ring_db          -- ring transport + ClickHouse ingestion
 
 Per-step (prefill vs decode) timing is intentionally NOT reported here.
 Inserting a GPU sync barrier between every step breaks CUDA-graph pipelining
@@ -115,7 +115,6 @@ class BenchConfig:
     drain_flush_entry_threshold: int = 0
     drain_flush_byte_threshold: int = 0
     drain_flush_timeout_us: int = 0
-    bypass_budget_mb: int = 256
     clone_slices: bool = False
 
     ch_parallelism: int = 10
@@ -146,7 +145,6 @@ def _make_ring_cfg(cfg: BenchConfig):
     rc.drain_flush_entry_threshold = cfg.drain_flush_entry_threshold
     rc.drain_flush_byte_threshold  = cfg.drain_flush_byte_threshold
     rc.drain_flush_timeout_us      = cfg.drain_flush_timeout_us
-    rc.bypass_budget_bytes         = cfg.bypass_budget_mb * 1024 * 1024
     rc.clone_slices                = cfg.clone_slices
     rc.insert_queue_max_bytes      = cfg.ch_queue_max_size_mb * 1024 * 1024
     rc.insert_queue_max_items      = cfg.ch_queue_max_items
@@ -219,7 +217,7 @@ def _make_inputs(tokenizer, cfg: BenchConfig, device: torch.device):
 
 
 # ---------------------------------------------------------------------------
-# Per-iteration runner — returns total wall time only
+# Per-iteration runner -- returns total wall time only
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -252,6 +250,12 @@ def _run_one(model, input_ids, attention_mask,
     extra["logits_to_keep"] = cfg.logits_to_keep
     if cfg.cuda_graphs:
         extra["cache_implementation"] = "static"
+        try:
+            from transformers import CompileConfig
+            extra["compile_config"] = CompileConfig(
+                mode="reduce-overhead", fullgraph=False)
+        except ImportError:
+            pass
 
     # Wrap prepare_inputs_for_generation to record per-step timestamps.
     # This is the first line of each step in HF's generate() loop.
@@ -501,7 +505,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         model.monitoring_engine = None
 
     try:
-        # Warmup — null mode so producer kernels fire (same CUDA graph topology)
+        # Warmup -- null mode so producer kernels fire (same CUDA graph topology)
         # but the kernel body is a no-op; ring buffer and drain pipeline are idle.
         print(f"  Warming up ({cfg.warmup} iter)...", flush=True)
         ring_engine    = getattr(engine, "_ring_engine",    None)
@@ -640,7 +644,7 @@ def _parse_args() -> BenchConfig:
     g.add_argument("--hf-offload-all",           action="store_true",
                    help="hf_offload: shorthand for all three above")
 
-    g = p.add_argument_group("Ring engine — GPU buffers")
+    g = p.add_argument_group("Ring engine -- GPU buffers")
     g.add_argument("--ring-task-entries", type=int, default=65536,
                    help="Task ring slot count")
     g.add_argument("--ring-payload-mb",   type=int, default=4096,
@@ -648,9 +652,9 @@ def _parse_args() -> BenchConfig:
     g.add_argument("--ring-pinned-mb",    type=int, default=4096,
                    help="Pinned staging ring size (MiB, 0 = payload size)")
 
-    g = p.add_argument_group("Ring engine — drain thread")
+    g = p.add_argument_group("Ring engine -- drain thread")
     g.add_argument("--drain-poll-timeout-us", type=int, default=100,
-                   help="Drain thread poll timeout in µs (must be > 0)")
+                   help="Drain thread poll timeout in us (must be > 0)")
     g.add_argument("--drain-flush-task-ratio",    type=float, default=0.0,
                    help="Flush at N%% task ring usage (0 = disabled)")
     g.add_argument("--drain-flush-payload-ratio", type=float, default=0.0,
@@ -662,9 +666,7 @@ def _parse_args() -> BenchConfig:
     g.add_argument("--drain-flush-timeout-us",     type=int, default=0,
                    help="Flush after complete tensor pending N us (0 = disabled)")
 
-    g = p.add_argument_group("Ring engine — bypass / p2p")
-    g.add_argument("--bypass-budget-mb", type=int, default=256,
-                   help="Large tensor bypass budget (MiB)")
+    g = p.add_argument_group("Ring engine -- p2p")
     g.add_argument("--clone-slices", action="store_true",
                    help="Clone per-request slices before submit")
 
@@ -707,7 +709,6 @@ def _parse_args() -> BenchConfig:
         drain_flush_entry_threshold=ns.drain_flush_entry_threshold,
         drain_flush_byte_threshold=ns.drain_flush_byte_threshold,
         drain_flush_timeout_us=ns.drain_flush_timeout_us,
-        bypass_budget_mb=ns.bypass_budget_mb,
         clone_slices=bool(ns.clone_slices),
         ch_parallelism=ns.ch_parallelism, ch_queue_max_items=ns.ch_queue_max_items,
         ch_queue_max_size_mb=ns.ch_queue_max_size_mb,
@@ -740,7 +741,7 @@ def main() -> None:
           f"(batch={cfg.batch_size}  prefill={cfg.prefill_len}  decode={cfg.decode_len})")
     print(f"Warmup/Iters : {cfg.warmup} / {cfg.iters}")
     print(f"Modes        : {cfg.modes}")
-    print(f"CUDA graphs  : {'yes (torch.compile + static cache)' if cfg.cuda_graphs else 'no'}")
+    print(f"CUDA graphs  : {'yes (CompileConfig + static cache)' if cfg.cuda_graphs else 'no'}")
     print(f"Ring buffers : payload={cfg.ring_payload_mb} MB  "
           f"pinned={cfg.ring_pinned_mb} MB  "
           f"tasks={cfg.ring_task_entries}")
@@ -773,10 +774,8 @@ def main() -> None:
             m = HookedGPT2LMHeadModel.from_pretrained(
                 model_id, attn_implementation="eager", torch_dtype=torch.float16)
         m.to(device).eval()
-        if cfg.cuda_graphs:
-            print("  Compiling with torch.compile(mode='reduce-overhead')...", flush=True)
-            m = torch.compile(m, mode="reduce-overhead")
-            print("  done.", flush=True)
+        # No external torch.compile -- HF's generate() handles compilation
+        # internally via CompileConfig passed in kwargs (see _run_one).
         return m
 
     def _load_vanilla():
@@ -785,10 +784,6 @@ def main() -> None:
         m = AutoModelForCausalLM.from_pretrained(
             model_id, attn_implementation="eager", torch_dtype=torch.float16)
         m.to(device).eval()
-        if cfg.cuda_graphs:
-            print("  Compiling with torch.compile(mode='reduce-overhead')...", flush=True)
-            m = torch.compile(m, mode="reduce-overhead")
-            print("  done.", flush=True)
         return m
 
     # Group modes by model type so we load/free each model once per group.
@@ -831,7 +826,7 @@ def main() -> None:
     # -----------------------------------------------------------------------
     W = 110
     print(f"\n{'='*W}")
-    print(f"{'SUMMARY  —  ' + workload + ('  (CUDA graphs)' if cfg.cuda_graphs else '  (eager)'):^{W}}")
+    print(f"{'SUMMARY  --  ' + workload + ('  (CUDA graphs)' if cfg.cuda_graphs else '  (eager)'):^{W}}")
     print(f"{'='*W}")
     print(f"{'mode':<12}  {'total':>8}  {'prefill':>9}  {'decode':>9}  "
           f"{'TPOT':>8}  {'dec tok/s':>9}  {'ring drain':>10}  {'db drain':>8}")

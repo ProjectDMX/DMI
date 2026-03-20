@@ -1,4 +1,4 @@
-// ring/ring_debug.h — Compile-time debug logging for ring transport.
+// ring/ring_debug.h -- Compile-time debug logging for ring transport.
 //
 // Set RING_DEBUG to 1 at compile time to enable verbose logging.
 // When 0 (default), all RING_DBG calls are compiled out completely.

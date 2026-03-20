@@ -1,4 +1,4 @@
-// ring/ring_config.h — Runtime configuration for the GPU offload rings.
+// ring/ring_config.h -- Runtime configuration for the GPU offload rings.
 //
 // All knobs live here.  Changing them at construction time does not require
 // re-capturing the CUDA graph (Milestone 5 constraint).
@@ -22,23 +22,7 @@ inline uint64_t align_up(uint64_t x, uint64_t a) {
 }
 
 // ---------------------------------------------------------------------------
-// Condition tensor values.
-//
-// Written by kernel (device-side):
-//   COND_RESET   (0): normal path done — ready for next forward.
-//   COND_PENDING (1): large bypass kernel done — drain must D2H + ack to 0.
-//
-// Written by drain thread (host-side H2D):
-//   COND_GRANT_TASK_ONLY (3): large tensor may proceed (task slot available).
-//   COND_GRANT_FULL      (4): normal tensor may proceed (task slot + ring space).
-// ---------------------------------------------------------------------------
-static constexpr uint32_t COND_RESET          = 0;
-static constexpr uint32_t COND_PENDING        = 1;
-static constexpr uint32_t COND_GRANT_TASK_ONLY = 3;
-static constexpr uint32_t COND_GRANT_FULL      = 4;
-
-// ---------------------------------------------------------------------------
-// DrainFlushConfig — controls when the batch drain thread flushes pending
+// DrainFlushConfig -- controls when the batch drain thread flushes pending
 // entries to host.
 // ---------------------------------------------------------------------------
 struct DrainFlushConfig {
@@ -56,7 +40,7 @@ struct DrainFlushConfig {
 };
 
 // ---------------------------------------------------------------------------
-// RingConfig — all tunable parameters.
+// RingConfig -- all tunable parameters.
 // ---------------------------------------------------------------------------
 struct RingConfig {
     // Task/control ring: number of fixed-size TaskEntry slots (power of 2
@@ -67,23 +51,13 @@ struct RingConfig {
     uint64_t payload_ring_bytes = 256ULL * 1024 * 1024;  // 256 MiB
 
     // Pinned staging ring size. 0 = default to payload_ring_bytes.
-    // The bypass guard (tensor_total_padded_bytes > staging_capacity)
-    // prevents deadlock regardless of the ratio to payload_ring_bytes.
     uint64_t pinned_staging_bytes = 0;
 
     // Drain thread poll timeout in microseconds.  Must be > 0.
-    // The drain thread polls periodically to process entries published
-    // mid-forward (e.g., forced flush when all granted tensors are present,
-    // or large-tensor bypass ack).
     uint64_t drain_poll_timeout_us = 100;
 
     // Batch drain flush rules.
     DrainFlushConfig drain_flush;
-
-    // Bypass path: max bytes of bypass tensors queued between drain
-    // and p2p threads. One tensor is always allowed even if it exceeds
-    // this budget (prevents single-large-tensor deadlock).
-    uint64_t bypass_budget_bytes = 256ULL * 1024 * 1024;  // 256 MiB
 
     // Clone per-request slices before submitting to host engine.
     // When true (and batch_size > 1), each slice is cloned so the full

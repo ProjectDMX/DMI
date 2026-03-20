@@ -1,4 +1,4 @@
-// ring/p2p_thread.h — Pinned-to-pageable thread: copies assembled tensors from
+// ring/p2p_thread.h -- Pinned-to-pageable thread: copies assembled tensors from
 // the pinned staging ring to pageable CPU memory, pops metadata from
 // TensorMetaFifo, performs per-request slicing, and submits to host engine.
 //
@@ -21,7 +21,7 @@ namespace at { class Tensor; }
 namespace ring {
 
 // Called by the p2p thread for each per-request tensor slice.
-// Runs without the GIL — all arguments are C++ types.
+// Runs without the GIL -- all arguments are C++ types.
 using SubmitFn = std::function<void(
     const std::string& model_id,
     int32_t            shard_rank,

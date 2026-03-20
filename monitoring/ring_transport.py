@@ -12,7 +12,7 @@ New CUDA-graph-compatible path (activated when model_shape + get_hook_specs are 
   - ModelShapeConfig + analytical shape computation (no warmup needed)
   - pre_push_all_metas called before orig_forward, outside compiled region
 
-Legacy path (HookPoint.forward → capture_tensor) still works as a fallback.
+Legacy path (HookPoint.forward -> capture_tensor) still works as a fallback.
 """
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ _HIDDEN_DIM_TYPES = frozenset({
 
 
 # ---------------------------------------------------------------------------
-# Hook-name → (hook_type, hook_id) helpers  (legacy path)
+# Hook-name -> (hook_type, hook_id) helpers  (legacy path)
 # ---------------------------------------------------------------------------
 
 _HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {
@@ -85,6 +85,11 @@ _HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {
 }
 
 
+def align_up_py(x: int, a: int) -> int:
+    """Python equivalent of ring::align_up (a must be a power of 2)."""
+    return (x + a - 1) & ~(a - 1)
+
+
 def _hook_type_from_name(hook_name: str) -> int:
     for suffix, htype in _HOOK_SUFFIX_TO_TYPE.items():
         if hook_name == suffix or hook_name.endswith("." + suffix):
@@ -104,7 +109,7 @@ def _hook_id_from_name(hook_name: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# ModelShapeConfig — provided at hook-installation time
+# ModelShapeConfig -- provided at hook-installation time
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -119,14 +124,14 @@ class ModelShapeConfig:
 
 
 # ---------------------------------------------------------------------------
-# HookSpec — model self-describes its hooks in forward() firing order
+# HookSpec -- model self-describes its hooks in forward() firing order
 # ---------------------------------------------------------------------------
 
 @dataclass
 class HookSpec:
     """One monitoring hook: name, shape convention, and module reference."""
     name:      str                        # e.g. "blocks.3.attn.hook_attn_scores"
-    hook_type: int                        # HOOK_TYPE_* — determines shape formula
+    hook_type: int                        # HOOK_TYPE_* -- determines shape formula
     module:    nn.Module                  # the HookPoint instance
     dtype:     Optional[torch.dtype] = None  # override model dtype (e.g. int64 for token_ids)
 
@@ -147,7 +152,7 @@ _active_transport: Optional["RingTransport"] = None
 # ---------------------------------------------------------------------------
 try:
     from . import _native_engine as _ne
-    _ne._load_extension()  # ensure .so is loaded → registers ring::producer
+    _ne._load_extension()  # ensure .so is loaded -> registers ring::producer
 
     @torch.library.register_fake("ring::producer")
     def _ring_producer_fake(
@@ -176,7 +181,7 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# kv_dim computation — cache-type-aware, called before each forward
+# kv_dim computation -- cache-type-aware, called before each forward
 # ---------------------------------------------------------------------------
 
 def _get_kv_dim(past_key_values: Any, q_len: int, is_static: bool = False) -> int:
@@ -190,7 +195,7 @@ def _get_kv_dim(past_key_values: Any, q_len: int, is_static: bool = False) -> in
     ASSUMPTION: hooked attention tensors (attn_scores, pattern) have shape
     [batch, heads, q_len, kv_dim] where kv_dim equals the physical cache
     dimension.  This is deterministic given the same input size and cache
-    config — required for correct FIFO metadata matching.
+    config -- required for correct FIFO metadata matching.
 
     Args:
         past_key_values: cache object (StaticCache, DynamicCache, or None)
@@ -246,7 +251,7 @@ def _compute_hook_shape(
     if hook_type == HOOK_TYPE_Z:
         return [batch, q_len, cfg.num_heads, cfg.head_dim]
     if hook_type == HOOK_TYPE_RESULT:
-        # hook_result is after o_proj → shape is [B, q_len, hidden_dim],
+        # hook_result is after o_proj -> shape is [B, q_len, hidden_dim],
         # not [B, q_len, num_heads, head_dim] (differs on GQA models).
         return [batch, q_len, cfg.hidden_dim]
     if hook_type in (HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN):
@@ -259,7 +264,7 @@ def _compute_hook_shape(
         # [batch, 1, vocab], not [batch, q_len, vocab].
         logits_q = min(q_len, logits_to_keep) if logits_to_keep > 0 else q_len
         return [batch, logits_q, cfg.vocab_size] if cfg.vocab_size > 0 else []
-    return []  # unknown type — push_meta skipped
+    return []  # unknown type -- push_meta skipped
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +278,7 @@ def _make_ring_hook(hook_type: int, hook_id: int):
     HookPoint.forward() via torch.ops.ring.producer (C++ TORCH_LIBRARY,
     captured in CUDA graph).  This hook is kept so _forward_hook_names
     remains populated and capture_tensor() correctly skips hooks handled
-    by HookPoint.forward().  The actual GPU→ring data path is entirely
+    by HookPoint.forward().  The actual GPU->ring data path is entirely
     in the C++ producer kernel; these Python hooks are never invoked for
     ring transport data capture.
     """
@@ -317,7 +322,7 @@ class RingTransport:
     def __init__(self, ring_engine: Any) -> None:
         self._ring_engine = ring_engine
 
-        # Current step context — set before each forward pass
+        # Current step context -- set before each forward pass
         self._current_model_id: Optional[str] = None
         self._current_shard_rank: int = 0
         self._current_req_ids: Optional[List[str]] = None
@@ -329,6 +334,12 @@ class RingTransport:
         # Toggle via _ring_engine.set_null_mode() to control device-side behavior.
         self.null_offload: bool = False
 
+        # Shared path flag for ALL hooks.  Reset to False at the start of
+        # every pre-forward.  Set to True when the entire step's data exceeds
+        # ring capacity (Case B).  When True, ALL enabled hooks use the
+        # eager .cpu() path for that step.
+        self.cpu_direct: bool = False
+
         # New-path state
         self._model_cfg: Optional[ModelShapeConfig] = None
         self._active_specs: List[HookSpec] = []
@@ -337,6 +348,14 @@ class RingTransport:
         # capture_tensor() skips these; any HookPoint whose name is not in this set
         # falls through to the legacy capture_tensor() path.
         self._forward_hook_names: set = set()
+
+        # When True, _prepare_wrapper skips prepare_step entirely --
+        # all hooks use cpu_direct for the entire generate() call.
+        # Set by generate_with_monitoring when decode doesn't fit in ring.
+        self._force_cpu_direct: bool = False
+
+        # warn_once tracking for Case B fallback
+        self._warned_shapes: set = set()
 
     def set_step_context(
         self,
@@ -395,6 +414,16 @@ class RingTransport:
                 list(self._current_req_ids),
                 list(self._current_token_ranges),
             )
+
+    def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
+                          hook_type: int, hook_id: int) -> None:
+        """Submit a CPU-direct tensor to the drain -> p2p pipeline.
+
+        Called from HookPoint.forward() when cpu_direct=True.  The tensor
+        is already in pageable CPU memory; it bypasses the ring and staging
+        entirely.
+        """
+        self._ring_engine.submit_cpu_direct(cpu_tensor)
 
     def capture_tensor(self, tensor: torch.Tensor, hook_name: str) -> None:
         """Legacy capture path: called from HookPoint.forward().

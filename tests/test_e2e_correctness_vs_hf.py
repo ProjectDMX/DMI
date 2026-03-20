@@ -169,7 +169,6 @@ def _make_ring_cfg():
     rc.drain_flush_entry_threshold = int(os.environ.get("E2E_DRAIN_FLUSH_ENTRY_THRESHOLD", "0"))
     rc.drain_flush_byte_threshold  = int(os.environ.get("E2E_DRAIN_FLUSH_BYTE_THRESHOLD", "0"))
     rc.drain_flush_timeout_us      = int(os.environ.get("E2E_DRAIN_FLUSH_TIMEOUT_US", "0"))
-    rc.bypass_budget_bytes        = int(os.environ.get("E2E_BYPASS_BUDGET_BYTES", str(256 * 1024**2)))
     rc.clone_slices               = int(os.environ.get("E2E_CLONE_SLICES", "0")) != 0
     rc.insert_queue_max_bytes     = int(os.environ.get("E2E_INSERT_QUEUE_MAX_BYTES", str(512 * 1024**2)))
     rc.insert_queue_max_items     = int(os.environ.get("E2E_INSERT_QUEUE_MAX_ITEMS", "4096"))
@@ -878,14 +877,11 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     )
     mon_model.to(device).eval()
 
-    # Compile BEFORE attaching the monitoring engine so torch.compile sees the
-    # original forward.  Monitoring hooks are then installed per generate call.
-    mon_model = torch.compile(mon_model, mode="reduce-overhead")
-
     mon_model.monitoring_engine = engine
     engine.prepare_for_model(mon_model)
 
     try:
+        from transformers import CompileConfig
         with torch.no_grad():
             gen_out = generate_with_monitoring(
                 mon_model,
@@ -895,9 +891,8 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
                 do_sample=False,
                 pad_token_id=pad_id,
                 eos_token_id=eos_id,
-                cache_implementation="static",  # enables CUDA graph capture in HF
-                # logits_to_keep defaults to 1 (HF generate auto-sets it).
-                # _compute_hook_shape handles this via logits_to_keep param.
+                cache_implementation="static",
+                compile_config=CompileConfig(mode="reduce-overhead", fullgraph=False),
             )
     finally:
         engine.close()
@@ -1285,11 +1280,11 @@ def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
     mon_model = model_cls.from_pretrained(
         hf_model_id, attn_implementation="eager", torch_dtype=torch.float16,
     ).to(device).eval()
-    mon_model = torch.compile(mon_model, mode="reduce-overhead")
     mon_model.monitoring_engine = engine
     engine.prepare_for_model(mon_model)
 
     try:
+        from transformers import CompileConfig
         with torch.no_grad():
             generate_with_monitoring(
                 mon_model,
@@ -1297,6 +1292,7 @@ def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
                 max_new_tokens=max_new_tokens, do_sample=False,
                 pad_token_id=pad_id, eos_token_id=eos_id,
                 cache_implementation="static",
+                compile_config=CompileConfig(mode="reduce-overhead", fullgraph=False),
             )
     finally:
         engine.close()

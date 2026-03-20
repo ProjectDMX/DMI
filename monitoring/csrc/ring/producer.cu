@@ -1,18 +1,7 @@
-// ring/producer.cu — Multi-block producer kernel and host-side launcher.
+// ring/producer.cu -- Multi-block producer kernel and host-side launcher.
 //
-// The kernel never spins.  Backpressure is handled by cuStreamWaitValue32
-// on the condition tensor BEFORE the kernel is launched (host side).
-// One tensor = one task entry.  No chunking.
-//
-// After publishing, the kernel writes to d_condition[hook_idx]:
-//   Normal path:  d_condition[hook_idx] = 0  (COND_RESET — ready for next forward)
-//   Large bypass: d_condition[hook_idx] = 1  (COND_PENDING — drain must D2H + ack)
-//
-// Large bypass: condition=1 is written BEFORE task_publish to prevent a race
-// where the drain processes the entry and acks (writes 0) before the kernel
-// writes 1 — which would overwrite the ack and cause deadlock.  The
-// __threadfence inside task_publish ensures condition=1 is globally visible
-// before ready_seq (which the drain polls).
+// The kernel never spins.  Space is guaranteed by the pre-forward capacity
+// check before kernel launch.  One tensor = one task entry.  No chunking.
 
 #include "producer.cuh"
 #include "payload_ring.cuh"
@@ -25,7 +14,7 @@ __device__ bool g_ring_null_mode = false;
 
 // Counter for last-block-arrives pattern.  Reset by the last block after
 // publishing.  Safe without host-side reset because producers are serialized
-// on one stream — the next producer_kernel launch cannot start until the
+// on one stream -- the next producer_kernel launch cannot start until the
 // current one finishes.
 __device__ uint32_t g_block_done_counter = 0;
 
@@ -54,56 +43,28 @@ __device__ inline void d2d_copy_grid_stride(
     for (uint64_t i = gtid; i < n_vec; i += stride)
         d4[i] = s4[i];
 
-    // Tail bytes — at most 15 bytes, only low-numbered threads participate.
+    // Tail bytes -- at most 15 bytes, only low-numbered threads participate.
     const uint64_t tb = n_vec * VEC;
     for (uint64_t i = gtid; i < tail; i += stride)
         dst[tb + i] = src[tb + i];
 }
 
 // ---------------------------------------------------------------------------
-// producer_kernel — multi-block, size-tiered grid
+// producer_kernel -- multi-block, size-tiered grid
 // ---------------------------------------------------------------------------
 __global__ void producer_kernel(
     RingState       ring,
     const uint8_t*  src,
     uint64_t        src_bytes,
-    uint32_t        hook_type,
-    bool            large_bypass,
-    uint32_t*       d_condition,
-    uint32_t        hook_idx)
+    uint32_t        hook_type)
 {
     if (g_ring_null_mode) return;
-
-    // --- Large tensor bypass ---
-    if (large_bypass) {
-        if (blockIdx.x == 0 && threadIdx.x == 0) {
-            uint64_t task_head = *ring.task_head;
-
-            TaskEntry entry{};
-            entry.tensor_total_bytes = src_bytes;
-            entry.device_src_ptr     = src;
-
-            // Write COND_PENDING BEFORE task_publish.  The __threadfence
-            // inside task_publish ensures this write is globally visible
-            // before ready_seq.  If we wrote AFTER, the drain could see
-            // the entry, ack (write 0), and then this kernel would
-            // overwrite the ack with 1 → deadlock.
-            if (d_condition)
-                d_condition[hook_idx] = COND_PENDING;
-
-            task_publish(ring.task_entries, ring.task_cap, task_head, entry);
-            *ring.task_head = task_head + 1;
-        }
-        return;
-    }
-
-    // --- Normal path: multi-block D2D copy + last-block publish ---
 
     const uint64_t gtid   = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const uint64_t stride = uint64_t(gridDim.x)  * blockDim.x;
 
     // All threads read ring heads from global memory (L1/L2 cached).
-    // These values are stable for the duration of this kernel — no other
+    // These values are stable for the duration of this kernel -- no other
     // kernel modifies them concurrently.
     const uint64_t alloc_bytes = align_up(src_bytes, PAYLOAD_ALIGN);
 
@@ -149,14 +110,10 @@ __global__ void producer_kernel(
             entry.payload_len1       = data_in_span1;
             entry.payload_off2       = spans.off2;
             entry.payload_len2       = src_bytes - data_in_span1;
-            entry.device_src_ptr     = nullptr;
 
             task_publish(ring.task_entries, ring.task_cap, task_head, entry);
             *ring.task_head    = task_head + 1;
             *ring.payload_head = ph;
-
-            if (d_condition)
-                d_condition[hook_idx] = COND_RESET;
 
             // Reset counter for the next kernel launch on this stream.
             g_block_done_counter = 0;
@@ -165,16 +122,13 @@ __global__ void producer_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// launch_producer — size-tiered grid selection
+// launch_producer -- size-tiered grid selection
 // ---------------------------------------------------------------------------
 void launch_producer(
     const RingState& ring,
     const uint8_t*   d_src,
     uint64_t         src_bytes,
     uint32_t         hook_type,
-    bool             large_bypass,
-    uint32_t*        d_condition,
-    uint32_t         hook_idx,
     cudaStream_t     stream)
 {
     // Size-tiered grid: baked into CUDA graph at capture time.
@@ -185,7 +139,7 @@ void launch_producer(
     else                                   n_blocks = TIER3_BLOCKS;
 
     producer_kernel<<<n_blocks, PRODUCER_BLOCK_DIM, 0, stream>>>(
-        ring, d_src, src_bytes, hook_type, large_bypass, d_condition, hook_idx);
+        ring, d_src, src_bytes, hook_type);
 }
 
 }  // namespace ring

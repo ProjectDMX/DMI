@@ -349,7 +349,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("drain_flush_entry_threshold", &ring_py::RingConfig::drain_flush_entry_threshold)
       .def_readwrite("drain_flush_byte_threshold",  &ring_py::RingConfig::drain_flush_byte_threshold)
       .def_readwrite("drain_flush_timeout_us",     &ring_py::RingConfig::drain_flush_timeout_us)
-      .def_readwrite("bypass_budget_bytes",       &ring_py::RingConfig::bypass_budget_bytes)
       .def_readwrite("clone_slices",              &ring_py::RingConfig::clone_slices)
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
       .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
@@ -385,23 +384,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("start", &ring_py::RingEnginePy::start)
       .def("stop",  &ring_py::RingEnginePy::stop,
            py::call_guard<py::gil_scoped_release>())
-      .def("init_hooks", &ring_py::RingEnginePy::init_hooks,
+      .def("prepare_step",
+           &ring_py::RingEnginePy::prepare_step,
+           py::arg("step_total_bytes"),
            py::arg("num_hooks"),
            py::call_guard<py::gil_scoped_release>())
-      // GIL held throughout (no py::call_guard<py::gil_scoped_release>):
-      // - Lambda accesses py::list (needs GIL for iteration + dec_ref).
-      // - Single Python thread in inference → holding GIL has zero cost.
-      // - Drain thread is pure C++ (never acquires GIL) → no deadlock.
-      .def("prepare_forward",
-           [](ring_py::RingEnginePy& self, py::list sizes_py, uint64_t stream) {
-               std::vector<uint64_t> sizes;
-               sizes.reserve(py::len(sizes_py));
-               for (auto h : sizes_py)
-                   sizes.push_back(py::cast<uint64_t>(h));
-               self.prepare_forward(sizes, stream);
+      .def("submit_cpu_direct",
+           [](ring_py::RingEnginePy& self, at::Tensor cpu_tensor) {
+               uint64_t nbytes = static_cast<uint64_t>(cpu_tensor.nbytes());
+               self.submit_cpu_direct(std::move(cpu_tensor), nbytes);
            },
-           py::arg("hook_tensor_bytes"),
-           py::arg("stream_handle") = uint64_t{0})
+           py::arg("cpu_tensor"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("payload_cap", &ring_py::RingEnginePy::payload_cap)
+      .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
       .def("push_meta",
            [](ring_py::RingEnginePy& self,
               const std::string& hook_name,

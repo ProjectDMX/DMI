@@ -1,4 +1,4 @@
-// ring/payload_ring.cuh — Payload byte-ring arithmetic.
+// ring/payload_ring.cuh -- Payload byte-ring arithmetic.
 //
 // All functions are __host__ __device__ so they can be called from both host
 // code (e.g., tests, init) and device kernels (e.g., the producer post-op).
@@ -24,7 +24,7 @@
 namespace ring {
 
 // ---------------------------------------------------------------------------
-// TwoSpan — result of a two-span payload reservation.
+// TwoSpan -- result of a two-span payload reservation.
 //
 // When a reservation of `nbytes` crosses the physical end of the ring, it is
 // split into two contiguous regions:
@@ -41,7 +41,7 @@ struct TwoSpan {
 };
 
 // ---------------------------------------------------------------------------
-// payload_free_bytes — available space for a new reservation.
+// payload_free_bytes -- available space for a new reservation.
 //
 // Invariant: head - tail <= capacity (enforced by the producer before
 // reserving; tail is only advanced by the consumer).
@@ -53,7 +53,7 @@ __host__ __device__ inline uint64_t payload_free_bytes(
 }
 
 // ---------------------------------------------------------------------------
-// payload_compute_spans — compute a two-span descriptor for `nbytes` bytes
+// payload_compute_spans -- compute a two-span descriptor for `nbytes` bytes
 // starting at the current `head` position.
 //
 // Precondition:
@@ -71,7 +71,7 @@ __host__ __device__ inline TwoSpan payload_compute_spans(
     uint64_t to_end = capacity - off;   // bytes from `off` to end-of-buffer
 
     if (nbytes <= to_end) {
-        // Single contiguous span — no wrap needed.
+        // Single contiguous span -- no wrap needed.
         s.off1 = off;
         s.len1 = nbytes;
         // s.off2, s.len2 remain 0
@@ -86,7 +86,7 @@ __host__ __device__ inline TwoSpan payload_compute_spans(
 }
 
 // ---------------------------------------------------------------------------
-// payload_advance_head — commit a reservation of `nbytes` bytes.
+// payload_advance_head -- commit a reservation of `nbytes` bytes.
 //
 // Call AFTER writing data into the spans returned by payload_compute_spans(),
 // but BEFORE publishing the corresponding TaskEntry (ready_seq must be the
@@ -99,7 +99,7 @@ __host__ __device__ inline void payload_advance_head(
 }
 
 // ---------------------------------------------------------------------------
-// payload_release — consumer frees `nbytes` of payload space.
+// payload_release -- consumer frees `nbytes` of payload space.
 //
 // Call AFTER the D2H transfer for the corresponding spans is complete and the
 // data has been safely staged in pinned host memory.  After this call,
@@ -112,7 +112,7 @@ __host__ __device__ inline void payload_release(
 }
 
 // ---------------------------------------------------------------------------
-// payload_chunk_bytes — payload bytes consumed by a TaskEntry.
+// payload_chunk_bytes -- payload bytes consumed by a TaskEntry.
 //
 // Convenience: just len1 + len2 (which equals the original nbytes argument
 // passed to payload_compute_spans).

@@ -1,4 +1,4 @@
-// ring/p2p_thread.cpp — Pinned-to-pageable thread implementation.
+// ring/p2p_thread.cpp -- Pinned-to-pageable thread implementation.
 // Compiled with g++ (not nvcc); uses ATen for tensor operations.
 
 #include "p2p_thread.h"
@@ -106,17 +106,10 @@ void P2PThread::process(std::vector<DrainTask>& tasks) {
     for (size_t i = 0; i < tasks.size(); ++i) {
         DrainTask& task = tasks[i];
 
-        if (task.large_tensor.defined()) {
-            // Large tensor — already in pageable memory
-            at::Tensor tensor = std::move(task.large_tensor);
+        if (task.cpu_paged_tensor.defined()) {
+            // CPU-direct tensor -- already in pageable memory, skip staging copy
+            at::Tensor tensor = std::move(task.cpu_paged_tensor);
             do_post_processing(tensor, task);
-
-            // Release bypass budget
-            {
-                std::lock_guard<std::mutex> lk(drain_.bypass_mu());
-                drain_.in_flight_bypass_bytes() -= task.tensor_total_bytes;
-            }
-            drain_.notify_bypass_freed();
             continue;
         }
 

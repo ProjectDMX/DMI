@@ -119,6 +119,22 @@ DeviceType = Optional[torch.device]
 _grad_t = Union[tuple[Tensor, ...], Tensor]
 
 
+@torch.compiler.disable
+def _hook_cpu_direct(x: Tensor, transport, hook_type: int, hook_id: int) -> None:
+    """CPU-direct capture path -- disabled from torch.compile.
+
+    Marked @torch.compiler.disable so Dynamo inserts a graph break immediately
+    without tracing the body.  This prevents recompilation-limit exhaustion
+    from per-hook shape specialization (all HookPoint instances share one
+    forward() bytecode, but each sees a different x shape).
+
+    When cpu_direct=False (normal ring path), this function is never called
+    and the ring branch compiles into a full CUDA graph.
+    """
+    cpu_tensor = x.detach().cpu()
+    transport.submit_cpu_direct(cpu_tensor, hook_type, hook_id)
+
+
 class HookPoint(nn.Module):
     """
     A helper class to access intermediate activations in a PyTorch model (inspired by Garcon).
@@ -137,11 +153,16 @@ class HookPoint(nn.Module):
         # module) - this is set by the root module at setup.
         self._name: Optional[str] = None
 
-        # ring_producer_op dispatch keys — set when self.name is assigned.
+        # ring_producer_op dispatch keys -- set when self.name is assigned.
         # Stored as plain ints so torch.compile treats them as compile-time
         # constants and bakes them directly into the captured CUDA graph.
         self._ring_hook_type: int = 0
         self._ring_hook_id: int = 0
+
+        # Master switch: False = completely bypass this hook (compiled out
+        # under CUDA graphs).  Set once before generate() to select which
+        # hooks are active.  Changing triggers Dynamo recompilation.
+        self.enabled: bool = True
 
     @property
     def name(self) -> Optional[str]:
@@ -260,23 +281,29 @@ class HookPoint(nn.Module):
         self.ctx = {}
 
     def forward(self, x: Tensor) -> Tensor:
-        # Ring transport capture via C++ TORCH_LIBRARY op.
-        # Only call ring.producer when a RingTransport is active.  Without this
-        # guard, HF's internal auto-compile (mode="reduce-overhead") would
-        # capture ring.producer in its CUDA graph.
-        #
-        # We return x_cont (not the original x) so that x_cont has downstream
-        # consumers in the model.  This prevents inductor from DCE'ing the
-        # .contiguous() copy + ring.producer call for non-contiguous tensors
-        # (Q/K/V views from QKV projection split).
-        if self._name is not None and x.is_cuda:
-            from .ring_transport import _active_transport
-            if _active_transport is not None:
-                x_cont = x.contiguous()
-                torch.ops.ring.producer(
-                    x_cont, self._ring_hook_type, self._ring_hook_id)
-                return x_cont
-        return x
+        if not self.enabled:
+            return x
+        if self._name is None or not x.is_cuda:
+            return x
+        from .ring_transport import _active_transport
+        if _active_transport is None:
+            return x
+        if _active_transport.cpu_direct:
+            # Delegate to disabled helper so Dynamo doesn't trace the
+            # graph-breaking .cpu() call or waste recompilation slots
+            # on per-hook shape specialization.
+            _hook_cpu_direct(x, _active_transport,
+                             self._ring_hook_type, self._ring_hook_id)
+            return x
+        # Ring path -- fully traceable, no graph break.
+        # We return x_cont (not the original x) so that x_cont has
+        # downstream consumers in the model.  This prevents inductor
+        # from DCE'ing the .contiguous() copy + ring.producer call for
+        # non-contiguous tensors (Q/K/V views from QKV projection split).
+        x_cont = x.contiguous()
+        torch.ops.ring.producer(
+            x_cont, self._ring_hook_type, self._ring_hook_id)
+        return x_cont
 
     def layer(self):
         # Returns the layer index if the name has the form 'blocks.{layer}.{...}'
@@ -736,7 +763,8 @@ class HookedRootModule(nn.Module):
                 pos_slice=pos_slice,
             )
 
-        # 若使用原生全局回调且本步没有需要临时挂载的 hooks，则跳过 hooks 上下文，避免每步 ResetHooks 开销
+        # Skip hooks context when native global callbacks are active and no
+        # transient hooks need mounting -- avoids per-step ResetHooks overhead.
         use_ctx = True
         try:
             engine = self.monitoring_engine
@@ -767,7 +795,7 @@ class HookedRootModule(nn.Module):
                 if incl_bwd:
                     model_out.backward()
 
-        # 若使用原生全局回调，前向结束后一次性收集 futures 写入 cache
+        # After forward: collect futures from native global callbacks into cache.
         try:
             engine = self.monitoring_engine
             if engine is not None:
@@ -1046,7 +1074,7 @@ class HookedRootModule(nn.Module):
                     cache[hook_name] = None
                     return
 
-                # sync build（进入同步分支到移动前的轻量准备）
+                # sync build (lightweight prep before entering sync move path)
                 t_sb0 = time.perf_counter() if _hook_stats_enabled() else None
                 t_mv0 = time.perf_counter() if _hook_stats_enabled() else None
                 resid_stream = resid_stream.to(device)

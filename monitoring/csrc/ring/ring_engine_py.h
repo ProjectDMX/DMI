@@ -1,4 +1,4 @@
-// ring/ring_engine_py.h — Plain C++ interface for RingEngine, usable from g++.
+// ring/ring_engine_py.h -- Plain C++ interface for RingEngine, usable from g++.
 //
 // All CUDA/ATen details are hidden behind a pimpl so bindings.cpp (compiled
 // with g++) can include this header without needing CUDA or nvcc compilation.
@@ -19,7 +19,7 @@ namespace at { class Tensor; }
 
 namespace ring_py {
 
-// Plain C++ mirror of ring::RingConfig — no CUDA types.
+// Plain C++ mirror of ring::RingConfig -- no CUDA types.
 struct RingConfig {
     uint32_t task_ring_entries          = 1024;
     uint64_t payload_ring_bytes         = 256ULL * 1024 * 1024;
@@ -31,8 +31,6 @@ struct RingConfig {
     uint64_t drain_flush_entry_threshold = 0;
     uint64_t drain_flush_byte_threshold  = 0;
     uint64_t drain_flush_timeout_us      = 0;
-    // Bypass budget for large tensors (bytes).
-    uint64_t bypass_budget_bytes        = 256ULL * 1024 * 1024;
     // Clone per-request slices
     bool     clone_slices               = false;
     // ClickHouse insert queue limits
@@ -64,14 +62,6 @@ public:
     void start();
     void stop();
 
-    // Allocate condition tensor after hook count is known.
-    void init_hooks(uint32_t num_hooks);
-
-    // Prepare forward: compute condition grants, enqueue H2D on main stream.
-    // Runs on Python thread (GIL released).  Non-blocking, no sync.
-    void prepare_forward(const std::vector<uint64_t>& hook_tensor_bytes,
-                         uint64_t stream_handle);
-
     // Enable/disable null mode (same kernel launch, no ring writes).
     void set_null_mode(bool enabled);
 
@@ -80,15 +70,50 @@ public:
     void push_all_metas(const std::vector<TensorMeta>& metas);
     void pop_last_meta();
 
-    // Launch producer kernel with condition tensor gating.
-    // Inserts cudaStreamWaitValue32 before kernel, and for large tensors
-    // also inserts post-kernel wait for condition == 0 (ack).
+    // Launch producer kernel unconditionally (no condition gating).
+    // Space must be guaranteed by pre-forward capacity check.
     void hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
                         uint32_t hook_type,
                         uint64_t stream_handle);
 
     // Lightweight wake-up for the drain thread.
     void notify_drain();
+
+    // Pre-forward capacity check + conditional flush.
+    //
+    // Called once per generate() step from _prepare_wrapper (GIL released).
+    // Reads ring/staging counters internally and decides whether this step's
+    // tensors fit in the ring (Case A) or must fall back to CPU-direct
+    // copies (Case B).
+    //
+    // When a flush is needed (Case A ring-full, or Case B), this method
+    // synchronises the CUDA current stream (via at::cuda::getCurrentCUDAStream)
+    // and asks the drain thread to flush.  The caller does NOT need to pass a
+    // stream handle -- the C++ side resolves it only when sync is required.
+    //
+    // Returns:
+    //   0  RING_OK        -- Case A, ring has space.  No sync, no flush.
+    //                        Forward may use ring::producer normally.
+    //   1  RING_FLUSHED   -- Case A, ring was full.  Synced + flushed.
+    //                        Ring now has space; forward may use ring::producer.
+    //   2  CPU_DIRECT     -- Case B, step exceeds effective ring capacity.
+    //                        Synced + flushed.  All hooks must use .cpu() path.
+    //
+    // For cases 0 and 1, advances cpu_payload_head_ and cpu_task_head_
+    // under mgmt_mu_ to pre-allocate ring space for this step's producers.
+    // Also resets the internal hook index counter for hook_no_notify.
+    static constexpr int STEP_RING_OK      = 0;
+    static constexpr int STEP_RING_FLUSHED = 1;
+    static constexpr int STEP_CPU_DIRECT   = 2;
+
+    int prepare_step(uint64_t step_total_bytes, uint32_t num_hooks);
+
+    // Submit a CPU-direct tensor to drain -> p2p pipeline.
+    void submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes);
+
+    // Capacity queries (for startup warning only -- not called per-step).
+    uint64_t payload_cap() const;
+    uint64_t staging_cap() const;
 
 private:
     struct Impl;

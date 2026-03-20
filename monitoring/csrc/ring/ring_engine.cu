@@ -1,10 +1,8 @@
-// ring/ring_engine.cu — RingEngine implementation (compiled with nvcc because
+// ring/ring_engine.cu -- RingEngine implementation (compiled with nvcc because
 // it owns AllocatedRing which calls task_ring_init / cudaMemsetAsync).
 
 #include "ring_engine.h"
 
-#include <cuda.h>
-#include <cstdlib>
 #include <stdexcept>
 
 namespace ring {
@@ -21,7 +19,7 @@ RingEngine::RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
     if (cfg_.drain_poll_timeout_us == 0) {
         throw std::runtime_error("RingConfig: drain_poll_timeout_us must be > 0. "
             "The drain thread must poll periodically to process entries "
-            "published mid-forward (e.g., forced flush, large-tensor bypass ack).");
+            "published mid-forward.");
     }
 
     auto* buf = ring_.state().payload_buf;
@@ -58,23 +56,6 @@ void RingEngine::stop() {
     drain_->stop();
     drain_->signal_p2p_stop();
     p2p_->stop();
-}
-
-void RingEngine::init_hooks(uint32_t num_hooks) {
-    // cuStreamWaitValue32 deadlocks with CUDA 12.2+ lazy module loading:
-    // a pending wait blocks the device sync needed to load new kernel modules.
-    // Require CUDA_MODULE_LOADING=EAGER (set before process start).
-    CUmoduleLoadingMode mode;
-    if (cuModuleGetLoadingMode(&mode) == CUDA_SUCCESS &&
-        mode != CU_MODULE_EAGER_LOADING) {
-        throw std::runtime_error(
-            "RingEngine requires CUDA_MODULE_LOADING=EAGER. "
-            "cuStreamWaitValue32 deadlocks with lazy module loading (CUDA 12.2+). "
-            "Set this environment variable before starting the process.");
-    }
-
-    ring_.init_condition(num_hooks);
-    drain_->set_condition(ring_.d_condition(), ring_.h_condition(), num_hooks);
 }
 
 }  // namespace ring

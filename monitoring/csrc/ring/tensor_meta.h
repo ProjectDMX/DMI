@@ -1,9 +1,9 @@
-// ring/tensor_meta.h — Tensor metadata FIFO for the ring transport.
+// ring/tensor_meta.h -- Tensor metadata FIFO for the ring transport.
 //
 // Pushed by the Python forward-pass thread (one entry per tensor offloaded),
 // popped by the C++ callback thread (drain side) in arrival order.
 //
-// No ATen dependency — safe to include from both g++ and nvcc translation units.
+// No ATen dependency -- safe to include from both g++ and nvcc translation units.
 
 #pragma once
 #include <cstdint>

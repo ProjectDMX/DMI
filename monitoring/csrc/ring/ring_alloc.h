@@ -1,15 +1,13 @@
-// ring/ring_alloc.h — CPU-side RAII owner of all ring device memory.
+// ring/ring_alloc.h -- CPU-side RAII owner of all ring device memory.
 //
 // AllocatedRing allocates and initialises all buffers for one ring pair:
-//   - task entry array          (cudaMallocManaged — GPU writes, CPU drain reads)
-//   - payload byte buffer       (cudaMalloc — device-only, D2H via copy engine)
-//   - head counters             (cudaMallocManaged — GPU writes heads)
-//   - condition tensor          (cudaMalloc device + cudaHostAlloc host mirror)
+//   - task entry array          (cudaMallocManaged -- GPU writes, CPU drain reads)
+//   - payload byte buffer       (cudaMalloc -- device-only, D2H via copy engine)
+//   - head counters             (cudaMallocManaged -- GPU writes heads)
 //
 // Usage:
 //   AllocatedRing ar(cfg);
 //   ar.init();                     // memset entries to SENTINEL, zero counters
-//   ar.init_condition(num_hooks);  // allocate condition tensor (after hook count known)
 //   RingState rs = ar.state();     // capture-safe snapshot of pointers
 //   launch_producer(rs, ...);      // pass rs into kernel
 //
@@ -54,47 +52,13 @@ public:
         chk(cudaDeviceSynchronize(), "cudaDeviceSynchronize after prefetch");
     }
 
-    // Allocate condition tensor after hook count is known (before CUDA graph capture).
-    // d_condition: device memory for cudaStreamWaitValue32.
-    // h_condition: host pinned memory for drain thread → cudaMemcpyAsync H2D.
-    void init_condition(uint32_t num_hooks) {
-        if (d_condition_) {
-            cudaFree(d_condition_);
-            d_condition_ = nullptr;
-        }
-        if (h_condition_) {
-            cudaFreeHost(h_condition_);
-            h_condition_ = nullptr;
-        }
-        num_hooks_ = num_hooks;
-        if (num_hooks == 0) return;
-
-        chk(cudaMalloc(&d_condition_, num_hooks * sizeof(uint32_t)),
-            "cudaMalloc d_condition");
-        chk(cudaMemset(d_condition_, 0, num_hooks * sizeof(uint32_t)),
-            "cudaMemset d_condition");
-        void* hp = nullptr;
-        chk(cudaHostAlloc(&hp, num_hooks * sizeof(uint32_t), cudaHostAllocDefault),
-            "cudaHostAlloc h_condition");
-        h_condition_ = static_cast<uint32_t*>(hp);
-        std::memset(h_condition_, 0, num_hooks * sizeof(uint32_t));
-    }
-
     RingState&       state()        { return state_; }
     const RingState& state()  const { return state_; }
     const RingConfig& config() const { return cfg_; }
 
-    uint32_t* d_condition()       { return d_condition_; }
-    uint32_t* h_condition()       { return h_condition_; }
-    uint32_t  num_hooks()   const { return num_hooks_; }
-
 private:
     RingConfig cfg_;
     RingState  state_{};
-
-    uint32_t*  d_condition_{nullptr};
-    uint32_t*  h_condition_{nullptr};
-    uint32_t   num_hooks_{0};
 
     static void chk(cudaError_t e, const char* ctx) {
         if (e != cudaSuccess)
@@ -119,8 +83,8 @@ private:
         state_.payload_cap = cfg_.payload_ring_bytes;
 
         // Move head counters to GPU HBM so the producer reads them at L2/HBM
-        // speed.  CPU writes (drain thread condition updates) use PCIe posted
-        // writes.  Task entries stay on CPU for fast drain-thread polling.
+        // speed.  CPU writes (drain thread) use PCIe posted writes.
+        // Task entries stay on CPU for fast drain-thread polling.
         int dev = 0;
         chk(cudaGetDevice(&dev), "cudaGetDevice");
         const cudaMemLocation gpu_loc  = {cudaMemLocationTypeDevice, dev};
@@ -149,8 +113,6 @@ private:
         cudaFree(state_.payload_buf);
         cudaFree(state_.task_head);
         cudaFree(state_.payload_head);
-        if (d_condition_) cudaFree(d_condition_);
-        if (h_condition_) cudaFreeHost(h_condition_);
     }
 };
 
