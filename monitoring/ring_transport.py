@@ -56,6 +56,75 @@ _HIDDEN_DIM_TYPES = frozenset({
     HOOK_TYPE_EMBED,     HOOK_TYPE_POS_EMBED,  HOOK_TYPE_FINAL_LN,
 })
 
+# ---------------------------------------------------------------------------
+# Hook selection presets
+#
+# Each preset defines the set of hook types to enable.  token_ids is always
+# included (needed for FIFO ordering and DB row identity).
+# ---------------------------------------------------------------------------
+_HOOK_SELECTION_PRESETS: Dict[str, frozenset] = {
+    # All hooks
+    "full": frozenset({
+        HOOK_TYPE_RESID_PRE, HOOK_TYPE_LN1, HOOK_TYPE_ATTN_OUT,
+        HOOK_TYPE_RESID_MID, HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN,
+        HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
+        HOOK_TYPE_RESULT, HOOK_TYPE_LN2, HOOK_TYPE_MLP_IN, HOOK_TYPE_MLP_OUT,
+        HOOK_TYPE_RESID_POST, HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED,
+        HOOK_TYPE_FINAL_LN, HOOK_TYPE_TOKEN_IDS, HOOK_TYPE_FINAL_LOGITS,
+    }),
+    # What HF returns with output_hidden_states + output_attentions:
+    # layer inputs/outputs, embeddings, attention weights, logits
+    "hf-only": frozenset({
+        HOOK_TYPE_RESID_PRE, HOOK_TYPE_RESID_POST,
+        HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED, HOOK_TYPE_FINAL_LN,
+        HOOK_TYPE_PATTERN,
+        HOOK_TYPE_FINAL_LOGITS, HOOK_TYPE_TOKEN_IDS,
+    }),
+    # Hidden states: residual stream + embeddings + final LN
+    "hidden-states": frozenset({
+        HOOK_TYPE_RESID_PRE, HOOK_TYPE_RESID_MID, HOOK_TYPE_RESID_POST,
+        HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED, HOOK_TYPE_FINAL_LN,
+        HOOK_TYPE_TOKEN_IDS,
+    }),
+    # Logits only
+    "logits": frozenset({
+        HOOK_TYPE_FINAL_LOGITS, HOOK_TYPE_TOKEN_IDS,
+    }),
+    # Attention: scores, pattern, Q, K, V, Z, attn_out, result
+    "attention": frozenset({
+        HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN,
+        HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
+        HOOK_TYPE_ATTN_OUT, HOOK_TYPE_RESULT,
+        HOOK_TYPE_TOKEN_IDS,
+    }),
+}
+
+
+def apply_hook_selection(specs: List["HookSpec"], mode: str) -> List["HookSpec"]:
+    """Filter specs and set HookPoint.enabled based on a selection preset.
+
+    Sets enabled=True on hooks in the preset, enabled=False on others.
+    Returns the filtered list of enabled specs (for _active_specs / metadata).
+
+    Args:
+        specs: all HookSpec objects from model.get_hook_specs()
+        mode: one of "full", "hf-only", "hidden-states", "logits", "attention"
+    """
+    allowed = _HOOK_SELECTION_PRESETS.get(mode)
+    if allowed is None:
+        raise ValueError(
+            f"Unknown hook selection mode {mode!r}. "
+            f"Available: {sorted(_HOOK_SELECTION_PRESETS.keys())}")
+
+    enabled_specs = []
+    for spec in specs:
+        if spec.hook_type in allowed:
+            spec.module.enabled = True
+            enabled_specs.append(spec)
+        else:
+            spec.module.enabled = False
+    return enabled_specs
+
 
 # ---------------------------------------------------------------------------
 # Hook-name -> (hook_type, hook_id) helpers  (legacy path)
@@ -353,6 +422,10 @@ class RingTransport:
         # all hooks use cpu_direct for the entire generate() call.
         # Set by generate_with_monitoring when decode doesn't fit in ring.
         self._force_cpu_direct: bool = False
+
+        # Hook selection preset name (e.g. "full", "hf-only", "hidden-states").
+        # Set by generate_with_monitoring before _install_monitoring_forward.
+        self._hook_selection: Optional[str] = None
 
         # warn_once tracking for Case B fallback
         self._warned_shapes: set = set()

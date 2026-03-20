@@ -100,6 +100,7 @@ class BenchConfig:
     modes: List[str] = field(default_factory=lambda: ["baseline", "ring_null"])
     cuda_graphs: bool = False
     logits_to_keep: int = 0  # 0 = keep all, 1 = last position only (HF default)
+    hook_selection: str = "full"  # full, hf-only, hidden-states, logits, attention
     hf_offload_hidden_states: bool = False
     hf_offload_attentions: bool = False
     hf_offload_logits: bool = False
@@ -280,7 +281,8 @@ def _run_one(model, input_ids, attention_mask,
                     max_new_tokens=cfg.decode_len,
                     min_new_tokens=cfg.decode_len,
                     do_sample=False,
-                    pad_token_id=pad_id, eos_token_id=eos_id, **extra,
+                    pad_token_id=pad_id, eos_token_id=eos_id,
+                    hook_selection=cfg.hook_selection, **extra,
                 )
             else:
                 model.generate(
@@ -635,6 +637,9 @@ def _parse_args() -> BenchConfig:
     g.add_argument("--cuda-graphs",     action="store_true")
     g.add_argument("--logits-to-keep",  type=int, default=0,
                    help="0=keep all logits, 1=last position only (HF default)")
+    g.add_argument("--hook-selection",  default="full",
+                   choices=["full", "hf-only", "hidden-states", "logits", "attention"],
+                   help="Hook selection preset (default: full)")
     g.add_argument("--hf-offload-hidden-states", action="store_true",
                    help="hf_offload: output + .cpu() hidden_states")
     g.add_argument("--hf-offload-attentions",    action="store_true",
@@ -697,6 +702,7 @@ def _parse_args() -> BenchConfig:
         modes=[m.strip() for m in ns.modes.split(",")],
         cuda_graphs=bool(ns.cuda_graphs),
         logits_to_keep=ns.logits_to_keep,
+        hook_selection=ns.hook_selection,
         csv_path=ns.csv,
         hf_offload_hidden_states=bool(ns.hf_offload_hidden_states or ns.hf_offload_all),
         hf_offload_attentions=bool(ns.hf_offload_attentions or ns.hf_offload_all),
@@ -742,6 +748,7 @@ def main() -> None:
     print(f"Warmup/Iters : {cfg.warmup} / {cfg.iters}")
     print(f"Modes        : {cfg.modes}")
     print(f"CUDA graphs  : {'yes (CompileConfig + static cache)' if cfg.cuda_graphs else 'no'}")
+    print(f"Hook select  : {cfg.hook_selection}")
     print(f"Ring buffers : payload={cfg.ring_payload_mb} MB  "
           f"pinned={cfg.ring_pinned_mb} MB  "
           f"tasks={cfg.ring_task_entries}")

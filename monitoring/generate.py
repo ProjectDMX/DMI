@@ -73,6 +73,13 @@ def _install_monitoring_forward(model: Any) -> None:
             engine       = getattr(model, "monitoring_engine", None)
             all_specs    = model.get_hook_specs()
             active_specs = _filter_specs(all_specs, engine)
+
+            # Apply hook selection preset (sets HookPoint.enabled per hook)
+            hook_selection = getattr(transport, '_hook_selection', None)
+            if hook_selection is not None:
+                active_specs = ring_transport.apply_hook_selection(
+                    active_specs, hook_selection)
+
             handles: List = []
             ring_transport.install_ring_hooks(active_specs, handles)
             transport._active_specs        = active_specs
@@ -149,6 +156,9 @@ def _install_monitoring_forward(model: Any) -> None:
     monitored_forward._monitoring_orig_forward = orig_forward
     model._monitoring_orig_forward             = orig_forward
     model._monitoring_forward_wrapper          = monitored_forward
+    # Record whether forward was already an instance attr (e.g. compiled
+    # forward) so _uninstall can delete it cleanly vs leave it in __dict__.
+    model._monitoring_had_instance_forward     = 'forward' in model.__dict__
     model.forward                              = monitored_forward
 
 
@@ -175,9 +185,16 @@ def _uninstall_monitoring_forward(model: Any) -> None:
     # Restore original model.forward
     orig = getattr(model, "_monitoring_orig_forward", None)
     if orig is not None:
-        model.forward                      = orig
+        had_instance = getattr(model, "_monitoring_had_instance_forward", True)
+        if had_instance:
+            # Forward was an instance attr before (e.g. compiled) -- restore it
+            model.forward = orig
+        else:
+            # Forward was a class method -- delete instance attr so class MRO resumes
+            model.__dict__.pop('forward', None)
         model._monitoring_orig_forward     = None
         model._monitoring_forward_wrapper  = None
+        model.__dict__.pop('_monitoring_had_instance_forward', None)
 
 
 def _install_prepare_wrapper(model: Any) -> None:
@@ -328,10 +345,20 @@ def _compute_decode_step_bytes(transport: Any, batch: int) -> int:
     return total
 
 
-def generate_with_monitoring(model: Any, *args: Any, **kwargs: Any):
+def generate_with_monitoring(model: Any, *args: Any,
+                             hook_selection: Optional[str] = None,
+                             **kwargs: Any):
     """Run HF generate() with ring-transport monitoring hooks active.
 
     Hooks are installed before generate() and removed on return.
+
+    Args:
+        hook_selection: preset name controlling which hooks are enabled.
+            "full" (default/None) -- all hooks
+            "hf-only"  -- hidden states + attention weights + logits (matches HF output_hidden_states + output_attentions)
+            "hidden-states" -- residual stream + embeddings + final LN
+            "logits"   -- final logits only
+            "attention" -- attention scores, pattern, Q, K, V, Z
 
     For CUDA graph capture, use HF's built-in CompileConfig::
 
@@ -424,6 +451,12 @@ def generate_with_monitoring(model: Any, *args: Any, **kwargs: Any):
     # ------------------------------------------------------------------
     # Phase 2: Resolve target, install monitoring hooks.
     # ------------------------------------------------------------------
+    # Set hook selection on transport so _install_monitoring_forward
+    # applies it when filtering active_specs.
+    transport = ring_transport.get_active()
+    if transport is not None and hook_selection is not None:
+        transport._hook_selection = hook_selection
+
     target = getattr(model, "_orig_mod", model)
     _restore_engine: Any = None
     if target is not model:
@@ -493,3 +526,4 @@ def generate_with_monitoring(model: Any, *args: Any, **kwargs: Any):
         if transport is not None:
             transport.cpu_direct = False
             transport._force_cpu_direct = False
+            transport._hook_selection = None
