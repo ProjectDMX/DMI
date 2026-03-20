@@ -498,49 +498,6 @@ class RingTransport:
         """
         self._ring_engine.submit_cpu_direct(cpu_tensor)
 
-    def capture_tensor(self, tensor: torch.Tensor, hook_name: str) -> None:
-        """Legacy capture path: called from HookPoint.forward().
-
-        Not used by the primary ring transport path.  When ring transport is
-        active with forward hooks installed, all hooks in _forward_hook_names
-        (including token_ids and final_logits) are handled by
-        torch.ops.ring.producer inside HookPoint.forward(), so this method
-        returns early on the _forward_hook_names check.  It remains as a
-        fallback for any HookPoint not covered by install_ring_hooks.
-        """
-        if hook_name in self._forward_hook_names:
-            return
-        if self.null_offload:
-            return  # kernel still launched by ring_producer_op; skip meta here
-        if self._current_req_ids is None or self._current_token_ranges is None:
-            return
-        if self._current_model_id is None:
-            return
-        if not tensor.is_cuda or not tensor.is_contiguous():
-            return
-
-        hook_type     = _hook_type_from_name(hook_name)
-        hook_id       = _hook_id_from_name(hook_name)
-        shape         = list(tensor.shape)
-        dtype         = tensor.dtype
-        d_ptr         = tensor.data_ptr()
-        nbytes        = tensor.nbytes
-        stream_handle = torch.cuda.current_stream(tensor.device.index).cuda_stream
-
-        self._ring_engine.push_meta(
-            hook_name,
-            self._current_model_id,
-            self._current_shard_rank,
-            list(self._current_req_ids),
-            list(self._current_token_ranges),
-            shape,
-            dtype,
-        )
-
-        try:
-            self._ring_engine.hook(d_ptr, nbytes, 0, hook_type, hook_id, stream_handle)
-        except Exception:
-            self._ring_engine.pop_last_meta()
 
 
 # ---------------------------------------------------------------------------

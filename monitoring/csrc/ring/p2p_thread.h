@@ -51,6 +51,7 @@ private:
     SubmitFn                 submit_fn_;
 
     std::thread              thread_;
+    ring_py::StepContext*    current_ctx_{nullptr};  // owned, freed on last_in_step
 
     void loop();
     void process(std::vector<DrainTask>& tasks);

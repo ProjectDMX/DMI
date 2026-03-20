@@ -79,6 +79,7 @@ P2PThread::P2PThread(DrainThread& drain, ring_py::TensorMetaFifo& fifo,
 
 P2PThread::~P2PThread() noexcept {
     stop();
+    delete current_ctx_;
 }
 
 void P2PThread::start() {
@@ -141,8 +142,21 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     ring_py::TensorMeta meta;
     if (!fifo_.pop(meta)) return;
 
-    if (meta.shape.empty() || first_task.tensor_total_bytes == 0) return;
-    if (!submit_fn_) return;
+    // Get step context -- pop from context queue if this is the first
+    // hook in a new step (current_ctx_ is null).
+    if (!current_ctx_) {
+        current_ctx_ = fifo_.pop_context();
+        if (!current_ctx_) return;  // no context available
+    }
+
+    if (meta.shape.empty() || first_task.tensor_total_bytes == 0) {
+        if (meta.last_in_step) { delete current_ctx_; current_ctx_ = nullptr; }
+        return;
+    }
+    if (!submit_fn_) {
+        if (meta.last_in_step) { delete current_ctx_; current_ctx_ = nullptr; }
+        return;
+    }
 
     auto dtype = static_cast<at::ScalarType>(meta.dtype);
     int64_t elem_size = at::elementSize(dtype);
@@ -154,6 +168,7 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
         fprintf(stderr, "[p2p] WARN: shape/bytes mismatch: expected=%ld actual=%lu hook=%s\n",
                 (long)expected_bytes, (unsigned long)first_task.tensor_total_bytes,
                 meta.hook_name.c_str());
+        if (meta.last_in_step) { delete current_ctx_; current_ctx_ = nullptr; }
         return;
     }
 
@@ -163,11 +178,12 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     bool is_attn = is_attn_hook(meta.hook_name);
     auto [layer_no, act_name] = parse_internal_id(meta.hook_name);
 
-    bool should_clone = cfg_.clone_slices && meta.requests.size() > 1;
+    const auto& requests = current_ctx_->requests;
+    bool should_clone = cfg_.clone_slices && requests.size() > 1;
 
-    for (size_t j = 0; j < meta.requests.size(); ++j) {
+    for (size_t j = 0; j < requests.size(); ++j) {
         if (static_cast<int64_t>(j) >= tensor.size(0)) break;
-        const ring_py::RequestMeta& req = meta.requests[j];
+        const ring_py::RequestMeta& req = requests[j];
         at::Tensor slice = slice_for_request(
             tensor, static_cast<int>(j),
             req.start_token, req.end_token, is_attn);
@@ -179,12 +195,18 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
         }
 
         try {
-            submit_fn_(meta.model_id, meta.shard_rank,
+            submit_fn_(current_ctx_->model_id, current_ctx_->shard_rank,
                        req.req_id, act_name, layer_no,
                        req.start_token, req.end_token,
                        std::move(slice));
         } catch (...) {
         }
+    }
+
+    // Last hook in step -- free context
+    if (meta.last_in_step) {
+        delete current_ctx_;
+        current_ctx_ = nullptr;
     }
 }
 

@@ -5,8 +5,34 @@ import inspect
 from typing import Any, List, Optional
 
 # Module-level profiling list for _prepare_wrapper timing.
+# Enabled by RING_PROFILE_PREPARE=1.
 # Accessible via monitoring.generate._prepare_profile_times
 _prepare_profile_times: List[dict] = []
+
+
+def print_prepare_profile() -> None:
+    """Print summary of _prepare_wrapper profiling data."""
+    if not _prepare_profile_times:
+        print("[prepare_profile] No data collected. Set RING_PROFILE_PREPARE=1.")
+        return
+    keys = ["orig_prepare", "ring_step", "shape_compute", "prepare_step", "push_metas", "total"]
+    n = len(_prepare_profile_times)
+    print(f"[prepare_profile] {n} steps:")
+    for k in keys:
+        vals = [d.get(k, 0.0) for d in _prepare_profile_times if k in d]
+        if not vals:
+            continue
+        avg = sum(vals) / len(vals)
+        mx = max(vals)
+        print(f"  {k:20s}: avg={avg:.3f} ms  max={mx:.3f} ms  ({len(vals)} samples)")
+    # Show prepare_step result distribution
+    results = [d.get("result") for d in _prepare_profile_times if "result" in d]
+    if results:
+        from collections import Counter
+        dist = Counter(results)
+        labels = {0: "RING_OK", 1: "RING_FLUSHED", 2: "CPU_DIRECT", -1: "FORCE_CPU_DIRECT"}
+        parts = [f"{labels.get(k, str(k))}={v}" for k, v in sorted(dist.items())]
+        print(f"  {'prepare_step results':20s}: {', '.join(parts)}")
 
 
 def _make_model_shape(model: Any) -> Optional[Any]:
@@ -213,12 +239,25 @@ def _install_prepare_wrapper(model: Any) -> None:
     if getattr(model, "_monitoring_orig_prepare", None) is not None:
         return
 
+    import os as _os
+    import time as _time
+    _profile = _os.environ.get("RING_PROFILE_PREPARE", "") == "1"
+
     @functools.wraps(orig_prepare)
     def _prepare_wrapper(*args: Any, **kwargs: Any) -> Any:
+        transport = ring_transport.get_active()
+        if transport is None or transport.null_offload:
+            return orig_prepare(*args, **kwargs)
+
+        if _profile:
+            _t0 = _time.perf_counter()
+
         model_inputs = orig_prepare(*args, **kwargs)
 
+        if _profile:
+            _t_orig = _time.perf_counter()
+
         engine    = getattr(model, "monitoring_engine", None)
-        transport = ring_transport.get_active()
 
         if (engine is not None
                 and getattr(engine, "_using_ring_transport", False)
@@ -237,6 +276,9 @@ def _install_prepare_wrapper(model: Any) -> None:
                 cache_position  = None
 
             engine._prepare_ring_step(input_ids_val, attention_mask, past_key_values, cache_position=cache_position)
+
+            if _profile:
+                _t_ring_step = _time.perf_counter()
 
             if input_ids_val is not None and hasattr(input_ids_val, "shape"):
                 try:
@@ -267,6 +309,9 @@ def _install_prepare_wrapper(model: Any) -> None:
                             else:
                                 hook_byte_sizes.append(0)
 
+                    if _profile:
+                        _t_shape = _time.perf_counter()
+
                     if not transport._force_cpu_direct:
                         step_total_bytes = sum(ring_transport.align_up_py(b, 16) for b in hook_byte_sizes)
                         n_hooks = len(hook_byte_sizes)
@@ -276,8 +321,21 @@ def _install_prepare_wrapper(model: Any) -> None:
                         # sync+flush, pre-allocate ring space.  Returns 0/1/2.
                         # GIL released inside; resolves CUDA stream lazily
                         # in C++ only when sync is needed (cases 1 and 2).
+                        if _profile:
+                            _t_pre_step = _time.perf_counter()
                         result = re.prepare_step(step_total_bytes, n_hooks)
                         transport.cpu_direct = (result == 2)
+
+                        if _profile:
+                            _t_prepare = _time.perf_counter()
+                            if result != 0:
+                                _labels = {1: "RING_FLUSHED", 2: "CPU_DIRECT"}
+                                print(
+                                    f"[prepare_profile] FLUSH: result={_labels.get(result, result)} "
+                                    f"step={step_total_bytes/1e6:.1f}MB "
+                                    f"batch={batch} q_len={q_len} n_hooks={n_hooks} "
+                                    f"took={(_t_prepare - _t_pre_step)*1000:.1f}ms",
+                                    flush=True)
 
                         if result == 2:
                             # Case B: warn once per (batch, q_len) shape
@@ -298,14 +356,36 @@ def _install_prepare_wrapper(model: Any) -> None:
                                     f"Falling back to synced eager CPU offload for all {n_hooks} hooks.",
                                     stacklevel=2,
                                 )
-                    # else: _force_cpu_direct -- cpu_direct already True,
-                    # skip prepare_step (no ring interaction needed)
+                    else:
+                        # _force_cpu_direct -- cpu_direct already True,
+                        # skip prepare_step (no ring interaction needed)
+                        if _profile:
+                            _t_prepare = _time.perf_counter()
 
                     # Push FIFO metadata for p2p thread
                     transport.pre_push_all_metas(batch, q_len, kv_dim,
                                                 logits_to_keep=logits_to_keep)
+
+                    if _profile:
+                        _t_meta = _time.perf_counter()
+                        _prepare_profile_times.append({
+                            "orig_prepare": (_t_orig - _t0) * 1000,
+                            "ring_step": (_t_ring_step - _t_orig) * 1000,
+                            "shape_compute": (_t_shape - _t_ring_step) * 1000,
+                            "prepare_step": (_t_prepare - _t_shape) * 1000,
+                            "push_metas": (_t_meta - _t_prepare) * 1000,
+                            "total": (_t_meta - _t0) * 1000,
+                            "result": result if not transport._force_cpu_direct else -1,
+                        })
+
                 except Exception:
                     pass
+        elif _profile:
+            _t_end = _time.perf_counter()
+            _prepare_profile_times.append({
+                "orig_prepare": (_t_orig - _t0) * 1000,
+                "total": (_t_end - _t0) * 1000,
+            })
 
         return model_inputs
 

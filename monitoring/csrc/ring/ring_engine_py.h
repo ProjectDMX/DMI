@@ -65,10 +65,9 @@ public:
     // Enable/disable null mode (same kernel launch, no ring writes).
     void set_null_mode(bool enabled);
 
-    // Push metadata for the next tensor about to be hooked.
-    void push_meta(TensorMeta meta);
-    void push_all_metas(const std::vector<TensorMeta>& metas);
-    void pop_last_meta();
+    // Push a complete step: context (heap-allocated, ownership transferred)
+    // + all hook metas.  Single lock on the FIFO.
+    void push_step(StepContext* ctx, std::vector<TensorMeta>& metas);
 
     // Launch producer kernel unconditionally (no condition gating).
     // Space must be guaranteed by pre-forward capacity check.

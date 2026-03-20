@@ -453,7 +453,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
             _run_one_offload()
 
         torch.cuda.synchronize()
-        time.sleep(2)
+        time.sleep(1)
         print("  -- warmup done, starting measured iters --", flush=True)
 
         all_runs: List[RunResult] = []
@@ -526,7 +526,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
                 ring_transport.null_offload = False
 
         torch.cuda.synchronize()
-        time.sleep(2)
+        time.sleep(1)
         print("  -- warmup done, starting measured iters --", flush=True)
 
         # Measured iterations
@@ -556,6 +556,16 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         print(f"    ring drain  : {ring_ms:7.1f} ms")
         print(f"    db drain    : {db_ms:7.1f} ms")
         print(f"    cleanup     : {cleanup_ms:7.1f} ms")
+
+        # Print pre-forward profiling if enabled
+        try:
+            from monitoring.generate import _prepare_profile_times, print_prepare_profile
+            if _prepare_profile_times:
+                print()
+                print_prepare_profile()
+                _prepare_profile_times.clear()
+        except Exception:
+            pass
 
         mean_t = statistics.mean([r.total_ms for r in all_runs])
         std_t  = statistics.stdev([r.total_ms for r in all_runs]) if len(all_runs) > 1 else 0.0
@@ -809,7 +819,7 @@ def main() -> None:
             gc.collect()
             torch.cuda.empty_cache()
 
-    for mode in cfg.modes:
+    for mode_idx, mode in enumerate(cfg.modes):
         if mode in _SELF_MANAGED_MODES:
             # hf_offload loads/frees its own model inside _run_mode
             _free_model()
