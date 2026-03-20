@@ -4,3 +4,7 @@
 [submodule "libs/clickhouse-cpp"]
 	path = libs/clickhouse-cpp
 	url = git@github.com:ClickHouse/clickhouse-cpp.git
+[submodule "vllm"]
+	path = vllm
+	url = https://github.com/ProjectDMX/vllm.git
+	branch = dmi_integration

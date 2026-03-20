@@ -402,8 +402,28 @@ def _uninstall_prepare_wrapper(model: Any) -> None:
         model._monitoring_orig_prepare      = None
 
 
-def _compute_decode_step_bytes(transport: Any, batch: int) -> int:
-    """Total padded bytes for one decode step (q_len=1) across all active hooks."""
+def _compute_decode_step_bytes(transport: Any, batch: int,
+                                kv_dim: int = 1) -> int:
+    """Estimate total padded bytes for one decode step (q_len=1).
+
+    This runs BEFORE generate() starts -- no StaticCache exists yet.
+    The caller must estimate kv_dim from generate() kwargs to match
+    what HF will create:
+
+        HF generate() computes max_cache_len as:
+            max_cache_length = generation_config.max_length - 1
+
+        where max_length = input_length + max_new_tokens (or explicit max_length).
+        StaticCache is then created with max_cache_len = max_cache_length.
+
+        For attn_scores/pattern hooks, kv_dim = max_cache_len.
+        For all other hooks, kv_dim is irrelevant (shapes don't depend on it).
+
+    The per-step _prepare_wrapper uses the REAL kv_dim from the actual
+    StaticCache object (past_key_values.max_cache_len), so FIFO metadata
+    shapes are always correct.  This function is only used for the Phase 3
+    upfront capacity check to decide whether to disable compilation.
+    """
     import torch
     from . import ring_transport as _rt
 
@@ -413,7 +433,7 @@ def _compute_decode_step_bytes(transport: Any, batch: int) -> int:
     total = 0
     for spec in transport._active_specs:
         shape = _rt._compute_hook_shape(
-            spec.hook_type, cfg, batch, q_len=1, kv_dim=1,
+            spec.hook_type, cfg, batch, q_len=1, kv_dim=kv_dim,
             logits_to_keep=1)
         if shape:
             dtype = spec.dtype if spec.dtype is not None else cfg.dtype
@@ -461,15 +481,28 @@ def generate_with_monitoring(model: Any, *args: Any,
     # ------------------------------------------------------------------
     # Phase 1: Strip external compilation when static cache is active.
     #
-    # External torch.compile wraps both prefill and decode, which causes
-    # CUDA graph topology conflicts when prefill uses cpu_direct.  HF's
-    # internal get_compiled_call() only compiles decode -- correct.
+    # WHY: HF generate() has a prefill/decode split:
+    #   - Prefill runs via uncompiled self(...) (different shapes each call)
+    #   - Decode runs via compiled model_forward from get_compiled_call()
+    #     (stable shapes, CUDA graphs via mode="reduce-overhead")
     #
-    # We detect external compilation, strip it, move cache_implementation
-    # into kwargs, and inject CompileConfig so HF handles the split.
+    # External torch.compile (model.forward = torch.compile(...) or
+    # model = torch.compile(model)) wraps BOTH prefill and decode in
+    # one compiled function.  When prefill needs cpu_direct (step data
+    # exceeds ring), the .cpu() calls in _hook_cpu_direct cause graph
+    # breaks.  With mode="reduce-overhead", this fragments the forward
+    # into many tiny CUDA graph segments.  When decode then runs with a
+    # different topology (no graph breaks, full ring path), the CUDA
+    # graph tree's shared buffer pool is corrupted -> segfault.
     #
-    # Without static cache, external compilation is harmless (no CUDA
-    # graph capture), so we leave it alone.
+    # FIX: Strip external compilation and inject HF's CompileConfig.
+    # HF's get_compiled_call() only compiles decode, leaving prefill
+    # uncompiled.  Prefill can safely use cpu_direct (eager, no CUDA
+    # graphs).  Decode uses ring path (no graph breaks, full CUDA graph).
+    #
+    # WHEN: Only when static cache is active (cache_implementation="static"
+    # or external StaticCache in past_key_values).  Without static cache,
+    # HF doesn't compile at all, so external compilation is harmless.
     # ------------------------------------------------------------------
     _saved_compiled_forward = None   # Case 1 restore
     _saved_cache_impl = None         # generation_config restore
@@ -549,9 +582,23 @@ def generate_with_monitoring(model: Any, *args: Any,
     _install_prepare_wrapper(target)
 
     # ------------------------------------------------------------------
-    # Phase 3: Check if decode fits in ring.  If not, force cpu_direct
-    # for the entire generate() call and strip compile_config to prevent
-    # HF from compiling decode (cpu_direct graph breaks crash CUDA graphs).
+    # Phase 3: Check if decode fits in ring.
+    #
+    # WHY: If even a single decode step exceeds ring capacity, EVERY step
+    # will use cpu_direct (.cpu() in HookPoint.forward).  Under CUDA
+    # graphs (CompileConfig), this causes graph breaks at every hook,
+    # fragmenting the forward into hundreds of tiny CUDA graph segments.
+    # The stale-buffer detection in PyTorch's cudagraph_trees then
+    # crashes on cross-segment tensor reuse.
+    #
+    # FIX: Detect this upfront by computing decode step size from
+    # input_ids.shape[0] (batch).  If it exceeds effective_cap:
+    #   1. Set _force_cpu_direct -- _prepare_wrapper skips prepare_step
+    #      entirely (avoids per-step sync+flush overhead)
+    #   2. Pop compile_config + cache_implementation from kwargs
+    #   3. Set disable_compile=True -- catches HF auto-compile from
+    #      external StaticCache (is_compileable=True)
+    # Result: entire generate() runs eager, no CUDA graphs, no crash.
     # ------------------------------------------------------------------
     transport = ring_transport.get_active()
     if transport is not None and transport._model_cfg is not None and transport._active_specs:
@@ -562,7 +609,55 @@ def generate_with_monitoring(model: Any, *args: Any,
             batch = int(input_ids.shape[0])
             re = transport._ring_engine
             effective_cap = min(re.payload_cap(), re.staging_cap())
-            decode_bytes = _compute_decode_step_bytes(transport, batch)
+
+            # Estimate kv_dim by calling HF's own _prepare_generated_length
+            # on a deepcopy of generation_config, then computing
+            # max_cache_len = max_length - 1 (same as generate() line 2498).
+            #
+            # This MUST match HF's generate() behavior exactly:
+            #   1. _prepare_generation_config() merges kwargs into gen config
+            #   2. _prepare_generated_length() resolves max_length from
+            #      max_new_tokens / max_length / default(20)
+            #   3. max_cache_len = max_length - 1
+            #   4. StaticCache is created with this max_cache_len
+            #   5. attn_scores/pattern hooks have shape [..., kv_dim]
+            #      where kv_dim = max_cache_len
+            #
+            # The per-step _prepare_wrapper reads the REAL kv_dim from the
+            # actual StaticCache (past_key_values.max_cache_len).  This
+            # estimate is only for Phase 3 upfront capacity check.
+            input_len = int(input_ids.shape[1])
+            try:
+                gen_cfg_copy, _ = model._prepare_generation_config(
+                    kwargs.get('generation_config'), **kwargs)
+                gen_cfg_copy = model._prepare_generated_length(
+                    generation_config=gen_cfg_copy,
+                    has_default_max_length=(
+                        kwargs.get("max_length") is None
+                        and gen_cfg_copy.max_length is not None),
+                    has_default_min_length=(
+                        kwargs.get("min_length") is None
+                        and gen_cfg_copy.min_length is not None),
+                    model_input_name="input_ids",
+                    inputs_tensor=input_ids,
+                    input_ids_length=input_len,
+                )
+                kv_dim_estimate = int(gen_cfg_copy.max_length) - 1
+            except Exception:
+                max_new = int(kwargs.get('max_new_tokens', 20))
+                kv_dim_estimate = input_len + max_new - 1
+                warnings.warn(
+                    "[ring_transport] Could not call model._prepare_generated_length "
+                    "to estimate kv_dim for capacity check. Falling back to "
+                    f"kv_dim={kv_dim_estimate} (input_len={input_len} + "
+                    f"max_new_tokens={max_new} - 1). This may under-estimate "
+                    "attn_scores/pattern hook sizes if max_position_embeddings "
+                    "caps max_length.",
+                    stacklevel=2,
+                )
+
+            decode_bytes = _compute_decode_step_bytes(
+                transport, batch, kv_dim=kv_dim_estimate)
 
             if decode_bytes > effective_cap:
                 transport.cpu_direct = True
