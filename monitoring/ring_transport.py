@@ -57,64 +57,107 @@ _HIDDEN_DIM_TYPES = frozenset({
 })
 
 # ---------------------------------------------------------------------------
-# Hook selection presets
+# Hook selection: composable presets + individual hook types
 #
-# Each preset defines the set of hook types to enable.  token_ids is always
-# included (needed for FIFO ordering and DB row identity).
+# Selection is a comma-separated string.  Each token is looked up in
+# _HOOK_SELECTIONS (presets or individual hook names).  The final enabled
+# set is the union of all tokens.
+#
+# Examples:
+#   "full"                            -- all hooks
+#   "no-attention-scores"             -- full minus attn_scores/pattern
+#   "hidden-states,token_ids"         -- resid_pre + token_ids
+#   "hidden-states,final_ln,logits"   -- resid_pre + final_ln + final_logits
+#   "resid_pre,resid_post,embed"      -- just those three
 # ---------------------------------------------------------------------------
-_HOOK_SELECTION_PRESETS: Dict[str, frozenset] = {
-    # All hooks
-    "full": frozenset({
-        HOOK_TYPE_RESID_PRE, HOOK_TYPE_LN1, HOOK_TYPE_ATTN_OUT,
-        HOOK_TYPE_RESID_MID, HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN,
-        HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
-        HOOK_TYPE_RESULT, HOOK_TYPE_LN2, HOOK_TYPE_MLP_IN, HOOK_TYPE_MLP_OUT,
-        HOOK_TYPE_RESID_POST, HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED,
-        HOOK_TYPE_FINAL_LN, HOOK_TYPE_TOKEN_IDS, HOOK_TYPE_FINAL_LOGITS,
-    }),
-    # What HF returns with output_hidden_states + output_attentions:
-    # layer inputs/outputs, embeddings, attention weights, logits
+
+_ALL_HOOK_TYPES = frozenset({
+    HOOK_TYPE_RESID_PRE, HOOK_TYPE_LN1, HOOK_TYPE_ATTN_OUT,
+    HOOK_TYPE_RESID_MID, HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN,
+    HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
+    HOOK_TYPE_RESULT, HOOK_TYPE_LN2, HOOK_TYPE_MLP_IN, HOOK_TYPE_MLP_OUT,
+    HOOK_TYPE_RESID_POST, HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED,
+    HOOK_TYPE_FINAL_LN, HOOK_TYPE_TOKEN_IDS, HOOK_TYPE_FINAL_LOGITS,
+})
+
+# -- Presets --
+_HOOK_SELECTIONS: Dict[str, frozenset] = {
+    "full": _ALL_HOOK_TYPES,
+    # full minus attn_scores/pattern (FlashAttention never materializes them)
+    "no-attention-scores": _ALL_HOOK_TYPES - {HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN},
+    # What HF returns with output_hidden_states + output_attentions + logits
     "hf-only": frozenset({
-        HOOK_TYPE_RESID_PRE, HOOK_TYPE_RESID_POST,
-        HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED, HOOK_TYPE_FINAL_LN,
+        HOOK_TYPE_RESID_PRE, HOOK_TYPE_FINAL_LN,
         HOOK_TYPE_PATTERN,
-        HOOK_TYPE_FINAL_LOGITS, HOOK_TYPE_TOKEN_IDS,
-    }),
-    # Hidden states: residual stream + embeddings + final LN
-    "hidden-states": frozenset({
-        HOOK_TYPE_RESID_PRE, HOOK_TYPE_RESID_MID, HOOK_TYPE_RESID_POST,
-        HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED, HOOK_TYPE_FINAL_LN,
-        HOOK_TYPE_TOKEN_IDS,
-    }),
-    # Logits only
-    "logits": frozenset({
-        HOOK_TYPE_FINAL_LOGITS, HOOK_TYPE_TOKEN_IDS,
-    }),
-    # Attention: scores, pattern, Q, K, V, Z, attn_out, result
-    "attention": frozenset({
-        HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN,
-        HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
-        HOOK_TYPE_ATTN_OUT, HOOK_TYPE_RESULT,
-        HOOK_TYPE_TOKEN_IDS,
+        HOOK_TYPE_FINAL_LOGITS,
     }),
 }
 
+# -- Individual hook type names (each maps to a single-element frozenset) --
+_HOOK_TYPE_BY_NAME: Dict[str, int] = {
+    "resid_pre":   HOOK_TYPE_RESID_PRE,
+    "ln1":         HOOK_TYPE_LN1,
+    "attn_out":    HOOK_TYPE_ATTN_OUT,
+    "resid_mid":   HOOK_TYPE_RESID_MID,
+    "attn_scores": HOOK_TYPE_ATTN_SCORES,
+    "pattern":     HOOK_TYPE_PATTERN,
+    "q":           HOOK_TYPE_Q,
+    "k":           HOOK_TYPE_K,
+    "v":           HOOK_TYPE_V,
+    "z":           HOOK_TYPE_Z,
+    "result":      HOOK_TYPE_RESULT,
+    "ln2":         HOOK_TYPE_LN2,
+    "mlp_in":      HOOK_TYPE_MLP_IN,
+    "mlp_out":     HOOK_TYPE_MLP_OUT,
+    "resid_post":  HOOK_TYPE_RESID_POST,
+    "embed":       HOOK_TYPE_EMBED,
+    "pos_embed":   HOOK_TYPE_POS_EMBED,
+    "final_ln":    HOOK_TYPE_FINAL_LN,
+    "token_ids":   HOOK_TYPE_TOKEN_IDS,
+    "final_logits": HOOK_TYPE_FINAL_LOGITS,
+}
+for _name, _htype in _HOOK_TYPE_BY_NAME.items():
+    _HOOK_SELECTIONS[_name] = frozenset({_htype})
+
+# -- Aliases --
+_HOOK_SELECTIONS["hidden-states"] = _HOOK_SELECTIONS["resid_pre"]
+_HOOK_SELECTIONS["hidden_states"] = _HOOK_SELECTIONS["resid_pre"]
+_HOOK_SELECTIONS["logits"] = _HOOK_SELECTIONS["final_logits"]
+_HOOK_SELECTIONS["token-ids"] = _HOOK_SELECTIONS["token_ids"]
+
+
+def resolve_hook_selection(mode: str) -> frozenset:
+    """Resolve a comma-separated hook selection string to a set of hook types.
+
+    Each comma-separated token is looked up in _HOOK_SELECTIONS (presets
+    and individual hook names).  The result is the union of all tokens.
+    """
+    result: set = set()
+    for token in mode.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        entry = _HOOK_SELECTIONS.get(token)
+        if entry is None:
+            raise ValueError(
+                f"Unknown hook selection {token!r}. "
+                f"Available: {sorted(_HOOK_SELECTIONS.keys())}")
+        result |= entry
+    if not result:
+        raise ValueError(f"Empty hook selection: {mode!r}")
+    return frozenset(result)
+
 
 def apply_hook_selection(specs: List["HookSpec"], mode: str) -> List["HookSpec"]:
-    """Filter specs and set HookPoint.enabled based on a selection preset.
+    """Filter specs and set HookPoint.enabled based on a selection string.
 
-    Sets enabled=True on hooks in the preset, enabled=False on others.
+    Selection is a comma-separated string of preset names and/or individual
+    hook type names.  The enabled set is the union of all tokens.
+
+    Sets enabled=True on hooks in the set, enabled=False on others.
     Returns the filtered list of enabled specs (for _active_specs / metadata).
-
-    Args:
-        specs: all HookSpec objects from model.get_hook_specs()
-        mode: one of "full", "hf-only", "hidden-states", "logits", "attention"
     """
-    allowed = _HOOK_SELECTION_PRESETS.get(mode)
-    if allowed is None:
-        raise ValueError(
-            f"Unknown hook selection mode {mode!r}. "
-            f"Available: {sorted(_HOOK_SELECTION_PRESETS.keys())}")
+    allowed = resolve_hook_selection(mode)
 
     enabled_specs = []
     for spec in specs:
@@ -166,15 +209,19 @@ def _hook_type_from_name(hook_name: str) -> int:
     return 0
 
 
-def _hook_id_from_name(hook_name: str) -> int:
-    """Extract layer index from 'blocks.N.xxx' or 'layers.N.xxx', returns 0 otherwise."""
+def _layer_no_from_name(hook_name: str) -> int:
+    """Extract layer index from 'blocks.N.xxx' or 'layers.N.xxx', returns -1 for global hooks."""
     parts = hook_name.split(".")
     if len(parts) >= 2 and parts[0] in ("blocks", "layers"):
         try:
             return int(parts[1])
         except ValueError:
             pass
-    return 0
+    return -1
+
+
+# Keep old name as alias for callers that still use it (HookPoint sets _ring_hook_id)
+_hook_id_from_name = _layer_no_from_name
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +245,10 @@ class ModelShapeConfig:
 
 @dataclass
 class HookSpec:
-    """One monitoring hook: name, shape convention, and module reference."""
-    name:      str                        # e.g. "blocks.3.attn.hook_attn_scores"
+    """One monitoring hook: type, layer, shape convention, and module reference."""
     hook_type: int                        # HOOK_TYPE_* -- determines shape formula
     module:    nn.Module                  # the HookPoint instance
+    layer_no:  int = -1                   # layer index (-1 for global hooks like embed, final_ln)
     dtype:     Optional[torch.dtype] = None  # override model dtype (e.g. int64 for token_ids)
 
 
@@ -367,9 +414,8 @@ def install_ring_hooks(specs: List[HookSpec], handles_out: List) -> None:
     can remove them later via handle.remove().
     """
     for spec in specs:
-        hook_id = _hook_id_from_name(spec.name)
         handle = spec.module.register_forward_hook(
-            _make_ring_hook(spec.hook_type, hook_id)
+            _make_ring_hook(spec.hook_type, spec.layer_no)
         )
         handles_out.append(handle)
 
@@ -393,9 +439,14 @@ class RingTransport:
 
         # Current step context -- set before each forward pass
         self._current_model_id: Optional[str] = None
-        self._current_shard_rank: int = 0
+        self._current_tp_rank: int = 0
+        self._current_dp_rank: int = 0
+        self._current_ep_rank: int = 0
+        self._current_pp_rank: int = 0
+        self._current_flattened: bool = False
         self._current_req_ids: Optional[List[str]] = None
         self._current_token_ranges: Optional[List[Tuple[int, int]]] = None
+        self._current_dim0_offsets: Optional[List[int]] = None
 
         # When True: push_meta / capture_tensor meta pushes are skipped so the
         # FIFO stays empty.  ring_producer_op still calls _ring_engine.hook()
@@ -433,15 +484,34 @@ class RingTransport:
     def set_step_context(
         self,
         model_id: str,
-        shard_rank: int,
         req_ids: List[str],
         token_ranges: List[Tuple[int, int]],
+        dim0_offsets: Optional[List[int]] = None,
+        tp_rank: int = 0,
+        dp_rank: int = 0,
+        ep_rank: int = 0,
+        pp_rank: int = 0,
+        flattened: bool = False,
     ) -> None:
-        """Called before each forward pass to provide per-step batch metadata."""
+        """Called before each forward pass to provide per-step batch metadata.
+
+        dim0_offsets: per-request offset in tensor dim 0.
+            HF: batch index (0, 1, 2, ...).  None = auto-generate range(len(req_ids)).
+            vLLM: token offset in packed tensor (cumulative sum of scheduled tokens).
+        flattened: False = HF batched [batch, q_len, ...], True = vLLM packed [total_tokens, ...].
+        """
         self._current_model_id = model_id
-        self._current_shard_rank = shard_rank
+        self._current_tp_rank = tp_rank
+        self._current_dp_rank = dp_rank
+        self._current_ep_rank = ep_rank
+        self._current_pp_rank = pp_rank
+        self._current_flattened = flattened
         self._current_req_ids = req_ids
         self._current_token_ranges = token_ranges
+        self._current_dim0_offsets = (
+            dim0_offsets if dim0_offsets is not None
+            else list(range(len(req_ids)))
+        )
 
     def set_model_cfg(self, cfg: ModelShapeConfig) -> None:
         """Set the model shape config for analytical shape computation."""
@@ -463,8 +533,11 @@ class RingTransport:
             return
         if self._current_req_ids is None or self._current_token_ranges is None:
             return
+        if self._current_dim0_offsets is None:
+            return
 
-        hook_names = []
+        hook_types = []
+        layer_nos = []
         shapes = []
         dtypes = []
         for spec in self._active_specs:
@@ -475,17 +548,23 @@ class RingTransport:
             if not shape:
                 continue
             dtype = spec.dtype if spec.dtype is not None else self._model_cfg.dtype
-            hook_names.append(spec.name)
+            hook_types.append(spec.hook_type)
+            layer_nos.append(spec.layer_no)
             shapes.append(shape)
             dtypes.append(dtype)
 
-        if hook_names:
+        if hook_types:
             self._ring_engine.push_all_metas(
-                hook_names, shapes, dtypes,
+                hook_types, layer_nos, shapes, dtypes,
                 self._current_model_id,
-                self._current_shard_rank,
+                self._current_tp_rank,
+                self._current_dp_rank,
+                self._current_ep_rank,
+                self._current_pp_rank,
+                self._current_flattened,
                 list(self._current_req_ids),
                 list(self._current_token_ranges),
+                list(self._current_dim0_offsets),
             )
 
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,

@@ -400,17 +400,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
       .def("push_all_metas",
            [](ring_py::RingEnginePy& self,
-              py::list hook_names_py,
+              py::list hook_types_py,
+              py::list layer_nos_py,
               py::list shapes_py,
               py::list dtypes_py,
               const std::string& model_id,
-              int32_t shard_rank,
+              int32_t tp_rank,
+              int32_t dp_rank,
+              int32_t ep_rank,
+              int32_t pp_rank,
+              bool flattened,
               py::list req_ids_py,
-              py::list token_ranges_py) {
+              py::list token_ranges_py,
+              py::list dim0_offsets_py) {
                // Build step context (heap-allocated, ownership to FIFO/p2p)
                auto* ctx = new ring_py::StepContext();
-               ctx->model_id   = model_id;
-               ctx->shard_rank = shard_rank;
+               ctx->model_id  = model_id;
+               ctx->tp_rank   = tp_rank;
+               ctx->dp_rank   = dp_rank;
+               ctx->ep_rank   = ep_rank;
+               ctx->pp_rank   = pp_rank;
+               ctx->flattened = flattened;
                ctx->requests.reserve(static_cast<size_t>(py::len(req_ids_py)));
                for (size_t i = 0; i < static_cast<size_t>(py::len(req_ids_py)); ++i) {
                    ring_py::RequestMeta rm;
@@ -418,15 +428,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                    py::tuple tr   = token_ranges_py[i].cast<py::tuple>();
                    rm.start_token = py::cast<int32_t>(tr[0]);
                    rm.end_token   = py::cast<int32_t>(tr[1]);
+                   rm.dim0_offset = py::cast<int64_t>(dim0_offsets_py[i]);
                    ctx->requests.push_back(std::move(rm));
                }
-               // Build per-hook metas (no per-step data, just hook-specific)
-               size_t n = static_cast<size_t>(py::len(hook_names_py));
+               // Build per-hook metas
+               size_t n = static_cast<size_t>(py::len(hook_types_py));
                std::vector<ring_py::TensorMeta> metas;
                metas.reserve(n);
                for (size_t i = 0; i < n; ++i) {
                    ring_py::TensorMeta meta;
-                   meta.hook_name    = py::cast<std::string>(hook_names_py[i]);
+                   meta.hook_type    = py::cast<int>(hook_types_py[i]);
+                   meta.layer_no     = py::cast<int>(layer_nos_py[i]);
                    meta.dtype        = static_cast<int>(dtypes_py[i].cast<at::ScalarType>());
                    meta.last_in_step = (i == n - 1);
                    py::list shape    = shapes_py[i].cast<py::list>();
@@ -438,9 +450,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                py::gil_scoped_release release;
                self.push_step(ctx, metas);
            },
-           py::arg("hook_names"), py::arg("shapes"), py::arg("dtypes"),
-           py::arg("model_id"), py::arg("shard_rank"),
-           py::arg("req_ids"), py::arg("token_ranges"))
+           py::arg("hook_types"), py::arg("layer_nos"),
+           py::arg("shapes"), py::arg("dtypes"),
+           py::arg("model_id"),
+           py::arg("tp_rank"), py::arg("dp_rank"),
+           py::arg("ep_rank"), py::arg("pp_rank"),
+           py::arg("flattened"),
+           py::arg("req_ids"), py::arg("token_ranges"),
+           py::arg("dim0_offsets"))
       .def("set_null_mode",
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),

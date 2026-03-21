@@ -110,7 +110,7 @@ def _install_monitoring_forward(model: Any) -> None:
             ring_transport.install_ring_hooks(active_specs, handles)
             transport._active_specs        = active_specs
             transport._using_forward_hooks = True
-            transport._forward_hook_names  = {s.name for s in active_specs}
+            transport._forward_hook_names  = {s.hook_type for s in active_specs}
             model._ring_hook_handles       = handles
 
             # Startup validation: warn if pinned staging < GPU ring
@@ -134,8 +134,15 @@ def _install_monitoring_forward(model: Any) -> None:
                 print(f"[ring] install_ring_hooks: all={len(all_specs)} active={len(active_specs)}"
                       f" model_cfg={transport._model_cfg is not None}")
 
+            # Ring transport does not need a model.forward wrapper.
+            # Pre-forward work (prepare_step, metadata push) happens in
+            # _prepare_wrapper which wraps prepare_inputs_for_generation.
+            # HookPoint.forward() calls ring::producer directly.
+            return
 
-    # --- monitored_forward wrapper ---
+    # --- monitored_forward wrapper (legacy native backend only) ---
+    # Ring transport returns above.  This wrapper is only installed when
+    # using the legacy native backend (start_step/end_step lifecycle).
     wrapper = getattr(model, "_monitoring_forward_wrapper", None)
     current_forward = model.forward
     if wrapper is not None and current_forward is wrapper:
@@ -164,14 +171,13 @@ def _install_monitoring_forward(model: Any) -> None:
         except Exception:
             pass
 
-        using_ring = engine is not None and getattr(engine, "_using_ring_transport", False)
-        if engine is not None and not using_ring:
+        if engine is not None:
             engine.start_step(phase=phase)
 
         try:
             return orig_forward(*f_args, **f_kwargs)
         finally:
-            if engine is not None and not using_ring:
+            if engine is not None:
                 engine.end_step()
 
     try:
@@ -182,8 +188,6 @@ def _install_monitoring_forward(model: Any) -> None:
     monitored_forward._monitoring_orig_forward = orig_forward
     model._monitoring_orig_forward             = orig_forward
     model._monitoring_forward_wrapper          = monitored_forward
-    # Record whether forward was already an instance attr (e.g. compiled
-    # forward) so _uninstall can delete it cleanly vs leave it in __dict__.
     model._monitoring_had_instance_forward     = 'forward' in model.__dict__
     model.forward                              = monitored_forward
 

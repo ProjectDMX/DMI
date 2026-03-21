@@ -354,7 +354,6 @@ class MonitoringEngine:
             print(f"[ring_step] prefill={is_prefill} token_ranges={token_ranges} finished={list(finished)}")
         self._ring_transport.set_step_context(
             model_id=str(self._model_id),
-            shard_rank=0,
             req_ids=list(req_ids),
             token_ranges=token_ranges,
         )

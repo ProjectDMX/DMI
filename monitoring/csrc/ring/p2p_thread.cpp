@@ -14,33 +14,32 @@ namespace ring {
 // ATen helpers (no GIL required for CPU tensors)
 // ---------------------------------------------------------------------------
 
-static std::pair<int32_t, std::string> parse_internal_id(const std::string& act_name) {
-    auto dot = act_name.find('.');
-    if (dot == std::string::npos) return {-1, act_name};
-    std::string prefix = act_name.substr(0, dot);
-    if (prefix != "blocks" && prefix != "layers") return {-1, act_name};
-    auto dot2 = act_name.find('.', dot + 1);
-    if (dot2 == std::string::npos) return {-1, act_name};
-    try {
-        int32_t layer = std::stoi(act_name.substr(dot + 1, dot2 - dot - 1));
-        return {layer, prefix + "." + act_name.substr(dot2 + 1)};
-    } catch (...) {
-        return {-1, act_name};
+// Build ClickHouse act_name from hook_type + layer_no.
+// layer_no >= 0: "layers.<hook_type_name>"  (layer_no passed separately)
+// layer_no < 0:  "<hook_type_name>"         (global hook like embed, final_ln)
+static std::string make_act_name(int hook_type, int layer_no) {
+    const char* name = ring_py::hook_type_name(hook_type);
+    if (layer_no >= 0) {
+        return std::string("layers.") + name;
     }
+    return std::string(name);
 }
 
-static bool is_attn_hook(const std::string& act_name) {
-    auto ends_with = [&](const std::string& suffix) {
-        return act_name.size() >= suffix.size() &&
-               act_name.compare(act_name.size() - suffix.size(),
-                                suffix.size(), suffix) == 0;
-    };
-    return ends_with("attn.hook_attn_scores") || ends_with("attn.hook_pattern");
+// Resolve shard_rank from hook_type and step context ranks.
+static int32_t resolve_shard_rank(int hook_type, const ring_py::StepContext& ctx) {
+    if (ring_py::is_tp_sharded(hook_type)) {
+        return ctx.tp_rank;
+    }
+    // For MoE models, MLP hooks are EP-sharded.  But is_tp_sharded already
+    // returns true for MLP_IN/MLP_OUT (dense case).  A future MoE flag on
+    // StepContext would override this.  For now, TP takes precedence.
+    return 0;
 }
 
+// HF batched slicing: tensor is [batch, q_len, ...].
 static at::Tensor slice_for_request(
     const at::Tensor& tensor,
-    int    batch_idx,
+    int64_t batch_idx,
     int32_t start_token,
     int32_t end_token,
     bool    is_attn)
@@ -69,6 +68,19 @@ static at::Tensor slice_for_request(
     }
 
     return s;
+}
+
+// vLLM flattened slicing: tensor is [total_tokens, ...], right-padded.
+static at::Tensor slice_flattened(
+    const at::Tensor& tensor,
+    int64_t dim0_offset,
+    int32_t start_token,
+    int32_t end_token)
+{
+    int64_t num_tokens = static_cast<int64_t>(end_token - start_token);
+    if (num_tokens <= 0) return at::Tensor{};
+    if (dim0_offset + num_tokens > tensor.size(0)) return at::Tensor{};
+    return tensor.narrow(0, dim0_offset, num_tokens);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +179,7 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     if (static_cast<uint64_t>(expected_bytes) != first_task.tensor_total_bytes) {
         fprintf(stderr, "[p2p] WARN: shape/bytes mismatch: expected=%ld actual=%lu hook=%s\n",
                 (long)expected_bytes, (unsigned long)first_task.tensor_total_bytes,
-                meta.hook_name.c_str());
+                ring_py::hook_type_name(meta.hook_type));
         if (meta.last_in_step) { delete current_ctx_; current_ctx_ = nullptr; }
         return;
     }
@@ -175,18 +187,30 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     tensor = tensor.view(dtype).reshape(
         std::vector<int64_t>(meta.shape.begin(), meta.shape.end()));
 
-    bool is_attn = is_attn_hook(meta.hook_name);
-    auto [layer_no, act_name] = parse_internal_id(meta.hook_name);
+    // Build act_name and resolve shard_rank from hook_type
+    std::string act_name = make_act_name(meta.hook_type, meta.layer_no);
+    int32_t shard_rank = resolve_shard_rank(meta.hook_type, *current_ctx_);
+    bool is_attn = ring_py::is_attn_hook(meta.hook_type);
 
     const auto& requests = current_ctx_->requests;
     bool should_clone = cfg_.clone_slices && requests.size() > 1;
 
     for (size_t j = 0; j < requests.size(); ++j) {
-        if (static_cast<int64_t>(j) >= tensor.size(0)) break;
         const ring_py::RequestMeta& req = requests[j];
-        at::Tensor slice = slice_for_request(
-            tensor, static_cast<int>(j),
-            req.start_token, req.end_token, is_attn);
+        at::Tensor slice;
+
+        if (current_ctx_->flattened) {
+            // vLLM: packed [total_tokens, ...], right-padded
+            if (is_attn) continue;
+            slice = slice_flattened(tensor, req.dim0_offset,
+                                    req.start_token, req.end_token);
+        } else {
+            // HF: [batch, q_len, ...], left-padded tokens
+            if (req.dim0_offset >= tensor.size(0)) break;
+            slice = slice_for_request(
+                tensor, req.dim0_offset,
+                req.start_token, req.end_token, is_attn);
+        }
         if (!slice.defined()) continue;
 
         slice = slice.contiguous();
@@ -195,8 +219,8 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
         }
 
         try {
-            submit_fn_(current_ctx_->model_id, current_ctx_->shard_rank,
-                       req.req_id, act_name, layer_no,
+            submit_fn_(current_ctx_->model_id, shard_rank,
+                       req.req_id, act_name, meta.layer_no,
                        req.start_token, req.end_token,
                        std::move(slice));
         } catch (...) {
