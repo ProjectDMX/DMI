@@ -251,14 +251,38 @@ class DMXGPUWorker(Worker):
         num_scheduled_per_req = list(num_scheduled.values())
         total_q = total_tokens
 
-        # Capacity check
+        # --- CUDA graph padding prediction ---
+        # vLLM pads total_tokens to the nearest CUDA graph capture size.
+        # The producer kernel sees the PADDED tensor, so both capacity
+        # check and meta shapes must use the padded count.
+        #
+        # RISK: We read cudagraph_dispatcher._bs_to_padded_graph_size,
+        # an internal list[int] indexed by token count.  This assumes:
+        #   (a) The list exists and is populated after warmup.
+        #   (b) For in-range tokens, if we don't set force_eager,
+        #       CUDA graph WILL be dispatched and padding WILL happen.
+        #       The only per-step condition that disables CUDA graph is
+        #       our own force_eager (from cpu_direct).  Other conditions
+        #       (LoRA, cascade, encoder) are session-level.
+        # CHECK ON VLLM UPGRADE: verify _bs_to_padded_graph_size still
+        # exists and the per-step dispatch logic hasn't added new
+        # conditions that bypass CUDA graphs.
+        padded_q = total_q
+        pad_table = getattr(
+            getattr(self.model_runner, 'cudagraph_dispatcher', None),
+            '_bs_to_padded_graph_size', None)
+        if pad_table is not None and total_q < len(pad_table):
+            padded_q = pad_table[total_q]
+
+        # Capacity check — use padded_q (matches real tensor size).
         cfg = transport._model_cfg
+        is_cpu_direct = False
         if cfg is not None and transport._active_specs:
             step_bytes = 0
             n_hooks = 0
             for spec in transport._active_specs:
                 shape = _compute_hook_shape(
-                    spec.hook_type, cfg, batch=0, q_len=total_q, kv_dim=0,
+                    spec.hook_type, cfg, batch=0, q_len=padded_q, kv_dim=0,
                     logits_to_keep=num_reqs)
                 if not shape:
                     continue
@@ -272,9 +296,15 @@ class DMXGPUWorker(Worker):
 
             if n_hooks > 0:
                 result = transport._ring_engine.prepare_step(step_bytes, n_hooks)
-                transport.cpu_direct = (result == 2)
-                if result == 2:
+                is_cpu_direct = (result == 2)
+                transport.cpu_direct = is_cpu_direct
+                if is_cpu_direct:
                     self._dmx_force_eager = True
+
+        # Meta q_len: if cpu_direct, we set force_eager which disables
+        # CUDA graph dispatch -> no padding -> tensor is unpadded.
+        # Otherwise padding stays -> tensor matches padded_q.
+        meta_q = total_q if is_cpu_direct else padded_q
 
         # Per-request metadata
         computed_map: dict = {}
@@ -324,7 +354,7 @@ class DMXGPUWorker(Worker):
             # DB token range to (end_token-1, end_token) — the single
             # predicted position per request.
             transport.pre_push_all_metas(
-                batch=0, q_len=total_q, kv_dim=0,
+                batch=0, q_len=meta_q, kv_dim=0,
                 logits_to_keep=num_reqs,
                 token_ids_dtype=ids_dtype)
 
