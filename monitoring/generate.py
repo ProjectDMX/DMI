@@ -279,7 +279,40 @@ def _install_prepare_wrapper(model: Any) -> None:
                 past_key_values = None
                 cache_position  = None
 
-            engine._prepare_ring_step(input_ids_val, attention_mask, past_key_values, cache_position=cache_position)
+            # Compute kv_offsets for attention hook kv-dimension slicing.
+            # Left-padded HF batches: both static and dynamic cache have the
+            # same left-padding in the kv dimension (cache_position = arange(Pmax)).
+            # kv_offset = pad_len = seq_len - real_len, computed once at prefill
+            # from the 2D attention mask, then reused for decode steps.
+            _kv_offsets = getattr(transport, '_prefill_kv_offsets', None)
+            if attention_mask is not None and _kv_offsets is None:
+                try:
+                    _am = attention_mask
+                    if isinstance(_am, dict):
+                        _am = _am.get("full_attention", _am)
+                    if hasattr(_am, 'dim'):
+                        ndim = _am.dim()
+                        if ndim == 2:
+                            _seq_len = int(_am.shape[1])
+                            _real_lens = _am.sum(dim=1).tolist()
+                            _kv_offsets = [_seq_len - int(rl) for rl in _real_lens]
+                        elif ndim == 4:
+                            _batch = int(_am.shape[0])
+                            _kv_offsets = []
+                            for b in range(_batch):
+                                row = _am[b, 0, -1, :]
+                                pad = int((row < 0).long().argmin().item())
+                                if pad == 0 and row[0] < 0:
+                                    pad = int(row.shape[0])
+                                _kv_offsets.append(pad)
+                        if _kv_offsets is not None:
+                            transport._prefill_kv_offsets = _kv_offsets
+                except Exception:
+                    pass
+
+            _is_static_cache = past_key_values is not None and hasattr(past_key_values, 'max_cache_len')
+            engine._prepare_ring_step(input_ids_val, attention_mask, past_key_values,
+                                      cache_position=cache_position, kv_offsets=_kv_offsets)
 
             if _profile:
                 _t_ring_step = _time.perf_counter()
@@ -291,7 +324,7 @@ def _install_prepare_wrapper(model: Any) -> None:
 
                     batch  = int(input_ids_val.shape[0])
                     q_len  = int(input_ids_val.shape[1])
-                    is_static = past_key_values is not None and hasattr(past_key_values, 'max_cache_len')
+                    is_static = _is_static_cache
                     kv_dim = ring_transport._get_kv_dim(past_key_values, q_len, is_static=is_static)
                     logits_to_keep = int(model_inputs.get("logits_to_keep", 0)) if isinstance(model_inputs, dict) else 0
 
@@ -706,3 +739,4 @@ def generate_with_monitoring(model: Any, *args: Any,
             transport.cpu_direct = False
             transport._force_cpu_direct = False
             transport._hook_selection = None
+            transport._prefill_kv_offsets = None

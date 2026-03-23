@@ -649,7 +649,7 @@ def _parse_args() -> BenchConfig:
                    help="0=keep all logits, 1=last position only (HF default)")
     g.add_argument("--hook-selection",  default="full",
                    help="Comma-separated hook selection (default: full). "
-                        "Presets: full, no-attention-scores, hf-only. "
+                        "Presets: full, vllm-full, hf-only. "
                         "Individual: resid_pre, q, k, v, z, final_logits, etc. "
                         "Aliases: hidden-states=resid_pre, logits=final_logits")
     g.add_argument("--hf-offload-hidden-states", action="store_true",

@@ -216,7 +216,8 @@ class MonitoringEngine:
         self._using_ring_transport = True
         _rt.activate(transport)
 
-    def _prepare_ring_step(self, input_ids: Any, attention_mask: Any, past_key_values: Any, cache_position: Any = None) -> None:
+    def _prepare_ring_step(self, input_ids: Any, attention_mask: Any, past_key_values: Any,
+                           cache_position: Any = None, kv_offsets: Any = None) -> None:
         """Precompute per-step batch context and set it on the ring transport.
 
         Called before the forward pass so ring hooks (firing during forward)
@@ -356,6 +357,7 @@ class MonitoringEngine:
             model_id=str(self._model_id),
             req_ids=list(req_ids),
             token_ranges=token_ranges,
+            kv_offsets=kv_offsets,
         )
 
     # ------------------------------------------------------------------

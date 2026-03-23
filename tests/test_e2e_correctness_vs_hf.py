@@ -676,12 +676,11 @@ def test_e2e_correctness_hf(subtests) -> None:
         # --- hook_final_ln ---
         # TODO: hook_final_ln comparison skipped.
 
-        # --- per-layer: attention pattern + resid_pre/post ---
+        # --- per-layer: attention pattern + resid_pre ---
         # Support both GPT-2 naming (blocks.attn.hook_pattern, blocks.hook_resid_*)
         # and Qwen3 naming (layers.self_attn.hook_pattern, layers.hook_resid_*)
         _ATTN_PATTERN_KEYS = ("blocks.attn.hook_pattern", "layers.self_attn.hook_pattern")
         _RESID_PRE_KEYS = ("blocks.hook_resid_pre", "layers.hook_resid_pre")
-        _RESID_POST_KEYS = ("blocks.hook_resid_post", "layers.hook_resid_post")
 
         n_layers = len(ref.attn_pattern) if ref.attn_pattern else 0
         assert n_layers == num_layers, (
@@ -689,21 +688,37 @@ def test_e2e_correctness_hf(subtests) -> None:
         )
 
         for layer_no in range(n_layers):
+            # attn_pattern: compare per-chunk (can't merge because kv_dim
+            # differs between prefill [H, plen, plen] and decode [H, 1, plen+i])
             key = next(((layer_no, k) for k in _ATTN_PATTERN_KEYS if (layer_no, k) in hooks_map), None)
             if key is not None:
                 pat = ref.attn_pattern[layer_no]  # [H, T, T]
                 chunks = sorted(hooks_map[key], key=lambda x: (x[0], x[1]))
-                _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} pattern")
-                db_t = merge_segments([t for _, _, t in chunks], key[1])
-                if db_t.ndim == 4 and db_t.shape[0] == 1:
-                    db_t = db_t.squeeze(0)
+                all_ok = True
+                fail_msg = ""
+                for start, end, t_chunk in chunks:
+                    q_len = end - start
+                    db_c = t_chunk
+                    if db_c.ndim == 4 and db_c.shape[0] == 1:
+                        db_c = db_c.squeeze(0)
+                    # kv_dim for these rows: causal, valid up to position 'end'
+                    kv_valid = end
+                    db_c = db_c[:, :q_len, :kv_valid]
+                    ref_c = pat[:, start:end, :kv_valid]
+                    if db_c.shape != ref_c.shape:
+                        all_ok = False
+                        fail_msg = (f"shape mismatch at [{start}:{end}] "
+                                    f"db={db_c.shape} ref={ref_c.shape}")
+                        break
+                    if not bitwise_equal(db_c, ref_c):
+                        max_abs = float((db_c.float() - ref_c.float()).abs().max().item())
+                        all_ok = False
+                        fail_msg = (f"value mismatch at [{start}:{end}] "
+                                    f"max_abs={max_abs:.6f}")
+                        break
                 with subtests.test(msg=f"{req_id}/layer{layer_no}/attn_pattern"):
-                    assert tuple(db_t.shape) == tuple(pat.shape), (
-                        f"pattern shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(pat.shape)}"
-                    )
-                    assert bitwise_equal(db_t, pat), (
-                        f"pattern mismatch layer={layer_no} "
-                        f"(max_abs={float((db_t.float() - pat.float()).abs().max().item())})"
+                    assert all_ok, (
+                        f"pattern layer={layer_no}: {fail_msg}"
                     )
 
             key = next(((layer_no, k) for k in _RESID_PRE_KEYS if (layer_no, k) in hooks_map), None)
@@ -721,23 +736,22 @@ def test_e2e_correctness_hf(subtests) -> None:
                         f"(max_abs={float((db_t.float() - hs.float()).abs().max().item())})"
                     )
 
-            key = next(((layer_no, k) for k in _RESID_POST_KEYS if (layer_no, k) in hooks_map), None)
-            # len(ref.hidden_states) == n_layers + 1
-            # here we skip the last one, because that is not a full layer, just after
-            # the final_ln
-            if key is not None and ref.hidden_states and (layer_no + 1) < n_layers:
-                hs = ref.hidden_states[layer_no + 1]  # [T, d]
-                chunks = sorted(hooks_map[key], key=lambda x: (x[0], x[1]))
-                _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} layer{layer_no} resid_post")
-                db_t = merge_segments([t for _, _, t in chunks], key[1])
-                with subtests.test(msg=f"{req_id}/layer{layer_no}/resid_post"):
-                    assert tuple(db_t.shape) == tuple(hs.shape), (
-                        f"resid_post shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
-                    )
-                    assert bitwise_equal(db_t, hs), (
-                        f"resid_post mismatch layer={layer_no} "
-                        f"(max_abs={float((db_t.float() - hs.float()).abs().max().item())})"
-                    )
+        # --- resid_final (global: last layer's pre-norm residual) ---
+        # HF's output_hidden_states[-1] is POST-final-norm (after ln_f),
+        # not pre-norm.  resid_final captures pre-norm.  No direct HF
+        # reference available, so we only check shape and presence.
+        key = (-1, "hook_resid_final")
+        if key in hooks_map:
+            chunks = sorted(hooks_map[key], key=lambda x: (x[0], x[1]))
+            _validate_contiguous(chunks, expected_end=seq_len, ctx=f"{req_id} resid_final")
+            db_t = merge_segments([t for _, _, t in chunks], key[1])
+            with subtests.test(msg=f"{req_id}/resid_final"):
+                assert db_t.shape[-1] == ref.hidden_states[0].shape[-1] if ref.hidden_states else True, (
+                    f"resid_final hidden_dim mismatch"
+                )
+                assert db_t.shape[0] == seq_len, (
+                    f"resid_final token count mismatch db={db_t.shape[0]} expected={seq_len}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -956,7 +970,7 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
         for (layer, hname), chunks in hooks_map.items():
             hook_totals[hname] += len(chunks)
     print(f"[DEBUG] Hook totals across all requests:")
-    for hname in ['token_ids', 'hook_embed', 'hook_pos_embed', 'blocks.0.hook_resid_pre', 'blocks.11.hook_resid_post', 'hook_final_ln', 'final_logits']:
+    for hname in ['token_ids', 'hook_embed', 'hook_pos_embed', 'blocks.0.hook_resid_pre', 'hook_resid_final', 'hook_final_ln', 'final_logits']:
         print(f"  {hname}: {hook_totals.get(hname, 0)} chunks")
     rid = request_ids[0]
     hooks_map = grouped[rid]
@@ -1049,7 +1063,26 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     # Per-request assertions (full verification)
     # -----------------------------------------------------------------------
     _RESID_PRE_KEYS  = ("blocks.hook_resid_pre",  "layers.hook_resid_pre")
-    _RESID_POST_KEYS = ("blocks.hook_resid_post", "layers.hook_resid_post")
+
+    # HF reference is uncompiled; monitored model is compiled (reduce-overhead).
+    # Fall back to allclose if not bitwise equal.
+    _COMPILED_ATOL = 0.5  # safety net: real transport errors are >> 1
+
+    def _assert_close_or_bitwise(db_t, ref_t, label):
+        if bitwise_equal(db_t, ref_t):
+            return
+        diff = (db_t.float() - ref_t.float()).abs()
+        max_abs = float(diff.max().item())
+        if torch.allclose(db_t.float(), ref_t.float(), atol=_COMPILED_ATOL, rtol=0.0):
+            import warnings
+            warnings.warn(
+                f"[NOT BITWISE] {label}: max_abs_diff={max_abs:.6f} "
+                f"(within atol={_COMPILED_ATOL}, but not bitwise equal)"
+            )
+            return
+        pytest.fail(
+            f"{label}: max_abs_diff={max_abs:.6f} > atol={_COMPILED_ATOL}"
+        )
 
     for req_id in req_order:
         local_i   = local_index_by_req[req_id]
@@ -1078,36 +1111,13 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
                 f"(if db_len << hf_len the CUDA-graph monitoring bug is present)"
             )
 
-        # --- final_logits / resid_pre / resid_post ---
-        # HF reference is uncompiled; monitored model is compiled (reduce-overhead).
-        # Fall back to allclose if not bitwise equal.
-        _COMPILED_ATOL = 0.5  # safety net: real transport errors are >> 1
-
-        def _assert_close_or_bitwise(db_t, ref_t, label):
-            """Assert bitwise equal; if not, try allclose and warn about max_abs_diff."""
-            if bitwise_equal(db_t, ref_t):
-                return
-            diff = (db_t.float() - ref_t.float()).abs()
-            max_abs = float(diff.max().item())
-            if torch.allclose(db_t.float(), ref_t.float(), atol=_COMPILED_ATOL, rtol=0.0):
-                import warnings
-                warnings.warn(
-                    f"[NOT BITWISE] {label}: max_abs_diff={max_abs:.6f} "
-                    f"(within atol={_COMPILED_ATOL}, but not bitwise equal)"
-                )
-                return
-            pytest.fail(
-                f"{label}: max_abs_diff={max_abs:.6f} > atol={_COMPILED_ATOL}"
-            )
-
+        # --- final_logits ---
         logits_chunks_raw = hooks_map.get((-1, "final_logits"), [])
         if logits_chunks_raw:
             lchunks   = _sort_chunks(logits_chunks_raw)
             db_logits = merge_segments([t for _, _, t in lchunks], "final_logits")
             if db_logits.ndim == 1:
                 db_logits = db_logits.unsqueeze(0)
-            # ref.final_logits is decode-only scores from generate():
-            # ref[s] = logits at position (plen - 1 + s).
             n_ref = int(ref.final_logits.shape[0])
             start = plen - 1
             end = min(start + n_ref, int(db_logits.shape[0]))
@@ -1115,13 +1125,13 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
             db_slice  = db_logits[start:end, :]
             rol_slice = ref.final_logits[:n, :]
             with subtests.test(msg=f"{req_id}/cuda_graph/final_logits"):
-                assert n > 0, f"final_logits: no overlapping rows (db={db_logits.shape[0]} ref={ref.final_logits.shape[0]})"
+                assert n > 0, f"final_logits: no overlapping rows"
                 assert db_slice.shape[1] == rol_slice.shape[1], (
                     f"final_logits vocab mismatch db={db_slice.shape[1]} hf={rol_slice.shape[1]}"
                 )
                 _assert_close_or_bitwise(db_slice, rol_slice, f"{req_id} final_logits")
 
-        # --- hook_embed (bitwise: embedding lookup has no arithmetic) ---
+        # --- hook_embed ---
         seq = db_tok.to(device)
         if wte is not None and wpe is not None and (-1, "hook_embed") in hooks_map:
             emb    = wte(seq).detach().cpu()
@@ -1144,9 +1154,21 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
                 )
                 _assert_close_or_bitwise(db_t, emb, f"{req_id} hook_embed")
 
-        # --- per-layer: resid_pre / resid_post ---
-        # attn_pattern skipped: static-cache decode produces [H, 1, kv_len] per step
-        # (kv_len grows each step), incompatible with rollout's [H, T, T].
+        # --- hook_pos_embed (GPT2 only) ---
+        if wpe is not None and (-1, "hook_pos_embed") in hooks_map:
+            pos = _positions_for_unpadded(seq_len, device=device)
+            pos_emb = wpe(pos).detach().cpu()
+            chunks = _sort_chunks(hooks_map[(-1, "hook_pos_embed")])
+            _validate_contiguous(chunks, seq_len, f"{req_id} hook_pos_embed")
+            db_t = merge_segments([t for _, _, t in chunks], "hook_pos_embed")
+            with subtests.test(msg=f"{req_id}/cuda_graph/hook_pos_embed"):
+                assert tuple(db_t.shape) == tuple(pos_emb.shape), (
+                    f"hook_pos_embed shape mismatch db={tuple(db_t.shape)} hf={tuple(pos_emb.shape)}"
+                )
+                _assert_close_or_bitwise(db_t, pos_emb, f"{req_id} hook_pos_embed")
+
+        # --- per-layer: resid_pre + attn_pattern ---
+        _ATTN_PATTERN_KEYS = ("blocks.attn.hook_pattern", "layers.self_attn.hook_pattern")
         for layer_no in range(num_layers):
             key = next(((layer_no, k) for k in _RESID_PRE_KEYS if (layer_no, k) in hooks_map), None)
             if key is not None and ref.hidden_states and layer_no < len(ref.hidden_states):
@@ -1160,17 +1182,32 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
                     )
                     _assert_close_or_bitwise(db_t, hs, f"{req_id} layer{layer_no} resid_pre")
 
-            key = next(((layer_no, k) for k in _RESID_POST_KEYS if (layer_no, k) in hooks_map), None)
-            if key is not None and ref.hidden_states and (layer_no + 1) < num_layers:
-                hs     = ref.hidden_states[layer_no + 1]
+            # attn_pattern: both DB and ref use static cache, same padding
+            key = next(((layer_no, k) for k in _ATTN_PATTERN_KEYS if (layer_no, k) in hooks_map), None)
+            if key is not None and ref.attn_pattern and layer_no < len(ref.attn_pattern):
+                pat = ref.attn_pattern[layer_no]
                 chunks = _sort_chunks(hooks_map[key])
-                _validate_contiguous(chunks, seq_len, f"{req_id} layer{layer_no} resid_post")
-                db_t   = merge_segments([t for _, _, t in chunks], key[1])
-                with subtests.test(msg=f"{req_id}/cuda_graph/layer{layer_no}/resid_post"):
-                    assert tuple(db_t.shape) == tuple(hs.shape), (
-                        f"resid_post shape mismatch layer={layer_no} db={tuple(db_t.shape)} hf={tuple(hs.shape)}"
+                db_pat = merge_segments([t for _, _, t in chunks], key[1])
+                if db_pat.ndim == 4 and db_pat.shape[0] == 1:
+                    db_pat = db_pat.squeeze(0)
+                with subtests.test(msg=f"{req_id}/cuda_graph/layer{layer_no}/attn_pattern"):
+                    assert tuple(db_pat.shape) == tuple(pat.shape), (
+                        f"pattern shape mismatch layer={layer_no} db={tuple(db_pat.shape)} hf={tuple(pat.shape)}"
                     )
-                    _assert_close_or_bitwise(db_t, hs, f"{req_id} layer{layer_no} resid_post")
+                    _assert_close_or_bitwise(db_pat, pat, f"{req_id} layer{layer_no} attn_pattern")
+
+        # --- resid_final ---
+        # HF's output_hidden_states[-1] is post-final-norm, not pre-norm.
+        # Only check shape and presence.
+        key = (-1, "hook_resid_final")
+        if key in hooks_map:
+            chunks = _sort_chunks(hooks_map[key])
+            _validate_contiguous(chunks, seq_len, f"{req_id} resid_final")
+            db_t = merge_segments([t for _, _, t in chunks], key[1])
+            with subtests.test(msg=f"{req_id}/cuda_graph/resid_final"):
+                assert db_t.shape[0] == seq_len, (
+                    f"resid_final token count mismatch db={db_t.shape[0]} expected={seq_len}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1291,6 +1328,7 @@ def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
                 input_ids=input_ids, attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens, do_sample=False,
                 pad_token_id=pad_id, eos_token_id=eos_id,
+                logits_to_keep=0,
                 cache_implementation="static",
                 compile_config=CompileConfig(mode="reduce-overhead", fullgraph=False),
             )
@@ -1360,11 +1398,18 @@ def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
 
     # --- Comparisons ---
     _EAGER_ATOL = 0.5
-    _RESID_PRE_KEYS  = ("blocks.hook_resid_pre",  "layers.hook_resid_pre")
-    _RESID_POST_KEYS = ("blocks.hook_resid_post", "layers.hook_resid_post")
+    _RESID_PRE_KEYS    = ("blocks.hook_resid_pre",  "layers.hook_resid_pre")
+    _ATTN_PATTERN_KEYS = ("blocks.attn.hook_pattern", "layers.self_attn.hook_pattern")
 
     def _sort_chunks(chunks):
         return sorted(chunks, key=lambda x: (x[0], x[1]))
+
+    def _close_enough(db_t, ref_t, ctx, atol=_EAGER_ATOL):
+        diff = (db_t.float() - ref_t.float()).abs()
+        max_abs = float(diff.max().item())
+        assert max_abs <= atol, (
+            f"{ctx} max_abs_diff={max_abs:.6f} > atol={atol}"
+        )
 
     for req_id in sorted(request_ids, key=_parse_request_id):
         local_i  = local_index_by_req[req_id]
@@ -1373,7 +1418,7 @@ def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
         db_tok   = db_token_ids_by_req[req_id]
         eref     = hf_eager_refs[local_i]
 
-        # Find matching token prefix (compiled vs eager may diverge)
+        # --- token_ids: full comparison ---
         min_len = min(int(db_tok.numel()), int(eref.token_ids.numel()))
         match_len = 0
         for t in range(min_len):
@@ -1386,11 +1431,52 @@ def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
                 f"compiled/eager diverge within prompt (match_len={match_len} plen={plen})"
             )
 
-        if match_len <= 0 or not eref.hidden_states:
+        with subtests.test(msg=f"{req_id}/cg_vs_eager/token_ids_full"):
+            assert db_tok.numel() == eref.token_ids.numel(), (
+                f"token count mismatch db={db_tok.numel()} eager={eref.token_ids.numel()}"
+            )
+            assert torch.equal(db_tok[:match_len], eref.token_ids[:match_len]), (
+                f"token_ids mismatch in matching prefix (len={match_len})"
+            )
+
+        if match_len <= 0:
             continue
 
-        # Compare hidden states over matching prefix
+        # --- final_logits ---
+        if eref.final_logits is not None and (-1, "final_logits") in hooks_map:
+            chunks = _sort_chunks(hooks_map[(-1, "final_logits")])
+            db_logits = merge_segments([t for _, _, t in chunks], "final_logits")
+            ref_logits = eref.final_logits
+            # Compare over matching prefix
+            ml = min(db_logits.shape[0], ref_logits.shape[0], match_len)
+            with subtests.test(msg=f"{req_id}/cg_vs_eager/final_logits"):
+                _close_enough(db_logits[:ml], ref_logits[:ml],
+                              f"{req_id} final_logits")
+
+        # --- hook_embed ---
+        if (-1, "hook_embed") in hooks_map:
+            chunks = _sort_chunks(hooks_map[(-1, "hook_embed")])
+            db_emb = merge_segments([t for _, _, t in chunks], "hook_embed")
+            if eref.hidden_states and len(eref.hidden_states) > 0:
+                # hidden_states[0] is the embedding output for HF models
+                # that include it (GPT2: embed+pos, Qwen3: embed only)
+                pass  # embed comparison needs model-specific reference
+            with subtests.test(msg=f"{req_id}/cg_vs_eager/hook_embed"):
+                assert db_emb.ndim >= 2, f"hook_embed unexpected shape {db_emb.shape}"
+
+        # --- hook_pos_embed (GPT2 only) ---
+        if (-1, "hook_pos_embed") in hooks_map:
+            chunks = _sort_chunks(hooks_map[(-1, "hook_pos_embed")])
+            db_pos = merge_segments([t for _, _, t in chunks], "hook_pos_embed")
+            with subtests.test(msg=f"{req_id}/cg_vs_eager/hook_pos_embed"):
+                assert db_pos.ndim >= 2, f"hook_pos_embed unexpected shape {db_pos.shape}"
+
+        # --- per-layer: resid_pre + attn_pattern ---
+        if not eref.hidden_states:
+            continue
+
         for layer_no in range(num_layers):
+            # resid_pre
             key = next(((layer_no, k) for k in _RESID_PRE_KEYS if (layer_no, k) in hooks_map), None)
             if key is not None and layer_no < len(eref.hidden_states):
                 hs_eager = eref.hidden_states[layer_no][:match_len, :]
@@ -1400,26 +1486,61 @@ def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
                     assert db_t.shape == hs_eager.shape, (
                         f"shape mismatch db={db_t.shape} eager={hs_eager.shape}"
                     )
-                    diff = (db_t.float() - hs_eager.float()).abs()
+                    _close_enough(db_t, hs_eager,
+                                  f"resid_pre layer={layer_no}")
+
+            # attn_pattern: compare step-by-step, trimming static cache padding.
+            # DB (static cache): each step has kv_dim = max_len (padded).
+            # Eager ref (dynamic cache): each step has kv_dim = actual kv_len.
+            # We compare per-chunk, trimming DB's kv_dim to the eager ref's.
+            key = next(((layer_no, k) for k in _ATTN_PATTERN_KEYS if (layer_no, k) in hooks_map), None)
+            if key is not None and eref.attn_pattern and layer_no < len(eref.attn_pattern):
+                pat_eager = eref.attn_pattern[layer_no]  # [H, T, T] from rollout
+                chunks = _sort_chunks(hooks_map[key])
+                # Rebuild step-by-step: each chunk covers [start:end] token positions
+                all_ok = True
+                fail_msg = ""
+                for start, end, t_chunk in chunks:
+                    if start >= match_len:
+                        break
+                    end_clamp = min(end, match_len)
+                    q_len = end_clamp - start
+                    # t_chunk: [H, q_len, kv_dim_padded] or [1, H, q_len, kv_dim_padded]
+                    db_c = t_chunk
+                    if db_c.ndim == 4 and db_c.shape[0] == 1:
+                        db_c = db_c.squeeze(0)
+                    db_c = db_c[:, :q_len, :]  # trim q_len if chunk extends beyond match_len
+                    # kv_dim for these rows: tokens 0..end_clamp-1 attended to
+                    # keys 0..end_clamp-1 (causal). Trim kv to end_clamp.
+                    kv_valid = end_clamp
+                    db_c = db_c[:, :, :kv_valid]
+                    # Corresponding slice from eager ref
+                    ref_c = pat_eager[:, start:end_clamp, :kv_valid]
+                    if db_c.shape != ref_c.shape:
+                        all_ok = False
+                        fail_msg = (f"shape mismatch at [{start}:{end_clamp}] "
+                                    f"db={db_c.shape} eager={ref_c.shape}")
+                        break
+                    diff = (db_c.float() - ref_c.float()).abs()
                     max_abs = float(diff.max().item())
-                    assert max_abs <= _EAGER_ATOL, (
-                        f"resid_pre layer={layer_no} max_abs_diff={max_abs:.6f} > atol={_EAGER_ATOL}"
+                    if max_abs > _EAGER_ATOL:
+                        all_ok = False
+                        fail_msg = (f"value mismatch at [{start}:{end_clamp}] "
+                                    f"max_abs={max_abs:.6f} > atol={_EAGER_ATOL}")
+                        break
+                with subtests.test(msg=f"{req_id}/cg_vs_eager/layer{layer_no}/attn_pattern"):
+                    assert all_ok, (
+                        f"attn_pattern layer={layer_no}: {fail_msg}"
                     )
 
-            key = next(((layer_no, k) for k in _RESID_POST_KEYS if (layer_no, k) in hooks_map), None)
-            # hidden_states has n_layers+1 entries: [embed, layer0, ..., layer_{n-1}, final_ln]
-            # resid_post for layer L maps to hidden_states[L+1], but the last entry is
-            # post-final-LN (not a layer resid_post), so skip the last layer.
-            if key is not None and (layer_no + 1) < num_layers:
-                hs_eager = eref.hidden_states[layer_no + 1][:match_len, :]
-                chunks = _sort_chunks(hooks_map[key])
-                db_t = merge_segments([t for _, _, t in chunks], key[1])[:match_len, :]
-                with subtests.test(msg=f"{req_id}/cg_vs_eager/layer{layer_no}/resid_post"):
-                    assert db_t.shape == hs_eager.shape, (
-                        f"shape mismatch db={db_t.shape} eager={hs_eager.shape}"
-                    )
-                    diff = (db_t.float() - hs_eager.float()).abs()
-                    max_abs = float(diff.max().item())
-                    assert max_abs <= _EAGER_ATOL, (
-                        f"resid_post layer={layer_no} max_abs_diff={max_abs:.6f} > atol={_EAGER_ATOL}"
-                    )
+        # --- resid_final (global, last layer's pre-norm residual) ---
+        # HF's output_hidden_states[-1] is post-final-norm, not pre-norm.
+        # Only check shape and presence.
+        key = next(((-1, k) for k in ("hook_resid_final",) if (-1, k) in hooks_map), None)
+        if key is not None:
+            chunks = _sort_chunks(hooks_map[key])
+            db_rf = merge_segments([t for _, _, t in chunks], key[1])[:match_len, :]
+            with subtests.test(msg=f"{req_id}/cg_vs_eager/resid_final"):
+                assert db_rf.shape[0] == match_len, (
+                    f"resid_final token count mismatch db={db_rf.shape[0]} expected={match_len}"
+                )

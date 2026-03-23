@@ -412,7 +412,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               bool flattened,
               py::list req_ids_py,
               py::list token_ranges_py,
-              py::list dim0_offsets_py) {
+              py::list dim0_offsets_py,
+              py::list kv_offsets_py) {
                // Build step context (heap-allocated, ownership to FIFO/p2p)
                auto* ctx = new ring_py::StepContext();
                ctx->model_id  = model_id;
@@ -429,6 +430,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                    rm.start_token = py::cast<int32_t>(tr[0]);
                    rm.end_token   = py::cast<int32_t>(tr[1]);
                    rm.dim0_offset = py::cast<int64_t>(dim0_offsets_py[i]);
+                   if (i < static_cast<size_t>(py::len(kv_offsets_py)))
+                       rm.kv_offset = py::cast<int32_t>(kv_offsets_py[i]);
                    ctx->requests.push_back(std::move(rm));
                }
                // Build per-hook metas
@@ -457,7 +460,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("ep_rank"), py::arg("pp_rank"),
            py::arg("flattened"),
            py::arg("req_ids"), py::arg("token_ranges"),
-           py::arg("dim0_offsets"))
+           py::arg("dim0_offsets"),
+           py::arg("kv_offsets") = py::list())
       .def("set_null_mode",
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),

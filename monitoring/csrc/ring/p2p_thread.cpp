@@ -14,13 +14,14 @@ namespace ring {
 // ATen helpers (no GIL required for CPU tensors)
 // ---------------------------------------------------------------------------
 
-// Build ClickHouse act_name from hook_type + layer_no.
-// layer_no >= 0: "layers.<hook_type_name>"  (layer_no passed separately)
-// layer_no < 0:  "<hook_type_name>"         (global hook like embed, final_ln)
+// Build ClickHouse act_name from hook_type.
+// Per-layer: "blocks.<hook_type_name>"  (e.g. "blocks.attn.hook_pattern")
+// Global:    "<hook_type_name>"         (e.g. "hook_embed", "token_ids")
+// layer_no is stored in a separate DB column, not embedded in act_name.
 static std::string make_act_name(int hook_type, int layer_no) {
     const char* name = ring_py::hook_type_name(hook_type);
     if (layer_no >= 0) {
-        return std::string("layers.") + name;
+        return std::string("blocks.") + name;
     }
     return std::string(name);
 }
@@ -42,7 +43,8 @@ static at::Tensor slice_for_request(
     int64_t batch_idx,
     int32_t start_token,
     int32_t end_token,
-    bool    is_attn)
+    bool    is_attn,
+    int32_t kv_offset = 0)
 {
     if (start_token >= end_token) return at::Tensor{};
     int32_t eff = end_token - start_token;
@@ -61,9 +63,11 @@ static at::Tensor slice_for_request(
     if (is_attn && s.dim() >= 2) {
         int key_dim = s.dim() - 1;
         int64_t want_k = static_cast<int64_t>(end_token);
-        if (want_k >= 0 && s.size(key_dim) > want_k) {
-            int64_t skip = s.size(key_dim) - want_k;
-            s = s.narrow(key_dim, skip, want_k);
+        if (want_k >= 0 && want_k <= s.size(key_dim)) {
+            // kv_offset: where real keys start in the kv dimension.
+            // Dynamic cache (left-padded): kv_offset = pad_len, real keys at end.
+            // Static cache: kv_offset = 0, real keys at start.
+            s = s.narrow(key_dim, kv_offset, want_k);
         }
     }
 
@@ -209,7 +213,8 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
             if (req.dim0_offset >= tensor.size(0)) break;
             slice = slice_for_request(
                 tensor, req.dim0_offset,
-                req.start_token, req.end_token, is_attn);
+                req.start_token, req.end_token, is_attn,
+                req.kv_offset);
         }
         if (!slice.defined()) continue;
 

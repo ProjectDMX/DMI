@@ -17,6 +17,14 @@
 namespace ring_py {
 
 // Hook type integer constants (must match ring_transport.py HOOK_TYPE_* values).
+//
+// Removed (gaps in numbering are intentional):
+//   10 (RESULT):  removed, attn_out captures the same tensor (o_proj output).
+//   resid_post:   removed (was per-layer).  Replaced by RESID_FINAL (global).
+//                 resid_post[i] == resid_pre[i+1] for all i < N-1.
+//
+// Kept despite overlap:
+//   LN2 vs MLP_IN: identical for dense models, differs for MoE (post-router).
 enum HookType : int {
     HOOK_TYPE_RESID_PRE    = 0,
     HOOK_TYPE_LN1          = 1,
@@ -28,11 +36,11 @@ enum HookType : int {
     HOOK_TYPE_K            = 7,
     HOOK_TYPE_V            = 8,
     HOOK_TYPE_Z            = 9,
-    HOOK_TYPE_RESULT       = 10,
+    // 10 removed (result == attn_out)
     HOOK_TYPE_LN2          = 11,
-    HOOK_TYPE_MLP_IN       = 12,
+    HOOK_TYPE_MLP_IN       = 12,  // == LN2 for dense; differs for MoE (post-router)
     HOOK_TYPE_MLP_OUT      = 13,
-    HOOK_TYPE_RESID_POST   = 14,
+    HOOK_TYPE_RESID_FINAL  = 14,  // global: last layer's residual before final norm
     HOOK_TYPE_EMBED        = 15,
     HOOK_TYPE_POS_EMBED    = 16,
     HOOK_TYPE_FINAL_LN     = 17,
@@ -42,12 +50,15 @@ enum HookType : int {
 };
 
 // Hook type -> display name for ClickHouse act_name column.
+// Uses old-style paths so segment_merger and test code work unchanged.
+// Per-layer hooks use "blocks." prefix; make_act_name prepends "blocks.<L>.".
 inline const char* hook_type_name(int hook_type) {
     static const char* NAMES[] = {
         "hook_resid_pre", "hook_ln1", "hook_attn_out", "hook_resid_mid",
-        "hook_attn_scores", "hook_pattern", "hook_q", "hook_k", "hook_v",
-        "hook_z", "hook_result", "hook_ln2", "hook_mlp_in", "hook_mlp_out",
-        "hook_resid_post", "hook_embed", "hook_pos_embed", "hook_final_ln",
+        "attn.hook_attn_scores", "attn.hook_pattern",
+        "attn.hook_q", "attn.hook_k", "attn.hook_v",
+        "attn.hook_z", nullptr, "hook_ln2", "hook_mlp_in", "hook_mlp_out",
+        "hook_resid_final", "hook_embed", "hook_pos_embed", "hook_final_ln",
         "token_ids", "final_logits",
     };
     if (hook_type >= 0 && hook_type < HOOK_TYPE_COUNT) return NAMES[hook_type];
@@ -58,8 +69,8 @@ inline const char* hook_type_name(int hook_type) {
 inline bool is_tp_sharded(int hook_type) {
     switch (hook_type) {
         case HOOK_TYPE_Q: case HOOK_TYPE_K: case HOOK_TYPE_V: case HOOK_TYPE_Z:
-        case HOOK_TYPE_ATTN_OUT: case HOOK_TYPE_RESULT:
-        case HOOK_TYPE_MLP_IN: case HOOK_TYPE_MLP_OUT:
+        case HOOK_TYPE_ATTN_OUT:
+        case HOOK_TYPE_MLP_OUT:
         case HOOK_TYPE_FINAL_LOGITS:
             return true;
         default:
@@ -84,6 +95,7 @@ struct RequestMeta {
     int32_t     start_token = 0;
     int32_t     end_token   = 0;
     int64_t     dim0_offset = 0;   // HF: batch_idx, vLLM: token offset
+    int32_t     kv_offset   = 0;   // attn kv-dim start (HF dynamic cache: pad_len, else 0)
 };
 
 // Per-step shared context.  Heap-allocated by push_step caller.
