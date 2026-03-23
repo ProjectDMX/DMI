@@ -135,6 +135,15 @@ def iter_batches(items: Sequence[Dict[str, Any]], batch_size: int) -> Iterable[L
         yield list(items[idx : idx + batch_size])
 
 
+def warmup_batches(items: Sequence[Dict[str, Any]], batch_size: int, count: int = 2) -> List[List[Dict[str, Any]]]:
+    batches = list(iter_batches(items, batch_size))[:count]
+    if not batches:
+        raise ValueError("no batches available for warmup")
+    while len(batches) < count:
+        batches.append(list(batches[-1]))
+    return batches
+
+
 def build_tokenizer(model_id: str, *, local_files_only: bool) -> Any:
     from transformers import AutoTokenizer
 

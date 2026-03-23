@@ -108,6 +108,14 @@ for dataset in "${DATASET_LIST[@]}"; do
                 "${EXTRA_ARGS[@]}"
               ;;
             hf_monitor)
+              python exp/offline_e2e/run_hf_monitor_manual.py \
+                --sample-file "${sample_file}" \
+                --batch-size "${batch_size}" \
+                --repeat-index "${repeat_index}" \
+                "${shared_args[@]}" \
+                "${EXTRA_ARGS[@]}"
+              ;;
+            hf_monitor_generate)
               python exp/offline_e2e/run_hf_monitor.py \
                 --sample-file "${sample_file}" \
                 --batch-size "${batch_size}" \
