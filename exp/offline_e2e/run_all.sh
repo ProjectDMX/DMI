@@ -20,6 +20,7 @@ DISABLE_COMPILE=0
 PAD_TO_MULTIPLE_OF=0
 PAD_BUCKETS=""
 MAX_INPUT_TOKENS=0
+SAMPLE_SIZE=500
 PROJ_DMI_MODE="ring_null"
 EXTRA_ARGS=()
 PROJ_DMI_ARGS=()
@@ -41,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     --pad-to-multiple-of) PAD_TO_MULTIPLE_OF="$2"; shift 2 ;;
     --pad-buckets) PAD_BUCKETS="$2"; shift 2 ;;
     --max-input-tokens) MAX_INPUT_TOKENS="$2"; shift 2 ;;
+    --sample-size) SAMPLE_SIZE="$2"; shift 2 ;;
     --proj-dmi-mode) PROJ_DMI_MODE="$2"; shift 2 ;;
     --ring-task-entries|--ring-payload-mb|--ring-pinned-mb|--drain-poll-timeout-us|--drain-flush-task-ratio|--drain-flush-payload-ratio|--drain-flush-entry-threshold|--drain-flush-byte-threshold|--drain-flush-timeout-us|--ch-parallelism|--ch-queue-max-items|--ch-queue-max-size-mb|--db-host|--db-port|--db-user|--db-password|--db-database|--db-table)
       PROJ_DMI_ARGS+=("$1" "$2"); shift 2 ;;
@@ -87,7 +89,7 @@ fi
 
 for dataset in "${DATASET_LIST[@]}"; do
   for sample_id in "${SAMPLE_LIST[@]}"; do
-    sample_file="benchmark/data/offline_e2e/${dataset}_1000_sample${sample_id}.jsonl"
+    sample_file="benchmark/data/offline_e2e/${dataset}_${SAMPLE_SIZE}_sample${sample_id}.jsonl"
     if [[ ! -f "${sample_file}" ]]; then
       echo "Missing sample file: ${sample_file}" >&2
       exit 1

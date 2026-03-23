@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import math
 import time
 
 import torch
+from tqdm import tqdm
 
 from common import (
     BatchMetrics,
@@ -166,7 +168,7 @@ def main() -> None:
     )
 
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode="full"),
+        hooks=HookSelection(mode="no-attention-scores"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
         native_partial_seal=NativePartialSealConfig(
             enabled=True,
@@ -202,10 +204,27 @@ def main() -> None:
     batch_metrics = []
     gen_kwargs = compile_generate_kwargs(compile_enabled)
     pad_buckets = parse_pad_buckets(args.pad_buckets)
+
+    # Warmup: two batches
+    with torch.no_grad():
+        for _ in range(2):
+            warmup_ids = torch.randint(0, tokenizer.vocab_size, (args.batch_size, 4), device=device)
+            warmup_mask = torch.ones_like(warmup_ids)
+            _ = generate_with_monitoring(
+                model, input_ids=warmup_ids,
+                attention_mask=warmup_mask,
+                max_new_tokens=4, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                hook_selection="no-attention-scores", **gen_kwargs,
+            )
+            device_sync(device)
+    print("Warmup done.", flush=True)
+
     try:
+        total_batches = math.ceil(len(rendered) / args.batch_size)
         with torch.no_grad():
             t0 = time.perf_counter()
-            for batch_index, batch in enumerate(iter_batches(rendered, args.batch_size)):
+            for batch_index, batch in tqdm(enumerate(iter_batches(rendered, args.batch_size)), total=total_batches, desc="proj_dmi"):
                 texts = [item["prompt_text"] for item in batch]
                 encoded = tokenize_batch(
                     tokenizer,
@@ -231,7 +250,7 @@ def main() -> None:
                     max_new_tokens=batch_max_new_tokens,
                     do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
-                    hook_selection="hf-only",
+                    hook_selection="no-attention-scores",
                     **gen_kwargs,
                 )
                 device_sync(device)
@@ -266,7 +285,7 @@ def main() -> None:
         batch_metrics=batch_metrics,
         extra={
             "local_files_only": bool(args.local_files_only),
-            "hook_selection": "hf-only",
+            "hook_selection": "no-attention-scores",
             "proj_dmi_mode": args.proj_dmi_mode,
             "ring_task_entries": int(args.ring_task_entries),
             "ring_payload_mb": int(args.ring_payload_mb),

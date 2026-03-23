@@ -6,7 +6,10 @@ import argparse
 import time
 from typing import Any
 
+import math
+
 import torch
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM
 
 from common import (
@@ -74,9 +77,19 @@ def main() -> None:
     batch_metrics = []
     pad_buckets = parse_pad_buckets(args.pad_buckets)
 
+    # Warmup: two batches
+    with torch.no_grad():
+        for _ in range(2):
+            warmup_ids = torch.randint(0, tokenizer.vocab_size, (args.batch_size, 4), device=device)
+            _ = model.generate(warmup_ids, max_new_tokens=4, do_sample=False,
+                               pad_token_id=tokenizer.pad_token_id)
+            device_sync(device)
+    print("Warmup done.", flush=True)
+
+    total_batches = math.ceil(len(rendered) / args.batch_size)
     with torch.no_grad():
         t0 = time.perf_counter()
-        for batch_index, batch in enumerate(iter_batches(rendered, args.batch_size)):
+        for batch_index, batch in tqdm(enumerate(iter_batches(rendered, args.batch_size)), total=total_batches, desc="hf_monitor"):
             texts = [item["prompt_text"] for item in batch]
             encoded = tokenize_batch(
                 tokenizer,
@@ -104,18 +117,16 @@ def main() -> None:
                 return_dict_in_generate=True,
                 output_scores=True,
                 output_hidden_states=True,
-                output_attentions=True,
+                output_attentions=False,
             )
             cpu_payload = {
                 "sequences": _to_cpu_tree(outputs.sequences),
                 "scores": _to_cpu_tree(outputs.scores),
                 "hidden_states": _to_cpu_tree(outputs.hidden_states),
-                "attentions": _to_cpu_tree(outputs.attentions),
             }
             _ = cpu_payload["sequences"].shape
             _ = len(cpu_payload["scores"]) if cpu_payload["scores"] is not None else 0
             _ = len(cpu_payload["hidden_states"]) if cpu_payload["hidden_states"] is not None else 0
-            _ = len(cpu_payload["attentions"]) if cpu_payload["attentions"] is not None else 0
             del cpu_payload
             del outputs
             device_sync(device)
@@ -151,7 +162,7 @@ def main() -> None:
             "hf_return_dict_in_generate": True,
             "hf_output_scores": True,
             "hf_output_hidden_states": True,
-            "hf_output_attentions": True,
+            "hf_output_attentions": False,
             "materialize_to_cpu": True,
             "pad_buckets": pad_buckets,
             "pad_to_multiple_of": int(args.pad_to_multiple_of),

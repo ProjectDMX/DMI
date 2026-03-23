@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import time
 
+import math
+
 import torch
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM
 
 from common import (
@@ -60,9 +63,19 @@ def main() -> None:
     gen_kwargs = compile_generate_kwargs(compile_enabled)
     pad_buckets = parse_pad_buckets(args.pad_buckets)
 
+    # Warmup: two batches to trigger CUDA graph compilation / kernel JIT
+    with torch.no_grad():
+        for _ in range(2):
+            warmup_ids = torch.randint(0, tokenizer.vocab_size, (args.batch_size, 4), device=device)
+            _ = model.generate(warmup_ids, max_new_tokens=4, do_sample=False,
+                               pad_token_id=tokenizer.pad_token_id, **gen_kwargs)
+            device_sync(device)
+    print("Warmup done.", flush=True)
+
+    total_batches = math.ceil(len(rendered) / args.batch_size)
     with torch.no_grad():
         t0 = time.perf_counter()
-        for batch_index, batch in enumerate(iter_batches(rendered, args.batch_size)):
+        for batch_index, batch in tqdm(enumerate(iter_batches(rendered, args.batch_size)), total=total_batches, desc="hf_upper_bound"):
             texts = [item["prompt_text"] for item in batch]
             encoded = tokenize_batch(
                 tokenizer,

@@ -92,21 +92,24 @@ def apply_chat_template_or_fallback(tokenizer: Any, messages: Sequence[Dict[str,
 def build_rendered_prompts(tokenizer: Any, examples: Sequence[PromptExample]) -> List[Dict[str, Any]]:
     rendered: List[Dict[str, Any]] = []
     for example in examples:
-        prompt_text = apply_chat_template_or_fallback(tokenizer, example.messages)
-        prompt_tok = tokenizer(
-            prompt_text,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_tensors=None,
-        )
         target_tok = tokenizer(
             example.target_text,
             add_special_tokens=False,
             return_attention_mask=False,
             return_tensors=None,
         )
-        prompt_len = len(prompt_tok["input_ids"])
         target_len = len(target_tok["input_ids"])
+        messages = list(example.messages) + [
+            {"role": "user", "content": f"Please respond with exactly {target_len} tokens."},
+        ]
+        prompt_text = apply_chat_template_or_fallback(tokenizer, messages)
+        prompt_tok = tokenizer(
+            prompt_text,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_tensors=None,
+        )
+        prompt_len = len(prompt_tok["input_ids"])
         rendered.append(
             {
                 "example": example,
