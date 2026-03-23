@@ -377,27 +377,43 @@ def _compute_hook_shape(
     guaranteed by the model architecture.
 
     Args:
+        batch: batch size.  0 = flattened (vLLM): no batch dimension,
+            q_len = total_tokens across all requests.
         logits_to_keep: HF generate() default is 1 (only last token logits).
             0 means keep all (q_len).
     """
+    # batch=0 means flattened (vLLM): shapes have no batch dimension.
+    b = [batch] if batch > 0 else []
+
     if hook_type in _HIDDEN_DIM_TYPES:
-        return [batch, q_len, cfg.hidden_dim]
+        return b + [q_len, cfg.hidden_dim]
     if hook_type == HOOK_TYPE_Q:
-        return [batch, q_len, cfg.num_heads, cfg.head_dim]
+        return b + [q_len, cfg.num_heads, cfg.head_dim]
     if hook_type in (HOOK_TYPE_K, HOOK_TYPE_V):
-        return [batch, q_len, cfg.num_kv_heads, cfg.head_dim]
+        return b + [q_len, cfg.num_kv_heads, cfg.head_dim]
     if hook_type == HOOK_TYPE_Z:
-        return [batch, q_len, cfg.num_heads, cfg.head_dim]
+        return b + [q_len, cfg.num_heads, cfg.head_dim]
     if hook_type in (HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN):
-        return [batch, cfg.num_heads, q_len, kv_dim]
+        return b + [cfg.num_heads, q_len, kv_dim]
     if hook_type == HOOK_TYPE_TOKEN_IDS:
-        return [batch, q_len]
+        return b + [q_len]
     if hook_type == HOOK_TYPE_FINAL_LOGITS:
-        # HF generate() sets logits_to_keep=1 by default (only last token
-        # needed for next-token prediction).  The actual tensor shape is
-        # [batch, 1, vocab], not [batch, q_len, vocab].
-        logits_q = min(q_len, logits_to_keep) if logits_to_keep > 0 else q_len
-        return [batch, logits_q, cfg.vocab_size] if cfg.vocab_size > 0 else []
+        # compute_logits returns fewer rows than q_len when logits_to_keep
+        # is set (HF generate default=1, vLLM always 1 per request).
+        #
+        # HF batched: tensor is [batch, logits_to_keep, vocab].
+        #   logits_to_keep = min(q_len, logits_to_keep) capped to q_len.
+        #
+        # vLLM flattened: tensor is [num_reqs, vocab] (1 logit per
+        #   request).  Caller passes logits_to_keep=num_reqs so the
+        #   meta shape becomes [num_reqs, vocab].  The p2p thread
+        #   indexes by request position (not token offset) and adjusts
+        #   DB token range to (end_token-1, end_token).
+        if batch > 0:
+            logits_q = min(q_len, logits_to_keep) if logits_to_keep > 0 else q_len
+        else:
+            logits_q = logits_to_keep if logits_to_keep > 0 else q_len
+        return (b + [logits_q, cfg.vocab_size]) if cfg.vocab_size > 0 else []
     return []  # unknown type -- push_meta skipped
 
 
@@ -432,7 +448,15 @@ def install_ring_hooks(specs: List[HookSpec], handles_out: List) -> None:
     can remove them later via handle.remove().
     """
     for spec in specs:
-        handle = spec.module.register_forward_hook(
+        hp = spec.module
+        # Ensure HookPoint._name is set so forward() doesn't early-return.
+        # Also set _ring_hook_type/_ring_hook_id for the producer op.
+        if hasattr(hp, '_name') and hp._name is None:
+            # Use hook_type_name for a descriptive name
+            hp._name = f"hook_{spec.hook_type}_{spec.layer_no}"
+            hp._ring_hook_type = spec.hook_type
+            hp._ring_hook_id = spec.layer_no
+        handle = hp.register_forward_hook(
             _make_ring_hook(spec.hook_type, spec.layer_no)
         )
         handles_out.append(handle)
@@ -546,7 +570,8 @@ class RingTransport:
         self._model_cfg = cfg
 
     def pre_push_all_metas(self, batch: int, q_len: int, kv_dim: int,
-                           logits_to_keep: int = 0) -> None:
+                           logits_to_keep: int = 0,
+                           token_ids_dtype: Optional[torch.dtype] = None) -> None:
         """Push C++ FIFO metadata for all active specs before orig_forward.
 
         Called in the same order as install_ring_hooks() so FIFO pop order
@@ -575,7 +600,12 @@ class RingTransport:
             )
             if not shape:
                 continue
-            dtype = spec.dtype if spec.dtype is not None else self._model_cfg.dtype
+            if spec.dtype is not None:
+                dtype = spec.dtype
+            elif spec.hook_type == HOOK_TYPE_TOKEN_IDS and token_ids_dtype is not None:
+                dtype = token_ids_dtype
+            else:
+                dtype = self._model_cfg.dtype
             hook_types.append(spec.hook_type)
             layer_nos.append(spec.layer_no)
             shapes.append(shape)

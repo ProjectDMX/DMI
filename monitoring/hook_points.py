@@ -285,21 +285,13 @@ class HookPoint(nn.Module):
             return x
         if self._name is None or not x.is_cuda:
             return x
-        from .ring_transport import _active_transport
-        if _active_transport is None:
+        import monitoring.ring_transport as _rt
+        if _rt._active_transport is None:
             return x
-        if _active_transport.cpu_direct:
-            # Delegate to disabled helper so Dynamo doesn't trace the
-            # graph-breaking .cpu() call or waste recompilation slots
-            # on per-hook shape specialization.
-            _hook_cpu_direct(x, _active_transport,
+        if _rt._active_transport.cpu_direct:
+            _hook_cpu_direct(x, _rt._active_transport,
                              self._ring_hook_type, self._ring_hook_id)
             return x
-        # Ring path -- fully traceable, no graph break.
-        # We return x_cont (not the original x) so that x_cont has
-        # downstream consumers in the model.  This prevents inductor
-        # from DCE'ing the .contiguous() copy + ring.producer call for
-        # non-contiguous tensors (Q/K/V views from QKV projection split).
         x_cont = x.contiguous()
         torch.ops.ring.producer(
             x_cont, self._ring_hook_type, self._ring_hook_id)

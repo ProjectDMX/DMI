@@ -53,6 +53,12 @@ void RingEngine::start() {
 }
 
 void RingEngine::stop() {
+    // Sync GPU so all producer kernels have completed their writes,
+    // then force the drain thread to flush everything through p2p
+    // while both threads are still running normally.
+    cudaDeviceSynchronize();
+    drain_->force_flush_and_wait();
+
     drain_->stop();
     drain_->signal_p2p_stop();
     p2p_->stop();

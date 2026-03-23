@@ -41,7 +41,7 @@ void ring_set_active_engine(ring_py::RingEnginePy* e) {
 void ring_producer_impl(
     const at::Tensor& tensor, int64_t hook_type, int64_t hook_id)
 {
-    if (!g_active_engine) return;
+    if (!g_active_engine) { return; }
     if (hook_type >= 0 && hook_type < HOST_HOOK_MAX)
         g_host_calls[hook_type].fetch_add(1);
 

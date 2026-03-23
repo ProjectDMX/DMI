@@ -399,9 +399,13 @@ def _install_prepare_wrapper(model: Any) -> None:
                         if _profile:
                             _t_prepare = _time.perf_counter()
 
-                    # Push FIFO metadata for p2p thread
+                    # Push FIFO metadata for p2p thread.
+                    # input_ids_val is guaranteed non-None here (guarded above).
+                    # On non-first PP ranks input_ids would be None and we
+                    # skip this entire block, so .dtype is always safe.
                     transport.pre_push_all_metas(batch, q_len, kv_dim,
-                                                logits_to_keep=logits_to_keep)
+                                                logits_to_keep=logits_to_keep,
+                                                token_ids_dtype=input_ids_val.dtype)
 
                     if _profile:
                         _t_meta = _time.perf_counter()

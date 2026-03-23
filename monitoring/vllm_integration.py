@@ -130,7 +130,14 @@ class DMXGPUWorker(Worker):
             ch_cfg = _ne.ClickHouseClientConfig()
             ch_cfg.host = db_host
             ch_cfg.port = db_port
-            stage_cfg = _ne.StageConfig.clickhouse_insert(ch_cfg)
+            ch_cfg.create_database_if_missing = True
+            stage_cfg = _ne.StageConfig.clickhouse_insert(
+                ch_cfg, parallelism=10, name="clickhouse_insert")
+            q = stage_cfg.input_queue
+            q.max_batch_items = 1024
+            q.high_watermark_items = 1024
+            q.max_batch_size = 2048 * 1024 * 1024
+            q.high_watermark_size = 2048 * 1024 * 1024
             host_engine = _ne.DMXHostEngine(stage_cfg)
             host_engine.start()
             self._dmx_host_engine = host_engine
@@ -146,11 +153,14 @@ class DMXGPUWorker(Worker):
         ring_engine.start()
         self._dmx_ring_engine = ring_engine
 
-        # Transport (model shape + hooks set later in load_model)
         transport = RingTransport(ring_engine)
+        self._dmx_null_mode_user = null_mode
         if null_mode:
             transport.null_offload = True
-            ring_engine.set_null_mode(True)
+        # Start in null mode — warmup/profiling will fire producer kernels
+        # (needed for CUDA graph capture) but as no-ops so the ring stays clean.
+        # Turned off after warmup in compile_or_warm_up_model.
+        ring_engine.set_null_mode(True)
         ring_transport.activate(transport)
 
         # Wrap model_runner for force_eager
@@ -165,9 +175,22 @@ class DMXGPUWorker(Worker):
         self.model_runner._determine_batch_execution_and_padding = _wrapped_determine
 
     def load_model(self) -> None:
+        # Remap HF architecture to our hooked variant so vLLM's registry
+        # resolves to the model with HookPoints (e.g. GPT2PLMHeadModel).
+        _ARCH_REMAP = {
+            "GPT2LMHeadModel": "GPT2PLMHeadModel",
+            "Qwen3ForCausalLM": "Qwen3PForCausalLM",
+        }
+        hf_cfg = self.vllm_config.model_config.hf_config
+        archs = getattr(hf_cfg, "architectures", [])
+        hf_cfg.architectures = [_ARCH_REMAP.get(a, a) for a in archs]
+
         super().load_model()
 
-        # Model is now available — set shape config and install hooks
+        # Model is now available — set shape config and install hooks.
+        # Hooks must be installed BEFORE warmup so CUDA graph capture
+        # includes the producer kernel. Null mode is active (set in
+        # init_device) so warmup producer calls are no-ops.
         from . import ring_transport
         from .ring_transport import apply_hook_selection, install_ring_hooks
         from .generate import _make_model_shape
@@ -198,6 +221,17 @@ class DMXGPUWorker(Worker):
             transport._active_specs = active_specs
             transport._using_forward_hooks = True
 
+    def compile_or_warm_up_model(self) -> float:
+        # Warmup runs with null_mode=True (set in init_device).
+        # Producer kernels fire but are no-ops — ring stays clean.
+        result = super().compile_or_warm_up_model()
+
+        # Warmup done. Turn off null mode (unless user explicitly wants it).
+        if not self._dmx_null_mode_user and self._dmx_ring_engine is not None:
+            self._dmx_ring_engine.set_null_mode(False)
+
+        return result
+
     @torch.inference_mode()
     def execute_model(self, scheduler_output: Any) -> Any:
         from . import ring_transport
@@ -209,16 +243,13 @@ class DMXGPUWorker(Worker):
         if total_tokens == 0 or transport is None or transport.null_offload:
             return super().execute_model(scheduler_output)
 
-        # Read batch info
-        input_batch = self.model_runner.input_batch
-        num_reqs = input_batch.num_reqs
-        req_ids = input_batch.req_ids[:num_reqs]
-
-        num_scheduled_per_req = []
-        for rid in req_ids:
-            num_scheduled_per_req.append(
-                scheduler_output.num_scheduled_tokens.get(rid, 0))
-        total_q = sum(num_scheduled_per_req)
+        # Read batch info from scheduler_output (not input_batch, which
+        # may not be populated yet for new requests at prefill time).
+        num_scheduled = scheduler_output.num_scheduled_tokens  # dict[req_id, int]
+        req_ids = list(num_scheduled.keys())
+        num_reqs = len(req_ids)
+        num_scheduled_per_req = list(num_scheduled.values())
+        total_q = total_tokens
 
         # Capacity check
         cfg = transport._model_cfg
@@ -227,7 +258,8 @@ class DMXGPUWorker(Worker):
             n_hooks = 0
             for spec in transport._active_specs:
                 shape = _compute_hook_shape(
-                    spec.hook_type, cfg, batch=1, q_len=total_q, kv_dim=0)
+                    spec.hook_type, cfg, batch=0, q_len=total_q, kv_dim=0,
+                    logits_to_keep=num_reqs)
                 if not shape:
                     continue
                 dtype = spec.dtype if spec.dtype is not None else cfg.dtype
@@ -278,14 +310,34 @@ class DMXGPUWorker(Worker):
         )
 
         if cfg is not None:
+            # Read input_ids dtype from model_runner buffer.  On non-first
+            # PP ranks the buffer may not exist; pass None (the token_ids
+            # hook is already filtered out by filter_by_pp_rank).
+            ids_buf = getattr(self.model_runner, 'input_ids', None)
+            ids_dtype = ids_buf.gpu.dtype if ids_buf is not None else None
+
+            # logits_to_keep=num_reqs: vLLM's compute_logits returns one
+            # logit per request, shaped [num_reqs, vocab].  In flattened
+            # mode _compute_hook_shape uses logits_to_keep directly as dim0
+            # (no batch dim), so the meta shape becomes [num_reqs, vocab].
+            # The p2p thread then slices row j for request j and adjusts
+            # DB token range to (end_token-1, end_token) — the single
+            # predicted position per request.
             transport.pre_push_all_metas(
-                batch=1, q_len=total_q, kv_dim=0, logits_to_keep=0)
+                batch=0, q_len=total_q, kv_dim=0,
+                logits_to_keep=num_reqs,
+                token_ids_dtype=ids_dtype)
 
         return super().execute_model(scheduler_output)
 
     def shutdown(self) -> None:
         from . import ring_transport
-        ring_transport.deactivate()
+
+        # Sync CUDA stream to ensure last producer kernels complete, then
+        # stop ring engine (flushes drain -> p2p -> host queue).
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         if self._dmx_ring_engine is not None:
             try:
@@ -293,6 +345,8 @@ class DMXGPUWorker(Worker):
             except Exception:
                 pass
             self._dmx_ring_engine = None
+
+        ring_transport.deactivate()
 
         if self._dmx_host_engine is not None:
             try:
