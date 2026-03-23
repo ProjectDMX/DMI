@@ -6,5 +6,5 @@
 	url = git@github.com:ClickHouse/clickhouse-cpp.git
 [submodule "vllm"]
 	path = integration/vllm
-	url = https://github.com/ProjectDMX/vllm.git
+	url = git@github.com:ProjectDMX/vllm.git
 	branch = dmi_integration
