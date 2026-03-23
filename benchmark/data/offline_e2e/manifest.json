@@ -1,0 +1,54 @@
+{
+  "sharegpt_source_rows": 94145,
+  "wildchat_source_rows": 837989,
+  "sample_size": 1000,
+  "seeds": [
+    3407,
+    3408,
+    3409
+  ],
+  "files": [
+    {
+      "dataset": "sharegpt",
+      "sample_id": 1,
+      "seed": 3407,
+      "path": "benchmark/data/offline_e2e/sharegpt_1000_sample1.jsonl",
+      "count": 1000
+    },
+    {
+      "dataset": "wildchat",
+      "sample_id": 1,
+      "seed": 3407,
+      "path": "benchmark/data/offline_e2e/wildchat_1000_sample1.jsonl",
+      "count": 1000
+    },
+    {
+      "dataset": "sharegpt",
+      "sample_id": 2,
+      "seed": 3408,
+      "path": "benchmark/data/offline_e2e/sharegpt_1000_sample2.jsonl",
+      "count": 1000
+    },
+    {
+      "dataset": "wildchat",
+      "sample_id": 2,
+      "seed": 3408,
+      "path": "benchmark/data/offline_e2e/wildchat_1000_sample2.jsonl",
+      "count": 1000
+    },
+    {
+      "dataset": "sharegpt",
+      "sample_id": 3,
+      "seed": 3409,
+      "path": "benchmark/data/offline_e2e/sharegpt_1000_sample3.jsonl",
+      "count": 1000
+    },
+    {
+      "dataset": "wildchat",
+      "sample_id": 3,
+      "seed": 3409,
+      "path": "benchmark/data/offline_e2e/wildchat_1000_sample3.jsonl",
+      "count": 1000
+    }
+  ]
+}
