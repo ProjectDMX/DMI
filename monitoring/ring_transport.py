@@ -658,6 +658,16 @@ def deactivate() -> None:
     try:
         from . import _native_engine as _ne
         _ne.ring_clear_active_engine()
+        _ne.ring_set_cpu_direct(False)
+    except Exception:
+        pass
+
+
+def set_cpu_direct(enabled: bool) -> None:
+    """Set/clear the C++ cpu_direct flag for ring_producer_impl."""
+    try:
+        from . import _native_engine as _ne
+        _ne.ring_set_cpu_direct(enabled)
     except Exception:
         pass
 

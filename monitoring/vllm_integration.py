@@ -298,6 +298,7 @@ class DMXGPUWorker(Worker):
                 result = transport._ring_engine.prepare_step(step_bytes, n_hooks)
                 is_cpu_direct = (result == 2)
                 transport.cpu_direct = is_cpu_direct
+                ring_transport.set_cpu_direct(is_cpu_direct)
                 if is_cpu_direct:
                     self._dmx_force_eager = True
 

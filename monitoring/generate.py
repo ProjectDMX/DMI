@@ -362,6 +362,7 @@ def _install_prepare_wrapper(model: Any) -> None:
                             _t_pre_step = _time.perf_counter()
                         result = re.prepare_step(step_total_bytes, n_hooks)
                         transport.cpu_direct = (result == 2)
+                        ring_transport.set_cpu_direct(result == 2)
 
                         if _profile:
                             _t_prepare = _time.perf_counter()
@@ -703,6 +704,7 @@ def generate_with_monitoring(model: Any, *args: Any,
             if decode_bytes > effective_cap:
                 transport.cpu_direct = True
                 transport._force_cpu_direct = True
+                ring_transport.set_cpu_direct(True)
                 # Disable all compilation paths in HF generate():
                 # 1. Pop compile_config from kwargs
                 # 2. Pop cache_implementation (HF defaults to CompileConfig()
@@ -742,5 +744,6 @@ def generate_with_monitoring(model: Any, *args: Any,
         if transport is not None:
             transport.cpu_direct = False
             transport._force_cpu_direct = False
+            ring_transport.set_cpu_direct(False)
             transport._hook_selection = None
             transport._prefill_kv_offsets = None

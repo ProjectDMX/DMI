@@ -119,22 +119,6 @@ DeviceType = Optional[torch.device]
 _grad_t = Union[tuple[Tensor, ...], Tensor]
 
 
-@torch.compiler.disable
-def _hook_cpu_direct(x: Tensor, transport, hook_type: int, hook_id: int) -> None:
-    """CPU-direct capture path -- disabled from torch.compile.
-
-    Marked @torch.compiler.disable so Dynamo inserts a graph break immediately
-    without tracing the body.  This prevents recompilation-limit exhaustion
-    from per-hook shape specialization (all HookPoint instances share one
-    forward() bytecode, but each sees a different x shape).
-
-    When cpu_direct=False (normal ring path), this function is never called
-    and the ring branch compiles into a full CUDA graph.
-    """
-    cpu_tensor = x.detach().cpu()
-    transport.submit_cpu_direct(cpu_tensor, hook_type, hook_id)
-
-
 class HookPoint(nn.Module):
     """
     A helper class to access intermediate activations in a PyTorch model (inspired by Garcon).
@@ -285,13 +269,11 @@ class HookPoint(nn.Module):
             return x
         if self._name is None or not x.is_cuda:
             return x
-        import monitoring.ring_transport as _rt
-        if _rt._active_transport is None:
-            return x
-        if _rt._active_transport.cpu_direct:
-            _hook_cpu_direct(x, _rt._active_transport,
-                             self._ring_hook_type, self._ring_hook_id)
-            return x
+        # No Python transport references — fully torch.compile-serializable.
+        # C++ ring_producer_impl handles all paths:
+        #   g_active_engine == nullptr  -> no-op (monitoring inactive)
+        #   g_cpu_direct == true        -> sync D2H + submit_cpu_direct
+        #   otherwise                   -> launch producer kernel (async D2D)
         x_cont = x.contiguous()
         torch.ops.ring.producer(
             x_cont, self._ring_hook_type, self._ring_hook_id)

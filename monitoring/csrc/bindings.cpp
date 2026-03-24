@@ -481,4 +481,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("ring_clear_active_engine",
         []() { ring_set_active_engine(nullptr); });
+
+  m.def("ring_set_cpu_direct",
+        [](bool enabled) { ring_set_cpu_direct(enabled); },
+        py::arg("enabled"));
 }
