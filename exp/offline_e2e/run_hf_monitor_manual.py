@@ -41,17 +41,21 @@ def _position_ids_from_attention_mask(attention_mask: torch.Tensor) -> torch.Ten
     return position_ids
 
 
-def _materialize_prefill_outputs(outputs: Any) -> None:
+def _materialize_prefill_outputs(outputs: Any, *, capture_logits: bool = False) -> None:
     if outputs.hidden_states is not None:
         for hidden in outputs.hidden_states:
             hidden.detach().cpu()
+    if capture_logits and outputs.logits is not None:
+        outputs.logits.detach().cpu()
 
 
-def _materialize_decode_outputs(outputs: Any, active_mask: torch.Tensor) -> None:
+def _materialize_decode_outputs(outputs: Any, active_mask: torch.Tensor, *, capture_logits: bool = False) -> None:
     if bool(active_mask.any().item()):
         if outputs.hidden_states is not None:
             for hidden in outputs.hidden_states:
                 hidden[active_mask].detach().cpu()
+        if capture_logits and outputs.logits is not None:
+            outputs.logits[active_mask].detach().cpu()
 
 
 def _forward_accepts_position_ids(model: Any) -> bool:
@@ -66,6 +70,7 @@ def _run_batch_manual(
     target_lengths: Sequence[int],
     pad_token_id: int,
     compile_enabled: bool,
+    capture_logits: bool = False,
 ) -> None:
     device = input_ids.device
     batch_size, prompt_width = input_ids.shape
@@ -135,7 +140,7 @@ def _run_batch_manual(
         prefill_kwargs['cache_position'] = cache_position
 
     outputs = model(**prefill_kwargs)
-    _materialize_prefill_outputs(outputs)
+    _materialize_prefill_outputs(outputs, capture_logits=capture_logits)
     if not compile_enabled:
         past_key_values = outputs.past_key_values
 
@@ -180,7 +185,7 @@ def _run_batch_manual(
             outputs = model(**step_kwargs)
             past_key_values = outputs.past_key_values
 
-        _materialize_decode_outputs(outputs, prev_active_mask)
+        _materialize_decode_outputs(outputs, prev_active_mask, capture_logits=capture_logits)
         next_tokens = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         del outputs
 
@@ -197,6 +202,7 @@ def main() -> None:
 
     model_id = resolve_model_id(args.model)
     compile_enabled = not args.disable_compile
+    capture_logits = args.capture_mode == "hs_logits"
     device = torch.device('cuda')
 
     examples = load_jsonl_examples(args.sample_file, limit=parsed_limit(args))
@@ -235,6 +241,7 @@ def main() -> None:
                 target_lengths=[16] * args.batch_size,
                 pad_token_id=int(tokenizer.pad_token_id),
                 compile_enabled=compile_enabled,
+                capture_logits=capture_logits,
             )
             device_sync(device)
         for warmup_batch in warmup_batches(rendered, args.batch_size, count=2):
@@ -248,6 +255,7 @@ def main() -> None:
                 target_lengths=batch_target_lengths(warmup_batch, int(args.max_new_tokens)),
                 pad_token_id=int(tokenizer.pad_token_id),
                 compile_enabled=compile_enabled,
+                capture_logits=capture_logits,
             )
             device_sync(device)
     print(f'Warmup done ({len(bucket_inputs)} buckets + 2 real batches).', flush=True)
@@ -285,6 +293,7 @@ def main() -> None:
                 target_lengths=target_lengths,
                 pad_token_id=int(tokenizer.pad_token_id),
                 compile_enabled=compile_enabled,
+                capture_logits=capture_logits,
             )
             device_sync(device)
             batch_t1 = time.perf_counter()

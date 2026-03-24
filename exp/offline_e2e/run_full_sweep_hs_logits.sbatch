@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=sweep-hs
+#SBATCH --job-name=sweep-hs-logits
 #SBATCH --partition=gpu-h100
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=32
@@ -49,7 +49,7 @@ RING_STEP_MB=5120
 RING_MIN_MB=5120
 RING_TASK_ENTRIES=131072
 RING_FLUSH=0.15
-CAPTURE_MODE="hs"
+CAPTURE_MODE="hs_logits"
 
 RUN_TAG="$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
 RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/full_sweep_${RUN_TAG}"

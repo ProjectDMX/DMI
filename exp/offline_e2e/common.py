@@ -389,6 +389,12 @@ def add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pad-to-multiple-of", type=int, default=0)
     parser.add_argument("--pad-buckets", default="")
     parser.add_argument("--max-input-tokens", type=int, default=0)
+    parser.add_argument(
+        "--capture-mode",
+        choices=["hs", "hs_logits"],
+        default="hs",
+        help="What to capture: 'hs' = hidden states only, 'hs_logits' = hidden states + logits.",
+    )
 
 
 def parsed_limit(args: argparse.Namespace) -> int | None:

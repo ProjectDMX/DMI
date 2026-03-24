@@ -44,15 +44,22 @@ def _run_batch(
     modules: list[Any],
     encoded: dict[str, torch.Tensor],
     batch_max_new_tokens: int,
+    capture_logits: bool = False,
 ) -> None:
     with model.generate(encoded, max_new_tokens=batch_max_new_tokens, do_sample=False) as tracer:
         step_hidden_states = list().save()
+        step_logits = list().save() if capture_logits else None
         for _ in tracer.iter[:]:
             step_hidden_states.append(tuple(module.output.to("cpu").save() for module in modules))
+            if capture_logits:
+                step_logits.append(model.lm_head.output.to("cpu").save())
 
     for step in step_hidden_states:
         for tensor in step:
             _ = tensor.shape
+    if capture_logits and step_logits is not None:
+        for logit_tensor in step_logits:
+            _ = logit_tensor.shape
 
 
 def main() -> None:
@@ -69,6 +76,7 @@ def main() -> None:
     device = torch.device("cuda")
     compile_requested = not args.disable_compile
     compile_enabled = False
+    capture_logits = args.capture_mode == "hs_logits"
 
     examples = load_jsonl_examples(args.sample_file, limit=parsed_limit(args))
     tokenizer = build_tokenizer(model_id, local_files_only=args.local_files_only)
@@ -106,6 +114,7 @@ def main() -> None:
                 modules=modules,
                 encoded=warmup_encoded,
                 batch_max_new_tokens=max(batch_target_lengths(warmup_batch, int(args.max_new_tokens))),
+                capture_logits=capture_logits,
             )
             device_sync(device)
     print("Warmup done (2 real batches).", flush=True)
@@ -139,6 +148,7 @@ def main() -> None:
                 modules=modules,
                 encoded=encoded,
                 batch_max_new_tokens=batch_max_new_tokens,
+                capture_logits=capture_logits,
             )
             device_sync(device)
             batch_t1 = time.perf_counter()

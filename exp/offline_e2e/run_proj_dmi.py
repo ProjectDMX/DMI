@@ -162,6 +162,7 @@ def main() -> None:
     model_id = resolve_model_id(args.model)
     compile_enabled = not args.disable_compile
     device = torch.device("cuda")
+    hook_sel = "hidden-states,final_ln,logits" if args.capture_mode == "hs_logits" else "hidden-states,final_ln"
 
     examples = load_jsonl_examples(args.sample_file, limit=parsed_limit(args))
     tokenizer = build_tokenizer(model_id, local_files_only=args.local_files_only)
@@ -171,7 +172,7 @@ def main() -> None:
     )
 
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode="hidden-states"),
+        hooks=HookSelection(mode=hook_sel),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
         native_partial_seal=NativePartialSealConfig(
             enabled=True,
@@ -225,7 +226,7 @@ def main() -> None:
                 model, input_ids=bi["input_ids"], attention_mask=bi["attention_mask"],
                 max_new_tokens=16, do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
-                hook_selection="hidden-states", **gen_kwargs,
+                hook_selection=hook_sel, **gen_kwargs,
             )
             device_sync(device)
         for warmup_batch in warmup_batches(rendered, args.batch_size, count=2):
@@ -237,7 +238,7 @@ def main() -> None:
                 attention_mask=warmup_encoded["attention_mask"].to(device),
                 max_new_tokens=warmup_decode_tokens(warmup_batch, int(args.max_new_tokens)), do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
-                hook_selection="hidden-states", **gen_kwargs,
+                hook_selection=hook_sel, **gen_kwargs,
             )
             device_sync(device)
     print(f"Warmup done ({len(bucket_inputs)} buckets + 2 real batches).", flush=True)
@@ -272,7 +273,7 @@ def main() -> None:
                     max_new_tokens=batch_max_new_tokens,
                     do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
-                    hook_selection="hidden-states",
+                    hook_selection=hook_sel,
                     **gen_kwargs,
                 )
                 device_sync(device)
@@ -307,7 +308,7 @@ def main() -> None:
         batch_metrics=batch_metrics,
         extra={
             "local_files_only": bool(args.local_files_only),
-            "hook_selection": "hidden-states",
+            "hook_selection": hook_sel,
             "proj_dmi_mode": args.proj_dmi_mode,
             "ring_task_entries": int(args.ring_task_entries),
             "ring_payload_mb": int(args.ring_payload_mb),

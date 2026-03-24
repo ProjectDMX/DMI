@@ -58,6 +58,7 @@ def main() -> None:
     model_id = resolve_model_id(args.model)
     compile_requested = not args.disable_compile
     compile_enabled = False
+    capture_logits = args.capture_mode == "hs_logits"
     device = torch.device("cuda")
 
     examples = load_jsonl_examples(args.sample_file, limit=parsed_limit(args))
@@ -88,7 +89,7 @@ def main() -> None:
                 attention_mask=warmup_encoded["attention_mask"].to(device),
                 max_new_tokens=max(batch_target_lengths(warmup_batch, int(args.max_new_tokens))), do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
-                return_dict_in_generate=True, output_scores=False,
+                return_dict_in_generate=True, output_scores=capture_logits,
                 output_hidden_states=True, output_attentions=False,
             )
             device_sync(device)
@@ -123,7 +124,7 @@ def main() -> None:
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 return_dict_in_generate=True,
-                output_scores=False,
+                output_scores=capture_logits,
                 output_hidden_states=True,
                 output_attentions=False,
             )
@@ -131,6 +132,8 @@ def main() -> None:
                 "sequences": _to_cpu_tree(outputs.sequences),
                 "hidden_states": _to_cpu_tree(outputs.hidden_states),
             }
+            if capture_logits and hasattr(outputs, "scores") and outputs.scores is not None:
+                cpu_payload["scores"] = _to_cpu_tree(outputs.scores)
             _ = cpu_payload["sequences"].shape
             _ = len(cpu_payload["hidden_states"]) if cpu_payload["hidden_states"] is not None else 0
             del cpu_payload
