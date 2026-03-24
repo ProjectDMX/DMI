@@ -9,5 +9,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bash "${SCRIPT_DIR}/test_llama31_8b_smoke.sh"
+SCRATCH=/scratch/zt1/project/zaoxing-prj/user/ynn1999
+PROJECT=${SCRATCH}/DMI/DMI
+
+bash "${PROJECT}/exp/offline_e2e/test_llama31_8b_smoke.sh"
