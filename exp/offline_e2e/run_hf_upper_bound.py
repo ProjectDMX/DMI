@@ -28,6 +28,7 @@ from common import (
     resolve_model_id,
     summarize_run,
     tokenize_batch,
+    make_bucket_warmup_inputs,
     warmup_batches,
     write_json,
 )
@@ -64,30 +65,28 @@ def main() -> None:
     gen_kwargs = compile_generate_kwargs(compile_enabled)
     pad_buckets = parse_pad_buckets(args.pad_buckets)
 
-    warmup_batch_list = warmup_batches(rendered, args.batch_size, count=2)
+    bucket_inputs = make_bucket_warmup_inputs(tokenizer, pad_buckets, args.batch_size, device) if pad_buckets else []
     with torch.no_grad():
-        for warmup_batch in warmup_batch_list:
-            warmup_texts = [item["prompt_text"] for item in warmup_batch]
-            warmup_encoded = tokenize_batch(
-                tokenizer,
-                warmup_texts,
-                pad_buckets=pad_buckets,
-                pad_to_multiple_of=int(args.pad_to_multiple_of),
-                max_input_tokens=int(args.max_input_tokens),
-            )
-            warmup_target_lengths = batch_target_lengths(warmup_batch, int(args.max_new_tokens))
-            warmup_input_ids = warmup_encoded["input_ids"].to(device)
-            warmup_attention_mask = warmup_encoded["attention_mask"].to(device)
+        for bi in bucket_inputs:
             _ = model.generate(
-                input_ids=warmup_input_ids,
-                attention_mask=warmup_attention_mask,
-                max_new_tokens=max(warmup_target_lengths),
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-                **gen_kwargs,
+                input_ids=bi["input_ids"], attention_mask=bi["attention_mask"],
+                max_new_tokens=4, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id, **gen_kwargs,
             )
             device_sync(device)
-    print("Warmup done.", flush=True)
+        if not bucket_inputs:
+            for warmup_batch in warmup_batches(rendered, args.batch_size, count=2):
+                warmup_texts = [item["prompt_text"] for item in warmup_batch]
+                warmup_encoded = tokenize_batch(tokenizer, warmup_texts, pad_buckets=pad_buckets,
+                    pad_to_multiple_of=int(args.pad_to_multiple_of), max_input_tokens=int(args.max_input_tokens))
+                _ = model.generate(
+                    input_ids=warmup_encoded["input_ids"].to(device),
+                    attention_mask=warmup_encoded["attention_mask"].to(device),
+                    max_new_tokens=4, do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id, **gen_kwargs,
+                )
+                device_sync(device)
+    print(f"Warmup done ({len(bucket_inputs)} buckets).", flush=True)
 
     total_batches = math.ceil(len(rendered) / args.batch_size)
     with torch.no_grad():

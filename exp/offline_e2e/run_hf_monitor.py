@@ -28,6 +28,7 @@ from common import (
     resolve_model_id,
     summarize_run,
     tokenize_batch,
+    make_bucket_warmup_inputs,
     warmup_batches,
     write_json,
 )
@@ -78,33 +79,32 @@ def main() -> None:
     batch_metrics = []
     pad_buckets = parse_pad_buckets(args.pad_buckets)
 
-    warmup_batch_list = warmup_batches(rendered, args.batch_size, count=2)
+    bucket_inputs = make_bucket_warmup_inputs(tokenizer, pad_buckets, args.batch_size, device) if pad_buckets else []
     with torch.no_grad():
-        for warmup_batch in warmup_batch_list:
-            warmup_texts = [item["prompt_text"] for item in warmup_batch]
-            warmup_encoded = tokenize_batch(
-                tokenizer,
-                warmup_texts,
-                pad_buckets=pad_buckets,
-                pad_to_multiple_of=int(args.pad_to_multiple_of),
-                max_input_tokens=int(args.max_input_tokens),
-            )
-            warmup_target_lengths = batch_target_lengths(warmup_batch, int(args.max_new_tokens))
-            warmup_input_ids = warmup_encoded["input_ids"].to(device)
-            warmup_attention_mask = warmup_encoded["attention_mask"].to(device)
+        for bi in bucket_inputs:
             _ = model.generate(
-                input_ids=warmup_input_ids,
-                attention_mask=warmup_attention_mask,
-                max_new_tokens=max(warmup_target_lengths),
-                do_sample=False,
+                input_ids=bi["input_ids"], attention_mask=bi["attention_mask"],
+                max_new_tokens=4, do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
-                return_dict_in_generate=True,
-                output_scores=True,
-                output_hidden_states=True,
-                output_attentions=False,
+                return_dict_in_generate=True, output_scores=False,
+                output_hidden_states=True, output_attentions=False,
             )
             device_sync(device)
-    print("Warmup done.", flush=True)
+        if not bucket_inputs:
+            for warmup_batch in warmup_batches(rendered, args.batch_size, count=2):
+                warmup_texts = [item["prompt_text"] for item in warmup_batch]
+                warmup_encoded = tokenize_batch(tokenizer, warmup_texts, pad_buckets=pad_buckets,
+                    pad_to_multiple_of=int(args.pad_to_multiple_of), max_input_tokens=int(args.max_input_tokens))
+                _ = model.generate(
+                    input_ids=warmup_encoded["input_ids"].to(device),
+                    attention_mask=warmup_encoded["attention_mask"].to(device),
+                    max_new_tokens=4, do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                    return_dict_in_generate=True, output_scores=False,
+                    output_hidden_states=True, output_attentions=False,
+                )
+                device_sync(device)
+    print(f"Warmup done ({len(bucket_inputs)} buckets).", flush=True)
 
     total_batches = math.ceil(len(rendered) / args.batch_size)
     with torch.no_grad():
@@ -135,17 +135,15 @@ def main() -> None:
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 return_dict_in_generate=True,
-                output_scores=True,
+                output_scores=False,
                 output_hidden_states=True,
                 output_attentions=False,
             )
             cpu_payload = {
                 "sequences": _to_cpu_tree(outputs.sequences),
-                "scores": _to_cpu_tree(outputs.scores),
                 "hidden_states": _to_cpu_tree(outputs.hidden_states),
             }
             _ = cpu_payload["sequences"].shape
-            _ = len(cpu_payload["scores"]) if cpu_payload["scores"] is not None else 0
             _ = len(cpu_payload["hidden_states"]) if cpu_payload["hidden_states"] is not None else 0
             del cpu_payload
             del outputs
@@ -180,7 +178,7 @@ def main() -> None:
         extra={
             "local_files_only": bool(args.local_files_only),
             "hf_return_dict_in_generate": True,
-            "hf_output_scores": True,
+            "hf_output_scores": False,
             "hf_output_hidden_states": True,
             "hf_output_attentions": False,
             "materialize_to_cpu": True,
