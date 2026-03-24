@@ -66,33 +66,9 @@ for sample_file in "${SHAREGPT_SAMPLE}" "${WILDCHAT_SAMPLE}"; do
     --results-dir "${RESULTS_DIR}"
   )
 
-  run_cmd "hs_logits/hf_upper_bound_eager/${dataset}" \
-    python run_hf_upper_bound.py "${COMMON[@]}" --capture-mode hs_logits --disable-compile
-
-  run_cmd "hs_logits/hf_monitor_generate_eager/${dataset}" \
-    python run_hf_monitor.py "${COMMON[@]}" --capture-mode hs_logits
-
-  run_cmd "hs_logits/hf_monitor_manual_compile/${dataset}" \
-    python run_hf_monitor_manual.py "${COMMON[@]}" --capture-mode hs_logits
-
   run_cmd "hs_logits/proj_dmi_compile/${dataset}" \
     python run_proj_dmi.py "${COMMON[@]}" --capture-mode hs_logits --proj-dmi-mode ring_null \
       --ring-payload-mb 5120 --ring-pinned-mb 5120 --ring-task-entries 65536
-
-  run_cmd "hs_logits/torch_hooks_eager/${dataset}" \
-    python run_torch_hooks.py "${COMMON[@]}" --capture-mode hs_logits --disable-compile
-
-  run_cmd "hs_logits/nnsight_eager/${dataset}" \
-    python run_nnsight.py "${COMMON[@]}" --capture-mode hs_logits --disable-compile
-
-  run_cmd "internal_hooks/hf_upper_bound_compile/${dataset}" \
-    python run_hf_upper_bound.py "${COMMON[@]}" --capture-mode hs
-
-  run_cmd "internal_hooks/torch_hooks_eager/${dataset}" \
-    python run_torch_hooks.py "${COMMON[@]}" --capture-mode hs --hook-selection "${INTERNAL_HOOKS}" --disable-compile
-
-  run_cmd "internal_hooks/nnsight_eager/${dataset}" \
-    python run_nnsight.py "${COMMON[@]}" --capture-mode hs --hook-selection "${INTERNAL_HOOKS}" --disable-compile
 
   run_cmd "internal_hooks/proj_dmi_compile/${dataset}" \
     python run_proj_dmi.py "${COMMON[@]}" --capture-mode hs --proj-dmi-mode ring_null \
