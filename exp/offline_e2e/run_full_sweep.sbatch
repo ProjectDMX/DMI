@@ -306,7 +306,7 @@ echo "  limit    : ${LIMIT}"
 echo "  results  : ${RESULTS_DIR}"
 echo ""
 echo "Total configs: 2 models x 2 datasets x 3 batch sizes = 12"
-echo "Total baseline invocations planned: 12 x 7 = 84 (plus Proj-DMI retries)"
+echo "Total baseline invocations planned: 12 x 8 = 96 (plus Proj-DMI retries)"
 echo ""
 
 for model in "${MODELS[@]}"; do
@@ -348,6 +348,9 @@ for model in "${MODELS[@]}"; do
 
             run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_monitor_generate_eager" \
                 python run_hf_monitor.py "${COMMON[@]}"
+
+            run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_monitor_manual_eager" \
+                python run_hf_monitor_manual.py "${COMMON[@]}" --disable-compile
 
             run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_monitor_manual_compile" \
                 python run_hf_monitor_manual.py "${COMMON[@]}"
