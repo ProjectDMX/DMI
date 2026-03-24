@@ -69,6 +69,7 @@ ClickHouse
 from __future__ import annotations
 
 import os
+import sys
 import uuid
 from typing import Dict, List, Tuple
 
@@ -84,6 +85,7 @@ from .hf_reference import (
     _hf_generate_collect_hidden_states_batched,
     _hf_generate_collect_scores_batched,
     _hf_greedy_rollout_collect_all_batched,
+    _load_hf_refs_from_disk,
     _parse_request_id,
     _positions_for_unpadded,
     _strip_left_pad,
@@ -195,8 +197,76 @@ def _make_host_cfg(db_cfg_native):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA + native backend required")
+@pytest.mark.skipif(not torch.backends.cuda.is_built(), reason="CUDA not built")
 def test_e2e_correctness_hf(subtests) -> None:
+    """E2E correctness: compare HOOKED model (ring transport -> ClickHouse)
+    against ORIGINAL model (HF output_hidden_states=True).
+
+    Three subprocesses — parent process never touches CUDA:
+      1. Reference: original model -> tensors on disk
+      2. Monitored: hooked model + ring transport -> ClickHouse
+      3. Comparator: reads both, compares, writes result.json
+    """
+    import json
+    import subprocess
+    import tempfile
+    import shutil
+
+    run_dir = tempfile.mkdtemp(prefix="hf_e2e_")
+    ref_dir = os.path.join(run_dir, "ref")
+    mon_dir = os.path.join(run_dir, "mon")
+    result_file = os.path.join(run_dir, "result.json")
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    try:
+        # Step 1: Reference run (original model, no CUDA in parent)
+        print("\n  [1/3] Reference run (original model)...", flush=True)
+        r1 = subprocess.run(
+            [sys.executable, "-m", "tests.hf_reference_runner",
+             "--output-dir", ref_dir],
+            env=os.environ, capture_output=True, text=True, cwd=project_root,
+        )
+        if r1.returncode != 0:
+            pytest.fail(f"Reference runner failed:\n{r1.stderr[-2000:]}")
+
+        # Step 2: Monitored run (hooked model + ring transport)
+        print("  [2/3] Monitored run (hooked model + ring)...", flush=True)
+        r2 = subprocess.run(
+            [sys.executable, "-m", "tests.hf_monitored_runner",
+             "--output-dir", mon_dir],
+            env=os.environ, capture_output=True, text=True, cwd=project_root,
+        )
+        if r2.returncode != 0:
+            pytest.fail(f"Monitored runner failed:\n{r2.stderr[-2000:]}")
+
+        # Step 3: Comparator (CPU only, reads disk + ClickHouse)
+        print("  [3/3] Comparing...", flush=True)
+        r3 = subprocess.run(
+            [sys.executable, "-m", "tests.hf_comparator",
+             "--ref-dir", ref_dir,
+             "--mon-dir", mon_dir,
+             "--result-file", result_file],
+            env=os.environ, capture_output=True, text=True, cwd=project_root,
+        )
+        if r3.returncode != 0:
+            pytest.fail(f"Comparator failed:\n{r3.stderr[-2000:]}")
+
+        # Read results
+        with open(result_file) as f:
+            results = json.load(f)
+
+        # Report via subtests
+        for test in results["tests"]:
+            with subtests.test(test["name"]):
+                assert test["passed"], test.get("detail", "")
+
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA + native backend required")
+def _test_e2e_correctness_hf_legacy(subtests) -> None:
+    """Legacy version kept for reference. Not called by verify_hf.sh."""
     try:
         import clickhouse_driver  # noqa: F401
     except Exception:
@@ -464,15 +534,23 @@ def test_e2e_correctness_hf(subtests) -> None:
 
     req_order = sorted(request_ids, key=_parse_request_id)
 
-    hf_refs_batch = _hf_generate_collect_hidden_states_batched(
-        hf_model=hf_model,
-        input_ids_batch=input_ids,
-        attention_mask_batch=attention_mask,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=eos_id,
-        pad_token_id=pad_id,
-        device=device,
+    # Run reference on ORIGINAL (non-hooked) model in a subprocess.
+    # This validates that our hooks don't change the model output,
+    # and ensures clean GPU memory isolation.
+    import subprocess, tempfile
+    ref_dir = tempfile.mkdtemp(prefix="hf_ref_")
+    ref_env = {**os.environ, "E2E_BATCH_SIZE": str(batch_size),
+               "E2E_MAX_NEW_TOKENS": str(max_new_tokens),
+               "E2E_MODEL": os.environ.get("E2E_MODEL", "gpt2")}
+    ref_result = subprocess.run(
+        [sys.executable, "-m", "tests.hf_reference_runner", "--output-dir", ref_dir],
+        env=ref_env, capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(__file__)),
     )
+    if ref_result.returncode != 0:
+        pytest.fail(f"Reference runner failed:\n{ref_result.stderr[-2000:]}")
+    hf_refs_batch = _load_hf_refs_from_disk(ref_dir)
+    import shutil
+    shutil.rmtree(ref_dir, ignore_errors=True)
     hf_gens_batch = _hf_generate_collect_scores_batched(
         hf_model=hf_model,
         input_ids_batch=input_ids,
@@ -1217,17 +1295,73 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA + native backend required")
 def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
-    """Compare monitoring DB (captured under CUDA graphs) against uncompiled eager HF.
+    """Compare CUDA-graph monitored run against original eager model.
 
-    The monitored model runs with torch.compile + StaticCache (CUDA graphs).
-    The reference model is uncompiled with DynamicCache (eager rollout).
-    Compiled vs uncompiled may produce different token sequences after a few
-    decode steps, so we compare the overlapping token prefix and hidden states
-    within that prefix using relaxed tolerance.
-
-    Run with:
-        CUDA_MODULE_LOADING=EAGER python -m pytest tests/test_e2e_correctness_vs_hf.py::test_e2e_cuda_graphs_vs_eager_hf -s
+    Three subprocesses — parent process never touches CUDA:
+      1. Reference: original model (eager) -> tensors on disk
+      2. Monitored: hooked model + ring (CUDA graphs, static cache) -> ClickHouse
+      3. Comparator: reads both, compares, writes result.json
     """
+    import json
+    import subprocess
+    import tempfile
+    import shutil
+
+    run_dir = tempfile.mkdtemp(prefix="hf_cg_e2e_")
+    ref_dir = os.path.join(run_dir, "ref")
+    mon_dir = os.path.join(run_dir, "mon")
+    result_file = os.path.join(run_dir, "result.json")
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # CUDA graph mode: monitored runs with static cache + torch.compile.
+    # Reference runs eager.  Relaxed tolerance for bf16 rounding from
+    # different accumulation order (compiled vs uncompiled).
+    mon_env = {**os.environ, "E2E_CUDA_GRAPHS": "1"}
+    cmp_env = {**os.environ, "E2E_TOLERANCE": "0.5"}
+
+    try:
+        print("\n  [1/3] Reference run (original model, eager)...", flush=True)
+        r1 = subprocess.run(
+            [sys.executable, "-m", "tests.hf_reference_runner",
+             "--output-dir", ref_dir],
+            env=os.environ, capture_output=True, text=True, cwd=project_root,
+        )
+        if r1.returncode != 0:
+            pytest.fail(f"Reference runner failed:\n{r1.stderr[-2000:]}")
+
+        print("  [2/3] Monitored run (hooked model + ring, CUDA graphs)...", flush=True)
+        r2 = subprocess.run(
+            [sys.executable, "-m", "tests.hf_monitored_runner",
+             "--output-dir", mon_dir],
+            env=mon_env, capture_output=True, text=True, cwd=project_root,
+        )
+        if r2.returncode != 0:
+            pytest.fail(f"Monitored runner failed:\n{r2.stderr[-2000:]}")
+
+        print("  [3/3] Comparing (tolerance=0.5 for CG vs eager)...", flush=True)
+        r3 = subprocess.run(
+            [sys.executable, "-m", "tests.hf_comparator",
+             "--ref-dir", ref_dir,
+             "--mon-dir", mon_dir,
+             "--result-file", result_file],
+            env=cmp_env, capture_output=True, text=True, cwd=project_root,
+        )
+        if r3.returncode != 0:
+            pytest.fail(f"Comparator failed:\n{r3.stderr[-2000:]}")
+
+        with open(result_file) as f:
+            results = json.load(f)
+
+        for test in results["tests"]:
+            with subtests.test(test["name"]):
+                assert test["passed"], test.get("detail", "")
+
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
+    """Legacy version kept for reference. Not called by verify_hf.sh."""
     try:
         import clickhouse_driver  # noqa: F401
     except Exception:

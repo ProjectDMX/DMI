@@ -340,6 +340,109 @@ def _hf_generate_collect_hidden_states_batched(
     return out_refs
 
 
+def _load_hf_refs_from_disk(output_dir: str) -> List[_HFRef]:
+    """Reconstruct _HFRef list from files saved by hf_reference_runner.py.
+
+    Same logic as _hf_generate_collect_hidden_states_batched but reads
+    from disk instead of running the model.
+    """
+    import os
+
+    meta = torch.load(os.path.join(output_dir, "meta.pt"), weights_only=False)
+    seqs = torch.load(os.path.join(output_dir, "sequences.pt"), weights_only=False)
+    attn_mask = torch.load(os.path.join(output_dir, "attention_mask.pt"), weights_only=False)
+
+    hs_path = os.path.join(output_dir, "hidden_states.pt")
+    hs_steps = torch.load(hs_path, weights_only=False) if os.path.exists(hs_path) else []
+
+    attn_path = os.path.join(output_dir, "attentions.pt")
+    attn_steps = torch.load(attn_path, weights_only=False) if os.path.exists(attn_path) else []
+
+    logits_path = os.path.join(output_dir, "logits.pt")
+    logits_list = torch.load(logits_path, weights_only=False) if os.path.exists(logits_path) else []
+
+    B = int(meta["batch_size"])
+    Pmax = int(meta["Pmax"])
+    eos_token_id = int(meta["eos_token_id"])
+    model_dtype = getattr(torch, meta["model_dtype"].replace("torch.", ""))
+
+    prompt_lens_t = attn_mask.sum(dim=1)
+    pad_lens = (Pmax - prompt_lens_t).tolist()
+
+    out_refs: List[_HFRef] = []
+    for b in range(B):
+        pad_len = int(pad_lens[b])
+
+        prompt_tok = seqs[b, pad_len:Pmax]
+        gen_tok_full = seqs[b, Pmax:]
+        gen_len = int(gen_tok_full.numel())
+        if gen_len > 0:
+            eos_hits = (gen_tok_full == eos_token_id).nonzero(as_tuple=False)
+            if eos_hits.numel() > 0:
+                gen_len = int(eos_hits[0].item()) + 1
+        gen_tok = gen_tok_full[:gen_len]
+
+        n_decode_steps = len(hs_steps) - 1 if hs_steps else 0
+        keep_gen = min(gen_len, n_decode_steps)
+        tok_ids = torch.cat([prompt_tok, gen_tok[:keep_gen]], dim=0).to(torch.long)
+
+        # Hidden states per layer
+        n_layers_plus_1 = len(hs_steps[0]) if hs_steps else 0
+        hidden_states_per_layer: List[torch.Tensor] = []
+        for l_idx in range(n_layers_plus_1):
+            chunks: List[torch.Tensor] = []
+            prefill_hs = hs_steps[0][l_idx][b, pad_len:, :]
+            chunks.append(prefill_hs)
+            for s in range(keep_gen):
+                decode_hs = hs_steps[s + 1][l_idx][b]
+                if decode_hs.ndim == 1:
+                    decode_hs = decode_hs.unsqueeze(0)
+                chunks.append(decode_hs)
+            hidden_states_per_layer.append(torch.cat(chunks, dim=0))
+
+        # Attention patterns per layer
+        attn_per_layer: List[torch.Tensor] = []
+        if attn_steps:
+            n_attn_layers = len(attn_steps[0])
+            for l_idx in range(n_attn_layers):
+                attn_chunks: List[torch.Tensor] = []
+                a0 = attn_steps[0][l_idx][b]
+                if a0.ndim == 4 and a0.shape[0] == 1:
+                    a0 = a0.squeeze(0)
+                a0 = a0[:, pad_len:, pad_len:]
+                attn_chunks.append(a0)
+                for s in range(keep_gen):
+                    ab = attn_steps[s + 1][l_idx][b]
+                    if ab.ndim == 2:
+                        ab = ab.unsqueeze(1)
+                    ab = ab[..., pad_len:]
+                    attn_chunks.append(ab)
+                merged = merge_segments(attn_chunks, "blocks.attn.hook_pattern")
+                if merged is None:
+                    merged = torch.empty((0,), dtype=torch.float32)
+                attn_per_layer.append(merged)
+
+        # Logits
+        logit_rows: List[torch.Tensor] = []
+        for s in range(min(keep_gen, len(logits_list))):
+            logit_rows.append(logits_list[s][b])
+        if logit_rows:
+            final_logits = torch.stack(logit_rows, dim=0).to(model_dtype)
+        else:
+            final_logits = torch.empty((0,), dtype=model_dtype)
+
+        out_refs.append(
+            _HFRef(
+                token_ids=tok_ids,
+                final_logits=final_logits,
+                hidden_states=hidden_states_per_layer,
+                attn_pattern=attn_per_layer,
+            )
+        )
+
+    return out_refs
+
+
 # ---------------------------------------------------------------------------
 # ROL reference: manual greedy KV-cache rollout
 # ---------------------------------------------------------------------------

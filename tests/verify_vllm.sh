@@ -38,6 +38,7 @@ run_test() {
     E2E_ENFORCE_EAGER=$eager \
     E2E_RING_PAYLOAD_MB=$ring_mb \
     E2E_RING_PINNED_MB=$ring_mb \
+    E2E_COMPARE_LAYERS=all \
     python -m pytest tests/test_vllm_correctness.py -q -s
 }
 
