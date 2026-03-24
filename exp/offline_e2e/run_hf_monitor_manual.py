@@ -215,13 +215,12 @@ def main() -> None:
         if compile_enabled and pad_buckets
         else []
     )
-    bucket_decode_tokens = warmup_decode_tokens(rendered, int(args.max_new_tokens))
     with torch.no_grad():
         for bi in bucket_inputs:
             _run_batch_manual(
                 model=model,
                 input_ids=bi['input_ids'], attention_mask=bi['attention_mask'],
-                target_lengths=[bucket_decode_tokens] * args.batch_size,
+                target_lengths=[16] * args.batch_size,
                 pad_token_id=int(tokenizer.pad_token_id),
                 compile_enabled=compile_enabled,
             )

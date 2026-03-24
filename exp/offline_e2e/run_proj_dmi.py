@@ -219,12 +219,11 @@ def main() -> None:
         if compile_enabled and pad_buckets
         else []
     )
-    bucket_decode_tokens = warmup_decode_tokens(rendered, int(args.max_new_tokens))
     with torch.no_grad():
         for bi in bucket_inputs:
             _ = generate_with_monitoring(
                 model, input_ids=bi["input_ids"], attention_mask=bi["attention_mask"],
-                max_new_tokens=bucket_decode_tokens, do_sample=False,
+                max_new_tokens=16, do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 hook_selection="hidden-states", **gen_kwargs,
             )
