@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=sweep-hs
+#SBATCH --job-name=sweep-internal-hooks
 #SBATCH --partition=gpu-h100
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=32
@@ -50,8 +50,10 @@ RING_MIN_MB=5120
 RING_TASK_ENTRIES=131072
 RING_FLUSH=0.15
 CAPTURE_MODE="hs"
-HOOK_LABEL="capture_${CAPTURE_MODE}"
-HOOK_TAG="${HOOK_LABEL// /_}"
+HOOK_SELECTION="q,k,v,z,mlp_in,mlp_out,resid_mid"
+HOOK_TAG="${HOOK_SELECTION//,/__}"
+HOOK_TAG="${HOOK_TAG// /}"
+HOOK_LABEL="internal_hooks:${HOOK_SELECTION}"
 
 RUN_TAG="$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
 RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/full_sweep_${HOOK_TAG}_${RUN_TAG}"
@@ -180,7 +182,7 @@ run_baseline_allow_fail() {
     local compute_toks=""
 
     echo ""
-    echo "=== ${baseline} | model=${model} dataset=${dataset} bs=${bs} ==="
+    echo "=== ${baseline} | model=${model} dataset=${dataset} bs=${bs} hooks=${HOOK_SELECTION} ==="
 
     if "$@" >"${log_file}" 2>&1; then
         cat "${log_file}"
@@ -249,7 +251,7 @@ estimate_proj_dmi_ring_mb() {
     echo "${ring_mb}"
 }
 
-run_proj_dmi_must_pass() {
+run_proj_dmi_with_retries() {
     local model="$1"
     local dataset="$2"
     local bs="$3"
@@ -260,14 +262,18 @@ run_proj_dmi_must_pass() {
 
     local ring_mb
     ring_mb=$(estimate_proj_dmi_ring_mb "${model}" "${bs}" "${max_input}" "${max_output}")
+    local last_ring_mb="${ring_mb}"
+    local last_log_file=""
 
     local safe_label="${baseline// /_}"
     safe_label="${safe_label//\//_}"
 
     while [ "${ring_mb}" -ge "${RING_MIN_MB}" ]; do
         local log_file="${LOG_DIR}/${model}__${dataset}__bs${bs}__${HOOK_TAG}__${safe_label}__ring${ring_mb}.log"
+        last_log_file="${log_file}"
+        last_ring_mb="${ring_mb}"
         echo ""
-        echo "=== ${baseline} | model=${model} dataset=${dataset} bs=${bs} ring=${ring_mb}MB ==="
+        echo "=== ${baseline} | model=${model} dataset=${dataset} bs=${bs} ring=${ring_mb}MB hooks=${HOOK_SELECTION} ==="
 
         if "$@" --ring-payload-mb "${ring_mb}" --ring-pinned-mb "${ring_mb}" \
             --ring-task-entries "${RING_TASK_ENTRIES}" \
@@ -291,13 +297,16 @@ run_proj_dmi_must_pass() {
             continue
         fi
 
-        append_summary "${model}" "${dataset}" "${bs}" "${baseline}" "FAIL_ABORT" "${ring_mb}" "" "" "${log_file}"
-        echo "ERROR: Proj-DMI failed for a non-OOM reason. Aborting."
-        return 1
+        append_summary "${model}" "${dataset}" "${bs}" "${baseline}" "FAIL_SKIP" "${ring_mb}" "" "" "${log_file}"
+        echo "Skipping Proj-DMI after non-OOM failure: ${baseline}"
+        cleanup_gpu
+        return 0
     done
 
-    echo "ERROR: Proj-DMI exhausted ring buffer retries and still did not pass."
-    return 1
+    append_summary "${model}" "${dataset}" "${bs}" "${baseline}" "OOM_EXHAUSTED_SKIP" "${last_ring_mb}" "" "" "${last_log_file}"
+    echo "Skipping Proj-DMI after exhausting ring buffer retries: ${baseline}"
+    cleanup_gpu
+    return 0
 }
 
 echo ""
@@ -307,10 +316,11 @@ echo "  datasets : ${DATASETS[*]}"
 echo "  batches  : ${BATCHES[*]}"
 echo "  limit    : ${LIMIT}"
 echo "  capture  : ${CAPTURE_MODE}"
+echo "  hooks    : ${HOOK_SELECTION}"
 echo "  results  : ${RESULTS_DIR}"
 echo ""
 echo "Total configs: 2 models x 2 datasets x 3 batch sizes = 12"
-echo "Total baseline invocations planned: 12 x 7 = 84 (plus Proj-DMI retries)"
+echo "Total baseline invocations planned: 12 x 4 = 48 (plus Proj-DMI retries)"
 echo ""
 
 for model in "${MODELS[@]}"; do
@@ -337,7 +347,7 @@ for model in "${MODELS[@]}"; do
         for bs in "${BATCHES[@]}"; do
             echo ""
             echo "############################################################"
-            echo "Config: model=${model} dataset=${dataset} bs=${bs} input=${MAX_INPUT} output=${MAX_OUTPUT} limit=${LIMIT}"
+            echo "Config: model=${model} dataset=${dataset} bs=${bs} input=${MAX_INPUT} output=${MAX_OUTPUT} limit=${LIMIT} hooks=${HOOK_SELECTION}"
             echo "############################################################"
 
             COMMON=(--model "${model}" --batch-size "${bs}" --sample-file "${SAMPLE_FILE}" --local-files-only \
@@ -347,33 +357,22 @@ for model in "${MODELS[@]}"; do
             run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_upper_bound_compile" \
                 python run_hf_upper_bound.py "${COMMON[@]}"
 
-            run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_upper_bound_eager" \
-                python run_hf_upper_bound.py "${COMMON[@]}" --disable-compile
-
-            run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_monitor_generate_eager" \
-                python run_hf_monitor.py "${COMMON[@]}"
-
-            run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_monitor_manual_compile" \
-                python run_hf_monitor_manual.py "${COMMON[@]}"
-
-            if ! run_proj_dmi_must_pass "${model}" "${dataset}" "${bs}" "proj_dmi_compile" "${MAX_INPUT}" "${MAX_OUTPUT}" \
-                python run_proj_dmi.py "${COMMON[@]}"; then
-                echo "ERROR: proj_dmi_compile could not be completed."
-                exit 1
-            fi
-
             run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "torch_hooks_eager" \
-                python run_torch_hooks.py "${COMMON[@]}" --disable-compile
+                python run_torch_hooks.py "${COMMON[@]}" --hook-selection "${HOOK_SELECTION}" --disable-compile
 
             run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "nnsight_eager" \
-                python run_nnsight.py "${COMMON[@]}"
+                python run_nnsight.py "${COMMON[@]}" --hook-selection "${HOOK_SELECTION}" --disable-compile
+
+            run_proj_dmi_with_retries "${model}" "${dataset}" "${bs}" "proj_dmi_compile" "${MAX_INPUT}" "${MAX_OUTPUT}" \
+                python run_proj_dmi.py "${COMMON[@]}" --hook-selection "${HOOK_SELECTION}"
         done
     done
 done
 
 echo ""
 echo "============================================================"
-echo "Full sweep done at $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Full internal-hooks sweep done at $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Results dir: ${RESULTS_DIR}"
 echo "Summary CSV: ${SUMMARY_CSV}"
+echo "Hook label : ${HOOK_LABEL}"
 echo "============================================================"

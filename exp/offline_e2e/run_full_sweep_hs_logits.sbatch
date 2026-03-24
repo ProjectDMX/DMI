@@ -50,14 +50,16 @@ RING_MIN_MB=5120
 RING_TASK_ENTRIES=131072
 RING_FLUSH=0.15
 CAPTURE_MODE="hs_logits"
+HOOK_LABEL="capture_${CAPTURE_MODE}"
+HOOK_TAG="${HOOK_LABEL// /_}"
 
 RUN_TAG="$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
-RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/full_sweep_${RUN_TAG}"
+RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/full_sweep_${HOOK_TAG}_${RUN_TAG}"
 LOG_DIR="${RESULTS_DIR}/logs"
 SUMMARY_CSV="${RESULTS_DIR}/summary.csv"
 mkdir -p "${RESULTS_DIR}" "${LOG_DIR}"
 
-echo "model,dataset,batch_size,baseline,status,ring_mb,target_tok_s,compute_tok_s,log_file" > "${SUMMARY_CSV}"
+echo "model,dataset,batch_size,baseline,capture_mode,hook_label,status,ring_mb,target_tok_s,compute_tok_s,log_file" > "${SUMMARY_CSV}"
 
 LOCAL_NVME_HF="/tmp/${USER}_hf_cache_${SLURM_JOB_ID}"
 LOCAL_HF="${LOCAL_NVME_HF}"
@@ -154,7 +156,7 @@ append_summary() {
     local target_toks="$7"
     local compute_toks="$8"
     local log_file="$9"
-    echo "${model},${dataset},${bs},${baseline},${status},${ring_mb},${target_toks},${compute_toks},${log_file}" >> "${SUMMARY_CSV}"
+    echo "${model},${dataset},${bs},${baseline},${CAPTURE_MODE},${HOOK_LABEL},${status},${ring_mb},${target_toks},${compute_toks},${log_file}" >> "${SUMMARY_CSV}"
 }
 
 cleanup_gpu() {
@@ -172,7 +174,7 @@ run_baseline_allow_fail() {
 
     local safe_label="${baseline// /_}"
     safe_label="${safe_label//\//_}"
-    local log_file="${LOG_DIR}/${model}__${dataset}__bs${bs}__${safe_label}.log"
+    local log_file="${LOG_DIR}/${model}__${dataset}__bs${bs}__${HOOK_TAG}__${safe_label}.log"
     local status="FAIL"
     local target_toks=""
     local compute_toks=""
@@ -247,7 +249,7 @@ estimate_proj_dmi_ring_mb() {
     echo "${ring_mb}"
 }
 
-run_proj_dmi_must_pass() {
+run_proj_dmi_with_retries() {
     local model="$1"
     local dataset="$2"
     local bs="$3"
@@ -258,12 +260,16 @@ run_proj_dmi_must_pass() {
 
     local ring_mb
     ring_mb=$(estimate_proj_dmi_ring_mb "${model}" "${bs}" "${max_input}" "${max_output}")
+    local last_ring_mb="${ring_mb}"
+    local last_log_file=""
 
     local safe_label="${baseline// /_}"
     safe_label="${safe_label//\//_}"
 
     while [ "${ring_mb}" -ge "${RING_MIN_MB}" ]; do
-        local log_file="${LOG_DIR}/${model}__${dataset}__bs${bs}__${safe_label}__ring${ring_mb}.log"
+        local log_file="${LOG_DIR}/${model}__${dataset}__bs${bs}__${HOOK_TAG}__${safe_label}__ring${ring_mb}.log"
+        last_log_file="${log_file}"
+        last_ring_mb="${ring_mb}"
         echo ""
         echo "=== ${baseline} | model=${model} dataset=${dataset} bs=${bs} ring=${ring_mb}MB ==="
 
@@ -289,13 +295,16 @@ run_proj_dmi_must_pass() {
             continue
         fi
 
-        append_summary "${model}" "${dataset}" "${bs}" "${baseline}" "FAIL_ABORT" "${ring_mb}" "" "" "${log_file}"
-        echo "ERROR: Proj-DMI failed for a non-OOM reason. Aborting."
-        return 1
+        append_summary "${model}" "${dataset}" "${bs}" "${baseline}" "FAIL_SKIP" "${ring_mb}" "" "" "${log_file}"
+        echo "Skipping Proj-DMI after non-OOM failure: ${baseline}"
+        cleanup_gpu
+        return 0
     done
 
-    echo "ERROR: Proj-DMI exhausted ring buffer retries and still did not pass."
-    return 1
+    append_summary "${model}" "${dataset}" "${bs}" "${baseline}" "OOM_EXHAUSTED_SKIP" "${last_ring_mb}" "" "" "${last_log_file}"
+    echo "Skipping Proj-DMI after exhausting ring buffer retries: ${baseline}"
+    cleanup_gpu
+    return 0
 }
 
 echo ""
@@ -308,7 +317,7 @@ echo "  capture  : ${CAPTURE_MODE}"
 echo "  results  : ${RESULTS_DIR}"
 echo ""
 echo "Total configs: 2 models x 2 datasets x 3 batch sizes = 12"
-echo "Total baseline invocations planned: 12 x 8 = 96 (plus Proj-DMI retries)"
+echo "Total baseline invocations planned: 12 x 6 = 72 (plus Proj-DMI retries)"
 echo ""
 
 for model in "${MODELS[@]}"; do
@@ -342,32 +351,20 @@ for model in "${MODELS[@]}"; do
                 --max-input-tokens "${MAX_INPUT}" --max-new-tokens "${MAX_OUTPUT}" --limit "${LIMIT}" \
                 --pad-buckets "${PAD_BUCKETS}" --results-dir "${RESULTS_DIR}" --capture-mode "${CAPTURE_MODE}")
 
-            run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_upper_bound_compile" \
-                python run_hf_upper_bound.py "${COMMON[@]}"
-
             run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_upper_bound_eager" \
                 python run_hf_upper_bound.py "${COMMON[@]}" --disable-compile
 
             run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_monitor_generate_eager" \
                 python run_hf_monitor.py "${COMMON[@]}"
 
-            run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_monitor_manual_eager" \
-                python run_hf_monitor_manual.py "${COMMON[@]}" --disable-compile
-
             run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_monitor_manual_compile" \
                 python run_hf_monitor_manual.py "${COMMON[@]}"
 
-            if ! run_proj_dmi_must_pass "${model}" "${dataset}" "${bs}" "proj_dmi_compile" "${MAX_INPUT}" "${MAX_OUTPUT}" \
-                python run_proj_dmi.py "${COMMON[@]}"; then
-                echo "ERROR: proj_dmi_compile could not be completed."
-                exit 1
-            fi
+            run_proj_dmi_with_retries "${model}" "${dataset}" "${bs}" "proj_dmi_compile" "${MAX_INPUT}" "${MAX_OUTPUT}" \
+                python run_proj_dmi.py "${COMMON[@]}"
 
-            if ! run_proj_dmi_must_pass "${model}" "${dataset}" "${bs}" "proj_dmi_eager" "${MAX_INPUT}" "${MAX_OUTPUT}" \
-                python run_proj_dmi.py "${COMMON[@]}" --disable-compile; then
-                echo "ERROR: proj_dmi_eager could not be completed."
-                exit 1
-            fi
+            run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "torch_hooks_eager" \
+                python run_torch_hooks.py "${COMMON[@]}" --disable-compile
 
             run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "nnsight_eager" \
                 python run_nnsight.py "${COMMON[@]}"

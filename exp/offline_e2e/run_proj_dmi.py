@@ -131,6 +131,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Proj-DMI offline baseline with ring transport.")
     add_shared_args(parser)
     parser.add_argument("--proj-dmi-mode", choices=["ring_null", "ring_db"], default="ring_null")
+    parser.add_argument("--hook-selection", default="hidden-states")
     parser.add_argument("--ring-task-entries", type=int, default=65536)
     parser.add_argument("--ring-payload-mb", type=int, default=4096)
     parser.add_argument("--ring-pinned-mb", type=int, default=4096)
@@ -162,7 +163,8 @@ def main() -> None:
     model_id = resolve_model_id(args.model)
     compile_enabled = not args.disable_compile
     device = torch.device("cuda")
-    hook_sel = "hidden-states,final_ln,logits" if args.capture_mode == "hs_logits" else "hidden-states,final_ln"
+    default_hook_sel = "hidden-states,final_ln,logits" if args.capture_mode == "hs_logits" else "hidden-states,final_ln"
+    hook_sel = str(args.hook_selection) if str(args.hook_selection) != "hidden-states" else default_hook_sel
 
     examples = load_jsonl_examples(args.sample_file, limit=parsed_limit(args))
     tokenizer = build_tokenizer(model_id, local_files_only=args.local_files_only)
@@ -172,7 +174,7 @@ def main() -> None:
     )
 
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode=hook_sel),
+        hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
         native_partial_seal=NativePartialSealConfig(
             enabled=True,
@@ -309,6 +311,7 @@ def main() -> None:
         extra={
             "local_files_only": bool(args.local_files_only),
             "hook_selection": hook_sel,
+            "capture_mode": str(args.capture_mode),
             "proj_dmi_mode": args.proj_dmi_mode,
             "ring_task_entries": int(args.ring_task_entries),
             "ring_payload_mb": int(args.ring_payload_mb),

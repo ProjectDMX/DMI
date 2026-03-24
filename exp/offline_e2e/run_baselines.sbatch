@@ -49,6 +49,8 @@ LIMIT=50
 RING_MB=56320        # 55GB
 FLUSH=0.15
 PAD_BUCKETS="64,128,256,512"
+CAPTURE_MODE="hs"
+HOOK_LABEL="capture_${CAPTURE_MODE}"
 
 # ---- 拷贝模型到本地 NVMe /tmp 加速加载 ----
 LOCAL_NVME_HF="/tmp/${USER}_hf_cache_${SLURM_JOB_ID}"
@@ -137,7 +139,7 @@ export HF_HOME="${LOCAL_HF}"
 # Cleanup on exit: 只清理 /tmp 本地缓存，绝不碰 scratch cache
 trap 'if [ -n "${CLEANUP_DIR}" ] && [ -d "${CLEANUP_DIR}" ]; then echo "Cleaning up ${CLEANUP_DIR}..."; rm -rf "${CLEANUP_DIR}"; fi' EXIT
 
-COMMON="--model ${MODEL} --batch-size ${BS} --sample-file ${SAMPLE_FILE} --local-files-only --max-input-tokens ${MAX_INPUT} --max-new-tokens ${MAX_OUTPUT} --limit ${LIMIT} --pad-buckets ${PAD_BUCKETS}"
+COMMON="--model ${MODEL} --batch-size ${BS} --sample-file ${SAMPLE_FILE} --local-files-only --max-input-tokens ${MAX_INPUT} --max-new-tokens ${MAX_OUTPUT} --limit ${LIMIT} --pad-buckets ${PAD_BUCKETS} --capture-mode ${CAPTURE_MODE}"
 
 # Collect results: "label|target_tok/s|compute_tok/s"
 declare -a RESULTS=()
@@ -205,7 +207,7 @@ run_baseline "nnsight (eager)" \
 echo ""
 echo "============================================================"
 echo "All baselines done at $(date '+%Y-%m-%d %H:%M:%S')"
-echo "Config: model=${MODEL} bs=${BS} input=${MAX_INPUT} output=${MAX_OUTPUT} samples=${LIMIT} buckets=${PAD_BUCKETS}"
+echo "Config: model=${MODEL} bs=${BS} input=${MAX_INPUT} output=${MAX_OUTPUT} samples=${LIMIT} buckets=${PAD_BUCKETS} hook=${HOOK_LABEL}"
 echo "============================================================"
 echo ""
 
