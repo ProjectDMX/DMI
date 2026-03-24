@@ -134,10 +134,13 @@ class DMXGPUWorker(Worker):
             stage_cfg = _ne.StageConfig.clickhouse_insert(
                 ch_cfg, parallelism=10, name="clickhouse_insert")
             q = stage_cfg.input_queue
-            q.max_batch_items = 1024
-            q.high_watermark_items = 1024
-            q.max_batch_size = 2048 * 1024 * 1024
-            q.high_watermark_size = 2048 * 1024 * 1024
+            q.max_batch_items = int(_cfg(
+                ac, "dmx_ch_max_batch_items", "DMX_CH_MAX_BATCH_ITEMS", 1024))
+            q.high_watermark_items = q.max_batch_items
+            q.max_batch_size = int(_cfg(
+                ac, "dmx_ch_max_batch_bytes", "DMX_CH_MAX_BATCH_BYTES",
+                2048 * 1024 * 1024))
+            q.high_watermark_size = q.max_batch_size
             host_engine = _ne.DMXHostEngine(stage_cfg)
             host_engine.start()
             self._dmx_host_engine = host_engine
@@ -147,6 +150,12 @@ class DMXGPUWorker(Worker):
         ring_cfg.payload_ring_bytes = ring_payload_mb * 1024 * 1024
         ring_cfg.pinned_staging_bytes = ring_pinned_mb * 1024 * 1024
         ring_cfg.task_ring_entries = ring_entries
+        ring_cfg.insert_queue_max_bytes = int(_cfg(
+            ac, "dmx_insert_queue_max_bytes", "DMX_INSERT_QUEUE_MAX_BYTES",
+            4096 * 1024 * 1024))
+        ring_cfg.insert_queue_max_items = int(_cfg(
+            ac, "dmx_insert_queue_max_items", "DMX_INSERT_QUEUE_MAX_ITEMS",
+            65536))
 
         ring_engine = _ne.RingEngine(ring_cfg, host_engine)
         ring_engine.init()

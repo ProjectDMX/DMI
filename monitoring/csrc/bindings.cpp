@@ -398,6 +398,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("payload_cap", &ring_py::RingEnginePy::payload_cap)
       .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
+      .def("task_cap",    &ring_py::RingEnginePy::task_cap)
       .def("push_all_metas",
            [](ring_py::RingEnginePy& self,
               py::list hook_types_py,

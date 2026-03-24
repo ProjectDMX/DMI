@@ -121,6 +121,14 @@ uint64_t DrainThread::cpu_payload_tail_committed() const {
     return cpu_payload_tail_committed_;
 }
 
+uint64_t DrainThread::cpu_task_head() const {
+    return cpu_task_head_;
+}
+
+uint64_t DrainThread::cpu_task_tail_committed() const {
+    return cpu_task_tail_;
+}
+
 // ---------------------------------------------------------------------------
 // reserve -- pre-allocate ring space for the next step.
 // Called from prepare_step after confirming space is available.

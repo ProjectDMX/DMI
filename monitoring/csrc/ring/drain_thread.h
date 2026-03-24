@@ -62,6 +62,8 @@ public:
     // Capacity query accessors (called from RingEnginePy::prepare_step).
     uint64_t cpu_payload_head() const;
     uint64_t cpu_payload_tail_committed() const;
+    uint64_t cpu_task_head() const;
+    uint64_t cpu_task_tail_committed() const;
 
     // Pre-allocate ring space for the next step's producer kernels.
     // Advances cpu_payload_head_ and cpu_task_head_ under mgmt_mu_.
