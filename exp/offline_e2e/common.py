@@ -149,15 +149,37 @@ def make_bucket_warmup_inputs(
     pad_buckets: Sequence[int],
     batch_size: int,
     device: torch.device,
+    *,
+    active_tokens: int,
 ) -> List[Dict[str, torch.Tensor]]:
     """Create one synthetic batch per bucket for CUDA graph warmup."""
     inputs = []
     pad_token_id = int(tokenizer.pad_token_id)
+    fill_token_id = int(
+        tokenizer.eos_token_id
+        if getattr(tokenizer, "eos_token_id", None) is not None
+        else tokenizer.pad_token_id
+    )
     for bucket in pad_buckets:
+        active = max(1, min(int(bucket), int(active_tokens)))
         input_ids = torch.full((batch_size, bucket), pad_token_id, dtype=torch.long, device=device)
-        attention_mask = torch.ones_like(input_ids)
+        attention_mask = torch.zeros_like(input_ids)
+        input_ids[:, bucket - active :] = fill_token_id
+        attention_mask[:, bucket - active :] = 1
         inputs.append({"input_ids": input_ids, "attention_mask": attention_mask})
     return inputs
+
+
+def warmup_decode_tokens(
+    items: Sequence[Dict[str, Any]],
+    max_new_tokens_cap: int,
+    *,
+    minimum: int = 4,
+) -> int:
+    if not items:
+        return int(minimum)
+    target_lengths = batch_target_lengths(items, max_new_tokens_cap)
+    return max(int(minimum), max(int(length) for length in target_lengths))
 
 
 def build_tokenizer(model_id: str, *, local_files_only: bool) -> Any:

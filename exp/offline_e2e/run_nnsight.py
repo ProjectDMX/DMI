@@ -20,7 +20,6 @@ from common import (
     device_sync,
     iter_batches,
     load_jsonl_examples,
-    make_bucket_warmup_inputs,
     make_output_path,
     maybe_sort_by_length,
     parse_pad_buckets,
@@ -91,36 +90,25 @@ def main() -> None:
 
     batch_metrics = []
     pad_buckets = parse_pad_buckets(args.pad_buckets)
-    bucket_inputs = make_bucket_warmup_inputs(tokenizer, pad_buckets, args.batch_size, device) if pad_buckets else []
-
     with torch.no_grad():
-        for bi in bucket_inputs:
+        for warmup_batch in warmup_batches(rendered, args.batch_size, count=2):
+            warmup_texts = [item["prompt_text"] for item in warmup_batch]
+            warmup_encoded = tokenize_batch(
+                tokenizer,
+                warmup_texts,
+                pad_buckets=pad_buckets,
+                pad_to_multiple_of=int(args.pad_to_multiple_of),
+                max_input_tokens=int(args.max_input_tokens),
+            )
+            warmup_encoded = {key: value.to(device) for key, value in warmup_encoded.items()}
             _run_batch(
                 model=model,
                 modules=modules,
-                encoded=bi,
-                batch_max_new_tokens=4,
+                encoded=warmup_encoded,
+                batch_max_new_tokens=max(batch_target_lengths(warmup_batch, int(args.max_new_tokens))),
             )
             device_sync(device)
-        if not bucket_inputs:
-            for warmup_batch in warmup_batches(rendered, args.batch_size, count=2):
-                warmup_texts = [item["prompt_text"] for item in warmup_batch]
-                warmup_encoded = tokenize_batch(
-                    tokenizer,
-                    warmup_texts,
-                    pad_buckets=pad_buckets,
-                    pad_to_multiple_of=int(args.pad_to_multiple_of),
-                    max_input_tokens=int(args.max_input_tokens),
-                )
-                warmup_encoded = {key: value.to(device) for key, value in warmup_encoded.items()}
-                _run_batch(
-                    model=model,
-                    modules=modules,
-                    encoded=warmup_encoded,
-                    batch_max_new_tokens=4,
-                )
-                device_sync(device)
-    print(f"Warmup done ({len(bucket_inputs)} buckets).", flush=True)
+    print("Warmup done (2 real batches).", flush=True)
 
     total_batches = math.ceil(len(rendered) / args.batch_size)
     with torch.no_grad():

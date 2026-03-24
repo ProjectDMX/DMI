@@ -22,6 +22,7 @@ from common import (
     iter_batches,
     load_jsonl_examples,
     make_output_path,
+    warmup_decode_tokens,
     maybe_sort_by_length,
     parse_pad_buckets,
     parsed_limit,
@@ -65,28 +66,39 @@ def main() -> None:
     gen_kwargs = compile_generate_kwargs(compile_enabled)
     pad_buckets = parse_pad_buckets(args.pad_buckets)
 
-    bucket_inputs = make_bucket_warmup_inputs(tokenizer, pad_buckets, args.batch_size, device) if pad_buckets else []
+    bucket_inputs = (
+        make_bucket_warmup_inputs(
+            tokenizer,
+            pad_buckets,
+            args.batch_size,
+            device,
+            active_tokens=(int(args.max_input_tokens) if int(args.max_input_tokens) > 0 else max(pad_buckets)),
+        )
+        if compile_enabled and pad_buckets
+        else []
+    )
+    bucket_decode_tokens = warmup_decode_tokens(rendered, int(args.max_new_tokens))
     with torch.no_grad():
         for bi in bucket_inputs:
             _ = model.generate(
                 input_ids=bi["input_ids"], attention_mask=bi["attention_mask"],
-                max_new_tokens=4, do_sample=False,
+                max_new_tokens=bucket_decode_tokens, do_sample=False,
                 pad_token_id=tokenizer.pad_token_id, **gen_kwargs,
             )
             device_sync(device)
-        if not bucket_inputs:
-            for warmup_batch in warmup_batches(rendered, args.batch_size, count=2):
-                warmup_texts = [item["prompt_text"] for item in warmup_batch]
-                warmup_encoded = tokenize_batch(tokenizer, warmup_texts, pad_buckets=pad_buckets,
-                    pad_to_multiple_of=int(args.pad_to_multiple_of), max_input_tokens=int(args.max_input_tokens))
-                _ = model.generate(
-                    input_ids=warmup_encoded["input_ids"].to(device),
-                    attention_mask=warmup_encoded["attention_mask"].to(device),
-                    max_new_tokens=4, do_sample=False,
-                    pad_token_id=tokenizer.pad_token_id, **gen_kwargs,
-                )
-                device_sync(device)
-    print(f"Warmup done ({len(bucket_inputs)} buckets).", flush=True)
+        for warmup_batch in warmup_batches(rendered, args.batch_size, count=2):
+            warmup_texts = [item["prompt_text"] for item in warmup_batch]
+            warmup_encoded = tokenize_batch(tokenizer, warmup_texts, pad_buckets=pad_buckets,
+                pad_to_multiple_of=int(args.pad_to_multiple_of), max_input_tokens=int(args.max_input_tokens))
+            _ = model.generate(
+                input_ids=warmup_encoded["input_ids"].to(device),
+                attention_mask=warmup_encoded["attention_mask"].to(device),
+                max_new_tokens=warmup_decode_tokens(warmup_batch, int(args.max_new_tokens)),
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id, **gen_kwargs,
+            )
+            device_sync(device)
+    print(f"Warmup done ({len(bucket_inputs)} buckets + 2 real batches).", flush=True)
 
     total_batches = math.ceil(len(rendered) / args.batch_size)
     with torch.no_grad():
