@@ -16,6 +16,12 @@ export LD_LIBRARY_PATH="${ENV_DIR}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export HF_HUB_DISABLE_XET=1
 export PYTHONPATH="${PROJECT}/transformers/src:${PROJECT}"
 export TL_ENABLE_NVTX=1
+export HF_HOME="${SCRATCH}/hf_cache"
+
+if [ ! -d "${HF_HOME}" ]; then
+  echo "ERROR: HF cache not found at ${HF_HOME}"
+  exit 1
+fi
 
 cd "${PROJECT}/exp/offline_e2e"
 
