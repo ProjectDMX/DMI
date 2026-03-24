@@ -59,8 +59,12 @@ def _collect_targets(model: Any, hook_selection: str) -> tuple[list[tuple[str, A
         names.append("final_ln")
     elif non_logit_set == internal_hook_set:
         for layer_idx, layer in enumerate(model.model.layers):
-            q_module = getattr(layer.self_attn, "q_norm", None) or layer.self_attn.q_proj
-            k_module = getattr(layer.self_attn, "k_norm", None) or layer.self_attn.k_proj
+            q_module = getattr(layer.self_attn, "q_norm", None)
+            if q_module is None:
+                q_module = layer.self_attn.q_proj
+            k_module = getattr(layer.self_attn, "k_norm", None)
+            if k_module is None:
+                k_module = layer.self_attn.k_proj
             specs = [
                 (f"layers.{layer_idx}.q", q_module, "output"),
                 (f"layers.{layer_idx}.k", k_module, "output"),
