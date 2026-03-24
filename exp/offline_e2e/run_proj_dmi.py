@@ -64,6 +64,10 @@ def _load_hooked_model(model_id: str, *, local_files_only: bool):
         from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
 
         model_cls = HookedQwen3ForCausalLM
+    elif "llama" in model_id.lower():
+        from transformers.models.llama.modeling_llama import HookedLlamaForCausalLM
+
+        model_cls = HookedLlamaForCausalLM
     elif model_id.lower() == "gpt2":
         from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
 
@@ -71,7 +75,7 @@ def _load_hooked_model(model_id: str, *, local_files_only: bool):
     else:
         raise ValueError(
             f"No local Hooked* model implementation found for {model_id}. "
-            "Proj-DMI is currently wired for repo HookedQwen3/GPT2 models."
+            "Proj-DMI is currently wired for repo HookedQwen3/Llama/GPT2 models."
         )
     return model_cls.from_pretrained(
         model_id,

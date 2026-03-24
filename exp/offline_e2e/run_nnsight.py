@@ -59,14 +59,17 @@ def _collect_targets(model: Any, hook_selection: str) -> tuple[list[tuple[str, A
         names.append("final_ln")
     elif non_logit_set == internal_hook_set:
         for layer_idx, layer in enumerate(model.model.layers):
+            q_module = getattr(layer.self_attn, "q_norm", None) or layer.self_attn.q_proj
+            k_module = getattr(layer.self_attn, "k_norm", None) or layer.self_attn.k_proj
             specs = [
-                (f"layers.{layer_idx}.q", layer.self_attn.q_norm, "output"),
-                (f"layers.{layer_idx}.k", layer.self_attn.k_norm, "output"),
+                (f"layers.{layer_idx}.q", q_module, "output"),
+                (f"layers.{layer_idx}.k", k_module, "output"),
                 (f"layers.{layer_idx}.v", layer.self_attn.v_proj, "output"),
                 (f"layers.{layer_idx}.z", layer.self_attn.o_proj, "input0"),
+                # NNsight requires accesses in actual forward-pass order.
+                (f"layers.{layer_idx}.resid_mid", layer.post_attention_layernorm, "input0"),
                 (f"layers.{layer_idx}.mlp_in", layer.post_attention_layernorm, "output"),
                 (f"layers.{layer_idx}.mlp_out", layer.mlp, "output"),
-                (f"layers.{layer_idx}.resid_mid", layer.post_attention_layernorm, "input0"),
             ]
             targets.extend(specs)
             names.extend(name for name, _, _ in specs)

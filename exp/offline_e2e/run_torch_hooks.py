@@ -83,16 +83,19 @@ class TorchHookCollector:
 
     def _register_internal_hooks(self) -> None:
         for layer_idx, layer in enumerate(self.model.model.layers):
+            q_module = getattr(layer.self_attn, "q_norm", None) or layer.self_attn.q_proj
+            k_module = getattr(layer.self_attn, "k_norm", None) or layer.self_attn.k_proj
+
             self.hook_names.append(f"layers.{layer_idx}.q")
             self.handles.append(
-                layer.self_attn.q_norm.register_forward_hook(
+                q_module.register_forward_hook(
                     lambda _module, _args, output: self._materialize(output)
                 )
             )
 
             self.hook_names.append(f"layers.{layer_idx}.k")
             self.handles.append(
-                layer.self_attn.k_norm.register_forward_hook(
+                k_module.register_forward_hook(
                     lambda _module, _args, output: self._materialize(output)
                 )
             )
