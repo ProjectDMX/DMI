@@ -91,6 +91,13 @@ def _run_batch_manual(
             dtype=model.dtype,
         )
         cache_position = torch.arange(prompt_width, device=device, dtype=torch.long)
+        # Pre-allocate fixed-size attention mask to avoid dynamic shapes
+        # that would force a new CUDA graph per decode step.
+        fixed_attention_mask = torch.zeros(
+            (batch_size, max_cache_len), device=device, dtype=attention_mask.dtype,
+        )
+        fixed_attention_mask[:, :prompt_width] = attention_mask
+        full_attention_mask = fixed_attention_mask
 
         def _decode_step(
             decode_input_ids: torch.Tensor,
@@ -121,7 +128,8 @@ def _run_batch_manual(
         'return_dict': True,
     }
     if wants_position_ids:
-        prefill_kwargs['position_ids'] = _position_ids_from_attention_mask(full_attention_mask)
+        prefill_pos = _position_ids_from_attention_mask(full_attention_mask)
+        prefill_kwargs['position_ids'] = prefill_pos[:, :prompt_width]
     if compile_enabled:
         prefill_kwargs['past_key_values'] = static_cache
         prefill_kwargs['cache_position'] = cache_position
@@ -144,10 +152,14 @@ def _run_batch_manual(
             next_tokens,
             torch.full_like(next_tokens, int(pad_token_id)),
         )
-        full_attention_mask = torch.cat(
-            [full_attention_mask, torch.ones((batch_size, 1), device=device, dtype=full_attention_mask.dtype)],
-            dim=1,
-        )
+        if compile_enabled:
+            # In-place update: fixed-size mask avoids shape change per step.
+            full_attention_mask[:, prompt_width + decode_index] = 1
+        else:
+            full_attention_mask = torch.cat(
+                [full_attention_mask, torch.ones((batch_size, 1), device=device, dtype=full_attention_mask.dtype)],
+                dim=1,
+            )
 
         if compile_enabled:
             cache_position = cache_position[-1:] + 1
