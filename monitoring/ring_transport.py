@@ -43,6 +43,10 @@ HOOK_TYPE_LN2         = 11
 HOOK_TYPE_MLP_IN      = 12
 HOOK_TYPE_MLP_OUT     = 13
 HOOK_TYPE_RESID_POST  = 14
+# Global residual stream right before final layer norm.
+# Reuse the same ring hook-type id as resid_post since the tensor shape and
+# slicing semantics are identical; it only differs by layer_no = -1.
+HOOK_TYPE_RESID_FINAL = HOOK_TYPE_RESID_POST
 HOOK_TYPE_EMBED       = 15
 HOOK_TYPE_POS_EMBED   = 16
 HOOK_TYPE_FINAL_LN    = 17
@@ -110,6 +114,7 @@ _HOOK_TYPE_BY_NAME: Dict[str, int] = {
     "mlp_in":      HOOK_TYPE_MLP_IN,
     "mlp_out":     HOOK_TYPE_MLP_OUT,
     "resid_post":  HOOK_TYPE_RESID_POST,
+    "resid_final": HOOK_TYPE_RESID_FINAL,
     "embed":       HOOK_TYPE_EMBED,
     "pos_embed":   HOOK_TYPE_POS_EMBED,
     "final_ln":    HOOK_TYPE_FINAL_LN,
@@ -189,6 +194,7 @@ _HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {
     "hook_mlp_in":      HOOK_TYPE_MLP_IN,
     "hook_mlp_out":     HOOK_TYPE_MLP_OUT,
     "hook_resid_post":  HOOK_TYPE_RESID_POST,
+    "hook_resid_final": HOOK_TYPE_RESID_FINAL,
     "hook_embed":       HOOK_TYPE_EMBED,
     "hook_pos_embed":   HOOK_TYPE_POS_EMBED,
     "hook_final_ln":    HOOK_TYPE_FINAL_LN,
