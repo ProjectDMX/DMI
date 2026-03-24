@@ -8,7 +8,7 @@ cd "${REPO_ROOT}"
 MODEL="qwen3-1.7b"
 DATASETS="sharegpt,wildchat"
 SAMPLE_IDS="1"
-BASELINES="hf_upper_bound,hf_monitor,proj_dmi"
+BASELINES="hf_upper_bound,hf_monitor,proj_dmi,nnsight"
 BATCH_SIZES="16"
 REPEATS=1
 MAX_NEW_TOKENS=0
@@ -131,6 +131,14 @@ for dataset in "${DATASET_LIST[@]}"; do
                 --proj-dmi-mode "${PROJ_DMI_MODE}" \
                 "${shared_args[@]}" \
                 "${PROJ_DMI_ARGS[@]}" \
+                "${EXTRA_ARGS[@]}"
+              ;;
+            nnsight)
+              python exp/offline_e2e/run_nnsight.py \
+                --sample-file "${sample_file}" \
+                --batch-size "${batch_size}" \
+                --repeat-index "${repeat_index}" \
+                "${shared_args[@]}" \
                 "${EXTRA_ARGS[@]}"
               ;;
             *)
