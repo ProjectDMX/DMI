@@ -1,11 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=sweep-llama31-hooks
+#SBATCH --job-name=retry-dmi-hooks
 #SBATCH --partition=gpu-h100
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --time=24:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=slurm-%j.out
+#SBATCH --exclusive
 
 set -uo pipefail
 
@@ -38,9 +39,6 @@ echo "Python: $(python --version 2>&1)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo "============================================================"
 
-MODELS=("llama3.1-8b")
-DATASETS=("sharegpt" "wildchat")
-BATCHES=(16 32 64)
 LIMIT=128
 PAD_BUCKETS="64,128,256,512"
 SAMPLE_FILE_SHAREGPT="../../benchmark/data/offline_e2e/sharegpt_500_sample1.jsonl"
@@ -55,13 +53,11 @@ HOOK_TAG="${HOOK_SELECTION//,/__}"
 HOOK_TAG="${HOOK_TAG// /}"
 HOOK_LABEL="internal_hooks:${HOOK_SELECTION}"
 
-RUN_TAG="$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
-RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/full_sweep_llama31_8b_${HOOK_TAG}_${RUN_TAG}"
+# Write into the ORIGINAL results dir from job 18689016
+RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/full_sweep_q__k__v__z__mlp_in__mlp_out__resid_mid_20260324_150039_18689016"
 LOG_DIR="${RESULTS_DIR}/logs"
 SUMMARY_CSV="${RESULTS_DIR}/summary.csv"
-mkdir -p "${RESULTS_DIR}" "${LOG_DIR}"
-
-echo "model,dataset,batch_size,baseline,capture_mode,hook_label,status,ring_mb,target_tok_s,compute_tok_s,log_file" > "${SUMMARY_CSV}"
+mkdir -p "${LOG_DIR}"
 
 LOCAL_NVME_HF="/tmp/${USER}_hf_cache_${SLURM_JOB_ID}"
 LOCAL_HF="${LOCAL_NVME_HF}"
@@ -128,12 +124,6 @@ prepare_model_cache() {
         qwen3-14b)
             copy_model "models--Qwen--Qwen3-14B"
             ;;
-        qwen3-1.7b)
-            copy_model "models--Qwen--Qwen3-1.7B"
-            ;;
-        llama3.1-8b)
-            copy_model "models--meta-llama--Llama-3.1-8B-Instruct"
-            ;;
         *)
             echo "Unknown model '${model}', falling back to scratch HF cache"
             LOCAL_HF="${SCRATCH}/hf_cache"
@@ -165,44 +155,6 @@ cleanup_gpu() {
     echo "--- GPU cleanup ---"
     python -c "import gc, torch; gc.collect(); torch.cuda.empty_cache()" || true
     sleep 5
-}
-
-run_baseline_allow_fail() {
-    local model="$1"
-    local dataset="$2"
-    local bs="$3"
-    local baseline="$4"
-    shift 4
-
-    local safe_label="${baseline// /_}"
-    safe_label="${safe_label//\//_}"
-    local log_file="${LOG_DIR}/${model}__${dataset}__bs${bs}__${HOOK_TAG}__${safe_label}.log"
-    local status="FAIL"
-    local target_toks=""
-    local compute_toks=""
-
-    echo ""
-    echo "=== ${baseline} | model=${model} dataset=${dataset} bs=${bs} hooks=${HOOK_SELECTION} ==="
-
-    if "$@" >"${log_file}" 2>&1; then
-        cat "${log_file}"
-        target_toks=$(grep -oP 'target_tok/s=\K[0-9.]+' "${log_file}" | tail -1 || true)
-        compute_toks=$(grep -oP 'compute_tok/s=\K[0-9.]+' "${log_file}" | tail -1 || true)
-        status="OK"
-    else
-        cat "${log_file}"
-        if is_oom_log "${log_file}"; then
-            status="OOM_SKIP"
-            echo "Skipping baseline after OOM: ${baseline}"
-        else
-            status="FAIL_SKIP"
-            echo "Skipping baseline after failure: ${baseline}"
-        fi
-    fi
-
-    append_summary "${model}" "${dataset}" "${bs}" "${baseline}" "${status}" "" "${target_toks}" "${compute_toks}" "${log_file}"
-    cleanup_gpu
-    return 0
 }
 
 estimate_proj_dmi_ring_mb() {
@@ -309,70 +261,53 @@ run_proj_dmi_with_retries() {
     return 0
 }
 
+# ---- Only retry the 10 failed proj_dmi_compile configs from job 18689016 ----
+
 echo ""
-echo "Planned matrix:"
-echo "  models   : ${MODELS[*]}"
-echo "  datasets : ${DATASETS[*]}"
-echo "  batches  : ${BATCHES[*]}"
-echo "  limit    : ${LIMIT}"
-echo "  capture  : ${CAPTURE_MODE}"
-echo "  hooks    : ${HOOK_SELECTION}"
-echo "  results  : ${RESULTS_DIR}"
-echo ""
-echo "Total configs: 1 model x 2 datasets x 3 batch sizes = 6"
-echo "Total baseline invocations planned: 6 x 4 = 24 (plus Proj-DMI retries)"
+echo "Retry: proj_dmi_compile for internal hooks (10 failed configs)"
+echo "Results appended to: ${RESULTS_DIR}"
 echo ""
 
-for model in "${MODELS[@]}"; do
-    prepare_model_cache "${model}"
+run_config() {
+    local model="$1"
+    local dataset="$2"
+    local bs="$3"
+    local max_input="$4"
+    local max_output="$5"
+    local sample_file="$6"
 
-    for dataset in "${DATASETS[@]}"; do
-        case "${dataset}" in
-            sharegpt)
-                SAMPLE_FILE="${SAMPLE_FILE_SHAREGPT}"
-                MAX_INPUT=200
-                MAX_OUTPUT=750
-                ;;
-            wildchat)
-                SAMPLE_FILE="${SAMPLE_FILE_WILDCHAT}"
-                MAX_INPUT=250
-                MAX_OUTPUT=1000
-                ;;
-            *)
-                echo "Unknown dataset: ${dataset}"
-                exit 1
-                ;;
-        esac
+    echo ""
+    echo "############################################################"
+    echo "RETRY: model=${model} dataset=${dataset} bs=${bs} hooks=${HOOK_SELECTION}"
+    echo "############################################################"
 
-        for bs in "${BATCHES[@]}"; do
-            echo ""
-            echo "############################################################"
-            echo "Config: model=${model} dataset=${dataset} bs=${bs} input=${MAX_INPUT} output=${MAX_OUTPUT} limit=${LIMIT} hooks=${HOOK_SELECTION}"
-            echo "############################################################"
+    COMMON=(--model "${model}" --batch-size "${bs}" --sample-file "${sample_file}" --local-files-only \
+        --max-input-tokens "${max_input}" --max-new-tokens "${max_output}" --limit "${LIMIT}" \
+        --pad-buckets "${PAD_BUCKETS}" --results-dir "${RESULTS_DIR}" --capture-mode "${CAPTURE_MODE}")
 
-            COMMON=(--model "${model}" --batch-size "${bs}" --sample-file "${SAMPLE_FILE}" --local-files-only \
-                --max-input-tokens "${MAX_INPUT}" --max-new-tokens "${MAX_OUTPUT}" --limit "${LIMIT}" \
-                --pad-buckets "${PAD_BUCKETS}" --results-dir "${RESULTS_DIR}" --capture-mode "${CAPTURE_MODE}")
+    run_proj_dmi_with_retries "${model}" "${dataset}" "${bs}" "proj_dmi_compile" "${max_input}" "${max_output}" \
+        python run_proj_dmi.py "${COMMON[@]}" --hook-selection "${HOOK_SELECTION}"
+}
 
-            run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "hf_upper_bound_compile" \
-                python run_hf_upper_bound.py "${COMMON[@]}"
+# qwen3-4b (4 configs)
+prepare_model_cache "qwen3-4b"
+run_config "qwen3-4b" "sharegpt" 64  200 750  "${SAMPLE_FILE_SHAREGPT}"
+run_config "qwen3-4b" "wildchat" 16  250 1000 "${SAMPLE_FILE_WILDCHAT}"
+run_config "qwen3-4b" "wildchat" 32  250 1000 "${SAMPLE_FILE_WILDCHAT}"
+run_config "qwen3-4b" "wildchat" 64  250 1000 "${SAMPLE_FILE_WILDCHAT}"
 
-            run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "torch_hooks_eager" \
-                python run_torch_hooks.py "${COMMON[@]}" --hook-selection "${HOOK_SELECTION}" --disable-compile
-
-            run_baseline_allow_fail "${model}" "${dataset}" "${bs}" "nnsight_eager" \
-                python run_nnsight.py "${COMMON[@]}" --hook-selection "${HOOK_SELECTION}" --disable-compile
-
-            run_proj_dmi_with_retries "${model}" "${dataset}" "${bs}" "proj_dmi_compile" "${MAX_INPUT}" "${MAX_OUTPUT}" \
-                python run_proj_dmi.py "${COMMON[@]}" --hook-selection "${HOOK_SELECTION}"
-        done
-    done
-done
+# qwen3-14b (6 configs)
+prepare_model_cache "qwen3-14b"
+run_config "qwen3-14b" "sharegpt" 16  200 750  "${SAMPLE_FILE_SHAREGPT}"
+run_config "qwen3-14b" "sharegpt" 32  200 750  "${SAMPLE_FILE_SHAREGPT}"
+run_config "qwen3-14b" "sharegpt" 64  200 750  "${SAMPLE_FILE_SHAREGPT}"
+run_config "qwen3-14b" "wildchat" 16  250 1000 "${SAMPLE_FILE_WILDCHAT}"
+run_config "qwen3-14b" "wildchat" 32  250 1000 "${SAMPLE_FILE_WILDCHAT}"
+run_config "qwen3-14b" "wildchat" 64  250 1000 "${SAMPLE_FILE_WILDCHAT}"
 
 echo ""
 echo "============================================================"
-echo "Full internal-hooks sweep done at $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Retry done at $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Results dir: ${RESULTS_DIR}"
 echo "Summary CSV: ${SUMMARY_CSV}"
-echo "Hook label : ${HOOK_LABEL}"
 echo "============================================================"

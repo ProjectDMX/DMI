@@ -103,10 +103,15 @@ def _run_batch(
     encoded: dict[str, torch.Tensor],
     batch_max_new_tokens: int,
 ) -> None:
+    step_tensors = None
     with model.generate(encoded, max_new_tokens=batch_max_new_tokens, do_sample=False) as tracer:
         step_tensors = list().save()
         for _ in tracer.iter[:]:
             step_tensors.append(tuple(_save_target(module, kind) for _name, module, kind in targets))
+
+    if step_tensors is None:
+        print("[nnsight] WARNING: tracer context did not produce step_tensors (generation may have been empty).", flush=True)
+        return
 
     for step in step_tensors:
         for tensor in step:
