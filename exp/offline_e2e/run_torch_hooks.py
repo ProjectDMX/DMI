@@ -47,6 +47,25 @@ def _forward_accepts_position_ids(model: Any) -> bool:
     return "position_ids" in inspect.signature(model.forward).parameters
 
 
+def _needs_hooked_attention_model(hook_selection: str) -> bool:
+    parts = {chunk.strip() for chunk in str(hook_selection).split(",") if chunk.strip()}
+    return bool({"attn_scores", "pattern"} & parts)
+
+
+def _load_model_for_hook_selection(model_id: str, *, local_files_only: bool, hook_selection: str):
+    if _needs_hooked_attention_model(hook_selection):
+        from run_proj_dmi import _load_hooked_model
+
+        return _load_hooked_model(model_id, local_files_only=local_files_only)
+
+    return AutoModelForCausalLM.from_pretrained(
+        model_id,
+        attn_implementation="eager",
+        torch_dtype=torch.float16,
+        local_files_only=local_files_only,
+    )
+
+
 class TorchHookCollector:
     def __init__(self, model: Any, hook_selection: str):
         self.model = model
@@ -393,11 +412,10 @@ def main() -> None:
         enabled=not args.no_sort_by_length,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model = _load_model_for_hook_selection(
         model_id,
-        attn_implementation="eager",
-        torch_dtype=torch.float16,
         local_files_only=args.local_files_only,
+        hook_selection=hook_selection,
     )
     model.to(device).eval()
     collector = TorchHookCollector(model, hook_selection=hook_selection)

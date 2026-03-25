@@ -318,6 +318,18 @@ def _close_proj_dmi(model: Any, engine: Any) -> None:
         pass
 
 
+def _load_torch_hook_model(model_id: str, *, local_files_only: bool, hook_selection: str):
+    from run_torch_hooks import _load_model_for_hook_selection
+
+    model = _load_model_for_hook_selection(
+        model_id,
+        local_files_only=local_files_only,
+        hook_selection=hook_selection,
+    )
+    model.to(torch.device("cuda")).eval()
+    return model
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prefill-only backpressure experiment runner.")
     parser.add_argument("--baseline", choices=["hf_native", "torch_hooks", "nnsight", "proj_dmi"], required=True)
@@ -401,15 +413,11 @@ def main() -> None:
         model.to(device).eval()
         extra["hook_set"] = "none"
     elif args.baseline == "torch_hooks":
-        from transformers import AutoModelForCausalLM
-
-        model = AutoModelForCausalLM.from_pretrained(
+        model = _load_torch_hook_model(
             model_id,
-            attn_implementation="eager",
-            torch_dtype=torch.float16,
             local_files_only=bool(args.local_files_only),
+            hook_selection=str(args.hook_selection),
         )
-        model.to(device).eval()
         from run_torch_hooks import TorchHookCollector
 
         collector = TorchHookCollector(model, hook_selection=str(args.hook_selection))
