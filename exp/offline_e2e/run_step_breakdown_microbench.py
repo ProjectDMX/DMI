@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import inspect
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Sequence, Tuple
+
+import torch
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+for _path in (SCRIPT_DIR, PROJECT_ROOT, PROJECT_ROOT / "transformers" / "src"):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
+
+from common import (
+    DEFAULT_RESULTS_DIR,
+    build_tokenizer,
+    device_sync,
+    ensure_dir,
+    make_output_path,
+    resolve_model_id,
+    write_json,
+)
+from run_nnsight import _collect_targets as _nnsight_collect_targets
+from run_nnsight import _save_target as _nnsight_save_target
+from run_proj_dmi import _NullHostEngine, _build_db_host_cfg, _build_ring_cfg, _load_hooked_model
+from run_torch_hooks import TorchHookCollector, _load_model_for_hook_selection
+
+
+HS_LOGITS_HOOK_SELECTION = "hidden-states,final_ln,logits"
+
+
+def _position_ids_from_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    position_ids = attention_mask.long().cumsum(dim=-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 0)
+    return position_ids
+
+
+def _forward_accepts_position_ids(model: Any) -> bool:
+    return "position_ids" in inspect.signature(model.forward).parameters
+
+
+def _make_synthetic_batch(
+    tokenizer: Any,
+    *,
+    batch_size: int,
+    prefill_tokens: int,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    fill_token_id = int(
+        tokenizer.eos_token_id
+        if getattr(tokenizer, "eos_token_id", None) is not None
+        else tokenizer.pad_token_id
+    )
+    input_ids = torch.full((batch_size, prefill_tokens), fill_token_id, dtype=torch.long, device=device)
+    attention_mask = torch.ones((batch_size, prefill_tokens), dtype=torch.long, device=device)
+    return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
+def _copy_hf_outputs_to_cpu(outputs: Any) -> None:
+    logits = getattr(outputs, "logits", None)
+    if isinstance(logits, torch.Tensor):
+        _ = logits.detach().cpu().shape
+    hidden_states = getattr(outputs, "hidden_states", None)
+    if hidden_states:
+        for hidden in hidden_states:
+            if isinstance(hidden, torch.Tensor):
+                _ = hidden.detach().cpu().shape
+
+
+def _hf_forward_kwargs(
+    *,
+    model: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    past_key_values: Any = None,
+    use_cache: bool = True,
+    output_hidden_states: bool = False,
+) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "use_cache": use_cache,
+        "return_dict": True,
+        "output_hidden_states": output_hidden_states,
+        "output_attentions": False,
+        "logits_to_keep": 1,
+    }
+    if _forward_accepts_position_ids(model):
+        kwargs["position_ids"] = _position_ids_from_attention_mask(attention_mask)
+        if input_ids.shape[1] == 1:
+            kwargs["position_ids"] = kwargs["position_ids"][:, -1:].contiguous()
+    if past_key_values is None:
+        kwargs.pop("past_key_values")
+    return kwargs
+
+
+def _measure_hf_ideal_prefill(model: Any, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    device_sync(encoded["input_ids"].device)
+    t0 = time.perf_counter()
+    outputs = model(**_hf_forward_kwargs(model=model, **encoded, use_cache=True, output_hidden_states=False))
+    _ = outputs.logits.shape
+    device_sync(encoded["input_ids"].device)
+    t1 = time.perf_counter()
+    return (t1 - t0) * 1000.0, (t1 - t0) * 1000.0
+
+
+def _measure_hf_ideal_prefill_decode(model: Any, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    device = encoded["input_ids"].device
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded["attention_mask"]
+    device_sync(device)
+    t0 = time.perf_counter()
+    prefill_outputs = model(**_hf_forward_kwargs(model=model, input_ids=input_ids, attention_mask=attention_mask, use_cache=True))
+    next_tokens = prefill_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    decode_mask = torch.cat(
+        [attention_mask, torch.ones((attention_mask.shape[0], 1), device=device, dtype=attention_mask.dtype)],
+        dim=1,
+    )
+    decode_outputs = model(
+        **_hf_forward_kwargs(
+            model=model,
+            input_ids=next_tokens,
+            attention_mask=decode_mask,
+            past_key_values=prefill_outputs.past_key_values,
+            use_cache=True,
+            output_hidden_states=False,
+        )
+    )
+    _ = decode_outputs.logits.shape
+    device_sync(device)
+    t1 = time.perf_counter()
+    return (t1 - t0) * 1000.0, (t1 - t0) * 1000.0
+
+
+def _measure_hf_api_prefill(model: Any, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    device = encoded["input_ids"].device
+    device_sync(device)
+    t0 = time.perf_counter()
+    outputs = model(**_hf_forward_kwargs(model=model, **encoded, use_cache=True, output_hidden_states=True))
+    device_sync(device)
+    t_compute = time.perf_counter()
+    _copy_hf_outputs_to_cpu(outputs)
+    device_sync(device)
+    t_end = time.perf_counter()
+    return (t_compute - t0) * 1000.0, (t_end - t0) * 1000.0
+
+
+def _measure_hf_api_prefill_decode(model: Any, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    device = encoded["input_ids"].device
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded["attention_mask"]
+    device_sync(device)
+    t0 = time.perf_counter()
+    prefill_outputs = model(**_hf_forward_kwargs(model=model, input_ids=input_ids, attention_mask=attention_mask, use_cache=True, output_hidden_states=True))
+    next_tokens = prefill_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    decode_mask = torch.cat(
+        [attention_mask, torch.ones((attention_mask.shape[0], 1), device=device, dtype=attention_mask.dtype)],
+        dim=1,
+    )
+    decode_outputs = model(
+        **_hf_forward_kwargs(
+            model=model,
+            input_ids=next_tokens,
+            attention_mask=decode_mask,
+            past_key_values=prefill_outputs.past_key_values,
+            use_cache=True,
+            output_hidden_states=True,
+        )
+    )
+    device_sync(device)
+    t_compute = time.perf_counter()
+    _copy_hf_outputs_to_cpu(prefill_outputs)
+    _copy_hf_outputs_to_cpu(decode_outputs)
+    device_sync(device)
+    t_end = time.perf_counter()
+    return (t_compute - t0) * 1000.0, (t_end - t0) * 1000.0
+
+
+def _measure_torch_hooks_prefill(model: Any, collector: TorchHookCollector, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    device = encoded["input_ids"].device
+    device_sync(device)
+    t0 = time.perf_counter()
+    collector.begin()
+    outputs = model(**_hf_forward_kwargs(model=model, **encoded, use_cache=True, output_hidden_states=False))
+    collector.end()
+    _ = outputs.logits.shape
+    device_sync(device)
+    t1 = time.perf_counter()
+    total_ms = (t1 - t0) * 1000.0
+    return total_ms, total_ms
+
+
+def _measure_torch_hooks_prefill_decode(model: Any, collector: TorchHookCollector, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    device = encoded["input_ids"].device
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded["attention_mask"]
+    device_sync(device)
+    t0 = time.perf_counter()
+    collector.begin()
+    prefill_outputs = model(**_hf_forward_kwargs(model=model, input_ids=input_ids, attention_mask=attention_mask, use_cache=True, output_hidden_states=False))
+    collector.end()
+    next_tokens = prefill_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    decode_mask = torch.cat(
+        [attention_mask, torch.ones((attention_mask.shape[0], 1), device=device, dtype=attention_mask.dtype)],
+        dim=1,
+    )
+    collector.begin()
+    decode_outputs = model(
+        **_hf_forward_kwargs(
+            model=model,
+            input_ids=next_tokens,
+            attention_mask=decode_mask,
+            past_key_values=prefill_outputs.past_key_values,
+            use_cache=True,
+            output_hidden_states=False,
+        )
+    )
+    collector.end()
+    _ = decode_outputs.logits.shape
+    device_sync(device)
+    t1 = time.perf_counter()
+    total_ms = (t1 - t0) * 1000.0
+    return total_ms, total_ms
+
+
+def _measure_nnsight_prefill(model: Any, targets: list[tuple[str, Any, str]], encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    device_sync(torch.device("cuda"))
+    t0 = time.perf_counter()
+    captured = None
+    with model.trace(encoded, use_cache=True, return_dict=True, logits_to_keep=1):
+        captured = tuple(_nnsight_save_target(module, kind) for _name, module, kind in targets)
+    for tensor in captured or ():
+        _ = tensor.shape
+    device_sync(torch.device("cuda"))
+    t1 = time.perf_counter()
+    total_ms = (t1 - t0) * 1000.0
+    return total_ms, total_ms
+
+
+def _measure_nnsight_prefill_decode(model: Any, targets: list[tuple[str, Any, str]], encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    device_sync(torch.device("cuda"))
+    t0 = time.perf_counter()
+    step_tensors = None
+    with model.generate(encoded, max_new_tokens=1, do_sample=False) as tracer:
+        step_tensors = list().save()
+        for _ in tracer.iter[:]:
+            step_tensors.append(tuple(_nnsight_save_target(module, kind) for _name, module, kind in targets))
+    for step in step_tensors or ():
+        for tensor in step:
+            _ = tensor.shape
+    device_sync(torch.device("cuda"))
+    t1 = time.perf_counter()
+    total_ms = (t1 - t0) * 1000.0
+    return total_ms, total_ms
+
+
+def _setup_proj_dmi_microbench(
+    *,
+    model_id: str,
+    local_files_only: bool,
+    proj_dmi_mode: str,
+    hook_selection: str,
+    args: argparse.Namespace,
+) -> tuple[Any, Any]:
+    from monitoring import AdvanceConfig, MonitoringConfig, MonitoringEngine, NativePartialSealConfig
+    from monitoring.config import CaptureSchedule, HookSelection
+    from monitoring.generate import _install_monitoring_forward, _uninstall_monitoring_forward
+    from monitoring import ring_transport
+
+    mon_cfg = MonitoringConfig(
+        hooks=HookSelection(mode="full"),
+        schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
+        native_partial_seal=NativePartialSealConfig(
+            enabled=True,
+            chunk_bytes=256 * 1024,
+            cap_enabled=True,
+            cap_ratio=0.8,
+            driver_guard_mb=1024,
+        ),
+        advance=AdvanceConfig(),
+    )
+
+    if proj_dmi_mode == "ring_db":
+        engine = MonitoringEngine(
+            async_enabled=True,
+            config=mon_cfg,
+            model_id=model_id,
+            db_config=_build_db_host_cfg(args),
+        )
+    else:
+        engine = MonitoringEngine(
+            async_enabled=True,
+            config=mon_cfg,
+            model_id=model_id,
+            host_engine=_NullHostEngine(),
+        )
+
+    engine.enable_ring_transport(_build_ring_cfg(args))
+    model = _load_hooked_model(model_id, local_files_only=local_files_only)
+    model.to(torch.device("cuda")).eval()
+    model.monitoring_engine = engine
+    engine.prepare_for_model(model)
+
+    transport = ring_transport.get_active()
+    if transport is None:
+        raise RuntimeError("ring transport was not activated")
+    transport._hook_selection = hook_selection
+    _install_monitoring_forward(model)
+    model._microbench_uninstall_monitoring_forward = _uninstall_monitoring_forward
+    return model, engine
+
+
+def _close_proj_dmi_microbench(model: Any, engine: Any) -> None:
+    uninstall = getattr(model, "_microbench_uninstall_monitoring_forward", None)
+    if uninstall is not None:
+        try:
+            uninstall(model)
+        except Exception:
+            pass
+    try:
+        engine.close()
+    except Exception:
+        pass
+
+
+def _prepare_ring_forward(
+    *,
+    model: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    past_key_values: Any = None,
+    cache_position: Any = None,
+    logits_to_keep: int = 1,
+) -> None:
+    from monitoring import ring_transport
+
+    engine = getattr(model, "monitoring_engine", None)
+    transport = ring_transport.get_active()
+    if engine is None or transport is None or not getattr(engine, "_using_ring_transport", False):
+        return
+    if not transport._using_forward_hooks:
+        return
+
+    engine._prepare_ring_step(input_ids, attention_mask, past_key_values, cache_position=cache_position)
+
+    batch = int(input_ids.shape[0])
+    q_len = int(input_ids.shape[1])
+    is_static = past_key_values is not None and hasattr(past_key_values, "max_cache_len")
+    kv_dim = ring_transport._get_kv_dim(past_key_values, q_len, is_static=is_static)
+
+    hook_byte_sizes: List[int] = []
+    model_cfg = transport._model_cfg
+    if model_cfg is not None:
+        for spec in transport._active_specs:
+            shape = ring_transport._compute_hook_shape(
+                spec.hook_type,
+                model_cfg,
+                batch,
+                q_len,
+                kv_dim,
+                logits_to_keep=logits_to_keep,
+            )
+            if shape:
+                dtype = spec.dtype if spec.dtype is not None else model_cfg.dtype
+                elem_size = torch._utils._element_size(dtype)
+                nbytes = elem_size
+                for dim in shape:
+                    nbytes *= dim
+                hook_byte_sizes.append(nbytes)
+            else:
+                hook_byte_sizes.append(0)
+
+    if not transport._force_cpu_direct:
+        step_total_bytes = sum(ring_transport.align_up_py(size, 16) for size in hook_byte_sizes)
+        n_hooks = len(hook_byte_sizes)
+        result = transport._ring_engine.prepare_step(step_total_bytes, n_hooks)
+        transport.cpu_direct = (result == 2)
+
+    transport.pre_push_all_metas(batch, q_len, kv_dim, logits_to_keep=logits_to_keep)
+
+
+def _dmi_prefill_kwargs(model: Any, encoded: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "input_ids": encoded["input_ids"],
+        "attention_mask": encoded["attention_mask"],
+        "use_cache": True,
+        "return_dict": True,
+        "logits_to_keep": 1,
+    }
+    if _forward_accepts_position_ids(model):
+        kwargs["position_ids"] = _position_ids_from_attention_mask(encoded["attention_mask"])
+    return kwargs
+
+
+def _measure_dmi_prefill(model: Any, engine: Any, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    device = encoded["input_ids"].device
+    kwargs = _dmi_prefill_kwargs(model, encoded)
+    device_sync(device)
+    t0 = time.perf_counter()
+    _prepare_ring_forward(model=model, input_ids=kwargs["input_ids"], attention_mask=kwargs["attention_mask"], logits_to_keep=1)
+    outputs = model(**kwargs)
+    _ = outputs.logits.shape
+    torch.cuda.current_stream().synchronize()
+    t_compute = time.perf_counter()
+    engine.resolve_all()
+    device_sync(device)
+    t_end = time.perf_counter()
+    return (t_compute - t0) * 1000.0, (t_end - t0) * 1000.0
+
+
+def _measure_dmi_prefill_decode(model: Any, engine: Any, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    device = encoded["input_ids"].device
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded["attention_mask"]
+    device_sync(device)
+    t0 = time.perf_counter()
+
+    prefill_kwargs = _dmi_prefill_kwargs(model, encoded)
+    _prepare_ring_forward(model=model, input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=1)
+    prefill_outputs = model(**prefill_kwargs)
+
+    next_tokens = prefill_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    decode_mask = torch.cat(
+        [attention_mask, torch.ones((attention_mask.shape[0], 1), device=device, dtype=attention_mask.dtype)],
+        dim=1,
+    )
+    cache_position = torch.tensor([input_ids.shape[1]], device=device, dtype=torch.long)
+    decode_kwargs: Dict[str, Any] = {
+        "input_ids": next_tokens,
+        "attention_mask": decode_mask,
+        "past_key_values": prefill_outputs.past_key_values,
+        "cache_position": cache_position,
+        "use_cache": True,
+        "return_dict": True,
+        "logits_to_keep": 1,
+    }
+    if _forward_accepts_position_ids(model):
+        decode_kwargs["position_ids"] = _position_ids_from_attention_mask(decode_mask)[:, -1:].contiguous()
+
+    _prepare_ring_forward(
+        model=model,
+        input_ids=next_tokens,
+        attention_mask=decode_mask,
+        past_key_values=prefill_outputs.past_key_values,
+        cache_position=cache_position,
+        logits_to_keep=1,
+    )
+    decode_outputs = model(**decode_kwargs)
+    _ = decode_outputs.logits.shape
+    torch.cuda.current_stream().synchronize()
+    t_compute = time.perf_counter()
+    engine.resolve_all()
+    device_sync(device)
+    t_end = time.perf_counter()
+    return (t_compute - t0) * 1000.0, (t_end - t0) * 1000.0
+
+
+def _mean(values: Sequence[float]) -> float:
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def _derive_decode(prefill: Dict[str, float], combined: Dict[str, float]) -> Dict[str, float]:
+    compute_ms = max(0.0, float(combined["compute_ms"]) - float(prefill["compute_ms"]))
+    total_ms = max(0.0, float(combined["total_ms"]) - float(prefill["total_ms"]))
+    transfer_tail_ms = max(0.0, total_ms - compute_ms)
+    return {
+        "compute_ms": compute_ms,
+        "total_ms": total_ms,
+        "transfer_tail_ms": transfer_tail_ms,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Prefill/decode-step breakdown microbenchmark.")
+    parser.add_argument("--baseline", choices=["hf_ideal", "hf_api", "torch_hooks", "nnsight", "proj_dmi"], required=True)
+    parser.add_argument("--baseline-label", default="")
+    parser.add_argument("--model", default="qwen3-4b")
+    parser.add_argument("--batch-size", type=int, required=True)
+    parser.add_argument("--prefill-tokens", type=int, default=384)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR))
+    parser.add_argument("--repeat-index", type=int, default=1)
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--hook-selection", default=HS_LOGITS_HOOK_SELECTION)
+    parser.add_argument("--proj-dmi-mode", choices=["ring_null", "ring_db"], default="ring_null")
+    parser.add_argument("--ring-task-entries", type=int, default=65536)
+    parser.add_argument("--ring-payload-mb", type=int, default=8192)
+    parser.add_argument("--ring-pinned-mb", type=int, default=8192)
+    parser.add_argument("--drain-poll-timeout-us", type=int, default=100)
+    parser.add_argument("--drain-flush-task-ratio", type=float, default=0.0)
+    parser.add_argument("--drain-flush-payload-ratio", type=float, default=0.0)
+    parser.add_argument("--drain-flush-entry-threshold", type=int, default=0)
+    parser.add_argument("--drain-flush-byte-threshold", type=int, default=0)
+    parser.add_argument("--drain-flush-timeout-us", type=int, default=0)
+    parser.add_argument("--clone-slices", action="store_true")
+    parser.add_argument("--ch-parallelism", type=int, default=10)
+    parser.add_argument("--ch-queue-max-items", type=int, default=1024)
+    parser.add_argument("--ch-queue-max-size-mb", type=int, default=2048)
+    parser.add_argument("--db-host", default="localhost")
+    parser.add_argument("--db-port", type=int, default=9000)
+    parser.add_argument("--db-user", default="default")
+    parser.add_argument("--db-password", default="")
+    parser.add_argument("--db-database", default="default")
+    parser.add_argument("--db-table", default="offload")
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+
+    model_id = resolve_model_id(args.model)
+    tokenizer = build_tokenizer(model_id, local_files_only=bool(args.local_files_only))
+    device = torch.device("cuda")
+    encoded = _make_synthetic_batch(
+        tokenizer,
+        batch_size=int(args.batch_size),
+        prefill_tokens=int(args.prefill_tokens),
+        device=device,
+    )
+
+    baseline_label = args.baseline_label or args.baseline
+    model = None
+    collector = None
+    nnsight_targets = None
+    nnsight_target_names = None
+    engine = None
+
+    if args.baseline == "hf_ideal":
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            attn_implementation="eager",
+            torch_dtype=torch.float16,
+            local_files_only=bool(args.local_files_only),
+        ).to(device).eval()
+    elif args.baseline == "hf_api":
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            attn_implementation="eager",
+            torch_dtype=torch.float16,
+            local_files_only=bool(args.local_files_only),
+        ).to(device).eval()
+    elif args.baseline == "torch_hooks":
+        model = _load_model_for_hook_selection(
+            model_id,
+            local_files_only=bool(args.local_files_only),
+            hook_selection=str(args.hook_selection),
+        ).to(device).eval()
+        collector = TorchHookCollector(model, hook_selection=str(args.hook_selection))
+    elif args.baseline == "nnsight":
+        from nnsight import LanguageModel
+
+        model = LanguageModel(
+            model_id,
+            tokenizer=tokenizer,
+            device_map="cuda:0",
+            dispatch=True,
+            torch_dtype="float16",
+            attn_implementation="eager",
+            local_files_only=bool(args.local_files_only),
+        )
+        nnsight_targets, nnsight_target_names = _nnsight_collect_targets(model, str(args.hook_selection))
+    else:
+        model, engine = _setup_proj_dmi_microbench(
+            model_id=model_id,
+            local_files_only=bool(args.local_files_only),
+            proj_dmi_mode=str(args.proj_dmi_mode),
+            hook_selection=str(args.hook_selection),
+            args=args,
+        )
+
+    try:
+        for _ in range(int(args.warmup)):
+            if args.baseline == "hf_ideal":
+                _measure_hf_ideal_prefill(model, encoded)
+                _measure_hf_ideal_prefill_decode(model, encoded)
+            elif args.baseline == "hf_api":
+                _measure_hf_api_prefill(model, encoded)
+                _measure_hf_api_prefill_decode(model, encoded)
+            elif args.baseline == "torch_hooks":
+                _measure_torch_hooks_prefill(model, collector, encoded)
+                _measure_torch_hooks_prefill_decode(model, collector, encoded)
+            elif args.baseline == "nnsight":
+                _measure_nnsight_prefill(model, nnsight_targets, encoded)
+                _measure_nnsight_prefill_decode(model, nnsight_targets, encoded)
+            else:
+                _measure_dmi_prefill(model, engine, encoded)
+                _measure_dmi_prefill_decode(model, engine, encoded)
+            device_sync(device)
+        print(f"Warmup done ({int(args.warmup)} iterations).", flush=True)
+
+        prefill_compute_runs: List[float] = []
+        prefill_total_runs: List[float] = []
+        combined_compute_runs: List[float] = []
+        combined_total_runs: List[float] = []
+
+        with torch.no_grad():
+            for _ in range(int(args.iters)):
+                if args.baseline == "hf_ideal":
+                    prefill_compute_ms, prefill_total_ms = _measure_hf_ideal_prefill(model, encoded)
+                    combined_compute_ms, combined_total_ms = _measure_hf_ideal_prefill_decode(model, encoded)
+                elif args.baseline == "hf_api":
+                    prefill_compute_ms, prefill_total_ms = _measure_hf_api_prefill(model, encoded)
+                    combined_compute_ms, combined_total_ms = _measure_hf_api_prefill_decode(model, encoded)
+                elif args.baseline == "torch_hooks":
+                    prefill_compute_ms, prefill_total_ms = _measure_torch_hooks_prefill(model, collector, encoded)
+                    combined_compute_ms, combined_total_ms = _measure_torch_hooks_prefill_decode(model, collector, encoded)
+                elif args.baseline == "nnsight":
+                    prefill_compute_ms, prefill_total_ms = _measure_nnsight_prefill(model, nnsight_targets, encoded)
+                    combined_compute_ms, combined_total_ms = _measure_nnsight_prefill_decode(model, nnsight_targets, encoded)
+                else:
+                    prefill_compute_ms, prefill_total_ms = _measure_dmi_prefill(model, engine, encoded)
+                    combined_compute_ms, combined_total_ms = _measure_dmi_prefill_decode(model, engine, encoded)
+
+                prefill_compute_runs.append(prefill_compute_ms)
+                prefill_total_runs.append(prefill_total_ms)
+                combined_compute_runs.append(combined_compute_ms)
+                combined_total_runs.append(combined_total_ms)
+
+        prefill_summary = {
+            "compute_ms": _mean(prefill_compute_runs),
+            "total_ms": _mean(prefill_total_runs),
+        }
+        prefill_summary["transfer_tail_ms"] = max(0.0, prefill_summary["total_ms"] - prefill_summary["compute_ms"])
+
+        combined_summary = {
+            "compute_ms": _mean(combined_compute_runs),
+            "total_ms": _mean(combined_total_runs),
+        }
+        combined_summary["transfer_tail_ms"] = max(0.0, combined_summary["total_ms"] - combined_summary["compute_ms"])
+        decode_summary = _derive_decode(prefill_summary, combined_summary)
+
+        payload = {
+            "baseline": str(args.baseline),
+            "baseline_label": baseline_label,
+            "model": str(args.model),
+            "model_id": model_id,
+            "batch_size": int(args.batch_size),
+            "prefill_tokens": int(args.prefill_tokens),
+            "warmup": int(args.warmup),
+            "iters": int(args.iters),
+            "hook_selection": str(args.hook_selection),
+            "repeat_index": int(args.repeat_index),
+            "measurement_kind": "prefill_decode_step_breakdown",
+            "prefill": {
+                **prefill_summary,
+                "compute_runs_ms": [float(v) for v in prefill_compute_runs],
+                "total_runs_ms": [float(v) for v in prefill_total_runs],
+            },
+            "prefill_plus_decode1": {
+                **combined_summary,
+                "compute_runs_ms": [float(v) for v in combined_compute_runs],
+                "total_runs_ms": [float(v) for v in combined_total_runs],
+            },
+            "decode_1": decode_summary,
+            "hook_count": (
+                len(collector.hook_names)
+                if collector is not None
+                else (len(nnsight_target_names) if nnsight_target_names is not None else None)
+            ),
+            "ring_payload_mb": int(args.ring_payload_mb) if args.baseline == "proj_dmi" else None,
+            "ring_pinned_mb": int(args.ring_pinned_mb) if args.baseline == "proj_dmi" else None,
+        }
+
+        results_dir = Path(args.results_dir)
+        ensure_dir(results_dir)
+        output_path = make_output_path(
+            results_dir,
+            prefix=baseline_label,
+            model=args.model,
+            sample_name=f"synthetic_prefill_{int(args.prefill_tokens)}",
+            batch_size=int(args.batch_size),
+            repeat_index=int(args.repeat_index),
+        )
+        write_json(output_path, payload)
+        print(f"Saved {output_path}")
+        print(
+            f"[{baseline_label}] bs={int(args.batch_size)} "
+            f"prefill compute={prefill_summary['compute_ms']:.3f} total={prefill_summary['total_ms']:.3f} "
+            f"decode compute={decode_summary['compute_ms']:.3f} total={decode_summary['total_ms']:.3f}",
+            flush=True,
+        )
+    finally:
+        if collector is not None:
+            collector.close()
+        if args.baseline == "proj_dmi" and model is not None and engine is not None:
+            _close_proj_dmi_microbench(model, engine)
+
+
+if __name__ == "__main__":
+    main()
