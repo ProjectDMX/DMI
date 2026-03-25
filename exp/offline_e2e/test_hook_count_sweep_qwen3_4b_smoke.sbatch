@@ -6,7 +6,6 @@
 #SBATCH --mem=96G
 #SBATCH --time=02:00:00
 #SBATCH --output=slurm-%j.out
-#SBATCH --exclusive
 
 set -euo pipefail
 
