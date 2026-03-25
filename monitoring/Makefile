@@ -42,15 +42,15 @@ TORCH_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension impo
 
 PYTHON_INCLUDE_FLAGS := $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); includes = {paths.get('include'), paths.get('platinclude')}; print(' '.join(f'-I{p}' for p in includes if p))")
 
-CUDA_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; cuda_inc = os.path.join(CUDA_HOME, 'include') if CUDA_HOME else ''; print(f'-I{cuda_inc}' if cuda_inc and os.path.exists(cuda_inc) else '')")
+CUDA_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; dirs = [os.path.join(CUDA_HOME, d) for d in ('include', 'targets/x86_64-linux/include') if CUDA_HOME] if CUDA_HOME else []; print(' '.join(f'-I{d}' for d in dirs if os.path.isdir(d)))")
 
 TORCH_LIB_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join(f'-L{path}' for path in library_paths()))")
 
 TORCH_RPATH_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join(f'-Wl,-rpath,{path}' for path in library_paths()))")
 
-CUDA_LIB_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; print(next((f'-L{os.path.join(CUDA_HOME, c)}' for c in ('lib64','lib') if CUDA_HOME and os.path.exists(os.path.join(CUDA_HOME, c))), ''))")
+CUDA_LIB_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; dirs = [os.path.join(CUDA_HOME, d) for d in ('lib64','lib','targets/x86_64-linux/lib','lib/stubs','targets/x86_64-linux/lib/stubs')] if CUDA_HOME else []; print(' '.join(f'-L{d}' for d in dirs if os.path.isdir(d)))")
 
-CUDA_RPATH_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; print(next((f'-Wl,-rpath,{os.path.join(CUDA_HOME, c)}' for c in ('lib64','lib') if CUDA_HOME and os.path.exists(os.path.join(CUDA_HOME, c))), ''))")
+CUDA_RPATH_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; dirs = [os.path.join(CUDA_HOME, d) for d in ('lib64','lib','targets/x86_64-linux/lib')] if CUDA_HOME else []; print(' '.join(f'-Wl,-rpath,{d}' for d in dirs if os.path.isdir(d)))")
 
 ABI_FLAG := $(shell $(PYTHON) -c "import torch; print(f'-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}')")
 
