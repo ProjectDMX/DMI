@@ -2,6 +2,7 @@
 #SBATCH --job-name=sweep-llama31-hslogits
 #SBATCH --partition=gpu-h100
 #SBATCH --gres=gpu:h100:1
+#SBATCH --exclusive
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
