@@ -109,12 +109,6 @@ run_case "Smoke: torch_hooks heavy" \
     --baseline-label torch_hooks \
     --hook-selection "${HEAVY_HOOKS}"
 
-run_case "Smoke: nnsight heavy" \
-  python run_prefill_backpressure.py "${COMMON[@]}" \
-    --baseline nnsight \
-    --baseline-label nnsight \
-    --hook-selection "${HEAVY_HOOKS}"
-
 run_case "Smoke: dmi_light" \
   python run_prefill_backpressure.py "${COMMON[@]}" \
     --baseline proj_dmi \

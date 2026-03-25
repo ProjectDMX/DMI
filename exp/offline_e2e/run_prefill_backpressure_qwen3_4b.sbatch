@@ -192,12 +192,6 @@ run_allow_fail "torch_hooks" "${DMI_HEAVY_HOOKS}" \
     --baseline-label torch_hooks \
     --hook-selection "${DMI_HEAVY_HOOKS}"
 
-run_allow_fail "nnsight" "${DMI_HEAVY_HOOKS}" \
-  python run_prefill_backpressure.py "${COMMON[@]}" \
-    --baseline nnsight \
-    --baseline-label nnsight \
-    --hook-selection "${DMI_HEAVY_HOOKS}"
-
 run_allow_fail "dmi_light" "${DMI_LIGHT_HOOKS}" \
   python run_prefill_backpressure.py "${COMMON[@]}" \
     --baseline proj_dmi \
