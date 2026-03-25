@@ -43,8 +43,8 @@ MODEL="qwen3-4b"
 BATCH_SIZE=2
 PREFILL_TOKENS=16
 NUM_MICROBATCHES=4
-LIGHT_HOOKS="logits"
 HEAVY_HOOKS="q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
+LIGHT_HOOKS="${HEAVY_HOOKS}"
 RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/prefill_backpressure_smoke_$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
 mkdir -p "${RESULTS_DIR}"
 
@@ -113,8 +113,8 @@ run_case "Smoke: dmi_light" \
     --baseline-label dmi_light \
     --proj-dmi-mode ring_null \
     --hook-selection "${LIGHT_HOOKS}" \
-    --ring-payload-mb 2048 \
-    --ring-pinned-mb 2048
+    --ring-payload-mb 8192 \
+    --ring-pinned-mb 8192
 
 run_case "Smoke: dmi_heavy" \
   python run_prefill_backpressure.py "${COMMON[@]}" \

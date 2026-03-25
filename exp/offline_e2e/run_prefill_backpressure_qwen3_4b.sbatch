@@ -44,10 +44,12 @@ BATCH_SIZE=64
 PREFILL_TOKENS=64
 NUM_MICROBATCHES=32
 HF_HOOK_SET="none"
-DMI_LIGHT_HOOKS="logits"
 DMI_HEAVY_HOOKS="q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
-RING_PAYLOAD_MB=16384
-RING_PINNED_MB=16384
+DMI_LIGHT_HOOKS="${DMI_HEAVY_HOOKS}"
+LIGHT_RING_PAYLOAD_MB=49152
+LIGHT_RING_PINNED_MB=49152
+HEAVY_RING_PAYLOAD_MB=16384
+HEAVY_RING_PINNED_MB=16384
 RING_TASK_ENTRIES=65536
 
 RUN_TAG="$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
@@ -183,8 +185,8 @@ run_allow_fail "dmi_light" "${DMI_LIGHT_HOOKS}" \
     --baseline-label dmi_light \
     --proj-dmi-mode ring_db \
     --hook-selection "${DMI_LIGHT_HOOKS}" \
-    --ring-payload-mb "${RING_PAYLOAD_MB}" \
-    --ring-pinned-mb "${RING_PINNED_MB}" \
+    --ring-payload-mb "${LIGHT_RING_PAYLOAD_MB}" \
+    --ring-pinned-mb "${LIGHT_RING_PINNED_MB}" \
     --ring-task-entries "${RING_TASK_ENTRIES}"
 
 run_allow_fail "dmi_heavy" "${DMI_HEAVY_HOOKS}" \
@@ -193,8 +195,8 @@ run_allow_fail "dmi_heavy" "${DMI_HEAVY_HOOKS}" \
     --baseline-label dmi_heavy \
     --proj-dmi-mode ring_db \
     --hook-selection "${DMI_HEAVY_HOOKS}" \
-    --ring-payload-mb "${RING_PAYLOAD_MB}" \
-    --ring-pinned-mb "${RING_PINNED_MB}" \
+    --ring-payload-mb "${HEAVY_RING_PAYLOAD_MB}" \
+    --ring-pinned-mb "${HEAVY_RING_PINNED_MB}" \
     --ring-task-entries "${RING_TASK_ENTRIES}"
 
 echo ""
