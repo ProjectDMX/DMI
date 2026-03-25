@@ -132,20 +132,7 @@ run_case() {
     sleep 3
 }
 
-HOOK_1="logits"
 HOOK_325="q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
-
-run_case "Smoke: logits / hf_upper_bound_compile" \
-  python run_hf_upper_bound.py "${COMMON[@]}"
-
-run_case "Smoke: logits / torch_hooks_eager" \
-  python run_torch_hooks.py "${COMMON[@]}" --disable-compile --hook-selection "${HOOK_1}"
-
-run_case "Smoke: logits / nnsight_eager" \
-  python run_nnsight.py "${COMMON[@]}" --disable-compile --hook-selection "${HOOK_1}"
-
-run_case "Smoke: logits / proj_dmi_compile" \
-  python run_proj_dmi.py "${COMMON[@]}" --hook-selection "${HOOK_1}" --proj-dmi-mode ring_null --ring-payload-mb 5120 --ring-pinned-mb 5120 --ring-task-entries 65536
 
 run_case "Smoke: hook325 / hf_upper_bound_compile" \
   python run_hf_upper_bound.py "${COMMON[@]}"
