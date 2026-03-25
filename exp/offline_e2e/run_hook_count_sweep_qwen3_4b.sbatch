@@ -80,7 +80,7 @@ HOOK_SELECTIONS=(
     "q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
 )
 HOOK_COUNTS=(1 73 145 253 325)
-BASELINES=("hf_native_compile" "torch_hooks_eager" "nnsight_eager" "proj_dmi_compile")
+BASELINES=("hf_native_compile" "torch_hooks_eager" "proj_dmi_compile")
 
 echo "dataset,model,batch_size,hook_count,hook_selection,baseline,status,ring_mb,target_tok_s,compute_tok_s,log_file" > "${SUMMARY_CSV}"
 
@@ -330,21 +330,6 @@ for idx in "${!HOOK_SELECTIONS[@]}"; do
 
     run_baseline_allow_fail "${hook_count}" "${hook_sel}" "torch_hooks_eager" \
         python run_torch_hooks.py \
-        --model "${MODEL}" \
-        --batch-size "${BATCH_SIZE}" \
-        --sample-file "${SAMPLE_FILE}" \
-        --local-files-only \
-        --max-input-tokens "${MAX_INPUT}" \
-        --max-new-tokens "${MAX_OUTPUT}" \
-        --limit "${LIMIT}" \
-        --pad-buckets "${PAD_BUCKETS}" \
-        --capture-mode "${CAPTURE_MODE}" \
-        --results-dir "${RESULTS_DIR}" \
-        --disable-compile \
-        --hook-selection "${hook_sel}"
-
-    run_baseline_allow_fail "${hook_count}" "${hook_sel}" "nnsight_eager" \
-        python run_nnsight.py \
         --model "${MODEL}" \
         --batch-size "${BATCH_SIZE}" \
         --sample-file "${SAMPLE_FILE}" \

@@ -140,9 +140,6 @@ run_case "Smoke: hook325 / hf_upper_bound_compile" \
 run_case "Smoke: hook325 / torch_hooks_eager" \
   python run_torch_hooks.py "${COMMON[@]}" --disable-compile --hook-selection "${HOOK_325}"
 
-run_case "Smoke: hook325 / nnsight_eager" \
-  python run_nnsight.py "${COMMON[@]}" --disable-compile --hook-selection "${HOOK_325}"
-
 run_case "Smoke: hook325 / proj_dmi_compile" \
   python run_proj_dmi.py "${COMMON[@]}" --hook-selection "${HOOK_325}" --proj-dmi-mode ring_null --ring-payload-mb 5120 --ring-pinned-mb 5120 --ring-task-entries 65536
 
