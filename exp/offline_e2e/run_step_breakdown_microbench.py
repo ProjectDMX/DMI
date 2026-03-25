@@ -517,20 +517,21 @@ def main() -> None:
         model.to(device).eval()
 
     try:
-        for _ in range(int(args.warmup)):
-            if args.baseline == "hf_ideal":
-                _measure_hf_ideal_prefill(model, encoded)
-                _measure_hf_ideal_decode(model, encoded)
-            elif args.baseline == "hf_api":
-                _measure_hf_api_prefill(model, encoded)
-                _measure_hf_api_decode(model, encoded)
-            elif args.baseline == "torch_hooks":
-                _measure_torch_hooks_prefill(model, collector, encoded)
-                _measure_torch_hooks_decode(model, collector, encoded)
-            else:
-                _measure_dmi_prefill(model, model_id, args, encoded)
-                _measure_dmi_decode(model, model_id, args, encoded)
-            device_sync(device)
+        with torch.no_grad():
+            for _ in range(int(args.warmup)):
+                if args.baseline == "hf_ideal":
+                    _measure_hf_ideal_prefill(model, encoded)
+                    _measure_hf_ideal_decode(model, encoded)
+                elif args.baseline == "hf_api":
+                    _measure_hf_api_prefill(model, encoded)
+                    _measure_hf_api_decode(model, encoded)
+                elif args.baseline == "torch_hooks":
+                    _measure_torch_hooks_prefill(model, collector, encoded)
+                    _measure_torch_hooks_decode(model, collector, encoded)
+                else:
+                    _measure_dmi_prefill(model, model_id, args, encoded)
+                    _measure_dmi_decode(model, model_id, args, encoded)
+                device_sync(device)
         print(f"Warmup done ({int(args.warmup)} iterations).", flush=True)
 
         prefill_compute_runs: List[float] = []
