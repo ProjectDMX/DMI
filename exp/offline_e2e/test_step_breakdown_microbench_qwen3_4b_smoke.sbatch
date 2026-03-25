@@ -11,7 +11,11 @@ set -euo pipefail
 
 SCRATCH=/scratch/zt1/project/zaoxing-prj/user/ynn1999
 ENV_DIR=${SCRATCH}/proj-dmx
-PROJECT=${SCRATCH}/DMI/DMI
+PROJECT=${SCRATCH}/DMI
+
+if [ -d "${PROJECT}/DMI" ]; then
+    PROJECT=${PROJECT}/DMI
+fi
 
 if [ ! -d "${ENV_DIR}" ]; then
     echo "Extracting conda environment ..."
@@ -23,12 +27,18 @@ if [ ! -x "${ENV_DIR}/bin/python" ]; then
     exit 1
 fi
 
+if [ -f "${SCRATCH}/export_env.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${SCRATCH}/export_env.sh"
+fi
+
+export ENV_PYTHON="${ENV_DIR}/bin/python"
 export PATH="${ENV_DIR}/bin:${PATH}"
-export CUDA_HOME="${ENV_DIR}"
 export LD_LIBRARY_PATH="${ENV_DIR}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export HF_HUB_DISABLE_XET=1
 export PYTHONPATH="${PROJECT}/transformers/src:${PROJECT}"
 export TL_ENABLE_NVTX=1
+export DMI_ROOT="${PROJECT}"
 
 cd "${PROJECT}/exp/offline_e2e"
 
@@ -38,8 +48,49 @@ echo "Python: $(python --version 2>&1)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo "============================================================"
 
+if command -v g++-11 >/dev/null 2>&1; then
+    CXX_BIN="$(command -v g++-11)"
+else
+    CXX_BIN="$(command -v g++)"
+fi
+
+NVCC_BIN=""
+if command -v nvcc >/dev/null 2>&1; then
+    NVCC_BIN="$(command -v nvcc)"
+else
+    for cand in \
+        "${ENV_DIR}/bin/nvcc" \
+        "/usr/local/cuda/bin/nvcc" \
+        "/usr/local/cuda-12.4/bin/nvcc" \
+        "/usr/local/cuda-12.3/bin/nvcc" \
+        "/usr/local/cuda-12.2/bin/nvcc" \
+        "/usr/local/cuda-12.1/bin/nvcc" \
+        "/usr/local/cuda-12.0/bin/nvcc" \
+        "/opt/cuda/bin/nvcc"
+    do
+        if [ -x "${cand}" ]; then
+            NVCC_BIN="${cand}"
+            break
+        fi
+    done
+fi
+
+if [ -z "${NVCC_BIN}" ]; then
+    echo "ERROR: nvcc not found on compute node"
+    exit 1
+fi
+
+export CUDA_HOME="$(cd "$(dirname "${NVCC_BIN}")/.." && pwd)"
+export PATH="$(dirname "${NVCC_BIN}"):${PATH}"
+echo "CXX=${CXX_BIN}"
+echo "NVCC=${NVCC_BIN}"
+echo "CUDA_HOME=${CUDA_HOME}"
+
 echo "Building monitoring extension inside job..."
-make -C "${PROJECT}/monitoring" -j "${SLURM_CPUS_PER_TASK:-8}" PYTHON="${ENV_DIR}/bin/python"
+make -C "${PROJECT}/monitoring" -j "${SLURM_CPUS_PER_TASK:-8}" \
+    PYTHON="${ENV_DIR}/bin/python" \
+    CXX="${CXX_BIN}" \
+    NVCC="${NVCC_BIN} -ccbin ${CXX_BIN}"
 
 MODEL="qwen3-4b"
 PREFILL_TOKENS=128
