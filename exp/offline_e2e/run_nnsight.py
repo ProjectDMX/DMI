@@ -32,6 +32,7 @@ from common import (
 
 
 DEFAULT_INTERNAL_HOOK_SET = "q,k,v,z,mlp_in,mlp_out,resid_mid"
+INTERNAL_HOOK_ORDER = ["q", "k", "v", "attn_scores", "pattern", "z", "resid_mid", "mlp_in", "mlp_out"]
 
 
 def _default_hook_selection(capture_mode: str) -> str:
@@ -50,14 +51,16 @@ def _collect_targets(model: Any, hook_selection: str) -> tuple[list[tuple[str, A
     hidden_state_set = {"hidden-states", "final_ln"}
     internal_hook_set = {part.strip() for part in DEFAULT_INTERNAL_HOOK_SET.split(",")}
 
-    if not non_logit_parts or non_logit_set == hidden_state_set or non_logit_set == {"hidden-states"}:
+    if not non_logit_parts:
+        pass
+    elif non_logit_set == hidden_state_set or non_logit_set == {"hidden-states"}:
         for layer_idx, layer in enumerate(model.model.layers):
             spec = (f"layers.{layer_idx}.hidden_state", layer, "output0")
             targets.append(spec)
             names.append(spec[0])
         targets.append(("final_ln", model.model.norm, "output"))
         names.append("final_ln")
-    elif non_logit_set == internal_hook_set:
+    elif non_logit_set == internal_hook_set or non_logit_set.issubset(internal_hook_set):
         for layer_idx, layer in enumerate(model.model.layers):
             q_module = getattr(layer.self_attn, "q_norm", None)
             if q_module is None:
@@ -65,16 +68,18 @@ def _collect_targets(model: Any, hook_selection: str) -> tuple[list[tuple[str, A
             k_module = getattr(layer.self_attn, "k_norm", None)
             if k_module is None:
                 k_module = layer.self_attn.k_proj
-            specs = [
-                (f"layers.{layer_idx}.q", q_module, "output"),
-                (f"layers.{layer_idx}.k", k_module, "output"),
-                (f"layers.{layer_idx}.v", layer.self_attn.v_proj, "output"),
-                (f"layers.{layer_idx}.z", layer.self_attn.o_proj, "input0"),
-                # NNsight requires accesses in actual forward-pass order.
-                (f"layers.{layer_idx}.resid_mid", layer.post_attention_layernorm, "input0"),
-                (f"layers.{layer_idx}.mlp_in", layer.post_attention_layernorm, "output"),
-                (f"layers.{layer_idx}.mlp_out", layer.mlp, "output"),
-            ]
+            spec_map = {
+                "q": (f"layers.{layer_idx}.q", q_module, "output"),
+                "k": (f"layers.{layer_idx}.k", k_module, "output"),
+                "v": (f"layers.{layer_idx}.v", layer.self_attn.v_proj, "output"),
+                "attn_scores": (f"layers.{layer_idx}.attn_scores", layer.self_attn.hook_attn_scores, "output"),
+                "pattern": (f"layers.{layer_idx}.pattern", layer.self_attn.hook_pattern, "output"),
+                "z": (f"layers.{layer_idx}.z", layer.self_attn.o_proj, "input0"),
+                "resid_mid": (f"layers.{layer_idx}.resid_mid", layer.post_attention_layernorm, "input0"),
+                "mlp_in": (f"layers.{layer_idx}.mlp_in", layer.post_attention_layernorm, "output"),
+                "mlp_out": (f"layers.{layer_idx}.mlp_out", layer.mlp, "output"),
+            }
+            specs = [spec_map[name] for name in INTERNAL_HOOK_ORDER if name in non_logit_set]
             targets.extend(specs)
             names.extend(name for name, _, _ in specs)
     else:

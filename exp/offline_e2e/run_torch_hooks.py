@@ -34,6 +34,7 @@ from common import (
 
 
 DEFAULT_INTERNAL_HOOK_SET = "q,k,v,z,mlp_in,mlp_out,resid_mid"
+INTERNAL_HOOK_ORDER = ["q", "k", "v", "attn_scores", "pattern", "z", "resid_mid", "mlp_in", "mlp_out"]
 
 
 def _position_ids_from_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -139,6 +140,93 @@ class TorchHookCollector:
                 )
             )
 
+    def _register_internal_subset(self, selected: set[str]) -> None:
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            q_module = getattr(layer.self_attn, "q_norm", None)
+            if q_module is None:
+                q_module = layer.self_attn.q_proj
+            k_module = getattr(layer.self_attn, "k_norm", None)
+            if k_module is None:
+                k_module = layer.self_attn.k_proj
+
+            if "q" in selected:
+                self.hook_names.append(f"layers.{layer_idx}.q")
+                self.handles.append(
+                    q_module.register_forward_hook(
+                        lambda _module, _args, output: self._materialize(output)
+                    )
+                )
+
+            if "k" in selected:
+                self.hook_names.append(f"layers.{layer_idx}.k")
+                self.handles.append(
+                    k_module.register_forward_hook(
+                        lambda _module, _args, output: self._materialize(output)
+                    )
+                )
+
+            if "v" in selected:
+                self.hook_names.append(f"layers.{layer_idx}.v")
+                self.handles.append(
+                    layer.self_attn.v_proj.register_forward_hook(
+                        lambda _module, _args, output: self._materialize(output, reshape_v=True)
+                    )
+                )
+
+            if "attn_scores" in selected:
+                attn_scores_module = getattr(layer.self_attn, "hook_attn_scores", None)
+                if attn_scores_module is None:
+                    raise ValueError("attn_scores hook requires hooked attention modules")
+                self.hook_names.append(f"layers.{layer_idx}.attn_scores")
+                self.handles.append(
+                    attn_scores_module.register_forward_hook(
+                        lambda _module, _args, output: self._materialize(output)
+                    )
+                )
+
+            if "pattern" in selected:
+                pattern_module = getattr(layer.self_attn, "hook_pattern", None)
+                if pattern_module is None:
+                    raise ValueError("pattern hook requires hooked attention modules")
+                self.hook_names.append(f"layers.{layer_idx}.pattern")
+                self.handles.append(
+                    pattern_module.register_forward_hook(
+                        lambda _module, _args, output: self._materialize(output)
+                    )
+                )
+
+            if "z" in selected:
+                self.hook_names.append(f"layers.{layer_idx}.z")
+                self.handles.append(
+                    layer.self_attn.o_proj.register_forward_pre_hook(
+                        lambda _module, args: self._materialize(args[0])
+                    )
+                )
+
+            if "resid_mid" in selected:
+                self.hook_names.append(f"layers.{layer_idx}.resid_mid")
+                self.handles.append(
+                    layer.post_attention_layernorm.register_forward_pre_hook(
+                        lambda _module, args: self._materialize(args[0])
+                    )
+                )
+
+            if "mlp_in" in selected:
+                self.hook_names.append(f"layers.{layer_idx}.mlp_in")
+                self.handles.append(
+                    layer.post_attention_layernorm.register_forward_hook(
+                        lambda _module, _args, output: self._materialize(output)
+                    )
+                )
+
+            if "mlp_out" in selected:
+                self.hook_names.append(f"layers.{layer_idx}.mlp_out")
+                self.handles.append(
+                    layer.mlp.register_forward_hook(
+                        lambda _module, _args, output: self._materialize(output)
+                    )
+                )
+
     def _register_logits(self) -> None:
         self.hook_names.append("logits")
         self.handles.append(
@@ -155,10 +243,14 @@ class TorchHookCollector:
         hidden_state_set = {"hidden-states", "final_ln"}
         internal_hook_set = {part.strip() for part in DEFAULT_INTERNAL_HOOK_SET.split(",")}
 
-        if not non_logit_parts or non_logit_set == hidden_state_set or non_logit_set == {"hidden-states"}:
+        if not non_logit_parts:
+            pass
+        elif non_logit_set == hidden_state_set or non_logit_set == {"hidden-states"}:
             self._register_hidden_states()
         elif non_logit_set == internal_hook_set:
             self._register_internal_hooks()
+        elif non_logit_set.issubset(internal_hook_set):
+            self._register_internal_subset(set(INTERNAL_HOOK_ORDER).intersection(non_logit_set))
         else:
             raise ValueError(f"unsupported torch hook selection: {self.hook_selection}")
 
