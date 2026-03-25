@@ -33,7 +33,7 @@ from common import (
 )
 
 
-DEFAULT_INTERNAL_HOOK_SET = "q,k,v,z,mlp_in,mlp_out,resid_mid"
+DEFAULT_INTERNAL_HOOK_SET = "q,k,v,attn_scores,pattern,z,mlp_in,mlp_out,resid_mid"
 INTERNAL_HOOK_ORDER = ["q", "k", "v", "attn_scores", "pattern", "z", "resid_mid", "mlp_in", "mlp_out"]
 
 
@@ -109,6 +109,26 @@ class TorchHookCollector:
             self.handles.append(
                 layer.self_attn.v_proj.register_forward_hook(
                     lambda _module, _args, output: self._materialize(output, reshape_v=True)
+                )
+            )
+
+            attn_scores_module = getattr(layer.self_attn, "hook_attn_scores", None)
+            if attn_scores_module is None:
+                raise ValueError("attn_scores hook requires hooked attention modules")
+            self.hook_names.append(f"layers.{layer_idx}.attn_scores")
+            self.handles.append(
+                attn_scores_module.register_forward_hook(
+                    lambda _module, _args, output: self._materialize(output)
+                )
+            )
+
+            pattern_module = getattr(layer.self_attn, "hook_pattern", None)
+            if pattern_module is None:
+                raise ValueError("pattern hook requires hooked attention modules")
+            self.hook_names.append(f"layers.{layer_idx}.pattern")
+            self.handles.append(
+                pattern_module.register_forward_hook(
+                    lambda _module, _args, output: self._materialize(output)
                 )
             )
 

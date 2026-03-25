@@ -31,7 +31,7 @@ from common import (
 )
 
 
-DEFAULT_INTERNAL_HOOK_SET = "q,k,v,z,mlp_in,mlp_out,resid_mid"
+DEFAULT_INTERNAL_HOOK_SET = "q,k,v,attn_scores,pattern,z,mlp_in,mlp_out,resid_mid"
 INTERNAL_HOOK_ORDER = ["q", "k", "v", "attn_scores", "pattern", "z", "resid_mid", "mlp_in", "mlp_out"]
 
 
