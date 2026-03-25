@@ -451,6 +451,8 @@ def _compute_decode_step_bytes(transport: Any, batch: int,
 
 def generate_with_monitoring(model: Any, *args: Any,
                              hook_selection: Optional[str] = None,
+                             timing_out: Optional[dict] = None,
+                             flush_after_generate: bool = False,
                              **kwargs: Any):
     """Run HF generate() with ring-transport monitoring hooks active.
 
@@ -479,8 +481,11 @@ def generate_with_monitoring(model: Any, *args: Any,
     compiles only the decode path (prefill stays uncompiled).
     """
     from . import ring_transport
+    import functools
+    import time
     import types
     import warnings
+    import torch
 
     # ------------------------------------------------------------------
     # Phase 1: Strip external compilation when static cache is active.
@@ -584,6 +589,17 @@ def generate_with_monitoring(model: Any, *args: Any,
 
     _install_monitoring_forward(target)
     _install_prepare_wrapper(target)
+
+    step_timestamps: List[float] = []
+    _saved_prepare_with_monitoring = target.prepare_inputs_for_generation
+
+    @functools.wraps(_saved_prepare_with_monitoring)
+    def _timed_prepare(*_args: Any, **_kwargs: Any):
+        step_timestamps.append(time.perf_counter())
+        return _saved_prepare_with_monitoring(*_args, **_kwargs)
+
+    if timing_out is not None:
+        target.prepare_inputs_for_generation = _timed_prepare
 
     # ------------------------------------------------------------------
     # Phase 3: Check if decode fits in ring.
@@ -689,9 +705,53 @@ def generate_with_monitoring(model: Any, *args: Any,
                     msg += " Disabled CUDA graph compilation for this generate() call."
                 warnings.warn(msg, stacklevel=2)
 
+    _t_generate_start = None
+    _t_generate_end = None
+    _flush_ms = 0.0
+    result = None
     try:
-        return model.generate(*args, **kwargs)
+        if timing_out is not None:
+            torch.cuda.synchronize()
+            _t_generate_start = time.perf_counter()
+        result = model.generate(*args, **kwargs)
+        if timing_out is not None:
+            torch.cuda.synchronize()
+            _t_generate_end = time.perf_counter()
+            if flush_after_generate and transport is not None:
+                ring_engine = getattr(transport, "_ring_engine", None)
+                if ring_engine is not None:
+                    _flush_ms = float(ring_engine.flush_and_wait()) / 1000.0
+            total_ms = (_t_generate_end - _t_generate_start) * 1000.0
+            timing_out.clear()
+            timing_out["generate_total_ms"] = total_ms
+            timing_out["flush_ms"] = _flush_ms
+            timing_out["total_with_flush_ms"] = total_ms + _flush_ms
+            timing_out["step_timestamps"] = list(step_timestamps)
+            if len(step_timestamps) >= 2:
+                prefill_ms = (step_timestamps[1] - step_timestamps[0]) * 1000.0
+                decode_total_ms = (_t_generate_end - step_timestamps[1]) * 1000.0
+                decode_steps = len(step_timestamps) - 1
+                timing_out["prefill_ms"] = prefill_ms
+                timing_out["decode_total_ms"] = decode_total_ms
+                timing_out["decode_total_with_flush_ms"] = decode_total_ms + _flush_ms
+                timing_out["decode_steps"] = decode_steps
+                timing_out["decode_last_step_ms"] = (_t_generate_end - step_timestamps[-1]) * 1000.0
+            elif len(step_timestamps) == 1:
+                timing_out["prefill_ms"] = total_ms
+                timing_out["decode_total_ms"] = 0.0
+                timing_out["decode_total_with_flush_ms"] = _flush_ms
+                timing_out["decode_steps"] = 0
+                timing_out["decode_last_step_ms"] = 0.0
+            else:
+                timing_out["prefill_ms"] = total_ms
+                timing_out["decode_total_ms"] = 0.0
+                timing_out["decode_total_with_flush_ms"] = _flush_ms
+                timing_out["decode_steps"] = 0
+                timing_out["decode_last_step_ms"] = 0.0
+        return result
     finally:
+        if timing_out is not None:
+            target.prepare_inputs_for_generation = _saved_prepare_with_monitoring
         _uninstall_monitoring_forward(target)
         _uninstall_prepare_wrapper(target)
         if target is not model:

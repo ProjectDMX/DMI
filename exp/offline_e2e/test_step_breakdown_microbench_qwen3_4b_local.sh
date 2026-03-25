@@ -29,11 +29,12 @@ run_one() {
     --results-dir "${RESULTS_DIR}" \
     ${LOCAL_FILES_ONLY} \
     --hook-selection "${HOOK_SELECTION}" \
-    --proj-dmi-mode ring_db \
-    --ring-payload-mb 1024 \
-    --ring-pinned-mb 1024 \
-    --drain-flush-task-ratio 0.15 \
-    --drain-flush-payload-ratio 0.15 \
+  --proj-dmi-mode ring_null \
+    --ring-payload-mb 10240 \
+    --ring-pinned-mb 10240 \
+    --drain-flush-task-ratio 0.0 \
+    --drain-flush-payload-ratio 0.0 \
+    --drain-flush-timeout-us 1000 \
     --ch-parallelism 1 \
     --ch-queue-max-items 128 \
     --ch-queue-max-size-mb 128 \
@@ -44,6 +45,6 @@ run_one() {
     --db-table offload
 }
 
-for baseline in hf_ideal hf_api torch_hooks proj_dmi; do
+for baseline in hf_ideal hf_api torch_hooks proj_dmi proj_dmi_legacy; do
   run_one "${baseline}"
 done
