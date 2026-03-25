@@ -40,10 +40,9 @@ echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo "============================================================"
 
 MODEL="qwen3-4b"
-SAMPLE_FILE="../../benchmark/data/offline_e2e/sharegpt_500_sample1.jsonl"
 BATCH_SIZE=2
-LIMIT=4
-PREFIX_LENGTHS="16,32"
+PREFILL_TOKENS=16
+NUM_MICROBATCHES=4
 LIGHT_HOOKS="logits"
 HEAVY_HOOKS="q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
 RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/prefill_backpressure_smoke_$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
@@ -77,11 +76,10 @@ echo "HF_HOME=${HF_HOME}"
 
 COMMON=(
   --model "${MODEL}"
-  --sample-file "${SAMPLE_FILE}"
   --local-files-only
   --batch-size "${BATCH_SIZE}"
-  --limit "${LIMIT}"
-  --prefix-lengths "${PREFIX_LENGTHS}"
+  --prefill-tokens "${PREFILL_TOKENS}"
+  --num-microbatches "${NUM_MICROBATCHES}"
   --results-dir "${RESULTS_DIR}"
 )
 

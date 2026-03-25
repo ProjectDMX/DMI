@@ -40,10 +40,9 @@ echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo "============================================================"
 
 MODEL="qwen3-4b"
-DATASET="${DATASET:-sharegpt}"
 BATCH_SIZE=64
-LIMIT=128
-PREFIX_LENGTHS="64,128,192,256,320,384,448"
+PREFILL_TOKENS=64
+NUM_MICROBATCHES=32
 HF_HOOK_SET="none"
 DMI_LIGHT_HOOKS="logits"
 DMI_HEAVY_HOOKS="q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
@@ -51,21 +50,8 @@ RING_PAYLOAD_MB=16384
 RING_PINNED_MB=16384
 RING_TASK_ENTRIES=65536
 
-case "${DATASET}" in
-    sharegpt)
-        SAMPLE_FILE="../../benchmark/data/offline_e2e/sharegpt_500_sample1.jsonl"
-        ;;
-    wildchat)
-        SAMPLE_FILE="../../benchmark/data/offline_e2e/wildchat_500_sample1.jsonl"
-        ;;
-    *)
-        echo "ERROR: unsupported DATASET=${DATASET}"
-        exit 1
-        ;;
-esac
-
 RUN_TAG="$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
-RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/prefill_backpressure_${DATASET}_${RUN_TAG}"
+RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/prefill_backpressure_fixed_${RUN_TAG}"
 LOG_DIR="${RESULTS_DIR}/logs"
 SUMMARY_CSV="${RESULTS_DIR}/summary.csv"
 mkdir -p "${RESULTS_DIR}" "${LOG_DIR}"
@@ -129,11 +115,10 @@ echo "HF_HOME=${HF_HOME}"
 
 COMMON=(
   --model "${MODEL}"
-  --sample-file "${SAMPLE_FILE}"
   --local-files-only
   --batch-size "${BATCH_SIZE}"
-  --limit "${LIMIT}"
-  --prefix-lengths "${PREFIX_LENGTHS}"
+  --prefill-tokens "${PREFILL_TOKENS}"
+  --num-microbatches "${NUM_MICROBATCHES}"
   --results-dir "${RESULTS_DIR}"
 )
 

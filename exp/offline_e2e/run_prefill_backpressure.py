@@ -21,13 +21,10 @@ for _path in (SCRIPT_DIR, PROJECT_ROOT, PROJECT_ROOT / "transformers" / "src"):
 
 from common import (
     DEFAULT_RESULTS_DIR,
-    apply_chat_template_or_fallback,
     build_tokenizer,
     device_sync,
     ensure_dir,
-    load_jsonl_examples,
     make_output_path,
-    parsed_limit,
     resolve_model_id,
     write_json,
 )
@@ -50,56 +47,27 @@ def _forward_accepts_position_ids(model: Any) -> bool:
     return "position_ids" in inspect.signature(model.forward).parameters
 
 
-def _load_rendered_prompts(
-    *,
-    sample_file: str,
-    model_id: str,
-    local_files_only: bool,
-    max_prefix_len: int,
-    limit: int | None,
-) -> tuple[Any, List[Dict[str, Any]]]:
-    tokenizer = build_tokenizer(model_id, local_files_only=local_files_only)
-    examples = load_jsonl_examples(sample_file, limit=limit)
-    rendered: List[Dict[str, Any]] = []
-    for example in examples:
-        prompt_text = apply_chat_template_or_fallback(tokenizer, example.messages)
-        prompt_tok = tokenizer(
-            prompt_text,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_tensors=None,
-        )
-        prompt_len = len(prompt_tok["input_ids"])
-        if prompt_len >= max_prefix_len:
-            rendered.append(
-                {
-                    "example": example,
-                    "prompt_text": prompt_text,
-                    "prompt_len": int(prompt_len),
-                }
-            )
-    rendered.sort(key=lambda item: (-item["prompt_len"], item["example"].entry_id))
-    return tokenizer, rendered
-
-
-def _iter_batches(items: Sequence[Dict[str, Any]], batch_size: int) -> Iterable[List[Dict[str, Any]]]:
-    for idx in range(0, len(items), batch_size):
-        yield list(items[idx : idx + batch_size])
-
-
-def _tokenize_prefix_batch(
+def _make_synthetic_prefill_batch(
     tokenizer: Any,
-    texts: Sequence[str],
     *,
-    prefix_len: int,
+    batch_size: int,
+    prefill_tokens: int,
+    device: torch.device,
 ) -> Dict[str, torch.Tensor]:
-    return tokenizer(
-        list(texts),
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=int(prefix_len),
+    pad_token_id = int(tokenizer.pad_token_id)
+    fill_token_id = int(
+        tokenizer.eos_token_id
+        if getattr(tokenizer, "eos_token_id", None) is not None
+        else tokenizer.pad_token_id
     )
+    input_ids = torch.full((batch_size, prefill_tokens), fill_token_id, dtype=torch.long, device=device)
+    attention_mask = torch.ones((batch_size, prefill_tokens), dtype=torch.long, device=device)
+    if pad_token_id != fill_token_id:
+        input_ids[:, 0] = pad_token_id
+        attention_mask[:, 0] = 0
+        input_ids[:, 0] = fill_token_id
+        attention_mask[:, 0] = 1
+    return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
 def _base_forward_kwargs(
@@ -335,12 +303,11 @@ def main() -> None:
     parser.add_argument("--baseline", choices=["hf_native", "torch_hooks", "nnsight", "proj_dmi"], required=True)
     parser.add_argument("--baseline-label", default="")
     parser.add_argument("--model", default="qwen3-4b")
-    parser.add_argument("--sample-file", required=True)
     parser.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR))
     parser.add_argument("--repeat-index", type=int, default=1)
-    parser.add_argument("--limit", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--prefix-lengths", default="64,128,192,256,320,384,448")
+    parser.add_argument("--prefill-tokens", type=int, default=64)
+    parser.add_argument("--num-microbatches", type=int, default=32)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--hook-selection", default=DEFAULT_HEAVY_HOOKS)
     parser.add_argument("--proj-dmi-mode", choices=["ring_null", "ring_db"], default="ring_db")
@@ -369,28 +336,11 @@ def main() -> None:
         raise RuntimeError("CUDA is required")
 
     model_id = resolve_model_id(args.model)
-    prefix_lengths = [int(chunk.strip()) for chunk in str(args.prefix_lengths).split(",") if chunk.strip()]
-    if not prefix_lengths:
-        raise ValueError("prefix-lengths must be non-empty")
-    max_prefix_len = max(prefix_lengths)
-
-    tokenizer, rendered = _load_rendered_prompts(
-        sample_file=args.sample_file,
-        model_id=model_id,
-        local_files_only=bool(args.local_files_only),
-        max_prefix_len=max_prefix_len,
-        limit=None,
-    )
-    if len(rendered) < args.limit:
-        raise ValueError(
-            f"need at least {args.limit} prompts with length >= {max_prefix_len}, found {len(rendered)}"
-        )
-    rendered = rendered[: args.limit]
-    if len(rendered) % args.batch_size != 0:
-        raise ValueError(
-            f"limit={len(rendered)} must be divisible by batch_size={args.batch_size} "
-            "for clean prefix-latency averaging"
-        )
+    if int(args.prefill_tokens) <= 0:
+        raise ValueError("prefill-tokens must be > 0")
+    if int(args.num_microbatches) <= 0:
+        raise ValueError("num-microbatches must be > 0")
+    tokenizer = build_tokenizer(model_id, local_files_only=bool(args.local_files_only))
 
     baseline_label = args.baseline_label or args.baseline
     device = torch.device("cuda")
@@ -460,13 +410,14 @@ def main() -> None:
     batch_records: List[Dict[str, Any]] = []
 
     try:
-        batches = list(_iter_batches(rendered, args.batch_size))
-        warmup_batch = batches[0]
-        warmup_texts = [item["prompt_text"] for item in warmup_batch]
+        warmup_encoded = _make_synthetic_prefill_batch(
+            tokenizer,
+            batch_size=int(args.batch_size),
+            prefill_tokens=int(args.prefill_tokens),
+            device=device,
+        )
         with torch.no_grad():
-            for prefix_len in prefix_lengths:
-                warmup_encoded = _tokenize_prefix_batch(tokenizer, warmup_texts, prefix_len=prefix_len)
-                warmup_encoded = {key: value.to(device) for key, value in warmup_encoded.items()}
+            for _ in range(2):
                 if args.baseline == "hf_native":
                     _run_hf_forward(model, warmup_encoded)
                 elif args.baseline == "torch_hooks":
@@ -476,81 +427,80 @@ def main() -> None:
                 else:
                     _run_proj_dmi_forward(model, warmup_encoded)
                 device_sync(device)
-        print(f"Warmup done ({len(prefix_lengths)} prefix lengths).", flush=True)
+        print("Warmup done (2 fixed microbatches).", flush=True)
 
         with torch.no_grad():
-            for prefix_len in prefix_lengths:
-                batch_times_ms: List[float] = []
-                batch_input_tokens: List[int] = []
-                batch_padded_tokens: List[int] = []
-                for batch_index, batch in enumerate(batches):
-                    texts = [item["prompt_text"] for item in batch]
-                    encoded = _tokenize_prefix_batch(tokenizer, texts, prefix_len=prefix_len)
-                    encoded = {key: value.to(device) for key, value in encoded.items()}
-                    input_tokens = int(encoded["attention_mask"].sum().item())
-                    padded_tokens = int(encoded["input_ids"].numel())
+            encoded = _make_synthetic_prefill_batch(
+                tokenizer,
+                batch_size=int(args.batch_size),
+                prefill_tokens=int(args.prefill_tokens),
+                device=device,
+            )
+            input_tokens = int(encoded["attention_mask"].sum().item())
+            padded_tokens = int(encoded["input_ids"].numel())
+            batch_times_ms: List[float] = []
+            for microbatch_index in range(int(args.num_microbatches)):
+                device_sync(device)
+                t0 = time.perf_counter()
+                if args.baseline == "hf_native":
+                    _run_hf_forward(model, encoded)
+                elif args.baseline == "torch_hooks":
+                    _run_torch_hooks_forward(model, collector, encoded)
+                elif args.baseline == "nnsight":
+                    _run_nnsight_forward(model, nnsight_targets, encoded)
+                else:
+                    _run_proj_dmi_forward(model, encoded)
+                device_sync(device)
+                t1 = time.perf_counter()
 
-                    device_sync(device)
-                    t0 = time.perf_counter()
-                    if args.baseline == "hf_native":
-                        _run_hf_forward(model, encoded)
-                    elif args.baseline == "torch_hooks":
-                        _run_torch_hooks_forward(model, collector, encoded)
-                    elif args.baseline == "nnsight":
-                        _run_nnsight_forward(model, nnsight_targets, encoded)
-                    else:
-                        _run_proj_dmi_forward(model, encoded)
-                    device_sync(device)
-                    t1 = time.perf_counter()
-
-                    wall_ms = (t1 - t0) * 1000.0
-                    batch_times_ms.append(wall_ms)
-                    batch_input_tokens.append(input_tokens)
-                    batch_padded_tokens.append(padded_tokens)
-                    batch_records.append(
-                        {
-                            "prefix_len": int(prefix_len),
-                            "batch_index": int(batch_index),
-                            "batch_size": int(len(batch)),
-                            "input_tokens": int(input_tokens),
-                            "padded_tokens": int(padded_tokens),
-                            "wall_time_ms": float(wall_ms),
-                        }
-                    )
-
-                estimate_mb = None
-                if args.baseline == "proj_dmi":
-                    estimate_mb = _estimate_dmi_payload_mb(model, str(args.hook_selection), int(prefix_len), int(args.batch_size))
-
-                per_prefix.append(
+                wall_ms = (t1 - t0) * 1000.0
+                batch_times_ms.append(wall_ms)
+                batch_records.append(
                     {
-                        "prefix_len": int(prefix_len),
-                        "num_batches": int(len(batch_times_ms)),
-                        "mean_wall_time_ms": float(sum(batch_times_ms) / len(batch_times_ms)),
-                        "batch_wall_time_ms": [float(value) for value in batch_times_ms],
-                        "mean_input_tokens": float(sum(batch_input_tokens) / len(batch_input_tokens)),
-                        "mean_padded_tokens": float(sum(batch_padded_tokens) / len(batch_padded_tokens)),
-                        "estimated_dmi_step_mb": estimate_mb,
+                        "microbatch_index": int(microbatch_index),
+                        "batch_size": int(args.batch_size),
+                        "input_tokens": int(input_tokens),
+                        "padded_tokens": int(padded_tokens),
+                        "wall_time_ms": float(wall_ms),
                     }
                 )
-                print(
-                    f"[{baseline_label}] prefix={prefix_len:>3d} "
-                    f"mean_ms={per_prefix[-1]['mean_wall_time_ms']:.3f}",
-                    flush=True,
+
+            estimate_mb = None
+            if args.baseline == "proj_dmi":
+                estimate_mb = _estimate_dmi_payload_mb(
+                    model, str(args.hook_selection), int(args.prefill_tokens), int(args.batch_size)
                 )
+
+            per_prefix.append(
+                {
+                    "prefill_tokens": int(args.prefill_tokens),
+                    "num_microbatches": int(args.num_microbatches),
+                    "mean_wall_time_ms": float(sum(batch_times_ms) / len(batch_times_ms)),
+                    "batch_wall_time_ms": [float(value) for value in batch_times_ms],
+                    "mean_input_tokens": float(input_tokens),
+                    "mean_padded_tokens": float(padded_tokens),
+                    "estimated_dmi_step_mb": estimate_mb,
+                }
+            )
+            print(
+                f"[{baseline_label}] prefill={int(args.prefill_tokens):>3d} "
+                f"microbatches={int(args.num_microbatches):>2d} "
+                f"mean_ms={per_prefix[-1]['mean_wall_time_ms']:.3f}",
+                flush=True,
+            )
 
         payload = {
             "baseline": str(args.baseline),
             "baseline_label": baseline_label,
             "model": str(args.model),
             "model_id": model_id,
-            "sample_file": str(args.sample_file),
             "repeat_index": int(args.repeat_index),
-            "dataset_size": int(len(rendered)),
             "batch_size": int(args.batch_size),
-            "prefix_lengths": [int(value) for value in prefix_lengths],
-            "measurement_kind": "prefill_prefix_latency",
+            "dataset_size": int(args.batch_size * int(args.num_microbatches)),
+            "measurement_kind": "fixed_prefill_microbatch_latency",
             "decode_tokens": 0,
+            "prefill_tokens": int(args.prefill_tokens),
+            "num_microbatches": int(args.num_microbatches),
             "local_files_only": bool(args.local_files_only),
             "per_prefix": per_prefix,
             "batch_records": batch_records,
@@ -561,7 +511,7 @@ def main() -> None:
             results_dir=args.results_dir,
             baseline=baseline_label,
             model=args.model,
-            sample_file=args.sample_file,
+            sample_file=f"synthetic_prefill_{int(args.prefill_tokens)}",
             batch_size=args.batch_size,
             repeat_index=args.repeat_index,
         )
