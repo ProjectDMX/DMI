@@ -28,6 +28,18 @@
 
 namespace ring {
 
+struct FlushStats {
+    uint64_t pending_entries{0};
+    uint64_t pending_bytes{0};
+    uint64_t cpu_payload_head{0};
+    uint64_t cpu_payload_tail_committed{0};
+    uint64_t total_flushes{0};
+    uint64_t last_flush_entries{0};
+    uint64_t last_flush_bytes{0};
+    uint64_t last_flush_complete_monotonic_us{0};
+    uint64_t last_force_flush_wait_us{0};
+};
+
 class DrainThread {
 public:
     DrainThread(RingState& rs, PinnedStaging& staging, const RingConfig& cfg);
@@ -45,6 +57,7 @@ public:
     // until it finishes.  Caller must have done cudaStreamSynchronize on
     // the main stream first so all GPU writes are visible.
     void force_flush_and_wait();
+    uint64_t force_flush_and_wait_timed();
 
     // Submit a CPU-direct tensor to drain -> p2p pipeline.
     // The tensor is already in pageable CPU memory; skips D2H and staging.
@@ -62,6 +75,7 @@ public:
     // Capacity query accessors (called from RingEnginePy::prepare_step).
     uint64_t cpu_payload_head() const;
     uint64_t cpu_payload_tail_committed() const;
+    FlushStats get_stats() const;
 
     // Pre-allocate ring space for the next step's producer kernels.
     // Advances cpu_payload_head_ and cpu_task_head_ under mgmt_mu_.
@@ -81,7 +95,7 @@ private:
     bool                    notified_{false};
 
     // ---- mgmt_mu_ protects all state below this line ----
-    std::mutex              mgmt_mu_;
+    mutable std::mutex      mgmt_mu_;
 
     uint64_t                visible_head_{0};
     uint64_t                pending_entries_{0};
@@ -96,6 +110,11 @@ private:
 
     std::chrono::steady_clock::time_point first_complete_time_{};
     bool                    has_complete_time_{false};
+    uint64_t                total_flushes_{0};
+    uint64_t                last_flush_entries_{0};
+    uint64_t                last_flush_bytes_{0};
+    uint64_t                last_flush_complete_monotonic_us_{0};
+    uint64_t                last_force_flush_wait_us_{0};
     // ---- end mgmt_mu_ protected state ----
 
     // Force-flush signalling (Python thread -> drain thread)

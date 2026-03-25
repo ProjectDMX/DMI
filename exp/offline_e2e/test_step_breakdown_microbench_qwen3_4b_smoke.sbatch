@@ -38,8 +38,11 @@ echo "Python: $(python --version 2>&1)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo "============================================================"
 
+echo "Building monitoring extension inside job..."
+make -C "${PROJECT}/monitoring" -j "${SLURM_CPUS_PER_TASK:-8}" PYTHON="${ENV_DIR}/bin/python"
+
 MODEL="qwen3-4b"
-PREFILL_TOKENS=384
+PREFILL_TOKENS=128
 WARMUP=1
 ITERS=2
 BATCH_SIZES=(1 8)
@@ -113,17 +116,11 @@ for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
         --baseline-label torch_hooks \
         --hook-selection "${HOOK_SELECTION}"
 
-    run_case "Smoke: nnsight bs=${BATCH_SIZE}" \
-      python run_step_breakdown_microbench.py "${COMMON[@]}" \
-        --baseline nnsight \
-        --baseline-label nnsight \
-        --hook-selection "${HOOK_SELECTION}"
-
     run_case "Smoke: dmi bs=${BATCH_SIZE}" \
       python run_step_breakdown_microbench.py "${COMMON[@]}" \
         --baseline proj_dmi \
         --baseline-label dmi \
-        --proj-dmi-mode ring_null \
+        --proj-dmi-mode ring_db \
         --hook-selection "${HOOK_SELECTION}" \
         --ring-payload-mb 4096 \
         --ring-pinned-mb 4096

@@ -353,6 +353,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
       .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
 
+  py::class_<ring_py::RingFlushStats>(m, "RingFlushStats")
+      .def(py::init<>())
+      .def_readwrite("pending_entries", &ring_py::RingFlushStats::pending_entries)
+      .def_readwrite("pending_bytes", &ring_py::RingFlushStats::pending_bytes)
+      .def_readwrite("cpu_payload_head", &ring_py::RingFlushStats::cpu_payload_head)
+      .def_readwrite("cpu_payload_tail_committed", &ring_py::RingFlushStats::cpu_payload_tail_committed)
+      .def_readwrite("total_flushes", &ring_py::RingFlushStats::total_flushes)
+      .def_readwrite("last_flush_entries", &ring_py::RingFlushStats::last_flush_entries)
+      .def_readwrite("last_flush_bytes", &ring_py::RingFlushStats::last_flush_bytes)
+      .def_readwrite("last_flush_complete_monotonic_us", &ring_py::RingFlushStats::last_flush_complete_monotonic_us)
+      .def_readwrite("last_force_flush_wait_us", &ring_py::RingFlushStats::last_force_flush_wait_us);
+
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
              ring_py::SubmitFn submit_fn;
@@ -383,6 +395,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("stream_handle") = uint64_t{0})
       .def("start", &ring_py::RingEnginePy::start)
       .def("stop",  &ring_py::RingEnginePy::stop,
+           py::call_guard<py::gil_scoped_release>())
+      .def("flush_and_wait", &ring_py::RingEnginePy::flush_and_wait,
+           py::call_guard<py::gil_scoped_release>())
+      .def("get_stats", &ring_py::RingEnginePy::get_stats,
            py::call_guard<py::gil_scoped_release>())
       .def("prepare_step",
            &ring_py::RingEnginePy::prepare_step,
