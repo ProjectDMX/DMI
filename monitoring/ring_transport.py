@@ -392,6 +392,10 @@ def _compute_hook_shape(
     if hook_type in (HOOK_TYPE_K, HOOK_TYPE_V):
         return b + [q_len, cfg.num_kv_heads, cfg.head_dim]
     if hook_type == HOOK_TYPE_Z:
+        # vLLM Attention.forward returns [N, hidden_size] (heads flattened).
+        # HF returns [batch, q_len, num_heads, head_dim].
+        if batch == 0:
+            return [q_len, cfg.num_heads * cfg.head_dim]
         return b + [q_len, cfg.num_heads, cfg.head_dim]
     if hook_type in (HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN):
         return b + [cfg.num_heads, q_len, kv_dim]

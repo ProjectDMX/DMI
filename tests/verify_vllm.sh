@@ -36,10 +36,11 @@ run_test() {
 
     E2E_MODEL=$model_key \
     E2E_ENFORCE_EAGER=$eager \
+    E2E_DTYPE=bfloat16 \
     E2E_RING_PAYLOAD_MB=$ring_mb \
     E2E_RING_PINNED_MB=$ring_mb \
     E2E_COMPARE_LAYERS=all \
-    python -m pytest tests/test_vllm_correctness.py -q -s
+    python -m pytest tests/test_vllm_rowcnt.py -q -s
 }
 
 for model in gpt2 qwen3; do
@@ -57,4 +58,50 @@ for model in gpt2 qwen3; do
 done
 
 echo ""
-echo "=== All 16 tests passed ==="
+echo "=== All 16 row-count tests passed ==="
+
+# ---------------------------------------------------------------------------
+# Identical check: bitwise tensor comparison (ref model vs ring transport)
+# Uses large ring (4096MB) — tests data correctness, not capacity handling.
+# ---------------------------------------------------------------------------
+
+run_identical_test() {
+    local model_name=$1
+    local model_key=$2
+    local eager=$3
+    local ring_mb=$4
+
+    local mode_name="eager"
+    if [ "$eager" = "0" ]; then
+        mode_name="CUDA-graph"
+    fi
+
+    echo "=== $model_name identical check ($mode_name) ring=${ring_mb}MB ==="
+    rm -rf /tmp/torchinductor_$(whoami)/ 2>/dev/null
+    rm -rf ~/.cache/vllm/ 2>/dev/null
+
+    E2E_MODEL=$model_key \
+    E2E_ENFORCE_EAGER=$eager \
+    E2E_DTYPE=bfloat16 \
+    E2E_HOOKS=vllm-full \
+    E2E_REF_MAX_LEN=8192 \
+    E2E_RING_PAYLOAD_MB=$ring_mb \
+    E2E_RING_PINNED_MB=$ring_mb \
+    python -m pytest tests/test_vllm_identical.py -q -s
+}
+
+for model in gpt2 qwen3; do
+    if [ "$model" = "gpt2" ]; then
+        model_name="GPT-2"
+    else
+        model_name="Qwen3"
+    fi
+
+    for ring_mb in 1 4 16 4096; do
+        run_identical_test "$model_name" "$model" "1" "$ring_mb"   # eager
+        run_identical_test "$model_name" "$model" "0" "$ring_mb"   # CUDA graph
+    done
+done
+
+echo ""
+echo "=== All 32 tests passed (16 row-count + 16 identical) ==="

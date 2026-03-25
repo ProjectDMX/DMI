@@ -4,7 +4,7 @@ monitored data from ClickHouse, compare, write results to JSON.
 No CUDA needed — runs entirely on CPU.
 
 Usage:
-    python -m tests.vllm_comparator \
+    python -m tests.vllm_rowcnt_comparator \
         --ref-dir /tmp/vllm_ref \
         --mon-dir /tmp/vllm_mon \
         --result-file /tmp/vllm_result.json
@@ -57,7 +57,8 @@ def main():
         raw_rows = ch_client.execute(
             "SELECT model_id, request_id, act_name, layer_no, shard_rank, "
             "start_token_idx, end_token_idx, dtype, shape, bytes "
-            "FROM default.offload")
+            "FROM default.offload",
+            settings={"strings_as_bytes": True})
     except Exception as e:
         _check("db_readable", False, str(e))
         with open(args.result_file, "w") as f:
@@ -74,13 +75,12 @@ def main():
         "torch.bool": torch.bool,
     }
     rows = []
+    _decode = lambda v: v.decode() if isinstance(v, bytes) else v
     for row in raw_rows:
         model_id_val, req_id, act_name, layer_no, shard_rank, s, e, dtype_str, shape, payload = row
-        dt = _DTYPE_MAP.get(dtype_str, torch.float32)
-        if isinstance(payload, str):
-            payload = payload.encode("latin-1")
+        dt = _DTYPE_MAP.get(_decode(dtype_str), torch.float32)
         t = torch.frombuffer(bytearray(payload), dtype=dt).reshape(list(shape))
-        key = (model_id_val, req_id, act_name, layer_no, shard_rank, s, e)
+        key = (_decode(model_id_val), _decode(req_id), _decode(act_name), layer_no, shard_rank, s, e)
         rows.append((key, t))
 
     _check("rows_found", len(rows) > 0, f"{len(rows)} rows")

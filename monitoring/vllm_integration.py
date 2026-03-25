@@ -211,6 +211,10 @@ class DMXGPUWorker(Worker):
         model = self.model_runner.model
         model_shape = _make_model_shape(model)
         if model_shape is not None:
+            # _make_model_shape reads model.dtype which is unavailable on
+            # vLLM model classes.  Override with the authoritative dtype
+            # from vllm_config so meta shapes use the correct element size.
+            model_shape.dtype = self.vllm_config.model_config.dtype
             transport.set_model_cfg(model_shape)
 
         if hasattr(model, "get_hook_specs"):
@@ -310,6 +314,28 @@ class DMXGPUWorker(Worker):
                 ring_transport.set_cpu_direct(is_cpu_direct)
                 if is_cpu_direct:
                     self._dmx_force_eager = True
+                    # Warn once per (total_q, num_reqs) shape
+                    shape_key = (total_q, num_reqs)
+                    if not hasattr(transport, '_warned_shapes'):
+                        transport._warned_shapes = set()
+                    if shape_key not in transport._warned_shapes:
+                        transport._warned_shapes.add(shape_key)
+                        import warnings
+                        re = transport._ring_engine
+                        pcap = re.payload_cap()
+                        scap = re.staging_cap()
+                        if step_bytes > pcap and step_bytes > scap:
+                            reason = (f"exceeds both GPU ring ({pcap / 1e6:.0f} MB) "
+                                      f"and pinned staging ({scap / 1e6:.0f} MB)")
+                        elif step_bytes > pcap:
+                            reason = f"exceeds GPU ring ({pcap / 1e6:.0f} MB)"
+                        else:
+                            reason = f"exceeds pinned staging ({scap / 1e6:.0f} MB)"
+                        warnings.warn(
+                            f"[vllm_integration] Step data ({step_bytes / 1e6:.1f} MB) "
+                            f"{reason}. Falling back to cpu_direct for {n_hooks} hooks.",
+                            stacklevel=2,
+                        )
 
         # Meta q_len: if cpu_direct, we set force_eager which disables
         # CUDA graph dispatch -> no padding -> tensor is unpadded.
