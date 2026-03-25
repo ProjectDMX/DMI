@@ -46,7 +46,8 @@ LIMIT=128
 PAD_BUCKETS="128,256,384,512"
 CAPTURE_MODE="hs_logits"
 RING_STEP_MB=5120
-RING_MIN_MB=5120
+RING_MIN_MB=1024
+RING_MAX_MB=40960
 RING_TASK_ENTRIES=131072
 RING_FLUSH=0.15
 RUN_TAG="$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
@@ -227,21 +228,40 @@ run_baseline_allow_fail() {
 }
 
 estimate_proj_dmi_ring_mb() {
-    local total_mb
-    total_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n1)
-    local base_reserve=14336
-    local batch_penalty=8192
-    local seq_penalty=3072
-    local total_seq=$((MAX_INPUT + MAX_OUTPUT))
-    if [ "${total_seq}" -ge 1200 ]; then
-        seq_penalty=5120
-    fi
-    local slack_mb=4096
-    local raw_mb=$((total_mb - base_reserve - batch_penalty - seq_penalty - slack_mb))
+    local hook_count="$1"
+    local raw_mb
+    case "${hook_count}" in
+        1)
+            raw_mb=1024
+            ;;
+        73)
+            # q + k + logits at bs64 / prefill384 is ~8.5 GiB; use ~2x.
+            raw_mb=17408
+            ;;
+        145)
+            # q + k + pattern + attn_scores is ~49 GiB at worst-case cap.
+            # 2x is not feasible once model/workspace are included, so cap.
+            raw_mb=${RING_MAX_MB}
+            ;;
+        253)
+            raw_mb=${RING_MAX_MB}
+            ;;
+        325)
+            raw_mb=${RING_MAX_MB}
+            ;;
+        *)
+            raw_mb=${RING_MAX_MB}
+            ;;
+    esac
     if [ "${raw_mb}" -lt "${RING_MIN_MB}" ]; then
         raw_mb="${RING_MIN_MB}"
     fi
-    raw_mb=$(( raw_mb / RING_STEP_MB * RING_STEP_MB ))
+    if [ "${raw_mb}" -gt "${RING_MAX_MB}" ]; then
+        raw_mb="${RING_MAX_MB}"
+    fi
+    if [ "${raw_mb}" -gt "${RING_STEP_MB}" ]; then
+        raw_mb=$(( raw_mb / RING_STEP_MB * RING_STEP_MB ))
+    fi
     if [ "${raw_mb}" -lt "${RING_MIN_MB}" ]; then
         raw_mb="${RING_MIN_MB}"
     fi
@@ -343,7 +363,7 @@ for idx in "${!HOOK_SELECTIONS[@]}"; do
         --disable-compile \
         --hook-selection "${hook_sel}"
 
-    initial_ring_mb=$(estimate_proj_dmi_ring_mb)
+    initial_ring_mb=$(estimate_proj_dmi_ring_mb "${hook_count}")
     run_proj_dmi_with_retry "${hook_count}" "${hook_sel}" "${initial_ring_mb}"
 done
 
