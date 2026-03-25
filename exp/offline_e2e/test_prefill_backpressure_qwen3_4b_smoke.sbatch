@@ -45,6 +45,7 @@ PREFILL_TOKENS=16
 NUM_MICROBATCHES=4
 HEAVY_HOOKS="q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
 LIGHT_HOOKS="${HEAVY_HOOKS}"
+RING_FLUSH=0.15
 RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/prefill_backpressure_smoke_$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
 mkdir -p "${RESULTS_DIR}"
 
@@ -114,7 +115,9 @@ run_case "Smoke: dmi_light" \
     --proj-dmi-mode ring_null \
     --hook-selection "${LIGHT_HOOKS}" \
     --ring-payload-mb 8192 \
-    --ring-pinned-mb 8192
+    --ring-pinned-mb 8192 \
+    --drain-flush-payload-ratio "${RING_FLUSH}" \
+    --drain-flush-task-ratio "${RING_FLUSH}"
 
 run_case "Smoke: dmi_heavy" \
   python run_prefill_backpressure.py "${COMMON[@]}" \
@@ -123,7 +126,9 @@ run_case "Smoke: dmi_heavy" \
     --proj-dmi-mode ring_null \
     --hook-selection "${HEAVY_HOOKS}" \
     --ring-payload-mb 2048 \
-    --ring-pinned-mb 2048
+    --ring-pinned-mb 2048 \
+    --drain-flush-payload-ratio "${RING_FLUSH}" \
+    --drain-flush-task-ratio "${RING_FLUSH}"
 
 echo ""
 echo "============================================================"

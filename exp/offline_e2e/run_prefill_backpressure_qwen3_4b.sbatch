@@ -46,11 +46,12 @@ NUM_MICROBATCHES=32
 HF_HOOK_SET="none"
 DMI_HEAVY_HOOKS="q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
 DMI_LIGHT_HOOKS="${DMI_HEAVY_HOOKS}"
-LIGHT_RING_PAYLOAD_MB=49152
-LIGHT_RING_PINNED_MB=49152
+LIGHT_RING_PAYLOAD_MB=61440
+LIGHT_RING_PINNED_MB=61440
 HEAVY_RING_PAYLOAD_MB=16384
 HEAVY_RING_PINNED_MB=16384
 RING_TASK_ENTRIES=65536
+RING_FLUSH=0.15
 
 RUN_TAG="$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
 RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/prefill_backpressure_fixed_${RUN_TAG}"
@@ -187,7 +188,9 @@ run_allow_fail "dmi_light" "${DMI_LIGHT_HOOKS}" \
     --hook-selection "${DMI_LIGHT_HOOKS}" \
     --ring-payload-mb "${LIGHT_RING_PAYLOAD_MB}" \
     --ring-pinned-mb "${LIGHT_RING_PINNED_MB}" \
-    --ring-task-entries "${RING_TASK_ENTRIES}"
+    --ring-task-entries "${RING_TASK_ENTRIES}" \
+    --drain-flush-payload-ratio "${RING_FLUSH}" \
+    --drain-flush-task-ratio "${RING_FLUSH}"
 
 run_allow_fail "dmi_heavy" "${DMI_HEAVY_HOOKS}" \
   python run_prefill_backpressure.py "${COMMON[@]}" \
@@ -197,7 +200,9 @@ run_allow_fail "dmi_heavy" "${DMI_HEAVY_HOOKS}" \
     --hook-selection "${DMI_HEAVY_HOOKS}" \
     --ring-payload-mb "${HEAVY_RING_PAYLOAD_MB}" \
     --ring-pinned-mb "${HEAVY_RING_PINNED_MB}" \
-    --ring-task-entries "${RING_TASK_ENTRIES}"
+    --ring-task-entries "${RING_TASK_ENTRIES}" \
+    --drain-flush-payload-ratio "${RING_FLUSH}" \
+    --drain-flush-task-ratio "${RING_FLUSH}"
 
 echo ""
 echo "============================================================"
