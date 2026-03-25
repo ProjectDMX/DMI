@@ -43,9 +43,9 @@ MODEL="qwen3-4b"
 SAMPLE_FILE="../../benchmark/data/offline_e2e/sharegpt_500_sample1.jsonl"
 BATCH_SIZE=2
 LIMIT=4
-MAX_INPUT=64
-MAX_OUTPUT=16
-PAD_BUCKETS="32,64"
+MAX_INPUT=128
+MAX_OUTPUT=32
+PAD_BUCKETS="64,128"
 CAPTURE_MODE="hs_logits"
 RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/hook_count_smoke_qwen3_4b_$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
 mkdir -p "${RESULTS_DIR}"

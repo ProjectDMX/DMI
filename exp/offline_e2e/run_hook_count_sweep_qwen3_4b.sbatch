@@ -59,12 +59,12 @@ case "${DATASET}" in
     sharegpt)
         SAMPLE_FILE="../../benchmark/data/offline_e2e/sharegpt_500_sample1.jsonl"
         MAX_INPUT=384
-        MAX_OUTPUT=256
+        MAX_OUTPUT=64
         ;;
     wildchat)
         SAMPLE_FILE="../../benchmark/data/offline_e2e/wildchat_500_sample1.jsonl"
         MAX_INPUT=384
-        MAX_OUTPUT=256
+        MAX_OUTPUT=64
         ;;
     *)
         echo "ERROR: unsupported DATASET=${DATASET}; use sharegpt or wildchat"
@@ -75,8 +75,8 @@ esac
 HOOK_SELECTIONS=(
     "logits"
     "q,k,logits"
-    "q,k,v,z,logits"
-    "q,k,v,z,mlp_in,mlp_out,resid_mid,logits"
+    "q,k,pattern,attn_scores,logits"
+    "q,k,v,z,pattern,attn_scores,resid_mid,logits"
     "q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
 )
 HOOK_COUNTS=(1 73 145 253 325)
