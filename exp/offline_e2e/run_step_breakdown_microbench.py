@@ -489,6 +489,19 @@ def _flush_proj_dmi_ring(engine: Any) -> Dict[str, int]:
     }
 
 
+def _set_proj_dmi_hook_enabled(model: Any, enabled: bool) -> None:
+    from monitoring import ring_transport
+
+    transport = ring_transport.get_active()
+    if transport is None:
+        return
+    for spec in getattr(transport, "_active_specs", []):
+        try:
+            spec.module.enabled = enabled
+        except Exception:
+            pass
+
+
 def _prepare_ring_forward(
     *,
     model: Any,
@@ -564,17 +577,20 @@ def _measure_dmi_prefill(
     args: argparse.Namespace,
     encoded: Dict[str, torch.Tensor],
     *,
+    engine: Any = None,
     compiled_prefill: Any = None,
 ) -> Tuple[float, float, Dict[str, int]]:
     device = encoded["input_ids"].device
     kwargs = _dmi_prefill_kwargs(model, encoded)
-    engine = _create_proj_dmi_engine_for_model(
-        model_id=model_id,
-        model=model,
-        proj_dmi_mode=str(args.proj_dmi_mode),
-        hook_selection=str(args.hook_selection),
-        args=args,
-    )
+    owns_engine = engine is None
+    if engine is None:
+        engine = _create_proj_dmi_engine_for_model(
+            model_id=model_id,
+            model=model,
+            proj_dmi_mode=str(args.proj_dmi_mode),
+            hook_selection=str(args.hook_selection),
+            args=args,
+        )
     device_sync(device)
     t0 = time.perf_counter()
     if compiled_prefill is None:
@@ -596,7 +612,8 @@ def _measure_dmi_prefill(
     torch.cuda.current_stream().synchronize()
     t_compute = time.perf_counter()
     ring_stats = _flush_proj_dmi_ring(engine)
-    _close_proj_dmi_microbench(model, engine)
+    if owns_engine:
+        _close_proj_dmi_microbench(model, engine)
     compute_ms = (t_compute - t0) * 1000.0
     total_ms = compute_ms + (float(ring_stats["flush_wait_us"]) / 1000.0)
     return compute_ms, total_ms, ring_stats
@@ -608,23 +625,26 @@ def _measure_dmi_decode(
     args: argparse.Namespace,
     encoded: Dict[str, torch.Tensor],
     *,
+    engine: Any = None,
     compiled_prefill: Any = None,
     compiled_decode: Any = None,
 ) -> Tuple[float, float, Dict[str, int]]:
     device = encoded["input_ids"].device
+    owns_engine = engine is None
     if compiled_prefill is None or compiled_decode is None:
         decode_kwargs = _build_decode_inputs_from_prefill(model, encoded)
         next_tokens = decode_kwargs["input_ids"]
         decode_mask = decode_kwargs["attention_mask"]
         past_key_values = decode_kwargs.get("past_key_values")
         cache_position = decode_kwargs.get("cache_position")
-        engine = _create_proj_dmi_engine_for_model(
-            model_id=model_id,
-            model=model,
-            proj_dmi_mode=str(args.proj_dmi_mode),
-            hook_selection=str(args.hook_selection),
-            args=args,
-        )
+        if engine is None:
+            engine = _create_proj_dmi_engine_for_model(
+                model_id=model_id,
+                model=model,
+                proj_dmi_mode=str(args.proj_dmi_mode),
+                hook_selection=str(args.hook_selection),
+                args=args,
+            )
         device_sync(device)
         torch.compiler.cudagraph_mark_step_begin()
         t0 = time.perf_counter()
@@ -647,8 +667,14 @@ def _measure_dmi_decode(
         prefill_kwargs = _dmi_prefill_kwargs(model, encoded)
         prefill_kwargs["past_key_values"] = cache
         prefill_kwargs["cache_position"] = torch.arange(encoded["input_ids"].shape[1], device=device, dtype=torch.long)
-        with torch.no_grad():
-            prefill_outputs = model(**prefill_kwargs)
+        if engine is not None:
+            _set_proj_dmi_hook_enabled(model, False)
+        try:
+            with torch.no_grad():
+                prefill_outputs = model(**prefill_kwargs)
+        finally:
+            if engine is not None:
+                _set_proj_dmi_hook_enabled(model, True)
         next_tokens = prefill_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
         del prefill_outputs
         decode_mask = torch.cat(
@@ -657,13 +683,14 @@ def _measure_dmi_decode(
         )
         decode_cache_position = torch.tensor([encoded["input_ids"].shape[1]], device=device, dtype=torch.long)
         decode_position_ids = _position_ids_from_attention_mask(decode_mask)[:, -1:].contiguous() if _forward_accepts_position_ids(model) else None
-        engine = _create_proj_dmi_engine_for_model(
-            model_id=model_id,
-            model=model,
-            proj_dmi_mode=str(args.proj_dmi_mode),
-            hook_selection=str(args.hook_selection),
-            args=args,
-        )
+        if engine is None:
+            engine = _create_proj_dmi_engine_for_model(
+                model_id=model_id,
+                model=model,
+                proj_dmi_mode=str(args.proj_dmi_mode),
+                hook_selection=str(args.hook_selection),
+                args=args,
+            )
         device_sync(device)
         t0 = time.perf_counter()
         _prepare_ring_forward(
@@ -680,7 +707,8 @@ def _measure_dmi_decode(
     torch.cuda.current_stream().synchronize()
     t_compute = time.perf_counter()
     ring_stats = _flush_proj_dmi_ring(engine)
-    _close_proj_dmi_microbench(model, engine)
+    if owns_engine:
+        _close_proj_dmi_microbench(model, engine)
     compute_ms = (t_compute - t0) * 1000.0
     total_ms = compute_ms + (float(ring_stats["flush_wait_us"]) / 1000.0)
     return compute_ms, total_ms, ring_stats
@@ -779,28 +807,8 @@ def main() -> None:
     else:
         model = _load_hooked_model(model_id, local_files_only=bool(args.local_files_only))
         model.to(device).eval()
-        if compile_enabled:
-            compiled_prefill = _compile_prefill_step(model, output_hidden_states=False)
-            compiled_decode = _compile_decode_step(model, output_hidden_states=False)
 
     try:
-        with torch.no_grad():
-            for _ in range(int(args.warmup)):
-                if args.baseline == "hf_ideal":
-                    _measure_hf_ideal_prefill(model, encoded, compiled_prefill=compiled_prefill)
-                    _measure_hf_ideal_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
-                elif args.baseline == "hf_api":
-                    _measure_hf_api_prefill(model, encoded, compiled_prefill=compiled_prefill)
-                    _measure_hf_api_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
-                elif args.baseline == "torch_hooks":
-                    _measure_torch_hooks_prefill(model, collector, encoded)
-                    _measure_torch_hooks_decode(model, collector, encoded)
-                else:
-                    _measure_dmi_prefill(model, model_id, args, encoded, compiled_prefill=compiled_prefill)
-                    _measure_dmi_decode(model, model_id, args, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
-                device_sync(device)
-        print(f"Warmup done ({int(args.warmup)} iterations).", flush=True)
-
         prefill_compute_runs: List[float] = []
         prefill_total_runs: List[float] = []
         decode_compute_runs: List[float] = []
@@ -808,31 +816,104 @@ def main() -> None:
         prefill_ring_stats_runs: List[Dict[str, int]] = []
         decode_ring_stats_runs: List[Dict[str, int]] = []
 
-        with torch.no_grad():
-            for _ in range(int(args.iters)):
-                if args.baseline == "hf_ideal":
-                    prefill_compute_ms, prefill_total_ms = _measure_hf_ideal_prefill(model, encoded, compiled_prefill=compiled_prefill)
-                    decode_compute_ms, decode_total_ms = _measure_hf_ideal_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
-                elif args.baseline == "hf_api":
-                    prefill_compute_ms, prefill_total_ms = _measure_hf_api_prefill(model, encoded, compiled_prefill=compiled_prefill)
-                    decode_compute_ms, decode_total_ms = _measure_hf_api_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
-                elif args.baseline == "torch_hooks":
-                    prefill_compute_ms, prefill_total_ms = _measure_torch_hooks_prefill(model, collector, encoded)
-                    decode_compute_ms, decode_total_ms = _measure_torch_hooks_decode(model, collector, encoded)
-                else:
-                    prefill_compute_ms, prefill_total_ms, prefill_ring_stats = _measure_dmi_prefill(
-                        model, model_id, args, encoded, compiled_prefill=compiled_prefill
-                    )
-                    decode_compute_ms, decode_total_ms, decode_ring_stats = _measure_dmi_decode(
-                        model, model_id, args, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode
-                    )
-                    prefill_ring_stats_runs.append(prefill_ring_stats)
-                    decode_ring_stats_runs.append(decode_ring_stats)
+        if args.baseline != "proj_dmi":
+            with torch.no_grad():
+                for _ in range(int(args.warmup)):
+                    if args.baseline == "hf_ideal":
+                        _measure_hf_ideal_prefill(model, encoded, compiled_prefill=compiled_prefill)
+                        _measure_hf_ideal_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
+                    elif args.baseline == "hf_api":
+                        _measure_hf_api_prefill(model, encoded, compiled_prefill=compiled_prefill)
+                        _measure_hf_api_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
+                    else:
+                        _measure_torch_hooks_prefill(model, collector, encoded)
+                        _measure_torch_hooks_decode(model, collector, encoded)
+                    device_sync(device)
+            print(f"Warmup done ({int(args.warmup)} iterations).", flush=True)
 
-                prefill_compute_runs.append(prefill_compute_ms)
-                prefill_total_runs.append(prefill_total_ms)
-                decode_compute_runs.append(decode_compute_ms)
-                decode_total_runs.append(decode_total_ms)
+            with torch.no_grad():
+                for _ in range(int(args.iters)):
+                    if args.baseline == "hf_ideal":
+                        prefill_compute_ms, prefill_total_ms = _measure_hf_ideal_prefill(model, encoded, compiled_prefill=compiled_prefill)
+                        decode_compute_ms, decode_total_ms = _measure_hf_ideal_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
+                    elif args.baseline == "hf_api":
+                        prefill_compute_ms, prefill_total_ms = _measure_hf_api_prefill(model, encoded, compiled_prefill=compiled_prefill)
+                        decode_compute_ms, decode_total_ms = _measure_hf_api_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
+                    else:
+                        prefill_compute_ms, prefill_total_ms = _measure_torch_hooks_prefill(model, collector, encoded)
+                        decode_compute_ms, decode_total_ms = _measure_torch_hooks_decode(model, collector, encoded)
+
+                    prefill_compute_runs.append(prefill_compute_ms)
+                    prefill_total_runs.append(prefill_total_ms)
+                    decode_compute_runs.append(decode_compute_ms)
+                    decode_total_runs.append(decode_total_ms)
+        else:
+            prefill_engine = _create_proj_dmi_engine_for_model(
+                model_id=model_id,
+                model=model,
+                proj_dmi_mode=str(args.proj_dmi_mode),
+                hook_selection=str(args.hook_selection),
+                args=args,
+            )
+            try:
+                dmi_compiled_prefill = (
+                    _compile_prefill_step(model, output_hidden_states=False) if compile_enabled else None
+                )
+                with torch.no_grad():
+                    for _ in range(int(args.warmup)):
+                        _measure_dmi_prefill(model, model_id, args, encoded, engine=prefill_engine, compiled_prefill=dmi_compiled_prefill)
+                        device_sync(device)
+                print(f"Warmup done ({int(args.warmup)} iterations).", flush=True)
+                with torch.no_grad():
+                    for _ in range(int(args.iters)):
+                        prefill_compute_ms, prefill_total_ms, prefill_ring_stats = _measure_dmi_prefill(
+                            model, model_id, args, encoded, engine=prefill_engine, compiled_prefill=dmi_compiled_prefill
+                        )
+                        prefill_compute_runs.append(prefill_compute_ms)
+                        prefill_total_runs.append(prefill_total_ms)
+                        prefill_ring_stats_runs.append(prefill_ring_stats)
+            finally:
+                _close_proj_dmi_microbench(model, prefill_engine)
+
+            decode_engine = _create_proj_dmi_engine_for_model(
+                model_id=model_id,
+                model=model,
+                proj_dmi_mode=str(args.proj_dmi_mode),
+                hook_selection=str(args.hook_selection),
+                args=args,
+            )
+            try:
+                dmi_compiled_decode = (
+                    _compile_decode_step(model, output_hidden_states=False) if compile_enabled else None
+                )
+                with torch.no_grad():
+                    for _ in range(int(args.warmup)):
+                        _measure_dmi_decode(
+                            model,
+                            model_id,
+                            args,
+                            encoded,
+                            engine=decode_engine,
+                            compiled_prefill=dmi_compiled_prefill if compile_enabled else None,
+                            compiled_decode=dmi_compiled_decode,
+                        )
+                        device_sync(device)
+                with torch.no_grad():
+                    for _ in range(int(args.iters)):
+                        decode_compute_ms, decode_total_ms, decode_ring_stats = _measure_dmi_decode(
+                            model,
+                            model_id,
+                            args,
+                            encoded,
+                            engine=decode_engine,
+                            compiled_prefill=dmi_compiled_prefill if compile_enabled else None,
+                            compiled_decode=dmi_compiled_decode,
+                        )
+                        decode_compute_runs.append(decode_compute_ms)
+                        decode_total_runs.append(decode_total_ms)
+                        decode_ring_stats_runs.append(decode_ring_stats)
+            finally:
+                _close_proj_dmi_microbench(model, decode_engine)
 
         prefill_summary = {
             "compute_ms": _mean(prefill_compute_runs),
