@@ -35,6 +35,31 @@ from run_torch_hooks import TorchHookCollector, _load_model_for_hook_selection
 HS_LOGITS_HOOK_SELECTION = "hidden-states,final_ln,logits"
 
 
+def _load_base_model(model_id: str, *, local_files_only: bool):
+    if "qwen3" in model_id.lower():
+        from transformers.models.qwen3_p.modeling_qwen3 import Qwen3ForCausalLM
+
+        model_cls = Qwen3ForCausalLM
+    elif "llama" in model_id.lower():
+        from transformers.models.llama.modeling_llama import LlamaForCausalLM
+
+        model_cls = LlamaForCausalLM
+    elif model_id.lower() == "gpt2":
+        from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+
+        model_cls = GPT2LMHeadModel
+    else:
+        from transformers import AutoModelForCausalLM
+
+        model_cls = AutoModelForCausalLM
+    return model_cls.from_pretrained(
+        model_id,
+        attn_implementation="eager",
+        torch_dtype=torch.float16,
+        local_files_only=local_files_only,
+    )
+
+
 def _make_static_cache(model: Any, *, batch_size: int, max_cache_len: int, device: torch.device) -> StaticCache:
     return StaticCache(
         config=model.config,
@@ -774,26 +799,12 @@ def main() -> None:
     compiled_prefill = None
     compiled_decode = None
     if args.baseline == "hf_ideal":
-        from transformers import AutoModelForCausalLM
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            attn_implementation="eager",
-            torch_dtype=torch.float16,
-            local_files_only=bool(args.local_files_only),
-        ).to(device).eval()
+        model = _load_base_model(model_id, local_files_only=bool(args.local_files_only)).to(device).eval()
         if compile_enabled:
             compiled_prefill = _compile_prefill_step(model, output_hidden_states=False)
             compiled_decode = _compile_decode_step(model, output_hidden_states=False)
     elif args.baseline == "hf_api":
-        from transformers import AutoModelForCausalLM
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            attn_implementation="eager",
-            torch_dtype=torch.float16,
-            local_files_only=bool(args.local_files_only),
-        ).to(device).eval()
+        model = _load_base_model(model_id, local_files_only=bool(args.local_files_only)).to(device).eval()
         if compile_enabled:
             compiled_prefill = _compile_prefill_step(model, output_hidden_states=True)
             compiled_decode = _compile_decode_step(model, output_hidden_states=True)
