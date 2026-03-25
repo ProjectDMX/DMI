@@ -70,7 +70,7 @@ def _compile_prefill_step(model: Any, *, output_hidden_states: bool):
             kwargs["position_ids"] = position_ids
         return model(**kwargs)
 
-    return torch.compile(_prefill_step, mode="reduce-overhead", fullgraph=False)
+    return torch.compile(_prefill_step, mode="reduce-overhead", fullgraph=True)
 
 
 def _compile_decode_step(model: Any, *, output_hidden_states: bool):
@@ -98,7 +98,7 @@ def _compile_decode_step(model: Any, *, output_hidden_states: bool):
             kwargs["position_ids"] = position_ids
         return model(**kwargs)
 
-    return torch.compile(_decode_step, mode="reduce-overhead", fullgraph=False)
+    return torch.compile(_decode_step, mode="reduce-overhead", fullgraph=True)
 
 
 def _position_ids_from_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
