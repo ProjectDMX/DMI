@@ -955,6 +955,8 @@ def _measure_dmi_legacy_decode(
     t_total0 = time.perf_counter()
     last_compute_ms = 0.0
     last_total_ms = 0.0
+    decode_total_compute_ms = 0.0
+    decode_total_total_ms = 0.0
     for step_idx in range(int(decode_steps)):
         decode_mask[:, prefill_tokens + step_idx] = 1
         decode_cache_position = torch.tensor([prefill_tokens + step_idx], device=device, dtype=torch.long)
@@ -985,23 +987,25 @@ def _measure_dmi_legacy_decode(
             decode_outputs = compiled_decode(next_tokens, decode_mask, cache, decode_cache_position, decode_position_ids)
         torch.cuda.current_stream().synchronize()
         step_compute_t = time.perf_counter()
-        engine.resolve_all()
-        step_end_t = time.perf_counter()
         if step_idx == int(decode_steps) - 1:
             last_compute_ms = (step_compute_t - step_t0) * 1000.0
-            last_total_ms = (step_end_t - step_t0) * 1000.0
+            last_total_ms = last_compute_ms
+            decode_total_compute_ms = (step_compute_t - t_total0) * 1000.0
+            decode_total_total_ms = decode_total_compute_ms
         next_tokens = decode_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
-    decode_total_compute_ms = (step_compute_t - t_total0) * 1000.0
-    decode_total_total_ms = (step_end_t - t_total0) * 1000.0
+    engine.resolve_all()
+    resolve_end_t = time.perf_counter()
     if owns_engine:
         _close_proj_dmi_microbench(model, engine)
+    last_total_with_flush_ms = (resolve_end_t - step_t0) * 1000.0
+    decode_total_total_with_flush_ms = (resolve_end_t - t_total0) * 1000.0
     return (
         last_compute_ms,
         last_total_ms,
-        last_total_ms,
+        last_total_with_flush_ms,
         decode_total_compute_ms,
         decode_total_total_ms,
-        decode_total_total_ms,
+        decode_total_total_with_flush_ms,
     )
 
 
