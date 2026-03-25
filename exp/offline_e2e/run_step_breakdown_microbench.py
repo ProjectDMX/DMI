@@ -301,6 +301,7 @@ def _measure_hf_ideal_decode(
     device_sync(device)
     t_total0 = time.perf_counter()
     for step_idx in range(int(decode_steps)):
+        step_t0 = time.perf_counter()
         decode_mask[:, prefill_tokens + step_idx] = 1
         decode_cache_position = torch.tensor([prefill_tokens + step_idx], device=device, dtype=torch.long)
         decode_position_ids = (
@@ -308,7 +309,6 @@ def _measure_hf_ideal_decode(
             if _forward_accepts_position_ids(model)
             else None
         )
-        step_t0 = time.perf_counter()
         if compiled_decode is None:
             decode_kwargs: Dict[str, Any] = {
                 "input_ids": next_tokens,
@@ -329,11 +329,11 @@ def _measure_hf_ideal_decode(
             torch.compiler.cudagraph_mark_step_begin()
             decode_outputs = compiled_decode(next_tokens, decode_mask, cache, decode_cache_position, decode_position_ids)
         device_sync(device)
+        next_tokens = decode_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
         step_t1 = time.perf_counter()
         if step_idx == int(decode_steps) - 1:
             last_compute_ms = (step_t1 - step_t0) * 1000.0
             last_total_ms = last_compute_ms
-        next_tokens = decode_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
     total_ms = (time.perf_counter() - t_total0) * 1000.0
     return last_compute_ms, last_total_ms, last_total_ms, total_ms, total_ms, total_ms
 
@@ -386,6 +386,7 @@ def _measure_hf_api_decode(
     device_sync(device)
     t_total0 = time.perf_counter()
     for step_idx in range(int(decode_steps)):
+        step_t0 = time.perf_counter()
         decode_mask[:, prefill_tokens + step_idx] = 1
         decode_cache_position = torch.tensor([prefill_tokens + step_idx], device=device, dtype=torch.long)
         decode_position_ids = (
@@ -393,7 +394,6 @@ def _measure_hf_api_decode(
             if _forward_accepts_position_ids(model)
             else None
         )
-        step_t0 = time.perf_counter()
         if compiled_decode is None:
             decode_kwargs: Dict[str, Any] = {
                 "input_ids": next_tokens,
@@ -417,11 +417,11 @@ def _measure_hf_api_decode(
         step_compute_t = time.perf_counter()
         _copy_hf_outputs_to_cpu(decode_outputs)
         device_sync(device)
+        next_tokens = decode_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
         step_end_t = time.perf_counter()
         if step_idx == int(decode_steps) - 1:
             last_compute_ms = (step_compute_t - step_t0) * 1000.0
             last_total_ms = (step_end_t - step_t0) * 1000.0
-        next_tokens = decode_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
     decode_total_compute_ms = (step_compute_t - t_total0) * 1000.0
     decode_total_total_ms = (step_end_t - t_total0) * 1000.0
     return (
@@ -464,6 +464,7 @@ def _measure_torch_hooks_decode(
     device_sync(device)
     t_total0 = time.perf_counter()
     for step_idx in range(int(decode_steps)):
+        step_t0 = time.perf_counter()
         decode_mask[:, prefill_tokens + step_idx] = 1
         decode_cache_position = torch.tensor([prefill_tokens + step_idx], device=device, dtype=torch.long)
         decode_position_ids = (
@@ -471,7 +472,6 @@ def _measure_torch_hooks_decode(
             if _forward_accepts_position_ids(model)
             else None
         )
-        step_t0 = time.perf_counter()
         decode_kwargs: Dict[str, Any] = {
             "input_ids": next_tokens,
             "attention_mask": decode_mask,
@@ -489,10 +489,10 @@ def _measure_torch_hooks_decode(
         decode_outputs = model(**decode_kwargs)
         collector.end()
         device_sync(device)
+        next_tokens = decode_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
         step_t1 = time.perf_counter()
         if step_idx == int(decode_steps) - 1:
             last_ms = (step_t1 - step_t0) * 1000.0
-        next_tokens = decode_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
     total_ms = (time.perf_counter() - t_total0) * 1000.0
     return last_ms, last_ms, last_ms, total_ms, total_ms, total_ms
 
@@ -555,13 +555,21 @@ def _create_proj_dmi_legacy_engine_for_model(
     *,
     model_id: str,
     model: Any,
+    hook_selection: str,
 ) -> Any:
     from monitoring import AdvanceConfig, MonitoringConfig, MonitoringEngine, NativePartialSealConfig
     from monitoring.config import CaptureSchedule, HookSelection
     from monitoring.generate import _install_monitoring_forward, _uninstall_monitoring_forward
+    from monitoring import ring_transport
+
+    include_names = [
+        name
+        for name in getattr(model, "hook_dict", {}).keys()
+        if ring_transport._hook_type_from_name(name) in ring_transport.resolve_hook_selection(hook_selection)
+    ]
 
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode="full"),
+        hooks=HookSelection(mode="custom", include=include_names),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
         native_partial_seal=NativePartialSealConfig(
             enabled=True,
@@ -864,7 +872,11 @@ def _measure_dmi_legacy_prefill(
     kwargs = _dmi_prefill_kwargs(model, encoded)
     owns_engine = engine is None
     if engine is None:
-        engine = _create_proj_dmi_legacy_engine_for_model(model_id=model_id, model=model)
+        engine = _create_proj_dmi_legacy_engine_for_model(
+            model_id=model_id,
+            model=model,
+            hook_selection=HS_LOGITS_HOOK_SELECTION,
+        )
     device_sync(device)
     t0 = time.perf_counter()
     if compiled_prefill is None:
@@ -902,7 +914,11 @@ def _measure_dmi_legacy_decode(
     device = encoded["input_ids"].device
     owns_engine = engine is None
     if engine is None:
-        engine = _create_proj_dmi_legacy_engine_for_model(model_id=model_id, model=model)
+        engine = _create_proj_dmi_legacy_engine_for_model(
+            model_id=model_id,
+            model=model,
+            hook_selection=HS_LOGITS_HOOK_SELECTION,
+        )
     prefill_tokens = int(encoded["input_ids"].shape[1])
     batch_size = int(encoded["input_ids"].shape[0])
     cache = _make_static_cache(
@@ -1196,6 +1212,7 @@ def main() -> None:
             legacy_prefill_engine = _create_proj_dmi_legacy_engine_for_model(
                 model_id=model_id,
                 model=model,
+                hook_selection=str(args.hook_selection),
             )
             try:
                 dmi_legacy_compiled_prefill = (
@@ -1229,6 +1246,7 @@ def main() -> None:
             legacy_decode_engine = _create_proj_dmi_legacy_engine_for_model(
                 model_id=model_id,
                 model=model,
+                hook_selection=str(args.hook_selection),
             )
             try:
                 dmi_legacy_compiled_decode = (
