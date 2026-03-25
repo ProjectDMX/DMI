@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
+from transformers import StaticCache
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
@@ -32,6 +33,72 @@ from run_torch_hooks import TorchHookCollector, _load_model_for_hook_selection
 
 
 HS_LOGITS_HOOK_SELECTION = "hidden-states,final_ln,logits"
+
+
+def _make_static_cache(model: Any, *, batch_size: int, max_cache_len: int, device: torch.device) -> StaticCache:
+    return StaticCache(
+        config=model.config,
+        batch_size=batch_size,
+        max_cache_len=max_cache_len,
+        device=device,
+        dtype=model.dtype,
+    )
+
+
+def _compile_prefill_step(model: Any, *, output_hidden_states: bool):
+    wants_position_ids = _forward_accepts_position_ids(model)
+
+    def _prefill_step(
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        cache: StaticCache,
+        cache_position: torch.Tensor,
+        position_ids: torch.Tensor | None,
+    ) -> Any:
+        kwargs: Dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": cache,
+            "cache_position": cache_position,
+            "use_cache": True,
+            "return_dict": True,
+            "output_hidden_states": output_hidden_states,
+            "output_attentions": False,
+            "logits_to_keep": 1,
+        }
+        if wants_position_ids:
+            kwargs["position_ids"] = position_ids
+        return model(**kwargs)
+
+    return torch.compile(_prefill_step, mode="reduce-overhead", fullgraph=False)
+
+
+def _compile_decode_step(model: Any, *, output_hidden_states: bool):
+    wants_position_ids = _forward_accepts_position_ids(model)
+
+    def _decode_step(
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        cache: StaticCache,
+        cache_position: torch.Tensor,
+        position_ids: torch.Tensor | None,
+    ) -> Any:
+        kwargs: Dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": cache,
+            "cache_position": cache_position,
+            "use_cache": True,
+            "return_dict": True,
+            "output_hidden_states": output_hidden_states,
+            "output_attentions": False,
+            "logits_to_keep": 1,
+        }
+        if wants_position_ids:
+            kwargs["position_ids"] = position_ids
+        return model(**kwargs)
+
+    return torch.compile(_decode_step, mode="reduce-overhead", fullgraph=False)
 
 
 def _position_ids_from_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -100,10 +167,27 @@ def _hf_forward_kwargs(
     return kwargs
 
 
-def _measure_hf_ideal_prefill(model: Any, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+def _measure_hf_ideal_prefill(
+    model: Any,
+    encoded: Dict[str, torch.Tensor],
+    *,
+    compiled_prefill: Any = None,
+) -> Tuple[float, float]:
     device_sync(encoded["input_ids"].device)
     t0 = time.perf_counter()
-    outputs = model(**_hf_forward_kwargs(model=model, **encoded, use_cache=True, output_hidden_states=False))
+    if compiled_prefill is None:
+        outputs = model(**_hf_forward_kwargs(model=model, **encoded, use_cache=True, output_hidden_states=False))
+    else:
+        cache = _make_static_cache(
+            model,
+            batch_size=int(encoded["input_ids"].shape[0]),
+            max_cache_len=int(encoded["input_ids"].shape[1]) + 4,
+            device=encoded["input_ids"].device,
+        )
+        cache_position = torch.arange(encoded["input_ids"].shape[1], device=encoded["input_ids"].device, dtype=torch.long)
+        position_ids = _position_ids_from_attention_mask(encoded["attention_mask"]) if _forward_accepts_position_ids(model) else None
+        torch.compiler.cudagraph_mark_step_begin()
+        outputs = compiled_prefill(encoded["input_ids"], encoded["attention_mask"], cache, cache_position, position_ids)
     _ = outputs.logits.shape
     device_sync(encoded["input_ids"].device)
     t1 = time.perf_counter()
@@ -133,23 +217,82 @@ def _build_decode_inputs_from_prefill(model: Any, encoded: Dict[str, torch.Tenso
     return decode_kwargs
 
 
-def _measure_hf_ideal_decode(model: Any, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+def _measure_hf_ideal_decode(
+    model: Any,
+    encoded: Dict[str, torch.Tensor],
+    *,
+    compiled_prefill: Any = None,
+    compiled_decode: Any = None,
+) -> Tuple[float, float]:
     device = encoded["input_ids"].device
-    decode_kwargs = _build_decode_inputs_from_prefill(model, encoded)
-    device_sync(device)
-    t0 = time.perf_counter()
-    decode_outputs = model(**decode_kwargs)
+    if compiled_prefill is None or compiled_decode is None:
+        decode_kwargs = _build_decode_inputs_from_prefill(model, encoded)
+        device_sync(device)
+        torch.compiler.cudagraph_mark_step_begin()
+        t0 = time.perf_counter()
+        decode_outputs = model(**decode_kwargs)
+    else:
+        cache = _make_static_cache(
+            model,
+            batch_size=int(encoded["input_ids"].shape[0]),
+            max_cache_len=int(encoded["input_ids"].shape[1]) + 4,
+            device=device,
+        )
+        prefill_kwargs: Dict[str, Any] = {
+            "input_ids": encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
+            "past_key_values": cache,
+            "cache_position": torch.arange(encoded["input_ids"].shape[1], device=device, dtype=torch.long),
+            "use_cache": True,
+            "return_dict": True,
+            "output_hidden_states": False,
+            "output_attentions": False,
+            "logits_to_keep": 1,
+        }
+        if _forward_accepts_position_ids(model):
+            prefill_kwargs["position_ids"] = _position_ids_from_attention_mask(encoded["attention_mask"])
+        with torch.no_grad():
+            prefill_outputs = model(**prefill_kwargs)
+        next_tokens = prefill_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
+        del prefill_outputs
+        decode_mask = torch.cat(
+            [encoded["attention_mask"], torch.ones((encoded["attention_mask"].shape[0], 1), device=device, dtype=encoded["attention_mask"].dtype)],
+            dim=1,
+        )
+        decode_cache_position = torch.tensor([encoded["input_ids"].shape[1]], device=device, dtype=torch.long)
+        decode_position_ids = _position_ids_from_attention_mask(decode_mask)[:, -1:].contiguous() if _forward_accepts_position_ids(model) else None
+        device_sync(device)
+        torch.compiler.cudagraph_mark_step_begin()
+        t0 = time.perf_counter()
+        decode_outputs = compiled_decode(next_tokens, decode_mask, cache, decode_cache_position, decode_position_ids)
     _ = decode_outputs.logits.shape
     device_sync(device)
     t1 = time.perf_counter()
     return (t1 - t0) * 1000.0, (t1 - t0) * 1000.0
 
 
-def _measure_hf_api_prefill(model: Any, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+def _measure_hf_api_prefill(
+    model: Any,
+    encoded: Dict[str, torch.Tensor],
+    *,
+    compiled_prefill: Any = None,
+) -> Tuple[float, float]:
     device = encoded["input_ids"].device
     device_sync(device)
     t0 = time.perf_counter()
-    outputs = model(**_hf_forward_kwargs(model=model, **encoded, use_cache=True, output_hidden_states=True))
+    if compiled_prefill is None:
+        outputs = model(**_hf_forward_kwargs(model=model, **encoded, use_cache=True, output_hidden_states=True))
+    else:
+        cache = _make_static_cache(
+            model,
+            batch_size=int(encoded["input_ids"].shape[0]),
+            max_cache_len=int(encoded["input_ids"].shape[1]) + 4,
+            device=device,
+        )
+        cache_position = torch.arange(encoded["input_ids"].shape[1], device=device, dtype=torch.long)
+        position_ids = _position_ids_from_attention_mask(encoded["attention_mask"]) if _forward_accepts_position_ids(model) else None
+        torch.compiler.cudagraph_mark_step_begin()
+        outputs = compiled_prefill(encoded["input_ids"], encoded["attention_mask"], cache, cache_position, position_ids)
     device_sync(device)
     t_compute = time.perf_counter()
     _copy_hf_outputs_to_cpu(outputs)
@@ -158,13 +301,55 @@ def _measure_hf_api_prefill(model: Any, encoded: Dict[str, torch.Tensor]) -> Tup
     return (t_compute - t0) * 1000.0, (t_end - t0) * 1000.0
 
 
-def _measure_hf_api_decode(model: Any, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+def _measure_hf_api_decode(
+    model: Any,
+    encoded: Dict[str, torch.Tensor],
+    *,
+    compiled_prefill: Any = None,
+    compiled_decode: Any = None,
+) -> Tuple[float, float]:
     device = encoded["input_ids"].device
-    decode_kwargs = _build_decode_inputs_from_prefill(model, encoded)
-    decode_kwargs["output_hidden_states"] = True
-    device_sync(device)
-    t0 = time.perf_counter()
-    decode_outputs = model(**decode_kwargs)
+    if compiled_prefill is None or compiled_decode is None:
+        decode_kwargs = _build_decode_inputs_from_prefill(model, encoded)
+        decode_kwargs["output_hidden_states"] = True
+        device_sync(device)
+        torch.compiler.cudagraph_mark_step_begin()
+        t0 = time.perf_counter()
+        decode_outputs = model(**decode_kwargs)
+    else:
+        cache = _make_static_cache(
+            model,
+            batch_size=int(encoded["input_ids"].shape[0]),
+            max_cache_len=int(encoded["input_ids"].shape[1]) + 4,
+            device=device,
+        )
+        prefill_kwargs: Dict[str, Any] = {
+            "input_ids": encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
+            "past_key_values": cache,
+            "cache_position": torch.arange(encoded["input_ids"].shape[1], device=device, dtype=torch.long),
+            "use_cache": True,
+            "return_dict": True,
+            "output_hidden_states": False,
+            "output_attentions": False,
+            "logits_to_keep": 1,
+        }
+        if _forward_accepts_position_ids(model):
+            prefill_kwargs["position_ids"] = _position_ids_from_attention_mask(encoded["attention_mask"])
+        with torch.no_grad():
+            prefill_outputs = model(**prefill_kwargs)
+        next_tokens = prefill_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
+        del prefill_outputs
+        decode_mask = torch.cat(
+            [encoded["attention_mask"], torch.ones((encoded["attention_mask"].shape[0], 1), device=device, dtype=encoded["attention_mask"].dtype)],
+            dim=1,
+        )
+        decode_cache_position = torch.tensor([encoded["input_ids"].shape[1]], device=device, dtype=torch.long)
+        decode_position_ids = _position_ids_from_attention_mask(decode_mask)[:, -1:].contiguous() if _forward_accepts_position_ids(model) else None
+        device_sync(device)
+        torch.compiler.cudagraph_mark_step_begin()
+        t0 = time.perf_counter()
+        decode_outputs = compiled_decode(next_tokens, decode_mask, cache, decode_cache_position, decode_position_ids)
     device_sync(device)
     t_compute = time.perf_counter()
     _copy_hf_outputs_to_cpu(decode_outputs)
@@ -373,7 +558,14 @@ def _dmi_prefill_kwargs(model: Any, encoded: Dict[str, torch.Tensor]) -> Dict[st
     return kwargs
 
 
-def _measure_dmi_prefill(model: Any, model_id: str, args: argparse.Namespace, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float, Dict[str, int]]:
+def _measure_dmi_prefill(
+    model: Any,
+    model_id: str,
+    args: argparse.Namespace,
+    encoded: Dict[str, torch.Tensor],
+    *,
+    compiled_prefill: Any = None,
+) -> Tuple[float, float, Dict[str, int]]:
     device = encoded["input_ids"].device
     kwargs = _dmi_prefill_kwargs(model, encoded)
     engine = _create_proj_dmi_engine_for_model(
@@ -385,8 +577,21 @@ def _measure_dmi_prefill(model: Any, model_id: str, args: argparse.Namespace, en
     )
     device_sync(device)
     t0 = time.perf_counter()
-    _prepare_ring_forward(model=model, input_ids=kwargs["input_ids"], attention_mask=kwargs["attention_mask"], logits_to_keep=1)
-    outputs = model(**kwargs)
+    if compiled_prefill is None:
+        _prepare_ring_forward(model=model, input_ids=kwargs["input_ids"], attention_mask=kwargs["attention_mask"], logits_to_keep=1)
+        outputs = model(**kwargs)
+    else:
+        cache = _make_static_cache(
+            model,
+            batch_size=int(encoded["input_ids"].shape[0]),
+            max_cache_len=int(encoded["input_ids"].shape[1]) + 4,
+            device=device,
+        )
+        cache_position = torch.arange(encoded["input_ids"].shape[1], device=device, dtype=torch.long)
+        position_ids = kwargs.get("position_ids")
+        _prepare_ring_forward(model=model, input_ids=kwargs["input_ids"], attention_mask=kwargs["attention_mask"], past_key_values=cache, cache_position=cache_position, logits_to_keep=1)
+        torch.compiler.cudagraph_mark_step_begin()
+        outputs = compiled_prefill(kwargs["input_ids"], kwargs["attention_mask"], cache, cache_position, position_ids)
     _ = outputs.logits.shape
     torch.cuda.current_stream().synchronize()
     t_compute = time.perf_counter()
@@ -397,31 +602,80 @@ def _measure_dmi_prefill(model: Any, model_id: str, args: argparse.Namespace, en
     return compute_ms, total_ms, ring_stats
 
 
-def _measure_dmi_decode(model: Any, model_id: str, args: argparse.Namespace, encoded: Dict[str, torch.Tensor]) -> Tuple[float, float, Dict[str, int]]:
+def _measure_dmi_decode(
+    model: Any,
+    model_id: str,
+    args: argparse.Namespace,
+    encoded: Dict[str, torch.Tensor],
+    *,
+    compiled_prefill: Any = None,
+    compiled_decode: Any = None,
+) -> Tuple[float, float, Dict[str, int]]:
     device = encoded["input_ids"].device
-    decode_kwargs = _build_decode_inputs_from_prefill(model, encoded)
-    next_tokens = decode_kwargs["input_ids"]
-    decode_mask = decode_kwargs["attention_mask"]
-    past_key_values = decode_kwargs.get("past_key_values")
-    cache_position = decode_kwargs.get("cache_position")
-    engine = _create_proj_dmi_engine_for_model(
-        model_id=model_id,
-        model=model,
-        proj_dmi_mode=str(args.proj_dmi_mode),
-        hook_selection=str(args.hook_selection),
-        args=args,
-    )
-    device_sync(device)
-    t0 = time.perf_counter()
-    _prepare_ring_forward(
-        model=model,
-        input_ids=next_tokens,
-        attention_mask=decode_mask,
-        past_key_values=past_key_values,
-        cache_position=cache_position,
-        logits_to_keep=1,
-    )
-    decode_outputs = model(**decode_kwargs)
+    if compiled_prefill is None or compiled_decode is None:
+        decode_kwargs = _build_decode_inputs_from_prefill(model, encoded)
+        next_tokens = decode_kwargs["input_ids"]
+        decode_mask = decode_kwargs["attention_mask"]
+        past_key_values = decode_kwargs.get("past_key_values")
+        cache_position = decode_kwargs.get("cache_position")
+        engine = _create_proj_dmi_engine_for_model(
+            model_id=model_id,
+            model=model,
+            proj_dmi_mode=str(args.proj_dmi_mode),
+            hook_selection=str(args.hook_selection),
+            args=args,
+        )
+        device_sync(device)
+        torch.compiler.cudagraph_mark_step_begin()
+        t0 = time.perf_counter()
+        _prepare_ring_forward(
+            model=model,
+            input_ids=next_tokens,
+            attention_mask=decode_mask,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            logits_to_keep=1,
+        )
+        decode_outputs = model(**decode_kwargs)
+    else:
+        cache = _make_static_cache(
+            model,
+            batch_size=int(encoded["input_ids"].shape[0]),
+            max_cache_len=int(encoded["input_ids"].shape[1]) + 4,
+            device=device,
+        )
+        prefill_kwargs = _dmi_prefill_kwargs(model, encoded)
+        prefill_kwargs["past_key_values"] = cache
+        prefill_kwargs["cache_position"] = torch.arange(encoded["input_ids"].shape[1], device=device, dtype=torch.long)
+        with torch.no_grad():
+            prefill_outputs = model(**prefill_kwargs)
+        next_tokens = prefill_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True).clone()
+        del prefill_outputs
+        decode_mask = torch.cat(
+            [encoded["attention_mask"], torch.ones((encoded["attention_mask"].shape[0], 1), device=device, dtype=encoded["attention_mask"].dtype)],
+            dim=1,
+        )
+        decode_cache_position = torch.tensor([encoded["input_ids"].shape[1]], device=device, dtype=torch.long)
+        decode_position_ids = _position_ids_from_attention_mask(decode_mask)[:, -1:].contiguous() if _forward_accepts_position_ids(model) else None
+        engine = _create_proj_dmi_engine_for_model(
+            model_id=model_id,
+            model=model,
+            proj_dmi_mode=str(args.proj_dmi_mode),
+            hook_selection=str(args.hook_selection),
+            args=args,
+        )
+        device_sync(device)
+        t0 = time.perf_counter()
+        _prepare_ring_forward(
+            model=model,
+            input_ids=next_tokens,
+            attention_mask=decode_mask,
+            past_key_values=cache,
+            cache_position=decode_cache_position,
+            logits_to_keep=1,
+        )
+        torch.compiler.cudagraph_mark_step_begin()
+        decode_outputs = compiled_decode(next_tokens, decode_mask, cache, decode_cache_position, decode_position_ids)
     _ = decode_outputs.logits.shape
     torch.cuda.current_stream().synchronize()
     t_compute = time.perf_counter()
@@ -449,6 +703,7 @@ def main() -> None:
     parser.add_argument("--repeat-index", type=int, default=1)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--hook-selection", default=HS_LOGITS_HOOK_SELECTION)
+    parser.add_argument("--disable-compile", action="store_true")
     parser.add_argument("--proj-dmi-mode", choices=["ring_null", "ring_db"], default="ring_db")
     parser.add_argument("--ring-task-entries", type=int, default=65536)
     parser.add_argument("--ring-payload-mb", type=int, default=1024)
@@ -485,8 +740,11 @@ def main() -> None:
     )
 
     baseline_label = args.baseline_label or args.baseline
+    compile_enabled = args.baseline != "torch_hooks" and not bool(args.disable_compile)
     model = None
     collector = None
+    compiled_prefill = None
+    compiled_decode = None
     if args.baseline == "hf_ideal":
         from transformers import AutoModelForCausalLM
 
@@ -496,6 +754,9 @@ def main() -> None:
             torch_dtype=torch.float16,
             local_files_only=bool(args.local_files_only),
         ).to(device).eval()
+        if compile_enabled:
+            compiled_prefill = _compile_prefill_step(model, output_hidden_states=False)
+            compiled_decode = _compile_decode_step(model, output_hidden_states=False)
     elif args.baseline == "hf_api":
         from transformers import AutoModelForCausalLM
 
@@ -505,6 +766,9 @@ def main() -> None:
             torch_dtype=torch.float16,
             local_files_only=bool(args.local_files_only),
         ).to(device).eval()
+        if compile_enabled:
+            compiled_prefill = _compile_prefill_step(model, output_hidden_states=True)
+            compiled_decode = _compile_decode_step(model, output_hidden_states=True)
     elif args.baseline == "torch_hooks":
         model = _load_model_for_hook_selection(
             model_id,
@@ -515,22 +779,25 @@ def main() -> None:
     else:
         model = _load_hooked_model(model_id, local_files_only=bool(args.local_files_only))
         model.to(device).eval()
+        if compile_enabled:
+            compiled_prefill = _compile_prefill_step(model, output_hidden_states=False)
+            compiled_decode = _compile_decode_step(model, output_hidden_states=False)
 
     try:
         with torch.no_grad():
             for _ in range(int(args.warmup)):
                 if args.baseline == "hf_ideal":
-                    _measure_hf_ideal_prefill(model, encoded)
-                    _measure_hf_ideal_decode(model, encoded)
+                    _measure_hf_ideal_prefill(model, encoded, compiled_prefill=compiled_prefill)
+                    _measure_hf_ideal_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
                 elif args.baseline == "hf_api":
-                    _measure_hf_api_prefill(model, encoded)
-                    _measure_hf_api_decode(model, encoded)
+                    _measure_hf_api_prefill(model, encoded, compiled_prefill=compiled_prefill)
+                    _measure_hf_api_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
                 elif args.baseline == "torch_hooks":
                     _measure_torch_hooks_prefill(model, collector, encoded)
                     _measure_torch_hooks_decode(model, collector, encoded)
                 else:
-                    _measure_dmi_prefill(model, model_id, args, encoded)
-                    _measure_dmi_decode(model, model_id, args, encoded)
+                    _measure_dmi_prefill(model, model_id, args, encoded, compiled_prefill=compiled_prefill)
+                    _measure_dmi_decode(model, model_id, args, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
                 device_sync(device)
         print(f"Warmup done ({int(args.warmup)} iterations).", flush=True)
 
@@ -544,17 +811,21 @@ def main() -> None:
         with torch.no_grad():
             for _ in range(int(args.iters)):
                 if args.baseline == "hf_ideal":
-                    prefill_compute_ms, prefill_total_ms = _measure_hf_ideal_prefill(model, encoded)
-                    decode_compute_ms, decode_total_ms = _measure_hf_ideal_decode(model, encoded)
+                    prefill_compute_ms, prefill_total_ms = _measure_hf_ideal_prefill(model, encoded, compiled_prefill=compiled_prefill)
+                    decode_compute_ms, decode_total_ms = _measure_hf_ideal_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
                 elif args.baseline == "hf_api":
-                    prefill_compute_ms, prefill_total_ms = _measure_hf_api_prefill(model, encoded)
-                    decode_compute_ms, decode_total_ms = _measure_hf_api_decode(model, encoded)
+                    prefill_compute_ms, prefill_total_ms = _measure_hf_api_prefill(model, encoded, compiled_prefill=compiled_prefill)
+                    decode_compute_ms, decode_total_ms = _measure_hf_api_decode(model, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode)
                 elif args.baseline == "torch_hooks":
                     prefill_compute_ms, prefill_total_ms = _measure_torch_hooks_prefill(model, collector, encoded)
                     decode_compute_ms, decode_total_ms = _measure_torch_hooks_decode(model, collector, encoded)
                 else:
-                    prefill_compute_ms, prefill_total_ms, prefill_ring_stats = _measure_dmi_prefill(model, model_id, args, encoded)
-                    decode_compute_ms, decode_total_ms, decode_ring_stats = _measure_dmi_decode(model, model_id, args, encoded)
+                    prefill_compute_ms, prefill_total_ms, prefill_ring_stats = _measure_dmi_prefill(
+                        model, model_id, args, encoded, compiled_prefill=compiled_prefill
+                    )
+                    decode_compute_ms, decode_total_ms, decode_ring_stats = _measure_dmi_decode(
+                        model, model_id, args, encoded, compiled_prefill=compiled_prefill, compiled_decode=compiled_decode
+                    )
                     prefill_ring_stats_runs.append(prefill_ring_stats)
                     decode_ring_stats_runs.append(decode_ring_stats)
 
@@ -586,6 +857,7 @@ def main() -> None:
             "iters": int(args.iters),
             "hook_selection": str(args.hook_selection),
             "repeat_index": int(args.repeat_index),
+            "compile_enabled": bool(compile_enabled),
             "measurement_kind": "prefill_decode_step_breakdown",
             "timing_semantics": {
                 "compute_ms": "Wall time until the GPU main compute stream is synchronized.",

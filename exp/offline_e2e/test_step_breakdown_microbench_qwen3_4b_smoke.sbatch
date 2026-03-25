@@ -48,50 +48,6 @@ echo "Python: $(python --version 2>&1)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo "============================================================"
 
-if command -v g++-11 >/dev/null 2>&1; then
-    CXX_BIN="$(command -v g++-11)"
-else
-    CXX_BIN="$(command -v g++)"
-fi
-
-NVCC_BIN=""
-if command -v nvcc >/dev/null 2>&1; then
-    NVCC_BIN="$(command -v nvcc)"
-else
-    for cand in \
-        "${ENV_DIR}/bin/nvcc" \
-        "/usr/local/cuda/bin/nvcc" \
-        "/usr/local/cuda-12.4/bin/nvcc" \
-        "/usr/local/cuda-12.3/bin/nvcc" \
-        "/usr/local/cuda-12.2/bin/nvcc" \
-        "/usr/local/cuda-12.1/bin/nvcc" \
-        "/usr/local/cuda-12.0/bin/nvcc" \
-        "/opt/cuda/bin/nvcc"
-    do
-        if [ -x "${cand}" ]; then
-            NVCC_BIN="${cand}"
-            break
-        fi
-    done
-fi
-
-if [ -z "${NVCC_BIN}" ]; then
-    echo "ERROR: nvcc not found on compute node"
-    exit 1
-fi
-
-export CUDA_HOME="$(cd "$(dirname "${NVCC_BIN}")/.." && pwd)"
-export PATH="$(dirname "${NVCC_BIN}"):${PATH}"
-echo "CXX=${CXX_BIN}"
-echo "NVCC=${NVCC_BIN}"
-echo "CUDA_HOME=${CUDA_HOME}"
-
-echo "Building monitoring extension inside job..."
-make -C "${PROJECT}/monitoring" -j "${SLURM_CPUS_PER_TASK:-8}" \
-    PYTHON="${ENV_DIR}/bin/python" \
-    CXX="${CXX_BIN}" \
-    NVCC="${NVCC_BIN} -ccbin ${CXX_BIN}"
-
 MODEL="qwen3-4b"
 PREFILL_TOKENS=128
 WARMUP=1
