@@ -676,10 +676,10 @@ def main() -> None:
         results_dir = Path(args.results_dir)
         ensure_dir(results_dir)
         output_path = make_output_path(
-            results_dir,
-            prefix=baseline_label,
+            results_dir=results_dir,
+            baseline=baseline_label,
             model=args.model,
-            sample_name=f"synthetic_prefill_{int(args.prefill_tokens)}",
+            sample_file=f"synthetic_prefill_{int(args.prefill_tokens)}.jsonl",
             batch_size=int(args.batch_size),
             repeat_index=int(args.repeat_index),
         )
