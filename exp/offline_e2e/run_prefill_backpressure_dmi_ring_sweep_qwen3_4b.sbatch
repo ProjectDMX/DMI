@@ -43,6 +43,9 @@ MODEL="qwen3-4b"
 BATCH_SIZE=64
 PREFILL_TOKENS=64
 NUM_MICROBATCHES=50
+DMI_HS_LOGITS_HOOKS="hidden-states,final_ln,logits"
+DMI_73_HOOKS="q,k,logits"
+DMI_145_HOOKS="q,k,pattern,attn_scores,logits"
 DMI_HOOKS="q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
 RING_SIZES_MB=(10240 20480 30720 40960 51200)
 RING_TASK_ENTRIES=65536
@@ -144,20 +147,21 @@ is_oom_log() {
 run_allow_fail() {
     local baseline="$1"
     local ring_mb="$2"
+    local hook_sel="$3"
     local log_file="${LOG_DIR}/${baseline}__ring${ring_mb}.log"
     local status="FAIL_SKIP"
     local results_json=""
 
     echo ""
     echo "############################################################"
-    echo "${baseline} | hooks=${DMI_HOOKS} | ring=${ring_mb}MB"
+    echo "${baseline} | hooks=${hook_sel} | ring=${ring_mb}MB"
     echo "############################################################"
 
     if python run_prefill_backpressure.py "${COMMON[@]}" \
         --baseline proj_dmi \
         --baseline-label "${baseline}" \
         --proj-dmi-mode ring_db \
-        --hook-selection "${DMI_HOOKS}" \
+        --hook-selection "${hook_sel}" \
         --ring-payload-mb "${ring_mb}" \
         --ring-pinned-mb "${ring_mb}" \
         --ring-task-entries "${RING_TASK_ENTRIES}" \
@@ -175,13 +179,16 @@ run_allow_fail() {
         echo "Skipping ${baseline} after failure"
     fi
 
-    append_summary "${baseline}" "${status}" "${DMI_HOOKS}" "${ring_mb}" "${results_json}" "${log_file}"
+    append_summary "${baseline}" "${status}" "${hook_sel}" "${ring_mb}" "${results_json}" "${log_file}"
     cleanup_gpu
 }
 
 for ring_mb in "${RING_SIZES_MB[@]}"; do
-    run_allow_fail "dmi_light_ring${ring_mb}" "${ring_mb}"
-    run_allow_fail "dmi_heavy_ring${ring_mb}" "${ring_mb}"
+    run_allow_fail "dmi_hs_logits_ring${ring_mb}" "${ring_mb}" "${DMI_HS_LOGITS_HOOKS}"
+    run_allow_fail "dmi_73_ring${ring_mb}" "${ring_mb}" "${DMI_73_HOOKS}"
+    run_allow_fail "dmi_145_ring${ring_mb}" "${ring_mb}" "${DMI_145_HOOKS}"
+    run_allow_fail "dmi_light_ring${ring_mb}" "${ring_mb}" "${DMI_HOOKS}"
+    run_allow_fail "dmi_heavy_ring${ring_mb}" "${ring_mb}" "${DMI_HOOKS}"
 done
 
 echo ""
