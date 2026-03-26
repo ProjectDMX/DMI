@@ -47,6 +47,7 @@ DMI_HS_LOGITS_HOOKS="hidden-states,final_ln,logits"
 DMI_73_HOOKS="q,k,logits"
 DMI_145_HOOKS="q,k,pattern,attn_scores,logits"
 DMI_HOOKS="q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
+LIGHT_BASELINE_RING_MB=61440
 RING_SIZES_MB=(10240 20480 30720 40960 51200)
 RING_TASK_ENTRIES=65536
 RING_FLUSH=0.15
@@ -183,10 +184,11 @@ run_allow_fail() {
     cleanup_gpu
 }
 
+run_allow_fail "dmi_hs_logits_ring${LIGHT_BASELINE_RING_MB}" "${LIGHT_BASELINE_RING_MB}" "${DMI_HS_LOGITS_HOOKS}"
+run_allow_fail "dmi_73_ring${LIGHT_BASELINE_RING_MB}" "${LIGHT_BASELINE_RING_MB}" "${DMI_73_HOOKS}"
+run_allow_fail "dmi_145_ring${LIGHT_BASELINE_RING_MB}" "${LIGHT_BASELINE_RING_MB}" "${DMI_145_HOOKS}"
+
 for ring_mb in "${RING_SIZES_MB[@]}"; do
-    run_allow_fail "dmi_hs_logits_ring${ring_mb}" "${ring_mb}" "${DMI_HS_LOGITS_HOOKS}"
-    run_allow_fail "dmi_73_ring${ring_mb}" "${ring_mb}" "${DMI_73_HOOKS}"
-    run_allow_fail "dmi_145_ring${ring_mb}" "${ring_mb}" "${DMI_145_HOOKS}"
     run_allow_fail "dmi_light_ring${ring_mb}" "${ring_mb}" "${DMI_HOOKS}"
     run_allow_fail "dmi_heavy_ring${ring_mb}" "${ring_mb}" "${DMI_HOOKS}"
 done
