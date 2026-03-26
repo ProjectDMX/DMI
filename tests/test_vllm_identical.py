@@ -84,6 +84,7 @@ def test_vllm_identical(subtests):
     sub_env = dict(os.environ)
     sub_env["VLLM_DISABLE_COMPILE_CACHE"] = "1"
     sub_env["E2E_ENFORCE_EAGER"] = enforce_eager
+    sub_env["DMX_HOOK_SELECTION"] = hooks
 
     try:
         # Backup ref model file

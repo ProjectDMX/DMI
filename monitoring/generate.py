@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import functools
 import inspect
-from typing import Any, List, Optional
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Module-level profiling list for _prepare_wrapper timing.
 # Enabled by RING_PROFILE_PREPARE=1.
@@ -747,3 +749,356 @@ def generate_with_monitoring(model: Any, *args: Any,
             ring_transport.set_cpu_direct(False)
             transport._hook_selection = None
             transport._prefill_kv_offsets = None
+
+
+# ---------------------------------------------------------------------------
+# generate_greedy: manual prefill + decode loop, no HF generate() overhead
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GreedyGenerateTimings:
+    """Optional per-step timing data from generate_greedy."""
+    prefill_ms: float = 0.0
+    decode_ms: float = 0.0
+    total_ms: float = 0.0
+    decode_steps: int = 0
+    batch_size: int = 0
+    prefill_tokens: int = 0
+    step_ms: List[float] = field(default_factory=list)
+
+    @property
+    def prefill_tok_per_s(self) -> float:
+        """Prefill throughput: prompt tokens processed per second."""
+        if self.prefill_ms <= 0:
+            return 0.0
+        return self.batch_size * self.prefill_tokens / self.prefill_ms * 1000.0
+
+    @property
+    def decode_tok_per_s(self) -> float:
+        """Decode throughput: new tokens generated per second."""
+        if self.decode_ms <= 0 or self.decode_steps <= 0:
+            return 0.0
+        return self.batch_size * self.decode_steps / self.decode_ms * 1000.0
+
+    @property
+    def e2e_tok_per_s(self) -> float:
+        """E2E throughput: all tokens (prompt + generated) per second."""
+        if self.total_ms <= 0:
+            return 0.0
+        total_tokens = self.batch_size * (self.prefill_tokens + self.decode_steps)
+        return total_tokens / self.total_ms * 1000.0
+
+    @property
+    def tpot_ms(self) -> float:
+        """Time per output token (decode only)."""
+        if self.decode_steps <= 0:
+            return 0.0
+        return self.decode_ms / self.decode_steps
+
+
+def _prepare_ring_forward(
+    model: Any,
+    input_ids: Any,
+    attention_mask: Any,
+    past_key_values: Any = None,
+    cache_position: Any = None,
+    logits_to_keep: int = 0,
+) -> None:
+    """Call engine._prepare_ring_step + prepare_step + pre_push_all_metas."""
+    from . import ring_transport
+    import torch
+
+    engine = getattr(model, "monitoring_engine", None)
+    transport = ring_transport.get_active()
+    if engine is None or transport is None:
+        return
+    if not getattr(engine, "_using_ring_transport", False):
+        return
+    if not transport._using_forward_hooks:
+        return
+
+    engine._prepare_ring_step(
+        input_ids, attention_mask, past_key_values,
+        cache_position=cache_position)
+
+    batch = int(input_ids.shape[0])
+    q_len = int(input_ids.shape[1])
+    is_static = (past_key_values is not None
+                 and hasattr(past_key_values, "max_cache_len"))
+    kv_dim = ring_transport._get_kv_dim(
+        past_key_values, q_len, is_static=is_static)
+
+    hook_byte_sizes: List[int] = []
+    model_cfg = transport._model_cfg
+    if model_cfg is not None:
+        for spec in transport._active_specs:
+            shape = ring_transport._compute_hook_shape(
+                spec.hook_type, model_cfg, batch, q_len, kv_dim,
+                logits_to_keep=logits_to_keep)
+            if shape:
+                dtype = spec.dtype if spec.dtype is not None else model_cfg.dtype
+                elem_size = torch._utils._element_size(dtype)
+                nbytes = elem_size
+                for d in shape:
+                    nbytes *= d
+                hook_byte_sizes.append(nbytes)
+            else:
+                hook_byte_sizes.append(0)
+
+    if not transport._force_cpu_direct:
+        step_total = sum(
+            ring_transport.align_up_py(s, 16) for s in hook_byte_sizes)
+        result = transport._ring_engine.prepare_step(
+            step_total, len(hook_byte_sizes))
+        transport.cpu_direct = (result == 2)
+
+    transport.pre_push_all_metas(
+        batch, q_len, kv_dim, logits_to_keep=logits_to_keep)
+
+
+def generate_greedy(
+    model: Any,
+    input_ids: Any,
+    attention_mask: Any,
+    *,
+    max_new_tokens: int,
+    min_new_tokens: int = 0,
+    eos_token_id: Optional[int] = None,
+    pad_token_id: Optional[int] = None,
+    logits_to_keep: int = 0,
+    cuda_graphs: bool = False,
+    monitoring: bool = False,
+    hook_selection: Optional[str] = None,
+    timings: Optional[GreedyGenerateTimings] = None,
+) -> List[Any]:
+    """Greedy-argmax generate loop, no HF generate() overhead.
+
+    Follows the same pattern as the hf_offload manual loop in
+    benchmark/bench_ring_transport.py:
+    - Optional torch.compile + StaticCache + CUDA graphs for decode
+    - Without cuda_graphs: uses HF default (DynamicCache) for KV cache
+    - Per-step CPU sync via token.cpu() (matches HF generate()'s implicit
+      GPU→CPU sync from ``unfinished_sequences.max() == 0``)
+    - Generated tokens moved to CPU per step
+
+    Supports EOS stopping (after min_new_tokens), min_new_tokens, max_new_tokens.
+    Greedy argmax only.  No beam search, no sampling.
+
+    Args:
+        model: HF model (AutoModelForCausalLM or similar).
+        input_ids: [B, seq_len] input token IDs on CUDA.
+        attention_mask: [B, seq_len] attention mask on CUDA.
+        max_new_tokens: Maximum tokens to generate.
+        min_new_tokens: Minimum tokens before EOS can stop generation.
+        eos_token_id: EOS token ID.  None = never stop early.
+        pad_token_id: Pad token ID (unused, kept for compat).
+        logits_to_keep: 0 = all, 1 = last position only.
+        cuda_graphs: If True, compile decode step with reduce-overhead + StaticCache.
+                     If False, use HF default DynamicCache, no compilation.
+        monitoring: If True, install ring transport hooks and call
+                    _prepare_ring_forward before each forward pass.
+        hook_selection: Hook selection preset (e.g. "hidden-states", "full").
+                        Only used when monitoring=True.
+        timings: If provided, filled with timing data.
+
+    Returns:
+        List of generated token ID tensors on CPU, one per batch element.
+        Each tensor has shape [num_generated_tokens].
+    """
+    import torch
+
+    device = input_ids.device
+    B, Pmax = input_ids.shape
+
+    _wants_position_ids = (
+        "position_ids" in inspect.signature(model.forward).parameters)
+
+    def _position_ids_from_mask(mask: Any) -> Any:
+        pos = mask.long().cumsum(dim=-1) - 1
+        pos.masked_fill_(mask == 0, 0)
+        return pos
+
+    # -- Monitoring setup --
+    if monitoring:
+        from . import ring_transport
+        transport = ring_transport.get_active()
+        if transport is not None and hook_selection is not None:
+            transport._hook_selection = hook_selection
+        _install_monitoring_forward(model)
+
+    try:
+        # -- Cache setup --
+        if cuda_graphs:
+            from transformers import StaticCache
+            max_cache_len = Pmax + max_new_tokens + 4
+            cache = StaticCache(
+                config=model.config, batch_size=B,
+                max_cache_len=max_cache_len, device=device,
+                dtype=model.dtype,
+            )
+        else:
+            cache = None  # DynamicCache, created by model on first call
+
+        # -- Decode step function (same as hf_offload in bench_ring_transport) --
+        def _decode_step_static(token, cache, cache_position):
+            kwargs: Dict[str, Any] = {
+                "input_ids": token,
+                "use_cache": True,
+                "past_key_values": cache,
+                "cache_position": cache_position,
+                "output_hidden_states": False,
+                "output_attentions": False,
+                "return_dict": True,
+                "logits_to_keep": logits_to_keep,
+            }
+            if _wants_position_ids:
+                kwargs["position_ids"] = cache_position.unsqueeze(0).expand(
+                    token.shape[0], -1)
+            return model(**kwargs)
+
+        if cuda_graphs:
+            compiled_decode = torch.compile(
+                _decode_step_static, mode="reduce-overhead", fullgraph=False)
+        else:
+            compiled_decode = None
+
+        do_timing = timings is not None
+        torch.cuda.synchronize()
+        t0 = time.perf_counter() if do_timing else 0.0
+
+        # -- Prefill (uncompiled, variable-length input) --
+        with torch.no_grad():
+            prefill_kwargs: Dict[str, Any] = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "use_cache": True,
+                "output_hidden_states": False,
+                "output_attentions": False,
+                "return_dict": True,
+                "logits_to_keep": logits_to_keep,
+            }
+            if cache is not None:
+                prefill_kwargs["past_key_values"] = cache
+                prefill_kwargs["cache_position"] = torch.arange(
+                    Pmax, device=device, dtype=torch.long)
+            if _wants_position_ids:
+                prefill_kwargs["position_ids"] = _position_ids_from_mask(
+                    attention_mask)
+
+            if monitoring:
+                _prepare_ring_forward(
+                    model, input_ids, attention_mask,
+                    past_key_values=prefill_kwargs.get("past_key_values"),
+                    cache_position=prefill_kwargs.get("cache_position"),
+                    logits_to_keep=logits_to_keep)
+
+            out = model(**prefill_kwargs)
+
+        token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        # .cpu() forces GPU→CPU sync (same effect as HF generate()'s
+        # ``this_peer_finished = unfinished_sequences.max() == 0``)
+        token_cpu = token.squeeze(-1).cpu()
+
+        if cuda_graphs:
+            cache_pos = torch.tensor(
+                [Pmax], device=device, dtype=torch.long)
+        else:
+            cache = out.past_key_values
+
+        t_decode_start = time.perf_counter() if do_timing else 0.0
+
+        # -- EOS tracking on GPU (same ops as HF generate() lines 2820-2821) --
+        unfinished_sequences = torch.ones(
+            B, dtype=torch.long, device=device)
+
+        # -- Decode loop (matches hf_offload overhead per step) --
+        _prev_step_t = t_decode_start if do_timing else 0.0
+        all_generated: List[Any] = [token.squeeze(-1)]
+        with torch.no_grad():
+            for step in range(max_new_tokens - 1):
+                if compiled_decode is not None:
+                    if monitoring:
+                        _prepare_ring_forward(
+                            model, token, attention_mask,
+                            past_key_values=cache,
+                            cache_position=cache_pos,
+                            logits_to_keep=logits_to_keep)
+                    torch.compiler.cudagraph_mark_step_begin()
+                    out = compiled_decode(token, cache, cache_pos)
+                else:
+                    decode_kwargs: Dict[str, Any] = {
+                        "input_ids": token,
+                        "past_key_values": cache,
+                        "use_cache": True,
+                        "output_hidden_states": False,
+                        "output_attentions": False,
+                        "return_dict": True,
+                        "logits_to_keep": logits_to_keep,
+                    }
+                    if _wants_position_ids:
+                        seq_pos = Pmax + step + 1
+                        decode_kwargs["position_ids"] = torch.full(
+                            (B, 1), seq_pos, device=device, dtype=torch.long)
+                    if monitoring:
+                        _prepare_ring_forward(
+                            model, token, attention_mask,
+                            past_key_values=cache,
+                            logits_to_keep=logits_to_keep)
+                    out = model(**decode_kwargs)
+                    cache = out.past_key_values
+
+                token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+                if cuda_graphs:
+                    cache_pos = cache_pos + 1
+
+                all_generated.append(token.squeeze(-1))
+
+                # EOS check on GPU — replaces hf_offload's token.max().item()
+                # with same-cost GPU reduction, but also checks EOS.
+                # (matches HF generate() lines 2820-2821)
+                tokens_generated = step + 2
+                if (eos_token_id is not None
+                        and tokens_generated > min_new_tokens):
+                    unfinished_sequences = unfinished_sequences & (
+                        token.squeeze(-1) != eos_token_id).long()
+                # GPU→CPU sync (same cost as token.max().item())
+                this_peer_finished = unfinished_sequences.max() == 0
+
+                if do_timing:
+                    step_t = time.perf_counter()
+                    timings.step_ms.append(
+                        (step_t - _prev_step_t) * 1000.0)
+                    _prev_step_t = step_t
+
+                if this_peer_finished:
+                    break
+
+        torch.cuda.synchronize()
+
+        if do_timing:
+            t_end = time.perf_counter()
+            timings.total_ms = (t_end - t0) * 1000.0
+            timings.prefill_ms = (t_decode_start - t0) * 1000.0
+            timings.decode_ms = (t_end - t_decode_start) * 1000.0
+            timings.decode_steps = len(timings.step_ms)
+            timings.batch_size = B
+            timings.prefill_tokens = Pmax
+
+        # Stack on GPU, move to CPU once, truncate per-sequence at EOS
+        # (after timing — this is result collection, not part of generation)
+        generated_ids = torch.stack(all_generated, dim=1).cpu()  # [B, T]
+        results: List[Any] = []
+        for b in range(B):
+            seq = generated_ids[b]
+            if eos_token_id is not None:
+                eos_positions = (seq == eos_token_id).nonzero(as_tuple=False)
+                if len(eos_positions) > 0:
+                    seq = seq[:int(eos_positions[0].item()) + 1]
+            results.append(seq)
+
+        return results
+
+    finally:
+        if monitoring:
+            _uninstall_monitoring_forward(model)
