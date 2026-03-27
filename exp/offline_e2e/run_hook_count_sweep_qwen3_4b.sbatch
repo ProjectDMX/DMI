@@ -41,7 +41,7 @@ echo "============================================================"
 MODEL="qwen3-4b"
 DATASET="${DATASET:-sharegpt}"
 BATCH_SIZE=64
-LIMIT=128
+LIMIT=512
 PAD_BUCKETS="128,256,384,512"
 CAPTURE_MODE="hs_logits"
 RING_STEP_MB=5120
