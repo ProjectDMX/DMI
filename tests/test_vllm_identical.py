@@ -131,6 +131,20 @@ def test_vllm_identical(subtests):
             print("  WARNING: ref logprob run failed, skipping sanity check")
             ref_logprobs_file = None
 
+        # Step 0c: Monitored model logprobs (baseline vs monitored comparison)
+        mon_logprobs_file = os.path.join(run_dir, "logprobs_mon.pt")
+        print("  [0/4] Sanity check: monitored model logprobs...", flush=True)
+        r0c = subprocess.run(
+            [sys.executable, "-m", "tests.vllm_logprob_runner",
+             "--output", mon_logprobs_file, "--monitored"],
+            env=sub_env, capture_output=True, text=True, cwd=project_root,
+        )
+        print(r0c.stdout[-1000:] if r0c.stdout else "", flush=True)
+        if r0c.returncode != 0:
+            print(r0c.stderr[-2000:] if r0c.stderr else "", flush=True)
+            print("  WARNING: monitored logprob run failed, skipping")
+            mon_logprobs_file = None
+
         # Step 1: Reference run
         print("\n  [1/4] Reference run (RefDiskWorker)...", flush=True)
         ref_env = dict(sub_env)
@@ -172,15 +186,18 @@ def test_vllm_identical(subtests):
             cmp_cmd += ["--orig-logprobs", orig_logprobs_file]
         if ref_logprobs_file and os.path.exists(ref_logprobs_file):
             cmp_cmd += ["--ref-logprobs", ref_logprobs_file]
+        if mon_logprobs_file and os.path.exists(mon_logprobs_file):
+            cmp_cmd += ["--mon-logprobs", mon_logprobs_file]
         r3 = subprocess.run(
             cmp_cmd,
             env=sub_env, capture_output=True, text=True, cwd=project_root,
         )
         if r3.stdout:
-            # Print first 3000 chars (logprob sanity check) + last 2000 chars (summary)
-            if len(r3.stdout) > 5000:
-                print(r3.stdout[:3000], flush=True)
-                print("  ... (truncated) ...", flush=True)
+            # Always print LOGPROBS summary and PASS/FAIL lines first
+            for line in r3.stdout.splitlines():
+                if "[LOGPROBS" in line or "ALL PASSED" in line or "FAILED (" in line:
+                    print(line, flush=True)
+            # Then print tail for hidden state details
             print(r3.stdout[-2000:], flush=True)
         if r3.returncode != 0:
             print(r3.stderr[-3000:] if r3.stderr else "", flush=True)

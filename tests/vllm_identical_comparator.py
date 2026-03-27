@@ -18,26 +18,39 @@ from pathlib import Path
 import torch
 
 
+def _bytes_identical(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """True iff a and b have identical raw bytes. Both must be CPU tensors.
+
+    Reinterprets as same-width integer type so torch.equal does true
+    bitwise comparison (no NaN/signed-zero surprises).
+    """
+    a_c = a.contiguous()
+    b_c = b.contiguous()
+    int_dtype = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+    dt = int_dtype.get(a_c.element_size())
+    if dt is None:
+        return bytes(a_c.untyped_storage()) == bytes(b_c.untyped_storage())
+    return torch.equal(a_c.view(dt), b_c.view(dt))
+
+
 def bitwise_check(a: torch.Tensor, b: torch.Tensor, label: str) -> dict:
     """Compare two tensors for bitwise equality.
 
     Returns dict with 'name', 'passed', 'detail'.
-    Asserts shape, dtype, device match before comparing bytes.
+    Checks device, dtype, shape first. Then compares raw byte buffers.
     """
-    if a.shape != b.shape:
-        return {"name": label, "passed": False,
-                "detail": f"shape mismatch: {list(a.shape)} vs {list(b.shape)}"}
-    if a.dtype != b.dtype:
-        return {"name": label, "passed": False,
-                "detail": f"dtype mismatch: {a.dtype} vs {b.dtype}"}
     if a.device != b.device:
         return {"name": label, "passed": False,
                 "detail": f"device mismatch: {a.device} vs {b.device}"}
+    if a.dtype != b.dtype:
+        return {"name": label, "passed": False,
+                "detail": f"dtype mismatch: {a.dtype} vs {b.dtype}"}
+    if a.shape != b.shape:
+        return {"name": label, "passed": False,
+                "detail": f"shape mismatch: {list(a.shape)} vs {list(b.shape)}"}
 
-    # Bitwise comparison via raw bytes
-    a_bytes = a.contiguous().view(torch.uint8)
-    b_bytes = b.contiguous().view(torch.uint8)
-    if torch.equal(a_bytes, b_bytes):
+    # Raw byte comparison via memoryview (no torch.equal)
+    if _bytes_identical(a, b):
         return {"name": label, "passed": True, "detail": "BITWISE EQUAL"}
 
     # Not bitwise equal — report max abs diff
@@ -47,67 +60,76 @@ def bitwise_check(a: torch.Tensor, b: torch.Tensor, label: str) -> dict:
 
 
 def compare_logprobs(orig_path: str, ref_path: str, results: dict,
-                     _check_fn) -> None:
-    """Compare full-vocab logprobs between original and ref model.
+                     _check_fn, label: str = "original vs ref") -> None:
+    """Compare full-vocab logprobs between two models.
 
     Informational only — never marks tests as failed.
-    Reports per-position max_abs_diff if not bitwise identical.
+    Prints summary line FIRST, then details.
     """
     orig_data = torch.load(orig_path, weights_only=False, map_location="cpu")
     ref_data = torch.load(ref_path, weights_only=False, map_location="cpu")
 
-    print("\n  === Step 0: Logprob sanity check (original vs ref) ===")
+    # First pass: check all prompts, collect results
+    all_exact = True
+    n_prompts = 0
+    n_exact = 0
+    worst_diff = 0.0
+    details = []
 
     for prompt_idx in sorted(orig_data.keys()):
+        n_prompts += 1
         orig = orig_data[prompt_idx]
         ref = ref_data.get(prompt_idx)
         if ref is None:
-            print(f"    prompt[{prompt_idx}]: ref missing — skipped")
+            all_exact = False
+            details.append(f"    prompt[{prompt_idx}]: ref missing")
             continue
 
-        # Compare token IDs first
         if orig["token_ids"] != ref["token_ids"]:
+            all_exact = False
             diff_pos = next(
                 i for i, (a, b) in enumerate(
                     zip(orig["token_ids"], ref["token_ids"]))
                 if a != b)
-            print(f"    prompt[{prompt_idx}]: token_ids DIFFER at position "
-                  f"{diff_pos} (orig={orig['token_ids'][diff_pos]} "
-                  f"ref={ref['token_ids'][diff_pos]})")
+            details.append(f"    prompt[{prompt_idx}]: token_ids DIFFER at pos {diff_pos}")
             continue
 
         orig_lp = orig["logprobs"]
         ref_lp = ref["logprobs"]
         if orig_lp is None or ref_lp is None:
-            print(f"    prompt[{prompt_idx}]: logprobs not available — skipped")
+            details.append(f"    prompt[{prompt_idx}]: logprobs N/A")
             continue
 
-        # Trim to same length
         min_len = min(orig_lp.shape[0], ref_lp.shape[0])
         min_vocab = min(orig_lp.shape[1], ref_lp.shape[1])
         a = orig_lp[:min_len, :min_vocab]
         b = ref_lp[:min_len, :min_vocab]
 
-        # Bitwise check
-        a_bytes = a.contiguous().view(torch.uint8)
-        b_bytes = b.contiguous().view(torch.uint8)
-        if torch.equal(a_bytes, b_bytes):
-            print(f"    prompt[{prompt_idx}]: BITWISE EXACT ({min_len} positions)")
+        if a.dtype != b.dtype:
+            all_exact = False
+            details.append(f"    prompt[{prompt_idx}]: dtype mismatch {a.dtype} vs {b.dtype}")
+            continue
+        if a.shape != b.shape:
+            all_exact = False
+            details.append(f"    prompt[{prompt_idx}]: shape mismatch {list(a.shape)} vs {list(b.shape)}")
             continue
 
-        # Not bitwise exact — report per-position max_abs_diff
-        for t in range(min_len):
-            at = a[t]
-            bt = b[t]
-            at_bytes = at.contiguous().view(torch.uint8)
-            bt_bytes = bt.contiguous().view(torch.uint8)
-            if torch.equal(at_bytes, bt_bytes):
-                continue
-            diff = (at - bt).abs().max().item()
-            print(f"    prompt[{prompt_idx}] pos[{t}]: "
-                  f"max_abs_diff={diff:.6e}")
+        if _bytes_identical(a, b):
+            n_exact += 1
+            continue
 
-    print("  === Step 0 complete (informational, never fails) ===\n")
+        all_exact = False
+        diff = (a.float() - b.float()).abs().max().item()
+        worst_diff = max(worst_diff, diff)
+        details.append(f"    prompt[{prompt_idx}]: DIFFER max_abs_diff={diff:.6e}")
+
+    # SUMMARY LINE — always visible even if output is truncated
+    if all_exact:
+        print(f"  [LOGPROBS {label}] BITWISE EXACT ({n_exact}/{n_prompts} prompts)", flush=True)
+    else:
+        detail_str = "; ".join(d.strip() for d in details)
+        print(f"  [LOGPROBS {label}] DIFFER ({n_exact}/{n_prompts} exact, "
+              f"worst={worst_diff:.6e}) -- {detail_str}", flush=True)
 
 
 def main():
@@ -119,6 +141,8 @@ def main():
                    help="Path to original model logprobs .pt file")
     p.add_argument("--ref-logprobs", default=None,
                    help="Path to ref model logprobs .pt file")
+    p.add_argument("--mon-logprobs", default=None,
+                   help="Path to monitored model logprobs .pt file")
     args = p.parse_args()
 
     with open(args.ref_config) as f:
@@ -146,9 +170,13 @@ def main():
             msg += f" -- {detail}"
         print(msg, flush=True)
 
-    # Step 0: Logprob sanity check (informational, never fails)
+    # Step 0: Logprob sanity checks (informational, never fails)
     if args.orig_logprobs and args.ref_logprobs:
-        compare_logprobs(args.orig_logprobs, args.ref_logprobs, results, _check)
+        compare_logprobs(args.orig_logprobs, args.ref_logprobs, results, _check,
+                         label="original vs ref")
+    if args.orig_logprobs and args.mon_logprobs:
+        compare_logprobs(args.orig_logprobs, args.mon_logprobs, results, _check,
+                         label="original vs monitored")
 
     # Read ClickHouse
     import clickhouse_driver
@@ -282,6 +310,56 @@ def main():
         # Both on CPU for comparison
         ch_t = ch_t.cpu()
         result = bitwise_check(ref_t, ch_t, label)
+        if not result["passed"]:
+            # Debug: print shapes, dtypes, and first bytes
+            ref_flat = ref_t.contiguous().view(-1)
+            ch_flat = ch_t.contiguous().view(-1)
+            print(f"    [debug] {label}: ref shape={list(ref_t.shape)} dtype={ref_t.dtype}"
+                  f"  ch shape={list(ch_t.shape)} dtype={ch_t.dtype}", flush=True)
+            n = min(8, ref_flat.numel(), ch_flat.numel())
+            print(f"    [debug]   ref first {n}: {ref_flat[:n].tolist()}", flush=True)
+            print(f"    [debug]   ch  first {n}: {ch_flat[:n].tolist()}", flush=True)
+            # Check if it looks like an offset shift
+            if ref_flat.numel() == ch_flat.numel() and ref_flat.numel() > 16:
+                # Try shifted comparison
+                for shift in [1, -1, 768, -768]:
+                    if shift > 0 and ref_flat.numel() > shift:
+                        m = ref_flat.numel() - abs(shift)
+                        if _bytes_identical(ref_flat[shift:shift+m].contiguous(),
+                                            ch_flat[:m].contiguous()):
+                            print(f"    [debug]   MATCH with shift={shift}!", flush=True)
+                            break
+                    elif shift < 0 and ref_flat.numel() > abs(shift):
+                        m = ref_flat.numel() - abs(shift)
+                        if _bytes_identical(ref_flat[:m].contiguous(),
+                                            ch_flat[abs(shift):abs(shift)+m].contiguous()):
+                            print(f"    [debug]   MATCH with shift={shift}!", flush=True)
+                            break
+        if not result["passed"] and hook == "resid_pre" and layer >= 0:
+            # Cross-layer check: does ref_L{N} match ch_L{N-1} or ch_L{N+1}?
+            for alt_layer in [layer - 1, layer + 1]:
+                alt_key = (req_id, ch_act, alt_layer, start, end)
+                alt_t = ch_data.get(alt_key)
+                if alt_t is not None:
+                    alt_t = alt_t.cpu()
+                    alt_res = bitwise_check(ref_t, alt_t, f"cross_L{layer}_vs_chL{alt_layer}")
+                    if alt_res["passed"]:
+                        print(f"    [CROSS-LAYER] ref L{layer} MATCHES ch L{alt_layer}! "
+                              f"Layer numbering off-by-one!", flush=True)
+                    else:
+                        print(f"    [cross-layer] ref L{layer} vs ch L{alt_layer}: "
+                              f"{alt_res['detail']}", flush=True)
+
+            # Ref self-check: does ref_L{N} == ref_L{N-1}? (clone buffer reuse)
+            if layer > 0:
+                prev_path = pt_path.replace(f"_L{layer}_", f"_L{layer-1}_")
+                if os.path.exists(prev_path):
+                    prev_t = torch.load(prev_path, weights_only=True, map_location="cpu")
+                    self_res = bitwise_check(ref_t, prev_t, f"ref_L{layer}_vs_ref_L{layer-1}")
+                    if self_res["passed"]:
+                        print(f"    [REF-SELF] ref L{layer} == ref L{layer-1}! "
+                              f"Clone buffer REUSED!", flush=True)
+
         _check(result["name"], result["passed"], result["detail"])
 
     _write_results(results, args.result_file)

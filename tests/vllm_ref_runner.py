@@ -37,7 +37,7 @@ def main():
 
     prompts = [f"The answer to question {i+1} is" for i in range(num_prompts)]
 
-    llm = LLM(
+    kwargs = dict(
         model=model_id,
         dtype=model_dtype,
         worker_cls="tests.ref_disk_worker.RefDiskWorker",
@@ -45,6 +45,11 @@ def main():
         enforce_eager=enforce_eager,
         gpu_memory_utilization=0.5,
     )
+    cg_mode = os.environ.get("E2E_CUDAGRAPH_MODE")
+    if cg_mode:
+        kwargs["compilation_config"] = {"cudagraph_mode": cg_mode}
+        print(f"[vllm_ref_runner] cudagraph_mode={cg_mode}", flush=True)
+    llm = LLM(**kwargs)
 
     params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
     outputs = llm.generate(prompts, params)

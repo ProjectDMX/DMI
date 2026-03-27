@@ -31,7 +31,8 @@ class RefDiskWorker(Worker):
         # Remap to ref variant
         hf_cfg = self.vllm_config.model_config.hf_config
         archs = getattr(hf_cfg, "architectures", [])
-        hf_cfg.architectures = [_ARCH_REMAP.get(a, a) for a in archs]
+        new_archs = [_ARCH_REMAP.get(a, a) for a in archs]
+        hf_cfg.architectures = new_archs
 
         super().load_model()
 

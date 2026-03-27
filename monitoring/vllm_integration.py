@@ -192,7 +192,8 @@ class DMXGPUWorker(Worker):
         }
         hf_cfg = self.vllm_config.model_config.hf_config
         archs = getattr(hf_cfg, "architectures", [])
-        hf_cfg.architectures = [_ARCH_REMAP.get(a, a) for a in archs]
+        new_archs = [_ARCH_REMAP.get(a, a) for a in archs]
+        hf_cfg.architectures = new_archs
 
         super().load_model()
 
@@ -251,6 +252,10 @@ class DMXGPUWorker(Worker):
         from .ring_transport import align_up_py, _compute_hook_shape
 
         total_tokens = scheduler_output.total_num_scheduled_tokens
+        if not hasattr(self, '_dmx_step_counter'):
+            self._dmx_step_counter = 0
+        self._dmx_step_counter += 1
+        _step = self._dmx_step_counter
         transport = ring_transport.get_active()
 
         if total_tokens == 0 or transport is None or transport.null_offload:
@@ -358,9 +363,14 @@ class DMXGPUWorker(Worker):
             rid = req_ids[i]
             n = num_scheduled_per_req[i]
             pre_computed = computed_map.get(rid, 0)
-            req_id_list.append(normalize_vllm_request_id(rid))
+            norm_id = normalize_vllm_request_id(rid)
+            req_id_list.append(norm_id)
             token_ranges.append((pre_computed, pre_computed + n))
             dim0_offsets.append(offset)
+            print(f"[dmx_worker] step={_step} req[{i}] rid={norm_id} offset={offset} n={n} "
+                  f"t_start={pre_computed} t_end={pre_computed + n} "
+                  f"pre_computed={pre_computed} padded_q={padded_q} meta_q={meta_q}",
+                  flush=True)
             offset += n
 
         transport.set_step_context(

@@ -31,11 +31,11 @@ def main():
     model_id = _MODEL_ALIASES.get(model_key, model_key)
     num_prompts = int(os.environ.get("E2E_NUM_PROMPTS", "8"))
     max_new_tokens = int(os.environ.get("E2E_MAX_NEW_TOKENS", "20"))
-    enforce_eager = os.environ.get("E2E_ENFORCE_EAGER", "0") == "1"
+    enforce_eager = os.environ.get("E2E_ENFORCE_EAGER", "1") == "1"
     model_dtype = os.environ.get("E2E_DTYPE", "auto")
     ring_payload_mb = int(os.environ.get("E2E_RING_PAYLOAD_MB", "4096"))
     ring_pinned_mb = int(os.environ.get("E2E_RING_PINNED_MB", "4096"))
-    hook_selection = os.environ.get("E2E_HOOK_SELECTION", "vllm-full")
+    hook_selection = os.environ.get("DMX_HOOK_SELECTION", "vllm-full")
     db_host = os.environ.get("DMX_DB_HOST", "localhost")
     db_port = int(os.environ.get("DMX_DB_PORT", "9000"))
 
@@ -49,7 +49,7 @@ def main():
     except Exception:
         pass
 
-    llm = LLM(
+    kwargs = dict(
         model=model_id,
         dtype=model_dtype,
         worker_cls="monitoring.vllm_integration.DMXGPUWorker",
@@ -64,6 +64,11 @@ def main():
         enforce_eager=enforce_eager,
         gpu_memory_utilization=0.5,
     )
+    cg_mode = os.environ.get("E2E_CUDAGRAPH_MODE")
+    if cg_mode:
+        kwargs["compilation_config"] = {"cudagraph_mode": cg_mode}
+        print(f"[vllm_monitored_runner] cudagraph_mode={cg_mode}", flush=True)
+    llm = LLM(**kwargs)
 
     params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
     outputs = llm.generate(prompts, params)
