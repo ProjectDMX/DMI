@@ -47,7 +47,7 @@ PAD_BUCKETS="128,256,384,512"
 CAPTURE_MODE="hs_logits"
 RING_MB=20480
 RING_TASK_ENTRIES=131072
-RING_FLUSH=0.15
+RING_FLUSH_TIMEOUT_US=200
 
 RUN_TAG="$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
 RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/hook_count_dmi_20g_qwen3_4b_${DATASET}_${RUN_TAG}"
@@ -184,8 +184,9 @@ run_proj_dmi_allow_fail() {
         --ring-payload-mb "${RING_MB}" \
         --ring-pinned-mb "${RING_MB}" \
         --ring-task-entries "${RING_TASK_ENTRIES}" \
-        --drain-flush-payload-ratio "${RING_FLUSH}" \
-        --drain-flush-task-ratio "${RING_FLUSH}" \
+        --drain-flush-payload-ratio 0 \
+        --drain-flush-task-ratio 0 \
+        --drain-flush-timeout-us "${RING_FLUSH_TIMEOUT_US}" \
         >"${log_file}" 2>&1; then
         cat "${log_file}"
         target_toks=$(grep -oP 'target_tok/s=\K[0-9.]+' "${log_file}" | tail -1 || true)

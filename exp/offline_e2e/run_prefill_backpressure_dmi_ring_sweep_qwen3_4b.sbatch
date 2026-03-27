@@ -50,7 +50,7 @@ DMI_HOOKS="q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
 LIGHT_BASELINE_RING_MB=61440
 RING_SIZES_MB=(10240 20480 30720 40960 51200)
 RING_TASK_ENTRIES=65536
-RING_FLUSH=0.15
+RING_FLUSH_TIMEOUT_US=200
 
 RUN_TAG="$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
 RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/prefill_backpressure_dmi_ring_sweep_${RUN_TAG}"
@@ -166,8 +166,9 @@ run_allow_fail() {
         --ring-payload-mb "${ring_mb}" \
         --ring-pinned-mb "${ring_mb}" \
         --ring-task-entries "${RING_TASK_ENTRIES}" \
-        --drain-flush-payload-ratio "${RING_FLUSH}" \
-        --drain-flush-task-ratio "${RING_FLUSH}" \
+        --drain-flush-payload-ratio 0 \
+        --drain-flush-task-ratio 0 \
+        --drain-flush-timeout-us "${RING_FLUSH_TIMEOUT_US}" \
         >"${log_file}" 2>&1; then
         cat "${log_file}"
         results_json=$(grep -oP '^Saved \K.*json$' "${log_file}" | tail -1 || true)
