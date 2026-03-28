@@ -31,6 +31,7 @@ CAPTURE_MODE=${CAPTURE_MODE:-hs_logits}
 PAD_BUCKETS=${PAD_BUCKETS:-64,128,256,512}
 MAX_BS_CAP=${MAX_BS_CAP:-500}
 SEARCH_HIGH_UPPER_COMPILE=${SEARCH_HIGH_UPPER_COMPILE:-183}
+SEARCH_HIGH_TORCH_HOOKS=${SEARCH_HIGH_TORCH_HOOKS:-192}
 SEARCH_HIGH_DMI=${SEARCH_HIGH_DMI:-128}
 SMOKE=${SMOKE:-0}
 RING_TASK_ENTRIES=${RING_TASK_ENTRIES:-131072}
@@ -39,6 +40,7 @@ RING_FLUSH=${RING_FLUSH:-0.15}
 if [ "${SMOKE}" = "1" ]; then
     MAX_BS_CAP=${MAX_BS_CAP_SMOKE:-64}
     SEARCH_HIGH_UPPER_COMPILE=${SEARCH_HIGH_UPPER_COMPILE_SMOKE:-64}
+    SEARCH_HIGH_TORCH_HOOKS=${SEARCH_HIGH_TORCH_HOOKS_SMOKE:-64}
     SEARCH_HIGH_DMI=${SEARCH_HIGH_DMI_SMOKE:-64}
 fi
 
@@ -59,6 +61,7 @@ esac
 
 BASELINES=(
     "hf_upper_bound_compile"
+    "torch_hooks_eager"
     "proj_dmi_compile_ring2g"
     "proj_dmi_compile_ring15g"
     "proj_dmi_compile_ring20g"
@@ -186,6 +189,8 @@ get_start_probe() {
     local baseline="$1"
     if [ "${baseline}" = "hf_upper_bound_compile" ]; then
         echo "${SEARCH_HIGH_UPPER_COMPILE}"
+    elif [ "${baseline}" = "torch_hooks_eager" ]; then
+        echo "${SEARCH_HIGH_TORCH_HOOKS}"
     else
         echo "${SEARCH_HIGH_DMI}"
     fi
@@ -213,6 +218,9 @@ build_command() {
     case "${baseline}" in
         hf_upper_bound_compile)
             CMD=(python run_hf_upper_bound.py "${COMMON[@]}")
+            ;;
+        torch_hooks_eager)
+            CMD=(python run_torch_hooks.py "${COMMON[@]}")
             ;;
         proj_dmi_compile_ring2g)
             RING_MB=2048
@@ -410,8 +418,8 @@ search_baseline() {
         done
     fi
 
-    if [ "${low_ok}" -gt 0 ] && [ "${high_fail}" -gt $((low_ok + 1)) ]; then
-        while [ $((high_fail - low_ok)) -gt 1 ]; do
+    if [ "${low_ok}" -gt 0 ] && [ "${high_fail}" -gt $((low_ok + 5)) ]; then
+        while [ $((high_fail - low_ok)) -gt 5 ]; do
             local mid=$(((low_ok + high_fail) / 2))
             run_attempt "${baseline}" "${mid}"
             if [ "${ATTEMPT_STATUS}" = "OK" ]; then

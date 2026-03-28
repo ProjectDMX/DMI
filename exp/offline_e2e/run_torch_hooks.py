@@ -73,6 +73,7 @@ class TorchHookCollector:
         self.handles: list[Any] = []
         self.active = False
         self.hook_names: list[str] = []
+        self._step_tensors: list[torch.Tensor] = []
         self._register()
 
     def _materialize(self, tensor: Any, *, reshape_v: bool = False) -> None:
@@ -82,8 +83,7 @@ class TorchHookCollector:
             num_kv_heads = int(self.model.config.num_key_value_heads)
             head_dim = int(self.model.model.layers[0].self_attn.head_dim)
             tensor = tensor.view(tensor.shape[0], tensor.shape[1], num_kv_heads, head_dim)
-        cpu_tensor = tensor.detach().cpu()
-        _ = cpu_tensor.shape
+        self._step_tensors.append(tensor.detach())
 
     def _register_hidden_states(self) -> None:
         for layer_idx, layer in enumerate(self.model.model.layers):
@@ -298,9 +298,14 @@ class TorchHookCollector:
 
     def begin(self) -> None:
         self.active = True
+        self._step_tensors = []
 
     def end(self) -> None:
         self.active = False
+        for tensor in self._step_tensors:
+            cpu_tensor = tensor.cpu()
+            _ = cpu_tensor.shape
+        self._step_tensors = []
 
     def close(self) -> None:
         for handle in self.handles:
