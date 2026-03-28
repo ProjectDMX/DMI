@@ -65,6 +65,8 @@ def test_vllm_identical(subtests):
         pytest.skip(f"No ref model for {model_key}")
     model_file = os.path.join(models_dir, ref_filename)
 
+    keep_artifacts = os.environ.get("E2E_KEEP_ARTIFACTS", "0") == "1"
+    dump_compiled = os.environ.get("E2E_DUMP_COMPILED", "0") == "1"
     run_dir = tempfile.mkdtemp(prefix="vllm_identical_")
     ref_dir = os.path.join(run_dir, "ref")
     mon_dir = os.path.join(run_dir, "mon")
@@ -85,6 +87,8 @@ def test_vllm_identical(subtests):
     sub_env["VLLM_DISABLE_COMPILE_CACHE"] = "1"
     sub_env["E2E_ENFORCE_EAGER"] = enforce_eager
     sub_env["DMX_HOOK_SELECTION"] = hooks
+    if dump_compiled:
+        sub_env["TORCH_LOGS"] = "+output_code"
 
     try:
         # Backup ref model file
@@ -112,6 +116,9 @@ def test_vllm_identical(subtests):
             env=sub_env, capture_output=True, text=True, cwd=project_root,
         )
         print(r0a.stdout[-1000:] if r0a.stdout else "", flush=True)
+        if dump_compiled and r0a.stderr:
+            with open(os.path.join(run_dir, "compile_orig.log"), "w") as f:
+                f.write(r0a.stderr)
         if r0a.returncode != 0:
             print(r0a.stderr[-2000:] if r0a.stderr else "", flush=True)
             print("  WARNING: original logprob run failed, skipping sanity check")
@@ -126,6 +133,9 @@ def test_vllm_identical(subtests):
             env=ref_lp_env, capture_output=True, text=True, cwd=project_root,
         )
         print(r0b.stdout[-1000:] if r0b.stdout else "", flush=True)
+        if dump_compiled and r0b.stderr:
+            with open(os.path.join(run_dir, "compile_ref_logprob.log"), "w") as f:
+                f.write(r0b.stderr)
         if r0b.returncode != 0:
             print(r0b.stderr[-2000:] if r0b.stderr else "", flush=True)
             print("  WARNING: ref logprob run failed, skipping sanity check")
@@ -140,6 +150,9 @@ def test_vllm_identical(subtests):
             env=sub_env, capture_output=True, text=True, cwd=project_root,
         )
         print(r0c.stdout[-1000:] if r0c.stdout else "", flush=True)
+        if dump_compiled and r0c.stderr:
+            with open(os.path.join(run_dir, "compile_mon_logprob.log"), "w") as f:
+                f.write(r0c.stderr)
         if r0c.returncode != 0:
             print(r0c.stderr[-2000:] if r0c.stderr else "", flush=True)
             print("  WARNING: monitored logprob run failed, skipping")
@@ -155,6 +168,12 @@ def test_vllm_identical(subtests):
             env=ref_env, capture_output=True, text=True, cwd=project_root,
         )
         print(r1.stdout[-2000:] if r1.stdout else "", flush=True)
+        if keep_artifacts and r1.stdout:
+            with open(os.path.join(run_dir, "stdout_ref_runner.log"), "w") as f:
+                f.write(r1.stdout)
+        if dump_compiled and r1.stderr:
+            with open(os.path.join(run_dir, "compile_ref_runner.log"), "w") as f:
+                f.write(r1.stderr)
         if r1.returncode != 0:
             print(r1.stderr[-3000:] if r1.stderr else "", flush=True)
             pytest.fail(f"Ref runner failed (rc={r1.returncode})")
@@ -170,6 +189,12 @@ def test_vllm_identical(subtests):
             env=sub_env, capture_output=True, text=True, cwd=project_root,
         )
         print(r2.stdout[-2000:] if r2.stdout else "", flush=True)
+        if keep_artifacts and r2.stdout:
+            with open(os.path.join(run_dir, "stdout_mon_runner.log"), "w") as f:
+                f.write(r2.stdout)
+        if dump_compiled and r2.stderr:
+            with open(os.path.join(run_dir, "compile_mon_runner.log"), "w") as f:
+                f.write(r2.stderr)
         if r2.returncode != 0:
             print(r2.stderr[-3000:] if r2.stderr else "", flush=True)
             pytest.fail(f"Monitored runner failed (rc={r2.returncode})")
@@ -215,4 +240,7 @@ def test_vllm_identical(subtests):
         # Always restore ref model file
         if os.path.exists(backup_file):
             shutil.copy2(backup_file, model_file)
-        shutil.rmtree(run_dir, ignore_errors=True)
+        if keep_artifacts:
+            print(f"\n  [kept] run_dir = {run_dir}", flush=True)
+        else:
+            shutil.rmtree(run_dir, ignore_errors=True)
