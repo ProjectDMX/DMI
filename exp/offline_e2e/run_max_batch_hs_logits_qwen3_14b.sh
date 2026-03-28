@@ -28,12 +28,10 @@ cd "${PROJECT}/exp/offline_e2e"
 MODEL=${MODEL:-qwen3-14b}
 DATASET=${DATASET:-wildchat}
 CAPTURE_MODE=${CAPTURE_MODE:-hs_logits}
-LIMIT_BASE=${LIMIT_BASE:-500}
 PAD_BUCKETS=${PAD_BUCKETS:-64,128,256,512}
 MAX_BS_CAP=${MAX_BS_CAP:-500}
 SEARCH_HIGH_NORMAL=${SEARCH_HIGH_NORMAL:-128}
 SEARCH_HIGH_HF_MONITOR=${SEARCH_HIGH_HF_MONITOR:-32}
-MEASURE_AFTER_SEARCH=${MEASURE_AFTER_SEARCH:-1}
 SMOKE=${SMOKE:-0}
 RING_TASK_ENTRIES=${RING_TASK_ENTRIES:-131072}
 RING_FLUSH=${RING_FLUSH:-0.15}
@@ -42,17 +40,14 @@ if [ "${SMOKE}" = "1" ]; then
     MAX_BS_CAP=${MAX_BS_CAP_SMOKE:-64}
     SEARCH_HIGH_NORMAL=${SEARCH_HIGH_NORMAL_SMOKE:-64}
     SEARCH_HIGH_HF_MONITOR=${SEARCH_HIGH_HF_MONITOR_SMOKE:-16}
-    MEASURE_AFTER_SEARCH=${MEASURE_AFTER_SEARCH_SMOKE:-0}
 fi
 
 case "${DATASET}" in
     wildchat)
-        SAMPLE_FILE="../../benchmark/data/offline_e2e/wildchat_500_sample1.jsonl"
         MAX_INPUT=250
         MAX_OUTPUT=1000
         ;;
     sharegpt)
-        SAMPLE_FILE="../../benchmark/data/offline_e2e/sharegpt_500_sample1.jsonl"
         MAX_INPUT=200
         MAX_OUTPUT=750
         ;;
@@ -77,15 +72,16 @@ TAG_SUFFIX=""
 if [ "${SMOKE}" = "1" ]; then
     TAG_SUFFIX="_smoke"
 fi
-RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/max_batch_${MODEL}_${DATASET}_${CAPTURE_MODE}${TAG_SUFFIX}_${RUN_TAG}"
+RESULTS_DIR="${PROJECT}/exp/offline_e2e/results/max_batch_${MODEL}_${DATASET}_${CAPTURE_MODE}_synthetic${TAG_SUFFIX}_${RUN_TAG}"
 LOG_DIR="${RESULTS_DIR}/logs"
 ATTEMPT_DIR="${RESULTS_DIR}/attempts"
 SUMMARY_CSV="${RESULTS_DIR}/summary.csv"
 ATTEMPTS_CSV="${RESULTS_DIR}/attempts.csv"
+SYNTHETIC_FILE="${RESULTS_DIR}/synthetic_${DATASET}_${MAX_INPUT}_${MAX_OUTPUT}_${MAX_BS_CAP}.jsonl"
 mkdir -p "${RESULTS_DIR}" "${LOG_DIR}" "${ATTEMPT_DIR}"
 
-echo "baseline,ring_mb,max_batch_size,last_ok_bs,first_fail_bs,measure_limit,measure_status,target_tok_s,compute_tok_s,prompts_s,total_seconds,search_total_seconds,measure_log_file,measure_json" > "${SUMMARY_CSV}"
-echo "baseline,ring_mb,phase,batch_size,limit,status,target_tok_s,compute_tok_s,prompts_s,total_seconds,log_file,json_file" > "${ATTEMPTS_CSV}"
+echo "baseline,ring_mb,max_batch_size,last_ok_bs,first_fail_bs,target_tok_s,compute_tok_s,prompts_s,total_seconds,search_total_seconds,search_log_file,search_json" > "${SUMMARY_CSV}"
+echo "baseline,ring_mb,batch_size,status,target_tok_s,compute_tok_s,prompts_s,total_seconds,log_file,json_file" > "${ATTEMPTS_CSV}"
 
 LOCAL_NVME_HF="/tmp/${USER}_hf_cache_${SLURM_JOB_ID:-manual}"
 LOCAL_HF="${LOCAL_NVME_HF}"
@@ -125,6 +121,36 @@ prepare_model_cache() {
     esac
     export HF_HOME="${LOCAL_HF}"
     echo "HF_HOME=${HF_HOME}"
+}
+
+generate_synthetic_sample() {
+    echo "Generating synthetic sample file: ${SYNTHETIC_FILE}"
+    python - <<'PY2' "${SYNTHETIC_FILE}" "${MAX_BS_CAP}" "${DATASET}" "${MAX_INPUT}" "${MAX_OUTPUT}"
+import json
+import sys
+from pathlib import Path
+out = Path(sys.argv[1])
+count = int(sys.argv[2])
+dataset = sys.argv[3]
+max_input = int(sys.argv[4])
+max_output = int(sys.argv[5])
+prompt_text = ("synthetic prompt token " * (max_input * 12)).strip()
+target_text = ("synthetic target token " * (max_output * 12)).strip()
+out.parent.mkdir(parents=True, exist_ok=True)
+with out.open('w', encoding='utf-8') as f:
+    for i in range(count):
+        row = {
+            "dataset": dataset,
+            "sample_id": i + 1,
+            "entry_id": f"synthetic_{i}",
+            "source_conversation_id": f"synthetic_{i}",
+            "approx_prompt_tokens": max_input,
+            "approx_target_tokens": max_output,
+            "target_text": target_text,
+            "messages": [{"role": "user", "content": prompt_text}],
+        }
+        f.write(json.dumps(row) + "\n")
+PY2
 }
 
 cleanup_gpu() {
@@ -176,17 +202,16 @@ get_start_probe() {
 build_command() {
     local baseline="$1"
     local bs="$2"
-    local limit="$3"
-    local run_dir="$4"
+    local run_dir="$3"
 
     COMMON=(
         --model "${MODEL}"
         --batch-size "${bs}"
-        --sample-file "${SAMPLE_FILE}"
+        --sample-file "${SYNTHETIC_FILE}"
         --local-files-only
         --max-input-tokens "${MAX_INPUT}"
         --max-new-tokens "${MAX_OUTPUT}"
-        --limit "${limit}"
+        --limit "${bs}"
         --pad-buckets "${PAD_BUCKETS}"
         --results-dir "${run_dir}"
         --capture-mode "${CAPTURE_MODE}"
@@ -227,17 +252,15 @@ build_command() {
 append_attempt() {
     local baseline="$1"
     local ring_mb="$2"
-    local phase="$3"
-    local bs="$4"
-    local limit="$5"
-    local status="$6"
-    local target_toks="$7"
-    local compute_toks="$8"
-    local prompts_s="$9"
-    local total_seconds="${10}"
-    local log_file="${11}"
-    local json_file="${12}"
-    echo "${baseline},${ring_mb},${phase},${bs},${limit},${status},${target_toks},${compute_toks},${prompts_s},${total_seconds},${log_file},${json_file}" >> "${ATTEMPTS_CSV}"
+    local bs="$3"
+    local status="$4"
+    local target_toks="$5"
+    local compute_toks="$6"
+    local prompts_s="$7"
+    local total_seconds="$8"
+    local log_file="$9"
+    local json_file="${10}"
+    echo "${baseline},${ring_mb},${bs},${status},${target_toks},${compute_toks},${prompts_s},${total_seconds},${log_file},${json_file}" >> "${ATTEMPTS_CSV}"
 }
 
 append_summary() {
@@ -246,35 +269,31 @@ append_summary() {
     local max_bs="$3"
     local low_ok="$4"
     local high_fail="$5"
-    local measure_limit="$6"
-    local measure_status="$7"
-    local target_toks="$8"
-    local compute_toks="$9"
-    local prompts_s="${10}"
-    local total_seconds="${11}"
-    local search_total_seconds="${12}"
-    local log_file="${13}"
-    local json_file="${14}"
-    echo "${baseline},${ring_mb},${max_bs},${low_ok},${high_fail},${measure_limit},${measure_status},${target_toks},${compute_toks},${prompts_s},${total_seconds},${search_total_seconds},${log_file},${json_file}" >> "${SUMMARY_CSV}"
+    local target_toks="$6"
+    local compute_toks="$7"
+    local prompts_s="$8"
+    local total_seconds="$9"
+    local search_total_seconds="${10}"
+    local log_file="${11}"
+    local json_file="${12}"
+    echo "${baseline},${ring_mb},${max_bs},${low_ok},${high_fail},${target_toks},${compute_toks},${prompts_s},${total_seconds},${search_total_seconds},${log_file},${json_file}" >> "${SUMMARY_CSV}"
 }
 
 run_attempt() {
     local baseline="$1"
-    local phase="$2"
-    local bs="$3"
-    local limit="$4"
+    local bs="$2"
 
     local safe_label="${baseline// /_}"
     safe_label="${safe_label//\//_}"
-    local tag="${safe_label}__${phase}__bs${bs}__limit${limit}"
+    local tag="${safe_label}__bs${bs}"
     local run_dir="${ATTEMPT_DIR}/${tag}"
     local log_file="${LOG_DIR}/${tag}.log"
     mkdir -p "${run_dir}"
 
-    build_command "${baseline}" "${bs}" "${limit}" "${run_dir}"
+    build_command "${baseline}" "${bs}" "${run_dir}"
 
     echo ""
-    echo "=== ${baseline} | phase=${phase} bs=${bs} limit=${limit} ring=${RING_MB:-na} ==="
+    echo "=== ${baseline} | bs=${bs} ring=${RING_MB:-na} ==="
 
     local status="FAIL"
     local target_toks=""
@@ -325,7 +344,7 @@ EOF
         compute_toks=$(grep -oP 'compute_tok/s=\K[0-9.]+' "${log_file}" | tail -1 || true)
     fi
 
-    append_attempt "${baseline}" "${RING_MB}" "${phase}" "${bs}" "${limit}" "${status}" "${target_toks}" "${compute_toks}" "${prompts_s}" "${total_seconds}" "${log_file}" "${json_file}"
+    append_attempt "${baseline}" "${RING_MB}" "${bs}" "${status}" "${target_toks}" "${compute_toks}" "${prompts_s}" "${total_seconds}" "${log_file}" "${json_file}"
     cleanup_gpu
 
     ATTEMPT_STATUS="${status}"
@@ -348,16 +367,34 @@ search_baseline() {
     search_start_ts=$(date +%s)
     local low_ok=0
     local high_fail=0
+    local best_target_toks=""
+    local best_compute_toks=""
+    local best_prompts_s=""
+    local best_total_seconds=""
+    local best_log_file=""
+    local best_json_file=""
 
-    run_attempt "${baseline}" "search" "${start_probe}" "${start_probe}"
+    run_attempt "${baseline}" "${start_probe}"
     if [ "${ATTEMPT_STATUS}" = "OK" ]; then
         low_ok="${start_probe}"
+        best_target_toks="${ATTEMPT_TARGET_TOKS}"
+        best_compute_toks="${ATTEMPT_COMPUTE_TOKS}"
+        best_prompts_s="${ATTEMPT_PROMPTS_S}"
+        best_total_seconds="${ATTEMPT_TOTAL_SECONDS}"
+        best_log_file="${ATTEMPT_LOG_FILE}"
+        best_json_file="${ATTEMPT_JSON_FILE}"
         local next_probe
         next_probe=$(next_probe_up "${low_ok}")
         while [ "${next_probe}" -gt 0 ]; do
-            run_attempt "${baseline}" "search" "${next_probe}" "${next_probe}"
+            run_attempt "${baseline}" "${next_probe}"
             if [ "${ATTEMPT_STATUS}" = "OK" ]; then
                 low_ok="${next_probe}"
+                best_target_toks="${ATTEMPT_TARGET_TOKS}"
+                best_compute_toks="${ATTEMPT_COMPUTE_TOKS}"
+                best_prompts_s="${ATTEMPT_PROMPTS_S}"
+                best_total_seconds="${ATTEMPT_TOTAL_SECONDS}"
+                best_log_file="${ATTEMPT_LOG_FILE}"
+                best_json_file="${ATTEMPT_JSON_FILE}"
                 if [ "${low_ok}" -ge "${MAX_BS_CAP}" ]; then
                     high_fail=0
                     break
@@ -374,9 +411,15 @@ search_baseline() {
             if [ "${bs}" -ge "${start_probe}" ]; then
                 continue
             fi
-            run_attempt "${baseline}" "search" "${bs}" "${bs}"
+            run_attempt "${baseline}" "${bs}"
             if [ "${ATTEMPT_STATUS}" = "OK" ]; then
                 low_ok="${bs}"
+                best_target_toks="${ATTEMPT_TARGET_TOKS}"
+                best_compute_toks="${ATTEMPT_COMPUTE_TOKS}"
+                best_prompts_s="${ATTEMPT_PROMPTS_S}"
+                best_total_seconds="${ATTEMPT_TOTAL_SECONDS}"
+                best_log_file="${ATTEMPT_LOG_FILE}"
+                best_json_file="${ATTEMPT_JSON_FILE}"
                 break
             fi
             high_fail="${bs}"
@@ -386,48 +429,26 @@ search_baseline() {
     if [ "${low_ok}" -gt 0 ] && [ "${high_fail}" -gt $((low_ok + 1)) ]; then
         while [ $((high_fail - low_ok)) -gt 1 ]; do
             local mid=$(((low_ok + high_fail) / 2))
-            run_attempt "${baseline}" "search" "${mid}" "${mid}"
+            run_attempt "${baseline}" "${mid}"
             if [ "${ATTEMPT_STATUS}" = "OK" ]; then
                 low_ok="${mid}"
+                best_target_toks="${ATTEMPT_TARGET_TOKS}"
+                best_compute_toks="${ATTEMPT_COMPUTE_TOKS}"
+                best_prompts_s="${ATTEMPT_PROMPTS_S}"
+                best_total_seconds="${ATTEMPT_TOTAL_SECONDS}"
+                best_log_file="${ATTEMPT_LOG_FILE}"
+                best_json_file="${ATTEMPT_JSON_FILE}"
             else
                 high_fail="${mid}"
             fi
         done
     fi
 
-    local max_bs="${low_ok}"
-    local measure_limit=""
-    local measure_status=""
-    local measure_target_toks=""
-    local measure_compute_toks=""
-    local measure_prompts_s=""
-    local measure_total_seconds=""
-    local measure_log_file=""
-    local measure_json_file=""
-
-    if [ "${MEASURE_AFTER_SEARCH}" = "1" ] && [ "${max_bs}" -gt 0 ]; then
-        measure_limit=$((max_bs * 2))
-        if [ "${measure_limit}" -gt "${LIMIT_BASE}" ]; then
-            measure_limit="${LIMIT_BASE}"
-        fi
-        if [ "${measure_limit}" -lt "${max_bs}" ]; then
-            measure_limit="${max_bs}"
-        fi
-        run_attempt "${baseline}" "measure" "${max_bs}" "${measure_limit}"
-        measure_status="${ATTEMPT_STATUS}"
-        measure_target_toks="${ATTEMPT_TARGET_TOKS}"
-        measure_compute_toks="${ATTEMPT_COMPUTE_TOKS}"
-        measure_prompts_s="${ATTEMPT_PROMPTS_S}"
-        measure_total_seconds="${ATTEMPT_TOTAL_SECONDS}"
-        measure_log_file="${ATTEMPT_LOG_FILE}"
-        measure_json_file="${ATTEMPT_JSON_FILE}"
-    fi
-
     local search_end_ts
     search_end_ts=$(date +%s)
     local search_total_seconds=$((search_end_ts - search_start_ts))
 
-    append_summary "${baseline}" "${RING_MB}" "${max_bs}" "${low_ok}" "${high_fail}" "${measure_limit}" "${measure_status}" "${measure_target_toks}" "${measure_compute_toks}" "${measure_prompts_s}" "${measure_total_seconds}" "${search_total_seconds}" "${measure_log_file}" "${measure_json_file}"
+    append_summary "${baseline}" "${RING_MB}" "${low_ok}" "${low_ok}" "${high_fail}" "${best_target_toks}" "${best_compute_toks}" "${best_prompts_s}" "${best_total_seconds}" "${search_total_seconds}" "${best_log_file}" "${best_json_file}"
 }
 
 echo "============================================================"
@@ -438,7 +459,7 @@ echo "============================================================"
 echo "Model    : ${MODEL}"
 echo "Dataset  : ${DATASET}"
 echo "Capture  : ${CAPTURE_MODE}"
-echo "Sample   : ${SAMPLE_FILE}"
+echo "Synthetic: ${SYNTHETIC_FILE}"
 echo "Input    : ${MAX_INPUT}"
 echo "Output   : ${MAX_OUTPUT}"
 echo "Max cap  : ${MAX_BS_CAP}"
@@ -446,6 +467,7 @@ echo "Results  : ${RESULTS_DIR}"
 echo "Smoke    : ${SMOKE}"
 
 prepare_model_cache
+generate_synthetic_sample
 
 for baseline in "${BASELINES[@]}"; do
     echo ""
