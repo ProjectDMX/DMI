@@ -55,6 +55,9 @@ def _make_model_shape(model: Any) -> Optional[Any]:
             import torch
             dtype = torch.float16
         vocab_size = getattr(cfg, "vocab_size", 0) or 0
+        intermediate_dim = getattr(cfg, "intermediate_size", None) or getattr(cfg, "n_inner", None) or 0
+        if not intermediate_dim and getattr(cfg, "model_type", "") == "gpt2":
+            intermediate_dim = 4 * int(hidden_dim)
         return ModelShapeConfig(
             hidden_dim=int(hidden_dim),
             num_heads=int(num_heads),
@@ -62,6 +65,7 @@ def _make_model_shape(model: Any) -> Optional[Any]:
             head_dim=int(head_dim),
             dtype=dtype,
             vocab_size=int(vocab_size),
+            intermediate_dim=int(intermediate_dim),
         )
     except Exception:
         return None
@@ -106,7 +110,7 @@ def _install_monitoring_forward(model: Any) -> None:
             hook_selection = getattr(transport, '_hook_selection', None)
             if hook_selection is not None:
                 active_specs = ring_transport.apply_hook_selection(
-                    active_specs, hook_selection)
+                    active_specs, hook_selection, cfg=transport._model_cfg)
 
             handles: List = []
             ring_transport.install_ring_hooks(active_specs, handles)

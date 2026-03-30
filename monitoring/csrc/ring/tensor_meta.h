@@ -46,7 +46,8 @@ enum HookType : int {
     HOOK_TYPE_FINAL_LN     = 17,
     HOOK_TYPE_TOKEN_IDS    = 18,
     HOOK_TYPE_FINAL_LOGITS = 19,
-    HOOK_TYPE_COUNT        = 20,
+    HOOK_TYPE_MLP_POST     = 20,  // after activation, before down_proj (TransformerLens hook_post)
+    HOOK_TYPE_COUNT        = 21,
 };
 
 // Hook type -> display name for ClickHouse act_name column.
@@ -59,7 +60,7 @@ inline const char* hook_type_name(int hook_type) {
         "attn.hook_q", "attn.hook_k", "attn.hook_v",
         "attn.hook_z", nullptr, "hook_ln2", "hook_mlp_in", "hook_mlp_out",
         "hook_resid_final", "hook_embed", "hook_pos_embed", "hook_final_ln",
-        "token_ids", "final_logits",
+        "token_ids", "final_logits", "hook_mlp_post",
     };
     if (hook_type >= 0 && hook_type < HOOK_TYPE_COUNT) return NAMES[hook_type];
     return "unknown";

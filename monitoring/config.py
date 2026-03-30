@@ -19,6 +19,7 @@ _ATTENTION_SUFFIXES = (
 
 _MLP_SUFFIXES = (
     "hook_mlp_in",
+    "hook_mlp_post",
     "hook_mlp_out",
 )
 

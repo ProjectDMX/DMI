@@ -35,6 +35,7 @@ SAMPLE_HOOK_NAMES = [
     "blocks.0.attn.hook_result",
     "blocks.0.hook_resid_mid",
     "blocks.0.mlp.hook_mlp_in",
+    "blocks.0.mlp.hook_mlp_post",
     "blocks.0.mlp.hook_mlp_out",
     "blocks.0.hook_resid_post",
     "blocks.1.hook_resid_pre",

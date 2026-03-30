@@ -220,7 +220,7 @@ class DMXGPUWorker(Worker):
 
         if hasattr(model, "get_hook_specs"):
             all_specs = model.get_hook_specs()
-            active_specs = apply_hook_selection(all_specs, self._dmx_hook_selection)
+            active_specs = apply_hook_selection(all_specs, self._dmx_hook_selection, cfg=model_shape)
 
             from vllm.distributed.parallel_state import get_pp_group
             pp_group = get_pp_group()

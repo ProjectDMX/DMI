@@ -62,6 +62,7 @@ HOOK_TYPE_Z           = 9
 HOOK_TYPE_LN2         = 11
 HOOK_TYPE_MLP_IN      = 12  # == LN2 for dense models; differs for MoE (post-router)
 HOOK_TYPE_MLP_OUT     = 13
+HOOK_TYPE_MLP_POST    = 20  # after activation, before down_proj (TransformerLens hook_post)
 HOOK_TYPE_RESID_FINAL = 14  # global: last layer's residual stream before final norm
 HOOK_TYPE_EMBED       = 15
 HOOK_TYPE_POS_EMBED   = 16
@@ -95,7 +96,7 @@ _ALL_HOOK_TYPES = frozenset({
     HOOK_TYPE_RESID_PRE, HOOK_TYPE_LN1, HOOK_TYPE_ATTN_OUT,
     HOOK_TYPE_RESID_MID, HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN,
     HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
-    HOOK_TYPE_LN2, HOOK_TYPE_MLP_IN, HOOK_TYPE_MLP_OUT,
+    HOOK_TYPE_LN2, HOOK_TYPE_MLP_IN, HOOK_TYPE_MLP_POST, HOOK_TYPE_MLP_OUT,
     HOOK_TYPE_RESID_FINAL, HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED,
     HOOK_TYPE_FINAL_LN, HOOK_TYPE_TOKEN_IDS, HOOK_TYPE_FINAL_LOGITS,
 })
@@ -132,6 +133,7 @@ _HOOK_TYPE_BY_NAME: Dict[str, int] = {
     "ln2":         HOOK_TYPE_LN2,
     "mlp_in":      HOOK_TYPE_MLP_IN,
     "mlp_out":     HOOK_TYPE_MLP_OUT,
+    "mlp_post":    HOOK_TYPE_MLP_POST,
     "resid_final":  HOOK_TYPE_RESID_FINAL,
     "embed":       HOOK_TYPE_EMBED,
     "pos_embed":   HOOK_TYPE_POS_EMBED,
@@ -171,20 +173,40 @@ def resolve_hook_selection(mode: str) -> frozenset:
     return frozenset(result)
 
 
-def apply_hook_selection(specs: List["HookSpec"], mode: str) -> List["HookSpec"]:
+def apply_hook_selection(
+    specs: List["HookSpec"],
+    mode: str,
+    cfg: Optional["ModelShapeConfig"] = None,
+) -> List["HookSpec"]:
     """Filter specs and set HookPoint.enabled based on a selection string.
 
     Selection is a comma-separated string of preset names and/or individual
     hook type names.  The enabled set is the union of all tokens.
+
+    If cfg is provided, hooks requiring unavailable model config fields
+    (e.g. mlp_post when intermediate_dim is unknown) are skipped.
 
     Sets enabled=True on hooks in the set, enabled=False on others.
     Returns the filtered list of enabled specs (for _active_specs / metadata).
     """
     allowed = resolve_hook_selection(mode)
 
+    # Hooks that require specific model config fields
+    _SKIP = set()
+    if cfg is not None:
+        if cfg.intermediate_dim == 0:
+            _SKIP.add(HOOK_TYPE_MLP_POST)
+
     enabled_specs = []
     for spec in specs:
-        if spec.hook_type in allowed:
+        if spec.hook_type in _SKIP:
+            spec.module.enabled = False
+            import warnings
+            warnings.warn(
+                f"[apply_hook_selection] Skipping hook_type={spec.hook_type} "
+                f"layer={spec.layer_no}: required model config unavailable "
+                f"(e.g. intermediate_dim=0)")
+        elif spec.hook_type in allowed:
             spec.module.enabled = True
             enabled_specs.append(spec)
         else:
@@ -210,6 +232,7 @@ _HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {
     "hook_ln2":         HOOK_TYPE_LN2,
     "hook_mlp_in":      HOOK_TYPE_MLP_IN,
     "hook_mlp_out":     HOOK_TYPE_MLP_OUT,
+    "hook_mlp_post":    HOOK_TYPE_MLP_POST,
     "hook_resid_final": HOOK_TYPE_RESID_FINAL,
     "hook_embed":       HOOK_TYPE_EMBED,
     "hook_pos_embed":   HOOK_TYPE_POS_EMBED,
@@ -259,6 +282,7 @@ class ModelShapeConfig:
     head_dim:     int
     dtype:        torch.dtype
     vocab_size:   int = 0  # required for final_logits shape
+    intermediate_dim: int = 0  # MLP intermediate size (for mlp_post shape)
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +423,10 @@ def _compute_hook_shape(
         return b + [q_len, cfg.num_heads, cfg.head_dim]
     if hook_type in (HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN):
         return b + [cfg.num_heads, q_len, kv_dim]
+    if hook_type == HOOK_TYPE_MLP_POST:
+        if cfg.intermediate_dim == 0:
+            return []  # intermediate_dim unknown — skip this hook
+        return b + [q_len, cfg.intermediate_dim]
     if hook_type == HOOK_TYPE_TOKEN_IDS:
         return b + [q_len]
     if hook_type == HOOK_TYPE_FINAL_LOGITS:

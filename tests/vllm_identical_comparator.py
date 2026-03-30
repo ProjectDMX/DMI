@@ -231,6 +231,7 @@ def main():
         "ln2": "blocks.hook_ln2",
         "mlp_in": "blocks.hook_mlp_in",
         "mlp_out": "blocks.hook_mlp_out",
+        "mlp_post": "blocks.hook_mlp_post",
         "embed": "hook_embed",
         "pos_embed": "hook_pos_embed",
         "resid_final": "hook_resid_final",
