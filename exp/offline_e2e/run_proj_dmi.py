@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import sys
 import time
 
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 
 from common import (
@@ -59,7 +62,23 @@ class _NullHostEngine:
         pass
 
 
-def _load_hooked_model(model_id: str, *, local_files_only: bool):
+def _dist_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank())
+    return int(os.environ.get("RANK", "0"))
+
+
+def _dist_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_world_size())
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _is_main_process() -> bool:
+    return _dist_rank() == 0
+
+
+def _load_hooked_model(model_id: str, *, local_files_only: bool, tp_size: int = 1):
     if "qwen3" in model_id.lower():
         from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
 
@@ -77,12 +96,16 @@ def _load_hooked_model(model_id: str, *, local_files_only: bool):
             f"No local Hooked* model implementation found for {model_id}. "
             "Proj-DMI is currently wired for repo HookedQwen3/Llama/GPT2 models."
         )
-    return model_cls.from_pretrained(
-        model_id,
+    load_kwargs = dict(
+        pretrained_model_name_or_path=model_id,
         attn_implementation="eager",
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         local_files_only=local_files_only,
     )
+    if int(tp_size) > 1:
+        load_kwargs["tp_plan"] = "auto"
+        load_kwargs["tp_size"] = int(tp_size)
+    return model_cls.from_pretrained(**load_kwargs)
 
 
 def _build_ring_cfg(args) -> object:
@@ -155,6 +178,7 @@ def main() -> None:
     parser.add_argument("--db-password", default="")
     parser.add_argument("--db-database", default="default")
     parser.add_argument("--db-table", default="offload")
+    parser.add_argument("--tp-size", type=int, default=1)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -166,7 +190,9 @@ def main() -> None:
 
     model_id = resolve_model_id(args.model)
     compile_enabled = not args.disable_compile
-    device = torch.device("cuda")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
     default_hook_sel = "hidden-states,final_ln,logits" if args.capture_mode == "hs_logits" else "hidden-states,final_ln"
     hook_sel = str(args.hook_selection) if str(args.hook_selection) != "hidden-states" else default_hook_sel
 
@@ -206,8 +232,10 @@ def main() -> None:
         )
     engine.enable_ring_transport(_build_ring_cfg(args))
 
-    model = _load_hooked_model(model_id, local_files_only=args.local_files_only)
-    model.to(device).eval()
+    model = _load_hooked_model(model_id, local_files_only=args.local_files_only, tp_size=int(args.tp_size))
+    if int(args.tp_size) <= 1:
+        model.to(device)
+    model.eval()
     model.monitoring_engine = engine
     engine.prepare_for_model(model)
 
@@ -247,13 +275,19 @@ def main() -> None:
                 hook_selection=hook_sel, **gen_kwargs,
             )
             device_sync(device)
-    print(f"Warmup done ({len(bucket_inputs)} buckets + 2 real batches).", flush=True)
+    if _is_main_process():
+        print(f"Warmup done ({len(bucket_inputs)} buckets + 2 real batches).", flush=True)
 
     try:
         total_batches = math.ceil(len(rendered) / args.batch_size)
         with torch.no_grad():
             t0 = time.perf_counter()
-            for batch_index, batch in tqdm(enumerate(iter_batches(rendered, args.batch_size)), total=total_batches, desc="proj_dmi"):
+            for batch_index, batch in tqdm(
+                enumerate(iter_batches(rendered, args.batch_size)),
+                total=total_batches,
+                desc="proj_dmi",
+                disable=not _is_main_process(),
+            ):
                 texts = [item["prompt_text"] for item in batch]
                 encoded = tokenize_batch(
                     tokenizer,
@@ -317,6 +351,11 @@ def main() -> None:
             "hook_selection": hook_sel,
             "capture_mode": str(args.capture_mode),
             "proj_dmi_mode": args.proj_dmi_mode,
+            "requested_tp_size": int(args.tp_size),
+            "model_tp_size": int(getattr(model, "_tp_size", 1) or 1),
+            "dist_rank": _dist_rank(),
+            "dist_world_size": _dist_world_size(),
+            "local_rank": local_rank,
             "ring_task_entries": int(args.ring_task_entries),
             "ring_payload_mb": int(args.ring_payload_mb),
             "ring_pinned_mb": int(args.ring_pinned_mb),
@@ -338,13 +377,23 @@ def main() -> None:
         batch_size=args.batch_size,
         repeat_index=args.repeat_index,
     )
-    write_json(out_path, payload)
-    print(f"Saved {out_path}")
-    print(
-        f"[proj_dmi:{args.proj_dmi_mode}] prompts/s={payload['prompts_per_s']:.3f} "
-        f"target_tok/s={payload['target_generated_tokens_per_s']:.3f} "
-        f"compute_tok/s={payload['actual_generated_tokens_per_s']:.3f}"
-    )
+    launched_distributed = _dist_world_size() > 1
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if _is_main_process():
+        write_json(out_path, payload)
+        print(f"Saved {out_path}")
+        print(
+            f"[proj_dmi:{args.proj_dmi_mode}] prompts/s={payload['prompts_per_s']:.3f} "
+            f"target_tok/s={payload['target_generated_tokens_per_s']:.3f} "
+            f"compute_tok/s={payload['actual_generated_tokens_per_s']:.3f}"
+        )
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if launched_distributed:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

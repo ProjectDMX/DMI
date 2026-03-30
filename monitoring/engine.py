@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import time
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 
 from .config import AdvanceConfig, MonitoringConfig
 from .task import CacheFuture, MonitoringTask
@@ -81,6 +83,7 @@ class MonitoringEngine:
             Tuple[str, int, List[str], List[Tuple[int, int]], Dict[str, Any]]
         ] = None
         self._model_id = model_id
+        self._prepared_model: Optional[Any] = None
         self._auto_batch_group_id = 0
         self._active_batch_request_ids: Optional[List[str]] = None
         self._active_batch_start_idx_per_request: Optional[List[int]] = None
@@ -352,11 +355,50 @@ class MonitoringEngine:
         import os
         if os.environ.get("RING_DEBUG_STEP"):
             print(f"[ring_step] prefill={is_prefill} token_ranges={token_ranges} finished={list(finished)}")
+        tp_rank, dp_rank, ep_rank, pp_rank = self._parallel_ranks()
         self._ring_transport.set_step_context(
             model_id=str(self._model_id),
             req_ids=list(req_ids),
             token_ranges=token_ranges,
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            ep_rank=ep_rank,
+            pp_rank=pp_rank,
         )
+
+    def _parallel_ranks(self) -> Tuple[int, int, int, int]:
+        """Best-effort rank discovery for HF tensor-parallel / distributed runs."""
+        tp_rank = 0
+        dp_rank = 0
+        ep_rank = 0
+        pp_rank = 0
+
+        model = self._prepared_model
+        device_mesh = getattr(model, "_device_mesh", None) if model is not None else None
+        if device_mesh is not None:
+            try:
+                tp_rank = int(device_mesh.get_local_rank())
+                return tp_rank, dp_rank, ep_rank, pp_rank
+            except Exception:
+                try:
+                    mesh_dim_names = getattr(device_mesh, "mesh_dim_names", None)
+                    if mesh_dim_names and "tp" in mesh_dim_names:
+                        tp_rank = int(device_mesh["tp"].get_local_rank())
+                        return tp_rank, dp_rank, ep_rank, pp_rank
+                except Exception:
+                    pass
+
+        if dist.is_available() and dist.is_initialized():
+            try:
+                tp_rank = int(dist.get_rank())
+            except Exception:
+                tp_rank = 0
+        else:
+            try:
+                tp_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+            except Exception:
+                tp_rank = 0
+        return tp_rank, dp_rank, ep_rank, pp_rank
 
     # ------------------------------------------------------------------
     # Public API
@@ -450,6 +492,7 @@ class MonitoringEngine:
         """Initialize monitoring hooks for a model and return init time (ms)."""
 
         start = time.perf_counter()
+        self._prepared_model = model
         try:
             if model is not None and hasattr(model, "prepare_monitoring"):
                 model.prepare_monitoring(

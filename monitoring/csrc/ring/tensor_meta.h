@@ -60,7 +60,6 @@ inline bool is_tp_sharded(int hook_type) {
         case HOOK_TYPE_Q: case HOOK_TYPE_K: case HOOK_TYPE_V: case HOOK_TYPE_Z:
         case HOOK_TYPE_ATTN_OUT: case HOOK_TYPE_RESULT:
         case HOOK_TYPE_MLP_IN: case HOOK_TYPE_MLP_OUT:
-        case HOOK_TYPE_FINAL_LOGITS:
             return true;
         default:
             return false;

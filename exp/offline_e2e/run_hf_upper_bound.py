@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import time
 
 import math
 
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM
 
@@ -35,9 +38,26 @@ from common import (
 )
 
 
+def _dist_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank())
+    return int(os.environ.get("RANK", "0"))
+
+
+def _dist_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_world_size())
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _is_main_process() -> bool:
+    return _dist_rank() == 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="HF upper-bound offline generate baseline.")
     add_shared_args(parser)
+    parser.add_argument("--tp-size", type=int, default=1)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -45,7 +65,9 @@ def main() -> None:
 
     model_id = resolve_model_id(args.model)
     compile_enabled = not args.disable_compile
-    device = torch.device("cuda")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
 
     examples = load_jsonl_examples(args.sample_file, limit=parsed_limit(args))
     tokenizer = build_tokenizer(model_id, local_files_only=args.local_files_only)
@@ -54,13 +76,19 @@ def main() -> None:
         enabled=not args.no_sort_by_length,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
+    load_kwargs = dict(
+        pretrained_model_name_or_path=model_id,
         attn_implementation="eager",
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         local_files_only=args.local_files_only,
     )
-    model.to(device).eval()
+    if int(args.tp_size) > 1:
+        load_kwargs["tp_plan"] = "auto"
+        load_kwargs["tp_size"] = int(args.tp_size)
+    model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
+    if int(args.tp_size) <= 1:
+        model.to(device)
+    model.eval()
 
     batch_metrics = []
     gen_kwargs = compile_generate_kwargs(compile_enabled)
@@ -97,12 +125,18 @@ def main() -> None:
                 pad_token_id=tokenizer.pad_token_id, **gen_kwargs,
             )
             device_sync(device)
-    print(f"Warmup done ({len(bucket_inputs)} buckets + 2 real batches).", flush=True)
+    if _is_main_process():
+        print(f"Warmup done ({len(bucket_inputs)} buckets + 2 real batches).", flush=True)
 
     total_batches = math.ceil(len(rendered) / args.batch_size)
     with torch.no_grad():
         t0 = time.perf_counter()
-        for batch_index, batch in tqdm(enumerate(iter_batches(rendered, args.batch_size)), total=total_batches, desc="hf_upper_bound"):
+        for batch_index, batch in tqdm(
+            enumerate(iter_batches(rendered, args.batch_size)),
+            total=total_batches,
+            desc="hf_upper_bound",
+            disable=not _is_main_process(),
+        ):
             texts = [item["prompt_text"] for item in batch]
             encoded = tokenize_batch(
                 tokenizer,
@@ -164,6 +198,11 @@ def main() -> None:
             "max_input_tokens": int(args.max_input_tokens),
             "decode_length_mode": "per_sample_target",
             "max_new_tokens_cap": int(args.max_new_tokens),
+            "requested_tp_size": int(args.tp_size),
+            "model_tp_size": int(getattr(model, "_tp_size", 1) or 1),
+            "dist_rank": _dist_rank(),
+            "dist_world_size": _dist_world_size(),
+            "local_rank": local_rank,
         },
     )
 
@@ -175,13 +214,23 @@ def main() -> None:
         batch_size=args.batch_size,
         repeat_index=args.repeat_index,
     )
-    write_json(out_path, payload)
-    print(f"Saved {out_path}")
-    print(
-        f"[hf_upper_bound] prompts/s={payload['prompts_per_s']:.3f} "
-        f"target_tok/s={payload['target_generated_tokens_per_s']:.3f} "
-        f"compute_tok/s={payload['actual_generated_tokens_per_s']:.3f}"
-    )
+    launched_distributed = _dist_world_size() > 1
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if _is_main_process():
+        write_json(out_path, payload)
+        print(f"Saved {out_path}")
+        print(
+            f"[hf_upper_bound] prompts/s={payload['prompts_per_s']:.3f} "
+            f"target_tok/s={payload['target_generated_tokens_per_s']:.3f} "
+            f"compute_tok/s={payload['actual_generated_tokens_per_s']:.3f}"
+        )
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if launched_distributed:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
