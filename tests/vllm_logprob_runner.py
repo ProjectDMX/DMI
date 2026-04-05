@@ -48,6 +48,14 @@ def main():
                    help="Use DMXGPUWorker (ring transport hooks)")
     p.add_argument("--verbose", action="store_true",
                    help="Print detailed info about stored logprob tensors")
+    p.add_argument("--random-prompts", action="store_true",
+                   help="Use random integers in prompt template")
+    p.add_argument("--math", action="store_true",
+                   help="Use math sequence prompts")
+    p.add_argument("--chat", action="store_true",
+                   help="Use realistic conversation prompts")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Random seed for --random-prompts")
     args, _ = p.parse_known_args()
 
     from vllm import LLM, SamplingParams
@@ -64,7 +72,25 @@ def main():
     db_host = os.environ.get("DMX_DB_HOST", "localhost")
     db_port = int(os.environ.get("DMX_DB_PORT", "9000"))
 
-    prompts = [f"The answer to question {i+1} is" for i in range(num_prompts)]
+    # Pick numbers
+    if args.random_prompts:
+        import random
+        seed = args.seed if args.seed is not None else int(os.environ.get("E2E_SEED", "42"))
+        rng = random.Random(seed)
+        numbers = [rng.randint(1, 100000) for _ in range(num_prompts)]
+    else:
+        numbers = list(range(1, num_prompts + 1))
+
+    # Number -> prompt
+    if args.chat:
+        prompts = [f"The {n}th most spoken language in the world is" for n in numbers]
+    elif args.math:
+        prompts = [f"Start from {n}, generate a sequence of numbers with gap 1:" for n in numbers]
+    else:
+        prompts = [f"The answer to question {n} is" for n in numbers]
+    if os.environ.get("E2E_PRINT_PROMPTS", "0") == "1":
+        for i, p in enumerate(prompts):
+            print(f"[vllm_logprob_runner] prompt[{i}]: {p!r}", flush=True)
 
     kwargs = dict(
         model=model_id,
