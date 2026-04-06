@@ -34,8 +34,8 @@ struct RingConfig {
     // Clone per-request slices
     bool     clone_slices               = false;
     // ClickHouse insert queue limits
-    uint64_t insert_queue_max_bytes     = 512ULL * 1024 * 1024;
-    uint64_t insert_queue_max_items     = 4096;
+    uint64_t insert_queue_max_bytes     = 4096ULL * 1024 * 1024;
+    uint64_t insert_queue_max_items     = 65536;
 };
 
 // Called by the p2p thread for each per-request tensor slice.
@@ -127,6 +127,7 @@ public:
     // Capacity queries (for startup warning only -- not called per-step).
     uint64_t payload_cap() const;
     uint64_t staging_cap() const;
+    uint64_t task_cap() const;
 
 private:
     struct Impl;

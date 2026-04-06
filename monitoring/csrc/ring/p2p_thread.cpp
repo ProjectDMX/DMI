@@ -14,13 +14,14 @@ namespace ring {
 // ATen helpers (no GIL required for CPU tensors)
 // ---------------------------------------------------------------------------
 
-// Build ClickHouse act_name from hook_type + layer_no.
-// layer_no >= 0: "layers.<hook_type_name>"  (layer_no passed separately)
-// layer_no < 0:  "<hook_type_name>"         (global hook like embed, final_ln)
+// Build ClickHouse act_name from hook_type.
+// Per-layer: "blocks.<hook_type_name>"  (e.g. "blocks.attn.hook_pattern")
+// Global:    "<hook_type_name>"         (e.g. "hook_embed", "token_ids")
+// layer_no is stored in a separate DB column, not embedded in act_name.
 static std::string make_act_name(int hook_type, int layer_no) {
     const char* name = ring_py::hook_type_name(hook_type);
     if (layer_no >= 0) {
-        return std::string("layers.") + name;
+        return std::string("blocks.") + name;
     }
     return std::string(name);
 }
@@ -42,7 +43,8 @@ static at::Tensor slice_for_request(
     int64_t batch_idx,
     int32_t start_token,
     int32_t end_token,
-    bool    is_attn)
+    bool    is_attn,
+    int32_t kv_offset = 0)
 {
     if (start_token >= end_token) return at::Tensor{};
     int32_t eff = end_token - start_token;
@@ -61,9 +63,11 @@ static at::Tensor slice_for_request(
     if (is_attn && s.dim() >= 2) {
         int key_dim = s.dim() - 1;
         int64_t want_k = static_cast<int64_t>(end_token);
-        if (want_k >= 0 && s.size(key_dim) > want_k) {
-            int64_t skip = s.size(key_dim) - want_k;
-            s = s.narrow(key_dim, skip, want_k);
+        if (want_k >= 0 && want_k <= s.size(key_dim)) {
+            // kv_offset: where real keys start in the kv dimension.
+            // Dynamic cache (left-padded): kv_offset = pad_len, real keys at end.
+            // Static cache: kv_offset = 0, real keys at start.
+            s = s.narrow(key_dim, kv_offset, want_k);
         }
     }
 
@@ -152,7 +156,9 @@ void P2PThread::process(std::vector<DrainTask>& tasks) {
 // ---------------------------------------------------------------------------
 void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_task) {
     ring_py::TensorMeta meta;
-    if (!fifo_.pop(meta)) return;
+    if (!fifo_.pop(meta)) {
+        return;
+    }
 
     // Get step context -- pop from context queue if this is the first
     // hook in a new step (current_ctx_ is null).
@@ -199,19 +205,47 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
         const ring_py::RequestMeta& req = requests[j];
         at::Tensor slice;
 
+        int32_t db_start = req.start_token;
+        int32_t db_end   = req.end_token;
+
         if (current_ctx_->flattened) {
-            // vLLM: packed [total_tokens, ...], right-padded
+            // vLLM: packed [total_tokens, ...], right-padded.
             if (is_attn) continue;
-            slice = slice_flattened(tensor, req.dim0_offset,
-                                    req.start_token, req.end_token);
+            if (meta.hook_type == ring_py::HOOK_TYPE_FINAL_LOGITS) {
+                // Contract: vLLM compute_logits returns exactly one logit
+                // per request, flattened to [num_reqs, vocab].  The meta
+                // shape matches this (logits_to_keep=num_reqs passed from
+                // execute_model).  We index by request position j (not
+                // the token-based dim0_offset) and extract one row.
+                slice = slice_flattened(tensor, /*dim0_offset=*/j,
+                                        /*start=*/0, /*end=*/1);
+            } else {
+                slice = slice_flattened(tensor, req.dim0_offset,
+                                        req.start_token, req.end_token);
+            }
         } else {
             // HF: [batch, q_len, ...], left-padded tokens
             if (req.dim0_offset >= tensor.size(0)) break;
             slice = slice_for_request(
                 tensor, req.dim0_offset,
-                req.start_token, req.end_token, is_attn);
+                req.start_token, req.end_token, is_attn,
+                req.kv_offset);
         }
-        if (!slice.defined()) continue;
+
+        // final_logits: the tensor's dim0 is logits_to_keep (often 1),
+        // not the full q_len.  The slice has the actual number of logit
+        // positions.  Adjust DB token range so (start, end) covers just
+        // the last N token positions the logits correspond to, rather
+        // than the full scheduled range.  Applies to both HF (where
+        // generate sets logits_to_keep=1) and vLLM (always 1 per req).
+        if (meta.hook_type == ring_py::HOOK_TYPE_FINAL_LOGITS && slice.defined()) {
+            int64_t logits_count = slice.size(0);
+            db_start = req.end_token - static_cast<int32_t>(logits_count);
+            db_end   = req.end_token;
+        }
+        if (!slice.defined()) {
+            continue;
+        }
 
         slice = slice.contiguous();
         if (should_clone) {
@@ -221,7 +255,7 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
         try {
             submit_fn_(current_ctx_->model_id, shard_rank,
                        req.req_id, act_name, meta.layer_no,
-                       req.start_token, req.end_token,
+                       db_start, db_end,
                        std::move(slice));
         } catch (...) {
         }

@@ -234,6 +234,54 @@ def _run_one(model, input_ids, attention_mask,
              use_monitoring: bool) -> RunResult:
     """Run one generate() and return timing breakdown.
 
+    When cuda_graphs is enabled, uses generate_greedy() for both baseline
+    and monitored modes — same lean loop, only difference is monitoring=True/False.
+    This eliminates HF generate()'s per-step Python overhead from the comparison.
+
+    When cuda_graphs is disabled, falls back to HF generate() / generate_with_monitoring()
+    for the full HF experience.
+    """
+    if cfg.cuda_graphs:
+        return _run_one_greedy(model, input_ids, attention_mask,
+                               cfg, eos_id, pad_id, use_monitoring)
+    return _run_one_hf_generate(model, input_ids, attention_mask,
+                                cfg, eos_id, pad_id, use_monitoring)
+
+
+def _run_one_greedy(model, input_ids, attention_mask,
+                    cfg: BenchConfig, eos_id: int, pad_id: int,
+                    use_monitoring: bool) -> RunResult:
+    """Run one iteration using generate_greedy (lean manual loop)."""
+    from monitoring.generate import generate_greedy, GreedyGenerateTimings
+
+    timings = GreedyGenerateTimings()
+    with torch.no_grad():
+        generate_greedy(
+            model, input_ids, attention_mask,
+            max_new_tokens=cfg.decode_len,
+            min_new_tokens=cfg.decode_len,
+            eos_token_id=eos_id,
+            pad_token_id=pad_id,
+            logits_to_keep=cfg.logits_to_keep,
+            cuda_graphs=True,
+            monitoring=use_monitoring,
+            hook_selection=cfg.hook_selection if use_monitoring else None,
+            timings=timings,
+        )
+
+    return RunResult(
+        total_ms=timings.total_ms,
+        prefill_ms=timings.prefill_ms,
+        decode_ms=timings.decode_ms,
+        decode_steps=timings.decode_steps,
+    )
+
+
+def _run_one_hf_generate(model, input_ids, attention_mask,
+                         cfg: BenchConfig, eos_id: int, pad_id: int,
+                         use_monitoring: bool) -> RunResult:
+    """Run one iteration using HF generate() (original path).
+
     Per-step timing relies on Python-side ``time.perf_counter()`` recorded at
     the start of each generate step (inside ``prepare_inputs_for_generation``).
     This is accurate because HF's generate loop unconditionally executes::
@@ -249,17 +297,8 @@ def _run_one(model, input_ids, attention_mask,
 
     extra = {}
     extra["logits_to_keep"] = cfg.logits_to_keep
-    if cfg.cuda_graphs:
-        extra["cache_implementation"] = "static"
-        try:
-            from transformers import CompileConfig
-            extra["compile_config"] = CompileConfig(
-                mode="reduce-overhead", fullgraph=False)
-        except ImportError:
-            pass
 
     # Wrap prepare_inputs_for_generation to record per-step timestamps.
-    # This is the first line of each step in HF's generate() loop.
     step_timestamps: List[float] = []
     orig_prepare = model.prepare_inputs_for_generation
 
@@ -299,7 +338,6 @@ def _run_one(model, input_ids, attention_mask,
         model.prepare_inputs_for_generation = orig_prepare
 
     total_ms = (t_end - t0) * 1000.0
-    # timestamps: [prefill_start, decode_step_1, decode_step_2, ...]
     if len(step_timestamps) >= 2:
         prefill_ms = (step_timestamps[1] - step_timestamps[0]) * 1000.0
         decode_ms = (t_end - step_timestamps[1]) * 1000.0
@@ -473,6 +511,8 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         mean_steps   = statistics.mean([r.decode_steps for r in all_runs])
         mean_tpot    = mean_decode / mean_steps if mean_steps > 0 else 0.0
         decode_throughput = (cfg.batch_size * mean_steps / mean_decode * 1000) if mean_decode > 0 else 0.0
+        prefill_throughput = (cfg.batch_size * cfg.prefill_len / mean_prefill * 1000) if mean_prefill > 0 else 0.0
+        e2e_throughput = (cfg.batch_size * (cfg.prefill_len + mean_steps) / mean_t * 1000) if mean_t > 0 else 0.0
         print(f"\n  Summary:  total={mean_t:.1f} ms  std={std_t:.1f} ms  "
               f"prefill={mean_prefill:.1f} ms  "
               f"decode={mean_decode:.1f} ms  "
@@ -486,7 +526,9 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
             "mode": mode, "mean_ms": mean_t, "std_ms": std_t,
             "min_ms": min(r.total_ms for r in all_runs),
             "max_ms": max(r.total_ms for r in all_runs),
+            "prefill_throughput": prefill_throughput,
             "decode_throughput": decode_throughput,
+            "e2e_throughput": e2e_throughput,
             "prefill_ms": mean_prefill, "decode_ms": mean_decode,
             "tpot_ms": mean_tpot,
             "close_ring_ms": 0.0, "close_db_ms": 0.0,
@@ -574,6 +616,8 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         mean_steps   = statistics.mean([r.decode_steps for r in all_runs])
         mean_tpot    = mean_decode / mean_steps if mean_steps > 0 else 0.0
         decode_throughput = (cfg.batch_size * mean_steps / mean_decode * 1000) if mean_decode > 0 else 0.0
+        prefill_throughput = (cfg.batch_size * cfg.prefill_len / mean_prefill * 1000) if mean_prefill > 0 else 0.0
+        e2e_throughput = (cfg.batch_size * (cfg.prefill_len + mean_steps) / mean_t * 1000) if mean_t > 0 else 0.0
         print(f"\n  Summary:  total={mean_t:.1f} ms  std={std_t:.1f} ms  "
               f"prefill={mean_prefill:.1f} ms  "
               f"decode={mean_decode:.1f} ms  "
@@ -610,7 +654,9 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
             "std_ms":             std_t,
             "min_ms":             min(r.total_ms for r in all_runs),
             "max_ms":             max(r.total_ms for r in all_runs),
+            "prefill_throughput": prefill_throughput,
             "decode_throughput":  decode_throughput,
+            "e2e_throughput":     e2e_throughput,
             "prefill_ms":         mean_prefill,
             "decode_ms":          mean_decode,
             "tpot_ms":            mean_tpot,
@@ -649,7 +695,7 @@ def _parse_args() -> BenchConfig:
                    help="0=keep all logits, 1=last position only (HF default)")
     g.add_argument("--hook-selection",  default="full",
                    help="Comma-separated hook selection (default: full). "
-                        "Presets: full, no-attention-scores, hf-only. "
+                        "Presets: full, vllm-full, hf-only. "
                         "Individual: resid_pre, q, k, v, z, final_logits, etc. "
                         "Aliases: hidden-states=resid_pre, logits=final_logits")
     g.add_argument("--hf-offload-hidden-states", action="store_true",
@@ -843,12 +889,13 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # Summary table
     # -----------------------------------------------------------------------
-    W = 110
+    W = 140
     print(f"\n{'='*W}")
     print(f"{'SUMMARY  --  ' + workload + ('  (CUDA graphs)' if cfg.cuda_graphs else '  (eager)'):^{W}}")
     print(f"{'='*W}")
     print(f"{'mode':<12}  {'total':>8}  {'prefill':>9}  {'decode':>9}  "
-          f"{'TPOT':>8}  {'dec tok/s':>9}  {'ring drain':>10}  {'db drain':>8}")
+          f"{'TPOT':>8}  {'pfill tok/s':>11}  {'dec tok/s':>9}  {'e2e tok/s':>9}  "
+          f"{'ring drain':>10}  {'db drain':>8}")
     print("-" * W)
     for r in results:
         print(f"{r['mode']:<12}  "
@@ -856,7 +903,9 @@ def main() -> None:
               f"{r['prefill_ms']:>8.1f}ms  "
               f"{r['decode_ms']:>8.1f}ms  "
               f"{r['tpot_ms']:>7.2f}ms  "
+              f"{r.get('prefill_throughput', 0.0):>11.1f}  "
               f"{r['decode_throughput']:>9.1f}  "
+              f"{r.get('e2e_throughput', 0.0):>9.1f}  "
               f"{r['close_ring_ms']:>9.1f}ms  "
               f"{r['close_db_ms']:>7.1f}ms")
 

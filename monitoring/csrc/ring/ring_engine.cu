@@ -53,6 +53,12 @@ void RingEngine::start() {
 }
 
 void RingEngine::stop() {
+    // Guard against double-stop (benchmark _timed_close + engine.close).
+    if (!drain_->is_running()) return;
+
+    cudaDeviceSynchronize();
+    drain_->force_flush_and_wait();
+
     drain_->stop();
     drain_->signal_p2p_stop();
     p2p_->stop();

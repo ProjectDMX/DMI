@@ -67,8 +67,8 @@ struct RingConfig {
 
     // ClickHouse insert queue limits (host engine).
     // P2p thread blocks on submit_direct() when queue is full.
-    uint64_t insert_queue_max_bytes = 512ULL * 1024 * 1024;  // 512 MiB
-    uint64_t insert_queue_max_items = 4096;
+    uint64_t insert_queue_max_bytes = 4096ULL * 1024 * 1024;  // 4 GiB
+    uint64_t insert_queue_max_items = 65536;
 
     // Effective staging capacity (resolved at init time).
     // If pinned_staging_bytes == 0, defaults to payload_ring_bytes.

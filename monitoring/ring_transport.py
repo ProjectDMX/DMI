@@ -25,7 +25,27 @@ from torch import nn
 
 
 # ---------------------------------------------------------------------------
-# Hook-type constants (values match _HOOK_SUFFIX_TO_TYPE)
+# Hook-type constants (values match C++ HookType enum in tensor_meta.h)
+#
+# Removed hook types (gaps in numbering are intentional):
+#   10 (result):     removed because attn_out captures the same tensor.
+#                    o_proj/c_proj output IS the attention block return value
+#                    in all known architectures.  Use ATTN_OUT instead.
+#   resid_post:      removed (was per-layer).  Replaced by RESID_FINAL (global).
+#                    resid_post[i] == resid_pre[i+1] for all i < N-1, so
+#                    per-layer capture was N-1 redundant D2D copies.
+#                    RESID_FINAL captures the only unique value: last layer's
+#                    residual stream before final norm.
+#
+# Duplicate hook types kept intentionally:
+#   LN2 vs MLP_IN:  identical for dense models (norm output goes directly to
+#                    MLP).  Differs for MoE models where a router sits between
+#                    norm and expert MLP (MLP_IN is post-router, EP-sharded).
+#
+# TODO: per-model deduplication.  Some hook pairs (e.g. ln2/mlp_in in dense
+# models) produce identical tensors.  A model-specific selection system could
+# alias them so the same preset skips duplicates on dense models but captures
+# both on MoE.  For now, both are always captured when selected.
 # ---------------------------------------------------------------------------
 
 HOOK_TYPE_RESID_PRE   = 0
@@ -38,15 +58,12 @@ HOOK_TYPE_Q           = 6
 HOOK_TYPE_K           = 7
 HOOK_TYPE_V           = 8
 HOOK_TYPE_Z           = 9
-HOOK_TYPE_RESULT      = 10
+# 10 removed (result == attn_out)
 HOOK_TYPE_LN2         = 11
-HOOK_TYPE_MLP_IN      = 12
+HOOK_TYPE_MLP_IN      = 12  # == LN2 for dense models; differs for MoE (post-router)
 HOOK_TYPE_MLP_OUT     = 13
-HOOK_TYPE_RESID_POST  = 14
-# Global residual stream right before final layer norm.
-# Reuse the same ring hook-type id as resid_post since the tensor shape and
-# slicing semantics are identical; it only differs by layer_no = -1.
-HOOK_TYPE_RESID_FINAL = HOOK_TYPE_RESID_POST
+HOOK_TYPE_MLP_POST    = 20  # after activation, before down_proj (TransformerLens hook_post)
+HOOK_TYPE_RESID_FINAL = 14  # global: last layer's residual stream before final norm
 HOOK_TYPE_EMBED       = 15
 HOOK_TYPE_POS_EMBED   = 16
 HOOK_TYPE_FINAL_LN    = 17
@@ -54,7 +71,7 @@ HOOK_TYPE_TOKEN_IDS   = 18
 HOOK_TYPE_FINAL_LOGITS = 19
 
 _HIDDEN_DIM_TYPES = frozenset({
-    HOOK_TYPE_RESID_PRE, HOOK_TYPE_RESID_MID, HOOK_TYPE_RESID_POST,
+    HOOK_TYPE_RESID_PRE, HOOK_TYPE_RESID_MID, HOOK_TYPE_RESID_FINAL,
     HOOK_TYPE_ATTN_OUT,  HOOK_TYPE_MLP_IN,    HOOK_TYPE_MLP_OUT,
     HOOK_TYPE_LN1,       HOOK_TYPE_LN2,
     HOOK_TYPE_EMBED,     HOOK_TYPE_POS_EMBED,  HOOK_TYPE_FINAL_LN,
@@ -69,26 +86,30 @@ _HIDDEN_DIM_TYPES = frozenset({
 #
 # Examples:
 #   "full"                            -- all hooks
-#   "no-attention-scores"             -- full minus attn_scores/pattern
+#   "vllm-full"                         -- full minus attn_scores/pattern/resid_final
 #   "hidden-states,token_ids"         -- resid_pre + token_ids
 #   "hidden-states,final_ln,logits"   -- resid_pre + final_ln + final_logits
-#   "resid_pre,resid_post,embed"      -- just those three
+#   "resid_pre,resid_final,embed"     -- just those three
 # ---------------------------------------------------------------------------
 
 _ALL_HOOK_TYPES = frozenset({
     HOOK_TYPE_RESID_PRE, HOOK_TYPE_LN1, HOOK_TYPE_ATTN_OUT,
     HOOK_TYPE_RESID_MID, HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN,
     HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
-    HOOK_TYPE_RESULT, HOOK_TYPE_LN2, HOOK_TYPE_MLP_IN, HOOK_TYPE_MLP_OUT,
-    HOOK_TYPE_RESID_POST, HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED,
+    HOOK_TYPE_LN2, HOOK_TYPE_MLP_IN, HOOK_TYPE_MLP_POST, HOOK_TYPE_MLP_OUT,
+    HOOK_TYPE_RESID_FINAL, HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED,
     HOOK_TYPE_FINAL_LN, HOOK_TYPE_TOKEN_IDS, HOOK_TYPE_FINAL_LOGITS,
 })
 
 # -- Presets --
 _HOOK_SELECTIONS: Dict[str, frozenset] = {
     "full": _ALL_HOOK_TYPES,
-    # full minus attn_scores/pattern (FlashAttention never materializes them)
-    "no-attention-scores": _ALL_HOOK_TYPES - {HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN},
+    # vLLM: full minus attn_scores/pattern (FlashAttention never materializes
+    # them) and resid_final (last layer's pre-norm residual is not materialized
+    # in vLLM's fused RMSNorm -- final_ln captures the post-norm value instead).
+    "vllm-full": _ALL_HOOK_TYPES - {
+        HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN, HOOK_TYPE_RESID_FINAL,
+    },
     # What HF returns with output_hidden_states + output_attentions + logits
     "hf-only": frozenset({
         HOOK_TYPE_RESID_PRE, HOOK_TYPE_FINAL_LN,
@@ -109,12 +130,11 @@ _HOOK_TYPE_BY_NAME: Dict[str, int] = {
     "k":           HOOK_TYPE_K,
     "v":           HOOK_TYPE_V,
     "z":           HOOK_TYPE_Z,
-    "result":      HOOK_TYPE_RESULT,
     "ln2":         HOOK_TYPE_LN2,
     "mlp_in":      HOOK_TYPE_MLP_IN,
     "mlp_out":     HOOK_TYPE_MLP_OUT,
-    "resid_post":  HOOK_TYPE_RESID_POST,
-    "resid_final": HOOK_TYPE_RESID_FINAL,
+    "mlp_post":    HOOK_TYPE_MLP_POST,
+    "resid_final":  HOOK_TYPE_RESID_FINAL,
     "embed":       HOOK_TYPE_EMBED,
     "pos_embed":   HOOK_TYPE_POS_EMBED,
     "final_ln":    HOOK_TYPE_FINAL_LN,
@@ -153,20 +173,40 @@ def resolve_hook_selection(mode: str) -> frozenset:
     return frozenset(result)
 
 
-def apply_hook_selection(specs: List["HookSpec"], mode: str) -> List["HookSpec"]:
+def apply_hook_selection(
+    specs: List["HookSpec"],
+    mode: str,
+    cfg: Optional["ModelShapeConfig"] = None,
+) -> List["HookSpec"]:
     """Filter specs and set HookPoint.enabled based on a selection string.
 
     Selection is a comma-separated string of preset names and/or individual
     hook type names.  The enabled set is the union of all tokens.
+
+    If cfg is provided, hooks requiring unavailable model config fields
+    (e.g. mlp_post when intermediate_dim is unknown) are skipped.
 
     Sets enabled=True on hooks in the set, enabled=False on others.
     Returns the filtered list of enabled specs (for _active_specs / metadata).
     """
     allowed = resolve_hook_selection(mode)
 
+    # Hooks that require specific model config fields
+    _SKIP = set()
+    if cfg is not None:
+        if cfg.intermediate_dim == 0:
+            _SKIP.add(HOOK_TYPE_MLP_POST)
+
     enabled_specs = []
     for spec in specs:
-        if spec.hook_type in allowed:
+        if spec.hook_type in _SKIP:
+            spec.module.enabled = False
+            import warnings
+            warnings.warn(
+                f"[apply_hook_selection] Skipping hook_type={spec.hook_type} "
+                f"layer={spec.layer_no}: required model config unavailable "
+                f"(e.g. intermediate_dim=0)")
+        elif spec.hook_type in allowed:
             spec.module.enabled = True
             enabled_specs.append(spec)
         else:
@@ -189,11 +229,10 @@ _HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {
     "hook_k":           HOOK_TYPE_K,
     "hook_v":           HOOK_TYPE_V,
     "hook_z":           HOOK_TYPE_Z,
-    "hook_result":      HOOK_TYPE_RESULT,
     "hook_ln2":         HOOK_TYPE_LN2,
     "hook_mlp_in":      HOOK_TYPE_MLP_IN,
     "hook_mlp_out":     HOOK_TYPE_MLP_OUT,
-    "hook_resid_post":  HOOK_TYPE_RESID_POST,
+    "hook_mlp_post":    HOOK_TYPE_MLP_POST,
     "hook_resid_final": HOOK_TYPE_RESID_FINAL,
     "hook_embed":       HOOK_TYPE_EMBED,
     "hook_pos_embed":   HOOK_TYPE_POS_EMBED,
@@ -243,6 +282,7 @@ class ModelShapeConfig:
     head_dim:     int
     dtype:        torch.dtype
     vocab_size:   int = 0  # required for final_logits shape
+    intermediate_dim: int = 0  # MLP intermediate size (for mlp_post shape)
 
 
 # ---------------------------------------------------------------------------
@@ -361,31 +401,51 @@ def _compute_hook_shape(
     guaranteed by the model architecture.
 
     Args:
+        batch: batch size.  0 = flattened (vLLM): no batch dimension,
+            q_len = total_tokens across all requests.
         logits_to_keep: HF generate() default is 1 (only last token logits).
             0 means keep all (q_len).
     """
+    # batch=0 means flattened (vLLM): shapes have no batch dimension.
+    b = [batch] if batch > 0 else []
+
     if hook_type in _HIDDEN_DIM_TYPES:
-        return [batch, q_len, cfg.hidden_dim]
+        return b + [q_len, cfg.hidden_dim]
     if hook_type == HOOK_TYPE_Q:
-        return [batch, q_len, cfg.num_heads, cfg.head_dim]
+        return b + [q_len, cfg.num_heads, cfg.head_dim]
     if hook_type in (HOOK_TYPE_K, HOOK_TYPE_V):
-        return [batch, q_len, cfg.num_kv_heads, cfg.head_dim]
+        return b + [q_len, cfg.num_kv_heads, cfg.head_dim]
     if hook_type == HOOK_TYPE_Z:
-        return [batch, q_len, cfg.num_heads, cfg.head_dim]
-    if hook_type == HOOK_TYPE_RESULT:
-        # hook_result is after o_proj -> shape is [B, q_len, hidden_dim],
-        # not [B, q_len, num_heads, head_dim] (differs on GQA models).
-        return [batch, q_len, cfg.hidden_dim]
+        # vLLM Attention.forward returns [N, hidden_size] (heads flattened).
+        # HF returns [batch, q_len, num_heads, head_dim].
+        if batch == 0:
+            return [q_len, cfg.num_heads * cfg.head_dim]
+        return b + [q_len, cfg.num_heads, cfg.head_dim]
     if hook_type in (HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN):
-        return [batch, cfg.num_heads, q_len, kv_dim]
+        return b + [cfg.num_heads, q_len, kv_dim]
+    if hook_type == HOOK_TYPE_MLP_POST:
+        if cfg.intermediate_dim == 0:
+            return []  # intermediate_dim unknown — skip this hook
+        return b + [q_len, cfg.intermediate_dim]
     if hook_type == HOOK_TYPE_TOKEN_IDS:
-        return [batch, q_len]
+        return b + [q_len]
     if hook_type == HOOK_TYPE_FINAL_LOGITS:
-        # HF generate() sets logits_to_keep=1 by default (only last token
-        # needed for next-token prediction).  The actual tensor shape is
-        # [batch, 1, vocab], not [batch, q_len, vocab].
-        logits_q = min(q_len, logits_to_keep) if logits_to_keep > 0 else q_len
-        return [batch, logits_q, cfg.vocab_size] if cfg.vocab_size > 0 else []
+        # compute_logits returns fewer rows than q_len when logits_to_keep
+        # is set (HF generate default=1, vLLM always 1 per request).
+        #
+        # HF batched: tensor is [batch, logits_to_keep, vocab].
+        #   logits_to_keep = min(q_len, logits_to_keep) capped to q_len.
+        #
+        # vLLM flattened: tensor is [num_reqs, vocab] (1 logit per
+        #   request).  Caller passes logits_to_keep=num_reqs so the
+        #   meta shape becomes [num_reqs, vocab].  The p2p thread
+        #   indexes by request position (not token offset) and adjusts
+        #   DB token range to (end_token-1, end_token).
+        if batch > 0:
+            logits_q = min(q_len, logits_to_keep) if logits_to_keep > 0 else q_len
+        else:
+            logits_q = logits_to_keep if logits_to_keep > 0 else q_len
+        return (b + [logits_q, cfg.vocab_size]) if cfg.vocab_size > 0 else []
     return []  # unknown type -- push_meta skipped
 
 
@@ -420,7 +480,15 @@ def install_ring_hooks(specs: List[HookSpec], handles_out: List) -> None:
     can remove them later via handle.remove().
     """
     for spec in specs:
-        handle = spec.module.register_forward_hook(
+        hp = spec.module
+        # Ensure HookPoint._name is set so forward() doesn't early-return.
+        # Also set _ring_hook_type/_ring_hook_id for the producer op.
+        if hasattr(hp, '_name') and hp._name is None:
+            # Use hook_type_name for a descriptive name
+            hp._name = f"hook_{spec.hook_type}_{spec.layer_no}"
+            hp._ring_hook_type = spec.hook_type
+            hp._ring_hook_id = spec.layer_no
+        handle = hp.register_forward_hook(
             _make_ring_hook(spec.hook_type, spec.layer_no)
         )
         handles_out.append(handle)
@@ -453,6 +521,7 @@ class RingTransport:
         self._current_req_ids: Optional[List[str]] = None
         self._current_token_ranges: Optional[List[Tuple[int, int]]] = None
         self._current_dim0_offsets: Optional[List[int]] = None
+        self._current_kv_offsets: Optional[List[int]] = None
 
         # When True: push_meta / capture_tensor meta pushes are skipped so the
         # FIFO stays empty.  ring_producer_op still calls _ring_engine.hook()
@@ -493,6 +562,7 @@ class RingTransport:
         req_ids: List[str],
         token_ranges: List[Tuple[int, int]],
         dim0_offsets: Optional[List[int]] = None,
+        kv_offsets: Optional[List[int]] = None,
         tp_rank: int = 0,
         dp_rank: int = 0,
         ep_rank: int = 0,
@@ -504,6 +574,10 @@ class RingTransport:
         dim0_offsets: per-request offset in tensor dim 0.
             HF: batch index (0, 1, 2, ...).  None = auto-generate range(len(req_ids)).
             vLLM: token offset in packed tensor (cumulative sum of scheduled tokens).
+        kv_offsets: per-request kv-dimension start for attention hooks.
+            HF dynamic cache: pad_len (real keys at the end, left-padded).
+            HF static cache / vLLM: 0 (real keys at the start).
+            None = auto-generate zeros.
         flattened: False = HF batched [batch, q_len, ...], True = vLLM packed [total_tokens, ...].
         """
         self._current_model_id = model_id
@@ -518,13 +592,18 @@ class RingTransport:
             dim0_offsets if dim0_offsets is not None
             else list(range(len(req_ids)))
         )
+        self._current_kv_offsets = (
+            kv_offsets if kv_offsets is not None
+            else [0] * len(req_ids)
+        )
 
     def set_model_cfg(self, cfg: ModelShapeConfig) -> None:
         """Set the model shape config for analytical shape computation."""
         self._model_cfg = cfg
 
     def pre_push_all_metas(self, batch: int, q_len: int, kv_dim: int,
-                           logits_to_keep: int = 0) -> None:
+                           logits_to_keep: int = 0,
+                           token_ids_dtype: Optional[torch.dtype] = None) -> None:
         """Push C++ FIFO metadata for all active specs before orig_forward.
 
         Called in the same order as install_ring_hooks() so FIFO pop order
@@ -553,7 +632,12 @@ class RingTransport:
             )
             if not shape:
                 continue
-            dtype = spec.dtype if spec.dtype is not None else self._model_cfg.dtype
+            if spec.dtype is not None:
+                dtype = spec.dtype
+            elif spec.hook_type == HOOK_TYPE_TOKEN_IDS and token_ids_dtype is not None:
+                dtype = token_ids_dtype
+            else:
+                dtype = self._model_cfg.dtype
             hook_types.append(spec.hook_type)
             layer_nos.append(spec.layer_no)
             shapes.append(shape)
@@ -571,6 +655,7 @@ class RingTransport:
                 list(self._current_req_ids),
                 list(self._current_token_ranges),
                 list(self._current_dim0_offsets),
+                list(self._current_kv_offsets) if self._current_kv_offsets else [],
             )
 
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
@@ -605,6 +690,16 @@ def deactivate() -> None:
     try:
         from . import _native_engine as _ne
         _ne.ring_clear_active_engine()
+        _ne.ring_set_cpu_direct(False)
+    except Exception:
+        pass
+
+
+def set_cpu_direct(enabled: bool) -> None:
+    """Set/clear the C++ cpu_direct flag for ring_producer_impl."""
+    try:
+        from . import _native_engine as _ne
+        _ne.ring_set_cpu_direct(enabled)
     except Exception:
         pass
 

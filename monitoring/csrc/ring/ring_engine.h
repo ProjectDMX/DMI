@@ -30,6 +30,7 @@ public:
 
     uint64_t  payload_cap() const { return cfg_.payload_ring_bytes; }
     uint64_t  staging_cap() const { return staging_.capacity(); }
+    uint64_t  task_cap()    const { return cfg_.task_ring_entries; }
 
 private:
     RingConfig      cfg_;

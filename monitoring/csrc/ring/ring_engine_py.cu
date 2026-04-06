@@ -143,35 +143,37 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     const uint64_t pcap = impl_->engine.payload_cap();
     const uint64_t scap = impl_->engine.staging_cap();
     const uint64_t effective_cap = std::min(pcap, scap);
+    const uint64_t tcap = impl_->engine.task_cap();
 
     auto& drain = impl_->engine.drain_thread();
 
-    if (step_total_bytes <= effective_cap) {
-        // Case A: step fits in both ring AND staging.
-        const uint64_t available = pcap -
-            (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
-        if (step_total_bytes <= available) {
-            // Pre-allocate: advance CPU-side head counters so the next
-            // prepare_step sees correct available space.
-            drain.reserve(step_total_bytes, num_hooks);
-            return STEP_RING_OK;  // fast path -- no CUDA or thread interaction
-        }
-        // Ring currently full from prior steps.  Sync main stream so all
-        // producer kernels finish writing, then flush to free ring space.
+    // Case B: single step exceeds capacity (payload OR task entries).
+    // Must fall back to cpu_direct.
+    if (step_total_bytes > effective_cap || num_hooks > tcap) {
         cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
         cudaStreamSynchronize(ms);
         drain.force_flush_and_wait();
-        drain.reserve(step_total_bytes, num_hooks);
-        return STEP_RING_FLUSHED;
+        return STEP_CPU_DIRECT;
     }
 
-    // Case B: step exceeds effective capacity.  Sync + flush, then caller
-    // must set cpu_direct=True so all hooks use the eager .cpu() path.
-    // No reserve -- cpu_direct hooks don't use the ring.
+    // Case A: step fits.  Check available space for BOTH payload AND tasks.
+    const uint64_t payload_avail = pcap -
+        (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
+    const uint64_t task_avail = tcap -
+        (drain.cpu_task_head() - drain.cpu_task_tail_committed());
+
+    if (step_total_bytes <= payload_avail && num_hooks <= task_avail) {
+        drain.reserve(step_total_bytes, num_hooks);
+        return STEP_RING_OK;  // fast path -- no CUDA or thread interaction
+    }
+
+    // Either payload or task ring full from prior steps.  Sync main
+    // stream so all producer kernels finish writing, then flush.
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
     cudaStreamSynchronize(ms);
     drain.force_flush_and_wait();
-    return STEP_CPU_DIRECT;
+    drain.reserve(step_total_bytes, num_hooks);
+    return STEP_RING_FLUSHED;
 }
 
 void RingEnginePy::submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes) {
@@ -187,6 +189,10 @@ uint64_t RingEnginePy::payload_cap() const {
 
 uint64_t RingEnginePy::staging_cap() const {
     return impl_->engine.staging_cap();
+}
+
+uint64_t RingEnginePy::task_cap() const {
+    return impl_->engine.task_cap();
 }
 
 }  // namespace ring_py

@@ -32,19 +32,51 @@ void ring_set_active_engine(ring_py::RingEnginePy* e) {
     g_active_engine = e;
 }
 
-// Side-effect op: launches producer kernel to copy tensor bytes into ring
-// buffer.  Void return + _register_effectful_op prevents DCE at FX level.
+// CPU-direct flag.  When true, ring_producer_impl copies tensor to CPU
+// and submits via submit_cpu_direct() instead of launching the producer
+// kernel.  Set per-step from Python before the model forward.
+// Lives in C++ so HookPoint.forward() needs no Python-level branching,
+// keeping the compiled graph free of non-serializable objects and
+// immune to torch.compile guard dropping.
+static bool g_cpu_direct = false;
+
+void ring_set_cpu_direct(bool enabled) {
+    g_cpu_direct = enabled;
+}
+
+// Side-effect op: either launches the producer kernel (normal ring path)
+// or copies tensor to CPU and submits directly (cpu_direct path).
+//
+// The branch is invisible to torch.compile -- this C++ body only runs
+// during CUDA graph CAPTURE or eager dispatch (never during graph REPLAY).
+// During replay, only the captured kernel is replayed (cpu_direct is
+// never True during capture because force_eager prevents graph replay
+// for cpu_direct steps).
+//
+// Void return + _register_effectful_op prevents DCE at FX level.
 // HookPoint.forward() returns x_cont (not original x) so inductor cannot
 // DCE the .contiguous() copy + producer call for non-contiguous tensors.
-//
-// Uses hook_no_notify() -- unconditional producer kernel launch.
 void ring_producer_impl(
     const at::Tensor& tensor, int64_t hook_type, int64_t hook_id)
 {
-    if (!g_active_engine) return;
+    if (!g_active_engine) { return; }
     if (hook_type >= 0 && hook_type < HOST_HOOK_MAX)
         g_host_calls[hook_type].fetch_add(1);
 
+    if (g_cpu_direct) {
+        // CPU-direct path: ring is full, sync D2H + submit to p2p pipeline.
+        // force_eager is set so no CUDA graph is active.
+        if (tensor.is_cuda()) {
+            // NOTE: compute nbytes BEFORE std::move to avoid use-after-move.
+            auto cpu_tensor = tensor.detach().cpu();
+            uint64_t nbytes = static_cast<uint64_t>(cpu_tensor.nbytes());
+            g_active_engine->submit_cpu_direct(
+                std::move(cpu_tensor), nbytes);
+        }
+        return;
+    }
+
+    // Normal ring path: async D2D copy into ring buffer via producer kernel.
     if (tensor.is_cuda() && tensor.is_contiguous()) {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
         g_active_engine->hook_no_notify(
