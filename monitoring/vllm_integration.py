@@ -189,6 +189,7 @@ class DMXGPUWorker(Worker):
         _ARCH_REMAP = {
             "GPT2LMHeadModel": "GPT2PLMHeadModel",
             "Qwen3ForCausalLM": "Qwen3PForCausalLM",
+            "LlamaForCausalLM": "LlamaPForCausalLM",
         }
         hf_cfg = self.vllm_config.model_config.hf_config
         archs = getattr(hf_cfg, "architectures", [])

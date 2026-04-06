@@ -55,8 +55,10 @@ def _load_extension() -> Any:
                 spec.loader.exec_module(module)  # type: ignore[arg-type]
                 _EXTENSION_MODULE = module
                 return _EXTENSION_MODULE
-        except Exception:
-            # Continue searching other local candidates.
+        except Exception as _e:
+            # Log the real error so it isn't silently swallowed.
+            import sys
+            print(f"[_native_engine] failed to load {so_path}: {_e}", file=sys.stderr, flush=True)
             pass
 
     raise ImportError(
