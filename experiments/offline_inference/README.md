@@ -11,7 +11,7 @@ This directory contains the PyTorch/HuggingFace offline evaluation scripts used 
 experiments/offline_inference/
   README.md
   run_*.sh                 # user-facing local experiment entrypoints
-  scripts/                 # Python runners and shared utilities
+  scripts/                 # Python runners and internal helper scripts
   testing/                 # smoke tests and local test entrypoints
   archived/                # original sbatch/retry scripts kept for reference
 ```
@@ -68,18 +68,7 @@ These scripts run end-to-end batched generation on sampled ShareGPT/WildChat dat
 | `run_hook_count_dmi_20g_qwen3_4b.sh` | DMI-only hook-count sweep |
 | `run_prefill_backpressure_qwen3_4b.sh` | Request dropping / prefill backpressure study |
 | `run_prefill_backpressure_dmi_ring_sweep_qwen3_4b.sh` | DMI ring-size sweep for prefill backpressure |
-| `run_max_batch_hs_logits_qwen3_14b.sh` | Max-batch search for 14B `hs+logits` |
-| `run_max_batch_hs_logits_qwen3_14b_compile_dmi.sh` | Max-batch search for compile HF vs DMI |
-| `run_max_batch_hs_logits_qwen3_14b_dmi_eager.sh` | Max-batch search for DMI eager ring sizes |
 | `run_tp_compile_sharegpt_qwen3_14b.sh` | TP=1/2/4 compile comparison for HF vs DMI on ShareGPT |
-
-### Shared Drivers
-
-| Script | Purpose |
-|---|---|
-| `run_all.sh` | Internal matrix driver used by the full sweeps |
-| `run_baselines.sh` | Convenience wrapper for selected baseline subsets |
-| `run_internal_hooks_compare.sh` | Helper wrapper for internal-hook comparisons |
 
 ### Example Commands
 
@@ -102,7 +91,6 @@ These scripts focus on phase-level timing rather than full offline sweeps.
 | Script | Purpose |
 |---|---|
 | `run_step_breakdown_microbench_qwen3_4b_local.sh` | Main local step-breakdown microbenchmark for Qwen3-4B |
-| `run_step_breakdown_baseline.sh` | Baseline dispatcher for `hf_ideal`, `hf_api`, `torch_hooks`, and DMI variants |
 
 The default step-breakdown workload is:
 
@@ -148,6 +136,7 @@ STORAGE_LABEL=disk PROJ_DMI_MODE=ring_null \
 
 - `testing/`: smoke tests and local test entrypoints
 - `archived/`: original sbatch/retry scripts and older superseded entrypoints kept as references; these are not the primary local reproduction path
+- `scripts/`: Python runners plus internal shell helpers such as the sweep matrix drivers and step-breakdown dispatcher
 
 ## Notes
 

@@ -34,7 +34,7 @@ run_one() {
   echo "============================================================"
   echo "baseline=${baseline} bs=${BATCH_SIZE} repeat=${repeat_index}/${REPEATS} ${extra_args[*]:-}"
   echo "============================================================"
-  PYTHON_BIN="${PYTHON_BIN}" bash experiments/offline_inference/run_step_breakdown_baseline.sh "${baseline}" \
+  PYTHON_BIN="${PYTHON_BIN}" bash experiments/offline_inference/scripts/run_step_breakdown_baseline.sh "${baseline}" \
     --model "${MODEL}" \
     --batch-size "${BATCH_SIZE}" \
     --prefill-tokens "${PREFILL_TOKENS}" \

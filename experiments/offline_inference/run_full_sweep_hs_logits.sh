@@ -15,7 +15,7 @@ for model in ${MODELS_CSV//,/ }; do
       wildchat) max_input=250; max_output=1000 ;;
       *) echo "Unknown dataset: ${dataset}" >&2; exit 1 ;;
     esac
-    bash experiments/offline_inference/run_all.sh \
+    bash experiments/offline_inference/scripts/run_all.sh \
       --model "${model}" \
       --datasets "${dataset}" \
       --baselines "hf_upper_bound_eager,hf_monitor_generate,hf_monitor_manual,proj_dmi,torch_hooks,nnsight" \
