@@ -234,15 +234,6 @@ The Python API doesn't fully expose the D2H configuration, so 3 files in the
 | `llmapi/llm.py` | +15 lines: read `TRTLLM_EXTRACT_NLAYERS` env var | `ExecutorConfig.additional_model_outputs` is not exposed by the constructor; this patch sets it internally |
 | `sampling_params.py` | 1 line: `gather_context=False` → `True` | Hardcoded default causes token index mismatch assertion |
 
-### Comparison
-
-| | vLLM-Hook | TRT-LLM Debug API |
-|---|---|---|
-| D2H mechanism | Python forward hook + `.cpu()` | C++ batch manager (built-in) |
-| CUDA graphs | Incompatible (must use eager) | Compatible |
-| Overhead source | Eager mode + Python callback + D2H | D2H only |
-| Modification style | External plugin (no vLLM changes) | Patch pip package (no external API) |
-
 ## Benchmark Parameters
 
 - **Datasets**: ShareGPT + WildChat, 500 samples each, 3 seeds (42, 123, 456)
