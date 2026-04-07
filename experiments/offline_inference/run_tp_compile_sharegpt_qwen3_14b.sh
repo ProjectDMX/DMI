@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_local_env.sh"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/scripts/_local_env.sh"
 offline_e2e_setup_local_env
 
 RESULTS_DIR="${RESULTS_DIR:-experiments/offline_inference/results/tp_compile_sharegpt_qwen3_14b_$(date '+%Y%m%d_%H%M%S')}"

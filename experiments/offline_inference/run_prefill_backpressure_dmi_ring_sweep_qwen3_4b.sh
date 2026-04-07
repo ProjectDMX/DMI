@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_local_env.sh"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/scripts/_local_env.sh"
 offline_e2e_setup_local_env
 
 RESULTS_DIR="${RESULTS_DIR:-experiments/offline_inference/results/prefill_backpressure_dmi_ring_sweep_$(date '+%Y%m%d_%H%M%S')}"
@@ -39,4 +39,3 @@ for label_and_hooks in \
     --ring-payload-mb 61440 --ring-pinned-mb 61440 --ring-task-entries 65536 \
     --drain-flush-payload-ratio 0 --drain-flush-task-ratio 0 --drain-flush-timeout-us 200 || true
 done
-

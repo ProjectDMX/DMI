@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_local_env.sh"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/scripts/_local_env.sh"
 offline_e2e_setup_local_env
 
 DATASET="${DATASET:-sharegpt}"
@@ -28,4 +28,3 @@ for hook_sel in "${HOOK_SELECTIONS[@]}"; do
     --ring-payload-mb 20480 --ring-pinned-mb 20480 --ring-task-entries 131072 \
     --drain-flush-payload-ratio 0 --drain-flush-task-ratio 0 --drain-flush-timeout-us 200 || true
 done
-
