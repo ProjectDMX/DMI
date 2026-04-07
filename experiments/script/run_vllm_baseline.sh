@@ -15,7 +15,7 @@ set -eo pipefail
 # ── Parse arguments ─────────────────────────────────────────────────
 MODEL_TAG=""
 RATES="1 2 4 8 16 32 64 128 256"
-RESULT_DIR="results/vllm_baseline"
+RESULT_DIR="$(cd "$(dirname "$0")/.." && pwd)/results/vllm_wo_monitor"
 PORT=8010
 DURATION=30
 
@@ -36,30 +36,29 @@ if [ -z "$MODEL_TAG" ]; then
 fi
 
 # ── Resolve model path ──────────────────────────────────────────────
-WORK_DIR=${WORK_DIR:-$(cd ~/scratch.zaoxing-prj && pwd)}
+WORK_DIR=${WORK_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}
 cd "$WORK_DIR"
+export HF_HOME=${HF_HOME:-${WORK_DIR}/hf_cache}
 
 case $MODEL_TAG in
-    qwen4b)  MODEL_PATH=$(ls -d hf_cache/hub/models--Qwen--Qwen3-4B/snapshots/*/ 2>/dev/null | head -1 | sed 's:/$::') ;;
-    llama8b) MODEL_PATH=$(ls -d hf_cache/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/*/ 2>/dev/null | head -1 | sed 's:/$::') ;;
-    qwen14b) MODEL_PATH=$(ls -d hf_cache/hub/models--Qwen--Qwen3-14B/snapshots/*/ 2>/dev/null | head -1 | sed 's:/$::') ;;
+    qwen4b)  MODEL_PATH=$(ls -d ${HF_HOME}/hub/models--Qwen--Qwen3-4B/snapshots/*/ 2>/dev/null | head -1 | sed 's:/$::') ;;
+    llama8b) MODEL_PATH=$(ls -d ${HF_HOME}/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/*/ 2>/dev/null | head -1 | sed 's:/$::') ;;
+    qwen14b) MODEL_PATH=$(ls -d ${HF_HOME}/hub/models--Qwen--Qwen3-14B/snapshots/*/ 2>/dev/null | head -1 | sed 's:/$::') ;;
     *) echo "Unknown model: $MODEL_TAG (use qwen4b, llama8b, qwen14b)"; exit 1 ;;
 esac
 
 if [ -z "$MODEL_PATH" ]; then
-    echo "ERROR: Model $MODEL_TAG not found in hf_cache"
+    echo "ERROR: Model $MODEL_TAG not found in $HF_HOME"
     exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Environment ─────────────────────────────────────────────────────
-ENV_PYTHON=${WORK_DIR}/envs/vllm-h100/bin/python3.10
-SITE=${WORK_DIR}/dmi-env/lib/python3.10/site-packages
-export PYTHONPATH=${WORK_DIR}/vllm-0.17.0:${WORK_DIR}/DMI/transformers/src:$SITE
+# Activate your conda env before running, then this script uses that python.
+ENV_PYTHON=${ENV_PYTHON:-python}
 export VLLM_TARGET_DEVICE=cuda
-export HF_HOME=${WORK_DIR}/hf_cache
-export HF_HUB_OFFLINE=1
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 export XDG_CACHE_HOME=${WORK_DIR}/.cache
 export VLLM_CACHE_ROOT=${WORK_DIR}/vllm_cache
 export VLLM_DISABLE_COMPILE_CACHE=1
@@ -97,12 +96,12 @@ fi
 
 # ── Benchmark ───────────────────────────────────────────────────────
 DATASETS=(
-    "sampled_datasets/sharegpt_seed42_n500_n30.json:sharegpt_s42"
-    "sampled_datasets/sharegpt_seed123_n500_n30.json:sharegpt_s123"
-    "sampled_datasets/sharegpt_seed456_n500_n30.json:sharegpt_s456"
-    "sampled_datasets/wildchat_seed42_n500_n30.json:wildchat_s42"
-    "sampled_datasets/wildchat_seed123_n500_n30.json:wildchat_s123"
-    "sampled_datasets/wildchat_seed456_n500_n30.json:wildchat_s456"
+    "experiments/sampled_datasets/sharegpt_seed42_n500_n30.json:sharegpt_s42"
+    "experiments/sampled_datasets/sharegpt_seed123_n500_n30.json:sharegpt_s123"
+    "experiments/sampled_datasets/sharegpt_seed456_n500_n30.json:sharegpt_s456"
+    "experiments/sampled_datasets/wildchat_seed42_n500_n30.json:wildchat_s42"
+    "experiments/sampled_datasets/wildchat_seed123_n500_n30.json:wildchat_s123"
+    "experiments/sampled_datasets/wildchat_seed456_n500_n30.json:wildchat_s456"
 )
 
 for ds_entry in "${DATASETS[@]}"; do

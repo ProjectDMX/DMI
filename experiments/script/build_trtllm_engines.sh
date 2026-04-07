@@ -31,17 +31,11 @@ WORK_DIR=${WORK_DIR:-$(cd ~/scratch.zaoxing-prj && pwd)}
 cd "$WORK_DIR"
 
 # ── Environment ─────────────────────────────────────────────────────
-NVIDIA_BASE=envs/trtllm/lib/python3.10/site-packages/nvidia
-NVIDIA_LIBS=$(find $NVIDIA_BASE -maxdepth 2 -name lib -type d ! -path "*/cu13/*" 2>/dev/null | paste -sd:)
-export LD_LIBRARY_PATH=/cvmfs/hpcsw.umd.edu/spack-software/2023.11.20/linux-rhel8-x86_64/gcc-11.3.0/openmpi-4.1.5-h3d4fsbq2zpfqyhmle4c44k35mvpw2bp/lib:${NVIDIA_LIBS}:$(pwd)/envs/trtllm/lib/cublas13_only
-export LD_PRELOAD=$(pwd)/envs/trtllm/lib/python3.10/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12
-export OMPI_MCA_rmaps_base_oversubscribe=1
-export OMPI_MCA_mca_base_env_list="LD_PRELOAD,LD_LIBRARY_PATH"
+# Activate your TRT-LLM conda env before running.
+PYTHON=${ENV_PYTHON:-python}
 export HF_HOME=$(pwd)/hf_cache
 export HF_HUB_OFFLINE=1
 export XDG_CACHE_HOME=$(pwd)/.cache
-
-PYTHON=envs/trtllm/bin/python3.10
 ENGINE_ROOT=$(pwd)/trtllm_engines
 mkdir -p "$ENGINE_ROOT"
 
