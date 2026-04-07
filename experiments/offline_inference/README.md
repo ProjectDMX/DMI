@@ -126,6 +126,8 @@ It is used to separate:
 - explicit ring flush time
 - downstream database insertion completion time
 
+Important: `STORAGE_LABEL=disk` or `STORAGE_LABEL=tmpfs` only changes the experiment label written to the result files. It does **not** reconfigure ClickHouse storage automatically. To actually compare disk-backed storage against `tmpfs`, you must manually change the ClickHouse data path, restart ClickHouse, and then rerun the script under the corresponding label.
+
 ### Max-Batch Memory Microbenchmark
 
 | Script | Purpose |
