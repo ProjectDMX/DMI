@@ -1,41 +1,38 @@
-"""RefDiskWorker: vLLM Worker that runs the ref model, saves captured
-tensors to disk after each forward pass.
+"""CompareWorker: DMXGPUWorker that also saves D2D capture buffers to disk.
 
-Post-forward: slices GPU buffers per-request using offsets computed from
-scheduler_output, saves as .pt files.
+Runs the compare model (qwen3_compare / gpt2_compare) which has both
+HookPoints (ring::producer) and .copy_() capture in the same compiled graph.
+After each forward, saves the .copy_() buffers to disk. The ring transport
+writes to ClickHouse. Compare disk vs ClickHouse for transport correctness.
 """
 import json
 import os
+import re
 from typing import Any
 
 import torch
 
-from vllm.v1.worker.gpu_worker import Worker
+from monitoring.vllm_integration import DMXGPUWorker
 
 
 _ARCH_REMAP = {
-    "GPT2LMHeadModel": "GPT2RefLMHeadModel",
-    "Qwen3ForCausalLM": "Qwen3RefForCausalLM",
+    "GPT2LMHeadModel": "GPT2CompareForCausalLM",
+    "Qwen3ForCausalLM": "Qwen3CompareForCausalLM",
 }
 
-
-# Hook names that are TP-sharded (output of ColumnParallel, before RowParallel).
-# Unsharded hooks are identical across TP ranks — only rank 0 saves them.
+# Hook names that are TP-sharded
 _TP_SHARDED_HOOKS = {"q", "k", "v", "z", "mlp_post"}
 
 
-class RefDiskWorker(Worker):
+class CompareWorker(DMXGPUWorker):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._ref_config: dict | None = None
-        self._output_dir: str = ""
-        self._step: int = 0
-        self._tp_rank: int = 0
-        self._tp_size: int = 1
+        self._compare_output_dir: str = ""
+        self._compare_step: int = 0
 
     def load_model(self) -> None:
-        # Remap to ref variant
+        # Remap to compare variant
         hf_cfg = self.vllm_config.model_config.hf_config
         archs = getattr(hf_cfg, "architectures", [])
         new_archs = [_ARCH_REMAP.get(a, a) for a in archs]
@@ -43,26 +40,26 @@ class RefDiskWorker(Worker):
 
         super().load_model()
 
-        from vllm.distributed.parallel_state import get_tp_group
-        self._tp_rank = get_tp_group().rank_in_group
-        self._tp_size = get_tp_group().world_size
+        # Allocate compare buffers. Use max_num_batched_tokens (not
+        # E2E_REF_MAX_LEN) because profiling runs the model with that many
+        # tokens and the .copy_() calls are unconditional.
+        max_len = self.vllm_config.scheduler_config.max_num_batched_tokens
+        model = self.model_runner.model
+        if hasattr(model, "allocate_compare_buffers"):
+            model.allocate_compare_buffers(max_len, self.vllm_config)
 
-        cfg_path = os.environ.get("REF_CONFIG")
-        if cfg_path:
-            with open(cfg_path) as f:
-                self._ref_config = json.load(f)
-            self._output_dir = self._ref_config["output_dir"]
-            os.makedirs(self._output_dir, exist_ok=True)
+        self._compare_output_dir = os.environ.get("COMPARE_OUTPUT_DIR", "")
+        if self._compare_output_dir:
+            os.makedirs(self._compare_output_dir, exist_ok=True)
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: Any) -> Any:
         # Collect per-request metadata BEFORE forward
         total_tokens = scheduler_output.total_num_scheduled_tokens
-        num_scheduled = scheduler_output.num_scheduled_tokens  # dict[req_id, int]
+        num_scheduled = scheduler_output.num_scheduled_tokens
         req_ids = list(num_scheduled.keys())
         num_per_req = list(num_scheduled.values())
 
-        # Compute per-request token ranges
         computed_map: dict = {}
         for new_req in scheduler_output.scheduled_new_reqs:
             computed_map[new_req.req_id] = new_req.num_computed_tokens
@@ -70,18 +67,16 @@ class RefDiskWorker(Worker):
         for i, rid in enumerate(cached.req_ids):
             computed_map[rid] = cached.num_computed_tokens[i]
 
-        # Run forward
+        # Run forward (DMXGPUWorker.execute_model handles ring transport)
         result = super().execute_model(scheduler_output)
 
-        if self._ref_config is None or total_tokens == 0:
-            return result
+        if self._compare_output_dir and total_tokens > 0:
+            self._save_compare_step(req_ids, num_per_req, computed_map)
+            self._compare_step += 1
 
-        # Post-forward: slice buffers and save
-        self._save_step(req_ids, num_per_req, computed_map)
-        self._step += 1
         return result
 
-    def _save_step(
+    def _save_compare_step(
         self,
         req_ids: list[str],
         num_per_req: list[int],
@@ -95,9 +90,17 @@ class RefDiskWorker(Worker):
         if not bufs:
             return
 
-        # Normalize request IDs (strip vLLM UUID suffix)
-        import re
         _suffix_re = re.compile(r"-[0-9a-f]{8}$")
+        tp_rank = self._dmx_tp_rank
+        tp_size = getattr(self, '_dmx_tp_size', 1)
+        # Get tp_size from the group if available
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+            tp_size = get_tp_group().world_size
+        except Exception:
+            pass
+
+        sr = f"_SR{tp_rank}" if tp_size > 1 else ""
 
         offset = 0
         for i, rid in enumerate(req_ids):
@@ -107,27 +110,19 @@ class RefDiskWorker(Worker):
             t_end = pre_computed + n
             norm_id = _suffix_re.sub("", rid)
 
-            req_dir = os.path.join(self._output_dir, norm_id)
+            req_dir = os.path.join(self._compare_output_dir, norm_id)
             os.makedirs(req_dir, exist_ok=True)
 
             for name, buf in bufs.items():
-                # Parse hook name: "resid_pre_L0" → hook=resid_pre
-                # or "embed" → hook=embed
                 if "_L" in name:
                     hook_name = name.rsplit("_L", 1)[0]
                 else:
                     hook_name = name
 
-                # TP: non-zero ranks skip unsharded hooks (identical to rank 0)
                 is_sharded = hook_name in _TP_SHARDED_HOOKS
-                if self._tp_rank != 0 and not is_sharded:
+                if tp_rank != 0 and not is_sharded:
                     continue
 
-                # Shard rank suffix (only when TP > 1)
-                sr = f"_SR{self._tp_rank}" if self._tp_size > 1 else ""
-
-                # final_logits: dim0 = num_reqs (one per request), not total_tokens.
-                # Slice by request index, save as single-token range (last predicted).
                 if name == "final_logits":
                     chunk = buf[i:i + 1].cpu().clone()
                     fl_start = t_end - 1

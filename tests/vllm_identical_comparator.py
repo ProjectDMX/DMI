@@ -209,10 +209,11 @@ def main():
     _decode = lambda v: v.decode() if isinstance(v, bytes) else v
     ch_data: dict[tuple, torch.Tensor] = {}
     for row in raw_rows:
-        _, req_id, act_name, layer_no, _, s, e, dtype_str, shape, payload = row
+        _, req_id, act_name, layer_no, shard_rank, s, e, dtype_str, shape, payload = row
         dt = _DTYPE_MAP.get(_decode(dtype_str), torch.float32)
         t = torch.frombuffer(bytearray(payload), dtype=dt).reshape(list(shape))
-        ch_data[(_decode(req_id), _decode(act_name), int(layer_no), int(s), int(e))] = t
+        ch_data[(_decode(req_id), _decode(act_name), int(layer_no),
+                 int(shard_rank), int(s), int(e))] = t
 
     # Map hook names to CH act_name format
     # CH uses "blocks.hook_resid_pre" for per-layer, "final_logits" for global
@@ -242,13 +243,15 @@ def main():
 
     # Scan ref directory for .pt files
     ref_path = Path(ref_dir)
-    # Pattern: {req_id}/{hook_name}_L{layer}_T{start}_{end}.pt
-    #       or {req_id}/{hook_name}_T{start}_{end}.pt
+    # Pattern: {hook}_L{layer}_T{start}_{end}[_SR{rank}].pt
+    #       or {hook}_T{start}_{end}[_SR{rank}].pt
     _PT_RE = re.compile(
-        r"^(?P<hook>\w+?)(?:_L(?P<layer>\d+))?_T(?P<start>\d+)_(?P<end>\d+)\.pt$"
+        r"^(?P<hook>\w+?)(?:_L(?P<layer>\d+))?_T(?P<start>\d+)_(?P<end>\d+)"
+        r"(?:_SR(?P<shard>\d+))?\.pt$"
     )
 
-    ref_files: list[tuple[str, str, int, int, int, str]] = []
+    # ref_files: (req_id, hook, layer, shard_rank, start, end, path)
+    ref_files: list[tuple[str, str, int, int, int, int, str]] = []
     for req_dir in sorted(ref_path.iterdir()):
         if not req_dir.is_dir():
             continue
@@ -259,31 +262,30 @@ def main():
                 continue
             hook = m.group("hook")
             layer = int(m.group("layer")) if m.group("layer") is not None else -1
+            shard = int(m.group("shard")) if m.group("shard") is not None else 0
             start = int(m.group("start"))
             end = int(m.group("end"))
-            ref_files.append((req_id, hook, layer, start, end, str(pt_file)))
+            ref_files.append((req_id, hook, layer, shard, start, end, str(pt_file)))
 
     _check("ref_files_found", len(ref_files) > 0, f"{len(ref_files)} files")
 
     # Compare each ref tensor against CH
-    for req_id, hook, layer, start, end, pt_path in ref_files:
+    for req_id, hook, layer, shard, start, end, pt_path in ref_files:
         ref_t = torch.load(pt_path, weights_only=True, map_location="cpu")
 
-        # Find matching CH tensor
+        # Find matching CH tensor (include shard_rank in key)
         ch_act = _HOOK_TO_CH_PREFIX.get(hook, hook)
         ch_layer = layer  # -1 for global hooks, matches CH layer_no
 
-        # For final_logits: DB stores one row per request at (end_token-1, end_token)
-        # Ref stores the full logits tensor for the step.
-        # We need to find the matching CH entry.
-        ch_key = (req_id, ch_act, ch_layer, start, end)
+        ch_key = (req_id, ch_act, ch_layer, shard, start, end)
         ch_t = ch_data.get(ch_key)
 
         if ch_t is None:
-            # Try finding with any token range for this (req_id, act, layer)
+            # Try finding with any token range for this (req_id, act, layer, shard)
             candidates = [
                 (k, v) for k, v in ch_data.items()
                 if k[0] == req_id and k[1] == ch_act and k[2] == ch_layer
+                and k[3] == shard
             ]
             if len(candidates) == 1:
                 ch_t = candidates[0][1]

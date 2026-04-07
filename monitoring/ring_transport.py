@@ -86,7 +86,7 @@ _HIDDEN_DIM_TYPES = frozenset({
 #
 # Examples:
 #   "full"                            -- all hooks
-#   "vllm-full"                         -- full minus attn_scores/pattern/resid_final
+#   "vllm-full"                         -- full minus attn_scores/pattern
 #   "hidden-states,token_ids"         -- resid_pre + token_ids
 #   "hidden-states,final_ln,logits"   -- resid_pre + final_ln + final_logits
 #   "resid_pre,resid_final,embed"     -- just those three
@@ -108,7 +108,7 @@ _HOOK_SELECTIONS: Dict[str, frozenset] = {
     # them) and resid_final (last layer's pre-norm residual is not materialized
     # in vLLM's fused RMSNorm -- final_ln captures the post-norm value instead).
     "vllm-full": _ALL_HOOK_TYPES - {
-        HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN, HOOK_TYPE_RESID_FINAL,
+        HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN,
     },
     # What HF returns with output_hidden_states + output_attentions + logits
     "hf-only": frozenset({
