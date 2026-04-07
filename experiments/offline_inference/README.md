@@ -1,9 +1,9 @@
-# Offline Inference Experiment Guide
+# Offline Inference/Microbenchmarks Experiment Guide
 
 This directory contains the PyTorch/HuggingFace offline evaluation scripts used in our paper. The experiments are organized into two groups:
 
 - `offline inference`: end-to-end batched generation experiments on sampled datasets
-- `microbenchmark`: targeted breakdown and storage-ablation experiments
+- `microbenchmark`: targeted breakdown and ablation experiments
 
 ## Directory Structure
 
@@ -20,25 +20,26 @@ experiments/offline_inference/
 
 The main offline inference experiments compare the following baselines.
 
-| Baseline | Meaning | Runner |
+| Baseline | Description | Runner |
 |---|---|---|
-| `hf_upper_bound_compile` | HuggingFace upper bound with compile enabled | `scripts/run_hf_upper_bound.py` |
-| `hf_upper_bound_eager` | HuggingFace upper bound in eager mode | `scripts/run_hf_upper_bound.py --disable-compile` |
-| `hf_monitor_generate` | HuggingFace output API path (`generate`) | `scripts/run_hf_monitor.py` |
-| `hf_monitor_manual` | HuggingFace manual loop / API-based extraction | `scripts/run_hf_monitor_manual.py` |
-| `proj_dmi` | DMI runner, typically with `ring_null` for end-to-end overhead studies | `scripts/run_proj_dmi.py` |
-| `torch_hooks` | PyTorch forward hooks | `scripts/run_torch_hooks.py` |
-| `nnsight` | NNsight tracing baseline | `scripts/run_nnsight.py` |
+| **Hugging Face (compiled baseline)** | Unmonitored HuggingFace baseline with compile enabled | `scripts/run_hf_upper_bound.py` |
+| **Hugging Face (eager baseline)** | Unmonitored HuggingFace baseline in eager mode | `scripts/run_hf_upper_bound.py --disable-compile` |
+| **DMI** | DMI monitoring integration with Hugging Face | `scripts/run_proj_dmi.py` |
+| **Hugging Face (generate)** | HuggingFace with offloading using output API path (`generate`) | `scripts/run_hf_monitor.py` |
+| **Hugging Face (manual)** | HuggingFace with offloading using manual loop | `scripts/run_hf_monitor_manual.py` |
+| **Torch Hooks** | PyTorch forward hooks | `scripts/run_torch_hooks.py` |
+| **NNsight** | NNsight tracing baseline | `scripts/run_nnsight.py` |
 
 The microbenchmark experiments use a smaller set of step-level baselines.
 
 | Baseline | Meaning | Runner |
 |---|---|---|
-| `hf_ideal` | HuggingFace ideal step timing | `scripts/run_step_breakdown_hf_ideal.py` |
-| `hf_api` | HuggingFace API timing | `scripts/run_step_breakdown_hf_api.py` |
-| `torch_hooks` | Torch hooks step timing | `scripts/run_step_breakdown_torch_hooks.py` |
-| `proj_dmi_manual` | DMI step timing with compile | `scripts/run_step_breakdown_proj_dmi_manual.py` |
-| `proj_dmi_manual` + `--disable-compile` | DMI no-ring style eager comparison | `scripts/run_step_breakdown_proj_dmi_manual.py --disable-compile` |
+| **Hugging Face (baseline)** | Unmonitored HuggingFace baseline step timing | `scripts/run_step_breakdown_hf_ideal.py` |
+| **DMI (full)** | DMI full pipeline step timing with compile | `scripts/run_step_breakdown_proj_dmi_manual.py` |
+| **DMI (no ring)** | DMI without ring step timing (fall back to eager) | `scripts/run_step_breakdown_proj_dmi_manual.py --disable-compile` |
+| **Hugging Face (API)** | HuggingFace with offloading using output API path step timing | `scripts/run_step_breakdown_hf_api.py` |
+| **Torch Hooks** | Torch hooks step timing | `scripts/run_step_breakdown_torch_hooks.py` |
+
 
 ## Models
 
