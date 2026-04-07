@@ -37,7 +37,7 @@ if [ -z "$MODEL_TAG" ]; then
 fi
 
 # ── Resolve model path and engine ───────────────────────────────────
-WORK_DIR=${WORK_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}
+WORK_DIR=${WORK_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}
 cd "$WORK_DIR"
 export HF_HOME=${HF_HOME:-${WORK_DIR}/hf_cache}
 

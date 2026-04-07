@@ -20,26 +20,46 @@ This branch contains everything needed to reproduce the 4 baselines from the DMI
 ## Directory Structure
 
 ```
-experiments/online_serving/
-  README.md                   # This file
-  vLLM-Hook/                  # Submodule: ProjectDMX/vLLM-Hook-baseline
-  TensorRT-LLM/               # Submodule: ProjectDMX/TensorRT-LLM-baseline
-  sampled_datasets/            # 6 JSON files: {sharegpt,wildchat}_seed{42,123,456}_n500_n30.json
-  results/                     # Benchmark output (git-ignored)
-  DMI_plot/                    # Plotting scripts
-  envs/                        # pip freeze outputs for each environment
-  script/
-    setup_env.sh               # Create conda envs + download models
-    run_vllm_baseline.sh       # Run vLLM baseline at specified rates
-    run_dmi.sh                 # Run DMI at specified rates
-    run_vllm_hook.sh           # Run vLLM-Hook at specified rates
-    run_trtllm_d2h.sh          # Run TRT-LLM D2H at specified rates
-    build_trtllm_engines.sh    # Build TRT-LLM engines with debug output
-    run_bench.py               # Benchmark client (wraps vllm.benchmarks.serve)
-    adaptive_bench.py          # Adaptive rate binary search (reference)
-    sample_datasets.py         # Dataset sampling script
-    sbatch/                    # Original SLURM sbatch files (reference)
+experiments/
+  online_serving/
+    README.md                 # This file
+    vLLM-Hook/                # Submodule: ProjectDMX/vLLM-Hook-baseline
+    TensorRT-LLM/             # Submodule: ProjectDMX/TensorRT-LLM-baseline
+    sampled_datasets/          # 6 JSON files: {sharegpt,wildchat}_seed{42,123,456}_n500_n30.json
+    results/                   # Benchmark output (git-ignored)
+    DMI_plot/                  # Plotting scripts
+    envs/                      # pip freeze outputs for each environment
+    script/
+      setup_env.sh             # Create conda envs + download models
+      run_vllm_baseline.sh     # Run vLLM baseline at specified rates
+      run_dmi.sh               # Run DMI at specified rates
+      run_vllm_hook.sh         # Run vLLM-Hook at specified rates
+      run_trtllm_d2h.sh        # Run TRT-LLM D2H at specified rates
+      build_trtllm_engines.sh  # Build TRT-LLM engines with debug output
+      run_bench.py             # Benchmark client (wraps vllm.benchmarks.serve)
+      adaptive_bench.py        # Adaptive rate binary search (reference)
+      sample_datasets.py       # Dataset sampling script
+      sbatch/                  # Original SLURM sbatch files (reference)
+  offline_inference/           # (separate experiment)
 ```
+
+## Prerequisites
+
+- **NVIDIA GPU** (tested on H100)
+- **CUDA 12.x** with `nvcc`
+- **conda** (Miniconda or Anaconda)
+- **cmake** ≥ 3.16 and **g++** with C++17 support
+- **MPI** (TRT-LLM only): TRT-LLM uses `MPI_Comm_spawn` internally, which
+  works reliably under SLURM (`salloc`/`sbatch`). On standalone machines with
+  pre-built OpenMPI (e.g. `conda install openmpi`), the engine build or serve
+  may hang. If you hit this, try one of:
+  - Run within a SLURM allocation (see `experiments/online_serving/script/sbatch/` for reference)
+  - Use MPICH instead (`conda install mpich` or `apt install mpich`) — its
+    `MPI_Comm_spawn` implementation tends to be more reliable standalone
+  - Build OpenMPI from source with `--enable-mpi-spawn` and full ORTE support
+
+  The other three baselines (vLLM, DMI, vLLM-Hook) work on any machine with
+  CUDA 12.x and do not require MPI.
 
 ## Quick Start
 
@@ -78,6 +98,9 @@ bash experiments/online_serving/script/setup_env.sh datasets
 
 See `experiments/online_serving/envs/*.requirements.txt` for exact package versions.
 
+`setup_env.sh baseline` installs vLLM 0.17.0, builds the DMI native extension,
+and sets up the integration source tree. See the script for details.
+
 ### 3. Run benchmarks
 
 Activate the appropriate conda env first, then run from the repo root.
@@ -114,7 +137,7 @@ If you used `setup_env.sh trtllm`, patches are already applied. Otherwise apply 
 ```bash
 conda activate trtllm-exp
 TRTLLM_SRC=experiments/online_serving/TensorRT-LLM/tensorrt_llm
-TRTLLM_DST=$(python -c "import tensorrt_llm; print(tensorrt_llm.__path__[0])")
+TRTLLM_DST=$(python -c "import tensorrt_llm; print(tensorrt_llm.__path__[0])" 2>/dev/null | tail -1)
 
 # Build-time (needed before engine compilation):
 cp $TRTLLM_SRC/models/modeling_utils.py $TRTLLM_DST/models/
@@ -156,14 +179,19 @@ python experiments/online_serving/DMI_plot/plot_pipeline.py \
 
 ### vLLM Baseline
 
-Unmodified vLLM 0.17.0. No hidden state extraction. CUDA graphs enabled.
-This is the performance reference — any monitoring overhead is measured against this.
+Unmodified vLLM 0.17.0 installed from pip. No hidden state extraction. CUDA graphs
+enabled. This is the performance reference — any monitoring overhead is measured
+against this. The baseline script uses the pip-installed vLLM directly (no PYTHONPATH
+override).
 
 ### DMI
 
 DMI hooks into vLLM via a custom worker class (`DMXGPUWorker`). During each decode
 step, DMI's ring-buffer transport asynchronously copies per-layer hidden states from
 GPU to a pinned CPU buffer, overlapping with computation. CUDA graphs remain enabled.
+
+The DMI script uses modified vLLM and transformers sources from `integration/`
+via PYTHONPATH, while compiled extensions are reused from the pip-installed vLLM.
 
 ### vLLM-Hook
 
@@ -231,6 +259,6 @@ All scripts support these overrides:
 |----------|---------|-------------|
 | `ENV_PYTHON` | `python` | Python binary for the server |
 | `BENCH_PYTHON` | `$ENV_PYTHON` | Python binary for benchmark client (TRT-LLM only) |
-| `WORK_DIR` | repo root | Root directory (where `experiments/online_serving/` lives) |
+| `WORK_DIR` | repo root | Root directory (where `experiments/` lives) |
 | `HF_HOME` | `$WORK_DIR/hf_cache` | HuggingFace cache directory |
 | `MPIRUN` | `which mpirun` | MPI launcher (TRT-LLM only) |

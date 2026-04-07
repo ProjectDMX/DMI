@@ -14,7 +14,7 @@
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 WORK_DIR=${WORK_DIR:-$(dirname "$REPO_ROOT")}
 
 echo "REPO_ROOT: $REPO_ROOT"
@@ -29,19 +29,46 @@ setup_baseline() {
     eval "$(conda shell.bash hook 2>/dev/null)"
     conda activate vllm-exp
 
-    # PyTorch (CUDA 12)
-    pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu126
+    # vLLM (includes torch, transformers, and all runtime deps)
+    pip install vllm==0.17.0
 
     # FlashInfer
     pip install flashinfer-python==0.6.4
 
-    # vLLM dependencies (not vLLM itself — we use source via PYTHONPATH)
-    pip install transformers==4.57.0 tokenizers sentencepiece
-    pip install openai aiohttp fastapi uvicorn ray
+    # huggingface-hub 1.0.0rc2: required by integration/transformers (used by DMI).
+    # Also satisfies pip transformers' "<1.0" constraint (rc2 < 1.0 in PEP 440).
+    pip install "huggingface-hub==1.0.0rc2"
+
+    # Extra tools for plotting
     pip install numpy pandas matplotlib
 
-    # DMI native extension
+    # ---- Build DMI native extension ----
     cd "$REPO_ROOT"
+
+    # 1. Build clickhouse-cpp (static lib linked into the .so, needs -fPIC)
+    cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    cmake --build libs/clickhouse-cpp/build -j
+
+    # 2. Build monitoring native backend
+    make -C monitoring -j
+
+    # 3. Symlink pip-installed vLLM's compiled extensions and generated files
+    #    into the integration source tree.  DMI's run_dmi.sh puts
+    #    integration/vllm on PYTHONPATH, which shadows the pip package.
+    #    Compiled .so files and _version.py only exist in the pip package
+    #    and must be made available to the source tree.
+    VLLM_SITE=$(python -c "import vllm, os; print(os.path.dirname(vllm.__file__))")
+    VLLM_INTEG="$REPO_ROOT/integration/vllm/vllm"
+    for so in "$VLLM_SITE"/*.so; do
+        [ -f "$so" ] && ln -sf "$so" "$VLLM_INTEG/$(basename "$so")"
+    done
+    for so in "$VLLM_SITE"/vllm_flash_attn/*.so; do
+        [ -f "$so" ] && ln -sf "$so" "$VLLM_INTEG/vllm_flash_attn/$(basename "$so")"
+    done
+    ln -sf "$VLLM_SITE/_version.py" "$VLLM_INTEG/_version.py"
+
+    # 4. Install DMI package (monitoring + benchmark)
     pip install -e .
 
     echo ""
@@ -49,10 +76,6 @@ setup_baseline() {
     echo "  conda activate vllm-exp"
     echo "  ./run_vllm_baseline.sh --model qwen4b --rates '1 2 4'"
     echo "  ./run_dmi.sh --model qwen4b --rates '1 2 4'"
-    echo ""
-    echo "NOTE: vLLM 0.17.0 source is used via PYTHONPATH (set automatically by scripts)."
-    echo "If you don't have it, download from: https://github.com/vllm-project/vllm/archive/refs/tags/v0.17.0.tar.gz"
-    echo "Extract to: $WORK_DIR/vllm-0.17.0/"
 }
 
 setup_hook() {
@@ -64,15 +87,9 @@ setup_hook() {
     eval "$(conda shell.bash hook 2>/dev/null)"
     conda activate hook-exp
 
-    # PyTorch (CUDA 12)
-    pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu126
-
-    # FlashInfer
-    pip install flashinfer-python==0.6.4
-
-    # vLLM dependencies
-    pip install transformers tokenizers sentencepiece
-    pip install openai aiohttp fastapi uvicorn ray
+    # vLLM (includes torch, transformers, and all runtime deps; also needed
+    # by run_bench.py which imports vllm.benchmarks.serve)
+    pip install vllm==0.17.0
 
     # Install vLLM-Hook plugin
     cd "$REPO_ROOT/experiments/online_serving/vLLM-Hook/vllm_hook_plugins"
@@ -105,7 +122,7 @@ setup_trtllm() {
     echo ""
     echo "Applying TRT-LLM patches..."
     TRTLLM_SRC="$REPO_ROOT/experiments/online_serving/TensorRT-LLM/tensorrt_llm"
-    TRTLLM_DST=$(python -c "import tensorrt_llm; print(tensorrt_llm.__path__[0])")
+    TRTLLM_DST=$(python -c "import tensorrt_llm; print(tensorrt_llm.__path__[0])" 2>/dev/null | tail -1)
 
     cp "$TRTLLM_SRC/models/modeling_utils.py" "$TRTLLM_DST/models/"
     cp "$TRTLLM_SRC/llmapi/llm.py" "$TRTLLM_DST/llmapi/"

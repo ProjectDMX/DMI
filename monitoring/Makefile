@@ -161,11 +161,19 @@ CXXFLAGS += -flto
 LDFLAGS += -flto
 endif
 
-# Optional NVTX runtime linking (default off). The code compiles without the
-# library thanks to nvtx_shim.h providing no-op stubs if headers/libs are absent.
-NVTX ?= 0
-ifeq ($(NVTX),1)
-LDFLAGS += -lnvToolsExt
+# NVTX runtime linking.  nvtx_shim.h uses __has_include(<nvToolsExt.h>) to
+# decide at compile time whether to emit NVTX calls.  If the header is found,
+# the library must also be linked.  Auto-detect by default; override with
+# NVTX=0 to force no-op stubs (the header's #else branch) or NVTX=1 to force
+# linking.
+NVTX ?= auto
+ifeq ($(NVTX),auto)
+  NVTX_HEADER_FOUND := $(shell echo '\#if __has_include(<nvToolsExt.h>)\nyes\n\#endif' | $(CXX) $(CUDA_INCLUDE_FLAGS) -E -x c++ - 2>/dev/null | grep -c yes)
+  ifeq ($(NVTX_HEADER_FOUND),1)
+    LDFLAGS += -lnvToolsExt
+  endif
+else ifeq ($(NVTX),1)
+  LDFLAGS += -lnvToolsExt
 endif
 
 # Automatic header dependency tracking.
