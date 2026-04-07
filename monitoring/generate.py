@@ -58,6 +58,16 @@ def _make_model_shape(model: Any) -> Optional[Any]:
         intermediate_dim = getattr(cfg, "intermediate_size", None) or getattr(cfg, "n_inner", None) or 0
         if not intermediate_dim and getattr(cfg, "model_type", "") == "gpt2":
             intermediate_dim = 4 * int(hidden_dim)
+        # TP: detect HF tensor parallelism via tp_plan
+        tp_size = 1
+        tp_plan = getattr(cfg, "tp_plan", None)
+        if tp_plan is not None:
+            if tp_plan != "auto":
+                raise ValueError(f"Only tp_plan='auto' is supported, got: {tp_plan}")
+            import torch.distributed as dist
+            if dist.is_initialized():
+                tp_size = dist.get_world_size()
+
         return ModelShapeConfig(
             hidden_dim=int(hidden_dim),
             num_heads=int(num_heads),
@@ -66,6 +76,7 @@ def _make_model_shape(model: Any) -> Optional[Any]:
             dtype=dtype,
             vocab_size=int(vocab_size),
             intermediate_dim=int(intermediate_dim),
+            tp_size=tp_size,
         )
     except Exception:
         return None

@@ -38,6 +38,7 @@ def main():
     hook_selection = os.environ.get("DMX_HOOK_SELECTION", "vllm-full")
     db_host = os.environ.get("DMX_DB_HOST", "localhost")
     db_port = int(os.environ.get("DMX_DB_PORT", "9000"))
+    tp_size = int(os.environ.get("E2E_TP_SIZE", "1"))
 
     prompts = [f"The answer to question {i+1} is" for i in range(num_prompts)]
 
@@ -63,6 +64,7 @@ def main():
         max_model_len=512,
         enforce_eager=enforce_eager,
         gpu_memory_utilization=0.5,
+        tensor_parallel_size=tp_size,
     )
     cg_mode = os.environ.get("E2E_CUDAGRAPH_MODE")
     if cg_mode:

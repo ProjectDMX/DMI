@@ -283,6 +283,7 @@ class ModelShapeConfig:
     dtype:        torch.dtype
     vocab_size:   int = 0  # required for final_logits shape
     intermediate_dim: int = 0  # MLP intermediate size (for mlp_post shape)
+    tp_size:      int = 1  # tensor parallel world size
 
 
 # ---------------------------------------------------------------------------
@@ -409,24 +410,27 @@ def _compute_hook_shape(
     # batch=0 means flattened (vLLM): shapes have no batch dimension.
     b = [batch] if batch > 0 else []
 
+    tp = cfg.tp_size
+
     if hook_type in _HIDDEN_DIM_TYPES:
         return b + [q_len, cfg.hidden_dim]
     if hook_type == HOOK_TYPE_Q:
-        return b + [q_len, cfg.num_heads, cfg.head_dim]
+        return b + [q_len, cfg.num_heads // tp, cfg.head_dim]
     if hook_type in (HOOK_TYPE_K, HOOK_TYPE_V):
-        return b + [q_len, cfg.num_kv_heads, cfg.head_dim]
+        kv_heads = max(1, cfg.num_kv_heads // tp)  # GQA: may replicate
+        return b + [q_len, kv_heads, cfg.head_dim]
     if hook_type == HOOK_TYPE_Z:
         # vLLM Attention.forward returns [N, hidden_size] (heads flattened).
         # HF returns [batch, q_len, num_heads, head_dim].
         if batch == 0:
-            return [q_len, cfg.num_heads * cfg.head_dim]
-        return b + [q_len, cfg.num_heads, cfg.head_dim]
+            return [q_len, (cfg.num_heads // tp) * cfg.head_dim]
+        return b + [q_len, cfg.num_heads // tp, cfg.head_dim]
     if hook_type in (HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN):
-        return b + [cfg.num_heads, q_len, kv_dim]
+        return b + [cfg.num_heads // tp, q_len, kv_dim]
     if hook_type == HOOK_TYPE_MLP_POST:
         if cfg.intermediate_dim == 0:
             return []  # intermediate_dim unknown — skip this hook
-        return b + [q_len, cfg.intermediate_dim]
+        return b + [q_len, cfg.intermediate_dim // tp]
     if hook_type == HOOK_TYPE_TOKEN_IDS:
         return b + [q_len]
     if hook_type == HOOK_TYPE_FINAL_LOGITS:

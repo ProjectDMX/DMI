@@ -75,6 +75,8 @@ void RingEnginePy::set_null_mode(bool enabled) {
     ring::set_ring_null_mode(enabled);
 }
 
+
+
 void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
     impl_->fifo.push_step(ctx, metas);
 }

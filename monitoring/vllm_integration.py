@@ -79,6 +79,39 @@ def filter_by_pp_rank(specs: list, is_first_rank: bool, is_last_rank: bool) -> l
 
 
 # ---------------------------------------------------------------------------
+# TP rank filtering — skip unsharded hooks on non-zero ranks
+# ---------------------------------------------------------------------------
+
+_TP_SHARDED_TYPES: set = set()  # populated lazily
+
+def _get_tp_sharded_types() -> set:
+    if not _TP_SHARDED_TYPES:
+        from .ring_transport import (
+            HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
+            HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN, HOOK_TYPE_MLP_POST,
+        )
+        _TP_SHARDED_TYPES.update({
+            HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
+            HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN, HOOK_TYPE_MLP_POST,
+        })
+    return _TP_SHARDED_TYPES
+
+def filter_by_tp_rank(specs: list, tp_rank: int) -> list:
+    """On non-zero TP ranks, keep only sharded hooks to avoid N× duplicate
+    writes of identical unsharded data.  Rank 0 keeps all hooks."""
+    if tp_rank == 0:
+        return specs
+    sharded = _get_tp_sharded_types()
+    filtered = []
+    for s in specs:
+        if s.hook_type not in sharded:
+            s.module.enabled = False
+            continue
+        filtered.append(s)
+    return filtered
+
+
+# ---------------------------------------------------------------------------
 # DMXGPUWorker
 # ---------------------------------------------------------------------------
 
@@ -166,10 +199,10 @@ class DMXGPUWorker(Worker):
         self._dmx_null_mode_user = null_mode
         if null_mode:
             transport.null_offload = True
-        # Start in null mode — warmup/profiling will fire producer kernels
-        # (needed for CUDA graph capture) but as no-ops so the ring stays clean.
+        # null_mode defaults to ON (g_ring_null_mode = true in producer.cu).
+        # Warmup/profiling will fire producer kernels (needed for CUDA graph
+        # capture) but the kernel no-ops so the ring stays clean.
         # Turned off after warmup in compile_or_warm_up_model.
-        ring_engine.set_null_mode(True)
         ring_transport.activate(transport)
 
         # Wrap model_runner for force_eager
@@ -216,6 +249,9 @@ class DMXGPUWorker(Worker):
             # vLLM model classes.  Override with the authoritative dtype
             # from vllm_config so meta shapes use the correct element size.
             model_shape.dtype = self.vllm_config.model_config.dtype
+            # TP: set world size so _compute_hook_shape divides sharded dims.
+            from vllm.distributed.parallel_state import get_tp_group
+            model_shape.tp_size = get_tp_group().world_size
             transport.set_model_cfg(model_shape)
 
         if hasattr(model, "get_hook_specs"):
@@ -230,6 +266,10 @@ class DMXGPUWorker(Worker):
                 is_last_rank=pp_group.is_last_rank,
             )
 
+            # TP: non-zero ranks only keep sharded hooks to avoid N×
+            # duplicate writes of identical unsharded data.
+            active_specs = filter_by_tp_rank(active_specs, self._dmx_tp_rank)
+
             handles: list = []
             install_ring_hooks(active_specs, handles)
             transport._active_specs = active_specs
@@ -238,11 +278,23 @@ class DMXGPUWorker(Worker):
     def compile_or_warm_up_model(self) -> float:
         # Warmup runs with null_mode=True (set in init_device).
         # Producer kernels fire but are no-ops — ring stays clean.
+        # We use null_mode (not HookPoint.enabled=False) because CUDA graph
+        # capture needs the producer kernel to be launched during warmup so
+        # it gets baked into the graph.  null_mode makes the kernel a no-op
+        # on the data path while still being captured.
         result = super().compile_or_warm_up_model()
 
         # Warmup done. Turn off null mode (unless user explicitly wants it).
+        # Sync first: warmup may have enqueued producer kernels on a
+        # non-blocking compute stream.  cudaMemcpyToSymbol goes through
+        # the legacy default stream which does NOT synchronize with
+        # non-blocking streams, so the memcpy could race with a pending
+        # producer kernel that still needs to read null_mode=true.
         if not self._dmx_null_mode_user and self._dmx_ring_engine is not None:
+            import torch
+            torch.cuda.synchronize()
             self._dmx_ring_engine.set_null_mode(False)
+            torch.cuda.synchronize()
 
         return result
 
@@ -406,12 +458,15 @@ class DMXGPUWorker(Worker):
 
         return super().execute_model(scheduler_output)
 
-    def shutdown(self) -> None:
-        from . import ring_transport
+    def stop_monitoring(self) -> None:
+        """Flush and stop DMI engine.  Callable via collective_rpc before
+        vLLM shutdown to avoid the 8-second kill deadline.
 
-        # Sync CUDA stream to ensure last producer kernels complete, then
-        # stop ring engine (flushes drain -> p2p -> host queue).
+        Reentrant: second call is a no-op (engine refs nulled after stop).
+        """
+        from . import ring_transport
         import torch
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -431,4 +486,12 @@ class DMXGPUWorker(Worker):
                 pass
             self._dmx_host_engine = None
 
+    def shutdown(self) -> None:
+        import logging
+        if self._dmx_ring_engine is not None:
+            logging.getLogger(__name__).warning(
+                "DMI engine not explicitly stopped before shutdown. "
+                "Data may be incomplete. Call stop_monitoring() first.")
+        # Best-effort flush (may be killed by vLLM's 8s deadline).
+        self.stop_monitoring()
         super().shutdown()

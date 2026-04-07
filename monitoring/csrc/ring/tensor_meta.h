@@ -70,9 +70,8 @@ inline const char* hook_type_name(int hook_type) {
 inline bool is_tp_sharded(int hook_type) {
     switch (hook_type) {
         case HOOK_TYPE_Q: case HOOK_TYPE_K: case HOOK_TYPE_V: case HOOK_TYPE_Z:
-        case HOOK_TYPE_ATTN_OUT:
-        case HOOK_TYPE_MLP_OUT:
-        case HOOK_TYPE_FINAL_LOGITS:
+        case HOOK_TYPE_ATTN_SCORES: case HOOK_TYPE_PATTERN:
+        case HOOK_TYPE_MLP_POST:
             return true;
         default:
             return false;

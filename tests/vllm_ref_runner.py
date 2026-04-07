@@ -34,6 +34,7 @@ def main():
     max_new_tokens = int(os.environ.get("E2E_MAX_NEW_TOKENS", "20"))
     enforce_eager = os.environ.get("E2E_ENFORCE_EAGER", "1") == "1"
     model_dtype = os.environ.get("E2E_DTYPE", "auto")
+    tp_size = int(os.environ.get("E2E_TP_SIZE", "1"))
 
     prompts = [f"The answer to question {i+1} is" for i in range(num_prompts)]
 
@@ -44,6 +45,7 @@ def main():
         max_model_len=512,
         enforce_eager=enforce_eager,
         gpu_memory_utilization=0.5,
+        tensor_parallel_size=tp_size,
     )
     cg_mode = os.environ.get("E2E_CUDAGRAPH_MODE")
     if cg_mode:

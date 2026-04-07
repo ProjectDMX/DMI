@@ -92,6 +92,8 @@ def main():
         for i, p in enumerate(prompts):
             print(f"[vllm_logprob_runner] prompt[{i}]: {p!r}", flush=True)
 
+    tp_size = int(os.environ.get("E2E_TP_SIZE", "1"))
+
     kwargs = dict(
         model=model_id,
         dtype=model_dtype,
@@ -99,6 +101,7 @@ def main():
         max_logprobs=-1,
         enforce_eager=enforce_eager,
         gpu_memory_utilization=0.5,
+        tensor_parallel_size=tp_size,
     )
     if args.ref:
         kwargs["worker_cls"] = "tests.vllm_logprob_runner.RefLogprobWorker"
