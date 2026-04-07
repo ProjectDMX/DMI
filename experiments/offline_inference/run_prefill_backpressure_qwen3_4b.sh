@@ -16,8 +16,6 @@ COMMON=(
 
 "${PYTHON_BIN}" experiments/offline_inference/scripts/run_prefill_backpressure.py "${COMMON[@]}" --baseline hf_native --baseline-label hf_native
 "${PYTHON_BIN}" experiments/offline_inference/scripts/run_prefill_backpressure.py "${COMMON[@]}" --baseline torch_hooks --baseline-label torch_hooks --hook-selection "q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits"
-"${PYTHON_BIN}" experiments/offline_inference/scripts/run_prefill_backpressure.py "${COMMON[@]}" --baseline proj_dmi --baseline-label dmi_light --proj-dmi-mode ring_db --hook-selection "q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits" --ring-payload-mb 61440 --ring-pinned-mb 61440 --ring-task-entries 65536 --drain-flush-payload-ratio 0.15 --drain-flush-task-ratio 0.15
-"${PYTHON_BIN}" experiments/offline_inference/scripts/run_prefill_backpressure.py "${COMMON[@]}" --baseline proj_dmi --baseline-label dmi_heavy --proj-dmi-mode ring_db --hook-selection "q,k,v,z,mlp_in,mlp_out,resid_mid,pattern,attn_scores,logits" --ring-payload-mb 16384 --ring-pinned-mb 16384 --ring-task-entries 65536 --drain-flush-payload-ratio 0.15 --drain-flush-task-ratio 0.15
 
 for ring_mb in 10240 20480 30720 40960 51200; do
   "${PYTHON_BIN}" experiments/offline_inference/scripts/run_prefill_backpressure.py "${COMMON[@]}" \
