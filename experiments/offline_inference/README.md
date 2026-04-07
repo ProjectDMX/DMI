@@ -32,13 +32,13 @@ The main offline inference experiments compare the following baselines.
 
 The microbenchmark experiments use a smaller set of step-level baselines.
 
-| Baseline | Meaning | Runner |
+| Baseline | Description | Runner |
 |---|---|---|
 | **Hugging Face (baseline)** | Unmonitored HuggingFace baseline step timing | `scripts/run_step_breakdown_hf_ideal.py` |
 | **DMI (full)** | DMI full pipeline step timing with compile | `scripts/run_step_breakdown_proj_dmi_manual.py` |
 | **DMI (no ring)** | DMI without ring step timing (fall back to eager) | `scripts/run_step_breakdown_proj_dmi_manual.py --disable-compile` |
-| **Hugging Face (API)** | HuggingFace with offloading using output API path step timing | `scripts/run_step_breakdown_hf_api.py` |
-| **Torch Hooks** | Torch hooks step timing | `scripts/run_step_breakdown_torch_hooks.py` |
+| **Hugging Face (API)** | HuggingFace with offloading using output API step timing | `scripts/run_step_breakdown_hf_api.py` |
+| **Torch Hooks** | PyTorch forward hooks step timing | `scripts/run_step_breakdown_torch_hooks.py` |
 
 
 ## Models
@@ -127,13 +127,9 @@ It is used to separate:
 
 ### Max-Batch Memory Microbenchmark
 
-The max-batch-size experiment is currently not exposed as a top-level script. The older entrypoints are preserved in `archived/`:
-
-- `archived/run_max_batch_hs_logits_qwen3_14b.sh`
-- `archived/run_max_batch_hs_logits_qwen3_14b_compile_dmi.sh`
-- `archived/run_max_batch_hs_logits_qwen3_14b_dmi_eager.sh`
-
-These scripts correspond to the earlier max-batch memory study, but they are still cluster-specific and need consolidation before being restored as a primary local entrypoint.
+| Script | Purpose |
+|---|---|
+| `run_max_batch_memory_microbench_qwen3_14b.sh` | Unified local max-batch-size search used for the Qwen3-14B memory microbenchmark, keeping only the final baselines and the DMI 2G configuration |
 
 ### Example Commands
 
@@ -149,6 +145,9 @@ bash experiments/offline_inference/run_prefill_backpressure_qwen3_4b.sh
 
 # TP microbenchmark
 bash experiments/offline_inference/run_tp_compile_sharegpt_qwen3_14b.sh
+
+# Max-batch memory microbenchmark
+bash experiments/offline_inference/run_max_batch_memory_microbench_qwen3_14b.sh
 
 # Storage ablation with ClickHouse on disk
 STORAGE_LABEL=disk PROJ_DMI_MODE=ring_db \
