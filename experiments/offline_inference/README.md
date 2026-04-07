@@ -64,10 +64,8 @@ These scripts run end-to-end batched generation on sampled ShareGPT/WildChat dat
 
 | Script | Purpose |
 |---|---|
-| `run_hook_count_sweep_qwen3_4b.sh` | Hook-count sweep across baselines |
-| `run_hook_count_dmi_20g_qwen3_4b.sh` | DMI-only hook-count sweep |
-| `run_prefill_backpressure_qwen3_4b.sh` | Request dropping / prefill backpressure study |
-| `run_prefill_backpressure_dmi_ring_sweep_qwen3_4b.sh` | DMI ring-size sweep for prefill backpressure |
+| `run_hook_count_sweep_qwen3_4b.sh` | Hook-count sweep across baselines, using the 20G DMI configuration used in the final figure |
+| `run_prefill_backpressure_qwen3_4b.sh` | Request dropping / prefill backpressure study, including the DMI ring-size and hook-selection sweep used for the final figure |
 | `run_tp_compile_sharegpt_qwen3_14b.sh` | TP=1/2/4 compile comparison for HF vs DMI on ShareGPT |
 
 ### Example Commands

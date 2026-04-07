@@ -6,6 +6,11 @@ offline_e2e_setup_local_env
 
 DATASET="${DATASET:-sharegpt}"
 RESULTS_DIR="${RESULTS_DIR:-experiments/offline_inference/results/hook_count_qwen3_4b_${DATASET}_$(date '+%Y%m%d_%H%M%S')}"
+DMI_RING_MB="${DMI_RING_MB:-20480}"
+DMI_RING_TASK_ENTRIES="${DMI_RING_TASK_ENTRIES:-131072}"
+DMI_DRAIN_FLUSH_PAYLOAD_RATIO="${DMI_DRAIN_FLUSH_PAYLOAD_RATIO:-0}"
+DMI_DRAIN_FLUSH_TASK_RATIO="${DMI_DRAIN_FLUSH_TASK_RATIO:-0}"
+DMI_DRAIN_FLUSH_TIMEOUT_US="${DMI_DRAIN_FLUSH_TIMEOUT_US:-200}"
 LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-1}"
 LOCAL_FLAG=()
 if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
@@ -43,6 +48,10 @@ for hook_sel in "${HOOK_SELECTIONS[@]}"; do
     --max-input-tokens "${MAX_INPUT}" --max-new-tokens "${MAX_OUTPUT}" \
     --limit 512 --pad-buckets "128,256,384,512" --capture-mode hs_logits \
     --results-dir "${RESULTS_DIR}" --hook-selection "${hook_sel}" \
-    --ring-payload-mb 40960 --ring-pinned-mb 40960 --ring-task-entries 131072 \
-    --drain-flush-payload-ratio 0.15 --drain-flush-task-ratio 0.15 "${LOCAL_FLAG[@]}" || true
+    --ring-payload-mb "${DMI_RING_MB}" --ring-pinned-mb "${DMI_RING_MB}" \
+    --ring-task-entries "${DMI_RING_TASK_ENTRIES}" \
+    --drain-flush-payload-ratio "${DMI_DRAIN_FLUSH_PAYLOAD_RATIO}" \
+    --drain-flush-task-ratio "${DMI_DRAIN_FLUSH_TASK_RATIO}" \
+    --drain-flush-timeout-us "${DMI_DRAIN_FLUSH_TIMEOUT_US}" \
+    "${LOCAL_FLAG[@]}" || true
 done
