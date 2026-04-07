@@ -60,22 +60,14 @@ These scripts run end-to-end batched generation on sampled ShareGPT/WildChat dat
 | `run_full_sweep_internal_hooks.sh` | Qwen internal-hook sweep (`q,k,v,z,mlp_in,mlp_out,resid_mid`) |
 | `run_full_sweep_internal_hooks_llama31_8b.sh` | Llama-3.1-8B internal-hook sweep |
 
-### Focused Ablations
-
-| Script | Purpose |
-|---|---|
-| `run_hook_count_sweep_qwen3_4b.sh` | Hook-count sweep across baselines, using the 20G DMI configuration used in the final figure |
-| `run_prefill_backpressure_qwen3_4b.sh` | Request dropping / prefill backpressure study, including the DMI ring-size and hook-selection sweep used for the final figure |
-| `run_tp_compile_sharegpt_qwen3_14b.sh` | TP=1/2/4 compile comparison for HF vs DMI on ShareGPT |
-
 ### Example Commands
 
 ```bash
 # Qwen hs+logits sweep
 bash experiments/offline_inference/run_full_sweep_hs_logits.sh
 
-# TP compile experiment
-bash experiments/offline_inference/run_tp_compile_sharegpt_qwen3_14b.sh
+# Llama hs+logits sweep
+bash experiments/offline_inference/run_full_sweep_hs_logits_llama31_8b.sh
 ```
 
 Most scripts support overriding `RESULTS_DIR`, `MODEL`, `DATASETS`, `BATCH_SIZES`, or other experiment-specific environment variables before invoking `bash`.
@@ -83,6 +75,24 @@ Most scripts support overriding `RESULTS_DIR`, `MODEL`, `DATASETS`, `BATCH_SIZES
 ## 2. Microbenchmark
 
 These scripts focus on phase-level timing rather than full offline sweeps.
+
+### Hook Count
+
+| Script | Purpose |
+|---|---|
+| `run_hook_count_sweep_qwen3_4b.sh` | Hook-count sweep across baselines, using the 20G DMI configuration used in the final figure |
+
+### Request Dropping / Prefill Backpressure
+
+| Script | Purpose |
+|---|---|
+| `run_prefill_backpressure_qwen3_4b.sh` | Request dropping / prefill backpressure study, including the DMI ring-size and hook-selection sweep used for the final figure |
+
+### Tensor Parallelism
+
+| Script | Purpose |
+|---|---|
+| `run_tp_compile_sharegpt_qwen3_14b.sh` | TP=1/2/4 compile comparison for HF vs DMI on ShareGPT |
 
 ### Step Breakdown
 
@@ -115,11 +125,30 @@ It is used to separate:
 - explicit ring flush time
 - downstream database insertion completion time
 
+### Max-Batch Memory Microbenchmark
+
+The max-batch-size experiment is currently not exposed as a top-level script. The older entrypoints are preserved in `archived/`:
+
+- `archived/run_max_batch_hs_logits_qwen3_14b.sh`
+- `archived/run_max_batch_hs_logits_qwen3_14b_compile_dmi.sh`
+- `archived/run_max_batch_hs_logits_qwen3_14b_dmi_eager.sh`
+
+These scripts correspond to the earlier max-batch memory study, but they are still cluster-specific and need consolidation before being restored as a primary local entrypoint.
+
 ### Example Commands
 
 ```bash
 # Step breakdown microbenchmark
 bash experiments/offline_inference/run_step_breakdown_microbench_qwen3_4b_local.sh
+
+# Hook-count microbenchmark
+bash experiments/offline_inference/run_hook_count_sweep_qwen3_4b.sh
+
+# Request dropping / prefill backpressure
+bash experiments/offline_inference/run_prefill_backpressure_qwen3_4b.sh
+
+# TP microbenchmark
+bash experiments/offline_inference/run_tp_compile_sharegpt_qwen3_14b.sh
 
 # Storage ablation with ClickHouse on disk
 STORAGE_LABEL=disk PROJ_DMI_MODE=ring_db \
