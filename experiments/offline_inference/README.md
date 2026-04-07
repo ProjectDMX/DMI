@@ -10,7 +10,8 @@ This directory contains the PyTorch/HuggingFace offline evaluation scripts used 
 ```text
 experiments/offline_inference/
   README.md
-  run_*.sh                 # user-facing local experiment entrypoints
+  offline_inference_*.sh   # user-facing end-to-end experiment entrypoints
+  microbenchmark_*.sh      # user-facing microbenchmark entrypoints
   scripts/                 # Python runners and internal helper scripts
   testing/                 # smoke tests and local test entrypoints
   archived/                # original sbatch/retry scripts kept for reference
@@ -51,54 +52,54 @@ The microbenchmark experiments use a smaller set of step-level baselines.
 
 These scripts run end-to-end batched generation on sampled ShareGPT/WildChat data and save JSON summaries.
 
-### Main End-to-End Sweeps
+### Main End-to-End Experiments
 
 | Script | Purpose |
 |---|---|
-| `run_full_sweep_hs_logits.sh` | Qwen `hs+logits` sweep |
-| `run_full_sweep_hs_logits_llama31_8b.sh` | Llama-3.1-8B `hs+logits` sweep |
-| `run_full_sweep_internal_hooks.sh` | Qwen internal-hook sweep (`q,k,v,z,mlp_in,mlp_out,resid_mid`) |
-| `run_full_sweep_internal_hooks_llama31_8b.sh` | Llama-3.1-8B internal-hook sweep |
+| `offline_inference_qwen_hs_logits.sh` | Qwen end-to-end comparison for the `hs+logits` setting |
+| `offline_inference_llama31_8b_hs_logits.sh` | Llama-3.1-8B end-to-end comparison for the `hs+logits` setting |
+| `offline_inference_qwen_internal_hooks.sh` | Qwen end-to-end comparison for the internal-hook setting (`q,k,v,z,mlp_in,mlp_out,resid_mid`) |
+| `offline_inference_llama31_8b_internal_hooks.sh` | Llama-3.1-8B end-to-end comparison for the internal-hook setting |
 
 ### Example Commands
 
 ```bash
-# Qwen hs+logits sweep
-bash experiments/offline_inference/run_full_sweep_hs_logits.sh
+# Qwen hs+logits end-to-end experiment
+bash experiments/offline_inference/offline_inference_qwen_hs_logits.sh
 
-# Llama hs+logits sweep
-bash experiments/offline_inference/run_full_sweep_hs_logits_llama31_8b.sh
+# Llama hs+logits end-to-end experiment
+bash experiments/offline_inference/offline_inference_llama31_8b_hs_logits.sh
 ```
 
 Most scripts support overriding `RESULTS_DIR`, `MODEL`, `DATASETS`, `BATCH_SIZES`, or other experiment-specific environment variables before invoking `bash`.
 
 ## 2. Microbenchmark
 
-These scripts focus on phase-level timing rather than full offline sweeps.
+These scripts focus on phase-level timing and targeted ablations rather than the main end-to-end runs.
 
 ### Hook Count
 
 | Script | Purpose |
 |---|---|
-| `run_hook_count_sweep_qwen3_4b.sh` | Hook-count sweep across baselines, using the 20G DMI configuration used in the final figure |
+| `microbenchmark_hook_count_qwen3_4b.sh` | Hook-count comparison across baselines, using the 20G DMI configuration used in the final figure |
 
 ### Request Dropping / Prefill Backpressure
 
 | Script | Purpose |
 |---|---|
-| `run_prefill_backpressure_qwen3_4b.sh` | Request dropping / prefill backpressure study, including the DMI ring-size and hook-selection sweep used for the final figure |
+| `microbenchmark_prefill_backpressure_qwen3_4b.sh` | Request dropping / prefill backpressure study, including the DMI ring-size and hook-selection configurations used for the final figure |
 
 ### Tensor Parallelism
 
 | Script | Purpose |
 |---|---|
-| `run_tp_compile_sharegpt_qwen3_14b.sh` | TP=1/2/4 compile comparison for HF vs DMI on ShareGPT |
+| `microbenchmark_tp_compile_qwen3_14b.sh` | TP=1/2/4 compile comparison for HF vs DMI on ShareGPT |
 
 ### Step Breakdown
 
 | Script | Purpose |
 |---|---|
-| `run_step_breakdown_microbench_qwen3_4b_local.sh` | Main local step-breakdown microbenchmark for Qwen3-4B |
+| `microbenchmark_step_breakdown_qwen3_4b.sh` | Main local step-breakdown microbenchmark for Qwen3-4B |
 
 The default step-breakdown workload is:
 
@@ -111,7 +112,7 @@ The default step-breakdown workload is:
 
 | Script | Purpose |
 |---|---|
-| `run_ring_db_storage_e2e_qwen3_4b_local.sh` | Ring storage ablation (`ring_null` vs `ring_db`, disk vs `tmpfs`) |
+| `microbenchmark_storage_ablation_qwen3_4b.sh` | Ring storage ablation (`ring_null` vs `ring_db`, disk vs `tmpfs`) |
 
 This script measures three completion timestamps over a 10-batch run:
 
@@ -129,43 +130,43 @@ It is used to separate:
 
 | Script | Purpose |
 |---|---|
-| `run_max_batch_memory_microbench_qwen3_14b.sh` | Unified local max-batch-size search used for the Qwen3-14B memory microbenchmark, keeping only the final baselines and the DMI 2G configuration |
+| `microbenchmark_max_batch_memory_qwen3_14b.sh` | Unified local max-batch-size search used for the Qwen3-14B memory microbenchmark, keeping only the final baselines and the DMI 2G configuration |
 
 ### Example Commands
 
 ```bash
 # Step breakdown microbenchmark
-bash experiments/offline_inference/run_step_breakdown_microbench_qwen3_4b_local.sh
+bash experiments/offline_inference/microbenchmark_step_breakdown_qwen3_4b.sh
 
 # Hook-count microbenchmark
-bash experiments/offline_inference/run_hook_count_sweep_qwen3_4b.sh
+bash experiments/offline_inference/microbenchmark_hook_count_qwen3_4b.sh
 
 # Request dropping / prefill backpressure
-bash experiments/offline_inference/run_prefill_backpressure_qwen3_4b.sh
+bash experiments/offline_inference/microbenchmark_prefill_backpressure_qwen3_4b.sh
 
 # TP microbenchmark
-bash experiments/offline_inference/run_tp_compile_sharegpt_qwen3_14b.sh
+bash experiments/offline_inference/microbenchmark_tp_compile_qwen3_14b.sh
 
 # Max-batch memory microbenchmark
-bash experiments/offline_inference/run_max_batch_memory_microbench_qwen3_14b.sh
+bash experiments/offline_inference/microbenchmark_max_batch_memory_qwen3_14b.sh
 
 # Storage ablation with ClickHouse on disk
 STORAGE_LABEL=disk PROJ_DMI_MODE=ring_db \
-  bash experiments/offline_inference/run_ring_db_storage_e2e_qwen3_4b_local.sh
+  bash experiments/offline_inference/microbenchmark_storage_ablation_qwen3_4b.sh
 
 # Lower-bound control without DB insertion
 STORAGE_LABEL=disk PROJ_DMI_MODE=ring_null \
-  bash experiments/offline_inference/run_ring_db_storage_e2e_qwen3_4b_local.sh
+  bash experiments/offline_inference/microbenchmark_storage_ablation_qwen3_4b.sh
 ```
 
 ## Testing and Archived Scripts
 
 - `testing/`: smoke tests and local test entrypoints
 - `archived/`: original sbatch/retry scripts and older superseded entrypoints kept as references; these are not the primary local reproduction path
-- `scripts/`: Python runners plus internal shell helpers such as the sweep matrix drivers and step-breakdown dispatcher
+- `scripts/`: Python runners plus internal shell helpers such as the end-to-end matrix drivers and step-breakdown dispatcher
 
 ## Notes
 
-- The recommended local entrypoints are the top-level `run_*.sh` scripts in this directory.
+- The recommended local entrypoints are the top-level `offline_inference_*.sh` and `microbenchmark_*.sh` scripts in this directory.
 - The actual Python runners live in `scripts/`.
 - Existing sbatch files and older superseded scripts are preserved under `archived/` for reference only.
