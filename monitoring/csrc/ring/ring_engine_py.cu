@@ -71,6 +71,25 @@ void RingEnginePy::stop() {
 #endif
 }
 
+uint64_t RingEnginePy::flush_and_wait() {
+    return impl_->engine.drain_thread().force_flush_and_wait_timed();
+}
+
+RingFlushStats RingEnginePy::get_stats() const {
+    const ring::FlushStats native = impl_->engine.drain_thread().get_stats();
+    RingFlushStats stats{};
+    stats.pending_entries = native.pending_entries;
+    stats.pending_bytes = native.pending_bytes;
+    stats.cpu_payload_head = native.cpu_payload_head;
+    stats.cpu_payload_tail_committed = native.cpu_payload_tail_committed;
+    stats.total_flushes = native.total_flushes;
+    stats.last_flush_entries = native.last_flush_entries;
+    stats.last_flush_bytes = native.last_flush_bytes;
+    stats.last_flush_complete_monotonic_us = native.last_flush_complete_monotonic_us;
+    stats.last_force_flush_wait_us = native.last_force_flush_wait_us;
+    return stats;
+}
+
 void RingEnginePy::set_null_mode(bool enabled) {
     ring::set_ring_null_mode(enabled);
 }

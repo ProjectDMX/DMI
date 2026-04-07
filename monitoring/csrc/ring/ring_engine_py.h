@@ -49,6 +49,18 @@ using SubmitFn = std::function<void(
     int32_t            end_token,
     at::Tensor         slice)>;
 
+struct RingFlushStats {
+    uint64_t pending_entries{0};
+    uint64_t pending_bytes{0};
+    uint64_t cpu_payload_head{0};
+    uint64_t cpu_payload_tail_committed{0};
+    uint64_t total_flushes{0};
+    uint64_t last_flush_entries{0};
+    uint64_t last_flush_bytes{0};
+    uint64_t last_flush_complete_monotonic_us{0};
+    uint64_t last_force_flush_wait_us{0};
+};
+
 // Opaque RAII engine.
 class RingEnginePy {
 public:
@@ -61,6 +73,8 @@ public:
     void init(uint64_t stream_handle = 0);
     void start();
     void stop();
+    uint64_t flush_and_wait();
+    RingFlushStats get_stats() const;
 
     // Enable/disable null mode (same kernel launch, no ring writes).
     void set_null_mode(bool enabled);

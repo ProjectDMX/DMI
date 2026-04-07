@@ -37,6 +37,14 @@ test_gpu_mem_leak.py
 .DS_Store
 Thumbs.db
 
+# Runtime caches
+hook_bench_results/
+model.cache
+vllm_cache/
+hf_cache/
+trtllm_engines/
+.cache/
+
 # Large model files
 *.bin
 *.safetensors
@@ -46,6 +54,9 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints
+
+# Local experiment scratch
+exp/
 
 # Temporary files
 *.tmp
