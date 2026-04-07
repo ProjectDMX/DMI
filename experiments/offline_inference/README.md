@@ -55,7 +55,6 @@ These scripts run end-to-end batched generation on sampled ShareGPT/WildChat dat
 
 | Script | Purpose |
 |---|---|
-| `run_full_sweep.sh` | Main `hs` sweep for Qwen3-4B and Qwen3-14B across ShareGPT/WildChat |
 | `run_full_sweep_hs_logits.sh` | Qwen `hs+logits` sweep |
 | `run_full_sweep_hs_logits_llama31_8b.sh` | Llama-3.1-8B `hs+logits` sweep |
 | `run_full_sweep_internal_hooks.sh` | Qwen internal-hook sweep (`q,k,v,z,mlp_in,mlp_out,resid_mid`) |
@@ -85,9 +84,6 @@ These scripts run end-to-end batched generation on sampled ShareGPT/WildChat dat
 ### Example Commands
 
 ```bash
-# Main offline sweep
-bash experiments/offline_inference/run_full_sweep.sh
-
 # Qwen hs+logits sweep
 bash experiments/offline_inference/run_full_sweep_hs_logits.sh
 
@@ -105,8 +101,7 @@ These scripts focus on phase-level timing rather than full offline sweeps.
 
 | Script | Purpose |
 |---|---|
-| `run_step_breakdown_microbench_qwen3_4b.sh` | Main local step-breakdown microbenchmark for Qwen3-4B |
-| `run_step_breakdown_microbench_qwen3_4b_local.sh` | Single local wrapper for the same workload |
+| `run_step_breakdown_microbench_qwen3_4b_local.sh` | Main local step-breakdown microbenchmark for Qwen3-4B |
 | `run_step_breakdown_baseline.sh` | Baseline dispatcher for `hf_ideal`, `hf_api`, `torch_hooks`, and DMI variants |
 
 The default step-breakdown workload is:
@@ -138,7 +133,7 @@ It is used to separate:
 
 ```bash
 # Step breakdown microbenchmark
-bash experiments/offline_inference/run_step_breakdown_microbench_qwen3_4b.sh
+bash experiments/offline_inference/run_step_breakdown_microbench_qwen3_4b_local.sh
 
 # Storage ablation with ClickHouse on disk
 STORAGE_LABEL=disk PROJ_DMI_MODE=ring_db \
@@ -152,10 +147,10 @@ STORAGE_LABEL=disk PROJ_DMI_MODE=ring_null \
 ## Testing and Archived Scripts
 
 - `testing/`: smoke tests and local test entrypoints
-- `archived/`: original sbatch and retry scripts kept as references; these are not the primary local reproduction path
+- `archived/`: original sbatch/retry scripts and older superseded entrypoints kept as references; these are not the primary local reproduction path
 
 ## Notes
 
 - The recommended local entrypoints are the top-level `run_*.sh` scripts in this directory.
 - The actual Python runners live in `scripts/`.
-- Existing sbatch files are preserved under `archived/` for cluster reference only.
+- Existing sbatch files and older superseded scripts are preserved under `archived/` for reference only.
