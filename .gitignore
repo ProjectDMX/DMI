@@ -47,6 +47,9 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints
 
+# Local experiment scratch
+exp/
+
 # Temporary files
 *.tmp
 *.bak
