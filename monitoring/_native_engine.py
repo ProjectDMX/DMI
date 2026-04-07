@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Optional
+import importlib
 import importlib.util
+import importlib.machinery
 import glob
+import sys
 
 import torch
 
@@ -38,24 +41,49 @@ def _load_extension() -> Any:
     global _EXTENSION_MODULE
     if _EXTENSION_MODULE is not None:
         return _EXTENSION_MODULE
+    cached = sys.modules.get(_EXTENSION_NAME)
+    if cached is not None:
+        _EXTENSION_MODULE = cached
+        return _EXTENSION_MODULE
+
+    # Prefer the standard import path so Python picks the extension matching
+    # the current ABI and caches it in sys.modules exactly once.
+    try:
+        _EXTENSION_MODULE = importlib.import_module(_EXTENSION_NAME)
+        return _EXTENSION_MODULE
+    except Exception:
+        pass
 
     # JIT build is intentionally disabled for reproducibility/stability.
     # Only load an already-built extension from this repository tree.
     pkg_dir = Path(__file__).resolve().parent
     repo_root = pkg_dir.parent
-    candidates = []
-    candidates.extend(glob.glob(str(pkg_dir / f"{_EXTENSION_NAME}*.so")))
-    candidates.extend(glob.glob(str(repo_root / f"{_EXTENSION_NAME}*.so")))
+    suffixes = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+    seen_paths: set[Path] = set()
+    candidates: list[Path] = []
+    for base_dir in (repo_root, pkg_dir):
+        for suffix in suffixes:
+            so_path = (base_dir / f"{_EXTENSION_NAME}{suffix}").resolve()
+            if so_path.exists() and so_path not in seen_paths:
+                seen_paths.add(so_path)
+                candidates.append(so_path)
+        for so_path_str in glob.glob(str(base_dir / f"{_EXTENSION_NAME}*.so")):
+            so_path = Path(so_path_str).resolve()
+            if so_path.exists() and so_path not in seen_paths:
+                seen_paths.add(so_path)
+                candidates.append(so_path)
 
     for so_path in candidates:
         try:
             spec = importlib.util.spec_from_file_location(_EXTENSION_NAME, so_path)
             if spec and spec.loader:
                 module = importlib.util.module_from_spec(spec)
+                sys.modules[_EXTENSION_NAME] = module
                 spec.loader.exec_module(module)  # type: ignore[arg-type]
                 _EXTENSION_MODULE = module
                 return _EXTENSION_MODULE
         except Exception:
+            sys.modules.pop(_EXTENSION_NAME, None)
             # Continue searching other local candidates.
             pass
 

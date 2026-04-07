@@ -34,7 +34,8 @@ run_one() {
   echo "============================================================"
   echo "baseline=${baseline} bs=${BATCH_SIZE} repeat=${repeat_index}/${REPEATS} ${extra_args[*]:-}"
   echo "============================================================"
-  PYTHON_BIN="${PYTHON_BIN}" bash exp/offline_e2e/run_step_breakdown_baseline.sh "${baseline}" \
+  "${PYTHON_BIN}" exp/offline_e2e/run_step_breakdown_microbench.py \
+    --baseline "${baseline}" \
     --model "${MODEL}" \
     --batch-size "${BATCH_SIZE}" \
     --prefill-tokens "${PREFILL_TOKENS}" \
@@ -64,8 +65,8 @@ for repeat_index in $(seq 1 "${REPEATS}"); do
   run_one hf_ideal "${repeat_index}"
   run_one hf_api "${repeat_index}"
   run_one torch_hooks "${repeat_index}"
-  run_one proj_dmi_manual "${repeat_index}" --baseline-label proj_dmi_manual
-  run_one proj_dmi_manual "${repeat_index}" --disable-compile --baseline-label proj_dmi_manual_eager
+  run_one proj_dmi "${repeat_index}"
+  run_one proj_dmi "${repeat_index}" --disable-compile --baseline-label proj_dmi_eager
 done
 
 "${PYTHON_BIN}" - <<'PY' "${RESULTS_DIR}"
@@ -84,8 +85,7 @@ for path in sorted(results_dir.glob("*.json")):
     decode_seq = data.get("decode_sequence_total") or {}
     rows.append(
         {
-            "baseline": data.get("baseline_label", data["baseline"]),
-            "baseline_key": data["baseline"],
+            "baseline": data["baseline"],
             "baseline_label": data.get("baseline_label", data["baseline"]),
             "repeat_index": int(data.get("repeat_index", 1)),
             "prefill_compute_ms": float(data["prefill"]["compute_ms"]),

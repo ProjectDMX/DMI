@@ -214,7 +214,7 @@ build_command() {
             exit 1
             ;;
     esac
-    CMD=(python run_proj_dmi.py "${COMMON[@]}" --ring-payload-mb "${RING_MB}" --ring-pinned-mb "${RING_MB}" --ring-task-entries "${RING_TASK_ENTRIES}" --drain-flush-payload-ratio "${RING_FLUSH}" --drain-flush-task-ratio "${RING_FLUSH}")
+    CMD=(python scripts/run_proj_dmi.py "${COMMON[@]}" --ring-payload-mb "${RING_MB}" --ring-pinned-mb "${RING_MB}" --ring-task-entries "${RING_TASK_ENTRIES}" --drain-flush-payload-ratio "${RING_FLUSH}" --drain-flush-task-ratio "${RING_FLUSH}")
 }
 
 append_attempt() {

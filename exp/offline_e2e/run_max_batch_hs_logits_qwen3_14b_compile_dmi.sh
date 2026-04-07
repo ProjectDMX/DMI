@@ -217,22 +217,22 @@ build_command() {
     RING_MB=""
     case "${baseline}" in
         hf_upper_bound_compile)
-            CMD=(python run_hf_upper_bound.py "${COMMON[@]}")
+            CMD=(python scripts/run_hf_upper_bound.py "${COMMON[@]}")
             ;;
         torch_hooks_eager)
-            CMD=(python run_torch_hooks.py "${COMMON[@]}")
+            CMD=(python scripts/run_torch_hooks.py "${COMMON[@]}")
             ;;
         proj_dmi_compile_ring2g)
             RING_MB=2048
-            CMD=(python run_proj_dmi.py "${COMMON[@]}" --ring-payload-mb "${RING_MB}" --ring-pinned-mb "${RING_MB}" --ring-task-entries "${RING_TASK_ENTRIES}" --drain-flush-payload-ratio "${RING_FLUSH}" --drain-flush-task-ratio "${RING_FLUSH}")
+            CMD=(python scripts/run_proj_dmi.py "${COMMON[@]}" --ring-payload-mb "${RING_MB}" --ring-pinned-mb "${RING_MB}" --ring-task-entries "${RING_TASK_ENTRIES}" --drain-flush-payload-ratio "${RING_FLUSH}" --drain-flush-task-ratio "${RING_FLUSH}")
             ;;
         proj_dmi_compile_ring15g)
             RING_MB=15360
-            CMD=(python run_proj_dmi.py "${COMMON[@]}" --ring-payload-mb "${RING_MB}" --ring-pinned-mb "${RING_MB}" --ring-task-entries "${RING_TASK_ENTRIES}" --drain-flush-payload-ratio "${RING_FLUSH}" --drain-flush-task-ratio "${RING_FLUSH}")
+            CMD=(python scripts/run_proj_dmi.py "${COMMON[@]}" --ring-payload-mb "${RING_MB}" --ring-pinned-mb "${RING_MB}" --ring-task-entries "${RING_TASK_ENTRIES}" --drain-flush-payload-ratio "${RING_FLUSH}" --drain-flush-task-ratio "${RING_FLUSH}")
             ;;
         proj_dmi_compile_ring20g)
             RING_MB=20480
-            CMD=(python run_proj_dmi.py "${COMMON[@]}" --ring-payload-mb "${RING_MB}" --ring-pinned-mb "${RING_MB}" --ring-task-entries "${RING_TASK_ENTRIES}" --drain-flush-payload-ratio "${RING_FLUSH}" --drain-flush-task-ratio "${RING_FLUSH}")
+            CMD=(python scripts/run_proj_dmi.py "${COMMON[@]}" --ring-payload-mb "${RING_MB}" --ring-pinned-mb "${RING_MB}" --ring-task-entries "${RING_TASK_ENTRIES}" --drain-flush-payload-ratio "${RING_FLUSH}" --drain-flush-task-ratio "${RING_FLUSH}")
             ;;
         *)
             echo "Unknown baseline ${baseline}"
