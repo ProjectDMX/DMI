@@ -199,10 +199,12 @@ class DMXGPUWorker(Worker):
         self._dmx_null_mode_user = null_mode
         if null_mode:
             transport.null_offload = True
-        # null_mode defaults to ON (g_ring_null_mode = true in producer.cu).
-        # Warmup/profiling will fire producer kernels (needed for CUDA graph
-        # capture) but the kernel no-ops so the ring stays clean.
-        # Turned off after warmup in compile_or_warm_up_model.
+        # Enable null_mode for warmup/profiling: producer kernels fire (needed
+        # for CUDA graph capture) but no-op on the data path so the ring stays
+        # clean.  Turned off after warmup in compile_or_warm_up_model.
+        # set_null_mode internally does cudaDeviceSynchronize before/after to
+        # avoid racing with non-blocking compute streams.
+        ring_engine.set_null_mode(True)
         ring_transport.activate(transport)
 
         # Wrap model_runner for force_eager
@@ -285,16 +287,10 @@ class DMXGPUWorker(Worker):
         result = super().compile_or_warm_up_model()
 
         # Warmup done. Turn off null mode (unless user explicitly wants it).
-        # Sync first: warmup may have enqueued producer kernels on a
-        # non-blocking compute stream.  cudaMemcpyToSymbol goes through
-        # the legacy default stream which does NOT synchronize with
-        # non-blocking streams, so the memcpy could race with a pending
-        # producer kernel that still needs to read null_mode=true.
+        # set_null_mode internally does cudaDeviceSynchronize before/after
+        # to avoid racing with non-blocking compute streams.
         if not self._dmx_null_mode_user and self._dmx_ring_engine is not None:
-            import torch
-            torch.cuda.synchronize()
             self._dmx_ring_engine.set_null_mode(False)
-            torch.cuda.synchronize()
 
         return result
 

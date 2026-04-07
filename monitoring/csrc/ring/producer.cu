@@ -10,11 +10,7 @@
 
 namespace ring {
 
-// Default ON: no ring writes until explicitly turned off via set_null_mode(false).
-// This ensures warmup/profiling producer kernels are no-ops even if
-// cudaMemcpyToSymbol races with non-blocking compute streams (see
-// compile_or_warm_up_model in vllm_integration.py for details).
-__device__ bool g_ring_null_mode = true;
+__device__ bool g_ring_null_mode = false;
 
 // Counter for last-block-arrives pattern.  Reset by the last block after
 // publishing.  Safe without host-side reset because producers are serialized

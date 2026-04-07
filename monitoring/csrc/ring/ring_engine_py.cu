@@ -72,7 +72,13 @@ void RingEnginePy::stop() {
 }
 
 void RingEnginePy::set_null_mode(bool enabled) {
+    // cudaMemcpyToSymbol goes through the legacy default stream, which does
+    // NOT synchronize with PyTorch's non-blocking compute streams.  Sync
+    // before to drain pending producer kernels that need the old value,
+    // and after to ensure the new value is visible before the next launch.
+    cudaDeviceSynchronize();
     ring::set_ring_null_mode(enabled);
+    cudaDeviceSynchronize();
 }
 
 
