@@ -44,7 +44,6 @@ def main():
     print("[DEBUG] Model loaded")
 
     print("[DEBUG] Preparing monitoring for model...")
-    engine.prepare_for_model(model)
     print("[DEBUG] Monitoring prepared")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)

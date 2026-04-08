@@ -111,7 +111,7 @@ def _build_ingress_policy() -> EnqueuePolicy:
 
 
 def _build_host_config(db_cfg: ClickHouseClientConfig, *, debug: bool = False) -> HostEngineConfig:
-    # Stage 1: wait on BackendFuture + parse payloads
+    # Stage 1: process futures + parse payloads
     stage_one = StageConfig.process_future(parallelism=1, name="process_future", debug=bool(debug))
     # Stage 2: insert into ClickHouse
     stage_two = StageConfig.clickhouse_insert(db_cfg, parallelism=1, name="clickhouse_insert")
@@ -184,7 +184,6 @@ def main() -> None:
     )
     model.to(device).eval()
     model.monitoring_engine = engine
-    engine.prepare_for_model(model)
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token_id is None:

@@ -96,14 +96,9 @@ def _filter_specs(all_specs: List, engine: Any) -> List:
 
 
 def _install_monitoring_forward(model: Any) -> None:
-    """Install monitored_forward wrapper and (if possible) ring forward hooks."""
+    """Install monitored_forward wrapper and ring hook setup."""
     from . import ring_transport
 
-    # --- Forward hooks (legacy registration for _forward_hook_names) ---
-    # These register_forward_hook calls are no-ops for ring transport data
-    # capture.  The actual producer kernel is called inside HookPoint.forward()
-    # via torch.ops.ring.producer.  The hooks here only serve to populate
-    # transport._forward_hook_names so capture_tensor() skips those hooks.
     transport = ring_transport.get_active()
     if transport is not None and hasattr(model, "get_hook_specs"):
         # Auto-detect model shape if not already set
@@ -123,12 +118,9 @@ def _install_monitoring_forward(model: Any) -> None:
                 active_specs = ring_transport.apply_hook_selection(
                     active_specs, hook_selection, cfg=transport._model_cfg)
 
-            handles: List = []
-            ring_transport.install_ring_hooks(active_specs, handles)
+            ring_transport.install_ring_hooks(active_specs)
             transport._active_specs        = active_specs
             transport._using_forward_hooks = True
-            transport._forward_hook_names  = {s.hook_type for s in active_specs}
-            model._ring_hook_handles       = handles
 
             # Startup validation: warn if pinned staging < GPU ring
             try:
@@ -157,91 +149,15 @@ def _install_monitoring_forward(model: Any) -> None:
             # HookPoint.forward() calls ring::producer directly.
             return
 
-    # --- monitored_forward wrapper (legacy native backend only) ---
-    # Ring transport returns above.  This wrapper is only installed when
-    # using the legacy native backend (start_step/end_step lifecycle).
-    wrapper = getattr(model, "_monitoring_forward_wrapper", None)
-    current_forward = model.forward
-    if wrapper is not None and current_forward is wrapper:
-        return  # already installed
-
-    existing_orig = getattr(current_forward, "_monitoring_orig_forward", None)
-    if existing_orig is not None:
-        model._monitoring_orig_forward    = existing_orig
-        model._monitoring_forward_wrapper = current_forward
-        return
-
-    orig_forward = current_forward
-
-    @functools.wraps(orig_forward)
-    def monitored_forward(*f_args: Any, **f_kwargs: Any):
-        engine = getattr(model, "monitoring_engine", None)
-
-        # Phase detection (Python, outside compiled region)
-        phase = "prefill" if f_kwargs.get("past_key_values") is None else "decode"
-        try:
-            input_ids = f_kwargs.get("input_ids")
-            if (hasattr(input_ids, "dim")
-                    and int(input_ids.dim()) >= 2
-                    and int(input_ids.shape[1]) > 1):
-                phase = "prefill"
-        except Exception:
-            pass
-
-        if engine is not None:
-            engine.start_step(phase=phase)
-
-        try:
-            return orig_forward(*f_args, **f_kwargs)
-        finally:
-            if engine is not None:
-                engine.end_step()
-
-    try:
-        monitored_forward.__signature__ = inspect.signature(orig_forward)
-    except (TypeError, ValueError):
-        pass
-
-    monitored_forward._monitoring_orig_forward = orig_forward
-    model._monitoring_orig_forward             = orig_forward
-    model._monitoring_forward_wrapper          = monitored_forward
-    model._monitoring_had_instance_forward     = 'forward' in model.__dict__
-    model.forward                              = monitored_forward
-
 
 def _uninstall_monitoring_forward(model: Any) -> None:
-    """Remove ring forward hooks and restore original model.forward."""
+    """Reset ring transport state."""
     from . import ring_transport
 
-    # Remove register_forward_hook handles (legacy no-op hooks on submodules;
-    # see _make_ring_hook in ring_transport.py)
-    for h in getattr(model, "_ring_hook_handles", []):
-        try:
-            h.remove()
-        except Exception:
-            pass
-    model._ring_hook_handles = []
-
-    # Reset transport new-path state
     transport = ring_transport.get_active()
     if transport is not None:
         transport._using_forward_hooks = False
         transport._active_specs        = []
-        transport._forward_hook_names  = set()
-
-    # Restore original model.forward
-    orig = getattr(model, "_monitoring_orig_forward", None)
-    if orig is not None:
-        had_instance = getattr(model, "_monitoring_had_instance_forward", True)
-        if had_instance:
-            # Forward was an instance attr before (e.g. compiled) -- restore it
-            model.forward = orig
-        else:
-            # Forward was a class method -- delete instance attr so class MRO resumes
-            model.__dict__.pop('forward', None)
-        model._monitoring_orig_forward     = None
-        model._monitoring_forward_wrapper  = None
-        model.__dict__.pop('_monitoring_had_instance_forward', None)
 
 
 def _install_prepare_wrapper(model: Any) -> None:

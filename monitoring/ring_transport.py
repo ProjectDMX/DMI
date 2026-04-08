@@ -457,45 +457,18 @@ def _compute_hook_shape(
 # Forward-hook installation
 # ---------------------------------------------------------------------------
 
-def _make_ring_hook(hook_type: int, hook_id: int):
-    """Return a PyTorch register_forward_hook callable for a HookPoint.
+def install_ring_hooks(specs: List[HookSpec]) -> None:
+    """Set up HookPoints for ring transport.
 
-    Legacy / no-op: ring::producer is now called directly inside
-    HookPoint.forward() via torch.ops.ring.producer (C++ TORCH_LIBRARY,
-    captured in CUDA graph).  This hook is kept so _forward_hook_names
-    remains populated and capture_tensor() correctly skips hooks handled
-    by HookPoint.forward().  The actual GPU->ring data path is entirely
-    in the C++ producer kernel; these Python hooks are never invoked for
-    ring transport data capture.
-    """
-    def _hook(module: nn.Module, inp: Any, output: Any) -> None:
-        pass
-    return _hook
-
-
-def install_ring_hooks(specs: List[HookSpec], handles_out: List) -> None:
-    """Register ring producer forward hooks on each spec's module.
-
-    Legacy: these hooks are no-ops (see _make_ring_hook).  They exist only
-    to populate _forward_hook_names so capture_tensor() skips hooks that
-    HookPoint.forward() handles via torch.ops.ring.producer.
-
-    handles_out receives the RemovableHandle for each hook so callers
-    can remove them later via handle.remove().
+    Sets _name, _ring_hook_type, _ring_hook_id on each HookPoint so
+    HookPoint.forward() fires torch.ops.ring.producer.
     """
     for spec in specs:
         hp = spec.module
-        # Ensure HookPoint._name is set so forward() doesn't early-return.
-        # Also set _ring_hook_type/_ring_hook_id for the producer op.
         if hasattr(hp, '_name') and hp._name is None:
-            # Use hook_type_name for a descriptive name
             hp._name = f"hook_{spec.hook_type}_{spec.layer_no}"
             hp._ring_hook_type = spec.hook_type
             hp._ring_hook_id = spec.layer_no
-        handle = hp.register_forward_hook(
-            _make_ring_hook(spec.hook_type, spec.layer_no)
-        )
-        handles_out.append(handle)
 
 
 # ---------------------------------------------------------------------------
@@ -527,10 +500,8 @@ class RingTransport:
         self._current_dim0_offsets: Optional[List[int]] = None
         self._current_kv_offsets: Optional[List[int]] = None
 
-        # When True: push_meta / capture_tensor meta pushes are skipped so the
-        # FIFO stays empty.  ring_producer_op still calls _ring_engine.hook()
-        # (same kernel launch) so CUDA graph topology is identical to real mode.
-        # Toggle via _ring_engine.set_null_mode() to control device-side behavior.
+        # When True: meta pushes are skipped so the FIFO stays empty.
+        # Producer kernel still fires (for CUDA graph capture) but as no-ops.
         self.null_offload: bool = False
 
         # Shared path flag for ALL hooks.  Reset to False at the start of
@@ -543,10 +514,6 @@ class RingTransport:
         self._model_cfg: Optional[ModelShapeConfig] = None
         self._active_specs: List[HookSpec] = []
         self._using_forward_hooks: bool = False
-        # Names of hooks handled by register_forward_hook (populated at install time).
-        # capture_tensor() skips these; any HookPoint whose name is not in this set
-        # falls through to the legacy capture_tensor() path.
-        self._forward_hook_names: set = set()
 
         # When True, _prepare_wrapper skips prepare_step entirely --
         # all hooks use cpu_direct for the entire generate() call.

@@ -118,7 +118,6 @@ def main():
     )
     engine.enable_ring_transport(ring_cfg)
     model.monitoring_engine = engine
-    engine.prepare_for_model(model)
 
     gen_kwargs = dict(
         input_ids=input_ids,

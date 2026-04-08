@@ -539,12 +539,10 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
         model_id = f"bench::{mode}::{uuid.uuid4().hex[:8]}"
         engine = _make_null_engine(cfg, model_id)
         model.monitoring_engine = engine
-        engine.prepare_for_model(model)
     elif mode == "ring_db":
         model_id = f"bench::{mode}::{uuid.uuid4().hex[:8]}"
         engine = _make_db_engine(cfg, model_id)
         model.monitoring_engine = engine
-        engine.prepare_for_model(model)
     else:
         model.monitoring_engine = None
 

@@ -272,8 +272,7 @@ class DMXGPUWorker(Worker):
             # duplicate writes of identical unsharded data.
             active_specs = filter_by_tp_rank(active_specs, self._dmx_tp_rank)
 
-            handles: list = []
-            install_ring_hooks(active_specs, handles)
+            install_ring_hooks(active_specs)
             transport._active_specs = active_specs
             transport._using_forward_hooks = True
 

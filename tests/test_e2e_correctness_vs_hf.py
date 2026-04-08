@@ -396,7 +396,6 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
     mon_model = model_cls.from_pretrained(hf_model_id, attn_implementation="eager", torch_dtype=torch.float16)
     mon_model.to(device).eval()
     mon_model.monitoring_engine = engine
-    engine.prepare_for_model(mon_model)
 
     try:
         with torch.no_grad():
@@ -970,7 +969,6 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     mon_model.to(device).eval()
 
     mon_model.monitoring_engine = engine
-    engine.prepare_for_model(mon_model)
 
     try:
         from transformers import CompileConfig
@@ -1452,7 +1450,6 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
         hf_model_id, attn_implementation="eager", torch_dtype=torch.float16,
     ).to(device).eval()
     mon_model.monitoring_engine = engine
-    engine.prepare_for_model(mon_model)
 
     try:
         from transformers import CompileConfig

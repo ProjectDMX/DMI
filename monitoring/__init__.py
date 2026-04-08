@@ -2,7 +2,6 @@
 
 from .engine import MonitoringEngine, HostEngineConfig
 from .config import AdvanceConfig, CaptureSchedule, HookSelection, MonitoringConfig, NativePartialSealConfig
-from .task import CacheFuture, MonitoringTask
 
 _NATIVE_EXPORTS = (
     "StageConfig",
@@ -25,8 +24,6 @@ def __getattr__(name: str):
 __all__ = [
     "MonitoringEngine",
     "HostEngineConfig",
-    "MonitoringTask",
-    "CacheFuture",
     "CaptureSchedule",
     "HookSelection",
     "NativePartialSealConfig",
