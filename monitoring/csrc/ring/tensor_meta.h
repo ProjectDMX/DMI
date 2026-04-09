@@ -58,30 +58,31 @@ struct HookDef {
     const char* short_name;  // Python selection preset name
     bool        per_layer;   // true = "blocks.<L>.<act_name>", false = "<act_name>"
     const char* group;       // "attn", "mlp", or "other"
+    bool        tp_sharded;  // true = tensor is TP-sharded (pre-all-reduce)
 };
 
-//  id                      act_name                    short_name      per_layer  group
+//  id                      act_name                    short_name      per_layer  group    tp_sharded
 static constexpr HookDef HOOK_DEFS[] = {
-    {HOOK_TYPE_RESID_PRE,   "hook_resid_pre",           "resid_pre",    true,  "other"},
-    {HOOK_TYPE_LN1,         "hook_ln1",                 "ln1",          true,  "other"},
-    {HOOK_TYPE_ATTN_OUT,    "hook_attn_out",            "attn_out",     true,  "attn" },
-    {HOOK_TYPE_RESID_MID,   "hook_resid_mid",           "resid_mid",    true,  "other"},
-    {HOOK_TYPE_ATTN_SCORES, "attn.hook_attn_scores",    "attn_scores",  true,  "attn" },
-    {HOOK_TYPE_PATTERN,     "attn.hook_pattern",         "pattern",      true,  "attn" },
-    {HOOK_TYPE_Q,           "attn.hook_q",              "q",            true,  "attn" },
-    {HOOK_TYPE_K,           "attn.hook_k",              "k",            true,  "attn" },
-    {HOOK_TYPE_V,           "attn.hook_v",              "v",            true,  "attn" },
-    {HOOK_TYPE_Z,           "attn.hook_z",              "z",            true,  "attn" },
-    {HOOK_TYPE_LN2,         "hook_ln2",                 "ln2",          true,  "other"},
-    {HOOK_TYPE_MLP_IN,      "hook_mlp_in",              "mlp_in",       true,  "mlp"  },
-    {HOOK_TYPE_MLP_OUT,     "hook_mlp_out",             "mlp_out",      true,  "mlp"  },
-    {HOOK_TYPE_MLP_POST,    "hook_mlp_post",            "mlp_post",     true,  "mlp"  },
-    {HOOK_TYPE_RESID_FINAL, "hook_resid_final",         "resid_final",  false, "other"},
-    {HOOK_TYPE_EMBED,       "hook_embed",               "embed",        false, "other"},
-    {HOOK_TYPE_POS_EMBED,   "hook_pos_embed",           "pos_embed",    false, "other"},
-    {HOOK_TYPE_FINAL_LN,    "hook_final_ln",            "final_ln",     false, "other"},
-    {HOOK_TYPE_TOKEN_IDS,   "token_ids",                "token_ids",    false, "other"},
-    {HOOK_TYPE_FINAL_LOGITS,"final_logits",             "final_logits", false, "other"},
+    {HOOK_TYPE_RESID_PRE,   "hook_resid_pre",           "resid_pre",    true,  "other", false},
+    {HOOK_TYPE_LN1,         "hook_ln1",                 "ln1",          true,  "other", false},
+    {HOOK_TYPE_ATTN_OUT,    "hook_attn_out",            "attn_out",     true,  "attn",  false},
+    {HOOK_TYPE_RESID_MID,   "hook_resid_mid",           "resid_mid",    true,  "other", false},
+    {HOOK_TYPE_ATTN_SCORES, "attn.hook_attn_scores",    "attn_scores",  true,  "attn",  true },
+    {HOOK_TYPE_PATTERN,     "attn.hook_pattern",         "pattern",      true,  "attn",  true },
+    {HOOK_TYPE_Q,           "attn.hook_q",              "q",            true,  "attn",  true },
+    {HOOK_TYPE_K,           "attn.hook_k",              "k",            true,  "attn",  true },
+    {HOOK_TYPE_V,           "attn.hook_v",              "v",            true,  "attn",  true },
+    {HOOK_TYPE_Z,           "attn.hook_z",              "z",            true,  "attn",  true },
+    {HOOK_TYPE_LN2,         "hook_ln2",                 "ln2",          true,  "other", false},
+    {HOOK_TYPE_MLP_IN,      "hook_mlp_in",              "mlp_in",       true,  "mlp",   false},
+    {HOOK_TYPE_MLP_OUT,     "hook_mlp_out",             "mlp_out",      true,  "mlp",   false},
+    {HOOK_TYPE_MLP_POST,    "hook_mlp_post",            "mlp_post",     true,  "mlp",   true },
+    {HOOK_TYPE_RESID_FINAL, "hook_resid_final",         "resid_final",  false, "other", false},
+    {HOOK_TYPE_EMBED,       "hook_embed",               "embed",        false, "other", false},
+    {HOOK_TYPE_POS_EMBED,   "hook_pos_embed",           "pos_embed",    false, "other", false},
+    {HOOK_TYPE_FINAL_LN,    "hook_final_ln",            "final_ln",     false, "other", false},
+    {HOOK_TYPE_TOKEN_IDS,   "token_ids",                "token_ids",    false, "other", false},
+    {HOOK_TYPE_FINAL_LOGITS,"final_logits",             "final_logits", false, "other", false},
 };
 static constexpr int HOOK_DEFS_COUNT = sizeof(HOOK_DEFS) / sizeof(HOOK_DEFS[0]);
 
@@ -99,16 +100,16 @@ inline const char* hook_type_name(int hook_type) {
     return "unknown";
 }
 
-// True if this hook type produces TP-sharded tensors.
+// Auto-derived from HOOK_DEFS tp_sharded column.
 inline bool is_tp_sharded(int hook_type) {
-    switch (hook_type) {
-        case HOOK_TYPE_Q: case HOOK_TYPE_K: case HOOK_TYPE_V: case HOOK_TYPE_Z:
-        case HOOK_TYPE_ATTN_SCORES: case HOOK_TYPE_PATTERN:
-        case HOOK_TYPE_MLP_POST:
-            return true;
-        default:
-            return false;
+    static bool FLAGS[HOOK_TYPE_COUNT] = {};
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < HOOK_TYPE_COUNT; i++) FLAGS[i] = false;
+        for (int i = 0; i < HOOK_DEFS_COUNT; i++) FLAGS[HOOK_DEFS[i].id] = HOOK_DEFS[i].tp_sharded;
+        init = true;
     }
+    return hook_type >= 0 && hook_type < HOOK_TYPE_COUNT && FLAGS[hook_type];
 }
 
 // True if this hook type produces EP-sharded tensors (MoE expert computation).

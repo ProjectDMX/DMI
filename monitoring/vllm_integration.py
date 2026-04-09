@@ -82,26 +82,12 @@ def filter_by_pp_rank(specs: list, is_first_rank: bool, is_last_rank: bool) -> l
 # TP rank filtering — skip unsharded hooks on non-zero ranks
 # ---------------------------------------------------------------------------
 
-_TP_SHARDED_TYPES: set = set()  # populated lazily
-
-def _get_tp_sharded_types() -> set:
-    if not _TP_SHARDED_TYPES:
-        from .ring_transport import (
-            HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
-            HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN, HOOK_TYPE_MLP_POST,
-        )
-        _TP_SHARDED_TYPES.update({
-            HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
-            HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN, HOOK_TYPE_MLP_POST,
-        })
-    return _TP_SHARDED_TYPES
-
 def filter_by_tp_rank(specs: list, tp_rank: int) -> list:
     """On non-zero TP ranks, keep only sharded hooks to avoid N× duplicate
     writes of identical unsharded data.  Rank 0 keeps all hooks."""
     if tp_rank == 0:
         return specs
-    sharded = _get_tp_sharded_types()
+    from .ring_transport import TP_SHARDED_TYPES as sharded
     filtered = []
     for s in specs:
         if s.hook_type not in sharded:
