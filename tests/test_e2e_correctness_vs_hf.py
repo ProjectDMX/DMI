@@ -274,10 +274,8 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
 
     try:
         from monitoring import (  # type: ignore
-            AdvanceConfig,
             MonitoringConfig,
             MonitoringEngine,
-            NativePartialSealConfig,
         )
         from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
         from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
@@ -347,14 +345,6 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
     mon_cfg = MonitoringConfig(
         hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
-        native_partial_seal=NativePartialSealConfig(
-            enabled=True,
-            chunk_bytes=int(chunk_bytes),
-            cap_enabled=True,
-            cap_ratio=0.8,
-            driver_guard_mb=1024,
-        ),
-        advance=AdvanceConfig(),
     )
     if hasattr(mon_cfg, "eos_token_id"):
         mon_cfg.eos_token_id = eos_id
@@ -388,7 +378,7 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
 
     unique_run_model_id = f"e2e_correctness_hf::{uuid.uuid4().hex}"[:120]
     engine = MonitoringEngine(
-        async_enabled=True, config=mon_cfg, model_id=unique_run_model_id, db_config=host_cfg
+        config=mon_cfg, model_id=unique_run_model_id, db_config=host_cfg
     )
     engine.enable_ring_transport(ring_cfg)
 
@@ -864,10 +854,8 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
 
     try:
         from monitoring import (  # type: ignore
-            AdvanceConfig,
             MonitoringConfig,
             MonitoringEngine,
-            NativePartialSealConfig,
         )
         from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
         from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
@@ -925,14 +913,6 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     mon_cfg = MonitoringConfig(
         hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
-        native_partial_seal=NativePartialSealConfig(
-            enabled=True,
-            chunk_bytes=int(chunk_bytes),
-            cap_enabled=True,
-            cap_ratio=0.8,
-            driver_guard_mb=1024,
-        ),
-        advance=AdvanceConfig(),
     )
 
     db_cfg_native = ClickHouseClientConfig()
@@ -957,7 +937,7 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     # -----------------------------------------------------------------------
     unique_run_model_id = f"e2e_cuda_graphs::{uuid.uuid4().hex}"[:120]
     engine = MonitoringEngine(
-        async_enabled=True, config=mon_cfg,
+        config=mon_cfg,
         model_id=unique_run_model_id, db_config=host_cfg,
     )
     engine.enable_ring_transport(ring_cfg)
@@ -1367,10 +1347,8 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
 
     try:
         from monitoring import (  # type: ignore
-            AdvanceConfig,
             MonitoringConfig,
             MonitoringEngine,
-            NativePartialSealConfig,
         )
         from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
         from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
@@ -1413,11 +1391,6 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
     mon_cfg = MonitoringConfig(
         hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
-        native_partial_seal=NativePartialSealConfig(
-            enabled=True, chunk_bytes=int(chunk_bytes),
-            cap_enabled=True, cap_ratio=0.8, driver_guard_mb=1024,
-        ),
-        advance=AdvanceConfig(),
     )
 
     db_cfg_native = ClickHouseClientConfig()
@@ -1440,7 +1413,7 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
     # --- Monitored model (compiled, CUDA graphs) ---
     unique_run_model_id = f"e2e_cg_vs_eager::{uuid.uuid4().hex}"[:120]
     engine = MonitoringEngine(
-        async_enabled=True, config=mon_cfg,
+        config=mon_cfg,
         model_id=unique_run_model_id, db_config=host_cfg,
     )
     engine.enable_ring_transport(ring_cfg)

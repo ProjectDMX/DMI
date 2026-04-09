@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Literal, Optional, Sequence
+from typing import Iterable, Literal, Optional
 
 
 _ATTENTION_SUFFIXES = (
@@ -117,89 +117,10 @@ class CaptureSchedule:
 
 
 @dataclass
-class NativePartialSealConfig:
-    """Runtime controls for native partial-seal and memory-based backpressure."""
-
-    enabled: bool = True
-    chunk_bytes: int = 64 * 1024 * 1024
-    cap_enabled: bool = False
-    cap_ratio: float = 0.8
-    driver_guard_mb: int = 1024
-
-    def __post_init__(self) -> None:
-        if self.chunk_bytes < 0:
-            raise ValueError("chunk_bytes must be >= 0.")
-        if not (0.0 < self.cap_ratio <= 1.0):
-            raise ValueError("cap_ratio must be in (0, 1].")
-        if self.driver_guard_mb < 0:
-            raise ValueError("driver_guard_mb must be >= 0.")
-
-
-@dataclass
-class AdvanceConfig:
-    """Advanced native runtime controls."""
-
-    pinpool_bins_kb: Sequence[int] = (256, 512, 1024, 2048, 4096, 8192)
-    pinpool_max_mb: int = 512
-    host_copy_threads: int = 0
-    host_copy_queue_size: int = 512
-
-    def __post_init__(self) -> None:
-        bins = tuple(int(v) for v in self.pinpool_bins_kb if int(v) > 0)
-        if not bins:
-            raise ValueError("pinpool_bins_kb must contain at least one positive integer.")
-        if self.pinpool_max_mb <= 0:
-            raise ValueError("pinpool_max_mb must be > 0.")
-        if self.host_copy_threads < 0:
-            raise ValueError("host_copy_threads must be >= 0.")
-        if self.host_copy_queue_size <= 0:
-            raise ValueError("host_copy_queue_size must be > 0.")
-        self.pinpool_bins_kb = bins
-
-
-@dataclass
 class MonitoringConfig:
     """Bundle hook selection and capture schedule for the monitoring engine."""
 
     hooks: HookSelection = field(default_factory=HookSelection)
     schedule: CaptureSchedule = field(default_factory=CaptureSchedule)
-    native_partial_seal: NativePartialSealConfig = field(default_factory=NativePartialSealConfig)
-    advance: AdvanceConfig = field(default_factory=AdvanceConfig)
     debug: bool = False
     no_strip: bool = field(default=False)
-
-    def as_dict(self) -> dict[str, object]:
-        """Return a JSON-friendly representation for native backend handoff."""
-
-        return {
-            "hooks": {
-                "mode": self.hooks.mode,
-                "include": list(self.hooks.include) if self.hooks.include is not None else None,
-                "exclude": list(self.hooks.exclude) if self.hooks.exclude is not None else None,
-            },
-            "schedule": {
-                "step_stride": self.schedule.step_stride,
-                "step_offset": self.schedule.step_offset,
-                "warmup_steps": self.schedule.warmup_steps,
-                "capture_prefill": self.schedule.capture_prefill,
-                "capture_decode": self.schedule.capture_decode,
-                "request_stride": self.schedule.request_stride,
-                "request_offset": self.schedule.request_offset,
-                "warmup_requests": self.schedule.warmup_requests,
-            },
-            "native_partial_seal": {
-                "enabled": self.native_partial_seal.enabled,
-                "chunk_bytes": self.native_partial_seal.chunk_bytes,
-                "cap_enabled": self.native_partial_seal.cap_enabled,
-                "cap_ratio": self.native_partial_seal.cap_ratio,
-                "driver_guard_mb": self.native_partial_seal.driver_guard_mb,
-            },
-            "advance": {
-                "pinpool_bins_kb": list(self.advance.pinpool_bins_kb),
-                "pinpool_max_mb": self.advance.pinpool_max_mb,
-                "host_copy_threads": self.advance.host_copy_threads,
-                "host_copy_queue_size": self.advance.host_copy_queue_size,
-            },
-            "debug": bool(self.debug),
-            "no_strip": bool(self.no_strip),
-        }

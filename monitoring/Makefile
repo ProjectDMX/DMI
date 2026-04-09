@@ -2,9 +2,7 @@ PYTHON ?= python
 CXX ?= g++
 
 # Optional toggles
-#   UNIFIED=1  -> build single TU (csrc/unified.cpp) for maximum inlining
 #   LTO=1      -> enable link-time optimization (-flto)
-UNIFIED ?= 0
 LTO ?= 0
 
 TARGET := monitoring_native_backend
@@ -143,11 +141,6 @@ clean:
 	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET)
 
 # Overrides --------------------------------------------------------------
-ifeq ($(UNIFIED),1)
-SRCS := csrc/unified.cpp
-OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
-endif
-
 ifeq ($(LTO),1)
 CXXFLAGS += -flto
 LDFLAGS += -flto

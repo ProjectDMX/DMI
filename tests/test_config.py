@@ -457,73 +457,6 @@ class TestMonitoringConfigDefaults:
         assert config.schedule.step_stride == 4
 
 
-class TestMonitoringConfigAsDict:
-    """Tests for MonitoringConfig.as_dict() serialization."""
-
-    def test_as_dict_structure(self):
-        """as_dict() should return correct structure."""
-        config = MonitoringConfig()
-        result = config.as_dict()
-
-        assert "hooks" in result
-        assert "schedule" in result
-
-        hooks_dict = result["hooks"]
-        assert hooks_dict["mode"] == "full"
-        assert hooks_dict["include"] is None
-        assert hooks_dict["exclude"] is None
-
-        schedule_dict = result["schedule"]
-        assert schedule_dict["step_stride"] == 1
-        assert schedule_dict["step_offset"] == 0
-        assert schedule_dict["warmup_steps"] == 0
-        assert schedule_dict["capture_prefill"] is True
-        assert schedule_dict["capture_decode"] is True
-        assert schedule_dict["request_stride"] == 1
-        assert schedule_dict["request_offset"] == 0
-        assert schedule_dict["warmup_requests"] == 0
-
-    def test_as_dict_with_include_exclude(self):
-        """as_dict() should handle include/exclude lists."""
-        hooks = HookSelection(
-            mode="custom",
-            include=["hook_a", "hook_b"],
-            exclude=["hook_c"],
-        )
-        config = MonitoringConfig(hooks=hooks)
-        result = config.as_dict()
-
-        hooks_dict = result["hooks"]
-        assert hooks_dict["mode"] == "custom"
-        assert hooks_dict["include"] == ["hook_a", "hook_b"]
-        assert hooks_dict["exclude"] == ["hook_c"]
-
-    def test_as_dict_with_custom_schedule(self):
-        """as_dict() should serialize custom schedule values."""
-        schedule = CaptureSchedule(
-            step_stride=4,
-            step_offset=2,
-            warmup_steps=10,
-            capture_prefill=False,
-            capture_decode=True,
-            request_stride=5,
-            request_offset=1,
-            warmup_requests=3,
-        )
-        config = MonitoringConfig(schedule=schedule)
-        result = config.as_dict()
-
-        schedule_dict = result["schedule"]
-        assert schedule_dict["step_stride"] == 4
-        assert schedule_dict["step_offset"] == 2
-        assert schedule_dict["warmup_steps"] == 10
-        assert schedule_dict["capture_prefill"] is False
-        assert schedule_dict["capture_decode"] is True
-        assert schedule_dict["request_stride"] == 5
-        assert schedule_dict["request_offset"] == 1
-        assert schedule_dict["warmup_requests"] == 3
-
-
 # =============================================================================
 # Integration-style tests
 # =============================================================================
@@ -554,18 +487,3 @@ class TestConfigIntegration:
         assert config.schedule.should_capture_step(10, "decode") is True   # first capture
         assert config.schedule.should_capture_step(11, "decode") is False  # not on stride
         assert config.schedule.should_capture_step(14, "decode") is True   # second capture
-
-    def test_serialization_roundtrip_preserves_values(self):
-        """Serialized config should preserve all values."""
-        original = MonitoringConfig(
-            hooks=HookSelection(mode="mlp", exclude=["blocks.0.mlp.hook_mlp_in"]),
-            schedule=CaptureSchedule(step_stride=2, request_stride=3),
-        )
-
-        serialized = original.as_dict()
-
-        # Verify all values are preserved
-        assert serialized["hooks"]["mode"] == "mlp"
-        assert serialized["hooks"]["exclude"] == ["blocks.0.mlp.hook_mlp_in"]
-        assert serialized["schedule"]["step_stride"] == 2
-        assert serialized["schedule"]["request_stride"] == 3

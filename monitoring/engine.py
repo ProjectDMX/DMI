@@ -32,16 +32,11 @@ class MonitoringEngine:
     def __init__(
         self,
         *,
-        async_enabled: bool = True,
-        queue_size: int = 0,
-        cache_dtype: Optional[torch.dtype] = None,
-        delay_steps: int = 0,
         config: Optional[MonitoringConfig] = None,
         model_id: Optional[str] = None,
         host_engine: Optional[Any] = None,
         db_config: Optional[HostEngineConfig] = None,
     ) -> None:
-        # async_enabled, cache_dtype, delay_steps kept for API compat but unused.
         self.config = config
         self._debug_enabled = bool(self.config.debug) if self.config is not None else False
         self._nvtx_enabled = self._debug_enabled

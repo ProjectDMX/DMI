@@ -116,17 +116,8 @@ def main() -> None:
     cfg = MonitoringConfig(
         hooks=HookSelection(
             mode="full",
-            # include=['final_logits']
         ),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
-        native_partial_seal=NativePartialSealConfig(
-            enabled=True,
-            chunk_bytes=64 * 1024 * 1024,
-            cap_enabled=True,
-            cap_ratio=0.8,
-            driver_guard_mb=1024,
-        ),
-        advance=AdvanceConfig(host_copy_threads=0),
         debug=os.environ.get("BENCH_NVTX", "0") == "1",
     )
 
@@ -136,7 +127,6 @@ def main() -> None:
         host_cfg = _build_host_config(db_cfg, parallelism=args.ch_parallelism)
 
     engine = MonitoringEngine(
-        async_enabled=True,
         config=cfg,
         model_id=model_id,
         db_config=host_cfg,

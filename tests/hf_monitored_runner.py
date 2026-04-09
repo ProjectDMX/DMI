@@ -72,18 +72,13 @@ def main():
     ch_cfg.index_granularity = 8192
 
     # Monitoring config
-    from monitoring import MonitoringConfig, AdvanceConfig, NativePartialSealConfig
+    from monitoring import MonitoringConfig
     from monitoring.config import CaptureSchedule, HookSelection
 
     hook_mode = os.environ.get("E2E_HOOK_MODE", "full")
     mon_cfg = MonitoringConfig(
         hooks=HookSelection(mode=hook_mode),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
-        native_partial_seal=NativePartialSealConfig(
-            enabled=True, chunk_bytes=int(os.environ.get("E2E_CHUNK_BYTES", str(256 * 1024))),
-            cap_enabled=True, cap_ratio=0.8, driver_guard_mb=1024,
-        ),
-        advance=AdvanceConfig(),
     )
     if hasattr(mon_cfg, "eos_token_id"):
         mon_cfg.eos_token_id = eos_id
@@ -115,7 +110,7 @@ def main():
 
     unique_run_model_id = f"e2e_correctness_hf::{uuid.uuid4().hex}"[:120]
     engine = MonitoringEngine(
-        async_enabled=True, config=mon_cfg, model_id=unique_run_model_id, db_config=host_cfg
+        config=mon_cfg, model_id=unique_run_model_id, db_config=host_cfg
     )
     engine.enable_ring_transport(ring_cfg)
     model.monitoring_engine = engine

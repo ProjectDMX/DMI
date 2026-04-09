@@ -1,7 +1,7 @@
 """Monitoring engine package for asynchronous hook processing."""
 
 from .engine import MonitoringEngine, HostEngineConfig
-from .config import AdvanceConfig, CaptureSchedule, HookSelection, MonitoringConfig, NativePartialSealConfig
+from .config import CaptureSchedule, HookSelection, MonitoringConfig
 
 _NATIVE_EXPORTS = (
     "StageConfig",
@@ -25,8 +25,6 @@ __all__ = [
     "HostEngineConfig",
     "CaptureSchedule",
     "HookSelection",
-    "NativePartialSealConfig",
-    "AdvanceConfig",
     "MonitoringConfig",
     *_NATIVE_EXPORTS,
 ]

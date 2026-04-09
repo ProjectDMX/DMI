@@ -26,12 +26,11 @@ def main():
         debug=True,
     )
     engine = MonitoringEngine(
-        async_enabled=True,
         config=cfg,
         model_id=model_name,
         db_config=None,  # no-db mode
     )
-    print(f"[DEBUG] Engine created, using_native_backend={engine._using_native_backend}")
+    print("[DEBUG] Engine created")
 
     print("[DEBUG] Loading model...")
     model = HookedGPT2LMHeadModel.from_pretrained(

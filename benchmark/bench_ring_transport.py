@@ -153,23 +153,18 @@ def _make_ring_cfg(cfg: BenchConfig):
 
 
 def _make_monitoring_cfg(cfg: BenchConfig):
-    from monitoring import AdvanceConfig, MonitoringConfig, NativePartialSealConfig  # type: ignore
+    from monitoring import MonitoringConfig  # type: ignore
     from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
     return MonitoringConfig(
         hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
-        native_partial_seal=NativePartialSealConfig(
-            enabled=True, chunk_bytes=256 * 1024,  # native engine partial seal
-            cap_enabled=True, cap_ratio=0.8, driver_guard_mb=1024,
-        ),
-        advance=AdvanceConfig(),
     )
 
 
 def _make_null_engine(cfg: BenchConfig, model_id: str):
     from monitoring import MonitoringEngine  # type: ignore
     engine = MonitoringEngine(
-        async_enabled=True, config=_make_monitoring_cfg(cfg),
+        config=_make_monitoring_cfg(cfg),
         model_id=model_id, host_engine=_NullHostEngine(),
     )
     engine.enable_ring_transport(_make_ring_cfg(cfg))
@@ -198,7 +193,7 @@ def _make_db_engine(cfg: BenchConfig, model_id: str):
     q.high_watermark_size  = cfg.ch_queue_max_size_mb * 1024 * 1024
 
     engine = MonitoringEngine(
-        async_enabled=True, config=_make_monitoring_cfg(cfg),
+        config=_make_monitoring_cfg(cfg),
         model_id=model_id, db_config=HostEngineConfig(stages=[stage]),
     )
     engine.enable_ring_transport(_make_ring_cfg(cfg))
