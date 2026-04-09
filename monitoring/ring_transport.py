@@ -11,7 +11,7 @@ New CUDA-graph-compatible path (activated when model_shape + get_hook_specs are 
   - ModelShapeConfig + analytical shape computation (no warmup needed)
   - pre_push_all_metas called before orig_forward, outside compiled region
 
-Legacy path (HookPoint.forward -> capture_tensor) still works as a fallback.
+All transport now uses the CUDA-graph-compatible forward-hook path.
 """
 from __future__ import annotations
 
@@ -441,11 +441,8 @@ def install_ring_hooks(specs: List[HookSpec]) -> None:
 class RingTransport:
     """Manages ring engine + per-step batch context for ring-mode monitoring.
 
-    Two capture paths:
-      - New (CUDA-graph-compatible): install_ring_hooks + pre_push_all_metas.
-        Activated when _model_cfg is set and _using_forward_hooks is True.
-      - Legacy: capture_tensor() called from HookPoint.forward().
-        _using_forward_hooks=False makes capture_tensor active.
+    CUDA-graph-compatible path: install_ring_hooks + pre_push_all_metas.
+    Activated when _model_cfg is set and _using_forward_hooks is True.
     """
 
     def __init__(self, ring_engine: Any) -> None:

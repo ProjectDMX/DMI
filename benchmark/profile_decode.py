@@ -168,8 +168,7 @@ def run_profile():
     torch.cuda.synchronize()
     if ring_transport is not None:
         n_specs = len(ring_transport._active_specs)
-        n_forward_hooks = len(ring_transport._forward_hook_names)
-        print(f"  [debug] active_specs={n_specs}  forward_hook_names={n_forward_hooks}"
+        print(f"  [debug] active_specs={n_specs}"
               f"  using_forward_hooks={ring_transport._using_forward_hooks}")
     if ring_engine    is not None: ring_engine.set_null_mode(False)
     if ring_transport is not None: ring_transport.null_offload = False
