@@ -22,6 +22,8 @@ export TORCHINDUCTOR_CACHE_ROOT
 
 safe_clear_dir() {
     local dir_path=$1
+    local resolved_tmp_root
+    local resolved_dir_path
 
     case "${dir_path}" in
         ""|"/")
@@ -30,12 +32,26 @@ safe_clear_dir() {
             ;;
     esac
 
-    case "${dir_path}" in
-        "${TMP_ROOT}"|"${TMP_ROOT}"/*)
-            rm -rf "${dir_path}" 2>/dev/null
+    resolved_tmp_root="$(realpath "${TMP_ROOT}" 2>/dev/null || true)"
+    resolved_dir_path="$(realpath -m "${dir_path}" 2>/dev/null || true)"
+    if [ -z "${resolved_tmp_root}" ] || [ -z "${resolved_dir_path}" ]; then
+        echo "ERROR: unable to resolve safe delete paths under TMP_ROOT." >&2
+        exit 1
+    fi
+
+    case "${resolved_tmp_root}" in
+        ""|"/"|"."|"..")
+            echo "ERROR: refusing to use unsafe TMP_ROOT=${resolved_tmp_root}" >&2
+            exit 1
+            ;;
+    esac
+
+    case "${resolved_dir_path}" in
+        "${resolved_tmp_root}"|"${resolved_tmp_root}"/*)
+            rm -rf "${resolved_dir_path}" 2>/dev/null
             ;;
         *)
-            echo "ERROR: refusing to delete directory outside TMP_ROOT: ${dir_path}" >&2
+            echo "ERROR: refusing to delete directory outside TMP_ROOT: ${resolved_dir_path}" >&2
             exit 1
             ;;
     esac
