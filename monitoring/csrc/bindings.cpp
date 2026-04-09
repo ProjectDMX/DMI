@@ -10,7 +10,6 @@ namespace py = pybind11;
 #include "ring/ring_engine_py.h"
 #include "ring/ring_torch_op.h"
 #include "ring/tensor_meta.h"
-#include <ATen/cuda/CUDAContext.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // ---- Hook definitions (single source of truth from C++ HOOK_DEFS table) ----

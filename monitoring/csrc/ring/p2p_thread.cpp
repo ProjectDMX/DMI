@@ -196,7 +196,7 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     // Build act_name and resolve shard_rank from hook_type
     std::string act_name = make_act_name(meta.hook_type, meta.layer_no);
     int32_t shard_rank = resolve_shard_rank(meta.hook_type, *current_ctx_);
-    bool is_attn = ring_py::is_attn_hook(meta.hook_type);
+    bool is_attn = ring_py::is_attn_weight_matrix(meta.hook_type);
 
     const auto& requests = current_ctx_->requests;
     bool should_clone = cfg_.clone_slices && requests.size() > 1;

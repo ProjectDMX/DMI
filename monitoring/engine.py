@@ -39,7 +39,6 @@ class MonitoringEngine:
     ) -> None:
         self.config = config
         self._debug_enabled = bool(self.config.debug) if self.config is not None else False
-        self._nvtx_enabled = self._debug_enabled
         self._no_strip = False if config is None else config.no_strip
         self._sync_hook_debug_flag()
 
@@ -52,7 +51,6 @@ class MonitoringEngine:
 
         # Host-side DB engine (optional; C++ backend only)
         self._host_engine: Optional[Any] = None
-        self._host_engine_enabled = False
 
         self._ring_transport: Optional[Any] = None
 
@@ -84,7 +82,6 @@ class MonitoringEngine:
                         self._host_engine.start()
                 except Exception as exc:
                     raise RuntimeError("Failed to start host_engine") from exc
-                self._host_engine_enabled = True
 
 
     # ------------------------------------------------------------------
@@ -316,7 +313,6 @@ class MonitoringEngine:
             except Exception:
                 pass
             self._host_engine = None
-            self._host_engine_enabled = False
 
 
 # ---------------------------------------------------------------------------

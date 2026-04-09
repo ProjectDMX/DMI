@@ -119,8 +119,9 @@ inline bool is_ep_sharded(int hook_type) {
     return hook_type == HOOK_TYPE_MLP_IN || hook_type == HOOK_TYPE_MLP_OUT;
 }
 
-// True if this hook type is an attention weight matrix (scores/pattern).
-inline bool is_attn_hook(int hook_type) {
+// True if this hook type is an attention weight matrix (attn_scores or pattern).
+// These have shape [batch, heads, q_len, kv_len] — token dim is dim[-2], not dim[0].
+inline bool is_attn_weight_matrix(int hook_type) {
     return hook_type == HOOK_TYPE_ATTN_SCORES || hook_type == HOOK_TYPE_PATTERN;
 }
 
