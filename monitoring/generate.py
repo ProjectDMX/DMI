@@ -197,7 +197,7 @@ def _install_prepare_wrapper(model: Any) -> None:
         engine    = getattr(model, "monitoring_engine", None)
 
         if (engine is not None
-                and getattr(engine, "_using_ring_transport", False)
+                and engine._ring_transport is not None
                 and transport is not None
                 and transport._using_forward_hooks):
 
@@ -743,7 +743,7 @@ def _prepare_ring_forward(
     transport = ring_transport.get_active()
     if engine is None or transport is None:
         return
-    if not getattr(engine, "_using_ring_transport", False):
+    if not engine._ring_transport is not None:
         return
     if not transport._using_forward_hooks:
         return

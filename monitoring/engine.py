@@ -86,9 +86,6 @@ class MonitoringEngine:
                     raise RuntimeError("Failed to start host_engine") from exc
                 self._host_engine_enabled = True
 
-        # Stats (optional) --------------------------------------------------
-        # Fine-grained Python-side timings (ms)
-        self._last_prepare_ms = 0.0
 
     # ------------------------------------------------------------------
     # Ring transport API

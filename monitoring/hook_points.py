@@ -6,7 +6,6 @@ Helpers to access activations in models.
 """
 
 import logging
-from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -38,39 +37,6 @@ def set_monitoring_debug(enabled: bool) -> None:
 
 def _nvtx_enabled() -> bool:
     return bool(_MONITORING_DEBUG and _nvtx is not None)
-
-
-def _hook_stats_enabled() -> bool:
-    return bool(_MONITORING_DEBUG)
-
-# Global accumulators for lightweight hook-side profiling (microseconds)
-_hook_total_calls = 0
-
-# For synchronous path diagnostics
-_sync_build_us = 0.0
-_sync_move_us = 0.0
-_sync_remove_batch_us = 0.0
-_sync_slice_us = 0.0
-_sync_cache_set_us = 0.0
-_per_hook_sync_move_us = defaultdict(float)
-_per_hook_sync_build_us = defaultdict(float)
-_per_hook_sync_slice_us = defaultdict(float)
-
-def get_monitoring_hook_stats() -> dict:
-    """Return aggregated hook-side profiling stats (cheap to call)."""
-    return {
-        "total_calls": _hook_total_calls,
-        "sync_build_us": int(_sync_build_us),
-        "sync_move_us": int(_sync_move_us),
-        "sync_remove_batch_us": int(_sync_remove_batch_us),
-        "sync_slice_us": int(_sync_slice_us),
-        "sync_cache_set_us": int(_sync_cache_set_us),
-        "per_hook_top": {
-            "sync_build_us": sorted(_per_hook_sync_build_us.items(), key=lambda kv: -kv[1])[:10],
-            "sync_move_us": sorted(_per_hook_sync_move_us.items(), key=lambda kv: -kv[1])[:10],
-            "sync_slice_us": sorted(_per_hook_sync_slice_us.items(), key=lambda kv: -kv[1])[:10],
-        },
-    }
 
 
 @contextmanager
@@ -295,7 +261,6 @@ __all__ = [
     "HookFunction",
     "NamesFilter",
     "LensHandle",
-    "get_monitoring_hook_stats",
 ]
 class HookedRootModule(nn.Module):
     """A class building on nn.Module to interface nicely with HookPoints.
