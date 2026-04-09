@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -15,14 +14,12 @@ from .config import MonitoringConfig
 class HostEngineConfig:
     """Configuration wrapper for the native DMXHostEngine pipeline.
 
-    The DMXHostEngine lives in the native monitoring extension and is used to
-    post-process per-step BackendFuture objects (e.g. wait on them, then write
-    results to ClickHouse).
+    The DMXHostEngine is a single-stage ClickHouse insert pipeline that
+    receives pre-assembled rows from the ring transport drain thread.
 
     Notes:
-      - This path requires the native monitoring backend (CUDA +
-        monitoring_native_backend extension).
-      - The engine currently expects exactly **two** stages.
+      - Requires the native monitoring extension (CUDA + pybind11).
+      - Expects exactly **one** stage (clickhouse_insert).
     """
 
     stages: Sequence[Any]

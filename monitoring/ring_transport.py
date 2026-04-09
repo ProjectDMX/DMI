@@ -1,7 +1,6 @@
 """Ring-based GPU-to-CPU tensor transport for monitoring.
 
-Replaces NativeMonitoringEngine's pin-pool cudaMemcpy path with the ring
-producer/drain pipeline.  Tensor metadata is pushed to the C++ TensorMetaFifo
+Uses the ring producer/drain pipeline for GPU-to-CPU tensor transport.  Tensor metadata is pushed to the C++ TensorMetaFifo
 (via push_meta) before the producer kernel is launched, so the C++ callback
 thread can reconstruct and slice the tensor without ever touching Python or
 the GIL.
