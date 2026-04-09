@@ -9,6 +9,18 @@ if [ -z "${CLICKHOUSE_DATA_DIR}" ]; then
     exit 1
 fi
 
+if [ ! -d "${CLICKHOUSE_DATA_DIR}" ]; then
+    echo "ERROR: CLICKHOUSE_DATA_DIR does not exist or is not a directory: ${CLICKHOUSE_DATA_DIR}"
+    exit 1
+fi
+
+case "${CLICKHOUSE_DATA_DIR}" in
+    ""|"/")
+        echo "ERROR: refusing to operate on unsafe CLICKHOUSE_DATA_DIR=${CLICKHOUSE_DATA_DIR}"
+        exit 1
+        ;;
+esac
+
 echo "=== Stopping ClickHouse ==="
 sudo systemctl stop clickhouse-server
 sleep 2

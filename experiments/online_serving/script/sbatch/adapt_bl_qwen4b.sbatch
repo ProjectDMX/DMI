@@ -8,8 +8,8 @@
 #SBATCH --output=cur_sbatch_log/abl-qwen4b-%j.out
 #SBATCH --error=cur_sbatch_log/abl-qwen4b-%j.err
 
-WORK_ROOT=""
-cd ""
+WORK_ROOT="${WORK_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+cd "${WORK_ROOT}"
 
 ENV_PYTHON=$(pwd)/envs/vllm-h100/bin/python3.10
 SITE=$(pwd)/dmi-env/lib/python3.10/site-packages

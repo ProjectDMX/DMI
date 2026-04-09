@@ -8,8 +8,8 @@
 #SBATCH --output=cur_sbatch_log/ahk-qwen14b-%j.out
 #SBATCH --error=cur_sbatch_log/ahk-qwen14b-%j.err
 
-WORK_ROOT=""
-cd ""
+WORK_ROOT="${WORK_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+cd "${WORK_ROOT}"
 
 source vllm-hook-env/bin/activate
 export PYTHONPATH=$(pwd)/vllm-0.17.0:$PYTHONPATH
