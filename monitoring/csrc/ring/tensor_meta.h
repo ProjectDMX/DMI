@@ -16,7 +16,7 @@
 
 namespace ring_py {
 
-// Hook type integer constants (must match ring_transport.py HOOK_TYPE_* values).
+// Hook type integer constants (single source of truth; Python imports via pybind11).
 //
 // Removed (gaps in numbering are intentional):
 //   10 (RESULT):  removed, attn_out captures the same tensor (o_proj output).

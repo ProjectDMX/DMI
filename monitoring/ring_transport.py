@@ -48,27 +48,31 @@ from torch import nn
 # both on MoE.  For now, both are always captured when selected.
 # ---------------------------------------------------------------------------
 
-HOOK_TYPE_RESID_PRE   = 0
-HOOK_TYPE_LN1         = 1
-HOOK_TYPE_ATTN_OUT    = 2
-HOOK_TYPE_RESID_MID   = 3
-HOOK_TYPE_ATTN_SCORES = 4
-HOOK_TYPE_PATTERN     = 5
-HOOK_TYPE_Q           = 6
-HOOK_TYPE_K           = 7
-HOOK_TYPE_V           = 8
-HOOK_TYPE_Z           = 9
-# 10 removed (result == attn_out)
-HOOK_TYPE_LN2         = 11
-HOOK_TYPE_MLP_IN      = 12  # == LN2 for dense models; differs for MoE (post-router)
-HOOK_TYPE_MLP_OUT     = 13
-HOOK_TYPE_MLP_POST    = 20  # after activation, before down_proj (TransformerLens hook_post)
-HOOK_TYPE_RESID_FINAL = 14  # global: last layer's residual stream before final norm
-HOOK_TYPE_EMBED       = 15
-HOOK_TYPE_POS_EMBED   = 16
-HOOK_TYPE_FINAL_LN    = 17
-HOOK_TYPE_TOKEN_IDS   = 18
-HOOK_TYPE_FINAL_LOGITS = 19
+# Hook type constants — single source of truth is the C++ enum in tensor_meta.h.
+# Imported from the native extension at module load time.
+from ._native_engine import _load_extension as _load_ext
+_ht = _load_ext().hook_types
+HOOK_TYPE_RESID_PRE    = _ht.RESID_PRE
+HOOK_TYPE_LN1          = _ht.LN1
+HOOK_TYPE_ATTN_OUT     = _ht.ATTN_OUT
+HOOK_TYPE_RESID_MID    = _ht.RESID_MID
+HOOK_TYPE_ATTN_SCORES  = _ht.ATTN_SCORES
+HOOK_TYPE_PATTERN      = _ht.PATTERN
+HOOK_TYPE_Q            = _ht.Q
+HOOK_TYPE_K            = _ht.K
+HOOK_TYPE_V            = _ht.V
+HOOK_TYPE_Z            = _ht.Z
+HOOK_TYPE_LN2          = _ht.LN2
+HOOK_TYPE_MLP_IN       = _ht.MLP_IN
+HOOK_TYPE_MLP_OUT      = _ht.MLP_OUT
+HOOK_TYPE_MLP_POST     = _ht.MLP_POST
+HOOK_TYPE_RESID_FINAL  = _ht.RESID_FINAL
+HOOK_TYPE_EMBED        = _ht.EMBED
+HOOK_TYPE_POS_EMBED    = _ht.POS_EMBED
+HOOK_TYPE_FINAL_LN     = _ht.FINAL_LN
+HOOK_TYPE_TOKEN_IDS    = _ht.TOKEN_IDS
+HOOK_TYPE_FINAL_LOGITS = _ht.FINAL_LOGITS
+del _ht, _load_ext
 
 _HIDDEN_DIM_TYPES = frozenset({
     HOOK_TYPE_RESID_PRE, HOOK_TYPE_RESID_MID, HOOK_TYPE_RESID_FINAL,
@@ -237,8 +241,8 @@ _HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {
     "hook_embed":       HOOK_TYPE_EMBED,
     "hook_pos_embed":   HOOK_TYPE_POS_EMBED,
     "hook_final_ln":    HOOK_TYPE_FINAL_LN,
-    "token_ids":        18,
-    "final_logits":     19,
+    "token_ids":        HOOK_TYPE_TOKEN_IDS,
+    "final_logits":     HOOK_TYPE_FINAL_LOGITS,
 }
 
 
