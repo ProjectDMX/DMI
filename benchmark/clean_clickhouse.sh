@@ -1,19 +1,27 @@
 #!/bin/bash
 set -e
 
+CLICKHOUSE_DATA_DIR="${CLICKHOUSE_DATA_DIR:-$(clickhouse extract-from-config --key=path 2>/dev/null || true)}"
+
+if [ -z "${CLICKHOUSE_DATA_DIR}" ]; then
+    echo "ERROR: unable to detect ClickHouse data dir automatically."
+    echo "Set CLICKHOUSE_DATA_DIR to your ClickHouse data directory and retry."
+    exit 1
+fi
+
 echo "=== Stopping ClickHouse ==="
 sudo systemctl stop clickhouse-server
 sleep 2
 
-echo "=== Clearing /var/lib/clickhouse/ ==="
-sudo rm -rf /var/lib/clickhouse/*
+echo "=== Clearing ${CLICKHOUSE_DATA_DIR}/ ==="
+sudo rm -rf "${CLICKHOUSE_DATA_DIR}"/*
 
 echo "=== Verifying ==="
-if [ -z "$(ls -A /var/lib/clickhouse/)" ]; then
+if [ -z "$(ls -A "${CLICKHOUSE_DATA_DIR}/")" ]; then
     echo "Data directory is clean."
 else
     echo "WARNING: directory not empty!"
-    ls -la /var/lib/clickhouse/
+    ls -la "${CLICKHOUSE_DATA_DIR}/"
 fi
 
 echo "=== Restarting ClickHouse ==="

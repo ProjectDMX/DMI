@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-SCRATCH=/scratch/zt1/project/zaoxing-prj/user/ynn1999
+SCRATCH="${SCRATCH:-YOUR_SCRATCH_PATH}"
 PROJECT=${SCRATCH}/DMI/DMI
 
 bash "${PROJECT}/experiments/offline_inference/test_llama31_8b_smoke.sh"

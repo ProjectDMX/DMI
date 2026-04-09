@@ -10,7 +10,7 @@
 
 set -uo pipefail
 
-SCRATCH=/scratch/zt1/project/zaoxing-prj/user/ynn1999
+SCRATCH="${SCRATCH:-YOUR_SCRATCH_PATH}"
 PROJECT=${SCRATCH}/DMI/DMI
 
 SMOKE=1 bash "${PROJECT}/experiments/offline_inference/run_max_batch_hs_logits_qwen3_14b_compile_dmi.sh"

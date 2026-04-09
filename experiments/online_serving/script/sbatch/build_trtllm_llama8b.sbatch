@@ -10,7 +10,8 @@
 
 set -eo pipefail
 
-cd ~/scratch.zaoxing-prj
+WORK_ROOT=""
+cd ""
 
 NVIDIA_BASE=envs/trtllm/lib/python3.10/site-packages/nvidia
 NVIDIA_LIBS=$(find $NVIDIA_BASE -maxdepth 2 -name lib -type d ! -path "*/cu13/*" 2>/dev/null | paste -sd:)

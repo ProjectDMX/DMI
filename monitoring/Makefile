@@ -106,7 +106,7 @@ endif
 endif
 
 # ---- CUDA kernel compilation (nvcc) ----------------------------------------
-NVCC    ?= /usr/local/cuda/bin/nvcc
+NVCC    ?= $(shell command -v nvcc 2>/dev/null || printf '%s' nvcc)
 SM_ARCH ?= native
 
 NVCCFLAGS := \

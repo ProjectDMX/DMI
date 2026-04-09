@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 cd "${PROJECT_ROOT}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/nengneng/miniconda3/envs/proj-dmx/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python)}"
 GPU="${GPU:-1}"
 MODEL="${MODEL:-qwen3-4b}"
 BATCH_SIZE="${BATCH_SIZE:-64}"

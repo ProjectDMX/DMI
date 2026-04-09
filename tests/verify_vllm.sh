@@ -21,6 +21,9 @@
 set -e
 
 export VLLM_DISABLE_COMPILE_CACHE=1
+TMP_ROOT="${TMP_ROOT:-${PWD}/.tmp}"
+RUN_USER="${USER:-$(id -un 2>/dev/null || printf '%s' user)}"
+TORCHINDUCTOR_CACHE_ROOT="${TORCHINDUCTOR_CACHE_ROOT:-${TMP_ROOT}/torchinductor_${RUN_USER}}"
 
 run_test() {
     local model_name=$1
@@ -31,7 +34,8 @@ run_test() {
     local ring_mb=$6
 
     echo "=== $model_name $mode_name ring=${size_name} ==="
-    rm -rf /tmp/torchinductor_$(whoami)/ 2>/dev/null
+    mkdir -p "${TMP_ROOT}"
+    rm -rf "${TORCHINDUCTOR_CACHE_ROOT}" 2>/dev/null
     rm -rf ~/.cache/vllm/ 2>/dev/null
 
     E2E_MODEL=$model_key \
@@ -77,7 +81,8 @@ run_identical_test() {
     fi
 
     echo "=== $model_name identical check ($mode_name) ring=${ring_mb}MB ==="
-    rm -rf /tmp/torchinductor_$(whoami)/ 2>/dev/null
+    mkdir -p "${TMP_ROOT}"
+    rm -rf "${TORCHINDUCTOR_CACHE_ROOT}" 2>/dev/null
     rm -rf ~/.cache/vllm/ 2>/dev/null
 
     E2E_MODEL=$model_key \

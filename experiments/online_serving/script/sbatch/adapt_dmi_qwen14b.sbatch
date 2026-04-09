@@ -8,7 +8,8 @@
 #SBATCH --output=cur_sbatch_log/admi-qwen14b-%j.out
 #SBATCH --error=cur_sbatch_log/admi-qwen14b-%j.err
 
-cd ~/scratch.zaoxing-prj
+WORK_ROOT=""
+cd ""
 
 ENV_PYTHON=$(pwd)/envs/vllm-h100/bin/python3.10
 SITE=$(pwd)/dmi-env/lib/python3.10/site-packages

@@ -1,6 +1,6 @@
 ============================= test session starts ==============================
 platform linux -- Python 3.10.18, pytest-8.4.2, pluggy-1.5.0
-rootdir: /home/nengneng/AIPrometheus/HF_Prometheus
+rootdir: <repo-root>
 plugins: typeguard-4.4.4, jaxtyping-0.3.3, anyio-4.11.0
 collected 2 items
 

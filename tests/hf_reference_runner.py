@@ -6,7 +6,7 @@ _HFRef objects without loading a model.
 Accepts the same env vars as test_e2e_correctness_vs_hf.py for parity.
 
 Usage:
-    python tests/hf_reference_runner.py --output-dir /tmp/hf_ref
+    python tests/hf_reference_runner.py --output-dir ./tmp/hf_ref
 """
 import argparse
 import os

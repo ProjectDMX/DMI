@@ -3,7 +3,7 @@
 Activations go to ClickHouse. Saves metadata to disk for the comparator.
 
 Usage:
-    python -m tests.vllm_monitored_runner --output-dir /tmp/vllm_mon
+    python -m tests.vllm_monitored_runner --output-dir ./tmp/vllm_mon
 """
 import argparse
 import json

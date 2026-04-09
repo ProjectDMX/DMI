@@ -10,7 +10,8 @@
 
 set -eo pipefail
 
-cd ~/scratch.zaoxing-prj
+WORK_ROOT=""
+cd ""
 
 # LD_LIBRARY_PATH: MPI + nvidia libs, but use cublas13_only (no libcudart.so.13)
 NVIDIA_BASE=envs/trtllm/lib/python3.10/site-packages/nvidia

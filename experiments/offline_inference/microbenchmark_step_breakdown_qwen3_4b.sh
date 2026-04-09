@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 cd "${PROJECT_ROOT}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/nengneng/miniconda3/envs/proj-dmx/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python)}"
 GPU="${GPU:-1}"
 MODEL="${MODEL:-qwen3-4b}"
 RESULTS_ROOT="${RESULTS_ROOT:-experiments/offline_inference/results/step_breakdown_qwen3_4b_local}"

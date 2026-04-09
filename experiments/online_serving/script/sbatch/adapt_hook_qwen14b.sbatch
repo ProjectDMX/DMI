@@ -8,7 +8,8 @@
 #SBATCH --output=cur_sbatch_log/ahk-qwen14b-%j.out
 #SBATCH --error=cur_sbatch_log/ahk-qwen14b-%j.err
 
-cd ~/scratch.zaoxing-prj
+WORK_ROOT=""
+cd ""
 
 source vllm-hook-env/bin/activate
 export PYTHONPATH=$(pwd)/vllm-0.17.0:$PYTHONPATH

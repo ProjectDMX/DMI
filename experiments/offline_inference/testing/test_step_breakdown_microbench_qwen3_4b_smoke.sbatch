@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-SCRATCH=/scratch/zt1/project/zaoxing-prj/user/ynn1999
+SCRATCH="${SCRATCH:-YOUR_SCRATCH_PATH}"
 ENV_DIR=${SCRATCH}/proj-dmx
 PROJECT=${SCRATCH}/DMI
 
@@ -57,7 +57,9 @@ HOOK_SELECTION="hidden-states,final_ln,logits"
 RESULTS_DIR="${PROJECT}/experiments/offline_inference/results/step_breakdown_smoke_$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
 mkdir -p "${RESULTS_DIR}"
 
-LOCAL_NVME_HF="/tmp/${USER}_hf_cache_${SLURM_JOB_ID}"
+TMP_ROOT="${TMP_ROOT:-${PWD}/.tmp}"
+mkdir -p "${TMP_ROOT}"
+LOCAL_NVME_HF="${TMP_ROOT}/${USER}_hf_cache_${SLURM_JOB_ID}"
 LOCAL_HF="${LOCAL_NVME_HF}"
 CLEANUP_DIR="${LOCAL_NVME_HF}"
 mkdir -p "${LOCAL_NVME_HF}/hub"

@@ -73,7 +73,7 @@ Timing results (decode duration per run):
 ...
 
 Profiler traces written under:
-  /home/user/HF_Prometheus/results/my_profile_run
+  results/my_profile_run
 ```
 
 ⚠️ Note: The wallclock times include profiler overhead and are **NOT** comparable to `--no-profile` runs.
