@@ -48,31 +48,27 @@ from torch import nn
 # both on MoE.  For now, both are always captured when selected.
 # ---------------------------------------------------------------------------
 
-# Hook type constants — single source of truth is the C++ enum in tensor_meta.h.
-# Imported from the native extension at module load time.
+# ---------------------------------------------------------------------------
+# Hook type constants — single source of truth is HOOK_DEFS in tensor_meta.h.
+# All mappings are auto-derived from the C++ table at import time.
+# To add a new hook: add one enum value + one HOOK_DEFS row in C++. Done.
+# ---------------------------------------------------------------------------
 from ._native_engine import _load_extension as _load_ext
-_ht = _load_ext().hook_types
-HOOK_TYPE_RESID_PRE    = _ht.RESID_PRE
-HOOK_TYPE_LN1          = _ht.LN1
-HOOK_TYPE_ATTN_OUT     = _ht.ATTN_OUT
-HOOK_TYPE_RESID_MID    = _ht.RESID_MID
-HOOK_TYPE_ATTN_SCORES  = _ht.ATTN_SCORES
-HOOK_TYPE_PATTERN      = _ht.PATTERN
-HOOK_TYPE_Q            = _ht.Q
-HOOK_TYPE_K            = _ht.K
-HOOK_TYPE_V            = _ht.V
-HOOK_TYPE_Z            = _ht.Z
-HOOK_TYPE_LN2          = _ht.LN2
-HOOK_TYPE_MLP_IN       = _ht.MLP_IN
-HOOK_TYPE_MLP_OUT      = _ht.MLP_OUT
-HOOK_TYPE_MLP_POST     = _ht.MLP_POST
-HOOK_TYPE_RESID_FINAL  = _ht.RESID_FINAL
-HOOK_TYPE_EMBED        = _ht.EMBED
-HOOK_TYPE_POS_EMBED    = _ht.POS_EMBED
-HOOK_TYPE_FINAL_LN     = _ht.FINAL_LN
-HOOK_TYPE_TOKEN_IDS    = _ht.TOKEN_IDS
-HOOK_TYPE_FINAL_LOGITS = _ht.FINAL_LOGITS
-del _ht, _load_ext
+_ext = _load_ext()
+_HOOK_DEFS = _ext.HOOK_DEFS  # list of (id, act_name, short_name, per_layer)
+
+# Auto-derive all mappings
+_id_by_short: Dict[str, int] = {}       # "q" → 6
+_act_name_by_id: Dict[int, str] = {}    # 6 → "attn.hook_q"
+_short_by_id: Dict[int, str] = {}       # 6 → "q"
+for _id, _act, _short, _pl in _HOOK_DEFS:
+    _id_by_short[_short] = _id
+    _act_name_by_id[_id] = _act
+    _short_by_id[_id] = _short
+    # Inject HOOK_TYPE_Q, HOOK_TYPE_RESID_PRE, etc. into module namespace
+    globals()[f"HOOK_TYPE_{_short.upper()}"] = _id
+
+del _ext, _load_ext
 
 _HIDDEN_DIM_TYPES = frozenset({
     HOOK_TYPE_RESID_PRE, HOOK_TYPE_RESID_MID, HOOK_TYPE_RESID_FINAL,
@@ -96,14 +92,7 @@ _HIDDEN_DIM_TYPES = frozenset({
 #   "resid_pre,resid_final,embed"     -- just those three
 # ---------------------------------------------------------------------------
 
-_ALL_HOOK_TYPES = frozenset({
-    HOOK_TYPE_RESID_PRE, HOOK_TYPE_LN1, HOOK_TYPE_ATTN_OUT,
-    HOOK_TYPE_RESID_MID, HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN,
-    HOOK_TYPE_Q, HOOK_TYPE_K, HOOK_TYPE_V, HOOK_TYPE_Z,
-    HOOK_TYPE_LN2, HOOK_TYPE_MLP_IN, HOOK_TYPE_MLP_POST, HOOK_TYPE_MLP_OUT,
-    HOOK_TYPE_RESID_FINAL, HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED,
-    HOOK_TYPE_FINAL_LN, HOOK_TYPE_TOKEN_IDS, HOOK_TYPE_FINAL_LOGITS,
-})
+_ALL_HOOK_TYPES = frozenset(_id_by_short.values())
 
 # -- Presets --
 _HOOK_SELECTIONS: Dict[str, frozenset] = {
@@ -122,30 +111,8 @@ _HOOK_SELECTIONS: Dict[str, frozenset] = {
     }),
 }
 
-# -- Individual hook type names (each maps to a single-element frozenset) --
-_HOOK_TYPE_BY_NAME: Dict[str, int] = {
-    "resid_pre":   HOOK_TYPE_RESID_PRE,
-    "ln1":         HOOK_TYPE_LN1,
-    "attn_out":    HOOK_TYPE_ATTN_OUT,
-    "resid_mid":   HOOK_TYPE_RESID_MID,
-    "attn_scores": HOOK_TYPE_ATTN_SCORES,
-    "pattern":     HOOK_TYPE_PATTERN,
-    "q":           HOOK_TYPE_Q,
-    "k":           HOOK_TYPE_K,
-    "v":           HOOK_TYPE_V,
-    "z":           HOOK_TYPE_Z,
-    "ln2":         HOOK_TYPE_LN2,
-    "mlp_in":      HOOK_TYPE_MLP_IN,
-    "mlp_out":     HOOK_TYPE_MLP_OUT,
-    "mlp_post":    HOOK_TYPE_MLP_POST,
-    "resid_final":  HOOK_TYPE_RESID_FINAL,
-    "embed":       HOOK_TYPE_EMBED,
-    "pos_embed":   HOOK_TYPE_POS_EMBED,
-    "final_ln":    HOOK_TYPE_FINAL_LN,
-    "token_ids":   HOOK_TYPE_TOKEN_IDS,
-    "final_logits": HOOK_TYPE_FINAL_LOGITS,
-}
-for _name, _htype in _HOOK_TYPE_BY_NAME.items():
+# -- Individual hook type names (auto-derived from HOOK_DEFS) --
+for _name, _htype in _id_by_short.items():
     _HOOK_SELECTIONS[_name] = frozenset({_htype})
 
 # -- Aliases --
@@ -219,31 +186,11 @@ def apply_hook_selection(
 
 
 # ---------------------------------------------------------------------------
-# Hook-name -> (hook_type, hook_id) helpers  (legacy path)
+# Hook-name -> hook_type helpers (auto-derived from HOOK_DEFS act_name)
 # ---------------------------------------------------------------------------
 
-_HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {
-    "hook_resid_pre":   HOOK_TYPE_RESID_PRE,
-    "hook_ln1":         HOOK_TYPE_LN1,
-    "hook_attn_out":    HOOK_TYPE_ATTN_OUT,
-    "hook_resid_mid":   HOOK_TYPE_RESID_MID,
-    "hook_attn_scores": HOOK_TYPE_ATTN_SCORES,
-    "hook_pattern":     HOOK_TYPE_PATTERN,
-    "hook_q":           HOOK_TYPE_Q,
-    "hook_k":           HOOK_TYPE_K,
-    "hook_v":           HOOK_TYPE_V,
-    "hook_z":           HOOK_TYPE_Z,
-    "hook_ln2":         HOOK_TYPE_LN2,
-    "hook_mlp_in":      HOOK_TYPE_MLP_IN,
-    "hook_mlp_out":     HOOK_TYPE_MLP_OUT,
-    "hook_mlp_post":    HOOK_TYPE_MLP_POST,
-    "hook_resid_final": HOOK_TYPE_RESID_FINAL,
-    "hook_embed":       HOOK_TYPE_EMBED,
-    "hook_pos_embed":   HOOK_TYPE_POS_EMBED,
-    "hook_final_ln":    HOOK_TYPE_FINAL_LN,
-    "token_ids":        HOOK_TYPE_TOKEN_IDS,
-    "final_logits":     HOOK_TYPE_FINAL_LOGITS,
-}
+# act_name is the suffix used in HookPoint names (e.g. "attn.hook_q", "token_ids")
+_HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {_act: _id for _id, _act, _short, _pl in _HOOK_DEFS}
 
 
 def align_up_py(x: int, a: int) -> int:

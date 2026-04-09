@@ -13,29 +13,18 @@ namespace py = pybind11;
 #include <ATen/cuda/CUDAContext.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  // ---- Hook type constants (single source of truth from C++ enum) ----
-  auto ht = m.def_submodule("hook_types", "Hook type integer constants");
-  ht.attr("RESID_PRE")    = (int)ring_py::HOOK_TYPE_RESID_PRE;
-  ht.attr("LN1")          = (int)ring_py::HOOK_TYPE_LN1;
-  ht.attr("ATTN_OUT")     = (int)ring_py::HOOK_TYPE_ATTN_OUT;
-  ht.attr("RESID_MID")    = (int)ring_py::HOOK_TYPE_RESID_MID;
-  ht.attr("ATTN_SCORES")  = (int)ring_py::HOOK_TYPE_ATTN_SCORES;
-  ht.attr("PATTERN")      = (int)ring_py::HOOK_TYPE_PATTERN;
-  ht.attr("Q")            = (int)ring_py::HOOK_TYPE_Q;
-  ht.attr("K")            = (int)ring_py::HOOK_TYPE_K;
-  ht.attr("V")            = (int)ring_py::HOOK_TYPE_V;
-  ht.attr("Z")            = (int)ring_py::HOOK_TYPE_Z;
-  ht.attr("LN2")          = (int)ring_py::HOOK_TYPE_LN2;
-  ht.attr("MLP_IN")       = (int)ring_py::HOOK_TYPE_MLP_IN;
-  ht.attr("MLP_OUT")      = (int)ring_py::HOOK_TYPE_MLP_OUT;
-  ht.attr("RESID_FINAL")  = (int)ring_py::HOOK_TYPE_RESID_FINAL;
-  ht.attr("EMBED")        = (int)ring_py::HOOK_TYPE_EMBED;
-  ht.attr("POS_EMBED")    = (int)ring_py::HOOK_TYPE_POS_EMBED;
-  ht.attr("FINAL_LN")     = (int)ring_py::HOOK_TYPE_FINAL_LN;
-  ht.attr("TOKEN_IDS")    = (int)ring_py::HOOK_TYPE_TOKEN_IDS;
-  ht.attr("FINAL_LOGITS") = (int)ring_py::HOOK_TYPE_FINAL_LOGITS;
-  ht.attr("MLP_POST")     = (int)ring_py::HOOK_TYPE_MLP_POST;
-  ht.attr("COUNT")        = (int)ring_py::HOOK_TYPE_COUNT;
+  // ---- Hook definitions (single source of truth from C++ HOOK_DEFS table) ----
+  // Expose as list of (id, act_name, short_name, per_layer) tuples.
+  // Python auto-derives all mappings from this at import time.
+  {
+    py::list defs;
+    for (int i = 0; i < ring_py::HOOK_DEFS_COUNT; i++) {
+      const auto& d = ring_py::HOOK_DEFS[i];
+      defs.append(py::make_tuple(d.id, d.act_name, d.short_name, d.per_layer));
+    }
+    m.attr("HOOK_DEFS") = defs;
+    m.attr("HOOK_TYPE_COUNT") = (int)ring_py::HOOK_TYPE_COUNT;
+  }
   // ---- ClickHouseClientConfig (config only; stage is C++-only) ----
   py::class_<dmx_host::ClickHouseClientConfig>(m, "ClickHouseClientConfig")
       .def(py::init<>())

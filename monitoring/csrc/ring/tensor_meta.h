@@ -16,15 +16,17 @@
 
 namespace ring_py {
 
-// Hook type integer constants (single source of truth; Python imports via pybind11).
+// ---------------------------------------------------------------------------
+// Hook type definitions — single source of truth.
 //
-// Removed (gaps in numbering are intentional):
-//   10 (RESULT):  removed, attn_out captures the same tensor (o_proj output).
-//   resid_post:   removed (was per-layer).  Replaced by RESID_FINAL (global).
-//                 resid_post[i] == resid_pre[i+1] for all i < N-1.
+// The enum provides compile-time constants for switch/case.
+// HOOK_DEFS[] associates each enum value with its act_name (for ClickHouse),
+// short_name (for Python selection presets), and per_layer flag.
+// Python imports this table via pybind11 and auto-derives all mappings.
 //
-// Kept despite overlap:
-//   LN2 vs MLP_IN: identical for dense models, differs for MoE (post-router).
+// To add a new hook type: add one enum value + one HOOK_DEFS row.
+// ---------------------------------------------------------------------------
+
 enum HookType : int {
     HOOK_TYPE_RESID_PRE    = 0,
     HOOK_TYPE_LN1          = 1,
@@ -38,31 +40,61 @@ enum HookType : int {
     HOOK_TYPE_Z            = 9,
     // 10 removed (result == attn_out)
     HOOK_TYPE_LN2          = 11,
-    HOOK_TYPE_MLP_IN       = 12,  // == LN2 for dense; differs for MoE (post-router)
+    HOOK_TYPE_MLP_IN       = 12,
     HOOK_TYPE_MLP_OUT      = 13,
-    HOOK_TYPE_RESID_FINAL  = 14,  // global: last layer's residual before final norm
+    HOOK_TYPE_RESID_FINAL  = 14,
     HOOK_TYPE_EMBED        = 15,
     HOOK_TYPE_POS_EMBED    = 16,
     HOOK_TYPE_FINAL_LN     = 17,
     HOOK_TYPE_TOKEN_IDS    = 18,
     HOOK_TYPE_FINAL_LOGITS = 19,
-    HOOK_TYPE_MLP_POST     = 20,  // after activation, before down_proj (TransformerLens hook_post)
+    HOOK_TYPE_MLP_POST     = 20,
     HOOK_TYPE_COUNT        = 21,
 };
 
-// Hook type -> display name for ClickHouse act_name column.
-// Uses old-style paths so segment_merger and test code work unchanged.
-// Per-layer hooks use "blocks." prefix; make_act_name prepends "blocks.<L>.".
+struct HookDef {
+    int         id;          // enum value
+    const char* act_name;    // ClickHouse act_name (p2p_thread uses this)
+    const char* short_name;  // Python selection preset name
+    bool        per_layer;   // true = "blocks.<L>.<act_name>", false = "<act_name>"
+};
+
+//  id                      act_name                    short_name      per_layer
+static constexpr HookDef HOOK_DEFS[] = {
+    {HOOK_TYPE_RESID_PRE,   "hook_resid_pre",           "resid_pre",    true },
+    {HOOK_TYPE_LN1,         "hook_ln1",                 "ln1",          true },
+    {HOOK_TYPE_ATTN_OUT,    "hook_attn_out",            "attn_out",     true },
+    {HOOK_TYPE_RESID_MID,   "hook_resid_mid",           "resid_mid",    true },
+    {HOOK_TYPE_ATTN_SCORES, "attn.hook_attn_scores",    "attn_scores",  true },
+    {HOOK_TYPE_PATTERN,     "attn.hook_pattern",         "pattern",      true },
+    {HOOK_TYPE_Q,           "attn.hook_q",              "q",            true },
+    {HOOK_TYPE_K,           "attn.hook_k",              "k",            true },
+    {HOOK_TYPE_V,           "attn.hook_v",              "v",            true },
+    {HOOK_TYPE_Z,           "attn.hook_z",              "z",            true },
+    {HOOK_TYPE_LN2,         "hook_ln2",                 "ln2",          true },
+    {HOOK_TYPE_MLP_IN,      "hook_mlp_in",              "mlp_in",       true },
+    {HOOK_TYPE_MLP_OUT,     "hook_mlp_out",             "mlp_out",      true },
+    {HOOK_TYPE_MLP_POST,    "hook_mlp_post",            "mlp_post",     true },
+    {HOOK_TYPE_RESID_FINAL, "hook_resid_final",         "resid_final",  false},
+    {HOOK_TYPE_EMBED,       "hook_embed",               "embed",        false},
+    {HOOK_TYPE_POS_EMBED,   "hook_pos_embed",           "pos_embed",    false},
+    {HOOK_TYPE_FINAL_LN,    "hook_final_ln",            "final_ln",     false},
+    {HOOK_TYPE_TOKEN_IDS,   "token_ids",                "token_ids",    false},
+    {HOOK_TYPE_FINAL_LOGITS,"final_logits",             "final_logits", false},
+};
+static constexpr int HOOK_DEFS_COUNT = sizeof(HOOK_DEFS) / sizeof(HOOK_DEFS[0]);
+
+// Auto-derived: int → act_name lookup (O(1) via indexed array).
 inline const char* hook_type_name(int hook_type) {
-    static const char* NAMES[] = {
-        "hook_resid_pre", "hook_ln1", "hook_attn_out", "hook_resid_mid",
-        "attn.hook_attn_scores", "attn.hook_pattern",
-        "attn.hook_q", "attn.hook_k", "attn.hook_v",
-        "attn.hook_z", nullptr, "hook_ln2", "hook_mlp_in", "hook_mlp_out",
-        "hook_resid_final", "hook_embed", "hook_pos_embed", "hook_final_ln",
-        "token_ids", "final_logits", "hook_mlp_post",
-    };
-    if (hook_type >= 0 && hook_type < HOOK_TYPE_COUNT) return NAMES[hook_type];
+    static const char* NAMES[HOOK_TYPE_COUNT] = {};
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < HOOK_TYPE_COUNT; i++) NAMES[i] = nullptr;
+        for (int i = 0; i < HOOK_DEFS_COUNT; i++) NAMES[HOOK_DEFS[i].id] = HOOK_DEFS[i].act_name;
+        init = true;
+    }
+    if (hook_type >= 0 && hook_type < HOOK_TYPE_COUNT && NAMES[hook_type])
+        return NAMES[hook_type];
     return "unknown";
 }
 
