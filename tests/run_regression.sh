@@ -34,15 +34,19 @@ run_test "unit: test_tp_shapes + test_config" \
 for model in qwen3 gpt2; do
     for mode in eager cudagraph; do
         run_test "vllm: $model $mode tp=1" \
-            bash tests/run_tp_compare.sh "$model" "$mode" 1
+            bash tests/run_tp_compare_vllm.sh "$model" "$mode" 1
         run_test "vllm: $model $mode tp=2" \
-            bash tests/run_tp_compare.sh "$model" "$mode" 2
+            bash tests/run_tp_compare_vllm.sh "$model" "$mode" 2
     done
 done
 
-# --- HF E2E correctness ---
-run_test "hf: gpt2+qwen3 eager tp=1" \
-    python -m pytest tests/test_e2e_correctness_vs_hf.py -q -s
+# --- HF transport correctness ---
+for model in gpt2 qwen3; do
+    for mode in eager cudagraph; do
+        run_test "hf: $model $mode tp=1" \
+            bash tests/run_tp_compare_hf.sh "$model" "$mode"
+    done
+done
 
 # --- Summary ---
 TOTAL=$((PASS + FAIL))

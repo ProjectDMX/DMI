@@ -307,6 +307,7 @@ class MonitoringEngine:
 
         if self._host_engine is not None:
             try:
+                self._host_engine.close_input()
                 self._host_engine.stop()
             except Exception:
                 pass

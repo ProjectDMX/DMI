@@ -1,12 +1,12 @@
 #!/bin/bash
 # Transport correctness test: single run, compare .copy_() buffers vs ClickHouse.
-# Usage: LD_PRELOAD=... CUDA_VISIBLE_DEVICES=0,1 bash tests/run_tp_compare.sh [model] [mode] [tp]
+# Usage: bash tests/run_tp_compare_vllm.sh [model] [mode] [tp]
 #   model: qwen3 (default) or gpt2
 #   mode:  eager (default) or cudagraph
 #   tp:    1 (default) or 2
 #
 # Configurable env vars (all have defaults):
-#   E2E_NUM_PROMPTS, E2E_MAX_NEW_TOKENS, E2E_REF_MAX_LEN
+#   E2E_GPUS, E2E_NUM_PROMPTS, E2E_MAX_NEW_TOKENS, E2E_REF_MAX_LEN
 #   E2E_RING_PAYLOAD_MB, E2E_RING_PINNED_MB
 #   DMX_HOOK_SELECTION, DMX_DB_HOST, DMX_DB_PORT
 #   DMX_DB_DATABASE, DMX_DB_TABLE, DMX_CH_PARALLELISM
@@ -16,6 +16,14 @@ set -e
 MODEL=${1:-qwen3}
 MODE=${2:-eager}
 TP=${3:-1}
+
+# Default GPUs: "0" for tp=1, "0,1" for tp=2
+if [ "$TP" = "1" ]; then
+    DEFAULT_GPUS="0"
+else
+    DEFAULT_GPUS="0,1"
+fi
+export CUDA_VISIBLE_DEVICES=${E2E_GPUS:-${CUDA_VISIBLE_DEVICES:-$DEFAULT_GPUS}}
 
 export VLLM_DISABLE_COMPILE_CACHE=1
 export E2E_MODEL=$MODEL
