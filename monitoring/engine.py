@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
-from .config import AdvanceConfig, MonitoringConfig
+from .config import MonitoringConfig
 
 
 @dataclass

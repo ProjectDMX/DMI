@@ -6,10 +6,8 @@
 
 namespace dmx_host{
 
-// DMXHostEngine is a single-stage insert pipeline.
-// Pre-assembled ClickHouseRows are submitted directly via submit_direct().
-// Format processing (BackendFuture → tensor → per-request slices) is
-// handled by the caller (ring transport drain callback).
+// DMXHostEngine is a single-stage ClickHouse insert pipeline.
+// Pre-assembled ClickHouseRows are submitted via submit_direct().
 class DMXHostEngine : public PipelinedEngine<dmx_host_queue_item, uint64_t, 1, QueueOptions<false, false, false>, false,
 NoOutputHandler<dmx_host_queue_item> >{
 public:
