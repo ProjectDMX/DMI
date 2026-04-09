@@ -58,12 +58,8 @@ _HOOK_DEFS = _ext.HOOK_DEFS  # list of (id, act_name, short_name, per_layer, gro
 
 # Auto-derive all mappings
 _id_by_short: Dict[str, int] = {}       # "q" → 6
-_act_name_by_id: Dict[int, str] = {}    # 6 → "attn.hook_q"
-_short_by_id: Dict[int, str] = {}       # 6 → "q"
 for _id, _act, _short, _pl, _grp, _tp in _HOOK_DEFS:
     _id_by_short[_short] = _id
-    _act_name_by_id[_id] = _act
-    _short_by_id[_id] = _short
     # Inject HOOK_TYPE_Q, HOOK_TYPE_RESID_PRE, etc. into module namespace
     globals()[f"HOOK_TYPE_{_short.upper()}"] = _id
 
