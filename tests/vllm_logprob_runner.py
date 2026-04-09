@@ -97,10 +97,10 @@ def main():
     kwargs = dict(
         model=model_id,
         dtype=model_dtype,
-        max_model_len=512,
+        max_model_len=int(os.environ.get("E2E_MAX_MODEL_LEN", "512")),
         max_logprobs=-1,
         enforce_eager=enforce_eager,
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.5")),
         tensor_parallel_size=tp_size,
     )
     if args.ref:

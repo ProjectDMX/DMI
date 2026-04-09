@@ -44,70 +44,25 @@ class MonitoringEngine:
         host_engine: Optional[Any] = None,
         db_config: Optional[HostEngineConfig] = None,
     ) -> None:
-        self.async_enabled = async_enabled
-        self.cache_dtype = cache_dtype
-        self._delay_steps = max(0, int(delay_steps))
+        # async_enabled, cache_dtype, delay_steps kept for API compat but unused.
         self.config = config
         self._debug_enabled = bool(self.config.debug) if self.config is not None else False
         self._nvtx_enabled = self._debug_enabled
         self._no_strip = False if config is None else config.no_strip
-        self._request_capture_enabled = True
-        self._capture_enabled = True
-        self._hook_cache_config_id: Optional[int] = None
-        self._hook_cache_key: Optional[int] = None
-        self._hook_cache_list: Optional[List[str]] = None
-        self._hook_cache_set: Optional[set[str]] = None
         self._sync_hook_debug_flag()
 
-        self._current_step_id: int = 0
-        self._pending_db_step: Optional[
-            Tuple[str, int, List[str], List[Tuple[int, int]], Dict[str, Any]]
-        ] = None
         self._model_id = model_id
         self._auto_batch_group_id = 0
         self._active_batch_request_ids: Optional[List[str]] = None
         self._active_batch_start_idx_per_request: Optional[List[int]] = None
         self._active_batch_finished_per_request: Optional[List[bool]] = None
 
-        # Native backend only.
-        self._native_backend: Optional[Any] = None
-        self._using_native_backend = False
 
         # Host-side DB engine (optional; C++ backend only)
         self._host_engine: Optional[Any] = None
         self._host_engine_enabled = False
 
-        # Ring transport (replaces NativeMonitoringEngine D2H when active)
         self._ring_transport: Optional[Any] = None
-        self._using_ring_transport = False
-
-        if not self.async_enabled:
-            raise RuntimeError(
-                "MonitoringEngine no longer supports async_enabled=False; Python backend was removed"
-            )
-
-        advance_cfg = self.config.advance if self.config is not None else AdvanceConfig()
-        native_backend = _load_native_backend(
-            queue_size,
-            cache_dtype,
-            self._delay_steps,
-            advance_cfg,
-        )
-        if native_backend is None:
-            raise RuntimeError(
-                "Failed to initialize native monitoring backend; "
-                "Python backend fallback has been removed"
-            )
-        self._native_backend = native_backend
-        self._using_native_backend = True
-
-        try:
-            native_backend.begin_step(int(self._current_step_id), 0)  # initialize step tracking
-        except Exception:
-            pass
-        if self.config is not None:
-            self._apply_capture_schedule()
-            self._apply_native_runtime_config()
 
         if host_engine is not None and db_config is not None:
             raise ValueError("Provide either host_engine or db_config, not both")
@@ -140,10 +95,6 @@ class MonitoringEngine:
                 self._host_engine_enabled = True
 
         # Stats (optional) --------------------------------------------------
-        self._stats_enabled = self._debug_enabled
-        self._stats_hooks = 0
-        self._stats_steps = 0
-        self._stats_tasks = 0
         # Fine-grained Python-side timings (ms)
         self._last_prepare_ms = 0.0
 
@@ -188,7 +139,7 @@ class MonitoringEngine:
             transport.set_model_cfg(model_shape)
         self._ring_engine = ring_engine
         self._ring_transport = transport
-        self._using_ring_transport = True
+        
         _rt.activate(transport)
 
     def _prepare_ring_step(self, input_ids: Any, attention_mask: Any, past_key_values: Any,
@@ -198,7 +149,7 @@ class MonitoringEngine:
         Called before the forward pass so ring hooks (firing during forward)
         can push correctly-keyed FIFO entries.
         """
-        if not self._using_ring_transport or self._ring_transport is None:
+        if self._ring_transport is None:
             return
         if self._model_id is None:
             return
@@ -336,21 +287,6 @@ class MonitoringEngine:
         )
 
     # ------------------------------------------------------------------
-    def _apply_capture_schedule(self) -> None:
-        if not self._native_backend or self.config is None:
-            return
-        schedule = self.config.schedule
-        self._native_backend.set_capture_schedule(
-            int(schedule.step_stride),
-            int(schedule.step_offset),
-            int(schedule.warmup_steps),
-            bool(schedule.capture_prefill),
-            bool(schedule.capture_decode),
-            int(schedule.request_stride),
-            int(schedule.request_offset),
-            int(schedule.warmup_requests),
-        )
-
     def _sync_hook_debug_flag(self) -> None:
         """Propagate debug mode to hook_points module without hard import coupling."""
 
@@ -363,74 +299,14 @@ class MonitoringEngine:
         except Exception:
             pass
 
-    def _apply_native_runtime_config(self) -> None:
-        if not self._native_backend or self.config is None:
-            return
-        cfg = self.config.native_partial_seal
-        setter = getattr(self._native_backend, "set_partial_seal_config", None)
-        if setter is None:
-            return
-        setter(
-            bool(cfg.enabled),
-            int(cfg.chunk_bytes),
-            bool(cfg.cap_enabled),
-            float(cfg.cap_ratio),
-            int(cfg.driver_guard_mb),
-        )
-
     def close(self) -> None:
         """Tear down backend resources."""
 
-        self._pending_db_step = None
         self._active_batch_request_ids = None
         self._active_batch_start_idx_per_request = None
         self._active_batch_finished_per_request = None
 
-        backend = self._native_backend
-        if backend is None:
-            return
-
-        if self._stats_enabled:
-            try:
-                stats = backend.get_stats()
-            except Exception:
-                stats = None
-            print(
-                "[MonEng/Stats] hooks=",
-                self._stats_hooks,
-                " steps=",
-                self._stats_steps,
-                " tasks=",
-                self._stats_tasks,
-            )
-            if stats is not None:
-                try:
-                    # Expect dict with microseconds
-                    print(
-                        "[Native/Stats] steps=",
-                        int(stats.get("total_steps", 0)),
-                        " tasks=",
-                        int(stats.get("total_tasks", 0)),
-                        " submit_ms=",
-                        round(float(stats.get("submit_us", 0.0)) / 1000.0, 3),
-                        " process_ms=",
-                        round(float(stats.get("process_us", 0.0)) / 1000.0, 3),
-                        " callback_ms=",
-                        round(float(stats.get("callback_us", 0.0)) / 1000.0, 3),
-                    )
-                except Exception:
-                    pass
-            # Optional: slice mode stats
-            try:
-                from monitoring.hook_points import get_monitoring_hook_stats
-
-                hook_stats = get_monitoring_hook_stats()
-                if hook_stats:
-                    print("[Hook/Stats]", hook_stats)
-            except Exception:
-                pass
-
-        if self._using_ring_transport:
+        if self._ring_transport is not None:
             try:
                 ring_engine = getattr(self, "_ring_engine", None)
                 if ring_engine is not None:
@@ -444,7 +320,6 @@ class MonitoringEngine:
                 pass
             self._ring_transport = None
             self._ring_engine = None
-            self._using_ring_transport = False
 
         if self._host_engine is not None:
             try:
@@ -454,58 +329,9 @@ class MonitoringEngine:
             self._host_engine = None
             self._host_engine_enabled = False
 
-        self.clear_completed_results()
-        backend.close()
-        self._native_backend = None
-        self._using_native_backend = False
-
-    def clear_completed_results(self) -> None:
-        """Clear completed results held by native backend to free memory."""
-
-        if self._native_backend is not None:
-            try:
-                from torch.cuda import nvtx as _nvtx  # type: ignore
-            except Exception:
-                _nvtx = None  # type: ignore
-            if _nvtx is not None and self._nvtx_enabled:
-                _nvtx.range_push("MonEng::PyClearResults")
-                try:
-                    self._native_backend.clear_completed_results()
-                finally:
-                    _nvtx.range_pop()
-            else:
-                self._native_backend.clear_completed_results()
-
 
 # ---------------------------------------------------------------------------
 # Backend loader
-
-
-def _load_native_backend(
-    queue_size: int,
-    cache_dtype: Optional[torch.dtype],
-    delay_steps: int,
-    advance: AdvanceConfig,
-) -> Optional[Any]:
-    """Attempt to load the native backend extension."""
-
-    try:
-        from . import _native_engine
-    except Exception:
-        return None
-
-    try:
-        return _native_engine.create_engine(  # type: ignore[attr-defined]
-            queue_size=queue_size,
-            cache_dtype=cache_dtype,
-            delay_steps=delay_steps,
-            pinpool_bins_kb=list(advance.pinpool_bins_kb),
-            pinpool_max_mb=int(advance.pinpool_max_mb),
-            host_copy_threads=int(advance.host_copy_threads),
-            host_copy_queue_size=int(advance.host_copy_queue_size),
-        )
-    except Exception:
-        return None
 
 
 __all__ = ["MonitoringEngine"]

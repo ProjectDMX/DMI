@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 import importlib.util
 import glob
-
-import torch
 
 _EXTENSION_NAME = "monitoring_native_backend"
 _EXTENSION_MODULE: Optional[Any] = None
@@ -20,12 +18,10 @@ _NATIVE_EXPORTS = (
     "StageConfig",
     "DMXHostEngine",
     "ClickHouseClientConfig",
-    "ThreadFailure",
     "QueueConfig",
     "EnqueuePolicy",
     "OnFullPolicy",
     "OnClosedPolicy",
-    "consume_backend_futures_cpp",
     "RingConfig",
     "RingEngine",
     "ring_set_active_engine",
@@ -65,28 +61,6 @@ def _load_extension() -> Any:
     )
 
 
-def create_engine(
-    queue_size: int,
-    cache_dtype: Optional[torch.dtype],
-    delay_steps: int,
-    *,
-    pinpool_bins_kb: list[int] | tuple[int, ...] = (256, 512, 1024, 2048, 4096, 8192),
-    pinpool_max_mb: int = 512,
-    host_copy_threads: int = 0,
-    host_copy_queue_size: int = 512,
-):
-    module = _load_extension()
-    return module.create_engine(
-        queue_size,
-        cache_dtype,
-        delay_steps,
-        pinpool_bins_kb,
-        pinpool_max_mb,
-        host_copy_threads,
-        host_copy_queue_size,
-    )
-
-
 def __getattr__(name: str) -> Any:
     if name in _NATIVE_EXPORTS:
         return getattr(_load_extension(), name)
@@ -97,4 +71,4 @@ def __dir__() -> list[str]:
     return sorted(set(list(globals().keys()) + list(_NATIVE_EXPORTS)))
 
 
-__all__ = ["create_engine", *_NATIVE_EXPORTS]
+__all__ = [*_NATIVE_EXPORTS]

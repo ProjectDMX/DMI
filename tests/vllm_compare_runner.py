@@ -69,10 +69,10 @@ def main():
             "dmx_db_host": db_host,
             "dmx_db_port": db_port,
         },
-        max_model_len=512,
-        max_num_batched_tokens=512,
+        max_model_len=int(os.environ.get("E2E_MAX_MODEL_LEN", "512")),
+        max_num_batched_tokens=int(os.environ.get("E2E_MAX_NUM_BATCHED_TOKENS", "512")),
         enforce_eager=enforce_eager,
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.5")),
         tensor_parallel_size=tp_size,
     )
 

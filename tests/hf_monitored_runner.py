@@ -67,8 +67,8 @@ def main():
     ch_cfg.table = os.environ.get("DMX_DB_TABLE", "offload")
     ch_cfg.secure = False
     ch_cfg.client_side_compress = "none"
-    ch_cfg.create_database_if_missing = True
-    ch_cfg.drop_existing_database = True
+    ch_cfg.create_database_if_missing = bool(int(os.environ.get("DMX_DB_CREATE_IF_MISSING", "1")))
+    ch_cfg.drop_existing_database = bool(int(os.environ.get("DMX_DB_DROP_EXISTING", "1")))
     ch_cfg.index_granularity = 8192
 
     # Monitoring config
@@ -93,12 +93,13 @@ def main():
     # Host engine config
     from monitoring import HostEngineConfig
     from monitoring._native_engine import StageConfig
-    stage = StageConfig.clickhouse_insert(ch_cfg, parallelism=10, name="ch_insert")
+    ch_parallelism = int(os.environ.get("DMX_CH_PARALLELISM", "10"))
+    stage = StageConfig.clickhouse_insert(ch_cfg, parallelism=ch_parallelism, name="ch_insert")
     q = stage.input_queue
-    q.max_batch_items = 1024
-    q.high_watermark_items = 1024
-    q.max_batch_size = 2048 * 1024 * 1024
-    q.high_watermark_size = 2048 * 1024 * 1024
+    q.max_batch_items = int(os.environ.get("DMX_CH_MAX_BATCH_ITEMS", "1024"))
+    q.high_watermark_items = q.max_batch_items
+    q.max_batch_size = int(os.environ.get("DMX_CH_MAX_BATCH_BYTES", str(2048 * 1024 * 1024)))
+    q.high_watermark_size = q.max_batch_size
     host_cfg = HostEngineConfig(stages=[stage])
 
     # Ring config

@@ -4,6 +4,13 @@
 #   model: qwen3 (default) or gpt2
 #   mode:  eager (default) or cudagraph
 #   tp:    1 (default) or 2
+#
+# Configurable env vars (all have defaults):
+#   E2E_NUM_PROMPTS, E2E_MAX_NEW_TOKENS, E2E_REF_MAX_LEN
+#   E2E_RING_PAYLOAD_MB, E2E_RING_PINNED_MB
+#   DMX_HOOK_SELECTION, DMX_DB_HOST, DMX_DB_PORT
+#   DMX_DB_DATABASE, DMX_DB_TABLE, DMX_CH_PARALLELISM
+#   DMX_CH_MAX_BATCH_ITEMS, DMX_CH_MAX_BATCH_BYTES
 set -e
 
 MODEL=${1:-qwen3}
@@ -18,7 +25,7 @@ export E2E_TP_SIZE=$TP
 export E2E_REF_MAX_LEN=${E2E_REF_MAX_LEN:-8192}
 export E2E_RING_PAYLOAD_MB=${E2E_RING_PAYLOAD_MB:-4096}
 export E2E_RING_PINNED_MB=${E2E_RING_PINNED_MB:-4096}
-export DMX_HOOK_SELECTION=vllm-full
+export DMX_HOOK_SELECTION=${DMX_HOOK_SELECTION:-vllm-full}
 export DMX_DB_HOST=${DMX_DB_HOST:-localhost}
 export DMX_DB_PORT=${DMX_DB_PORT:-9000}
 

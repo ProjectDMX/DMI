@@ -13,16 +13,10 @@ from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
 from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
 
 from monitoring import (
-    AdvanceConfig,
     ClickHouseClientConfig,
-    EnqueuePolicy,
     HostEngineConfig,
     MonitoringConfig,
     MonitoringEngine,
-    NativePartialSealConfig,
-    OnClosedPolicy,
-    OnFullPolicy,
-    QueueConfig,
     StageConfig,
 )
 from monitoring.config import CaptureSchedule, HookSelection
@@ -73,7 +67,7 @@ def _build_db_config() -> ClickHouseClientConfig:
     # Previous version dropped the DB each run; keep that default here,
     # but allow overriding via env var.
     cfg.drop_existing_database = bool(int(os.environ.get("DMX_DB_DROP_EXISTING", "1")))
-    cfg.index_granularity = 8192
+    cfg.index_granularity = int(os.environ.get("DMX_DB_INDEX_GRANULARITY", "8192"))
     return cfg
 
 @contextlib.contextmanager
@@ -93,38 +87,9 @@ def _nvtx_range(name: str):
         nvtx.range_pop()
 
 
-def _build_queue_config(*, high_watermark_items: int | None = None) -> QueueConfig:
-    # Keep the benchmark effectively "unbounded" by default (matches old script),
-    # so long runs don't fail due to queue backpressure.
-    q = QueueConfig()
-    q.min_batch_items = 1
-    q.high_watermark_items = high_watermark_items
-    return q
-
-
-def _build_ingress_policy() -> EnqueuePolicy:
-    p = EnqueuePolicy()
-    p.block = False
-    p.on_full = OnFullPolicy.RAISE
-    p.on_closed = OnClosedPolicy.RAISE
-    return p
-
-
-def _build_host_config(db_cfg: ClickHouseClientConfig, *, debug: bool = False) -> HostEngineConfig:
-    # Stage 1: process futures + parse payloads
-    stage_one = StageConfig.process_future(parallelism=1, name="process_future", debug=bool(debug))
-    # Stage 2: insert into ClickHouse
-    stage_two = StageConfig.clickhouse_insert(db_cfg, parallelism=1, name="clickhouse_insert")
-
-    stage_one.input_queue = _build_queue_config()
-    stage_two.input_queue = _build_queue_config()
-
-    ingress = _build_ingress_policy()
-    stage_one.ingress_policy = ingress
-    stage_two.ingress_policy = ingress
-
-    # MonitoringEngine currently expects exactly two stages.
-    return HostEngineConfig(stages=[stage_one, stage_two])
+def _build_host_config(db_cfg: ClickHouseClientConfig, *, parallelism: int = 10) -> HostEngineConfig:
+    stage = StageConfig.clickhouse_insert(db_cfg, parallelism=parallelism, name="clickhouse_insert")
+    return HostEngineConfig(stages=[stage])
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Monitoring generate benchmark")
@@ -136,6 +101,9 @@ def main() -> None:
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--json-out", default="")
     parser.add_argument("--no-db", action="store_true", help="Disable host_engine DB submission.")
+    parser.add_argument("--ring-payload-mb", type=int, default=int(os.environ.get("DMX_RING_PAYLOAD_MB", "4096")))
+    parser.add_argument("--ring-pinned-mb", type=int, default=int(os.environ.get("DMX_RING_PINNED_MB", "4096")))
+    parser.add_argument("--ch-parallelism", type=int, default=int(os.environ.get("DMX_CH_PARALLELISM", "10")))
     args = parser.parse_args()
     model_id = _resolve_model_id(args.model)
 
@@ -165,7 +133,7 @@ def main() -> None:
     host_cfg = None
     if not args.no_db:
         db_cfg = _build_db_config()
-        host_cfg = _build_host_config(db_cfg, debug=bool(cfg.debug))
+        host_cfg = _build_host_config(db_cfg, parallelism=args.ch_parallelism)
 
     engine = MonitoringEngine(
         async_enabled=True,

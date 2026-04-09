@@ -147,6 +147,9 @@ class DMXGPUWorker(Worker):
         null_mode       = _cfg(ac, "dmx_null_mode",        "DMX_NULL_MODE",        False)
         db_host         = _cfg(ac, "dmx_db_host",          "DMX_DB_HOST",          "")
         db_port         = _cfg(ac, "dmx_db_port",          "DMX_DB_PORT",          9000)
+        db_database     = _cfg(ac, "dmx_db_database",      "DMX_DB_DATABASE",      "default")
+        db_table        = _cfg(ac, "dmx_db_table",         "DMX_DB_TABLE",         "offload")
+        ch_parallelism  = int(_cfg(ac, "dmx_ch_parallelism", "DMX_CH_PARALLELISM",  10))
 
         self._dmx_model_id = model_id or str(self.vllm_config.model_config.model)
 
@@ -163,9 +166,11 @@ class DMXGPUWorker(Worker):
             ch_cfg = _ne.ClickHouseClientConfig()
             ch_cfg.host = db_host
             ch_cfg.port = db_port
+            ch_cfg.database = db_database
+            ch_cfg.table = db_table
             ch_cfg.create_database_if_missing = True
             stage_cfg = _ne.StageConfig.clickhouse_insert(
-                ch_cfg, parallelism=10, name="clickhouse_insert")
+                ch_cfg, parallelism=ch_parallelism, name="clickhouse_insert")
             q = stage_cfg.input_queue
             q.max_batch_items = int(_cfg(
                 ac, "dmx_ch_max_batch_items", "DMX_CH_MAX_BATCH_ITEMS", 1024))

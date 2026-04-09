@@ -7,7 +7,6 @@ _NATIVE_EXPORTS = (
     "StageConfig",
     "DMXHostEngine",
     "ClickHouseClientConfig",
-    "ThreadFailure",
     "QueueConfig",
     "EnqueuePolicy",
     "OnFullPolicy",
