@@ -71,6 +71,19 @@ void DrainThread::force_flush_and_wait() {
     flush_done_cv_.wait(lk, [this] { return flush_done_; });
 }
 
+uint64_t DrainThread::force_flush_and_wait_timed() {
+    const auto start = std::chrono::steady_clock::now();
+    force_flush_and_wait();
+    const uint64_t wait_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count());
+    {
+        std::lock_guard<std::mutex> lk(mgmt_mu_);
+        last_force_flush_wait_us_ = wait_us;
+    }
+    return wait_us;
+}
+
 // ---------------------------------------------------------------------------
 // Task queue interface for p2p thread
 // ---------------------------------------------------------------------------
@@ -127,6 +140,21 @@ uint64_t DrainThread::cpu_task_head() const {
 
 uint64_t DrainThread::cpu_task_tail_committed() const {
     return cpu_task_tail_;
+}
+
+FlushStats DrainThread::get_stats() const {
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
+    FlushStats stats{};
+    stats.pending_entries = pending_entries_;
+    stats.pending_bytes = pending_bytes_;
+    stats.cpu_payload_head = cpu_payload_head_;
+    stats.cpu_payload_tail_committed = cpu_payload_tail_committed_;
+    stats.total_flushes = total_flushes_;
+    stats.last_flush_entries = last_flush_entries_;
+    stats.last_flush_bytes = last_flush_bytes_;
+    stats.last_flush_complete_monotonic_us = last_flush_complete_monotonic_us_;
+    stats.last_force_flush_wait_us = last_force_flush_wait_us_;
+    return stats;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +214,12 @@ void DrainThread::do_full_flush() {
         {
             std::lock_guard<std::mutex> lk(mgmt_mu_);
             cpu_payload_tail_committed_ = cpu_payload_tail_;
+            total_flushes_ += 1;
+            last_flush_entries_ = flush_count;
+            last_flush_bytes_ = flush_bytes;
+            last_flush_complete_monotonic_us_ = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
         }
         submit_to_p2p(flush_count, flush_bytes);
         {
@@ -268,6 +302,12 @@ void DrainThread::loop() {
             {
                 std::lock_guard<std::mutex> lk(mgmt_mu_);
                 cpu_payload_tail_committed_ = cpu_payload_tail_;
+                total_flushes_ += 1;
+                last_flush_entries_ = flush_count;
+                last_flush_bytes_ = flush_bytes;
+                last_flush_complete_monotonic_us_ = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
             }
 
             submit_to_p2p(flush_count, flush_bytes);
