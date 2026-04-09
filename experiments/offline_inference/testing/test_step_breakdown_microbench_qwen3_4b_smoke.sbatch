@@ -9,7 +9,12 @@
 
 set -euo pipefail
 
-SCRATCH="${SCRATCH:-YOUR_SCRATCH_PATH}"
+SCRATCH="${SCRATCH:-}"
+if [ -z "${SCRATCH}" ] || [ "${SCRATCH}" = "YOUR_SCRATCH_PATH" ]; then
+    echo "ERROR: SCRATCH is not set to a valid scratch directory." >&2
+    echo "Please export SCRATCH=/path/to/your/scratch before running this script." >&2
+    exit 1
+fi
 ENV_DIR=${SCRATCH}/proj-dmx
 PROJECT=${SCRATCH}/DMI
 
@@ -57,7 +62,7 @@ HOOK_SELECTION="hidden-states,final_ln,logits"
 RESULTS_DIR="${PROJECT}/experiments/offline_inference/results/step_breakdown_smoke_$(date '+%Y%m%d_%H%M%S')_${SLURM_JOB_ID}"
 mkdir -p "${RESULTS_DIR}"
 
-TMP_ROOT="${TMP_ROOT:-${PWD}/.tmp}"
+TMP_ROOT="${TMP_ROOT:-${TMPDIR:-/tmp}}"
 mkdir -p "${TMP_ROOT}"
 LOCAL_NVME_HF="${TMP_ROOT}/${USER}_hf_cache_${SLURM_JOB_ID}"
 LOCAL_HF="${LOCAL_NVME_HF}"

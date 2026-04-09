@@ -9,7 +9,12 @@
 
 set -uo pipefail
 
-SCRATCH="${SCRATCH:-YOUR_SCRATCH_PATH}"
+SCRATCH="${SCRATCH:-}"
+if [ -z "${SCRATCH}" ] || [ "${SCRATCH}" = "YOUR_SCRATCH_PATH" ]; then
+    echo "ERROR: SCRATCH is not set to a valid scratch directory." >&2
+    echo "Please export SCRATCH=/path/to/your/scratch before running this script." >&2
+    exit 1
+fi
 ENV_DIR=${SCRATCH}/proj-dmx
 PROJECT=${SCRATCH}/DMI/DMI
 
@@ -44,7 +49,7 @@ SAMPLE_FILE_SHAREGPT="../../benchmark/data/offline_e2e/sharegpt_500_sample1.json
 RING_STEP_MB=5120
 RING_MIN_MB=5120
 
-TMP_ROOT="${TMP_ROOT:-${PWD}/.tmp}"
+TMP_ROOT="${TMP_ROOT:-${TMPDIR:-/tmp}}"
 mkdir -p "${TMP_ROOT}"
 LOCAL_NVME_HF="${TMP_ROOT}/${USER}_hf_cache_${SLURM_JOB_ID}"
 LOCAL_HF="${LOCAL_NVME_HF}"

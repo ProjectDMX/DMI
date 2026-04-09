@@ -9,7 +9,12 @@
 
 set -eo pipefail
 
-SCRATCH="${SCRATCH:-YOUR_SCRATCH_PATH}"
+SCRATCH="${SCRATCH:-}"
+if [ -z "${SCRATCH}" ] || [ "${SCRATCH}" = "YOUR_SCRATCH_PATH" ]; then
+    echo "ERROR: SCRATCH is not set to a valid scratch directory." >&2
+    echo "Please export SCRATCH=/path/to/your/scratch before running this script." >&2
+    exit 1
+fi
 ENV_DIR=${SCRATCH}/proj-dmx
 PROJECT=${SCRATCH}/DMI/DMI
 
@@ -53,7 +58,7 @@ CAPTURE_MODE="hs"
 HOOK_LABEL="capture_${CAPTURE_MODE}"
 
 # ---- 拷贝模型到本地 NVMe /tmp 加速加载 ----
-TMP_ROOT="${TMP_ROOT:-${PWD}/.tmp}"
+TMP_ROOT="${TMP_ROOT:-${TMPDIR:-/tmp}}"
 mkdir -p "${TMP_ROOT}"
 LOCAL_NVME_HF="${TMP_ROOT}/${USER}_hf_cache_${SLURM_JOB_ID}"
 LOCAL_HF="${LOCAL_NVME_HF}"

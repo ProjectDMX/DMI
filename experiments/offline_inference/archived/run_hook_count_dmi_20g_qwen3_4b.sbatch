@@ -10,7 +10,12 @@
 
 set -uo pipefail
 
-SCRATCH="${SCRATCH:-YOUR_SCRATCH_PATH}"
+SCRATCH="${SCRATCH:-}"
+if [ -z "${SCRATCH}" ] || [ "${SCRATCH}" = "YOUR_SCRATCH_PATH" ]; then
+    echo "ERROR: SCRATCH is not set to a valid scratch directory." >&2
+    echo "Please export SCRATCH=/path/to/your/scratch before running this script." >&2
+    exit 1
+fi
 ENV_DIR=${SCRATCH}/proj-dmx
 PROJECT=${SCRATCH}/DMI/DMI
 
@@ -83,7 +88,7 @@ HOOK_COUNTS=(1 73 145 253 325)
 
 echo "dataset,model,batch_size,hook_count,hook_selection,baseline,status,ring_mb,target_tok_s,compute_tok_s,log_file" > "${SUMMARY_CSV}"
 
-TMP_ROOT="${TMP_ROOT:-${PWD}/.tmp}"
+TMP_ROOT="${TMP_ROOT:-${TMPDIR:-/tmp}}"
 mkdir -p "${TMP_ROOT}"
 LOCAL_NVME_HF="${TMP_ROOT}/${USER}_hf_cache_${SLURM_JOB_ID}"
 LOCAL_HF="${LOCAL_NVME_HF}"

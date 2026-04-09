@@ -9,7 +9,12 @@
 
 set -euo pipefail
 
-SCRATCH="${SCRATCH:-YOUR_SCRATCH_PATH}"
+SCRATCH="${SCRATCH:-}"
+if [ -z "${SCRATCH}" ] || [ "${SCRATCH}" = "YOUR_SCRATCH_PATH" ]; then
+    echo "ERROR: SCRATCH is not set to a valid scratch directory." >&2
+    echo "Please export SCRATCH=/path/to/your/scratch before running this script." >&2
+    exit 1
+fi
 PROJECT=${SCRATCH}/DMI/DMI
 
 bash "${PROJECT}/experiments/offline_inference/test_llama31_8b_smoke.sh"
