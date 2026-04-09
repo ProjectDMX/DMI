@@ -9,17 +9,38 @@ if [ -z "${CLICKHOUSE_DATA_DIR}" ]; then
     exit 1
 fi
 
-if [ ! -d "${CLICKHOUSE_DATA_DIR}" ]; then
-    echo "ERROR: CLICKHOUSE_DATA_DIR does not exist or is not a directory: ${CLICKHOUSE_DATA_DIR}"
-    exit 1
-fi
-
 case "${CLICKHOUSE_DATA_DIR}" in
-    ""|"/")
+    "."|"..")
         echo "ERROR: refusing to operate on unsafe CLICKHOUSE_DATA_DIR=${CLICKHOUSE_DATA_DIR}"
         exit 1
         ;;
 esac
+
+RESOLVED_CLICKHOUSE_DATA_DIR="$(realpath "${CLICKHOUSE_DATA_DIR}" 2>/dev/null || true)"
+if [ -z "${RESOLVED_CLICKHOUSE_DATA_DIR}" ]; then
+    echo "ERROR: unable to resolve CLICKHOUSE_DATA_DIR to an absolute path: ${CLICKHOUSE_DATA_DIR}"
+    exit 1
+fi
+
+case "${RESOLVED_CLICKHOUSE_DATA_DIR}" in
+    ""|"/"|"."|"..")
+        echo "ERROR: refusing to operate on unsafe CLICKHOUSE_DATA_DIR=${RESOLVED_CLICKHOUSE_DATA_DIR}"
+        exit 1
+        ;;
+    /*)
+        ;;
+    *)
+        echo "ERROR: CLICKHOUSE_DATA_DIR must resolve to an absolute path: ${RESOLVED_CLICKHOUSE_DATA_DIR}"
+        exit 1
+        ;;
+esac
+
+CLICKHOUSE_DATA_DIR="${RESOLVED_CLICKHOUSE_DATA_DIR}"
+
+if [ ! -d "${CLICKHOUSE_DATA_DIR}" ]; then
+    echo "ERROR: CLICKHOUSE_DATA_DIR does not exist or is not a directory: ${CLICKHOUSE_DATA_DIR}"
+    exit 1
+fi
 
 echo "=== Stopping ClickHouse ==="
 sudo systemctl stop clickhouse-server
