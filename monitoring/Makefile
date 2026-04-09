@@ -7,7 +7,6 @@ LTO ?= 0
 
 TARGET := monitoring_native_backend
 SRCS := csrc/bindings.cpp \
-        csrc/dmx_host_utils.cpp \
         csrc/clickhouse_client.cpp \
         csrc/ring/drain_thread.cpp \
         csrc/ring/p2p_thread.cpp \
