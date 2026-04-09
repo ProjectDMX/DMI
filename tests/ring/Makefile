@@ -1,4 +1,4 @@
-NVCC     ?= /usr/local/cuda/bin/nvcc
+NVCC     ?= $(shell command -v nvcc 2>/dev/null || printf '%s' nvcc)
 SM_ARCH  ?= native
 CXX_STD  ?= c++17
 BUILD    := build

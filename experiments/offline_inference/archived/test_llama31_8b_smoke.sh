@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRATCH=/scratch/zt1/project/zaoxing-prj/user/ynn1999
+SCRATCH="${SCRATCH:-}"
+if [ -z "${SCRATCH}" ] || [ "${SCRATCH}" = "YOUR_SCRATCH_PATH" ]; then
+    echo "ERROR: SCRATCH is not set to a valid scratch directory." >&2
+    echo "Please export SCRATCH=/path/to/your/scratch before running this script." >&2
+    exit 1
+fi
 ENV_DIR=${SCRATCH}/proj-dmx
 PROJECT=${SCRATCH}/DMI/DMI
 

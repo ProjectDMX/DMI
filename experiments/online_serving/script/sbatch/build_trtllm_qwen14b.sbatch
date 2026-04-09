@@ -10,7 +10,8 @@
 
 set -eo pipefail
 
-cd ~/scratch.zaoxing-prj
+WORK_ROOT="${WORK_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+cd "${WORK_ROOT}"
 
 NVIDIA_BASE=envs/trtllm/lib/python3.10/site-packages/nvidia
 NVIDIA_LIBS=$(find $NVIDIA_BASE -maxdepth 2 -name lib -type d ! -path "*/cu13/*" 2>/dev/null | paste -sd:)

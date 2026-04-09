@@ -10,7 +10,12 @@
 
 set -uo pipefail
 
-SCRATCH=/scratch/zt1/project/zaoxing-prj/user/ynn1999
+SCRATCH="${SCRATCH:-}"
+if [ -z "${SCRATCH}" ] || [ "${SCRATCH}" = "YOUR_SCRATCH_PATH" ]; then
+    echo "ERROR: SCRATCH is not set to a valid scratch directory." >&2
+    echo "Please export SCRATCH=/path/to/your/scratch before running this script." >&2
+    exit 1
+fi
 PROJECT=${SCRATCH}/DMI/DMI
 
 bash "${PROJECT}/experiments/offline_inference/run_max_batch_hs_logits_qwen3_14b_compile_dmi.sh"

@@ -1,5 +1,6 @@
 """Analyze how overhead scales with tensor size for precision reduction vs quantization."""
 
+from pathlib import Path
 import torch
 import time
 import matplotlib
@@ -350,7 +351,9 @@ def benchmark_scaling():
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plot_path = '/home/nengneng/AIPrometheus/HF_Prometheus/results/overhead_scaling_analysis.png'
+    results_dir = Path(__file__).resolve().parents[2] / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    plot_path = results_dir / "overhead_scaling_analysis.png"
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     print(f"\n✅ Plots saved to: {plot_path}")
 

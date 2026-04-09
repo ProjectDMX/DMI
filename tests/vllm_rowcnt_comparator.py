@@ -5,9 +5,9 @@ No CUDA needed — runs entirely on CPU.
 
 Usage:
     python -m tests.vllm_rowcnt_comparator \
-        --ref-dir /tmp/vllm_ref \
-        --mon-dir /tmp/vllm_mon \
-        --result-file /tmp/vllm_result.json
+        --ref-dir ./tmp/vllm_ref \
+        --mon-dir ./tmp/vllm_mon \
+        --result-file ./tmp/vllm_result.json
 """
 import argparse
 import json

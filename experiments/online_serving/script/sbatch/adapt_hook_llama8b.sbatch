@@ -8,7 +8,8 @@
 #SBATCH --output=cur_sbatch_log/ahk-llama8b-%j.out
 #SBATCH --error=cur_sbatch_log/ahk-llama8b-%j.err
 
-cd ~/scratch.zaoxing-prj
+WORK_ROOT="${WORK_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+cd "${WORK_ROOT}"
 
 source vllm-hook-env/bin/activate
 export PYTHONPATH=$(pwd)/vllm-0.17.0:$PYTHONPATH

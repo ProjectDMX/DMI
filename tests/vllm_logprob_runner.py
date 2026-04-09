@@ -5,8 +5,8 @@ Two modes:
   default: load original model (stock vLLM)
 
 Usage:
-    python -m tests.vllm_logprob_runner --output /tmp/logprobs_orig.pt
-    REF_CONFIG=/tmp/ref_config.json python -m tests.vllm_logprob_runner --output /tmp/logprobs_ref.pt --ref
+    python -m tests.vllm_logprob_runner --output ./tmp/logprobs_orig.pt
+    REF_CONFIG=./tmp/ref_config.json python -m tests.vllm_logprob_runner --output ./tmp/logprobs_ref.pt --ref
 """
 import argparse
 import os

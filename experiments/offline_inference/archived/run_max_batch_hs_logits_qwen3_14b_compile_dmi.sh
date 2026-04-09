@@ -1,8 +1,13 @@
 #!/bin/bash
 
-set -uo pipefail
+set -euo pipefail
 
-SCRATCH=${SCRATCH:-/scratch/zt1/project/zaoxing-prj/user/ynn1999}
+SCRATCH="${SCRATCH:-}"
+if [ -z "${SCRATCH}" ] || [ "${SCRATCH}" = "YOUR_SCRATCH_PATH" ]; then
+    echo "ERROR: SCRATCH is not set to a valid scratch directory." >&2
+    echo "Please export SCRATCH=/path/to/your/scratch before running this script." >&2
+    exit 1
+fi
 ENV_DIR=${ENV_DIR:-${SCRATCH}/proj-dmx}
 PROJECT=${PROJECT:-${SCRATCH}/DMI/DMI}
 
@@ -83,7 +88,9 @@ mkdir -p "${RESULTS_DIR}" "${LOG_DIR}" "${ATTEMPT_DIR}"
 echo "baseline,ring_mb,max_batch_size,last_ok_bs,first_fail_bs,target_tok_s,compute_tok_s,prompts_s,total_seconds,search_total_seconds,search_log_file,search_json" > "${SUMMARY_CSV}"
 echo "baseline,ring_mb,batch_size,status,target_tok_s,compute_tok_s,prompts_s,total_seconds,log_file,json_file" > "${ATTEMPTS_CSV}"
 
-LOCAL_NVME_HF="/tmp/${USER}_hf_cache_${SLURM_JOB_ID:-manual}"
+TMP_ROOT="${TMP_ROOT:-${TMPDIR:-/tmp}}"
+mkdir -p "${TMP_ROOT}"
+LOCAL_NVME_HF="${TMP_ROOT}/${USER}_hf_cache_${SLURM_JOB_ID:-manual}"
 LOCAL_HF="${LOCAL_NVME_HF}"
 CLEANUP_DIR="${LOCAL_NVME_HF}"
 mkdir -p "${LOCAL_NVME_HF}/hub"

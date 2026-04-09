@@ -9,7 +9,12 @@
 
 set -uo pipefail
 
-SCRATCH=/scratch/zt1/project/zaoxing-prj/user/ynn1999
+SCRATCH="${SCRATCH:-}"
+if [ -z "${SCRATCH}" ] || [ "${SCRATCH}" = "YOUR_SCRATCH_PATH" ]; then
+    echo "ERROR: SCRATCH is not set to a valid scratch directory." >&2
+    echo "Please export SCRATCH=/path/to/your/scratch before running this script." >&2
+    exit 1
+fi
 ENV_DIR=${SCRATCH}/proj-dmx
 PROJECT=${SCRATCH}/DMI/DMI
 
@@ -56,7 +61,9 @@ LOG_DIR="${RESULTS_DIR}/logs"
 SUMMARY_CSV="${RESULTS_DIR}/summary.csv"
 mkdir -p "${LOG_DIR}"
 
-LOCAL_NVME_HF="/tmp/${USER}_hf_cache_${SLURM_JOB_ID}"
+TMP_ROOT="${TMP_ROOT:-${TMPDIR:-/tmp}}"
+mkdir -p "${TMP_ROOT}"
+LOCAL_NVME_HF="${TMP_ROOT}/${USER}_hf_cache_${SLURM_JOB_ID}"
 LOCAL_HF="${LOCAL_NVME_HF}"
 CLEANUP_DIR="${LOCAL_NVME_HF}"
 mkdir -p "${LOCAL_NVME_HF}/hub"
@@ -67,7 +74,7 @@ trap 'if [ -n "${CLEANUP_DIR}" ] && [ -d "${CLEANUP_DIR}" ]; then echo "Cleaning
 verify_copy() {
     local src="$1"
     local dst="$2"
-    local log="/tmp/verify_${SLURM_JOB_ID}.log"
+    local log="${TMP_ROOT}/verify_${SLURM_JOB_ID}.log"
     if ! diff -qr --no-dereference "$src" "$dst" >"$log" 2>&1; then
         echo "ERROR: copy verification failed!"
         head -100 "$log" || true

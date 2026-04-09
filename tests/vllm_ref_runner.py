@@ -3,8 +3,8 @@
 Tensors saved to disk.  Exits cleanly so GPU is released.
 
 Usage:
-    REF_CONFIG=/tmp/ref/ref_config.json \
-    python -m tests.vllm_ref_runner --output-dir /tmp/ref
+    REF_CONFIG=./tmp/ref/ref_config.json \
+    python -m tests.vllm_ref_runner --output-dir ./tmp/ref
 """
 import argparse
 import json

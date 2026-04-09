@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import os
 import random
 from collections import defaultdict
 from pathlib import Path
@@ -15,17 +16,34 @@ from datasets import Dataset
 
 
 DEFAULT_OUT_DIR = Path("benchmark/data/offline_e2e")
-SHAREGPT_PATH = Path(
-    "/home/nengneng/.cache/huggingface/hub/"
-    "datasets--anon8231489123--ShareGPT_Vicuna_unfiltered/"
-    "snapshots/192ab2185289094fc556ec8ce5ce1e8e587154ca/"
-    "ShareGPT_V3_unfiltered_cleaned_split.json"
-)
-WILDCHAT_DIR = Path(
-    "/home/nengneng/.cache/huggingface/datasets/"
-    "allenai___wild_chat-1_m/default/0.0.0/7d6490e462285cf85d91eabea0f9a954fbddcd1f"
-)
 DEFAULT_SEEDS = [3407, 3408, 3409]
+
+
+def _default_hf_home() -> Path:
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return Path(hf_home).expanduser()
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return Path(xdg_cache_home).expanduser() / "huggingface"
+    return Path.home() / ".cache" / "huggingface"
+
+
+DEFAULT_HF_HOME = _default_hf_home()
+DEFAULT_SHAREGPT_PATH = (
+    DEFAULT_HF_HOME
+    / "hub"
+    / "datasets--anon8231489123--ShareGPT_Vicuna_unfiltered"
+    / "snapshots"
+    / "192ab2185289094fc556ec8ce5ce1e8e587154ca"
+    / "ShareGPT_V3_unfiltered_cleaned_split.json"
+)
+DEFAULT_WILDCHAT_DIR = Path(
+    os.environ.get(
+        "HF_DATASETS_CACHE",
+        str(DEFAULT_HF_HOME / "datasets"),
+    )
+).expanduser() / "allenai___wild_chat-1_m" / "default" / "0.0.0" / "7d6490e462285cf85d91eabea0f9a954fbddcd1f"
 
 
 def _canonical_text(messages: Iterable[Dict[str, str]]) -> str:
@@ -178,10 +196,10 @@ def _sample_sharegpt(raw_rows: List[Dict[str, object]], seeds: List[int], sample
     return out, total
 
 
-def _load_wildchat_shards():
-    shard_paths = sorted(WILDCHAT_DIR.glob("wild_chat-1_m-train-*.arrow"))
+def _load_wildchat_shards(wildchat_dir: Path):
+    shard_paths = sorted(wildchat_dir.glob("wild_chat-1_m-train-*.arrow"))
     if not shard_paths:
-        raise FileNotFoundError(f"no WildChat shards found under {WILDCHAT_DIR}")
+        raise FileNotFoundError(f"no WildChat shards found under {wildchat_dir}")
     shards = []
     prefix = [0]
     for path in shard_paths:
@@ -246,6 +264,16 @@ def _write_jsonl(path: Path, rows: List[Dict[str, object]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sample fixed chat benchmark datasets locally.")
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
+    parser.add_argument(
+        "--sharegpt-path",
+        default=os.environ.get("SHAREGPT_PATH", str(DEFAULT_SHAREGPT_PATH)),
+        help="Path to ShareGPT_V3_unfiltered_cleaned_split.json.",
+    )
+    parser.add_argument(
+        "--wildchat-dir",
+        default=os.environ.get("WILDCHAT_DIR", str(DEFAULT_WILDCHAT_DIR)),
+        help="Directory containing wild_chat-1_m-train-*.arrow shards.",
+    )
     parser.add_argument("--sample-size", type=int, default=1000)
     parser.add_argument(
         "--seeds",
@@ -261,8 +289,10 @@ def main() -> None:
     enc = tiktoken.get_encoding("cl100k_base")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    sharegpt_path = Path(args.sharegpt_path).expanduser()
+    wildchat_dir = Path(args.wildchat_dir).expanduser()
 
-    with open(SHAREGPT_PATH, "r", encoding="utf-8") as handle:
+    with open(sharegpt_path, "r", encoding="utf-8") as handle:
         sharegpt_raw = json.load(handle)
     sharegpt_samples, sharegpt_total = _sample_sharegpt(
         sharegpt_raw,
@@ -271,7 +301,7 @@ def main() -> None:
         enc=enc,
     )
 
-    wildchat_shards, wildchat_prefix = _load_wildchat_shards()
+    wildchat_shards, wildchat_prefix = _load_wildchat_shards(wildchat_dir)
     wildchat_samples, wildchat_total = _sample_wildchat(
         wildchat_shards,
         wildchat_prefix,

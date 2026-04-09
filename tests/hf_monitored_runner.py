@@ -3,7 +3,7 @@
 Activations go to ClickHouse. Saves model_id to disk for the comparator.
 
 Usage:
-    python -m tests.hf_monitored_runner --output-dir /tmp/hf_mon
+    python -m tests.hf_monitored_runner --output-dir ./tmp/hf_mon
 """
 import argparse
 import json

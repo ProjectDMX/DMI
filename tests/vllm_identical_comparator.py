@@ -5,9 +5,9 @@ No CUDA needed — runs entirely on CPU.
 
 Usage:
     python -m tests.vllm_identical_comparator \
-        --ref-config /tmp/ref/ref_config.json \
-        --mon-dir /tmp/vllm_mon \
-        --result-file /tmp/result.json
+        --ref-config ./tmp/ref/ref_config.json \
+        --mon-dir ./tmp/vllm_mon \
+        --result-file ./tmp/result.json
 """
 import argparse
 import json

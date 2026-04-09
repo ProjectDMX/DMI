@@ -15,6 +15,47 @@
 set -e
 
 export VLLM_DISABLE_COMPILE_CACHE=1
+TMP_ROOT="${TMP_ROOT:-${PWD}/.tmp}"
+RUN_USER="${USER:-$(id -un 2>/dev/null || printf '%s' user)}"
+TORCHINDUCTOR_CACHE_ROOT="${TORCHINDUCTOR_CACHE_ROOT:-${TMP_ROOT}/torchinductor_${RUN_USER}}"
+export TORCHINDUCTOR_CACHE_ROOT
+
+safe_clear_dir() {
+    local dir_path=$1
+    local resolved_tmp_root
+    local resolved_dir_path
+
+    case "${dir_path}" in
+        ""|"/")
+            echo "ERROR: refusing to delete unsafe directory: ${dir_path:-<empty>}" >&2
+            exit 1
+            ;;
+    esac
+
+    resolved_tmp_root="$(realpath "${TMP_ROOT}" 2>/dev/null || true)"
+    resolved_dir_path="$(realpath -m "${dir_path}" 2>/dev/null || true)"
+    if [ -z "${resolved_tmp_root}" ] || [ -z "${resolved_dir_path}" ]; then
+        echo "ERROR: unable to resolve safe delete paths under TMP_ROOT." >&2
+        exit 1
+    fi
+
+    case "${resolved_tmp_root}" in
+        ""|"/"|"."|"..")
+            echo "ERROR: refusing to use unsafe TMP_ROOT=${resolved_tmp_root}" >&2
+            exit 1
+            ;;
+    esac
+
+    case "${resolved_dir_path}" in
+        "${resolved_tmp_root}"|"${resolved_tmp_root}"/*)
+            rm -rf "${resolved_dir_path}" 2>/dev/null
+            ;;
+        *)
+            echo "ERROR: refusing to delete directory outside TMP_ROOT: ${resolved_dir_path}" >&2
+            exit 1
+            ;;
+    esac
+}
 
 run_identical_test() {
     local model_name=$1
@@ -28,7 +69,8 @@ run_identical_test() {
     fi
 
     echo "=== $model_name identical check ($mode_name) ring=${ring_mb}MB ==="
-    rm -rf /tmp/torchinductor_$(whoami)/ 2>/dev/null
+    mkdir -p "${TMP_ROOT}"
+    safe_clear_dir "${TORCHINDUCTOR_CACHE_ROOT}"
     rm -rf ~/.cache/vllm/ 2>/dev/null
 
     E2E_MODEL=$model_key \

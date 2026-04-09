@@ -9,7 +9,8 @@
 #SBATCH --error=d2h-serve-llama8b-%j.err
 #SBATCH --exclude=gpu-a6-2
 
-cd ~/scratch.zaoxing-prj
+WORK_ROOT="${WORK_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+cd "${WORK_ROOT}"
 MPIRUN=/cvmfs/hpcsw.umd.edu/spack-software/2023.11.20/linux-rhel8-x86_64/gcc-11.3.0/openmpi-4.1.5-h3d4fsbq2zpfqyhmle4c44k35mvpw2bp/bin/mpirun
 
 # ---------- Environment ----------

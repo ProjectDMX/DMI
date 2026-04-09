@@ -5,9 +5,9 @@ No CUDA needed — runs entirely on CPU.
 
 Usage:
     python -m tests.hf_comparator \
-        --ref-dir /tmp/hf_ref \
-        --mon-dir /tmp/hf_mon \
-        --result-file /tmp/hf_result.json
+        --ref-dir ./tmp/hf_ref \
+        --mon-dir ./tmp/hf_mon \
+        --result-file ./tmp/hf_result.json
 """
 import argparse
 import json
