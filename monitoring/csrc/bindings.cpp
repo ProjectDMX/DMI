@@ -13,13 +13,15 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // ---- Hook definitions (single source of truth from C++ HOOK_DEFS table) ----
-  // Expose as list of (id, act_name, short_name, per_layer, group, tp_sharded) tuples.
+  // Expose as list of (id, act_name, short_name, per_layer, group, tp_sharded,
+  //                     shape_class, pp_stage) tuples — all ints except act_name/short_name.
   // Python auto-derives all mappings from this at import time.
   {
     py::list defs;
     for (int i = 0; i < ring_py::HOOK_DEFS_COUNT; i++) {
       const auto& d = ring_py::HOOK_DEFS[i];
-      defs.append(py::make_tuple(d.id, d.act_name, d.short_name, d.per_layer, d.group, d.tp_sharded));
+      defs.append(py::make_tuple(d.id, d.act_name, d.short_name, d.per_layer,
+                                 d.group, d.tp_sharded, d.shape_class, d.pp_stage));
     }
     m.attr("HOOK_DEFS") = defs;
     m.attr("HOOK_TYPE_COUNT") = (int)ring_py::HOOK_TYPE_COUNT;

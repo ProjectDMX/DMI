@@ -54,36 +54,49 @@ from torch import nn
 # ---------------------------------------------------------------------------
 from ._native_engine import _load_extension as _load_ext
 _ext = _load_ext()
-_HOOK_DEFS = _ext.HOOK_DEFS  # list of (id, act_name, short_name, per_layer, group, tp_sharded)
+# (id, act_name, short_name, per_layer, group, tp_sharded, shape_class, pp_stage)
+# group/shape_class/pp_stage are int enums matching the C++ definitions.
+_HOOK_DEFS = _ext.HOOK_DEFS
+
+# C++ enum mirrors — keep in sync with tensor_meta.h
+GROUP_ATTN, GROUP_MLP, GROUP_OTHER = 0, 1, 2
+SHAPE_HIDDEN, SHAPE_QKV_Q, SHAPE_QKV_KV, SHAPE_QKV_Z = 0, 1, 2, 3
+SHAPE_ATTN_WT, SHAPE_MLP_POST, SHAPE_TOKEN_IDS, SHAPE_LOGITS = 4, 5, 6, 7
+PP_ANY, PP_FIRST, PP_LAST = 0, 1, 2
 
 # Auto-derive all mappings
 _id_by_short: Dict[str, int] = {}       # "q" → 6
-for _id, _act, _short, _pl, _grp, _tp in _HOOK_DEFS:
+for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS:
     _id_by_short[_short] = _id
     # Inject HOOK_TYPE_Q, HOOK_TYPE_RESID_PRE, etc. into module namespace
     globals()[f"HOOK_TYPE_{_short.upper()}"] = _id
 
 # Auto-derive act_name suffix sets per group (used by config.py HookSelection).
 _ATTN_SUFFIXES: Tuple[str, ...] = tuple(
-    _act for _id, _act, _short, _pl, _grp, _tp in _HOOK_DEFS if _grp == "attn"
+    _act for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _grp == GROUP_ATTN
 )
 _MLP_SUFFIXES: Tuple[str, ...] = tuple(
-    _act for _id, _act, _short, _pl, _grp, _tp in _HOOK_DEFS if _grp == "mlp"
+    _act for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _grp == GROUP_MLP
 )
 
-# Auto-derive TP-sharded hook type set (used by vllm_integration.py).
+# Auto-derive property sets from HOOK_DEFS columns.
 TP_SHARDED_TYPES: frozenset = frozenset(
-    _id for _id, _act, _short, _pl, _grp, _tp in _HOOK_DEFS if _tp
+    _id for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _tp
+)
+_HIDDEN_DIM_TYPES: frozenset = frozenset(
+    _id for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _sc == SHAPE_HIDDEN
+)
+_ATTN_WT_TYPES: frozenset = frozenset(
+    _id for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _sc == SHAPE_ATTN_WT
+)
+PP_FIRST_ONLY: frozenset = frozenset(
+    _id for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _pp == PP_FIRST
+)
+PP_LAST_ONLY: frozenset = frozenset(
+    _id for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _pp == PP_LAST
 )
 
 del _ext, _load_ext
-
-_HIDDEN_DIM_TYPES = frozenset({
-    HOOK_TYPE_RESID_PRE, HOOK_TYPE_RESID_MID, HOOK_TYPE_RESID_FINAL,
-    HOOK_TYPE_ATTN_OUT,  HOOK_TYPE_MLP_IN,    HOOK_TYPE_MLP_OUT,
-    HOOK_TYPE_LN1,       HOOK_TYPE_LN2,
-    HOOK_TYPE_EMBED,     HOOK_TYPE_POS_EMBED,  HOOK_TYPE_FINAL_LN,
-})
 
 # ---------------------------------------------------------------------------
 # Hook selection: composable presets + individual hook types
@@ -105,12 +118,9 @@ _ALL_HOOK_TYPES = frozenset(_id_by_short.values())
 # -- Presets --
 _HOOK_SELECTIONS: Dict[str, frozenset] = {
     "full": _ALL_HOOK_TYPES,
-    # vLLM: full minus attn_scores/pattern (FlashAttention never materializes
-    # them) and resid_final (last layer's pre-norm residual is not materialized
-    # in vLLM's fused RMSNorm -- final_ln captures the post-norm value instead).
-    "vllm-full": _ALL_HOOK_TYPES - {
-        HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN,
-    },
+    # vLLM: full minus attention weight matrices (FlashAttention never
+    # materializes attn_scores/pattern).
+    "vllm-full": _ALL_HOOK_TYPES - _ATTN_WT_TYPES,
     # What HF returns with output_hidden_states + output_attentions + logits
     "hf-only": frozenset({
         HOOK_TYPE_RESID_PRE, HOOK_TYPE_FINAL_LN,
@@ -198,7 +208,7 @@ def apply_hook_selection(
 # ---------------------------------------------------------------------------
 
 # act_name is the suffix used in HookPoint names (e.g. "attn.hook_q", "token_ids")
-_HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {_act: _id for _id, _act, _short, _pl, _grp, _tp in _HOOK_DEFS}
+_HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {_act: _id for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS}
 
 
 def align_up_py(x: int, a: int) -> int:

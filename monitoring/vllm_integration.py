@@ -59,12 +59,7 @@ def normalize_vllm_request_id(req_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def filter_by_pp_rank(specs: list, is_first_rank: bool, is_last_rank: bool) -> list:
-    from .ring_transport import (
-        HOOK_TYPE_TOKEN_IDS, HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED,
-        HOOK_TYPE_FINAL_LN, HOOK_TYPE_FINAL_LOGITS,
-    )
-    first_only = {HOOK_TYPE_TOKEN_IDS, HOOK_TYPE_EMBED, HOOK_TYPE_POS_EMBED}
-    last_only = {HOOK_TYPE_FINAL_LN, HOOK_TYPE_FINAL_LOGITS}
+    from .ring_transport import PP_FIRST_ONLY as first_only, PP_LAST_ONLY as last_only
 
     filtered = []
     for s in specs:
