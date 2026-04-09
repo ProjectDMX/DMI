@@ -72,37 +72,4 @@ namespace dmx_host{
         }
     }
 
-    std::vector<dmx_host_queue_item> input_handler_v1(
-        const std::string& model_id,
-        int32_t shard_rank,
-        const std::vector<std::vector<std::string>>& request_ids,
-        const std::vector<std::vector<std::pair<int32_t, int32_t>>>& token_range_per_request,
-        const std::vector<std::map<std::string, monitoring::BackendFuture>>& cache_dicts) {
-        std::vector<dmx_host_queue_item> outputs;
-        const size_t step_cnt = request_ids.size();
-        if (step_cnt != token_range_per_request.size() || step_cnt != cache_dicts.size()) {
-            throw std::runtime_error(
-                "In input_handler_v1, request_ids.size(), token_range_per_request.size(), "
-                "cache_dicts.size() do not match.");
-        }
-        for (size_t i = 0; i < step_cnt; ++i) {
-            if (request_ids[i].size() != token_range_per_request[i].size()) {
-                throw std::runtime_error(
-                    "In input_handler_v1, request_ids[i].size() != token_range_per_request[i].size().");
-            }
-            for (const auto& [name, t_future] : cache_dicts[i]) {
-                FutureProcessRow fr;
-                fr.push_back(model_id);
-                fr.push_back(shard_rank);
-                fr.push_back(request_ids[i]);
-                fr.push_back(token_range_per_request[i]);
-                fr.push_back(name);
-                fr.push_back(t_future);
-                // Use BackendFuture reported task bytes as queue budget unit.
-                dmx_host_queue_item out_item(fr, t_future.size());
-                outputs.push_back(out_item);
-            }
-        }
-        return outputs;
-    }
 }

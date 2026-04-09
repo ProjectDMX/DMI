@@ -8,20 +8,13 @@ UNIFIED ?= 0
 LTO ?= 0
 
 TARGET := monitoring_native_backend
-SRCS := csrc/native_engine.cpp \
-        csrc/engine_core.cpp \
-        csrc/engine_utils.cpp \
-        csrc/api_submit.cpp \
-        csrc/hooks.cpp \
-        csrc/slice.cpp \
-        csrc/bindings.cpp \
+SRCS := csrc/bindings.cpp \
         csrc/dmx_host_utils.cpp \
         csrc/clickhouse_client.cpp \
         csrc/ring/drain_thread.cpp \
         csrc/ring/p2p_thread.cpp \
         csrc/ring/ring_torch_op.cpp
-HEADERS := csrc/native_engine.h csrc/native_engine_internal.h \
-           csrc/pipelined_engine.hpp csrc/dmx_host_utils.h \
+HEADERS := csrc/dmx_host_utils.h \
            csrc/clickhouse_client.h csrc/dmx_host_engine.h \
            csrc/ring/ring_config.h csrc/ring/ring_state.h csrc/ring/ring_alloc.h \
            csrc/ring/task_entry.h csrc/ring/drain_task.h csrc/ring/drain_thread.h \

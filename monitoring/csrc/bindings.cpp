@@ -1,38 +1,15 @@
-// Pybind11 module + factory
+// Pybind11 module — ring transport + ClickHouse pipeline bindings
 
-#include "native_engine_internal.h"
+#include <torch/extension.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+namespace py = pybind11;
+
 #include "clickhouse_client.h"
-// dmx_host pipeline
 #include "dmx_host_engine.h"
-// ring offload engine
 #include "ring/ring_engine_py.h"
 #include "ring/ring_torch_op.h"
 #include <ATen/cuda/CUDAContext.h>
-
-namespace monitoring {
-
-std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,
-                                                      py::object cache_dtype,
-                                                      int64_t delay_steps,
-                                                      const std::vector<int64_t>& pinpool_bins_kb,
-                                                      int64_t pinpool_max_mb,
-                                                      int64_t host_copy_threads,
-                                                      int64_t host_copy_queue_size) {
-  std::optional<at::ScalarType> dtype;
-  if (!cache_dtype.is_none()) {
-    dtype = cache_dtype.cast<at::ScalarType>();
-  }
-  return std::make_shared<NativeMonitoringEngine>(
-      queue_size,
-      dtype,
-      delay_steps,
-      pinpool_bins_kb,
-      pinpool_max_mb,
-      host_copy_threads,
-      host_copy_queue_size);
-}
-
-}  // namespace monitoring
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // ---- ClickHouseClientConfig (config only; stage is C++-only) ----
