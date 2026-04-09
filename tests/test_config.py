@@ -15,9 +15,11 @@ from monitoring.config import (
     CaptureSchedule,
     HookSelection,
     MonitoringConfig,
-    _ATTENTION_SUFFIXES,
-    _MLP_SUFFIXES,
+    _get_group_suffixes,
 )
+
+_ATTENTION_SUFFIXES = _get_group_suffixes("attn")
+_MLP_SUFFIXES = _get_group_suffixes("mlp")
 
 
 # =============================================================================

@@ -54,18 +54,28 @@ from torch import nn
 # ---------------------------------------------------------------------------
 from ._native_engine import _load_extension as _load_ext
 _ext = _load_ext()
-_HOOK_DEFS = _ext.HOOK_DEFS  # list of (id, act_name, short_name, per_layer)
+_HOOK_DEFS = _ext.HOOK_DEFS  # list of (id, act_name, short_name, per_layer, group)
 
 # Auto-derive all mappings
 _id_by_short: Dict[str, int] = {}       # "q" → 6
 _act_name_by_id: Dict[int, str] = {}    # 6 → "attn.hook_q"
 _short_by_id: Dict[int, str] = {}       # 6 → "q"
-for _id, _act, _short, _pl in _HOOK_DEFS:
+_group_by_id: Dict[int, str] = {}       # 6 → "attn"
+for _id, _act, _short, _pl, _grp in _HOOK_DEFS:
     _id_by_short[_short] = _id
     _act_name_by_id[_id] = _act
     _short_by_id[_id] = _short
+    _group_by_id[_id] = _grp
     # Inject HOOK_TYPE_Q, HOOK_TYPE_RESID_PRE, etc. into module namespace
     globals()[f"HOOK_TYPE_{_short.upper()}"] = _id
+
+# Auto-derive act_name suffix sets per group (used by config.py HookSelection).
+_ATTN_SUFFIXES: Tuple[str, ...] = tuple(
+    _act for _id, _act, _short, _pl, _grp in _HOOK_DEFS if _grp == "attn"
+)
+_MLP_SUFFIXES: Tuple[str, ...] = tuple(
+    _act for _id, _act, _short, _pl, _grp in _HOOK_DEFS if _grp == "mlp"
+)
 
 del _ext, _load_ext
 
@@ -189,7 +199,7 @@ def apply_hook_selection(
 # ---------------------------------------------------------------------------
 
 # act_name is the suffix used in HookPoint names (e.g. "attn.hook_q", "token_ids")
-_HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {_act: _id for _id, _act, _short, _pl in _HOOK_DEFS}
+_HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {_act: _id for _id, _act, _short, _pl, _grp in _HOOK_DEFS}
 
 
 def align_up_py(x: int, a: int) -> int:

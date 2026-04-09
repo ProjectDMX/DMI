@@ -3,25 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Literal, Optional
+from typing import Iterable, Literal, Optional, Sequence, Tuple
 
 
-_ATTENTION_SUFFIXES = (
-    "hook_q",
-    "hook_k",
-    "hook_v",
-    "hook_z",
-    "hook_attn_scores",
-    "hook_pattern",
-    "hook_result",
-    "hook_attn_out",
-)
-
-_MLP_SUFFIXES = (
-    "hook_mlp_in",
-    "hook_mlp_post",
-    "hook_mlp_out",
-)
+def _get_group_suffixes(group: str) -> Tuple[str, ...]:
+    """Return act_name suffixes for a hook group, derived from C++ HOOK_DEFS."""
+    from .ring_transport import _ATTN_SUFFIXES, _MLP_SUFFIXES
+    if group == "attn":
+        return _ATTN_SUFFIXES
+    elif group == "mlp":
+        return _MLP_SUFFIXES
+    raise ValueError(f"Unknown hook group: {group!r}")
 
 
 def _matches_suffix(name: str, suffixes: Sequence[str]) -> bool:
@@ -44,9 +36,9 @@ class HookSelection:
         if self.mode == "full":
             selected = list(names)
         elif self.mode == "attention":
-            selected = [name for name in names if _matches_suffix(name, _ATTENTION_SUFFIXES)]
+            selected = [name for name in names if _matches_suffix(name, _get_group_suffixes("attn"))]
         elif self.mode == "mlp":
-            selected = [name for name in names if _matches_suffix(name, _MLP_SUFFIXES)]
+            selected = [name for name in names if _matches_suffix(name, _get_group_suffixes("mlp"))]
         elif self.mode == "custom":
             if self.include is None:
                 raise ValueError("HookSelection(mode='custom') requires include to be provided.")
