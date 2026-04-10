@@ -27,6 +27,8 @@ _BUF_TO_CH_ACT = {
     "k": "blocks.attn.hook_k",
     "v": "blocks.attn.hook_v",
     "z": "blocks.attn.hook_z",
+    "attn_scores": "blocks.attn.hook_attn_scores",
+    "pattern": "blocks.attn.hook_pattern",
     "attn_out": "blocks.hook_attn_out",
     "resid_mid": "blocks.hook_resid_mid",
     "ln2": "blocks.hook_ln2",

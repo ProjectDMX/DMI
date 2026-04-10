@@ -220,7 +220,7 @@ def main():
             print("[compare] ALL PASSED", flush=True)
 
 
-_TP_SHARDED_HOOKS = {"q", "k", "v", "z", "mlp_post"}
+_TP_SHARDED_HOOKS = {"q", "k", "v", "z", "attn_scores", "pattern", "mlp_post"}
 
 
 class _StepSaver:
@@ -239,6 +239,7 @@ class _StepSaver:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.step = 0
+        self._kv_offsets: list = []  # per-request kv pad, set on prefill step
 
     def save_step(self):
         req_ids = self.engine._active_batch_request_ids
@@ -261,12 +262,14 @@ class _StepSaver:
 
         for i in range(batch_size):
             req_id = req_ids[i]
-            # starts[i] was already advanced by _prepare_ring_step
             t_end = int(starts[i])
             if is_prefill:
                 t_start = 0
-                real_tokens = t_end  # prompt_len for this request
-                pad_len = seq_len - real_tokens  # left-padding
+                real_tokens = t_end
+                pad_len = seq_len - real_tokens
+                # Store kv_offset per request (= left-pad count, constant for all steps)
+                if len(self._kv_offsets) <= i:
+                    self._kv_offsets.append(pad_len)
             else:
                 t_start = t_end - 1
                 real_tokens = 1
@@ -288,15 +291,18 @@ class _StepSaver:
                     hook_name = name
                     layer = -1
 
-                if hook_name == "final_logits":
-                    continue
-
                 # Non-zero TP ranks only save sharded hooks
                 if self.tp_rank != 0 and hook_name not in _TP_SHARDED_HOOKS:
                     continue
 
-                # Strip left-padding: real data is at buf[i, pad_len : pad_len + real_tokens]
-                chunk = buf[i, pad_len:pad_len + real_tokens].cpu().clone()
+                # attn_scores/pattern: [B, heads, q_len, kv_len] — strip kv padding
+                # matching p2p_thread's kv_offset slicing.
+                if hook_name in ("attn_scores", "pattern"):
+                    kv_total = int(cache_pos[-1]) + 1
+                    kv_pad = self._kv_offsets[i]
+                    chunk = buf[i, :, pad_len:pad_len + real_tokens, kv_pad:kv_total].cpu().clone()
+                else:
+                    chunk = buf[i, pad_len:pad_len + real_tokens].cpu().clone()
 
                 if layer >= 0:
                     fname = f"{hook_name}_L{layer}_T{t_start}_{t_end}{sr}.pt"

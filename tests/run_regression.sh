@@ -40,12 +40,17 @@ for model in qwen3 gpt2; do
     done
 done
 
-# --- HF transport correctness ---
+# --- HF transport correctness (compare model) ---
 for model in gpt2 qwen3; do
     for mode in eager cudagraph; do
         run_test "hf: $model $mode tp=1" \
-            bash tests/run_tp_compare_hf.sh "$model" "$mode"
+            bash tests/run_tp_compare_hf.sh "$model" "$mode" 1
     done
+done
+# HF TP=2 (qwen3 only — gpt2 lacks tp_plan support)
+for mode in eager cudagraph; do
+    run_test "hf: qwen3 $mode tp=2" \
+        bash tests/run_tp_compare_hf.sh qwen3 "$mode" 2
 done
 
 # --- Summary ---
