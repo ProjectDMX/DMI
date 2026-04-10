@@ -253,6 +253,7 @@ class ModelShapeConfig:
     vocab_size:   int = 0  # required for final_logits shape
     intermediate_dim: int = 0  # MLP intermediate size (for mlp_post shape)
     tp_size:      int = 1  # tensor parallel world size
+    tp_rank:      int = 0  # this rank's TP index
 
 
 # ---------------------------------------------------------------------------

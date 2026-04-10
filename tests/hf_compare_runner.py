@@ -5,11 +5,14 @@ The compare model has BOTH HookPoints (ring::producer -> ClickHouse) and
 After generate(), saves buffers to disk and compares vs ClickHouse for
 bitwise equality.
 
+Supports TP via torchrun:
+    torchrun --nproc_per_node=2 -m tests.hf_compare_runner
+
 Usage:
     E2E_MODEL=gpt2 E2E_CUDA_GRAPHS=0 python -m tests.hf_compare_runner
+    E2E_MODEL=qwen3 E2E_TP_SIZE=2 torchrun --nproc_per_node=2 -m tests.hf_compare_runner
 """
 import os
-import re
 import sys
 import tempfile
 import uuid
@@ -36,6 +39,16 @@ def main():
     cuda_graphs = os.environ.get("E2E_CUDA_GRAPHS", "0") == "1"
     db_host = os.environ.get("DMX_DB_HOST", "localhost")
     db_port = int(os.environ.get("DMX_DB_PORT", "9000"))
+    tp_size = int(os.environ.get("E2E_TP_SIZE", "1"))
+
+    # Init distributed for TP
+    tp_rank = 0
+    if tp_size > 1:
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            dist.init_process_group("nccl")
+        tp_rank = dist.get_rank()
+        torch.cuda.set_device(tp_rank)
 
     device = torch.device("cuda")
 
@@ -47,9 +60,14 @@ def main():
         from transformers.models.gpt2_compare.modeling_gpt2 import CompareGPT2LMHeadModel
         model_cls = CompareGPT2LMHeadModel
 
-    model = model_cls.from_pretrained(
-        hf_model_id, attn_implementation="eager", torch_dtype=torch.float16
-    ).to(device).eval()
+    load_kwargs = dict(attn_implementation="eager", torch_dtype=torch.float16)
+    if tp_size > 1:
+        load_kwargs["tp_plan"] = "auto"
+
+    model = model_cls.from_pretrained(hf_model_id, **load_kwargs).to(device).eval()
+    if tp_size > 1:
+        import torch.distributed as dist
+        dist.barrier()
 
     tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
     if tokenizer.pad_token_id is None:
@@ -64,15 +82,19 @@ def main():
     attention_mask = encoded["attention_mask"].to(device)
 
     max_total_len = int(input_ids.shape[1]) + max_new_tokens + 16
-    model.allocate_compare_buffers(batch_size, max_total_len, dtype=torch.float16)
+    model.allocate_compare_buffers(batch_size, max_total_len, dtype=torch.float16, tp_size=tp_size)
 
-    # ClickHouse setup
+    # ClickHouse setup — drop per-rank tables
     import clickhouse_driver
     ch_client = clickhouse_driver.Client(db_host, port=db_port)
+    table_name = f"offload_rank{tp_rank}" if tp_size > 1 else "offload"
     try:
-        ch_client.execute("DROP TABLE IF EXISTS default.offload")
+        ch_client.execute(f"DROP TABLE IF EXISTS default.{table_name}")
     except Exception:
         pass
+    if tp_size > 1:
+        import torch.distributed as dist
+        dist.barrier()
 
     ch_cfg = ClickHouseClientConfig()
     ch_cfg.host = db_host
@@ -80,7 +102,7 @@ def main():
     ch_cfg.username = os.environ.get("DMX_DB_USER", "default")
     ch_cfg.password = os.environ.get("DMX_DB_PASSWORD", "")
     ch_cfg.database = "default"
-    ch_cfg.table = "offload"
+    ch_cfg.table = f"offload_rank{tp_rank}" if tp_size > 1 else "offload"
     ch_cfg.secure = False
     ch_cfg.client_side_compress = "none"
     ch_cfg.client_settings = None
@@ -120,14 +142,28 @@ def main():
     )
     engine.enable_ring_transport(ring_cfg)
     model.monitoring_engine = engine
+    if tp_size > 1:
+        import torch.distributed as dist
+        dist.barrier()
 
     mode = "cudagraph" if cuda_graphs else "eager"
-    print(f"[compare] model={model_key} mode={mode} batch={batch_size} "
-          f"tokens={max_new_tokens}", flush=True)
+    if tp_rank == 0:
+        print(f"[compare] model={model_key} mode={mode} tp={tp_size} "
+              f"batch={batch_size} tokens={max_new_tokens}", flush=True)
 
-    compare_dir = tempfile.mkdtemp(prefix="hf_compare_ref_")
-    print(f"[compare] ref_dir={compare_dir}", flush=True)
-    _step_saver = _StepSaver(model, engine, compare_dir)
+    # Shared compare dir across ranks — rank 0 creates, broadcasts to all
+    if tp_rank == 0:
+        compare_dir = tempfile.mkdtemp(prefix="hf_compare_ref_")
+        print(f"[compare] ref_dir={compare_dir}", flush=True)
+    else:
+        compare_dir = ""
+    if tp_size > 1:
+        import torch.distributed as dist
+        obj_list = [compare_dir]
+        dist.broadcast_object_list(obj_list, src=0)
+        compare_dir = obj_list[0]
+
+    _step_saver = _StepSaver(model, engine, compare_dir, tp_rank, tp_size)
     _save_handle = model.register_forward_hook(
         lambda mod, inp, out: _step_saver.save_step()
     )
@@ -152,20 +188,39 @@ def main():
         engine.close()
 
     generated_ids = outputs.sequences if hasattr(outputs, "sequences") else outputs
-    for i in range(batch_size):
-        n_gen = (generated_ids[i] != pad_id).sum().item() - (input_ids[i] != pad_id).sum().item()
-        print(f"  prompt[{i}]: {n_gen} tokens generated")
+    if tp_rank == 0:
+        for i in range(batch_size):
+            n_gen = (generated_ids[i] != pad_id).sum().item() - (input_ids[i] != pad_id).sum().item()
+            print(f"  prompt[{i}]: {n_gen} tokens generated")
 
-    # Compare disk vs ClickHouse
-    print("\n[compare] Comparing disk vs ClickHouse...", flush=True)
-    from tests.compare_disk_vs_ch import read_clickhouse, compare
-    ch_data, num_rows = read_clickhouse(db_host, db_port)
-    passed, failed = compare(compare_dir, ch_data, num_rows)
+    # Barrier so all ranks finish writing ref files before comparison
+    if tp_size > 1:
+        import torch.distributed as dist
+        dist.barrier()
 
-    if failed > 0:
-        sys.exit(1)
-    else:
-        print("[compare] ALL PASSED", flush=True)
+    # Only rank 0 compares — merge all per-rank CH tables
+    if tp_rank == 0:
+        print("\n[compare] Comparing disk vs ClickHouse...", flush=True)
+        from tests.compare_disk_vs_ch import read_clickhouse, compare
+        ch_data_all = {}
+        total_rows = 0
+        if tp_size > 1:
+            for r in range(tp_size):
+                data, n = read_clickhouse(db_host, db_port,
+                                          table=f"offload_rank{r}")
+                ch_data_all.update(data)
+                total_rows += n
+        else:
+            ch_data_all, total_rows = read_clickhouse(db_host, db_port)
+        passed, failed = compare(compare_dir, ch_data_all, total_rows)
+
+        if failed > 0:
+            sys.exit(1)
+        else:
+            print("[compare] ALL PASSED", flush=True)
+
+
+_TP_SHARDED_HOOKS = {"q", "k", "v", "z", "mlp_post"}
 
 
 class _StepSaver:
@@ -176,10 +231,13 @@ class _StepSaver:
     the correct (start, end) for each request, then save the buffer slice.
     """
 
-    def __init__(self, model, engine, compare_dir: str):
+    def __init__(self, model, engine, compare_dir: str,
+                 tp_rank: int = 0, tp_size: int = 1):
         self.model = model
         self.engine = engine
         self.compare_dir = compare_dir
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
         self.step = 0
 
     def save_step(self):
@@ -220,6 +278,8 @@ class _StepSaver:
             req_dir = os.path.join(self.compare_dir, req_id)
             os.makedirs(req_dir, exist_ok=True)
 
+            sr = f"_SR{self.tp_rank}" if self.tp_size > 1 else ""
+
             for name, buf in bufs.items():
                 if "_L" in name:
                     hook_name = name.rsplit("_L", 1)[0]
@@ -231,13 +291,17 @@ class _StepSaver:
                 if hook_name == "final_logits":
                     continue
 
+                # Non-zero TP ranks only save sharded hooks
+                if self.tp_rank != 0 and hook_name not in _TP_SHARDED_HOOKS:
+                    continue
+
                 # Strip left-padding: real data is at buf[i, pad_len : pad_len + real_tokens]
                 chunk = buf[i, pad_len:pad_len + real_tokens].cpu().clone()
 
                 if layer >= 0:
-                    fname = f"{hook_name}_L{layer}_T{t_start}_{t_end}.pt"
+                    fname = f"{hook_name}_L{layer}_T{t_start}_{t_end}{sr}.pt"
                 else:
-                    fname = f"{hook_name}_T{t_start}_{t_end}.pt"
+                    fname = f"{hook_name}_T{t_start}_{t_end}{sr}.pt"
 
                 torch.save(chunk, os.path.join(req_dir, fname))
 

@@ -263,11 +263,17 @@ class MonitoringEngine:
         import os
         if os.environ.get("RING_DEBUG_STEP"):
             print(f"[ring_step] prefill={is_prefill} token_ranges={token_ranges} finished={list(finished)}")
+        tp_rank = 0
+        if self._ring_transport is not None:
+            cfg = getattr(self._ring_transport, "_model_cfg", None)
+            if cfg is not None:
+                tp_rank = getattr(cfg, "tp_rank", 0)
         self._ring_transport.set_step_context(
             model_id=str(self._model_id),
             req_ids=list(req_ids),
             token_ranges=token_ranges,
             kv_offsets=kv_offsets,
+            tp_rank=tp_rank,
         )
 
     # ------------------------------------------------------------------
