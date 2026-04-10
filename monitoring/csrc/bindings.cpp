@@ -1,123 +1,31 @@
-// Pybind11 module + factory
+// Pybind11 module — ring transport + ClickHouse pipeline bindings
 
-#include "native_engine_internal.h"
+#include <torch/extension.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+namespace py = pybind11;
+
 #include "clickhouse_client.h"
-// dmx_host pipeline
 #include "dmx_host_engine.h"
-#include "future_process.h"
-
-namespace monitoring {
-
-std::shared_ptr<NativeMonitoringEngine> create_engine(int64_t queue_size,
-                                                      py::object cache_dtype,
-                                                      int64_t delay_steps,
-                                                      const std::vector<int64_t>& pinpool_bins_kb,
-                                                      int64_t pinpool_max_mb,
-                                                      int64_t host_copy_threads,
-                                                      int64_t host_copy_queue_size) {
-  std::optional<at::ScalarType> dtype;
-  if (!cache_dtype.is_none()) {
-    dtype = cache_dtype.cast<at::ScalarType>();
-  }
-  return std::make_shared<NativeMonitoringEngine>(
-      queue_size,
-      dtype,
-      delay_steps,
-      pinpool_bins_kb,
-      pinpool_max_mb,
-      host_copy_threads,
-      host_copy_queue_size);
-}
-
-}  // namespace monitoring
+#include "ring/ring_engine_py.h"
+#include "ring/ring_torch_op.h"
+#include "ring/tensor_meta.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  py::class_<monitoring::NativeMonitoringEngine,
-             std::shared_ptr<monitoring::NativeMonitoringEngine>>(m, "NativeMonitoringEngine")
-      .def("submit_step", &monitoring::NativeMonitoringEngine::submit_step,
-           py::arg("step_id"), py::arg("tasks"),
-           py::arg("stream_handle") = std::optional<uint64_t>())
-      .def("set_capture_schedule", &monitoring::NativeMonitoringEngine::set_capture_schedule,
-           py::arg("step_stride"), py::arg("step_offset"), py::arg("warmup_steps"),
-           py::arg("capture_prefill"), py::arg("capture_decode"),
-           py::arg("request_stride"), py::arg("request_offset"), py::arg("warmup_requests"))
-      .def("begin_request", &monitoring::NativeMonitoringEngine::begin_request,
-           py::arg("request_id"))
-      .def("begin_step", &monitoring::NativeMonitoringEngine::begin_step,
-           py::arg("step_id"),
-           py::arg("phase") = static_cast<int64_t>(monitoring::StepPhase::kUnknown))
-      .def("set_partial_seal_config",
-           &monitoring::NativeMonitoringEngine::set_partial_seal_config,
-           py::arg("enabled"),
-           py::arg("chunk_bytes"),
-           py::arg("cap_enabled"),
-           py::arg("cap_ratio"),
-           py::arg("driver_guard_mb"))
-      .def("create_hook_callback", &monitoring::NativeMonitoringEngine::create_hook_callback,
-           py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("pos_slice"),
-           py::arg("target_device") = py::none())
-      .def("create_hook_callback_with_cache",
-           &monitoring::NativeMonitoringEngine::create_hook_callback_with_cache,
-           py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("pos_slice"),
-           py::arg("target_device") = py::none(), py::arg("cache"))
-      .def("create_hook_callback_with_cache_sig",
-           &monitoring::NativeMonitoringEngine::create_hook_callback_with_cache_sig,
-           py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
-           py::arg("target_device") = py::none(), py::arg("cache"))
-      .def("create_global_hook_callback_sig",
-           &monitoring::NativeMonitoringEngine::create_global_hook_callback_sig,
-           py::arg("hook_name"), py::arg("remove_batch_dim"), py::arg("slice_tuple"),
-           py::arg("target_device") = py::none())
-      .def("set_enabled_hooks", &monitoring::NativeMonitoringEngine::set_enabled_hooks,
-           py::arg("enabled_names"))
-      .def("collect_step_futures_into",
-           &monitoring::NativeMonitoringEngine::collect_step_futures_into,
-           py::arg("step_id"), py::arg("cache"))
-      .def("add_task", &monitoring::NativeMonitoringEngine::add_task,
-           py::arg("step_id"), py::arg("task"))
-      .def("seal_step", &monitoring::NativeMonitoringEngine::seal_step,
-           py::arg("step_id"),
-           py::arg("stream_handle") = std::optional<uint64_t>())
-      .def("append_hook", &monitoring::NativeMonitoringEngine::append_hook,
-           py::arg("step_id"), py::arg("hook_name"), py::arg("tensor"),
-           py::arg("remove_batch_dim"), py::arg("pos_slice"),
-           py::arg("target_device") = py::none())
-      .def("resolve_all", &monitoring::NativeMonitoringEngine::resolve_all)
-      .def("future_ready", &monitoring::NativeMonitoringEngine::future_ready,
-           py::arg("token"))
-      .def("future_wait", &monitoring::NativeMonitoringEngine::future_wait,
-           py::arg("token"), py::arg("timeout") = std::optional<double>(),
-           py::arg("called_from_cpp") = false)
-      .def("future_result", &monitoring::NativeMonitoringEngine::future_result,
-           py::arg("token"), py::arg("timeout") = std::optional<double>(),
-           py::arg("called_from_cpp") = false)
-      .def("close", &monitoring::NativeMonitoringEngine::close)
-      .def("clear_completed_results", &monitoring::NativeMonitoringEngine::clear_completed_results)
-      .def("get_stats", &monitoring::NativeMonitoringEngine::get_stats);
-
-  // C++ BackendFuture class exposed to Python with the same interface as before.
-  py::class_<monitoring::BackendFuture>(m, "BackendFuture")
-      .def(py::init<std::shared_ptr<monitoring::NativeMonitoringEngine>, int64_t>(),
-           py::arg("backend"), py::arg("token"))
-      .def("size", &monitoring::BackendFuture::size)
-      .def("ready", &monitoring::BackendFuture::ready)
-      .def("wait", &monitoring::BackendFuture::wait,
-           py::arg("timeout") = std::optional<double>(),
-           py::arg("called_from_cpp") = false)
-      .def("result", &monitoring::BackendFuture::result,
-           py::arg("timeout") = std::optional<double>(),
-           py::arg("called_from_cpp") = false);
-
-  m.def("create_engine", &monitoring::create_engine,
-        py::arg("queue_size"),
-        py::arg("cache_dtype"),
-        py::arg("delay_steps"),
-        py::arg("pinpool_bins_kb") = std::vector<int64_t>{256, 512, 1024, 2048, 4096, 8192},
-        py::arg("pinpool_max_mb") = 512,
-        py::arg("host_copy_threads") = 0,
-        py::arg("host_copy_queue_size") = 512);
-
-
+  // ---- Hook definitions (single source of truth from C++ HOOK_DEFS table) ----
+  // Expose as list of (id, act_name, short_name, per_layer, group, tp_sharded,
+  //                     shape_class, pp_stage) tuples — all ints except act_name/short_name.
+  // Python auto-derives all mappings from this at import time.
+  {
+    py::list defs;
+    for (int i = 0; i < ring_py::HOOK_DEFS_COUNT; i++) {
+      const auto& d = ring_py::HOOK_DEFS[i];
+      defs.append(py::make_tuple(d.id, d.act_name, d.short_name, d.per_layer,
+                                 d.group, d.tp_sharded, d.shape_class, d.pp_stage));
+    }
+    m.attr("HOOK_DEFS") = defs;
+    m.attr("HOOK_TYPE_COUNT") = (int)ring_py::HOOK_TYPE_COUNT;
+  }
   // ---- ClickHouseClientConfig (config only; stage is C++-only) ----
   py::class_<dmx_host::ClickHouseClientConfig>(m, "ClickHouseClientConfig")
       .def(py::init<>())
@@ -261,25 +169,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "thread_name_prefix",
           [](const StageConfig& s) { return s.thread_name_prefix; },
           [](StageConfig& s, std::optional<std::string> v) { s.thread_name_prefix = std::move(v); })
-      // Stage 1: ProcessFuture
-      .def_static(
-          "process_future",
-          [](int parallelism, std::string name, bool debug) {
-            StageConfig cfg;
-            cfg.name = std::move(name);
-            cfg.parallelism = parallelism;
-            cfg.process_fn = [](std::vector<dmx_host::dmx_host_queue_item> batch, QueueT* next_q) {
-              return dmx_host::ProcessFutureStage::ProcessFn<QueueT>(std::move(batch), next_q);
-            };
-            cfg.thread_init_config = debug;
-            cfg.thread_init = &dmx_host::ProcessFutureStage::ThreadInitAny;
-            cfg.thread_cleanup = &dmx_host::ProcessFutureStage::ThreadCleanupAny;
-            return cfg;
-          },
-          py::arg("parallelism") = 1,
-          py::arg("name") = "process_future",
-          py::arg("debug") = false)
-      // Stage 2: ClickHouse insert (this is where thread_init_config matters)
+      // ClickHouse insert stage (the only stage in DMXHostEngine)
       .def_static(
           "clickhouse_insert",
           [](const dmx_host::ClickHouseClientConfig& ch_cfg, int parallelism, std::string name) {
@@ -300,7 +190,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("name") = "clickhouse_insert");
 
   py::class_<DMXHostEngine, std::shared_ptr<DMXHostEngine>>(m, "DMXHostEngine")
-      .def(py::init<std::array<StageConfig, 2>>(), py::arg("stages"))
+      .def(py::init<StageConfig>(), py::arg("insert_stage"))
       .def("start", &DMXHostEngine::start)
       .def("stop",
            [](DMXHostEngine& self, bool graceful, std::optional<double> timeout_s) {
@@ -323,9 +213,182 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("failures", &DMXHostEngine::failures)
       .def("raise_if_failed", &DMXHostEngine::raise_if_failed)
-      .def("submit", &DMXHostEngine::submit,
-          py::arg("model_id"), py::arg("shard_rank"),
-          py::arg("request_ids"), py::arg("token_range_per_request"),
-          py::arg("cache_dicts"),
-          py::call_guard<py::gil_scoped_release>());
+      // Submit a pre-formatted ClickHouseRow directly to the insert stage.
+      // Called from the ring transport drain callback after format processing.
+      .def("submit_direct",
+           [](DMXHostEngine& self,
+              const std::string& model_id, int32_t shard_rank,
+              const std::string& req_id, const std::string& act_name,
+              int32_t layer_no, int32_t start_token, int32_t end_token,
+              at::Tensor tensor) {
+             at::Tensor t = tensor.is_contiguous() ? tensor : tensor.contiguous();
+             uint64_t nbytes = static_cast<uint64_t>(t.nbytes());
+             dmx_host::ClickHouseRow row;
+             row.push_back(model_id);
+             row.push_back(req_id);
+             row.push_back(act_name);
+             row.push_back(layer_no);
+             row.push_back(shard_rank);
+             row.push_back(start_token);
+             row.push_back(end_token);
+             row.push_back(std::move(t));
+             self.submit_direct(std::move(row), nbytes);
+           },
+           py::arg("model_id"), py::arg("shard_rank"),
+           py::arg("req_id"), py::arg("act_name"),
+           py::arg("layer_no"), py::arg("start_token"), py::arg("end_token"),
+           py::arg("tensor"),
+           py::call_guard<py::gil_scoped_release>());
+
+  // -------------------------------------------------------------------------
+  // Ring offload engine
+  // -------------------------------------------------------------------------
+  py::class_<ring_py::RingConfig>(m, "RingConfig")
+      .def(py::init<>())
+      .def_readwrite("task_ring_entries",         &ring_py::RingConfig::task_ring_entries)
+      .def_readwrite("payload_ring_bytes",        &ring_py::RingConfig::payload_ring_bytes)
+      .def_readwrite("pinned_staging_bytes",      &ring_py::RingConfig::pinned_staging_bytes)
+      .def_readwrite("drain_poll_timeout_us",     &ring_py::RingConfig::drain_poll_timeout_us)
+      .def_readwrite("drain_flush_task_ratio",     &ring_py::RingConfig::drain_flush_task_ratio)
+      .def_readwrite("drain_flush_payload_ratio",  &ring_py::RingConfig::drain_flush_payload_ratio)
+      .def_readwrite("drain_flush_entry_threshold", &ring_py::RingConfig::drain_flush_entry_threshold)
+      .def_readwrite("drain_flush_byte_threshold",  &ring_py::RingConfig::drain_flush_byte_threshold)
+      .def_readwrite("drain_flush_timeout_us",     &ring_py::RingConfig::drain_flush_timeout_us)
+      .def_readwrite("clone_slices",              &ring_py::RingConfig::clone_slices)
+      .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
+      .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
+
+  py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
+      .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
+             ring_py::SubmitFn submit_fn;
+             if (!host_engine_obj.is_none()) {
+                 auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
+                 submit_fn = [host](const std::string& model_id, int32_t shard_rank,
+                                    const std::string& req_id, const std::string& act_name,
+                                    int32_t layer_no, int32_t start_token, int32_t end_token,
+                                    at::Tensor slice) {
+                     dmx_host::ClickHouseRow row;
+                     row.emplace_back(model_id);
+                     row.emplace_back(req_id);
+                     row.emplace_back(act_name);
+                     row.emplace_back(layer_no);
+                     row.emplace_back(shard_rank);
+                     row.emplace_back(start_token);
+                     row.emplace_back(end_token);
+                     uint64_t nbytes = static_cast<uint64_t>(slice.nbytes());
+                     row.emplace_back(std::move(slice));
+                     host->submit_direct(std::move(row), nbytes);
+                 };
+             }
+             return std::make_shared<ring_py::RingEnginePy>(
+                 std::move(cfg), std::move(submit_fn));
+           }),
+           py::arg("config"), py::arg("host_engine") = py::none())
+      .def("init",  &ring_py::RingEnginePy::init,
+           py::arg("stream_handle") = uint64_t{0})
+      .def("start", &ring_py::RingEnginePy::start)
+      .def("stop",  &ring_py::RingEnginePy::stop,
+           py::call_guard<py::gil_scoped_release>())
+      .def("prepare_step",
+           &ring_py::RingEnginePy::prepare_step,
+           py::arg("step_total_bytes"),
+           py::arg("num_hooks"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("submit_cpu_direct",
+           [](ring_py::RingEnginePy& self, at::Tensor cpu_tensor) {
+               uint64_t nbytes = static_cast<uint64_t>(cpu_tensor.nbytes());
+               self.submit_cpu_direct(std::move(cpu_tensor), nbytes);
+           },
+           py::arg("cpu_tensor"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("payload_cap", &ring_py::RingEnginePy::payload_cap)
+      .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
+      .def("task_cap",    &ring_py::RingEnginePy::task_cap)
+      .def("push_all_metas",
+           [](ring_py::RingEnginePy& self,
+              py::list hook_types_py,
+              py::list layer_nos_py,
+              py::list shapes_py,
+              py::list dtypes_py,
+              const std::string& model_id,
+              int32_t tp_rank,
+              int32_t dp_rank,
+              int32_t ep_rank,
+              int32_t pp_rank,
+              bool flattened,
+              py::list req_ids_py,
+              py::list token_ranges_py,
+              py::list dim0_offsets_py,
+              py::list kv_offsets_py) {
+               // Build step context (heap-allocated, ownership to FIFO/p2p)
+               auto* ctx = new ring_py::StepContext();
+               ctx->model_id  = model_id;
+               ctx->tp_rank   = tp_rank;
+               ctx->dp_rank   = dp_rank;
+               ctx->ep_rank   = ep_rank;
+               ctx->pp_rank   = pp_rank;
+               ctx->flattened = flattened;
+               ctx->requests.reserve(static_cast<size_t>(py::len(req_ids_py)));
+               for (size_t i = 0; i < static_cast<size_t>(py::len(req_ids_py)); ++i) {
+                   ring_py::RequestMeta rm;
+                   rm.req_id      = py::cast<std::string>(req_ids_py[i]);
+                   py::tuple tr   = token_ranges_py[i].cast<py::tuple>();
+                   rm.start_token = py::cast<int32_t>(tr[0]);
+                   rm.end_token   = py::cast<int32_t>(tr[1]);
+                   rm.dim0_offset = py::cast<int64_t>(dim0_offsets_py[i]);
+                   if (i < static_cast<size_t>(py::len(kv_offsets_py)))
+                       rm.kv_offset = py::cast<int32_t>(kv_offsets_py[i]);
+                   ctx->requests.push_back(std::move(rm));
+               }
+               // Build per-hook metas
+               size_t n = static_cast<size_t>(py::len(hook_types_py));
+               std::vector<ring_py::TensorMeta> metas;
+               metas.reserve(n);
+               for (size_t i = 0; i < n; ++i) {
+                   ring_py::TensorMeta meta;
+                   meta.hook_type    = py::cast<int>(hook_types_py[i]);
+                   meta.layer_no     = py::cast<int>(layer_nos_py[i]);
+                   meta.dtype        = static_cast<int>(dtypes_py[i].cast<at::ScalarType>());
+                   meta.last_in_step = (i == n - 1);
+                   py::list shape    = shapes_py[i].cast<py::list>();
+                   for (auto d : shape)
+                       meta.shape.push_back(py::cast<int64_t>(d));
+                   metas.push_back(std::move(meta));
+               }
+               // Release GIL, push context + metas in single lock
+               py::gil_scoped_release release;
+               self.push_step(ctx, metas);
+           },
+           py::arg("hook_types"), py::arg("layer_nos"),
+           py::arg("shapes"), py::arg("dtypes"),
+           py::arg("model_id"),
+           py::arg("tp_rank"), py::arg("dp_rank"),
+           py::arg("ep_rank"), py::arg("pp_rank"),
+           py::arg("flattened"),
+           py::arg("req_ids"), py::arg("token_ranges"),
+           py::arg("dim0_offsets"),
+           py::arg("kv_offsets") = py::list())
+      .def("set_null_mode",
+           &ring_py::RingEnginePy::set_null_mode,
+           py::arg("enabled"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("notify_drain",
+           &ring_py::RingEnginePy::notify_drain,
+           py::call_guard<py::gil_scoped_release>());
+
+  // Register the active ring engine pointer so C++ ring_producer_impl can
+  // call it during CUDA graph capture.  The raw pointer is valid as long as
+  // Python holds the shared_ptr (i.e. while the RingTransport is active).
+  m.def("ring_set_active_engine",
+        [](std::shared_ptr<ring_py::RingEnginePy> engine) {
+            ring_set_active_engine(engine.get());
+        },
+        py::arg("engine"));
+
+  m.def("ring_clear_active_engine",
+        []() { ring_set_active_engine(nullptr); });
+
+  m.def("ring_set_cpu_direct",
+        [](bool enabled) { ring_set_cpu_direct(enabled); },
+        py::arg("enabled"));
 }

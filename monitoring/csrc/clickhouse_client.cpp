@@ -397,7 +397,7 @@ void ClickHouseInsertStage::InsertBatch(std::vector<dmx_host_queue_item>&& batch
   std::vector<StagedRow> rows;
   rows.reserve(batch.size());
   for (auto& row : batch) {
-    rows.emplace_back(StageOneRow(std::move(std::get<ClickHouseRow>(row.core))));
+    rows.emplace_back(StageOneRow(std::move(row.core)));
   }
 
   const std::string fq_table = QualifiedTableNameQuoted(tl_db, tl_table);

@@ -2,25 +2,22 @@ PYTHON ?= python
 CXX ?= g++
 
 # Optional toggles
-#   UNIFIED=1  -> build single TU (csrc/unified.cpp) for maximum inlining
 #   LTO=1      -> enable link-time optimization (-flto)
-UNIFIED ?= 0
 LTO ?= 0
 
 TARGET := monitoring_native_backend
-SRCS := csrc/native_engine.cpp \
-        csrc/engine_core.cpp \
-        csrc/engine_utils.cpp \
-        csrc/api_submit.cpp \
-        csrc/hooks.cpp \
-        csrc/slice.cpp \
-        csrc/bindings.cpp \
-        csrc/dmx_host_utils.cpp \
-        csrc/future_process.cpp \
-        csrc/clickhouse_client.cpp
-HEADERS := csrc/native_engine.h csrc/native_engine_internal.h \
-csrc/pipelined_engine.hpp csrc/dmx_host_utils.h csrc/future_process.h \
-           csrc/clickhouse_client.h csrc/dmx_host_engine.h
+SRCS := csrc/bindings.cpp \
+        csrc/clickhouse_client.cpp \
+        csrc/ring/drain_thread.cpp \
+        csrc/ring/p2p_thread.cpp \
+        csrc/ring/ring_torch_op.cpp
+HEADERS := csrc/dmx_host_utils.h \
+           csrc/clickhouse_client.h csrc/dmx_host_engine.h \
+           csrc/ring/ring_config.h csrc/ring/ring_state.h csrc/ring/ring_alloc.h \
+           csrc/ring/task_entry.h csrc/ring/drain_task.h csrc/ring/drain_thread.h \
+           csrc/ring/p2p_thread.h csrc/ring/pinned_staging.h \
+           csrc/ring/ring_engine.h csrc/ring/ring_engine_py.h \
+           csrc/ring/ring_torch_op.h csrc/ring/tensor_meta.h
 BUILD_DIR := build
 OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 PROJECT_ROOT := $(abspath $(CURDIR)/..)
@@ -52,10 +49,11 @@ PYBIND_FLAGS := $(shell $(PYTHON) -c "import pybind11; print(' '.join([f'-DPYBIN
 CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
             -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=$(TARGET) \
             $(ABI_FLAG) $(PYBIND_FLAGS) \
-            $(TORCH_INCLUDE_FLAGS) $(PYTHON_INCLUDE_FLAGS) $(CUDA_INCLUDE_FLAGS) -Icsrc
+            $(TORCH_INCLUDE_FLAGS) $(PYTHON_INCLUDE_FLAGS) $(CUDA_INCLUDE_FLAGS) -Icsrc \
+            -MMD -MP
 
 LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPATH_FLAGS) \
-           -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -lcudart -lpthread
+           -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -lcudart -lcuda -lpthread
 
 
 # ---- ClickHouse C++ client (fixed in-repo paths) ----
@@ -96,6 +94,28 @@ LDFLAGS  += -L$(VENV_PREFIX)/lib -Wl,-rpath,$(VENV_PREFIX)/lib
 endif
 endif
 
+# ---- CUDA kernel compilation (nvcc) ----------------------------------------
+NVCC    ?= /usr/local/cuda/bin/nvcc
+SM_ARCH ?= native
+
+NVCCFLAGS := \
+    -std=c++17 \
+    -arch=$(SM_ARCH) \
+    -O2 \
+    -Xcompiler -fPIC \
+    $(ABI_FLAG) \
+    $(CUDA_INCLUDE_FLAGS) \
+    $(TORCH_INCLUDE_FLAGS) \
+    $(PYTHON_INCLUDE_FLAGS) \
+    -Icsrc
+
+RING_SRCS := csrc/ring/producer.cu \
+             csrc/ring/ring_engine.cu \
+             csrc/ring/ring_engine_py.cu
+RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
+
+OBJS += $(RING_OBJS)
+
 .PHONY: all build clean
 
 all: $(FINAL_TARGET)
@@ -104,7 +124,12 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ring/%.o: csrc/ring/%.cu | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) -MMD -MP -MF $(@:.o=.d) -c $< -o $@
 
 $(FINAL_TARGET): $(OBJS)
 	$(CXX) -shared $^ -o $(BUILD_DIR)/$(TARGET_SO) $(LDFLAGS)
@@ -115,11 +140,6 @@ clean:
 	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET)
 
 # Overrides --------------------------------------------------------------
-ifeq ($(UNIFIED),1)
-SRCS := csrc/unified.cpp
-OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
-endif
-
 ifeq ($(LTO),1)
 CXXFLAGS += -flto
 LDFLAGS += -flto
@@ -131,3 +151,8 @@ NVTX ?= 0
 ifeq ($(NVTX),1)
 LDFLAGS += -lnvToolsExt
 endif
+
+# Automatic header dependency tracking.
+# -MMD -MP (g++) and -MMD -MF (nvcc) above generate .d files alongside .o files.
+# Including them here makes make rebuild any .o whose headers have changed.
+-include $(wildcard $(BUILD_DIR)/*.d $(BUILD_DIR)/ring/*.d)

@@ -80,7 +80,6 @@ def main() -> None:
     db_cfg = _build_db_config()
     host_cfg = _build_host_config(db_cfg, debug=bool(cfg.debug))
     engine = MonitoringEngine(
-        async_enabled=True,
         config=cfg,
         model_id=model_id,
         db_config=host_cfg,

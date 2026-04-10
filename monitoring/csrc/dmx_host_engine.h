@@ -6,20 +6,28 @@
 
 namespace dmx_host{
 
-class DMXHostEngine : public PipelinedEngine<dmx_host_queue_item, uint64_t, 2, QueueOptions<false, false, false>, false, 
+// DMXHostEngine is a single-stage ClickHouse insert pipeline.
+// Pre-assembled ClickHouseRows are submitted via submit_direct().
+class DMXHostEngine : public PipelinedEngine<dmx_host_queue_item, uint64_t, 1, QueueOptions<false, false, false>, false,
 NoOutputHandler<dmx_host_queue_item> >{
 public:
-    DMXHostEngine(std::array<StageConfig, 2> two_stages): 
-    PipelinedEngine (two_stages, EngineConfig{}){
-    }
-    void submit(
-        const std::string& model_id,
-        int32_t shard_rank,
-        const std::vector<std::vector<std::string>>& request_ids,
-        const std::vector<std::vector<std::pair<int32_t, int32_t>>>& token_range_per_request,
-        const std::vector<std::map<std::string, monitoring::BackendFuture>>& cache_dicts) {
-        submit_items(input_handler_v1(
-            model_id, shard_rank, request_ids, token_range_per_request, cache_dicts));
+    explicit DMXHostEngine(StageConfig insert_stage):
+    PipelinedEngine(std::array<StageConfig, 1>{std::move(insert_stage)}, EngineConfig{}){}
+
+    // Submit a pre-assembled ClickHouseRow directly to the insert stage.
+    // Fields must match the order expected by ClickHouseInsertStage:
+    //   [0] model_id     (string)
+    //   [1] request_id   (string)
+    //   [2] act_name     (string)
+    //   [3] layer_no     (int32)
+    //   [4] shard_rank   (int32)
+    //   [5] start_token  (int32)
+    //   [6] end_token    (int32)
+    //   [7] tensor       (at::Tensor, contiguous CPU)
+    void submit_direct(ClickHouseRow row, uint64_t nbytes) {
+        std::vector<dmx_host_queue_item> items;
+        items.emplace_back(std::move(row), nbytes);
+        submit_items(std::move(items));
     }
 };
 
