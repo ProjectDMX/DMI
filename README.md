@@ -1,295 +1,310 @@
-<!--
-New open-source style intro (DMI) is added below.
-Original README content is preserved and kept after the new sections.
--->
+# DMI Quickstart
 
-<!-- # DMI (Deep Model Inspection) -->
+This guide walks through getting **Project-DMI** (Deep Model Inspection) running end-to-end:
+clone with submodules, install ClickHouse, build native dependencies, and launch a benchmark
+against either the **HuggingFace** path or the **vLLM** path.
 
-<p align="center">
-  <img src="./Figures/f20e2340-3411-4d49-8979-0a7214d3db4b.png" alt="DMI logo" width="400" />
-</p>
+Tested on Linux + CUDA 12.x + Python 3.10. A CUDA-capable GPU is required (the ring transport
+is a GPU-resident pipeline).
 
-<p align="center">
-  <strong>Built for real-time visibility into LLM inference</strong>
-</p>
+---
 
-**Project-DMI** is an open-source LLM monitoring toolkit for LLM inference.  
-It helps you inspect any internal model states (activations, attention, logits, KV cache) during real LLM inference, with a high-performance C++ backend and async data pipeline.
+## 1. Clone the repository
 
-## About
-
-DMI is built for engineers and researchers who need to understand what happens *inside* a model while it runs. DMI includes **Shadow Block**, a unique GPU-resident hook system for CUDA-Graph-friendly monitored inference at high speed.
-
-Instead of only looking at final outputs or manually adding hooks, DMI lets you:
-- **Attach** hook points to internal layers wherever you want,
-- **Fast capture** internal states with minimal inference interruption,
-- **Persist** the data to DB (Disk/In-memory) for large-scale analysis with **Visualization**.
-
-The goal is practical model debugging and inspection with minimal overhead.
-
-## Key Features
-
-- 🔍 **Deep Internal Inspection**: Capture any internal model states as you want.
-- ⚙️ **Configurable Capture Control**: Per-step and per-request sampling with flexible hook selection.
-- ⚡ **GPU-Resident Hook System***: We introduced **Shadow Block**, a system-level kernel innovation for CUDA-Graph-friendly monitored inference at high speed.
-- 🚀 **Fast Monitoring Engine for Data Transfer**: C++-powered, high-throughput data movement for inference-time capture.
-- 🗄️ **Host Engine for Persistence & Visualization**: Built-in database pipeline to persist captured data, with ready-to-inspect visualization dashboards.
-- 🧩 **Seamless Hugging Face API Integration**: Works with familiar HF `generate` APIs and natively supports HF parallel inference strategies (e.g., TP/PP workflows).
-
-\* In active integration; this direction is included as part of DMI's core roadmap.
-
-## Installation
-
-### 1) Clone repository + submodules
+The repo uses three git submodules: a fork of HuggingFace `transformers`, a fork of `vllm`,
+and the `clickhouse-cpp` C++ client.
 
 ```bash
-git clone --recursive <your-repo-url>
-cd HF_Prometheus
+git clone --recursive <your-repo-url> DMI
+cd DMI
 
-# If already cloned without --recursive
+# If you forgot --recursive:
 git submodule update --init --recursive
 ```
 
-Current required submodules in this repo:
-- `transformers/`
-- `libs/clickhouse-cpp/`
+After this, you should have:
 
-### 2) Create Python environment
+- `integration/transformers/` — modified HF transformers (provides `gpt2_p`, `qwen3_p`)
+- `integration/vllm/` — modified vLLM with DMI integration hooks
+- `libs/clickhouse-cpp/` — ClickHouse C++ client (linked into the native backend)
+
+---
+
+## 2. Install ClickHouse server
+
+The DB sink writes captured tensors into a ClickHouse table. Install the server (Ubuntu/Debian
+example):
+
+```bash
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' \
+    | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+ARCH=$(dpkg --print-architecture)
+echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=${ARCH}] \
+https://packages.clickhouse.com/deb stable main" \
+    | sudo tee /etc/apt/sources.list.d/clickhouse.list
+sudo apt-get update
+sudo apt-get install -y clickhouse-server clickhouse-client
+```
+
+Start the server (it listens on TCP port `9000` by default — that's what DMI connects to):
+
+```bash
+sudo systemctl enable --now clickhouse-server
+sudo systemctl status clickhouse-server     # should be "active (running)"
+clickhouse-client --query "SELECT 1"        # smoke check; expect "1"
+```
+
+Optional connection overrides via env (defaults shown):
+
+```
+DMX_DB_HOST=localhost
+DMX_DB_PORT=9000
+DMX_DB_USER=default
+DMX_DB_PASSWORD=
+DMX_DB_DATABASE=default
+DMX_DB_TABLE=offload
+```
+
+To wipe state between runs, use the helper at `benchmark/clean_clickhouse.sh`:
+
+```bash
+bash benchmark/clean_clickhouse.sh
+```
+
+It stops the server, deletes `/var/lib/clickhouse/*`, and restarts the server.
+
+---
+
+## 3. Create the Python environment
 
 ```bash
 conda env create -f environment.yml
 conda activate proj-dmx
 ```
 
-### 3) Install Python packages
+This creates a Python 3.10 env and installs everything in `requirements.txt`
+(torch ≥ 2.8, HF stack, pandas, etc.).
+
+---
+
+## 4. Install the Python packages
+
+Install the modified `transformers` (editable, so the `gpt2_p` / `qwen3_p` hook-aware
+modules are importable), then DMI itself:
 
 ```bash
+pip install -e integration/transformers/
 pip install -e .
-pip install -e transformers/
 ```
 
-### 4) Build native dependencies
+---
 
-Build ClickHouse C++ client (required by the monitoring extension link stage):
+## 5. Build the ClickHouse C++ client
+
+The DMI native backend (`monitoring_native_backend.so`) links against `libclickhouse-cpp-lib`
+and its bundled deps (lz4, cityhash, absl, zstd). Build them in-tree:
 
 ```bash
 cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build -DCMAKE_BUILD_TYPE=Release
 cmake --build libs/clickhouse-cpp/build -j
 ```
 
-Build DMI native backend:
+After this you should see `libs/clickhouse-cpp/build/clickhouse/libclickhouse-cpp-lib.a`
+(and the contrib static libs under `libs/clickhouse-cpp/build/contrib/`).
+
+---
+
+## 6. Build the DMI native backend
+
+Compiles the C++/CUDA monitoring extension (ring buffers, drain thread, ClickHouse
+client, torch op for the producer kernel). Uses `nvcc` for `.cu` files and `g++` for
+`.cpp` — paths are auto-discovered from the active Python interpreter.
 
 ```bash
 make -C monitoring -j
-# or simply: make
+# or simply:  make
 ```
 
-## Quick Start
+Artifact: `monitoring_native_backend.<EXT_SUFFIX>.so` at the project root (and inside
+`monitoring/`). If `nvcc` isn't on your `PATH`, set `NVCC=/usr/local/cuda/bin/nvcc` in
+the environment.
 
-Supported model architectures (current):
-- `gpt2`
-- `qwen3`
-
-We provide runnable example scripts in `benchmark/scripts/`:
-
-- `benchmark/scripts/hf_generate.py` (HF baseline inference)
-- `benchmark/scripts/hf_monitoring_generate.py` (DMI monitored inference)
-
-
-
-Example runs:
+Sanity check the import:
 
 ```bash
-python benchmark/scripts/hf_generate.py --model gpt2 --device cuda --batch-size 8 --max-new-tokens 16
-python benchmark/scripts/hf_monitoring_generate.py --model qwen3 --device cuda --batch-size 8 --max-new-tokens 16 --no-db
+python -c "import monitoring; print(monitoring.__file__)"
+python -c "from monitoring._native_engine import RingConfig; print(RingConfig())"
 ```
 
 ---
 
-<!-- Original README starts here (preserved) -->
+## 7. Install vLLM (only if you want the vLLM path)
 
-<!-- # Proj-dmx (Huggineface/transformers)
-
-**Prototype of Proj-dmx on HF/transformers library.** A white-box observability system for LLM inference. Capture and analyze internal model states (activations, attention weights, KV cache) with minimal performance overhead.
-
-## Features
-
-- **Internal State Monitoring**: Capture activations, attention patterns, and KV cache statistics during inference
-- **Configurable Sampling**: Control capture frequency with step-level and request-level scheduling
-- **Async Pipeline**: Non-blocking GPU→CPU transfer with pinned memory pools
-- **Native C++ Backend**: High-performance hook callbacks with Python/C++ hybrid architecture
-- **TransformerLens-style API**: Familiar `run_with_cache` interface for activation collection
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────┐
-│  HookedGPT2Model (modified transformers)         │
-│  └── HookPoints → trigger callbacks              │
-└─────────────────────┬────────────────────────────┘
-                      ↓
-┌──────────────────────────────────────────────────┐
-│  MonitoringEngine                                │
-│  ├── CaptureSchedule (token/request sampling)    │
-│  ├── HookSelection (hooks sampling)              │
-│  └── Native Backend routing                      │
-└─────────────────────┬────────────────────────────┘
-                      ↓
-┌──────────────────────────────────────────────────┐
-│  C++ Native Backend                              │
-│  ├── Async GPU→CPU transfer                      │
-│  ├── Pinned memory management                    │
-│  └── Lock-free task queue                        │
-└──────────────────────────────────────────────────┘
-```
-
-
-## Project Structure
-
-```
-HF_Prometheus/
-├── monitoring/
-│   ├── __init__.py
-│   ├── engine.py          # MonitoringEngine
-│   ├── config.py          # Configuration classes
-│   ├── task.py            # Task definitions
-│   └── csrc/              # C++ native backend
-│       ├── native_engine.cpp
-│       ├── hooks.cpp
-│       └── ...
-├── transformers/          # Git submodule (forked)
-│   └── src/transformers/models/gpt2_p/
-│       ├── modeling_gpt2.py   # HookedGPT2Model
-│       └── hook_points.py     # HookPoint implementation
-├── benchmark/
-│   └── tests/             # Performance benchmarks
-├── example/               # User-facing examples
-└── tests/                 # Unit tests
-```
-
-
-## Installation
+The `integration/vllm/` submodule is a fork with DMI hooks. Install editable from
+the submodule:
 
 ```bash
-# Clone with submodules
-git clone --recursive git@github.com:Samfisheryu/vLLM-Prometheus.git
-cd vLLM-Prometheus
-
-# If already cloned without --recursive
-git submodule update --init --recursive
-
-# Ensure nested submodules inside dmx_host are present (clickhouse-cpp)
-git -C dmx_host submodule update --init --recursive
+pip install -e integration/vllm/
 ```
 
-### Option 1: Conda (Recommended)
+This may take a while — it's a full vLLM build.
+
+---
+
+## 8. Launch — HuggingFace path
+
+### 8a. Quick HF generate (no monitoring, sanity check)
 
 ```bash
-conda env create -f environment.yml
-conda activate proj-dmx
-pip install -e transformers/  # Install local modified transformers
-pip install -e dmx_host/      # Builds clickhouse_client extension
+python benchmark/scripts/hf_generate.py \
+    --model gpt2 --device cuda --batch-size 8 --max-new-tokens 16
 ```
 
-### Option 2: Pip
+### 8b. HF + DMI monitoring, no DB sink
+
+Captures internal states via the ring transport but discards them (good for measuring
+transport overhead alone):
 
 ```bash
-pip install -r requirements.txt
-pip install -e transformers/  # Install local modified transformers
-pip install -e dmx_host/      # Builds clickhouse_client extension
+python benchmark/scripts/hf_monitoring_generate.py \
+    --model qwen3 --device cuda --batch-size 8 --max-new-tokens 16 --no-db
 ```
 
-### Build C++ Extension
+### 8c. HF + DMI monitoring → ClickHouse
 
 ```bash
-cd monitoring && make
+python benchmark/scripts/hf_monitoring_generate.py \
+    --model qwen3 --device cuda --batch-size 8 --max-new-tokens 16
 ```
 
-
-
-
-## Quick Start
-
-**Notebook:** [Quick_Start.ipynb](./Quick_Start.ipynb)
-
-### Example: Minimal monitoring (CPU)
-```bash
-python -m example.gpt2_generate_with_monitoring
-```
-### Example: CUDA + ClickHouse pipeline
-Requires running ClickHouse and the dmx_host extension built.
-```bash
-python -m example.gpt2_generate_with_monitoring_db
-```
-
-#### ClickHouse quick check
-```bash
-clickhouse-client --query "SELECT 1"
-```
-
-Optional DB overrides:
-`DMX_DB_HOST`, `DMX_DB_PORT`, `DMX_DB_USER`, `DMX_DB_PASSWORD`,
-`DMX_DB_DATABASE`, `DMX_DB_TABLE`.
-
-
-
-## Run Benchmark
-
-## Benchmark Runtime Config
-
-- Runtime env toggles under `MON_NATIVE_*` are removed.
-- Use `MonitoringConfig` for runtime tuning (`advance.*`) and debug behavior (`debug`).
-- For benchmark scripts that expose it, use `--nvtx` to enable debug/NVTX (`MonitoringConfig.debug=True`).
-- Policy: new runtime behavior knobs must be added via config fields, not new environment variables.
-
-### Args
-```bash
-steps: requests
-warmup: warmup requests
-decode-steps: decode token length
-```
-
-### profile_decode.py - Comprehensive Comparison
-
-Compares multiple inference approaches (TransformerLens, HuggingFace, HookedGPT2Model) with profiling support:
-
-
-
-# Basic run
-python -m benchmark.tests.profile_decode_qwen3 --batch-size 1 --steps 1 --warmup 1 --collect-hidden --collect-attention --no-profile --dtype fp16
-
-# With nsight profiling
-nsys profile --output=your_results_path/xxx --force-overwrite=true --trace=cuda,nvtx,osrt --sample=cpu --sampling-period=1000000 --cpuctxsw=process-tree --cuda-memory-usage=false python -m benchmark.tests.profile_decode --profile-dir your_results_dir/xxx --batch-size 64 --decode-steps 64 --collect-hidden --collect-attention --steps 1 --warmup 1 --no-profile --nvtx
-
-**Tested configurations:**
-- `transformer_lens` / `transformer_lens_cache` - Original TransformerLens
-- `huggingface` / `huggingface_api` - Pure HuggingFace
-- `hf_modified` / `hf_modified_hook` / `hf_modified_hook_async` - HookedGPT2Model with MonitoringEngine
-
-### hf_modified_async_config_benchmark.py - Config Validation
-
-Tests different MonitoringConfig settings (full capture vs sampled):
+After it finishes, inspect captured rows:
 
 ```bash
-python benchmark/tests/hf_modified_async_config_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
+clickhouse-client --query "SELECT count() FROM default.offload"
 ```
 
-### hf_modified_async_config_token_stride_benchmark.py - Token Stride Impact
+### 8d. HF ring-transport benchmark
 
-Measures performance impact of different `step_stride` values:
+Compares `baseline` (no monitoring), `ring_null` (transport active, no DB),
+`ring_db` (full pipeline), and `hf_offload` (HF's own `output_hidden_states=True`
+path) for apples-to-apples overhead numbers:
 
 ```bash
-python benchmark/tests/hf_modified_async_config_token_stride_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
+# Decode-heavy (single-token prompt, 16 decode steps)
+python -m benchmark.bench_ring_transport \
+    --model qwen3 --batch-size 4 \
+    --prefill-len 1 --decode-len 16 \
+    --warmup 1 --iters 3 \
+    --modes baseline,ring_null,ring_db \
+    --cuda-graphs
 ```
 
-Tests strides: `[1, 10, 30, 400]` - higher stride = fewer captures = faster
+Useful flags (see `bench_ring_transport.py` for the full list):
 
-### hf_modified_async_config_request_stride_benchmark.py - Request Stride Impact
+- `--model gpt2 | qwen3` (alias for `Qwen/Qwen3-4B`)
+- `--cuda-graphs` — capture decode under CUDA graphs (uses the lean greedy loop)
+- `--hook-selection full | hf-only | hidden-states | logits | attention`
+- `--ring-payload-mb`, `--ring-pinned-mb` — ring buffer sizes (default 4096 MiB each)
+- `--csv path.csv` — append a result row
 
-Measures performance impact of different `request_stride` values:
+---
+
+## 9. Launch — vLLM path
+
+DMI plugs into vLLM via a custom worker class:
+`monitoring.vllm_integration.DMXGPUWorker`.
+Pass it through `--worker-cls` (or `worker_cls=` in the offline `LLM(...)` API),
+plus `additional_config` for hook selection and DB connection.
+
+### 9a. Offline use via the `LLM(...)` API
+
+Below is a self-contained snippet — paste into a `.py` file and run. It loads vLLM
+with the DMI worker and pushes captured tensors into ClickHouse:
+
+```python
+import os
+os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="Qwen/Qwen3-0.6B",
+    max_model_len=512,
+    enforce_eager=False,
+    gpu_memory_utilization=0.5,
+    worker_cls="monitoring.vllm_integration.DMXGPUWorker",
+    additional_config={
+        "dmx_hook_selection":   "vllm-full",
+        "dmx_ring_payload_mb":  4096,
+        "dmx_ring_pinned_mb":   4096,
+        "dmx_db_host":          "localhost",
+        "dmx_db_port":          9000,
+        # Set "dmx_null_mode": True to skip DB writes (transport-only).
+    },
+)
+
+prompts = [f"The answer to question {i+1} is" for i in range(8)]
+params = SamplingParams(temperature=0.0, max_tokens=32)
+for o in llm.generate(prompts, params):
+    print(o.outputs[0].text)
+```
+
+To get a baseline (vanilla vLLM, no monitoring), drop `worker_cls` and
+`additional_config`. To get a transport-only run (no DB write), add
+`"dmx_null_mode": True` to `additional_config`.
+
+### 9b. vLLM serve with DMI
 
 ```bash
-python benchmark/tests/hf_modified_async_config_request_stride_benchmark.py --batch-size 64 --steps 10 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention --no-profile
+vllm serve Qwen/Qwen3-8B \
+    --worker-cls monitoring.vllm_integration.DMXGPUWorker \
+    --additional-config '{
+        "dmx_hook_selection": "vllm-full",
+        "dmx_ring_payload_mb": 4096,
+        "dmx_ring_pinned_mb": 4096,
+        "dmx_db_host": "localhost",
+        "dmx_db_port": 9000
+    }'
 ```
 
-Tests strides: `[1, 2, 5, 100]` - higher stride = skip more requests -->
+If you need to disable vLLM's compile cache (recommended for benchmarking):
+
+```bash
+export VLLM_DISABLE_COMPILE_CACHE=1
+```
+
+---
+
+## 10. Troubleshooting
+
+- **`ImportError` on `monitoring_native_backend`** — rebuild: `make -C monitoring clean && make -C monitoring -j`.
+  Make sure `pip install -e .` was run from the same conda env.
+- **Linker errors against `libclickhouse-cpp-lib`** — step 5 didn't complete; check
+  `libs/clickhouse-cpp/build/clickhouse/` exists.
+- **`Connection refused` to ClickHouse** — `sudo systemctl status clickhouse-server`;
+  default port is `9000` (TCP), not `8123` (HTTP).
+- **`libstdc++` mismatch under vLLM** — preload the conda libstdc++:
+  `LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6 python -m benchmark.bench_vllm_transport ...`
+- **Stale DB rows between runs** — `bash benchmark/clean_clickhouse.sh` (stops the
+  server, wipes `/var/lib/clickhouse/*`, restarts).
+- **CUDA arch mismatch** — the Makefile uses `SM_ARCH=native`. Override with
+  `make -C monitoring SM_ARCH=sm_89` (e.g. RTX 4090) if needed.
+
+---
+
+## 11. Repo map (where to look)
+
+| Path | What's there |
+|------|--------------|
+| `monitoring/` | Python engine + `csrc/` C++/CUDA backend |
+| `monitoring/csrc/ring/` | Ring buffers, drain thread, producer kernel |
+| `monitoring/vllm_integration.py` | `DMXGPUWorker` for vLLM |
+| `benchmark/scripts/hf_generate.py` | Vanilla HF generate (baseline) |
+| `benchmark/scripts/hf_monitoring_generate.py` | HF + monitoring, optional DB |
+| `benchmark/bench_ring_transport.py` | HF ring-transport overhead benchmark |
+| `benchmark/data/prompts.txt` | Default prompt corpus |
+| `benchmark/clean_clickhouse.sh` | Wipe `/var/lib/clickhouse/*` and restart server |
+| `libs/clickhouse-cpp/` | ClickHouse C++ client (submodule) |
+| `integration/transformers/` | Modified HF transformers (submodule) |
+| `integration/vllm/` | Modified vLLM (submodule) |
