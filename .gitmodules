@@ -8,3 +8,11 @@
 	path = integration/vllm
 	url = git@github.com:ProjectDMX/vllm.git
 	branch = dmi_integration
+[submodule "experiments/online_serving/vLLM-Hook"]
+	path = experiments/online_serving/vLLM-Hook
+	url = git@github.com:ProjectDMX/vLLM-Hook-baseline.git
+	branch = dmi_experiment_mods
+[submodule "experiments/online_serving/TensorRT-LLM"]
+	path = experiments/online_serving/TensorRT-LLM
+	url = git@github.com:ProjectDMX/TensorRT-LLM-baseline.git
+	branch = dmi_experiment_mods
