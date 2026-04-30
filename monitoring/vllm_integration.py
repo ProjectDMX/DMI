@@ -54,42 +54,8 @@ def normalize_vllm_request_id(req_id: str) -> str:
     return _VLLM_REQ_ID_SUFFIX.sub("", req_id)
 
 
-# ---------------------------------------------------------------------------
-# PP rank filtering
-# ---------------------------------------------------------------------------
-
-def filter_by_pp_rank(specs: list, is_first_rank: bool, is_last_rank: bool) -> list:
-    from .ring_transport import PP_FIRST_ONLY as first_only, PP_LAST_ONLY as last_only
-
-    filtered = []
-    for s in specs:
-        if s.hook_type in first_only and not is_first_rank:
-            s.module.enabled = False
-            continue
-        if s.hook_type in last_only and not is_last_rank:
-            s.module.enabled = False
-            continue
-        filtered.append(s)
-    return filtered
-
-
-# ---------------------------------------------------------------------------
-# TP rank filtering — skip unsharded hooks on non-zero ranks
-# ---------------------------------------------------------------------------
-
-def filter_by_tp_rank(specs: list, tp_rank: int) -> list:
-    """On non-zero TP ranks, keep only sharded hooks to avoid N× duplicate
-    writes of identical unsharded data.  Rank 0 keeps all hooks."""
-    if tp_rank == 0:
-        return specs
-    from .ring_transport import TP_SHARDED_TYPES as sharded
-    filtered = []
-    for s in specs:
-        if s.hook_type not in sharded:
-            s.module.enabled = False
-            continue
-        filtered.append(s)
-    return filtered
+# PP / TP rank filters live in monitoring.selection (Phase 1 of the
+# unified-adaptor refactor).  They are imported in load_model() below.
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +189,12 @@ class DMXGPUWorker(Worker):
         # includes the producer kernel. Null mode is active (set in
         # init_device) so warmup producer calls are no-ops.
         from . import ring_transport
-        from .ring_transport import apply_hook_selection, install_ring_hooks
+        from .ring_transport import install_ring_hooks
+        from .selection import (
+            apply_hook_selection,
+            filter_by_pp_rank,
+            filter_by_tp_rank,
+        )
         from .generate import _make_model_shape
 
         transport = ring_transport.get_active()

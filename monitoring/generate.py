@@ -97,6 +97,7 @@ def _filter_specs(all_specs: List, engine: Any) -> List:
 def _install_monitoring_forward(model: Any) -> None:
     """Install monitored_forward wrapper and ring hook setup."""
     from . import ring_transport
+    from .selection import apply_hook_selection
 
     transport = ring_transport.get_active()
     if transport is not None and hasattr(model, "get_hook_specs"):
@@ -114,7 +115,7 @@ def _install_monitoring_forward(model: Any) -> None:
             # Apply hook selection preset (sets HookPoint.enabled per hook)
             hook_selection = getattr(transport, '_hook_selection', None)
             if hook_selection is not None:
-                active_specs = ring_transport.apply_hook_selection(
+                active_specs = apply_hook_selection(
                     active_specs, hook_selection, cfg=transport._model_cfg)
 
             ring_transport.install_ring_hooks(active_specs)

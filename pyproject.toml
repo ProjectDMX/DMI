@@ -19,4 +19,4 @@ include-package-data = true
 monitoring = ["csrc/*.cpp", "csrc/*.h", "csrc/*.hpp", "Makefile"]
 
 [tool.setuptools.packages.find]
-include = ["monitoring*", "benchmark*"]
+include = ["monitoring*", "benchmark*", "integration"]
