@@ -73,11 +73,10 @@ def main():
 
     # Monitoring config
     from monitoring import MonitoringConfig
-    from monitoring.config import CaptureSchedule, HookSelection
+    from monitoring.config import CaptureSchedule
 
     hook_mode = os.environ.get("E2E_HOOK_MODE", "full")
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode=hook_mode),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
     if hasattr(mon_cfg, "eos_token_id"):
@@ -129,7 +128,7 @@ def main():
 
     try:
         with torch.no_grad():
-            _ = generate_with_monitoring(model, **gen_kwargs)
+            _ = generate_with_monitoring(model, hook_selection=hook_mode, **gen_kwargs)
     finally:
         engine.close()
 

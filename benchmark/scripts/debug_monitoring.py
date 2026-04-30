@@ -11,7 +11,7 @@ from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
 print("[DEBUG] HookedGPT2LMHeadModel imported")
 
 from monitoring import MonitoringConfig, MonitoringEngine
-from monitoring.config import CaptureSchedule, HookSelection
+from monitoring.config import CaptureSchedule
 from monitoring.generate import generate_with_monitoring
 print("[DEBUG] monitoring modules imported")
 
@@ -21,7 +21,6 @@ def main():
 
     print("[DEBUG] Creating MonitoringEngine...")
     cfg = MonitoringConfig(
-        hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
         debug=True,
     )

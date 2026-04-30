@@ -278,7 +278,7 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
             MonitoringEngine,
         )
         from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
-        from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
+        from monitoring.config import CaptureSchedule  # type: ignore
         from monitoring.generate import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
@@ -343,7 +343,6 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
     # -----------------------------------------------------------------------
 
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
     if hasattr(mon_cfg, "eos_token_id"):
@@ -858,7 +857,7 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
             MonitoringEngine,
         )
         from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
-        from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
+        from monitoring.config import CaptureSchedule  # type: ignore
         from monitoring.generate import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
@@ -911,7 +910,6 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     # Monitoring + DB config
     # -----------------------------------------------------------------------
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
 
@@ -1351,7 +1349,7 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
             MonitoringEngine,
         )
         from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
-        from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
+        from monitoring.config import CaptureSchedule  # type: ignore
         from monitoring.generate import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
@@ -1389,7 +1387,6 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
 
     # --- Monitoring config + DB ---
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
 

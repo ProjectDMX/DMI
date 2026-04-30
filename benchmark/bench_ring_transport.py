@@ -154,9 +154,8 @@ def _make_ring_cfg(cfg: BenchConfig):
 
 def _make_monitoring_cfg(cfg: BenchConfig):
     from monitoring import MonitoringConfig  # type: ignore
-    from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
+    from monitoring.config import CaptureSchedule  # type: ignore
     return MonitoringConfig(
-        hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
 

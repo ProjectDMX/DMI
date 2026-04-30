@@ -19,7 +19,7 @@ from monitoring import (
     MonitoringEngine,
     StageConfig,
 )
-from monitoring.config import CaptureSchedule, HookSelection
+from monitoring.config import CaptureSchedule
 from monitoring.generate import generate_with_monitoring
 
 _MODEL_ALIASES = {
@@ -114,9 +114,6 @@ def main() -> None:
     device = torch.device(args.device)
 
     cfg = MonitoringConfig(
-        hooks=HookSelection(
-            mode="full",
-        ),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
         debug=os.environ.get("BENCH_NVTX", "0") == "1",
     )

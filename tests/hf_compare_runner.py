@@ -28,7 +28,7 @@ _MODEL_ALIASES = {
 def main():
     from monitoring import MonitoringEngine, MonitoringConfig, HostEngineConfig
     from monitoring._native_engine import ClickHouseClientConfig, StageConfig, RingConfig
-    from monitoring.config import CaptureSchedule, HookSelection
+    from monitoring.config import CaptureSchedule
     from monitoring.generate import generate_with_monitoring
     from transformers import AutoTokenizer
 
@@ -128,7 +128,6 @@ def main():
     ring_cfg.clone_slices = False
 
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
     if hasattr(mon_cfg, "eos_token_id"):

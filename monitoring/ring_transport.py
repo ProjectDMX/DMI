@@ -71,7 +71,7 @@ for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS:
     # Inject HOOK_TYPE_Q, HOOK_TYPE_RESID_PRE, etc. into module namespace
     globals()[f"HOOK_TYPE_{_short.upper()}"] = _id
 
-# Auto-derive act_name suffix sets per group (used by config.py HookSelection).
+# Auto-derive act_name suffix sets per group (re-exported for tooling).
 _ATTN_SUFFIXES: Tuple[str, ...] = tuple(
     _act for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _grp == GROUP_ATTN
 )
