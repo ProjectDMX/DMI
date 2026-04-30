@@ -1,6 +1,6 @@
 """Unit tests for BackendAdaptor.before_forward call ordering.
 
-Phase 1 verification gate (§11.1 of unified_adaptor_plan.md).  Uses fakes for
+Phase 1 verification gate (Sec.11.1 of unified_adaptor_plan.md).  Uses fakes for
 MonitoringEngine, RingTransport, and RingEngine to verify the driver flow:
 
     build_step_context -> _step_bytes -> [prepare_step
@@ -188,7 +188,7 @@ def test_capacity_exceeded_result_two(mock_set_cpu_direct):
     # bumps q_len by 100).
     assert a.on_capacity_exceeded_calls[0].q_len == 4 + 100
     assert a.warn_calls[0][1:] == (1024, 3)
-    # set_step_context still runs after the capacity branch — uses the
+    # set_step_context still runs after the capacity branch -- uses the
     # adapted ctx, so q_len in the kwargs reflects the bump.
     assert len(a.transport.set_step_context_calls) == 1
     pushed_meta = a.transport.pre_push_all_metas_calls[0]
@@ -262,7 +262,7 @@ def test_register_preset_raises_on_duplicate():
     import pytest
     from monitoring import selection
 
-    # "full" is registered at module load — re-registering must raise.
+    # "full" is registered at module load -- re-registering must raise.
     with pytest.raises(ValueError, match="already registered"):
         selection.register_preset("full", frozenset())
 

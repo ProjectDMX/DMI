@@ -1,7 +1,7 @@
 """BackendAdaptor: abstract base for framework-specific monitoring adapters.
 
 Carved out as part of the unified-adaptor refactor (Phase 1).  Each concrete
-adapter (HFAdaptor, VLLMAdaptor — Phases 2 and 3) will live under
+adapter (HFAdaptor, VLLMAdaptor -- Phases 2 and 3) will live under
 ``integration/`` and convert framework-specific batch state into the
 ``RingTransport`` step protocol.
 
@@ -18,7 +18,7 @@ every concrete adapter:
     -> set_step_context
     -> pre_push_all_metas
 
-Phase 1 ships the abstraction only — no concrete subclass is wired in yet.
+Phase 1 ships the abstraction only -- no concrete subclass is wired in yet.
 The unit-test gate (``tests/test_adapter_protocol.py``) exercises the driver
 ordering with mocks.
 """
@@ -150,7 +150,7 @@ class BackendAdaptor(abc.ABC):
 
         if not self._force_cpu_direct:
             total_bytes, n_hooks = self._step_bytes(ctx)
-            # Gate prepare_step on n_hooks > 0 — matches vLLM's existing
+            # Gate prepare_step on n_hooks > 0 -- matches vLLM's existing
             # behavior and is consistent with the non-zero-shape counting
             # rule for _step_bytes.  When the gate skips, set_step_context
             # and pre_push_all_metas still run unchanged: their internal
@@ -181,7 +181,7 @@ class BackendAdaptor(abc.ABC):
         """Return ``(aligned total bytes, n_hooks)`` for one step.
 
         ``n_hooks`` counts only specs whose ``_compute_hook_shape`` returns
-        a non-empty list — matches the count of metas
+        a non-empty list -- matches the count of metas
         ``pre_push_all_metas`` will push and the count of task-ring slots
         ``prepare_step`` needs to reserve.
         """

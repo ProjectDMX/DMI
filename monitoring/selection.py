@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 
 # Import the C++-mirror constants from ring_transport.  These describe the
 # universe of hooks; selection policy lives here.  Module-level (not lazy)
-# matches the existing pattern — ring_transport's import already loads the
+# matches the existing pattern -- ring_transport's import already loads the
 # native extension, and selection is only meaningful with hooks loaded.
 from .ring_transport import (
     _id_by_short,
@@ -175,7 +175,7 @@ def filter_by_pp_rank(specs: list, is_first_rank: bool, is_last_rank: bool) -> l
 
 
 def filter_by_tp_rank(specs: list, tp_rank: int) -> list:
-    """On non-zero TP ranks, keep only sharded hooks to avoid N× duplicate
+    """On non-zero TP ranks, keep only sharded hooks to avoid Nx duplicate
     writes of identical unsharded data.  Rank 0 keeps all hooks."""
     if tp_rank == 0:
         return specs

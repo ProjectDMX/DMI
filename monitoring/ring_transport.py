@@ -48,7 +48,7 @@ from torch import nn
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Hook type constants — single source of truth is HOOK_DEFS in tensor_meta.h.
+# Hook type constants -- single source of truth is HOOK_DEFS in tensor_meta.h.
 # All mappings are auto-derived from the C++ table at import time.
 # To add a new hook: add one enum value + one HOOK_DEFS row in C++. Done.
 # ---------------------------------------------------------------------------
@@ -58,14 +58,14 @@ _ext = _load_ext()
 # group/shape_class/pp_stage are int enums matching the C++ definitions.
 _HOOK_DEFS = _ext.HOOK_DEFS
 
-# C++ enum mirrors — keep in sync with tensor_meta.h
+# C++ enum mirrors -- keep in sync with tensor_meta.h
 GROUP_ATTN, GROUP_MLP, GROUP_OTHER = 0, 1, 2
 SHAPE_HIDDEN, SHAPE_QKV_Q, SHAPE_QKV_KV, SHAPE_QKV_Z = 0, 1, 2, 3
 SHAPE_ATTN_WT, SHAPE_MLP_POST, SHAPE_TOKEN_IDS, SHAPE_LOGITS = 4, 5, 6, 7
 PP_ANY, PP_FIRST, PP_LAST = 0, 1, 2
 
 # Auto-derive all mappings
-_id_by_short: Dict[str, int] = {}       # "q" → 6
+_id_by_short: Dict[str, int] = {}       # "q" -> 6
 for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS:
     _id_by_short[_short] = _id
     # Inject HOOK_TYPE_Q, HOOK_TYPE_RESID_PRE, etc. into module namespace
@@ -99,8 +99,22 @@ PP_LAST_ONLY: frozenset = frozenset(
 del _ext, _load_ext
 
 # Hook selection (presets, resolve/apply, PP/TP filters) lives in
-# monitoring/selection.py — that module imports the C++-mirror constants
-# above.  See the unified-adaptor refactor plan §6 for rationale.
+# monitoring/selection.py -- that module imports the C++-mirror constants
+# above.  See the unified-adaptor refactor plan Sec.6 for rationale.
+
+# ---------------------------------------------------------------------------
+# Two batch conventions used throughout this file
+# ---------------------------------------------------------------------------
+# - "batched" (batch > 0): tensors carry a leading batch dim; shapes are
+#   [batch, q_len, ...].  This is what HF generate() produces.
+# - "packed/flattened" (batch == 0): no leading batch dim; rows from every
+#   active request are concatenated along dim 0 and q_len = total tokens
+#   across requests.  This is what vLLM produces (one tensor per
+#   scheduler step, requests cumsum'd into dim 0).
+#
+# Beyond this attribution block the rest of the file refers to the
+# conventions by their neutral names ("batched" / "packed").
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -267,17 +281,21 @@ def _compute_hook_shape(
 ) -> List[int]:
     """Return expected tensor shape for a given hook type and step dimensions.
 
+    See the "two batch conventions" block at the top of this file for
+    what ``batch == 0`` (packed/flattened) vs ``batch > 0`` (batched) mean.
+
     ASSUMPTION: hooked tensors have deterministic shapes given the same
     (batch, q_len, kv_dim, logits_to_keep) and model config.  This is
     guaranteed by the model architecture.
 
     Args:
-        batch: batch size.  0 = flattened (vLLM): no batch dimension,
-            q_len = total_tokens across all requests.
-        logits_to_keep: HF generate() default is 1 (only last token logits).
-            0 means keep all (q_len).
+        batch: batch size, or ``0`` for the packed/flattened convention.
+        logits_to_keep: how many logit rows the model returns per step.
+            ``0`` means "all q_len rows".  Frameworks that materialize
+            only the last-token logits per request pass
+            ``logits_to_keep > 0``.
     """
-    # batch=0 means flattened (vLLM): shapes have no batch dimension.
+    # batch=0 means packed/flattened: shapes have no batch dimension.
     b = [batch] if batch > 0 else []
 
     tp = cfg.tp_size
@@ -290,8 +308,9 @@ def _compute_hook_shape(
         kv_heads = max(1, cfg.num_kv_heads // tp)  # GQA: may replicate
         return b + [q_len, kv_heads, cfg.head_dim]
     if hook_type == HOOK_TYPE_Z:
-        # vLLM Attention.forward returns [N, hidden_size] (heads flattened).
-        # HF returns [batch, q_len, num_heads, head_dim].
+        # Packed/flattened convention flattens heads into a single
+        # trailing dim -> [q_len, num_heads * head_dim].
+        # Batched convention keeps four dims -> [batch, q_len, num_heads, head_dim].
         if batch == 0:
             return [q_len, (cfg.num_heads // tp) * cfg.head_dim]
         return b + [q_len, cfg.num_heads // tp, cfg.head_dim]
@@ -299,22 +318,23 @@ def _compute_hook_shape(
         return b + [cfg.num_heads // tp, q_len, kv_dim]
     if hook_type == HOOK_TYPE_MLP_POST:
         if cfg.intermediate_dim == 0:
-            return []  # intermediate_dim unknown — skip this hook
+            return []  # intermediate_dim unknown -- skip this hook
         return b + [q_len, cfg.intermediate_dim // tp]
     if hook_type == HOOK_TYPE_TOKEN_IDS:
         return b + [q_len]
     if hook_type == HOOK_TYPE_FINAL_LOGITS:
-        # compute_logits returns fewer rows than q_len when logits_to_keep
-        # is set (HF generate default=1, vLLM always 1 per request).
+        # compute_logits returns fewer rows than q_len when the framework
+        # only materializes the last-token logits per request.
         #
-        # HF batched: tensor is [batch, logits_to_keep, vocab].
-        #   logits_to_keep = min(q_len, logits_to_keep) capped to q_len.
+        # Batched (batch > 0): tensor is [batch, logits_to_keep, vocab].
+        #   logits_to_keep is capped at q_len (defaults to q_len when 0).
         #
-        # vLLM flattened: tensor is [num_reqs, vocab] (1 logit per
-        #   request).  Caller passes logits_to_keep=num_reqs so the
-        #   meta shape becomes [num_reqs, vocab].  The p2p thread
-        #   indexes by request position (not token offset) and adjusts
-        #   DB token range to (end_token-1, end_token).
+        # Packed/flattened (batch == 0): tensor is [num_reqs, vocab]
+        #   (one logit per request).  Caller passes
+        #   logits_to_keep=num_reqs so the meta shape becomes
+        #   [num_reqs, vocab].  The p2p thread indexes by request
+        #   position (not token offset) and adjusts the DB token range
+        #   to (end_token-1, end_token).
         if batch > 0:
             logits_q = min(q_len, logits_to_keep) if logits_to_keep > 0 else q_len
         else:
@@ -387,8 +407,8 @@ class RingTransport:
         # Set by generate_with_monitoring when decode doesn't fit in ring.
         self._force_cpu_direct: bool = False
 
-        # Hook selection preset name (e.g. "full", "hf-only", "hidden-states").
-        # Set by generate_with_monitoring before _install_monitoring_forward.
+        # Hook selection preset name (e.g. "full", "hidden-states", "logits").
+        # Set by the active adapter before hook installation.
         self._hook_selection: Optional[str] = None
 
         # warn_once tracking for Case B fallback
@@ -409,14 +429,18 @@ class RingTransport:
     ) -> None:
         """Called before each forward pass to provide per-step batch metadata.
 
+        See the "two batch conventions" block at the top of this file for
+        the ``batched`` / ``packed`` terminology.
+
         dim0_offsets: per-request offset in tensor dim 0.
-            HF: batch index (0, 1, 2, ...).  None = auto-generate range(len(req_ids)).
-            vLLM: token offset in packed tensor (cumulative sum of scheduled tokens).
+            Batched: batch index (0, 1, 2, ...).  None = auto-generate range(len(req_ids)).
+            Packed: token offset in the packed tensor
+                (cumulative sum of scheduled tokens per request).
         kv_offsets: per-request kv-dimension start for attention hooks.
-            HF dynamic cache: pad_len (real keys at the end, left-padded).
-            HF static cache / vLLM: 0 (real keys at the start).
+            Dynamic-cache batched: pad_len (real keys at the end, left-padded).
+            Static-cache batched / packed: 0 (real keys at the start).
             None = auto-generate zeros.
-        flattened: False = HF batched [batch, q_len, ...], True = vLLM packed [total_tokens, ...].
+        flattened: False = batched [batch, q_len, ...], True = packed [total_tokens, ...].
         """
         self._current_model_id = model_id
         self._current_tp_rank = tp_rank
