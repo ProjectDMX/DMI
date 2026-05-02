@@ -197,12 +197,18 @@ class TestRealCompareModelsContainAllExpectedHooks:
 # sweep (~80 HF cells) is the same parametrization with all hooks; it
 # is behind ``@pytest.mark.slow`` to avoid being part of the default run.
 SMOKE_CELLS = [
-    ("hf", "qwen3", "q",            "eager"),
-    ("hf", "qwen3", "q",            "compiled"),
-    ("hf", "qwen3", "resid_pre",    "eager"),
-    ("hf", "qwen3", "resid_pre",    "compiled"),
-    ("hf", "qwen3", "final_logits", "eager"),
-    ("hf", "qwen3", "final_logits", "compiled"),
+    ("hf",   "qwen3", "q",            "eager"),
+    ("hf",   "qwen3", "q",            "compiled"),
+    ("hf",   "qwen3", "resid_pre",    "eager"),
+    ("hf",   "qwen3", "resid_pre",    "compiled"),
+    ("hf",   "qwen3", "final_logits", "eager"),
+    ("hf",   "qwen3", "final_logits", "compiled"),
+    ("vllm", "qwen3", "q",            "eager"),
+    ("vllm", "qwen3", "q",            "compiled"),
+    ("vllm", "qwen3", "resid_pre",    "eager"),
+    ("vllm", "qwen3", "resid_pre",    "compiled"),
+    ("vllm", "qwen3", "final_logits", "eager"),
+    ("vllm", "qwen3", "final_logits", "compiled"),
 ]
 
 # Tolerance for compiled-mode logprob comparisons (both L_ours and L_ref
@@ -213,13 +219,13 @@ _COMPILED_ATOL = 0.15
 _COMPILED_RTOL = 0.0
 
 
-_SUBPROCESS_RUNNER = dedent("""
-    '''Per-cell rollout: vanilla / _p+hook_selection / _compare-isolated.
+_HF_RUNNER = dedent("""
+    '''HF rollout: vanilla / _p+hook_selection / _compare-isolated.
 
-    Reads cell args from argv.  Writes three logprob tensors to
-    --output-dir/orig.pt|ours.pt|ref.pt.  Each rollout is greedy decode
-    of the same prompt; logprobs are taken from the last layer's
-    final_logits softmax over the generated tokens.
+    Saves a dict {token_ids: int64[N], logprobs: float32[N]} -- the
+    chosen-token IDs (greedy argmax) and the log-prob the model assigned
+    to each chosen token.  Same format the vLLM runner emits, so the
+    pytest assertion code is framework-agnostic.
     '''
     import argparse, os, sys
     import torch
@@ -232,6 +238,7 @@ _SUBPROCESS_RUNNER = dedent("""
     ap.add_argument('--output-dir', required=True)
     ap.add_argument('--rollout', required=True, choices=['orig', 'ours', 'ref'])
     args = ap.parse_args()
+    assert args.framework == 'hf'
 
     MODEL_ALIASES = {'gpt2': 'gpt2', 'qwen3': 'Qwen/Qwen3-0.6B'}
     hf_id = MODEL_ALIASES[args.model_key]
@@ -249,12 +256,12 @@ _SUBPROCESS_RUNNER = dedent("""
     elif args.rollout == 'ref':
         # Use the patched _compare model.  The driver patches the source
         # file before launching this subprocess and unpatches after.
-        if args.framework == 'hf' and args.model_key == 'qwen3':
+        if args.model_key == 'qwen3':
             from transformers.models.qwen3_compare.modeling_qwen3 import CompareQwen3ForCausalLM as model_cls
-        elif args.framework == 'hf' and args.model_key == 'gpt2':
+        elif args.model_key == 'gpt2':
             from transformers.models.gpt2_compare.modeling_gpt2 import CompareGPT2LMHeadModel as model_cls
         else:
-            raise ValueError(f'unsupported (framework, model_key)={(args.framework, args.model_key)!r} for ref rollout')
+            raise ValueError(f'unsupported model_key={args.model_key!r} for HF ref rollout')
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(hf_id)
         if tok.pad_token_id is None:
@@ -265,12 +272,12 @@ _SUBPROCESS_RUNNER = dedent("""
         # Allocate buffers (only the isolated hook will get written).
         model.allocate_compare_buffers(1, 32, dtype=dtype, tp_size=1)
     elif args.rollout == 'ours':
-        if args.framework == 'hf' and args.model_key == 'qwen3':
+        if args.model_key == 'qwen3':
             from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM as model_cls
-        elif args.framework == 'hf' and args.model_key == 'gpt2':
+        elif args.model_key == 'gpt2':
             from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel as model_cls
         else:
-            raise ValueError(f'unsupported (framework, model_key)={(args.framework, args.model_key)!r} for ours rollout')
+            raise ValueError(f'unsupported model_key={args.model_key!r} for HF ours rollout')
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(hf_id)
         if tok.pad_token_id is None:
@@ -298,14 +305,12 @@ _SUBPROCESS_RUNNER = dedent("""
 
     if args.rollout == 'ours':
         # Drive monitoring through HFAdaptor with hook_selection=H.  The
-        # monitoring engine writes to ClickHouse; we don't read it here
-        # (logprob equality is what we care about for Phase 2b smoke).
+        # ring transport runs without ClickHouse (no db_config).
         from monitoring import MonitoringEngine, MonitoringConfig
         from monitoring.config import CaptureSchedule
         from monitoring._native_engine import RingConfig
         from integration.hf_adapter import generate_with_monitoring
         cfg = MonitoringConfig(schedule=CaptureSchedule(capture_prefill=True, capture_decode=True))
-        # No db_config: ring_engine runs without ClickHouse for this rollout.
         engine = MonitoringEngine(config=cfg, model_id='per_hook_isolation')
         ring_cfg = RingConfig()
         ring_cfg.task_ring_entries = 1024
@@ -321,13 +326,99 @@ _SUBPROCESS_RUNNER = dedent("""
         with torch.no_grad():
             out = model.generate(**gen_kwargs)
 
-    # out.scores is a tuple of [batch, vocab] tensors, one per generated step.
-    # Stack into [num_steps, batch, vocab] -> log_softmax -> CPU.
-    scores = torch.stack(out.scores, dim=0)
-    logprobs = torch.log_softmax(scores.float(), dim=-1).cpu()
+    # out.scores is a tuple of [batch=1, vocab] tensors, one per step.
+    scores = torch.stack(out.scores, dim=0)            # [N, 1, vocab]
+    log_probs = torch.log_softmax(scores.float(), dim=-1)
+    arg_step = scores.argmax(dim=-1)                   # [N, 1]  (greedy)
+    token_ids = arg_step.squeeze(1).cpu().to(torch.int64)            # [N]
+    chosen_lp = log_probs.gather(-1, arg_step.unsqueeze(-1)).squeeze(-1).squeeze(-1).cpu().float()  # [N]
     out_path = os.path.join(args.output_dir, f'{args.rollout}.pt')
-    torch.save(logprobs, out_path)
-    print(f'OK {args.rollout} logprobs.shape={logprobs.shape} -> {out_path}')
+    torch.save({'token_ids': token_ids, 'logprobs': chosen_lp}, out_path)
+    print(f'OK {args.rollout} N={len(token_ids)} -> {out_path}')
+""")
+
+
+_VLLM_RUNNER = dedent("""
+    '''vLLM rollout: vanilla / DMXGPUWorker+hook_selection / CompareWorker-isolated.
+
+    Saves the same dict format as _HF_RUNNER:
+      {token_ids: int64[N], logprobs: float32[N]}.
+
+    Logprobs come from SamplingParams(logprobs=1).  The chosen token's
+    logprob is what vLLM stores for the selected sample at each step.
+    '''
+    import argparse, os, sys
+    os.environ.setdefault('VLLM_DISABLE_COMPILE_CACHE', '1')
+
+    import torch
+    from vllm import LLM, SamplingParams
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--framework', required=True)
+    ap.add_argument('--model-key', required=True)
+    ap.add_argument('--hook', required=True)
+    ap.add_argument('--mode', required=True)
+    ap.add_argument('--output-dir', required=True)
+    ap.add_argument('--rollout', required=True, choices=['orig', 'ours', 'ref'])
+    args = ap.parse_args()
+    assert args.framework == 'vllm'
+
+    MODEL_ALIASES = {'gpt2': 'gpt2', 'qwen3': 'Qwen/Qwen3-0.6B'}
+    model_name = MODEL_ALIASES[args.model_key]
+
+    llm_kwargs = dict(
+        model=model_name,
+        max_model_len=128,
+        gpu_memory_utilization=0.5,
+        enforce_eager=(args.mode == 'eager'),
+    )
+
+    additional_config = {
+        'dmx_hook_selection': args.hook,
+        # Disable ClickHouse so concurrent rollouts in the smoke don't
+        # see each other's rows; we only need logprobs here.
+        'dmx_db_host': '',
+    }
+
+    if args.rollout == 'orig':
+        # Vanilla vLLM, no worker_cls override -- standard model class.
+        pass
+    elif args.rollout == 'ours':
+        llm_kwargs['worker_cls'] = 'integration.vllm_adapter.DMXGPUWorker'
+        llm_kwargs['additional_config'] = additional_config
+    elif args.rollout == 'ref':
+        # CompareWorker subclasses DMXGPUWorker but remaps to the
+        # _compare class (Qwen3CompareForCausalLM etc.).  The patcher
+        # applied by the driver before this subprocess starts has
+        # commented out every `.copy_()` line in the _compare source
+        # except hook H's, so only that one buffer is written.
+        llm_kwargs['worker_cls'] = 'tests.compare_worker.CompareWorker'
+        llm_kwargs['additional_config'] = additional_config
+
+    llm = LLM(**llm_kwargs)
+
+    prompts = ['Hello']
+    params = SamplingParams(temperature=0.0, max_tokens=4, logprobs=1)
+    outputs = llm.generate(prompts, params)
+
+    output = outputs[0]
+    completion = output.outputs[0]
+    ids = list(completion.token_ids)
+    lps = []
+    step_logprobs = completion.logprobs or []
+    for i in range(len(ids)):
+        chosen_id = ids[i]
+        if i < len(step_logprobs) and step_logprobs[i] is not None:
+            lp_obj = step_logprobs[i].get(chosen_id)
+            lps.append(lp_obj.logprob if lp_obj is not None else float('-inf'))
+        else:
+            lps.append(float('-inf'))
+
+    token_ids = torch.tensor(ids, dtype=torch.int64)
+    logprobs = torch.tensor(lps, dtype=torch.float32)
+    out_path = os.path.join(args.output_dir, f'{args.rollout}.pt')
+    torch.save({'token_ids': token_ids, 'logprobs': logprobs}, out_path)
+    print(f'OK {args.rollout} N={len(token_ids)} -> {out_path}')
 """)
 
 
@@ -348,8 +439,14 @@ def _run_rollout(
     hook: str, mode: str, env: dict,
 ) -> None:
     """Spawn one rollout subprocess.  Raises on non-zero exit."""
+    if framework == "hf":
+        runner = _HF_RUNNER
+    elif framework == "vllm":
+        runner = _VLLM_RUNNER
+    else:
+        raise ValueError(f"unsupported framework={framework!r}")
     cmd = [
-        sys.executable, "-c", _SUBPROCESS_RUNNER,
+        sys.executable, "-c", runner,
         "--framework", framework,
         "--model-key", model_key,
         "--hook", hook,
@@ -405,48 +502,76 @@ def test_per_hook_isolation_smoke(
     L_ours = torch.load(tmp_path / "ours.pt", map_location="cpu")
     L_ref = torch.load(tmp_path / "ref.pt", map_location="cpu")
 
-    assert L_orig.shape == L_ours.shape == L_ref.shape, (
-        f"shape mismatch: orig={L_orig.shape} ours={L_ours.shape} ref={L_ref.shape}"
+    # Both runners save {"token_ids": int64[N], "logprobs": float32[N]}.
+    for name, L in [("orig", L_orig), ("ours", L_ours), ("ref", L_ref)]:
+        assert isinstance(L, dict) and "token_ids" in L and "logprobs" in L, (
+            f"{name}.pt must be a dict with token_ids + logprobs; got {type(L)}"
+        )
+
+    assert L_orig["token_ids"].shape == L_ours["token_ids"].shape == L_ref["token_ids"].shape, (
+        f"token_ids shape mismatch: orig={L_orig['token_ids'].shape} "
+        f"ours={L_ours['token_ids'].shape} ref={L_ref['token_ids'].shape}"
     )
 
-    # ALWAYS report the actual diffs, regardless of pass/fail, so a
-    # passing-but-barely-passing trend surfaces in test output.
-    diff_ours = (L_orig - L_ours).abs()
-    diff_ref = (L_orig - L_ref).abs()
+    def _diffs(a: dict, b: dict) -> tuple[int, float, float]:
+        n_token_diff = int((a["token_ids"] != b["token_ids"]).sum().item())
+        lp_diff = (a["logprobs"] - b["logprobs"]).abs()
+        return n_token_diff, lp_diff.max().item(), lp_diff.mean().item()
+
+    ours_tok_n, ours_lp_max, ours_lp_mean = _diffs(L_orig, L_ours)
+    ref_tok_n, ref_lp_max, ref_lp_mean = _diffs(L_orig, L_ref)
     label = f"{framework}-{model_key}-{hook}-{mode}"
     print(
         f"\n[per_hook_isolation] {label}\n"
-        f"  L_orig vs L_ours: max={diff_ours.max().item():.6g}  "
-        f"mean={diff_ours.mean().item():.6g}\n"
-        f"  L_orig vs L_ref:  max={diff_ref.max().item():.6g}  "
-        f"mean={diff_ref.mean().item():.6g}",
+        f"  L_orig vs L_ours: token_diff={ours_tok_n}  "
+        f"logprob_max={ours_lp_max:.6g}  logprob_mean={ours_lp_mean:.6g}\n"
+        f"  L_orig vs L_ref:  token_diff={ref_tok_n}  "
+        f"logprob_max={ref_lp_max:.6g}  logprob_mean={ref_lp_mean:.6g}",
         flush=True,
     )
 
     if mode == "eager":
-        # Strict: any non-zero diff is a regression in eager mode.
-        assert torch.equal(L_orig, L_ours), (
-            f"L_orig != L_ours for hook={hook!r} (eager): "
-            f"HFAdaptor perturbs forward (max diff "
-            f"{diff_ours.max().item():.4f})"
+        # Strict: tokens + logprobs both bitwise-equal in eager mode.
+        assert torch.equal(L_orig["token_ids"], L_ours["token_ids"]), (
+            f"token_ids differ for hook={hook!r} (eager, ours): "
+            f"{ours_tok_n} positions differ"
         )
-        assert torch.equal(L_orig, L_ref), (
-            f"L_orig != L_ref for hook={hook!r} (eager): "
-            f"_compare-side capture perturbs forward (max diff "
-            f"{diff_ref.max().item():.4f})"
+        assert torch.equal(L_orig["logprobs"], L_ours["logprobs"]), (
+            f"logprobs differ for hook={hook!r} (eager, ours): max diff "
+            f"{ours_lp_max:.4f}"
+        )
+        assert torch.equal(L_orig["token_ids"], L_ref["token_ids"]), (
+            f"token_ids differ for hook={hook!r} (eager, ref): "
+            f"{ref_tok_n} positions differ"
+        )
+        assert torch.equal(L_orig["logprobs"], L_ref["logprobs"]), (
+            f"logprobs differ for hook={hook!r} (eager, ref): max diff "
+            f"{ref_lp_max:.4f}"
         )
     else:
-        # Tolerant: torch.compile injects ~0.07-0.1 fp16 noise per class
-        # hierarchy.  Cap at _COMPILED_ATOL (0.15); see module docstring.
-        assert torch.allclose(
-            L_orig, L_ours, atol=_COMPILED_ATOL, rtol=_COMPILED_RTOL,
-        ), (
-            f"L_orig vs L_ours for hook={hook!r} (compiled): max diff "
-            f"{diff_ours.max().item():.4f} exceeds atol={_COMPILED_ATOL}"
+        # Compiled: chosen tokens still expected to match (greedy +
+        # high-confidence top-1); chosen-token logprobs within tolerance
+        # to absorb torch.compile's per-class fusion noise.
+        assert torch.equal(L_orig["token_ids"], L_ours["token_ids"]), (
+            f"token_ids differ for hook={hook!r} (compiled, ours): "
+            f"{ours_tok_n} positions differ -- a hook installation "
+            f"flipped the argmax under compile"
         )
         assert torch.allclose(
-            L_orig, L_ref, atol=_COMPILED_ATOL, rtol=_COMPILED_RTOL,
+            L_orig["logprobs"], L_ours["logprobs"],
+            atol=_COMPILED_ATOL, rtol=_COMPILED_RTOL,
         ), (
-            f"L_orig vs L_ref for hook={hook!r} (compiled): max diff "
-            f"{diff_ref.max().item():.4f} exceeds atol={_COMPILED_ATOL}"
+            f"logprobs for hook={hook!r} (compiled, ours): max diff "
+            f"{ours_lp_max:.4f} exceeds atol={_COMPILED_ATOL}"
+        )
+        assert torch.equal(L_orig["token_ids"], L_ref["token_ids"]), (
+            f"token_ids differ for hook={hook!r} (compiled, ref): "
+            f"{ref_tok_n} positions differ"
+        )
+        assert torch.allclose(
+            L_orig["logprobs"], L_ref["logprobs"],
+            atol=_COMPILED_ATOL, rtol=_COMPILED_RTOL,
+        ), (
+            f"logprobs for hook={hook!r} (compiled, ref): max diff "
+            f"{ref_lp_max:.4f} exceeds atol={_COMPILED_ATOL}"
         )
