@@ -15,10 +15,8 @@ Key pieces:
   * ``generate_with_monitoring`` and ``generate_greedy`` -- HF entry
     points; both run through ``HFAdaptor`` rather than touching transport
     state directly.
-  * ``_make_model_shape_from_hf_config`` -- shared helper used by
-    HFAdaptor and (Phase 3) the future VLLMAdaptor.
-  * ``_make_model_shape`` -- backwards-compat wrapper used by
-    ``monitoring/vllm_integration.py`` until Phase 3 lands.
+  * ``_make_model_shape_from_hf_config`` -- shared helper, lives in
+    ``integration/model_shape.py`` and is also imported by VLLMAdaptor.
 
 ``monitoring/generate.py`` is now a thin re-export shim; Phase 5 deletes
 it once external callers migrate to ``integration.hf_adapter``.
@@ -52,6 +50,7 @@ from monitoring.selection import (
     filter_by_tp_rank,
 )
 from monitoring.step_context import StepContext
+from integration.model_shape import _make_model_shape_from_hf_config
 
 
 # ---------------------------------------------------------------------------
@@ -87,74 +86,11 @@ def print_prepare_profile() -> None:
         print(f"  {'prepare_step results':20s}: {', '.join(parts)}")
 
 
-# ---------------------------------------------------------------------------
-# Model-shape helpers
-# ---------------------------------------------------------------------------
-
-def _make_model_shape_from_hf_config(
-    hf_config: Any,
-    dtype: Optional[torch.dtype] = None,
-) -> Optional[ModelShapeConfig]:
-    """Build a ``ModelShapeConfig`` from an HF model config.
-
-    Used by ``HFAdaptor.detect_model_shape`` (HF model.config + model.dtype)
-    and (Phase 3) by ``VLLMAdaptor.detect_model_shape`` (vLLM hf_config +
-    vllm_config.model_config.dtype).
-
-    Returns ``None`` if the config is missing required fields.
-    """
-    cfg = hf_config
-    hidden_dim = getattr(cfg, "hidden_size", getattr(cfg, "n_embd", None))
-    num_heads = getattr(cfg, "num_attention_heads", getattr(cfg, "n_head", None))
-    num_kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
-    head_dim = getattr(cfg, "head_dim", None)
-    if hidden_dim is None or num_heads is None:
-        return None
-    if head_dim is None:
-        head_dim = int(hidden_dim) // int(num_heads)
-    if dtype is None:
-        dtype = getattr(cfg, "torch_dtype", None)
-    if dtype is None:
-        dtype = torch.float16
-    vocab_size = getattr(cfg, "vocab_size", 0) or 0
-    intermediate_dim = getattr(cfg, "intermediate_size", None) or getattr(cfg, "n_inner", None) or 0
-    if not intermediate_dim and getattr(cfg, "model_type", "") == "gpt2":
-        intermediate_dim = 4 * int(hidden_dim)
-
-    # TP detection happens in HFAdaptor.detect_parallel_ranks; leave defaults here.
-    return ModelShapeConfig(
-        hidden_dim=int(hidden_dim),
-        num_heads=int(num_heads),
-        num_kv_heads=int(num_kv_heads),
-        head_dim=int(head_dim),
-        dtype=dtype,
-        vocab_size=int(vocab_size),
-        intermediate_dim=int(intermediate_dim),
-        tp_size=1,
-        tp_rank=0,
-    )
-
-
-def _make_model_shape(model: Any) -> Optional[ModelShapeConfig]:
-    """Backwards-compat wrapper used by ``monitoring/vllm_integration.py``
-    until Phase 3 lands ``integration/vllm_adapter.py``.
-
-    Reads model.config and model.dtype, then calls
-    ``_make_model_shape_from_hf_config``.  Detects torch.distributed TP
-    so the legacy vLLM call path keeps working.
-    """
-    try:
-        dtype = getattr(model, "dtype", None)
-        cfg = _make_model_shape_from_hf_config(model.config, dtype=dtype)
-        if cfg is None:
-            return None
-        import torch.distributed as dist
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            cfg.tp_size = dist.get_world_size()
-            cfg.tp_rank = dist.get_rank()
-        return cfg
-    except Exception:
-        return None
+# Model-shape helpers were extracted to integration/model_shape.py in
+# Phase 3a so VLLMAdaptor can share them.  The legacy
+# `_make_model_shape(model)` wrapper that fed the old
+# `monitoring/vllm_integration.py` substantial-implementation was
+# deleted alongside Phase 3a's shim shrink (its only caller).
 
 
 # ---------------------------------------------------------------------------
@@ -1137,8 +1073,6 @@ __all__ = [
     "GreedyGenerateTimings",
     "generate_with_monitoring",
     "generate_greedy",
-    "_make_model_shape",
-    "_make_model_shape_from_hf_config",
     "_prepare_profile_times",
     "print_prepare_profile",
 ]

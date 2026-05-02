@@ -53,11 +53,8 @@ _ALL_HOOK_TYPES = frozenset(_id_by_short.values())
 # -- Presets --
 _HOOK_SELECTIONS: Dict[str, frozenset] = {
     "full": _ALL_HOOK_TYPES,
-    # vLLM: full minus attention weight matrices (FlashAttention never
-    # materializes attn_scores/pattern).
-    # Phase 1.5 will move this entry into integration/vllm_adapter.py via
-    # delete-then-register_preset.
-    "vllm-full": _ALL_HOOK_TYPES - _ATTN_WT_TYPES,
+    # "vllm-full" is registered at import time by integration/vllm_adapter.py
+    # via register_preset (Phase 3a; deferred from Phase 1.5).
     # What HF returns with output_hidden_states + output_attentions + logits
     "hf-only": frozenset({
         HOOK_TYPE_RESID_PRE, HOOK_TYPE_FINAL_LN,
