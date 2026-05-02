@@ -20,3 +20,8 @@ monitoring = ["csrc/*.cpp", "csrc/*.h", "csrc/*.hpp", "Makefile"]
 
 [tool.setuptools.packages.find]
 include = ["monitoring*", "benchmark*", "integration"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: tests that take more than ~30 s (per-hook isolation full sweep, large E2E sweeps); skipped by default unless `-m slow` is passed",
+]
