@@ -145,6 +145,9 @@ class HFAdaptor(BackendAdaptor):
       * ``_batch_request_ids``: list[str] auto-generated as
         ``f"{group_id}:{i}"`` per active request.
       * ``_batch_starts``: per-request next token offset.
+      * ``_batch_finished``: per-request post-EOS latch (mirrors HF's
+        ``unfinished_sequences``).  Once True, decode emits zero-length
+        token ranges for that request unless ``no_strip_right_pad=True``.
       * ``_prefill_kv_offsets``: per-request left-pad in the kv dim,
         computed once per prefill from the 2D/4D attention mask.
       * ``_orig_prepare``: original ``prepare_inputs_for_generation``,
@@ -161,16 +164,26 @@ class HFAdaptor(BackendAdaptor):
         model_id: str,
         *,
         no_strip_left_pad: bool = False,
+        no_strip_right_pad: bool = False,
+        eos_token_id: Any = None,
     ) -> None:
         super().__init__(engine, model_id)
         self._batch_request_ids: Optional[List[str]] = None
         self._batch_starts: Optional[List[int]] = None
+        self._batch_finished: Optional[List[bool]] = None
         self._prefill_kv_offsets: Optional[List[int]] = None
         self._orig_prepare: Any = None
-        # Per-instance default for left-pad / post-EOS stripping.  Per-call
-        # ``attach_model(no_strip_left_pad=...)`` overrides only when explicitly
-        # passed (Q16/Q19 = b).  Read by ``build_step_context``.
+        # Per-instance defaults.  Per-call ``attach_model(...)`` overrides
+        # only when the kwarg is explicitly passed (None means inherit).
         self._no_strip_left_pad: bool = bool(no_strip_left_pad)
+        self._no_strip_right_pad: bool = bool(no_strip_right_pad)
+        # User-supplied eos_token_id (or None for auto-detect at attach
+        # time).  Stored verbatim; resolution into ``_eos_token_ids``
+        # happens in ``attach_model`` so we can chain to the model's
+        # generation_config / config when neither constructor nor
+        # attach_model call passes an explicit value.
+        self._eos_token_id_arg: Any = eos_token_id
+        self._eos_token_ids: frozenset = frozenset()
 
     # --- abstract overrides ---------------------------------------------
     def detect_model_shape(self, model: Any) -> ModelShapeConfig:
@@ -230,11 +243,56 @@ class HFAdaptor(BackendAdaptor):
             stacklevel=2,
         )
 
+    # --- eos resolution -------------------------------------------------
+    @staticmethod
+    def _normalize_eos(value: Any) -> "frozenset[int]":
+        """Coerce ``int`` / ``list[int]`` / ``torch.Tensor`` / ``None`` into
+        ``frozenset[int]``.  ``None`` -> empty frozenset."""
+        if value is None:
+            return frozenset()
+        if isinstance(value, torch.Tensor):
+            return frozenset(int(t) for t in value.flatten().tolist())
+        if isinstance(value, int):
+            return frozenset({value})
+        # Assume iterable (list, tuple, set, ...)
+        return frozenset(int(t) for t in value)
+
+    def _resolve_eos_token_ids(
+        self, model: Any, attach_arg: Any
+    ) -> "frozenset[int]":
+        """Resolution chain for the post-EOS strip's eos token set.  Runs
+        each time ``attach_model`` is called.
+
+        Priority order:
+          1. ``attach_arg`` (per-call kwarg) if non-None.
+          2. ``self._eos_token_id_arg`` (constructor kwarg) if non-None.
+          3. ``model.generation_config.eos_token_id`` if present and non-None.
+          4. ``model.config.eos_token_id`` if present and non-None.
+          5. Empty frozenset (silent fallback; strip never latches).
+        """
+        if attach_arg is not None:
+            return self._normalize_eos(attach_arg)
+        if self._eos_token_id_arg is not None:
+            return self._normalize_eos(self._eos_token_id_arg)
+        gen_cfg = getattr(model, "generation_config", None)
+        if gen_cfg is not None:
+            v = getattr(gen_cfg, "eos_token_id", None)
+            if v is not None:
+                return self._normalize_eos(v)
+        cfg = getattr(model, "config", None)
+        if cfg is not None:
+            v = getattr(cfg, "eos_token_id", None)
+            if v is not None:
+                return self._normalize_eos(v)
+        return frozenset()
+
     # --- attach / detach ------------------------------------------------
     def attach_model(
         self, model: Any, hook_selection: str = "full",
         install_prepare_wrapper: bool = True,
         no_strip_left_pad: Optional[bool] = None,
+        no_strip_right_pad: Optional[bool] = None,
+        eos_token_id: Any = None,
     ) -> None:
         """Resolve shape, install ring hooks, and (optionally) wrap
         ``prepare_inputs_for_generation`` so each forward pass triggers
@@ -244,12 +302,25 @@ class HFAdaptor(BackendAdaptor):
         ``generate_greedy_with_monitoring`` which calls
         ``before_forward_manual`` directly per step.
 
-        ``no_strip_left_pad``: when not ``None``, override the per-instance default
-        set in ``__init__``.  ``None`` (default) inherits the constructor
-        value.  Per-call wins only when explicitly passed.
+        ``no_strip_left_pad`` / ``no_strip_right_pad``: when not ``None``,
+        override the per-instance default set in ``__init__``.  ``None``
+        (default) inherits the constructor value.  Per-call wins only
+        when explicitly passed.
+
+        ``eos_token_id``: per-call override (highest priority).  When
+        ``None``, falls back to the constructor's ``eos_token_id``; if
+        that is also ``None``, auto-detects from
+        ``model.generation_config.eos_token_id`` then
+        ``model.config.eos_token_id``; if neither is set, the resolved
+        set is empty and the post-EOS strip never latches.  Accepts
+        ``int``, ``list[int]``, or ``torch.Tensor``; normalised to
+        ``frozenset[int]``.
         """
         if no_strip_left_pad is not None:
             self._no_strip_left_pad = bool(no_strip_left_pad)
+        if no_strip_right_pad is not None:
+            self._no_strip_right_pad = bool(no_strip_right_pad)
+        self._eos_token_ids = self._resolve_eos_token_ids(model, eos_token_id)
         super().attach_model(model, hook_selection)
 
         # Startup validation: warn if pinned staging < GPU ring.
@@ -389,13 +460,15 @@ class HFAdaptor(BackendAdaptor):
             gid = self.engine.next_auto_group_id()
             self._batch_request_ids = [f"{gid}:{i}" for i in range(batch_size)]
             self._batch_starts = [0] * batch_size
+            self._batch_finished = [False] * batch_size
             # On (re)prefill, recompute kv_offsets from the attention mask
             # (it can change per-prefill if the user sends a fresh mask).
             self._prefill_kv_offsets = None
 
         req_ids = self._batch_request_ids
         starts = self._batch_starts
-        if req_ids is None or starts is None:
+        finished = self._batch_finished
+        if req_ids is None or starts is None or finished is None:
             return None
 
         # Qwen3 + StaticCache passes attention_mask as a dict
@@ -480,16 +553,50 @@ class HFAdaptor(BackendAdaptor):
                 token_ranges.append((start_i, end_i))
                 starts[i] = end_i
         else:
+            # Decode: optional post-EOS strip.  Detection runs one step
+            # late by construction -- ``input_ids[:, -1]`` is the token
+            # appended by the previous step's argmax.  At step N
+            # (EOS-producing): last_id is T_{N-1}, no latch, capture
+            # normally.  At step N+1 (EOS-feeding): last_id = T_N = EOS,
+            # latch and strip from here.  This keeps the activation that
+            # produced the first EOS while dropping every step thereafter.
+            #
+            # One ``.tolist()`` per step (B bytes) -- single GPU->CPU sync,
+            # mirroring HF's own per-step ``unfinished_sequences.max() == 0``
+            # sync.  Skipped entirely when the eos set is empty (auto-detect
+            # found nothing) or when the user opted out via
+            # ``no_strip_right_pad=True``.
+            no_strip_right_pad = self._no_strip_right_pad
+            if (
+                self._eos_token_ids
+                and not no_strip_right_pad
+                and hasattr(input_ids, "shape")
+                and len(input_ids.shape) >= 2
+                and int(input_ids.shape[1]) >= 1
+            ):
+                try:
+                    last_ids_list = input_ids[:, -1].tolist()
+                except Exception:
+                    last_ids_list = None
+                if last_ids_list is not None and len(last_ids_list) == batch_size:
+                    eos_set = self._eos_token_ids
+                    for i in range(batch_size):
+                        if not finished[i] and last_ids_list[i] in eos_set:
+                            finished[i] = True
+
             for i in range(batch_size):
                 start_i = int(starts[i])
-                end_i = start_i + 1
-                token_ranges.append((start_i, end_i))
-                starts[i] = end_i
+                if finished[i] and not no_strip_right_pad:
+                    token_ranges.append((start_i, start_i))
+                else:
+                    end_i = start_i + 1
+                    token_ranges.append((start_i, end_i))
+                    starts[i] = end_i
 
         if os.environ.get("RING_DEBUG_STEP"):
             print(
                 f"[ring_step] prefill={is_prefill} "
-                f"token_ranges={token_ranges}"
+                f"token_ranges={token_ranges} finished={list(finished)}"
             )
 
         # Derive q_len, kv_dim, dim0_offsets.
@@ -585,6 +692,8 @@ def generate_with_monitoring(
     model: Any, *args: Any,
     hook_selection: Optional[str] = None,
     no_strip_left_pad: bool = False,
+    no_strip_right_pad: bool = False,
+    eos_token_id: Any = None,
     **kwargs: Any,
 ):
     """Run HF ``generate()`` with ring-transport monitoring hooks active.
@@ -597,9 +706,18 @@ def generate_with_monitoring(
             "hf-only"        -- hidden states + attention weights + logits
             "hidden-states"  -- residual stream + embeddings + final LN
             "logits"         -- final logits only
-        no_strip_left_pad: if True, keep the full mask width when computing prefill
-            ``token_ranges`` (i.e. emit a row for every model-input position
-            including left-padding).  Default False (strip left-pad).
+        no_strip_left_pad: if True, keep the full mask width when computing
+            prefill ``token_ranges`` (i.e. emit a row for every model-input
+            position including left-padding).  Default False (strip left-pad).
+        no_strip_right_pad: if True, keep decode rows even after a request
+            hits EOS (HF inserts pad in lockstep batches; those rows are
+            captured normally).  Default False (strip post-EOS noise).
+        eos_token_id: per-call override for EOS detection.  Accepts
+            ``int``, ``list[int]``, or ``torch.Tensor``.  When ``None``,
+            HFAdaptor auto-detects from ``model.generation_config.eos_token_id``
+            then ``model.config.eos_token_id``; if neither is set, the
+            post-EOS strip never latches.  Has no effect when
+            ``no_strip_right_pad=True``.
 
     For CUDA graph capture, use HF's built-in ``CompileConfig``::
 
@@ -708,7 +826,12 @@ def generate_with_monitoring(
         engine = getattr(model, "monitoring_engine", None)
     adaptor: Optional[HFAdaptor] = None
     if engine is not None and engine._ring_transport is not None:
-        adaptor = HFAdaptor(engine, engine._model_id, no_strip_left_pad=no_strip_left_pad)
+        adaptor = HFAdaptor(
+            engine, engine._model_id,
+            no_strip_left_pad=no_strip_left_pad,
+            no_strip_right_pad=no_strip_right_pad,
+            eos_token_id=eos_token_id,
+        )
         adaptor.attach_model(
             target,
             hook_selection=hook_selection or "full",
@@ -824,13 +947,14 @@ def generate_greedy_with_monitoring(
     *,
     max_new_tokens: int,
     min_new_tokens: int = 0,
-    eos_token_id: Optional[int] = None,
+    eos_token_id: Any = None,
     pad_token_id: Optional[int] = None,
     logits_to_keep: int = 0,
     cuda_graphs: bool = False,
     monitoring: bool = False,
     hook_selection: Optional[str] = None,
     no_strip_left_pad: bool = False,
+    no_strip_right_pad: bool = False,
     timings: Optional[GreedyGenerateTimings] = None,
 ) -> List[Any]:
     """Greedy-argmax generate loop, no HF generate() overhead.
@@ -864,6 +988,9 @@ def generate_greedy_with_monitoring(
             True, keep the full mask width in prefill ``token_ranges``
             (i.e. emit a row for every model-input position including
             left-padding).  Default False (strip left-pad).
+        no_strip_right_pad: forwarded to ``HFAdaptor`` when monitoring=True.
+            If True, keep decode rows even after a request hits EOS.
+            Default False (strip post-EOS).
         timings: if provided, filled with timing data.
 
     Returns:
@@ -886,7 +1013,12 @@ def generate_greedy_with_monitoring(
     if monitoring:
         engine = getattr(model, "monitoring_engine", None)
         if engine is not None and engine._ring_transport is not None:
-            adaptor = HFAdaptor(engine, engine._model_id, no_strip_left_pad=no_strip_left_pad)
+            adaptor = HFAdaptor(
+                engine, engine._model_id,
+                no_strip_left_pad=no_strip_left_pad,
+                no_strip_right_pad=no_strip_right_pad,
+                eos_token_id=eos_token_id,
+            )
             adaptor.attach_model(
                 model,
                 hook_selection=hook_selection or "full",
