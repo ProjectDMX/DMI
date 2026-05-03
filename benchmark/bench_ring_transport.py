@@ -228,7 +228,7 @@ def _run_one(model, input_ids, attention_mask,
              use_monitoring: bool) -> RunResult:
     """Run one generate() and return timing breakdown.
 
-    When cuda_graphs is enabled, uses generate_greedy() for both baseline
+    When cuda_graphs is enabled, uses generate_greedy_with_monitoring() for both baseline
     and monitored modes — same lean loop, only difference is monitoring=True/False.
     This eliminates HF generate()'s per-step Python overhead from the comparison.
 
@@ -245,12 +245,12 @@ def _run_one(model, input_ids, attention_mask,
 def _run_one_greedy(model, input_ids, attention_mask,
                     cfg: BenchConfig, eos_id: int, pad_id: int,
                     use_monitoring: bool) -> RunResult:
-    """Run one iteration using generate_greedy (lean manual loop)."""
-    from monitoring.generate import generate_greedy, GreedyGenerateTimings
+    """Run one iteration using generate_greedy_with_monitoring (lean manual loop)."""
+    from monitoring.generate import generate_greedy_with_monitoring, GreedyGenerateTimings
 
     timings = GreedyGenerateTimings()
     with torch.no_grad():
-        generate_greedy(
+        generate_greedy_with_monitoring(
             model, input_ids, attention_mask,
             max_new_tokens=cfg.decode_len,
             min_new_tokens=cfg.decode_len,

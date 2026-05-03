@@ -79,10 +79,6 @@ def main():
     mon_cfg = MonitoringConfig(
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
-    if hasattr(mon_cfg, "eos_token_id"):
-        mon_cfg.eos_token_id = eos_id
-    if hasattr(mon_cfg, "pad_token_id"):
-        mon_cfg.pad_token_id = pad_id
 
     # Host engine config
     from monitoring import HostEngineConfig

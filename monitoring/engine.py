@@ -25,7 +25,22 @@ class HostEngineConfig:
 
 
 class MonitoringEngine:
-    """High-level wrapper that routes monitoring tasks to native backend."""
+    """High-level wrapper that routes monitoring tasks to the native backend.
+
+    Canonical surface that adapters depend on:
+      * ``__init__(config, model_id, host_engine|db_config)``
+      * ``enable_ring_transport(ring_config, model_shape=None) -> RingTransport``
+      * ``next_auto_group_id() -> int``  -- engine-scoped counter for HF;
+        vLLM passes its own scheduler-assigned request IDs.
+      * ``close()``
+      * ``model.monitoring_engine = engine`` -- the convention adapters
+        look for to discover the active engine.
+
+    Per-framework state (no_strip_left_pad, batch tracking, etc.) lives on the
+    adapter (HFAdaptor / VLLMAdaptor), not here.  Callers wanting NVTX
+    ranges call ``monitoring.hook_points.set_monitoring_debug(True)``
+    directly.
+    """
 
     def __init__(
         self,
@@ -36,10 +51,6 @@ class MonitoringEngine:
         db_config: Optional[HostEngineConfig] = None,
     ) -> None:
         self.config = config
-        self._debug_enabled = bool(self.config.debug) if self.config is not None else False
-        self._no_strip = False if config is None else config.no_strip
-        self._sync_hook_debug_flag()
-
         self._model_id = model_id
         self._auto_batch_group_id = 0
 
@@ -84,7 +95,7 @@ class MonitoringEngine:
 
     def enable_ring_transport(
         self, ring_config: Any, model_shape: Optional[Any] = None
-    ) -> None:
+    ) -> Any:
         """Switch to ring-based D2H transport.
 
         Creates a RingEngine with the C++ host engine as the submit target so
@@ -97,6 +108,11 @@ class MonitoringEngine:
                           When provided, the new CUDA-graph-compatible forward-hook
                           path is activated.  If None, shape is auto-detected from
                           model.config in _install_monitoring_forward.
+
+        Returns:
+            The ``RingTransport`` instance (also stored as
+            ``self._ring_transport``).  Returned so adapters can hold a
+            direct reference instead of reaching through the engine.
         """
         from . import ring_transport as _rt
         from . import _native_engine  # type: ignore[attr-defined]
@@ -120,8 +136,9 @@ class MonitoringEngine:
             transport.set_model_cfg(model_shape)
         self._ring_engine = ring_engine
         self._ring_transport = transport
-        
+
         _rt.activate(transport)
+        return transport
 
     # ------------------------------------------------------------------
     def next_auto_group_id(self) -> int:
@@ -135,18 +152,6 @@ class MonitoringEngine:
         gid = int(self._auto_batch_group_id)
         self._auto_batch_group_id += 1
         return gid
-
-    def _sync_hook_debug_flag(self) -> None:
-        """Propagate debug mode to hook_points module without hard import coupling."""
-
-        try:
-            from . import hook_points  # local import to avoid import cycle at module load
-
-            setter = getattr(hook_points, "set_monitoring_debug", None)
-            if setter is not None:
-                setter(self._debug_enabled)
-        except Exception:
-            pass
 
     def close(self) -> None:
         """Tear down backend resources."""

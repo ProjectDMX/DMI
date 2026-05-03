@@ -164,8 +164,6 @@ class TestMonitoringConfigDefaults:
         config = MonitoringConfig()
         assert isinstance(config.schedule, CaptureSchedule)
         assert config.schedule.step_stride == 1
-        assert config.debug is False
-        assert config.no_strip is False
 
     def test_custom_schedule(self):
         schedule = CaptureSchedule(step_stride=4)

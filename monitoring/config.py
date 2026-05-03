@@ -55,8 +55,15 @@ class CaptureSchedule:
 
 @dataclass
 class MonitoringConfig:
-    """Bundle capture schedule and runtime flags for the monitoring engine."""
+    """Bundle capture schedule and runtime flags for the monitoring engine.
+
+    Framework-specific flags (HF left-pad ``no_strip_left_pad``, NVTX
+    ``debug``) were moved out in the Phase 4 cleanup:
+      * ``no_strip_left_pad`` is now an explicit kwarg on the HF entry
+        points (``generate_with_monitoring``,
+        ``generate_greedy_with_monitoring``, ``HFAdaptor.attach_model``).
+      * NVTX ranges are toggled via
+        ``monitoring.hook_points.set_monitoring_debug(True)``.
+    """
 
     schedule: CaptureSchedule = field(default_factory=CaptureSchedule)
-    debug: bool = False
-    no_strip: bool = field(default=False)

@@ -12,9 +12,9 @@ Key pieces:
     pre-refactor ``MonitoringEngine._prepare_ring_step`` plus the
     kv_offsets / q_len / kv_dim derivation from
     ``_install_prepare_wrapper``.
-  * ``generate_with_monitoring`` and ``generate_greedy`` -- HF entry
-    points; both run through ``HFAdaptor`` rather than touching transport
-    state directly.
+  * ``generate_with_monitoring`` and ``generate_greedy_with_monitoring``
+    -- HF entry points; both run through ``HFAdaptor`` rather than
+    touching transport state directly.
   * ``_make_model_shape_from_hf_config`` -- shared helper, lives in
     ``integration/model_shape.py`` and is also imported by VLLMAdaptor.
 
@@ -99,7 +99,7 @@ def print_prepare_profile() -> None:
 
 @dataclass
 class GreedyGenerateTimings:
-    """Optional per-step timing data from generate_greedy."""
+    """Optional per-step timing data from generate_greedy_with_monitoring."""
     prefill_ms: float = 0.0
     decode_ms: float = 0.0
     total_ms: float = 0.0
@@ -145,7 +145,6 @@ class HFAdaptor(BackendAdaptor):
       * ``_batch_request_ids``: list[str] auto-generated as
         ``f"{group_id}:{i}"`` per active request.
       * ``_batch_starts``: per-request next token offset.
-      * ``_batch_finished``: per-request EOS/pad latch.
       * ``_prefill_kv_offsets``: per-request left-pad in the kv dim,
         computed once per prefill from the 2D/4D attention mask.
       * ``_orig_prepare``: original ``prepare_inputs_for_generation``,
@@ -156,13 +155,22 @@ class HFAdaptor(BackendAdaptor):
     or mid-call batch shrinks each get a unique group prefix.
     """
 
-    def __init__(self, engine: Any, model_id: str) -> None:
+    def __init__(
+        self,
+        engine: Any,
+        model_id: str,
+        *,
+        no_strip_left_pad: bool = False,
+    ) -> None:
         super().__init__(engine, model_id)
         self._batch_request_ids: Optional[List[str]] = None
         self._batch_starts: Optional[List[int]] = None
-        self._batch_finished: Optional[List[bool]] = None
         self._prefill_kv_offsets: Optional[List[int]] = None
         self._orig_prepare: Any = None
+        # Per-instance default for left-pad / post-EOS stripping.  Per-call
+        # ``attach_model(no_strip_left_pad=...)`` overrides only when explicitly
+        # passed (Q16/Q19 = b).  Read by ``build_step_context``.
+        self._no_strip_left_pad: bool = bool(no_strip_left_pad)
 
     # --- abstract overrides ---------------------------------------------
     def detect_model_shape(self, model: Any) -> ModelShapeConfig:
@@ -226,14 +234,22 @@ class HFAdaptor(BackendAdaptor):
     def attach_model(
         self, model: Any, hook_selection: str = "full",
         install_prepare_wrapper: bool = True,
+        no_strip_left_pad: Optional[bool] = None,
     ) -> None:
         """Resolve shape, install ring hooks, and (optionally) wrap
         ``prepare_inputs_for_generation`` so each forward pass triggers
         ``before_forward(model_inputs)``.
 
-        ``install_prepare_wrapper=False`` is used by ``generate_greedy``
-        which calls ``before_forward_manual`` directly per step.
+        ``install_prepare_wrapper=False`` is used by
+        ``generate_greedy_with_monitoring`` which calls
+        ``before_forward_manual`` directly per step.
+
+        ``no_strip_left_pad``: when not ``None``, override the per-instance default
+        set in ``__init__``.  ``None`` (default) inherits the constructor
+        value.  Per-call wins only when explicitly passed.
         """
+        if no_strip_left_pad is not None:
+            self._no_strip_left_pad = bool(no_strip_left_pad)
         super().attach_model(model, hook_selection)
 
         # Startup validation: warn if pinned staging < GPU ring.
@@ -373,15 +389,13 @@ class HFAdaptor(BackendAdaptor):
             gid = self.engine.next_auto_group_id()
             self._batch_request_ids = [f"{gid}:{i}" for i in range(batch_size)]
             self._batch_starts = [0] * batch_size
-            self._batch_finished = [False] * batch_size
             # On (re)prefill, recompute kv_offsets from the attention mask
             # (it can change per-prefill if the user sends a fresh mask).
             self._prefill_kv_offsets = None
 
         req_ids = self._batch_request_ids
         starts = self._batch_starts
-        finished = self._batch_finished
-        if req_ids is None or starts is None or finished is None:
+        if req_ids is None or starts is None:
             return None
 
         # Qwen3 + StaticCache passes attention_mask as a dict
@@ -424,7 +438,7 @@ class HFAdaptor(BackendAdaptor):
 
         # Build per-request token_ranges.
         token_ranges: List[Tuple[int, int]] = []
-        no_strip = bool(getattr(self.engine, "_no_strip", False))
+        no_strip_left_pad = self._no_strip_left_pad
         if is_prefill:
             if attention_mask is None or not hasattr(attention_mask, "dim"):
                 return None
@@ -433,7 +447,7 @@ class HFAdaptor(BackendAdaptor):
                 if ndim == 2:
                     lengths = (
                         attention_mask.sum(dim=1).tolist()
-                        if not no_strip
+                        if not no_strip_left_pad
                         else [attention_mask.shape[1]] * attention_mask.shape[0]
                     )
                 elif ndim == 4 and len(input_shape) >= 2 and int(input_shape[1]) > 0:
@@ -447,7 +461,7 @@ class HFAdaptor(BackendAdaptor):
                     lengths = (
                         (attention_mask[:, 0, -1, :q_len_mask] >= 0.0)
                         .sum(dim=-1).long().tolist()
-                        if not no_strip
+                        if not no_strip_left_pad
                         else [q_len_mask] * int(attention_mask.shape[0])
                     )
                 else:
@@ -466,50 +480,16 @@ class HFAdaptor(BackendAdaptor):
                 token_ranges.append((start_i, end_i))
                 starts[i] = end_i
         else:
-            eos_or_pad_ids: set = set()
-            cfg = self.engine.config
-            eos_token_id = (
-                getattr(cfg, "eos_token_id", None) if cfg is not None else None
-            )
-            pad_token_id = (
-                getattr(cfg, "pad_token_id", None) if cfg is not None else None
-            )
-            if eos_token_id is not None:
-                if isinstance(eos_token_id, (list, tuple, set)):
-                    eos_or_pad_ids.update(int(v) for v in eos_token_id)
-                else:
-                    eos_or_pad_ids.add(int(eos_token_id))
-            if pad_token_id is not None:
-                eos_or_pad_ids.add(int(pad_token_id))
-            last_ids = None
-            if eos_or_pad_ids:
-                try:
-                    last_ids = input_ids[:, -1]
-                except Exception:
-                    last_ids = None
-
             for i in range(batch_size):
                 start_i = int(starts[i])
-                is_finished = bool(finished[i])
-                if (not is_finished) and (last_ids is not None):
-                    try:
-                        if int(last_ids[i]) in eos_or_pad_ids:
-                            is_finished = True
-                    except Exception:
-                        pass
-                if is_finished:
-                    finished[i] = True
-                if is_finished and not no_strip:
-                    token_ranges.append((start_i, start_i))
-                else:
-                    end_i = start_i + 1
-                    token_ranges.append((start_i, end_i))
-                    starts[i] = end_i
+                end_i = start_i + 1
+                token_ranges.append((start_i, end_i))
+                starts[i] = end_i
 
         if os.environ.get("RING_DEBUG_STEP"):
             print(
                 f"[ring_step] prefill={is_prefill} "
-                f"token_ranges={token_ranges} finished={list(finished)}"
+                f"token_ranges={token_ranges}"
             )
 
         # Derive q_len, kv_dim, dim0_offsets.
@@ -604,6 +584,7 @@ class HFAdaptor(BackendAdaptor):
 def generate_with_monitoring(
     model: Any, *args: Any,
     hook_selection: Optional[str] = None,
+    no_strip_left_pad: bool = False,
     **kwargs: Any,
 ):
     """Run HF ``generate()`` with ring-transport monitoring hooks active.
@@ -616,6 +597,9 @@ def generate_with_monitoring(
             "hf-only"        -- hidden states + attention weights + logits
             "hidden-states"  -- residual stream + embeddings + final LN
             "logits"         -- final logits only
+        no_strip_left_pad: if True, keep the full mask width when computing prefill
+            ``token_ranges`` (i.e. emit a row for every model-input position
+            including left-padding).  Default False (strip left-pad).
 
     For CUDA graph capture, use HF's built-in ``CompileConfig``::
 
@@ -724,7 +708,7 @@ def generate_with_monitoring(
         engine = getattr(model, "monitoring_engine", None)
     adaptor: Optional[HFAdaptor] = None
     if engine is not None and engine._ring_transport is not None:
-        adaptor = HFAdaptor(engine, engine._model_id)
+        adaptor = HFAdaptor(engine, engine._model_id, no_strip_left_pad=no_strip_left_pad)
         adaptor.attach_model(
             target,
             hook_selection=hook_selection or "full",
@@ -830,10 +814,10 @@ def generate_with_monitoring(
 
 
 # ---------------------------------------------------------------------------
-# generate_greedy (manual prefill + decode loop)
+# generate_greedy_with_monitoring (manual prefill + decode loop)
 # ---------------------------------------------------------------------------
 
-def generate_greedy(
+def generate_greedy_with_monitoring(
     model: Any,
     input_ids: Any,
     attention_mask: Any,
@@ -846,6 +830,7 @@ def generate_greedy(
     cuda_graphs: bool = False,
     monitoring: bool = False,
     hook_selection: Optional[str] = None,
+    no_strip_left_pad: bool = False,
     timings: Optional[GreedyGenerateTimings] = None,
 ) -> List[Any]:
     """Greedy-argmax generate loop, no HF generate() overhead.
@@ -875,6 +860,10 @@ def generate_greedy(
             call before_forward_manual before each forward pass.
         hook_selection: hook selection preset (e.g. "hidden-states", "full").
             Only used when monitoring=True.
+        no_strip_left_pad: forwarded to ``HFAdaptor`` when monitoring=True.  If
+            True, keep the full mask width in prefill ``token_ranges``
+            (i.e. emit a row for every model-input position including
+            left-padding).  Default False (strip left-pad).
         timings: if provided, filled with timing data.
 
     Returns:
@@ -897,7 +886,7 @@ def generate_greedy(
     if monitoring:
         engine = getattr(model, "monitoring_engine", None)
         if engine is not None and engine._ring_transport is not None:
-            adaptor = HFAdaptor(engine, engine._model_id)
+            adaptor = HFAdaptor(engine, engine._model_id, no_strip_left_pad=no_strip_left_pad)
             adaptor.attach_model(
                 model,
                 hook_selection=hook_selection or "full",
@@ -1072,7 +1061,7 @@ __all__ = [
     "HFAdaptor",
     "GreedyGenerateTimings",
     "generate_with_monitoring",
-    "generate_greedy",
+    "generate_greedy_with_monitoring",
     "_prepare_profile_times",
     "print_prepare_profile",
 ]

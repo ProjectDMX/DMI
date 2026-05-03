@@ -12,7 +12,7 @@ from integration.hf_adapter import (
     HFAdaptor,
     GreedyGenerateTimings,
     generate_with_monitoring,
-    generate_greedy,
+    generate_greedy_with_monitoring,
     _prepare_profile_times,
     print_prepare_profile,
 )
@@ -22,7 +22,7 @@ __all__ = [
     "HFAdaptor",
     "GreedyGenerateTimings",
     "generate_with_monitoring",
-    "generate_greedy",
+    "generate_greedy_with_monitoring",
     "_make_model_shape_from_hf_config",
     "_prepare_profile_times",
     "print_prepare_profile",
