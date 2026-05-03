@@ -134,7 +134,7 @@ def main():
             print(f"\n  Value comparison: {len(ref_data)} ref requests, layers={layer_ids}")
 
             # Group DB resid_pre by request
-            from monitoring.vllm_integration import normalize_vllm_request_id
+            from integration.vllm_adapter import normalize_vllm_request_id
 
             db_grouped: Dict[str, Dict[int, List]] = {}
             for k, t in rows:

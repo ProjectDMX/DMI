@@ -20,7 +20,7 @@ def main():
 
     from monitoring import MonitoringEngine
     from monitoring._native_engine import ClickHouseClientConfig
-    from monitoring.generate import generate_with_monitoring
+    from integration.hf_adapter import generate_with_monitoring
     from transformers import AutoTokenizer
 
     # Config from env (same vars as the test)

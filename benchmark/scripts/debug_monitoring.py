@@ -12,7 +12,7 @@ print("[DEBUG] HookedGPT2LMHeadModel imported")
 
 from monitoring import MonitoringConfig, MonitoringEngine
 from monitoring.config import CaptureSchedule
-from monitoring.generate import generate_with_monitoring
+from integration.hf_adapter import generate_with_monitoring
 print("[DEBUG] monitoring modules imported")
 
 def main():

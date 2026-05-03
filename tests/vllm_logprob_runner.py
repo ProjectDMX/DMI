@@ -106,7 +106,7 @@ def main():
     if args.ref:
         kwargs["worker_cls"] = "tests.vllm_logprob_runner.RefLogprobWorker"
     elif args.monitored:
-        kwargs["worker_cls"] = "monitoring.vllm_integration.DMXGPUWorker"
+        kwargs["worker_cls"] = "integration.vllm_adapter.DMXGPUWorker"
         kwargs["additional_config"] = {
             "dmx_hook_selection": hook_selection,
             "dmx_ring_payload_mb": ring_payload_mb,

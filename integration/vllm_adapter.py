@@ -25,9 +25,6 @@ Key pieces:
     (deferred from Phase 1.5 per the unified-adaptor plan).  Lands as
     a side-effect of importing this module.
 
-``monitoring/vllm_integration.py`` is now a thin re-export shim;
-Phase 5 deletes it once external ``--worker-cls=...`` strings migrate
-to ``integration.vllm_adapter.DMXGPUWorker``.
 """
 from __future__ import annotations
 
@@ -72,8 +69,7 @@ from integration.model_shape import _make_model_shape_from_hf_config
 # Moved out of monitoring/selection.py's default _HOOK_SELECTIONS so the
 # core selection module is framework-neutral.  Registers when this
 # module is imported -- which happens whenever DMXGPUWorker is loaded
-# (either via worker_cls="integration.vllm_adapter.DMXGPUWorker" or via
-# the monitoring.vllm_integration shim).
+# via worker_cls="integration.vllm_adapter.DMXGPUWorker".
 #
 # `register_preset` raises on duplicates, so re-import within the same
 # process is a no-op (Python caches the module body).  Across separate
@@ -282,6 +278,21 @@ class VLLMAdaptor(BackendAdaptor):
         if total_tokens == 0:
             return None
 
+        # Why vLLM has no post-EOS strip (unlike HFAdaptor):
+        #   vLLM v1's scheduler removes finished requests from
+        #   ``scheduler_output.num_scheduled_tokens`` before the next
+        #   step.  The EOS-producing step's activation is real data
+        #   (and is captured); subsequent steps for that request never
+        #   appear in ``req_ids`` because the scheduler reassigned the
+        #   slot.  No lockstep, no post-EOS noise to filter.
+        #
+        #   HF's batched ``generate()`` is lockstep: finished requests
+        #   keep producing forward activations until the whole batch
+        #   finishes or ``max_new_tokens`` hits, so HFAdaptor needs the
+        #   per-request finished latch + zero-length token_range strip.
+        #   Do NOT propagate that pattern here -- the scheduler is
+        #   already filtering for us.
+
         self._step_counter += 1
         _step = self._step_counter
 
@@ -481,8 +492,7 @@ class DMXGPUWorker(Worker):
         # Backwards-compat attributes for external subclasses that read
         # the pre-refactor names (e.g. tests/compare_worker.py reads
         # `self._dmx_tp_rank` + `self._dmx_tp_size` to format per-rank
-        # filenames).  Phase 5's shim removal is the natural moment to
-        # delete these aliases.
+        # filenames).
         from vllm.distributed.parallel_state import get_tp_group
         tp_rank, dp_rank, ep_rank, pp_rank = self.adaptor.detect_parallel_ranks()
         self._dmx_tp_rank = tp_rank

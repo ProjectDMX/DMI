@@ -16,7 +16,7 @@ from monitoring import (
     StageConfig,
 )
 from monitoring.config import CaptureSchedule
-from monitoring.generate import generate_with_monitoring
+from integration.hf_adapter import generate_with_monitoring
 
 
 def _build_db_config() -> ClickHouseClientConfig:

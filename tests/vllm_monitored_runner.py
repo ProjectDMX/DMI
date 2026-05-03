@@ -53,7 +53,7 @@ def main():
     kwargs = dict(
         model=model_id,
         dtype=model_dtype,
-        worker_cls="monitoring.vllm_integration.DMXGPUWorker",
+        worker_cls="integration.vllm_adapter.DMXGPUWorker",
         additional_config={
             "dmx_hook_selection": hook_selection,
             "dmx_ring_payload_mb": ring_payload_mb,

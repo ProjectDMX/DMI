@@ -85,7 +85,7 @@ def _make_null_engine(model_id: str):
 
 def _run(model, input_ids, attention_mask, eos_id, pad_id, use_monitoring: bool):
     import torch
-    from monitoring.generate import generate_with_monitoring  # type: ignore
+    from integration.hf_adapter import generate_with_monitoring  # type: ignore
     extra = {"cache_implementation": "static"}
     with torch.no_grad():
         if use_monitoring:

@@ -246,7 +246,7 @@ def _run_one_greedy(model, input_ids, attention_mask,
                     cfg: BenchConfig, eos_id: int, pad_id: int,
                     use_monitoring: bool) -> RunResult:
     """Run one iteration using generate_greedy_with_monitoring (lean manual loop)."""
-    from monitoring.generate import generate_greedy_with_monitoring, GreedyGenerateTimings
+    from integration.hf_adapter import generate_greedy_with_monitoring, GreedyGenerateTimings
 
     timings = GreedyGenerateTimings()
     with torch.no_grad():
@@ -287,7 +287,7 @@ def _run_one_hf_generate(model, input_ids, attention_mask,
     time the next ``prepare_inputs_for_generation`` call begins, all GPU work
     from the previous step has completed.
     """
-    from monitoring.generate import generate_with_monitoring  # type: ignore
+    from integration.hf_adapter import generate_with_monitoring  # type: ignore
 
     extra = {}
     extra["logits_to_keep"] = cfg.logits_to_keep
@@ -593,7 +593,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
 
         # Print pre-forward profiling if enabled
         try:
-            from monitoring.generate import _prepare_profile_times, print_prepare_profile
+            from integration.hf_adapter import _prepare_profile_times, print_prepare_profile
             if _prepare_profile_times:
                 print()
                 print_prepare_profile()
@@ -618,7 +618,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
 
         # Print prepare_wrapper profiling if available
         try:
-            from monitoring.generate import _prepare_profile_times
+            from integration.hf_adapter import _prepare_profile_times
             times_list = _prepare_profile_times
         except ImportError:
             times_list = None
