@@ -325,13 +325,14 @@ class VLLMAdaptor(BackendAdaptor):
             req_id_list.append(norm_id)
             token_ranges.append((pre_computed, pre_computed + n))
             dim0_offsets.append(offset)
-            print(
-                f"[dmx_worker] step={_step} req[{i}] rid={norm_id} "
-                f"offset={offset} n={n} "
-                f"t_start={pre_computed} t_end={pre_computed + n} "
-                f"pre_computed={pre_computed} padded_q={padded_q}",
-                flush=True,
-            )
+            if os.environ.get("RING_DEBUG_STEP"):
+                print(
+                    f"[dmx_worker] step={_step} req[{i}] rid={norm_id} "
+                    f"offset={offset} n={n} "
+                    f"t_start={pre_computed} t_end={pre_computed + n} "
+                    f"pre_computed={pre_computed} padded_q={padded_q}",
+                    flush=True,
+                )
             offset += n
 
         # Read input_ids dtype from model_runner buffer.  On non-first
