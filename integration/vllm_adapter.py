@@ -399,7 +399,7 @@ class DMXGPUWorker(Worker):
         super().init_device()
 
         from monitoring import _native_engine as _ne
-        from monitoring.engine import MonitoringEngine, HostEngineConfig
+        from monitoring.engine import MonitoringEngine
 
         ac = self.vllm_config.additional_config
         if not isinstance(ac, dict):
@@ -447,10 +447,6 @@ class DMXGPUWorker(Worker):
             host_engine.start()
             self._dmx_host_engine = host_engine
 
-        # MonitoringEngine + ring transport.
-        engine = MonitoringEngine(
-            config=None, model_id=resolved_model_id, host_engine=host_engine
-        )
         ring_cfg = _ne.RingConfig()
         ring_cfg.payload_ring_bytes = ring_payload_mb * 1024 * 1024
         ring_cfg.pinned_staging_bytes = ring_pinned_mb * 1024 * 1024
@@ -461,7 +457,14 @@ class DMXGPUWorker(Worker):
         ring_cfg.insert_queue_max_items = int(_cfg(
             ac, "dmx_insert_queue_max_items", "DMX_INSERT_QUEUE_MAX_ITEMS",
             65536))
-        engine.enable_ring_transport(ring_cfg)
+
+        # MonitoringEngine + ring transport.
+        engine = MonitoringEngine(
+            config=None,
+            model_id=resolved_model_id,
+            host_engine=host_engine,
+            ring_config=ring_cfg,
+        )
 
         # Build the adaptor.  Hooks aren't installed yet -- that
         # happens in load_model after the model is materialized.

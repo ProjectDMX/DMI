@@ -825,18 +825,28 @@ def generate_with_monitoring(
     if engine is None:
         engine = getattr(model, "monitoring_engine", None)
     adaptor: Optional[HFAdaptor] = None
-    if engine is not None and engine._ring_transport is not None:
-        adaptor = HFAdaptor(
-            engine, engine._model_id,
-            no_strip_left_pad=no_strip_left_pad,
-            no_strip_right_pad=no_strip_right_pad,
-            eos_token_id=eos_token_id,
+    if engine is None:
+        raise RuntimeError(
+            "generate_with_monitoring() requires model.monitoring_engine to "
+            "be set to a MonitoringEngine instance."
         )
-        adaptor.attach_model(
-            target,
-            hook_selection=hook_selection or "full",
-            install_prepare_wrapper=True,
+    if engine._ring_transport is None:
+        raise RuntimeError(
+            "generate_with_monitoring() found model.monitoring_engine, but "
+            "ring transport is disabled. Construct MonitoringEngine with "
+            "enable_ring_transport=True or call engine.enable_ring_transport(...)."
         )
+    adaptor = HFAdaptor(
+        engine, engine._model_id,
+        no_strip_left_pad=no_strip_left_pad,
+        no_strip_right_pad=no_strip_right_pad,
+        eos_token_id=eos_token_id,
+    )
+    adaptor.attach_model(
+        target,
+        hook_selection=hook_selection or "full",
+        install_prepare_wrapper=True,
+    )
 
     # ------------------------------------------------------------------
     # Phase 3: Check if a single decode step exceeds ring capacity.

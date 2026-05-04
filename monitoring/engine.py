@@ -30,6 +30,7 @@ class MonitoringEngine:
     Canonical surface that adapters depend on:
       * ``__init__(config, model_id, host_engine|db_config)``
       * ``enable_ring_transport(ring_config, model_shape=None) -> RingTransport``
+        (enabled by default from ``__init__`` with a default RingConfig)
       * ``next_auto_group_id() -> int``  -- engine-scoped counter for HF;
         vLLM passes its own scheduler-assigned request IDs.
       * ``close()``
@@ -49,6 +50,11 @@ class MonitoringEngine:
         model_id: Optional[str] = None,
         host_engine: Optional[Any] = None,
         db_config: Optional[HostEngineConfig] = None,
+        enable_ring_transport: bool = True,
+        ring_config: Optional[Any] = None,
+        ring_payload_mb: int = 4096,
+        ring_pinned_mb: int = 4096,
+        ring_task_entries: int = 65536,
     ) -> None:
         self.config = config
         self._model_id = model_id
@@ -89,9 +95,34 @@ class MonitoringEngine:
                 except Exception as exc:
                     raise RuntimeError("Failed to start host_engine") from exc
 
+        if enable_ring_transport or ring_config is not None:
+            if ring_config is None:
+                ring_config = self._make_default_ring_config(
+                    payload_mb=ring_payload_mb,
+                    pinned_mb=ring_pinned_mb,
+                    task_entries=ring_task_entries,
+                )
+            self.enable_ring_transport(ring_config)
+
 
     # ------------------------------------------------------------------
     # Ring transport API
+
+    @staticmethod
+    def _make_default_ring_config(
+        *,
+        payload_mb: int,
+        pinned_mb: int,
+        task_entries: int,
+    ) -> Any:
+        """Build a default RingConfig for the ring-only monitoring path."""
+        from . import _native_engine  # type: ignore[attr-defined]
+
+        ring_config = _native_engine.RingConfig()
+        ring_config.payload_ring_bytes = int(payload_mb) * 1024 * 1024
+        ring_config.pinned_staging_bytes = int(pinned_mb) * 1024 * 1024
+        ring_config.task_ring_entries = int(task_entries)
+        return ring_config
 
     def enable_ring_transport(
         self, ring_config: Any, model_shape: Optional[Any] = None
@@ -116,6 +147,20 @@ class MonitoringEngine:
         """
         from . import ring_transport as _rt
         from . import _native_engine  # type: ignore[attr-defined]
+
+        if self._ring_transport is not None:
+            try:
+                ring_engine = getattr(self, "_ring_engine", None)
+                if ring_engine is not None:
+                    ring_engine.stop()
+            except Exception:
+                pass
+            try:
+                _rt.deactivate()
+            except Exception:
+                pass
+            self._ring_transport = None
+            self._ring_engine = None
 
         # Pass the DMXHostEngine C++ object directly; RingEngine builds a
         # SubmitFn that calls submit_direct without touching Python/GIL.
