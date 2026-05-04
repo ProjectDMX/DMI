@@ -54,6 +54,17 @@ That's the gap DMI fills.
 - **Quantified overhead** — measured against vanilla HF, HF's `output_hidden_states`,
   and `register_forward_hook`. See [benchmarks](docs/benchmarks.md).
 
+## Demo                                                                                                                                                                                  
+                  
+Captured internals explored in a Jupyter notebook -- attention patterns, residual-stream norms, per-token confidence, and top-k alternatives over one prompt through Qwen3-0.6B.  
+Source under [`example/visualization/`](example/visualization/README.md).  
+
+
+https://github.com/user-attachments/assets/df68bb06-d575-43e3-aed8-b08ca587e81a
+
+
+
+
 ## Performance
 
 **Offline throughput** — Qwen3-4B / Llama-3.1-8B / Qwen3-14B on ShareGPT and
