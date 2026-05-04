@@ -142,6 +142,7 @@ class VLLMAdaptor(BackendAdaptor):
     ) -> None:
         super().__init__(engine, model_id)
         self.vllm_config = vllm_config
+        self._debug_step: bool = bool(os.environ.get("RING_DEBUG_STEP"))
         # Set when on_capacity_exceeded fires; read + cleared by the
         # _determine_batch_execution_and_padding wrapper installed in
         # DMXGPUWorker.init_device.
@@ -325,7 +326,7 @@ class VLLMAdaptor(BackendAdaptor):
             req_id_list.append(norm_id)
             token_ranges.append((pre_computed, pre_computed + n))
             dim0_offsets.append(offset)
-            if os.environ.get("RING_DEBUG_STEP"):
+            if self._debug_step:
                 print(
                     f"[dmx_worker] step={_step} req[{i}] rid={norm_id} "
                     f"offset={offset} n={n} "

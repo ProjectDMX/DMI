@@ -168,6 +168,7 @@ class HFAdaptor(BackendAdaptor):
         eos_token_id: Any = None,
     ) -> None:
         super().__init__(engine, model_id)
+        self._debug_step: bool = bool(os.environ.get("RING_DEBUG_STEP"))
         self._batch_request_ids: Optional[List[str]] = None
         self._batch_starts: Optional[List[int]] = None
         self._batch_finished: Optional[List[bool]] = None
@@ -593,7 +594,7 @@ class HFAdaptor(BackendAdaptor):
                     token_ranges.append((start_i, end_i))
                     starts[i] = end_i
 
-        if os.environ.get("RING_DEBUG_STEP"):
+        if self._debug_step:
             print(
                 f"[ring_step] prefill={is_prefill} "
                 f"token_ranges={token_ranges} finished={list(finished)}"
