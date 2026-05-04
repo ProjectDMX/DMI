@@ -33,9 +33,9 @@ HF_MODEL = "Qwen/Qwen3-0.6B"
 # Hooks that the notebook needs.  ``token_ids`` is required for the
 # notebook to recover token labels; ``pattern`` powers plot 1
 # (attention heatmaps), ``resid_pre`` powers plot 2 (residual norm),
-# ``final_logits`` powers plots 3 + 5 (per-token confidence + top-k
-# alternatives), ``mlp_post`` powers plot 4 (top neuron activations).
-HOOK_SELECTION = "token_ids,pattern,resid_pre,final_logits,mlp_post"
+# ``final_logits`` powers plots 3 + 4 (per-token confidence + top-k
+# alternatives).
+HOOK_SELECTION = "token_ids,pattern,resid_pre,final_logits"
 
 
 def _read_prompt() -> str:

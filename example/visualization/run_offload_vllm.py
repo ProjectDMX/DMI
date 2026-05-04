@@ -40,7 +40,7 @@ HF_MODEL = "Qwen/Qwen3-0.6B"
 # ``pattern`` is dropped (vLLM exclusion) -- everything else matches
 # the HF demo's hook selection so the notebook can render the same
 # plots.
-HOOK_SELECTION = "token_ids,resid_pre,final_logits,mlp_post"
+HOOK_SELECTION = "token_ids,resid_pre,final_logits"
 
 
 def _read_prompt() -> str:

@@ -1,6 +1,6 @@
 # DMI visualization demo
 
-Five mech-interp views of one prompt through Qwen3-0.6B, served from
+Four mech-interp views of one prompt through Qwen3-0.6B, served from
 ClickHouse via a Jupyter notebook.
 
 ## Run
@@ -37,9 +37,7 @@ token should be a noun (`gift`, `book`, ...), not another name.
    per (layer, token).  One line per token.
 3. **Per-token confidence** -- each generated token shaded by the
    model's top-1 probability when it picked it.
-4. **Top neuron activations (MLP)** -- top-k activating tokens per
-   (layer, neuron).  Subsampled to top-128 highest-variance neurons.
-5. **Top-k alternative tokens** -- each generated token colored by
+4. **Top-k alternative tokens** -- each generated token colored by
    its log-probability, with the model's top-10 alternatives on hover.
 
 ## Files
