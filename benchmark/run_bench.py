@@ -183,11 +183,6 @@ def main() -> None:
             mon_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
-    else:
-        mon_args = common_args[:] + monitor_extra_args + ["--no-db"]
-        mon_start_ts = _now_epoch()
-        mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
-        mon_end_ts = _now_epoch()
 
     # Run monitoring with --no-db
     gpu_csv_mon_nodb = os.path.join(args.out_dir, f"gpu_mem_monitoring_nodb_{tag}.csv")

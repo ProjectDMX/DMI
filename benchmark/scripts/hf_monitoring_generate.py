@@ -3,7 +3,9 @@ import contextlib
 import json
 import math
 import os
+import sys
 import time
+from pathlib import Path
 from typing import List
 
 import torch
@@ -11,6 +13,10 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
 from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from monitoring import (
     ClickHouseClientConfig,
@@ -20,6 +26,7 @@ from monitoring import (
     StageConfig,
 )
 from monitoring.config import CaptureSchedule
+from monitoring.hook_points import set_monitoring_debug
 from integration.hf_adapter import generate_with_monitoring
 
 _MODEL_ALIASES = {
@@ -103,6 +110,7 @@ def main() -> None:
     parser.add_argument("--no-db", action="store_true", help="Disable host_engine DB submission.")
     parser.add_argument("--ring-payload-mb", type=int, default=int(os.environ.get("DMX_RING_PAYLOAD_MB", "4096")))
     parser.add_argument("--ring-pinned-mb", type=int, default=int(os.environ.get("DMX_RING_PINNED_MB", "4096")))
+    parser.add_argument("--ring-task-entries", type=int, default=int(os.environ.get("DMX_RING_TASK_ENTRIES", "65536")))
     parser.add_argument("--ch-parallelism", type=int, default=int(os.environ.get("DMX_CH_PARALLELISM", "10")))
     args = parser.parse_args()
     model_id = _resolve_model_id(args.model)
@@ -112,10 +120,11 @@ def main() -> None:
 
     prompts = _load_prompts(args.prompts)
     device = torch.device(args.device)
+    use_nvtx = os.environ.get("BENCH_NVTX", "0") == "1"
+    set_monitoring_debug(use_nvtx)
 
     cfg = MonitoringConfig(
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
-        debug=os.environ.get("BENCH_NVTX", "0") == "1",
     )
 
     host_cfg = None
@@ -127,6 +136,9 @@ def main() -> None:
         config=cfg,
         model_id=model_id,
         db_config=host_cfg,
+        ring_payload_mb=args.ring_payload_mb,
+        ring_pinned_mb=args.ring_pinned_mb,
+        ring_task_entries=args.ring_task_entries,
     )
 
     # For Qwen3, switching to HookedQwen3ForCausalLM is enough to run the same
@@ -153,7 +165,6 @@ def main() -> None:
 
     try:
         total_batches = math.ceil(len(prompts) / args.batch_size)
-        use_nvtx = os.environ.get("BENCH_NVTX", "0") == "1"
         nvtx_ctx = _nvtx_range("monitoring_generate") if use_nvtx else contextlib.nullcontext()
         with nvtx_ctx, torch.no_grad():
             for batch_idx, batch_prompts in tqdm(
@@ -195,11 +206,6 @@ def main() -> None:
                 host_timings = engine._host_engine.timings()
             except Exception:
                 host_timings = None
-        if args.no_db:
-            try:
-                engine.clear_completed_results()
-            except Exception:
-                pass
         engine.close()
 
     if loop_end is None:
