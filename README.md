@@ -49,12 +49,12 @@ That's the gap DMI fills.
   is drained asynchronously.
 - **HF + vLLM integration** — no engine fork required by the user. Plug in
   through a worker class (vLLM) or a thin generation wrapper (HF).
-- **Configurable sinks** — drop after capture (transport-only), write to disk,
-  or stream into a queryable store and visualize from notebooks / Grafana.
+- **Configurable offloading** — capture your hidden states on GPU, CPU or write to disk,
+  and stream into a queryable store and visualize from notebooks / Grafana (check out the [Demo](#demo) below).
 - **Quantified overhead** — measured against vanilla HF, HF's `output_hidden_states`,
   and `register_forward_hook`. See [benchmarks](docs/benchmarks.md).
 
-## Demo                                                                                                                                                                                  
+## Demo                                         
                   
 Captured internals explored in a Jupyter notebook -- attention patterns, residual-stream norms, per-token confidence, and top-k alternatives over one prompt through Qwen3-0.6B.  
 Source under [`example/visualization/`](example/visualization/README.md).  
