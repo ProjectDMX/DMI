@@ -28,8 +28,8 @@ _MODEL_ALIASES = {
 def main():
     from monitoring import MonitoringEngine, MonitoringConfig, HostEngineConfig
     from monitoring._native_engine import ClickHouseClientConfig, StageConfig, RingConfig
-    from monitoring.config import CaptureSchedule, HookSelection
-    from monitoring.generate import generate_with_monitoring
+    from monitoring.config import CaptureSchedule
+    from integration.hf_adapter import generate_with_monitoring
     from transformers import AutoTokenizer
 
     model_key = os.environ.get("E2E_MODEL", "gpt2")
@@ -128,13 +128,8 @@ def main():
     ring_cfg.clone_slices = False
 
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
-    if hasattr(mon_cfg, "eos_token_id"):
-        mon_cfg.eos_token_id = eos_id
-    if hasattr(mon_cfg, "pad_token_id"):
-        mon_cfg.pad_token_id = pad_id
 
     unique_run_model_id = f"hf_compare::{uuid.uuid4().hex}"[:120]
     engine = MonitoringEngine(

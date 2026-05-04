@@ -20,7 +20,7 @@ def main():
 
     from monitoring import MonitoringEngine
     from monitoring._native_engine import ClickHouseClientConfig
-    from monitoring.generate import generate_with_monitoring
+    from integration.hf_adapter import generate_with_monitoring
     from transformers import AutoTokenizer
 
     # Config from env (same vars as the test)
@@ -73,17 +73,12 @@ def main():
 
     # Monitoring config
     from monitoring import MonitoringConfig
-    from monitoring.config import CaptureSchedule, HookSelection
+    from monitoring.config import CaptureSchedule
 
     hook_mode = os.environ.get("E2E_HOOK_MODE", "full")
     mon_cfg = MonitoringConfig(
-        hooks=HookSelection(mode=hook_mode),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
-    if hasattr(mon_cfg, "eos_token_id"):
-        mon_cfg.eos_token_id = eos_id
-    if hasattr(mon_cfg, "pad_token_id"):
-        mon_cfg.pad_token_id = pad_id
 
     # Host engine config
     from monitoring import HostEngineConfig
@@ -129,7 +124,7 @@ def main():
 
     try:
         with torch.no_grad():
-            _ = generate_with_monitoring(model, **gen_kwargs)
+            _ = generate_with_monitoring(model, hook_selection=hook_mode, **gen_kwargs)
     finally:
         engine.close()
 

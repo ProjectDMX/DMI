@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence
 
 from .config import MonitoringConfig
 
@@ -25,7 +25,23 @@ class HostEngineConfig:
 
 
 class MonitoringEngine:
-    """High-level wrapper that routes monitoring tasks to native backend."""
+    """High-level wrapper that routes monitoring tasks to the native backend.
+
+    Canonical surface that adapters depend on:
+      * ``__init__(config, model_id, host_engine|db_config)``
+      * ``enable_ring_transport(ring_config, model_shape=None) -> RingTransport``
+        (enabled by default from ``__init__`` with a default RingConfig)
+      * ``next_auto_group_id() -> int``  -- engine-scoped counter for HF;
+        vLLM passes its own scheduler-assigned request IDs.
+      * ``close()``
+      * ``model.monitoring_engine = engine`` -- the convention adapters
+        look for to discover the active engine.
+
+    Per-framework state (no_strip_left_pad, batch tracking, etc.) lives on the
+    adapter (HFAdaptor / VLLMAdaptor), not here.  Callers wanting NVTX
+    ranges call ``monitoring.hook_points.set_monitoring_debug(True)``
+    directly.
+    """
 
     def __init__(
         self,
@@ -34,17 +50,15 @@ class MonitoringEngine:
         model_id: Optional[str] = None,
         host_engine: Optional[Any] = None,
         db_config: Optional[HostEngineConfig] = None,
+        enable_ring_transport: bool = True,
+        ring_config: Optional[Any] = None,
+        ring_payload_mb: int = 4096,
+        ring_pinned_mb: int = 4096,
+        ring_task_entries: int = 65536,
     ) -> None:
         self.config = config
-        self._debug_enabled = bool(self.config.debug) if self.config is not None else False
-        self._no_strip = False if config is None else config.no_strip
-        self._sync_hook_debug_flag()
-
         self._model_id = model_id
         self._auto_batch_group_id = 0
-        self._active_batch_request_ids: Optional[List[str]] = None
-        self._active_batch_start_idx_per_request: Optional[List[int]] = None
-        self._active_batch_finished_per_request: Optional[List[bool]] = None
 
 
         # Host-side DB engine (optional; C++ backend only)
@@ -81,13 +95,38 @@ class MonitoringEngine:
                 except Exception as exc:
                     raise RuntimeError("Failed to start host_engine") from exc
 
+        if enable_ring_transport or ring_config is not None:
+            if ring_config is None:
+                ring_config = self._make_default_ring_config(
+                    payload_mb=ring_payload_mb,
+                    pinned_mb=ring_pinned_mb,
+                    task_entries=ring_task_entries,
+                )
+            self.enable_ring_transport(ring_config)
+
 
     # ------------------------------------------------------------------
     # Ring transport API
 
+    @staticmethod
+    def _make_default_ring_config(
+        *,
+        payload_mb: int,
+        pinned_mb: int,
+        task_entries: int,
+    ) -> Any:
+        """Build a default RingConfig for the ring-only monitoring path."""
+        from . import _native_engine  # type: ignore[attr-defined]
+
+        ring_config = _native_engine.RingConfig()
+        ring_config.payload_ring_bytes = int(payload_mb) * 1024 * 1024
+        ring_config.pinned_staging_bytes = int(pinned_mb) * 1024 * 1024
+        ring_config.task_ring_entries = int(task_entries)
+        return ring_config
+
     def enable_ring_transport(
         self, ring_config: Any, model_shape: Optional[Any] = None
-    ) -> None:
+    ) -> Any:
         """Switch to ring-based D2H transport.
 
         Creates a RingEngine with the C++ host engine as the submit target so
@@ -100,9 +139,28 @@ class MonitoringEngine:
                           When provided, the new CUDA-graph-compatible forward-hook
                           path is activated.  If None, shape is auto-detected from
                           model.config in _install_monitoring_forward.
+
+        Returns:
+            The ``RingTransport`` instance (also stored as
+            ``self._ring_transport``).  Returned so adapters can hold a
+            direct reference instead of reaching through the engine.
         """
         from . import ring_transport as _rt
         from . import _native_engine  # type: ignore[attr-defined]
+
+        if self._ring_transport is not None:
+            try:
+                ring_engine = getattr(self, "_ring_engine", None)
+                if ring_engine is not None:
+                    ring_engine.stop()
+            except Exception:
+                pass
+            try:
+                _rt.deactivate()
+            except Exception:
+                pass
+            self._ring_transport = None
+            self._ring_engine = None
 
         # Pass the DMXHostEngine C++ object directly; RingEngine builds a
         # SubmitFn that calls submit_direct without touching Python/GIL.
@@ -123,178 +181,25 @@ class MonitoringEngine:
             transport.set_model_cfg(model_shape)
         self._ring_engine = ring_engine
         self._ring_transport = transport
-        
+
         _rt.activate(transport)
-
-    def _prepare_ring_step(self, input_ids: Any, attention_mask: Any, past_key_values: Any,
-                           cache_position: Any = None, kv_offsets: Any = None) -> None:
-        """Precompute per-step batch context and set it on the ring transport.
-
-        Called before the forward pass so ring hooks (firing during forward)
-        can push correctly-keyed FIFO entries.
-        """
-        if self._ring_transport is None:
-            return
-        if self._model_id is None:
-            return
-        if input_ids is None or not hasattr(input_ids, "shape"):
-            return
-        try:
-            input_shape = tuple(input_ids.shape)
-        except Exception:
-            return
-        if not input_shape:
-            return
-        try:
-            batch_size = int(input_shape[0])
-        except Exception:
-            return
-        if batch_size <= 0:
-            return
-
-        if cache_position is not None:
-            try:
-                is_prefill = int(cache_position[0]) == 0
-            except Exception:
-                is_prefill = past_key_values is None
-        else:
-            is_prefill = past_key_values is None
-            try:
-                if hasattr(input_ids, "dim") and int(input_ids.dim()) >= 2:
-                    if int(input_ids.shape[1]) > 1:
-                        is_prefill = True
-            except Exception:
-                pass
-
-        current_ids = self._active_batch_request_ids
-        need_reset = is_prefill or current_ids is None or len(current_ids) != batch_size
-        if need_reset:
-            gid = int(self._auto_batch_group_id)
-            self._auto_batch_group_id += 1
-            self._active_batch_request_ids = [f"{gid}:{i}" for i in range(batch_size)]
-            self._active_batch_start_idx_per_request = [0] * batch_size
-            self._active_batch_finished_per_request = [False] * batch_size
-
-        req_ids = self._active_batch_request_ids
-        starts = self._active_batch_start_idx_per_request
-        finished = self._active_batch_finished_per_request
-        if req_ids is None or starts is None or finished is None:
-            return
-
-        if isinstance(attention_mask, dict):
-            assert "full_attention" in attention_mask, f"attention_mask dict missing 'full_attention' key: {list(attention_mask.keys())}"
-            attention_mask = attention_mask["full_attention"]
-
-        token_ranges: List[Tuple[int, int]] = []
-        if is_prefill:
-            if attention_mask is None or not hasattr(attention_mask, "dim"):
-                return
-            try:
-                ndim = int(attention_mask.dim())
-                if ndim == 2:
-                    # Standard 2D mask [batch, seq_len]
-                    lengths = (
-                        attention_mask.sum(dim=1).tolist()
-                        if not self._no_strip
-                        else [attention_mask.shape[1]] * attention_mask.shape[0]
-                    )
-                elif ndim == 4 and len(input_shape) >= 2 and int(input_shape[1]) > 0:
-                    # 4D causal mask [batch, 1, q_len, kv_dim] -- used by static-cache generate.
-                    # Values: 0.0 = attend, large negative = masked (NOT integer 0/1).
-                    # Count non-masked positions among the first q_len key slots using the
-                    # last query row (most permissive for left-padded causal sequences).
-                    q_len_mask = int(input_shape[1])
-                    lengths = (
-                        (attention_mask[:, 0, -1, :q_len_mask] >= 0.0).sum(dim=-1).long().tolist()
-                        if not self._no_strip
-                        else [q_len_mask] * int(attention_mask.shape[0])
-                    )
-                else:
-                    return
-                lengths = [int(v) for v in lengths]
-            except Exception:
-                return
-            if len(lengths) != batch_size:
-                return
-            for i in range(batch_size):
-                start_i = int(starts[i])
-                delta_i = int(lengths[i])
-                if delta_i < 0:
-                    delta_i = 0
-                end_i = start_i + delta_i
-                token_ranges.append((start_i, end_i))
-                starts[i] = end_i
-        else:
-            eos_or_pad_ids: set[int] = set()
-            eos_token_id = getattr(self.config, "eos_token_id", None) if self.config is not None else None
-            pad_token_id = getattr(self.config, "pad_token_id", None) if self.config is not None else None
-            if eos_token_id is not None:
-                if isinstance(eos_token_id, (list, tuple, set)):
-                    eos_or_pad_ids.update(int(v) for v in eos_token_id)
-                else:
-                    eos_or_pad_ids.add(int(eos_token_id))
-            if pad_token_id is not None:
-                eos_or_pad_ids.add(int(pad_token_id))
-            last_ids = None
-            if eos_or_pad_ids:
-                try:
-                    last_ids = input_ids[:, -1]
-                except Exception:
-                    last_ids = None
-
-            for i in range(batch_size):
-                start_i = int(starts[i])
-                is_finished = bool(finished[i])
-                if (not is_finished) and (last_ids is not None):
-                    try:
-                        if int(last_ids[i]) in eos_or_pad_ids:
-                            is_finished = True
-                    except Exception:
-                        pass
-                if is_finished:
-                    finished[i] = True
-                if is_finished and not self._no_strip:
-                    token_ranges.append((start_i, start_i))
-                else:
-                    end_i = start_i + 1
-                    token_ranges.append((start_i, end_i))
-                    starts[i] = end_i
-
-        import os
-        if os.environ.get("RING_DEBUG_STEP"):
-            print(f"[ring_step] prefill={is_prefill} token_ranges={token_ranges} finished={list(finished)}")
-        tp_rank = 0
-        if self._ring_transport is not None:
-            cfg = getattr(self._ring_transport, "_model_cfg", None)
-            if cfg is not None:
-                tp_rank = getattr(cfg, "tp_rank", 0)
-        self._ring_transport.set_step_context(
-            model_id=str(self._model_id),
-            req_ids=list(req_ids),
-            token_ranges=token_ranges,
-            kv_offsets=kv_offsets,
-            tp_rank=tp_rank,
-        )
+        return transport
 
     # ------------------------------------------------------------------
-    def _sync_hook_debug_flag(self) -> None:
-        """Propagate debug mode to hook_points module without hard import coupling."""
+    def next_auto_group_id(self) -> int:
+        """Claim a unique batch-group ID for an HF generate() call.
 
-        try:
-            from . import hook_points  # local import to avoid import cycle at module load
-
-            setter = getattr(hook_points, "set_monitoring_debug", None)
-            if setter is not None:
-                setter(self._debug_enabled)
-        except Exception:
-            pass
+        Engine-scoped counter so each top-level monitored generate()
+        receives a distinct group prefix; per-request IDs are then minted
+        as f"{group}:{i}" by the HF adapter.  vLLM does not use this
+        (vLLM passes its own scheduler-assigned request IDs).
+        """
+        gid = int(self._auto_batch_group_id)
+        self._auto_batch_group_id += 1
+        return gid
 
     def close(self) -> None:
         """Tear down backend resources."""
-
-        self._active_batch_request_ids = None
-        self._active_batch_start_idx_per_request = None
-        self._active_batch_finished_per_request = None
 
         if self._ring_transport is not None:
             try:

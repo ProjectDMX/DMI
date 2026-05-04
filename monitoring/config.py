@@ -1,64 +1,9 @@
-"""Configuration helpers for monitoring capture selection and scheduling."""
+"""Configuration helpers for monitoring capture scheduling."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Literal, Optional, Sequence, Tuple
-
-
-def _get_group_suffixes(group: str) -> Tuple[str, ...]:
-    """Return act_name suffixes for a hook group, derived from C++ HOOK_DEFS."""
-    from .ring_transport import _ATTN_SUFFIXES, _MLP_SUFFIXES
-    if group == "attn":
-        return _ATTN_SUFFIXES
-    elif group == "mlp":
-        return _MLP_SUFFIXES
-    raise ValueError(f"Unknown hook group: {group!r}")
-
-
-def _matches_suffix(name: str, suffixes: Sequence[str]) -> bool:
-    return any(name.endswith(suffix) for suffix in suffixes)
-
-
-@dataclass
-class HookSelection:
-    """Select which hooks to enable for capture."""
-
-    mode: Literal["full", "attention", "mlp", "custom"] = "full"
-    include: Optional[Sequence[str]] = None
-    exclude: Optional[Sequence[str]] = None
-
-    def compile(self, hook_names: Iterable[str]) -> list[str]:
-        """Return the ordered list of hook names that should be enabled."""
-
-        names = list(hook_names)
-
-        if self.mode == "full":
-            selected = list(names)
-        elif self.mode == "attention":
-            selected = [name for name in names if _matches_suffix(name, _get_group_suffixes("attn"))]
-        elif self.mode == "mlp":
-            selected = [name for name in names if _matches_suffix(name, _get_group_suffixes("mlp"))]
-        elif self.mode == "custom":
-            if self.include is None:
-                raise ValueError("HookSelection(mode='custom') requires include to be provided.")
-            include_set = set(self.include)
-            selected = [name for name in names if name in include_set]
-        else:
-            raise ValueError(f"Unsupported hook selection mode: {self.mode}")
-
-        if self.include is not None and self.mode != "custom":
-            include_set = set(self.include)
-            selected = [name for name in selected if name in include_set]
-
-        if self.exclude:
-            exclude_set = set(self.exclude)
-            selected = [name for name in selected if name not in exclude_set]
-
-        return selected
-
-    def is_full(self) -> bool:
-        return self.mode == "full" and self.include is None and not self.exclude
+from typing import Literal
 
 
 @dataclass
@@ -110,9 +55,15 @@ class CaptureSchedule:
 
 @dataclass
 class MonitoringConfig:
-    """Bundle hook selection and capture schedule for the monitoring engine."""
+    """Bundle capture schedule and runtime flags for the monitoring engine.
 
-    hooks: HookSelection = field(default_factory=HookSelection)
+    Framework-specific flags (HF left-pad ``no_strip_left_pad``, NVTX
+    ``debug``) were moved out in the Phase 4 cleanup:
+      * ``no_strip_left_pad`` is now an explicit kwarg on the HF entry
+        points (``generate_with_monitoring``,
+        ``generate_greedy_with_monitoring``, ``HFAdaptor.attach_model``).
+      * NVTX ranges are toggled via
+        ``monitoring.hook_points.set_monitoring_debug(True)``.
+    """
+
     schedule: CaptureSchedule = field(default_factory=CaptureSchedule)
-    debug: bool = False
-    no_strip: bool = field(default=False)

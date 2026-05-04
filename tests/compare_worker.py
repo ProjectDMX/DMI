@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from monitoring.vllm_integration import DMXGPUWorker
+from integration.vllm_adapter import DMXGPUWorker
 
 
 _ARCH_REMAP = {

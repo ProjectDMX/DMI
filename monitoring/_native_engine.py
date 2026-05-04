@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Optional
+import importlib.machinery
 import importlib.util
 import glob
 
@@ -40,8 +41,20 @@ def _load_extension() -> Any:
     pkg_dir = Path(__file__).resolve().parent
     repo_root = pkg_dir.parent
     candidates = []
-    candidates.extend(glob.glob(str(pkg_dir / f"{_EXTENSION_NAME}*.so")))
-    candidates.extend(glob.glob(str(repo_root / f"{_EXTENSION_NAME}*.so")))
+    seen = set()
+    search_dirs = (pkg_dir, repo_root)
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        for search_dir in search_dirs:
+            path = search_dir / f"{_EXTENSION_NAME}{suffix}"
+            if path.exists() and path not in seen:
+                candidates.append(str(path))
+                seen.add(path)
+    for search_dir in search_dirs:
+        for so_path in glob.glob(str(search_dir / f"{_EXTENSION_NAME}*.so")):
+            path = Path(so_path)
+            if path not in seen:
+                candidates.append(str(path))
+                seen.add(path)
 
     for so_path in candidates:
         try:

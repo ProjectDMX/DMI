@@ -15,8 +15,8 @@ from monitoring import (
     QueueConfig,
     StageConfig,
 )
-from monitoring.config import CaptureSchedule, HookSelection
-from monitoring.generate import generate_with_monitoring
+from monitoring.config import CaptureSchedule
+from integration.hf_adapter import generate_with_monitoring
 
 
 def _build_db_config() -> ClickHouseClientConfig:
@@ -73,7 +73,6 @@ def main() -> None:
 
     # Minimal capture set that still supports DB pipeline.
     cfg = MonitoringConfig(
-        hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
 

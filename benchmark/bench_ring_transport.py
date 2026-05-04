@@ -154,9 +154,8 @@ def _make_ring_cfg(cfg: BenchConfig):
 
 def _make_monitoring_cfg(cfg: BenchConfig):
     from monitoring import MonitoringConfig  # type: ignore
-    from monitoring.config import CaptureSchedule, HookSelection  # type: ignore
+    from monitoring.config import CaptureSchedule  # type: ignore
     return MonitoringConfig(
-        hooks=HookSelection(mode="full"),
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
 
@@ -229,7 +228,7 @@ def _run_one(model, input_ids, attention_mask,
              use_monitoring: bool) -> RunResult:
     """Run one generate() and return timing breakdown.
 
-    When cuda_graphs is enabled, uses generate_greedy() for both baseline
+    When cuda_graphs is enabled, uses generate_greedy_with_monitoring() for both baseline
     and monitored modes — same lean loop, only difference is monitoring=True/False.
     This eliminates HF generate()'s per-step Python overhead from the comparison.
 
@@ -246,12 +245,12 @@ def _run_one(model, input_ids, attention_mask,
 def _run_one_greedy(model, input_ids, attention_mask,
                     cfg: BenchConfig, eos_id: int, pad_id: int,
                     use_monitoring: bool) -> RunResult:
-    """Run one iteration using generate_greedy (lean manual loop)."""
-    from monitoring.generate import generate_greedy, GreedyGenerateTimings
+    """Run one iteration using generate_greedy_with_monitoring (lean manual loop)."""
+    from integration.hf_adapter import generate_greedy_with_monitoring, GreedyGenerateTimings
 
     timings = GreedyGenerateTimings()
     with torch.no_grad():
-        generate_greedy(
+        generate_greedy_with_monitoring(
             model, input_ids, attention_mask,
             max_new_tokens=cfg.decode_len,
             min_new_tokens=cfg.decode_len,
@@ -288,7 +287,7 @@ def _run_one_hf_generate(model, input_ids, attention_mask,
     time the next ``prepare_inputs_for_generation`` call begins, all GPU work
     from the previous step has completed.
     """
-    from monitoring.generate import generate_with_monitoring  # type: ignore
+    from integration.hf_adapter import generate_with_monitoring  # type: ignore
 
     extra = {}
     extra["logits_to_keep"] = cfg.logits_to_keep
@@ -594,7 +593,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
 
         # Print pre-forward profiling if enabled
         try:
-            from monitoring.generate import _prepare_profile_times, print_prepare_profile
+            from integration.hf_adapter import _prepare_profile_times, print_prepare_profile
             if _prepare_profile_times:
                 print()
                 print_prepare_profile()
@@ -619,7 +618,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
 
         # Print prepare_wrapper profiling if available
         try:
-            from monitoring.generate import _prepare_profile_times
+            from integration.hf_adapter import _prepare_profile_times
             times_list = _prepare_profile_times
         except ImportError:
             times_list = None
