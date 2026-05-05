@@ -8,10 +8,10 @@
   <strong>A decoupled, asynchronous observation substrate for high-speed LLM inference.</strong>
 </p>
 
-> **Project Status — research preview.** DMI currently supports HuggingFace and
-> vLLM paths for Qwen3, Llama 3.1, and GPT-2-family experiments, with Ring²
-> transport and optional host-side persistence. APIs may change. Contributions,
-> bug reports, and feature requests are welcome.
+> **Project Status — research preview.** DMI currently supports HuggingFace
+> and vLLM paths for Qwen3 and GPT-2-family experiments, with Ring² transport
+> and optional host-side persistence. APIs may change. Contributions, bug
+> reports, and feature requests are welcome.
 
 ---
 
@@ -24,8 +24,8 @@ forking the inference engine.
 
 DMI works in **HuggingFace Transformers** and **vLLM** out of the box, captures
 internal tensors through CUDA-Graph–compatible hooks, and streams them off the
-GPU via a dedicated ring buffer to a host-side drain that writes to disk or a
-queryable store.
+GPU via a dedicated ring buffer to a host-side drain that pushes into a
+queryable store (or drops them, for transport-only profiling).
 
 ## Why DMI
 
@@ -49,8 +49,8 @@ That's the gap DMI fills.
   is drained asynchronously.
 - **HF + vLLM integration** — no engine fork required by the user. Plug in
   through a worker class (vLLM) or a thin generation wrapper (HF).
-- **Configurable offloading** — capture your hidden states on GPU, CPU or write to disk,
-  and stream into a queryable store and visualize from notebooks / Grafana (check out the [Demo](#demo) below).
+- **Configurable offloading** — capture your hidden states on GPU, stage on host,
+  and stream into a queryable store; visualize from notebooks (check out the [Demo](#demo) below).
 - **Quantified overhead** — measured against vanilla HF, HF's `output_hidden_states`,
   and `register_forward_hook`. See [benchmarks](docs/benchmarks.md).
 
@@ -94,7 +94,8 @@ vLLM entry point.
 
 ```python
 import os
-os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+# Required for the current effectful-op integration with vLLM
+os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 
 from vllm import LLM, SamplingParams
 

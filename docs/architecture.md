@@ -32,8 +32,10 @@ attention pattern, logits, KV-cache slices. It is:
   same API. Each model declares its observation sites via a `HookSpec`, so
   the transport layer knows the metadata template (shape, dtype, slot id)
   for one forward pass.
-- **Selectable at runtime.** Hook selection (`full`, `hidden-states`, `attention`,
+- **Selectable at runtime.** Hook selection (`full`, `hf-only`, `hidden-states`,
   `logits`, …) controls which sites emit data, without recompiling the model.
+  Individual hook short names (e.g. `q`, `k`, `v`, `attn_scores`, `pattern`,
+  `mlp_post`) can also be combined.
 
 Engine integration is intentionally thin: for vLLM, DMI subclasses `Worker` to
 install hooks before CUDA-Graph capture; for HuggingFace, it wraps
@@ -53,8 +55,9 @@ that reuse. Ring² solves this with a **GPU–CPU co-designed** double-ring layo
 
 - **On-device payload ring** — a dedicated GPU buffer for tensor payloads,
   isolated from the KV-cache pool. The HookPoint kernel writes directly here.
-- **On-host meta ring** — a pinned-memory ring of `TensorMeta` records (slot
-  id, shape, dtype, step index, request id) drained asynchronously by the host.
+- **On-host meta ring** — a CPU-preferred managed-memory ring of fixed-size
+  descriptors, paired with a pre-pushed host-side `TensorMetaFIFO` of runtime
+  metadata (request IDs, shapes, dtypes); drained asynchronously by the host.
 
 Because the payload ring is allocated outside the inference memory pool, captured
 tensors do not extend the lifetime of activations the engine wants to free, and
@@ -65,18 +68,20 @@ capture path runs inside the replayable execution graph.
 
 ## 3. Async host backend
 
-A drain thread on the host continuously pulls from the meta ring, copies payloads
-out of the GPU payload ring, and forwards them to a configurable sink:
+A drain thread on the host wakes on producer notifications (or a configurable
+poll timeout), copies ready payloads out of the GPU payload ring into a
+pinned host staging buffer, and hands them to a p2p thread that submits to
+the host engine — a single-stage ClickHouse insert pipeline (`DMXHostEngine`).
 
-- **`null`** — drop after copy. Used to isolate transport overhead.
-- **`file`** — write tensors / metadata to disk.
-- **`clickhouse`** — push into a ClickHouse table for downstream querying and
-  visualization (Grafana, notebooks, ad-hoc analytics).
+A runtime `dmx_null_mode=True` switch short-circuits the p2p submit step:
+payloads still flow GPU → ring → drain → staging, but nothing is inserted.
+This is useful for isolating transport overhead independently of ClickHouse.
 
 The drain pipeline is independent of the inference loop: backpressure on the
 sink does not block the GPU producer as long as the rings are sized for the
-workload. Sizing knobs (`dmx_ring_payload_mb`, `dmx_ring_pinned_mb`) are exposed
-through `additional_config` for vLLM and CLI flags for the HF benchmarks.
+workload. Sizing knobs (`dmx_ring_payload_mb`, `dmx_ring_pinned_mb`) are
+exposed through `additional_config` for vLLM and CLI flags for the HF
+benchmarks.
 
 ---
 

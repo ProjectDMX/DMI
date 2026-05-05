@@ -40,21 +40,6 @@ DMI tracks the no-monitor baseline closely. The synchronous hook/debug baselines
 (vLLM Hook, TRT-LLM Debug API) saturate at substantially lower request rates
 because their capture paths block the hot stream.
 
-## Reproducing the paper experiments
-
-The paper evaluation scripts live under [`../experiments`](../experiments).
-They are the source of the offline and online results shown above.
-
-| Experiment group | Directory | What it contains |
-|---|---|---|
-| Offline inference and microbenchmarks | [`../experiments/offline_inference`](../experiments/offline_inference) | HuggingFace / DMI / HF extraction / Torch Hooks / NNsight runs, plus hook-count, TP, storage, max-batch, and step-breakdown microbenchmarks |
-| Online serving | [`../experiments/online_serving`](../experiments/online_serving) | vLLM baseline, DMI, vLLM-Hook, TRT-LLM Debug API, sampled datasets, benchmark driver, and plotting scripts |
-
-Start with the README in each directory:
-
-- [`../experiments/offline_inference/README.md`](../experiments/offline_inference/README.md)
-- [`../experiments/online_serving/README.md`](../experiments/online_serving/README.md)
-
 For local setup of this repo's native backend and ClickHouse sink, see
-[`install.md`](install.md). For simple API examples outside the full paper
-reproduction path, see [`huggingface.md`](huggingface.md) and [`vllm.md`](vllm.md).
+[`install.md`](install.md). For simple API examples, see
+[`huggingface.md`](huggingface.md) and [`vllm.md`](vllm.md).

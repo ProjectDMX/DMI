@@ -13,26 +13,17 @@ python benchmark/scripts/hf_generate.py \
     --model gpt2 --device cuda --batch-size 8 --max-new-tokens 16
 ```
 
-## DMI monitoring without DB writes
+## DMI monitoring (transport only or with persistence)
 
-This captures internal states through Ring² and drops them on the host. Use this
-mode to isolate transport overhead without persistence cost.
+Both flows go through `benchmark.bench_ring_transport`. Pick the mode that
+matches whether you want to persist captures:
 
-```bash
-python benchmark/scripts/hf_monitoring_generate.py \
-    --model qwen3 --device cuda --batch-size 8 --max-new-tokens 16 --no-db
-```
+- `ring_null` — Ring² capture + transport, drop on the host. Isolates transport
+  overhead without ClickHouse setup.
+- `ring_db` — Ring² capture + transport + ClickHouse insert. Start ClickHouse
+  per [`install.md`](install.md) first.
 
-## DMI monitoring with persistence
-
-Start ClickHouse as described in [`install.md`](install.md), then run:
-
-```bash
-python benchmark/scripts/hf_monitoring_generate.py \
-    --model qwen3 --device cuda --batch-size 8 --max-new-tokens 16
-```
-
-Inspect captured rows:
+Inspect captured rows after a `ring_db` run:
 
 ```bash
 clickhouse-client --query "SELECT count() FROM default.offload"
@@ -62,7 +53,7 @@ python -m benchmark.bench_ring_transport \
 Useful flags:
 
 - `--model gpt2 | qwen3`
-- `--hook-selection full | hf-only | hidden-states | logits | attention`
+- `--hook-selection full | hf-only | hidden-states | logits | <individual hook short name>` (individual hooks like `q`, `k`, `v`, `attn_scores`, `pattern`, `attn_out`, `mlp_post` can be passed comma-separated)
 - `--ring-payload-mb`, `--ring-pinned-mb`
 - `--cuda-graphs`
 - `--csv path.csv`

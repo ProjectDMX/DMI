@@ -1,18 +1,10 @@
 [submodule "transformers"]
 	path = integration/transformers
-	url = git@github.com:Samfisheryu/transformers.git
+	url = https://github.com/ProjectDMX/transformers-DMI.git
 [submodule "libs/clickhouse-cpp"]
 	path = libs/clickhouse-cpp
-	url = git@github.com:ClickHouse/clickhouse-cpp.git
+	url = https://github.com/ClickHouse/clickhouse-cpp.git
 [submodule "vllm"]
 	path = integration/vllm
-	url = git@github.com:ProjectDMX/vllm.git
+	url = https://github.com/ProjectDMX/vllm-DMI.git
 	branch = dmi_integration
-[submodule "experiments/online_serving/vLLM-Hook"]
-	path = experiments/online_serving/vLLM-Hook
-	url = git@github.com:ProjectDMX/vLLM-Hook-baseline.git
-	branch = dmi_experiment_mods
-[submodule "experiments/online_serving/TensorRT-LLM"]
-	path = experiments/online_serving/TensorRT-LLM
-	url = git@github.com:ProjectDMX/TensorRT-LLM-baseline.git
-	branch = dmi_experiment_mods

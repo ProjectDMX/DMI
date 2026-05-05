@@ -6,13 +6,39 @@ build the native backend, and prepare the optional ClickHouse sink.
 Tested on Linux + CUDA 12.x + Python 3.10. A CUDA-capable GPU is required because
 Ring² is a GPU-resident capture and transport pipeline.
 
+## 0. System prerequisites
+
+DMI builds C++/CUDA artifacts; the conda env covers Python deps but not
+system toolchains. On Debian/Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake git
+```
+
+Plus a working CUDA toolkit (NVCC) matching your driver. DMI is tested
+against CUDA 12.x; install per the
+[official NVIDIA instructions](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/).
+Verify:
+
+```bash
+nvcc --version
+nvidia-smi
+```
+
+If `nvcc` is not on `PATH`, point the build at it explicitly:
+
+```bash
+export NVCC=/usr/local/cuda/bin/nvcc
+```
+
 ## 1. Clone the repository
 
 The repo uses three git submodules: a fork of HuggingFace `transformers`, a fork
 of `vllm`, and the `clickhouse-cpp` C++ client.
 
 ```bash
-git clone --recursive <your-repo-url> DMI
+git clone --recursive https://github.com/ProjectDMX/DMI.git
 cd DMI
 
 # If you forgot --recursive:
@@ -61,11 +87,9 @@ DMX_DB_DATABASE=default
 DMX_DB_TABLE=offload
 ```
 
-To wipe local DB state between runs:
-
-```bash
-bash benchmark/clean_clickhouse.sh
-```
+If captured tensors accumulate and the ClickHouse data directory grows too large
+between runs, you may want to clear old content. Refer to the ClickHouse
+documentation for the appropriate cleanup procedure.
 
 ## 3. Create the Python environment
 
@@ -108,18 +132,26 @@ make -C monitoring -j
 ```
 
 Artifacts are emitted as `monitoring_native_backend.<EXT_SUFFIX>.so` at the
-project root and inside `monitoring/`. If `nvcc` is not on `PATH`, set:
+project root and inside `monitoring/`.
 
-```bash
-export NVCC=/usr/local/cuda/bin/nvcc
-```
-
-Smoke check:
+Smoke check (loads the built `.so`):
 
 ```bash
 python -c "import monitoring; print(monitoring.__file__)"
 python -c "from monitoring._native_engine import RingConfig; print(RingConfig())"
 ```
+
+## 6. End-to-end smoke check
+
+Runs the visualization demo's HF offload script, captures activations into
+ClickHouse, then queries the row count:
+
+```bash
+python example/visualization/run_offload_hf.py
+clickhouse-client --query "SELECT count() FROM default.offload WHERE model_id='demo_hf'"
+```
+
+Expect the generated text on stdout and a non-zero row count.
 
 ## Troubleshooting
 
