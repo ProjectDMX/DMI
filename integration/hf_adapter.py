@@ -195,6 +195,11 @@ class HFAdaptor(BackendAdaptor):
                 "HFAdaptor.detect_model_shape: model.config is missing "
                 "hidden_size/num_attention_heads (or n_embd/n_head)."
             )
+        # HF DMI is TP-only for now: the whole torch.distributed world
+        # is the TP group. DP/PP not handled on the HF path yet.
+        import torch.distributed as dist
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            cfg.tp_size = max(1, dist.get_world_size())
         return cfg
 
     def detect_parallel_ranks(self) -> Tuple[int, int, int, int]:
@@ -843,6 +848,10 @@ def generate_with_monitoring(
         no_strip_right_pad=no_strip_right_pad,
         eos_token_id=eos_token_id,
     )
+    # Expose the adaptor on the engine so external callers (e.g. the HF
+    # compare-runner test harness) can read per-step batch tracking
+    # (_batch_request_ids, _batch_starts).
+    engine._hf_adaptor = adaptor
     adaptor.attach_model(
         target,
         hook_selection=hook_selection or "full",
@@ -971,7 +980,7 @@ def generate_greedy_with_monitoring(
     """Greedy-argmax generate loop, no HF generate() overhead.
 
     Follows the same pattern as the hf_offload manual loop in
-    benchmark/bench_ring_transport.py:
+    benchmark/bench_hf_transport.py:
       * Optional torch.compile + StaticCache + CUDA graphs for decode.
       * Without cuda_graphs: HF default (DynamicCache) for KV cache.
       * Per-step CPU sync via token.cpu() (matches HF generate()'s
@@ -1030,6 +1039,7 @@ def generate_greedy_with_monitoring(
                 no_strip_right_pad=no_strip_right_pad,
                 eos_token_id=eos_token_id,
             )
+            engine._hf_adaptor = adaptor
             adaptor.attach_model(
                 model,
                 hook_selection=hook_selection or "full",

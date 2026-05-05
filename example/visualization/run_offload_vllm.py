@@ -105,8 +105,10 @@ def main() -> None:
     )
     decoded = out[0].outputs[0].text
 
-    # vLLM's worker shutdown should call stop_monitoring (DMXGPUWorker
-    # registers it).  Force a final flush by deleting the LLM.
+    # Explicit per-worker flush+stop. The implicit path via
+    # DMXGPUWorker.shutdown() races vLLM's 8s deadline and may drop tail
+    # rows. collective_rpc fans out to every TP rank.
+    llm.collective_rpc("stop_monitoring")
     del llm
     import torch
     torch.cuda.empty_cache()

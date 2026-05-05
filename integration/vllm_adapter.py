@@ -113,6 +113,7 @@ def normalize_vllm_request_id(req_id: str) -> str:
 _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2PLMHeadModel",
     "Qwen3ForCausalLM": "Qwen3PForCausalLM",
+    "LlamaForCausalLM": "LlamaPForCausalLM",
 }
 
 

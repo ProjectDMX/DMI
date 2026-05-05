@@ -130,8 +130,8 @@ class TestPatcherRoundTrip:
     """Verify the on-disk patch / unpatch context manager."""
 
     @pytest.mark.parametrize("framework,model_key", [
-        ("hf", "gpt2"), ("hf", "qwen3"),
-        ("vllm", "gpt2"), ("vllm", "qwen3"),
+        ("hf", "gpt2"), ("hf", "qwen3"), ("hf", "llama"),
+        ("vllm", "gpt2"), ("vllm", "qwen3"), ("vllm", "llama"),
     ])
     def test_round_trip_byte_identical(self, framework, model_key):
         """File contents before and after patch_compare_model must match."""
@@ -171,7 +171,7 @@ class TestRealCompareModelsContainAllExpectedHooks:
     SMOKE_HOOKS = ["q", "resid_pre", "final_logits"]
 
     @pytest.mark.parametrize("framework,model_key", [
-        ("hf", "qwen3"), ("hf", "gpt2"),
+        ("hf", "qwen3"), ("hf", "gpt2"), ("hf", "llama"),
     ])
     def test_smoke_hooks_present_in_compare_source(self, framework, model_key):
         p = compare_model_path(framework, model_key)
@@ -240,7 +240,11 @@ _HF_RUNNER = dedent("""
     args = ap.parse_args()
     assert args.framework == 'hf'
 
-    MODEL_ALIASES = {'gpt2': 'gpt2', 'qwen3': 'Qwen/Qwen3-0.6B'}
+    MODEL_ALIASES = {
+        'gpt2': 'gpt2',
+        'qwen3': 'Qwen/Qwen3-0.6B',
+        'llama': 'meta-llama/Llama-3.1-8B',
+    }
     hf_id = MODEL_ALIASES[args.model_key]
     device = torch.device('cuda')
     dtype = torch.float16
@@ -260,6 +264,8 @@ _HF_RUNNER = dedent("""
             from transformers.models.qwen3_compare.modeling_qwen3 import CompareQwen3ForCausalLM as model_cls
         elif args.model_key == 'gpt2':
             from transformers.models.gpt2_compare.modeling_gpt2 import CompareGPT2LMHeadModel as model_cls
+        elif args.model_key == 'llama':
+            from transformers.models.llama_compare.modeling_llama import CompareLlamaForCausalLM as model_cls
         else:
             raise ValueError(f'unsupported model_key={args.model_key!r} for HF ref rollout')
         from transformers import AutoTokenizer
@@ -419,6 +425,14 @@ _VLLM_RUNNER = dedent("""
     out_path = os.path.join(args.output_dir, f'{args.rollout}.pt')
     torch.save({'token_ids': token_ids, 'logprobs': logprobs}, out_path)
     print(f'OK {args.rollout} N={len(token_ids)} -> {out_path}')
+
+    # Explicit per-worker flush+stop before process exit. Avoids the
+    # implicit-shutdown race against vLLM's 8s deadline. No-op if the
+    # worker doesn't carry stop_monitoring (e.g. baseline configs).
+    try:
+        llm.collective_rpc('stop_monitoring')
+    except Exception:
+        pass
 """)
 
 

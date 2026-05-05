@@ -19,7 +19,7 @@ For prefill, tok/s counts prompt tokens processed (batch * prefill_len).
 For decode,  tok/s counts new tokens generated  (batch * decode_len).
 
 Usage:
-  python -m benchmark.bench_ring_transport --model qwen3 --modes baseline,ring_null
+  python -m benchmark.bench_hf_transport --model qwen3 --modes baseline,ring_null
 """
 
 from __future__ import annotations
@@ -773,7 +773,10 @@ def _parse_args() -> BenchConfig:
     )
 
 
-_MODEL_ALIASES = {"qwen3": "Qwen/Qwen3-4B"}
+_MODEL_ALIASES = {
+    "qwen3": "Qwen/Qwen3-4B",
+    "llama": "meta-llama/Llama-3.1-8B",
+}
 
 
 def main() -> None:

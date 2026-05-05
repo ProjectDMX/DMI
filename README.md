@@ -1,295 +1,149 @@
-<!--
-New open-source style intro (DMI) is added below.
-Original README content is preserved and kept after the new sections.
--->
-
-<!-- # DMI (Deep Model Inspection) -->
-
 <p align="center">
-  <img src="./Figures/f20e2340-3411-4d49-8979-0a7214d3db4b.png" alt="DMI logo" width="400" />
+  <img src="./Figures/new_logo.png" alt="DMI logo" width="280" />
 </p>
 
+<h1 align="center">DMI — Deep Model Inspector</h1>
+
 <p align="center">
-  <strong>Built for real-time visibility into LLM inference</strong>
+  <strong>A decoupled, asynchronous observation substrate for high-speed LLM inference.</strong>
 </p>
 
-**Project-DMI** is an open-source LLM monitoring toolkit for LLM inference.  
-It helps you inspect any internal model states (activations, attention, logits, KV cache) during real LLM inference, with a high-performance C++ backend and async data pipeline.
-
-## About
-
-DMI is built for engineers and researchers who need to understand what happens *inside* a model while it runs. DMI includes **Shadow Block**, a unique GPU-resident hook system for CUDA-Graph-friendly monitored inference at high speed.
-
-Instead of only looking at final outputs or manually adding hooks, DMI lets you:
-- **Attach** hook points to internal layers wherever you want,
-- **Fast capture** internal states with minimal inference interruption,
-- **Persist** the data to DB (Disk/In-memory) for large-scale analysis with **Visualization**.
-
-The goal is practical model debugging and inspection with minimal overhead.
-
-## Key Features
-
-- 🔍 **Deep Internal Inspection**: Capture any internal model states as you want.
-- ⚙️ **Configurable Capture Control**: Per-step and per-request sampling with flexible hook selection.
-- ⚡ **GPU-Resident Hook System***: We introduced **Shadow Block**, a system-level kernel innovation for CUDA-Graph-friendly monitored inference at high speed.
-- 🚀 **Fast Monitoring Engine for Data Transfer**: C++-powered, high-throughput data movement for inference-time capture.
-- 🗄️ **Host Engine for Persistence & Visualization**: Built-in database pipeline to persist captured data, with ready-to-inspect visualization dashboards.
-- 🧩 **Seamless Hugging Face API Integration**: Works with familiar HF `generate` APIs and natively supports HF parallel inference strategies (e.g., TP/PP workflows).
-
-\* In active integration; this direction is included as part of DMI's core roadmap.
-
-## Installation
-
-### 1) Clone repository + submodules
-
-```bash
-git clone --recursive <your-repo-url>
-cd HF_Prometheus
-
-# If already cloned without --recursive
-git submodule update --init --recursive
-```
-
-Current required submodules in this repo:
-- `transformers/`
-- `libs/clickhouse-cpp/`
-
-### 2) Create Python environment
-
-```bash
-conda env create -f environment.yml
-conda activate proj-dmx
-```
-
-### 3) Install Python packages
-
-```bash
-pip install -e .
-pip install -e transformers/
-```
-
-### 4) Build native dependencies
-
-Build ClickHouse C++ client (required by the monitoring extension link stage):
-
-```bash
-cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build -DCMAKE_BUILD_TYPE=Release
-cmake --build libs/clickhouse-cpp/build -j
-```
-
-Build DMI native backend:
-
-```bash
-make -C monitoring -j
-# or simply: make
-```
-
-## Quick Start
-
-Supported model architectures (current):
-- `gpt2`
-- `qwen3`
-
-We provide runnable example scripts in `benchmark/scripts/`:
-
-- `benchmark/scripts/hf_generate.py` (HF baseline inference)
-- `benchmark/scripts/hf_monitoring_generate.py` (DMI monitored inference)
-
-
-
-Example runs:
-
-```bash
-python benchmark/scripts/hf_generate.py --model gpt2 --device cuda --batch-size 8 --max-new-tokens 16
-python benchmark/scripts/hf_monitoring_generate.py --model qwen3 --device cuda --batch-size 8 --max-new-tokens 16 --no-db
-```
+> **Project Status — research preview.** DMI currently supports HuggingFace
+> and vLLM backends for Qwen3 / Llama3.1 and GPT-2-family experiments, with Ring² transport
+> and optional host-side persistence. APIs may change. Contributions, bug
+> reports, and feature requests are welcome.
 
 ---
 
-<!-- Original README starts here (preserved) -->
+## About
 
-<!-- # Proj-dmx (Huggineface/transformers)
+**DMI is an observability layer for LLM inference.** It gives real-time access to
+*any* internal model state — residual streams, attention patterns, MLP outputs,
+KV-cache slices, logits — during real serving, with minimal overhead and without
+forking the inference engine.
 
-**Prototype of Proj-dmx on HF/transformers library.** A white-box observability system for LLM inference. Capture and analyze internal model states (activations, attention weights, KV cache) with minimal performance overhead.
+DMI works in **HuggingFace Transformers** and **vLLM** out of the box, captures
+internal tensors through CUDA-Graph–compatible hooks, and streams them off the
+GPU via a dedicated ring buffer to a host-side drain that pushes into a
+queryable store (or drops them, for transport-only profiling).
 
-## Features
+## Why DMI
 
-- **Internal State Monitoring**: Capture activations, attention patterns, and KV cache statistics during inference
-- **Configurable Sampling**: Control capture frequency with step-level and request-level scheduling
-- **Async Pipeline**: Non-blocking GPU→CPU transfer with pinned memory pools
-- **Native C++ Backend**: High-performance hook callbacks with Python/C++ hybrid architecture
-- **TransformerLens-style API**: Familiar `run_with_cache` interface for activation collection
+If you're:
 
-## Architecture
+- debugging hallucinations and model bugs in production,
+- studying interpretability, activation steering, or refusal behavior,
+- building speculative-decoding drafts that consume the target model's internals,
+- mining distillation datasets from hidden states,
+- or monitoring attention collapse during long generation,
 
-```
-┌──────────────────────────────────────────────────┐
-│  HookedGPT2Model (modified transformers)         │
-│  └── HookPoints → trigger callbacks              │
-└─────────────────────┬────────────────────────────┘
-                      ↓
-┌──────────────────────────────────────────────────┐
-│  MonitoringEngine                                │
-│  ├── CaptureSchedule (token/request sampling)    │
-│  ├── HookSelection (hooks sampling)              │
-│  └── Native Backend routing                      │
-└─────────────────────┬────────────────────────────┘
-                      ↓
-┌──────────────────────────────────────────────────┐
-│  C++ Native Backend                              │
-│  ├── Async GPU→CPU transfer                      │
-│  ├── Pinned memory management                    │
-│  └── Lock-free task queue                        │
-└──────────────────────────────────────────────────┘
-```
+you need internal visibility **without rewriting your model or slowing inference 10×**.
+That's the gap DMI fills.
 
+## Key features
 
-## Project Structure
+- **`HookPoint`** — drop-in observation primitive. Place it anywhere in a PyTorch
+  model; works under CUDA Graphs and survives `torch.compile`.
+- **`Ring²`** — GPU↔CPU co-designed staging. A dedicated GPU-side payload ring
+  isolates captured tensors from the KV-cache memory pool; an on-host meta ring
+  is drained asynchronously.
+- **HF + vLLM integration** — no engine fork required by the user. Plug in
+  through a worker class (vLLM) or a thin generation wrapper (HF).
+- **Configurable offloading** — capture your hidden states on GPU, stage on host,
+  and stream into a queryable store; visualize from notebooks (check out the [Demo](#demo) below).
+- **Quantified overhead** — measured against vanilla HF, HF's `output_hidden_states`,
+  and `register_forward_hook`. See [benchmarks](docs/benchmarks.md).
 
-```
-HF_Prometheus/
-├── monitoring/
-│   ├── __init__.py
-│   ├── engine.py          # MonitoringEngine
-│   ├── config.py          # Configuration classes
-│   ├── task.py            # Task definitions
-│   └── csrc/              # C++ native backend
-│       ├── native_engine.cpp
-│       ├── hooks.cpp
-│       └── ...
-├── transformers/          # Git submodule (forked)
-│   └── src/transformers/models/gpt2_p/
-│       ├── modeling_gpt2.py   # HookedGPT2Model
-│       └── hook_points.py     # HookPoint implementation
-├── benchmark/
-│   └── tests/             # Performance benchmarks
-├── example/               # User-facing examples
-└── tests/                 # Unit tests
-```
+## Demo                                         
+                  
+Captured internals explored in a Jupyter notebook -- attention patterns, residual-stream norms, per-token confidence, and top-k alternatives over one prompt through Qwen3-0.6B.  
+Source under [`example/visualization/`](example/visualization/README.md).  
 
 
-## Installation
-
-```bash
-# Clone with submodules
-git clone --recursive git@github.com:Samfisheryu/vLLM-Prometheus.git
-cd vLLM-Prometheus
-
-# If already cloned without --recursive
-git submodule update --init --recursive
-
-# Ensure nested submodules inside dmx_host are present (clickhouse-cpp)
-git -C dmx_host submodule update --init --recursive
-```
-
-### Option 1: Conda (Recommended)
-
-```bash
-conda env create -f environment.yml
-conda activate proj-dmx
-pip install -e transformers/  # Install local modified transformers
-pip install -e dmx_host/      # Builds clickhouse_client extension
-```
-
-### Option 2: Pip
-
-```bash
-pip install -r requirements.txt
-pip install -e transformers/  # Install local modified transformers
-pip install -e dmx_host/      # Builds clickhouse_client extension
-```
-
-### Build C++ Extension
-
-```bash
-cd monitoring && make
-```
+https://github.com/user-attachments/assets/df68bb06-d575-43e3-aed8-b08ca587e81a
 
 
 
 
-## Quick Start
+## Performance
 
-**Notebook:** [Quick_Start.ipynb](./Quick_Start.ipynb)
+**Offline throughput** — Qwen3-4B / Llama-3.1-8B / Qwen3-14B on ShareGPT and
+WildChat, normalized to vanilla HuggingFace (ideal, no observation = 1.0).
+Red × = out of memory.
 
-### Example: Minimal monitoring (CPU)
-```bash
-python -m example.gpt2_generate_with_monitoring
-```
-### Example: CUDA + ClickHouse pipeline
-Requires running ClickHouse and the dmx_host extension built.
-```bash
-python -m example.gpt2_generate_with_monitoring_db
+<p align="center">
+  <img src="./Figures/offline_hs_logits_real.png" alt="Offline throughput with limited hooks" width="100%" />
+</p>
+
+**Online serving (TPOT)** — same models on vLLM, plotted against request rate.
+DMI tracks the no-monitor baseline; synchronous hook/debug baselines saturate
+at much lower request rates.
+
+<p align="center">
+  <img src="./Figures/tpot_comparison.png" alt="Online TPOT: DMI vs vLLM Hook / TRT-LLM Debug API / vLLM no-monitor" width="100%" />
+</p>
+
+Full setup, additional results, and how to reproduce:
+[`docs/benchmarks.md`](docs/benchmarks.md).
+
+## Get started
+
+Start with the [installation guide](docs/install.md), then choose the
+HuggingFace or vLLM path depending on the runtime you want to inspect. The
+snippet below shows the minimal vLLM entry point.
+
+```python
+import os
+# Required for the current effectful-op integration with vLLM
+os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="Qwen/Qwen3-0.6B",
+    worker_cls="integration.vllm_adapter.DMXGPUWorker",
+    additional_config={
+        "dmx_hook_selection": "vllm-full",
+        "dmx_null_mode": True,   # capture + transport, drop on host (no DB needed)
+    },
+)
+
+for o in llm.generate(["The answer is"], SamplingParams(max_tokens=16)):
+    print(o.outputs[0].text)
+# Internal states for every layer have been captured into Ring²
+# during the run. Set "dmx_null_mode": False and configure a sink
+# to persist them.
 ```
 
-#### ClickHouse quick check
-```bash
-clickhouse-client --query "SELECT 1"
+| | |
+|---|---|
+| **[HuggingFace](docs/huggingface.md)** | Run HF generation, monitored generation, and offline benchmark scripts |
+| **[vLLM](docs/vllm.md)** | Run DMI through the vLLM offline API or `vllm serve` |
+
+## Contribute
+
+DMI is an early research system from FrootLab at the University of Maryland, and
+we welcome contributions from users, researchers, and systems builders. Useful
+contributions include bug reports, documentation fixes, benchmark reproduction
+notes, new model integrations, and backend-specific improvements for
+HuggingFace or vLLM.
+
+- **Questions, bugs, and feature requests.** Please open a GitHub issue with the
+  model, backend, hardware, and reproduction steps when applicable.
+- **Code and documentation.** Pull requests are welcome. For larger changes,
+  open an issue first so we can align on scope and avoid duplicated work.
+- **Model and backend support.** We are especially interested in additional model
+  families and serving backends, and welcome collaborations with other inference
+  backends or projects.
+- **Contact.** For collaborations or project-level discussions, reach out through
+  GitHub issues or contact the maintainers through the ProjectDMX organization.
+
+## Citation
+
+```bibtex
+% Coming soon.
 ```
 
-Optional DB overrides:
-`DMX_DB_HOST`, `DMX_DB_PORT`, `DMX_DB_USER`, `DMX_DB_PASSWORD`,
-`DMX_DB_DATABASE`, `DMX_DB_TABLE`.
+## License
 
-
-
-## Run Benchmark
-
-## Benchmark Runtime Config
-
-- Runtime env toggles under `MON_NATIVE_*` are removed.
-- Use `MonitoringConfig` for runtime tuning (`advance.*`) and debug behavior (`debug`).
-- For benchmark scripts that expose it, use `--nvtx` to enable debug/NVTX (`MonitoringConfig.debug=True`).
-- Policy: new runtime behavior knobs must be added via config fields, not new environment variables.
-
-### Args
-```bash
-steps: requests
-warmup: warmup requests
-decode-steps: decode token length
-```
-
-### profile_decode.py - Comprehensive Comparison
-
-Compares multiple inference approaches (TransformerLens, HuggingFace, HookedGPT2Model) with profiling support:
-
-
-
-# Basic run
-python -m benchmark.tests.profile_decode_qwen3 --batch-size 1 --steps 1 --warmup 1 --collect-hidden --collect-attention --no-profile --dtype fp16
-
-# With nsight profiling
-nsys profile --output=your_results_path/xxx --force-overwrite=true --trace=cuda,nvtx,osrt --sample=cpu --sampling-period=1000000 --cpuctxsw=process-tree --cuda-memory-usage=false python -m benchmark.tests.profile_decode --profile-dir your_results_dir/xxx --batch-size 64 --decode-steps 64 --collect-hidden --collect-attention --steps 1 --warmup 1 --no-profile --nvtx
-
-**Tested configurations:**
-- `transformer_lens` / `transformer_lens_cache` - Original TransformerLens
-- `huggingface` / `huggingface_api` - Pure HuggingFace
-- `hf_modified` / `hf_modified_hook` / `hf_modified_hook_async` - HookedGPT2Model with MonitoringEngine
-
-### hf_modified_async_config_benchmark.py - Config Validation
-
-Tests different MonitoringConfig settings (full capture vs sampled):
-
-```bash
-python benchmark/tests/hf_modified_async_config_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
-```
-
-### hf_modified_async_config_token_stride_benchmark.py - Token Stride Impact
-
-Measures performance impact of different `step_stride` values:
-
-```bash
-python benchmark/tests/hf_modified_async_config_token_stride_benchmark.py --batch-size 64 --steps 1 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention
-```
-
-Tests strides: `[1, 10, 30, 400]` - higher stride = fewer captures = faster
-
-### hf_modified_async_config_request_stride_benchmark.py - Request Stride Impact
-
-Measures performance impact of different `request_stride` values:
-
-```bash
-python benchmark/tests/hf_modified_async_config_request_stride_benchmark.py --batch-size 64 --steps 10 --warmup 1 --decode-steps 64 --collect-hidden --collect-attention --no-profile
-```
-
-Tests strides: `[1, 2, 5, 100]` - higher stride = skip more requests -->
+DMI is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.

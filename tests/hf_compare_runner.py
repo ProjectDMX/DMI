@@ -22,6 +22,7 @@ import torch
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
     "qwen3": "Qwen/Qwen3-0.6B",
+    "llama": "meta-llama/Llama-3.1-8B",
 }
 
 
@@ -53,9 +54,13 @@ def main():
     device = torch.device("cuda")
 
     # Load compare model
-    if "qwen3" in hf_model_id.lower() or "qwen" in hf_model_id.lower():
+    model_id_lc = hf_model_id.lower()
+    if "qwen3" in model_id_lc or "qwen" in model_id_lc:
         from transformers.models.qwen3_compare.modeling_qwen3 import CompareQwen3ForCausalLM
         model_cls = CompareQwen3ForCausalLM
+    elif "llama" in model_id_lc:
+        from transformers.models.llama_compare.modeling_llama import CompareLlamaForCausalLM
+        model_cls = CompareLlamaForCausalLM
     else:
         from transformers.models.gpt2_compare.modeling_gpt2 import CompareGPT2LMHeadModel
         model_cls = CompareGPT2LMHeadModel
@@ -84,14 +89,17 @@ def main():
     max_total_len = int(input_ids.shape[1]) + max_new_tokens + 16
     model.allocate_compare_buffers(batch_size, max_total_len, dtype=torch.float16, tp_size=tp_size)
 
-    # ClickHouse setup — drop per-rank tables
+    # ClickHouse setup -- drop the single shared table from rank 0 only.
+    # Production (vllm_adapter, hf_adapter) writes all ranks to one table
+    # with `shard_rank` column distinguishing per-rank rows; the test now
+    # mirrors that.
     import clickhouse_driver
-    ch_client = clickhouse_driver.Client(db_host, port=db_port)
-    table_name = f"offload_rank{tp_rank}" if tp_size > 1 else "offload"
-    try:
-        ch_client.execute(f"DROP TABLE IF EXISTS default.{table_name}")
-    except Exception:
-        pass
+    if tp_rank == 0:
+        ch_client = clickhouse_driver.Client(db_host, port=db_port)
+        try:
+            ch_client.execute("DROP TABLE IF EXISTS default.offload")
+        except Exception:
+            pass
     if tp_size > 1:
         import torch.distributed as dist
         dist.barrier()
@@ -102,12 +110,14 @@ def main():
     ch_cfg.username = os.environ.get("DMX_DB_USER", "default")
     ch_cfg.password = os.environ.get("DMX_DB_PASSWORD", "")
     ch_cfg.database = "default"
-    ch_cfg.table = f"offload_rank{tp_rank}" if tp_size > 1 else "offload"
+    ch_cfg.table = "offload"
     ch_cfg.secure = False
     ch_cfg.client_side_compress = "none"
     ch_cfg.client_settings = None
     ch_cfg.create_database_if_missing = True
-    ch_cfg.drop_existing_database = True
+    # Drop is done explicitly above on rank 0 only, so individual host
+    # engines must NOT drop the DB (would race across ranks).
+    ch_cfg.drop_existing_database = False
     ch_cfg.index_granularity = 8192
 
     stage = StageConfig.clickhouse_insert(ch_cfg, parallelism=10, name="ch_insert")
@@ -193,20 +203,11 @@ def main():
         import torch.distributed as dist
         dist.barrier()
 
-    # Only rank 0 compares — merge all per-rank CH tables
+    # Only rank 0 compares -- read the single shared table.
     if tp_rank == 0:
         print("\n[compare] Comparing disk vs ClickHouse...", flush=True)
         from tests.compare_disk_vs_ch import read_clickhouse, compare
-        ch_data_all = {}
-        total_rows = 0
-        if tp_size > 1:
-            for r in range(tp_size):
-                data, n = read_clickhouse(db_host, db_port,
-                                          table=f"offload_rank{r}")
-                ch_data_all.update(data)
-                total_rows += n
-        else:
-            ch_data_all, total_rows = read_clickhouse(db_host, db_port)
+        ch_data_all, total_rows = read_clickhouse(db_host, db_port)
         passed, failed = compare(compare_dir, ch_data_all, total_rows)
 
         if failed > 0:
@@ -237,8 +238,15 @@ class _StepSaver:
         self._kv_offsets: list = []  # per-request kv pad, set on prefill step
 
     def save_step(self):
-        req_ids = self.engine._active_batch_request_ids
-        starts = self.engine._active_batch_start_idx_per_request
+        # Per the unified-adaptor refactor (commit e64a0aa79), per-batch
+        # request tracking moved off MonitoringEngine onto HFAdaptor.
+        # generate_with_monitoring now stashes the adaptor on the engine
+        # as ``_hf_adaptor`` so external test harnesses can reach it.
+        adaptor = getattr(self.engine, "_hf_adaptor", None)
+        if adaptor is None:
+            return
+        req_ids = adaptor._batch_request_ids
+        starts = adaptor._batch_starts
         if req_ids is None or starts is None:
             return
 
