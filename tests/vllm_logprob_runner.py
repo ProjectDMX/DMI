@@ -167,6 +167,11 @@ def main():
                 print(f"  stored[{i}]: tokens={len(tids)} logprobs=None",
                       flush=True)
 
+    # Flush DMI per-worker (no-op if RefLogprobWorker is in use).
+    try:
+        llm.collective_rpc("stop_monitoring")
+    except Exception:
+        pass
     del llm
     torch.cuda.empty_cache()
 

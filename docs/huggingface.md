@@ -15,7 +15,7 @@ python benchmark/scripts/hf_generate.py \
 
 ## DMI monitoring (transport only or with persistence)
 
-Both flows go through `benchmark.bench_ring_transport`. Pick the mode that
+Both flows go through `benchmark.bench_hf_transport`. Pick the mode that
 matches whether you want to persist captures:
 
 - `ring_null` — Ring² capture + transport, drop on the host. Isolates transport
@@ -41,7 +41,7 @@ The benchmark compares:
 | `hf_offload` | HF's `output_hidden_states=True` path |
 
 ```bash
-python -m benchmark.bench_ring_transport \
+python -m benchmark.bench_hf_transport \
     --model qwen3 --batch-size 4 \
     --prefill-len 1 --decode-len 16 \
     --warmup 1 --iters 3 \
@@ -52,7 +52,7 @@ python -m benchmark.bench_ring_transport \
 
 Useful flags:
 
-- `--model gpt2 | qwen3`
+- `--model gpt2 | qwen3 | llama`
 - `--hook-selection full | hf-only | hidden-states | logits | <individual hook short name>` (individual hooks like `q`, `k`, `v`, `attn_scores`, `pattern`, `attn_out`, `mlp_post` can be passed comma-separated)
 - `--ring-payload-mb`, `--ring-pinned-mb`
 - `--cuda-graphs`

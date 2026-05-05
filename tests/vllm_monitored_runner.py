@@ -92,6 +92,13 @@ def main():
             "db_port": db_port,
         }, f)
 
+    # Explicit per-worker flush+stop before LLM teardown. The implicit
+    # path via DMXGPUWorker.shutdown() races vLLM's 8s deadline and warns
+    # "Data may be incomplete." collective_rpc fans out to every TP rank.
+    try:
+        llm.collective_rpc("stop_monitoring")
+    except Exception:
+        pass
     del llm
     torch.cuda.empty_cache()
     print(f"[vllm_monitored_runner] Done", flush=True)

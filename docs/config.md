@@ -110,7 +110,7 @@ All E2E ring parameters are set via `E2E_*` environment variables
 ## Benchmark CLI Arguments
 
 All benchmark ring parameters are set via CLI flags
-(see `benchmark/bench_ring_transport.py`).
+(see `benchmark/bench_hf_transport.py`).
 
 ```
 Ring engine -- GPU buffers:

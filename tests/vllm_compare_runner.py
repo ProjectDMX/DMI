@@ -20,6 +20,7 @@ import torch
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
     "qwen3": "Qwen/Qwen3-0.6B",
+    "llama": "meta-llama/Llama-3.1-8B",
 }
 
 
@@ -83,7 +84,13 @@ def main():
     for i, o in enumerate(outputs):
         print(f"  prompt[{i}]: {len(o.outputs[0].token_ids)} tokens generated")
 
-    # Shutdown flushes ring → ClickHouse (best-effort via death pipe path)
+    # Explicit per-worker flush+stop before teardown. Without this, the
+    # implicit DMXGPUWorker.shutdown() races vLLM's 8s deadline and may
+    # drop tail rows -- exactly the data we're about to compare.
+    try:
+        llm.collective_rpc("stop_monitoring")
+    except Exception:
+        pass
     del llm
     torch.cuda.empty_cache()
 

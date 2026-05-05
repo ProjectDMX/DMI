@@ -18,6 +18,7 @@ from integration.vllm_adapter import DMXGPUWorker
 _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2CompareForCausalLM",
     "Qwen3ForCausalLM": "Qwen3CompareForCausalLM",
+    "LlamaForCausalLM": "LlamaCompareForCausalLM",
 }
 
 # Hook names that are TP-sharded

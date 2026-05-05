@@ -47,7 +47,7 @@ git submodule update --init --recursive
 
 Expected submodule paths:
 
-- `integration/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`)
+- `integration/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`, `llama_p`)
 - `integration/vllm/` — modified vLLM with DMI integration hooks
 - `libs/clickhouse-cpp/` — ClickHouse C++ client linked into the native backend
 
