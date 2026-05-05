@@ -9,7 +9,7 @@
 </p>
 
 > **Project Status — research preview.** DMI currently supports HuggingFace
-> and vLLM paths for Qwen3 and GPT-2-family experiments, with Ring² transport
+> and vLLM backends for Qwen3 / Llama3.1 and GPT-2-family experiments, with Ring² transport
 > and optional host-side persistence. APIs may change. Contributions, bug
 > reports, and feature requests are welcome.
 
