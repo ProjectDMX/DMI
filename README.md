@@ -88,9 +88,9 @@ Full setup, additional results, and how to reproduce:
 
 ## Get started
 
-Start with the installation guide, then choose the HuggingFace or vLLM path
-depending on the runtime you want to inspect. The snippet below shows the minimal
-vLLM entry point.
+Start with the [installation guide](docs/install.md), then choose the
+HuggingFace or vLLM path depending on the runtime you want to inspect. The
+snippet below shows the minimal vLLM entry point.
 
 ```python
 import os
@@ -117,7 +117,6 @@ for o in llm.generate(["The answer is"], SamplingParams(max_tokens=16)):
 
 | | |
 |---|---|
-| **[Install](docs/install.md)** | Set up submodules, dependencies, ClickHouse, and the native backend |
 | **[HuggingFace](docs/huggingface.md)** | Run HF generation, monitored generation, and offline benchmark scripts |
 | **[vLLM](docs/vllm.md)** | Run DMI through the vLLM offline API or `vllm serve` |
 
