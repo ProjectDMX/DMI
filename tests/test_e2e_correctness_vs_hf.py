@@ -95,7 +95,7 @@ from .hf_reference import (
 # Model aliases
 # ---------------------------------------------------------------------------
 
-_MODEL_ALIASES = {"qwen3": "Qwen/Qwen3-4B"}
+_MODEL_ALIASES = {"qwen3": "Qwen/Qwen3-4B", "llama": "meta-llama/Llama-3.1-8B"}
 
 
 def _resolve_model_id(model: str) -> str:
@@ -287,6 +287,7 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel  # type: ignore
         from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM  # type: ignore
+        from transformers.models.llama_p.modeling_llama import HookedLlamaForCausalLM  # type: ignore
     except Exception as exc:
         pytest.skip(f"transformers or repo Hooked* classes not available: {exc}")
 
@@ -377,7 +378,12 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
     )
     engine.enable_ring_transport(ring_cfg)
 
-    model_cls = HookedQwen3ForCausalLM if "qwen3" in hf_model_id.lower() else HookedGPT2LMHeadModel
+    if "qwen3" in hf_model_id.lower():
+        model_cls = HookedQwen3ForCausalLM
+    elif "llama" in hf_model_id.lower():
+        model_cls = HookedLlamaForCausalLM
+    else:
+        model_cls = HookedGPT2LMHeadModel
     mon_model = model_cls.from_pretrained(hf_model_id, attn_implementation="eager", torch_dtype=torch.float16)
     mon_model.to(device).eval()
     mon_model.monitoring_engine = engine
@@ -862,6 +868,7 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel  # type: ignore
         from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM  # type: ignore
+        from transformers.models.llama_p.modeling_llama import HookedLlamaForCausalLM  # type: ignore
     except Exception as exc:
         pytest.skip(f"transformers or Hooked* classes not available: {exc}")
 
@@ -936,7 +943,12 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     )
     engine.enable_ring_transport(ring_cfg)
 
-    model_cls = HookedQwen3ForCausalLM if "qwen3" in hf_model_id.lower() else HookedGPT2LMHeadModel
+    if "qwen3" in hf_model_id.lower():
+        model_cls = HookedQwen3ForCausalLM
+    elif "llama" in hf_model_id.lower():
+        model_cls = HookedLlamaForCausalLM
+    else:
+        model_cls = HookedGPT2LMHeadModel
     mon_model = model_cls.from_pretrained(
         hf_model_id, attn_implementation="eager", torch_dtype=torch.float16,
     )
@@ -1354,6 +1366,7 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel  # type: ignore
         from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM  # type: ignore
+        from transformers.models.llama_p.modeling_llama import HookedLlamaForCausalLM  # type: ignore
     except Exception as exc:
         pytest.skip(f"transformers or Hooked* classes not available: {exc}")
 
@@ -1411,7 +1424,12 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
     )
     engine.enable_ring_transport(ring_cfg)
 
-    model_cls = HookedQwen3ForCausalLM if "qwen3" in hf_model_id.lower() else HookedGPT2LMHeadModel
+    if "qwen3" in hf_model_id.lower():
+        model_cls = HookedQwen3ForCausalLM
+    elif "llama" in hf_model_id.lower():
+        model_cls = HookedLlamaForCausalLM
+    else:
+        model_cls = HookedGPT2LMHeadModel
     mon_model = model_cls.from_pretrained(
         hf_model_id, attn_implementation="eager", torch_dtype=torch.float16,
     ).to(device).eval()

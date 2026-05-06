@@ -27,7 +27,7 @@ def main():
     batch_size = int(os.environ.get("E2E_BATCH_SIZE", "4"))
     max_new_tokens = int(os.environ.get("E2E_MAX_NEW_TOKENS", "8"))
     cuda_graphs = os.environ.get("E2E_CUDA_GRAPHS", "0") == "1"
-    _MODEL_ALIASES = {"qwen3": "Qwen/Qwen3-4B"}
+    _MODEL_ALIASES = {"qwen3": "Qwen/Qwen3-4B", "llama": "meta-llama/Llama-3.1-8B"}
     model_key = os.environ.get("E2E_MODEL", "gpt2")
     hf_model_id = _MODEL_ALIASES.get(model_key, model_key)
 
@@ -37,6 +37,9 @@ def main():
     if "qwen3" in hf_model_id.lower() or "qwen" in hf_model_id.lower():
         from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
         model_cls = HookedQwen3ForCausalLM
+    elif "llama" in hf_model_id.lower():
+        from transformers.models.llama_p.modeling_llama import HookedLlamaForCausalLM
+        model_cls = HookedLlamaForCausalLM
     else:
         from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
         model_cls = HookedGPT2LMHeadModel

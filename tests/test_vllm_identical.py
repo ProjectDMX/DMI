@@ -42,6 +42,7 @@ import torch
 _MODEL_REF_FILES = {
     "gpt2": "gpt2_ref.py",
     "qwen3": "qwen3_ref.py",
+    "llama": "llama_ref.py",
 }
 
 

@@ -23,7 +23,7 @@ def main():
     # Read config from env (same vars as the test)
     batch_size = int(os.environ.get("E2E_BATCH_SIZE", "4"))
     max_new_tokens = int(os.environ.get("E2E_MAX_NEW_TOKENS", "8"))
-    model_aliases = {"qwen3": "Qwen/Qwen3-4B"}
+    model_aliases = {"qwen3": "Qwen/Qwen3-4B", "llama": "meta-llama/Llama-3.1-8B"}
     model_key = os.environ.get("E2E_MODEL", "gpt2")
     hf_model_id = model_aliases.get(model_key, model_key)
 

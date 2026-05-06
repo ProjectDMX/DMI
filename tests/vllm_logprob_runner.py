@@ -20,11 +20,13 @@ from vllm.v1.worker.gpu_worker import Worker
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
     "qwen3": "Qwen/Qwen3-0.6B",
+    "llama": "meta-llama/Llama-3.1-8B",
 }
 
 _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2RefLMHeadModel",
     "Qwen3ForCausalLM": "Qwen3RefForCausalLM",
+    "LlamaForCausalLM": "LlamaRefForCausalLM",
 }
 
 
