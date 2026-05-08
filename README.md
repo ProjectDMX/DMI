@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./Figures/new_logo.png" alt="DMI logo" width="280" />
+  <img src="./Figures/new-logo.png" alt="DMI logo" width="280" />
 </p>
 
 <h1 align="center">DMI — Deep Model Inspector</h1>
