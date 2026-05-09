@@ -8,6 +8,11 @@
   <strong>A decoupled, asynchronous observation substrate for high-speed LLM inference.</strong>
 </p>
 
+> [!IMPORTANT]
+> **Seeking Research Collaborations.** We are actively looking for research
+> collaborators to explore downstream applications built on DMI such as **interpretability**, **speculative decoding**,
+> **hallucination analysis**, **distillation**, **activation steering**, and beyond. If you're interested, please [contact us](mailto:ynn1999@umd.edu,sixianx@umd.edu,zaoxing@umd.edu).
+
 > **Project Status — research preview.** DMI currently supports HuggingFace
 > and vLLM backends for Qwen3 / Llama3.1 and GPT-2-family experiments, with Ring² transport
 > and optional host-side persistence. APIs may change. Contributions, bug
