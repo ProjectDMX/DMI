@@ -21,12 +21,12 @@ reads from ClickHouse only -- no model loaded, no GPU needed.
 ## Prompt
 
 ```
-When John and Mary went to the store, John gave Mary a
+While John and Mary were working at the office, John gave a notebook to
 ```
 
 The canonical Indirect Object Identification (IOI) prompt.  The model
-has to track that `Mary` already received the action, so the next
-token should be a noun (`gift`, `book`, ...), not another name.
+has to track which name was the indirect object (`Mary`), so the next
+token should be `Mary`.
 
 ## What each plot shows
 

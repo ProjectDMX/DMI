@@ -60,10 +60,15 @@ def _wipe_my_rows(db_host: str, db_port: int, database: str, table: str) -> None
             {"m": MODEL_ID},
         )
     except Exception as exc:
-        msg = str(exc)
-        if "doesn't exist" in msg.lower() or "unknown table" in msg.lower():
+        # Silently return on known "missing table" messages (fresh DB);
+        # warn (but do not abort) on any other failure.
+        msg_lower = str(exc).lower()
+        if any(s in msg_lower for s in ("doesn't exist", "unknown table",
+                                         "could not find table")):
             return
-        raise
+        print(f"[demo] WARNING: pre-insert wipe failed "
+              f"({type(exc).__name__}: {exc}); continuing.",
+              file=sys.stderr, flush=True)
 
 
 def main() -> None:
