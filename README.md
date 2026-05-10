@@ -65,7 +65,8 @@ Captured internals explored in a Jupyter notebook -- attention patterns, residua
 Source under [`example/visualization/`](example/visualization/README.md).  
 
 
-https://github.com/user-attachments/assets/df68bb06-d575-43e3-aed8-b08ca587e81a
+https://github.com/user-attachments/assets/7aaf73ce-a0e4-4953-ba99-dd78dd36ca52
+
 
 
 
