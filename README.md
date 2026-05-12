@@ -9,7 +9,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Seeking Research Collaborations.** We are actively looking for research
+> **Seeking Research and Dev. Collaborations.** We are actively looking for research
 > collaborators to explore downstream applications built on DMI such as **interpretability**, **speculative decoding**,
 > **hallucination analysis**, **distillation**, **activation steering**, and beyond. If you're interested, please [contact us](mailto:ynn1999@umd.edu,sixianx@umd.edu,zaoxing@umd.edu).
 
@@ -22,12 +22,12 @@
 
 ## About
 
-**DMI is an observability layer for LLM inference.** It gives real-time access to
+**DMI is a full-feature observability layer for LLM inference.** It gives real-time access to
 *any* internal model state — residual streams, attention patterns, MLP outputs,
 KV-cache slices, logits — during real serving, with minimal overhead and without
 forking the inference engine.
 
-DMI works in **HuggingFace Transformers** and **vLLM** out of the box, captures
+Right now, DMI works in **HuggingFace Transformers** and **vLLM** out of the box, captures
 internal tensors through CUDA-Graph–compatible hooks, and streams them off the
 GPU via a dedicated ring buffer to a host-side drain that pushes into a
 queryable store (or drops them, for transport-only profiling).
