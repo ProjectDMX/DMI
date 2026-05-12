@@ -53,22 +53,11 @@ Expected submodule paths:
 
 ## 2. Install ClickHouse server
 
-The DB sink writes captured tensors into a ClickHouse table. Install the server
-if you want persistent capture rather than transport-only runs.
+DMI writes captured tensors into a ClickHouse table. Follow the
+[ClickHouse installation guide](https://clickhouse.com/docs/install) for your
+platform.
 
-```bash
-sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
-curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' \
-    | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
-ARCH=$(dpkg --print-architecture)
-echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=${ARCH}] \
-https://packages.clickhouse.com/deb stable main" \
-    | sudo tee /etc/apt/sources.list.d/clickhouse.list
-sudo apt-get update
-sudo apt-get install -y clickhouse-server clickhouse-client
-```
-
-Start the server:
+Start the server and confirm it accepts queries:
 
 ```bash
 sudo systemctl enable --now clickhouse-server
@@ -93,9 +82,32 @@ documentation for the appropriate cleanup procedure.
 
 ## 3. Create the Python environment
 
+Pick one of the two options below.
+
+### 3a. Conda
+
+If conda is not already installed, follow the
+[Miniconda installation guide](https://docs.anaconda.com/miniconda/install/)
+first. Then:
+
 ```bash
 conda env create -f environment.yml
 conda activate proj-dmx
+```
+
+### 3b. venv
+
+Install the Python `venv` module (Ubuntu/Debian):
+
+```bash
+sudo apt install python3-venv
+```
+
+Then create and activate the environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
 ## 4. Install Python packages
