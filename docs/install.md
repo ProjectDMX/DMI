@@ -3,7 +3,7 @@
 Set up DMI from a fresh clone: fetch submodules, install the Python packages,
 build the native backend, and prepare the optional ClickHouse sink.
 
-Tested on Linux + CUDA 12.x + Python 3.10. A CUDA-capable GPU is required because
+Tested on Linux + CUDA 12.x + Python >=3.10. A CUDA-capable GPU is required because
 Ring² is a GPU-resident capture and transport pipeline.
 
 ## 0. System prerequisites
@@ -80,7 +80,7 @@ If captured tensors accumulate and the ClickHouse data directory grows too large
 between runs, you may want to clear old content. Refer to the ClickHouse
 documentation for the appropriate cleanup procedure.
 
-## 3. Create the Python environment
+## 3. Set up the Python environment
 
 Pick one of the two options below.
 
@@ -103,11 +103,12 @@ Install the Python `venv` module (Ubuntu/Debian):
 sudo apt install python3-venv
 ```
 
-Then create and activate the environment:
+Then create the environment, activate it, and install requirements:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ## 4. Install Python packages
