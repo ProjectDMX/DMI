@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hf-prometheus"
-version = "0.1.0"
-description = "LLM monitoring with HuggingFace Transformers"
+name = "DMI"
+version = "1.0.0"
+description = "A decoupled, asynchronous observation substrate for high-speed LLM inference."
 requires-python = ">=3.10"
 dynamic = ["dependencies"]
 
@@ -16,9 +16,19 @@ dependencies = { file = ["requirements.txt"] }
 include-package-data = true
 
 [tool.setuptools.package-data]
-monitoring = ["csrc/*.cpp", "csrc/*.h", "csrc/*.hpp", "Makefile"]
+monitoring = [
+    "csrc/*.cpp",    "csrc/*.h",    "csrc/*.hpp",
+    "csrc/*.cu",     "csrc/*.cuh",
+    "csrc/**/*.cpp", "csrc/**/*.h", "csrc/**/*.hpp",
+    "csrc/**/*.cu",  "csrc/**/*.cuh",
+    "Makefile",
+]
 
 [tool.setuptools.packages.find]
+# `integration` without star: integration/transformers/ and integration/vllm/
+# are vendored git submodules with their own pip installs. Avoiding the star
+# (and the fact that those subdirs lack a top-level __init__.py) keeps the
+# forks out of our wheel.
 include = ["monitoring*", "benchmark*", "integration"]
 
 [tool.pytest.ini_options]

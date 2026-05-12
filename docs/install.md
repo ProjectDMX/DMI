@@ -120,7 +120,9 @@ This may take a while because it is a full vLLM build.
 Build the ClickHouse C++ client:
 
 ```bash
-cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 cmake --build libs/clickhouse-cpp/build -j
 ```
 
