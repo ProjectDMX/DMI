@@ -147,7 +147,15 @@ HuggingFace or vLLM.
 ## Citation
 
 ```bibtex
-% Coming soon.
+@misc{yu2026enablingperformantflexiblemodelinternal,
+      title={Enabling Performant and Flexible Model-Internal Observability for LLM Inference}, 
+      author={Nengneng Yu and Sixian Xiong and Yibo Zhao and Wei Wang and Zaoxing Liu},
+      year={2026},
+      eprint={2605.11093},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2605.11093}, 
+}
 ```
 
 ## License
