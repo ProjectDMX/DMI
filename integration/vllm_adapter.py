@@ -11,11 +11,11 @@ Key pieces:
       ``predict_padded_q_len`` (reads ``cudagraph_dispatcher._bs_to_padded_graph_size``);
       ``build_step_context`` (constructs the packed/flattened
       StepContext from a ``scheduler_output`` + ``model_runner`` pair);
-      ``adapt_for_cpu_direct`` (swaps padded -> unpadded q_len when
-      cpu_direct triggers a force-eager fallback for this batch);
-      ``on_capacity_exceeded`` (sets the ``force_eager_next_batch``
-      flag the worker reads from its ``_determine_batch_execution_and_padding``
-      wrapper);
+      ``adapt_for_cpu_direct`` (swaps padded -> unpadded q_len when an
+      oversize step forces eager dispatch + safety net for this batch);
+      ``on_capacity_exceeded`` (no-op stub; transport.force_eager is
+      owned by adaptor_base.before_forward and read by the
+      ``_determine_batch_execution_and_padding`` wrapper);
       ``_warn_once_capacity`` (per-(total_q, num_reqs) shape warn).
   * ``DMXGPUWorker`` -- ~60-line vLLM ``Worker`` subclass that owns a
     ``VLLMAdaptor`` and delegates per-step work to it.  Architecture
@@ -45,7 +45,6 @@ from monitoring.ring_transport import (
     _compute_hook_shape,
     align_up_py,
     install_ring_hooks,
-    set_cpu_direct,
 )
 from monitoring.selection import (
     apply_hook_selection,
@@ -144,10 +143,10 @@ class VLLMAdaptor(BackendAdaptor):
         super().__init__(engine, model_id)
         self.vllm_config = vllm_config
         self._debug_step: bool = bool(os.environ.get("RING_DEBUG_STEP"))
-        # Set when on_capacity_exceeded fires; read + cleared by the
-        # _determine_batch_execution_and_padding wrapper installed in
-        # DMXGPUWorker.init_device.
-        self.force_eager_next_batch: bool = False
+        # Force-eager state lives on the active transport
+        # (self.transport.force_eager).  Set by on_capacity_exceeded;
+        # read + cleared by the _determine_batch_execution_and_padding
+        # wrapper installed in DMXGPUWorker.init_device.
         # User opt-in; when True, ring transport stays in null mode after
         # warmup (kernels fire as no-ops, FIFO stays empty).
         self.user_wants_null_mode: bool = False
@@ -201,10 +200,11 @@ class VLLMAdaptor(BackendAdaptor):
         return get_pp_group().is_last_rank
 
     def on_capacity_exceeded(self, ctx: StepContext) -> None:
-        # Tell the next call to _determine_batch_execution_and_padding
-        # to force eager for the current batch.  The worker's wrapper
-        # reads + clears this flag.
-        self.force_eager_next_batch = True
+        # No-op.  transport.force_eager is owned by adaptor_base
+        # before_forward (`force_eager = (result == 2) or needs_eager`).
+        # Kept as a framework hook for subclasses that want to react to
+        # overflow events (telemetry, custom logging, etc.).
+        return
 
     def adapt_for_cpu_direct(self, ctx: StepContext) -> StepContext:
         # When the worker forces eager for this batch, the actual
@@ -241,7 +241,8 @@ class VLLMAdaptor(BackendAdaptor):
             reason = f"exceeds pinned staging ({scap / 1e6:.0f} MB)"
         warnings.warn(
             f"[vllm_integration] Step data ({total_bytes / 1e6:.1f} MB) "
-            f"{reason}. Falling back to cpu_direct for {n_hooks} hooks.",
+            f"{reason}. Falling back to eager dispatch + per-hook safety net "
+            f"for {n_hooks} hooks.",
             stacklevel=2,
         )
 
@@ -274,7 +275,7 @@ class VLLMAdaptor(BackendAdaptor):
 
         The returned ``q_len`` is the CUDA-graph-padded total token
         count; ``adapt_for_cpu_direct`` swaps it back to ``total_q`` if
-        the driver's prepare_step triggers cpu_direct.
+        the driver's prepare_step returns code 2 (oversize step).
         """
         total_tokens = scheduler_output.total_num_scheduled_tokens
         if total_tokens == 0:
@@ -488,9 +489,12 @@ class DMXGPUWorker(Worker):
         orig_fn = self.model_runner._determine_batch_execution_and_padding
 
         def _wrapped_determine(*args: Any, **kwargs: Any) -> Any:
-            if adaptor.force_eager_next_batch:
+            # Read-only.  transport.force_eager is owned by
+            # before_forward (per-batch reassignment); clearing here
+            # would hide this batch's force_eager from HookPoint.forward
+            # since the dispatch wrapper fires BEFORE the model forward.
+            if adaptor.transport.force_eager:
                 kwargs["force_eager"] = True
-                adaptor.force_eager_next_batch = False
             return orig_fn(*args, **kwargs)
 
         self.model_runner._determine_batch_execution_and_padding = _wrapped_determine

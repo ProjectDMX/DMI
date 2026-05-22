@@ -27,7 +27,6 @@ _NATIVE_EXPORTS = (
     "RingEngine",
     "ring_set_active_engine",
     "ring_clear_active_engine",
-    "ring_set_cpu_direct",
 )
 
 

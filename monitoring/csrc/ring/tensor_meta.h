@@ -182,13 +182,23 @@ struct StepContext {
     bool                     flattened = false;  // false=HF batched, true=vLLM packed
 };
 
+// Per-hook metadata flag bits.  Packed into TensorMeta::flags.
+//   META_FLAG_ALLOW_MISMATCH -- consumer recomputes dim-0 from the
+//     actual bytes the producer wrote rather than asserting that the
+//     received byte count equals shape's product * elem_size.  Set
+//     when the source HookSpec has allow_token_cnt_mismatch=True
+//     (dynamic-shape EP hooks).
+static constexpr uint8_t META_FLAG_ALLOW_MISMATCH = 1u << 0;
+
 // Per-hook metadata.  No strings -- hook_type + layer_no replace hook_name.
+// flags occupies a padding byte; struct size is unchanged.
 struct TensorMeta {
     int                      hook_type    = 0;   // HookType enum value
     int                      layer_no     = -1;  // -1 for global hooks
     std::vector<int64_t>     shape;
     int                      dtype        = 0;   // at::ScalarType integer value
     bool                     last_in_step = false;
+    uint8_t                  flags        = 0;   // META_FLAG_* bitmask
 };
 
 // Thread-safe dual FIFO for TensorMeta + StepContext.

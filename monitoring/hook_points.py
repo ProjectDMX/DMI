@@ -233,12 +233,41 @@ class HookPoint(nn.Module):
             return x
         if self._name is None or not x.is_cuda:
             return x
-        # No Python transport references — fully torch.compile-serializable.
-        # C++ ring_producer_impl handles all paths:
-        #   g_active_engine == nullptr  -> no-op (monitoring inactive)
-        #   g_cpu_direct == true        -> sync D2H + submit_cpu_direct
-        #   otherwise                   -> launch producer kernel (async D2D)
+
         x_cont = x.contiguous()
+
+        # Eager safety-net path: when the active transport asks for it,
+        # dispatch dynamically based on whether the hook's tensor fits.
+        # CPU knows x_cont.nbytes exactly; no upper-bound math.
+        from . import ring_transport as _rt
+        transport = _rt._active_transport
+        if transport is not None and transport.force_eager:
+            engine = transport._ring_engine
+            if engine is not None:
+                nbytes = x_cont.nbytes
+                if nbytes <= engine.available_capacity():
+                    engine.reserve_one(nbytes)
+                    torch.ops.ring.producer(
+                        x_cont, self._ring_hook_type, self._ring_hook_id)
+                elif nbytes <= engine.payload_cap():
+                    engine.flush_and_wait()
+                    engine.reserve_one(nbytes)
+                    torch.ops.ring.producer(
+                        x_cont, self._ring_hook_type, self._ring_hook_id)
+                else:
+                    # Single tensor larger than the whole ring -- bypass via
+                    # cpu_direct.  Flush first so submit_cpu_direct consumes
+                    # the FIFO meta for THIS hook (prior ring entries finish
+                    # first; this hook's pre-pushed meta becomes the head).
+                    engine.flush_and_wait()
+                    transport.submit_cpu_direct(
+                        x_cont.cpu(),
+                        self._ring_hook_type, self._ring_hook_id)
+                return x_cont
+
+        # Fast path: torch.compile-serializable, CUDA-graph captureable.
+        # C++ ring_producer_impl no-ops when g_active_engine is null
+        # (monitoring inactive) and otherwise launches the producer kernel.
         torch.ops.ring.producer(
             x_cont, self._ring_hook_type, self._ring_hook_id)
         return x_cont

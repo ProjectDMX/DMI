@@ -28,6 +28,15 @@ struct RingState {
     uint64_t    payload_cap;    // capacity in bytes
 
     uint64_t*   payload_head;   // monotonically increasing; producer writes
+
+    // Monotonic counter of actual bytes written by all producer kernels
+    // (sum of src_bytes across every kernel invocation, ever).  Producer
+    // atomicAdd's inside the last-block-arrives section; CPU reads the
+    // value via delta vs a per-engine last_counter_read snapshot.  Used by
+    // prepare_step to reclaim ring space when reservations over-estimate
+    // actual writes (EP upper-bound reservations etc.).  Counter is never
+    // reset -- delta tracking on the CPU side handles wrap-around.
+    uint64_t*   actual_bytes_counter;
 };
 
 }  // namespace ring

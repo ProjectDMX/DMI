@@ -115,6 +115,15 @@ __global__ void producer_kernel(
             *ring.task_head    = task_head + 1;
             *ring.payload_head = ph;
 
+            // Monotonic accumulator of actual bytes written.  No new fence
+            // needed -- the __threadfence() above this section already orders
+            // the D2D stores before any of this metadata-publish work, so a
+            // CPU observer that sees this counter increment also sees the
+            // bytes whose write it accounts for.  Counter is never reset;
+            // CPU side tracks deltas.
+            atomicAdd(reinterpret_cast<unsigned long long*>(ring.actual_bytes_counter),
+                      static_cast<unsigned long long>(src_bytes));
+
             // Reset counter for the next kernel launch on this stream.
             g_block_done_counter = 0;
         }

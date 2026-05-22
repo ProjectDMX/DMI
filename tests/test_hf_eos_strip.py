@@ -31,7 +31,7 @@ from integration.hf_adapter import HFAdaptor
 
 class FakeTransport:
     null_offload = False
-    cpu_direct = False
+    force_eager = False
     _model_cfg = None
     _active_specs: list = []
     _using_forward_hooks = False

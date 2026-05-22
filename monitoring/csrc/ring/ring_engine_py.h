@@ -103,7 +103,10 @@ public:
     // Also resets the internal hook index counter for hook_no_notify.
     static constexpr int STEP_RING_OK      = 0;
     static constexpr int STEP_RING_FLUSHED = 1;
-    static constexpr int STEP_CPU_DIRECT   = 2;
+    // Step's total bytes > ring capacity (or n_hooks > task ring entries):
+    // even an empty ring can't hold it.  Caller falls back to the per-hook
+    // safety net in HookPoint.forward via transport.force_eager = True.
+    static constexpr int STEP_OVERSIZED    = 2;
 
     int prepare_step(uint64_t step_total_bytes, uint32_t num_hooks);
 
@@ -114,6 +117,26 @@ public:
     uint64_t payload_cap() const;
     uint64_t staging_cap() const;
     uint64_t task_cap() const;
+
+    // ---- Runtime queries / actions used by the safety-net branch in
+    //      HookPoint.forward (eager-only path).  Never called during
+    //      CUDA-graph capture or replay.
+
+    // Free bytes in the payload ring not currently reserved and not
+    // pending drain.  CPU-only read.
+    uint64_t available_capacity() const;
+
+    // Per-hook reservation: claim `nbytes` of payload ring + 1 task entry
+    // for an upcoming producer kernel launch.  Used by the safety net
+    // when force_eager is on and the spec is dynamic-shape.  Advances
+    // cpu_payload_head/cpu_task_head atomically.
+    void reserve_one(uint64_t nbytes);
+
+    // Synchronise the current CUDA stream + force drain to process all
+    // outstanding entries.  Blocking; the Python binding releases the
+    // GIL.  Used by safety-net branches that need to free ring space or
+    // ensure FIFO ordering before consuming the next meta out-of-band.
+    void flush_and_wait();
 
 private:
     struct Impl;

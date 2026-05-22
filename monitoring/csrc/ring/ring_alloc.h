@@ -37,8 +37,9 @@ public:
     // Call once on host before the first graph capture.
     void init(cudaStream_t stream = 0) {
         task_ring_init(state_.task_entries, cfg_.task_ring_entries, stream);
-        *state_.task_head    = 0;
-        *state_.payload_head = 0;
+        *state_.task_head           = 0;
+        *state_.payload_head        = 0;
+        *state_.actual_bytes_counter = 0;
         // Trigger page migration: move counter pages to GPU HBM and
         // task_entry pages to CPU RAM, then synchronise.
         int dev = 0;
@@ -46,9 +47,10 @@ public:
         const size_t          entries_sz = cfg_.task_ring_entries * sizeof(TaskEntry);
         const cudaMemLocation gpu_loc    = {cudaMemLocationTypeDevice, dev};
         const cudaMemLocation cpu_loc    = {cudaMemLocationTypeHost,   0};
-        cudaMemPrefetchAsync(state_.task_entries, entries_sz,  cpu_loc, 0, stream);
-        cudaMemPrefetchAsync(state_.task_head,    sizeof(uint64_t), gpu_loc, 0, stream);
-        cudaMemPrefetchAsync(state_.payload_head, sizeof(uint64_t), gpu_loc, 0, stream);
+        cudaMemPrefetchAsync(state_.task_entries,         entries_sz,        cpu_loc, 0, stream);
+        cudaMemPrefetchAsync(state_.task_head,            sizeof(uint64_t),  gpu_loc, 0, stream);
+        cudaMemPrefetchAsync(state_.payload_head,         sizeof(uint64_t),  gpu_loc, 0, stream);
+        cudaMemPrefetchAsync(state_.actual_bytes_counter, sizeof(uint64_t),  gpu_loc, 0, stream);
         chk(cudaDeviceSynchronize(), "cudaDeviceSynchronize after prefetch");
     }
 
@@ -76,8 +78,9 @@ private:
         auto mg = [&](uint64_t** pp, const char* name) {
             chk(cudaMallocManaged(pp, sizeof(uint64_t)), name);
         };
-        mg(&state_.task_head,    "task_head");
-        mg(&state_.payload_head, "payload_head");
+        mg(&state_.task_head,            "task_head");
+        mg(&state_.payload_head,         "payload_head");
+        mg(&state_.actual_bytes_counter, "actual_bytes_counter");
 
         state_.task_cap    = cfg_.task_ring_entries;
         state_.payload_cap = cfg_.payload_ring_bytes;
@@ -99,6 +102,7 @@ private:
         };
         advise_gpu(state_.task_head);
         advise_gpu(state_.payload_head);
+        advise_gpu(state_.actual_bytes_counter);
 
         chk(cudaMemAdvise(state_.task_entries, entries_sz,
                           cudaMemAdviseSetPreferredLocation, cpu_loc),
@@ -113,6 +117,7 @@ private:
         cudaFree(state_.payload_buf);
         cudaFree(state_.task_head);
         cudaFree(state_.payload_head);
+        cudaFree(state_.actual_bytes_counter);
     }
 };
 

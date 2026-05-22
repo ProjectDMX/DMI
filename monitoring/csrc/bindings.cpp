@@ -304,12 +304,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("payload_cap", &ring_py::RingEnginePy::payload_cap)
       .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
       .def("task_cap",    &ring_py::RingEnginePy::task_cap)
+      // Safety-net surface (eager only).  available_capacity() and
+      // reserve_one() are CPU-only and fast -- no GIL release needed.
+      // flush_and_wait() blocks on cudaStreamSynchronize + drain flush --
+      // GIL released so other Python threads aren't blocked.
+      .def("available_capacity", &ring_py::RingEnginePy::available_capacity)
+      .def("reserve_one",
+           &ring_py::RingEnginePy::reserve_one,
+           py::arg("nbytes"))
+      .def("flush_and_wait",
+           &ring_py::RingEnginePy::flush_and_wait,
+           py::call_guard<py::gil_scoped_release>())
       .def("push_all_metas",
            [](ring_py::RingEnginePy& self,
               py::list hook_types_py,
               py::list layer_nos_py,
               py::list shapes_py,
               py::list dtypes_py,
+              py::list flags_py,
               const std::string& model_id,
               int32_t tp_rank,
               int32_t dp_rank,
@@ -350,6 +362,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                    meta.layer_no     = py::cast<int>(layer_nos_py[i]);
                    meta.dtype        = static_cast<int>(dtypes_py[i].cast<at::ScalarType>());
                    meta.last_in_step = (i == n - 1);
+                   meta.flags        = static_cast<uint8_t>(py::cast<int>(flags_py[i]));
                    py::list shape    = shapes_py[i].cast<py::list>();
                    for (auto d : shape)
                        meta.shape.push_back(py::cast<int64_t>(d));
@@ -360,7 +373,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                self.push_step(ctx, metas);
            },
            py::arg("hook_types"), py::arg("layer_nos"),
-           py::arg("shapes"), py::arg("dtypes"),
+           py::arg("shapes"), py::arg("dtypes"), py::arg("flags"),
            py::arg("model_id"),
            py::arg("tp_rank"), py::arg("dp_rank"),
            py::arg("ep_rank"), py::arg("pp_rank"),
@@ -387,8 +400,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("ring_clear_active_engine",
         []() { ring_set_active_engine(nullptr); });
-
-  m.def("ring_set_cpu_direct",
-        [](bool enabled) { ring_set_cpu_direct(enabled); },
-        py::arg("enabled"));
 }

@@ -182,6 +182,27 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     for (auto d : meta.shape) expected_elems *= d;
     int64_t expected_bytes = expected_elems * elem_size;
 
+    // Dynamic-shape hooks (META_FLAG_ALLOW_MISMATCH set): the producer
+    // may have written fewer/more bytes than the CPU shape estimate
+    // predicted (e.g. EP hooks where token count routed to this rank
+    // varies per step).  Recompute dim-0 from the actual bytes using
+    // shape[1:] as the fixed inner shape.  Requires shape.size() >= 2.
+    if (static_cast<uint64_t>(expected_bytes) != first_task.tensor_total_bytes
+        && (meta.flags & ring_py::META_FLAG_ALLOW_MISMATCH)
+        && meta.shape.size() >= 2) {
+        int64_t inner_elems = 1;
+        for (size_t k = 1; k < meta.shape.size(); ++k) inner_elems *= meta.shape[k];
+        int64_t inner_bytes = inner_elems * elem_size;
+        if (inner_bytes > 0
+            && first_task.tensor_total_bytes % static_cast<uint64_t>(inner_bytes) == 0) {
+            meta.shape[0] = static_cast<int64_t>(
+                first_task.tensor_total_bytes / static_cast<uint64_t>(inner_bytes));
+            expected_elems = 1;
+            for (auto d : meta.shape) expected_elems *= d;
+            expected_bytes = expected_elems * elem_size;
+        }
+    }
+
     if (static_cast<uint64_t>(expected_bytes) != first_task.tensor_total_bytes) {
         fprintf(stderr, "[p2p] WARN: shape/bytes mismatch: expected=%ld actual=%lu hook=%s\n",
                 (long)expected_bytes, (unsigned long)first_task.tensor_total_bytes,

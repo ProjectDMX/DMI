@@ -181,6 +181,11 @@ class HookSpec:
     module:    nn.Module                  # the HookPoint instance
     layer_no:  int = -1                   # layer index (-1 for global hooks like embed, final_ln)
     dtype:     Optional[torch.dtype] = None  # override model dtype (e.g. int64 for token_ids)
+    # True when the producer kernel may write fewer (or more) bytes than the
+    # CPU-side shape estimate predicts -- e.g. EP hooks where the token count
+    # routed to this rank varies per step.  Propagated to TensorMeta.flags as
+    # META_FLAG_ALLOW_MISMATCH; consumer recomputes dim-0 from actual bytes.
+    allow_token_cnt_mismatch: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -391,21 +396,20 @@ class RingTransport:
         # Producer kernel still fires (for CUDA graph capture) but as no-ops.
         self.null_offload: bool = False
 
-        # Shared path flag for ALL hooks.  Reset to False at the start of
-        # every pre-forward.  Set to True when the entire step's data exceeds
-        # ring capacity (Case B).  When True, ALL enabled hooks use the
-        # eager .cpu() path for that step.
-        self.cpu_direct: bool = False
+        # When True, HookPoint.forward takes the runtime safety-net branch
+        # instead of the fast path:
+        #   1. fits in current slack       -> reserve_one + ring
+        #   2. fits after flushing the ring -> flush_and_wait + reserve_one + ring
+        #   3. single tensor > ring        -> flush_and_wait + submit_cpu_direct
+        # Owned by adaptor_base.before_forward (per-batch reassignment based
+        # on prepare_step result and dynamic-spec presence).  Consumers
+        # (vLLM dispatch wrapper, HookPoint.forward) read only.
+        self.force_eager: bool = False
 
         # New-path state
         self._model_cfg: Optional[ModelShapeConfig] = None
         self._active_specs: List[HookSpec] = []
         self._using_forward_hooks: bool = False
-
-        # When True, _prepare_wrapper skips prepare_step entirely --
-        # all hooks use cpu_direct for the entire generate() call.
-        # Set by generate_with_monitoring when decode doesn't fit in ring.
-        self._force_cpu_direct: bool = False
 
         # Hook selection preset name (e.g. "full", "hidden-states", "logits").
         # Set by the active adapter before hook installation.
@@ -487,6 +491,7 @@ class RingTransport:
         layer_nos = []
         shapes = []
         dtypes = []
+        flags = []
         for spec in self._active_specs:
             shape = _compute_hook_shape(
                 spec.hook_type, self._model_cfg, batch, q_len, kv_dim,
@@ -504,10 +509,11 @@ class RingTransport:
             layer_nos.append(spec.layer_no)
             shapes.append(shape)
             dtypes.append(dtype)
+            flags.append(1 if spec.allow_token_cnt_mismatch else 0)
 
         if hook_types:
             self._ring_engine.push_all_metas(
-                hook_types, layer_nos, shapes, dtypes,
+                hook_types, layer_nos, shapes, dtypes, flags,
                 self._current_model_id,
                 self._current_tp_rank,
                 self._current_dp_rank,
@@ -522,11 +528,11 @@ class RingTransport:
 
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
                           hook_type: int, hook_id: int) -> None:
-        """Submit a CPU-direct tensor to the drain -> p2p pipeline.
+        """Submit a CPU-tensor to the drain -> p2p pipeline.
 
-        Called from HookPoint.forward() when cpu_direct=True.  The tensor
-        is already in pageable CPU memory; it bypasses the ring and staging
-        entirely.
+        Called from HookPoint.forward()'s safety-net branch when a single
+        tensor exceeds ring capacity.  The tensor is already in pageable
+        CPU memory; it bypasses the ring and staging entirely.
         """
         self._ring_engine.submit_cpu_direct(cpu_tensor)
 
@@ -552,16 +558,6 @@ def deactivate() -> None:
     try:
         from . import _native_engine as _ne
         _ne.ring_clear_active_engine()
-        _ne.ring_set_cpu_direct(False)
-    except Exception:
-        pass
-
-
-def set_cpu_direct(enabled: bool) -> None:
-    """Set/clear the C++ cpu_direct flag for ring_producer_impl."""
-    try:
-        from . import _native_engine as _ne
-        _ne.ring_set_cpu_direct(enabled)
     except Exception:
         pass
 
