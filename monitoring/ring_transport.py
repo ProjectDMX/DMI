@@ -186,6 +186,12 @@ class HookSpec:
     # routed to this rank varies per step.  Propagated to TensorMeta.flags as
     # META_FLAG_ALLOW_MISMATCH; consumer recomputes dim-0 from actual bytes.
     allow_token_cnt_mismatch: bool = False
+    # True when this spec's shape has dim-0 = total_tokens in the framework's
+    # layout (vLLM flat: total_tokens; HF batched: batch * q_len when q_len is
+    # the variable axis).  Adapters that enable a padding-strip mode use this
+    # flag to mark prefix-eligible specs.  Static property; ignored when no
+    # adapter activates strip.
+    dim0_is_actual_tokens: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -206,24 +212,40 @@ try:
     from . import _native_engine as _ne
     _ne._load_extension()  # ensure .so is loaded -> registers ring::producer
 
+    # Three fake impls, one per op.  Void schema; pure side-effect.
     @torch.library.register_fake("ring::producer")
     def _ring_producer_fake(
-        tensor: torch.Tensor, hook_type: int, hook_id: int
+        tensor: torch.Tensor, hook_type: int, hook_id: int,
     ) -> None:
-        # Void schema: op is a pure side-effect (kernel launch), no output.
-        # Marked effectful via _register_effectful_op so FX/inductor cannot DCE
-        # the node even when its return value is unused.
         return None
 
-    # Mark ring::producer as an ordered side-effect so torch.compile/inductor
-    # preserves the node in the FX graph (prevents DCE on [num_users=0] nodes).
+    @torch.library.register_fake("ring::producer_prefix")
+    def _ring_producer_prefix_fake(
+        tensor: torch.Tensor, row_count: torch.Tensor, row_bytes: int,
+        hook_type: int, hook_id: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("ring::producer_chunked")
+    def _ring_producer_chunked_fake(
+        tensor: torch.Tensor, chunk_bytes: torch.Tensor,
+        hook_type: int, hook_id: int,
+    ) -> None:
+        return None
+
+    # Mark all three as ordered side-effects so torch.compile/inductor
+    # preserves the node in the FX graph (prevents DCE on [num_users=0]
+    # nodes).
     try:
         from torch._higher_order_ops.effects import (
             _register_effectful_op, _EffectType,
         )
         _register_effectful_op(
-            torch.ops.ring.producer.default, _EffectType.ORDERED
-        )
+            torch.ops.ring.producer.default, _EffectType.ORDERED)
+        _register_effectful_op(
+            torch.ops.ring.producer_prefix.default, _EffectType.ORDERED)
+        _register_effectful_op(
+            torch.ops.ring.producer_chunked.default, _EffectType.ORDERED)
     except Exception:
         pass  # older PyTorch without _EffectType; effectful path unavailable
 
@@ -469,12 +491,20 @@ class RingTransport:
 
     def pre_push_all_metas(self, batch: int, q_len: int, kv_dim: int,
                            logits_to_keep: int = 0,
-                           token_ids_dtype: Optional[torch.dtype] = None) -> None:
+                           token_ids_dtype: Optional[torch.dtype] = None,
+                           actual_q_len: Optional[int] = None) -> None:
         """Push C++ FIFO metadata for all active specs before orig_forward.
 
         Called in the same order as install_ring_hooks() so FIFO pop order
         in the drain thread matches ring arrival order.
         Requires _model_cfg to be set via set_model_cfg() or enable_ring_transport().
+
+        When ``actual_q_len`` is set AND a spec has
+        ``dim0_is_actual_tokens=True``, the meta's shape uses
+        ``actual_q_len`` in place of ``q_len`` -- so the meta describes
+        the unpadded data the producer will actually write under
+        padding-strip mode.  Other specs and the no-strip case use
+        ``q_len`` (today's behavior).
         """
         if self.null_offload:
             return  # kernel launches happen; metas are intentionally skipped
@@ -493,8 +523,11 @@ class RingTransport:
         dtypes = []
         flags = []
         for spec in self._active_specs:
+            spec_q_len = (actual_q_len if actual_q_len is not None
+                          and spec.dim0_is_actual_tokens
+                          else q_len)
             shape = _compute_hook_shape(
-                spec.hook_type, self._model_cfg, batch, q_len, kv_dim,
+                spec.hook_type, self._model_cfg, batch, spec_q_len, kv_dim,
                 logits_to_keep=logits_to_keep,
             )
             if not shape:

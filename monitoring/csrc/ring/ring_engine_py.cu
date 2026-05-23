@@ -96,26 +96,62 @@ void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
 }
 
 // ---------------------------------------------------------------------------
-// hook_no_notify -- unconditional producer launch.
+// hook_no_notify (3 variants) -- unconditional producer launches.
 //
 // No condition gating.  Space is guaranteed by the pre-forward capacity
-// check in Python.  The kernel just does D2D copy + task_publish.
+// check in Python.  Each variant maps to one torch op.
 // ---------------------------------------------------------------------------
 void RingEnginePy::hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
                                   uint32_t hook_type,
                                   uint64_t stream_handle)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-
-    RING_DBG("[hook_no_notify] idx=%u nbytes=%lu\n",
+    RING_DBG("[hook_no_notify_static] idx=%u nbytes=%lu\n",
             impl_->current_hook_idx, (unsigned long)nbytes);
-
     impl_->current_hook_idx++;
-
-    ring::launch_producer(
+    ring::launch_producer_static(
         impl_->engine.ring_state(),
         reinterpret_cast<const uint8_t*>(d_ptr),
         nbytes, hook_type, stream);
+}
+
+void RingEnginePy::hook_no_notify_prefix(uint64_t d_ptr, uint64_t nbytes_upper,
+                                          uint64_t row_count_dev_ptr,
+                                          uint64_t row_bytes,
+                                          uint32_t hook_type,
+                                          uint64_t stream_handle)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    RING_DBG("[hook_no_notify_prefix] idx=%u nbytes_upper=%lu row_bytes=%lu\n",
+            impl_->current_hook_idx, (unsigned long)nbytes_upper,
+            (unsigned long)row_bytes);
+    impl_->current_hook_idx++;
+    ring::launch_producer_prefix(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr),
+        nbytes_upper,
+        reinterpret_cast<const int64_t*>(row_count_dev_ptr),
+        row_bytes,
+        hook_type, stream);
+}
+
+void RingEnginePy::hook_no_notify_chunked(uint64_t d_ptr, uint64_t nbytes_upper,
+                                           uint64_t chunk_bytes_dev_ptr,
+                                           uint32_t K,
+                                           uint32_t hook_type,
+                                           uint64_t stream_handle)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    RING_DBG("[hook_no_notify_chunked] idx=%u nbytes_upper=%lu K=%u\n",
+            impl_->current_hook_idx, (unsigned long)nbytes_upper, K);
+    impl_->current_hook_idx++;
+    ring::launch_producer_chunked(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr),
+        nbytes_upper,
+        reinterpret_cast<const int64_t*>(chunk_bytes_dev_ptr),
+        K,
+        hook_type, stream);
 }
 
 void RingEnginePy::notify_drain() {

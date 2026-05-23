@@ -71,9 +71,28 @@ public:
 
     // Launch producer kernel unconditionally (no condition gating).
     // Space must be guaranteed by pre-forward capacity check.
+    // Three variants matching the three torch ops.
+
+    // Static: copies all `nbytes`; today's behavior.
     void hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
                         uint32_t hook_type,
                         uint64_t stream_handle);
+
+    // Prefix: reads row_count[0] from device, copies
+    // (row_count[0] * row_bytes) bytes.  Used by ring::producer_prefix.
+    void hook_no_notify_prefix(uint64_t d_ptr, uint64_t nbytes_upper,
+                                uint64_t row_count_dev_ptr,
+                                uint64_t row_bytes,
+                                uint32_t hook_type,
+                                uint64_t stream_handle);
+
+    // Chunked: K>1 chunked-suffix; per-chunk bytes from
+    // chunk_bytes_dev_ptr[K].  Used by ring::producer_chunked.
+    void hook_no_notify_chunked(uint64_t d_ptr, uint64_t nbytes_upper,
+                                 uint64_t chunk_bytes_dev_ptr,
+                                 uint32_t K,
+                                 uint32_t hook_type,
+                                 uint64_t stream_handle);
 
     // Lightweight wake-up for the drain thread.
     void notify_drain();

@@ -182,6 +182,7 @@ class BackendAdaptor(abc.ABC):
             kv_dim=ctx.kv_dim,
             logits_to_keep=ctx.logits_to_keep,
             token_ids_dtype=ctx.token_ids_dtype,
+            actual_q_len=ctx.actual_q_len,
         )
 
     def close(self) -> None:
@@ -207,9 +208,16 @@ class BackendAdaptor(abc.ABC):
         n = 0
         needs_eager = False
         for spec in self.active_specs:
+            # When the adapter has populated actual_q_len AND the spec is
+            # prefix-strip-eligible, size the byte budget for the unpadded
+            # data the producer will actually write.  Other specs and the
+            # no-strip case use ctx.q_len.
+            spec_q_len = (ctx.actual_q_len if ctx.actual_q_len is not None
+                          and spec.dim0_is_actual_tokens
+                          else ctx.q_len)
             shape = _compute_hook_shape(
                 spec.hook_type, self.model_cfg,
-                ctx.batch, ctx.q_len, ctx.kv_dim,
+                ctx.batch, spec_q_len, ctx.kv_dim,
                 logits_to_keep=ctx.logits_to_keep,
             )
             if not shape:

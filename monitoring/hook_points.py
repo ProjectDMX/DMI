@@ -83,6 +83,27 @@ DeviceType = Optional[torch.device]
 _grad_t = Union[tuple[Tensor, ...], Tensor]
 
 
+def _dispatch_producer(
+    x_cont: torch.Tensor,
+    strip_tensor: Optional[torch.Tensor],
+    strip_row_bytes: int,
+    hook_type: int,
+    hook_id: int,
+) -> None:
+    """Dispatch to one of three ring producer ops based on per-HookPoint
+    strip-mode state.  Module-level so torch.compile can specialize the
+    branch per HookPoint without re-tracing the function body.
+    """
+    if strip_tensor is None:
+        torch.ops.ring.producer(x_cont, hook_type, hook_id)
+    elif strip_row_bytes > 0:
+        torch.ops.ring.producer_prefix(
+            x_cont, strip_tensor, strip_row_bytes, hook_type, hook_id)
+    else:
+        torch.ops.ring.producer_chunked(
+            x_cont, strip_tensor, hook_type, hook_id)
+
+
 class HookPoint(nn.Module):
     """
     A helper class to access intermediate activations in a PyTorch model (inspired by Garcon).
@@ -111,6 +132,33 @@ class HookPoint(nn.Module):
         # under CUDA graphs).  Set once before generate() to select which
         # hooks are active.  Changing triggers Dynamo recompilation.
         self.enabled: bool = True
+
+        # Strip-mode state.  Three modes signaled by these two attrs:
+        #   _strip_tensor is None                    -> producer (static)
+        #   _strip_tensor set, _strip_row_bytes > 0  -> producer_prefix
+        #   _strip_tensor set, _strip_row_bytes == 0 -> producer_chunked
+        #
+        # For prefix mode: _strip_tensor is a 1-element int64 device
+        # tensor holding the row count; kernel computes
+        # bytes = row_count[0] * row_bytes.
+        # For chunked mode: _strip_tensor is a K-element int64 device
+        # tensor holding per-chunk byte counts; K = numel.
+        #
+        # CUDA-graph capture contract (caller's responsibility -- not
+        # enforced at runtime):
+        #   * _strip_tensor's data_ptr() and numel() must be stable
+        #     across replays;
+        #   * _strip_row_bytes must be fixed for any captured graph.
+        # Both fixes are natural: they reflect structural properties
+        # tied to the captured shape signature.  Per-step variation
+        # lives in the tensor's *values*, which the kernel re-reads
+        # each replay.
+        #
+        # Set ONCE at attach time + update VALUES in place each step
+        # (via a separate kernel on the same stream as the producer).
+        # Phase 3 / vLLM adapter glue honors this contract.
+        self._strip_tensor: Optional[torch.Tensor] = None
+        self._strip_row_bytes: int = 0
 
     @property
     def name(self) -> Optional[str]:
@@ -239,6 +287,15 @@ class HookPoint(nn.Module):
         # Eager safety-net path: when the active transport asks for it,
         # dispatch dynamically based on whether the hook's tensor fits.
         # CPU knows x_cont.nbytes exactly; no upper-bound math.
+        # Strip-mode dispatch.  Three branches signaled by attrs:
+        #   _strip_tensor is None                    -> producer (static)
+        #   _strip_tensor set, _strip_row_bytes > 0  -> producer_prefix
+        #   _strip_tensor set, _strip_row_bytes == 0 -> producer_chunked
+        # The branch is predictable per HookPoint (set once at attach;
+        # never changes); torch.compile traces only the live branch.
+        strip_t = self._strip_tensor
+        strip_rb = self._strip_row_bytes
+
         from . import ring_transport as _rt
         transport = _rt._active_transport
         if transport is not None and transport.force_eager:
@@ -247,18 +304,21 @@ class HookPoint(nn.Module):
                 nbytes = x_cont.nbytes
                 if nbytes <= engine.available_capacity():
                     engine.reserve_one(nbytes)
-                    torch.ops.ring.producer(
-                        x_cont, self._ring_hook_type, self._ring_hook_id)
+                    _dispatch_producer(x_cont, strip_t, strip_rb,
+                                       self._ring_hook_type, self._ring_hook_id)
                 elif nbytes <= engine.payload_cap():
                     engine.flush_and_wait()
                     engine.reserve_one(nbytes)
-                    torch.ops.ring.producer(
-                        x_cont, self._ring_hook_type, self._ring_hook_id)
+                    _dispatch_producer(x_cont, strip_t, strip_rb,
+                                       self._ring_hook_type, self._ring_hook_id)
                 else:
                     # Single tensor larger than the whole ring -- bypass via
                     # cpu_direct.  Flush first so submit_cpu_direct consumes
                     # the FIFO meta for THIS hook (prior ring entries finish
                     # first; this hook's pre-pushed meta becomes the head).
+                    # The strip is not applied here -- bypass path sends the
+                    # full tensor to the consumer; consumer's CPU-side
+                    # slicing handles request-level demux as today.
                     engine.flush_and_wait()
                     transport.submit_cpu_direct(
                         x_cont.cpu(),
@@ -266,10 +326,10 @@ class HookPoint(nn.Module):
                 return x_cont
 
         # Fast path: torch.compile-serializable, CUDA-graph captureable.
-        # C++ ring_producer_impl no-ops when g_active_engine is null
-        # (monitoring inactive) and otherwise launches the producer kernel.
-        torch.ops.ring.producer(
-            x_cont, self._ring_hook_type, self._ring_hook_id)
+        # C++ ring_producer_* impls no-op when g_active_engine is null
+        # (monitoring inactive); otherwise launch the producer kernel.
+        _dispatch_producer(x_cont, strip_t, strip_rb,
+                           self._ring_hook_type, self._ring_hook_id)
         return x_cont
 
     def layer(self):

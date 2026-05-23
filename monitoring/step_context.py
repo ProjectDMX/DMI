@@ -43,6 +43,14 @@ class StepContext:
     kv_dim:          int = 0
     logits_to_keep:  int = 0
     token_ids_dtype: Optional[torch.dtype] = None
+    # When set, the UNPADDED total-token count for the step (vLLM:
+    # total_q before CUDA-graph padding to q_len; HF: same as q_len
+    # typically).  Used by adapters that enable padding-strip mode:
+    # specs with `dim0_is_actual_tokens=True` substitute this value
+    # for `q_len` in shape / byte-budget computation, so the meta
+    # describes the unpadded data and reservation is sized to actual.
+    # None means today's behavior (use q_len everywhere).
+    actual_q_len:    Optional[int] = None
 
     def transport_kwargs(self) -> dict:
         """Return kwargs accepted by ``RingTransport.set_step_context``."""

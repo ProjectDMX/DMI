@@ -32,16 +32,38 @@ void ring_set_active_engine(ring_py::RingEnginePy* e) {
     g_active_engine = e;
 }
 
-// Side-effect op: launches the producer kernel for an async D2D copy
-// into the ring buffer.  The CPU-side safety net in HookPoint.forward
-// handles the eager fallback for oversize tensors (calls
-// transport.submit_cpu_direct directly).
+// Three side-effect ops, one per use case:
+//
+//   ring::producer(x, hook_type, hook_id)
+//     Static path; copies all of x.nbytes(); today's behavior.
+//
+//   ring::producer_prefix(x, row_count, row_bytes, hook_type, hook_id)
+//     Reads row_count[0] from device at kernel start; copies
+//     row_count[0] * row_bytes bytes from x.  Shared-scalar pattern:
+//     multiple HookPoints may pass the SAME row_count tensor.
+//
+//   ring::producer_chunked(x, chunk_bytes, hook_type, hook_id)
+//     K = chunk_bytes.numel(); source viewed as K equal chunks of
+//     (x.nbytes() / K) bytes each; copies first chunk_bytes[i] bytes
+//     of chunk i, packed contiguously.
+//
+// CUDA-graph capture contract: the chosen op, kernel launch args,
+// and device-pointer args are all baked at trace time.  The *values*
+// at the captured pointers are re-read each replay; the pointers,
+// K, and row_bytes are not.  K and row_bytes being fixed is natural:
+// they reflect structural properties tied to the captured shape
+// signature (any change implies a different shape signature, which
+// would trigger re-capture upstream).  Caller's responsibility to
+// keep tensors at stable addresses with fixed numel.  Not enforced
+// here.
 //
 // Void return + _register_effectful_op prevents DCE at FX level.
-// HookPoint.forward() returns x_cont (not original x) so inductor cannot
-// DCE the .contiguous() copy + producer call for non-contiguous tensors.
+// HookPoint.forward() returns x_cont (not original x) so inductor
+// cannot DCE the .contiguous() copy + producer call for
+// non-contiguous tensors.
 void ring_producer_impl(
-    const at::Tensor& tensor, int64_t hook_type, int64_t hook_id)
+    const at::Tensor& tensor,
+    int64_t hook_type, int64_t hook_id)
 {
     if (!g_active_engine) { return; }
     if (hook_type >= 0 && hook_type < HOST_HOOK_MAX)
@@ -53,15 +75,67 @@ void ring_producer_impl(
             reinterpret_cast<uint64_t>(tensor.data_ptr()),
             static_cast<uint64_t>(tensor.nbytes()),
             static_cast<uint32_t>(hook_type),
-            reinterpret_cast<uint64_t>(stream.stream())
-        );
+            reinterpret_cast<uint64_t>(stream.stream()));
+    }
+}
+
+void ring_producer_prefix_impl(
+    const at::Tensor& tensor,
+    const at::Tensor& row_count,
+    int64_t row_bytes,
+    int64_t hook_type, int64_t hook_id)
+{
+    if (!g_active_engine) { return; }
+    if (hook_type >= 0 && hook_type < HOST_HOOK_MAX)
+        g_host_calls[hook_type].fetch_add(1);
+
+    if (tensor.is_cuda() && tensor.is_contiguous()
+        && row_count.defined() && row_count.is_cuda()) {
+        auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
+        g_active_engine->hook_no_notify_prefix(
+            reinterpret_cast<uint64_t>(tensor.data_ptr()),
+            static_cast<uint64_t>(tensor.nbytes()),
+            reinterpret_cast<uint64_t>(row_count.data_ptr()),
+            static_cast<uint64_t>(row_bytes),
+            static_cast<uint32_t>(hook_type),
+            reinterpret_cast<uint64_t>(stream.stream()));
+    }
+}
+
+void ring_producer_chunked_impl(
+    const at::Tensor& tensor,
+    const at::Tensor& chunk_bytes,
+    int64_t hook_type, int64_t hook_id)
+{
+    if (!g_active_engine) { return; }
+    if (hook_type >= 0 && hook_type < HOST_HOOK_MAX)
+        g_host_calls[hook_type].fetch_add(1);
+
+    if (tensor.is_cuda() && tensor.is_contiguous()
+        && chunk_bytes.defined() && chunk_bytes.is_cuda()) {
+        const uint32_t K = static_cast<uint32_t>(chunk_bytes.numel());
+        if (K == 0) return;
+        auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
+        g_active_engine->hook_no_notify_chunked(
+            reinterpret_cast<uint64_t>(tensor.data_ptr()),
+            static_cast<uint64_t>(tensor.nbytes()),
+            reinterpret_cast<uint64_t>(chunk_bytes.data_ptr()),
+            K,
+            static_cast<uint32_t>(hook_type),
+            reinterpret_cast<uint64_t>(stream.stream()));
     }
 }
 
 TORCH_LIBRARY(ring, m) {
     m.def("producer(Tensor x, int hook_type, int hook_id) -> ()");
+    m.def("producer_prefix(Tensor x, Tensor row_count, int row_bytes, "
+          "int hook_type, int hook_id) -> ()");
+    m.def("producer_chunked(Tensor x, Tensor chunk_bytes, "
+          "int hook_type, int hook_id) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(ring, CUDA, m) {
-    m.impl("producer", ring_producer_impl);
+    m.impl("producer",         ring_producer_impl);
+    m.impl("producer_prefix",  ring_producer_prefix_impl);
+    m.impl("producer_chunked", ring_producer_chunked_impl);
 }

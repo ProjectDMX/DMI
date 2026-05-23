@@ -138,7 +138,8 @@ class VLLMAdaptor(BackendAdaptor):
     """
 
     def __init__(
-        self, engine: Any, model_id: str, vllm_config: Any
+        self, engine: Any, model_id: str, vllm_config: Any,
+        *, gpu_padding_strip: bool = True,
     ) -> None:
         super().__init__(engine, model_id)
         self.vllm_config = vllm_config
@@ -155,6 +156,18 @@ class VLLMAdaptor(BackendAdaptor):
         self._last_total_q: int = 0
         # vLLM step counter (debug logging only).
         self._step_counter: int = 0
+        # gpu_padding_strip mode: when True, the producer copies only
+        # actual_q_len * row_bytes per eligible hook (instead of the
+        # full padded captured tensor).  Default False = today's
+        # behavior verbatim.  When True, attach_model allocates the
+        # shared row_count tensor pair and wires each eligible
+        # HookPoint's _strip_tensor + _strip_row_bytes; build_step_context
+        # populates ctx.actual_q_len; before_forward does the per-step
+        # 8-byte cudaMemcpyAsync of the new actual_q_len.
+        self.gpu_padding_strip: bool = gpu_padding_strip
+        self._row_count_dev: Optional[torch.Tensor] = None      # 1 int64 on GPU
+        self._pinned_row_count: Optional[torch.Tensor] = None   # 1 int64 pinned host
+        self._strip_eligible_hps: List[Any] = []                # for inspection
 
     # ------- abstract overrides ---------------------------------------
 
@@ -369,7 +382,82 @@ class VLLMAdaptor(BackendAdaptor):
             kv_dim=0,
             logits_to_keep=num_reqs,
             token_ids_dtype=ids_dtype,
+            # In gpu_padding_strip mode, eligible specs use this for shape
+            # + reservation; non-eligible specs and gpu_padding_strip=False
+            # ignore (None).
+            actual_q_len=(total_q if self.gpu_padding_strip else None),
         )
+
+    # ----- gpu_padding_strip integration -----
+
+    def attach_model(self, model: Any, hook_selection: str = "full") -> None:
+        """Standard attach, plus gpu_padding_strip pool setup when enabled.
+
+        When `gpu_padding_strip=True`, allocate one shared int64[1] device
+        tensor (`_row_count_dev`) and one pinned-host counterpart.  For
+        every active spec with `dim0_is_actual_tokens=True`, point the
+        HookPoint's `_strip_tensor` at the shared tensor and bake its
+        per-spec `_strip_row_bytes` (CPU-known constant).  Every step
+        we update the shared tensor's value in place (see
+        before_forward); each HookPoint's captured producer_prefix
+        call reads the freshly-written value and multiplies by its
+        baked row_bytes.
+        """
+        super().attach_model(model, hook_selection)
+        if not self.gpu_padding_strip:
+            return
+        device = next(model.parameters()).device if hasattr(model, "parameters") else "cuda"
+        self._row_count_dev    = torch.empty(1, dtype=torch.int64, device=device)
+        self._pinned_row_count = torch.empty(1, dtype=torch.int64, pin_memory=True)
+        for spec in self.active_specs:
+            if not spec.dim0_is_actual_tokens:
+                continue
+            hp = spec.module
+            rb = _row_bytes_for_spec(spec, self.model_cfg)
+            if rb <= 0:
+                continue
+            hp._strip_tensor    = self._row_count_dev
+            hp._strip_row_bytes = rb
+            self._strip_eligible_hps.append(hp)
+
+    def before_forward(self, *raw) -> None:
+        """Standard driver, plus per-step memcpy when gpu_padding_strip=True."""
+        super().before_forward(*raw)
+        if (self.gpu_padding_strip
+                and self._pinned_row_count is not None
+                and self._row_count_dev is not None
+                and self._last_total_q > 0):
+            # CPU: write the current step's actual_q_len to pinned host.
+            # GPU: enqueue an async copy to the shared device scalar on
+            # the model stream (captureable; values propagate to replays).
+            self._pinned_row_count[0] = self._last_total_q
+            self._row_count_dev.copy_(self._pinned_row_count, non_blocking=True)
+
+
+def _row_bytes_for_spec(spec, model_cfg) -> int:
+    """Bytes-per-token for `spec`'s shape under vLLM flat layout.
+
+    Computed as prod(shape_excluding_total_tokens) * elem_size where
+    the shape comes from _compute_hook_shape with batch=0, q_len=1.
+    The "1" stands in for "one token's worth"; the result is the
+    per-token byte stride.  Returns 0 if the spec produces an empty
+    shape (skip).
+    """
+    shape = _compute_hook_shape(
+        spec.hook_type, model_cfg, batch=0, q_len=1, kv_dim=0,
+        logits_to_keep=0,
+    )
+    if not shape:
+        return 0
+    # In flat mode, dim-0 of the spec's shape IS the token count.
+    # shape[0] should be 1 here (since we passed q_len=1); the
+    # remaining dims times elem_size = bytes per token.
+    nelem = 1
+    for d in shape[1:]:
+        nelem *= d
+    dtype = spec.dtype if spec.dtype is not None else model_cfg.dtype
+    elem_size = torch._utils._element_size(dtype)
+    return int(nelem) * int(elem_size)
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +560,14 @@ class DMXGPUWorker(Worker):
 
         # Build the adaptor.  Hooks aren't installed yet -- that
         # happens in load_model after the model is materialized.
-        self.adaptor = VLLMAdaptor(engine, resolved_model_id, self.vllm_config)
+        # gpu_padding_strip is on by default; flip it off via
+        # additional_config["dmx_gpu_padding_strip"]=False or
+        # DMX_GPU_PADDING_STRIP=0 if needed for debugging.
+        gpu_padding_strip = _cfg(
+            ac, "dmx_gpu_padding_strip", "DMX_GPU_PADDING_STRIP", True)
+        self.adaptor = VLLMAdaptor(
+            engine, resolved_model_id, self.vllm_config,
+            gpu_padding_strip=bool(gpu_padding_strip))
         self.adaptor.user_wants_null_mode = bool(null_mode)
         if null_mode:
             self.adaptor.transport.null_offload = True
