@@ -12,7 +12,7 @@ import os
 import sys
 import tempfile
 
-os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "0")
 
 import torch
 
