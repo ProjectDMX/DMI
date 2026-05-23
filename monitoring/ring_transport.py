@@ -118,38 +118,21 @@ del _ext, _load_ext
 
 
 # ---------------------------------------------------------------------------
-# Hook-name -> hook_type helpers (auto-derived from HOOK_DEFS act_name)
+# Hook-type -> short-name map (shared, derived from HOOK_DEFS).  Used for
+# debug labels (logs, NVTX ranges, error messages).  Not part of any
+# dispatch path -- kernel hook_type values come from HookSpec, never from
+# string parsing.
 # ---------------------------------------------------------------------------
 
-# act_name is the suffix used in HookPoint names (e.g. "attn.hook_q", "token_ids")
-_HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {_act: _id for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS}
+HOOK_TYPE_TO_SHORT_NAME: Dict[int, str] = {
+    _id: _short
+    for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS
+}
 
 
 def align_up_py(x: int, a: int) -> int:
     """Python equivalent of ring::align_up (a must be a power of 2)."""
     return (x + a - 1) & ~(a - 1)
-
-
-def _hook_type_from_name(hook_name: str) -> int:
-    for suffix, htype in _HOOK_SUFFIX_TO_TYPE.items():
-        if hook_name == suffix or hook_name.endswith("." + suffix):
-            return htype
-    return 0
-
-
-def _layer_no_from_name(hook_name: str) -> int:
-    """Extract layer index from 'blocks.N.xxx' or 'layers.N.xxx', returns -1 for global hooks."""
-    parts = hook_name.split(".")
-    if len(parts) >= 2 and parts[0] in ("blocks", "layers"):
-        try:
-            return int(parts[1])
-        except ValueError:
-            pass
-    return -1
-
-
-# Keep old name as alias for callers that still use it (HookPoint sets _ring_hook_id)
-_hook_id_from_name = _layer_no_from_name
 
 
 # ---------------------------------------------------------------------------
@@ -213,41 +196,35 @@ try:
     _ne._load_extension()  # ensure .so is loaded -> registers ring::producer
 
     # Three fake impls, one per op.  Void schema; pure side-effect.
+    # `ring_payload` is the shared `Tensor(a!)` mutation alias -- a view
+    # of the engine's GPU payload buffer.  AOT autograd tracks the
+    # mutation; successive producer calls form a real R/W chain through
+    # this shared tensor, which prevents inductor from DCE-ing the op
+    # AND from reordering successive producer launches relative to one
+    # another.  No `_register_effectful_op` needed -- the alias is a
+    # stronger guarantee than the effect-token hint.
     @torch.library.register_fake("ring::producer")
     def _ring_producer_fake(
-        tensor: torch.Tensor, hook_type: int, hook_id: int,
+        ring_payload: torch.Tensor, tensor: torch.Tensor,
+        hook_type: int, hook_id: int,
     ) -> None:
         return None
 
     @torch.library.register_fake("ring::producer_prefix")
     def _ring_producer_prefix_fake(
-        tensor: torch.Tensor, row_count: torch.Tensor, row_bytes: int,
+        ring_payload: torch.Tensor, tensor: torch.Tensor,
+        row_count: torch.Tensor, row_bytes: int,
         hook_type: int, hook_id: int,
     ) -> None:
         return None
 
     @torch.library.register_fake("ring::producer_chunked")
     def _ring_producer_chunked_fake(
-        tensor: torch.Tensor, chunk_bytes: torch.Tensor,
+        ring_payload: torch.Tensor, tensor: torch.Tensor,
+        chunk_bytes: torch.Tensor,
         hook_type: int, hook_id: int,
     ) -> None:
         return None
-
-    # Mark all three as ordered side-effects so torch.compile/inductor
-    # preserves the node in the FX graph (prevents DCE on [num_users=0]
-    # nodes).
-    try:
-        from torch._higher_order_ops.effects import (
-            _register_effectful_op, _EffectType,
-        )
-        _register_effectful_op(
-            torch.ops.ring.producer.default, _EffectType.ORDERED)
-        _register_effectful_op(
-            torch.ops.ring.producer_prefix.default, _EffectType.ORDERED)
-        _register_effectful_op(
-            torch.ops.ring.producer_chunked.default, _EffectType.ORDERED)
-    except Exception:
-        pass  # older PyTorch without _EffectType; effectful path unavailable
 
     del _ne
 except Exception:
@@ -374,18 +351,21 @@ def _compute_hook_shape(
 # Forward-hook installation
 # ---------------------------------------------------------------------------
 
-def install_ring_hooks(specs: List[HookSpec]) -> None:
-    """Set up HookPoints for ring transport.
+def install_ring_hooks(specs: List[HookSpec],
+                       ring_payload: Optional[torch.Tensor] = None) -> None:
+    """Bind HookPoints to ring transport.
 
-    Sets _name, _ring_hook_type, _ring_hook_id on each HookPoint so
-    HookPoint.forward() fires torch.ops.ring.producer.
+    Idempotent: overwrites `_ring_hook_type` / `_ring_hook_id` /
+    `_ring_payload` on each HookPoint from its spec + the engine's
+    shared payload-view tensor.  Until this runs (and for any HookPoint
+    not listed in `specs`), `_ring_hook_type is None` and
+    HookPoint.forward() short-circuits without firing the producer.
     """
     for spec in specs:
         hp = spec.module
-        if hasattr(hp, '_name') and hp._name is None:
-            hp._name = f"hook_{spec.hook_type}_{spec.layer_no}"
-            hp._ring_hook_type = spec.hook_type
-            hp._ring_hook_id = spec.layer_no
+        hp._ring_hook_type = spec.hook_type
+        hp._ring_hook_id = spec.layer_no
+        hp._ring_payload = ring_payload
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +381,14 @@ class RingTransport:
 
     def __init__(self, ring_engine: Any) -> None:
         self._ring_engine = ring_engine
+
+        # Cached torch.Tensor view of the engine's GPU payload buffer.
+        # Used as the shared `Tensor(a!)` mutation alias passed to every
+        # producer op call.  Same physical memory across hooks ->
+        # successive producer calls form a real R/W chain in the FX
+        # graph, which inductor cannot reorder.  Pinned at engine init;
+        # the data_ptr is stable across cudagraph replays.
+        self._ring_payload: torch.Tensor = ring_engine.payload_tensor()
 
         # Current step context -- set before each forward pass
         self._current_model_id: Optional[str] = None

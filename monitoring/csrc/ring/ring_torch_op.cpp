@@ -61,7 +61,18 @@ void ring_set_active_engine(ring_py::RingEnginePy* e) {
 // HookPoint.forward() returns x_cont (not original x) so inductor
 // cannot DCE the .contiguous() copy + producer call for
 // non-contiguous tensors.
+// `ring_payload` is declared `Tensor(a!)` (mutated) in the schema and
+// is the same tensor (a view of the engine's GPU payload buffer) for
+// every producer call from the same engine.  The annotation gives AOT
+// autograd a real R/W dependency between successive producer calls,
+// which inductor must preserve -- preventing the kernel-launch reorder
+// observed under HF's `CompileConfig(mode="reduce-overhead",
+// fullgraph=False)` decode compile.  The impl doesn't need to touch
+// `ring_payload`; the kernel reaches the same memory via
+// `g_active_engine`, so the annotation truthfully describes the
+// effect.
 void ring_producer_impl(
+    const at::Tensor& /*ring_payload*/,
     const at::Tensor& tensor,
     int64_t hook_type, int64_t hook_id)
 {
@@ -80,6 +91,7 @@ void ring_producer_impl(
 }
 
 void ring_producer_prefix_impl(
+    const at::Tensor& /*ring_payload*/,
     const at::Tensor& tensor,
     const at::Tensor& row_count,
     int64_t row_bytes,
@@ -103,6 +115,7 @@ void ring_producer_prefix_impl(
 }
 
 void ring_producer_chunked_impl(
+    const at::Tensor& /*ring_payload*/,
     const at::Tensor& tensor,
     const at::Tensor& chunk_bytes,
     int64_t hook_type, int64_t hook_id)
@@ -127,11 +140,13 @@ void ring_producer_chunked_impl(
 }
 
 TORCH_LIBRARY(ring, m) {
-    m.def("producer(Tensor x, int hook_type, int hook_id) -> ()");
-    m.def("producer_prefix(Tensor x, Tensor row_count, int row_bytes, "
+    m.def("producer(Tensor(a!) ring_payload, Tensor x, "
           "int hook_type, int hook_id) -> ()");
-    m.def("producer_chunked(Tensor x, Tensor chunk_bytes, "
+    m.def("producer_prefix(Tensor(a!) ring_payload, Tensor x, "
+          "Tensor row_count, int row_bytes, "
           "int hook_type, int hook_id) -> ()");
+    m.def("producer_chunked(Tensor(a!) ring_payload, Tensor x, "
+          "Tensor chunk_bytes, int hook_type, int hook_id) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(ring, CUDA, m) {

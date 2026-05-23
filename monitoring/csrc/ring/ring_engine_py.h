@@ -137,6 +137,14 @@ public:
     uint64_t staging_cap() const;
     uint64_t task_cap() const;
 
+    // Return a torch.Tensor view of the GPU payload buffer (uint8,
+    // length = payload_cap()).  No copy, no ownership transfer -- the
+    // buffer continues to be owned by the engine.  Used as the
+    // `Tensor(a!)` mutation alias passed to every producer op call,
+    // which gives AOT autograd a real R/W dependency that prevents
+    // inductor from reordering successive producer launches.
+    at::Tensor payload_tensor() const;
+
     // ---- Runtime queries / actions used by the safety-net branch in
     //      HookPoint.forward (eager-only path).  Never called during
     //      CUDA-graph capture or replay.

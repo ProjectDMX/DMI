@@ -304,6 +304,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("payload_cap", &ring_py::RingEnginePy::payload_cap)
       .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
       .def("task_cap",    &ring_py::RingEnginePy::task_cap)
+      .def("payload_tensor", &ring_py::RingEnginePy::payload_tensor)
       // Safety-net surface (eager only).  available_capacity() and
       // reserve_one() are CPU-only and fast -- no GIL release needed.
       // flush_and_wait() blocks on cudaStreamSynchronize + drain flush --

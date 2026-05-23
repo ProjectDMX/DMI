@@ -143,7 +143,7 @@ class BackendAdaptor(abc.ABC):
         specs = filter_by_pp_rank(specs, self.is_pp_first(), self.is_pp_last())
         specs = filter_by_tp_rank(specs, tp)
 
-        install_ring_hooks(specs)
+        install_ring_hooks(specs, ring_payload=self.transport._ring_payload)
         self.active_specs = specs
         self.transport._active_specs = specs
         self.transport._using_forward_hooks = True

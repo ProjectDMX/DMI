@@ -33,9 +33,22 @@ struct RingEnginePy::Impl {
     // device tensor at execution time and the CPU can't know it upfront.
     uint64_t         last_counter_read{0};
 
+    // Cached torch.Tensor view of the payload buffer.  Built once at
+    // engine init; returned by payload_tensor().  Used as the
+    // Tensor(a!) mutation alias passed to every producer op call.
+    at::Tensor       payload_view;
+
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
-    {}
+    {
+        const auto& state = engine.ring_state();
+        int dev_idx = 0;
+        cudaGetDevice(&dev_idx);
+        payload_view = at::from_blob(
+            state.payload_buf,
+            {static_cast<int64_t>(state.payload_cap)},
+            at::TensorOptions().dtype(at::kByte).device(at::kCUDA, dev_idx));
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -240,6 +253,10 @@ uint64_t RingEnginePy::staging_cap() const {
 
 uint64_t RingEnginePy::task_cap() const {
     return impl_->engine.task_cap();
+}
+
+at::Tensor RingEnginePy::payload_tensor() const {
+    return impl_->payload_view;
 }
 
 // ---------------------------------------------------------------------------
