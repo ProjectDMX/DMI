@@ -16,6 +16,7 @@ from vllm.v1.worker.gpu_worker import Worker
 _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2RefLMHeadModel",
     "Qwen3ForCausalLM": "Qwen3RefForCausalLM",
+    "Qwen2MoeForCausalLM": "Qwen2MoeRefForCausalLM",
 }
 
 

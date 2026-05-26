@@ -19,12 +19,14 @@ from vllm.v1.worker.gpu_worker import Worker
 
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
+    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B",
 }
 
 _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2RefLMHeadModel",
+    "Qwen2MoeForCausalLM": "Qwen2MoeRefForCausalLM",
     "Qwen3ForCausalLM": "Qwen3RefForCausalLM",
     "LlamaForCausalLM": "LlamaRefForCausalLM",
 }
@@ -95,11 +97,12 @@ def main():
             print(f"[vllm_logprob_runner] prompt[{i}]: {p!r}", flush=True)
 
     tp_size = int(os.environ.get("E2E_TP_SIZE", "1"))
-
     kwargs = dict(
         model=model_id,
         dtype=model_dtype,
         max_model_len=int(os.environ.get("E2E_MAX_MODEL_LEN", "512")),
+        max_num_batched_tokens=int(
+            os.environ.get("E2E_MAX_NUM_BATCHED_TOKENS", "512")),
         max_logprobs=-1,
         enforce_eager=enforce_eager,
         gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.5")),
@@ -169,11 +172,12 @@ def main():
                 print(f"  stored[{i}]: tokens={len(tids)} logprobs=None",
                       flush=True)
 
-    # Flush DMI per-worker (no-op if RefLogprobWorker is in use).
-    try:
-        llm.collective_rpc("stop_monitoring")
-    except Exception:
-        pass
+    # Flush DMI workers explicitly only for the monitored path.
+    if args.monitored:
+        try:
+            llm.collective_rpc("stop_monitoring")
+        except Exception:
+            pass
     del llm
     torch.cuda.empty_cache()
 

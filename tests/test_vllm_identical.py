@@ -15,6 +15,7 @@ Environment variables:
   E2E_DTYPE             Model dtype, e.g. "bfloat16", "float16", "auto" (default "bfloat16")
   E2E_HOOKS             Hook selection (default "vllm-full")
   E2E_REF_MAX_LEN       Max first-dim for buffers (default 8192)
+  E2E_MAX_NUM_BATCHED_TOKENS  vLLM scheduler max_num_batched_tokens (default 512)
   E2E_RING_PAYLOAD_MB   Ring payload size (default 4096)
   E2E_RING_PINNED_MB    Pinned staging size (default 4096)
   E2E_HOOK_SELECTION    Hook selection for monitored run (default "vllm-full")
@@ -41,6 +42,7 @@ import torch
 
 _MODEL_REF_FILES = {
     "gpt2": "gpt2_ref.py",
+    "qwen2_moe": "qwen2_moe_ref.py",
     "qwen3": "qwen3_ref.py",
     "llama": "llama_ref.py",
 }
@@ -68,7 +70,12 @@ def test_vllm_identical(subtests):
 
     keep_artifacts = os.environ.get("E2E_KEEP_ARTIFACTS", "0") == "1"
     dump_compiled = os.environ.get("E2E_DUMP_COMPILED", "0") == "1"
-    run_dir = tempfile.mkdtemp(prefix="vllm_identical_")
+    artifact_dir = os.environ.get("E2E_ARTIFACT_DIR")
+    if artifact_dir:
+        run_dir = os.path.abspath(artifact_dir)
+        os.makedirs(run_dir, exist_ok=True)
+    else:
+        run_dir = tempfile.mkdtemp(prefix="vllm_identical_")
     ref_dir = os.path.join(run_dir, "ref")
     mon_dir = os.path.join(run_dir, "mon")
     config_file = os.path.join(ref_dir, "ref_config.json")

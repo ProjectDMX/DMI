@@ -56,6 +56,12 @@ def _make_model_shape_from_hf_config(
     if dtype is None:
         dtype = torch.float16
     vocab_size = getattr(cfg, "vocab_size", 0) or 0
+    num_experts = getattr(cfg, "num_experts", 0) or 0
+    top_k = (
+        getattr(cfg, "num_experts_per_tok", None)
+        or getattr(cfg, "top_k", None)
+        or 0
+    )
     intermediate_dim = (
         getattr(cfg, "intermediate_size", None)
         or getattr(cfg, "n_inner", None)
@@ -72,6 +78,8 @@ def _make_model_shape_from_hf_config(
         dtype=dtype,
         vocab_size=int(vocab_size),
         intermediate_dim=int(intermediate_dim),
+        num_experts=int(num_experts),
+        top_k=int(top_k),
         tp_size=1,
         tp_rank=0,
     )

@@ -239,6 +239,9 @@ def main():
         "final_ln": "hook_final_ln",
         "final_logits": "final_logits",
         "token_ids": "token_ids",
+        "router_logits": "blocks.mlp.hook_router_logits",
+        "topk_ids": "blocks.mlp.hook_topk_ids",
+        "topk_weights": "blocks.mlp.hook_topk_weights",
     }
 
     # Scan ref directory for .pt files

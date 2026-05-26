@@ -149,6 +149,8 @@ class ModelShapeConfig:
     dtype:        torch.dtype
     vocab_size:   int = 0  # required for final_logits shape
     intermediate_dim: int = 0  # MLP intermediate size (for mlp_post shape)
+    num_experts:  int = 0  # router_logits final dim
+    top_k:        int = 0  # topk_ids / topk_weights final dim
     tp_size:      int = 1  # tensor parallel world size
     tp_rank:      int = 0  # this rank's TP index
 
@@ -324,6 +326,12 @@ def _compute_hook_shape(
         if cfg.intermediate_dim == 0:
             return []  # intermediate_dim unknown -- skip this hook
         return b + [q_len, cfg.intermediate_dim // tp]
+    if hook_type == HOOK_TYPE_ROUTER_LOGITS:
+        return (b + [q_len, cfg.num_experts]) if cfg.num_experts > 0 else []
+    if hook_type == HOOK_TYPE_TOPK_IDS:
+        return (b + [q_len, cfg.top_k]) if cfg.top_k > 0 else []
+    if hook_type == HOOK_TYPE_TOPK_WEIGHTS:
+        return (b + [q_len, cfg.top_k]) if cfg.top_k > 0 else []
     if hook_type == HOOK_TYPE_TOKEN_IDS:
         return b + [q_len]
     if hook_type == HOOK_TYPE_FINAL_LOGITS:

@@ -243,6 +243,7 @@ _HF_RUNNER = dedent("""
     MODEL_ALIASES = {
         'gpt2': 'gpt2',
         'qwen3': 'Qwen/Qwen3-0.6B',
+        'qwen2_moe': 'Qwen/Qwen1.5-MoE-A2.7B',
         'llama': 'meta-llama/Llama-3.1-8B',
     }
     hf_id = MODEL_ALIASES[args.model_key]
@@ -262,6 +263,8 @@ _HF_RUNNER = dedent("""
         # file before launching this subprocess and unpatches after.
         if args.model_key == 'qwen3':
             from transformers.models.qwen3_compare.modeling_qwen3 import CompareQwen3ForCausalLM as model_cls
+        elif args.model_key == 'qwen2_moe':
+            from transformers.models.qwen2_moe_compare.modeling_qwen2_moe import CompareQwen2MoeForCausalLM as model_cls
         elif args.model_key == 'gpt2':
             from transformers.models.gpt2_compare.modeling_gpt2 import CompareGPT2LMHeadModel as model_cls
         elif args.model_key == 'llama':
@@ -280,6 +283,8 @@ _HF_RUNNER = dedent("""
     elif args.rollout == 'ours':
         if args.model_key == 'qwen3':
             from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM as model_cls
+        elif args.model_key == 'qwen2_moe':
+            from transformers.models.qwen2_moe_p.modeling_qwen2_moe import HookedQwen2MoeForCausalLM as model_cls
         elif args.model_key == 'gpt2':
             from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel as model_cls
         else:
@@ -369,7 +374,11 @@ _VLLM_RUNNER = dedent("""
     args = ap.parse_args()
     assert args.framework == 'vllm'
 
-    MODEL_ALIASES = {'gpt2': 'gpt2', 'qwen3': 'Qwen/Qwen3-0.6B'}
+    MODEL_ALIASES = {
+        'gpt2': 'gpt2',
+        'qwen3': 'Qwen/Qwen3-0.6B',
+        'qwen2_moe': 'Qwen/Qwen1.5-MoE-A2.7B',
+    }
     model_name = MODEL_ALIASES[args.model_key]
 
     llm_kwargs = dict(

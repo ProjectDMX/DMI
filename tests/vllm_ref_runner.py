@@ -17,6 +17,7 @@ import torch
 
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
+    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B",
 }
@@ -44,6 +45,8 @@ def main():
         dtype=model_dtype,
         worker_cls="tests.ref_disk_worker.RefDiskWorker",
         max_model_len=int(os.environ.get("E2E_MAX_MODEL_LEN", "512")),
+        max_num_batched_tokens=int(
+            os.environ.get("E2E_MAX_NUM_BATCHED_TOKENS", "512")),
         enforce_eager=enforce_eager,
         gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.5")),
         tensor_parallel_size=tp_size,

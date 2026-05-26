@@ -111,6 +111,7 @@ def normalize_vllm_request_id(req_id: str) -> str:
 # Architecture remap so vLLM's registry resolves to the hooked variant.
 _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2PLMHeadModel",
+    "Qwen2MoeForCausalLM": "Qwen2MoePForCausalLM",
     "Qwen3ForCausalLM": "Qwen3PForCausalLM",
     "LlamaForCausalLM": "LlamaPForCausalLM",
 }
