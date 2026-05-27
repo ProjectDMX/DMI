@@ -92,6 +92,9 @@ at much lower request rates.
 Full setup, additional results, and how to reproduce:
 [`docs/benchmarks.md`](docs/benchmarks.md).
 
+Comparison with vLLM's Extract Hidden States feature (PR #33736):
+[`docs/dmi_vllm_ehs/dmi-vs-ehs.md`](docs/dmi_vllm_ehs/dmi-vs-ehs.md).
+
 ## Get started
 
 Start with the [installation guide](docs/install.md), then choose the
