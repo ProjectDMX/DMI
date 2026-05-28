@@ -73,6 +73,14 @@ https://github.com/user-attachments/assets/7aaf73ce-a0e4-4953-ba99-dd78dd36ca52
 
 ## Performance
 
+> [!NOTE]
+> **New: DMI vs. vLLM Hidden State Extraction.** vLLM recently added a native
+> way to save hidden states. We benchmarked it against DMI on Qwen3-4B prefill:
+> DMI captures about **13× more tensor data per token** while keeping extraction
+> overhead **15–17× lower** at batch sizes 16–32 in a matched extraction-only
+> setup. Read the full comparison:
+> [`docs/dmi_vllm_ehs/dmi-vs-ehs.md`](docs/dmi_vllm_ehs/dmi-vs-ehs.md).
+
 **Offline throughput** — Qwen3-4B / Llama-3.1-8B / Qwen3-14B on ShareGPT and
 WildChat, normalized to vanilla HuggingFace (ideal, no observation = 1.0).
 Red × = out of memory.
