@@ -1,5 +1,7 @@
 # Inside the model: comparing DMI and vLLM's Extract Hidden States
 
+*From DMI Team: Special thanks to two brilliant UMD undergrads, Jalal Ahmad and Fahran Bajaj, for the detailed benchmark.*
+
 *A look at two recent systems for pulling internal tensors out of a running LLM, and what the performance gap looks like in practice.*
 
 ## Summary
@@ -7,7 +9,6 @@
 - We benchmarked **DMI** against vLLM's **Extract Hidden States** feature (PR #33736, in vLLM ≥0.18) on Qwen3-4B running on a single NVIDIA A100.
 - At a typical production batch size (≥16), **DMI adds only 2–3% prefill overhead** while capturing roughly **13× more tensor data per token** than EHS in the matched configuration.
 - EHS as shipped costs **47–77% of prefill throughput** depending on batch size. About half of that gap is the synchronous safetensors disk write; the other half is the dummy-draft-model machinery itself.
-- DMI is the more general system. EHS is narrower but easier to drop into a stock vLLM install.
 
 ## Why we ran this
 
@@ -88,25 +89,13 @@ DMI takes the opposite design stance: the ring buffer is asynchronous to the for
 
 *Impact of the safetensors disk write on EHS prefill throughput across batch sizes. The "standard" line is EHS as shipped; the "no-write" line is the same run with the `safetensors.save_file()` call commented out in the connector.*
 
-## Things that surprised us along the way
-
-A few notes from actually running both systems on UMD's Zaratan Cluster:
-
-- **DMI may take more work to set up but is simpler to run.** Once the env is built, DMI is one flag in vLLM's `--worker-cls` plus a small `additional_config` dict. Building the env, though, was a project of its own, mostly due to cluster reasons — DMI has tight version pins and we ended up source-building vLLM 0.17 on Zaratan. EHS does the opposite: it drops into a stock `vllm-openai` Apptainer image, but enabling it requires stacking two nested config objects (a speculative-decoding config and a KV transfer config).
-
-- **The two systems target different vLLM versions, so they can't share an env.** DMI pins to vLLM 0.17; EHS needs ≥0.18. We ran each in its own environment and combined the CSVs offline.
-
-- **Both systems hit the same FlashAttention floor.** Neither can capture the full attention-score matrix because the fused kernel never writes it to GPU global memory. This is a ceiling for any observability tool that wants to live inside a production serving engine — you'd have to give up FlashAttention to get raw attention scores.
-
-- **EHS's "no-write" mode required us to fork the connector.** vLLM exposes `KVConnector` as an extension point, but the only one that ships bundles transport with the blocking disk write. For the matched-storage comparison we had to subclass it and comment out the `safetensors.save_file` call. DMI's `dmx_null_mode=True` flag does the equivalent in zero user-side code.
-
 ## Try it yourself
 
 The benchmark scripts (DMI side, EHS side, sbatch wrappers, results CSVs, and a `diagnose_env.sh` for sanity-checking the DMI build) are in [JalalA984/dmi-vllm-ehs](https://github.com/JalalA984/dmi-vllm-ehs). You'll need an A100 (or anything else that fits Qwen3-4B), a CUDA 12.x toolchain — the source-build of vLLM 0.17 may be slow. Each script has a header explaining what it does and any gotchas.
 
-A more in-depth writeup with the full feature comparison and methodology lives in our class report (Contact us).
+A more in-depth writeup with the full feature comparison and methodology lives in our class report ([Contact us](mailto:jahmad1@terpmail.umd.edu,fbajaj@terpmail.umd.edu)). 
 
-## Contributors
+## Contributors of this benchmark
 
 - **Jalal Ahmad** (jahmad1@terpmail.umd.edu) — DMI-side benchmarking
 
