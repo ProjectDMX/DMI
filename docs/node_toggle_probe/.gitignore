@@ -1,0 +1,4 @@
+# Compiled probe binaries — rebuild with the nvcc line in each .cu header / README.
+probe
+probe_dr
+*.o

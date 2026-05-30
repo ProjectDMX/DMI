@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ring² Node-Toggle — Implementation Plan (diagram + change map + phased plan)</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --panel:#ffffff; --panel2:#f0f2f5; --ink:#1a1d23; --mut:#5a6473;
+    --line:#e4e7ec; --accent:#2563eb; --green:#15994f; --amber:#b87514; --red:#d23838;
+    --violet:#7c4dd6; --gpu:#2563eb; --host:#7c4dd6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft Yahei",sans-serif}
+  .wrap{max-width:1160px;margin:0 auto;padding:36px 24px 90px}
+  h1{font-size:28px;margin:0 0 6px}
+  h2{font-size:21px;margin:46px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{font-size:16px;margin:22px 0 8px}
+  .sub{color:var(--mut);font-size:14px;margin:0 0 4px}
+  code{background:#eef0f3;padding:1px 6px;border-radius:5px;font-size:12.5px;color:#2b3242;border:1px solid #e1e4e9}
+  .muted{color:var(--mut)}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin:14px 0 4px;font-size:13px}
+  .tag{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11.5px;font-weight:600;vertical-align:middle}
+  .t-ok{background:rgba(21,153,79,.12);color:var(--green);border:1px solid rgba(21,153,79,.4)}
+  .t-new{background:rgba(184,117,20,.12);color:var(--amber);border:1px solid rgba(184,117,20,.4)}
+  .t-block{background:rgba(210,56,56,.10);color:var(--red);border:1px solid rgba(210,56,56,.4)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0;box-shadow:0 1px 3px rgba(16,24,40,.06)}
+  .grid{display:grid;gap:14px}
+  .g2{grid-template-columns:1fr 1fr}
+  .g3{grid-template-columns:1fr 1fr 1fr}
+  @media(max-width:900px){.g2,.g3{grid-template-columns:1fr}}
+  table{width:100%;border-collapse:collapse;margin:8px 0;font-size:13.5px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--mut);font-weight:600;font-size:12.5px}
+  .note{font-size:12.5px;color:var(--mut);border-left:3px solid #d6dae1;padding:2px 0 2px 12px;margin:10px 0}
+  .foot{margin-top:30px;font-size:12px;color:var(--mut)}
+  ul{margin:6px 0 6px;padding-left:20px}
+  li{margin:4px 0}
+  .file{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#1d6fd6}
+
+  /* ---- dataflow diagram ---- */
+  .lane{border-radius:12px;padding:14px 16px;margin:12px 0;position:relative}
+  .lane-gpu{background:linear-gradient(180deg,rgba(37,99,235,.06),rgba(37,99,235,.015));border:1px solid rgba(37,99,235,.30)}
+  .lane-host{background:linear-gradient(180deg,rgba(124,77,214,.06),rgba(124,77,214,.015));border:1px solid rgba(124,77,214,.30)}
+  .lane-title{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;margin-bottom:10px}
+  .lane-gpu .lane-title{color:#1d4ed8}
+  .lane-host .lane-title{color:#6d3bc4}
+  .row{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap}
+  .box{background:#ffffff;border:1px solid var(--line);border-radius:9px;padding:10px 12px;min-width:120px;flex:1;position:relative;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+  .box .bt{font-size:13px;font-weight:600;margin-bottom:3px}
+  .box .bd{font-size:11.5px;color:var(--mut);line-height:1.45}
+  .box .bf{display:block;margin-top:6px;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:#3576c4;word-break:break-all}
+  .arr{display:flex;align-items:center;justify-content:center;color:var(--accent);font-size:22px;font-weight:700;min-width:22px}
+  .badge{position:absolute;top:-9px;right:-7px;font-size:11px;padding:1px 7px;border-radius:20px;font-weight:700}
+  .b-ok{background:#d9f3e4;color:#147a41;border:1px solid rgba(21,153,79,.5)}
+  .b-new{background:#fbeed3;color:#9a6210;border:1px solid rgba(184,117,20,.5)}
+  .b-block{background:#fadcdc;color:#b62f2f;border:1px solid rgba(210,56,56,.5)}
+  .box.ann-ok{border-color:rgba(21,153,79,.55);box-shadow:0 0 0 1px rgba(21,153,79,.12) inset,0 1px 2px rgba(16,24,40,.05)}
+  .box.ann-new{border-color:rgba(184,117,20,.55);box-shadow:0 0 0 1px rgba(184,117,20,.12) inset,0 1px 2px rgba(16,24,40,.05)}
+  .box.ann-block{border-color:rgba(210,56,56,.55);box-shadow:0 0 0 1px rgba(210,56,56,.12) inset,0 1px 2px rgba(16,24,40,.05)}
+
+  /* FIFO alignment strip */
+  .align{display:grid;grid-template-columns:120px 1fr;gap:8px;align-items:center;margin:6px 0}
+  .align .lab{font-size:11.5px;color:var(--mut);text-align:right}
+  .slots{display:flex;gap:6px;flex-wrap:wrap}
+  .slot{width:46px;height:34px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;border:1px solid var(--line);font-variant-numeric:tabular-nums}
+  .slot.p{background:rgba(37,99,235,.10);border-color:rgba(37,99,235,.40);color:#1d4ed8}
+  .slot.m{background:rgba(124,77,214,.10);border-color:rgba(124,77,214,.40);color:#6d3bc4}
+  .slot.gap{background:rgba(210,56,56,.07);border-color:rgba(210,56,56,.40);color:#c33;border-style:dashed}
+  .matchline{height:14px;display:flex;gap:6px}
+  .matchline span{width:46px;text-align:center;color:var(--green);font-size:12px}
+
+  .pill{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .kbig{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+  .efS{color:#147a41} .efM{color:#9a6210} .efL{color:#b62f2f}
+  .gate{background:rgba(21,153,79,.07);border:1px dashed rgba(21,153,79,.45);border-radius:8px;padding:8px 12px;margin:8px 0;font-size:12.5px}
+  .gate b{color:#147a41}
+  .phase{border:1px solid var(--line);border-radius:12px;padding:0;margin:16px 0;overflow:hidden;background:var(--panel);box-shadow:0 1px 3px rgba(16,24,40,.06)}
+  .phase .ph-head{padding:12px 16px;background:var(--panel2);display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-bottom:1px solid var(--line)}
+  .phase .ph-head .n{font-size:18px;font-weight:700}
+  .phase .ph-body{padding:14px 16px}
+  .chip{font-size:11px;padding:2px 9px;border-radius:20px;font-weight:600;border:1px solid var(--line)}
+  .chip.s{background:rgba(21,153,79,.10);color:#147a41;border-color:rgba(21,153,79,.4)}
+  .chip.m{background:rgba(184,117,20,.10);color:#9a6210;border-color:rgba(184,117,20,.4)}
+  .chip.l{background:rgba(210,56,56,.09);color:#b62f2f;border-color:rgba(210,56,56,.4)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Ring² Node-Toggle — Implementation Plan</h1>
+  <p class="sub">Wiring runtime selection of which producer nodes fire inside an already-captured CUDA graph (<code>cudaGraphNodeSetEnabled</code>) into the Ring² pipeline. This document is a <strong>design / plan</strong>; it does not modify any existing source.</p>
+  <p class="sub">Branch <code>feature/dmi_kernel_node_toggle</code> · based on the completed investigation in <span class="file">docs/node_toggle_investigation_report.md</span> + the validated probe (<span class="file">docs/node_toggle_probe/probe_dualring_toggle.cu</span>)</p>
+  <div class="legend">
+    <span><span class="tag t-ok">✅ Verified</span> measured by the probe on RTX 4090, or already present in current code</span>
+    <span><span class="tag t-new">⚙️ New code needed</span> the parts to be written</span>
+    <span><span class="tag t-block">⛔ blocker</span> not achievable with the current structure / sticking point</span>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- PART 1 -->
+  <!-- ================================================================= -->
+  <h2>1 · How current Ring² works (intuitive diagram)</h2>
+  <p class="muted" style="margin-top:0">In a single forward step, <strong>two lanes advance in parallel and must stay aligned</strong>: the GPU data lane (blue) moves tensor bytes, and the host metadata lane (violet) moves shape/dtype/req information. The two lanes are finally rejoined by the p2p thread <strong>by FIFO position (the i-th payload ↔ the i-th meta)</strong> — this is the linchpin of the entire mechanism.</p>
+
+  <!-- GPU data lane -->
+  <div class="lane lane-gpu">
+    <div class="lane-title">⬢ GPU data lane (inside the captured CUDA graph, firing per-hook in order)</div>
+    <div class="row">
+      <div class="box ann-ok">
+        <span class="badge b-ok">Captured as a fixed node</span>
+        <div class="bt">HookPoint.forward</div>
+        <div class="bd"><code>nn.Module</code> inserted into the forward graph; calls <code>torch.ops.ring.producer(x,type,id)</code> (marked ORDERED to prevent Inductor DCE)</div>
+        <span class="bf">monitoring/hook_points.py · csrc/ring/ring_torch_op.cpp</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box">
+        <div class="bt">producer_kernel</div>
+        <div class="bd">Multi-block grid-stride D2D copy into the payload ring; the <strong>last block</strong> reads <code>*task_head</code>/<code>*payload_head</code> at runtime and <strong>advances them itself</strong> + publishes one TaskEntry</div>
+        <span class="bf">csrc/ring/producer.cu:61(null early-return),96-117(head advance + publish)</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box">
+        <div class="bt">Payload ring + Task/Meta ring</div>
+        <div class="bd">payload = byte ring; task = ring of 64B <code>TaskEntry</code>. Publish protocol: write fields → <code>__threadfence</code> → write <code>ready_seq=seq_no</code> (publish gate, SENTINEL = not yet published)</div>
+        <span class="bf">payload_ring.cuh · task_ring.cuh · task_entry.h</span>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div class="box">
+        <div class="bt">Drain thread</div>
+        <div class="bd">Polls the task ring (<code>task_cpu_ready</code>: <code>ready_seq==tail</code>), does batched D2H into pinned staging, pushes a DrainTask to p2p</div>
+        <span class="bf">csrc/ring/drain_thread.cpp(scan_ready/enqueue_d2h/submit_to_p2p)</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box">
+        <div class="bt">Pinned staging</div>
+        <div class="bd">Pinned-memory staging area; drain writes, p2p reads, then <code>notify_staging_freed_bytes</code> reclaims</div>
+        <span class="bf">csrc/ring/pinned_staging.*</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box ann-ok">
+        <span class="badge b-ok">Rejoin point</span>
+        <div class="bt">P2P thread</div>
+        <div class="bd">pinned→pageable; <strong>per payload, calls <code>fifo_.pop(meta)</code> to fetch metadata</strong>; slices by req → <code>submit_fn_</code></div>
+        <span class="bf">csrc/ring/p2p_thread.cpp:122(process),158(do_post_processing)</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Host metadata lane -->
+  <div class="lane lane-host">
+    <div class="lane-title">⬡ Host metadata lane (pure CPU, same order as forward, not in the graph)</div>
+    <div class="row">
+      <div class="box">
+        <div class="bt">set_step_context</div>
+        <div class="bd">Before each step, provides model_id / req_ids / token_ranges / dim0_offsets / flattened …</div>
+        <span class="bf">ring_transport.py:559-598</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box ann-ok">
+        <span class="badge b-ok">Already symmetric with null_mode</span>
+        <div class="bt">pre_push_all_metas</div>
+        <div class="bd">For each <code>_active_specs</code>, parses shape/dtype and pushes <strong>in install order</strong>. Note: <code>if self.null_offload: return</code> — under null_mode the meta is skipped too, keeping host/device symmetric and avoiding desync</div>
+        <span class="bf">ring_transport.py:604(fn),613-614(null gate),647(push_all_metas)</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box">
+        <div class="bt">TensorMetaFifo</div>
+        <div class="bd">host <code>std::deque&lt;TensorMeta&gt;</code> + <code>deque&lt;StepContext*&gt;</code>. <code>push_step</code> enqueues; the p2p side <code>pop</code>/<code>pop_context</code> dequeues</div>
+        <span class="bf">csrc/ring/tensor_meta.h:124-156</span>
+      </div>
+      <div class="arr" style="font-size:16px">↘ popped by p2p</div>
+    </div>
+  </div>
+
+  <!-- FIFO alignment crux -->
+  <div class="panel">
+    <h3 style="margin-top:0">The linchpin: positional FIFO alignment (the i-th payload ↔ the i-th meta)</h3>
+    <p class="muted" style="font-size:12.5px;margin:0 0 8px"><code>p2p_thread.cpp:158</code> pairs the i-th drained payload with the i-th <code>fifo_.pop(meta)</code>; the only guard is the byte-count check at <code>:185</code> — it only catches a desync by chance when adjacent shapes differ, so <strong>adjacent same-size entries will be silently mismatched</strong>.</p>
+    <div class="align">
+      <div class="lab">GPU payload (task ring)</div>
+      <div class="slots">
+        <div class="slot p">P0</div><div class="slot p">P1</div><div class="slot p">P2</div><div class="slot p">P3</div><div class="slot p">P4</div>
+      </div>
+    </div>
+    <div class="align">
+      <div class="lab"></div>
+      <div class="slots matchline"><span>‖</span><span>‖</span><span>‖</span><span>‖</span><span>‖</span></div>
+    </div>
+    <div class="align">
+      <div class="lab">Host meta (FIFO)</div>
+      <div class="slots">
+        <div class="slot m">M0</div><div class="slot m">M1</div><div class="slot m">M2</div><div class="slot m">M3</div><div class="slot m">M4</div>
+      </div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:8px 0 0"><span class="pill" style="background:var(--green)"></span>Today both lanes are always equal-length (both push the full set), so position i is naturally aligned. This is the invariant that toggle must break, yet must preserve.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- PART 2 -->
+  <!-- ================================================================= -->
+  <h2>2 · What changes when toggle is added (change map)</h2>
+  <p class="muted" style="margin-top:0">The same diagram, annotated with the fate of each component. In one sentence: <strong>the device side is proven by the probe to be naturally compatible (disabling a node leaves no hole; the ring closes up automatically)</strong>; what actually needs writing is the <em>host-side lockstep</em> and <em>obtaining node handles</em>.</p>
+
+  <!-- GPU lane annotated -->
+  <div class="lane lane-gpu">
+    <div class="lane-title">⬢ GPU data lane — change annotations</div>
+    <div class="row">
+      <div class="box ann-block">
+        <span class="badge b-block">⛔ handle</span>
+        <div class="bt">graph node handle</div>
+        <div class="bd">To toggle, you must obtain the producer node's <code>cudaGraphNode_t</code>. Both HF/torch.compile and vLLM <strong>own the graph themselves</strong>; DMI currently holds no <code>cudaGraphExec_t</code>/node handle. This is the real blocker.</div>
+        <span class="bf">vllm_integration.py(DMXGPUWorker); HF uses CompileConfig reduce-overhead</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box ann-ok">
+        <span class="badge b-ok">✅ no change</span>
+        <div class="bt">producer_kernel</div>
+        <div class="bd">The kernel body needs <strong>zero changes</strong>. The head is advanced by the kernel itself at runtime, so a disabled node never touches the head and the next node writes the next slot — the ring closes up automatically, no holes. The probe ran 50 random reconfigs with zero corruption.</div>
+        <span class="bf">producer.cu:96-117(structurally compatible, proven)</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box ann-ok">
+        <span class="badge b-ok">✅ no change</span>
+        <div class="bt">Payload / Task ring</div>
+        <div class="bd">The ring protocol is unchanged; after disabling a subset the remaining entries are still contiguous, gap-free, with correct offsets, and <code>payload_head == #published×ALLOC</code>.</div>
+        <span class="bf">task_ring.cuh / payload_ring.cuh</span>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div class="box ann-ok">
+        <span class="badge b-ok">✅ no change</span>
+        <div class="bt">Drain + Staging</div>
+        <div class="bd">Only looks at <code>ready_seq</code> contiguity; after disabling, what it sees is simply a shorter contiguous sequence, logic unchanged.</div>
+        <span class="bf">drain_thread.cpp</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box ann-new">
+        <span class="badge b-new">⚙️ node→hook map</span>
+        <div class="bt">node→hook map</div>
+        <div class="bd"><code>cudaGraphGetNodes()</code> <strong>does not guarantee enumeration order</strong>. The probe's approach: enable single nodes one by one, observe which producer-id publishes, and build an explicit <code>node↦(hook_type,layer)</code> map. New code must replicate this.</div>
+        <span class="bf">new: build the map after graph capture (see probe_dualring_toggle.cu)</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box ann-ok">
+        <span class="badge b-ok">✅ no change</span>
+        <div class="bt">P2P thread</div>
+        <div class="bd">Still pops a meta per payload. <strong>Provided the two lanes remain equal-length</strong> — which pushes the burden onto the host lane.</div>
+        <span class="bf">p2p_thread.cpp:158</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Host lane annotated -->
+  <div class="lane lane-host">
+    <div class="lane-title">⬡ Host metadata lane — change annotations</div>
+    <div class="row">
+      <div class="box ann-new">
+        <span class="badge b-new">⚙️ enabled-set state</span>
+        <div class="bt">toggle list state</div>
+        <div class="bd">A new host-side "node switch table": on/off for each captured node. Flipped at step boundaries. Must share <strong>the same state</strong> as the meta-push below.</div>
+        <span class="bf">new: ring_engine_py.{cu,h} + bindings.cpp (exposed like set_null_mode)</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box ann-new">
+        <span class="badge b-new">⚙️ lockstep gate (core)</span>
+        <div class="bt">pre_push_all_metas</div>
+        <div class="bd"><strong>Push meta only for currently enabled nodes</strong>. The existing global <code>null_offload</code> gate must be upgraded to a <em>per-spec</em> enabled check. This is the one new critical invariant: the host meta set == the device enabled set.</div>
+        <span class="bf">change: ring_transport.py:604-659 (add per-spec enabled filter)</span>
+      </div>
+      <div class="arr">→</div>
+      <div class="box ann-ok">
+        <span class="badge b-ok">✅ no change</span>
+        <div class="bt">TensorMetaFifo</div>
+        <div class="bd">The deque itself is unchanged; only the number enqueued varies with the enabled set (it gets shorter).</div>
+        <span class="bf">tensor_meta.h</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Desync illustration + granularity -->
+  <div class="grid g2">
+    <div class="panel" style="margin-top:8px">
+      <h3 style="margin-top:0">⛔ What happens if you skip lockstep</h3>
+      <p class="muted" style="font-size:12px;margin:0 0 6px">The producer for node 2 is disabled, but the host still pushes the full set M0..M4 → everything from the 3rd onward is shifted (an off-by-N cascade), and the size check only saves you occasionally.</p>
+      <div class="align"><div class="lab">payload (P2 missing)</div>
+        <div class="slots"><div class="slot p">P0</div><div class="slot p">P1</div><div class="slot gap">∅</div><div class="slot p">P3</div><div class="slot p">P4</div></div></div>
+      <div class="align"><div class="lab">meta (still full set)</div>
+        <div class="slots"><div class="slot m">M0</div><div class="slot m">M1</div><div class="slot m">M2</div><div class="slot m">M3</div><div class="slot m">M4</div></div></div>
+      <p class="muted" style="font-size:12px;margin:8px 0 0">P3 gets paired with M2, P4 with M3 … all wrong. <strong>The fix</strong>: the host also pushes only the enabled ones → both sides become {M0,M1,M3,M4}, and positions realign.</p>
+    </div>
+    <div class="panel" style="margin-top:8px">
+      <h3 style="margin-top:0">Granularity: what can / cannot be done</h3>
+      <table>
+        <tr><th>Granularity</th><th>Feasible?</th></tr>
+        <tr><td>Global (equivalent to null_mode but actually saves launches)</td><td><span class="tag t-ok">✅</span></td></tr>
+        <tr><td>per-hook-type</td><td><span class="tag t-ok">✅</span></td></tr>
+        <tr><td>per-layer</td><td><span class="tag t-ok">✅</span></td></tr>
+        <tr><td>per-step (flip the whole batch)</td><td><span class="tag t-ok">✅</span></td></tr>
+        <tr><td><strong>per-request heterogeneous</strong></td><td><span class="tag t-block">⛔ not possible</span></td></tr>
+      </table>
+      <p class="muted" style="font-size:12px;margin:6px 0 0">Graph nodes are <strong>shared by the batch</strong>: a node is either on or off for the entire batch. per-request needs a different design (a per-request mask inside the kernel) and is <strong>not part of this plan</strong>.</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3 style="margin-top:0">Cost (measured by the probe, RTX 4090, 16×1MB)</h3>
+    <div class="grid g3">
+      <div><div class="kbig efS">0.19 µs</div><div class="muted" style="font-size:12px"><code>cudaGraphNodeSetEnabled</code>/call, <strong>no re-instantiate</strong></div></div>
+      <div><div class="kbig efS">−98.1%</div><div class="muted" style="font-size:12px">all-on 183.6µs → all-disabled 3.4µs; true-disable saves another ~0.6µs/node over null_mode (the launch itself)</div></div>
+      <div><div class="kbig efL">100s µs–ms</div><div class="muted" style="font-size:12px">⛔ the cost of a <code>cudaGraphInstantiate</code> rebuild — this path <strong>deliberately avoids it</strong></div></div>
+    </div>
+    <p class="note">Full-set flips scale linearly at ~0.2µs/node (16 nodes 3.1µs, 145 nodes 30.3µs). Adaptive only touches a few nodes = (#changed)×0.2µs.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- PART 3 -->
+  <!-- ================================================================= -->
+  <h2>3 · Concrete implementation plan (phased, ordered)</h2>
+  <p class="muted" style="margin-top:0">Principle: <strong>first establish the lockstep discipline on the HF path (where DMI can control its own graph), then tackle the real blocker of vLLM handles</strong>. The device side is already de-risked, so the engineering focus is host lockstep + handle acquisition. Each phase lists: files touched, validation gate, effort (S/M/L), and risk.</p>
+
+  <!-- Phase 0 -->
+  <div class="phase">
+    <div class="ph-head">
+      <span class="n">Phase 0</span><span>Standalone node-toggle test target</span>
+      <span class="chip s">Effort S</span><span class="chip s">Risk low</span>
+    </div>
+    <div class="ph-body">
+      <ul>
+        <li>Add a <code>test_node_toggle</code> target (and the missing <code>test_null_mode</code>) to <span class="file">tests/ring/Makefile</span> — the current Makefile only has <code>test_rings / test_producer / test_ring_engine</code>; <span class="file">tests/ring/test_null_mode.cu</span> already exists but has <strong>no target</strong>.</li>
+        <li>Distill the core of the probe (<span class="file">docs/node_toggle_probe/probe_dualring_toggle.cu</span>) into a repeatable CI unit test: link the real <code>ring::producer_kernel</code> + <code>AllocatedRing</code>, capture N producer nodes, disable a subset, and assert that the task ring is contiguous/gap-free with correct offsets.</li>
+        <li>While at it, turn the probe's <strong>node→producer-id mapping</strong> (enabling each node one by one to build the table) into a reusable helper — Phase 2 will use it.</li>
+      </ul>
+      <div class="gate"><b>Gate:</b> Pass the probe-level assertions on H100 (50 random reconfigs, zero corruption), reproducing the 4090 conclusion. Files: <span class="file">tests/ring/Makefile</span>, new <span class="file">tests/ring/test_node_toggle.cu</span>.</div>
+      <p class="note">Do NOT do: any host/Python plumbing; this phase only locks down the device primitive on the target hardware.</p>
+    </div>
+  </div>
+
+  <!-- Phase 1 -->
+  <div class="phase">
+    <div class="ph-head">
+      <span class="n">Phase 1</span><span>HF-path prototype — DMI owns the graph + lockstep meta gate (core proof)</span>
+      <span class="chip m">Effort M</span><span class="chip m">Risk medium</span>
+    </div>
+    <div class="ph-body">
+      <p style="margin-top:0">Goal: in an environment where DMI can control the graph, prove end-to-end the §2 discipline "host meta set == device enabled set", with data + correctness flowing through drain/p2p to submit_fn.</p>
+      <ul>
+        <li><strong>1a · Obtain node handles.</strong> HF currently goes through torch.compile <code>CompileConfig(mode="reduce-overhead")</code>'s cudagraph_trees (<span class="file">monitoring/generate.py:519,604</span>), and DMI likewise does not directly hold the raw graph. The Phase 1 tradeoff: in the HF prototype, switch to a <strong>DMI-owned explicit <code>cudaGraph_t</code> capture</strong> (begin/end capture + instantiate around the producer launch ourselves) in order to obtain the <code>cudaGraphNode_t</code>. This is a "sandbox" environment; it is not required to merge with HF's compile path.</li>
+        <li><strong>1b · enabled-set + real toggle.</strong> Maintain an enabled set in the prototype and call <code>cudaGraphNodeSetEnabled</code> to flip it between replays.</li>
+        <li><strong>1c · lockstep meta gate (the key change).</strong> Upgrade the global <code>null_offload</code> gate at <span class="file">ring_transport.py:613-614</span> into a <strong>per-spec enabled check</strong>: inside the <code>pre_push_all_metas</code> loop, <code>if not enabled(spec): continue</code>, pushing meta only for currently enabled nodes.</li>
+        <li><strong>1d · End-to-end alignment verification.</strong> Reuse the mechanism in <span class="file">tests/test_e2e_correctness_vs_hf.py</span>: all-on → disable a subset (while the host skips the same subset) → assert that (a) disabled hooks produce nothing, (b) the remaining hooks' <code>act_name</code>/<code>layer_no</code>/shape are all aligned, (c) after re-enabling, the full set realigns.</li>
+      </ul>
+      <div class="gate"><b>Gate:</b> Multiple flips within a single run, with zero warnings from the p2p-side <code>:185</code> size-check and per-hook-correct content landed in ClickHouse. This proves the lockstep discipline holds.</div>
+      <p class="note">Do NOT do: vLLM integration; do not try to modify HF's compile path itself. This phase is only to "prove the discipline under a controllable graph".</p>
+    </div>
+  </div>
+
+  <!-- Phase 2 -->
+  <div class="phase">
+    <div class="ph-head">
+      <span class="n">Phase 2</span><span>Toggle-List API surface — host state + bindings + explicit node↦hook map</span>
+      <span class="chip m">Effort M</span><span class="chip s">Risk low-medium</span>
+    </div>
+    <div class="ph-body">
+      <ul>
+        <li><strong>Expose the API, mirroring the <code>set_null_mode</code> chain.</strong> The device flag chain is <code>producer.cu:21 set_ring_null_mode</code> → <span class="file">ring_engine_py.cu:93</span> → <span class="file">bindings.cpp:482</span>. Add the matching toggle-list interface: <code>set_node_enabled(node_idx,bool)</code> / <code>set_enabled_mask(...)</code>, exposed to Python via <span class="file">ring_engine_py.{cu,h}</span> + <span class="file">bindings.cpp</span>, with <code>gil_scoped_release</code> (same as set_null_mode).</li>
+        <li><strong>The node→hook map must be explicit.</strong> Because <code>cudaGraphGetNodes()</code> does not guarantee order, use the Phase 0 helper: after capture, enable single nodes one by one, observe the published producer-id, and build a <code>node_idx ↦ (hook_type, layer_no)</code> mapping table as the index basis for the toggle list.</li>
+        <li><strong>Single source of truth.</strong> The enabled set is shared by two places: the device-side <code>cudaGraphNodeSetEnabled</code> and the host-side <code>pre_push_all_metas</code> filter. Provide an atomic "set the whole table" entry point to avoid a half-flipped state.</li>
+      </ul>
+      <div class="gate"><b>Gate:</b> The Python API flips any subset at step boundaries, the Phase 1 e2e assertions still pass, and the node↦hook map is correct for all captured nodes.</div>
+      <p class="note">Do NOT do: any re-instantiate / re-capture path (that is 100s µs–ms; the whole selling point of this mechanism is to avoid it).</p>
+    </div>
+  </div>
+
+  <!-- Phase 3 -->
+  <div class="phase">
+    <div class="ph-head">
+      <span class="n">Phase 3</span><span>⛔ vLLM integration — locate DMI's nodes inside vLLM's captured exec graph (the real blocker)</span>
+      <span class="chip l">Effort L</span><span class="chip l">Risk high (includes unknowns)</span>
+    </div>
+    <div class="ph-body">
+      <p style="margin-top:0"><strong>This is the real reason the whole feature is stuck.</strong> vLLM owns the graph's capture/instantiate/replay; DMI only installs the producer before warmup (<span class="file">vllm_integration.py</span> <code>DMXGPUWorker.load_model</code>), then steers solely via the global <code>null_mode</code> (True during warmup, False afterward, see <code>:172,240-245</code>). DMI <strong>holds neither a <code>cudaGraphExec_t</code> nor any node handle</strong>.</p>
+      <ul>
+        <li><strong>Unknown to resolve:</strong> can we enumerate/locate DMI's own producer nodes inside vLLM's captured exec graph and obtain handles? This requires tagging DMI nodes during vLLM's capture flow or adding a hook to recover the handles — there is no such plumbing today.</li>
+        <li>Research directions: does vLLM's <code>CUDAGraphRunner</code>/capture context expose the graph object; is <code>cudaGraphChildGraphNodeGetGraph</code>/node traversal usable; or, at DMI's op registration point, side-channel the stream→node association at the moment of capture.</li>
+        <li>Fallback: if handles cannot be obtained, the vLLM path falls back to a <strong>static superset + global null_mode</strong> (v0 is already sufficient, see investigation report §6).</li>
+      </ul>
+      <div class="gate"><b>Gate (research):</b> answer the binary question "can the handle be obtained" before investing in implementation. Explicitly flagged: feasibility unproven.</div>
+      <p class="note">Before the gate passes, do not write a toggle implementation on the vLLM path; the Phase 1/2 deliverables are independently usable on the HF path.</p>
+    </div>
+  </div>
+
+  <!-- Phase 4 -->
+  <div class="phase">
+    <div class="ph-head">
+      <span class="n">Phase 4</span><span>Adaptive observability (built on the toggle list: cheap default → upgrade on demand)</span>
+      <span class="chip m">Effort M</span><span class="chip m">Risk medium (depends on Phase 2/3)</span>
+    </div>
+    <div class="ph-body">
+      <ul>
+        <li>Set the default enabled set to the minimum (e.g. a single-layer residual + final_logits); when a signal is detected (e.g. suspected hallucination), flip the relevant hook-types/layers on at the next step boundary, then flip them back afterward.</li>
+        <li>Built purely on top of the Phase 2 toggle-list state + lockstep gate; touching only a few nodes → cost (#changed)×0.2µs, far below a full-set flip.</li>
+        <li>Decouple the policy layer (when to upgrade) from the mechanism layer (toggle list); start with simple threshold rules.</li>
+      </ul>
+      <div class="gate"><b>Gate:</b> The adaptive policy does not break lockstep alignment when flipping at step boundaries; the TPOT overhead is quantifiable (anchored to the paper's ~6%).</div>
+      <p class="note">The HF path (on top of Phase 1/2) can validate the policy first; online vLLM adaptivity depends on Phase 3 being unlocked.</p>
+    </div>
+  </div>
+
+  <!-- explicitly NOT building -->
+  <div class="panel">
+    <h3 style="margin-top:0">Explicitly <strong>not</strong> building (out of scope)</h3>
+    <ul>
+      <li><span class="tag t-block">⛔</span> <strong>per-request heterogeneous (#3)</strong>: graph nodes are batch-shared, so node-toggle physically cannot do it. If needed in the future, it is a separate design (a per-request mask inside the kernel + per-request meta), not node switching.</li>
+      <li><span class="tag t-block">⛔</span> <strong>any path that requires re-instantiate / re-capture</strong>: <code>cudaGraphInstantiate</code> is 100s µs–ms; the entire value of this mechanism is using <code>cudaGraphNodeSetEnabled</code> (0.19µs, no rebuild) to avoid it.</li>
+      <li><span class="tag t-block">⛔</span> Modifying the <code>producer_kernel</code> body: the probe has proven it is structurally compatible with zero changes.</li>
+      <li><span class="tag t-block">⛔</span> Touching the legacy non-ring <code>set_enabled_hooks</code> (<span class="file">hooks.cpp:207</span>): it is not on the ring/CUDA-graph path and is unrelated to this feature.</li>
+    </ul>
+  </div>
+
+  <div class="panel">
+    <h3 style="margin-top:0">Phase overview</h3>
+    <table>
+      <tr><th>Phase</th><th>Content</th><th>Key files</th><th>Effort</th><th>Risk</th></tr>
+      <tr><td>0</td><td>standalone test target + node→id helper</td><td class="file">tests/ring/Makefile, test_node_toggle.cu</td><td><span class="chip s">S</span></td><td>low</td></tr>
+      <tr><td>1</td><td>HF DMI-owned graph + lockstep meta gate (core)</td><td class="file">generate.py, ring_transport.py:604-659, test_e2e_correctness_vs_hf.py</td><td><span class="chip m">M</span></td><td>medium</td></tr>
+      <tr><td>2</td><td>toggle-list API + explicit node↦hook map</td><td class="file">ring_engine_py.{cu,h}, bindings.cpp, ring_transport.py</td><td><span class="chip m">M</span></td><td>low-medium</td></tr>
+      <tr><td>3</td><td>⛔ vLLM handle acquisition (real blocker, research-first)</td><td class="file">vllm_integration.py + vLLM capture internals</td><td><span class="chip l">L</span></td><td>high</td></tr>
+      <tr><td>4</td><td>adaptive upgrade (built on the toggle list)</td><td class="file">policy layer + Phase 2 state</td><td><span class="chip m">M</span></td><td>medium</td></tr>
+    </table>
+  </div>
+
+  <p class="foot">Sources: the verified investigation report <span class="file">docs/node_toggle_investigation_report.md</span> + the probe <span class="file">docs/node_toggle_probe/probe_dualring_toggle.cu</span>. All file:line references have been cross-checked against the current code in <span class="file">monitoring/</span> (producer.cu / p2p_thread.cpp / tensor_meta.h / drain_thread.cpp / ring_transport.py / ring_engine_py.cu / bindings.cpp / tests/ring/Makefile). This document is a design plan and does not modify any existing source.</p>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DMI Toggle List — vLLM 下的性能与用例预计</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --ink:#e8ecf3; --mut:#9aa4b2;
+    --line:#2a2f3a; --accent:#5b9dff; --green:#3fbf7f; --amber:#f0b65b; --red:#f06b6b;
+    --violet:#a98bff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft Yahei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:36px 24px 80px}
+  h1{font-size:28px;margin:0 0 6px}
+  h2{font-size:20px;margin:38px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{font-size:15px;margin:0 0 8px}
+  .sub{color:var(--mut);font-size:14px;margin:0 0 4px}
+  code{background:#222633;padding:1px 6px;border-radius:5px;font-size:12.5px;color:#cdd6e4}
+  .muted{color:var(--mut)}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin:14px 0 4px;font-size:13px}
+  .tag{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11.5px;font-weight:600;vertical-align:middle}
+  .t-meas{background:rgba(63,191,127,.16);color:var(--green);border:1px solid rgba(63,191,127,.4)}
+  .t-proj{background:rgba(240,182,91,.14);color:var(--amber);border:1px solid rgba(240,182,91,.4)}
+  .t-no{background:rgba(240,107,107,.14);color:var(--red);border:1px solid rgba(240,107,107,.4)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .grid{display:grid;gap:14px}
+  .g2{grid-template-columns:1fr 1fr}
+  .g3{grid-template-columns:1fr 1fr 1fr}
+  @media(max-width:780px){.g2,.g3{grid-template-columns:1fr}}
+  .card{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .card .lab{font-size:11.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;margin-top:10px}
+  table{width:100%;border-collapse:collapse;margin:8px 0;font-size:13.5px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--mut);font-weight:600;font-size:12.5px}
+  td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  /* bar chart */
+  .bars{margin:10px 0}
+  .barrow{display:grid;grid-template-columns:170px 1fr 96px;align-items:center;gap:12px;margin:9px 0}
+  .barrow .name{font-size:13px}
+  .track{background:#11141b;border:1px solid var(--line);border-radius:7px;height:26px;position:relative;overflow:hidden}
+  .fill{height:100%;border-radius:6px 0 0 6px;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;font-size:11.5px;font-weight:600;color:#0b0d11}
+  .val{font-variant-numeric:tabular-nums;font-size:13px;text-align:right;color:var(--mut)}
+  .pill{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .flow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px;margin-top:6px}
+  .node{padding:4px 9px;border-radius:6px;border:1px solid var(--line);background:#11141b;font-variant-numeric:tabular-nums}
+  .on{border-color:rgba(63,191,127,.5);background:rgba(63,191,127,.12);color:#bfe9d2}
+  .off{border-color:rgba(240,107,107,.35);background:rgba(240,107,107,.08);color:#e8a9a9;text-decoration:line-through;opacity:.7}
+  .arrow{color:var(--mut)}
+  .note{font-size:12.5px;color:var(--mut);border-left:3px solid var(--line);padding:2px 0 2px 12px;margin:10px 0}
+  .kbig{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+  .foot{margin-top:30px;font-size:12px;color:var(--mut)}
+  ul{margin:6px 0 6px;padding-left:20px}
+  li{margin:3px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>DMI Toggle List — vLLM 下的性能与用例预计</h1>
+  <p class="sub">运行时切换「哪些 producer/hook 节点在已捕获的 CUDA graph 里发火」—— 通过 <code>cudaGraphNodeSetEnabled</code> 在两次 replay 之间翻转,无需重新 capture。</p>
+  <div class="legend">
+    <span><span class="tag t-meas">实测</span> RTX 4090 / CUDA 13 微基准(真实 producer + dual-ring)</span>
+    <span><span class="tag t-proj">预计</span> 推算到 vLLM+DMI / H100 在线服务(锚定论文 ~6% 在线 TPOT)</span>
+    <span><span class="tag t-no">不支持</span> 此机制做不到</span>
+  </div>
+
+  <!-- ============ 概念 ============ -->
+  <h2>1 · 什么是 Toggle List</h2>
+  <div class="panel">
+    <p style="margin:0 0 10px">一张「节点开关表」:graph 捕获时把<strong>全集</strong>的 hook 节点都录进去(superset),运行时给每个节点一个 on/off 状态,按需在 step 边界翻转。两条硬约束:</p>
+    <div class="flow">
+      <span class="node on">resid_pre·L0</span>
+      <span class="node off">attn_scores·L0</span>
+      <span class="node on">resid_final</span>
+      <span class="node off">q·L3</span>
+      <span class="node off">k·L3</span>
+      <span class="node on">final_logits</span>
+      <span class="arrow">→ replay</span>
+    </div>
+    <p class="muted" style="font-size:12.5px;margin:8px 0 0">
+      每个方块 = 一个 hook 节点(<em>某张量 @ 某层</em>,均为 DMI 支持的类型)。
+      <span style="color:#bfe9d2">绿色 = 本步开启捕获</span>,
+      <span style="color:#e8a9a9;text-decoration:line-through">红色 = 本步关闭</span>(运行时状态,可随时翻回,<strong>不代表不支持</strong>)。
+      此例:这一步只抓 resid_pre·L0 + resid_final + final_logits。
+    </p>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <h3>① 设备侧:环会自动「合拢」 <span class="tag t-meas">实测</span></h3>
+        <p class="muted" style="font-size:13px;margin:0">被关掉的节点不发火,就不推进 <code>task_head</code>/<code>payload_head</code>(head 由 kernel 运行时自己推进,非 host 预留),剩下的节点写出<strong>连续无空洞</strong>的 task entry。50 次随机翻转零损坏。</p>
+      </div>
+      <div class="card">
+        <h3>② 主机侧:meta 必须 lockstep <span class="tag t-proj">待实现</span></h3>
+        <p class="muted" style="font-size:13px;margin:0">Python 的 <code>pre_push_all_metas</code> 必须<strong>只为开启的节点</strong>推 meta,和节点开关同步。否则 host <code>TensorMetaFifo</code> 与 payload 按位置错配 → 全盘 desync。这是软件纪律,非环架构限制。</p>
+      </div>
+    </div>
+    <p class="note"><strong>可行性门槛(blocker):</strong> vLLM 拥有 CUDA graph,DMI 目前<strong>拿不到节点句柄</strong>(只靠全局 <code>null_mode</code> 软开关)。要在真实 vLLM 下做 toggle list,需新增「在 vLLM 捕获的 exec graph 里定位 DMI 节点」的管线 —— 建议先在 HF 路径(DMI 可自持图)落地原型。</p>
+  </div>
+
+  <!-- ============ 性能预计 ============ -->
+  <h2>2 · 性能预计:在线 TPOT 开销</h2>
+  <p class="sub">下图把不同 toggle 策略的<strong>在线 TPOT 额外开销</strong>放在一起对比。「全量捕获 ~6%」是论文实测锚点;其余为基于微基准成本的<strong>推算区间</strong>。</p>
+  <div class="panel">
+    <div class="bars">
+      <div class="barrow"><span class="name">全量捕获(always-on)</span>
+        <div class="track"><div class="fill" style="width:100%;background:var(--red)">~6.0%</div></div>
+        <span class="val">论文实测</span></div>
+      <div class="barrow"><span class="name">自适应:5% step 升级</span>
+        <div class="track"><div class="fill" style="width:11%;background:var(--violet)">~0.6%</div></div>
+        <span class="val">预计</span></div>
+      <div class="barrow"><span class="name">null_mode 空转(现状软关)</span>
+        <div class="track"><div class="fill" style="width:17%;background:var(--amber)">~1.0%</div></div>
+        <span class="val">预计</span></div>
+      <div class="barrow"><span class="name">单探针层(1 hook)</span>
+        <div class="track"><div class="fill" style="width:5%;background:var(--green)">~0.3%</div></div>
+        <span class="val">预计</span></div>
+      <div class="barrow"><span class="name">真关 / idle(toggle off)</span>
+        <div class="track"><div class="fill" style="width:1.5%;background:var(--green)">~0.05%</div></div>
+        <span class="val">预计</span></div>
+    </div>
+    <p class="note">关键对比:<strong>idle 时</strong>,「真关(node-disable)」≈ 0 开销,而现状的 <code>null_mode</code> 仍要逐个 launch producer(每节点 ~0.6µs),145 hook ≈ 87µs/step 残留 → 推算 ~1% TPOT 拿不掉。这就是 #2「true disable vs null_mode」的价值。</p>
+  </div>
+
+  <!-- ============ 微基准基础 ============ -->
+  <h2>3 · 预计所依据的实测数据 <span class="tag t-meas">实测</span></h2>
+  <div class="panel">
+    <table>
+      <tr><th>量</th><th>数值</th><th>说明</th></tr>
+      <tr><td>每次重放(16 节点×1MB,全开)</td><td class="num">180.9 µs</td><td>真实 producer D2D + publish(隔离微基准,无模型计算)</td></tr>
+      <tr><td>全部真关(node-disable)</td><td class="num">3.4 µs</td><td>节点不 launch,仅剩图遍历开销</td></tr>
+      <tr><td>null_mode 软关</td><td class="num">13.4 µs</td><td>kernel 仍 launch 后 early-return(~0.6µs/node)</td></tr>
+      <tr><td>单节点 <code>cudaGraphNodeSetEnabled</code></td><td class="num">0.19 µs/call</td><td>host wall-clock;<strong>不触发 re-instantiate</strong></td></tr>
+      <tr><td>全量翻转 N=16</td><td class="num">3.1 µs</td><td rowspan="2">线性 ~0.2µs/node;每节点成本恒定 → 无隐藏重验证</td></tr>
+      <tr><td>全量翻转 N=145</td><td class="num">30.3 µs</td></tr>
+    </table>
+    <p class="note"><strong>「遍历+call」开销:</strong> 全开↔全关 = N 次 host 调用,线性增长(145 hook ≈ 30µs/次,纯 host 串行、在关键路径上)。相对几 ms 的 TPOT 是 ~0.3%。但它<strong>避开了 re-instantiate</strong>(几百µs~ms 量级)—— 真正大的开销是重实例化,而非 toggle。只改几个节点时成本 = (#改动)×0.2µs。</p>
+  </div>
+
+  <!-- ============ 用例 ============ -->
+  <h2>4 · 用例(Toggle List 模式)</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h3><span class="pill" style="background:var(--green)"></span>Idle / 关闭</h3>
+      <div class="flow"><span class="node off">all hooks</span></div>
+      <div class="lab">用途</div>生产默认态,无人监控时 DMI ≈ 零开销。
+      <div class="lab">粒度</div>全局
+      <div class="lab">预计 TPOT</div><span class="kbig" style="color:var(--green)">~0.05%</span> <span class="muted">(vs null_mode ~1%)</span>
+    </div>
+    <div class="card">
+      <h3><span class="pill" style="background:var(--green)"></span>单探针层</h3>
+      <div class="flow"><span class="node on">resid·L_probe</span><span class="node off">其余</span></div>
+      <div class="lab">用途</div>在线幻觉探针:只抓一层残差喂给 probe。
+      <div class="lab">粒度</div>per-hook-type / per-layer
+      <div class="lab">预计 TPOT</div><span class="kbig" style="color:var(--green)">&lt;0.3%</span> <span class="muted">(单次 D2D/step)</span>
+    </div>
+    <div class="card">
+      <h3><span class="pill" style="background:var(--violet)"></span>自适应升级 (#4)</h3>
+      <div class="flow"><span class="node on">1 probe</span><span class="arrow">怀疑→</span><span class="node on">full multi-layer + attn</span></div>
+      <div class="lab">用途</div>便宜信号触发后才升到全量捕获,只在可疑 step 付全价。
+      <div class="lab">粒度</div>per-hook-type,逐 step(batch 共享)
+      <div class="lab">预计 TPOT</div><span class="kbig" style="color:var(--violet)">~6%×升级比例</span> <span class="muted">+ 翻转 ~30µs</span>
+    </div>
+    <div class="card">
+      <h3><span class="pill" style="background:var(--green)"></span>选择性 hook 类型</h3>
+      <div class="flow"><span class="node on">resid_final</span><span class="node on">logits</span><span class="node off">q/k/v</span><span class="node off">attn</span></div>
+      <div class="lab">用途</div>只抓某 probe 需要的张量,跳过昂贵的 attention/QKV。
+      <div class="lab">粒度</div>per-hook-type
+      <div class="lab">预计 TPOT</div><span class="kbig" style="color:var(--green)">∝ 开启字节</span>
+    </div>
+  </div>
+  <div class="card" style="margin-top:14px;border-color:rgba(240,107,107,.35)">
+    <h3><span class="pill" style="background:var(--red)"></span>每请求异构监控 (#3) <span class="tag t-no">不支持</span></h3>
+    <p class="muted" style="font-size:13px;margin:6px 0 0">同一 batch 里不同请求抓不同张量 —— <strong>node toggle 做不到</strong>:graph 节点是 batch 共享的,一个节点要么整批开、要么整批关。需另设机制(kernel 内 per-request mask + per-request meta),不在 toggle list 范畴。</p>
+  </div>
+
+  <!-- ============ 粒度矩阵 ============ -->
+  <h2>5 · 粒度能力矩阵</h2>
+  <div class="panel">
+    <table>
+      <tr><th>粒度</th><th>能否 toggle 实现</th><th>对应用例</th></tr>
+      <tr><td>全局 on/off</td><td><span class="tag t-meas">可</span></td><td>idle / 全量</td></tr>
+      <tr><td>per-hook-type(如只 resid / 只 logits)</td><td><span class="tag t-meas">可</span></td><td>选择性捕获、单探针</td></tr>
+      <tr><td>per-layer(某几层)</td><td><span class="tag t-meas">可</span></td><td>探针层、自适应升级</td></tr>
+      <tr><td>逐 step 改变(batch 内全体)</td><td><span class="tag t-proj">可(需 meta lockstep)</span></td><td>自适应观测 #4</td></tr>
+      <tr><td>per-request(同 batch 不同请求)</td><td><span class="tag t-no">不可</span></td><td>#3 —— 需另设机制</td></tr>
+    </table>
+  </div>
+
+  <!-- ============ 假设 ============ -->
+  <h2>6 · 预计的假设与边界(诚实说明)</h2>
+  <div class="panel">
+    <ul>
+      <li><strong>锚点:</strong>「全量捕获 ~6% 在线 TPOT」来自 DMI 论文实测;其余 TPOT% 由该锚点 + 微基准 toggle 成本推算,<strong>非真实 vLLM 端到端实测</strong>。</li>
+      <li><strong>TPOT 基线假设</strong>几 ms 量级(H100,4B–14B,中等 batch);具体百分比随 TPOT、hook 数、张量大小浮动。</li>
+      <li><strong>hook 数</strong>以 145(backpressure 配置)为「多 hook」代表;少 hook 时全量翻转成本更低(线性)。</li>
+      <li>微基准为<strong>隔离</strong>测量:合成 1MB 张量、自持 graph、无模型计算、无 Python meta-FIFO / drain / ClickHouse。设备侧一致性与相对开销可信;端到端服务开销待 H100 实测。</li>
+      <li><strong>未计入</strong>:vLLM 取节点句柄的工程成本(blocker)、meta lockstep 落地、连续 batching 下的调度交互。</li>
+    </ul>
+    <p class="note">下一步可把这些预计变成实测:在 HF 路径落地 toggle list + meta lockstep 原型,然后在 Zaratan H100 上按真实 hook 配置量化 idle / 单探针 / 自适应三档的 TPOT。详见 <code>docs/node_toggle_investigation_report.md</code> §5。</p>
+  </div>
+
+  <p class="foot">数据来源:<code>docs/node_toggle_probe/probe_dualring_toggle.cu</code>(实测,RTX 4090 / CUDA 13)· 论文锚点见 <code>CLAUDE.md</code> / SOSP 提交 · 机制与 blocker 分析见 <code>docs/node_toggle_investigation_report.md</code>。<br>标 <span class="tag t-proj">预计</span> 的数字是工程推算,落地前请以 H100 端到端实测为准。</p>
+
+</div>
+</body>
+</html>
