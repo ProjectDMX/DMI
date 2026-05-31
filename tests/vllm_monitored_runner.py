@@ -41,6 +41,8 @@ def main():
     db_host = os.environ.get("DMX_DB_HOST", "localhost")
     db_port = int(os.environ.get("DMX_DB_PORT", "9000"))
     tp_size = int(os.environ.get("E2E_TP_SIZE", "1"))
+    enable_ep = os.environ.get("E2E_ENABLE_EP", "0") == "1"
+    all2all_backend = os.environ.get("E2E_ALL2ALL_BACKEND")
 
     prompts = [f"The answer to question {i+1} is" for i in range(num_prompts)]
 
@@ -70,6 +72,10 @@ def main():
         gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.5")),
         tensor_parallel_size=tp_size,
     )
+    if enable_ep:
+        kwargs["enable_expert_parallel"] = True
+    if all2all_backend:
+        kwargs["all2all_backend"] = all2all_backend
     cg_mode = os.environ.get("E2E_CUDAGRAPH_MODE")
     if cg_mode:
         kwargs["compilation_config"] = {"cudagraph_mode": cg_mode}
