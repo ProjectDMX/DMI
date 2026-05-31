@@ -24,6 +24,9 @@ from .ring_transport import (
     HOOK_TYPE_PATTERN,
     HOOK_TYPE_FINAL_LOGITS,
     HOOK_TYPE_MLP_POST,
+    HOOK_TYPE_ROUTER_LOGITS,
+    HOOK_TYPE_TOPK_IDS,
+    HOOK_TYPE_TOPK_WEIGHTS,
     PP_FIRST_ONLY,
     PP_LAST_ONLY,
     TP_SHARDED_TYPES,
@@ -135,6 +138,11 @@ def apply_hook_selection(
     if cfg is not None:
         if cfg.intermediate_dim == 0:
             _SKIP.add(HOOK_TYPE_MLP_POST)
+        if cfg.num_experts == 0:
+            _SKIP.add(HOOK_TYPE_ROUTER_LOGITS)
+        if cfg.top_k == 0:
+            _SKIP.add(HOOK_TYPE_TOPK_IDS)
+            _SKIP.add(HOOK_TYPE_TOPK_WEIGHTS)
 
     enabled_specs = []
     for spec in specs:

@@ -71,9 +71,28 @@ public:
 
     // Launch producer kernel unconditionally (no condition gating).
     // Space must be guaranteed by pre-forward capacity check.
+    // Three variants matching the three torch ops.
+
+    // Static: copies all `nbytes`; today's behavior.
     void hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
                         uint32_t hook_type,
                         uint64_t stream_handle);
+
+    // Prefix: reads row_count[0] from device, copies
+    // (row_count[0] * row_bytes) bytes.  Used by ring::producer_prefix.
+    void hook_no_notify_prefix(uint64_t d_ptr, uint64_t nbytes_upper,
+                                uint64_t row_count_dev_ptr,
+                                uint64_t row_bytes,
+                                uint32_t hook_type,
+                                uint64_t stream_handle);
+
+    // Chunked: K>1 chunked-suffix; per-chunk bytes from
+    // chunk_bytes_dev_ptr[K].  Used by ring::producer_chunked.
+    void hook_no_notify_chunked(uint64_t d_ptr, uint64_t nbytes_upper,
+                                 uint64_t chunk_bytes_dev_ptr,
+                                 uint32_t K,
+                                 uint32_t hook_type,
+                                 uint64_t stream_handle);
 
     // Lightweight wake-up for the drain thread.
     void notify_drain();
@@ -103,7 +122,10 @@ public:
     // Also resets the internal hook index counter for hook_no_notify.
     static constexpr int STEP_RING_OK      = 0;
     static constexpr int STEP_RING_FLUSHED = 1;
-    static constexpr int STEP_CPU_DIRECT   = 2;
+    // Step's total bytes > ring capacity (or n_hooks > task ring entries):
+    // even an empty ring can't hold it.  Caller falls back to the per-hook
+    // safety net in HookPoint.forward via transport.force_eager = True.
+    static constexpr int STEP_OVERSIZED    = 2;
 
     int prepare_step(uint64_t step_total_bytes, uint32_t num_hooks);
 
@@ -114,6 +136,34 @@ public:
     uint64_t payload_cap() const;
     uint64_t staging_cap() const;
     uint64_t task_cap() const;
+
+    // Return a torch.Tensor view of the GPU payload buffer (uint8,
+    // length = payload_cap()).  No copy, no ownership transfer -- the
+    // buffer continues to be owned by the engine.  Used as the
+    // `Tensor(a!)` mutation alias passed to every producer op call,
+    // which gives AOT autograd a real R/W dependency that prevents
+    // inductor from reordering successive producer launches.
+    at::Tensor payload_tensor() const;
+
+    // ---- Runtime queries / actions used by the safety-net branch in
+    //      HookPoint.forward (eager-only path).  Never called during
+    //      CUDA-graph capture or replay.
+
+    // Free bytes in the payload ring not currently reserved and not
+    // pending drain.  CPU-only read.
+    uint64_t available_capacity() const;
+
+    // Per-hook reservation: claim `nbytes` of payload ring + 1 task entry
+    // for an upcoming producer kernel launch.  Used by the safety net
+    // when force_eager is on and the spec is dynamic-shape.  Advances
+    // cpu_payload_head/cpu_task_head atomically.
+    void reserve_one(uint64_t nbytes);
+
+    // Synchronise the current CUDA stream + force drain to process all
+    // outstanding entries.  Blocking; the Python binding releases the
+    // GIL.  Used by safety-net branches that need to free ring space or
+    // ensure FIFO ordering before consuming the next meta out-of-band.
+    void flush_and_wait();
 
 private:
     struct Impl;

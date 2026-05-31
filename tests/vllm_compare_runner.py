@@ -12,13 +12,14 @@ import os
 import sys
 import tempfile
 
-os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "0")
 
 import torch
 
 
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
+    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B",
 }

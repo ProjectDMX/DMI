@@ -17,6 +17,7 @@ import torch
 
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
+    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B",
 }
@@ -36,6 +37,8 @@ def main():
     enforce_eager = os.environ.get("E2E_ENFORCE_EAGER", "1") == "1"
     model_dtype = os.environ.get("E2E_DTYPE", "auto")
     tp_size = int(os.environ.get("E2E_TP_SIZE", "1"))
+    enable_ep = os.environ.get("E2E_ENABLE_EP", "0") == "1"
+    all2all_backend = os.environ.get("E2E_ALL2ALL_BACKEND")
 
     prompts = [f"The answer to question {i+1} is" for i in range(num_prompts)]
 
@@ -44,10 +47,16 @@ def main():
         dtype=model_dtype,
         worker_cls="tests.ref_disk_worker.RefDiskWorker",
         max_model_len=int(os.environ.get("E2E_MAX_MODEL_LEN", "512")),
+        max_num_batched_tokens=int(
+            os.environ.get("E2E_MAX_NUM_BATCHED_TOKENS", "512")),
         enforce_eager=enforce_eager,
         gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.5")),
         tensor_parallel_size=tp_size,
     )
+    if enable_ep:
+        kwargs["enable_expert_parallel"] = True
+    if all2all_backend:
+        kwargs["all2all_backend"] = all2all_backend
     cg_mode = os.environ.get("E2E_CUDAGRAPH_MODE")
     if cg_mode:
         kwargs["compilation_config"] = {"cudagraph_mode": cg_mode}

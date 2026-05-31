@@ -6,6 +6,5 @@
 // During graph REPLAY, only the captured cudaLaunchKernel args are re-used --
 // this pointer is never read.
 void ring_set_active_engine(ring_py::RingEnginePy* e);
-void ring_set_cpu_direct(bool enabled);
 void ring_diag_reset_host_counters();
 void ring_diag_print_host_counters();

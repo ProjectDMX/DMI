@@ -83,6 +83,34 @@ DeviceType = Optional[torch.device]
 _grad_t = Union[tuple[Tensor, ...], Tensor]
 
 
+def _dispatch_producer(
+    ring_payload: torch.Tensor,
+    x_cont: torch.Tensor,
+    strip_tensor: Optional[torch.Tensor],
+    strip_row_bytes: int,
+    hook_type: int,
+    hook_id: int,
+) -> None:
+    """Dispatch to one of three ring producer ops based on per-HookPoint
+    strip-mode state.  Module-level so torch.compile can specialize the
+    branch per HookPoint without re-tracing the function body.
+
+    `ring_payload` is the shared `Tensor(a!)` mutation alias (same
+    tensor for every call from a given engine).  Successive producer
+    calls form a real R/W chain through this tensor, which inductor
+    cannot reorder.
+    """
+    if strip_tensor is None:
+        torch.ops.ring.producer(ring_payload, x_cont, hook_type, hook_id)
+    elif strip_row_bytes > 0:
+        torch.ops.ring.producer_prefix(
+            ring_payload, x_cont, strip_tensor, strip_row_bytes,
+            hook_type, hook_id)
+    else:
+        torch.ops.ring.producer_chunked(
+            ring_payload, x_cont, strip_tensor, hook_type, hook_id)
+
+
 class HookPoint(nn.Module):
     """
     A helper class to access intermediate activations in a PyTorch model (inspired by Garcon).
@@ -97,32 +125,54 @@ class HookPoint(nn.Module):
         self.bwd_hooks: list[LensHandle] = []
         self.ctx = {}
 
-        # A variable giving the hook's name (from the perspective of the root
-        # module) - this is set by the root module at setup.
-        self._name: Optional[str] = None
+        # ring_producer_op dispatch keys -- set by install_ring_hooks()
+        # from the spec's hook_type / layer_no.  Until install runs, both
+        # are None, which makes HookPoint.forward() short-circuit (the
+        # producer kernel never fires).  Stored as plain ints once set
+        # so torch.compile treats them as compile-time constants and
+        # bakes them directly into the captured CUDA graph.
+        self._ring_hook_type: Optional[int] = None
+        self._ring_hook_id: Optional[int] = None
 
-        # ring_producer_op dispatch keys -- set when self.name is assigned.
-        # Stored as plain ints so torch.compile treats them as compile-time
-        # constants and bakes them directly into the captured CUDA graph.
-        self._ring_hook_type: int = 0
-        self._ring_hook_id: int = 0
+        # Shared GPU payload-view tensor used as the Tensor(a!) mutation
+        # alias for every producer op call from this HookPoint's
+        # engine.  Pointing every HookPoint's `_ring_payload` at the
+        # same physical memory creates a real R/W chain in the FX graph
+        # that prevents inductor from reordering successive producer
+        # launches.  Set by install_ring_hooks().
+        self._ring_payload: Optional[torch.Tensor] = None
 
         # Master switch: False = completely bypass this hook (compiled out
         # under CUDA graphs).  Set once before generate() to select which
         # hooks are active.  Changing triggers Dynamo recompilation.
         self.enabled: bool = True
 
-    @property
-    def name(self) -> Optional[str]:
-        return self._name
-
-    @name.setter
-    def name(self, value: Optional[str]) -> None:
-        object.__setattr__(self, "_name", value)
-        if value is not None:
-            from .ring_transport import _hook_type_from_name, _hook_id_from_name
-            object.__setattr__(self, "_ring_hook_type", _hook_type_from_name(value))
-            object.__setattr__(self, "_ring_hook_id", _hook_id_from_name(value))
+        # Strip-mode state.  Three modes signaled by these two attrs:
+        #   _strip_tensor is None                    -> producer (static)
+        #   _strip_tensor set, _strip_row_bytes > 0  -> producer_prefix
+        #   _strip_tensor set, _strip_row_bytes == 0 -> producer_chunked
+        #
+        # For prefix mode: _strip_tensor is a 1-element int64 device
+        # tensor holding the row count; kernel computes
+        # bytes = row_count[0] * row_bytes.
+        # For chunked mode: _strip_tensor is a K-element int64 device
+        # tensor holding per-chunk byte counts; K = numel.
+        #
+        # CUDA-graph capture contract (caller's responsibility -- not
+        # enforced at runtime):
+        #   * _strip_tensor's data_ptr() and numel() must be stable
+        #     across replays;
+        #   * _strip_row_bytes must be fixed for any captured graph.
+        # Both fixes are natural: they reflect structural properties
+        # tied to the captured shape signature.  Per-step variation
+        # lives in the tensor's *values*, which the kernel re-reads
+        # each replay.
+        #
+        # Set ONCE at attach time + update VALUES in place each step
+        # (via a separate kernel on the same stream as the producer).
+        # Phase 3 / vLLM adapter glue honors this contract.
+        self._strip_tensor: Optional[torch.Tensor] = None
+        self._strip_row_bytes: int = 0
 
     def add_perma_hook(self, hook: HookFunction, dir: Literal["fwd", "bwd"] = "fwd") -> None:
         self.add_hook(hook, dir=dir, is_permanent=True)
@@ -157,8 +207,13 @@ class HookPoint(nn.Module):
                 dir == "bwd"
             ):  # For a backwards hook, module_output is a tuple of (grad,) - I don't know why.
                 module_output = module_output[0]
-            hook_name = self.name or "unnamed"
-            with _nvtx_range(f"TL::Hook[{hook_name}:{dir}]"):
+            from .ring_transport import HOOK_TYPE_TO_SHORT_NAME
+            ht = self._ring_hook_type
+            if ht is not None:
+                hook_label = f"{HOOK_TYPE_TO_SHORT_NAME.get(ht, ht)}@L{self._ring_hook_id}"
+            else:
+                hook_label = "uninstalled"
+            with _nvtx_range(f"TL::Hook[{hook_label}:{dir}]"):
                 return hook(module_output, hook=self)
 
         # annotate the `full_hook` with the string representation of the `hook` function
@@ -231,16 +286,58 @@ class HookPoint(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if not self.enabled:
             return x
-        if self._name is None or not x.is_cuda:
+        if self._ring_hook_type is None or not x.is_cuda:
             return x
-        # No Python transport references — fully torch.compile-serializable.
-        # C++ ring_producer_impl handles all paths:
-        #   g_active_engine == nullptr  -> no-op (monitoring inactive)
-        #   g_cpu_direct == true        -> sync D2H + submit_cpu_direct
-        #   otherwise                   -> launch producer kernel (async D2D)
+
         x_cont = x.contiguous()
-        torch.ops.ring.producer(
-            x_cont, self._ring_hook_type, self._ring_hook_id)
+
+        # Eager safety-net path: when the active transport asks for it,
+        # dispatch dynamically based on whether the hook's tensor fits.
+        # CPU knows x_cont.nbytes exactly; no upper-bound math.
+        # Strip-mode dispatch.  Three branches signaled by attrs:
+        #   _strip_tensor is None                    -> producer (static)
+        #   _strip_tensor set, _strip_row_bytes > 0  -> producer_prefix
+        #   _strip_tensor set, _strip_row_bytes == 0 -> producer_chunked
+        # The branch is predictable per HookPoint (set once at attach;
+        # never changes); torch.compile traces only the live branch.
+        strip_t = self._strip_tensor
+        strip_rb = self._strip_row_bytes
+        ring_payload = self._ring_payload
+
+        from . import ring_transport as _rt
+        transport = _rt._active_transport
+        if transport is not None and transport.force_eager:
+            engine = transport._ring_engine
+            if engine is not None:
+                nbytes = x_cont.nbytes
+                if nbytes <= engine.available_capacity():
+                    engine.reserve_one(nbytes)
+                    _dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
+                                       self._ring_hook_type, self._ring_hook_id)
+                elif nbytes <= engine.payload_cap():
+                    engine.flush_and_wait()
+                    engine.reserve_one(nbytes)
+                    _dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
+                                       self._ring_hook_type, self._ring_hook_id)
+                else:
+                    # Single tensor larger than the whole ring -- bypass via
+                    # cpu_direct.  Flush first so submit_cpu_direct consumes
+                    # the FIFO meta for THIS hook (prior ring entries finish
+                    # first; this hook's pre-pushed meta becomes the head).
+                    # The strip is not applied here -- bypass path sends the
+                    # full tensor to the consumer; consumer's CPU-side
+                    # slicing handles request-level demux as today.
+                    engine.flush_and_wait()
+                    transport.submit_cpu_direct(
+                        x_cont.cpu(),
+                        self._ring_hook_type, self._ring_hook_id)
+                return x_cont
+
+        # Fast path: torch.compile-serializable, CUDA-graph captureable.
+        # C++ ring_producer_* impls no-op when g_active_engine is null
+        # (monitoring inactive); otherwise launch the producer kernel.
+        _dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
+                           self._ring_hook_type, self._ring_hook_id)
         return x_cont
 
     def layer(self):

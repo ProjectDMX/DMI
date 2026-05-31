@@ -118,38 +118,21 @@ del _ext, _load_ext
 
 
 # ---------------------------------------------------------------------------
-# Hook-name -> hook_type helpers (auto-derived from HOOK_DEFS act_name)
+# Hook-type -> short-name map (shared, derived from HOOK_DEFS).  Used for
+# debug labels (logs, NVTX ranges, error messages).  Not part of any
+# dispatch path -- kernel hook_type values come from HookSpec, never from
+# string parsing.
 # ---------------------------------------------------------------------------
 
-# act_name is the suffix used in HookPoint names (e.g. "attn.hook_q", "token_ids")
-_HOOK_SUFFIX_TO_TYPE: Dict[str, int] = {_act: _id for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS}
+HOOK_TYPE_TO_SHORT_NAME: Dict[int, str] = {
+    _id: _short
+    for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS
+}
 
 
 def align_up_py(x: int, a: int) -> int:
     """Python equivalent of ring::align_up (a must be a power of 2)."""
     return (x + a - 1) & ~(a - 1)
-
-
-def _hook_type_from_name(hook_name: str) -> int:
-    for suffix, htype in _HOOK_SUFFIX_TO_TYPE.items():
-        if hook_name == suffix or hook_name.endswith("." + suffix):
-            return htype
-    return 0
-
-
-def _layer_no_from_name(hook_name: str) -> int:
-    """Extract layer index from 'blocks.N.xxx' or 'layers.N.xxx', returns -1 for global hooks."""
-    parts = hook_name.split(".")
-    if len(parts) >= 2 and parts[0] in ("blocks", "layers"):
-        try:
-            return int(parts[1])
-        except ValueError:
-            pass
-    return -1
-
-
-# Keep old name as alias for callers that still use it (HookPoint sets _ring_hook_id)
-_hook_id_from_name = _layer_no_from_name
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +149,8 @@ class ModelShapeConfig:
     dtype:        torch.dtype
     vocab_size:   int = 0  # required for final_logits shape
     intermediate_dim: int = 0  # MLP intermediate size (for mlp_post shape)
+    num_experts:  int = 0  # router_logits final dim
+    top_k:        int = 0  # topk_ids / topk_weights final dim
     tp_size:      int = 1  # tensor parallel world size
     tp_rank:      int = 0  # this rank's TP index
 
@@ -181,6 +166,17 @@ class HookSpec:
     module:    nn.Module                  # the HookPoint instance
     layer_no:  int = -1                   # layer index (-1 for global hooks like embed, final_ln)
     dtype:     Optional[torch.dtype] = None  # override model dtype (e.g. int64 for token_ids)
+    # True when the producer kernel may write fewer (or more) bytes than the
+    # CPU-side shape estimate predicts -- e.g. EP hooks where the token count
+    # routed to this rank varies per step.  Propagated to TensorMeta.flags as
+    # META_FLAG_ALLOW_MISMATCH; consumer recomputes dim-0 from actual bytes.
+    allow_token_cnt_mismatch: bool = False
+    # True when this spec's shape has dim-0 = total_tokens in the framework's
+    # layout (vLLM flat: total_tokens; HF batched: batch * q_len when q_len is
+    # the variable axis).  Adapters that enable a padding-strip mode use this
+    # flag to mark prefix-eligible specs.  Static property; ignored when no
+    # adapter activates strip.
+    dim0_is_actual_tokens: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -201,26 +197,36 @@ try:
     from . import _native_engine as _ne
     _ne._load_extension()  # ensure .so is loaded -> registers ring::producer
 
+    # Three fake impls, one per op.  Void schema; pure side-effect.
+    # `ring_payload` is the shared `Tensor(a!)` mutation alias -- a view
+    # of the engine's GPU payload buffer.  AOT autograd tracks the
+    # mutation; successive producer calls form a real R/W chain through
+    # this shared tensor, which prevents inductor from DCE-ing the op
+    # AND from reordering successive producer launches relative to one
+    # another.  No `_register_effectful_op` needed -- the alias is a
+    # stronger guarantee than the effect-token hint.
     @torch.library.register_fake("ring::producer")
     def _ring_producer_fake(
-        tensor: torch.Tensor, hook_type: int, hook_id: int
+        ring_payload: torch.Tensor, tensor: torch.Tensor,
+        hook_type: int, hook_id: int,
     ) -> None:
-        # Void schema: op is a pure side-effect (kernel launch), no output.
-        # Marked effectful via _register_effectful_op so FX/inductor cannot DCE
-        # the node even when its return value is unused.
         return None
 
-    # Mark ring::producer as an ordered side-effect so torch.compile/inductor
-    # preserves the node in the FX graph (prevents DCE on [num_users=0] nodes).
-    try:
-        from torch._higher_order_ops.effects import (
-            _register_effectful_op, _EffectType,
-        )
-        _register_effectful_op(
-            torch.ops.ring.producer.default, _EffectType.ORDERED
-        )
-    except Exception:
-        pass  # older PyTorch without _EffectType; effectful path unavailable
+    @torch.library.register_fake("ring::producer_prefix")
+    def _ring_producer_prefix_fake(
+        ring_payload: torch.Tensor, tensor: torch.Tensor,
+        row_count: torch.Tensor, row_bytes: int,
+        hook_type: int, hook_id: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("ring::producer_chunked")
+    def _ring_producer_chunked_fake(
+        ring_payload: torch.Tensor, tensor: torch.Tensor,
+        chunk_bytes: torch.Tensor,
+        hook_type: int, hook_id: int,
+    ) -> None:
+        return None
 
     del _ne
 except Exception:
@@ -320,6 +326,12 @@ def _compute_hook_shape(
         if cfg.intermediate_dim == 0:
             return []  # intermediate_dim unknown -- skip this hook
         return b + [q_len, cfg.intermediate_dim // tp]
+    if hook_type == HOOK_TYPE_ROUTER_LOGITS:
+        return (b + [q_len, cfg.num_experts]) if cfg.num_experts > 0 else []
+    if hook_type == HOOK_TYPE_TOPK_IDS:
+        return (b + [q_len, cfg.top_k]) if cfg.top_k > 0 else []
+    if hook_type == HOOK_TYPE_TOPK_WEIGHTS:
+        return (b + [q_len, cfg.top_k]) if cfg.top_k > 0 else []
     if hook_type == HOOK_TYPE_TOKEN_IDS:
         return b + [q_len]
     if hook_type == HOOK_TYPE_FINAL_LOGITS:
@@ -347,18 +359,21 @@ def _compute_hook_shape(
 # Forward-hook installation
 # ---------------------------------------------------------------------------
 
-def install_ring_hooks(specs: List[HookSpec]) -> None:
-    """Set up HookPoints for ring transport.
+def install_ring_hooks(specs: List[HookSpec],
+                       ring_payload: Optional[torch.Tensor] = None) -> None:
+    """Bind HookPoints to ring transport.
 
-    Sets _name, _ring_hook_type, _ring_hook_id on each HookPoint so
-    HookPoint.forward() fires torch.ops.ring.producer.
+    Idempotent: overwrites `_ring_hook_type` / `_ring_hook_id` /
+    `_ring_payload` on each HookPoint from its spec + the engine's
+    shared payload-view tensor.  Until this runs (and for any HookPoint
+    not listed in `specs`), `_ring_hook_type is None` and
+    HookPoint.forward() short-circuits without firing the producer.
     """
     for spec in specs:
         hp = spec.module
-        if hasattr(hp, '_name') and hp._name is None:
-            hp._name = f"hook_{spec.hook_type}_{spec.layer_no}"
-            hp._ring_hook_type = spec.hook_type
-            hp._ring_hook_id = spec.layer_no
+        hp._ring_hook_type = spec.hook_type
+        hp._ring_hook_id = spec.layer_no
+        hp._ring_payload = ring_payload
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +389,14 @@ class RingTransport:
 
     def __init__(self, ring_engine: Any) -> None:
         self._ring_engine = ring_engine
+
+        # Cached torch.Tensor view of the engine's GPU payload buffer.
+        # Used as the shared `Tensor(a!)` mutation alias passed to every
+        # producer op call.  Same physical memory across hooks ->
+        # successive producer calls form a real R/W chain in the FX
+        # graph, which inductor cannot reorder.  Pinned at engine init;
+        # the data_ptr is stable across cudagraph replays.
+        self._ring_payload: torch.Tensor = ring_engine.payload_tensor()
 
         # Current step context -- set before each forward pass
         self._current_model_id: Optional[str] = None
@@ -391,21 +414,20 @@ class RingTransport:
         # Producer kernel still fires (for CUDA graph capture) but as no-ops.
         self.null_offload: bool = False
 
-        # Shared path flag for ALL hooks.  Reset to False at the start of
-        # every pre-forward.  Set to True when the entire step's data exceeds
-        # ring capacity (Case B).  When True, ALL enabled hooks use the
-        # eager .cpu() path for that step.
-        self.cpu_direct: bool = False
+        # When True, HookPoint.forward takes the runtime safety-net branch
+        # instead of the fast path:
+        #   1. fits in current slack       -> reserve_one + ring
+        #   2. fits after flushing the ring -> flush_and_wait + reserve_one + ring
+        #   3. single tensor > ring        -> flush_and_wait + submit_cpu_direct
+        # Owned by adaptor_base.before_forward (per-batch reassignment based
+        # on prepare_step result and dynamic-spec presence).  Consumers
+        # (vLLM dispatch wrapper, HookPoint.forward) read only.
+        self.force_eager: bool = False
 
         # New-path state
         self._model_cfg: Optional[ModelShapeConfig] = None
         self._active_specs: List[HookSpec] = []
         self._using_forward_hooks: bool = False
-
-        # When True, _prepare_wrapper skips prepare_step entirely --
-        # all hooks use cpu_direct for the entire generate() call.
-        # Set by generate_with_monitoring when decode doesn't fit in ring.
-        self._force_cpu_direct: bool = False
 
         # Hook selection preset name (e.g. "full", "hidden-states", "logits").
         # Set by the active adapter before hook installation.
@@ -465,12 +487,20 @@ class RingTransport:
 
     def pre_push_all_metas(self, batch: int, q_len: int, kv_dim: int,
                            logits_to_keep: int = 0,
-                           token_ids_dtype: Optional[torch.dtype] = None) -> None:
+                           token_ids_dtype: Optional[torch.dtype] = None,
+                           actual_q_len: Optional[int] = None) -> None:
         """Push C++ FIFO metadata for all active specs before orig_forward.
 
         Called in the same order as install_ring_hooks() so FIFO pop order
         in the drain thread matches ring arrival order.
         Requires _model_cfg to be set via set_model_cfg() or enable_ring_transport().
+
+        When ``actual_q_len`` is set AND a spec has
+        ``dim0_is_actual_tokens=True``, the meta's shape uses
+        ``actual_q_len`` in place of ``q_len`` -- so the meta describes
+        the unpadded data the producer will actually write under
+        padding-strip mode.  Other specs and the no-strip case use
+        ``q_len`` (today's behavior).
         """
         if self.null_offload:
             return  # kernel launches happen; metas are intentionally skipped
@@ -487,9 +517,13 @@ class RingTransport:
         layer_nos = []
         shapes = []
         dtypes = []
+        flags = []
         for spec in self._active_specs:
+            spec_q_len = (actual_q_len if actual_q_len is not None
+                          and spec.dim0_is_actual_tokens
+                          else q_len)
             shape = _compute_hook_shape(
-                spec.hook_type, self._model_cfg, batch, q_len, kv_dim,
+                spec.hook_type, self._model_cfg, batch, spec_q_len, kv_dim,
                 logits_to_keep=logits_to_keep,
             )
             if not shape:
@@ -504,10 +538,11 @@ class RingTransport:
             layer_nos.append(spec.layer_no)
             shapes.append(shape)
             dtypes.append(dtype)
+            flags.append(1 if spec.allow_token_cnt_mismatch else 0)
 
         if hook_types:
             self._ring_engine.push_all_metas(
-                hook_types, layer_nos, shapes, dtypes,
+                hook_types, layer_nos, shapes, dtypes, flags,
                 self._current_model_id,
                 self._current_tp_rank,
                 self._current_dp_rank,
@@ -522,11 +557,11 @@ class RingTransport:
 
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
                           hook_type: int, hook_id: int) -> None:
-        """Submit a CPU-direct tensor to the drain -> p2p pipeline.
+        """Submit a CPU-tensor to the drain -> p2p pipeline.
 
-        Called from HookPoint.forward() when cpu_direct=True.  The tensor
-        is already in pageable CPU memory; it bypasses the ring and staging
-        entirely.
+        Called from HookPoint.forward()'s safety-net branch when a single
+        tensor exceeds ring capacity.  The tensor is already in pageable
+        CPU memory; it bypasses the ring and staging entirely.
         """
         self._ring_engine.submit_cpu_direct(cpu_tensor)
 
@@ -552,16 +587,6 @@ def deactivate() -> None:
     try:
         from . import _native_engine as _ne
         _ne.ring_clear_active_engine()
-        _ne.ring_set_cpu_direct(False)
-    except Exception:
-        pass
-
-
-def set_cpu_direct(enabled: bool) -> None:
-    """Set/clear the C++ cpu_direct flag for ring_producer_impl."""
-    try:
-        from . import _native_engine as _ne
-        _ne.ring_set_cpu_direct(enabled)
     except Exception:
         pass
 

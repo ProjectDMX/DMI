@@ -17,6 +17,7 @@ from integration.vllm_adapter import DMXGPUWorker
 
 _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2CompareForCausalLM",
+    "Qwen2MoeForCausalLM": "Qwen2MoeCompareForCausalLM",
     "Qwen3ForCausalLM": "Qwen3CompareForCausalLM",
     "LlamaForCausalLM": "LlamaCompareForCausalLM",
 }

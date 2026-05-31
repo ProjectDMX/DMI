@@ -48,7 +48,10 @@ enum HookType : int {
     HOOK_TYPE_TOKEN_IDS    = 18,
     HOOK_TYPE_FINAL_LOGITS = 19,
     HOOK_TYPE_MLP_POST     = 20,
-    HOOK_TYPE_COUNT        = 21,
+    HOOK_TYPE_ROUTER_LOGITS= 21,
+    HOOK_TYPE_TOPK_IDS     = 22,
+    HOOK_TYPE_TOPK_WEIGHTS = 23,
+    HOOK_TYPE_COUNT        = 24,
 };
 
 // Hook group — which sub-block produces this tensor.
@@ -63,9 +66,13 @@ enum HookGroup : int { GROUP_ATTN = 0, GROUP_MLP = 1, GROUP_OTHER = 2 };
 //   SHAPE_MLP_POST : [batch, q_len, intermediate_dim/tp]
 //   SHAPE_TOKEN_IDS: [batch, q_len]  (int64, no feature dim)
 //   SHAPE_LOGITS   : [batch, logits_to_keep, vocab_size]
+//   SHAPE_ROUTER_LOGITS : [batch, q_len, num_experts]
+//   SHAPE_TOPK_IDS      : [batch, q_len, top_k]
+//   SHAPE_TOPK_WEIGHTS  : [batch, q_len, top_k]
 enum ShapeClass : int {
     SHAPE_HIDDEN = 0, SHAPE_QKV_Q = 1, SHAPE_QKV_KV = 2, SHAPE_QKV_Z = 3,
     SHAPE_ATTN_WT = 4, SHAPE_MLP_POST = 5, SHAPE_TOKEN_IDS = 6, SHAPE_LOGITS = 7,
+    SHAPE_ROUTER_LOGITS = 8, SHAPE_TOPK_IDS = 9, SHAPE_TOPK_WEIGHTS = 10,
 };
 
 // Pipeline-parallel stage placement.
@@ -104,6 +111,9 @@ static constexpr HookDef HOOK_DEFS[] = {
     {HOOK_TYPE_FINAL_LN,    "hook_final_ln",            "final_ln",     false, GROUP_OTHER, false, SHAPE_HIDDEN,   PP_LAST },
     {HOOK_TYPE_TOKEN_IDS,   "token_ids",                "token_ids",    false, GROUP_OTHER, false, SHAPE_TOKEN_IDS,PP_FIRST},
     {HOOK_TYPE_FINAL_LOGITS,"final_logits",             "final_logits", false, GROUP_OTHER, false, SHAPE_LOGITS,   PP_LAST },
+    {HOOK_TYPE_ROUTER_LOGITS,"mlp.hook_router_logits",  "router_logits",true,  GROUP_OTHER, false, SHAPE_ROUTER_LOGITS, PP_ANY },
+    {HOOK_TYPE_TOPK_IDS,    "mlp.hook_topk_ids",        "topk_ids",     true,  GROUP_OTHER, false, SHAPE_TOPK_IDS, PP_ANY },
+    {HOOK_TYPE_TOPK_WEIGHTS,"mlp.hook_topk_weights",    "topk_weights", true,  GROUP_OTHER, false, SHAPE_TOPK_WEIGHTS, PP_ANY },
 };
 static constexpr int HOOK_DEFS_COUNT = sizeof(HOOK_DEFS) / sizeof(HOOK_DEFS[0]);
 
@@ -182,13 +192,23 @@ struct StepContext {
     bool                     flattened = false;  // false=HF batched, true=vLLM packed
 };
 
+// Per-hook metadata flag bits.  Packed into TensorMeta::flags.
+//   META_FLAG_ALLOW_MISMATCH -- consumer recomputes dim-0 from the
+//     actual bytes the producer wrote rather than asserting that the
+//     received byte count equals shape's product * elem_size.  Set
+//     when the source HookSpec has allow_token_cnt_mismatch=True
+//     (dynamic-shape EP hooks).
+static constexpr uint8_t META_FLAG_ALLOW_MISMATCH = 1u << 0;
+
 // Per-hook metadata.  No strings -- hook_type + layer_no replace hook_name.
+// flags occupies a padding byte; struct size is unchanged.
 struct TensorMeta {
     int                      hook_type    = 0;   // HookType enum value
     int                      layer_no     = -1;  // -1 for global hooks
     std::vector<int64_t>     shape;
     int                      dtype        = 0;   // at::ScalarType integer value
     bool                     last_in_step = false;
+    uint8_t                  flags        = 0;   // META_FLAG_* bitmask
 };
 
 // Thread-safe dual FIFO for TensorMeta + StepContext.

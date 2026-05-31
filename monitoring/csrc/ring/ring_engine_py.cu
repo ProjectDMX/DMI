@@ -25,9 +25,30 @@ struct RingEnginePy::Impl {
     ring::RingEngine engine;
     uint32_t         current_hook_idx{0};
 
+    // Snapshot of the device-side actual_bytes_counter as of the last
+    // prepare_step call.  Used to compute the per-step delta of bytes the
+    // producer actually wrote, for reclamation accounting when a step's
+    // reservation overshoots its actual writes.  Consumed by future
+    // GPU-side-strip flows where the producer's src_bytes is set from a
+    // device tensor at execution time and the CPU can't know it upfront.
+    uint64_t         last_counter_read{0};
+
+    // Cached torch.Tensor view of the payload buffer.  Built once at
+    // engine init; returned by payload_tensor().  Used as the
+    // Tensor(a!) mutation alias passed to every producer op call.
+    at::Tensor       payload_view;
+
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
-    {}
+    {
+        const auto& state = engine.ring_state();
+        int dev_idx = 0;
+        cudaGetDevice(&dev_idx);
+        payload_view = at::from_blob(
+            state.payload_buf,
+            {static_cast<int64_t>(state.payload_cap)},
+            at::TensorOptions().dtype(at::kByte).device(at::kCUDA, dev_idx));
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -88,26 +109,62 @@ void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
 }
 
 // ---------------------------------------------------------------------------
-// hook_no_notify -- unconditional producer launch.
+// hook_no_notify (3 variants) -- unconditional producer launches.
 //
 // No condition gating.  Space is guaranteed by the pre-forward capacity
-// check in Python.  The kernel just does D2D copy + task_publish.
+// check in Python.  Each variant maps to one torch op.
 // ---------------------------------------------------------------------------
 void RingEnginePy::hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
                                   uint32_t hook_type,
                                   uint64_t stream_handle)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
-
-    RING_DBG("[hook_no_notify] idx=%u nbytes=%lu\n",
+    RING_DBG("[hook_no_notify_static] idx=%u nbytes=%lu\n",
             impl_->current_hook_idx, (unsigned long)nbytes);
-
     impl_->current_hook_idx++;
-
-    ring::launch_producer(
+    ring::launch_producer_static(
         impl_->engine.ring_state(),
         reinterpret_cast<const uint8_t*>(d_ptr),
         nbytes, hook_type, stream);
+}
+
+void RingEnginePy::hook_no_notify_prefix(uint64_t d_ptr, uint64_t nbytes_upper,
+                                          uint64_t row_count_dev_ptr,
+                                          uint64_t row_bytes,
+                                          uint32_t hook_type,
+                                          uint64_t stream_handle)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    RING_DBG("[hook_no_notify_prefix] idx=%u nbytes_upper=%lu row_bytes=%lu\n",
+            impl_->current_hook_idx, (unsigned long)nbytes_upper,
+            (unsigned long)row_bytes);
+    impl_->current_hook_idx++;
+    ring::launch_producer_prefix(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr),
+        nbytes_upper,
+        reinterpret_cast<const int64_t*>(row_count_dev_ptr),
+        row_bytes,
+        hook_type, stream);
+}
+
+void RingEnginePy::hook_no_notify_chunked(uint64_t d_ptr, uint64_t nbytes_upper,
+                                           uint64_t chunk_bytes_dev_ptr,
+                                           uint32_t K,
+                                           uint32_t hook_type,
+                                           uint64_t stream_handle)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    RING_DBG("[hook_no_notify_chunked] idx=%u nbytes_upper=%lu K=%u\n",
+            impl_->current_hook_idx, (unsigned long)nbytes_upper, K);
+    impl_->current_hook_idx++;
+    ring::launch_producer_chunked(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr),
+        nbytes_upper,
+        reinterpret_cast<const int64_t*>(chunk_bytes_dev_ptr),
+        K,
+        hook_type, stream);
 }
 
 void RingEnginePy::notify_drain() {
@@ -120,7 +177,7 @@ void RingEnginePy::notify_drain() {
 // Fast path (STEP_RING_OK): reads two uint64_t counters, returns immediately.
 // No stream resolution, no sync, no flush.
 //
-// Slow path (STEP_RING_FLUSHED / STEP_CPU_DIRECT): resolves the current CUDA
+// Slow path (STEP_RING_FLUSHED / STEP_OVERSIZED): resolves the current CUDA
 // stream via at::cuda::getCurrentCUDAStream(), synchronises it, then asks the
 // drain thread to flush all pending entries.
 // ---------------------------------------------------------------------------
@@ -128,6 +185,18 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
                                uint32_t num_hooks)
 {
     impl_->current_hook_idx = 0;
+
+    // Read the device-side actual_bytes counter and compute the delta vs the
+    // snapshot from the previous prepare_step call.  The counter is monotonic
+    // and atomically updated inside the producer kernel's last-block-arrives
+    // section; the existing __threadfence() in producer.cu orders the D2D
+    // stores before the increment, so any delta we observe corresponds to
+    // bytes whose write is already globally visible.  No cudaStreamSynchronize
+    // is required.
+    const uint64_t counter_cur = *impl_->engine.ring_state().actual_bytes_counter;
+    const uint64_t counter_delta = counter_cur - impl_->last_counter_read;
+    impl_->last_counter_read = counter_cur;
+    (void)counter_delta;  // consumed by reservation accounting in a follow-up
 
     const uint64_t pcap = impl_->engine.payload_cap();
     const uint64_t scap = impl_->engine.staging_cap();
@@ -137,12 +206,14 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     auto& drain = impl_->engine.drain_thread();
 
     // Case B: single step exceeds capacity (payload OR task entries).
-    // Must fall back to cpu_direct.
+    // Caller falls back to the per-hook safety net (force_eager + eager
+    // dispatch).  We still flush so the ring is empty when the safety
+    // net starts firing.
     if (step_total_bytes > effective_cap || num_hooks > tcap) {
         cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
         cudaStreamSynchronize(ms);
         drain.force_flush_and_wait();
-        return STEP_CPU_DIRECT;
+        return STEP_OVERSIZED;
     }
 
     // Case A: step fits.  Check available space for BOTH payload AND tasks.
@@ -182,6 +253,64 @@ uint64_t RingEnginePy::staging_cap() const {
 
 uint64_t RingEnginePy::task_cap() const {
     return impl_->engine.task_cap();
+}
+
+at::Tensor RingEnginePy::payload_tensor() const {
+    return impl_->payload_view;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime queries / actions used by the safety-net branch in
+// HookPoint.forward.  All three are called only when force_eager is active
+// (eager mode); never run during CUDA-graph capture or replay.
+//
+// Thread safety of the check-and-reserve pattern used by the safety net:
+//
+//   if nbytes <= available_capacity():
+//       reserve_one(nbytes)
+//
+// The main thread (this thread) is the only writer of cpu_payload_head_
+// (it advances only through reserve / reserve_one calls).  The drain
+// thread only ever advances cpu_payload_tail_committed_ forward as it
+// frees ring space.  Between the check and the reserve:
+//   - tail may move forward (drain freed more): actual available at
+//     reserve time is >= what we observed.
+//   - head is unchanged (single-threaded writer).
+// So the check's "fits" decision remains valid at reserve time.  No extra
+// locking around the pair is required.
+//
+// Within available_capacity(), the two accessor calls happen under
+// separate mutex acquires (drain.cpu_payload_head() and
+// drain.cpu_payload_tail_committed() each take mgmt_mu_ internally).
+// The observed snapshot is non-atomic: if drain advances tail between
+// the two reads, available_observed = pcap - head + tail_later, which
+// is >= the true available at the time of the head read.  That is, the
+// non-atomicity errs on the "over-estimate available" side -- the
+// reserve will still succeed because the actual ring state has at least
+// as much room as we computed.
+// ---------------------------------------------------------------------------
+
+uint64_t RingEnginePy::available_capacity() const {
+    auto& drain = impl_->engine.drain_thread();
+    const uint64_t pcap = impl_->engine.payload_cap();
+    return pcap - (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
+}
+
+// Per-hook reservation: claim nbytes of payload + 1 task entry for an
+// upcoming producer kernel launch.  Caller must have checked
+// available_capacity() first.  drain.reserve takes mgmt_mu_ internally.
+void RingEnginePy::reserve_one(uint64_t nbytes) {
+    impl_->engine.drain_thread().reserve(nbytes, 1);
+}
+
+// Synchronise the current CUDA stream so all queued producer kernels
+// finish writing, then force the drain thread to flush all outstanding
+// task entries through the consumer pipeline.  Blocking call; the
+// Python binding releases the GIL.
+void RingEnginePy::flush_and_wait() {
+    cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
+    cudaStreamSynchronize(ms);
+    impl_->engine.drain_thread().force_flush_and_wait();
 }
 
 }  // namespace ring_py

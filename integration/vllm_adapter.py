@@ -11,11 +11,11 @@ Key pieces:
       ``predict_padded_q_len`` (reads ``cudagraph_dispatcher._bs_to_padded_graph_size``);
       ``build_step_context`` (constructs the packed/flattened
       StepContext from a ``scheduler_output`` + ``model_runner`` pair);
-      ``adapt_for_cpu_direct`` (swaps padded -> unpadded q_len when
-      cpu_direct triggers a force-eager fallback for this batch);
-      ``on_capacity_exceeded`` (sets the ``force_eager_next_batch``
-      flag the worker reads from its ``_determine_batch_execution_and_padding``
-      wrapper);
+      ``adapt_for_cpu_direct`` (swaps padded -> unpadded q_len when an
+      oversize step forces eager dispatch + safety net for this batch);
+      ``on_capacity_exceeded`` (no-op stub; transport.force_eager is
+      owned by adaptor_base.before_forward and read by the
+      ``_determine_batch_execution_and_padding`` wrapper);
       ``_warn_once_capacity`` (per-(total_q, num_reqs) shape warn).
   * ``DMXGPUWorker`` -- ~60-line vLLM ``Worker`` subclass that owns a
     ``VLLMAdaptor`` and delegates per-step work to it.  Architecture
@@ -45,7 +45,6 @@ from monitoring.ring_transport import (
     _compute_hook_shape,
     align_up_py,
     install_ring_hooks,
-    set_cpu_direct,
 )
 from monitoring.selection import (
     apply_hook_selection,
@@ -112,6 +111,7 @@ def normalize_vllm_request_id(req_id: str) -> str:
 # Architecture remap so vLLM's registry resolves to the hooked variant.
 _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2PLMHeadModel",
+    "Qwen2MoeForCausalLM": "Qwen2MoePForCausalLM",
     "Qwen3ForCausalLM": "Qwen3PForCausalLM",
     "LlamaForCausalLM": "LlamaPForCausalLM",
 }
@@ -139,15 +139,16 @@ class VLLMAdaptor(BackendAdaptor):
     """
 
     def __init__(
-        self, engine: Any, model_id: str, vllm_config: Any
+        self, engine: Any, model_id: str, vllm_config: Any,
+        *, gpu_padding_strip: bool = True,
     ) -> None:
         super().__init__(engine, model_id)
         self.vllm_config = vllm_config
         self._debug_step: bool = bool(os.environ.get("RING_DEBUG_STEP"))
-        # Set when on_capacity_exceeded fires; read + cleared by the
-        # _determine_batch_execution_and_padding wrapper installed in
-        # DMXGPUWorker.init_device.
-        self.force_eager_next_batch: bool = False
+        # Force-eager state lives on the active transport
+        # (self.transport.force_eager).  Set by on_capacity_exceeded;
+        # read + cleared by the _determine_batch_execution_and_padding
+        # wrapper installed in DMXGPUWorker.init_device.
         # User opt-in; when True, ring transport stays in null mode after
         # warmup (kernels fire as no-ops, FIFO stays empty).
         self.user_wants_null_mode: bool = False
@@ -156,6 +157,18 @@ class VLLMAdaptor(BackendAdaptor):
         self._last_total_q: int = 0
         # vLLM step counter (debug logging only).
         self._step_counter: int = 0
+        # gpu_padding_strip mode: when True, the producer copies only
+        # actual_q_len * row_bytes per eligible hook (instead of the
+        # full padded captured tensor).  Default False = today's
+        # behavior verbatim.  When True, attach_model allocates the
+        # shared row_count tensor pair and wires each eligible
+        # HookPoint's _strip_tensor + _strip_row_bytes; build_step_context
+        # populates ctx.actual_q_len; before_forward does the per-step
+        # 8-byte cudaMemcpyAsync of the new actual_q_len.
+        self.gpu_padding_strip: bool = gpu_padding_strip
+        self._row_count_dev: Optional[torch.Tensor] = None      # 1 int64 on GPU
+        self._pinned_row_count: Optional[torch.Tensor] = None   # 1 int64 pinned host
+        self._strip_eligible_hps: List[Any] = []                # for inspection
 
     # ------- abstract overrides ---------------------------------------
 
@@ -201,10 +214,11 @@ class VLLMAdaptor(BackendAdaptor):
         return get_pp_group().is_last_rank
 
     def on_capacity_exceeded(self, ctx: StepContext) -> None:
-        # Tell the next call to _determine_batch_execution_and_padding
-        # to force eager for the current batch.  The worker's wrapper
-        # reads + clears this flag.
-        self.force_eager_next_batch = True
+        # No-op.  transport.force_eager is owned by adaptor_base
+        # before_forward (`force_eager = (result == 2) or needs_eager`).
+        # Kept as a framework hook for subclasses that want to react to
+        # overflow events (telemetry, custom logging, etc.).
+        return
 
     def adapt_for_cpu_direct(self, ctx: StepContext) -> StepContext:
         # When the worker forces eager for this batch, the actual
@@ -241,7 +255,8 @@ class VLLMAdaptor(BackendAdaptor):
             reason = f"exceeds pinned staging ({scap / 1e6:.0f} MB)"
         warnings.warn(
             f"[vllm_integration] Step data ({total_bytes / 1e6:.1f} MB) "
-            f"{reason}. Falling back to cpu_direct for {n_hooks} hooks.",
+            f"{reason}. Falling back to eager dispatch + per-hook safety net "
+            f"for {n_hooks} hooks.",
             stacklevel=2,
         )
 
@@ -274,7 +289,7 @@ class VLLMAdaptor(BackendAdaptor):
 
         The returned ``q_len`` is the CUDA-graph-padded total token
         count; ``adapt_for_cpu_direct`` swaps it back to ``total_q`` if
-        the driver's prepare_step triggers cpu_direct.
+        the driver's prepare_step returns code 2 (oversize step).
         """
         total_tokens = scheduler_output.total_num_scheduled_tokens
         if total_tokens == 0:
@@ -368,7 +383,82 @@ class VLLMAdaptor(BackendAdaptor):
             kv_dim=0,
             logits_to_keep=num_reqs,
             token_ids_dtype=ids_dtype,
+            # In gpu_padding_strip mode, eligible specs use this for shape
+            # + reservation; non-eligible specs and gpu_padding_strip=False
+            # ignore (None).
+            actual_q_len=(total_q if self.gpu_padding_strip else None),
         )
+
+    # ----- gpu_padding_strip integration -----
+
+    def attach_model(self, model: Any, hook_selection: str = "full") -> None:
+        """Standard attach, plus gpu_padding_strip pool setup when enabled.
+
+        When `gpu_padding_strip=True`, allocate one shared int64[1] device
+        tensor (`_row_count_dev`) and one pinned-host counterpart.  For
+        every active spec with `dim0_is_actual_tokens=True`, point the
+        HookPoint's `_strip_tensor` at the shared tensor and bake its
+        per-spec `_strip_row_bytes` (CPU-known constant).  Every step
+        we update the shared tensor's value in place (see
+        before_forward); each HookPoint's captured producer_prefix
+        call reads the freshly-written value and multiplies by its
+        baked row_bytes.
+        """
+        super().attach_model(model, hook_selection)
+        if not self.gpu_padding_strip:
+            return
+        device = next(model.parameters()).device if hasattr(model, "parameters") else "cuda"
+        self._row_count_dev    = torch.empty(1, dtype=torch.int64, device=device)
+        self._pinned_row_count = torch.empty(1, dtype=torch.int64, pin_memory=True)
+        for spec in self.active_specs:
+            if not spec.dim0_is_actual_tokens:
+                continue
+            hp = spec.module
+            rb = _row_bytes_for_spec(spec, self.model_cfg)
+            if rb <= 0:
+                continue
+            hp._strip_tensor    = self._row_count_dev
+            hp._strip_row_bytes = rb
+            self._strip_eligible_hps.append(hp)
+
+    def before_forward(self, *raw) -> None:
+        """Standard driver, plus per-step memcpy when gpu_padding_strip=True."""
+        super().before_forward(*raw)
+        if (self.gpu_padding_strip
+                and self._pinned_row_count is not None
+                and self._row_count_dev is not None
+                and self._last_total_q > 0):
+            # CPU: write the current step's actual_q_len to pinned host.
+            # GPU: enqueue an async copy to the shared device scalar on
+            # the model stream (captureable; values propagate to replays).
+            self._pinned_row_count[0] = self._last_total_q
+            self._row_count_dev.copy_(self._pinned_row_count, non_blocking=True)
+
+
+def _row_bytes_for_spec(spec, model_cfg) -> int:
+    """Bytes-per-token for `spec`'s shape under vLLM flat layout.
+
+    Computed as prod(shape_excluding_total_tokens) * elem_size where
+    the shape comes from _compute_hook_shape with batch=0, q_len=1.
+    The "1" stands in for "one token's worth"; the result is the
+    per-token byte stride.  Returns 0 if the spec produces an empty
+    shape (skip).
+    """
+    shape = _compute_hook_shape(
+        spec.hook_type, model_cfg, batch=0, q_len=1, kv_dim=0,
+        logits_to_keep=0,
+    )
+    if not shape:
+        return 0
+    # In flat mode, dim-0 of the spec's shape IS the token count.
+    # shape[0] should be 1 here (since we passed q_len=1); the
+    # remaining dims times elem_size = bytes per token.
+    nelem = 1
+    for d in shape[1:]:
+        nelem *= d
+    dtype = spec.dtype if spec.dtype is not None else model_cfg.dtype
+    elem_size = torch._utils._element_size(dtype)
+    return int(nelem) * int(elem_size)
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +561,14 @@ class DMXGPUWorker(Worker):
 
         # Build the adaptor.  Hooks aren't installed yet -- that
         # happens in load_model after the model is materialized.
-        self.adaptor = VLLMAdaptor(engine, resolved_model_id, self.vllm_config)
+        # gpu_padding_strip is on by default; flip it off via
+        # additional_config["dmx_gpu_padding_strip"]=False or
+        # DMX_GPU_PADDING_STRIP=0 if needed for debugging.
+        gpu_padding_strip = _cfg(
+            ac, "dmx_gpu_padding_strip", "DMX_GPU_PADDING_STRIP", True)
+        self.adaptor = VLLMAdaptor(
+            engine, resolved_model_id, self.vllm_config,
+            gpu_padding_strip=bool(gpu_padding_strip))
         self.adaptor.user_wants_null_mode = bool(null_mode)
         if null_mode:
             self.adaptor.transport.null_offload = True
@@ -488,9 +585,12 @@ class DMXGPUWorker(Worker):
         orig_fn = self.model_runner._determine_batch_execution_and_padding
 
         def _wrapped_determine(*args: Any, **kwargs: Any) -> Any:
-            if adaptor.force_eager_next_batch:
+            # Read-only.  transport.force_eager is owned by
+            # before_forward (per-batch reassignment); clearing here
+            # would hide this batch's force_eager from HookPoint.forward
+            # since the dispatch wrapper fires BEFORE the model forward.
+            if adaptor.transport.force_eager:
                 kwargs["force_eager"] = True
-                adaptor.force_eager_next_batch = False
             return orig_fn(*args, **kwargs)
 
         self.model_runner._determine_batch_execution_and_padding = _wrapped_determine

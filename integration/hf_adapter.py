@@ -42,7 +42,6 @@ from monitoring.ring_transport import (
     _get_kv_dim,
     align_up_py,
     install_ring_hooks,
-    set_cpu_direct,
 )
 from monitoring.selection import (
     apply_hook_selection,
@@ -217,8 +216,9 @@ class HFAdaptor(BackendAdaptor):
         return True
 
     def on_capacity_exceeded(self, ctx: StepContext) -> None:
-        # cpu_direct flag is already set by the driver; nothing else to do
-        # for HF (the C++ side picks up the flag at the next hook fire).
+        # No-op.  transport.force_eager is owned by adaptor_base
+        # before_forward.  Kept as a framework hook for HF-specific
+        # reactions to overflow (none today).
         return
 
     # --- override of base no-op stub ------------------------------------
@@ -751,16 +751,16 @@ def generate_with_monitoring(
     #
     # External torch.compile (model.forward = torch.compile(...) or
     # model = torch.compile(model)) wraps BOTH prefill and decode in
-    # one compiled function.  When prefill needs cpu_direct (step data
-    # exceeds ring), the .cpu() calls in _hook_cpu_direct cause graph
-    # breaks.  With mode="reduce-overhead", this fragments the forward
-    # into many tiny CUDA graph segments.  When decode then runs with a
-    # different topology (no graph breaks, full ring path), the CUDA
-    # graph tree's shared buffer pool is corrupted -> segfault.
+    # one compiled function.  When prefill triggers the safety net's
+    # branch 3 (single tensor > ring capacity), the .cpu() call causes
+    # graph breaks.  With mode="reduce-overhead", this fragments the
+    # forward into many tiny CUDA graph segments.  When decode then
+    # runs with a different topology (no graph breaks, full ring path),
+    # the CUDA graph tree's shared buffer pool is corrupted -> segfault.
     #
     # FIX: Strip external compilation and inject HF's CompileConfig.
     # HF's get_compiled_call() only compiles decode, leaving prefill
-    # uncompiled.  Prefill can safely use cpu_direct (eager, no CUDA
+    # uncompiled.  Prefill can safely use the safety net (eager, no CUDA
     # graphs).  Decode uses ring path (no graph breaks, full CUDA graph).
     #
     # WHEN: Only when static cache is active (cache_implementation="static"
@@ -861,20 +861,18 @@ def generate_with_monitoring(
     # ------------------------------------------------------------------
     # Phase 3: Check if a single decode step exceeds ring capacity.
     #
-    # WHY: If even one decode step exceeds capacity, every step uses
-    # cpu_direct (.cpu() in HookPoint.forward).  Under CUDA graphs
-    # (CompileConfig), this causes graph breaks at every hook,
-    # fragmenting the forward into hundreds of tiny segments.  PyTorch's
-    # cudagraph_trees stale-buffer detection then crashes on
-    # cross-segment tensor reuse.
+    # WHY disable_compile is essential when overflow is expected:
+    # HookPoint.forward's safety-net check on `transport.force_eager`
+    # is Python.  Under CUDA graphs the branch is baked at warmup
+    # (force_eager False) and the captured forward replays the fast
+    # path regardless of runtime force_eager.  So the safety net is
+    # only reachable in eager forwards.  Detecting overflow upfront +
+    # disable_compile keeps the whole generate() eager so per-batch
+    # before_forward + safety net can run.
     #
-    # FIX: Detect upfront from input_ids.shape[0].  If the worst-case
-    # decode step exceeds effective_cap:
-    #   1. Set adaptor._force_cpu_direct -- driver skips prepare_step.
-    #   2. Pop compile_config + cache_implementation from kwargs.
-    #   3. Set disable_compile=True -- catches HF auto-compile from
-    #      external StaticCache.
-    # Result: entire generate() runs eager, no CUDA graphs, no crash.
+    # Out of scope: runtime overflow with CUDA graphs active for a
+    # shape we didn't predict (e.g. dynamic batching).  Doesn't arise
+    # in current HF usage (StaticCache fixes shapes at warmup).
     # ------------------------------------------------------------------
     if adaptor is not None and adaptor.model_cfg is not None and adaptor.active_specs:
         input_ids = kwargs.get("input_ids")
@@ -918,9 +916,10 @@ def generate_with_monitoring(
             decode_bytes = adaptor.decode_step_bytes(batch, kv_dim_estimate)
 
             if decode_bytes > effective_cap:
-                adaptor.transport.cpu_direct = True
-                adaptor._force_cpu_direct = True
-                set_cpu_direct(True)
+                # Decode steps will overflow.  Force eager dispatch so
+                # before_forward's per-batch capacity check + HookPoint's
+                # safety net (ring D2D where it fits, submit_cpu_direct
+                # where it doesn't) can run.
                 had_compile = bool(
                     kwargs.pop("compile_config", None) is not None
                     or kwargs.pop("cache_implementation", None) is not None
@@ -929,7 +928,7 @@ def generate_with_monitoring(
                 msg = (
                     f"[ring_transport] Decode step ({decode_bytes / 1e6:.1f} MB) "
                     f"exceeds ring capacity ({effective_cap / 1e6:.0f} MB). "
-                    f"All hooks using synced CPU-direct offload."
+                    f"Using eager dispatch + per-hook safety net."
                 )
                 if had_compile:
                     msg += " Disabled CUDA graph compilation for this generate() call."
@@ -948,12 +947,8 @@ def generate_with_monitoring(
             gen_cfg = getattr(model, "generation_config", None)
             if gen_cfg is not None:
                 gen_cfg.cache_implementation = _saved_cache_impl
-        # Reset module-level cpu_direct flags so the next generate() starts clean.
-        transport = ring_transport.get_active()
-        if transport is not None:
-            transport.cpu_direct = False
-            transport._force_cpu_direct = False
-            set_cpu_direct(False)
+        # force_eager is owned by before_forward (per-batch reassignment);
+        # no cleanup needed -- the next generate()'s first batch will set it.
 
 
 # ---------------------------------------------------------------------------

@@ -9,12 +9,14 @@ The driver in ``before_forward`` is the canonical per-step flow shared by
 every concrete adapter:
 
     build_step_context  (subclass)
-    -> _step_bytes      (base, uses _compute_hook_shape over active_specs)
+    -> _compute_step_plan  (base; walks active_specs once for
+                            total_bytes + n_hooks + needs_eager)
     -> prepare_step     (skipped when n_hooks == 0)
        on result == 2:
          -> adapt_for_cpu_direct  (subclass; default no-op)
          -> on_capacity_exceeded  (subclass)
          -> _warn_once_capacity   (base stub; subclass overrides)
+    set transport.force_eager from (result == 2) OR needs_eager.
     -> set_step_context
     -> pre_push_all_metas
 
@@ -35,7 +37,6 @@ from .ring_transport import (
     _compute_hook_shape,
     align_up_py,
     install_ring_hooks,
-    set_cpu_direct,
 )
 from .selection import (
     apply_hook_selection,
@@ -55,8 +56,9 @@ class BackendAdaptor(abc.ABC):
     detection, and per-step context construction.  The base class owns the
     driver (``before_forward``) that all concrete adapters share, plus
     ``attach_model`` (resolves hook selection + PP/TP filters + installs
-    HookPoints) and ``_step_bytes`` (uses ``_compute_hook_shape`` over the
-    adapter's active specs to compute the prepare_step inputs).
+    HookPoints) and ``_compute_step_plan`` (one walk over active_specs
+    that returns ``(total_bytes, n_hooks, needs_eager)`` -- inputs to
+    ``prepare_step`` and the per-batch ``force_eager`` decision).
     """
 
     def __init__(self, engine: "MonitoringEngine", model_id: str) -> None:
@@ -66,7 +68,6 @@ class BackendAdaptor(abc.ABC):
         self.ring_engine = getattr(engine, "_ring_engine", None)
         self.model_cfg: Optional[ModelShapeConfig] = None
         self.active_specs: List[HookSpec] = []
-        self._force_cpu_direct: bool = False
         self._warned_shapes: set = set()
 
     # --- subclass implements ---------------------------------------------
@@ -115,6 +116,13 @@ class BackendAdaptor(abc.ABC):
         warnings when cpu-direct fallback first triggers for a given shape.
         """
 
+    def _spec_needs_eager(self, spec: HookSpec) -> bool:
+        """Return True if this spec requires eager dispatch + safety net
+        for every batch it fires (independent of overflow).  Base default
+        is False; subclasses override for dynamic-shape backends.
+        """
+        return False
+
     # --- shared (subclass never overrides) -------------------------------
     def attach_model(self, model, hook_selection: str = "full") -> None:
         """Resolve shape, install hooks per the selection + PP/TP filters."""
@@ -135,7 +143,7 @@ class BackendAdaptor(abc.ABC):
         specs = filter_by_pp_rank(specs, self.is_pp_first(), self.is_pp_last())
         specs = filter_by_tp_rank(specs, tp)
 
-        install_ring_hooks(specs)
+        install_ring_hooks(specs, ring_payload=self.transport._ring_payload)
         self.active_specs = specs
         self.transport._active_specs = specs
         self.transport._using_forward_hooks = True
@@ -148,22 +156,24 @@ class BackendAdaptor(abc.ABC):
         if ctx is None:
             return
 
-        if not self._force_cpu_direct:
-            total_bytes, n_hooks = self._step_bytes(ctx)
-            # Gate prepare_step on n_hooks > 0 -- matches vLLM's existing
-            # behavior and is consistent with the non-zero-shape counting
-            # rule for _step_bytes.  When the gate skips, set_step_context
-            # and pre_push_all_metas still run unchanged: their internal
-            # loops produce nothing to push when the active-spec list is
-            # empty or every shape was empty.
-            if n_hooks > 0:
-                result = self.ring_engine.prepare_step(total_bytes, n_hooks)
-                self.transport.cpu_direct = (result == 2)
-                set_cpu_direct(result == 2)
-                if result == 2:
-                    ctx = self.adapt_for_cpu_direct(ctx)
-                    self.on_capacity_exceeded(ctx)
-                    self._warn_once_capacity(ctx, total_bytes, n_hooks)
+        total_bytes, n_hooks, needs_eager = self._compute_step_plan(ctx)
+        # Gate prepare_step on n_hooks > 0 -- matches vLLM's existing
+        # behavior and is consistent with the non-zero-shape counting
+        # rule for _compute_step_plan.  When the gate skips,
+        # set_step_context and pre_push_all_metas still run unchanged:
+        # their internal loops produce nothing to push when the
+        # active-spec list is empty or every shape was empty.
+        if n_hooks > 0:
+            result = self.ring_engine.prepare_step(total_bytes, n_hooks)
+            self.transport.force_eager = (result == 2) or needs_eager
+            if result == 2:
+                ctx = self.adapt_for_cpu_direct(ctx)
+                self.on_capacity_exceeded(ctx)
+                self._warn_once_capacity(ctx, total_bytes, n_hooks)
+        else:
+            # No hook fires this step (all shapes empty) -- no
+            # safety net needed.
+            self.transport.force_eager = False
 
         self.transport.set_step_context(**ctx.transport_kwargs())
         self.transport.pre_push_all_metas(
@@ -172,28 +182,42 @@ class BackendAdaptor(abc.ABC):
             kv_dim=ctx.kv_dim,
             logits_to_keep=ctx.logits_to_keep,
             token_ids_dtype=ctx.token_ids_dtype,
+            actual_q_len=ctx.actual_q_len,
         )
 
     def close(self) -> None:
         self.engine.close()
 
-    def _step_bytes(self, ctx: StepContext) -> "tuple[int, int]":
-        """Return ``(aligned total bytes, n_hooks)`` for one step.
+    def _compute_step_plan(self, ctx: StepContext) -> "tuple[int, int, bool]":
+        """Return ``(aligned total bytes, n_hooks, needs_eager)`` for one step.
 
-        ``n_hooks`` counts only specs whose ``_compute_hook_shape`` returns
-        a non-empty list -- matches the count of metas
-        ``pre_push_all_metas`` will push and the count of task-ring slots
-        ``prepare_step`` needs to reserve.
+        Single walk over ``active_specs``:
+        - ``total`` and ``n_hooks`` feed ``prepare_step``.  ``n_hooks``
+          counts only specs whose ``_compute_hook_shape`` returns a
+          non-empty list -- matches the count of metas
+          ``pre_push_all_metas`` will push.
+        - ``needs_eager`` is the OR of ``_spec_needs_eager(spec)`` over
+          firing specs.  Drives the dispatch + safety-net decision in
+          ``before_forward`` together with ``prepare_step``'s overflow
+          result.
         """
         if self.model_cfg is None or not self.active_specs:
-            return 0, 0
+            return 0, 0, False
 
         total = 0
         n = 0
+        needs_eager = False
         for spec in self.active_specs:
+            # When the adapter has populated actual_q_len AND the spec is
+            # prefix-strip-eligible, size the byte budget for the unpadded
+            # data the producer will actually write.  Other specs and the
+            # no-strip case use ctx.q_len.
+            spec_q_len = (ctx.actual_q_len if ctx.actual_q_len is not None
+                          and spec.dim0_is_actual_tokens
+                          else ctx.q_len)
             shape = _compute_hook_shape(
                 spec.hook_type, self.model_cfg,
-                ctx.batch, ctx.q_len, ctx.kv_dim,
+                ctx.batch, spec_q_len, ctx.kv_dim,
                 logits_to_keep=ctx.logits_to_keep,
             )
             if not shape:
@@ -205,7 +229,9 @@ class BackendAdaptor(abc.ABC):
                 nbytes *= d
             total += align_up_py(nbytes, 16)
             n += 1
-        return total, n
+            if self._spec_needs_eager(spec):
+                needs_eager = True
+        return total, n, needs_eager
 
 
 __all__ = ["BackendAdaptor"]
