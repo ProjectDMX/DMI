@@ -46,7 +46,7 @@ void launch_producer(
     uint32_t         hook_type,
     cudaStream_t     stream = 0);
 
-void set_ring_null_mode(bool enabled);
+cudaError_t set_ring_null_mode(bool enabled);
 
 }  // namespace ring
 

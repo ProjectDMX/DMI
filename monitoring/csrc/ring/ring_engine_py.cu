@@ -11,10 +11,12 @@
 #include "ring/producer.cuh"
 #include "ring/ring_debug.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
+#include <stdexcept>
+#include <string>
 
 // Forward-declare symbols from producer.cu
 namespace ring {
-void set_ring_null_mode(bool enabled);
+cudaError_t set_ring_null_mode(bool enabled);
 }  // namespace ring
 
 namespace ring_py {
@@ -91,16 +93,27 @@ RingFlushStats RingEnginePy::get_stats() const {
 }
 
 void RingEnginePy::set_null_mode(bool enabled) {
-    // cudaMemcpyToSymbol goes through the legacy default stream, which does
-    // NOT synchronize with PyTorch's non-blocking compute streams.  Sync
-    // before to drain pending producer kernels that still need the old value,
-    // and after to ensure the new value is visible before the next launch.
-    // (Ported from ring_full_tp d0a99a5; the same stream-ordering discipline
-    // applies to any post-capture node-toggle reconfigure -- see
-    // docs/node_toggle_design_notes.md.)
-    cudaDeviceSynchronize();
-    ring::set_ring_null_mode(enabled);
-    cudaDeviceSynchronize();
+    // null_mode flips a __device__ flag via cudaMemcpyToSymbol, which goes
+    // through the legacy default stream and does NOT synchronize with PyTorch's
+    // non-blocking compute streams.  Sync before (drain pending producer kernels
+    // that still need the old value) and after (make the new value visible
+    // before the next launch).  Ported from ring_full_tp d0a99a5.
+    //
+    // NOTE: this is the discipline for the *null_mode device-flag* path only.
+    // Post-capture node-toggle has a DIFFERENT requirement (prior replay must be
+    // complete before mutating the exec graph + meta-FIFO lockstep), not this
+    // default-stream sync -- see docs/node_toggle_design_notes.md §0.
+    //
+    // This carries race-fix semantics, so every step is checked: a silent
+    // failure here would corrupt capture without any Python-visible signal.
+    auto ck = [](cudaError_t e, const char* what) {
+        if (e != cudaSuccess)
+            throw std::runtime_error(std::string("set_null_mode: ") + what + ": " +
+                                     cudaGetErrorString(e));
+    };
+    ck(cudaDeviceSynchronize(),         "pre-sync");
+    ck(ring::set_ring_null_mode(enabled), "cudaMemcpyToSymbol(g_ring_null_mode)");
+    ck(cudaDeviceSynchronize(),         "post-sync");
 }
 
 void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {

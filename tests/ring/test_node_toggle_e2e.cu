@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>   // std::exit
 #include <mutex>
 #include <set>
 #include <thread>
@@ -100,24 +101,49 @@ static Result run_scenario(bool lockstep, std::vector<uint8_t*>& src) {
     CUDA_CHECK(cudaStreamEndCapture(s, &graph));
     CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
 
-    // Node -> producer-id map, read STATICALLY from each kernel node's hook_type
-    // arg (index 3) -- no execution, no assumption on cudaGraphGetNodes() order.
+    // Collect the kernel nodes. We do NOT assume cudaGraphGetNodes() returns
+    // them in capture order, and we do NOT read kernel args by index (that would
+    // implicitly bind to producer_kernel's argument order -- a silent break if
+    // the signature changes).
     size_t nn = 0; CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &nn));
     std::vector<cudaGraphNode_t> nodes(nn); CUDA_CHECK(cudaGraphGetNodes(graph, nodes.data(), &nn));
-    std::vector<cudaGraphNode_t> node_of_pid(N, nullptr);
-    int kcount = 0;
+    std::vector<cudaGraphNode_t> knodes;
     for (auto& nd : nodes) {
         cudaGraphNodeType t;
-        if (cudaGraphNodeGetType(nd, &t) != cudaSuccess || t != cudaGraphNodeTypeKernel) continue;
-        cudaKernelNodeParams kp{};
-        CUDA_CHECK(cudaGraphKernelNodeGetParams(nd, &kp));
-        uint32_t htype = *reinterpret_cast<uint32_t*>(kp.kernelParams[3]);
-        if ((int)htype >= 0 && (int)htype < N) node_of_pid[htype] = nd;
-        kcount++;
+        if (cudaGraphNodeGetType(nd, &t) == cudaSuccess && t == cudaGraphNodeTypeKernel) knodes.push_back(nd);
     }
-    ASSERT(kcount == N);
-    bool bij = true; for (int j = 0; j < N; j++) if (!node_of_pid[j]) bij = false;
-    ASSERT(bij);
+    if ((int)knodes.size() != N) {
+        fprintf(stderr, "FATAL: expected %d kernel nodes, got %zu\n", N, knodes.size()); std::exit(1);
+    }
+
+    // Build the node->producer-id map by RUNTIME OBSERVATION (no ABI coupling):
+    // enable exactly one node, replay, and the single published payload's first
+    // byte is the producer id it drives.  Done BEFORE engine.start() so the
+    // drain/p2p consumer isn't running yet and we can read the task ring directly.
+    auto reset_rings = [&] {
+        RingState& rs = engine.ring_state();
+        CUDA_CHECK(cudaMemset(rs.task_entries, 0xFF, rs.task_cap * sizeof(TaskEntry)));
+        *rs.task_head = 0; *rs.payload_head = 0;
+        CUDA_CHECK(cudaDeviceSynchronize());
+    };
+    std::vector<cudaGraphNode_t> node_of_pid(N, nullptr);
+    for (int k = 0; k < N; k++) {
+        for (int m = 0; m < N; m++)
+            CUDA_CHECK(cudaGraphNodeSetEnabled(exec, knodes[m], m == k ? 1 : 0));
+        reset_rings();
+        CUDA_CHECK(cudaGraphLaunch(exec, s)); CUDA_CHECK(cudaStreamSynchronize(s));
+        RingState& rs = engine.ring_state();
+        if (*rs.task_head != 1) {  // fatal: otherwise the entry below is sentinel
+            fprintf(stderr, "FATAL: single-node probe published %llu entries (want 1)\n",
+                    (unsigned long long)*rs.task_head); std::exit(1);
+        }
+        TaskEntry e0; CUDA_CHECK(cudaMemcpy(&e0, rs.task_entries, sizeof(TaskEntry), cudaMemcpyDeviceToHost));
+        uint8_t fb; CUDA_CHECK(cudaMemcpy(&fb, rs.payload_buf + e0.payload_off1, 1, cudaMemcpyDeviceToHost));
+        if ((int)fb < N) node_of_pid[fb] = knodes[k];
+    }
+    for (int j = 0; j < N; j++)
+        if (!node_of_pid[j]) { fprintf(stderr, "FATAL: producer %d has no mapped node\n", j); std::exit(1); }
+    reset_rings();   // clean ring state before the consumer starts
 
     auto set_enabled = [&](const std::set<int>& on) {
         for (int j = 0; j < N; j++)

@@ -49,6 +49,15 @@ static int g_fail  = 0;
         fprintf(stderr, "  FAIL  %s:%d  %s\n", __FILE__, __LINE__, #cond); } \
 } while (0)
 
+// Fatal precondition: aborts immediately. Use when continuing would read
+// uninitialized ring state or index with an unresolved map (UB), rather than
+// merely accumulating a failure.
+#define REQUIRE(cond, msg) do {                                    \
+    if (!(cond)) {                                                 \
+        fprintf(stderr, "FATAL %s:%d  %s\n", __FILE__, __LINE__, msg); \
+        return 1; }                                                \
+} while (0)
+
 #define CUDA_CHECK(e) do {                                         \
     cudaError_t _e = (e);                                          \
     if (_e != cudaSuccess) {                                       \
@@ -177,13 +186,18 @@ int main() {
             CUDA_CHECK(cudaGraphNodeSetEnabled(exec, knodes[m], m == k ? 1 : 0));
         reset_ring(ar);
         CUDA_CHECK(cudaGraphLaunch(exec, s)); CUDA_CHECK(cudaStreamSynchronize(s));
-        ASSERT(*ar.state().task_head == 1);
+        // Fatal: if a single-node probe did not publish exactly one entry, the
+        // TaskEntry below is sentinel and its payload_off1 is garbage -> reading
+        // it would cudaMemcpy from an illegal address. Abort instead.
+        REQUIRE(*ar.state().task_head == 1, "single-node probe must publish exactly one entry");
         TaskEntry e0; CUDA_CHECK(cudaMemcpy(&e0, ar.state().task_entries, sizeof(TaskEntry), cudaMemcpyDeviceToHost));
         int pid = payload_writer_id(ar.state().payload_buf, e0.payload_off1);
         if (pid >= 0 && pid < N) pid_node[pid] = (int)k;
     }
+    // Fatal: an unresolved map (pid_node[j] == -1) would index knodes[-1] in
+    // set_disabled below (UB). Abort before any dependent use.
     bool bij = true; for (int j = 0; j < N; j++) if (pid_node[j] < 0) bij = false;
-    ASSERT(bij);  // every producer id reachable
+    REQUIRE(bij, "node->producer map not bijective (some producer id unreachable)");
 
     auto enable_all   = [&]{ for (auto& nd : knodes) CUDA_CHECK(cudaGraphNodeSetEnabled(exec, nd, 1)); };
     auto set_disabled = [&](const std::set<int>& drop){

@@ -18,8 +18,8 @@ __device__ bool g_ring_null_mode = false;
 // current one finishes.
 __device__ uint32_t g_block_done_counter = 0;
 
-void set_ring_null_mode(bool enabled) {
-    cudaMemcpyToSymbol(g_ring_null_mode, &enabled, sizeof(bool));
+cudaError_t set_ring_null_mode(bool enabled) {
+    return cudaMemcpyToSymbol(g_ring_null_mode, &enabled, sizeof(bool));
 }
 
 static_assert(PAYLOAD_ALIGN == sizeof(uint4),
