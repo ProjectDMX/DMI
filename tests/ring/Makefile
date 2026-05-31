@@ -16,6 +16,8 @@ NVCC_FLAGS := \
 
 PRODUCER_CU  := ../../monitoring/csrc/ring/producer.cu
 DRAIN_SRC    := ../../monitoring/csrc/ring/drain_thread.cpp
+P2P_SRC      := ../../monitoring/csrc/ring/p2p_thread.cpp
+ENGINE_SRC   := ../../monitoring/csrc/ring/ring_engine.cu
 
 # test_ring_engine needs ATen headers + libtorch for DrainTask (contains at::Tensor).
 # Use torch.utils.cmake_prefix_path to locate them.  The Python E2E tests
@@ -29,7 +31,7 @@ TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer $(BUILD)/test_ring_engine
 NPROD  ?= 16
 SRC_KB ?= 1024
 
-.PHONY: all test_rings test_producer test_ring_engine test_node_toggle run clean
+.PHONY: all test_rings test_producer test_ring_engine test_node_toggle test_node_toggle_e2e run clean
 
 all: $(TARGETS)
 
@@ -60,6 +62,13 @@ test_ring_engine: $(BUILD)/test_ring_engine
 
 test_node_toggle: $(BUILD)/test_node_toggle
 	$(BUILD)/test_node_toggle
+
+# End-to-end: full consumer (ring_engine + drain + p2p) → needs torch like test_ring_engine.
+$(BUILD)/test_node_toggle_e2e: test_node_toggle_e2e.cu $(PRODUCER_CU) $(DRAIN_SRC) $(P2P_SRC) $(ENGINE_SRC) | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -I$(TORCH_INC) -I$(TORCH_INC)/torch/csrc/api/include -L$(TORCH_LIB) -Xlinker -rpath,$(TORCH_LIB) -ltorch -ltorch_cpu -lc10 -lpthread $^ -o $@
+
+test_node_toggle_e2e: $(BUILD)/test_node_toggle_e2e
+	$(BUILD)/test_node_toggle_e2e
 
 FORCE:
 
