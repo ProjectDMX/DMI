@@ -28,6 +28,7 @@
 #include "ring/ring_engine.h"
 #include "ring/producer.cuh"
 #include "ring/tensor_meta.h"
+#include "ring/node_toggle.h"   // Phase 2: NodeToggleController (toggle-list API)
 
 #include <ATen/ATen.h>
 #include <cuda_runtime.h>
@@ -143,12 +144,13 @@ static Result run_scenario(bool lockstep, std::vector<uint8_t*>& src) {
     }
     for (int j = 0; j < N; j++)
         if (!node_of_pid[j]) { fprintf(stderr, "FATAL: producer %d has no mapped node\n", j); std::exit(1); }
+    // Phase 2 API: register each producer's node under its hook identity
+    // (RESID_PRE, layer = producer id), in capture order. The controller is now
+    // the single source of truth for BOTH node-toggle and the meta-push list.
+    NodeToggleController ctrl;
+    for (int j = 0; j < N; j++)
+        ctrl.register_node(HookId{ring_py::HOOK_TYPE_RESID_PRE, j}, node_of_pid[j]);
     reset_rings();   // clean ring state before the consumer starts
-
-    auto set_enabled = [&](const std::set<int>& on) {
-        for (int j = 0; j < N; j++)
-            CUDA_CHECK(cudaGraphNodeSetEnabled(exec, node_of_pid[j], on.count(j) ? 1 : 0));
-    };
 
     engine.start();
 
@@ -156,25 +158,30 @@ static Result run_scenario(bool lockstep, std::vector<uint8_t*>& src) {
     size_t n_payloads = 0;
     for (auto& step : STEPS) {
         CUDA_CHECK(cudaStreamSynchronize(s));   // #1/#2: prior replay done before reconfigure
-        set_enabled(step);
 
-        // metas to push: lockstep -> only enabled; violation -> ALL producers.
-        std::vector<int> meta_ids;
-        if (lockstep) meta_ids.assign(step.begin(), step.end());
-        else          for (int j = 0; j < N; j++) meta_ids.push_back(j);
+        // ONE enabled-set drives the node-toggle...
+        ctrl.set_enabled_if([&](HookId h) { return step.count(h.layer_no) > 0; });
+        CUDA_CHECK(ctrl.apply(exec));
+
+        // ...and the host meta-push. lockstep -> push exactly the controller's
+        // enabled set (single source of truth); violation -> push for ALL hooks
+        // (bypassing the controller), which is the bug the API exists to prevent.
+        std::vector<HookId> push_hooks;
+        if (lockstep) push_hooks = ctrl.enabled_in_capture_order();
+        else for (int j = 0; j < N; j++) push_hooks.push_back(HookId{ring_py::HOOK_TYPE_RESID_PRE, j});
 
         auto* ctx = new ring_py::StepContext();
         ctx->model_id = "m";
         ctx->flattened = true;
         ctx->requests.push_back(ring_py::RequestMeta{"r", 0, 1, 0, 0});
         std::vector<ring_py::TensorMeta> metas;
-        for (size_t i = 0; i < meta_ids.size(); i++) {
+        for (size_t i = 0; i < push_hooks.size(); i++) {
             ring_py::TensorMeta m;
-            m.hook_type    = ring_py::HOOK_TYPE_RESID_PRE;
-            m.layer_no     = meta_ids[i];
+            m.hook_type    = push_hooks[i].hook_type;
+            m.layer_no     = push_hooks[i].layer_no;
             m.shape        = { 1, (int64_t)SRC_BYTES };
             m.dtype        = (int)at::kByte;
-            m.last_in_step = (i + 1 == meta_ids.size());
+            m.last_in_step = (i + 1 == push_hooks.size());
             metas.push_back(std::move(m));
         }
         fifo.push_step(ctx, metas);
