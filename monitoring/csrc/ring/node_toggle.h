@@ -1,20 +1,33 @@
 // ring/node_toggle.h -- runtime "toggle list" controller for post-capture
 // producer node enable/disable (Axis-A #1/#4).
 //
-// Purpose: make the lockstep invariant STRUCTURAL.  A single enabled-set drives
-// BOTH (a) which producer graph nodes fire -- via cudaGraphNodeSetEnabled -- and
-// (b) which hook metadata the host pushes -- via enabled_in_capture_order().
-// Because both come from the same source, there is no way to enable a node
-// without its meta being in the push list, or vice versa.  This removes the
-// hand-coordination that, if violated, desyncs the positional meta<->payload
-// matching in p2p_thread (see docs/node_toggle_design_notes.md §1).
+// Purpose: keep the lockstep invariant on a SINGLE SOURCE OF TRUTH.  One
+// enabled-set drives BOTH (a) which producer graph nodes fire -- via apply() ->
+// cudaGraphNodeSetEnabled -- and (b) which hook metadata the host pushes -- via
+// enabled_in_capture_order().  This removes the hand-coordination that, if
+// violated, desyncs the positional meta<->payload matching in p2p_thread.
 //
-// Lifecycle (design-notes §1, must be honored by the caller):
-//   1. capture time:        register_node(hook, node) for each producer, in
-//                           capture order.
-//   2. between steps only:  with the prior replay COMPLETE, set the enabled-set,
-//                           apply(exec), push metas for enabled_in_capture_order(),
-//                           then launch.  Never mutate while the exec is running.
+// IMPORTANT -- this is NOT unconditional "lockstep by construction".  It holds
+// only when the caller honors all of:
+//   * Single-threaded, step-boundary ownership.  The controller is plain mutable
+//     state with no internal locking.  Mutate + apply + read the enabled list
+//     from ONE consistent snapshot.  Prefer apply_and_get_enabled(), which
+//     applies and returns the enabled list in a single call so no mutation can
+//     interleave between the two lanes.
+//   * Registration in PRODUCER PUBLISH ORDER.  p2p matches the i-th drained
+//     payload to the i-th popped meta POSITIONALLY.  The meta-push order is the
+//     order entries were register_node()'d.  Therefore entries MUST be
+//     registered in the order producers actually fire (graph capture / launch
+//     order), NOT sorted by hook identity.  Having the same enabled *set* is not
+//     enough -- the *order* must match, or FIFO positions mismatch and desync.
+//     The controller cannot verify this (it has no independent notion of capture
+//     order); it is a caller contract.  validate() checks the things it CAN:
+//     null/duplicate nodes and duplicate hook ids.
+//
+// Lifecycle (design-notes §1): register at capture time, in publish order;
+// between steps only, with the prior replay COMPLETE, set the enabled-set,
+// apply(exec) (or apply_and_get_enabled), push metas for the returned list,
+// then launch.  Never mutate while the exec is running.
 //
 // Header-only, no ATen / no engine deps -- usable from the native backend and
 // from standalone tests alike.
@@ -22,6 +35,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace ring {
@@ -38,7 +52,8 @@ struct HookId {
 
 class NodeToggleController {
 public:
-    // Register, in capture order, the graph node that produces `hook`.
+    // Register, IN PRODUCER PUBLISH ORDER, the graph node that produces `hook`.
+    // (See class doc: order matters, not just identity.)
     void register_node(HookId hook, cudaGraphNode_t node) {
         entries_.push_back(Entry{hook, node, true});  // default: enabled
     }
@@ -55,25 +70,56 @@ public:
         for (auto& e : entries_) e.enabled = static_cast<bool>(pred(e.hook));
     }
 
+    // Check the registry is well-formed: no null node handles, no duplicate node
+    // handles, no duplicate hook ids.  Does NOT (cannot) verify that registration
+    // order equals producer publish order -- that is a caller contract.  Returns
+    // false and sets *reason (if given) on the first problem.  O(n^2); n is small.
+    bool validate(std::string* reason = nullptr) const {
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].node == nullptr) {
+                if (reason) *reason = "null node handle"; return false;
+            }
+            for (size_t j = i + 1; j < entries_.size(); ++j) {
+                if (entries_[i].node == entries_[j].node) {
+                    if (reason) *reason = "duplicate node handle"; return false;
+                }
+                if (entries_[i].hook == entries_[j].hook) {
+                    if (reason) *reason = "duplicate hook id"; return false;
+                }
+            }
+        }
+        return true;
+    }
+
     // Apply the current enabled bits to `exec`.  The CALLER must guarantee the
     // prior replay has completed (design-notes §1 #2) before calling this.
     // Returns the first CUDA error encountered, or cudaSuccess.
     cudaError_t apply(cudaGraphExec_t exec) const {
-        for (auto& e : entries_) {
+        for (const auto& e : entries_) {
             cudaError_t err = cudaGraphNodeSetEnabled(exec, e.node, e.enabled ? 1u : 0u);
             if (err != cudaSuccess) return err;
         }
         return cudaSuccess;
     }
 
-    // The enabled hooks, in capture order -- THE single source of truth for the
-    // host meta-push.  Pushing metas for exactly this list (and only this list)
-    // is what keeps the host meta lane in lockstep with apply().
+    // The enabled hooks, in capture order -- the meta-push list.
     std::vector<HookId> enabled_in_capture_order() const {
         std::vector<HookId> out;
         out.reserve(entries_.size());
         for (const auto& e : entries_) if (e.enabled) out.push_back(e.hook);
         return out;
+    }
+
+    // PREFERRED entry point: apply the enabled bits AND return the matching
+    // meta-push list, from ONE snapshot of the state, in a single call.  Because
+    // no caller mutation can interleave between the two lanes, this is the safe
+    // way to drive a step (still single-threaded; see class doc).
+    cudaError_t apply_and_get_enabled(cudaGraphExec_t exec,
+                                      std::vector<HookId>& out_enabled) const {
+        cudaError_t err = apply(exec);
+        if (err != cudaSuccess) return err;
+        out_enabled = enabled_in_capture_order();
+        return cudaSuccess;
     }
 
 private:

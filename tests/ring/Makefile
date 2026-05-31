@@ -64,8 +64,10 @@ test_node_toggle: $(BUILD)/test_node_toggle
 	$(BUILD)/test_node_toggle
 
 # End-to-end: full consumer (ring_engine + drain + p2p) → needs torch like test_ring_engine.
-$(BUILD)/test_node_toggle_e2e: test_node_toggle_e2e.cu $(PRODUCER_CU) $(DRAIN_SRC) $(P2P_SRC) $(ENGINE_SRC) | $(BUILD)
-	$(NVCC) $(NVCC_FLAGS) -I$(TORCH_INC) -I$(TORCH_INC)/torch/csrc/api/include -L$(TORCH_LIB) -Xlinker -rpath,$(TORCH_LIB) -ltorch -ltorch_cpu -lc10 -lpthread $^ -o $@
+# FORCE-rebuilt: the header-only node_toggle.h (and other ring headers) are not
+# tracked as deps, so always recompile to avoid stale-green binaries.
+$(BUILD)/test_node_toggle_e2e: test_node_toggle_e2e.cu $(PRODUCER_CU) $(DRAIN_SRC) $(P2P_SRC) $(ENGINE_SRC) FORCE | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -I$(TORCH_INC) -I$(TORCH_INC)/torch/csrc/api/include -L$(TORCH_LIB) -Xlinker -rpath,$(TORCH_LIB) -ltorch -ltorch_cpu -lc10 -lpthread test_node_toggle_e2e.cu $(PRODUCER_CU) $(DRAIN_SRC) $(P2P_SRC) $(ENGINE_SRC) -o $@
 
 test_node_toggle_e2e: $(BUILD)/test_node_toggle_e2e
 	$(BUILD)/test_node_toggle_e2e

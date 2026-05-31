@@ -150,6 +150,7 @@ static Result run_scenario(bool lockstep, std::vector<uint8_t*>& src) {
     NodeToggleController ctrl;
     for (int j = 0; j < N; j++)
         ctrl.register_node(HookId{ring_py::HOOK_TYPE_RESID_PRE, j}, node_of_pid[j]);
+    { std::string why; if (!ctrl.validate(&why)) { fprintf(stderr, "FATAL: controller invalid: %s\n", why.c_str()); std::exit(1); } }
     reset_rings();   // clean ring state before the consumer starts
 
     engine.start();
@@ -159,16 +160,19 @@ static Result run_scenario(bool lockstep, std::vector<uint8_t*>& src) {
     for (auto& step : STEPS) {
         CUDA_CHECK(cudaStreamSynchronize(s));   // #1/#2: prior replay done before reconfigure
 
-        // ONE enabled-set drives the node-toggle...
         ctrl.set_enabled_if([&](HookId h) { return step.count(h.layer_no) > 0; });
-        CUDA_CHECK(ctrl.apply(exec));
 
-        // ...and the host meta-push. lockstep -> push exactly the controller's
-        // enabled set (single source of truth); violation -> push for ALL hooks
-        // (bypassing the controller), which is the bug the API exists to prevent.
+        // lockstep -> apply AND get the meta-push list from ONE snapshot
+        // (apply_and_get_enabled: no mutation can interleave the two lanes);
+        // violation -> apply, then push for ALL hooks (bypassing the controller),
+        // the bug the API exists to prevent.
         std::vector<HookId> push_hooks;
-        if (lockstep) push_hooks = ctrl.enabled_in_capture_order();
-        else for (int j = 0; j < N; j++) push_hooks.push_back(HookId{ring_py::HOOK_TYPE_RESID_PRE, j});
+        if (lockstep) {
+            CUDA_CHECK(ctrl.apply_and_get_enabled(exec, push_hooks));
+        } else {
+            CUDA_CHECK(ctrl.apply(exec));
+            for (int j = 0; j < N; j++) push_hooks.push_back(HookId{ring_py::HOOK_TYPE_RESID_PRE, j});
+        }
 
         auto* ctx = new ring_py::StepContext();
         ctx->model_id = "m";
