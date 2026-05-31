@@ -240,8 +240,8 @@
       <div class="box ann-new">
         <span class="badge b-new">⚙️ node→hook map</span>
         <div class="bt">node→hook map</div>
-        <div class="bd"><code>cudaGraphGetNodes()</code> <strong>does not guarantee enumeration order</strong>. The probe's approach: enable single nodes one by one, observe which producer-id publishes, and build an explicit <code>node↦(hook_type,layer)</code> map. New code must replicate this.</div>
-        <span class="bf">new: build the map after graph capture (see probe_dualring_toggle.cu)</span>
+        <div class="bd"><code>cudaGraphGetNodes()</code> <strong>does not guarantee enumeration order</strong>, and the published <code>TaskEntry</code> carries <strong>no hook identity</strong> (the producer kernel only gets <code>hook_type</code>; <code>hook_id</code> is dropped before launch). So a "enable one node, observe the writer" map is a <strong>test-only fixture</strong> and cannot recover <code>(hook_type,layer)</code> in production. Use a <strong>capture-time registry</strong>: record each producer's <code>cudaGraphNode_t</code> in publish order as hooks are installed/captured.</div>
+        <span class="bf">capture-time registry in publish order — implemented as <code>ring::NodeToggleController</code> (node_toggle.h)</span>
       </div>
       <div class="arr">→</div>
       <div class="box ann-ok">
@@ -319,58 +319,73 @@
   <!-- PART 3 -->
   <!-- ================================================================= -->
   <h2>3 · Concrete implementation plan (phased, ordered)</h2>
-  <p class="muted" style="margin-top:0">Principle: <strong>first establish the lockstep discipline on the HF path (where DMI can control its own graph), then tackle the real blocker of vLLM handles</strong>. The device side is already de-risked, so the engineering focus is host lockstep + handle acquisition. Each phase lists: files touched, validation gate, effort (S/M/L), and risk.</p>
+  <p class="muted" style="margin-top:0">Principle: <strong>first establish the lockstep discipline where DMI can control its own graph, then tackle the real blocker of framework (vLLM/HF) handles</strong>. The device side is already de-risked, so the engineering focus is host lockstep + handle acquisition. Each phase lists: files touched, validation gate, effort (S/M/L), and risk.</p>
+
+  <div class="panel" style="border-left:4px solid #15994f">
+    <h3 style="margin-top:0">Status as built (local, RTX 4090 · branch <code>feature/dmi_kernel_node_toggle</code>)</h3>
+    <p class="muted" style="margin-top:0">This plan pre-dates the implementation. The <em>locally verifiable</em> parts of Phases 0–2 are done and tested; the framework-graph integration is not. Phase cards below are annotated with what actually shipped vs. what is deferred.</p>
+    <ul>
+      <li><b style="color:#15994f">✓ Phase 0</b> — device-ring toggle test <span class="file">tests/ring/test_node_toggle.cu</span> (<code>23b881c</code>). <em>H100 reproduction still pending.</em> Results: <span class="file">docs/node_toggle_phase0_results.md</span>.</li>
+      <li><b style="color:#15994f">✓ Phase 1 (C++ ring-consumer E2E)</b> — <span class="file">tests/ring/test_node_toggle_e2e.cu</span> (<code>43c626a</code>): lockstep proven through the real RingEngine→drain→p2p→TensorMetaFifo→SubmitFn on a non-blocking stream, plus a negative control. This is <strong>not</strong> the HF <code>generate()</code> / <code>ring_transport.py</code> / ClickHouse path — that is <b>Phase 1b (pending)</b>. Results: <span class="file">docs/node_toggle_phase1_results.md</span>.</li>
+      <li><b style="color:#15994f">✓ Phase 2 (C++ controller)</b> — <span class="file">monitoring/csrc/ring/node_toggle.h</span> (<code>4c61c83</code>, <code>cc9257d</code>): the <code>NodeToggleController</code> toggle-list. The Python binding is <b>Phase 2b (pending)</b>. Results: <span class="file">docs/node_toggle_phase2_results.md</span>.</li>
+      <li>Invariants of record: <span class="file">docs/node_toggle_design_notes.md</span> §1. Also landed: the <code>set_null_mode</code> stream-race sync fix (<code>b1784ca</code>).</li>
+    </ul>
+  </div>
 
   <!-- Phase 0 -->
   <div class="phase">
     <div class="ph-head">
       <span class="n">Phase 0</span><span>Standalone node-toggle test target</span>
-      <span class="chip s">Effort S</span><span class="chip s">Risk low</span>
+      <span class="chip s">Effort S</span><span class="chip s">Risk low</span><b style="color:#15994f;margin-left:8px">✓ done (4090)</b>
     </div>
     <div class="ph-body">
       <ul>
-        <li>Add a <code>test_node_toggle</code> target (and the missing <code>test_null_mode</code>) to <span class="file">tests/ring/Makefile</span> — the current Makefile only has <code>test_rings / test_producer / test_ring_engine</code>; <span class="file">tests/ring/test_null_mode.cu</span> already exists but has <strong>no target</strong>.</li>
-        <li>Distill the core of the probe (<span class="file">docs/node_toggle_probe/probe_dualring_toggle.cu</span>) into a repeatable CI unit test: link the real <code>ring::producer_kernel</code> + <code>AllocatedRing</code>, capture N producer nodes, disable a subset, and assert that the task ring is contiguous/gap-free with correct offsets.</li>
-        <li>While at it, turn the probe's <strong>node→producer-id mapping</strong> (enabling each node one by one to build the table) into a reusable helper — Phase 2 will use it.</li>
+        <li><b style="color:#15994f">Done:</b> added a <code>test_node_toggle</code> target to <span class="file">tests/ring/Makefile</span> (the Makefile previously only had <code>test_rings / test_producer / test_ring_engine</code>). <em>Note: the pre-existing <span class="file">tests/ring/test_null_mode.cu</span> still has no target — it is unrelated to this feature (older assembler path) and was intentionally left out of scope.</em></li>
+        <li><b style="color:#15994f">Done:</b> distilled the probe (<span class="file">docs/node_toggle_probe/probe_dualring_toggle.cu</span>) into a repeatable test: links the real <code>ring::producer_kernel</code> + <code>AllocatedRing</code>, captures N producer nodes, disables a subset, and asserts the task ring is contiguous/gap-free with correct offsets + sequence numbers.</li>
+        <li>The test builds its node→producer map by <strong>runtime observation</strong> (single-node enable + read the writer byte) — valid here only because the test fills each payload with its producer id. This is a <strong>test fixture, not the production mapping</strong>; production uses the capture-time registry (Phase 2, <span class="file">node_toggle.h</span>).</li>
       </ul>
-      <div class="gate"><b>Gate:</b> Pass the probe-level assertions on H100 (50 random reconfigs, zero corruption), reproducing the 4090 conclusion. Files: <span class="file">tests/ring/Makefile</span>, new <span class="file">tests/ring/test_node_toggle.cu</span>.</div>
-      <p class="note">Do NOT do: any host/Python plumbing; this phase only locks down the device primitive on the target hardware.</p>
+      <div class="gate"><b>Gate (4090, met):</b> 50 random reconfigs, zero corruption; per-replay + reconfigure costs measured. <b>Still open:</b> reproduce on H100. Files: <span class="file">tests/ring/Makefile</span>, <span class="file">tests/ring/test_node_toggle.cu</span>.</div>
+      <p class="note">Did NOT do: any host/Python plumbing; this phase only locks down the device primitive.</p>
     </div>
   </div>
 
   <!-- Phase 1 -->
   <div class="phase">
     <div class="ph-head">
-      <span class="n">Phase 1</span><span>HF-path prototype — DMI owns the graph + lockstep meta gate (core proof)</span>
-      <span class="chip m">Effort M</span><span class="chip m">Risk medium</span>
+      <span class="n">Phase 1</span><span>Lockstep proof through the real consumer (DMI-owned capture)</span>
+      <span class="chip m">Effort M</span><span class="chip m">Risk medium</span><b style="color:#15994f;margin-left:8px">✓ done (C++ E2E)</b>
     </div>
     <div class="ph-body">
-      <p style="margin-top:0">Goal: in an environment where DMI can control the graph, prove end-to-end the §2 discipline "host meta set == device enabled set", with data + correctness flowing through drain/p2p to submit_fn.</p>
+      <p style="margin-top:0">Goal: where DMI can control the graph, prove end-to-end the §1 discipline "host meta set == device enabled set", with data + correctness flowing through drain/p2p to <code>submit_fn</code>.</p>
+      <p style="margin:0 0 8px"><b style="color:#15994f">Done — as a C++ end-to-end test</b> (<span class="file">tests/ring/test_node_toggle_e2e.cu</span>, <code>43c626a</code>), not yet wired into HF:</p>
       <ul>
-        <li><strong>1a · Obtain node handles.</strong> HF currently goes through torch.compile <code>CompileConfig(mode="reduce-overhead")</code>'s cudagraph_trees (<span class="file">monitoring/generate.py:519,604</span>), and DMI likewise does not directly hold the raw graph. The Phase 1 tradeoff: in the HF prototype, switch to a <strong>DMI-owned explicit <code>cudaGraph_t</code> capture</strong> (begin/end capture + instantiate around the producer launch ourselves) in order to obtain the <code>cudaGraphNode_t</code>. This is a "sandbox" environment; it is not required to merge with HF's compile path.</li>
-        <li><strong>1b · enabled-set + real toggle.</strong> Maintain an enabled set in the prototype and call <code>cudaGraphNodeSetEnabled</code> to flip it between replays.</li>
-        <li><strong>1c · lockstep meta gate (the key change).</strong> Upgrade the global <code>null_offload</code> gate at <span class="file">ring_transport.py:613-614</span> into a <strong>per-spec enabled check</strong>: inside the <code>pre_push_all_metas</code> loop, <code>if not enabled(spec): continue</code>, pushing meta only for currently enabled nodes.</li>
-        <li><strong>1d · End-to-end alignment verification.</strong> Reuse the mechanism in <span class="file">tests/test_e2e_correctness_vs_hf.py</span>: all-on → disable a subset (while the host skips the same subset) → assert that (a) disabled hooks produce nothing, (b) the remaining hooks' <code>act_name</code>/<code>layer_no</code>/shape are all aligned, (c) after re-enabling, the full set realigns.</li>
+        <li><strong>1a · node handles (done).</strong> DMI-owned explicit <code>cudaGraph_t</code> capture (begin/end capture + instantiate around the producer launches ourselves) to obtain the <code>cudaGraphNode_t</code>. A sandbox — independent of how HF/vLLM capture.</li>
+        <li><strong>1b · enabled-set + real toggle (done).</strong> <code>cudaGraphNodeSetEnabled</code> flips the set between replays on a <strong>non-blocking stream</strong>, at step boundaries with the prior replay synced first.</li>
+        <li><strong>1c · lockstep meta gate (done in the harness).</strong> Metas are pushed only for the enabled set; a <strong>negative control</strong> (push for all nodes) confirms the desync is real (22/37 misaligned). Drives the real <code>RingEngine → drain → p2p → TensorMetaFifo → SubmitFn</code>.</li>
+        <li><strong>1d · alignment verified (done).</strong> Every submitted slice satisfies <code>layer_no == first-byte(payload)</code> and the delivered sequence equals the per-step enabled sets; 0 desync under lockstep.</li>
       </ul>
-      <div class="gate"><b>Gate:</b> Multiple flips within a single run, with zero warnings from the p2p-side <code>:185</code> size-check and per-hook-correct content landed in ClickHouse. This proves the lockstep discipline holds.</div>
-      <p class="note">Do NOT do: vLLM integration; do not try to modify HF's compile path itself. This phase is only to "prove the discipline under a controllable graph".</p>
+      <div class="gate"><b>Gate (met):</b> multiple flips in one run, 0 desync end-to-end through the consumer; negative control trips. Proves the lockstep discipline holds.</div>
+      <p class="phase" style="border:0;padding:0;margin:10px 0 0"><b>Phase 1b — real HF meta path (PENDING).</b> What this card originally scoped but is <em>not</em> done: HF goes through torch.compile <code>CompileConfig(mode="reduce-overhead")</code> cudagraph_trees (<span class="file">generate.py:519,604</span>), so DMI doesn't hold that graph (same class of blocker as vLLM — see Phase 3). 1b = turn the global <code>null_offload</code> gate (<span class="file">ring_transport.py:613-614</span>) into a per-spec enabled check inside <code>pre_push_all_metas</code>, and validate via <span class="file">tests/test_e2e_correctness_vs_hf.py</span> with content landing in ClickHouse. Needs the backend build.</p>
+      <p class="note">Did NOT do here: vLLM integration; modifying HF's compile path.</p>
     </div>
   </div>
 
   <!-- Phase 2 -->
   <div class="phase">
     <div class="ph-head">
-      <span class="n">Phase 2</span><span>Toggle-List API surface — host state + bindings + explicit node↦hook map</span>
-      <span class="chip m">Effort M</span><span class="chip s">Risk low-medium</span>
+      <span class="n">Phase 2</span><span>Toggle-List API — controller + (binding) + capture-time node↦hook registry</span>
+      <span class="chip m">Effort M</span><span class="chip s">Risk low-medium</span><b style="color:#15994f;margin-left:8px">✓ C++ controller done · 2b binding pending</b>
     </div>
     <div class="ph-body">
+      <p class="note" style="border-left-color:#b87514;background:#fdf6ec"><b>Hard prerequisite.</b> The toggle-list only does anything where DMI <em>owns or is handed</em> both the <code>cudaGraphExec_t</code> and the producer <code>cudaGraphNode_t</code>s. That holds in the DMI-owned sandbox capture (Phase 1) but <strong>not</strong> in HF/vLLM until handle acquisition is solved (Phase 3). So the controller is handle-agnostic by design; the runtime knob is only usable on a DMI-owned graph or after Phase 3.</p>
       <ul>
-        <li><strong>Expose the API, mirroring the <code>set_null_mode</code> chain.</strong> The device flag chain is <code>producer.cu:21 set_ring_null_mode</code> → <span class="file">ring_engine_py.cu:93</span> → <span class="file">bindings.cpp:482</span>. Add the matching toggle-list interface: <code>set_node_enabled(node_idx,bool)</code> / <code>set_enabled_mask(...)</code>, exposed to Python via <span class="file">ring_engine_py.{cu,h}</span> + <span class="file">bindings.cpp</span>, with <code>gil_scoped_release</code> (same as set_null_mode).</li>
-        <li><strong>The node→hook map must be explicit.</strong> Because <code>cudaGraphGetNodes()</code> does not guarantee order, use the Phase 0 helper: after capture, enable single nodes one by one, observe the published producer-id, and build a <code>node_idx ↦ (hook_type, layer_no)</code> mapping table as the index basis for the toggle list.</li>
-        <li><strong>Single source of truth.</strong> The enabled set is shared by two places: the device-side <code>cudaGraphNodeSetEnabled</code> and the host-side <code>pre_push_all_metas</code> filter. Provide an atomic "set the whole table" entry point to avoid a half-flipped state.</li>
+        <li><b style="color:#15994f">Done — the controller.</b> <code>ring::NodeToggleController</code> (<span class="file">monitoring/csrc/ring/node_toggle.h</span>): one enabled-set drives both <code>apply(exec)</code>→<code>cudaGraphNodeSetEnabled</code> and the meta-push list. It takes node handles via <code>register_node()</code> — it does not acquire them.</li>
+        <li><strong>Capture-time registry (not runtime observation).</strong> Because <code>cudaGraphGetNodes()</code> gives no order guarantee <em>and</em> the payload carries no hook identity, the map is built at capture time: <code>register_node({hook_type,layer_no}, node)</code> <strong>in producer publish order</strong>. p2p matches positionally, so the same enabled <em>set</em> in the wrong <em>order</em> still desyncs — <code>validate()</code> checks null/duplicate nodes + duplicate hook ids (order itself is a caller contract).</li>
+        <li><strong>§1 invariants are part of the API contract</strong> (<span class="file">node_toggle_design_notes.md</span> §1): reconfigure only at a step boundary; <code>apply()</code> only after the prior replay has <em>completed</em> (never mutate a running exec); push metas for the same snapshot the same step; mutate-then-launch. Use <code>apply_and_get_enabled(exec,out)</code> — applies and returns the meta-push list from <strong>one snapshot</strong>, so no mutation can interleave the two lanes (single-threaded ownership).</li>
+        <li><b>2b (pending) — Python binding.</b> Mirror the <code>set_null_mode</code> chain (<code>producer.cu set_ring_null_mode</code> → <code>ring_engine_py</code> → <code>bindings.cpp</code>, with <code>gil_scoped_release</code>): expose <code>set_enabled_hooks([...])</code> / atomic whole-table set, and feed the controller from <code>RingEnginePy</code>. Needs the backend build to compile-test.</li>
       </ul>
-      <div class="gate"><b>Gate:</b> The Python API flips any subset at step boundaries, the Phase 1 e2e assertions still pass, and the node↦hook map is correct for all captured nodes.</div>
-      <p class="note">Do NOT do: any re-instantiate / re-capture path (that is 100s µs–ms; the whole selling point of this mechanism is to avoid it).</p>
+      <div class="gate"><b>Gate:</b> (done) controller drives the Phase 1 e2e with 0 desync under lockstep, validate() passes; (2b) Python API flips any subset at step boundaries with the meta path in lockstep.</div>
+      <p class="note">Do NOT do: any re-instantiate / re-capture path (100s µs–ms; avoiding it is the whole point).</p>
     </div>
   </div>
 
@@ -423,16 +438,18 @@
   <div class="panel">
     <h3 style="margin-top:0">Phase overview</h3>
     <table>
-      <tr><th>Phase</th><th>Content</th><th>Key files</th><th>Effort</th><th>Risk</th></tr>
-      <tr><td>0</td><td>standalone test target + node→id helper</td><td class="file">tests/ring/Makefile, test_node_toggle.cu</td><td><span class="chip s">S</span></td><td>low</td></tr>
-      <tr><td>1</td><td>HF DMI-owned graph + lockstep meta gate (core)</td><td class="file">generate.py, ring_transport.py:604-659, test_e2e_correctness_vs_hf.py</td><td><span class="chip m">M</span></td><td>medium</td></tr>
-      <tr><td>2</td><td>toggle-list API + explicit node↦hook map</td><td class="file">ring_engine_py.{cu,h}, bindings.cpp, ring_transport.py</td><td><span class="chip m">M</span></td><td>low-medium</td></tr>
-      <tr><td>3</td><td>⛔ vLLM handle acquisition (real blocker, research-first)</td><td class="file">vllm_integration.py + vLLM capture internals</td><td><span class="chip l">L</span></td><td>high</td></tr>
-      <tr><td>4</td><td>adaptive upgrade (built on the toggle list)</td><td class="file">policy layer + Phase 2 state</td><td><span class="chip m">M</span></td><td>medium</td></tr>
+      <tr><th>Phase</th><th>Content</th><th>Key files</th><th>Effort</th><th>Status</th></tr>
+      <tr><td>0</td><td>standalone device-ring toggle test</td><td class="file">tests/ring/Makefile, test_node_toggle.cu</td><td><span class="chip s">S</span></td><td><b style="color:#15994f">✓ done (4090); H100 pending</b></td></tr>
+      <tr><td>1</td><td>lockstep proof through real consumer (DMI-owned capture)</td><td class="file">tests/ring/test_node_toggle_e2e.cu</td><td><span class="chip m">M</span></td><td><b style="color:#15994f">✓ done</b></td></tr>
+      <tr><td>1b</td><td>real HF meta path (per-spec gate + ClickHouse e2e)</td><td class="file">ring_transport.py:604-659, generate.py, test_e2e_correctness_vs_hf.py</td><td><span class="chip m">M</span></td><td>pending (needs backend build)</td></tr>
+      <tr><td>2</td><td>toggle-list controller (capture-time registry)</td><td class="file">monitoring/csrc/ring/node_toggle.h</td><td><span class="chip m">M</span></td><td><b style="color:#15994f">✓ done</b></td></tr>
+      <tr><td>2b</td><td>Python binding for the toggle list</td><td class="file">ring_engine_py.{cu,h}, bindings.cpp, ring_transport.py</td><td><span class="chip s">S</span></td><td>pending (needs backend build)</td></tr>
+      <tr><td>3</td><td>⛔ vLLM/HF handle acquisition (real blocker, research-first)</td><td class="file">vllm_integration.py + framework capture internals</td><td><span class="chip l">L</span></td><td>pending (gates 1b/2b on framework path)</td></tr>
+      <tr><td>4</td><td>adaptive upgrade (built on the toggle list)</td><td class="file">policy layer + Phase 2 state</td><td><span class="chip m">M</span></td><td>pending (depends on 2b/3)</td></tr>
     </table>
   </div>
 
-  <p class="foot">Sources: the verified investigation report <span class="file">docs/node_toggle_investigation_report.md</span> + the probe <span class="file">docs/node_toggle_probe/probe_dualring_toggle.cu</span>. All file:line references have been cross-checked against the current code in <span class="file">monitoring/</span> (producer.cu / p2p_thread.cpp / tensor_meta.h / drain_thread.cpp / ring_transport.py / ring_engine_py.cu / bindings.cpp / tests/ring/Makefile). This document is a design plan and does not modify any existing source.</p>
+  <p class="foot">Sources: the investigation report <span class="file">docs/node_toggle_investigation_report.md</span>, the probe <span class="file">docs/node_toggle_probe/</span>, and the per-phase results docs <span class="file">docs/node_toggle_phase{0,1,2}_results.md</span> + invariants <span class="file">docs/node_toggle_design_notes.md</span>. <b>Caveat on line references:</b> the file:line citations here were accurate when this plan was first written and have since <em>drifted</em> as the implementation landed (e.g. <code>set_null_mode</code> moved in <code>ring_engine_py.cu</code> and now returns <code>cudaError_t</code>; <code>producer.cu</code> changed). Treat them as approximate pointers — the per-phase results docs reflect the current code. This document is a design plan; the committed code is the source of truth.</p>
 
 </div>
 </body>
