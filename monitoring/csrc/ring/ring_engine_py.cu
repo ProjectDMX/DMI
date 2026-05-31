@@ -91,7 +91,16 @@ RingFlushStats RingEnginePy::get_stats() const {
 }
 
 void RingEnginePy::set_null_mode(bool enabled) {
+    // cudaMemcpyToSymbol goes through the legacy default stream, which does
+    // NOT synchronize with PyTorch's non-blocking compute streams.  Sync
+    // before to drain pending producer kernels that still need the old value,
+    // and after to ensure the new value is visible before the next launch.
+    // (Ported from ring_full_tp d0a99a5; the same stream-ordering discipline
+    // applies to any post-capture node-toggle reconfigure -- see
+    // docs/node_toggle_design_notes.md.)
+    cudaDeviceSynchronize();
     ring::set_ring_null_mode(enabled);
+    cudaDeviceSynchronize();
 }
 
 void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {

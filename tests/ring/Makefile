@@ -25,7 +25,11 @@ TORCH_LIB := $(shell python -c "import torch; print(torch.utils.cmake_prefix_pat
 
 TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer $(BUILD)/test_ring_engine
 
-.PHONY: all test_rings test_producer test_ring_engine run clean
+# Override producer count / tensor size:  make test_node_toggle NPROD=145 SRC_KB=512
+NPROD  ?= 16
+SRC_KB ?= 1024
+
+.PHONY: all test_rings test_producer test_ring_engine test_node_toggle run clean
 
 all: $(TARGETS)
 
@@ -41,6 +45,10 @@ $(BUILD)/test_producer: test_producer.cu $(PRODUCER_CU) | $(BUILD)
 $(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRC) | $(BUILD)
 	$(NVCC) $(NVCC_FLAGS) -I$(TORCH_INC) -I$(TORCH_INC)/torch/csrc/api/include -L$(TORCH_LIB) -Xlinker -rpath,$(TORCH_LIB) -ltorch -ltorch_cpu -lc10 -lpthread $^ -o $@
 
+# Rebuilt unconditionally (.PHONY dep) so NPROD/SRC_KB overrides always take effect.
+$(BUILD)/test_node_toggle: test_node_toggle.cu $(PRODUCER_CU) FORCE | $(BUILD)
+	$(NVCC) $(NVCC_FLAGS) -DNPROD=$(NPROD) -DSRC_KB=$(SRC_KB) test_node_toggle.cu $(PRODUCER_CU) -o $@
+
 test_rings: $(BUILD)/test_rings
 	$(BUILD)/test_rings
 
@@ -49,6 +57,11 @@ test_producer: $(BUILD)/test_producer
 
 test_ring_engine: $(BUILD)/test_ring_engine
 	$(BUILD)/test_ring_engine
+
+test_node_toggle: $(BUILD)/test_node_toggle
+	$(BUILD)/test_node_toggle
+
+FORCE:
 
 run: all
 	$(BUILD)/test_rings
