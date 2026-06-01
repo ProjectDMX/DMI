@@ -328,6 +328,7 @@
       <li><b style="color:#15994f">✓ Phase 0</b> — device-ring toggle test <span class="file">tests/ring/test_node_toggle.cu</span> (<code>23b881c</code>). <em>H100 reproduction still pending.</em> Results: <span class="file">docs/node_toggle_phase0_results.md</span>.</li>
       <li><b style="color:#15994f">✓ Phase 1 (C++ ring-consumer E2E)</b> — <span class="file">tests/ring/test_node_toggle_e2e.cu</span> (<code>43c626a</code>): lockstep proven through the real RingEngine→drain→p2p→TensorMetaFifo→SubmitFn on a non-blocking stream, plus a negative control. This is <strong>not</strong> the HF <code>generate()</code> / <code>ring_transport.py</code> / ClickHouse path — that is <b>Phase 1b (pending)</b>. Results: <span class="file">docs/node_toggle_phase1_results.md</span>.</li>
       <li><b style="color:#15994f">✓ Phase 2 (C++ controller)</b> — <span class="file">monitoring/csrc/ring/node_toggle.h</span> (<code>4c61c83</code>, <code>cc9257d</code>): the <code>NodeToggleController</code> toggle-list. The Python binding is <b>Phase 2b (pending)</b>. Results: <span class="file">docs/node_toggle_phase2_results.md</span>.</li>
+      <li><b style="color:#15994f">✓ Phase 3 feasibility</b> — the "real blocker" is cleared in principle: DMI node handles recoverable via <code>cudaStreamGetCaptureInfo</code> + torch's <code>raw_cuda_graph_exec</code>; toggle confirmed on a foreign exec and on torch's own exec (<code>e170828</code>). Real vLLM wiring (3b) pending. Results: <span class="file">docs/node_toggle_phase3_feasibility.md</span>.</li>
       <li>Invariants of record: <span class="file">docs/node_toggle_design_notes.md</span> §1. Also landed: the <code>set_null_mode</code> stream-race sync fix (<code>b1784ca</code>).</li>
     </ul>
   </div>
@@ -444,7 +445,8 @@
       <tr><td>1b</td><td>real HF meta path (per-spec gate + ClickHouse e2e)</td><td class="file">ring_transport.py:604-659, generate.py, test_e2e_correctness_vs_hf.py</td><td><span class="chip m">M</span></td><td>pending (needs backend build)</td></tr>
       <tr><td>2</td><td>toggle-list controller (capture-time registry)</td><td class="file">monitoring/csrc/ring/node_toggle.h</td><td><span class="chip m">M</span></td><td><b style="color:#15994f">✓ done</b></td></tr>
       <tr><td>2b</td><td>Python binding for the toggle list</td><td class="file">ring_engine_py.{cu,h}, bindings.cpp, ring_transport.py</td><td><span class="chip s">S</span></td><td>pending (needs backend build)</td></tr>
-      <tr><td>3</td><td>⛔ vLLM/HF handle acquisition (real blocker, research-first)</td><td class="file">vllm_integration.py + framework capture internals</td><td><span class="chip l">L</span></td><td>pending (gates 1b/2b on framework path)</td></tr>
+      <tr><td>3a</td><td>framework graph-handle feasibility (was the blocker)</td><td class="file">probe_phase3_capture_handles.cu, probe_phase3_torch_handle.py</td><td><span class="chip s">S</span></td><td><b style="color:#15994f">✓ feasible (mechanism proven)</b></td></tr>
+      <tr><td>3b</td><td>real vLLM handle wiring (keep_graph, per-graph registry)</td><td class="file">vllm_integration.py + framework capture internals</td><td><span class="chip l">L</span></td><td>pending (verify on H100)</td></tr>
       <tr><td>4</td><td>adaptive upgrade (built on the toggle list)</td><td class="file">policy layer + Phase 2 state</td><td><span class="chip m">M</span></td><td>pending (depends on 2b/3)</td></tr>
     </table>
   </div>
