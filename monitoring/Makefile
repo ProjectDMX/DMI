@@ -174,6 +174,11 @@ ifeq ($(NVTX),auto)
   endif
 else ifeq ($(NVTX),1)
   LDFLAGS += -lnvToolsExt
+else ifeq ($(NVTX),0)
+  # Fully disable NVTX: compile the no-op shim path (not just drop the lib).
+  # Needed on CUDA 13 where nvToolsExt.h exists but libnvToolsExt.so does not.
+  CXXFLAGS  += -DMON_NVTX_DISABLE
+  NVCCFLAGS += -DMON_NVTX_DISABLE
 endif
 
 # Automatic header dependency tracking.

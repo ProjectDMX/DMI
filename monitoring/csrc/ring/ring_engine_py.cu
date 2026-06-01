@@ -74,21 +74,20 @@ void RingEnginePy::stop() {
 }
 
 uint64_t RingEnginePy::flush_and_wait() {
-    return impl_->engine.drain_thread().force_flush_and_wait_timed();
+    // NOTE: this branch's DrainThread exposes only `void force_flush_and_wait()`
+    // (no timed variant / FlushStats accessor that this file was written against
+    // -- a pre-existing mismatch, see docs/node_toggle_impl_plan_local.md Phase A).
+    // Stub the timing return as 0 (only feeds a diagnostic _flush_ms in
+    // generate.py); behaviour/correctness of the flush itself is unchanged.
+    impl_->engine.drain_thread().force_flush_and_wait();
+    return 0;
 }
 
 RingFlushStats RingEnginePy::get_stats() const {
-    const ring::FlushStats native = impl_->engine.drain_thread().get_stats();
+    // See note in flush_and_wait: DrainThread has no get_stats()/FlushStats on
+    // this branch. Return zeroed stats (ring get_stats is bound but unused from
+    // Python). TODO: reconcile drain timed-flush + stats API across branches.
     RingFlushStats stats{};
-    stats.pending_entries = native.pending_entries;
-    stats.pending_bytes = native.pending_bytes;
-    stats.cpu_payload_head = native.cpu_payload_head;
-    stats.cpu_payload_tail_committed = native.cpu_payload_tail_committed;
-    stats.total_flushes = native.total_flushes;
-    stats.last_flush_entries = native.last_flush_entries;
-    stats.last_flush_bytes = native.last_flush_bytes;
-    stats.last_flush_complete_monotonic_us = native.last_flush_complete_monotonic_us;
-    stats.last_force_flush_wait_us = native.last_force_flush_wait_us;
     return stats;
 }
 

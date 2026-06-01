@@ -6,7 +6,12 @@
 
 #include <stdint.h>
 
-#if defined(__has_include)
+#if defined(MON_NVTX_DISABLE)
+// Forced off (e.g. CUDA 13 ships nvToolsExt.h headers but no libnvToolsExt.so,
+// so __has_include would be true yet nvtxRangePushA is unresolvable). Build with
+// NVTX=0 to take this no-op path.
+#  define MON_NVTX_ENABLED 0
+#elif defined(__has_include)
 #  if __has_include(<nvToolsExt.h>)
 #    include <nvToolsExt.h>
 #    define MON_NVTX_ENABLED 1
