@@ -80,18 +80,18 @@ std::string QualifiedTableNameQuoted(const std::string& db, const std::string& t
 std::string ClickHouseInitRemediation(const ClickHouseClientConfig& cfg,
                                       const char* error) {
   const std::string err = error ? error : "";
+  const bool database_missing =
+      err.find("Database ") != std::string::npos
+      && err.find("does not exist") != std::string::npos;
   if (err.find("Database default does not exist") != std::string::npos) {
     return "Please create the ClickHouse database 'default' before starting DMI.";
   }
-  if (!cfg.create_database_if_missing) {
+  if (database_missing && !cfg.create_database_if_missing) {
     return "Please set create_database_if_missing=true, or create the configured "
            "ClickHouse database '" + cfg.database + "' manually before "
            "starting DMI.";
   }
-  if (
-      err.find("Database ") != std::string::npos
-      && err.find("does not exist") != std::string::npos
-  ) {
+  if (database_missing) {
     return "Please create the missing ClickHouse database manually, or verify the "
            "configured database name and permissions.";
   }
@@ -423,9 +423,11 @@ void ClickHouseInsertStage::ThreadInit(int /*thread_idx*/, const ClickHouseClien
     tl_client->Execute("USE " + QuoteIdent(cfg.database));
     ApplySessionSettings(*tl_client, cfg);
   } catch (const std::exception& e) {
+    tl_client.reset();
     LogClickHouseInitFailure(cfg, e.what());
     throw;
   } catch (...) {
+    tl_client.reset();
     LogClickHouseInitFailure(cfg, "unknown non-std exception");
     throw;
   }
