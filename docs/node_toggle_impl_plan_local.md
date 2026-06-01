@@ -24,16 +24,23 @@ git submodule update --init libs/clickhouse-cpp           # was not checked out
 cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON   # PIC required for .so
 cmake --build libs/clickhouse-cpp/build -j
-make -C monitoring -j NVTX=0                               # NVTX off (see below)
+make -C monitoring -j                                      # auto-detect handles NVTX
 python -c "import monitoring_native_backend as m; print(hasattr(m,'RingEngine'))"  # True
 ```
 Three issues hit + fixed (all now in-tree):
 1. **clickhouse-cpp submodule not checked out** → `submodule update --init`.
 2. **`-fPIC`**: the default CLAUDE.md cmake line builds non-PIC static libs → `ld: ...
    can not be used when making a shared object`. Add `-DCMAKE_POSITION_INDEPENDENT_CODE=ON`.
-3. **NVTX on CUDA 13**: `nvToolsExt.h` exists but `libnvToolsExt.so` doesn't → undefined
-   `nvtxRangePushA` at import. Added a `MON_NVTX_DISABLE` guard to `nvtx_shim.h` and wired
-   `make NVTX=0` to define it. Build with `NVTX=0`.
+3. **NVTX auto-detect was broken** (not a missing lib — `libnvToolsExt.so` *does* exist at
+   `/usr/lib/x86_64-linux-gnu`). The Makefile's `NVTX_HEADER_FOUND := $(shell echo '\#if
+   __has_include...')` used `\#` to hide `#` from *make's* comment parser, but that
+   backslash broke the preprocessor test → it reported "not found" and skipped
+   `-lnvToolsExt`, while the *compiler* found the header (via torch's bundled NVTX) and
+   emitted `nvtxRangePushA` → `undefined symbol` at import. Fix: (a) added a
+   `MON_NVTX_DISABLE` guard to `nvtx_shim.h` so emission and linking stay consistent; (b)
+   rewrote auto-detect to enable NVTX only when it can positively confirm header+lib, else
+   define `MON_NVTX_DISABLE` (no-op shim). Net: **default `make` now builds + imports** (no
+   `NVTX=0` needed); NVTX ends up conservatively off here, which is harmless (profiling only).
 4. **Pre-existing branch break**: `ring_engine_py.cu` referenced `force_flush_and_wait_timed`
    / `FlushStats` / `get_stats` absent from this branch's `drain_thread.{h,cpp}`. Stubbed
    the two (diagnostics only) to match the real API. TODO: reconcile the drain timed/stats

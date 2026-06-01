@@ -161,22 +161,32 @@ CXXFLAGS += -flto
 LDFLAGS += -flto
 endif
 
-# NVTX runtime linking.  nvtx_shim.h uses __has_include(<nvToolsExt.h>) to
-# decide at compile time whether to emit NVTX calls.  If the header is found,
-# the library must also be linked.  Auto-detect by default; override with
-# NVTX=0 to force no-op stubs (the header's #else branch) or NVTX=1 to force
-# linking.
+# NVTX runtime linking.  nvtx_shim.h emits NVTX calls only when MON_NVTX_ENABLED.
+# Auto-detect (default) enables NVTX iff BOTH the header is present AND
+# libnvToolsExt is actually linkable -- on CUDA 13 the header ships but the lib
+# does not, so a header-only check would build a .so that fails to import with
+# `undefined symbol: nvtxRangePushA`.  Override: NVTX=1 forces linking, NVTX=0
+# forces the no-op shim.
 NVTX ?= auto
 ifeq ($(NVTX),auto)
-  NVTX_HEADER_FOUND := $(shell echo '\#if __has_include(<nvToolsExt.h>)\nyes\n\#endif' | $(CXX) $(CUDA_INCLUDE_FLAGS) -E -x c++ - 2>/dev/null | grep -c yes)
-  ifeq ($(NVTX_HEADER_FOUND),1)
+  # Enable NVTX iff the header is actually includable AND libnvToolsExt links.
+  # Detect the header by trying to -include it (NOT an `echo '#if ...'` pipe: make
+  # treats `#` as a comment, and the old `\#` escape leaked a backslash that broke
+  # the preprocessor test -> it reported "not found" while the compiler DID find
+  # the header and emitted nvtxRangePushA, yielding `undefined symbol` at import).
+  NVTX_HEADER_FOUND := $(shell $(CXX) $(CUDA_INCLUDE_FLAGS) $(TORCH_INCLUDE_FLAGS) -E -include nvToolsExt.h -x c++ /dev/null >/dev/null 2>&1 && echo 1 || echo 0)
+  NVTX_LIB_FOUND := $(shell echo 'int main(){return 0;}' | $(CXX) $(CUDA_LIB_FLAGS) -x c++ - -lnvToolsExt -o /dev/null 2>/dev/null && echo 1 || echo 0)
+  ifeq ($(NVTX_HEADER_FOUND)$(NVTX_LIB_FOUND),11)
     LDFLAGS += -lnvToolsExt
+  else
+    # header or lib unavailable: compile the no-op shim so the build is consistent.
+    CXXFLAGS  += -DMON_NVTX_DISABLE
+    NVCCFLAGS += -DMON_NVTX_DISABLE
   endif
 else ifeq ($(NVTX),1)
   LDFLAGS += -lnvToolsExt
 else ifeq ($(NVTX),0)
   # Fully disable NVTX: compile the no-op shim path (not just drop the lib).
-  # Needed on CUDA 13 where nvToolsExt.h exists but libnvToolsExt.so does not.
   CXXFLAGS  += -DMON_NVTX_DISABLE
   NVCCFLAGS += -DMON_NVTX_DISABLE
 endif

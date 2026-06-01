@@ -7,9 +7,11 @@
 #include <stdint.h>
 
 #if defined(MON_NVTX_DISABLE)
-// Forced off (e.g. CUDA 13 ships nvToolsExt.h headers but no libnvToolsExt.so,
-// so __has_include would be true yet nvtxRangePushA is unresolvable). Build with
-// NVTX=0 to take this no-op path.
+// Forced off by the build (Makefile NVTX auto-detect could not confirm both the
+// nvToolsExt header AND a linkable libnvToolsExt, or NVTX=0 was passed). This
+// guard keeps emission consistent with linking: without it, the compiler's
+// __has_include could emit nvtxRangePushA while the lib is not linked, giving an
+// `undefined symbol` at import.
 #  define MON_NVTX_ENABLED 0
 #elif defined(__has_include)
 #  if __has_include(<nvToolsExt.h>)
