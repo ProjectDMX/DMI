@@ -49,7 +49,26 @@ Three issues hit + fixed (all now in-tree):
 
 ---
 
-## Phase B (= 2b) — Toggle-list registry + Python binding
+## Phase B (= 2b) — Toggle-list registry + Python binding  ✓ DONE (commit 283fe79)
+
+**As built** (test: `tests/ring/test_toggle_binding.py`, ALL PASS):
+- Registry implemented **inline in `ring_engine_py.cu`'s `Impl`** (multi-graph: per
+  `cudaGraph_t` node list + exec map + a single global enabled-set), rather than per-graph
+  `NodeToggleController` instances — cleaner for the backend's multi-graph reality.
+  `node_toggle.h` remains the standalone-test abstraction. The enabled-set is the single
+  source read by both `apply_toggle()` (device) and `is_hook_enabled()` (host meta gate).
+- `ring_torch_op.cpp`: after the producer launch, if `g_toggle_capture` and the stream is
+  capturing, records the tail-dependency node via `cudaStreamGetCaptureInfo` (CUDA-13
+  7-arg signature) — gated by `enable_toggle_capture(true)`, default off.
+- Bindings: `enable_toggle_capture / bind_graph_exec / set_enabled_hooks / apply_toggle /
+  is_hook_enabled / toggle_node_count / clear_toggle_registry` (handles as `uint64_t`).
+- **Verified through the real backend**: real `torch.ops.ring.producer` registered all
+  nodes during a torch capture; `apply_toggle()` succeeded on torch's `raw_cuda_graph_exec`
+  with the capture-recorded handles (the Phase 3 mechanism, now via the actual producer op).
+- **Not yet verified here**: the device *effect* (disabled node writes nothing) observed
+  end-to-end — that needs the meta gate + a consumer, i.e. Phase C.
+
+### Original plan (for reference)
 
 Goal: capture-time node registration in C++, a host enabled-set, an `apply` that
 toggles on a bound exec, and a Python API. No model needed to unit-test.
