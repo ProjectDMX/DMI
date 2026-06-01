@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "ring/tensor_meta.h"   // TensorMeta, TensorMetaFifo
@@ -88,6 +89,33 @@ public:
     void hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
                         uint32_t hook_type,
                         uint64_t stream_handle);
+
+    // --- Runtime node-toggle (Phase B). cudaGraph_t / cudaGraphNode_t /
+    //     cudaGraphExec_t are passed as uint64_t handles to keep this header
+    //     CUDA-free (it is included by g++-compiled bindings.cpp). The enabled
+    //     hook set is the SINGLE SOURCE OF TRUTH: apply_toggle() (device) and
+    //     is_hook_enabled() (host meta gate) both read it. See
+    //     docs/node_toggle_design_notes.md §1.
+    //
+    // enable_toggle_capture(true) makes the producer op record its kernel node
+    // (via cudaStreamGetCaptureInfo) during graph capture; default off ->
+    // behaviour unchanged.
+    void enable_toggle_capture(bool enabled);
+    bool toggle_capture_enabled() const;
+    // Called from the producer op during capture (C++ only, not bound).
+    void register_capture_node(uint64_t graph, int hook_type, int layer_no, uint64_t node);
+    // Associate the instantiated exec (torch raw_cuda_graph_exec) with the graph
+    // (torch raw_cuda_graph) the nodes were recorded under.
+    void bind_graph_exec(uint64_t graph, uint64_t exec);
+    // Set the enabled (hook_type, layer_no) set (the single source).
+    void set_enabled_hooks(const std::vector<std::pair<int,int>>& enabled);
+    // Apply the enabled set to every bound exec via cudaGraphNodeSetEnabled.
+    // Caller guarantees the prior replay has completed (design-notes §1).
+    int  apply_toggle();
+    // Host meta-gate query: true if the hook is enabled (or toggle inactive).
+    bool is_hook_enabled(int hook_type, int layer_no) const;
+    uint64_t toggle_node_count() const;
+    void clear_toggle_registry();
 
     // Lightweight wake-up for the drain thread.
     void notify_drain();

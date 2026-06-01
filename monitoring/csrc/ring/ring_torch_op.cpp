@@ -44,6 +44,15 @@ void ring_set_cpu_direct(bool enabled) {
     g_cpu_direct = enabled;
 }
 
+// Node-toggle capture flag.  When true, after launching the producer kernel the
+// op records its just-added graph node (the capture tail dependency) into the
+// active engine's toggle registry, so it can be toggled post-capture.  Default
+// off -> hot path unchanged.
+static bool g_toggle_capture = false;
+void ring_set_toggle_capture(bool enabled) {
+    g_toggle_capture = enabled;
+}
+
 // Side-effect op: either launches the producer kernel (normal ring path)
 // or copies tensor to CPU and submits directly (cpu_direct path).
 //
@@ -85,6 +94,25 @@ void ring_producer_impl(
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream())
         );
+
+        // Node-toggle: if capturing, record THIS producer's kernel node (the
+        // current tail dependency) so it can be enabled/disabled post-capture.
+        if (g_toggle_capture) {
+            cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+            unsigned long long      cap_id = 0;
+            cudaGraph_t             cap_graph = nullptr;
+            const cudaGraphNode_t*  cap_deps  = nullptr;
+            const cudaGraphEdgeData* cap_edges = nullptr;  // CUDA 13 signature
+            size_t                  cap_nd    = 0;
+            if (cudaStreamGetCaptureInfo(stream.stream(), &cap_st, &cap_id, &cap_graph,
+                                         &cap_deps, &cap_edges, &cap_nd) == cudaSuccess
+                && cap_st == cudaStreamCaptureStatusActive && cap_nd >= 1) {
+                g_active_engine->register_capture_node(
+                    reinterpret_cast<uint64_t>(cap_graph),
+                    static_cast<int>(hook_type), static_cast<int>(hook_id),
+                    reinterpret_cast<uint64_t>(cap_deps[cap_nd - 1]));
+            }
+        }
     }
 }
 

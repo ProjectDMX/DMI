@@ -483,6 +483,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),
            py::call_guard<py::gil_scoped_release>())
+      // --- Runtime node-toggle (Phase B) ---
+      .def("enable_toggle_capture",
+           &ring_py::RingEnginePy::enable_toggle_capture,
+           py::arg("enabled"))
+      .def("bind_graph_exec",
+           &ring_py::RingEnginePy::bind_graph_exec,
+           py::arg("graph"), py::arg("exec"))
+      .def("set_enabled_hooks",
+           &ring_py::RingEnginePy::set_enabled_hooks,
+           py::arg("enabled"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("apply_toggle",
+           &ring_py::RingEnginePy::apply_toggle,
+           py::call_guard<py::gil_scoped_release>())
+      .def("is_hook_enabled",
+           &ring_py::RingEnginePy::is_hook_enabled,
+           py::arg("hook_type"), py::arg("layer_no"))
+      .def("toggle_node_count", &ring_py::RingEnginePy::toggle_node_count)
+      .def("clear_toggle_registry", &ring_py::RingEnginePy::clear_toggle_registry)
       .def("notify_drain",
            &ring_py::RingEnginePy::notify_drain,
            py::call_guard<py::gil_scoped_release>());

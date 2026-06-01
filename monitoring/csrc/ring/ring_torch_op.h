@@ -7,5 +7,8 @@
 // this pointer is never read.
 void ring_set_active_engine(ring_py::RingEnginePy* e);
 void ring_set_cpu_direct(bool enabled);
+// When true, the producer op records its kernel node during graph capture
+// (via cudaStreamGetCaptureInfo) into the active engine's toggle registry.
+void ring_set_toggle_capture(bool enabled);
 void ring_diag_reset_host_counters();
 void ring_diag_print_host_counters();

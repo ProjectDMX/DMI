@@ -11,8 +11,14 @@
 #include "ring/producer.cuh"
 #include "ring/ring_debug.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
+#include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <set>
+#include <unordered_map>
+#include <vector>
+#include <mutex>
 
 // Forward-declare symbols from producer.cu
 namespace ring {
@@ -26,6 +32,15 @@ struct RingEnginePy::Impl {
     TensorMetaFifo   fifo;
     ring::RingEngine engine;
     uint32_t         current_hook_idx{0};
+
+    // --- node-toggle registry (Phase B) ---
+    struct RegEntry { int hook_type; int layer_no; cudaGraphNode_t node; };
+    std::unordered_map<cudaGraph_t, std::vector<RegEntry>> reg_nodes;  // per captured graph
+    std::unordered_map<cudaGraph_t, cudaGraphExec_t>       reg_exec;   // graph -> exec
+    std::set<std::pair<int,int>>                           enabled_hooks;  // single source
+    bool                                                   toggle_active{false};
+    bool                                                   toggle_capture{false};
+    mutable std::mutex                                     toggle_mu;
 
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
@@ -113,6 +128,71 @@ void RingEnginePy::set_null_mode(bool enabled) {
     ck(cudaDeviceSynchronize(),         "pre-sync");
     ck(ring::set_ring_null_mode(enabled), "cudaMemcpyToSymbol(g_ring_null_mode)");
     ck(cudaDeviceSynchronize(),         "post-sync");
+}
+
+// --- Runtime node-toggle (Phase B) ----------------------------------------
+void RingEnginePy::enable_toggle_capture(bool enabled) {
+    { std::lock_guard<std::mutex> lk(impl_->toggle_mu); impl_->toggle_capture = enabled; }
+    ring_set_toggle_capture(enabled);   // tell the producer op to record nodes
+}
+
+bool RingEnginePy::toggle_capture_enabled() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    return impl_->toggle_capture;
+}
+
+void RingEnginePy::register_capture_node(uint64_t graph, int hook_type, int layer_no, uint64_t node) {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    impl_->reg_nodes[reinterpret_cast<cudaGraph_t>(graph)].push_back(
+        Impl::RegEntry{hook_type, layer_no, reinterpret_cast<cudaGraphNode_t>(node)});
+}
+
+void RingEnginePy::bind_graph_exec(uint64_t graph, uint64_t exec) {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    impl_->reg_exec[reinterpret_cast<cudaGraph_t>(graph)] =
+        reinterpret_cast<cudaGraphExec_t>(exec);
+}
+
+void RingEnginePy::set_enabled_hooks(const std::vector<std::pair<int,int>>& enabled) {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    impl_->enabled_hooks.clear();
+    for (const auto& p : enabled) impl_->enabled_hooks.insert(p);
+    impl_->toggle_active = true;
+}
+
+int RingEnginePy::apply_toggle() {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    cudaError_t first = cudaSuccess;
+    for (const auto& kv : impl_->reg_exec) {
+        cudaGraphExec_t exec = kv.second;
+        auto it = impl_->reg_nodes.find(kv.first);
+        if (it == impl_->reg_nodes.end()) continue;
+        for (const auto& e : it->second) {
+            const bool on = impl_->enabled_hooks.count({e.hook_type, e.layer_no}) > 0;
+            cudaError_t err = cudaGraphNodeSetEnabled(exec, e.node, on ? 1u : 0u);
+            if (err != cudaSuccess && first == cudaSuccess) first = err;
+        }
+    }
+    return static_cast<int>(first);
+}
+
+bool RingEnginePy::is_hook_enabled(int hook_type, int layer_no) const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    if (!impl_->toggle_active) return true;   // toggle inactive -> all hooks on
+    return impl_->enabled_hooks.count({hook_type, layer_no}) > 0;
+}
+
+uint64_t RingEnginePy::toggle_node_count() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    uint64_t n = 0;
+    for (const auto& kv : impl_->reg_nodes) n += kv.second.size();
+    return n;
+}
+
+void RingEnginePy::clear_toggle_registry() {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    impl_->reg_nodes.clear();
+    impl_->reg_exec.clear();
 }
 
 void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
