@@ -211,7 +211,7 @@
       <div class="box ann-block">
         <span class="badge b-block">⛔ handle</span>
         <div class="bt">graph node handle</div>
-        <div class="bd">To toggle, you must obtain the producer node's <code>cudaGraphNode_t</code>. Both HF/torch.compile and vLLM <strong>own the graph themselves</strong>; DMI currently holds no <code>cudaGraphExec_t</code>/node handle. This is the real blocker.</div>
+        <div class="bd">To toggle, you must obtain the producer node's <code>cudaGraphNode_t</code> + the <code>cudaGraphExec_t</code>. The framework owns the graph; DMI holds neither today. <strong>Was the blocker — now shown reachable</strong> (<code>cudaStreamGetCaptureInfo</code> + torch <code>raw_cuda_graph_exec</code>); see Phase 3. Real vLLM wiring still pending.</div>
         <span class="bf">vllm_integration.py(DMXGPUWorker); HF uses CompileConfig reduce-overhead</span>
       </div>
       <div class="arr">→</div>
@@ -393,18 +393,24 @@
   <!-- Phase 3 -->
   <div class="phase">
     <div class="ph-head">
-      <span class="n">Phase 3</span><span>⛔ vLLM integration — locate DMI's nodes inside vLLM's captured exec graph (the real blocker)</span>
-      <span class="chip l">Effort L</span><span class="chip l">Risk high (includes unknowns)</span>
+      <span class="n">Phase 3</span><span>Framework graph-handle acquisition (was "the real blocker")</span>
+      <span class="chip l">Effort L</span><span class="chip m">Risk medium</span><b style="color:#15994f;margin-left:8px">✓ 3a feasibility proven · 3b wiring pending</b>
     </div>
     <div class="ph-body">
-      <p style="margin-top:0"><strong>This is the real reason the whole feature is stuck.</strong> vLLM owns the graph's capture/instantiate/replay; DMI only installs the producer before warmup (<span class="file">vllm_integration.py</span> <code>DMXGPUWorker.load_model</code>), then steers solely via the global <code>null_mode</code> (True during warmup, False afterward, see <code>:172,240-245</code>). DMI <strong>holds neither a <code>cudaGraphExec_t</code> nor any node handle</strong>.</p>
+      <p class="note" style="border-left-color:#15994f;background:#eef9f1"><b>Research spike (3a): ANSWERED YES, with a concrete mechanism</b> — <span class="file">docs/node_toggle_phase3_feasibility.md</span>. The "DMI holds no <code>cudaGraphExec_t</code>/node handle" wall is not fundamental; both handles are reachable, proven locally (RTX 4090 / torch 2.10 / vLLM 0.19):</p>
       <ul>
-        <li><strong>Unknown to resolve:</strong> can we enumerate/locate DMI's own producer nodes inside vLLM's captured exec graph and obtain handles? This requires tagging DMI nodes during vLLM's capture flow or adding a hook to recover the handles — there is no such plumbing today.</li>
-        <li>Research directions: does vLLM's <code>CUDAGraphRunner</code>/capture context expose the graph object; is <code>cudaGraphChildGraphNodeGetGraph</code>/node traversal usable; or, at DMI's op registration point, side-channel the stream→node association at the moment of capture.</li>
-        <li>Fallback: if handles cannot be obtained, the vLLM path falls back to a <strong>static superset + global null_mode</strong> (v0 is already sufficient, see investigation report §6).</li>
+        <li><b style="color:#15994f">Node handles (proven).</b> During capture, right after launching a producer, call <code>cudaStreamGetCaptureInfo</code> and record the tail-dependency node = the node just added — works even though DMI doesn't drive the capture. DMI's producers already run <em>inside</em> the framework's warmup capture, so the hook point exists. (<span class="file">probe_phase3_capture_handles.cu</span>: disabled {1,4,6} of 8 on a foreign exec, interleaved compute intact.)</li>
+        <li><b style="color:#15994f">Exec handle (proven).</b> <code>torch.cuda.CUDAGraph</code> exposes <code>raw_cuda_graph()</code> / <code>raw_cuda_graph_exec()</code>; <code>cudaGraphNodeSetEnabled</code> on torch's own exec (via cuda-python) actually toggled a node — <span class="file">probe_phase3_torch_handle.py</span>: a=0 when disabled, restored on re-enable. vLLM's full-cudagraph path uses <code>torch.cuda.CUDAGraph</code>.</li>
       </ul>
-      <div class="gate"><b>Gate (research):</b> answer the binary question "can the handle be obtained" before investing in implementation. Explicitly flagged: feasibility unproven.</div>
-      <p class="note">Before the gate passes, do not write a toggle implementation on the vLLM path; the Phase 1/2 deliverables are independently usable on the HF path.</p>
+      <p style="margin:6px 0 4px"><strong>3b — real vLLM wiring (PENDING, verify on H100 + backend build):</strong></p>
+      <ul>
+        <li><strong><code>keep_graph=True</code></strong> on the framework CUDAGraph (else torch frees the template after instantiate → node handles dangle) — a vLLM-side setting.</li>
+        <li><strong>Capture mode:</strong> feasible on the full-cudagraph path (<span class="file">vllm/compilation/cuda_graph.py</span>); piecewise/inductor cudagraph_trees path TBD.</li>
+        <li><strong>Per-graph registry</strong> (one graph per batch size; key node handles by the <code>id</code> from capture info) + §1 lifecycle across vLLM's replay loop; confirm handles stay valid through vLLM's instantiate.</li>
+        <li>Fallback if 3b proves impractical: static superset + global <code>null_mode</code> (v0 already sufficient, investigation report §6).</li>
+      </ul>
+      <div class="gate"><b>Gate:</b> 3a (met) — yes + mechanism. 3b — on H100, obtain handles for vLLM's real graphs and toggle a real DMI hook node with the meta path in lockstep.</div>
+      <p class="note">Phase 1/2 deliverables are independently usable on a DMI-owned/sandbox graph; 3b unlocks the production vLLM path.</p>
     </div>
   </div>
 
