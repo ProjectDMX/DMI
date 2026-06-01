@@ -6,13 +6,46 @@
 #include "pinned_staging.h"
 
 #include <ATen/ATen.h>
+#include <cstdio>
 #include <cstring>
+#include <exception>
+#include <mutex>
 
 namespace ring {
 
 // ---------------------------------------------------------------------------
 // ATen helpers (no GIL required for CPU tensors)
 // ---------------------------------------------------------------------------
+
+static std::once_flag g_submit_failure_log_once;
+
+static void log_submit_failure_once(
+    const std::string& model_id,
+    const std::string& req_id,
+    const std::string& act_name,
+    int32_t layer_no,
+    int32_t shard_rank,
+    int32_t start_token,
+    int32_t end_token,
+    const char* error)
+{
+    std::call_once(g_submit_failure_log_once, [&] {
+        fprintf(stderr,
+                "[DMI][P2P] WARN: failed to submit tensor slice to host "
+                "engine; suppressing further submit errors. model_id=%s "
+                "request_id=%s act_name=%s layer_no=%d shard_rank=%d "
+                "token_range=[%d,%d) error=\"%s\"\n",
+                model_id.c_str(),
+                req_id.c_str(),
+                act_name.c_str(),
+                layer_no,
+                shard_rank,
+                start_token,
+                end_token,
+                error ? error : "unknown");
+        fflush(stderr);
+    });
+}
 
 // Build ClickHouse act_name from hook_type.
 // Per-layer: "blocks.<hook_type_name>"  (e.g. "blocks.attn.hook_pattern")
@@ -278,7 +311,15 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
                        req.req_id, act_name, meta.layer_no,
                        db_start, db_end,
                        std::move(slice));
+        } catch (const std::exception& e) {
+            log_submit_failure_once(current_ctx_->model_id, req.req_id,
+                                    act_name, meta.layer_no, shard_rank,
+                                    db_start, db_end, e.what());
         } catch (...) {
+            log_submit_failure_once(current_ctx_->model_id, req.req_id,
+                                    act_name, meta.layer_no, shard_rank,
+                                    db_start, db_end,
+                                    "unknown non-std exception");
         }
     }
 
