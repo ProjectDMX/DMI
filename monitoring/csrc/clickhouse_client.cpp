@@ -77,6 +77,48 @@ std::string QualifiedTableNameQuoted(const std::string& db, const std::string& t
   return QuoteIdent(db) + "." + QuoteIdent(table);
 }
 
+std::string ClickHouseInitRemediation(const ClickHouseClientConfig& cfg,
+                                      const char* error) {
+  const std::string err = error ? error : "";
+  if (err.find("Database default does not exist") != std::string::npos) {
+    return "Please create the ClickHouse database 'default' before starting DMI.";
+  }
+  if (!cfg.create_database_if_missing) {
+    return "Please set create_database_if_missing=true, or create the configured "
+           "ClickHouse database '" + cfg.database + "' manually before "
+           "starting DMI.";
+  }
+  if (
+      err.find("Database ") != std::string::npos
+      && err.find("does not exist") != std::string::npos
+  ) {
+    return "Please create the missing ClickHouse database manually, or verify the "
+           "configured database name and permissions.";
+  }
+  return "Please check ClickHouse connectivity, credentials, database/table "
+         "configuration, and server logs.";
+}
+
+void LogClickHouseInitFailure(const ClickHouseClientConfig& cfg,
+                              const char* error) noexcept {
+  try {
+    const std::string remediation = ClickHouseInitRemediation(cfg, error);
+    std::cerr
+        << "[DMI][ClickHouse] ERROR: failed to initialize ClickHouse insert "
+           "stage. "
+        << remediation
+        << " host=" << cfg.host
+        << " port=" << cfg.port
+        << " database=" << cfg.database
+        << " table=" << cfg.table
+        << " create_database_if_missing="
+        << (cfg.create_database_if_missing ? "true" : "false")
+        << " error=\"" << (error ? error : "unknown") << "\""
+        << std::endl;
+  } catch (...) {
+  }
+}
+
 // --------------------- clickhouse-cpp compat: compression ---------------------
 
 template <typename OptionsT>
@@ -370,15 +412,23 @@ void ClickHouseInsertStage::ThreadInit(int /*thread_idx*/, const ClickHouseClien
     }
   }
 
-  // DDL init once globally (copy cfg/opts into the call_once closure)
-  std::call_once(g_schema_once, [cfg, opts]() { RunSchemaInitOnce(cfg, opts); });
+  try {
+    // DDL init once globally (copy cfg/opts into the call_once closure)
+    std::call_once(g_schema_once, [cfg, opts]() { RunSchemaInitOnce(cfg, opts); });
 
-  // Per-thread client
-  tl_client = std::make_unique<clickhouse::Client>(opts);
-  tl_client->Ping();
+    // Per-thread client
+    tl_client = std::make_unique<clickhouse::Client>(opts);
+    tl_client->Ping();
 
-  tl_client->Execute("USE " + QuoteIdent(cfg.database));
-  ApplySessionSettings(*tl_client, cfg);
+    tl_client->Execute("USE " + QuoteIdent(cfg.database));
+    ApplySessionSettings(*tl_client, cfg);
+  } catch (const std::exception& e) {
+    LogClickHouseInitFailure(cfg, e.what());
+    throw;
+  } catch (...) {
+    LogClickHouseInitFailure(cfg, "unknown non-std exception");
+    throw;
+  }
 
   tl_inited = true;
 }
