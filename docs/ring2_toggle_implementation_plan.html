@@ -319,7 +319,7 @@
   <!-- PART 3 -->
   <!-- ================================================================= -->
   <h2>3 · Concrete implementation plan (phased, ordered)</h2>
-  <p class="muted" style="margin-top:0">Principle: <strong>first establish the lockstep discipline where DMI can control its own graph, then tackle the real blocker of framework (vLLM/HF) handles</strong>. The device side is already de-risked, so the engineering focus is host lockstep + handle acquisition. Each phase lists: files touched, validation gate, effort (S/M/L), and risk.</p>
+  <p class="muted" style="margin-top:0">Principle: <strong>first establish the lockstep discipline where DMI can control its own graph, then tackle framework (vLLM/HF) handle acquisition</strong> (was the feared blocker — now shown feasible, see Phase 3). The device side is already de-risked, so the engineering focus is host lockstep + handle acquisition. Each phase lists: files touched, validation gate, effort (S/M/L), and risk.</p>
 
   <div class="panel" style="border-left:4px solid #15994f">
     <h3 style="margin-top:0">Status as built (local, RTX 4090 · branch <code>feature/dmi_kernel_node_toggle</code>)</h3>
