@@ -31,12 +31,17 @@ enumerate nodes from `raw_cuda_graph()`, then `cudaGraphNodeSetEnabled(raw_cuda_
 
 ## Required conditions (concrete, must be satisfied for the real path)
 
-1. **`keep_graph=True` on the framework's `CUDAGraph`.** By default torch destroys the
-   template `cudaGraph_t` after `instantiate()` (and `raw_cuda_graph()` then raises).
-   The node handles DMI records live in that template; they must stay valid against the
-   exec. So vLLM's capture must be created with `keep_graph=True` (a vLLM-side setting),
-   or the handles risk dangling. **Verify node-handle validity after instantiate on the
-   actual vLLM path.**
+1. **`keep_graph=True` on the framework's `CUDAGraph` — CONFIRMED REQUIRED.**
+   `probe_phase3_handle_survival.py` settles this directly: a node handle recorded via
+   `cudaStreamGetCaptureInfo` *inside a real `with torch.cuda.graph(g)` capture*
+   - with `keep_graph=False` (vLLM's default): after torch instantiates and frees the
+     template, `cudaGraphNodeSetEnabled(exec, recorded_node, 0)` **returns err 1** (the
+     handle dangles) — toggle impossible.
+   - with `keep_graph=True`: the handle stays valid and toggling works (`a` stays 0).
+   vLLM 0.19 creates `torch.cuda.CUDAGraph()` *without* `keep_graph` (`vllm/compilation/cuda_graph.py:283`),
+   so **DMI needs vLLM to pass `keep_graph=True`** — a small, concrete vLLM-side patch.
+   (Also confirmed by the same probe: `cudaStreamGetCaptureInfo` works *inside* torch's
+   capture context, i.e. the DMI-producer-during-capture hook point is real.)
 2. **`instantiate()` must have run** before `raw_cuda_graph_exec()` — normal (it is
    instantiated for replay anyway).
 3. **Capture mode matters.** vLLM 0.19 has both a full-cudagraph path
@@ -51,11 +56,16 @@ enumerate nodes from `raw_cuda_graph()`, then `cudaGraphNodeSetEnabled(raw_cuda_
    the prior replay complete + meta-FIFO lockstep; and vLLM must tolerate its exec graph
    being mutated between replays.
 
-## Still to verify on the real vLLM path (next, on H100 with the backend)
+## Resolved by the local probes
+- `cudaStreamGetCaptureInfo` works inside a real `torch.cuda.graph` capture (the DMI hook
+  point during capture is valid). ✓
+- Node-handle validity through instantiate: **requires `keep_graph=True`** (proven). ✓
 
-- Does DMI's producer op actually run *inside* vLLM's capture (so `cudaStreamGetCaptureInfo`
-  is valid there), under both full and piecewise modes?
-- Node-handle validity through vLLM's instantiate (condition 1).
+## Still to verify on the real vLLM path (next, on H100 with the backend)
+- Land the `keep_graph=True` change in vLLM's `CUDAGraphWrapper` (or confirm a config knob),
+  and confirm DMI's producer runs inside that capture under FULL mode (default decode path).
+- The piecewise/inductor path (attention runs eager, graphs are inductor-managed): whether
+  any toggle is possible there, or DMI restricts to the FULL (decode) path.
 - Reaching `raw_cuda_graph_exec` for the specific graph(s) vLLM holds, per batch size.
 
 ## Bottom line
@@ -63,15 +73,19 @@ enumerate nodes from `raw_cuda_graph()`, then `cudaGraphNodeSetEnabled(raw_cuda_
 The thing the investigation called "the real blocker" — DMI holding no graph/node handle
 — is **not a hard wall**: handles are recoverable (`cudaStreamGetCaptureInfo`) and the
 exec is exposed by torch (`raw_cuda_graph_exec`), and toggling works on both a foreign
-raw-CUDA exec and torch's own exec. What remains is integration work + a `keep_graph=True`
-requirement + confirming the vLLM capture mode — not a fundamental impossibility. This
-materially de-risks the whole feature.
+raw-CUDA exec and torch's own exec. The one hard requirement is now pinned down:
+**the framework's CUDAGraph must be created with `keep_graph=True`** (proven — handles
+dangle otherwise). That plus confirming the FULL capture path is the remaining
+integration work — not a fundamental impossibility. This materially de-risks the feature.
 
 ## Reproduce
 
 ```bash
-# (a) raw-CUDA mechanism
 cd docs/node_toggle_probe
+# (a) raw-CUDA mechanism: capture-info node recovery + toggle on a foreign exec
 nvcc -std=c++17 -arch=native -O2 probe_phase3_capture_handles.cu -o probe_p3 && ./probe_p3
-# (b) torch-level: see the cuda-python snippet in this doc's commit message / history.
+# (b) torch-level: cudaGraphNodeSetEnabled on torch's raw_cuda_graph_exec
+python probe_phase3_torch_handle.py
+# (c) handle survival: capture-info inside torch capture + keep_graph requirement
+python probe_phase3_handle_survival.py
 ```
