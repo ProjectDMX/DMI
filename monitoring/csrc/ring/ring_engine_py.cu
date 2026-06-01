@@ -34,7 +34,8 @@ struct RingEnginePy::Impl {
     uint32_t         current_hook_idx{0};
 
     // --- node-toggle registry (Phase B) ---
-    struct RegEntry { int hook_type; int layer_no; cudaGraphNode_t node; };
+    struct RegEntry { int hook_type; int layer_no; cudaGraphNode_t node;
+                      bool last_enabled{true}; };  // device default after instantiate
     std::unordered_map<cudaGraph_t, std::vector<RegEntry>> reg_nodes;  // per captured graph
     std::unordered_map<cudaGraph_t, cudaGraphExec_t>       reg_exec;   // graph -> exec
     std::set<std::pair<int,int>>                           enabled_hooks;  // single source
@@ -163,14 +164,20 @@ void RingEnginePy::set_enabled_hooks(const std::vector<std::pair<int,int>>& enab
 int RingEnginePy::apply_toggle() {
     std::lock_guard<std::mutex> lk(impl_->toggle_mu);
     cudaError_t first = cudaSuccess;
-    for (const auto& kv : impl_->reg_exec) {
+    for (auto& kv : impl_->reg_exec) {
         cudaGraphExec_t exec = kv.second;
         auto it = impl_->reg_nodes.find(kv.first);
         if (it == impl_->reg_nodes.end()) continue;
-        for (const auto& e : it->second) {
+        for (auto& e : it->second) {
             const bool on = impl_->enabled_hooks.count({e.hook_type, e.layer_no}) > 0;
+            // Diff: only touch nodes whose desired state changed since the last
+            // apply (last_enabled tracks the exec's actual state -- DMI is the
+            // only toggler of its nodes). Adaptive flips of a few hooks then cost
+            // O(#changed) SetEnabled calls instead of O(#nodes).
+            if (on == e.last_enabled) continue;
             cudaError_t err = cudaGraphNodeSetEnabled(exec, e.node, on ? 1u : 0u);
-            if (err != cudaSuccess && first == cudaSuccess) first = err;
+            if (err != cudaSuccess) { if (first == cudaSuccess) first = err; continue; }
+            e.last_enabled = on;   // update only on success
         }
     }
     return static_cast<int>(first);
