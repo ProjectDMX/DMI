@@ -38,6 +38,7 @@ struct RingEnginePy::Impl {
                       bool last_enabled{true}; };  // device default after instantiate
     std::unordered_map<cudaGraph_t, std::vector<RegEntry>> reg_nodes;  // per captured graph
     std::unordered_map<cudaGraph_t, cudaGraphExec_t>       reg_exec;   // graph -> exec
+    std::set<std::pair<int,int>>                           registered_hooks;  // (ht,layer) with a captured node
     std::set<std::pair<int,int>>                           enabled_hooks;  // single source
     bool                                                   toggle_active{false};
     bool                                                   toggle_capture{false};
@@ -146,6 +147,7 @@ void RingEnginePy::register_capture_node(uint64_t graph, int hook_type, int laye
     std::lock_guard<std::mutex> lk(impl_->toggle_mu);
     impl_->reg_nodes[reinterpret_cast<cudaGraph_t>(graph)].push_back(
         Impl::RegEntry{hook_type, layer_no, reinterpret_cast<cudaGraphNode_t>(node)});
+    impl_->registered_hooks.insert({hook_type, layer_no});
 }
 
 void RingEnginePy::bind_graph_exec(uint64_t graph, uint64_t exec) {
@@ -186,7 +188,12 @@ int RingEnginePy::apply_toggle() {
 bool RingEnginePy::is_hook_enabled(int hook_type, int layer_no) const {
     std::lock_guard<std::mutex> lk(impl_->toggle_mu);
     if (!impl_->toggle_active) return true;   // toggle inactive -> all hooks on
-    return impl_->enabled_hooks.count({hook_type, layer_no}) > 0;
+    // Desync guard (#14): the meta gate returns true only if the hook is BOTH
+    // enabled AND actually registered (has a captured producer node). Otherwise
+    // an enabled-but-uncaptured hook would push a meta with no matching payload
+    // -> p2p desync. With this, "meta pushed" <=> "a producer fires" in all cases.
+    const std::pair<int,int> k{hook_type, layer_no};
+    return impl_->enabled_hooks.count(k) > 0 && impl_->registered_hooks.count(k) > 0;
 }
 
 uint64_t RingEnginePy::toggle_node_count() const {
@@ -200,6 +207,7 @@ void RingEnginePy::clear_toggle_registry() {
     std::lock_guard<std::mutex> lk(impl_->toggle_mu);
     impl_->reg_nodes.clear();
     impl_->reg_exec.clear();
+    impl_->registered_hooks.clear();
 }
 
 void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {

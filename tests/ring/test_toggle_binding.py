@@ -67,6 +67,12 @@ def main():
     gate_ok = all(engine.is_hook_enabled(HT, j) == (j in keep) for j in range(N))
     check(gate_ok, f"is_hook_enabled matches enabled set {keep}")
 
+    # #14 desync guard: a hook that was never captured must gate OFF even if
+    # someone puts it in the enabled set (else meta pushed with no payload).
+    engine.set_enabled_hooks([(HT, 0), (HT, 99)])   # layer 99 was not captured
+    check(engine.is_hook_enabled(HT, 0) and not engine.is_hook_enabled(HT, 99),
+          "enabled-but-uncaptured hook (HT,99) gated off (#14 guard)")
+
     print("[apply_toggle on torch exec with capture-recorded handles]")
     err = engine.apply_toggle()
     check(err == 0, f"apply_toggle() returns cudaSuccess (got {err})")
