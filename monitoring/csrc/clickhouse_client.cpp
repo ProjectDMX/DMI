@@ -101,22 +101,25 @@ std::string ClickHouseInitRemediation(const ClickHouseClientConfig& cfg,
 
 void LogClickHouseInitFailure(const ClickHouseClientConfig& cfg,
                               const char* error) noexcept {
-  try {
-    const std::string remediation = ClickHouseInitRemediation(cfg, error);
-    std::cerr
-        << "[DMI][ClickHouse] ERROR: failed to initialize ClickHouse insert "
-           "stage. "
-        << remediation
-        << " host=" << cfg.host
-        << " port=" << cfg.port
-        << " database=" << cfg.database
-        << " table=" << cfg.table
-        << " create_database_if_missing="
-        << (cfg.create_database_if_missing ? "true" : "false")
-        << " error=\"" << (error ? error : "unknown") << "\""
-        << std::endl;
-  } catch (...) {
-  }
+  static std::once_flag log_once;
+  std::call_once(log_once, [&] {
+    try {
+      const std::string remediation = ClickHouseInitRemediation(cfg, error);
+      std::cerr
+          << "[DMI][ClickHouse] ERROR: failed to initialize ClickHouse insert "
+             "stage. "
+          << remediation
+          << " host=" << cfg.host
+          << " port=" << cfg.port
+          << " database=" << cfg.database
+          << " table=" << cfg.table
+          << " create_database_if_missing="
+          << (cfg.create_database_if_missing ? "true" : "false")
+          << " error=\"" << (error ? error : "unknown") << "\""
+          << std::endl;
+    } catch (...) {
+    }
+  });
 }
 
 // --------------------- clickhouse-cpp compat: compression ---------------------
