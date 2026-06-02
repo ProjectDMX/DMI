@@ -120,7 +120,24 @@ deliver and stay aligned. (Python analog of `test_node_toggle_e2e.cu`.)
 
 ---
 
-## Phase C (= 1b) — Per-spec meta gate in the real Python path
+## Phase C (= 1b) — Per-spec meta gate in the real Python path  ✓ DONE (commit 0ea0790)
+
+**As built** (test: `tests/ring/test_meta_gate_e2e.py`, ALL PASS on GPU):
+- `ring_transport.py`: per-spec gate in `pre_push_all_metas` (`if _toggle_gate_active and
+  not engine.is_hook_enabled(ht, ln): continue`) — short-circuits when toggle inactive so
+  the **default path is unchanged**. New driver `RingTransport.set_active_hooks(enabled)`:
+  `set_enabled_hooks` + `apply_toggle` (device) + activates the gate (host), single source.
+- `bindings.cpp`: `RingEngine` now also accepts a **Python callable** as the SubmitFn sink
+  (GIL re-acquired in the p2p thread) — for tests / custom consumers, alongside ClickHouse.
+- **Verified end-to-end through the real path** (real `pre_push_all_metas` gate + real
+  `torch.ops.ring.producer` + real RingEngine→drain→p2p→SubmitFn): enabled `{0,2}` delivered
+  aligned (`layer_no == payload marker`), disabled `{1,3}` produced nothing. Uses `null_mode`
+  during warmup/capture (as vLLM does) then toggles at the controlled step.
+- Per the #10 decision, the gate currently queries the C++ single source per spec
+  (`is_hook_enabled`, with the #14 enabled-AND-captured guard); the once-per-step Python
+  snapshot is the documented perf optimization, deferrable.
+
+### Original plan (for reference)
 
 ### C1. `monitoring/ring_transport.py` — gate `pre_push_all_metas` (:604-659)
 Inside the `for spec in self._active_specs:` loop, before computing/pushing the meta:
