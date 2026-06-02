@@ -79,6 +79,64 @@ def filter_by_pp_rank(specs: list, is_first_rank: bool, is_last_rank: bool) -> l
 
 
 # ---------------------------------------------------------------------------
+# Node-toggle (Phase 3b) helpers
+# ---------------------------------------------------------------------------
+
+def _parse_enabled_hooks(s: Any):
+    """Parse 'hook_type:layer,hook_type:layer,...' -> [(ht, ln), ...]; '' -> None."""
+    if not s:
+        return None
+    out = []
+    for tok in str(s).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        ht, _, ln = tok.partition(":")
+        out.append((int(ht), int(ln if ln != "" else -1)))
+    return out or None
+
+
+_CUDAGRAPH_KEEP_PATCHED = False
+
+
+def _patch_cudagraph_keep_graph() -> None:
+    """Monkeypatch torch.cuda.CUDAGraph to default keep_graph=True.
+
+    vLLM's CUDAGraphWrapper creates `torch.cuda.CUDAGraph()` (keep_graph=False), which
+    frees the captured template graph after instantiate -> the node handles DMI records
+    via cudaStreamGetCaptureInfo would dangle. keep_graph=True keeps the template alive
+    (host memory only; no device/latency cost). Idempotent, process-global; only applied
+    when node-toggle is enabled. See docs/node_toggle_phase3_feasibility.md.
+    """
+    global _CUDAGRAPH_KEEP_PATCHED
+    if _CUDAGRAPH_KEEP_PATCHED:
+        return
+    import torch
+    Orig = torch.cuda.CUDAGraph
+    if getattr(Orig, "_dmx_keep_graph", False):
+        _CUDAGRAPH_KEEP_PATCHED = True
+        return
+
+    class _KeepGraphCUDAGraph(Orig):
+        # Force keep_graph=True in BOTH __new__ and __init__: vLLM calls
+        # `CUDAGraph()` with no args, so __init__ (builtin) would otherwise reset
+        # keep_graph to its False default after __new__ set it. Subclass (not a
+        # factory) so isinstance(x, torch.cuda.CUDAGraph) still holds.
+        _dmx_keep_graph = True
+
+        def __new__(cls, *args, **kwargs):
+            kwargs["keep_graph"] = True
+            return Orig.__new__(cls, **kwargs)
+
+        def __init__(self, *args, **kwargs):
+            kwargs["keep_graph"] = True
+            super().__init__(**kwargs)
+
+    torch.cuda.CUDAGraph = _KeepGraphCUDAGraph
+    _CUDAGRAPH_KEEP_PATCHED = True
+
+
+# ---------------------------------------------------------------------------
 # DMXGPUWorker
 # ---------------------------------------------------------------------------
 
@@ -114,6 +172,11 @@ class DMXGPUWorker(Worker):
         null_mode       = _cfg(ac, "dmx_null_mode",        "DMX_NULL_MODE",        False)
         db_host         = _cfg(ac, "dmx_db_host",          "DMX_DB_HOST",          "")
         db_port         = _cfg(ac, "dmx_db_port",          "DMX_DB_PORT",          9000)
+        # Runtime node-toggle (Phase 3b). Default off -> behaviour unchanged.
+        # dmx_enabled_hooks: optional static enabled set "hook_type:layer,..." applied
+        # once after warmup (for testing); empty -> toggle armed but gate inactive.
+        node_toggle     = _cfg(ac, "dmx_node_toggle",      "DMX_NODE_TOGGLE",      False)
+        enabled_hooks_s = _cfg(ac, "dmx_enabled_hooks",    "DMX_ENABLED_HOOKS",    "")
 
         self._dmx_model_id = model_id or str(self.vllm_config.model_config.model)
 
@@ -171,6 +234,16 @@ class DMXGPUWorker(Worker):
         # Turned off after warmup in compile_or_warm_up_model.
         ring_engine.set_null_mode(True)
         ring_transport.activate(transport)
+
+        # --- Runtime node-toggle (Phase 3b) ---
+        self._dmx_node_toggle = bool(node_toggle)
+        self._dmx_enabled_hooks = _parse_enabled_hooks(enabled_hooks_s)
+        if self._dmx_node_toggle:
+            # Record producer nodes during vLLM's warmup capture, and make the
+            # captured template graph survive instantiate (keep_graph=True) so the
+            # recorded node handles stay valid for cudaGraphNodeSetEnabled.
+            ring_engine.enable_toggle_capture(True)
+            _patch_cudagraph_keep_graph()
 
         # Wrap model_runner for force_eager
         orig_fn = self.model_runner._determine_batch_execution_and_padding
@@ -245,7 +318,55 @@ class DMXGPUWorker(Worker):
         if not self._dmx_null_mode_user and self._dmx_ring_engine is not None:
             self._dmx_ring_engine.set_null_mode(False)
 
+        # Node-toggle: bind each captured graph's exec to the toggle registry, then
+        # (optionally) apply the static enabled set. Done here -- after warmup, before
+        # serving -- so no replay is in flight (design-notes §1).
+        if getattr(self, "_dmx_node_toggle", False) and self._dmx_ring_engine is not None:
+            n_bound = self._dmx_bind_captured_graphs()
+            print(f"[DMX] node-toggle: bound {n_bound} captured graph(s), "
+                  f"{self._dmx_ring_engine.toggle_node_count()} nodes registered")
+            if self._dmx_enabled_hooks is not None and n_bound > 0:
+                from . import ring_transport
+                transport = ring_transport.get_active()
+                if transport is not None:
+                    transport.set_active_hooks(self._dmx_enabled_hooks)
+                    print(f"[DMX] node-toggle: active hooks set to {self._dmx_enabled_hooks}")
+
         return result
+
+    def _dmx_bind_captured_graphs(self) -> int:
+        """Find vLLM's captured CUDA graphs and bind each exec to the toggle
+        registry. Returns the number bound. FULL-cudagraph path only (decode);
+        the model is wrapped as CUDAGraphWrapper whose concrete_cudagraph_entries
+        hold one torch.cuda.CUDAGraph per batch size (see
+        docs/node_toggle_phase3b_vllm_investigation.md)."""
+        try:
+            from vllm.compilation.cuda_graph import CUDAGraphWrapper
+        except Exception:
+            return 0
+        model = getattr(self.model_runner, "model", None)
+        n = 0
+        # Unwrap nested wrappers (UBatchWrapper etc.) to find CUDAGraphWrapper(s).
+        seen = set()
+        stack = [model]
+        while stack:
+            obj = stack.pop()
+            if id(obj) in seen or obj is None:
+                continue
+            seen.add(id(obj))
+            if isinstance(obj, CUDAGraphWrapper):
+                for entry in obj.concrete_cudagraph_entries.values():
+                    g = getattr(entry, "cudagraph", None)
+                    if g is None:
+                        continue
+                    g.instantiate()  # keep_graph=True defers it; do it once before bind
+                    self._dmx_ring_engine.bind_graph_exec(
+                        g.raw_cuda_graph(), g.raw_cuda_graph_exec())
+                    n += 1
+            inner = getattr(obj, "runnable", None)
+            if inner is not None:
+                stack.append(inner)
+        return n
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: Any) -> Any:
