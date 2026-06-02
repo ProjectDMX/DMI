@@ -77,6 +77,37 @@ overhead matters). Prefill/mixed use the piecewise/inductor path → **out of sc
 - **Local validation** is possible (vLLM 0.19 + small model + `cudagraph_mode=FULL` on a free
   GPU); only TPOT numbers need H100.
 
+## Local smoke-test attempt (2026-06-02) — blocked; wiring verified vs the fork
+
+Tried to run the wiring locally. Findings:
+- **DMI runs against the vLLM fork** `integration/vllm` (`git@github.com:ProjectDMX/vllm`),
+  which carries the hooked variants `gpt2_p.py` / `qwen3_p.py` / `llama_p.py`. The fork is
+  source-only; the box has **pip `vllm==0.19.0`** (prebuilt). They cannot be mixed, and
+  building the fork on CUDA 13 / torch 2.10 is a heavy compile — not a quick local run.
+- vLLM v1 runs workers in **subprocesses**, so the wiring must execute inside
+  `DMXGPUWorker` (fork loaded); it can't be validated by poking a driver `LLM()`.
+- **Good news (verified by reading the fork):** the fork's
+  `vllm/compilation/cuda_graph.py` matches exactly what the wiring depends on —
+  `CUDAGraphWrapper` (:140), `concrete_cudagraph_entries` (:193), `torch.cuda.CUDAGraph()`
+  (:252, keep_graph patch site), `runnable` inside `with torch.cuda.graph` (:281, so DMI
+  hooks are captured), `entry.cudagraph` (:299); model wrapped at
+  `gpu_model_runner.py:4415`. The `_dmx_bind_captured_graphs` walk is structure-agnostic
+  (finds `CUDAGraphWrapper` by isinstance), so it is fork-compatible.
+
+**Where to actually run it:** the Zaratan `vllm-h100` env (fork already built). Recipe
+(adapt `tests/vllm_monitored_runner.py`):
+```python
+LLM(model=<Qwen3-4B path>, enforce_eager=False,
+    compilation_config={"cudagraph_mode": "FULL"},   # or FULL_AND_PIECEWISE (decode=FULL)
+    worker_cls="monitoring.vllm_integration.DMXGPUWorker",
+    additional_config={"dmx_node_toggle": True,
+                       "dmx_enabled_hooks": "0:0,0:2",  # subset for the smoke test
+                       "dmx_hook_selection": "hidden-states", "dmx_db_host": ""})
+```
+PYTHONPATH must put `integration/vllm` first. **Look for:** the `[DMX] node-toggle: bound N
+graph(s), M nodes registered` print (N>0, M>0), `active hooks set to ...`, and that the
+`n_bound==0` guard does NOT fire. Then with ClickHouse, verify only the enabled hooks land.
+
 ## Bottom line
 The bind path is concrete and reachable: `self.model_runner.model` (a `CUDAGraphWrapper`
 in FULL mode) → `concrete_cudagraph_entries[*].cudagraph` → `raw_cuda_graph()/_exec()`.
