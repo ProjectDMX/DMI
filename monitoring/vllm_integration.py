@@ -236,14 +236,12 @@ class DMXGPUWorker(Worker):
         ring_transport.activate(transport)
 
         # --- Runtime node-toggle (Phase 3b) ---
+        # Only store config here. Capture recording + the keep_graph patch are
+        # turned on around the REAL graph capture (compile_or_warm_up_model), not
+        # here -- enabling them in init_device would also affect vLLM's pre-capture
+        # memory profiling and any later captures (#1).
         self._dmx_node_toggle = bool(node_toggle)
         self._dmx_enabled_hooks = _parse_enabled_hooks(enabled_hooks_s)
-        if self._dmx_node_toggle:
-            # Record producer nodes during vLLM's warmup capture, and make the
-            # captured template graph survive instantiate (keep_graph=True) so the
-            # recorded node handles stay valid for cudaGraphNodeSetEnabled.
-            ring_engine.enable_toggle_capture(True)
-            _patch_cudagraph_keep_graph()
 
         # Wrap model_runner for force_eager
         orig_fn = self.model_runner._determine_batch_execution_and_padding
@@ -310,6 +308,15 @@ class DMXGPUWorker(Worker):
             transport._using_forward_hooks = True
 
     def compile_or_warm_up_model(self) -> float:
+        toggle = getattr(self, "_dmx_node_toggle", False) and self._dmx_ring_engine is not None
+        if toggle:
+            # Scope node recording + keep_graph to the REAL capture that
+            # super().compile_or_warm_up_model() performs (memory profiling already
+            # ran in determine_available_memory). Clear any stale registry first.
+            self._dmx_ring_engine.clear_toggle_registry()
+            self._dmx_ring_engine.enable_toggle_capture(True)
+            _patch_cudagraph_keep_graph()
+
         # Warmup runs with null_mode=True (set in init_device).
         # Producer kernels fire but are no-ops — ring stays clean.
         result = super().compile_or_warm_up_model()
@@ -318,19 +325,30 @@ class DMXGPUWorker(Worker):
         if not self._dmx_null_mode_user and self._dmx_ring_engine is not None:
             self._dmx_ring_engine.set_null_mode(False)
 
-        # Node-toggle: bind each captured graph's exec to the toggle registry, then
-        # (optionally) apply the static enabled set. Done here -- after warmup, before
-        # serving -- so no replay is in flight (design-notes §1).
-        if getattr(self, "_dmx_node_toggle", False) and self._dmx_ring_engine is not None:
+        # Node-toggle: bind each captured graph's exec, then close the capture
+        # window and (optionally) apply the static enabled set. Done here -- after
+        # warmup, before serving -- so no replay is in flight (design-notes §1).
+        if toggle:
             n_bound = self._dmx_bind_captured_graphs()
+            self._dmx_ring_engine.enable_toggle_capture(False)  # close the window (#1)
             print(f"[DMX] node-toggle: bound {n_bound} captured graph(s), "
                   f"{self._dmx_ring_engine.toggle_node_count()} nodes registered")
-            if self._dmx_enabled_hooks is not None and n_bound > 0:
+            if self._dmx_enabled_hooks is not None:
+                if n_bound == 0:
+                    # Requested a subset but nothing bound (e.g. cudagraph_mode not
+                    # FULL) -> refuse to serve silently with all hooks on (#2).
+                    raise RuntimeError(
+                        "dmx_node_toggle + dmx_enabled_hooks were set but no CUDA graph "
+                        "was bound (is cudagraph_mode FULL/FULL_AND_PIECEWISE for decode?). "
+                        "Refusing to serve with node-toggle silently inert.")
                 from . import ring_transport
                 transport = ring_transport.get_active()
                 if transport is not None:
                     transport.set_active_hooks(self._dmx_enabled_hooks)
                     print(f"[DMX] node-toggle: active hooks set to {self._dmx_enabled_hooks}")
+            elif n_bound == 0:
+                print("[DMX] node-toggle: WARNING no graph bound; toggle is inert "
+                      "(no dmx_enabled_hooks requested, so serving continues all-on).")
 
         return result
 
@@ -359,9 +377,15 @@ class DMXGPUWorker(Worker):
                     g = getattr(entry, "cudagraph", None)
                     if g is None:
                         continue
-                    g.instantiate()  # keep_graph=True defers it; do it once before bind
-                    self._dmx_ring_engine.bind_graph_exec(
-                        g.raw_cuda_graph(), g.raw_cuda_graph_exec())
+                    # Don't re-instantiate if an exec already exists (that would
+                    # destroy it, #3). raw_cuda_graph_exec() raises until the graph
+                    # is instantiated -> instantiate exactly once in that case.
+                    try:
+                        exec_ptr = g.raw_cuda_graph_exec()
+                    except RuntimeError:
+                        g.instantiate()
+                        exec_ptr = g.raw_cuda_graph_exec()
+                    self._dmx_ring_engine.bind_graph_exec(g.raw_cuda_graph(), exec_ptr)
                     n += 1
             inner = getattr(obj, "runnable", None)
             if inner is not None:
