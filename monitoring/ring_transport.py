@@ -529,6 +529,14 @@ class RingTransport:
         # Toggle via _ring_engine.set_null_mode() to control device-side behavior.
         self.null_offload: bool = False
 
+        # Runtime node-toggle gate (Phase C / 1b). When False (default), the meta
+        # path is unchanged -- every active spec pushes a meta. When True (set by
+        # set_active_hooks), pre_push_all_metas skips specs the engine reports
+        # disabled, in LOCKSTEP with the device-side cudaGraphNodeSetEnabled. The
+        # engine's enabled-set (with the #14 enabled-AND-captured guard) is the
+        # single source of truth read by both lanes.
+        self._toggle_gate_active: bool = False
+
         # Shared path flag for ALL hooks.  Reset to False at the start of
         # every pre-forward.  Set to True when the entire step's data exceeds
         # ring capacity (Case B).  When True, ALL enabled hooks use the
@@ -626,6 +634,12 @@ class RingTransport:
         shapes = []
         dtypes = []
         for spec in self._active_specs:
+            # Lockstep node-toggle gate: skip metas for currently-disabled hooks
+            # so the host meta set == the device enabled set (else p2p desyncs).
+            # Short-circuits when toggle is inactive -> default path unchanged.
+            if self._toggle_gate_active and not self._ring_engine.is_hook_enabled(
+                    spec.hook_type, spec.layer_no):
+                continue
             shape = _compute_hook_shape(
                 spec.hook_type, self._model_cfg, batch, q_len, kv_dim,
                 logits_to_keep=logits_to_keep,
@@ -657,6 +671,29 @@ class RingTransport:
                 list(self._current_dim0_offsets),
                 list(self._current_kv_offsets) if self._current_kv_offsets else [],
             )
+
+    def set_active_hooks(self, enabled: "Iterable[Tuple[int, int]]") -> None:
+        """Set which hooks fire this step, as (hook_type, layer_no) pairs.
+
+        THE single driver for runtime node-toggle. Must be called at a step
+        boundary with the prior graph replay complete (design-notes §1). It:
+          1. set_enabled_hooks + apply_toggle on the engine -> device side
+             (cudaGraphNodeSetEnabled on the captured producer nodes), and
+          2. activates the host meta gate so pre_push_all_metas pushes metas only
+             for the same enabled set.
+        Both lanes then read the engine's enabled-set (single source of truth).
+
+        Requires the producer nodes to have been registered during capture
+        (enable_toggle_capture(True) before capture) and the exec(s) bound via
+        the engine's bind_graph_exec(). Hooks not captured are gated off (the
+        engine's #14 guard), so they neither fire nor get a meta.
+        """
+        pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
+        self._ring_engine.set_enabled_hooks(pairs)
+        err = self._ring_engine.apply_toggle()
+        if err != 0:
+            raise RuntimeError(f"apply_toggle failed with CUDA error {err}")
+        self._toggle_gate_active = True
 
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
                           hook_type: int, hook_id: int) -> None:
