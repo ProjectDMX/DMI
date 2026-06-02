@@ -402,7 +402,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                          try {
                              (*pyfn)(model_id, shard_rank, req_id, act_name, layer_no,
                                      start_token, end_token, std::move(slice));
-                         } catch (const py::error_already_set&) { /* swallow in p2p */ }
+                         } catch (const py::error_already_set& ex) {
+                             // Don't let a sink error kill the p2p thread, but make
+                             // it visible (tests rely on this path) -- #5.
+                             fprintf(stderr, "[ring p2p] Python SubmitFn raised: %s\n", ex.what());
+                         }
                      };
                  }
              }
@@ -520,6 +524,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ring_py::RingEnginePy::is_hook_enabled,
            py::arg("hook_type"), py::arg("layer_no"))
       .def("toggle_node_count", &ring_py::RingEnginePy::toggle_node_count)
+      .def("bound_graph_count", &ring_py::RingEnginePy::bound_graph_count)
+      .def("last_apply_count", &ring_py::RingEnginePy::last_apply_count)
+      .def("toggle_registry_uniform", &ring_py::RingEnginePy::toggle_registry_uniform)
       .def("clear_toggle_registry", &ring_py::RingEnginePy::clear_toggle_registry)
       .def("notify_drain",
            &ring_py::RingEnginePy::notify_drain,

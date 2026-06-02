@@ -42,6 +42,7 @@ struct RingEnginePy::Impl {
     std::set<std::pair<int,int>>                           enabled_hooks;  // single source
     bool                                                   toggle_active{false};
     bool                                                   toggle_capture{false};
+    uint64_t                                               last_apply_count{0};
     mutable std::mutex                                     toggle_mu;
 
     Impl(ring::RingConfig cfg, SubmitFn sf)
@@ -166,6 +167,7 @@ void RingEnginePy::set_enabled_hooks(const std::vector<std::pair<int,int>>& enab
 int RingEnginePy::apply_toggle() {
     std::lock_guard<std::mutex> lk(impl_->toggle_mu);
     cudaError_t first = cudaSuccess;
+    uint64_t applied = 0;
     for (auto& kv : impl_->reg_exec) {
         cudaGraphExec_t exec = kv.second;
         auto it = impl_->reg_nodes.find(kv.first);
@@ -180,9 +182,38 @@ int RingEnginePy::apply_toggle() {
             cudaError_t err = cudaGraphNodeSetEnabled(exec, e.node, on ? 1u : 0u);
             if (err != cudaSuccess) { if (first == cudaSuccess) first = err; continue; }
             e.last_enabled = on;   // update only on success
+            ++applied;
         }
     }
+    impl_->last_apply_count = applied;
     return static_cast<int>(first);
+}
+
+uint64_t RingEnginePy::bound_graph_count() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    return impl_->reg_exec.size();
+}
+
+uint64_t RingEnginePy::last_apply_count() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    return impl_->last_apply_count;
+}
+
+bool RingEnginePy::toggle_registry_uniform() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    // True iff every captured graph registered the same set of (hook_type,layer).
+    // The meta gate keys on (ht,layer) globally; if graphs differ, a hook present
+    // in one graph but absent from the one replayed this step would push a meta
+    // with no payload -> desync. vLLM captures all hooks in every graph (uniform).
+    const std::set<std::pair<int,int>>* ref = nullptr;
+    std::set<std::pair<int,int>> ref_set;
+    for (const auto& kv : impl_->reg_nodes) {
+        std::set<std::pair<int,int>> s;
+        for (const auto& e : kv.second) s.insert({e.hook_type, e.layer_no});
+        if (!ref) { ref_set = std::move(s); ref = &ref_set; }
+        else if (s != ref_set) return false;
+    }
+    return true;
 }
 
 bool RingEnginePy::is_hook_enabled(int hook_type, int layer_no) const {
@@ -204,10 +235,20 @@ uint64_t RingEnginePy::toggle_node_count() const {
 }
 
 void RingEnginePy::clear_toggle_registry() {
-    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
-    impl_->reg_nodes.clear();
-    impl_->reg_exec.clear();
-    impl_->registered_hooks.clear();
+    {
+        std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+        impl_->reg_nodes.clear();
+        impl_->reg_exec.clear();
+        impl_->registered_hooks.clear();
+        // Full reset: also drop the enabled set + deactivate, so a stale gate
+        // (is_hook_enabled) can't skip every meta after a clear (#2). Disable
+        // capture too so a later capture doesn't record into a cleared engine (#3).
+        impl_->enabled_hooks.clear();
+        impl_->toggle_active = false;
+        impl_->toggle_capture = false;
+        impl_->last_apply_count = 0;
+    }
+    ring_set_toggle_capture(false);
 }
 
 void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {

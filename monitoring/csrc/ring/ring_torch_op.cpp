@@ -30,6 +30,9 @@ void ring_diag_print_host_counters() {
 
 void ring_set_active_engine(ring_py::RingEnginePy* e) {
     g_active_engine = e;
+    // Deactivation must also disable capture: g_toggle_capture is process-global,
+    // so a later engine/capture would otherwise keep recording nodes (#3).
+    if (e == nullptr) ring_set_toggle_capture(false);
 }
 
 // CPU-direct flag.  When true, ring_producer_impl copies tensor to CPU

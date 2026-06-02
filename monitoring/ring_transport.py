@@ -688,12 +688,37 @@ class RingTransport:
         the engine's bind_graph_exec(). Hooks not captured are gated off (the
         engine's #14 guard), so they neither fire nor get a meta.
         """
+        eng = self._ring_engine
+        # Guard (#1): activating the host gate while the device toggle is a no-op
+        # (no exec bound / nothing captured) would filter metas while every
+        # producer still fires at its default-enabled state -> desync. Fail loud.
+        if eng.bound_graph_count() == 0 or eng.toggle_node_count() == 0:
+            raise RuntimeError(
+                "set_active_hooks: no producer nodes registered / no graph exec bound "
+                "(toggle_node_count=%d, bound_graph_count=%d). Capture with "
+                "enable_toggle_capture(True) and call bind_graph_exec() first."
+                % (eng.toggle_node_count(), eng.bound_graph_count()))
+        # Guard (#4): the gate keys on (hook_type,layer) globally; if captured
+        # graphs have different hook sets, a hook in one graph but not the one
+        # replayed this step would push a meta with no payload.
+        if not eng.toggle_registry_uniform():
+            raise RuntimeError(
+                "set_active_hooks: captured graphs have non-uniform hook sets; the "
+                "global meta gate cannot stay aligned. Ensure every captured graph "
+                "registers the same hooks.")
         pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
-        self._ring_engine.set_enabled_hooks(pairs)
-        err = self._ring_engine.apply_toggle()
+        eng.set_enabled_hooks(pairs)
+        err = eng.apply_toggle()
         if err != 0:
             raise RuntimeError(f"apply_toggle failed with CUDA error {err}")
         self._toggle_gate_active = True
+
+    def clear_toggle(self) -> None:
+        """Paired teardown: clear the engine's toggle registry AND deactivate the
+        host gate, so neither lane is left half-configured (#2). Call before a
+        re-capture or when disabling monitoring."""
+        self._ring_engine.clear_toggle_registry()
+        self._toggle_gate_active = False
 
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
                           hook_type: int, hook_id: int) -> None:

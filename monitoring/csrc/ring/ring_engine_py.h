@@ -115,6 +115,10 @@ public:
     // Host meta-gate query: true if the hook is enabled (or toggle inactive).
     bool is_hook_enabled(int hook_type, int layer_no) const;
     uint64_t toggle_node_count() const;
+    uint64_t bound_graph_count() const;          // #bound execs (0 => apply is a no-op)
+    uint64_t last_apply_count() const;           // #SetEnabled calls in last apply_toggle
+    bool     toggle_registry_uniform() const;    // all graphs share the same hook set
+    // Full reset: registry, exec map, enabled set, toggle_active, and capture flag.
     void clear_toggle_registry();
 
     // Lightweight wake-up for the drain thread.

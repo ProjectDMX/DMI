@@ -61,6 +61,14 @@ def main():
         model_id="m", req_ids=["r"], token_ranges=[(0, QLEN)],
         dim0_offsets=[0], kv_offsets=[0], flattened=True)
 
+    # #1 guard: activating the host gate before any node/exec is bound must raise
+    # (else metas get filtered while all producers still fire -> desync).
+    try:
+        transport.set_active_hooks([(HT, 0)])
+        check(False, "set_active_hooks before bind should have raised (#1 guard)")
+    except RuntimeError:
+        check(True, "set_active_hooks before bind raises (#1 guard)")
+
     # src[j] filled with value j -> slice marker identifies the producer.
     src = [torch.full((QLEN, HID), float(j), device="cuda", dtype=torch.float32) for j in range(N)]
 
