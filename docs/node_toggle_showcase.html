@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DMI Runtime Node-Toggle — Design · Usage · Performance</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --panel:#ffffff; --panel2:#f0f2f5; --ink:#1a1d23; --mut:#5a6473;
+    --line:#e4e7ec; --accent:#2563eb; --green:#15994f; --amber:#b87514; --red:#d23838;
+    --violet:#7c4dd6; --gpu:#2563eb; --host:#7c4dd6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft Yahei",sans-serif}
+  .wrap{max-width:1160px;margin:0 auto;padding:36px 24px 90px}
+  h1{font-size:30px;margin:0 0 6px}
+  h2{font-size:21px;margin:48px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{font-size:16px;margin:22px 0 8px}
+  .sub{color:var(--mut);font-size:14px;margin:0 0 4px}
+  code{background:#eef0f3;padding:1px 6px;border-radius:5px;font-size:12.5px;color:#2b3242;border:1px solid #e1e4e9}
+  .muted{color:var(--mut)}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin:16px 0 4px;font-size:13px}
+  .tag{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11.5px;font-weight:600;vertical-align:middle}
+  .t-meas{background:rgba(21,153,79,.12);color:var(--green);border:1px solid rgba(21,153,79,.4)}
+  .t-proj{background:rgba(184,117,20,.12);color:var(--amber);border:1px solid rgba(184,117,20,.4)}
+  .t-no{background:rgba(210,56,56,.10);color:var(--red);border:1px solid rgba(210,56,56,.4)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0;box-shadow:0 1px 3px rgba(16,24,40,.06)}
+  .grid{display:grid;gap:14px}
+  .g2{grid-template-columns:1fr 1fr}
+  .g3{grid-template-columns:1fr 1fr 1fr}
+  @media(max-width:900px){.g2,.g3{grid-template-columns:1fr}}
+  table{width:100%;border-collapse:collapse;margin:8px 0;font-size:13.5px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--mut);font-weight:600;font-size:12.5px}
+  td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .note{font-size:12.5px;color:var(--mut);border-left:3px solid #d6dae1;padding:2px 0 2px 12px;margin:10px 0}
+  .foot{margin-top:30px;font-size:12px;color:var(--mut)}
+  ul{margin:6px 0 6px;padding-left:20px}
+  li{margin:4px 0}
+  .file{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#1d6fd6}
+  .lead{font-size:16px;line-height:1.55;background:linear-gradient(180deg,rgba(37,99,235,.05),rgba(37,99,235,.01));border:1px solid rgba(37,99,235,.25);border-radius:12px;padding:16px 20px;margin:8px 0 4px}
+
+  /* ---- lanes ---- */
+  .lane{border-radius:12px;padding:14px 16px;margin:12px 0;position:relative}
+  .lane-gpu{background:linear-gradient(180deg,rgba(37,99,235,.06),rgba(37,99,235,.015));border:1px solid rgba(37,99,235,.30)}
+  .lane-host{background:linear-gradient(180deg,rgba(124,77,214,.06),rgba(124,77,214,.015));border:1px solid rgba(124,77,214,.30)}
+  .lane-src{background:linear-gradient(180deg,rgba(21,153,79,.07),rgba(21,153,79,.015));border:1px solid rgba(21,153,79,.35)}
+  .lane-title{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;margin-bottom:10px}
+  .lane-gpu .lane-title{color:#1d4ed8}
+  .lane-host .lane-title{color:#6d3bc4}
+  .lane-src .lane-title{color:#147a41}
+  .row{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap}
+  .box{background:#ffffff;border:1px solid var(--line);border-radius:9px;padding:10px 12px;min-width:120px;flex:1;position:relative;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+  .box .bt{font-size:13px;font-weight:600;margin-bottom:3px}
+  .box .bd{font-size:11.5px;color:var(--mut);line-height:1.45}
+  .box .bf{display:block;margin-top:6px;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:#3576c4;word-break:break-all}
+  .arr{display:flex;align-items:center;justify-content:center;color:var(--accent);font-size:22px;font-weight:700;min-width:22px}
+  .arrdown{text-align:center;color:var(--green);font-size:24px;font-weight:700;line-height:1;margin:4px 0}
+
+  /* source-of-truth chip */
+  .truth{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:6px 0}
+  .chipnode{padding:5px 11px;border-radius:8px;border:1px solid var(--line);background:#fff;font-variant-numeric:tabular-nums;font-size:12.5px}
+  .on{border-color:rgba(21,153,79,.55);background:rgba(21,153,79,.10);color:#147a41}
+  .off{border-color:rgba(210,56,56,.40);background:rgba(210,56,56,.06);color:#b53b3b;text-decoration:line-through;opacity:.75}
+
+  /* FIFO alignment strip */
+  .align{display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:center;margin:6px 0}
+  .align .lab{font-size:11.5px;color:var(--mut);text-align:right}
+  .slots{display:flex;gap:6px;flex-wrap:wrap}
+  .slot{width:50px;height:34px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;border:1px solid var(--line);font-variant-numeric:tabular-nums}
+  .slot.p{background:rgba(37,99,235,.10);border-color:rgba(37,99,235,.40);color:#1d4ed8}
+  .slot.m{background:rgba(124,77,214,.10);border-color:rgba(124,77,214,.40);color:#6d3bc4}
+  .slot.gap{background:rgba(210,56,56,.07);border-color:rgba(210,56,56,.40);color:#c33;border-style:dashed}
+  .matchline{height:14px}
+  .matchline span{display:inline-flex;width:50px;justify-content:center;color:var(--green);font-size:13px;margin-right:6px}
+
+  /* steps */
+  .steps{counter-reset:st;display:grid;gap:12px}
+  .step{display:grid;grid-template-columns:36px 1fr;gap:14px;align-items:start;background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:14px 16px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+  .step .n{counter-increment:st;width:32px;height:32px;border-radius:50%;background:var(--accent);color:#fff;font-weight:700;display:flex;align-items:center;justify-content:center;font-size:15px}
+  .step .n::before{content:counter(st)}
+  .step .h{font-weight:600;font-size:14.5px;margin-bottom:2px}
+  .step .d{font-size:13px;color:var(--mut)}
+  .step .d code{font-size:12px}
+
+  /* api surface */
+  .apigrid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+  @media(max-width:760px){.apigrid{grid-template-columns:1fr}}
+  .api{border:1px solid var(--line);border-radius:8px;padding:9px 11px;background:var(--panel2)}
+  .api .m{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:#1d4ed8;font-weight:600}
+  .api .x{font-size:11.5px;color:var(--mut);margin-top:2px}
+
+  /* invariants */
+  .inv{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px dashed var(--line)}
+  .inv:last-child{border-bottom:0}
+  .inv .k{flex:0 0 26px;height:26px;border-radius:6px;background:rgba(21,153,79,.12);color:#147a41;border:1px solid rgba(21,153,79,.4);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px}
+  .inv .t{font-size:13px}
+
+  /* bar chart */
+  .bars{margin:10px 0}
+  .barrow{display:grid;grid-template-columns:210px 1fr 70px;align-items:center;gap:12px;margin:9px 0}
+  .barrow .name{font-size:13px}
+  .track{background:#eef0f3;border:1px solid var(--line);border-radius:7px;height:26px;position:relative;overflow:hidden}
+  .fill{height:100%;border-radius:6px 0 0 6px;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;font-size:11.5px;font-weight:700;color:#fff;white-space:nowrap}
+  .val{font-variant-numeric:tabular-nums;font-size:12px;text-align:right;color:var(--mut)}
+
+  .pill{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .kbig{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+  .card{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .card .lab{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;margin-top:10px}
+  .flowmini{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;margin:4px 0}
+  .flowmini .nd{padding:3px 8px;border-radius:6px;border:1px solid var(--line);background:#fff}
+  .flowmini .on{border-color:rgba(21,153,79,.5);background:rgba(21,153,79,.1);color:#147a41}
+  .flowmini .off{border-color:rgba(210,56,56,.35);background:rgba(210,56,56,.06);color:#b53b3b;text-decoration:line-through;opacity:.7}
+  .statusbar{background:rgba(21,153,79,.07);border:1px solid rgba(21,153,79,.35);border-radius:10px;padding:12px 16px;font-size:13.5px;margin-top:14px}
+  .statusbar b{color:#147a41}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>DMI Runtime Node-Toggle</h1>
+  <p class="sub">Design · Usage flow · Expected performance — a showcase of the Ring² post-capture producer-node toggle</p>
+  <p class="lead"><strong>What it is, in one line:</strong> flip <em>which</em> producer / hook nodes fire inside an <strong>already-captured</strong> CUDA graph, between replays, via <code>cudaGraphNodeSetEnabled</code> — <strong>no re-capture, no re-instantiation.</strong></p>
+  <div class="legend">
+    <span><span class="tag t-meas">Measured</span> RTX 4090, isolated microbench (real producer + dual-ring)</span>
+    <span><span class="tag t-proj">Projected</span> online vLLM+DMI TPOT, anchored on the paper's measured ~6% full-capture overhead</span>
+    <span><span class="tag t-no">Not supported</span> outside what this mechanism can do</span>
+  </div>
+
+  <!-- =============================================================== -->
+  <!-- SECTION 1 — DESIGN -->
+  <!-- =============================================================== -->
+  <h2>1 · What it is — the design</h2>
+
+  <h3>The single source of truth drives two lanes in lockstep</h3>
+  <p class="muted" style="margin-top:0">A graph captures the <strong>superset</strong> of hook nodes once. At runtime, <strong>one enabled-set</strong> is the single source of truth that must drive <em>both</em> lanes identically — the device lane (which kernels run) and the host lane (which metadata is pushed). If the two ever disagree, the pipeline desyncs.</p>
+
+  <!-- source of truth -->
+  <div class="lane lane-src">
+    <div class="lane-title">◆ Single source of truth — the enabled-set (this step: resid_pre·L0, resid_final, logits)</div>
+    <div class="truth">
+      <span class="chipnode on">resid_pre·L0</span>
+      <span class="chipnode off">attn_scores·L0</span>
+      <span class="chipnode off">q·L3</span>
+      <span class="chipnode off">k·L3</span>
+      <span class="chipnode on">resid_final</span>
+      <span class="chipnode on">final_logits</span>
+    </div>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">Each chip = one hook node (a tensor @ a layer). <span style="color:#147a41">Green = on this step</span>, <span style="color:#b53b3b;text-decoration:line-through">red = off this step</span> (runtime state, freely flipped back — <strong>not</strong> "unsupported").</p>
+  </div>
+  <div class="arrdown">↓ &nbsp; the SAME set feeds both lanes &nbsp; ↓</div>
+
+  <div class="grid g2">
+    <!-- device lane -->
+    <div class="lane lane-gpu" style="margin:0">
+      <div class="lane-title">⬢ Device lane — which kernels run</div>
+      <div class="box">
+        <div class="bt">apply_toggle() → cudaGraphNodeSetEnabled</div>
+        <div class="bd">For each captured producer node, set its <code>enabled</code> bit on the instantiated <code>cudaGraphExec_t</code>. Disabled nodes are skipped at launch dispatch — the kernel never runs, so it never advances the ring head. The ring "closes up": remaining producers publish a <strong>contiguous, gap-free</strong> run of task entries.</div>
+        <span class="bf">ring_engine_py.h · node_toggle.h::apply()</span>
+      </div>
+    </div>
+    <!-- host lane -->
+    <div class="lane lane-host" style="margin:0">
+      <div class="lane-title">⬡ Host lane — which metadata is pushed</div>
+      <div class="box">
+        <div class="bt">pre_push_all_metas → is_hook_enabled() gate</div>
+        <div class="bd">Push a <code>TensorMeta</code> <strong>only</strong> for hooks that are enabled this step. The per-spec <code>is_hook_enabled()</code> gate replaces the old global <code>null_offload</code> skip. The number of metas pushed shrinks to exactly match the enabled producers.</div>
+        <span class="bf">ring_transport.py · ring_engine_py.h::is_hook_enabled()</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- why lockstep matters: positional FIFO -->
+  <div class="panel">
+    <h3 style="margin-top:0">Why the two lanes <em>must</em> agree: p2p matches positionally</h3>
+    <p class="muted" style="font-size:12.5px;margin:0 0 10px">The p2p thread rejoins the lanes by <strong>FIFO position</strong>: the i-th drained payload is paired with the i-th popped meta (<code>fifo_.pop(meta)</code>). So the enabled node-set and the pushed meta-set must be the <strong>same set, in the same order, the same step</strong>.</p>
+    <div class="grid g2">
+      <div>
+        <p style="margin:0 0 6px;font-size:12.5px"><span class="tag t-meas">In lockstep</span> &nbsp; both lanes drop node 2 → positions realign</p>
+        <div class="align"><div class="lab">GPU payload (ring)</div>
+          <div class="slots"><div class="slot p">P0</div><div class="slot p">P1</div><div class="slot p">P3</div><div class="slot p">P4</div></div></div>
+        <div class="align"><div class="lab"></div>
+          <div class="slots matchline"><span>‖</span><span>‖</span><span>‖</span><span>‖</span></div></div>
+        <div class="align"><div class="lab">Host meta (FIFO)</div>
+          <div class="slots"><div class="slot m">M0</div><div class="slot m">M1</div><div class="slot m">M3</div><div class="slot m">M4</div></div></div>
+        <p class="muted" style="font-size:12px;margin:6px 0 0">Both sides = {0,1,3,4}. P3↔M3, P4↔M4. Correct.</p>
+      </div>
+      <div>
+        <p style="margin:0 0 6px;font-size:12.5px"><span class="tag t-no">Lockstep violated</span> &nbsp; node 2 disabled but host still pushes all → cascade desync</p>
+        <div class="align"><div class="lab">GPU payload (P2 gone)</div>
+          <div class="slots"><div class="slot p">P0</div><div class="slot p">P1</div><div class="slot gap">∅</div><div class="slot p">P3</div><div class="slot p">P4</div></div></div>
+        <div class="align"><div class="lab">Host meta (full set)</div>
+          <div class="slots"><div class="slot m">M0</div><div class="slot m">M1</div><div class="slot m">M2</div><div class="slot m">M3</div><div class="slot m">M4</div></div></div>
+        <p class="muted" style="font-size:12px;margin:6px 0 0">P3↔M2, P4↔M3 … every later hook mismatched (Phase 1 negative control: 22/37 misaligned).</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- registry + #14 guard -->
+  <div class="grid g2">
+    <div class="panel" style="margin-top:8px">
+      <h3 style="margin-top:0">Capture-time registry — how nodes get their handles</h3>
+      <p class="muted" style="font-size:13px;margin:0">During capture, the producer op records its own kernel node via <code>cudaStreamGetCaptureInfo</code> (reading the tail dependency = the node just added). Handles are kept in a registry <strong>keyed per <code>cudaGraph_t</code></strong>, registered in producer publish order (<code>cudaGraphGetNodes()</code> gives no order guarantee, so enumeration order is never used).</p>
+      <p class="note" style="margin-bottom:0">Requires <code>keep_graph=True</code> on the framework's <code>CUDAGraph</code> so the template survives <code>instantiate()</code> — otherwise the recorded node handles dangle (proven: toggle returns err 1 without it).</p>
+    </div>
+    <div class="panel" style="margin-top:8px">
+      <h3 style="margin-top:0">The "enabled AND captured" guard</h3>
+      <p class="muted" style="font-size:13px;margin:0">A hook is treated as <strong>on</strong> only if it is <strong>enabled</strong> <em>and</em> was actually <strong>captured</strong> as a node. This guarantees a meta is never pushed for a hook that has no captured payload behind it — keeping the host lane from ever over-counting relative to the device lane.</p>
+      <div class="flowmini" style="margin-top:10px">
+        <span class="nd on">enabled</span><span>×</span><span class="nd on">captured</span><span>=</span><span class="nd on">push meta + run node</span>
+      </div>
+      <div class="flowmini">
+        <span class="nd on">enabled</span><span>×</span><span class="nd off">not captured</span><span>=</span><span class="nd off">no meta (safe)</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- =============================================================== -->
+  <!-- SECTION 2 — USAGE FLOW -->
+  <!-- =============================================================== -->
+  <h2>2 · Usage flow — the lifecycle</h2>
+  <p class="muted" style="margin-top:0">Three points in the lifecycle: turn on capture recording <em>before</em> the graph is captured, bind each exec <em>after</em> instantiate, then reconfigure <em>at every step boundary</em>.</p>
+
+  <div class="steps">
+    <div class="step">
+      <div class="n"></div>
+      <div>
+        <div class="h">Capture time — record the nodes</div>
+        <div class="d"><code>engine.enable_toggle_capture(true)</code> before the graph is captured. Each producer op then records its kernel node into the per-graph registry as it fires during capture.</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="n"></div>
+      <div>
+        <div class="h">After instantiate — bind the exec (per captured graph)</div>
+        <div class="d"><code>engine.bind_graph_exec(raw_cuda_graph(), raw_cuda_graph_exec())</code> associates the instantiated exec with the graph the nodes were recorded under. One bind per captured graph (vLLM keeps one per batch size).</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="n"></div>
+      <div>
+        <div class="h">Each step boundary — reconfigure from one source</div>
+        <div class="d"><code>transport.set_active_hooks(enabled)</code> drives the device toggle (<code>apply_toggle</code> → <code>cudaGraphNodeSetEnabled</code>) <em>and</em> the host meta gate (<code>is_hook_enabled</code>) from the same enabled-set. Call only when the prior replay has completed.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- invariants -->
+  <div class="panel">
+    <h3 style="margin-top:0">The §1 invariants — hard rules for every reconfigure</h3>
+    <div class="inv"><div class="k">1</div><div class="t"><strong>Reconfigure only at a step boundary.</strong> Never mid-step / mid-forward.</div></div>
+    <div class="inv"><div class="k">2</div><div class="t"><strong>Prior replay must be complete</strong> before mutating the exec graph. Calling <code>cudaGraphNodeSetEnabled</code> while the exec may still be running is undefined behavior.</div></div>
+    <div class="inv"><div class="k">3</div><div class="t"><strong>Node-enabled set ≡ host meta-push set</strong> — same version, same step, derived from one source of truth, never independently.</div></div>
+    <div class="inv"><div class="k">4</div><div class="t"><strong>Mutate the exec graph, THEN launch.</strong> Order: prior replay done → apply <code>SetEnabled</code> for the new set → push matching metas → launch. Not interleaved.</div></div>
+    <div class="inv"><div class="k">5</div><div class="t"><strong>Never modify the <code>enabled</code> bit while the exec is running</strong> (corollary of #2, stated explicitly — it is the UB that bites silently).</div></div>
+    <p class="note" style="margin-bottom:0">Violating #3 desyncs the positional meta↔payload matching in <code>p2p_thread.cpp</code> — corrupting every subsequent hook's association.</p>
+  </div>
+
+  <!-- API surface -->
+  <div class="panel">
+    <h3 style="margin-top:0">The 7-method API surface (<code>RingEnginePy</code>, <span class="file">ring_engine_py.h</span>)</h3>
+    <div class="apigrid">
+      <div class="api"><div class="m">enable_toggle_capture(bool)</div><div class="x">Make the producer op record its node during capture.</div></div>
+      <div class="api"><div class="m">bind_graph_exec(graph, exec)</div><div class="x">Associate an instantiated exec with the graph its nodes were recorded under.</div></div>
+      <div class="api"><div class="m">set_enabled_hooks([(type,layer),…])</div><div class="x">Set the enabled (hook_type, layer_no) set — the single source.</div></div>
+      <div class="api"><div class="m">apply_toggle()</div><div class="x">Apply the enabled set to every bound exec via <code>cudaGraphNodeSetEnabled</code>.</div></div>
+      <div class="api"><div class="m">is_hook_enabled(type, layer)</div><div class="x">Host meta-gate query: true if enabled (or toggle inactive).</div></div>
+      <div class="api"><div class="m">toggle_node_count()</div><div class="x">How many producer nodes are registered.</div></div>
+      <div class="api"><div class="m">clear_toggle_registry()</div><div class="x">Full reset: registry, exec map, enabled set, active flag, capture flag.</div></div>
+    </div>
+  </div>
+
+  <!-- vLLM wiring -->
+  <div class="panel">
+    <h3 style="margin-top:0">vLLM wiring (<code>DMXGPUWorker</code>)</h3>
+    <div class="row">
+      <div class="box">
+        <div class="bt">Before warmup</div>
+        <div class="bd"><code>engine.enable_toggle_capture(True)</code> so the producer op records nodes during vLLM's warmup capture.</div>
+      </div>
+      <div class="arr">→</div>
+      <div class="box">
+        <div class="bt">After warmup</div>
+        <div class="bd">Walk <code>CUDAGraphWrapper.concrete_cudagraph_entries</code> (one per batch size); for each, <code>instantiate()</code> once and <code>bind_graph_exec(g.raw_cuda_graph(), g.raw_cuda_graph_exec())</code>.</div>
+      </div>
+      <div class="arr">→</div>
+      <div class="box">
+        <div class="bt">Per step</div>
+        <div class="bd"><code>transport.set_active_hooks(enabled)</code> at a step boundary, prior replay complete → device toggle + meta gate in lockstep.</div>
+      </div>
+    </div>
+    <p class="note">Needs a <code>keep_graph=True</code> patch — vLLM 0.19 creates <code>torch.cuda.CUDAGraph()</code> without it (<span class="file">vllm/compilation/cuda_graph.py</span>), so the template would be freed after instantiate and the node handles would dangle.</p>
+    <div style="background:rgba(184,117,20,.08);border:1px solid rgba(184,117,20,.35);border-radius:8px;padding:10px 14px;font-size:12.5px;color:#7a5410">
+      <strong>Run status (honest):</strong> the wiring is <strong>written and verified against the DMI fork's <code>cuda_graph.py</code></strong> (the structure-agnostic <code>CUDAGraphWrapper</code> walk matches the fork exactly) — but it has <strong>not yet been executed</strong>. The fork is source-only while the local box has prebuilt <code>pip vllm==0.19.0</code>; they cannot be mixed, so a real run is pending on Zaratan / a fork build.
+    </div>
+  </div>
+
+  <!-- =============================================================== -->
+  <!-- SECTION 3 — PERFORMANCE -->
+  <!-- =============================================================== -->
+  <h2>3 · Expected performance</h2>
+
+  <p class="lead" style="background:linear-gradient(180deg,rgba(184,117,20,.06),rgba(184,117,20,.01));border-color:rgba(184,117,20,.3)"><strong>Read this first.</strong> The microsecond figures below are from an <strong>isolated microbench with no model compute</strong> (synthetic 1MB tensors, self-captured graph). The point is the <strong>relative takeaways</strong> — true-disable is ≈ free of the producer cost, <code>null_mode</code> still pays the launch, and reconfigure is ≈ free — <strong>not</strong> a serving overhead number. Serving-% is the separate <em>projection</em> further down.</p>
+
+  <h3>Measured — per-replay producer cost <span class="tag t-meas">RTX 4090</span></h3>
+  <div class="panel">
+    <table>
+      <tr><th>Scenario (per replay)</th><th>16 nodes × 1MB</th><th>145 nodes × 1MB</th><th></th></tr>
+      <tr><td>All enabled (full capture)</td><td class="num">180.9 µs</td><td class="num">2942.8 µs</td><td class="muted" style="font-size:12px">baseline producer cost</td></tr>
+      <tr><td><strong>True node-disable</strong> (node off)</td><td class="num" style="color:var(--green);font-weight:600">3.4 µs &nbsp;(−98%)</td><td class="num" style="color:var(--green);font-weight:600">28 µs &nbsp;(−99%)</td><td class="muted" style="font-size:12px">node never launches</td></tr>
+      <tr><td><code>null_mode</code> soft (kernel still launched)</td><td class="num" style="color:var(--amber)">13.4 µs</td><td class="num" style="color:var(--amber)">119 µs</td><td class="muted" style="font-size:12px">launch + early-return</td></tr>
+      <tr><td>Half node-disabled</td><td class="num">89.8 µs</td><td class="num">—</td><td class="muted" style="font-size:12px">scales with #enabled</td></tr>
+      <tr><td><strong>true-disable saves vs null_mode</strong></td><td class="num">9.8 µs</td><td class="num">91 µs</td><td class="muted" style="font-size:12px">≈ 0.6 µs/node launch cost</td></tr>
+    </table>
+    <p class="note" style="margin-bottom:0">The <code>true-disable vs null_mode</code> delta is exactly the launch overhead <code>null_mode</code> cannot remove (it still launches every producer, then early-returns): <strong>≈ 0.6 µs/node</strong> → 9.8 µs @16 nodes, 91 µs @145 nodes. This is the concrete, scale-dependent value of true-disable over the existing soft switch.</p>
+  </div>
+
+  <h3>Measured — reconfigure cost (host wall-clock) <span class="tag t-meas">RTX 4090</span></h3>
+  <div class="panel">
+    <div class="grid g3">
+      <div><div class="kbig" style="color:var(--green)">0.19 µs</div><div class="muted" style="font-size:12px">per single-node <code>cudaGraphNodeSetEnabled</code> call — <strong>no re-instantiation</strong></div></div>
+      <div><div class="kbig" style="color:var(--green)">3.1 µs / 30.3 µs</div><div class="muted" style="font-size:12px">full-set flip @16 / @145 nodes (~0.2 µs/node, linear)</div></div>
+      <div><div class="kbig" style="color:var(--green)">O(#changed)</div><div class="muted" style="font-size:12px"><code>apply_toggle</code> is diff-only → cost = (#changed) × 0.2 µs per reconfigure</div></div>
+    </div>
+    <p class="note" style="margin-bottom:0">Reconfigure is cheap, linear, and crucially <strong>avoids re-instantiation</strong> (a <code>cudaGraphInstantiate</code> rebuild is 100s of µs to ms — the cost this mechanism deliberately sidesteps). Touching a few nodes for adaptive escalation is essentially free.</p>
+  </div>
+
+  <h3>Projected — online TPOT overhead <span class="tag t-proj">Projection</span></h3>
+  <p class="muted" style="margin-top:0">Projected from the per-node costs above, <strong>anchored on the paper's measured ~6% full-capture online TPOT</strong>. Only "full capture ~6%" is measured (red); the rest are engineering projections (amber/green), not end-to-end vLLM measurements.</p>
+  <div class="panel">
+    <div class="bars">
+      <div class="barrow"><span class="name">Full capture (always-on)</span>
+        <div class="track"><div class="fill" style="width:100%;background:var(--red)">~6.0%</div></div>
+        <span class="val">measured</span></div>
+      <div class="barrow"><span class="name"><code>null_mode</code> idle (soft-off)</span>
+        <div class="track"><div class="fill" style="width:16.7%;background:var(--amber)">~1.0%</div></div>
+        <span class="val">projected</span></div>
+      <div class="barrow"><span class="name">Adaptive (5% of steps escalate)</span>
+        <div class="track"><div class="fill" style="width:10%;background:var(--amber)">~0.6%</div></div>
+        <span class="val">projected</span></div>
+      <div class="barrow"><span class="name">Single probe layer (1 hook)</span>
+        <div class="track"><div class="fill" style="width:5%;background:var(--green)">&lt;0.3%</div></div>
+        <span class="val">projected</span></div>
+      <div class="barrow"><span class="name">True-disable / idle (toggle off)</span>
+        <div class="track"><div class="fill" style="width:1.5%;background:var(--green)">~0.05%</div></div>
+        <span class="val">projected</span></div>
+    </div>
+    <div class="legend" style="margin-top:4px">
+      <span><span class="pill" style="background:var(--red)"></span>measured anchor (paper)</span>
+      <span><span class="pill" style="background:var(--amber)"></span>projected — pays a per-node or escalation cost</span>
+      <span><span class="pill" style="background:var(--green)"></span>projected — toggle's true-off / minimal-on win</span>
+    </div>
+    <p class="note" style="margin-bottom:0">Key contrast: at <strong>idle</strong>, true node-disable ≈ 0 overhead (~0.05%), whereas the existing <code>null_mode</code> still launches every producer (~0.6 µs/node) → ~1% TPOT it cannot shed. That gap is the whole point of true-disable over the soft switch.</p>
+  </div>
+
+  <!-- =============================================================== -->
+  <!-- SECTION 4 — USE CASES + STATUS -->
+  <!-- =============================================================== -->
+  <h2>4 · Use cases &amp; status</h2>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3 style="margin-top:0"><span class="pill" style="background:var(--green)"></span>Idle / off</h3>
+      <div class="flowmini"><span class="nd off">all hooks off</span></div>
+      <div class="lab">Use</div>Production default; DMI ≈ zero overhead when nobody is observing.
+      <div class="lab">Projected TPOT</div><span class="kbig" style="color:var(--green)">~0.05%</span> <span class="muted">vs null_mode ~1%</span>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0"><span class="pill" style="background:var(--green)"></span>Single probe layer</h3>
+      <div class="flowmini"><span class="nd on">resid·L_probe</span><span class="nd off">rest</span></div>
+      <div class="lab">Use</div>Online hallucination probe: capture one residual layer to feed a probe.
+      <div class="lab">Projected TPOT</div><span class="kbig" style="color:var(--green)">&lt;0.3%</span>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0"><span class="pill" style="background:var(--amber)"></span>Adaptive escalation (#4)</h3>
+      <div class="flowmini"><span class="nd on">1 probe</span><span>suspect →</span><span class="nd on">full multi-layer + attn</span></div>
+      <div class="lab">Use</div>Cheap default; escalate to full capture only on suspicious steps, then flip back.
+      <div class="lab">Projected TPOT</div><span class="kbig" style="color:var(--amber)">~0.6%</span> <span class="muted">@5% escalation</span>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0"><span class="pill" style="background:var(--green)"></span>Selective hook-types</h3>
+      <div class="flowmini"><span class="nd on">resid_final</span><span class="nd on">logits</span><span class="nd off">q/k/v</span><span class="nd off">attn</span></div>
+      <div class="lab">Use</div>Capture only the tensors a probe needs; skip expensive attention / QKV.
+      <div class="lab">Projected TPOT</div><span class="kbig" style="color:var(--green)">∝ enabled bytes</span>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px;border-color:rgba(210,56,56,.35)">
+    <h3 style="margin-top:0"><span class="pill" style="background:var(--red)"></span>Per-request heterogeneity <span class="tag t-no">Not supported</span></h3>
+    <p class="muted" style="font-size:13px;margin:6px 0 0">Different requests in the same batch capturing different tensors — <strong>node-toggle cannot do this</strong>. Graph nodes are <strong>batch-shared</strong>: a node is on or off for the entire batch. It would need a separate mechanism (a per-request mask inside the kernel + per-request meta) and is out of scope for the toggle list.</p>
+  </div>
+
+  <div class="statusbar">
+    <b>Status:</b> device mechanism (<code>cudaGraphNodeSetEnabled</code> ring-toggle) + host meta gate + the <code>NodeToggleController</code> + lockstep meta gate are <b>built &amp; verified locally end-to-end</b> (RTX 4090, through the real RingEngine → drain → p2p → TensorMetaFifo → SubmitFn consumer, with a negative control proving necessity). The <b>vLLM wiring is written &amp; verified against the fork's <code>cuda_graph.py</code>, but the run is pending</b> (Zaratan / fork build).
+  </div>
+
+  <p class="foot">Sources (no numbers fabricated): <span class="file">docs/node_toggle_design_notes.md</span> (§1 invariants) · <span class="file">docs/node_toggle_phase0_results.md</span> (RTX 4090 microbench) · <span class="file">docs/node_toggle_phase1_results.md</span> · <span class="file">docs/node_toggle_phase2_results.md</span> · <span class="file">docs/node_toggle_phase3_feasibility.md</span> · <span class="file">docs/node_toggle_phase3b_vllm_investigation.md</span> · <span class="file">docs/toggle_list_vllm_projection.html</span> (projected TPOT) · <span class="file">docs/ring2_toggle_implementation_plan.html</span> (phase status) · <span class="file">monitoring/csrc/ring/node_toggle.h</span> + <span class="file">monitoring/csrc/ring/ring_engine_py.h</span> (API). Microsecond figures are isolated microbench (no model compute); TPOT %s other than the ~6% anchor are projections pending H100 end-to-end measurement.</p>
+
+</div>
+</body>
+</html>
