@@ -1,10 +1,17 @@
 // tests/ring/test_rings.cu — Standalone CUDA unit tests for ring primitives.
 //
-// Covers all Milestone 1 acceptance criteria:
-//   - Payload wrap correctness (two-span)
-//   - Task ring FIFO correctness by seq_no
-//   - ready_seq guard: consumer cannot read unpublished slot
-//   - DROP marker correctness
+// Covers:
+//   - Payload ring accounting + wrap correctness (two-span)
+//   - Task ring free-slot accounting
+//   - TaskEntry layout (current 64-byte struct)
+//   - RingConfig defaults
+//
+// NOTE: the task-ring FIFO / ready_seq-lifecycle / wrap-reuse GPU tests and the
+// DROP-marker tests were removed — they exercised the old 128-byte TaskEntry
+// (per-entry seq_no/hook_id/flags/reason) and the chunking + drop-marker
+// subsystems, all of which were removed (identity now flows via TensorMetaFifo,
+// one tensor = one entry, no chunking). They need a rewrite against the current
+// design, not a field rename. See docs/node_toggle_local_perf.md.
 //
 // Build with: make -C tests/ring
 // Run with:   ./tests/ring/test_rings
@@ -227,52 +234,14 @@ static void test_task_entry_layout() {
     banner("TaskEntry — size and field offsets");
     using namespace ring;
 
-    EXPECT(sizeof(TaskEntry) == 128);
-    EXPECT(alignof(TaskEntry) == 128);
+    EXPECT(sizeof(TaskEntry) == 64);
+    EXPECT(alignof(TaskEntry) == 64);
     EXPECT(offsetof(TaskEntry, ready_seq)          == 0);
-    EXPECT(offsetof(TaskEntry, seq_no)             == 8);
-    EXPECT(offsetof(TaskEntry, logical_task_id)    == 16);
-    EXPECT(offsetof(TaskEntry, chunk_offset_bytes) == 24);
-    EXPECT(offsetof(TaskEntry, tensor_total_bytes) == 32);
-    EXPECT(offsetof(TaskEntry, payload_off1)       == 40);
-    EXPECT(offsetof(TaskEntry, payload_len1)       == 48);
-    EXPECT(offsetof(TaskEntry, payload_off2)       == 56);
-    EXPECT(offsetof(TaskEntry, payload_len2)       == 64);
-    EXPECT(offsetof(TaskEntry, chunk_idx)          == 72);
-    EXPECT(offsetof(TaskEntry, hook_type)          == 76);
-    EXPECT(offsetof(TaskEntry, hook_id)            == 80);
-    EXPECT(offsetof(TaskEntry, flags)              == 84);
-    EXPECT(offsetof(TaskEntry, reason)             == 88);
-}
-
-// ---------------------------------------------------------------------------
-// Test 7: DROP marker fields
-// ---------------------------------------------------------------------------
-static void test_drop_marker_fields() {
-    banner("DROP marker — fields and flags");
-    using namespace ring;
-
-    TaskEntry e{};
-    // Producer fills a DROP marker.
-    e.seq_no          = 42;
-    e.logical_task_id = 999;
-    e.flags           = TASK_FLAG_IS_DROP;
-    e.reason          = DROP_REASON_TIMEOUT_NO_PROGRESS;
-    e.payload_len1    = 0;
-    e.payload_len2    = 0;
-
-    EXPECT((e.flags & TASK_FLAG_IS_DROP) != 0);
-    EXPECT((e.flags & TASK_FLAG_IS_FIRST) == 0);
-    EXPECT((e.flags & TASK_FLAG_IS_LAST) == 0);
-    EXPECT(e.payload_len1 == 0);
-    EXPECT(e.payload_len2 == 0);
-    EXPECT(e.reason == DROP_REASON_TIMEOUT_NO_PROGRESS);
-    EXPECT(payload_chunk_bytes(e.payload_len1, e.payload_len2) == 0);
-
-    // SENTINEL must not equal any plausible seq_no value (just check a few).
-    EXPECT(READY_SEQ_SENTINEL != 0);
-    EXPECT(READY_SEQ_SENTINEL != 42);
-    EXPECT(READY_SEQ_SENTINEL != uint64_t(-2));  // -2 != UINT64_MAX
+    EXPECT(offsetof(TaskEntry, tensor_total_bytes) == 8);
+    EXPECT(offsetof(TaskEntry, payload_off1)       == 16);
+    EXPECT(offsetof(TaskEntry, payload_len1)       == 24);
+    EXPECT(offsetof(TaskEntry, payload_off2)       == 32);
+    EXPECT(offsetof(TaskEntry, payload_len2)       == 40);
 }
 
 // ---------------------------------------------------------------------------
@@ -283,441 +252,113 @@ static void test_ring_config_defaults() {
     using namespace ring;
 
     RingConfig cfg;
-    EXPECT(cfg.task_ring_entries  == 1024);
-    EXPECT(cfg.payload_ring_bytes == 256ULL * 1024 * 1024);
-    EXPECT(cfg.chunk_bytes        == 64ULL  * 1024 * 1024);
-    EXPECT(cfg.wait_policy        == WaitPolicy::INFINITE);
-    EXPECT(cfg.drop_reporting     == DropReporting::DROP_TASK);
-    EXPECT(cfg.chunk_bytes * 4    <= cfg.payload_ring_bytes);  // forward-progress
+    EXPECT(cfg.task_ring_entries    == 1024);
+    EXPECT(cfg.payload_ring_bytes   == 256ULL * 1024 * 1024);
+    EXPECT(cfg.drain_poll_timeout_us > 0);
+    EXPECT(cfg.pinned_staging_bytes == 0);  // 0 => defaults to payload_ring_bytes
+    EXPECT(cfg.effective_staging_bytes() == cfg.payload_ring_bytes);
 }
 
 // ===========================================================================
-// GPU TESTS
+// GPU TESTS — task ring publish/consume protocol (task_ring.cuh)
 // ===========================================================================
-
-// ---------------------------------------------------------------------------
-// Test 9: task ring FIFO — sequential producer→consumer on the same stream.
 //
-// The ring is large enough to hold all entries at once, so the producer fills
-// it entirely before the consumer drains it.  This tests pure FIFO ordering
-// without requiring concurrent kernel execution.
-//
-// Verifies:
-//   - Entries are consumed in seq_no order.
-//   - hook_id values match what the producer wrote.
-//   - task_release correctly resets ready_seq so slots can be reused.
-// ---------------------------------------------------------------------------
+// One kernel publishes a contiguous range of sequence numbers with task_publish()
+// (the exact device op the producer uses); the CPU side uses task_cpu_ready() /
+// task_release_cpu() (the exact ops the drain uses). Entries live in managed
+// memory so both sides touch the same slots. Each seq s encodes recognizable data
+// (tensor_total_bytes = 1000+s, payload_off1 = 16*s) so round-trip and ordering
+// can be checked. Single-threaded publish keeps the FIFO order deterministic.
 
-static const int FIFO_N = 32;  // number of tasks to produce and consume
-
-// Producer: publishes FIFO_N entries; ring is large enough (cap >= FIFO_N)
-// so it never needs to wait for the consumer.
-__global__ void kernel_producer_fifo(ring::TaskEntry*   entries,
-                                     uint64_t           cap,
-                                     volatile uint64_t* d_head)
-{
-    for (int i = 0; i < FIFO_N; i++) {
-        uint64_t seq = *d_head;
-
-        ring::TaskEntry e{};
-        e.seq_no          = seq;
-        e.logical_task_id = (uint64_t)i;
-        e.hook_id         = (uint32_t)i;
-        e.flags           = ring::TASK_FLAG_IS_FIRST | ring::TASK_FLAG_IS_LAST;
-
-        ring::task_publish(entries, cap, seq, e);
-        *d_head = seq + 1;
+__global__ void kernel_publish_range(ring::TaskEntry* entries, uint64_t capacity,
+                                     uint64_t start, uint64_t n) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (uint64_t i = 0; i < n; ++i) {
+            uint64_t s = start + i;
+            ring::TaskEntry src{};
+            src.tensor_total_bytes = 1000 + s;
+            src.payload_off1       = s * 16;
+            src.payload_len1       = 1000 + s;
+            ring::task_publish(entries, capacity, s, src);
+        }
     }
 }
 
-// Consumer: drains FIFO_N entries; called after the producer completes.
-__global__ void kernel_consumer_fifo(const ring::TaskEntry* entries,
-                                     ring::TaskEntry*       entries_rw,
-                                     uint64_t               cap,
-                                     volatile uint64_t*     d_tail,
-                                     uint32_t*              results,
-                                     uint64_t*              result_seq)
-{
-    for (int i = 0; i < FIFO_N; i++) {
-        uint64_t tail = *d_tail;
-        const ring::TaskEntry* e = ring::task_spin_wait(entries, cap, tail);
-        results[i]    = e->hook_id;
-        result_seq[i] = e->seq_no;
-        ring::task_release(entries_rw, cap, tail);
-        *d_tail = tail + 1;
-    }
-}
-
+// Test 9: FIFO — publish N (<= capacity) in order, consume in order.
 static void test_task_ring_fifo_gpu() {
-    banner("task ring FIFO (GPU) — sequential producer then consumer");
+    banner("task ring FIFO — publish N, consume in order");
     using namespace ring;
-
-    // Ring larger than FIFO_N so producer never blocks waiting for space.
-    const uint64_t cap = 64;
-
-    TaskEntry* d_entries;
-    CUDA_CHECK(cudaMalloc(&d_entries, cap * sizeof(TaskEntry)));
-    task_ring_init(d_entries, cap, 0);
-
-    volatile uint64_t* d_head;
-    volatile uint64_t* d_tail;
-    CUDA_CHECK(cudaMallocManaged((void**)&d_head, sizeof(uint64_t)));
-    CUDA_CHECK(cudaMallocManaged((void**)&d_tail, sizeof(uint64_t)));
-    *d_head = 0;
-    *d_tail = 0;
-
-    uint32_t* results;
-    uint64_t* result_seq;
-    CUDA_CHECK(cudaMallocManaged(&results,    FIFO_N * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMallocManaged(&result_seq, FIFO_N * sizeof(uint64_t)));
-
-    // Sync to ensure managed memory is initialised before kernels run.
+    const uint64_t cap = 64, n = 50;
+    TaskEntry* e = nullptr;
+    CUDA_CHECK(cudaMallocManaged(&e, cap * sizeof(TaskEntry)));
+    task_ring_init(e, cap);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-
-    // Sequential: producer runs completely, then consumer drains.
-    kernel_producer_fifo<<<1,1,0,stream>>>(d_entries, cap, d_head);
-    kernel_consumer_fifo<<<1,1,0,stream>>>(d_entries, d_entries, cap,
-                                           d_tail, results, result_seq);
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    kernel_publish_range<<<1, 1>>>(e, cap, 0, n);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    for (int i = 0; i < FIFO_N; i++) {
-        EXPECT(results[i]    == (uint32_t)i);
-        EXPECT(result_seq[i] == (uint64_t)i);
+    bool order_ok = true, data_ok = true;
+    for (uint64_t tail = 0; tail < n; ++tail) {
+        if (!task_cpu_ready(e, cap, tail)) { order_ok = false; break; }
+        const TaskEntry& s = e[tail % cap];
+        if (s.tensor_total_bytes != 1000 + tail ||
+            s.payload_off1 != tail * 16 ||
+            s.payload_len1 != 1000 + tail) data_ok = false;
+        task_release_cpu(e, cap, tail);
     }
-
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    cudaFree(d_entries);
-    cudaFree((void*)d_head);
-    cudaFree((void*)d_tail);
-    cudaFree(results);
-    cudaFree(result_seq);
+    EXPECT(order_ok);                     // each slot published in seq order
+    EXPECT(data_ok);                      // payload round-tripped intact
+    EXPECT(!task_cpu_ready(e, cap, n));   // seq n was never published
+    CUDA_CHECK(cudaFree(e));
 }
 
-// ---------------------------------------------------------------------------
-// Test 10: ready_seq lifecycle — sequential guard semantics (single stream).
-//
-// In production the producer runs inside the CUDA graph and the consumer runs
-// after the graph completes (ordered via a CUDA event).  This test mimics
-// that flow and verifies the full ready_seq lifecycle:
-//
-//   Phase A — after init:    ready_seq[i] == SENTINEL  (slot not readable)
-//   Phase B — after publish: ready_seq[seq] == seq_no  (slot readable)
-//   Phase C — after release: ready_seq[seq] == SENTINEL (slot recycled)
-//
-// Correctness guarantee covered: if task_publish omitted __threadfence() or
-// wrote the wrong value, the consumer's spin_wait (which checks ready_seq)
-// would malfunction.  The sequential stream ordering means "happened-before"
-// is enforced by the GPU's stream FIFO, but the volatile + membar semantics
-// are still exercised by the actual instructions generated.
-// ---------------------------------------------------------------------------
-
-__global__ void kernel_check_all_sentinel(const ring::TaskEntry* entries,
-                                          uint64_t               cap,
-                                          int*                   ok)
-{
-    for (uint64_t i = 0; i < cap; i++) {
-        uint64_t rs = *reinterpret_cast<const volatile uint64_t*>(
-            &entries[i].ready_seq);
-        if (rs != ring::READY_SEQ_SENTINEL) { *ok = 0; return; }
-    }
-    *ok = 1;
-}
-
-__global__ void kernel_publish_one(ring::TaskEntry*   entries,
-                                   uint64_t           cap,
-                                   volatile uint64_t* d_head,
-                                   int*               ok)
-{
-    uint64_t seq = *d_head;
-    ring::TaskEntry e{};
-    e.seq_no             = seq;
-    e.logical_task_id    = 0xDEADBEEFULL;
-    e.hook_id            = 0xCAFEBABEu;
-    e.flags              = ring::TASK_FLAG_IS_FIRST | ring::TASK_FLAG_IS_LAST;
-    e.tensor_total_bytes = 12345;
-    ring::task_publish(entries, cap, seq, e);
-    *d_head = seq + 1;
-
-    // Verify ready_seq is now the sequence number we published.
-    uint64_t rs = *reinterpret_cast<const volatile uint64_t*>(
-        &entries[seq % cap].ready_seq);
-    *ok = (rs == seq) ? 1 : 0;
-}
-
-__global__ void kernel_consume_one(const ring::TaskEntry* entries,
-                                   ring::TaskEntry*       entries_rw,
-                                   uint64_t               cap,
-                                   volatile uint64_t*     d_tail,
-                                   uint64_t*              out_hook_id,
-                                   uint64_t*              out_ltid,
-                                   uint64_t*              out_total,
-                                   int*                   sentinel_ok)
-{
-    uint64_t tail = *d_tail;
-    const ring::TaskEntry* e = ring::task_spin_wait(entries, cap, tail);
-    *out_hook_id = e->hook_id;
-    *out_ltid    = e->logical_task_id;
-    *out_total   = e->tensor_total_bytes;
-    ring::task_release(entries_rw, cap, tail);
-    *d_tail = tail + 1;
-
-    // After release, ready_seq must be SENTINEL again.
-    uint64_t rs = *reinterpret_cast<const volatile uint64_t*>(
-        &entries_rw[tail % cap].ready_seq);
-    *sentinel_ok = (rs == ring::READY_SEQ_SENTINEL) ? 1 : 0;
-}
-
+// Test 10: ready_seq guard — an unpublished slot is not consumable; publish then
+// release flips it ready then back to unpublished.
 static void test_ready_seq_lifecycle_gpu() {
-    banner("ready_seq lifecycle (GPU) — init sentinel, publish, consume, reset");
+    banner("ready_seq guard — unpublished slot not consumable");
     using namespace ring;
-
-    const uint64_t cap = 8;
-
-    TaskEntry* d_entries;
-    CUDA_CHECK(cudaMalloc(&d_entries, cap * sizeof(TaskEntry)));
-    task_ring_init(d_entries, cap, 0);
-
-    volatile uint64_t* d_head;
-    volatile uint64_t* d_tail;
-    CUDA_CHECK(cudaMallocManaged((void**)&d_head, sizeof(uint64_t)));
-    CUDA_CHECK(cudaMallocManaged((void**)&d_tail, sizeof(uint64_t)));
-    *d_head = 0;
-    *d_tail = 0;
-
-    int*     d_ok_sentinel;
-    int*     d_ok_publish;
-    int*     d_ok_sentinel2;
-    uint64_t* d_hook_id;
-    uint64_t* d_ltid;
-    uint64_t* d_total;
-    CUDA_CHECK(cudaMallocManaged(&d_ok_sentinel,  sizeof(int)));
-    CUDA_CHECK(cudaMallocManaged(&d_ok_publish,   sizeof(int)));
-    CUDA_CHECK(cudaMallocManaged(&d_ok_sentinel2, sizeof(int)));
-    CUDA_CHECK(cudaMallocManaged(&d_hook_id,      sizeof(uint64_t)));
-    CUDA_CHECK(cudaMallocManaged(&d_ltid,         sizeof(uint64_t)));
-    CUDA_CHECK(cudaMallocManaged(&d_total,        sizeof(uint64_t)));
-
+    const uint64_t cap = 8, seq = 0, idx = seq % cap;  // idx: keep '%' out of EXPECT()
+    TaskEntry* e = nullptr;
+    CUDA_CHECK(cudaMallocManaged(&e, cap * sizeof(TaskEntry)));
+    task_ring_init(e, cap);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    EXPECT(e[idx].ready_seq == READY_SEQ_SENTINEL);
+    EXPECT(!task_cpu_ready(e, cap, seq));   // before publish: not ready
 
-    // All phases run sequentially on one stream.
-    kernel_check_all_sentinel<<<1,1,0,stream>>>(d_entries, cap, d_ok_sentinel);
-    kernel_publish_one<<<1,1,0,stream>>>(d_entries, cap, d_head, d_ok_publish);
-    kernel_consume_one<<<1,1,0,stream>>>(d_entries, d_entries, cap,
-                                         d_tail, d_hook_id, d_ltid, d_total,
-                                         d_ok_sentinel2);
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    kernel_publish_range<<<1, 1>>>(e, cap, seq, 1);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    EXPECT(*d_ok_sentinel  == 1);            // all slots are SENTINEL after init
-    EXPECT(*d_ok_publish   == 1);            // ready_seq is set correctly after publish
-    EXPECT(*d_hook_id      == 0xCAFEBABEULL);
-    EXPECT(*d_ltid         == 0xDEADBEEFULL);
-    EXPECT(*d_total        == 12345ULL);
-    EXPECT(*d_ok_sentinel2 == 1);            // slot reset to SENTINEL after release
+    EXPECT(task_cpu_ready(e, cap, seq));    // after publish: ready
+    EXPECT(e[idx].tensor_total_bytes == 1000 + seq);
 
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    cudaFree(d_entries);
-    cudaFree((void*)d_head);
-    cudaFree((void*)d_tail);
-    cudaFree(d_ok_sentinel);
-    cudaFree(d_ok_publish);
-    cudaFree(d_ok_sentinel2);
-    cudaFree(d_hook_id);
-    cudaFree(d_ltid);
-    cudaFree(d_total);
+    task_release_cpu(e, cap, seq);
+    EXPECT(!task_cpu_ready(e, cap, seq));   // after release: not ready again
+    CUDA_CHECK(cudaFree(e));
 }
 
-// ---------------------------------------------------------------------------
-// Test 11: DROP marker round-trip (GPU, sequential) — producer emits IS_DROP,
-//          consumer reads it and observes zero payload and IS_DROP flag.
-// ---------------------------------------------------------------------------
-
-__global__ void kernel_producer_drop(ring::TaskEntry*   entries,
-                                     uint64_t           cap,
-                                     volatile uint64_t* d_head)
-{
-    uint64_t seq = *d_head;
-    ring::TaskEntry e{};
-    e.seq_no          = seq;
-    e.logical_task_id = 777;
-    e.flags           = ring::TASK_FLAG_IS_DROP;
-    e.reason          = ring::DROP_REASON_TIMEOUT_NO_PROGRESS;
-    e.payload_len1    = 0;
-    e.payload_len2    = 0;
-    ring::task_publish(entries, cap, seq, e);
-    *d_head = seq + 1;
-}
-
-__global__ void kernel_consumer_drop(const ring::TaskEntry* entries,
-                                     ring::TaskEntry*       entries_rw,
-                                     uint64_t               cap,
-                                     volatile uint64_t*     d_tail,
-                                     uint32_t*              out_flags,
-                                     uint32_t*              out_reason,
-                                     uint64_t*              out_len_total)
-{
-    uint64_t tail = *d_tail;
-    const ring::TaskEntry* e = ring::task_spin_wait(entries, cap, tail);
-    *out_flags     = e->flags;
-    *out_reason    = e->reason;
-    *out_len_total = e->payload_len1 + e->payload_len2;
-    ring::task_release(entries_rw, cap, tail);
-    *d_tail = tail + 1;
-}
-
-static void test_drop_marker_gpu() {
-    banner("DROP marker (GPU) — producer emits drop, consumer sees IS_DROP");
-    using namespace ring;
-
-    const uint64_t cap = 4;
-
-    TaskEntry* d_entries;
-    CUDA_CHECK(cudaMalloc(&d_entries, cap * sizeof(TaskEntry)));
-    task_ring_init(d_entries, cap, 0);
-
-    volatile uint64_t* d_head;
-    volatile uint64_t* d_tail;
-    CUDA_CHECK(cudaMallocManaged((void**)&d_head, sizeof(uint64_t)));
-    CUDA_CHECK(cudaMallocManaged((void**)&d_tail, sizeof(uint64_t)));
-    *d_head = 0;
-    *d_tail = 0;
-
-    uint32_t* out_flags;
-    uint32_t* out_reason;
-    uint64_t* out_len_total;
-    CUDA_CHECK(cudaMallocManaged(&out_flags,     sizeof(uint32_t)));
-    CUDA_CHECK(cudaMallocManaged(&out_reason,    sizeof(uint32_t)));
-    CUDA_CHECK(cudaMallocManaged(&out_len_total, sizeof(uint64_t)));
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-
-    // Sequential: producer publishes DROP, then consumer drains it.
-    kernel_producer_drop<<<1,1,0,stream>>>(d_entries, cap, d_head);
-    kernel_consumer_drop<<<1,1,0,stream>>>(d_entries, d_entries, cap,
-                                           d_tail,
-                                           out_flags, out_reason, out_len_total);
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    EXPECT((*out_flags & TASK_FLAG_IS_DROP) != 0);
-    EXPECT((*out_flags & TASK_FLAG_IS_FIRST) == 0);
-    EXPECT((*out_flags & TASK_FLAG_IS_LAST) == 0);
-    EXPECT(*out_reason    == DROP_REASON_TIMEOUT_NO_PROGRESS);
-    EXPECT(*out_len_total == 0);
-
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    cudaFree(d_entries);
-    cudaFree((void*)d_head);
-    cudaFree((void*)d_tail);
-    cudaFree(out_flags);
-    cudaFree(out_reason);
-    cudaFree(out_len_total);
-}
-
-// ---------------------------------------------------------------------------
-// Test 12: task ring wrap-around (slot reuse) — sequential producer→consumer,
-//          ring slots reused 4× to verify FIFO is preserved across full wraps.
-//
-// Uses cap < WRAP_TOTAL so that slots are recycled; sequential (same stream)
-// to avoid concurrent-spin dependency issues.
-// ---------------------------------------------------------------------------
-static const int WRAP_TOTAL = 64;   // 4× a cap-16 ring
-
-__global__ void kernel_producer_wrap(ring::TaskEntry*   entries,
-                                     uint64_t           cap,
-                                     volatile uint64_t* d_head,
-                                     int                n_total,
-                                     int                base_id)
-{
-    // Producer assumes ring is drained by a previous consumer pass.
-    for (int i = 0; i < n_total; i++) {
-        uint64_t seq = *d_head;
-        ring::TaskEntry e{};
-        e.seq_no  = seq;
-        e.hook_id = (uint32_t)(base_id + i);  // globally unique hook_id
-        e.flags   = ring::TASK_FLAG_IS_FIRST | ring::TASK_FLAG_IS_LAST;
-        ring::task_publish(entries, cap, seq, e);
-        *d_head = seq + 1;
-    }
-}
-
-__global__ void kernel_consumer_wrap(const ring::TaskEntry* entries,
-                                     ring::TaskEntry*       entries_rw,
-                                     uint64_t               cap,
-                                     volatile uint64_t*     d_tail,
-                                     uint32_t*              results,
-                                     int                    n_total)
-{
-    for (int i = 0; i < n_total; i++) {
-        uint64_t tail = *d_tail;
-        const ring::TaskEntry* e = ring::task_spin_wait(entries, cap, tail);
-        results[i] = e->hook_id;
-        ring::task_release(entries_rw, cap, tail);
-        *d_tail = tail + 1;
-    }
-}
-
+// Test 11: wrap-around — publish/consume 3x capacity one at a time; slot
+// (seq % capacity) is reused correctly across wraps.
 static void test_task_ring_wrap_reuse_gpu() {
-    banner("task ring wrap-around (GPU) — slot reuse, FIFO preserved");
+    banner("task ring wrap — slot reuse across capacity");
     using namespace ring;
-
-    // cap < WRAP_TOTAL to force slot reuse; run in batches of cap entries.
-    const uint64_t cap    = 16;
-    const int      batch  = (int)cap;  // publish+consume `batch` at a time
-
-    TaskEntry* d_entries;
-    CUDA_CHECK(cudaMalloc(&d_entries, cap * sizeof(TaskEntry)));
-    task_ring_init(d_entries, cap, 0);
-
-    volatile uint64_t* d_head;
-    volatile uint64_t* d_tail;
-    CUDA_CHECK(cudaMallocManaged((void**)&d_head, sizeof(uint64_t)));
-    CUDA_CHECK(cudaMallocManaged((void**)&d_tail, sizeof(uint64_t)));
-    *d_head = 0;
-    *d_tail = 0;
-
-    uint32_t* results;
-    CUDA_CHECK(cudaMallocManaged(&results, WRAP_TOTAL * sizeof(uint32_t)));
-
+    const uint64_t cap = 4, n = 3 * cap;   // 3 full wraps
+    TaskEntry* e = nullptr;
+    CUDA_CHECK(cudaMallocManaged(&e, cap * sizeof(TaskEntry)));
+    task_ring_init(e, cap);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-
-    // Process in batches of `cap` entries so the ring never overflows.
-    // Each pass: producer fills the ring, then consumer drains it.
-    for (int base = 0; base < WRAP_TOTAL; base += batch) {
-        kernel_producer_wrap<<<1,1,0,stream>>>(d_entries, cap, d_head,
-                                               batch, base);
-        kernel_consumer_wrap<<<1,1,0,stream>>>(d_entries, d_entries, cap,
-                                               d_tail, results + base, batch);
+    bool ok = true;
+    for (uint64_t s = 0; s < n; ++s) {
+        kernel_publish_range<<<1, 1>>>(e, cap, s, 1);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (!task_cpu_ready(e, cap, s)) { ok = false; break; }   // reused slot republished
+        if (e[s % cap].tensor_total_bytes != 1000 + s) { ok = false; break; }
+        task_release_cpu(e, cap, s);
+        if (task_cpu_ready(e, cap, s)) { ok = false; break; }    // freed for next wrap
     }
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    for (int i = 0; i < WRAP_TOTAL; i++) {
-        EXPECT(results[i] == (uint32_t)i);
-    }
-
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    cudaFree(d_entries);
-    cudaFree((void*)d_head);
-    cudaFree((void*)d_tail);
-    cudaFree(results);
+    EXPECT(ok);
+    CUDA_CHECK(cudaFree(e));
 }
 
 // ===========================================================================
@@ -744,13 +385,11 @@ int main() {
     test_payload_ring_simulation();
     test_task_free_slots();
     test_task_entry_layout();
-    test_drop_marker_fields();
     test_ring_config_defaults();
 
-    // GPU tests (all sequential — producer then consumer on same stream).
+    // GPU tests — task ring publish/consume protocol (single stream).
     test_task_ring_fifo_gpu();
     test_ready_seq_lifecycle_gpu();
-    test_drop_marker_gpu();
     test_task_ring_wrap_reuse_gpu();
 
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);
