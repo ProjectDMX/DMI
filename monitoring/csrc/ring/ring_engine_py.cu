@@ -322,16 +322,22 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     }
 
     // Case A: step fits.  Check available space for BOTH payload AND tasks.
-    // Saturating: if head has (incorrectly) run past tail by more than the cap,
-    // clamp avail to 0 instead of underflowing uint64 to a huge "available"
-    // value that silently disables the capacity check. (head>=tail always holds;
-    // head-tail > cap should not happen once reserve matches production, but a
-    // future drift must fail safe, not silently pass.)
-    const uint64_t payload_used =
-        drain.cpu_payload_head() - drain.cpu_payload_tail_committed();
+    // Clamp `used` to [0, cap] on BOTH ends:
+    //   - head < tail: a small constant skew exists because producers that fire
+    //     during CUDA-graph capture get drained (advancing the tail) with no
+    //     matching reserve() (which only runs per real step) -> the ring is in
+    //     fact drained, so used = 0 (avail = cap). Computing head-tail here would
+    //     underflow uint64 to a huge value -> avail = 0 -> a spurious ring-full
+    //     flush (main-stream sync) every step.
+    //   - head-tail > cap: over-reserve drift; fail safe with avail = 0 rather
+    //     than underflowing to a huge "available" that disables the check.
+    const uint64_t ph = drain.cpu_payload_head();
+    const uint64_t pt = drain.cpu_payload_tail_committed();
+    const uint64_t payload_used = (ph > pt) ? (ph - pt) : 0;
     const uint64_t payload_avail = (payload_used >= pcap) ? 0 : pcap - payload_used;
-    const uint64_t task_used =
-        drain.cpu_task_head() - drain.cpu_task_tail_committed();
+    const uint64_t th = drain.cpu_task_head();
+    const uint64_t tt = drain.cpu_task_tail_committed();
+    const uint64_t task_used = (th > tt) ? (th - tt) : 0;
     const uint64_t task_avail = (task_used >= tcap) ? 0 : tcap - task_used;
 
     if (step_total_bytes <= payload_avail && num_hooks <= task_avail) {

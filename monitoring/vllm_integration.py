@@ -219,6 +219,17 @@ class DMXGPUWorker(Worker):
         ring_cfg.insert_queue_max_items = int(_cfg(
             ac, "dmx_insert_queue_max_items", "DMX_INSERT_QUEUE_MAX_ITEMS",
             65536))
+        # Drain flush timeout (us): bound export latency for LOW-VOLUME / sparse-hook
+        # configs. should_flush() otherwise only fires when the ring fills, so a few
+        # hooks (e.g. residual on the last few layers for hallucination monitoring)
+        # on a multi-GB ring can delay export by minutes — the FEWER hooks, the WORSE
+        # the latency. The drain-thread timeout flush runs on the drain's own D2H
+        # stream (does NOT stall decode) and only commits already-published entries;
+        # high-volume configs fill the ring before the timeout fires (unaffected) and
+        # idle periods have nothing pending (no flush). 0 = legacy flush-when-full.
+        # See docs/node_toggle_local_perf.md "Low-volume drain latency".
+        ring_cfg.drain_flush_timeout_us = int(_cfg(
+            ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US", 50000))
 
         ring_engine = _ne.RingEngine(ring_cfg, host_engine)
         ring_engine.init()

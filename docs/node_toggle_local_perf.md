@@ -76,16 +76,97 @@ Done (this round):
   (identical every decode step) → `2_capacity_check` 20→8.6 us (gpt2), host floor
   −31% (OFF) / −46% (full).
 
+Done (reserve-invariant fix, commit `8d91350`):
+- **Opt B (subsumed):** one `effective_specs` set, recomputed once per
+  `set_active_hooks`, now drives capacity-reserve + meta-push + device-toggle. No
+  per-step `is_hook_enabled` C-calls; capacity no longer over-counts disabled
+  hooks (this was also a correctness fix — see "Reserve invariant" below).
+
 Proposed:
 - **Opt A — empty-enabled fast path:** when the enabled set is empty, short-circuit
   `execute_model` to `super()` (nodes disabled → nothing to capture). Removes
   capacity + meta_build + set_ctx + push → host floor ~1.8 us, toggle OFF ≈ baseline.
-  This is the key win for the online "monitor off by default, on when suspicious"
-  pattern.
-- **Opt B — precompute enabled spec subset on `set_active_hooks`:** so per-step
-  `push_meta_fifo` and capacity iterate only enabled specs (no per-step
-  `is_hook_enabled` C-calls) and capacity stops over-counting disabled hooks.
-  Makes partial-on cost scale with #enabled.
+  (Partially free already: empty `effective_specs` → `n_hooks==0` → `prepare_step`
+  is skipped; the remaining meta_build/set_ctx is the leftover.)
+
+## Reserve invariant (correctness, commit `8d91350`)
+
+The ring's flow control requires `reserve(step_bytes, n_hooks)` to equal what the
+producers actually write: the host pre-claims ring space in `reserve()` (advancing
+`cpu_payload_head_`), the drain advances `cpu_*_tail_committed` as it consumes the
+REAL task entries. node-toggle introduced "only enabled hooks fire" but capacity
+still counted all `_active_specs` → `reserve > produced` → the head-tail gap drifts
+monotonically (long-run probe: toggle_0 payload-gap → 344 MB, after which a uint64
+underflow in `prepare_step`'s `pcap-(head-tail)` silently disabled the capacity
+check). Same class of bug on the byte axis: `token_ids` was reserved at model dtype
+but written/pushed at the real `input_ids` dtype. Fixed by the single
+`effective_specs` source + matched dtype + saturating capacity math. Verified by the
+probe: `resv_hooks == pushed` for toggle off/partial/full and token_ids-inclusive.
+
+## Low-volume drain latency (general DMI, NOT toggle-specific)
+
+**Symptom.** With few enabled hooks the per-step payload is small, so the ring
+fills slowly. `DrainThread::should_flush()` with default thresholds (all 0) only
+flushes when the ring is FULL (`pending_bytes >= payload_cap` / `pending_entries >=
+task_cap`). So low-volume data sits in the GPU payload ring, uncommitted and
+un-exported, until the ring fills (or shutdown). Probe: `toggle_4` payload-gap
+climbs +8.2 MB/win with `task_tail` frozen — data produced but not drained.
+
+**Not a node-toggle issue.** `should_flush()` is purely volume-driven; it doesn't
+care HOW the hook set was made small — runtime node-toggle OR a static
+`dmx_hook_selection` (e.g. residual on the last few layers for hallucination
+monitoring) hit it identically.
+
+**Impact (concrete).** Qwen3-0.6B, 4 hidden-states hooks ≈ 8.2 KB/step. With the
+default 4 GB payload ring: fill time ≈ 4 GB / 8.2 KB ≈ 5e5 steps ≈ ~17 min at
+~2 ms/step. So a sparse-layer monitor's data could be ~17 min stale before reaching
+ClickHouse. Counter-intuitively, the LIGHTER the monitoring, the WORSE the latency.
+Data is not lost or desynced — it flushes at ring-full or shutdown.
+
+**Fix (commit `05bd6e8`).** Default `RingConfig.drain_flush_timeout_us = 50000`
+(50 ms) in `DMXGPUWorker`, configurable via `dmx_drain_flush_timeout_us` /
+`DMX_DRAIN_FLUSH_TIMEOUT_US`. `should_flush()` then flushes when the oldest pending
+entry is older than the timeout, regardless of volume — bounding export latency to
+~50 ms. The drain-thread timeout flush runs on the drain's OWN D2H stream (does NOT
+stall the decode/compute stream, unlike `prepare_step`'s ring-full force_flush),
+and idle periods have nothing pending (no flush). `0` restores legacy
+flush-when-full.
+
+Same commit also clamps `prepare_step`'s `used` to `[0, cap]` on BOTH ends: a small
+constant `tail > head` skew exists because producers that fire during CUDA-graph
+capture get drained (advancing the tail) with no matching `reserve()`. Once the
+timeout flush keeps the tail caught up, this surfaced and `head - tail` underflowed
+uint64 → `avail = 0` → a spurious ring-full flush (main-stream sync) every step
+(+16% TPOT). `tail >= head` now reads as `used = 0` (ring drained).
+
+### Potential issue considered: does 50 ms flushing hurt throughput?
+
+"Flush only when full" is partly a batching optimization — larger D2H transfers
+amortize per-transfer overhead and approach peak PCIe bandwidth. A 50 ms timeout
+makes smaller, more frequent transfers, which *could* reduce export efficiency.
+
+**Measured — it does not.** High-volume `all_on` (28 hooks), 2 GB ring, 4000-step
+decode, `timeout=0` vs `50ms`:
+
+| setting | gap behavior | mean TPOT | total |
+|---------|--------------|----------:|------:|
+| `timeout=0` (flush-when-full) | grows to ~115 MB, big-batch/at-end | 2.332 ms | 9.33 s |
+| `timeout=50ms` | bounded ~0.5 MB, continuous | 2.328 ms | 9.31 s |
+
+Identical (within noise), `resv==pushed=56000` both. Why the batching loss cancels:
+- **Self-balancing:** `should_flush()` fires on ring-full OR timeout, whichever
+  first. When export is bandwidth-bound the ring fills within 50 ms → ring-full wins
+  → big batches preserved *exactly when they matter*. The timeout only shrinks
+  batches when the ring isn't filling (bandwidth headroom — small batches are free).
+- Drain D2H is async on its own stream → TPOT unaffected either way.
+- PCIe batching saturates by ~1–16 MB, not GB; the old multi-GB-full batches were
+  past diminishing returns.
+- Per-flush fixed cost at ≤20 flushes/s is trivial CPU.
+
+**Not locally measured:** export-bandwidth saturation with real ClickHouse ingestion
++ high concurrency (above was a null sink, batch=1, 4090). But that is precisely the
+regime where the ring fills fast → ring-full wins the race → large batches preserved
+by construction, so the design argument covers it.
 
 ## Caveats
 - RTX 4090, batch=1, single stream. Paper-grade TPOT numbers require H100 +
