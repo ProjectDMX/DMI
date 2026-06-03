@@ -334,16 +334,26 @@ def _install_prepare_wrapper(model: Any) -> None:
                     kv_dim = ring_transport._get_kv_dim(past_key_values, q_len, is_static=is_static)
                     logits_to_keep = int(model_inputs.get("logits_to_keep", 0)) if isinstance(model_inputs, dict) else 0
 
-                    # Compute per-hook tensor byte sizes (only enabled hooks)
+                    # Compute per-hook tensor byte sizes (only enabled hooks).
+                    # Use effective_specs so capacity-reserve matches meta-push and
+                    # the device enabled set (== _active_specs when toggle is off).
                     hook_byte_sizes = []
                     model_cfg = transport._model_cfg
                     if model_cfg is not None:
-                        for spec in transport._active_specs:
+                        for spec in transport.effective_specs:
                             shape = ring_transport._compute_hook_shape(
                                 spec.hook_type, model_cfg, batch, q_len, kv_dim,
                                 logits_to_keep=logits_to_keep)
                             if shape:
-                                dtype = spec.dtype if spec.dtype is not None else model_cfg.dtype
+                                # Same dtype selection as pre_push: token_ids uses
+                                # the real input_ids dtype (e.g. int64), not model
+                                # dtype, so reserve bytes == produced bytes.
+                                if spec.dtype is not None:
+                                    dtype = spec.dtype
+                                elif spec.hook_type == ring_transport.HOOK_TYPE_TOKEN_IDS:
+                                    dtype = input_ids_val.dtype
+                                else:
+                                    dtype = model_cfg.dtype
                                 elem_size = torch._utils._element_size(dtype)
                                 nbytes = elem_size
                                 for d in shape:
@@ -895,12 +905,21 @@ def _prepare_ring_forward(
     hook_byte_sizes: List[int] = []
     model_cfg = transport._model_cfg
     if model_cfg is not None:
-        for spec in transport._active_specs:
+        # effective_specs: capacity-reserve must match meta-push + device enabled
+        # set (== _active_specs when node-toggle is inactive, as in the HF path).
+        for spec in transport.effective_specs:
             shape = ring_transport._compute_hook_shape(
                 spec.hook_type, model_cfg, batch, q_len, kv_dim,
                 logits_to_keep=logits_to_keep)
             if shape:
-                dtype = spec.dtype if spec.dtype is not None else model_cfg.dtype
+                # token_ids uses the real input_ids dtype, not model dtype, so
+                # reserve bytes == produced bytes (and == the meta push below).
+                if spec.dtype is not None:
+                    dtype = spec.dtype
+                elif spec.hook_type == ring_transport.HOOK_TYPE_TOKEN_IDS:
+                    dtype = input_ids.dtype
+                else:
+                    dtype = model_cfg.dtype
                 elem_size = torch._utils._element_size(dtype)
                 nbytes = elem_size
                 for d in shape:
@@ -917,7 +936,8 @@ def _prepare_ring_forward(
         transport.cpu_direct = (result == 2)
 
     transport.pre_push_all_metas(
-        batch, q_len, kv_dim, logits_to_keep=logits_to_keep)
+        batch, q_len, kv_dim, logits_to_keep=logits_to_keep,
+        token_ids_dtype=input_ids.dtype)
 
 
 def generate_greedy(

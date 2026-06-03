@@ -359,6 +359,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("pending_bytes", &ring_py::RingFlushStats::pending_bytes)
       .def_readwrite("cpu_payload_head", &ring_py::RingFlushStats::cpu_payload_head)
       .def_readwrite("cpu_payload_tail_committed", &ring_py::RingFlushStats::cpu_payload_tail_committed)
+      .def_readwrite("cpu_task_head", &ring_py::RingFlushStats::cpu_task_head)
+      .def_readwrite("cpu_task_tail_committed", &ring_py::RingFlushStats::cpu_task_tail_committed)
       .def_readwrite("total_flushes", &ring_py::RingFlushStats::total_flushes)
       .def_readwrite("last_flush_entries", &ring_py::RingFlushStats::last_flush_entries)
       .def_readwrite("last_flush_bytes", &ring_py::RingFlushStats::last_flush_bytes)

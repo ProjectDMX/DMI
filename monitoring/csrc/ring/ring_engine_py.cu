@@ -102,10 +102,18 @@ uint64_t RingEnginePy::flush_and_wait() {
 }
 
 RingFlushStats RingEnginePy::get_stats() const {
-    // See note in flush_and_wait: DrainThread has no get_stats()/FlushStats on
-    // this branch. Return zeroed stats (ring get_stats is bound but unused from
-    // Python). TODO: reconcile drain timed-flush + stats API across branches.
+    // Debug-only: expose the live drain-thread head/tail counters so a probe can
+    // watch the ring flow-control accounting. The payload/task head advances on
+    // reserve() (prepare_step); the *_tail_committed advances as the drain thread
+    // consumes ACTUAL producer task entries. A monotonically growing
+    // (head - tail_committed) gap means reserve() is over-counting vs what
+    // producers actually write (e.g. node-toggle reserving for disabled hooks).
     RingFlushStats stats{};
+    auto& drain = impl_->engine.drain_thread();
+    stats.cpu_payload_head           = drain.cpu_payload_head();
+    stats.cpu_payload_tail_committed = drain.cpu_payload_tail_committed();
+    stats.cpu_task_head              = drain.cpu_task_head();
+    stats.cpu_task_tail_committed    = drain.cpu_task_tail_committed();
     return stats;
 }
 
@@ -314,10 +322,17 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     }
 
     // Case A: step fits.  Check available space for BOTH payload AND tasks.
-    const uint64_t payload_avail = pcap -
-        (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
-    const uint64_t task_avail = tcap -
-        (drain.cpu_task_head() - drain.cpu_task_tail_committed());
+    // Saturating: if head has (incorrectly) run past tail by more than the cap,
+    // clamp avail to 0 instead of underflowing uint64 to a huge "available"
+    // value that silently disables the capacity check. (head>=tail always holds;
+    // head-tail > cap should not happen once reserve matches production, but a
+    // future drift must fail safe, not silently pass.)
+    const uint64_t payload_used =
+        drain.cpu_payload_head() - drain.cpu_payload_tail_committed();
+    const uint64_t payload_avail = (payload_used >= pcap) ? 0 : pcap - payload_used;
+    const uint64_t task_used =
+        drain.cpu_task_head() - drain.cpu_task_tail_committed();
+    const uint64_t task_avail = (task_used >= tcap) ? 0 : tcap - task_used;
 
     if (step_total_bytes <= payload_avail && num_hooks <= task_avail) {
         drain.reserve(step_total_bytes, num_hooks);

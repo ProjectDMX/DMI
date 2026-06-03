@@ -1,0 +1,94 @@
+# Node-Toggle Local Performance (Qwen3-0.6B, RTX 4090)
+
+> Local validation of the runtime CUDA-graph node-toggle feature
+> (`feature/dmi_kernel_node_toggle`). Measures per-step decode overhead of
+> enabling/disabling producer (hook) nodes in an already-captured graph.
+>
+> **Setup:** Qwen3-0.6B (28 layers, hidden 1024, GQA kv_heads 8), vLLM fork
+> `0.17.2.dev11+cu130` (editable), `cudagraph_mode=FULL`, batch=1, decode 200
+> tokens, TPOT = median over 50 iterations. GPU 2 (RTX 4090). Hook selection
+> `hidden-states` (one producer per layer). DMXGPUWorker.
+>
+> **Why not gpt2:** gpt2 (12 layers, ~0.77 ms/step) is misleading — its small
+> per-node transport (~1 us/node) understates node-toggle's value and its small
+> TPOT inflates the relative weight of the fixed host floor. Qwen3-0.6B gives
+> tight variance (<1%) and a realistic decode shape. Numbers below are Qwen3-0.6B.
+
+## Table 1 — Overhead overview
+
+Baseline TPOT = 2.0043 ms (no DMI). All overheads vs baseline.
+
+| Config | TPOT (ms) | Overhead | us/step | Meaning |
+|--------|----------:|---------:|--------:|---------|
+| baseline | 2.0043 | — | — | plain vLLM, no DMI |
+| **toggle OFF** (0/28 enabled) | 2.0188 | **+0.72%** | +14.5 | all producer nodes disabled; only host floor remains |
+| **toggle partial** (4/28) | 2.0286 | **+1.21%** | +24.3 | realistic online case |
+| **toggle ON** (28/28) | 2.0632 | **+2.94%** | +58.9 | all nodes enabled (toggle machinery active) |
+| **ring_null** (no toggle, full transport, no DB) | 2.0696 | **+3.26%** | +65.3 | producers fire + D2D copy + drain + p2p, null sink |
+| **ring_full** (ring_db, + ClickHouse) | 2.0676 | **+3.16%** | +63.3 | full transport + async DB write |
+
+Key conclusions:
+
+1. **toggle OFF ≈ baseline (+0.72%).** Monitoring armed-but-idle is nearly free.
+2. **toggle cost is ~linear in #enabled hooks:** 0/4/28 → +0.72/+1.21/+2.94%
+   (~1.6–2.5 us/hook). Cost tracks how much you capture, not a fixed tax.
+3. **toggle ON ≈ ring_null (+2.94% vs +3.26%, within noise).** Node-toggle is
+   "free to have" — full-on costs the same as plain full transport, but you gain
+   the ability to dial down.
+4. **ring_full ≈ ring_null (+3.16% vs +3.26%).** Writing to ClickHouse adds ~0
+   TPOT — export is fully async (drain→p2p→submit→DB off the critical path).
+   Confirms DMI's async-export design.
+5. **Node-toggle's value:** turns a fixed "+3.26% always-on transport tax" into
+   "+0.72% (idle) … +2.94% (full)", paid in proportion to active hooks. The
+   online steady state (mostly off) pays 0.72% instead of being stuck at ~3.3%.
+
+Note: profiled host-floor CPU time (Table 2) overstates TPOT impact — the
+end-to-end OFF overhead is 14.5 us/step while raw host CPU is 28.85 us/step,
+because ~half the host work overlaps with the GPU replay of the prior step.
+The host-floor optimizations therefore matter most for CPU-bound throughput
+(online serving under concurrency), less for single-stream TPOT.
+
+## Table 2 — Where the "toggle OFF" overhead goes (per-step host path)
+
+CPU-time attribution of the `execute_model` host path, toggle OFF (0 enabled),
+Qwen3-0.6B, 11000 steps. Each block runs *before* the real graph replay.
+
+| Block | What it does | us/step | % of floor | Needed when OFF? | Removed by |
+|-------|--------------|--------:|-----------:|------------------|------------|
+| **5_push_meta_fifo** | loop active specs → `is_hook_enabled` per spec → push surviving metas to C++ FIFO (p2p pops these to slice payloads). OFF: 28 `is_hook_enabled` C-calls, push nothing. | 10.60 | 36.7% | ❌ | Opt B |
+| **2_capacity_check** | compute step_bytes + `prepare_step()` C-call (ring/staging room; else cpu_direct fallback). Shapes are cached. | 8.74 | 30.3% | ❌ (0 bytes) | Opt A |
+| **3_build_req_meta** | build per-request meta: req_ids, token_ranges, dim0_offsets; strip vLLM UUID suffix (regex) | 6.34 | 22.0% | ❌ | Opt A |
+| **1_predict_padding** | map total_tokens → vLLM CUDA-graph padding bucket (`padded_q`) so DMI shapes match the padded tensor | 1.81 | 6.3% | ✅ | — |
+| **4_store_step_ctx** | store the per-request meta into transport fields for pre_push to read | 1.36 | 4.7% | ❌ | Opt A |
+| **HOST FLOOR total** | | **28.85** | 100% | | |
+| (6_cudagraph_replay) | `super().execute_model()` — the actual vLLM step + graph replay | ~512 | — | ✅ | — |
+
+When OFF, **94% (27/28.85 us) is wasted work** — producer nodes are disabled, so
+no data is produced, yet the path still runs capacity/meta/push. Only
+`1_predict_padding` is genuinely needed.
+
+## Optimizations
+
+Done (this round):
+- **Gated the per-step debug `print`** behind `DMX_STEP_DEBUG` — it ran every
+  decode step (flushed stdout). On gpt2 this alone cut full-on overhead ~13%→~5%.
+- **Cached the capacity-check shape computation** keyed by `(padded_q, num_reqs)`
+  (identical every decode step) → `2_capacity_check` 20→8.6 us (gpt2), host floor
+  −31% (OFF) / −46% (full).
+
+Proposed:
+- **Opt A — empty-enabled fast path:** when the enabled set is empty, short-circuit
+  `execute_model` to `super()` (nodes disabled → nothing to capture). Removes
+  capacity + meta_build + set_ctx + push → host floor ~1.8 us, toggle OFF ≈ baseline.
+  This is the key win for the online "monitor off by default, on when suspicious"
+  pattern.
+- **Opt B — precompute enabled spec subset on `set_active_hooks`:** so per-step
+  `push_meta_fifo` and capacity iterate only enabled specs (no per-step
+  `is_hook_enabled` C-calls) and capacity stops over-counting disabled hooks.
+  Makes partial-on cost scale with #enabled.
+
+## Caveats
+- RTX 4090, batch=1, single stream. Paper-grade TPOT numbers require H100 +
+  Qwen3-4B/14B (Zaratan). This validates direction and mechanism, not absolutes.
+- TPOT here (~2.0 ms) is dominated by vLLM per-step framework overhead, not just
+  the 512 us model replay; the host floor is a small fraction either way.

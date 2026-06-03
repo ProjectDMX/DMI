@@ -395,7 +395,7 @@ class DMXGPUWorker(Worker):
     @torch.inference_mode()
     def execute_model(self, scheduler_output: Any) -> Any:
         from . import ring_transport
-        from .ring_transport import align_up_py, _compute_hook_shape
+        from .ring_transport import align_up_py, _compute_hook_shape, HOOK_TYPE_TOKEN_IDS
 
         total_tokens = scheduler_output.total_num_scheduled_tokens
         if not hasattr(self, '_dmx_step_counter'):
@@ -406,6 +406,24 @@ class DMXGPUWorker(Worker):
 
         if total_tokens == 0 or transport is None or transport.null_offload:
             return super().execute_model(scheduler_output)
+
+        # --- per-step host-path profiling (DMX_PROFILE) -------------------
+        _prof_on = bool(os.environ.get("DMX_PROFILE"))
+        if _prof_on:
+            import time as _time, collections
+            if not hasattr(self, "_dmx_prof"):
+                self._dmx_prof = collections.defaultdict(float)
+                self._dmx_prof_n = 0
+            self._dmx_prof_n += 1
+            _pf = _time.perf_counter
+            _tmark = [_pf()]
+            def _mark(label):
+                now = _pf()
+                self._dmx_prof[label] += now - _tmark[0]
+                _tmark[0] = now
+        else:
+            def _mark(label):
+                pass
 
         # Read batch info from scheduler_output (not input_batch, which
         # may not be populated yet for new requests at prefill time).
@@ -437,29 +455,69 @@ class DMXGPUWorker(Worker):
             '_bs_to_padded_graph_size', None)
         if pad_table is not None and total_q < len(pad_table):
             padded_q = pad_table[total_q]
+        _mark("1_predict_padding")
 
         # Capacity check — use padded_q (matches real tensor size).
         cfg = transport._model_cfg
+        # token_ids producer writes the REAL input_ids tensor (e.g. int64), not the
+        # model dtype. Read its dtype once and feed the SAME dtype selection used by
+        # pre_push_all_metas into the capacity loop below — otherwise reserve bytes
+        # for the token_ids hook (included in the default vllm-full selection) would
+        # use cfg.dtype and not match what the producer actually writes. None on
+        # non-first PP ranks (token_ids hook filtered out there anyway).
+        _ids_buf = getattr(self.model_runner, 'input_ids', None)
+        token_ids_dtype = _ids_buf.gpu.dtype if _ids_buf is not None else None
         is_cpu_direct = False
+        step_bytes = 0
+        n_hooks = 0
+        prep_ret = -1
         if cfg is not None and transport._active_specs:
-            step_bytes = 0
-            n_hooks = 0
-            for spec in transport._active_specs:
-                shape = _compute_hook_shape(
-                    spec.hook_type, cfg, batch=0, q_len=padded_q, kv_dim=0,
-                    logits_to_keep=num_reqs)
-                if not shape:
-                    continue
-                dtype = spec.dtype if spec.dtype is not None else cfg.dtype
-                elem_size = torch._utils._element_size(dtype)
-                nbytes = elem_size
-                for d in shape:
-                    nbytes *= d
-                step_bytes += align_up_py(nbytes, 16)
-                n_hooks += 1
+            # (step_bytes, n_hooks) depend only on (padded_q, num_reqs) for a
+            # fixed spec set + dtypes -> identical every decode step.  The
+            # per-step _compute_hook_shape loop was the dominant host-floor
+            # cost (see DMX_PROFILE: ~20-32 us/step), so cache it and reuse.
+            # prepare_step still runs every step (ring fill level changes).
+            _cap_cache = getattr(self, "_dmx_capacity_cache", None)
+            if _cap_cache is None:
+                _cap_cache = self._dmx_capacity_cache = {}
+            # Key on _enabled_version so the cache invalidates when the toggle
+            # enabled set changes. Reserve over only the EFFECTIVE enabled specs
+            # (same set meta-push + device toggle use) — counting all _active_specs
+            # would over-reserve bytes+hooks for disabled hooks (the integration
+            # bug: reserve must match what producers actually write).
+            _ckey = (padded_q, num_reqs, transport._enabled_version, token_ids_dtype)
+            _cached = _cap_cache.get(_ckey)
+            if _cached is None:
+                step_bytes = 0
+                n_hooks = 0
+                for spec in transport.effective_specs:
+                    shape = _compute_hook_shape(
+                        spec.hook_type, cfg, batch=0, q_len=padded_q, kv_dim=0,
+                        logits_to_keep=num_reqs)
+                    if not shape:
+                        continue
+                    # Same dtype selection as pre_push_all_metas, so reserve bytes
+                    # == produced bytes for every hook (token_ids uses the real
+                    # input_ids dtype, not the model dtype).
+                    if spec.dtype is not None:
+                        dtype = spec.dtype
+                    elif spec.hook_type == HOOK_TYPE_TOKEN_IDS and token_ids_dtype is not None:
+                        dtype = token_ids_dtype
+                    else:
+                        dtype = cfg.dtype
+                    elem_size = torch._utils._element_size(dtype)
+                    nbytes = elem_size
+                    for d in shape:
+                        nbytes *= d
+                    step_bytes += align_up_py(nbytes, 16)
+                    n_hooks += 1
+                _cap_cache[_ckey] = (step_bytes, n_hooks)
+            else:
+                step_bytes, n_hooks = _cached
 
             if n_hooks > 0:
                 result = transport._ring_engine.prepare_step(step_bytes, n_hooks)
+                prep_ret = result
                 is_cpu_direct = (result == 2)
                 transport.cpu_direct = is_cpu_direct
                 ring_transport.set_cpu_direct(is_cpu_direct)
@@ -488,10 +546,22 @@ class DMXGPUWorker(Worker):
                             stacklevel=2,
                         )
 
+        # No enabled hooks this step (e.g. node-toggle fully off): nothing will be
+        # produced, so prepare_step() above was skipped. Explicitly clear any stale
+        # cpu_direct / force_eager left by a prior step — a leftover force_eager would
+        # run this step EAGER, firing producers outside the captured graph while the
+        # meta push is empty -> desync. (force_eager is one-shot today, but the gate
+        # set_cpu_direct flag is not; don't rely on that implicit invariant.)
+        if n_hooks == 0:
+            self._dmx_force_eager = False
+            transport.cpu_direct = False
+            ring_transport.set_cpu_direct(False)
+
         # Meta q_len: if cpu_direct, we set force_eager which disables
         # CUDA graph dispatch -> no padding -> tensor is unpadded.
         # Otherwise padding stays -> tensor matches padded_q.
         meta_q = total_q if is_cpu_direct else padded_q
+        _mark("2_capacity_check")
 
         # Per-request metadata
         computed_map: dict = {}
@@ -513,11 +583,13 @@ class DMXGPUWorker(Worker):
             req_id_list.append(norm_id)
             token_ranges.append((pre_computed, pre_computed + n))
             dim0_offsets.append(offset)
-            print(f"[dmx_worker] step={_step} req[{i}] rid={norm_id} offset={offset} n={n} "
-                  f"t_start={pre_computed} t_end={pre_computed + n} "
-                  f"pre_computed={pre_computed} padded_q={padded_q} meta_q={meta_q}",
-                  flush=True)
+            if os.environ.get("DMX_STEP_DEBUG"):
+                print(f"[dmx_worker] step={_step} req[{i}] rid={norm_id} offset={offset} n={n} "
+                      f"t_start={pre_computed} t_end={pre_computed + n} "
+                      f"pre_computed={pre_computed} padded_q={padded_q} meta_q={meta_q}",
+                      flush=True)
             offset += n
+        _mark("3_build_req_meta")
 
         transport.set_step_context(
             model_id=self._dmx_model_id,
@@ -530,14 +602,12 @@ class DMXGPUWorker(Worker):
             pp_rank=self._dmx_pp_rank,
             flattened=True,
         )
+        _mark("4_store_step_ctx")
 
         if cfg is not None:
-            # Read input_ids dtype from model_runner buffer.  On non-first
-            # PP ranks the buffer may not exist; pass None (the token_ids
-            # hook is already filtered out by filter_by_pp_rank).
-            ids_buf = getattr(self.model_runner, 'input_ids', None)
-            ids_dtype = ids_buf.gpu.dtype if ids_buf is not None else None
-
+            # token_ids_dtype computed once at the top of this method (same value
+            # the capacity loop reserved with) -> reserve == push == produced.
+            #
             # logits_to_keep=num_reqs: vLLM's compute_logits returns one
             # logit per request, shaped [num_reqs, vocab].  In flattened
             # mode _compute_hook_shape uses logits_to_keep directly as dim0
@@ -548,12 +618,61 @@ class DMXGPUWorker(Worker):
             transport.pre_push_all_metas(
                 batch=0, q_len=meta_q, kv_dim=0,
                 logits_to_keep=num_reqs,
-                token_ids_dtype=ids_dtype)
+                token_ids_dtype=token_ids_dtype)
+        _mark("5_push_meta_fifo")
 
-        return super().execute_model(scheduler_output)
+        # --- over-reserve probe (DMX_PROBE): reserved (capacity) vs pushed (metas)
+        # vs the live ring head/tail gap. Monotonic payload_gap growth == reserve()
+        # over-counting vs actual producer writes (the node-toggle integration bug).
+        if os.environ.get("DMX_PROBE"):
+            p = getattr(self, "_dmx_probe", None)
+            if p is None:
+                p = self._dmx_probe = {
+                    "n": 0, "win": int(os.environ.get("DMX_PROBE_WINDOW", "500")),
+                    "prep": [0, 0, 0], "cpu_direct": 0,
+                    "resv_hooks": 0, "pushed": 0, "last_gap": 0,
+                }
+            p["n"] += 1
+            if 0 <= prep_ret <= 2:
+                p["prep"][prep_ret] += 1
+            p["cpu_direct"] += 1 if is_cpu_direct else 0
+            p["resv_hooks"] += n_hooks
+            p["pushed"] += getattr(transport, "_last_push_count", 0)
+            if p["n"] % p["win"] == 0:
+                st = transport._ring_engine.get_stats()
+                pay_gap = st.cpu_payload_head - st.cpu_payload_tail_committed
+                task_gap = st.cpu_task_head - st.cpu_task_tail_committed
+                dgap = pay_gap - p["last_gap"]
+                p["last_gap"] = pay_gap
+                print(f"[PROBE] step={p['n']} payload_gap={pay_gap/1e6:.2f}MB "
+                      f"(+{dgap/1e6:.2f}/win) task_gap={task_gap} "
+                      f"prep[ok={p['prep'][0]},flush={p['prep'][1]},cpudir={p['prep'][2]}] "
+                      f"resv_hooks/win={p['resv_hooks']} pushed/win={p['pushed']}",
+                      flush=True)
+                p["prep"] = [0, 0, 0]
+                p["cpu_direct"] = 0
+                p["resv_hooks"] = 0
+                p["pushed"] = 0
+
+        result = super().execute_model(scheduler_output)
+        _mark("6_cudagraph_replay")
+        return result
 
     def shutdown(self) -> None:
         from . import ring_transport
+
+        if getattr(self, "_dmx_prof", None):
+            n = max(1, self._dmx_prof_n)
+            print(f"\n[DMX PROFILE] per-step host path over {self._dmx_prof_n} steps:",
+                  flush=True)
+            host = 0.0
+            for k in sorted(self._dmx_prof):
+                us = self._dmx_prof[k] / n * 1e6
+                print(f"  {k:18s} {us:8.2f} us/step   "
+                      f"(cum {self._dmx_prof[k] * 1e3:7.1f} ms)", flush=True)
+                if not k.startswith("6_"):
+                    host += us
+            print(f"  {'HOST FLOOR (1-5)':18s} {host:8.2f} us/step", flush=True)
 
         # Sync CUDA stream to ensure last producer kernels complete, then
         # stop ring engine (flushes drain -> p2p -> host queue).

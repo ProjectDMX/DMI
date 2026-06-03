@@ -537,6 +537,17 @@ class RingTransport:
         # single source of truth read by both lanes.
         self._toggle_gate_active: bool = False
 
+        # Single source of truth for "which specs actually fire this step".
+        # When the toggle gate is active, this is the subset of _active_specs
+        # whose nodes are enabled-AND-captured (engine.is_hook_enabled); it is
+        # recomputed once per set_active_hooks/clear_toggle, NOT per step.
+        # None => toggle inactive => all _active_specs fire (legacy behaviour).
+        # capacity-reserve, meta-push AND the device node-enable must all read
+        # this same set, else reserve() over-counts vs actual producer writes
+        # (the node-toggle integration bug — see docs/node_toggle_local_perf.md).
+        self._effective_enabled_specs: "Optional[List[HookSpec]]" = None
+        self._enabled_version: int = 0   # bumped whenever the enabled set changes
+
         # Shared path flag for ALL hooks.  Reset to False at the start of
         # every pre-forward.  Set to True when the entire step's data exceeds
         # ring capacity (Case B).  When True, ALL enabled hooks use the
@@ -609,6 +620,16 @@ class RingTransport:
         """Set the model shape config for analytical shape computation."""
         self._model_cfg = cfg
 
+    @property
+    def effective_specs(self) -> "List[HookSpec]":
+        """The specs that actually fire this step — the single set that must
+        drive capacity-reserve, meta-push and device node-enable in lockstep.
+        Toggle active -> the precomputed enabled-AND-captured subset; else all
+        active specs (legacy: every active hook fires every step)."""
+        if self._toggle_gate_active and self._effective_enabled_specs is not None:
+            return self._effective_enabled_specs
+        return self._active_specs
+
     def pre_push_all_metas(self, batch: int, q_len: int, kv_dim: int,
                            logits_to_keep: int = 0,
                            token_ids_dtype: Optional[torch.dtype] = None) -> None:
@@ -633,13 +654,11 @@ class RingTransport:
         layer_nos = []
         shapes = []
         dtypes = []
-        for spec in self._active_specs:
-            # Lockstep node-toggle gate: skip metas for currently-disabled hooks
-            # so the host meta set == the device enabled set (else p2p desyncs).
-            # Short-circuits when toggle is inactive -> default path unchanged.
-            if self._toggle_gate_active and not self._ring_engine.is_hook_enabled(
-                    spec.hook_type, spec.layer_no):
-                continue
+        # Iterate the single effective-enabled set (precomputed in
+        # set_active_hooks). This IS the lockstep node-toggle gate: host meta set
+        # == device enabled set == capacity-reserve set. No per-step
+        # is_hook_enabled call; toggle-inactive -> effective_specs is _active_specs.
+        for spec in self.effective_specs:
             shape = _compute_hook_shape(
                 spec.hook_type, self._model_cfg, batch, q_len, kv_dim,
                 logits_to_keep=logits_to_keep,
@@ -657,6 +676,7 @@ class RingTransport:
             shapes.append(shape)
             dtypes.append(dtype)
 
+        self._last_push_count = len(hook_types)   # debug probe: metas actually pushed
         if hook_types:
             self._ring_engine.push_all_metas(
                 hook_types, layer_nos, shapes, dtypes,
@@ -712,6 +732,15 @@ class RingTransport:
         if err != 0:
             raise RuntimeError(f"apply_toggle failed with CUDA error {err}")
         self._toggle_gate_active = True
+        # Recompute the single effective-enabled set ONCE here (the enabled set
+        # only changes via this method / clear_toggle; registered set is fixed
+        # after capture). capacity-reserve + meta-push both read this -> they can
+        # never diverge from the device enabled set. Bump version to invalidate
+        # the worker's capacity cache.
+        self._effective_enabled_specs = [
+            s for s in self._active_specs
+            if eng.is_hook_enabled(s.hook_type, s.layer_no)]
+        self._enabled_version += 1
 
     def clear_toggle(self) -> None:
         """Paired teardown: clear the engine's toggle registry AND deactivate the
@@ -719,6 +748,8 @@ class RingTransport:
         re-capture or when disabling monitoring."""
         self._ring_engine.clear_toggle_registry()
         self._toggle_gate_active = False
+        self._effective_enabled_specs = None
+        self._enabled_version += 1
 
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
                           hook_type: int, hook_id: int) -> None:

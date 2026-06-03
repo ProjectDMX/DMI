@@ -55,6 +55,8 @@ struct RingFlushStats {
     uint64_t pending_bytes{0};
     uint64_t cpu_payload_head{0};
     uint64_t cpu_payload_tail_committed{0};
+    uint64_t cpu_task_head{0};
+    uint64_t cpu_task_tail_committed{0};
     uint64_t total_flushes{0};
     uint64_t last_flush_entries{0};
     uint64_t last_flush_bytes{0};
