@@ -67,6 +67,11 @@ When OFF, **94% (27/28.85 us) is wasted work** — producer nodes are disabled, 
 no data is produced, yet the path still runs capacity/meta/push. Only
 `1_predict_padding` is genuinely needed.
 
+**IMPORTANT — this host CPU is NOT what drives toggle-OFF TPOT.** It overlaps with
+the GPU replay of the prior step. Skipping the entire host path (the reverted
+Opt A) left toggle-OFF TPOT unchanged. The actual TPOT driver is GPU-side; see
+"Toggle-OFF overhead — what actually drives TPOT" below.
+
 ## Optimizations
 
 Done (this round):
@@ -82,12 +87,56 @@ Done (reserve-invariant fix, commit `8d91350`):
   per-step `is_hook_enabled` C-calls; capacity no longer over-counts disabled
   hooks (this was also a correctness fix — see "Reserve invariant" below).
 
-Proposed:
-- **Opt A — empty-enabled fast path:** when the enabled set is empty, short-circuit
-  `execute_model` to `super()` (nodes disabled → nothing to capture). Removes
-  capacity + meta_build + set_ctx + push → host floor ~1.8 us, toggle OFF ≈ baseline.
-  (Partially free already: empty `effective_specs` → `n_hooks==0` → `prepare_step`
-  is skipped; the remaining meta_build/set_ctx is the leftover.)
+Tried and reverted:
+- **Opt A — empty-enabled fast path:** short-circuit `execute_model` to `super()`
+  when `effective_specs` is empty. Implemented and confirmed firing (no host-path
+  profile output), but **single-stream TPOT was unchanged** (toggle-OFF +0.68%
+  before and after) — the host path overlaps the GPU replay, so removing it doesn't
+  shorten the step. Also flagged unsafe by review (entrenches "OFF = skip the host
+  protocol", which only holds on bound-FULL-graph steps; an eager/piecewise step
+  fires producers untoggled → 0 metas → desync). Reverted. The host floor matters
+  only for CPU-bound / high-concurrency throughput, not single-stream latency.
+
+## Toggle-OFF overhead — what actually drives TPOT
+
+Decomposed on Qwen3-0.6B (28 hidden-states hooks). Three components, each pinned
+by a separate experiment:
+
+| component | size | how pinned | optimizable? |
+|-----------|------|-----------|--------------|
+| host per-step path | ~14–28 us CPU | overlaps GPU → ~0 TPOT (Opt A removed it, no change) | n/a (already hidden) |
+| producer kernel launch | ~1.07 us/node | `null_mode` (launch+no-op) = +1.49%; toggle (disabled) = +0.80% | **already removed by node-toggle** |
+| disabled-node graph traversal | **~0.34 us/node** | linearity test below | only via dual-graph |
+
+**Launch is already removed.** Leaving the 28 producers enabled-but-no-op
+(`null_mode`) costs +1.49%; node-toggle disabling them costs +0.80%. So toggle-OFF
+is ~half of `null_mode`-OFF — node-toggle saves ~14 us/step of kernel-launch
+overhead (the real win over the old `null_mode` approach; invisible on gpt2 where
+launch is ~free, clear on a 28-layer model).
+
+**The residual is per-disabled-node graph traversal — linear, through the origin.**
+A disabled node (`cudaGraphNodeSetEnabled(0)` → grid 0) stays an entry in the
+executable graph; the replay engine still walks/skips it each step. Varying the
+number of captured-but-disabled nodes (same model, 50 iters):
+
+| disabled nodes N | overhead vs baseline | us/node |
+|-----------------:|---------------------:|--------:|
+| 0 | — | — |
+| 7 | +2.6 us | 0.37 |
+| 14 | +4.7 us | 0.34 |
+| 21 | +7.0 us | 0.33 |
+| 28 | +9.6 us | 0.34 |
+
+Dead linear, slope ≈ **0.34 us/node**, intercept ≈ 0 → no fixed toggle/graph-launch
+cost; the overhead is purely "how many nodes still live in the graph."
+
+**Predictive use:** toggle-OFF overhead ≈ 0.34 us × (#captured nodes). E.g. vllm-full
+(~40+ hooks) OFF ≈ 14 us ≈ 0.7%; a 4-layer residual monitor OFF ≈ 1.4 us ≈ 0.07%.
+
+**Only dual-graph removes the residual.** Since the cost is ∝ nodes-in-graph (not
+enabled count), the sole way to reach exactly baseline when OFF is to replay a
+separate hook-free captured graph — 2× graph memory + re-capture, which defeats
+node-toggle's single-graph premise. Poor trade for ~0.3–0.8%; not recommended.
 
 ## Reserve invariant (correctness, commit `8d91350`)
 
