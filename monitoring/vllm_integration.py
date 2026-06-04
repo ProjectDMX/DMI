@@ -24,6 +24,12 @@ import torch
 from vllm.v1.worker.gpu_worker import Worker
 
 
+# Phase 4 lazy per-graph toggle: when True, the keep_graph CUDAGraph.replay()
+# override applies the deferred toggle to the graph about to replay (and records
+# an event after). Off by default -> replay() is the stock path, zero overhead.
+_DMX_LAZY_REPLAY_HOOK = False
+
+
 # ---------------------------------------------------------------------------
 # Config: additional_config preferred, env var fallback
 # ---------------------------------------------------------------------------
@@ -123,6 +129,7 @@ def _patch_cudagraph_keep_graph() -> None:
         # keep_graph to its False default after __new__ set it. Subclass (not a
         # factory) so isinstance(x, torch.cuda.CUDAGraph) still holds.
         _dmx_keep_graph = True
+        _dmx_lazy_logged = False
 
         def __new__(cls, *args, **kwargs):
             kwargs["keep_graph"] = True
@@ -131,6 +138,26 @@ def _patch_cudagraph_keep_graph() -> None:
         def __init__(self, *args, **kwargs):
             kwargs["keep_graph"] = True
             super().__init__(**kwargs)
+
+        def replay(self):
+            # Phase 4 lazy: apply the deferred toggle to THIS graph just before it
+            # replays (and record an event after, so the next ensure waits for
+            # this replay before mutating the exec). Gated by _DMX_LAZY_REPLAY_HOOK
+            # and an active toggle gate; otherwise it's the stock replay (the
+            # common case, incl. all eager-toggle and non-toggle runs).
+            if _DMX_LAZY_REPLAY_HOOK:
+                from . import ring_transport as _rt
+                t = _rt.get_active()
+                if t is not None and getattr(t, "_toggle_gate_active", False):
+                    raw = self.raw_cuda_graph()
+                    t.ensure_graph_current(raw)   # apply deferred toggle if stale (no-op for unbound)
+                    super().replay()
+                    t.record_replay_event(raw)    # event guard for the next ensure
+                    if not _KeepGraphCUDAGraph._dmx_lazy_logged:
+                        _KeepGraphCUDAGraph._dmx_lazy_logged = True
+                        print("[DMX] node-toggle: lazy replay hook active", flush=True)
+                    return
+            super().replay()
 
     torch.cuda.CUDAGraph = _KeepGraphCUDAGraph
     _CUDAGRAPH_KEEP_PATCHED = True
@@ -177,6 +204,9 @@ class DMXGPUWorker(Worker):
         # once after warmup (for testing); empty -> toggle armed but gate inactive.
         node_toggle     = _cfg(ac, "dmx_node_toggle",      "DMX_NODE_TOGGLE",      False)
         enabled_hooks_s = _cfg(ac, "dmx_enabled_hooks",    "DMX_ENABLED_HOOKS",    "")
+        # Phase 4: lazy per-graph toggle (defer device apply to per-graph replay).
+        # Opt-in; only meaningful with node_toggle. Default off -> eager apply.
+        lazy_toggle     = _cfg(ac, "dmx_lazy_toggle",      "DMX_LAZY_TOGGLE",      False)
 
         self._dmx_model_id = model_id or str(self.vllm_config.model_config.model)
 
@@ -252,6 +282,7 @@ class DMXGPUWorker(Worker):
         # here -- enabling them in init_device would also affect vLLM's pre-capture
         # memory profiling and any later captures (#1).
         self._dmx_node_toggle = bool(node_toggle)
+        self._dmx_lazy_toggle = bool(lazy_toggle)
         self._dmx_enabled_hooks = _parse_enabled_hooks(enabled_hooks_s)
 
         # Wrap model_runner for force_eager
@@ -355,8 +386,17 @@ class DMXGPUWorker(Worker):
                 from . import ring_transport
                 transport = ring_transport.get_active()
                 if transport is not None:
-                    transport.set_active_hooks(self._dmx_enabled_hooks)
-                    print(f"[DMX] node-toggle: active hooks set to {self._dmx_enabled_hooks}")
+                    if self._dmx_lazy_toggle:
+                        # Phase 4: arm the replay() hook; defer device apply to
+                        # each graph's first replay (lazy per-graph).
+                        global _DMX_LAZY_REPLAY_HOOK
+                        _DMX_LAZY_REPLAY_HOOK = True
+                        transport.set_active_hooks_lazy(self._dmx_enabled_hooks)
+                        print(f"[DMX] node-toggle: LAZY active hooks set to "
+                              f"{self._dmx_enabled_hooks}")
+                    else:
+                        transport.set_active_hooks(self._dmx_enabled_hooks)
+                        print(f"[DMX] node-toggle: active hooks set to {self._dmx_enabled_hooks}")
             elif n_bound == 0:
                 print("[DMX] node-toggle: WARNING no graph bound; toggle is inert "
                       "(no dmx_enabled_hooks requested, so serving continues all-on).")

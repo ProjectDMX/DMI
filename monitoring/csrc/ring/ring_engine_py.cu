@@ -288,6 +288,7 @@ void RingEnginePy::record_replay_event(uint64_t graph) {
     // mutating that exec.
     std::lock_guard<std::mutex> lk(impl_->toggle_mu);
     cudaGraph_t g = reinterpret_cast<cudaGraph_t>(graph);
+    if (impl_->reg_exec.find(g) == impl_->reg_exec.end()) return;  // only track bound graphs
     cudaEvent_t& ev = impl_->replay_event[g];
     if (ev == nullptr) {
         if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) return;
