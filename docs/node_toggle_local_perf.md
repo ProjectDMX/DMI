@@ -217,6 +217,48 @@ Identical (within noise), `resv==pushed=56000` both. Why the batching loss cance
 regime where the ring fills fast → ring-full wins the race → large batches preserved
 by construction, so the design argument covers it.
 
+## Reconfigure (set_active_hooks) cost & optimization
+
+Dynamic reconfigure = the cost of `set_active_hooks` at runtime (changing which
+hooks are active). Measured on Qwen3-0.6B (35 bound graphs):
+
+```
+set_active_hooks ≈ fixed pybind crossings (~130us)  +  variable (0.34us × changed × 35 graphs)
+```
+At per-request frequency this is ~0.1% (a 450us full flip amortized over a ~400ms
+request); it only matters for per-step / adaptive reconfigure.
+
+**Fixed part — pybind crossings (NOT the C++ walk).** An eager-delta attempt on
+the C++ `apply_toggle` walk gave **zero** benefit — the walk was already ~10us;
+the fixed cost is the ~33 Python↔C++ crossings, dominated by the effective-set
+recompute (one `is_hook_enabled` per spec). Fixed by `effective_enabled_mask`
+(commit `312aeec`): one batched crossing instead of N. Measured: flip-1
+130→104us, flip-4 193→141us (−20/−27%); flip-28 unchanged (variable-bound).
+
+**Variable part — `cudaGraphNodeSetEnabled × changed × graphs`.** Irreducible per
+call except by touching fewer graphs → **lazy per-graph (Phase 4)**.
+
+### Phase 4 — lazy per-graph toggle (opt-in `dmx_lazy_toggle`)
+
+Eager applies the new enabled set to ALL bound graphs at `set_active_hooks`. Lazy
+just bumps a `target_version` and updates the meta gate; each graph is applied
+**on its first replay after the change** (`ensure_graph_current`, hooked into the
+keep_graph `CUDAGraph.replay()` override → uses vLLM's own dispatch, no graph
+prediction). So the cost scales with **graphs actually used**, not all 35 — and
+graphs never replayed after a change are never touched.
+
+- Measured: the reconfigure **call** drops **256.5 → 45.8 us (−82%)** by deferring
+  the apply (the apply work moves to per-graph replays).
+- Event guard: `record_replay_event` after each replay; `ensure_graph_current`
+  waits on that graph's last-replay event before mutating the exec
+  (`cudaGraphNodeSetEnabled` on an executing exec is UB; host can run ahead).
+- Verified: `test_reconfig_lazy_e2e` (per-graph apply correct across deferred /
+  one-/two-version-stale / empty, 2 graphs); gpt2 FULL-cudagraph smoke
+  ("lazy replay hook active" fires, coherent generation, no desync); eager
+  guardrails unaffected. Commits `f72e885` (engine core) + `97b1896` (vLLM wiring).
+- Off by default → eager apply, unchanged. Worth enabling only for high-frequency
+  reconfigure.
+
 ## Caveats
 - RTX 4090, batch=1, single stream. Paper-grade TPOT numbers require H100 +
   Qwen3-4B/14B (Zaratan). This validates direction and mechanism, not absolutes.
