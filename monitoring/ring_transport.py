@@ -737,9 +737,14 @@ class RingTransport:
         # after capture). capacity-reserve + meta-push both read this -> they can
         # never diverge from the device enabled set. Bump version to invalidate
         # the worker's capacity cache.
+        #
+        # One batched pybind call (effective_enabled_mask) instead of one
+        # is_hook_enabled() per spec -> the dominant reconfigure cost was those
+        # N round-trips, not the C++ apply loop. C++ stays the source of truth.
+        _mask = eng.effective_enabled_mask(
+            [(s.hook_type, s.layer_no) for s in self._active_specs])
         self._effective_enabled_specs = [
-            s for s in self._active_specs
-            if eng.is_hook_enabled(s.hook_type, s.layer_no)]
+            s for s, m in zip(self._active_specs, _mask) if m]
         self._enabled_version += 1
 
     def clear_toggle(self) -> None:

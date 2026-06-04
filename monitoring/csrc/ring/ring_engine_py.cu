@@ -235,6 +235,22 @@ bool RingEnginePy::is_hook_enabled(int hook_type, int layer_no) const {
     return impl_->enabled_hooks.count(k) > 0 && impl_->registered_hooks.count(k) > 0;
 }
 
+std::vector<int> RingEnginePy::effective_enabled_mask(
+    const std::vector<std::pair<int,int>>& query) const {
+    // Batched is_hook_enabled (same semantics, one lock, one pybind crossing):
+    // toggle inactive -> all on; else enabled AND registered (#14 guard).
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    const bool inactive = !impl_->toggle_active;
+    std::vector<int> mask;
+    mask.reserve(query.size());
+    for (const auto& k : query) {
+        mask.push_back((inactive ||
+                        (impl_->enabled_hooks.count(k) > 0 &&
+                         impl_->registered_hooks.count(k) > 0)) ? 1 : 0);
+    }
+    return mask;
+}
+
 uint64_t RingEnginePy::toggle_node_count() const {
     std::lock_guard<std::mutex> lk(impl_->toggle_mu);
     uint64_t n = 0;

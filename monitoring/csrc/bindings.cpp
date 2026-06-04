@@ -525,6 +525,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("is_hook_enabled",
            &ring_py::RingEnginePy::is_hook_enabled,
            py::arg("hook_type"), py::arg("layer_no"))
+      .def("effective_enabled_mask",
+           &ring_py::RingEnginePy::effective_enabled_mask,
+           py::arg("query"))
       .def("toggle_node_count", &ring_py::RingEnginePy::toggle_node_count)
       .def("bound_graph_count", &ring_py::RingEnginePy::bound_graph_count)
       .def("last_apply_count", &ring_py::RingEnginePy::last_apply_count)

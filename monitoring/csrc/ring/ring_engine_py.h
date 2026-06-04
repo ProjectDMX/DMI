@@ -116,6 +116,12 @@ public:
     int  apply_toggle();
     // Host meta-gate query: true if the hook is enabled (or toggle inactive).
     bool is_hook_enabled(int hook_type, int layer_no) const;
+    // Batched is_hook_enabled: one entry per query (hook_type, layer_no), same
+    // semantics (enabled AND registered, or all-on if toggle inactive). Lets the
+    // per-reconfigure effective-set recompute be ONE pybind crossing instead of
+    // N is_hook_enabled() round-trips; C++ remains the single source of truth.
+    std::vector<int> effective_enabled_mask(
+        const std::vector<std::pair<int,int>>& query) const;
     uint64_t toggle_node_count() const;
     uint64_t bound_graph_count() const;          // #bound execs (0 => apply is a no-op)
     uint64_t last_apply_count() const;           // #SetEnabled calls in last apply_toggle
