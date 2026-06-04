@@ -122,6 +122,12 @@ public:
     // N is_hook_enabled() round-trips; C++ remains the single source of truth.
     std::vector<int> effective_enabled_mask(
         const std::vector<std::pair<int,int>>& query) const;
+    // Phase 4 lazy per-graph apply. ensure_graph_current(): apply the current
+    // enabled set to ONE graph if it is stale (call just before that graph
+    // replays). record_replay_event(): record a stream event after that graph's
+    // replay so a later ensure can wait for it before mutating the exec.
+    int  ensure_graph_current(uint64_t graph);
+    void record_replay_event(uint64_t graph);
     uint64_t toggle_node_count() const;
     uint64_t bound_graph_count() const;          // #bound execs (0 => apply is a no-op)
     uint64_t last_apply_count() const;           // #SetEnabled calls in last apply_toggle

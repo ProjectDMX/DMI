@@ -747,6 +747,44 @@ class RingTransport:
             s for s, m in zip(self._active_specs, _mask) if m]
         self._enabled_version += 1
 
+    def set_active_hooks_lazy(self, enabled: "Iterable[Tuple[int, int]]") -> None:
+        """Phase 4 lazy reconfigure: update the enabled set + host meta gate, but
+        DEFER the device apply to per-graph ensure_graph_current() (called just
+        before each graph replays). set_enabled_hooks bumps the engine's
+        target_version, marking every captured graph stale; the device flip then
+        happens lazily, only on graphs actually replayed -> reconfigure cost
+        scales with graphs-used, not all graphs. Same guards + gate semantics as
+        set_active_hooks (which apply eagerly), minus apply_toggle.
+        """
+        eng = self._ring_engine
+        if eng.bound_graph_count() == 0 or eng.toggle_node_count() == 0:
+            raise RuntimeError(
+                "set_active_hooks_lazy: no producer nodes registered / no graph exec "
+                "bound (toggle_node_count=%d, bound_graph_count=%d)."
+                % (eng.toggle_node_count(), eng.bound_graph_count()))
+        if not eng.toggle_registry_uniform():
+            raise RuntimeError(
+                "set_active_hooks_lazy: captured graphs have non-uniform hook sets.")
+        pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
+        eng.set_enabled_hooks(pairs)        # bumps target_version; device apply deferred
+        self._toggle_gate_active = True
+        _mask = eng.effective_enabled_mask(
+            [(s.hook_type, s.layer_no) for s in self._active_specs])
+        self._effective_enabled_specs = [
+            s for s, m in zip(self._active_specs, _mask) if m]
+        self._enabled_version += 1
+
+    def ensure_graph_current(self, raw_graph: int) -> int:
+        """Lazy: apply the deferred toggle to the graph about to replay (no-op if
+        already current). Call right before the graph's replay; raw_graph is the
+        cudaGraph_t handle the graph was bound with."""
+        return self._ring_engine.ensure_graph_current(raw_graph)
+
+    def record_replay_event(self, raw_graph: int) -> None:
+        """Lazy event guard: record a stream event after a graph's replay so a
+        later ensure_graph_current() waits for it before mutating that exec."""
+        self._ring_engine.record_replay_event(raw_graph)
+
     def clear_toggle(self) -> None:
         """Paired teardown: clear the engine's toggle registry AND deactivate the
         host gate, so neither lane is left half-configured (#2). Call before a

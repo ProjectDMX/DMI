@@ -43,11 +43,25 @@ struct RingEnginePy::Impl {
     bool                                                   toggle_active{false};
     bool                                                   toggle_capture{false};
     uint64_t                                               last_apply_count{0};
+    // --- Phase 4: lazy per-graph apply ---
+    // target_version bumps on every enabled-set change; each graph tracks the
+    // version it was last applied to. ensure_graph_current() applies the current
+    // enabled set to ONE graph only when it's stale (just before that graph
+    // replays), so a reconfigure costs O(changed x graphs-actually-used) instead
+    // of O(changed x all-graphs). replay_event[g] is recorded after each replay
+    // so ensure can wait for the prior replay to finish before mutating the exec
+    // (cudaGraphNodeSetEnabled on an executing exec is UB).
+    uint64_t                                               target_version{0};
+    std::unordered_map<cudaGraph_t, uint64_t>              applied_version;
+    std::unordered_map<cudaGraph_t, cudaEvent_t>           replay_event;
     mutable std::mutex                                     toggle_mu;
 
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
     {}
+    ~Impl() {
+        for (auto& kv : replay_event) if (kv.second) cudaEventDestroy(kv.second);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -170,6 +184,7 @@ void RingEnginePy::set_enabled_hooks(const std::vector<std::pair<int,int>>& enab
     impl_->enabled_hooks.clear();
     for (const auto& p : enabled) impl_->enabled_hooks.insert(p);
     impl_->toggle_active = true;
+    ++impl_->target_version;   // mark all graphs stale for lazy ensure (no-op for eager)
 }
 
 int RingEnginePy::apply_toggle() {
@@ -235,6 +250,51 @@ bool RingEnginePy::is_hook_enabled(int hook_type, int layer_no) const {
     return impl_->enabled_hooks.count(k) > 0 && impl_->registered_hooks.count(k) > 0;
 }
 
+int RingEnginePy::ensure_graph_current(uint64_t graph) {
+    // Phase 4 lazy: apply the current enabled set to ONE graph, only if it is
+    // stale (applied_version != target_version). Called just before that graph
+    // replays. Same per-node diff as apply_toggle, but scoped to one graph.
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    cudaGraph_t g = reinterpret_cast<cudaGraph_t>(graph);
+    auto av = impl_->applied_version.find(g);
+    const uint64_t cur = (av == impl_->applied_version.end()) ? 0 : av->second;
+    if (cur == impl_->target_version) return 0;   // current -> fast no-op (common path)
+
+    auto ex = impl_->reg_exec.find(g);
+    if (ex == impl_->reg_exec.end()) return 0;     // unregistered/unbound graph -> skip
+    auto it = impl_->reg_nodes.find(g);
+    if (it == impl_->reg_nodes.end()) return 0;
+
+    // Event guard: the prior replay of THIS exec must be complete before we
+    // mutate it (host can run ahead of the GPU). Wait on its last-replay event.
+    auto ev = impl_->replay_event.find(g);
+    if (ev != impl_->replay_event.end() && ev->second) cudaEventSynchronize(ev->second);
+
+    cudaError_t first = cudaSuccess;
+    for (auto& e : it->second) {
+        const bool on = impl_->enabled_hooks.count({e.hook_type, e.layer_no}) > 0;
+        if (on == e.last_enabled) continue;
+        cudaError_t err = cudaGraphNodeSetEnabled(ex->second, e.node, on ? 1u : 0u);
+        if (err != cudaSuccess) { if (first == cudaSuccess) first = err; continue; }
+        e.last_enabled = on;
+    }
+    impl_->applied_version[g] = impl_->target_version;
+    return static_cast<int>(first);
+}
+
+void RingEnginePy::record_replay_event(uint64_t graph) {
+    // Record a (timing-disabled) event on the current stream right after a
+    // graph's replay, so a later ensure_graph_current() can wait for it before
+    // mutating that exec.
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    cudaGraph_t g = reinterpret_cast<cudaGraph_t>(graph);
+    cudaEvent_t& ev = impl_->replay_event[g];
+    if (ev == nullptr) {
+        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) return;
+    }
+    cudaEventRecord(ev, at::cuda::getCurrentCUDAStream().stream());
+}
+
 std::vector<int> RingEnginePy::effective_enabled_mask(
     const std::vector<std::pair<int,int>>& query) const {
     // Batched is_hook_enabled (same semantics, one lock, one pybind crossing):
@@ -271,6 +331,11 @@ void RingEnginePy::clear_toggle_registry() {
         impl_->toggle_active = false;
         impl_->toggle_capture = false;
         impl_->last_apply_count = 0;
+        // Phase 4 lazy state: reset versions + destroy per-graph replay events.
+        impl_->target_version = 0;
+        impl_->applied_version.clear();
+        for (auto& kv : impl_->replay_event) if (kv.second) cudaEventDestroy(kv.second);
+        impl_->replay_event.clear();
     }
     ring_set_toggle_capture(false);
 }

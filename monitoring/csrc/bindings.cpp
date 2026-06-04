@@ -528,6 +528,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("effective_enabled_mask",
            &ring_py::RingEnginePy::effective_enabled_mask,
            py::arg("query"))
+      .def("ensure_graph_current",
+           &ring_py::RingEnginePy::ensure_graph_current,
+           py::arg("graph"))
+      .def("record_replay_event",
+           &ring_py::RingEnginePy::record_replay_event,
+           py::arg("graph"))
       .def("toggle_node_count", &ring_py::RingEnginePy::toggle_node_count)
       .def("bound_graph_count", &ring_py::RingEnginePy::bound_graph_count)
       .def("last_apply_count", &ring_py::RingEnginePy::last_apply_count)
