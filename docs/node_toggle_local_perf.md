@@ -16,37 +16,43 @@
 
 ## Table 1 — Overhead overview
 
-Baseline TPOT = 2.0043 ms (no DMI). All overheads vs baseline.
+Baseline TPOT = 2.0038 ms (no DMI). 50 iters, median. All overheads vs baseline.
+Numbers are the current post-fix state (reserve-invariant fix + drain-flush
+timeout + pybind-batched reconfigure all in). One representative run; run-to-run
+jitter ~±0.02 ms, but the ordering below is stable across runs.
 
 | Config | TPOT (ms) | Overhead | us/step | Meaning |
 |--------|----------:|---------:|--------:|---------|
-| baseline | 2.0043 | — | — | plain vLLM, no DMI |
-| **toggle OFF** (0/28 enabled) | 2.0188 | **+0.72%** | +14.5 | all producer nodes disabled; only host floor remains |
-| **toggle partial** (4/28) | 2.0286 | **+1.21%** | +24.3 | realistic online case |
-| **toggle ON** (28/28) | 2.0632 | **+2.94%** | +58.9 | all nodes enabled (toggle machinery active) |
-| **ring_null** (no toggle, full transport, no DB) | 2.0696 | **+3.26%** | +65.3 | producers fire + D2D copy + drain + p2p, null sink |
-| **ring_full** (ring_db, + ClickHouse) | 2.0676 | **+3.16%** | +63.3 | full transport + async DB write |
+| baseline | 2.0038 | — | — | plain vLLM, no DMI |
+| **toggle OFF** (0/28 enabled) | 2.0147 | **+0.54%** | +10.9 | all producer nodes disabled; only host floor + disabled-node graph traversal |
+| **toggle partial** (4/28) | 2.0271 | **+1.16%** | +23.3 | realistic online case |
+| **toggle ON** (28/28) | 2.0605 | **+2.83%** | +56.7 | all nodes enabled (toggle machinery active) |
+| **ring_null** (no toggle, full transport, no DB) | 2.0616 | **+2.88%** | +57.8 | producers fire + D2D copy + drain + p2p, null sink |
+| **ring_full** (ring_db, + ClickHouse) | 2.0659 | **+3.10%** | +62.1 | full transport + async DB write |
 
 Key conclusions:
 
-1. **toggle OFF ≈ baseline (+0.72%).** Monitoring armed-but-idle is nearly free.
-2. **toggle cost is ~linear in #enabled hooks:** 0/4/28 → +0.72/+1.21/+2.94%
-   (~1.6–2.5 us/hook). Cost tracks how much you capture, not a fixed tax.
-3. **toggle ON ≈ ring_null (+2.94% vs +3.26%, within noise).** Node-toggle is
+1. **toggle OFF ≈ baseline (+0.54%).** Monitoring armed-but-idle is nearly free
+   (residual is the disabled producer nodes still in the captured graph — see
+   "Toggle-OFF overhead": ~0.34 us/node graph-replay traversal, not host).
+2. **toggle cost is ~linear in #enabled hooks:** 0/4/28 → +0.54/+1.16/+2.83%
+   (~1.6 us/hook). Cost tracks how much you capture, not a fixed tax.
+3. **toggle ON ≈ ring_null (+2.83% vs +2.88%, within noise).** Node-toggle is
    "free to have" — full-on costs the same as plain full transport, but you gain
    the ability to dial down.
-4. **ring_full ≈ ring_null (+3.16% vs +3.26%).** Writing to ClickHouse adds ~0
+4. **ring_full ≈ ring_null (+3.10% vs +2.88%).** Writing to ClickHouse adds ~0
    TPOT — export is fully async (drain→p2p→submit→DB off the critical path).
    Confirms DMI's async-export design.
-5. **Node-toggle's value:** turns a fixed "+3.26% always-on transport tax" into
-   "+0.72% (idle) … +2.94% (full)", paid in proportion to active hooks. The
-   online steady state (mostly off) pays 0.72% instead of being stuck at ~3.3%.
+5. **Node-toggle's value:** turns a fixed "+2.88% always-on transport tax" into
+   "+0.54% (idle) … +2.83% (full)", paid in proportion to active hooks. The
+   online steady state (mostly off) pays 0.54% instead of being stuck at ~2.9%
+   — recovering ~81% of the transport overhead when idle.
 
-Note: profiled host-floor CPU time (Table 2) overstates TPOT impact — the
-end-to-end OFF overhead is 14.5 us/step while raw host CPU is 28.85 us/step,
-because ~half the host work overlaps with the GPU replay of the prior step.
-The host-floor optimizations therefore matter most for CPU-bound throughput
-(online serving under concurrency), less for single-stream TPOT.
+Note: the host part of the OFF overhead overlaps the GPU replay — end-to-end OFF
+is ~+10.9 us/step while the raw per-step host CPU is ~28.85 us/step (Table 2), so
+roughly a third surfaces in single-stream TPOT. Host-side optimizations therefore
+matter most for CPU-bound throughput (online serving under concurrency), less for
+single-stream latency.
 
 ## Table 2 — Where the "toggle OFF" overhead goes (per-step host path)
 
