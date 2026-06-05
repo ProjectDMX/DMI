@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DMI Node-Toggle — Mechanism &amp; API</title>
+<style>
+  :root{
+    --ink:#1a1f29; --muted:#5b6573; --line:#e2e6ee; --bg:#ffffff; --soft:#f6f8fc;
+    --accent:#2f6df0; --green:#1a9d6b; --red:#d2453b; --amber:#c87f15; --mono:#0f1320;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:34px 30px 60px}
+  h1{font-size:26px;margin:0 0 4px;letter-spacing:-.2px}
+  .sub{color:var(--muted);margin:0 0 22px;font-size:14.5px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);
+     margin:30px 0 12px;font-weight:700}
+  code,.m{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;color:var(--mono)}
+  .card{border:1px solid var(--line);border-radius:12px;background:#fff;padding:16px 18px}
+  .soft{background:var(--soft)}
+  /* flow */
+  .flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .step{border:1px solid var(--line);border-radius:11px;padding:13px 14px;position:relative;background:#fff}
+  .step .n{position:absolute;top:-10px;left:13px;background:var(--accent);color:#fff;font-size:11px;
+           font-weight:700;border-radius:20px;padding:2px 9px}
+  .step h3{margin:6px 0 5px;font-size:14px}
+  .step p{margin:0;color:var(--muted);font-size:12.6px}
+  .step .api{margin-top:8px;font-size:11.5px;color:var(--accent)}
+  /* lockstep */
+  .lock{display:grid;grid-template-columns:200px 1fr;gap:14px;align-items:center}
+  .srcbox{border:2px solid var(--accent);border-radius:11px;padding:14px;text-align:center;background:#f3f7ff}
+  .srcbox b{font-size:14px}
+  .lanes{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  .lane{border:1px solid var(--line);border-radius:10px;padding:11px 12px;background:#fff}
+  .lane .t{font-weight:700;font-size:12.5px;margin-bottom:3px}
+  .lane .d{color:var(--muted);font-size:12px}
+  .invariant{margin-top:12px;text-align:center;font-size:13px;color:var(--ink);background:#f1faf5;
+             border:1px solid #cfe9dc;border-radius:9px;padding:9px}
+  /* two-up */
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .two h3{margin:0 0 6px;font-size:14px}
+  .pill{display:inline-block;font-size:11px;font-weight:700;border-radius:20px;padding:2px 9px;margin-left:6px}
+  .pe{background:#eef3ff;color:var(--accent)} .pl{background:#fff4e2;color:var(--amber)}
+  .two ul{margin:6px 0 0;padding-left:18px;color:var(--muted);font-size:12.6px}
+  .two li{margin:3px 0}
+  /* api table */
+  table{width:100%;border-collapse:collapse;font-size:12.8px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  td.api code{color:var(--accent);font-weight:600}
+  .grp{font-weight:700;color:var(--ink);background:var(--soft)}
+  /* results */
+  .res{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .stat{border:1px solid var(--line);border-radius:11px;padding:12px 14px;text-align:center}
+  .stat .v{font-size:20px;font-weight:700;letter-spacing:-.3px}
+  .stat .k{font-size:11.5px;color:var(--muted);margin-top:2px}
+  .on{color:var(--green)} .off{color:var(--accent)}
+  .foot{margin-top:26px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:12px}
+  .req{font-size:12px;color:var(--amber);margin-top:8px}
+  @media(max-width:820px){.flow,.res{grid-template-columns:repeat(2,1fr)}.lock{grid-template-columns:1fr}.lanes,.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>DMI Node-Toggle</h1>
+  <p class="sub">Enable/disable per-hook producer nodes <b>inside an already-captured CUDA graph</b>, between
+  replays, via <code>cudaGraphNodeSetEnabled</code> — no re-capture. Pay monitoring overhead in proportion to the
+  hooks you actually capture.</p>
+
+  <h2>Mechanism — 4 steps</h2>
+  <div class="flow">
+    <div class="step"><span class="n">1</span><h3>Capture &amp; record</h3>
+      <p>vLLM captures the FULL decode graph. DMI's producer op records its node via
+      <span class="m">cudaStreamGetCaptureInfo</span>. <span class="m">keep_graph=True</span> so handles survive instantiate.</p>
+      <div class="api">enable_toggle_capture(True)</div></div>
+    <div class="step"><span class="n">2</span><h3>Bind</h3>
+      <p>After warmup, register each captured graph's exec handle, keyed by its <span class="m">cudaGraph_t</span>.</p>
+      <div class="api">bind_graph_exec(graph, exec)</div></div>
+    <div class="step"><span class="n">3</span><h3>Toggle</h3>
+      <p>Flip the enabled set at runtime → <span class="m">cudaGraphNodeSetEnabled</span> on the registered nodes.
+      No re-capture, no re-instantiate.</p>
+      <div class="api">set_active_hooks(enabled)</div></div>
+    <div class="step"><span class="n">4</span><h3>Replay</h3>
+      <p>Enabled nodes fire (D2D&rarr;ring&rarr;export); disabled nodes are skipped by the replay engine
+      (~0.34&nbsp;µs/node residual).</p>
+      <div class="api">graph.replay()</div></div>
+  </div>
+
+  <h2>The lockstep invariant — one source drives three lanes</h2>
+  <div class="card">
+    <div class="lock">
+      <div class="srcbox">
+        <b>effective_specs</b><br>
+        <span class="m" style="font-size:11px">active ∩ enabled ∩ registered</span>
+        <div style="font-size:11.5px;color:var(--muted);margin-top:6px">recomputed once per<br><code>set_active_hooks</code></div>
+      </div>
+      <div>
+        <div class="lanes">
+          <div class="lane"><div class="t">① capacity-reserve</div><div class="d">worker <code>prepare_step</code> reserves ring bytes/slots</div></div>
+          <div class="lane"><div class="t">② meta-push</div><div class="d"><code>pre_push_all_metas</code> → TensorMetaFifo</div></div>
+          <div class="lane"><div class="t">③ device enable</div><div class="d"><code>cudaGraphNodeSetEnabled</code> on the nodes</div></div>
+        </div>
+        <div class="invariant"><b>reserve&nbsp;==&nbsp;meta&nbsp;==&nbsp;device&nbsp;==&nbsp;what&nbsp;fires.</b>
+          If any lane diverges → ring accounting drift / p2p desync. One set, no drift.</div>
+      </div>
+    </div>
+  </div>
+
+  <h2>Apply strategies — eager vs lazy</h2>
+  <div class="two">
+    <div class="card"><h3>Eager<span class="pill pe">default</span></h3>
+      <p style="margin:0;color:var(--muted);font-size:12.8px"><code>set_active_hooks</code> applies the new set to
+      <b>all</b> bound graphs immediately.</p>
+      <ul><li>simple; reconfigure cost ∝ <span class="m">changed × all-graphs</span></li>
+        <li>pybind-batched effective-set query (one C++ call, not N)</li></ul></div>
+    <div class="card"><h3>Lazy<span class="pill pl">opt-in</span></h3>
+      <p style="margin:0;color:var(--muted);font-size:12.8px"><code>set_active_hooks_lazy</code> bumps a version; each
+      graph is applied on its <b>first replay</b> (hook in <span class="m">CUDAGraph.replay()</span>, uses vLLM's own dispatch).</p>
+      <ul><li>cost ∝ <span class="m">changed × graphs-used</span> (often 1–2 of N)</li>
+        <li>per-exec event guard before mutating an executing exec</li></ul></div>
+  </div>
+
+  <h2>Core API</h2>
+  <div class="card" style="padding:4px 6px">
+  <table>
+    <tr><th style="width:38%">Call</th><th>What it does</th></tr>
+    <tr class="grp"><td colspan="2">Engine &nbsp;<span class="m" style="font-weight:400;color:var(--muted)">RingEngine / RingEnginePy</span></td></tr>
+    <tr><td class="api"><code>enable_toggle_capture(bool)</code></td><td>arm capture-time node recording (around the FULL-graph capture)</td></tr>
+    <tr><td class="api"><code>bind_graph_exec(graph, exec)</code></td><td>register a captured graph's exec handle for toggling</td></tr>
+    <tr><td class="api"><code>set_enabled_hooks(pairs)</code></td><td>set the enabled (hook_type, layer) set; bumps target_version</td></tr>
+    <tr><td class="api"><code>apply_toggle() → int</code></td><td>eager: diff-apply enabled set to all bound graphs (cuda err code)</td></tr>
+    <tr><td class="api"><code>ensure_graph_current(graph) → int</code></td><td>lazy: apply deferred toggle to one graph if stale (before its replay)</td></tr>
+    <tr><td class="api"><code>record_replay_event(graph)</code></td><td>lazy: stream event after replay → ensure waits on it (UB guard)</td></tr>
+    <tr><td class="api"><code>effective_enabled_mask(query) → [int]</code></td><td>batched is_hook_enabled (enabled ∧ registered) — one crossing</td></tr>
+    <tr><td class="api"><code>is_hook_enabled(ht, layer) → bool</code></td><td>single-hook gate query (enabled ∧ registered, or all-on if inactive)</td></tr>
+    <tr><td class="api"><code>toggle_node_count / bound_graph_count</code></td><td>registry sizes (guards: must be &gt; 0 before activating the gate)</td></tr>
+    <tr><td class="api"><code>toggle_registry_uniform() → bool</code></td><td>all graphs share the same hook set (else the global gate desyncs)</td></tr>
+    <tr><td class="api"><code>clear_toggle_registry()</code></td><td>full teardown: registry + versions + events + deactivate gate</td></tr>
+    <tr class="grp"><td colspan="2">Transport &nbsp;<span class="m" style="font-weight:400;color:var(--muted)">RingTransport</span></td></tr>
+    <tr><td class="api"><code>set_active_hooks(enabled)</code></td><td>eager driver: guards → set_enabled → apply_toggle → effective_specs</td></tr>
+    <tr><td class="api"><code>set_active_hooks_lazy(enabled)</code></td><td>lazy driver: set_enabled + gate, defer device apply to replay</td></tr>
+    <tr><td class="api"><code>effective_specs</code></td><td>the single set (property) read by capacity + meta lanes</td></tr>
+    <tr><td class="api"><code>ensure_graph_current / record_replay_event</code></td><td>lazy wrappers, called by the CUDAGraph.replay() hook</td></tr>
+    <tr class="grp"><td colspan="2">Worker config &nbsp;<span class="m" style="font-weight:400;color:var(--muted)">--additional-config / env</span></td></tr>
+    <tr><td class="api"><code>dmx_node_toggle: true</code></td><td>enable the feature (default off → unchanged behaviour)</td></tr>
+    <tr><td class="api"><code>dmx_enabled_hooks: "ht:layer,…"</code></td><td>initial enabled set; <code>ht 0</code> = hidden-states/resid_pre</td></tr>
+    <tr><td class="api"><code>dmx_lazy_toggle: true</code></td><td>opt into lazy per-graph apply (for high-freq reconfigure)</td></tr>
+    <tr><td class="api"><code>dmx_drain_flush_timeout_us</code></td><td>bound export latency for sparse-hook (low-volume) configs</td></tr>
+  </table>
+  </div>
+  <p class="req">Requires <code>cudagraph_mode=FULL</code> (decode) so producer nodes are captured &amp; bindable;
+  the worker raises if a subset is requested but no graph bound.</p>
+
+  <h2>Measured (Qwen3-0.6B, RTX 4090 — relative is the point)</h2>
+  <div class="res">
+    <div class="stat"><div class="v off">+0.54%</div><div class="k">toggle OFF (idle)</div></div>
+    <div class="stat"><div class="v">+1.16%</div><div class="k">partial 4/28</div></div>
+    <div class="stat"><div class="v on">+2.83%</div><div class="k">full ≈ ring_null</div></div>
+    <div class="stat"><div class="v">~81%</div><div class="k">transport overhead recovered when idle</div></div>
+  </div>
+  <div class="res" style="margin-top:10px">
+    <div class="stat"><div class="v">1.6 µs</div><div class="k">per enabled hook (transport)</div></div>
+    <div class="stat"><div class="v">0.34 µs</div><div class="k">per disabled node (graph traversal)</div></div>
+    <div class="stat"><div class="v">−20–27%</div><div class="k">reconfigure (pybind batched)</div></div>
+    <div class="stat"><div class="v">6.1×</div><div class="k">pure reconfigure (lazy, 80→13 µs)</div></div>
+  </div>
+
+  <p class="foot">Branch <code>feature/dmi_kernel_node_toggle</code>. Correctness: single <code>effective_specs</code> source
+  (reserve == produced) + guardrail tests (<code>test_meta_gate_e2e</code>, <code>test_reconfig_{sequence,multigraph,lazy}_e2e</code>).
+  Caveat: host-side cost overlaps the GPU replay → single-stream TPOT impact is small; the wins are host-CPU / throughput
+  and high-frequency reconfigure. See <code>docs/node_toggle_local_perf.md</code>.</p>
+
+</div>
+</body>
+</html>
