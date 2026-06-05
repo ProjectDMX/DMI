@@ -100,7 +100,7 @@
       <div class="ro">
         <div class="k">Config you'd pass</div>
         <div class="cfg" id="cfg"></div>
-        <div class="note">Each fires ≈1.6&nbsp;µs (transport); each disabled-but-captured ≈0.34&nbsp;µs (replay traversal).
+        <div class="note">Each fires ≈3.5&nbsp;µs (transport, H100/8B); each disabled-but-captured ≈0.18&nbsp;µs (replay traversal).
         A real model has 2× #layers such nodes → see Results.</div>
       </div>
     </div>
@@ -116,26 +116,27 @@ transport.<span class="f">set_active_hooks</span>(<span class="s">enabled</span>
   <p class="note">Lazy variant for high-frequency reconfigure: <code>set_active_hooks_lazy()</code> + per-graph
   <code>ensure_graph_current()</code> on replay.</p>
 
-  <h2>Results — measured (Qwen3-0.6B, RTX 4090)</h2>
+  <h2>Results — measured (Qwen3-8B, H100, batch=1, FULL cudagraph, 100 steps × 30 reps, median)</h2>
   <div class="card" style="padding:6px 10px">
   <table>
-    <tr><th>Config</th><th class="r">TPOT (ms)</th><th class="r">Overhead</th><th class="r">µs/step</th><th>Meaning</th></tr>
-    <tr><td>baseline</td><td class="r">2.0038</td><td class="r">—</td><td class="r">—</td><td>plain vLLM, no DMI</td></tr>
-    <tr><td><b>toggle OFF</b> (0/28)</td><td class="r">2.0147</td><td class="r acc">+0.54%</td><td class="r">+10.9</td><td>all nodes disabled; host floor + disabled-node traversal</td></tr>
-    <tr><td><b>toggle partial</b> (4/28)</td><td class="r">2.0271</td><td class="r">+1.16%</td><td class="r">+23.3</td><td>realistic online monitor</td></tr>
-    <tr><td><b>toggle ON</b> (28/28)</td><td class="r">2.0605</td><td class="r grnt">+2.83%</td><td class="r">+56.7</td><td>all hidden-states (toggle machinery active)</td></tr>
-    <tr><td>ring_null (no toggle, full)</td><td class="r">2.0616</td><td class="r">+2.88%</td><td class="r">+57.8</td><td>producers fire + D2D + drain + p2p, null sink</td></tr>
-    <tr><td>ring_full (+ ClickHouse)</td><td class="r">2.0659</td><td class="r">+3.10%</td><td class="r">+62.1</td><td>full transport + async DB write</td></tr>
+    <tr><th>Config</th><th class="r">per-step (ms)</th><th class="r">Δ µs/step</th><th class="r">Overhead</th><th>Meaning</th></tr>
+    <tr><td>baseline (no DMI)</td><td class="r">6.5220</td><td class="r">—</td><td class="r">—</td><td>plain vLLM</td></tr>
+    <tr><td><b>toggle off</b> (0/36)</td><td class="r">6.5282</td><td class="r">+6.3</td><td class="r acc">+0.10%</td><td>armed but idle — nodes disabled (not launched)</td></tr>
+    <tr><td>DMI null mode</td><td class="r">6.5455</td><td class="r">+23.5</td><td class="r">+0.36%</td><td>nodes still launch + early-return (no toggle)</td></tr>
+    <tr><td><b>toggle partial</b> (4/36)</td><td class="r">6.5490</td><td class="r">+27.0</td><td class="r">+0.41%</td><td>realistic online monitor</td></tr>
+    <tr><td>DMI on (full transport)</td><td class="r">6.6411</td><td class="r">+119.2</td><td class="r">+1.83%</td><td>always-on DMI, all layers, null sink</td></tr>
+    <tr><td><b>toggle full</b> (36/36)</td><td class="r">6.6543</td><td class="r">+132.4</td><td class="r grnt">+2.03%</td><td>all enabled (≈ DMI on + toggle machinery)</td></tr>
   </table>
   </div>
   <div class="res">
-    <div class="stat"><div class="v">~81%</div><div class="k">overhead recovered when idle</div></div>
-    <div class="stat"><div class="v">1.6 µs</div><div class="k">per enabled hook</div></div>
-    <div class="stat"><div class="v">0.34 µs</div><div class="k">per disabled node</div></div>
+    <div class="stat"><div class="v">~95%</div><div class="k">overhead recovered when idle</div></div>
+    <div class="stat"><div class="v">~3.5 µs</div><div class="k">per enabled hook</div></div>
+    <div class="stat"><div class="v">~0.18 µs</div><div class="k">per disabled node</div></div>
     <div class="stat"><div class="v">6.1×</div><div class="k">faster reconfigure (lazy)</div></div>
   </div>
-  <p class="note">Node-toggle turns a fixed +2.9% always-on tax into +0.54% (idle) … +2.83% (full), proportional to
-  what you enable. (Host cost overlaps GPU → single-stream TPOT impact small; wins are host-CPU / throughput.)</p>
+  <p class="note">Node-toggle turns a fixed <b>+2.03%</b> always-on tax into <b>+0.10% (idle) … +2.03% (full)</b>,
+  proportional to what you enable. And <b>toggle-off (+0.10%) beats DMI null-mode (+0.36%)</b> — disabled nodes
+  don't even launch. (6.1× reconfigure is a separate host-side measurement.)</p>
 
   <p class="foot">Branch <code>feature/dmi_kernel_node_toggle</code>. See <code>docs/node_toggle_local_perf.md</code>
   and <code>docs/node_toggle_mechanism_api.html</code>.</p>

@@ -14,6 +14,31 @@
 > TPOT inflates the relative weight of the fixed host floor. Qwen3-0.6B gives
 > tight variance (<1%) and a realistic decode shape. Numbers below are Qwen3-0.6B.
 
+## H100 results (Qwen3-8B) — authoritative
+
+Per-step decode overhead, **Qwen3-8B, H100, batch=1, FULL cudagraph, 100 steps ×
+30 reps, median**. Baseline per-step = 6.5220 ms. These are the paper-grade
+numbers; the Qwen3-0.6B / RTX 4090 tables below are the local dev + decomposition.
+
+| Config | per-step (ms) | Δ µs/step | overhead |
+|--------|--------------:|----------:|---------:|
+| baseline (no DMI)        | 6.5220 | —      | —      |
+| **toggle off** (0/36)    | 6.5282 | +6.3   | +0.10% |
+| DMI null mode            | 6.5455 | +23.5  | +0.36% |
+| **toggle partial** (4/36)| 6.5490 | +27.0  | +0.41% |
+| DMI on (full transport)  | 6.6411 | +119.2 | +1.83% |
+| **toggle full** (36/36)  | 6.6543 | +132.4 | +2.03% |
+
+Key points:
+1. **toggle off ≈ baseline (+0.10%).** Armed-but-idle is essentially free on H100.
+2. **toggle off (+0.10%) < DMI null mode (+0.36%).** Disabling nodes beats the old
+   `null_mode` (kernels still launch + early-return) — node-toggle removes the
+   launch, not just the work. ~3.7× cheaper idle.
+3. **Scales with #enabled:** 0/4/36 → +0.10/+0.41/+2.03% (~3.5 us/enabled hook).
+4. **toggle full (+2.03%) ≈ DMI on (+1.83%).** Toggle is ~free to have at full-on
+   (~13 us machinery over plain always-on), and recovers **~95%** of that
+   transport overhead when idle.
+
 ## Table 1 — Overhead overview
 
 Baseline TPOT = 2.0038 ms (no DMI). 50 iters, median. All overheads vs baseline.

@@ -155,18 +155,18 @@
   <p class="req">Requires <code>cudagraph_mode=FULL</code> (decode) so producer nodes are captured &amp; bindable;
   the worker raises if a subset is requested but no graph bound.</p>
 
-  <h2>Measured (Qwen3-0.6B, RTX 4090 — relative is the point)</h2>
+  <h2>Measured (Qwen3-8B, H100, batch=1, FULL cudagraph, 100×30 reps — relative is the point)</h2>
   <div class="res">
-    <div class="stat"><div class="v off">+0.54%</div><div class="k">toggle OFF (idle)</div></div>
-    <div class="stat"><div class="v">+1.16%</div><div class="k">partial 4/28</div></div>
-    <div class="stat"><div class="v on">+2.83%</div><div class="k">full ≈ ring_null</div></div>
-    <div class="stat"><div class="v">~81%</div><div class="k">transport overhead recovered when idle</div></div>
+    <div class="stat"><div class="v off">+0.10%</div><div class="k">toggle OFF (idle)</div></div>
+    <div class="stat"><div class="v">+0.41%</div><div class="k">partial 4/36</div></div>
+    <div class="stat"><div class="v on">+2.03%</div><div class="k">full ≈ DMI-on (+1.83%)</div></div>
+    <div class="stat"><div class="v">~95%</div><div class="k">transport overhead recovered when idle</div></div>
   </div>
   <div class="res" style="margin-top:10px">
-    <div class="stat"><div class="v">1.6 µs</div><div class="k">per enabled hook (transport)</div></div>
-    <div class="stat"><div class="v">0.34 µs</div><div class="k">per disabled node (graph traversal)</div></div>
-    <div class="stat"><div class="v">−20–27%</div><div class="k">reconfigure (pybind batched)</div></div>
-    <div class="stat"><div class="v">6.1×</div><div class="k">pure reconfigure (lazy, 80→13 µs)</div></div>
+    <div class="stat"><div class="v">~3.5 µs</div><div class="k">per enabled hook (transport)</div></div>
+    <div class="stat"><div class="v">~0.18 µs</div><div class="k">per disabled node (graph traversal)</div></div>
+    <div class="stat"><div class="v">+0.10%</div><div class="k">toggle-off &lt; null-mode +0.36%</div></div>
+    <div class="stat"><div class="v">6.1×</div><div class="k">lazy reconfigure (4090 host)</div></div>
   </div>
 
   <p class="foot">Branch <code>feature/dmi_kernel_node_toggle</code>. Correctness: single <code>effective_specs</code> source
