@@ -8,3 +8,7 @@
 	path = integration/vllm
 	url = https://github.com/ProjectDMX/vllm-DMI.git
 	branch = dmi_integration
+[submodule "integration/megatron-lm"]
+	path = integration/megatron-lm
+	url = git@github.com:ProjectDMX/Megatron-LM-DMI.git
+	branch = dmi_integration
