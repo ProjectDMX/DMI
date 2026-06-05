@@ -119,12 +119,13 @@ transport.<span class="f">set_active_hooks</span>(<span class="s">enabled</span>
   <h2>Results — measured (Qwen3-0.6B, RTX 4090)</h2>
   <div class="card" style="padding:6px 10px">
   <table>
-    <tr><th>Config</th><th class="r">Overhead</th><th>Meaning</th></tr>
-    <tr><td>baseline</td><td class="r">—</td><td>plain vLLM</td></tr>
-    <tr><td><b>toggle OFF</b></td><td class="r acc">+0.54%</td><td>armed but idle (≈ baseline)</td></tr>
-    <tr><td><b>partial</b> (4/28)</td><td class="r">+1.16%</td><td>realistic online monitor</td></tr>
-    <tr><td><b>toggle ON</b></td><td class="r grnt">+2.83%</td><td>all hidden-states ≈ always-on DMI</td></tr>
-    <tr><td>ring_full (+ClickHouse)</td><td class="r">+3.10%</td><td>DB write is async → ~0 extra</td></tr>
+    <tr><th>Config</th><th class="r">TPOT (ms)</th><th class="r">Overhead</th><th class="r">µs/step</th><th>Meaning</th></tr>
+    <tr><td>baseline</td><td class="r">2.0038</td><td class="r">—</td><td class="r">—</td><td>plain vLLM, no DMI</td></tr>
+    <tr><td><b>toggle OFF</b> (0/28)</td><td class="r">2.0147</td><td class="r acc">+0.54%</td><td class="r">+10.9</td><td>all nodes disabled; host floor + disabled-node traversal</td></tr>
+    <tr><td><b>toggle partial</b> (4/28)</td><td class="r">2.0271</td><td class="r">+1.16%</td><td class="r">+23.3</td><td>realistic online monitor</td></tr>
+    <tr><td><b>toggle ON</b> (28/28)</td><td class="r">2.0605</td><td class="r grnt">+2.83%</td><td class="r">+56.7</td><td>all hidden-states (toggle machinery active)</td></tr>
+    <tr><td>ring_null (no toggle, full)</td><td class="r">2.0616</td><td class="r">+2.88%</td><td class="r">+57.8</td><td>producers fire + D2D + drain + p2p, null sink</td></tr>
+    <tr><td>ring_full (+ ClickHouse)</td><td class="r">2.0659</td><td class="r">+3.10%</td><td class="r">+62.1</td><td>full transport + async DB write</td></tr>
   </table>
   </div>
   <div class="res">
