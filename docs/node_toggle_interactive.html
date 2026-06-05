@@ -5,221 +5,192 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DMI Node-Toggle — Interactive</title>
 <style>
-  :root{
-    --ink:#1a1f29;--muted:#5b6573;--line:#e2e6ee;--bg:#fff;--soft:#f6f8fc;
-    --accent:#2f6df0;--green:#1a9d6b;--greenbg:#e7f7ef;--red:#d2453b;--amber:#c87f15;--mono:#0f1320;
-  }
+  :root{--ink:#1a1f29;--muted:#5b6573;--line:#e2e6ee;--bg:#fff;--soft:#f6f8fc;
+    --accent:#2f6df0;--green:#1a9d6b;--greenbg:#e7f7ef;--gray:#9aa3b2;--mono:#0f1320}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
     font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
-  .wrap{max-width:1120px;margin:0 auto;padding:32px 28px 64px}
-  h1{font-size:26px;margin:0 0 4px;letter-spacing:-.2px}
-  .sub{color:var(--muted);margin:0 0 20px;font-size:14.5px}
-  h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);margin:30px 0 12px;font-weight:700}
+  .wrap{max-width:960px;margin:0 auto;padding:34px 28px 60px}
+  h1{font-size:25px;margin:0 0 4px}
+  .sub{color:var(--muted);margin:0 0 22px;font-size:14.5px}
+  h2{font-size:12.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);margin:30px 0 12px;font-weight:700}
   code,.m{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;color:var(--mono)}
-  .card{border:1px solid var(--line);border-radius:12px;background:#fff;padding:16px 18px}
-  /* layout */
-  .demo{display:grid;grid-template-columns:1.15fr 1fr;gap:18px;align-items:start}
-  .controls{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;align-items:center}
-  .btn{border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 11px;font-size:12.5px;cursor:pointer;color:var(--ink)}
+  .card{border:1px solid var(--line);border-radius:12px;background:#fff;padding:18px}
+  .controls{display:flex;gap:8px;margin-bottom:14px}
+  .btn{border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 12px;font-size:12.5px;cursor:pointer}
   .btn:hover{border-color:var(--accent);color:var(--accent)}
-  select{border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-size:12.5px;background:#fff}
-  .lab{font-size:12px;color:var(--muted);margin-right:2px}
-  /* model stack */
-  .stack{max-height:430px;overflow:auto;border:1px solid var(--line);border-radius:11px;padding:10px;background:var(--soft)}
-  .lrow{display:grid;grid-template-columns:42px 1fr 1fr;gap:8px;align-items:center;margin:5px 0}
-  .lname{font-size:11.5px;color:var(--muted);text-align:right;font-family:ui-monospace,monospace}
-  .cell{border:1px solid var(--line);border-radius:8px;padding:7px 0;text-align:center;font-size:12px;font-weight:600;
-    cursor:pointer;background:#fff;color:#9aa3b2;user-select:none;transition:all .08s}
-  .cell:hover{border-color:var(--accent)}
-  .cell.on{background:var(--greenbg);border-color:#bfe6d3;color:var(--green)}
-  .cell.on::before{content:"● ";font-size:9px;vertical-align:1px}
-  .cell.off::before{content:"○ ";font-size:9px;color:#c2c9d4}
-  .colhdr{display:grid;grid-template-columns:42px 1fr 1fr;gap:8px;margin:0 0 4px;font-size:10.5px;
-    text-transform:uppercase;letter-spacing:.05em;color:var(--muted);text-align:center}
-  /* live panel */
-  .panel .row{display:flex;justify-content:space-between;align-items:baseline;margin:0 0 10px}
-  .big{font-size:30px;font-weight:700;letter-spacing:-.5px}
-  .big small{font-size:14px;color:var(--muted);font-weight:500}
-  .bar{height:12px;border-radius:7px;background:#eef1f6;overflow:hidden;margin:4px 0 2px}
-  .bar > i{display:block;height:100%;background:linear-gradient(90deg,#2f6df0,#1a9d6b);transition:width .15s}
-  .barlab{font-size:11.5px;color:var(--muted)}
-  .lanes{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
-  .lane{border:1px solid var(--line);border-radius:9px;padding:9px 8px;text-align:center;background:#fff}
-  .lane .ln{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
-  .lane .lv{font-size:18px;font-weight:700;margin-top:2px}
-  .aligned{margin-top:10px;text-align:center;font-size:12.5px;border-radius:8px;padding:7px}
-  .aligned.ok{background:var(--greenbg);border:1px solid #cfe9dc;color:var(--green)}
-  .cfg{margin-top:12px;background:var(--mono);color:#e8edf6;border-radius:9px;padding:10px 12px;
-    font-family:ui-monospace,monospace;font-size:11.5px;line-height:1.5;word-break:break-all}
-  .cfg .k{color:#7fb0ff} .cfg .v{color:#a6e3c0}
+  /* graph */
+  .graph{display:flex;align-items:flex-start;gap:0;overflow-x:auto;padding:6px 2px 2px}
+  .col{display:flex;flex-direction:column;align-items:center;min-width:96px}
+  .compute{border:1px solid var(--line);background:var(--soft);border-radius:9px;padding:9px 4px;width:84px;
+    text-align:center;font-size:12px;font-weight:600;color:#39414f}
+  .vbar{width:2px;height:18px;background:var(--line);margin:2px 0}
+  .vbar.on{background:var(--green)} .vbar.off{background:#dfe4ec;border-left:2px dashed #cfd5df;width:0}
+  .prod{border:1.5px solid var(--line);border-radius:9px;padding:9px 4px;width:84px;text-align:center;
+    font-size:12px;font-weight:600;cursor:pointer;background:#fff;color:var(--gray);user-select:none;transition:.08s}
+  .prod:hover{border-color:var(--accent)}
+  .prod.on{background:var(--greenbg);border-color:#bfe6d3;color:var(--green)}
+  .prod .s{display:block;font-size:10px;font-weight:500;margin-top:2px}
+  .arrow{align-self:center;color:#c2c9d4;font-size:18px;padding:0 2px;margin-top:14px}
+  .ring{align-self:flex-start;border:1.5px dashed #bfe6d3;border-radius:10px;padding:10px 12px;background:#f3fbf7;
+    margin-left:8px;text-align:center;min-width:96px}
+  .ring .t{font-size:12px;font-weight:700;color:var(--green)} .ring .d{font-size:10.5px;color:var(--muted)}
+  .hint{font-size:12px;color:var(--muted);margin-top:12px}
+  /* readout */
+  .read{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+  .ro{border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .ro .k{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+  .ro .v{font-size:15px;margin-top:3px}
+  .lanes{display:flex;gap:8px;margin-top:5px}
+  .ln{flex:1;border:1px solid var(--line);border-radius:8px;text-align:center;padding:6px 0;font-size:12px}
+  .ln b{display:block;font-size:16px;color:var(--green)}
+  .ok{color:var(--green);font-size:12px;margin-top:6px}
+  .cfg{background:var(--mono);color:#e8edf6;border-radius:8px;padding:9px 11px;margin-top:6px;
+    font-family:ui-monospace,monospace;font-size:11.5px;word-break:break-all}
+  .cfg .k{color:#7fb0ff}.cfg .v{color:#a6e3c0}
+  /* api */
+  pre{background:var(--mono);color:#e8edf6;border-radius:10px;padding:14px 16px;overflow:auto;
+    font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.7;margin:0}
+  pre .c{color:#8a93a3} pre .f{color:#7fb0ff} pre .s{color:#a6e3c0}
   /* results */
   table{width:100%;border-collapse:collapse;font-size:12.8px}
   th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
   th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
   td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
+  .grnt{color:var(--green)}.acc{color:var(--accent)}
   .res{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}
   .stat{border:1px solid var(--line);border-radius:11px;padding:12px;text-align:center}
-  .stat .v{font-size:20px;font-weight:700} .stat .k{font-size:11.5px;color:var(--muted);margin-top:2px}
-  .on{color:var(--green)} .off{color:var(--accent)}
+  .stat .v{font-size:19px;font-weight:700}.stat .k{font-size:11px;color:var(--muted);margin-top:2px}
   .note{font-size:12px;color:var(--muted);margin-top:10px}
-  .foot{margin-top:26px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:12px}
-  @media(max-width:860px){.demo{grid-template-columns:1fr}.res{grid-template-columns:repeat(2,1fr)}}
+  .foot{margin-top:24px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:12px}
+  @media(max-width:720px){.read,.res{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>DMI Node-Toggle — Interactive</h1>
-  <p class="sub">Click any <b>Attn</b> or <b>FFN</b> cell to enable/disable that hook in the captured CUDA graph.
-  Everything updates live: the lockstep lanes (reserve = meta = device), the overhead estimate, and the config you'd pass.
-  No re-capture — flipping cells is what <code>cudaGraphNodeSetEnabled</code> does between replays.</p>
+  <p class="sub">One captured CUDA graph. Click a <b>producer node</b> to enable/disable it — that's exactly what
+  <code>cudaGraphNodeSetEnabled</code> does between replays, no re-capture. Enabled nodes fire (copy → ring → export);
+  disabled nodes are skipped.</p>
 
-  <h2>Try it</h2>
-  <div class="controls">
-    <span class="lab">Model</span>
-    <select id="model">
-      <option value="12">demo · 12 layers</option>
-      <option value="32">Llama-3.1-8B · 32</option>
-      <option value="36" selected>Qwen3-4B · 36</option>
-      <option value="40">Qwen3-14B · 40</option>
-    </select>
-    <span class="lab" style="margin-left:8px">Presets</span>
-    <button class="btn" data-p="all">All on</button>
-    <button class="btn" data-p="none">All off</button>
-    <button class="btn" data-p="last4">Last 4 layers</button>
-    <button class="btn" data-p="attn">Attn only</button>
-    <button class="btn" data-p="ffn">FFN only</button>
-  </div>
-
-  <div class="demo">
-    <div class="card">
-      <div class="colhdr"><span></span><span>Attention</span><span>FFN / MLP</span></div>
-      <div class="stack" id="stack"></div>
-      <p class="note">Green ● = enabled (fires: D2D → ring → export). Gray ○ = disabled (skipped at replay,
-      ~0.34&nbsp;µs/node residual). Two hooks per layer.</p>
+  <h2>The captured graph</h2>
+  <div class="card">
+    <div class="controls">
+      <button class="btn" data-p="all">All on</button>
+      <button class="btn" data-p="none">All off</button>
+      <button class="btn" data-p="ffn">FFN only</button>
+      <button class="btn" data-p="last">Last layer</button>
     </div>
+    <div class="graph" id="graph"></div>
+    <p class="hint">Top row = the model forward (fixed compute nodes). Below each = its DMI producer node — click to toggle.
+    Solid green branch = fires into Ring²; dashed = skipped.</p>
 
-    <div class="card panel">
-      <div class="row"><span class="lab">Enabled hooks</span>
-        <span class="big"><span id="nEn">0</span><small>/<span id="nTot">0</span></small></span></div>
-      <div class="lab">Estimated decode overhead vs baseline</div>
-      <div class="bar"><i id="ovBar" style="width:0%"></i></div>
-      <div class="barlab"><b id="ovPct">0.00%</b> &nbsp;(<span id="ovUs">0</span> µs/step over a ~2.0 ms baseline)</div>
-
-      <div class="lanes">
-        <div class="lane"><div class="ln">① reserve</div><div class="lv" id="lR">0</div></div>
-        <div class="lane"><div class="ln">② meta push</div><div class="lv" id="lM">0</div></div>
-        <div class="lane"><div class="ln">③ device enable</div><div class="lv" id="lD">0</div></div>
+    <div class="read">
+      <div class="ro">
+        <div class="k">Enabled producers</div>
+        <div class="v"><b id="nEn" style="font-size:22px">4</b> / <span id="nTot">4</span>
+          &nbsp;<span class="note" id="brk"></span></div>
+        <div class="lanes">
+          <div class="ln">reserve<b id="lR">4</b></div>
+          <div class="ln">meta<b id="lM">4</b></div>
+          <div class="ln">device<b id="lD">4</b></div>
+        </div>
+        <div class="ok">reserve = meta = device = what fires &nbsp;✓ aligned (one <code>effective_specs</code>)</div>
       </div>
-      <div class="aligned ok" id="align">reserve = meta = device = what fires &nbsp;✓ aligned</div>
-
-      <div class="cfg" id="cfg"></div>
-      <p class="note">One <code>effective_specs</code> set drives all three lanes, so they can never diverge —
-      that's the correctness invariant (reserve == produced).</p>
+      <div class="ro">
+        <div class="k">Config you'd pass</div>
+        <div class="cfg" id="cfg"></div>
+        <div class="note">Each fires ≈1.6&nbsp;µs (transport); each disabled-but-captured ≈0.34&nbsp;µs (replay traversal).
+        A real model has 2× #layers such nodes → see Results.</div>
+      </div>
     </div>
   </div>
 
-  <h2>Results — measured (Qwen3-0.6B, RTX 4090; relative is the point)</h2>
+  <h2>Core API</h2>
+  <pre><span class="c"># once, around capture + after warmup</span>
+engine.<span class="f">enable_toggle_capture</span>(True)        <span class="c"># record producer nodes during capture</span>
+engine.<span class="f">bind_graph_exec</span>(graph, exec)        <span class="c"># register the captured exec</span>
+
+<span class="c"># at runtime, any time — flip the active set (no re-capture)</span>
+transport.<span class="f">set_active_hooks</span>(<span class="s">enabled</span>)       <span class="c"># cudaGraphNodeSetEnabled + meta gate, in lockstep</span></pre>
+  <p class="note">Lazy variant for high-frequency reconfigure: <code>set_active_hooks_lazy()</code> + per-graph
+  <code>ensure_graph_current()</code> on replay.</p>
+
+  <h2>Results — measured (Qwen3-0.6B, RTX 4090)</h2>
   <div class="card" style="padding:6px 10px">
   <table>
-    <tr><th>Config</th><th class="r">Overhead</th><th class="r">µs/step</th><th>Meaning</th></tr>
-    <tr><td>baseline</td><td class="r">—</td><td class="r">—</td><td>plain vLLM, no DMI</td></tr>
-    <tr><td><b>toggle OFF</b> (0/28)</td><td class="r off">+0.54%</td><td class="r">+10.9</td><td>armed but idle — disabled-node traversal only</td></tr>
-    <tr><td><b>toggle partial</b> (4/28)</td><td class="r">+1.16%</td><td class="r">+23.3</td><td>realistic online monitor</td></tr>
-    <tr><td><b>toggle ON</b> (28/28)</td><td class="r on">+2.83%</td><td class="r">+56.7</td><td>all hidden-states</td></tr>
-    <tr><td>ring_null (no toggle, full)</td><td class="r">+2.88%</td><td class="r">+57.8</td><td>== always-on DMI (toggle ON ≈ this)</td></tr>
-    <tr><td>ring_full (+ ClickHouse)</td><td class="r">+3.10%</td><td class="r">+62.1</td><td>DB write is async → ~0 extra TPOT</td></tr>
+    <tr><th>Config</th><th class="r">Overhead</th><th>Meaning</th></tr>
+    <tr><td>baseline</td><td class="r">—</td><td>plain vLLM</td></tr>
+    <tr><td><b>toggle OFF</b></td><td class="r acc">+0.54%</td><td>armed but idle (≈ baseline)</td></tr>
+    <tr><td><b>partial</b> (4/28)</td><td class="r">+1.16%</td><td>realistic online monitor</td></tr>
+    <tr><td><b>toggle ON</b></td><td class="r grnt">+2.83%</td><td>all hidden-states ≈ always-on DMI</td></tr>
+    <tr><td>ring_full (+ClickHouse)</td><td class="r">+3.10%</td><td>DB write is async → ~0 extra</td></tr>
   </table>
   </div>
-
   <div class="res">
-    <div class="stat"><div class="v">~81%</div><div class="k">transport overhead recovered when idle</div></div>
-    <div class="stat"><div class="v">1.6 µs</div><div class="k">per enabled hook (transport)</div></div>
-    <div class="stat"><div class="v">0.34 µs</div><div class="k">per disabled node (graph traversal)</div></div>
-    <div class="stat"><div class="v">6.1×</div><div class="k">pure reconfigure, lazy (80→13 µs)</div></div>
+    <div class="stat"><div class="v">~81%</div><div class="k">overhead recovered when idle</div></div>
+    <div class="stat"><div class="v">1.6 µs</div><div class="k">per enabled hook</div></div>
+    <div class="stat"><div class="v">0.34 µs</div><div class="k">per disabled node</div></div>
+    <div class="stat"><div class="v">6.1×</div><div class="k">faster reconfigure (lazy)</div></div>
   </div>
-  <p class="note">Node-toggle turns a fixed <b>+2.9%</b> always-on transport tax into <b>+0.54% (idle) … +2.83% (full)</b>,
-  paid in proportion to the hooks you enable. Caveat: host-side cost overlaps the GPU replay → single-stream TPOT impact
-  is small; the wins are host-CPU / throughput and high-frequency reconfigure.</p>
+  <p class="note">Node-toggle turns a fixed +2.9% always-on tax into +0.54% (idle) … +2.83% (full), proportional to
+  what you enable. (Host cost overlaps GPU → single-stream TPOT impact small; wins are host-CPU / throughput.)</p>
 
-  <p class="foot">Branch <code>feature/dmi_kernel_node_toggle</code>. Overhead estimate here = enabled×1.6µs +
-  disabled×0.34µs over a 2.0 ms step (the measured per-hook costs); the live lanes illustrate the lockstep invariant.
-  See <code>docs/node_toggle_local_perf.md</code> and <code>docs/node_toggle_mechanism_api.html</code>.</p>
+  <p class="foot">Branch <code>feature/dmi_kernel_node_toggle</code>. See <code>docs/node_toggle_local_perf.md</code>
+  and <code>docs/node_toggle_mechanism_api.html</code>.</p>
 </div>
 
 <script>
 (function(){
-  var BASE_US=2000, EN_US=1.6, DIS_US=0.34;
-  var state=[]; // [{attn:bool, ffn:bool}, ...]
-  var stack=document.getElementById('stack');
+  // 2 layers x {Attn, FFN} producer nodes on one graph
+  var NODES=[{l:0,k:'attn'},{l:0,k:'mlp'},{l:1,k:'attn'},{l:1,k:'mlp'}];
+  var on=NODES.map(function(){return true;});
+  var g=document.getElementById('graph');
 
-  function nLayers(){ return parseInt(document.getElementById('model').value,10); }
-
-  function build(preset){
-    var N=nLayers();
-    state=[];
-    for(var i=0;i<N;i++){ state.push({attn:true,ffn:true}); }
-    applyPreset(preset||'all');
-    render();
-  }
-  function applyPreset(p){
-    var N=state.length;
-    for(var i=0;i<N;i++){
-      if(p==='all'){state[i].attn=true;state[i].ffn=true;}
-      else if(p==='none'){state[i].attn=false;state[i].ffn=false;}
-      else if(p==='last4'){var on=i>=N-4;state[i].attn=on;state[i].ffn=on;}
-      else if(p==='attn'){state[i].attn=true;state[i].ffn=false;}
-      else if(p==='ffn'){state[i].attn=false;state[i].ffn=true;}
-    }
-  }
-  function render(){
-    stack.innerHTML='';
-    state.forEach(function(s,i){
-      var row=document.createElement('div'); row.className='lrow';
-      row.innerHTML='<div class="lname">L'+i+'</div>'+
-        cell(i,'attn',s.attn)+cell(i,'ffn',s.ffn);
-      stack.appendChild(row);
+  function preset(p){
+    on=NODES.map(function(n){
+      if(p==='all')return true; if(p==='none')return false;
+      if(p==='ffn')return n.k==='mlp'; if(p==='last')return n.l===1;
+      return true;
     });
-    stack.querySelectorAll('.cell').forEach(function(c){
-      c.addEventListener('click',function(){
-        var i=+c.dataset.i, k=c.dataset.k; state[i][k]=!state[i][k]; render();
-      });
+  }
+  function label(n){return (n.k==='attn'?'Attn':'FFN')+' L'+n.l;}
+  function render(){
+    g.innerHTML='';
+    NODES.forEach(function(n,i){
+      if(i>0){var a=document.createElement('div');a.className='arrow';a.textContent='→';g.appendChild(a);}
+      var col=document.createElement('div');col.className='col';
+      col.innerHTML=
+        '<div class="compute">'+label(n)+'<br><span style="font-size:10px;color:#8a93a3;font-weight:500">compute</span></div>'+
+        '<div class="vbar '+(on[i]?'on':'off')+'"></div>'+
+        '<div class="prod '+(on[i]?'on':'')+'" data-i="'+i+'">producer<span class="s">'+(on[i]?'● fires':'○ skipped')+'</span></div>';
+      g.appendChild(col);
+    });
+    var a=document.createElement('div');a.className='arrow';a.textContent='→';g.appendChild(a);
+    var r=document.createElement('div');r.className='ring';
+    r.innerHTML='<div class="t">Ring²</div><div class="d">D2D → drain<br>→ export</div>';g.appendChild(r);
+    g.querySelectorAll('.prod').forEach(function(p){
+      p.addEventListener('click',function(){on[+p.dataset.i]=!on[+p.dataset.i];render();});
     });
     update();
   }
-  function cell(i,k,on){
-    return '<div class="cell '+(on?'on':'off')+'" data-i="'+i+'" data-k="'+k+'">'+
-      (k==='attn'?'Attn':'FFN')+'</div>';
-  }
   function update(){
-    var tot=state.length*2, en=0;
-    state.forEach(function(s){ en+=(s.attn?1:0)+(s.ffn?1:0); });
-    var dis=tot-en;
-    var ov=en*EN_US+dis*DIS_US;
-    var ovMax=tot*EN_US;
-    var pct=(ov/BASE_US*100);
+    var en=on.filter(Boolean).length, tot=on.length, dis=tot-en;
     document.getElementById('nEn').textContent=en;
     document.getElementById('nTot').textContent=tot;
-    document.getElementById('ovBar').style.width=(ovMax? (ov/ovMax*100):0).toFixed(0)+'%';
-    document.getElementById('ovPct').textContent='+'+pct.toFixed(2)+'%';
-    document.getElementById('ovUs').textContent=ov.toFixed(1);
+    document.getElementById('brk').textContent='— '+en+' fire · '+dis+' skipped';
     document.getElementById('lR').textContent=en;
     document.getElementById('lM').textContent=en;
     document.getElementById('lD').textContent=en;
-    // config string
-    var parts=[];
-    state.forEach(function(s,i){ if(s.attn)parts.push('attn:'+i); if(s.ffn)parts.push('mlp:'+i); });
-    var shown = parts.length>10 ? parts.slice(0,8).join(',')+', … ('+parts.length+' total)' : (parts.join(',')||'(none)');
+    var parts=[];NODES.forEach(function(n,i){if(on[i])parts.push(n.k+':'+n.l);});
     document.getElementById('cfg').innerHTML=
       '<span class="k">dmx_node_toggle</span>: <span class="v">true</span>,<br>'+
-      '<span class="k">dmx_enabled_hooks</span>: <span class="v">"'+shown+'"</span>';
+      '<span class="k">dmx_enabled_hooks</span>: <span class="v">"'+(parts.join(',')||'(none)')+'"</span>';
   }
-
-  document.getElementById('model').addEventListener('change',function(){ build('all'); });
   document.querySelectorAll('.btn[data-p]').forEach(function(b){
-    b.addEventListener('click',function(){ applyPreset(b.dataset.p); render(); });
+    b.addEventListener('click',function(){preset(b.dataset.p);render();});
   });
-  build('all');
+  render();
 })();
 </script>
 </body>
