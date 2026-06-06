@@ -191,7 +191,8 @@ class BackendAdaptor(abc.ABC):
     def _compute_step_plan(self, ctx: StepContext) -> "tuple[int, int, bool]":
         """Return ``(aligned total bytes, n_hooks, needs_eager)`` for one step.
 
-        Single walk over ``active_specs``:
+        Single walk over ``transport.effective_specs`` (the node-toggle single
+        source of truth):
         - ``total`` and ``n_hooks`` feed ``prepare_step``.  ``n_hooks``
           counts only specs whose ``_compute_hook_shape`` returns a
           non-empty list -- matches the count of metas
@@ -200,6 +201,14 @@ class BackendAdaptor(abc.ABC):
           firing specs.  Drives the dispatch + safety-net decision in
           ``before_forward`` together with ``prepare_step``'s overflow
           result.
+
+        ``effective_specs`` == ``active_specs`` when node-toggle is inactive
+        (no behaviour change), and the enabled-AND-captured subset when it is
+        active -- so capacity-reserve here stays in LOCKSTEP with the meta-push
+        in ``pre_push_all_metas`` (both read the same set). Reserving for the
+        full ``active_specs`` while only the enabled subset fires would
+        over-count vs actual producer writes -> ring head/tail drift (the
+        reserve-invariant bug).
         """
         if self.model_cfg is None or not self.active_specs:
             return 0, 0, False
@@ -207,7 +216,7 @@ class BackendAdaptor(abc.ABC):
         total = 0
         n = 0
         needs_eager = False
-        for spec in self.active_specs:
+        for spec in self.transport.effective_specs:
             # When the adapter has populated actual_q_len AND the spec is
             # prefix-strip-eligible, size the byte budget for the unpadded
             # data the producer will actually write.  Other specs and the
