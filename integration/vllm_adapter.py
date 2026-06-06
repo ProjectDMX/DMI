@@ -483,11 +483,25 @@ _CUDAGRAPH_KEEP_PATCHED = False
 
 
 def _parse_enabled_hooks(s: Any):
-    """Parse 'hook_type:layer,hook_type:layer,...' -> [(ht, ln), ...]; '' -> None."""
-    if not s:
+    """Parse the dmx_enabled_hooks config into an enabled (ht, layer) list.
+
+    Three distinct meanings (#5 -- no overloading of the empty string, no
+    nonexistent-hook hack):
+      - not provided / "" -> None  : toggle gate INACTIVE (all hooks fire)
+      - "none"            -> []    : explicit EMPTY set -> toggle-0 (all off)
+      - "0:1,0:2"         -> [(0,1),(0,2)] : that specific set
+
+    layer omitted ("14") -> layer_no -1 (global hook).
+    """
+    if s is None:
         return None
+    s = str(s).strip()
+    if s == "":
+        return None                 # unconfigured -> gate inactive
+    if s.lower() == "none":
+        return []                   # explicit all-off
     out = []
-    for tok in str(s).split(","):
+    for tok in s.split(","):
         tok = tok.strip()
         if not tok:
             continue

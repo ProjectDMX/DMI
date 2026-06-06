@@ -39,9 +39,13 @@ def main():
 
     check(va._parse_enabled_hooks("0:32,0:33") == [(0, 32), (0, 33)],
           "_parse_enabled_hooks('0:32,0:33')")
-    check(va._parse_enabled_hooks("") is None, "_parse_enabled_hooks('') -> None")
     check(va._parse_enabled_hooks("14") == [(14, -1)],
           "_parse_enabled_hooks('14') -> global layer -1")
+    # (#5) the three distinct config meanings, no overloaded empty string:
+    check(va._parse_enabled_hooks(None) is None, "_parse_enabled_hooks(None) -> None (unconfigured)")
+    check(va._parse_enabled_hooks("") is None, "_parse_enabled_hooks('') -> None (unconfigured)")
+    check(va._parse_enabled_hooks("none") == [], "_parse_enabled_hooks('none') -> [] (explicit all-off)")
+    check(va._parse_enabled_hooks("NONE") == [], "_parse_enabled_hooks('NONE') -> [] (case-insensitive)")
 
     Orig = torch.cuda.CUDAGraph
     va._patch_cudagraph_keep_graph()
