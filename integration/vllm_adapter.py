@@ -578,7 +578,15 @@ def _patch_cudagraph_keep_graph() -> None:
                                 f"the ring irrecoverably. The worker MUST terminate; do NOT "
                                 f"catch and continue serving.")
                         super().replay()
-                        t.record_replay_event(raw)   # event guard for the next ensure
+                        # (#1) Record the replay event; if recording fails the
+                        # next ensure could mutate an executing exec (UB) -> FATAL.
+                        rerr = t.record_replay_event(raw)
+                        if rerr != 0:
+                            raise RuntimeError(
+                                f"[DMX] node-toggle FATAL: record_replay_event failed with "
+                                f"CUDA error {rerr} for graph {raw:#x}. Without a valid replay "
+                                f"event the next lazy reconfigure could mutate a still-executing "
+                                f"graph exec (UB). The worker MUST terminate.")
                     else:
                         # eager: device apply happened at config time; here we
                         # only validated the graph is bound (read-only).
@@ -816,7 +824,10 @@ class DMXGPUWorker(Worker):
                     # FULL) -> refuse to serve silently with all hooks on (#2).
                     raise RuntimeError(
                         "dmx_node_toggle + dmx_enabled_hooks were set but no CUDA graph "
-                        "was bound (is cudagraph_mode FULL/FULL_AND_PIECEWISE for decode?). "
+                        "was bound. Node-toggle requires cudagraph_mode=FULL for decode "
+                        "(one full-model graph per batch size). PIECEWISE graphs hold only "
+                        "a model SUBSET, so different graphs capture different hook subsets "
+                        "and would fail the uniform-hook-set requirement -- use FULL. "
                         "Refusing to serve with node-toggle silently inert.")
                 transport = self.adaptor.transport
                 # Arm the replay-time guard for BOTH modes (#3): eager needs the
