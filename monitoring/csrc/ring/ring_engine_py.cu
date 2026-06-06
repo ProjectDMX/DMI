@@ -323,6 +323,23 @@ uint64_t RingEnginePy::toggle_node_count() const {
     return n;
 }
 
+bool RingEnginePy::is_graph_ready(uint64_t graph) const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    cudaGraph_t g = reinterpret_cast<cudaGraph_t>(graph);
+    return impl_->reg_nodes.count(g) > 0 && impl_->reg_exec.count(g) > 0;
+}
+
+bool RingEnginePy::toggle_registry_complete() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    // Exact key-set match: every captured graph bound AND every bound graph
+    // captured. Equal sizes + every reg_nodes key present in reg_exec ⟹
+    // bijection (both keyed by unique cudaGraph_t).
+    if (impl_->reg_nodes.size() != impl_->reg_exec.size()) return false;
+    for (const auto& kv : impl_->reg_nodes)
+        if (impl_->reg_exec.count(kv.first) == 0) return false;
+    return true;
+}
+
 void RingEnginePy::clear_toggle_registry() {
     {
         std::lock_guard<std::mutex> lk(impl_->toggle_mu);

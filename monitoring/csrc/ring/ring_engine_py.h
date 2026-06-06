@@ -221,6 +221,17 @@ public:
     uint64_t bound_graph_count() const;          // #bound execs (0 => apply is a no-op)
     uint64_t last_apply_count() const;           // #SetEnabled calls in last apply_toggle
     bool     toggle_registry_uniform() const;    // all graphs share the same hook set
+    // Read-only replay-time guard (eager + lazy): a graph is "ready" iff it has
+    // recorded producer nodes AND a bound exec. A graph vLLM captured at RUNTIME
+    // (new batch_descriptor, after the warmup capture window closed) is neither,
+    // so its producers run default-ON while the meta gate filters -> desync. The
+    // replay hook calls this and fails loud. NO version bump / event wait / node
+    // mutation -- pure validation (distinct from ensure_graph_current).
+    bool     is_graph_ready(uint64_t graph) const;
+    // True iff the node-registry and exec-binding key sets match EXACTLY (every
+    // captured graph is bound, every bound graph has nodes). Checked at
+    // activation so a partial/mismatched bind fails loud instead of desyncing.
+    bool     toggle_registry_complete() const;
     // Full reset: registry, exec map, enabled set, toggle_active, capture flag,
     // and Phase-4 lazy state (versions + per-graph replay events).
     void clear_toggle_registry();
