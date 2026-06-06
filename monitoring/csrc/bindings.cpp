@@ -262,6 +262,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
              ring_py::SubmitFn submit_fn;
              if (!host_engine_obj.is_none()) {
+                 // A DMXHostEngine -> ClickHouse sink, or a plain Python callable
+                 // sink (mainly for tests / custom consumers, e.g. node-toggle
+                 // reconfigure guardrails that observe delivered slices).
+                 if (py::isinstance<dmx_host::DMXHostEngine>(host_engine_obj)) {
                  auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
                  submit_fn = [host](const std::string& model_id, int32_t shard_rank,
                                     const std::string& req_id, const std::string& act_name,
@@ -279,6 +283,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                      row.emplace_back(std::move(slice));
                      host->submit_direct(std::move(row), nbytes);
                  };
+                 } else {
+                     // Python callable sink. The p2p thread calls submit_fn with
+                     // the GIL released, so re-acquire before calling into Python.
+                     auto pyfn = std::make_shared<py::function>(
+                         host_engine_obj.cast<py::function>());
+                     submit_fn = [pyfn](const std::string& model_id, int32_t shard_rank,
+                                        const std::string& req_id, const std::string& act_name,
+                                        int32_t layer_no, int32_t start_token, int32_t end_token,
+                                        at::Tensor slice) {
+                         py::gil_scoped_acquire gil;
+                         try {
+                             (*pyfn)(model_id, shard_rank, req_id, act_name, layer_no,
+                                     start_token, end_token, std::move(slice));
+                         } catch (const py::error_already_set& ex) {
+                             // Don't let a sink error kill the p2p thread, but make
+                             // it visible (tests rely on this path).
+                             fprintf(stderr, "[ring p2p] Python SubmitFn raised: %s\n", ex.what());
+                         }
+                     };
+                 }
              }
              return std::make_shared<ring_py::RingEnginePy>(
                  std::move(cfg), std::move(submit_fn));
