@@ -291,7 +291,14 @@ int RingEnginePy::ensure_graph_current(uint64_t graph) {
         if (err != cudaSuccess) { if (first == cudaSuccess) first = err; continue; }
         e.last_enabled = on;
     }
-    impl_->applied_version[g] = impl_->target_version;
+    // (#2) Mark this graph current ONLY on full success. If any SetEnabled
+    // failed, leave applied_version stale so a later ensure retries the
+    // still-unapplied nodes (last_enabled already tracks per-node success, so
+    // the retry is a no-op for the ones that did flip). The caller (replay
+    // hook) treats a nonzero return as a FATAL desync and terminates, but the
+    // stale version is the correct state regardless.
+    if (first == cudaSuccess)
+        impl_->applied_version[g] = impl_->target_version;
     return static_cast<int>(first);
 }
 

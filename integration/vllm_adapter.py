@@ -531,7 +531,20 @@ def _patch_cudagraph_keep_graph() -> None:
                 t = ring_transport.get_active()
                 if t is not None and getattr(t, "_toggle_gate_active", False):
                     raw = self.raw_cuda_graph()
-                    t.ensure_graph_current(raw)   # apply deferred toggle if stale
+                    # (#1) The deferred device apply MUST succeed before replay:
+                    # before_forward already pushed this step's metas for the new
+                    # enabled set, so replaying with a stale/partial node state
+                    # would put payloads and metas out of lockstep -> desync. A
+                    # nonzero result is a FATAL, unrecoverable error (the FIFO is
+                    # already dirty for this step) -> raise and let the worker die.
+                    err = t.ensure_graph_current(raw)
+                    if err != 0:
+                        raise RuntimeError(
+                            f"[DMX] node-toggle FATAL: lazy apply (ensure_graph_current) "
+                            f"failed with CUDA error {err} for graph {raw:#x}. The meta "
+                            f"gate already advanced to the new enabled set this step, so "
+                            f"replaying now would desync the ring irrecoverably. The "
+                            f"worker MUST terminate; do NOT catch this and continue serving.")
                     super().replay()
                     t.record_replay_event(raw)    # event guard for the next ensure
                     if not _KeepGraphCUDAGraph._dmx_lazy_logged:
