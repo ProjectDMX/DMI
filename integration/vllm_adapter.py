@@ -693,6 +693,14 @@ class DMXGPUWorker(Worker):
         ring_cfg.payload_ring_bytes = ring_payload_mb * 1024 * 1024
         ring_cfg.pinned_staging_bytes = ring_pinned_mb * 1024 * 1024
         ring_cfg.task_ring_entries = ring_entries
+        # Bound export latency for LOW-VOLUME / sparse-hook monitoring (e.g.
+        # node-toggle with a small enabled set): without a timed flush the drain
+        # waits on byte/entry thresholds that sparse steps never hit, so data
+        # sits in the ring until the buffer fills or a final flush-on-close. A
+        # nonzero timeout forces the drain to flush pending entries after that
+        # idle window. 0 (default) = threshold-only (legacy behaviour).
+        ring_cfg.drain_flush_timeout_us = int(_cfg(
+            ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US", 0))
         ring_cfg.insert_queue_max_bytes = int(_cfg(
             ac, "dmx_insert_queue_max_bytes", "DMX_INSERT_QUEUE_MAX_BYTES",
             4096 * 1024 * 1024))
