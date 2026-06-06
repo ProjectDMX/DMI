@@ -464,6 +464,87 @@ def _row_bytes_for_spec(spec, model_cfg) -> int:
 # ---------------------------------------------------------------------------
 # DMXGPUWorker
 # ---------------------------------------------------------------------------
+# Node-toggle (Phase 3b) helpers
+# ---------------------------------------------------------------------------
+
+# Phase 4 lazy per-graph toggle: when True, the keep_graph CUDAGraph.replay()
+# override applies the deferred toggle to the graph about to replay (and records
+# an event after). Set only when dmx_lazy_toggle is requested.
+_DMX_LAZY_REPLAY_HOOK = False
+_CUDAGRAPH_KEEP_PATCHED = False
+
+
+def _parse_enabled_hooks(s: Any):
+    """Parse 'hook_type:layer,hook_type:layer,...' -> [(ht, ln), ...]; '' -> None."""
+    if not s:
+        return None
+    out = []
+    for tok in str(s).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        ht, _, ln = tok.partition(":")
+        out.append((int(ht), int(ln if ln != "" else -1)))
+    return out or None
+
+
+def _patch_cudagraph_keep_graph() -> None:
+    """Monkeypatch torch.cuda.CUDAGraph to default keep_graph=True.
+
+    vLLM's CUDAGraphWrapper creates ``torch.cuda.CUDAGraph()`` (keep_graph=False),
+    which frees the captured template graph after instantiate -> the node handles
+    DMI records via cudaStreamGetCaptureInfo would dangle. keep_graph=True keeps
+    the template alive (host memory only; no device/latency cost). Idempotent,
+    process-global; only applied when node-toggle is enabled.
+    """
+    global _CUDAGRAPH_KEEP_PATCHED
+    if _CUDAGRAPH_KEEP_PATCHED:
+        return
+    Orig = torch.cuda.CUDAGraph
+    if getattr(Orig, "_dmx_keep_graph", False):
+        _CUDAGRAPH_KEEP_PATCHED = True
+        return
+
+    class _KeepGraphCUDAGraph(Orig):
+        # Force keep_graph=True in BOTH __new__ and __init__: vLLM calls
+        # ``CUDAGraph()`` with no args, so __init__ (builtin) would otherwise
+        # reset keep_graph to its False default after __new__ set it. Subclass
+        # (not a factory) so isinstance(x, torch.cuda.CUDAGraph) still holds.
+        _dmx_keep_graph = True
+        _dmx_lazy_logged = False
+
+        def __new__(cls, *args, **kwargs):
+            kwargs["keep_graph"] = True
+            return Orig.__new__(cls, **kwargs)
+
+        def __init__(self, *args, **kwargs):
+            kwargs["keep_graph"] = True
+            super().__init__(**kwargs)
+
+        def replay(self):
+            # Phase 4 lazy: apply the deferred toggle to THIS graph just before
+            # it replays (and record an event after, so the next ensure waits for
+            # this replay before mutating the exec). Gated by _DMX_LAZY_REPLAY_HOOK
+            # and an active toggle gate; otherwise stock replay (the common case,
+            # incl. all eager-toggle and non-toggle runs).
+            if _DMX_LAZY_REPLAY_HOOK:
+                t = ring_transport.get_active()
+                if t is not None and getattr(t, "_toggle_gate_active", False):
+                    raw = self.raw_cuda_graph()
+                    t.ensure_graph_current(raw)   # apply deferred toggle if stale
+                    super().replay()
+                    t.record_replay_event(raw)    # event guard for the next ensure
+                    if not _KeepGraphCUDAGraph._dmx_lazy_logged:
+                        _KeepGraphCUDAGraph._dmx_lazy_logged = True
+                        print("[DMX] node-toggle: lazy replay hook active", flush=True)
+                    return
+            super().replay()
+
+    torch.cuda.CUDAGraph = _KeepGraphCUDAGraph
+    _CUDAGRAPH_KEEP_PATCHED = True
+
+
+# ---------------------------------------------------------------------------
 
 
 class DMXGPUWorker(Worker):
@@ -513,6 +594,16 @@ class DMXGPUWorker(Worker):
         ch_parallelism = int(
             _cfg(ac, "dmx_ch_parallelism", "DMX_CH_PARALLELISM", 10)
         )
+        # Runtime node-toggle (Phase 3b). Default off -> behaviour unchanged.
+        # dmx_enabled_hooks: optional static enabled set "hook_type:layer,..."
+        # applied once after warmup; empty -> toggle armed but gate inactive.
+        node_toggle = _cfg(ac, "dmx_node_toggle", "DMX_NODE_TOGGLE", False)
+        enabled_hooks_s = _cfg(ac, "dmx_enabled_hooks", "DMX_ENABLED_HOOKS", "")
+        # Phase 4 lazy per-graph toggle (defer device apply to per-graph replay).
+        lazy_toggle = _cfg(ac, "dmx_lazy_toggle", "DMX_LAZY_TOGGLE", False)
+        self._dmx_node_toggle = bool(node_toggle)
+        self._dmx_lazy_toggle = bool(lazy_toggle)
+        self._dmx_enabled_hooks = _parse_enabled_hooks(enabled_hooks_s)
 
         resolved_model_id = model_id or str(self.vllm_config.model_config.model)
 
@@ -566,6 +657,16 @@ class DMXGPUWorker(Worker):
         # DMX_GPU_PADDING_STRIP=0 if needed for debugging.
         gpu_padding_strip = _cfg(
             ac, "dmx_gpu_padding_strip", "DMX_GPU_PADDING_STRIP", True)
+        # Option B: node-toggle records nodes only from the BASIC producer op.
+        # gpu_padding_strip routes eligible hooks to producer_prefix instead,
+        # whose nodes are not toggle-recorded -> 0 bound nodes. Force strip off
+        # when toggle is on so every hook dispatches to the basic producer.
+        if self._dmx_node_toggle and gpu_padding_strip:
+            warnings.warn(
+                "[DMX] node-toggle: forcing gpu_padding_strip=False (toggle records "
+                "only basic-producer nodes; prefix/chunked producers are not "
+                "toggle-recorded). Set dmx_gpu_padding_strip=False to silence.")
+            gpu_padding_strip = False
         self.adaptor = VLLMAdaptor(
             engine, resolved_model_id, self.vllm_config,
             gpu_padding_strip=bool(gpu_padding_strip))
@@ -626,6 +727,16 @@ class DMXGPUWorker(Worker):
         )
 
     def compile_or_warm_up_model(self) -> float:
+        toggle = (getattr(self, "_dmx_node_toggle", False)
+                  and self.adaptor is not None
+                  and self.adaptor.ring_engine is not None)
+        if toggle:
+            # Scope node recording + keep_graph to the REAL capture that
+            # super() performs. Clear any stale registry first.
+            self.adaptor.ring_engine.clear_toggle_registry()
+            self.adaptor.ring_engine.enable_toggle_capture(True)
+            _patch_cudagraph_keep_graph()
+
         # Warmup runs with null_mode=True (set in init_device).
         # Producer kernels fire but are no-ops -- ring stays clean.
         result = super().compile_or_warm_up_model()
@@ -640,7 +751,80 @@ class DMXGPUWorker(Worker):
         ):
             self.adaptor.ring_engine.set_null_mode(False)
 
+        # Node-toggle: bind each captured graph's exec, close the capture window,
+        # and (optionally) apply the static enabled set. Done here -- after
+        # warmup, before serving -- so no replay is in flight.
+        if toggle:
+            eng = self.adaptor.ring_engine
+            n_bound = self._dmx_bind_captured_graphs()
+            eng.enable_toggle_capture(False)   # close the window (#1)
+            print(f"[DMX] node-toggle: bound {n_bound} captured graph(s), "
+                  f"{eng.toggle_node_count()} nodes registered")
+            if self._dmx_enabled_hooks is not None:
+                if n_bound == 0:
+                    # Requested a subset but nothing bound (e.g. cudagraph_mode not
+                    # FULL) -> refuse to serve silently with all hooks on (#2).
+                    raise RuntimeError(
+                        "dmx_node_toggle + dmx_enabled_hooks were set but no CUDA graph "
+                        "was bound (is cudagraph_mode FULL/FULL_AND_PIECEWISE for decode?). "
+                        "Refusing to serve with node-toggle silently inert.")
+                transport = self.adaptor.transport
+                if self._dmx_lazy_toggle:
+                    # Phase 4: arm the replay() hook; defer device apply to each
+                    # graph's first replay (lazy per-graph).
+                    global _DMX_LAZY_REPLAY_HOOK
+                    _DMX_LAZY_REPLAY_HOOK = True
+                    transport.set_active_hooks_lazy(self._dmx_enabled_hooks)
+                    print(f"[DMX] node-toggle: LAZY active hooks set to "
+                          f"{self._dmx_enabled_hooks}")
+                else:
+                    transport.set_active_hooks(self._dmx_enabled_hooks)
+                    print(f"[DMX] node-toggle: active hooks set to {self._dmx_enabled_hooks}")
+            elif n_bound == 0:
+                print("[DMX] node-toggle: WARNING no graph bound; toggle is inert "
+                      "(no dmx_enabled_hooks requested, so serving continues all-on).")
+
         return result
+
+    def _dmx_bind_captured_graphs(self) -> int:
+        """Find vLLM's captured CUDA graphs and bind each exec to the toggle
+        registry. Returns the number bound. FULL-cudagraph path only (decode);
+        the model is wrapped as CUDAGraphWrapper whose concrete_cudagraph_entries
+        hold one torch.cuda.CUDAGraph per batch size."""
+        try:
+            from vllm.compilation.cuda_graph import CUDAGraphWrapper
+        except Exception:
+            return 0
+        eng = self.adaptor.ring_engine
+        model = getattr(self.model_runner, "model", None)
+        n = 0
+        # Unwrap nested wrappers (UBatchWrapper etc.) to find CUDAGraphWrapper(s).
+        seen = set()
+        stack = [model]
+        while stack:
+            obj = stack.pop()
+            if id(obj) in seen or obj is None:
+                continue
+            seen.add(id(obj))
+            if isinstance(obj, CUDAGraphWrapper):
+                for entry in obj.concrete_cudagraph_entries.values():
+                    g = getattr(entry, "cudagraph", None)
+                    if g is None:
+                        continue
+                    # Don't re-instantiate if an exec already exists (that would
+                    # destroy it, #3). raw_cuda_graph_exec() raises until the graph
+                    # is instantiated -> instantiate exactly once in that case.
+                    try:
+                        exec_ptr = g.raw_cuda_graph_exec()
+                    except RuntimeError:
+                        g.instantiate()
+                        exec_ptr = g.raw_cuda_graph_exec()
+                    eng.bind_graph_exec(g.raw_cuda_graph(), exec_ptr)
+                    n += 1
+            inner = getattr(obj, "runnable", None)
+            if inner is not None:
+                stack.append(inner)
+        return n
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: Any) -> Any:
