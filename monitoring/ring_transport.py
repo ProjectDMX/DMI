@@ -445,6 +445,10 @@ class RingTransport:
         # reserve() over-counts vs actual producer writes.
         self._effective_enabled_specs: "Optional[List[HookSpec]]" = None
         self._enabled_version: int = 0   # bumped whenever the enabled set changes
+        # True when the active gate uses the LAZY device-apply path
+        # (set_active_hooks_lazy). The replay guard reads this to decide whether
+        # to ensure_graph_current (lazy) or only validate (eager).
+        self._lazy_active: bool = False
 
         # Hook selection preset name (e.g. "full", "hidden-states", "logits").
         # Set by the active adapter before hook installation.
@@ -620,12 +624,22 @@ class RingTransport:
                 "set_active_hooks: captured graphs have non-uniform hook sets; the "
                 "global meta gate cannot stay aligned. Ensure every captured graph "
                 "registers the same hooks.")
+        # Guard (#4): node-registry and exec-binding key sets must match exactly.
+        # A partial/mismatched bind (a captured graph left unbound, or a bound
+        # graph with no recorded nodes) would let some graph replay with
+        # default-ON producers while the meta gate filters -> desync.
+        if not eng.toggle_registry_complete():
+            raise RuntimeError(
+                "set_active_hooks: toggle registry incomplete -- the set of graphs "
+                "with recorded producer nodes does not match the set of bound execs. "
+                "Every captured graph must be bound (bind_graph_exec) and vice versa.")
         pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
         eng.set_enabled_hooks(pairs)
         err = eng.apply_toggle()
         if err != 0:
             raise RuntimeError(f"apply_toggle failed with CUDA error {err}")
         self._toggle_gate_active = True
+        self._lazy_active = False
         self._recompute_effective_specs()
 
     def set_active_hooks_lazy(self, enabled: "Iterable[Tuple[int, int]]") -> None:
@@ -645,9 +659,15 @@ class RingTransport:
         if not eng.toggle_registry_uniform():
             raise RuntimeError(
                 "set_active_hooks_lazy: captured graphs have non-uniform hook sets.")
+        if not eng.toggle_registry_complete():
+            raise RuntimeError(
+                "set_active_hooks_lazy: toggle registry incomplete -- node-registry and "
+                "exec-binding key sets differ (some captured graph unbound, or some "
+                "bound graph has no recorded nodes).")
         pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
         eng.set_enabled_hooks(pairs)        # bumps target_version; device apply deferred
         self._toggle_gate_active = True
+        self._lazy_active = True
         self._recompute_effective_specs()
 
     def _recompute_effective_specs(self) -> None:
@@ -662,6 +682,12 @@ class RingTransport:
         self._effective_enabled_specs = [
             s for s, m in zip(self._active_specs, mask) if m]
         self._enabled_version += 1
+
+    def is_graph_ready(self, raw_graph: int) -> bool:
+        """Read-only replay-time guard: True iff the graph has recorded producer
+        nodes AND a bound exec. False for a graph vLLM captured at runtime after
+        the warmup window closed -> the replay hook fails loud (#3)."""
+        return self._ring_engine.is_graph_ready(raw_graph)
 
     def ensure_graph_current(self, raw_graph: int) -> int:
         """Lazy: apply the deferred toggle to the graph about to replay (no-op if
@@ -680,6 +706,7 @@ class RingTransport:
         re-capture or when disabling monitoring."""
         self._ring_engine.clear_toggle_registry()
         self._toggle_gate_active = False
+        self._lazy_active = False
         self._effective_enabled_specs = None
         self._enabled_version += 1
 

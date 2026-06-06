@@ -467,10 +467,15 @@ def _row_bytes_for_spec(spec, model_cfg) -> int:
 # Node-toggle (Phase 3b) helpers
 # ---------------------------------------------------------------------------
 
-# Phase 4 lazy per-graph toggle: when True, the keep_graph CUDAGraph.replay()
-# override applies the deferred toggle to the graph about to replay (and records
-# an event after). Set only when dmx_lazy_toggle is requested.
-_DMX_LAZY_REPLAY_HOOK = False
+# Armed (True) whenever a node-toggle gate is active (eager OR lazy). The
+# keep_graph CUDAGraph.replay() override then runs the replay-time graph guard:
+#   - validate the graph is registered+bound (else a runtime-captured graph
+#     would replay with default-ON producers while the meta gate filters ->
+#     desync); FATAL if not (#3).
+#   - lazy mode only: apply the deferred toggle (ensure_graph_current) and check
+#     its result (#1); eager mode: validation only (apply happened at config
+#     time -- read-only, per the eager/lazy separation).
+_DMX_TOGGLE_REPLAY_GUARD = False
 _CUDAGRAPH_KEEP_PATCHED = False
 
 
@@ -522,34 +527,52 @@ def _patch_cudagraph_keep_graph() -> None:
             super().__init__(**kwargs)
 
         def replay(self):
-            # Phase 4 lazy: apply the deferred toggle to THIS graph just before
-            # it replays (and record an event after, so the next ensure waits for
-            # this replay before mutating the exec). Gated by _DMX_LAZY_REPLAY_HOOK
-            # and an active toggle gate; otherwise stock replay (the common case,
-            # incl. all eager-toggle and non-toggle runs).
-            if _DMX_LAZY_REPLAY_HOOK:
+            # Replay-time node-toggle guard (eager + lazy). Armed by
+            # _DMX_TOGGLE_REPLAY_GUARD when a gate is active; otherwise stock
+            # replay (the common case, incl. all non-toggle runs).
+            if _DMX_TOGGLE_REPLAY_GUARD:
                 t = ring_transport.get_active()
                 if t is not None and getattr(t, "_toggle_gate_active", False):
                     raw = self.raw_cuda_graph()
-                    # (#1) The deferred device apply MUST succeed before replay:
-                    # before_forward already pushed this step's metas for the new
-                    # enabled set, so replaying with a stale/partial node state
-                    # would put payloads and metas out of lockstep -> desync. A
-                    # nonzero result is a FATAL, unrecoverable error (the FIFO is
-                    # already dirty for this step) -> raise and let the worker die.
-                    err = t.ensure_graph_current(raw)
-                    if err != 0:
+                    # (#3) The graph about to replay MUST be a registered+bound
+                    # toggle graph. A graph vLLM captured at RUNTIME (new
+                    # batch_descriptor, after the warmup capture window closed)
+                    # has no recorded producer nodes and no bound exec -> its
+                    # producers run default-ON while the meta gate pushes only the
+                    # enabled subset -> desync. before_forward already pushed this
+                    # step's metas, so this is FATAL and unrecoverable: raise and
+                    # let the worker die. Read-only validation (eager + lazy).
+                    if not t.is_graph_ready(raw):
                         raise RuntimeError(
-                            f"[DMX] node-toggle FATAL: lazy apply (ensure_graph_current) "
-                            f"failed with CUDA error {err} for graph {raw:#x}. The meta "
-                            f"gate already advanced to the new enabled set this step, so "
-                            f"replaying now would desync the ring irrecoverably. The "
-                            f"worker MUST terminate; do NOT catch this and continue serving.")
-                    super().replay()
-                    t.record_replay_event(raw)    # event guard for the next ensure
+                            f"[DMX] node-toggle FATAL: graph {raw:#x} is about to replay "
+                            f"but is NOT registered+bound in the toggle registry -- it was "
+                            f"almost certainly captured by vLLM at RUNTIME after DMI closed "
+                            f"its capture window at warmup. Its producers run all-ON while "
+                            f"the meta gate filters to the enabled subset, which desyncs the "
+                            f"ring. The worker MUST terminate; do NOT catch and continue. "
+                            f"(Fix: ensure all decode batch_descriptors are captured during "
+                            f"warmup, or add runtime graph registration.)")
+                    if getattr(t, "_lazy_active", False):
+                        # (#1) lazy: apply the deferred toggle now; a nonzero
+                        # result is FATAL (metas already pushed for the new set).
+                        err = t.ensure_graph_current(raw)
+                        if err != 0:
+                            raise RuntimeError(
+                                f"[DMX] node-toggle FATAL: lazy apply (ensure_graph_current) "
+                                f"failed with CUDA error {err} for graph {raw:#x}. The meta "
+                                f"gate already advanced this step, so replaying would desync "
+                                f"the ring irrecoverably. The worker MUST terminate; do NOT "
+                                f"catch and continue serving.")
+                        super().replay()
+                        t.record_replay_event(raw)   # event guard for the next ensure
+                    else:
+                        # eager: device apply happened at config time; here we
+                        # only validated the graph is bound (read-only).
+                        super().replay()
                     if not _KeepGraphCUDAGraph._dmx_lazy_logged:
                         _KeepGraphCUDAGraph._dmx_lazy_logged = True
-                        print("[DMX] node-toggle: lazy replay hook active", flush=True)
+                        _mode = "lazy" if getattr(t, "_lazy_active", False) else "eager"
+                        print(f"[DMX] node-toggle: replay guard active (mode={_mode})", flush=True)
                     return
             super().replay()
 
@@ -782,11 +805,12 @@ class DMXGPUWorker(Worker):
                         "was bound (is cudagraph_mode FULL/FULL_AND_PIECEWISE for decode?). "
                         "Refusing to serve with node-toggle silently inert.")
                 transport = self.adaptor.transport
+                # Arm the replay-time guard for BOTH modes (#3): eager needs the
+                # runtime-graph validation too, not just lazy.
+                global _DMX_TOGGLE_REPLAY_GUARD
+                _DMX_TOGGLE_REPLAY_GUARD = True
                 if self._dmx_lazy_toggle:
-                    # Phase 4: arm the replay() hook; defer device apply to each
-                    # graph's first replay (lazy per-graph).
-                    global _DMX_LAZY_REPLAY_HOOK
-                    _DMX_LAZY_REPLAY_HOOK = True
+                    # Phase 4: defer device apply to each graph's first replay.
                     transport.set_active_hooks_lazy(self._dmx_enabled_hooks)
                     print(f"[DMX] node-toggle: LAZY active hooks set to "
                           f"{self._dmx_enabled_hooks}")
