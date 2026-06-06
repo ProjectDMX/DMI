@@ -593,8 +593,13 @@ class RingTransport:
     def set_active_hooks(self, enabled: "Iterable[Tuple[int, int]]") -> None:
         """Set which hooks fire this step, as (hook_type, layer_no) pairs.
 
-        THE single driver for runtime node-toggle (eager apply). Must be called
-        at a step boundary with the prior graph replay complete. It:
+        EAGER apply: flips every bound exec NOW via cudaGraphNodeSetEnabled.
+        CONTRACT: only safe at a QUIESCENT point (no replay of any bound exec in
+        flight) -- e.g. once after warmup for a static config. apply_toggle does
+        NOT wait on per-graph replay events, so mutating an exec that the GPU is
+        still executing is UB. For DYNAMIC / per-step reconfigure use
+        set_active_hooks_lazy (its replay-time ensure_graph_current waits on the
+        prior replay event before mutating). It:
           1. set_enabled_hooks + apply_toggle on the engine -> device side
              (cudaGraphNodeSetEnabled on the captured producer nodes), and
           2. activates the host meta gate so pre_push_all_metas pushes metas only
