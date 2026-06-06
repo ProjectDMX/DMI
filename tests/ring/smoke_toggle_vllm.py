@@ -1,25 +1,57 @@
-"""Real FULL vLLM server smoke for node-toggle (offline LLM, in-process worker).
+"""Real FULL-decode vLLM smoke gate for node-toggle (offline LLM, in-process worker).
 
 Loads Qwen3-0.6B with the DMXGPUWorker, cudagraph_mode=FULL, node-toggle ON with
 a PARTIAL enabled set (last 4 of 28 hidden-state hooks), full pipeline -> ClickHouse.
 Exercises the real lifecycle: capture window -> producer-node recording -> bind
 captured graphs -> set_active_hooks (eager) -> per-replay graph guard -> meta gate
-+ reserve in lockstep -> drain/p2p -> DB. A desync or guard failure crashes here.
++ reserve in lockstep -> drain/p2p -> DB.
 
-Asserts (via markers grepped by the runner):
-  - bound >=1 captured graphs, nodes registered,
-  - active hooks set to the partial set,
-  - replay guard active (mode=eager) -- the #3 guard runs in vivo,
-  - generation produces text (no desync/crash),
-  - ClickHouse received rows ONLY for the enabled layers (partial-toggle lockstep).
+This is a SELF-CHECKING GATE: it DROPs its table up front (so any rows seen are
+provably from THIS run -- no historical pollution), then asserts the export
+landed rows for EXACTLY the enabled layers with the right shape, and exits
+NONZERO on any failure. SMOKE_OK + exit 0 only on full success.
+
+Note: vLLM may auto-downgrade cudagraph_mode FULL -> FULL_AND_PIECEWISE when the
+attention backend lacks full-graph support; this validates the FULL-DECODE path
+(the graphs node-toggle binds), not full FULL_AND_PIECEWISE coverage.
+
+Requires: fork vllm on PYTHONPATH, the monitoring .so, a cached model
+(SMOKE_MODEL), ClickHouse on localhost:9000.
+
+Run:  CUDA_VISIBLE_DEVICES=<free gpu> CUDA_MODULE_LOADING=EAGER HF_HUB_OFFLINE=1 \
+      VLLM_ENABLE_V1_MULTIPROCESSING=0 SMOKE_MODEL=<path> \
+      PYTHONPATH=$PWD/integration/vllm:$PWD <venv>/bin/python tests/ring/smoke_toggle_vllm.py
 """
+import gc
 import os
+import subprocess
 import sys
+import time
 
 MODEL = os.environ["SMOKE_MODEL"]
 DB_TABLE = "smoke_toggle"
 ENABLED = "0:24,0:25,0:26,0:27"          # last 4 layers of Qwen3-0.6B (28 layers)
 ENABLED_LAYERS = {24, 25, 26, 27}
+HIDDEN = 1024                              # Qwen3-0.6B hidden dim; rows are [q_len, HIDDEN]
+                                           # (q_len=1 for decode, >1 for prefill chunks)
+
+
+def ch(query: str) -> str:
+    """Run a clickhouse-client query; FAIL the smoke if the CLI errors."""
+    r = subprocess.run(["clickhouse-client", "--query", query],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(f"clickhouse-client failed ({r.returncode}): {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def fail(msg: str):
+    print(f"SMOKE_FAIL: {msg}", flush=True)
+    sys.exit(1)
+
+
+# --- fresh table: any rows seen afterwards are provably from THIS run (#2) ---
+ch(f"DROP TABLE IF EXISTS {DB_TABLE}")
 
 from vllm import LLM, SamplingParams
 
@@ -49,28 +81,40 @@ out = llm.generate(
      "In the beginning", "A short story about a robot:"],
     SamplingParams(temperature=0.0, max_tokens=48),
 )
-for o in out:
-    print(f"SMOKE_GEN: {o.outputs[0].text!r}", flush=True)
+texts = [o.outputs[0].text for o in out]
+for t in texts:
+    print(f"SMOKE_GEN: {t!r}", flush=True)
+if not all(t.strip() for t in texts):
+    fail("a prompt produced empty output (generation/desync problem)")
 
-# Clean shutdown so the async export pipeline flushes to ClickHouse (low-volume
-# runs won't hit the insert batch watermark, so a flush-on-close is required).
-import gc, time
+# Clean shutdown so the async export pipeline flushes to ClickHouse.
 del llm
 gc.collect()
 time.sleep(3.0)
 
-# Verify rows landed for ONLY the enabled layers (partial-toggle lockstep in vivo)
-# via the clickhouse-client CLI (clickhouse_driver isn't in the venv).
-import subprocess
-q = (f"SELECT layer_no, count() FROM {DB_TABLE} GROUP BY layer_no ORDER BY layer_no "
-     f"FORMAT TSV")
-res = subprocess.run(["clickhouse-client", "--query", q], capture_output=True, text=True)
-print("SMOKE_DB_RAW:\n" + (res.stdout.strip() or "<empty>"), flush=True)
-got = sorted(int(l.split("\t")[0]) for l in res.stdout.strip().splitlines() if l)
-if set(got) == ENABLED_LAYERS:
-    print("SMOKE_DB_OK: rows for EXACTLY the enabled layers (partial-toggle lockstep)", flush=True)
-elif got:
-    print(f"SMOKE_DB_MISMATCH: got {got} expected {sorted(ENABLED_LAYERS)}", flush=True)
-else:
-    print("SMOKE_DB_EMPTY", flush=True)
+# --- strict verification: rows for EXACTLY the enabled layers, right shape ---
+raw = ch(f"SELECT layer_no, count() FROM {DB_TABLE} GROUP BY layer_no ORDER BY layer_no FORMAT TSV")
+print("SMOKE_DB_RAW:\n" + (raw or "<empty>"), flush=True)
+rows = [ln.split("\t") for ln in raw.splitlines() if ln]
+got_layers = sorted(int(c[0]) for c in rows)
+total = sum(int(c[1]) for c in rows)
+
+if total == 0:
+    fail("ClickHouse received 0 rows (export/flush problem)")
+if set(got_layers) != ENABLED_LAYERS:
+    fail(f"delivered layers {got_layers} != enabled {sorted(ENABLED_LAYERS)} (lockstep desync)")
+
+import re
+shapes = ch(f"SELECT DISTINCT shape FROM {DB_TABLE} FORMAT TSV").splitlines()
+# hidden-states rows are [q_len, HIDDEN]: q_len=1 (decode) or >1 (prefill chunk).
+bad = [s for s in shapes if not re.fullmatch(rf"\[\d+,{HIDDEN}\]", s)]
+if bad:
+    fail(f"shapes with wrong hidden dim (expected [*,{HIDDEN}]): {bad}")
+
+print(f"SMOKE_DB_OK: {total} rows, layers={got_layers}, shapes={shapes} "
+      f"(partial-toggle lockstep on a real model)", flush=True)
+
+# Leave the table clean for the next run.
+ch(f"DROP TABLE IF EXISTS {DB_TABLE}")
 print("SMOKE_OK", flush=True)
+sys.exit(0)
