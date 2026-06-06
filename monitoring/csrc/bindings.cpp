@@ -258,6 +258,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
       .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
 
+  py::class_<ring_py::RingFlushStats>(m, "RingFlushStats")
+      .def_readonly("cpu_payload_head", &ring_py::RingFlushStats::cpu_payload_head)
+      .def_readonly("cpu_payload_tail_committed", &ring_py::RingFlushStats::cpu_payload_tail_committed)
+      .def_readonly("cpu_task_head", &ring_py::RingFlushStats::cpu_task_head)
+      .def_readonly("cpu_task_tail_committed", &ring_py::RingFlushStats::cpu_task_tail_committed);
+
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
              ring_py::SubmitFn submit_fn;
@@ -412,6 +418,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("notify_drain",
            &ring_py::RingEnginePy::notify_drain,
+           py::call_guard<py::gil_scoped_release>())
+      .def("get_stats", &ring_py::RingEnginePy::get_stats,
            py::call_guard<py::gil_scoped_release>())
       // --- Runtime node-toggle (Phase B) ---
       .def("enable_toggle_capture",

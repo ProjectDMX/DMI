@@ -39,6 +39,20 @@ struct RingConfig {
     uint64_t insert_queue_max_items     = 65536;
 };
 
+// Live ring flow-control counters (debug / reserve-invariant probe).
+// payload/task *_head advance on reserve() (prepare_step); *_tail_committed
+// advance as the drain thread consumes ACTUAL producer task entries. A
+// monotonically growing (head - tail_committed) gap means reserve() over-counts
+// vs what producers actually write (e.g. node-toggle reserving for disabled
+// hooks) -- the reserve invariant is held iff the ring fully drains to
+// head == tail_committed after a flush.
+struct RingFlushStats {
+    uint64_t cpu_payload_head{0};
+    uint64_t cpu_payload_tail_committed{0};
+    uint64_t cpu_task_head{0};
+    uint64_t cpu_task_tail_committed{0};
+};
+
 // Called by the p2p thread for each per-request tensor slice.
 using SubmitFn = std::function<void(
     const std::string& model_id,
@@ -165,6 +179,9 @@ public:
     // GIL.  Used by safety-net branches that need to free ring space or
     // ensure FIFO ordering before consuming the next meta out-of-band.
     void flush_and_wait();
+
+    // Snapshot the live ring head/tail counters (reserve-invariant probe).
+    RingFlushStats get_stats() const;
 
     // ---- Runtime node-toggle (Phase B) -----------------------------------
     // cudaGraph_t / cudaGraphNode_t / cudaGraphExec_t are passed as opaque

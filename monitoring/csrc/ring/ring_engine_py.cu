@@ -139,6 +139,19 @@ void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
     impl_->fifo.push_step(ctx, metas);
 }
 
+RingFlushStats RingEnginePy::get_stats() const {
+    // Reserve-invariant probe: expose the live drain-thread head/tail counters
+    // so a test can confirm the ring fully drains (head == tail_committed) after
+    // a flush -> reserve() matched actual producer writes.
+    RingFlushStats stats{};
+    auto& drain = impl_->engine.drain_thread();
+    stats.cpu_payload_head           = drain.cpu_payload_head();
+    stats.cpu_payload_tail_committed = drain.cpu_payload_tail_committed();
+    stats.cpu_task_head              = drain.cpu_task_head();
+    stats.cpu_task_tail_committed    = drain.cpu_task_tail_committed();
+    return stats;
+}
+
 // --- Runtime node-toggle (Phase B) -----------------------------------------
 void RingEnginePy::enable_toggle_capture(bool enabled) {
     { std::lock_guard<std::mutex> lk(impl_->toggle_mu); impl_->toggle_capture = enabled; }
