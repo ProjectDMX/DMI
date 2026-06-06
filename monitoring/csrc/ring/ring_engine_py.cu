@@ -11,6 +11,12 @@
 #include "ring/producer.cuh"
 #include "ring/ring_debug.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
+#include <cuda_runtime.h>
+#include <set>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <mutex>
 
 // Forward-declare symbols from producer.cu
 namespace ring {
@@ -38,6 +44,28 @@ struct RingEnginePy::Impl {
     // Tensor(a!) mutation alias passed to every producer op call.
     at::Tensor       payload_view;
 
+    // --- node-toggle registry (Phase B) ---
+    struct RegEntry { int hook_type; int layer_no; cudaGraphNode_t node;
+                      bool last_enabled{true}; };  // device default after instantiate
+    std::unordered_map<cudaGraph_t, std::vector<RegEntry>> reg_nodes;  // per captured graph
+    std::unordered_map<cudaGraph_t, cudaGraphExec_t>       reg_exec;   // graph -> exec
+    std::set<std::pair<int,int>>                           registered_hooks;  // (ht,layer) captured
+    std::set<std::pair<int,int>>                           enabled_hooks;     // single source
+    bool                                                   toggle_active{false};
+    bool                                                   toggle_capture{false};
+    uint64_t                                               last_apply_count{0};
+    // --- Phase 4: lazy per-graph apply ---
+    // target_version bumps on every enabled-set change; each graph tracks the
+    // version it was last applied to. ensure_graph_current() applies the current
+    // enabled set to ONE graph only when stale (just before that graph replays),
+    // so a reconfigure costs O(changed x graphs-actually-used). replay_event[g]
+    // is recorded after each replay so ensure can wait for the prior replay to
+    // finish before mutating the exec (SetEnabled on an executing exec is UB).
+    uint64_t                                               target_version{0};
+    std::unordered_map<cudaGraph_t, uint64_t>              applied_version;
+    std::unordered_map<cudaGraph_t, cudaEvent_t>           replay_event;
+    mutable std::mutex                                     toggle_mu;
+
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
     {
@@ -48,6 +76,9 @@ struct RingEnginePy::Impl {
             state.payload_buf,
             {static_cast<int64_t>(state.payload_cap)},
             at::TensorOptions().dtype(at::kByte).device(at::kCUDA, dev_idx));
+    }
+    ~Impl() {
+        for (auto& kv : replay_event) if (kv.second) cudaEventDestroy(kv.second);
     }
 };
 
@@ -106,6 +137,192 @@ void RingEnginePy::set_null_mode(bool enabled) {
 
 void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
     impl_->fifo.push_step(ctx, metas);
+}
+
+// --- Runtime node-toggle (Phase B) -----------------------------------------
+void RingEnginePy::enable_toggle_capture(bool enabled) {
+    { std::lock_guard<std::mutex> lk(impl_->toggle_mu); impl_->toggle_capture = enabled; }
+    ring_set_toggle_capture(enabled);   // tell the producer op to record nodes
+}
+
+bool RingEnginePy::toggle_capture_enabled() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    return impl_->toggle_capture;
+}
+
+void RingEnginePy::register_capture_node(uint64_t graph, int hook_type, int layer_no, uint64_t node) {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    impl_->reg_nodes[reinterpret_cast<cudaGraph_t>(graph)].push_back(
+        Impl::RegEntry{hook_type, layer_no, reinterpret_cast<cudaGraphNode_t>(node)});
+    impl_->registered_hooks.insert({hook_type, layer_no});
+}
+
+void RingEnginePy::bind_graph_exec(uint64_t graph, uint64_t exec) {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    impl_->reg_exec[reinterpret_cast<cudaGraph_t>(graph)] =
+        reinterpret_cast<cudaGraphExec_t>(exec);
+}
+
+void RingEnginePy::set_enabled_hooks(const std::vector<std::pair<int,int>>& enabled) {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    impl_->enabled_hooks.clear();
+    for (const auto& p : enabled) impl_->enabled_hooks.insert(p);
+    impl_->toggle_active = true;
+    ++impl_->target_version;   // mark all graphs stale for lazy ensure (no-op for eager)
+}
+
+int RingEnginePy::apply_toggle() {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    cudaError_t first = cudaSuccess;
+    uint64_t applied = 0;
+    for (auto& kv : impl_->reg_exec) {
+        cudaGraphExec_t exec = kv.second;
+        auto it = impl_->reg_nodes.find(kv.first);
+        if (it == impl_->reg_nodes.end()) continue;
+        for (auto& e : it->second) {
+            const bool on = impl_->enabled_hooks.count({e.hook_type, e.layer_no}) > 0;
+            // Diff: only touch nodes whose desired state changed since the last
+            // apply (last_enabled tracks the exec's actual state -- DMI is the
+            // only toggler of its nodes). Adaptive flips of a few hooks then cost
+            // O(#changed) SetEnabled calls instead of O(#nodes).
+            if (on == e.last_enabled) continue;
+            cudaError_t err = cudaGraphNodeSetEnabled(exec, e.node, on ? 1u : 0u);
+            if (err != cudaSuccess) { if (first == cudaSuccess) first = err; continue; }
+            e.last_enabled = on;   // update only on success
+            ++applied;
+        }
+    }
+    impl_->last_apply_count = applied;
+    return static_cast<int>(first);
+}
+
+uint64_t RingEnginePy::bound_graph_count() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    return impl_->reg_exec.size();
+}
+
+uint64_t RingEnginePy::last_apply_count() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    return impl_->last_apply_count;
+}
+
+bool RingEnginePy::toggle_registry_uniform() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    // True iff every captured graph registered the same set of (hook_type,layer).
+    // The meta gate keys on (ht,layer) globally; if graphs differ, a hook present
+    // in one graph but absent from the one replayed this step would push a meta
+    // with no payload -> desync. vLLM captures all hooks in every graph (uniform).
+    const std::set<std::pair<int,int>>* ref = nullptr;
+    std::set<std::pair<int,int>> ref_set;
+    for (const auto& kv : impl_->reg_nodes) {
+        std::set<std::pair<int,int>> s;
+        for (const auto& e : kv.second) s.insert({e.hook_type, e.layer_no});
+        if (!ref) { ref_set = std::move(s); ref = &ref_set; }
+        else if (s != ref_set) return false;
+    }
+    return true;
+}
+
+bool RingEnginePy::is_hook_enabled(int hook_type, int layer_no) const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    if (!impl_->toggle_active) return true;   // toggle inactive -> all hooks on
+    // Desync guard (#14): the meta gate returns true only if the hook is BOTH
+    // enabled AND actually registered (has a captured producer node). Otherwise
+    // an enabled-but-uncaptured hook would push a meta with no matching payload
+    // -> p2p desync. With this, "meta pushed" <=> "a producer fires" in all cases.
+    const std::pair<int,int> k{hook_type, layer_no};
+    return impl_->enabled_hooks.count(k) > 0 && impl_->registered_hooks.count(k) > 0;
+}
+
+std::vector<int> RingEnginePy::effective_enabled_mask(
+    const std::vector<std::pair<int,int>>& query) const {
+    // Batched is_hook_enabled (same semantics, one lock, one pybind crossing):
+    // toggle inactive -> all on; else enabled AND registered (#14 guard).
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    const bool inactive = !impl_->toggle_active;
+    std::vector<int> mask;
+    mask.reserve(query.size());
+    for (const auto& k : query) {
+        mask.push_back((inactive ||
+                        (impl_->enabled_hooks.count(k) > 0 &&
+                         impl_->registered_hooks.count(k) > 0)) ? 1 : 0);
+    }
+    return mask;
+}
+
+int RingEnginePy::ensure_graph_current(uint64_t graph) {
+    // Phase 4 lazy: apply the current enabled set to ONE graph, only if it is
+    // stale (applied_version != target_version). Called just before that graph
+    // replays. Same per-node diff as apply_toggle, but scoped to one graph.
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    cudaGraph_t g = reinterpret_cast<cudaGraph_t>(graph);
+    auto av = impl_->applied_version.find(g);
+    const uint64_t cur = (av == impl_->applied_version.end()) ? 0 : av->second;
+    if (cur == impl_->target_version) return 0;   // current -> fast no-op (common path)
+
+    auto ex = impl_->reg_exec.find(g);
+    if (ex == impl_->reg_exec.end()) return 0;     // unregistered/unbound graph -> skip
+    auto it = impl_->reg_nodes.find(g);
+    if (it == impl_->reg_nodes.end()) return 0;
+
+    // Event guard: the prior replay of THIS exec must be complete before we
+    // mutate it (host can run ahead of the GPU). Wait on its last-replay event.
+    auto ev = impl_->replay_event.find(g);
+    if (ev != impl_->replay_event.end() && ev->second) cudaEventSynchronize(ev->second);
+
+    cudaError_t first = cudaSuccess;
+    for (auto& e : it->second) {
+        const bool on = impl_->enabled_hooks.count({e.hook_type, e.layer_no}) > 0;
+        if (on == e.last_enabled) continue;
+        cudaError_t err = cudaGraphNodeSetEnabled(ex->second, e.node, on ? 1u : 0u);
+        if (err != cudaSuccess) { if (first == cudaSuccess) first = err; continue; }
+        e.last_enabled = on;
+    }
+    impl_->applied_version[g] = impl_->target_version;
+    return static_cast<int>(first);
+}
+
+void RingEnginePy::record_replay_event(uint64_t graph) {
+    // Record a (timing-disabled) event on the current stream right after a
+    // graph's replay, so a later ensure_graph_current() can wait for it before
+    // mutating that exec.
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    cudaGraph_t g = reinterpret_cast<cudaGraph_t>(graph);
+    if (impl_->reg_exec.find(g) == impl_->reg_exec.end()) return;  // only track bound graphs
+    cudaEvent_t& ev = impl_->replay_event[g];
+    if (ev == nullptr) {
+        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) return;
+    }
+    cudaEventRecord(ev, at::cuda::getCurrentCUDAStream().stream());
+}
+
+uint64_t RingEnginePy::toggle_node_count() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    uint64_t n = 0;
+    for (const auto& kv : impl_->reg_nodes) n += kv.second.size();
+    return n;
+}
+
+void RingEnginePy::clear_toggle_registry() {
+    {
+        std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+        impl_->reg_nodes.clear();
+        impl_->reg_exec.clear();
+        impl_->registered_hooks.clear();
+        // Full reset: also drop the enabled set + deactivate, so a stale gate
+        // (is_hook_enabled) can't skip every meta after a clear (#2). Disable
+        // capture too so a later capture doesn't record into a cleared engine (#3).
+        impl_->enabled_hooks.clear();
+        impl_->toggle_active = false;
+        impl_->toggle_capture = false;
+        impl_->last_apply_count = 0;
+        // Phase 4 lazy state: reset versions + destroy per-graph replay events.
+        impl_->target_version = 0;
+        impl_->applied_version.clear();
+        for (auto& kv : impl_->replay_event) if (kv.second) cudaEventDestroy(kv.second);
+        impl_->replay_event.clear();
+    }
+    ring_set_toggle_capture(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -217,10 +434,23 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     }
 
     // Case A: step fits.  Check available space for BOTH payload AND tasks.
-    const uint64_t payload_avail = pcap -
-        (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
-    const uint64_t task_avail = tcap -
-        (drain.cpu_task_head() - drain.cpu_task_tail_committed());
+    // Clamp `used` to [0, cap] on BOTH ends (node-toggle reserve-invariant):
+    //   - head < tail: a small constant skew exists because producers that fire
+    //     during CUDA-graph capture get drained (advancing the tail) with no
+    //     matching reserve() (which only runs per real step) -> the ring is in
+    //     fact drained, so used = 0 (avail = cap). Computing head-tail here would
+    //     underflow uint64 to a huge value -> avail = 0 -> a spurious ring-full
+    //     flush (main-stream sync) every step.
+    //   - head-tail > cap: over-reserve drift; fail safe with avail = 0 rather
+    //     than underflowing to a huge "available" that disables the check.
+    const uint64_t ph = drain.cpu_payload_head();
+    const uint64_t pt = drain.cpu_payload_tail_committed();
+    const uint64_t payload_used = (ph > pt) ? (ph - pt) : 0;
+    const uint64_t payload_avail = (payload_used >= pcap) ? 0 : pcap - payload_used;
+    const uint64_t th = drain.cpu_task_head();
+    const uint64_t tt = drain.cpu_task_tail_committed();
+    const uint64_t task_used = (th > tt) ? (th - tt) : 0;
+    const uint64_t task_avail = (task_used >= tcap) ? 0 : tcap - task_used;
 
     if (step_total_bytes <= payload_avail && num_hooks <= task_avail) {
         drain.reserve(step_total_bytes, num_hooks);

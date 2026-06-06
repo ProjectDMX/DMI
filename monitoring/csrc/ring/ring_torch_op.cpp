@@ -28,8 +28,18 @@ void ring_diag_print_host_counters() {
     fprintf(stderr, "  total=%lu\n", total);
 }
 
+// Node-toggle capture flag (process-global, like g_active_engine). Set true
+// only during the warmup CUDA-graph capture window via ring_set_toggle_capture.
+static bool g_toggle_capture = false;
+void ring_set_toggle_capture(bool enabled) {
+    g_toggle_capture = enabled;
+}
+
 void ring_set_active_engine(ring_py::RingEnginePy* e) {
     g_active_engine = e;
+    // Deactivation must also disable capture: g_toggle_capture is process-global,
+    // so a stale "true" after the engine is cleared would record into nothing (#3).
+    if (e == nullptr) ring_set_toggle_capture(false);
 }
 
 // Three side-effect ops, one per use case:
@@ -87,6 +97,28 @@ void ring_producer_impl(
             static_cast<uint64_t>(tensor.nbytes()),
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
+
+        // Node-toggle (option B: basic producer only -- toggle requires
+        // gpu_padding_strip=False so every hook dispatches here, not to
+        // producer_prefix/producer_chunked). If capturing, record THIS
+        // producer's kernel node (the current tail dependency) so it can be
+        // enabled/disabled post-capture via cudaGraphNodeSetEnabled.
+        if (g_toggle_capture) {
+            cudaStreamCaptureStatus  cap_st    = cudaStreamCaptureStatusNone;
+            unsigned long long       cap_id    = 0;
+            cudaGraph_t              cap_graph = nullptr;
+            const cudaGraphNode_t*   cap_deps  = nullptr;
+            const cudaGraphEdgeData* cap_edges = nullptr;  // CUDA 13 signature
+            size_t                   cap_nd    = 0;
+            if (cudaStreamGetCaptureInfo(stream.stream(), &cap_st, &cap_id, &cap_graph,
+                                         &cap_deps, &cap_edges, &cap_nd) == cudaSuccess
+                && cap_st == cudaStreamCaptureStatusActive && cap_nd >= 1) {
+                g_active_engine->register_capture_node(
+                    reinterpret_cast<uint64_t>(cap_graph),
+                    static_cast<int>(hook_type), static_cast<int>(hook_id),
+                    reinterpret_cast<uint64_t>(cap_deps[cap_nd - 1]));
+            }
+        }
     }
 }
 
