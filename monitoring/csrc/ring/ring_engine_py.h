@@ -216,7 +216,14 @@ public:
     // replays). record_replay_event(): record a stream event after that graph's
     // replay so a later ensure can wait for it before mutating the exec.
     int  ensure_graph_current(uint64_t graph);
-    void record_replay_event(uint64_t graph);
+    // Returns the CUDA error from event create/record (0 = ok). Nonzero must be
+    // treated as FATAL by the caller (a missing/stale replay event would let a
+    // later ensure mutate an executing exec -> UB).
+    int  record_replay_event(uint64_t graph);
+    // Test-only: force ensure_graph_current to fail with `code` (0 disables);
+    // and query whether a graph's applied_version == target_version.
+    void _test_force_apply_error(int code);
+    bool _test_applied_current(uint64_t graph) const;
     uint64_t toggle_node_count() const;
     uint64_t bound_graph_count() const;          // #bound execs (0 => apply is a no-op)
     uint64_t last_apply_count() const;           // #SetEnabled calls in last apply_toggle

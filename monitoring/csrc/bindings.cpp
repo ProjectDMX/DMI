@@ -456,6 +456,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("toggle_registry_uniform", &ring_py::RingEnginePy::toggle_registry_uniform)
       .def("is_graph_ready", &ring_py::RingEnginePy::is_graph_ready, py::arg("graph"))
       .def("toggle_registry_complete", &ring_py::RingEnginePy::toggle_registry_complete)
+      .def("_test_force_apply_error", &ring_py::RingEnginePy::_test_force_apply_error, py::arg("code"))
+      .def("_test_applied_current", &ring_py::RingEnginePy::_test_applied_current, py::arg("graph"))
       .def("clear_toggle_registry", &ring_py::RingEnginePy::clear_toggle_registry);
 
   // Register the active ring engine pointer so C++ ring_producer_impl can

@@ -700,10 +700,12 @@ class RingTransport:
         cudaGraph_t handle the graph was bound with."""
         return self._ring_engine.ensure_graph_current(raw_graph)
 
-    def record_replay_event(self, raw_graph: int) -> None:
+    def record_replay_event(self, raw_graph: int) -> int:
         """Lazy event guard: record a stream event after a graph's replay so a
-        later ensure_graph_current() waits for it before mutating that exec."""
-        self._ring_engine.record_replay_event(raw_graph)
+        later ensure_graph_current() waits for it before mutating that exec.
+        Returns the CUDA error (0 = ok); nonzero is FATAL (a missing event would
+        let a later ensure mutate an executing exec)."""
+        return self._ring_engine.record_replay_event(raw_graph)
 
     def clear_toggle(self) -> None:
         """Paired teardown: clear the engine's toggle registry AND deactivate the

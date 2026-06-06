@@ -65,6 +65,10 @@ struct RingEnginePy::Impl {
     std::unordered_map<cudaGraph_t, uint64_t>              applied_version;
     std::unordered_map<cudaGraph_t, cudaEvent_t>           replay_event;
     mutable std::mutex                                     toggle_mu;
+    // Test-only fault injection: when nonzero, ensure_graph_current returns this
+    // code as if a device apply failed (no SetEnabled, no version bump). Lets
+    // the failure-path gates exercise #1/#2 error propagation deterministically.
+    int                                                    force_apply_error{0};
 
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
@@ -278,10 +282,19 @@ int RingEnginePy::ensure_graph_current(uint64_t graph) {
     auto it = impl_->reg_nodes.find(g);
     if (it == impl_->reg_nodes.end()) return 0;
 
+    // Test fault injection (#2 gate): fail before any mutation / version bump.
+    if (impl_->force_apply_error != 0) return impl_->force_apply_error;
+
     // Event guard: the prior replay of THIS exec must be complete before we
     // mutate it (host can run ahead of the GPU). Wait on its last-replay event.
+    // (#1) If the wait itself fails we CANNOT confirm the prior replay finished,
+    // so do NOT touch the exec -- return the error; the caller treats it as a
+    // FATAL desync risk. No nodes mutated, version left stale.
     auto ev = impl_->replay_event.find(g);
-    if (ev != impl_->replay_event.end() && ev->second) cudaEventSynchronize(ev->second);
+    if (ev != impl_->replay_event.end() && ev->second) {
+        cudaError_t se = cudaEventSynchronize(ev->second);
+        if (se != cudaSuccess) return static_cast<int>(se);
+    }
 
     cudaError_t first = cudaSuccess;
     for (auto& e : it->second) {
@@ -302,18 +315,37 @@ int RingEnginePy::ensure_graph_current(uint64_t graph) {
     return static_cast<int>(first);
 }
 
-void RingEnginePy::record_replay_event(uint64_t graph) {
+int RingEnginePy::record_replay_event(uint64_t graph) {
     // Record a (timing-disabled) event on the current stream right after a
     // graph's replay, so a later ensure_graph_current() can wait for it before
-    // mutating that exec.
+    // mutating that exec. (#1) Returns the CUDA error: if event create OR record
+    // fails, the stored event would be stale/missing and a later ensure could
+    // wrongly believe a prior replay finished -> mutate an executing exec (UB).
+    // The caller treats nonzero as FATAL so we never reach that state.
     std::lock_guard<std::mutex> lk(impl_->toggle_mu);
     cudaGraph_t g = reinterpret_cast<cudaGraph_t>(graph);
-    if (impl_->reg_exec.find(g) == impl_->reg_exec.end()) return;  // only track bound graphs
+    if (impl_->reg_exec.find(g) == impl_->reg_exec.end()) return 0;  // not bound -> nothing to track
     cudaEvent_t& ev = impl_->replay_event[g];
     if (ev == nullptr) {
-        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) return;
+        cudaError_t ce = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+        if (ce != cudaSuccess) { ev = nullptr; return static_cast<int>(ce); }
     }
-    cudaEventRecord(ev, at::cuda::getCurrentCUDAStream().stream());
+    cudaError_t re = cudaEventRecord(ev, at::cuda::getCurrentCUDAStream().stream());
+    return static_cast<int>(re);
+}
+
+// --- test-only fault injection / introspection (see Impl::force_apply_error) -
+void RingEnginePy::_test_force_apply_error(int code) {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    impl_->force_apply_error = code;
+}
+
+bool RingEnginePy::_test_applied_current(uint64_t graph) const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    cudaGraph_t g = reinterpret_cast<cudaGraph_t>(graph);
+    auto av = impl_->applied_version.find(g);
+    const uint64_t cur = (av == impl_->applied_version.end()) ? 0 : av->second;
+    return cur == impl_->target_version;
 }
 
 uint64_t RingEnginePy::toggle_node_count() const {
