@@ -69,6 +69,10 @@ struct RingEnginePy::Impl {
     // code as if a device apply failed (no SetEnabled, no version bump). Lets
     // the failure-path gates exercise #1/#2 error propagation deterministically.
     int                                                    force_apply_error{0};
+    // Count of capture-time recordings whose tail-dependency node was NOT a
+    // kernel node (so it could not be the producer kernel). Nonzero => the
+    // registry may be misaligned; set_active_hooks fails loud (fail-closed).
+    uint64_t                                               capture_anomaly{0};
 
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
@@ -172,6 +176,16 @@ void RingEnginePy::register_capture_node(uint64_t graph, int hook_type, int laye
     impl_->reg_nodes[reinterpret_cast<cudaGraph_t>(graph)].push_back(
         Impl::RegEntry{hook_type, layer_no, reinterpret_cast<cudaGraphNode_t>(node)});
     impl_->registered_hooks.insert({hook_type, layer_no});
+}
+
+void RingEnginePy::note_capture_anomaly() {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    ++impl_->capture_anomaly;
+}
+
+uint64_t RingEnginePy::capture_anomaly_count() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    return impl_->capture_anomaly;
 }
 
 void RingEnginePy::bind_graph_exec(uint64_t graph, uint64_t exec) {
@@ -375,6 +389,22 @@ bool RingEnginePy::toggle_registry_complete() const {
 void RingEnginePy::clear_toggle_registry() {
     {
         std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+        // Restore device state BEFORE dropping the registry: re-enable any node
+        // we disabled, so a graph that keeps replaying after a clear does not run
+        // with producers OFF while the (now-inactive) host gate pushes all metas
+        // -> desync. Best-effort, only for bound execs; safe at the quiescent
+        // call sites (warmup-start / teardown, no replay in flight). To revert to
+        // all-on DURING serving, prefer set_active_hooks(full_set) (event-guarded)
+        // over clear_toggle.
+        for (auto& kv : impl_->reg_nodes) {
+            auto ex = impl_->reg_exec.find(kv.first);
+            if (ex == impl_->reg_exec.end()) continue;
+            for (auto& e : kv.second) {
+                if (e.last_enabled) continue;
+                if (cudaGraphNodeSetEnabled(ex->second, e.node, 1u) == cudaSuccess)
+                    e.last_enabled = true;
+            }
+        }
         impl_->reg_nodes.clear();
         impl_->reg_exec.clear();
         impl_->registered_hooks.clear();
@@ -385,6 +415,7 @@ void RingEnginePy::clear_toggle_registry() {
         impl_->toggle_active = false;
         impl_->toggle_capture = false;
         impl_->last_apply_count = 0;
+        impl_->capture_anomaly = 0;
         // Phase 4 lazy state: reset versions + destroy per-graph replay events.
         impl_->target_version = 0;
         impl_->applied_version.clear();

@@ -76,6 +76,16 @@ until the ring fills or shutdown. The default `dmx_drain_flush_timeout_us=50000`
 (50 ms, when toggle is on) forces a periodic flush. Lower it for tighter export
 latency; raise/zero it if you batch large volumes and prefer threshold-only.
 
+## Scope (current)
+
+The enabled set is **engine/step-level**, applied at a step boundary — **not
+per-request-within-a-batch**. When multiple requests are batched into one decode
+step, a hook is either on or off for the whole batch tensor. True per-request
+adaptive monitoring (different hooks per request in the same step) would need a
+request → step-union → graph layering plus row-sparse producer copy; that's a
+future feature, not implemented here. For now, take the per-step union of what
+any request needs and route/filter downstream.
+
 ## Runtime (programmatic) reconfigure
 
 For dynamic toggling from your own code (e.g. an adaptive monitor), the transport
