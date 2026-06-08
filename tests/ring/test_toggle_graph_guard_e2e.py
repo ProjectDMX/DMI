@@ -131,9 +131,39 @@ def test_replay_guard():
     eng.stop()
 
 
+def test_capture_anomaly_guard():
+    """A capture-time non-kernel tail node (recorded as an anomaly) must make
+    set_active_hooks fail loud (fail-closed) -- registering a wrong node would
+    toggle the wrong graph node. Simulated via the test-only note_capture_anomaly."""
+    print("[capture-anomaly fail-closed]")
+    eng = _new_engine()
+    ne.ring_set_active_engine(eng)
+    eng.set_null_mode(True)
+    payload = eng.payload_tensor()
+    transport = RingTransport(eng)
+    transport.set_model_cfg(ModelShapeConfig(hidden_dim=HID, num_heads=2, num_kv_heads=2,
+                                             head_dim=HID // 2, dtype=torch.float32))
+    transport._active_specs = [HookSpec(hook_type=HT, module=None, layer_no=j) for j in range(N)]
+    gA, _sa = _capture(eng, payload, record=True)
+    eng.bind_graph_exec(gA.raw_cuda_graph(), gA.raw_cuda_graph_exec())
+    check(eng.capture_anomaly_count() == 0, "real producer capture -> 0 anomalies (validation ran clean)")
+
+    eng.note_capture_anomaly()   # simulate a non-kernel tail node recorded during capture
+    raised = False
+    try:
+        transport.set_active_hooks([(HT, 0)])
+    except RuntimeError as e:
+        raised = "non-kernel" in str(e)
+    check(raised, "set_active_hooks RAISES when a capture anomaly was recorded (fail-closed)")
+
+    ne.ring_clear_active_engine()
+    eng.stop()
+
+
 def main():
     test_completeness_guard()
     test_replay_guard()
+    test_capture_anomaly_guard()
     print(f"\n{'ALL PASS' if fails == 0 else f'{fails} FAILURES'}")
     return 1 if fails else 0
 

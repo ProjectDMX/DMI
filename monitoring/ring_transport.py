@@ -638,6 +638,12 @@ class RingTransport:
                 "set_active_hooks: toggle registry incomplete -- the set of graphs "
                 "with recorded producer nodes does not match the set of bound execs. "
                 "Every captured graph must be bound (bind_graph_exec) and vice versa.")
+        if eng.capture_anomaly_count() > 0:
+            raise RuntimeError(
+                "set_active_hooks: capture recorded %d non-kernel tail node(s) -- the "
+                "producer node registry may be misaligned (multi-op producer / capture "
+                "event-join / unexpected topology). Refusing to activate (fail-closed)."
+                % eng.capture_anomaly_count())
         pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
         eng.set_enabled_hooks(pairs)
         err = eng.apply_toggle()
@@ -669,6 +675,11 @@ class RingTransport:
                 "set_active_hooks_lazy: toggle registry incomplete -- node-registry and "
                 "exec-binding key sets differ (some captured graph unbound, or some "
                 "bound graph has no recorded nodes).")
+        if eng.capture_anomaly_count() > 0:
+            raise RuntimeError(
+                "set_active_hooks_lazy: capture recorded %d non-kernel tail node(s); "
+                "producer node registry may be misaligned. Refusing to activate."
+                % eng.capture_anomaly_count())
         pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
         eng.set_enabled_hooks(pairs)        # bumps target_version; device apply deferred
         self._toggle_gate_active = True

@@ -113,10 +113,22 @@ void ring_producer_impl(
             if (cudaStreamGetCaptureInfo(stream.stream(), &cap_st, &cap_id, &cap_graph,
                                          &cap_deps, &cap_edges, &cap_nd) == cudaSuccess
                 && cap_st == cudaStreamCaptureStatusActive && cap_nd >= 1) {
-                g_active_engine->register_capture_node(
-                    reinterpret_cast<uint64_t>(cap_graph),
-                    static_cast<int>(hook_type), static_cast<int>(hook_id),
-                    reinterpret_cast<uint64_t>(cap_deps[cap_nd - 1]));
+                // The producer is a single kernel launch, so the capture tail
+                // dependency should be a kernel node. Validate it (fail-closed):
+                // if the tail node is NOT a kernel (multi-op producer, capture
+                // event-join, or unexpected topology), do NOT register a wrong
+                // node -- flag an anomaly so set_active_hooks refuses to activate.
+                cudaGraphNode_t node = cap_deps[cap_nd - 1];
+                cudaGraphNodeType ntype;
+                if (cudaGraphNodeGetType(node, &ntype) == cudaSuccess
+                    && ntype == cudaGraphNodeTypeKernel) {
+                    g_active_engine->register_capture_node(
+                        reinterpret_cast<uint64_t>(cap_graph),
+                        static_cast<int>(hook_type), static_cast<int>(hook_id),
+                        reinterpret_cast<uint64_t>(node));
+                } else {
+                    g_active_engine->note_capture_anomaly();
+                }
             }
         }
     }

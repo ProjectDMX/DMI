@@ -196,6 +196,10 @@ public:
     bool toggle_capture_enabled() const;
     // Called from the producer op during capture (C++ only, not bound).
     void register_capture_node(uint64_t graph, int hook_type, int layer_no, uint64_t node);
+    // Called from the producer op during capture when the recorded tail node is
+    // NOT a kernel node (could not be the producer) -> fail-closed signal.
+    void note_capture_anomaly();
+    uint64_t capture_anomaly_count() const;     // >0 => registry suspect, refuse to activate
     // Bind a captured graph to its instantiated exec (post-warmup).
     void bind_graph_exec(uint64_t graph, uint64_t exec);
     // Set the enabled (hook_type, layer_no) set (the single source).
