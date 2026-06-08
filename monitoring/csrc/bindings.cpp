@@ -421,7 +421,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("get_stats", &ring_py::RingEnginePy::get_stats,
            py::call_guard<py::gil_scoped_release>())
-      // --- Runtime node-toggle (Phase B) ---
+      // --- Runtime node-toggle ---
       .def("enable_toggle_capture",
            &ring_py::RingEnginePy::enable_toggle_capture,
            py::arg("enabled"))

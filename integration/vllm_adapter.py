@@ -21,8 +21,8 @@ Key pieces:
     ``VLLMAdaptor`` and delegates per-step work to it.  Architecture
     remap (GPT2LMHeadModel -> GPT2PLMHeadModel etc.) stays here.
   * Module-level ``register_preset("vllm-full", ...)`` -- relocated
-    from ``monitoring/selection.py``'s default ``_HOOK_SELECTIONS``
-    (deferred from Phase 1.5 per the unified-adaptor plan).  Lands as
+    from ``monitoring/selection.py``'s default ``_HOOK_SELECTIONS``.
+    Lands as
     a side-effect of importing this module.
 
 """
@@ -63,7 +63,7 @@ from integration.model_shape import _make_model_shape_from_hf_config
 
 
 # ---------------------------------------------------------------------------
-# vLLM-full preset registration (deferred from Phase 1.5).
+# vLLM-full preset registration.
 #
 # Moved out of monitoring/selection.py's default _HOOK_SELECTIONS so the
 # core selection module is framework-neutral.  Registers when this
@@ -159,8 +159,8 @@ class VLLMAdaptor(BackendAdaptor):
         self._step_counter: int = 0
         # gpu_padding_strip mode: when True, the producer copies only
         # actual_q_len * row_bytes per eligible hook (instead of the
-        # full padded captured tensor).  Default False = today's
-        # behavior verbatim.  When True, attach_model allocates the
+        # full padded captured tensor).  Default False = no strip.
+        # When True, attach_model allocates the
         # shared row_count tensor pair and wires each eligible
         # HookPoint's _strip_tensor + _strip_row_bytes; build_step_context
         # populates ctx.actual_q_len; before_forward does the per-step
@@ -464,16 +464,16 @@ def _row_bytes_for_spec(spec, model_cfg) -> int:
 # ---------------------------------------------------------------------------
 # DMXGPUWorker
 # ---------------------------------------------------------------------------
-# Node-toggle (Phase 3b) helpers
+# Node-toggle helpers
 # ---------------------------------------------------------------------------
 
 # Armed (True) whenever a node-toggle gate is active (eager OR lazy). The
 # keep_graph CUDAGraph.replay() override then runs the replay-time graph guard:
 #   - validate the graph is registered+bound (else a runtime-captured graph
 #     would replay with default-ON producers while the meta gate filters ->
-#     desync); FATAL if not (#3).
+#     desync); FATAL if not.
 #   - lazy mode only: apply the deferred toggle (ensure_graph_current) and check
-#     its result (#1); eager mode: validation only (apply happened at config
+#     its result; eager mode: validation only (apply happened at config
 #     time -- read-only, per the eager/lazy separation).
 _DMX_TOGGLE_REPLAY_GUARD = False
 _CUDAGRAPH_KEEP_PATCHED = False
@@ -482,7 +482,7 @@ _CUDAGRAPH_KEEP_PATCHED = False
 def _parse_enabled_hooks(s: Any):
     """Parse the dmx_enabled_hooks config into an enabled (ht, layer) list.
 
-    Three distinct meanings (#5 -- no overloading of the empty string, no
+    Three distinct meanings (no overloading of the empty string, no
     nonexistent-hook hack):
       - not provided / "" -> None  : toggle gate INACTIVE (all hooks fire)
       - "none"            -> []    : explicit EMPTY set -> toggle-0 (all off)
@@ -548,7 +548,7 @@ def _patch_cudagraph_keep_graph() -> None:
                 t = ring_transport.get_active()
                 if t is not None and getattr(t, "_toggle_gate_active", False):
                     raw = self.raw_cuda_graph()
-                    # (#3) The graph about to replay MUST be a registered+bound
+                    # The graph about to replay MUST be a registered+bound
                     # toggle graph. A graph vLLM captured at RUNTIME (new
                     # batch_descriptor, after the warmup capture window closed)
                     # has no recorded producer nodes and no bound exec -> its
@@ -567,7 +567,7 @@ def _patch_cudagraph_keep_graph() -> None:
                             f"(Fix: ensure all decode batch_descriptors are captured during "
                             f"warmup, or add runtime graph registration.)")
                     if getattr(t, "_lazy_active", False):
-                        # (#1) lazy: apply the deferred toggle now; a nonzero
+                        # Lazy: apply the deferred toggle now; a nonzero
                         # result is FATAL (metas already pushed for the new set).
                         err = t.ensure_graph_current(raw)
                         if err != 0:
@@ -578,7 +578,7 @@ def _patch_cudagraph_keep_graph() -> None:
                                 f"the ring irrecoverably. The worker MUST terminate; do NOT "
                                 f"catch and continue serving.")
                         super().replay()
-                        # (#1) Record the replay event; if recording fails the
+                        # Record the replay event; if recording fails the
                         # next ensure could mutate an executing exec (UB) -> FATAL.
                         rerr = t.record_replay_event(raw)
                         if rerr != 0:
@@ -652,12 +652,12 @@ class DMXGPUWorker(Worker):
         ch_parallelism = int(
             _cfg(ac, "dmx_ch_parallelism", "DMX_CH_PARALLELISM", 10)
         )
-        # Runtime node-toggle (Phase 3b). Default off -> behaviour unchanged.
+        # Runtime node-toggle. Default off -> behaviour unchanged.
         # dmx_enabled_hooks: optional static enabled set "hook_type:layer,..."
         # applied once after warmup; empty -> toggle armed but gate inactive.
         node_toggle = _cfg(ac, "dmx_node_toggle", "DMX_NODE_TOGGLE", False)
         enabled_hooks_s = _cfg(ac, "dmx_enabled_hooks", "DMX_ENABLED_HOOKS", "")
-        # Phase 4 lazy per-graph toggle (defer device apply to per-graph replay).
+        # Lazy per-graph toggle (defer device apply to per-graph replay).
         lazy_toggle = _cfg(ac, "dmx_lazy_toggle", "DMX_LAZY_TOGGLE", False)
         self._dmx_node_toggle = bool(node_toggle)
         self._dmx_lazy_toggle = bool(lazy_toggle)
@@ -699,10 +699,9 @@ class DMXGPUWorker(Worker):
         # sits in the ring until the buffer fills or a final flush-on-close. A
         # nonzero timeout forces the drain to flush pending entries after that
         # idle window.
-        # Default: 50 ms when node-toggle is ON (sparse by design -- matches the
-        # original toggle branch's default so partial-toggle users get prompt
-        # export without manual tuning); 0 (threshold-only, legacy) otherwise, to
-        # preserve main's non-toggle behaviour. Override via dmx_drain_flush_timeout_us.
+        # Default: 50 ms when node-toggle is ON (sparse by design, so partial
+        # toggle exports promptly without manual tuning); 0 (threshold-only)
+        # otherwise. Override via dmx_drain_flush_timeout_us.
         _default_flush_us = 50000 if node_toggle else 0
         ring_cfg.drain_flush_timeout_us = int(_cfg(
             ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US",
@@ -829,13 +828,13 @@ class DMXGPUWorker(Worker):
         if toggle:
             eng = self.adaptor.ring_engine
             n_bound = self._dmx_bind_captured_graphs()
-            eng.enable_toggle_capture(False)   # close the window (#1)
+            eng.enable_toggle_capture(False)   # close the window
             print(f"[DMX] node-toggle: bound {n_bound} captured graph(s), "
                   f"{eng.toggle_node_count()} nodes registered")
             if self._dmx_enabled_hooks is not None:
                 if n_bound == 0:
                     # Requested a subset but nothing bound (e.g. cudagraph_mode not
-                    # FULL) -> refuse to serve silently with all hooks on (#2).
+                    # FULL) -> refuse to serve silently with all hooks on.
                     raise RuntimeError(
                         "dmx_node_toggle + dmx_enabled_hooks were set but no CUDA graph "
                         "was bound. Node-toggle requires cudagraph_mode=FULL for decode "
@@ -844,12 +843,12 @@ class DMXGPUWorker(Worker):
                         "and would fail the uniform-hook-set requirement -- use FULL. "
                         "Refusing to serve with node-toggle silently inert.")
                 transport = self.adaptor.transport
-                # Arm the replay-time guard for BOTH modes (#3): eager needs the
+                # Arm the replay-time guard for BOTH modes: eager needs the
                 # runtime-graph validation too, not just lazy.
                 global _DMX_TOGGLE_REPLAY_GUARD
                 _DMX_TOGGLE_REPLAY_GUARD = True
                 if self._dmx_lazy_toggle:
-                    # Phase 4: defer device apply to each graph's first replay.
+                    # Lazy: defer device apply to each graph's first replay.
                     transport.set_active_hooks_lazy(self._dmx_enabled_hooks)
                     print(f"[DMX] node-toggle: LAZY active hooks set to "
                           f"{self._dmx_enabled_hooks}")
@@ -888,7 +887,7 @@ class DMXGPUWorker(Worker):
                     if g is None:
                         continue
                     # Don't re-instantiate if an exec already exists (that would
-                    # destroy it, #3). raw_cuda_graph_exec() raises until the graph
+                    # destroy it). raw_cuda_graph_exec() raises until the graph
                     # is instantiated -> instantiate exactly once in that case.
                     try:
                         exec_ptr = g.raw_cuda_graph_exec()

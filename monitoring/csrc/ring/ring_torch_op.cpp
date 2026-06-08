@@ -38,14 +38,14 @@ void ring_set_toggle_capture(bool enabled) {
 void ring_set_active_engine(ring_py::RingEnginePy* e) {
     g_active_engine = e;
     // Deactivation must also disable capture: g_toggle_capture is process-global,
-    // so a stale "true" after the engine is cleared would record into nothing (#3).
+    // so a stale "true" after the engine is cleared would record into nothing.
     if (e == nullptr) ring_set_toggle_capture(false);
 }
 
 // Three side-effect ops, one per use case:
 //
 //   ring::producer(x, hook_type, hook_id)
-//     Static path; copies all of x.nbytes(); today's behavior.
+//     Static path; copies all of x.nbytes().
 //
 //   ring::producer_prefix(x, row_count, row_bytes, hook_type, hook_id)
 //     Reads row_count[0] from device at kernel start; copies
