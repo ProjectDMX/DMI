@@ -88,7 +88,7 @@ public:
     // Space must be guaranteed by pre-forward capacity check.
     // Three variants matching the three torch ops.
 
-    // Static: copies all `nbytes`; today's behavior.
+    // Static: copies all `nbytes`.
     void hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
                         uint32_t hook_type,
                         uint64_t stream_handle);
@@ -183,7 +183,7 @@ public:
     // Snapshot the live ring head/tail counters (reserve-invariant probe).
     RingFlushStats get_stats() const;
 
-    // ---- Runtime node-toggle (Phase B) -----------------------------------
+    // ---- Runtime node-toggle -----------------------------------
     // cudaGraph_t / cudaGraphNode_t / cudaGraphExec_t are passed as opaque
     // uint64_t so this header stays CUDA-free (it is included by the
     // g++-compiled bindings.cpp). The enabled (hook_type, layer_no) set is the
@@ -215,7 +215,7 @@ public:
     // N round-trips; C++ remains the single source of truth.
     std::vector<int> effective_enabled_mask(
         const std::vector<std::pair<int,int>>& query) const;
-    // Phase 4 lazy per-graph apply. ensure_graph_current(): apply the current
+    // Lazy per-graph apply. ensure_graph_current(): apply the current
     // enabled set to ONE graph if it is stale (call just before that graph
     // replays). record_replay_event(): record a stream event after that graph's
     // replay so a later ensure can wait for it before mutating the exec.
@@ -244,7 +244,7 @@ public:
     // activation so a partial/mismatched bind fails loud instead of desyncing.
     bool     toggle_registry_complete() const;
     // Full reset: registry, exec map, enabled set, toggle_active, capture flag,
-    // and Phase-4 lazy state (versions + per-graph replay events).
+    // and lazy state (versions + per-graph replay events).
     void clear_toggle_registry();
 
 private:
