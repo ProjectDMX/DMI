@@ -698,9 +698,15 @@ class DMXGPUWorker(Worker):
         # waits on byte/entry thresholds that sparse steps never hit, so data
         # sits in the ring until the buffer fills or a final flush-on-close. A
         # nonzero timeout forces the drain to flush pending entries after that
-        # idle window. 0 (default) = threshold-only (legacy behaviour).
+        # idle window.
+        # Default: 50 ms when node-toggle is ON (sparse by design -- matches the
+        # original toggle branch's default so partial-toggle users get prompt
+        # export without manual tuning); 0 (threshold-only, legacy) otherwise, to
+        # preserve main's non-toggle behaviour. Override via dmx_drain_flush_timeout_us.
+        _default_flush_us = 50000 if node_toggle else 0
         ring_cfg.drain_flush_timeout_us = int(_cfg(
-            ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US", 0))
+            ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US",
+            _default_flush_us))
         ring_cfg.insert_queue_max_bytes = int(_cfg(
             ac, "dmx_insert_queue_max_bytes", "DMX_INSERT_QUEUE_MAX_BYTES",
             4096 * 1024 * 1024))

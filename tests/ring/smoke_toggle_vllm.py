@@ -71,7 +71,9 @@ llm = LLM(
         "dmx_db_host": "localhost",
         "dmx_db_port": 9000,
         "dmx_db_table": DB_TABLE,
-        "dmx_drain_flush_timeout_us": 2000,   # flush sparse data within ~2ms
+        # NOTE: deliberately NOT setting dmx_drain_flush_timeout_us -- this
+        # exercises the new toggle-on default (50ms) so the default export
+        # behaviour is covered (not just an explicit override).
         "dmx_ch_max_batch_items": 16,         # low insert watermark for the smoke
     },
 )
