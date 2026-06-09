@@ -628,10 +628,12 @@ class RingTransport:
                 "Every captured graph must be bound (bind_graph_exec) and vice versa.")
         if eng.capture_anomaly_count() > 0:
             raise RuntimeError(
-                "set_active_hooks: capture recorded %d non-kernel tail node(s) -- the "
-                "producer node registry may be misaligned (multi-op producer / capture "
-                "event-join / unexpected topology). Refusing to activate (fail-closed)."
-                % eng.capture_anomaly_count())
+                "set_active_hooks: capture recorded %d producer node(s) node-toggle "
+                "cannot manage -- either a non-kernel tail dependency (multi-op "
+                "producer / capture event-join), or a chunked/MoE producer (not "
+                "supported with gpu_padding_strip; set dmx_gpu_padding_strip=False to "
+                "route every hook through the basic producer). Refusing to activate "
+                "(fail-closed)." % eng.capture_anomaly_count())
         pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
         eng.set_enabled_hooks(pairs)
         err = eng.apply_toggle()
@@ -665,8 +667,9 @@ class RingTransport:
                 "bound graph has no recorded nodes).")
         if eng.capture_anomaly_count() > 0:
             raise RuntimeError(
-                "set_active_hooks_lazy: capture recorded %d non-kernel tail node(s); "
-                "producer node registry may be misaligned. Refusing to activate."
+                "set_active_hooks_lazy: capture recorded %d producer node(s) node-toggle "
+                "cannot manage (non-kernel tail, or chunked/MoE producer -- set "
+                "dmx_gpu_padding_strip=False). Refusing to activate."
                 % eng.capture_anomaly_count())
         pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
         eng.set_enabled_hooks(pairs)        # bumps target_version; device apply deferred

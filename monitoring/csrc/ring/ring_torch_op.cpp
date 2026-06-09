@@ -42,6 +42,48 @@ void ring_set_active_engine(ring_py::RingEnginePy* e) {
     if (e == nullptr) ring_set_toggle_capture(false);
 }
 
+// Node-toggle capture: record THIS producer's kernel node (the current capture
+// tail dependency) so it can be enabled/disabled post-capture via
+// cudaGraphNodeSetEnabled. No-op outside the capture window.
+//   supported=true  (basic + prefix producers): each is a single kernel launch,
+//     so the tail dependency is its kernel node. Validate it (fail-closed): a
+//     non-kernel tail (multi-op producer / capture event-join) must NOT be
+//     registered as a wrong node.
+//   supported=false (chunked/MoE producer): node-toggle does not manage this
+//     producer in the current prefix-path implementation. Flag an anomaly so
+//     set_active_hooks fails loud instead of leaving a fired-but-unregistered
+//     producer (which would desync). Use gpu_padding_strip=False (all-basic)
+//     to run toggle on MoE.
+static void dmx_record_capture_node(cudaStream_t stream, int hook_type,
+                                    int hook_id, bool supported) {
+    if (!g_toggle_capture || !g_active_engine) return;
+    cudaStreamCaptureStatus  cap_st    = cudaStreamCaptureStatusNone;
+    unsigned long long       cap_id    = 0;
+    cudaGraph_t              cap_graph = nullptr;
+    const cudaGraphNode_t*   cap_deps  = nullptr;
+    const cudaGraphEdgeData* cap_edges = nullptr;  // CUDA 13 signature
+    size_t                   cap_nd    = 0;
+    if (cudaStreamGetCaptureInfo(stream, &cap_st, &cap_id, &cap_graph,
+                                 &cap_deps, &cap_edges, &cap_nd) != cudaSuccess
+        || cap_st != cudaStreamCaptureStatusActive || cap_nd < 1) {
+        return;
+    }
+    if (!supported) {
+        g_active_engine->note_capture_anomaly();
+        return;
+    }
+    cudaGraphNode_t node = cap_deps[cap_nd - 1];
+    cudaGraphNodeType ntype;
+    if (cudaGraphNodeGetType(node, &ntype) == cudaSuccess
+        && ntype == cudaGraphNodeTypeKernel) {
+        g_active_engine->register_capture_node(
+            reinterpret_cast<uint64_t>(cap_graph), hook_type, hook_id,
+            reinterpret_cast<uint64_t>(node));
+    } else {
+        g_active_engine->note_capture_anomaly();
+    }
+}
+
 // Three side-effect ops, one per use case:
 //
 //   ring::producer(x, hook_type, hook_id)
@@ -98,39 +140,9 @@ void ring_producer_impl(
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
 
-        // Node-toggle (option B: basic producer only -- toggle requires
-        // gpu_padding_strip=False so every hook dispatches here, not to
-        // producer_prefix/producer_chunked). If capturing, record THIS
-        // producer's kernel node (the current tail dependency) so it can be
-        // enabled/disabled post-capture via cudaGraphNodeSetEnabled.
-        if (g_toggle_capture) {
-            cudaStreamCaptureStatus  cap_st    = cudaStreamCaptureStatusNone;
-            unsigned long long       cap_id    = 0;
-            cudaGraph_t              cap_graph = nullptr;
-            const cudaGraphNode_t*   cap_deps  = nullptr;
-            const cudaGraphEdgeData* cap_edges = nullptr;  // CUDA 13 signature
-            size_t                   cap_nd    = 0;
-            if (cudaStreamGetCaptureInfo(stream.stream(), &cap_st, &cap_id, &cap_graph,
-                                         &cap_deps, &cap_edges, &cap_nd) == cudaSuccess
-                && cap_st == cudaStreamCaptureStatusActive && cap_nd >= 1) {
-                // The producer is a single kernel launch, so the capture tail
-                // dependency should be a kernel node. Validate it (fail-closed):
-                // if the tail node is NOT a kernel (multi-op producer, capture
-                // event-join, or unexpected topology), do NOT register a wrong
-                // node -- flag an anomaly so set_active_hooks refuses to activate.
-                cudaGraphNode_t node = cap_deps[cap_nd - 1];
-                cudaGraphNodeType ntype;
-                if (cudaGraphNodeGetType(node, &ntype) == cudaSuccess
-                    && ntype == cudaGraphNodeTypeKernel) {
-                    g_active_engine->register_capture_node(
-                        reinterpret_cast<uint64_t>(cap_graph),
-                        static_cast<int>(hook_type), static_cast<int>(hook_id),
-                        reinterpret_cast<uint64_t>(node));
-                } else {
-                    g_active_engine->note_capture_anomaly();
-                }
-            }
-        }
+        // Node-toggle: record this basic producer's kernel node (if capturing).
+        dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                static_cast<int>(hook_id), /*supported=*/true);
     }
 }
 
@@ -155,6 +167,11 @@ void ring_producer_prefix_impl(
             static_cast<uint64_t>(row_bytes),
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
+
+        // Node-toggle (Option A, prefix path): record the prefix producer's
+        // kernel node so toggle works with gpu_padding_strip on (dense hooks).
+        dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                static_cast<int>(hook_id), /*supported=*/true);
     }
 }
 
@@ -180,6 +197,12 @@ void ring_producer_chunked_impl(
             K,
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
+
+        // Node-toggle does not manage chunked/MoE producers in the prefix-path
+        // implementation -> flag (fail-closed): set_active_hooks will refuse to
+        // activate. Run toggle on MoE with gpu_padding_strip=False (all-basic).
+        dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                static_cast<int>(hook_id), /*supported=*/false);
     }
 }
 

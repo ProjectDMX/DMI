@@ -52,9 +52,11 @@ Comma-separated `hook_type:layer` pairs. `hook_type` 0 = hidden-states
   (e.g. FlashAttention `UNIFORM_BATCH`); node-toggle still binds the full *decode*
   graphs, and if an unregistered (runtime-captured) graph ever replays the worker
   **fails loud** rather than silently desyncing.
-- **`gpu_padding_strip` is auto-forced off** when node-toggle is on (only the
-  basic producer's kernel node is toggle-recorded; the prefix/chunked strip
-  producers are not). A warning is emitted if you set it on explicitly.
+- **`gpu_padding_strip` composes with node-toggle** for the basic and **prefix**
+  producers (both record their kernel node at capture). The **chunked/MoE**
+  producer is *not* toggle-managed yet: if any fires under capture,
+  `set_active_hooks` fails loud — run toggle on MoE with
+  `dmx_gpu_padding_strip=False` so every hook routes through the basic producer.
 - Model code needs **no changes** — toggle is entirely backend + adaptor; hooked
   models only place `HookPoint`s and declare `get_hook_specs()`.
 

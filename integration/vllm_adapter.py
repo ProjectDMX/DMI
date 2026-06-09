@@ -734,16 +734,11 @@ class DMXGPUWorker(Worker):
         # DMX_GPU_PADDING_STRIP=0 if needed for debugging.
         gpu_padding_strip = _cfg(
             ac, "dmx_gpu_padding_strip", "DMX_GPU_PADDING_STRIP", True)
-        # Option B: node-toggle records nodes only from the BASIC producer op.
-        # gpu_padding_strip routes eligible hooks to producer_prefix instead,
-        # whose nodes are not toggle-recorded -> 0 bound nodes. Force strip off
-        # when toggle is on so every hook dispatches to the basic producer.
-        if self._dmx_node_toggle and gpu_padding_strip:
-            warnings.warn(
-                "[DMX] node-toggle: forcing gpu_padding_strip=False (toggle records "
-                "only basic-producer nodes; prefix/chunked producers are not "
-                "toggle-recorded). Set dmx_gpu_padding_strip=False to silence.")
-            gpu_padding_strip = False
+        # Node-toggle composes with gpu_padding_strip for the basic + prefix
+        # producers (both record their kernel node at capture). Chunked/MoE
+        # producers are NOT toggle-managed yet: if any fire under capture,
+        # set_active_hooks fails loud -- run toggle on MoE with
+        # dmx_gpu_padding_strip=False (everything routes to the basic producer).
         self.adaptor = VLLMAdaptor(
             engine, resolved_model_id, self.vllm_config,
             gpu_padding_strip=bool(gpu_padding_strip))
