@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from transformers import Qwen2MoeConfig
 from transformers.models.qwen2_moe_compare.modeling_qwen2_moe import CompareQwen2MoeForCausalLM
 from transformers.models.qwen2_moe_p.modeling_qwen2_moe import HookedQwen2MoeForCausalLM
@@ -18,6 +20,8 @@ from monitoring.ring_transport import (
     _id_by_short,
 )
 from tests.ref_disk_worker import _ARCH_REMAP as _REF_ARCH_REMAP
+
+pytestmark = pytest.mark.cpu
 
 
 def test_moe_v1_routing_hook_types_registered() -> None:

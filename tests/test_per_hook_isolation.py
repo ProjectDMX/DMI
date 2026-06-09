@@ -89,6 +89,7 @@ SAMPLE_COMPARE_SOURCE = dedent("""
 """).strip("\n")
 
 
+@pytest.mark.cpu
 class TestPatcherCorrectness:
     """Verify the regex + line-by-line patching logic."""
 
@@ -126,6 +127,7 @@ class TestPatcherCorrectness:
                 assert indent == 8, f"unexpected indent on: {line!r}"
 
 
+@pytest.mark.cpu
 class TestPatcherRoundTrip:
     """Verify the on-disk patch / unpatch context manager."""
 
@@ -163,6 +165,7 @@ class TestPatcherRoundTrip:
             isolate_hook.patch("test", "fake", "q")
 
 
+@pytest.mark.cpu
 class TestRealCompareModelsContainAllExpectedHooks:
     """The smoke cells assume specific hooks have a `.copy_()` line in the
     real _compare files.  If a hook is missing the smoke fails opaquely,
@@ -488,6 +491,7 @@ def _run_rollout(
         )
 
 
+@pytest.mark.gpu
 @pytest.mark.slow
 @pytest.mark.parametrize(
     "framework,model_key,hook,mode", SMOKE_CELLS,

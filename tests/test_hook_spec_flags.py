@@ -11,10 +11,13 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 import torch.nn as nn
 
 from monitoring.ring_transport import HookSpec, ModelShapeConfig, RingTransport
+
+pytestmark = pytest.mark.cpu
 
 
 def test_hook_spec_flag_defaults_false():

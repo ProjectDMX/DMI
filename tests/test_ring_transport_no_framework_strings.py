@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.cpu
+
 RING_TRANSPORT = (
     Path(__file__).resolve().parent.parent / "monitoring" / "ring_transport.py"
 )

@@ -5,6 +5,11 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel as HFOriginal
 from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2Model
 from transformers.models.gpt2_p.modeling_gpt2 import GPT2LMHeadModel as HFModifiedGPT2
 
+from tests._requirements import require_model_cache
+
+# Runs on CPU but pulls real gpt2 weights via from_pretrained -> `hf`, not `cpu`.
+pytestmark = [pytest.mark.hf, require_model_cache("gpt2")]
+
 
 @pytest.fixture(scope="module")
 def gpt2_tokenizer():

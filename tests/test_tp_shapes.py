@@ -6,6 +6,8 @@ No GPU or distributed setup needed — tests use ModelShapeConfig directly.
 import pytest
 import torch
 
+pytestmark = pytest.mark.cpu
+
 from monitoring.ring_transport import (
     HOOK_TYPE_RESID_PRE,
     HOOK_TYPE_LN1,

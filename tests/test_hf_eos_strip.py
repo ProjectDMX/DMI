@@ -21,6 +21,8 @@ from typing import Optional
 import pytest
 import torch
 
+pytestmark = pytest.mark.cpu
+
 from integration.hf_adapter import HFAdaptor
 
 

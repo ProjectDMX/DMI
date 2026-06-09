@@ -15,6 +15,8 @@ import pytest
 
 from monitoring.config import CaptureSchedule, MonitoringConfig
 
+pytestmark = pytest.mark.cpu
+
 
 # =============================================================================
 # CaptureSchedule

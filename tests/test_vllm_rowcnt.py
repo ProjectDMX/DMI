@@ -40,6 +40,13 @@ import tempfile
 import pytest
 import torch
 
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.vllm,
+    pytest.mark.clickhouse,
+    pytest.mark.e2e,
+]
+
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",

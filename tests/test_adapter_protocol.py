@@ -16,8 +16,12 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
+
 from monitoring.adaptor_base import BackendAdaptor
 from monitoring.step_context import StepContext
+
+pytestmark = pytest.mark.cpu
 
 
 # ---------------------------------------------------------------------------
