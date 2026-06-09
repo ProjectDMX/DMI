@@ -49,11 +49,16 @@ void ring_set_active_engine(ring_py::RingEnginePy* e) {
 //     so the tail dependency is its kernel node. Validate it (fail-closed): a
 //     non-kernel tail (multi-op producer / capture event-join) must NOT be
 //     registered as a wrong node.
-//   supported=false (chunked/MoE producer): node-toggle does not manage this
+//   supported=false (chunked producer): node-toggle does not manage this
 //     producer in the current prefix-path implementation. Flag an anomaly so
 //     set_active_hooks fails loud instead of leaving a fired-but-unregistered
-//     producer (which would desync). Use gpu_padding_strip=False (all-basic)
-//     to run toggle on MoE.
+//     producer (which would desync). (The vLLM adapter never dispatches chunked
+//     today -- it is dormant infra; this is a fail-closed guard for it.)
+//
+// Fail-closed: any state where the producer fired under capture but we could
+// NOT record its node flags an anomaly (capture-info read failed, or capturing
+// with no tail dependency). The one silent case is "not actively capturing"
+// (status != Active) -- that's a legitimate eager warmup run, not a graph node.
 static void dmx_record_capture_node(cudaStream_t stream, int hook_type,
                                     int hook_id, bool supported) {
     if (!g_toggle_capture || !g_active_engine) return;
@@ -63,9 +68,18 @@ static void dmx_record_capture_node(cudaStream_t stream, int hook_type,
     const cudaGraphNode_t*   cap_deps  = nullptr;
     const cudaGraphEdgeData* cap_edges = nullptr;  // CUDA 13 signature
     size_t                   cap_nd    = 0;
-    if (cudaStreamGetCaptureInfo(stream, &cap_st, &cap_id, &cap_graph,
-                                 &cap_deps, &cap_edges, &cap_nd) != cudaSuccess
-        || cap_st != cudaStreamCaptureStatusActive || cap_nd < 1) {
+    cudaError_t ce = cudaStreamGetCaptureInfo(stream, &cap_st, &cap_id, &cap_graph,
+                                              &cap_deps, &cap_edges, &cap_nd);
+    if (ce != cudaSuccess) {
+        // In the capture window but can't read capture state -> can't confirm
+        // the node was recorded. Fail closed. (A healthy non-capturing stream
+        // returns success with status=None, so this is a genuine error.)
+        g_active_engine->note_capture_anomaly();
+        return;
+    }
+    if (cap_st != cudaStreamCaptureStatusActive) return;  // eager run, not a node
+    if (cap_nd < 1) {                                     // capturing, no tail dep -> abnormal
+        g_active_engine->note_capture_anomaly();
         return;
     }
     if (!supported) {
@@ -198,9 +212,11 @@ void ring_producer_chunked_impl(
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
 
-        // Node-toggle does not manage chunked/MoE producers in the prefix-path
+        // Node-toggle does not manage the chunked producer in the prefix-path
         // implementation -> flag (fail-closed): set_active_hooks will refuse to
-        // activate. Run toggle on MoE with gpu_padding_strip=False (all-basic).
+        // activate. (The vLLM adapter never dispatches chunked today; this guards
+        // any future/manual use. dmx_gpu_padding_strip=False routes everything to
+        // the basic producer.)
         dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
                                 static_cast<int>(hook_id), /*supported=*/false);
     }

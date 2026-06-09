@@ -630,9 +630,9 @@ class RingTransport:
             raise RuntimeError(
                 "set_active_hooks: capture recorded %d producer node(s) node-toggle "
                 "cannot manage -- either a non-kernel tail dependency (multi-op "
-                "producer / capture event-join), or a chunked/MoE producer (not "
-                "supported with gpu_padding_strip; set dmx_gpu_padding_strip=False to "
-                "route every hook through the basic producer). Refusing to activate "
+                "producer / capture event-join), or a chunked producer (not "
+                "supported under node-toggle; set dmx_gpu_padding_strip=False to route "
+                "every hook through the basic producer). Refusing to activate "
                 "(fail-closed)." % eng.capture_anomaly_count())
         pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
         eng.set_enabled_hooks(pairs)
@@ -668,7 +668,7 @@ class RingTransport:
         if eng.capture_anomaly_count() > 0:
             raise RuntimeError(
                 "set_active_hooks_lazy: capture recorded %d producer node(s) node-toggle "
-                "cannot manage (non-kernel tail, or chunked/MoE producer -- set "
+                "cannot manage (non-kernel tail, or chunked producer -- set "
                 "dmx_gpu_padding_strip=False). Refusing to activate."
                 % eng.capture_anomaly_count())
         pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
