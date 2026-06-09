@@ -1,8 +1,8 @@
-"""Layer-4 unit gate: the node-toggle vLLM wiring that is model-independent.
+"""Unit gate for the node-toggle vLLM wiring that is model-independent.
 
 The full server smoke (launch DMXGPUWorker + dmx_node_toggle, bind N graphs,
-serve) requires the vLLM fork whose hooked models match main's 4-arg producer
-op -- i.e. the integration/vllm submodule at main's pinned commit (Layer 0).
+serve) requires the vLLM fork (the integration/vllm submodule at its pinned
+commit) whose hooked models match the 4-arg producer op.
 This test covers the pieces that DON'T need a model:
 
   - integration.vllm_adapter imports cleanly (wiring/syntax),

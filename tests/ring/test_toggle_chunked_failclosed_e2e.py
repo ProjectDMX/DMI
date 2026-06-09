@@ -1,7 +1,7 @@
 """Chunked producer fail-closed under node-toggle.
 
-The chunked producer is not toggle-managed (the prefix-path Option A covers basic
-+ prefix only). If one fires during capture, its node is NOT recorded and a
+The chunked producer is not toggle-managed (only the basic and prefix producers
+record their kernel nodes). If one fires during capture, its node is NOT recorded and a
 capture anomaly is flagged, so set_active_hooks / set_active_hooks_lazy must
 REFUSE to activate (fail-closed) -- otherwise it would be a fired-but-unregistered
 producer (silent desync). This gate captures a MIXED graph (basic producers

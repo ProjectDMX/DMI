@@ -511,7 +511,7 @@ class RingTransport:
         """The specs that actually fire this step -- the single set that must
         drive capacity-reserve, meta-push and device node-enable in lockstep.
         Toggle active -> the precomputed enabled-AND-captured subset; else all
-        active specs (legacy: every active hook fires every step)."""
+        active specs (toggle inactive: every active hook fires every step)."""
         if self._toggle_gate_active and self._effective_enabled_specs is not None:
             return self._effective_enabled_specs
         return self._active_specs

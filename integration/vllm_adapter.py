@@ -730,10 +730,9 @@ class DMXGPUWorker(Worker):
             ac, "dmx_gpu_padding_strip", "DMX_GPU_PADDING_STRIP", True)
         # Node-toggle composes with gpu_padding_strip for the basic + prefix
         # producers (both record their kernel node at capture). The chunked
-        # producer is NOT toggle-managed (and is not dispatched by this adapter
-        # today -- dormant infra); if one ever fires under capture, set_active_hooks
-        # fails loud. dmx_gpu_padding_strip=False routes everything to the basic
-        # producer.
+        # producer is NOT toggle-managed (and this adapter never dispatches it);
+        # if one fires under capture, set_active_hooks fails loud.
+        # dmx_gpu_padding_strip=False routes every hook to the basic producer.
         self.adaptor = VLLMAdaptor(
             engine, resolved_model_id, self.vllm_config,
             gpu_padding_strip=bool(gpu_padding_strip))

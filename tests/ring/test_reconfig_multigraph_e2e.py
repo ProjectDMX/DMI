@@ -8,9 +8,9 @@ the OBSERVABLE invariant:
     data came from G (per-graph marker), regardless of how many reconfigures
     happened since G was last replayed.
 
-This is implementation-agnostic: it passes under today's eager apply (every graph
-updated on every reconfigure) AND is the safety net for lazy per-graph apply
-(reconfigure only bumps a version; each graph is applied just before it replays).
+This is implementation-agnostic: it passes under the eager apply (every graph
+updated on every reconfigure) AND under the lazy per-graph apply (reconfigure
+only bumps a version; each graph is applied just before it replays).
 The lazy bugs it catches: a stale graph firing its OLD enabled set while the meta
 gate pushed the NEW set (-> desync), applying to the wrong graph, or missing a
 multi-version-stale catch-up. Covered transitions: deferred apply (replay B then

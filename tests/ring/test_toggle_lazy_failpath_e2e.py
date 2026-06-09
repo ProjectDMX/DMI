@@ -1,15 +1,13 @@
-"""Lazy apply failure-path gates (fixes #1 + #2, fault-injected).
+"""Lazy apply failure-path gates (fault-injected).
 
 Uses the engine's test-only fault injection (_test_force_apply_error) to drive
 the device-apply error path deterministically -- cudaGraphNodeSetEnabled itself
 can't be forced to fail from Python. Verifies:
 
-  #2  apply failure -> applied_version NOT marked current (graph stays stale, so
-      a later ensure retries); success -> marked current.
-  #1  with the replay-time guard armed, a failed ensure_graph_current at replay
-      RAISES FATAL (and does NOT replay); a clean ensure replays normally.
-
-Targets the post-#40/#51 backend (4-arg producer op).
+  - apply failure -> applied_version NOT marked current (graph stays stale, so
+    a later ensure retries); success -> marked current.
+  - with the replay-time guard armed, a failed ensure_graph_current at replay
+    RAISES FATAL (and does NOT replay); a clean ensure replays normally.
 
 Run:  CUDA_VISIBLE_DEVICES=<free gpu> CUDA_MODULE_LOADING=EAGER \
       python tests/ring/test_toggle_lazy_failpath_e2e.py
@@ -67,8 +65,8 @@ def main():
     eng.bind_graph_exec(gA.raw_cuda_graph(), gA.raw_cuda_graph_exec())
     raw = gA.raw_cuda_graph()
 
-    # ---- #2: version-on-success-only ----
-    print("[#2 applied_version only on full success]")
+    # ---- version-on-success-only ----
+    print("[applied_version only on full success]")
     transport.set_active_hooks_lazy([(HT, j) for j in range(N)])   # target bumped; A stale
     check(not eng._test_applied_current(raw), "A stale right after lazy reconfigure (deferred)")
 
@@ -83,8 +81,8 @@ def main():
     check(err == 0, "ensure_graph_current succeeds after clearing injection")
     check(eng._test_applied_current(raw), "apply SUCCEEDED -> applied_version marked current")
 
-    # ---- #1: replay raises FATAL on apply error ----
-    print("[#1 replay FATAL on lazy apply error]")
+    # ---- replay raises FATAL on apply error ----
+    print("[replay FATAL on lazy apply error]")
     transport.set_active_hooks_lazy([(HT, 0)])      # bump target -> A stale again
     eng._test_force_apply_error(INJ)
     raised = False

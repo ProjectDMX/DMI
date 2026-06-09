@@ -268,9 +268,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
              ring_py::SubmitFn submit_fn;
              if (!host_engine_obj.is_none()) {
-                 // A DMXHostEngine -> ClickHouse sink, or a plain Python callable
-                 // sink (mainly for tests / custom consumers, e.g. node-toggle
-                 // reconfigure guardrails that observe delivered slices).
+                 // A DMXHostEngine -> ClickHouse sink, or a plain Python
+                 // callable sink (tests / custom consumers).
                  if (py::isinstance<dmx_host::DMXHostEngine>(host_engine_obj)) {
                  auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
                  submit_fn = [host](const std::string& model_id, int32_t shard_rank,
@@ -303,8 +302,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                              (*pyfn)(model_id, shard_rank, req_id, act_name, layer_no,
                                      start_token, end_token, std::move(slice));
                          } catch (const py::error_already_set& ex) {
-                             // Don't let a sink error kill the p2p thread, but make
-                             // it visible (tests rely on this path).
+                             // Don't let a sink error kill the p2p thread, but
+                             // make it visible.
                              fprintf(stderr, "[ring p2p] Python SubmitFn raised: %s\n", ex.what());
                          }
                      };

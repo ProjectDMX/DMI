@@ -1,4 +1,4 @@
-"""Reserve-invariant guardrail (Layer 3: capacity path reads effective_specs).
+"""Reserve-invariant guardrail (capacity path reads effective_specs).
 
 Drives the REAL adaptor capacity path -- BackendAdaptor._compute_step_plan ->
 prepare_step -> pre_push_all_metas -> replay -> drain -- across a sequence of
@@ -9,11 +9,11 @@ node-toggle reconfigures, and asserts the reserve invariant every round:
   - after flush the ring FULLY DRAINS (payload/task head == tail_committed):
     reserve() matched what producers actually wrote, so the head-tail gap does
     NOT drift. Reserving for the full active_specs while only the enabled subset
-    fires (the pre-Layer-3 bug) would leave head > tail by the over-reserved
-    amount, growing every step -> caught here.
+    fires would leave head > tail by the over-reserved amount, growing every
+    step -> caught here.
 
-Targets the post-#40/#51 backend (4-arg producer op). Option-B: basic producer
-only (no gpu_padding_strip), so every node is toggle-recorded.
+Every hook uses the basic producer (no gpu_padding_strip), so every node is
+toggle-recorded.
 
 Run:  CUDA_VISIBLE_DEVICES=<free gpu> CUDA_MODULE_LOADING=EAGER \
       python tests/ring/test_reserve_invariant_e2e.py
