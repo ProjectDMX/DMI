@@ -1,4 +1,4 @@
-"""Phase B test: the node-toggle binding through the REAL backend + producer op.
+"""Node-toggle binding through the REAL backend + producer op.
 
 Drives torch.ops.ring.producer inside a torch CUDA-graph capture (keep_graph=True)
 with the engine active and toggle-capture on, so the producer op records its kernel
@@ -7,13 +7,13 @@ node via cudaStreamGetCaptureInfo. Then exercises the Python binding:
   - is_hook_enabled():   enabled-set single-source gate (for pre_push_all_metas)
   - effective_enabled_mask(): batched gate matches is_hook_enabled
   - apply_toggle():      cudaGraphNodeSetEnabled on torch's raw_cuda_graph_exec using
-                         the capture-recorded handles SUCCEEDS (err 0) -> the whole
-                         Phase 3 mechanism works through the real DMI backend.
+                         the capture-recorded handles SUCCEEDS (err 0) -> the
+                         toggle mechanism works through the real DMI backend.
 
-Note: this targets the post-#40/#51 backend, whose producer op signature is
+Note: the producer op signature is
 ``producer(Tensor(a!) ring_payload, Tensor x, int hook_type, int hook_id)``.
-Option-B assumption: toggle records nodes only from the *basic* producer op, so
-this test uses producer (not producer_prefix/producer_chunked).
+This test drives the *basic* producer op only (producer_prefix has its own gate,
+test_toggle_prefix_e2e).
 
 Run:  CUDA_MODULE_LOADING=EAGER python tests/ring/test_toggle_binding.py
 Requires the built backend (monitoring_native_backend*.so at repo root) + torch CUDA.

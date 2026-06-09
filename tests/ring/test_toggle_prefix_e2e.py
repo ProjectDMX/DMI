@@ -1,4 +1,4 @@
-"""Option A (prefix path): node-toggle works with the gpu_padding_strip producer.
+"""Node-toggle composes with the gpu_padding_strip (prefix) producer.
 
 Drives torch.ops.ring.producer_prefix (the strip producer: reads a device
 row_count scalar at execution, copies only the first row_count rows) inside a
@@ -9,8 +9,9 @@ captured graph with toggle-capture on, and verifies:
     each delivered slice is the correct stripped prefix (marker == layer),
     disabled hooks deliver nothing.
 
-This is the dense hidden-states case (strip on). Chunked/MoE is deliberately NOT
-covered here (it fails loud at set_active_hooks; run toggle on MoE with strip off).
+The chunked producer is deliberately NOT covered here -- it is not
+toggle-managed and fails loud at set_active_hooks
+(see test_toggle_chunked_failclosed_e2e).
 
 Run:  CUDA_VISIBLE_DEVICES=<free gpu> CUDA_MODULE_LOADING=EAGER \
       python tests/ring/test_toggle_prefix_e2e.py

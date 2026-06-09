@@ -242,7 +242,7 @@ bool RingEnginePy::toggle_registry_uniform() const {
     // True iff every captured graph registered the same set of (hook_type,layer).
     // The meta gate keys on (ht,layer) globally; if graphs differ, a hook present
     // in one graph but absent from the one replayed this step would push a meta
-    // with no payload -> desync. vLLM captures all hooks in every graph (uniform).
+    // with no payload -> desync.
     const std::set<std::pair<int,int>>* ref = nullptr;
     std::set<std::pair<int,int>> ref_set;
     for (const auto& kv : impl_->reg_nodes) {

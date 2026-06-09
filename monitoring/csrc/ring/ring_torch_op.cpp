@@ -50,10 +50,8 @@ void ring_set_active_engine(ring_py::RingEnginePy* e) {
 //     non-kernel tail (multi-op producer / capture event-join) must NOT be
 //     registered as a wrong node.
 //   supported=false (chunked producer): node-toggle does not manage this
-//     producer in the current prefix-path implementation. Flag an anomaly so
-//     set_active_hooks fails loud instead of leaving a fired-but-unregistered
-//     producer (which would desync). (The vLLM adapter never dispatches chunked
-//     today -- it is dormant infra; this is a fail-closed guard for it.)
+//     producer. Flag an anomaly so set_active_hooks fails loud instead of
+//     leaving a fired-but-unregistered producer (which would desync).
 //
 // Fail-closed: any state where the producer fired under capture but we could
 // NOT record its node flags an anomaly (capture-info read failed, or capturing
@@ -182,8 +180,8 @@ void ring_producer_prefix_impl(
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
 
-        // Node-toggle (Option A, prefix path): record the prefix producer's
-        // kernel node so toggle works with gpu_padding_strip on (dense hooks).
+        // Node-toggle: record the prefix producer's kernel node so the
+        // toggle composes with gpu_padding_strip.
         dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
                                 static_cast<int>(hook_id), /*supported=*/true);
     }
@@ -212,11 +210,9 @@ void ring_producer_chunked_impl(
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
 
-        // Node-toggle does not manage the chunked producer in the prefix-path
-        // implementation -> flag (fail-closed): set_active_hooks will refuse to
-        // activate. (The vLLM adapter never dispatches chunked today; this guards
-        // any future/manual use. dmx_gpu_padding_strip=False routes everything to
-        // the basic producer.)
+        // Node-toggle does not manage the chunked producer -> flag
+        // (fail-closed): set_active_hooks will refuse to activate.
+        // dmx_gpu_padding_strip=False routes every hook to the basic producer.
         dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
                                 static_cast<int>(hook_id), /*supported=*/false);
     }

@@ -12,9 +12,9 @@ This guards the toggle *reconfigure* path through the REAL pipeline
 graph, bad diff seed, or a meta-gate that diverges from the device enabled set)
 would desync and fail here.
 
-Targets the post-#40/#51 backend: producer op is 4-arg
-``producer(ring_payload, x, hook_type, hook_id)``. Option-B: every hook uses the
-basic producer (no gpu_padding_strip), so all nodes are toggle-recorded.
+Every hook uses the basic producer
+``producer(ring_payload, x, hook_type, hook_id)`` (no gpu_padding_strip), so all
+nodes are toggle-recorded.
 
 Run:  CUDA_VISIBLE_DEVICES=<free gpu> CUDA_MODULE_LOADING=EAGER \
       python tests/ring/test_reconfig_sequence_e2e.py
@@ -89,7 +89,7 @@ def main():
     for r_i, keep in enumerate(ROUNDS):
         collected.clear()
         transport.set_active_hooks([(HT, j) for j in keep])          # device toggle + gate
-        # effective_specs (Layer-2 single source) must equal the enabled set.
+        # effective_specs (the single source) must equal the enabled set.
         eff = sorted(s.layer_no for s in transport.effective_specs)
         check(eff == sorted(keep), f"round {r_i} keep={keep}: effective_specs {eff} == enabled")
         transport.pre_push_all_metas(batch=0, q_len=QLEN, kv_dim=0)  # gated meta push

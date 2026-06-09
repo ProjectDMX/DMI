@@ -1,4 +1,4 @@
-"""Lazy per-graph toggle — engine-level correctness (Phase 4, sub-step 4.1).
+"""Lazy per-graph toggle — engine-level correctness.
 
 Same two-graph reconfigure scenarios as test_reconfig_multigraph_e2e, but driven
 through the LAZY path:

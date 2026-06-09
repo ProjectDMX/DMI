@@ -1,15 +1,13 @@
-"""Graph-guard failure paths (fixes #3 + #4).
+"""Graph-guard failure paths.
 
-#4 registry completeness: set_active_hooks must RAISE when the set of graphs with
+Registry completeness: set_active_hooks must RAISE when the set of graphs with
    recorded producer nodes != the set of bound execs (partial/mismatched bind).
 
-#3 replay-time guard: with a toggle gate active, replaying a graph that is NOT
+Replay-time guard: with a toggle gate active, replaying a graph that is NOT
    registered+bound (e.g. one vLLM captured at RUNTIME after DMI closed its
    capture window) must RAISE -- such a graph's producers run default-ON while
    the meta gate filters to the enabled subset, which would desync the ring.
    A registered+bound graph must replay fine.
-
-Targets the post-#40/#51 backend (4-arg producer op). Option-B: basic producer.
 
 Run:  CUDA_VISIBLE_DEVICES=<free gpu> CUDA_MODULE_LOADING=EAGER \
       python tests/ring/test_toggle_graph_guard_e2e.py
@@ -60,7 +58,7 @@ def _capture(engine, payload, record):
 
 
 def test_completeness_guard():
-    print("[#4 registry completeness]")
+    print("[registry completeness]")
     eng = _new_engine()
     ne.ring_set_active_engine(eng)
     eng.set_null_mode(True)
@@ -89,7 +87,7 @@ def test_completeness_guard():
 
 
 def test_replay_guard():
-    print("[#3 replay-time unknown-graph guard]")
+    print("[replay-time unknown-graph guard]")
     va._patch_cudagraph_keep_graph()
     va._DMX_TOGGLE_REPLAY_GUARD = True
 
