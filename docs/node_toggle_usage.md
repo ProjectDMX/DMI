@@ -53,10 +53,12 @@ Comma-separated `hook_type:layer` pairs. `hook_type` 0 = hidden-states
   graphs, and if an unregistered (runtime-captured) graph ever replays the worker
   **fails loud** rather than silently desyncing.
 - **`gpu_padding_strip` composes with node-toggle** for the basic and **prefix**
-  producers (both record their kernel node at capture). The **chunked/MoE**
-  producer is *not* toggle-managed yet: if any fires under capture,
-  `set_active_hooks` fails loud — run toggle on MoE with
-  `dmx_gpu_padding_strip=False` so every hook routes through the basic producer.
+  producers (both record their kernel node at capture) — this covers the dense
+  hidden-states case, including MoE models (their hooks go through prefix). The
+  **chunked** producer is *not* toggle-managed and is not dispatched by the vLLM
+  adapter today (dormant infra); if one ever fires under capture,
+  `set_active_hooks` fails loud — `dmx_gpu_padding_strip=False` routes every hook
+  through the basic producer.
 - Model code needs **no changes** — toggle is entirely backend + adaptor; hooked
   models only place `HookPoint`s and declare `get_hook_specs()`.
 
