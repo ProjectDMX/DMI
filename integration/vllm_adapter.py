@@ -21,8 +21,8 @@ Key pieces:
     ``VLLMAdaptor`` and delegates per-step work to it.  Architecture
     remap (GPT2LMHeadModel -> GPT2PLMHeadModel etc.) stays here.
   * Module-level ``register_preset("vllm-full", ...)`` -- relocated
-    from ``monitoring/selection.py``'s default ``_HOOK_SELECTIONS``.
-    Lands as
+    from ``monitoring/selection.py``'s default ``_HOOK_SELECTIONS``
+    (deferred from Phase 1.5 per the unified-adaptor plan).  Lands as
     a side-effect of importing this module.
 
 """
@@ -66,7 +66,7 @@ from monitoring.internal_mapper import make_lazy_internal
 
 
 # ---------------------------------------------------------------------------
-# vLLM-full preset registration.
+# vLLM-full preset registration (deferred from Phase 1.5).
 #
 # Moved out of monitoring/selection.py's default _HOOK_SELECTIONS so the
 # core selection module is framework-neutral.  Registers when this
@@ -162,8 +162,8 @@ class VLLMAdaptor(BackendAdaptor):
         self._step_counter: int = 0
         # gpu_padding_strip mode: when True, the producer copies only
         # actual_q_len * row_bytes per eligible hook (instead of the
-        # full padded captured tensor).  Default False = no strip.
-        # When True, attach_model allocates the
+        # full padded captured tensor).  Default False = today's
+        # behavior verbatim.  When True, attach_model allocates the
         # shared row_count tensor pair and wires each eligible
         # HookPoint's _strip_tensor + _strip_row_bytes; build_step_context
         # populates ctx.actual_q_len; before_forward does the per-step

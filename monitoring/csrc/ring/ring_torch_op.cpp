@@ -99,7 +99,7 @@ static void dmx_record_capture_node(cudaStream_t stream, int hook_type,
 // Three side-effect ops, one per use case:
 //
 //   ring::producer(x, hook_type, hook_id)
-//     Static path; copies all of x.nbytes().
+//     Static path; copies all of x.nbytes(); today's behavior.
 //
 //   ring::producer_prefix(x, row_count, row_bytes, hook_type, hook_id)
 //     Reads row_count[0] from device at kernel start; copies
