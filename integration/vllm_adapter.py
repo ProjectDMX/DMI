@@ -887,6 +887,21 @@ class DMXGPUWorker(Worker):
                     g = getattr(entry, "cudagraph", None)
                     if g is None:
                         continue
+                    # A graph not created by the keep_graph patch means vLLM
+                    # resolved torch.cuda.CUDAGraph before (or without) the
+                    # patch -- its template is freed on instantiate, so the
+                    # capture-recorded node handles dangle and SetEnabled on
+                    # them is UB. Refuse before any handle is touched.
+                    if not getattr(type(g), "_dmx_keep_graph", False):
+                        raise RuntimeError(
+                            "[DMX] node-toggle FATAL: a captured CUDA graph was "
+                            "created from the UNPATCHED torch.cuda.CUDAGraph "
+                            "(keep_graph=False), so its template graph is already "
+                            "freed and the recorded producer-node handles dangle. "
+                            "vLLM likely binds the CUDAGraph class at import time "
+                            "in this version, bypassing _patch_cudagraph_keep_graph. "
+                            "Refusing to bind; fix the patch injection point before "
+                            "serving with node-toggle.")
                     # Don't re-instantiate if an exec already exists (that would
                     # destroy it). raw_cuda_graph_exec() raises until the graph
                     # is instantiated -> instantiate exactly once in that case.
