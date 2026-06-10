@@ -13,12 +13,12 @@ Environment variables:
   E2E_MAX_NEW_TOKENS    Tokens to generate per prompt (default 20)
   E2E_ENFORCE_EAGER     "1" to disable CUDA graphs (default "1")
   E2E_DTYPE             Model dtype, e.g. "bfloat16", "float16", "auto" (default "bfloat16")
-  E2E_HOOKS             Hook selection (default "vllm-full")
   E2E_REF_MAX_LEN       Max first-dim for buffers (default 8192)
   E2E_MAX_NUM_BATCHED_TOKENS  vLLM scheduler max_num_batched_tokens (default 512)
   E2E_RING_PAYLOAD_MB   Ring payload size (default 4096)
   E2E_RING_PINNED_MB    Pinned staging size (default 4096)
-  E2E_HOOK_SELECTION    Hook selection for monitored run (default "vllm-full")
+  E2E_HOOK_SELECTION    Public hook selection input (default "vllm-full");
+                        translated to DMX_HOOK_SELECTION for subprocesses
   DMX_DB_HOST           ClickHouse host (default "localhost")
   DMX_DB_PORT           ClickHouse port (default 9000)
 
@@ -61,7 +61,7 @@ def test_vllm_identical(subtests):
     """Bitwise comparison: ref model (disk) vs monitored model (ClickHouse)."""
 
     model_key = os.environ.get("E2E_MODEL", "gpt2")
-    hooks = os.environ.get("E2E_HOOKS", "vllm-full")
+    hooks = os.environ.get("E2E_HOOK_SELECTION", "vllm-full")
     max_len = int(os.environ.get("E2E_REF_MAX_LEN", "8192"))
     enforce_eager = os.environ.get("E2E_ENFORCE_EAGER", "1")
 

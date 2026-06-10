@@ -12,7 +12,8 @@ Environment variables:
   E2E_ENFORCE_EAGER     "1" to disable torch.compile + CUDA graphs (default "0")
   E2E_RING_PAYLOAD_MB   Ring payload size in MB (default 4096)
   E2E_RING_PINNED_MB    Pinned staging size in MB (default 4096)
-  E2E_HOOK_SELECTION    Hook selection preset (default "vllm-full")
+  E2E_HOOK_SELECTION    Public hook selection preset (default "vllm-full");
+                        translated to DMX_HOOK_SELECTION for subprocesses
   E2E_COMPARE_LAYERS    "all" or comma-separated layer IDs for value comparison.
                         Requires model supported by extract_hidden_states.
                         GPT-2 not supported -- value comparison skipped with warning.
@@ -61,6 +62,12 @@ def test_vllm_rowcnt(subtests):
     model_key = os.environ.get("E2E_MODEL", "gpt2")
     model_id = _MODEL_ALIASES.get(model_key, model_key)
 
+    # Translate the public E2E_HOOK_SELECTION input into the internal
+    # DMX_HOOK_SELECTION runtime contract that the runner actually reads.
+    sub_env = dict(os.environ)
+    sub_env["DMX_HOOK_SELECTION"] = os.environ.get(
+        "E2E_HOOK_SELECTION", "vllm-full")
+
     run_dir = tempfile.mkdtemp(prefix="vllm_rowcnt_")
     ref_dir = os.path.join(run_dir, "ref")
     mon_dir = os.path.join(run_dir, "mon")
@@ -83,7 +90,7 @@ def test_vllm_rowcnt(subtests):
         r2 = subprocess.run(
             [sys.executable, "-m", "tests.vllm_monitored_runner",
              "--output-dir", mon_dir],
-            env=os.environ, capture_output=True, text=True, cwd=project_root,
+            env=sub_env, capture_output=True, text=True, cwd=project_root,
         )
         if r2.returncode != 0:
             pytest.fail(f"Monitored runner failed:\n{r2.stderr[-2000:]}")
@@ -95,7 +102,7 @@ def test_vllm_rowcnt(subtests):
              "--ref-dir", ref_dir,
              "--mon-dir", mon_dir,
              "--result-file", result_file],
-            env=os.environ, capture_output=True, text=True, cwd=project_root,
+            env=sub_env, capture_output=True, text=True, cwd=project_root,
         )
         if r3.returncode != 0:
             pytest.fail(f"Comparator failed:\n{r3.stderr[-2000:]}")
