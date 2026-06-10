@@ -531,7 +531,7 @@ class RingTransport:
         ``actual_q_len`` in place of ``q_len`` -- so the meta describes
         the unpadded data the producer will actually write under
         padding-strip mode.  Other specs and the no-strip case use
-        ``q_len``.
+        ``q_len`` (today's behavior).
         """
         if self.null_offload:
             return  # kernel launches happen; metas are intentionally skipped

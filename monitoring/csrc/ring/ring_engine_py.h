@@ -88,7 +88,7 @@ public:
     // Space must be guaranteed by pre-forward capacity check.
     // Three variants matching the three torch ops.
 
-    // Static: copies all `nbytes`.
+    // Static: copies all `nbytes`; today's behavior.
     void hook_no_notify(uint64_t d_ptr, uint64_t nbytes,
                         uint32_t hook_type,
                         uint64_t stream_handle);
