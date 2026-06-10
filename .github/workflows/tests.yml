@@ -1,0 +1,115 @@
+name: tests
+
+# Wires the four canonical test suites (plan §3 / docs/testing.md):
+#   CPU default (every PR) -> -m "not gpu and not e2e and not manual"
+#   Single-GPU smoke       -> -m "gpu and not multi_gpu and not slow"
+#   Multi-GPU / TP         -> -m "multi_gpu"
+#   Full / nightly         -> -m "slow or nightly"
+#
+# The CPU job runs on every push/PR. The GPU/multi-GPU jobs need self-hosted
+# runners with CUDA devices (labelled `gpu` / `multi-gpu`); the nightly full
+# sweep runs on a schedule. GPU jobs fail *closed with a reason* via the
+# tests/_requirements.py skip-guards when ClickHouse / weights are absent, so a
+# runner missing a dependency skips rather than errors.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 07:00 UTC nightly full sweep.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- CPU default suite: every PR / push (plan acceptance gate) ----------
+  cpu:
+    # Skip on the nightly schedule (the nightly job is the relevant one there).
+    if: github.event_name != 'schedule'
+    runs-on: [self-hosted, linux, dmi-cpu]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-dmi
+      - name: CPU default suite
+        run: python -m pytest -m "not gpu and not e2e and not manual" -q
+
+  # ---- Single-GPU smoke ----------------------------------------------------
+  gpu-smoke:
+    if: github.event_name != 'schedule'
+    needs: cpu
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 60
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-dmi
+        with:
+          install-vllm: "true"
+      - name: Single-GPU smoke suite
+        # Exit code 5 ("no tests collected") is tolerated: a hardware tier with
+        # nothing marked for it yet is not a failure.
+        run: |
+          set +e
+          python -m pytest -m "gpu and not multi_gpu and not slow" -q
+          rc=$?
+          if [ "$rc" -eq 5 ]; then echo "::notice::no single-GPU tests collected"; exit 0; fi
+          exit $rc
+
+  # ---- Multi-GPU / TP ------------------------------------------------------
+  multi-gpu:
+    if: github.event_name != 'schedule'
+    needs: cpu
+    runs-on: [self-hosted, linux, multi-gpu]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-dmi
+        with:
+          install-vllm: "true"
+      - name: Multi-GPU / TP suite
+        # Exit code 5 ("no tests collected") is tolerated: TP tests acquire the
+        # multi_gpu marker in later phases; an empty selection is not a failure.
+        run: |
+          set +e
+          python -m pytest -m "multi_gpu" -q
+          rc=$?
+          if [ "$rc" -eq 5 ]; then echo "::notice::no multi_gpu tests collected"; exit 0; fi
+          exit $rc
+
+  # ---- Full / nightly sweep ------------------------------------------------
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 180
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-dmi
+        with:
+          install-vllm: "true"
+      - name: Full / nightly sweep
+        # Exit code 5 ("no tests collected") is tolerated for an empty selection.
+        run: |
+          set +e
+          python -m pytest -m "slow or nightly" -q
+          rc=$?
+          if [ "$rc" -eq 5 ]; then echo "::notice::no slow/nightly tests collected"; exit 0; fi
+          exit $rc
