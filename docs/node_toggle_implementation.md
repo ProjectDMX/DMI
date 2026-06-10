@@ -204,6 +204,37 @@ Measured: pure reconfigure host cost dropped **6.1×** (≈80 µs → ≈13 µs)
 Opt-in via `dmx_lazy_toggle` (eager is default; lazy only matters for high-
 frequency per-step reconfigure, not static configs).
 
+### Opt 4 — Reconfigure caches (guard verdict + preset memo)
+
+Per-step reconfigure is the access pattern of the planned consumers (graduated
+hallucination monitoring, per-layer profiler sweeps, debugging), and at
+production scale the dominant reconfigure cost turned out to be **re-validating
+an immutable registry**: the `set_active_hooks[_lazy]` guards (uniformity /
+completeness, O(graphs × hooks)) scale with bound graphs — measured host-only
+lazy cost 9.9 / 15.5 / 36.6 µs at 1 / 8 / 35 graphs
+(`docs/node_toggle_probe/probe_reconfig_scaling.py`).
+
+The registry only mutates at capture / bind / clear time, so the engine keeps a
+`registry_version` bumped by **every** mutation, and the transport memoizes on
+it:
+
+- **Guard verdict**: a guard PASS is cached per registry version; the next
+  reconfigure on an unchanged registry skips the checks entirely. Failures are
+  never cached, and any mutation (including `note_capture_anomaly`) forces full
+  re-validation — the fail-loud semantics are unchanged, gated by
+  `test_toggle_reconfig_cache_e2e.py`.
+- **Preset memo**: `(registry version, enabled set, active_specs identity) →
+  effective_specs`, so cycling presets skips the batched-mask recompute.
+
+Measured after: lazy reconfigure **4–6 µs flat, independent of graph count**
+(35 graphs: 36.6 → 4.4 µs); per-step full lazy price (call + ensure + event)
+17.8 → 10.5 µs on the ~4 ms probe step.
+
+> A fifth idea — **exec ping-pong** (two execs per template; apply to the idle
+> one to hide the ensure event-wait) — was probed and rejected: the event-wait
+> bubble is only ~6 µs, while a second exec costs ~7 KiB/node of device memory
+> (≈0.25–0.5 GiB across 35 production graphs).
+
 ### Opt 3a — Event guard (safety for lazy)
 
 Mutating an exec while a prior replay of it is still running is **undefined

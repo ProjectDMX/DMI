@@ -73,6 +73,10 @@ struct RingEnginePy::Impl {
     // kernel node (so it could not be the producer kernel). Nonzero => the
     // registry may be misaligned; set_active_hooks fails loud (fail-closed).
     uint64_t                                               capture_anomaly{0};
+    // Bumped by EVERY registry mutation (capture flag, node recording, anomaly,
+    // bind, clear). The host caches its registry-guard verdict keyed on this
+    // version, so a stale "valid" verdict can never outlive a mutation.
+    uint64_t                                               registry_version{0};
 
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
@@ -162,7 +166,11 @@ RingFlushStats RingEnginePy::get_stats() const {
 
 // --- Runtime node-toggle -----------------------------------------
 void RingEnginePy::enable_toggle_capture(bool enabled) {
-    { std::lock_guard<std::mutex> lk(impl_->toggle_mu); impl_->toggle_capture = enabled; }
+    {
+        std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+        impl_->toggle_capture = enabled;
+        ++impl_->registry_version;
+    }
     ring_set_toggle_capture(enabled);   // tell the producer op to record nodes
 }
 
@@ -176,11 +184,13 @@ void RingEnginePy::register_capture_node(uint64_t graph, int hook_type, int laye
     impl_->reg_nodes[reinterpret_cast<cudaGraph_t>(graph)].push_back(
         Impl::RegEntry{hook_type, layer_no, reinterpret_cast<cudaGraphNode_t>(node)});
     impl_->registered_hooks.insert({hook_type, layer_no});
+    ++impl_->registry_version;
 }
 
 void RingEnginePy::note_capture_anomaly() {
     std::lock_guard<std::mutex> lk(impl_->toggle_mu);
     ++impl_->capture_anomaly;
+    ++impl_->registry_version;
 }
 
 uint64_t RingEnginePy::capture_anomaly_count() const {
@@ -192,6 +202,12 @@ void RingEnginePy::bind_graph_exec(uint64_t graph, uint64_t exec) {
     std::lock_guard<std::mutex> lk(impl_->toggle_mu);
     impl_->reg_exec[reinterpret_cast<cudaGraph_t>(graph)] =
         reinterpret_cast<cudaGraphExec_t>(exec);
+    ++impl_->registry_version;
+}
+
+uint64_t RingEnginePy::toggle_registry_version() const {
+    std::lock_guard<std::mutex> lk(impl_->toggle_mu);
+    return impl_->registry_version;
 }
 
 void RingEnginePy::set_enabled_hooks(const std::vector<std::pair<int,int>>& enabled) {
@@ -421,6 +437,7 @@ void RingEnginePy::clear_toggle_registry() {
         impl_->applied_version.clear();
         for (auto& kv : impl_->replay_event) if (kv.second) cudaEventDestroy(kv.second);
         impl_->replay_event.clear();
+        ++impl_->registry_version;
     }
     ring_set_toggle_capture(false);
 }

@@ -456,6 +456,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("is_graph_ready", &ring_py::RingEnginePy::is_graph_ready, py::arg("graph"))
       .def("toggle_registry_complete", &ring_py::RingEnginePy::toggle_registry_complete)
       .def("capture_anomaly_count", &ring_py::RingEnginePy::capture_anomaly_count)
+      .def("toggle_registry_version", &ring_py::RingEnginePy::toggle_registry_version)
       .def("note_capture_anomaly", &ring_py::RingEnginePy::note_capture_anomaly)
       .def("_test_force_apply_error", &ring_py::RingEnginePy::_test_force_apply_error, py::arg("code"))
       .def("_test_applied_current", &ring_py::RingEnginePy::_test_applied_current, py::arg("graph"))
