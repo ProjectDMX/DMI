@@ -309,6 +309,60 @@ def run_cell(cell: Cell, args: argparse.Namespace) -> CellResult:
 
 
 # ---------------------------------------------------------------------------
+# Thin-wrapper support (plan §5)
+# ---------------------------------------------------------------------------
+
+
+def matrix_argv_from_env(backend: str, standard: str, *,
+                         mode: Optional[str] = None,
+                         default_tolerance: str = "0.01",
+                         env: Optional[dict] = None) -> List[str]:
+    """Build a single-cell matrix argv from the legacy ``E2E_*`` env knobs.
+
+    The pytest wrappers preserve the old test names + shell entry points
+    (verify_hf.sh / verify_vllm.sh) and drive the matrix with the same
+    configuration the legacy tests honored.  ``mode`` defaults to
+    eager/cuda_graph from ``E2E_ENFORCE_EAGER``; the HF cuda-graph wrapper
+    passes it explicitly.
+    """
+    e = os.environ if env is None else env
+    if mode is None:
+        mode = "eager" if e.get("E2E_ENFORCE_EAGER", "1") == "1" else "cuda_graph"
+    hooks = e.get("E2E_HOOK_SELECTION", e.get("DMX_HOOK_SELECTION", "vllm-full"))
+    return [
+        "--backend", backend,
+        "--model", e.get("E2E_MODEL", "gpt2"),
+        "--mode", mode,
+        "--standard", standard,
+        "--hooks", hooks,
+        "--tp", e.get("E2E_TP_SIZE", "1"),
+        "--ring-mb", e.get("E2E_RING_PAYLOAD_MB", "4096"),
+        "--dtype", e.get("E2E_DTYPE", "bfloat16"),
+        "--num-prompts", e.get("E2E_NUM_PROMPTS", "8"),
+        "--max-new-tokens", e.get("E2E_MAX_NEW_TOKENS", "20"),
+        "--max-model-len", e.get("E2E_MAX_MODEL_LEN", "512"),
+        "--max-batched-tokens", e.get("E2E_MAX_NUM_BATCHED_TOKENS", "512"),
+        "--gpu-mem-util", e.get("E2E_GPU_MEM_UTIL", "0.5"),
+        "--tolerance", e.get("E2E_TOLERANCE", default_tolerance),
+        "--db-host", e.get("DMX_DB_HOST", "localhost"),
+        "--db-port", e.get("DMX_DB_PORT", "9000"),
+    ]
+
+
+def run_single(argv: List[str]) -> CellResult:
+    """Parse ``argv`` into exactly one cell, run it, return its CellResult.
+
+    Raises ``ValueError`` if the axes expand to other than one cell -- the
+    wrappers must drive a single concrete cell.
+    """
+    args = build_parser().parse_args(argv)
+    cells = build_cells(args)
+    if len(cells) != 1:
+        raise ValueError(f"run_single expected exactly 1 cell, got {len(cells)}")
+    return run_cell(cells[0], args)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
