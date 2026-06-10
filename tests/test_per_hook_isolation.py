@@ -61,8 +61,7 @@ from tests.isolate_hook import (
     _COPY_LINE_RE,
     _patched_source,
     compare_model_path,
-    invalidate_bytecode,
-    patch_compare_model,
+    isolated_hook,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -136,10 +135,10 @@ class TestPatcherRoundTrip:
         ("vllm", "gpt2"), ("vllm", "qwen3"), ("vllm", "llama"),
     ])
     def test_round_trip_byte_identical(self, framework, model_key):
-        """File contents before and after patch_compare_model must match."""
+        """File contents before and after isolated_hook must match."""
         p = compare_model_path(framework, model_key)
         original = p.read_bytes()
-        with patch_compare_model(framework, model_key, "q") as (model_path, commented):
+        with isolated_hook(framework, model_key, "q") as (model_path, commented):
             assert p.read_bytes() != original, "patch did not modify the file"
             assert len(commented) > 0, "no _buf_* capture lines were commented"
             assert "q" not in commented, "q itself should not be in commented list"
@@ -148,6 +147,28 @@ class TestPatcherRoundTrip:
         # Backup is gone
         backup = p.with_suffix(p.suffix + ".copy_isolate_backup")
         assert not backup.exists()
+
+    def test_dirty_restore_raises_loudly(self, tmp_path, monkeypatch):
+        """If the file can't be restored byte-identically, exit must raise.
+
+        Simulates a body that clobbers the source *and* removes the backup
+        (the failure mode §6 hardens against): the context manager's
+        hash compare on exit must surface it as a loud RuntimeError rather
+        than silently leaving the vendored submodule dirty.
+        """
+        from tests import isolate_hook
+        target = tmp_path / "fake_compare.py"
+        target.write_text(SAMPLE_COMPARE_SOURCE)
+        fake_paths = {("test", "fake"): target}
+        monkeypatch.setattr(isolate_hook, "_COMPARE_MODEL_PATHS", fake_paths)
+
+        with pytest.raises(RuntimeError, match="byte-identically"):
+            with isolate_hook.isolated_hook("test", "fake", "q"):
+                # Corrupt the file and delete the backup so neither unpatch
+                # nor the snapshot can restore the original bytes.
+                target.write_text("corrupted contents that won't be restored")
+                backup = target.with_suffix(target.suffix + ".copy_isolate_backup")
+                backup.unlink()
 
     def test_stale_backup_raises(self, tmp_path, monkeypatch):
         """If a previous run crashed mid-patch leaving a backup, refuse."""
@@ -518,11 +539,10 @@ def test_per_hook_isolation_smoke(
     _run_rollout(tmp_path, "ours", framework, model_key, hook, mode, env)
 
     # Ref: _compare variant patched to isolate H.  Patch persists for
-    # the lifetime of the with-block; the ``invalidate_bytecode`` call
-    # ensures the subprocess imports the patched source rather than a
-    # stale .pyc.
-    with patch_compare_model(framework, model_key, hook):
-        invalidate_bytecode(framework, model_key)
+    # the lifetime of the with-block; ``isolated_hook`` invalidates the
+    # cached bytecode so the subprocess imports the patched source rather
+    # than a stale .pyc, and asserts byte-identical restoration on exit.
+    with isolated_hook(framework, model_key, hook):
         _run_rollout(tmp_path, "ref", framework, model_key, hook, mode, env)
 
     L_orig = torch.load(tmp_path / "orig.pt", map_location="cpu")

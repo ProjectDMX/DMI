@@ -13,8 +13,11 @@ disabled; otherwise the captured tensor for hook H is correct but the
 forward pass also writes to other buffers, which keeps the un-hooked
 tensors live and could mask hook-perturbation regressions.
 
-This module owns the source-level patching.  It is callable both as a
-library (``patch_compare_model``) and as a CLI for ad-hoc isolation runs.
+This module owns the source-level patching.  The canonical entry point is
+the ``isolated_hook`` context manager, which snapshots the file bytes,
+patches, and on exit restores *and asserts byte-identical restoration* so
+the vendored submodule is never left dirty.  It is also callable as a CLI
+for ad-hoc isolation runs.
 
 The patch is applied **in-place** to the source file, with the original
 saved to a sibling ``.copy_isolate_backup`` so a Ctrl-C / crash doesn't
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import os
 import re
 import shutil
@@ -173,24 +177,64 @@ def unpatch(framework: str, model_key: str) -> Path:
 
 
 @contextlib.contextmanager
-def patch_compare_model(
-    framework: str, model_key: str, hook: str
+def isolated_hook(
+    framework: str, model_key: str, hook: str, *, invalidate: bool = True,
 ) -> Iterator[tuple[Path, list[str]]]:
-    """Context-manager form of patch / unpatch.
+    """Single hardened isolation contract (plan §6).
 
-    Yields ``(model_path, commented_bufs)``.  Always restores on exit,
-    even on exception, even on Ctrl-C (best effort -- the backup file
-    persists across crashes).
+    Snapshots the vendored ``_compare`` source bytes, patches the file so
+    only ``hook``'s ``.copy_()`` line fires, yields
+    ``(model_path, commented_bufs)``, and on exit -- always, even on
+    exception or Ctrl-C -- restores from backup and **asserts the file is
+    byte-identical to the snapshot** via a SHA-256 compare.  A non-identical
+    restore raises ``RuntimeError`` loudly so a dirty vendored submodule can
+    never escape unnoticed.
+
+    With ``invalidate=True`` (default) the module's cached bytecode is
+    dropped after patching and after restoring, so a subprocess import
+    always picks up the on-disk source rather than a stale ``.pyc``.  The
+    numeric-difference study (plan §9) consumes this context manager rather
+    than the raw ``patch`` / ``unpatch`` functions.
     """
-    p, commented = patch(framework, model_key, hook)
+    p = compare_model_path(framework, model_key)
+    original_digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    _, commented = patch(framework, model_key, hook)
+    if invalidate:
+        invalidate_bytecode(framework, model_key)
     try:
         yield p, commented
     finally:
         try:
             unpatch(framework, model_key)
         except FileNotFoundError:
-            # Already unpatched (e.g. if the body called unpatch directly).
+            # Already unpatched (e.g. if the body called unpatch directly);
+            # fall through to the hash check, which confirms the on-disk
+            # source matches the snapshot regardless.
             pass
+        if invalidate:
+            invalidate_bytecode(framework, model_key)
+        restored_digest = hashlib.sha256(p.read_bytes()).hexdigest()
+        if restored_digest != original_digest:
+            raise RuntimeError(
+                f"isolated_hook failed to restore {p} byte-identically "
+                f"(framework={framework!r}, model_key={model_key!r}, "
+                f"hook={hook!r}); the vendored submodule may be left dirty. "
+                f"Restore it manually, e.g. `git -C {REPO_ROOT} checkout -- {p}`."
+            )
+
+
+@contextlib.contextmanager
+def patch_compare_model(
+    framework: str, model_key: str, hook: str
+) -> Iterator[tuple[Path, list[str]]]:
+    """Backward-compatible alias for :func:`isolated_hook`.
+
+    Kept for existing callers.  Delegates to the hardened contract but
+    leaves bytecode invalidation to the caller (historical behavior).
+    Prefer :func:`isolated_hook` for new code.
+    """
+    with isolated_hook(framework, model_key, hook, invalidate=False) as y:
+        yield y
 
 
 def _bytecode_paths_for(p: Path) -> list[Path]:
