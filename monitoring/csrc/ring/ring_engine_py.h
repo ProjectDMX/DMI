@@ -202,6 +202,10 @@ public:
     uint64_t capture_anomaly_count() const;     // >0 => registry suspect, refuse to activate
     // Bind a captured graph to its instantiated exec (post-warmup).
     void bind_graph_exec(uint64_t graph, uint64_t exec);
+    // Bumped by every registry mutation (capture flag, node recording, anomaly,
+    // bind, clear). The host caches its registry-guard verdict keyed on this,
+    // so a cached "valid" can never survive a mutation.
+    uint64_t toggle_registry_version() const;
     // Set the enabled (hook_type, layer_no) set (the single source).
     void set_enabled_hooks(const std::vector<std::pair<int,int>>& enabled);
     // Apply the enabled set to every bound exec via cudaGraphNodeSetEnabled.
