@@ -521,8 +521,12 @@ class RingTransport:
         """The specs that actually fire this step -- the single set that must
         drive capacity-reserve, meta-push and device node-enable in lockstep.
         Toggle active -> the precomputed enabled-AND-captured subset; else all
-        active specs (toggle inactive: every active hook fires every step)."""
-        if self._toggle_gate_active and self._effective_enabled_specs is not None:
+        active specs (toggle inactive: every active hook fires every step).
+
+        getattr defaults: a minimally-constructed transport (tests build one
+        via ``RingTransport.__new__``) has no toggle attributes -> inactive."""
+        if (getattr(self, "_toggle_gate_active", False)
+                and getattr(self, "_effective_enabled_specs", None) is not None):
             return self._effective_enabled_specs
         return self._active_specs
 
@@ -717,8 +721,8 @@ class RingTransport:
 
     def is_graph_ready(self, raw_graph: int) -> bool:
         """Read-only replay-time guard: True iff the graph has recorded producer
-        nodes AND a bound exec. False for a graph vLLM captured at runtime after
-        the warmup window closed -> the replay hook fails loud."""
+        nodes AND a bound exec. False for a graph the serving framework captured
+        at runtime after the warmup window closed -> the replay hook fails loud."""
         return self._ring_engine.is_graph_ready(raw_graph)
 
     def ensure_graph_current(self, raw_graph: int) -> int:
