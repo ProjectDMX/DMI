@@ -307,3 +307,62 @@ class TestMatrixExpansion:
     def test_main_empty_axis_returns_2(self):
         from tests.e2e_matrix import main
         assert main(["--backend", "", "--dry-run"]) == 2
+
+
+class TestWrapperTranslation:
+    """matrix_argv_from_env / run_single — the thin-wrapper surface (plan §5)."""
+
+    def test_env_to_argv_defaults(self):
+        from tests.e2e_matrix import matrix_argv_from_env, build_parser, build_cells
+        argv = matrix_argv_from_env("vllm", "bitwise", env={})
+        cell = build_cells(build_parser().parse_args(argv))[0]
+        assert cell.backend == "vllm" and cell.standard == "bitwise"
+        assert cell.model == "gpt2" and cell.mode == "eager"
+        assert cell.hooks == "vllm-full" and cell.ring_mb == 4096
+
+    def test_env_enforce_eager_maps_mode(self):
+        from tests.e2e_matrix import matrix_argv_from_env, build_parser, build_cells
+        env = {"E2E_ENFORCE_EAGER": "0", "E2E_MODEL": "qwen3"}
+        cell = build_cells(build_parser().parse_args(
+            matrix_argv_from_env("vllm", "row_count", env=env)))[0]
+        assert cell.mode == "cuda_graph" and cell.model == "qwen3"
+
+    def test_explicit_mode_overrides_enforce_eager(self):
+        from tests.e2e_matrix import matrix_argv_from_env, build_parser, build_cells
+        # HF cuda-graph wrapper forces mode even though E2E_ENFORCE_EAGER=1.
+        env = {"E2E_ENFORCE_EAGER": "1"}
+        cell = build_cells(build_parser().parse_args(
+            matrix_argv_from_env("hf", "allclose", mode="cuda_graph", env=env)))[0]
+        assert cell.mode == "cuda_graph"
+
+    def test_hook_selection_precedence(self):
+        from tests.e2e_matrix import matrix_argv_from_env
+        # public E2E_HOOK_SELECTION wins over internal DMX_HOOK_SELECTION
+        argv = matrix_argv_from_env("vllm", "bitwise", env={
+            "E2E_HOOK_SELECTION": "q", "DMX_HOOK_SELECTION": "k"})
+        assert argv[argv.index("--hooks") + 1] == "q"
+        # falls back to DMX_HOOK_SELECTION when public unset
+        argv = matrix_argv_from_env("vllm", "bitwise", env={"DMX_HOOK_SELECTION": "k"})
+        assert argv[argv.index("--hooks") + 1] == "k"
+
+    def test_default_tolerance_passthrough(self):
+        from tests.e2e_matrix import matrix_argv_from_env
+        argv = matrix_argv_from_env("hf", "allclose", mode="cuda_graph",
+                                    default_tolerance="0.5", env={})
+        assert argv[argv.index("--tolerance") + 1] == "0.5"
+        # explicit env overrides the default
+        argv = matrix_argv_from_env("hf", "allclose", default_tolerance="0.5",
+                                    env={"E2E_TOLERANCE": "0.01"})
+        assert argv[argv.index("--tolerance") + 1] == "0.01"
+
+    def test_run_single_rejects_multi_cell(self, monkeypatch):
+        # matrix_argv_from_env always yields one cell; guard the invariant.
+        from tests import e2e_matrix
+        args = e2e_matrix.build_parser().parse_args(
+            ["--backend", "hf,vllm", "--standard", "row_count"])
+        monkeypatch.setattr(e2e_matrix, "run_cell", lambda *a, **k: None)
+        with pytest.raises(ValueError, match="exactly 1 cell"):
+            # build_cells gives 2 -> run_single must refuse
+            cells = e2e_matrix.build_cells(args)
+            assert len(cells) == 2
+            e2e_matrix.run_single(["--backend", "hf,vllm", "--standard", "row_count"])
