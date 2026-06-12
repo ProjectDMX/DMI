@@ -21,7 +21,7 @@ import torch
 from monitoring import _native_engine as ne
 from monitoring import ring_transport as rt
 from monitoring.ring_transport import RingTransport, HookSpec, ModelShapeConfig
-import integration.vllm_adapter as va
+import integration.vllm_node_toggle as vnt
 
 HT = rt.HOOK_TYPE_RESID_PRE
 N = 3
@@ -88,8 +88,8 @@ def test_completeness_guard():
 
 def test_replay_guard():
     print("[replay-time unknown-graph guard]")
-    va._patch_cudagraph_keep_graph()
-    va._DMX_TOGGLE_REPLAY_GUARD = True
+    vnt._patch_cudagraph_keep_graph()
+    vnt._DMX_TOGGLE_REPLAY_GUARD = True
 
     eng = _new_engine()
     eng.set_null_mode(True)
@@ -125,7 +125,7 @@ def test_replay_guard():
     check(raised, "unknown graph B RAISES fatal at replay (would-be desync blocked)")
 
     rt.deactivate()
-    va._DMX_TOGGLE_REPLAY_GUARD = False
+    vnt._DMX_TOGGLE_REPLAY_GUARD = False
     eng.stop()
 
 

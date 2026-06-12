@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 import torch
 import integration.vllm_adapter as va
+import integration.vllm_node_toggle as vnt
 
 fails = 0
 
@@ -37,22 +38,22 @@ def main():
     check(hasattr(va, "DMXGPUWorker") and hasattr(va, "VLLMAdaptor"),
           "vllm_adapter imports (DMXGPUWorker + VLLMAdaptor present)")
 
-    check(va._parse_enabled_hooks("0:32,0:33") == [(0, 32), (0, 33)],
+    check(vnt._parse_enabled_hooks("0:32,0:33") == [(0, 32), (0, 33)],
           "_parse_enabled_hooks('0:32,0:33')")
-    check(va._parse_enabled_hooks("14") == [(14, -1)],
+    check(vnt._parse_enabled_hooks("14") == [(14, -1)],
           "_parse_enabled_hooks('14') -> global layer -1")
     # (#5) the three distinct config meanings, no overloaded empty string:
-    check(va._parse_enabled_hooks(None) is None, "_parse_enabled_hooks(None) -> None (unconfigured)")
-    check(va._parse_enabled_hooks("") is None, "_parse_enabled_hooks('') -> None (unconfigured)")
-    check(va._parse_enabled_hooks("none") == [], "_parse_enabled_hooks('none') -> [] (explicit all-off)")
-    check(va._parse_enabled_hooks("NONE") == [], "_parse_enabled_hooks('NONE') -> [] (case-insensitive)")
+    check(vnt._parse_enabled_hooks(None) is None, "_parse_enabled_hooks(None) -> None (unconfigured)")
+    check(vnt._parse_enabled_hooks("") is None, "_parse_enabled_hooks('') -> None (unconfigured)")
+    check(vnt._parse_enabled_hooks("none") == [], "_parse_enabled_hooks('none') -> [] (explicit all-off)")
+    check(vnt._parse_enabled_hooks("NONE") == [], "_parse_enabled_hooks('NONE') -> [] (case-insensitive)")
 
     Orig = torch.cuda.CUDAGraph
-    va._patch_cudagraph_keep_graph()
+    vnt._patch_cudagraph_keep_graph()
     Patched = torch.cuda.CUDAGraph
     check(Patched is not Orig and issubclass(Patched, Orig),
           "keep_graph patch installed as a CUDAGraph subclass")
-    va._patch_cudagraph_keep_graph()
+    vnt._patch_cudagraph_keep_graph()
     check(torch.cuda.CUDAGraph is Patched, "patch is idempotent")
 
     # vLLM builds graphs as CUDAGraph() with NO args -> must default keep_graph=True.

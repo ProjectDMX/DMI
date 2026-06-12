@@ -86,7 +86,7 @@ def main():
         want = [(s.hook_type, s.layer_no) for s in fresh_effective(transport, keep)]
         check(got == want and sorted(ln for _, ln in got) == sorted(keep),
               f"round {r_i} keep={keep}: effective {sorted(ln for _, ln in got)}")
-    check(len(transport._effective_specs_cache) > 0, "preset cache populated")
+    check(len(transport._toggle._cache) > 0, "preset cache populated")
 
     print("[equivalence: _active_specs swap must miss the cache]")
     transport._active_specs = transport._active_specs[:4]   # new list object
