@@ -429,36 +429,10 @@ class RingTransport:
         self._active_specs: List[HookSpec] = []
         self._using_forward_hooks: bool = False
 
-        # Runtime node-toggle gate. When False (default), the meta path is
-        # unchanged -- every active spec pushes a meta. When True (set by
-        # set_active_hooks), pre_push_all_metas pushes metas only for the
-        # enabled-AND-captured subset, in LOCKSTEP with the device-side
-        # cudaGraphNodeSetEnabled. The engine's enabled-set (with the
-        # enabled-AND-captured guard) is the single source of truth.
-        self._toggle_gate_active: bool = False
-        # Single source of truth for "which specs actually fire this step".
-        # When the toggle gate is active, this is the subset of _active_specs
-        # whose nodes are enabled-AND-captured; recomputed once per
-        # set_active_hooks (NOT per step). None => toggle inactive => all
-        # _active_specs fire. capacity-reserve (adaptor_base._compute_step_plan),
-        # meta-push AND the device node-enable must all read this same set, else
-        # reserve() over-counts vs actual producer writes.
-        self._effective_enabled_specs: "Optional[List[HookSpec]]" = None
-        self._enabled_version: int = 0   # bumped whenever the enabled set changes
-        # True when the active gate uses the LAZY device-apply path
-        # (set_active_hooks_lazy). The replay guard reads this to decide whether
-        # to ensure_graph_current (lazy) or only validate (eager).
-        self._lazy_active: bool = False
-        # Reconfigure caches, both keyed on the engine's registry version (bumped
-        # by every registry mutation) so neither can serve a stale result:
-        #   - _guard_valid_version: the registry version whose guard validation
-        #     PASSED; same version => skip re-running the O(graphs x hooks)
-        #     registry guards on the next reconfigure. Failures are never cached.
-        #   - _effective_specs_cache: (registry_version, enabled frozenset) ->
-        #     (active_specs ref, effective list). The stored active_specs
-        #     reference is compared with `is` (the strong ref pins the id).
-        self._guard_valid_version: Optional[int] = None
-        self._effective_specs_cache: dict = {}
+        # Runtime node-toggle controller (monitoring/node_toggle.py), created
+        # on first use. None (or absent on a minimally-constructed transport)
+        # => toggle inactive => every active spec fires every step.
+        self._toggle: "Optional[NodeToggleController]" = None
 
         # Hook selection preset name (e.g. "full", "hidden-states", "logits").
         # Set by the active adapter before hook installation.
@@ -523,12 +497,29 @@ class RingTransport:
         Toggle active -> the precomputed enabled-AND-captured subset; else all
         active specs (toggle inactive: every active hook fires every step).
 
-        getattr defaults: a minimally-constructed transport (tests build one
-        via ``RingTransport.__new__``) has no toggle attributes -> inactive."""
-        if (getattr(self, "_toggle_gate_active", False)
-                and getattr(self, "_effective_enabled_specs", None) is not None):
-            return self._effective_enabled_specs
+        getattr default: a minimally-constructed transport (tests build one
+        via ``RingTransport.__new__``) has no controller -> inactive."""
+        t = getattr(self, "_toggle", None)
+        if (t is not None and t.gate_active
+                and t.effective_enabled_specs is not None):
+            return t.effective_enabled_specs
         return self._active_specs
+
+    def _toggle_ctrl(self) -> "NodeToggleController":
+        if self._toggle is None:
+            from monitoring.node_toggle import NodeToggleController
+            self._toggle = NodeToggleController(self._ring_engine, self)
+        return self._toggle
+
+    @property
+    def toggle_gate_active(self) -> bool:
+        t = getattr(self, "_toggle", None)
+        return t is not None and t.gate_active
+
+    @property
+    def toggle_lazy_active(self) -> bool:
+        t = getattr(self, "_toggle", None)
+        return t is not None and t.lazy_active
 
     def pre_push_all_metas(self, batch: int, q_len: int, kv_dim: int,
                            logits_to_keep: int = 0,
@@ -605,150 +596,34 @@ class RingTransport:
             )
 
     def set_active_hooks(self, enabled: "Iterable[Tuple[int, int]]") -> None:
-        """Eager runtime node-toggle: enable exactly `enabled` (hook_type, layer_no)
-        pairs and disable the rest, NOW.
-
-        Flips the captured producer nodes on every bound exec (apply_toggle) and
-        activates the host meta gate, both driven by the engine's enabled-set
-        (single source of truth) so reserve/meta/device stay in lockstep.
-
-        CONTRACT: eager apply does not wait on replay events, so call only at a
-        quiescent point (no bound-exec replay in flight) -- e.g. once after warmup.
-        For dynamic / per-step reconfigure use set_active_hooks_lazy (event-guarded).
-        Requires producer nodes registered at capture + execs bound.
-        """
-        eng = self._ring_engine
-        self._validate_toggle_registry("set_active_hooks")
-        pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
-        eng.set_enabled_hooks(pairs)
-        err = eng.apply_toggle()
-        if err != 0:
-            raise RuntimeError(f"apply_toggle failed with CUDA error {err}")
-        self._toggle_gate_active = True
-        self._lazy_active = False
-        self._recompute_effective_specs(pairs)
+        """Eager node-toggle reconfigure (quiescent-point only). See
+        ``node_toggle.NodeToggleController.set_active_hooks`` for the contract."""
+        self._toggle_ctrl().set_active_hooks(enabled)
 
     def set_active_hooks_lazy(self, enabled: "Iterable[Tuple[int, int]]") -> None:
-        """Lazy reconfigure: update the enabled set + host meta gate, but
-        DEFER the device apply to per-graph ensure_graph_current() (called just
-        before each graph replays). set_enabled_hooks bumps the engine's
-        target_version, marking every captured graph stale; the device flip then
-        happens lazily, only on graphs actually replayed. Same guards + gate
-        semantics as set_active_hooks, minus apply_toggle.
-        """
-        eng = self._ring_engine
-        self._validate_toggle_registry("set_active_hooks_lazy")
-        pairs = [(int(ht), int(ln)) for (ht, ln) in enabled]
-        eng.set_enabled_hooks(pairs)        # bumps target_version; device apply deferred
-        self._toggle_gate_active = True
-        self._lazy_active = True
-        self._recompute_effective_specs(pairs)
-
-    def _validate_toggle_registry(self, who: str) -> None:
-        """Registry guards shared by set_active_hooks[_lazy], memoized on the
-        engine's registry version: the registry mutates only at capture / bind /
-        clear time, so re-running the O(graphs x hooks) checks on an unchanged
-        registry is wasted work on every reconfigure. Only a PASS is cached;
-        every registry mutation bumps the version and forces re-validation."""
-        eng = self._ring_engine
-        version = eng.toggle_registry_version()   # read BEFORE validating
-        if version == self._guard_valid_version:
-            return
-        # Guard: gate active but device toggle a no-op (nothing bound/captured)
-        # -> metas filtered while all producers still fire -> desync. Fail loud.
-        if eng.bound_graph_count() == 0 or eng.toggle_node_count() == 0:
-            raise RuntimeError(
-                "%s: no producer nodes registered / no graph exec bound "
-                "(toggle_node_count=%d, bound_graph_count=%d). Capture with "
-                "enable_toggle_capture(True) and call bind_graph_exec() first."
-                % (who, eng.toggle_node_count(), eng.bound_graph_count()))
-        # Guard: non-uniform hook sets across graphs -> a hook in one graph but
-        # not the replayed one pushes an orphan meta.
-        if not eng.toggle_registry_uniform():
-            raise RuntimeError(
-                "%s: captured graphs have non-uniform hook sets; the "
-                "global meta gate cannot stay aligned. Ensure every captured graph "
-                "registers the same hooks." % who)
-        # Guard: node-registry vs exec-binding key mismatch (partial bind) -> a
-        # graph replays default-ON while the meta gate filters -> desync.
-        if not eng.toggle_registry_complete():
-            raise RuntimeError(
-                "%s: toggle registry incomplete -- the set of graphs "
-                "with recorded producer nodes does not match the set of bound execs. "
-                "Every captured graph must be bound (bind_graph_exec) and vice versa."
-                % who)
-        if eng.capture_anomaly_count() > 0:
-            raise RuntimeError(
-                "%s: capture recorded %d producer node(s) node-toggle "
-                "cannot manage -- either a non-kernel tail dependency (multi-op "
-                "producer / capture event-join), or a chunked producer (not "
-                "supported under node-toggle; set dmx_gpu_padding_strip=False to route "
-                "every hook through the basic producer). Refusing to activate "
-                "(fail-closed)." % (who, eng.capture_anomaly_count()))
-        self._guard_valid_version = version
-
-    def _recompute_effective_specs(self, pairs=None) -> None:
-        """Recompute the single effective-enabled set (active ∩ enabled ∩
-        registered) via ONE batched pybind call. Called by set_active_hooks[_lazy]
-        only (the enabled set changes there; registered set is fixed after
-        capture). capacity-reserve + meta-push both read this -> they can never
-        diverge from the device enabled set. Bumps version to invalidate the
-        worker's capacity cache.
-
-        With `pairs` (the enabled set just pushed to the engine), the result is
-        memoized per (registry version, enabled set, active_specs identity), so
-        repeated presets (graduated monitoring levels, profiler sweep cycles)
-        skip the recompute. The cached active_specs reference is compared with
-        `is`; holding it pins the id, so identity cannot be reused."""
-        key = None
-        if pairs is not None:
-            key = (self._ring_engine.toggle_registry_version(), frozenset(pairs))
-            hit = self._effective_specs_cache.get(key)
-            if hit is not None and hit[0] is self._active_specs:
-                self._effective_enabled_specs = hit[1]
-                self._enabled_version += 1
-                return
-        mask = self._ring_engine.effective_enabled_mask(
-            [(s.hook_type, s.layer_no) for s in self._active_specs])
-        self._effective_enabled_specs = [
-            s for s, m in zip(self._active_specs, mask) if m]
-        self._enabled_version += 1
-        if key is not None:
-            if len(self._effective_specs_cache) >= 64:   # ad-hoc sets: bound it
-                self._effective_specs_cache.clear()
-            self._effective_specs_cache[key] = (
-                self._active_specs, self._effective_enabled_specs)
+        """Lazy node-toggle reconfigure (device apply deferred per graph). See
+        ``node_toggle.NodeToggleController.set_active_hooks_lazy``."""
+        self._toggle_ctrl().set_active_hooks_lazy(enabled)
 
     def is_graph_ready(self, raw_graph: int) -> bool:
-        """Read-only replay-time guard: True iff the graph has recorded producer
-        nodes AND a bound exec. False for a graph the serving framework captured
-        at runtime after the warmup window closed -> the replay hook fails loud."""
-        return self._ring_engine.is_graph_ready(raw_graph)
+        """Read-only replay-time guard. See
+        ``node_toggle.NodeToggleController.is_graph_ready``."""
+        return self._toggle_ctrl().is_graph_ready(raw_graph)
 
     def ensure_graph_current(self, raw_graph: int) -> int:
-        """Lazy: apply the deferred toggle to the graph about to replay (no-op if
-        already current). Call right before the graph's replay; raw_graph is the
-        cudaGraph_t handle the graph was bound with."""
-        return self._ring_engine.ensure_graph_current(raw_graph)
+        """Lazy per-graph device apply. See
+        ``node_toggle.NodeToggleController.ensure_graph_current``."""
+        return self._toggle_ctrl().ensure_graph_current(raw_graph)
 
     def record_replay_event(self, raw_graph: int) -> int:
-        """Lazy event guard: record a stream event after a graph's replay so a
-        later ensure_graph_current() waits for it before mutating that exec.
-        Returns the CUDA error (0 = ok); nonzero is FATAL (a missing event would
-        let a later ensure mutate an executing exec)."""
-        return self._ring_engine.record_replay_event(raw_graph)
+        """Lazy event guard (record after replay). See
+        ``node_toggle.NodeToggleController.record_replay_event``."""
+        return self._toggle_ctrl().record_replay_event(raw_graph)
 
     def clear_toggle(self) -> None:
-        """Paired teardown: clear the engine's toggle registry AND deactivate the
-        host gate, so neither lane is left half-configured. Call before a
-        re-capture or when disabling monitoring."""
-        self._ring_engine.clear_toggle_registry()
-        self._toggle_gate_active = False
-        self._lazy_active = False
-        self._effective_enabled_specs = None
-        self._enabled_version += 1
-        self._guard_valid_version = None
-        self._effective_specs_cache.clear()
+        """Paired teardown of registry + host gate. See
+        ``node_toggle.NodeToggleController.clear``."""
+        self._toggle_ctrl().clear()
 
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
                           hook_type: int, hook_id: int) -> None:

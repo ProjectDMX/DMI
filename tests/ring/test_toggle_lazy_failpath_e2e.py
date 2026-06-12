@@ -21,7 +21,7 @@ import torch
 from monitoring import _native_engine as ne
 from monitoring import ring_transport as rt
 from monitoring.ring_transport import RingTransport, HookSpec, ModelShapeConfig
-import integration.vllm_adapter as va
+import integration.vllm_node_toggle as vnt
 
 HT = rt.HOOK_TYPE_RESID_PRE
 N = 3
@@ -38,8 +38,8 @@ def check(cond, msg):
 
 
 def main():
-    va._patch_cudagraph_keep_graph()
-    va._DMX_TOGGLE_REPLAY_GUARD = True
+    vnt._patch_cudagraph_keep_graph()
+    vnt._DMX_TOGGLE_REPLAY_GUARD = True
 
     cfg = ne.RingConfig()
     cfg.payload_ring_bytes = 32 * 1024 * 1024
@@ -101,7 +101,7 @@ def main():
     check(ok, "clean lazy apply replays without raising (recovery)")
 
     rt.deactivate()
-    va._DMX_TOGGLE_REPLAY_GUARD = False
+    vnt._DMX_TOGGLE_REPLAY_GUARD = False
     eng.stop()
     print(f"\n{'ALL PASS' if fails == 0 else f'{fails} FAILURES'}")
     return 1 if fails else 0
