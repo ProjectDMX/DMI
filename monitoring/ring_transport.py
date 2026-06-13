@@ -172,8 +172,8 @@ class HookSpec:
     # META_FLAG_ALLOW_MISMATCH; consumer recomputes dim-0 from actual bytes.
     allow_token_cnt_mismatch: bool = False
     # True when this spec's shape has dim-0 = total_tokens in the framework's
-    # layout (vLLM flat: total_tokens; HF batched: batch * q_len when q_len is
-    # the variable axis).  Adapters that enable a padding-strip mode use this
+    # packed-flat layout, or batch * q_len in the batched layout when q_len is
+    # the variable axis.  Adapters that enable a padding-strip mode use this
     # flag to mark prefix-eligible specs.  Static property; ignored when no
     # adapter activates strip.
     dim0_is_actual_tokens: bool = False
@@ -420,8 +420,8 @@ class RingTransport:
         #   2. fits after flushing the ring -> flush_and_wait + reserve_one + ring
         #   3. single tensor > ring        -> flush_and_wait + submit_cpu_direct
         # Owned by adaptor_base.before_forward (per-batch reassignment based
-        # on prepare_step result and dynamic-spec presence).  Consumers
-        # (vLLM dispatch wrapper, HookPoint.forward) read only.
+        # on prepare_step result and dynamic-spec presence).  Dispatch
+        # wrappers and HookPoint.forward read only.
         self.force_eager: bool = False
 
         # New-path state

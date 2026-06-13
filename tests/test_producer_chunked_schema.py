@@ -16,29 +16,30 @@ import torch
 
 from monitoring._native_engine import _load_extension
 
+pytestmark = pytest.mark.native_backend
+
 
 def setup_module(module):  # noqa: D401 -- pytest hook
-    _load_extension()  # ensure .so loaded -> three ring ops registered
+    try:
+        _load_extension()  # ensure .so loaded -> three ring ops registered
+    except ImportError as exc:
+        pytest.skip(f"DMI native backend required: {exc}", allow_module_level=True)
 
 
-# --- Registration / wiring: no CUDA device required (CPU default suite) ------
+# --- Registration / wiring: no CUDA device required, but native backend needed.
 
-@pytest.mark.cpu
 def test_producer_op_registered():
     assert torch.ops.ring.producer.default is not None
 
 
-@pytest.mark.cpu
 def test_producer_prefix_op_registered():
     assert torch.ops.ring.producer_prefix.default is not None
 
 
-@pytest.mark.cpu
 def test_producer_chunked_op_registered():
     assert torch.ops.ring.producer_chunked.default is not None
 
 
-@pytest.mark.cpu
 def test_hook_point_strip_attrs_default_to_static():
     """HookPoint instances default to the static path."""
     from monitoring.hook_points import HookPoint
