@@ -15,7 +15,7 @@ source "$CONDA_SH"
 conda activate "$CONDA_ENV_NAME"
 
 MODEL="${E2E_MODEL:-qwen2_moe}"
-HOOKS="${E2E_HOOKS:-vllm-full}"
+HOOKS="${E2E_HOOK_SELECTION:-vllm-full}"
 TP="${E2E_TP_SIZE:-2}"
 MAX_MODEL_LEN="${E2E_MAX_MODEL_LEN:-128}"
 REF_MAX_LEN="${E2E_REF_MAX_LEN:-512}"

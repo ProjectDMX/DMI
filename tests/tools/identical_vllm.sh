@@ -34,7 +34,7 @@ run_identical_test() {
     E2E_MODEL=$model_key \
     E2E_ENFORCE_EAGER=$eager \
     E2E_DTYPE=bfloat16 \
-    E2E_HOOKS=vllm-full \
+    E2E_HOOK_SELECTION=vllm-full \
     E2E_REF_MAX_LEN=8192 \
     E2E_RING_PAYLOAD_MB=$ring_mb \
     E2E_RING_PINNED_MB=$ring_mb \
