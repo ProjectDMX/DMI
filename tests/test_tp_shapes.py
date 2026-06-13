@@ -1,34 +1,71 @@
 """Unit tests for TP-aware shape computation in _compute_hook_shape.
 
-No GPU or distributed setup needed — tests use ModelShapeConfig directly.
+No GPU or distributed setup needed. These tests still import ring_transport's
+native hook-definition layer, so they are not part of the no-native-build CPU
+gate.
 """
 
 import pytest
 import torch
 
-from monitoring.ring_transport import (
-    HOOK_TYPE_RESID_PRE,
-    HOOK_TYPE_LN1,
-    HOOK_TYPE_ATTN_OUT,
-    HOOK_TYPE_RESID_MID,
-    HOOK_TYPE_LN2,
-    HOOK_TYPE_MLP_IN,
-    HOOK_TYPE_MLP_OUT,
-    HOOK_TYPE_Q,
-    HOOK_TYPE_K,
-    HOOK_TYPE_V,
-    HOOK_TYPE_Z,
-    HOOK_TYPE_ATTN_SCORES,
-    HOOK_TYPE_MLP_POST,
-    HOOK_TYPE_RESID_FINAL,
-    HOOK_TYPE_EMBED,
-    HOOK_TYPE_POS_EMBED,
-    HOOK_TYPE_FINAL_LN,
-    HOOK_TYPE_TOKEN_IDS,
-    HOOK_TYPE_FINAL_LOGITS,
-    ModelShapeConfig,
-    _compute_hook_shape,
-)
+try:
+    from monitoring.ring_transport import (
+        HOOK_TYPE_RESID_PRE,
+        HOOK_TYPE_LN1,
+        HOOK_TYPE_ATTN_OUT,
+        HOOK_TYPE_RESID_MID,
+        HOOK_TYPE_LN2,
+        HOOK_TYPE_MLP_IN,
+        HOOK_TYPE_MLP_OUT,
+        HOOK_TYPE_Q,
+        HOOK_TYPE_K,
+        HOOK_TYPE_V,
+        HOOK_TYPE_Z,
+        HOOK_TYPE_ATTN_SCORES,
+        HOOK_TYPE_MLP_POST,
+        HOOK_TYPE_RESID_FINAL,
+        HOOK_TYPE_EMBED,
+        HOOK_TYPE_POS_EMBED,
+        HOOK_TYPE_FINAL_LN,
+        HOOK_TYPE_TOKEN_IDS,
+        HOOK_TYPE_FINAL_LOGITS,
+        ModelShapeConfig,
+        _compute_hook_shape,
+    )
+    _NATIVE_IMPORT_ERROR = None
+except ImportError as exc:
+    (
+        HOOK_TYPE_RESID_PRE,
+        HOOK_TYPE_LN1,
+        HOOK_TYPE_ATTN_OUT,
+        HOOK_TYPE_RESID_MID,
+        HOOK_TYPE_LN2,
+        HOOK_TYPE_MLP_IN,
+        HOOK_TYPE_MLP_OUT,
+        HOOK_TYPE_Q,
+        HOOK_TYPE_K,
+        HOOK_TYPE_V,
+        HOOK_TYPE_Z,
+        HOOK_TYPE_ATTN_SCORES,
+        HOOK_TYPE_MLP_POST,
+        HOOK_TYPE_RESID_FINAL,
+        HOOK_TYPE_EMBED,
+        HOOK_TYPE_POS_EMBED,
+        HOOK_TYPE_FINAL_LN,
+        HOOK_TYPE_TOKEN_IDS,
+        HOOK_TYPE_FINAL_LOGITS,
+        ModelShapeConfig,
+        _compute_hook_shape,
+    ) = (None,) * 21
+    _NATIVE_IMPORT_ERROR = exc
+
+pytestmark = [
+    pytest.mark.native_backend,
+    pytest.mark.skipif(
+        _NATIVE_IMPORT_ERROR is not None,
+        reason=f"DMI native backend required: {_NATIVE_IMPORT_ERROR}",
+    ),
+]
 
 
 def _cfg(tp_size=1):

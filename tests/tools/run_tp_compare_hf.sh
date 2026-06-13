@@ -1,6 +1,6 @@
 #!/bin/bash
 # HF transport correctness test: single run with compare model.
-# Usage: bash tests/run_tp_compare_hf.sh [model] [mode] [tp]
+# Usage: bash tests/tools/run_tp_compare_hf.sh [model] [mode] [tp]
 #   model: gpt2 (default) or qwen3
 #   mode:  eager (default) or cudagraph
 #   tp:    1 (default) or 2

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Transport correctness test: single run, compare .copy_() buffers vs ClickHouse.
-# Usage: bash tests/run_tp_compare_vllm.sh [model] [mode] [tp]
+# Usage: bash tests/tools/run_tp_compare_vllm.sh [model] [mode] [tp]
 #   model: qwen3 (default) or gpt2
 #   mode:  eager (default) or cudagraph
 #   tp:    1 (default) or 2

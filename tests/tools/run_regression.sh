@@ -1,6 +1,6 @@
 #!/bin/bash
 # Full regression test suite.
-# Usage: LD_PRELOAD=... CUDA_VISIBLE_DEVICES=0,1 bash tests/run_regression.sh
+# Usage: LD_PRELOAD=... CUDA_VISIBLE_DEVICES=0,1 bash tests/tools/run_regression.sh
 set -e
 
 PASS=0
@@ -23,7 +23,7 @@ run_test() {
     fi
 }
 
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$PROJECT_ROOT"
 
 # --- Unit tests ---
@@ -34,9 +34,9 @@ run_test "unit: test_tp_shapes + test_config" \
 for model in qwen3 gpt2; do
     for mode in eager cudagraph; do
         run_test "vllm: $model $mode tp=1" \
-            bash tests/run_tp_compare_vllm.sh "$model" "$mode" 1
+            bash tests/tools/run_tp_compare_vllm.sh "$model" "$mode" 1
         run_test "vllm: $model $mode tp=2" \
-            bash tests/run_tp_compare_vllm.sh "$model" "$mode" 2
+            bash tests/tools/run_tp_compare_vllm.sh "$model" "$mode" 2
     done
 done
 
@@ -44,13 +44,13 @@ done
 for model in gpt2 qwen3; do
     for mode in eager cudagraph; do
         run_test "hf: $model $mode tp=1" \
-            bash tests/run_tp_compare_hf.sh "$model" "$mode" 1
+            bash tests/tools/run_tp_compare_hf.sh "$model" "$mode" 1
     done
 done
 # HF TP=2 (qwen3 only — gpt2 lacks tp_plan support)
 for mode in eager cudagraph; do
     run_test "hf: qwen3 $mode tp=2" \
-        bash tests/run_tp_compare_hf.sh qwen3 "$mode" 2
+        bash tests/tools/run_tp_compare_hf.sh qwen3 "$mode" 2
 done
 
 # --- Summary ---

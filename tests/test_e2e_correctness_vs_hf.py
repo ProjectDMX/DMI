@@ -76,6 +76,13 @@ from typing import Dict, List, Tuple
 import pytest
 import torch
 
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.e2e,
+    pytest.mark.clickhouse,
+    pytest.mark.hf,
+]
+
 from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
 from monitoring.segment_merger import merge_segments, parse_internal_id
 

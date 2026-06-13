@@ -11,10 +11,24 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 import torch.nn as nn
 
-from monitoring.ring_transport import HookSpec, ModelShapeConfig, RingTransport
+try:
+    from monitoring.ring_transport import HookSpec, ModelShapeConfig, RingTransport
+    _NATIVE_IMPORT_ERROR = None
+except ImportError as exc:
+    HookSpec = ModelShapeConfig = RingTransport = None
+    _NATIVE_IMPORT_ERROR = exc
+
+pytestmark = [
+    pytest.mark.native_backend,
+    pytest.mark.skipif(
+        _NATIVE_IMPORT_ERROR is not None,
+        reason=f"DMI native backend required: {_NATIVE_IMPORT_ERROR}",
+    ),
+]
 
 
 def test_hook_spec_flag_defaults_false():

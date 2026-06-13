@@ -40,6 +40,13 @@ import tempfile
 import pytest
 import torch
 
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.vllm,
+    pytest.mark.clickhouse,
+    pytest.mark.e2e,
+]
+
 _MODEL_REF_FILES = {
     "gpt2": "gpt2_ref.py",
     "qwen2_moe": "qwen2_moe_ref.py",

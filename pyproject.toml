@@ -32,6 +32,23 @@ monitoring = [
 include = ["monitoring*", "benchmark*", "integration"]
 
 [tool.pytest.ini_options]
+# `manual` tools and native-ring sources are not collected by default. The
+# lightweight PR gate should select true CPU tests explicitly:
+#   python -m pytest -m "cpu" -q
+addopts = "-ra -m 'not manual'"
+norecursedirs = ["tests/tools", "tests/ring", ".venv", "integration", "build"]
 markers = [
+    "cpu: pure-CPU contract/unit test (no CUDA / ClickHouse / vLLM runtime / model weights / native extension build required)",
+    "gpu: requires a CUDA device",
+    "multi_gpu: requires >= 2 CUDA devices (TP / EP / routing)",
+    "e2e: end-to-end pipeline through the native backend + host engine",
+    "clickhouse: requires a reachable ClickHouse instance",
+    "vllm: requires the vLLM runtime importable",
+    "hf: requires HuggingFace weights / model cache",
+    "native_backend: requires the DMI native backend .so importable/built; no GPU necessarily",
+    "framework_fork: requires vendored/modified framework forks importable",
+    "ring_native: native CUDA ring tests built via tests/ring/Makefile (needs nvcc)",
     "slow: tests that take more than ~30 s (per-hook isolation full sweep, large E2E sweeps); skipped by default unless `-m slow` is passed",
+    "manual: investigation / tooling, not a regression gate; not collected by default",
+    "numeric: per-hook numeric-difference study (drift vs the unhooked baseline)",
 ]

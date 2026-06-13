@@ -34,6 +34,8 @@ from textwrap import dedent
 
 import pytest
 
+pytestmark = [pytest.mark.gpu, pytest.mark.vllm, pytest.mark.hf]
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 HF_GPT2_MODEL = "gpt2"

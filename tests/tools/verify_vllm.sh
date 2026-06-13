@@ -17,7 +17,7 @@
 #   - LD_PRELOAD for libstdc++ (caller's responsibility)
 #
 # Usage:
-#   LD_PRELOAD=/path/to/libstdc++.so.6 bash tests/verify_vllm.sh
+#   LD_PRELOAD=/path/to/libstdc++.so.6 bash tests/tools/verify_vllm.sh
 set -e
 
 export VLLM_DISABLE_COMPILE_CACHE=1

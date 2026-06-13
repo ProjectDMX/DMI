@@ -1,19 +1,32 @@
-import torch
 import pytest
-from transformers import AutoTokenizer, GPT2Config
-from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel as HFOriginalGPT2
-from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2Model
-from transformers.models.gpt2_p.modeling_gpt2 import GPT2LMHeadModel as HFModifiedGPT2
+import torch
+
+from tests._requirements import require_model_cache
+
+# Runs on CPU but pulls real gpt2 weights via from_pretrained -> `hf`, not `cpu`.
+pytestmark = [pytest.mark.hf, pytest.mark.framework_fork, require_model_cache("gpt2")]
+
+
+def _import_gpt2_modules():
+    try:
+        from transformers import AutoTokenizer
+        from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel as HFOriginalGPT2
+        from transformers.models.gpt2_p.modeling_gpt2 import GPT2LMHeadModel as HFModifiedGPT2
+    except ImportError as exc:
+        pytest.skip(f"modified transformers fork required: {exc}")
+    return AutoTokenizer, HFOriginalGPT2, HFModifiedGPT2
 
 
 @pytest.fixture(scope="module")
 def gpt2_tokenizer():
+    AutoTokenizer, _, _ = _import_gpt2_modules()
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
 
 
 def build_models(seed: int = 0):
+    _, HFOriginalGPT2, HFModifiedGPT2 = _import_gpt2_modules()
     torch.manual_seed(seed)
     hf_original = HFOriginalGPT2.from_pretrained("gpt2")
     torch.manual_seed(seed)
