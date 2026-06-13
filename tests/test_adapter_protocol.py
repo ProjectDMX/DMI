@@ -10,7 +10,8 @@ the driver flow:
     set transport.force_eager from (result == 2) OR needs_eager.
     -> set_step_context -> pre_push_all_metas
 
-No GPU / native engine required.
+No GPU required; imports the native hook-definition layer through
+BackendAdaptor's ring_transport dependency.
 """
 from __future__ import annotations
 
@@ -18,10 +19,22 @@ import dataclasses
 
 import pytest
 
-from monitoring.adaptor_base import BackendAdaptor
-from monitoring.step_context import StepContext
+try:
+    from monitoring.adaptor_base import BackendAdaptor
+    from monitoring.step_context import StepContext
+    _NATIVE_IMPORT_ERROR = None
+except ImportError as exc:
+    BackendAdaptor = object
+    StepContext = None
+    _NATIVE_IMPORT_ERROR = exc
 
-pytestmark = pytest.mark.cpu
+pytestmark = [
+    pytest.mark.native_backend,
+    pytest.mark.skipif(
+        _NATIVE_IMPORT_ERROR is not None,
+        reason=f"DMI native backend required: {_NATIVE_IMPORT_ERROR}",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------

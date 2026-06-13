@@ -2,7 +2,9 @@
 
 Phase 4.B verification gate.  Pure unit test against the strip logic --
 no DB, no GPU, no real model.  Reuses the FakeEngine pattern from
-``tests/test_adapter_protocol.py``.
+``tests/test_adapter_protocol.py``.  HFAdaptor imports the native hook
+definition layer through ring_transport, so this is not part of the
+no-native-build CPU gate.
 
 The strip semantic under test:
   * Detection runs one step late by construction -- ``input_ids[:, -1]``
@@ -21,9 +23,20 @@ from typing import Optional
 import pytest
 import torch
 
-pytestmark = pytest.mark.cpu
+try:
+    from integration.hf_adapter import HFAdaptor
+    _NATIVE_IMPORT_ERROR = None
+except ImportError as exc:
+    HFAdaptor = None
+    _NATIVE_IMPORT_ERROR = exc
 
-from integration.hf_adapter import HFAdaptor
+pytestmark = [
+    pytest.mark.native_backend,
+    pytest.mark.skipif(
+        _NATIVE_IMPORT_ERROR is not None,
+        reason=f"DMI native backend required: {_NATIVE_IMPORT_ERROR}",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
