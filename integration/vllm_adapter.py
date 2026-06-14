@@ -282,6 +282,38 @@ class VLLMAdaptor(BackendAdaptor):
             return pad_table[total_q]
         return total_q
 
+    def _step_uses_decode_graph(
+        self, model_runner: Any, total_q: int, num_scheduled_per_req: list
+    ) -> bool:
+        """True iff this step will replay a captured FULL decode graph -- the
+        only steps where node-toggle's SetEnabled actually gates producers.
+
+        Mirrors vLLM's dispatch condition (cudagraph_dispatcher): a uniform
+        decode batch (every request scheduled exactly uniform_decode_query_len
+        tokens) whose total token count is within the captured-size range.
+        Anything else (prefill, mixed, oversize) runs eager -> producers fire
+        ungated -> the caller uses the full active set for meta + reserve.
+
+        Risk surface (same as predict_padded_q_len): reads
+        cudagraph_dispatcher.uniform_decode_query_len and
+        compilation_config.max_cudagraph_capture_size. On a vLLM upgrade,
+        verify these still gate FULL-graph dispatch. Conservative on failure:
+        any unexpected shape returns False (full set -> never under-reserves).
+        """
+        if not num_scheduled_per_req:
+            return False
+        uniform_q = getattr(
+            getattr(model_runner, "cudagraph_dispatcher", None),
+            "uniform_decode_query_len", 1) or 1
+        if any(n != uniform_q for n in num_scheduled_per_req):
+            return False  # prefill / mixed -> eager
+        max_cap = getattr(
+            getattr(self.vllm_config, "compilation_config", None),
+            "max_cudagraph_capture_size", None)
+        if max_cap is not None and total_q > max_cap:
+            return False  # oversize uniform decode -> eager
+        return True
+
     def build_step_context(
         self, scheduler_output: Any, model_runner: Any
     ) -> Optional[StepContext]:
@@ -322,6 +354,17 @@ class VLLMAdaptor(BackendAdaptor):
 
         padded_q = self.predict_padded_q_len(model_runner, total_q)
         self._last_total_q = total_q
+
+        # Per-step node-toggle gate selector. The toggle (SetEnabled on captured
+        # nodes) only governs producers running INSIDE a replayed decode graph.
+        # A prefill / mixed / oversize step runs eager -- producers fire ungated
+        # -- so meta-push + reserve must use the FULL active set that step, not
+        # the toggle subset, or they desync. This mirrors vLLM's own FULL-graph
+        # dispatch condition: a uniform-decode batch (every req scheduled exactly
+        # uniform_decode_query_len tokens) whose token count fits a captured
+        # size. Same private-attr risk surface as predict_padded_q_len.
+        self.transport._gated_step = self._step_uses_decode_graph(
+            model_runner, total_q, num_scheduled_per_req)
 
         # Per-request offsets and token ranges.
         computed_map: dict = {}

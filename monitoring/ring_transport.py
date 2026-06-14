@@ -433,6 +433,15 @@ class RingTransport:
         # on first use. None (or absent on a minimally-constructed transport)
         # => toggle inactive => every active spec fires every step.
         self._toggle: "Optional[NodeToggleController]" = None
+        # Per-step gate selector. The toggle gate (SetEnabled on captured nodes)
+        # only governs producers that run INSIDE a replayed decode graph. In a
+        # prefill / eager step the producers run unconditionally (no graph to
+        # gate), so meta-push and capacity-reserve MUST use the full active set
+        # that step, or they desync (reserve/meta < producers fired). The vLLM
+        # adapter sets this per step (True = decode-graph step, gate applies;
+        # False = prefill/eager step, use full active_specs). Default True so a
+        # synthetic single-graph test that only drives decode keeps gating.
+        self._gated_step: bool = True
 
         # Hook selection preset name (e.g. "full", "hidden-states", "logits").
         # Set by the active adapter before hook installation.
@@ -505,6 +514,16 @@ class RingTransport:
             return t.effective_enabled_specs
         return self._active_specs
 
+    def specs_for_step(self) -> "List[HookSpec]":
+        """The spec set that drives meta-push + capacity-reserve THIS step.
+        Decode-graph step -> effective_specs (toggle gate applies); prefill /
+        eager step -> full active_specs (producers run ungated, so meta/reserve
+        must match the full set). When toggle is inactive the two are identical.
+        """
+        if getattr(self, "_gated_step", True):
+            return self.effective_specs
+        return self._active_specs
+
     def _toggle_ctrl(self) -> "NodeToggleController":
         if self._toggle is None:
             from monitoring.node_toggle import NodeToggleController
@@ -554,11 +573,12 @@ class RingTransport:
         shapes = []
         dtypes = []
         flags = []
-        # Iterate the single effective-enabled set: host meta set == device
-        # enabled set == capacity-reserve set (the lockstep gate). When the
-        # toggle is inactive, effective_specs is just _active_specs (all active
-        # hooks fire).
-        for spec in self.effective_specs:
+        # Iterate the per-step spec set: host meta set == device enabled set ==
+        # capacity-reserve set (the lockstep gate). On a decode-graph step this
+        # is the toggle subset; on a prefill/eager step it is the full active
+        # set (producers run ungated there). When toggle is inactive the two are
+        # identical.
+        for spec in self.specs_for_step():
             spec_q_len = (actual_q_len if actual_q_len is not None
                           and spec.dim0_is_actual_tokens
                           else q_len)

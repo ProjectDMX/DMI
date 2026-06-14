@@ -80,6 +80,25 @@ until the ring fills or shutdown. The default `dmx_drain_flush_timeout_us=50000`
 (50 ms, when toggle is on) forces a periodic flush. Lower it for tighter export
 latency; raise/zero it if you batch large volumes and prefer threshold-only.
 
+## Scope: decode-gated, prefill-passthrough
+
+The toggle gates only the **decode** path (producers that run inside a replayed
+full-decode CUDA graph, via `cudaGraphNodeSetEnabled`). **Prefill** steps run
+eager — there is no graph to gate — so they are **not** toggled: prefill emits
+the **full active hook set** regardless of the enabled subset (stock monitoring
+behavior, unchanged). Concretely, with `dmx_enabled_hooks="0:24,..,0:27"`:
+
+- **decode** rows (one token/step) → only layers 24–27,
+- **prefill** rows (the prompt) → **all active layers**.
+
+So enabling a small decode subset does **not** reduce prefill data volume. This
+is by construction: gating prefill would require either per-step graph
+prediction (fragile) or gating the eager producers (changes prefill semantics).
+The meta-push and capacity-reserve follow the same per-step split, so the ring
+stays in lockstep on both paths (a prefill step that pushed only the decode
+subset's metas while firing all producers would desync — guarded by
+`test_toggle_prefill_passthrough_e2e`).
+
 ## Scope (current)
 
 The enabled set is **engine/step-level**, applied at a step boundary — **not
