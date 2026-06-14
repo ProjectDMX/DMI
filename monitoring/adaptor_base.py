@@ -202,13 +202,12 @@ class BackendAdaptor(abc.ABC):
           ``before_forward`` together with ``prepare_step``'s overflow
           result.
 
-        ``effective_specs`` == ``active_specs`` when node-toggle is inactive
-        (no behaviour change), and the enabled-AND-captured subset when it is
-        active -- so capacity-reserve here stays in LOCKSTEP with the meta-push
-        in ``pre_push_all_metas`` (both read the same set). Reserving for the
-        full ``active_specs`` while only the enabled subset fires would
-        over-count vs actual producer writes -> ring head/tail drift (the
-        reserve-invariant bug).
+        Reads ``transport.specs_for_step()`` -- the per-step lockstep set that
+        ``pre_push_all_metas`` also reads. On a decode-graph step that is the
+        node-toggle subset; on a prefill / eager step it is the full active set
+        (producers run ungated there). When node-toggle is inactive both are
+        ``active_specs``. Reserving for a different set than what fires would
+        drift the ring head/tail (the reserve-invariant bug).
         """
         if self.model_cfg is None or not self.active_specs:
             return 0, 0, False
@@ -216,7 +215,7 @@ class BackendAdaptor(abc.ABC):
         total = 0
         n = 0
         needs_eager = False
-        for spec in self.transport.effective_specs:
+        for spec in self.transport.specs_for_step():
             # When the adapter has populated actual_q_len AND the spec is
             # prefix-strip-eligible, size the byte budget for the unpadded
             # data the producer will actually write.  Other specs and the
