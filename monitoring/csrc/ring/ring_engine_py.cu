@@ -186,17 +186,30 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
 {
     impl_->current_hook_idx = 0;
 
-    // Read the device-side actual_bytes counter and compute the delta vs the
-    // snapshot from the previous prepare_step call.  The counter is monotonic
-    // and atomically updated inside the producer kernel's last-block-arrives
-    // section; the existing __threadfence() in producer.cu orders the D2D
-    // stores before the increment, so any delta we observe corresponds to
-    // bytes whose write is already globally visible.  No cudaStreamSynchronize
-    // is required.
-    const uint64_t counter_cur = *impl_->engine.ring_state().actual_bytes_counter;
-    const uint64_t counter_delta = counter_cur - impl_->last_counter_read;
-    impl_->last_counter_read = counter_cur;
-    (void)counter_delta;  // consumed by reservation accounting in a follow-up
+    // actual_bytes_counter reclamation: DISABLED for now (see below).
+    //
+    // The counter exists to reclaim ring space when a step's reservation
+    // OVER-estimates what the producer actually writes.  That only happens for
+    // producers whose written byte count the CPU cannot size up front -- i.e.
+    // variable-byte / EP "chunked" producers that reserve an upper bound.  No
+    // hook currently uses that path: the vLLM adapter only wires the prefix
+    // producer (CPU-known actual_q_len * row_bytes) and the basic producer
+    // (CPU-known x.nbytes()), both of which reserve exactly what they write and
+    // need no reclamation.  The reclamation consumer was also never landed, so
+    // the delta is unused.
+    //
+    // Reading the counter here is NOT free: it is a host dereference of a
+    // cudaMallocManaged page whose preferred location is the GPU and which the
+    // producer writes every step, so the read forces a UVM coherence stall
+    // (measured ~430 us/step on Llama-8B -- effectively a per-step implicit GPU
+    // sync, despite no explicit cudaStreamSynchronize).  Keep it commented out
+    // until a chunked-style producer AND a reclamation consumer actually exist;
+    // when they do, read the counter OFF the prepare_step critical path (e.g.
+    // on the drain thread, which already synchronizes) rather than here.
+    //
+    // const uint64_t counter_cur = *impl_->engine.ring_state().actual_bytes_counter;
+    // const uint64_t counter_delta = counter_cur - impl_->last_counter_read;
+    // impl_->last_counter_read = counter_cur;
 
     const uint64_t pcap = impl_->engine.payload_cap();
     const uint64_t scap = impl_->engine.staging_cap();
