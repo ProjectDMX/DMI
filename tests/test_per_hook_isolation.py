@@ -126,10 +126,10 @@ class TestPatcherCorrectness:
                 assert indent == 8, f"unexpected indent on: {line!r}"
 
 
-@pytest.mark.cpu
 class TestPatcherRoundTrip:
     """Verify the on-disk patch / unpatch context manager."""
 
+    @pytest.mark.framework_fork
     @pytest.mark.parametrize("framework,model_key", [
         ("hf", "gpt2"), ("hf", "qwen3"), ("hf", "llama"),
         ("vllm", "gpt2"), ("vllm", "qwen3"), ("vllm", "llama"),
@@ -148,6 +148,7 @@ class TestPatcherRoundTrip:
         backup = p.with_suffix(p.suffix + ".copy_isolate_backup")
         assert not backup.exists()
 
+    @pytest.mark.cpu
     def test_dirty_restore_raises_loudly(self, tmp_path, monkeypatch):
         """If the file can't be restored byte-identically, exit must raise.
 
@@ -170,6 +171,7 @@ class TestPatcherRoundTrip:
                 backup = target.with_suffix(target.suffix + ".copy_isolate_backup")
                 backup.unlink()
 
+    @pytest.mark.cpu
     def test_stale_backup_raises(self, tmp_path, monkeypatch):
         """If a previous run crashed mid-patch leaving a backup, refuse."""
         from tests import isolate_hook
@@ -186,7 +188,7 @@ class TestPatcherRoundTrip:
             isolate_hook.patch("test", "fake", "q")
 
 
-@pytest.mark.cpu
+@pytest.mark.framework_fork
 class TestRealCompareModelsContainAllExpectedHooks:
     """The smoke cells assume specific hooks have a `.copy_()` line in the
     real _compare files.  If a hook is missing the smoke fails opaquely,
