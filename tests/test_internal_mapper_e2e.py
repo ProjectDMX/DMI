@@ -143,18 +143,21 @@ def test_output_matches_plain_hf(single):
 
 def test_available_lists_captured_field(single, deps):
     internal = single.out.dmi_internal
-    assert internal.available == ["hidden_states"]
+    assert internal.available == ["hidden_states", "token_mask"]
 
 
 def test_hidden_states_tuple_shape(single, deps):
     internal = single.out.dmi_internal
     hs = internal.hidden_states
+    token_mask = internal.token_mask
     cfg = single.model.config
     assert len(hs) == cfg.num_hidden_layers          # one entry per block (resid_pre)
     assert all(t.dim() == 3 for t in hs)             # [batch, seq, hidden]
     assert hs[0].shape[0] == 1                        # batch
     assert hs[0].shape[2] == cfg.hidden_size         # hidden
     assert all(t.shape == hs[0].shape for t in hs)   # uniform across layers
+    assert token_mask.shape == hs[0].shape[:2]
+    assert token_mask.dtype == torch.bool
 
 
 def test_token_count_drops_unforwarded_last(single, deps):

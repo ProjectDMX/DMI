@@ -55,7 +55,52 @@ out = generate_with_monitoring_dict(
 )
 
 hidden_states = out.dmi_internal.hidden_states
+token_mask = out.dmi_internal.token_mask
 ```
+
+Supported mapped fields are:
+
+| Field | DMI act_name |
+|---|---|
+| `hidden_states` | `blocks.hook_resid_pre` |
+| `attentions` | `blocks.attn.hook_pattern` |
+| `logits` | `final_logits` |
+| `token_mask` | Derived from this generate call's token ranges |
+
+These fields are reassembled into one value per field. For example,
+`hidden_states` is a tuple ordered by layer, with each tensor shaped
+`[batch, seq, hidden]`; `attentions` is a tuple ordered by layer, with each
+tensor shaped `[batch, heads, seq, seq]`; `logits` is shaped
+`[batch, seq, vocab]`; `token_mask` is shaped `[batch, seq]` with bool dtype.
+For `generate_with_monitoring_dict(...)`, tensor reads are scoped to the request
+IDs from that generate call rather than loading every row for the model_id.
+
+This is intentionally not the raw nested layout returned by
+`generate(..., output_hidden_states=True)`. Hugging Face returns generation
+internals in step-first form, roughly `step -> layer -> tensor`. DMI internals
+are returned in analysis-friendly layer-first form, `layer -> full-sequence
+tensor`, after prefill and decode chunks have been stitched together on CPU.
+The original Hugging Face generation output is still available directly on
+`out`, for example `out.sequences`.
+
+When DMI reassembles ragged per-request sequences into a batch, shorter
+requests are left-padded with synthetic zeros. These zeros are not Hugging Face
+pad-token activations. Use `token_mask` to ignore them:
+
+```python
+hidden_states = out.dmi_internal.hidden_states
+token_mask = out.dmi_internal.token_mask
+norm = hidden_states[0].float().norm(dim=-1)[token_mask].mean()
+```
+
+`dmi_internal` does not currently expose `scores` or `past_key_values`.
+Hugging Face `scores` are generation scores after logits processors/warpers,
+so they are not always the same as raw model logits; DMI exposes raw captured
+`final_logits` as `out.dmi_internal.logits` instead. `past_key_values` is not
+mapped because HF cache objects are cache-implementation-specific and DMI does
+not reconstruct that object today. If Hugging Face itself returned these fields,
+they remain available on the original generation output, for example
+`out.scores` or `out.past_key_values`.
 
 Plain field access such as `out.dmi_internal.hidden_states` is lazy and
 field-cached. It reads the backing store on first successful access and then

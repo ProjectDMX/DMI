@@ -127,12 +127,14 @@ def main() -> None:
     print(f"[example] Output: {decoded!r}")
 
     hidden_states = out.dmi_internal.hidden_states
+    token_mask = out.dmi_internal.token_mask
     assert len(hidden_states) == expected_layers
     assert all(t.device.type == "cpu" for t in hidden_states)
+    assert token_mask.device.type == "cpu"
 
     print("[example] Per-layer hidden-state activation norm:")
     for layer, tensor in enumerate(hidden_states):
-        norm = tensor.float().norm(dim=-1).mean().item()
+        norm = tensor.float().norm(dim=-1)[token_mask].mean().item()
         print(f"  layer {layer:02d}: {norm:.6f}")
 
 

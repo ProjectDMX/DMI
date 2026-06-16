@@ -49,9 +49,31 @@ class SequenceReader:
         return rows
 
 
+class PrefixReader:
+    def __init__(self, rows):
+        self._rows = rows
+        self.prefixes = []
+
+    @property
+    def calls(self):
+        return len(self.prefixes)
+
+    def prefix_get(self, prefix):
+        self.prefixes.append(prefix)
+        return [
+            (key, tensor)
+            for key, tensor in self._rows
+            if key[:len(prefix)] == prefix
+        ]
+
+
 def _row(req, layer, start, tensor):
     # key = (model_id, request_id, act_name, layer_no, shard_rank, start, end)
     return ((("m", req, ACT, layer, 0, start, start + tensor.shape[0])), tensor)
+
+
+def _row_act(req, act, layer, start, end, tensor):
+    return ((("m", req, act, layer, 0, start, end)), tensor)
 
 
 def test_per_layer_tuple_and_shape():
@@ -64,6 +86,44 @@ def test_per_layer_tuple_and_shape():
     hs = internal.hidden_states
     assert len(hs) == 2                       # two layers
     assert tuple(hs[0].shape) == (1, 3, 4)    # [batch, seq, hidden]
+
+
+def test_available_includes_hf_mapped_fields():
+    rows = [
+        _row("0:0", 0, 0, torch.ones(3, 4)),
+        _row_act("0:0", "blocks.attn.hook_pattern", 0, 0, 3, torch.ones(2, 3, 3)),
+        _row_act("0:0", "final_logits", -1, 0, 3, torch.ones(3, 10)),
+    ]
+    internal = get_internal("m", FakeReader(rows))
+
+    assert internal.available == ["attentions", "hidden_states", "logits"]
+
+
+def test_logits_reassemble_global_batch_by_numeric_request_id():
+    rows = [
+        _row_act("0:10", "final_logits", -1, 0, 1, torch.full((1, 2), 10.0)),
+        _row_act("0:2", "final_logits", -1, 0, 1, torch.full((1, 2), 2.0)),
+    ]
+    logits = get_internal("m", FakeReader(rows)).logits
+
+    assert tuple(logits.shape) == (2, 1, 2)
+    assert torch.equal(logits[0, 0], torch.full((2,), 2.0))
+    assert torch.equal(logits[1, 0], torch.full((2,), 10.0))
+
+
+def test_attentions_reassemble_per_layer_with_decode_growth():
+    prefill = torch.ones(2, 2, 2)
+    decode = torch.ones(2, 1, 3) * 2
+    rows = [
+        _row_act("0:0", "blocks.attn.hook_pattern", 0, 0, 2, prefill),
+        _row_act("0:0", "blocks.attn.hook_pattern", 0, 2, 3, decode),
+    ]
+    attentions = get_internal("m", FakeReader(rows)).attentions
+
+    assert len(attentions) == 1
+    assert tuple(attentions[0].shape) == (1, 2, 3, 3)
+    assert torch.equal(attentions[0][0, :, :2, :2], prefill)
+    assert torch.equal(attentions[0][0, :, 2:, :], decode)
 
 
 def test_chunks_concat_by_start():
@@ -113,6 +173,51 @@ def test_lazy_internal_loads_once_after_success():
     assert internal.hidden_states[0].shape == (1, 3, 4)
     assert reader.calls == 1
     assert "cached=['hidden_states']" in repr(internal)
+
+
+def test_lazy_internal_with_request_ids_reads_only_requested_act_prefixes():
+    rows = [
+        _row("0:0", 0, 0, torch.ones(3, 4)),
+        _row("0:1", 0, 0, torch.ones(2, 4) * 2),
+        _row_act("0:0", "final_logits", -1, 0, 3, torch.ones(3, 10)),
+        _row_act("other:0", ACT, 0, 0, 1, torch.ones(1, 4) * 9),
+    ]
+    reader = PrefixReader(rows)
+    internal = make_lazy_internal("m", reader, request_ids=("0:0", "0:1"))
+
+    hs = internal.hidden_states
+
+    assert tuple(hs[0].shape) == (2, 3, 4)
+    assert reader.prefixes == [
+        ("m", "0:0", ACT),
+        ("m", "0:1", ACT),
+    ]
+
+
+def test_lazy_internal_token_mask_uses_recorded_ranges_without_reader():
+    reader = PrefixReader([])
+    internal = make_lazy_internal(
+        "m",
+        reader,
+        request_ids=("0:0", "0:1"),
+        token_ranges={
+            "0:0": ((0, 3), (3, 4)),
+            "0:1": ((0, 2), (2, 2)),
+        },
+    )
+
+    mask = internal.token_mask
+
+    assert mask.dtype == torch.bool
+    assert torch.equal(
+        mask,
+        torch.tensor([
+            [True, True, True, True],
+            [False, False, True, True],
+        ]),
+    )
+    assert reader.calls == 0
+    assert internal.token_mask is mask
 
 
 def test_lazy_internal_retries_after_failed_load():

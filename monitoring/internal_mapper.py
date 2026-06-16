@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 
 from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
+from monitoring.segment_merger import merge_segments
 
 
 def _default_reader() -> CHClickhouseDriverReadOnly:
@@ -38,6 +39,17 @@ def _left_pad_stack(per_request: list[torch.Tensor]) -> torch.Tensor:
     return batched
 
 
+def _request_sort_key(request_id: str) -> tuple:
+    parts = request_id.split(":")
+    key = []
+    for part in parts:
+        try:
+            key.append((0, int(part)))
+        except ValueError:
+            key.append((1, part))
+    return tuple(key)
+
+
 def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
     """Reassemble a per-layer hook (residual stream, mlp, ...).
 
@@ -52,10 +64,63 @@ def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
     for layer in sorted(layers):
         per_request = [
             torch.cat([t for _, t in sorted(chunks)], dim=0)
-            for _, chunks in sorted(layers[layer].items())
+            for _, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
         ]
         out.append(_left_pad_stack(per_request))
     return tuple(out)
+
+
+def _left_pad_stack_attention(per_request: list[torch.Tensor]) -> torch.Tensor:
+    """Stack ragged per-request attention tensors into [batch, heads, seq, seq].
+
+    Each request tensor is [heads, query_tokens, key_tokens]. Shorter requests
+    are left-padded on both query and key axes.
+    """
+    heads = per_request[0].shape[0]
+    seq = max(t.shape[-1] for t in per_request)
+    batched = torch.zeros(len(per_request), heads, seq, seq,
+                          dtype=per_request[0].dtype)
+    for i, t in enumerate(per_request):
+        q_len = t.shape[-2]
+        k_len = t.shape[-1]
+        batched[i, :, seq - q_len:, seq - k_len:] = t
+    return batched
+
+
+def _reassemble_attention_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
+    """Reassemble attention-pattern rows as a tuple ordered by layer."""
+    layers: dict[int, dict[str, list]] = {}
+    for key, tensor in rows:
+        layers.setdefault(key[3], {}).setdefault(key[1], []).append((key[5], tensor))
+    out = []
+    for layer in sorted(layers):
+        per_request = [
+            merge_segments(
+                [t for _, t in sorted(chunks)],
+                "blocks.attn.hook_pattern",
+            )
+            for _, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
+        ]
+        out.append(_left_pad_stack_attention(per_request))
+    return tuple(out)
+
+
+def _reassemble_global(rows: list) -> torch.Tensor:
+    """Reassemble a non-layered field into [batch, seq, ...]."""
+    requests: dict[str, list] = {}
+    for key, tensor in rows:
+        requests.setdefault(key[1], []).append((key[5], tensor))
+    per_request = [
+        torch.cat([t for _, t in sorted(chunks)], dim=0)
+        for _, chunks in sorted(requests.items(), key=lambda item: _request_sort_key(item[0]))
+    ]
+    if per_request[0].ndim == 1:
+        seq = max(t.shape[0] for t in per_request)
+        batched = torch.zeros(len(per_request), seq, dtype=per_request[0].dtype)
+        for i, t in enumerate(per_request):
+            batched[i, seq - t.shape[0]:] = t
+        return batched
+    return _left_pad_stack(per_request)
 
 
 # Public field name -> (capture act_name, reassembler). The reassembler takes the
@@ -63,6 +128,8 @@ def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
 # internals (attention, logits, kv, ...) here, each with its own reassembler.
 _FIELDS = {
     "hidden_states": ("blocks.hook_resid_pre", _reassemble_per_layer),
+    "attentions": ("blocks.attn.hook_pattern", _reassemble_attention_per_layer),
+    "logits": ("final_logits", _reassemble_global),
 }
 
 
@@ -165,12 +232,19 @@ class _LazyInternal:
         model_id: str,
         reader: CHClickhouseDriverReadOnly | None = None,
         requirements: InternalRequirements | None = None,
+        request_ids: tuple[str, ...] | list[str] | None = None,
+        token_ranges: dict[str, tuple[tuple[int, int], ...] | list[tuple[int, int]]] | None = None,
     ) -> None:
         self._model_id = model_id
         self._reader = reader
         self._requirements = (
             requirements.copy() if requirements is not None else InternalRequirements()
         )
+        self._request_ids = tuple(request_ids or ())
+        self._token_ranges = {
+            rid: tuple((int(start), int(end)) for start, end in ranges)
+            for rid, ranges in dict(token_ranges or {}).items()
+        }
         self._field_cache: dict[str, object] = {}
 
     def require(
@@ -256,11 +330,73 @@ class _LazyInternal:
         field: str,
         requirement: _Requirement | None,
     ) -> object:
-        internal = get_internal(self._model_id, self._reader)
-        value = getattr(internal, field)
+        value = self._read_field(field)
         self._validate(field, value, requirement)
         self._field_cache[field] = value
         return value
+
+    def _reader_or_default(self) -> CHClickhouseDriverReadOnly:
+        return self._reader or _default_reader()
+
+    def _read_rows_for_field(self, field: str) -> list:
+        if field not in _FIELDS:
+            raise AttributeError(
+                f"{field!r} is not a supported DMI internal field. "
+                f"Available mapped fields: {sorted(_FIELDS)}."
+            )
+        act, _ = _FIELDS[field]
+        reader = self._reader_or_default()
+        if self._request_ids:
+            rows = []
+            for request_id in self._request_ids:
+                rows.extend(reader.prefix_get((self._model_id, request_id, act)))
+            return rows
+        return [
+            (key, tensor)
+            for key, tensor in reader.prefix_get((self._model_id,))
+            if key[2] == act
+        ]
+
+    def _read_field(self, field: str) -> object:
+        if field == "token_mask":
+            return self._build_token_mask()
+        if field not in _FIELDS:
+            raise AttributeError(
+                f"{field!r} was not captured because it is not a supported "
+                "DMI internal field. "
+                f"Available mapped fields: {sorted(_FIELDS) + ['token_mask']}."
+            )
+        act, reassemble = _FIELDS[field]
+        rows = self._read_rows_for_field(field)
+        if not rows:
+            raise AttributeError(
+                f"{field!r} was not captured in this run. "
+                f"Pass the corresponding hook via hook_selection= when generating."
+            )
+        return reassemble(rows)
+
+    def _build_token_mask(self) -> torch.Tensor:
+        if not self._request_ids or not self._token_ranges:
+            raise AttributeError(
+                "'token_mask' is not available because this internal handle "
+                "does not have per-generate request token ranges."
+            )
+        max_len = 0
+        for rid in self._request_ids:
+            ranges = self._token_ranges.get(rid, ())
+            for _, end in ranges:
+                max_len = max(max_len, int(end))
+        mask = torch.zeros(len(self._request_ids), max_len, dtype=torch.bool)
+        for batch_i, rid in enumerate(self._request_ids):
+            ranges = self._token_ranges.get(rid, ())
+            final_len = max((int(end) for _, end in ranges), default=0)
+            offset = max_len - final_len
+            for start, end in ranges:
+                start_i = int(start)
+                end_i = int(end)
+                if end_i > start_i:
+                    mask[batch_i, offset + start_i: offset + end_i] = True
+        return mask
 
     def _load_field_with_retry(
         self,
@@ -314,7 +450,15 @@ class _LazyInternal:
 
     @property
     def available(self) -> list[str]:
-        return get_internal(self._model_id, self._reader).available
+        if not self._request_ids:
+            return get_internal(self._model_id, self._reader).available
+        fields = []
+        for field in sorted(_FIELDS):
+            if self._read_rows_for_field(field):
+                fields.append(field)
+        if self._token_ranges:
+            fields.append("token_mask")
+        return fields
 
     def __getattr__(self, name: str):
         return self._load_field(name)
@@ -328,8 +472,16 @@ def make_lazy_internal(
     model_id: str,
     reader: CHClickhouseDriverReadOnly | None = None,
     requirements: InternalRequirements | None = None,
+    request_ids: tuple[str, ...] | list[str] | None = None,
+    token_ranges: dict[str, tuple[tuple[int, int], ...] | list[tuple[int, int]]] | None = None,
 ) -> _LazyInternal:
-    return _LazyInternal(model_id, reader, requirements=requirements)
+    return _LazyInternal(
+        model_id,
+        reader,
+        requirements=requirements,
+        request_ids=request_ids,
+        token_ranges=token_ranges,
+    )
 
 
 def get_internal(model_id: str, reader: CHClickhouseDriverReadOnly | None = None) -> Internal:
