@@ -11,6 +11,8 @@ needs no change.
 from __future__ import annotations
 
 import os
+import time
+from dataclasses import dataclass
 
 import torch
 
@@ -91,23 +93,63 @@ class IncompleteInternalError(RuntimeError):
     """Raised when a required internal field is present but incomplete."""
 
 
+@dataclass(frozen=True)
+class _Requirement:
+    count: int
+    retry: bool = False
+    timeout_s: float | None = 30.0
+    poll_s: float = 0.25
+
+
 class InternalRequirements:
     """Reusable strictness policy for lazy internal fields."""
 
-    def __init__(self, counts: dict[str, int] | None = None) -> None:
-        self._counts = dict(counts or {})
+    def __init__(self, counts: dict[str, int | _Requirement] | None = None) -> None:
+        self._requirements = {
+            field: self._coerce_requirement(value)
+            for field, value in dict(counts or {}).items()
+        }
 
-    def require(self, field: str, *, count: int) -> "InternalRequirements":
+    @staticmethod
+    def _coerce_requirement(value: int | _Requirement) -> _Requirement:
+        if isinstance(value, _Requirement):
+            return value
+        return _Requirement(count=int(value))
+
+    def require(
+        self,
+        field: str,
+        *,
+        count: int,
+        retry: bool = False,
+        timeout_s: float | None = 30.0,
+        poll_s: float = 0.25,
+    ) -> "InternalRequirements":
         if count < 0:
             raise ValueError("count must be non-negative")
-        self._counts[field] = int(count)
+        if timeout_s is not None and timeout_s < 0:
+            raise ValueError("timeout_s must be non-negative or None")
+        if poll_s <= 0:
+            raise ValueError("poll_s must be positive")
+        self._requirements[field] = _Requirement(
+            count=int(count),
+            retry=bool(retry),
+            timeout_s=timeout_s,
+            poll_s=float(poll_s),
+        )
         return self
 
     def copy(self) -> "InternalRequirements":
-        return InternalRequirements(self._counts)
+        return InternalRequirements(self._requirements)
 
     def expected_count(self, field: str) -> int | None:
-        return self._counts.get(field)
+        requirement = self._requirements.get(field)
+        if requirement is None:
+            return None
+        return requirement.count
+
+    def requirement(self, field: str) -> _Requirement | None:
+        return self._requirements.get(field)
 
 
 class _LazyInternal:
@@ -131,8 +173,22 @@ class _LazyInternal:
         )
         self._field_cache: dict[str, object] = {}
 
-    def require(self, field: str, *, count: int) -> "_LazyInternal":
-        self._requirements.require(field, count=count)
+    def require(
+        self,
+        field: str,
+        *,
+        count: int,
+        retry: bool = False,
+        timeout_s: float | None = 30.0,
+        poll_s: float = 0.25,
+    ) -> "_LazyInternal":
+        self._requirements.require(
+            field,
+            count=count,
+            retry=retry,
+            timeout_s=timeout_s,
+            poll_s=poll_s,
+        )
         return self
 
     def clear_cache(self, field: str | None = None) -> None:
@@ -141,37 +197,120 @@ class _LazyInternal:
             return
         self._field_cache.pop(field, None)
 
-    def _validate(self, field: str, value: object) -> None:
-        expected = self._requirements.expected_count(field)
-        if expected is None:
-            return
+    def _count_value(self, field: str, value: object) -> int:
         try:
-            found = len(value)  # type: ignore[arg-type]
+            return len(value)  # type: ignore[arg-type]
         except TypeError as exc:
             raise IncompleteInternalError(
                 f"{field} cannot be validated for model_id={self._model_id!r}: "
                 "value has no length."
             ) from exc
-        if found != expected:
-            raise IncompleteInternalError(
-                f"{field} is incomplete for model_id={self._model_id!r}: "
-                f"expected {expected} entries, found {found}."
+
+    def _incomplete_error(
+        self,
+        field: str,
+        requirement: _Requirement,
+        *,
+        found: int | None = None,
+        timeout: bool = False,
+        cause: Exception | None = None,
+    ) -> IncompleteInternalError:
+        if found is None:
+            detail = f"expected {requirement.count} entries, found none"
+        else:
+            detail = f"expected {requirement.count} entries, found {found}"
+        if timeout:
+            timeout_text = (
+                "without timeout"
+                if requirement.timeout_s is None
+                else f"within {requirement.timeout_s:.3g}s"
             )
+            detail = f"{detail} {timeout_text}"
+        message = (
+            f"{field} is incomplete for model_id={self._model_id!r}: "
+            f"{detail}."
+        )
+        error = IncompleteInternalError(message)
+        error.field = field  # type: ignore[attr-defined]
+        error.expected = requirement.count  # type: ignore[attr-defined]
+        error.found = found  # type: ignore[attr-defined]
+        if cause is not None:
+            error.__cause__ = cause
+        return error
+
+    def _validate(
+        self,
+        field: str,
+        value: object,
+        requirement: _Requirement | None = None,
+    ) -> None:
+        requirement = requirement or self._requirements.requirement(field)
+        if requirement is None:
+            return
+        found = self._count_value(field, value)
+        if found != requirement.count:
+            raise self._incomplete_error(field, requirement, found=found)
+
+    def _load_field_once(
+        self,
+        field: str,
+        requirement: _Requirement | None,
+    ) -> object:
+        internal = get_internal(self._model_id, self._reader)
+        value = getattr(internal, field)
+        self._validate(field, value, requirement)
+        self._field_cache[field] = value
+        return value
+
+    def _load_field_with_retry(
+        self,
+        field: str,
+        requirement: _Requirement,
+    ) -> object:
+        deadline = (
+            None
+            if requirement.timeout_s is None
+            else time.monotonic() + requirement.timeout_s
+        )
+        last_error: Exception | None = None
+        last_found: int | None = None
+
+        while True:
+            try:
+                return self._load_field_once(field, requirement)
+            except IncompleteInternalError as exc:
+                last_error = exc
+                last_found = getattr(exc, "found", None)
+                if field in self._field_cache:
+                    self._field_cache.pop(field, None)
+            except AttributeError as exc:
+                last_error = exc
+
+            if deadline is not None and time.monotonic() >= deadline:
+                raise self._incomplete_error(
+                    field,
+                    requirement,
+                    found=last_found,
+                    timeout=True,
+                    cause=last_error,
+                )
+            time.sleep(requirement.poll_s)
 
     def _load_field(self, field: str) -> object:
+        requirement = self._requirements.requirement(field)
         if field in self._field_cache:
             value = self._field_cache[field]
             try:
-                self._validate(field, value)
+                self._validate(field, value, requirement)
             except Exception:
                 self._field_cache.pop(field, None)
-                raise
+                if requirement is None or not requirement.retry:
+                    raise
+                return self._load_field_with_retry(field, requirement)
             return value
-        internal = get_internal(self._model_id, self._reader)
-        value = getattr(internal, field)
-        self._validate(field, value)
-        self._field_cache[field] = value
-        return value
+        if requirement is not None and requirement.retry:
+            return self._load_field_with_retry(field, requirement)
+        return self._load_field_once(field, requirement)
 
     @property
     def available(self) -> list[str]:

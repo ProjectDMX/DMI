@@ -42,6 +42,8 @@ from monitoring.internal_mapper import InternalRequirements
 requirements = InternalRequirements().require(
     "hidden_states",
     count=model.config.num_hidden_layers,
+    retry=True,
+    timeout_s=30.0,
 )
 
 out = generate_with_monitoring_dict(
@@ -59,12 +61,42 @@ Plain field access such as `out.dmi_internal.hidden_states` is lazy and
 field-cached. It reads the backing store on first successful access and then
 reuses the cached value. If ClickHouse is still receiving rows, plain access can
 cache a partial result. Use a requirement when you know the expected number of
-entries and want incomplete reads to fail explicitly.
+entries.
+
+By default, requirements are strict one-shot checks:
+
+```python
+out.dmi_internal.require("hidden_states", count=model.config.num_hidden_layers)
+hidden_states = out.dmi_internal.hidden_states
+```
+
+If the field is missing or incomplete, access raises immediately. To wait for
+asynchronous ClickHouse writes, opt into retry explicitly:
+
+```python
+out.dmi_internal.require(
+    "hidden_states",
+    count=model.config.num_hidden_layers,
+    retry=True,
+    timeout_s=30.0,
+    poll_s=0.25,
+)
+hidden_states = out.dmi_internal.hidden_states
+```
+
+`retry=True` retries missing or incomplete fields until complete. `timeout_s`
+defaults to 30 seconds; pass `timeout_s=None` only when you intentionally want
+to wait forever. `poll_s` controls the interval between reads. Incomplete reads
+are not cached; successful complete reads are cached.
 
 Per-output requirements are also supported:
 
 ```python
-out.dmi_internal.require("hidden_states", count=model.config.num_hidden_layers)
+out.dmi_internal.require(
+    "hidden_states",
+    count=model.config.num_hidden_layers,
+    retry=True,
+)
 hidden_states = out.dmi_internal.hidden_states
 ```
 

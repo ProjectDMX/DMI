@@ -35,6 +35,20 @@ class FailingOnceReader:
         return self._rows
 
 
+class SequenceReader:
+    def __init__(self, row_sets):
+        self._row_sets = list(row_sets)
+        self.calls = 0
+
+    def prefix_get(self, prefix):
+        self.calls += 1
+        idx = min(self.calls - 1, len(self._row_sets) - 1)
+        rows = self._row_sets[idx]
+        if isinstance(rows, Exception):
+            raise rows
+        return rows
+
+
 def _row(req, layer, start, tensor):
     # key = (model_id, request_id, act_name, layer_no, shard_rank, start, end)
     return ((("m", req, ACT, layer, 0, start, start + tensor.shape[0])), tensor)
@@ -151,6 +165,61 @@ def test_lazy_internal_requirement_blocks_incomplete_cache():
         internal.hidden_states
 
     assert reader.calls == 2
+
+
+def test_lazy_internal_requirement_retries_missing_until_success():
+    rows = [_row("0:0", 0, 0, torch.ones(3, 4))]
+    reader = SequenceReader([[], rows])
+    internal = make_lazy_internal("m", reader)
+    internal.require("hidden_states", count=1, retry=True, timeout_s=1.0, poll_s=0.001)
+
+    assert len(internal.hidden_states) == 1
+    assert reader.calls == 2
+
+
+def test_lazy_internal_requirement_retries_incomplete_until_success():
+    one_layer = [_row("0:0", 0, 0, torch.ones(3, 4))]
+    two_layers = [
+        _row("0:0", 0, 0, torch.ones(3, 4)),
+        _row("0:0", 1, 0, torch.ones(3, 4)),
+    ]
+    reader = SequenceReader([one_layer, two_layers])
+    internal = make_lazy_internal("m", reader)
+    internal.require("hidden_states", count=2, retry=True, timeout_s=1.0, poll_s=0.001)
+
+    assert len(internal.hidden_states) == 2
+    assert reader.calls == 2
+
+
+def test_lazy_internal_requirement_retry_timeout_raises_incomplete():
+    rows = [_row("0:0", 0, 0, torch.ones(3, 4))]
+    reader = SequenceReader([rows])
+    internal = make_lazy_internal("m", reader)
+    internal.require("hidden_states", count=2, retry=True, timeout_s=0.0, poll_s=0.001)
+
+    with pytest.raises(IncompleteInternalError, match="expected 2 entries, found 1"):
+        internal.hidden_states
+    assert reader.calls == 1
+
+
+def test_lazy_internal_requirement_can_retry_without_timeout():
+    rows = [_row("0:0", 0, 0, torch.ones(3, 4))]
+    reader = SequenceReader([[], [], rows])
+    internal = make_lazy_internal("m", reader)
+    internal.require("hidden_states", count=1, retry=True, timeout_s=None, poll_s=0.001)
+
+    assert len(internal.hidden_states) == 1
+    assert reader.calls == 3
+
+
+def test_lazy_internal_retry_does_not_swallow_unexpected_errors():
+    reader = SequenceReader([RuntimeError("boom")])
+    internal = make_lazy_internal("m", reader)
+    internal.require("hidden_states", count=1, retry=True, timeout_s=1.0, poll_s=0.001)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        internal.hidden_states
+    assert reader.calls == 1
 
 
 def test_lazy_internal_requirement_revalidates_existing_cache():
