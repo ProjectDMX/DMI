@@ -93,10 +93,20 @@ def test_available_includes_hf_mapped_fields():
         _row("0:0", 0, 0, torch.ones(3, 4)),
         _row_act("0:0", "blocks.attn.hook_pattern", 0, 0, 3, torch.ones(2, 3, 3)),
         _row_act("0:0", "final_logits", -1, 0, 3, torch.ones(3, 10)),
+        _row_act("0:0", "token_ids", -1, 0, 3, torch.arange(3)),
+        _row_act("0:0", "hook_embed", -1, 0, 3, torch.ones(3, 4)),
+        _row_act("0:0", "blocks.attn.hook_q", 0, 0, 3, torch.ones(3, 2, 2)),
     ]
     internal = get_internal("m", FakeReader(rows))
 
-    assert internal.available == ["attentions", "hidden_states", "logits"]
+    assert internal.available == [
+        "attentions",
+        "embeddings",
+        "hidden_states",
+        "logits",
+        "q",
+        "token_ids",
+    ]
 
 
 def test_logits_reassemble_global_batch_by_numeric_request_id():
@@ -109,6 +119,40 @@ def test_logits_reassemble_global_batch_by_numeric_request_id():
     assert tuple(logits.shape) == (2, 1, 2)
     assert torch.equal(logits[0, 0], torch.full((2,), 2.0))
     assert torch.equal(logits[1, 0], torch.full((2,), 10.0))
+
+
+def test_token_ids_reassemble_global_1d():
+    rows = [
+        _row_act("0:0", "token_ids", -1, 0, 2, torch.tensor([10, 11])),
+        _row_act("0:1", "token_ids", -1, 0, 1, torch.tensor([20])),
+    ]
+    token_ids = get_internal("m", FakeReader(rows)).token_ids
+
+    assert torch.equal(token_ids, torch.tensor([[10, 11], [0, 20]]))
+
+
+def test_embeddings_reassemble_global_hidden_field():
+    rows = [
+        _row_act("0:0", "hook_embed", -1, 0, 2, torch.ones(2, 4)),
+        _row_act("0:1", "hook_embed", -1, 0, 1, torch.ones(1, 4) * 2),
+    ]
+    embeddings = get_internal("m", FakeReader(rows)).embeddings
+
+    assert tuple(embeddings.shape) == (2, 2, 4)
+    assert torch.equal(embeddings[1, 0], torch.zeros(4))
+    assert torch.equal(embeddings[1, 1], torch.ones(4) * 2)
+
+
+def test_q_reassemble_per_layer():
+    rows = [
+        _row_act("0:0", "blocks.attn.hook_q", 0, 0, 2, torch.ones(2, 2, 3)),
+        _row_act("0:0", "blocks.attn.hook_q", 1, 0, 2, torch.ones(2, 2, 3) * 2),
+    ]
+    q = get_internal("m", FakeReader(rows)).q
+
+    assert len(q) == 2
+    assert tuple(q[0].shape) == (1, 2, 2, 3)
+    assert torch.equal(q[1], torch.ones(1, 2, 2, 3) * 2)
 
 
 def test_attentions_reassemble_per_layer_with_decode_growth():
@@ -124,6 +168,21 @@ def test_attentions_reassemble_per_layer_with_decode_growth():
     assert tuple(attentions[0].shape) == (1, 2, 3, 3)
     assert torch.equal(attentions[0][0, :, :2, :2], prefill)
     assert torch.equal(attentions[0][0, :, 2:, :], decode)
+
+
+def test_attention_scores_reassemble_with_negative_inf_padding():
+    prefill = torch.ones(1, 2, 2)
+    decode = torch.ones(1, 1, 3) * 2
+    rows = [
+        _row_act("0:0", "blocks.attn.hook_attn_scores", 0, 0, 2, prefill),
+        _row_act("0:0", "blocks.attn.hook_attn_scores", 0, 2, 3, decode),
+    ]
+    scores = get_internal("m", FakeReader(rows)).attention_scores
+
+    assert tuple(scores[0].shape) == (1, 1, 3, 3)
+    assert torch.isneginf(scores[0][0, 0, 0, 2])
+    assert torch.equal(scores[0][0, :, :2, :2], prefill)
+    assert torch.equal(scores[0][0, :, 2:, :], decode)
 
 
 def test_chunks_concat_by_start():

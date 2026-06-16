@@ -1,12 +1,13 @@
-"""One-file HF example: generate, read DMI internals, print layer norms.
+"""One-file HF example: capture DMI attentions and save an attention matrix.
 
 Prerequisites:
   - ClickHouse is running on DMX_DB_HOST:DMX_DB_PORT, default localhost:9000.
   - The project is installed with the patched transformers/HF hooks.
   - CUDA is available.
+  - matplotlib is installed.
 
 Usage:
-    python example/hf_internal_norms/run_hf_internal_norms.py
+    python example/hf_attention_matrix/run_hf_attention_matrix.py
 """
 from __future__ import annotations
 
@@ -20,10 +21,13 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch
 
-MODEL_ID = "example_hf_internal_norms"
+MODEL_ID = "example_hf_attention_matrix"
 HF_MODEL = "Qwen/Qwen3-0.6B"
 PROMPT = "The capital of France is"
 MAX_NEW_TOKENS = 8
+LAYER = 0
+HEAD = 0
+OUTPUT_PNG = Path(__file__).resolve().parent / "attention_layer00_head00.png"
 
 
 def _build_db_config():
@@ -66,9 +70,17 @@ def _wipe_my_rows(db_cfg) -> None:
         print(f"[example] WARNING: row cleanup failed: {exc}", file=sys.stderr)
 
 
+def _token_labels(tokenizer, sequence: torch.Tensor, n_tokens: int) -> list[str]:
+    ids = sequence[:n_tokens].detach().cpu().tolist()
+    labels = tokenizer.convert_ids_to_tokens(ids)
+    return [label.replace("\u0120", " ").replace("\n", "\\n") for label in labels]
+
+
 def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("This example requires CUDA.")
+
+    import matplotlib.pyplot as plt
 
     from integration.hf_adapter import generate_with_monitoring_dict
     from monitoring import HostEngineConfig, MonitoringConfig, MonitoringEngine
@@ -86,6 +98,7 @@ def main() -> None:
     model = HookedQwen3ForCausalLM.from_pretrained(
         HF_MODEL,
         torch_dtype=torch.float16,
+        attn_implementation="eager",
     ).to(device).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(HF_MODEL)
@@ -101,10 +114,8 @@ def main() -> None:
     model.monitoring_engine = engine
 
     expected_layers = model.config.num_hidden_layers
-    # For layer-tuple fields, count validates the number of layers. It does not
-    # validate token completeness inside each layer tensor.
     requirements = InternalRequirements().require(
-        "hidden_states",
+        "attentions",
         count=expected_layers,
         retry=True,
         timeout_s=30.0,
@@ -119,25 +130,39 @@ def main() -> None:
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
-                hook_selection="hidden-states",
+                hook_selection="pattern",
                 internal_requirements=requirements,
             )
     finally:
         engine.close()
 
+    attentions = out.dmi_internal.attentions
+    token_mask = out.dmi_internal.token_mask
+    assert len(attentions) == expected_layers
+
+    matrix = attentions[LAYER][0, HEAD].float()
+    real_tokens = token_mask[0]
+    matrix = matrix[real_tokens][:, real_tokens]
+    labels = _token_labels(tokenizer, out.sequences[0], matrix.shape[0])
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    image = ax.imshow(matrix.numpy(), cmap="viridis", vmin=0.0)
+    ax.set_title(f"Layer {LAYER}, head {HEAD}")
+    ax.set_xlabel("Key token")
+    ax.set_ylabel("Query token")
+    if len(labels) <= 32:
+        ax.set_xticks(range(len(labels)))
+        ax.set_yticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=90, fontsize=8)
+        ax.set_yticklabels(labels, fontsize=8)
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(OUTPUT_PNG, dpi=160)
+    plt.close(fig)
+
     decoded = tokenizer.decode(out.sequences[0], skip_special_tokens=True)
     print(f"[example] Output: {decoded!r}")
-
-    hidden_states = out.dmi_internal.hidden_states
-    token_mask = out.dmi_internal.token_mask
-    assert len(hidden_states) == expected_layers
-    assert all(t.device.type == "cpu" for t in hidden_states)
-    assert token_mask.device.type == "cpu"
-
-    print("[example] Per-layer hidden-state activation norm:")
-    for layer, tensor in enumerate(hidden_states):
-        norm = tensor.float().norm(dim=-1)[token_mask].mean().item()
-        print(f"  layer {layer:02d}: {norm:.6f}")
+    print(f"[example] Saved attention matrix to {OUTPUT_PNG}")
 
 
 if __name__ == "__main__":

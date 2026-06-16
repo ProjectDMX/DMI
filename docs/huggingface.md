@@ -58,14 +58,38 @@ hidden_states = out.dmi_internal.hidden_states
 token_mask = out.dmi_internal.token_mask
 ```
 
+For layer-tuple fields such as `hidden_states`, `count` validates the number of
+layers in the reassembled tuple. It does not validate token completeness inside
+each layer tensor.
+
 Supported mapped fields are:
 
 | Field | DMI act_name |
 |---|---|
-| `hidden_states` | `blocks.hook_resid_pre` |
-| `attentions` | `blocks.attn.hook_pattern` |
-| `logits` | `final_logits` |
 | `token_mask` | Derived from this generate call's token ranges |
+| `token_ids` | `token_ids` |
+| `embeddings` | `hook_embed` |
+| `position_embeddings` | `hook_pos_embed` |
+| `final_residual` | `hook_resid_final` |
+| `final_hidden` | `hook_final_ln` |
+| `hidden_states` | `blocks.hook_resid_pre` |
+| `ln1` | `blocks.hook_ln1` |
+| `attention_output` | `blocks.hook_attn_out` |
+| `middle_residual` | `blocks.hook_resid_mid` |
+| `ln2` | `blocks.hook_ln2` |
+| `mlp_input` | `blocks.hook_mlp_in` |
+| `mlp_output` | `blocks.hook_mlp_out` |
+| `mlp_activation` | `blocks.hook_mlp_post` |
+| `attention_scores` | `blocks.attn.hook_attn_scores` |
+| `attentions` | `blocks.attn.hook_pattern` |
+| `q` | `blocks.attn.hook_q` |
+| `k` | `blocks.attn.hook_k` |
+| `v` | `blocks.attn.hook_v` |
+| `attention_values` | `blocks.attn.hook_z` |
+| `router_logits` | `blocks.mlp.hook_router_logits` |
+| `expert_ids` | `blocks.mlp.hook_topk_ids` |
+| `expert_weights` | `blocks.mlp.hook_topk_weights` |
+| `logits` | `final_logits` |
 
 These fields are reassembled into one value per field. For example,
 `hidden_states` is a tuple ordered by layer, with each tensor shaped
@@ -91,6 +115,16 @@ pad-token activations. Use `token_mask` to ignore them:
 hidden_states = out.dmi_internal.hidden_states
 token_mask = out.dmi_internal.token_mask
 norm = hidden_states[0].float().norm(dim=-1)[token_mask].mean()
+```
+
+If a tensor field and `token_mask` have different `[batch, seq]` shapes, it
+usually means the tensor field was read before all rows for that field arrived.
+Current requirements for layer-tuple fields validate layer count, not token
+count, so clear that field's cache and read it again:
+
+```python
+out.dmi_internal.clear_cache("hidden_states")
+hidden_states = out.dmi_internal.hidden_states
 ```
 
 `dmi_internal` does not currently expose `scores` or `past_key_values`.

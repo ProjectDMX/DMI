@@ -28,11 +28,11 @@ def _default_reader() -> CHClickhouseDriverReadOnly:
 
 
 def _left_pad_stack(per_request: list[torch.Tensor]) -> torch.Tensor:
-    """Stack ragged per-request tensors [seq_i, hidden] into [batch, seq, hidden],
+    """Stack ragged per-request tensors [seq_i, ...] into [batch, seq, ...],
     left-padding shorter requests with zeros so real tokens stay right-aligned --
     the layout HF's left-padded batch produces."""
     seq = max(t.shape[0] for t in per_request)
-    batched = torch.zeros(len(per_request), seq, per_request[0].shape[1],
+    batched = torch.zeros(len(per_request), seq, *per_request[0].shape[1:],
                           dtype=per_request[0].dtype)
     for i, t in enumerate(per_request):
         batched[i, seq - t.shape[0]:] = t
@@ -87,8 +87,8 @@ def _left_pad_stack_attention(per_request: list[torch.Tensor]) -> torch.Tensor:
     return batched
 
 
-def _reassemble_attention_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
-    """Reassemble attention-pattern rows as a tuple ordered by layer."""
+def _reassemble_attention_per_layer(rows: list, act_name: str) -> tuple[torch.Tensor, ...]:
+    """Reassemble attention-matrix rows as a tuple ordered by layer."""
     layers: dict[int, dict[str, list]] = {}
     for key, tensor in rows:
         layers.setdefault(key[3], {}).setdefault(key[1], []).append((key[5], tensor))
@@ -97,12 +97,18 @@ def _reassemble_attention_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
         per_request = [
             merge_segments(
                 [t for _, t in sorted(chunks)],
-                "blocks.attn.hook_pattern",
+                act_name,
             )
             for _, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
         ]
         out.append(_left_pad_stack_attention(per_request))
     return tuple(out)
+
+
+def _attention_reassembler(act_name: str):
+    def _reassemble(rows: list) -> tuple[torch.Tensor, ...]:
+        return _reassemble_attention_per_layer(rows, act_name)
+    return _reassemble
 
 
 def _reassemble_global(rows: list) -> torch.Tensor:
@@ -127,9 +133,35 @@ def _reassemble_global(rows: list) -> torch.Tensor:
 # (key, tensor) rows for its act_name and returns the field value. Add new
 # internals (attention, logits, kv, ...) here, each with its own reassembler.
 _FIELDS = {
+    "attention_output": ("blocks.hook_attn_out", _reassemble_per_layer),
+    "attention_scores": (
+        "blocks.attn.hook_attn_scores",
+        _attention_reassembler("blocks.attn.hook_attn_scores"),
+    ),
+    "attention_values": ("blocks.attn.hook_z", _reassemble_per_layer),
     "hidden_states": ("blocks.hook_resid_pre", _reassemble_per_layer),
-    "attentions": ("blocks.attn.hook_pattern", _reassemble_attention_per_layer),
+    "attentions": (
+        "blocks.attn.hook_pattern",
+        _attention_reassembler("blocks.attn.hook_pattern"),
+    ),
+    "embeddings": ("hook_embed", _reassemble_global),
+    "expert_ids": ("blocks.mlp.hook_topk_ids", _reassemble_per_layer),
+    "expert_weights": ("blocks.mlp.hook_topk_weights", _reassemble_per_layer),
+    "final_hidden": ("hook_final_ln", _reassemble_global),
+    "final_residual": ("hook_resid_final", _reassemble_global),
+    "k": ("blocks.attn.hook_k", _reassemble_per_layer),
+    "ln1": ("blocks.hook_ln1", _reassemble_per_layer),
+    "ln2": ("blocks.hook_ln2", _reassemble_per_layer),
     "logits": ("final_logits", _reassemble_global),
+    "middle_residual": ("blocks.hook_resid_mid", _reassemble_per_layer),
+    "mlp_activation": ("blocks.hook_mlp_post", _reassemble_per_layer),
+    "mlp_input": ("blocks.hook_mlp_in", _reassemble_per_layer),
+    "mlp_output": ("blocks.hook_mlp_out", _reassemble_per_layer),
+    "position_embeddings": ("hook_pos_embed", _reassemble_global),
+    "q": ("blocks.attn.hook_q", _reassemble_per_layer),
+    "router_logits": ("blocks.mlp.hook_router_logits", _reassemble_per_layer),
+    "token_ids": ("token_ids", _reassemble_global),
+    "v": ("blocks.attn.hook_v", _reassemble_per_layer),
 }
 
 
@@ -169,7 +201,11 @@ class _Requirement:
 
 
 class InternalRequirements:
-    """Reusable strictness policy for lazy internal fields."""
+    """Reusable strictness policy for lazy internal fields.
+
+    ``count`` validates ``len(field_value)``. For per-layer fields such as
+    ``hidden_states``, that means layer count, not token completeness.
+    """
 
     def __init__(self, counts: dict[str, int | _Requirement] | None = None) -> None:
         self._requirements = {
