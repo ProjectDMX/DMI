@@ -90,6 +90,7 @@ class MonitoringEngine:
                     raise RuntimeError("Failed to construct DMXHostEngine") from exc
             # Only DMXHostEngine has a lifecycle here. A Python callable sink
             # (e.g. hallu_monitor ProbeWorker) is started/stopped by its owner.
+            from . import _native_engine  # type: ignore[attr-defined]
             if isinstance(self._host_engine, _native_engine.DMXHostEngine):
                 try:
                     if db_config is None or db_config.start_on_init:
@@ -222,6 +223,7 @@ class MonitoringEngine:
 
         # Only DMXHostEngine owns a ClickHouse pipeline to tear down here; a
         # callable sink (ProbeWorker) is stopped by its owner.
+        from . import _native_engine  # type: ignore[attr-defined]
         if isinstance(self._host_engine, _native_engine.DMXHostEngine):
             try:
                 self._host_engine.close_input()
