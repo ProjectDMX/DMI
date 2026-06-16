@@ -694,6 +694,28 @@ class HFAdaptor(BackendAdaptor):
 # generate_with_monitoring (rewritten to use HFAdaptor)
 # ---------------------------------------------------------------------------
 
+class MonitoredGenerateOutput:
+    """HF ``generate()`` output plus the ``model_id`` needed to retrieve the
+    captured internals. ``sequences`` mirrors HF's generated token ids;
+    ``model_id`` is the handle ``get_internal`` uses. Any other attribute
+    (scores, logits, hidden_states, ...) falls through to the underlying HF
+    output when ``return_dict_in_generate=True`` was used."""
+
+    def __init__(self, raw: Any, model_id: str):
+        self._raw = raw
+        self.model_id = model_id
+
+    @property
+    def sequences(self) -> Any:
+        return getattr(self._raw, "sequences", self._raw)
+
+    def __getattr__(self, name: str) -> Any:
+        raw = self.__dict__.get("_raw")
+        if raw is not None and hasattr(raw, name):
+            return getattr(raw, name)
+        raise AttributeError(name)
+
+
 def generate_with_monitoring(
     model: Any, *args: Any,
     hook_selection: Optional[str] = None,
@@ -935,7 +957,8 @@ def generate_with_monitoring(
                 warnings.warn(msg, stacklevel=2)
 
     try:
-        return model.generate(*args, **kwargs)
+        gen = model.generate(*args, **kwargs)
+        return MonitoredGenerateOutput(gen, engine._model_id)
     finally:
         if adaptor is not None:
             adaptor.detach_model(target)
@@ -1208,6 +1231,7 @@ def generate_greedy_with_monitoring(
 __all__ = [
     "HFAdaptor",
     "GreedyGenerateTimings",
+    "MonitoredGenerateOutput",
     "generate_with_monitoring",
     "generate_greedy_with_monitoring",
     "_prepare_profile_times",
