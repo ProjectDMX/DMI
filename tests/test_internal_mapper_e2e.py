@@ -47,7 +47,7 @@ def deps():
         from monitoring._native_engine import ClickHouseClientConfig, StageConfig
         from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
         from monitoring.internal_mapper import get_internal
-        from integration.hf_adapter import generate_with_monitoring, MonitoredGenerateOutput
+        from integration.hf_adapter import generate_with_monitoring_dict
         import clickhouse_driver
     except Exception as exc:
         pytest.skip(f"DMI HF stack unavailable: {exc}")
@@ -66,7 +66,7 @@ def _wipe(deps, model_id):
 
 
 def _monitored(deps, model, inputs, model_id, hook_selection="resid_pre"):
-    """Run generate_with_monitoring into a fresh ClickHouse slot, return the output."""
+    """Run generate_with_monitoring_dict into a fresh ClickHouse slot."""
     _wipe(deps, model_id)
     host, port = _db_host_port()
     db = deps.ClickHouseClientConfig()
@@ -83,7 +83,7 @@ def _monitored(deps, model, inputs, model_id, hook_selection="resid_pre"):
     model.monitoring_engine = engine
     try:
         with torch.no_grad():
-            return deps.generate_with_monitoring(
+            return deps.generate_with_monitoring_dict(
                 model, **inputs, max_new_tokens=MAX_NEW, do_sample=False,
                 hook_selection=hook_selection,
             )
@@ -112,7 +112,7 @@ def single(deps, model_tok):
         ref = model.generate(**inputs, max_new_tokens=MAX_NEW, do_sample=False)
     model_id = f"test_internal::single::{uuid.uuid4().hex}"[:120]
     out = _monitored(deps, model, inputs, model_id)
-    yield SimpleNamespace(out=out, ref=ref, model=model)
+    yield SimpleNamespace(out=out, ref=ref, model=model, model_id=model_id)
     _wipe(deps, model_id)
 
 
@@ -123,16 +123,15 @@ def ragged(deps, model_tok):
     inputs = tok(["The capital of France is", "Hi"], return_tensors="pt", padding=True).to("cuda")
     model_id = f"test_internal::ragged::{uuid.uuid4().hex}"[:120]
     out = _monitored(deps, model, inputs, model_id)
-    yield SimpleNamespace(out=out, n_prompts=2)
+    yield SimpleNamespace(out=out, n_prompts=2, model_id=model_id)
     _wipe(deps, model_id)
 
 
-# --- wrapper return shape ---------------------------------------------------
+# --- dict return shape ------------------------------------------------------
 
-def test_returns_monitored_output(single, deps):
-    assert isinstance(single.out, deps.MonitoredGenerateOutput)
-    assert isinstance(single.out.model_id, str) and single.out.model_id
+def test_returns_dict_output_with_dmi_internal(single):
     assert single.out.sequences.dim() == 2  # [batch, total_len]
+    assert hasattr(single.out, "dmi_internal")
 
 
 def test_output_matches_plain_hf(single):
@@ -143,12 +142,12 @@ def test_output_matches_plain_hf(single):
 # --- get_internal: structure ------------------------------------------------
 
 def test_available_lists_captured_field(single, deps):
-    internal = deps.get_internal(single.out)
+    internal = single.out.dmi_internal
     assert internal.available == ["hidden_states"]
 
 
 def test_hidden_states_tuple_shape(single, deps):
-    internal = deps.get_internal(single.out)
+    internal = single.out.dmi_internal
     hs = internal.hidden_states
     cfg = single.model.config
     assert len(hs) == cfg.num_hidden_layers          # one entry per block (resid_pre)
@@ -161,23 +160,23 @@ def test_hidden_states_tuple_shape(single, deps):
 def test_token_count_drops_unforwarded_last(single, deps):
     # The final generated token is never fed through a forward, so it has no
     # captured hidden state: captured seq == sequence length - 1.
-    hs = deps.get_internal(single.out).hidden_states
+    hs = single.out.dmi_internal.hidden_states
     assert hs[0].shape[1] == single.out.sequences.shape[1] - 1
 
 
-# --- get_internal: source + reader handling --------------------------------
+# --- get_internal: model_id + reader handling ------------------------------
 
 def test_source_model_id_with_explicit_reader(single, deps):
     host, port = _db_host_port()
     reader = deps.CHClickhouseDriverReadOnly(host=host, port=port)
-    from_out = deps.get_internal(single.out).hidden_states
-    from_id = deps.get_internal(single.out.model_id, reader).hidden_states
+    from_out = single.out.dmi_internal.hidden_states
+    from_id = deps.get_internal(single.model_id, reader).hidden_states
     assert len(from_out) == len(from_id)
     assert torch.equal(from_out[0], from_id[0])
 
 
 def test_uncaptured_field_raises(single, deps):
-    internal = deps.get_internal(single.out)
+    internal = single.out.dmi_internal
     with pytest.raises(AttributeError, match="not captured"):
         internal.attention
 
@@ -185,7 +184,7 @@ def test_uncaptured_field_raises(single, deps):
 # --- get_internal: ragged batch left-pad -----------------------------------
 
 def test_ragged_batch_left_pads(ragged, deps):
-    hs = deps.get_internal(ragged.out).hidden_states
+    hs = ragged.out.dmi_internal.hidden_states
     layer0 = hs[0]
     assert layer0.shape[0] == ragged.n_prompts
 

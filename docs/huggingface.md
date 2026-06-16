@@ -29,6 +29,53 @@ Inspect captured rows after a `ring_db` run:
 clickhouse-client --query "SELECT count() FROM default.offload"
 ```
 
+## Reading internals from HF generation output
+
+`generate_with_monitoring(...)` preserves Hugging Face's normal return behavior.
+Use `generate_with_monitoring_dict(...)` when you want a dict-style generation
+output with DMI internals attached:
+
+```python
+from integration.hf_adapter import generate_with_monitoring_dict
+from monitoring.internal_mapper import InternalRequirements
+
+requirements = InternalRequirements().require(
+    "hidden_states",
+    count=model.config.num_hidden_layers,
+)
+
+out = generate_with_monitoring_dict(
+    model,
+    **inputs,
+    max_new_tokens=8,
+    do_sample=False,
+    internal_requirements=requirements,
+)
+
+hidden_states = out.dmi_internal.hidden_states
+```
+
+Plain field access such as `out.dmi_internal.hidden_states` is lazy and
+field-cached. It reads the backing store on first successful access and then
+reuses the cached value. If ClickHouse is still receiving rows, plain access can
+cache a partial result. Use a requirement when you know the expected number of
+entries and want incomplete reads to fail explicitly.
+
+Per-output requirements are also supported:
+
+```python
+out.dmi_internal.require("hidden_states", count=model.config.num_hidden_layers)
+hidden_states = out.dmi_internal.hidden_states
+```
+
+If more rows arrive after a field has been cached, clear that field before
+reading again:
+
+```python
+out.dmi_internal.clear_cache("hidden_states")
+hidden_states = out.dmi_internal.hidden_states
+```
+
 ## Ring-transport benchmark
 
 The benchmark compares:

@@ -87,14 +87,119 @@ class Internal:
         )
 
 
-def get_internal(source, reader: CHClickhouseDriverReadOnly | None = None) -> Internal:
+class IncompleteInternalError(RuntimeError):
+    """Raised when a required internal field is present but incomplete."""
+
+
+class InternalRequirements:
+    """Reusable strictness policy for lazy internal fields."""
+
+    def __init__(self, counts: dict[str, int] | None = None) -> None:
+        self._counts = dict(counts or {})
+
+    def require(self, field: str, *, count: int) -> "InternalRequirements":
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        self._counts[field] = int(count)
+        return self
+
+    def copy(self) -> "InternalRequirements":
+        return InternalRequirements(self._counts)
+
+    def expected_count(self, field: str) -> int | None:
+        return self._counts.get(field)
+
+
+class _LazyInternal:
+    """Lazy proxy for captured internals.
+
+    Successful field access caches that field. Failed loads and incomplete
+    fields are passed through unchanged and are not cached, so later accesses
+    retry.
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        reader: CHClickhouseDriverReadOnly | None = None,
+        requirements: InternalRequirements | None = None,
+    ) -> None:
+        self._model_id = model_id
+        self._reader = reader
+        self._requirements = (
+            requirements.copy() if requirements is not None else InternalRequirements()
+        )
+        self._field_cache: dict[str, object] = {}
+
+    def require(self, field: str, *, count: int) -> "_LazyInternal":
+        self._requirements.require(field, count=count)
+        return self
+
+    def clear_cache(self, field: str | None = None) -> None:
+        if field is None:
+            self._field_cache.clear()
+            return
+        self._field_cache.pop(field, None)
+
+    def _validate(self, field: str, value: object) -> None:
+        expected = self._requirements.expected_count(field)
+        if expected is None:
+            return
+        try:
+            found = len(value)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise IncompleteInternalError(
+                f"{field} cannot be validated for model_id={self._model_id!r}: "
+                "value has no length."
+            ) from exc
+        if found != expected:
+            raise IncompleteInternalError(
+                f"{field} is incomplete for model_id={self._model_id!r}: "
+                f"expected {expected} entries, found {found}."
+            )
+
+    def _load_field(self, field: str) -> object:
+        if field in self._field_cache:
+            value = self._field_cache[field]
+            try:
+                self._validate(field, value)
+            except Exception:
+                self._field_cache.pop(field, None)
+                raise
+            return value
+        internal = get_internal(self._model_id, self._reader)
+        value = getattr(internal, field)
+        self._validate(field, value)
+        self._field_cache[field] = value
+        return value
+
+    @property
+    def available(self) -> list[str]:
+        return get_internal(self._model_id, self._reader).available
+
+    def __getattr__(self, name: str):
+        return self._load_field(name)
+
+    def __repr__(self) -> str:
+        state = f"cached={sorted(self._field_cache)}" if self._field_cache else "pending"
+        return f"<DMIInternal model_id={self._model_id!r} state={state}>"
+
+
+def make_lazy_internal(
+    model_id: str,
+    reader: CHClickhouseDriverReadOnly | None = None,
+    requirements: InternalRequirements | None = None,
+) -> _LazyInternal:
+    return _LazyInternal(model_id, reader, requirements=requirements)
+
+
+def get_internal(model_id: str, reader: CHClickhouseDriverReadOnly | None = None) -> Internal:
     """Retrieve a run's captured internals.
 
-    ``source`` is either the ``generate_with_monitoring`` output (its
-    ``model_id`` is used) or a ``model_id`` string. ``reader`` defaults to a
-    local ClickHouse connection (``DMX_DB_HOST`` / ``DMX_DB_PORT``); pass one to
-    read a run from another process or host."""
-    model_id = getattr(source, "model_id", source)
+    ``model_id`` identifies the captured run. ``reader`` defaults to a local
+    ClickHouse connection (``DMX_DB_HOST`` / ``DMX_DB_PORT``); pass one to read
+    a run from another process or host.
+    """
     reader = reader or _default_reader()
     rows_by_act: dict[str, list] = {}
     for key, tensor in reader.prefix_get((model_id,)):

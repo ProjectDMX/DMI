@@ -694,34 +694,13 @@ class HFAdaptor(BackendAdaptor):
 # generate_with_monitoring (rewritten to use HFAdaptor)
 # ---------------------------------------------------------------------------
 
-class MonitoredGenerateOutput:
-    """HF ``generate()`` output plus the ``model_id`` needed to retrieve the
-    captured internals. ``sequences`` mirrors HF's generated token ids;
-    ``model_id`` is the handle ``get_internal`` uses. Any other attribute
-    (scores, logits, hidden_states, ...) falls through to the underlying HF
-    output when ``return_dict_in_generate=True`` was used."""
-
-    def __init__(self, raw: Any, model_id: str):
-        self._raw = raw
-        self.model_id = model_id
-
-    @property
-    def sequences(self) -> Any:
-        return getattr(self._raw, "sequences", self._raw)
-
-    def __getattr__(self, name: str) -> Any:
-        raw = self.__dict__.get("_raw")
-        if raw is not None and hasattr(raw, name):
-            return getattr(raw, name)
-        raise AttributeError(name)
-
-
-def generate_with_monitoring(
+def _generate_with_monitoring_impl(
     model: Any, *args: Any,
     hook_selection: Optional[str] = None,
     no_strip_left_pad: bool = False,
     no_strip_right_pad: bool = False,
     eos_token_id: Any = None,
+    _return_model_id: bool = False,
     **kwargs: Any,
 ):
     """Run HF ``generate()`` with ring-transport monitoring hooks active.
@@ -958,7 +937,9 @@ def generate_with_monitoring(
 
     try:
         gen = model.generate(*args, **kwargs)
-        return MonitoredGenerateOutput(gen, engine._model_id)
+        if _return_model_id:
+            return gen, engine._model_id
+        return gen
     finally:
         if adaptor is not None:
             adaptor.detach_model(target)
@@ -972,6 +953,70 @@ def generate_with_monitoring(
                 gen_cfg.cache_implementation = _saved_cache_impl
         # force_eager is owned by before_forward (per-batch reassignment);
         # no cleanup needed -- the next generate()'s first batch will set it.
+
+
+def generate_with_monitoring(
+    model: Any, *args: Any,
+    hook_selection: Optional[str] = None,
+    no_strip_left_pad: bool = False,
+    no_strip_right_pad: bool = False,
+    eos_token_id: Any = None,
+    **kwargs: Any,
+):
+    """Run HF ``generate()`` with monitoring hooks and return HF output unchanged."""
+    return _generate_with_monitoring_impl(
+        model, *args,
+        hook_selection=hook_selection,
+        no_strip_left_pad=no_strip_left_pad,
+        no_strip_right_pad=no_strip_right_pad,
+        eos_token_id=eos_token_id,
+        **kwargs,
+    )
+
+
+def generate_with_monitoring_dict(
+    model: Any, *args: Any,
+    hook_selection: Optional[str] = None,
+    no_strip_left_pad: bool = False,
+    no_strip_right_pad: bool = False,
+    eos_token_id: Any = None,
+    reader: Any = None,
+    internal_requirements: Any = None,
+    **kwargs: Any,
+):
+    """Run monitored HF ``generate()`` and return dict-style output with DMI internals.
+
+    This API always forces ``return_dict_in_generate=True`` and attaches one DMI
+    extension, ``dmi_internal``, which lazily reads captured internals.
+    """
+    gen_kwargs = dict(kwargs)
+    if gen_kwargs.get("return_dict_in_generate") is False:
+        warnings.warn(
+            "generate_with_monitoring_dict() requires "
+            "return_dict_in_generate=True; overriding the supplied False value.",
+            UserWarning,
+            stacklevel=2,
+        )
+    gen_kwargs["return_dict_in_generate"] = True
+
+    output, model_id = _generate_with_monitoring_impl(
+        model, *args,
+        hook_selection=hook_selection,
+        no_strip_left_pad=no_strip_left_pad,
+        no_strip_right_pad=no_strip_right_pad,
+        eos_token_id=eos_token_id,
+        _return_model_id=True,
+        **gen_kwargs,
+    )
+
+    from monitoring.internal_mapper import make_lazy_internal
+    dmi_internal = make_lazy_internal(
+        model_id, reader=reader, requirements=internal_requirements)
+    try:
+        output.dmi_internal = dmi_internal
+    except Exception:
+        object.__setattr__(output, "dmi_internal", dmi_internal)
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -1231,8 +1276,8 @@ def generate_greedy_with_monitoring(
 __all__ = [
     "HFAdaptor",
     "GreedyGenerateTimings",
-    "MonitoredGenerateOutput",
     "generate_with_monitoring",
+    "generate_with_monitoring_dict",
     "generate_greedy_with_monitoring",
     "_prepare_profile_times",
     "print_prepare_profile",

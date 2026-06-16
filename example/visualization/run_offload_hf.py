@@ -152,7 +152,7 @@ def main() -> None:
     finally:
         engine.close()
 
-    decoded = tokenizer.decode(output_ids.sequences[0], skip_special_tokens=True)
+    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     print(f"[demo] Output:  {decoded!r}", flush=True)
     print(f"[demo] model_id = {MODEL_ID}  (open visualize.ipynb to render)", flush=True)
 
