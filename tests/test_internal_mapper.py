@@ -355,6 +355,47 @@ def test_lazy_internal_requirement_retries_incomplete_until_success():
     assert reader.calls == 2
 
 
+def test_lazy_internal_requirement_detects_missing_token_ranges():
+    rows = [_row("0:0", 0, 0, torch.ones(2, 4))]
+    reader = PrefixReader(rows)
+    internal = make_lazy_internal(
+        "m",
+        reader,
+        request_ids=("0:0",),
+        token_ranges={"0:0": ((0, 2), (2, 3))},
+    )
+    internal.require("hidden_states", count=1, match_token_ranges=True)
+
+    with pytest.raises(IncompleteInternalError, match="token ranges are incomplete"):
+        internal.hidden_states
+
+
+def test_lazy_internal_requirement_retries_missing_token_ranges_until_success():
+    partial = [_row("0:0", 0, 0, torch.ones(2, 4))]
+    complete = [
+        _row("0:0", 0, 0, torch.ones(2, 4)),
+        _row("0:0", 0, 2, torch.ones(1, 4)),
+    ]
+    reader = SequenceReader([partial, complete])
+    internal = make_lazy_internal(
+        "m",
+        reader,
+        request_ids=("0:0",),
+        token_ranges={"0:0": ((0, 2), (2, 3))},
+    )
+    internal.require(
+        "hidden_states",
+        count=1,
+        retry=True,
+        timeout_s=1.0,
+        poll_s=0.001,
+        match_token_ranges=True,
+    )
+
+    assert tuple(internal.hidden_states[0].shape) == (1, 3, 4)
+    assert reader.calls == 2
+
+
 def test_lazy_internal_requirement_retry_timeout_raises_incomplete():
     rows = [_row("0:0", 0, 0, torch.ones(3, 4))]
     reader = SequenceReader([rows])

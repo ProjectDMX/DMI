@@ -198,6 +198,7 @@ class _Requirement:
     retry: bool = False
     timeout_s: float | None = 30.0
     poll_s: float = 0.25
+    match_token_ranges: bool = False
 
 
 class InternalRequirements:
@@ -205,6 +206,8 @@ class InternalRequirements:
 
     ``count`` validates ``len(field_value)``. For per-layer fields such as
     ``hidden_states``, that means layer count, not token completeness.
+    ``match_token_ranges=True`` additionally validates that captured row ranges
+    match this generate call's expected request token ranges.
     """
 
     def __init__(self, counts: dict[str, int | _Requirement] | None = None) -> None:
@@ -227,6 +230,7 @@ class InternalRequirements:
         retry: bool = False,
         timeout_s: float | None = 30.0,
         poll_s: float = 0.25,
+        match_token_ranges: bool = False,
     ) -> "InternalRequirements":
         if count < 0:
             raise ValueError("count must be non-negative")
@@ -239,6 +243,7 @@ class InternalRequirements:
             retry=bool(retry),
             timeout_s=timeout_s,
             poll_s=float(poll_s),
+            match_token_ranges=bool(match_token_ranges),
         )
         return self
 
@@ -291,6 +296,7 @@ class _LazyInternal:
         retry: bool = False,
         timeout_s: float | None = 30.0,
         poll_s: float = 0.25,
+        match_token_ranges: bool = False,
     ) -> "_LazyInternal":
         self._requirements.require(
             field,
@@ -298,6 +304,7 @@ class _LazyInternal:
             retry=retry,
             timeout_s=timeout_s,
             poll_s=poll_s,
+            match_token_ranges=match_token_ranges,
         )
         return self
 
@@ -366,7 +373,7 @@ class _LazyInternal:
         field: str,
         requirement: _Requirement | None,
     ) -> object:
-        value = self._read_field(field)
+        value = self._read_field(field, requirement)
         self._validate(field, value, requirement)
         self._field_cache[field] = value
         return value
@@ -393,7 +400,55 @@ class _LazyInternal:
             if key[2] == act
         ]
 
-    def _read_field(self, field: str) -> object:
+    def _expected_non_empty_ranges(self, request_id: str) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (int(start), int(end))
+            for start, end in self._token_ranges.get(request_id, ())
+            if int(end) > int(start)
+        )
+
+    def _actual_ranges_for_request(
+        self,
+        rows: list,
+        request_id: str,
+        layer: int | None,
+    ) -> tuple[tuple[int, int], ...]:
+        ranges = {
+            (int(key[5]), int(key[6]))
+            for key, _ in rows
+            if key[1] == request_id and (layer is None or int(key[3]) == layer)
+            and int(key[6]) > int(key[5])
+        }
+        return tuple(sorted(ranges))
+
+    def _validate_token_ranges(
+        self,
+        field: str,
+        rows: list,
+        requirement: _Requirement | None,
+    ) -> None:
+        if (
+            requirement is None
+            or not requirement.match_token_ranges
+            or not self._request_ids
+            or not self._token_ranges
+        ):
+            return
+        layers = sorted({int(key[3]) for key, _ in rows if int(key[3]) >= 0})
+        # Fast check for per-layer fields: validating the last layer catches the
+        # common "writer still pending" case without scanning every layer.
+        check_layer = layers[-1] if layers else None
+        for request_id in self._request_ids:
+            expected = self._expected_non_empty_ranges(request_id)
+            actual = self._actual_ranges_for_request(rows, request_id, check_layer)
+            if actual != expected:
+                raise IncompleteInternalError(
+                    f"{field} token ranges are incomplete for "
+                    f"model_id={self._model_id!r}, request_id={request_id!r}: "
+                    f"expected {list(expected)}, found {list(actual)}."
+                )
+
+    def _read_field(self, field: str, requirement: _Requirement | None = None) -> object:
         if field == "token_mask":
             return self._build_token_mask()
         if field not in _FIELDS:
@@ -409,6 +464,7 @@ class _LazyInternal:
                 f"{field!r} was not captured in this run. "
                 f"Pass the corresponding hook via hook_selection= when generating."
             )
+        self._validate_token_ranges(field, rows, requirement)
         return reassemble(rows)
 
     def _build_token_mask(self) -> torch.Tensor:

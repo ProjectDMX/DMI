@@ -109,6 +109,7 @@ def main() -> None:
         retry=True,
         timeout_s=30.0,
         poll_s=0.25,
+        match_token_ranges=True,
     )
     inputs = tokenizer(PROMPT, return_tensors="pt").to(device)
 

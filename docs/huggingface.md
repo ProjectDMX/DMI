@@ -44,6 +44,7 @@ requirements = InternalRequirements().require(
     count=model.config.num_hidden_layers,
     retry=True,
     timeout_s=30.0,
+    match_token_ranges=True,
 )
 
 out = generate_with_monitoring_dict(
@@ -60,7 +61,9 @@ token_mask = out.dmi_internal.token_mask
 
 For layer-tuple fields such as `hidden_states`, `count` validates the number of
 layers in the reassembled tuple. It does not validate token completeness inside
-each layer tensor.
+each layer tensor unless `match_token_ranges=True` is set. That option checks
+the captured row ranges against the token ranges recorded during this generate
+call. For per-layer fields it uses a fast representative-layer check.
 
 Supported mapped fields are:
 
@@ -119,8 +122,9 @@ norm = hidden_states[0].float().norm(dim=-1)[token_mask].mean()
 
 If a tensor field and `token_mask` have different `[batch, seq]` shapes, it
 usually means the tensor field was read before all rows for that field arrived.
-Current requirements for layer-tuple fields validate layer count, not token
-count, so clear that field's cache and read it again:
+Use `match_token_ranges=True` with `retry=True` to wait for expected token
+ranges. If you already cached a partial field, clear that field's cache and read
+it again:
 
 ```python
 out.dmi_internal.clear_cache("hidden_states")
@@ -159,6 +163,7 @@ out.dmi_internal.require(
     retry=True,
     timeout_s=30.0,
     poll_s=0.25,
+    match_token_ranges=True,
 )
 hidden_states = out.dmi_internal.hidden_states
 ```
