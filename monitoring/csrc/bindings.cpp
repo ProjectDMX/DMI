@@ -262,23 +262,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
              ring_py::SubmitFn submit_fn;
              if (!host_engine_obj.is_none()) {
-                 auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
-                 submit_fn = [host](const std::string& model_id, int32_t shard_rank,
-                                    const std::string& req_id, const std::string& act_name,
-                                    int32_t layer_no, int32_t start_token, int32_t end_token,
-                                    at::Tensor slice) {
-                     dmx_host::ClickHouseRow row;
-                     row.emplace_back(model_id);
-                     row.emplace_back(req_id);
-                     row.emplace_back(act_name);
-                     row.emplace_back(layer_no);
-                     row.emplace_back(shard_rank);
-                     row.emplace_back(start_token);
-                     row.emplace_back(end_token);
-                     uint64_t nbytes = static_cast<uint64_t>(slice.nbytes());
-                     row.emplace_back(std::move(slice));
-                     host->submit_direct(std::move(row), nbytes);
-                 };
+                 if (py::isinstance<dmx_host::DMXHostEngine>(host_engine_obj)) {
+                     // DMXHostEngine sink -> ClickHouse. Runs without the GIL
+                     // (all args are C++ types).
+                     auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
+                     submit_fn = [host](const std::string& model_id, int32_t shard_rank,
+                                        const std::string& req_id, const std::string& act_name,
+                                        int32_t layer_no, int32_t start_token, int32_t end_token,
+                                        at::Tensor slice) {
+                         dmx_host::ClickHouseRow row;
+                         row.emplace_back(model_id);
+                         row.emplace_back(req_id);
+                         row.emplace_back(act_name);
+                         row.emplace_back(layer_no);
+                         row.emplace_back(shard_rank);
+                         row.emplace_back(start_token);
+                         row.emplace_back(end_token);
+                         uint64_t nbytes = static_cast<uint64_t>(slice.nbytes());
+                         row.emplace_back(std::move(slice));
+                         host->submit_direct(std::move(row), nbytes);
+                     };
+                 } else {
+                     // Python callable sink (tests / custom in-memory consumers,
+                     // e.g. hallu_monitor's ProbeWorker). The p2p thread calls
+                     // submit_fn with the GIL released, so re-acquire before
+                     // calling into Python.
+                     auto pyfn = std::make_shared<py::function>(
+                         host_engine_obj.cast<py::function>());
+                     submit_fn = [pyfn](const std::string& model_id, int32_t shard_rank,
+                                        const std::string& req_id, const std::string& act_name,
+                                        int32_t layer_no, int32_t start_token, int32_t end_token,
+                                        at::Tensor slice) {
+                         py::gil_scoped_acquire gil;
+                         try {
+                             (*pyfn)(model_id, shard_rank, req_id, act_name, layer_no,
+                                     start_token, end_token, std::move(slice));
+                         } catch (const py::error_already_set& ex) {
+                             // Don't let a sink error kill the p2p thread; surface it.
+                             fprintf(stderr, "[ring p2p] Python SubmitFn raised: %s\n", ex.what());
+                         }
+                     };
+                 }
              }
              return std::make_shared<ring_py::RingEnginePy>(
                  std::move(cfg), std::move(submit_fn));

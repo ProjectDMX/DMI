@@ -88,7 +88,9 @@ class MonitoringEngine:
                     self._host_engine = DMXHostEngine(stages[0])  # type: ignore[call-arg]
                 except Exception as exc:
                     raise RuntimeError("Failed to construct DMXHostEngine") from exc
-            if self._host_engine is not None:
+            # Only DMXHostEngine has a lifecycle here. A Python callable sink
+            # (e.g. hallu_monitor ProbeWorker) is started/stopped by its owner.
+            if isinstance(self._host_engine, _native_engine.DMXHostEngine):
                 try:
                     if db_config is None or db_config.start_on_init:
                         self._host_engine.start()
@@ -166,9 +168,11 @@ class MonitoringEngine:
         # SubmitFn that calls submit_direct without touching Python/GIL.
         # Pass None for null/benchmark mode (no DB writes).
         host_cpp = None
-        if self._host_engine is not None and isinstance(
-            self._host_engine, _native_engine.DMXHostEngine
-        ):
+        if isinstance(self._host_engine, _native_engine.DMXHostEngine):
+            host_cpp = self._host_engine
+        elif callable(self._host_engine):
+            # Python callable sink (e.g. hallu_monitor ProbeWorker): RingEngine's
+            # binding routes host tensors to it in memory, bypassing ClickHouse.
             host_cpp = self._host_engine
 
         ring_engine = _native_engine.RingEngine(ring_config, host_cpp)
@@ -216,13 +220,15 @@ class MonitoringEngine:
             self._ring_transport = None
             self._ring_engine = None
 
-        if self._host_engine is not None:
+        # Only DMXHostEngine owns a ClickHouse pipeline to tear down here; a
+        # callable sink (ProbeWorker) is stopped by its owner.
+        if isinstance(self._host_engine, _native_engine.DMXHostEngine):
             try:
                 self._host_engine.close_input()
                 self._host_engine.stop()
             except Exception:
                 pass
-            self._host_engine = None
+        self._host_engine = None
 
 
 # ---------------------------------------------------------------------------
