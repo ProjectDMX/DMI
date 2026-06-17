@@ -513,6 +513,9 @@ class DMXGPUWorker(Worker):
         self.adaptor: Optional[VLLMAdaptor] = None
         self._dmx_host_engine: Any = None
         self._dmx_hook_selection: str = "vllm-full"
+        # callable-sink (e.g. ProbeWorker) + per-request auto-finalize
+        self._dmx_callable_sink: Any = None
+        self._dmx_auto_finalize: bool = False
 
     def init_device(self) -> None:
         super().init_device()
@@ -580,6 +583,14 @@ class DMXGPUWorker(Worker):
             if host_engine is None:
                 raise RuntimeError(
                     "registered dmx sink factory returned None")
+            self._dmx_callable_sink = host_engine
+            # auto-finalize each request when vLLM reports it finished, so
+            # per-request ("final"/pooled) probes score at the response's last
+            # token under continuous batching (no manual finalize_all needed).
+            # Only meaningful for a finalize-capable sink (e.g. ProbeWorker).
+            self._dmx_auto_finalize = bool(_cfg(
+                ac, "dmx_auto_finalize", "DMX_AUTO_FINALIZE", True)) and \
+                hasattr(host_engine, "finalize_request")
 
         ring_cfg = _ne.RingConfig()
         ring_cfg.payload_ring_bytes = ring_payload_mb * 1024 * 1024
@@ -701,7 +712,32 @@ class DMXGPUWorker(Worker):
             and scheduler_output.total_num_scheduled_tokens > 0
         ):
             self.adaptor.before_forward(scheduler_output, self.model_runner)
-        return super().execute_model(scheduler_output)
+        out = super().execute_model(scheduler_output)
+        if self._dmx_auto_finalize:
+            self._dmx_finalize_finished(scheduler_output)
+        return out
+
+    def _dmx_finalize_finished(self, scheduler_output: Any) -> None:
+        """Finalize each request vLLM reports finished this step, at its true
+        final token. finished_req_ids come from prior step(s), so the final-token
+        slices are already captured; flush_and_wait drains them to the sink
+        BEFORE we enqueue finalize, so the worker sees [...slices, finalize] in
+        FIFO order and a "final"-pooled probe scores the last token. The flush
+        runs only on finish-steps (cheap when finishes are sparse; a per-finish
+        cudaStreamSynchronize otherwise -- disable via dmx_auto_finalize=False)."""
+        fin = getattr(scheduler_output, "finished_req_ids", None)
+        if not fin:
+            return
+        sink = self._dmx_callable_sink
+        finalize = getattr(sink, "finalize_request", None)
+        if finalize is None:
+            return
+        self.dmx_flush()  # deliver finished requests' final-token slices first
+        for rid in fin:
+            try:
+                finalize(normalize_vllm_request_id(rid))
+            except Exception:
+                pass
 
     def dmx_flush(self) -> None:
         """Force the ring to drain all pending slices to the sink, NOW, without
