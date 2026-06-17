@@ -25,9 +25,6 @@ export VLLM_DISABLE_COMPILE_CACHE=1
 ## Offline API
 
 ```python
-import os
-os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"  # required (see above)
-
 from vllm import LLM, SamplingParams
 
 llm = LLM(
@@ -60,9 +57,6 @@ the captured internals back from the store -- the same object the HuggingFace
 path's `out.dmi_internal` gives you.
 
 ```python
-import os
-os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"  # required (see above)
-
 from vllm import SamplingParams
 from integration.vllm_adapter import DMILLM
 
