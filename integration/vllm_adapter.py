@@ -703,6 +703,17 @@ class DMXGPUWorker(Worker):
             self.adaptor.before_forward(scheduler_output, self.model_runner)
         return super().execute_model(scheduler_output)
 
+    def dmx_flush(self) -> None:
+        """Force the ring to drain all pending slices to the sink, NOW, without
+        stopping. Lets an in-memory consumer reach a request's final-token slice
+        deterministically (e.g. before finalize_all) instead of waiting on the
+        periodic flush. Call via collective_rpc('dmx_flush')."""
+        if self.adaptor is not None and self.adaptor.ring_engine is not None:
+            try:
+                self.adaptor.ring_engine.flush_and_wait()
+            except Exception:
+                pass
+
     def stop_monitoring(self) -> None:
         """Flush and stop DMI engine.  Reentrant: second call no-ops."""
         if torch.cuda.is_available():
