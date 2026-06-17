@@ -100,6 +100,32 @@ def _cfg(ac: dict, key: str, env_key: str, default: Any) -> Any:
     return default
 
 
+# ---------------------------------------------------------------------------
+# In-process callable sink (hallu_monitor option-3 path)
+# ---------------------------------------------------------------------------
+# DMXGPUWorker normally builds a ClickHouse DMXHostEngine from additional_config.
+# For an in-process consumer (e.g. hallu_monitor's ProbeWorker) there is no
+# config-serializable way to hand a live Python object to the worker, so we
+# stash a zero-arg factory in a module global. init_device() calls it when no
+# dmx_db_host is set. Requires the in-process worker path
+# (VLLM_ENABLE_V1_MULTIPROCESSING=0) so this module global is shared; with TP>1
+# every rank would call the factory, which must then return a per-rank sink.
+_DMX_SINK_FACTORY: Optional[Any] = None
+
+
+def register_sink_factory(factory: Any) -> None:
+    """Register a zero-arg callable returning the host_engine sink (a ProbeWorker
+    or any Python callable). Used instead of ClickHouse when dmx_db_host is unset.
+    The sink's lifecycle (start/stop) is owned by the registrant, NOT the worker."""
+    global _DMX_SINK_FACTORY
+    _DMX_SINK_FACTORY = factory
+
+
+def clear_sink_factory() -> None:
+    global _DMX_SINK_FACTORY
+    _DMX_SINK_FACTORY = None
+
+
 _VLLM_REQ_ID_SUFFIX = re.compile(r"-[0-9a-f]{8}$")
 
 
@@ -516,8 +542,11 @@ class DMXGPUWorker(Worker):
 
         resolved_model_id = model_id or str(self.vllm_config.model_config.model)
 
-        # Host engine (ClickHouse), optional.
+        # Host engine: ClickHouse DMXHostEngine, or an in-process callable sink
+        # (hallu_monitor ProbeWorker) registered via register_sink_factory().
+        # db_host takes precedence; if neither is set the ring runs sink-less.
         host_engine = None
+        use_callable_sink = (not db_host) and _DMX_SINK_FACTORY is not None
         if db_host:
             ch_cfg = _ne.ClickHouseClientConfig()
             ch_cfg.host = db_host
@@ -539,11 +568,22 @@ class DMXGPUWorker(Worker):
             host_engine = _ne.DMXHostEngine(stage_cfg)
             host_engine.start()
             self._dmx_host_engine = host_engine
+        elif use_callable_sink:
+            # NOT stored in self._dmx_host_engine: a callable sink is started/
+            # stopped by whoever registered it, not by stop_monitoring().
+            host_engine = _DMX_SINK_FACTORY()
+            if host_engine is None:
+                raise RuntimeError(
+                    "registered dmx sink factory returned None")
 
         ring_cfg = _ne.RingConfig()
         ring_cfg.payload_ring_bytes = ring_payload_mb * 1024 * 1024
         ring_cfg.pinned_staging_bytes = ring_pinned_mb * 1024 * 1024
         ring_cfg.task_ring_entries = ring_entries
+        # The async ProbeWorker reads each slice later on another thread, so the
+        # backend must hand it an OWNED tensor (not aliasing reused staging).
+        if use_callable_sink:
+            ring_cfg.clone_slices = True
         ring_cfg.insert_queue_max_bytes = int(_cfg(
             ac, "dmx_insert_queue_max_bytes", "DMX_INSERT_QUEUE_MAX_BYTES",
             4096 * 1024 * 1024))
