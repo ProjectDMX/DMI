@@ -25,9 +25,6 @@ export VLLM_DISABLE_COMPILE_CACHE=1
 ## Offline API
 
 ```python
-import os
-os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"  # required (see above)
-
 from vllm import LLM, SamplingParams
 
 llm = LLM(
@@ -51,6 +48,42 @@ for o in llm.generate(["The answer is"], params):
 
 Set `"dmx_null_mode": False` and configure `dmx_db_*` fields to persist captures
 to ClickHouse.
+
+## Reading internals back: `DMILLM`
+
+`DMILLM` is a drop-in subclass of `LLM`: it injects the DMI worker for you, and
+every `RequestOutput` from `generate` carries a lazy `.dmi_internal` that reads
+the captured internals back from the store -- the same object the HuggingFace
+path's `out.dmi_internal` gives you.
+
+```python
+from vllm import SamplingParams
+from integration.vllm_adapter import DMILLM
+
+llm = DMILLM(
+    "Qwen/Qwen3-0.6B",
+    additional_config={
+        "dmx_model_id": "demo_vllm",
+        "dmx_hook_selection": "resid_pre",
+        "dmx_db_host": "localhost",
+        "dmx_db_port": 9000,
+    },
+    max_model_len=512, enforce_eager=True, gpu_memory_utilization=0.5,
+)
+
+out = llm.generate(["The capital of France is"], SamplingParams(max_tokens=8))
+
+out[0].outputs[0].text             # native vLLM output, unchanged
+out[0].dmi_internal.hidden_states  # tuple indexed by layer, each [1, seq, hidden]
+out[0].dmi_internal.available      # ['hidden_states']
+```
+
+`DMILLM` only injects `worker_cls`; pass DMI settings through `additional_config`
+exactly as with plain `LLM`. Persisting to ClickHouse (`dmx_db_*`, i.e. not
+`dmx_null_mode`) is required to read internals back. Each `RequestOutput` exposes
+only its own request's internals; for the whole batch as one
+`[batch, seq, hidden]` tensor use `get_internal(model_id)` from
+`monitoring.internal_mapper`.
 
 ## vLLM serve
 
