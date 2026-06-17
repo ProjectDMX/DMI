@@ -547,6 +547,11 @@ class DMXGPUWorker(Worker):
         # db_host takes precedence; if neither is set the ring runs sink-less.
         host_engine = None
         use_callable_sink = (not db_host) and _DMX_SINK_FACTORY is not None
+        if os.environ.get("DMX_DEBUG_SINK"):
+            print(f"[dmx-debug] init_device: db_host={db_host!r} "
+                  f"factory_set={_DMX_SINK_FACTORY is not None} "
+                  f"use_callable_sink={use_callable_sink} "
+                  f"hook_selection={self._dmx_hook_selection!r}", flush=True)
         if db_host:
             ch_cfg = _ne.ClickHouseClientConfig()
             ch_cfg.host = db_host
@@ -584,6 +589,13 @@ class DMXGPUWorker(Worker):
         # backend must hand it an OWNED tensor (not aliasing reused staging).
         if use_callable_sink:
             ring_cfg.clone_slices = True
+        # Periodic drain flush (us). 0 = legacy (flush only when the ring fills
+        # or on stop) -- fine for batch ClickHouse, but a live in-memory consumer
+        # needs slices to keep arriving during serving, not just at shutdown.
+        # Default 50ms for the callable sink, 0 otherwise.
+        ring_cfg.drain_flush_timeout_us = int(_cfg(
+            ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US",
+            50000 if use_callable_sink else 0))
         ring_cfg.insert_queue_max_bytes = int(_cfg(
             ac, "dmx_insert_queue_max_bytes", "DMX_INSERT_QUEUE_MAX_BYTES",
             4096 * 1024 * 1024))
