@@ -74,6 +74,7 @@ vllm serve Qwen/Qwen3-8B \
 | `dmx_null_mode` | `True` drops captures after transport; `False` persists |
 | `dmx_ring_payload_mb` | GPU payload ring size |
 | `dmx_ring_pinned_mb` | Host-side pinned payload staging buffer (D2H copy target). `0` = match `dmx_ring_payload_mb`. |
+| `dmx_drain_flush_timeout_us` | Max time a completed tensor waits before GPU-to-CPU drain flush. Default `100000` (100 ms). `0` disables timeout-based flushing. |
 | `dmx_db_host`, `dmx_db_port` | ClickHouse connection |
 
 ## Troubleshooting

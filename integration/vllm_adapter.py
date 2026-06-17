@@ -550,6 +550,9 @@ class DMXGPUWorker(Worker):
         ring_cfg.insert_queue_max_items = int(_cfg(
             ac, "dmx_insert_queue_max_items", "DMX_INSERT_QUEUE_MAX_ITEMS",
             65536))
+        ring_cfg.drain_flush_timeout_us = int(_cfg(
+            ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US",
+            100 * 1000))
 
         # MonitoringEngine + ring transport.
         engine = MonitoringEngine(
