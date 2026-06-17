@@ -177,7 +177,7 @@ def _make_ring_cfg():
     rc.drain_flush_payload_ratio  = float(os.environ.get("E2E_DRAIN_FLUSH_PAYLOAD_RATIO", "0.0"))
     rc.drain_flush_entry_threshold = int(os.environ.get("E2E_DRAIN_FLUSH_ENTRY_THRESHOLD", "0"))
     rc.drain_flush_byte_threshold  = int(os.environ.get("E2E_DRAIN_FLUSH_BYTE_THRESHOLD", "0"))
-    rc.drain_flush_timeout_us      = int(os.environ.get("E2E_DRAIN_FLUSH_TIMEOUT_US", "0"))
+    rc.drain_flush_timeout_us      = int(os.environ.get("E2E_DRAIN_FLUSH_TIMEOUT_US", "100000"))
     rc.clone_slices               = int(os.environ.get("E2E_CLONE_SLICES", "0")) != 0
     rc.insert_queue_max_bytes     = int(os.environ.get("E2E_INSERT_QUEUE_MAX_BYTES", str(512 * 1024**2)))
     rc.insert_queue_max_items     = int(os.environ.get("E2E_INSERT_QUEUE_MAX_ITEMS", "4096"))

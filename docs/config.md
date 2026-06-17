@@ -38,11 +38,12 @@ ring. Force flush at 100% capacity is always active (prevents deadlock).
 | `drain_flush_payload_ratio` | `float` | 0.0 | Flush when scanned payload bytes >= this fraction of `payload_ring_bytes`. 0 = disabled. |
 | `drain_flush_entry_threshold` | `uint64_t` | 0 | Flush after N entries ready. 0 = disabled. |
 | `drain_flush_byte_threshold` | `uint64_t` | 0 | Flush after N payload bytes ready. 0 = disabled. |
-| `drain_flush_timeout_us` | `uint64_t` | 0 | If a complete tensor has been pending for longer than this many microseconds, flush unconditionally. 0 = disabled. |
+| `drain_flush_timeout_us` | `uint64_t` | 100000 | If a complete tensor has been pending for longer than this many microseconds, flush unconditionally. 0 = disabled. |
 
-With all flush thresholds at 0 (default), the drain thread only flushes when
-the ring is 100% full or at `stop()` time. This minimizes CUDA API calls but
-increases latency.
+With timeout-based flushing disabled explicitly (`drain_flush_timeout_us = 0`)
+and all other flush thresholds at 0, the drain thread only flushes when the ring
+is 100% full or at `stop()` time. This minimizes CUDA API calls but increases
+latency.
 
 ## P2P Thread / Output
 
@@ -99,7 +100,7 @@ All E2E ring parameters are set via `E2E_*` environment variables
 | `E2E_DRAIN_FLUSH_PAYLOAD_RATIO` | 0.0 | `drain_flush_payload_ratio` |
 | `E2E_DRAIN_FLUSH_ENTRY_THRESHOLD` | 0 | `drain_flush_entry_threshold` |
 | `E2E_DRAIN_FLUSH_BYTE_THRESHOLD` | 0 | `drain_flush_byte_threshold` |
-| `E2E_DRAIN_FLUSH_TIMEOUT_US` | 0 | `drain_flush_timeout_us` |
+| `E2E_DRAIN_FLUSH_TIMEOUT_US` | 100000 | `drain_flush_timeout_us` |
 | `E2E_CLONE_SLICES` | 0 | `clone_slices` |
 | `E2E_INSERT_QUEUE_MAX_BYTES` | 512 MiB | `insert_queue_max_bytes` |
 | `E2E_INSERT_QUEUE_MAX_ITEMS` | 4096 | `insert_queue_max_items` |
@@ -124,7 +125,7 @@ Ring engine -- drain thread:
   --drain-flush-payload-ratio F    Flush at F fraction of payload ring (default: 0.0)
   --drain-flush-entry-threshold N  Flush after N entries (default: 0)
   --drain-flush-byte-threshold N   Flush after N bytes (default: 0)
-  --drain-flush-timeout-us N       Per-tensor flush timeout in microseconds (default: 0)
+  --drain-flush-timeout-us N       Per-tensor flush timeout in microseconds (default: 100000)
 
 Ring engine -- p2p / output:
   --clone-slices              Clone per-request slices before submit

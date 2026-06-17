@@ -218,5 +218,6 @@ Useful flags:
 - `--model gpt2 | qwen3 | llama`
 - `--hook-selection full | hf-only | hidden-states | logits | <individual hook short name>` (individual hooks like `q`, `k`, `v`, `attn_scores`, `pattern`, `attn_out`, `mlp_post` can be passed comma-separated)
 - `--ring-payload-mb`, `--ring-pinned-mb`
+- `--drain-flush-timeout-us` (default `100000`, 100 ms; `0` disables timeout-based GPU-to-CPU flushing)
 - `--cuda-graphs`
 - `--csv path.csv`
