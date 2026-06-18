@@ -516,6 +516,11 @@ class DMXGPUWorker(Worker):
         # callable-sink (e.g. ProbeWorker) + per-request auto-finalize
         self._dmx_callable_sink: Any = None
         self._dmx_auto_finalize: bool = False
+        # deferred finalize: a request's final-token slice is delivered to the
+        # sink a few steps AFTER vLLM reports it finished (ring flush lag), so we
+        # hold finished requests for a grace of N steps before finalizing.
+        self._dmx_pending_finalize: dict = {}
+        self._dmx_finalize_delay: int = 4
 
     def init_device(self) -> None:
         super().init_device()
@@ -718,26 +723,54 @@ class DMXGPUWorker(Worker):
         return out
 
     def _dmx_finalize_finished(self, scheduler_output: Any) -> None:
-        """Finalize each request vLLM reports finished this step, at its true
-        final token. finished_req_ids come from prior step(s), so the final-token
-        slices are already captured; flush_and_wait drains them to the sink
-        BEFORE we enqueue finalize, so the worker sees [...slices, finalize] in
-        FIFO order and a "final"-pooled probe scores the last token. The flush
-        runs only on finish-steps (cheap when finishes are sparse; a per-finish
-        cudaStreamSynchronize otherwise -- disable via dmx_auto_finalize=False)."""
-        fin = getattr(scheduler_output, "finished_req_ids", None)
-        if not fin:
-            return
+        """Finalize each finished request at its true final token, DEFERRED.
+
+        vLLM reports a request finished, but its final-token decode slice reaches
+        the sink a few steps later (ring flush lag). Finalizing immediately makes
+        a "final"-pooled probe score an EARLIER (already-delivered) token. So we
+        hold each finished request for `_dmx_finalize_delay` steps; when the grace
+        elapses we flush_and_wait (force its tail to the sink) THEN finalize, so
+        the worker sees [...all this req's slices, finalize] in order. Requests
+        that finish in the very last steps are swept in stop_monitoring."""
         sink = self._dmx_callable_sink
         finalize = getattr(sink, "finalize_request", None)
         if finalize is None:
             return
-        self.dmx_flush()  # deliver finished requests' final-token slices first
-        for rid in fin:
+        due = []
+        for rid in list(self._dmx_pending_finalize):
+            self._dmx_pending_finalize[rid] -= 1
+            if self._dmx_pending_finalize[rid] <= 0:
+                due.append(rid)
+                del self._dmx_pending_finalize[rid]
+        fin = getattr(scheduler_output, "finished_req_ids", None)
+        if fin:
+            for rid in fin:
+                self._dmx_pending_finalize[normalize_vllm_request_id(rid)] = \
+                    self._dmx_finalize_delay
+        if due:
+            self.dmx_flush()  # force the due requests' tail slices to the sink
+            for rid in due:
+                try:
+                    finalize(rid)
+                except Exception:
+                    pass
+
+    def _dmx_finalize_sweep(self) -> None:
+        """Finalize every still-pending request (those that finished in the last
+        steps and never reached their grace). Flush hard first so their tails
+        are delivered."""
+        sink = self._dmx_callable_sink
+        finalize = getattr(sink, "finalize_request", None)
+        if finalize is None or not self._dmx_pending_finalize:
+            return
+        for _ in range(3):
+            self.dmx_flush()
+        for rid in list(self._dmx_pending_finalize):
             try:
-                finalize(normalize_vllm_request_id(rid))
+                finalize(rid)
             except Exception:
                 pass
+        self._dmx_pending_finalize.clear()
 
     def dmx_flush(self) -> None:
         """Force the ring to drain all pending slices to the sink, NOW, without
@@ -752,6 +785,8 @@ class DMXGPUWorker(Worker):
 
     def stop_monitoring(self) -> None:
         """Flush and stop DMI engine.  Reentrant: second call no-ops."""
+        if self._dmx_auto_finalize:
+            self._dmx_finalize_sweep()   # finalize last-step requests before teardown
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
