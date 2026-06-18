@@ -317,9 +317,26 @@ class VLLMAdaptor(BackendAdaptor):
         _step = self._step_counter
 
         num_scheduled = scheduler_output.num_scheduled_tokens  # dict[req_id, int]
-        req_ids = list(num_scheduled.keys())
+        # ROW ORDER IS LOAD-BEARING. vLLM V1's model_runner lays out the flattened
+        # hidden-tensor rows in INPUT_BATCH order (input_batch.req_ids), NOT in
+        # num_scheduled_tokens dict order: _prepare_inputs builds
+        #   num_scheduled_np = [num_scheduled[i] for i in input_batch.req_ids]
+        #   req_indices = np.repeat(arange[:num_reqs], num_scheduled_np)
+        # so rows are concatenated per request in input_batch order. Under
+        # continuous batching the dict order diverges from the slot order
+        # (freed-slot reuse / condense), so iterating the dict attaches each
+        # request's metadata to ANOTHER request's rows -> right metadata, WRONG
+        # activation. Order by input_batch; fall back to dict order when there is
+        # no input_batch (single-request / unexpected shape).
+        input_batch = getattr(model_runner, "input_batch", None)
+        ib_req_ids = getattr(input_batch, "req_ids", None) if input_batch is not None else None
+        if (ib_req_ids is not None and len(ib_req_ids) == len(num_scheduled)
+                and all(r in num_scheduled for r in ib_req_ids)):
+            req_ids = list(ib_req_ids)
+        else:
+            req_ids = list(num_scheduled.keys())
         num_reqs = len(req_ids)
-        num_scheduled_per_req = list(num_scheduled.values())
+        num_scheduled_per_req = [num_scheduled[rid] for rid in req_ids]
         total_q = total_tokens
 
         padded_q = self.predict_padded_q_len(model_runner, total_q)
@@ -631,6 +648,26 @@ class DMXGPUWorker(Worker):
             self.model_runner.model, hook_selection=self._dmx_hook_selection
         )
 
+        # The per-step capture context (which flattened row belongs to which
+        # request) MUST be built from the POST-_update_states input_batch order.
+        # before_forward used to run in execute_model BEFORE super().execute_model
+        # -> before the model_runner's _update_states (remove_request /
+        # add_request / condense), so it saw the PREVIOUS step's input_batch order
+        # while the forward lays rows out in THIS step's order -> per-request
+        # metadata attached to the wrong row under continuous batching. Wrap
+        # _update_states so the context is built right after it (input_batch now
+        # reflects this step) and before the forward.
+        mr = self.model_runner
+        adaptor = self.adaptor
+        _orig_update_states = mr._update_states
+
+        def _dmx_update_states(scheduler_output):
+            _orig_update_states(scheduler_output)
+            if scheduler_output.total_num_scheduled_tokens > 0:
+                adaptor.before_forward(scheduler_output, mr)
+
+        mr._update_states = _dmx_update_states
+
     def compile_or_warm_up_model(self) -> float:
         # Warmup runs with null_mode=True (set in init_device).
         # Producer kernels fire but are no-ops -- ring stays clean.
@@ -650,11 +687,9 @@ class DMXGPUWorker(Worker):
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: Any) -> Any:
-        if (
-            self.adaptor is not None
-            and scheduler_output.total_num_scheduled_tokens > 0
-        ):
-            self.adaptor.before_forward(scheduler_output, self.model_runner)
+        # NOTE: before_forward is now driven from a _update_states wrapper
+        # installed in load_model (so the step context is built from the
+        # POST-update input_batch row order), NOT here. See load_model.
         return super().execute_model(scheduler_output)
 
     def stop_monitoring(self) -> None:
