@@ -366,8 +366,13 @@ class VLLMAdaptor(BackendAdaptor):
         # dispatch condition: a uniform-decode batch (every req scheduled exactly
         # uniform_decode_query_len tokens) whose token count fits a captured
         # size. Same private-attr risk surface as predict_padded_q_len.
-        self.transport._gated_step = self._step_uses_decode_graph(
-            model_runner, total_q, num_scheduled_per_req)
+        #
+        # Only compute it when the toggle gate is active: with the gate off,
+        # specs_for_step() returns active_specs regardless of _gated_step, so the
+        # non-toggle path pays nothing for this.
+        if self.transport.toggle_gate_active:
+            self.transport._gated_step = self._step_uses_decode_graph(
+                model_runner, total_q, num_scheduled_per_req)
 
         # Per-request offsets and token ranges.
         computed_map: dict = {}
@@ -613,9 +618,9 @@ class DMXGPUWorker(Worker):
         # nonzero timeout forces the drain to flush pending entries after that
         # idle window.
         # Default: 50 ms when node-toggle is ON (sparse by design, so partial
-        # toggle exports promptly without manual tuning); 0 (threshold-only)
+        # toggle exports promptly without manual tuning); main's 100 ms
         # otherwise. Override via dmx_drain_flush_timeout_us.
-        _default_flush_us = 50000 if node_toggle else 0
+        _default_flush_us = 50000 if node_toggle else 100 * 1000
         ring_cfg.drain_flush_timeout_us = int(_cfg(
             ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US",
             _default_flush_us))
@@ -625,9 +630,6 @@ class DMXGPUWorker(Worker):
         ring_cfg.insert_queue_max_items = int(_cfg(
             ac, "dmx_insert_queue_max_items", "DMX_INSERT_QUEUE_MAX_ITEMS",
             65536))
-        ring_cfg.drain_flush_timeout_us = int(_cfg(
-            ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US",
-            100 * 1000))
 
         # MonitoringEngine + ring transport.
         engine = MonitoringEngine(

@@ -437,10 +437,11 @@ class RingTransport:
         # only governs producers that run INSIDE a replayed decode graph. In a
         # prefill / eager step the producers run unconditionally (no graph to
         # gate), so meta-push and capacity-reserve MUST use the full active set
-        # that step, or they desync (reserve/meta < producers fired). The vLLM
-        # adapter sets this per step (True = decode-graph step, gate applies;
-        # False = prefill/eager step, use full active_specs). Default True so a
-        # synthetic single-graph test that only drives decode keeps gating.
+        # that step, or they desync (reserve/meta < producers fired). The
+        # serving-framework adapter sets this per step (True = decode-graph step,
+        # gate applies; False = prefill/eager step, use full active_specs).
+        # Default True so a synthetic single-graph test that only drives decode
+        # keeps gating.
         self._gated_step: bool = True
 
         # Hook selection preset name (e.g. "full", "hidden-states", "logits").
