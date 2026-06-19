@@ -28,8 +28,72 @@ void ring_diag_print_host_counters() {
     fprintf(stderr, "  total=%lu\n", total);
 }
 
+// Node-toggle capture flag (process-global, like g_active_engine). Set true
+// only during the warmup CUDA-graph capture window via ring_set_toggle_capture.
+static bool g_toggle_capture = false;
+void ring_set_toggle_capture(bool enabled) {
+    g_toggle_capture = enabled;
+}
+
 void ring_set_active_engine(ring_py::RingEnginePy* e) {
     g_active_engine = e;
+    // Deactivation must also disable capture: g_toggle_capture is process-global,
+    // so a stale "true" after the engine is cleared would record into nothing.
+    if (e == nullptr) ring_set_toggle_capture(false);
+}
+
+// Node-toggle capture: record THIS producer's kernel node (the current capture
+// tail dependency) so it can be enabled/disabled post-capture via
+// cudaGraphNodeSetEnabled. No-op outside the capture window.
+//   supported=true  (basic + prefix producers): each is a single kernel launch,
+//     so the tail dependency is its kernel node. Validate it (fail-closed): a
+//     non-kernel tail (multi-op producer / capture event-join) must NOT be
+//     registered as a wrong node.
+//   supported=false (chunked producer): node-toggle does not manage this
+//     producer. Flag an anomaly so set_active_hooks fails loud instead of
+//     leaving a fired-but-unregistered producer (which would desync).
+//
+// Fail-closed: any state where the producer fired under capture but we could
+// NOT record its node flags an anomaly (capture-info read failed, or capturing
+// with no tail dependency). The one silent case is "not actively capturing"
+// (status != Active) -- that's a legitimate eager warmup run, not a graph node.
+static void dmx_record_capture_node(cudaStream_t stream, int hook_type,
+                                    int hook_id, bool supported) {
+    if (!g_toggle_capture || !g_active_engine) return;
+    cudaStreamCaptureStatus  cap_st    = cudaStreamCaptureStatusNone;
+    unsigned long long       cap_id    = 0;
+    cudaGraph_t              cap_graph = nullptr;
+    const cudaGraphNode_t*   cap_deps  = nullptr;
+    const cudaGraphEdgeData* cap_edges = nullptr;  // CUDA 13 signature
+    size_t                   cap_nd    = 0;
+    cudaError_t ce = cudaStreamGetCaptureInfo(stream, &cap_st, &cap_id, &cap_graph,
+                                              &cap_deps, &cap_edges, &cap_nd);
+    if (ce != cudaSuccess) {
+        // In the capture window but can't read capture state -> can't confirm
+        // the node was recorded. Fail closed. (A healthy non-capturing stream
+        // returns success with status=None, so this is a genuine error.)
+        g_active_engine->note_capture_anomaly();
+        return;
+    }
+    if (cap_st != cudaStreamCaptureStatusActive) return;  // eager run, not a node
+    if (cap_nd < 1) {                                     // capturing, no tail dep -> abnormal
+        g_active_engine->note_capture_anomaly();
+        return;
+    }
+    if (!supported) {
+        g_active_engine->note_capture_anomaly();
+        return;
+    }
+    cudaGraphNode_t node = cap_deps[cap_nd - 1];
+    cudaGraphNodeType ntype;
+    if (cudaGraphNodeGetType(node, &ntype) == cudaSuccess
+        && ntype == cudaGraphNodeTypeKernel) {
+        g_active_engine->register_capture_node(
+            reinterpret_cast<uint64_t>(cap_graph), hook_type, hook_id,
+            reinterpret_cast<uint64_t>(node));
+    } else {
+        g_active_engine->note_capture_anomaly();
+    }
 }
 
 // Three side-effect ops, one per use case:
@@ -87,6 +151,10 @@ void ring_producer_impl(
             static_cast<uint64_t>(tensor.nbytes()),
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
+
+        // Node-toggle: record this basic producer's kernel node (if capturing).
+        dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                static_cast<int>(hook_id), /*supported=*/true);
     }
 }
 
@@ -111,6 +179,11 @@ void ring_producer_prefix_impl(
             static_cast<uint64_t>(row_bytes),
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
+
+        // Node-toggle: record the prefix producer's kernel node so the
+        // toggle composes with gpu_padding_strip.
+        dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                static_cast<int>(hook_id), /*supported=*/true);
     }
 }
 
@@ -136,6 +209,12 @@ void ring_producer_chunked_impl(
             K,
             static_cast<uint32_t>(hook_type),
             reinterpret_cast<uint64_t>(stream.stream()));
+
+        // Node-toggle does not manage the chunked producer -> flag
+        // (fail-closed): set_active_hooks will refuse to activate.
+        // dmx_gpu_padding_strip=False routes every hook to the basic producer.
+        dmx_record_capture_node(stream.stream(), static_cast<int>(hook_type),
+                                static_cast<int>(hook_id), /*supported=*/false);
     }
 }
 

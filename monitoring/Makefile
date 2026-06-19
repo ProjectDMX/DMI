@@ -111,7 +111,8 @@ NVCCFLAGS := \
 
 RING_SRCS := csrc/ring/producer.cu \
              csrc/ring/ring_engine.cu \
-             csrc/ring/ring_engine_py.cu
+             csrc/ring/ring_engine_py.cu \
+             csrc/ring/toggle_registry.cu
 RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
 
 OBJS += $(RING_OBJS)

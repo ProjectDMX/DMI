@@ -63,6 +63,7 @@ from monitoring.step_context import StepContext
 from integration.model_shape import _make_model_shape_from_hf_config
 from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
 from monitoring.internal_mapper import make_lazy_internal
+from integration import vllm_node_toggle
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +285,38 @@ class VLLMAdaptor(BackendAdaptor):
             return pad_table[total_q]
         return total_q
 
+    def _step_uses_decode_graph(
+        self, model_runner: Any, total_q: int, num_scheduled_per_req: list
+    ) -> bool:
+        """True iff this step will replay a captured FULL decode graph -- the
+        only steps where node-toggle's SetEnabled actually gates producers.
+
+        Mirrors vLLM's dispatch condition (cudagraph_dispatcher): a uniform
+        decode batch (every request scheduled exactly uniform_decode_query_len
+        tokens) whose total token count is within the captured-size range.
+        Anything else (prefill, mixed, oversize) runs eager -> producers fire
+        ungated -> the caller uses the full active set for meta + reserve.
+
+        Risk surface (same as predict_padded_q_len): reads
+        cudagraph_dispatcher.uniform_decode_query_len and
+        compilation_config.max_cudagraph_capture_size. On a vLLM upgrade,
+        verify these still gate FULL-graph dispatch. Conservative on failure:
+        any unexpected shape returns False (full set -> never under-reserves).
+        """
+        if not num_scheduled_per_req:
+            return False
+        uniform_q = getattr(
+            getattr(model_runner, "cudagraph_dispatcher", None),
+            "uniform_decode_query_len", 1) or 1
+        if any(n != uniform_q for n in num_scheduled_per_req):
+            return False  # prefill / mixed -> eager
+        max_cap = getattr(
+            getattr(self.vllm_config, "compilation_config", None),
+            "max_cudagraph_capture_size", None)
+        if max_cap is not None and total_q > max_cap:
+            return False  # oversize uniform decode -> eager
+        return True
+
     def build_step_context(
         self, scheduler_output: Any, model_runner: Any
     ) -> Optional[StepContext]:
@@ -324,6 +357,22 @@ class VLLMAdaptor(BackendAdaptor):
 
         padded_q = self.predict_padded_q_len(model_runner, total_q)
         self._last_total_q = total_q
+
+        # Per-step node-toggle gate selector. The toggle (SetEnabled on captured
+        # nodes) only governs producers running INSIDE a replayed decode graph.
+        # A prefill / mixed / oversize step runs eager -- producers fire ungated
+        # -- so meta-push + reserve must use the FULL active set that step, not
+        # the toggle subset, or they desync. This mirrors vLLM's own FULL-graph
+        # dispatch condition: a uniform-decode batch (every req scheduled exactly
+        # uniform_decode_query_len tokens) whose token count fits a captured
+        # size. Same private-attr risk surface as predict_padded_q_len.
+        #
+        # Only compute it when the toggle gate is active: with the gate off,
+        # specs_for_step() returns active_specs regardless of _gated_step, so the
+        # non-toggle path pays nothing for this.
+        if self.transport.toggle_gate_active:
+            self.transport._gated_step = self._step_uses_decode_graph(
+                model_runner, total_q, num_scheduled_per_req)
 
         # Per-request offsets and token ranges.
         computed_map: dict = {}
@@ -467,6 +516,11 @@ def _row_bytes_for_spec(spec, model_cfg) -> int:
 # ---------------------------------------------------------------------------
 # DMXGPUWorker
 # ---------------------------------------------------------------------------
+# Node-toggle wiring (keep_graph patch, replay guard, config parser,
+# bind walker, post-warmup activation) lives in vllm_node_toggle.
+
+
+# ---------------------------------------------------------------------------
 
 
 class DMXGPUWorker(Worker):
@@ -516,6 +570,16 @@ class DMXGPUWorker(Worker):
         ch_parallelism = int(
             _cfg(ac, "dmx_ch_parallelism", "DMX_CH_PARALLELISM", 10)
         )
+        # Runtime node-toggle. Default off -> behaviour unchanged.
+        # dmx_enabled_hooks: optional static enabled set "hook_type:layer,..."
+        # applied once after warmup; empty -> toggle armed but gate inactive.
+        node_toggle = _cfg(ac, "dmx_node_toggle", "DMX_NODE_TOGGLE", False)
+        enabled_hooks_s = _cfg(ac, "dmx_enabled_hooks", "DMX_ENABLED_HOOKS", "")
+        # Lazy per-graph toggle (defer device apply to per-graph replay).
+        lazy_toggle = _cfg(ac, "dmx_lazy_toggle", "DMX_LAZY_TOGGLE", False)
+        self._dmx_node_toggle = bool(node_toggle)
+        self._dmx_lazy_toggle = bool(lazy_toggle)
+        self._dmx_enabled_hooks = vllm_node_toggle._parse_enabled_hooks(enabled_hooks_s)
 
         resolved_model_id = model_id or str(self.vllm_config.model_config.model)
 
@@ -547,15 +611,25 @@ class DMXGPUWorker(Worker):
         ring_cfg.payload_ring_bytes = ring_payload_mb * 1024 * 1024
         ring_cfg.pinned_staging_bytes = ring_pinned_mb * 1024 * 1024
         ring_cfg.task_ring_entries = ring_entries
+        # Bound export latency for LOW-VOLUME / sparse-hook monitoring (e.g.
+        # node-toggle with a small enabled set): without a timed flush the drain
+        # waits on byte/entry thresholds that sparse steps never hit, so data
+        # sits in the ring until the buffer fills or a final flush-on-close. A
+        # nonzero timeout forces the drain to flush pending entries after that
+        # idle window.
+        # Default: 50 ms when node-toggle is ON (sparse by design, so partial
+        # toggle exports promptly without manual tuning); main's 100 ms
+        # otherwise. Override via dmx_drain_flush_timeout_us.
+        _default_flush_us = 50000 if node_toggle else 100 * 1000
+        ring_cfg.drain_flush_timeout_us = int(_cfg(
+            ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US",
+            _default_flush_us))
         ring_cfg.insert_queue_max_bytes = int(_cfg(
             ac, "dmx_insert_queue_max_bytes", "DMX_INSERT_QUEUE_MAX_BYTES",
             4096 * 1024 * 1024))
         ring_cfg.insert_queue_max_items = int(_cfg(
             ac, "dmx_insert_queue_max_items", "DMX_INSERT_QUEUE_MAX_ITEMS",
             65536))
-        ring_cfg.drain_flush_timeout_us = int(_cfg(
-            ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US",
-            100 * 1000))
 
         # MonitoringEngine + ring transport.
         engine = MonitoringEngine(
@@ -572,6 +646,11 @@ class DMXGPUWorker(Worker):
         # DMX_GPU_PADDING_STRIP=0 if needed for debugging.
         gpu_padding_strip = _cfg(
             ac, "dmx_gpu_padding_strip", "DMX_GPU_PADDING_STRIP", True)
+        # Node-toggle composes with gpu_padding_strip for the basic + prefix
+        # producers (both record their kernel node at capture). The chunked
+        # producer is NOT toggle-managed (and this adapter never dispatches it);
+        # if one fires under capture, set_active_hooks fails loud.
+        # dmx_gpu_padding_strip=False routes every hook to the basic producer.
         self.adaptor = VLLMAdaptor(
             engine, resolved_model_id, self.vllm_config,
             gpu_padding_strip=bool(gpu_padding_strip))
@@ -632,6 +711,14 @@ class DMXGPUWorker(Worker):
         )
 
     def compile_or_warm_up_model(self) -> float:
+        toggle = (getattr(self, "_dmx_node_toggle", False)
+                  and self.adaptor is not None
+                  and self.adaptor.ring_engine is not None)
+        if toggle:
+            # Scope node recording + keep_graph to the REAL capture that
+            # super() performs.
+            vllm_node_toggle.begin_capture_window(self.adaptor.ring_engine)
+
         # Warmup runs with null_mode=True (set in init_device).
         # Producer kernels fire but are no-ops -- ring stays clean.
         result = super().compile_or_warm_up_model()
@@ -645,6 +732,18 @@ class DMXGPUWorker(Worker):
             and self.adaptor.ring_engine is not None
         ):
             self.adaptor.ring_engine.set_null_mode(False)
+
+        # Node-toggle: bind each captured graph's exec, close the capture window,
+        # and (optionally) apply the static enabled set. Done here -- after
+        # warmup, before serving -- so no replay is in flight.
+        if toggle:
+            vllm_node_toggle.activate_after_warmup(
+                getattr(self.model_runner, "model", None),
+                self.adaptor.ring_engine,
+                self.adaptor.transport,
+                self._dmx_enabled_hooks,
+                lazy=self._dmx_lazy_toggle,
+            )
 
         return result
 
