@@ -58,12 +58,14 @@ jobs:
           import monitoring.config
           import monitoring.engine
           import monitoring.hook_points
-          import monitoring.selection
           import tests.hf_comparator
           import tests.hf_reference
           import tests._requirements
           print('All pure-Python modules import OK')
           "
+          # monitoring.selection and monitoring.ring_transport are excluded:
+          # they call _load_ext() at import time and require the native .so,
+          # which is only built in the GPU stage.
 
       # Run the cpu-marked subset.  These tests require no CUDA device, no
       # ClickHouse instance, no vLLM runtime, no model weights, and no native
