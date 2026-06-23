@@ -411,6 +411,7 @@ _VLLM_RUNNER = dedent("""
         model=model_name,
         max_model_len=128,
         gpu_memory_utilization=0.5,
+        max_num_seqs=32,
         enforce_eager=(args.mode == 'eager'),
     )
 

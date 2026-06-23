@@ -45,7 +45,7 @@ def main():
         model_cls = HookedGPT2LMHeadModel
 
     model = model_cls.from_pretrained(
-        hf_model_id, attn_implementation="eager", torch_dtype=torch.float16
+        hf_model_id, attn_implementation="eager", dtype=torch.float16
     ).to(device).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
@@ -99,8 +99,15 @@ def main():
     from monitoring._native_engine import RingConfig
     ring_cfg = RingConfig()
     ring_cfg.task_ring_entries = int(os.environ.get("E2E_RING_TASK_ENTRIES", "16384"))
-    ring_cfg.payload_ring_bytes = int(os.environ.get("E2E_RING_PAYLOAD_BYTES", str(4 * 1024**3)))
-    ring_cfg.pinned_staging_bytes = int(os.environ.get("E2E_RING_PINNED_BYTES", str(4 * 1024**3)))
+    # E2E_RING_PAYLOAD_MB is the matrix-level knob (set by cell_env via --ring-mb).
+    # E2E_RING_PAYLOAD_BYTES is a fine-grained override; if neither is set, default
+    # to 256 MB so the runner does not OOM on GPUs smaller than the ring buffer.
+    _payload_mb = int(os.environ.get("E2E_RING_PAYLOAD_MB", "256"))
+    ring_cfg.payload_ring_bytes = int(os.environ.get("E2E_RING_PAYLOAD_BYTES",
+                                                      str(_payload_mb * 1024 * 1024)))
+    _pinned_mb = int(os.environ.get("E2E_RING_PINNED_MB", "256"))
+    ring_cfg.pinned_staging_bytes = int(os.environ.get("E2E_RING_PINNED_BYTES",
+                                                        str(_pinned_mb * 1024 * 1024)))
     ring_cfg.drain_poll_timeout_us = int(os.environ.get("E2E_DRAIN_POLL_TIMEOUT_US", "100"))
     ring_cfg.clone_slices = int(os.environ.get("E2E_CLONE_SLICES", "0")) != 0
     ring_cfg.insert_queue_max_bytes = int(os.environ.get("E2E_INSERT_QUEUE_MAX_BYTES", str(512 * 1024**2)))

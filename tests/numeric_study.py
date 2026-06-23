@@ -36,8 +36,9 @@ Alert policy (plan §9), expressed through the §8 standards-by-mode choice:
 
 The capture side reuses the proven subprocess-rollout pattern from
 ``tests/test_per_hook_isolation.py`` (a clean CUDA context / ring-transport
-instance per cell), but saves the **full** ``[N, vocab]`` logits so the study
-can report top-k vocab drift at the first divergence.
+instance per cell).  HF saves full ``[N, vocab]`` logits.  vLLM saves a
+same-shaped tensor whose non-top-k entries are filled to ``-1e30`` (top-k
+logprob capture only); drift metrics are restricted to reported entries.
 
 The comparison / report / alert core (``compute_drift``, ``format_table``, the
 ``*_to_dict`` helpers) is pure and CPU-testable; ``torch`` is imported lazily
@@ -209,6 +210,7 @@ def compute_drift(
     mode: str,
     threshold: float,
     topk: int = 5,
+    sparse_floor: Optional[float] = None,
 ) -> HookDrift:
     """Compare one monitored capture against the unhooked baseline.
 
@@ -218,6 +220,12 @@ def compute_drift(
     augments it with token-divergence + top-k vocab drift.  The §9 alert
     policy is applied here.  Never raises on bad input: records ``error`` /
     ``shape_mismatch`` so the caller can alert.
+
+    ``sparse_floor``: when set (e.g. ``-1e30`` for vLLM top-k logprob captures),
+    drift metrics (max_abs, mean_abs, first_diff_pos, top-k vocab) are computed
+    only over entries where at least one tensor has a value above the floor,
+    preventing the floor fill from dominating the statistics.  Greedy-token
+    argmax is always computed from the raw logits (the floor is too low to win).
     """
     import torch
 
@@ -248,10 +256,17 @@ def compute_drift(
         drift.check = _run_standard(b_logits, m_logits, mode=mode, threshold=threshold)
         return _finalize_alert(drift, mode=mode)
 
-    # Shared-lib verdict (bitwise / allclose) -- carries max/mean/first stats.
-    drift.check = _run_standard(b_logits, m_logits, mode=mode, threshold=threshold)
-
     abs_diff = (b_logits - m_logits).abs()
+    if sparse_floor is not None:
+        # Restrict to entries where at least one runner reported a real logit;
+        # floor-vs-floor pairs contribute zero so they don't inflate max/mean.
+        real_mask = (b_logits > sparse_floor * 0.5) | (m_logits > sparse_floor * 0.5)
+        abs_diff = abs_diff.where(real_mask, torch.zeros_like(abs_diff))
+
+    # Shared-lib verdict (bitwise / allclose) -- carries max/mean/first stats.
+    drift.check = _run_standard(b_logits, m_logits, mode=mode, threshold=threshold,
+                                masked_abs_diff=abs_diff if sparse_floor is not None else None)
+
     drift.first_diff_pos = _first_diff_row(abs_diff)
 
     # Greedy (argmax) token divergence, recomputed from logits and
@@ -287,12 +302,37 @@ def compute_drift(
     return _finalize_alert(drift, mode=mode)
 
 
-def _run_standard(b_logits: "Any", m_logits: "Any", *, mode: str, threshold: float) -> Check:
-    """Run the §8 standard for ``mode`` and return its :class:`Check`."""
+def _run_standard(b_logits: "Any", m_logits: "Any", *, mode: str, threshold: float,
+                  masked_abs_diff: "Optional[Any]" = None) -> "Check":
+    """Run the §8 standard for ``mode`` and return its :class:`Check`.
+
+    When ``masked_abs_diff`` is supplied (pre-computed, sparse-masked), the
+    Check is built directly from it instead of recomputing from the raw tensors
+    -- ensuring metrics reflect only the meaningful (non-floor) entries.
+    """
     name = standard_for_mode(mode)
+    if masked_abs_diff is None:
+        if name == "bitwise":
+            return bitwise(b_logits, m_logits, name="logits_bitwise")
+        return allclose(b_logits, m_logits, name="logits_allclose", atol=threshold, rtol=0.0)
+
+    # Sparse path: derive stats from the already-masked diff tensor.
+    import torch as _torch
+    ad = masked_abs_diff.float()
+    n = ad.numel()
+    max_v = float(ad.max().item()) if n > 0 else 0.0
+    mean_v = float(ad.mean().item()) if n > 0 else 0.0
+    ne = (ad > 0).any(dim=-1).nonzero(as_tuple=False) if ad.ndim >= 2 else (ad > 0).nonzero(as_tuple=False)
+    first: Optional[int] = int(ne[0].item()) if ne.numel() > 0 else None
     if name == "bitwise":
-        return bitwise(b_logits, m_logits, name="logits_bitwise")
-    return allclose(b_logits, m_logits, name="logits_allclose", atol=threshold, rtol=0.0)
+        passed = max_v == 0.0
+        return Check("logits_bitwise", passed, max_abs=max_v, mean_abs=mean_v,
+                     first_diff_pos=None if passed else first,
+                     detail="bitwise equal" if passed else f"max_abs={max_v:.6e}")
+    passed = max_v <= threshold
+    return Check("logits_allclose", passed, max_abs=max_v, mean_abs=mean_v,
+                 first_diff_pos=None if passed else first,
+                 detail=f"max_abs={max_v:.6e} (atol={threshold:g}, rtol=0)")
 
 
 def _finalize_alert(drift: HookDrift, *, mode: str) -> HookDrift:
@@ -370,8 +410,10 @@ def format_table(result: StudyResult) -> str:
 # Subprocess rollout runners (full-logits capture)
 # ---------------------------------------------------------------------------
 
-# Each rollout subprocess saves {token_ids: int64[N], logits: float32[N, vocab]}.
-# Same on-disk shape for HF and vLLM so the comparison code is framework-agnostic.
+# HF rollout saves {token_ids: int64[N], logits: float32[N, vocab]} -- full vocabulary.
+# vLLM rollout saves the same shape, but only top-k logprob entries are real; all
+# other vocab positions are filled to -1e30.  Drift metrics must be restricted to
+# entries where at least one runner reported a real logit (see compute_drift sparse_floor).
 
 _HF_RUNNER = dedent("""
     import argparse, os
@@ -385,6 +427,7 @@ _HF_RUNNER = dedent("""
     ap.add_argument('--rollout', required=True, choices=['baseline', 'hooked'])
     ap.add_argument('--max-new-tokens', type=int, default=4)
     ap.add_argument('--prompt', default='Hello')
+    ap.add_argument('--dtype', default='float16')
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
 
@@ -396,7 +439,8 @@ _HF_RUNNER = dedent("""
     }
     hf_id = MODEL_ALIASES[args.model_key]
     device = torch.device('cuda')
-    dtype = torch.float16
+    _DTYPE_MAP = {'float16': torch.float16, 'bfloat16': torch.bfloat16, 'float32': torch.float32}
+    dtype = _DTYPE_MAP.get(args.dtype, torch.float16)
 
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(hf_id)
@@ -494,6 +538,7 @@ _VLLM_RUNNER = dedent("""
     ap.add_argument('--rollout', required=True, choices=['baseline', 'hooked'])
     ap.add_argument('--max-new-tokens', type=int, default=4)
     ap.add_argument('--prompt', default='Hello')
+    ap.add_argument('--dtype', default='float16')
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
 
@@ -509,6 +554,7 @@ _VLLM_RUNNER = dedent("""
         max_model_len=128,
         gpu_memory_utilization=0.5,
         enforce_eager=(args.mode == 'eager'),
+        dtype=args.dtype,
     )
     if args.rollout == 'hooked':
         additional_config = {'dmx_hook_selection': args.hook, 'dmx_db_host': ''}
@@ -569,6 +615,7 @@ def _run_rollout(
     max_new_tokens: int,
     prompt: str,
     env: dict,
+    dtype: str = "float16",
     timeout: int = 600,
 ) -> None:
     """Spawn one rollout subprocess; raise with captured output on failure."""
@@ -582,6 +629,7 @@ def _run_rollout(
         "--rollout", rollout,
         "--max-new-tokens", str(max_new_tokens),
         "--prompt", prompt,
+        "--dtype", dtype,
         "--out", str(out_path),
     ]
     proc = subprocess.run(
@@ -634,12 +682,15 @@ def run_study(
         dtype=dtype, standard=standard_for_mode(mode), threshold=thr, topk=topk,
     )
 
+    # vLLM saves top-k logprobs; restrict diff metrics to reported entries only.
+    sparse_floor: Optional[float] = -1e30 if framework == "vllm" else None
+
     # 1. Baseline (unhooked) captured once; hook arg is unused by the runner.
     baseline_path = out_dir / "baseline.pt"
     _run_rollout(
         framework=framework, model_key=model, hook=hooks[0] if hooks else "q",
         mode=mode, variant="p", rollout="baseline", out_path=baseline_path,
-        max_new_tokens=max_new_tokens, prompt=prompt, env=env,
+        max_new_tokens=max_new_tokens, prompt=prompt, env=env, dtype=dtype,
     )
     baseline = torch.load(baseline_path, map_location="cpu")
 
@@ -655,17 +706,18 @@ def run_study(
                     _run_rollout(
                         framework=framework, model_key=model, hook=hook, mode=mode,
                         variant="compare", rollout="hooked", out_path=hooked_path,
-                        max_new_tokens=max_new_tokens, prompt=prompt, env=env,
+                        max_new_tokens=max_new_tokens, prompt=prompt, env=env, dtype=dtype,
                     )
             else:
                 _run_rollout(
                     framework=framework, model_key=model, hook=hook, mode=mode,
                     variant="p", rollout="hooked", out_path=hooked_path,
-                    max_new_tokens=max_new_tokens, prompt=prompt, env=env,
+                    max_new_tokens=max_new_tokens, prompt=prompt, env=env, dtype=dtype,
                 )
             monitored = torch.load(hooked_path, map_location="cpu")
             drift = compute_drift(
                 hook, baseline, monitored, mode=mode, threshold=thr, topk=topk,
+                sparse_floor=sparse_floor,
             )
         except Exception as exc:  # subprocess crash / OOM / dirty restore -> alert
             drift.error = f"{type(exc).__name__}: {exc}"

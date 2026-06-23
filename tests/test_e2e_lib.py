@@ -297,9 +297,10 @@ class TestMatrixExpansion:
             plan_cell(Cell("nope", "gpt2", "eager", "bitwise", "vllm-full"), "/run")
 
     def test_main_dry_run_no_side_effects(self, capsys):
+        # hf only supports allclose; expand over two models to get 2 cells.
         from tests.e2e_matrix import main
-        rc = main(["--backend", "hf,vllm", "--model", "gpt2",
-                   "--standard", "row_count", "--dry-run"])
+        rc = main(["--backend", "hf", "--model", "gpt2,qwen3",
+                   "--standard", "allclose", "--dry-run"])
         assert rc == 0
         out = capsys.readouterr().out
         assert "2 cell(s) planned" in out
@@ -318,7 +319,7 @@ class TestWrapperTranslation:
         cell = build_cells(build_parser().parse_args(argv))[0]
         assert cell.backend == "vllm" and cell.standard == "bitwise"
         assert cell.model == "gpt2" and cell.mode == "eager"
-        assert cell.hooks == "vllm-full" and cell.ring_mb == 4096
+        assert cell.hooks == "vllm-full" and cell.ring_mb == 256
 
     def test_env_enforce_eager_maps_mode(self):
         from tests.e2e_matrix import matrix_argv_from_env, build_parser, build_cells

@@ -16,10 +16,17 @@ Cell dispatch
 - ``vllm`` + ``bitwise`` / ``transport_bitwise``
       vllm_ref_runner (RefDiskWorker, D2D->disk) + vllm_monitored_runner
       (ring->ClickHouse) -> vllm_identical_comparator.
-- ``vllm`` + ``row_count`` / ``allclose``
-      vllm_monitored_runner -> vllm_rowcnt_comparator.
-- ``hf``   (any standard)
-      hf_reference_runner + hf_monitored_runner -> hf_comparator.
+- ``vllm`` + ``row_count``
+      vllm_monitored_runner -> vllm_rowcnt_comparator (row-count checks only;
+      value comparison is skipped because no reference tensors are captured).
+- ``hf``   + ``allclose``
+      hf_reference_runner + hf_monitored_runner -> hf_comparator
+      (token-id equality + max-abs-diff <= E2E_TOLERANCE on hidden states and
+      logits).  ``bitwise`` and ``row_count`` are not implemented for HF.
+
+Unsupported combinations (``vllm`` + ``allclose``, ``hf`` + ``bitwise`` /
+``row_count``) raise ``ValueError`` at plan time so the matrix never reports
+a misleading cell.
 
 The public ``E2E_HOOK_SELECTION`` input is translated to the internal
 ``DMX_HOOK_SELECTION`` runtime contract in each subprocess env (plan §2).
@@ -55,6 +62,10 @@ _VLLM_REF_FILES = {
 
 # Standards that compare reference D2D buffers against ring/ClickHouse output.
 _VLLM_IDENTICAL_STANDARDS = {"bitwise", "transport_bitwise"}
+# Standards that only verify row counts (no reference tensors captured).
+_VLLM_ROWCOUNT_STANDARDS = {"row_count"}
+# The only standard whose comparator is actually implemented for HF.
+_HF_SUPPORTED_STANDARDS = {"allclose"}
 
 
 @dataclass(frozen=True)
@@ -171,7 +182,12 @@ def plan_cell(cell: Cell, run_dir: str) -> tuple[List[Step], str, str]:
                 "--ref-config", config_file, "--mon-dir", mon_dir,
                 "--result-file", result_file)))
             return steps, "tests.vllm_identical_comparator", result_file
-        # row_count / allclose -> monitored-only + rowcnt comparator
+        # row_count -> monitored-only + rowcnt comparator (value comparison skipped)
+        if cell.standard not in _VLLM_ROWCOUNT_STANDARDS:
+            raise ValueError(
+                f"vllm backend does not support standard={cell.standard!r}. "
+                f"Supported: {sorted(_VLLM_IDENTICAL_STANDARDS | _VLLM_ROWCOUNT_STANDARDS)}"
+            )
         steps.append(Step("vllm_monitored", _runner("tests.vllm_monitored_runner", "--output-dir", mon_dir)))
         steps.append(Step("compare", _runner(
             "tests.vllm_rowcnt_comparator",
@@ -180,11 +196,17 @@ def plan_cell(cell: Cell, run_dir: str) -> tuple[List[Step], str, str]:
         return steps, "tests.vllm_rowcnt_comparator", result_file
 
     if cell.backend == "hf":
+        if cell.standard not in _HF_SUPPORTED_STANDARDS:
+            raise ValueError(
+                f"hf backend does not support standard={cell.standard!r}. "
+                f"Supported: {sorted(_HF_SUPPORTED_STANDARDS)}"
+            )
         steps.append(Step("hf_ref", _runner("tests.hf_reference_runner", "--output-dir", ref_dir)))
         steps.append(Step("hf_monitored", _runner("tests.hf_monitored_runner", "--output-dir", mon_dir)))
         steps.append(Step("compare", _runner(
             "tests.hf_comparator",
             "--ref-dir", ref_dir, "--mon-dir", mon_dir,
+            "--standard", cell.standard,
             "--result-file", result_file)))
         return steps, "tests.hf_comparator", result_file
 
@@ -375,12 +397,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default="gpt2", help="comma list: gpt2,qwen3,llama,qwen2_moe,<path>")
     p.add_argument("--mode", default="eager", help="comma list: eager,cuda_graph")
     p.add_argument("--standard", default="transport_bitwise",
-                   help="comma list: bitwise,allclose,row_count,transport_bitwise")
+                   help=(
+                       "comma list of comparison standards. "
+                       "vllm supports: bitwise, transport_bitwise, row_count. "
+                       "hf supports: allclose. "
+                       "Unsupported combinations raise an error at plan time."
+                   ))
     p.add_argument("--hooks", default="vllm-full",
                    help="comma list: preset (vllm-full,hidden-states) or single hook")
     p.add_argument("--tp", default="1", help="comma list of tensor-parallel sizes")
     p.add_argument("--ring-mb", dest="ring_mb", default="4096",
-                   help="comma list of ring payload/pinned sizes in MB")
+                   help="comma list of ring payload/pinned sizes in MB (default 4096)")
     p.add_argument("--dtype", default="bfloat16", help="comma list: bfloat16,float16,float32")
     p.add_argument("--prompt-set", dest="prompt_set", default="smoke",
                    help="comma list: smoke,math,chat,random")

@@ -3,7 +3,7 @@
 The configurable matrix (:mod:`tests.e2e_matrix`) treats tensor-parallel size
 as a first-class axis (``--tp`` / ``E2E_TP_SIZE``), but the single-GPU wrappers
 (``test_vllm_identical`` / ``test_e2e_correctness_vs_hf``) all drive ``tp=1``.
-This module drives the same matrix cells at ``tp=2`` so the documented
+This module drives vLLM matrix cells at ``tp=2`` so the documented
 ``-m multi_gpu`` suite (docs/testing.md) actually exercises TP sharding rather
 than collecting nothing.
 
@@ -11,8 +11,13 @@ TP=2 is "where meaningful" for the sharded model: with two ranks the
 attention/expert projections are split across GPUs, so the reference-vs-monitored
 comparison validates that the ring transport reassembles per-rank shards
 correctly.  ``qwen3`` is the default model (GQA + a non-trivial hidden size makes
-the sharding observable); ``gpt2`` is too small for TP to be interesting.  Both
-backends honor ``E2E_MODEL`` for an override.
+the sharding observable); ``gpt2`` is too small for TP to be interesting.  The
+model is still overridable via ``E2E_MODEL``.
+
+HF TP=2 is not covered here: ``hf_reference_runner`` / ``hf_monitored_runner``
+do not read ``E2E_TP_SIZE``, do not launch under ``torchrun``, and do not pass
+``tp_plan="auto"``.  A test claiming HF TP=2 coverage would require 2 GPUs
+without actually exercising tensor parallelism, which would be misleading.
 
 Skip-guarded (``tests/_requirements``) so a runner with <2 GPUs, no vLLM, or no
 ClickHouse skips with a reason instead of failing the job.
@@ -71,13 +76,3 @@ def test_vllm_identical_tp2(subtests) -> None:
     _assert_cell(subtests, run_single(argv))
 
 
-@pytest.mark.hf
-@require_gpus(2)
-@require_clickhouse()
-def test_e2e_correctness_hf_tp2(subtests) -> None:
-    """HF TP=2 eager: hooked model (ring -> ClickHouse) vs original model.
-
-    Equivalent matrix cell: ``--backend hf --mode eager --standard allclose --tp 2``.
-    """
-    argv = matrix_argv_from_env("hf", "allclose", mode="eager", env=_tp2_env())
-    _assert_cell(subtests, run_single(argv))
