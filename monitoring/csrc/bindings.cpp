@@ -298,8 +298,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                              (*pyfn)(model_id, shard_rank, req_id, act_name, layer_no,
                                      start_token, end_token, std::move(slice));
                          } catch (const py::error_already_set& ex) {
-                             // Don't let a sink error kill the p2p thread; surface it.
-                             fprintf(stderr, "[ring p2p] Python SubmitFn raised: %s\n", ex.what());
+                             // Fail loud: re-raise as a GIL-free std::exception so the
+                             // p2p thread's handler counts it (submit_exceptions /
+                             // last_sink_error) instead of silently swallowing a slice.
+                             // Extract the message while the GIL is held; the
+                             // py::error_already_set is destroyed on leaving this handler
+                             // (gil still in scope), then runtime_error -- which holds no
+                             // Python refs -- propagates out to the p2p catch.
+                             std::string msg =
+                                 std::string("Python SubmitFn raised: ") + ex.what();
+                             throw std::runtime_error(msg);
                          }
                      };
                  }
@@ -340,6 +348,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("flush_and_wait",
            &ring_py::RingEnginePy::flush_and_wait,
            py::call_guard<py::gil_scoped_release>())
+      // C1: flush + barrier through the SubmitFn stage (GIL released so the
+      // p2p thread can re-acquire it to call the Python sink).
+      .def("drain_to_sink_and_wait",
+           &ring_py::RingEnginePy::drain_to_sink_and_wait,
+           py::arg("timeout_ms") = uint32_t{0},
+           py::call_guard<py::gil_scoped_release>())
+      // C0: fail-loud sink error surface.
+      .def_property_readonly("submit_exceptions",
+           &ring_py::RingEnginePy::submit_exceptions)
+      .def_property_readonly("last_sink_error",
+           &ring_py::RingEnginePy::last_sink_error)
+      .def_property_readonly("sink_failed",
+           &ring_py::RingEnginePy::sink_failed)
+      .def("set_abort_on_sink_error",
+           &ring_py::RingEnginePy::set_abort_on_sink_error,
+           py::arg("enabled"))
       .def("push_all_metas",
            [](ring_py::RingEnginePy& self,
               py::list hook_types_py,

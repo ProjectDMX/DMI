@@ -6,6 +6,7 @@
 #include "pinned_staging.h"
 
 #include <ATen/ATen.h>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -148,7 +149,37 @@ void P2PThread::loop() {
         std::vector<DrainTask> local;
         drain_.pop_tasks(n, local);
         process(local);
+
+        // C1: publish progress under barrier_mu_ so a drain_to_sink_and_wait()
+        // waiter can't miss the wakeup (it checks the predicate under the same
+        // mutex).  Counts DrainTasks, matching DrainThread::tasks_enqueued().
+        {
+            std::lock_guard<std::mutex> lk(barrier_mu_);
+            tasks_processed_.fetch_add(local.size(), std::memory_order_release);
+        }
+        barrier_cv_.notify_all();
     }
+}
+
+// ---------------------------------------------------------------------------
+bool P2PThread::wait_until_processed(uint64_t target, uint32_t timeout_ms) {
+    std::unique_lock<std::mutex> lk(barrier_mu_);
+    auto reached = [&] {
+        return tasks_processed_.load(std::memory_order_acquire) >= target;
+    };
+    if (timeout_ms == 0) {
+        barrier_cv_.wait(lk, reached);
+        return true;
+    }
+    return barrier_cv_.wait_for(
+        lk, std::chrono::milliseconds(timeout_ms), reached);
+}
+
+// ---------------------------------------------------------------------------
+void P2PThread::note_submit_error(const char* what) {
+    submit_exceptions_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(err_mu_);
+    last_error_ = what ? what : "unknown sink error";
 }
 
 // ---------------------------------------------------------------------------
@@ -315,11 +346,13 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
             log_submit_failure_once(current_ctx_->model_id, req.req_id,
                                     act_name, meta.layer_no, shard_rank,
                                     db_start, db_end, e.what());
+            note_submit_error(e.what());  // C0: fail-loud, count + record
         } catch (...) {
             log_submit_failure_once(current_ctx_->model_id, req.req_id,
                                     act_name, meta.layer_no, shard_rank,
                                     db_start, db_end,
                                     "unknown non-std exception");
+            note_submit_error("unknown non-std exception");
         }
     }
 

@@ -313,4 +313,29 @@ void RingEnginePy::flush_and_wait() {
     impl_->engine.drain_thread().force_flush_and_wait();
 }
 
+// C1: sync the stream, flush the GPU ring, AND barrier through the p2p ->
+// SubmitFn stage so every produced slice has reached the sink on return.
+int RingEnginePy::drain_to_sink_and_wait(uint32_t timeout_ms) {
+    cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
+    cudaStreamSynchronize(ms);
+    return impl_->engine.drain_to_sink_and_wait(timeout_ms);
+}
+
+// C0: fail-loud sink error surface.
+uint64_t RingEnginePy::submit_exceptions() const {
+    return impl_->engine.submit_exceptions();
+}
+
+std::string RingEnginePy::last_sink_error() const {
+    return impl_->engine.last_sink_error();
+}
+
+void RingEnginePy::set_abort_on_sink_error(bool enabled) {
+    impl_->engine.set_abort_on_sink_error(enabled);
+}
+
+bool RingEnginePy::sink_failed() const {
+    return impl_->engine.sink_failed();
+}
+
 }  // namespace ring_py

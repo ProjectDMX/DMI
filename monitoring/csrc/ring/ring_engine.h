@@ -32,6 +32,22 @@ public:
     uint64_t  staging_cap() const { return staging_.capacity(); }
     uint64_t  task_cap()    const { return cfg_.task_ring_entries; }
 
+    // C1: flush the GPU ring AND barrier through the p2p -> SubmitFn stage, so
+    // that on return every slice produced so far has been handed to the sink.
+    // Caller must cudaStreamSynchronize first (see RingEnginePy).  Returns 0 if
+    // all tasks were delivered, 1 on timeout (timeout_ms==0 waits forever).
+    int drain_to_sink_and_wait(uint32_t timeout_ms) {
+        drain_->force_flush_and_wait();                 // GPU ring -> p2p queue
+        const uint64_t target = drain_->tasks_enqueued();
+        return p2p_->wait_until_processed(target, timeout_ms) ? 0 : 1;
+    }
+
+    // C0: fail-loud sink error surface.
+    uint64_t    submit_exceptions() const { return p2p_->submit_exceptions(); }
+    std::string last_sink_error()   const { return p2p_->last_error(); }
+    void set_abort_on_sink_error(bool v)  { p2p_->set_abort_on_sink_error(v); }
+    bool sink_failed() const              { return p2p_->sink_failed(); }
+
 private:
     RingConfig      cfg_;
     AllocatedRing   ring_;
