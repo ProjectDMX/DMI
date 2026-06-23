@@ -8,15 +8,25 @@ on:
 jobs:
   cpu-gate:
     name: CPU tests (Python ${{ matrix.python-version }})
+    # Python 3.12 is required: the committed native backend .so is built for
+    # cpython-312. Python 3.10/3.11 cannot load it and ring_transport will
+    # raise ImportError at module level.
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10"]
+        python-version: ["3.12"]
 
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: false
+          submodules: false   # vLLM fork is 3.7 GB — too heavy for CPU gate
+
+      # The vendored transformers fork (57 MB, Python-only) is needed for the
+      # framework_fork-marked tests.  Init it here without touching the heavy
+      # vLLM submodule.  Tests that need the vLLM fork skip gracefully via the
+      # _mods() try/except guard in test_moe_v1_routing_hooks.py.
+      - name: Init transformers submodule
+        run: git submodule update --init --depth 1 integration/transformers
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -30,9 +40,8 @@ jobs:
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      # Install the rest of the declared dependencies.  vLLM and the vendored
-      # framework forks are git submodules wired into the GPU stage only; they
-      # are deliberately excluded here.
+      # Install the rest of the declared dependencies.  The vLLM runtime and
+      # the 3.7 GB vLLM fork submodule are GPU-stage only and excluded here.
       - name: Install Python dependencies
         run: |
           pip install -r requirements.txt
