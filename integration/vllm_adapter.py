@@ -35,6 +35,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from vllm import LLM
 from vllm.v1.worker.gpu_worker import Worker
 
 from monitoring import ring_transport
@@ -60,6 +61,8 @@ from monitoring.ring_transport import _ATTN_WT_TYPES
 from monitoring.step_context import StepContext
 
 from integration.model_shape import _make_model_shape_from_hf_config
+from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
+from monitoring.internal_mapper import make_lazy_internal
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +553,9 @@ class DMXGPUWorker(Worker):
         ring_cfg.insert_queue_max_items = int(_cfg(
             ac, "dmx_insert_queue_max_items", "DMX_INSERT_QUEUE_MAX_ITEMS",
             65536))
+        ring_cfg.drain_flush_timeout_us = int(_cfg(
+            ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US",
+            100 * 1000))
 
         # MonitoringEngine + ring transport.
         engine = MonitoringEngine(
@@ -693,8 +699,43 @@ class DMXGPUWorker(Worker):
         super().shutdown()
 
 
+def _attach_dmi_internal(outputs, model_id, reader=None):
+    """Tag each vLLM ``RequestOutput`` with a lazy ``.dmi_internal`` keyed by
+    its (normalized) request_id, so the captured internals read back per
+    request -- the same object HF's ``out.dmi_internal`` gives you."""
+    for r in outputs:
+        rid = normalize_vllm_request_id(r.request_id)
+        r.dmi_internal = make_lazy_internal(model_id, reader=reader, request_ids=[rid])
+    return outputs
+
+
+class DMILLM(LLM):
+    """Drop-in replacement for vLLM's ``LLM`` that captures model internals.
+
+    Injects the DMI worker (so ``worker_cls`` need not be passed) and tags every
+    ``RequestOutput`` from ``generate`` with a lazy ``.dmi_internal``. Pass DMI
+    settings through ``additional_config`` exactly as with plain ``LLM``
+    (``dmx_model_id``, ``dmx_db_host``, ``dmx_db_port``, ``dmx_hook_selection``, ...).
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("worker_cls", "integration.vllm_adapter.DMXGPUWorker")
+        ac = kwargs.get("additional_config") or {}
+        self._dmx_model_id = ac.get("dmx_model_id") or str(
+            kwargs.get("model") or (args[0] if args else ""))
+        self._dmx_db_host = ac.get("dmx_db_host", "localhost")
+        self._dmx_db_port = int(ac.get("dmx_db_port", 9000))
+        super().__init__(*args, **kwargs)
+
+    def generate(self, *args: Any, **kwargs: Any):
+        outputs = super().generate(*args, **kwargs)
+        reader = CHClickhouseDriverReadOnly(host=self._dmx_db_host, port=self._dmx_db_port)
+        return _attach_dmi_internal(outputs, self._dmx_model_id, reader)
+
+
 __all__ = [
     "VLLMAdaptor",
     "DMXGPUWorker",
+    "DMILLM",
     "normalize_vllm_request_id",
 ]

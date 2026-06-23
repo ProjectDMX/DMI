@@ -115,7 +115,7 @@ class BenchConfig:
     drain_flush_payload_ratio: float = 0.0
     drain_flush_entry_threshold: int = 0
     drain_flush_byte_threshold: int = 0
-    drain_flush_timeout_us: int = 0
+    drain_flush_timeout_us: int = 100 * 1000
     clone_slices: bool = False
 
     ch_parallelism: int = 10
@@ -718,8 +718,8 @@ def _parse_args() -> BenchConfig:
                    help="Flush after N entries ready (0 = disabled)")
     g.add_argument("--drain-flush-byte-threshold",  type=int, default=0,
                    help="Flush after N payload bytes ready (0 = disabled)")
-    g.add_argument("--drain-flush-timeout-us",     type=int, default=0,
-                   help="Flush after complete tensor pending N us (0 = disabled)")
+    g.add_argument("--drain-flush-timeout-us",     type=int, default=100 * 1000,
+                   help="Flush after complete tensor pending N us (default: 100000; 0 = disabled)")
 
     g = p.add_argument_group("Ring engine -- p2p")
     g.add_argument("--clone-slices", action="store_true",

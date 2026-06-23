@@ -8,6 +8,9 @@ from typing import Any, Optional, Sequence
 from .config import MonitoringConfig
 
 
+DEFAULT_DRAIN_FLUSH_TIMEOUT_US = 100 * 1000
+
+
 @dataclass
 class HostEngineConfig:
     """Configuration wrapper for the native DMXHostEngine pipeline.
@@ -122,6 +125,7 @@ class MonitoringEngine:
         ring_config.payload_ring_bytes = int(payload_mb) * 1024 * 1024
         ring_config.pinned_staging_bytes = int(pinned_mb) * 1024 * 1024
         ring_config.task_ring_entries = int(task_entries)
+        ring_config.drain_flush_timeout_us = DEFAULT_DRAIN_FLUSH_TIMEOUT_US
         return ring_config
 
     def enable_ring_transport(

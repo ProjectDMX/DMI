@@ -173,6 +173,8 @@ class HFAdaptor(BackendAdaptor):
         self._batch_finished: Optional[List[bool]] = None
         self._prefill_kv_offsets: Optional[List[int]] = None
         self._orig_prepare: Any = None
+        self.request_ids_in_this_generate: List[str] = []
+        self.token_ranges_in_this_generate: Dict[str, List[Tuple[int, int]]] = {}
         # Per-instance defaults.  Per-call ``attach_model(...)`` overrides
         # only when the kwarg is explicitly passed (None means inherit).
         self._no_strip_left_pad: bool = bool(no_strip_left_pad)
@@ -465,6 +467,9 @@ class HFAdaptor(BackendAdaptor):
         if need_reset:
             gid = self.engine.next_auto_group_id()
             self._batch_request_ids = [f"{gid}:{i}" for i in range(batch_size)]
+            for rid in self._batch_request_ids:
+                if rid not in self.request_ids_in_this_generate:
+                    self.request_ids_in_this_generate.append(rid)
             self._batch_starts = [0] * batch_size
             self._batch_finished = [False] * batch_size
             # On (re)prefill, recompute kv_offsets from the attention mask
@@ -605,6 +610,11 @@ class HFAdaptor(BackendAdaptor):
                 f"token_ranges={token_ranges} finished={list(finished)}"
             )
 
+        for rid, token_range in zip(req_ids, token_ranges):
+            self.token_ranges_in_this_generate.setdefault(rid, []).append(
+                (int(token_range[0]), int(token_range[1]))
+            )
+
         # Derive q_len, kv_dim, dim0_offsets.
         q_len = int(input_shape[1]) if len(input_shape) >= 2 else 1
         is_static = (
@@ -694,12 +704,14 @@ class HFAdaptor(BackendAdaptor):
 # generate_with_monitoring (rewritten to use HFAdaptor)
 # ---------------------------------------------------------------------------
 
-def generate_with_monitoring(
+def _generate_with_monitoring_impl(
     model: Any, *args: Any,
     hook_selection: Optional[str] = None,
     no_strip_left_pad: bool = False,
     no_strip_right_pad: bool = False,
     eos_token_id: Any = None,
+    _return_model_id: bool = False,
+    _return_internal_metadata: bool = False,
     **kwargs: Any,
 ):
     """Run HF ``generate()`` with ring-transport monitoring hooks active.
@@ -852,6 +864,8 @@ def generate_with_monitoring(
     # compare-runner test harness) can read per-step batch tracking
     # (_batch_request_ids, _batch_starts).
     engine._hf_adaptor = adaptor
+    adaptor.request_ids_in_this_generate = []
+    adaptor.token_ranges_in_this_generate = {}
     adaptor.attach_model(
         target,
         hook_selection=hook_selection or "full",
@@ -935,7 +949,21 @@ def generate_with_monitoring(
                 warnings.warn(msg, stacklevel=2)
 
     try:
-        return model.generate(*args, **kwargs)
+        gen = model.generate(*args, **kwargs)
+        if _return_internal_metadata:
+            token_ranges = {
+                rid: tuple(ranges)
+                for rid, ranges in adaptor.token_ranges_in_this_generate.items()
+            }
+            return (
+                gen,
+                engine._model_id,
+                tuple(adaptor.request_ids_in_this_generate),
+                token_ranges,
+            )
+        if _return_model_id:
+            return gen, engine._model_id
+        return gen
     finally:
         if adaptor is not None:
             adaptor.detach_model(target)
@@ -949,6 +977,75 @@ def generate_with_monitoring(
                 gen_cfg.cache_implementation = _saved_cache_impl
         # force_eager is owned by before_forward (per-batch reassignment);
         # no cleanup needed -- the next generate()'s first batch will set it.
+
+
+def generate_with_monitoring(
+    model: Any, *args: Any,
+    hook_selection: Optional[str] = None,
+    no_strip_left_pad: bool = False,
+    no_strip_right_pad: bool = False,
+    eos_token_id: Any = None,
+    **kwargs: Any,
+):
+    """Run HF ``generate()`` with monitoring hooks and return HF output unchanged."""
+    return _generate_with_monitoring_impl(
+        model, *args,
+        hook_selection=hook_selection,
+        no_strip_left_pad=no_strip_left_pad,
+        no_strip_right_pad=no_strip_right_pad,
+        eos_token_id=eos_token_id,
+        **kwargs,
+    )
+
+
+def generate_with_monitoring_dict(
+    model: Any, *args: Any,
+    hook_selection: Optional[str] = None,
+    no_strip_left_pad: bool = False,
+    no_strip_right_pad: bool = False,
+    eos_token_id: Any = None,
+    reader: Any = None,
+    internal_requirements: Any = None,
+    **kwargs: Any,
+):
+    """Run monitored HF ``generate()`` and return dict-style output with DMI internals.
+
+    This API always forces ``return_dict_in_generate=True`` and attaches one DMI
+    extension, ``dmi_internal``, which lazily reads captured internals.
+    """
+    gen_kwargs = dict(kwargs)
+    if gen_kwargs.get("return_dict_in_generate") is False:
+        warnings.warn(
+            "generate_with_monitoring_dict() requires "
+            "return_dict_in_generate=True; overriding the supplied False value.",
+            UserWarning,
+            stacklevel=2,
+        )
+    gen_kwargs["return_dict_in_generate"] = True
+
+    output, model_id, request_ids, token_ranges = _generate_with_monitoring_impl(
+        model, *args,
+        hook_selection=hook_selection,
+        no_strip_left_pad=no_strip_left_pad,
+        no_strip_right_pad=no_strip_right_pad,
+        eos_token_id=eos_token_id,
+        _return_internal_metadata=True,
+        **gen_kwargs,
+    )
+
+    from monitoring.internal_mapper import make_lazy_internal
+    dmi_internal = make_lazy_internal(
+        model_id,
+        reader=reader,
+        requirements=internal_requirements,
+        request_ids=request_ids,
+        token_ranges=token_ranges,
+    )
+    try:
+        output.dmi_internal = dmi_internal
+    except Exception:
+        object.__setattr__(output, "dmi_internal", dmi_internal)
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -1209,6 +1306,7 @@ __all__ = [
     "HFAdaptor",
     "GreedyGenerateTimings",
     "generate_with_monitoring",
+    "generate_with_monitoring_dict",
     "generate_greedy_with_monitoring",
     "_prepare_profile_times",
     "print_prepare_profile",

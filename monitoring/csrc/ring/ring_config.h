@@ -36,7 +36,7 @@ struct DrainFlushConfig {
 
     // Time-based flush: if a complete tensor has been pending for longer
     // than this many microseconds, flush unconditionally.  0 = disabled.
-    uint64_t timeout_us = 0;
+    uint64_t timeout_us = 100ULL * 1000;
 };
 
 // ---------------------------------------------------------------------------

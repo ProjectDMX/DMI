@@ -30,7 +30,7 @@ struct RingConfig {
     float    drain_flush_payload_ratio  = 0.0f;
     uint64_t drain_flush_entry_threshold = 0;
     uint64_t drain_flush_byte_threshold  = 0;
-    uint64_t drain_flush_timeout_us      = 0;
+    uint64_t drain_flush_timeout_us      = 100ULL * 1000;
     // Clone per-request slices
     bool     clone_slices               = false;
     // ClickHouse insert queue limits
