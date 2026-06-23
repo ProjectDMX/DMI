@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import warnings
 from typing import Any, List, Optional, Tuple
 
@@ -552,6 +553,12 @@ class DMXGPUWorker(Worker):
         # stalled sink). Steps to retry the barrier before giving up valid=False.
         self._dmx_finalize_drain_timeout_ms: int = 200
         self._dmx_finalize_max_steps: int = 8
+        # B3 serving-cost telemetry for the finalize barrier (read via
+        # dmx_sink_stats, published to Grafana at shutdown): cumulative count of
+        # barrier timeouts + a bounded ring of recent barrier wait-times (s).
+        self._dmx_finalize_timeouts: int = 0
+        self._dmx_finalize_waits: list = []
+        self._DMX_WAIT_CAP: int = 512
 
     def init_device(self) -> None:
         super().init_device()
@@ -814,7 +821,9 @@ class DMXGPUWorker(Worker):
                     nrid, self._dmx_finalize_max_steps)
         if not self._dmx_pending_finalize:
             return
+        t0 = time.monotonic()
         status = self.dmx_drain_to_sink(self._dmx_finalize_drain_timeout_ms)
+        self._dmx_record_finalize_wait(time.monotonic() - t0, timed_out=(status == 1))
         delivered = (status == 0)
         sink_failed = (status == 2)
         for rid in list(self._dmx_pending_finalize):
@@ -827,16 +836,31 @@ class DMXGPUWorker(Worker):
                 self._dmx_finalize_one(finalize, rid, valid=False)
 
     def _dmx_finalize_one(self, finalize: Any, rid: str, valid: bool) -> None:
-        """Finalize one request and drop it from the pending set. `valid=False`
-        flags a best-effort finalize (barrier timed out / sink failed) so the
-        verdict is visibly incomplete rather than silently trusted or lost."""
-        del self._dmx_pending_finalize[rid]
+        """Finalize one request, dropping it from the pending set only AFTER the
+        finalize is accepted. `valid=False` flags a best-effort finalize (barrier
+        timed out / sink failed) so the verdict is visibly incomplete rather than
+        silently trusted. If the finalize ENQUEUE itself fails, we keep the
+        request pending so it's retried next step / in the stop sweep -- never
+        silently dropped (preserves the "verdict never lost" invariant)."""
         try:
-            finalize(rid, valid=valid)
-        except TypeError:
-            finalize(rid)  # sink without the valid kwarg (older ProbeWorker)
+            try:
+                finalize(rid, valid=valid)
+            except TypeError:
+                finalize(rid)  # sink without the valid kwarg (older ProbeWorker)
         except Exception as e:
-            print(f"[dmx] finalize_request({rid}) raised: {e}", flush=True)
+            print(f"[dmx] finalize_request({rid}) raised: {e}; keeping pending "
+                  "for retry", flush=True)
+            return
+        self._dmx_pending_finalize.pop(rid, None)
+
+    def _dmx_record_finalize_wait(self, dt: float, timed_out: bool) -> None:
+        """B3: accumulate finalize-barrier serving-cost telemetry."""
+        if timed_out:
+            self._dmx_finalize_timeouts += 1
+        w = self._dmx_finalize_waits
+        w.append(float(dt))
+        if len(w) > self._DMX_WAIT_CAP:
+            del w[:len(w) - self._DMX_WAIT_CAP]
 
     def _dmx_finalize_sweep(self) -> None:
         """Finalize every still-pending request before teardown. Barrier hard so
@@ -866,8 +890,16 @@ class DMXGPUWorker(Worker):
             except Exception:
                 pass
             return -1
+        # PER-BARRIER sink-error detection: compare the cumulative exception
+        # count across THIS drain, not against zero. submit_exceptions never
+        # resets, so testing `> 0` would make one transient SubmitFn failure
+        # poison every later finalize. A latched sink_failed (opt-in via
+        # set_abort_on_sink_error) is the explicit fail-closed policy and is
+        # honored permanently.
+        exc_before = int(getattr(re, "submit_exceptions", 0) or 0)
         status = drain(int(timeout_ms))
-        if getattr(re, "submit_exceptions", 0):
+        exc_after = int(getattr(re, "submit_exceptions", 0) or 0)
+        if bool(getattr(re, "sink_failed", False)) or exc_after > exc_before:
             return 2
         return int(status)
 
@@ -879,16 +911,24 @@ class DMXGPUWorker(Worker):
         self.dmx_drain_to_sink(self._dmx_finalize_drain_timeout_ms)
 
     def dmx_sink_stats(self) -> dict:
-        """C0 observability: cumulative SubmitFn-exception count + last error +
-        whether the engine latched failed. Call via collective_rpc('dmx_sink_stats')."""
+        """C0/B3 observability: cumulative SubmitFn-exception count + last error +
+        latched-failed flag, plus the finalize-barrier serving-cost telemetry
+        (timeout count + recent wait-times). Call via
+        collective_rpc('dmx_sink_stats')."""
         re = self.adaptor.ring_engine if self.adaptor is not None else None
+        base = {
+            "submit_exceptions": 0, "last_sink_error": "", "sink_failed": False,
+            "finalize_timeouts": int(self._dmx_finalize_timeouts),
+            "finalize_waits": list(self._dmx_finalize_waits),
+        }
         if re is None:
-            return {"submit_exceptions": 0, "last_sink_error": "", "sink_failed": False}
-        return {
+            return base
+        base.update({
             "submit_exceptions": int(getattr(re, "submit_exceptions", 0) or 0),
             "last_sink_error": str(getattr(re, "last_sink_error", "") or ""),
             "sink_failed": bool(getattr(re, "sink_failed", False)),
-        }
+        })
+        return base
 
     def stop_monitoring(self) -> None:
         """Flush and stop DMI engine.  Reentrant: second call no-ops."""
