@@ -165,7 +165,7 @@ public:
     // ensure FIFO ordering before consuming the next meta out-of-band.
     void flush_and_wait();
 
-    // C1: like flush_and_wait(), but additionally barrier through the
+    // Like flush_and_wait(), but additionally barrier through the
     // p2p -> SubmitFn stage so every slice produced so far has reached the
     // sink on return.  Returns 0 = delivered, 1 = timed out (0 = wait forever).
     // The adapter calls this (not flush_and_wait) before finalizing a finished
@@ -174,7 +174,7 @@ public:
     // submit_exceptions()/sink_failed() for per-request sink errors.
     int drain_to_sink_and_wait(uint32_t timeout_ms);
 
-    // C0: fail-loud sink error surface, observable from Python.
+    // Fail-loud sink error surface, observable from Python.
     uint64_t    submit_exceptions() const;   // count of SubmitFn exceptions
     std::string last_sink_error()   const;   // most recent error message
     void set_abort_on_sink_error(bool enabled);

@@ -348,13 +348,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("flush_and_wait",
            &ring_py::RingEnginePy::flush_and_wait,
            py::call_guard<py::gil_scoped_release>())
-      // C1: flush + barrier through the SubmitFn stage (GIL released so the
+      // flush + delivery barrier through the SubmitFn stage (GIL released so the
       // p2p thread can re-acquire it to call the Python sink).
       .def("drain_to_sink_and_wait",
            &ring_py::RingEnginePy::drain_to_sink_and_wait,
            py::arg("timeout_ms") = uint32_t{0},
            py::call_guard<py::gil_scoped_release>())
-      // C0: fail-loud sink error surface.
+      // fail-loud sink error surface.
       .def_property_readonly("submit_exceptions",
            &ring_py::RingEnginePy::submit_exceptions)
       .def_property_readonly("last_sink_error",

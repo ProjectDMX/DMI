@@ -155,7 +155,7 @@ void DrainThread::submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes
         std::lock_guard<std::mutex> lk(pop_mu_);
         can_pop_count_ += 1;
     }
-    tasks_enqueued_.fetch_add(1, std::memory_order_release);  // C1
+    tasks_enqueued_.fetch_add(1, std::memory_order_release);  // sink-barrier accounting
     pop_cv_.notify_one();
 }
 
@@ -439,7 +439,7 @@ void DrainThread::submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes) {
             std::lock_guard<std::mutex> lk(pop_mu_);
             can_pop_count_ += 1;
         }
-        tasks_enqueued_.fetch_add(1, std::memory_order_release);  // C1
+        tasks_enqueued_.fetch_add(1, std::memory_order_release);  // sink-barrier accounting
         pop_cv_.notify_one();
     }
 

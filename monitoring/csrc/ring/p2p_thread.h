@@ -47,7 +47,7 @@ public:
     void start();
     void stop();
 
-    // -- C0: fail-loud sink error accounting (observable from Python) -------
+    // -- fail-loud sink error accounting (observable from Python) ----------
     // submit_fn exceptions (incl. re-raised Python SubmitFn errors) are caught
     // in do_post_processing; instead of being swallowed they are counted here.
     uint64_t submit_exceptions() const {
@@ -66,7 +66,7 @@ public:
             && submit_exceptions_.load(std::memory_order_relaxed) > 0;
     }
 
-    // -- C1: barrier through the SubmitFn ----------------------------------
+    // -- delivery barrier through the SubmitFn -----------------------------
     // Tasks fully processed by this thread (each = one DrainTask popped and run
     // through do_post_processing, i.e. all its per-request submit_fn calls have
     // returned).  Paired with DrainThread::tasks_enqueued() for a sink barrier.
@@ -86,13 +86,13 @@ private:
     std::thread              thread_;
     ring_py::StepContext*    current_ctx_{nullptr};  // owned, freed on last_in_step
 
-    // C0 error accounting.
+    // Sink error accounting.
     std::atomic<uint64_t>    submit_exceptions_{0};
     mutable std::mutex       err_mu_;
     std::string              last_error_;
     std::atomic<bool>        abort_on_sink_error_{false};
 
-    // C1 sink barrier.
+    // Sink delivery barrier.
     std::atomic<uint64_t>    tasks_processed_{0};
     std::mutex               barrier_mu_;
     std::condition_variable  barrier_cv_;

@@ -150,7 +150,7 @@ void P2PThread::loop() {
         drain_.pop_tasks(n, local);
         process(local);
 
-        // C1: publish progress under barrier_mu_ so a drain_to_sink_and_wait()
+        // Publish progress under barrier_mu_ so a drain_to_sink_and_wait()
         // waiter can't miss the wakeup (it checks the predicate under the same
         // mutex).  Counts DrainTasks, matching DrainThread::tasks_enqueued().
         {
@@ -346,7 +346,7 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
             log_submit_failure_once(current_ctx_->model_id, req.req_id,
                                     act_name, meta.layer_no, shard_rank,
                                     db_start, db_end, e.what());
-            note_submit_error(e.what());  // C0: fail-loud, count + record
+            note_submit_error(e.what());  // fail-loud: count + record
         } catch (...) {
             log_submit_failure_once(current_ctx_->model_id, req.req_id,
                                     act_name, meta.layer_no, shard_rank,

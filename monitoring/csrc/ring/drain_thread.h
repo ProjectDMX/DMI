@@ -59,7 +59,7 @@ public:
 
     bool is_running() const { return running_.load(std::memory_order_relaxed); }
 
-    // C1: cumulative count of DrainTasks pushed to the p2p queue (one per
+    // Cumulative count of DrainTasks pushed to the p2p queue (one per
     // can_pop_count_ increment).  Paired with P2PThread::tasks_processed() to
     // barrier flush through the SubmitFn stage.
     uint64_t tasks_enqueued() const {
@@ -115,7 +115,7 @@ private:
     std::deque<DrainTask>   task_queue_;
     std::mutex              queue_mu_;
     uint64_t                can_pop_count_{0};
-    std::atomic<uint64_t>   tasks_enqueued_{0};  // C1: cumulative tasks pushed
+    std::atomic<uint64_t>   tasks_enqueued_{0};  // cumulative tasks pushed
     std::mutex              pop_mu_;
     std::condition_variable pop_cv_;
     bool                    p2p_stop_requested_{false};

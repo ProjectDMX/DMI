@@ -543,13 +543,13 @@ class DMXGPUWorker(Worker):
         self._dmx_callable_sink: Any = None
         self._dmx_auto_finalize: bool = False
         # deferred finalize: a request's final-token slice may still be in the
-        # ring when vLLM reports it finished. We barrier it to the sink (C1
-        # drain_to_sink_and_wait) before finalizing so a "final"-pooled probe
+        # ring when vLLM reports it finished. We barrier it to the sink
+        # (drain_to_sink_and_wait) before finalizing so a "final"-pooled probe
         # scores the true last token. _dmx_pending_finalize maps req_id -> the
         # remaining step budget before we give up and best-effort finalize the
         # request as valid=False (so its verdict is visible, never silently lost).
         self._dmx_pending_finalize: dict = {}
-        # ms the C1 barrier waits for a request's tail to reach the sink (0 = wait
+        # ms the sink barrier waits for a request's tail to reach the sink (0 = wait
         # forever -- avoid; a finite timeout keeps execute_model bounded under a
         # stalled sink). Steps to retry the barrier before giving up valid=False.
         self._dmx_finalize_drain_timeout_ms: int = 200
@@ -649,7 +649,7 @@ class DMXGPUWorker(Worker):
             self._dmx_auto_finalize = bool(_cfg(
                 ac, "dmx_auto_finalize", "DMX_AUTO_FINALIZE", True)) and \
                 hasattr(host_engine, "finalize_request")
-            # C1 finalize-barrier knobs (see _dmx_finalize_finished).
+            # finalize-barrier knobs (see _dmx_finalize_finished).
             self._dmx_finalize_drain_timeout_ms = int(_cfg(
                 ac, "dmx_finalize_drain_timeout_ms",
                 "DMX_FINALIZE_DRAIN_TIMEOUT_MS", 200))
@@ -802,19 +802,19 @@ class DMXGPUWorker(Worker):
         return out
 
     def _dmx_finalize_finished(self, scheduler_output: Any) -> None:
-        """Finalize each finished request at its true final token via the C1
-        barrier.
+        """Finalize each finished request at its true final token via the sink
+        delivery barrier.
 
         vLLM reports a request finished, but its final-token decode slice may
         still be in the ring (GPU->p2p->sink lag). Finalizing immediately makes a
         "final"-pooled probe score an EARLIER (already-delivered) token. So once
-        any request is pending we drive `drain_to_sink_and_wait` (C1): it flushes
-        the GPU ring AND blocks until every flushed slice has reached the Python
+        any request is pending we drive `drain_to_sink_and_wait`: it flushes the
+        GPU ring AND blocks until every flushed slice has reached the Python
         sink, so the worker is guaranteed to see [...all this req's slices,
         finalize] in order. When the barrier reports delivered we finalize all
         pending requests; on timeout we retry next step up to
         `_dmx_finalize_max_steps`, then best-effort finalize as valid=False so a
-        verdict is never silently lost. A sink error (C0) -> same valid=False
+        verdict is never silently lost. A sink error -> same valid=False
         fail-safe immediately. Requests finishing in the last steps are swept in
         stop_monitoring."""
         sink = self._dmx_callable_sink
@@ -885,15 +885,15 @@ class DMXGPUWorker(Worker):
             self._dmx_finalize_one(finalize, rid, valid=delivered)
 
     def dmx_drain_to_sink(self, timeout_ms: int = 0) -> int:
-        """C1 barrier: flush the GPU ring AND block until every flushed slice has
-        been processed by the p2p thread. Returns 0=delivered, 1=timeout,
-        2=sink-error, -1=no engine / method unavailable. Falls back to the
-        GPU-only flush_and_wait if the .so predates drain_to_sink_and_wait.
+        """Sink delivery barrier: flush the GPU ring AND block until every
+        flushed slice has been processed by the p2p thread. Returns 0=delivered,
+        1=timeout, 2=sink-error, -1=no engine / method unavailable. Falls back to
+        the GPU-only flush_and_wait if the .so predates drain_to_sink_and_wait.
 
         NOTE: 0 (delivered) means every task was processed, NOT that every
         per-request sink call SUCCEEDED -- a SubmitFn exception is caught and
-        counted, not propagated. Sink success is the complementary C0 signal
-        (submit_exceptions / sink_failed), which is why we return 2 on a new
+        counted, not propagated. Sink success is the complementary
+        submit_exceptions / sink_failed signal, which is why we return 2 on a new
         exception during this barrier."""
         if self.adaptor is None or self.adaptor.ring_engine is None:
             return -1
@@ -920,15 +920,15 @@ class DMXGPUWorker(Worker):
 
     def dmx_flush(self) -> None:
         """Force the ring to drain all pending slices to the sink, NOW, without
-        stopping. Barriers through the SubmitFn (C1) so an in-memory consumer
+        stopping. Barriers through the SubmitFn so an in-memory consumer
         deterministically has every produced slice on return, not just the
         GPU->p2p handoff. Call via collective_rpc('dmx_flush')."""
         self.dmx_drain_to_sink(self._dmx_finalize_drain_timeout_ms)
 
     def dmx_sink_stats(self) -> dict:
-        """C0/B3 observability: cumulative SubmitFn-exception count + last error +
-        latched-failed flag, plus the finalize-barrier serving-cost telemetry
-        (timeout count + recent wait-times). Call via
+        """Sink + finalize-barrier observability: cumulative SubmitFn-exception
+        count + last error + latched-failed flag, plus the finalize-barrier
+        serving-cost telemetry (timeout count + recent wait-times). Call via
         collective_rpc('dmx_sink_stats')."""
         re = self.adaptor.ring_engine if self.adaptor is not None else None
         base = {
