@@ -1,0 +1,73 @@
+name: CI — CPU PR gate
+
+on:
+  push:
+    branches: ["main", "**"]
+  pull_request:
+
+jobs:
+  cpu-gate:
+    name: CPU tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Install CPU-only torch first so the subsequent requirements.txt install
+      # doesn't pull in the CUDA wheel (CUDA is not available on free runners).
+      - name: Install CPU-only torch
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      # Install the rest of the declared dependencies.  vLLM and the vendored
+      # framework forks are git submodules wired into the GPU stage only; they
+      # are deliberately excluded here.
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+
+      # Install the package itself in editable mode so `import monitoring` and
+      # `import tests.*` resolve correctly.  --no-build-isolation is required
+      # because the native backend build needs torch's include/lib paths, but
+      # we skip the actual C extension here (CPU runners have no nvcc/CUDA).
+      - name: Install package (editable, skip native build)
+        run: |
+          pip install -e . --no-build-isolation --no-build-isolation \
+            --config-setting=--build-option=--skip-native 2>/dev/null || \
+          pip install -e . --no-build-isolation || true
+          # Fallback: direct editable install without build_ext side-effects
+          pip install -e . --no-deps --no-build-isolation
+
+      # Smoke check: all key pure-Python modules must be importable without
+      # CUDA, ClickHouse, or vLLM present.
+      - name: Smoke check — module imports
+        run: |
+          python -c "
+          import monitoring
+          import monitoring.config
+          import monitoring.engine
+          import monitoring.hook_points
+          import monitoring.selection
+          import tests.hf_comparator
+          import tests.hf_reference
+          import tests._requirements
+          print('All pure-Python modules import OK')
+          "
+
+      # Run the cpu-marked subset.  These tests require no CUDA device, no
+      # ClickHouse instance, no vLLM runtime, no model weights, and no native
+      # .so beyond what torch ships.
+      - name: Run CPU test suite
+        run: |
+          python -m pytest -m "not slow and not gpu" -v --tb=short
