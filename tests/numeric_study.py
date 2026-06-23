@@ -407,7 +407,7 @@ def format_table(result: StudyResult) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess rollout runners (full-logits capture)
+# Subprocess rollout runners
 # ---------------------------------------------------------------------------
 
 # HF rollout saves {token_ids: int64[N], logits: float32[N, vocab]} -- full vocabulary.
