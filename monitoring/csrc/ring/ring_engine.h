@@ -33,9 +33,13 @@ public:
     uint64_t  task_cap()    const { return cfg_.task_ring_entries; }
 
     // C1: flush the GPU ring AND barrier through the p2p -> SubmitFn stage, so
-    // that on return every slice produced so far has been handed to the sink.
+    // that on return every produced slice has been HANDED to the sink stage.
     // Caller must cudaStreamSynchronize first (see RingEnginePy).  Returns 0 if
-    // all tasks were delivered, 1 on timeout (timeout_ms==0 waits forever).
+    // all tasks were processed, 1 on timeout (timeout_ms==0 waits forever).
+    // NOTE: "processed" means every per-request submit_fn was CALLED, not that
+    // it succeeded -- a SubmitFn exception is caught + counted (submit_exceptions),
+    // not propagated.  Pair this barrier with submit_exceptions()/sink_failed()
+    // to tell delivered-and-succeeded from delivered-but-some-sink-errors.
     int drain_to_sink_and_wait(uint32_t timeout_ms) {
         drain_->force_flush_and_wait();                 // GPU ring -> p2p queue
         const uint64_t target = drain_->tasks_enqueued();

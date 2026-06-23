@@ -168,8 +168,10 @@ public:
     // C1: like flush_and_wait(), but additionally barrier through the
     // p2p -> SubmitFn stage so every slice produced so far has reached the
     // sink on return.  Returns 0 = delivered, 1 = timed out (0 = wait forever).
-    // The B-side adapter calls this (not flush_and_wait) before finalizing a
-    // finished request so its committed-token slice is guaranteed delivered.
+    // The adapter calls this (not flush_and_wait) before finalizing a finished
+    // request so its committed-token slice is guaranteed delivered.  "Delivered"
+    // = every submit_fn was called, NOT that each succeeded; check
+    // submit_exceptions()/sink_failed() for per-request sink errors.
     int drain_to_sink_and_wait(uint32_t timeout_ms);
 
     // C0: fail-loud sink error surface, observable from Python.

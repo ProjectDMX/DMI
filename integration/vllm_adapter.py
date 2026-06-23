@@ -358,9 +358,10 @@ class VLLMAdaptor(BackendAdaptor):
         elif len(num_scheduled) <= 1:
             req_ids = list(num_scheduled.keys())  # single-req / no input_batch: order is unambiguous
         else:
-            # #4: multiple requests but input_batch order is unusable -> dict
-            # order would silently re-enter the L2 row<->request mismatch bug
-            # (right metadata, WRONG activation). Fail loud instead.
+            # multiple concurrent requests but input_batch order is unusable:
+            # dict order would attach each request's metadata to ANOTHER
+            # request's hidden rows (right metadata, WRONG activation). Fail
+            # loud rather than silently corrupt continuous-batch capture.
             raise RuntimeError(
                 "dmx: cannot determine input_batch row order for "
                 f"{len(num_scheduled)} concurrent requests "
@@ -553,7 +554,11 @@ class DMXGPUWorker(Worker):
         # stalled sink). Steps to retry the barrier before giving up valid=False.
         self._dmx_finalize_drain_timeout_ms: int = 200
         self._dmx_finalize_max_steps: int = 8
-        # B3 serving-cost telemetry for the finalize barrier (read via
+        # teardown sweep waits for the tail with a FINITE timeout: a sink that
+        # blocks forever must not hang stop_monitoring. After it, still-undelivered
+        # requests are finalized valid=False.
+        self._dmx_finalize_sweep_timeout_ms: int = 5000
+        # serving-cost telemetry for the finalize barrier (read via
         # dmx_sink_stats, published to Grafana at shutdown): cumulative count of
         # barrier timeouts + a bounded ring of recent barrier wait-times (s).
         self._dmx_finalize_timeouts: int = 0
@@ -593,7 +598,7 @@ class DMXGPUWorker(Worker):
         # db_host takes precedence; if neither is set the ring runs sink-less.
         host_engine = None
         use_callable_sink = (not db_host) and _DMX_SINK_FACTORY is not None
-        # #5: fail loud when a callable sink is REQUIRED but none is registered
+        # fail loud when a callable sink is REQUIRED but none is registered
         # (e.g. forgot VLLM_ENABLE_V1_MULTIPROCESSING=0 so the module-global
         # factory isn't shared into this worker process) -- otherwise the ring
         # runs sink-less and silently produces no scores.
@@ -650,6 +655,9 @@ class DMXGPUWorker(Worker):
                 "DMX_FINALIZE_DRAIN_TIMEOUT_MS", 200))
             self._dmx_finalize_max_steps = int(_cfg(
                 ac, "dmx_finalize_max_steps", "DMX_FINALIZE_MAX_STEPS", 8))
+            self._dmx_finalize_sweep_timeout_ms = int(_cfg(
+                ac, "dmx_finalize_sweep_timeout_ms",
+                "DMX_FINALIZE_SWEEP_TIMEOUT_MS", 5000))
 
         ring_cfg = _ne.RingConfig()
         ring_cfg.payload_ring_bytes = ring_payload_mb * 1024 * 1024
@@ -854,7 +862,7 @@ class DMXGPUWorker(Worker):
         self._dmx_pending_finalize.pop(rid, None)
 
     def _dmx_record_finalize_wait(self, dt: float, timed_out: bool) -> None:
-        """B3: accumulate finalize-barrier serving-cost telemetry."""
+        """Accumulate finalize-barrier serving-cost telemetry."""
         if timed_out:
             self._dmx_finalize_timeouts += 1
         w = self._dmx_finalize_waits
@@ -863,23 +871,30 @@ class DMXGPUWorker(Worker):
             del w[:len(w) - self._DMX_WAIT_CAP]
 
     def _dmx_finalize_sweep(self) -> None:
-        """Finalize every still-pending request before teardown. Barrier hard so
-        their tails are delivered; whatever still hasn't arrived is finalized
-        valid=False (visible, not lost)."""
+        """Finalize every still-pending request before teardown. Barrier for the
+        tail with a FINITE timeout (a blocking sink must not hang teardown);
+        whatever still hasn't arrived is finalized valid=False (visible, not
+        lost)."""
         sink = self._dmx_callable_sink
         finalize = getattr(sink, "finalize_request", None)
         if finalize is None or not self._dmx_pending_finalize:
             return
-        status = self.dmx_drain_to_sink(0)  # wait for the tail this last time
+        status = self.dmx_drain_to_sink(self._dmx_finalize_sweep_timeout_ms)
         delivered = (status == 0)
         for rid in list(self._dmx_pending_finalize):
             self._dmx_finalize_one(finalize, rid, valid=delivered)
 
     def dmx_drain_to_sink(self, timeout_ms: int = 0) -> int:
         """C1 barrier: flush the GPU ring AND block until every flushed slice has
-        reached the Python sink. Returns 0=delivered, 1=timeout, 2=sink-error
-        (C0), -1=no engine / method unavailable. Falls back to the GPU-only
-        flush_and_wait if the .so predates drain_to_sink_and_wait."""
+        been processed by the p2p thread. Returns 0=delivered, 1=timeout,
+        2=sink-error, -1=no engine / method unavailable. Falls back to the
+        GPU-only flush_and_wait if the .so predates drain_to_sink_and_wait.
+
+        NOTE: 0 (delivered) means every task was processed, NOT that every
+        per-request sink call SUCCEEDED -- a SubmitFn exception is caught and
+        counted, not propagated. Sink success is the complementary C0 signal
+        (submit_exceptions / sink_failed), which is why we return 2 on a new
+        exception during this barrier."""
         if self.adaptor is None or self.adaptor.ring_engine is None:
             return -1
         re = self.adaptor.ring_engine
