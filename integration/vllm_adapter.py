@@ -354,8 +354,17 @@ class VLLMAdaptor(BackendAdaptor):
         if (ib_req_ids is not None and len(ib_req_ids) == len(num_scheduled)
                 and all(r in num_scheduled for r in ib_req_ids)):
             req_ids = list(ib_req_ids)
+        elif len(num_scheduled) <= 1:
+            req_ids = list(num_scheduled.keys())  # single-req / no input_batch: order is unambiguous
         else:
-            req_ids = list(num_scheduled.keys())  # fallback: single-req / no input_batch
+            # #4: multiple requests but input_batch order is unusable -> dict
+            # order would silently re-enter the L2 row<->request mismatch bug
+            # (right metadata, WRONG activation). Fail loud instead.
+            raise RuntimeError(
+                "dmx: cannot determine input_batch row order for "
+                f"{len(num_scheduled)} concurrent requests "
+                f"(input_batch.req_ids={ib_req_ids!r}); refusing the dict-order "
+                "fallback that mis-associates activations under continuous batching")
         num_reqs = len(req_ids)
         num_scheduled_per_req = [num_scheduled[rid] for rid in req_ids]
         total_q = total_tokens
@@ -531,11 +540,18 @@ class DMXGPUWorker(Worker):
         # callable-sink (e.g. ProbeWorker) + per-request auto-finalize
         self._dmx_callable_sink: Any = None
         self._dmx_auto_finalize: bool = False
-        # deferred finalize: a request's final-token slice is delivered to the
-        # sink a few steps AFTER vLLM reports it finished (ring flush lag), so we
-        # hold finished requests for a grace of N steps before finalizing.
+        # deferred finalize: a request's final-token slice may still be in the
+        # ring when vLLM reports it finished. We barrier it to the sink (C1
+        # drain_to_sink_and_wait) before finalizing so a "final"-pooled probe
+        # scores the true last token. _dmx_pending_finalize maps req_id -> the
+        # remaining step budget before we give up and best-effort finalize the
+        # request as valid=False (so its verdict is visible, never silently lost).
         self._dmx_pending_finalize: dict = {}
-        self._dmx_finalize_delay: int = 4
+        # ms the C1 barrier waits for a request's tail to reach the sink (0 = wait
+        # forever -- avoid; a finite timeout keeps execute_model bounded under a
+        # stalled sink). Steps to retry the barrier before giving up valid=False.
+        self._dmx_finalize_drain_timeout_ms: int = 200
+        self._dmx_finalize_max_steps: int = 8
 
     def init_device(self) -> None:
         super().init_device()
@@ -570,6 +586,16 @@ class DMXGPUWorker(Worker):
         # db_host takes precedence; if neither is set the ring runs sink-less.
         host_engine = None
         use_callable_sink = (not db_host) and _DMX_SINK_FACTORY is not None
+        # #5: fail loud when a callable sink is REQUIRED but none is registered
+        # (e.g. forgot VLLM_ENABLE_V1_MULTIPROCESSING=0 so the module-global
+        # factory isn't shared into this worker process) -- otherwise the ring
+        # runs sink-less and silently produces no scores.
+        require_callable_sink = bool(_cfg(
+            ac, "dmx_require_callable_sink", "DMX_REQUIRE_CALLABLE_SINK", False))
+        if require_callable_sink and not db_host and _DMX_SINK_FACTORY is None:
+            raise RuntimeError(
+                "dmx_require_callable_sink set but no sink factory registered "
+                "(register_sink_factory + VLLM_ENABLE_V1_MULTIPROCESSING=0?)")
         if os.environ.get("DMX_DEBUG_SINK"):
             print(f"[dmx-debug] init_device: db_host={db_host!r} "
                   f"factory_set={_DMX_SINK_FACTORY is not None} "
@@ -611,6 +637,12 @@ class DMXGPUWorker(Worker):
             self._dmx_auto_finalize = bool(_cfg(
                 ac, "dmx_auto_finalize", "DMX_AUTO_FINALIZE", True)) and \
                 hasattr(host_engine, "finalize_request")
+            # C1 finalize-barrier knobs (see _dmx_finalize_finished).
+            self._dmx_finalize_drain_timeout_ms = int(_cfg(
+                ac, "dmx_finalize_drain_timeout_ms",
+                "DMX_FINALIZE_DRAIN_TIMEOUT_MS", 200))
+            self._dmx_finalize_max_steps = int(_cfg(
+                ac, "dmx_finalize_max_steps", "DMX_FINALIZE_MAX_STEPS", 8))
 
         ring_cfg = _ne.RingConfig()
         ring_cfg.payload_ring_bytes = ring_payload_mb * 1024 * 1024
@@ -755,65 +787,108 @@ class DMXGPUWorker(Worker):
         return out
 
     def _dmx_finalize_finished(self, scheduler_output: Any) -> None:
-        """Finalize each finished request at its true final token, DEFERRED.
+        """Finalize each finished request at its true final token via the C1
+        barrier.
 
-        vLLM reports a request finished, but its final-token decode slice reaches
-        the sink a few steps later (ring flush lag). Finalizing immediately makes
-        a "final"-pooled probe score an EARLIER (already-delivered) token. So we
-        hold each finished request for `_dmx_finalize_delay` steps; when the grace
-        elapses we flush_and_wait (force its tail to the sink) THEN finalize, so
-        the worker sees [...all this req's slices, finalize] in order. Requests
-        that finish in the very last steps are swept in stop_monitoring."""
+        vLLM reports a request finished, but its final-token decode slice may
+        still be in the ring (GPU->p2p->sink lag). Finalizing immediately makes a
+        "final"-pooled probe score an EARLIER (already-delivered) token. So once
+        any request is pending we drive `drain_to_sink_and_wait` (C1): it flushes
+        the GPU ring AND blocks until every flushed slice has reached the Python
+        sink, so the worker is guaranteed to see [...all this req's slices,
+        finalize] in order. When the barrier reports delivered we finalize all
+        pending requests; on timeout we retry next step up to
+        `_dmx_finalize_max_steps`, then best-effort finalize as valid=False so a
+        verdict is never silently lost. A sink error (C0) -> same valid=False
+        fail-safe immediately. Requests finishing in the last steps are swept in
+        stop_monitoring."""
         sink = self._dmx_callable_sink
         finalize = getattr(sink, "finalize_request", None)
         if finalize is None:
             return
-        due = []
-        for rid in list(self._dmx_pending_finalize):
-            self._dmx_pending_finalize[rid] -= 1
-            if self._dmx_pending_finalize[rid] <= 0:
-                due.append(rid)
-                del self._dmx_pending_finalize[rid]
         fin = getattr(scheduler_output, "finished_req_ids", None)
         if fin:
             for rid in fin:
-                self._dmx_pending_finalize[normalize_vllm_request_id(rid)] = \
-                    self._dmx_finalize_delay
-        if due:
-            self.dmx_flush()  # force the due requests' tail slices to the sink
-            for rid in due:
-                try:
-                    finalize(rid)
-                except Exception:
-                    pass
+                nrid = normalize_vllm_request_id(rid)
+                self._dmx_pending_finalize.setdefault(
+                    nrid, self._dmx_finalize_max_steps)
+        if not self._dmx_pending_finalize:
+            return
+        status = self.dmx_drain_to_sink(self._dmx_finalize_drain_timeout_ms)
+        delivered = (status == 0)
+        sink_failed = (status == 2)
+        for rid in list(self._dmx_pending_finalize):
+            if delivered:
+                self._dmx_finalize_one(finalize, rid, valid=True)
+                continue
+            # not delivered: count down the retry budget; sink error gives up now
+            self._dmx_pending_finalize[rid] -= 1
+            if sink_failed or self._dmx_pending_finalize[rid] <= 0:
+                self._dmx_finalize_one(finalize, rid, valid=False)
+
+    def _dmx_finalize_one(self, finalize: Any, rid: str, valid: bool) -> None:
+        """Finalize one request and drop it from the pending set. `valid=False`
+        flags a best-effort finalize (barrier timed out / sink failed) so the
+        verdict is visibly incomplete rather than silently trusted or lost."""
+        del self._dmx_pending_finalize[rid]
+        try:
+            finalize(rid, valid=valid)
+        except TypeError:
+            finalize(rid)  # sink without the valid kwarg (older ProbeWorker)
+        except Exception as e:
+            print(f"[dmx] finalize_request({rid}) raised: {e}", flush=True)
 
     def _dmx_finalize_sweep(self) -> None:
-        """Finalize every still-pending request (those that finished in the last
-        steps and never reached their grace). Flush hard first so their tails
-        are delivered."""
+        """Finalize every still-pending request before teardown. Barrier hard so
+        their tails are delivered; whatever still hasn't arrived is finalized
+        valid=False (visible, not lost)."""
         sink = self._dmx_callable_sink
         finalize = getattr(sink, "finalize_request", None)
         if finalize is None or not self._dmx_pending_finalize:
             return
-        for _ in range(3):
-            self.dmx_flush()
+        status = self.dmx_drain_to_sink(0)  # wait for the tail this last time
+        delivered = (status == 0)
         for rid in list(self._dmx_pending_finalize):
+            self._dmx_finalize_one(finalize, rid, valid=delivered)
+
+    def dmx_drain_to_sink(self, timeout_ms: int = 0) -> int:
+        """C1 barrier: flush the GPU ring AND block until every flushed slice has
+        reached the Python sink. Returns 0=delivered, 1=timeout, 2=sink-error
+        (C0), -1=no engine / method unavailable. Falls back to the GPU-only
+        flush_and_wait if the .so predates drain_to_sink_and_wait."""
+        if self.adaptor is None or self.adaptor.ring_engine is None:
+            return -1
+        re = self.adaptor.ring_engine
+        drain = getattr(re, "drain_to_sink_and_wait", None)
+        if drain is None:
             try:
-                finalize(rid)
+                re.flush_and_wait()
             except Exception:
                 pass
-        self._dmx_pending_finalize.clear()
+            return -1
+        status = drain(int(timeout_ms))
+        if getattr(re, "submit_exceptions", 0):
+            return 2
+        return int(status)
 
     def dmx_flush(self) -> None:
         """Force the ring to drain all pending slices to the sink, NOW, without
-        stopping. Lets an in-memory consumer reach a request's final-token slice
-        deterministically (e.g. before finalize_all) instead of waiting on the
-        periodic flush. Call via collective_rpc('dmx_flush')."""
-        if self.adaptor is not None and self.adaptor.ring_engine is not None:
-            try:
-                self.adaptor.ring_engine.flush_and_wait()
-            except Exception:
-                pass
+        stopping. Barriers through the SubmitFn (C1) so an in-memory consumer
+        deterministically has every produced slice on return, not just the
+        GPU->p2p handoff. Call via collective_rpc('dmx_flush')."""
+        self.dmx_drain_to_sink(self._dmx_finalize_drain_timeout_ms)
+
+    def dmx_sink_stats(self) -> dict:
+        """C0 observability: cumulative SubmitFn-exception count + last error +
+        whether the engine latched failed. Call via collective_rpc('dmx_sink_stats')."""
+        re = self.adaptor.ring_engine if self.adaptor is not None else None
+        if re is None:
+            return {"submit_exceptions": 0, "last_sink_error": "", "sink_failed": False}
+        return {
+            "submit_exceptions": int(getattr(re, "submit_exceptions", 0) or 0),
+            "last_sink_error": str(getattr(re, "last_sink_error", "") or ""),
+            "sink_failed": bool(getattr(re, "sink_failed", False)),
+        }
 
     def stop_monitoring(self) -> None:
         """Flush and stop DMI engine.  Reentrant: second call no-ops."""
