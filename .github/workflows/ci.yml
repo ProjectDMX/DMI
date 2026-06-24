@@ -8,13 +8,10 @@ on:
 jobs:
   cpu-gate:
     name: CPU tests (Python ${{ matrix.python-version }})
-    # Python 3.12 is required: the committed native backend .so is built for
-    # cpython-312. Python 3.10/3.11 cannot load it and ring_transport will
-    # raise ImportError at module level.
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.12"]
+        python-version: ["3.10"]
 
     steps:
       - uses: actions/checkout@v4
@@ -72,9 +69,8 @@ jobs:
           import tests._requirements
           print('All pure-Python modules import OK')
           "
-          # monitoring.selection and monitoring.ring_transport are excluded:
-          # they call _load_ext() at import time and require the native .so,
-          # which is only built in the GPU stage.
+          # monitoring.selection and monitoring.ring_transport now import
+          # safely without the native .so (graceful fallback when absent).
 
       # Run the cpu-marked subset.  These tests require no CUDA device, no
       # ClickHouse instance, no vLLM runtime, no model weights, and no native
