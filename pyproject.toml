@@ -1,4 +1,10 @@
 [build-system]
+# torch must be importable at build time for include/lib path detection.
+# Always install with --no-build-isolation:
+#   pip install torch          # install CUDA torch first
+#   pip install . --no-build-isolation
+#
+# System requirements: build-essential, cmake, nvcc (CUDA toolkit).
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 

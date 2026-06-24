@@ -45,15 +45,12 @@ jobs:
 
       # Install the package itself in editable mode so `import monitoring` and
       # `import tests.*` resolve correctly.  --no-build-isolation is required
-      # because the native backend build needs torch's include/lib paths, but
-      # we skip the actual C extension here (CPU runners have no nvcc/CUDA).
+      # because setup.py reads torch's include/lib paths, but SKIP_NATIVE_BUILD
+      # tells NativeBuildExt.run() to exit early — CPU runners have no nvcc.
       - name: Install package (editable, skip native build)
-        run: |
-          pip install -e . --no-build-isolation --no-build-isolation \
-            --config-setting=--build-option=--skip-native 2>/dev/null || \
-          pip install -e . --no-build-isolation || true
-          # Fallback: direct editable install without build_ext side-effects
-          pip install -e . --no-deps --no-build-isolation
+        env:
+          SKIP_NATIVE_BUILD: "1"
+        run: pip install -e . --no-build-isolation
 
       # Smoke check: all key pure-Python modules must be importable without
       # CUDA, ClickHouse, or vLLM present.

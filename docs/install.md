@@ -1,15 +1,14 @@
 # Installation
 
 Set up DMI from a fresh clone: fetch submodules, install the Python packages,
-build the native backend, and prepare the optional ClickHouse sink.
+and let `pip` compile the native backend in one step.
 
 Tested on Linux + CUDA 12.x + Python >=3.10. A CUDA-capable GPU is required because
 Ring² is a GPU-resident capture and transport pipeline.
 
 ## 0. System prerequisites
 
-DMI builds C++/CUDA artifacts; the conda env covers Python deps but not
-system toolchains. On Debian/Ubuntu:
+DMI builds C++/CUDA artifacts. On Debian/Ubuntu:
 
 ```bash
 sudo apt-get update
@@ -38,11 +37,13 @@ The repo uses three git submodules: a fork of HuggingFace `transformers`, a fork
 of `vllm`, and the `clickhouse-cpp` C++ client.
 
 ```bash
-git clone --recursive https://github.com/ProjectDMX/DMI.git
+git clone https://github.com/ProjectDMX/DMI.git
 cd DMI
 
-# If you forgot --recursive:
-git submodule update --init --recursive
+# Initialise submodules (clickhouse-cpp is required for the native build;
+# transformers and vllm are installed separately in step 4).
+git submodule update --init --recursive libs/clickhouse-cpp
+git submodule update --init --recursive integration/transformers
 ```
 
 Expected submodule paths:
@@ -76,10 +77,6 @@ DMX_DB_DATABASE=default
 DMX_DB_TABLE=offload
 ```
 
-If captured tensors accumulate and the ClickHouse data directory grows too large
-between runs, you may want to clear old content. Refer to the ClickHouse
-documentation for the appropriate cleanup procedure.
-
 ## 3. Set up the Python environment
 
 Pick one of the two options below.
@@ -97,84 +94,74 @@ conda activate proj-dmx
 
 ### 3b. venv
 
-Install the Python `venv` module (Ubuntu/Debian):
-
-```bash
-sudo apt install python3-venv
-```
-
-Then create the environment, activate it, and install requirements:
-
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 4. Install Python packages
+## 4. Install DMI (compiles the native backend)
 
-Install the modified Transformers submodule, then DMI itself:
-
-```bash
-pip install -e integration/transformers/
-pip install -e .
-```
-
-Install vLLM only if you want the vLLM path:
+> **Build-isolation requirement** — the native backend build queries torch's
+> include/lib paths at compile time, so torch must be importable during the
+> build.  Always pass `--no-build-isolation`:
 
 ```bash
-pip install -e integration/vllm/
+# Step 4a: install a CUDA-capable torch first (skip if already installed)
+pip install torch
+
+# Step 4b: install the vendored transformers fork
+pip install -e integration/transformers --no-deps
+
+# Step 4c: build and install DMI (compiles clickhouse-cpp + native backend)
+pip install -e . --no-build-isolation
 ```
 
-This may take a while because it is a full vLLM build.
+`pip install -e . --no-build-isolation` runs `setup.py`'s `NativeBuildExt`,
+which performs these steps automatically:
 
-## 5. Build native dependencies
-
-Build the ClickHouse C++ client:
-
-```bash
-cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-cmake --build libs/clickhouse-cpp/build -j
-```
-
-Build the DMI native backend:
-
-```bash
-make -C monitoring -j
-# or simply: make
-```
+1. `git submodule update --init libs/clickhouse-cpp` (if not already done)
+2. `cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build` (configure)
+3. `cmake --build libs/clickhouse-cpp/build` (build static lib)
+4. `make -C monitoring` (compile the `.so` via nvcc + g++)
 
 Artifacts are emitted as `monitoring_native_backend.<EXT_SUFFIX>.so` at the
 project root and inside `monitoring/`.
 
-Smoke check (loads the built `.so`):
+### 4a (optional). Install the vLLM fork
+
+Only needed for the vLLM integration path:
 
 ```bash
-python -c "import monitoring; print(monitoring.__file__)"
-python -c "from monitoring._native_engine import RingConfig; print(RingConfig())"
+git submodule update --init --recursive integration/vllm
+pip install -e integration/vllm
 ```
 
-## 6. End-to-end smoke check
+This may take a while because it is a full vLLM build.
 
-Runs the visualization demo's HF offload script, captures activations into
-ClickHouse, then queries the row count:
+## 5. Smoke check
 
 ```bash
+# Verify the native backend loaded
+python -c "from monitoring._native_engine import RingConfig; print(RingConfig())"
+
+# End-to-end: capture activations into ClickHouse and query row count
 python example/visualization/run_offload_hf.py
 clickhouse-client --query "SELECT count() FROM default.offload WHERE model_id='demo_hf'"
 ```
 
-Expect the generated text on stdout and a non-zero row count.
+Expect generated text on stdout and a non-zero row count.
 
 ## Troubleshooting
 
 - **`ImportError` on `monitoring_native_backend`** — rebuild with
-  `make -C monitoring clean && make -C monitoring -j`, then confirm `pip install -e .`
-  used the active conda env.
-- **Linker errors against `libclickhouse-cpp-lib`** — rerun step 5 and confirm
-  `libs/clickhouse-cpp/build/clickhouse/` exists.
+  `make -C monitoring clean && pip install -e . --no-build-isolation`.
+  Confirm `nvcc` is on PATH and the active Python is the one that has torch.
+- **`--no-build-isolation` omitted** — if torch is not importable during the
+  build, the Makefile cannot detect include/lib paths; always pass the flag.
+- **Linker errors against `libclickhouse-cpp-lib`** — the cmake step may have
+  been skipped; delete `libs/clickhouse-cpp/build` and re-run
+  `pip install -e . --no-build-isolation`.
 - **`Connection refused` to ClickHouse** — check
   `sudo systemctl status clickhouse-server`; DMI uses TCP port `9000`, not HTTP
   port `8123`.
