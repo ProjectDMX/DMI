@@ -17,6 +17,10 @@ import torch.nn as nn
 
 try:
     from monitoring.ring_transport import HookSpec, ModelShapeConfig, RingTransport
+    # HOOK_TYPE_Q is only defined when _HOOK_DEFS is populated, i.e. the native
+    # .so loaded successfully.  Import it as a probe: if missing the backend is
+    # absent and _compute_hook_shape will raise NameError at runtime.
+    from monitoring.ring_transport import HOOK_TYPE_Q as _  # noqa: F401
     _NATIVE_IMPORT_ERROR = None
 except ImportError as exc:
     HookSpec = ModelShapeConfig = RingTransport = None
