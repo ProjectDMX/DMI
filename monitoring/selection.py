@@ -88,11 +88,14 @@ _HOOK_SELECTIONS: Dict[str, frozenset] = {
 for _name, _htype in _id_by_short.items():
     _HOOK_SELECTIONS[_name] = frozenset({_htype})
 
-# -- Aliases --
-_HOOK_SELECTIONS["hidden-states"] = _HOOK_SELECTIONS["resid_pre"]
-_HOOK_SELECTIONS["hidden_states"] = _HOOK_SELECTIONS["resid_pre"]
-_HOOK_SELECTIONS["logits"] = _HOOK_SELECTIONS["final_logits"]
-_HOOK_SELECTIONS["token-ids"] = _HOOK_SELECTIONS["token_ids"]
+# -- Aliases (only defined when the native backend populated the source keys) --
+if "resid_pre" in _HOOK_SELECTIONS:
+    _HOOK_SELECTIONS["hidden-states"] = _HOOK_SELECTIONS["resid_pre"]
+    _HOOK_SELECTIONS["hidden_states"] = _HOOK_SELECTIONS["resid_pre"]
+if "final_logits" in _HOOK_SELECTIONS:
+    _HOOK_SELECTIONS["logits"] = _HOOK_SELECTIONS["final_logits"]
+if "token_ids" in _HOOK_SELECTIONS:
+    _HOOK_SELECTIONS["token-ids"] = _HOOK_SELECTIONS["token_ids"]
 
 
 def register_preset(name: str, hook_types: frozenset) -> None:
