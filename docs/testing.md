@@ -87,18 +87,35 @@ for the ClickHouse probe, `HF_HOME` / `HF_HUB_CACHE` for the weight-cache check.
 ## Continuous integration
 
 [`.github/workflows/tests.yml`](../.github/workflows/tests.yml) wires the four
-commands into four jobs, sharing the [`setup-dmi`](../.github/actions/setup-dmi/action.yml)
-composite action (Python deps + Transformers fork + native backend build):
+commands into four jobs using the three-stage plan from #55:
 
-| Job | Trigger | Runner | Command |
-|---|---|---|---|
-| `cpu` | push / PR | `[self-hosted, linux, dmi-cpu]` | CPU default |
-| `gpu-smoke` | push / PR (after `cpu`) | `[self-hosted, linux, gpu]` | single-GPU smoke |
-| `multi-gpu` | push / PR (after `cpu`) | `[self-hosted, linux, multi-gpu]` | multi-GPU / TP |
-| `nightly` | `schedule` (07:00 UTC) / manual | `[self-hosted, linux, gpu]` | `slow or nightly` |
+| Job | Stage | Trigger | Runner | Command |
+|---|---|---|---|---|
+| `cpu` | 1 — CPU gate | push / every PR | `ubuntu-latest` (GitHub-hosted) | CPU default |
+| `gpu-smoke` | 2 — GPU regression | nightly / `run-gpu` label / manual | `[self-hosted, linux, gpu]` | single-GPU smoke |
+| `multi-gpu` | 2 — GPU regression | nightly / `run-gpu` label / manual | `[self-hosted, linux, multi-gpu]` | multi-GPU / TP |
+| `nightly` | 2 — GPU regression | `schedule` 02:00 UTC / manual | `[self-hosted, linux, gpu]` | `slow or nightly` |
 
-The GPU jobs run on self-hosted runners with CUDA devices, labelled by
-capability. Because the suites use the skip-guards above, a runner missing
-ClickHouse or model weights **skips** the affected tests with a reason rather
-than failing the job. Trigger an off-schedule full sweep with the
-**workflow_dispatch** button (the `nightly` job also runs on manual dispatch).
+**Stage 1 — CPU gate** runs on GitHub-hosted `ubuntu-latest` on every push and
+PR. It uses `SKIP_NATIVE_BUILD=1` so no `nvcc` is needed; the native `.so` is
+absent, and tests that need it must carry an `e2e` or `gpu` marker (which the
+CPU selector `-m "not gpu and not e2e and not manual"` already excludes).
+
+**Stage 2 — GPU / native regression** jobs run on Frootlab self-hosted runners
+with CUDA. They are restricted to trusted triggers to prevent fork PRs from
+executing untrusted code on the runner:
+- **`schedule`** — nightly at 02:00 UTC
+- **`workflow_dispatch`** — manual trigger via the GitHub Actions UI
+- **`pull_request` labeled `run-gpu`** — maintainer applies the label to trusted
+  internal PRs; a fork-PR check (`head.repo.full_name == github.repository`)
+  ensures the label cannot be abused by external contributors
+
+**Stage 3 — Packaging**: the [`setup-dmi`](../.github/actions/setup-dmi/action.yml)
+composite action installs DMI via `pip install -e . --no-build-isolation`
+(the Stage 3 entrypoint from `setup.py`), which internally runs cmake for
+`libs/clickhouse-cpp` and `make -C monitoring`. CI no longer calls cmake or
+make directly; the build is owned by `setup.py` `NativeBuildExt`.
+
+Because the GPU suites use the skip-guards in `tests/_requirements.py`, a runner
+missing ClickHouse or model weights **skips** the affected tests with a reason
+rather than failing the job.

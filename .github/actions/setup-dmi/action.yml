@@ -1,10 +1,9 @@
 name: "Set up DMI"
 description: >-
-  Install DMI's Python deps + the modified Transformers fork, build the
-  native backend (.so) and the ClickHouse C++ client, and (optionally) the
-  vLLM fork. Importing `monitoring` loads the prebuilt native backend at
-  import time (JIT is disabled), so the .so must be built even for the
-  CPU-only suite -- which needs nvcc to compile, but no GPU at runtime.
+  Install DMI's Python deps + the modified Transformers fork, then build and
+  install DMI via the Stage 3 pip entrypoint (pip install -e . --no-build-isolation).
+  The entrypoint calls setup.py NativeBuildExt which runs cmake + make internally.
+  Pass skip-native-build: "true" on CPU-only runners to bypass nvcc/cmake entirely.
 
 inputs:
   python-version:
@@ -13,6 +12,13 @@ inputs:
     default: "3.12"
   install-vllm:
     description: "Also install the vLLM fork (heavy; only for vLLM E2E suites)"
+    required: false
+    default: "false"
+  skip-native-build:
+    description: >-
+      Set SKIP_NATIVE_BUILD=1 so NativeBuildExt.run() exits early.
+      Use on CPU-only runners that have no nvcc. The native .so will be absent,
+      and tests that need it must be excluded via marker (not e2e and not gpu).
     required: false
     default: "false"
 
@@ -28,43 +34,44 @@ runs:
       shell: bash
       run: |
         python --version
-        nvcc --version || { echo "::error::nvcc not found -- the native backend cannot be built"; exit 1; }
         cmake --version
+        if [[ "${{ inputs.skip-native-build }}" != "true" ]]; then
+          nvcc --version || {
+            echo "::error::nvcc not found — pass skip-native-build: 'true' for CPU-only runners"
+            exit 1
+          }
+        fi
 
     - name: Install Python dependencies
       shell: bash
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pytest
 
     - name: Install the modified Transformers fork
       shell: bash
-      run: pip install -e integration/transformers/
+      run: pip install -e integration/transformers/ --no-deps
 
     - name: Install vLLM fork (optional)
       if: ${{ inputs.install-vllm == 'true' }}
       shell: bash
       run: pip install -e integration/vllm/
 
-    - name: Build the ClickHouse C++ client
+    - name: Build and install DMI (Stage 3 entrypoint)
       shell: bash
-      run: |
-        cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-        cmake --build libs/clickhouse-cpp/build -j
-
-    - name: Build the DMI native backend
-      shell: bash
-      run: make -C monitoring -j
-
-    - name: Install DMI (editable)
-      shell: bash
+      # pip install -e . --no-build-isolation calls NativeBuildExt (setup.py):
+      #   1. git submodule update --init libs/clickhouse-cpp  (if needed)
+      #   2. cmake configure + build (libclickhouse-cpp-lib.a)
+      #   3. make -C monitoring  (compile monitoring_native_backend.so via nvcc)
+      # SKIP_NATIVE_BUILD=1 short-circuits all three steps — no nvcc required.
+      env:
+        SKIP_NATIVE_BUILD: ${{ inputs.skip-native-build == 'true' && '1' || '' }}
       run: pip install -e . --no-build-isolation
 
-    - name: Smoke-check the native backend loads
+    - name: Smoke-check monitoring imports
       shell: bash
       run: |
         python -c "import monitoring; print('monitoring:', monitoring.__file__)"
-        python -c "from monitoring._native_engine import RingConfig; print(RingConfig())"
+        if [[ "${{ inputs.skip-native-build }}" != "true" ]]; then
+          python -c "from monitoring._native_engine import RingConfig; print(RingConfig())"
+        fi
