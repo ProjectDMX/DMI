@@ -1,0 +1,169 @@
+name: tests
+
+# Stage-aware CI test suite aligned with #55 three-stage plan:
+#
+#   Stage 1 — CPU PR gate:
+#     runs-on: ubuntu-latest (GitHub-hosted)
+#     Trigger: every push / pull_request
+#     No nvcc, no self-hosted risk — SKIP_NATIVE_BUILD=1 bypasses the .so build.
+#
+#   Stage 2 — GPU / native regression:
+#     runs-on: [self-hosted, linux, gpu|multi-gpu]
+#     Trigger: nightly schedule, workflow_dispatch, or 'run-gpu' label on
+#              TRUSTED (non-fork) internal PRs only.
+#     Security guard prevents fork PRs from running on Frootlab self-hosted runners.
+#
+#   Stage 3 — Packaging:
+#     Native backend compiled via `pip install -e . --no-build-isolation`
+#     (setup.py NativeBuildExt), not by manually calling cmake/make in CI.
+#     The setup-dmi composite action wraps this entrypoint.
+
+on:
+  push:
+    branches: [main, "**"]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: "0 2 * * *"   # 02:00 UTC nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Stage 1: CPU PR gate — GitHub-hosted, no GPU, no native build required
+  # --------------------------------------------------------------------------
+  cpu:
+    # Run on every push and PR (opened/sync/reopened/labeled).
+    # Skip on the nightly schedule — the nightly job is the authoritative sweep.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: cpu-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false   # vLLM fork is 3.7 GB — too heavy for CPU gate
+      - name: Init transformers submodule
+        run: git submodule update --init --depth 1 integration/transformers
+      - uses: ./.github/actions/setup-dmi
+        with:
+          skip-native-build: "true"
+      - name: CPU default suite
+        run: python -m pytest -m "not gpu and not e2e and not manual and not native_backend" -q
+
+  # --------------------------------------------------------------------------
+  # Stage 2: Single-GPU smoke — self-hosted, trusted triggers only
+  #
+  # Security: self-hosted jobs must NEVER run for fork PRs (untrusted code
+  # would execute on the Frootlab runner). Allowed triggers:
+  #   • schedule (nightly)
+  #   • workflow_dispatch (manual)
+  #   • pull_request labeled 'run-gpu' AND head is this repo (non-fork)
+  # --------------------------------------------------------------------------
+  gpu-smoke:
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'pull_request' &&
+        github.event.label.name == 'run-gpu' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 60
+    concurrency:
+      group: gpu-smoke-${{ github.ref }}
+      cancel-in-progress: false   # don't kill a running GPU test mid-flight
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Init submodules (transformers + clickhouse-cpp)
+        run: |
+          git submodule update --init --recursive integration/transformers
+          git submodule update --init --recursive libs/clickhouse-cpp
+      - uses: ./.github/actions/setup-dmi
+      - name: Single-GPU smoke suite
+        # Exit code 5 ("no tests collected") is tolerated — a hardware tier
+        # with nothing marked yet is not a failure.
+        run: |
+          set +e
+          python -m pytest -m "gpu and not multi_gpu and not slow" -q
+          rc=$?
+          if [ "$rc" -eq 5 ]; then echo "::notice::no single-GPU tests collected"; exit 0; fi
+          exit $rc
+
+  # --------------------------------------------------------------------------
+  # Stage 2: Multi-GPU / TP — self-hosted, same trusted-trigger guard
+  # --------------------------------------------------------------------------
+  multi-gpu:
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'pull_request' &&
+        github.event.label.name == 'run-gpu' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: [self-hosted, linux, multi-gpu]
+    timeout-minutes: 90
+    concurrency:
+      group: multi-gpu-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Init submodules (transformers + clickhouse-cpp)
+        run: |
+          git submodule update --init --recursive integration/transformers
+          git submodule update --init --recursive libs/clickhouse-cpp
+      - uses: ./.github/actions/setup-dmi
+      - name: Multi-GPU / TP suite
+        # multi_gpu currently selects zero tests (TP tests land in a later
+        # phase). Exit code 5 is tolerated.
+        run: |
+          set +e
+          python -m pytest -m "multi_gpu" -q
+          rc=$?
+          if [ "$rc" -eq 5 ]; then echo "::notice::no multi_gpu tests collected"; exit 0; fi
+          exit $rc
+
+  # --------------------------------------------------------------------------
+  # Nightly: full sweep — schedule / workflow_dispatch only
+  # --------------------------------------------------------------------------
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 180
+    concurrency:
+      group: nightly-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Init submodules (transformers + clickhouse-cpp + vllm)
+        run: |
+          git submodule update --init --recursive integration/transformers
+          git submodule update --init --recursive libs/clickhouse-cpp
+          git submodule update --init --recursive integration/vllm
+      - uses: ./.github/actions/setup-dmi
+        with:
+          install-vllm: "true"
+      - name: Full / nightly sweep
+        # Exit code 5 ("no tests collected") is tolerated for an empty selection.
+        run: |
+          set +e
+          python -m pytest -m "slow or nightly" -q
+          rc=$?
+          if [ "$rc" -eq 5 ]; then echo "::notice::no slow/nightly tests collected"; exit 0; fi
+          exit $rc
