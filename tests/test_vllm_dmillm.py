@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("vllm")  # vllm_adapter imports vllm at module load
+pytest.importorskip("integration.vllm_adapter")  # vllm lazy-loads; guard the real import
 
 from integration.vllm_adapter import _attach_dmi_internal, normalize_vllm_request_id
 

@@ -16,21 +16,39 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 # universe of hooks; selection policy lives here.  Module-level (not lazy)
 # matches the existing pattern -- ring_transport's import already loads the
 # native extension, and selection is only meaningful with hooks loaded.
+#
+# The always-defined names (_id_by_short, frozensets) are safe to import
+# unconditionally.  HOOK_TYPE_* constants only exist when the native .so was
+# loaded successfully; guard with try/except so pure-Python callers (e.g.
+# tests that monkeypatch the implementation) can import this module without
+# the native backend present.
 from .ring_transport import (
     _id_by_short,
     _ATTN_WT_TYPES,
-    HOOK_TYPE_RESID_PRE,
-    HOOK_TYPE_FINAL_LN,
-    HOOK_TYPE_PATTERN,
-    HOOK_TYPE_FINAL_LOGITS,
-    HOOK_TYPE_MLP_POST,
-    HOOK_TYPE_ROUTER_LOGITS,
-    HOOK_TYPE_TOPK_IDS,
-    HOOK_TYPE_TOPK_WEIGHTS,
     PP_FIRST_ONLY,
     PP_LAST_ONLY,
     TP_SHARDED_TYPES,
 )
+try:
+    from .ring_transport import (
+        HOOK_TYPE_RESID_PRE,
+        HOOK_TYPE_FINAL_LN,
+        HOOK_TYPE_PATTERN,
+        HOOK_TYPE_FINAL_LOGITS,
+        HOOK_TYPE_MLP_POST,
+        HOOK_TYPE_ROUTER_LOGITS,
+        HOOK_TYPE_TOPK_IDS,
+        HOOK_TYPE_TOPK_WEIGHTS,
+    )
+except ImportError:
+    # Native backend not available; sentinel values are never equal to a real
+    # hook-type int, so selection logic degrades gracefully.  Code that
+    # actually calls apply_hook_selection / resolve_hook_selection still
+    # requires the native extension and will get an empty preset table.
+    HOOK_TYPE_RESID_PRE = HOOK_TYPE_FINAL_LN = None
+    HOOK_TYPE_PATTERN = HOOK_TYPE_FINAL_LOGITS = None
+    HOOK_TYPE_MLP_POST = HOOK_TYPE_ROUTER_LOGITS = None
+    HOOK_TYPE_TOPK_IDS = HOOK_TYPE_TOPK_WEIGHTS = None
 
 if TYPE_CHECKING:
     from .ring_transport import HookSpec, ModelShapeConfig
@@ -70,11 +88,14 @@ _HOOK_SELECTIONS: Dict[str, frozenset] = {
 for _name, _htype in _id_by_short.items():
     _HOOK_SELECTIONS[_name] = frozenset({_htype})
 
-# -- Aliases --
-_HOOK_SELECTIONS["hidden-states"] = _HOOK_SELECTIONS["resid_pre"]
-_HOOK_SELECTIONS["hidden_states"] = _HOOK_SELECTIONS["resid_pre"]
-_HOOK_SELECTIONS["logits"] = _HOOK_SELECTIONS["final_logits"]
-_HOOK_SELECTIONS["token-ids"] = _HOOK_SELECTIONS["token_ids"]
+# -- Aliases (only defined when the native backend populated the source keys) --
+if "resid_pre" in _HOOK_SELECTIONS:
+    _HOOK_SELECTIONS["hidden-states"] = _HOOK_SELECTIONS["resid_pre"]
+    _HOOK_SELECTIONS["hidden_states"] = _HOOK_SELECTIONS["resid_pre"]
+if "final_logits" in _HOOK_SELECTIONS:
+    _HOOK_SELECTIONS["logits"] = _HOOK_SELECTIONS["final_logits"]
+if "token_ids" in _HOOK_SELECTIONS:
+    _HOOK_SELECTIONS["token-ids"] = _HOOK_SELECTIONS["token_ids"]
 
 
 def register_preset(name: str, hook_types: frozenset) -> None:

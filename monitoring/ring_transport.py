@@ -53,10 +53,13 @@ from torch import nn
 # To add a new hook: add one enum value + one HOOK_DEFS row in C++. Done.
 # ---------------------------------------------------------------------------
 from ._native_engine import _load_extension as _load_ext
-_ext = _load_ext()
+try:
+    _ext = _load_ext()
+except ImportError:
+    _ext = None
 # (id, act_name, short_name, per_layer, group, tp_sharded, shape_class, pp_stage)
 # group/shape_class/pp_stage are int enums matching the C++ definitions.
-_HOOK_DEFS = _ext.HOOK_DEFS
+_HOOK_DEFS: list = _ext.HOOK_DEFS if _ext is not None else []
 
 # C++ enum mirrors -- keep in sync with tensor_meta.h
 GROUP_ATTN, GROUP_MLP, GROUP_OTHER = 0, 1, 2
