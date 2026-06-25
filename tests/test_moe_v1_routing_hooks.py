@@ -4,20 +4,23 @@ import json
 
 import pytest
 
-from transformers import Qwen2MoeConfig
-from transformers.models.qwen2_moe_compare.modeling_qwen2_moe import CompareQwen2MoeForCausalLM
-from transformers.models.qwen2_moe_p.modeling_qwen2_moe import HookedQwen2MoeForCausalLM
+try:
+    from transformers import Qwen2MoeConfig
+    from transformers.models.qwen2_moe_compare.modeling_qwen2_moe import CompareQwen2MoeForCausalLM
+    from transformers.models.qwen2_moe_p.modeling_qwen2_moe import HookedQwen2MoeForCausalLM
 
-from integration.model_shape import _make_model_shape_from_hf_config
-from monitoring.ring_transport import (
-    HOOK_TYPE_ROUTER_LOGITS,
-    HOOK_TYPE_TOPK_IDS,
-    HOOK_TYPE_TOPK_WEIGHTS,
-    _compute_hook_shape,
-    _id_by_short,
-)
+    from integration.model_shape import _make_model_shape_from_hf_config
+    from monitoring.ring_transport import (
+        HOOK_TYPE_ROUTER_LOGITS,
+        HOOK_TYPE_TOPK_IDS,
+        HOOK_TYPE_TOPK_WEIGHTS,
+        _compute_hook_shape,
+        _id_by_short,
+    )
+except ImportError as exc:
+    pytest.skip(f"modified framework forks required: {exc}", allow_module_level=True)
 
-pytestmark = pytest.mark.cpu
+pytestmark = pytest.mark.framework_fork
 
 
 def test_moe_v1_routing_hook_types_registered() -> None:
