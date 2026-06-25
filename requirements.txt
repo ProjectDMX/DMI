@@ -26,6 +26,7 @@ matplotlib>=3.10.0
 seaborn>=0.13.0
 
 # Utilities
+regex>=2023.12.25
 tqdm>=4.67.0
 rich>=14.0.0
 pydantic>=2.11.0
