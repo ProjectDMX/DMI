@@ -14,8 +14,7 @@
 > **hallucination analysis**, **distillation**, **activation steering**, and beyond. If you're interested, please [contact us](mailto:ynn1999@umd.edu,sixianx@umd.edu,zaoxing@umd.edu).
 
 > **Project Status — research preview.** DMI currently supports HuggingFace
-> and vLLM backends for Qwen3 / Llama3.1 and GPT-2-family experiments, with Ring² transport
-> and optional host-side persistence. APIs may change. Contributions, bug
+> and vLLM backends for Qwen3 / Llama3.1 and GPT-2-family. SGLang support is on the way. APIs may change. Contributions, bug
 > reports, and feature requests are welcome.
 
 ---
