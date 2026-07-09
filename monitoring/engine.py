@@ -185,21 +185,20 @@ class MonitoringEngine:
         ):
             host_cpp = self._host_engine
 
-        ring_engine = _native_engine.RingEngine(ring_config, host_cpp)
-
-        ring_engine.init()
-        ring_engine.start()
-
-        transport = _rt.RingTransport(ring_engine)
-        if model_shape is not None:
-            transport.set_model_cfg(model_shape)
-
         gov_cfg = (
             pcie_governor_config
             if pcie_governor_config is not None
             else self._pcie_governor_config
         )
+        ring_engine = _native_engine.RingEngine(ring_config, host_cpp)
         try:
+            ring_engine.init()
+            ring_engine.start()
+
+            transport = _rt.RingTransport(ring_engine)
+            if model_shape is not None:
+                transport.set_model_cfg(model_shape)
+
             from .governor import PCIeGovernor, set_current
 
             if gov_cfg is not None and bool(getattr(gov_cfg, "enabled", False)):
@@ -211,19 +210,26 @@ class MonitoringEngine:
                 set_current(None)
                 if hasattr(ring_engine, "set_drain_control"):
                     ring_engine.set_drain_control(0, 0, 0)
+            _rt.activate(transport)
         except Exception:
             try:
-                transport.set_governor(None)
-                if hasattr(ring_engine, "set_drain_control"):
-                    ring_engine.set_drain_control(0, 0, 0)
+                from .governor import set_current
+
+                set_current(None)
+            except Exception:
+                pass
+            try:
+                _rt.deactivate()
+            except Exception:
+                pass
+            try:
+                ring_engine.stop()
             except Exception:
                 pass
             raise
 
         self._ring_engine = ring_engine
         self._ring_transport = transport
-
-        _rt.activate(transport)
         return transport
 
     # ------------------------------------------------------------------

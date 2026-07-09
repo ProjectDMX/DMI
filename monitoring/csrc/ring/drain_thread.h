@@ -26,6 +26,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace ring {
@@ -87,6 +88,8 @@ private:
     PinnedStaging&  staging_;
     RingConfig      cfg_;
     cudaStream_t    stream_{};
+    cudaEvent_t     probe_start_event_{};
+    cudaEvent_t     probe_end_event_{};
 
     std::thread             thread_;
     std::mutex              mu_;
@@ -148,8 +151,10 @@ private:
     // Called under mgmt_mu_:
     void scan_ready();
     bool should_flush() const;
+    std::pair<uint64_t, uint64_t> select_flush_batch(uint64_t max_bytes) const;
     void flush_state_update(uint64_t flush_count, uint64_t flush_bytes);
 
+    void flush_batch(uint64_t flush_count, uint64_t flush_bytes);
     void sync_stream();
     void enqueue_d2h(uint64_t flush_bytes);
     void record_d2h_batch(uint64_t flush_bytes,
@@ -158,9 +163,8 @@ private:
                           uint64_t event_elapsed_us);
     uint64_t normal_batch_limit() const;
 
-    // Split into two: submit_to_p2p pushes DrainTasks to the p2p queue
-    // (uses queue_mu_/pop_mu_, NOT mgmt_mu_).  trim_scanned updates
-    // scanned_/pending state (caller MUST hold mgmt_mu_).
+    // submit_to_p2p commits the staging head before publishing DrainTasks.
+    // trim_scanned updates scanned_/pending state (caller MUST hold mgmt_mu_).
     void submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes);
     void trim_scanned(uint64_t flush_count, uint64_t flush_bytes);
 };

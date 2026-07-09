@@ -165,10 +165,27 @@ class BackendAdaptor(abc.ABC):
         # active-spec list is empty or every shape was empty.
         if n_hooks > 0:
             result = self.ring_engine.prepare_step(total_bytes, n_hooks)
+            self.transport.force_eager = (result == 2) or needs_eager
             governor = getattr(self.transport, "governor", None)
             if governor is not None:
-                governor.on_step()
-            self.transport.force_eager = (result == 2) or needs_eager
+                try:
+                    governor.on_step()
+                except Exception:
+                    try:
+                        governor.disable()
+                    except Exception:
+                        pass
+                    try:
+                        self.transport.set_governor(None)
+                    except Exception:
+                        pass
+                    try:
+                        from .governor import get_current, set_current
+
+                        if get_current() is governor:
+                            set_current(None)
+                    except Exception:
+                        pass
             if result == 2:
                 ctx = self.adapt_for_cpu_direct(ctx)
                 self.on_capacity_exceeded(ctx)

@@ -14,8 +14,10 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <tuple>
 
 namespace ring {
 
@@ -34,12 +36,27 @@ DrainThread::DrainThread(RingState& rs, PinnedStaging& staging,
                          const RingConfig& cfg)
     : ring_(rs), staging_(staging), cfg_(cfg)
 {
-    if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess)
+    if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
         throw std::runtime_error("DrainThread: cudaStreamCreate failed");
+    }
+    if (cudaEventCreate(&probe_start_event_) != cudaSuccess) {
+        cudaStreamDestroy(stream_);
+        stream_ = {};
+        throw std::runtime_error("DrainThread: probe start event creation failed");
+    }
+    if (cudaEventCreate(&probe_end_event_) != cudaSuccess) {
+        cudaEventDestroy(probe_start_event_);
+        probe_start_event_ = {};
+        cudaStreamDestroy(stream_);
+        stream_ = {};
+        throw std::runtime_error("DrainThread: probe end event creation failed");
+    }
 }
 
 DrainThread::~DrainThread() noexcept {
     stop();
+    if (probe_start_event_) cudaEventDestroy(probe_start_event_);
+    if (probe_end_event_) cudaEventDestroy(probe_end_event_);
     cudaStreamDestroy(stream_);
 }
 
@@ -102,7 +119,11 @@ std::map<std::string, uint64_t> DrainThread::link_stats() {
     uint64_t staging_used_bytes = 0;
     {
         std::lock_guard<std::mutex> lk(staging_mu_);
-        staging_used_bytes = staging_.capacity() - staging_.free_bytes();
+        const uint64_t head = staging_.head();
+        const uint64_t tail = staging_.tail();
+        assert(head >= tail);
+        assert(head - tail <= staging_.capacity());
+        staging_used_bytes = head - tail;
     }
 
     return {
@@ -118,6 +139,9 @@ std::map<std::string, uint64_t> DrainThread::link_stats() {
         {"payload_reserved_bytes", payload_reserved_bytes},
         {"task_reserved_entries", task_reserved_entries},
         {"staging_used_bytes", staging_used_bytes},
+        {"payload_cap", ring_.payload_cap},
+        {"task_cap", ring_.task_cap},
+        {"staging_cap", staging_.capacity()},
         {"defer_until_ns", defer_until_ns_.load(std::memory_order_relaxed)},
         {"max_d2h_chunk_bytes", max_d2h_chunk_bytes_.load(std::memory_order_relaxed)},
         {"hard_watermark_bytes", hard_watermark_bytes_.load(std::memory_order_relaxed)},
@@ -242,53 +266,12 @@ void DrainThread::do_full_flush() {
             std::lock_guard<std::mutex> lk(mgmt_mu_);
             scan_ready();
             if (pending_entries_ == 0) break;
-            for (size_t i = 0; i < scanned_.size(); ++i) {
-                uint64_t ab = align_up(scanned_[i].tensor_total_bytes, PAYLOAD_ALIGN);
-                if (flush_bytes + ab > staging_.capacity()) break;
-                flush_bytes += ab;
-                flush_count++;
-            }
+            std::tie(flush_count, flush_bytes) =
+                select_flush_batch(staging_.capacity());
             if (flush_count == 0) break;
             flush_state_update(flush_count, flush_bytes);
         }
-        {
-            std::unique_lock<std::mutex> lk(staging_mu_);
-            staging_cv_.wait(lk, [&] { return staging_.free_bytes() >= flush_bytes; });
-        }
-        const bool collect_probe = flush_bytes >= kProbeMinBytes;
-        cudaEvent_t ev_start{}, ev_end{};
-        if (collect_probe) {
-            cudaEventCreate(&ev_start);
-            cudaEventCreate(&ev_end);
-            cudaEventRecord(ev_start, stream_);
-        }
-        const auto host_start = std::chrono::steady_clock::now();
-        enqueue_d2h(flush_bytes);
-        if (collect_probe) {
-            cudaEventRecord(ev_end, stream_);
-        }
-        sync_stream();
-        const auto host_end = std::chrono::steady_clock::now();
-        uint64_t event_us = 0;
-        if (collect_probe) {
-            float event_ms = 0.0f;
-            if (cudaEventElapsedTime(&event_ms, ev_start, ev_end) == cudaSuccess) {
-                event_us = static_cast<uint64_t>(event_ms * 1000.0f);
-            }
-            cudaEventDestroy(ev_start);
-            cudaEventDestroy(ev_end);
-        }
-        record_d2h_batch(flush_bytes, collect_probe,
-                         elapsed_us(host_start, host_end), event_us);
-        {
-            std::lock_guard<std::mutex> lk(mgmt_mu_);
-            cpu_payload_tail_committed_ = cpu_payload_tail_;
-        }
-        submit_to_p2p(flush_count, flush_bytes);
-        {
-            std::lock_guard<std::mutex> lk(mgmt_mu_);
-            trim_scanned(flush_count, flush_bytes);
-        }
+        flush_batch(flush_count, flush_bytes);
     }
 }
 
@@ -332,25 +315,13 @@ void DrainThread::loop() {
             scan_ready();
 
             if (should_flush()) {
-                for (size_t i = 0; i < scanned_.size(); ++i) {
-                    uint64_t ab = align_up(scanned_[i].tensor_total_bytes, PAYLOAD_ALIGN);
-                    const uint64_t limit = normal_batch_limit();
-                    if (flush_count > 0 && flush_bytes + ab > limit) break;
-                    if (flush_count == 0 && ab > limit && ab <= staging_.capacity()) {
-                        flush_bytes += ab;
-                        flush_count++;
-                        break;
-                    }
-                    if (flush_bytes + ab > limit) break;
-                    flush_bytes += ab;
-                    flush_count++;
-                }
+                std::tie(flush_count, flush_bytes) =
+                    select_flush_batch(normal_batch_limit());
                 if (flush_count > 0) {
                     RING_DBG("[drain_flush] iter=%lu flush_count=%lu flush_bytes=%lu "
-                            "pending=%lu staging_free=%lu\n",
+                            "pending=%lu\n",
                             (unsigned long)loop_iter, (unsigned long)flush_count,
-                            (unsigned long)flush_bytes, (unsigned long)pending_entries_,
-                            (unsigned long)staging_.free_bytes());
+                            (unsigned long)flush_bytes, (unsigned long)pending_entries_);
 
                     flush_state_update(flush_count, flush_bytes);
                     needs_flush = true;
@@ -359,49 +330,7 @@ void DrainThread::loop() {
         }
 
         if (needs_flush) {
-            {
-                std::unique_lock<std::mutex> lk(staging_mu_);
-                staging_cv_.wait(lk, [&] {
-                    return staging_.free_bytes() >= flush_bytes;
-                });
-            }
-
-            const bool collect_probe = flush_bytes >= kProbeMinBytes;
-            cudaEvent_t ev_start{}, ev_end{};
-            if (collect_probe) {
-                cudaEventCreate(&ev_start);
-                cudaEventCreate(&ev_end);
-                cudaEventRecord(ev_start, stream_);
-            }
-            const auto host_start = std::chrono::steady_clock::now();
-            enqueue_d2h(flush_bytes);
-            if (collect_probe) {
-                cudaEventRecord(ev_end, stream_);
-            }
-            sync_stream();
-            const auto host_end = std::chrono::steady_clock::now();
-            uint64_t event_us = 0;
-            if (collect_probe) {
-                float event_ms = 0.0f;
-                if (cudaEventElapsedTime(&event_ms, ev_start, ev_end) == cudaSuccess) {
-                    event_us = static_cast<uint64_t>(event_ms * 1000.0f);
-                }
-                cudaEventDestroy(ev_start);
-                cudaEventDestroy(ev_end);
-            }
-            record_d2h_batch(flush_bytes, collect_probe,
-                             elapsed_us(host_start, host_end), event_us);
-
-            {
-                std::lock_guard<std::mutex> lk(mgmt_mu_);
-                cpu_payload_tail_committed_ = cpu_payload_tail_;
-            }
-
-            submit_to_p2p(flush_count, flush_bytes);
-            {
-                std::lock_guard<std::mutex> lk(mgmt_mu_);
-                trim_scanned(flush_count, flush_bytes);
-            }
+            flush_batch(flush_count, flush_bytes);
         }
 
         {
@@ -458,11 +387,29 @@ bool DrainThread::should_flush() const {
     if (fe >= task_cap) return true;
     if (fb >= payload_cap) return true;
 
+    // Occupancy ratios remain safety triggers while deferred.  In particular,
+    // the task ring can fill independently of payload bytes for small entries.
+    if (fc.task_ratio > 0.0f &&
+        fe >= static_cast<uint64_t>(fc.task_ratio * task_cap)) return true;
+    if (fc.payload_ratio > 0.0f &&
+        fb >= static_cast<uint64_t>(fc.payload_ratio * payload_cap)) return true;
+
     const uint64_t hard_watermark =
         hard_watermark_bytes_.load(std::memory_order_relaxed);
-    if (hard_watermark > 0 &&
-        (cpu_payload_head_ - cpu_payload_tail_committed_) >= hard_watermark) {
-        return true;
+    if (hard_watermark > 0) {
+        const uint64_t payload_reserved =
+            cpu_payload_head_ - cpu_payload_tail_committed_;
+        const uint64_t task_reserved = cpu_task_head_ - cpu_task_tail_;
+        const long double hard_ratio = std::min<long double>(
+            1.0L,
+            static_cast<long double>(hard_watermark) /
+                static_cast<long double>(payload_cap));
+        const uint64_t hard_task_watermark = std::max<uint64_t>(
+            1, static_cast<uint64_t>(std::ceil(hard_ratio * task_cap)));
+        if (payload_reserved >= hard_watermark ||
+            task_reserved >= hard_task_watermark) {
+            return true;
+        }
     }
 
     const uint64_t defer_until =
@@ -471,10 +418,6 @@ bool DrainThread::should_flush() const {
         return false;
     }
 
-    if (fc.task_ratio > 0.0f &&
-        fe >= static_cast<uint64_t>(fc.task_ratio * task_cap)) return true;
-    if (fc.payload_ratio > 0.0f &&
-        fb >= static_cast<uint64_t>(fc.payload_ratio * payload_cap)) return true;
     if (fc.entry_threshold > 0 && fe >= fc.entry_threshold) return true;
     if (fc.byte_threshold > 0 && fb >= fc.byte_threshold) return true;
     if (fc.timeout_us > 0 && has_complete_time_) {
@@ -487,6 +430,30 @@ bool DrainThread::should_flush() const {
 }
 
 // ---------------------------------------------------------------------------
+std::pair<uint64_t, uint64_t>
+DrainThread::select_flush_batch(uint64_t max_bytes) const {
+    uint64_t flush_count = 0;
+    uint64_t flush_bytes = 0;
+    const uint64_t limit = std::min(max_bytes, staging_.capacity());
+
+    for (const auto& entry : scanned_) {
+        const uint64_t alloc_bytes =
+            align_up(entry.tensor_total_bytes, PAYLOAD_ALIGN);
+        if (flush_count == 0 && alloc_bytes > limit) {
+            if (alloc_bytes <= staging_.capacity()) {
+                flush_count = 1;
+                flush_bytes = alloc_bytes;
+            }
+            break;
+        }
+        if (flush_bytes + alloc_bytes > limit) break;
+        flush_bytes += alloc_bytes;
+        ++flush_count;
+    }
+    return {flush_count, flush_bytes};
+}
+
+// ---------------------------------------------------------------------------
 // flush_state_update -- CPU-only state changes under mgmt_mu_.
 // ---------------------------------------------------------------------------
 void DrainThread::flush_state_update(uint64_t flush_count, uint64_t flush_bytes) {
@@ -495,6 +462,46 @@ void DrainThread::flush_state_update(uint64_t flush_count, uint64_t flush_bytes)
         ++cpu_task_tail_;
     }
     cpu_payload_tail_ += flush_bytes;
+}
+
+void DrainThread::flush_batch(uint64_t flush_count, uint64_t flush_bytes) {
+    if (flush_count == 0) return;
+
+    {
+        std::unique_lock<std::mutex> lk(staging_mu_);
+        staging_cv_.wait(lk, [&] {
+            return staging_.free_bytes() >= flush_bytes;
+        });
+    }
+
+    const bool collect_probe = flush_bytes >= kProbeMinBytes;
+    if (collect_probe) cudaEventRecord(probe_start_event_, stream_);
+    const auto host_start = std::chrono::steady_clock::now();
+    enqueue_d2h(flush_bytes);
+    if (collect_probe) cudaEventRecord(probe_end_event_, stream_);
+    sync_stream();
+    const auto host_end = std::chrono::steady_clock::now();
+
+    uint64_t event_us = 0;
+    if (collect_probe) {
+        float event_ms = 0.0f;
+        if (cudaEventElapsedTime(
+                &event_ms, probe_start_event_, probe_end_event_) == cudaSuccess) {
+            event_us = static_cast<uint64_t>(event_ms * 1000.0f);
+        }
+    }
+    record_d2h_batch(flush_bytes, collect_probe,
+                     elapsed_us(host_start, host_end), event_us);
+
+    {
+        std::lock_guard<std::mutex> lk(mgmt_mu_);
+        cpu_payload_tail_committed_ = cpu_payload_tail_;
+    }
+    submit_to_p2p(flush_count, flush_bytes);
+    {
+        std::lock_guard<std::mutex> lk(mgmt_mu_);
+        trim_scanned(flush_count, flush_bytes);
+    }
 }
 
 void DrainThread::sync_stream() {
@@ -562,12 +569,17 @@ void DrainThread::enqueue_d2h(uint64_t flush_bytes) {
 }
 
 // ---------------------------------------------------------------------------
-// submit_to_p2p -- push DrainTasks to p2p queue.  Uses queue_mu_/pop_mu_
-// only (NOT mgmt_mu_).  Safe to call with or without mgmt_mu_ held.
+// submit_to_p2p -- commit staging occupancy, then publish DrainTasks.
+// Does not use mgmt_mu_; safe to call with or without it held.
 // ---------------------------------------------------------------------------
 void DrainThread::submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes) {
     uint64_t cumulative = 0;
-    const uint64_t staging_batch_start = staging_.head();
+    uint64_t staging_batch_start = 0;
+    {
+        std::lock_guard<std::mutex> lk(staging_mu_);
+        staging_batch_start = staging_.head();
+        staging_.advance_head(flush_bytes);
+    }
 
     for (uint64_t i = 0; i < flush_count; ++i) {
         const TaskEntry& ec = scanned_[i];
@@ -605,8 +617,6 @@ void DrainThread::submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes) {
         }
         pop_cv_.notify_one();
     }
-
-    staging_.advance_head(flush_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -619,11 +629,7 @@ void DrainThread::trim_scanned(uint64_t flush_count, uint64_t flush_bytes) {
     }
     pending_entries_ -= flush_count;
     pending_bytes_   -= flush_bytes;
-    has_complete_time_ = false;
-    if (pending_entries_ > 0) {
-        first_complete_time_ = std::chrono::steady_clock::now();
-        has_complete_time_ = true;
-    }
+    if (pending_entries_ == 0) has_complete_time_ = false;
 }
 
 }  // namespace ring

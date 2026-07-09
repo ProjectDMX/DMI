@@ -325,7 +325,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ring_py::RingEnginePy::set_defer_until_ns,
            py::arg("defer_until_ns"))
       .def("link_stats",
-           &ring_py::RingEnginePy::link_stats)
+           &ring_py::RingEnginePy::link_stats,
+           py::call_guard<py::gil_scoped_release>())
       .def("push_all_metas",
            [](ring_py::RingEnginePy& self,
               py::list hook_types_py,

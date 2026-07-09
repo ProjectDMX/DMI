@@ -62,15 +62,22 @@ class FakeTransport:
     def set_model_cfg(self, cfg):
         self._model_cfg = cfg
 
+    def set_governor(self, governor):
+        self.governor = governor
+
 
 class FakeRingEngine:
     def __init__(self, prepare_step_result: int = 0) -> None:
         self._result = prepare_step_result
         self.prepare_step_calls: list = []
+        self.drain_control_calls: list = []
 
     def prepare_step(self, total_bytes: int, n_hooks: int) -> int:
         self.prepare_step_calls.append((total_bytes, n_hooks))
         return self._result
+
+    def set_drain_control(self, *control) -> None:
+        self.drain_control_calls.append(control)
 
 
 class FakeEngine:
@@ -85,6 +92,17 @@ class FakeGovernor:
 
     def on_step(self) -> None:
         self.on_step_calls += 1
+
+
+class RaisingGovernor:
+    def __init__(self) -> None:
+        self.disabled = False
+
+    def on_step(self) -> None:
+        raise RuntimeError("synthetic governor failure")
+
+    def disable(self) -> None:
+        self.disabled = True
 
 
 class StubAdaptor(BackendAdaptor):
@@ -254,6 +272,22 @@ def test_governor_on_step_runs_after_prepare_step_without_force_eager_change():
     assert governor.on_step_calls == 1
     assert a.ring_engine.prepare_step_calls == [(1024, 3)]
     assert a.transport.force_eager is False
+
+
+def test_governor_failure_is_fail_open_and_does_not_abort_serving_step():
+    ctx = _make_ctx()
+    engine = FakeEngine(prepare_step_result=2)
+    governor = RaisingGovernor()
+    engine._ring_transport.governor = governor
+    a = StubAdaptor(engine, "test_model", ctx)
+
+    a.before_forward("raw")
+
+    assert governor.disabled is True
+    assert a.transport.governor is None
+    assert a.transport.force_eager is True
+    assert a.adapt_for_cpu_direct_calls == [ctx]
+    assert len(a.transport.pre_push_all_metas_calls) == 1
 
 
 def test_n_hooks_zero_skips_prepare_step():

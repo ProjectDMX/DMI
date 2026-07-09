@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 @dataclass(frozen=True)
@@ -90,25 +90,33 @@ class PCIeGovernor:
     ``set_drain_control()``, ``set_defer_until_ns()``, and ``link_stats()``.
     """
 
-    _COARSE_TRUSTED_SOURCES = frozenset(
+    _COARSE_TRUSTED_D2H_SOURCES = frozenset(
         {
             "kv_store",
-            "kv_load",
             "lmcache_store",
-            "lmcache_load",
             "offloading_store",
-            "offloading_load",
         }
     )
 
-    def __init__(self, engine: Any, config: PCIeGovernorConfig) -> None:
+    def __init__(
+        self,
+        engine: Any,
+        config: PCIeGovernorConfig,
+        *,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
         self.engine = engine
         self.config = config
+        self._clock_ns = clock_ns
 
         self._hint_deadline_ns = 0
+        self._hint_deadlines_ns: dict[str, int] = {}
         self._feedback_deadline_ns = 0
+        self._feedback_active = False
         self._last_written_defer_ns = 0
         self._last_stats: Optional[dict[str, int]] = None
+        self._window_started_ns = 0
+        self._disabled = False
 
         self._baseline_gbps = float(config.baseline_gbps or 0.0)
         self._ewma_pressure = 0.0
@@ -122,7 +130,9 @@ class PCIeGovernor:
         self.defer_writes = 0
 
         self._max_defer_ns = int(config.max_defer_us) * 1_000
-        self._feedback_window_ns = int(config.feedback_window_ms) * 1_000_000
+        self._feedback_window_ns = max(
+            1, int(config.feedback_window_ms) * 1_000_000
+        )
         debug_env = os.environ.get("DMX_PCIE_GOVERNOR_DEBUG")
         self._debug = bool(
             config.debug
@@ -139,42 +149,63 @@ class PCIeGovernor:
     def on_hint(self, hint: PCIeHint) -> None:
         """Accept a serving-side hint and immediately update C++ defer state."""
 
-        now = time.monotonic_ns()
+        if self._disabled:
+            return
+
+        now = self._clock_ns()
+        source = str(hint.source or "")
+        ending = hint.valid_until_ns > 0 and hint.valid_until_ns <= now
+        self._expire_hint_deadlines(now)
         self.hints_seen += 1
 
-        if not self._hint_is_relevant(hint):
+        if not self._hint_is_relevant(hint) and not (
+            ending and source in self._hint_deadlines_ns
+        ):
             self.hints_ignored += 1
             self._debug_log("ignore_hint", hint=hint)
             return
 
         self.hints_accepted += 1
-        if hint.valid_until_ns > 0 and hint.valid_until_ns <= now:
-            self._hint_deadline_ns = 0
+        if ending:
+            self._hint_deadlines_ns.pop(source, None)
         else:
             requested = (
                 int(hint.valid_until_ns)
                 if hint.valid_until_ns > now
                 else now + self._max_defer_ns
             )
-            self._hint_deadline_ns = min(requested, now + self._max_defer_ns)
+            self._hint_deadlines_ns[source] = min(
+                requested, now + self._max_defer_ns
+            )
 
+        self._refresh_hint_deadline()
         self._write_defer(now)
         self._debug_log("hint", hint=hint, hint_deadline_ns=self._hint_deadline_ns)
 
     def on_step(self) -> None:
         """Run feedback control once at the serving step boundary."""
 
-        now = time.monotonic_ns()
-        stats = self.engine.link_stats()
-        stats = {str(k): int(v) for k, v in stats.items()}
+        if self._disabled:
+            return
 
-        if self._hint_deadline_ns <= now:
-            self._hint_deadline_ns = 0
+        now = self._clock_ns()
+        self._expire_hint_deadlines(now)
         if self._feedback_deadline_ns <= now:
             self._feedback_deadline_ns = 0
 
+        if (
+            self._last_stats is not None
+            and now - self._window_started_ns < self._feedback_window_ns
+        ):
+            self._write_defer(now)
+            return
+
+        stats = self.engine.link_stats()
+        stats = {str(k): int(v) for k, v in stats.items()}
+
         if self._last_stats is None:
             self._last_stats = stats
+            self._window_started_ns = now
             self._write_defer(now)
             return
 
@@ -194,21 +225,41 @@ class PCIeGovernor:
                 self._ewma_pressure = pressure
                 pressure_observed = True
 
-        if pressure_observed and pressure > float(self.config.p_hi):
-            self._hot_windows += 1
+        is_hot = pressure_observed and pressure > float(self.config.p_hi)
+        is_clean = (
+            pressure_observed
+            and pressure < float(self.config.p_lo)
+            and stall_count == 0
+        )
+
+        if not self._feedback_active:
             self._clean_windows = 0
-            if self._hot_windows >= int(self.config.hot_windows_to_yield):
+            self._hot_windows = self._hot_windows + 1 if is_hot else 0
+            if self._hot_windows >= max(1, int(self.config.hot_windows_to_yield)):
+                self._feedback_active = True
                 self._feedback_deadline_ns = now + 2 * self._feedback_window_ns
                 self.feedback_yields += 1
-        elif pressure_observed and pressure < float(self.config.p_lo) and stall_count == 0:
-            self._clean_windows += 1
+                self._hot_windows = 0
+        else:
             self._hot_windows = 0
-            if self._clean_windows >= int(self.config.clean_windows_to_resume):
+            if is_hot:
+                self._clean_windows = 0
+                self._feedback_deadline_ns = now + 2 * self._feedback_window_ns
+                self.feedback_yields += 1
+            elif is_clean:
+                self._clean_windows += 1
+            else:
+                self._clean_windows = 0
+
+            if self._clean_windows >= max(
+                1, int(self.config.clean_windows_to_resume)
+            ):
+                self._feedback_active = False
                 self._feedback_deadline_ns = 0
-        elif stall_count > 0:
-            self._clean_windows = 0
+                self._clean_windows = 0
 
         self._last_stats = stats
+        self._window_started_ns = now
         self._write_defer(now)
         self._debug_log(
             "step",
@@ -218,18 +269,39 @@ class PCIeGovernor:
             feedback_deadline_ns=self._feedback_deadline_ns,
         )
 
+    def disable(self) -> None:
+        """Fail open and restore the pre-governor drain controls."""
+
+        if self._disabled:
+            return
+        self._disabled = True
+        self._hint_deadlines_ns.clear()
+        self._hint_deadline_ns = 0
+        self._feedback_deadline_ns = 0
+        self._feedback_active = False
+        self._last_written_defer_ns = 0
+        try:
+            self.engine.set_drain_control(0, 0, 0)
+        except Exception:
+            try:
+                self.engine.set_defer_until_ns(0)
+            except Exception:
+                pass
+
     def snapshot(self) -> dict[str, Any]:
         """Return an audit snapshot of governor state."""
 
         return {
-            "enabled": bool(self.config.enabled),
+            "enabled": bool(self.config.enabled) and not self._disabled,
             "hint_deadline_ns": self._hint_deadline_ns,
             "feedback_deadline_ns": self._feedback_deadline_ns,
+            "feedback_active": self._feedback_active,
             "defer_until_ns": self._last_written_defer_ns,
             "baseline_gbps": self._baseline_gbps,
             "ewma_pressure": self._ewma_pressure,
             "clean_windows": self._clean_windows,
             "hot_windows": self._hot_windows,
+            "window_started_ns": self._window_started_ns,
             "hints_seen": self.hints_seen,
             "hints_accepted": self.hints_accepted,
             "hints_ignored": self.hints_ignored,
@@ -255,11 +327,26 @@ class PCIeGovernor:
         direction = str(hint.direction or "").upper()
         est_bytes = int(hint.est_bytes or 0)
 
+        if direction != "D2H":
+            return False
         if est_bytes > 0 and est_bytes < int(self.config.hint_min_bytes or 0):
             return False
-        if source in self._COARSE_TRUSTED_SOURCES:
-            return direction in {"D2H", "H2D"}
-        return direction == "D2H" and est_bytes >= int(self.config.hint_min_bytes or 0)
+        if source in self._COARSE_TRUSTED_D2H_SOURCES:
+            return True
+        return est_bytes > 0 and est_bytes >= int(self.config.hint_min_bytes or 0)
+
+    def _expire_hint_deadlines(self, now_ns: int) -> None:
+        expired = [
+            source
+            for source, deadline in self._hint_deadlines_ns.items()
+            if deadline <= now_ns
+        ]
+        for source in expired:
+            self._hint_deadlines_ns.pop(source, None)
+        self._refresh_hint_deadline()
+
+    def _refresh_hint_deadline(self) -> None:
+        self._hint_deadline_ns = max(self._hint_deadlines_ns.values(), default=0)
 
     def _update_baseline(self, bw_gbps: float) -> None:
         fixed = float(self.config.baseline_gbps or 0.0)
