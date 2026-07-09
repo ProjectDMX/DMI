@@ -8,6 +8,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -164,6 +165,13 @@ public:
     // GIL.  Used by safety-net branches that need to free ring space or
     // ensure FIFO ordering before consuming the next meta out-of-band.
     void flush_and_wait();
+
+    // PCIe governor control and passive telemetry.
+    void set_drain_control(uint64_t defer_until_ns,
+                           uint64_t max_d2h_chunk_bytes,
+                           uint64_t hard_watermark_bytes);
+    void set_defer_until_ns(uint64_t defer_until_ns);
+    std::map<std::string, uint64_t> link_stats();
 
 private:
     struct Impl;

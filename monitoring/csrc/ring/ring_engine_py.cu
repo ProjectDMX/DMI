@@ -11,6 +11,7 @@
 #include "ring/producer.cuh"
 #include "ring/ring_debug.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
+#include <chrono>
 
 // Forward-declare symbols from producer.cu
 namespace ring {
@@ -223,9 +224,14 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     // dispatch).  We still flush so the ring is empty when the safety
     // net starts firing.
     if (step_total_bytes > effective_cap || num_hooks > tcap) {
+        const auto stall_start = std::chrono::steady_clock::now();
         cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
         cudaStreamSynchronize(ms);
         drain.force_flush_and_wait();
+        const auto stall_end = std::chrono::steady_clock::now();
+        drain.record_prepare_step_stall(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                stall_end - stall_start).count()));
         return STEP_OVERSIZED;
     }
 
@@ -242,9 +248,14 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
 
     // Either payload or task ring full from prior steps.  Sync main
     // stream so all producer kernels finish writing, then flush.
+    const auto stall_start = std::chrono::steady_clock::now();
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
     cudaStreamSynchronize(ms);
     drain.force_flush_and_wait();
+    const auto stall_end = std::chrono::steady_clock::now();
+    drain.record_prepare_step_stall(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            stall_end - stall_start).count()));
     drain.reserve(step_total_bytes, num_hooks);
     return STEP_RING_FLUSHED;
 }
@@ -324,6 +335,21 @@ void RingEnginePy::flush_and_wait() {
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
     cudaStreamSynchronize(ms);
     impl_->engine.drain_thread().force_flush_and_wait();
+}
+
+void RingEnginePy::set_drain_control(uint64_t defer_until_ns,
+                                     uint64_t max_d2h_chunk_bytes,
+                                     uint64_t hard_watermark_bytes) {
+    impl_->engine.drain_thread().set_drain_control(
+        defer_until_ns, max_d2h_chunk_bytes, hard_watermark_bytes);
+}
+
+void RingEnginePy::set_defer_until_ns(uint64_t defer_until_ns) {
+    impl_->engine.drain_thread().set_defer_until_ns(defer_until_ns);
+}
+
+std::map<std::string, uint64_t> RingEnginePy::link_stats() {
+    return impl_->engine.drain_thread().link_stats();
 }
 
 }  // namespace ring_py

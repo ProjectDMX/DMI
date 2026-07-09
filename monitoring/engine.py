@@ -58,10 +58,12 @@ class MonitoringEngine:
         ring_payload_mb: int = 4096,
         ring_pinned_mb: int = 4096,
         ring_task_entries: int = 65536,
+        pcie_governor_config: Optional[Any] = None,
     ) -> None:
         self.config = config
         self._model_id = model_id
         self._auto_batch_group_id = 0
+        self._pcie_governor_config = pcie_governor_config
 
 
         # Host-side DB engine (optional; C++ backend only)
@@ -129,7 +131,10 @@ class MonitoringEngine:
         return ring_config
 
     def enable_ring_transport(
-        self, ring_config: Any, model_shape: Optional[Any] = None
+        self,
+        ring_config: Any,
+        model_shape: Optional[Any] = None,
+        pcie_governor_config: Optional[Any] = None,
     ) -> Any:
         """Switch to ring-based D2H transport.
 
@@ -153,6 +158,11 @@ class MonitoringEngine:
         from . import _native_engine  # type: ignore[attr-defined]
 
         if self._ring_transport is not None:
+            try:
+                from .governor import set_current
+                set_current(None)
+            except Exception:
+                pass
             try:
                 ring_engine = getattr(self, "_ring_engine", None)
                 if ring_engine is not None:
@@ -183,6 +193,33 @@ class MonitoringEngine:
         transport = _rt.RingTransport(ring_engine)
         if model_shape is not None:
             transport.set_model_cfg(model_shape)
+
+        gov_cfg = (
+            pcie_governor_config
+            if pcie_governor_config is not None
+            else self._pcie_governor_config
+        )
+        try:
+            from .governor import PCIeGovernor, set_current
+
+            if gov_cfg is not None and bool(getattr(gov_cfg, "enabled", False)):
+                governor = PCIeGovernor(ring_engine, gov_cfg)
+                transport.set_governor(governor)
+                set_current(governor)
+            else:
+                transport.set_governor(None)
+                set_current(None)
+                if hasattr(ring_engine, "set_drain_control"):
+                    ring_engine.set_drain_control(0, 0, 0)
+        except Exception:
+            try:
+                transport.set_governor(None)
+                if hasattr(ring_engine, "set_drain_control"):
+                    ring_engine.set_drain_control(0, 0, 0)
+            except Exception:
+                pass
+            raise
+
         self._ring_engine = ring_engine
         self._ring_transport = transport
 
@@ -206,6 +243,11 @@ class MonitoringEngine:
         """Tear down backend resources."""
 
         if self._ring_transport is not None:
+            try:
+                from .governor import set_current
+                set_current(None)
+            except Exception:
+                pass
             try:
                 ring_engine = getattr(self, "_ring_engine", None)
                 if ring_engine is not None:

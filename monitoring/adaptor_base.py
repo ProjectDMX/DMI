@@ -165,6 +165,9 @@ class BackendAdaptor(abc.ABC):
         # active-spec list is empty or every shape was empty.
         if n_hooks > 0:
             result = self.ring_engine.prepare_step(total_bytes, n_hooks)
+            governor = getattr(self.transport, "governor", None)
+            if governor is not None:
+                governor.on_step()
             self.transport.force_eager = (result == 2) or needs_eager
             if result == 2:
                 ctx = self.adapt_for_cpu_direct(ctx)

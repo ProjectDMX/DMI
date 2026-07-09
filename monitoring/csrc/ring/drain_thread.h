@@ -22,7 +22,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -70,6 +72,16 @@ public:
     // Called from prepare_step after confirming space is available.
     void reserve(uint64_t payload_bytes, uint32_t num_tasks);
 
+    // PCIe governor control surface.  All-zero control is the disabled state
+    // and preserves the original drain behavior.
+    void set_drain_control(uint64_t defer_until_ns,
+                           uint64_t max_d2h_chunk_bytes,
+                           uint64_t hard_watermark_bytes);
+    void set_defer_until_ns(uint64_t defer_until_ns);
+    void record_prepare_step_stall(uint64_t stall_us);
+    std::map<std::string, uint64_t> link_stats();
+    static uint64_t monotonic_now_ns();
+
 private:
     RingState&      ring_;
     PinnedStaging&  staging_;
@@ -100,6 +112,18 @@ private:
     bool                    has_complete_time_{false};
     // ---- end mgmt_mu_ protected state ----
 
+    std::atomic<uint64_t>   defer_until_ns_{0};
+    std::atomic<uint64_t>   max_d2h_chunk_bytes_{0};
+    std::atomic<uint64_t>   hard_watermark_bytes_{0};
+
+    std::atomic<uint64_t>   d2h_bytes_{0};
+    std::atomic<uint64_t>   d2h_batches_{0};
+    std::atomic<uint64_t>   d2h_probe_bytes_{0};
+    std::atomic<uint64_t>   d2h_probe_event_us_{0};
+    std::atomic<uint64_t>   d2h_probe_host_us_{0};
+    std::atomic<uint64_t>   stall_us_total_{0};
+    std::atomic<uint64_t>   stall_count_{0};
+
     // Force-flush signalling (Python thread -> drain thread)
     bool                    flush_requested_{false};  // guarded by mu_
     bool                    flush_done_{false};        // guarded by mu_
@@ -128,6 +152,11 @@ private:
 
     void sync_stream();
     void enqueue_d2h(uint64_t flush_bytes);
+    void record_d2h_batch(uint64_t flush_bytes,
+                          bool collect_probe,
+                          uint64_t host_elapsed_us,
+                          uint64_t event_elapsed_us);
+    uint64_t normal_batch_limit() const;
 
     // Split into two: submit_to_p2p pushes DrainTasks to the p2p queue
     // (uses queue_mu_/pop_mu_, NOT mgmt_mu_).  trim_scanned updates

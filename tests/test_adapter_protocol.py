@@ -46,6 +46,7 @@ class FakeTransport:
     def __init__(self) -> None:
         self.null_offload = False
         self.force_eager = False
+        self.governor = None
         self.set_step_context_calls: list = []
         self.pre_push_all_metas_calls: list = []
         self._active_specs: list = []
@@ -76,6 +77,14 @@ class FakeEngine:
     def __init__(self, prepare_step_result: int = 0) -> None:
         self._ring_transport = FakeTransport()
         self._ring_engine = FakeRingEngine(prepare_step_result)
+
+
+class FakeGovernor:
+    def __init__(self) -> None:
+        self.on_step_calls = 0
+
+    def on_step(self) -> None:
+        self.on_step_calls += 1
 
 
 class StubAdaptor(BackendAdaptor):
@@ -230,6 +239,20 @@ def test_force_eager_cleared_on_normal_step_after_overflow():
     # Swap the fake engine to return 0 (normal) and re-run.
     a.engine._ring_engine._result = 0
     a.before_forward(None)
+    assert a.transport.force_eager is False
+
+
+def test_governor_on_step_runs_after_prepare_step_without_force_eager_change():
+    ctx = _make_ctx()
+    engine = FakeEngine(prepare_step_result=0)
+    governor = FakeGovernor()
+    engine._ring_transport.governor = governor
+    a = StubAdaptor(engine, "test_model", ctx)
+
+    a.before_forward("raw")
+
+    assert governor.on_step_calls == 1
+    assert a.ring_engine.prepare_step_calls == [(1024, 3)]
     assert a.transport.force_eager is False
 
 

@@ -316,6 +316,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("flush_and_wait",
            &ring_py::RingEnginePy::flush_and_wait,
            py::call_guard<py::gil_scoped_release>())
+      .def("set_drain_control",
+           &ring_py::RingEnginePy::set_drain_control,
+           py::arg("defer_until_ns"),
+           py::arg("max_d2h_chunk_bytes"),
+           py::arg("hard_watermark_bytes"))
+      .def("set_defer_until_ns",
+           &ring_py::RingEnginePy::set_defer_until_ns,
+           py::arg("defer_until_ns"))
+      .def("link_stats",
+           &ring_py::RingEnginePy::link_stats)
       .def("push_all_metas",
            [](ring_py::RingEnginePy& self,
               py::list hook_types_py,

@@ -433,8 +433,15 @@ class RingTransport:
         # Set by the active adapter before hook installation.
         self._hook_selection: Optional[str] = None
 
+        # Optional PCIe drain governor.  It only controls the D2H drain path;
+        # hook capture and producer dispatch never depend on it.
+        self.governor: Optional[Any] = None
+
         # warn_once tracking for Case B fallback
         self._warned_shapes: set = set()
+
+    def set_governor(self, governor: Optional[Any]) -> None:
+        self.governor = governor
 
     def set_step_context(
         self,

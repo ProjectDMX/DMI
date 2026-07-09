@@ -99,6 +99,8 @@ def _cfg(ac: dict, key: str, env_key: str, default: Any) -> Any:
             return env_val not in ("0", "false", "False", "")
         if isinstance(default, int):
             return int(env_val)
+        if isinstance(default, float):
+            return float(env_val)
         return env_val
     return default
 
@@ -496,6 +498,7 @@ class DMXGPUWorker(Worker):
 
         from monitoring import _native_engine as _ne
         from monitoring.engine import MonitoringEngine
+        from monitoring.governor import PCIeGovernorConfig
 
         ac = self.vllm_config.additional_config
         if not isinstance(ac, dict):
@@ -515,6 +518,74 @@ class DMXGPUWorker(Worker):
         db_table = _cfg(ac, "dmx_db_table", "DMX_DB_TABLE", "offload")
         ch_parallelism = int(
             _cfg(ac, "dmx_ch_parallelism", "DMX_CH_PARALLELISM", 10)
+        )
+        pcie_governor_cfg = PCIeGovernorConfig(
+            enabled=bool(_cfg(
+                ac,
+                "dmx_pcie_governor_enabled",
+                "DMX_PCIE_GOVERNOR_ENABLED",
+                False,
+            )),
+            hint_min_bytes=int(_cfg(
+                ac,
+                "dmx_pcie_governor_hint_min_mb",
+                "DMX_PCIE_GOVERNOR_HINT_MIN_MB",
+                4,
+            )) * 1024 * 1024,
+            max_defer_us=int(_cfg(
+                ac,
+                "dmx_pcie_governor_max_defer_us",
+                "DMX_PCIE_GOVERNOR_MAX_DEFER_US",
+                5_000,
+            )),
+            hard_watermark_ratio=float(_cfg(
+                ac,
+                "dmx_pcie_governor_hard_watermark_ratio",
+                "DMX_PCIE_GOVERNOR_HARD_WATERMARK_RATIO",
+                0.80,
+            )),
+            max_d2h_chunk_bytes=int(_cfg(
+                ac,
+                "dmx_pcie_governor_max_chunk_mb",
+                "DMX_PCIE_GOVERNOR_MAX_CHUNK_MB",
+                32,
+            )) * 1024 * 1024,
+            baseline_gbps=float(_cfg(
+                ac,
+                "dmx_pcie_governor_baseline_gbps",
+                "DMX_PCIE_GOVERNOR_BASELINE_GBPS",
+                0.0,
+            )),
+            p_hi=float(_cfg(
+                ac,
+                "dmx_pcie_governor_p_hi",
+                "DMX_PCIE_GOVERNOR_P_HI",
+                0.35,
+            )),
+            p_lo=float(_cfg(
+                ac,
+                "dmx_pcie_governor_p_lo",
+                "DMX_PCIE_GOVERNOR_P_LO",
+                0.15,
+            )),
+            feedback_window_ms=int(_cfg(
+                ac,
+                "dmx_pcie_governor_feedback_window_ms",
+                "DMX_PCIE_GOVERNOR_FEEDBACK_WINDOW_MS",
+                100,
+            )),
+            clean_windows_to_resume=int(_cfg(
+                ac,
+                "dmx_pcie_governor_clean_windows_to_resume",
+                "DMX_PCIE_GOVERNOR_CLEAN_WINDOWS_TO_RESUME",
+                20,
+            )),
+            debug=bool(_cfg(
+                ac,
+                "dmx_pcie_governor_debug",
+                "DMX_PCIE_GOVERNOR_DEBUG",
+                False,
+            )),
         )
 
         resolved_model_id = model_id or str(self.vllm_config.model_config.model)
@@ -563,6 +634,7 @@ class DMXGPUWorker(Worker):
             model_id=resolved_model_id,
             host_engine=host_engine,
             ring_config=ring_cfg,
+            pcie_governor_config=pcie_governor_cfg,
         )
 
         # Build the adaptor.  Hooks aren't installed yet -- that
