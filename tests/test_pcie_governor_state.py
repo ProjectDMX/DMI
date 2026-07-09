@@ -330,3 +330,46 @@ def test_enable_ring_transport_stops_engine_when_governor_init_fails(monkeypatch
     assert engine._ring_transport is None
     assert get_current() is None
     assert ring_transport.get_active() is None
+
+
+def test_enable_ring_transport_cleans_up_when_native_start_fails(monkeypatch):
+    from monitoring import _native_engine
+    from monitoring.engine import MonitoringEngine
+
+    class StartFailingRingEngine:
+        def __init__(self) -> None:
+            self.init_calls = 0
+            self.start_calls = 0
+            self.stop_calls = 0
+
+        def init(self) -> None:
+            self.init_calls += 1
+
+        def start(self) -> None:
+            self.start_calls += 1
+            raise RuntimeError("synthetic native start failure")
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    native_engine = StartFailingRingEngine()
+    monkeypatch.setattr(
+        _native_engine,
+        "RingEngine",
+        lambda _config, _host: native_engine,
+    )
+
+    engine = MonitoringEngine.__new__(MonitoringEngine)
+    engine._host_engine = None
+    engine._ring_engine = None
+    engine._ring_transport = None
+    engine._pcie_governor_config = PCIeGovernorConfig(enabled=True)
+
+    with pytest.raises(RuntimeError, match="synthetic native start failure"):
+        engine.enable_ring_transport(object())
+
+    assert native_engine.init_calls == 1
+    assert native_engine.start_calls == 1
+    assert native_engine.stop_calls == 1
+    assert engine._ring_engine is None
+    assert engine._ring_transport is None

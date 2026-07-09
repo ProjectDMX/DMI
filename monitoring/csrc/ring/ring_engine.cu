@@ -48,13 +48,25 @@ void RingEngine::init(cudaStream_t stream) {
 }
 
 void RingEngine::start() {
-    drain_->start();
-    p2p_->start();
+    bool drain_started = false;
+    try {
+        drain_->start();
+        drain_started = true;
+        p2p_->start();
+    } catch (...) {
+        if (drain_started) drain_->stop();
+        throw;
+    }
 }
 
 void RingEngine::stop() {
-    // Guard against double-stop (benchmark _timed_close + engine.close).
-    if (!drain_->is_running()) return;
+    // A failed or already-stopped drain has no worker that can acknowledge a
+    // force flush.  Only unblock and join the P2P side in that state.
+    if (!drain_->is_running()) {
+        drain_->signal_p2p_stop();
+        p2p_->stop();
+        return;
+    }
 
     cudaDeviceSynchronize();
     drain_->force_flush_and_wait();

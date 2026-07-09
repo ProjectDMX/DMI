@@ -62,12 +62,17 @@ DrainThread::~DrainThread() noexcept {
 
 void DrainThread::start() {
     running_.store(true, std::memory_order_relaxed);
-    thread_ = std::thread([this] { loop(); });
+    try {
+        thread_ = std::thread([this] { loop(); });
+    } catch (...) {
+        running_.store(false, std::memory_order_relaxed);
+        throw;
+    }
 }
 
 void DrainThread::stop() {
-    if (!running_.exchange(false)) return;
-    cv_.notify_all();
+    const bool was_running = running_.exchange(false);
+    if (was_running) cv_.notify_all();
     if (thread_.joinable()) thread_.join();
 }
 
