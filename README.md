@@ -17,7 +17,23 @@
 > and vLLM backends for Qwen3 / Llama3.1 and GPT-2-family. SGLang support is on the way. APIs may change. Contributions, bug
 > reports, and feature requests are welcome.
 
+> **👀Technical Report Available:** https://arxiv.org/abs/2605.11093
+
 ---
+## Roadmap
+
+We are working to make DMI useful across more backends, more models, and more
+stages of the model lifecycle.
+
+- **More backend support and models** — Bring DMI to **SGLang** and expand support for
+  more widely used model families, including multimodal models.
+- **From inference to training** — Extend DMI's low-overhead inspection to
+  large-scale training framework. (**Megatron**).
+- **From observation to action** — Low-latency streaming/pluggable APIs enables more downstream applications like online monitoring, activation steering,
+    distillation, and speculative decoding.
+- **Broader PCIe-aware scheduling** — Extend DMI's serving-first drain governor
+  to more KV connectors, multi-rank topologies, and other serving traffic.
+
 
 ## About
 
