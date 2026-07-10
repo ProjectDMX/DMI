@@ -1,0 +1,10 @@
+{
+  "block_mb": 64,
+  "direction": "bidirectional",
+  "dry_run": false,
+  "duration_s": 30,
+  "gpus": "0",
+  "inflight": 2,
+  "sample_interval_s": 1.0,
+  "target_mb_s": 2048
+}

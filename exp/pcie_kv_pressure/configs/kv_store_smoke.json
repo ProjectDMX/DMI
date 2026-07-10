@@ -1,0 +1,19 @@
+{
+  "seed": 20260709,
+  "model": "Qwen/Qwen3-0.6B",
+  "num_prefixes": 4,
+  "prefix_len_tokens": 6144,
+  "suffix_len_tokens": 32,
+  "max_tokens": 1,
+  "store_rps": 32.0,
+  "store_burst_size": 1,
+  "store_burst_gap_s": 0.5,
+  "store_burst_spacing_s": 0.0,
+  "retrieve_rps": 1.0,
+  "retrieve_repeats": 0,
+  "reuse_gap_s": 0.0,
+  "timestamp_jitter_s": 0.0,
+  "kv_bytes_per_token": 114688,
+  "temperature": 0.0,
+  "top_p": 1.0
+}

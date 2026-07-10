@@ -1,0 +1,16 @@
+{
+  "seed": 20260708,
+  "model": "Qwen/Qwen3-8B",
+  "num_prefixes": 96,
+  "prefix_len_tokens": 8192,
+  "suffix_len_tokens": 512,
+  "max_tokens": 256,
+  "store_rps": 8.0,
+  "retrieve_rps": 12.0,
+  "retrieve_repeats": 3,
+  "reuse_gap_s": 20.0,
+  "timestamp_jitter_s": 0.03,
+  "kv_bytes_per_token": 131072,
+  "temperature": 0.0,
+  "top_p": 1.0
+}
