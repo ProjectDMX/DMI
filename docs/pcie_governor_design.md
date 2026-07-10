@@ -819,3 +819,69 @@ pending-only watcher 直接查询 CUDA event，正式矩阵中全部 24 个 oper
   持续占链路时，DMI cudaEvent bandwidth 仍约为 201Gbit/s，排队体现在 host elapsed。
   governor 因此改用包含 queue wait 的 `effective_bw` 算 pressure，同时保留 event BW
   和 queue delay 供审计。
+
+### 8.13 2026-07-10 queue-aware 完整复测
+
+在 commit `e711fe2e2` 上重新跑完整矩阵。硬件为单张 RTX 4090（物理 GPU 2），模型
+为 Qwen3-0.6B。端到端三种模式共享同一条 34-request cold-store trace：6144-token
+prefix、2 个 warmup、32 个 measured request、1.5s burst gap。每个条件独立重启
+vLLM/LMCache，`dmi_off / gov_off / gov_on` 按 repetition 轮转顺序，各 3 次；DMI
+使用 7 个 hooks、4GB payload ring、2GB pinned staging、32MB chunk cap、0.95 hard
+watermark 和 1s stale-hint watchdog。LMCache 只用 CPU tier，不启用 disk；DMI 保留
+ring D2H，但不配置 DB host，因此不写 ClickHouse。
+
+#### 8.13.1 无压力开关开销
+
+在无 KV movement、DMI 捕获相同的 paired 3-repetition 实验中，scheduler-on 相对
+scheduler-off：mean latency -0.160%、P95 -0.342%、P99 +0.604%、request throughput
+-0.045%。差异量级小且方向不一致，未观察到可分辨的 governor 固有开销。
+
+#### 8.13.2 原生机制验证
+
+50-repetition critical-D2H collision benchmark：
+
+| 条件 | critical D2H P95 |
+|---|---:|
+| idle | 1.352ms |
+| 无调度 | 21.813ms |
+| 仅 32MB 分块 | 1.768ms |
+| lifecycle hint + 分块 | 1.490ms |
+
+分块相对无调度降低 P95 91.89%；hint 在分块基础上再降低 15.74%；完整 hint+cap
+相对无调度降低 93.17%，距离 idle 为 +10.21%。该实验只验证 burst fast path，
+不冒充 feedback 实验。
+
+持续 D2H feedback 独立跑 5 次，5/5 均进入 avoid，且全部
+`slow_path_flushes=0`。激活延迟均值 447.09ms（440.95--453.05ms）；激活窗中
+cudaEvent BW 均值仍为 201.55Gbit/s，但包含排队的 effective BW 只有
+43.73Gbit/s，host-event queue delay 均值 71.27ms。这直接验证 queue-aware
+pressure 信号，而不是靠降低阈值让状态机通过。
+
+#### 8.13.3 三种 LMCache 模式
+
+下面均为 3 次重复的 aggregate；括号内是 `gov_on` 相对 `gov_off`：
+
+| 模式 | gov_on mean latency | gov_on P95 | KV completion mean | KV BW | 相对 gov_off |
+|---|---:|---:|---:|---:|---|
+| in-process | 151.07ms | 158.97ms | 31.19ms | 21.08GB/s | mean -15.36%，P95 -13.10%，KV -44.26%，BW +79.91% |
+| layerwise | 127.79ms | 133.94ms | 87.31ms | 7.52GB/s | mean -25.94%，P95 -24.57%，KV -33.22%，BW +49.83% |
+| LMCacheMP | 119.35ms | 123.10ms | 111.87ms | 5.87GB/s | mean -9.78%，P95 -19.19%，KV -18.27%，BW +22.16% |
+
+相对各自 `dmi_off`，`gov_on` 的 client P95 分别为 +6.16%、+3.25%、+6.45%；
+KV completion mean 分别为 +0.69%、+5.77%、+2.60%。这说明 scheduler 基本恢复
+serving-critical D2H，但不会消除 DMI 捕获/kernel 本身的全部代价。
+
+三套 summary 均通过 formal validation，共 27 trial、864 measured requests、0 client
+error。三个模式的 governor-on 合计 306 start / 4 renew / 306 end，0 expired、
+0 unterminated；所有 MP completion mapping 有效。平均 hint coverage 分别约为
+101.67ms、93.78ms、112.92ms。端到端 feedback activation 均为 0，这是预期结果：
+1.5s 间隔的 KV burst 由前馈 hint 处理，持续域能力由上一节的独立 feedback 实验验证。
+
+原始结果：
+
+- `exp/pcie_kv_pressure/results/pcie_scheduler_overhead_queueaware_20260710/`
+- `exp/pcie_kv_pressure/results/pcie_governor_hint_queueaware_r50_20260710/`
+- `exp/pcie_kv_pressure/results/pcie_governor_feedback_queueaware_20260710/`
+- `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_inprocess_queueaware_20260710/`
+- `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_layerwise_queueaware_20260710/`
+- `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_mp_queueaware_20260710/`
