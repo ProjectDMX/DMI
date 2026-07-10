@@ -401,9 +401,13 @@ EWMA / baseline / hysteresis，只负责反馈状态机和过期重算。governo
 （`valid_until_ns=now`）只清 hint deadline，不会误杀反馈避让。
 
 线程契约：vendored vLLM v1 的 `pre_forward()` / forward / `post_forward()` /
-`before_forward()` 在同一个 worker 线程串行调用；LMCacheMP 的后台 D2H 由已有
-future/CUDA event 表示，worker 在 `get_finished()` 中轮询并更新 lease。v1
-governor 内部不加锁，唯一跨线程接口是 C++ 的 3 个 atomic。`snapshot()` 只用于
+`before_forward()` 在同一个 worker 线程串行调用。LMCacheMP 是例外：STORE
+真正完成发生在后台 CUDA future 上，且 serving 在最后一个请求后不保证再调用
+`get_finished()`。因此只有 MP connector 在 pending STORE 期间启动一个 daemon
+watcher，每 5ms 查询已有 `CUDAMessagingFuture`，完成即发 end，长 operation 每
+100ms renew；无 pending STORE 时线程退出。governor 用 `RLock` 串行化 worker
+thread 的 `on_step()` 与 watcher thread 的 renew/end。普通 LMCache 路径仍无新增
+线程或锁；C++ 跨 drain/mgmt 线程接口仍只有 3 个 atomic。`snapshot()` 只用于
 审计导出。
 不单独做 `poll()`；decode step 已经比 100ms 决策窗密，step 边界就是天然
 poll 点。
@@ -565,8 +569,9 @@ v1 原则：hint 接入必须是 best-effort、可选、失败静默，不影响
 3. `integration/vllm/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py`
    - 提交第一个 STORE batch 时 `source="lmcache_mp_store"` begin；
    - `wait_for_save()` 返回不结束 lease；
-   - `get_finished()` 利用已有 `store_futures`/`CUDAMessagingFuture.query()` 续租，
-     只有 pending future 集合为空时 end；多个并发 store 不会提前恢复；
+   - pending-only watcher 利用已有 `store_futures` / `CUDAMessagingFuture.query()`
+     续租，只有所有 future 的 CUDA event 完成时 end；多个并发 store 不会提前
+     恢复，最后一个请求之后也不依赖下一 serving step；
    - 只追踪 CUDA D2H 完成，不等待后续磁盘/远端持久化。
 
 4. `integration/vllm/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py`
@@ -648,9 +653,10 @@ v1 目标是证明 serving-first 控制有效，不追求完整 PCIe 拓扑感�
 
 ### 8.10 2026-07-09 实现验证
 
-- 单元测试：新增 11 个 lifecycle case，覆盖 lease begin/renew/end、managed
+- 单元测试：新增 12 个 lifecycle case，覆盖 lease begin/renew/end、managed
   connector 去重、non-layerwise/layerwise/no-store/异常路径、MP pending/并发
-  future；原 LMCache connector 23 个测试保持通过。
+  future，以及最后一个 MP STORE 后无下一 serving step 时仍能 end；原 LMCache
+  connector 23 个测试保持通过。
 - 真实 non-layerwise：Qwen3-0.6B + DMI + LMCache CPU，1024-token cold store；
   日志顺序为 `lmcache_store begin` → 6.32ms offload → end，end 后 governor
   deadline 立即归零。
@@ -659,3 +665,127 @@ v1 目标是证明 serving-first 控制有效，不追求完整 PCIe 拓扑感�
 - 真实 LMCacheMP：独立 LMCache server + `LMCacheMPConnector` + DMI；begin 后
   server 完成 1024-token CUDA store（13ms），worker 观察到 CUDA future 完成后
   end。`wait_for_save()` 返回本身不清 lease。
+
+### 8.11 2026-07-09 scheduler benchmark 重跑
+
+#### 8.11.1 Non-layerwise 高压有效性
+
+实验固定使用 GPU 2、Qwen3-0.6B、LMCache CPU backend 和 7 个 DMI hooks
+（`resid_pre,ln1,attn_out,resid_mid,ln2,mlp_in,mlp_out`）。每次请求包含
+6144-token 可保存前缀，单次 KV store 约 0.6562GB；8 个 cold-store 请求以
+1.5s 间隔组成一轮，每个条件独立重启 serving 并重复 3 轮。表中 P95 是 3 轮
+各自 P95 的均值。
+
+| 条件 | 平均请求延迟 | P95 请求延迟 | LMCache D2H 均值 | LMCache D2H 带宽 |
+|---|---:|---:|---:|---:|
+| DMI 关闭 | 146.74ms | 169.97ms | 31.19ms | 20.98Gbps |
+| DMI 开，scheduler 关闭 | 182.46ms | 205.15ms | 54.19ms | 12.09Gbps |
+| scheduler 开，旧 5ms watchdog | 179.10ms | 201.30ms | 53.53ms | 12.24Gbps |
+| scheduler 开，完整 lifecycle / 1s watchdog | 158.95ms | 180.12ms | 31.10ms | 21.03Gbps |
+
+结果说明：
+
+- 完整 governor 相比 scheduler-off 将平均请求延迟降低 12.9%、P95 降低
+  12.2%，LMCache offload 时间降低 42.6%，LMCache D2H 带宽提高 73.9%。
+- 完整 governor 的 LMCache offload 时间和带宽与 DMI-off 基线分别只差
+  -0.29% 和 +0.27%，均在实验噪声内；即 serving-critical D2H 基本恢复到无
+  DMI 竞争时的水平。
+- 旧 5ms policy 只让 LMCache offload 改善 1.2%，与 scheduler-off 基本相同。
+  这直接验证了原问题：operation bracket 实际约 102--127ms，5ms 到期后 DMI
+  在 KV store 尚未结束时恢复。
+- 3 轮 full-governor 共观察到 24 个 begin 和 24 个 end，全部配对；每轮 hint
+  coverage 均值为 101.79--102.70ms，远小于 1s watchdog，因此正常恢复全部由
+  connector end hint 驱动，不是 watchdog 到期。
+- feedback activation 在所有 full-governor trial 中均为 0。收益来自 lifecycle
+  hint 的 tier-aware 让路，而不是 DMI 自探针；这与第 2.1.1 节的 priority
+  inversion 分析一致。
+- scheduler 并不消除 DMI capture 自身成本。full governor 相比 DMI-off 仍有
+  8.32% 平均延迟和 5.97% P95 延迟开销；但它消除了 scheduler-off 相对
+  DMI-off 新增延迟的 65.8%（mean）和 71.1%（P95）。
+
+该 workload 会让单 step DMI 数据达到约 2526.9MB，超过 2048MiB pinned
+staging，触发既有 eager-dispatch safety path；这是刻意构造的高压边界，不代表
+普通 serving 的常态。50ms NVML 采样会漏掉 31--54ms 的短 burst，因此结论以
+LMCache 自身的 operation timing 和客户端延迟为主，NVML 只作交叉检查。
+
+原始结果：
+
+- `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_lifecycle_3rep_20260709/`
+- `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_short_watchdog_3rep_20260709/`
+- `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_dmi_off_3rep_20260709/`
+
+#### 8.11.2 无 KV movement 的 scheduler 开销
+
+使用 HiddenCache RealReentry 的真实 prompt，128 个请求/轮，scheduler off/on
+按 `off,on,on,off,off,on` 顺序各跑 3 轮，共 768 请求且 0 error：
+
+- request throughput：-0.008%，可视为不变；
+- mean end-to-end latency：+0.36ms / +0.44%；
+- mean TTFT：+0.25ms / +1.77%；
+- P95 latency：+0.92ms / +1.04%，但三轮 paired delta 的标准差为 2.03ms，
+  尚不能区分于运行波动。
+
+因此当前实现不能表述为严格零开销，但在该实验下吞吐无可测回退，平均请求延迟
+代价低于 0.5%。原始结果位于
+`exp/pcie_kv_pressure/results/pcie_scheduler_overhead_lifecycle_20260709/`。
+
+#### 8.11.3 Layerwise 高压有效性
+
+除 `use_layerwise=true` 外，workload、DMI hooks、ring 配置和 3-repeat 方法均与
+8.11.1 相同。Layerwise 日志不单列 `offload_time`，因此表中的 store 时间使用
+LMCache operation-level `cost`。
+
+| 条件 | 平均请求延迟 | P95 请求延迟 | LMCache store 均值 | LMCache store 带宽 |
+|---|---:|---:|---:|---:|
+| DMI 关闭 | 126.88ms | 149.87ms | 82.95ms | 7.92Gbps |
+| DMI 开，scheduler 关闭 | 177.87ms | 193.70ms | 130.46ms | 5.03Gbps |
+| DMI 开，完整 lifecycle governor | 133.44ms | 153.32ms | 88.83ms | 7.40Gbps |
+
+- governor-on 相比 governor-off：mean latency -25.0%、P95 -20.8%、store cost
+  -31.9%、store bandwidth +47.0%。
+- 相比同模式 DMI-off，governor-on 仍有 5.17% mean / 2.30% P95 延迟和 7.08%
+  store cost；它消除了 DMI 竞争新增 mean latency 的 87.1%、P95 的 92.1%，以及
+  store cost penalty 的 87.6%。
+- 3 轮 governor-on 共 24 begin / 24 end，hint coverage 均值 95.48ms（各轮
+  94.74--96.34ms），feedback activation 为 0。结果说明从第一层实际
+  `save_kv_layer()` 开始的前馈 hint 确实覆盖了 layerwise D2H，而不是只保护尾部
+  `wait_for_save()`。
+
+原始结果：
+
+- `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_layerwise_3rep_20260709/`
+- `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_layerwise_dmi_off_3rep_20260709/`
+
+#### 8.11.4 LMCacheMP 高压有效性
+
+每个 trial 独立启动一个 8GB lazy-L1 LMCache server，vLLM 使用
+`LMCacheMPConnector` 和 GPU IPC transfer；其余 workload 与 8.11.1 相同。MP
+server 的 `Stored ... seconds` 只覆盖 CUDA enqueue，不代表 copy 完成，因此实验
+开启 `DMX_PCIE_HINT_AUDIT=1`，从提交前计时到 `CUDAMessagingFuture` 的 CUDA
+event 完成。该 audit 默认关闭，不进入生产热路径。
+
+| 条件 | 平均请求延迟 | P95 请求延迟 | MP future completion 均值 | 等效带宽 |
+|---|---:|---:|---:|---:|
+| DMI 关闭 | 120.82ms | 156.94ms | 108.84ms | 6.24Gbps |
+| DMI 开，scheduler 关闭 | 142.59ms | 173.32ms | 137.45ms | 4.82Gbps |
+| DMI 开，完整 lifecycle governor | 127.87ms | 158.51ms | 104.80ms | 6.31Gbps |
+
+- governor-on 相比 governor-off：mean latency -10.3%、P95 -8.54%、future
+  completion -23.8%、等效带宽 +30.8%。
+- 相比同模式 DMI-off，governor-on 的 mean / P95 延迟分别为 +5.84% / +1.00%；
+  future completion 和带宽差异为 -3.72% / +1.19%。DMI-off 的首个 STORE 有较大
+  warmup 方差，因此这里只应表述为恢复到同一量级，不能声称比基线更快。
+- scheduler 消除了 governor-off 相对 DMI-off 新增 mean latency 的 67.6% 和
+  P95 的 90.4%。3 轮 governor-on 共 24 begin / 3 renew / 24 end，hint coverage
+  均值 104.78ms（各轮 103.27--105.63ms），feedback activation 为 0。
+
+第一次 MP smoke 暴露了一个真实边界：只在 `get_finished()` 中查看
+`store_futures` 时，每个 step 会先加入当前 future 再 poll，连续请求期间集合永远
+非空；最后一个请求后又可能没有下一 step，lease 最终只能等 watchdog。修复后由
+pending-only watcher 直接查询 CUDA event，正式矩阵中全部 24 个 operation 都由
+真实 end 关闭，未发生 watchdog-only 恢复。
+
+原始结果：
+
+- `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_mp_3rep_20260709/`
+- `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_mp_dmi_off_3rep_20260709/`

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -110,6 +111,7 @@ class PCIeGovernor:
         self.engine = engine
         self.config = config
         self._clock_ns = clock_ns
+        self._state_lock = threading.RLock()
 
         self._hint_deadline_ns = 0
         self._hint_deadlines_ns: dict[str, int] = {}
@@ -149,6 +151,10 @@ class PCIeGovernor:
         )
 
     def on_hint(self, hint: PCIeHint) -> None:
+        with self._state_lock:
+            self._on_hint_locked(hint)
+
+    def _on_hint_locked(self, hint: PCIeHint) -> None:
         """Accept a serving-side hint and immediately update C++ defer state."""
 
         if self._disabled:
@@ -185,6 +191,10 @@ class PCIeGovernor:
         self._debug_log("hint", hint=hint, hint_deadline_ns=self._hint_deadline_ns)
 
     def on_step(self) -> None:
+        with self._state_lock:
+            self._on_step_locked()
+
+    def _on_step_locked(self) -> None:
         """Run feedback control once at the serving step boundary."""
 
         if self._disabled:
@@ -272,6 +282,10 @@ class PCIeGovernor:
         )
 
     def disable(self) -> None:
+        with self._state_lock:
+            self._disable_locked()
+
+    def _disable_locked(self) -> None:
         """Fail open and restore the pre-governor drain controls."""
 
         if self._disabled:
@@ -291,6 +305,10 @@ class PCIeGovernor:
                 pass
 
     def snapshot(self) -> dict[str, Any]:
+        with self._state_lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict[str, Any]:
         """Return an audit snapshot of governor state."""
 
         return {
