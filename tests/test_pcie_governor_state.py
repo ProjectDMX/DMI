@@ -236,6 +236,57 @@ def test_mid_band_window_breaks_consecutive_hot_sequence():
     assert engine.defer_writes == []
 
 
+def test_active_feedback_renews_through_mid_band_without_recounting_yield():
+    governor, engine, clock = _governor(
+        baseline_gbps=100.0,
+        pressure_ewma_alpha=1.0,
+        p_hi=0.35,
+        p_lo=0.15,
+        feedback_window_ms=100,
+        hot_windows_to_yield=2,
+        clean_windows_to_resume=2,
+    )
+    governor.on_step()
+
+    for _ in range(2):
+        _add_probe(engine, bandwidth_gbps=50.0)
+        clock.advance_ms(100)
+        governor.on_step()
+
+    assert governor.snapshot()["feedback_active"] is True
+    assert governor.snapshot()["feedback_yields"] == 1
+
+    for _ in range(2):
+        _add_probe(engine, bandwidth_gbps=80.0)
+        clock.advance_ms(100)
+        governor.on_step()
+        snapshot = governor.snapshot()
+        assert snapshot["feedback_active"] is True
+        assert snapshot["feedback_deadline_ns"] > clock()
+        assert snapshot["feedback_yields"] == 1
+
+
+def test_active_feedback_expires_when_serving_stops_polling():
+    governor, engine, clock = _governor(
+        baseline_gbps=100.0,
+        pressure_ewma_alpha=1.0,
+        feedback_window_ms=100,
+        hot_windows_to_yield=1,
+    )
+    governor.on_step()
+    _add_probe(engine, bandwidth_gbps=50.0)
+    clock.advance_ms(100)
+    governor.on_step()
+    assert governor.snapshot()["feedback_active"] is True
+
+    clock.advance_ms(201)
+    governor.on_step()
+
+    assert governor.snapshot()["feedback_active"] is False
+    assert governor.snapshot()["feedback_deadline_ns"] == 0
+    assert engine.defer_writes[-1] == 0
+
+
 def test_init_sets_static_chunk_cap_and_hard_watermark():
     engine = FakeEngine(payload_cap=1000)
     cfg = PCIeGovernorConfig(

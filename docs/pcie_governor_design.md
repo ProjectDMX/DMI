@@ -48,8 +48,8 @@ DMI 观测流量是低层（Tier-1）。governor 做的事只有一件：在高�
 
 **核心事实：burst 域和持续域需要完全不同的机制。**
 
-- **burst（ms 级）**：等你测到它，它已经结束——任何反馈检测（探针 EWMA
-  100ms 窗、NVML 20ms 采样）都存在时间混叠，物理上测不到。但 burst 恰好
+- **burst（ms 级）**：等你测到它，它已经结束——探针 EWMA 的 100ms 反馈窗
+  存在时间混叠，物理上测不到。但 burst 恰好
   **引擎自己提前知道**（hint）；不能预知的（外部进程）只能靠**限界单次伤害**
   （flush 分成可配置 batch，例如 16-64MB，碰撞窗口有界）。
 - **持续（秒级）**：hint 无意义（没有"事件"可宣告），但反馈探针正确——压力
@@ -65,8 +65,7 @@ DMI 观测流量是低层（Tier-1）。governor 做的事只有一件：在高�
 
 **测得到**：①自己每次 D2H 的 cudaEvent 耗时 ②host 侧 enqueue→sync 完成耗时
 （可给出近似排队/串行化上界，不是精确 copy-engine queue delay）
-③NVML 链路吞吐（TX/RX 分方向，~20ms 粒度）④ring/staging 占用及斜率
-⑤`prepare_step` 停顿时长（对 serving 的**真实**干扰）。
+③ring/staging 占用及斜率 ④`prepare_step` 停顿时长（对 serving 的**真实**干扰）。
 
 ### 2.1 S0：引擎前馈 hint（第一优先信号）
 
@@ -155,13 +154,7 @@ burst 2–20ms vs 探针机会主义采样 + 100ms 窗，时间混叠，命中�
 守卫：batch < 4 MB 不作样本；持续域避让后的恢复判断缺数据时发 4 MB 只读合成
 探针；`approx_queue_delay` 含自串行化，需 self-only 校准（2.5）。
 
-### 2.3 S2：NVML 交叉验证（辅助，20–50 ms 轮询）
-
-`ext_bytes ≈ nvml_total − 自己的账`。用途：区分"堵的是我"（调节奏即可）与
-"堵的是别人"（避让）。**方向性**：PCIe 全双工，KV 写回是 D2H（同向真竞争），
-权重/KV 载入是 H2D（反向，影响弱）；TX/RX 分开读，只计同向。
-
-### 2.4 S3：直接干扰事件（契约地面真值）
+### 2.3 S2：直接干扰事件（契约地面真值）
 
 `prepare_step` 返回 `STEP_RING_FLUSHED` = 我们真实停顿了 serving；在
 `ring_engine_py.cu:prepare_step` 测停顿时长，直接扣 ε 预算。ring 占用斜率
@@ -180,9 +173,7 @@ burst 2–20ms vs 探针机会主义采样 + 100ms 窗，时间混叠，命中�
 ### 2.6 已知局限（论文老实写）
 
 - 只能自我让路；措辞 "yield"，不是 "schedule the link"；
-- 单 rank 探针只见自己链路段；共享 switch 的上行竞争留 v2
-  （`nvmlDeviceGetTopologyCommonAncestor`）；
-- NVML 粒度/权限问题：S2 是交叉验证不是依赖；
+- 单 rank 探针只见自己链路段；共享 switch 的上行竞争留 v2；
 - **PCIe-TP 机器（无 NVLink）**：forward 期间链路被 all-reduce 持续占用，
   永不空闲——"空窗回填"退化，DMI 在这类机器上天然更贵。定位：DMI 主目标是
   NVLink-TP / 单卡 serving；PCIe-TP 场景由持续域反馈路径处理（让路 =
@@ -609,28 +600,27 @@ v1 目标是证明 serving-first 控制有效，不追求完整 PCIe 拓扑感�
    - 总开关关闭时不创建 governor、`get_current()` 返回 `None`、connector hint
      no-op、`before_forward()` 不调用 governor。
    - `test_dmi_pcie_hint.py`：lease begin/renew/end、non-layerwise/layerwise 时序、
-     no-store/异常清理、MP future completion/并发、managed connector 去重。
+     no-store/异常清理、MP future completion/并发、managed connector 去重，以及
+     真实 connector `__init__` 的 layerwise 探测和已安装 LMCache metadata 契约。
 
 明确不做：
 
 - 不改 hook selection / strip / producer；
 - 不新增 drop 策略；
-- 不依赖 NVML；
 - 不承诺抢占已提交的 memcpy；
 - 不新增 `minimal_flush_and_wait()` 阻塞 API；
 - 不在 C++ 维护 EWMA / baseline / pressure；
-- 不改任何 `exp/` 或 `experiments/` 下文件。
+- 不引入 NVML 采样线程或旁路控制信号。
 
 ### 8.8 可选 v2
 
-- NVML TX/RX 交叉验证：单独 `monitoring/nvml_pcie_probe.py`，无权限时自动禁用；
 - source credibility：按 `kv_store` / `lmcache_store` / `offloading_store` 维护
   hint lead-time、est_bytes 误差、missed collision；
 - offloading connector 的真实 `transfer_size` / `transfer_time` 回灌，用于
   source credibility 和 est_bytes 校准；
 - 空窗回填：根据 step 边界、hint valid window 和 decode cadence，把 normal
   drain 排进 KV save 完成后的窗口；
-- 跨 rank / 共享 switch：用 NVML topology common ancestor 做同 switch 分组，
+- 跨 rank / 共享 switch：以后按 PCI sysfs/CUDA topology 做同 switch 分组，
   但 v1 不阻塞于此；
 - 更精确 queue delay：若需要绝对 copy-engine 排队时间，再引入 CUPTI 或专门
   polling thread；不把它放入 v1。
@@ -653,10 +643,11 @@ v1 目标是证明 serving-first 控制有效，不追求完整 PCIe 拓扑感�
 
 ### 8.10 2026-07-09 实现验证
 
-- 单元测试：新增 12 个 lifecycle case，覆盖 lease begin/renew/end、managed
+- 单元测试：新增 16 个 lifecycle/wiring case，覆盖 lease begin/renew/end、managed
   connector 去重、non-layerwise/layerwise/no-store/异常路径、MP pending/并发
-  future，以及最后一个 MP STORE 后无下一 serving step 时仍能 end；原 LMCache
-  connector 23 个测试保持通过。
+  future、最后一个 MP STORE 后无下一 serving step 时仍能 end，以及真实
+  connector 初始化和外部 LMCache metadata shape；原 LMCache connector 23 个测试
+  保持通过。
 - 真实 non-layerwise：Qwen3-0.6B + DMI + LMCache CPU，1024-token cold store；
   日志顺序为 `lmcache_store begin` → 6.32ms offload → end，end 后 governor
   deadline 立即归零。
@@ -668,6 +659,12 @@ v1 目标是证明 serving-first 控制有效，不追求完整 PCIe 拓扑感�
 
 ### 8.11 2026-07-09 scheduler benchmark 重跑
 
+本节记录的是实现阶段的 preliminary matrix：每轮 8 个请求、3 次独立重启，未
+单独排除首请求 warmup，因此适合验证方向，不作为最终 paper-grade 置信区间。
+review 后的 formal harness 已改为每轮 2 个 warmup + 32 个 measured stores、至少
+3 次重复，并在 `gov_on` 下强制检查 lifecycle start/end 配对。对旧数据做删首请求
+敏感性分析后，三种模式的 P95 改善方向仍保持（13.1% / 23.4% / 19.8%）。
+
 #### 8.11.1 Non-layerwise 高压有效性
 
 实验固定使用 GPU 2、Qwen3-0.6B、LMCache CPU backend 和 7 个 DMI hooks
@@ -678,10 +675,10 @@ v1 目标是证明 serving-first 控制有效，不追求完整 PCIe 拓扑感�
 
 | 条件 | 平均请求延迟 | P95 请求延迟 | LMCache D2H 均值 | LMCache D2H 带宽 |
 |---|---:|---:|---:|---:|
-| DMI 关闭 | 146.74ms | 169.97ms | 31.19ms | 20.98Gbps |
-| DMI 开，scheduler 关闭 | 182.46ms | 205.15ms | 54.19ms | 12.09Gbps |
-| scheduler 开，旧 5ms watchdog | 179.10ms | 201.30ms | 53.53ms | 12.24Gbps |
-| scheduler 开，完整 lifecycle / 1s watchdog | 158.95ms | 180.12ms | 31.10ms | 21.03Gbps |
+| DMI 关闭 | 146.74ms | 169.97ms | 31.19ms | 20.98GB/s |
+| DMI 开，scheduler 关闭 | 182.46ms | 205.15ms | 54.19ms | 12.09GB/s |
+| scheduler 开，旧 5ms watchdog | 179.10ms | 201.30ms | 53.53ms | 12.24GB/s |
+| scheduler 开，完整 lifecycle / 1s watchdog | 158.95ms | 180.12ms | 31.10ms | 21.03GB/s |
 
 结果说明：
 
@@ -705,8 +702,8 @@ v1 目标是证明 serving-first 控制有效，不追求完整 PCIe 拓扑感�
 
 该 workload 会让单 step DMI 数据达到约 2526.9MB，超过 2048MiB pinned
 staging，触发既有 eager-dispatch safety path；这是刻意构造的高压边界，不代表
-普通 serving 的常态。50ms NVML 采样会漏掉 31--54ms 的短 burst，因此结论以
-LMCache 自身的 operation timing 和客户端延迟为主，NVML 只作交叉检查。
+普通 serving 的常态。结论只使用 LMCache operation completion、DMI 自有 probe
+和客户端延迟；NVML 不进入控制或正式评估口径。
 
 原始结果：
 
@@ -737,9 +734,9 @@ LMCache operation-level `cost`。
 
 | 条件 | 平均请求延迟 | P95 请求延迟 | LMCache store 均值 | LMCache store 带宽 |
 |---|---:|---:|---:|---:|
-| DMI 关闭 | 126.88ms | 149.87ms | 82.95ms | 7.92Gbps |
-| DMI 开，scheduler 关闭 | 177.87ms | 193.70ms | 130.46ms | 5.03Gbps |
-| DMI 开，完整 lifecycle governor | 133.44ms | 153.32ms | 88.83ms | 7.40Gbps |
+| DMI 关闭 | 126.88ms | 149.87ms | 82.95ms | 7.92GB/s |
+| DMI 开，scheduler 关闭 | 177.87ms | 193.70ms | 130.46ms | 5.03GB/s |
+| DMI 开，完整 lifecycle governor | 133.44ms | 153.32ms | 88.83ms | 7.40GB/s |
 
 - governor-on 相比 governor-off：mean latency -25.0%、P95 -20.8%、store cost
   -31.9%、store bandwidth +47.0%。
@@ -766,9 +763,9 @@ event 完成。该 audit 默认关闭，不进入生产热路径。
 
 | 条件 | 平均请求延迟 | P95 请求延迟 | MP future completion 均值 | 等效带宽 |
 |---|---:|---:|---:|---:|
-| DMI 关闭 | 120.82ms | 156.94ms | 108.84ms | 6.24Gbps |
-| DMI 开，scheduler 关闭 | 142.59ms | 173.32ms | 137.45ms | 4.82Gbps |
-| DMI 开，完整 lifecycle governor | 127.87ms | 158.51ms | 104.80ms | 6.31Gbps |
+| DMI 关闭 | 120.82ms | 156.94ms | 108.84ms | 6.24GB/s |
+| DMI 开，scheduler 关闭 | 142.59ms | 173.32ms | 137.45ms | 4.82GB/s |
+| DMI 开，完整 lifecycle governor | 127.87ms | 158.51ms | 104.80ms | 6.31GB/s |
 
 - governor-on 相比 governor-off：mean latency -10.3%、P95 -8.54%、future
   completion -23.8%、等效带宽 +30.8%。
@@ -789,3 +786,19 @@ pending-only watcher 直接查询 CUDA event，正式矩阵中全部 24 个 oper
 
 - `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_mp_3rep_20260709/`
 - `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_mp_dmi_off_3rep_20260709/`
+
+### 8.12 2026-07-10 review 收敛
+
+- 删除 NVML throughput monitor 及其 summary 字段。它不参与 governor 决策，实测
+  `50ms` 请求周期在三卡轮询时退化为约 `174ms`，无法解析 KV burst；正式口径只用
+  lifecycle completion、DMI 自有 cudaEvent probe 和客户端延迟。
+- 修复 feedback active 状态只在 hot window 续期的问题：active 且未达到连续 clean
+  恢复条件时，每个决策窗都滚动有界 deadline；超过两个窗口没有 `on_step()` 时仍
+  自然过期。`feedback_yields` 只统计 normal→avoid 状态边沿。
+- formal benchmark 默认 3 repetitions、每轮 2 warmup + 32 measured stores，并用
+  Latin-square 顺序轮换三个条件；汇总器会拒绝请求不足、配置错位、客户端错误以及
+  `gov_on` 中未配对或未真正触发的 lifecycle hint。
+- LMCacheMP audit 改为 episode 口径并记录一个 episode 覆盖的 STORE 数；overlap 时
+  聚合该 episode 的总字节，不再把一个 watcher duration 按数组下标伪配给单请求。
+- governor debug 明确输出 `start/renew/end`，旧日志 fallback 也会在 watchdog 过期后
+  把下一次 hint 识别为 fresh start，避免虚增 coverage。

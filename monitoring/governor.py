@@ -164,6 +164,7 @@ class PCIeGovernor:
         source = str(hint.source or "")
         ending = hint.valid_until_ns > 0 and hint.valid_until_ns <= now
         self._expire_hint_deadlines(now)
+        source_was_active = source in self._hint_deadlines_ns
         self.hints_seen += 1
 
         if not self._hint_is_relevant(hint) and not (
@@ -175,8 +176,10 @@ class PCIeGovernor:
 
         self.hints_accepted += 1
         if ending:
+            action = "end"
             self._hint_deadlines_ns.pop(source, None)
         else:
+            action = "renew" if source_was_active else "start"
             requested = (
                 int(hint.valid_until_ns)
                 if hint.valid_until_ns > now
@@ -188,7 +191,14 @@ class PCIeGovernor:
 
         self._refresh_hint_deadline()
         self._write_defer(now)
-        self._debug_log("hint", hint=hint, hint_deadline_ns=self._hint_deadline_ns)
+        self._debug_log(
+            "hint",
+            hint=hint,
+            action=action,
+            now_ns=now,
+            source_deadline_ns=self._hint_deadlines_ns.get(source, 0),
+            hint_deadline_ns=self._hint_deadline_ns,
+        )
 
     def on_step(self) -> None:
         with self._state_lock:
@@ -204,6 +214,8 @@ class PCIeGovernor:
         self._expire_hint_deadlines(now)
         if self._feedback_deadline_ns <= now:
             self._feedback_deadline_ns = 0
+            self._feedback_active = False
+            self._clean_windows = 0
 
         if (
             self._last_stats is not None
@@ -256,8 +268,6 @@ class PCIeGovernor:
             self._hot_windows = 0
             if is_hot:
                 self._clean_windows = 0
-                self._feedback_deadline_ns = now + 2 * self._feedback_window_ns
-                self.feedback_yields += 1
             elif is_clean:
                 self._clean_windows += 1
             else:
@@ -269,6 +279,11 @@ class PCIeGovernor:
                 self._feedback_active = False
                 self._feedback_deadline_ns = 0
                 self._clean_windows = 0
+            else:
+                # Stay in avoid mode until enough consecutive clean windows
+                # arrive. The bounded deadline still lets the state decay when
+                # serving stops calling on_step().
+                self._feedback_deadline_ns = now + 2 * self._feedback_window_ns
 
         self._last_stats = stats
         self._window_started_ns = now
