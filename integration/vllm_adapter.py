@@ -536,7 +536,7 @@ class DMXGPUWorker(Worker):
                 ac,
                 "dmx_pcie_governor_max_defer_us",
                 "DMX_PCIE_GOVERNOR_MAX_DEFER_US",
-                5_000,
+                1_000_000,
             )),
             hard_watermark_ratio=float(_cfg(
                 ac,

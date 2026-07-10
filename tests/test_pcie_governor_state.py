@@ -122,6 +122,19 @@ def test_h2d_hint_is_audit_only_and_does_not_defer_drain():
     assert governor.snapshot()["hints_ignored"] == 1
 
 
+def test_default_max_defer_is_a_stale_hint_watchdog():
+    assert PCIeGovernorConfig().max_defer_us == 1_000_000
+
+
+def test_lmcache_mp_store_is_a_trusted_d2h_source():
+    governor, engine, clock = _governor(max_defer_us=10_000)
+
+    governor.on_hint(PCIeHint(direction="D2H", source="lmcache_mp_store"))
+
+    assert engine.defer_writes[-1] > clock()
+    assert governor.snapshot()["hints_accepted"] == 1
+
+
 def test_ending_one_source_keeps_other_source_deferred():
     governor, engine, clock = _governor(max_defer_us=10_000)
     governor.on_hint(PCIeHint(direction="D2H", source="kv_store"))

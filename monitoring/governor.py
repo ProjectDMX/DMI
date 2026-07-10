@@ -25,7 +25,8 @@ class PCIeGovernorConfig:
 
     enabled: bool = False
     hint_min_bytes: int = 4 * 1024 * 1024
-    max_defer_us: int = 5_000
+    # Safety expiry for a missing end hint, not the normal yield duration.
+    max_defer_us: int = 1_000_000
     hard_watermark_ratio: float = 0.80
     max_d2h_chunk_bytes: int = 32 * 1024 * 1024
     baseline_gbps: float = 0.0
@@ -94,6 +95,7 @@ class PCIeGovernor:
         {
             "kv_store",
             "lmcache_store",
+            "lmcache_mp_store",
             "offloading_store",
         }
     )
