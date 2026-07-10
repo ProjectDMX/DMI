@@ -74,12 +74,19 @@ def _governor(**kwargs) -> tuple[PCIeGovernor, FakeEngine, FakeClock]:
     return PCIeGovernor(engine, cfg, clock_ns=clock), engine, clock
 
 
-def _add_probe(engine: FakeEngine, *, bandwidth_gbps: float) -> None:
+def _add_probe(
+    engine: FakeEngine,
+    *,
+    bandwidth_gbps: float,
+    host_bandwidth_gbps: float | None = None,
+) -> None:
     bytes_sample = 10 * 1024 * 1024
     engine.stats["d2h_probe_bytes"] += bytes_sample
-    engine.stats["d2h_probe_event_us"] += int(
-        (bytes_sample * 8) / (bandwidth_gbps * 1000)
-    )
+    event_us = int((bytes_sample * 8) / (bandwidth_gbps * 1000))
+    host_gbps = host_bandwidth_gbps or bandwidth_gbps
+    host_us = int((bytes_sample * 8) / (host_gbps * 1000))
+    engine.stats["d2h_probe_event_us"] += event_us
+    engine.stats["d2h_probe_host_us"] += max(event_us, host_us)
 
 
 def test_hint_enters_defer_and_resume_hint_clears_only_hint_deadline():
@@ -206,6 +213,32 @@ def test_feedback_uses_wall_clock_windows_before_yielding_and_cleaning():
     assert engine.defer_writes[-1] == 0
     assert governor.snapshot()["feedback_deadline_ns"] == 0
     assert governor.snapshot()["feedback_active"] is False
+
+
+def test_feedback_detects_host_side_queueing_when_event_bandwidth_stays_fast():
+    governor, engine, clock = _governor(
+        baseline_gbps=100.0,
+        pressure_ewma_alpha=1.0,
+        p_hi=0.35,
+        feedback_window_ms=100,
+        hot_windows_to_yield=1,
+    )
+    governor.on_step()
+
+    _add_probe(
+        engine,
+        bandwidth_gbps=100.0,
+        host_bandwidth_gbps=50.0,
+    )
+    clock.advance_ms(100)
+    governor.on_step()
+
+    snapshot = governor.snapshot()
+    assert snapshot["feedback_active"] is True
+    assert snapshot["ewma_pressure"] == pytest.approx(0.5, abs=0.01)
+    assert snapshot["probe_event_gbps"] == pytest.approx(100.0, rel=0.01)
+    assert snapshot["probe_effective_gbps"] == pytest.approx(50.0, rel=0.01)
+    assert snapshot["probe_queue_us"] > 0
 
 
 def test_mid_band_window_breaks_consecutive_hot_sequence():

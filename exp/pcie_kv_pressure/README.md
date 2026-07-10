@@ -22,6 +22,10 @@ placeholder samples. Set `DRY_RUN=0` explicitly before using a GPU.
 
 - `run_synthetic_pressure.sh`: main launcher for synthetic PCIe pressure.
 - `scripts/synthetic_pcie_hog.py`: CUDA D2H/H2D hog, with dry-run mode.
+- `scripts/synthetic_governor_contention.py`: native RingEngine benchmark for
+  chunk capping and lifecycle-hint protection.
+- `scripts/synthetic_feedback_activation.py`: native sustained-pressure check
+  for passive feedback activation.
 - `scripts/build_real_reentry_trace.py`: wrapper around HiddenCache
   `RealReentry` builders for real dataset traces.
 - `scripts/generate_kv_pressure_trace.py`: writes `prefix_bank.jsonl`,
@@ -81,13 +85,24 @@ Direction choices:
 
 Use the native contention benchmark first. It creates real RingEngine backlog,
 then times a serving-critical D2H copy with no control, chunk capping only, and
-the complete governor:
+chunk capping plus a lifecycle hint:
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 conda run --no-capture-output -n agent-dmi \
   python exp/pcie_kv_pressure/scripts/synthetic_governor_contention.py \
   --out-dir exp/pcie_kv_pressure/results/native_contention \
   --repetitions 50
+```
+
+This benchmark intentionally isolates the fast hint path; its condition is named
+`hint_and_cap` and it does not claim to exercise feedback. Verify the passive
+feedback path separately with sustained external D2H pressure. This check fails
+unless real `on_step()` windows drive the governor into its feedback avoid state:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 conda run --no-capture-output -n agent-dmi \
+  python exp/pcie_kv_pressure/scripts/synthetic_feedback_activation.py \
+  --out-dir exp/pcie_kv_pressure/results/native_feedback
 ```
 
 For an end-to-end vLLM + DMI + LMCache run, use isolated high-intensity store

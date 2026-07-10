@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure governor protection under forced DMI/critical-D2H overlap."""
+"""Measure chunk-cap and lifecycle-hint protection for a critical D2H copy."""
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ def run_condition(args: argparse.Namespace, condition: str) -> list[dict[str, An
     activate(transport)
 
     governor = None
-    if condition == "gov_on":
+    if condition == "hint_and_cap":
         governor = PCIeGovernor(
             engine,
             PCIeGovernorConfig(
@@ -253,7 +253,7 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    conditions = ("idle", "gov_off", "cap_only", "gov_on")
+    conditions = ("idle", "gov_off", "cap_only", "hint_and_cap")
     for condition in conditions:
         rows.extend(run_condition(args, condition))
 
@@ -286,9 +286,11 @@ def main() -> None:
         "comparisons": {
             "uncontrolled_slowdown_vs_idle": compare_conditions("gov_off", "idle"),
             "cap_only_vs_off": compare_conditions("cap_only", "gov_off"),
-            "governor_on_vs_cap_only": compare_conditions("gov_on", "cap_only"),
-            "governor_on_vs_off": compare_conditions("gov_on", "gov_off"),
-            "governor_gap_vs_idle": compare_conditions("gov_on", "idle"),
+            "hint_and_cap_vs_cap_only": compare_conditions(
+                "hint_and_cap", "cap_only"
+            ),
+            "hint_and_cap_vs_off": compare_conditions("hint_and_cap", "gov_off"),
+            "hint_and_cap_gap_vs_idle": compare_conditions("hint_and_cap", "idle"),
         },
     }
     summary_path = args.out_dir / "contention_summary.json"

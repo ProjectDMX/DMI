@@ -274,7 +274,7 @@ def test_governor_on_step_runs_after_prepare_step_without_force_eager_change():
     assert a.transport.force_eager is False
 
 
-def test_governor_failure_is_fail_open_and_does_not_abort_serving_step():
+def test_governor_failure_is_logged_and_does_not_abort_serving_step(caplog):
     ctx = _make_ctx()
     engine = FakeEngine(prepare_step_result=2)
     governor = RaisingGovernor()
@@ -283,6 +283,8 @@ def test_governor_failure_is_fail_open_and_does_not_abort_serving_step():
 
     a.before_forward("raw")
 
+    assert "PCIe governor failed" in caplog.text
+    assert "synthetic governor failure" in caplog.text
     assert governor.disabled is True
     assert a.transport.governor is None
     assert a.transport.force_eager is True

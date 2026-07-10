@@ -124,6 +124,9 @@ class PCIeGovernor:
 
         self._baseline_gbps = float(config.baseline_gbps or 0.0)
         self._ewma_pressure = 0.0
+        self._last_probe_event_gbps = 0.0
+        self._last_probe_effective_gbps = 0.0
+        self._last_probe_queue_us = 0
         self._clean_windows = 0
         self._hot_windows = 0
 
@@ -235,15 +238,23 @@ class PCIeGovernor:
 
         probe_bytes = self._delta(stats, "d2h_probe_bytes")
         probe_event_us = self._delta(stats, "d2h_probe_event_us")
+        probe_host_us = self._delta(stats, "d2h_probe_host_us")
         stall_count = self._delta(stats, "stall_count")
 
         pressure_observed = False
         pressure = self._ewma_pressure
         if probe_bytes > 0 and probe_event_us > 0:
-            bw_gbps = (probe_bytes * 8.0) / (probe_event_us * 1000.0)
-            self._update_baseline(bw_gbps)
+            event_bw_gbps = (probe_bytes * 8.0) / (probe_event_us * 1000.0)
+            effective_us = max(probe_event_us, probe_host_us)
+            effective_bw_gbps = (probe_bytes * 8.0) / (effective_us * 1000.0)
+            self._last_probe_event_gbps = event_bw_gbps
+            self._last_probe_effective_gbps = effective_bw_gbps
+            self._last_probe_queue_us = max(0, probe_host_us - probe_event_us)
+            self._update_baseline(effective_bw_gbps)
             if self._baseline_gbps > 0:
-                raw_pressure = max(0.0, 1.0 - (bw_gbps / self._baseline_gbps))
+                raw_pressure = max(
+                    0.0, 1.0 - (effective_bw_gbps / self._baseline_gbps)
+                )
                 alpha = min(max(float(self.config.pressure_ewma_alpha), 0.0), 1.0)
                 pressure = alpha * raw_pressure + (1.0 - alpha) * self._ewma_pressure
                 self._ewma_pressure = pressure
@@ -292,6 +303,9 @@ class PCIeGovernor:
             "step",
             pressure=round(self._ewma_pressure, 4),
             baseline_gbps=round(self._baseline_gbps, 4),
+            probe_event_gbps=round(self._last_probe_event_gbps, 4),
+            probe_effective_gbps=round(self._last_probe_effective_gbps, 4),
+            probe_queue_us=self._last_probe_queue_us,
             hint_deadline_ns=self._hint_deadline_ns,
             feedback_deadline_ns=self._feedback_deadline_ns,
         )
@@ -334,6 +348,9 @@ class PCIeGovernor:
             "defer_until_ns": self._last_written_defer_ns,
             "baseline_gbps": self._baseline_gbps,
             "ewma_pressure": self._ewma_pressure,
+            "probe_event_gbps": self._last_probe_event_gbps,
+            "probe_effective_gbps": self._last_probe_effective_gbps,
+            "probe_queue_us": self._last_probe_queue_us,
             "clean_windows": self._clean_windows,
             "hot_windows": self._hot_windows,
             "window_started_ns": self._window_started_ns,

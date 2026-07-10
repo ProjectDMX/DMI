@@ -129,11 +129,12 @@ drain 本来就按批发 `cudaMemcpyAsync` D2H（`drain_thread.cpp: enqueue_d2h`
 按 **flush batch** 套一对 cudaEvent（不是按 ring wrap chunk；一个 batch 内
 可能因 wrap 被拆成 2-3 段 memcpy）：
 
-- `achieved_bw = batch_bytes / (t_end − t_start)`
+- `event_bw = batch_bytes / cuda_event_elapsed`（DMA 获得执行机会后的速率）
+- `effective_bw = batch_bytes / max(host_elapsed, cuda_event_elapsed)`（控制信号）
 - `approx_queue_delay = host_elapsed − cuda_event_elapsed`
 
 C++ 只导出单调计数器；空载标定、EWMA 和
-`P = 1 − achieved_bw/bw_baseline` 全在 Python governor 的 step 差分里算，
+`P = 1 − effective_bw/bw_baseline` 全在 Python governor 的 step 差分里算，
 便于 §2.5 反复调参。
 
 **角色一（持续域估计器）**：流式换入换出、TP/PP-over-PCIe、多租户挤压——
@@ -395,7 +396,7 @@ EWMA / baseline / hysteresis，只负责反馈状态机和过期重算。governo
 `before_forward()` 在同一个 worker 线程串行调用。LMCacheMP 是例外：STORE
 真正完成发生在后台 CUDA future 上，且 serving 在最后一个请求后不保证再调用
 `get_finished()`。因此只有 MP connector 在 pending STORE 期间启动一个 daemon
-watcher，每 5ms 查询已有 `CUDAMessagingFuture`，完成即发 end，长 operation 每
+watcher，每 20ms 查询已有 `CUDAMessagingFuture`，完成即发 end，长 operation 每
 100ms renew；无 pending STORE 时线程退出。governor 用 `RLock` 串行化 worker
 thread 的 `on_step()` 与 watcher thread 的 renew/end。普通 LMCache 路径仍无新增
 线程或锁；C++ 跨 drain/mgmt 线程接口仍只有 3 个 atomic。`snapshot()` 只用于
@@ -404,7 +405,7 @@ thread 的 `on_step()` 与 watcher thread 的 renew/end。普通 LMCache 路径�
 poll 点。
 
 baseline 初始化：若配置 `baseline_gbps`，直接使用固定基线；否则用 probe
-`event_bw` 的 running max（慢衰减）作为初始 v1 基线。§2.5 实验 4 后再替换成
+`effective_bw` 的 running max（慢衰减）作为初始 v1 基线。§2.5 实验 4 后再替换成
 更精细的空闲重标定。
 
 时钟契约：`defer_until_ns` 使用 Linux `CLOCK_MONOTONIC` 纳秒。Python 侧用
@@ -480,7 +481,10 @@ connector 做 optional import。vLLM worker 一进程一卡，v1 不需要单独
    - 所有 D2H batch 累加 `d2h_bytes` / `d2h_batches`。
    - 样本 >=4MB 时再累加 `d2h_probe_bytes` / `d2h_probe_event_us` /
      `d2h_probe_host_us`，Python 用差分计算
-     `event_bw` 和 `approx_queue_delay = host_elapsed_us - event_elapsed_us`。
+     `event_bw`、`effective_bw = bytes / max(host_elapsed, event_elapsed)` 和
+     `approx_queue_delay = host_elapsed_us - event_elapsed_us`。反馈 pressure 使用
+     `effective_bw`；否则外部 copy 排队只增加 host wait、event bandwidth 仍接近峰值时
+     会被错误判成零压力。
    - baseline、EWMA、pressure、clean window 都在 Python governor 内做。这些统计
      只用于持续压力反馈和审计，不尝试实时捕捉 ms 级 burst。
 
@@ -802,3 +806,16 @@ pending-only watcher 直接查询 CUDA event，正式矩阵中全部 24 个 oper
   聚合该 episode 的总字节，不再把一个 watcher duration 按数组下标伪配给单请求。
 - governor debug 明确输出 `start/renew/end`，旧日志 fallback 也会在 watchdog 过期后
   把下一次 hint 识别为 fresh start，避免虚增 coverage。
+- `on_step()` 的 fail-open 路径现在先记录异常堆栈，再关闭 governor 并恢复普通 drain，
+  避免生产环境静默失去调度保护。
+- LMCache 遇到未知 `save_spec` / request metadata 形状时改为保守发 store hint，并用
+  `warning_once` 暴露兼容性退化；明确 `can_save=False` 仍不会发 hint。
+- LMCacheMP pending watcher 从 5ms 轮询降为 20ms，并增加跨 renew interval 的真实线程
+  测试，验证长时间异步 future 会持续续租、完成后立即 end。
+- 原生微基准不再把 hint-only 条件称为完整 governor：collision benchmark 的条件名改为
+  `hint_and_cap`；另增持续 D2H pressure benchmark，真实调用 `on_step()` 并要求 feedback
+  状态机实际进入 avoid 状态。
+- 持续 D2H 原生验证暴露了 event-only feedback 的盲点：RTX 4090 上外部 D2H hog 已
+  持续占链路时，DMI cudaEvent bandwidth 仍约为 201Gbit/s，排队体现在 host elapsed。
+  governor 因此改用包含 queue wait 的 `effective_bw` 算 pressure，同时保留 event BW
+  和 queue delay 供审计。

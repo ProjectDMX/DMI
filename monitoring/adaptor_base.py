@@ -27,6 +27,7 @@ ordering with mocks.
 from __future__ import annotations
 
 import abc
+import logging
 from typing import List, Optional, TYPE_CHECKING
 
 import torch
@@ -47,6 +48,9 @@ from .step_context import StepContext
 
 if TYPE_CHECKING:
     from .engine import MonitoringEngine
+
+
+logger = logging.getLogger(__name__)
 
 
 class BackendAdaptor(abc.ABC):
@@ -171,6 +175,10 @@ class BackendAdaptor(abc.ABC):
                 try:
                     governor.on_step()
                 except Exception:
+                    logger.exception(
+                        "PCIe governor failed; disabling it and continuing "
+                        "with ungoverned DMI drain"
+                    )
                     try:
                         governor.disable()
                     except Exception:

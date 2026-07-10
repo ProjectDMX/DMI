@@ -134,6 +134,22 @@ for o in llm.generate(["The answer is"], SamplingParams(max_tokens=16)):
 | **[HuggingFace](docs/huggingface.md)** | Run HF generation, monitored generation, and offline benchmark scripts |
 | **[vLLM](docs/vllm.md)** | Run DMI through the vLLM offline API or `vllm serve` |
 
+## Roadmap
+
+We are working to make DMI useful across more backends, more models, and more
+stages of the model lifecycle.
+
+- **More backend support and models** — Bring DMI to **SGLang** and expand support for
+  more widely used model families, including multimodal models.
+- **From inference to training** — Extend DMI's low-overhead inspection to
+  large-scale training framework. (**Megatron**).
+- **From observation to action** — Low-latency streaming/pluggable APIs enables more downstream applications like online monitoring, activation steering,
+    distillation, and speculative decoding.
+- **Broader PCIe-aware scheduling** — Extend DMI's serving-first drain governor
+  to more KV connectors, multi-rank topologies, and other serving traffic.
+
+
+
 ## Contribute
 
 DMI is an early research system from FrootLab at the University of Maryland, and
