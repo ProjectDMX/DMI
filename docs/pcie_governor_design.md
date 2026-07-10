@@ -877,6 +877,22 @@ error。三个模式的 governor-on 合计 306 start / 4 renew / 306 end，0 exp
 101.67ms、93.78ms、112.92ms。端到端 feedback activation 均为 0，这是预期结果：
 1.5s 间隔的 KV burst 由前馈 hint 处理，持续域能力由上一节的独立 feedback 实验验证。
 
+#### 8.13.4 持续过载边界（单独报告）
+
+另用同一模型和 DMI 配置，在 0.72s 内注入 24 个 6144-token prefix（约 15.75GB
+KV 引用量），三条件各跑 3 次；每轮去掉 2 个 warmup 后保留 22 个请求。该 workload
+故意不给 DMI 空窗，不能与 8.13.3 的 serving-first 有效性结果合并。
+
+`gov_on` 相比 `gov_off`，KV completion mean 降低 45.94%、P95 降低 52.32%、
+KV bandwidth 提高 41.28%，基本恢复到 `dmi_off`（completion mean -0.16%、
+bandwidth +0.73%）。但 client mean/P95 latency 反而增加 56.39% / 65.36%，request
+throughput 下降 35.08%；相对 `dmi_off` 的 P95 更高 131.58%。三轮均无请求错误且
+hint start/end 配平。
+
+这个结果确认系统边界：governor 能把当前 PCIe 服务权让给 KV，但不能增加链路容量；
+持续超载时，被延后的 DMI backlog 最终仍要排水，代价会转移到后续 serving。论文应把
+它作为 overload limitation，而不能用饱和流结果否定或夸大 burst scheduling 收益。
+
 原始结果：
 
 - `exp/pcie_kv_pressure/results/pcie_scheduler_overhead_queueaware_20260710/`
@@ -885,3 +901,4 @@ error。三个模式的 governor-on 合计 306 start / 4 renew / 306 end，0 exp
 - `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_inprocess_queueaware_20260710/`
 - `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_layerwise_queueaware_20260710/`
 - `exp/pcie_kv_pressure/results/pcie_scheduler_effectiveness_mp_queueaware_20260710/`
+- `exp/pcie_kv_pressure/results/pcie_scheduler_saturation_inprocess_queueaware_20260710/`
