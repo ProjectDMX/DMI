@@ -307,6 +307,18 @@ class HookPoint(nn.Module):
         from . import ring_transport as _rt
         transport = _rt._active_transport
         if transport is not None and transport.force_eager:
+            # Node-toggle: the eager safety net fires producers WITHOUT a graph,
+            # so cudaGraphNodeSetEnabled cannot gate them. On a gated step (a
+            # decode step that overflowed -> force_eager) a disabled hook must
+            # skip here too, or it fires while meta/reserve counted only the
+            # enabled subset -> ring desync. Gate host-side (safe: this branch
+            # is never captured/compiled). The toggle_gate_active short-circuit
+            # keeps the non-toggle eager path (stock prefill) untouched.
+            if (transport.toggle_gate_active
+                    and getattr(transport, "_gated_step", True)
+                    and not transport._ring_engine.is_hook_enabled(
+                        self._ring_hook_type, self._ring_hook_id)):
+                return x_cont
             engine = transport._ring_engine
             if engine is not None:
                 nbytes = x_cont.nbytes

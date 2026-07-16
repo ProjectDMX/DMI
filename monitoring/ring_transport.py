@@ -16,7 +16,7 @@ All transport now uses the CUDA-graph-compatible forward-hook path.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.library
@@ -429,6 +429,21 @@ class RingTransport:
         self._active_specs: List[HookSpec] = []
         self._using_forward_hooks: bool = False
 
+        # Runtime node-toggle controller (monitoring/node_toggle.py), created
+        # on first use. None (or absent on a minimally-constructed transport)
+        # => toggle inactive => every active spec fires every step.
+        self._toggle: "Optional[NodeToggleController]" = None
+        # Per-step gate selector. The toggle gate (SetEnabled on captured nodes)
+        # only governs producers that run INSIDE a replayed decode graph. In a
+        # prefill / eager step the producers run unconditionally (no graph to
+        # gate), so meta-push and capacity-reserve MUST use the full active set
+        # that step, or they desync (reserve/meta < producers fired). The
+        # serving-framework adapter sets this per step (True = decode-graph step,
+        # gate applies; False = prefill/eager step, use full active_specs).
+        # Default True so a synthetic single-graph test that only drives decode
+        # keeps gating.
+        self._gated_step: bool = True
+
         # Hook selection preset name (e.g. "full", "hidden-states", "logits").
         # Set by the active adapter before hook installation.
         self._hook_selection: Optional[str] = None
@@ -485,6 +500,47 @@ class RingTransport:
         """Set the model shape config for analytical shape computation."""
         self._model_cfg = cfg
 
+    @property
+    def effective_specs(self) -> "List[HookSpec]":
+        """The specs that actually fire this step -- the single set that must
+        drive capacity-reserve, meta-push and device node-enable in lockstep.
+        Toggle active -> the precomputed enabled-AND-captured subset; else all
+        active specs (toggle inactive: every active hook fires every step).
+
+        getattr default: a minimally-constructed transport (tests build one
+        via ``RingTransport.__new__``) has no controller -> inactive."""
+        t = getattr(self, "_toggle", None)
+        if (t is not None and t.gate_active
+                and t.effective_enabled_specs is not None):
+            return t.effective_enabled_specs
+        return self._active_specs
+
+    def specs_for_step(self) -> "List[HookSpec]":
+        """The spec set that drives meta-push + capacity-reserve THIS step.
+        Decode-graph step -> effective_specs (toggle gate applies); prefill /
+        eager step -> full active_specs (producers run ungated, so meta/reserve
+        must match the full set). When toggle is inactive the two are identical.
+        """
+        if getattr(self, "_gated_step", True):
+            return self.effective_specs
+        return self._active_specs
+
+    def _toggle_ctrl(self) -> "NodeToggleController":
+        if self._toggle is None:
+            from monitoring.node_toggle import NodeToggleController
+            self._toggle = NodeToggleController(self._ring_engine, self)
+        return self._toggle
+
+    @property
+    def toggle_gate_active(self) -> bool:
+        t = getattr(self, "_toggle", None)
+        return t is not None and t.gate_active
+
+    @property
+    def toggle_lazy_active(self) -> bool:
+        t = getattr(self, "_toggle", None)
+        return t is not None and t.lazy_active
+
     def pre_push_all_metas(self, batch: int, q_len: int, kv_dim: int,
                            logits_to_keep: int = 0,
                            token_ids_dtype: Optional[torch.dtype] = None,
@@ -518,7 +574,12 @@ class RingTransport:
         shapes = []
         dtypes = []
         flags = []
-        for spec in self._active_specs:
+        # Iterate the per-step spec set: host meta set == device enabled set ==
+        # capacity-reserve set (the lockstep gate). On a decode-graph step this
+        # is the toggle subset; on a prefill/eager step it is the full active
+        # set (producers run ungated there). When toggle is inactive the two are
+        # identical.
+        for spec in self.specs_for_step():
             spec_q_len = (actual_q_len if actual_q_len is not None
                           and spec.dim0_is_actual_tokens
                           else q_len)
@@ -554,6 +615,36 @@ class RingTransport:
                 list(self._current_dim0_offsets),
                 list(self._current_kv_offsets) if self._current_kv_offsets else [],
             )
+
+    def set_active_hooks(self, enabled: "Iterable[Tuple[int, int]]") -> None:
+        """Eager node-toggle reconfigure (quiescent-point only). See
+        ``node_toggle.NodeToggleController.set_active_hooks`` for the contract."""
+        self._toggle_ctrl().set_active_hooks(enabled)
+
+    def set_active_hooks_lazy(self, enabled: "Iterable[Tuple[int, int]]") -> None:
+        """Lazy node-toggle reconfigure (device apply deferred per graph). See
+        ``node_toggle.NodeToggleController.set_active_hooks_lazy``."""
+        self._toggle_ctrl().set_active_hooks_lazy(enabled)
+
+    def is_graph_ready(self, raw_graph: int) -> bool:
+        """Read-only replay-time guard. See
+        ``node_toggle.NodeToggleController.is_graph_ready``."""
+        return self._toggle_ctrl().is_graph_ready(raw_graph)
+
+    def ensure_graph_current(self, raw_graph: int) -> int:
+        """Lazy per-graph device apply. See
+        ``node_toggle.NodeToggleController.ensure_graph_current``."""
+        return self._toggle_ctrl().ensure_graph_current(raw_graph)
+
+    def record_replay_event(self, raw_graph: int) -> int:
+        """Lazy event guard (record after replay). See
+        ``node_toggle.NodeToggleController.record_replay_event``."""
+        return self._toggle_ctrl().record_replay_event(raw_graph)
+
+    def clear_toggle(self) -> None:
+        """Paired teardown of registry + host gate. See
+        ``node_toggle.NodeToggleController.clear``."""
+        self._toggle_ctrl().clear()
 
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
                           hook_type: int, hook_id: int) -> None:

@@ -191,7 +191,8 @@ class BackendAdaptor(abc.ABC):
     def _compute_step_plan(self, ctx: StepContext) -> "tuple[int, int, bool]":
         """Return ``(aligned total bytes, n_hooks, needs_eager)`` for one step.
 
-        Single walk over ``active_specs``:
+        Single walk over ``transport.effective_specs`` (the node-toggle single
+        source of truth):
         - ``total`` and ``n_hooks`` feed ``prepare_step``.  ``n_hooks``
           counts only specs whose ``_compute_hook_shape`` returns a
           non-empty list -- matches the count of metas
@@ -200,6 +201,13 @@ class BackendAdaptor(abc.ABC):
           firing specs.  Drives the dispatch + safety-net decision in
           ``before_forward`` together with ``prepare_step``'s overflow
           result.
+
+        Reads ``transport.specs_for_step()`` -- the per-step lockstep set that
+        ``pre_push_all_metas`` also reads. On a decode-graph step that is the
+        node-toggle subset; on a prefill / eager step it is the full active set
+        (producers run ungated there). When node-toggle is inactive both are
+        ``active_specs``. Reserving for a different set than what fires would
+        drift the ring head/tail (the reserve-invariant bug).
         """
         if self.model_cfg is None or not self.active_specs:
             return 0, 0, False
@@ -207,7 +215,7 @@ class BackendAdaptor(abc.ABC):
         total = 0
         n = 0
         needs_eager = False
-        for spec in self.active_specs:
+        for spec in self.transport.specs_for_step():
             # When the adapter has populated actual_q_len AND the spec is
             # prefix-strip-eligible, size the byte budget for the unpadded
             # data the producer will actually write.  Other specs and the

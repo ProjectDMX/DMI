@@ -8,3 +8,9 @@
 void ring_set_active_engine(ring_py::RingEnginePy* e);
 void ring_diag_reset_host_counters();
 void ring_diag_print_host_counters();
+
+// Node-toggle capture window. When enabled, each producer op records the
+// kernel node it just enqueued (via cudaStreamGetCaptureInfo) into the active
+// engine's toggle registry, so it can be enabled/disabled post-capture with
+// cudaGraphNodeSetEnabled. Default off -> producer path is unchanged.
+void ring_set_toggle_capture(bool enabled);

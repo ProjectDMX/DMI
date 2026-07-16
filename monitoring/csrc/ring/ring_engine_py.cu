@@ -10,7 +10,14 @@
 #include "ring/ring_torch_op.h"
 #include "ring/producer.cuh"
 #include "ring/ring_debug.h"
+#include "ring/toggle_registry.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
+#include <cuda_runtime.h>
+#include <set>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <mutex>
 
 // Forward-declare symbols from producer.cu
 namespace ring {
@@ -37,6 +44,10 @@ struct RingEnginePy::Impl {
     // engine init; returned by payload_tensor().  Used as the
     // Tensor(a!) mutation alias passed to every producer op call.
     at::Tensor       payload_view;
+
+    // Runtime node-toggle: all state + CUDA-graph operations live in the
+    // registry (toggle_registry.h); the engine methods only delegate.
+    ToggleRegistry toggle;
 
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
@@ -106,6 +117,116 @@ void RingEnginePy::set_null_mode(bool enabled) {
 
 void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
     impl_->fifo.push_step(ctx, metas);
+}
+
+RingFlushStats RingEnginePy::get_stats() const {
+    // Reserve-invariant probe: expose the live drain-thread head/tail counters
+    // so a test can confirm the ring fully drains (head == tail_committed) after
+    // a flush -> reserve() matched actual producer writes.
+    RingFlushStats stats{};
+    auto& drain = impl_->engine.drain_thread();
+    stats.cpu_payload_head           = drain.cpu_payload_head();
+    stats.cpu_payload_tail_committed = drain.cpu_payload_tail_committed();
+    stats.cpu_task_head              = drain.cpu_task_head();
+    stats.cpu_task_tail_committed    = drain.cpu_task_tail_committed();
+    return stats;
+}
+
+// --- Runtime node-toggle -----------------------------------------
+// Thin delegates: all toggle state + CUDA-graph operations live in
+// ToggleRegistry (toggle_registry.{h,cu}). The engine only glues in the
+// process-global capture flag (ring_set_toggle_capture, read by the producer
+// op) and the ATen current stream for the replay event.
+void RingEnginePy::enable_toggle_capture(bool enabled) {
+    impl_->toggle.set_capture(enabled);
+    ring_set_toggle_capture(enabled);   // tell the producer op to record nodes
+}
+
+bool RingEnginePy::toggle_capture_enabled() const {
+    return impl_->toggle.capture_enabled();
+}
+
+void RingEnginePy::register_capture_node(uint64_t graph, int hook_type, int layer_no, uint64_t node) {
+    impl_->toggle.register_node(graph, hook_type, layer_no, node);
+}
+
+void RingEnginePy::note_capture_anomaly() {
+    impl_->toggle.note_anomaly();
+}
+
+uint64_t RingEnginePy::capture_anomaly_count() const {
+    return impl_->toggle.anomaly_count();
+}
+
+void RingEnginePy::bind_graph_exec(uint64_t graph, uint64_t exec) {
+    impl_->toggle.bind_exec(graph, exec);
+}
+
+uint64_t RingEnginePy::toggle_registry_version() const {
+    return impl_->toggle.version();
+}
+
+void RingEnginePy::set_enabled_hooks(const std::vector<std::pair<int,int>>& enabled) {
+    impl_->toggle.set_enabled(enabled);
+}
+
+int RingEnginePy::apply_toggle() {
+    return impl_->toggle.apply_all();
+}
+
+uint64_t RingEnginePy::bound_graph_count() const {
+    return impl_->toggle.bound_count();
+}
+
+uint64_t RingEnginePy::last_apply_count() const {
+    return impl_->toggle.last_apply_count();
+}
+
+bool RingEnginePy::toggle_registry_uniform() const {
+    return impl_->toggle.uniform();
+}
+
+bool RingEnginePy::is_hook_enabled(int hook_type, int layer_no) const {
+    return impl_->toggle.is_enabled(hook_type, layer_no);
+}
+
+std::vector<int> RingEnginePy::effective_enabled_mask(
+    const std::vector<std::pair<int,int>>& query) const {
+    return impl_->toggle.effective_mask(query);
+}
+
+int RingEnginePy::ensure_graph_current(uint64_t graph) {
+    return impl_->toggle.ensure_current(graph);
+}
+
+int RingEnginePy::record_replay_event(uint64_t graph) {
+    return impl_->toggle.record_replay_event(
+        graph, at::cuda::getCurrentCUDAStream().stream());
+}
+
+void RingEnginePy::_test_force_apply_error(int code) {
+    impl_->toggle.force_apply_error(code);
+}
+
+bool RingEnginePy::_test_applied_current(uint64_t graph) const {
+    return impl_->toggle.applied_current(graph);
+}
+
+uint64_t RingEnginePy::toggle_node_count() const {
+    return impl_->toggle.node_count();
+}
+
+bool RingEnginePy::is_graph_ready(uint64_t graph) const {
+    return impl_->toggle.is_ready(graph);
+}
+
+bool RingEnginePy::toggle_registry_complete() const {
+    return impl_->toggle.complete();
+}
+
+void RingEnginePy::clear_toggle_registry() {
+    impl_->toggle.clear();
+    ring_set_toggle_capture(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -230,10 +351,23 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     }
 
     // Case A: step fits.  Check available space for BOTH payload AND tasks.
-    const uint64_t payload_avail = pcap -
-        (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
-    const uint64_t task_avail = tcap -
-        (drain.cpu_task_head() - drain.cpu_task_tail_committed());
+    // Clamp `used` to [0, cap] on BOTH ends (node-toggle reserve-invariant):
+    //   - head < tail: a small constant skew exists because producers that fire
+    //     during CUDA-graph capture get drained (advancing the tail) with no
+    //     matching reserve() (which only runs per real step) -> the ring is in
+    //     fact drained, so used = 0 (avail = cap). Computing head-tail here would
+    //     underflow uint64 to a huge value -> avail = 0 -> a spurious ring-full
+    //     flush (main-stream sync) every step.
+    //   - head-tail > cap: over-reserve drift; fail safe with avail = 0 rather
+    //     than underflowing to a huge "available" that disables the check.
+    const uint64_t ph = drain.cpu_payload_head();
+    const uint64_t pt = drain.cpu_payload_tail_committed();
+    const uint64_t payload_used = (ph > pt) ? (ph - pt) : 0;
+    const uint64_t payload_avail = (payload_used >= pcap) ? 0 : pcap - payload_used;
+    const uint64_t th = drain.cpu_task_head();
+    const uint64_t tt = drain.cpu_task_tail_committed();
+    const uint64_t task_used = (th > tt) ? (th - tt) : 0;
+    const uint64_t task_avail = (task_used >= tcap) ? 0 : tcap - task_used;
 
     if (step_total_bytes <= payload_avail && num_hooks <= task_avail) {
         drain.reserve(step_total_bytes, num_hooks);
