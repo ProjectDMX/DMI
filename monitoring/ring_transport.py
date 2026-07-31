@@ -16,6 +16,7 @@ All transport now uses the CUDA-graph-compatible forward-hook path.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -64,10 +65,28 @@ SHAPE_HIDDEN, SHAPE_QKV_Q, SHAPE_QKV_KV, SHAPE_QKV_Z = 0, 1, 2, 3
 SHAPE_ATTN_WT, SHAPE_MLP_POST, SHAPE_TOKEN_IDS, SHAPE_LOGITS = 4, 5, 6, 7
 PP_ANY, PP_FIRST, PP_LAST = 0, 1, 2
 
+
+class HookRowBasis(Enum):
+    """Per-step cardinality that scales a registered hook's payload.
+
+    ``TOKEN_ROWS`` means the shape scales with ``q_len``. In packed vLLM,
+    padding-strip eligibility separately decides whether the adapter uses the
+    actual token count or the padded execution count. ``REQUEST_ROWS`` means
+    the packed-vLLM shape scales with the request count supplied through
+    ``logits_to_keep``. This enum does not describe tensor dimension order,
+    rank ownership, or prefix-strip eligibility.
+    """
+
+    TOKEN_ROWS = auto()
+    REQUEST_ROWS = auto()
+
+
 # Auto-derive all mappings
 _id_by_short: Dict[str, int] = {}       # "q" -> 6
+_shape_class_by_type: Dict[int, int] = {}
 for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS:
     _id_by_short[_short] = _id
+    _shape_class_by_type[_id] = _sc
     # Inject HOOK_TYPE_Q, HOOK_TYPE_RESID_PRE, etc. into module namespace
     globals()[f"HOOK_TYPE_{_short.upper()}"] = _id
 
@@ -97,6 +116,24 @@ PP_LAST_ONLY: frozenset = frozenset(
 )
 
 del _ext, _load_ext
+
+
+def hook_row_basis(hook_type: int) -> HookRowBasis:
+    """Return the canonical row basis derived from `_HOOK_DEFS.shape_class`.
+
+    The native hook-definition table is the sole mapping source. Logit-shaped
+    payloads are request-scaled; every other registered shape class is
+    token-scaled. An unregistered hook type is a configuration error.
+    """
+
+    try:
+        shape_class = _shape_class_by_type[hook_type]
+    except KeyError as exc:
+        raise ValueError(f"Unknown hook type: {hook_type!r}") from exc
+    if shape_class == SHAPE_LOGITS:
+        return HookRowBasis.REQUEST_ROWS
+    return HookRowBasis.TOKEN_ROWS
+
 
 # Hook selection (presets, resolve/apply, PP/TP filters) lives in
 # monitoring/selection.py -- that module imports the C++-mirror constants
@@ -163,7 +200,7 @@ class ModelShapeConfig:
 class HookSpec:
     """One monitoring hook: type, layer, shape convention, and module reference."""
     hook_type: int                        # HOOK_TYPE_* -- determines shape formula
-    module:    nn.Module                  # the HookPoint instance
+    module:    Optional[nn.Module]        # HookPoint, or None for model-wide specs
     layer_no:  int = -1                   # layer index (-1 for global hooks like embed, final_ln)
     dtype:     Optional[torch.dtype] = None  # override model dtype (e.g. int64 for token_ids)
     # True when the producer kernel may write fewer (or more) bytes than the
@@ -371,6 +408,10 @@ def install_ring_hooks(specs: List[HookSpec],
     """
     for spec in specs:
         hp = spec.module
+        if hp is None:
+            raise RuntimeError(
+                "install_ring_hooks received an unbound model-wide HookSpec"
+            )
         hp._ring_hook_type = spec.hook_type
         hp._ring_hook_id = spec.layer_no
         hp._ring_payload = ring_payload

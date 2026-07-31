@@ -8,18 +8,16 @@ Key pieces:
 
   * ``VLLMAdaptor`` -- concrete ``BackendAdaptor`` for vLLM models.
     Owns the framework-fragile pieces in localized methods:
-      ``predict_padded_q_len`` (reads ``cudagraph_dispatcher._bs_to_padded_graph_size``);
-      ``build_step_context`` (constructs the packed/flattened
-      StepContext from a ``scheduler_output`` + ``model_runner`` pair);
+      ``_record_real_layout`` (copies post-prepare packed request order);
+      ``_preflight_force_eager`` (evaluates cached worst-role formulas);
+      ``build_step_context`` (uses the real layout and batch descriptor);
       ``adapt_for_cpu_direct`` (swaps padded -> unpadded q_len when an
       oversize step forces eager dispatch + safety net for this batch);
-      ``on_capacity_exceeded`` (no-op stub; transport.force_eager is
-      owned by adaptor_base.before_forward and read by the
-      ``_determine_batch_execution_and_padding`` wrapper);
+      ``before_forward`` (commits one already-computed actual plan);
       ``_warn_once_capacity`` (per-(total_q, num_reqs) shape warn).
-  * ``DMXGPUWorker`` -- ~60-line vLLM ``Worker`` subclass that owns a
-    ``VLLMAdaptor`` and delegates per-step work to it.  Architecture
-    remap (GPT2LMHeadModel -> GPT2PLMHeadModel etc.) stays here.
+  * ``DMXGPUWorker`` -- vLLM ``Worker`` subclass that owns a
+    ``VLLMAdaptor``, records the real input layout, and commits at real
+    dispatch. Architecture remap stays here.
   * Module-level ``register_preset("vllm-full", ...)`` -- relocated
     from ``monitoring/selection.py``'s default ``_HOOK_SELECTIONS``
     (deferred from Phase 1.5 per the unified-adaptor plan).  Lands as
@@ -28,30 +26,36 @@ Key pieces:
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import os
 import re
 import warnings
 from typing import Any, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from vllm import LLM
+from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.v1.worker.gpu_worker import Worker
 
 from monitoring import ring_transport
 from monitoring.adaptor_base import BackendAdaptor
 from monitoring.ring_transport import (
+    HookRowBasis,
     HookSpec,
     ModelShapeConfig,
     _compute_hook_shape,
     align_up_py,
+    hook_row_basis,
     install_ring_hooks,
 )
 from monitoring.selection import (
-    apply_hook_selection,
-    filter_by_pp_rank,
-    filter_by_tp_rank,
+    hook_belongs_to_pp_rank,
+    hook_belongs_to_tp_rank,
     register_preset,
+    select_hook_specs,
     _HOOK_SELECTIONS,
     _ALL_HOOK_TYPES,
 )
@@ -121,6 +125,185 @@ _ARCH_REMAP = {
 
 
 # ---------------------------------------------------------------------------
+# Per-call request-layout / dispatch state
+# ---------------------------------------------------------------------------
+
+
+class VLLMStepPhase(Enum):
+    IDLE = auto()
+    ARMED = auto()
+    LAYOUT_READY = auto()
+    COMMITTED = auto()
+
+
+class VLLMValidationMode(Enum):
+    OFF = auto()
+    VERIFY = auto()
+
+
+@dataclass(frozen=True)
+class _VLLMRealLayout:
+    raw_req_ids: Tuple[str, ...]
+    req_ids: Tuple[str, ...]
+    scheduled_counts: Tuple[int, ...]
+    computed_counts: Tuple[int, ...]
+    token_ranges: Tuple[Tuple[int, int], ...]
+    dim0_offsets: Tuple[int, ...]
+    total_rows: int
+
+
+@dataclass
+class _VLLMStepState:
+    phase: VLLMStepPhase = VLLMStepPhase.IDLE
+    scheduler_output: Any = None
+    layout: Optional[_VLLMRealLayout] = None
+    force_eager_latch: bool = False
+    prelayout_dispatch_seen: bool = False
+    capacity_candidate: Optional[Tuple[Any, Any]] = None
+    expected_dispatch: Optional[Tuple[Any, Any]] = None
+    execution_bound: Optional[int] = None
+    real_rows_bound: Optional[int] = None
+    request_rows_bound: Optional[int] = None
+    real_cudagraph_mode: Any = None
+    real_batch_descriptor: Any = None
+
+
+@dataclass(frozen=True)
+class _VLLMHookSelection:
+    local_hooks: Tuple[HookSpec, ...]
+    candidate_rank_hook_sets: Tuple[Tuple[HookSpec, ...], ...]
+
+    @classmethod
+    def from_model(
+        cls,
+        *,
+        model: Any,
+        local_hooks: Tuple[HookSpec, ...],
+        hook_selection: str,
+        cfg: ModelShapeConfig,
+        parallel_config: Any,
+        hf_config: Any,
+    ) -> "_VLLMHookSelection":
+        """Select local and model-wide rank-type hooks once at attachment."""
+        tp_size = int(parallel_config.tensor_parallel_size)
+        pp_size = int(parallel_config.pipeline_parallel_size)
+        if tp_size < 1 or pp_size < 1:
+            raise RuntimeError(
+                f"Invalid vLLM parallel sizes: TP={tp_size}, PP={pp_size}"
+            )
+
+        num_layers = getattr(
+            hf_config,
+            "num_hidden_layers",
+            getattr(hf_config, "n_layer", None),
+        )
+        if num_layers is None:
+            raise RuntimeError("DMI vLLM model has no hidden-layer count")
+        num_layers = int(num_layers)
+
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+        selection_model = (
+            model.unwrap()
+            if isinstance(model, CUDAGraphWrapper)
+            else model
+        )
+        get_hook_specs = getattr(selection_model, "get_hook_specs", None)
+        if get_hook_specs is None:
+            raise RuntimeError(
+                "DMI vLLM model does not provide get_hook_specs"
+            )
+        try:
+            model_wide_specs = get_hook_specs(model_wide=True)
+        except TypeError as exc:
+            raise RuntimeError(
+                "DMI vLLM model does not support "
+                "get_hook_specs(model_wide=True)"
+            ) from exc
+        if any(spec.module is not None for spec in model_wide_specs):
+            raise RuntimeError(
+                "DMI vLLM model-wide HookSpecs must not bind live modules"
+            )
+        inventory_layers = {
+            spec.layer_no for spec in model_wide_specs if spec.layer_no >= 0
+        }
+        if inventory_layers != set(range(num_layers)):
+            raise RuntimeError(
+                "DMI vLLM model-wide hook inventory does not cover every layer"
+            )
+
+        selected_model_wide = select_hook_specs(
+            model_wide_specs, hook_selection, cfg
+        )
+
+        from vllm.distributed.utils import get_pp_indices
+
+        pp_intervals = tuple(
+            get_pp_indices(num_layers, pp_rank, pp_size)
+            for pp_rank in range(pp_size)
+        )
+        covered_layers = [
+            layer
+            for start, end in pp_intervals
+            for layer in range(start, end)
+        ]
+        if covered_layers != list(range(num_layers)):
+            raise RuntimeError("vLLM PP layer partition is not an exact cover")
+
+        tp_role_count = min(tp_size, 2)
+        candidate_rank_hook_sets: List[Tuple[HookSpec, ...]] = []
+        for pp_rank, (start_layer, end_layer) in enumerate(pp_intervals):
+            pp_specs = tuple(
+                spec
+                for spec in selected_model_wide
+                if (
+                    (
+                        spec.layer_no < 0
+                        or start_layer <= spec.layer_no < end_layer
+                    )
+                    and hook_belongs_to_pp_rank(
+                        spec,
+                        is_first_rank=(pp_rank == 0),
+                        is_last_rank=(pp_rank == pp_size - 1),
+                    )
+                )
+            )
+            for tp_role in range(tp_role_count):
+                candidate_rank_hook_sets.append(
+                    tuple(
+                        spec
+                        for spec in pp_specs
+                        if hook_belongs_to_tp_rank(spec, tp_role)
+                    )
+                )
+
+        return cls(
+            local_hooks=local_hooks,
+            candidate_rank_hook_sets=tuple(candidate_rank_hook_sets),
+        )
+
+
+@dataclass(frozen=True)
+class _VLLMRoleFormula:
+    real_terms: Tuple[Tuple[int, int], ...] = field(default_factory=tuple)
+    execution_terms: Tuple[Tuple[int, int], ...] = field(default_factory=tuple)
+    request_terms: Tuple[Tuple[int, int], ...] = field(default_factory=tuple)
+    hook_count: int = 0
+
+    def bytes_for(
+        self, execution_rows: int, real_rows: int, request_rows: int
+    ) -> int:
+        total = 0
+        for row_bytes, multiplicity in self.real_terms:
+            total += multiplicity * align_up_py(real_rows * row_bytes, 16)
+        for row_bytes, multiplicity in self.execution_terms:
+            total += multiplicity * align_up_py(execution_rows * row_bytes, 16)
+        for row_bytes, multiplicity in self.request_terms:
+            total += multiplicity * align_up_py(request_rows * row_bytes, 16)
+        return total
+
+
+# ---------------------------------------------------------------------------
 # VLLMAdaptor
 # ---------------------------------------------------------------------------
 
@@ -134,11 +317,10 @@ class VLLMAdaptor(BackendAdaptor):
       * Request IDs come from ``scheduler_output``, not auto-minted.
       * CUDA-graph dispatch may pad ``total_q`` up to the nearest
         capture size; meta shape must match the padded tensor.
-      * When the ring is full, the worker falls back to eager for the
-        next-determined batch (we set ``force_eager_next_batch``); the
-        wrapped ``_determine_batch_execution_and_padding`` reads + clears
-        the flag so the current batch runs unpadded, and the meta is
-        rewritten via ``adapt_for_cpu_direct``.
+      * Cached role formulas decide whether the current dispatch must be
+        eager before vLLM selects its real batch descriptor.
+      * Reservation and metadata use that real descriptor plus the packed
+        request order recorded after vLLM prepares its inputs.
     """
 
     def __init__(
@@ -148,10 +330,9 @@ class VLLMAdaptor(BackendAdaptor):
         super().__init__(engine, model_id)
         self.vllm_config = vllm_config
         self._debug_step: bool = bool(os.environ.get("RING_DEBUG_STEP"))
-        # Force-eager state lives on the active transport
-        # (self.transport.force_eager).  Set by on_capacity_exceeded;
-        # read + cleared by the _determine_batch_execution_and_padding
-        # wrapper installed in DMXGPUWorker.init_device.
+        # The per-call state carries a monotonic pre-dispatch eager latch.
+        # transport.force_eager is assigned during the actual-layout commit
+        # for the producer path of that same model step.
         # User opt-in; when True, ring transport stays in null mode after
         # warmup (kernels fire as no-ops, FIFO stays empty).
         self.user_wants_null_mode: bool = False
@@ -172,6 +353,21 @@ class VLLMAdaptor(BackendAdaptor):
         self._row_count_dev: Optional[torch.Tensor] = None      # 1 int64 on GPU
         self._pinned_row_count: Optional[torch.Tensor] = None   # 1 int64 pinned host
         self._strip_eligible_hps: List[Any] = []                # for inspection
+        self._step_state = _VLLMStepState()
+        self._validation_mode = (
+            VLLMValidationMode.VERIFY
+            if self._debug_step
+            else VLLMValidationMode.OFF
+        )
+        self._role_formulas: Tuple[_VLLMRoleFormula, ...] = ()
+        self._local_role_formula: Optional[_VLLMRoleFormula] = None
+        self._has_global_hooks = False
+        self._byte_capacity = 0
+        self._task_capacity = 0
+        self._max_num_batched_tokens = 0
+        self._max_num_seqs = 0
+        self._capture_sizes: Tuple[int, ...] = ()
+        self._max_capture_size = 0
 
     # ------- abstract overrides ---------------------------------------
 
@@ -287,73 +483,35 @@ class VLLMAdaptor(BackendAdaptor):
     def build_step_context(
         self, scheduler_output: Any, model_runner: Any
     ) -> Optional[StepContext]:
-        """Construct the per-step ``StepContext`` from vLLM's
-        scheduler_output + model_runner.
-
-        The returned ``q_len`` is the CUDA-graph-padded total token
-        count; ``adapt_for_cpu_direct`` swaps it back to ``total_q`` if
-        the driver's prepare_step returns code 2 (oversize step).
-        """
-        total_tokens = scheduler_output.total_num_scheduled_tokens
-        if total_tokens == 0:
+        """Build metadata from the real packed layout and real dispatch."""
+        state = self._step_state
+        layout = state.layout
+        batch_descriptor = state.real_batch_descriptor
+        if layout is None or batch_descriptor is None:
+            raise RuntimeError(
+                "DMI vLLM step context requested before real layout/dispatch"
+            )
+        if state.scheduler_output is not scheduler_output:
+            raise RuntimeError("DMI vLLM scheduler output changed within one step")
+        if layout.total_rows == 0:
             return None
-
-        # Why vLLM has no post-EOS strip (unlike HFAdaptor):
-        #   vLLM v1's scheduler removes finished requests from
-        #   ``scheduler_output.num_scheduled_tokens`` before the next
-        #   step.  The EOS-producing step's activation is real data
-        #   (and is captured); subsequent steps for that request never
-        #   appear in ``req_ids`` because the scheduler reassigned the
-        #   slot.  No lockstep, no post-EOS noise to filter.
-        #
-        #   HF's batched ``generate()`` is lockstep: finished requests
-        #   keep producing forward activations until the whole batch
-        #   finishes or ``max_new_tokens`` hits, so HFAdaptor needs the
-        #   per-request finished latch + zero-length token_range strip.
-        #   Do NOT propagate that pattern here -- the scheduler is
-        #   already filtering for us.
 
         self._step_counter += 1
         _step = self._step_counter
+        self._last_total_q = layout.total_rows
 
-        num_scheduled = scheduler_output.num_scheduled_tokens  # dict[req_id, int]
-        req_ids = list(num_scheduled.keys())
-        num_reqs = len(req_ids)
-        num_scheduled_per_req = list(num_scheduled.values())
-        total_q = total_tokens
-
-        padded_q = self.predict_padded_q_len(model_runner, total_q)
-        self._last_total_q = total_q
-
-        # Per-request offsets and token ranges.
-        computed_map: dict = {}
-        for new_req in scheduler_output.scheduled_new_reqs:
-            computed_map[new_req.req_id] = new_req.num_computed_tokens
-        cached = scheduler_output.scheduled_cached_reqs
-        for i, rid in enumerate(cached.req_ids):
-            computed_map[rid] = cached.num_computed_tokens[i]
-
-        offset = 0
-        req_id_list: List[str] = []
-        token_ranges: List[Tuple[int, int]] = []
-        dim0_offsets: List[int] = []
-        for i in range(num_reqs):
-            rid = req_ids[i]
-            n = num_scheduled_per_req[i]
-            pre_computed = computed_map.get(rid, 0)
-            norm_id = normalize_vllm_request_id(rid)
-            req_id_list.append(norm_id)
-            token_ranges.append((pre_computed, pre_computed + n))
-            dim0_offsets.append(offset)
-            if self._debug_step:
+        if self._debug_step:
+            for i, req_id in enumerate(layout.req_ids):
+                start, end = layout.token_ranges[i]
                 print(
-                    f"[dmx_worker] step={_step} req[{i}] rid={norm_id} "
-                    f"offset={offset} n={n} "
-                    f"t_start={pre_computed} t_end={pre_computed + n} "
-                    f"pre_computed={pre_computed} padded_q={padded_q}",
+                    f"[dmx_worker] step={_step} req[{i}] rid={req_id} "
+                    f"offset={layout.dim0_offsets[i]} "
+                    f"n={layout.scheduled_counts[i]} "
+                    f"t_start={start} t_end={end} "
+                    f"pre_computed={layout.computed_counts[i]} "
+                    f"q_len={batch_descriptor.num_tokens}",
                     flush=True,
                 )
-            offset += n
 
         # Read input_ids dtype from model_runner buffer.  On non-first
         # PP ranks the buffer may not exist; pass None (the token_ids
@@ -373,23 +531,22 @@ class VLLMAdaptor(BackendAdaptor):
         return StepContext(
             model_id=str(self.model_id),
             flattened=True,
-            req_ids=req_id_list,
-            token_ranges=token_ranges,
-            dim0_offsets=dim0_offsets,
-            kv_offsets=[0] * num_reqs,
+            req_ids=list(layout.req_ids),
+            token_ranges=list(layout.token_ranges),
+            dim0_offsets=list(layout.dim0_offsets),
+            kv_offsets=[0] * len(layout.req_ids),
             tp_rank=tp_rank,
             dp_rank=dp_rank,
             ep_rank=ep_rank,
             pp_rank=pp_rank,
             batch=0,
-            q_len=padded_q,
+            q_len=int(batch_descriptor.num_tokens),
             kv_dim=0,
-            logits_to_keep=num_reqs,
+            logits_to_keep=len(layout.req_ids),
             token_ids_dtype=ids_dtype,
-            # In gpu_padding_strip mode, eligible specs use this for shape
-            # + reservation; non-eligible specs and gpu_padding_strip=False
-            # ignore (None).
-            actual_q_len=(total_q if self.gpu_padding_strip else None),
+            actual_q_len=(
+                layout.total_rows if self.gpu_padding_strip else None
+            ),
         )
 
     # ----- gpu_padding_strip integration -----
@@ -408,25 +565,570 @@ class VLLMAdaptor(BackendAdaptor):
         baked row_bytes.
         """
         super().attach_model(model, hook_selection)
-        if not self.gpu_padding_strip:
-            return
-        device = next(model.parameters()).device if hasattr(model, "parameters") else "cuda"
-        self._row_count_dev    = torch.empty(1, dtype=torch.int64, device=device)
-        self._pinned_row_count = torch.empty(1, dtype=torch.int64, pin_memory=True)
-        for spec in self.active_specs:
-            if not spec.dim0_is_actual_tokens:
-                continue
-            hp = spec.module
-            rb = _row_bytes_for_spec(spec, self.model_cfg)
-            if rb <= 0:
-                continue
-            hp._strip_tensor    = self._row_count_dev
-            hp._strip_row_bytes = rb
-            self._strip_eligible_hps.append(hp)
+        if self.gpu_padding_strip:
+            device = (
+                next(model.parameters()).device
+                if hasattr(model, "parameters")
+                else "cuda"
+            )
+            self._row_count_dev = torch.empty(
+                1, dtype=torch.int64, device=device
+            )
+            self._pinned_row_count = torch.empty(
+                1, dtype=torch.int64, pin_memory=True
+            )
+            for spec in self.active_specs:
+                if not spec.dim0_is_actual_tokens:
+                    continue
+                hp = spec.module
+                rb = _row_bytes_for_spec(spec, self.model_cfg)
+                if rb <= 0:
+                    continue
+                hp._strip_tensor = self._row_count_dev
+                hp._strip_row_bytes = rb
+                self._strip_eligible_hps.append(hp)
 
-    def before_forward(self, *raw) -> None:
-        """Standard driver, plus per-step memcpy when gpu_padding_strip=True."""
-        super().before_forward(*raw)
+        if self.transport is not None and self.transport.null_offload:
+            return
+        cfg = self.model_cfg
+        if cfg is None or self.ring_engine is None:
+            raise RuntimeError("DMI vLLM role formulas require an attached ring")
+        selection = _VLLMHookSelection.from_model(
+            model=model,
+            local_hooks=tuple(self.active_specs),
+            hook_selection=hook_selection,
+            cfg=cfg,
+            parallel_config=self.vllm_config.parallel_config,
+            hf_config=self.vllm_config.model_config.hf_config,
+        )
+        self._compile_role_formulas(selection)
+
+    def _compile_role_formulas(
+        self, selection: _VLLMHookSelection
+    ) -> None:
+        """Compile exact byte/hook formulas for distinct TP/PP rank types."""
+        cfg = self.model_cfg
+        if cfg is None or self.ring_engine is None:
+            raise RuntimeError("DMI vLLM role formulas require an attached ring")
+
+        parallel = self.vllm_config.parallel_config
+        scheduler = self.vllm_config.scheduler_config
+        tp_size = int(parallel.tensor_parallel_size)
+        if parallel.data_parallel_size > 1 and parallel.use_ubatching:
+            raise RuntimeError(
+                "DMI vLLM does not support DP with DBO/ubatching"
+            )
+
+        try:
+            self._byte_capacity = min(
+                int(self.ring_engine.payload_cap()),
+                int(self.ring_engine.staging_cap()),
+            )
+            self._task_capacity = int(self.ring_engine.task_cap())
+            self._max_num_batched_tokens = int(
+                scheduler.max_num_batched_tokens
+            )
+            self._max_num_seqs = int(scheduler.max_num_seqs)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "DMI vLLM could not cache finite scheduler/ring bounds"
+            ) from exc
+        if (
+            self._byte_capacity <= 0
+            or self._task_capacity <= 0
+            or self._max_num_batched_tokens <= 0
+            or self._max_num_seqs <= 0
+        ):
+            raise RuntimeError("DMI vLLM scheduler/ring bounds must be positive")
+
+        compilation = self.vllm_config.compilation_config
+        capture_sizes = compilation.cudagraph_capture_sizes or ()
+        try:
+            self._capture_sizes = tuple(
+                sorted({int(size) for size in capture_sizes if int(size) > 0})
+            )
+            self._max_capture_size = int(
+                compilation.max_cudagraph_capture_size
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "DMI vLLM could not cache CUDA-graph capture bounds"
+            ) from exc
+        if self._capture_sizes and (
+            self._max_capture_size <= 0
+            or self._capture_sizes[-1] > self._max_capture_size
+        ):
+            raise RuntimeError("Invalid vLLM CUDA-graph capture sizes")
+
+        if (
+            self.vllm_config.speculative_config is not None
+            and any(
+                hook_row_basis(spec.hook_type)
+                is HookRowBasis.REQUEST_ROWS
+                for specs in selection.candidate_rank_hook_sets
+                for spec in specs
+            )
+        ):
+            raise RuntimeError(
+                "DMI vLLM request-row metadata does not support "
+                "speculative decoding"
+            )
+
+        tp_role_count = min(tp_size, 2)
+
+        def add_term(
+            terms: dict[int, int], row_bytes: int, multiplicity: int
+        ) -> None:
+            terms[row_bytes] = terms.get(row_bytes, 0) + multiplicity
+
+        def compile_formula(
+            specs: Tuple[HookSpec, ...]
+        ) -> _VLLMRoleFormula:
+            real_terms: dict[int, int] = {}
+            execution_terms: dict[int, int] = {}
+            request_terms: dict[int, int] = {}
+            hook_count = 0
+            for spec in specs:
+                row_bytes = _row_bytes_for_spec(spec, cfg)
+                if row_bytes <= 0:
+                    continue
+                row_basis = hook_row_basis(spec.hook_type)
+                if row_basis is HookRowBasis.REQUEST_ROWS:
+                    add_term(request_terms, row_bytes, 1)
+                elif self.gpu_padding_strip and spec.dim0_is_actual_tokens:
+                    add_term(real_terms, row_bytes, 1)
+                else:
+                    add_term(execution_terms, row_bytes, 1)
+                hook_count += 1
+            return _VLLMRoleFormula(
+                real_terms=tuple(sorted(real_terms.items())),
+                execution_terms=tuple(sorted(execution_terms.items())),
+                request_terms=tuple(sorted(request_terms.items())),
+                hook_count=hook_count,
+            )
+
+        candidate_formulas = tuple(
+            compile_formula(specs)
+            for specs in selection.candidate_rank_hook_sets
+        )
+
+        tp_rank, _dp_rank, _ep_rank, pp_rank = self.detect_parallel_ranks()
+        local_tp_role = 0 if tp_rank == 0 else 1
+        local_candidate_index = pp_rank * tp_role_count + local_tp_role
+        if not 0 <= local_candidate_index < len(candidate_formulas):
+            raise RuntimeError("DMI vLLM could not identify its local role")
+        local_formula = candidate_formulas[local_candidate_index]
+        concrete_formula = compile_formula(selection.local_hooks)
+        if local_formula != concrete_formula:
+            raise RuntimeError(
+                "DMI vLLM cached role formula does not match local hook layout: "
+                f"cached={local_formula}, concrete={concrete_formula}"
+            )
+
+        self._role_formulas = tuple(dict.fromkeys(candidate_formulas))
+        self._local_role_formula = local_formula
+        self._has_global_hooks = any(
+            formula.hook_count > 0 for formula in self._role_formulas
+        )
+        max_hooks = max(
+            (formula.hook_count for formula in self._role_formulas),
+            default=0,
+        )
+        if max_hooks > self._task_capacity:
+            raise RuntimeError(
+                "DMI vLLM selected hooks exceed task-ring capacity: "
+                f"hooks={max_hooks}, capacity={self._task_capacity}"
+            )
+
+    def _record_real_layout(
+        self,
+        scheduler_output: Any,
+        model_runner: Any,
+        num_scheduled_tokens: Any,
+    ) -> None:
+        """Copy and validate the packed order produced by real vLLM prep."""
+        state = self._step_state
+        if state.phase is not VLLMStepPhase.ARMED:
+            raise RuntimeError(
+                "DMI vLLM observed duplicate or unarmed _prepare_inputs"
+            )
+        if state.scheduler_output is not scheduler_output:
+            raise RuntimeError("DMI vLLM scheduler output changed during prep")
+
+        num_reqs = int(model_runner.input_batch.num_reqs)
+        raw_req_ids = tuple(model_runner.input_batch.req_ids[:num_reqs])
+        scheduled_counts = tuple(
+            int(value) for value in num_scheduled_tokens
+        )
+        computed_counts = tuple(
+            int(value)
+            for value in model_runner.input_batch.num_computed_tokens_cpu[
+                :num_reqs
+            ]
+        )
+        if (
+            len(raw_req_ids) != num_reqs
+            or len(scheduled_counts) != num_reqs
+            or len(computed_counts) != num_reqs
+        ):
+            raise RuntimeError("DMI vLLM packed layout lengths disagree")
+        if any(not isinstance(req_id, str) for req_id in raw_req_ids):
+            raise RuntimeError("DMI vLLM request IDs must be strings")
+        if len(set(raw_req_ids)) != num_reqs:
+            raise RuntimeError("DMI vLLM packed request IDs are not unique")
+
+        req_ids = tuple(
+            normalize_vllm_request_id(req_id) for req_id in raw_req_ids
+        )
+        if len(set(req_ids)) != num_reqs:
+            raise RuntimeError(
+                "DMI vLLM normalized request IDs are not unique"
+            )
+        if any(value < 0 for value in scheduled_counts):
+            raise RuntimeError("DMI vLLM scheduled token count is negative")
+        if any(value < 0 for value in computed_counts):
+            raise RuntimeError("DMI vLLM computed token count is negative")
+
+        scheduler_counts = scheduler_output.num_scheduled_tokens
+        if (
+            len(scheduler_counts) != num_reqs
+            or set(scheduler_counts) != set(raw_req_ids)
+        ):
+            raise RuntimeError(
+                "DMI vLLM packed IDs do not match scheduler membership"
+            )
+        for req_id, count in zip(raw_req_ids, scheduled_counts):
+            if int(scheduler_counts[req_id]) != count:
+                raise RuntimeError(
+                    f"DMI vLLM scheduled count mismatch for {req_id!r}"
+                )
+
+        total_rows = sum(scheduled_counts)
+        if total_rows != int(scheduler_output.total_num_scheduled_tokens):
+            raise RuntimeError(
+                "DMI vLLM packed rows do not match scheduler total"
+            )
+
+        offsets: List[int] = []
+        token_ranges: List[Tuple[int, int]] = []
+        offset = 0
+        for scheduled, computed in zip(
+            scheduled_counts, computed_counts
+        ):
+            offsets.append(offset)
+            token_ranges.append((computed, computed + scheduled))
+            offset += scheduled
+        if offset != total_rows:
+            raise RuntimeError("DMI vLLM packed offsets do not cover all rows")
+
+        state.layout = _VLLMRealLayout(
+            raw_req_ids=raw_req_ids,
+            req_ids=req_ids,
+            scheduled_counts=scheduled_counts,
+            computed_counts=computed_counts,
+            token_ranges=tuple(token_ranges),
+            dim0_offsets=tuple(offsets),
+            total_rows=total_rows,
+        )
+        state.phase = VLLMStepPhase.LAYOUT_READY
+
+    def _preview_exact_dispatch(
+        self,
+        model_runner: Any,
+        *,
+        num_tokens: int,
+        num_reqs: int,
+        max_num_scheduled_tokens: int,
+        use_cascade_attn: bool,
+        force_eager: bool,
+        force_uniform_decode: Optional[bool],
+        force_has_lora: Optional[bool],
+        force_num_active_loras: Optional[int],
+        num_encoder_reqs: int,
+    ) -> Tuple[Any, Any]:
+        """Run only vLLM's read-only dispatcher calculation."""
+        from vllm.config import CUDAGraphMode
+
+        uniform_decode = model_runner._is_uniform_decode(
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            uniform_decode_query_len=model_runner.uniform_decode_query_len,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            force_uniform_decode=force_uniform_decode,
+        )
+        has_encoder_output = (
+            model_runner.model_config.is_encoder_decoder
+            and num_encoder_reqs > 0
+        )
+        num_active_loras = (
+            force_num_active_loras
+            if force_num_active_loras is not None
+            else len(model_runner.input_batch.lora_id_to_lora_request)
+        )
+        has_lora = (
+            num_active_loras > 0
+            if force_has_lora is None
+            else force_has_lora
+        )
+        valid_modes = (
+            {CUDAGraphMode.NONE}
+            if force_eager
+            else set(CUDAGraphMode.valid_runtime_modes())
+        )
+        invalid_modes = (
+            {CUDAGraphMode.FULL}
+            if use_cascade_attn or has_encoder_output
+            else set()
+        )
+        return model_runner.cudagraph_dispatcher.dispatch(
+            num_tokens=num_tokens,
+            has_lora=has_lora,
+            uniform_decode=uniform_decode,
+            num_active_loras=num_active_loras,
+            valid_modes=valid_modes,
+            invalid_modes=invalid_modes,
+        )
+
+    def _conservative_execution_bound(
+        self, num_tokens: int, num_reqs: int
+    ) -> Tuple[int, int, int]:
+        """Return bounded execution, real-row, and request-row counts."""
+        parallel = self.vllm_config.parallel_config
+        compilation = self.vllm_config.compilation_config
+        if parallel.data_parallel_size > 1:
+            real_rows = self._max_num_batched_tokens
+            request_rows = self._max_num_seqs
+        else:
+            real_rows = int(num_tokens)
+            request_rows = int(num_reqs)
+
+        dispatch_rows = real_rows
+        if compilation.pass_config.enable_sp:
+            tp_size = int(parallel.tensor_parallel_size)
+            dispatch_rows = (
+                (dispatch_rows + tp_size - 1) // tp_size
+            ) * tp_size
+
+        execution_rows = dispatch_rows
+        if (
+            self._capture_sizes
+            and dispatch_rows <= self._max_capture_size
+        ):
+            execution_rows = self._max_capture_size
+        if execution_rows < dispatch_rows:
+            raise RuntimeError(
+                "DMI vLLM conservative graph bound is not an upper bound"
+            )
+        return execution_rows, real_rows, request_rows
+
+    def _preflight_force_eager(
+        self,
+        model_runner: Any,
+        *,
+        num_tokens: int,
+        num_reqs: int,
+        max_num_scheduled_tokens: int,
+        use_cascade_attn: bool,
+        caller_force_eager: bool,
+        force_uniform_decode: Optional[bool],
+        force_has_lora: Optional[bool],
+        force_num_active_loras: Optional[int],
+        num_encoder_reqs: int,
+    ) -> bool:
+        """Evaluate cached worst-role formulas with no transport effects."""
+        state = self._step_state
+        parallel = self.vllm_config.parallel_config
+        compilation = self.vllm_config.compilation_config
+        exact = (
+            not compilation.pass_config.enable_sp
+            and parallel.data_parallel_size == 1
+            and not parallel.enable_expert_parallel
+        )
+
+        if exact:
+            capacity_candidate = self._preview_exact_dispatch(
+                model_runner,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                use_cascade_attn=use_cascade_attn,
+                force_eager=(
+                    caller_force_eager or state.force_eager_latch
+                ),
+                force_uniform_decode=force_uniform_decode,
+                force_has_lora=force_has_lora,
+                force_num_active_loras=force_num_active_loras,
+                num_encoder_reqs=num_encoder_reqs,
+            )
+            state.capacity_candidate = capacity_candidate
+            state.execution_bound = None
+            state.real_rows_bound = None
+            state.request_rows_bound = None
+            execution_rows = int(capacity_candidate[1].num_tokens)
+            real_rows = int(num_tokens)
+            request_rows = int(num_reqs)
+        else:
+            (
+                execution_rows,
+                real_rows,
+                request_rows,
+            ) = self._conservative_execution_bound(
+                num_tokens, num_reqs
+            )
+            state.capacity_candidate = None
+            state.execution_bound = execution_rows
+            state.real_rows_bound = real_rows
+            state.request_rows_bound = request_rows
+
+        worst_bytes = max(
+            (
+                formula.bytes_for(
+                    execution_rows, real_rows, request_rows
+                )
+                for formula in self._role_formulas
+            ),
+            default=0,
+        )
+        force_eager = worst_bytes > self._byte_capacity
+
+        if (
+            exact
+            and self._validation_mode is VLLMValidationMode.VERIFY
+        ):
+            state.expected_dispatch = self._preview_exact_dispatch(
+                model_runner,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                use_cascade_attn=use_cascade_attn,
+                force_eager=(
+                    caller_force_eager
+                    or state.force_eager_latch
+                    or force_eager
+                ),
+                force_uniform_decode=force_uniform_decode,
+                force_has_lora=force_has_lora,
+                force_num_active_loras=force_num_active_loras,
+                num_encoder_reqs=num_encoder_reqs,
+            )
+        else:
+            state.expected_dispatch = None
+        return force_eager
+
+    def _commit_actual_dispatch(
+        self,
+        scheduler_output: Any,
+        model_runner: Any,
+        cudagraph_mode: Any,
+        batch_descriptor: Any,
+        combined_force_eager: bool,
+    ) -> None:
+        """Commit metadata/reservation from the real layout and descriptor."""
+        state = self._step_state
+        layout = state.layout
+        if state.phase is not VLLMStepPhase.LAYOUT_READY or layout is None:
+            raise RuntimeError(
+                "DMI vLLM dispatch committed without one real layout"
+            )
+        if int(batch_descriptor.num_tokens) < layout.total_rows:
+            raise RuntimeError(
+                "DMI vLLM dispatch has fewer rows than the packed layout"
+            )
+
+        state.real_cudagraph_mode = cudagraph_mode
+        state.real_batch_descriptor = batch_descriptor
+
+        if self._validation_mode is VLLMValidationMode.VERIFY:
+            if state.expected_dispatch is not None:
+                if state.expected_dispatch != (
+                    cudagraph_mode,
+                    batch_descriptor,
+                ):
+                    raise RuntimeError(
+                        "DMI vLLM exact dispatch preview disagrees with vLLM"
+                    )
+            elif state.execution_bound is not None:
+                if int(batch_descriptor.num_tokens) > state.execution_bound:
+                    raise RuntimeError(
+                        "DMI vLLM execution rows exceed conservative bound"
+                    )
+                if (
+                    state.real_rows_bound is None
+                    or layout.total_rows > state.real_rows_bound
+                    or state.request_rows_bound is None
+                    or len(layout.req_ids) > state.request_rows_bound
+                ):
+                    raise RuntimeError(
+                        "DMI vLLM real layout exceeds conservative bound"
+                    )
+
+        ctx = self.build_step_context(scheduler_output, model_runner)
+        if ctx is None:
+            raise RuntimeError("DMI vLLM committed an empty armed step")
+        actual_plan = self._compute_step_plan(ctx)
+        actual_bytes, actual_hooks, actual_needs_eager = actual_plan
+        if actual_hooks > self._task_capacity:
+            raise RuntimeError(
+                "DMI vLLM actual hook count exceeds cached task capacity"
+            )
+        actual_requires_eager = (
+            actual_needs_eager
+            or actual_bytes > self._byte_capacity
+        )
+        if actual_requires_eager and not combined_force_eager:
+            raise RuntimeError(
+                "DMI vLLM eager preflight produced a false negative"
+            )
+
+        if self._validation_mode is VLLMValidationMode.VERIFY:
+            formula = self._local_role_formula
+            if formula is None:
+                raise RuntimeError("DMI vLLM local role formula is missing")
+            formula_plan = (
+                formula.bytes_for(
+                    int(batch_descriptor.num_tokens),
+                    layout.total_rows,
+                    len(layout.req_ids),
+                ),
+                formula.hook_count,
+            )
+            if formula_plan != actual_plan[:2] or actual_needs_eager:
+                raise RuntimeError(
+                    "DMI vLLM cached local formula disagrees with actual plan: "
+                    f"cached={formula_plan}, actual={actual_plan}"
+                )
+
+        self.before_forward(ctx, actual_plan)
+        state.phase = VLLMStepPhase.COMMITTED
+
+    def before_forward(
+        self, ctx: StepContext, step_plan: Tuple[int, int, bool]
+    ) -> None:
+        """Commit one precomputed plan, then update padding-strip rows."""
+        if self.transport is None or self.transport.null_offload:
+            return
+
+        total_bytes, n_hooks, needs_eager = step_plan
+        if n_hooks > 0:
+            result = self.ring_engine.prepare_step(total_bytes, n_hooks)
+            self.transport.force_eager = (result == 2) or needs_eager
+            if result == 2:
+                ctx = self.adapt_for_cpu_direct(ctx)
+                self.on_capacity_exceeded(ctx)
+                self._warn_once_capacity(ctx, total_bytes, n_hooks)
+        else:
+            self.transport.force_eager = False
+
+        self.transport.set_step_context(**ctx.transport_kwargs())
+        self.transport.pre_push_all_metas(
+            batch=ctx.batch,
+            q_len=ctx.q_len,
+            kv_dim=ctx.kv_dim,
+            logits_to_keep=ctx.logits_to_keep,
+            token_ids_dtype=ctx.token_ids_dtype,
+            actual_q_len=ctx.actual_q_len,
+        )
+
         if (self.gpu_padding_strip
                 and self._pinned_row_count is not None
                 and self._row_count_dev is not None
@@ -475,11 +1177,12 @@ class DMXGPUWorker(Worker):
 
     Lifecycle:
       ``init_device``           -- super + build engine + adaptor + null mode +
-                                    wrap _determine_batch_execution_and_padding.
+                                    wrap input preparation and dispatch.
       ``load_model``            -- arch remap + super + adaptor.attach_model.
       ``compile_or_warm_up_model`` -- super + clear null_mode (unless user
                                        opted-in via ``dmx_null_mode``).
-      ``execute_model``         -- adaptor.before_forward + super.
+      ``execute_model``         -- arm per-call state + super; the dispatch
+                                    wrapper commits DMI metadata before forward.
       ``stop_monitoring``       -- adaptor.close (CUDA sync, ring stop,
                                     deactivate transport, host engine stop).
       ``shutdown``              -- best-effort stop_monitoring + super.
@@ -555,7 +1258,7 @@ class DMXGPUWorker(Worker):
             65536))
         ring_cfg.drain_flush_timeout_us = int(_cfg(
             ac, "dmx_drain_flush_timeout_us", "DMX_DRAIN_FLUSH_TIMEOUT_US",
-            100 * 1000))
+            0))
 
         # MonitoringEngine + ring transport.
         engine = MonitoringEngine(
@@ -585,21 +1288,136 @@ class DMXGPUWorker(Worker):
         # explicitly opted in to permanent null mode.
         self.adaptor.ring_engine.set_null_mode(True)
 
-        # Wrap _determine_batch_execution_and_padding so the adapter
-        # can request eager for the current batch via on_capacity_exceeded.
+        # DMI's transport and native active-engine slots are process/device
+        # global. This integration therefore assumes one active monitored
+        # engine/forward owner per process.
         adaptor = self.adaptor
+        model_runner = self.model_runner
+        orig_prepare = model_runner._prepare_inputs
         orig_fn = self.model_runner._determine_batch_execution_and_padding
 
-        def _wrapped_determine(*args: Any, **kwargs: Any) -> Any:
-            # Read-only.  transport.force_eager is owned by
-            # before_forward (per-batch reassignment); clearing here
-            # would hide this batch's force_eager from HookPoint.forward
-            # since the dispatch wrapper fires BEFORE the model forward.
-            if adaptor.transport.force_eager:
-                kwargs["force_eager"] = True
-            return orig_fn(*args, **kwargs)
+        def _wrapped_prepare(
+            scheduler_output: Any,
+            num_scheduled_tokens: np.ndarray,
+        ) -> Any:
+            result = orig_prepare(
+                scheduler_output,
+                num_scheduled_tokens,
+            )
+            phase = adaptor._step_state.phase
+            if phase is VLLMStepPhase.ARMED:
+                adaptor._record_real_layout(
+                    scheduler_output,
+                    model_runner,
+                    num_scheduled_tokens,
+                )
+            elif phase is not VLLMStepPhase.IDLE:
+                raise RuntimeError(
+                    "DMI vLLM observed a second _prepare_inputs in one step"
+                )
+            return result
 
-        self.model_runner._determine_batch_execution_and_padding = _wrapped_determine
+        def _wrapped_determine(
+            num_tokens: int,
+            num_reqs: int,
+            num_scheduled_tokens_np: np.ndarray,
+            max_num_scheduled_tokens: int,
+            use_cascade_attn: bool,
+            allow_microbatching: bool = True,
+            force_eager: bool = False,
+            force_uniform_decode: Optional[bool] = None,
+            force_has_lora: Optional[bool] = None,
+            force_num_active_loras: Optional[int] = None,
+            num_encoder_reqs: int = 0,
+        ) -> Any:
+            state = adaptor._step_state
+            if state.phase is VLLMStepPhase.IDLE:
+                return orig_fn(
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                    use_cascade_attn=use_cascade_attn,
+                    allow_microbatching=allow_microbatching,
+                    force_eager=force_eager,
+                    force_uniform_decode=force_uniform_decode,
+                    force_has_lora=force_has_lora,
+                    force_num_active_loras=force_num_active_loras,
+                    num_encoder_reqs=num_encoder_reqs,
+                )
+            if state.phase is VLLMStepPhase.COMMITTED:
+                raise RuntimeError(
+                    "DMI vLLM observed dispatch after metadata commit"
+                )
+            if state.phase not in {
+                VLLMStepPhase.ARMED,
+                VLLMStepPhase.LAYOUT_READY,
+            }:
+                raise RuntimeError(
+                    f"DMI vLLM invalid dispatch phase: {state.phase}"
+                )
+
+            state.force_eager_latch |= adaptor._preflight_force_eager(
+                model_runner,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                use_cascade_attn=use_cascade_attn,
+                caller_force_eager=force_eager,
+                force_uniform_decode=force_uniform_decode,
+                force_has_lora=force_has_lora,
+                force_num_active_loras=force_num_active_loras,
+                num_encoder_reqs=num_encoder_reqs,
+            )
+            combined_force_eager = force_eager or state.force_eager_latch
+            result = orig_fn(
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                use_cascade_attn=use_cascade_attn,
+                allow_microbatching=allow_microbatching,
+                force_eager=combined_force_eager,
+                force_uniform_decode=force_uniform_decode,
+                force_has_lora=force_has_lora,
+                force_num_active_loras=force_num_active_loras,
+                num_encoder_reqs=num_encoder_reqs,
+            )
+
+            if state.phase is VLLMStepPhase.ARMED:
+                parallel = adaptor.vllm_config.parallel_config
+                compilation = adaptor.vllm_config.compilation_config
+                if (
+                    parallel.pipeline_parallel_size <= 1
+                    or not compilation.pass_config.enable_sp
+                    or state.prelayout_dispatch_seen
+                ):
+                    raise RuntimeError(
+                        "DMI vLLM observed unexpected pre-layout dispatch"
+                    )
+                state.prelayout_dispatch_seen = True
+                if (
+                    adaptor._validation_mode
+                    is VLLMValidationMode.VERIFY
+                    and state.execution_bound is not None
+                    and int(result[1].num_tokens) > state.execution_bound
+                ):
+                    raise RuntimeError(
+                        "DMI vLLM early dispatch exceeds conservative bound"
+                    )
+                return result
+
+            adaptor._commit_actual_dispatch(
+                state.scheduler_output,
+                model_runner,
+                result[0],
+                result[1],
+                combined_force_eager,
+            )
+            return result
+
+        model_runner._prepare_inputs = _wrapped_prepare
+        model_runner._determine_batch_execution_and_padding = _wrapped_determine
 
         # Backwards-compat attributes for external subclasses that read
         # the pre-refactor names (e.g. tests/compare_worker.py reads
@@ -650,12 +1468,35 @@ class DMXGPUWorker(Worker):
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: Any) -> Any:
+        adaptor = self.adaptor
         if (
-            self.adaptor is not None
-            and scheduler_output.total_num_scheduled_tokens > 0
+            adaptor is None
+            or scheduler_output.total_num_scheduled_tokens <= 0
+            or adaptor.transport is None
+            or adaptor.transport.null_offload
+            or not adaptor._has_global_hooks
+            # EC producers return after state update without preparing or
+            # executing a model batch, so there is no DMI step to commit.
+            or (has_ec_transfer() and get_ec_transfer().is_producer)
         ):
-            self.adaptor.before_forward(scheduler_output, self.model_runner)
-        return super().execute_model(scheduler_output)
+            return super().execute_model(scheduler_output)
+        if adaptor._step_state.phase is not VLLMStepPhase.IDLE:
+            raise RuntimeError("DMI vLLM execute_model calls overlap")
+
+        adaptor._step_state = _VLLMStepState(
+            phase=VLLMStepPhase.ARMED,
+            scheduler_output=scheduler_output,
+        )
+        state = adaptor._step_state
+        try:
+            result = super().execute_model(scheduler_output)
+            if state.phase is not VLLMStepPhase.COMMITTED:
+                raise RuntimeError(
+                    "DMI vLLM forward completed without metadata commit"
+                )
+            return result
+        finally:
+            adaptor._step_state = _VLLMStepState()
 
     def stop_monitoring(self) -> None:
         """Flush and stop DMI engine.  Reentrant: second call no-ops."""

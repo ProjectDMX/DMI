@@ -115,6 +115,29 @@ def resolve_hook_selection(mode: str) -> frozenset:
     return frozenset(result)
 
 
+def select_hook_specs(
+    specs: List["HookSpec"],
+    mode: str,
+    cfg: Optional["ModelShapeConfig"] = None,
+) -> List["HookSpec"]:
+    """Purely filter specs by selection and available shape configuration."""
+    allowed = resolve_hook_selection(mode)
+    unavailable = set()
+    if cfg is not None:
+        if cfg.intermediate_dim == 0:
+            unavailable.add(HOOK_TYPE_MLP_POST)
+        if cfg.num_experts == 0:
+            unavailable.add(HOOK_TYPE_ROUTER_LOGITS)
+        if cfg.top_k == 0:
+            unavailable.add(HOOK_TYPE_TOPK_IDS)
+            unavailable.add(HOOK_TYPE_TOPK_WEIGHTS)
+    return [
+        spec
+        for spec in specs
+        if spec.hook_type in allowed and spec.hook_type not in unavailable
+    ]
+
+
 def apply_hook_selection(
     specs: List["HookSpec"],
     mode: str,
@@ -131,33 +154,30 @@ def apply_hook_selection(
     Sets enabled=True on hooks in the set, enabled=False on others.
     Returns the filtered list of enabled specs (for _active_specs / metadata).
     """
-    allowed = resolve_hook_selection(mode)
-
-    # Hooks that require specific model config fields
-    _SKIP = set()
+    enabled_specs = select_hook_specs(specs, mode, cfg)
+    enabled_ids = {id(spec) for spec in enabled_specs}
+    unavailable = set()
     if cfg is not None:
         if cfg.intermediate_dim == 0:
-            _SKIP.add(HOOK_TYPE_MLP_POST)
+            unavailable.add(HOOK_TYPE_MLP_POST)
         if cfg.num_experts == 0:
-            _SKIP.add(HOOK_TYPE_ROUTER_LOGITS)
+            unavailable.add(HOOK_TYPE_ROUTER_LOGITS)
         if cfg.top_k == 0:
-            _SKIP.add(HOOK_TYPE_TOPK_IDS)
-            _SKIP.add(HOOK_TYPE_TOPK_WEIGHTS)
+            unavailable.add(HOOK_TYPE_TOPK_IDS)
+            unavailable.add(HOOK_TYPE_TOPK_WEIGHTS)
 
-    enabled_specs = []
     for spec in specs:
-        if spec.hook_type in _SKIP:
-            spec.module.enabled = False
+        if spec.module is None:
+            raise RuntimeError(
+                "apply_hook_selection requires bound executable HookSpecs"
+            )
+        spec.module.enabled = id(spec) in enabled_ids
+        if spec.hook_type in unavailable:
             import warnings
             warnings.warn(
                 f"[apply_hook_selection] Skipping hook_type={spec.hook_type} "
                 f"layer={spec.layer_no}: required model config unavailable "
                 f"(e.g. intermediate_dim=0)")
-        elif spec.hook_type in allowed:
-            spec.module.enabled = True
-            enabled_specs.append(spec)
-        else:
-            spec.module.enabled = False
     return enabled_specs
 
 
@@ -165,14 +185,31 @@ def apply_hook_selection(
 # PP / TP filters (used by adapters during attach_model)
 # ---------------------------------------------------------------------------
 
+def hook_belongs_to_pp_rank(
+    spec: "HookSpec", is_first_rank: bool, is_last_rank: bool
+) -> bool:
+    """Return whether a hook belongs to the given PP-stage role."""
+    if spec.hook_type in PP_FIRST_ONLY and not is_first_rank:
+        return False
+    if spec.hook_type in PP_LAST_ONLY and not is_last_rank:
+        return False
+    return True
+
+
+def hook_belongs_to_tp_rank(spec: "HookSpec", tp_rank: int) -> bool:
+    """Return whether a hook belongs to the given TP-rank role."""
+    return tp_rank == 0 or spec.hook_type in TP_SHARDED_TYPES
+
+
 def filter_by_pp_rank(specs: list, is_first_rank: bool, is_last_rank: bool) -> list:
     """Drop hooks that are PP-stage-restricted and not on this rank."""
     filtered = []
     for s in specs:
-        if s.hook_type in PP_FIRST_ONLY and not is_first_rank:
-            s.module.enabled = False
-            continue
-        if s.hook_type in PP_LAST_ONLY and not is_last_rank:
+        if not hook_belongs_to_pp_rank(s, is_first_rank, is_last_rank):
+            if s.module is None:
+                raise RuntimeError(
+                    "filter_by_pp_rank requires bound executable HookSpecs"
+                )
             s.module.enabled = False
             continue
         filtered.append(s)
@@ -186,7 +223,11 @@ def filter_by_tp_rank(specs: list, tp_rank: int) -> list:
         return specs
     filtered = []
     for s in specs:
-        if s.hook_type not in TP_SHARDED_TYPES:
+        if not hook_belongs_to_tp_rank(s, tp_rank):
+            if s.module is None:
+                raise RuntimeError(
+                    "filter_by_tp_rank requires bound executable HookSpecs"
+                )
             s.module.enabled = False
             continue
         filtered.append(s)
@@ -196,7 +237,10 @@ def filter_by_tp_rank(specs: list, tp_rank: int) -> list:
 __all__ = [
     "register_preset",
     "resolve_hook_selection",
+    "select_hook_specs",
     "apply_hook_selection",
+    "hook_belongs_to_pp_rank",
+    "hook_belongs_to_tp_rank",
     "filter_by_pp_rank",
     "filter_by_tp_rank",
 ]

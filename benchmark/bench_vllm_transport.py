@@ -2,7 +2,8 @@
 
 Compares modes:
   baseline         -- plain vLLM generate, no monitoring
-  ring_null        -- ring transport active (GPU->ring->CPU), null sink (no DB write)
+  ring_null        -- public DMI no-op/null mode (no planning or payload copy)
+  ring_active      -- ring transport active, no persistence sink
   ring_db          -- ring transport + ClickHouse ingestion
 
 Reports total wall time (ms) and throughput (tok/s) for the generate call.
@@ -10,7 +11,7 @@ TTFT (time to first token) is not measured — vLLM's offline LLM API
 does not expose per-token timing.
 
 Usage:
-  python -m benchmark.bench_vllm_transport --model gpt2 --modes baseline,ring_null
+  python -m benchmark.bench_vllm_transport --model gpt2 --modes baseline,ring_active
   python -m benchmark.bench_vllm_transport --model qwen3 --num-prompts 8 --max-tokens 64
   python -m benchmark.bench_vllm_transport --model gpt2 --modes baseline,ring_null,ring_db
 
@@ -62,6 +63,8 @@ class BenchConfig:
     # vLLM
     max_model_len: int = 512
     gpu_memory_utilization: float = 0.5
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
 
 
 @dataclass
@@ -94,7 +97,7 @@ def _run_mode(mode: str, cfg: BenchConfig) -> None:
 
     if mode == "baseline":
         pass  # no monitoring
-    elif mode in ("ring_null", "ring_db"):
+    elif mode in ("ring_null", "ring_active", "ring_db"):
         worker_cls = "integration.vllm_adapter.DMXGPUWorker"
         additional_config = {
             "dmx_hook_selection": cfg.hook_selection,
@@ -103,6 +106,9 @@ def _run_mode(mode: str, cfg: BenchConfig) -> None:
         }
         if mode == "ring_null":
             additional_config["dmx_null_mode"] = True
+        elif mode == "ring_active":
+            additional_config["dmx_null_mode"] = False
+            additional_config["dmx_db_host"] = ""
         elif mode == "ring_db":
             additional_config["dmx_db_host"] = cfg.db_host
             additional_config["dmx_db_port"] = cfg.db_port
@@ -115,6 +121,8 @@ def _run_mode(mode: str, cfg: BenchConfig) -> None:
         max_model_len=cfg.max_model_len,
         enforce_eager=cfg.enforce_eager,
         gpu_memory_utilization=cfg.gpu_memory_utilization,
+        tensor_parallel_size=cfg.tensor_parallel_size,
+        pipeline_parallel_size=cfg.pipeline_parallel_size,
     )
     if worker_cls:
         kwargs["worker_cls"] = worker_cls
@@ -154,14 +162,10 @@ def _run_mode(mode: str, cfg: BenchConfig) -> None:
     print(f"\n  Summary:  total={mean_t:.1f} ms  std={std_t:.1f} ms  "
           f"throughput={mean_tps:.1f} tok/s")
 
-    # Explicit per-worker flush+stop before LLM teardown. Avoids the
-    # implicit DMXGPUWorker.shutdown() race against vLLM's 8s deadline
-    # (see vllm_adapter.py:587 warning). No-op for baseline mode where
-    # the worker isn't a DMXGPUWorker.
-    try:
+    # Explicit per-worker flush+stop before LLM teardown. Keep shutdown
+    # failures visible for modes that actually start monitoring.
+    if mode in ("ring_active", "ring_db"):
         llm.collective_rpc("stop_monitoring")
-    except Exception:
-        pass
     del llm
     torch.cuda.empty_cache()
 
@@ -177,6 +181,7 @@ def main():
     print(f"  vLLM Ring Transport Benchmark")
     print(f"  model={model_id}  prompts={cfg.num_prompts}  max_tokens={cfg.max_tokens}")
     print(f"  enforce_eager={cfg.enforce_eager}  ring={cfg.ring_payload_mb}MB")
+    print(f"  tp={cfg.tensor_parallel_size}  pp={cfg.pipeline_parallel_size}")
     print(f"  hooks={cfg.hook_selection}")
     print(f"  warmup={cfg.warmup}  iters={cfg.iters}")
     print(f"  modes={cfg.modes}")
@@ -223,7 +228,7 @@ def _parse_args() -> BenchConfig:
     g.add_argument("--warmup", type=int, default=2)
     g.add_argument("--iters", type=int, default=5)
     g.add_argument("--modes", default="baseline,ring_null",
-                   help="comma-separated: baseline,ring_null,ring_db")
+                   help="comma-separated: baseline,ring_null,ring_active,ring_db")
     g.add_argument("--enforce-eager", action="store_true")
     g.add_argument("--hook-selection", default="vllm-full")
 
@@ -238,6 +243,8 @@ def _parse_args() -> BenchConfig:
     g = p.add_argument_group("vLLM")
     g.add_argument("--max-model-len", type=int, default=512)
     g.add_argument("--gpu-memory-utilization", type=float, default=0.5)
+    g.add_argument("--tensor-parallel-size", type=int, default=1)
+    g.add_argument("--pipeline-parallel-size", type=int, default=1)
 
     ns = p.parse_args()
     return BenchConfig(
@@ -256,6 +263,8 @@ def _parse_args() -> BenchConfig:
         db_port=ns.db_port,
         max_model_len=ns.max_model_len,
         gpu_memory_utilization=ns.gpu_memory_utilization,
+        tensor_parallel_size=ns.tensor_parallel_size,
+        pipeline_parallel_size=ns.pipeline_parallel_size,
     )
 
 

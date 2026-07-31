@@ -35,15 +35,15 @@ ring. Force flush at 100% capacity is always active (prevents deadlock).
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `drain_flush_task_ratio` | `float` | 0.0 | Flush when scanned entries >= this fraction of `task_ring_entries`. 0 = disabled. |
-| `drain_flush_payload_ratio` | `float` | 0.0 | Flush when scanned payload bytes >= this fraction of `payload_ring_bytes`. 0 = disabled. |
+| `drain_flush_payload_ratio` | `float` | 0.5 | Flush when scanned payload bytes >= this fraction of `payload_ring_bytes`. 0 = disabled. |
 | `drain_flush_entry_threshold` | `uint64_t` | 0 | Flush after N entries ready. 0 = disabled. |
 | `drain_flush_byte_threshold` | `uint64_t` | 0 | Flush after N payload bytes ready. 0 = disabled. |
-| `drain_flush_timeout_us` | `uint64_t` | 100000 | If a complete tensor has been pending for longer than this many microseconds, flush unconditionally. 0 = disabled. |
+| `drain_flush_timeout_us` | `uint64_t` | 0 | If a complete tensor has been pending for longer than this many microseconds, flush unconditionally. 0 = disabled. |
 
-With timeout-based flushing disabled explicitly (`drain_flush_timeout_us = 0`)
-and all other flush thresholds at 0, the drain thread only flushes when the ring
-is 100% full or at `stop()` time. This minimizes CUDA API calls but increases
-latency.
+By default, timeout-based flushing is disabled and the drain thread flushes at
+50% payload-ring usage. If `drain_flush_payload_ratio` and all other thresholds
+are explicitly set to 0, the drain thread only flushes when the ring is 100%
+full or at `stop()` time.
 
 ## P2P Thread / Output
 
@@ -97,10 +97,10 @@ All E2E ring parameters are set via `E2E_*` environment variables
 | `E2E_RING_PINNED_BYTES` | 4 GiB | `pinned_staging_bytes` |
 | `E2E_DRAIN_POLL_TIMEOUT_US` | 100 | `drain_poll_timeout_us` |
 | `E2E_DRAIN_FLUSH_TASK_RATIO` | 0.0 | `drain_flush_task_ratio` |
-| `E2E_DRAIN_FLUSH_PAYLOAD_RATIO` | 0.0 | `drain_flush_payload_ratio` |
+| `E2E_DRAIN_FLUSH_PAYLOAD_RATIO` | 0.5 | `drain_flush_payload_ratio` |
 | `E2E_DRAIN_FLUSH_ENTRY_THRESHOLD` | 0 | `drain_flush_entry_threshold` |
 | `E2E_DRAIN_FLUSH_BYTE_THRESHOLD` | 0 | `drain_flush_byte_threshold` |
-| `E2E_DRAIN_FLUSH_TIMEOUT_US` | 100000 | `drain_flush_timeout_us` |
+| `E2E_DRAIN_FLUSH_TIMEOUT_US` | 0 | `drain_flush_timeout_us` |
 | `E2E_CLONE_SLICES` | 0 | `clone_slices` |
 | `E2E_INSERT_QUEUE_MAX_BYTES` | 512 MiB | `insert_queue_max_bytes` |
 | `E2E_INSERT_QUEUE_MAX_ITEMS` | 4096 | `insert_queue_max_items` |

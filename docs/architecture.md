@@ -73,9 +73,10 @@ poll timeout), copies ready payloads out of the GPU payload ring into a
 pinned host staging buffer, and hands them to a p2p thread that submits to
 the host engine — a single-stage ClickHouse insert pipeline (`DMXHostEngine`).
 
-A runtime `dmx_null_mode=True` switch short-circuits the p2p submit step:
-payloads still flow GPU → ring → drain → staging, but nothing is inserted.
-This is useful for isolating transport overhead independently of ClickHouse.
+A runtime `dmx_null_mode=True` switch disables DMI step planning, metadata,
+and payload copying; the native producer path remains in no-op/null mode.
+For active transport without persistence, use `dmx_null_mode=False` and leave
+the database host empty.
 
 The drain pipeline is independent of the inference loop: backpressure on the
 sink does not block the GPU producer as long as the rings are sized for the

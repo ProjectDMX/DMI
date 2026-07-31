@@ -56,23 +56,66 @@ class CompareWorker(DMXGPUWorker):
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output: Any) -> Any:
-        # Collect per-request metadata BEFORE forward
         total_tokens = scheduler_output.total_num_scheduled_tokens
-        num_scheduled = scheduler_output.num_scheduled_tokens
-        req_ids = list(num_scheduled.keys())
-        num_per_req = list(num_scheduled.values())
-
-        computed_map: dict = {}
-        for new_req in scheduler_output.scheduled_new_reqs:
-            computed_map[new_req.req_id] = new_req.num_computed_tokens
-        cached = scheduler_output.scheduled_cached_reqs
-        for i, rid in enumerate(cached.req_ids):
-            computed_map[rid] = cached.num_computed_tokens[i]
+        should_save = bool(self._compare_output_dir and total_tokens > 0)
+        adaptor = self.adaptor
+        if should_save:
+            if adaptor is None or adaptor.transport is None:
+                raise RuntimeError(
+                    "CompareWorker requires active DMI transport"
+                )
+            step_before = adaptor._step_counter
 
         # Run forward (DMXGPUWorker.execute_model handles ring transport)
         result = super().execute_model(scheduler_output)
 
-        if self._compare_output_dir and total_tokens > 0:
+        if should_save:
+            if adaptor._step_counter != step_before + 1:
+                raise RuntimeError(
+                    "CompareWorker did not observe exactly one committed DMI step"
+                )
+
+            transport = adaptor.transport
+            req_ids = list(transport._current_req_ids or ())
+            token_ranges = list(transport._current_token_ranges or ())
+            dim0_offsets = list(transport._current_dim0_offsets or ())
+            if (
+                not transport._current_flattened
+                or not req_ids
+                or len(req_ids) != len(token_ranges)
+                or len(req_ids) != len(dim0_offsets)
+                or len(set(req_ids)) != len(req_ids)
+            ):
+                raise RuntimeError(
+                    "CompareWorker received an invalid committed DMI layout"
+                )
+
+            num_per_req: list[int] = []
+            computed_map: dict[str, int] = {}
+            expected_offset = 0
+            for req_id, token_range, offset in zip(
+                req_ids, token_ranges, dim0_offsets
+            ):
+                start, end = (int(value) for value in token_range)
+                if (
+                    not isinstance(req_id, str)
+                    or start < 0
+                    or end <= start
+                    or int(offset) != expected_offset
+                ):
+                    raise RuntimeError(
+                        "CompareWorker received an invalid committed DMI range"
+                    )
+                count = end - start
+                num_per_req.append(count)
+                computed_map[req_id] = start
+                expected_offset += count
+
+            if expected_offset != int(total_tokens):
+                raise RuntimeError(
+                    "CompareWorker committed DMI rows do not match scheduler total"
+                )
+
             self._save_compare_step(req_ids, num_per_req, computed_map)
             self._compare_step += 1
 

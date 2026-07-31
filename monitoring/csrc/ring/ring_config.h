@@ -28,7 +28,7 @@ inline uint64_t align_up(uint64_t x, uint64_t a) {
 struct DrainFlushConfig {
     // Ratio thresholds (fraction of capacity; 0.0 = disabled)
     float task_ratio     = 0.0f;   // flush at N% task queue usage
-    float payload_ratio  = 0.0f;   // flush at N% payload ring usage
+    float payload_ratio  = 0.5f;   // flush at N% payload ring usage
 
     // Absolute thresholds (0 = disabled)
     uint64_t entry_threshold = 0;  // flush after N entries ready
@@ -36,7 +36,7 @@ struct DrainFlushConfig {
 
     // Time-based flush: if a complete tensor has been pending for longer
     // than this many microseconds, flush unconditionally.  0 = disabled.
-    uint64_t timeout_us = 100ULL * 1000;
+    uint64_t timeout_us = 0;
 };
 
 // ---------------------------------------------------------------------------
