@@ -37,7 +37,8 @@ llm = LLM(
         "dmx_hook_selection": "vllm-full",
         "dmx_ring_payload_mb": 4096,
         "dmx_ring_pinned_mb": 4096,
-        "dmx_null_mode": True,
+        "dmx_null_mode": False,
+        "dmx_db_host": "",
     },
 )
 
@@ -46,8 +47,10 @@ for o in llm.generate(["The answer is"], params):
     print(o.outputs[0].text)
 ```
 
-Set `"dmx_null_mode": False` and configure `dmx_db_*` fields to persist captures
-to ClickHouse.
+With `"dmx_null_mode": False` and no database host, capture and transport remain
+active without persistence. Configure `dmx_db_*` fields to persist captures to
+ClickHouse. Setting `"dmx_null_mode": True` disables DMI planning, metadata,
+and payload copying.
 
 ## Reading internals back: `DMILLM`
 
@@ -79,9 +82,9 @@ out[0].dmi_internal.available      # ['hidden_states']
 ```
 
 `DMILLM` only injects `worker_cls`; pass DMI settings through `additional_config`
-exactly as with plain `LLM`. Persisting to ClickHouse (`dmx_db_*`, i.e. not
-`dmx_null_mode`) is required to read internals back. Each `RequestOutput` exposes
-only its own request's internals; for the whole batch as one
+exactly as with plain `LLM`. A nonempty `dmx_db_host` and
+`dmx_null_mode=False` are required to read internals back. Each `RequestOutput`
+exposes only its own request's internals; for the whole batch as one
 `[batch, seq, hidden]` tensor use `get_internal(model_id)` from
 `monitoring.internal_mapper`.
 
@@ -104,15 +107,15 @@ vllm serve Qwen/Qwen3-8B \
 | Field | Meaning |
 |---|---|
 | `dmx_hook_selection` | Hook preset, usually `vllm-full` |
-| `dmx_null_mode` | `True` drops captures after transport; `False` persists |
+| `dmx_null_mode` | `True` disables DMI planning, metadata, and payload copying; `False` enables capture/transport |
 | `dmx_ring_payload_mb` | GPU payload ring size |
 | `dmx_ring_pinned_mb` | Host-side pinned payload staging buffer (D2H copy target). `0` = match `dmx_ring_payload_mb`. |
-| `dmx_drain_flush_timeout_us` | Max time a completed tensor waits before GPU-to-CPU drain flush. Default `100000` (100 ms). `0` disables timeout-based flushing. |
+| `dmx_drain_flush_timeout_us` | Max time a completed tensor waits before GPU-to-CPU drain flush. Default `0` (disabled). |
 | `dmx_db_host`, `dmx_db_port` | ClickHouse connection |
 
 ## Troubleshooting
 
 - **Baseline vLLM** — remove `worker_cls` and `additional_config`.
-- **Transport-only run** — set `"dmx_null_mode": True`.
+- **Transport-only run** — set `"dmx_null_mode": False` and leave `dmx_db_host` empty.
 - **`libstdc++` mismatch** — preload the conda libstdc++:
   `LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6 python your_script.py`.

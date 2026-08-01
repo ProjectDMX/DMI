@@ -133,15 +133,16 @@ llm = LLM(
     worker_cls="integration.vllm_adapter.DMXGPUWorker",
     additional_config={
         "dmx_hook_selection": "vllm-full",
-        "dmx_null_mode": True,   # capture + transport, drop on host (no DB needed)
+        "dmx_null_mode": False,
+        "dmx_db_host": "",       # active capture + transport; no persistence
     },
 )
 
 for o in llm.generate(["The answer is"], SamplingParams(max_tokens=16)):
     print(o.outputs[0].text)
-# Internal states for every layer have been captured into Ring²
-# during the run. Set "dmx_null_mode": False and configure a sink
-# to persist them.
+# Internal states for every layer have traversed Ring² during the run.
+# Configure a sink to persist them. Setting "dmx_null_mode": True
+# disables DMI planning, metadata, and payload copying.
 ```
 
 | | |

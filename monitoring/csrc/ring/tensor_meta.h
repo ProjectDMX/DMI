@@ -105,7 +105,7 @@ static constexpr HookDef HOOK_DEFS[] = {
     {HOOK_TYPE_MLP_IN,      "hook_mlp_in",              "mlp_in",       true,  GROUP_MLP,   false, SHAPE_HIDDEN,   PP_ANY  },
     {HOOK_TYPE_MLP_OUT,     "hook_mlp_out",             "mlp_out",      true,  GROUP_MLP,   false, SHAPE_HIDDEN,   PP_ANY  },
     {HOOK_TYPE_MLP_POST,    "hook_mlp_post",            "mlp_post",     true,  GROUP_MLP,   true,  SHAPE_MLP_POST, PP_ANY  },
-    {HOOK_TYPE_RESID_FINAL, "hook_resid_final",         "resid_final",  false, GROUP_OTHER, false, SHAPE_HIDDEN,   PP_ANY  },
+    {HOOK_TYPE_RESID_FINAL, "hook_resid_final",         "resid_final",  false, GROUP_OTHER, false, SHAPE_HIDDEN,   PP_LAST  },
     {HOOK_TYPE_EMBED,       "hook_embed",               "embed",        false, GROUP_OTHER, false, SHAPE_HIDDEN,   PP_FIRST},
     {HOOK_TYPE_POS_EMBED,   "hook_pos_embed",           "pos_embed",    false, GROUP_OTHER, false, SHAPE_HIDDEN,   PP_FIRST},
     {HOOK_TYPE_FINAL_LN,    "hook_final_ln",            "final_ln",     false, GROUP_OTHER, false, SHAPE_HIDDEN,   PP_LAST },

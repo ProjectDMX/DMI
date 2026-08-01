@@ -8,7 +8,7 @@ from typing import Any, Optional, Sequence
 from .config import MonitoringConfig
 
 
-DEFAULT_DRAIN_FLUSH_TIMEOUT_US = 100 * 1000
+DEFAULT_DRAIN_FLUSH_TIMEOUT_US = 0
 
 
 @dataclass
