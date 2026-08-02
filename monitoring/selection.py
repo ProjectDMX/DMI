@@ -16,21 +16,31 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 # universe of hooks; selection policy lives here.  Module-level (not lazy)
 # matches the existing pattern -- ring_transport's import already loads the
 # native extension, and selection is only meaningful with hooks loaded.
-from .ring_transport import (
-    _id_by_short,
-    _ATTN_WT_TYPES,
-    HOOK_TYPE_RESID_PRE,
-    HOOK_TYPE_FINAL_LN,
-    HOOK_TYPE_PATTERN,
-    HOOK_TYPE_FINAL_LOGITS,
-    HOOK_TYPE_MLP_POST,
-    HOOK_TYPE_ROUTER_LOGITS,
-    HOOK_TYPE_TOPK_IDS,
-    HOOK_TYPE_TOPK_WEIGHTS,
-    PP_FIRST_ONLY,
-    PP_LAST_ONLY,
-    TP_SHARDED_TYPES,
-)
+try:
+    from .ring_transport import (
+        _id_by_short,
+        _ATTN_WT_TYPES,
+        HOOK_TYPE_RESID_PRE,
+        HOOK_TYPE_FINAL_LN,
+        HOOK_TYPE_PATTERN,
+        HOOK_TYPE_FINAL_LOGITS,
+        HOOK_TYPE_MLP_POST,
+        HOOK_TYPE_ROUTER_LOGITS,
+        HOOK_TYPE_TOPK_IDS,
+        HOOK_TYPE_TOPK_WEIGHTS,
+        PP_FIRST_ONLY,
+        PP_LAST_ONLY,
+        TP_SHARDED_TYPES,
+    )
+except ImportError:
+    # Native backend absent (CPU-only runner, SKIP_NATIVE_BUILD=1).
+    # Module stays importable; any call that needs real hook IDs will fail
+    # at invocation time, not at collection time.
+    _id_by_short: Dict[str, int] = {}
+    _ATTN_WT_TYPES = PP_FIRST_ONLY = PP_LAST_ONLY = TP_SHARDED_TYPES = frozenset()
+    HOOK_TYPE_RESID_PRE = HOOK_TYPE_FINAL_LN = HOOK_TYPE_PATTERN = None
+    HOOK_TYPE_FINAL_LOGITS = HOOK_TYPE_MLP_POST = None
+    HOOK_TYPE_ROUTER_LOGITS = HOOK_TYPE_TOPK_IDS = HOOK_TYPE_TOPK_WEIGHTS = None
 
 if TYPE_CHECKING:
     from .ring_transport import HookSpec, ModelShapeConfig
@@ -70,11 +80,12 @@ _HOOK_SELECTIONS: Dict[str, frozenset] = {
 for _name, _htype in _id_by_short.items():
     _HOOK_SELECTIONS[_name] = frozenset({_htype})
 
-# -- Aliases --
-_HOOK_SELECTIONS["hidden-states"] = _HOOK_SELECTIONS["resid_pre"]
-_HOOK_SELECTIONS["hidden_states"] = _HOOK_SELECTIONS["resid_pre"]
-_HOOK_SELECTIONS["logits"] = _HOOK_SELECTIONS["final_logits"]
-_HOOK_SELECTIONS["token-ids"] = _HOOK_SELECTIONS["token_ids"]
+# -- Aliases (only registered when the hook names exist in _HOOK_SELECTIONS) --
+if _id_by_short:
+    _HOOK_SELECTIONS["hidden-states"] = _HOOK_SELECTIONS["resid_pre"]
+    _HOOK_SELECTIONS["hidden_states"] = _HOOK_SELECTIONS["resid_pre"]
+    _HOOK_SELECTIONS["logits"] = _HOOK_SELECTIONS["final_logits"]
+    _HOOK_SELECTIONS["token-ids"] = _HOOK_SELECTIONS["token_ids"]
 
 
 def register_preset(name: str, hook_types: frozenset) -> None:

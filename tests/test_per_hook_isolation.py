@@ -136,6 +136,8 @@ class TestPatcherRoundTrip:
     ])
     def test_round_trip_byte_identical(self, framework, model_key):
         """File contents before and after isolated_hook must match."""
+        if framework == "vllm":
+            pytest.skip("vLLM _compare models not yet vendored")
         p = compare_model_path(framework, model_key)
         original = p.read_bytes()
         with isolated_hook(framework, model_key, "q") as (model_path, commented):
