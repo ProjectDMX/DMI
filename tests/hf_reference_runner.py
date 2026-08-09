@@ -33,7 +33,7 @@ def main():
 
     # Load ORIGINAL model (NOT hooked)
     model = AutoModelForCausalLM.from_pretrained(
-        hf_model_id, attn_implementation="eager", torch_dtype=torch.float16
+        hf_model_id, attn_implementation="eager", dtype=torch.float16
     ).to(device).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(hf_model_id)

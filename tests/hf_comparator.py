@@ -23,7 +23,15 @@ def main():
     p.add_argument("--ref-dir", required=True)
     p.add_argument("--mon-dir", required=True)
     p.add_argument("--result-file", required=True)
+    p.add_argument("--standard", default="allclose",
+                   help="comparison standard (only 'allclose' is implemented)")
     args = p.parse_args()
+
+    if args.standard != "allclose":
+        raise SystemExit(
+            f"hf_comparator: standard={args.standard!r} is not implemented; "
+            "only 'allclose' is supported"
+        )
 
     from tests.hf_reference import (
         _HFRef,

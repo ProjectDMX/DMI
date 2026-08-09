@@ -51,6 +51,7 @@ def main():
             os.environ.get("E2E_MAX_NUM_BATCHED_TOKENS", "512")),
         enforce_eager=enforce_eager,
         gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.5")),
+        max_num_seqs=int(os.environ.get("E2E_MAX_NUM_SEQS", "32")),
         tensor_parallel_size=tp_size,
     )
     if enable_ep:

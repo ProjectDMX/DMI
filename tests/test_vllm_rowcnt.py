@@ -1,45 +1,27 @@
-"""vLLM E2E correctness test — three subprocesses, parent never touches CUDA.
+"""vLLM row-count check — thin wrapper over the configurable matrix (plan §5).
 
-  1. Reference: original model + FullHiddenStatesConnector -> disk
-     (skipped for models not supported by extract_hidden_states, e.g. GPT-2)
-  2. Monitored: hooked model + DMXGPUWorker + ring transport -> ClickHouse
-  3. Comparator: reads both, validates row counts + value comparison
+Runs the monitored model (hooked + ring transport -> ClickHouse) and
+validates schema + per-hook row counts (plus value comparison against the
+reference when the model is supported by extract_hidden_states).  The
+orchestration (vllm_monitored_runner -> vllm_rowcnt_comparator) now lives in
+:mod:`tests.e2e_matrix`; this wrapper drives the matrix's vLLM ``row_count``
+cell and asserts on its checks.
 
-Environment variables:
-  E2E_MODEL             "gpt2" (default) or "qwen3"
-  E2E_NUM_PROMPTS       Number of prompts (default 8)
-  E2E_MAX_NEW_TOKENS    Tokens to generate per prompt (default 20)
-  E2E_ENFORCE_EAGER     "1" to disable torch.compile + CUDA graphs (default "0")
-  E2E_RING_PAYLOAD_MB   Ring payload size in MB (default 4096)
-  E2E_RING_PINNED_MB    Pinned staging size in MB (default 4096)
-  E2E_HOOK_SELECTION    Public hook selection preset (default "vllm-full");
-                        translated to DMX_HOOK_SELECTION for subprocesses
-  E2E_COMPARE_LAYERS    "all" or comma-separated layer IDs for value comparison.
-                        Requires model supported by extract_hidden_states.
-                        GPT-2 not supported -- value comparison skipped with warning.
-  E2E_TOLERANCE         Max abs diff tolerance (default "0.01")
-  DMX_DB_HOST           ClickHouse host (default "localhost")
-  DMX_DB_PORT           ClickHouse port (default 9000)
-
-Requires:
-  - ClickHouse running on DMX_DB_HOST:DMX_DB_PORT
-  - VLLM_DISABLE_COMPILE_CACHE=1 (set automatically)
-  - LD_PRELOAD for libstdc++ if needed (caller's responsibility)
+The test name is preserved because ``tests/tools/verify_vllm.sh`` invokes
+this file and threads the model / ring-size / tolerance env vars the matrix
+wrapper reads (E2E_MODEL, E2E_ENFORCE_EAGER, E2E_RING_PAYLOAD_MB,
+E2E_RING_PINNED_MB, E2E_TOLERANCE, DMX_DB_HOST, DMX_DB_PORT).
 
 Usage:
   python -m pytest tests/test_vllm_rowcnt.py -q -s
-  E2E_MODEL=qwen3 E2E_COMPARE_LAYERS=all python -m pytest tests/test_vllm_rowcnt.py -q -s
+  E2E_MODEL=qwen3 python -m pytest tests/test_vllm_rowcnt.py -q -s
 """
-
-import json
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
+from __future__ import annotations
 
 import pytest
-import torch
+
+from tests._requirements import require_cuda, require_clickhouse, require_vllm
+from tests.e2e_matrix import matrix_argv_from_env, run_single
 
 pytestmark = [
     pytest.mark.gpu,
@@ -48,73 +30,16 @@ pytestmark = [
     pytest.mark.e2e,
 ]
 
-_MODEL_ALIASES = {
-    "gpt2": "gpt2",
-    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",
-    "qwen3": "Qwen/Qwen3-0.6B",
-}
 
-@pytest.mark.skipif(
-    not torch.backends.cuda.is_built(), reason="CUDA not built")
-def test_vllm_rowcnt(subtests):
-    """vLLM row-count validation: monitored run + row-count check."""
-
-    model_key = os.environ.get("E2E_MODEL", "gpt2")
-    model_id = _MODEL_ALIASES.get(model_key, model_key)
-
-    # Translate the public E2E_HOOK_SELECTION input into the internal
-    # DMX_HOOK_SELECTION runtime contract that the runner actually reads.
-    sub_env = dict(os.environ)
-    sub_env["DMX_HOOK_SELECTION"] = os.environ.get(
-        "E2E_HOOK_SELECTION", "vllm-full")
-
-    run_dir = tempfile.mkdtemp(prefix="vllm_rowcnt_")
-    ref_dir = os.path.join(run_dir, "ref")
-    mon_dir = os.path.join(run_dir, "mon")
-    result_file = os.path.join(run_dir, "result.json")
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    # ref_dir still needed by comparator (with skipped marker)
-    os.makedirs(ref_dir, exist_ok=True)
-    with open(os.path.join(ref_dir, "meta.json"), "w") as f:
-        json.dump({"skipped": True}, f)
-
-    print(f"\n{'=' * 60}")
-    print(f"  vLLM row-count test")
-    print(f"  model={model_id}")
-    print(f"{'=' * 60}")
-
-    try:
-        # Step 1: Monitored run (hooked model + ring transport)
-        print("\n  [1/2] Monitored run (hooked model + DMXGPUWorker)...", flush=True)
-        r2 = subprocess.run(
-            [sys.executable, "-m", "tests.vllm_monitored_runner",
-             "--output-dir", mon_dir],
-            env=sub_env, capture_output=True, text=True, cwd=project_root,
-        )
-        if r2.returncode != 0:
-            pytest.fail(f"Monitored runner failed:\n{r2.stderr[-2000:]}")
-
-        # Step 2: Comparator (CPU only, row-count validation)
-        print("  [2/2] Checking row counts...", flush=True)
-        r3 = subprocess.run(
-            [sys.executable, "-m", "tests.vllm_rowcnt_comparator",
-             "--ref-dir", ref_dir,
-             "--mon-dir", mon_dir,
-             "--result-file", result_file],
-            env=sub_env, capture_output=True, text=True, cwd=project_root,
-        )
-        if r3.returncode != 0:
-            pytest.fail(f"Comparator failed:\n{r3.stderr[-2000:]}")
-
-        # Read results
-        with open(result_file) as f:
-            results = json.load(f)
-
-        # Report via subtests
-        for test in results["tests"]:
-            with subtests.test(test["name"]):
-                assert test["passed"], test.get("detail", "")
-
-    finally:
-        shutil.rmtree(run_dir, ignore_errors=True)
+@require_cuda()
+@require_vllm()
+@require_clickhouse()
+def test_vllm_rowcnt(subtests) -> None:
+    """vLLM row-count validation: monitored run + schema / row-count checks."""
+    cr = run_single(matrix_argv_from_env("vllm", "row_count"))
+    if cr.error:
+        pytest.fail(f"matrix cell errored: {cr.error}")
+    assert cr.checks, "matrix produced no checks"
+    for chk in cr.checks:
+        with subtests.test(chk.name):
+            assert chk.passed, chk.detail
