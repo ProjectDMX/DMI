@@ -68,6 +68,7 @@ def _optional_list(value):
 def main() -> None:
     args = _parse_args()
     os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
     from vllm import LLM, SamplingParams
 

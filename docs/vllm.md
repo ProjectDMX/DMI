@@ -9,11 +9,28 @@ DMI plugs into vLLM through:
 integration.vllm_adapter.DMXGPUWorker
 ```
 
-The pinned integration is based on vLLM 0.19.0. A statically validated 0.18.0
-port is also maintained as the `dmi-v0.18.0` branch in the vLLM submodule. The
-adapter uses vLLM's public out-of-tree model registry, so the bundled monitored model
-classes also work with a matching official vLLM wheel without installing the
-whole submodule as an editable package.
+This branch pins vLLM 0.25.1. The exact upstream base is
+`752a3a504485790a2e8491cacbb35c137339ad34`; DMI's vLLM patch branch is
+`dmi-v0.25.1`, currently at
+`2228df2b07ebcdb68dcf836dc46f1587fec2cdd1`. The root repository's submodule
+gitlink is the authoritative DMI/vLLM commit pair. Older ports remain on their
+versioned branches rather than being overwritten by this branch.
+
+The adapter uses vLLM's public out-of-tree model registry, so the bundled
+monitored model classes also work with the matching official vLLM 0.25.1 wheel
+without installing the whole submodule as an editable package.
+
+vLLM 0.25.1 defaults eligible dense models to its new V2 model runner. DMI's
+0.25.1 port currently supports the V1 runner only because its request-layout
+and dispatch boundaries are different. Set this before importing `vllm`:
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=0
+```
+
+`DMXGPUWorker` checks this at startup and fails before device initialization
+with a corrective error if V2 was selected; it never silently runs without
+monitoring.
 
 ## Supported model architectures
 
@@ -29,7 +46,7 @@ nonstandard remote-code implementations still require separate validation.
 Pass it through `worker_cls=` in the offline `LLM(...)` API or `--worker-cls`
 in `vllm serve`.
 
-## Required: disable the vLLM compile cache
+## Required runtime environment
 
 DMI's capture op is registered as a void+ordered-effect op, which the vLLM
 AOT compile cache cannot serialize correctly. Set
@@ -37,6 +54,7 @@ AOT compile cache cannot serialize correctly. Set
 
 ```bash
 export VLLM_DISABLE_COMPILE_CACHE=1
+export VLLM_USE_V2_MODEL_RUNNER=0
 ```
 
 ## Offline API

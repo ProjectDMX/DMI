@@ -21,6 +21,7 @@
 set -e
 
 export VLLM_DISABLE_COMPILE_CACHE=1
+export VLLM_USE_V2_MODEL_RUNNER=0
 
 run_test() {
     local model_name=$1

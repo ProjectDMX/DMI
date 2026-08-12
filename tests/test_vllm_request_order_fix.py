@@ -14,7 +14,10 @@ import torch
 import torch.nn as nn
 
 import vllm
-import vllm._C
+try:
+    import vllm._C as _vllm_native_extension
+except ModuleNotFoundError:
+    import vllm._C_stable_libtorch as _vllm_native_extension
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
@@ -79,7 +82,7 @@ PINNED_VLLM_ROOT = (REPO_ROOT / "integration" / "vllm").resolve()
 
 def test_runtime_uses_a_coherent_supported_vllm_installation():
     source = Path(vllm.__file__).resolve()
-    extension = Path(vllm._C.__file__).resolve()
+    extension = Path(_vllm_native_extension.__file__).resolve()
 
     if source.is_relative_to(PINNED_VLLM_ROOT):
         assert extension.is_relative_to(PINNED_VLLM_ROOT)
@@ -90,7 +93,12 @@ def test_runtime_uses_a_coherent_supported_vllm_installation():
     # and constrain this path to the versions covered by the port matrix.
     assert source.parent == extension.parent
     version = Version(vllm.__version__)
-    assert (version.major, version.minor) in {(0, 17), (0, 18), (0, 19)}
+    assert (version.major, version.minor) in {
+        (0, 17),
+        (0, 18),
+        (0, 19),
+        (0, 25),
+    }
 
 
 def _scheduler(order=("A", "B"), counts=(2, 3), total=None):

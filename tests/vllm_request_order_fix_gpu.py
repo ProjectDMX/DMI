@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+
 import torch
 from vllm import LLM, SamplingParams
 
@@ -349,10 +351,13 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     pinned_root = (repo_root / "integration" / "vllm").resolve()
     import vllm
-    import vllm._C
+    try:
+        import vllm._C as vllm_native_extension
+    except ModuleNotFoundError:
+        import vllm._C_stable_libtorch as vllm_native_extension
 
     assert Path(vllm.__file__).resolve().is_relative_to(pinned_root)
-    assert Path(vllm._C.__file__).resolve().is_relative_to(pinned_root)
+    assert Path(vllm_native_extension.__file__).resolve().is_relative_to(pinned_root)
     native = _native_engine._load_extension()
     assert Path(native.__file__).resolve().is_relative_to(repo_root)
     assert HOOK_TYPE_RESID_FINAL in PP_LAST_ONLY

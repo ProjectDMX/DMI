@@ -36,6 +36,10 @@ tokens, text, and stop metadata:
 ```bash
 CUDA_VISIBLE_DEVICES=0 pytest -q -s tests/test_vllm_blackbox.py
 
+# Exercise both eager and CUDA-graph public API paths.
+DMI_BLACKBOX_CUDAGRAPH=1 CUDA_VISIBLE_DEVICES=0 \
+  pytest -q -s tests/test_vllm_blackbox.py
+
 # Reproduce or broaden a generated corpus.
 DMI_BLACKBOX_SEED=20260812 DMI_BLACKBOX_GENERATED_CASES=20 \
   CUDA_VISIBLE_DEVICES=0 pytest -q -s tests/test_vllm_blackbox.py
@@ -54,6 +58,10 @@ CUDA_VISIBLE_DEVICES=0 python tests/tools/smoke_vllm_model.py \
   --cases tests/blackbox/cases/transparency.json \
   --output /tmp/qwen2-monitored.json
 ```
+
+The vLLM runners set `VLLM_USE_V2_MODEL_RUNNER=0` before importing vLLM.
+The 0.25.1 port is V1-runner-only and fails closed if an embedding process
+selects V2.
 
 > Native CUDA ring tests live separately under `tests/ring/` (built via its
 > `Makefile`, marker `ring_native`, needs `nvcc`) and are likewise excluded from

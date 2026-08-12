@@ -13,6 +13,7 @@ import os
 import uuid
 
 os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
 import torch
 from vllm.v1.worker.gpu_worker import Worker

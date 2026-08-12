@@ -1260,6 +1260,12 @@ class DMXGPUWorker(Worker):
         self._dmx_hook_selection: str = "vllm-full"
 
     def init_device(self) -> None:
+        if getattr(self, "use_v2_model_runner", False):
+            raise RuntimeError(
+                "DMI does not yet support vLLM's V2 model runner. "
+                "Set VLLM_USE_V2_MODEL_RUNNER=0 before constructing the "
+                "vLLM engine to select the supported V1 runner."
+            )
         super().init_device()
 
         from monitoring import _native_engine as _ne
@@ -1517,7 +1523,7 @@ class DMXGPUWorker(Worker):
             self.model_runner.model, hook_selection=self._dmx_hook_selection
         )
 
-    def compile_or_warm_up_model(self) -> float:
+    def compile_or_warm_up_model(self) -> Any:
         # Warmup runs with null_mode=True (set in init_device).
         # Producer kernels fire but are no-ops -- ring stays clean.
         result = super().compile_or_warm_up_model()

@@ -14,6 +14,7 @@ import tempfile
 import uuid
 
 os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "0")
+os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
 import torch
 

@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm.model_executor.models import ModelRegistry
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -66,3 +68,16 @@ def test_load_model_forwards_newer_vllm_keyword_arguments(monkeypatch):
     assert worker.vllm_config.model_config.hf_config.architectures == [
         "LlamaPForCausalLM"
     ]
+
+
+def test_v2_model_runner_fails_closed_before_device_initialization(monkeypatch):
+    initialized = []
+    monkeypatch.setattr(Worker, "init_device", lambda _self: initialized.append(True))
+
+    worker = DMXGPUWorker.__new__(DMXGPUWorker)
+    worker.use_v2_model_runner = True
+
+    with pytest.raises(RuntimeError, match="VLLM_USE_V2_MODEL_RUNNER=0"):
+        worker.init_device()
+
+    assert initialized == []
