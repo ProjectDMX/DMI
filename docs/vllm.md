@@ -32,12 +32,19 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 with a corrective error if V2 was selected; it never silently runs without
 monitoring.
 
-## Supported model architectures
+## Model architecture coverage
 
-The monitored variants currently cover GPT-2, Qwen2/Qwen2.5, Qwen3,
-Qwen2-MoE, and Llama. Architectures that upstream vLLM implements directly
-with its Llama class (Aquila, Cwm, InternLM/InternLM3, IQuestCoder, legacy
-LLaMA, and Xverse) are remapped to the same monitored Llama variant.
+The monitored variants currently exist for GPT-2, Qwen2/Qwen2.5, Qwen3,
+Qwen2-MoE, and Llama. On vLLM 0.25.1, GPT-2, Qwen2/Qwen2.5, and Qwen3 have
+runtime black-box evidence; Llama and Qwen2-MoE currently have static/import
+evidence only. Architectures that upstream vLLM implements directly with its
+Llama class (Aquila, Cwm, InternLM/InternLM3, IQuestCoder, legacy LLaMA, and
+Xverse) are remapped to the same monitored Llama variant but have not been
+independently executed on this port.
+
+See the
+[`vLLM 0.25.1 compatibility audit`](vllm-0.25.1-compatibility-audit.md) for the
+exact tested cells, exclusions, checklist results, and commit pair.
 
 Model support is architecture-based, so different checkpoint sizes in the
 same family do not require another DMI model class. Quantized checkpoints and
