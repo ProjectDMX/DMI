@@ -10,6 +10,7 @@ Usage:
 """
 import argparse
 import os
+import uuid
 
 os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
 
@@ -35,12 +36,12 @@ _ARCH_REMAP = {
 class RefLogprobWorker(Worker):
     """Minimal worker that remaps architecture to ref variant."""
 
-    def load_model(self) -> None:
+    def load_model(self, *args, **kwargs) -> None:
         hf_cfg = self.vllm_config.model_config.hf_config
         archs = getattr(hf_cfg, "architectures", [])
         new_archs = [_ARCH_REMAP.get(a, a) for a in archs]
         hf_cfg.architectures = new_archs
-        super().load_model()
+        super().load_model(*args, **kwargs)
 
 
 def main():
@@ -111,8 +112,13 @@ def main():
     if args.ref:
         kwargs["worker_cls"] = "tests.vllm_logprob_runner.RefLogprobWorker"
     elif args.monitored:
+        capture_model_id = os.environ.get(
+            "E2E_DMX_MODEL_ID",
+            f"vllm-logprobs::{model_key}::{uuid.uuid4().hex}",
+        )
         kwargs["worker_cls"] = "integration.vllm_adapter.DMXGPUWorker"
         kwargs["additional_config"] = {
+            "dmx_model_id": capture_model_id,
             "dmx_hook_selection": hook_selection,
             "dmx_ring_payload_mb": ring_payload_mb,
             "dmx_ring_pinned_mb": ring_pinned_mb,
@@ -174,10 +180,7 @@ def main():
 
     # Flush DMI workers explicitly only for the monitored path.
     if args.monitored:
-        try:
-            llm.collective_rpc("stop_monitoring")
-        except Exception:
-            pass
+        llm.collective_rpc("stop_monitoring")
     del llm
     torch.cuda.empty_cache()
 

@@ -8,6 +8,7 @@ Usage:
 import argparse
 import json
 import os
+import uuid
 
 os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
 
@@ -16,6 +17,7 @@ import torch
 
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
+    "qwen2": "Qwen/Qwen2.5-0.5B-Instruct",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B",
@@ -30,7 +32,11 @@ def main():
     from vllm import LLM, SamplingParams
 
     model_key = os.environ.get("E2E_MODEL", "gpt2")
-    model_id = _MODEL_ALIASES.get(model_key, model_key)
+    checkpoint_model_id = _MODEL_ALIASES.get(model_key, model_key)
+    capture_model_id = os.environ.get(
+        "E2E_DMX_MODEL_ID",
+        f"vllm-e2e::{model_key}::{uuid.uuid4().hex}",
+    )
     num_prompts = int(os.environ.get("E2E_NUM_PROMPTS", "8"))
     max_new_tokens = int(os.environ.get("E2E_MAX_NEW_TOKENS", "20"))
     enforce_eager = os.environ.get("E2E_ENFORCE_EAGER", "1") == "1"
@@ -46,19 +52,12 @@ def main():
 
     prompts = [f"The answer to question {i+1} is" for i in range(num_prompts)]
 
-    # Drop existing table
-    try:
-        import clickhouse_driver
-        client = clickhouse_driver.Client(db_host, port=db_port)
-        client.execute("DROP TABLE IF EXISTS default.offload")
-    except Exception:
-        pass
-
     kwargs = dict(
-        model=model_id,
+        model=checkpoint_model_id,
         dtype=model_dtype,
         worker_cls="integration.vllm_adapter.DMXGPUWorker",
         additional_config={
+            "dmx_model_id": capture_model_id,
             "dmx_hook_selection": hook_selection,
             "dmx_ring_payload_mb": ring_payload_mb,
             "dmx_ring_pinned_mb": ring_pinned_mb,
@@ -85,7 +84,12 @@ def main():
     params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
     outputs = llm.generate(prompts, params)
 
-    # Save metadata
+    # Explicit per-worker flush+stop before recording a successful run. The
+    # implicit DMXGPUWorker.shutdown() path can race vLLM's shutdown deadline.
+    # Do not swallow failures: incomplete ClickHouse data must fail the test.
+    llm.collective_rpc("stop_monitoring")
+
+    # Save metadata only after monitoring has flushed successfully.
     os.makedirs(args.output_dir, exist_ok=True)
     generated = {}
     for i, o in enumerate(outputs):
@@ -94,7 +98,8 @@ def main():
 
     with open(os.path.join(args.output_dir, "meta.json"), "w") as f:
         json.dump({
-            "model_id": model_id,
+            "model_id": capture_model_id,
+            "checkpoint_model_id": checkpoint_model_id,
             "num_prompts": num_prompts,
             "max_new_tokens": max_new_tokens,
             "generated_tokens": generated,
@@ -102,13 +107,6 @@ def main():
             "db_port": db_port,
         }, f)
 
-    # Explicit per-worker flush+stop before LLM teardown. The implicit
-    # path via DMXGPUWorker.shutdown() races vLLM's 8s deadline and warns
-    # "Data may be incomplete." collective_rpc fans out to every TP rank.
-    try:
-        llm.collective_rpc("stop_monitoring")
-    except Exception:
-        pass
     del llm
     torch.cuda.empty_cache()
     print(f"[vllm_monitored_runner] Done", flush=True)

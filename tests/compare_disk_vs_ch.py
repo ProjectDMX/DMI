@@ -65,15 +65,30 @@ def _bytes_identical(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def read_clickhouse(db_host: str, db_port: int,
-                    database: str = "default", table: str = "offload"):
-    """Read all rows from ClickHouse, return dict keyed by (req_id, act_name, layer, shard, start, end)."""
+                    database: str = "default", table: str = "offload",
+                    model_id: str | None = None):
+    """Read ClickHouse rows keyed by request/hook/token range.
+
+    ``model_id`` should identify one test run. It remains optional for the
+    legacy Hugging Face comparator, which owns a freshly cleared table.
+    """
     import clickhouse_driver
     ch_client = clickhouse_driver.Client(db_host, port=db_port)
-    raw_rows = ch_client.execute(
+    query = (
         f"SELECT model_id, request_id, act_name, layer_no, shard_rank, "
         f"start_token_idx, end_token_idx, dtype, shape, bytes "
-        f"FROM {database}.{table}",
-        settings={"strings_as_bytes": True})
+        f"FROM {database}.{table}"
+    )
+    params = None
+    if model_id is not None:
+        query += " WHERE model_id = %(model_id)s"
+        params = {"model_id": model_id}
+    if params is None:
+        raw_rows = ch_client.execute(
+            query, settings={"strings_as_bytes": True})
+    else:
+        raw_rows = ch_client.execute(
+            query, params, settings={"strings_as_bytes": True})
 
     ch_data: dict[tuple, torch.Tensor] = {}
     for row in raw_rows:

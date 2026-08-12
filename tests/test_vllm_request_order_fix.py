@@ -8,6 +8,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+from packaging.version import Version
 import pytest
 import torch
 import torch.nn as nn
@@ -76,12 +77,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PINNED_VLLM_ROOT = (REPO_ROOT / "integration" / "vllm").resolve()
 
 
-def test_runtime_uses_the_pinned_source_and_extension():
+def test_runtime_uses_a_coherent_supported_vllm_installation():
     source = Path(vllm.__file__).resolve()
     extension = Path(vllm._C.__file__).resolve()
 
-    assert source.is_relative_to(PINNED_VLLM_ROOT)
-    assert extension.is_relative_to(PINNED_VLLM_ROOT)
+    if source.is_relative_to(PINNED_VLLM_ROOT):
+        assert extension.is_relative_to(PINNED_VLLM_ROOT)
+        return
+
+    # The adapter can lazily register the bundled model variants with an
+    # official wheel.  Keep source and native extension from that same wheel,
+    # and constrain this path to the versions covered by the port matrix.
+    assert source.parent == extension.parent
+    version = Version(vllm.__version__)
+    assert (version.major, version.minor) in {(0, 17), (0, 18), (0, 19)}
 
 
 def _scheduler(order=("A", "B"), counts=(2, 3), total=None):
@@ -1582,6 +1591,55 @@ def test_worker_resets_state_when_upstream_raises(monkeypatch):
     with pytest.raises(RuntimeError, match="upstream failure"):
         worker.execute_model(_scheduler())
     assert adaptor._step_state.phase is VLLMStepPhase.IDLE
+
+
+def test_explicit_monitoring_stop_reports_failure_after_full_cleanup(monkeypatch):
+    events = []
+
+    def fail_ring_stop():
+        events.append("ring_stop")
+        raise RuntimeError("ring flush failed")
+
+    worker = DMXGPUWorker.__new__(DMXGPUWorker)
+    worker.adaptor = SimpleNamespace(
+        ring_engine=SimpleNamespace(stop=fail_ring_stop),
+        engine=SimpleNamespace(close=lambda: events.append("engine_close")),
+    )
+    worker._dmx_host_engine = SimpleNamespace(
+        stop=lambda: events.append("host_stop")
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        "integration.vllm_adapter.ring_transport.deactivate",
+        lambda: events.append("deactivate"),
+    )
+
+    with pytest.raises(RuntimeError, match="ring_engine.stop: ring flush failed"):
+        worker.stop_monitoring()
+
+    assert events == ["ring_stop", "deactivate", "engine_close", "host_stop"]
+    assert worker.adaptor is None
+    assert worker._dmx_host_engine is None
+
+
+def test_monitoring_stop_is_reentrant_after_success(monkeypatch):
+    events = []
+    worker = DMXGPUWorker.__new__(DMXGPUWorker)
+    worker.adaptor = SimpleNamespace(
+        ring_engine=SimpleNamespace(stop=lambda: events.append("ring_stop")),
+        engine=SimpleNamespace(close=lambda: events.append("engine_close")),
+    )
+    worker._dmx_host_engine = None
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        "integration.vllm_adapter.ring_transport.deactivate",
+        lambda: events.append("deactivate"),
+    )
+
+    worker.stop_monitoring()
+    worker.stop_monitoring()
+
+    assert events == ["ring_stop", "deactivate", "engine_close"]
 
 
 def test_ec_transfer_producer_passthrough_never_arms(monkeypatch):

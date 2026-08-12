@@ -141,8 +141,8 @@ class ProbeWorker(DMXGPUWorker):
         runner._prepare_inputs = observed_prepare
         runner._determine_batch_execution_and_padding = observed_determine
 
-    def load_model(self) -> None:
-        super().load_model()
+    def load_model(self, *args, **kwargs) -> None:
+        super().load_model(*args, **kwargs)
         from vllm.distributed.utils import get_pp_indices
 
         adaptor = self.adaptor

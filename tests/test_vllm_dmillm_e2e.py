@@ -17,17 +17,29 @@ import sys
 import tempfile
 
 import pytest
-import torch
+
+from tests._requirements import (
+    require_clickhouse,
+    require_cuda,
+    require_model_cache,
+    require_vllm,
+)
+
+
+MODEL = os.environ.get("E2E_MODEL", "Qwen/Qwen3-0.6B")
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.vllm,
     pytest.mark.clickhouse,
     pytest.mark.e2e,
+    require_cuda(),
+    require_clickhouse(),
+    require_vllm(),
+    require_model_cache(MODEL),
 ]
 
 
-@pytest.mark.skipif(not torch.backends.cuda.is_built(), reason="CUDA not built")
 def test_vllm_dmillm_e2e():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     run_dir = tempfile.mkdtemp(prefix="vllm_dmillm_")
@@ -37,16 +49,37 @@ def test_vllm_dmillm_e2e():
 
     try:
         r = subprocess.run(
-            [sys.executable, "-m", "tests.vllm_dmillm_runner", "--result-file", result_file],
+            [
+                sys.executable,
+                "-m",
+                "tests.vllm_dmillm_runner",
+                "--model",
+                MODEL,
+                "--result-file",
+                result_file,
+            ],
             env=env, capture_output=True, text=True, cwd=project_root,
         )
-        if not os.path.exists(result_file):
-            pytest.skip(
-                f"DMILLM runner could not run (vLLM / ClickHouse / deps missing?):\n"
-                f"{r.stderr[-1500:]}"
+        results = None
+        if os.path.exists(result_file):
+            with open(result_file) as f:
+                results = json.load(f)
+        if r.returncode != 0:
+            failed = (
+                [test for test in results["tests"] if not test["passed"]]
+                if results is not None
+                else "result file missing"
             )
-        with open(result_file) as f:
-            results = json.load(f)
+            pytest.fail(
+                f"DMILLM runner failed with rc={r.returncode}\n"
+                f"failed checks: {failed}\n"
+                f"stdout:\n{r.stdout[-4000:]}\n"
+                f"stderr:\n{r.stderr[-4000:]}"
+            )
+        if results is None:
+            pytest.fail(
+                "DMILLM runner exited successfully without producing its result file"
+            )
         failed = [t for t in results["tests"] if not t["passed"]]
         assert not failed, f"failed checks: {failed}"
     finally:

@@ -33,14 +33,14 @@ class CompareWorker(DMXGPUWorker):
         self._compare_output_dir: str = ""
         self._compare_step: int = 0
 
-    def load_model(self) -> None:
+    def load_model(self, *args, **kwargs) -> None:
         # Remap to compare variant
         hf_cfg = self.vllm_config.model_config.hf_config
         archs = getattr(hf_cfg, "architectures", [])
         new_archs = [_ARCH_REMAP.get(a, a) for a in archs]
         hf_cfg.architectures = new_archs
 
-        super().load_model()
+        super().load_model(*args, **kwargs)
 
         # Allocate compare buffers. Use max_num_batched_tokens (not
         # E2E_REF_MAX_LEN) because profiling runs the model with that many

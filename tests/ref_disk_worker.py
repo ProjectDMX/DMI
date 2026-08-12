@@ -35,14 +35,14 @@ class RefDiskWorker(Worker):
         self._tp_rank: int = 0
         self._tp_size: int = 1
 
-    def load_model(self) -> None:
+    def load_model(self, *args, **kwargs) -> None:
         # Remap to ref variant
         hf_cfg = self.vllm_config.model_config.hf_config
         archs = getattr(hf_cfg, "architectures", [])
         new_archs = [_ARCH_REMAP.get(a, a) for a in archs]
         hf_cfg.architectures = new_archs
 
-        super().load_model()
+        super().load_model(*args, **kwargs)
 
         from vllm.distributed.parallel_state import get_tp_group
         self._tp_rank = get_tp_group().rank_in_group
