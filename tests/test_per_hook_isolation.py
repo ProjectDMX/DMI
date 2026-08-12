@@ -136,7 +136,10 @@ class TestPatcherRoundTrip:
     ])
     def test_round_trip_byte_identical(self, framework, model_key):
         """File contents before and after isolated_hook must match."""
-        p = compare_model_path(framework, model_key)
+        try:
+            p = compare_model_path(framework, model_key)
+        except FileNotFoundError as exc:
+            pytest.skip(str(exc))
         original = p.read_bytes()
         with isolated_hook(framework, model_key, "q") as (model_path, commented):
             assert p.read_bytes() != original, "patch did not modify the file"
@@ -198,7 +201,10 @@ class TestRealCompareModelsContainAllExpectedHooks:
         ("hf", "qwen3"), ("hf", "gpt2"), ("hf", "llama"),
     ])
     def test_smoke_hooks_present_in_compare_source(self, framework, model_key):
-        p = compare_model_path(framework, model_key)
+        try:
+            p = compare_model_path(framework, model_key)
+        except FileNotFoundError as exc:
+            pytest.skip(str(exc))
         src = p.read_text()
         for hook in self.SMOKE_HOOKS:
             patched, commented = _patched_source(src, hook)

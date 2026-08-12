@@ -1,0 +1,77 @@
+name: CI — CPU PR gate
+
+on:
+  push:
+    branches: ["main", "**"]
+  pull_request:
+
+jobs:
+  cpu-gate:
+    name: CPU tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false   # vLLM fork is 3.7 GB — too heavy for CPU gate
+
+      # The vendored transformers fork (57 MB, Python-only) is needed for the
+      # framework_fork-marked tests.  Init it here without touching the heavy
+      # vLLM submodule.  Tests that need the vLLM fork skip gracefully via the
+      # _mods() try/except guard in test_moe_v1_routing_hooks.py.
+      - name: Init transformers submodule
+        run: git submodule update --init --depth 1 integration/transformers
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Install CPU-only torch first so the subsequent requirements.txt install
+      # doesn't pull in the CUDA wheel (CUDA is not available on free runners).
+      - name: Install CPU-only torch
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      # Install the rest of the declared dependencies.  The vLLM runtime and
+      # the 3.7 GB vLLM fork submodule are GPU-stage only and excluded here.
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+
+      # Install the package itself in editable mode so `import monitoring` and
+      # `import tests.*` resolve correctly.  --no-build-isolation is required
+      # because setup.py reads torch's include/lib paths, but SKIP_NATIVE_BUILD
+      # tells NativeBuildExt.run() to exit early — CPU runners have no nvcc.
+      - name: Install package (editable, skip native build)
+        env:
+          SKIP_NATIVE_BUILD: "1"
+        run: pip install -e . --no-build-isolation
+
+      # Smoke check: all key pure-Python modules must be importable without
+      # CUDA, ClickHouse, or vLLM present.
+      - name: Smoke check — module imports
+        run: |
+          python -c "
+          import monitoring
+          import monitoring.config
+          import monitoring.engine
+          import monitoring.hook_points
+          import tests.hf_comparator
+          import tests.hf_reference
+          import tests._requirements
+          print('All pure-Python modules import OK')
+          "
+          # monitoring.selection and monitoring.ring_transport now import
+          # safely without the native .so (graceful fallback when absent).
+
+      # Run the cpu-marked subset.  These tests require no CUDA device, no
+      # ClickHouse instance, no vLLM runtime, no model weights, and no native
+      # .so beyond what torch ships.
+      - name: Run CPU test suite
+        run: |
+          python -m pytest -m "not slow and not gpu" -v --tb=short

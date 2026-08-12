@@ -1,0 +1,72 @@
+name: CI — GPU regression
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # nightly at 02:00 UTC
+  pull_request:
+    types: [labeled]
+
+jobs:
+  gpu-regression:
+    name: GPU regression suite
+    # Security: never auto-run on fork PRs.  Self-hosted runners that execute
+    # untrusted fork code are an RCE / secret-leak risk.  Only internal PRs
+    # that carry the 'gpu' label, or the nightly schedule, reach this job.
+    if: |
+      github.event_name == 'schedule' ||
+      (
+        github.event_name == 'pull_request' &&
+        github.event.label.name == 'gpu' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: [self-hosted, gpu]
+
+    # Don't cancel a running regression mid-test; queue the next run instead.
+    concurrency:
+      group: gpu-regression-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false   # init selectively below; vllm fork is ~3.7 GB
+
+      # Init only the submodules we need.  The clickhouse-cpp library is
+      # required to build the native backend; the framework forks are needed
+      # by the regression script.
+      - name: Init submodules (transformers + clickhouse-cpp + vllm)
+        run: |
+          git submodule update --init --recursive integration/transformers
+          git submodule update --init --recursive libs/clickhouse-cpp
+          git submodule update --init --recursive integration/vllm
+
+      # Install core deps first.  The self-hosted runner is expected to have
+      # a CUDA-capable torch already present; pip will satisfy torch>=2.8.0
+      # from the environment without replacing it.
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # The vendored transformers fork is Python-only; --no-deps avoids
+      # pulling in duplicate/conflicting upstream transformers wheels.
+      - name: Install vendored transformers fork
+        run: pip install -e integration/transformers --no-deps
+
+      # The vllm fork carries its own CUDA extensions; install with full deps
+      # so the runtime is usable inside run_regression.sh.
+      - name: Install vendored vLLM fork
+        run: pip install -e integration/vllm
+
+      # pip install . --no-build-isolation is the Stage 3 entrypoint; it
+      # compiles the native backend against the torch/CUDA already on PATH.
+      # torch must be importable at build time for the include/lib paths.
+      - name: Build native backend
+        run: pip install -e . --no-build-isolation
+
+      # Run only the GPU-marked pytest suite (complements run_regression.sh
+      # which exercises the model-level regression paths via shell scripts).
+      - name: Run GPU pytest suite
+        run: python -m pytest -m "gpu" -v --tb=short
+
+      # Full regression: vLLM + HF transport correctness across models/modes/TP.
+      - name: Run full regression suite
+        run: bash tests/tools/run_regression.sh
