@@ -18,6 +18,7 @@ the vLLM runtime); they are not CPU-safe.
 | `identical_vllm.sh` | Wrapper around the vLLM bitwise-identical pytest check. |
 | `verify_vllm.sh` | vLLM row-count + identical verification sweep across ring sizes. |
 | `verify_hf.sh` | HF E2E correctness sweep across ring sizes. |
+| `smoke_vllm_model.py` | Baseline/monitored public-output smoke for a new vLLM version or model; no ClickHouse required. |
 
 Example:
 
@@ -25,6 +26,33 @@ Example:
 # from the repo root
 LD_PRELOAD=/path/to/libstdc++.so.6 CUDA_VISIBLE_DEVICES=0,1 \
   bash tests/tools/run_regression.sh
+```
+
+The formal API-only differential gate combines the curated corpus under
+`tests/blackbox/cases/` with reproducible generated prompts, runs baseline and
+monitored vLLM in separate processes, and compares prompt tokens, generated
+tokens, text, and stop metadata:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 pytest -q -s tests/test_vllm_blackbox.py
+
+# Reproduce or broaden a generated corpus.
+DMI_BLACKBOX_SEED=20260812 DMI_BLACKBOX_GENERATED_CASES=20 \
+  CUDA_VISIBLE_DEVICES=0 pytest -q -s tests/test_vllm_blackbox.py
+```
+
+For manual diagnosis, run both modes against the same case manifest and compare
+their JSON outputs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tests/tools/smoke_vllm_model.py \
+  --mode baseline --model qwen2 \
+  --cases tests/blackbox/cases/transparency.json \
+  --output /tmp/qwen2-baseline.json
+CUDA_VISIBLE_DEVICES=0 python tests/tools/smoke_vllm_model.py \
+  --mode monitored --model qwen2 \
+  --cases tests/blackbox/cases/transparency.json \
+  --output /tmp/qwen2-monitored.json
 ```
 
 > Native CUDA ring tests live separately under `tests/ring/` (built via its

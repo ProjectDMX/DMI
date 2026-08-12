@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "vllm-transparency-core",
+  "prompts": [
+    "The capital of France is",
+    "Hi",
+    "Unicode and emoji: café, 東京, 🚀",
+    "Shared prefix for cache behavior: alpha beta gamma, first continuation:",
+    "Shared prefix for cache behavior: alpha beta gamma, second continuation:",
+    "This deliberately longer request creates a ragged batch beside short prompts. Repeatable public API behavior matters more than the semantic quality of this continuation."
+  ]
+}
