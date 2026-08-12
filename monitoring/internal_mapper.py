@@ -50,6 +50,21 @@ def _request_sort_key(request_id: str) -> tuple:
     return tuple(key)
 
 
+def _coalesce_token_ranges(
+    ranges: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    """Merge overlapping/adjacent ranges without hiding token gaps."""
+    merged: list[list[int]] = []
+    for start, end in sorted(ranges):
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return tuple((start, end) for start, end in merged)
+
+
 def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
     """Reassemble a per-layer hook (residual stream, mlp, ...).
 
@@ -439,8 +454,12 @@ class _LazyInternal:
         # common "writer still pending" case without scanning every layer.
         check_layer = layers[-1] if layers else None
         for request_id in self._request_ids:
-            expected = self._expected_non_empty_ranges(request_id)
-            actual = self._actual_ranges_for_request(rows, request_id, check_layer)
+            expected = _coalesce_token_ranges(
+                self._expected_non_empty_ranges(request_id)
+            )
+            actual = _coalesce_token_ranges(
+                self._actual_ranges_for_request(rows, request_id, check_layer)
+            )
             if actual != expected:
                 raise IncompleteInternalError(
                     f"{field} token ranges are incomplete for "

@@ -9,6 +9,23 @@ DMI plugs into vLLM through:
 integration.vllm_adapter.DMXGPUWorker
 ```
 
+The pinned integration is based on vLLM 0.19.0. A statically validated 0.18.0
+port is also maintained as the `dmi-v0.18.0` branch in the vLLM submodule. The
+adapter uses vLLM's public out-of-tree model registry, so the bundled monitored model
+classes also work with a matching official vLLM wheel without installing the
+whole submodule as an editable package.
+
+## Supported model architectures
+
+The monitored variants currently cover GPT-2, Qwen2/Qwen2.5, Qwen3,
+Qwen2-MoE, and Llama. Architectures that upstream vLLM implements directly
+with its Llama class (Aquila, Cwm, InternLM/InternLM3, IQuestCoder, legacy
+LLaMA, and Xverse) are remapped to the same monitored Llama variant.
+
+Model support is architecture-based, so different checkpoint sizes in the
+same family do not require another DMI model class. Quantized checkpoints and
+nonstandard remote-code implementations still require separate validation.
+
 Pass it through `worker_cls=` in the offline `LLM(...)` API or `--worker-cls`
 in `vllm serve`.
 
@@ -87,6 +104,30 @@ exactly as with plain `LLM`. A nonempty `dmx_db_host` and
 exposes only its own request's internals; for the whole batch as one
 `[batch, seq, hidden]` tensor use `get_internal(model_id)` from
 `monitoring.internal_mapper`.
+
+Persistence is asynchronous. For a complete read before an explicit
+`stop_monitoring`, enable a bounded drain timeout and use the public retry
+contract instead of sleeping for an assumed duration:
+
+```python
+from transformers import AutoConfig
+
+# additional_config={..., "dmx_drain_flush_timeout_us": 100_000}
+expected_layers = AutoConfig.from_pretrained(
+    "Qwen/Qwen3-0.6B"
+).num_hidden_layers
+out[0].dmi_internal.require(
+    "hidden_states",
+    count=expected_layers,
+    retry=True,
+    timeout_s=30.0,
+    poll_s=0.25,
+)
+hidden_states = out[0].dmi_internal.hidden_states
+```
+
+Without a drain timeout, call
+`llm.collective_rpc("stop_monitoring")` before the authoritative read.
 
 ## vLLM serve
 
