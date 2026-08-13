@@ -35,9 +35,9 @@ the registry source, but remains upstream-static evidence rather than DMI
 runtime support. Across the 41 representative checkpoints below:
 
 - all 41 resolve in vLLM 0.27.1;
-- 14 architectures have a DMI model remap on the current stacked expansion
+- 15 architectures have a DMI model remap on the current stacked expansion
   branch;
-- 27 are unmapped by DMI;
+- 26 are unmapped by DMI;
 - registry presence is upstream static evidence, not DMI runtime support.
 
 Between vLLM 0.25.1 and 0.27.1, the combined text/multimodal registry adds eight
@@ -164,6 +164,17 @@ post-activation boundary. The verdict covers vLLM's Python xIELU fallback;
 Apertus v1.1/70B and other config branches, the optional fused xIELU extension,
 TP>1, prefix caching, quantization, serving, and speculative modes remain
 excluded.
+
+ERNIE 4.5 dense is `supported` for the official
+`baidu/ERNIE-4.5-0.3B-PT` checkpoint in the bounded TP1 BF16 V1 offline
+eager/default-graph cell at integration commit `6f2cf03f68e4`. The
+[`ERNIE 4.5 audit`](vllm-0.27.1-ernie45-audit.md) records strict public API
+parity and byte-identical eager/graph storage on that same production
+checkpoint. Its 203-family manifest follows the inherited dense Llama block,
+while the monitored and compare variants explicitly replay ERNIE's non-NeoX
+rotary and bias-free output-projection post-init changes. Other ERNIE sizes,
+ERNIE MoE/VL, alternate configuration branches, TP>1, prefix caching,
+quantization, serving, and speculative modes remain excluded.
 
 For each row, use an upstream tiny/random fixture for fast focused tests when
 available, then require one real-checkpoint baseline/monitored run before moving

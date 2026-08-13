@@ -21,6 +21,9 @@ _COMPARE_MODEL_VARIANTS = {
     "ApertusCompareForCausalLM": (
         "apertus_compare:ApertusCompareForCausalLM"
     ),
+    "Ernie4_5CompareForCausalLM": (
+        "ernie45_compare:Ernie4_5CompareForCausalLM"
+    ),
     "FalconH1CompareForCausalLM": (
         "falcon_h1_compare:FalconH1CompareForCausalLM"
     ),
@@ -76,6 +79,7 @@ _register_compare_model_variants()
 
 _ARCH_REMAP = {
     "ApertusForCausalLM": "ApertusCompareForCausalLM",
+    "Ernie4_5ForCausalLM": "Ernie4_5CompareForCausalLM",
     "FalconH1ForCausalLM": "FalconH1CompareForCausalLM",
     "Gemma3ForCausalLM": "Gemma3CompareForCausalLM",
     "GPT2LMHeadModel": "GPT2CompareForCausalLM",

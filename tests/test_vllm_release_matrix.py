@@ -72,6 +72,7 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
     assert "focused-cpu-contracts" in case_ids
     for model in (
         "apertus",
+        "ernie45",
         "falcon_h1",
         "gemma3",
         "gpt2",
@@ -108,6 +109,8 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
     assert "storage-olmo3-cudagraph-tp1" in case_ids
     assert "storage-apertus-eager-tp1" in case_ids
     assert "storage-apertus-cudagraph-tp1" in case_ids
+    assert "storage-ernie45-eager-tp1" in case_ids
+    assert "storage-ernie45-cudagraph-tp1" in case_ids
 
 
 def test_gemma3_matrix_resolves_the_fixture_subfolder() -> None:
@@ -262,6 +265,25 @@ def test_apertus_matrix_uses_the_qualified_8b_production_checkpoint() -> None:
         storage = cases[f"storage-apertus-{mode}-tp1"]
         assert storage.model_id == "swiss-ai/Apertus-8B-Instruct-2509"
         assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.93"
+        assert storage.environment["E2E_REF_MAX_LEN"] == "128"
+        assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
+
+
+def test_ernie45_matrix_uses_the_qualified_03b_checkpoint() -> None:
+    cases = {case.case_id: case for case in build_cases("all")}
+
+    public = cases["public-ernie45-tp1-eager-graph"]
+    assert public.model_id == "baidu/ERNIE-4.5-0.3B-PT"
+    assert public.environment["DMI_BLACKBOX_MODEL"] == (
+        "baidu/ERNIE-4.5-0.3B-PT"
+    )
+    assert public.environment["DMI_BLACKBOX_GPU_MEMORY_UTILIZATION"] == "0.3"
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "128"
+
+    for mode in ("eager", "cudagraph"):
+        storage = cases[f"storage-ernie45-{mode}-tp1"]
+        assert storage.model_id == "baidu/ERNIE-4.5-0.3B-PT"
+        assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.3"
         assert storage.environment["E2E_REF_MAX_LEN"] == "128"
         assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
 
