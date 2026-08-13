@@ -118,12 +118,13 @@ def _storage_case(
     model_subfolder: str | None = None,
     max_model_len: int = 512,
     memory_utilization: float | None = None,
+    ring_mb: int = 512,
 ) -> MatrixCase:
     environment = {
         "DMX_HOOK_SELECTION": hook_selection,
         "E2E_REF_MAX_LEN": str(ref_max_len),
-        "E2E_RING_PAYLOAD_MB": "512",
-        "E2E_RING_PINNED_MB": "512",
+        "E2E_RING_PAYLOAD_MB": str(ring_mb),
+        "E2E_RING_PINNED_MB": str(ring_mb),
         "E2E_GPU_MEM_UTIL": str(
             memory_utilization
             if memory_utilization is not None
@@ -164,6 +165,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_granite_p_contract.py",
             "tests/test_jamba_p_contract.py",
             "tests/test_lfm2_p_contract.py",
+            "tests/test_olmo3_p_contract.py",
             "tests/test_conv_hook_contract.py",
             "tests/test_gemma3_p_inventory.py",
             "tests/test_model_artifacts.py",
@@ -186,6 +188,14 @@ def build_cases(phase: str) -> list[MatrixCase]:
         environment={},
     )
     public = [
+        _blackbox_case(
+            "olmo3",
+            "allenai/Olmo-3-7B-Instruct",
+            tp_size=1,
+            memory_utilization=0.85,
+            model_arg="allenai/Olmo-3-7B-Instruct",
+            max_model_len=128,
+        ),
         _blackbox_case(
             "granite",
             "ibm-granite/granite-4.1-3b",
@@ -267,6 +277,18 @@ def build_cases(phase: str) -> list[MatrixCase]:
     ]
     storage: list[MatrixCase] = []
     for mode in ("eager", "cudagraph"):
+        storage.append(
+            _storage_case(
+                "olmo3",
+                "allenai/Olmo-3-7B-Instruct",
+                mode,
+                1,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.9,
+                ring_mb=1024,
+            )
+        )
         storage.append(
             _storage_case(
                 "granite",

@@ -42,6 +42,9 @@ _COMPARE_MODEL_VARIANTS = {
     "MistralCompareForCausalLM": (
         "mistral_compare:MistralCompareForCausalLM"
     ),
+    "Olmo3CompareForCausalLM": (
+        "olmo3_compare:Olmo3CompareForCausalLM"
+    ),
     "Phi3CompareForCausalLM": (
         "phi3_compare:Phi3CompareForCausalLM"
     ),
@@ -79,6 +82,7 @@ _ARCH_REMAP = {
     "Qwen3ForCausalLM": "Qwen3CompareForCausalLM",
     "LlamaForCausalLM": "LlamaCompareForCausalLM",
     "MistralForCausalLM": "MistralCompareForCausalLM",
+    "Olmo3ForCausalLM": "Olmo3CompareForCausalLM",
     "Phi3ForCausalLM": "Phi3CompareForCausalLM",
 }
 

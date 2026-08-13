@@ -151,6 +151,7 @@ _ARCH_REMAP = {
     "JambaForCausalLM": "JambaPForCausalLM",
     "Lfm2ForCausalLM": "Lfm2PForCausalLM",
     "MistralForCausalLM": "MistralPForCausalLM",
+    "Olmo3ForCausalLM": "Olmo3PForCausalLM",
     "Phi3ForCausalLM": "Phi3PForCausalLM",
     "Qwen2ForCausalLM": "Qwen2PForCausalLM",
     "Qwen2MoeForCausalLM": "Qwen2MoePForCausalLM",
@@ -180,6 +181,7 @@ _DMI_MODEL_VARIANTS = {
     "Qwen3PForCausalLM": "qwen3_p:Qwen3PForCausalLM",
     "LlamaPForCausalLM": "llama_p:LlamaPForCausalLM",
     "MistralPForCausalLM": "mistral_p:MistralPForCausalLM",
+    "Olmo3PForCausalLM": "olmo3_p:Olmo3PForCausalLM",
     "Phi3PForCausalLM": "phi3_p:Phi3PForCausalLM",
 }
 

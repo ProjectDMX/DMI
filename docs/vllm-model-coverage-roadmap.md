@@ -35,9 +35,9 @@ the registry source, but remains upstream-static evidence rather than DMI
 runtime support. Across the 41 representative checkpoints below:
 
 - all 41 resolve in vLLM 0.27.1;
-- 12 architectures have a DMI model remap on the current stacked expansion
+- 13 architectures have a DMI model remap on the current stacked expansion
   branch;
-- 29 are unmapped by DMI;
+- 28 are unmapped by DMI;
 - registry presence is upstream static evidence, not DMI runtime support.
 
 Between vLLM 0.25.1 and 0.27.1, the combined text/multimodal registry adds eight
@@ -140,6 +140,18 @@ logits scaling and adds the exact post-activation MLP boundary. Granite 4.1 8B
 and 30B share the statically audited dense path but remain runtime-unqualified;
 Granite MoE/hybrid/multimodal models, TP>1, prefix caching, quantization,
 serving, and speculative modes remain excluded.
+
+OLMo 3 is `supported` for the official `allenai/Olmo-3-7B-Instruct`
+checkpoint in the bounded TP1 BF16 V1 offline eager/default-graph cell at
+integration commit `9f6a5c762bc5`. The
+[`OLMo 3 audit`](vllm-0.27.1-olmo3-audit.md) records public API parity and
+byte-identical eager/graph storage on that same production checkpoint. Its
+389-family manifest follows OLMo 3's post-norm residual order and observes Q/K
+after Q/K normalization but before the layer-type-specific RoPE. Available tiny
+fixtures do not independently cover the production sliding/full schedule plus
+both default and YaRN RoPE branches, so they are not used to generalize the
+runtime verdict. Other checkpoints, TP>1, prefix caching, quantization, serving,
+speculative, and other OLMo-family architectures remain excluded.
 
 For each row, use an upstream tiny/random fixture for fast focused tests when
 available, then require one real-checkpoint baseline/monitored run before moving

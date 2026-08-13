@@ -44,6 +44,7 @@ MODEL_ALIASES = {
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B-Instruct",
     "mistral": "openaccess-ai-collective/tiny-mistral",
+    "olmo3": "allenai/Olmo-3-7B-Instruct",
     "phi3": "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM",
 }
 MODEL_ARG = os.environ.get("DMI_BLACKBOX_MODEL", "qwen2")

@@ -81,6 +81,7 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
         "qwen3",
         "llama",
         "mistral",
+        "olmo3",
         "phi3",
         "qwen2_moe",
     ):
@@ -102,6 +103,8 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
     assert "storage-jamba-cudagraph-tp1" in case_ids
     assert "storage-lfm2-eager-tp1" in case_ids
     assert "storage-lfm2-cudagraph-tp1" in case_ids
+    assert "storage-olmo3-eager-tp1" in case_ids
+    assert "storage-olmo3-cudagraph-tp1" in case_ids
 
 
 def test_gemma3_matrix_resolves_the_fixture_subfolder() -> None:
@@ -218,6 +221,27 @@ def test_granite_matrix_uses_the_qualified_41_production_checkpoint() -> None:
         assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.6"
         assert storage.environment["E2E_REF_MAX_LEN"] == "128"
         assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
+
+
+def test_olmo3_matrix_uses_the_branch_complete_production_checkpoint() -> None:
+    cases = {case.case_id: case for case in build_cases("all")}
+
+    public = cases["public-olmo3-tp1-eager-graph"]
+    assert public.model_id == "allenai/Olmo-3-7B-Instruct"
+    assert public.environment["DMI_BLACKBOX_MODEL"] == (
+        "allenai/Olmo-3-7B-Instruct"
+    )
+    assert public.environment["DMI_BLACKBOX_GPU_MEMORY_UTILIZATION"] == "0.85"
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "128"
+
+    for mode in ("eager", "cudagraph"):
+        storage = cases[f"storage-olmo3-{mode}-tp1"]
+        assert storage.model_id == "allenai/Olmo-3-7B-Instruct"
+        assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.9"
+        assert storage.environment["E2E_REF_MAX_LEN"] == "128"
+        assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
+        assert storage.environment["E2E_RING_PAYLOAD_MB"] == "1024"
+        assert storage.environment["E2E_RING_PINNED_MB"] == "1024"
 
 
 def test_static_only_models_use_bounded_two_gpu_storage_cells():
