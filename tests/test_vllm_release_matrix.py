@@ -120,6 +120,7 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
 def test_sota_matrix_pins_lite_h100_cells() -> None:
     cases = {case.case_id: case for case in build_cases("sota")}
     gpt_oss_revision = "6cee5e81ee83917806bbde320786a8fb61efebee"
+    gemma4_e2b_revision = "3e22461f65e89153144f8adb70e3b8c2cc9845a7"
     glm52_revision = "b4734de4facf877f85769a911abafc5283eab3d9"
     llama4_scout_revision = "c2b440bc2b8c784ad310291d035b8550a771f24f"
     minimax_m27_revision = "d494266a4affc0d2995ba1fa35c8481cbd84294b"
@@ -128,6 +129,7 @@ def test_sota_matrix_pins_lite_h100_cells() -> None:
 
     assert set(cases) == {
         "focused-cpu-contracts",
+        "public-gemma4_e2b-tp1-eager-graph",
         "public-gpt_oss-tp1-eager-graph",
         "public-glm52-tp32-eager-graph",
         "public-llama4_scout-tp4-eager-graph",
@@ -136,6 +138,8 @@ def test_sota_matrix_pins_lite_h100_cells() -> None:
         "public-qwen36-tp1-eager-graph",
         "storage-gpt_oss-eager-tp1",
         "storage-gpt_oss-cudagraph-tp1",
+        "storage-gemma4_e2b-eager-tp1",
+        "storage-gemma4_e2b-cudagraph-tp1",
         "storage-glm52-eager-tp32",
         "storage-glm52-cudagraph-tp32",
         "storage-llama4_scout-eager-tp4",
@@ -147,6 +151,20 @@ def test_sota_matrix_pins_lite_h100_cells() -> None:
         "storage-qwen36-eager-tp1",
         "storage-qwen36-cudagraph-tp1",
     }
+    public = cases["public-gemma4_e2b-tp1-eager-graph"]
+    assert public.model_id == "google/gemma-4-E2B-it"
+    assert public.environment["DMI_BLACKBOX_MODEL_REVISION"] == gemma4_e2b_revision
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "128"
+    assert public.environment["DMI_BLACKBOX_MULTIMODAL_IMAGE"] == "1"
+    assert public.environment["DMI_BLACKBOX_IMAGE_PLACEHOLDER"] == "<|image|>"
+    assert public.environment["DMI_BLACKBOX_GENERATED_CASES"] == "2"
+    for mode in ("eager", "cudagraph"):
+        storage = cases[f"storage-gemma4_e2b-{mode}-tp1"]
+        assert storage.model_id == "google/gemma-4-E2B-it"
+        assert storage.environment["E2E_MODEL_REVISION"] == gemma4_e2b_revision
+        assert storage.environment["E2E_RING_PAYLOAD_MB"] == "2048"
+        assert storage.environment["E2E_REF_MAX_LEN"] == "128"
+
     public = cases["public-gpt_oss-tp1-eager-graph"]
     assert public.model_id == "openai/gpt-oss-20b"
     assert public.environment["DMI_BLACKBOX_MODEL_REVISION"] == gpt_oss_revision

@@ -21,6 +21,7 @@ _MODEL_ALIASES = {
     "ernie45": "baidu/ERNIE-4.5-0.3B-PT",
     "falcon_h1": "tiiuae/Falcon-H1-Tiny-90M-Instruct",
     "gemma3": "shibatch/tinygemma3-2m",
+    "gemma4_e2b": "google/gemma-4-E2B-it",
     "gpt2": "gpt2",
     "gpt_oss": "openai/gpt-oss-20b",
     "glm52": "zai-org/GLM-5.2",

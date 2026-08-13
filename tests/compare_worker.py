@@ -30,6 +30,9 @@ _COMPARE_MODEL_VARIANTS = {
     "Gemma3CompareForCausalLM": (
         "gemma3_compare:Gemma3CompareForCausalLM"
     ),
+    "Gemma4CompareForConditionalGeneration": (
+        "gemma4_compare:Gemma4CompareForConditionalGeneration"
+    ),
     "GPT2CompareForCausalLM": "gpt2_compare:GPT2CompareForCausalLM",
     "GptOssCompareForCausalLM": (
         "gpt_oss_compare:GptOssCompareForCausalLM"
@@ -103,6 +106,7 @@ _ARCH_REMAP = {
     "Ernie4_5ForCausalLM": "Ernie4_5CompareForCausalLM",
     "FalconH1ForCausalLM": "FalconH1CompareForCausalLM",
     "Gemma3ForCausalLM": "Gemma3CompareForCausalLM",
+    "Gemma4ForConditionalGeneration": "Gemma4CompareForConditionalGeneration",
     "GPT2LMHeadModel": "GPT2CompareForCausalLM",
     "GptOssForCausalLM": "GptOssCompareForCausalLM",
     "GlmMoeDsaForCausalLM": "GlmMoeDsaCompareForCausalLM",

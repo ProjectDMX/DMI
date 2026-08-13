@@ -200,6 +200,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_olmo3_p_contract.py",
             "tests/test_conv_hook_contract.py",
             "tests/test_gemma3_p_inventory.py",
+            "tests/test_gemma4_p_contract.py",
             "tests/test_model_artifacts.py",
             "tests/test_mistral_p_contract.py",
             "tests/test_minicpm_p_contract.py",
@@ -485,12 +486,24 @@ def build_cases(phase: str) -> list[MatrixCase]:
             )
 
     gpt_oss_revision = "6cee5e81ee83917806bbde320786a8fb61efebee"
+    gemma4_e2b_revision = "3e22461f65e89153144f8adb70e3b8c2cc9845a7"
     glm52_revision = "b4734de4facf877f85769a911abafc5283eab3d9"
     llama4_scout_revision = "c2b440bc2b8c784ad310291d035b8550a771f24f"
     minimax_m27_revision = "d494266a4affc0d2995ba1fa35c8481cbd84294b"
     qwen3_moe_revision = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
     qwen36_revision = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
     sota = [
+        _blackbox_case(
+            "gemma4_e2b",
+            "google/gemma-4-E2B-it",
+            tp_size=1,
+            memory_utilization=0.5,
+            max_model_len=128,
+            revision=gemma4_e2b_revision,
+            multimodal_image=True,
+            multimodal_image_placeholder="<|image|>",
+            generated_cases=2,
+        ),
         _blackbox_case(
             "gpt_oss",
             "openai/gpt-oss-20b",
@@ -550,6 +563,19 @@ def build_cases(phase: str) -> list[MatrixCase]:
         ),
     ]
     for mode in ("eager", "cudagraph"):
+        sota.append(
+            _storage_case(
+                "gemma4_e2b",
+                "google/gemma-4-E2B-it",
+                mode,
+                1,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.5,
+                ring_mb=2048,
+                revision=gemma4_e2b_revision,
+            )
+        )
         sota.append(
             _storage_case(
                 "llama4_scout",
