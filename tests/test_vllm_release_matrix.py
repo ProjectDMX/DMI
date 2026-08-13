@@ -122,18 +122,22 @@ def test_sota_matrix_pins_lite_h100_cells() -> None:
     gpt_oss_revision = "6cee5e81ee83917806bbde320786a8fb61efebee"
     llama4_scout_revision = "c2b440bc2b8c784ad310291d035b8550a771f24f"
     qwen3_moe_revision = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
+    qwen36_revision = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
 
     assert set(cases) == {
         "focused-cpu-contracts",
         "public-gpt_oss-tp1-eager-graph",
         "public-llama4_scout-tp4-eager-graph",
         "public-qwen3_moe-tp1-eager-graph",
+        "public-qwen36-tp1-eager-graph",
         "storage-gpt_oss-eager-tp1",
         "storage-gpt_oss-cudagraph-tp1",
         "storage-llama4_scout-eager-tp4",
         "storage-llama4_scout-cudagraph-tp4",
         "storage-qwen3_moe-eager-tp1",
         "storage-qwen3_moe-cudagraph-tp1",
+        "storage-qwen36-eager-tp1",
+        "storage-qwen36-cudagraph-tp1",
     }
     public = cases["public-gpt_oss-tp1-eager-graph"]
     assert public.model_id == "openai/gpt-oss-20b"
@@ -169,6 +173,22 @@ def test_sota_matrix_pins_lite_h100_cells() -> None:
         storage = cases[f"storage-qwen3_moe-{mode}-tp1"]
         assert storage.model_id == "Qwen/Qwen3-30B-A3B"
         assert storage.environment["E2E_MODEL_REVISION"] == qwen3_moe_revision
+        assert storage.environment["E2E_RING_PAYLOAD_MB"] == "2048"
+        assert storage.environment["E2E_REF_MAX_LEN"] == "128"
+
+    public = cases["public-qwen36-tp1-eager-graph"]
+    assert public.model_id == "Qwen/Qwen3.6-27B"
+    assert public.environment["DMI_BLACKBOX_MODEL_REVISION"] == qwen36_revision
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "128"
+    assert public.environment["DMI_BLACKBOX_MULTIMODAL_IMAGE"] == "1"
+    assert public.environment["DMI_BLACKBOX_IMAGE_PLACEHOLDER"] == (
+        "<|vision_start|><|image_pad|><|vision_end|>"
+    )
+    assert public.environment["DMI_BLACKBOX_GENERATED_CASES"] == "2"
+    for mode in ("eager", "cudagraph"):
+        storage = cases[f"storage-qwen36-{mode}-tp1"]
+        assert storage.model_id == "Qwen/Qwen3.6-27B"
+        assert storage.environment["E2E_MODEL_REVISION"] == qwen36_revision
         assert storage.environment["E2E_RING_PAYLOAD_MB"] == "2048"
         assert storage.environment["E2E_REF_MAX_LEN"] == "128"
 

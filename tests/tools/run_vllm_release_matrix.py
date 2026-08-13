@@ -85,6 +85,7 @@ def _blackbox_case(
     trust_remote_code: bool = False,
     revision: str | None = None,
     multimodal_image: bool = False,
+    multimodal_image_placeholder: str | None = None,
     generated_cases: int = 6,
 ) -> MatrixCase:
     environment = {
@@ -104,6 +105,10 @@ def _blackbox_case(
         environment["DMI_BLACKBOX_MODEL_REVISION"] = revision
     if multimodal_image:
         environment["DMI_BLACKBOX_MULTIMODAL_IMAGE"] = "1"
+        if multimodal_image_placeholder:
+            environment["DMI_BLACKBOX_IMAGE_PLACEHOLDER"] = (
+                multimodal_image_placeholder
+            )
     return MatrixCase(
         case_id=f"public-{model_key}-tp{tp_size}-eager-graph",
         command=(
@@ -188,6 +193,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_gpt_oss_p_contract.py",
             "tests/test_llama4_p_contract.py",
             "tests/test_qwen3_moe_p_contract.py",
+            "tests/test_qwen3_5_p_contract.py",
             "tests/test_jamba_p_contract.py",
             "tests/test_lfm2_p_contract.py",
             "tests/test_olmo3_p_contract.py",
@@ -479,6 +485,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
     gpt_oss_revision = "6cee5e81ee83917806bbde320786a8fb61efebee"
     llama4_scout_revision = "c2b440bc2b8c784ad310291d035b8550a771f24f"
     qwen3_moe_revision = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
+    qwen36_revision = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
     sota = [
         _blackbox_case(
             "gpt_oss",
@@ -505,6 +512,19 @@ def build_cases(phase: str) -> list[MatrixCase]:
             memory_utilization=0.9,
             max_model_len=128,
             revision=qwen3_moe_revision,
+        ),
+        _blackbox_case(
+            "qwen36",
+            "Qwen/Qwen3.6-27B",
+            tp_size=1,
+            memory_utilization=0.9,
+            max_model_len=128,
+            revision=qwen36_revision,
+            multimodal_image=True,
+            multimodal_image_placeholder=(
+                "<|vision_start|><|image_pad|><|vision_end|>"
+            ),
+            generated_cases=2,
         ),
     ]
     for mode in ("eager", "cudagraph"):
@@ -545,6 +565,19 @@ def build_cases(phase: str) -> list[MatrixCase]:
                 memory_utilization=0.9,
                 ring_mb=2048,
                 revision=qwen3_moe_revision,
+            )
+        )
+        sota.append(
+            _storage_case(
+                "qwen36",
+                "Qwen/Qwen3.6-27B",
+                mode,
+                1,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.9,
+                ring_mb=2048,
+                revision=qwen36_revision,
             )
         )
 

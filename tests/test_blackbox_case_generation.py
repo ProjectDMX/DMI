@@ -97,3 +97,16 @@ def test_deterministic_image_case_is_auditable() -> None:
     validate_case_corpus(corpus)
     assert case["input"]["form"] == "text_with_image"
     assert case["input"]["image"]["color"] == [17, 101, 203]
+
+
+def test_deterministic_image_case_accepts_a_public_model_placeholder() -> None:
+    placeholder = "<|vision_start|><|image_pad|><|vision_end|>"
+
+    case = deterministic_image_case(placeholder=placeholder)
+
+    assert case["input"]["text"].startswith(placeholder)
+
+
+def test_deterministic_image_case_rejects_an_empty_placeholder() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        deterministic_image_case(placeholder="")

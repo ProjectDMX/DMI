@@ -42,6 +42,7 @@ MODEL_ALIASES = {
     "gpt_oss": "openai/gpt-oss-20b",
     "llama4_scout": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
+    "qwen36": "Qwen/Qwen3.6-27B",
     "granite": "ibm-granite/granite-4.1-3b",
     "jamba": "ai21labs/AI21-Jamba2-3B",
     "lfm2": "tiny-random/lfm2",
@@ -178,7 +179,13 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
     }
     core["cases"].extend(generate_cases(seed=seed, count=generated_count))
     if os.environ.get("DMI_BLACKBOX_MULTIMODAL_IMAGE", "0") == "1":
-        core["cases"].append(deterministic_image_case())
+        placeholder = os.environ.get(
+            "DMI_BLACKBOX_IMAGE_PLACEHOLDER",
+            "<|image|>",
+        )
+        core["cases"].append(
+            deterministic_image_case(placeholder=placeholder)
+        )
     cases = run_dir / "cases.json"
     cases.write_text(json.dumps(core, indent=2, ensure_ascii=False) + "\n")
 
