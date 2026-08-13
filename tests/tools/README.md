@@ -78,6 +78,18 @@ python tests/tools/check_vllm_storage.py \
   --model-id <unique-capture-id>
 ```
 
+Phi-3 release validation uses the official checkpoint for public parity and the
+tiny fixture for the independent full-hook value oracle:
+
+```bash
+DMI_BLACKBOX_MODEL=microsoft/Phi-3.5-mini-instruct \
+  DMI_BLACKBOX_CUDAGRAPH=1 CUDA_VISIBLE_DEVICES=0 \
+  pytest -q -s tests/test_vllm_blackbox.py
+
+E2E_GPUS=0 E2E_MAX_MODEL_LEN=128 E2E_MAX_NUM_BATCHED_TOKENS=128 \
+  bash tests/tools/run_tp_compare_vllm.sh phi3 cudagraph 1
+```
+
 Set `DMI_BLACKBOX_ARTIFACT_DIR` to retain each mode's generated cases and raw
 baseline/monitored JSON instead of relying on pytest's temporary directory.
 

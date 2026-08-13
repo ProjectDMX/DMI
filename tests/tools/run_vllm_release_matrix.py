@@ -76,10 +76,11 @@ def _blackbox_case(
     tp_size: int,
     memory_utilization: float,
     model_subfolder: str | None = None,
+    model_arg: str | None = None,
     max_model_len: int = 512,
 ) -> MatrixCase:
     environment = {
-        "DMI_BLACKBOX_MODEL": model_key,
+        "DMI_BLACKBOX_MODEL": model_arg or model_key,
         "DMI_BLACKBOX_TP_SIZE": str(tp_size),
         "DMI_BLACKBOX_GPU_MEMORY_UTILIZATION": str(memory_utilization),
         "DMI_BLACKBOX_CUDAGRAPH": "1",
@@ -156,6 +157,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_vllm_027_model_contracts.py",
             "tests/test_gemma3_p_inventory.py",
             "tests/test_model_artifacts.py",
+            "tests/test_phi3_p_contract.py",
             "tests/test_vllm_storage_contracts.py",
             "tests/test_qwen2_p_inventory.py",
             "tests/test_vllm_blackbox_contract.py",
@@ -179,6 +181,14 @@ def build_cases(phase: str) -> list[MatrixCase]:
             memory_utilization=0.2,
             model_subfolder="hf",
             max_model_len=128,
+        ),
+        _blackbox_case(
+            "phi3",
+            "microsoft/Phi-3.5-mini-instruct",
+            tp_size=1,
+            memory_utilization=0.75,
+            model_arg="microsoft/Phi-3.5-mini-instruct",
+            max_model_len=512,
         ),
         _blackbox_case("gpt2", "gpt2", tp_size=1, memory_utilization=0.5),
         _blackbox_case(
@@ -213,6 +223,16 @@ def build_cases(phase: str) -> list[MatrixCase]:
                 1,
                 ref_max_len=128,
                 model_subfolder="hf",
+                max_model_len=128,
+            )
+        )
+        storage.append(
+            _storage_case(
+                "phi3",
+                "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM",
+                mode,
+                1,
+                ref_max_len=128,
                 max_model_len=128,
             )
         )

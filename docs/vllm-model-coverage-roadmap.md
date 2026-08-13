@@ -86,6 +86,13 @@ tiny fixture. The official `google/gemma-3-1b-it` checkpoint was gated for the
 available account, so the real-checkpoint completion gate remains open and the
 row is not yet `supported`.
 
+Phi-3 is `supported` for the bounded TP1 BF16 V1 offline eager/default-graph
+cell at integration commit `b4965771d8a4`. The
+[`Phi-3 audit`](vllm-0.27.1-phi3-audit.md) records strict public tests on the
+official `microsoft/Phi-3.5-mini-instruct` checkpoint plus byte-identical
+eager/graph full-hook transport on a tiny fixture. TP>1, PP, quantization,
+serving, speculative, and non-text task variants remain excluded.
+
 For each row, use an upstream tiny/random fixture for fast focused tests when
 available, then require one real-checkpoint baseline/monitored run before moving
 beyond `static-only`.

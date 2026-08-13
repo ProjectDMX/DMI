@@ -27,6 +27,9 @@ _COMPARE_MODEL_VARIANTS = {
     ),
     "Qwen3CompareForCausalLM": "qwen3_compare:Qwen3CompareForCausalLM",
     "LlamaCompareForCausalLM": "llama_compare:LlamaCompareForCausalLM",
+    "Phi3CompareForCausalLM": (
+        "phi3_compare:Phi3CompareForCausalLM"
+    ),
 }
 
 
@@ -56,6 +59,7 @@ _ARCH_REMAP = {
     "Qwen2MoeForCausalLM": "Qwen2MoeCompareForCausalLM",
     "Qwen3ForCausalLM": "Qwen3CompareForCausalLM",
     "LlamaForCausalLM": "LlamaCompareForCausalLM",
+    "Phi3ForCausalLM": "Phi3CompareForCausalLM",
 }
 
 # Hook names that are TP-sharded

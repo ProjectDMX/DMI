@@ -146,6 +146,7 @@ _LLAMA_COMPAT_ARCHES = {
 _ARCH_REMAP = {
     "Gemma3ForCausalLM": "Gemma3PForCausalLM",
     "GPT2LMHeadModel": "GPT2PLMHeadModel",
+    "Phi3ForCausalLM": "Phi3PForCausalLM",
     "Qwen2ForCausalLM": "Qwen2PForCausalLM",
     "Qwen2MoeForCausalLM": "Qwen2MoePForCausalLM",
     "Qwen3ForCausalLM": "Qwen3PForCausalLM",
@@ -169,6 +170,7 @@ _DMI_MODEL_VARIANTS = {
     "Qwen2MoePForCausalLM": "qwen2_moe_p:Qwen2MoePForCausalLM",
     "Qwen3PForCausalLM": "qwen3_p:Qwen3PForCausalLM",
     "LlamaPForCausalLM": "llama_p:LlamaPForCausalLM",
+    "Phi3PForCausalLM": "phi3_p:Phi3PForCausalLM",
 }
 
 

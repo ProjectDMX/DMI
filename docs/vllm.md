@@ -40,7 +40,7 @@ monitoring.
 ## Model architecture coverage
 
 The monitored variants currently exist for GPT-2, Qwen2/Qwen2.5, Qwen3,
-Qwen2-MoE, Llama, and an experimental Gemma 3 text variant. The vLLM 0.27.1
+Qwen2-MoE, Llama, Phi-3, and an experimental Gemma 3 text variant. The vLLM 0.27.1
 baseline port has focused, public API, accelerator,
 and scoped storage evidence for all five variants; exact topology verdicts are
 recorded in the 0.27.1 compatibility audit rather than inferred from import
@@ -51,6 +51,11 @@ that upstream vLLM implements directly with its
 Llama class (Aquila, Cwm, InternLM/InternLM3, IQuestCoder, legacy LLaMA, and
 Xverse) are remapped to the same monitored Llama variant but require separate
 runtime evidence before they are claimed.
+
+Phi-3 has a distinct monitored subclass even though upstream reuses Llama's
+math: its fused QKV and gate/up checkpoint packing is different. The bounded
+support cell and official Phi-3.5 Mini evidence are recorded in the
+[Phi-3 audit](vllm-0.27.1-phi3-audit.md).
 
 See the
 [`vLLM 0.27.1 compatibility audit`](vllm-0.27.1-port-audit.md) for the

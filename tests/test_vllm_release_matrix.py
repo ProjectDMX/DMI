@@ -76,6 +76,7 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
         "qwen2",
         "qwen3",
         "llama",
+        "phi3",
         "qwen2_moe",
     ):
         assert any(case_id.startswith(f"public-{model}-") for case_id in case_ids)
@@ -84,6 +85,8 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
         assert f"storage-{model}-cudagraph-tp2" in case_ids
     assert "storage-gemma3-eager-tp1" in case_ids
     assert "storage-gemma3-cudagraph-tp1" in case_ids
+    assert "storage-phi3-eager-tp1" in case_ids
+    assert "storage-phi3-cudagraph-tp1" in case_ids
 
 
 def test_gemma3_matrix_resolves_the_fixture_subfolder() -> None:
@@ -96,6 +99,23 @@ def test_gemma3_matrix_resolves_the_fixture_subfolder() -> None:
 
     storage = cases["storage-gemma3-cudagraph-tp1"]
     assert storage.environment["E2E_MODEL_SUBFOLDER"] == "hf"
+    assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
+
+
+def test_phi3_public_matrix_uses_the_production_checkpoint() -> None:
+    cases = {case.case_id: case for case in build_cases("all")}
+
+    public = cases["public-phi3-tp1-eager-graph"]
+    assert public.model_id == "microsoft/Phi-3.5-mini-instruct"
+    assert public.environment["DMI_BLACKBOX_MODEL"] == (
+        "microsoft/Phi-3.5-mini-instruct"
+    )
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "512"
+
+    storage = cases["storage-phi3-cudagraph-tp1"]
+    assert storage.model_id == (
+        "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM"
+    )
     assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
 
 

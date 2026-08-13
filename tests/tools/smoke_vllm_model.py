@@ -25,6 +25,7 @@ MODEL_ALIASES = {
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B-Instruct",
+    "phi3": "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM",
 }
 
 
