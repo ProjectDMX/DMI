@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from tests.tools.run_vllm_release_matrix import (
+    MatrixCase,
     _pytest_summary,
+    _resume_manifest,
     _selected_gpus,
     build_cases,
 )
@@ -63,3 +66,95 @@ def test_pytest_summary_retains_skipped_prerequisites(tmp_path: Path):
         "errors": 0,
         "skipped": 1,
     }
+
+
+def _resume_identity(tmp_path: Path) -> tuple[list[MatrixCase], dict]:
+    log = tmp_path / "focused.log"
+    log.write_text("passed\n")
+    cases = [
+        MatrixCase("focused", ("pytest",), {}),
+        MatrixCase("gpu", ("pytest",), {}, gpu_count=1),
+    ]
+    manifest = {
+        "schema_version": 1,
+        "project_root": str(Path(__file__).resolve().parents[1]),
+        "root_commit": "root-sha",
+        "vllm_integration_commit": "vllm-sha",
+        "runtime": {"vllm_version": "0.25.1"},
+        "physical_gpus": ["1", "2"],
+        "phase": "all",
+        "results": [
+            {
+                "case_id": "focused",
+                "status": "passed",
+                "returncode": 0,
+                "log": str(log),
+                "pytest_summary": {
+                    "tests": 1,
+                    "failures": 0,
+                    "errors": 0,
+                    "skipped": 0,
+                },
+            },
+            {
+                "case_id": "gpu",
+                "status": "blocked-prerequisite",
+            },
+        ],
+        "finished_at": "old",
+        "passed": 1,
+        "failed": 0,
+        "blocked": 1,
+    }
+    return cases, manifest
+
+
+def test_resume_keeps_only_a_verified_passed_prefix(tmp_path: Path):
+    cases, manifest = _resume_identity(tmp_path)
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest))
+
+    resumed = _resume_manifest(
+        path,
+        cases=cases,
+        root_commit="root-sha",
+        integration_commit="vllm-sha",
+        runtime={"vllm_version": "0.25.1"},
+        gpus=("1", "2"),
+        phase="all",
+    )
+
+    assert [result["case_id"] for result in resumed["results"]] == ["focused"]
+    assert len(resumed["resumed_at"]) == 1
+    assert "finished_at" not in resumed
+    assert "blocked" not in resumed
+
+
+def test_resume_rejects_identity_or_evidence_mismatch(tmp_path: Path):
+    cases, manifest = _resume_identity(tmp_path)
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="root_commit mismatch"):
+        _resume_manifest(
+            path,
+            cases=cases,
+            root_commit="different",
+            integration_commit="vllm-sha",
+            runtime={"vllm_version": "0.25.1"},
+            gpus=("1", "2"),
+            phase="all",
+        )
+
+    manifest["results"][0]["log"] = str(tmp_path / "missing.log")
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="evidence log is missing"):
+        _resume_manifest(
+            path,
+            cases=cases,
+            root_commit="root-sha",
+            integration_commit="vllm-sha",
+            runtime={"vllm_version": "0.25.1"},
+            gpus=("1", "2"),
+            phase="all",
+        )

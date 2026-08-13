@@ -45,6 +45,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--idle-samples", type=int, default=3)
     parser.add_argument("--idle-interval", type=float, default=2.0)
     parser.add_argument("--artifact-dir", type=Path)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a prerequisite-blocked run in --artifact-dir.",
+    )
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--list", action="store_true")
     return parser.parse_args()
@@ -138,6 +143,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_clickhouse_test_utils.py",
             "tests/test_gpu_idle_check.py",
             "tests/test_blackbox_case_generation.py",
+            "tests/test_vllm_release_matrix.py",
         ),
         environment={},
     )
@@ -277,11 +283,88 @@ def _case_environment(case: MatrixCase, gpus: tuple[str, str]) -> dict[str, str]
     return environment
 
 
-def _artifact_dir(path: Path | None) -> Path:
+def _artifact_dir(path: Path | None, *, resume: bool) -> Path:
+    if resume:
+        if path is None:
+            raise ValueError("--resume requires --artifact-dir")
+        if not path.is_dir():
+            raise ValueError(f"resume artifact directory does not exist: {path}")
+        return path.resolve()
     if path is not None:
         path.mkdir(parents=True, exist_ok=False)
         return path.resolve()
     return Path(tempfile.mkdtemp(prefix="dmi_vllm_0251_matrix_"))
+
+
+def _validate_passed_result(result: dict[str, Any]) -> None:
+    case_id = result.get("case_id", "<unknown>")
+    if result.get("status") != "passed" or result.get("returncode") != 0:
+        raise ValueError(f"cannot resume past non-passing case {case_id}")
+    log = result.get("log")
+    if not isinstance(log, str) or not Path(log).is_file():
+        raise ValueError(f"resume evidence log is missing for {case_id}")
+    summary = result.get("pytest_summary")
+    if summary is not None and any(
+        int(summary.get(field, 0))
+        for field in ("failures", "errors", "skipped")
+    ):
+        raise ValueError(f"resume pytest evidence is not clean for {case_id}")
+
+
+def _resume_manifest(
+    manifest_path: Path,
+    *,
+    cases: list[MatrixCase],
+    root_commit: str,
+    integration_commit: str,
+    runtime: dict[str, str],
+    gpus: tuple[str, str],
+    phase: str,
+) -> dict[str, Any]:
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read resume manifest: {error}") from error
+
+    expected = {
+        "schema_version": 1,
+        "project_root": str(PROJECT_ROOT),
+        "root_commit": root_commit,
+        "vllm_integration_commit": integration_commit,
+        "runtime": runtime,
+        "physical_gpus": list(gpus),
+        "phase": phase,
+    }
+    for field, value in expected.items():
+        if manifest.get(field) != value:
+            raise ValueError(
+                f"resume manifest {field} mismatch: "
+                f"expected {value!r}, found {manifest.get(field)!r}"
+            )
+
+    results = manifest.get("results")
+    if not isinstance(results, list):
+        raise ValueError("resume manifest results must be a list")
+    if results and results[-1].get("status") == "blocked-prerequisite":
+        results.pop()
+    if len(results) > len(cases):
+        raise ValueError("resume manifest contains more results than matrix cases")
+    for index, result in enumerate(results):
+        expected_case = cases[index]
+        if result.get("case_id") != expected_case.case_id:
+            raise ValueError(
+                f"resume case order mismatch at {index + 1}: expected "
+                f"{expected_case.case_id}, found {result.get('case_id')}"
+            )
+        _validate_passed_result(result)
+
+    resumed_at = manifest.setdefault("resumed_at", [])
+    if not isinstance(resumed_at, list):
+        raise ValueError("resume manifest resumed_at must be a list")
+    resumed_at.append(datetime.now(timezone.utc).isoformat())
+    for field in ("finished_at", "passed", "failed", "blocked"):
+        manifest.pop(field, None)
+    return manifest
 
 
 def _is_pytest_command(command: tuple[str, ...]) -> bool:
@@ -334,25 +417,53 @@ def main() -> None:
     if missing_models:
         raise SystemExit(f"model artifacts are not cached: {missing_models}")
 
-    artifact_dir = _artifact_dir(args.artifact_dir)
-    manifest: dict[str, Any] = {
-        "schema_version": 1,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "project_root": str(PROJECT_ROOT),
-        "root_commit": _git(PROJECT_ROOT, "rev-parse", "HEAD"),
-        "vllm_integration_commit": _git(integration, "rev-parse", "HEAD"),
-        "runtime": runtime,
-        "physical_gpus": list(gpus),
-        "phase": args.phase,
-        "results": [],
-    }
+    try:
+        artifact_dir = _artifact_dir(args.artifact_dir, resume=args.resume)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     manifest_path = artifact_dir / "manifest.json"
+    root_commit = _git(PROJECT_ROOT, "rev-parse", "HEAD")
+    integration_commit = _git(integration, "rev-parse", "HEAD")
+    if args.resume:
+        try:
+            manifest = _resume_manifest(
+                manifest_path,
+                cases=cases,
+                root_commit=root_commit,
+                integration_commit=integration_commit,
+                runtime=runtime,
+                gpus=gpus,
+                phase=args.phase,
+            )
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    else:
+        manifest = {
+            "schema_version": 1,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "project_root": str(PROJECT_ROOT),
+            "root_commit": root_commit,
+            "vllm_integration_commit": integration_commit,
+            "runtime": runtime,
+            "physical_gpus": list(gpus),
+            "phase": args.phase,
+            "results": [],
+        }
 
     blocked = False
+    attempt = len(manifest.get("resumed_at", [])) + 1
     for index, case in enumerate(cases, start=1):
+        if index <= len(manifest["results"]):
+            print(
+                f"[{index}/{len(cases)}] {case.case_id} (resume: already passed)",
+                flush=True,
+            )
+            continue
         print(f"[{index}/{len(cases)}] {case.case_id}", flush=True)
         result: dict[str, Any] = {
             **asdict(case),
+            "attempt": attempt,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
         if blocked:
@@ -379,13 +490,17 @@ def main() -> None:
 
         environment = _case_environment(case, gpus)
         if case.phase == "public":
-            environment["DMI_BLACKBOX_ARTIFACT_DIR"] = str(
-                artifact_dir / "raw" / case.case_id
+            raw_artifact_root = (
+                artifact_dir / "raw" / case.case_id / f"attempt-{attempt}"
             )
+            environment["DMI_BLACKBOX_ARTIFACT_DIR"] = str(raw_artifact_root)
+            result["raw_artifact_root"] = str(raw_artifact_root)
         command = list(case.command)
         junit_path = None
         if _is_pytest_command(case.command):
-            junit_path = artifact_dir / f"{index:02d}-{case.case_id}.xml"
+            junit_path = artifact_dir / (
+                f"{index:02d}-{case.case_id}-attempt-{attempt}.xml"
+            )
             command.append(f"--junitxml={junit_path}")
         started = time.monotonic()
         try:
@@ -404,7 +519,9 @@ def main() -> None:
             output = (error.stdout or "") + (error.stderr or "")
             returncode = None
             status = "timeout"
-        log_path = artifact_dir / f"{index:02d}-{case.case_id}.log"
+        log_path = artifact_dir / (
+            f"{index:02d}-{case.case_id}-attempt-{attempt}.log"
+        )
         log_path.write_text(output)
         pytest_summary = (
             _pytest_summary(junit_path)
