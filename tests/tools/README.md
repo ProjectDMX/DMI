@@ -90,6 +90,22 @@ E2E_GPUS=0 E2E_MAX_MODEL_LEN=128 E2E_MAX_NUM_BATCHED_TOKENS=128 \
   bash tests/tools/run_tp_compare_vllm.sh phi3 cudagraph 1
 ```
 
+Mistral uses the official 7B checkpoint for public parity and a graph-safe small
+fixture for the full-hook value oracle. Keep the fixture's memory and token
+bounds: an extremely small Mistral can make vLLM derive excessive KV metadata,
+and attention heads below the target FlexAttention minimum cannot compile.
+
+```bash
+DMI_BLACKBOX_MODEL=mistralai/Mistral-7B-Instruct-v0.2 \
+  DMI_BLACKBOX_CUDAGRAPH=1 DMI_BLACKBOX_GPU_MEMORY_UTILIZATION=0.9 \
+  DMI_BLACKBOX_MAX_MODEL_LEN=512 CUDA_VISIBLE_DEVICES=0 \
+  pytest -q -s tests/test_vllm_blackbox.py
+
+E2E_GPUS=0 E2E_GPU_MEM_UTIL=0.2 E2E_MAX_MODEL_LEN=128 \
+  E2E_MAX_NUM_BATCHED_TOKENS=128 \
+  bash tests/tools/run_tp_compare_vllm.sh mistral cudagraph 1
+```
+
 Set `DMI_BLACKBOX_ARTIFACT_DIR` to retain each mode's generated cases and raw
 baseline/monitored JSON instead of relying on pytest's temporary directory.
 

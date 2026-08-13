@@ -117,13 +117,18 @@ def _storage_case(
     ref_max_len: int = 8192,
     model_subfolder: str | None = None,
     max_model_len: int = 512,
+    memory_utilization: float | None = None,
 ) -> MatrixCase:
     environment = {
         "DMX_HOOK_SELECTION": hook_selection,
         "E2E_REF_MAX_LEN": str(ref_max_len),
         "E2E_RING_PAYLOAD_MB": "512",
         "E2E_RING_PINNED_MB": "512",
-        "E2E_GPU_MEM_UTIL": "0.85" if tp_size == 2 else "0.6",
+        "E2E_GPU_MEM_UTIL": str(
+            memory_utilization
+            if memory_utilization is not None
+            else (0.85 if tp_size == 2 else 0.6)
+        ),
         "E2E_MAX_MODEL_LEN": str(max_model_len),
         "E2E_MAX_NUM_BATCHED_TOKENS": str(max_model_len),
     }
@@ -157,6 +162,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_vllm_027_model_contracts.py",
             "tests/test_gemma3_p_inventory.py",
             "tests/test_model_artifacts.py",
+            "tests/test_mistral_p_contract.py",
             "tests/test_phi3_p_contract.py",
             "tests/test_vllm_storage_contracts.py",
             "tests/test_qwen2_p_inventory.py",
@@ -188,6 +194,14 @@ def build_cases(phase: str) -> list[MatrixCase]:
             tp_size=1,
             memory_utilization=0.75,
             model_arg="microsoft/Phi-3.5-mini-instruct",
+            max_model_len=512,
+        ),
+        _blackbox_case(
+            "mistral",
+            "mistralai/Mistral-7B-Instruct-v0.2",
+            tp_size=1,
+            memory_utilization=0.9,
+            model_arg="mistralai/Mistral-7B-Instruct-v0.2",
             max_model_len=512,
         ),
         _blackbox_case("gpt2", "gpt2", tp_size=1, memory_utilization=0.5),
@@ -224,6 +238,17 @@ def build_cases(phase: str) -> list[MatrixCase]:
                 ref_max_len=128,
                 model_subfolder="hf",
                 max_model_len=128,
+            )
+        )
+        storage.append(
+            _storage_case(
+                "mistral",
+                "openaccess-ai-collective/tiny-mistral",
+                mode,
+                1,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.2,
             )
         )
         storage.append(

@@ -93,6 +93,15 @@ official `microsoft/Phi-3.5-mini-instruct` checkpoint plus byte-identical
 eager/graph full-hook transport on a tiny fixture. TP>1, PP, quantization,
 serving, speculative, and non-text task variants remain excluded.
 
+Mistral is `supported` for the bounded TP1 BF16 V1 offline eager/default-graph
+cell at integration commit `8c89ec33bbc5`. The
+[`Mistral audit`](vllm-0.27.1-mistral-audit.md) records strict public parity on
+the official `mistralai/Mistral-7B-Instruct-v0.2` checkpoint and byte-identical
+eager/graph full-hook transport on a qualified small fixture. Configurations
+that enable Llama-4 attention scaling or adaptive conditional RMS normalization,
+alternate loaders, TP>1, quantization, serving, speculative, and non-text
+variants remain excluded.
+
 For each row, use an upstream tiny/random fixture for fast focused tests when
 available, then require one real-checkpoint baseline/monitored run before moving
 beyond `static-only`.

@@ -76,6 +76,7 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
         "qwen2",
         "qwen3",
         "llama",
+        "mistral",
         "phi3",
         "qwen2_moe",
     ):
@@ -87,6 +88,8 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
     assert "storage-gemma3-cudagraph-tp1" in case_ids
     assert "storage-phi3-eager-tp1" in case_ids
     assert "storage-phi3-cudagraph-tp1" in case_ids
+    assert "storage-mistral-eager-tp1" in case_ids
+    assert "storage-mistral-cudagraph-tp1" in case_ids
 
 
 def test_gemma3_matrix_resolves_the_fixture_subfolder() -> None:
@@ -117,6 +120,23 @@ def test_phi3_public_matrix_uses_the_production_checkpoint() -> None:
         "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM"
     )
     assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
+
+
+def test_mistral_matrix_separates_production_and_graph_safe_fixtures() -> None:
+    cases = {case.case_id: case for case in build_cases("all")}
+
+    public = cases["public-mistral-tp1-eager-graph"]
+    assert public.model_id == "mistralai/Mistral-7B-Instruct-v0.2"
+    assert public.environment["DMI_BLACKBOX_MODEL"] == (
+        "mistralai/Mistral-7B-Instruct-v0.2"
+    )
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "512"
+
+    for mode in ("eager", "cudagraph"):
+        storage = cases[f"storage-mistral-{mode}-tp1"]
+        assert storage.model_id == "openaccess-ai-collective/tiny-mistral"
+        assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.2"
+        assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
 
 
 def test_static_only_models_use_bounded_two_gpu_storage_cells():
