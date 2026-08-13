@@ -151,6 +151,7 @@ _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2PLMHeadModel",
     "GraniteForCausalLM": "GranitePForCausalLM",
     "JambaForCausalLM": "JambaPForCausalLM",
+    "KimiK3ForConditionalGeneration": "KimiK3PForConditionalGeneration",
     "Lfm2ForCausalLM": "Lfm2PForCausalLM",
     "MiniCPMForCausalLM": "MiniCPMPForCausalLM",
     "MistralForCausalLM": "MistralPForCausalLM",
@@ -180,6 +181,9 @@ _DMI_MODEL_VARIANTS = {
     "GPT2PLMHeadModel": "gpt2_p:GPT2PLMHeadModel",
     "GranitePForCausalLM": "granite_p:GranitePForCausalLM",
     "JambaPForCausalLM": "jamba_p:JambaPForCausalLM",
+    "KimiK3PForConditionalGeneration": (
+        "kimi_k3_p:KimiK3PForConditionalGeneration"
+    ),
     "Lfm2PForCausalLM": "lfm2_p:Lfm2PForCausalLM",
     "MiniCPMPForCausalLM": "minicpm_p:MiniCPMPForCausalLM",
     "Qwen2PForCausalLM": "qwen2_p:Qwen2PForCausalLM",

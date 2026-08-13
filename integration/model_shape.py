@@ -94,6 +94,7 @@ def _make_model_shape_from_hf_config(
     )
     top_k = (
         getattr(cfg, "num_experts_per_tok", None)
+        or getattr(cfg, "num_experts_per_token", None)
         or getattr(cfg, "top_k", None)
         or 0
     )
