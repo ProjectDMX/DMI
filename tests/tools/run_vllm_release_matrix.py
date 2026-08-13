@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from typing import Any
+from xml.etree import ElementTree
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -283,6 +284,23 @@ def _artifact_dir(path: Path | None) -> Path:
     return Path(tempfile.mkdtemp(prefix="dmi_vllm_0251_matrix_"))
 
 
+def _is_pytest_command(command: tuple[str, ...]) -> bool:
+    return len(command) >= 3 and command[1:3] == ("-m", "pytest")
+
+
+def _pytest_summary(path: Path) -> dict[str, int]:
+    root = ElementTree.parse(path).getroot()
+    suites = [
+        suite
+        for suite in root.iter("testsuite")
+        if any(child.tag == "testcase" for child in suite)
+    ]
+    return {
+        field: sum(int(suite.attrib.get(field, "0")) for suite in suites)
+        for field in ("tests", "failures", "errors", "skipped")
+    }
+
+
 def main() -> None:
     args = _parse_args()
     try:
@@ -364,10 +382,15 @@ def main() -> None:
             environment["DMI_BLACKBOX_ARTIFACT_DIR"] = str(
                 artifact_dir / "raw" / case.case_id
             )
+        command = list(case.command)
+        junit_path = None
+        if _is_pytest_command(case.command):
+            junit_path = artifact_dir / f"{index:02d}-{case.case_id}.xml"
+            command.append(f"--junitxml={junit_path}")
         started = time.monotonic()
         try:
             completed = subprocess.run(
-                case.command,
+                command,
                 cwd=PROJECT_ROOT,
                 env=environment,
                 capture_output=True,
@@ -383,9 +406,22 @@ def main() -> None:
             status = "timeout"
         log_path = artifact_dir / f"{index:02d}-{case.case_id}.log"
         log_path.write_text(output)
+        pytest_summary = (
+            _pytest_summary(junit_path)
+            if junit_path is not None and junit_path.is_file()
+            else None
+        )
+        if (
+            status == "passed"
+            and pytest_summary is not None
+            and pytest_summary["skipped"]
+        ):
+            status = "blocked-prerequisite"
         result.update(
             status=status,
             returncode=returncode,
+            executed_command=command,
+            pytest_summary=pytest_summary,
             duration_s=round(time.monotonic() - started, 3),
             log=str(log_path),
             finished_at=datetime.now(timezone.utc).isoformat(),

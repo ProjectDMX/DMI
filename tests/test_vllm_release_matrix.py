@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from tests.tools.run_vllm_release_matrix import _selected_gpus, build_cases
+from tests.tools.run_vllm_release_matrix import (
+    _pytest_summary,
+    _selected_gpus,
+    build_cases,
+)
 
 
 pytestmark = pytest.mark.cpu
@@ -40,3 +46,20 @@ def test_static_only_models_use_bounded_two_gpu_storage_cells():
         assert case.gpu_count == 2
         assert case.environment["DMX_HOOK_SELECTION"] == "resid_pre"
         assert case.environment["E2E_REF_MAX_LEN"] == "512"
+
+
+def test_pytest_summary_retains_skipped_prerequisites(tmp_path: Path):
+    report = tmp_path / "report.xml"
+    report.write_text(
+        '<testsuites><testsuite tests="3" failures="0" errors="0" skipped="1">'
+        '<testcase name="passed"/><testcase name="also-passed"/>'
+        '<testcase name="missing"><skipped/></testcase>'
+        "</testsuite></testsuites>"
+    )
+
+    assert _pytest_summary(report) == {
+        "tests": 3,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 1,
+    }
