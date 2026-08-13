@@ -20,6 +20,7 @@ from tests.blackbox.contracts import (
     metamorphic_mismatches,
     transparency_mismatches,
 )
+from tests.process_group import run_process_group
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -78,13 +79,20 @@ def _run(
     env = dict(os.environ)
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("TRANSFORMERS_OFFLINE", "1")
-    result = subprocess.run(
-        command,
-        cwd=PROJECT_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    timeout = float(os.environ.get("DMI_BLACKBOX_PROCESS_TIMEOUT", "1800"))
+    try:
+        result = run_process_group(
+            command,
+            cwd=PROJECT_ROOT,
+            env=env,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        pytest.fail(
+            f"{mode} black-box runner exceeded {timeout}s and its process "
+            f"group was terminated\nstdout:\n{(error.output or '')[-4000:]}\n"
+            f"stderr:\n{(error.stderr or '')[-4000:]}"
+        )
     assert result.returncode == 0, (
         f"{mode} black-box runner failed with rc={result.returncode}\n"
         f"stdout:\n{result.stdout[-4000:]}\n"

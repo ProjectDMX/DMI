@@ -17,9 +17,12 @@ import time
 from typing import Any
 from xml.etree import ElementTree
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 IDLE_CHECK = PROJECT_ROOT / "tests/tools/check_gpu_idle.py"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tests.process_group import run_process_group
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_clickhouse_test_utils.py",
             "tests/test_gpu_idle_check.py",
             "tests/test_blackbox_case_generation.py",
+            "tests/test_process_group.py",
             "tests/test_vllm_release_matrix.py",
         ),
         environment={},
@@ -504,12 +508,10 @@ def main() -> None:
             command.append(f"--junitxml={junit_path}")
         started = time.monotonic()
         try:
-            completed = subprocess.run(
+            completed = run_process_group(
                 command,
                 cwd=PROJECT_ROOT,
                 env=environment,
-                capture_output=True,
-                text=True,
                 timeout=args.case_timeout,
             )
             output = completed.stdout + completed.stderr
