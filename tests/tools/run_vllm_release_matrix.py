@@ -188,6 +188,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_vllm_027_model_contracts.py",
             "tests/test_apertus_p_contract.py",
             "tests/test_ernie45_p_contract.py",
+            "tests/test_deepseek_v4_p_contract.py",
             "tests/test_falcon_h1_p_contract.py",
             "tests/test_granite_p_contract.py",
             "tests/test_gpt_oss_p_contract.py",
@@ -487,12 +488,22 @@ def build_cases(phase: str) -> list[MatrixCase]:
 
     gpt_oss_revision = "6cee5e81ee83917806bbde320786a8fb61efebee"
     gemma4_e2b_revision = "3e22461f65e89153144f8adb70e3b8c2cc9845a7"
+    deepseek_v4_flash_revision = "60d8d70770c6776ff598c94bb586a859a38244f1"
     glm52_revision = "b4734de4facf877f85769a911abafc5283eab3d9"
     llama4_scout_revision = "c2b440bc2b8c784ad310291d035b8550a771f24f"
     minimax_m27_revision = "d494266a4affc0d2995ba1fa35c8481cbd84294b"
     qwen3_moe_revision = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
     qwen36_revision = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
     sota = [
+        _blackbox_case(
+            "deepseek_v4_flash",
+            "deepseek-ai/DeepSeek-V4-Flash",
+            tp_size=4,
+            memory_utilization=0.9,
+            max_model_len=128,
+            revision=deepseek_v4_flash_revision,
+            generated_cases=2,
+        ),
         _blackbox_case(
             "gemma4_e2b",
             "google/gemma-4-E2B-it",
@@ -563,6 +574,19 @@ def build_cases(phase: str) -> list[MatrixCase]:
         ),
     ]
     for mode in ("eager", "cudagraph"):
+        sota.append(
+            _storage_case(
+                "deepseek_v4_flash",
+                "deepseek-ai/DeepSeek-V4-Flash",
+                mode,
+                4,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.9,
+                ring_mb=2048,
+                revision=deepseek_v4_flash_revision,
+            )
+        )
         sota.append(
             _storage_case(
                 "gemma4_e2b",

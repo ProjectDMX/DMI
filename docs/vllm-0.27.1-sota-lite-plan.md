@@ -15,7 +15,7 @@ H100 evidence required before a model is called supported.
 | 5 | `zai-org/GLM-5.2` | `GlmMoeDsaForCausalLM` | `deepseek_v2:GlmMoeDsaForCausalLM` | full text decoder | lite implemented; H100 TP32 pending |
 | 6 | `MiniMaxAI/MiniMax-M2.7` | `MiniMaxM2ForCausalLM` | `minimax_m2:MiniMaxM2ForCausalLM` | full text decoder | lite implemented; H100 TP4 pending |
 | 7 | `google/gemma-4-E2B-it` | `Gemma4ForConditionalGeneration` | `gemma4_mm:Gemma4ForConditionalGeneration` | multimodal decoder | lite implemented; H100 TP1 pending |
-| 8 | `deepseek-ai/DeepSeek-V4-Flash` | `DeepseekV4ForCausalLM` | `vllm.models.deepseek_v4:DeepseekV4ForCausalLM` | full text decoder/plugin | queued |
+| 8 | `deepseek-ai/DeepSeek-V4-Flash` | `DeepseekV4ForCausalLM` | `vllm.models.deepseek_v4:DeepseekV4ForCausalLM` | reduced text decoder/plugin | lite implemented; H100 TP4 pending |
 | 9 | `moonshotai/Kimi-K3` | `KimiK3ForConditionalGeneration` | `vllm.models.kimi_k3:KimiK3ForConditionalGeneration` | multimodal decoder/plugin | queued |
 
 `multimodal decoder` means the public model still accepts the named text/image
