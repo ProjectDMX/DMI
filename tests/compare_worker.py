@@ -18,6 +18,9 @@ from monitoring.ring_transport import HOOK_TYPE_TO_SHORT_NAME, HookSpec
 
 
 _COMPARE_MODEL_VARIANTS = {
+    "ApertusCompareForCausalLM": (
+        "apertus_compare:ApertusCompareForCausalLM"
+    ),
     "FalconH1CompareForCausalLM": (
         "falcon_h1_compare:FalconH1CompareForCausalLM"
     ),
@@ -72,6 +75,7 @@ _register_compare_model_variants()
 
 
 _ARCH_REMAP = {
+    "ApertusForCausalLM": "ApertusCompareForCausalLM",
     "FalconH1ForCausalLM": "FalconH1CompareForCausalLM",
     "Gemma3ForCausalLM": "Gemma3CompareForCausalLM",
     "GPT2LMHeadModel": "GPT2CompareForCausalLM",

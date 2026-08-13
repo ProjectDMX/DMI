@@ -21,6 +21,7 @@ import torch
 
 
 _MODEL_ALIASES = {
+    "apertus": "swiss-ai/Apertus-8B-Instruct-2509",
     "falcon_h1": "tiiuae/Falcon-H1-Tiny-90M-Instruct",
     "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",

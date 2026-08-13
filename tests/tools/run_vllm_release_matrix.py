@@ -161,6 +161,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "-q",
             "tests/test_vllm_version_compat.py",
             "tests/test_vllm_027_model_contracts.py",
+            "tests/test_apertus_p_contract.py",
             "tests/test_falcon_h1_p_contract.py",
             "tests/test_granite_p_contract.py",
             "tests/test_jamba_p_contract.py",
@@ -188,6 +189,14 @@ def build_cases(phase: str) -> list[MatrixCase]:
         environment={},
     )
     public = [
+        _blackbox_case(
+            "apertus",
+            "swiss-ai/Apertus-8B-Instruct-2509",
+            tp_size=1,
+            memory_utilization=0.9,
+            model_arg="swiss-ai/Apertus-8B-Instruct-2509",
+            max_model_len=128,
+        ),
         _blackbox_case(
             "olmo3",
             "allenai/Olmo-3-7B-Instruct",
@@ -277,6 +286,17 @@ def build_cases(phase: str) -> list[MatrixCase]:
     ]
     storage: list[MatrixCase] = []
     for mode in ("eager", "cudagraph"):
+        storage.append(
+            _storage_case(
+                "apertus",
+                "swiss-ai/Apertus-8B-Instruct-2509",
+                mode,
+                1,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.93,
+            )
+        )
         storage.append(
             _storage_case(
                 "olmo3",

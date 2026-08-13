@@ -35,9 +35,9 @@ the registry source, but remains upstream-static evidence rather than DMI
 runtime support. Across the 41 representative checkpoints below:
 
 - all 41 resolve in vLLM 0.27.1;
-- 13 architectures have a DMI model remap on the current stacked expansion
+- 14 architectures have a DMI model remap on the current stacked expansion
   branch;
-- 28 are unmapped by DMI;
+- 27 are unmapped by DMI;
 - registry presence is upstream static evidence, not DMI runtime support.
 
 Between vLLM 0.25.1 and 0.27.1, the combined text/multimodal registry adds eight
@@ -152,6 +152,18 @@ fixtures do not independently cover the production sliding/full schedule plus
 both default and YaRN RoPE branches, so they are not used to generalize the
 runtime verdict. Other checkpoints, TP>1, prefix caching, quantization, serving,
 speculative, and other OLMo-family architectures remain excluded.
+
+Apertus is `supported` for the official
+`swiss-ai/Apertus-8B-Instruct-2509` checkpoint in the bounded TP1 BF16 V1
+offline eager/default-graph cell at integration commit `3d5e5fb6b87f`. The
+[`Apertus audit`](vllm-0.27.1-apertus-audit.md) records strict public API parity
+and byte-identical eager/graph storage on that same production checkpoint. Its
+389-family manifest follows fused pre-norm residual arithmetic, observes Q/K
+after per-head normalization and before RoPE, and exposes the xIELU
+post-activation boundary. The verdict covers vLLM's Python xIELU fallback;
+Apertus v1.1/70B and other config branches, the optional fused xIELU extension,
+TP>1, prefix caching, quantization, serving, and speculative modes remain
+excluded.
 
 For each row, use an upstream tiny/random fixture for fast focused tests when
 available, then require one real-checkpoint baseline/monitored run before moving

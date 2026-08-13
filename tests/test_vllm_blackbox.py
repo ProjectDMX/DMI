@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = PROJECT_ROOT / "tests/tools/smoke_vllm_model.py"
 CASES = PROJECT_ROOT / "tests/blackbox/cases/transparency.json"
 MODEL_ALIASES = {
+    "apertus": "swiss-ai/Apertus-8B-Instruct-2509",
     "falcon_h1": "tiiuae/Falcon-H1-Tiny-90M-Instruct",
     "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",

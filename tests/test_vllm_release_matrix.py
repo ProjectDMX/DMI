@@ -71,6 +71,7 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
 
     assert "focused-cpu-contracts" in case_ids
     for model in (
+        "apertus",
         "falcon_h1",
         "gemma3",
         "gpt2",
@@ -105,6 +106,8 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
     assert "storage-lfm2-cudagraph-tp1" in case_ids
     assert "storage-olmo3-eager-tp1" in case_ids
     assert "storage-olmo3-cudagraph-tp1" in case_ids
+    assert "storage-apertus-eager-tp1" in case_ids
+    assert "storage-apertus-cudagraph-tp1" in case_ids
 
 
 def test_gemma3_matrix_resolves_the_fixture_subfolder() -> None:
@@ -242,6 +245,25 @@ def test_olmo3_matrix_uses_the_branch_complete_production_checkpoint() -> None:
         assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
         assert storage.environment["E2E_RING_PAYLOAD_MB"] == "1024"
         assert storage.environment["E2E_RING_PINNED_MB"] == "1024"
+
+
+def test_apertus_matrix_uses_the_qualified_8b_production_checkpoint() -> None:
+    cases = {case.case_id: case for case in build_cases("all")}
+
+    public = cases["public-apertus-tp1-eager-graph"]
+    assert public.model_id == "swiss-ai/Apertus-8B-Instruct-2509"
+    assert public.environment["DMI_BLACKBOX_MODEL"] == (
+        "swiss-ai/Apertus-8B-Instruct-2509"
+    )
+    assert public.environment["DMI_BLACKBOX_GPU_MEMORY_UTILIZATION"] == "0.9"
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "128"
+
+    for mode in ("eager", "cudagraph"):
+        storage = cases[f"storage-apertus-{mode}-tp1"]
+        assert storage.model_id == "swiss-ai/Apertus-8B-Instruct-2509"
+        assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.93"
+        assert storage.environment["E2E_REF_MAX_LEN"] == "128"
+        assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
 
 
 def test_static_only_models_use_bounded_two_gpu_storage_cells():
