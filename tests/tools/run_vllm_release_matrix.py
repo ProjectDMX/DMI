@@ -161,6 +161,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_vllm_version_compat.py",
             "tests/test_vllm_027_model_contracts.py",
             "tests/test_falcon_h1_p_contract.py",
+            "tests/test_jamba_p_contract.py",
             "tests/test_lfm2_p_contract.py",
             "tests/test_conv_hook_contract.py",
             "tests/test_gemma3_p_inventory.py",
@@ -184,6 +185,14 @@ def build_cases(phase: str) -> list[MatrixCase]:
         environment={},
     )
     public = [
+        _blackbox_case(
+            "jamba",
+            "ai21labs/AI21-Jamba2-3B",
+            tp_size=1,
+            memory_utilization=0.5,
+            model_arg="ai21labs/AI21-Jamba2-3B",
+            max_model_len=128,
+        ),
         _blackbox_case(
             "lfm2",
             "LiquidAI/LFM2.5-1.2B-Instruct",
@@ -249,6 +258,17 @@ def build_cases(phase: str) -> list[MatrixCase]:
     ]
     storage: list[MatrixCase] = []
     for mode in ("eager", "cudagraph"):
+        storage.append(
+            _storage_case(
+                "jamba",
+                "ai21labs/AI21-Jamba2-3B",
+                mode,
+                1,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.5,
+            )
+        )
         storage.append(
             _storage_case(
                 "lfm2",

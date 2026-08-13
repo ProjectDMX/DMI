@@ -74,6 +74,7 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
         "falcon_h1",
         "gemma3",
         "gpt2",
+        "jamba",
         "lfm2",
         "qwen2",
         "qwen3",
@@ -94,6 +95,8 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
     assert "storage-mistral-cudagraph-tp1" in case_ids
     assert "storage-falcon_h1-eager-tp1" in case_ids
     assert "storage-falcon_h1-cudagraph-tp1" in case_ids
+    assert "storage-jamba-eager-tp1" in case_ids
+    assert "storage-jamba-cudagraph-tp1" in case_ids
     assert "storage-lfm2-eager-tp1" in case_ids
     assert "storage-lfm2-cudagraph-tp1" in case_ids
 
@@ -176,6 +179,23 @@ def test_lfm2_matrix_separates_production_and_hybrid_fixture() -> None:
         storage = cases[f"storage-lfm2-{mode}-tp1"]
         assert storage.model_id == "tiny-random/lfm2"
         assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.2"
+        assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
+
+
+def test_jamba_matrix_uses_the_qualified_dense_production_checkpoint() -> None:
+    cases = {case.case_id: case for case in build_cases("all")}
+
+    public = cases["public-jamba-tp1-eager-graph"]
+    assert public.model_id == "ai21labs/AI21-Jamba2-3B"
+    assert public.environment["DMI_BLACKBOX_MODEL"] == (
+        "ai21labs/AI21-Jamba2-3B"
+    )
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "128"
+
+    for mode in ("eager", "cudagraph"):
+        storage = cases[f"storage-jamba-{mode}-tp1"]
+        assert storage.model_id == "ai21labs/AI21-Jamba2-3B"
+        assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.5"
         assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
 
 
