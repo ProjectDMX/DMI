@@ -13,7 +13,14 @@ from integration.vllm_adapter import _attach_dmi_internal, normalize_vllm_reques
 
 
 def _fake_outputs(*request_ids):
-    return [SimpleNamespace(request_id=rid) for rid in request_ids]
+    return [
+        SimpleNamespace(
+            request_id=rid,
+            prompt_token_ids=[10, 11],
+            outputs=[SimpleNamespace(token_ids=[20, 21, 22])],
+        )
+        for rid in request_ids
+    ]
 
 
 def test_tags_each_output_with_lazy_internal():
@@ -29,6 +36,16 @@ def test_per_request_isolation():
     # Each output's internal is keyed only by its own (normalized) request_id.
     assert outs[0].dmi_internal._request_ids == (normalize_vllm_request_id("req-a"),)
     assert outs[1].dmi_internal._request_ids == (normalize_vllm_request_id("req-b"),)
+
+
+def test_expected_token_coverage_comes_from_public_request_output():
+    outs = _fake_outputs("req-a")
+
+    _attach_dmi_internal(outs, "m", reader=None)
+
+    rid = normalize_vllm_request_id("req-a")
+    # 2 prompt + 3 generated - the final unforwarded sampled token.
+    assert outs[0].dmi_internal._token_ranges == {rid: ((0, 4),)}
 
 
 def test_reader_passed_through():

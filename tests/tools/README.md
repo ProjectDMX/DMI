@@ -18,6 +18,8 @@ the vLLM runtime); they are not CPU-safe.
 | `identical_vllm.sh` | Wrapper around the vLLM bitwise-identical pytest check. |
 | `verify_vllm.sh` | vLLM row-count + identical verification sweep across ring sizes. |
 | `verify_hf.sh` | HF E2E correctness sweep across ring sizes. |
+| `smoke_vllm_model.py` | Baseline/monitored public-output smoke for a new vLLM version or model; no ClickHouse required. |
+| `run_vllm_release_matrix.py` | Version-pinned focused/public/storage matrix with two-GPU idle gates and retained JSON/log evidence. |
 
 Example:
 
@@ -25,6 +27,61 @@ Example:
 # from the repo root
 LD_PRELOAD=/path/to/libstdc++.so.6 CUDA_VISIBLE_DEVICES=0,1 \
   bash tests/tools/run_regression.sh
+```
+
+The formal API-only differential gate combines the curated corpus under
+`tests/blackbox/cases/` with reproducible generated prompts, runs baseline and
+monitored vLLM in separate processes, and compares prompt tokens, generated
+tokens, text, and stop metadata:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 pytest -q -s tests/test_vllm_blackbox.py
+
+# Exercise both eager and CUDA-graph public API paths.
+DMI_BLACKBOX_CUDAGRAPH=1 CUDA_VISIBLE_DEVICES=0 \
+  pytest -q -s tests/test_vllm_blackbox.py
+
+# Reproduce or broaden a generated corpus.
+DMI_BLACKBOX_SEED=20260812 DMI_BLACKBOX_GENERATED_CASES=20 \
+  CUDA_VISIBLE_DEVICES=0 pytest -q -s tests/test_vllm_blackbox.py
+
+# A model that requires two-way tensor parallelism.
+DMI_BLACKBOX_MODEL=qwen2_moe DMI_BLACKBOX_TP_SIZE=2 \
+  DMI_BLACKBOX_GPU_MEMORY_UTILIZATION=0.85 \
+  CUDA_VISIBLE_DEVICES=0,1 pytest -q -s tests/test_vllm_blackbox.py
+```
+
+Set `DMI_BLACKBOX_ARTIFACT_DIR` to retain each mode's generated cases and raw
+baseline/monitored JSON instead of relying on pytest's temporary directory.
+
+For manual diagnosis, run both modes against the same case manifest and compare
+their JSON outputs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tests/tools/smoke_vllm_model.py \
+  --mode baseline --model qwen2 \
+  --cases tests/blackbox/cases/transparency.json \
+  --output /tmp/qwen2-baseline.json
+CUDA_VISIBLE_DEVICES=0 python tests/tools/smoke_vllm_model.py \
+  --mode monitored --model qwen2 \
+  --cases tests/blackbox/cases/transparency.json \
+  --output /tmp/qwen2-monitored.json
+```
+
+The vLLM runners set `VLLM_USE_V2_MODEL_RUNNER=0` before importing vLLM.
+The 0.25.1 port is V1-runner-only and fails closed if an embedding process
+selects V2.
+
+Before starting a shared-machine multi-GPU sweep, verify the selected physical
+cards are idle for consecutive samples:
+
+```bash
+python tests/tools/check_gpu_idle.py --gpus 0,1 --samples 3 --interval 2
+
+# Once two physical cards are idle, run the complete vLLM 0.25.1 matrix from
+# the intended Python environment. The output directory must not already exist.
+python tests/tools/run_vllm_release_matrix.py \
+  --gpus 0,1 --phase all --artifact-dir /tmp/dmi-vllm-0251-evidence
 ```
 
 > Native CUDA ring tests live separately under `tests/ring/` (built via its

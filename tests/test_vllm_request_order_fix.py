@@ -8,12 +8,16 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+from packaging.version import Version
 import pytest
 import torch
 import torch.nn as nn
 
 import vllm
-import vllm._C
+try:
+    import vllm._C as _vllm_native_extension
+except ModuleNotFoundError:
+    import vllm._C_stable_libtorch as _vllm_native_extension
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
@@ -69,19 +73,32 @@ from monitoring.selection import (
     hook_belongs_to_tp_rank,
     select_hook_specs,
 )
-from tests.compare_worker import CompareWorker
+from tests.compare_worker import CompareWorker, _filter_ref_buffers
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PINNED_VLLM_ROOT = (REPO_ROOT / "integration" / "vllm").resolve()
 
 
-def test_runtime_uses_the_pinned_source_and_extension():
+def test_runtime_uses_a_coherent_supported_vllm_installation():
     source = Path(vllm.__file__).resolve()
-    extension = Path(vllm._C.__file__).resolve()
+    extension = Path(_vllm_native_extension.__file__).resolve()
 
-    assert source.is_relative_to(PINNED_VLLM_ROOT)
-    assert extension.is_relative_to(PINNED_VLLM_ROOT)
+    if source.is_relative_to(PINNED_VLLM_ROOT):
+        assert extension.is_relative_to(PINNED_VLLM_ROOT)
+        return
+
+    # The adapter can lazily register the bundled model variants with an
+    # official wheel.  Keep source and native extension from that same wheel,
+    # and constrain this path to the versions covered by the port matrix.
+    assert source.parent == extension.parent
+    version = Version(vllm.__version__)
+    assert (version.major, version.minor) in {
+        (0, 17),
+        (0, 18),
+        (0, 19),
+        (0, 25),
+    }
 
 
 def _scheduler(order=("A", "B"), counts=(2, 3), total=None):
@@ -247,7 +264,14 @@ def test_compare_worker_saves_committed_real_layout(
         _current_dim0_offsets=[0],
         _current_flattened=True,
     )
-    adaptor = SimpleNamespace(transport=transport, _step_counter=4)
+    adaptor = SimpleNamespace(
+        transport=transport,
+        _step_counter=4,
+        active_specs=(
+            SimpleNamespace(hook_type=HOOK_TYPE_RESID_PRE),
+            SimpleNamespace(hook_type=HOOK_TYPE_FINAL_LOGITS),
+        ),
+    )
     buffers = {
         "resid_pre_L0": torch.tensor(
             [[100], [101], [102], [200], [201]],
@@ -317,6 +341,43 @@ def test_compare_worker_saves_committed_real_layout(
         ),
         buffers["final_logits"][1:2],
     )
+
+
+def test_compare_worker_filters_reference_to_active_hook_contract():
+    buffers = {
+        "resid_pre_L0": torch.zeros(1),
+        "resid_pre_L1": torch.zeros(1),
+        "q_L0": torch.zeros(1),
+        "final_logits": torch.zeros(1),
+    }
+    active_specs = (
+        SimpleNamespace(hook_type=HOOK_TYPE_RESID_PRE),
+        SimpleNamespace(hook_type=HOOK_TYPE_FINAL_LOGITS),
+    )
+
+    filtered = _filter_ref_buffers(buffers, active_specs)
+
+    assert set(filtered) == {
+        "resid_pre_L0",
+        "resid_pre_L1",
+        "final_logits",
+    }
+
+
+def test_compare_worker_rejects_missing_active_hook_reference():
+    active_specs = (SimpleNamespace(hook_type=HOOK_TYPE_FINAL_LOGITS),)
+
+    with pytest.raises(RuntimeError, match="no reference buffers"):
+        _filter_ref_buffers({"resid_pre_L0": torch.zeros(1)}, active_specs)
+
+
+def test_compare_worker_allows_empty_rank_local_hook_contract():
+    filtered = _filter_ref_buffers(
+        {"resid_pre_L0": torch.zeros(1)},
+        (),
+    )
+
+    assert filtered == {}
 
 
 @pytest.mark.parametrize(
@@ -1582,6 +1643,55 @@ def test_worker_resets_state_when_upstream_raises(monkeypatch):
     with pytest.raises(RuntimeError, match="upstream failure"):
         worker.execute_model(_scheduler())
     assert adaptor._step_state.phase is VLLMStepPhase.IDLE
+
+
+def test_explicit_monitoring_stop_reports_failure_after_full_cleanup(monkeypatch):
+    events = []
+
+    def fail_ring_stop():
+        events.append("ring_stop")
+        raise RuntimeError("ring flush failed")
+
+    worker = DMXGPUWorker.__new__(DMXGPUWorker)
+    worker.adaptor = SimpleNamespace(
+        ring_engine=SimpleNamespace(stop=fail_ring_stop),
+        engine=SimpleNamespace(close=lambda: events.append("engine_close")),
+    )
+    worker._dmx_host_engine = SimpleNamespace(
+        stop=lambda: events.append("host_stop")
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        "integration.vllm_adapter.ring_transport.deactivate",
+        lambda: events.append("deactivate"),
+    )
+
+    with pytest.raises(RuntimeError, match="ring_engine.stop: ring flush failed"):
+        worker.stop_monitoring()
+
+    assert events == ["ring_stop", "deactivate", "engine_close", "host_stop"]
+    assert worker.adaptor is None
+    assert worker._dmx_host_engine is None
+
+
+def test_monitoring_stop_is_reentrant_after_success(monkeypatch):
+    events = []
+    worker = DMXGPUWorker.__new__(DMXGPUWorker)
+    worker.adaptor = SimpleNamespace(
+        ring_engine=SimpleNamespace(stop=lambda: events.append("ring_stop")),
+        engine=SimpleNamespace(close=lambda: events.append("engine_close")),
+    )
+    worker._dmx_host_engine = None
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        "integration.vllm_adapter.ring_transport.deactivate",
+        lambda: events.append("deactivate"),
+    )
+
+    worker.stop_monitoring()
+    worker.stop_monitoring()
+
+    assert events == ["ring_stop", "deactivate", "engine_close"]
 
 
 def test_ec_transfer_producer_passthrough_never_arms(monkeypatch):

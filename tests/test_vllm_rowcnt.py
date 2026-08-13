@@ -39,28 +39,42 @@ import sys
 import tempfile
 
 import pytest
-import torch
+
+from tests._requirements import (
+    require_clickhouse,
+    require_cuda,
+    require_model_cache,
+    require_vllm,
+)
+from tests._clickhouse_test_utils import delete_capture_from_meta
+
+
+_MODEL_ALIASES = {
+    "gpt2": "gpt2",
+    "qwen2": "Qwen/Qwen2.5-0.5B-Instruct",
+    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+    "qwen3": "Qwen/Qwen3-0.6B",
+}
+_MODEL_KEY = os.environ.get("E2E_MODEL", "gpt2")
+_MODEL_ID = _MODEL_ALIASES.get(_MODEL_KEY, _MODEL_KEY)
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.vllm,
     pytest.mark.clickhouse,
     pytest.mark.e2e,
+    require_cuda(),
+    require_clickhouse(),
+    require_vllm(),
+    require_model_cache(_MODEL_ID),
 ]
 
-_MODEL_ALIASES = {
-    "gpt2": "gpt2",
-    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",
-    "qwen3": "Qwen/Qwen3-0.6B",
-}
 
-@pytest.mark.skipif(
-    not torch.backends.cuda.is_built(), reason="CUDA not built")
 def test_vllm_rowcnt(subtests):
     """vLLM row-count validation: monitored run + row-count check."""
 
-    model_key = os.environ.get("E2E_MODEL", "gpt2")
-    model_id = _MODEL_ALIASES.get(model_key, model_key)
+    model_key = _MODEL_KEY
+    model_id = _MODEL_ID
 
     # Translate the public E2E_HOOK_SELECTION input into the internal
     # DMX_HOOK_SELECTION runtime contract that the runner actually reads.
@@ -93,7 +107,11 @@ def test_vllm_rowcnt(subtests):
             env=sub_env, capture_output=True, text=True, cwd=project_root,
         )
         if r2.returncode != 0:
-            pytest.fail(f"Monitored runner failed:\n{r2.stderr[-2000:]}")
+            pytest.fail(
+                f"Monitored runner failed with rc={r2.returncode}\n"
+                f"stdout:\n{r2.stdout[-4000:]}\n"
+                f"stderr:\n{r2.stderr[-4000:]}"
+            )
 
         # Step 2: Comparator (CPU only, row-count validation)
         print("  [2/2] Checking row counts...", flush=True)
@@ -105,7 +123,15 @@ def test_vllm_rowcnt(subtests):
             env=sub_env, capture_output=True, text=True, cwd=project_root,
         )
         if r3.returncode != 0:
-            pytest.fail(f"Comparator failed:\n{r3.stderr[-2000:]}")
+            pytest.fail(
+                f"Comparator failed with rc={r3.returncode}\n"
+                f"stdout:\n{r3.stdout[-4000:]}\n"
+                f"stderr:\n{r3.stderr[-4000:]}"
+            )
+        if not os.path.exists(result_file):
+            pytest.fail(
+                "Comparator exited successfully without producing its result file"
+            )
 
         # Read results
         with open(result_file) as f:
@@ -117,4 +143,7 @@ def test_vllm_rowcnt(subtests):
                 assert test["passed"], test.get("detail", "")
 
     finally:
-        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            delete_capture_from_meta(mon_dir)
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)

@@ -9,10 +9,54 @@ DMI plugs into vLLM through:
 integration.vllm_adapter.DMXGPUWorker
 ```
 
+This branch pins vLLM 0.25.1. The exact upstream base is
+`752a3a504485790a2e8491cacbb35c137339ad34`; DMI's vLLM patch branch is
+`dmi-v0.25.1`, currently at
+`2228df2b07ebcdb68dcf836dc46f1587fec2cdd1`. The root repository's submodule
+gitlink is the authoritative DMI/vLLM commit pair. Older ports remain on their
+versioned branches rather than being overwritten by this branch.
+
+The adapter uses vLLM's public out-of-tree model registry, so the bundled
+monitored model classes also work with the matching official vLLM 0.25.1 wheel
+without installing the whole submodule as an editable package.
+
+vLLM 0.25.1 defaults eligible dense models to its new V2 model runner. DMI's
+0.25.1 port currently supports the V1 runner only because its request-layout
+and dispatch boundaries are different. Set this before importing `vllm`:
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=0
+```
+
+`DMXGPUWorker` checks this at startup and fails before device initialization
+with a corrective error if V2 was selected; it never silently runs without
+monitoring.
+
+## Model architecture coverage
+
+The monitored variants currently exist for GPT-2, Qwen2/Qwen2.5, Qwen3,
+Qwen2-MoE, and Llama. On vLLM 0.25.1, GPT-2, Qwen2/Qwen2.5, and Qwen3 have
+runtime black-box evidence; Llama and Qwen2-MoE currently have static/import
+evidence only. Architectures that upstream vLLM implements directly with its
+Llama class (Aquila, Cwm, InternLM/InternLM3, IQuestCoder, legacy LLaMA, and
+Xverse) are remapped to the same monitored Llama variant but have not been
+independently executed on this port.
+
+See the
+[`vLLM 0.25.1 compatibility audit`](vllm-0.25.1-compatibility-audit.md) for the
+exact tested cells, exclusions, checklist results, and commit pair.
+The [`model coverage roadmap`](vllm-model-coverage-roadmap.md) records the
+versioned backlog for the current upstream vLLM release; entries in that roadmap
+are discovery targets rather than support claims.
+
+Model support is architecture-based, so different checkpoint sizes in the
+same family do not require another DMI model class. Quantized checkpoints and
+nonstandard remote-code implementations still require separate validation.
+
 Pass it through `worker_cls=` in the offline `LLM(...)` API or `--worker-cls`
 in `vllm serve`.
 
-## Required: disable the vLLM compile cache
+## Required runtime environment
 
 DMI's capture op is registered as a void+ordered-effect op, which the vLLM
 AOT compile cache cannot serialize correctly. Set
@@ -20,6 +64,7 @@ AOT compile cache cannot serialize correctly. Set
 
 ```bash
 export VLLM_DISABLE_COMPILE_CACHE=1
+export VLLM_USE_V2_MODEL_RUNNER=0
 ```
 
 ## Offline API
@@ -87,6 +132,30 @@ exactly as with plain `LLM`. A nonempty `dmx_db_host` and
 exposes only its own request's internals; for the whole batch as one
 `[batch, seq, hidden]` tensor use `get_internal(model_id)` from
 `monitoring.internal_mapper`.
+
+Persistence is asynchronous. For a complete read before an explicit
+`stop_monitoring`, enable a bounded drain timeout and use the public retry
+contract instead of sleeping for an assumed duration:
+
+```python
+from transformers import AutoConfig
+
+# additional_config={..., "dmx_drain_flush_timeout_us": 100_000}
+expected_layers = AutoConfig.from_pretrained(
+    "Qwen/Qwen3-0.6B"
+).num_hidden_layers
+out[0].dmi_internal.require(
+    "hidden_states",
+    count=expected_layers,
+    retry=True,
+    timeout_s=30.0,
+    poll_s=0.25,
+)
+hidden_states = out[0].dmi_internal.hidden_states
+```
+
+Without a drain timeout, call
+`llm.collective_rpc("stop_monitoring")` before the authoritative read.
 
 ## vLLM serve
 

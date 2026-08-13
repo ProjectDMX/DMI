@@ -11,6 +11,7 @@
 #   DMX_HOOK_SELECTION, DMX_DB_HOST, DMX_DB_PORT
 #   DMX_DB_DATABASE, DMX_DB_TABLE, DMX_CH_PARALLELISM
 #   DMX_CH_MAX_BATCH_ITEMS, DMX_CH_MAX_BATCH_BYTES
+#   DMI_MATRIX_PYTHON (exact interpreter selected by the release matrix)
 set -e
 
 MODEL=${1:-qwen3}
@@ -25,7 +26,8 @@ else
 fi
 export CUDA_VISIBLE_DEVICES=${E2E_GPUS:-${CUDA_VISIBLE_DEVICES:-$DEFAULT_GPUS}}
 
-export VLLM_DISABLE_COMPILE_CACHE=${VLLM_DISABLE_COMPILE_CACHE:-0}
+export VLLM_DISABLE_COMPILE_CACHE=${VLLM_DISABLE_COMPILE_CACHE:-1}
+export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-0}
 export E2E_MODEL=$MODEL
 export E2E_NUM_PROMPTS=${E2E_NUM_PROMPTS:-8}
 export E2E_MAX_NEW_TOKENS=${E2E_MAX_NEW_TOKENS:-20}
@@ -52,4 +54,4 @@ echo "  model=$MODEL  mode=$MODE  tp=$TP"
 echo "  prompts=$E2E_NUM_PROMPTS  tokens=$E2E_MAX_NEW_TOKENS"
 echo "============================================"
 
-python -m tests.vllm_compare_runner
+"${DMI_MATRIX_PYTHON:-python}" -m tests.vllm_compare_runner

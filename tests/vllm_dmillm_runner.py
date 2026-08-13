@@ -13,9 +13,10 @@ import argparse
 import json
 import os
 import sys
-import time
+import uuid
 
 os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
 
 def _shapes(outputs):
@@ -31,68 +32,106 @@ def main() -> None:
 
     import torch
     import clickhouse_driver
+    from transformers import AutoConfig
     from vllm import SamplingParams
     from integration.vllm_adapter import DMILLM
 
     host = os.environ.get("DMX_DB_HOST", "localhost")
     port = int(os.environ.get("DMX_DB_PORT", "9000"))
-    model_id = f"test_dmillm::{os.getpid()}"
+    model_id = f"test_dmillm::{uuid.uuid4().hex}"[:120]
     client = clickhouse_driver.Client(host=host, port=port)
-    client.execute("ALTER TABLE default.offload DELETE WHERE model_id=%(m)s", {"m": model_id})
-
-    llm = DMILLM(
-        args.model,
-        additional_config={
-            "dmx_model_id": model_id, "dmx_hook_selection": "resid_pre",
-            "dmx_db_host": host, "dmx_db_port": port,
-        },
-        max_model_len=512, enforce_eager=True, gpu_memory_utilization=0.5,
+    client.execute(
+        "ALTER TABLE default.offload DELETE WHERE model_id=%(m)s",
+        {"m": model_id},
     )
-    prompts = ["The capital of France is", "Hello"]
-    outputs = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=8))
 
-    # No-flush read: rely on the 100ms drain-flush timeout (default since the
-    # drain-flush change) to land captures in ClickHouse without stop_monitoring.
-    time.sleep(2.0)
-    no_stop = _shapes(outputs)
-    for o in outputs:
-        o.dmi_internal.clear_cache()
+    expected_layers = int(AutoConfig.from_pretrained(args.model).num_hidden_layers)
+    llm = None
+    stopped = False
+    try:
+        llm = DMILLM(
+            args.model,
+            additional_config={
+                "dmx_model_id": model_id,
+                "dmx_hook_selection": "resid_pre",
+                "dmx_db_host": host,
+                "dmx_db_port": port,
+                # This test intentionally verifies bounded asynchronous reads.
+                # The production default is 0 (flush on pressure or stop).
+                "dmx_drain_flush_timeout_us": 100_000,
+            },
+            max_model_len=512,
+            enforce_eager=True,
+            gpu_memory_utilization=0.5,
+        )
+        prompts = ["The capital of France is", "Hello"]
+        outputs = llm.generate(
+            prompts, SamplingParams(temperature=0.0, max_tokens=8)
+        )
 
-    # Explicit flush, then re-read as the authoritative baseline.
-    llm.collective_rpc("stop_monitoring")
-    time.sleep(0.5)
-    internals = [o.dmi_internal.hidden_states for o in outputs]
-    after_stop = [(len(hs), hs[0].shape[1]) for hs in internals]
+        # Replace fixed sleeps with the public bounded-retry contract. This
+        # rejects both missing fields and partial layer sets.
+        for output in outputs:
+            output.dmi_internal.require(
+                "hidden_states",
+                count=expected_layers,
+                retry=True,
+                timeout_s=15.0,
+                poll_s=0.1,
+                match_token_ranges=True,
+            )
+        before_stop = _shapes(outputs)
+        for output in outputs:
+            output.dmi_internal.clear_cache()
 
-    tests = [
-        {"name": "outputs_are_native",
-         "passed": len(outputs) == 2 and all(o.outputs[0].text for o in outputs),
-         "detail": [o.outputs[0].text for o in outputs]},
-        # Auto-drain: internals reach ClickHouse without an explicit stop_monitoring.
-        {"name": "readable_without_stop_monitoring",
-         "passed": no_stop == after_stop and all(layers > 0 for layers, _ in no_stop),
-         "detail": {"no_stop": no_stop, "after_stop": after_stop}},
-        # Per-request: each is its own [1, seq, hidden] (batch dim 1).
-        {"name": "per_request_hidden_states",
-         "passed": all(len(hs) > 0 and hs[0].dim() == 3 and hs[0].shape[0] == 1
-                       for hs in internals),
-         "detail": after_stop},
-        # Ragged prompts -> independent seq lengths (no cross-padding).
-        {"name": "per_request_isolated_lengths",
-         "passed": len({s for _, s in after_stop}) > 1,
-         "detail": [s for _, s in after_stop]},
-        {"name": "available_lists_hidden_states",
-         "passed": "hidden_states" in outputs[0].dmi_internal.available,
-         "detail": outputs[0].dmi_internal.available},
-    ]
+        # Explicit flush, then re-read as the authoritative baseline.
+        llm.collective_rpc("stop_monitoring")
+        stopped = True
+        internals = [output.dmi_internal.hidden_states for output in outputs]
+        after_stop = [(len(hs), hs[0].shape[1]) for hs in internals]
 
-    client.execute("ALTER TABLE default.offload DELETE WHERE model_id=%(m)s", {"m": model_id})
-    with open(args.result_file, "w") as f:
-        json.dump({"tests": tests}, f)
+        tests = [
+            {"name": "outputs_are_native",
+             "passed": len(outputs) == 2 and all(o.outputs[0].text for o in outputs),
+             "detail": [o.outputs[0].text for o in outputs]},
+            {"name": "bounded_async_read_is_complete",
+             "passed": before_stop == after_stop
+                       and all(layers == expected_layers
+                               for layers, _ in before_stop),
+             "detail": {"before_stop": before_stop,
+                        "after_stop": after_stop}},
+            # Per-request: each is its own [1, seq, hidden] (batch dim 1).
+            {"name": "per_request_hidden_states",
+             "passed": all(len(hs) > 0 and hs[0].dim() == 3
+                           and hs[0].shape[0] == 1 for hs in internals),
+             "detail": after_stop},
+            # Ragged prompts -> independent seq lengths (no cross-padding).
+            {"name": "per_request_isolated_lengths",
+             "passed": len({s for _, s in after_stop}) > 1,
+             "detail": [s for _, s in after_stop]},
+            {"name": "available_lists_hidden_states",
+             "passed": "hidden_states" in outputs[0].dmi_internal.available,
+             "detail": outputs[0].dmi_internal.available},
+        ]
 
-    del llm
-    torch.cuda.empty_cache()
-    sys.exit(0 if all(t["passed"] for t in tests) else 1)
+        with open(args.result_file, "w") as f:
+            json.dump({"tests": tests}, f)
+        success = all(test["passed"] for test in tests)
+    finally:
+        try:
+            if llm is not None and not stopped:
+                llm.collective_rpc("stop_monitoring")
+        finally:
+            client.execute(
+                "ALTER TABLE default.offload DELETE WHERE model_id=%(m)s",
+                {"m": model_id},
+                settings={"mutations_sync": 1},
+            )
+            if llm is not None:
+                del llm
+            torch.cuda.empty_cache()
+
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":

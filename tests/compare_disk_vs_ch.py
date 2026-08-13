@@ -65,15 +65,30 @@ def _bytes_identical(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def read_clickhouse(db_host: str, db_port: int,
-                    database: str = "default", table: str = "offload"):
-    """Read all rows from ClickHouse, return dict keyed by (req_id, act_name, layer, shard, start, end)."""
+                    database: str = "default", table: str = "offload",
+                    model_id: str | None = None):
+    """Read ClickHouse rows keyed by request/hook/token range.
+
+    ``model_id`` should identify one test run. It remains optional for the
+    legacy Hugging Face comparator, which owns a freshly cleared table.
+    """
     import clickhouse_driver
     ch_client = clickhouse_driver.Client(db_host, port=db_port)
-    raw_rows = ch_client.execute(
+    query = (
         f"SELECT model_id, request_id, act_name, layer_no, shard_rank, "
         f"start_token_idx, end_token_idx, dtype, shape, bytes "
-        f"FROM {database}.{table}",
-        settings={"strings_as_bytes": True})
+        f"FROM {database}.{table}"
+    )
+    params = None
+    if model_id is not None:
+        query += " WHERE model_id = %(model_id)s"
+        params = {"model_id": model_id}
+    if params is None:
+        raw_rows = ch_client.execute(
+            query, settings={"strings_as_bytes": True})
+    else:
+        raw_rows = ch_client.execute(
+            query, params, settings={"strings_as_bytes": True})
 
     ch_data: dict[tuple, torch.Tensor] = {}
     for row in raw_rows:
@@ -92,6 +107,7 @@ def compare(ref_dir: str, ch_data: dict, num_ch_rows: int) -> tuple[int, int]:
     passed = 0
     failed = 0
     not_found = 0
+    used_ch_keys: set[tuple] = set()
 
     for req_dir in sorted(ref_path.iterdir()):
         if not req_dir.is_dir():
@@ -112,23 +128,53 @@ def compare(ref_dir: str, ch_data: dict, num_ch_rows: int) -> tuple[int, int]:
             ch_act = _BUF_TO_CH_ACT.get(hook, hook)
             ch_key = (req_id, ch_act, layer, shard, start, end)
             ch_t = ch_data.get(ch_key)
+            matched_keys: list[tuple] = []
+            if ch_t is not None:
+                matched_keys.append(ch_key)
 
             if ch_t is None:
-                # Collect all segments for this (req, act, layer, shard)
+                # Reconstruct exactly [start, end) from contiguous storage
+                # segments for this (request, hook, layer, rank). Reject gaps,
+                # overlaps, and malformed row spans instead of accepting a
+                # same-shaped tensor with unrelated token metadata.
                 candidates = sorted(
                     [(k, v) for k, v in ch_data.items()
                      if k[0] == req_id and k[1] == ch_act and k[2] == layer
-                     and k[3] == shard],
+                     and k[3] == shard and k[4] < end and k[5] > start],
                     key=lambda kv: kv[0][4],  # sort by start_token
                 )
-                if len(candidates) == 1:
-                    ch_t = candidates[0][1]
-                elif len(candidates) > 1:
-                    # Concatenate segments covering [start, end)
-                    segments = [(k[4], k[5], v) for k, v in candidates
-                                if k[4] < end and k[5] > start]
-                    if segments:
-                        ch_t = torch.cat([v for _, _, v in segments], dim=0)
+                cursor = start
+                pieces: list[torch.Tensor] = []
+                for key, candidate in candidates:
+                    segment_start, segment_end = key[4], key[5]
+                    if segment_end <= segment_start:
+                        pieces = []
+                        break
+                    if candidate.ndim < 1 or candidate.shape[0] != (
+                        segment_end - segment_start
+                    ):
+                        pieces = []
+                        break
+                    if pieces and segment_start < cursor:
+                        pieces = []
+                        break
+                    if segment_start > cursor:
+                        pieces = []
+                        break
+                    piece_end = min(end, segment_end)
+                    pieces.append(
+                        candidate[
+                            cursor - segment_start:piece_end - segment_start
+                        ]
+                    )
+                    matched_keys.append(key)
+                    cursor = piece_end
+                    if cursor == end:
+                        break
+                if pieces and cursor == end:
+                    ch_t = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+                else:
+                    matched_keys.clear()
 
             label = f"{req_id}/{hook}"
             if layer >= 0:
@@ -141,6 +187,7 @@ def compare(ref_dir: str, ch_data: dict, num_ch_rows: int) -> tuple[int, int]:
                 not_found += 1
                 continue
 
+            used_ch_keys.update(matched_keys)
             ch_t = ch_t.cpu()
             if ref_t.shape != ch_t.shape:
                 print(f"  [FAIL] {label} -- shape {list(ref_t.shape)} vs {list(ch_t.shape)}",
@@ -160,6 +207,29 @@ def compare(ref_dir: str, ch_data: dict, num_ch_rows: int) -> tuple[int, int]:
                 diff = (ref_t.float() - ch_t.float()).abs().max().item()
                 print(f"  [FAIL] {label} -- max_abs_diff={diff:.6e}", flush=True)
                 failed += 1
+
+    if passed + failed == 0:
+        print("  [FAIL] no reference tensors were produced", flush=True)
+        failed += 1
+
+    duplicate_rows = max(0, num_ch_rows - len(ch_data))
+    if duplicate_rows:
+        print(
+            f"  [FAIL] {duplicate_rows} duplicate ClickHouse row key(s)",
+            flush=True,
+        )
+        failed += duplicate_rows
+
+    unexpected_keys = sorted(set(ch_data) - used_ch_keys)
+    if unexpected_keys:
+        for key in unexpected_keys[:20]:
+            print(f"  [FAIL] unexpected ClickHouse key: {key}", flush=True)
+        if len(unexpected_keys) > 20:
+            print(
+                f"  [FAIL] ... and {len(unexpected_keys) - 20} more unexpected keys",
+                flush=True,
+            )
+        failed += len(unexpected_keys)
 
     total = passed + failed
     print(f"\n[compare] {num_ch_rows} rows in ClickHouse", flush=True)
