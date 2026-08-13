@@ -71,7 +71,9 @@ def main():
     ch_cfg.secure = False
     ch_cfg.client_side_compress = "none"
     ch_cfg.create_database_if_missing = bool(int(os.environ.get("DMX_DB_CREATE_IF_MISSING", "1")))
-    ch_cfg.drop_existing_database = bool(int(os.environ.get("DMX_DB_DROP_EXISTING", "1")))
+    ch_cfg.drop_existing_database = bool(
+        int(os.environ.get("DMX_DB_DROP_EXISTING", "0"))
+    )
     ch_cfg.index_granularity = 8192
 
     # Monitoring config

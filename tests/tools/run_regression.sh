@@ -26,6 +26,9 @@ run_test() {
 PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$PROJECT_ROOT"
 
+export VLLM_DISABLE_COMPILE_CACHE=${VLLM_DISABLE_COMPILE_CACHE:-1}
+export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-0}
+
 # --- Unit tests ---
 run_test "unit: test_tp_shapes + test_config" \
     python -m pytest tests/test_tp_shapes.py tests/test_config.py -q

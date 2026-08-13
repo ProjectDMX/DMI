@@ -40,6 +40,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.4)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--ring-mb", type=int, default=64)
     parser.add_argument("--hook-selection", default="resid_pre")
     parser.add_argument("--cudagraph", action="store_true")
@@ -81,6 +82,7 @@ def main() -> None:
         "enforce_eager": not args.cudagraph,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "disable_log_stats": True,
+        "tensor_parallel_size": args.tensor_parallel_size,
     }
     if args.mode == "monitored":
         kwargs.update(
@@ -105,6 +107,7 @@ def main() -> None:
             "mode": args.mode,
             "model": model_id,
             "cudagraph": args.cudagraph,
+            "tensor_parallel_size": args.tensor_parallel_size,
             "prompts": prompts,
             "prompt_token_ids": [
                 _optional_list(output.prompt_token_ids) for output in outputs

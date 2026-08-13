@@ -43,6 +43,11 @@ DMI_BLACKBOX_CUDAGRAPH=1 CUDA_VISIBLE_DEVICES=0 \
 # Reproduce or broaden a generated corpus.
 DMI_BLACKBOX_SEED=20260812 DMI_BLACKBOX_GENERATED_CASES=20 \
   CUDA_VISIBLE_DEVICES=0 pytest -q -s tests/test_vllm_blackbox.py
+
+# A model that requires two-way tensor parallelism.
+DMI_BLACKBOX_MODEL=qwen2_moe DMI_BLACKBOX_TP_SIZE=2 \
+  DMI_BLACKBOX_GPU_MEMORY_UTILIZATION=0.85 \
+  CUDA_VISIBLE_DEVICES=0,1 pytest -q -s tests/test_vllm_blackbox.py
 ```
 
 For manual diagnosis, run both modes against the same case manifest and compare
@@ -62,6 +67,13 @@ CUDA_VISIBLE_DEVICES=0 python tests/tools/smoke_vllm_model.py \
 The vLLM runners set `VLLM_USE_V2_MODEL_RUNNER=0` before importing vLLM.
 The 0.25.1 port is V1-runner-only and fails closed if an embedding process
 selects V2.
+
+Before starting a shared-machine multi-GPU sweep, verify the selected physical
+cards are idle for consecutive samples:
+
+```bash
+python tests/tools/check_gpu_idle.py --gpus 0,1 --samples 3 --interval 2
+```
 
 > Native CUDA ring tests live separately under `tests/ring/` (built via its
 > `Makefile`, marker `ring_native`, needs `nvcc`) and are likewise excluded from

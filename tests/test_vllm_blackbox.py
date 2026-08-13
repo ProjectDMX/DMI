@@ -27,6 +27,10 @@ MODEL_ALIASES = {
 }
 MODEL_ARG = os.environ.get("DMI_BLACKBOX_MODEL", "qwen2")
 MODEL_ID = MODEL_ALIASES.get(MODEL_ARG, MODEL_ARG)
+TP_SIZE = int(os.environ.get("DMI_BLACKBOX_TP_SIZE", "1"))
+GPU_MEMORY_UTILIZATION = os.environ.get(
+    "DMI_BLACKBOX_GPU_MEMORY_UTILIZATION", "0.4"
+)
 
 pytestmark = [
     pytest.mark.gpu,
@@ -56,6 +60,10 @@ def _run(
         str(cases),
         "--output",
         str(output),
+        "--tensor-parallel-size",
+        str(TP_SIZE),
+        "--gpu-memory-utilization",
+        GPU_MEMORY_UTILIZATION,
     ]
     if cudagraph:
         command.append("--cudagraph")

@@ -9,6 +9,7 @@ _TRANSPARENCY_FIELDS = (
     "schema_version",
     "model",
     "cudagraph",
+    "tensor_parallel_size",
     "prompts",
     "prompt_token_ids",
     "token_ids",

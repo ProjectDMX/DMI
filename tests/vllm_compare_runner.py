@@ -9,6 +9,7 @@ Usage:
     python -m tests.vllm_compare_runner
 """
 import os
+import shutil
 import sys
 import tempfile
 import uuid
@@ -77,33 +78,48 @@ def main():
         tensor_parallel_size=tp_size,
     )
 
-    llm = LLM(**kwargs)
-    params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
-    outputs = llm.generate(prompts, params)
+    llm = None
+    try:
+        llm = LLM(**kwargs)
+        params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
+        outputs = llm.generate(prompts, params)
 
-    for i, o in enumerate(outputs):
-        print(f"  prompt[{i}]: {len(o.outputs[0].token_ids)} tokens generated")
+        for i, o in enumerate(outputs):
+            print(f"  prompt[{i}]: {len(o.outputs[0].token_ids)} tokens generated")
 
-    # Explicit per-worker flush+stop before teardown. Without this, the
-    # implicit DMXGPUWorker.shutdown() races vLLM's 8s deadline and may
-    # drop tail rows -- exactly the data we're about to compare.
-    llm.collective_rpc("stop_monitoring")
-    del llm
-    torch.cuda.empty_cache()
+        # Explicit per-worker flush+stop before teardown. Without this, the
+        # implicit DMXGPUWorker.shutdown() races vLLM's 8s deadline and may
+        # drop tail rows -- exactly the data we're about to compare.
+        llm.collective_rpc("stop_monitoring")
+        del llm
+        llm = None
+        torch.cuda.empty_cache()
 
-    # --- Compare disk (.copy_() buffers) vs ClickHouse (ring transport) ---
-    print("\n[compare] Comparing disk vs ClickHouse...", flush=True)
+        # --- Compare disk (.copy_() buffers) vs ClickHouse ring transport. ---
+        print("\n[compare] Comparing disk vs ClickHouse...", flush=True)
 
-    from tests.compare_disk_vs_ch import read_clickhouse, compare
+        from tests.compare_disk_vs_ch import read_clickhouse, compare
 
-    ch_data, num_rows = read_clickhouse(
-        db_host, db_port, model_id=capture_model_id)
-    passed, failed = compare(compare_dir, ch_data, num_rows)
+        ch_data, num_rows = read_clickhouse(
+            db_host, db_port, model_id=capture_model_id
+        )
+        _, failed = compare(compare_dir, ch_data, num_rows)
 
-    if failed > 0:
-        sys.exit(1)
-    else:
+        if failed > 0:
+            sys.exit(1)
         print("[compare] ALL PASSED", flush=True)
+    finally:
+        if llm is not None:
+            try:
+                llm.collective_rpc("stop_monitoring")
+            except Exception:
+                pass
+        try:
+            from tests._clickhouse_test_utils import delete_capture
+
+            delete_capture(db_host, db_port, capture_model_id)
+        finally:
+            shutil.rmtree(compare_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

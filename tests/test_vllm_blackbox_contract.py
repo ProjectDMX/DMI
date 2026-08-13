@@ -18,6 +18,7 @@ def _payload() -> dict:
         "mode": "baseline",
         "model": "model",
         "cudagraph": False,
+        "tensor_parallel_size": 1,
         "prompts": ["hello"],
         "prompt_token_ids": [[1]],
         "token_ids": [[2]],
