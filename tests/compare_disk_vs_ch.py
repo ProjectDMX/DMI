@@ -9,6 +9,8 @@ from pathlib import Path
 
 import torch
 
+from monitoring.ring_transport import HOOK_DEFINITIONS
+
 
 _DTYPE_MAP = {
     "torch.bfloat16": torch.bfloat16, "torch.float": torch.float32,
@@ -19,31 +21,20 @@ _DTYPE_MAP = {
     "torch.bool": torch.bool,
 }
 
-# Map short hook name → ClickHouse act_name (must match tensor_meta.h + p2p make_act_name).
+# Derive storage names from the native ABI table so newly registered hook
+# families cannot silently diverge between reference files and ClickHouse.
 _BUF_TO_CH_ACT = {
-    "resid_pre": "blocks.hook_resid_pre",
-    "ln1": "blocks.hook_ln1",
-    "q": "blocks.attn.hook_q",
-    "k": "blocks.attn.hook_k",
-    "v": "blocks.attn.hook_v",
-    "z": "blocks.attn.hook_z",
-    "attn_scores": "blocks.attn.hook_attn_scores",
-    "pattern": "blocks.attn.hook_pattern",
-    "attn_out": "blocks.hook_attn_out",
-    "resid_mid": "blocks.hook_resid_mid",
-    "ln2": "blocks.hook_ln2",
-    "mlp_in": "blocks.hook_mlp_in",
-    "mlp_out": "blocks.hook_mlp_out",
-    "mlp_post": "blocks.hook_mlp_post",
-    "embed": "hook_embed",
-    "pos_embed": "hook_pos_embed",
-    "resid_final": "hook_resid_final",
-    "final_ln": "hook_final_ln",
-    "final_logits": "final_logits",
-    "token_ids": "token_ids",
-    "router_logits": "blocks.mlp.hook_router_logits",
-    "topk_ids": "blocks.mlp.hook_topk_ids",
-    "topk_weights": "blocks.mlp.hook_topk_weights",
+    short_name: f"blocks.{act_name}" if per_layer else act_name
+    for (
+        _hook_type,
+        act_name,
+        short_name,
+        per_layer,
+        _group,
+        _tp_sharded,
+        _shape_class,
+        _pp_stage,
+    ) in HOOK_DEFINITIONS
 }
 
 _PT_RE = re.compile(

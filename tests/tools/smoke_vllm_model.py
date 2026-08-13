@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 MODEL_ALIASES = {
+    "falcon_h1": "tiiuae/Falcon-H1-Tiny-90M-Instruct",
     "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",
     "qwen2": "Qwen/Qwen2.5-0.5B-Instruct",

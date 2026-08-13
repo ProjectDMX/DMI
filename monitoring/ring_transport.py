@@ -57,10 +57,11 @@ from ._native_engine import _load_extension as _load_ext
 _ext = _load_ext()
 # (id, act_name, short_name, per_layer, group, tp_sharded, shape_class, pp_stage)
 # group/shape_class/pp_stage are int enums matching the C++ definitions.
-_HOOK_DEFS = _ext.HOOK_DEFS
+HOOK_DEFINITIONS = tuple(_ext.HOOK_DEFS)
+_HOOK_DEFS = HOOK_DEFINITIONS
 
 # C++ enum mirrors -- keep in sync with tensor_meta.h
-GROUP_ATTN, GROUP_MLP, GROUP_OTHER = 0, 1, 2
+GROUP_ATTN, GROUP_MLP, GROUP_OTHER, GROUP_SSM = 0, 1, 2, 3
 SHAPE_HIDDEN, SHAPE_QKV_Q, SHAPE_QKV_KV, SHAPE_QKV_Z = 0, 1, 2, 3
 SHAPE_ATTN_WT, SHAPE_MLP_POST, SHAPE_TOKEN_IDS, SHAPE_LOGITS = 4, 5, 6, 7
 PP_ANY, PP_FIRST, PP_LAST = 0, 1, 2
@@ -96,6 +97,9 @@ _ATTN_SUFFIXES: Tuple[str, ...] = tuple(
 )
 _MLP_SUFFIXES: Tuple[str, ...] = tuple(
     _act for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _grp == GROUP_MLP
+)
+_SSM_SUFFIXES: Tuple[str, ...] = tuple(
+    _act for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _grp == GROUP_SSM
 )
 
 # Auto-derive property sets from HOOK_DEFS columns.

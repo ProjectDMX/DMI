@@ -35,8 +35,9 @@ the registry source, but remains upstream-static evidence rather than DMI
 runtime support. Across the 41 representative checkpoints below:
 
 - all 41 resolve in vLLM 0.27.1;
-- 5 architectures have a DMI model remap today;
-- 36 are unmapped by DMI;
+- 9 architectures have a DMI model remap on the current stacked expansion
+  branch;
+- 32 are unmapped by DMI;
 - registry presence is upstream static evidence, not DMI runtime support.
 
 Between vLLM 0.25.1 and 0.27.1, the combined text/multimodal registry adds eight
@@ -101,6 +102,14 @@ eager/graph full-hook transport on a qualified small fixture. Configurations
 that enable Llama-4 attention scaling or adaptive conditional RMS normalization,
 alternate loaders, TP>1, quantization, serving, speculative, and non-text
 variants remain excluded.
+
+Falcon-H1 is `supported` for the bounded TP1 BF16 V1 offline
+eager/default-graph cell at integration commit `e69be3978552`. The
+[`Falcon-H1 audit`](vllm-0.27.1-falcon-h1-audit.md) records public validation on
+the official 0.5B checkpoint, byte-identical eager/graph full-hook transport on
+the official Tiny checkpoint, and the bounded SSM branch capability manifest.
+Internal Mamba state, TP>1, prefix caching, quantization, serving, speculative,
+and non-text variants remain excluded.
 
 For each row, use an upstream tiny/random fixture for fast focused tests when
 available, then require one real-checkpoint baseline/monitored run before moving

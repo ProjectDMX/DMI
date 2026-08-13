@@ -144,6 +144,7 @@ _LLAMA_COMPAT_ARCHES = {
 }
 
 _ARCH_REMAP = {
+    "FalconH1ForCausalLM": "FalconH1PForCausalLM",
     "Gemma3ForCausalLM": "Gemma3PForCausalLM",
     "GPT2LMHeadModel": "GPT2PLMHeadModel",
     "MistralForCausalLM": "MistralPForCausalLM",
@@ -165,6 +166,7 @@ _ARCH_REMAP = {
 # Lazy strings are important here: importing model implementations eagerly in
 # the parent process can initialize CUDA before vLLM forks its workers.
 _DMI_MODEL_VARIANTS = {
+    "FalconH1PForCausalLM": "falcon_h1_p:FalconH1PForCausalLM",
     "Gemma3PForCausalLM": "gemma3_p:Gemma3PForCausalLM",
     "GPT2PLMHeadModel": "gpt2_p:GPT2PLMHeadModel",
     "Qwen2PForCausalLM": "qwen2_p:Qwen2PForCausalLM",
