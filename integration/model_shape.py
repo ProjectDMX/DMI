@@ -89,6 +89,7 @@ def _make_model_shape_from_hf_config(
     num_experts = (
         getattr(cfg, "num_experts", None)
         or getattr(cfg, "num_local_experts", None)
+        or getattr(cfg, "n_routed_experts", None)
         or 0
     )
     top_k = (

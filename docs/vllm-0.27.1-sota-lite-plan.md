@@ -12,7 +12,7 @@ H100 evidence required before a model is called supported.
 | 2 | `Qwen/Qwen3-30B-A3B` | `Qwen3MoeForCausalLM` | `qwen3_moe:Qwen3MoeForCausalLM` | full text decoder | lite implemented; H100 pending |
 | 3 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | `Llama4ForConditionalGeneration` | `mllama4:Llama4ForConditionalGeneration` | multimodal decoder | lite implemented; H100 TP4 pending |
 | 4 | `Qwen/Qwen3.6-27B` | `Qwen3_5ForConditionalGeneration` | `qwen3_5:Qwen3_5ForConditionalGeneration` | multimodal decoder | lite implemented; H100 pending |
-| 5 | `zai-org/GLM-5.2` | `GlmMoeDsaForCausalLM` | `deepseek_v2:GlmMoeDsaForCausalLM` | full text decoder | queued |
+| 5 | `zai-org/GLM-5.2` | `GlmMoeDsaForCausalLM` | `deepseek_v2:GlmMoeDsaForCausalLM` | full text decoder | lite implemented; H100 TP32 pending |
 | 6 | `MiniMaxAI/MiniMax-M2.7` | `MiniMaxM2ForCausalLM` | `minimax_m2:MiniMaxM2ForCausalLM` | full text decoder | queued |
 | 7 | `google/gemma-4-E2B-it` | `Gemma4ForConditionalGeneration` | `gemma4_mm:Gemma4ForConditionalGeneration` | multimodal decoder | queued |
 | 8 | `deepseek-ai/DeepSeek-V4-Flash` | `DeepseekV4ForCausalLM` | `vllm.models.deepseek_v4:DeepseekV4ForCausalLM` | full text decoder/plugin | queued |
@@ -51,8 +51,13 @@ Run the currently implemented SOTA cells with:
 ```bash
 MKL_THREADING_LAYER=GNU .venv/bin/python \
   tests/tools/run_vllm_release_matrix.py \
-  --phase sota --gpus 0,1,2,3 --artifact-dir /path/to/sota-artifacts
+  --phase sota \
+  --gpus 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31 \
+  --artifact-dir /path/to/sota-artifacts
 ```
 
 The matrix writes bounded per-case logs and a structured manifest; only failing
-log excerpts should be returned to the implementation agent.
+log excerpts should be returned to the implementation agent. GLM-5.2 must be
+pre-cached (the pinned BF16 weight tree is about 1.403 TiB), and the current
+runner requires all 32 GPUs to be locally visible; a multi-node execution needs
+a separate launcher extension before it can count as evidence.

@@ -40,6 +40,7 @@ MODEL_ALIASES = {
     "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",
     "gpt_oss": "openai/gpt-oss-20b",
+    "glm52": "zai-org/GLM-5.2",
     "llama4_scout": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "qwen36": "Qwen/Qwen3.6-27B",

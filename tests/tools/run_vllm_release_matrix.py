@@ -191,6 +191,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_falcon_h1_p_contract.py",
             "tests/test_granite_p_contract.py",
             "tests/test_gpt_oss_p_contract.py",
+            "tests/test_glm_moe_dsa_p_contract.py",
             "tests/test_llama4_p_contract.py",
             "tests/test_qwen3_moe_p_contract.py",
             "tests/test_qwen3_5_p_contract.py",
@@ -483,6 +484,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             )
 
     gpt_oss_revision = "6cee5e81ee83917806bbde320786a8fb61efebee"
+    glm52_revision = "b4734de4facf877f85769a911abafc5283eab3d9"
     llama4_scout_revision = "c2b440bc2b8c784ad310291d035b8550a771f24f"
     qwen3_moe_revision = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
     qwen36_revision = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
@@ -494,6 +496,15 @@ def build_cases(phase: str) -> list[MatrixCase]:
             memory_utilization=0.5,
             max_model_len=128,
             revision=gpt_oss_revision,
+        ),
+        _blackbox_case(
+            "glm52",
+            "zai-org/GLM-5.2",
+            tp_size=32,
+            memory_utilization=0.9,
+            max_model_len=128,
+            revision=glm52_revision,
+            generated_cases=2,
         ),
         _blackbox_case(
             "llama4_scout",
@@ -552,6 +563,19 @@ def build_cases(phase: str) -> list[MatrixCase]:
                 memory_utilization=0.5,
                 ring_mb=2048,
                 revision=gpt_oss_revision,
+            )
+        )
+        sota.append(
+            _storage_case(
+                "glm52",
+                "zai-org/GLM-5.2",
+                mode,
+                32,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.9,
+                ring_mb=2048,
+                revision=glm52_revision,
             )
         )
         sota.append(
