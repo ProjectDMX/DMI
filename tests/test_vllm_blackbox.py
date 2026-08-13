@@ -14,6 +14,7 @@ from tests._requirements import require_cuda, require_model_cache, require_vllm
 from tests.blackbox.case_generation import (
     GENERATOR_NAME,
     GENERATOR_VERSION,
+    deterministic_image_case,
     generate_cases,
 )
 from tests.blackbox.contracts import (
@@ -173,6 +174,8 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
         "generated_count": generated_count,
     }
     core["cases"].extend(generate_cases(seed=seed, count=generated_count))
+    if os.environ.get("DMI_BLACKBOX_MULTIMODAL_IMAGE", "0") == "1":
+        core["cases"].append(deterministic_image_case())
     cases = run_dir / "cases.json"
     cases.write_text(json.dumps(core, indent=2, ensure_ascii=False) + "\n")
 

@@ -650,6 +650,33 @@ def test_public_token_id_case_uses_the_public_tokenizer_contract():
     assert sampling == {"temperature": 0.0, "max_tokens": 3}
 
 
+def test_public_image_case_materializes_only_public_multimodal_data():
+    prompt, sampling = _materialize_case(
+        {
+            "case_id": "image",
+            "input": {
+                "form": "text_with_image",
+                "text": "<|image|>Describe it.",
+                "image": {
+                    "mode": "RGB",
+                    "size": [32, 32],
+                    "color": [17, 101, 203],
+                },
+            },
+            "sampling": {"temperature": 0.0, "max_tokens": 3},
+        },
+        object(),
+        8,
+    )
+
+    assert prompt["prompt"] == "<|image|>Describe it."
+    image = prompt["multi_modal_data"]["image"]
+    assert image.mode == "RGB"
+    assert image.size == (32, 32)
+    assert image.getpixel((0, 0)) == (17, 101, 203)
+    assert sampling == {"temperature": 0.0, "max_tokens": 3}
+
+
 def test_request_serializer_keeps_identity_cardinality_and_completion_fields():
     from types import SimpleNamespace
 

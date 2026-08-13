@@ -6,6 +6,7 @@ import pytest
 
 from tests.blackbox.case_generation import (
     GENERATOR_VERSION,
+    deterministic_image_case,
     generate_cases,
     generate_prompts,
     validate_case_corpus,
@@ -80,3 +81,19 @@ def test_corpus_validation_rejects_unmapped_oracle_free_cases():
 
     with pytest.raises(ValueError, match="missing fields.*kills"):
         validate_case_corpus(corpus)
+
+
+def test_deterministic_image_case_is_auditable() -> None:
+    case = deterministic_image_case()
+    corpus = {
+        "schema_version": 2,
+        "name": "image",
+        "generator": {"name": "test", "version": 1},
+        "executions": ["batch", "reversed"],
+        "cases": [case],
+        "omitted_combinations": [],
+    }
+
+    validate_case_corpus(corpus)
+    assert case["input"]["form"] == "text_with_image"
+    assert case["input"]["image"]["color"] == [17, 101, 203]

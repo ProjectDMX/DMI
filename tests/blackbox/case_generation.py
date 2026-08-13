@@ -53,10 +53,22 @@ def validate_case_corpus(payload: dict) -> None:
         input_spec = case["input"]
         if (
             not isinstance(input_spec, dict)
-            or input_spec.get("form") not in {"text", "token_ids_from_text"}
+            or input_spec.get("form")
+            not in {"text", "token_ids_from_text", "text_with_image"}
             or not isinstance(input_spec.get("text"), str)
         ):
             raise ValueError(f"{case_id} has an invalid public input spec")
+        if input_spec.get("form") == "text_with_image":
+            image = input_spec.get("image")
+            if (
+                not isinstance(image, dict)
+                or image.get("mode") != "RGB"
+                or image.get("size") != [32, 32]
+                or image.get("color") != [17, 101, 203]
+            ):
+                raise ValueError(
+                    f"{case_id} has an invalid deterministic image spec"
+                )
         sampling = case["sampling"]
         if not isinstance(sampling, dict) or sampling.get("temperature") != 0.0:
             raise ValueError(f"{case_id} must declare deterministic sampling")
@@ -154,3 +166,32 @@ def generate_cases(*, seed: int, count: int) -> list[dict]:
         }
         for index, prompt in enumerate(prompts)
     ]
+
+
+def deterministic_image_case() -> dict:
+    """Return one implementation-blind public image-input contract."""
+
+    return {
+        "case_id": "deterministic-rgb-image",
+        "checklist_ids": ["P02", "P03", "P04", "P05", "P07"],
+        "input": {
+            "form": "text_with_image",
+            "text": "<|image|>Describe the dominant color in one word.",
+            "image": {
+                "mode": "RGB",
+                "size": [32, 32],
+                "color": [17, 101, 203],
+            },
+        },
+        "sampling": {"temperature": 0.0, "max_tokens": 8},
+        "dimensions": {
+            "prompt_form": "public-multimodal-dict",
+            "image_fixture": "deterministic-solid-rgb",
+            "generation_length": "multi-step",
+        },
+        "oracles": ["differential", "reverse-batch-order"],
+        "kills": [
+            "multimodal-wrapper-bypasses-monitored-decoder",
+            "encoder-embedding-merge-changes-public-output",
+        ],
+    }
