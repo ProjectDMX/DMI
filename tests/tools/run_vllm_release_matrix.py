@@ -161,6 +161,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_vllm_version_compat.py",
             "tests/test_vllm_027_model_contracts.py",
             "tests/test_falcon_h1_p_contract.py",
+            "tests/test_granite_p_contract.py",
             "tests/test_jamba_p_contract.py",
             "tests/test_lfm2_p_contract.py",
             "tests/test_conv_hook_contract.py",
@@ -185,6 +186,14 @@ def build_cases(phase: str) -> list[MatrixCase]:
         environment={},
     )
     public = [
+        _blackbox_case(
+            "granite",
+            "ibm-granite/granite-4.1-3b",
+            tp_size=1,
+            memory_utilization=0.6,
+            model_arg="ibm-granite/granite-4.1-3b",
+            max_model_len=128,
+        ),
         _blackbox_case(
             "jamba",
             "ai21labs/AI21-Jamba2-3B",
@@ -258,6 +267,17 @@ def build_cases(phase: str) -> list[MatrixCase]:
     ]
     storage: list[MatrixCase] = []
     for mode in ("eager", "cudagraph"):
+        storage.append(
+            _storage_case(
+                "granite",
+                "ibm-granite/granite-4.1-3b",
+                mode,
+                1,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.6,
+            )
+        )
         storage.append(
             _storage_case(
                 "jamba",

@@ -35,9 +35,9 @@ the registry source, but remains upstream-static evidence rather than DMI
 runtime support. Across the 41 representative checkpoints below:
 
 - all 41 resolve in vLLM 0.27.1;
-- 11 architectures have a DMI model remap on the current stacked expansion
+- 12 architectures have a DMI model remap on the current stacked expansion
   branch;
-- 30 are unmapped by DMI;
+- 29 are unmapped by DMI;
 - registry presence is upstream static evidence, not DMI runtime support.
 
 Between vLLM 0.25.1 and 0.27.1, the combined text/multimodal registry adds eight
@@ -73,7 +73,7 @@ adding only Llama-like aliases.
 | 4 | `tiiuae/Falcon-H1-0.5B-Instruct` | 23,911 | `FalconH1ForCausalLM` | `falcon_h1:FalconH1ForCausalLM` | attention/Mamba hybrid |
 | 5 | `LiquidAI/LFM2.5-1.2B-Instruct` | 510,295 | `Lfm2ForCausalLM` | `lfm2:Lfm2ForCausalLM` | attention/short-convolution hybrid |
 | 6 | `ai21labs/AI21-Jamba2-3B` | 26,935 | `JambaForCausalLM` | `jamba:JambaForCausalLM` | dense attention/Mamba hybrid; MoE configs excluded |
-| 7 | `ibm-granite/granite-4.1-8b` | 4,155,476 | `GraniteForCausalLM` | `granite:GraniteForCausalLM` | dense; validate with the smaller 3B sibling first |
+| 7 | `ibm-granite/granite-4.1-8b` | 4,155,476 | `GraniteForCausalLM` | `granite:GraniteForCausalLM` | dense with four model-specific scalar operations; runtime-qualified on the 3B sibling |
 | 8 | `allenai/Olmo-3-7B-Instruct` | 425,421 | `Olmo3ForCausalLM` | `olmo3:Olmo3ForCausalLM` | dense; implementation changed since 0.25.1 |
 | 9 | `swiss-ai/Apertus-8B-Instruct-2509` | 472,853 | `ApertusForCausalLM` | `apertus:ApertusForCausalLM` | dense with model-specific attention/norm |
 | 10 | `baidu/ERNIE-4.5-0.3B-PT` | 22,897 | `Ernie4_5ForCausalLM` | `ernie45:Ernie4_5ForCausalLM` | modified Llama subclass |
@@ -129,6 +129,17 @@ truthful 263-family manifest distinguishes 26 Mamba1 layers from attention
 layers 7 and 21. The loader fails closed if any layer has more than one expert;
 Jamba-MoE, other Jamba schedules, internal recurrent/cache state, TP>1, prefix
 caching, quantization, serving, and speculative modes remain excluded.
+
+Granite is `supported` for the official
+`ibm-granite/granite-4.1-3b` checkpoint in the bounded TP1 BF16 V1 offline
+eager/default-graph cell at integration commit `dca631b19ec7`. The
+[`Granite audit`](vllm-0.27.1-granite-audit.md) records public API parity and
+byte-identical eager/graph storage on that same production checkpoint. Its
+485-family manifest preserves Granite's attention, embedding, residual, and
+logits scaling and adds the exact post-activation MLP boundary. Granite 4.1 8B
+and 30B share the statically audited dense path but remain runtime-unqualified;
+Granite MoE/hybrid/multimodal models, TP>1, prefix caching, quantization,
+serving, and speculative modes remain excluded.
 
 For each row, use an upstream tiny/random fixture for fast focused tests when
 available, then require one real-checkpoint baseline/monitored run before moving

@@ -74,6 +74,7 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
         "falcon_h1",
         "gemma3",
         "gpt2",
+        "granite",
         "jamba",
         "lfm2",
         "qwen2",
@@ -95,6 +96,8 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
     assert "storage-mistral-cudagraph-tp1" in case_ids
     assert "storage-falcon_h1-eager-tp1" in case_ids
     assert "storage-falcon_h1-cudagraph-tp1" in case_ids
+    assert "storage-granite-eager-tp1" in case_ids
+    assert "storage-granite-cudagraph-tp1" in case_ids
     assert "storage-jamba-eager-tp1" in case_ids
     assert "storage-jamba-cudagraph-tp1" in case_ids
     assert "storage-lfm2-eager-tp1" in case_ids
@@ -196,6 +199,24 @@ def test_jamba_matrix_uses_the_qualified_dense_production_checkpoint() -> None:
         storage = cases[f"storage-jamba-{mode}-tp1"]
         assert storage.model_id == "ai21labs/AI21-Jamba2-3B"
         assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.5"
+        assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
+
+
+def test_granite_matrix_uses_the_qualified_41_production_checkpoint() -> None:
+    cases = {case.case_id: case for case in build_cases("all")}
+
+    public = cases["public-granite-tp1-eager-graph"]
+    assert public.model_id == "ibm-granite/granite-4.1-3b"
+    assert public.environment["DMI_BLACKBOX_MODEL"] == (
+        "ibm-granite/granite-4.1-3b"
+    )
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "128"
+
+    for mode in ("eager", "cudagraph"):
+        storage = cases[f"storage-granite-{mode}-tp1"]
+        assert storage.model_id == "ibm-granite/granite-4.1-3b"
+        assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.6"
+        assert storage.environment["E2E_REF_MAX_LEN"] == "128"
         assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
 
 
