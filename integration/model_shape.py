@@ -83,7 +83,11 @@ def _make_model_shape_from_hf_config(
     if dtype is None:
         dtype = torch.float16
     vocab_size = getattr(cfg, "vocab_size", 0) or 0
-    num_experts = getattr(cfg, "num_experts", 0) or 0
+    num_experts = (
+        getattr(cfg, "num_experts", None)
+        or getattr(cfg, "num_local_experts", None)
+        or 0
+    )
     top_k = (
         getattr(cfg, "num_experts_per_tok", None)
         or getattr(cfg, "top_k", None)

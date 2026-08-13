@@ -1,5 +1,8 @@
 # vLLM model coverage roadmap
 
+The frozen nine-model SOTA expansion and its lower-cost local/H100 split are
+tracked in [`vllm-0.27.1-sota-lite-plan.md`](vllm-0.27.1-sota-lite-plan.md).
+
 This document defines the model backlog for the vLLM 0.27.1 port. It is a
 versioned discovery snapshot, not a support claim.
 

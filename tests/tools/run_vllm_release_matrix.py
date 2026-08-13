@@ -40,7 +40,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gpus", required=True, help="Two physical GPU indices")
     parser.add_argument(
         "--phase",
-        choices=("focused", "public", "storage", "all"),
+        choices=("focused", "public", "storage", "sota", "all"),
         default="all",
     )
     parser.add_argument("--expected-vllm-version", default="0.27.1")
@@ -177,6 +177,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_ernie45_p_contract.py",
             "tests/test_falcon_h1_p_contract.py",
             "tests/test_granite_p_contract.py",
+            "tests/test_gpt_oss_p_contract.py",
             "tests/test_jamba_p_contract.py",
             "tests/test_lfm2_p_contract.py",
             "tests/test_olmo3_p_contract.py",
@@ -465,12 +466,40 @@ def build_cases(phase: str) -> list[MatrixCase]:
                 )
             )
 
+    gpt_oss_revision = "6cee5e81ee83917806bbde320786a8fb61efebee"
+    sota = [
+        _blackbox_case(
+            "gpt_oss",
+            "openai/gpt-oss-20b",
+            tp_size=1,
+            memory_utilization=0.5,
+            max_model_len=128,
+            revision=gpt_oss_revision,
+        )
+    ]
+    for mode in ("eager", "cudagraph"):
+        sota.append(
+            _storage_case(
+                "gpt_oss",
+                "openai/gpt-oss-20b",
+                mode,
+                1,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.5,
+                ring_mb=2048,
+                revision=gpt_oss_revision,
+            )
+        )
+
     if phase == "focused":
         return [focused]
     if phase == "public":
         return [focused, *public]
     if phase == "storage":
         return [focused, *storage]
+    if phase == "sota":
+        return [focused, *sota]
     return [focused, *public, *storage]
 
 
