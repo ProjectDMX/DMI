@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import json
 import os
@@ -44,7 +44,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--phase",
-        choices=("focused", "public", "storage", "sota", "all"),
+        choices=("focused", "public", "storage", "sota", "h100-tp4", "all"),
         default="all",
     )
     parser.add_argument("--expected-vllm-version", default="0.27.1")
@@ -173,6 +173,20 @@ def _storage_case(
         gpu_count=tp_size,
         model_id=model_id,
         phase="storage",
+    )
+
+
+def _eager_only_public_case(case: MatrixCase) -> MatrixCase:
+    """Narrow a combined public eager/graph case to its cheaper eager cell."""
+
+    if case.phase != "public" or not case.case_id.endswith("-eager-graph"):
+        raise ValueError(f"not a combined public case: {case.case_id}")
+    environment = dict(case.environment)
+    environment["DMI_BLACKBOX_CUDAGRAPH"] = "0"
+    return replace(
+        case,
+        case_id=case.case_id.removesuffix("-graph"),
+        environment=environment,
     )
 
 
@@ -705,6 +719,57 @@ def build_cases(phase: str) -> list[MatrixCase]:
             )
         )
 
+    # The practical release gate is intentionally bounded to one four-H100
+    # node.  Qwen3-0.6B supplies the missing TP4 public and storage evidence;
+    # the larger SOTA checkpoints get one public eager differential plus one
+    # eager storage comparison.  GLM-5.2 and Kimi K3 remain explicit
+    # TP32 runtime gaps rather than being silently substituted by other models.
+    qwen3_revision = "c1899de289a04d12100db370d81485cdf75e47ca"
+    h100_tp4 = [
+        _blackbox_case(
+            "qwen3",
+            "Qwen/Qwen3-0.6B",
+            tp_size=4,
+            memory_utilization=0.5,
+            max_model_len=128,
+            revision=qwen3_revision,
+            generated_cases=2,
+        ),
+        _storage_case(
+            "qwen3",
+            "Qwen/Qwen3-0.6B",
+            "eager",
+            4,
+            ref_max_len=128,
+            max_model_len=128,
+            memory_utilization=0.5,
+            revision=qwen3_revision,
+        ),
+        _storage_case(
+            "qwen3",
+            "Qwen/Qwen3-0.6B",
+            "cudagraph",
+            4,
+            ref_max_len=128,
+            max_model_len=128,
+            memory_utilization=0.5,
+            revision=qwen3_revision,
+        ),
+    ]
+    h100_tp4.extend(
+        _eager_only_public_case(case)
+        for case in sota
+        if case.gpu_count <= 4
+        and case.phase == "public"
+    )
+    h100_tp4.extend(
+        case
+        for case in sota
+        if case.gpu_count <= 4
+        and case.phase == "storage"
+        and "-eager-" in case.case_id
+    )
+
     if phase == "focused":
         return [focused]
     if phase == "public":
@@ -713,6 +778,8 @@ def build_cases(phase: str) -> list[MatrixCase]:
         return [focused, *storage]
     if phase == "sota":
         return [focused, *sota]
+    if phase == "h100-tp4":
+        return [focused, *h100_tp4]
     return [focused, *public, *storage]
 
 

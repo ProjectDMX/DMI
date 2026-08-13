@@ -146,6 +146,25 @@ python tests/tools/run_vllm_release_matrix.py \
   --gpus 0,1 --phase all --artifact-dir /tmp/dmi-vllm-0271-evidence
 ```
 
+For the practical four-H100 SOTA gate, pre-cache the pinned model artifacts,
+start ClickHouse, and run the scheduler-neutral wrapper from a clean committed
+worktree:
+
+```bash
+bash tests/tools/run_h100_tp4_matrix.sh \
+  0,1,2,3 /path/to/new/dmi-vllm-0271-h100-artifacts
+```
+
+The gate first proves DMI's generic TP4 path with `Qwen/Qwen3-0.6B` using a
+public eager/graph differential and eager/graph storage comparisons. It then
+runs the seven SOTA checkpoints that fit at TP4 or below, using a public
+eager differential and one eager storage comparison per checkpoint. CUDA-graph
+storage is sampled only by the small TP4 representative to keep this acceptance
+gate bounded.
+GLM-5.2 and Kimi K3 are deliberately omitted because their pinned cells require
+TP32; this phase does not substitute a different architecture or report those
+two checkpoints as runtime-tested.
+
 > Native CUDA ring tests live separately under `tests/ring/` (built via its
 > `Makefile`, marker `ring_native`, needs `nvcc`) and are likewise excluded from
 > default pytest discovery.

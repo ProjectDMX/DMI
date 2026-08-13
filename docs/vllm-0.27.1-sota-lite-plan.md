@@ -62,3 +62,25 @@ pre-cached (the pinned BF16 weight tree is about 1.403 TiB), and the current
 runner requires all 32 GPUs to be locally visible; a multi-node execution needs
 a separate launcher extension before it can count as evidence. Kimi K3 has the
 same local-visibility requirement; its pinned MXFP4 tree is about 1.420 TiB.
+
+## Practical four-H100 gate
+
+The project acceptance gate is bounded to TP4. It is enough to establish
+representative runtime confidence; it is not a claim that every implemented
+model/topology pair was exhaustively tested. Run it from a clean committed
+worktree with the pinned checkpoints already cached and ClickHouse available:
+
+```bash
+bash tests/tools/run_h100_tp4_matrix.sh \
+  0,1,2,3 /path/to/new/sota-tp4-artifacts
+```
+
+This phase adds TP4 public and storage evidence for `Qwen/Qwen3-0.6B`, then runs
+the seven SOTA checkpoints whose pinned cells use at most four GPUs. Each SOTA
+checkpoint gets an isolated public eager differential plus an eager DMI storage
+comparison. Qwen3 gets public eager/graph coverage and both eager and CUDA-graph
+storage comparisons as the generic TP4 transport representative.
+
+GLM-5.2 and Kimi K3 remain `lite implemented; TP32 runtime untested`. Their
+absence does not block the practical gate, and a smaller same-brand checkpoint
+must not be reported as runtime evidence for either exact architecture.

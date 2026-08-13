@@ -293,6 +293,58 @@ def test_sota_matrix_pins_lite_h100_cells() -> None:
         assert storage.environment["E2E_REF_MAX_LEN"] == "128"
 
 
+def test_h100_tp4_matrix_is_bounded_and_keeps_tp32_gaps_explicit() -> None:
+    cases = build_cases("h100-tp4")
+    case_ids = {case.case_id for case in cases}
+
+    assert max(case.gpu_count for case in cases) == 4
+    assert not any("glm52" in case_id for case_id in case_ids)
+    assert not any("kimi_k3" in case_id for case_id in case_ids)
+    assert {
+        "public-qwen3-tp4-eager-graph",
+        "storage-qwen3-eager-tp4",
+        "storage-qwen3-cudagraph-tp4",
+    } <= case_ids
+
+    sota_models = {
+        "deepseek_v4_flash",
+        "gemma4_e2b",
+        "gpt_oss",
+        "llama4_scout",
+        "minimax_m27",
+        "qwen3_moe",
+        "qwen36",
+    }
+    for model in sota_models:
+        public_ids = {
+            case_id
+            for case_id in case_ids
+            if case_id.startswith(f"public-{model}-")
+        }
+        assert len(public_ids) == 1
+        assert next(iter(public_ids)).endswith("-eager")
+        assert any(
+            case_id.startswith(f"storage-{model}-eager-") for case_id in case_ids
+        )
+        assert not any(
+            case_id.startswith(f"storage-{model}-cudagraph-")
+            for case_id in case_ids
+        )
+
+    qwen3_revision = "c1899de289a04d12100db370d81485cdf75e47ca"
+    qwen3_cases = [case for case in cases if "-qwen3-" in case.case_id]
+    assert {
+        case.environment.get("DMI_BLACKBOX_MODEL_REVISION")
+        for case in qwen3_cases
+        if case.phase == "public"
+    } == {qwen3_revision}
+    assert {
+        case.environment.get("E2E_MODEL_REVISION")
+        for case in qwen3_cases
+        if case.phase == "storage"
+    } == {qwen3_revision}
+
+
 def test_gemma3_matrix_resolves_the_fixture_subfolder() -> None:
     cases = {case.case_id: case for case in build_cases("all")}
 
