@@ -43,6 +43,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--ring-mb", type=int, default=64)
     parser.add_argument("--hook-selection", default="resid_pre")
+    parser.add_argument(
+        "--decision-logprobs",
+        type=int,
+        default=0,
+        help="Public top-logprob count retained to justify greedy branch ambiguity.",
+    )
     parser.add_argument("--cudagraph", action="store_true")
     return parser.parse_args()
 
@@ -131,6 +137,9 @@ def _serialize_request(case_id: str, output) -> dict:
                 "text": completion.text,
                 "token_ids": list(completion.token_ids),
                 "cumulative_logprob": completion.cumulative_logprob,
+                "decision_logprobs": _serialize_logprob_trace(
+                    getattr(completion, "logprobs", None)
+                ),
                 "finish_reason": completion.finish_reason,
                 "stop_reason": completion.stop_reason,
             }
@@ -139,8 +148,29 @@ def _serialize_request(case_id: str, output) -> dict:
     }
 
 
+def _serialize_logprob_trace(logprobs) -> list[list[dict]] | None:
+    """Serialize public vLLM top-logprobs without retaining runtime objects."""
+
+    if logprobs is None:
+        return None
+    return [
+        [
+            {
+                "token_id": int(token_id),
+                "logprob": float(value.logprob),
+                "rank": None if value.rank is None else int(value.rank),
+                "decoded_token": value.decoded_token,
+            }
+            for token_id, value in sorted(step.items())
+        ]
+        for step in logprobs
+    ]
+
+
 def main() -> None:
     args = _parse_args()
+    if args.decision_logprobs < 0:
+        raise ValueError("--decision-logprobs must be non-negative")
     os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
@@ -188,7 +218,14 @@ def main() -> None:
             case_order = execution_orders[execution_id]
             prompts = [materialized[case_id][0] for case_id in case_order]
             sampling_params = [
-                SamplingParams(**materialized[case_id][1])
+                SamplingParams(
+                    **materialized[case_id][1],
+                    **(
+                        {"logprobs": args.decision_logprobs}
+                        if args.decision_logprobs
+                        else {}
+                    ),
+                )
                 for case_id in case_order
             ]
             outputs = llm.generate(
@@ -217,6 +254,7 @@ def main() -> None:
             "model": model_id,
             "cudagraph": args.cudagraph,
             "tensor_parallel_size": args.tensor_parallel_size,
+            "decision_logprobs": args.decision_logprobs,
             "corpus": corpus,
             "executions": executions,
         }

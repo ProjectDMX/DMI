@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import math
 from typing import Any
 
 
@@ -25,9 +26,14 @@ _TRANSPARENCY_V2_FIELDS = (
     "model",
     "cudagraph",
     "tensor_parallel_size",
+    "decision_logprobs",
     "corpus",
     "executions",
 )
+
+MAX_DECISION_LOGPROB_DRIFT = 0.25
+MAX_GREEDY_BRANCH_GAP = 0.25
+MAX_GREEDY_SELECTED_GAP = 1e-6
 
 
 def _recursive_mismatches(
@@ -99,10 +105,31 @@ def transparency_mismatches(
     if mode_errors:
         return mode_errors
     return _recursive_mismatches(
-        {field: baseline[field] for field in fields},
-        {field: monitored[field] for field in fields},
+        _without_decision_evidence(
+            {field: baseline[field] for field in fields}
+        ),
+        _without_decision_evidence(
+            {field: monitored[field] for field in fields}
+        ),
         path="",
     )
+
+
+def _without_decision_evidence(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove numeric branch evidence handled by the tolerance-aware oracle."""
+
+    normalized = deepcopy(payload)
+    for execution in normalized.get("executions", []):
+        if not isinstance(execution, dict):
+            continue
+        for result in execution.get("results", []):
+            if not isinstance(result, dict):
+                continue
+            for output in result.get("outputs", []):
+                if isinstance(output, dict):
+                    output.pop("decision_logprobs", None)
+                    output.pop("cumulative_logprob", None)
+    return normalized
 
 
 def _without_generated_outputs(payload: dict[str, Any]) -> dict[str, Any]:
@@ -194,6 +221,216 @@ def baseline_envelope_mismatches(
                     f"{execution.get('execution_id')}."
                     f"{result.get('case_id')}.outputs"
                 )
+    return mismatches
+
+
+def _decision_step(step: Any) -> dict[int, dict[str, Any]] | None:
+    if not isinstance(step, list) or not step:
+        return None
+    parsed: dict[int, dict[str, Any]] = {}
+    ranks: set[int] = set()
+    for row in step:
+        if not isinstance(row, dict) or set(row) != {
+            "token_id",
+            "logprob",
+            "rank",
+            "decoded_token",
+        }:
+            return None
+        token_id = row.get("token_id")
+        logprob = row.get("logprob")
+        rank = row.get("rank")
+        decoded_token = row.get("decoded_token")
+        if (
+            not isinstance(token_id, int)
+            or isinstance(token_id, bool)
+            or token_id in parsed
+            or not isinstance(logprob, (int, float))
+            or isinstance(logprob, bool)
+            or not math.isfinite(float(logprob))
+            or (
+                rank is not None
+                and (not isinstance(rank, int) or isinstance(rank, bool) or rank < 1)
+            )
+            or (decoded_token is not None and not isinstance(decoded_token, str))
+        ):
+            return None
+        if rank is not None:
+            if rank in ranks:
+                return None
+            ranks.add(rank)
+        parsed[token_id] = row
+    return parsed
+
+
+def _selected_logprob_mismatch(
+    baseline_step: dict[int, dict[str, Any]],
+    monitored_step: dict[int, dict[str, Any]],
+    token_id: int,
+) -> bool:
+    if token_id not in baseline_step or token_id not in monitored_step:
+        return True
+    return abs(
+        float(baseline_step[token_id]["logprob"])
+        - float(monitored_step[token_id]["logprob"])
+    ) > MAX_DECISION_LOGPROB_DRIFT
+
+
+def sampling_ambiguity_mismatches(
+    baseline: dict[str, Any],
+    monitored: dict[str, Any],
+) -> list[str]:
+    """Accept only publicly evidenced near-tied greedy branch divergence.
+
+    The two runs must remain exact outside completion values. Selected-token
+    logprobs are compared along the common prefix. At the first divergent token,
+    both alternatives must appear in both public top-logprob maps, remain close
+    across runs, and be separated by no more than the predeclared branch gap.
+    """
+
+    normalized_mismatches = _recursive_mismatches(
+        _without_generated_outputs(baseline),
+        _without_generated_outputs(monitored),
+        path="",
+    )
+    if normalized_mismatches:
+        return [f"ambiguity.{path}" for path in normalized_mismatches]
+    decision_count = baseline.get("decision_logprobs")
+    if (
+        not isinstance(decision_count, int)
+        or isinstance(decision_count, bool)
+        or decision_count < 2
+    ):
+        return ["ambiguity.decision_logprobs"]
+
+    mismatches: list[str] = []
+    for execution_index, baseline_execution in enumerate(baseline["executions"]):
+        monitored_execution = monitored["executions"][execution_index]
+        for result_index, baseline_result in enumerate(baseline_execution["results"]):
+            monitored_result = monitored_execution["results"][result_index]
+            base = (
+                f"ambiguity.{baseline_execution['execution_id']}."
+                f"{baseline_result['case_id']}"
+            )
+            baseline_outputs = baseline_result.get("outputs")
+            monitored_outputs = monitored_result.get("outputs")
+            if (
+                not isinstance(baseline_outputs, list)
+                or not isinstance(monitored_outputs, list)
+                or len(baseline_outputs) != len(monitored_outputs)
+            ):
+                mismatches.append(f"{base}.outputs")
+                continue
+            for output_index, (left, right) in enumerate(
+                zip(baseline_outputs, monitored_outputs)
+            ):
+                output_base = f"{base}.outputs[{output_index}]"
+                for field in ("index", "finish_reason", "stop_reason"):
+                    if left.get(field) != right.get(field):
+                        mismatches.append(f"{output_base}.{field}")
+                left_tokens = left.get("token_ids")
+                right_tokens = right.get("token_ids")
+                left_trace = left.get("decision_logprobs")
+                right_trace = right.get("decision_logprobs")
+                if (
+                    left_tokens == right_tokens
+                    and left.get("text") == right.get("text")
+                    and left_trace is None
+                    and right_trace is None
+                ):
+                    continue
+                if (
+                    not isinstance(left_tokens, list)
+                    or not isinstance(right_tokens, list)
+                    or not isinstance(left_trace, list)
+                    or not isinstance(right_trace, list)
+                    or len(left_trace) != len(left_tokens)
+                    or len(right_trace) != len(right_tokens)
+                ):
+                    mismatches.append(f"{output_base}.decision_logprobs")
+                    continue
+
+                common = min(len(left_tokens), len(right_tokens))
+                divergence = next(
+                    (
+                        index
+                        for index in range(common)
+                        if left_tokens[index] != right_tokens[index]
+                    ),
+                    common,
+                )
+                for step_index in range(divergence):
+                    left_step = _decision_step(left_trace[step_index])
+                    right_step = _decision_step(right_trace[step_index])
+                    token_id = left_tokens[step_index]
+                    if (
+                        left_step is None
+                        or right_step is None
+                        or _selected_logprob_mismatch(
+                            left_step, right_step, token_id
+                        )
+                    ):
+                        mismatches.append(
+                            f"{output_base}.decision_logprobs[{step_index}]"
+                        )
+
+                if divergence == common:
+                    if len(left_tokens) != len(right_tokens):
+                        mismatches.append(f"{output_base}.token_ids.length")
+                    elif left.get("text") != right.get("text"):
+                        mismatches.append(f"{output_base}.text")
+                    continue
+
+                left_step = _decision_step(left_trace[divergence])
+                right_step = _decision_step(right_trace[divergence])
+                left_token = left_tokens[divergence]
+                right_token = right_tokens[divergence]
+                if left_step is None or right_step is None:
+                    mismatches.append(
+                        f"{output_base}.decision_logprobs[{divergence}]"
+                    )
+                    continue
+                if any(
+                    token_id not in step
+                    for token_id in (left_token, right_token)
+                    for step in (left_step, right_step)
+                ):
+                    mismatches.append(
+                        f"{output_base}.decision_candidates[{divergence}]"
+                    )
+                    continue
+                if any(
+                    max(float(row["logprob"]) for row in step.values())
+                    - float(step[token_id]["logprob"])
+                    > MAX_GREEDY_SELECTED_GAP
+                    for step, token_id in (
+                        (left_step, left_token),
+                        (right_step, right_token),
+                    )
+                ):
+                    mismatches.append(
+                        f"{output_base}.selected_gap[{divergence}]"
+                    )
+                if any(
+                    abs(
+                        float(step[left_token]["logprob"])
+                        - float(step[right_token]["logprob"])
+                    )
+                    > MAX_GREEDY_BRANCH_GAP
+                    for step in (left_step, right_step)
+                ):
+                    mismatches.append(
+                        f"{output_base}.decision_gap[{divergence}]"
+                    )
+                if any(
+                    _selected_logprob_mismatch(
+                        left_step, right_step, token_id
+                    )
+                    for token_id in (left_token, right_token)
+                ):
+                    mismatches.append(
+                        f"{output_base}.decision_drift[{divergence}]"
+                    )
     return mismatches
 
 
@@ -309,6 +546,7 @@ def metamorphic_mismatches(payload: dict[str, Any]) -> list[str]:
                     "text",
                     "token_ids",
                     "cumulative_logprob",
+                    "decision_logprobs",
                     "finish_reason",
                     "stop_reason",
                 }
@@ -337,8 +575,53 @@ def metamorphic_mismatches(payload: dict[str, Any]) -> list[str]:
                     and len(token_ids) != max_tokens
                 ):
                     mismatches.append(f"{output_base}.token_ids.length_finish")
-                if output.get("cumulative_logprob") is not None:
-                    mismatches.append(f"{output_base}.cumulative_logprob")
+                decision_count = payload.get("decision_logprobs")
+                decision_trace = output.get("decision_logprobs")
+                cumulative_logprob = output.get("cumulative_logprob")
+                if (
+                    not isinstance(decision_count, int)
+                    or isinstance(decision_count, bool)
+                    or decision_count < 0
+                ):
+                    mismatches.append("decision_logprobs")
+                elif decision_count == 0:
+                    if decision_trace is not None:
+                        mismatches.append(
+                            f"{output_base}.decision_logprobs.disabled"
+                        )
+                    if cumulative_logprob is not None:
+                        mismatches.append(f"{output_base}.cumulative_logprob")
+                elif (
+                    not isinstance(decision_trace, list)
+                    or not isinstance(token_ids, list)
+                    or len(decision_trace) != len(token_ids)
+                ):
+                    mismatches.append(f"{output_base}.decision_logprobs")
+                else:
+                    selected_logprobs: list[float] = []
+                    for step_index, (selected_token, step) in enumerate(
+                        zip(token_ids, decision_trace)
+                    ):
+                        parsed_step = _decision_step(step)
+                        if parsed_step is None or selected_token not in parsed_step:
+                            mismatches.append(
+                                f"{output_base}.decision_logprobs[{step_index}]"
+                            )
+                        else:
+                            selected_logprobs.append(
+                                float(parsed_step[selected_token]["logprob"])
+                            )
+                    if (
+                        not isinstance(cumulative_logprob, (int, float))
+                        or isinstance(cumulative_logprob, bool)
+                        or not math.isfinite(float(cumulative_logprob))
+                        or len(selected_logprobs) != len(token_ids)
+                        or abs(
+                            float(cumulative_logprob) - sum(selected_logprobs)
+                        )
+                        > 1e-5
+                    ):
+                        mismatches.append(f"{output_base}.cumulative_logprob")
                 stop_reason = output.get("stop_reason")
                 if stop_reason is not None and not isinstance(
                     stop_reason, (str, int)

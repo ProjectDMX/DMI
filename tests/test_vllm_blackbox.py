@@ -17,9 +17,13 @@ from tests.blackbox.case_generation import (
     generate_cases,
 )
 from tests.blackbox.contracts import (
+    MAX_DECISION_LOGPROB_DRIFT,
+    MAX_GREEDY_BRANCH_GAP,
+    MAX_GREEDY_SELECTED_GAP,
     baseline_envelope_mismatches,
     baseline_instabilities,
     metamorphic_mismatches,
+    sampling_ambiguity_mismatches,
     transparency_mismatches,
 )
 from tests.process_group import run_process_group
@@ -77,6 +81,12 @@ def _run(
     ]
     if cudagraph:
         command.append("--cudagraph")
+    command.extend(
+        [
+            "--decision-logprobs",
+            os.environ.get("DMI_BLACKBOX_DECISION_LOGPROBS", "20"),
+        ]
+    )
 
     env = dict(os.environ)
     env.setdefault("HF_HUB_OFFLINE", "1")
@@ -162,7 +172,69 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
     baselines = [baseline]
     envelope_mismatches: list[str] = []
     instabilities: list[str] = []
+    ambiguity_mismatches = sampling_ambiguity_mismatches(
+        baseline, monitored
+    )
+    decision_count = baseline.get("decision_logprobs")
+    decision_evidence_available = (
+        isinstance(decision_count, int)
+        and not isinstance(decision_count, bool)
+        and decision_count >= 2
+    )
+    if not mismatches:
+        assert not ambiguity_mismatches, (
+            "DMI changed public decision logprobs beyond the declared "
+            f"tolerance: {ambiguity_mismatches}\ncase_seed={seed}"
+        )
     if mismatches:
+        if not ambiguity_mismatches:
+            (run_dir / "stability.json").write_text(
+                json.dumps(
+                    {
+                        "strict_mismatches": mismatches,
+                        "accepted_oracle": "public-decision-logprob",
+                        "sampling_ambiguity_mismatches": [],
+                        "sampling_ambiguity_thresholds": {
+                            "max_branch_gap": MAX_GREEDY_BRANCH_GAP,
+                            "max_selected_gap": MAX_GREEDY_SELECTED_GAP,
+                            "max_cross_run_drift": MAX_DECISION_LOGPROB_DRIFT,
+                        },
+                        "baseline_processes": 1,
+                        "baseline_instabilities": [],
+                        "envelope_mismatches": [],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            return
+        if decision_evidence_available:
+            (run_dir / "stability.json").write_text(
+                json.dumps(
+                    {
+                        "strict_mismatches": mismatches,
+                        "accepted_oracle": None,
+                        "sampling_ambiguity_mismatches": ambiguity_mismatches,
+                        "sampling_ambiguity_thresholds": {
+                            "max_branch_gap": MAX_GREEDY_BRANCH_GAP,
+                            "max_selected_gap": MAX_GREEDY_SELECTED_GAP,
+                            "max_cross_run_drift": MAX_DECISION_LOGPROB_DRIFT,
+                        },
+                        "baseline_processes": 1,
+                        "baseline_instabilities": [],
+                        "envelope_mismatches": [
+                            "not attempted: public decision evidence was available"
+                        ],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            pytest.fail(
+                "DMI output failed the public decision-logprob oracle: "
+                f"strict={mismatches}, ambiguity={ambiguity_mismatches}\n"
+                f"case_seed={seed}"
+            )
         max_baselines = int(
             os.environ.get("DMI_BLACKBOX_MAX_BASELINES", "3")
         )
@@ -189,6 +261,17 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
             json.dumps(
                 {
                     "strict_mismatches": mismatches,
+                    "accepted_oracle": (
+                        "baseline-envelope"
+                        if instabilities and not envelope_mismatches
+                        else None
+                    ),
+                    "sampling_ambiguity_mismatches": ambiguity_mismatches,
+                    "sampling_ambiguity_thresholds": {
+                        "max_branch_gap": MAX_GREEDY_BRANCH_GAP,
+                        "max_selected_gap": MAX_GREEDY_SELECTED_GAP,
+                        "max_cross_run_drift": MAX_DECISION_LOGPROB_DRIFT,
+                    },
                     "baseline_processes": len(baselines),
                     "baseline_instabilities": instabilities,
                     "envelope_mismatches": envelope_mismatches,

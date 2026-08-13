@@ -47,9 +47,11 @@ those IDs are not duplicated onto every input row.
 
 The schema-2 comparator fails closed on missing fields, types, list cardinality,
 ordering, case IDs, public request IDs, prompt token IDs, candidate count/index,
-complete generated token IDs, decoded text, cumulative log probability when
-present, finish reason, and stop reason. It reports the exact nested field path.
-It intentionally excludes timing metrics and other nondeterministic telemetry.
+complete generated token IDs, decoded text, the public output top-logprob schema
+and decision values used by the oracle, cumulative log probability when
+requested, finish reason, and stop reason. It reports the exact nested field
+path. It intentionally excludes timing metrics and other nondeterministic
+telemetry.
 
 Each mode executes the canonical batch and its reverse in the same engine. The
 metamorphic oracle requires result order to equal input order, matches by
@@ -63,17 +65,32 @@ Generated text and token IDs are deliberately not required to match between the
 canonical and reversed calls. Changing the batch can change floating-point
 reduction shape, so even greedy decoding is not a public token-invariance
 guarantee. Those fields remain compared exactly between baseline and monitored
-for each identical call sequence unless the bounded instability fallback below
-first proves that the upstream baseline itself has multiple public results.
+for each identical call sequence as the first oracle.
 
-If strict baseline/monitored comparison fails, the runner executes up to two
-additional baseline processes. Stable identity-matched cases remain exact. For a
-case whose complete public candidate list varies across independent baselines,
-the monitored candidate list must equal one entire observed baseline list; it
-cannot mix fields or introduce a new result. The retained `stability.json`
-records the strict mismatch, number of baseline processes, unstable cases, and
-envelope verdict. This bounded fallback handles upstream graph/kernel
-non-repeatability without globally weakening token comparison.
+Every differential run requests the public top-20 output logprobs. If greedy
+token IDs first diverge, the comparator accepts the branch only when the two
+token alternatives appear in both runs' public decision maps, each actually
+selected token is within `1e-6` nat of that run's public maximum, their within-run
+branch gaps are at most 0.25 nat, their cross-run drifts are at most 0.25 nat, and
+selected-token logprobs on the exact common prefix have no larger drift. Ordinal
+rank is retained as evidence but does not decide acceptance because equal public
+logprobs can receive different rank numbers; numeric gap defines the ambiguous
+decision set. The trace must contain finite values for every selected token and
+reconstruct `cumulative_logprob`. These thresholds are fixed before execution.
+After this first-divergence proof, later generated tokens are conditioned on
+different histories, so the comparator keeps schema, identity, candidate
+metadata, finish/stop category, and generation bounds exact but does not require
+the later paths to converge. `stability.json` records the accepted oracle and
+thresholds.
+
+When public decision logprobs are available, failing that oracle is final; extra
+baseline retries cannot replace the first-divergence evidence. Only when this
+public evidence is unavailable may the runner execute up to two additional
+baseline processes as a bounded secondary oracle. Stable identity-matched cases
+remain exact. For a case whose complete public candidate list varies across
+independent baselines, the monitored list must equal one entire observed baseline
+list; it cannot mix fields or introduce a new result. The runner never expands
+this bound or its numeric thresholds after a failure.
 
 ## Explicit gaps
 
@@ -81,7 +98,9 @@ The current V1 offline corpus does not claim:
 
 - async, serving, streaming, disconnect, cancellation, or concurrency;
 - `n > 1`, beam, or speculative sequence association;
-- logprob tensors, which use the separate full-vocabulary comparator;
+- prompt logprobs and full-vocabulary logit equivalence, which require separate
+  public/focused comparators; the current output top-logprobs are decision
+  evidence rather than a full-vocabulary correctness claim;
 - capacity overflow, native producer/consumer failure, and ClickHouse
   exact-once/isolation, which require the transport/storage negative-path suite;
 - PP/DP/EP/SP, multimodal, quantized, or LoRA cells.
