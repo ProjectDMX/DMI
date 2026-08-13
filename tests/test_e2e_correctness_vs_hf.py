@@ -102,7 +102,10 @@ from .hf_reference import (
 # Model aliases
 # ---------------------------------------------------------------------------
 
-_MODEL_ALIASES = {"qwen3": "Qwen/Qwen3-4B", "llama": "meta-llama/Llama-3.1-8B"}
+_MODEL_ALIASES = {
+    "qwen3": "Qwen/Qwen3-4B",
+    "llama": "meta-llama/Llama-3.1-8B-Instruct",
+}
 
 
 def _resolve_model_id(model: str) -> str:

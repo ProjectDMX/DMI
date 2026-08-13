@@ -52,7 +52,7 @@ from tests._clickhouse_test_utils import delete_capture_from_meta
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
     "qwen2": "Qwen/Qwen2.5-0.5B-Instruct",
-    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",
+    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
 }
 _MODEL_KEY = os.environ.get("E2E_MODEL", "gpt2")

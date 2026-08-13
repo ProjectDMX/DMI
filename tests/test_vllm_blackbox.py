@@ -21,9 +21,9 @@ CASES = PROJECT_ROOT / "tests/blackbox/cases/transparency.json"
 MODEL_ALIASES = {
     "gpt2": "gpt2",
     "qwen2": "Qwen/Qwen2.5-0.5B-Instruct",
-    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",
+    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
-    "llama": "meta-llama/Llama-3.1-8B",
+    "llama": "meta-llama/Llama-3.1-8B-Instruct",
 }
 MODEL_ARG = os.environ.get("DMI_BLACKBOX_MODEL", "qwen2")
 MODEL_ID = MODEL_ALIASES.get(MODEL_ARG, MODEL_ARG)

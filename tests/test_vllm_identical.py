@@ -50,9 +50,9 @@ from tests._clickhouse_test_utils import delete_capture_from_meta
 
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
-    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B",
+    "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
-    "llama": "meta-llama/Llama-3.1-8B",
+    "llama": "meta-llama/Llama-3.1-8B-Instruct",
 }
 _MODEL_KEY = os.environ.get("E2E_MODEL", "gpt2")
 _MODEL_ID = _MODEL_ALIASES.get(_MODEL_KEY, _MODEL_KEY)
