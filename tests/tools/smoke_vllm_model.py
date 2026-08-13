@@ -32,6 +32,7 @@ MODEL_ALIASES = {
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B-Instruct",
     "mistral": "openaccess-ai-collective/tiny-mistral",
+    "minicpm4": "openbmb/MiniCPM4.1-8B",
     "olmo3": "allenai/Olmo-3-7B-Instruct",
     "phi3": "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM",
 }
@@ -61,6 +62,15 @@ def _parse_args() -> argparse.Namespace:
         help="Public top-logprob count retained to justify greedy branch ambiguity.",
     )
     parser.add_argument("--cudagraph", action="store_true")
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow a checkpoint's pinned remote configuration code.",
+    )
+    parser.add_argument(
+        "--revision",
+        help="Exact model/tokenizer revision used for reproducible qualification.",
+    )
     return parser.parse_args()
 
 
@@ -200,6 +210,9 @@ def main() -> None:
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "disable_log_stats": True,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "trust_remote_code": args.trust_remote_code,
+        "revision": args.revision,
+        "tokenizer_revision": args.revision,
     }
     if args.mode == "monitored":
         kwargs.update(

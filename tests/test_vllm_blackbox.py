@@ -46,6 +46,7 @@ MODEL_ALIASES = {
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B-Instruct",
     "mistral": "openaccess-ai-collective/tiny-mistral",
+    "minicpm4": "openbmb/MiniCPM4.1-8B",
     "olmo3": "allenai/Olmo-3-7B-Instruct",
     "phi3": "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM",
 }
@@ -57,6 +58,8 @@ GPU_MEMORY_UTILIZATION = os.environ.get(
 )
 MAX_MODEL_LEN = os.environ.get("DMI_BLACKBOX_MAX_MODEL_LEN", "512")
 MODEL_SUBFOLDER = os.environ.get("DMI_BLACKBOX_MODEL_SUBFOLDER")
+TRUST_REMOTE_CODE = os.environ.get("DMI_BLACKBOX_TRUST_REMOTE_CODE", "0") == "1"
+MODEL_REVISION = os.environ.get("DMI_BLACKBOX_MODEL_REVISION")
 
 pytestmark = [
     pytest.mark.gpu,
@@ -97,6 +100,10 @@ def _run(
         command.append("--cudagraph")
     if MODEL_SUBFOLDER:
         command.extend(["--model-subfolder", MODEL_SUBFOLDER])
+    if TRUST_REMOTE_CODE:
+        command.append("--trust-remote-code")
+    if MODEL_REVISION:
+        command.extend(["--revision", MODEL_REVISION])
     command.extend(
         [
             "--decision-logprobs",

@@ -79,6 +79,7 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
         "granite",
         "jamba",
         "lfm2",
+        "minicpm4",
         "qwen2",
         "qwen3",
         "llama",
@@ -111,6 +112,8 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
     assert "storage-apertus-cudagraph-tp1" in case_ids
     assert "storage-ernie45-eager-tp1" in case_ids
     assert "storage-ernie45-cudagraph-tp1" in case_ids
+    assert "storage-minicpm4-eager-tp1" in case_ids
+    assert "storage-minicpm4-cudagraph-tp1" in case_ids
 
 
 def test_gemma3_matrix_resolves_the_fixture_subfolder() -> None:
@@ -286,6 +289,35 @@ def test_ernie45_matrix_uses_the_qualified_03b_checkpoint() -> None:
         assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.3"
         assert storage.environment["E2E_REF_MAX_LEN"] == "128"
         assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
+
+
+def test_minicpm4_matrix_pins_remote_code_and_the_official_checkpoint() -> None:
+    cases = {case.case_id: case for case in build_cases("all")}
+
+    public = cases["public-minicpm4-tp1-eager-graph"]
+    assert public.model_id == "openbmb/MiniCPM4.1-8B"
+    assert public.environment["DMI_BLACKBOX_MODEL"] == "openbmb/MiniCPM4.1-8B"
+    assert public.environment["DMI_BLACKBOX_GPU_MEMORY_UTILIZATION"] == "0.93"
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "128"
+    assert public.environment["DMI_BLACKBOX_TRUST_REMOTE_CODE"] == "1"
+    assert (
+        public.environment["DMI_BLACKBOX_MODEL_REVISION"]
+        == "3a8dfed9c79a45e07dbff95bcd49d792343fa1a3"
+    )
+
+    for mode in ("eager", "cudagraph"):
+        storage = cases[f"storage-minicpm4-{mode}-tp1"]
+        assert storage.model_id == "openbmb/MiniCPM4.1-8B"
+        assert storage.environment["E2E_GPU_MEM_UTIL"] == "0.93"
+        assert storage.environment["E2E_REF_MAX_LEN"] == "128"
+        assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
+        assert storage.environment["E2E_RING_PAYLOAD_MB"] == "1024"
+        assert storage.environment["E2E_RING_PINNED_MB"] == "1024"
+        assert storage.environment["E2E_TRUST_REMOTE_CODE"] == "1"
+        assert (
+            storage.environment["E2E_MODEL_REVISION"]
+            == "3a8dfed9c79a45e07dbff95bcd49d792343fa1a3"
+        )
 
 
 def test_static_only_models_use_bounded_two_gpu_storage_cells():

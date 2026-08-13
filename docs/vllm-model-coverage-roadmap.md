@@ -35,9 +35,9 @@ the registry source, but remains upstream-static evidence rather than DMI
 runtime support. Across the 41 representative checkpoints below:
 
 - all 41 resolve in vLLM 0.27.1;
-- 15 architectures have a DMI model remap on the current stacked expansion
+- 16 architectures have a DMI model remap on the current stacked expansion
   branch;
-- 26 are unmapped by DMI;
+- 25 are unmapped by DMI;
 - registry presence is upstream static evidence, not DMI runtime support.
 
 Between vLLM 0.25.1 and 0.27.1, the combined text/multimodal registry adds eight
@@ -175,6 +175,19 @@ while the monitored and compare variants explicitly replay ERNIE's non-NeoX
 rotary and bias-free output-projection post-init changes. Other ERNIE sizes,
 ERNIE MoE/VL, alternate configuration branches, TP>1, prefix caching,
 quantization, serving, and speculative modes remain excluded.
+
+MiniCPM 4.1 dense is `supported` for the official
+`openbmb/MiniCPM4.1-8B` checkpoint in the bounded TP1 BF16 V1 offline
+eager/default-graph cell at integration commit `db9e7cfccc0b`. The
+[`MiniCPM 4.1 audit`](vllm-0.27.1-minicpm4-audit.md) records strict public API
+parity and byte-identical eager/graph storage on that same production
+checkpoint. Its 389-family manifest preserves scaled embeddings, both
+depth-scaled residual branches, LongRoPE placement, and final width scaling.
+Pinned remote repository code is used only to parse the configuration under
+Transformers 5.15.0; vLLM's native implementation executes the model. Earlier
+MiniCPM families, MoE/FatReLU/sparse/multimodal branches, TP>1, prefix caching,
+quantization, serving, speculative modes, and remote Hugging Face model
+execution remain excluded.
 
 For each row, use an upstream tiny/random fixture for fast focused tests when
 available, then require one real-checkpoint baseline/monitored run before moving

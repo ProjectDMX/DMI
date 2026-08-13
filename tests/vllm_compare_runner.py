@@ -33,6 +33,7 @@ _MODEL_ALIASES = {
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B-Instruct",
     "mistral": "openaccess-ai-collective/tiny-mistral",
+    "minicpm4": "openbmb/MiniCPM4.1-8B",
     "olmo3": "allenai/Olmo-3-7B-Instruct",
     "phi3": "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM",
 }
@@ -113,6 +114,9 @@ def main():
         enforce_eager=enforce_eager,
         gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.5")),
         tensor_parallel_size=tp_size,
+        trust_remote_code=os.environ.get("E2E_TRUST_REMOTE_CODE", "0") == "1",
+        revision=os.environ.get("E2E_MODEL_REVISION"),
+        tokenizer_revision=os.environ.get("E2E_MODEL_REVISION"),
     )
 
     llm = None

@@ -78,6 +78,8 @@ def _blackbox_case(
     model_subfolder: str | None = None,
     model_arg: str | None = None,
     max_model_len: int = 512,
+    trust_remote_code: bool = False,
+    revision: str | None = None,
 ) -> MatrixCase:
     environment = {
         "DMI_BLACKBOX_MODEL": model_arg or model_key,
@@ -90,6 +92,10 @@ def _blackbox_case(
     }
     if model_subfolder:
         environment["DMI_BLACKBOX_MODEL_SUBFOLDER"] = model_subfolder
+    if trust_remote_code:
+        environment["DMI_BLACKBOX_TRUST_REMOTE_CODE"] = "1"
+    if revision:
+        environment["DMI_BLACKBOX_MODEL_REVISION"] = revision
     return MatrixCase(
         case_id=f"public-{model_key}-tp{tp_size}-eager-graph",
         command=(
@@ -119,6 +125,8 @@ def _storage_case(
     max_model_len: int = 512,
     memory_utilization: float | None = None,
     ring_mb: int = 512,
+    trust_remote_code: bool = False,
+    revision: str | None = None,
 ) -> MatrixCase:
     environment = {
         "DMX_HOOK_SELECTION": hook_selection,
@@ -135,6 +143,10 @@ def _storage_case(
     }
     if model_subfolder:
         environment["E2E_MODEL_SUBFOLDER"] = model_subfolder
+    if trust_remote_code:
+        environment["E2E_TRUST_REMOTE_CODE"] = "1"
+    if revision:
+        environment["E2E_MODEL_REVISION"] = revision
     return MatrixCase(
         case_id=f"storage-{model_key}-{mode}-tp{tp_size}",
         command=(
@@ -172,6 +184,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_gemma3_p_inventory.py",
             "tests/test_model_artifacts.py",
             "tests/test_mistral_p_contract.py",
+            "tests/test_minicpm_p_contract.py",
             "tests/test_phi3_p_contract.py",
             "tests/test_vllm_storage_contracts.py",
             "tests/test_qwen2_p_inventory.py",
@@ -190,6 +203,16 @@ def build_cases(phase: str) -> list[MatrixCase]:
         environment={},
     )
     public = [
+        _blackbox_case(
+            "minicpm4",
+            "openbmb/MiniCPM4.1-8B",
+            tp_size=1,
+            memory_utilization=0.93,
+            model_arg="openbmb/MiniCPM4.1-8B",
+            max_model_len=128,
+            trust_remote_code=True,
+            revision="3a8dfed9c79a45e07dbff95bcd49d792343fa1a3",
+        ),
         _blackbox_case(
             "ernie45",
             "baidu/ERNIE-4.5-0.3B-PT",
@@ -295,6 +318,20 @@ def build_cases(phase: str) -> list[MatrixCase]:
     ]
     storage: list[MatrixCase] = []
     for mode in ("eager", "cudagraph"):
+        storage.append(
+            _storage_case(
+                "minicpm4",
+                "openbmb/MiniCPM4.1-8B",
+                mode,
+                1,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.93,
+                ring_mb=1024,
+                trust_remote_code=True,
+                revision="3a8dfed9c79a45e07dbff95bcd49d792343fa1a3",
+            )
+        )
         storage.append(
             _storage_case(
                 "ernie45",
