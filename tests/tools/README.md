@@ -19,6 +19,7 @@ the vLLM runtime); they are not CPU-safe.
 | `verify_vllm.sh` | vLLM row-count + identical verification sweep across ring sizes. |
 | `verify_hf.sh` | HF E2E correctness sweep across ring sizes. |
 | `smoke_vllm_model.py` | Baseline/monitored public-output smoke for a new vLLM version or model; no ClickHouse required. |
+| `run_vllm_release_matrix.py` | Version-pinned focused/public/storage matrix with two-GPU idle gates and retained JSON/log evidence. |
 
 Example:
 
@@ -50,6 +51,9 @@ DMI_BLACKBOX_MODEL=qwen2_moe DMI_BLACKBOX_TP_SIZE=2 \
   CUDA_VISIBLE_DEVICES=0,1 pytest -q -s tests/test_vllm_blackbox.py
 ```
 
+Set `DMI_BLACKBOX_ARTIFACT_DIR` to retain each mode's generated cases and raw
+baseline/monitored JSON instead of relying on pytest's temporary directory.
+
 For manual diagnosis, run both modes against the same case manifest and compare
 their JSON outputs:
 
@@ -73,6 +77,11 @@ cards are idle for consecutive samples:
 
 ```bash
 python tests/tools/check_gpu_idle.py --gpus 0,1 --samples 3 --interval 2
+
+# Once two physical cards are idle, run the complete vLLM 0.25.1 matrix from
+# the intended Python environment. The output directory must not already exist.
+python tests/tools/run_vllm_release_matrix.py \
+  --gpus 0,1 --phase all --artifact-dir /tmp/dmi-vllm-0251-evidence
 ```
 
 > Native CUDA ring tests live separately under `tests/ring/` (built via its

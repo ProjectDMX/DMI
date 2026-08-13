@@ -95,24 +95,32 @@ def _run(
     ids=lambda enabled: "cudagraph" if enabled else "eager",
 )
 def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
+    artifact_root = os.environ.get("DMI_BLACKBOX_ARTIFACT_DIR")
+    if artifact_root:
+        run_dir = Path(artifact_root) / (
+            "cudagraph" if cudagraph else "eager"
+        )
+        run_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        run_dir = tmp_path
     core = json.loads(CASES.read_text())
     seed = int(os.environ.get("DMI_BLACKBOX_SEED", "20260812"))
     generated_count = int(os.environ.get("DMI_BLACKBOX_GENERATED_CASES", "6"))
     core["name"] = f"{core['name']}+generated"
     core["seed"] = seed
     core["prompts"].extend(generate_prompts(seed=seed, count=generated_count))
-    cases = tmp_path / "cases.json"
+    cases = run_dir / "cases.json"
     cases.write_text(json.dumps(core, indent=2, ensure_ascii=False) + "\n")
 
     baseline = _run(
         "baseline",
-        tmp_path / "baseline.json",
+        run_dir / "baseline.json",
         cases=cases,
         cudagraph=cudagraph,
     )
     monitored = _run(
         "monitored",
-        tmp_path / "monitored.json",
+        run_dir / "monitored.json",
         cases=cases,
         cudagraph=cudagraph,
     )
