@@ -9,7 +9,7 @@ H100 evidence required before a model is called supported.
 | Order | Checkpoint | Architecture | vLLM implementation | DMI tier | Status |
 | ---: | --- | --- | --- | --- | --- |
 | 1 | `openai/gpt-oss-20b` | `GptOssForCausalLM` | `gpt_oss:GptOssForCausalLM` | full text decoder | lite implemented; H100 pending |
-| 2 | `Qwen/Qwen3-30B-A3B` | `Qwen3MoeForCausalLM` | `qwen3_moe:Qwen3MoeForCausalLM` | full text decoder | queued |
+| 2 | `Qwen/Qwen3-30B-A3B` | `Qwen3MoeForCausalLM` | `qwen3_moe:Qwen3MoeForCausalLM` | full text decoder | lite implemented; H100 pending |
 | 3 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | `Llama4ForConditionalGeneration` | `mllama4:Llama4ForConditionalGeneration` | multimodal decoder | queued |
 | 4 | `Qwen/Qwen3.6-27B` | `Qwen3_5ForConditionalGeneration` | `qwen3_5:Qwen3_5ForConditionalGeneration` | multimodal decoder | queued |
 | 5 | `zai-org/GLM-5.2` | `GlmMoeDsaForCausalLM` | `deepseek_v2:GlmMoeDsaForCausalLM` | full text decoder | queued |

@@ -178,6 +178,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_falcon_h1_p_contract.py",
             "tests/test_granite_p_contract.py",
             "tests/test_gpt_oss_p_contract.py",
+            "tests/test_qwen3_moe_p_contract.py",
             "tests/test_jamba_p_contract.py",
             "tests/test_lfm2_p_contract.py",
             "tests/test_olmo3_p_contract.py",
@@ -467,6 +468,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             )
 
     gpt_oss_revision = "6cee5e81ee83917806bbde320786a8fb61efebee"
+    qwen3_moe_revision = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
     sota = [
         _blackbox_case(
             "gpt_oss",
@@ -475,7 +477,15 @@ def build_cases(phase: str) -> list[MatrixCase]:
             memory_utilization=0.5,
             max_model_len=128,
             revision=gpt_oss_revision,
-        )
+        ),
+        _blackbox_case(
+            "qwen3_moe",
+            "Qwen/Qwen3-30B-A3B",
+            tp_size=1,
+            memory_utilization=0.9,
+            max_model_len=128,
+            revision=qwen3_moe_revision,
+        ),
     ]
     for mode in ("eager", "cudagraph"):
         sota.append(
@@ -489,6 +499,19 @@ def build_cases(phase: str) -> list[MatrixCase]:
                 memory_utilization=0.5,
                 ring_mb=2048,
                 revision=gpt_oss_revision,
+            )
+        )
+        sota.append(
+            _storage_case(
+                "qwen3_moe",
+                "Qwen/Qwen3-30B-A3B",
+                mode,
+                1,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.9,
+                ring_mb=2048,
+                revision=qwen3_moe_revision,
             )
         )
 
