@@ -18,6 +18,9 @@ from monitoring.ring_transport import HOOK_TYPE_TO_SHORT_NAME, HookSpec
 
 
 _COMPARE_MODEL_VARIANTS = {
+    "Gemma3CompareForCausalLM": (
+        "gemma3_compare:Gemma3CompareForCausalLM"
+    ),
     "GPT2CompareForCausalLM": "gpt2_compare:GPT2CompareForCausalLM",
     "Qwen2MoeCompareForCausalLM": (
         "qwen2_moe_compare:Qwen2MoeCompareForCausalLM"
@@ -48,6 +51,7 @@ _register_compare_model_variants()
 
 
 _ARCH_REMAP = {
+    "Gemma3ForCausalLM": "Gemma3CompareForCausalLM",
     "GPT2LMHeadModel": "GPT2CompareForCausalLM",
     "Qwen2MoeForCausalLM": "Qwen2MoeCompareForCausalLM",
     "Qwen3ForCausalLM": "Qwen3CompareForCausalLM",

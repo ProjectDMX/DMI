@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 MODEL_ALIASES = {
+    "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",
     "qwen2": "Qwen/Qwen2.5-0.5B-Instruct",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
@@ -31,6 +32,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("baseline", "monitored"), required=True)
     parser.add_argument("--model", default="qwen2")
+    parser.add_argument("--model-subfolder")
     parser.add_argument(
         "--cases",
         type=Path,
@@ -177,6 +179,9 @@ def main() -> None:
     from vllm import LLM, SamplingParams
 
     model_id = MODEL_ALIASES.get(args.model, args.model)
+    from tests.model_artifacts import resolve_model_artifact
+
+    model_id = resolve_model_artifact(model_id, args.model_subfolder)
     kwargs = {
         "model": model_id,
         "dtype": "bfloat16",

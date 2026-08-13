@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "name": "Gemma3ForCausalLM-6-layer-full-hook-storage",
+  "checkpoint": "shibatch/tinygemma3-2m",
+  "checkpoint_subfolder": "hf",
+  "expected_request_count": 2,
+  "num_layers": 6,
+  "hooks": [
+    {"act_name": "token_ids", "layers": [-1], "dtype": "torch.int", "shape_tail": []},
+    {"act_name": "hook_embed", "layers": [-1], "dtype": "torch.bfloat16", "shape_tail": [128]},
+    {"act_name": "hook_resid_final", "layers": [-1], "dtype": "torch.bfloat16", "shape_tail": [128]},
+    {"act_name": "hook_final_ln", "layers": [-1], "dtype": "torch.bfloat16", "shape_tail": [128]},
+    {"act_name": "final_logits", "layers": [-1], "dtype": "torch.bfloat16", "shape_tail": [1024], "coverage": "decisions"},
+    {"act_name": "blocks.hook_resid_pre", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [128]},
+    {"act_name": "blocks.hook_ln1", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [128]},
+    {"act_name": "blocks.attn.hook_q", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [4, 32]},
+    {"act_name": "blocks.attn.hook_k", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [1, 32]},
+    {"act_name": "blocks.attn.hook_v", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [1, 32]},
+    {"act_name": "blocks.attn.hook_z", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [128]},
+    {"act_name": "blocks.hook_attn_out", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [128]},
+    {"act_name": "blocks.hook_resid_mid", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [128]},
+    {"act_name": "blocks.hook_ln2", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [128]},
+    {"act_name": "blocks.hook_mlp_in", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [128]},
+    {"act_name": "blocks.hook_mlp_post", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [512]},
+    {"act_name": "blocks.hook_mlp_out", "layers": "all", "dtype": "torch.bfloat16", "shape_tail": [128]}
+  ]
+}

@@ -17,6 +17,7 @@ import torch
 
 
 _MODEL_ALIASES = {
+    "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",
     "qwen2": "Qwen/Qwen2.5-0.5B-Instruct",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
@@ -34,6 +35,12 @@ def main():
 
     model_key = os.environ.get("E2E_MODEL", "gpt2")
     checkpoint_model_id = _MODEL_ALIASES.get(model_key, model_key)
+    from tests.model_artifacts import resolve_model_artifact
+
+    checkpoint_model_id = resolve_model_artifact(
+        checkpoint_model_id,
+        os.environ.get("E2E_MODEL_SUBFOLDER"),
+    )
     capture_model_id = os.environ.get(
         "E2E_DMX_MODEL_ID",
         f"vllm-e2e::{model_key}::{uuid.uuid4().hex}",

@@ -51,6 +51,33 @@ DMI_BLACKBOX_MODEL=qwen2_moe DMI_BLACKBOX_TP_SIZE=2 \
   CUDA_VISIBLE_DEVICES=0,1 pytest -q -s tests/test_vllm_blackbox.py
 ```
 
+Tiny fixtures whose context window is below the default 512-token test budget
+can set `DMI_BLACKBOX_MAX_MODEL_LEN` to the exact smaller runtime limit.
+Repositories that keep a loadable model below their root can additionally set
+`DMI_BLACKBOX_MODEL_SUBFOLDER`; the runner resolves the current cached snapshot
+without storing a machine-specific snapshot hash.
+
+The Gemma 3 expansion cell is reproducible as:
+
+```bash
+DMI_BLACKBOX_MODEL=gemma3 DMI_BLACKBOX_MODEL_SUBFOLDER=hf \
+  DMI_BLACKBOX_MAX_MODEL_LEN=128 DMI_BLACKBOX_CUDAGRAPH=1 \
+  CUDA_VISIBLE_DEVICES=0 pytest -q -s tests/test_vllm_blackbox.py
+
+E2E_GPUS=0 E2E_MODEL_SUBFOLDER=hf E2E_MAX_MODEL_LEN=128 \
+  E2E_MAX_NUM_BATCHED_TOKENS=128 \
+  bash tests/tools/run_tp_compare_vllm.sh gemma3 cudagraph 1
+```
+
+For a completed full-hook capture, validate completeness independently of the
+model implementation:
+
+```bash
+python tests/tools/check_vllm_storage.py \
+  --contract tests/fixtures/vllm/gemma3_2m_storage_contract.json \
+  --model-id <unique-capture-id>
+```
+
 Set `DMI_BLACKBOX_ARTIFACT_DIR` to retain each mode's generated cases and raw
 baseline/monitored JSON instead of relying on pytest's temporary directory.
 

@@ -70,11 +70,33 @@ def test_all_matrix_covers_existing_architectures_and_storage_modes():
     case_ids = {case.case_id for case in cases}
 
     assert "focused-cpu-contracts" in case_ids
-    for model in ("gpt2", "qwen2", "qwen3", "llama", "qwen2_moe"):
+    for model in (
+        "gemma3",
+        "gpt2",
+        "qwen2",
+        "qwen3",
+        "llama",
+        "qwen2_moe",
+    ):
         assert any(case_id.startswith(f"public-{model}-") for case_id in case_ids)
     for model in ("gpt2", "qwen3", "llama", "qwen2_moe"):
         assert f"storage-{model}-eager-tp2" in case_ids
         assert f"storage-{model}-cudagraph-tp2" in case_ids
+    assert "storage-gemma3-eager-tp1" in case_ids
+    assert "storage-gemma3-cudagraph-tp1" in case_ids
+
+
+def test_gemma3_matrix_resolves_the_fixture_subfolder() -> None:
+    cases = {case.case_id: case for case in build_cases("all")}
+
+    public = cases["public-gemma3-tp1-eager-graph"]
+    assert public.model_id == "shibatch/tinygemma3-2m"
+    assert public.environment["DMI_BLACKBOX_MODEL_SUBFOLDER"] == "hf"
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "128"
+
+    storage = cases["storage-gemma3-cudagraph-tp1"]
+    assert storage.environment["E2E_MODEL_SUBFOLDER"] == "hf"
+    assert storage.environment["E2E_MAX_MODEL_LEN"] == "128"
 
 
 def test_static_only_models_use_bounded_two_gpu_storage_cells():

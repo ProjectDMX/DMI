@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = PROJECT_ROOT / "tests/tools/smoke_vllm_model.py"
 CASES = PROJECT_ROOT / "tests/blackbox/cases/transparency.json"
 MODEL_ALIASES = {
+    "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",
     "qwen2": "Qwen/Qwen2.5-0.5B-Instruct",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
@@ -45,6 +46,8 @@ TP_SIZE = int(os.environ.get("DMI_BLACKBOX_TP_SIZE", "1"))
 GPU_MEMORY_UTILIZATION = os.environ.get(
     "DMI_BLACKBOX_GPU_MEMORY_UTILIZATION", "0.4"
 )
+MAX_MODEL_LEN = os.environ.get("DMI_BLACKBOX_MAX_MODEL_LEN", "512")
+MODEL_SUBFOLDER = os.environ.get("DMI_BLACKBOX_MODEL_SUBFOLDER")
 
 pytestmark = [
     pytest.mark.gpu,
@@ -78,9 +81,13 @@ def _run(
         str(TP_SIZE),
         "--gpu-memory-utilization",
         GPU_MEMORY_UTILIZATION,
+        "--max-model-len",
+        MAX_MODEL_LEN,
     ]
     if cudagraph:
         command.append("--cudagraph")
+    if MODEL_SUBFOLDER:
+        command.extend(["--model-subfolder", MODEL_SUBFOLDER])
     command.extend(
         [
             "--decision-logprobs",

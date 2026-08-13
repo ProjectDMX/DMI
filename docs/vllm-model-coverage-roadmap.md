@@ -78,6 +78,14 @@ adding only Llama-like aliases.
 | 10 | `baidu/ERNIE-4.5-0.3B-PT` | 22,897 | `Ernie4_5ForCausalLM` | `ernie45:Ernie4_5ForCausalLM` | modified Llama subclass |
 | 11 | `openbmb/MiniCPM4.1-8B` | 48,765 | `MiniCPMForCausalLM` | `minicpm:MiniCPMForCausalLM` | dense, remote-code/version constraints |
 
+Current expansion status: Gemma 3 is `experimental` for the TP1 V1 offline
+eager/default-graph cells at integration commit `b71a55ae4227`. The
+[`Gemma 3 audit`](vllm-0.27.1-gemma3-audit.md) records strict public parity,
+complete hook storage, and byte-identical eager/graph transport on a six-layer
+tiny fixture. The official `google/gemma-3-1b-it` checkpoint was gated for the
+available account, so the real-checkpoint completion gate remains open and the
+row is not yet `supported`.
+
 For each row, use an upstream tiny/random fixture for fast focused tests when
 available, then require one real-checkpoint baseline/monitored run before moving
 beyond `static-only`.

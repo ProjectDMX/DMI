@@ -1,5 +1,9 @@
 """CPU-only compatibility checks for supported vLLM worker APIs."""
 
+import json
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +41,10 @@ def test_qwen2_uses_its_hooked_variant():
     assert _ARCH_REMAP["Qwen2ForCausalLM"] == "Qwen2PForCausalLM"
 
 
+def test_gemma3_uses_its_hooked_variant():
+    assert _ARCH_REMAP["Gemma3ForCausalLM"] == "Gemma3PForCausalLM"
+
+
 def test_bundled_variants_are_registered_with_official_vllm():
     supported = set(ModelRegistry.get_supported_archs())
 
@@ -45,6 +53,38 @@ def test_bundled_variants_are_registered_with_official_vllm():
         model_cls = ModelRegistry._try_load_model_cls(architecture)
         assert model_cls is not None
         assert model_cls.__name__ == architecture
+
+
+def test_gemma3_registration_is_lazy_and_cuda_safe_in_parent_process():
+    project_root = Path(__file__).resolve().parents[1]
+    code = """
+import json
+import sys
+import torch
+import integration.vllm_adapter as adapter
+from vllm.model_executor.models import ModelRegistry
+print(json.dumps({
+    "cuda_initialized": torch.cuda.is_initialized(),
+    "gemma_module_loaded": (
+        "vllm.model_executor.models.gemma3_p" in sys.modules
+    ),
+    "registered": "Gemma3PForCausalLM" in ModelRegistry.get_supported_archs(),
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload == {
+        "cuda_initialized": False,
+        "gemma_module_loaded": False,
+        "registered": True,
+    }
 
 
 def test_compare_variants_are_lazily_registered_with_official_vllm():

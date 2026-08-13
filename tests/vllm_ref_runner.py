@@ -17,6 +17,7 @@ import torch
 
 
 _MODEL_ALIASES = {
+    "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
@@ -33,6 +34,12 @@ def main():
 
     model_key = os.environ.get("E2E_MODEL", "gpt2")
     model_id = _MODEL_ALIASES.get(model_key, model_key)
+    from tests.model_artifacts import resolve_model_artifact
+
+    model_id = resolve_model_artifact(
+        model_id,
+        os.environ.get("E2E_MODEL_SUBFOLDER"),
+    )
     num_prompts = int(os.environ.get("E2E_NUM_PROMPTS", "8"))
     max_new_tokens = int(os.environ.get("E2E_MAX_NEW_TOKENS", "20"))
     enforce_eager = os.environ.get("E2E_ENFORCE_EAGER", "1") == "1"

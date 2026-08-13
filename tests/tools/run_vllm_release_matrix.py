@@ -75,7 +75,20 @@ def _blackbox_case(
     *,
     tp_size: int,
     memory_utilization: float,
+    model_subfolder: str | None = None,
+    max_model_len: int = 512,
 ) -> MatrixCase:
+    environment = {
+        "DMI_BLACKBOX_MODEL": model_key,
+        "DMI_BLACKBOX_TP_SIZE": str(tp_size),
+        "DMI_BLACKBOX_GPU_MEMORY_UTILIZATION": str(memory_utilization),
+        "DMI_BLACKBOX_CUDAGRAPH": "1",
+        "DMI_BLACKBOX_SEED": "20260812",
+        "DMI_BLACKBOX_GENERATED_CASES": "6",
+        "DMI_BLACKBOX_MAX_MODEL_LEN": str(max_model_len),
+    }
+    if model_subfolder:
+        environment["DMI_BLACKBOX_MODEL_SUBFOLDER"] = model_subfolder
     return MatrixCase(
         case_id=f"public-{model_key}-tp{tp_size}-eager-graph",
         command=(
@@ -86,14 +99,7 @@ def _blackbox_case(
             "-s",
             "tests/test_vllm_blackbox.py",
         ),
-        environment={
-            "DMI_BLACKBOX_MODEL": model_key,
-            "DMI_BLACKBOX_TP_SIZE": str(tp_size),
-            "DMI_BLACKBOX_GPU_MEMORY_UTILIZATION": str(memory_utilization),
-            "DMI_BLACKBOX_CUDAGRAPH": "1",
-            "DMI_BLACKBOX_SEED": "20260812",
-            "DMI_BLACKBOX_GENERATED_CASES": "6",
-        },
+        environment=environment,
         gpu_count=tp_size,
         model_id=model_id,
         phase="public",
@@ -108,7 +114,20 @@ def _storage_case(
     *,
     hook_selection: str = "vllm-full",
     ref_max_len: int = 8192,
+    model_subfolder: str | None = None,
+    max_model_len: int = 512,
 ) -> MatrixCase:
+    environment = {
+        "DMX_HOOK_SELECTION": hook_selection,
+        "E2E_REF_MAX_LEN": str(ref_max_len),
+        "E2E_RING_PAYLOAD_MB": "512",
+        "E2E_RING_PINNED_MB": "512",
+        "E2E_GPU_MEM_UTIL": "0.85" if tp_size == 2 else "0.6",
+        "E2E_MAX_MODEL_LEN": str(max_model_len),
+        "E2E_MAX_NUM_BATCHED_TOKENS": str(max_model_len),
+    }
+    if model_subfolder:
+        environment["E2E_MODEL_SUBFOLDER"] = model_subfolder
     return MatrixCase(
         case_id=f"storage-{model_key}-{mode}-tp{tp_size}",
         command=(
@@ -118,13 +137,7 @@ def _storage_case(
             mode,
             str(tp_size),
         ),
-        environment={
-            "DMX_HOOK_SELECTION": hook_selection,
-            "E2E_REF_MAX_LEN": str(ref_max_len),
-            "E2E_RING_PAYLOAD_MB": "512",
-            "E2E_RING_PINNED_MB": "512",
-            "E2E_GPU_MEM_UTIL": "0.85" if tp_size == 2 else "0.6",
-        },
+        environment=environment,
         gpu_count=tp_size,
         model_id=model_id,
         phase="storage",
@@ -141,6 +154,9 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "-q",
             "tests/test_vllm_version_compat.py",
             "tests/test_vllm_027_model_contracts.py",
+            "tests/test_gemma3_p_inventory.py",
+            "tests/test_model_artifacts.py",
+            "tests/test_vllm_storage_contracts.py",
             "tests/test_qwen2_p_inventory.py",
             "tests/test_vllm_blackbox_contract.py",
             "tests/test_vllm_comparator_contract.py",
@@ -156,6 +172,14 @@ def build_cases(phase: str) -> list[MatrixCase]:
         environment={},
     )
     public = [
+        _blackbox_case(
+            "gemma3",
+            "shibatch/tinygemma3-2m",
+            tp_size=1,
+            memory_utilization=0.2,
+            model_subfolder="hf",
+            max_model_len=128,
+        ),
         _blackbox_case("gpt2", "gpt2", tp_size=1, memory_utilization=0.5),
         _blackbox_case(
             "qwen2",
@@ -180,6 +204,18 @@ def build_cases(phase: str) -> list[MatrixCase]:
         ),
     ]
     storage: list[MatrixCase] = []
+    for mode in ("eager", "cudagraph"):
+        storage.append(
+            _storage_case(
+                "gemma3",
+                "shibatch/tinygemma3-2m",
+                mode,
+                1,
+                ref_max_len=128,
+                model_subfolder="hf",
+                max_model_len=128,
+            )
+        )
     for model_key, model_id in (
         ("gpt2", "gpt2"),
         ("qwen3", "Qwen/Qwen3-0.6B"),
