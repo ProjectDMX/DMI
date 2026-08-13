@@ -392,6 +392,18 @@ def _pytest_summary(path: Path) -> dict[str, int]:
     }
 
 
+_FATAL_RUNTIME_LOG_MARKERS = (
+    "WorkerProc hit an exception.",
+    "EngineCore failed to start.",
+)
+
+
+def _fatal_runtime_log_markers(output: str) -> tuple[str, ...]:
+    """Return runtime failures that must invalidate a zero process exit code."""
+
+    return tuple(marker for marker in _FATAL_RUNTIME_LOG_MARKERS if marker in output)
+
+
 def main() -> None:
     args = _parse_args()
     try:
@@ -511,6 +523,7 @@ def main() -> None:
             )
             command.append(f"--junitxml={junit_path}")
         started = time.monotonic()
+        fatal_markers: tuple[str, ...] = ()
         try:
             completed = run_process_group(
                 command,
@@ -521,6 +534,9 @@ def main() -> None:
             output = completed.stdout + completed.stderr
             returncode = completed.returncode
             status = "passed" if returncode == 0 else "failed"
+            fatal_markers = _fatal_runtime_log_markers(output)
+            if status == "passed" and fatal_markers:
+                status = "failed-runtime-log"
         except subprocess.TimeoutExpired as error:
             output = (error.stdout or "") + (error.stderr or "")
             returncode = None
@@ -545,6 +561,7 @@ def main() -> None:
             returncode=returncode,
             executed_command=command,
             pytest_summary=pytest_summary,
+            fatal_runtime_log_markers=list(fatal_markers),
             duration_s=round(time.monotonic() - started, 3),
             log=str(log_path),
             finished_at=datetime.now(timezone.utc).isoformat(),
@@ -563,7 +580,7 @@ def main() -> None:
         result["status"] == "passed" for result in manifest["results"]
     )
     manifest["failed"] = sum(
-        result["status"] in {"failed", "timeout"}
+        result["status"] in {"failed", "failed-runtime-log", "timeout"}
         for result in manifest["results"]
     )
     manifest["blocked"] = sum(

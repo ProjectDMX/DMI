@@ -73,7 +73,7 @@ from monitoring.selection import (
     hook_belongs_to_tp_rank,
     select_hook_specs,
 )
-from tests.compare_worker import CompareWorker
+from tests.compare_worker import CompareWorker, _filter_ref_buffers
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -264,7 +264,14 @@ def test_compare_worker_saves_committed_real_layout(
         _current_dim0_offsets=[0],
         _current_flattened=True,
     )
-    adaptor = SimpleNamespace(transport=transport, _step_counter=4)
+    adaptor = SimpleNamespace(
+        transport=transport,
+        _step_counter=4,
+        active_specs=(
+            SimpleNamespace(hook_type=HOOK_TYPE_RESID_PRE),
+            SimpleNamespace(hook_type=HOOK_TYPE_FINAL_LOGITS),
+        ),
+    )
     buffers = {
         "resid_pre_L0": torch.tensor(
             [[100], [101], [102], [200], [201]],
@@ -334,6 +341,43 @@ def test_compare_worker_saves_committed_real_layout(
         ),
         buffers["final_logits"][1:2],
     )
+
+
+def test_compare_worker_filters_reference_to_active_hook_contract():
+    buffers = {
+        "resid_pre_L0": torch.zeros(1),
+        "resid_pre_L1": torch.zeros(1),
+        "q_L0": torch.zeros(1),
+        "final_logits": torch.zeros(1),
+    }
+    active_specs = (
+        SimpleNamespace(hook_type=HOOK_TYPE_RESID_PRE),
+        SimpleNamespace(hook_type=HOOK_TYPE_FINAL_LOGITS),
+    )
+
+    filtered = _filter_ref_buffers(buffers, active_specs)
+
+    assert set(filtered) == {
+        "resid_pre_L0",
+        "resid_pre_L1",
+        "final_logits",
+    }
+
+
+def test_compare_worker_rejects_missing_active_hook_reference():
+    active_specs = (SimpleNamespace(hook_type=HOOK_TYPE_FINAL_LOGITS),)
+
+    with pytest.raises(RuntimeError, match="no reference buffers"):
+        _filter_ref_buffers({"resid_pre_L0": torch.zeros(1)}, active_specs)
+
+
+def test_compare_worker_allows_empty_rank_local_hook_contract():
+    filtered = _filter_ref_buffers(
+        {"resid_pre_L0": torch.zeros(1)},
+        (),
+    )
+
+    assert filtered == {}
 
 
 @pytest.mark.parametrize(

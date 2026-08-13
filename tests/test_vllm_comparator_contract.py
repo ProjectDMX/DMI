@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.compare_disk_vs_ch import read_clickhouse
+from tests.compare_disk_vs_ch import compare, read_clickhouse
 from tests.vllm_identical_comparator import bitwise_check, compare_logprobs
 
 
@@ -106,3 +106,55 @@ def test_clickhouse_reader_filters_to_one_capture(monkeypatch):
     assert count == 0
     assert "WHERE model_id = %(model_id)s" in calls[0][0]
     assert calls[0][1] == {"model_id": "capture-123"}
+
+
+def _storage_key(*, start: int = 0, end: int = 1, act: str = "blocks.hook_resid_pre"):
+    return ("request", act, 0, 0, start, end)
+
+
+def _write_storage_reference(tmp_path, tensor: torch.Tensor) -> None:
+    request_dir = tmp_path / "request"
+    request_dir.mkdir()
+    torch.save(tensor, request_dir / "resid_pre_L0_T0_1.pt")
+
+
+def test_storage_comparison_rejects_same_value_at_wrong_token_range(tmp_path):
+    reference = torch.tensor([[1.0]])
+    _write_storage_reference(tmp_path, reference)
+
+    passed, failed = compare(
+        str(tmp_path),
+        {_storage_key(start=1, end=2): reference},
+        1,
+    )
+
+    assert passed == 0
+    assert failed > 0
+
+
+def test_storage_comparison_rejects_unexpected_hook_keys(tmp_path):
+    reference = torch.tensor([[1.0]])
+    _write_storage_reference(tmp_path, reference)
+    storage = {
+        _storage_key(): reference,
+        _storage_key(act="blocks.attn.hook_q"): reference,
+    }
+
+    passed, failed = compare(str(tmp_path), storage, 2)
+
+    assert passed == 1
+    assert failed == 1
+
+
+def test_storage_comparison_rejects_duplicate_row_keys(tmp_path):
+    reference = torch.tensor([[1.0]])
+    _write_storage_reference(tmp_path, reference)
+
+    passed, failed = compare(
+        str(tmp_path),
+        {_storage_key(): reference},
+        2,
+    )
+
+    assert passed == 1
+    assert failed == 1

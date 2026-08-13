@@ -8,11 +8,13 @@ writes to ClickHouse. Compare disk vs ClickHouse for transport correctness.
 import json
 import os
 import re
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
 
 from integration.vllm_adapter import DMXGPUWorker
+from monitoring.ring_transport import HOOK_TYPE_TO_SHORT_NAME, HookSpec
 
 
 _COMPARE_MODEL_VARIANTS = {
@@ -54,6 +56,57 @@ _ARCH_REMAP = {
 
 # Hook names that are TP-sharded
 _TP_SHARDED_HOOKS = {"q", "k", "v", "z", "mlp_post"}
+
+_LAYER_BUFFER_SUFFIX = re.compile(r"_L\d+$")
+
+
+def _buffer_hook_name(buffer_name: str) -> str:
+    """Return the canonical hook short name for one compare buffer."""
+
+    return _LAYER_BUFFER_SUFFIX.sub("", buffer_name)
+
+
+def _filter_ref_buffers(
+    buffers: Mapping[str, torch.Tensor],
+    active_specs: Iterable[HookSpec],
+) -> dict[str, torch.Tensor]:
+    """Keep exactly the buffers promised by the active DMI hook contract.
+
+    Compare models allocate copies for every hook they can expose.  A matrix
+    cell may intentionally select a smaller set, so the reference oracle must
+    be derived from the adapter's bound ``active_specs`` rather than from that
+    larger capability inventory.
+    """
+
+    selected_names: set[str] = set()
+    for spec in active_specs:
+        try:
+            selected_names.add(HOOK_TYPE_TO_SHORT_NAME[spec.hook_type])
+        except KeyError as exc:
+            raise RuntimeError(
+                f"CompareWorker received unknown active hook type {spec.hook_type}"
+            ) from exc
+
+    available_names = {_buffer_hook_name(name) for name in buffers}
+    unknown_names = available_names - set(HOOK_TYPE_TO_SHORT_NAME.values())
+    if unknown_names:
+        raise RuntimeError(
+            "CompareWorker received non-canonical reference buffers: "
+            f"{sorted(unknown_names)}"
+        )
+
+    missing_names = selected_names - available_names
+    if missing_names:
+        raise RuntimeError(
+            "CompareWorker has no reference buffers for active hooks: "
+            f"{sorted(missing_names)}"
+        )
+
+    return {
+        name: buffer
+        for name, buffer in buffers.items()
+        if _buffer_hook_name(name) in selected_names
+    }
 
 
 class CompareWorker(DMXGPUWorker):
@@ -163,6 +216,14 @@ class CompareWorker(DMXGPUWorker):
 
         bufs = model.get_ref_buffers()
         if not bufs:
+            return
+        adaptor = self.adaptor
+        if adaptor is None:
+            raise RuntimeError("CompareWorker requires an active DMI adapter")
+        bufs = _filter_ref_buffers(bufs, adaptor.active_specs)
+        if not bufs:
+            # A TP/PP rank can legitimately own no hooks after placement
+            # filtering (for example rank 1 with an unsharded-only selection).
             return
 
         _suffix_re = re.compile(r"-[0-9a-f]{8}$")

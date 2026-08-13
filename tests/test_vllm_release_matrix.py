@@ -11,6 +11,7 @@ import pytest
 from tests.tools.run_vllm_release_matrix import (
     MatrixCase,
     _case_environment,
+    _fatal_runtime_log_markers,
     _pytest_summary,
     _resume_manifest,
     _selected_gpus,
@@ -72,6 +73,15 @@ def test_storage_wrapper_uses_the_pinned_matrix_python():
     wrapper = Path("tests/tools/run_tp_compare_vllm.sh").read_text()
 
     assert '"${DMI_MATRIX_PYTHON:-python}" -m tests.vllm_compare_runner' in wrapper
+
+
+def test_release_matrix_rejects_worker_errors_despite_zero_exit_code():
+    output = "generation completed\nWorkerProc hit an exception.\n"
+
+    assert _fatal_runtime_log_markers(output) == (
+        "WorkerProc hit an exception.",
+    )
+    assert _fatal_runtime_log_markers("generation completed\n") == ()
 
 
 def test_pytest_summary_retains_skipped_prerequisites(tmp_path: Path):
