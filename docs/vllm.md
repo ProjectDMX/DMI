@@ -16,6 +16,11 @@ This branch pins vLLM 0.27.1. The exact upstream base is
 gitlink is the authoritative DMI/vLLM commit pair. Older ports remain on their
 versioned branches rather than being overwritten by this branch.
 
+The release matrix verified DMI root `ed43791eedac99c6fb18e24af8253e780bd56a54`
+with that integration commit: 18/18 cells passed, including 219 focused tests,
+10 public eager/graph tests, and 395,896/395,896 bitwise-equal ClickHouse rows.
+The exact topology and exclusions are recorded in the compatibility audit.
+
 The adapter uses vLLM's public out-of-tree model registry, so the bundled
 monitored model classes also work with the matching official vLLM 0.27.1 wheel
 without installing the whole submodule as an editable package.
@@ -35,9 +40,10 @@ monitoring.
 ## Model architecture coverage
 
 The monitored variants currently exist for GPT-2, Qwen2/Qwen2.5, Qwen3,
-Qwen2-MoE, and Llama. The vLLM 0.27.1 port has focused CPU/API evidence for all
-five variants; accelerator and storage verdicts are recorded in the 0.27.1
-compatibility audit rather than inferred from import success. Architectures
+Qwen2-MoE, and Llama. The vLLM 0.27.1 port has focused, public API, accelerator,
+and scoped storage evidence for all five variants; exact topology verdicts are
+recorded in the 0.27.1 compatibility audit rather than inferred from import
+success. Architectures
 that upstream vLLM implements directly with its
 Llama class (Aquila, Cwm, InternLM/InternLM3, IQuestCoder, legacy LLaMA, and
 Xverse) are remapped to the same monitored Llama variant but require separate

@@ -27,5 +27,8 @@ work and regressions.
 | `6f1fce945c54` | `de52ce06a728` | replayed; packed Llama loader remains semantically unchanged |
 | target-only | `fdfe631884ae` | adapted GPT-2 `AutoWeightsLoader`, Qwen2 dynamic positions, and Qwen3 per-layer sliding window for 0.27.1 |
 
-The resulting versioned integration branch is `dmi-v0.27.1`. No tag is cut
-until the final support matrix and exact root gitlink have been approved.
+The resulting versioned integration branch is `dmi-v0.27.1` at
+`fdfe631884ae318050ce371e472c1135f317cfa2`. The exact root
+`ed43791eedac99c6fb18e24af8253e780bd56a54` passed the final 18-cell support
+matrix. Proposed tag `dmi-v0.27.1-r1` remains uncut until review approves this
+pair.

@@ -10,7 +10,7 @@ versioned discovery snapshot, not a support claim.
 | Snapshot time | 2026-08-13 03:32 UTC |
 | Current upstream release | [`v0.27.1`](https://github.com/vllm-project/vllm/releases/tag/v0.27.1) |
 | Target upstream commit | `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
-| Current DMI port under validation | vLLM `v0.27.1` / `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
+| Current DMI supported port | root `ed43791eedac99c6fb18e24af8253e780bd56a54` / integration `fdfe631884ae318050ce371e472c1135f317cfa2` / upstream vLLM `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
 | Registry source | [`v0.27.1` model registry](https://github.com/vllm-project/vllm/blob/v0.27.1/vllm/model_executor/models/registry.py) |
 | Runtime registry evidence | [`vllm-0.27.1-runtime-registry.json`](vllm-0.27.1-runtime-registry.json), official wheel, 41/41 lazy classes resolved |
 | Upstream test exemplars | [`v0.27.1` test registry](https://github.com/vllm-project/vllm/blob/v0.27.1/tests/models/registry.py) |
@@ -52,11 +52,11 @@ row must be re-audited after the worker/runner port to 0.27.1.
 
 | Representative checkpoint | architecture | vLLM 0.27.1 implementation | DMI 0.25.1 evidence | DMI 0.27.1 status |
 | --- | --- | --- | --- | --- |
-| `openai-community/gpt2` | `GPT2LMHeadModel` | `gpt2:GPT2LMHeadModel` | supported, eager+graph+storage | ported; TP1 public and TP1/TP2 storage value cells passed; final W07 matrix pending |
-| `Qwen/Qwen2.5-0.5B-Instruct` | `Qwen2ForCausalLM` | `qwen2:Qwen2ForCausalLM` | supported, eager+graph | ported; TP1 public eager+graph passed; final W07 matrix pending |
-| `Qwen/Qwen1.5-MoE-A2.7B-Chat` | `Qwen2MoeForCausalLM` | `qwen2_moe:Qwen2MoeForCausalLM` | supported, TP2 eager+graph+storage | ported; TP2 public/storage value cells passed; EP excluded and final W07 matrix pending |
-| `Qwen/Qwen3-8B` | `Qwen3ForCausalLM` | `qwen3:Qwen3ForCausalLM` | supported via 0.6B checkpoint, eager+graph+storage | ported; TP1 public and TP1/TP2 storage value cells passed; final W07 matrix pending |
-| `meta-llama/Llama-3.2-1B-Instruct` | `LlamaForCausalLM` | `llama:LlamaForCausalLM` | supported via 3.1-8B checkpoint, TP2 eager+graph+storage | ported; Llama-3.1-8B TP2 public/storage value cells passed; final W07 matrix pending |
+| `openai-community/gpt2` | `GPT2LMHeadModel` | `gpt2:GPT2LMHeadModel` | supported, eager+graph+storage | supported; TP1 public and TP1/TP2 storage value cells passed the final matrix |
+| `Qwen/Qwen2.5-0.5B-Instruct` | `Qwen2ForCausalLM` | `qwen2:Qwen2ForCausalLM` | supported, eager+graph | supported; TP1 public eager+graph passed the final matrix |
+| `Qwen/Qwen1.5-MoE-A2.7B-Chat` | `Qwen2MoeForCausalLM` | `qwen2_moe:Qwen2MoeForCausalLM` | supported, TP2 eager+graph+storage | supported; TP2 public/storage value cells passed; EP remains excluded |
+| `Qwen/Qwen3-8B` | `Qwen3ForCausalLM` | `qwen3:Qwen3ForCausalLM` | supported via 0.6B checkpoint, eager+graph+storage | supported; TP1 public and TP1/TP2 storage value cells passed the final matrix |
+| `meta-llama/Llama-3.2-1B-Instruct` | `LlamaForCausalLM` | `llama:LlamaForCausalLM` | supported via 3.1-8B checkpoint, TP2 eager+graph+storage | supported; Llama-3.1-8B TP2 public/storage value cells passed the final matrix |
 
 ## Phase 1: bounded single-GPU families
 

@@ -1,10 +1,10 @@
 # DMI-vLLM 0.27.1 compatibility audit
 
 This is the agent-authored discovery and validation record for the versioned
-0.27.1 port. It is not a support claim until the accelerator matrix closes all
-claimed cells. Static, ABI, registry, focused CPU, public differential, and
-storage-value gates are complete. A clean-commit matrix rerun remains required
-after the W07 lifecycle adaptation described below.
+0.27.1 port. Static, ABI, registry, focused CPU, public differential,
+storage-value, and lifecycle gates are complete for the exact support cells and
+commit pair below. Unlisted runners, APIs, topologies, and model families do not
+inherit this verdict.
 
 ## Audit header
 
@@ -17,8 +17,9 @@ after the W07 lifecycle adaptation described below.
 | Integration shape | root adapter plus versioned vLLM patch branch and official-wheel lazy registration |
 | Target runtime inspected | official `vllm==0.27.1` PyPI wheel |
 | Target environment | Python 3.12.8, PyTorch 2.13.0+cu130, CUDA build 13.0 |
+| DMI root evidence commit | `ed43791eedac99c6fb18e24af8253e780bd56a54` |
 | DMI target integration | branch `dmi-v0.27.1`, commit `fdfe631884ae318050ce371e472c1135f317cfa2` |
-| Candidate claim | V1 offline API; five existing production variants; eager and supported CUDA-graph cells; topology per matrix only |
+| Verified claim | V1 offline API; five existing production variants; eager and supported CUDA-graph cells; topology per matrix only |
 | Explicitly outside this discovery | V2, serving, async, speculative, quantized, PP/DP/EP/SP, multimodal runtime |
 | Auditor/date | Codex agent / 2026-08-13 UTC |
 
@@ -72,7 +73,7 @@ The changed methods require these semantic verdicts:
 | W03 | `compatible` | `load_model` is AST-identical, including keyword forwarding and model-loader context. |
 | W04 | `change-required` evidence | Warm-up now accounts memory through `total_consumed` and can persist a startup plan before returning. DMI may still clear native null mode after `super()`, but must prove startup-plan replay and graph capture do not publish warm-up rows. |
 | W05 | `compatible` for non-Mamba V1 cells | Worker execution is AST-identical. Runner execution adds only `align_ctx=mamba_bufs.postprocess_align` in the Mamba branch; existing five variants cannot enter it. Hybrid/Mamba families need a separate verdict. |
-| W07 | `change-required`; `adapted-verified` at focused and targeted runtime scope | Worker shutdown is AST-identical, but the public `LLM` object has no close method in 0.27.1. Storage runners now flush DMI explicitly and call the bounded EngineCore shutdown contract. DMI's rank-local teardown could also let TCPStore owner rank 0 exit before a peer NCCL heartbeat stopped; rank 0 now retains a 0.5 s post-worker grace only for distributed cells. Focused tests verify fail-closed EngineCore lookup, bounded shutdown, and rank-specific grace. Full-matrix requalification remains pending. |
+| W07 | `change-required`; `adapted-verified` | Worker shutdown is AST-identical, but the public `LLM` object has no close method in 0.27.1. Storage runners now flush DMI explicitly and call the bounded EngineCore shutdown contract. DMI's rank-local teardown could also let TCPStore owner rank 0 exit before a peer NCCL heartbeat stopped; rank 0 now retains a 0.5 s post-worker grace only for distributed cells. Focused tests verify fail-closed EngineCore lookup, bounded shutdown, and rank-specific grace; the final 18-cell matrix has no frontend force-kill or TCPStore marker. |
 | C01-C06 | `change-required` audit | Config files changed substantially, including model, parallel, compilation, cache, scheduler, speculative, and new fault-tolerance/EC-manager configuration. Every DMI-read field must be re-traced; unchanged method signatures do not approve these fields. |
 | S01-S04, G01-G04, G07-G10 | `compatible` at source level for ordinary V1 | Both DMI patch points are AST-identical. Their enclosing execution path is unchanged for existing dense/MoE non-Mamba cells except unrelated branches. Request-order, actual/padded rows, early PP/SP dispatch, and exactly-once commit must be rerun. |
 | G05-G06 | `blocked` outside initial cell | Async scheduling, PP, SP, fault tolerance, and newer runner branches are not covered by source identity. |
@@ -176,6 +177,25 @@ Targeted W07 validation after the adaptation establishes:
   warning. Frontend force-kills, worker exceptions, and TCPStore races remain
   fatal even when the process exit code is zero.
 
+The final clean-commit matrix at root `ed43791eedac99c6fb18e24af8253e780bd56a54`
+and integration `fdfe631884ae318050ce371e472c1135f317cfa2` passed 18/18
+processes with zero failed or blocked cells:
+
+- 219/219 focused CPU/API tests;
+- five public model cells, each passing eager and CUDA graph (10/10 tests);
+- twelve storage cells with 395,896/395,896 ClickHouse rows bitwise equal;
+- zero fatal runtime-log markers and no residual vLLM process;
+- only the exact-upstream inner-executor warning in the four graph+TP2 storage
+  cells; and
+- three-sample post-run idle checks passing on both physical GPUs.
+
+The support boundary is the tested topology, not every permutation: GPT-2 and
+Qwen3 public TP1 plus storage TP1/TP2; Qwen2 public TP1; and Llama/Qwen2-MoE
+public and storage TP2. All are BF16, V1 offline API, eager or the default
+supported CUDA-graph path. V2, serve/async, PP/DP/EP/SP, quantization,
+speculative decoding, multimodal inputs, and unlisted checkpoints/configuration
+branches remain outside the claim.
+
 The exact patch replay is recorded in
 [`vllm-0.27.1-replay-ledger.md`](vllm-0.27.1-replay-ledger.md). Every prior DMI
 commit has an explicit target commit and semantic disposition; the final target-
@@ -188,8 +208,9 @@ only rewrite is `fdfe631884ae318050ce371e472c1135f317cfa2`.
 3. Boundary inventory/map, target drift adaptations, and focused regressions:
    complete at 219/219.
 4. Separate-process public black-box eager/graph and scoped storage TP1/TP2:
-   value/transparency sweep complete, W07 clean-commit requalification pending.
-5. Only after phase 0 evidence is complete, add roadmap families one contract
-   class at a time. V2 and untested API/topology cells remain explicit.
+   complete at 18/18 with 395,896/395,896 storage rows.
+5. Add roadmap families one contract class at a time. V2 and untested
+   API/topology cells remain explicit.
 
-No integration tag is proposed by this pre-port audit.
+Proposed integration tag: `dmi-v0.27.1-r1` at `fdfe631884ae`. The tag is not
+cut until review approves the exact root/integration pair.
