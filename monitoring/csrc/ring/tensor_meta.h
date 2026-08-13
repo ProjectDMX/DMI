@@ -53,7 +53,9 @@ enum HookType : int {
     HOOK_TYPE_TOPK_WEIGHTS = 23,
     HOOK_TYPE_SSM_IN       = 24,
     HOOK_TYPE_SSM_OUT      = 25,
-    HOOK_TYPE_COUNT        = 26,
+    HOOK_TYPE_CONV_IN      = 26,
+    HOOK_TYPE_CONV_OUT     = 27,
+    HOOK_TYPE_COUNT        = 28,
 };
 
 // Hook group — which sub-block produces this tensor.
@@ -62,6 +64,7 @@ enum HookGroup : int {
     GROUP_MLP = 1,
     GROUP_OTHER = 2,
     GROUP_SSM = 3,
+    GROUP_CONV = 4,
 };
 
 // Shape class — determines the shape formula in _compute_hook_shape:
@@ -123,6 +126,8 @@ static constexpr HookDef HOOK_DEFS[] = {
     {HOOK_TYPE_TOPK_WEIGHTS,"mlp.hook_topk_weights",    "topk_weights", true,  GROUP_OTHER, false, SHAPE_TOPK_WEIGHTS, PP_ANY },
     {HOOK_TYPE_SSM_IN,      "ssm.hook_in",              "ssm_in",       true,  GROUP_SSM,   false, SHAPE_HIDDEN, PP_ANY },
     {HOOK_TYPE_SSM_OUT,     "ssm.hook_out",             "ssm_out",      true,  GROUP_SSM,   false, SHAPE_HIDDEN, PP_ANY },
+    {HOOK_TYPE_CONV_IN,     "conv.hook_in",              "conv_in",      true,  GROUP_CONV,  false, SHAPE_HIDDEN, PP_ANY },
+    {HOOK_TYPE_CONV_OUT,    "conv.hook_out",             "conv_out",     true,  GROUP_CONV,  false, SHAPE_HIDDEN, PP_ANY },
 };
 static constexpr int HOOK_DEFS_COUNT = sizeof(HOOK_DEFS) / sizeof(HOOK_DEFS[0]);
 

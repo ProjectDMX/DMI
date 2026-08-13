@@ -35,9 +35,9 @@ the registry source, but remains upstream-static evidence rather than DMI
 runtime support. Across the 41 representative checkpoints below:
 
 - all 41 resolve in vLLM 0.27.1;
-- 9 architectures have a DMI model remap on the current stacked expansion
+- 10 architectures have a DMI model remap on the current stacked expansion
   branch;
-- 32 are unmapped by DMI;
+- 31 are unmapped by DMI;
 - registry presence is upstream static evidence, not DMI runtime support.
 
 Between vLLM 0.25.1 and 0.27.1, the combined text/multimodal registry adds eight
@@ -110,6 +110,15 @@ the official 0.5B checkpoint, byte-identical eager/graph full-hook transport on
 the official Tiny checkpoint, and the bounded SSM branch capability manifest.
 Internal Mamba state, TP>1, prefix caching, quantization, serving, speculative,
 and non-text variants remain excluded.
+
+LFM2 is `supported` for the bounded TP1 BF16 V1 offline eager/default-graph
+cell at integration commit `229014dd9692`. The
+[`LFM2 audit`](vllm-0.27.1-lfm2-audit.md) records strict public parity on the
+official `LiquidAI/LFM2.5-1.2B-Instruct` checkpoint and byte-identical
+eager/graph full-hook transport on a qualified two-layer hybrid fixture. The
+manifest distinguishes ten production convolution layers from six attention
+layers. Internal convolution/cache state, LFM2-MoE/VL, TP>1, prefix caching,
+quantization, serving, and speculative modes remain excluded.
 
 For each row, use an upstream tiny/random fixture for fast focused tests when
 available, then require one real-checkpoint baseline/monitored run before moving

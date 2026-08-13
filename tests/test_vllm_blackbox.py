@@ -36,6 +36,7 @@ MODEL_ALIASES = {
     "falcon_h1": "tiiuae/Falcon-H1-Tiny-90M-Instruct",
     "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",
+    "lfm2": "tiny-random/lfm2",
     "qwen2": "Qwen/Qwen2.5-0.5B-Instruct",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",

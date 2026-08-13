@@ -61,7 +61,7 @@ HOOK_DEFINITIONS = tuple(_ext.HOOK_DEFS)
 _HOOK_DEFS = HOOK_DEFINITIONS
 
 # C++ enum mirrors -- keep in sync with tensor_meta.h
-GROUP_ATTN, GROUP_MLP, GROUP_OTHER, GROUP_SSM = 0, 1, 2, 3
+GROUP_ATTN, GROUP_MLP, GROUP_OTHER, GROUP_SSM, GROUP_CONV = 0, 1, 2, 3, 4
 SHAPE_HIDDEN, SHAPE_QKV_Q, SHAPE_QKV_KV, SHAPE_QKV_Z = 0, 1, 2, 3
 SHAPE_ATTN_WT, SHAPE_MLP_POST, SHAPE_TOKEN_IDS, SHAPE_LOGITS = 4, 5, 6, 7
 PP_ANY, PP_FIRST, PP_LAST = 0, 1, 2
@@ -100,6 +100,9 @@ _MLP_SUFFIXES: Tuple[str, ...] = tuple(
 )
 _SSM_SUFFIXES: Tuple[str, ...] = tuple(
     _act for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _grp == GROUP_SSM
+)
+_CONV_SUFFIXES: Tuple[str, ...] = tuple(
+    _act for _id, _act, _short, _pl, _grp, _tp, _sc, _pp in _HOOK_DEFS if _grp == GROUP_CONV
 )
 
 # Auto-derive property sets from HOOK_DEFS columns.
