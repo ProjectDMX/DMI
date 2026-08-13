@@ -152,6 +152,7 @@ _ARCH_REMAP = {
     "GraniteForCausalLM": "GranitePForCausalLM",
     "JambaForCausalLM": "JambaPForCausalLM",
     "Lfm2ForCausalLM": "Lfm2PForCausalLM",
+    "Llama4ForConditionalGeneration": "Llama4PForConditionalGeneration",
     "MiniCPMForCausalLM": "MiniCPMPForCausalLM",
     "MistralForCausalLM": "MistralPForCausalLM",
     "Olmo3ForCausalLM": "Olmo3PForCausalLM",
@@ -181,6 +182,9 @@ _DMI_MODEL_VARIANTS = {
     "GranitePForCausalLM": "granite_p:GranitePForCausalLM",
     "JambaPForCausalLM": "jamba_p:JambaPForCausalLM",
     "Lfm2PForCausalLM": "lfm2_p:Lfm2PForCausalLM",
+    "Llama4PForConditionalGeneration": (
+        "mllama4_p:Llama4PForConditionalGeneration"
+    ),
     "MiniCPMPForCausalLM": "minicpm_p:MiniCPMPForCausalLM",
     "Qwen2PForCausalLM": "qwen2_p:Qwen2PForCausalLM",
     "Qwen2MoePForCausalLM": "qwen2_moe_p:Qwen2MoePForCausalLM",
@@ -281,6 +285,7 @@ class _VLLMHookSelection:
         hf_config: Any,
     ) -> "_VLLMHookSelection":
         """Select local and model-wide rank-type hooks once at attachment."""
+        hf_config = getattr(hf_config, "text_config", hf_config)
         tp_size = int(parallel_config.tensor_parallel_size)
         pp_size = int(parallel_config.pipeline_parallel_size)
         if tp_size < 1 or pp_size < 1:
