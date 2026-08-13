@@ -156,6 +156,7 @@ _ARCH_REMAP = {
     "Lfm2ForCausalLM": "Lfm2PForCausalLM",
     "Llama4ForConditionalGeneration": "Llama4PForConditionalGeneration",
     "MiniCPMForCausalLM": "MiniCPMPForCausalLM",
+    "MiniMaxM2ForCausalLM": "MiniMaxM2PForCausalLM",
     "MistralForCausalLM": "MistralPForCausalLM",
     "Olmo3ForCausalLM": "Olmo3PForCausalLM",
     "Phi3ForCausalLM": "Phi3PForCausalLM",
@@ -192,6 +193,7 @@ _DMI_MODEL_VARIANTS = {
         "mllama4_p:Llama4PForConditionalGeneration"
     ),
     "MiniCPMPForCausalLM": "minicpm_p:MiniCPMPForCausalLM",
+    "MiniMaxM2PForCausalLM": "minimax_m2_p:MiniMaxM2PForCausalLM",
     "Qwen2PForCausalLM": "qwen2_p:Qwen2PForCausalLM",
     "Qwen2MoePForCausalLM": "qwen2_moe_p:Qwen2MoePForCausalLM",
     "Qwen3PForCausalLM": "qwen3_p:Qwen3PForCausalLM",

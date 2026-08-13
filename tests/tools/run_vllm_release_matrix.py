@@ -203,6 +203,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_model_artifacts.py",
             "tests/test_mistral_p_contract.py",
             "tests/test_minicpm_p_contract.py",
+            "tests/test_minimax_m2_p_contract.py",
             "tests/test_phi3_p_contract.py",
             "tests/test_vllm_storage_contracts.py",
             "tests/test_qwen2_p_inventory.py",
@@ -486,6 +487,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
     gpt_oss_revision = "6cee5e81ee83917806bbde320786a8fb61efebee"
     glm52_revision = "b4734de4facf877f85769a911abafc5283eab3d9"
     llama4_scout_revision = "c2b440bc2b8c784ad310291d035b8550a771f24f"
+    minimax_m27_revision = "d494266a4affc0d2995ba1fa35c8481cbd84294b"
     qwen3_moe_revision = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
     qwen36_revision = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
     sota = [
@@ -514,6 +516,15 @@ def build_cases(phase: str) -> list[MatrixCase]:
             max_model_len=128,
             revision=llama4_scout_revision,
             multimodal_image=True,
+            generated_cases=2,
+        ),
+        _blackbox_case(
+            "minimax_m27",
+            "MiniMaxAI/MiniMax-M2.7",
+            tp_size=4,
+            memory_utilization=0.9,
+            max_model_len=128,
+            revision=minimax_m27_revision,
             generated_cases=2,
         ),
         _blackbox_case(
@@ -550,6 +561,19 @@ def build_cases(phase: str) -> list[MatrixCase]:
                 memory_utilization=0.88,
                 ring_mb=2048,
                 revision=llama4_scout_revision,
+            )
+        )
+        sota.append(
+            _storage_case(
+                "minimax_m27",
+                "MiniMaxAI/MiniMax-M2.7",
+                mode,
+                4,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.9,
+                ring_mb=2048,
+                revision=minimax_m27_revision,
             )
         )
         sota.append(

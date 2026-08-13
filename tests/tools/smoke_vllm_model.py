@@ -38,6 +38,7 @@ MODEL_ALIASES = {
     "llama": "meta-llama/Llama-3.1-8B-Instruct",
     "mistral": "openaccess-ai-collective/tiny-mistral",
     "minicpm4": "openbmb/MiniCPM4.1-8B",
+    "minimax_m27": "MiniMaxAI/MiniMax-M2.7",
     "olmo3": "allenai/Olmo-3-7B-Instruct",
     "phi3": "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM",
 }

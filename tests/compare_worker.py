@@ -52,6 +52,9 @@ _COMPARE_MODEL_VARIANTS = {
     "MiniCPMCompareForCausalLM": (
         "minicpm_compare:MiniCPMCompareForCausalLM"
     ),
+    "MiniMaxM2CompareForCausalLM": (
+        "minimax_m2_compare:MiniMaxM2CompareForCausalLM"
+    ),
     "Qwen2MoeCompareForCausalLM": (
         "qwen2_moe_compare:Qwen2MoeCompareForCausalLM"
     ),
@@ -108,6 +111,7 @@ _ARCH_REMAP = {
     "Lfm2ForCausalLM": "Lfm2CompareForCausalLM",
     "Llama4ForConditionalGeneration": "Llama4CompareForConditionalGeneration",
     "MiniCPMForCausalLM": "MiniCPMCompareForCausalLM",
+    "MiniMaxM2ForCausalLM": "MiniMaxM2CompareForCausalLM",
     "Qwen2MoeForCausalLM": "Qwen2MoeCompareForCausalLM",
     "Qwen3ForCausalLM": "Qwen3CompareForCausalLM",
     "Qwen3MoeForCausalLM": "Qwen3MoeCompareForCausalLM",

@@ -13,7 +13,7 @@ H100 evidence required before a model is called supported.
 | 3 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | `Llama4ForConditionalGeneration` | `mllama4:Llama4ForConditionalGeneration` | multimodal decoder | lite implemented; H100 TP4 pending |
 | 4 | `Qwen/Qwen3.6-27B` | `Qwen3_5ForConditionalGeneration` | `qwen3_5:Qwen3_5ForConditionalGeneration` | multimodal decoder | lite implemented; H100 pending |
 | 5 | `zai-org/GLM-5.2` | `GlmMoeDsaForCausalLM` | `deepseek_v2:GlmMoeDsaForCausalLM` | full text decoder | lite implemented; H100 TP32 pending |
-| 6 | `MiniMaxAI/MiniMax-M2.7` | `MiniMaxM2ForCausalLM` | `minimax_m2:MiniMaxM2ForCausalLM` | full text decoder | queued |
+| 6 | `MiniMaxAI/MiniMax-M2.7` | `MiniMaxM2ForCausalLM` | `minimax_m2:MiniMaxM2ForCausalLM` | full text decoder | lite implemented; H100 TP4 pending |
 | 7 | `google/gemma-4-E2B-it` | `Gemma4ForConditionalGeneration` | `gemma4_mm:Gemma4ForConditionalGeneration` | multimodal decoder | queued |
 | 8 | `deepseek-ai/DeepSeek-V4-Flash` | `DeepseekV4ForCausalLM` | `vllm.models.deepseek_v4:DeepseekV4ForCausalLM` | full text decoder/plugin | queued |
 | 9 | `moonshotai/Kimi-K3` | `KimiK3ForConditionalGeneration` | `vllm.models.kimi_k3:KimiK3ForConditionalGeneration` | multimodal decoder/plugin | queued |
