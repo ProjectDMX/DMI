@@ -155,6 +155,7 @@ _ARCH_REMAP = {
     "GptOssForCausalLM": "GptOssPForCausalLM",
     "GraniteForCausalLM": "GranitePForCausalLM",
     "JambaForCausalLM": "JambaPForCausalLM",
+    "KimiK3ForConditionalGeneration": "KimiK3PForConditionalGeneration",
     "Lfm2ForCausalLM": "Lfm2PForCausalLM",
     "Llama4ForConditionalGeneration": "Llama4PForConditionalGeneration",
     "MiniCPMForCausalLM": "MiniCPMPForCausalLM",
@@ -194,6 +195,9 @@ _DMI_MODEL_VARIANTS = {
     "GptOssPForCausalLM": "gpt_oss_p:GptOssPForCausalLM",
     "GranitePForCausalLM": "granite_p:GranitePForCausalLM",
     "JambaPForCausalLM": "jamba_p:JambaPForCausalLM",
+    "KimiK3PForConditionalGeneration": (
+        "kimi_k3_p:KimiK3PForConditionalGeneration"
+    ),
     "Lfm2PForCausalLM": "lfm2_p:Lfm2PForCausalLM",
     "Llama4PForConditionalGeneration": (
         "mllama4_p:Llama4PForConditionalGeneration"

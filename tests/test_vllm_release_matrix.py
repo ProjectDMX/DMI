@@ -124,6 +124,7 @@ def test_sota_matrix_pins_lite_h100_cells() -> None:
     deepseek_v4_flash_revision = "60d8d70770c6776ff598c94bb586a859a38244f1"
     glm52_revision = "b4734de4facf877f85769a911abafc5283eab3d9"
     llama4_scout_revision = "c2b440bc2b8c784ad310291d035b8550a771f24f"
+    kimi_k3_revision = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
     minimax_m27_revision = "d494266a4affc0d2995ba1fa35c8481cbd84294b"
     qwen3_moe_revision = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
     qwen36_revision = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
@@ -135,6 +136,7 @@ def test_sota_matrix_pins_lite_h100_cells() -> None:
         "public-gpt_oss-tp1-eager-graph",
         "public-glm52-tp32-eager-graph",
         "public-llama4_scout-tp4-eager-graph",
+        "public-kimi_k3-tp32-eager-graph",
         "public-minimax_m27-tp4-eager-graph",
         "public-qwen3_moe-tp1-eager-graph",
         "public-qwen36-tp1-eager-graph",
@@ -148,6 +150,8 @@ def test_sota_matrix_pins_lite_h100_cells() -> None:
         "storage-glm52-cudagraph-tp32",
         "storage-llama4_scout-eager-tp4",
         "storage-llama4_scout-cudagraph-tp4",
+        "storage-kimi_k3-eager-tp32",
+        "storage-kimi_k3-cudagraph-tp32",
         "storage-minimax_m27-eager-tp4",
         "storage-minimax_m27-cudagraph-tp4",
         "storage-qwen3_moe-eager-tp1",
@@ -224,6 +228,24 @@ def test_sota_matrix_pins_lite_h100_cells() -> None:
         assert storage.model_id == "meta-llama/Llama-4-Scout-17B-16E-Instruct"
         assert storage.gpu_count == 4
         assert storage.environment["E2E_MODEL_REVISION"] == llama4_scout_revision
+        assert storage.environment["E2E_RING_PAYLOAD_MB"] == "2048"
+        assert storage.environment["E2E_REF_MAX_LEN"] == "128"
+
+    public = cases["public-kimi_k3-tp32-eager-graph"]
+    assert public.model_id == "moonshotai/Kimi-K3"
+    assert public.gpu_count == 32
+    assert public.environment["DMI_BLACKBOX_MODEL_REVISION"] == kimi_k3_revision
+    assert public.environment["DMI_BLACKBOX_MAX_MODEL_LEN"] == "128"
+    assert public.environment["DMI_BLACKBOX_MULTIMODAL_IMAGE"] == "1"
+    assert public.environment["DMI_BLACKBOX_IMAGE_PLACEHOLDER"] == (
+        "<|kimi_image_placeholder|>"
+    )
+    assert public.environment["DMI_BLACKBOX_GENERATED_CASES"] == "2"
+    for mode in ("eager", "cudagraph"):
+        storage = cases[f"storage-kimi_k3-{mode}-tp32"]
+        assert storage.model_id == "moonshotai/Kimi-K3"
+        assert storage.gpu_count == 32
+        assert storage.environment["E2E_MODEL_REVISION"] == kimi_k3_revision
         assert storage.environment["E2E_RING_PAYLOAD_MB"] == "2048"
         assert storage.environment["E2E_REF_MAX_LEN"] == "128"
 

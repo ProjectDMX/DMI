@@ -49,6 +49,9 @@ _COMPARE_MODEL_VARIANTS = {
     "JambaCompareForCausalLM": (
         "jamba_compare:JambaCompareForCausalLM"
     ),
+    "KimiK3CompareForConditionalGeneration": (
+        "kimi_k3_compare:KimiK3CompareForConditionalGeneration"
+    ),
     "Lfm2CompareForCausalLM": (
         "lfm2_compare:Lfm2CompareForCausalLM"
     ),
@@ -116,6 +119,7 @@ _ARCH_REMAP = {
     "GlmMoeDsaForCausalLM": "GlmMoeDsaCompareForCausalLM",
     "GraniteForCausalLM": "GraniteCompareForCausalLM",
     "JambaForCausalLM": "JambaCompareForCausalLM",
+    "KimiK3ForConditionalGeneration": "KimiK3CompareForConditionalGeneration",
     "Lfm2ForCausalLM": "Lfm2CompareForCausalLM",
     "Llama4ForConditionalGeneration": "Llama4CompareForConditionalGeneration",
     "MiniCPMForCausalLM": "MiniCPMCompareForCausalLM",

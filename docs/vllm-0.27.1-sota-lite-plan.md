@@ -16,7 +16,7 @@ H100 evidence required before a model is called supported.
 | 6 | `MiniMaxAI/MiniMax-M2.7` | `MiniMaxM2ForCausalLM` | `minimax_m2:MiniMaxM2ForCausalLM` | full text decoder | lite implemented; H100 TP4 pending |
 | 7 | `google/gemma-4-E2B-it` | `Gemma4ForConditionalGeneration` | `gemma4_mm:Gemma4ForConditionalGeneration` | multimodal decoder | lite implemented; H100 TP1 pending |
 | 8 | `deepseek-ai/DeepSeek-V4-Flash` | `DeepseekV4ForCausalLM` | `vllm.models.deepseek_v4:DeepseekV4ForCausalLM` | reduced text decoder/plugin | lite implemented; H100 TP4 pending |
-| 9 | `moonshotai/Kimi-K3` | `KimiK3ForConditionalGeneration` | `vllm.models.kimi_k3:KimiK3ForConditionalGeneration` | multimodal decoder/plugin | queued |
+| 9 | `moonshotai/Kimi-K3` | `KimiK3ForConditionalGeneration` | `vllm.models.kimi_k3:KimiK3ForConditionalGeneration` | reduced multimodal decoder/plugin | lite implemented; H100 TP32 pending |
 
 `multimodal decoder` means the public model still accepts the named text/image
 inputs and produces ordinary vLLM outputs, while DMI exports only the fused
@@ -60,4 +60,5 @@ The matrix writes bounded per-case logs and a structured manifest; only failing
 log excerpts should be returned to the implementation agent. GLM-5.2 must be
 pre-cached (the pinned BF16 weight tree is about 1.403 TiB), and the current
 runner requires all 32 GPUs to be locally visible; a multi-node execution needs
-a separate launcher extension before it can count as evidence.
+a separate launcher extension before it can count as evidence. Kimi K3 has the
+same local-visibility requirement; its pinned MXFP4 tree is about 1.420 TiB.

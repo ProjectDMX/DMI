@@ -197,6 +197,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_qwen3_moe_p_contract.py",
             "tests/test_qwen3_5_p_contract.py",
             "tests/test_jamba_p_contract.py",
+            "tests/test_kimi_k3_p_contract.py",
             "tests/test_lfm2_p_contract.py",
             "tests/test_olmo3_p_contract.py",
             "tests/test_conv_hook_contract.py",
@@ -491,6 +492,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
     deepseek_v4_flash_revision = "60d8d70770c6776ff598c94bb586a859a38244f1"
     glm52_revision = "b4734de4facf877f85769a911abafc5283eab3d9"
     llama4_scout_revision = "c2b440bc2b8c784ad310291d035b8550a771f24f"
+    kimi_k3_revision = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
     minimax_m27_revision = "d494266a4affc0d2995ba1fa35c8481cbd84294b"
     qwen3_moe_revision = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
     qwen36_revision = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
@@ -540,6 +542,17 @@ def build_cases(phase: str) -> list[MatrixCase]:
             max_model_len=128,
             revision=llama4_scout_revision,
             multimodal_image=True,
+            generated_cases=2,
+        ),
+        _blackbox_case(
+            "kimi_k3",
+            "moonshotai/Kimi-K3",
+            tp_size=32,
+            memory_utilization=0.9,
+            max_model_len=128,
+            revision=kimi_k3_revision,
+            multimodal_image=True,
+            multimodal_image_placeholder="<|kimi_image_placeholder|>",
             generated_cases=2,
         ),
         _blackbox_case(
@@ -611,6 +624,19 @@ def build_cases(phase: str) -> list[MatrixCase]:
                 memory_utilization=0.88,
                 ring_mb=2048,
                 revision=llama4_scout_revision,
+            )
+        )
+        sota.append(
+            _storage_case(
+                "kimi_k3",
+                "moonshotai/Kimi-K3",
+                mode,
+                32,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.9,
+                ring_mb=2048,
+                revision=kimi_k3_revision,
             )
         )
         sota.append(
