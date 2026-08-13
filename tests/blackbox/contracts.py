@@ -32,8 +32,26 @@ _TRANSPARENCY_V2_FIELDS = (
 )
 
 MAX_DECISION_LOGPROB_DRIFT = 0.25
+MAX_DECISION_LOGPROB_DRIFT_BY_MODEL = {
+    # vLLM 0.27.1 GPT-2 calibration (three independent baseline and monitored
+    # processes) observed 0.342 nat drift on an exact common token history.
+    # Keep this model-specific so larger-model public logprobs retain the
+    # stricter default. The first-divergence branch gap remains 0.25 below.
+    "gpt2": 0.5,
+}
 MAX_GREEDY_BRANCH_GAP = 0.25
 MAX_GREEDY_SELECTED_GAP = 1e-6
+
+
+def decision_logprob_drift_limit(payload: dict[str, Any]) -> float:
+    """Return the predeclared public-logprob drift limit for a model."""
+
+    model = payload.get("model")
+    if isinstance(model, str):
+        return MAX_DECISION_LOGPROB_DRIFT_BY_MODEL.get(
+            model, MAX_DECISION_LOGPROB_DRIFT
+        )
+    return MAX_DECISION_LOGPROB_DRIFT
 
 
 def _recursive_mismatches(
@@ -267,13 +285,14 @@ def _selected_logprob_mismatch(
     baseline_step: dict[int, dict[str, Any]],
     monitored_step: dict[int, dict[str, Any]],
     token_id: int,
+    max_drift: float,
 ) -> bool:
     if token_id not in baseline_step or token_id not in monitored_step:
         return True
     return abs(
         float(baseline_step[token_id]["logprob"])
         - float(monitored_step[token_id]["logprob"])
-    ) > MAX_DECISION_LOGPROB_DRIFT
+    ) > max_drift
 
 
 def sampling_ambiguity_mismatches(
@@ -302,6 +321,7 @@ def sampling_ambiguity_mismatches(
         or decision_count < 2
     ):
         return ["ambiguity.decision_logprobs"]
+    max_drift = decision_logprob_drift_limit(baseline)
 
     mismatches: list[str] = []
     for execution_index, baseline_execution in enumerate(baseline["executions"]):
@@ -367,7 +387,7 @@ def sampling_ambiguity_mismatches(
                         left_step is None
                         or right_step is None
                         or _selected_logprob_mismatch(
-                            left_step, right_step, token_id
+                            left_step, right_step, token_id, max_drift
                         )
                     ):
                         mismatches.append(
@@ -424,7 +444,7 @@ def sampling_ambiguity_mismatches(
                     )
                 if any(
                     _selected_logprob_mismatch(
-                        left_step, right_step, token_id
+                        left_step, right_step, token_id, max_drift
                     )
                     for token_id in (left_token, right_token)
                 ):

@@ -114,12 +114,36 @@ the repository package loader's single canonical path.
 
 ## Current focused evidence
 
-The target environment passed 206/206 focused tests. This includes version and
+The target environment passed 209/209 focused tests. This includes version and
 registry compatibility, model hook inventories, black-box/comparator contracts,
 request ordering and padding, MoE routing, ClickHouse test utilities, GPU-idle
 gating, generated black-box cases, process-group cleanup, and release-runner
 behavior. The target-specific model contracts live in
 `tests/test_vllm_027_model_contracts.py`.
+
+The first target GPU sweep found one GPT-2 eager run whose public token branch
+diverged at an exactly/near-tied decision and whose common-prefix public logprob
+drift exceeded the old 0.25 nat default. Three fresh baseline and three fresh
+monitored processes over the identical corpus showed:
+
+- baseline/baseline: 72/72 public outputs exact;
+- monitored/monitored: 70/72 exact, with both branches publicly tied or within
+  0.25 nat and both candidates present;
+- baseline/monitored: 213/216 exact across all process pairs;
+- maximum common-prefix drift: 0.342 nat; maximum first-divergence cross-run
+  drift: 0.138 nat; selected-token gap from each public maximum: zero.
+
+The oracle therefore uses a checkpoint-specific 0.5 nat drift ceiling for the
+`gpt2` release cell while retaining 0.25 for every other model. Candidate
+presence, selected gap `1e-6`, branch gap 0.25, finite/schema validation, and
+cumulative-logprob reconstruction are unchanged. CPU regressions reject the
+same drift for non-GPT-2 payloads and reject GPT-2 drift above 0.5. A fresh
+eager+graph GPT-2 public run passed 2/2 after calibration.
+
+The release runner also retries the full three-sample idle check through a
+bounded post-case cooldown. This prevents transient utilization from a just-
+exited TP cell from being mistaken for a persistent prerequisite failure; it
+never bypasses the idle thresholds or terminates unrelated work.
 
 The exact patch replay is recorded in
 [`vllm-0.27.1-replay-ledger.md`](vllm-0.27.1-replay-ledger.md). Every prior DMI

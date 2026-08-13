@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+import tests.tools.run_vllm_release_matrix as release_matrix
 from tests.tools.run_vllm_release_matrix import (
     MatrixCase,
     _case_environment,
@@ -15,6 +16,7 @@ from tests.tools.run_vllm_release_matrix import (
     _pytest_summary,
     _resume_manifest,
     _selected_gpus,
+    _wait_for_idle,
     build_cases,
 )
 
@@ -30,6 +32,36 @@ def test_release_matrix_requires_two_distinct_physical_gpus():
         _selected_gpus("0,0")
     with pytest.raises(ValueError, match="integer"):
         _selected_gpus("gpu0,1")
+
+
+def test_idle_gate_retries_transient_post_case_utilization(monkeypatch):
+    results = [
+        release_matrix.subprocess.CompletedProcess([], 1, "busy", ""),
+        release_matrix.subprocess.CompletedProcess([], 0, "idle", ""),
+    ]
+    sleeps = []
+    monkeypatch.setattr(
+        release_matrix.subprocess,
+        "run",
+        lambda *args, **kwargs: results.pop(0),
+    )
+    monkeypatch.setattr(release_matrix.time, "sleep", sleeps.append)
+    args = type(
+        "Args",
+        (),
+        {
+            "idle_samples": 3,
+            "idle_interval": 2.0,
+            "idle_retries": 3,
+            "idle_retry_interval": 5.0,
+        },
+    )()
+
+    result, attempts = _wait_for_idle(("0", "1"), args)
+
+    assert result.returncode == 0
+    assert attempts == 2
+    assert sleeps == [5.0]
 
 
 def test_all_matrix_covers_existing_architectures_and_storage_modes():

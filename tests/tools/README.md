@@ -54,6 +54,13 @@ DMI_BLACKBOX_MODEL=qwen2_moe DMI_BLACKBOX_TP_SIZE=2 \
 Set `DMI_BLACKBOX_ARTIFACT_DIR` to retain each mode's generated cases and raw
 baseline/monitored JSON instead of relying on pytest's temporary directory.
 
+The public decision-logprob oracle keeps a 0.25 nat cross-run drift ceiling by
+default. The exact `gpt2` release cell uses a 0.5 nat ceiling calibrated from
+three independent baseline and monitored processes on vLLM 0.27.1. This does
+not relax its first-divergence requirements: both branch tokens must occur in
+both public top-logprob maps, each selected token must be within `1e-6` of the
+public maximum, and the within-run branch gap must remain at most 0.25 nat.
+
 For manual diagnosis, run both modes against the same case manifest and compare
 their JSON outputs:
 

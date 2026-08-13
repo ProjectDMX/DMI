@@ -9,6 +9,7 @@ import pytest
 from tests.blackbox.contracts import (
     baseline_envelope_mismatches,
     baseline_instabilities,
+    decision_logprob_drift_limit,
     metamorphic_mismatches,
     sampling_ambiguity_mismatches,
     transparency_mismatches,
@@ -413,6 +414,40 @@ def test_sampling_ambiguity_rejects_selected_logprob_drift_without_branch():
     ] = -0.5
 
     assert transparency_mismatches(baseline, monitored) == []
+    assert sampling_ambiguity_mismatches(baseline, monitored) == [
+        "ambiguity.batch.case-a.outputs[0].decision_logprobs[0]"
+    ]
+
+
+def test_sampling_ambiguity_uses_calibrated_gpt2_drift_only() -> None:
+    baseline = _with_complete_decision_traces(_payload())
+    baseline["model"] = "gpt2"
+    monitored = deepcopy(baseline)
+    monitored["mode"] = "monitored"
+    output = monitored["executions"][0]["results"][0]["outputs"][0]
+    output["decision_logprobs"][0][0]["logprob"] = -0.45
+    output["cumulative_logprob"] = -0.45
+
+    assert decision_logprob_drift_limit(baseline) == 0.5
+    assert sampling_ambiguity_mismatches(baseline, monitored) == []
+
+    baseline["model"] = "qwen2"
+    monitored["model"] = "qwen2"
+    assert decision_logprob_drift_limit(baseline) == 0.25
+    assert sampling_ambiguity_mismatches(baseline, monitored) == [
+        "ambiguity.batch.case-a.outputs[0].decision_logprobs[0]"
+    ]
+
+
+def test_sampling_ambiguity_rejects_gpt2_drift_above_calibration() -> None:
+    baseline = _with_complete_decision_traces(_payload())
+    baseline["model"] = "gpt2"
+    monitored = deepcopy(baseline)
+    monitored["mode"] = "monitored"
+    output = monitored["executions"][0]["results"][0]["outputs"][0]
+    output["decision_logprobs"][0][0]["logprob"] = -0.7
+    output["cumulative_logprob"] = -0.7
+
     assert sampling_ambiguity_mismatches(baseline, monitored) == [
         "ambiguity.batch.case-a.outputs[0].decision_logprobs[0]"
     ]

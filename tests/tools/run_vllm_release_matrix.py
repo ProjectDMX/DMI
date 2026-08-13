@@ -47,6 +47,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--case-timeout", type=float, default=3600.0)
     parser.add_argument("--idle-samples", type=int, default=3)
     parser.add_argument("--idle-interval", type=float, default=2.0)
+    parser.add_argument("--idle-retries", type=int, default=6)
+    parser.add_argument("--idle-retry-interval", type=float, default=5.0)
     parser.add_argument("--artifact-dir", type=Path)
     parser.add_argument(
         "--resume",
@@ -267,6 +269,31 @@ def _idle_command(gpus: tuple[str, ...], args: argparse.Namespace) -> list[str]:
         "--interval",
         str(args.idle_interval),
     ]
+
+
+def _wait_for_idle(
+    gpus: tuple[str, ...], args: argparse.Namespace
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    """Wait through bounded post-case GPU utilization cooldown."""
+
+    if args.idle_retries < 1:
+        raise ValueError("--idle-retries must be at least 1")
+    if args.idle_retry_interval < 0:
+        raise ValueError("--idle-retry-interval cannot be negative")
+    result: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(1, args.idle_retries + 1):
+        result = subprocess.run(
+            _idle_command(gpus, args),
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result, attempt
+        if attempt < args.idle_retries:
+            time.sleep(args.idle_retry_interval)
+    assert result is not None
+    return result, args.idle_retries
 
 
 def _case_environment(case: MatrixCase, gpus: tuple[str, str]) -> dict[str, str]:
@@ -493,16 +520,18 @@ def main() -> None:
             continue
         if case.gpu_count:
             selected = gpus[: case.gpu_count]
-            idle = subprocess.run(
-                _idle_command(selected, args),
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
+            try:
+                idle, idle_attempts = _wait_for_idle(selected, args)
+            except ValueError as error:
+                raise SystemExit(str(error)) from error
             if idle.returncode != 0:
                 result.update(
                     status="blocked-prerequisite",
-                    reason=idle.stdout + idle.stderr,
+                    reason=(
+                        f"GPU idle check failed after {idle_attempts} attempts:\n"
+                        + idle.stdout
+                        + idle.stderr
+                    ),
                 )
                 manifest["results"].append(result)
                 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")

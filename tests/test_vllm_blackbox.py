@@ -17,11 +17,11 @@ from tests.blackbox.case_generation import (
     generate_cases,
 )
 from tests.blackbox.contracts import (
-    MAX_DECISION_LOGPROB_DRIFT,
     MAX_GREEDY_BRANCH_GAP,
     MAX_GREEDY_SELECTED_GAP,
     baseline_envelope_mismatches,
     baseline_instabilities,
+    decision_logprob_drift_limit,
     metamorphic_mismatches,
     sampling_ambiguity_mismatches,
     transparency_mismatches,
@@ -175,6 +175,7 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
     ambiguity_mismatches = sampling_ambiguity_mismatches(
         baseline, monitored
     )
+    decision_drift_limit = decision_logprob_drift_limit(baseline)
     decision_count = baseline.get("decision_logprobs")
     decision_evidence_available = (
         isinstance(decision_count, int)
@@ -197,7 +198,7 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
                         "sampling_ambiguity_thresholds": {
                             "max_branch_gap": MAX_GREEDY_BRANCH_GAP,
                             "max_selected_gap": MAX_GREEDY_SELECTED_GAP,
-                            "max_cross_run_drift": MAX_DECISION_LOGPROB_DRIFT,
+                            "max_cross_run_drift": decision_drift_limit,
                         },
                         "baseline_processes": 1,
                         "baseline_instabilities": [],
@@ -218,7 +219,7 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
                         "sampling_ambiguity_thresholds": {
                             "max_branch_gap": MAX_GREEDY_BRANCH_GAP,
                             "max_selected_gap": MAX_GREEDY_SELECTED_GAP,
-                            "max_cross_run_drift": MAX_DECISION_LOGPROB_DRIFT,
+                            "max_cross_run_drift": decision_drift_limit,
                         },
                         "baseline_processes": 1,
                         "baseline_instabilities": [],
@@ -270,7 +271,7 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
                     "sampling_ambiguity_thresholds": {
                         "max_branch_gap": MAX_GREEDY_BRANCH_GAP,
                         "max_selected_gap": MAX_GREEDY_SELECTED_GAP,
-                        "max_cross_run_drift": MAX_DECISION_LOGPROB_DRIFT,
+                        "max_cross_run_drift": decision_drift_limit,
                     },
                     "baseline_processes": len(baselines),
                     "baseline_instabilities": instabilities,
