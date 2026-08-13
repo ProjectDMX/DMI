@@ -2,8 +2,9 @@
 
 This is the agent-authored discovery and validation record for the versioned
 0.27.1 port. It is not a support claim until the accelerator matrix closes all
-claimed cells. Static, ABI, registry, and focused CPU gates are complete;
-accelerator and storage validation remain explicit gates below.
+claimed cells. Static, ABI, registry, focused CPU, public differential, and
+storage-value gates are complete. A clean-commit matrix rerun remains required
+after the W07 lifecycle adaptation described below.
 
 ## Audit header
 
@@ -71,7 +72,7 @@ The changed methods require these semantic verdicts:
 | W03 | `compatible` | `load_model` is AST-identical, including keyword forwarding and model-loader context. |
 | W04 | `change-required` evidence | Warm-up now accounts memory through `total_consumed` and can persist a startup plan before returning. DMI may still clear native null mode after `super()`, but must prove startup-plan replay and graph capture do not publish warm-up rows. |
 | W05 | `compatible` for non-Mamba V1 cells | Worker execution is AST-identical. Runner execution adds only `align_ctx=mamba_bufs.postprocess_align` in the Mamba branch; existing five variants cannot enter it. Hybrid/Mamba families need a separate verdict. |
-| W07 | `compatible` at source level | Worker shutdown is AST-identical. Target-PyTorch native rebuild and repeated-stop tests remain required. |
+| W07 | `change-required`; `adapted-verified` at focused and targeted runtime scope | Worker shutdown is AST-identical, but the public `LLM` object has no close method in 0.27.1. Storage runners now flush DMI explicitly and call the bounded EngineCore shutdown contract. DMI's rank-local teardown could also let TCPStore owner rank 0 exit before a peer NCCL heartbeat stopped; rank 0 now retains a 0.5 s post-worker grace only for distributed cells. Focused tests verify fail-closed EngineCore lookup, bounded shutdown, and rank-specific grace. Full-matrix requalification remains pending. |
 | C01-C06 | `change-required` audit | Config files changed substantially, including model, parallel, compilation, cache, scheduler, speculative, and new fault-tolerance/EC-manager configuration. Every DMI-read field must be re-traced; unchanged method signatures do not approve these fields. |
 | S01-S04, G01-G04, G07-G10 | `compatible` at source level for ordinary V1 | Both DMI patch points are AST-identical. Their enclosing execution path is unchanged for existing dense/MoE non-Mamba cells except unrelated branches. Request-order, actual/padded rows, early PP/SP dispatch, and exactly-once commit must be rerun. |
 | G05-G06 | `blocked` outside initial cell | Async scheduling, PP, SP, fault tolerance, and newer runner branches are not covered by source identity. |
@@ -86,11 +87,11 @@ remapped names never inherit a DMI verdict automatically.
 
 | DMI variant | Target source drift | Discovery status | Required port action |
 | --- | --- | --- | --- |
-| GPT-2 | 43 changed lines | `adapted-verified` at focused scope | All P/compare/ref variants use target `AutoWeightsLoader` and Conv1D transpose generator; loader/transpose regressions pass. GPU cells pending. |
-| Qwen2 | 4 changed lines | `adapted-verified` at focused scope | Dynamic `positions` dimension matches 0.27.1 and lazy registry/inventory tests pass. GPU cells pending. |
-| Qwen3 | 4 added lines | `adapted-verified` at focused scope | `per_layer_sliding_window` is threaded through P/compare/ref attention and decoder layers; propagation regressions pass. GPU cells pending. |
-| Llama | no target file diff | `unchanged-verified` at source/focused scope | Packed weight loader and hook inventory are preserved. TP2 eager/graph/storage revalidation pending. |
-| Qwen2-MoE | 6 changed lines | `adapted-verified` at focused scope | Target factory returns a runner exposing `router.select_experts`; focused routing tests verify call order, shapes, and dtypes. TP2/EP runtime ownership remains matrix-scoped. |
+| GPT-2 | 43 changed lines | `adapted-verified` | All P/compare/ref variants use target `AutoWeightsLoader` and Conv1D transpose generator; loader/transpose regressions and TP1/TP2 eager/graph/storage cells passed the pre-lifecycle matrix. |
+| Qwen2 | 4 changed lines | `adapted-verified` | Dynamic `positions` dimension matches 0.27.1; lazy registry/inventory and TP1 eager/graph public cells passed. |
+| Qwen3 | 4 added lines | `adapted-verified` | `per_layer_sliding_window` is threaded through P/compare/ref attention and decoder layers; focused propagation and TP1/TP2 eager/graph/storage cells passed. |
+| Llama | no target file diff | `unchanged-verified` for the named cell | Packed weight loader and hook inventory are preserved; Llama-3.1-8B TP2 eager/graph public and storage cells passed. |
+| Qwen2-MoE | 6 changed lines | `adapted-verified` for TP2, EP excluded | Target factory exposes `router.select_experts`; focused routing and Qwen1.5-MoE TP2 eager/graph public and storage cells passed. EP remains untested. |
 
 `compatible` here is a pre-edit discovery status, not a final
 `unchanged-verified` verdict.
@@ -114,7 +115,7 @@ the repository package loader's single canonical path.
 
 ## Current focused evidence
 
-The target environment passed 209/209 focused tests. This includes version and
+The target environment passed 217/217 focused tests. This includes version and
 registry compatibility, model hook inventories, black-box/comparator contracts,
 request ordering and padding, MoE routing, ClickHouse test utilities, GPU-idle
 gating, generated black-box cases, process-group cleanup, and release-runner
@@ -145,6 +146,29 @@ bounded post-case cooldown. This prevents transient utilization from a just-
 exited TP cell from being mistaken for a persistent prerequisite failure; it
 never bypasses the idle thresholds or terminates unrelated work.
 
+The first clean-commit 0.27.1 accelerator sweep at root
+`fe35f1d672e74f938da50b600971537ac71e8b3f` passed all 18/18 case processes:
+five public eager+graph cells and twelve storage cells with 447,456/447,456
+reference rows bitwise equal. Evidence inspection nevertheless rejected that
+run as final release proof because four graph+TP2 storage logs let the frontend
+force-kill EngineCore after its five-second destructor timeout, and one Qwen3
+eager+TP2 log showed a rank-1 TCPStore heartbeat race.
+
+Targeted W07 validation after the adaptation establishes:
+
+- explicit EngineCore shutdown removes the frontend force-kill path;
+- three exact official-wheel Qwen3 eager+TP2 baselines shut down cleanly;
+- the unadapted DMI full case reproduced the TCPStore warning and showed rank 0
+  returning from worker teardown about 21 ms before rank 1;
+- keeping only the store-owner rank alive for 0.5 s removed that warning from
+  full eager and CUDA-graph Qwen3 TP2 storage runs, both of which retained
+  76,960/76,960 bitwise-equal rows;
+- vLLM's inner executor may still SIGTERM CUDA-graph workers after its own
+  five-second grace. The same marker was reproduced without DMI against the
+  exact official wheel, so the runner retains it as a named non-fatal upstream
+  warning. Frontend force-kills, worker exceptions, and TCPStore races remain
+  fatal even when the process exit code is zero.
+
 The exact patch replay is recorded in
 [`vllm-0.27.1-replay-ledger.md`](vllm-0.27.1-replay-ledger.md). Every prior DMI
 commit has an explicit target commit and semantic disposition; the final target-
@@ -155,9 +179,9 @@ only rewrite is `fdfe631884ae318050ce371e472c1135f317cfa2`.
 1. Root `vllm-0.27-support` and integration `dmi-v0.27.1` branches: complete.
 2. Target-native rebuild, loaded-path check, and ABI parity: complete.
 3. Boundary inventory/map, target drift adaptations, and focused regressions:
-   complete at 206/206.
+   complete at 217/217.
 4. Separate-process public black-box eager/graph and scoped storage TP1/TP2:
-   pending the clean-commit release matrix.
+   value/transparency sweep complete, W07 clean-commit requalification pending.
 5. Only after phase 0 evidence is complete, add roadmap families one contract
    class at a time. V2 and untested API/topology cells remain explicit.
 

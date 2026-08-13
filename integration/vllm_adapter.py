@@ -31,6 +31,7 @@ from enum import Enum, auto
 import os
 from pathlib import Path
 import re
+import time
 import warnings
 from typing import Any, List, Optional, Tuple
 
@@ -110,6 +111,14 @@ def _cfg(ac: dict, key: str, env_key: str, default: Any) -> Any:
 
 
 _VLLM_REQ_ID_SUFFIX = re.compile(r"-[0-9a-f]{8}$")
+
+# vLLM 0.27.1 owns the default TCPStore in global rank 0.  DMI's rank-local
+# resource teardown can make rank 0 return from Worker.shutdown slightly before
+# its peers, allowing the store to disappear while another rank's NCCL heartbeat
+# thread is still stopping.  Keep the store owner alive briefly after its local
+# CUDA/model teardown; WorkerProc destroys process groups immediately after this
+# method returns, so non-owner ranks get a deterministic head start.
+_STORE_OWNER_SHUTDOWN_GRACE_S = 0.5
 
 
 def normalize_vllm_request_id(req_id: str) -> str:
@@ -1635,6 +1644,11 @@ class DMXGPUWorker(Worker):
                 "DMI monitoring shutdown was incomplete during worker teardown"
             )
         super().shutdown()
+        vllm_config = getattr(self, "vllm_config", None)
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        world_size = int(getattr(parallel_config, "world_size", 1))
+        if world_size > 1 and int(getattr(self, "rank", -1)) == 0:
+            time.sleep(_STORE_OWNER_SHUTDOWN_GRACE_S)
 
 
 def _attach_dmi_internal(outputs, model_id, reader=None):

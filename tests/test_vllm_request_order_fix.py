@@ -1695,6 +1695,45 @@ def test_monitoring_stop_is_reentrant_after_success(monkeypatch):
     assert events == ["ring_stop", "deactivate", "engine_close"]
 
 
+@pytest.mark.parametrize(
+    ("rank", "world_size", "expected_sleeps"),
+    [
+        (0, 2, [0.5]),
+        (1, 2, []),
+        (0, 1, []),
+        (0, None, []),
+    ],
+)
+def test_worker_keeps_distributed_store_owner_alive_through_peer_teardown(
+    monkeypatch, rank, world_size, expected_sleeps
+):
+    events = []
+    sleeps = []
+    worker = DMXGPUWorker.__new__(DMXGPUWorker)
+    worker.adaptor = None
+    worker._dmx_host_engine = None
+    worker.rank = rank
+    if world_size is not None:
+        worker.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=world_size)
+        )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        Worker,
+        "shutdown",
+        lambda _self: events.append("upstream_shutdown"),
+    )
+    monkeypatch.setattr(
+        "integration.vllm_adapter.time.sleep",
+        sleeps.append,
+    )
+
+    worker.shutdown()
+
+    assert events == ["upstream_shutdown"]
+    assert sleeps == expected_sleeps
+
+
 def test_ec_transfer_producer_passthrough_never_arms(monkeypatch):
     adaptor = SimpleNamespace(
         transport=SimpleNamespace(null_offload=False),

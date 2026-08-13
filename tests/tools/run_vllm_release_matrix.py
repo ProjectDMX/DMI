@@ -150,6 +150,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_gpu_idle_check.py",
             "tests/test_blackbox_case_generation.py",
             "tests/test_process_group.py",
+            "tests/test_vllm_compare_runner.py",
             "tests/test_vllm_release_matrix.py",
         ),
         environment={},
@@ -423,6 +424,15 @@ def _pytest_summary(path: Path) -> dict[str, int]:
 _FATAL_RUNTIME_LOG_MARKERS = (
     "WorkerProc hit an exception.",
     "EngineCore failed to start.",
+    "Process manager: force killing remaining process",
+    'Failed to check the "should dump" flag on TCPStore',
+)
+
+# Retain warnings that were reproduced by the exact official vLLM 0.27.1 wheel
+# without DMI.  They do not overturn an otherwise clean cell, but keeping them
+# in the manifest prevents a green summary from hiding upstream teardown risk.
+_KNOWN_UPSTREAM_RUNTIME_LOG_MARKERS = (
+    "Executor: workers still running after grace period; sending SIGTERM",
 )
 
 
@@ -430,6 +440,14 @@ def _fatal_runtime_log_markers(output: str) -> tuple[str, ...]:
     """Return runtime failures that must invalidate a zero process exit code."""
 
     return tuple(marker for marker in _FATAL_RUNTIME_LOG_MARKERS if marker in output)
+
+
+def _known_upstream_runtime_log_markers(output: str) -> tuple[str, ...]:
+    """Return non-fatal warnings reproduced by the pinned upstream runtime."""
+
+    return tuple(
+        marker for marker in _KNOWN_UPSTREAM_RUNTIME_LOG_MARKERS if marker in output
+    )
 
 
 def main() -> None:
@@ -553,7 +571,6 @@ def main() -> None:
             )
             command.append(f"--junitxml={junit_path}")
         started = time.monotonic()
-        fatal_markers: tuple[str, ...] = ()
         try:
             completed = run_process_group(
                 command,
@@ -564,13 +581,14 @@ def main() -> None:
             output = completed.stdout + completed.stderr
             returncode = completed.returncode
             status = "passed" if returncode == 0 else "failed"
-            fatal_markers = _fatal_runtime_log_markers(output)
-            if status == "passed" and fatal_markers:
-                status = "failed-runtime-log"
         except subprocess.TimeoutExpired as error:
             output = (error.stdout or "") + (error.stderr or "")
             returncode = None
             status = "timeout"
+        fatal_markers = _fatal_runtime_log_markers(output)
+        known_upstream_markers = _known_upstream_runtime_log_markers(output)
+        if status == "passed" and fatal_markers:
+            status = "failed-runtime-log"
         log_path = artifact_dir / (
             f"{index:02d}-{case.case_id}-attempt-{attempt}.log"
         )
@@ -592,6 +610,7 @@ def main() -> None:
             executed_command=command,
             pytest_summary=pytest_summary,
             fatal_runtime_log_markers=list(fatal_markers),
+            known_upstream_runtime_log_markers=list(known_upstream_markers),
             duration_s=round(time.monotonic() - started, 3),
             log=str(log_path),
             finished_at=datetime.now(timezone.utc).isoformat(),

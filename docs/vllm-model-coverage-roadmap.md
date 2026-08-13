@@ -52,11 +52,11 @@ row must be re-audited after the worker/runner port to 0.27.1.
 
 | Representative checkpoint | architecture | vLLM 0.27.1 implementation | DMI 0.25.1 evidence | DMI 0.27.1 status |
 | --- | --- | --- | --- | --- |
-| `openai-community/gpt2` | `GPT2LMHeadModel` | `gpt2:GPT2LMHeadModel` | supported, eager+graph+storage | ported; focused gate passed, GPU revalidation pending |
-| `Qwen/Qwen2.5-0.5B-Instruct` | `Qwen2ForCausalLM` | `qwen2:Qwen2ForCausalLM` | supported, eager+graph | ported; focused gate passed, GPU revalidation pending |
-| `Qwen/Qwen1.5-MoE-A2.7B-Chat` | `Qwen2MoeForCausalLM` | `qwen2_moe:Qwen2MoeForCausalLM` | supported, TP2 eager+graph+storage | ported; factory/runner contract passed, GPU revalidation pending |
-| `Qwen/Qwen3-8B` | `Qwen3ForCausalLM` | `qwen3:Qwen3ForCausalLM` | supported via 0.6B checkpoint, eager+graph+storage | ported; focused gate passed, GPU revalidation pending |
-| `meta-llama/Llama-3.2-1B-Instruct` | `LlamaForCausalLM` | `llama:LlamaForCausalLM` | supported via 3.1-8B checkpoint, TP2 eager+graph+storage | ported; focused gate passed, GPU revalidation pending |
+| `openai-community/gpt2` | `GPT2LMHeadModel` | `gpt2:GPT2LMHeadModel` | supported, eager+graph+storage | ported; TP1 public and TP1/TP2 storage value cells passed; final W07 matrix pending |
+| `Qwen/Qwen2.5-0.5B-Instruct` | `Qwen2ForCausalLM` | `qwen2:Qwen2ForCausalLM` | supported, eager+graph | ported; TP1 public eager+graph passed; final W07 matrix pending |
+| `Qwen/Qwen1.5-MoE-A2.7B-Chat` | `Qwen2MoeForCausalLM` | `qwen2_moe:Qwen2MoeForCausalLM` | supported, TP2 eager+graph+storage | ported; TP2 public/storage value cells passed; EP excluded and final W07 matrix pending |
+| `Qwen/Qwen3-8B` | `Qwen3ForCausalLM` | `qwen3:Qwen3ForCausalLM` | supported via 0.6B checkpoint, eager+graph+storage | ported; TP1 public and TP1/TP2 storage value cells passed; final W07 matrix pending |
+| `meta-llama/Llama-3.2-1B-Instruct` | `LlamaForCausalLM` | `llama:LlamaForCausalLM` | supported via 3.1-8B checkpoint, TP2 eager+graph+storage | ported; Llama-3.1-8B TP2 public/storage value cells passed; final W07 matrix pending |
 
 ## Phase 1: bounded single-GPU families
 

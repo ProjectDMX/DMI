@@ -13,6 +13,7 @@ from tests.tools.run_vllm_release_matrix import (
     MatrixCase,
     _case_environment,
     _fatal_runtime_log_markers,
+    _known_upstream_runtime_log_markers,
     _pytest_summary,
     _resume_manifest,
     _selected_gpus,
@@ -108,12 +109,40 @@ def test_storage_wrapper_uses_the_pinned_matrix_python():
 
 
 def test_release_matrix_rejects_worker_errors_despite_zero_exit_code():
-    output = "generation completed\nWorkerProc hit an exception.\n"
+    output = (
+        "generation completed\n"
+        "WorkerProc hit an exception.\n"
+        "Process manager: force killing remaining processes count=1\n"
+    )
 
     assert _fatal_runtime_log_markers(output) == (
         "WorkerProc hit an exception.",
+        "Process manager: force killing remaining process",
     )
     assert _fatal_runtime_log_markers("generation completed\n") == ()
+
+
+def test_release_matrix_rejects_distributed_teardown_warnings() -> None:
+    output = (
+        '[rank1] Failed to check the "should dump" flag on TCPStore, '
+        "server shut down too early\n"
+    )
+
+    assert _fatal_runtime_log_markers(output) == (
+        'Failed to check the "should dump" flag on TCPStore',
+    )
+
+
+def test_release_matrix_retains_reproduced_upstream_teardown_warnings() -> None:
+    output = (
+        "Executor: workers still running after grace period; "
+        "sending SIGTERM count=2\n"
+    )
+
+    assert _fatal_runtime_log_markers(output) == ()
+    assert _known_upstream_runtime_log_markers(output) == (
+        "Executor: workers still running after grace period; sending SIGTERM",
+    )
 
 
 def test_pytest_summary_retains_skipped_prerequisites(tmp_path: Path):
