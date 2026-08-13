@@ -47,6 +47,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--case-timeout", type=float, default=3600.0)
     parser.add_argument("--idle-samples", type=int, default=3)
     parser.add_argument("--idle-interval", type=float, default=2.0)
+    parser.add_argument("--idle-retries", type=int, default=6)
+    parser.add_argument("--idle-retry-interval", type=float, default=5.0)
     parser.add_argument("--artifact-dir", type=Path)
     parser.add_argument(
         "--resume",
@@ -73,6 +75,7 @@ def _blackbox_case(
     *,
     tp_size: int,
     memory_utilization: float,
+    revision: str,
 ) -> MatrixCase:
     return MatrixCase(
         case_id=f"public-{model_key}-tp{tp_size}-eager-graph",
@@ -91,6 +94,7 @@ def _blackbox_case(
             "DMI_BLACKBOX_CUDAGRAPH": "1",
             "DMI_BLACKBOX_SEED": "20260812",
             "DMI_BLACKBOX_GENERATED_CASES": "6",
+            "DMI_BLACKBOX_MODEL_REVISION": revision,
         },
         gpu_count=tp_size,
         model_id=model_id,
@@ -106,6 +110,7 @@ def _storage_case(
     *,
     hook_selection: str = "vllm-full",
     ref_max_len: int = 8192,
+    revision: str,
 ) -> MatrixCase:
     return MatrixCase(
         case_id=f"storage-{model_key}-{mode}-tp{tp_size}",
@@ -122,6 +127,7 @@ def _storage_case(
             "E2E_RING_PAYLOAD_MB": "512",
             "E2E_RING_PINNED_MB": "512",
             "E2E_GPU_MEM_UTIL": "0.85" if tp_size == 2 else "0.6",
+            "E2E_MODEL_REVISION": revision,
         },
         gpu_count=tp_size,
         model_id=model_id,
@@ -130,6 +136,13 @@ def _storage_case(
 
 
 def build_cases(phase: str) -> list[MatrixCase]:
+    revisions = {
+        "gpt2": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+        "qwen2": "7ae557604adf67be50417f59c2c2f167def9a775",
+        "qwen3": "c1899de289a04d12100db370d81485cdf75e47ca",
+        "llama": "0e9e39f249a16976918f6564b8830bc894c89659",
+        "qwen2_moe": "ec052fda178e241c7c443468d2fa1db6618996be",
+    }
     focused = MatrixCase(
         case_id="focused-cpu-contracts",
         command=(
@@ -147,32 +160,46 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_gpu_idle_check.py",
             "tests/test_blackbox_case_generation.py",
             "tests/test_process_group.py",
+            "tests/test_vllm_compare_runner.py",
             "tests/test_vllm_release_matrix.py",
         ),
         environment={},
     )
     public = [
-        _blackbox_case("gpt2", "gpt2", tp_size=1, memory_utilization=0.5),
+        _blackbox_case(
+            "gpt2",
+            "gpt2",
+            tp_size=1,
+            memory_utilization=0.5,
+            revision=revisions["gpt2"],
+        ),
         _blackbox_case(
             "qwen2",
             "Qwen/Qwen2.5-0.5B-Instruct",
             tp_size=1,
             memory_utilization=0.5,
+            revision=revisions["qwen2"],
         ),
         _blackbox_case(
-            "qwen3", "Qwen/Qwen3-0.6B", tp_size=1, memory_utilization=0.5
+            "qwen3",
+            "Qwen/Qwen3-0.6B",
+            tp_size=1,
+            memory_utilization=0.5,
+            revision=revisions["qwen3"],
         ),
         _blackbox_case(
             "llama",
             "meta-llama/Llama-3.1-8B-Instruct",
             tp_size=2,
             memory_utilization=0.8,
+            revision=revisions["llama"],
         ),
         _blackbox_case(
             "qwen2_moe",
             "Qwen/Qwen1.5-MoE-A2.7B-Chat",
             tp_size=2,
             memory_utilization=0.85,
+            revision=revisions["qwen2_moe"],
         ),
     ]
     storage: list[MatrixCase] = []
@@ -182,7 +209,15 @@ def build_cases(phase: str) -> list[MatrixCase]:
     ):
         for mode in ("eager", "cudagraph"):
             for tp_size in (1, 2):
-                storage.append(_storage_case(model_key, model_id, mode, tp_size))
+                storage.append(
+                    _storage_case(
+                        model_key,
+                        model_id,
+                        mode,
+                        tp_size,
+                        revision=revisions[model_key],
+                    )
+                )
     for model_key, model_id in (
         ("llama", "meta-llama/Llama-3.1-8B-Instruct"),
         ("qwen2_moe", "Qwen/Qwen1.5-MoE-A2.7B-Chat"),
@@ -196,6 +231,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
                     2,
                     hook_selection="resid_pre",
                     ref_max_len=512,
+                    revision=revisions[model_key],
                 )
             )
 
@@ -218,7 +254,7 @@ def _git(path: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _model_in_cache(model_id: str) -> bool:
+def _model_in_cache(model_id: str, revision: str | None = None) -> bool:
     if os.path.exists(model_id):
         return True
     cache_root = Path(
@@ -228,7 +264,10 @@ def _model_in_cache(model_id: str) -> bool:
             / "hub",
         )
     )
-    return (cache_root / ("models--" + model_id.replace("/", "--"))).is_dir()
+    repo = cache_root / ("models--" + model_id.replace("/", "--"))
+    if not repo.is_dir():
+        return False
+    return revision is None or (repo / "snapshots" / revision).is_dir()
 
 
 def _check_clickhouse() -> None:
@@ -266,6 +305,31 @@ def _idle_command(gpus: tuple[str, ...], args: argparse.Namespace) -> list[str]:
         "--interval",
         str(args.idle_interval),
     ]
+
+
+def _wait_for_idle(
+    gpus: tuple[str, ...], args: argparse.Namespace
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    """Wait through bounded post-case GPU utilization cooldown."""
+
+    if args.idle_retries < 1:
+        raise ValueError("--idle-retries must be at least 1")
+    if args.idle_retry_interval < 0:
+        raise ValueError("--idle-retry-interval cannot be negative")
+    result: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(1, args.idle_retries + 1):
+        result = subprocess.run(
+            _idle_command(gpus, args),
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result, attempt
+        if attempt < args.idle_retries:
+            time.sleep(args.idle_retry_interval)
+    assert result is not None
+    return result, args.idle_retries
 
 
 def _case_environment(case: MatrixCase, gpus: tuple[str, str]) -> dict[str, str]:
@@ -395,6 +459,8 @@ def _pytest_summary(path: Path) -> dict[str, int]:
 _FATAL_RUNTIME_LOG_MARKERS = (
     "WorkerProc hit an exception.",
     "EngineCore failed to start.",
+    "Process manager: force killing remaining process",
+    'Failed to check the "should dump" flag on TCPStore',
 )
 
 
@@ -429,9 +495,14 @@ def main() -> None:
         _check_clickhouse()
     missing_models = sorted(
         {
-            case.model_id
+            f"{case.model_id}@{revision}" if revision else case.model_id
             for case in cases
-            if case.model_id is not None and not _model_in_cache(case.model_id)
+            if case.model_id is not None
+            for revision in (
+                case.environment.get("DMI_BLACKBOX_MODEL_REVISION")
+                or case.environment.get("E2E_MODEL_REVISION"),
+            )
+            if not _model_in_cache(case.model_id, revision)
         }
     )
     if missing_models:
@@ -492,12 +563,11 @@ def main() -> None:
             continue
         if case.gpu_count:
             selected = gpus[: case.gpu_count]
-            idle = subprocess.run(
-                _idle_command(selected, args),
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
+            try:
+                idle, idle_attempts = _wait_for_idle(selected, args)
+            except ValueError as error:
+                raise SystemExit(str(error)) from error
+            result["idle_check_attempts"] = idle_attempts
             if idle.returncode != 0:
                 result.update(
                     status="blocked-prerequisite",

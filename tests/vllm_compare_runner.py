@@ -28,6 +28,27 @@ _MODEL_ALIASES = {
 }
 
 
+def _shutdown_llm(llm, *, timeout: float = 30.0) -> None:
+    """Close the version-pinned EngineCore after DMI workers have flushed.
+
+    vLLM 0.25.1's public ``LLM`` object has no close/shutdown method. Its
+    EngineCore client exposes a bounded shutdown contract; relying on garbage
+    collection can terminate graph and TP workers before their normal teardown
+    completes. Keep this private API explicit and fail closed when a future
+    vLLM version changes it.
+    """
+
+    llm_engine = getattr(llm, "llm_engine", None)
+    engine_core = getattr(llm_engine, "engine_core", None)
+    shutdown = getattr(engine_core, "shutdown", None)
+    if not callable(shutdown):
+        raise RuntimeError(
+            "vLLM LLMEngine EngineCore client has no callable shutdown; "
+            "update the version-pinned storage lifecycle adapter"
+        )
+    shutdown(timeout=timeout)
+
+
 def main():
     from vllm import LLM, SamplingParams
 
@@ -76,6 +97,8 @@ def main():
         enforce_eager=enforce_eager,
         gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.5")),
         tensor_parallel_size=tp_size,
+        revision=os.environ.get("E2E_MODEL_REVISION"),
+        tokenizer_revision=os.environ.get("E2E_MODEL_REVISION"),
     )
 
     llm = None
@@ -91,6 +114,7 @@ def main():
         # implicit DMXGPUWorker.shutdown() races vLLM's 8s deadline and may
         # drop tail rows -- exactly the data we're about to compare.
         llm.collective_rpc("stop_monitoring")
+        _shutdown_llm(llm)
         del llm
         llm = None
         torch.cuda.empty_cache()
@@ -112,6 +136,10 @@ def main():
         if llm is not None:
             try:
                 llm.collective_rpc("stop_monitoring")
+            except Exception:
+                pass
+            try:
+                _shutdown_llm(llm)
             except Exception:
                 pass
         try:

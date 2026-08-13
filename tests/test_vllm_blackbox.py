@@ -45,6 +45,7 @@ TP_SIZE = int(os.environ.get("DMI_BLACKBOX_TP_SIZE", "1"))
 GPU_MEMORY_UTILIZATION = os.environ.get(
     "DMI_BLACKBOX_GPU_MEMORY_UTILIZATION", "0.4"
 )
+MODEL_REVISION = os.environ.get("DMI_BLACKBOX_MODEL_REVISION")
 
 pytestmark = [
     pytest.mark.gpu,
@@ -81,6 +82,8 @@ def _run(
     ]
     if cudagraph:
         command.append("--cudagraph")
+    if MODEL_REVISION:
+        command.extend(["--revision", MODEL_REVISION])
     command.extend(
         [
             "--decision-logprobs",

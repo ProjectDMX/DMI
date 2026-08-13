@@ -17,6 +17,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from tests.vllm_compare_runner import _shutdown_llm
+
 
 MODEL_ALIASES = {
     "gpt2": "gpt2",
@@ -50,6 +52,10 @@ def _parse_args() -> argparse.Namespace:
         help="Public top-logprob count retained to justify greedy branch ambiguity.",
     )
     parser.add_argument("--cudagraph", action="store_true")
+    parser.add_argument(
+        "--revision",
+        help="Exact model/tokenizer revision used for reproducible qualification.",
+    )
     return parser.parse_args()
 
 
@@ -186,6 +192,8 @@ def main() -> None:
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "disable_log_stats": True,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "revision": args.revision,
+        "tokenizer_revision": args.revision,
     }
     if args.mode == "monitored":
         kwargs.update(
@@ -263,6 +271,7 @@ def main() -> None:
             if args.mode == "monitored":
                 llm.collective_rpc("stop_monitoring")
         finally:
+            _shutdown_llm(llm)
             del llm
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")

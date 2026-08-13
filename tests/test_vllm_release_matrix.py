@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +17,7 @@ from tests.tools.run_vllm_release_matrix import (
     _pytest_summary,
     _resume_manifest,
     _selected_gpus,
+    _wait_for_idle,
     build_cases,
 )
 
@@ -54,6 +57,49 @@ def test_static_only_models_use_bounded_two_gpu_storage_cells():
         assert case.environment["E2E_REF_MAX_LEN"] == "512"
 
 
+def test_gpu_cases_pin_exact_model_revisions():
+    cases = [case for case in build_cases("all") if case.gpu_count]
+    expected = {
+        "gpt2": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+        "qwen2": "7ae557604adf67be50417f59c2c2f167def9a775",
+        "qwen3": "c1899de289a04d12100db370d81485cdf75e47ca",
+        "llama": "0e9e39f249a16976918f6564b8830bc894c89659",
+        "qwen2_moe": "ec052fda178e241c7c443468d2fa1db6618996be",
+    }
+
+    assert cases
+    for case in cases:
+        model_key = case.case_id.split("-")[1]
+        revision = case.environment.get(
+            "DMI_BLACKBOX_MODEL_REVISION"
+        ) or case.environment.get("E2E_MODEL_REVISION")
+        assert revision == expected[model_key]
+
+
+def test_idle_gate_retries_bounded_gpu_cooldown(monkeypatch):
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 1, "busy", ""),
+            subprocess.CompletedProcess([], 0, "idle", ""),
+        ]
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: next(results))
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    args = SimpleNamespace(
+        idle_retries=3,
+        idle_retry_interval=0.25,
+        idle_samples=1,
+        idle_interval=0.0,
+    )
+
+    result, attempts = _wait_for_idle(("2",), args)
+
+    assert result.returncode == 0
+    assert attempts == 2
+    assert sleeps == [0.25]
+
+
 def test_case_environment_pins_shell_children_to_matrix_python(monkeypatch):
     monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
     environment = _case_environment(
@@ -76,10 +122,14 @@ def test_storage_wrapper_uses_the_pinned_matrix_python():
 
 
 def test_release_matrix_rejects_worker_errors_despite_zero_exit_code():
-    output = "generation completed\nWorkerProc hit an exception.\n"
+    output = (
+        "generation completed\nWorkerProc hit an exception.\n"
+        "Process manager: force killing remaining process\n"
+    )
 
     assert _fatal_runtime_log_markers(output) == (
         "WorkerProc hit an exception.",
+        "Process manager: force killing remaining process",
     )
     assert _fatal_runtime_log_markers("generation completed\n") == ()
 
