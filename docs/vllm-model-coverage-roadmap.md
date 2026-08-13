@@ -12,6 +12,7 @@ versioned discovery snapshot, not a support claim.
 | Target upstream commit | `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
 | Current DMI port under validation | vLLM `v0.25.1` / `752a3a504485790a2e8491cacbb35c137339ad34` |
 | Registry source | [`v0.27.1` model registry](https://github.com/vllm-project/vllm/blob/v0.27.1/vllm/model_executor/models/registry.py) |
+| Runtime registry evidence | [`vllm-0.27.1-runtime-registry.json`](vllm-0.27.1-runtime-registry.json), official wheel, 41/41 lazy classes resolved |
 | Upstream test exemplars | [`v0.27.1` test registry](https://github.com/vllm-project/vllm/blob/v0.27.1/tests/models/registry.py) |
 | Popularity/config source | timestamped [Hugging Face model API](https://huggingface.co/docs/hub/api) lookups of official publisher checkpoints |
 
@@ -26,7 +27,12 @@ per family.
 The inventory was generated with the `dmi-port-vllm` skill's
 `catalog_vllm_models.py`. It resolves each checkpoint's declared architecture
 against the exact target registry and separately inspects DMI's static remap.
-Across the 41 representative checkpoints below:
+The source catalog was also replayed through the official `vllm==0.27.1` wheel
+in a CPU-only process with Python 3.12.8 and PyTorch 2.13.0+cu130. The
+repository verifier resolved all 41 lazy classes, including Kimi-K3 and
+DeepSeek-V4 under `vllm.models.*`. This is stronger import evidence than parsing
+the registry source, but remains upstream-static evidence rather than DMI
+runtime support. Across the 41 representative checkpoints below:
 
 - all 41 resolve in vLLM 0.27.1;
 - 5 architectures have a DMI model remap today;
