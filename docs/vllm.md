@@ -45,6 +45,9 @@ independently executed on this port.
 See the
 [`vLLM 0.25.1 compatibility audit`](vllm-0.25.1-compatibility-audit.md) for the
 exact tested cells, exclusions, checklist results, and commit pair.
+The [`model coverage roadmap`](vllm-model-coverage-roadmap.md) records the
+versioned backlog for the current upstream vLLM release; entries in that roadmap
+are discovery targets rather than support claims.
 
 Model support is architecture-based, so different checkpoint sizes in the
 same family do not require another DMI model class. Quantized checkpoints and
