@@ -148,6 +148,7 @@ _ARCH_REMAP = {
     "Ernie4_5ForCausalLM": "Ernie4_5PForCausalLM",
     "FalconH1ForCausalLM": "FalconH1PForCausalLM",
     "Gemma3ForCausalLM": "Gemma3PForCausalLM",
+    "Gemma4ForConditionalGeneration": "Gemma4PForConditionalGeneration",
     "GPT2LMHeadModel": "GPT2PLMHeadModel",
     "GraniteForCausalLM": "GranitePForCausalLM",
     "JambaForCausalLM": "JambaPForCausalLM",
@@ -183,6 +184,9 @@ _DMI_MODEL_VARIANTS = {
     "Lfm2PForCausalLM": "lfm2_p:Lfm2PForCausalLM",
     "MiniCPMPForCausalLM": "minicpm_p:MiniCPMPForCausalLM",
     "Qwen2PForCausalLM": "qwen2_p:Qwen2PForCausalLM",
+    "Gemma4PForConditionalGeneration": (
+        "gemma4_p:Gemma4PForConditionalGeneration"
+    ),
     "Qwen2MoePForCausalLM": "qwen2_moe_p:Qwen2MoePForCausalLM",
     "Qwen3PForCausalLM": "qwen3_p:Qwen3PForCausalLM",
     "LlamaPForCausalLM": "llama_p:LlamaPForCausalLM",
