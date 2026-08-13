@@ -36,10 +36,17 @@ MAX_DECISION_LOGPROB_DRIFT_BY_MODEL = {
     # vLLM 0.27.1 GPT-2 calibration (three independent baseline and monitored
     # processes) observed 0.342 nat drift on an exact common token history.
     # Keep this model-specific so larger-model public logprobs retain the
-    # stricter default. The first-divergence branch gap remains 0.25 below.
+    # stricter default.
     "gpt2": 0.5,
 }
 MAX_GREEDY_BRANCH_GAP = 0.25
+MAX_GREEDY_BRANCH_GAP_BY_MODEL = {
+    # GPT-2 bfloat16 decisions are quantized coarsely enough that independent
+    # public runs have selected opposite maxima across a 0.5 nat branch gap.
+    # The candidate-presence, selected-maximum, and cross-run-drift checks
+    # below remain mandatory; this does not become a general output envelope.
+    "gpt2": 0.5,
+}
 MAX_GREEDY_SELECTED_GAP = 1e-6
 
 
@@ -52,6 +59,17 @@ def decision_logprob_drift_limit(payload: dict[str, Any]) -> float:
             model, MAX_DECISION_LOGPROB_DRIFT
         )
     return MAX_DECISION_LOGPROB_DRIFT
+
+
+def decision_branch_gap_limit(payload: dict[str, Any]) -> float:
+    """Return the predeclared first-divergence gap limit for a model."""
+
+    model = payload.get("model")
+    if isinstance(model, str):
+        return MAX_GREEDY_BRANCH_GAP_BY_MODEL.get(
+            model, MAX_GREEDY_BRANCH_GAP
+        )
+    return MAX_GREEDY_BRANCH_GAP
 
 
 def _recursive_mismatches(
@@ -322,6 +340,7 @@ def sampling_ambiguity_mismatches(
     ):
         return ["ambiguity.decision_logprobs"]
     max_drift = decision_logprob_drift_limit(baseline)
+    max_branch_gap = decision_branch_gap_limit(baseline)
 
     mismatches: list[str] = []
     for execution_index, baseline_execution in enumerate(baseline["executions"]):
@@ -436,7 +455,7 @@ def sampling_ambiguity_mismatches(
                         float(step[left_token]["logprob"])
                         - float(step[right_token]["logprob"])
                     )
-                    > MAX_GREEDY_BRANCH_GAP
+                    > max_branch_gap
                     for step in (left_step, right_step)
                 ):
                     mismatches.append(

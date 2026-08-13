@@ -115,7 +115,7 @@ the repository package loader's single canonical path.
 
 ## Current focused evidence
 
-The target environment passed 217/217 focused tests. This includes version and
+The target environment passed 219/219 focused tests. This includes version and
 registry compatibility, model hook inventories, black-box/comparator contracts,
 request ordering and padding, MoE routing, ClickHouse test utilities, GPU-idle
 gating, generated black-box cases, process-group cleanup, and release-runner
@@ -136,10 +136,17 @@ monitored processes over the identical corpus showed:
 
 The oracle therefore uses a checkpoint-specific 0.5 nat drift ceiling for the
 `gpt2` release cell while retaining 0.25 for every other model. Candidate
-presence, selected gap `1e-6`, branch gap 0.25, finite/schema validation, and
-cumulative-logprob reconstruction are unchanged. CPU regressions reject the
-same drift for non-GPT-2 payloads and reject GPT-2 drift above 0.5. A fresh
-eager+graph GPT-2 public run passed 2/2 after calibration.
+presence, selected gap `1e-6`, finite/schema validation, and cumulative-logprob
+reconstruction remain mandatory. A later clean matrix observed one GPT-2 graph
+decision with a 0.5 nat baseline branch gap, a tied monitored branch, zero
+selected-to-public-maximum gap, both candidates present, and per-candidate
+cross-run drift below the already calibrated 0.5 ceiling. Four independent
+graph reruns and twelve active/null-mode isolation runs were exact; three more
+full eager+graph replicas reproduced one eager branch reversal whose two
+outputs had both appeared in independent baselines. The GPT-2 branch-gap ceiling
+is therefore also 0.5, while every other model remains at 0.25. CPU regressions
+reject the same gap/drift for non-GPT-2 payloads and reject GPT-2 evidence above
+0.5.
 
 The release runner also retries the full three-sample idle check through a
 bounded post-case cooldown. This prevents transient utilization from a just-
@@ -148,7 +155,7 @@ never bypasses the idle thresholds or terminates unrelated work.
 
 The first clean-commit 0.27.1 accelerator sweep at root
 `fe35f1d672e74f938da50b600971537ac71e8b3f` passed all 18/18 case processes:
-five public eager+graph cells and twelve storage cells with 447,456/447,456
+five public eager+graph cells and twelve storage cells with 395,896/395,896
 reference rows bitwise equal. Evidence inspection nevertheless rejected that
 run as final release proof because four graph+TP2 storage logs let the frontend
 force-kill EngineCore after its five-second destructor timeout, and one Qwen3
@@ -179,7 +186,7 @@ only rewrite is `fdfe631884ae318050ce371e472c1135f317cfa2`.
 1. Root `vllm-0.27-support` and integration `dmi-v0.27.1` branches: complete.
 2. Target-native rebuild, loaded-path check, and ABI parity: complete.
 3. Boundary inventory/map, target drift adaptations, and focused regressions:
-   complete at 217/217.
+   complete at 219/219.
 4. Separate-process public black-box eager/graph and scoped storage TP1/TP2:
    value/transparency sweep complete, W07 clean-commit requalification pending.
 5. Only after phase 0 evidence is complete, add roadmap families one contract

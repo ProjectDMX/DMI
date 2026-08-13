@@ -9,6 +9,7 @@ import pytest
 from tests.blackbox.contracts import (
     baseline_envelope_mismatches,
     baseline_instabilities,
+    decision_branch_gap_limit,
     decision_logprob_drift_limit,
     metamorphic_mismatches,
     sampling_ambiguity_mismatches,
@@ -450,6 +451,78 @@ def test_sampling_ambiguity_rejects_gpt2_drift_above_calibration() -> None:
 
     assert sampling_ambiguity_mismatches(baseline, monitored) == [
         "ambiguity.batch.case-a.outputs[0].decision_logprobs[0]"
+    ]
+
+
+def test_sampling_ambiguity_uses_calibrated_gpt2_branch_gap_only() -> None:
+    common = [_decision_row(2, -0.1, 1)]
+    baseline_step = [
+        _decision_row(4, -2.0, 1),
+        _decision_row(5, -2.5, 2),
+    ]
+    monitored_step = [
+        _decision_row(4, -2.25, 2),
+        _decision_row(5, -2.25, 1),
+    ]
+    baseline = _with_decision_trace(
+        _payload(),
+        execution=0,
+        result=0,
+        tokens=[2, 4],
+        steps=[common, baseline_step],
+        mode="baseline",
+    )
+    baseline["model"] = "gpt2"
+    monitored = _with_decision_trace(
+        baseline,
+        execution=0,
+        result=0,
+        tokens=[2, 5],
+        steps=[common, monitored_step],
+        mode="monitored",
+    )
+
+    assert decision_branch_gap_limit(baseline) == 0.5
+    assert sampling_ambiguity_mismatches(baseline, monitored) == []
+
+    baseline["model"] = "qwen2"
+    monitored["model"] = "qwen2"
+    assert decision_branch_gap_limit(baseline) == 0.25
+    assert sampling_ambiguity_mismatches(baseline, monitored) == [
+        "ambiguity.batch.case-a.outputs[0].decision_gap[1]"
+    ]
+
+
+def test_sampling_ambiguity_rejects_gpt2_branch_gap_above_calibration() -> None:
+    common = [_decision_row(2, -0.1, 1)]
+    baseline_step = [
+        _decision_row(4, -2.0, 1),
+        _decision_row(5, -2.51, 2),
+    ]
+    monitored_step = [
+        _decision_row(4, -2.255, 2),
+        _decision_row(5, -2.255, 1),
+    ]
+    baseline = _with_decision_trace(
+        _payload(),
+        execution=0,
+        result=0,
+        tokens=[2, 4],
+        steps=[common, baseline_step],
+        mode="baseline",
+    )
+    baseline["model"] = "gpt2"
+    monitored = _with_decision_trace(
+        baseline,
+        execution=0,
+        result=0,
+        tokens=[2, 5],
+        steps=[common, monitored_step],
+        mode="monitored",
+    )
+
+    assert sampling_ambiguity_mismatches(baseline, monitored) == [
+        "ambiguity.batch.case-a.outputs[0].decision_gap[1]"
     ]
 
 
