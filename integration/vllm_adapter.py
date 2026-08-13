@@ -145,6 +145,7 @@ _LLAMA_COMPAT_ARCHES = {
 
 _ARCH_REMAP = {
     "ApertusForCausalLM": "ApertusPForCausalLM",
+    "DeepseekV4ForCausalLM": "DeepseekV4PForCausalLM",
     "Ernie4_5ForCausalLM": "Ernie4_5PForCausalLM",
     "FalconH1ForCausalLM": "FalconH1PForCausalLM",
     "Gemma3ForCausalLM": "Gemma3PForCausalLM",
@@ -174,6 +175,7 @@ _ARCH_REMAP = {
 # the parent process can initialize CUDA before vLLM forks its workers.
 _DMI_MODEL_VARIANTS = {
     "ApertusPForCausalLM": "apertus_p:ApertusPForCausalLM",
+    "DeepseekV4PForCausalLM": "deepseek_v4_p:DeepseekV4PForCausalLM",
     "Ernie4_5PForCausalLM": "ernie45_p:Ernie4_5PForCausalLM",
     "FalconH1PForCausalLM": "falcon_h1_p:FalconH1PForCausalLM",
     "Gemma3PForCausalLM": "gemma3_p:Gemma3PForCausalLM",
