@@ -5,11 +5,11 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 GPU_LIST ARTIFACT_DIR" >&2
+    echo "Usage: $0 GPU_LIST ARTIFACT_DIR [--resume]" >&2
     echo "Example: $0 0,1,2,3 /scratch/dmi-vllm-0271-h100" >&2
 }
 
-if [[ $# -ne 2 ]]; then
+if [[ $# -lt 2 || $# -gt 3 || ( $# -eq 3 && ${3:-} != "--resume" ) ]]; then
     usage
     exit 2
 fi
@@ -37,9 +37,14 @@ fi
 
 case_timeout=${DMI_CASE_TIMEOUT_SECONDS:-7200}
 export MKL_THREADING_LAYER=${MKL_THREADING_LAYER:-GNU}
+resume_args=()
+if [[ ${3:-} == "--resume" ]]; then
+    resume_args=(--resume)
+fi
 
 exec "$python_bin" tests/tools/run_vllm_release_matrix.py \
     --phase h100-tp4 \
     --gpus "$gpu_list" \
     --case-timeout "$case_timeout" \
-    --artifact-dir "$artifact_dir"
+    --artifact-dir "$artifact_dir" \
+    "${resume_args[@]}"

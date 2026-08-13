@@ -155,6 +155,9 @@ bash tests/tools/run_h100_tp4_matrix.sh \
   0,1,2,3 /path/to/new/dmi-vllm-0271-h100-artifacts
 ```
 
+If a scheduler time limit interrupts the run after a completed case, submit the
+same command with `--resume` and the existing artifact directory.
+
 The gate first proves DMI's generic TP4 path with `Qwen/Qwen3-0.6B` using a
 public eager/graph differential and eager/graph storage comparisons. It then
 runs the seven SOTA checkpoints that fit at TP4 or below, using a public
