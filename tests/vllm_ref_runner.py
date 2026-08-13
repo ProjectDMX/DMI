@@ -23,6 +23,7 @@ _MODEL_ALIASES = {
     "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",
     "granite": "ibm-granite/granite-4.1-3b",
+    "glm52": "zai-org/GLM-5.2",
     "jamba": "ai21labs/AI21-Jamba2-3B",
     "lfm2": "tiny-random/lfm2",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",

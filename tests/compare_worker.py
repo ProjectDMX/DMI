@@ -34,6 +34,9 @@ _COMPARE_MODEL_VARIANTS = {
     "GraniteCompareForCausalLM": (
         "granite_compare:GraniteCompareForCausalLM"
     ),
+    "GlmMoeDsaCompareForCausalLM": (
+        "glm_moe_dsa_compare:GlmMoeDsaCompareForCausalLM"
+    ),
     "JambaCompareForCausalLM": (
         "jamba_compare:JambaCompareForCausalLM"
     ),
@@ -87,6 +90,7 @@ _ARCH_REMAP = {
     "Gemma3ForCausalLM": "Gemma3CompareForCausalLM",
     "GPT2LMHeadModel": "GPT2CompareForCausalLM",
     "GraniteForCausalLM": "GraniteCompareForCausalLM",
+    "GlmMoeDsaForCausalLM": "GlmMoeDsaCompareForCausalLM",
     "JambaForCausalLM": "JambaCompareForCausalLM",
     "Lfm2ForCausalLM": "Lfm2CompareForCausalLM",
     "MiniCPMForCausalLM": "MiniCPMCompareForCausalLM",
