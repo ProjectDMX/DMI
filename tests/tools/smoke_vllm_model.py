@@ -25,6 +25,7 @@ MODEL_ALIASES = {
     "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",
     "gpt_oss": "openai/gpt-oss-20b",
+    "llama4_scout": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "granite": "ibm-granite/granite-4.1-3b",
     "jamba": "ai21labs/AI21-Jamba2-3B",
@@ -132,6 +133,22 @@ def _materialize_case(case: dict, tokenizer, default_max_tokens: int):
         prompt = text
     elif form == "token_ids_from_text":
         prompt = list(tokenizer.encode(text))
+    elif form == "text_with_image":
+        from PIL import Image
+
+        image_spec = input_spec.get("image")
+        if not isinstance(image_spec, dict):
+            raise ValueError(f"{case.get('case_id')} has no image object")
+        prompt = {
+            "prompt": text,
+            "multi_modal_data": {
+                "image": Image.new(
+                    image_spec["mode"],
+                    tuple(image_spec["size"]),
+                    tuple(image_spec["color"]),
+                )
+            },
+        }
     else:
         raise ValueError(f"{case.get('case_id')} has unsupported input form {form!r}")
 

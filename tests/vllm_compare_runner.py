@@ -27,6 +27,7 @@ _MODEL_ALIASES = {
     "gemma3": "shibatch/tinygemma3-2m",
     "gpt2": "gpt2",
     "gpt_oss": "openai/gpt-oss-20b",
+    "llama4_scout": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "granite": "ibm-granite/granite-4.1-3b",
     "jamba": "ai21labs/AI21-Jamba2-3B",

@@ -69,7 +69,10 @@ def _make_model_shape_from_hf_config(
 
     Returns ``None`` if required fields are missing.
     """
-    cfg = hf_config
+    # Multimodal public wrappers keep decoder geometry under text_config.
+    # DMI's current multimodal tier observes that decoder, not the encoder or
+    # projector, so all hook shapes must derive from the same nested config.
+    cfg = getattr(hf_config, "text_config", hf_config)
     hidden_dim = getattr(cfg, "hidden_size", getattr(cfg, "n_embd", None))
     num_heads = getattr(cfg, "num_attention_heads", getattr(cfg, "n_head", None))
     num_kv_heads = getattr(cfg, "num_key_value_heads", num_heads)

@@ -10,7 +10,7 @@ H100 evidence required before a model is called supported.
 | ---: | --- | --- | --- | --- | --- |
 | 1 | `openai/gpt-oss-20b` | `GptOssForCausalLM` | `gpt_oss:GptOssForCausalLM` | full text decoder | lite implemented; H100 pending |
 | 2 | `Qwen/Qwen3-30B-A3B` | `Qwen3MoeForCausalLM` | `qwen3_moe:Qwen3MoeForCausalLM` | full text decoder | lite implemented; H100 pending |
-| 3 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | `Llama4ForConditionalGeneration` | `mllama4:Llama4ForConditionalGeneration` | multimodal decoder | queued |
+| 3 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | `Llama4ForConditionalGeneration` | `mllama4:Llama4ForConditionalGeneration` | multimodal decoder | lite implemented; H100 TP4 pending |
 | 4 | `Qwen/Qwen3.6-27B` | `Qwen3_5ForConditionalGeneration` | `qwen3_5:Qwen3_5ForConditionalGeneration` | multimodal decoder | queued |
 | 5 | `zai-org/GLM-5.2` | `GlmMoeDsaForCausalLM` | `deepseek_v2:GlmMoeDsaForCausalLM` | full text decoder | queued |
 | 6 | `MiniMaxAI/MiniMax-M2.7` | `MiniMaxM2ForCausalLM` | `minimax_m2:MiniMaxM2ForCausalLM` | full text decoder | queued |
@@ -51,7 +51,7 @@ Run the currently implemented SOTA cells with:
 ```bash
 MKL_THREADING_LAYER=GNU .venv/bin/python \
   tests/tools/run_vllm_release_matrix.py \
-  --phase sota --gpus 0,1 --artifact-dir /path/to/sota-artifacts
+  --phase sota --gpus 0,1,2,3 --artifact-dir /path/to/sota-artifacts
 ```
 
 The matrix writes bounded per-case logs and a structured manifest; only failing

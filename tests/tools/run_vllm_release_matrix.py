@@ -37,7 +37,11 @@ class MatrixCase:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gpus", required=True, help="Two physical GPU indices")
+    parser.add_argument(
+        "--gpus",
+        required=True,
+        help="Comma-separated physical GPU indices available to the matrix",
+    )
     parser.add_argument(
         "--phase",
         choices=("focused", "public", "storage", "sota", "all"),
@@ -60,13 +64,13 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _selected_gpus(value: str) -> tuple[str, str]:
+def _selected_gpus(value: str) -> tuple[str, ...]:
     values = tuple(item.strip() for item in value.split(",") if item.strip())
-    if len(values) != 2 or len(set(values)) != 2:
-        raise ValueError("--gpus must name exactly two distinct physical indices")
+    if not values or len(set(values)) != len(values):
+        raise ValueError("--gpus must name one or more distinct physical indices")
     if not all(item.isdigit() for item in values):
         raise ValueError("--gpus must contain integer physical indices")
-    return values[0], values[1]
+    return values
 
 
 def _blackbox_case(
@@ -80,6 +84,8 @@ def _blackbox_case(
     max_model_len: int = 512,
     trust_remote_code: bool = False,
     revision: str | None = None,
+    multimodal_image: bool = False,
+    generated_cases: int = 6,
 ) -> MatrixCase:
     environment = {
         "DMI_BLACKBOX_MODEL": model_arg or model_key,
@@ -87,7 +93,7 @@ def _blackbox_case(
         "DMI_BLACKBOX_GPU_MEMORY_UTILIZATION": str(memory_utilization),
         "DMI_BLACKBOX_CUDAGRAPH": "1",
         "DMI_BLACKBOX_SEED": "20260812",
-        "DMI_BLACKBOX_GENERATED_CASES": "6",
+        "DMI_BLACKBOX_GENERATED_CASES": str(generated_cases),
         "DMI_BLACKBOX_MAX_MODEL_LEN": str(max_model_len),
     }
     if model_subfolder:
@@ -96,6 +102,8 @@ def _blackbox_case(
         environment["DMI_BLACKBOX_TRUST_REMOTE_CODE"] = "1"
     if revision:
         environment["DMI_BLACKBOX_MODEL_REVISION"] = revision
+    if multimodal_image:
+        environment["DMI_BLACKBOX_MULTIMODAL_IMAGE"] = "1"
     return MatrixCase(
         case_id=f"public-{model_key}-tp{tp_size}-eager-graph",
         command=(
@@ -178,6 +186,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "tests/test_falcon_h1_p_contract.py",
             "tests/test_granite_p_contract.py",
             "tests/test_gpt_oss_p_contract.py",
+            "tests/test_llama4_p_contract.py",
             "tests/test_qwen3_moe_p_contract.py",
             "tests/test_jamba_p_contract.py",
             "tests/test_lfm2_p_contract.py",
@@ -468,6 +477,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             )
 
     gpt_oss_revision = "6cee5e81ee83917806bbde320786a8fb61efebee"
+    llama4_scout_revision = "c2b440bc2b8c784ad310291d035b8550a771f24f"
     qwen3_moe_revision = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
     sota = [
         _blackbox_case(
@@ -479,6 +489,16 @@ def build_cases(phase: str) -> list[MatrixCase]:
             revision=gpt_oss_revision,
         ),
         _blackbox_case(
+            "llama4_scout",
+            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            tp_size=4,
+            memory_utilization=0.88,
+            max_model_len=128,
+            revision=llama4_scout_revision,
+            multimodal_image=True,
+            generated_cases=2,
+        ),
+        _blackbox_case(
             "qwen3_moe",
             "Qwen/Qwen3-30B-A3B",
             tp_size=1,
@@ -488,6 +508,19 @@ def build_cases(phase: str) -> list[MatrixCase]:
         ),
     ]
     for mode in ("eager", "cudagraph"):
+        sota.append(
+            _storage_case(
+                "llama4_scout",
+                "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+                mode,
+                4,
+                ref_max_len=128,
+                max_model_len=128,
+                memory_utilization=0.88,
+                ring_mb=2048,
+                revision=llama4_scout_revision,
+            )
+        )
         sota.append(
             _storage_case(
                 "gpt_oss",
@@ -611,7 +644,7 @@ def _wait_for_idle(
     return result, args.idle_retries
 
 
-def _case_environment(case: MatrixCase, gpus: tuple[str, str]) -> dict[str, str]:
+def _case_environment(case: MatrixCase, gpus: tuple[str, ...]) -> dict[str, str]:
     selected = gpus[: case.gpu_count] if case.gpu_count else ()
     environment = dict(os.environ)
     environment.update(
@@ -669,7 +702,7 @@ def _resume_manifest(
     root_commit: str,
     integration_commit: str,
     runtime: dict[str, str],
-    gpus: tuple[str, str],
+    gpus: tuple[str, ...],
     phase: str,
 ) -> dict[str, Any]:
     try:
@@ -775,6 +808,13 @@ def main() -> None:
         for case in cases:
             print(f"{case.case_id}\tgpus={case.gpu_count}\t{' '.join(case.command)}")
         return
+
+    required_gpus = max((case.gpu_count for case in cases), default=0)
+    if len(gpus) < required_gpus:
+        raise SystemExit(
+            f"phase {args.phase} requires {required_gpus} physical GPUs; "
+            f"--gpus supplied {len(gpus)}"
+        )
 
     root_status = _git(PROJECT_ROOT, "status", "--short")
     if root_status:
