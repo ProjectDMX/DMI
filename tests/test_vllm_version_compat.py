@@ -13,6 +13,7 @@ from integration.vllm_adapter import (
     _DMI_MODEL_VARIANTS,
     _LLAMA_COMPAT_ARCHES,
 )
+from tests.compare_worker import _COMPARE_MODEL_VARIANTS
 
 
 def test_llama_registry_aliases_use_the_hooked_variant():
@@ -41,6 +42,16 @@ def test_bundled_variants_are_registered_with_official_vllm():
 
     assert set(_DMI_MODEL_VARIANTS) <= supported
     for architecture in _DMI_MODEL_VARIANTS:
+        model_cls = ModelRegistry._try_load_model_cls(architecture)
+        assert model_cls is not None
+        assert model_cls.__name__ == architecture
+
+
+def test_compare_variants_are_lazily_registered_with_official_vllm():
+    supported = set(ModelRegistry.get_supported_archs())
+
+    assert set(_COMPARE_MODEL_VARIANTS) <= supported
+    for architecture in _COMPARE_MODEL_VARIANTS:
         model_cls = ModelRegistry._try_load_model_cls(architecture)
         assert model_cls is not None
         assert model_cls.__name__ == architecture

@@ -15,6 +15,36 @@ import torch
 from integration.vllm_adapter import DMXGPUWorker
 
 
+_COMPARE_MODEL_VARIANTS = {
+    "GPT2CompareForCausalLM": "gpt2_compare:GPT2CompareForCausalLM",
+    "Qwen2MoeCompareForCausalLM": (
+        "qwen2_moe_compare:Qwen2MoeCompareForCausalLM"
+    ),
+    "Qwen3CompareForCausalLM": "qwen3_compare:Qwen3CompareForCausalLM",
+    "LlamaCompareForCausalLM": "llama_compare:LlamaCompareForCausalLM",
+}
+
+
+def _register_compare_model_variants() -> None:
+    """Lazily register test-only compare models with an official wheel."""
+
+    from vllm.model_executor.models import ModelRegistry
+
+    registered = set(ModelRegistry.get_supported_archs())
+    module_prefix = "vllm.model_executor.models."
+    for architecture, target in _COMPARE_MODEL_VARIANTS.items():
+        if architecture in registered:
+            continue
+        module_name, class_name = target.split(":", 1)
+        ModelRegistry.register_model(
+            architecture,
+            f"{module_prefix}{module_name}:{class_name}",
+        )
+
+
+_register_compare_model_variants()
+
+
 _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2CompareForCausalLM",
     "Qwen2MoeForCausalLM": "Qwen2MoeCompareForCausalLM",

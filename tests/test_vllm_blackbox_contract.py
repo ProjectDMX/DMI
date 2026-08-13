@@ -7,6 +7,8 @@ from copy import deepcopy
 import pytest
 
 from tests.blackbox.contracts import (
+    baseline_envelope_mismatches,
+    baseline_instabilities,
     metamorphic_mismatches,
     transparency_mismatches,
 )
@@ -139,6 +141,46 @@ def test_transparency_reports_missing_fields_before_comparison():
 
     assert transparency_mismatches(baseline, monitored) == [
         "missing required field: executions"
+    ]
+
+
+def test_baseline_envelope_keeps_stable_fields_exact_and_outputs_atomic():
+    first = _payload()
+    second = deepcopy(first)
+    second["executions"][0]["results"][0]["outputs"][0].update(
+        text="alternate",
+        token_ids=[9],
+    )
+    monitored = deepcopy(first)
+    monitored["mode"] = "monitored"
+    monitored["executions"][0]["results"][0]["outputs"] = deepcopy(
+        second["executions"][0]["results"][0]["outputs"]
+    )
+
+    assert baseline_instabilities([first, second]) == ["batch.case-a.outputs"]
+    assert baseline_envelope_mismatches([first, second], monitored) == []
+
+    monitored["executions"][0]["results"][0]["outputs"][0]["token_ids"] = [7]
+    assert baseline_envelope_mismatches([first, second], monitored) == [
+        "envelope.batch.case-a.outputs"
+    ]
+
+
+def test_baseline_envelope_never_relaxes_prompt_or_result_structure():
+    first = _payload()
+    second = deepcopy(first)
+    monitored = deepcopy(first)
+    monitored["mode"] = "monitored"
+    monitored["executions"][0]["results"][0]["prompt_token_ids"] = [9]
+
+    assert baseline_envelope_mismatches([first, second], monitored) == [
+        "envelope[2].executions[0].results[0].prompt_token_ids[0]"
+    ]
+
+
+def test_baseline_envelope_requires_independent_replica():
+    assert baseline_envelope_mismatches([_payload()], _payload()) == [
+        "baseline envelope requires at least two baseline processes"
     ]
 
 

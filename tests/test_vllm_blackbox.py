@@ -17,6 +17,8 @@ from tests.blackbox.case_generation import (
     generate_cases,
 )
 from tests.blackbox.contracts import (
+    baseline_envelope_mismatches,
+    baseline_instabilities,
     metamorphic_mismatches,
     transparency_mismatches,
 )
@@ -102,6 +104,15 @@ def _run(
     return json.loads(output.read_text())
 
 
+def _assert_public_payload(mode: str, payload: dict, seed: int) -> None:
+    mismatches = metamorphic_mismatches(payload)
+    assert not mismatches, (
+        f"{mode} public schema/attribution relation failed: {mismatches}\n"
+        f"case_seed={seed}\n"
+        f"payload={json.dumps(payload, indent=2, ensure_ascii=False)}"
+    )
+
+
 @pytest.mark.parametrize(
     "cudagraph",
     [False, True]
@@ -144,18 +155,52 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
         cases=cases,
         cudagraph=cudagraph,
     )
+    _assert_public_payload("baseline-1", baseline, seed)
+    _assert_public_payload("monitored", monitored, seed)
 
     mismatches = transparency_mismatches(baseline, monitored)
-    assert not mismatches, (
-        f"DMI changed public vLLM fields: {mismatches}\n"
-        f"case_seed={seed}\n"
-        f"baseline={json.dumps(baseline, indent=2, ensure_ascii=False)}\n"
-        f"monitored={json.dumps(monitored, indent=2, ensure_ascii=False)}"
-    )
-    for mode, payload in (("baseline", baseline), ("monitored", monitored)):
-        metamorphic = metamorphic_mismatches(payload)
-        assert not metamorphic, (
-            f"{mode} reverse-order public relation failed: {metamorphic}\n"
-            f"case_seed={seed}\n"
-            f"payload={json.dumps(payload, indent=2, ensure_ascii=False)}"
+    baselines = [baseline]
+    envelope_mismatches: list[str] = []
+    instabilities: list[str] = []
+    if mismatches:
+        max_baselines = int(
+            os.environ.get("DMI_BLACKBOX_MAX_BASELINES", "3")
+        )
+        if max_baselines < 2:
+            raise ValueError("DMI_BLACKBOX_MAX_BASELINES must be at least 2")
+        for replicate_index in range(2, max_baselines + 1):
+            replicate = _run(
+                "baseline",
+                run_dir / f"baseline-replica-{replicate_index}.json",
+                cases=cases,
+                cudagraph=cudagraph,
+            )
+            baselines.append(replicate)
+            _assert_public_payload(
+                f"baseline-{replicate_index}", replicate, seed
+            )
+            envelope_mismatches = baseline_envelope_mismatches(
+                baselines, monitored
+            )
+            instabilities = baseline_instabilities(baselines)
+            if instabilities and not envelope_mismatches:
+                break
+        (run_dir / "stability.json").write_text(
+            json.dumps(
+                {
+                    "strict_mismatches": mismatches,
+                    "baseline_processes": len(baselines),
+                    "baseline_instabilities": instabilities,
+                    "envelope_mismatches": envelope_mismatches,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        assert instabilities and not envelope_mismatches, (
+            "DMI output was outside the bounded public baseline envelope: "
+            f"strict={mismatches}, instabilities={instabilities}, "
+            f"envelope={envelope_mismatches}\ncase_seed={seed}\n"
+            f"baseline={json.dumps(baseline, indent=2, ensure_ascii=False)}\n"
+            f"monitored={json.dumps(monitored, indent=2, ensure_ascii=False)}"
         )

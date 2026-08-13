@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+import json
 from typing import Any
 
 
@@ -101,6 +103,98 @@ def transparency_mismatches(
         {field: monitored[field] for field in fields},
         path="",
     )
+
+
+def _without_generated_outputs(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(payload)
+    normalized["mode"] = "baseline"
+    for execution in normalized.get("executions", []):
+        if not isinstance(execution, dict):
+            continue
+        for result in execution.get("results", []):
+            if isinstance(result, dict):
+                result["outputs"] = "<baseline-envelope>"
+    return normalized
+
+
+def _output_key(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+
+def baseline_instabilities(
+    baselines: list[dict[str, Any]],
+) -> list[str]:
+    """Return identity-matched public completions varying across baselines."""
+
+    if len(baselines) < 2:
+        return []
+    reference = baselines[0]
+    instabilities: list[str] = []
+    for execution_index, execution in enumerate(reference.get("executions", [])):
+        for result_index, result in enumerate(execution.get("results", [])):
+            observed = {
+                _output_key(
+                    baseline["executions"][execution_index]["results"][
+                        result_index
+                    ].get("outputs")
+                )
+                for baseline in baselines
+            }
+            if len(observed) > 1:
+                instabilities.append(
+                    f"{execution.get('execution_id')}.{result.get('case_id')}.outputs"
+                )
+    return instabilities
+
+
+def baseline_envelope_mismatches(
+    baselines: list[dict[str, Any]],
+    monitored: dict[str, Any],
+) -> list[str]:
+    """Compare monitored output against a bounded observed baseline envelope.
+
+    All public fields except generated candidates remain exact. Each monitored
+    candidate list must equal one complete identity-matched candidate list seen
+    in an independent baseline process; fields cannot be mixed across runs.
+    """
+
+    if len(baselines) < 2:
+        return ["baseline envelope requires at least two baseline processes"]
+    reference = baselines[0]
+    mismatches: list[str] = []
+    reference_shape = _without_generated_outputs(reference)
+    for index, payload in enumerate([*baselines[1:], monitored], start=1):
+        mismatches.extend(
+            f"envelope[{index}].{path}"
+            for path in _recursive_mismatches(
+                reference_shape,
+                _without_generated_outputs(payload),
+                path="",
+            )
+        )
+    if mismatches:
+        return mismatches
+
+    for execution_index, execution in enumerate(reference["executions"]):
+        for result_index, result in enumerate(execution["results"]):
+            observed = {
+                _output_key(
+                    baseline["executions"][execution_index]["results"][
+                        result_index
+                    ]["outputs"]
+                )
+                for baseline in baselines
+            }
+            candidate = monitored["executions"][execution_index]["results"][
+                result_index
+            ]["outputs"]
+            if _output_key(candidate) not in observed:
+                mismatches.append(
+                    "envelope."
+                    f"{execution.get('execution_id')}."
+                    f"{result.get('case_id')}.outputs"
+                )
+    return mismatches
 
 
 def metamorphic_mismatches(payload: dict[str, Any]) -> list[str]:

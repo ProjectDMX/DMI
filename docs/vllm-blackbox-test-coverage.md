@@ -63,7 +63,17 @@ Generated text and token IDs are deliberately not required to match between the
 canonical and reversed calls. Changing the batch can change floating-point
 reduction shape, so even greedy decoding is not a public token-invariance
 guarantee. Those fields remain compared exactly between baseline and monitored
-for each identical call sequence, which is the DMI transparency contract.
+for each identical call sequence unless the bounded instability fallback below
+first proves that the upstream baseline itself has multiple public results.
+
+If strict baseline/monitored comparison fails, the runner executes up to two
+additional baseline processes. Stable identity-matched cases remain exact. For a
+case whose complete public candidate list varies across independent baselines,
+the monitored candidate list must equal one entire observed baseline list; it
+cannot mix fields or introduce a new result. The retained `stability.json`
+records the strict mismatch, number of baseline processes, unstable cases, and
+envelope verdict. This bounded fallback handles upstream graph/kernel
+non-repeatability without globally weakening token comparison.
 
 ## Explicit gaps
 

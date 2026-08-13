@@ -273,7 +273,11 @@ def _case_environment(case: MatrixCase, gpus: tuple[str, str]) -> dict[str, str]
     environment = dict(os.environ)
     environment.update(
         {
+            "DMI_MATRIX_PYTHON": sys.executable,
             "HF_HUB_OFFLINE": "1",
+            "PATH": os.pathsep.join(
+                [str(Path(sys.executable).parent), environment.get("PATH", "")]
+            ).rstrip(os.pathsep),
             "TRANSFORMERS_OFFLINE": "1",
             "VLLM_DISABLE_COMPILE_CACHE": "1",
             "VLLM_USE_V2_MODEL_RUNNER": "0",

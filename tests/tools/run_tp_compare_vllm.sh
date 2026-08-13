@@ -11,6 +11,7 @@
 #   DMX_HOOK_SELECTION, DMX_DB_HOST, DMX_DB_PORT
 #   DMX_DB_DATABASE, DMX_DB_TABLE, DMX_CH_PARALLELISM
 #   DMX_CH_MAX_BATCH_ITEMS, DMX_CH_MAX_BATCH_BYTES
+#   DMI_MATRIX_PYTHON (exact interpreter selected by the release matrix)
 set -e
 
 MODEL=${1:-qwen3}
@@ -53,4 +54,4 @@ echo "  model=$MODEL  mode=$MODE  tp=$TP"
 echo "  prompts=$E2E_NUM_PROMPTS  tokens=$E2E_MAX_NEW_TOKENS"
 echo "============================================"
 
-python -m tests.vllm_compare_runner
+"${DMI_MATRIX_PYTHON:-python}" -m tests.vllm_compare_runner

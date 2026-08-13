@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
 from tests.tools.run_vllm_release_matrix import (
     MatrixCase,
+    _case_environment,
     _pytest_summary,
     _resume_manifest,
     _selected_gpus,
@@ -49,6 +51,27 @@ def test_static_only_models_use_bounded_two_gpu_storage_cells():
         assert case.gpu_count == 2
         assert case.environment["DMX_HOOK_SELECTION"] == "resid_pre"
         assert case.environment["E2E_REF_MAX_LEN"] == "512"
+
+
+def test_case_environment_pins_shell_children_to_matrix_python(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    environment = _case_environment(
+        MatrixCase("storage", ("bash", "runner.sh"), {}, gpu_count=2),
+        ("2", "0"),
+    )
+
+    assert environment["DMI_MATRIX_PYTHON"] == sys.executable
+    assert environment["PATH"].split(":", 1)[0] == str(
+        Path(sys.executable).parent
+    )
+    assert environment["CUDA_VISIBLE_DEVICES"] == "2,0"
+    assert environment["E2E_GPUS"] == "2,0"
+
+
+def test_storage_wrapper_uses_the_pinned_matrix_python():
+    wrapper = Path("tests/tools/run_tp_compare_vllm.sh").read_text()
+
+    assert '"${DMI_MATRIX_PYTHON:-python}" -m tests.vllm_compare_runner' in wrapper
 
 
 def test_pytest_summary_retains_skipped_prerequisites(tmp_path: Path):
