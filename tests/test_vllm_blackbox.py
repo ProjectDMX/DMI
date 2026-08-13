@@ -42,6 +42,7 @@ MODEL_ALIASES = {
     "granite": "ibm-granite/granite-4.1-3b",
     "jamba": "ai21labs/AI21-Jamba2-3B",
     "lfm2": "tiny-random/lfm2",
+    "qwen36": "Qwen/Qwen3.6-27B",
     "qwen2": "Qwen/Qwen2.5-0.5B-Instruct",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
@@ -175,7 +176,13 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
     }
     core["cases"].extend(generate_cases(seed=seed, count=generated_count))
     if os.environ.get("DMI_BLACKBOX_MULTIMODAL_IMAGE", "0") == "1":
-        core["cases"].append(deterministic_image_case())
+        placeholder = os.environ.get(
+            "DMI_BLACKBOX_IMAGE_PLACEHOLDER",
+            "<|image|>",
+        )
+        core["cases"].append(
+            deterministic_image_case(placeholder=placeholder)
+        )
     cases = run_dir / "cases.json"
     cases.write_text(json.dumps(core, indent=2, ensure_ascii=False) + "\n")
 

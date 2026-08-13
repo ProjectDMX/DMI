@@ -47,6 +47,9 @@ _COMPARE_MODEL_VARIANTS = {
         "qwen2_moe_compare:Qwen2MoeCompareForCausalLM"
     ),
     "Qwen3CompareForCausalLM": "qwen3_compare:Qwen3CompareForCausalLM",
+    "Qwen3_5CompareForConditionalGeneration": (
+        "qwen3_5_compare:Qwen3_5CompareForConditionalGeneration"
+    ),
     "LlamaCompareForCausalLM": "llama_compare:LlamaCompareForCausalLM",
     "MistralCompareForCausalLM": (
         "mistral_compare:MistralCompareForCausalLM"
@@ -92,6 +95,7 @@ _ARCH_REMAP = {
     "MiniCPMForCausalLM": "MiniCPMCompareForCausalLM",
     "Qwen2MoeForCausalLM": "Qwen2MoeCompareForCausalLM",
     "Qwen3ForCausalLM": "Qwen3CompareForCausalLM",
+    "Qwen3_5ForConditionalGeneration": "Qwen3_5CompareForConditionalGeneration",
     "LlamaForCausalLM": "LlamaCompareForCausalLM",
     "MistralForCausalLM": "MistralCompareForCausalLM",
     "Olmo3ForCausalLM": "Olmo3CompareForCausalLM",

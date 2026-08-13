@@ -168,15 +168,18 @@ def generate_cases(*, seed: int, count: int) -> list[dict]:
     ]
 
 
-def deterministic_image_case() -> dict:
+def deterministic_image_case(*, placeholder: str = "<|image|>") -> dict:
     """Return one implementation-blind public image-input contract."""
+
+    if not placeholder:
+        raise ValueError("image placeholder must be non-empty")
 
     return {
         "case_id": "deterministic-rgb-image",
         "checklist_ids": ["P02", "P03", "P04", "P05", "P07"],
         "input": {
             "form": "text_with_image",
-            "text": "<|image|>Describe the dominant color in one word.",
+            "text": f"{placeholder}Describe the dominant color in one word.",
             "image": {
                 "mode": "RGB",
                 "size": [32, 32],

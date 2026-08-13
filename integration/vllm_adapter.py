@@ -159,6 +159,7 @@ _ARCH_REMAP = {
     "Qwen2ForCausalLM": "Qwen2PForCausalLM",
     "Qwen2MoeForCausalLM": "Qwen2MoePForCausalLM",
     "Qwen3ForCausalLM": "Qwen3PForCausalLM",
+    "Qwen3_5ForConditionalGeneration": "Qwen3_5PForConditionalGeneration",
     **{arch: "LlamaPForCausalLM" for arch in _LLAMA_COMPAT_ARCHES},
 }
 
@@ -185,6 +186,9 @@ _DMI_MODEL_VARIANTS = {
     "Qwen2PForCausalLM": "qwen2_p:Qwen2PForCausalLM",
     "Qwen2MoePForCausalLM": "qwen2_moe_p:Qwen2MoePForCausalLM",
     "Qwen3PForCausalLM": "qwen3_p:Qwen3PForCausalLM",
+    "Qwen3_5PForConditionalGeneration": (
+        "qwen3_5_p:Qwen3_5PForConditionalGeneration"
+    ),
     "LlamaPForCausalLM": "llama_p:LlamaPForCausalLM",
     "MistralPForCausalLM": "mistral_p:MistralPForCausalLM",
     "Olmo3PForCausalLM": "olmo3_p:Olmo3PForCausalLM",

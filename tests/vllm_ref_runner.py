@@ -25,6 +25,7 @@ _MODEL_ALIASES = {
     "granite": "ibm-granite/granite-4.1-3b",
     "jamba": "ai21labs/AI21-Jamba2-3B",
     "lfm2": "tiny-random/lfm2",
+    "qwen36": "Qwen/Qwen3.6-27B",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
     "llama": "meta-llama/Llama-3.1-8B-Instruct",
