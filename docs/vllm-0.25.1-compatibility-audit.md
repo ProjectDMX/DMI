@@ -4,6 +4,8 @@ This report records what was actually inspected and executed for the vLLM
 0.25.1 port. It is deliberately narrower than a blanket "vLLM 0.25 support"
 claim. The machine-readable boundary inventory is
 [`vllm-0.25.1-boundary-inventory.json`](vllm-0.25.1-boundary-inventory.json).
+The public corpus and its current limits are described in
+[`vllm-blackbox-test-coverage.md`](vllm-blackbox-test-coverage.md).
 
 ## Identity
 

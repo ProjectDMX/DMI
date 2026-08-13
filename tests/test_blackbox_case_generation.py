@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from tests.blackbox.case_generation import generate_prompts
+from tests.blackbox.case_generation import (
+    GENERATOR_VERSION,
+    generate_cases,
+    generate_prompts,
+    validate_case_corpus,
+)
 
 
 pytestmark = pytest.mark.cpu
@@ -25,3 +30,53 @@ def test_generated_cases_change_with_seed():
 def test_generated_case_count_is_validated():
     with pytest.raises(ValueError, match="non-negative"):
         generate_prompts(seed=0, count=-1)
+
+
+def test_generated_cases_are_auditable_and_reproducible():
+    cases = generate_cases(seed=17, count=3)
+
+    assert cases == generate_cases(seed=17, count=3)
+    assert GENERATOR_VERSION == 2
+    assert [case["case_id"] for case in cases] == [
+        "generated-17-000",
+        "generated-17-001",
+        "generated-17-002",
+    ]
+    for case in cases:
+        assert case["checklist_ids"]
+        assert case["dimensions"]
+        assert "differential" in case["oracles"]
+        assert "reverse-batch-order" in case["oracles"]
+        assert "scheduler-order-used-as-public-order" in case["kills"]
+
+
+def test_repository_corpus_is_complete_and_auditable():
+    import json
+    from pathlib import Path
+
+    corpus = json.loads(
+        (Path(__file__).parent / "blackbox/cases/transparency.json").read_text()
+    )
+
+    validate_case_corpus(corpus)
+    assert any(
+        case["input"]["form"] == "token_ids_from_text"
+        for case in corpus["cases"]
+    )
+    assert corpus["omitted_combinations"]
+
+
+def test_corpus_validation_rejects_unmapped_oracle_free_cases():
+    case = generate_cases(seed=1, count=1)[0]
+    corpus = {
+        "schema_version": 2,
+        "name": "bad",
+        "generator": {"name": "test", "version": 1},
+        "executions": ["batch", "reversed"],
+        "cases": [case],
+        "omitted_combinations": [],
+    }
+    del case["kills"]
+
+    with pytest.raises(ValueError, match="missing fields.*kills"):
+        validate_case_corpus(corpus)

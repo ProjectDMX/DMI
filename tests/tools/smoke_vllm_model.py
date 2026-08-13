@@ -47,23 +47,96 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_prompts(cases_path: Path | None) -> list[str]:
+def _load_corpus(cases_path: Path | None) -> dict:
     if cases_path is None:
-        return ["The capital of France is", "2 + 2 ="]
+        return {
+            "schema_version": 2,
+            "name": "default-smoke",
+            "generator": {"name": "manual", "version": 1},
+            "executions": ["batch", "reversed"],
+            "cases": [
+                {
+                    "case_id": "default-capital",
+                    "checklist_ids": ["P02", "P03", "P04", "P05"],
+                    "input": {"form": "text", "text": "The capital of France is"},
+                    "sampling": {"temperature": 0.0, "max_tokens": 8},
+                    "dimensions": {"prompt_form": "text"},
+                    "oracles": ["differential", "reverse-batch-order"],
+                    "kills": ["compare-only-decoded-text"],
+                },
+                {
+                    "case_id": "default-math",
+                    "checklist_ids": ["P02", "P03", "P04", "P05"],
+                    "input": {"form": "text", "text": "2 + 2 ="},
+                    "sampling": {"temperature": 0.0, "max_tokens": 8},
+                    "dimensions": {"prompt_form": "text"},
+                    "oracles": ["differential", "reverse-batch-order"],
+                    "kills": ["compare-only-decoded-text"],
+                },
+            ],
+            "omitted_combinations": [],
+        }
 
     payload = json.loads(cases_path.read_text())
-    prompts = payload.get("prompts")
-    if (
-        not isinstance(prompts, list)
-        or not prompts
-        or not all(isinstance(prompt, str) for prompt in prompts)
-    ):
-        raise ValueError(f"{cases_path} must contain a non-empty string prompts list")
-    return prompts
+    from tests.blackbox.case_generation import validate_case_corpus
+
+    try:
+        validate_case_corpus(payload)
+    except ValueError as error:
+        raise ValueError(f"{cases_path}: {error}") from error
+    return payload
 
 
 def _optional_list(value):
     return None if value is None else list(value)
+
+
+def _materialize_case(case: dict, tokenizer, default_max_tokens: int):
+    input_spec = case.get("input")
+    if not isinstance(input_spec, dict):
+        raise ValueError(f"{case.get('case_id')} has no input object")
+    form = input_spec.get("form")
+    text = input_spec.get("text")
+    if not isinstance(text, str):
+        raise ValueError(f"{case.get('case_id')} input.text must be a string")
+    if form == "text":
+        prompt = text
+    elif form == "token_ids_from_text":
+        prompt = list(tokenizer.encode(text))
+    else:
+        raise ValueError(f"{case.get('case_id')} has unsupported input form {form!r}")
+
+    sampling = dict(case.get("sampling", {}))
+    sampling.setdefault("temperature", 0.0)
+    sampling.setdefault("max_tokens", default_max_tokens)
+    allowed = {"temperature", "max_tokens", "top_p", "top_k", "min_tokens"}
+    unexpected = sorted(set(sampling) - allowed)
+    if unexpected:
+        raise ValueError(
+            f"{case.get('case_id')} has unsupported sampling fields {unexpected}"
+        )
+    return prompt, sampling
+
+
+def _serialize_request(case_id: str, output) -> dict:
+    return {
+        "case_id": case_id,
+        "request_id": output.request_id,
+        "prompt": output.prompt,
+        "prompt_token_ids": _optional_list(output.prompt_token_ids),
+        "finished": output.finished,
+        "outputs": [
+            {
+                "index": completion.index,
+                "text": completion.text,
+                "token_ids": list(completion.token_ids),
+                "cumulative_logprob": completion.cumulative_logprob,
+                "finish_reason": completion.finish_reason,
+                "stop_reason": completion.stop_reason,
+            }
+            for completion in output.outputs
+        ],
+    }
 
 
 def main() -> None:
@@ -95,29 +168,57 @@ def main() -> None:
             },
         )
 
-    prompts = _load_prompts(args.cases)
+    corpus = _load_corpus(args.cases)
     llm = LLM(**kwargs)
     try:
-        outputs = llm.generate(
-            prompts,
-            SamplingParams(temperature=0.0, max_tokens=args.max_tokens),
-        )
+        tokenizer = llm.get_tokenizer()
+        materialized = {
+            case["case_id"]: _materialize_case(
+                case, tokenizer, args.max_tokens
+            )
+            for case in corpus["cases"]
+        }
+        canonical_order = [case["case_id"] for case in corpus["cases"]]
+        execution_orders = {
+            "batch": canonical_order,
+            "reversed": list(reversed(canonical_order)),
+        }
+        executions = []
+        for execution_id in corpus["executions"]:
+            case_order = execution_orders[execution_id]
+            prompts = [materialized[case_id][0] for case_id in case_order]
+            sampling_params = [
+                SamplingParams(**materialized[case_id][1])
+                for case_id in case_order
+            ]
+            outputs = llm.generate(
+                prompts,
+                sampling_params,
+                use_tqdm=False,
+            )
+            if len(outputs) != len(case_order):
+                raise RuntimeError(
+                    f"public LLM.generate returned {len(outputs)} outputs for "
+                    f"{len(case_order)} inputs"
+                )
+            executions.append(
+                {
+                    "execution_id": execution_id,
+                    "case_order": case_order,
+                    "results": [
+                        _serialize_request(case_id, output)
+                        for case_id, output in zip(case_order, outputs)
+                    ],
+                }
+            )
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "mode": args.mode,
             "model": model_id,
             "cudagraph": args.cudagraph,
             "tensor_parallel_size": args.tensor_parallel_size,
-            "prompts": prompts,
-            "prompt_token_ids": [
-                _optional_list(output.prompt_token_ids) for output in outputs
-            ],
-            "token_ids": [list(output.outputs[0].token_ids) for output in outputs],
-            "texts": [output.outputs[0].text for output in outputs],
-            "finish_reasons": [
-                output.outputs[0].finish_reason for output in outputs
-            ],
-            "stop_reasons": [output.outputs[0].stop_reason for output in outputs],
+            "corpus": corpus,
+            "executions": executions,
         }
     finally:
         try:

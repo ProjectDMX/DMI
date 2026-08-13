@@ -1,12 +1,73 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "vllm-transparency-core",
-  "prompts": [
-    "The capital of France is",
-    "Hi",
-    "Unicode and emoji: café, 東京, 🚀",
-    "Shared prefix for cache behavior: alpha beta gamma, first continuation:",
-    "Shared prefix for cache behavior: alpha beta gamma, second continuation:",
-    "This deliberately longer request creates a ragged batch beside short prompts. Repeatable public API behavior matters more than the semantic quality of this continuation."
+  "generator": {
+    "name": "dmi-vllm-public-cases",
+    "version": 2,
+    "seed": null,
+    "generated_count": 0
+  },
+  "executions": ["batch", "reversed"],
+  "cases": [
+    {
+      "case_id": "core-one-token-tail",
+      "checklist_ids": ["S03", "S05", "P03", "P05"],
+      "input": {"form": "text", "text": "Hi"},
+      "sampling": {"temperature": 0.0, "max_tokens": 1},
+      "dimensions": {"prompt_form": "text", "batch_shape": "short", "generation_length": "one"},
+      "oracles": ["differential", "reverse-batch-order"],
+      "kills": ["omit-final-completion", "compare-only-decoded-text"]
+    },
+    {
+      "case_id": "core-unicode",
+      "checklist_ids": ["P02", "P03", "P04"],
+      "input": {"form": "text", "text": "Unicode and emoji: café, 東京, 🚀"},
+      "sampling": {"temperature": 0.0, "max_tokens": 8},
+      "dimensions": {"prompt_form": "text", "batch_shape": "ragged", "content": "unicode"},
+      "oracles": ["differential", "reverse-batch-order"],
+      "kills": ["lossy-prompt-serialization", "compare-only-decoded-text"]
+    },
+    {
+      "case_id": "core-shared-prefix-a",
+      "checklist_ids": ["S02", "S04", "G07", "P07"],
+      "input": {"form": "text", "text": "Shared prefix for cache behavior: alpha beta gamma, first continuation:"},
+      "sampling": {"temperature": 0.0, "max_tokens": 8},
+      "dimensions": {"prompt_form": "text", "batch_shape": "shared-prefix", "continuation": "a"},
+      "oracles": ["differential", "reverse-batch-order"],
+      "kills": ["scheduler-order-used-as-public-order", "shared-prefix-attribution-collision"]
+    },
+    {
+      "case_id": "core-shared-prefix-b",
+      "checklist_ids": ["S02", "S04", "G07", "P07"],
+      "input": {"form": "text", "text": "Shared prefix for cache behavior: alpha beta gamma, second continuation:"},
+      "sampling": {"temperature": 0.0, "max_tokens": 8},
+      "dimensions": {"prompt_form": "text", "batch_shape": "shared-prefix", "continuation": "b"},
+      "oracles": ["differential", "reverse-batch-order"],
+      "kills": ["scheduler-order-used-as-public-order", "shared-prefix-attribution-collision"]
+    },
+    {
+      "case_id": "core-ragged-long",
+      "checklist_ids": ["S02", "S03", "G01", "G02", "P07"],
+      "input": {"form": "text", "text": "This deliberately longer request creates a ragged batch beside short prompts. Repeatable public API behavior matters more than the semantic quality of this continuation."},
+      "sampling": {"temperature": 0.0, "max_tokens": 8},
+      "dimensions": {"prompt_form": "text", "batch_shape": "ragged-long", "generation_length": "multi-step"},
+      "oracles": ["differential", "reverse-batch-order"],
+      "kills": ["padded-rows-treated-as-real", "scheduler-order-used-as-public-order"]
+    },
+    {
+      "case_id": "core-token-ids",
+      "checklist_ids": ["P02", "P03", "P07"],
+      "input": {"form": "token_ids_from_text", "text": "Public token ID input must stay distinct."},
+      "sampling": {"temperature": 0.0, "max_tokens": 8},
+      "dimensions": {"prompt_form": "token_ids", "batch_shape": "ragged", "generation_length": "multi-step"},
+      "oracles": ["differential", "reverse-batch-order"],
+      "kills": ["token-input-retokenized", "compare-only-decoded-text"]
+    }
+  ],
+  "omitted_combinations": [
+    {"dimension": "async/serve/streaming/cancellation", "reason": "outside the current V1 offline compatibility cell"},
+    {"dimension": "n>1/speculative/beam", "reason": "multi-sequence support is not currently claimed"},
+    {"dimension": "logprobs", "reason": "covered by a separate full-vocabulary comparator, not this smoke corpus"},
+    {"dimension": "capacity/storage failures", "reason": "requires the scoped transport/storage negative-path suite"}
   ]
 }

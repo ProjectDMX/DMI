@@ -11,8 +11,15 @@ import sys
 import pytest
 
 from tests._requirements import require_cuda, require_model_cache, require_vllm
-from tests.blackbox.case_generation import generate_prompts
-from tests.blackbox.contracts import transparency_mismatches
+from tests.blackbox.case_generation import (
+    GENERATOR_NAME,
+    GENERATOR_VERSION,
+    generate_cases,
+)
+from tests.blackbox.contracts import (
+    metamorphic_mismatches,
+    transparency_mismatches,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -107,8 +114,13 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
     seed = int(os.environ.get("DMI_BLACKBOX_SEED", "20260812"))
     generated_count = int(os.environ.get("DMI_BLACKBOX_GENERATED_CASES", "6"))
     core["name"] = f"{core['name']}+generated"
-    core["seed"] = seed
-    core["prompts"].extend(generate_prompts(seed=seed, count=generated_count))
+    core["generator"] = {
+        "name": GENERATOR_NAME,
+        "version": GENERATOR_VERSION,
+        "seed": seed,
+        "generated_count": generated_count,
+    }
+    core["cases"].extend(generate_cases(seed=seed, count=generated_count))
     cases = run_dir / "cases.json"
     cases.write_text(json.dumps(core, indent=2, ensure_ascii=False) + "\n")
 
@@ -132,3 +144,10 @@ def test_monitoring_is_transparent_at_the_public_vllm_api(tmp_path, cudagraph):
         f"baseline={json.dumps(baseline, indent=2, ensure_ascii=False)}\n"
         f"monitored={json.dumps(monitored, indent=2, ensure_ascii=False)}"
     )
+    for mode, payload in (("baseline", baseline), ("monitored", monitored)):
+        metamorphic = metamorphic_mismatches(payload)
+        assert not metamorphic, (
+            f"{mode} reverse-order public relation failed: {metamorphic}\n"
+            f"case_seed={seed}\n"
+            f"payload={json.dumps(payload, indent=2, ensure_ascii=False)}"
+        )
