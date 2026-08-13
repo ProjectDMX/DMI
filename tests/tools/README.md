@@ -69,7 +69,7 @@ CUDA_VISIBLE_DEVICES=0 python tests/tools/smoke_vllm_model.py \
 ```
 
 The vLLM runners set `VLLM_USE_V2_MODEL_RUNNER=0` before importing vLLM.
-The 0.25.1 port is V1-runner-only and fails closed if an embedding process
+The 0.27.1 port is V1-runner-only and fails closed if an embedding process
 selects V2.
 
 Before starting a shared-machine multi-GPU sweep, verify the selected physical
@@ -78,10 +78,10 @@ cards are idle for consecutive samples:
 ```bash
 python tests/tools/check_gpu_idle.py --gpus 0,1 --samples 3 --interval 2
 
-# Once two physical cards are idle, run the complete vLLM 0.25.1 matrix from
+# Once two physical cards are idle, run the complete vLLM 0.27.1 matrix from
 # the intended Python environment. The output directory must not already exist.
 python tests/tools/run_vllm_release_matrix.py \
-  --gpus 0,1 --phase all --artifact-dir /tmp/dmi-vllm-0251-evidence
+  --gpus 0,1 --phase all --artifact-dir /tmp/dmi-vllm-0271-evidence
 ```
 
 > Native CUDA ring tests live separately under `tests/ring/` (built via its

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "name": "DMI repository default",
+  "adapter": "integration/vllm_adapter.py",
+  "vllm_source": "integration/vllm",
+  "scan_paths": [
+    "integration/vllm_adapter.py",
+    "integration/vllm/vllm/model_executor/models/*_p.py"
+  ],
+  "native_paths": [
+    "monitoring/csrc",
+    "monitoring/ring_transport.py"
+  ],
+  "model_dir": "integration/vllm/vllm/model_executor/models",
+  "worker_class": "DMXGPUWorker",
+  "variant_registry": "_DMI_MODEL_VARIANTS",
+  "forward_methods": [
+    "load_model"
+  ],
+  "runtime": {
+    "adapter_module": "integration.vllm_adapter",
+    "variant_registry": "_DMI_MODEL_VARIANTS",
+    "worker_module": "vllm.v1.worker.gpu_worker",
+    "worker_class": "Worker",
+    "worker_methods": [
+      "load_model",
+      "execute_model",
+      "compile_or_warm_up_model"
+    ],
+    "registry_module": "vllm.model_executor.models",
+    "registry_class": "ModelRegistry",
+    "registry_resolver": "_try_load_model_cls"
+  }
+}

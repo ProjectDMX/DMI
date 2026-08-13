@@ -1,21 +1,23 @@
-# DMI-vLLM 0.27.1 pre-port audit
+# DMI-vLLM 0.27.1 compatibility audit
 
-This is the agent-authored discovery record for the next version port. It is
-not a support claim. Final checklist verdicts require a dedicated 0.27.1
-worktree, a native rebuild, focused regressions, and accelerator evidence.
+This is the agent-authored discovery and validation record for the versioned
+0.27.1 port. It is not a support claim until the accelerator matrix closes all
+claimed cells. Static, ABI, registry, and focused CPU gates are complete;
+accelerator and storage validation remain explicit gates below.
 
 ## Audit header
 
 | Field | Value |
 | --- | --- |
-| DMI discovery commit | `dc9b642267366f242537338ef70e308b47732716` |
+| DMI replay basis | `2f0a0ec56a8af7647633fea38d61c7e689dfb2b0` |
 | Previous supported basis | vLLM `v0.25.1` / `752a3a504485790a2e8491cacbb35c137339ad34` |
-| Previous vLLM integration | `2228df2b07ebcdb68dcf836dc46f1587fec2cdd1` |
+| Previous vLLM integration | `6f1fce945c54b96255d1eacd726918d538d5d707` |
 | Target | vLLM `v0.27.1` / `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
 | Integration shape | root adapter plus versioned vLLM patch branch and official-wheel lazy registration |
 | Target runtime inspected | official `vllm==0.27.1` PyPI wheel |
 | Target environment | Python 3.12.8, PyTorch 2.13.0+cu130, CUDA build 13.0 |
-| Initial claim | none; V1 offline discovery only |
+| DMI target integration | branch `dmi-v0.27.1`, commit `fdfe631884ae318050ce371e472c1135f317cfa2` |
+| Candidate claim | V1 offline API; five existing production variants; eager and supported CUDA-graph cells; topology per matrix only |
 | Explicitly outside this discovery | V2, serving, async, speculative, quantized, PP/DP/EP/SP, multimodal runtime |
 | Auditor/date | Codex agent / 2026-08-13 UTC |
 
@@ -42,6 +44,14 @@ The versioned artifact
 and repository verifier resolve 41/41 roadmap architectures through the exact
 wheel, with zero failures. That proves only R01/R05/R07 upstream packaging and
 lazy-target availability. It does not prove DMI remap validity or execution.
+
+The repository-owned profile
+[`vllm-api-audit-profile.json`](vllm-api-audit-profile.json) discovers 240
+boundary candidates, grouped into 131 semantic boundaries. The agent-authored
+[`vllm-0.27.1-api-boundary-map.json`](vllm-0.27.1-api-boundary-map.json) maps
+all 131/131 group IDs to W/C/S/G/M/R/N/L/P checklist rows; it contains no null
+or empty mappings. This closes inventory coverage only. Behavioral verdicts
+still depend on the source and runtime evidence in this report.
 
 ## Core semantic diff
 
@@ -76,43 +86,55 @@ remapped names never inherit a DMI verdict automatically.
 
 | DMI variant | Target source drift | Discovery status | Required port action |
 | --- | --- | --- | --- |
-| GPT-2 | 43 changed lines | `change-required` | Replace the copied manual loader with target `AutoWeightsLoader` plus the target Conv1D transpose generator; preserve attention-mask skips and add a loader regression. |
-| Qwen2 | 4 changed lines | `compatible` pending focused test | Target base now detects mixed attention through `config.layer_types`; DMI subclasses the target base at runtime, but constructor behavior and sliding-window cells must be verified. |
-| Qwen3 | 4 added lines | `change-required` | Thread `per_layer_sliding_window` through the copied attention and decoder-layer constructors. Test both absent and configured values. |
-| Llama | no target file diff | `compatible` at source level | Re-run constructor, loader, hook inventory, TP2, eager, graph, and storage cells. Aliases remain separate evidence rows. |
-| Qwen2-MoE | 6 changed lines | `change-required` evidence | Target replaces `FusedMoE` with `FusedMoEFactory`. Revalidate `experts.router.select_experts`, routing tensor semantics, loader behavior, and TP/EP ownership before retaining the wrapper. |
+| GPT-2 | 43 changed lines | `adapted-verified` at focused scope | All P/compare/ref variants use target `AutoWeightsLoader` and Conv1D transpose generator; loader/transpose regressions pass. GPU cells pending. |
+| Qwen2 | 4 changed lines | `adapted-verified` at focused scope | Dynamic `positions` dimension matches 0.27.1 and lazy registry/inventory tests pass. GPU cells pending. |
+| Qwen3 | 4 added lines | `adapted-verified` at focused scope | `per_layer_sliding_window` is threaded through P/compare/ref attention and decoder layers; propagation regressions pass. GPU cells pending. |
+| Llama | no target file diff | `unchanged-verified` at source/focused scope | Packed weight loader and hook inventory are preserved. TP2 eager/graph/storage revalidation pending. |
+| Qwen2-MoE | 6 changed lines | `adapted-verified` at focused scope | Target factory returns a runner exposing `router.select_experts`; focused routing tests verify call order, shapes, and dtypes. TP2/EP runtime ownership remains matrix-scoped. |
 
 `compatible` here is a pre-edit discovery status, not a final
 `unchanged-verified` verdict.
 
 ## Native ABI gate
 
-The current repository extension was built in the 0.25.1 environment against
-PyTorch 2.11.0+cu130. The 0.27.1 wheel installs PyTorch 2.13.0+cu130. Reusing
-the old extension is invalid:
+The 0.25.1 extension was built against PyTorch 2.11.0+cu130 and cannot be
+reused. The dedicated 0.27.1 worktree rebuilt ClickHouse with position-
+independent code and rebuilt the monitoring extension against PyTorch
+2.13.0+cu130/CUDA 13.0/CXX11 ABI. The loaded-path check resolves:
 
-- loading the old extension first then importing target torch produced a torch
-  C-extension symbol mismatch;
-- importing target torch first caused the repository extension loader to reject
-  the old binary.
+- vLLM from the official `vllm==0.27.1` wheel;
+- `monitoring_native_backend` from this worktree's `monitoring/` package;
+- all 23 native hook-definition rows through the package loader.
 
-Therefore N10 and every runtime/import gate involving DMI remain `blocked`
-until a dedicated 0.27.1 worktree rebuilds the extension with target PyTorch.
-An extension import by itself will not close N01-N12.
+N10 is therefore `adapted-verified` for import/ABI parity. N01-N09 and N11-N13
+retain their own focused/runtime/storage requirements; extension import alone
+does not close them. Importing the same `.so` manually under two module names is
+invalid because PyTorch operator namespaces are process-global; all tests use
+the repository package loader's single canonical path.
+
+## Current focused evidence
+
+The target environment passed 206/206 focused tests. This includes version and
+registry compatibility, model hook inventories, black-box/comparator contracts,
+request ordering and padding, MoE routing, ClickHouse test utilities, GPU-idle
+gating, generated black-box cases, process-group cleanup, and release-runner
+behavior. The target-specific model contracts live in
+`tests/test_vllm_027_model_contracts.py`.
+
+The exact patch replay is recorded in
+[`vllm-0.27.1-replay-ledger.md`](vllm-0.27.1-replay-ledger.md). Every prior DMI
+commit has an explicit target commit and semantic disposition; the final target-
+only rewrite is `fdfe631884ae318050ce371e472c1135f317cfa2`.
 
 ## Implementation and validation order
 
-1. Create root `vllm-0.27-support` and fork `dmi-v0.27.1` branches from exact
-   immutable bases after the 0.25.1 GPU matrix is understood.
-2. Rebuild ClickHouse and the monitoring native extension in the isolated
-   0.27.1 environment; verify loaded-path and enum parity.
-3. Port core V1 boundaries, fill every B/W/C/S/G/R/N/L/P checklist row, and add
-   focused regressions for warm-up/startup-plan behavior and config drift.
-4. Port the existing five models in the table above and resolve every declared
-   hook on real models.
-5. Run separate-process baseline/monitored black-box cases in eager and graph,
-   then scoped storage and TP1/TP2 gates.
-6. Only after phase 0 evidence is complete, add roadmap families one contract
-   class at a time. Keep V2 and untested API/topology cells explicit.
+1. Root `vllm-0.27-support` and integration `dmi-v0.27.1` branches: complete.
+2. Target-native rebuild, loaded-path check, and ABI parity: complete.
+3. Boundary inventory/map, target drift adaptations, and focused regressions:
+   complete at 206/206.
+4. Separate-process public black-box eager/graph and scoped storage TP1/TP2:
+   pending the clean-commit release matrix.
+5. Only after phase 0 evidence is complete, add roadmap families one contract
+   class at a time. V2 and untested API/topology cells remain explicit.
 
 No integration tag is proposed by this pre-port audit.

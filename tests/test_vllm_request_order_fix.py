@@ -98,6 +98,7 @@ def test_runtime_uses_a_coherent_supported_vllm_installation():
         (0, 18),
         (0, 19),
         (0, 25),
+        (0, 27),
     }
 
 

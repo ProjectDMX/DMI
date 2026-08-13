@@ -43,7 +43,7 @@ def _parse_args() -> argparse.Namespace:
         choices=("focused", "public", "storage", "all"),
         default="all",
     )
-    parser.add_argument("--expected-vllm-version", default="0.25.1")
+    parser.add_argument("--expected-vllm-version", default="0.27.1")
     parser.add_argument("--case-timeout", type=float, default=3600.0)
     parser.add_argument("--idle-samples", type=int, default=3)
     parser.add_argument("--idle-interval", type=float, default=2.0)
@@ -138,6 +138,7 @@ def build_cases(phase: str) -> list[MatrixCase]:
             "pytest",
             "-q",
             "tests/test_vllm_version_compat.py",
+            "tests/test_vllm_027_model_contracts.py",
             "tests/test_qwen2_p_inventory.py",
             "tests/test_vllm_blackbox_contract.py",
             "tests/test_vllm_comparator_contract.py",
@@ -301,7 +302,7 @@ def _artifact_dir(path: Path | None, *, resume: bool) -> Path:
     if path is not None:
         path.mkdir(parents=True, exist_ok=False)
         return path.resolve()
-    return Path(tempfile.mkdtemp(prefix="dmi_vllm_0251_matrix_"))
+    return Path(tempfile.mkdtemp(prefix="dmi_vllm_0271_matrix_"))
 
 
 def _validate_passed_result(result: dict[str, Any]) -> None:

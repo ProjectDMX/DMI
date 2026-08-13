@@ -9,19 +9,19 @@ DMI plugs into vLLM through:
 integration.vllm_adapter.DMXGPUWorker
 ```
 
-This branch pins vLLM 0.25.1. The exact upstream base is
-`752a3a504485790a2e8491cacbb35c137339ad34`; DMI's vLLM patch branch is
-`dmi-v0.25.1`, currently at
-`2228df2b07ebcdb68dcf836dc46f1587fec2cdd1`. The root repository's submodule
+This branch pins vLLM 0.27.1. The exact upstream base is
+`6e448d0ea9bf3d88d898b65449ca6dc2aec170ac`; DMI's vLLM patch branch is
+`dmi-v0.27.1`, currently at
+`fdfe631884ae318050ce371e472c1135f317cfa2`. The root repository's submodule
 gitlink is the authoritative DMI/vLLM commit pair. Older ports remain on their
 versioned branches rather than being overwritten by this branch.
 
 The adapter uses vLLM's public out-of-tree model registry, so the bundled
-monitored model classes also work with the matching official vLLM 0.25.1 wheel
+monitored model classes also work with the matching official vLLM 0.27.1 wheel
 without installing the whole submodule as an editable package.
 
-vLLM 0.25.1 defaults eligible dense models to its new V2 model runner. DMI's
-0.25.1 port currently supports the V1 runner only because its request-layout
+vLLM 0.27.1 defaults eligible dense models to its V2 model runner. DMI's
+0.27.1 port currently supports the V1 runner only because its request-layout
 and dispatch boundaries are different. Set this before importing `vllm`:
 
 ```bash
@@ -35,15 +35,16 @@ monitoring.
 ## Model architecture coverage
 
 The monitored variants currently exist for GPT-2, Qwen2/Qwen2.5, Qwen3,
-Qwen2-MoE, and Llama. On vLLM 0.25.1, GPT-2, Qwen2/Qwen2.5, and Qwen3 have
-runtime black-box evidence; Llama and Qwen2-MoE currently have static/import
-evidence only. Architectures that upstream vLLM implements directly with its
+Qwen2-MoE, and Llama. The vLLM 0.27.1 port has focused CPU/API evidence for all
+five variants; accelerator and storage verdicts are recorded in the 0.27.1
+compatibility audit rather than inferred from import success. Architectures
+that upstream vLLM implements directly with its
 Llama class (Aquila, Cwm, InternLM/InternLM3, IQuestCoder, legacy LLaMA, and
-Xverse) are remapped to the same monitored Llama variant but have not been
-independently executed on this port.
+Xverse) are remapped to the same monitored Llama variant but require separate
+runtime evidence before they are claimed.
 
 See the
-[`vLLM 0.25.1 compatibility audit`](vllm-0.25.1-compatibility-audit.md) for the
+[`vLLM 0.27.1 compatibility audit`](vllm-0.27.1-port-audit.md) for the
 exact tested cells, exclusions, checklist results, and commit pair.
 The [`model coverage roadmap`](vllm-model-coverage-roadmap.md) records the
 versioned backlog for the current upstream vLLM release; entries in that roadmap

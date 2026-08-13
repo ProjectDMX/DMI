@@ -1,6 +1,6 @@
 # vLLM model coverage roadmap
 
-This document defines the model backlog after the vLLM 0.25.1 port. It is a
+This document defines the model backlog for the vLLM 0.27.1 port. It is a
 versioned discovery snapshot, not a support claim.
 
 ## Snapshot and scope
@@ -10,7 +10,7 @@ versioned discovery snapshot, not a support claim.
 | Snapshot time | 2026-08-13 03:32 UTC |
 | Current upstream release | [`v0.27.1`](https://github.com/vllm-project/vllm/releases/tag/v0.27.1) |
 | Target upstream commit | `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
-| Current DMI port under validation | vLLM `v0.25.1` / `752a3a504485790a2e8491cacbb35c137339ad34` |
+| Current DMI port under validation | vLLM `v0.27.1` / `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
 | Registry source | [`v0.27.1` model registry](https://github.com/vllm-project/vllm/blob/v0.27.1/vllm/model_executor/models/registry.py) |
 | Runtime registry evidence | [`vllm-0.27.1-runtime-registry.json`](vllm-0.27.1-runtime-registry.json), official wheel, 41/41 lazy classes resolved |
 | Upstream test exemplars | [`v0.27.1` test registry](https://github.com/vllm-project/vllm/blob/v0.27.1/tests/models/registry.py) |
@@ -52,11 +52,11 @@ row must be re-audited after the worker/runner port to 0.27.1.
 
 | Representative checkpoint | architecture | vLLM 0.27.1 implementation | DMI 0.25.1 evidence | DMI 0.27.1 status |
 | --- | --- | --- | --- | --- |
-| `openai-community/gpt2` | `GPT2LMHeadModel` | `gpt2:GPT2LMHeadModel` | experimental, eager+graph | not ported |
-| `Qwen/Qwen2.5-0.5B-Instruct` | `Qwen2ForCausalLM` | `qwen2:Qwen2ForCausalLM` | experimental, eager+graph | not ported |
-| `Qwen/Qwen1.5-MoE-A2.7B-Chat` | `Qwen2MoeForCausalLM` | `qwen2_moe:Qwen2MoeForCausalLM` | static-only | not ported |
-| `Qwen/Qwen3-8B` | `Qwen3ForCausalLM` | `qwen3:Qwen3ForCausalLM` | experimental via 0.6B checkpoint, eager+graph | not ported |
-| `meta-llama/Llama-3.2-1B-Instruct` | `LlamaForCausalLM` | `llama:LlamaForCausalLM` | static-only | not ported |
+| `openai-community/gpt2` | `GPT2LMHeadModel` | `gpt2:GPT2LMHeadModel` | supported, eager+graph+storage | ported; focused gate passed, GPU revalidation pending |
+| `Qwen/Qwen2.5-0.5B-Instruct` | `Qwen2ForCausalLM` | `qwen2:Qwen2ForCausalLM` | supported, eager+graph | ported; focused gate passed, GPU revalidation pending |
+| `Qwen/Qwen1.5-MoE-A2.7B-Chat` | `Qwen2MoeForCausalLM` | `qwen2_moe:Qwen2MoeForCausalLM` | supported, TP2 eager+graph+storage | ported; factory/runner contract passed, GPU revalidation pending |
+| `Qwen/Qwen3-8B` | `Qwen3ForCausalLM` | `qwen3:Qwen3ForCausalLM` | supported via 0.6B checkpoint, eager+graph+storage | ported; focused gate passed, GPU revalidation pending |
+| `meta-llama/Llama-3.2-1B-Instruct` | `LlamaForCausalLM` | `llama:LlamaForCausalLM` | supported via 3.1-8B checkpoint, TP2 eager+graph+storage | ported; focused gate passed, GPU revalidation pending |
 
 ## Phase 1: bounded single-GPU families
 
@@ -155,6 +155,6 @@ of the following for three consecutive samples:
 - utilization remains below 10 percent.
 
 Unrelated processes are never terminated. Once two cards qualify, pin the exact
-indices with `CUDA_VISIBLE_DEVICES`/`E2E_GPUS`, run the 0.25.1 focused and public
+indices with `CUDA_VISIBLE_DEVICES`/`E2E_GPUS`, run the 0.27.1 focused and public
 black-box gates, then run the scoped ClickHouse TP=1/TP=2 transport matrix. Use a
 unique capture ID and delete only rows belonging to that capture.
