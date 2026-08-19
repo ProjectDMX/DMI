@@ -43,6 +43,8 @@ from vllm.v1.worker.gpu_worker import Worker
 from monitoring import ring_transport
 from monitoring.adaptor_base import BackendAdaptor
 from monitoring.ring_transport import (
+    HOOK_TYPE_TOPK_IDS,
+    HOOK_TYPE_TOPK_WEIGHTS,
     HookRowBasis,
     HookSpec,
     ModelShapeConfig,
@@ -591,6 +593,7 @@ class VLLMAdaptor(BackendAdaptor):
 
         if self.transport is not None and self.transport.null_offload:
             return
+        self._validate_moe_routing_capture(model, self.active_specs)
         cfg = self.model_cfg
         if cfg is None or self.ring_engine is None:
             raise RuntimeError("DMI vLLM role formulas require an attached ring")
@@ -603,6 +606,46 @@ class VLLMAdaptor(BackendAdaptor):
             hf_config=self.vllm_config.model_config.hf_config,
         )
         self._compile_role_formulas(selection)
+
+    @staticmethod
+    def _validate_moe_routing_capture(
+        model: Any,
+        specs: List[HookSpec],
+    ) -> None:
+        """Reject top-k capture when the selected MoE kernel hides routing."""
+        if not any(
+            spec.hook_type in (HOOK_TYPE_TOPK_IDS, HOOK_TYPE_TOPK_WEIGHTS)
+            for spec in specs
+        ):
+            return
+
+        from vllm.model_executor.layers.fused_moe.layer import MoERunner
+
+        moe_runners = tuple(
+            module for module in model.modules()
+            if isinstance(module, MoERunner)
+        )
+        if not moe_runners:
+            raise RuntimeError(
+                "DMI selected top-k routing hooks but found no local MoE runner"
+            )
+        if any(runner.is_monolithic for runner in moe_runners):
+            raise RuntimeError(
+                "DMI top-k routing capture requires a modular MoE backend; "
+                "select one with --moe-backend (for example, triton)."
+            )
+        if any(
+            runner.do_naive_dispatch_combine
+            or (
+                runner.moe_config.pcp_size > 1
+                and not runner.moe_config.moe_parallel_config.use_all2all_kernels
+            )
+            for runner in moe_runners
+        ):
+            raise RuntimeError(
+                "DMI top-k routing capture does not support vLLM paths that "
+                "dispatch cross-rank token rows before routing"
+            )
 
     def _compile_role_formulas(
         self, selection: _VLLMHookSelection
