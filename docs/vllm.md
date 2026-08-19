@@ -16,9 +16,12 @@ This branch pins vLLM 0.27.1. The exact upstream base is
 gitlink is the authoritative DMI/vLLM commit pair. Older ports remain on their
 versioned branches rather than being overwritten by this branch.
 
-The vLLM 0.27.1 integration passed the focused CPU suite. GPT-2 (`gpt2`) and
-Qwen3 (`Qwen/Qwen3-0.6B`) passed the TP1/PP1, TP2/PP1, and TP1/PP2 real-GPU
-regressions; each TP1/PP1 run included the eager prefix-cache probe.
+The validation scope covers offline GPT-2 (`gpt2`) and Qwen3
+(`Qwen/Qwen3-0.6B`) at TP1/PP1, TP2/PP1, and TP1/PP2, including the TP1/PP1
+prefix-cache probe. Online Qwen3 storage validation covers the same topology
+matrix through the OpenAI-compatible completions endpoint, including
+prefix-cache token ranges, topology-specific ClickHouse inventory, and
+bitwise comparison with `Qwen3Ref`.
 
 The bundled monitored model classes are registered by the patched submodule;
 the official vLLM 0.27.1 wheel alone does not contain them.
@@ -163,6 +166,28 @@ vllm serve Qwen/Qwen3-8B \
         "dmx_db_port": 9000
     }'
 ```
+
+Run the online Qwen3 storage regression with a local ClickHouse instance and
+the checkpoint available in the Hugging Face cache:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m tests.vllm_online_storage --tp 1 --pp 1
+CUDA_VISIBLE_DEVICES=0,1 python -m tests.vllm_online_storage --tp 2 --pp 1
+CUDA_VISIBLE_DEVICES=0,1 python -m tests.vllm_online_storage --tp 1 --pp 2
+```
+
+Each cell starts reference and monitored `vllm serve` processes, sends cold and
+prefix-cache-hit HTTP completion requests, validates the exact topology-specific
+ClickHouse row, shard, and token-range inventory, and compares every stored
+tensor with the same-topology `Qwen3Ref` disk dump. It uses an isolated
+temporary table and removes that table after the run. These online cells use
+eager sequential requests; the offline GPU oracle covers CUDA-graph continuous
+batching and scheduler-versus-packed-order divergence.
+
+To guarantee that the final captured rows reach storage, call
+`stop_monitoring` on every worker before terminating the server. The regression
+test enables vLLM's developer RPC on localhost and invokes this method before
+shutdown. Do not expose the developer RPC on a public interface.
 
 ## Common configuration
 

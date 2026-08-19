@@ -43,10 +43,8 @@ def bitwise_check(a: torch.Tensor, b: torch.Tensor, label: str) -> dict:
         return {"name": label, "passed": False,
                 "detail": f"device mismatch: {a.device} vs {b.device}"}
     if a.dtype != b.dtype:
-        print(f"  [WARNING] {label}: dtype mismatch {a.dtype} vs {b.dtype} — SKIPPED",
-              flush=True)
-        return {"name": label, "passed": True,
-                "detail": f"SKIPPED dtype mismatch: {a.dtype} vs {b.dtype}"}
+        return {"name": label, "passed": False,
+                "detail": f"dtype mismatch: {a.dtype} vs {b.dtype}"}
     if a.shape != b.shape:
         return {"name": label, "passed": False,
                 "detail": f"shape mismatch: {list(a.shape)} vs {list(b.shape)}"}
@@ -210,10 +208,20 @@ def main():
     ch_data: dict[tuple, torch.Tensor] = {}
     for row in raw_rows:
         _, req_id, act_name, layer_no, shard_rank, s, e, dtype_str, shape, payload = row
-        dt = _DTYPE_MAP.get(_decode(dtype_str), torch.float32)
+        dtype_name = _decode(dtype_str)
+        if dtype_name not in _DTYPE_MAP:
+            _check("db_dtype_supported", False, repr(dtype_name))
+            continue
+        dt = _DTYPE_MAP[dtype_name]
         t = torch.frombuffer(bytearray(payload), dtype=dt).reshape(list(shape))
         ch_data[(_decode(req_id), _decode(act_name), int(layer_no),
                  int(shard_rank), int(s), int(e))] = t
+
+    _check(
+        "db_rows_unique",
+        len(ch_data) == len(raw_rows),
+        f"raw={len(raw_rows)}, unique={len(ch_data)}",
+    )
 
     # Map hook names to CH act_name format
     # CH uses "blocks.hook_resid_pre" for per-layer, "final_logits" for global
@@ -272,6 +280,39 @@ def main():
 
     _check("ref_files_found", len(ref_files) > 0, f"{len(ref_files)} files")
 
+    ref_keys = [
+        (
+            req_id,
+            _HOOK_TO_CH_PREFIX.get(hook, hook),
+            layer,
+            shard,
+            start,
+            end,
+        )
+        for req_id, hook, layer, shard, start, end, _ in ref_files
+    ]
+    unique_ref_keys = set(ref_keys)
+    ch_keys = set(ch_data)
+    _check(
+        "ref_rows_unique",
+        len(unique_ref_keys) == len(ref_keys),
+        f"raw={len(ref_keys)}, unique={len(unique_ref_keys)}",
+    )
+    _check(
+        "db_ref_row_count",
+        len(raw_rows) == len(ref_files),
+        f"ClickHouse={len(raw_rows)}, reference={len(ref_files)}",
+    )
+    missing_keys = unique_ref_keys - ch_keys
+    unexpected_keys = ch_keys - unique_ref_keys
+    _check(
+        "db_ref_inventory",
+        not missing_keys and not unexpected_keys,
+        f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}; "
+        f"missing sample={sorted(missing_keys)[:3]}; "
+        f"unexpected sample={sorted(unexpected_keys)[:3]}",
+    )
+
     # Compare each ref tensor against CH
     for req_id, hook, layer, shard, start, end, pt_path in ref_files:
         ref_t = torch.load(pt_path, weights_only=True, map_location="cpu")
@@ -294,7 +335,7 @@ def main():
                 ch_t = candidates[0][1]
             elif len(candidates) > 1:
                 # Multiple segments — find overlapping ones and concatenate
-                segments = [(k[3], k[4], v) for k, v in candidates]
+                segments = [(k[4], k[5], v) for k, v in candidates]
                 segments.sort(key=lambda x: x[0])
                 # Find segments that overlap with [start, end)
                 matching = [v for s, e, v in segments if s < end and e > start]

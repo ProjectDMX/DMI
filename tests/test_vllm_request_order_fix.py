@@ -73,6 +73,7 @@ from monitoring.selection import (
     select_hook_specs,
 )
 from tests.compare_worker import CompareWorker
+from tests.ref_disk_worker import RefDiskWorker
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -280,6 +281,109 @@ def test_real_layout_keeps_immutable_copies():
     assert layout.raw_req_ids == ("B", "A")
     assert layout.computed_counts == (7, 11)
     assert layout.scheduled_counts == (3, 2)
+
+
+def test_ref_disk_oracle_slices_the_real_packed_order(tmp_path):
+    raw_a = "cmpl-a-0-aaaaaaaa"
+    raw_b = "cmpl-b-0-bbbbbbbb"
+    scheduler_output = SimpleNamespace(
+        # Deliberately opposite the real packed order below.
+        num_scheduled_tokens={raw_a: 2, raw_b: 1},
+        total_num_scheduled_tokens=3,
+    )
+
+    class _RefModel:
+        @staticmethod
+        def get_ref_buffers():
+            return {
+                "token_ids": torch.tensor([201, 101, 102], dtype=torch.int32),
+                "final_logits": torch.tensor([[20, 21], [10, 11]]),
+            }
+
+    worker = RefDiskWorker.__new__(RefDiskWorker)
+    worker.model_runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            num_reqs=2,
+            req_ids=[raw_b, raw_a],
+            num_computed_tokens_cpu=np.array([7, 3]),
+        ),
+        model=_RefModel(),
+    )
+    worker._output_dir = str(tmp_path)
+    worker._tp_rank = 0
+    worker._tp_size = 1
+    worker._pp_is_first = True
+    worker._pp_is_last = True
+
+    layout = worker._capture_packed_layout(
+        scheduler_output,
+        np.array([1, 2]),
+    )
+    worker._save_step(
+        layout.request_ids,
+        layout.scheduled_counts,
+        layout.computed_counts,
+    )
+
+    assert layout.request_ids == ("cmpl-b-0", "cmpl-a-0")
+    assert torch.equal(
+        torch.load(tmp_path / "cmpl-b-0/token_ids_T7_8.pt", weights_only=True),
+        torch.tensor([201], dtype=torch.int32),
+    )
+    assert torch.equal(
+        torch.load(tmp_path / "cmpl-a-0/token_ids_T3_5.pt", weights_only=True),
+        torch.tensor([101, 102], dtype=torch.int32),
+    )
+    assert torch.equal(
+        torch.load(
+            tmp_path / "cmpl-b-0/final_logits_T7_8.pt", weights_only=True
+        ),
+        torch.tensor([[20, 21]]),
+    )
+    assert torch.equal(
+        torch.load(
+            tmp_path / "cmpl-a-0/final_logits_T4_5.pt", weights_only=True
+        ),
+        torch.tensor([[10, 11]]),
+    )
+
+
+@pytest.mark.parametrize(
+    ("is_first", "is_last", "expected"),
+    [
+        (True, False, {"token_ids", "embed", "resid_pre"}),
+        (False, True, {"resid_pre", "resid_final", "final_ln", "final_logits"}),
+    ],
+)
+def test_ref_disk_oracle_filters_global_hooks_by_pp_stage(
+    tmp_path, is_first, is_last, expected
+):
+    buffers = {
+        "token_ids": torch.tensor([1], dtype=torch.int32),
+        "embed": torch.tensor([[2.0]]),
+        "resid_pre_L0": torch.tensor([[3.0]]),
+        "resid_final": torch.tensor([[4.0]]),
+        "final_ln": torch.tensor([[5.0]]),
+        "final_logits": torch.tensor([[6.0]]),
+    }
+
+    worker = RefDiskWorker.__new__(RefDiskWorker)
+    worker.model_runner = SimpleNamespace(
+        model=SimpleNamespace(get_ref_buffers=lambda: buffers)
+    )
+    worker._output_dir = str(tmp_path)
+    worker._tp_rank = 0
+    worker._tp_size = 1
+    worker._pp_is_first = is_first
+    worker._pp_is_last = is_last
+
+    worker._save_step(("request",), (1,), (0,))
+
+    saved = {
+        path.name.split("_L", 1)[0].split("_T", 1)[0]
+        for path in (tmp_path / "request").glob("*.pt")
+    }
+    assert saved == expected
 
 
 def test_compare_worker_saves_committed_real_layout(
