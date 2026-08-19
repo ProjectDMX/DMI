@@ -124,7 +124,6 @@ snippet below shows the minimal vLLM entry point.
 ```python
 import os
 # Required for the current vLLM integration
-os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
 from vllm import LLM, SamplingParams

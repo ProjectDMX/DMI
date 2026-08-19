@@ -21,12 +21,9 @@ from __future__ import annotations
 
 import os
 import sys
-
-# Required workaround for the void+effectful ring::producer op + vLLM's
-# AOT compile-cache serialization (see todo.md item 10).
-os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
-
 from pathlib import Path
+
+os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
 # Bootstrap: add the repo root to sys.path so `monitoring` /
 # `integration` resolve when the script is invoked directly.

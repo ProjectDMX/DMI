@@ -28,6 +28,17 @@ QWEN3_MODULES = (
 )
 
 
+def test_dense_qwen2_uses_the_registered_monitored_variant() -> None:
+    from integration.vllm_adapter import _ARCH_REMAP
+    from vllm.model_executor.models.qwen2_p import Qwen2PForCausalLM
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    monitored_arch = _ARCH_REMAP["Qwen2ForCausalLM"]
+    assert monitored_arch == "Qwen2PForCausalLM"
+    assert monitored_arch in ModelRegistry.models
+    assert callable(Qwen2PForCausalLM.get_hook_specs)
+
+
 @pytest.mark.parametrize("module_name", GPT2_MODULES)
 def test_gpt2_variants_use_v027_auto_loader_contract(
     module_name: str,

@@ -1,20 +1,14 @@
 # vLLM Usage
 
-Run DMI through the vLLM path after completing [`install.md`](install.md) and
-installing the `integration/vllm/` submodule.
+DMI currently supports vLLM 0.27.1 through the pinned
+`integration/vllm/` submodule. Complete [`install.md`](install.md) before using
+the vLLM integration.
 
 DMI plugs into vLLM through:
 
 ```text
 integration.vllm_adapter.DMXGPUWorker
 ```
-
-This branch pins vLLM 0.27.1. The exact upstream base is
-`6e448d0ea9bf3d88d898b65449ca6dc2aec170ac`; DMI's vLLM patch branch is
-`dmi-v0.27.1`, currently at
-`5c00e7369bfcf8cbbc2a770024ebe520d4c9cddc`. The root repository's submodule
-gitlink is the authoritative DMI/vLLM commit pair. Older ports remain on their
-versioned branches rather than being overwritten by this branch.
 
 The validation scope covers offline GPT-2 (`gpt2`) and Qwen3
 (`Qwen/Qwen3-0.6B`) at TP1/PP1, TP2/PP1, and TP1/PP2, including the TP1/PP1
@@ -23,12 +17,11 @@ matrix through the OpenAI-compatible completions endpoint, including
 prefix-cache token ranges, topology-specific ClickHouse inventory, and
 bitwise comparison with `Qwen3Ref`.
 
-The bundled monitored model classes are registered by the patched submodule;
-the official vLLM 0.27.1 wheel alone does not contain them.
+The official vLLM 0.27.1 wheel does not include DMI's monitored model classes;
+install the pinned submodule described above.
 
-vLLM 0.27.1 defaults eligible dense models to its V2 model runner. DMI's
-0.27.1 port currently supports the V1 runner only because its request-layout
-and dispatch boundaries are different. Set this before importing `vllm`:
+DMI currently supports the V1 model runner only. Set this before starting
+vLLM:
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -40,28 +33,14 @@ monitoring.
 
 ## Model architecture coverage
 
-The patched fork contains monitored variants for GPT-2, Qwen2/Qwen2.5, Qwen3,
-Qwen2-MoE, and Llama. The adapter automatically remaps GPT-2, Qwen3,
-Qwen2-MoE, and Llama. Dense Qwen2 remains in the fork but is not automatically
-remapped by the minimum adapter.
+- GPT-2
+- Qwen3
+- Qwen2-MoE
+- Llama
+- Qwen2/Qwen2.5
 
-Model support is architecture-based, so different checkpoint sizes in the
-same family do not require another DMI model class. Quantized checkpoints and
-nonstandard remote-code implementations still require separate validation.
-
-Pass it through `worker_cls=` in the offline `LLM(...)` API or `--worker-cls`
-in `vllm serve`.
-
-## Required runtime environment
-
-DMI's capture op is registered as a void+ordered-effect op, which the vLLM
-AOT compile cache cannot serialize correctly. Set
-`VLLM_DISABLE_COMPILE_CACHE=1` before importing `vllm`:
-
-```bash
-export VLLM_DISABLE_COMPILE_CACHE=1
-export VLLM_USE_V2_MODEL_RUNNER=0
-```
+Use `DMXGPUWorker` through `worker_cls=` in the offline `LLM(...)` API or
+`--worker-cls` in `vllm serve`.
 
 ## Offline API
 
@@ -129,9 +108,9 @@ exposes only its own request's internals; for the whole batch as one
 `[batch, seq, hidden]` tensor use `get_internal(model_id)` from
 `monitoring.internal_mapper`.
 
-Persistence is asynchronous. For a complete read before an explicit
-`stop_monitoring`, enable a bounded drain timeout and use the public retry
-contract instead of sleeping for an assumed duration:
+Persistence is asynchronous. To read while the engine remains active, enable a
+bounded drain timeout and use the public retry contract instead of sleeping for
+an assumed duration:
 
 ```python
 from transformers import AutoConfig
@@ -149,9 +128,6 @@ out[0].dmi_internal.require(
 )
 hidden_states = out[0].dmi_internal.hidden_states
 ```
-
-Without a drain timeout, call
-`llm.collective_rpc("stop_monitoring")` before the authoritative read.
 
 ## vLLM serve
 
@@ -184,10 +160,12 @@ temporary table and removes that table after the run. These online cells use
 eager sequential requests; the offline GPU oracle covers CUDA-graph continuous
 batching and scheduler-versus-packed-order divergence.
 
-To guarantee that the final captured rows reach storage, call
-`stop_monitoring` on every worker before terminating the server. The regression
-test enables vLLM's developer RPC on localhost and invokes this method before
-shutdown. Do not expose the developer RPC on a public interface.
+The online regression calls `stop_monitoring` on every monitored worker after
+the final HTTP response, waits for and validates the complete ClickHouse
+inventory, and only then terminates the server. The reference server has no DMI
+engine and does not need this call. The test enables vLLM's developer RPC on
+localhost for this terminal flush; do not expose that RPC on a public
+interface.
 
 ## Common configuration
 
