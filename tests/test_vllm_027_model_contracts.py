@@ -1,21 +1,16 @@
-"""Focused CPU contracts for DMI's vLLM 0.27.1 model variants."""
+"""Focused contracts for the model ports required by vLLM 0.27.1."""
 
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterable
 import importlib
 import inspect
 import textwrap
-from collections.abc import Iterable
+from types import SimpleNamespace
 
 import pytest
 import torch
-from torch import nn
-
-# Importing the adapter extends the official wheel's model package path and
-# registers DMI's lazy model variants without replacing the wheel runtime.
-import integration.vllm_adapter  # noqa: F401
-from monitoring.hook_points import HookPoint
 
 
 pytestmark = pytest.mark.framework_fork
@@ -34,33 +29,9 @@ QWEN3_MODULES = (
 
 
 @pytest.mark.parametrize("module_name", GPT2_MODULES)
-def test_gpt2_variants_transpose_only_hf_conv1d_weights(module_name: str) -> None:
-    module = importlib.import_module(module_name)
-    model = module.GPT2Model.__new__(module.GPT2Model)
-    conv1d_weight = torch.arange(6).reshape(2, 3)
-    ordinary_weight = torch.arange(8).reshape(2, 4)
-    bias = torch.arange(3)
-
-    converted = dict(
-        model._transpose_conv1d(
-            [
-                ("h.0.attn.c_attn.weight", conv1d_weight),
-                ("h.0.mlp.c_fc.weight", conv1d_weight),
-                ("h.0.attn.c_attn.bias", bias),
-                ("wte.weight", ordinary_weight),
-            ]
-        )
-    )
-
-    assert torch.equal(converted["h.0.attn.c_attn.weight"], conv1d_weight.t())
-    assert torch.equal(converted["h.0.mlp.c_fc.weight"], conv1d_weight.t())
-    assert converted["h.0.attn.c_attn.bias"] is bias
-    assert converted["wte.weight"] is ordinary_weight
-
-
-@pytest.mark.parametrize("module_name", GPT2_MODULES)
-def test_gpt2_variants_use_027_auto_loader_contract(
-    module_name: str, monkeypatch: pytest.MonkeyPatch
+def test_gpt2_variants_use_v027_auto_loader_contract(
+    module_name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = importlib.import_module(module_name)
     calls: dict[str, object] = {}
@@ -71,7 +42,8 @@ def test_gpt2_variants_use_027_auto_loader_contract(
             calls["skip_substrs"] = skip_substrs
 
         def load_weights(
-            self, weights: Iterable[tuple[str, torch.Tensor]]
+            self,
+            weights: Iterable[tuple[str, torch.Tensor]],
         ) -> set[str]:
             materialized = list(weights)
             calls["weights"] = materialized
@@ -102,7 +74,9 @@ def _call_forwards_keyword(function: object, keyword: str) -> bool:
 
 
 @pytest.mark.parametrize("module_name", QWEN3_MODULES)
-def test_qwen3_variants_forward_per_layer_sliding_window(module_name: str) -> None:
+def test_qwen3_variants_forward_per_layer_sliding_window(
+    module_name: str,
+) -> None:
     module = importlib.import_module(module_name)
 
     for model_type in (module.Qwen3Attention, module.Qwen3DecoderLayer):
@@ -114,81 +88,51 @@ def test_qwen3_variants_forward_per_layer_sliding_window(module_name: str) -> No
         )
 
 
-def test_qwen2_moe_variant_uses_factory_runner_router_contract() -> None:
-    module = importlib.import_module("vllm.model_executor.models.qwen2_moe_p")
-    block = module.Qwen2MoeSparseMoeBlock.__new__(
-        module.Qwen2MoeSparseMoeBlock
-    )
-    nn.Module.__init__(block)
-    events: list[tuple[str, tuple[int, ...]]] = []
+def test_llama_ref_loader_passes_the_hf_to_vllm_mapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("vllm.model_executor.models.llama_ref")
+    calls: dict[str, object] = {}
 
-    class FakeGate(nn.Module):
-        def forward(self, hidden_states: torch.Tensor):
-            events.append(("gate", tuple(hidden_states.shape)))
-            logits = torch.arange(
-                hidden_states.shape[0] * 4, dtype=torch.float32
-            ).reshape(hidden_states.shape[0], 4)
-            return logits, None
+    class FakeLoader:
+        def __init__(self, model: object, *, skip_prefixes: list[str] | None):
+            calls["model"] = model
+            calls["skip_prefixes"] = skip_prefixes
 
-    class FakeRouter:
-        def select_experts(
+        def load_weights(
             self,
-            hidden_states: torch.Tensor,
-            router_logits: torch.Tensor,
-            topk_indices_dtype: torch.dtype | None = None,
+            weights: Iterable[tuple[str, torch.Tensor]],
             *,
-            input_ids: torch.Tensor | None = None,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            assert topk_indices_dtype is None
-            assert input_ids is None
-            events.append(("route", tuple(router_logits.shape)))
-            rows = hidden_states.shape[0]
-            return (
-                torch.full((rows, 2), 0.5, dtype=torch.float32),
-                torch.arange(rows * 2, dtype=torch.int32).reshape(rows, 2) % 4,
+            mapper: object,
+        ) -> set[str]:
+            calls["weights"] = list(weights)
+            calls["mapper"] = mapper
+            return {"loaded"}
+
+    monkeypatch.setattr(module, "AutoWeightsLoader", FakeLoader)
+    model = module.LlamaRefForCausalLM.__new__(module.LlamaRefForCausalLM)
+    object.__setattr__(
+        model,
+        "config",
+        SimpleNamespace(tie_word_embeddings=False),
+    )
+    weight = torch.zeros(2, 2)
+
+    loaded = model.load_weights(
+        [("model.layers.0.self_attn.q_proj.weight", weight)]
+    )
+
+    assert loaded == {"loaded"}
+    assert calls["model"] is model
+    assert calls["skip_prefixes"] is None
+    assert calls["mapper"] is model.hf_to_vllm_mapper
+    mapped_name, mapped_weight = next(
+        iter(
+            model.hf_to_vllm_mapper.apply(
+                [("model.layers.0.self_attn.q_proj.weight", weight)]
             )
-
-    class FakeExperts(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.router = FakeRouter()
-
-        def forward(
-            self,
-            hidden_states: torch.Tensor,
-            router_logits: torch.Tensor,
-        ) -> torch.Tensor:
-            events.append(("experts", tuple(router_logits.shape)))
-            return hidden_states + 1
-
-    block.gate = FakeGate()
-    block.experts = FakeExperts()
-    block.hook_router_logits = HookPoint()
-    block.hook_topk_ids = HookPoint()
-    block.hook_topk_weights = HookPoint()
-    captured: dict[str, torch.Tensor] = {}
-    block.hook_router_logits.register_forward_hook(
-        lambda _module, _args, output: captured.setdefault("router", output)
+        )
     )
-    block.hook_topk_ids.register_forward_hook(
-        lambda _module, _args, output: captured.setdefault("ids", output)
-    )
-    block.hook_topk_weights.register_forward_hook(
-        lambda _module, _args, output: captured.setdefault("weights", output)
-    )
-
-    hidden_states = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
-    output = block(hidden_states)
-
-    assert events == [
-        ("gate", (6, 4)),
-        ("route", (6, 4)),
-        ("experts", (6, 4)),
-    ]
-    assert output.shape == hidden_states.shape
-    assert torch.equal(output, hidden_states + 1)
-    assert captured["router"].shape == (6, 4)
-    assert captured["ids"].shape == (6, 2)
-    assert captured["ids"].dtype is torch.int32
-    assert captured["weights"].shape == (6, 2)
-    assert captured["weights"].dtype is torch.float32
+    assert mapped_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert mapped_weight is weight
+    assert mapped_weight.shard_id == "q"

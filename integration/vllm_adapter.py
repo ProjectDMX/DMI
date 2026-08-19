@@ -29,9 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import os
-from pathlib import Path
 import re
-import time
 import warnings
 from typing import Any, List, Optional, Tuple
 
@@ -40,7 +38,6 @@ import torch
 
 from vllm import LLM
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
-from vllm.model_executor.models import ModelRegistry
 from vllm.v1.worker.gpu_worker import Worker
 
 from monitoring import ring_transport
@@ -112,14 +109,6 @@ def _cfg(ac: dict, key: str, env_key: str, default: Any) -> Any:
 
 _VLLM_REQ_ID_SUFFIX = re.compile(r"-[0-9a-f]{8}$")
 
-# vLLM 0.27.1 owns the default TCPStore in global rank 0.  DMI's rank-local
-# resource teardown can make rank 0 return from Worker.shutdown slightly before
-# its peers, allowing the store to disappear while another rank's NCCL heartbeat
-# thread is still stopping.  Keep the store owner alive briefly after its local
-# CUDA/model teardown; WorkerProc destroys process groups immediately after this
-# method returns, so non-owner ranks get a deterministic head start.
-_STORE_OWNER_SHUTDOWN_GRACE_S = 0.5
-
 
 def normalize_vllm_request_id(req_id: str) -> str:
     """Strip the UUID suffix that vLLM V1 appends to request IDs."""
@@ -127,75 +116,12 @@ def normalize_vllm_request_id(req_id: str) -> str:
 
 
 # Architecture remap so vLLM's registry resolves to the hooked variant.
-#
-# Keep the Llama aliases aligned with upstream registry entries that resolve
-# directly to ``llama.LlamaForCausalLM``.  These architectures therefore use
-# the same implementation and can safely share DMI's hooked Llama variant.
-_LLAMA_COMPAT_ARCHES = {
-    "AquilaModel",
-    "AquilaForCausalLM",
-    "CwmForCausalLM",
-    "InternLMForCausalLM",
-    "InternLM3ForCausalLM",
-    "IQuestCoderForCausalLM",
-    "LlamaForCausalLM",
-    "LLaMAForCausalLM",
-    "XverseForCausalLM",
-}
-
 _ARCH_REMAP = {
     "GPT2LMHeadModel": "GPT2PLMHeadModel",
-    "Qwen2ForCausalLM": "Qwen2PForCausalLM",
     "Qwen2MoeForCausalLM": "Qwen2MoePForCausalLM",
     "Qwen3ForCausalLM": "Qwen3PForCausalLM",
-    **{arch: "LlamaPForCausalLM" for arch in _LLAMA_COMPAT_ARCHES},
+    "LlamaForCausalLM": "LlamaPForCausalLM",
 }
-
-
-# DMI model variants can be consumed in two ways:
-#
-# 1. the integration/vllm fork registers them in its own registry.py; or
-# 2. an official vLLM wheel imports this adapter, which exposes the submodule's
-#    model directory as an out-of-tree model package and registers lazy class
-#    references through vLLM's public ModelRegistry API.
-#
-# Lazy strings are important here: importing model implementations eagerly in
-# the parent process can initialize CUDA before vLLM forks its workers.
-_DMI_MODEL_VARIANTS = {
-    "GPT2PLMHeadModel": "gpt2_p:GPT2PLMHeadModel",
-    "Qwen2PForCausalLM": "qwen2_p:Qwen2PForCausalLM",
-    "Qwen2MoePForCausalLM": "qwen2_moe_p:Qwen2MoePForCausalLM",
-    "Qwen3PForCausalLM": "qwen3_p:Qwen3PForCausalLM",
-    "LlamaPForCausalLM": "llama_p:LlamaPForCausalLM",
-}
-
-
-def _register_dmi_model_variants() -> None:
-    """Register bundled DMI models when running against an official wheel."""
-
-    import vllm.model_executor.models as model_package
-
-    model_dir = Path(__file__).resolve().parent / "vllm/vllm/model_executor/models"
-    if not model_dir.is_dir():
-        raise RuntimeError(f"DMI vLLM model directory is missing: {model_dir}")
-
-    package_path = str(model_dir)
-    if package_path not in model_package.__path__:
-        model_package.__path__.append(package_path)
-
-    registered = set(ModelRegistry.get_supported_archs())
-    module_prefix = "vllm.model_executor.models."
-    for architecture, target in _DMI_MODEL_VARIANTS.items():
-        if architecture in registered:
-            continue
-        module_name, class_name = target.split(":", 1)
-        ModelRegistry.register_model(
-            architecture,
-            f"{module_prefix}{module_name}:{class_name}",
-        )
-
-
-_register_dmi_model_variants()
 
 
 # ---------------------------------------------------------------------------
@@ -734,19 +660,8 @@ class VLLMAdaptor(BackendAdaptor):
         ):
             raise RuntimeError("Invalid vLLM CUDA-graph capture sizes")
 
-        if (
-            self.vllm_config.speculative_config is not None
-            and any(
-                hook_row_basis(spec.hook_type)
-                is HookRowBasis.REQUEST_ROWS
-                for specs in selection.candidate_rank_hook_sets
-                for spec in specs
-            )
-        ):
-            raise RuntimeError(
-                "DMI vLLM request-row metadata does not support "
-                "speculative decoding"
-            )
+        if self.vllm_config.speculative_config is not None:
+            raise RuntimeError("DMI vLLM does not support speculative decoding")
 
         tp_role_count = min(tp_size, 2)
 
@@ -1511,7 +1426,7 @@ class DMXGPUWorker(Worker):
         self._dmx_pp_rank = pp_rank
         self._dmx_tp_size = get_tp_group().world_size
 
-    def load_model(self, *args: Any, **kwargs: Any) -> None:
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
         # Remap the architecture string in the HF config so vLLM's
         # registry resolves to the hooked variant (Qwen3PForCausalLM
         # etc.).  Mutates vllm_config in place.
@@ -1520,10 +1435,7 @@ class DMXGPUWorker(Worker):
         new_archs = [_ARCH_REMAP.get(a, a) for a in archs]
         hf_cfg.architectures = new_archs
 
-        # vLLM 0.19 added the keyword-only ``load_dummy_weights`` argument;
-        # forwarding the call unchanged keeps this worker compatible with
-        # both the older no-argument API and the newer one.
-        super().load_model(*args, **kwargs)
+        super().load_model(load_dummy_weights=load_dummy_weights)
 
         # Now the model is materialized; install hooks via the adapter.
         if self.adaptor is None:
@@ -1582,18 +1494,9 @@ class DMXGPUWorker(Worker):
             adaptor._step_state = _VLLMStepState()
 
     def stop_monitoring(self) -> None:
-        """Flush and stop DMI, surfacing incomplete-shutdown failures.
-
-        Cleanup remains exhaustive and reentrant: every component gets a stop
-        attempt even if an earlier one fails, then the explicit caller receives
-        one aggregated error. ``shutdown()`` keeps its best-effort semantics.
-        """
-        errors: list[tuple[str, Exception]] = []
+        """Flush and stop DMI engine.  Reentrant: second call no-ops."""
         if torch.cuda.is_available():
-            try:
-                torch.cuda.synchronize()
-            except Exception as exc:
-                errors.append(("torch.cuda.synchronize", exc))
+            torch.cuda.synchronize()
 
         if self.adaptor is not None:
             engine = self.adaptor.engine
@@ -1601,32 +1504,24 @@ class DMXGPUWorker(Worker):
             if ring_engine is not None:
                 try:
                     ring_engine.stop()
-                except Exception as exc:
-                    errors.append(("ring_engine.stop", exc))
+                except Exception:
+                    pass
             try:
                 ring_transport.deactivate()
-            except Exception as exc:
-                errors.append(("ring_transport.deactivate", exc))
+            except Exception:
+                pass
             try:
                 engine.close()
-            except Exception as exc:
-                errors.append(("monitoring_engine.close", exc))
+            except Exception:
+                pass
             self.adaptor = None
 
         if self._dmx_host_engine is not None:
             try:
                 self._dmx_host_engine.stop()
-            except Exception as exc:
-                errors.append(("host_engine.stop", exc))
+            except Exception:
+                pass
             self._dmx_host_engine = None
-
-        if errors:
-            summary = "; ".join(
-                f"{operation}: {error}" for operation, error in errors
-            )
-            raise RuntimeError(
-                f"DMI monitoring shutdown was incomplete: {summary}"
-            ) from errors[0][1]
 
     def shutdown(self) -> None:
         import logging
@@ -1635,20 +1530,9 @@ class DMXGPUWorker(Worker):
                 "DMI engine not explicitly stopped before shutdown. "
                 "Data may be incomplete. Call stop_monitoring() first."
             )
-        # Best-effort flush (may be killed by vLLM's 8 s deadline). Explicit
-        # collective_rpc("stop_monitoring") calls still receive failures.
-        try:
-            self.stop_monitoring()
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "DMI monitoring shutdown was incomplete during worker teardown"
-            )
+        # Best-effort flush (may be killed by vLLM's 8 s deadline).
+        self.stop_monitoring()
         super().shutdown()
-        vllm_config = getattr(self, "vllm_config", None)
-        parallel_config = getattr(vllm_config, "parallel_config", None)
-        world_size = int(getattr(parallel_config, "world_size", 1))
-        if world_size > 1 and int(getattr(self, "rank", -1)) == 0:
-            time.sleep(_STORE_OWNER_SHUTDOWN_GRACE_S)
 
 
 def _attach_dmi_internal(outputs, model_id, reader=None):
@@ -1657,29 +1541,7 @@ def _attach_dmi_internal(outputs, model_id, reader=None):
     request -- the same object HF's ``out.dmi_internal`` gives you."""
     for r in outputs:
         rid = normalize_vllm_request_id(r.request_id)
-        prompt_token_ids = getattr(r, "prompt_token_ids", None) or ()
-        candidates = getattr(r, "outputs", None) or ()
-        generated_token_ids = (
-            getattr(candidates[0], "token_ids", None) or ()
-            if candidates
-            else ()
-        )
-        # The last sampled token is returned but is never fed through another
-        # model forward, so no activation exists for it. Describe coverage as
-        # one logical interval; the reader coalesces vLLM's physical prefill /
-        # decode segments before validating completeness.
-        forwarded_tokens = max(
-            0, len(prompt_token_ids) + len(generated_token_ids) - 1
-        )
-        token_ranges = (
-            {rid: ((0, forwarded_tokens),)} if forwarded_tokens else None
-        )
-        r.dmi_internal = make_lazy_internal(
-            model_id,
-            reader=reader,
-            request_ids=[rid],
-            token_ranges=token_ranges,
-        )
+        r.dmi_internal = make_lazy_internal(model_id, reader=reader, request_ids=[rid])
     return outputs
 
 

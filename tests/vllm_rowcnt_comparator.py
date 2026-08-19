@@ -35,7 +35,6 @@ def main():
         mon_meta = json.load(f)
     db_host = mon_meta["db_host"]
     db_port = mon_meta["db_port"]
-    capture_model_id = mon_meta["model_id"]
 
     results = {"tests": [], "passed": 0, "failed": 0}
 
@@ -51,16 +50,14 @@ def main():
             msg += f" -- {detail}"
         print(msg, flush=True)
 
-    # Read only this run. Historical and concurrent rows must not influence
-    # either row counts or value comparisons.
+    # Read ClickHouse — get all rows (table was dropped before monitored run)
     import clickhouse_driver
     ch_client = clickhouse_driver.Client(db_host, port=db_port)
     try:
         raw_rows = ch_client.execute(
             "SELECT model_id, request_id, act_name, layer_no, shard_rank, "
             "start_token_idx, end_token_idx, dtype, shape, bytes "
-            "FROM default.offload WHERE model_id = %(model_id)s",
-            {"model_id": capture_model_id},
+            "FROM default.offload",
             settings={"strings_as_bytes": True})
     except Exception as e:
         _check("db_readable", False, str(e))

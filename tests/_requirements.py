@@ -67,17 +67,13 @@ def require_gpus(n: int):
 
 
 def require_clickhouse(host: str | None = None, port: int | None = None):
-    """Skip unless the Python driver exists and ClickHouse is reachable.
+    """Skip unless a ClickHouse TCP port is reachable.
 
     Host/port default to the ``DMX_DB_HOST`` / ``DMX_DB_PORT`` env vars (and
     finally ``127.0.0.1:9000``), matching the runners' connection defaults.
     """
     host = host or os.environ.get("DMX_DB_HOST", "127.0.0.1")
     port = int(port if port is not None else os.environ.get("DMX_DB_PORT", "9000"))
-    if importlib.util.find_spec("clickhouse_driver") is None:
-        return pytest.mark.skipif(
-            True, reason="clickhouse-driver is not installed"
-        )
     reachable = False
     try:
         with socket.create_connection((host, port), timeout=1.0):

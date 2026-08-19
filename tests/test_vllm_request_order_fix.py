@@ -8,7 +8,6 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
-from packaging.version import Version
 import pytest
 import torch
 import torch.nn as nn
@@ -73,33 +72,60 @@ from monitoring.selection import (
     hook_belongs_to_tp_rank,
     select_hook_specs,
 )
-from tests.compare_worker import CompareWorker, _filter_ref_buffers
+from tests.compare_worker import CompareWorker
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PINNED_VLLM_ROOT = (REPO_ROOT / "integration" / "vllm").resolve()
 
 
-def test_runtime_uses_a_coherent_supported_vllm_installation():
+def test_runtime_uses_the_pinned_source_and_extension():
     source = Path(vllm.__file__).resolve()
     extension = Path(_vllm_native_extension.__file__).resolve()
 
-    if source.is_relative_to(PINNED_VLLM_ROOT):
-        assert extension.is_relative_to(PINNED_VLLM_ROOT)
-        return
+    assert source.is_relative_to(PINNED_VLLM_ROOT)
+    assert extension.is_relative_to(PINNED_VLLM_ROOT)
 
-    # The adapter can lazily register the bundled model variants with an
-    # official wheel.  Keep source and native extension from that same wheel,
-    # and constrain this path to the versions covered by the port matrix.
-    assert source.parent == extension.parent
-    version = Version(vllm.__version__)
-    assert (version.major, version.minor) in {
-        (0, 17),
-        (0, 18),
-        (0, 19),
-        (0, 25),
-        (0, 27),
-    }
+
+def test_worker_load_model_forwards_v027_keyword(monkeypatch):
+    calls = []
+
+    def fake_load_model(self, *, load_dummy_weights=False):
+        calls.append(load_dummy_weights)
+
+    monkeypatch.setattr(Worker, "load_model", fake_load_model)
+    worker = DMXGPUWorker.__new__(DMXGPUWorker)
+    worker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"]
+            )
+        )
+    )
+    worker.adaptor = None
+
+    worker.load_model(load_dummy_weights=True)
+
+    assert calls == [True]
+    assert worker.vllm_config.model_config.hf_config.architectures == [
+        "LlamaPForCausalLM"
+    ]
+
+
+def test_v2_model_runner_fails_before_device_initialization(monkeypatch):
+    initialized = []
+    monkeypatch.setattr(
+        Worker,
+        "init_device",
+        lambda _self: initialized.append(True),
+    )
+    worker = DMXGPUWorker.__new__(DMXGPUWorker)
+    worker.use_v2_model_runner = True
+
+    with pytest.raises(RuntimeError, match="VLLM_USE_V2_MODEL_RUNNER=0"):
+        worker.init_device()
+
+    assert initialized == []
 
 
 def _scheduler(order=("A", "B"), counts=(2, 3), total=None):
@@ -265,14 +291,7 @@ def test_compare_worker_saves_committed_real_layout(
         _current_dim0_offsets=[0],
         _current_flattened=True,
     )
-    adaptor = SimpleNamespace(
-        transport=transport,
-        _step_counter=4,
-        active_specs=(
-            SimpleNamespace(hook_type=HOOK_TYPE_RESID_PRE),
-            SimpleNamespace(hook_type=HOOK_TYPE_FINAL_LOGITS),
-        ),
-    )
+    adaptor = SimpleNamespace(transport=transport, _step_counter=4)
     buffers = {
         "resid_pre_L0": torch.tensor(
             [[100], [101], [102], [200], [201]],
@@ -342,43 +361,6 @@ def test_compare_worker_saves_committed_real_layout(
         ),
         buffers["final_logits"][1:2],
     )
-
-
-def test_compare_worker_filters_reference_to_active_hook_contract():
-    buffers = {
-        "resid_pre_L0": torch.zeros(1),
-        "resid_pre_L1": torch.zeros(1),
-        "q_L0": torch.zeros(1),
-        "final_logits": torch.zeros(1),
-    }
-    active_specs = (
-        SimpleNamespace(hook_type=HOOK_TYPE_RESID_PRE),
-        SimpleNamespace(hook_type=HOOK_TYPE_FINAL_LOGITS),
-    )
-
-    filtered = _filter_ref_buffers(buffers, active_specs)
-
-    assert set(filtered) == {
-        "resid_pre_L0",
-        "resid_pre_L1",
-        "final_logits",
-    }
-
-
-def test_compare_worker_rejects_missing_active_hook_reference():
-    active_specs = (SimpleNamespace(hook_type=HOOK_TYPE_FINAL_LOGITS),)
-
-    with pytest.raises(RuntimeError, match="no reference buffers"):
-        _filter_ref_buffers({"resid_pre_L0": torch.zeros(1)}, active_specs)
-
-
-def test_compare_worker_allows_empty_rank_local_hook_contract():
-    filtered = _filter_ref_buffers(
-        {"resid_pre_L0": torch.zeros(1)},
-        (),
-    )
-
-    assert filtered == {}
 
 
 @pytest.mark.parametrize(
@@ -1646,94 +1628,6 @@ def test_worker_resets_state_when_upstream_raises(monkeypatch):
     assert adaptor._step_state.phase is VLLMStepPhase.IDLE
 
 
-def test_explicit_monitoring_stop_reports_failure_after_full_cleanup(monkeypatch):
-    events = []
-
-    def fail_ring_stop():
-        events.append("ring_stop")
-        raise RuntimeError("ring flush failed")
-
-    worker = DMXGPUWorker.__new__(DMXGPUWorker)
-    worker.adaptor = SimpleNamespace(
-        ring_engine=SimpleNamespace(stop=fail_ring_stop),
-        engine=SimpleNamespace(close=lambda: events.append("engine_close")),
-    )
-    worker._dmx_host_engine = SimpleNamespace(
-        stop=lambda: events.append("host_stop")
-    )
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(
-        "integration.vllm_adapter.ring_transport.deactivate",
-        lambda: events.append("deactivate"),
-    )
-
-    with pytest.raises(RuntimeError, match="ring_engine.stop: ring flush failed"):
-        worker.stop_monitoring()
-
-    assert events == ["ring_stop", "deactivate", "engine_close", "host_stop"]
-    assert worker.adaptor is None
-    assert worker._dmx_host_engine is None
-
-
-def test_monitoring_stop_is_reentrant_after_success(monkeypatch):
-    events = []
-    worker = DMXGPUWorker.__new__(DMXGPUWorker)
-    worker.adaptor = SimpleNamespace(
-        ring_engine=SimpleNamespace(stop=lambda: events.append("ring_stop")),
-        engine=SimpleNamespace(close=lambda: events.append("engine_close")),
-    )
-    worker._dmx_host_engine = None
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(
-        "integration.vllm_adapter.ring_transport.deactivate",
-        lambda: events.append("deactivate"),
-    )
-
-    worker.stop_monitoring()
-    worker.stop_monitoring()
-
-    assert events == ["ring_stop", "deactivate", "engine_close"]
-
-
-@pytest.mark.parametrize(
-    ("rank", "world_size", "expected_sleeps"),
-    [
-        (0, 2, [0.5]),
-        (1, 2, []),
-        (0, 1, []),
-        (0, None, []),
-    ],
-)
-def test_worker_keeps_distributed_store_owner_alive_through_peer_teardown(
-    monkeypatch, rank, world_size, expected_sleeps
-):
-    events = []
-    sleeps = []
-    worker = DMXGPUWorker.__new__(DMXGPUWorker)
-    worker.adaptor = None
-    worker._dmx_host_engine = None
-    worker.rank = rank
-    if world_size is not None:
-        worker.vllm_config = SimpleNamespace(
-            parallel_config=SimpleNamespace(world_size=world_size)
-        )
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(
-        Worker,
-        "shutdown",
-        lambda _self: events.append("upstream_shutdown"),
-    )
-    monkeypatch.setattr(
-        "integration.vllm_adapter.time.sleep",
-        sleeps.append,
-    )
-
-    worker.shutdown()
-
-    assert events == ["upstream_shutdown"]
-    assert sleeps == expected_sleeps
-
-
 def test_ec_transfer_producer_passthrough_never_arms(monkeypatch):
     adaptor = SimpleNamespace(
         transport=SimpleNamespace(null_offload=False),
@@ -2214,7 +2108,7 @@ def test_task_capacity_exact_fit_and_one_extra_hook_fail_attachment():
         _compile_formula_adaptor(overflow, overflow_model, "vllm-full")
 
 
-def test_compile_rejects_dp_ubatching_and_speculative_logits():
+def test_compile_rejects_dp_ubatching_and_all_speculative_decoding():
     dbo, dbo_model = _formula_adaptor(
         tp_size=1,
         tp_rank=0,
@@ -2232,10 +2126,11 @@ def test_compile_rejects_dp_ubatching_and_speculative_logits():
         pp_rank=0,
         gpu_padding_strip=True,
         speculative_config=object(),
+        hook_selection="resid_pre",
     )
     with pytest.raises(RuntimeError, match="speculative"):
         _compile_formula_adaptor(
-            speculative, speculative_model, "vllm-full"
+            speculative, speculative_model, "resid_pre"
         )
 
 

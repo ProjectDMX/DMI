@@ -7,4 +7,4 @@
 [submodule "vllm"]
 	path = integration/vllm
 	url = https://github.com/ProjectDMX/vllm-DMI.git
-	branch = dmi_integration
+	branch = dmi-v0.27.1

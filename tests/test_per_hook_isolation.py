@@ -267,8 +267,8 @@ _HF_RUNNER = dedent("""
     MODEL_ALIASES = {
         'gpt2': 'gpt2',
         'qwen3': 'Qwen/Qwen3-0.6B',
-        'qwen2_moe': 'Qwen/Qwen1.5-MoE-A2.7B-Chat',
-        'llama': 'meta-llama/Llama-3.1-8B-Instruct',
+        'qwen2_moe': 'Qwen/Qwen1.5-MoE-A2.7B',
+        'llama': 'meta-llama/Llama-3.1-8B',
     }
     hf_id = MODEL_ALIASES[args.model_key]
     device = torch.device('cuda')
@@ -401,7 +401,7 @@ _VLLM_RUNNER = dedent("""
     MODEL_ALIASES = {
         'gpt2': 'gpt2',
         'qwen3': 'Qwen/Qwen3-0.6B',
-        'qwen2_moe': 'Qwen/Qwen1.5-MoE-A2.7B-Chat',
+        'qwen2_moe': 'Qwen/Qwen1.5-MoE-A2.7B',
     }
     model_name = MODEL_ALIASES[args.model_key]
 
