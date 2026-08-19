@@ -16,9 +16,9 @@ This branch pins vLLM 0.27.1. The exact upstream base is
 gitlink is the authoritative DMI/vLLM commit pair. Older ports remain on their
 versioned branches rather than being overwritten by this branch.
 
-The minimized port was verified at DMI root
-`33dc441347dd7814d49dbdb055bdabecf9ce60ed`: 155 focused tests and the
-TP1/PP1, TP2/PP1, and TP1/PP2 GPU regressions passed.
+The vLLM 0.27.1 integration passed the focused CPU suite. GPT-2 (`gpt2`) and
+Qwen3 (`Qwen/Qwen3-0.6B`) passed the TP1/PP1, TP2/PP1, and TP1/PP2 real-GPU
+regressions; each TP1/PP1 run included the eager prefix-cache probe.
 
 The bundled monitored model classes are registered by the patched submodule;
 the official vLLM 0.27.1 wheel alone does not contain them.

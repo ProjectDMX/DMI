@@ -515,7 +515,7 @@ def main() -> None:
     os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 
     prompts = [
-        "Alpha beta gamma",
+        "Once upon a",
         "One two three four",
         "Red green blue yellow orange",
         "The capital of France is",
