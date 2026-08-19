@@ -10,13 +10,6 @@ DMI plugs into vLLM through:
 integration.vllm_adapter.DMXGPUWorker
 ```
 
-The validation scope covers offline GPT-2 (`gpt2`) and Qwen3
-(`Qwen/Qwen3-0.6B`) at TP1/PP1, TP2/PP1, and TP1/PP2, including the TP1/PP1
-prefix-cache probe. Online Qwen3 storage validation covers the same topology
-matrix through the OpenAI-compatible completions endpoint, including
-prefix-cache token ranges, topology-specific ClickHouse inventory, and
-bitwise comparison with `Qwen3Ref`.
-
 The official vLLM 0.27.1 wheel does not include DMI's monitored model classes;
 install the pinned submodule described above.
 
@@ -132,7 +125,7 @@ hidden_states = out[0].dmi_internal.hidden_states
 ## vLLM serve
 
 ```bash
-vllm serve Qwen/Qwen3-8B \
+VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen3-8B \
     --worker-cls integration.vllm_adapter.DMXGPUWorker \
     --additional-config '{
         "dmx_hook_selection": "vllm-full",
@@ -143,29 +136,32 @@ vllm serve Qwen/Qwen3-8B \
     }'
 ```
 
-Run the online Qwen3 storage regression with a local ClickHouse instance and
-the checkpoint available in the Hugging Face cache:
+Send requests through vLLM's OpenAI-compatible API:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m tests.vllm_online_storage --tp 1 --pp 1
-CUDA_VISIBLE_DEVICES=0,1 python -m tests.vllm_online_storage --tp 2 --pp 1
-CUDA_VISIBLE_DEVICES=0,1 python -m tests.vllm_online_storage --tp 1 --pp 2
+curl --fail-with-body http://127.0.0.1:8000/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+        "model":"Qwen/Qwen3-8B",
+        "prompt":"The answer is",
+        "max_tokens":32,
+        "temperature":0
+    }'
 ```
 
-Each cell starts reference and monitored `vllm serve` processes, sends cold and
-prefix-cache-hit HTTP completion requests, validates the exact topology-specific
-ClickHouse row, shard, and token-range inventory, and compares every stored
-tensor with the same-topology `Qwen3Ref` disk dump. It uses an isolated
-temporary table and removes that table after the run. These online cells use
-eager sequential requests; the offline GPU oracle covers CUDA-graph continuous
-batching and scheduler-versus-packed-order divergence.
+Before terminating an online server, first stop accepting new requests. Then
+invoke `stop_monitoring` on every worker and wait for it to finish before
+shutting down vLLM. The normal worker shutdown performs only a best-effort
+flush, so the final captured rows may otherwise be incomplete.
 
-The online regression calls `stop_monitoring` on every monitored worker after
-the final HTTP response, waits for and validates the complete ClickHouse
-inventory, and only then terminates the server. The reference server has no DMI
-engine and does not need this call. The test enables vLLM's developer RPC on
-localhost for this terminal flush; do not expose that RPC on a public
-interface.
+vLLM 0.27.1 exposes the worker RPC endpoint when started with
+`VLLM_SERVER_DEV_MODE=1`. Keep this endpoint on a trusted control interface:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8000/collective_rpc \
+    -H 'Content-Type: application/json' \
+    -d '{"method":"stop_monitoring","timeout":30}'
+```
 
 ## Common configuration
 
