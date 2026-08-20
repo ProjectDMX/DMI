@@ -1,14 +1,11 @@
 """Shared model-shape derivation helpers for adapters.
 
-Phase 3a of the unified-adaptor refactor moves
-``_make_model_shape_from_hf_config`` here so both ``HFAdaptor`` and
-``VLLMAdaptor`` (and any future SGLang / TRT-LLM adapter) can import it
-from the same neutral place.
+``_make_model_shape_from_hf_config`` is the root-owned HF adapter's legacy
+helper. External framework integrations use the public equivalent in
+``monitoring.integration_api.v1``.
 
-The helper takes a HuggingFace-shaped config object
-(``transformers.PretrainedConfig`` or vLLM's
-``vllm_config.model_config.hf_config``) plus an optional dtype override
-and returns a ``ModelShapeConfig``.  TP fields default to
+The helper takes a HuggingFace-shaped config object plus an optional dtype
+override and returns a ``ModelShapeConfig``. TP fields default to
 ``tp_size=1, tp_rank=0``; each adapter's ``detect_parallel_ranks``
 fills them in.
 

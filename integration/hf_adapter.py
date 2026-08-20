@@ -15,8 +15,8 @@ Key pieces:
   * ``generate_with_monitoring`` and ``generate_greedy_with_monitoring``
     -- HF entry points; both run through ``HFAdaptor`` rather than
     touching transport state directly.
-  * ``_make_model_shape_from_hf_config`` -- shared helper, lives in
-    ``integration/model_shape.py`` and is also imported by VLLMAdaptor.
+  * ``_make_model_shape_from_hf_config`` -- HF model-shape helper in
+    ``integration/model_shape.py``.
 
 ``monitoring/generate.py`` is now a thin re-export shim; Phase 5 deletes
 it once external callers migrate to ``integration.hf_adapter``.
@@ -85,11 +85,9 @@ def print_prepare_profile() -> None:
         print(f"  {'prepare_step results':20s}: {', '.join(parts)}")
 
 
-# Model-shape helpers were extracted to integration/model_shape.py in
-# Phase 3a so VLLMAdaptor can share them.  The legacy
-# `_make_model_shape(model)` wrapper that fed the old
-# `monitoring/vllm_integration.py` substantial-implementation was
-# deleted alongside Phase 3a's shim shrink (its only caller).
+# Model-shape helpers live in integration/model_shape.py. The legacy
+# `_make_model_shape(model)` wrapper was deleted after its only caller moved
+# to the adapter-level helper.
 
 
 # ---------------------------------------------------------------------------

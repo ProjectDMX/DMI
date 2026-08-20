@@ -90,9 +90,8 @@ def main():
     model.allocate_compare_buffers(batch_size, max_total_len, dtype=torch.float16, tp_size=tp_size)
 
     # ClickHouse setup -- drop the single shared table from rank 0 only.
-    # Production (vllm_adapter, hf_adapter) writes all ranks to one table
-    # with `shard_rank` column distinguishing per-rank rows; the test now
-    # mirrors that.
+    # Production writes all ranks to one table with `shard_rank`
+    # distinguishing per-rank rows; the test mirrors that.
     import clickhouse_driver
     if tp_rank == 0:
         ch_client = clickhouse_driver.Client(db_host, port=db_port)

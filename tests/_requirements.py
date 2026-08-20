@@ -16,13 +16,12 @@ or composed into a module-level mark list alongside a category marker::
     pytestmark = [pytest.mark.gpu, require_cuda()]
 
 This module must stay importable on a CPU-only box with no CUDA, ClickHouse,
-vLLM, model weights, or native build toolchain present. All heavy imports
+model weights, or native build toolchain present. All heavy imports
 (``torch`` in particular) are deferred into the helper bodies so that merely
 importing this file costs nothing.
 """
 from __future__ import annotations
 
-import importlib.util
 import os
 import shutil
 import socket
@@ -33,7 +32,6 @@ __all__ = [
     "require_cuda",
     "require_gpus",
     "require_clickhouse",
-    "require_vllm",
     "require_model_cache",
     "require_nvcc",
 ]
@@ -83,12 +81,6 @@ def require_clickhouse(host: str | None = None, port: int | None = None):
     return pytest.mark.skipif(
         not reachable, reason=f"ClickHouse unreachable at {host}:{port}"
     )
-
-
-def require_vllm():
-    """Skip unless the vLLM runtime is importable."""
-    available = importlib.util.find_spec("vllm") is not None
-    return pytest.mark.skipif(not available, reason="vLLM not importable")
 
 
 def _model_in_cache(model: str) -> bool:
