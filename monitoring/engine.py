@@ -55,7 +55,7 @@ class MonitoringEngine:
         look for to discover the active engine.
 
     Per-framework state (no_strip_left_pad, batch tracking, etc.) lives on the
-    adapter (HFAdaptor / VLLMAdaptor), not here.  Callers wanting NVTX
+    concrete framework adapter, not here. Callers wanting NVTX
     ranges call ``monitoring.hook_points.set_monitoring_debug(True)``
     directly.
     """

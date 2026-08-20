@@ -30,16 +30,6 @@ cd "$PROJECT_ROOT"
 run_test "unit: test_tp_shapes + test_config" \
     python -m pytest tests/test_tp_shapes.py tests/test_config.py -q
 
-# --- vLLM transport correctness (compare model) ---
-for model in qwen3 gpt2; do
-    for mode in eager cudagraph; do
-        run_test "vllm: $model $mode tp=1" \
-            bash tests/tools/run_tp_compare_vllm.sh "$model" "$mode" 1
-        run_test "vllm: $model $mode tp=2" \
-            bash tests/tools/run_tp_compare_vllm.sh "$model" "$mode" 2
-    done
-done
-
 # --- HF transport correctness (compare model) ---
 for model in gpt2 qwen3; do
     for mode in eager cudagraph; do

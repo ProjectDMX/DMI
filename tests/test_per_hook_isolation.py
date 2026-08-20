@@ -132,7 +132,6 @@ class TestPatcherRoundTrip:
 
     @pytest.mark.parametrize("framework,model_key", [
         ("hf", "gpt2"), ("hf", "qwen3"), ("hf", "llama"),
-        ("vllm", "gpt2"), ("vllm", "qwen3"), ("vllm", "llama"),
     ])
     def test_round_trip_byte_identical(self, framework, model_key):
         """File contents before and after isolated_hook must match."""
@@ -227,12 +226,6 @@ SMOKE_CELLS = [
     ("hf",   "qwen3", "resid_pre",    "compiled"),
     ("hf",   "qwen3", "final_logits", "eager"),
     ("hf",   "qwen3", "final_logits", "compiled"),
-    ("vllm", "qwen3", "q",            "eager"),
-    ("vllm", "qwen3", "q",            "compiled"),
-    ("vllm", "qwen3", "resid_pre",    "eager"),
-    ("vllm", "qwen3", "resid_pre",    "compiled"),
-    ("vllm", "qwen3", "final_logits", "eager"),
-    ("vllm", "qwen3", "final_logits", "compiled"),
 ]
 
 # Tolerance for compiled-mode logprob comparisons (both L_ours and L_ref
@@ -248,8 +241,7 @@ _HF_RUNNER = dedent("""
 
     Saves a dict {token_ids: int64[N], logprobs: float32[N]} -- the
     chosen-token IDs (greedy argmax) and the log-prob the model assigned
-    to each chosen token.  Same format the vLLM runner emits, so the
-    pytest assertion code is framework-agnostic.
+    to each chosen token.
     '''
     import argparse, os, sys
     import torch
@@ -373,105 +365,8 @@ _HF_RUNNER = dedent("""
 """)
 
 
-_VLLM_RUNNER = dedent("""
-    '''vLLM rollout: vanilla / DMXGPUWorker+hook_selection / CompareWorker-isolated.
-
-    Saves the same dict format as _HF_RUNNER:
-      {token_ids: int64[N], logprobs: float32[N]}.
-
-    Logprobs come from SamplingParams(logprobs=1).  The chosen token's
-    logprob is what vLLM stores for the selected sample at each step.
-    '''
-    import argparse, os, sys
-    os.environ.setdefault('VLLM_DISABLE_COMPILE_CACHE', '1')
-
-    import torch
-    from vllm import LLM, SamplingParams
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--framework', required=True)
-    ap.add_argument('--model-key', required=True)
-    ap.add_argument('--hook', required=True)
-    ap.add_argument('--mode', required=True)
-    ap.add_argument('--output-dir', required=True)
-    ap.add_argument('--rollout', required=True, choices=['orig', 'ours', 'ref'])
-    args = ap.parse_args()
-    assert args.framework == 'vllm'
-
-    MODEL_ALIASES = {
-        'gpt2': 'gpt2',
-        'qwen3': 'Qwen/Qwen3-0.6B',
-        'qwen2_moe': 'Qwen/Qwen1.5-MoE-A2.7B',
-    }
-    model_name = MODEL_ALIASES[args.model_key]
-
-    llm_kwargs = dict(
-        model=model_name,
-        max_model_len=128,
-        gpu_memory_utilization=0.5,
-        enforce_eager=(args.mode == 'eager'),
-    )
-
-    additional_config = {
-        'dmx_hook_selection': args.hook,
-        # Disable ClickHouse so concurrent rollouts in the smoke don't
-        # see each other's rows; we only need logprobs here.
-        'dmx_db_host': '',
-    }
-
-    if args.rollout == 'orig':
-        # Vanilla vLLM, no worker_cls override -- standard model class.
-        pass
-    elif args.rollout == 'ours':
-        llm_kwargs['worker_cls'] = 'integration.vllm_adapter.DMXGPUWorker'
-        llm_kwargs['additional_config'] = additional_config
-    elif args.rollout == 'ref':
-        # CompareWorker subclasses DMXGPUWorker but remaps to the
-        # _compare class (Qwen3CompareForCausalLM etc.).  The patcher
-        # applied by the driver before this subprocess starts has
-        # commented out every `.copy_()` line in the _compare source
-        # except hook H's, so only that one buffer is written.
-        llm_kwargs['worker_cls'] = 'tests.compare_worker.CompareWorker'
-        llm_kwargs['additional_config'] = additional_config
-
-    llm = LLM(**llm_kwargs)
-
-    prompts = ['Hello']
-    params = SamplingParams(temperature=0.0, max_tokens=4, logprobs=1)
-    outputs = llm.generate(prompts, params)
-
-    output = outputs[0]
-    completion = output.outputs[0]
-    ids = list(completion.token_ids)
-    lps = []
-    step_logprobs = completion.logprobs or []
-    for i in range(len(ids)):
-        chosen_id = ids[i]
-        if i < len(step_logprobs) and step_logprobs[i] is not None:
-            lp_obj = step_logprobs[i].get(chosen_id)
-            lps.append(lp_obj.logprob if lp_obj is not None else float('-inf'))
-        else:
-            lps.append(float('-inf'))
-
-    token_ids = torch.tensor(ids, dtype=torch.int64)
-    logprobs = torch.tensor(lps, dtype=torch.float32)
-    out_path = os.path.join(args.output_dir, f'{args.rollout}.pt')
-    torch.save({'token_ids': token_ids, 'logprobs': logprobs}, out_path)
-    print(f'OK {args.rollout} N={len(token_ids)} -> {out_path}')
-
-    # Explicit per-worker flush+stop before process exit. Avoids the
-    # implicit-shutdown race against vLLM's 8s deadline. No-op if the
-    # worker doesn't carry stop_monitoring (e.g. baseline configs).
-    try:
-        llm.collective_rpc('stop_monitoring')
-    except Exception:
-        pass
-""")
-
-
 def _build_subprocess_env() -> dict:
-    """Same env hardening as test_no_graph_breaks.py: pin CUDA_VISIBLE_DEVICES=0
-    + put conda lib on LD_LIBRARY_PATH so vllm imports succeed."""
+    """Pin GPU 0 and use the active environment's native libraries."""
     env = os.environ.copy()
     conda_prefix = env.get("CONDA_PREFIX")
     if conda_prefix:
@@ -486,12 +381,9 @@ def _run_rollout(
     hook: str, mode: str, env: dict,
 ) -> None:
     """Spawn one rollout subprocess.  Raises on non-zero exit."""
-    if framework == "hf":
-        runner = _HF_RUNNER
-    elif framework == "vllm":
-        runner = _VLLM_RUNNER
-    else:
+    if framework != "hf":
         raise ValueError(f"unsupported framework={framework!r}")
+    runner = _HF_RUNNER
     cmd = [
         sys.executable, "-c", runner,
         "--framework", framework,

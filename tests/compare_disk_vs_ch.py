@@ -1,6 +1,6 @@
 """Shared comparator: compare .pt ref files on disk vs ClickHouse rows.
 
-Used by both vllm_compare_runner.py and hf_compare_runner.py.
+Used by the root HF comparison runner. Other integrations own their copies.
 No CUDA needed — runs entirely on CPU.
 """
 import re

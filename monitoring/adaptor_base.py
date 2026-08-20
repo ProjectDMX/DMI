@@ -1,9 +1,8 @@
 """BackendAdaptor: abstract base for framework-specific monitoring adapters.
 
-Carved out as part of the unified-adaptor refactor (Phase 1).  Each concrete
-adapter (HFAdaptor, VLLMAdaptor -- Phases 2 and 3) will live under
-``integration/`` and convert framework-specific batch state into the
-``RingTransport`` step protocol.
+Each concrete adapter converts framework-specific batch state into the
+``RingTransport`` step protocol. Root-owned adapters may live under
+``integration/``; external adapters consume the public integration API.
 
 The driver in ``before_forward`` is the canonical per-step flow shared by
 every concrete adapter:
@@ -21,7 +20,6 @@ every concrete adapter:
     -> set_step_context
     -> pre_push_all_metas
 
-Phase 1 ships the abstraction only -- no concrete subclass is wired in yet.
 The unit-test gate (``tests/test_adapter_protocol.py``) exercises the driver
 ordering with mocks.
 """
