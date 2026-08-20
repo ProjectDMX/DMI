@@ -1,9 +1,8 @@
 """Schema + dispatch tests for the three producer ops.
 
-End-to-end strip verification (kernel actually copies fewer bytes
-and consumer receives stripped output) requires real engine +
-ClickHouse plumbing and lives in the vLLM regression sweep with
-`padding_strip=True`.  These tests cover the wiring surface:
+End-to-end strip verification (kernel actually copies fewer bytes and the
+consumer receives stripped output) requires a real engine and ClickHouse.
+These tests cover the framework-neutral wiring surface:
 - the three torch ops are registered
 - each accepts the right arg shape (smoke; no engine required)
 - HookPoint's strip-mode attributes default to static path
