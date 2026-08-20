@@ -13,7 +13,6 @@ Usage:
     E2E_MODEL=qwen3 E2E_TP_SIZE=2 torchrun --nproc_per_node=2 -m tests.hf_compare_runner
 """
 import os
-import shutil
 import sys
 import tempfile
 import uuid
@@ -23,7 +22,7 @@ import torch
 _MODEL_ALIASES = {
     "gpt2": "gpt2",
     "qwen3": "Qwen/Qwen3-0.6B",
-    "llama": "meta-llama/Llama-3.1-8B-Instruct",
+    "llama": "meta-llama/Llama-3.1-8B",
 }
 
 
@@ -90,6 +89,20 @@ def main():
     max_total_len = int(input_ids.shape[1]) + max_new_tokens + 16
     model.allocate_compare_buffers(batch_size, max_total_len, dtype=torch.float16, tp_size=tp_size)
 
+    # ClickHouse setup -- drop the single shared table from rank 0 only.
+    # Production writes all ranks to one table with `shard_rank`
+    # distinguishing per-rank rows; the test mirrors that.
+    import clickhouse_driver
+    if tp_rank == 0:
+        ch_client = clickhouse_driver.Client(db_host, port=db_port)
+        try:
+            ch_client.execute("DROP TABLE IF EXISTS default.offload")
+        except Exception:
+            pass
+    if tp_size > 1:
+        import torch.distributed as dist
+        dist.barrier()
+
     ch_cfg = ClickHouseClientConfig()
     ch_cfg.host = db_host
     ch_cfg.port = db_port
@@ -101,8 +114,8 @@ def main():
     ch_cfg.client_side_compress = "none"
     ch_cfg.client_settings = None
     ch_cfg.create_database_if_missing = True
-    # Shared-machine tests never drop the table. Capture identity scopes both
-    # comparison and cleanup, including TP runs.
+    # Drop is done explicitly above on rank 0 only, so individual host
+    # engines must NOT drop the DB (would race across ranks).
     ch_cfg.drop_existing_database = False
     ch_cfg.index_granularity = 8192
 
@@ -127,15 +140,7 @@ def main():
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
 
-    unique_run_model_id = (
-        f"hf_compare::{uuid.uuid4().hex}"[:120] if tp_rank == 0 else ""
-    )
-    if tp_size > 1:
-        import torch.distributed as dist
-
-        model_id_values = [unique_run_model_id]
-        dist.broadcast_object_list(model_id_values, src=0)
-        unique_run_model_id = model_id_values[0]
+    unique_run_model_id = f"hf_compare::{uuid.uuid4().hex}"[:120]
     engine = MonitoringEngine(
         config=mon_cfg, model_id=unique_run_model_id, db_config=host_cfg
     )
@@ -197,27 +202,17 @@ def main():
         import torch.distributed as dist
         dist.barrier()
 
-    # Only rank 0 compares one capture and then removes exactly those rows.
+    # Only rank 0 compares -- read the single shared table.
     if tp_rank == 0:
-        try:
-            print("\n[compare] Comparing disk vs ClickHouse...", flush=True)
-            from tests.compare_disk_vs_ch import read_clickhouse, compare
+        print("\n[compare] Comparing disk vs ClickHouse...", flush=True)
+        from tests.compare_disk_vs_ch import read_clickhouse, compare
+        ch_data_all, total_rows = read_clickhouse(db_host, db_port)
+        passed, failed = compare(compare_dir, ch_data_all, total_rows)
 
-            ch_data_all, total_rows = read_clickhouse(
-                db_host, db_port, model_id=unique_run_model_id
-            )
-            _, failed = compare(compare_dir, ch_data_all, total_rows)
-
-            if failed > 0:
-                sys.exit(1)
+        if failed > 0:
+            sys.exit(1)
+        else:
             print("[compare] ALL PASSED", flush=True)
-        finally:
-            from tests._clickhouse_test_utils import delete_capture
-
-            try:
-                delete_capture(db_host, db_port, unique_run_model_id)
-            finally:
-                shutil.rmtree(compare_dir, ignore_errors=True)
 
 
 _TP_SHARDED_HOOKS = {"q", "k", "v", "z", "attn_scores", "pattern", "mlp_post"}
