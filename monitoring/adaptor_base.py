@@ -9,9 +9,10 @@ The driver in ``before_forward`` is the canonical per-step flow shared by
 every concrete adapter:
 
     build_step_context  (subclass)
-    -> _compute_step_plan  (base; walks active_specs once for
-                            total_bytes + n_hooks + needs_eager)
-    -> prepare_step     (skipped when n_hooks == 0)
+    -> plan_step        (base; walks active_specs once for
+                         total_bytes + hook_count + needs_eager)
+    -> commit_step      (base)
+       -> prepare_step  (skipped when hook_count == 0)
        on result == 2:
          -> adapt_for_cpu_direct  (subclass; default no-op)
          -> on_capacity_exceeded  (subclass)
@@ -27,7 +28,8 @@ ordering with mocks.
 from __future__ import annotations
 
 import abc
-from typing import List, Optional, TYPE_CHECKING
+from enum import IntEnum
+from typing import List, NamedTuple, Optional, TYPE_CHECKING
 
 import torch
 
@@ -49,6 +51,23 @@ if TYPE_CHECKING:
     from .engine import MonitoringEngine
 
 
+class StepPlan(NamedTuple):
+    """Immutable, tuple-compatible reservation inputs for one model step."""
+
+    total_bytes: int
+    hook_count: int
+    needs_eager: bool
+
+
+class StepReservation(IntEnum):
+    """Outcome of committing a :class:`StepPlan` to the ring."""
+
+    SKIPPED = -1
+    RESERVED = 0
+    FLUSHED = 1
+    OVERSIZED = 2
+
+
 class BackendAdaptor(abc.ABC):
     """One adapter per attached model.
 
@@ -56,9 +75,8 @@ class BackendAdaptor(abc.ABC):
     detection, and per-step context construction.  The base class owns the
     driver (``before_forward``) that all concrete adapters share, plus
     ``attach_model`` (resolves hook selection + PP/TP filters + installs
-    HookPoints) and ``_compute_step_plan`` (one walk over active_specs
-    that returns ``(total_bytes, n_hooks, needs_eager)`` -- inputs to
-    ``prepare_step`` and the per-batch ``force_eager`` decision).
+    HookPoints), ``plan_step`` (one walk over active_specs), and
+    ``commit_step`` (reservation + context/metadata publication).
     """
 
     def __init__(self, engine: "MonitoringEngine", model_id: str) -> None:
@@ -69,6 +87,16 @@ class BackendAdaptor(abc.ABC):
         self.model_cfg: Optional[ModelShapeConfig] = None
         self.active_specs: List[HookSpec] = []
         self._warned_shapes: set = set()
+
+    @property
+    def active_hook_specs(self) -> tuple[HookSpec, ...]:
+        """Read-only snapshot of selected hooks in forward firing order."""
+        return tuple(self.active_specs)
+
+    @property
+    def model_shape(self) -> Optional[ModelShapeConfig]:
+        """Detected model shape, or ``None`` before model attachment."""
+        return self.model_cfg
 
     # --- subclass implements ---------------------------------------------
     @abc.abstractmethod
@@ -156,24 +184,51 @@ class BackendAdaptor(abc.ABC):
         if ctx is None:
             return
 
-        total_bytes, n_hooks, needs_eager = self._compute_step_plan(ctx)
-        # Gate prepare_step on n_hooks > 0 -- matches vLLM's existing
+        plan = self.plan_step(ctx)
+        self.commit_step(ctx, plan)
+
+    def commit_step(
+        self, ctx: StepContext, plan: Optional[StepPlan] = None
+    ) -> StepReservation:
+        """Reserve and publish one step, optionally using a precomputed plan.
+
+        Supplying ``plan`` guarantees that hook shapes are not recomputed.
+        This lets integrations plan before framework dispatch and commit once
+        the real layout is known, without exposing the transport or native
+        ring engine.
+        """
+        if self.transport is None or self.transport.null_offload:
+            return StepReservation.SKIPPED
+        if plan is None:
+            plan = self.plan_step(ctx)
+
+        # Gate prepare_step on hook_count > 0 -- matches vLLM's existing
         # behavior and is consistent with the non-zero-shape counting
-        # rule for _compute_step_plan.  When the gate skips,
+        # rule for plan_step.  When the gate skips,
         # set_step_context and pre_push_all_metas still run unchanged:
         # their internal loops produce nothing to push when the
         # active-spec list is empty or every shape was empty.
-        if n_hooks > 0:
-            result = self.ring_engine.prepare_step(total_bytes, n_hooks)
-            self.transport.force_eager = (result == 2) or needs_eager
-            if result == 2:
+        if plan.hook_count > 0:
+            reservation = StepReservation(
+                self.ring_engine.prepare_step(
+                    plan.total_bytes, plan.hook_count
+                )
+            )
+            self.transport.force_eager = (
+                reservation is StepReservation.OVERSIZED
+                or plan.needs_eager
+            )
+            if reservation is StepReservation.OVERSIZED:
                 ctx = self.adapt_for_cpu_direct(ctx)
                 self.on_capacity_exceeded(ctx)
-                self._warn_once_capacity(ctx, total_bytes, n_hooks)
+                self._warn_once_capacity(
+                    ctx, plan.total_bytes, plan.hook_count
+                )
         else:
             # No hook fires this step (all shapes empty) -- no
             # safety net needed.
             self.transport.force_eager = False
+            reservation = StepReservation.SKIPPED
 
         self.transport.set_step_context(**ctx.transport_kwargs())
         self.transport.pre_push_all_metas(
@@ -184,15 +239,17 @@ class BackendAdaptor(abc.ABC):
             token_ids_dtype=ctx.token_ids_dtype,
             actual_q_len=ctx.actual_q_len,
         )
+        return reservation
 
     def close(self) -> None:
         self.engine.close()
 
-    def _compute_step_plan(self, ctx: StepContext) -> "tuple[int, int, bool]":
-        """Return ``(aligned total bytes, n_hooks, needs_eager)`` for one step.
+    def plan_step(self, ctx: StepContext) -> StepPlan:
+        """Build a side-effect-free reservation plan for one step.
 
         Single walk over ``active_specs``:
-        - ``total`` and ``n_hooks`` feed ``prepare_step``.  ``n_hooks``
+        - ``total_bytes`` and ``hook_count`` feed ``prepare_step``.
+          ``hook_count``
           counts only specs whose ``_compute_hook_shape`` returns a
           non-empty list -- matches the count of metas
           ``pre_push_all_metas`` will push.
@@ -202,7 +259,7 @@ class BackendAdaptor(abc.ABC):
           result.
         """
         if self.model_cfg is None or not self.active_specs:
-            return 0, 0, False
+            return StepPlan(total_bytes=0, hook_count=0, needs_eager=False)
 
         total = 0
         n = 0
@@ -231,7 +288,15 @@ class BackendAdaptor(abc.ABC):
             n += 1
             if self._spec_needs_eager(spec):
                 needs_eager = True
-        return total, n, needs_eager
+        return StepPlan(
+            total_bytes=total,
+            hook_count=n,
+            needs_eager=needs_eager,
+        )
+
+    def _compute_step_plan(self, ctx: StepContext) -> StepPlan:
+        """Compatibility wrapper returning a tuple-compatible plan."""
+        return self.plan_step(ctx)
 
 
-__all__ = ["BackendAdaptor"]
+__all__ = ["BackendAdaptor", "StepPlan", "StepReservation"]

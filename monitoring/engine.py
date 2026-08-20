@@ -11,6 +11,20 @@ from .config import MonitoringConfig
 DEFAULT_DRAIN_FLUSH_TIMEOUT_US = 0
 
 
+@dataclass(frozen=True, slots=True)
+class RingCapacities:
+    """Immutable snapshot of the active ring transport's capacities."""
+
+    payload_bytes: int
+    staging_bytes: int
+    task_entries: int
+
+    @property
+    def effective_bytes(self) -> int:
+        """Usable per-step byte capacity across payload and staging rings."""
+        return min(self.payload_bytes, self.staging_bytes)
+
+
 @dataclass
 class HostEngineConfig:
     """Configuration wrapper for the native DMXHostEngine pipeline.
@@ -111,6 +125,52 @@ class MonitoringEngine:
     # ------------------------------------------------------------------
     # Ring transport API
 
+    def ring_capacities(self) -> RingCapacities:
+        """Return a stable snapshot of the active ring's capacity limits.
+
+        This deliberately exposes values rather than the native ``RingEngine``
+        object so integrations cannot mutate ring lifecycle or reservation
+        state.
+        """
+        ring_engine = getattr(self, "_ring_engine", None)
+        if ring_engine is None:
+            raise RuntimeError("Ring transport is not enabled")
+        return RingCapacities(
+            payload_bytes=int(ring_engine.payload_cap()),
+            staging_bytes=int(ring_engine.staging_cap()),
+            task_entries=int(ring_engine.task_cap()),
+        )
+
+    @property
+    def capture_enabled(self) -> bool:
+        """Whether the active transport is accepting capture metadata."""
+        transport = self._ring_transport
+        return transport is not None and not bool(transport.null_offload)
+
+    def set_capture_enabled(self, enabled: bool) -> None:
+        """Enable or suppress capture at a lifecycle quiescent boundary.
+
+        Callers must ensure that no forward pass can overlap this method (for
+        example, immediately before and after framework warmup).  The native
+        null-mode transition performs its own CUDA synchronization.  Metadata
+        suppression changes only after that transition succeeds, so an error
+        leaves the Python-visible state unchanged.
+        """
+        transport = self._ring_transport
+        ring_engine = getattr(self, "_ring_engine", None)
+        if transport is None or ring_engine is None:
+            raise RuntimeError("Ring transport is not enabled")
+
+        target_null_mode = not bool(enabled)
+        if bool(transport.null_offload) == target_null_mode:
+            return
+        ring_engine.set_null_mode(target_null_mode)
+        transport.null_offload = target_null_mode
+        # The eager safety-net bypasses the native producer and does not read
+        # null_offload.  Never carry a prior oversized-step decision across a
+        # lifecycle toggle; the next committed step recomputes it.
+        transport.force_eager = False
+
     @staticmethod
     def _make_default_ring_config(
         *,
@@ -153,6 +213,11 @@ class MonitoringEngine:
         from . import _native_engine  # type: ignore[attr-defined]
 
         if self._ring_transport is not None:
+            # Native null mode is device-global rather than RingEngine-local.
+            # Restore its default before destroying a disabled transport so a
+            # replacement starts capture-enabled without an extra startup sync.
+            if not self.capture_enabled:
+                self.set_capture_enabled(True)
             try:
                 ring_engine = getattr(self, "_ring_engine", None)
                 if ring_engine is not None:
@@ -206,6 +271,14 @@ class MonitoringEngine:
         """Tear down backend resources."""
 
         if self._ring_transport is not None:
+            # Best-effort reset of the device-global native null flag.  This is
+            # needed only after callers explicitly disabled capture; the normal
+            # HF path pays no extra synchronization cost.
+            if not self.capture_enabled:
+                try:
+                    self.set_capture_enabled(True)
+                except Exception:
+                    pass
             try:
                 ring_engine = getattr(self, "_ring_engine", None)
                 if ring_engine is not None:
@@ -233,4 +306,4 @@ class MonitoringEngine:
 # Backend loader
 
 
-__all__ = ["MonitoringEngine"]
+__all__ = ["MonitoringEngine", "RingCapacities"]
