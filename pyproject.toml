@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "DMI"
-version = "1.0.0"
+version = "1.1.0"
 description = "A decoupled, asynchronous observation substrate for high-speed LLM inference."
 requires-python = ">=3.10"
 dynamic = ["dependencies"]
@@ -25,10 +25,9 @@ monitoring = [
 ]
 
 [tool.setuptools.packages.find]
-# `integration` without star: integration/transformers/ and integration/vllm/
-# are vendored git submodules with their own pip installs. Avoiding the star
-# (and the fact that those subdirs lack a top-level __init__.py) keeps the
-# forks out of our wheel.
+# `integration` without star: integration/transformers/ and
+# integration/vllm_integration/ are separately installed submodules. Avoiding
+# the star keeps both external distributions out of the DMI wheel.
 include = ["monitoring*", "benchmark*", "integration"]
 
 [tool.pytest.ini_options]
@@ -38,12 +37,11 @@ include = ["monitoring*", "benchmark*", "integration"]
 addopts = "-ra -m 'not manual'"
 norecursedirs = ["tests/tools", "tests/ring", ".venv", "integration", "build"]
 markers = [
-    "cpu: pure-CPU contract/unit test (no CUDA / ClickHouse / vLLM runtime / model weights / native extension build required)",
+    "cpu: pure-CPU contract/unit test (no CUDA / ClickHouse / model weights / native extension build required)",
     "gpu: requires a CUDA device",
     "multi_gpu: requires >= 2 CUDA devices (TP / EP / routing)",
     "e2e: end-to-end pipeline through the native backend + host engine",
     "clickhouse: requires a reachable ClickHouse instance",
-    "vllm: requires the vLLM runtime importable",
     "hf: requires HuggingFace weights / model cache",
     "native_backend: requires the DMI native backend .so importable/built; no GPU necessarily",
     "framework_fork: requires vendored/modified framework forks importable",
