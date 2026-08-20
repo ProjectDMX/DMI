@@ -276,6 +276,20 @@ def test_v1_padding_strip_configuration_preserves_existing_modes() -> None:
             vocab_size=256,
             torch_dtype=torch.bfloat16,
         ),
+        SimpleNamespace(
+            text_config=SimpleNamespace(
+                model_type="kimi_k3",
+                hidden_size=128,
+                num_attention_heads=16,
+                num_key_value_heads=4,
+                head_dim=8,
+                intermediate_size=512,
+                num_experts=64,
+                num_experts_per_token=8,
+                vocab_size=320,
+                torch_dtype=torch.bfloat16,
+            ),
+        ),
     ],
 )
 def test_v1_model_shape_helper_matches_existing_helper(config) -> None:
