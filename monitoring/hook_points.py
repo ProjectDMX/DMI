@@ -170,7 +170,7 @@ class HookPoint(nn.Module):
         #
         # Set ONCE at attach time + update VALUES in place each step
         # (via a separate kernel on the same stream as the producer).
-        # Phase 3 / vLLM adapter glue honors this contract.
+        # Framework adapters must honor this contract.
         self._strip_tensor: Optional[torch.Tensor] = None
         self._strip_row_bytes: int = 0
 

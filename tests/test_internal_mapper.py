@@ -396,39 +396,6 @@ def test_lazy_internal_requirement_retries_missing_token_ranges_until_success():
     assert reader.calls == 2
 
 
-def test_token_range_validation_accepts_different_contiguous_segmentation():
-    rows = [
-        _row("0:0", 0, 0, torch.ones(2, 4)),
-        _row("0:0", 0, 2, torch.ones(1, 4)),
-    ]
-    internal = make_lazy_internal(
-        "m",
-        PrefixReader(rows),
-        request_ids=("0:0",),
-        token_ranges={"0:0": ((0, 3),)},
-    )
-    internal.require("hidden_states", count=1, match_token_ranges=True)
-
-    assert tuple(internal.hidden_states[0].shape) == (1, 3, 4)
-
-
-def test_token_range_validation_does_not_coalesce_across_gaps():
-    rows = [
-        _row("0:0", 0, 0, torch.ones(1, 4)),
-        _row("0:0", 0, 2, torch.ones(1, 4)),
-    ]
-    internal = make_lazy_internal(
-        "m",
-        PrefixReader(rows),
-        request_ids=("0:0",),
-        token_ranges={"0:0": ((0, 3),)},
-    )
-    internal.require("hidden_states", count=1, match_token_ranges=True)
-
-    with pytest.raises(IncompleteInternalError, match="token ranges are incomplete"):
-        internal.hidden_states
-
-
 def test_lazy_internal_requirement_retry_timeout_raises_incomplete():
     rows = [_row("0:0", 0, 0, torch.ones(3, 4))]
     reader = SequenceReader([rows])

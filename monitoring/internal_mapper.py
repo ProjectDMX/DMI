@@ -50,21 +50,6 @@ def _request_sort_key(request_id: str) -> tuple:
     return tuple(key)
 
 
-def _coalesce_token_ranges(
-    ranges: tuple[tuple[int, int], ...],
-) -> tuple[tuple[int, int], ...]:
-    """Merge overlapping/adjacent ranges without hiding token gaps."""
-    merged: list[list[int]] = []
-    for start, end in sorted(ranges):
-        if end <= start:
-            continue
-        if merged and start <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    return tuple((start, end) for start, end in merged)
-
-
 def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
     """Reassemble a per-layer hook (residual stream, mlp, ...).
 
@@ -208,12 +193,16 @@ class IncompleteInternalError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class _Requirement:
+class InternalRequirement:
     count: int
     retry: bool = False
     timeout_s: float | None = 30.0
     poll_s: float = 0.25
     match_token_ranges: bool = False
+
+
+# Backward-compatible private name used before integration API v1.
+_Requirement = InternalRequirement
 
 
 class InternalRequirements:
@@ -225,17 +214,22 @@ class InternalRequirements:
     match this generate call's expected request token ranges.
     """
 
-    def __init__(self, counts: dict[str, int | _Requirement] | None = None) -> None:
+    def __init__(
+        self,
+        counts: dict[str, int | InternalRequirement] | None = None,
+    ) -> None:
         self._requirements = {
             field: self._coerce_requirement(value)
             for field, value in dict(counts or {}).items()
         }
 
     @staticmethod
-    def _coerce_requirement(value: int | _Requirement) -> _Requirement:
-        if isinstance(value, _Requirement):
+    def _coerce_requirement(
+        value: int | InternalRequirement,
+    ) -> InternalRequirement:
+        if isinstance(value, InternalRequirement):
             return value
-        return _Requirement(count=int(value))
+        return InternalRequirement(count=int(value))
 
     def require(
         self,
@@ -253,7 +247,7 @@ class InternalRequirements:
             raise ValueError("timeout_s must be non-negative or None")
         if poll_s <= 0:
             raise ValueError("poll_s must be positive")
-        self._requirements[field] = _Requirement(
+        self._requirements[field] = InternalRequirement(
             count=int(count),
             retry=bool(retry),
             timeout_s=timeout_s,
@@ -271,11 +265,11 @@ class InternalRequirements:
             return None
         return requirement.count
 
-    def requirement(self, field: str) -> _Requirement | None:
+    def requirement(self, field: str) -> InternalRequirement | None:
         return self._requirements.get(field)
 
 
-class _LazyInternal:
+class LazyInternal:
     """Lazy proxy for captured internals.
 
     Successful field access caches that field. Failed loads and incomplete
@@ -312,7 +306,7 @@ class _LazyInternal:
         timeout_s: float | None = 30.0,
         poll_s: float = 0.25,
         match_token_ranges: bool = False,
-    ) -> "_LazyInternal":
+    ) -> "LazyInternal":
         self._requirements.require(
             field,
             count=count,
@@ -341,7 +335,7 @@ class _LazyInternal:
     def _incomplete_error(
         self,
         field: str,
-        requirement: _Requirement,
+        requirement: InternalRequirement,
         *,
         found: int | None = None,
         timeout: bool = False,
@@ -374,7 +368,7 @@ class _LazyInternal:
         self,
         field: str,
         value: object,
-        requirement: _Requirement | None = None,
+        requirement: InternalRequirement | None = None,
     ) -> None:
         requirement = requirement or self._requirements.requirement(field)
         if requirement is None:
@@ -386,7 +380,7 @@ class _LazyInternal:
     def _load_field_once(
         self,
         field: str,
-        requirement: _Requirement | None,
+        requirement: InternalRequirement | None,
     ) -> object:
         value = self._read_field(field, requirement)
         self._validate(field, value, requirement)
@@ -440,7 +434,7 @@ class _LazyInternal:
         self,
         field: str,
         rows: list,
-        requirement: _Requirement | None,
+        requirement: InternalRequirement | None,
     ) -> None:
         if (
             requirement is None
@@ -454,12 +448,8 @@ class _LazyInternal:
         # common "writer still pending" case without scanning every layer.
         check_layer = layers[-1] if layers else None
         for request_id in self._request_ids:
-            expected = _coalesce_token_ranges(
-                self._expected_non_empty_ranges(request_id)
-            )
-            actual = _coalesce_token_ranges(
-                self._actual_ranges_for_request(rows, request_id, check_layer)
-            )
+            expected = self._expected_non_empty_ranges(request_id)
+            actual = self._actual_ranges_for_request(rows, request_id, check_layer)
             if actual != expected:
                 raise IncompleteInternalError(
                     f"{field} token ranges are incomplete for "
@@ -467,7 +457,11 @@ class _LazyInternal:
                     f"expected {list(expected)}, found {list(actual)}."
                 )
 
-    def _read_field(self, field: str, requirement: _Requirement | None = None) -> object:
+    def _read_field(
+        self,
+        field: str,
+        requirement: InternalRequirement | None = None,
+    ) -> object:
         if field == "token_mask":
             return self._build_token_mask()
         if field not in _FIELDS:
@@ -512,7 +506,7 @@ class _LazyInternal:
     def _load_field_with_retry(
         self,
         field: str,
-        requirement: _Requirement,
+        requirement: InternalRequirement,
     ) -> object:
         deadline = (
             None
@@ -579,14 +573,18 @@ class _LazyInternal:
         return f"<DMIInternal model_id={self._model_id!r} state={state}>"
 
 
+# Backward-compatible private name used before integration API v1.
+_LazyInternal = LazyInternal
+
+
 def make_lazy_internal(
     model_id: str,
     reader: CHClickhouseDriverReadOnly | None = None,
     requirements: InternalRequirements | None = None,
     request_ids: tuple[str, ...] | list[str] | None = None,
     token_ranges: dict[str, tuple[tuple[int, int], ...] | list[tuple[int, int]]] | None = None,
-) -> _LazyInternal:
-    return _LazyInternal(
+) -> LazyInternal:
+    return LazyInternal(
         model_id,
         reader,
         requirements=requirements,

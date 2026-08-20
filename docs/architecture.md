@@ -37,9 +37,12 @@ attention pattern, logits, KV-cache slices. It is:
   Individual hook short names (e.g. `q`, `k`, `v`, `attn_scores`, `pattern`,
   `mlp_post`) can also be combined.
 
-Engine integration is intentionally thin: for vLLM, DMI subclasses `Worker` to
-install hooks before CUDA-Graph capture; for HuggingFace, it wraps
-`prepare_inputs_for_generation`. The framework's backbone code is untouched.
+Engine integration is intentionally thin. For HuggingFace, DMI wraps
+`prepare_inputs_for_generation`. For vLLM, the separately distributed,
+version-matched `DMI-vLLM-Integration` package uses vLLM's worker and plugin
+entry points, imports DMI through `monitoring.integration_api.v1`, and installs
+the monitored model before CUDA-Graph capture. The official vLLM package is
+not patched.
 
 ---
 
