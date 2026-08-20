@@ -1,7 +1,7 @@
 """Selection policy: presets, resolve/apply, PP/TP filters.
 
-Carved out of ``ring_transport.py`` and ``vllm_integration.py`` as part of
-the unified-adaptor refactor (Phase 1).  The C++ ``HOOK_DEFS`` mirror layer
+Carved out of ``ring_transport.py`` as part of the unified-adaptor refactor.
+The C++ ``HOOK_DEFS`` mirror layer
 (hook-type IDs, suffix tuples, property frozensets) remains in
 ``ring_transport.py``; this module owns the *policy* layer (which hooks to
 enable in which configuration).
@@ -56,8 +56,8 @@ _ALL_HOOK_TYPES = frozenset(_id_by_short.values())
 # -- Presets --
 _HOOK_SELECTIONS: Dict[str, frozenset] = {
     "full": _ALL_HOOK_TYPES,
-    # "vllm-full" is registered at import time by integration/vllm_adapter.py
-    # via register_preset (Phase 3a; deferred from Phase 1.5).
+    # Framework-specific integrations may register additional presets through
+    # register_preset without modifying this core table.
     # What HF returns with output_hidden_states + output_attentions + logits
     "hf-only": frozenset({
         HOOK_TYPE_RESID_PRE, HOOK_TYPE_FINAL_LN,

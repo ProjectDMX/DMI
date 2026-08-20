@@ -1,18 +1,5 @@
-"""Shared model-shape derivation helpers for adapters.
+"""Framework-neutral model-shape derivation for integration API v1."""
 
-``_make_model_shape_from_hf_config`` is the root-owned HF adapter's legacy
-helper. External framework integrations use the public equivalent in
-``monitoring.integration_api.v1``.
-
-The helper takes a HuggingFace-shaped config object plus an optional dtype
-override and returns a ``ModelShapeConfig``. TP fields default to
-``tp_size=1, tp_rank=0``; each adapter's ``detect_parallel_ranks``
-fills them in.
-
-Dependency direction: ``integration`` -> ``monitoring.ring_transport``
-(for ``ModelShapeConfig``).  Core ``monitoring/`` does not import
-``integration/``.
-"""
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -22,13 +9,8 @@ import torch
 from monitoring.ring_transport import ModelShapeConfig
 
 
-def _effective_intermediate_dim(cfg: Any) -> int:
-    """Return the tensor width at the post-activation MLP boundary.
-
-    Most architectures expose that width directly as ``intermediate_size``.
-    LFM2 can instead derive it with the same adjustment and alignment used by
-    its upstream ``Lfm2MLP`` constructor.
-    """
+def effective_intermediate_dim(cfg: Any) -> int:
+    """Return the tensor width at the post-activation MLP boundary."""
 
     intermediate_dim = (
         getattr(cfg, "intermediate_size", None)
@@ -49,39 +31,36 @@ def _effective_intermediate_dim(cfg: Any) -> int:
     return int(intermediate_dim)
 
 
-def _make_model_shape_from_hf_config(
+def make_model_shape_from_hf_config(
     hf_config: Any,
     dtype: Optional[torch.dtype] = None,
 ) -> Optional[ModelShapeConfig]:
-    """Build a ``ModelShapeConfig`` from a HuggingFace-shaped config object.
+    """Build a model-shape description from a Hugging-Face-shaped config.
 
-    Reads the standard transformer config fields:
-      * hidden_size (or n_embd for GPT-2 family)
-      * num_attention_heads (or n_head)
-      * num_key_value_heads (default = num_attention_heads for MHA)
-      * head_dim (default = hidden_size // num_attention_heads)
-      * vocab_size
-      * intermediate_size (or n_inner; falls back to 4 * hidden_size for GPT-2)
-      * torch_dtype (overridden by the ``dtype`` argument when provided)
-
-    Returns ``None`` if required fields are missing.
+    The object need not inherit from a Transformers class. Only the standard
+    configuration attributes read below are required.
     """
-    # Multimodal public wrappers keep decoder geometry under text_config.
-    # DMI's current multimodal tier observes that decoder, not the encoder or
-    # projector, so all hook shapes must derive from the same nested config.
+
+    # Multimodal wrappers keep decoder geometry under ``text_config``.
     cfg = getattr(hf_config, "text_config", hf_config)
     hidden_dim = getattr(cfg, "hidden_size", getattr(cfg, "n_embd", None))
-    num_heads = getattr(cfg, "num_attention_heads", getattr(cfg, "n_head", None))
+    num_heads = getattr(
+        cfg,
+        "num_attention_heads",
+        getattr(cfg, "n_head", None),
+    )
     num_kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
     head_dim = getattr(cfg, "head_dim", None)
     if hidden_dim is None or num_heads is None:
         return None
     if head_dim is None:
         head_dim = int(hidden_dim) // int(num_heads)
+
     if dtype is None:
         dtype = getattr(cfg, "torch_dtype", None)
     if dtype is None:
         dtype = torch.float16
+
     vocab_size = getattr(cfg, "vocab_size", 0) or 0
     num_experts = (
         getattr(cfg, "num_experts", None)
@@ -95,7 +74,7 @@ def _make_model_shape_from_hf_config(
         or getattr(cfg, "top_k", None)
         or 0
     )
-    intermediate_dim = _effective_intermediate_dim(cfg)
+    intermediate_dim = effective_intermediate_dim(cfg)
     if not intermediate_dim and getattr(cfg, "model_type", "") == "gpt2":
         intermediate_dim = 4 * int(hidden_dim)
 
@@ -114,4 +93,4 @@ def _make_model_shape_from_hf_config(
     )
 
 
-__all__ = ["_effective_intermediate_dim", "_make_model_shape_from_hf_config"]
+__all__ = ["effective_intermediate_dim", "make_model_shape_from_hf_config"]

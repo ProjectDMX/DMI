@@ -26,22 +26,9 @@ run_test() {
 PROJECT_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$PROJECT_ROOT"
 
-export VLLM_DISABLE_COMPILE_CACHE=${VLLM_DISABLE_COMPILE_CACHE:-1}
-export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-0}
-
 # --- Unit tests ---
 run_test "unit: test_tp_shapes + test_config" \
     python -m pytest tests/test_tp_shapes.py tests/test_config.py -q
-
-# --- vLLM transport correctness (compare model) ---
-for model in qwen3 gpt2; do
-    for mode in eager cudagraph; do
-        run_test "vllm: $model $mode tp=1" \
-            bash tests/tools/run_tp_compare_vllm.sh "$model" "$mode" 1
-        run_test "vllm: $model $mode tp=2" \
-            bash tests/tools/run_tp_compare_vllm.sh "$model" "$mode" 2
-    done
-done
 
 # --- HF transport correctness (compare model) ---
 for model in gpt2 qwen3; do
