@@ -1,6 +1,6 @@
 """Shared comparator: compare .pt ref files on disk vs ClickHouse rows.
 
-Used by both vllm_compare_runner.py and hf_compare_runner.py.
+Used by the root HF comparison runner. Other integrations own their copies.
 No CUDA needed — runs entirely on CPU.
 """
 import re
@@ -56,35 +56,23 @@ def _bytes_identical(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def read_clickhouse(db_host: str, db_port: int,
-                    database: str = "default", table: str = "offload",
-                    model_id: str | None = None):
-    """Read ClickHouse rows keyed by request/hook/token range.
-
-    ``model_id`` should identify one test run. It remains optional for the
-    legacy Hugging Face comparator, which owns a freshly cleared table.
-    """
+                    database: str = "default", table: str = "offload"):
+    """Read all rows from ClickHouse, return dict keyed by (req_id, act_name, layer, shard, start, end)."""
     import clickhouse_driver
     ch_client = clickhouse_driver.Client(db_host, port=db_port)
-    query = (
+    raw_rows = ch_client.execute(
         f"SELECT model_id, request_id, act_name, layer_no, shard_rank, "
         f"start_token_idx, end_token_idx, dtype, shape, bytes "
-        f"FROM {database}.{table}"
-    )
-    params = None
-    if model_id is not None:
-        query += " WHERE model_id = %(model_id)s"
-        params = {"model_id": model_id}
-    if params is None:
-        raw_rows = ch_client.execute(
-            query, settings={"strings_as_bytes": True})
-    else:
-        raw_rows = ch_client.execute(
-            query, params, settings={"strings_as_bytes": True})
+        f"FROM {database}.{table}",
+        settings={"strings_as_bytes": True})
 
     ch_data: dict[tuple, torch.Tensor] = {}
     for row in raw_rows:
         _, req_id, act_name, layer_no, shard_rank, s, e, dtype_str, shape, payload = row
-        dt = _DTYPE_MAP.get(_decode(dtype_str), torch.float32)
+        dtype_name = _decode(dtype_str)
+        if dtype_name not in _DTYPE_MAP:
+            raise ValueError(f"Unsupported ClickHouse tensor dtype: {dtype_name!r}")
+        dt = _DTYPE_MAP[dtype_name]
         t = torch.frombuffer(bytearray(payload), dtype=dt).reshape(list(shape))
         ch_data[(_decode(req_id), _decode(act_name), int(layer_no),
                  int(shard_rank), int(s), int(e))] = t
@@ -93,13 +81,17 @@ def read_clickhouse(db_host: str, db_port: int,
 
 
 def compare(ref_dir: str, ch_data: dict, num_ch_rows: int) -> tuple[int, int]:
-    """Compare .pt files in ref_dir against ch_data. Returns (passed, failed)."""
+    """Compare .pt files against an exactly matching physical CH inventory.
+
+    Raw row count, unique keys, and token-segment boundaries must all match;
+    values are then compared by dtype, shape, and bytes.
+    """
     ref_path = Path(ref_dir)
     passed = 0
     failed = 0
     not_found = 0
-    used_ch_keys: set[tuple] = set()
 
+    ref_files: list[tuple[tuple, str, Path]] = []
     for req_dir in sorted(ref_path.iterdir()):
         if not req_dir.is_dir():
             continue
@@ -114,113 +106,104 @@ def compare(ref_dir: str, ch_data: dict, num_ch_rows: int) -> tuple[int, int]:
             start = int(m.group("start"))
             end = int(m.group("end"))
 
-            ref_t = torch.load(str(pt_file), weights_only=True, map_location="cpu")
-
             ch_act = _BUF_TO_CH_ACT.get(hook, hook)
             ch_key = (req_id, ch_act, layer, shard, start, end)
-            ch_t = ch_data.get(ch_key)
-            matched_keys: list[tuple] = []
-            if ch_t is not None:
-                matched_keys.append(ch_key)
+            ref_files.append((ch_key, hook, pt_file))
 
-            if ch_t is None:
-                # Reconstruct exactly [start, end) from contiguous storage
-                # segments for this (request, hook, layer, rank). Reject gaps,
-                # overlaps, and malformed row spans instead of accepting a
-                # same-shaped tensor with unrelated token metadata.
-                candidates = sorted(
-                    [(k, v) for k, v in ch_data.items()
-                     if k[0] == req_id and k[1] == ch_act and k[2] == layer
-                     and k[3] == shard and k[4] < end and k[5] > start],
-                    key=lambda kv: kv[0][4],  # sort by start_token
-                )
-                cursor = start
-                pieces: list[torch.Tensor] = []
-                for key, candidate in candidates:
-                    segment_start, segment_end = key[4], key[5]
-                    if segment_end <= segment_start:
-                        pieces = []
-                        break
-                    if candidate.ndim < 1 or candidate.shape[0] != (
-                        segment_end - segment_start
-                    ):
-                        pieces = []
-                        break
-                    if pieces and segment_start < cursor:
-                        pieces = []
-                        break
-                    if segment_start > cursor:
-                        pieces = []
-                        break
-                    piece_end = min(end, segment_end)
-                    pieces.append(
-                        candidate[
-                            cursor - segment_start:piece_end - segment_start
-                        ]
-                    )
-                    matched_keys.append(key)
-                    cursor = piece_end
-                    if cursor == end:
-                        break
-                if pieces and cursor == end:
-                    ch_t = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
-                else:
-                    matched_keys.clear()
+    ref_keys = [key for key, _, _ in ref_files]
+    unique_ref_keys = set(ref_keys)
+    ch_keys = set(ch_data)
 
-            label = f"{req_id}/{hook}"
-            if layer >= 0:
-                label += f"_L{layer}"
-            label += f"_T{start}_{end}"
-
-            if ch_t is None:
-                print(f"  [FAIL] {label} -- not found in ClickHouse", flush=True)
-                failed += 1
-                not_found += 1
-                continue
-
-            used_ch_keys.update(matched_keys)
-            ch_t = ch_t.cpu()
-            if ref_t.shape != ch_t.shape:
-                print(f"  [FAIL] {label} -- shape {list(ref_t.shape)} vs {list(ch_t.shape)}",
-                      flush=True)
-                failed += 1
-                continue
-
-            if ref_t.dtype != ch_t.dtype:
-                print(f"  [FAIL] {label} -- dtype mismatch: ref={ref_t.dtype} ch={ch_t.dtype}",
-                      flush=True)
-                failed += 1
-                continue
-
-            if _bytes_identical(ref_t, ch_t):
-                passed += 1
-            else:
-                diff = (ref_t.float() - ch_t.float()).abs().max().item()
-                print(f"  [FAIL] {label} -- max_abs_diff={diff:.6e}", flush=True)
-                failed += 1
-
-    if passed + failed == 0:
-        print("  [FAIL] no reference tensors were produced", flush=True)
+    if not ref_files:
+        print("  [FAIL] no reference tensor files found", flush=True)
         failed += 1
-
-    duplicate_rows = max(0, num_ch_rows - len(ch_data))
-    if duplicate_rows:
+    if len(unique_ref_keys) != len(ref_keys):
         print(
-            f"  [FAIL] {duplicate_rows} duplicate ClickHouse row key(s)",
+            "  [FAIL] duplicate logical reference rows: "
+            f"{len(ref_keys) - len(unique_ref_keys)}",
             flush=True,
         )
-        failed += duplicate_rows
+        failed += 1
+    if len(ch_data) != num_ch_rows:
+        print(
+            "  [FAIL] duplicate ClickHouse primary-key rows: "
+            f"raw={num_ch_rows}, unique={len(ch_data)}",
+            flush=True,
+        )
+        failed += 1
+    if num_ch_rows != len(ref_files):
+        print(
+            "  [FAIL] ClickHouse/reference row-count mismatch: "
+            f"ClickHouse={num_ch_rows}, reference={len(ref_files)}",
+            flush=True,
+        )
+        failed += 1
 
-    unexpected_keys = sorted(set(ch_data) - used_ch_keys)
-    if unexpected_keys:
-        for key in unexpected_keys[:20]:
-            print(f"  [FAIL] unexpected ClickHouse key: {key}", flush=True)
-        if len(unexpected_keys) > 20:
-            print(
-                f"  [FAIL] ... and {len(unexpected_keys) - 20} more unexpected keys",
-                flush=True,
+    missing_keys = unique_ref_keys - ch_keys
+    unexpected_keys = ch_keys - unique_ref_keys
+    if missing_keys or unexpected_keys:
+        print(
+            "  [FAIL] ClickHouse/reference inventory mismatch: "
+            f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}; "
+            f"missing sample={sorted(missing_keys)[:3]}; "
+            f"unexpected sample={sorted(unexpected_keys)[:3]}",
+            flush=True,
+        )
+        failed += 1
+
+    for ch_key, hook, pt_file in ref_files:
+        req_id, ch_act, layer, shard, start, end = ch_key
+        ref_t = torch.load(str(pt_file), weights_only=True, map_location="cpu")
+
+        ch_t = ch_data.get(ch_key)
+
+        if ch_t is None:
+            # Collect all segments for this (req, act, layer, shard)
+            candidates = sorted(
+                [(k, v) for k, v in ch_data.items()
+                 if k[0] == req_id and k[1] == ch_act and k[2] == layer
+                 and k[3] == shard],
+                key=lambda kv: kv[0][4],  # sort by start_token
             )
-        failed += len(unexpected_keys)
+            if len(candidates) == 1:
+                ch_t = candidates[0][1]
+            elif len(candidates) > 1:
+                # Concatenate segments covering [start, end)
+                segments = [(k[4], k[5], v) for k, v in candidates
+                            if k[4] < end and k[5] > start]
+                if segments:
+                    ch_t = torch.cat([v for _, _, v in segments], dim=0)
+
+        label = f"{req_id}/{hook}"
+        if layer >= 0:
+            label += f"_L{layer}"
+        label += f"_T{start}_{end}"
+
+        if ch_t is None:
+            print(f"  [FAIL] {label} -- not found in ClickHouse", flush=True)
+            failed += 1
+            not_found += 1
+            continue
+
+        ch_t = ch_t.cpu()
+        if ref_t.shape != ch_t.shape:
+            print(f"  [FAIL] {label} -- shape {list(ref_t.shape)} vs {list(ch_t.shape)}",
+                  flush=True)
+            failed += 1
+            continue
+
+        if ref_t.dtype != ch_t.dtype:
+            print(f"  [FAIL] {label} -- dtype mismatch: ref={ref_t.dtype} ch={ch_t.dtype}",
+                  flush=True)
+            failed += 1
+            continue
+
+        if _bytes_identical(ref_t, ch_t):
+            passed += 1
+        else:
+            diff = (ref_t.float() - ch_t.float()).abs().max().item()
+            print(f"  [FAIL] {label} -- max_abs_diff={diff:.6e}", flush=True)
+            failed += 1
 
     total = passed + failed
     print(f"\n[compare] {num_ch_rows} rows in ClickHouse", flush=True)

@@ -34,8 +34,8 @@ export NVCC=/usr/local/cuda/bin/nvcc
 
 ## 1. Clone the repository
 
-The repo uses three git submodules: a fork of HuggingFace `transformers`, a fork
-of `vllm`, and the `clickhouse-cpp` C++ client.
+The repo uses three git submodules: the DMI HuggingFace integration, the
+version-matched DMI-vLLM integration, and the `clickhouse-cpp` C++ client.
 
 ```bash
 git clone --recursive https://github.com/ProjectDMX/DMI.git
@@ -48,7 +48,7 @@ git submodule update --init --recursive
 Expected submodule paths:
 
 - `integration/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`, `llama_p`)
-- `integration/vllm/` — modified vLLM with DMI integration hooks
+- `integration/vllm_integration/` — DMI integration for an unmodified official vLLM installation
 - `libs/clickhouse-cpp/` — ClickHouse C++ client linked into the native backend
 
 ## 2. Install ClickHouse server
@@ -120,13 +120,12 @@ pip install -e integration/transformers/
 pip install -e .
 ```
 
-Install vLLM only if you want the vLLM path:
+For the vLLM path, install the versioned integration. Its dependency metadata
+installs the matching official vLLM release:
 
 ```bash
-pip install -e integration/vllm/
+pip install -e integration/vllm_integration/
 ```
-
-This may take a while because it is a full vLLM build.
 
 ## 5. Build native dependencies
 

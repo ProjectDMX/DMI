@@ -16,13 +16,12 @@ or composed into a module-level mark list alongside a category marker::
     pytestmark = [pytest.mark.gpu, require_cuda()]
 
 This module must stay importable on a CPU-only box with no CUDA, ClickHouse,
-vLLM, model weights, or native build toolchain present. All heavy imports
+model weights, or native build toolchain present. All heavy imports
 (``torch`` in particular) are deferred into the helper bodies so that merely
 importing this file costs nothing.
 """
 from __future__ import annotations
 
-import importlib.util
 import os
 import shutil
 import socket
@@ -33,7 +32,6 @@ __all__ = [
     "require_cuda",
     "require_gpus",
     "require_clickhouse",
-    "require_vllm",
     "require_model_cache",
     "require_nvcc",
 ]
@@ -67,17 +65,13 @@ def require_gpus(n: int):
 
 
 def require_clickhouse(host: str | None = None, port: int | None = None):
-    """Skip unless the Python driver exists and ClickHouse is reachable.
+    """Skip unless a ClickHouse TCP port is reachable.
 
     Host/port default to the ``DMX_DB_HOST`` / ``DMX_DB_PORT`` env vars (and
     finally ``127.0.0.1:9000``), matching the runners' connection defaults.
     """
     host = host or os.environ.get("DMX_DB_HOST", "127.0.0.1")
     port = int(port if port is not None else os.environ.get("DMX_DB_PORT", "9000"))
-    if importlib.util.find_spec("clickhouse_driver") is None:
-        return pytest.mark.skipif(
-            True, reason="clickhouse-driver is not installed"
-        )
     reachable = False
     try:
         with socket.create_connection((host, port), timeout=1.0):
@@ -87,12 +81,6 @@ def require_clickhouse(host: str | None = None, port: int | None = None):
     return pytest.mark.skipif(
         not reachable, reason=f"ClickHouse unreachable at {host}:{port}"
     )
-
-
-def require_vllm():
-    """Skip unless the vLLM runtime is importable."""
-    available = importlib.util.find_spec("vllm") is not None
-    return pytest.mark.skipif(not available, reason="vLLM not importable")
 
 
 def _model_in_cache(model: str) -> bool:
