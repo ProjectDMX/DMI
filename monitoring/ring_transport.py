@@ -73,7 +73,7 @@ class HookRowBasis(Enum):
     ``TOKEN_ROWS`` means the shape scales with ``q_len``. In packed execution,
     padding-strip eligibility separately decides whether the adapter uses the
     actual token count or the padded execution count. ``REQUEST_ROWS`` means
-    the packed-runtime shape scales with the request count supplied through
+    the packed shape scales with the request count supplied through
     ``logits_to_keep``. This enum does not describe tensor dimension order,
     rank ownership, or prefix-strip eligibility.
     """

@@ -1,6 +1,7 @@
 """Framework integrations.
 
-Concrete BackendAdaptor subclasses live here as separate modules:
-``hf_adapter.py``, ``vllm_adapter.py``, etc.  The base class lives in
+Root-owned framework adapters live here as separate modules. The HF adapter is
+``hf_adapter.py``; separately distributed integrations use
+``monitoring.integration_api.v1``. The base class lives in
 ``monitoring.adaptor_base``.
 """

@@ -10,7 +10,8 @@ ClickHouse running, and `pip install matplotlib circuitsvis jupyter`.
 
 ```bash
 python example/visualization/run_offload_hf.py
-# (or run_offload_vllm.py to populate the demo_vllm slot.)
+# Or populate the demo_vllm slot with the separately installed vLLM integration:
+python integration/vllm_integration/examples/visualization/run_offload.py
 jupyter notebook example/visualization/visualize.ipynb
 ```
 
@@ -42,8 +43,11 @@ token should be `Mary`.
 
 ## Files
 
-- `prompt.txt` -- edit and re-run an offload to swap.
-- `run_offload_hf.py` / `run_offload_vllm.py` -- write to fixed
-  `model_id="demo_hf"` / `"demo_vllm"`.  Re-running wipes only the
+- `example/visualization/prompt.txt` feeds the HF script;
+  `integration/vllm_integration/examples/visualization/prompt.txt` feeds the
+  vLLM script.
+- `run_offload_hf.py` writes to fixed `model_id="demo_hf"`.
+- `integration/vllm_integration/examples/visualization/run_offload.py` writes
+  to fixed `model_id="demo_vllm"`. Re-running either script wipes only that
   script's own slot.
 - `visualize.ipynb` -- 5 plot cells, output-stripped.

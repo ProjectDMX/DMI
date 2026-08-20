@@ -8,7 +8,7 @@ The pre-refactor ``HookSelection`` dataclass was removed in Phase 2a of
 the unified-adaptor refactor (the path was a silent no-op due to a dead
 ``_filter_specs`` call).  Selection now flows through
 ``monitoring.selection.apply_hook_selection`` driven by the ``hook_selection=``
-arg on ``generate_with_monitoring`` / ``DMXGPUWorker.additional_config``.
+argument on ``generate_with_monitoring`` or an external adapter.
 """
 
 import pytest
