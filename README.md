@@ -119,18 +119,20 @@ Full setup, additional results, and how to reproduce:
 
 Start with the [installation guide](docs/install.md), then choose the
 HuggingFace or vLLM path depending on the runtime you want to inspect. The
-snippet below shows the minimal vLLM entry point.
+snippet below shows the minimal vLLM entry point. The version-matched
+`DMI-vLLM-Integration` package connects DMI to an unmodified official vLLM
+installation.
 
 ```python
 import os
-# Required for the current effectful-op integration with vLLM
-os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+# Required for the current vLLM integration
+os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
 from vllm import LLM, SamplingParams
 
 llm = LLM(
     model="Qwen/Qwen3-0.6B",
-    worker_cls="integration.vllm_adapter.DMXGPUWorker",
+    worker_cls="dmi_vllm_integration.worker.DMXGPUWorker",
     additional_config={
         "dmx_hook_selection": "vllm-full",
         "dmx_null_mode": False,

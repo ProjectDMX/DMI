@@ -61,22 +61,6 @@ _COMPARE_MODEL_PATHS = {
         REPO_ROOT
         / "integration/transformers/src/transformers/models/qwen2_moe_compare/modeling_qwen2_moe.py"
     ),
-    ("vllm", "gpt2"): (
-        REPO_ROOT
-        / "integration/vllm/vllm/model_executor/models/gpt2_compare.py"
-    ),
-    ("vllm", "qwen3"): (
-        REPO_ROOT
-        / "integration/vllm/vllm/model_executor/models/qwen3_compare.py"
-    ),
-    ("vllm", "llama"): (
-        REPO_ROOT
-        / "integration/vllm/vllm/model_executor/models/llama_compare.py"
-    ),
-    ("vllm", "qwen2_moe"): (
-        REPO_ROOT
-        / "integration/vllm/vllm/model_executor/models/qwen2_moe_compare.py"
-    ),
 }
 
 # Matches the canonical ``.copy_()`` capture pattern in _compare files:
@@ -266,7 +250,7 @@ def _main() -> int:
     ap = argparse.ArgumentParser(
         description="Patch a _compare model file to capture one hook only."
     )
-    ap.add_argument("--framework", required=True, choices=["hf", "vllm"])
+    ap.add_argument("--framework", required=True, choices=["hf"])
     ap.add_argument(
         "--model", required=True, choices=["gpt2", "qwen3", "qwen2_moe"], dest="model_key"
     )

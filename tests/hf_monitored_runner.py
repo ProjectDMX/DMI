@@ -27,10 +27,7 @@ def main():
     batch_size = int(os.environ.get("E2E_BATCH_SIZE", "4"))
     max_new_tokens = int(os.environ.get("E2E_MAX_NEW_TOKENS", "8"))
     cuda_graphs = os.environ.get("E2E_CUDA_GRAPHS", "0") == "1"
-    _MODEL_ALIASES = {
-        "qwen3": "Qwen/Qwen3-4B",
-        "llama": "meta-llama/Llama-3.1-8B-Instruct",
-    }
+    _MODEL_ALIASES = {"qwen3": "Qwen/Qwen3-4B", "llama": "meta-llama/Llama-3.1-8B"}
     model_key = os.environ.get("E2E_MODEL", "gpt2")
     hf_model_id = _MODEL_ALIASES.get(model_key, model_key)
 
@@ -74,9 +71,7 @@ def main():
     ch_cfg.secure = False
     ch_cfg.client_side_compress = "none"
     ch_cfg.create_database_if_missing = bool(int(os.environ.get("DMX_DB_CREATE_IF_MISSING", "1")))
-    ch_cfg.drop_existing_database = bool(
-        int(os.environ.get("DMX_DB_DROP_EXISTING", "0"))
-    )
+    ch_cfg.drop_existing_database = bool(int(os.environ.get("DMX_DB_DROP_EXISTING", "1")))
     ch_cfg.index_granularity = 8192
 
     # Monitoring config
