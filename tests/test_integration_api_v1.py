@@ -49,8 +49,12 @@ _HOOK_EXPORTS = {
     "HOOK_TYPE_TOKEN_IDS",
     "HOOK_TYPE_FINAL_LOGITS",
     "HOOK_TYPE_ROUTER_LOGITS",
+    "HOOK_TYPE_SSM_IN",
+    "HOOK_TYPE_SSM_OUT",
     "HOOK_TYPE_TOPK_IDS",
     "HOOK_TYPE_TOPK_WEIGHTS",
+    "HOOK_TYPE_CONV_IN",
+    "HOOK_TYPE_CONV_OUT",
 }
 
 _NON_HOOK_EXPORTS = {
@@ -73,6 +77,7 @@ _NON_HOOK_EXPORTS = {
     "compute_hook_shape",
     "align_up",
     "make_model_shape_from_hf_config",
+    "effective_intermediate_dim",
     "install_ring_hooks",
     "configure_hook_padding_strip",
     "ALL_HOOK_TYPES",

@@ -22,6 +22,33 @@ import torch
 from monitoring.ring_transport import ModelShapeConfig
 
 
+def _effective_intermediate_dim(cfg: Any) -> int:
+    """Return the tensor width at the post-activation MLP boundary.
+
+    Most architectures expose that width directly as ``intermediate_size``.
+    LFM2 can instead derive it with the same adjustment and alignment used by
+    its upstream ``Lfm2MLP`` constructor.
+    """
+
+    intermediate_dim = (
+        getattr(cfg, "intermediate_size", None)
+        or getattr(cfg, "n_inner", None)
+        or 0
+    )
+    if not intermediate_dim:
+        return 0
+    if getattr(cfg, "block_auto_adjust_ff_dim", False):
+        intermediate_dim = int(2 * int(intermediate_dim) / 3)
+        multiplier = getattr(cfg, "block_ffn_dim_multiplier", None)
+        if multiplier is not None:
+            intermediate_dim = int(multiplier * intermediate_dim)
+        multiple_of = int(getattr(cfg, "block_multiple_of"))
+        intermediate_dim = multiple_of * (
+            (intermediate_dim + multiple_of - 1) // multiple_of
+        )
+    return int(intermediate_dim)
+
+
 def _make_model_shape_from_hf_config(
     hf_config: Any,
     dtype: Optional[torch.dtype] = None,
@@ -39,7 +66,10 @@ def _make_model_shape_from_hf_config(
 
     Returns ``None`` if required fields are missing.
     """
-    cfg = hf_config
+    # Multimodal public wrappers keep decoder geometry under text_config.
+    # DMI's current multimodal tier observes that decoder, not the encoder or
+    # projector, so all hook shapes must derive from the same nested config.
+    cfg = getattr(hf_config, "text_config", hf_config)
     hidden_dim = getattr(cfg, "hidden_size", getattr(cfg, "n_embd", None))
     num_heads = getattr(cfg, "num_attention_heads", getattr(cfg, "n_head", None))
     num_kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
@@ -53,17 +83,18 @@ def _make_model_shape_from_hf_config(
     if dtype is None:
         dtype = torch.float16
     vocab_size = getattr(cfg, "vocab_size", 0) or 0
-    num_experts = getattr(cfg, "num_experts", 0) or 0
+    num_experts = (
+        getattr(cfg, "num_experts", None)
+        or getattr(cfg, "num_local_experts", None)
+        or getattr(cfg, "n_routed_experts", None)
+        or 0
+    )
     top_k = (
         getattr(cfg, "num_experts_per_tok", None)
         or getattr(cfg, "top_k", None)
         or 0
     )
-    intermediate_dim = (
-        getattr(cfg, "intermediate_size", None)
-        or getattr(cfg, "n_inner", None)
-        or 0
-    )
+    intermediate_dim = _effective_intermediate_dim(cfg)
     if not intermediate_dim and getattr(cfg, "model_type", "") == "gpt2":
         intermediate_dim = 4 * int(hidden_dim)
 
@@ -82,4 +113,4 @@ def _make_model_shape_from_hf_config(
     )
 
 
-__all__ = ["_make_model_shape_from_hf_config"]
+__all__ = ["_effective_intermediate_dim", "_make_model_shape_from_hf_config"]

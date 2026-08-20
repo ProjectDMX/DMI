@@ -47,11 +47,15 @@ from monitoring.ring_transport import (
     HOOK_TYPE_RESID_MID,
     HOOK_TYPE_RESID_PRE,
     HOOK_TYPE_ROUTER_LOGITS,
+    HOOK_TYPE_SSM_IN,
+    HOOK_TYPE_SSM_OUT,
     HOOK_TYPE_TOKEN_IDS,
     HOOK_TYPE_TOPK_IDS,
     HOOK_TYPE_TOPK_WEIGHTS,
     HOOK_TYPE_V,
     HOOK_TYPE_Z,
+    HOOK_TYPE_CONV_IN,
+    HOOK_TYPE_CONV_OUT,
     HookRowBasis,
     HookSpec,
     ModelShapeConfig,
@@ -67,7 +71,7 @@ from monitoring.selection import (
 )
 from monitoring.step_context import StepContext
 
-from .model_shape import make_model_shape_from_hf_config
+from .model_shape import effective_intermediate_dim, make_model_shape_from_hf_config
 
 
 DMI_INTEGRATION_API_VERSION = 1
@@ -176,6 +180,7 @@ __all__ = [
     "compute_hook_shape",
     "align_up",
     "make_model_shape_from_hf_config",
+    "effective_intermediate_dim",
     "install_ring_hooks",
     "configure_hook_padding_strip",
     "ALL_HOOK_TYPES",
@@ -203,6 +208,10 @@ __all__ = [
     "HOOK_TYPE_ROUTER_LOGITS",
     "HOOK_TYPE_TOPK_IDS",
     "HOOK_TYPE_TOPK_WEIGHTS",
+    "HOOK_TYPE_SSM_IN",
+    "HOOK_TYPE_SSM_OUT",
+    "HOOK_TYPE_CONV_IN",
+    "HOOK_TYPE_CONV_OUT",
     "register_preset",
     "is_preset_registered",
     "select_hook_specs",

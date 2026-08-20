@@ -9,6 +9,28 @@ import torch
 from monitoring.ring_transport import ModelShapeConfig
 
 
+def effective_intermediate_dim(cfg: Any) -> int:
+    """Return the tensor width at the post-activation MLP boundary."""
+
+    intermediate_dim = (
+        getattr(cfg, "intermediate_size", None)
+        or getattr(cfg, "n_inner", None)
+        or 0
+    )
+    if not intermediate_dim:
+        return 0
+    if getattr(cfg, "block_auto_adjust_ff_dim", False):
+        intermediate_dim = int(2 * int(intermediate_dim) / 3)
+        multiplier = getattr(cfg, "block_ffn_dim_multiplier", None)
+        if multiplier is not None:
+            intermediate_dim = int(multiplier * intermediate_dim)
+        multiple_of = int(getattr(cfg, "block_multiple_of"))
+        intermediate_dim = multiple_of * (
+            (intermediate_dim + multiple_of - 1) // multiple_of
+        )
+    return int(intermediate_dim)
+
+
 def make_model_shape_from_hf_config(
     hf_config: Any,
     dtype: Optional[torch.dtype] = None,
@@ -19,39 +41,40 @@ def make_model_shape_from_hf_config(
     configuration attributes read below are required.
     """
 
-    hidden_dim = getattr(
-        hf_config, "hidden_size", getattr(hf_config, "n_embd", None)
-    )
+    # Multimodal wrappers keep decoder geometry under ``text_config``.
+    cfg = getattr(hf_config, "text_config", hf_config)
+    hidden_dim = getattr(cfg, "hidden_size", getattr(cfg, "n_embd", None))
     num_heads = getattr(
-        hf_config,
+        cfg,
         "num_attention_heads",
-        getattr(hf_config, "n_head", None),
+        getattr(cfg, "n_head", None),
     )
-    num_kv_heads = getattr(hf_config, "num_key_value_heads", num_heads)
-    head_dim = getattr(hf_config, "head_dim", None)
+    num_kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
+    head_dim = getattr(cfg, "head_dim", None)
     if hidden_dim is None or num_heads is None:
         return None
     if head_dim is None:
         head_dim = int(hidden_dim) // int(num_heads)
 
     if dtype is None:
-        dtype = getattr(hf_config, "torch_dtype", None)
+        dtype = getattr(cfg, "torch_dtype", None)
     if dtype is None:
         dtype = torch.float16
 
-    vocab_size = getattr(hf_config, "vocab_size", 0) or 0
-    num_experts = getattr(hf_config, "num_experts", 0) or 0
+    vocab_size = getattr(cfg, "vocab_size", 0) or 0
+    num_experts = (
+        getattr(cfg, "num_experts", None)
+        or getattr(cfg, "num_local_experts", None)
+        or getattr(cfg, "n_routed_experts", None)
+        or 0
+    )
     top_k = (
-        getattr(hf_config, "num_experts_per_tok", None)
-        or getattr(hf_config, "top_k", None)
+        getattr(cfg, "num_experts_per_tok", None)
+        or getattr(cfg, "top_k", None)
         or 0
     )
-    intermediate_dim = (
-        getattr(hf_config, "intermediate_size", None)
-        or getattr(hf_config, "n_inner", None)
-        or 0
-    )
-    if not intermediate_dim and getattr(hf_config, "model_type", "") == "gpt2":
+    intermediate_dim = effective_intermediate_dim(cfg)
+    if not intermediate_dim and getattr(cfg, "model_type", "") == "gpt2":
         intermediate_dim = 4 * int(hidden_dim)
 
     return ModelShapeConfig(
@@ -69,4 +92,4 @@ def make_model_shape_from_hf_config(
     )
 
 
-__all__ = ["make_model_shape_from_hf_config"]
+__all__ = ["effective_intermediate_dim", "make_model_shape_from_hf_config"]

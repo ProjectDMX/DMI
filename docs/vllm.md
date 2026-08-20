@@ -30,8 +30,19 @@ The integration fails before device initialization when it detects an
 unsupported runner, version, architecture, or parallel mode. Its supported
 model architectures are:
 
+- Apertus
+- ERNIE 4.5 dense
+- Falcon-H1
+- Gemma 3 text
 - GPT-2
+- Granite dense
+- Jamba dense
+- LFM2
 - Llama
+- MiniCPM
+- Mistral
+- OLMo 3
+- Phi-3
 - Qwen2/Qwen2.5
 - Qwen2-MoE
 - Qwen3

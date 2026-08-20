@@ -623,6 +623,19 @@ returns `None` only when hidden size or attention-head count is absent. It does
 little validation: a present-but-`None` primary attribute does not fall back to
 its alias, and conversion/division errors propagate.
 
+Multimodal wrappers are read through `text_config` when present. Expert count
+also accepts `num_local_experts` and `n_routed_experts`. LFM2-style adjusted
+feed-forward widths use the public `effective_intermediate_dim` helper.
+
+### `effective_intermediate_dim`
+
+```python
+effective_intermediate_dim(hf_config) -> int
+```
+
+Returns `intermediate_size`/`n_inner`, including LFM2's configured two-thirds,
+multiplier, and alignment adjustment, or zero when no width is declared.
+
 ### `install_ring_hooks`
 
 ```python
@@ -771,6 +784,10 @@ is `max(1, num_kv_heads//P)`, `D` is `head_dim`, `S` is `kv_dim`, `I` is
 | `HOOK_TYPE_ROUTER_LOGITS` (21) | `router_logits` / `blocks.mlp.hook_router_logits` | Raw expert-gate output before selection | `[B?, T, E]` | Per-layer, TP0 |
 | `HOOK_TYPE_TOPK_IDS` (22) | `topk_ids` / `blocks.mlp.hook_topk_ids` | Expert IDs returned by routing and consumed by experts | `[B?, T, K]` | Per-layer, TP0 |
 | `HOOK_TYPE_TOPK_WEIGHTS` (23) | `topk_weights` / `blocks.mlp.hook_topk_weights` | Weights paired with selected experts | `[B?, T, K]` | Per-layer, TP0 |
+| `HOOK_TYPE_SSM_IN` (24) | `ssm_in` / `blocks.ssm.hook_in` | Input to an SSM branch | `[B?, T, H]` | Per-layer, TP0 |
+| `HOOK_TYPE_SSM_OUT` (25) | `ssm_out` / `blocks.ssm.hook_out` | Output from an SSM branch | `[B?, T, H]` | Per-layer, TP0 |
+| `HOOK_TYPE_CONV_IN` (26) | `conv_in` / `blocks.conv.hook_in` | Input to a short-convolution branch | `[B?, T, H]` | Per-layer, TP0 |
+| `HOOK_TYPE_CONV_OUT` (27) | `conv_out` / `blocks.conv.hook_out` | Output from a short-convolution branch | `[B?, T, H]` | Per-layer, TP0 |
 
 “Per-layer” means the native table permits any PP stage; the integration still
 must include only layers owned by that stage. `FINAL_LOGITS` is the only
