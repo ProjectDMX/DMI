@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 
-import integration.vllm_adapter  # noqa: F401
 import monitoring.ring_transport as ring
 from monitoring.selection import resolve_hook_selection
 from tests.compare_disk_vs_ch import _BUF_TO_CH_ACT
@@ -53,8 +52,8 @@ def test_conv_hooks_use_full_hidden_rows_in_both_layouts() -> None:
         ]
 
 
-def test_vllm_full_selects_conv_without_reclassifying_ssm() -> None:
-    selected = resolve_hook_selection("vllm-full")
+def test_full_selects_conv_without_reclassifying_ssm() -> None:
+    selected = resolve_hook_selection("full")
 
     assert ring.HOOK_TYPE_CONV_IN in selected
     assert ring.HOOK_TYPE_CONV_OUT in selected

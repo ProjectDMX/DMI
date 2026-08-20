@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from functools import lru_cache
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -10,14 +9,13 @@ pytestmark = pytest.mark.framework_fork
 
 
 @lru_cache(maxsize=1)
-def _vllm_mods() -> SimpleNamespace:
+def _mods() -> SimpleNamespace:
     try:
         from transformers import Qwen2MoeConfig
+        from transformers.models.qwen2_moe_compare.modeling_qwen2_moe import CompareQwen2MoeForCausalLM
+        from transformers.models.qwen2_moe_p.modeling_qwen2_moe import HookedQwen2MoeForCausalLM
 
         from integration.model_shape import _make_model_shape_from_hf_config
-        from integration.vllm_adapter import _ARCH_REMAP
-        from integration.vllm.vllm.model_executor.models.enable_ref_hooks import enable_ref_hooks
-        from integration.vllm.vllm.model_executor.models.registry import _TEXT_GENERATION_MODELS
         from monitoring.ring_transport import (
             HOOK_TYPE_ROUTER_LOGITS,
             HOOK_TYPE_TOPK_IDS,
@@ -25,21 +23,20 @@ def _vllm_mods() -> SimpleNamespace:
             _compute_hook_shape,
             _id_by_short,
         )
-        from tests.ref_disk_worker import _ARCH_REMAP as _REF_ARCH_REMAP
     except ImportError as exc:
-        pytest.skip(f"modified framework forks required: {exc}")
+        pytest.skip(f"modified Transformers fork required: {exc}")
     return SimpleNamespace(**locals())
 
 
 def test_moe_v1_routing_hook_types_registered() -> None:
-    m = _vllm_mods()
+    m = _mods()
     assert m._id_by_short["router_logits"] == m.HOOK_TYPE_ROUTER_LOGITS
     assert m._id_by_short["topk_ids"] == m.HOOK_TYPE_TOPK_IDS
     assert m._id_by_short["topk_weights"] == m.HOOK_TYPE_TOPK_WEIGHTS
 
 
 def test_moe_v1_routing_shapes_from_qwen2_moe_config() -> None:
-    m = _vllm_mods()
+    m = _mods()
     cfg = m.Qwen2MoeConfig(
         hidden_size=64,
         intermediate_size=128,
@@ -67,44 +64,45 @@ def test_moe_v1_routing_shapes_from_qwen2_moe_config() -> None:
     ) == [q_len, 4]
 
 
-def test_vllm_adapter_remaps_qwen2_moe_to_hooked_variant() -> None:
-    m = _vllm_mods()
-    assert m._ARCH_REMAP["Qwen2MoeForCausalLM"] == "Qwen2MoePForCausalLM"
-
-
-def test_vllm_compare_model_is_registered() -> None:
-    m = _vllm_mods()
-    assert m._TEXT_GENERATION_MODELS["Qwen2MoeCompareForCausalLM"] == (
-        "qwen2_moe_compare",
-        "Qwen2MoeCompareForCausalLM",
+def test_hf_hooked_qwen2_moe_exposes_routing_hook_specs() -> None:
+    m = _mods()
+    model = m.HookedQwen2MoeForCausalLM(
+        m.Qwen2MoeConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_experts=8,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            vocab_size=128,
+        )
     )
+    emitted = {spec.hook_type for spec in model.get_hook_specs()}
+    assert m.HOOK_TYPE_ROUTER_LOGITS in emitted
+    assert m.HOOK_TYPE_TOPK_IDS in emitted
+    assert m.HOOK_TYPE_TOPK_WEIGHTS in emitted
 
 
-def test_vllm_ref_model_is_registered() -> None:
-    m = _vllm_mods()
-    assert m._TEXT_GENERATION_MODELS["Qwen2MoeRefForCausalLM"] == (
-        "qwen2_moe_ref",
-        "Qwen2MoeRefForCausalLM",
+def test_hf_compare_qwen2_moe_exposes_compare_api() -> None:
+    m = _mods()
+    model = m.CompareQwen2MoeForCausalLM(
+        m.Qwen2MoeConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_experts=8,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            vocab_size=128,
+        )
     )
-    assert m._REF_ARCH_REMAP["Qwen2MoeForCausalLM"] == "Qwen2MoeRefForCausalLM"
-
-
-def test_qwen2_moe_ref_preset_adds_routing_hooks(tmp_path) -> None:
-    m = _vllm_mods()
-    model_file = tmp_path / "qwen2_moe_ref.py"
-    model_file.write_text("class Dummy:\n    pass\n", encoding="utf-8")
-    out_dir = tmp_path / "out"
-    cfg_out = tmp_path / "ref_config.json"
-
-    m.enable_ref_hooks(
-        model_file=str(model_file),
-        hooks="vllm-full",
-        max_len=128,
-        output_dir=str(out_dir),
-        config_out=str(cfg_out),
-    )
-
-    cfg = json.loads(cfg_out.read_text(encoding="utf-8"))
-    assert "router_logits" in cfg["enabled_hooks"]
-    assert "topk_ids" in cfg["enabled_hooks"]
-    assert "topk_weights" in cfg["enabled_hooks"]
+    assert hasattr(model, "allocate_compare_buffers")
+    assert hasattr(model, "get_ref_buffers")
