@@ -1,9 +1,25 @@
+"""Unit tests for the dict-returning generate_with_monitoring wrappers."""
 from types import SimpleNamespace
 
 import pytest
 
-from integration import hf_adapter
-from monitoring.internal_mapper import InternalRequirements
+try:
+    from integration import hf_adapter
+    from monitoring.internal_mapper import InternalRequirements
+    _NATIVE_IMPORT_ERROR = None
+except ImportError as exc:  # pragma: no cover - depends on build environment
+    hf_adapter = None
+    InternalRequirements = None
+    _NATIVE_IMPORT_ERROR = exc
+
+
+pytestmark = [
+    pytest.mark.native_backend,
+    pytest.mark.skipif(
+        _NATIVE_IMPORT_ERROR is not None,
+        reason=f"DMI native backend required: {_NATIVE_IMPORT_ERROR}",
+    ),
+]
 
 
 def test_generate_with_monitoring_returns_impl_output_unchanged(monkeypatch):
