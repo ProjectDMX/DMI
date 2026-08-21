@@ -41,11 +41,18 @@ class _ScriptedModel(torch.nn.Module):
         self.dtype = torch.float32
         self.config = SimpleNamespace()
 
-    def forward(self, input_ids, **kwargs):
+    def forward(self, input_ids, position_ids=None, **kwargs):
+        # position_ids must be a declared parameter: the loop probes
+        # inspect.signature(model.forward) to decide whether to pass it at all,
+        # so a **kwargs-only double silently disables every position_ids path.
         call_index = len(self.calls)
         self.calls.append(
             {
                 "input_ids": input_ids.detach().clone(),
+                "position_ids": (
+                    None if position_ids is None
+                    else position_ids.detach().clone()
+                ),
                 "kwargs": dict(kwargs),
             }
         )
@@ -77,11 +84,14 @@ def _generate(
     eos_token_id=None,
     logits_to_keep=0,
     timings=None,
+    attention_mask=None,
 ):
     model = _ScriptedModel(token_steps)
     batch = len(token_steps[0]) if token_steps else 1
-    input_ids = torch.ones((batch, 2), dtype=torch.long)
-    attention_mask = torch.ones_like(input_ids)
+    width = 2 if attention_mask is None else int(attention_mask.shape[1])
+    input_ids = torch.ones((batch, width), dtype=torch.long)
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
     result = generate_greedy_with_monitoring(
         model,
         input_ids,
@@ -294,3 +304,33 @@ def test_result_is_never_shorter_than_min_new_tokens(
     assert len(model.calls) == max_new_tokens
     for row in result:
         assert len(row) >= min_new_tokens
+
+
+def test_prefill_position_ids_come_from_the_attention_mask():
+    """Left-padded rows must start at 0 on their first real token."""
+    mask = torch.tensor([[0, 1, 1], [1, 1, 1]], dtype=torch.long)
+    model, _result = _generate(
+        [[3, 4], [5, 6]], max_new_tokens=2, attention_mask=mask
+    )
+
+    # cumsum(-1) - 1, with masked positions pinned to 0.
+    assert model.calls[0]["position_ids"].tolist() == [[0, 0, 1], [0, 1, 2]]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "known bug: eager decode computes seq_pos = Pmax + step + 1, so the "
+        "first decode token is placed at Pmax+1 and skips a position.  The "
+        "cuda_graphs path is correct -- it starts cache_pos at [Pmax] -- so "
+        "the two decode paths disagree.  Only reachable with cuda_graphs=False; "
+        "the sole caller (benchmark/bench_hf_transport.py) passes True."
+    ),
+)
+def test_first_decode_position_id_continues_from_the_prompt():
+    model, _result = _generate([[3], [4], [5]], max_new_tokens=3)
+
+    # Prompt occupies positions 0..Pmax-1, so the first generated token is at
+    # Pmax, and each later step advances by exactly one.
+    assert model.calls[1]["position_ids"].tolist() == [[2]]
+    assert model.calls[2]["position_ids"].tolist() == [[3]]

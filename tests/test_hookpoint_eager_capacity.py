@@ -25,6 +25,21 @@ pytestmark = [
 ]
 
 
+# The producer op receives (ring_payload, tensor, strip_tensor, strip_row_bytes,
+# hook_type, hook_id).  Pinning the identity values here lets tests assert the
+# whole tuple instead of just the call count -- a swapped hook_type/hook_id or a
+# wrong payload handle mis-associates activations with hooks and raises nothing.
+HOOK_TYPE = 7
+HOOK_ID = 3
+PAYLOAD = object()
+# HookPoint defaults for a hook with no strip configured (hook_points.py:174).
+NO_STRIP = (None, 0)
+
+
+def expected_dispatch(tensor):
+    return (PAYLOAD, tensor, *NO_STRIP, HOOK_TYPE, HOOK_ID)
+
+
 class _FakeCudaTensor:
     is_cuda = True
 
@@ -128,9 +143,9 @@ def _run(nbytes: int, engine: _CapacityEngine):
     transport = _Transport(engine)
     ring_transport._active_transport = transport
     hp = hook_points.HookPoint()
-    hp._ring_hook_type = 7
-    hp._ring_hook_id = 3
-    hp._ring_payload = object()
+    hp._ring_hook_type = HOOK_TYPE
+    hp._ring_hook_id = HOOK_ID
+    hp._ring_payload = PAYLOAD
     tensor = _FakeCudaTensor(nbytes)
     result = hp(tensor)
     assert result is tensor
@@ -141,21 +156,21 @@ def _run(nbytes: int, engine: _CapacityEngine):
 def test_tensor_fitting_current_slack_reserves_then_dispatches(dispatch, nbytes):
     engine = _CapacityEngine(available=64, payload=128, staging=128)
 
-    _tensor, transport = _run(nbytes, engine)
+    tensor, transport = _run(nbytes, engine)
 
     assert ("reserve_one", nbytes) in engine.calls
     assert ("flush_and_wait",) not in engine.calls
-    assert len(dispatch) == 1
+    assert dispatch == [expected_dispatch(tensor)]
     assert transport.direct == []
 
 
 def test_exact_effective_capacity_is_accepted(dispatch):
     engine = _CapacityEngine(available=64, payload=64, staging=64)
 
-    _tensor, transport = _run(64, engine)
+    tensor, transport = _run(64, engine)
 
     assert engine.calls[-1] == ("reserve_one", 64)
-    assert len(dispatch) == 1
+    assert dispatch == [expected_dispatch(tensor)]
     assert transport.direct == []
 
 
@@ -167,12 +182,12 @@ def test_flushes_before_reserving_when_only_current_slack_is_insufficient(dispat
         available_after_flush=64,
     )
 
-    _tensor, transport = _run(16, engine)
+    tensor, transport = _run(16, engine)
 
     assert engine.calls.index(("flush_and_wait",)) < engine.calls.index(
         ("reserve_one", 16)
     )
-    assert len(dispatch) == 1
+    assert dispatch == [expected_dispatch(tensor)]
     assert transport.direct == []
 
 
@@ -185,7 +200,7 @@ def test_tensor_larger_than_payload_uses_cpu_direct_without_reservation(dispatch
     assert not any(call[0] == "reserve_one" for call in engine.calls)
     assert dispatch == []
     assert tensor.cpu_calls == 1
-    assert transport.direct == [(('cpu', 33), 7, 3)]
+    assert transport.direct == [(('cpu', 33), HOOK_TYPE, HOOK_ID)]
 
 
 @pytest.mark.parametrize(
@@ -213,7 +228,7 @@ def test_tensor_larger_than_staging_uses_cpu_direct(
     assert not any(call[0] == "reserve_one" for call in engine.calls)
     assert dispatch == []
     assert tensor.cpu_calls == 1
-    assert transport.direct == [(('cpu', nbytes), 7, 3)]
+    assert transport.direct == [(('cpu', nbytes), HOOK_TYPE, HOOK_ID)]
 
 
 @pytest.mark.xfail(
@@ -233,7 +248,7 @@ def test_failed_post_flush_capacity_check_falls_back_to_cpu_direct(dispatch):
     assert not any(call[0] == "reserve_one" for call in engine.calls)
     assert dispatch == []
     assert tensor.cpu_calls == 1
-    assert transport.direct == [(('cpu', 32), 7, 3)]
+    assert transport.direct == [(('cpu', 32), HOOK_TYPE, HOOK_ID)]
 
 
 def test_disabled_hook_is_a_true_noop(dispatch):
@@ -242,9 +257,9 @@ def test_disabled_hook_is_a_true_noop(dispatch):
     ring_transport._active_transport = transport
     hp = hook_points.HookPoint()
     hp.enabled = False
-    hp._ring_hook_type = 7
-    hp._ring_hook_id = 3
-    hp._ring_payload = object()
+    hp._ring_hook_type = HOOK_TYPE
+    hp._ring_hook_id = HOOK_ID
+    hp._ring_payload = PAYLOAD
     tensor = _FakeCudaTensor(16)
 
     assert hp(tensor) is tensor
@@ -265,9 +280,9 @@ def test_non_eager_transport_skips_capacity_checks_entirely(dispatch):
     transport.force_eager = False
     ring_transport._active_transport = transport
     hp = hook_points.HookPoint()
-    hp._ring_hook_type = 7
-    hp._ring_hook_id = 3
-    hp._ring_payload = object()
+    hp._ring_hook_type = HOOK_TYPE
+    hp._ring_hook_id = HOOK_ID
+    hp._ring_payload = PAYLOAD
     tensor = _FakeCudaTensor(1 << 30)
 
     assert hp(tensor) is tensor
@@ -279,9 +294,9 @@ def test_non_eager_transport_skips_capacity_checks_entirely(dispatch):
 def test_no_active_transport_still_dispatches(dispatch):
     ring_transport._active_transport = None
     hp = hook_points.HookPoint()
-    hp._ring_hook_type = 7
-    hp._ring_hook_id = 3
-    hp._ring_payload = object()
+    hp._ring_hook_type = HOOK_TYPE
+    hp._ring_hook_id = HOOK_ID
+    hp._ring_payload = PAYLOAD
     tensor = _FakeCudaTensor(1 << 30)
 
     assert hp(tensor) is tensor
@@ -303,9 +318,9 @@ def test_cpu_tensor_is_a_noop(dispatch):
     engine = _CapacityEngine(available=64, payload=64, staging=64)
     ring_transport._active_transport = _Transport(engine)
     hp = hook_points.HookPoint()
-    hp._ring_hook_type = 7
-    hp._ring_hook_id = 3
-    hp._ring_payload = object()
+    hp._ring_hook_type = HOOK_TYPE
+    hp._ring_hook_id = HOOK_ID
+    hp._ring_payload = PAYLOAD
     tensor = _FakeCudaTensor(16)
     tensor.is_cuda = False
 
@@ -328,9 +343,9 @@ def _run_repeatedly(nbytes: int, engine: _CapacityEngine, times: int):
     ring_transport._active_transport = transport
     for _ in range(times):
         hp = hook_points.HookPoint()
-        hp._ring_hook_type = 7
-        hp._ring_hook_id = 3
-        hp._ring_payload = object()
+        hp._ring_hook_type = HOOK_TYPE
+        hp._ring_hook_id = HOOK_ID
+        hp._ring_payload = PAYLOAD
         hp(_FakeCudaTensor(nbytes))
     return transport
 
