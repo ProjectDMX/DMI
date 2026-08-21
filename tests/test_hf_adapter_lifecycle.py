@@ -229,6 +229,15 @@ def test_prepare_wrapper_contains_monitoring_protocol_failure(
     contract is "a failure at *any* protocol stage is contained", and a future
     per-phase policy would need each case.
 
+    What this replaced, stated accurately: three strict xfails asserting the
+    opposite (that the failure propagates), labelled "known bug".  Because
+    they were strict, they already tripped as XPASS when the swallow was
+    removed -- verified: deleting the ``except`` at ea7161a failed three
+    tests, exactly as it does now.  So this change bought no new detection.
+    What it fixed is the labelling and the direction: the suite no longer
+    files a bug report against code that is behaving as designed, and a
+    reader can now tell containment is the intended contract.
+
     The known sharp edge, deliberately not asserted here: the swallow is bare,
     with no log, warning, or counter, so a partial ``commit_step`` can leave
     the step partly published while hooks still fire.  Making that observable
