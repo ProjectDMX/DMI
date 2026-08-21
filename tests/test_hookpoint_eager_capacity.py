@@ -48,6 +48,7 @@ class _CapacityEngine:
         payload: int,
         staging: int,
         available_after_flush: int | None = None,
+        tasks: int = 1024,
     ) -> None:
         self.available = available
         self.payload = payload
@@ -55,6 +56,9 @@ class _CapacityEngine:
         self.available_after_flush = (
             payload if available_after_flush is None else available_after_flush
         )
+        self.tasks = tasks
+        self.tasks_used = 0
+        self.overdrafts = []
         self.calls = []
 
     def available_capacity(self) -> int:
@@ -69,15 +73,25 @@ class _CapacityEngine:
         self.calls.append(("staging_cap",))
         return self.staging
 
+    def task_cap(self) -> int:
+        self.calls.append(("task_cap",))
+        return self.tasks
+
     def reserve_one(self, nbytes: int) -> None:
+        # DrainThread::reserve just advances the head counters; it never
+        # raises.  An over-reservation is silent ring corruption in the real
+        # engine, so record it here rather than turning it into an exception
+        # the production path would never see.
         self.calls.append(("reserve_one", nbytes))
         if nbytes > self.available:
-            raise RuntimeError("reservation exceeds available capacity")
+            self.overdrafts.append(nbytes)
         self.available -= nbytes
+        self.tasks_used += 1
 
     def flush_and_wait(self) -> None:
         self.calls.append(("flush_and_wait",))
         self.available = self.available_after_flush
+        self.tasks_used = 0
 
 
 class _Transport:
@@ -237,3 +251,115 @@ def test_disabled_hook_is_a_true_noop(dispatch):
     assert engine.calls == []
     assert dispatch == []
     assert transport.direct == []
+
+
+# ---------------------------------------------------------------------------
+# Early-return branches of HookPoint.forward.  None of these touch the ring
+# engine, so a capacity call appearing here is itself the regression.
+# ---------------------------------------------------------------------------
+
+
+def test_non_eager_transport_skips_capacity_checks_entirely(dispatch):
+    engine = _CapacityEngine(available=0, payload=0, staging=0)
+    transport = _Transport(engine)
+    transport.force_eager = False
+    ring_transport._active_transport = transport
+    hp = hook_points.HookPoint()
+    hp._ring_hook_type = 7
+    hp._ring_hook_id = 3
+    hp._ring_payload = object()
+    tensor = _FakeCudaTensor(1 << 30)
+
+    assert hp(tensor) is tensor
+    assert engine.calls == []
+    assert len(dispatch) == 1
+    assert transport.direct == []
+
+
+def test_no_active_transport_still_dispatches(dispatch):
+    ring_transport._active_transport = None
+    hp = hook_points.HookPoint()
+    hp._ring_hook_type = 7
+    hp._ring_hook_id = 3
+    hp._ring_payload = object()
+    tensor = _FakeCudaTensor(1 << 30)
+
+    assert hp(tensor) is tensor
+    assert len(dispatch) == 1
+
+
+def test_uninstalled_hook_is_a_noop(dispatch):
+    engine = _CapacityEngine(available=64, payload=64, staging=64)
+    ring_transport._active_transport = _Transport(engine)
+    hp = hook_points.HookPoint()
+    tensor = _FakeCudaTensor(16)
+
+    assert hp(tensor) is tensor
+    assert engine.calls == []
+    assert dispatch == []
+
+
+def test_cpu_tensor_is_a_noop(dispatch):
+    engine = _CapacityEngine(available=64, payload=64, staging=64)
+    ring_transport._active_transport = _Transport(engine)
+    hp = hook_points.HookPoint()
+    hp._ring_hook_type = 7
+    hp._ring_hook_id = 3
+    hp._ring_payload = object()
+    tensor = _FakeCudaTensor(16)
+    tensor.is_cuda = False
+
+    assert hp(tensor) is tensor
+    assert engine.calls == []
+    assert dispatch == []
+
+
+# ---------------------------------------------------------------------------
+# Task-ring capacity.  prepare_step() checks payload AND task entries
+# (`num_hooks > tcap` -> STEP_OVERSIZED, `num_hooks <= task_avail` -> fast
+# path), and reserve_one() claims one task entry per call.  The eager net --
+# which exists to service the steps prepare_step rejected -- only ever looks
+# at payload bytes.
+# ---------------------------------------------------------------------------
+
+
+def _run_repeatedly(nbytes: int, engine: _CapacityEngine, times: int):
+    transport = _Transport(engine)
+    ring_transport._active_transport = transport
+    for _ in range(times):
+        hp = hook_points.HookPoint()
+        hp._ring_hook_type = 7
+        hp._ring_hook_id = 3
+        hp._ring_payload = object()
+        hp(_FakeCudaTensor(nbytes))
+    return transport
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "known bug: the eager net never consults task_cap(), so successive "
+        "hooks keep calling reserve_one() past the task ring's capacity.  "
+        "task_cap() is bound to Python right next to available_capacity() and "
+        "reserve_one() as part of the documented safety-net surface."
+    ),
+)
+def test_task_capacity_is_respected_across_successive_hooks(dispatch):
+    engine = _CapacityEngine(available=1024, payload=1024, staging=1024, tasks=2)
+
+    _run_repeatedly(8, engine, times=3)
+
+    assert ("task_cap",) in engine.calls
+    assert engine.tasks_used <= 2
+
+
+def test_payload_overdraft_never_happens_on_the_reserve_paths(dispatch):
+    """Both reserving branches must leave the ring accounting consistent."""
+    engine = _CapacityEngine(available=64, payload=64, staging=64)
+
+    # Six 16-byte hooks against a 64-byte ring: the first four consume the
+    # initial slack, the fifth takes the flush-then-reserve branch.
+    _run_repeatedly(16, engine, times=6)
+
+    assert ("flush_and_wait",) in engine.calls
+    assert engine.overdrafts == []

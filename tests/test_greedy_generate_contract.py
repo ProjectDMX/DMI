@@ -231,3 +231,66 @@ def test_batch_rows_finish_independently_without_extra_decode():
 
     assert result == [[2], [4, 2]]
     assert len(model.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "eos_token_id",
+    [
+        pytest.param([2, 5], id="list"),
+        pytest.param(torch.tensor([2, 5]), id="tensor"),
+    ],
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "known bug: the decode loop and the final truncation compare tokens "
+        "against eos_token_id with scalar !=/==, so a multi-EOS set raises "
+        "instead of stopping -- AttributeError for a list ('bool' has no "
+        "'long'), RuntimeError for a Tensor (size mismatch).  "
+        "HFAdaptor._normalize_eos accepts int, list[int] and Tensor, and "
+        "generate_greedy_with_monitoring forwards eos_token_id straight into "
+        "it, so the two halves disagree on the accepted type."
+    ),
+)
+def test_multi_eos_token_ids_stop_generation(eos_token_id):
+    model, result = _generate(
+        [[4], [5], [9]],
+        max_new_tokens=3,
+        eos_token_id=eos_token_id,
+    )
+
+    assert result == [[4, 5]]
+    assert len(model.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("token_steps", "max_new_tokens", "min_new_tokens"),
+    [
+        # min == max: the configuration benchmark/bench_hf_transport.py uses.
+        ([[4], [2], [9]], 3, 3),
+        ([[2], [6], [7]], 3, 2),
+    ],
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "known bug: the stop check honors min_new_tokens but the final "
+        "truncation does not, so a result can be shorter than the requested "
+        "minimum.  Every generated step is still forwarded (and monitored), "
+        "so the returned token count desyncs from the captured activation "
+        "rows."
+    ),
+)
+def test_result_is_never_shorter_than_min_new_tokens(
+    token_steps, max_new_tokens, min_new_tokens
+):
+    model, result = _generate(
+        token_steps,
+        max_new_tokens=max_new_tokens,
+        min_new_tokens=min_new_tokens,
+        eos_token_id=2,
+    )
+
+    assert len(model.calls) == max_new_tokens
+    for row in result:
+        assert len(row) >= min_new_tokens

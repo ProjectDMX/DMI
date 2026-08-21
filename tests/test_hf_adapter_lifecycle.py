@@ -59,6 +59,7 @@ class _FakeEngine:
         self._ring_transport = _FakeTransport()
         self._ring_engine = self._ring_transport._ring_engine
         self._auto_batch_group_id = 0
+        self._model_id = "test-model"
 
     def next_auto_group_id(self) -> int:
         result = self._auto_batch_group_id
@@ -260,3 +261,104 @@ def test_null_offload_bypasses_monitoring_protocol(monkeypatch):
     result = model.prepare_inputs_for_generation(input_ids="tokens")
 
     assert result["input_ids"] == "tokens"
+
+
+# ---------------------------------------------------------------------------
+# monitoring=True path of generate_greedy_with_monitoring
+#
+# generate_greedy_with_monitoring builds its own HFAdaptor, attaches with
+# install_prepare_wrapper=False, drives before_forward_manual per forward, and
+# detaches in a finally block.  That wiring has no other coverage: the
+# prepare-wrapper tests above all go through attach_model directly.
+# ---------------------------------------------------------------------------
+
+
+class _GeneratingFakeModel(_FakeModel):
+    """``_FakeModel`` that can also serve the manual greedy loop."""
+
+    def __init__(self, engine, token_steps: list[list[int]]) -> None:
+        super().__init__()
+        self.monitoring_engine = engine
+        self.token_steps = token_steps
+        self.forward_calls = 0
+        self.raise_on_call: int | None = None
+
+    def forward(self, input_ids, **kwargs):
+        index = self.forward_calls
+        self.forward_calls += 1
+        if self.raise_on_call is not None and index == self.raise_on_call:
+            raise RuntimeError("model exploded mid-generation")
+        next_tokens = self.token_steps[index]
+        logits = torch.full((len(next_tokens), 1, 32), -1000.0)
+        for row, token_id in enumerate(next_tokens):
+            logits[row, 0, token_id] = 1000.0
+        return SimpleNamespace(logits=logits, past_key_values=object())
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+
+@pytest.fixture
+def greedy_monitoring(monkeypatch):
+    """Patch out CUDA sync and record every before_forward_manual call."""
+    from integration import hf_adapter
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    calls = []
+    monkeypatch.setattr(
+        HFAdaptor,
+        "before_forward_manual",
+        lambda self, *args, **kwargs: calls.append(kwargs),
+    )
+    return hf_adapter.generate_greedy_with_monitoring, calls
+
+
+def _run_greedy(generate, model, *, max_new_tokens):
+    input_ids = torch.ones((1, 2), dtype=torch.long)
+    return generate(
+        model,
+        input_ids,
+        torch.ones_like(input_ids),
+        max_new_tokens=max_new_tokens,
+        monitoring=True,
+    )
+
+
+def test_monitoring_generation_drives_one_step_per_forward(greedy_monitoring):
+    generate, calls = greedy_monitoring
+    engine = _FakeEngine()
+    model = _GeneratingFakeModel(engine, [[3], [4], [5]])
+
+    result = _run_greedy(generate, model, max_new_tokens=3)
+
+    assert [tokens.tolist() for tokens in result] == [[3, 4, 5]]
+    assert model.forward_calls == 3
+    assert len(calls) == 3
+    assert engine._hf_adaptor is not None
+
+
+def test_monitoring_generation_detaches_after_success(greedy_monitoring):
+    generate, _calls = greedy_monitoring
+    engine = _FakeEngine()
+    model = _GeneratingFakeModel(engine, [[3], [4]])
+
+    _run_greedy(generate, model, max_new_tokens=2)
+
+    assert engine._ring_transport._using_forward_hooks is False
+    assert engine._ring_transport._active_specs == []
+
+
+@pytest.mark.parametrize("raise_on_call", [0, 1])
+def test_monitoring_generation_detaches_when_the_model_raises(
+    greedy_monitoring, raise_on_call
+):
+    generate, _calls = greedy_monitoring
+    engine = _FakeEngine()
+    model = _GeneratingFakeModel(engine, [[3], [4], [5]])
+    model.raise_on_call = raise_on_call
+
+    with pytest.raises(RuntimeError, match="model exploded mid-generation"):
+        _run_greedy(generate, model, max_new_tokens=3)
+
+    assert engine._ring_transport._using_forward_hooks is False
+    assert engine._ring_transport._active_specs == []
