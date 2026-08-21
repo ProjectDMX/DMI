@@ -178,7 +178,16 @@ def test_reattach_with_different_selection_disables_old_selection():
 
 @pytest.mark.xfail(
     strict=True,
-    reason="known bug: detach leaves producer attributes installed on HookPoints",
+    reason=(
+        "known gap: detach_model restores prepare_inputs_for_generation and "
+        "clears the transport's active specs, but never clears the HookPoints' "
+        "_ring_hook_type / _ring_hook_id / _ring_payload or resets .enabled, so "
+        "a plain forward still reaches _dispatch_producer.  Defence-in-depth, "
+        "not live data loss: all three ops early-return on a null g_active_engine "
+        "(ring_torch_op.cpp:79,100,123), so a correct teardown captures nothing. "
+        "It matters if an engine is still active, or on re-attach to a different "
+        "one."
+    ),
 )
 def test_detach_prevents_plain_forward_from_dispatching(monkeypatch):
     model, _engine, adaptor, _original_prepare = _make_attached(

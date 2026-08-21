@@ -231,24 +231,20 @@ def test_tensor_larger_than_staging_uses_cpu_direct(
     assert transport.direct == [(('cpu', nbytes), HOOK_TYPE, HOOK_ID)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="known bug: eager fallback reserves without rechecking after flush",
-)
-def test_failed_post_flush_capacity_check_falls_back_to_cpu_direct(dispatch):
-    engine = _CapacityEngine(
-        available=8,
-        payload=64,
-        staging=64,
-        available_after_flush=16,
-    )
-
-    tensor, transport = _run(32, engine)
-
-    assert not any(call[0] == "reserve_one" for call in engine.calls)
-    assert dispatch == []
-    assert tensor.cpu_calls == 1
-    assert transport.direct == [(('cpu', 32), HOOK_TYPE, HOOK_ID)]
+# Removed: test_failed_post_flush_capacity_check_falls_back_to_cpu_direct.
+#
+# It was a strict xfail for "eager fallback reserves without rechecking after
+# flush", built on a double with available_after_flush(16) < payload_cap(64).
+# The real engine cannot reach that state.  RingEnginePy::flush_and_wait
+# cudaStreamSynchronizes the main stream and then force_flush_and_wait()s, and
+# DrainThread::do_full_flush loops until flush_count == 0 while setting
+# cpu_payload_tail_committed_ = cpu_payload_tail_.  Head therefore equals
+# committed tail afterwards, so available_capacity() == payload_cap(), and the
+# second eager branch's reserve_one cannot fail for a tensor already known to
+# satisfy nbytes <= payload_cap().  The xfail was a standing instruction to fix
+# something unreachable.  The reachable capacity gaps are covered by
+# test_tensor_larger_than_staging_uses_cpu_direct and
+# test_task_capacity_is_respected_across_successive_hooks.
 
 
 def test_disabled_hook_is_a_true_noop(dispatch):

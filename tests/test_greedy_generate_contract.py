@@ -157,7 +157,13 @@ def test_timings_describe_the_completed_generation():
 )
 @pytest.mark.xfail(
     strict=True,
-    reason="known bug: greedy generation does not validate token limits",
+    reason=(
+        "requested hardening, not a known defect: the loop silently accepts "
+        "invalid limits (max_new_tokens<0 and max_new_tokens=0 both return "
+        "exactly one token; min_new_tokens>max_new_tokens is ignored) instead "
+        "of rejecting them.  Nobody has signed off on raising ValueError, so "
+        "this pins a proposal -- it flips to XPASS if validation lands."
+    ),
 )
 def test_invalid_token_limits_are_rejected(
     max_new_tokens, min_new_tokens, message
@@ -196,20 +202,40 @@ def test_first_generated_eos_stops_without_an_extra_model_call():
     assert len(model.calls) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="known bug: EOS at min_new_tokens has an off-by-one stop check",
-)
-def test_eos_at_minimum_boundary_stops_immediately():
-    model, result = _generate(
+def test_eos_at_the_minimum_does_not_stop_generation():
+    """The ``>`` in the stop check is correct; do not "fix" it to ``>=``.
+
+    HuggingFace bans EOS outright until more than ``min_new_tokens`` tokens
+    exist.  ``MinNewTokensLengthLogitsProcessor.__call__`` is::
+
+        new_tokens_length = input_ids.shape[-1] - self.prompt_length_to_skip
+        if new_tokens_length < self.min_new_tokens:
+            scores_processed = torch.where(eos_token_mask, -math.inf, scores)
+
+    and ``prompt_length_to_skip`` is the prompt length.  Before generating
+    token *k* the prompt holds ``k-1`` new tokens, so EOS is suppressed while
+    ``k <= min_new_tokens`` and the earliest legal EOS is token
+    ``min_new_tokens + 1``.  ``tokens_generated > min_new_tokens`` encodes
+    exactly that.  Stopping at ``>=`` would end one token earlier than the
+    reference this repo is measured against.
+
+    Verified against transformers 5.15.1.  This started life as a strict xfail
+    calling the ``>`` an off-by-one bug -- it is not; it is HF parity.
+
+    Only the model-call count is asserted.  The returned sequence is still
+    truncated at the pre-minimum EOS, which is a real and separate defect --
+    see ``test_result_is_never_shorter_than_min_new_tokens``.
+    """
+    model, _result = _generate(
         [[5], [2], [9]],
         max_new_tokens=3,
         min_new_tokens=2,
         eos_token_id=2,
     )
 
-    assert result == [[5, 2]]
-    assert len(model.calls) == 2
+    # EOS lands at token 2 == min_new_tokens, so it must NOT stop: all three
+    # steps run.
+    assert len(model.calls) == 3
 
 
 @pytest.mark.xfail(
