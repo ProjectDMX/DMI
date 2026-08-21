@@ -2,10 +2,10 @@
   <img src="./Figures/new-logo.png" alt="DMI logo" width=80% />
 </p>
 
-<h1 align="center">DMI — Deep Model Inspector</h1>
+<h1 align="center">DMI — Deep Model Inspection</h1>
 
 <p align="center">
-  <strong>A decoupled, asynchronous observation substrate for high-speed LLM inference.</strong>
+  <strong>A decoupled, asynchronous AI-native data observation backend for high-speed LLM inference.</strong>
 </p>
 
 > [!IMPORTANT]
