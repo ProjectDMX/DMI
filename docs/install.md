@@ -6,11 +6,7 @@ native backend, and optionally prepare the ClickHouse sink.
 Tested on Linux + Python >=3.10. A CUDA-capable GPU is required because Ring² is
 a GPU-resident capture and transport pipeline.
 
-> [!IMPORTANT]
-> The supported installation is a recursive source checkout with a locally
-> built native backend and editable Python packages. Wheels and source archives
-> produced by repository checks are temporary package-layout fixtures; they are
-> not published or supported runtime-install artifacts.
+DMI currently supports installation from source.
 
 ## 0. System prerequisites
 
