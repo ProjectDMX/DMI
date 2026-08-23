@@ -1,22 +1,22 @@
 # vLLM usage
 
-DMI supports official vLLM 0.27.1 through the separately installed
-`DMI-vLLM-Integration` 0.27.1 package. The source checkout pins that package at
-`integration/vllm_integration/`; it does not contain a vLLM fork.
+DMI supports official vLLM 0.27.1 through the version-matched integration
+checkout pinned at `third_party/vllm-integration/`. It does not contain a vLLM
+fork.
 
-Install the matching releases:
+## Install the vLLM backend
 
-```bash
-pip install 'DMI>=1.1.0,<2.0'
-pip install 'vllm==0.27.1'
-pip install 'DMI-vLLM-Integration==0.27.1'
-```
-
-For a source checkout, install DMI and then the integration submodule:
+Use a dedicated environment and DMI checkout for vLLM. Do not install the
+modified HuggingFace integration from `third_party/transformers/` in this
+environment. Complete the [core installation](install.md), then install the
+version-matched integration editable. Its dependency metadata installs the
+matching official vLLM release.
 
 ```bash
-pip install -e .
-pip install -e integration/vllm_integration/
+pip install -e third_party/vllm-integration/
+make -C native clean
+make -C native -j
+python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
 
 DMI supports vLLM's V1 model runner only. Set this before importing or starting
@@ -27,17 +27,12 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 ```
 
 The integration fails before device initialization when it detects an
-unsupported runner, version, architecture, or parallel mode. Its supported
-model architectures are:
-
-- GPT-2
-- Llama
-- Qwen2/Qwen2.5
-- Qwen2-MoE
-- Qwen3
+unsupported runner, version, architecture, or parallel mode. See the
+versioned integration's [model support list](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/v0.27.1-r2/README.md#model-support)
+for available model families and their qualification status.
 
 The exact vLLM behavior assumed by this release is documented in the
-[vLLM contract](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/v0.27.1/docs/vllm_contract.md).
+[vLLM contract](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/v0.27.1-r2/docs/vllm_contract.md).
 
 ## Offline API
 

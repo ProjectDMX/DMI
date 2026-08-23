@@ -7,7 +7,7 @@ Two reference modes:
 
 NOTE:
   - tests/correctness/tensor_utils.py no longer exists.
-  - Attention-matrix stitching now uses monitoring.segment_merger.merge_segments().
+  - Attention-matrix stitching now uses dmi.storage.reassembly.merge_segments().
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from monitoring.segment_merger import merge_segments
+from dmi.storage.reassembly import merge_segments
 
 
 # ---------------------------------------------------------------------------

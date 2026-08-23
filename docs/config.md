@@ -3,8 +3,8 @@
 All parameters are set on `RingConfig` before constructing `RingEngine`.
 Changing them does not require re-capturing the CUDA graph.
 
-Source: `monitoring/csrc/ring/ring_config.h`
-Python binding: `monitoring/csrc/bindings.cpp` -> `RingConfig`
+Source: `native/csrc/ring/ring_config.h`
+Python binding: `native/csrc/bindings.cpp` -> `RingConfig`
 
 ---
 
@@ -64,7 +64,7 @@ full or at `stop()` time.
 ## Python Usage
 
 ```python
-from monitoring._native_engine import RingConfig, RingEngine
+from dmi.transport.native import RingConfig, RingEngine
 
 cfg = RingConfig()
 cfg.task_ring_entries = 512
@@ -111,7 +111,7 @@ All E2E ring parameters are set via `E2E_*` environment variables
 ## Benchmark CLI Arguments
 
 All benchmark ring parameters are set via CLI flags
-(see `benchmark/bench_hf_transport.py`).
+(see `benchmarks/bench_hf_transport.py`).
 
 ```
 Ring engine -- GPU buffers:

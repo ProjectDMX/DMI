@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=64.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "DMI"
-version = "1.1.0"
+version = "1.2.0"
 description = "A decoupled, asynchronous observation substrate for high-speed LLM inference."
 requires-python = ">=3.10"
 dynamic = ["dependencies"]
@@ -14,28 +14,21 @@ dependencies = { file = ["requirements.txt"] }
 
 [tool.setuptools]
 include-package-data = true
-
-[tool.setuptools.package-data]
-monitoring = [
-    "csrc/*.cpp",    "csrc/*.h",    "csrc/*.hpp",
-    "csrc/*.cu",     "csrc/*.cuh",
-    "csrc/**/*.cpp", "csrc/**/*.h", "csrc/**/*.hpp",
-    "csrc/**/*.cu",  "csrc/**/*.cuh",
-    "Makefile",
-]
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
-# `integration` without star: integration/transformers/ and
-# integration/vllm_integration/ are separately installed submodules. Avoiding
-# the star keeps both external distributions out of the DMI wheel.
-include = ["monitoring*", "benchmark*", "integration"]
+# Runtime code has one canonical namespace. Native sources and external
+# repositories live under ``native/`` and ``third_party/``.
+where = ["src"]
+include = ["dmi*"]
 
 [tool.pytest.ini_options]
 # `manual` tools and native-ring sources are not collected by default. The
 # lightweight PR gate should select true CPU tests explicitly:
 #   python -m pytest -m "cpu" -q
 addopts = "-ra -m 'not manual'"
-norecursedirs = ["tests/tools", "tests/ring", ".venv", "integration", "build"]
+pythonpath = ["src"]
+norecursedirs = ["tests/tools", "tests/native", ".venv", "native", "third_party", "build"]
 markers = [
     "cpu: pure-CPU contract/unit test (no CUDA / ClickHouse / model weights / native extension build required)",
     "gpu: requires a CUDA device",
@@ -45,7 +38,7 @@ markers = [
     "hf: requires HuggingFace weights / model cache",
     "native_backend: requires the DMI native backend .so importable/built; no GPU necessarily",
     "framework_fork: requires vendored/modified framework forks importable",
-    "ring_native: native CUDA ring tests built via tests/ring/Makefile (needs nvcc)",
+    "ring_native: native CUDA ring tests built via tests/native/ring/Makefile (needs nvcc)",
     "slow: tests that take more than ~30 s (per-hook isolation full sweep, large E2E sweeps); skipped by default unless `-m slow` is passed",
     "manual: investigation / tooling, not a regression gate; not collected by default",
     "numeric: per-hook numeric-difference study (drift vs the unhooked baseline)",

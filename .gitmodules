@@ -1,9 +1,9 @@
-[submodule "transformers"]
-	path = integration/transformers
+[submodule "third_party/transformers"]
+	path = third_party/transformers
 	url = https://github.com/ProjectDMX/transformers-DMI.git
-[submodule "libs/clickhouse-cpp"]
-	path = libs/clickhouse-cpp
+[submodule "third_party/clickhouse-cpp"]
+	path = third_party/clickhouse-cpp
 	url = https://github.com/ClickHouse/clickhouse-cpp.git
-[submodule "integration/vllm_integration"]
-	path = integration/vllm_integration
+[submodule "third_party/vllm-integration"]
+	path = third_party/vllm-integration
 	url = https://github.com/ProjectDMX/DMI-vLLM-Integration.git

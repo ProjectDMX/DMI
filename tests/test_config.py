@@ -1,4 +1,4 @@
-"""Unit tests for monitoring/config.py.
+"""Unit tests for :mod:`dmi.config`.
 
 Covers ``CaptureSchedule`` (step / request scheduling with warmup, offset,
 stride, and phase filtering) and ``MonitoringConfig`` (the bundle and its
@@ -7,13 +7,13 @@ default values).  Pure Python with no torch dependency.
 The pre-refactor ``HookSelection`` dataclass was removed in Phase 2a of
 the unified-adaptor refactor (the path was a silent no-op due to a dead
 ``_filter_specs`` call).  Selection now flows through
-``monitoring.selection.apply_hook_selection`` driven by the ``hook_selection=``
+``dmi.hooks.selection.apply_hook_selection`` driven by the ``hook_selection=``
 argument on ``generate_with_monitoring`` or an external adapter.
 """
 
 import pytest
 
-from monitoring.config import CaptureSchedule, MonitoringConfig
+from dmi.config import CaptureSchedule, MonitoringConfig
 
 pytestmark = pytest.mark.cpu
 

@@ -19,7 +19,7 @@ Setup: 1 hidden-state hook per layer + final-LN + logits (38 / 34 / 42 hooks
 total on Qwen3-4B / Llama-3.1-8B / Qwen3-14B). Normalized to HuggingFace Ideal.
 
 <p align="center">
-  <img src="../Figures/offline_hs_logits_real.png" alt="Offline throughput with limited hooks, normalized to HF ideal" width="100%" />
+  <img src="assets/images/offline_hs_logits_real.png" alt="Offline throughput with limited hooks, normalized to HF ideal" width="100%" />
 </p>
 
 DMI stays close to the HF-ideal line across all configurations. Python-callback
@@ -33,7 +33,7 @@ is bottlenecked similarly — it materializes internals on the hot path.
 Setup: vLLM serve, varying request rate on ShareGPT and WildChat.
 
 <p align="center">
-  <img src="../Figures/tpot_comparison.png" alt="Online TPOT vs request rate" width="100%" />
+  <img src="assets/images/tpot_comparison.png" alt="Online TPOT vs request rate" width="100%" />
 </p>
 
 DMI tracks the no-monitor baseline closely. The synchronous hook/debug baselines

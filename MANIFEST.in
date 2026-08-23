@@ -1,0 +1,5 @@
+# Internal source-layout fixture only; this is not a supported install artifact.
+include Makefile
+include native/Makefile
+include native/cuda_toolkit.py
+recursive-include native/csrc *.cpp *.cu *.cuh *.h *.hpp

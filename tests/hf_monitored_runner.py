@@ -18,9 +18,9 @@ def main():
     p.add_argument("--output-dir", required=True)
     args, _ = p.parse_known_args()
 
-    from monitoring import MonitoringEngine
-    from monitoring._native_engine import ClickHouseClientConfig
-    from integration.hf_adapter import generate_with_monitoring
+    from dmi import MonitoringEngine
+    from dmi.transport.native import ClickHouseClientConfig
+    from dmi.adapters.huggingface.generation import generate_with_monitoring
     from transformers import AutoTokenizer
 
     # Config from env (same vars as the test)
@@ -75,8 +75,8 @@ def main():
     ch_cfg.index_granularity = 8192
 
     # Monitoring config
-    from monitoring import MonitoringConfig
-    from monitoring.config import CaptureSchedule
+    from dmi import MonitoringConfig
+    from dmi.config import CaptureSchedule
 
     hook_mode = os.environ.get("E2E_HOOK_MODE", "full")
     mon_cfg = MonitoringConfig(
@@ -84,8 +84,8 @@ def main():
     )
 
     # Host engine config
-    from monitoring import HostEngineConfig
-    from monitoring._native_engine import StageConfig
+    from dmi import HostEngineConfig
+    from dmi.transport.native import StageConfig
     ch_parallelism = int(os.environ.get("DMX_CH_PARALLELISM", "10"))
     stage = StageConfig.clickhouse_insert(ch_cfg, parallelism=ch_parallelism, name="ch_insert")
     q = stage.input_queue
@@ -96,7 +96,7 @@ def main():
     host_cfg = HostEngineConfig(stages=[stage])
 
     # Ring config
-    from monitoring._native_engine import RingConfig
+    from dmi.transport.native import RingConfig
     ring_cfg = RingConfig()
     ring_cfg.task_ring_entries = int(os.environ.get("E2E_RING_TASK_ENTRIES", "16384"))
     ring_cfg.payload_ring_bytes = int(os.environ.get("E2E_RING_PAYLOAD_BYTES", str(4 * 1024**3)))
