@@ -31,17 +31,12 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 ```
 
 The integration fails before device initialization when it detects an
-unsupported runner, version, architecture, or parallel mode. Its supported
-model architectures are:
-
-- GPT-2
-- Llama
-- Qwen2/Qwen2.5
-- Qwen2-MoE
-- Qwen3
+unsupported runner, version, architecture, or parallel mode. See the
+versioned integration's [model support list](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/v0.27.1-r2/README.md#model-support)
+for available model families and their qualification status.
 
 The exact vLLM behavior assumed by this release is documented in the
-[vLLM contract](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/v0.27.1/docs/vllm_contract.md).
+[vLLM contract](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/v0.27.1-r2/docs/vllm_contract.md).
 
 ## Offline API
 
