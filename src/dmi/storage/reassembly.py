@@ -12,7 +12,7 @@ def parse_internal_id(internal_id: str) -> Tuple[int, str]:
         return (int(internal_id_list[1]), '.'.join(['blocks'] + internal_id_list[2:]))
     else:
         return (-1, internal_id)
-    
+
 def get_delta_token_len(shape: tuple, act_name: str, have_batch_dim: bool = False) -> int:
     diff_dim = 1 if not have_batch_dim else 0
     if act_name.endswith('attn.hook_attn_scores') or act_name.endswith('attn.hook_pattern'):
@@ -63,7 +63,7 @@ class TorchOffloadedSegmentsOnDim(OffloadedSegments):
     @property
     def size(self):
         return sum([t.numel() * t.element_size() for t in self._tensor_list])
-    
+
 
 # TODO: Store as Sparse matrix.
 class TorchOffloadedSegmentsAttnMatrix(OffloadedSegments):
@@ -95,9 +95,9 @@ class TorchOffloadedSegmentsAttnMatrix(OffloadedSegments):
             t_shape[self._td_sum] = keep_token_cnt - t_shape[self._td_sum]
             if t_shape[self._td_sum] > 0:
                 pad_t = torch.full(
-                    size=t_shape, 
-                    fill_value=self._fill_val, 
-                    dtype=t.dtype, 
+                    size=t_shape,
+                    fill_value=self._fill_val,
+                    dtype=t.dtype,
                     device=t.device
                 )
                 t = torch.cat([t, pad_t], dim=self._td_sum)
@@ -111,7 +111,7 @@ class TorchOffloadedSegmentsAttnMatrix(OffloadedSegments):
     @property
     def size(self):
         return sum([t.numel() * t.element_size() for t in self._tensor_list])
-    
+
 # Now no batch_dim.
 def segment_manager(act_name: str, drop_token_cnt_to: Optional[int] = None, have_batch_dim: bool = False):
     # NOTE: This assumes parse_id before.
@@ -127,4 +127,3 @@ def merge_segments(tensor_list: list, act_name: str, drop_token_cnt_to: Optional
     manager = segment_manager(act_name, drop_token_cnt_to, have_batch_dim)
     manager.extend(tensor_list)
     return manager.read_and_merge()
-    
