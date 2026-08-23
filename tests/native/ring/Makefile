@@ -55,9 +55,10 @@ NVCC_FLAGS := \
 PRODUCER_CU  := ../../../native/csrc/ring/producer.cu
 DRAIN_SRC    := ../../../native/csrc/ring/drain_thread.cpp
 
-TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer $(BUILD)/test_ring_engine
+TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer \
+           $(BUILD)/test_ring_engine $(BUILD)/test_null_mode
 
-.PHONY: all test_rings test_producer test_ring_engine run clean FORCE
+.PHONY: all test_rings test_producer test_ring_engine test_null_mode run clean FORCE
 
 all: $(TARGETS)
 
@@ -80,6 +81,9 @@ $(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRC) $(CUD
 		$(TORCH_RPATH_FLAGS) -ltorch -ltorch_cpu -lc10 -lpthread \
 		$(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
 
+$(BUILD)/test_null_mode: test_null_mode.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
+	$(CUDA_NVCC) $(NVCC_FLAGS) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
+
 test_rings: $(BUILD)/test_rings
 	$(BUILD)/test_rings
 
@@ -89,10 +93,14 @@ test_producer: $(BUILD)/test_producer
 test_ring_engine: $(BUILD)/test_ring_engine
 	$(BUILD)/test_ring_engine
 
+test_null_mode: $(BUILD)/test_null_mode
+	$(BUILD)/test_null_mode
+
 run: all
 	$(BUILD)/test_rings
 	$(BUILD)/test_producer
 	$(BUILD)/test_ring_engine
+	$(BUILD)/test_null_mode
 
 clean:
 	rm -rf $(BUILD)

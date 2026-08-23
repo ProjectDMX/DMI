@@ -1,288 +1,171 @@
-// tests/native/ring/test_null_mode.cu — Tests for producer null mode.
-//
-// Verifies that set_ring_null_mode(true) makes producer_kernel launch with
-// the same parameters but skip all ring writes, while
-// set_ring_null_mode(false) restores normal delivery.
-//
-// Build: see tests/native/ring/Makefile (target: test_null_mode)
-// Run:   ./build/test_null_mode
+// CUDA tests for producer null mode with the current producer variants.
 
-#include "ring/ring_alloc.h"
 #include "ring/producer.cuh"
-#include "ring/pinned_pool.h"
-#include "ring/drain_thread.h"
-#include "ring/chunk_assembler.h"
+#include "ring/ring_alloc.h"
 
-#include <cassert>
-#include <chrono>
-#include <condition_variable>
-#include <cstring>
-#include <mutex>
-#include <numeric>
-#include <stdio.h>
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
-using namespace ring;
+static int g_pass = 0;
+static int g_fail = 0;
 
-// ---------------------------------------------------------------------------
-// Shared test harness (same as test_ring_engine.cu)
-// ---------------------------------------------------------------------------
-struct ResultCollector {
-    std::mutex              mu;
-    std::condition_variable cv;
-    std::vector<AssembledTensor> tensors;
+#define CUDA_CHECK(expr)                                                    \
+    do {                                                                    \
+        cudaError_t error_ = (expr);                                        \
+        if (error_ != cudaSuccess) {                                        \
+            std::fprintf(stderr, "CUDA error at %s:%d: %s\n",             \
+                         __FILE__, __LINE__, cudaGetErrorString(error_));    \
+            std::exit(1);                                                   \
+        }                                                                   \
+    } while (0)
 
-    void push(AssembledTensor&& t) {
-        std::lock_guard<std::mutex> lk(mu);
-        tensors.push_back(std::move(t));
-        cv.notify_all();
-    }
+#define EXPECT(condition)                                                   \
+    do {                                                                    \
+        if (!(condition)) {                                                 \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n",                      \
+                         __FILE__, __LINE__, #condition);                    \
+            ++g_fail;                                                       \
+        } else {                                                            \
+            ++g_pass;                                                       \
+        }                                                                   \
+    } while (0)
 
-    bool wait_for(int n, int timeout_ms = 5000) {
-        std::unique_lock<std::mutex> lk(mu);
-        return cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
-                           [&] { return (int)tensors.size() >= n; });
-    }
-
-    int count() {
-        std::lock_guard<std::mutex> lk(mu);
-        return (int)tensors.size();
-    }
-};
-
-static constexpr uint64_t PINNED_BYTES = 8 * 256 * 1024;  // 8 chunks worth
-
-static RingConfig make_cfg() {
-    RingConfig cfg{};
-    cfg.task_ring_entries  = 64;
-    cfg.payload_ring_bytes = 4 * 1024 * 1024;
-    cfg.chunk_bytes        = 256 * 1024;
-    cfg.pinned_pool_bytes  = PINNED_BYTES;
-    cfg.wait_policy        = WaitPolicy::INFINITE;
-    cfg.drop_reporting     = DropReporting::DROP_TASK;
+static ring::RingConfig make_config() {
+    ring::RingConfig cfg;
+    cfg.task_ring_entries = 16;
+    cfg.payload_ring_bytes = 4096;
+    cfg.pinned_staging_bytes = 4096;
     return cfg;
 }
 
-static uint8_t* upload(const std::vector<uint8_t>& h, cudaStream_t s) {
-    uint8_t* d;
-    cudaMalloc(&d, h.size());
-    cudaMemcpyAsync(d, h.data(), h.size(), cudaMemcpyHostToDevice, s);
-    return d;
-}
-
-// ---------------------------------------------------------------------------
-// test_null_mode_no_delivery
-//   With null mode ON, producer kernel launches but emits nothing to the ring.
-//   The drain thread should receive no tensors within the timeout window.
-// ---------------------------------------------------------------------------
-static void test_null_mode_no_delivery() {
-    printf("  test_null_mode_no_delivery ... ");
-
-    set_ring_null_mode(true);
-
-    RingConfig cfg = make_cfg();
-    AllocatedRing ar(cfg);
-    ar.init();
-
-    ResultCollector rc;
-    PinnedPool pool;
-    pool.init(PINNED_BYTES);
-
-    ChunkAssembler asm_(pool, [&](AssembledTensor&& t) { rc.push(std::move(t)); });
-    DrainThread dt(ar.state(), pool, [&](DrainedChunk&& c) { asm_.push(std::move(c)); });
-    dt.start();
-
-    const uint64_t data_bytes = 64 * 1024;
-    std::vector<uint8_t> src(data_bytes, 0xAB);
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-    uint8_t* d_src = upload(src, stream);
-
-    launch_producer_with_notify(ar.state(), d_src, data_bytes,
-                                /*logical_task_id=*/1, 0, 0,
-                                DrainThread::hostfunc_cb, &dt, stream);
-    cudaStreamSynchronize(stream);
-
-    // Give drain thread time to process any spurious notification.
-    bool got = rc.wait_for(1, /*timeout_ms=*/300);
-    assert(!got && "null mode: no tensor should arrive");
-    assert(rc.count() == 0);
-
-    // task_head must remain 0 — kernel wrote nothing.
-    assert(*ar.state().task_head == 0);
-
-    dt.stop();
-    cudaFree(d_src);
-    cudaStreamDestroy(stream);
-    set_ring_null_mode(false);  // restore for subsequent tests
-    printf("PASS\n");
-}
-
-// ---------------------------------------------------------------------------
-// test_null_mode_off_delivers
-//   With null mode OFF (default), producer works normally.
-// ---------------------------------------------------------------------------
-static void test_null_mode_off_delivers() {
-    printf("  test_null_mode_off_delivers ... ");
-
-    set_ring_null_mode(false);
-
-    RingConfig cfg = make_cfg();
-    AllocatedRing ar(cfg);
-    ar.init();
-
-    ResultCollector rc;
-    PinnedPool pool;
-    pool.init(PINNED_BYTES);
-
-    ChunkAssembler asm_(pool, [&](AssembledTensor&& t) { rc.push(std::move(t)); });
-    DrainThread dt(ar.state(), pool, [&](DrainedChunk&& c) { asm_.push(std::move(c)); });
-    dt.start();
-
-    const uint64_t data_bytes = 64 * 1024;
-    std::vector<uint8_t> src(data_bytes);
-    std::iota(src.begin(), src.end(), uint8_t(7));
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-    uint8_t* d_src = upload(src, stream);
-
-    launch_producer_with_notify(ar.state(), d_src, data_bytes,
-                                /*logical_task_id=*/2, 0, 0,
-                                DrainThread::hostfunc_cb, &dt, stream);
-
-    assert(rc.wait_for(1));
-    const auto& t = rc.tensors[0];
-    assert(!t.is_drop);
-    assert(t.data.size() == data_bytes);
-    assert(memcmp(t.data.data(), src.data(), data_bytes) == 0);
-
-    dt.stop();
-    cudaStreamSynchronize(stream);
-    cudaFree(d_src);
-    cudaStreamDestroy(stream);
-    printf("PASS\n");
-}
-
-// ---------------------------------------------------------------------------
-// test_toggle
-//   Submit N kernels in null mode (none arrive), then toggle off and submit
-//   M kernels in real mode (all M arrive, with correct data).
-//   Verifies that toggling leaves the ring in a consistent state.
-// ---------------------------------------------------------------------------
-static void test_toggle() {
-    printf("  test_toggle ... ");
-
-    RingConfig cfg = make_cfg();
-    AllocatedRing ar(cfg);
-    ar.init();
-
-    ResultCollector rc;
-    PinnedPool pool;
-    pool.init(PINNED_BYTES);
-
-    ChunkAssembler asm_(pool, [&](AssembledTensor&& t) { rc.push(std::move(t)); });
-    DrainThread dt(ar.state(), pool, [&](DrainedChunk&& c) { asm_.push(std::move(c)); });
-    dt.start();
-
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-
-    const uint64_t data_bytes = 32 * 1024;
-    const int N_null = 5;
-    const int N_real = 4;
-
-    // --- null mode phase ---
-    set_ring_null_mode(true);
-    std::vector<uint8_t*> null_ptrs(N_null);
-    for (int i = 0; i < N_null; ++i) {
-        std::vector<uint8_t> src(data_bytes, uint8_t(0xCC));
-        null_ptrs[i] = upload(src, stream);
-        launch_producer_with_notify(ar.state(), null_ptrs[i], data_bytes,
-                                    uint64_t(100 + i), 0, 0,
-                                    DrainThread::hostfunc_cb, &dt, stream);
+static uint8_t* upload_bytes(uint64_t size) {
+    std::vector<uint8_t> source(size);
+    for (uint64_t i = 0; i < size; ++i) {
+        source[i] = static_cast<uint8_t>(i * 13);
     }
-    cudaStreamSynchronize(stream);
-    // Brief wait: drain thread must NOT deliver anything.
-    bool got = rc.wait_for(1, /*timeout_ms=*/300);
-    assert(!got && "toggle: null-mode tensors must not arrive");
-    assert(*ar.state().task_head == 0);
-
-    // --- real mode phase ---
-    set_ring_null_mode(false);
-    std::vector<std::vector<uint8_t>> real_srcs(N_real);
-    std::vector<uint8_t*> real_ptrs(N_real);
-    for (int i = 0; i < N_real; ++i) {
-        real_srcs[i].resize(data_bytes);
-        for (uint64_t j = 0; j < data_bytes; ++j) real_srcs[i][j] = uint8_t(i * 13 + j);
-        real_ptrs[i] = upload(real_srcs[i], stream);
-        launch_producer_with_notify(ar.state(), real_ptrs[i], data_bytes,
-                                    uint64_t(200 + i), 0, 0,
-                                    DrainThread::hostfunc_cb, &dt, stream);
-    }
-
-    assert(rc.wait_for(N_real));
-    assert(rc.count() == N_real);
-    for (int i = 0; i < N_real; ++i) {
-        const auto& t = rc.tensors[i];
-        assert(!t.is_drop);
-        assert(t.data.size() == data_bytes);
-        int idx = static_cast<int>(t.logical_task_id) - 200;
-        assert(idx >= 0 && idx < N_real);
-        assert(memcmp(t.data.data(), real_srcs[idx].data(), data_bytes) == 0);
-    }
-
-    dt.stop();
-    cudaStreamSynchronize(stream);
-    for (auto p : null_ptrs) cudaFree(p);
-    for (auto p : real_ptrs) cudaFree(p);
-    cudaStreamDestroy(stream);
-    printf("PASS\n");
+    uint8_t* device = nullptr;
+    CUDA_CHECK(cudaMalloc(&device, size));
+    CUDA_CHECK(cudaMemcpy(device, source.data(), size, cudaMemcpyHostToDevice));
+    return device;
 }
 
-// ---------------------------------------------------------------------------
-// test_null_multiple_launches
-//   Launch many kernels in null mode; ring state (task_head, payload_head)
-//   must be completely unchanged — no partial writes.
-// ---------------------------------------------------------------------------
-static void test_null_ring_state_unchanged() {
-    printf("  test_null_ring_state_unchanged ... ");
-
-    set_ring_null_mode(true);
-
-    RingConfig cfg = make_cfg();
-    AllocatedRing ar(cfg);
-    ar.init();
-
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-
-    const int N = 10;
-    const uint64_t data_bytes = 128 * 1024;
-    std::vector<uint8_t*> ptrs(N);
-    for (int i = 0; i < N; ++i) {
-        std::vector<uint8_t> src(data_bytes, uint8_t(i));
-        ptrs[i] = upload(src, stream);
-        // launch_producer (no hostfunc needed; we just check ring state)
-        launch_producer(ar.state(), ptrs[i], data_bytes, uint64_t(i), 0, 0, stream);
-    }
-    cudaStreamSynchronize(stream);
-
-    assert(*ar.state().task_head    == 0 && "null mode: task_head must be 0");
-    assert(*ar.state().payload_head == 0 && "null mode: payload_head must be 0");
-
-    for (auto p : ptrs) cudaFree(p);
-    cudaStreamDestroy(stream);
-    set_ring_null_mode(false);
-    printf("PASS\n");
+static int64_t* upload_counts(const std::vector<int64_t>& counts) {
+    int64_t* device = nullptr;
+    CUDA_CHECK(cudaMalloc(&device, counts.size() * sizeof(int64_t)));
+    CUDA_CHECK(cudaMemcpy(device, counts.data(),
+                          counts.size() * sizeof(int64_t),
+                          cudaMemcpyHostToDevice));
+    return device;
 }
 
-// ---------------------------------------------------------------------------
+static void set_null_mode(bool enabled) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ring::set_ring_null_mode(enabled);
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+static void expect_empty(const ring::RingState& state) {
+    EXPECT(*state.task_head == 0);
+    EXPECT(*state.payload_head == 0);
+    EXPECT(*state.actual_bytes_counter == 0);
+    for (uint64_t i = 0; i < state.task_cap; ++i) {
+        EXPECT(state.task_entries[i].ready_seq == ring::READY_SEQ_SENTINEL);
+    }
+}
+
+static void test_all_variants_are_noops() {
+    std::printf("[ TEST ] all producer variants are no-ops\n");
+    ring::AllocatedRing allocated(make_config());
+    allocated.init();
+    ring::RingState& state = allocated.state();
+
+    uint8_t* source = upload_bytes(256);
+    int64_t* row_count = upload_counts({3});
+    int64_t* chunk_counts = upload_counts({16, 32, 0, 8});
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    set_null_mode(true);
+    ring::launch_producer_static(state, source, 256, 0, stream);
+    ring::launch_producer_prefix(state, source, 256, row_count, 32, 0, stream);
+    ring::launch_producer_chunked(state, source, 256, chunk_counts, 4, 0,
+                                  stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    expect_empty(state);
+
+    set_null_mode(false);
+    CUDA_CHECK(cudaFree(chunk_counts));
+    CUDA_CHECK(cudaFree(row_count));
+    CUDA_CHECK(cudaFree(source));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+static void test_disabling_restores_delivery() {
+    std::printf("[ TEST ] disabling null mode restores delivery\n");
+    ring::AllocatedRing allocated(make_config());
+    allocated.init();
+    ring::RingState& state = allocated.state();
+    uint8_t* source = upload_bytes(128);
+
+    set_null_mode(true);
+    ring::launch_producer_static(state, source, 128, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    expect_empty(state);
+
+    set_null_mode(false);
+    ring::launch_producer_static(state, source, 128, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT(*state.task_head == 1);
+    EXPECT(*state.payload_head == 128);
+    EXPECT(*state.actual_bytes_counter == 128);
+    EXPECT(state.task_entries[0].ready_seq == 0);
+    EXPECT(state.task_entries[0].tensor_total_bytes == 128);
+
+    CUDA_CHECK(cudaFree(source));
+}
+
+static void test_toggle_preserves_sequence() {
+    std::printf("[ TEST ] toggling preserves producer sequence\n");
+    ring::AllocatedRing allocated(make_config());
+    allocated.init();
+    ring::RingState& state = allocated.state();
+    uint8_t* source = upload_bytes(64);
+
+    set_null_mode(false);
+    ring::launch_producer_static(state, source, 64, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    set_null_mode(true);
+    ring::launch_producer_static(state, source, 64, 0);
+    ring::launch_producer_static(state, source, 64, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    set_null_mode(false);
+    ring::launch_producer_static(state, source, 64, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    EXPECT(*state.task_head == 2);
+    EXPECT(*state.payload_head == 128);
+    EXPECT(*state.actual_bytes_counter == 128);
+    EXPECT(state.task_entries[0].ready_seq == 0);
+    EXPECT(state.task_entries[1].ready_seq == 1);
+
+    CUDA_CHECK(cudaFree(source));
+}
+
 int main() {
-    printf("test_null_mode\n");
-    test_null_mode_no_delivery();
-    test_null_mode_off_delivers();
-    test_toggle();
-    test_null_ring_state_unchanged();
-    printf("All tests passed.\n");
-    return 0;
+    setbuf(stdout, nullptr);
+    std::printf("test_null_mode (current producer variants)\n");
+
+    test_all_variants_are_noops();
+    test_disabling_restores_delivery();
+    test_toggle_preserves_sequence();
+    set_null_mode(false);
+
+    std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
+    return g_fail == 0 ? 0 : 1;
 }
