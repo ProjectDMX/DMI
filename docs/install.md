@@ -3,8 +3,8 @@
 Set up DMI from a fresh clone: fetch submodules, install the Python packages,
 build the native backend, and prepare the optional ClickHouse sink.
 
-Tested on Linux + CUDA 12.x + Python >=3.10. A CUDA-capable GPU is required because
-Ring² is a GPU-resident capture and transport pipeline.
+Tested on Linux + Python >=3.10. A CUDA-capable GPU is required because Ring² is
+a GPU-resident capture and transport pipeline.
 
 ## 0. System prerequisites
 
@@ -16,26 +16,38 @@ sudo apt-get update
 sudo apt-get install -y build-essential cmake git
 ```
 
-Plus a working CUDA toolkit (NVCC) matching your driver. DMI is tested
-against CUDA 12.x; install per the
+Plus a complete CUDA toolkit whose major version matches the CUDA version used
+to build PyTorch (`torch.version.cuda`) and is supported by your driver. Install
+it per the
 [official NVIDIA instructions](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/).
 Verify:
 
 ```bash
 nvcc --version
 nvidia-smi
+python -c "import torch; print(torch.version.cuda)"
 ```
 
-If `nvcc` is not on `PATH`, point the build at it explicitly:
+DMI automatically selects one coherent toolkit for NVCC, headers, and runtime
+libraries. Inspect that selection with:
 
 ```bash
-export NVCC=/usr/local/cuda/bin/nvcc
+make -C native cuda-info
+```
+
+If multiple matching toolkits are installed, select one explicitly:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.8
+# Alternatively: export CUDACXX=/usr/local/cuda-12.8/bin/nvcc
 ```
 
 ## 1. Clone the repository
 
 The repo uses three git submodules: the DMI HuggingFace integration, the
 version-matched DMI-vLLM integration, and the `clickhouse-cpp` C++ client.
+Recursive checkout fetches all three repositories; it does not install either
+Python integration.
 
 ```bash
 git clone --recursive https://github.com/ProjectDMX/DMI.git
@@ -113,14 +125,22 @@ pip install -r requirements.txt
 
 ## 4. Install Python packages
 
-Install the modified Transformers submodule, then DMI itself:
+Install DMI itself first:
 
 ```bash
-pip install -e third_party/transformers/
 pip install -e .
 ```
 
-For the vLLM path, install the versioned integration. Its dependency metadata
+Then install the integration for the backend you intend to use. You do not need
+both unless you plan to test both backends.
+
+For HuggingFace:
+
+```bash
+pip install -e third_party/transformers/
+```
+
+Or, for vLLM, install the versioned integration. Its dependency metadata
 installs the matching official vLLM release:
 
 ```bash

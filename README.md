@@ -119,7 +119,8 @@ Full setup, additional results, and how to reproduce:
 
 Start with the [installation guide](docs/install.md), then choose the
 HuggingFace or vLLM path depending on the runtime you want to inspect. The
-snippet below shows the minimal vLLM entry point. The version-matched
+repository checks out both integrations as submodules, but you only install the
+one you need. The snippet below shows the minimal vLLM entry point. The version-matched
 `DMI-vLLM-Integration` package connects DMI to an unmodified official vLLM
 installation.
 
