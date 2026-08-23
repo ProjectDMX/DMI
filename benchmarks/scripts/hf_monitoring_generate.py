@@ -18,16 +18,16 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from monitoring import (
+from dmi import (
     ClickHouseClientConfig,
     HostEngineConfig,
     MonitoringConfig,
     MonitoringEngine,
     StageConfig,
 )
-from monitoring.config import CaptureSchedule
-from monitoring.hook_points import set_monitoring_debug
-from integration.hf_adapter import generate_with_monitoring
+from dmi.config import CaptureSchedule
+from dmi.hooks.point import set_monitoring_debug
+from dmi.adapters.huggingface.adapter import generate_with_monitoring
 
 _MODEL_ALIASES = {
     # Convenience alias used in benchmark CLI.
@@ -100,7 +100,7 @@ def _build_host_config(db_cfg: ClickHouseClientConfig, *, parallelism: int = 10)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Monitoring generate benchmark")
-    parser.add_argument("--prompts", default="benchmark/data/prompts.txt")
+    parser.add_argument("--prompts", default="benchmarks/data/prompts.txt")
     parser.add_argument("--model", default="qwen3")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)

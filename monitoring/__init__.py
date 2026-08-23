@@ -1,7 +1,10 @@
-"""Monitoring engine package for asynchronous hook processing."""
+"""Compatibility namespace for DMI 1.x.
 
-from .engine import MonitoringEngine, HostEngineConfig
-from .config import CaptureSchedule, MonitoringConfig
+New code should import from :mod:`dmi`. Existing ``monitoring`` imports remain
+supported and resolve to the same implementation objects.
+"""
+
+from dmi import CaptureSchedule, HostEngineConfig, MonitoringConfig, MonitoringEngine
 
 _NATIVE_EXPORTS = (
     "StageConfig",
@@ -15,8 +18,9 @@ _NATIVE_EXPORTS = (
 
 def __getattr__(name: str):
     if name in _NATIVE_EXPORTS:
-        from . import _native_engine
-        return getattr(_native_engine, name)
+        from dmi.transport import native
+
+        return getattr(native, name)
     raise AttributeError(name)
 
 

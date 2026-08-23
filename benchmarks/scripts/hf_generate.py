@@ -56,7 +56,7 @@ def _nvtx_range(name: str):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="HF generate benchmark")
-    parser.add_argument("--prompts", default="benchmark/data/prompts.txt")
+    parser.add_argument("--prompts", default="benchmarks/data/prompts.txt")
     parser.add_argument("--model", default="gpt2")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)

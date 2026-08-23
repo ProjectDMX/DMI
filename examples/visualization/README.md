@@ -9,10 +9,10 @@ Pre-requisite: project installed per the repo root `README.md`,
 ClickHouse running, and `pip install matplotlib circuitsvis jupyter`.
 
 ```bash
-python example/visualization/run_offload_hf.py
+python examples/visualization/run_offload_hf.py
 # Or populate the demo_vllm slot with the separately installed vLLM integration:
 python integration/vllm_integration/examples/visualization/run_offload.py
-jupyter notebook example/visualization/visualize.ipynb
+jupyter notebook examples/visualization/visualize.ipynb
 ```
 
 The notebook defaults to `MODEL_ID = "demo_hf"`.  Switch to
@@ -43,7 +43,7 @@ token should be `Mary`.
 
 ## Files
 
-- `example/visualization/prompt.txt` feeds the HF script;
+- `examples/visualization/prompt.txt` feeds the HF script;
   `integration/vllm_integration/examples/visualization/prompt.txt` feeds the
   vLLM script.
 - `run_offload_hf.py` writes to fixed `model_id="demo_hf"`.

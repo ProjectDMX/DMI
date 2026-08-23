@@ -6,7 +6,7 @@ patterns, MLP outputs, KV-cache slices, logits, …) without modifying the infer
 engine's backbone and without breaking CUDA Graph replay or KV-cache memory reuse.
 
 <p align="center">
-  <img src="../Figures/overview.png" alt="DMI overview" width="100%" />
+  <img src="assets/images/overview.png" alt="DMI overview" width="100%" />
 </p>
 
 The system has three layers:
@@ -40,7 +40,7 @@ attention pattern, logits, KV-cache slices. It is:
 Engine integration is intentionally thin. For HuggingFace, DMI wraps
 `prepare_inputs_for_generation`. For vLLM, the separately distributed,
 version-matched `DMI-vLLM-Integration` package uses vLLM's worker and plugin
-entry points, imports DMI through `monitoring.integration_api.v1`, and installs
+entry points, imports DMI through the stable `dmi.api.v1` facade, and installs
 the monitored model before CUDA-Graph capture. The official vLLM package is
 not patched.
 
@@ -49,7 +49,7 @@ not patched.
 ## 2. Ring² — GPU↔CPU staging
 
 <p align="center">
-  <img src="../Figures/ring_workflow.png" alt="Ring² workflow" width="420" />
+  <img src="assets/images/ring_workflow.png" alt="Ring² workflow" width="420" />
 </p>
 
 The challenge: high-performance serving stacks reuse GPU memory aggressively

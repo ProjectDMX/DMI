@@ -41,7 +41,7 @@ def _start_monitors(
         subprocess.Popen(
             [
                 sys.executable,
-                "benchmark/scripts/monitor_gpu_mem.py",
+                "benchmarks/scripts/monitor_gpu_mem.py",
                 "--gpu-id",
                 str(gpu_id),
                 "--interval",
@@ -53,7 +53,7 @@ def _start_monitors(
         subprocess.Popen(
             [
                 sys.executable,
-                "benchmark/scripts/monitor_cpu_mem.py",
+                "benchmarks/scripts/monitor_cpu_mem.py",
                 "--pid",
                 str(os.getpid()),
                 "--interval",
@@ -84,13 +84,13 @@ def _now_epoch() -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run HF vs monitoring benchmarks")
-    parser.add_argument("--prompts", default="benchmark/data/prompts.txt")
+    parser.add_argument("--prompts", default="benchmarks/data/prompts.txt")
     parser.add_argument("--model", default="qwen3")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--do-sample", action="store_true")
-    parser.add_argument("--out-dir", default="benchmark/results")
+    parser.add_argument("--out-dir", default="benchmarks/results")
     parser.add_argument("--tag", default="")
     parser.add_argument("--no-db", action="store_true", help="Disable host_engine DB submission.")
     parser.add_argument("--monitor-mem", action="store_true")
@@ -101,7 +101,7 @@ def main() -> None:
     parser.add_argument(
         "--monitor-extra-args",
         default="",
-        help="Extra CLI args passed through to benchmark/scripts/hf_monitoring_generate.py",
+        help="Extra CLI args passed through to benchmarks/scripts/hf_monitoring_generate.py",
     )
     parser.add_argument(
         "--no-clickhouse-pid",
@@ -149,13 +149,13 @@ def main() -> None:
         )
         try:
             hf_start_ts = _now_epoch()
-            hf_result = _run_script("benchmark/scripts/hf_generate.py", common_args, env=base_env)
+            hf_result = _run_script("benchmarks/scripts/hf_generate.py", common_args, env=base_env)
             hf_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
     else:
         hf_start_ts = _now_epoch()
-        hf_result = _run_script("benchmark/scripts/hf_generate.py", common_args, env=base_env)
+        hf_result = _run_script("benchmarks/scripts/hf_generate.py", common_args, env=base_env)
         hf_end_ts = _now_epoch()
 
     # Run monitoring with DB (unless --no-db is specified)
@@ -179,7 +179,7 @@ def main() -> None:
             )
         try:
             mon_start_ts = _now_epoch()
-            mon_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
+            mon_result = _run_script("benchmarks/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
             mon_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
@@ -198,13 +198,13 @@ def main() -> None:
         )
         try:
             mon_nodb_start_ts = _now_epoch()
-            mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args, env=base_env)
+            mon_nodb_result = _run_script("benchmarks/scripts/hf_monitoring_generate.py", mon_nodb_args, env=base_env)
             mon_nodb_end_ts = _now_epoch()
         finally:
             _stop_monitors(procs)
     else:
         mon_nodb_start_ts = _now_epoch()
-        mon_nodb_result = _run_script("benchmark/scripts/hf_monitoring_generate.py", mon_nodb_args, env=base_env)
+        mon_nodb_result = _run_script("benchmarks/scripts/hf_monitoring_generate.py", mon_nodb_args, env=base_env)
         mon_nodb_end_ts = _now_epoch()
 
     summary = {

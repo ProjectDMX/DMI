@@ -3,11 +3,11 @@
 Run with:
   nsys profile --trace=cuda,nvtx,osrt \
        --output /tmp/profile_decode \
-       conda run -n ring_offload python -m benchmark.profile_decode
+       conda run -n ring_offload python -m benchmarks.profile_decode
 
 Then analyse:
   nsys stats --report cuda_gpu_kern_sum,cuda_gpu_memtransfer_sum /tmp/profile_decode.nsys-rep
-  nsys export --type sqlite /tmp/profile_decode.nsys-rep  &&  python -m benchmark.profile_decode --analyse /tmp/profile_decode.sqlite
+  nsys export --type sqlite /tmp/profile_decode.nsys-rep  &&  python -m benchmarks.profile_decode --analyse /tmp/profile_decode.sqlite
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def _make_inputs(tokenizer, device):
 
 
 def _make_ring_engine_cfg():
-    from monitoring._native_engine import RingConfig  # type: ignore
+    from dmi.transport.native import RingConfig  # type: ignore
     rc = RingConfig()
     rc.task_ring_entries  = RING_TASK_ENTRIES
     rc.payload_ring_bytes = RING_PAYLOAD_MB * 1024 * 1024
@@ -55,8 +55,8 @@ def _make_ring_engine_cfg():
 
 
 def _make_monitoring_cfg():
-    from monitoring import MonitoringConfig  # type: ignore
-    from monitoring.config import CaptureSchedule  # type: ignore
+    from dmi import MonitoringConfig  # type: ignore
+    from dmi.config import CaptureSchedule  # type: ignore
     return MonitoringConfig(
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
@@ -74,7 +74,7 @@ class _NullHostEngine:
 
 
 def _make_null_engine(model_id: str):
-    from monitoring import MonitoringEngine  # type: ignore
+    from dmi import MonitoringEngine  # type: ignore
     engine = MonitoringEngine(
         config=_make_monitoring_cfg(),
         model_id=model_id, host_engine=_NullHostEngine(),
@@ -85,7 +85,7 @@ def _make_null_engine(model_id: str):
 
 def _run(model, input_ids, attention_mask, eos_id, pad_id, use_monitoring: bool):
     import torch
-    from integration.hf_adapter import generate_with_monitoring  # type: ignore
+    from dmi.adapters.huggingface.adapter import generate_with_monitoring  # type: ignore
     extra = {"cache_implementation": "static"}
     with torch.no_grad():
         if use_monitoring:

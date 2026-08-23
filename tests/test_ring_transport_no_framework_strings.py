@@ -1,4 +1,4 @@
-"""Lint-style test: monitoring/ring_transport.py is framework-neutral.
+"""Lint-style test: dmi/transport/ring.py is framework-neutral.
 
 Phase 1.5 verification gate.  After the unified-adaptor refactor, the core
 transport module has one explicit attribution block naming the two batch
@@ -28,11 +28,11 @@ import pytest
 pytestmark = pytest.mark.cpu
 
 RING_TRANSPORT = (
-    Path(__file__).resolve().parent.parent / "monitoring" / "ring_transport.py"
+    Path(__file__).resolve().parent.parent / "dmi" / "transport" / "ring.py"
 )
 
 # Patterns that are *always* a framework leak -- never allowed anywhere
-# in ring_transport.py, including inside the attribution block.
+# in the ring transport, including inside the attribution block.
 FORBIDDEN_PATTERNS = [
     re.compile(r"\bvllm-[A-Za-z0-9_-]*"),    # "vllm-full", "vllm-foo", etc.
     re.compile(r"\bhf-[A-Za-z0-9_-]*"),      # "hf-only", "hf-foo", etc.
@@ -40,7 +40,7 @@ FORBIDDEN_PATTERNS = [
     re.compile(r"\bvllm\b"),                  # lowercase 'vllm' -- usually points to a package or preset
     # 'transformers' as an identifier prefix.  We allow it as part of
     # words like "transformer" / "transformers" only inside import-style
-    # references, but ring_transport.py shouldn't import from transformers.
+    # references, but the ring transport should not import from transformers.
     re.compile(r"\btransformers\.", re.IGNORECASE),
     re.compile(r"\bfrom transformers\b", re.IGNORECASE),
     re.compile(r"\bimport transformers\b", re.IGNORECASE),
@@ -70,7 +70,7 @@ def _attribution_lines(source: str) -> set[int]:
             break
     if start is None or end is None:
         pytest.fail(
-            "Attribution block markers not found in ring_transport.py; "
+            "Attribution block markers not found in dmi/transport/ring.py; "
             "either restore the block or update this test's anchors.")
     return set(range(start, end + 1))
 
@@ -86,7 +86,7 @@ def test_no_forbidden_framework_patterns():
                 failures.append((line_no, pat.pattern, line.rstrip()))
     if failures:
         msg_lines = [
-            f"Forbidden framework-leaking pattern(s) in ring_transport.py:"
+            "Forbidden framework-leaking pattern(s) in dmi/transport/ring.py:"
         ]
         for line_no, pat, line in failures:
             msg_lines.append(f"  line {line_no} matches /{pat}/: {line}")
@@ -124,7 +124,7 @@ def test_attribution_block_present():
     """
     src = RING_TRANSPORT.read_text()
     assert ATTRIBUTION_BLOCK_START in src, (
-        "Attribution block start marker missing from ring_transport.py")
+        "Attribution block start marker missing from dmi/transport/ring.py")
     # Both names must appear at least once inside the block -- otherwise the
     # block isn't doing its job (a reader can't map conventions back to
     # their framework origins).

@@ -9,7 +9,7 @@ and DMI's generation wrapper.
 Run vanilla HF generation first:
 
 ```bash
-python benchmark/scripts/hf_generate.py \
+python benchmarks/scripts/hf_generate.py \
     --model gpt2 --device cuda --batch-size 8 --max-new-tokens 16
 ```
 
@@ -36,8 +36,8 @@ Use `generate_with_monitoring_dict(...)` when you want a dict-style generation
 output with DMI internals attached:
 
 ```python
-from integration.hf_adapter import generate_with_monitoring_dict
-from monitoring.internal_mapper import InternalRequirements
+from dmi.adapters.huggingface import generate_with_monitoring_dict
+from dmi.storage.internals import InternalRequirements
 
 requirements = InternalRequirements().require(
     "hidden_states",
@@ -204,7 +204,7 @@ The benchmark compares:
 | `hf_offload` | HF's `output_hidden_states=True` path |
 
 ```bash
-python -m benchmark.bench_hf_transport \
+python -m benchmarks.bench_hf_transport \
     --model qwen3 --batch-size 4 \
     --prefill-len 1 --decode-len 16 \
     --warmup 1 --iters 3 \

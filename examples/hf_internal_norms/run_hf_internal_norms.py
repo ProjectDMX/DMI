@@ -6,7 +6,7 @@ Prerequisites:
   - CUDA is available.
 
 Usage:
-    python example/hf_internal_norms/run_hf_internal_norms.py
+    python examples/hf_internal_norms/run_hf_internal_norms.py
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ MAX_NEW_TOKENS = 8
 
 
 def _build_db_config():
-    from monitoring._native_engine import ClickHouseClientConfig
+    from dmi.transport.native import ClickHouseClientConfig
 
     cfg = ClickHouseClientConfig()
     cfg.host = os.environ.get("DMX_DB_HOST", "localhost")
@@ -70,11 +70,11 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("This example requires CUDA.")
 
-    from integration.hf_adapter import generate_with_monitoring_dict
-    from monitoring import HostEngineConfig, MonitoringConfig, MonitoringEngine
-    from monitoring._native_engine import StageConfig
-    from monitoring.config import CaptureSchedule
-    from monitoring.internal_mapper import InternalRequirements
+    from dmi.adapters.huggingface.adapter import generate_with_monitoring_dict
+    from dmi import HostEngineConfig, MonitoringConfig, MonitoringEngine
+    from dmi.transport.native import StageConfig
+    from dmi.config import CaptureSchedule
+    from dmi.storage.internals import InternalRequirements
     from transformers import AutoTokenizer
     from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
 

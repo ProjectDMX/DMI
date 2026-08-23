@@ -59,12 +59,18 @@ import pytest
 
 from tests.isolate_hook import (
     _COPY_LINE_RE,
+    _COMPARE_MODEL_PATHS,
     _patched_source,
     compare_model_path,
     isolated_hook,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+requires_compare_models = pytest.mark.skipif(
+    not all(path.is_file() for path in _COMPARE_MODEL_PATHS.values()),
+    reason="Transformers comparison-model submodule is not initialized",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +133,7 @@ class TestPatcherCorrectness:
 
 
 @pytest.mark.cpu
+@requires_compare_models
 class TestPatcherRoundTrip:
     """Verify the on-disk patch / unpatch context manager."""
 
@@ -186,6 +193,7 @@ class TestPatcherRoundTrip:
 
 
 @pytest.mark.cpu
+@requires_compare_models
 class TestRealCompareModelsContainAllExpectedHooks:
     """The smoke cells assume specific hooks have a `.copy_()` line in the
     real _compare files.  If a hook is missing the smoke fails opaquely,

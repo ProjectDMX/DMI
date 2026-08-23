@@ -1,6 +1,6 @@
 # DMI integration API v1
 
-`monitoring.integration_api.v1` is the supported boundary between DMI core and
+`dmi.api.v1` is the supported boundary between DMI core and
 an external framework integration. It specifies how an integration constructs
 the runtime, describes model hooks, publishes metadata before a forward pass,
 and reads captured tensors back.
@@ -12,7 +12,7 @@ integration repository.
 ## Import and version check
 
 ```python
-import monitoring.integration_api.v1 as dmi
+import dmi.api.v1 as dmi
 
 if dmi.DMI_INTEGRATION_API_VERSION != 1:
     raise RuntimeError("This integration requires DMI integration API v1")
@@ -22,10 +22,11 @@ if dmi.DMI_INTEGRATION_API_VERSION != 1:
 DMI package version or native-extension ABI version. This module always
 exports `1`, even after a future `v2` module is added.
 
-Importing the facade loads DMI's native hook definitions. It does not construct
-an engine, allocate ring buffers, start host threads, import an inference
-framework, or register framework-specific presets. Re-exported objects use the
-same transport and selection state as DMI core.
+Importing the facade loads DMI's pure-Python mirror of the native hook
+definitions. It does not load the compiled extension, construct an engine,
+allocate ring buffers, start host threads, import an inference framework, or
+register framework-specific presets. Re-exported objects use the same
+transport and selection state as DMI core.
 
 ## Complete lifecycle
 
@@ -52,7 +53,7 @@ replaced, recreate the adaptor and reinstall hooks.
 ### Minimal construction
 
 ```python
-import monitoring.integration_api.v1 as dmi
+import dmi.api.v1 as dmi
 
 clickhouse = dmi.ClickHouseClientConfig()
 clickhouse.host = "localhost"
@@ -1218,7 +1219,7 @@ finally:
 ## Compatibility policy
 
 External integration code should import DMI functionality only from
-`monitoring.integration_api.v1`.
+`dmi.api.v1`.
 
 Compatible additions to v1 include a new export that does not change existing
 behavior, an optional argument with a backward-compatible default, or new hook
@@ -1242,4 +1243,4 @@ DMI package release number.
 This contract does not define framework scheduler ordering, worker lifecycle,
 model implementations, compilation or graph-dispatch behavior, serving
 endpoints, or supported framework versions. It does not make unexported
-`monitoring.*` implementation details stable.
+`dmi.*` implementation details stable.

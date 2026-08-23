@@ -151,9 +151,12 @@ project root and inside `monitoring/`.
 Smoke check (loads the built `.so`):
 
 ```bash
-python -c "import monitoring; print(monitoring.__file__)"
-python -c "from monitoring._native_engine import RingConfig; print(RingConfig())"
+python -c "import dmi; print(dmi.__file__)"
+python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
+
+The legacy `monitoring` and `integration.hf_adapter` import paths remain
+available during the DMI 1.x compatibility window.
 
 ## 6. End-to-end smoke check
 
@@ -161,7 +164,7 @@ Runs the visualization demo's HF offload script, captures activations into
 ClickHouse, then queries the row count:
 
 ```bash
-python example/visualization/run_offload_hf.py
+python examples/visualization/run_offload_hf.py
 clickhouse-client --query "SELECT count() FROM default.offload WHERE model_id='demo_hf'"
 ```
 

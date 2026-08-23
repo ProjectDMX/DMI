@@ -12,7 +12,7 @@ namespace py = pybind11;
 #include "ring/tensor_meta.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  // ---- Hook definitions (single source of truth from C++ HOOK_DEFS table) ----
+  // ---- Hook definitions (native ABI table; mirrored by dmi/hooks/catalog.py) ----
   // Expose as list of (id, act_name, short_name, per_layer, group, tp_sharded,
   //                     shape_class, pp_stage) tuples — all ints except act_name/short_name.
   // Python auto-derives all mappings from this at import time.

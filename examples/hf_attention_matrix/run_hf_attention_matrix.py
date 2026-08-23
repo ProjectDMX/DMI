@@ -7,7 +7,7 @@ Prerequisites:
   - matplotlib is installed.
 
 Usage:
-    python example/hf_attention_matrix/run_hf_attention_matrix.py
+    python examples/hf_attention_matrix/run_hf_attention_matrix.py
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ OUTPUT_PNG = Path(__file__).resolve().parent / "attention_layer00_head00.png"
 
 
 def _build_db_config():
-    from monitoring._native_engine import ClickHouseClientConfig
+    from dmi.transport.native import ClickHouseClientConfig
 
     cfg = ClickHouseClientConfig()
     cfg.host = os.environ.get("DMX_DB_HOST", "localhost")
@@ -82,11 +82,11 @@ def main() -> None:
 
     import matplotlib.pyplot as plt
 
-    from integration.hf_adapter import generate_with_monitoring_dict
-    from monitoring import HostEngineConfig, MonitoringConfig, MonitoringEngine
-    from monitoring._native_engine import StageConfig
-    from monitoring.config import CaptureSchedule
-    from monitoring.internal_mapper import InternalRequirements
+    from dmi.adapters.huggingface.adapter import generate_with_monitoring_dict
+    from dmi import HostEngineConfig, MonitoringConfig, MonitoringEngine
+    from dmi.transport.native import StageConfig
+    from dmi.config import CaptureSchedule
+    from dmi.storage.internals import InternalRequirements
     from transformers import AutoTokenizer
     from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
 

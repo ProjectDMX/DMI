@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./Figures/new-logo.png" alt="DMI logo" width=80% />
+  <img src="./docs/assets/images/new-logo.png" alt="DMI logo" width=80% />
 </p>
 
 <h1 align="center">DMI — Deep Model Inspection</h1>
@@ -77,7 +77,7 @@ That's the gap DMI fills.
 ## Demo                                         
                   
 Captured internals explored in a Jupyter notebook -- attention patterns, residual-stream norms, per-token confidence, and top-k alternatives over one prompt through Qwen3-0.6B.  
-Source under [`example/visualization/`](example/visualization/README.md).  
+Source under [`examples/visualization/`](examples/visualization/README.md).
 
 
 https://github.com/user-attachments/assets/7aaf73ce-a0e4-4953-ba99-dd78dd36ca52
@@ -101,7 +101,7 @@ WildChat, normalized to vanilla HuggingFace (ideal, no observation = 1.0).
 Red × = out of memory.
 
 <p align="center">
-  <img src="./Figures/offline_hs_logits_real.png" alt="Offline throughput with limited hooks" width="100%" />
+  <img src="./docs/assets/images/offline_hs_logits_real.png" alt="Offline throughput with limited hooks" width="100%" />
 </p>
 
 **Online serving (TPOT)** — same models on vLLM, plotted against request rate.
@@ -109,7 +109,7 @@ DMI tracks the no-monitor baseline; synchronous hook/debug baselines saturate
 at much lower request rates.
 
 <p align="center">
-  <img src="./Figures/tpot_comparison.png" alt="Online TPOT: DMI vs vLLM Hook / TRT-LLM Debug API / vLLM no-monitor" width="100%" />
+  <img src="./docs/assets/images/tpot_comparison.png" alt="Online TPOT: DMI vs vLLM Hook / TRT-LLM Debug API / vLLM no-monitor" width="100%" />
 </p>
 
 Full setup, additional results, and how to reproduce:
@@ -163,7 +163,9 @@ HuggingFace or vLLM.
 - **Questions, bugs, and feature requests.** Please open a GitHub issue with the
   model, backend, hardware, and reproduction steps when applicable.
 - **Code and documentation.** Pull requests are welcome. For larger changes,
-  open an issue first so we can align on scope and avoid duplicated work.
+  open an issue first so we can align on scope and avoid duplicated work. See
+  the [code-organization guide](docs/code-organization.md) for package
+  boundaries and compatibility expectations.
 - **Model and backend support.** We are especially interested in additional model
   families and serving backends, and welcome collaborations with other inference
   backends or projects.

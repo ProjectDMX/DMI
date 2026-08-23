@@ -17,13 +17,15 @@
 namespace ring_py {
 
 // ---------------------------------------------------------------------------
-// Hook type definitions — single source of truth.
+// Hook type definitions — native ABI definition.
 //
 // The enum provides compile-time constants for switch/case.
 // HOOK_DEFS[] associates each enum value with all its properties.
-// Python imports this table via pybind11 and auto-derives all mappings.
+// ``dmi/hooks/catalog.py`` mirrors this table so Python planning can be
+// imported without first loading the compiled extension. Native tests compare
+// the two definitions.
 //
-// To add a new hook type: add one enum value + one HOOK_DEFS row.
+// To add a new hook type: update the enum, HOOK_DEFS, and Python catalog.
 // ---------------------------------------------------------------------------
 
 enum HookType : int {

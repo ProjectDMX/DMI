@@ -1,7 +1,5 @@
-"""Framework integrations.
+"""Compatibility namespace for DMI 1.x framework integrations.
 
-Root-owned framework adapters live here as separate modules. The HF adapter is
-``hf_adapter.py``; separately distributed integrations use
-``monitoring.integration_api.v1``. The base class lives in
-``monitoring.adaptor_base``.
+New HuggingFace integrations live under :mod:`dmi.adapters.huggingface`, and
+separately distributed framework plugins should use :mod:`dmi.api.v1`.
 """

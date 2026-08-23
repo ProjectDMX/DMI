@@ -25,10 +25,11 @@ monitoring = [
 ]
 
 [tool.setuptools.packages.find]
-# `integration` without star: integration/transformers/ and
-# integration/vllm_integration/ are separately installed submodules. Avoiding
-# the star keeps both external distributions out of the DMI wheel.
-include = ["monitoring*", "benchmark*", "integration"]
+# ``dmi`` is the canonical package. ``monitoring`` and ``integration`` remain
+# compatibility namespaces for the 1.x API. Using ``integration`` without a
+# wildcard keeps the separately distributed framework submodules out of the
+# DMI wheel.
+include = ["dmi*", "monitoring*", "benchmarks*", "integration"]
 
 [tool.pytest.ini_options]
 # `manual` tools and native-ring sources are not collected by default. The

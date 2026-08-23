@@ -11,7 +11,7 @@ Pre-requisites: project installed per main README, ClickHouse running
 on ``DMX_DB_HOST`` (default ``localhost:9000``).
 
 Usage:
-    python example/visualization/run_offload_hf.py
+    python examples/visualization/run_offload_hf.py
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def _read_prompt() -> str:
 
 
 def _build_db_config():
-    from monitoring._native_engine import ClickHouseClientConfig
+    from dmi.transport.native import ClickHouseClientConfig
 
     cfg = ClickHouseClientConfig()
     cfg.host = os.environ.get("DMX_DB_HOST", "localhost")
@@ -99,13 +99,13 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("This demo requires CUDA.")
 
-    from monitoring import HostEngineConfig, MonitoringConfig, MonitoringEngine
-    from monitoring._native_engine import StageConfig
-    from monitoring.config import CaptureSchedule
+    from dmi import HostEngineConfig, MonitoringConfig, MonitoringEngine
+    from dmi.transport.native import StageConfig
+    from dmi.config import CaptureSchedule
     from transformers import AutoTokenizer
     from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
 
-    from integration.hf_adapter import generate_with_monitoring
+    from dmi.adapters.huggingface.adapter import generate_with_monitoring
 
     db_cfg = _build_db_config()
     _wipe_my_rows(db_cfg)

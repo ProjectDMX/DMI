@@ -61,8 +61,8 @@ def plot_benchmark(data: dict, output_path: str):
 
 
 def main():
-    results_dir = "benchmark/results"
-    output_path = "benchmark/figures/benchmark_comparison.png"
+    results_dir = "benchmarks/results"
+    output_path = "benchmarks/figures/benchmark_comparison.png"
 
     data = load_summaries(results_dir)
     if not data:

@@ -19,7 +19,7 @@ For prefill, tok/s counts prompt tokens processed (batch * prefill_len).
 For decode,  tok/s counts new tokens generated  (batch * decode_len).
 
 Usage:
-  python -m benchmark.bench_hf_transport --model qwen3 --modes baseline,ring_null
+  python -m benchmarks.bench_hf_transport --model qwen3 --modes baseline,ring_null
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ class BenchConfig:
 # ---------------------------------------------------------------------------
 
 def _make_ring_cfg(cfg: BenchConfig):
-    from monitoring._native_engine import RingConfig  # type: ignore
+    from dmi.transport.native import RingConfig  # type: ignore
     rc = RingConfig()
     rc.task_ring_entries  = cfg.ring_task_entries
     rc.payload_ring_bytes = cfg.ring_payload_mb * 1024 * 1024
@@ -153,15 +153,15 @@ def _make_ring_cfg(cfg: BenchConfig):
 
 
 def _make_monitoring_cfg(cfg: BenchConfig):
-    from monitoring import MonitoringConfig  # type: ignore
-    from monitoring.config import CaptureSchedule  # type: ignore
+    from dmi import MonitoringConfig  # type: ignore
+    from dmi.config import CaptureSchedule  # type: ignore
     return MonitoringConfig(
         schedule=CaptureSchedule(capture_prefill=True, capture_decode=True),
     )
 
 
 def _make_null_engine(cfg: BenchConfig, model_id: str):
-    from monitoring import MonitoringEngine  # type: ignore
+    from dmi import MonitoringEngine  # type: ignore
     engine = MonitoringEngine(
         config=_make_monitoring_cfg(cfg),
         model_id=model_id, host_engine=_NullHostEngine(),
@@ -171,8 +171,8 @@ def _make_null_engine(cfg: BenchConfig, model_id: str):
 
 
 def _make_db_engine(cfg: BenchConfig, model_id: str):
-    from monitoring import HostEngineConfig, MonitoringEngine  # type: ignore
-    from monitoring._native_engine import ClickHouseClientConfig, StageConfig  # type: ignore
+    from dmi import HostEngineConfig, MonitoringEngine  # type: ignore
+    from dmi.transport.native import ClickHouseClientConfig, StageConfig  # type: ignore
 
     ch = ClickHouseClientConfig()
     ch.host = cfg.db_host;  ch.port = cfg.db_port
@@ -246,7 +246,7 @@ def _run_one_greedy(model, input_ids, attention_mask,
                     cfg: BenchConfig, eos_id: int, pad_id: int,
                     use_monitoring: bool) -> RunResult:
     """Run one iteration using generate_greedy_with_monitoring (lean manual loop)."""
-    from integration.hf_adapter import generate_greedy_with_monitoring, GreedyGenerateTimings
+    from dmi.adapters.huggingface.adapter import generate_greedy_with_monitoring, GreedyGenerateTimings
 
     timings = GreedyGenerateTimings()
     with torch.no_grad():
@@ -287,7 +287,7 @@ def _run_one_hf_generate(model, input_ids, attention_mask,
     time the next ``prepare_inputs_for_generation`` call begins, all GPU work
     from the previous step has completed.
     """
-    from integration.hf_adapter import generate_with_monitoring  # type: ignore
+    from dmi.adapters.huggingface.adapter import generate_with_monitoring  # type: ignore
 
     extra = {}
     extra["logits_to_keep"] = cfg.logits_to_keep
@@ -593,7 +593,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
 
         # Print pre-forward profiling if enabled
         try:
-            from integration.hf_adapter import _prepare_profile_times, print_prepare_profile
+            from dmi.adapters.huggingface.adapter import _prepare_profile_times, print_prepare_profile
             if _prepare_profile_times:
                 print()
                 print_prepare_profile()
@@ -618,7 +618,7 @@ def _run_mode(mode: str, model, input_ids, attention_mask,
 
         # Print prepare_wrapper profiling if available
         try:
-            from integration.hf_adapter import _prepare_profile_times
+            from dmi.adapters.huggingface.adapter import _prepare_profile_times
             times_list = _prepare_profile_times
         except ImportError:
             times_list = None
