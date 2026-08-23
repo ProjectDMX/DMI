@@ -57,10 +57,6 @@ _COMPARE_MODEL_PATHS = {
         REPO_ROOT
         / "third_party/transformers/src/transformers/models/llama_compare/modeling_llama.py"
     ),
-    ("hf", "qwen2_moe"): (
-        REPO_ROOT
-        / "third_party/transformers/src/transformers/models/qwen2_moe_compare/modeling_qwen2_moe.py"
-    ),
 }
 
 # Matches the canonical ``.copy_()`` capture pattern in _compare files:
@@ -252,7 +248,7 @@ def _main() -> int:
     )
     ap.add_argument("--framework", required=True, choices=["hf"])
     ap.add_argument(
-        "--model", required=True, choices=["gpt2", "qwen3", "qwen2_moe"], dest="model_key"
+        "--model", required=True, choices=["gpt2", "qwen3", "llama"], dest="model_key"
     )
     ap.add_argument("--hook", required=True,
                     help="Short hook name (e.g. q, resid_pre, final_logits)")

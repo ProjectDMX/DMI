@@ -31,15 +31,18 @@ TORCH_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension impo
 
 PYTHON_INCLUDE_FLAGS := $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); includes = {paths.get('include'), paths.get('platinclude')}; print(' '.join(f'-I{p}' for p in includes if p))")
 
-CUDA_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; cuda_inc = os.path.join(CUDA_HOME, 'include') if CUDA_HOME else ''; print(f'-I{cuda_inc}' if cuda_inc and os.path.exists(cuda_inc) else '')")
+CUDA_INCLUDE_DIRS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import glob, os, site, sys; roots=list(dict.fromkeys(p for p in (CUDA_HOME, sys.prefix) if p)); sites=[*site.getsitepackages(), site.getusersitepackages()]; paths=[os.path.join(root, 'include') for root in roots]; paths += [path for root in roots for path in glob.glob(os.path.join(root, 'targets', '*', 'include'))]; paths += [path for base in sites for path in glob.glob(os.path.join(base, 'nvidia', '*', 'include'))]; print(' '.join(dict.fromkeys(path for path in paths if os.path.isdir(path))))")
+CUDA_INCLUDE_FLAGS := $(addprefix -I,$(CUDA_INCLUDE_DIRS))
 
 TORCH_LIB_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join(f'-L{path}' for path in library_paths()))")
 
 TORCH_RPATH_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join(f'-Wl,-rpath,{path}' for path in library_paths()))")
 
-CUDA_LIB_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; print(next((f'-L{os.path.join(CUDA_HOME, c)}' for c in ('lib64','lib') if CUDA_HOME and os.path.exists(os.path.join(CUDA_HOME, c))), ''))")
+CUDA_LIBRARY_DIRS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import glob, os, site, sys, sysconfig; roots=list(dict.fromkeys(p for p in (CUDA_HOME, sys.prefix) if p)); sites=[*site.getsitepackages(), site.getusersitepackages()]; multiarch=sysconfig.get_config_var('MULTIARCH'); paths=[os.path.join(root, leaf) for root in roots for leaf in ('lib64', 'lib')]; paths += [path for root in roots for path in glob.glob(os.path.join(root, 'targets', '*', 'lib*'))]; paths += [path for base in sites for path in glob.glob(os.path.join(base, 'nvidia', '*', 'lib'))]; paths += [path for path in (os.path.join('/usr/lib', multiarch) if multiarch else '', '/usr/lib64', '/usr/lib', '/usr/local/nvidia/lib64') if path]; print(' '.join(dict.fromkeys(path for path in paths if os.path.isdir(path))))")
+CUDA_LIB_FLAGS := $(addprefix -L,$(CUDA_LIBRARY_DIRS))
 
-CUDA_RPATH_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os; print(next((f'-Wl,-rpath,{os.path.join(CUDA_HOME, c)}' for c in ('lib64','lib') if CUDA_HOME and os.path.exists(os.path.join(CUDA_HOME, c))), ''))")
+comma := ,
+CUDA_RPATH_FLAGS := $(foreach path,$(CUDA_LIBRARY_DIRS),-Wl$(comma)-rpath$(comma)$(path))
 
 ABI_FLAG := $(shell $(PYTHON) -c "import torch; print(f'-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}')")
 
@@ -95,7 +98,7 @@ endif
 endif
 
 # ---- CUDA kernel compilation (nvcc) ----------------------------------------
-NVCC    ?= /usr/local/cuda/bin/nvcc
+NVCC    ?= $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os, shutil, sys; paths=[shutil.which('nvcc'), os.path.join(CUDA_HOME, 'bin', 'nvcc') if CUDA_HOME else None, os.path.join(sys.prefix, 'bin', 'nvcc'), '/usr/local/cuda/bin/nvcc']; print(next((path for path in paths if path and (shutil.which(path) or os.path.isfile(path))), 'nvcc'))")
 SM_ARCH ?= native
 
 NVCCFLAGS := \

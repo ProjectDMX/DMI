@@ -16,8 +16,11 @@ import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+for _source_root in reversed(
+    (_REPO_ROOT / "src", _REPO_ROOT / "third_party" / "transformers" / "src")
+):
+    if _source_root.is_dir() and str(_source_root) not in sys.path:
+        sys.path.insert(0, str(_source_root))
 
 import torch
 

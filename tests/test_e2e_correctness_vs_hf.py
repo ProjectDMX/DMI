@@ -1,5 +1,5 @@
 # tests/test_e2e_correctness_hf.py
-# PYTHONPATH=./:./monitoring:$PYTHONPATH E2E_PRINT_TEXT=1 E2E_HF_DROP_LAST_TOKEN=1 E2E_PRINT_TOPK_LOGITS=1 pytest -q -s tests/test_e2e_correctness_vs_hf.py
+# PYTHONPATH=./src:$PYTHONPATH E2E_PRINT_TEXT=1 E2E_HF_DROP_LAST_TOKEN=1 E2E_PRINT_TOPK_LOGITS=1 pytest -q -s tests/test_e2e_correctness_vs_hf.py
 """E2E correctness test: monitoring DB vs HuggingFace Transformers (HF-driven ground truth).
 
 This test runs the repo monitoring pipeline end-to-end (native backend + host engine + ClickHouse),
@@ -112,6 +112,24 @@ def _resolve_model_id(model: str) -> str:
 # ---------------------------------------------------------------------------
 # Small utils (inlined to avoid test-only deps)
 # ---------------------------------------------------------------------------
+
+
+def _source_subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Return a child environment that imports DMI and HF from this checkout."""
+
+    env = os.environ.copy()
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    source_roots = (
+        os.path.join(repo_root, "src"),
+        os.path.join(repo_root, "third_party", "transformers", "src"),
+    )
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (*source_roots, existing) if value
+    )
+    if extra:
+        env.update(extra)
+    return env
 
 
 def bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -231,7 +249,7 @@ def test_e2e_correctness_hf(subtests) -> None:
         r1 = subprocess.run(
             [sys.executable, "-m", "tests.hf_reference_runner",
              "--output-dir", ref_dir],
-            env=os.environ, capture_output=True, text=True, cwd=project_root,
+            env=_source_subprocess_env(), capture_output=True, text=True, cwd=project_root,
         )
         if r1.returncode != 0:
             pytest.fail(f"Reference runner failed:\n{r1.stderr[-2000:]}")
@@ -241,7 +259,7 @@ def test_e2e_correctness_hf(subtests) -> None:
         r2 = subprocess.run(
             [sys.executable, "-m", "tests.hf_monitored_runner",
              "--output-dir", mon_dir],
-            env=os.environ, capture_output=True, text=True, cwd=project_root,
+            env=_source_subprocess_env(), capture_output=True, text=True, cwd=project_root,
         )
         if r2.returncode != 0:
             pytest.fail(f"Monitored runner failed:\n{r2.stderr[-2000:]}")
@@ -253,7 +271,7 @@ def test_e2e_correctness_hf(subtests) -> None:
              "--ref-dir", ref_dir,
              "--mon-dir", mon_dir,
              "--result-file", result_file],
-            env=os.environ, capture_output=True, text=True, cwd=project_root,
+            env=_source_subprocess_env(), capture_output=True, text=True, cwd=project_root,
         )
         if r3.returncode != 0:
             pytest.fail(f"Comparator failed:\n{r3.stderr[-2000:]}")
@@ -536,9 +554,11 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
     # and ensures clean GPU memory isolation.
     import subprocess, tempfile
     ref_dir = tempfile.mkdtemp(prefix="hf_ref_")
-    ref_env = {**os.environ, "E2E_BATCH_SIZE": str(batch_size),
-               "E2E_MAX_NEW_TOKENS": str(max_new_tokens),
-               "E2E_MODEL": os.environ.get("E2E_MODEL", "gpt2")}
+    ref_env = _source_subprocess_env({
+        "E2E_BATCH_SIZE": str(batch_size),
+        "E2E_MAX_NEW_TOKENS": str(max_new_tokens),
+        "E2E_MODEL": os.environ.get("E2E_MODEL", "gpt2"),
+    })
     ref_result = subprocess.run(
         [sys.executable, "-m", "tests.hf_reference_runner", "--output-dir", ref_dir],
         env=ref_env, capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(__file__)),
@@ -1307,15 +1327,15 @@ def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
     # CUDA graph mode: monitored runs with static cache + torch.compile.
     # Reference runs eager.  Relaxed tolerance for bf16 rounding from
     # different accumulation order (compiled vs uncompiled).
-    mon_env = {**os.environ, "E2E_CUDA_GRAPHS": "1"}
-    cmp_env = {**os.environ, "E2E_TOLERANCE": "0.5"}
+    mon_env = _source_subprocess_env({"E2E_CUDA_GRAPHS": "1"})
+    cmp_env = _source_subprocess_env({"E2E_TOLERANCE": "0.5"})
 
     try:
         print("\n  [1/3] Reference run (original model, eager)...", flush=True)
         r1 = subprocess.run(
             [sys.executable, "-m", "tests.hf_reference_runner",
              "--output-dir", ref_dir],
-            env=os.environ, capture_output=True, text=True, cwd=project_root,
+            env=_source_subprocess_env(), capture_output=True, text=True, cwd=project_root,
         )
         if r1.returncode != 0:
             pytest.fail(f"Reference runner failed:\n{r1.stderr[-2000:]}")

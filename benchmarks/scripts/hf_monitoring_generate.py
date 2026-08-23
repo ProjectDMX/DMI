@@ -8,15 +8,18 @@ import time
 from pathlib import Path
 from typing import List
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+for _source_root in reversed(
+    (_REPO_ROOT / "src", _REPO_ROOT / "third_party" / "transformers" / "src")
+):
+    if _source_root.is_dir() and str(_source_root) not in sys.path:
+        sys.path.insert(0, str(_source_root))
+
 import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel
 from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 from dmi import (
     ClickHouseClientConfig,

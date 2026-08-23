@@ -53,11 +53,11 @@ def _run(
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
-def _validate_archive(wheel: Path) -> None:
+def _validate_archive(wheel: Path, native_members: set[str]) -> None:
     with zipfile.ZipFile(wheel) as archive:
         members = set(archive.namelist())
 
-    missing = sorted(REQUIRED_MEMBERS - members)
+    missing = sorted((REQUIRED_MEMBERS | native_members) - members)
     if missing:
         raise RuntimeError(
             "wheel is missing canonical package files: " + ", ".join(missing)
@@ -74,7 +74,9 @@ def _validate_archive(wheel: Path) -> None:
         )
 
 
-def _smoke_test_install(wheel: Path, audit_root: Path) -> None:
+def _smoke_test_install(
+    wheel: Path, audit_root: Path, *, expect_native_backend: bool
+) -> None:
     venv_root = audit_root / "venv"
     venv.EnvBuilder(with_pip=True, system_site_packages=True).create(venv_root)
 
@@ -108,14 +110,33 @@ for module_name in (
     assert module_file.is_relative_to(venv_root), module_file
 
 for legacy_name in ("monitoring", "integration", "benchmark", "example"):
-    assert importlib.util.find_spec(legacy_name) is None, legacy_name
+    spec = importlib.util.find_spec(legacy_name)
+    if spec is None:
+        continue
+    locations = [spec.origin, *(spec.submodule_search_locations or ())]
+    assert not any(
+        location and Path(location).resolve().is_relative_to(venv_root)
+        for location in locations
+    ), (legacy_name, locations)
+
+if sys.argv[2] == "1":
+    from dmi.transport.native import RingConfig
+
+    assert RingConfig is not None
 
 print(f"installed package smoke test passed: {package_file}")
 """
     clean_env = os.environ.copy()
     clean_env.pop("PYTHONPATH", None)
     _run(
-        [str(python), "-I", "-c", smoke_code, str(venv_root)],
+        [
+            str(python),
+            "-I",
+            "-c",
+            smoke_code,
+            str(venv_root),
+            "1" if expect_native_backend else "0",
+        ],
         cwd=audit_root,
         env=clean_env,
     )
@@ -145,8 +166,14 @@ def main() -> None:
         if len(wheels) != 1:
             raise RuntimeError(f"expected one wheel, found {len(wheels)}")
 
-        _validate_archive(wheels[0])
-        _smoke_test_install(wheels[0], audit_root)
+        native_members = {
+            f"dmi/{path.name}"
+            for path in (REPO_ROOT / "src" / "dmi").glob("_native_backend*.so")
+        }
+        _validate_archive(wheels[0], native_members)
+        _smoke_test_install(
+            wheels[0], audit_root, expect_native_backend=bool(native_members)
+        )
 
     print("package distribution check passed")
 
