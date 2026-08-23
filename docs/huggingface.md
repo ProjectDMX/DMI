@@ -1,8 +1,21 @@
-# HuggingFace Usage
+# HuggingFace usage
 
-Run DMI through the HuggingFace path after completing
-[`install.md`](install.md). The HF path uses the modified Transformers submodule
-and DMI's generation wrapper.
+## Install the HuggingFace backend
+
+Use a dedicated environment and recursive DMI checkout for the HuggingFace
+backend. Do not reuse the vLLM environment or checkout. Complete the
+[core installation](install.md), then install the modified Transformers
+submodule editable and rebuild the environment-specific native extension:
+
+```bash
+pip install -e third_party/transformers/
+make -C native clean
+make -C native -j
+python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
+```
+
+The HuggingFace path uses that modified Transformers checkout and DMI's
+generation wrapper.
 
 ## Sanity check
 
@@ -28,6 +41,18 @@ Inspect captured rows after a `ring_db` run:
 ```bash
 clickhouse-client --query "SELECT count() FROM default.offload"
 ```
+
+### End-to-end persistence smoke check
+
+With ClickHouse enabled, run the visualization demo's HF offload script and
+verify that it persisted rows:
+
+```bash
+python examples/visualization/run_offload_hf.py
+clickhouse-client --query "SELECT count() FROM default.offload WHERE model_id='demo_hf'"
+```
+
+Expect generated text on stdout and a non-zero row count.
 
 ## Reading internals from HF generation output
 

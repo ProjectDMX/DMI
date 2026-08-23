@@ -59,7 +59,6 @@ from ...storage.internals import (
     LazyInternal,
     make_lazy_internal as _make_lazy_internal,
 )
-from ...transport import ring as _ring_transport
 from ...hooks import selection as _selection
 from ...hooks.selection import (
     hook_belongs_to_pp_rank,
@@ -80,7 +79,14 @@ compute_hook_shape = _specs.compute_hook_shape
 align_up = _specs.align_up_py
 ALL_HOOK_TYPES = _selection._ALL_HOOK_TYPES
 ATTENTION_WEIGHT_HOOK_TYPES = _specs._ATTN_WT_TYPES
-deactivate_ring_transport = _ring_transport.deactivate
+
+
+def deactivate_ring_transport() -> None:
+    """Clear the process-global active ring transport."""
+
+    from ...transport import ring as _ring_transport
+
+    _ring_transport.deactivate()
 
 
 def is_preset_registered(name: str) -> bool:

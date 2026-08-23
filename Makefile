@@ -20,6 +20,7 @@ test-cpu:
 test-all:
 	$(PYTHON) -m pytest -q
 
+# Internal Python package-layout regression; this does not qualify a release artifact.
 test-package:
 	$(PYTHON) tests/tools/check_package.py
 

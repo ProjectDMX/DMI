@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.abc
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 from typing import get_type_hints
@@ -280,6 +281,26 @@ def test_v1_model_shape_helper_matches_existing_helper(config) -> None:
     assert v1.make_model_shape_from_hf_config(config) == (
         _make_model_shape_from_hf_config(config)
     )
+
+
+def test_v1_import_does_not_load_native_transport() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source_root = repo_root / "src"
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {str(source_root)!r}); "
+        "import dmi.api.v1; "
+        "assert 'dmi.transport.ring' not in sys.modules; "
+        "assert 'dmi.transport.native' not in sys.modules"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_v1_import_has_no_framework_or_preset_side_effects() -> None:

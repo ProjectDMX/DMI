@@ -1,23 +1,27 @@
 # vLLM usage
 
-DMI supports official vLLM 0.27.1 through the separately installed
-`DMI-vLLM-Integration` 0.27.1 package. The source checkout pins that package at
-`third_party/vllm-integration/`; it does not contain a vLLM fork.
+DMI supports official vLLM 0.27.1 through the version-matched integration
+checkout pinned at `third_party/vllm-integration/`. It does not contain a vLLM
+fork.
 
-Install the matching releases:
+## Install the vLLM backend
 
-```bash
-pip install 'DMI>=1.1.0,<2.0'
-pip install 'vllm==0.27.1'
-pip install 'DMI-vLLM-Integration==0.27.1'
-```
-
-For a source checkout, install DMI and then the integration submodule:
+Use a dedicated environment and recursive DMI checkout for vLLM. Do not install
+the modified HuggingFace integration from `third_party/transformers/` in this
+environment. Complete the [core installation](install.md), then install the
+version-matched integration editable. Its dependency metadata installs the
+matching official vLLM release.
 
 ```bash
-pip install -e .
 pip install -e third_party/vllm-integration/
+make -C native clean
+make -C native -j
+python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
+
+DMI and DMI-vLLM-Integration registry artifacts are not assumed or supported by
+this guide. The supported path is the recursive source checkout, editable
+installs, and the locally built native backend above.
 
 DMI supports vLLM's V1 model runner only. Set this before importing or starting
 vLLM:

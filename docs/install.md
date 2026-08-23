@@ -1,10 +1,16 @@
-# Installation
+# Core installation
 
-Set up DMI from a fresh clone: fetch submodules, install the Python packages,
-build the native backend, and prepare the optional ClickHouse sink.
+Set up DMI from a fresh clone: fetch submodules, install DMI editable, build the
+native backend, and optionally prepare the ClickHouse sink.
 
 Tested on Linux + Python >=3.10. A CUDA-capable GPU is required because Ring² is
 a GPU-resident capture and transport pipeline.
+
+> [!IMPORTANT]
+> The supported installation is a recursive source checkout with a locally
+> built native backend and editable Python packages. Wheels and source archives
+> produced by repository checks are temporary package-layout fixtures; they are
+> not published or supported runtime-install artifacts.
 
 ## 0. System prerequisites
 
@@ -25,21 +31,6 @@ Verify:
 ```bash
 nvcc --version
 nvidia-smi
-python -c "import torch; print(torch.version.cuda)"
-```
-
-DMI automatically selects one coherent toolkit for NVCC, headers, and runtime
-libraries. Inspect that selection with:
-
-```bash
-make -C native cuda-info
-```
-
-If multiple matching toolkits are installed, select one explicitly:
-
-```bash
-export CUDA_HOME=/usr/local/cuda-12.8
-# Alternatively: export CUDACXX=/usr/local/cuda-12.8/bin/nvcc
 ```
 
 ## 1. Clone the repository
@@ -48,6 +39,10 @@ The repo uses three git submodules: the DMI HuggingFace integration, the
 version-matched DMI-vLLM integration, and the `clickhouse-cpp` C++ client.
 Recursive checkout fetches all three repositories; it does not install either
 Python integration.
+
+The command below creates one backend checkout. If you plan to use both
+backends, repeat it with distinct target directories such as `DMI-hf` and
+`DMI-vllm`; do not share one checkout between their environments.
 
 ```bash
 git clone --recursive https://github.com/ProjectDMX/DMI.git
@@ -63,9 +58,10 @@ Expected submodule paths:
 - `third_party/vllm-integration/` — DMI integration for an unmodified official vLLM installation
 - `third_party/clickhouse-cpp/` — ClickHouse C++ client linked into the native backend
 
-## 2. Install ClickHouse server
+## 2. Optional: install ClickHouse server
 
-DMI writes captured tensors into a ClickHouse table. Follow the
+DMI can write captured tensors into a ClickHouse table. Skip the server setup
+when you only need transport without persistence. Otherwise, follow the
 [ClickHouse installation guide](https://clickhouse.com/docs/install) for your
 platform.
 
@@ -103,8 +99,9 @@ If conda is not already installed, follow the
 first. Then:
 
 ```bash
-conda env create -f environment.yml
-conda activate proj-dmx
+DMI_BACKEND_ENV=dmi-hf  # Example; use dmi-vllm in the vLLM checkout.
+conda env create -f environment.yml --name "$DMI_BACKEND_ENV"
+conda activate "$DMI_BACKEND_ENV"
 ```
 
 ### 3b. venv
@@ -120,31 +117,37 @@ Then create the environment, activate it, and install requirements:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade "pip>=21.3"
 pip install -r requirements.txt
 ```
 
-## 4. Install Python packages
+The pip minimum is required for the PEP 660 editable install used below. Conda
+environments must provide the same or a newer pip version.
 
-Install DMI itself first:
+With the environment active and the recursive checkout available, verify the
+PyTorch CUDA build and inspect the coherent toolkit DMI selected:
+
+```bash
+python -c "import torch; print(torch.version.cuda)"
+make -C native cuda-info
+```
+
+If multiple matching toolkits are installed, select one explicitly and rerun
+`cuda-info`:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.8
+# Alternatively: export CUDACXX=/usr/local/cuda-12.8/bin/nvcc
+make -C native cuda-info
+```
+
+## 4. Install DMI core
+
+Install the root checkout editable. The native build in the next step writes
+its importable extension directly into this source tree.
 
 ```bash
 pip install -e .
-```
-
-Then install the integration for the backend you intend to use. You do not need
-both unless you plan to test both backends.
-
-For HuggingFace:
-
-```bash
-pip install -e third_party/transformers/
-```
-
-Or, for vLLM, install the versioned integration. Its dependency metadata
-installs the matching official vLLM release:
-
-```bash
-pip install -e third_party/vllm-integration/
 ```
 
 ## 5. Build native dependencies
@@ -175,17 +178,19 @@ python -c "import dmi; print(dmi.__file__)"
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
 
-## 6. End-to-end smoke check
+## 6. Choose one backend
 
-Runs the visualization demo's HF offload script, captures activations into
-ClickHouse, then queries the row count:
+Continue with either the [HuggingFace guide](huggingface.md) or the
+[vLLM guide](vllm.md). A separate environment and recursive checkout are
+required for each backend. The HuggingFace path installs a modified
+Transformers checkout, whereas the vLLM path installs its own official
+dependency set; do not install the HuggingFace integration in the vLLM
+environment.
 
-```bash
-python examples/visualization/run_offload_hf.py
-clickhouse-client --query "SELECT count() FROM default.offload WHERE model_id='demo_hf'"
-```
-
-Expect the generated text on stdout and a non-zero row count.
+The native extension is also environment-specific: its Python suffix, Torch
+ABI, CUDA selection, and runtime paths come from the active environment. Each
+backend guide therefore finishes by rebuilding the extension in that backend's
+checkout.
 
 ## Troubleshooting
 

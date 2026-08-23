@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build and smoke-test DMI as an installed wheel.
+"""Build and smoke-test DMI's Python package layout.
 
 Pytest adds ``src`` to ``sys.path``, which is useful for development but can
-hide broken package discovery after a layout change.  This check builds a real
-wheel, validates its archive layout, installs it into a temporary virtual
-environment, and imports it from outside the repository.
+hide broken package discovery after a layout change. This internal check builds
+a temporary wheel, validates its archive layout, installs it into a temporary
+virtual environment, and imports it from outside the repository. It does not
+build or qualify the native backend, and the wheel is not a release artifact.
 """
 
 from __future__ import annotations
@@ -73,6 +74,17 @@ def _validate_archive(wheel: Path) -> None:
             "wheel contains legacy top-level paths: " + ", ".join(legacy)
         )
 
+    native_members = sorted(
+        member
+        for member in members
+        if member.startswith("dmi/_native_backend") and member.endswith(".so")
+    )
+    if native_members:
+        raise RuntimeError(
+            "package-layout wheel unexpectedly contains native artifacts: "
+            + ", ".join(native_members)
+        )
+
 
 def _smoke_test_install(wheel: Path, audit_root: Path) -> None:
     venv_root = audit_root / "venv"
@@ -117,7 +129,7 @@ for legacy_name in ("monitoring", "integration", "benchmark", "example"):
         for location in locations
     ), (legacy_name, locations)
 
-print(f"installed package smoke test passed: {package_file}")
+print(f"package-layout smoke test passed: {package_file}")
 """
     clean_env = os.environ.copy()
     clean_env.pop("PYTHONPATH", None)
@@ -161,7 +173,7 @@ def main() -> None:
         _validate_archive(wheels[0])
         _smoke_test_install(wheels[0], audit_root)
 
-    print("package distribution check passed")
+    print("internal package-layout check passed")
 
 
 if __name__ == "__main__":

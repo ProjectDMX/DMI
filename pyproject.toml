@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=64.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "DMI"
-version = "1.1.0"
+version = "1.2.0"
 description = "A decoupled, asynchronous observation substrate for high-speed LLM inference."
 requires-python = ">=3.10"
 dynamic = ["dependencies"]

@@ -1,7 +1,7 @@
 # Code organization
 
 DMI uses a `src` layout with one canonical Python namespace. Compiled backend
-sources and external repositories stay outside the installable package.
+sources and external repositories stay outside that runtime namespace.
 
 ```text
 src/dmi/
@@ -44,7 +44,8 @@ docs/                           Architecture and usage documentation
   specifications to HookPoints, and `dmi.transport.ring` owns runtime movement.
 - Native loading stays isolated in `dmi.transport.native`, so importing `dmi`
   does not require CUDA or a compiled extension.
-- `third_party` is never discovered or distributed as part of the DMI package.
+- `third_party` is never discovered as part of the DMI Python package or copied
+  into its temporary package-layout artifacts.
 
 ## Native backend
 
@@ -66,5 +67,7 @@ The build keeps an intermediate copy under `native/` and writes the importable
 3. Run `python -m compileall -q src/dmi tests benchmarks examples`.
 4. Run `python -m pytest -m cpu -q`, followed by `python -m pytest -q` where
    native and framework dependencies are available.
-5. Verify the source distribution contains `dmi` and required native sources;
-   verify source and wheel distributions both exclude `third_party` contents.
+5. Run `make test-package` to check the temporary wheel's Python layout. When
+   manually inspecting a source archive, verify that it contains `dmi` and the
+   native sources and excludes `third_party` contents. These artifacts are
+   internal regression fixtures, not published or supported installations.

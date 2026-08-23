@@ -14,6 +14,10 @@ pytestmark = pytest.mark.cpu
 
 def test_pinned_framework_integrations_use_the_dmi_namespace():
     repo_root = Path(__file__).resolve().parents[1]
+    vllm_integration_root = (
+        repo_root / "third_party/vllm-integration/src/dmi_vllm_integration"
+    )
+    legacy_api_compatibility = vllm_integration_root / "dmi_api.py"
     integration_source_roots = (
         repo_root / "third_party/transformers/src/transformers/models/gpt2_p",
         repo_root / "third_party/transformers/src/transformers/models/gpt2_compare",
@@ -21,7 +25,7 @@ def test_pinned_framework_integrations_use_the_dmi_namespace():
         repo_root / "third_party/transformers/src/transformers/models/qwen3_compare",
         repo_root / "third_party/transformers/src/transformers/models/llama_p",
         repo_root / "third_party/transformers/src/transformers/models/llama_compare",
-        repo_root / "third_party/vllm-integration/src/dmi_vllm_integration",
+        vllm_integration_root,
     )
     stale_namespaces = (
         "monitoring.hook_points",
@@ -33,7 +37,13 @@ def test_pinned_framework_integrations_use_the_dmi_namespace():
         assert source_root.is_dir(), f"submodule source is missing: {source_root}"
         for source_path in source_root.rglob("*.py"):
             source = source_path.read_text()
-            assert not any(name in source for name in stale_namespaces), source_path
+            for name in stale_namespaces:
+                if (
+                    name == "monitoring.integration_api"
+                    and source_path == legacy_api_compatibility
+                ):
+                    continue
+                assert name not in source, source_path
 
 
 def test_canonical_core_types_are_available():
