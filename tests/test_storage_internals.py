@@ -9,6 +9,8 @@ from dmi.storage.internals import (
     make_lazy_internal,
 )
 
+pytestmark = pytest.mark.cpu
+
 ACT = "blocks.hook_resid_pre"
 
 

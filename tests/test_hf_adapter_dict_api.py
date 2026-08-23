@@ -5,6 +5,8 @@ import pytest
 from dmi.adapters.huggingface import generation as hf_generation
 from dmi.storage.internals import InternalRequirements
 
+pytestmark = pytest.mark.cpu
+
 
 def test_generate_with_monitoring_returns_impl_output_unchanged(monkeypatch):
     expected = object()

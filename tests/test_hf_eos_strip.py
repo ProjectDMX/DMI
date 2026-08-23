@@ -2,9 +2,8 @@
 
 Phase 4.B verification gate.  Pure unit test against the strip logic --
 no DB, no GPU, no real model.  Reuses the FakeEngine pattern from
-``tests/test_adapter_protocol.py``.  HuggingFaceAdapter imports the native hook
-definition layer through ring_transport, so this is not part of the
-no-native-build CPU gate.
+``tests/test_adapter_protocol.py``.  The adapter imports only Python transport
+facades during collection, so no compiled backend is required.
 
 The strip semantic under test:
   * Detection runs one step late by construction -- ``input_ids[:, -1]``
@@ -23,20 +22,9 @@ from typing import Optional
 import pytest
 import torch
 
-try:
-    from dmi.adapters.huggingface.adapter import HuggingFaceAdapter
-    _NATIVE_IMPORT_ERROR = None
-except ImportError as exc:
-    HuggingFaceAdapter = None
-    _NATIVE_IMPORT_ERROR = exc
+from dmi.adapters.huggingface.adapter import HuggingFaceAdapter
 
-pytestmark = [
-    pytest.mark.native_backend,
-    pytest.mark.skipif(
-        _NATIVE_IMPORT_ERROR is not None,
-        reason=f"DMI native backend required: {_NATIVE_IMPORT_ERROR}",
-    ),
-]
+pytestmark = pytest.mark.cpu
 
 
 # ---------------------------------------------------------------------------

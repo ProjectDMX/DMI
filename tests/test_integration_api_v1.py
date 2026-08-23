@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import os
+import importlib
+import importlib.abc
 from pathlib import Path
-import subprocess
 import sys
-import textwrap
 from types import SimpleNamespace
 from typing import get_type_hints
 
@@ -14,17 +13,7 @@ import pytest
 import torch
 
 
-pytestmark = pytest.mark.native_backend
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _require_native_backend() -> None:
-    try:
-        from dmi.transport import native as _native_engine
-
-        _native_engine._load_extension()
-    except Exception as exc:
-        pytest.skip(f"DMI native backend is unavailable: {exc}")
+pytestmark = pytest.mark.cpu
 
 
 _HOOK_EXPORTS = {
@@ -113,7 +102,6 @@ def test_v1_public_surface_is_exact() -> None:
 
 
 def test_v1_reexports_existing_objects_and_state() -> None:
-    from dmi.transport import native as _native_engine
     from dmi.adapters import base as adapter_base
     from dmi.storage import clickhouse
     from dmi import config
@@ -166,7 +154,18 @@ def test_v1_reexports_existing_objects_and_state() -> None:
     for name in _HOOK_EXPORTS:
         assert getattr(v1, name) == getattr(specs, name)
 
-    native = _native_engine._load_extension()
+
+
+@pytest.mark.native_backend
+def test_v1_native_exports_reexport_compiled_objects() -> None:
+    from dmi.api import v1
+    from dmi.transport import native as _native_engine
+
+    try:
+        native = _native_engine._load_extension()
+    except Exception as exc:
+        pytest.skip(f"DMI native backend is unavailable: {exc}")
+
     for name in {
         "RingConfig",
         "ClickHouseClientConfig",
@@ -284,43 +283,60 @@ def test_v1_model_shape_helper_matches_existing_helper(config) -> None:
 
 
 def test_v1_import_has_no_framework_or_preset_side_effects() -> None:
-    root = Path(__file__).resolve().parents[1]
-    script = textwrap.dedent(
-        """
-        import importlib.abc
-        import sys
+    from dmi import api as api_package
+    from dmi.hooks import selection
 
-        from dmi.hooks import selection
+    before = dict(selection._HOOK_SELECTIONS)
+    missing = object()
+    old_v1_attribute = getattr(api_package, "v1", missing)
 
-        before = dict(selection._HOOK_SELECTIONS)
+    isolated_names = {
+        name
+        for name in sys.modules
+        if name == "dmi.api.v1"
+        or name.startswith("dmi.api.v1.")
+        or name == "dmi.adapters.huggingface.adapter"
+        or name == "vllm"
+        or name.startswith("vllm.")
+    }
+    saved_modules = {name: sys.modules[name] for name in isolated_names}
 
-        class RejectFrameworkImports(importlib.abc.MetaPathFinder):
-            def find_spec(self, fullname, path=None, target=None):
-                blocked = (
-                    fullname == "vllm"
-                    or fullname.startswith("vllm.")
-                    or fullname == "dmi.adapters.huggingface.adapter"
-                )
-                if blocked:
-                    raise AssertionError(f"unexpected framework import: {fullname}")
-                return None
+    class RejectFrameworkImports(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            blocked = (
+                fullname == "vllm"
+                or fullname.startswith("vllm.")
+                or fullname == "dmi.adapters.huggingface.adapter"
+            )
+            if blocked:
+                raise AssertionError(f"unexpected framework import: {fullname}")
+            return None
 
-        sys.meta_path.insert(0, RejectFrameworkImports())
-        import dmi.api.v1 as api
+    finder = RejectFrameworkImports()
+    for name in isolated_names:
+        sys.modules.pop(name, None)
+    if old_v1_attribute is not missing:
+        delattr(api_package, "v1")
+    sys.meta_path.insert(0, finder)
+
+    try:
+        api = importlib.import_module("dmi.api.v1")
 
         assert api.DMI_INTEGRATION_API_VERSION == 1
         assert selection._HOOK_SELECTIONS == before
-        assert not any(name == "vllm" or name.startswith("vllm.")
-                       for name in sys.modules)
+        assert not any(
+            name == "vllm" or name.startswith("vllm.")
+            for name in sys.modules
+        )
         assert "dmi.adapters.huggingface.adapter" not in sys.modules
-        """
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=root,
-        env=os.environ.copy(),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    finally:
+        sys.meta_path.remove(finder)
+        for name in list(sys.modules):
+            if name == "dmi.api.v1" or name.startswith("dmi.api.v1."):
+                sys.modules.pop(name)
+        sys.modules.update(saved_modules)
+        if old_v1_attribute is missing:
+            if hasattr(api_package, "v1"):
+                delattr(api_package, "v1")
+        else:
+            api_package.v1 = old_v1_attribute
