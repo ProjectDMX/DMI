@@ -339,12 +339,12 @@ _HF_RUNNER = dedent("""
         gen_kwargs['compile_config'] = CompileConfig(mode='reduce-overhead', fullgraph=False)
 
     if args.rollout == 'ours':
-        # Drive monitoring through HFAdaptor with hook_selection=H.  The
+        # Drive monitoring through HuggingFaceAdapter with hook_selection=H. The
         # ring transport runs without ClickHouse (no db_config).
         from dmi import MonitoringEngine, MonitoringConfig
         from dmi.config import CaptureSchedule
         from dmi.transport.native import RingConfig
-        from dmi.adapters.huggingface.adapter import generate_with_monitoring
+        from dmi.adapters.huggingface.generation import generate_with_monitoring
         cfg = MonitoringConfig(schedule=CaptureSchedule(capture_prefill=True, capture_decode=True))
         engine = MonitoringEngine(config=cfg, model_id='per_hook_isolation')
         ring_cfg = RingConfig()

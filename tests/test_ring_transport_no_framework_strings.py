@@ -1,7 +1,7 @@
-"""Lint-style test: dmi/transport/ring.py is framework-neutral.
+"""Lint-style test: core hook and ring modules are framework-neutral.
 
 Phase 1.5 verification gate.  After the unified-adaptor refactor, the core
-transport module has one explicit attribution block naming the two batch
+specification module has one explicit attribution block naming the two batch
 conventions (HF = batched, vLLM = packed/flattened) and otherwise refers
 to them only by their neutral names ("batched", "packed", "flattened").
 
@@ -27,9 +27,12 @@ import pytest
 
 pytestmark = pytest.mark.cpu
 
-RING_TRANSPORT = (
-    Path(__file__).resolve().parent.parent / "dmi" / "transport" / "ring.py"
+SOURCE_ROOT = Path(__file__).resolve().parent.parent / "src" / "dmi"
+CORE_MODULES = (
+    SOURCE_ROOT / "hooks" / "specs.py",
+    SOURCE_ROOT / "transport" / "ring.py",
 )
+HOOK_SPECS = CORE_MODULES[0]
 
 # Patterns that are *always* a framework leak -- never allowed anywhere
 # in the ring transport, including inside the attribution block.
@@ -70,23 +73,25 @@ def _attribution_lines(source: str) -> set[int]:
             break
     if start is None or end is None:
         pytest.fail(
-            "Attribution block markers not found in dmi/transport/ring.py; "
+            "Attribution block markers not found in dmi/hooks/specs.py; "
             "either restore the block or update this test's anchors.")
     return set(range(start, end + 1))
 
 
 def test_no_forbidden_framework_patterns():
     """Verify no `vllm-...` / `hf-...` / lowercase-vllm / transformers-import."""
-    src = RING_TRANSPORT.read_text()
     failures: list[tuple[int, str, str]] = []
-    for line_no, line in enumerate(src.splitlines(), start=1):
-        for pat in FORBIDDEN_PATTERNS:
-            m = pat.search(line)
-            if m is not None:
-                failures.append((line_no, pat.pattern, line.rstrip()))
+    for module in CORE_MODULES:
+        for line_no, line in enumerate(module.read_text().splitlines(), start=1):
+            for pat in FORBIDDEN_PATTERNS:
+                m = pat.search(line)
+                if m is not None:
+                    failures.append(
+                        (line_no, pat.pattern, f"{module.name}: {line.rstrip()}")
+                    )
     if failures:
         msg_lines = [
-            "Forbidden framework-leaking pattern(s) in dmi/transport/ring.py:"
+            "Forbidden framework-leaking pattern(s) in core hook/transport modules:"
         ]
         for line_no, pat, line in failures:
             msg_lines.append(f"  line {line_no} matches /{pat}/: {line}")
@@ -95,7 +100,7 @@ def test_no_forbidden_framework_patterns():
 
 def test_framework_proper_names_only_in_attribution_block():
     """``vLLM`` / ``HF`` outside the attribution block point to a leak."""
-    src = RING_TRANSPORT.read_text()
+    src = HOOK_SPECS.read_text()
     allowed = _attribution_lines(src)
     capitalized_pat = re.compile(r"\bvLLM\b|\bHF\b")
     failures = []
@@ -122,9 +127,9 @@ def test_attribution_block_present():
     Catches accidental deletion that would silently let any framework
     name pass `test_framework_proper_names_only_in_attribution_block`.
     """
-    src = RING_TRANSPORT.read_text()
+    src = HOOK_SPECS.read_text()
     assert ATTRIBUTION_BLOCK_START in src, (
-        "Attribution block start marker missing from dmi/transport/ring.py")
+        "Attribution block start marker missing from dmi/hooks/specs.py")
     # Both names must appear at least once inside the block -- otherwise the
     # block isn't doing its job (a reader can't map conventions back to
     # their framework origins).

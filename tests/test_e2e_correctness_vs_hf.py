@@ -286,7 +286,7 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
         )
         from dmi.transport.native import ClickHouseClientConfig  # type: ignore
         from dmi.config import CaptureSchedule  # type: ignore
-        from dmi.adapters.huggingface.adapter import generate_with_monitoring  # type: ignore
+        from dmi.adapters.huggingface.generation import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
 
@@ -867,7 +867,7 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
         )
         from dmi.transport.native import ClickHouseClientConfig  # type: ignore
         from dmi.config import CaptureSchedule  # type: ignore
-        from dmi.adapters.huggingface.adapter import generate_with_monitoring  # type: ignore
+        from dmi.adapters.huggingface.generation import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
 
@@ -1365,7 +1365,7 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
         )
         from dmi.transport.native import ClickHouseClientConfig  # type: ignore
         from dmi.config import CaptureSchedule  # type: ignore
-        from dmi.adapters.huggingface.adapter import generate_with_monitoring  # type: ignore
+        from dmi.adapters.huggingface.generation import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
 

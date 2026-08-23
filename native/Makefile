@@ -25,7 +25,7 @@ PROJECT_ROOT := $(abspath $(CURDIR)/..)
 EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 TARGET_SO := $(TARGET)$(EXT_SUFFIX)
 LOCAL_TARGET := $(CURDIR)/$(TARGET_SO)
-FINAL_TARGET := $(PROJECT_ROOT)/dmi/$(TARGET_SO)
+FINAL_TARGET := $(PROJECT_ROOT)/src/dmi/$(TARGET_SO)
 
 TORCH_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join(f'-I{path}' for path in include_paths()))")
 

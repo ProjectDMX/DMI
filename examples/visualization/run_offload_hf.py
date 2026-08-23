@@ -105,7 +105,7 @@ def main() -> None:
     from transformers import AutoTokenizer
     from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
 
-    from dmi.adapters.huggingface.adapter import generate_with_monitoring
+    from dmi.adapters.huggingface.generation import generate_with_monitoring
 
     db_cfg = _build_db_config()
     _wipe_my_rows(db_cfg)

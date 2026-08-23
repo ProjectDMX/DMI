@@ -1,10 +1,10 @@
-// tests/ring/test_null_mode.cu — Tests for producer null mode.
+// tests/native/ring/test_null_mode.cu — Tests for producer null mode.
 //
 // Verifies that set_ring_null_mode(true) makes producer_kernel launch with
 // the same parameters but skip all ring writes, while
 // set_ring_null_mode(false) restores normal delivery.
 //
-// Build: see tests/ring/Makefile (target: test_null_mode)
+// Build: see tests/native/ring/Makefile (target: test_null_mode)
 // Run:   ./build/test_null_mode
 
 #include "ring/ring_alloc.h"

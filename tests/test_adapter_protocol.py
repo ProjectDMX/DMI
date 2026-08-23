@@ -1,4 +1,4 @@
-"""Unit tests for BackendAdaptor step planning and commit ordering.
+"""Unit tests for BackendAdapter step planning and commit ordering.
 
 Uses fakes for MonitoringEngine, RingTransport, and RingEngine to verify
 the driver flow:
@@ -11,7 +11,7 @@ the driver flow:
     -> set_step_context -> pre_push_all_metas
 
 No GPU required; imports the native hook-definition layer through
-BackendAdaptor's ring_transport dependency.
+BackendAdapter's ring transport dependency.
 """
 from __future__ import annotations
 
@@ -21,14 +21,14 @@ import pytest
 
 try:
     from dmi.adapters.base import (
-        BackendAdaptor,
+        BackendAdapter,
         StepPlan,
         StepReservation,
     )
     from dmi.adapters.types import StepContext
     _NATIVE_IMPORT_ERROR = None
 except ImportError as exc:
-    BackendAdaptor = object
+    BackendAdapter = object
     StepContext = None
     _NATIVE_IMPORT_ERROR = exc
 
@@ -82,8 +82,8 @@ class FakeEngine:
         self._ring_engine = FakeRingEngine(prepare_step_result)
 
 
-class StubAdaptor(BackendAdaptor):
-    """Concrete BackendAdaptor with fixed StepContext + recordable callbacks."""
+class StubAdapter(BackendAdapter):
+    """Concrete BackendAdapter with fixed StepContext and recorded callbacks."""
 
     def __init__(self, engine, model_id, ctx, step_plan=(1024, 3, False)):
         super().__init__(engine, model_id)
@@ -149,7 +149,7 @@ def _make_ctx() -> StepContext:
 def _make_adaptor(prepare_result, ctx_override=..., step_plan=(1024, 3, False)):
     engine = FakeEngine(prepare_step_result=prepare_result)
     ctx = _make_ctx() if ctx_override is ... else ctx_override
-    return StubAdaptor(engine, "test_model", ctx, step_plan=step_plan)
+    return StubAdapter(engine, "test_model", ctx, step_plan=step_plan)
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +302,7 @@ def test_capacity_exceeded_result_two():
     assert a.transport.force_eager is True
     assert len(a.adapt_for_cpu_direct_calls) == 1
     assert len(a.on_capacity_exceeded_calls) == 1
-    # on_capacity_exceeded receives the post-adapt ctx (StubAdaptor.adapt_for_cpu_direct
+    # on_capacity_exceeded receives the post-adapt ctx (StubAdapter.adapt_for_cpu_direct
     # bumps q_len by 100).
     assert a.on_capacity_exceeded_calls[0].q_len == 4 + 100
     assert a.warn_calls[0][1:] == (1024, 3)

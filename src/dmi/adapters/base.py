@@ -31,12 +31,12 @@ from typing import List, NamedTuple, Optional, TYPE_CHECKING
 
 import torch
 
-from ..transport.ring import (
+from ..hooks.dispatch import install_ring_hooks
+from ..hooks.specs import (
     HookSpec,
     ModelShapeConfig,
-    _compute_hook_shape,
     align_up_py,
-    install_ring_hooks,
+    compute_hook_shape,
 )
 from ..hooks.selection import (
     apply_hook_selection,
@@ -66,7 +66,7 @@ class StepReservation(IntEnum):
     OVERSIZED = 2
 
 
-class BackendAdaptor(abc.ABC):
+class BackendAdapter(abc.ABC):
     """One adapter per attached model.
 
     Subclasses implement framework-specific shape detection, parallel-rank
@@ -154,7 +154,7 @@ class BackendAdaptor(abc.ABC):
         """Resolve shape, install hooks per the selection + PP/TP filters."""
         if self.transport is None:
             raise RuntimeError(
-                "BackendAdaptor.attach_model called before "
+                "BackendAdapter.attach_model called before "
                 "MonitoringEngine.enable_ring_transport()")
 
         cfg = self.detect_model_shape(model)
@@ -248,7 +248,7 @@ class BackendAdaptor(abc.ABC):
         Single walk over ``active_specs``:
         - ``total_bytes`` and ``hook_count`` feed ``prepare_step``.
           ``hook_count``
-          counts only specs whose ``_compute_hook_shape`` returns a
+          counts only specs whose ``compute_hook_shape`` returns a
           non-empty list -- matches the count of metas
           ``pre_push_all_metas`` will push.
         - ``needs_eager`` is the OR of ``_spec_needs_eager(spec)`` over
@@ -270,7 +270,7 @@ class BackendAdaptor(abc.ABC):
             spec_q_len = (ctx.actual_q_len if ctx.actual_q_len is not None
                           and spec.dim0_is_actual_tokens
                           else ctx.q_len)
-            shape = _compute_hook_shape(
+            shape = compute_hook_shape(
                 spec.hook_type, self.model_cfg,
                 ctx.batch, spec_q_len, ctx.kv_dim,
                 logits_to_keep=ctx.logits_to_keep,
@@ -297,9 +297,8 @@ class BackendAdaptor(abc.ABC):
         return self.plan_step(ctx)
 
 
-# Preferred spelling for new code.  Keep the original class object and name so
-# legacy reprs, pickles, and imports remain compatible.
-BackendAdapter = BackendAdaptor
+# Compatibility spelling retained for integrations written against API v1.
+BackendAdaptor = BackendAdapter
 
 
 __all__ = [

@@ -1,9 +1,11 @@
 """Hugging Face integration for DMI."""
 
 from .adapter import (
-    GreedyGenerateTimings,
     HFAdaptor,
     HuggingFaceAdapter,
+)
+from .generation import (
+    GreedyGenerateTimings,
     generate_greedy_with_monitoring,
     generate_with_monitoring,
     generate_with_monitoring_dict,

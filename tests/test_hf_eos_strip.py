@@ -1,8 +1,8 @@
-"""Unit tests for HFAdaptor's post-EOS strip in ``build_step_context``.
+"""Unit tests for HuggingFaceAdapter's post-EOS strip in ``build_step_context``.
 
 Phase 4.B verification gate.  Pure unit test against the strip logic --
 no DB, no GPU, no real model.  Reuses the FakeEngine pattern from
-``tests/test_adapter_protocol.py``.  HFAdaptor imports the native hook
+``tests/test_adapter_protocol.py``.  HuggingFaceAdapter imports the native hook
 definition layer through ring_transport, so this is not part of the
 no-native-build CPU gate.
 
@@ -24,10 +24,10 @@ import pytest
 import torch
 
 try:
-    from dmi.adapters.huggingface.adapter import HFAdaptor
+    from dmi.adapters.huggingface.adapter import HuggingFaceAdapter
     _NATIVE_IMPORT_ERROR = None
 except ImportError as exc:
-    HFAdaptor = None
+    HuggingFaceAdapter = None
     _NATIVE_IMPORT_ERROR = exc
 
 pytestmark = [
@@ -40,7 +40,7 @@ pytestmark = [
 
 
 # ---------------------------------------------------------------------------
-# Fakes (minimal -- HFAdaptor only touches a few fields)
+# Fakes (minimal -- HuggingFaceAdapter only touches a few fields)
 # ---------------------------------------------------------------------------
 
 
@@ -64,14 +64,14 @@ class FakeEngine:
         return gid
 
 
-def _make_adaptor(eos_token_id=None, no_strip_right_pad=False) -> HFAdaptor:
-    a = HFAdaptor(
+def _make_adapter(eos_token_id=None, no_strip_right_pad=False) -> HuggingFaceAdapter:
+    a = HuggingFaceAdapter(
         FakeEngine(), "test-model",
         no_strip_right_pad=no_strip_right_pad,
         eos_token_id=eos_token_id,
     )
     if eos_token_id is not None:
-        a._eos_token_ids = HFAdaptor._normalize_eos(eos_token_id)
+        a._eos_token_ids = HuggingFaceAdapter._normalize_eos(eos_token_id)
     return a
 
 
@@ -99,20 +99,20 @@ def _decode_inputs(token_ids_per_req: list[int]) -> dict:
 
 
 def test_eos_normalize_int():
-    assert HFAdaptor._normalize_eos(2) == frozenset({2})
+    assert HuggingFaceAdapter._normalize_eos(2) == frozenset({2})
 
 
 def test_eos_normalize_list():
-    assert HFAdaptor._normalize_eos([2, 5, 7]) == frozenset({2, 5, 7})
+    assert HuggingFaceAdapter._normalize_eos([2, 5, 7]) == frozenset({2, 5, 7})
 
 
 def test_eos_normalize_tensor():
     t = torch.tensor([2, 5, 7], dtype=torch.long)
-    assert HFAdaptor._normalize_eos(t) == frozenset({2, 5, 7})
+    assert HuggingFaceAdapter._normalize_eos(t) == frozenset({2, 5, 7})
 
 
 def test_eos_normalize_none():
-    assert HFAdaptor._normalize_eos(None) == frozenset()
+    assert HuggingFaceAdapter._normalize_eos(None) == frozenset()
 
 
 def test_post_eos_strip_one_step_late():
@@ -126,7 +126,7 @@ def test_post_eos_strip_one_step_late():
         req 0 stays latched, still ``(r0, r0)``.  req 1, 2 continue.
     """
     EOS = 2
-    a = _make_adaptor(eos_token_id=EOS)
+    a = _make_adapter(eos_token_id=EOS)
 
     # Prefill: real lengths [1, 3, 4] -- request 0 has 3 left-pads.
     input_ids = torch.tensor(
@@ -165,7 +165,7 @@ def test_post_eos_strip_one_step_late():
 def test_no_strip_right_pad_disables_strip():
     """no_strip_right_pad=True keeps every decode row regardless of EOS."""
     EOS = 2
-    a = _make_adaptor(eos_token_id=EOS, no_strip_right_pad=True)
+    a = _make_adapter(eos_token_id=EOS, no_strip_right_pad=True)
 
     input_ids = torch.tensor(
         [[0, 0, 0, 9], [0, 5, 5, 5], [4, 4, 4, 4]], dtype=torch.long
@@ -184,7 +184,7 @@ def test_no_strip_right_pad_disables_strip():
 
 def test_empty_eos_set_skips_detection():
     """Empty _eos_token_ids -> no .tolist() sync, no latch, never strips."""
-    a = _make_adaptor(eos_token_id=None)  # no EOS configured
+    a = _make_adapter(eos_token_id=None)  # no EOS configured
     assert a._eos_token_ids == frozenset()
 
     input_ids = torch.tensor(
@@ -204,7 +204,7 @@ def test_empty_eos_set_skips_detection():
 
 def test_multi_eos_any_match_latches():
     """Multi-EOS (frozenset of multiple ids): any match latches."""
-    a = _make_adaptor(eos_token_id=[2, 7, 11])
+    a = _make_adapter(eos_token_id=[2, 7, 11])
 
     input_ids = torch.tensor([[9], [4], [3]], dtype=torch.long)
     mask = torch.tensor([[1], [1], [1]], dtype=torch.long)
@@ -229,7 +229,7 @@ def test_resolve_eos_chain():
         config = FakeCfg()
         generation_config = FakeGenCfg()
 
-    a = HFAdaptor(FakeEngine(), "x")  # constructor arg = None
+    a = HuggingFaceAdapter(FakeEngine(), "x")  # constructor arg = None
     model = FakeModel()
 
     # Auto-detect: generation_config wins over config.
@@ -239,7 +239,7 @@ def test_resolve_eos_chain():
     assert a._resolve_eos_token_ids(model, [11, 22]) == frozenset({11, 22})
 
     # Constructor-arg wins over auto-detect.
-    a2 = HFAdaptor(FakeEngine(), "x", eos_token_id=33)
+    a2 = HuggingFaceAdapter(FakeEngine(), "x", eos_token_id=33)
     assert a2._resolve_eos_token_ids(model, None) == frozenset({33})
 
     # attach-arg overrides constructor-arg.
@@ -275,7 +275,7 @@ def test_resolve_eos_chain():
 def test_batch_resize_resets_finished_latch():
     """Mid-call batch shrink -> reset clears _batch_finished, fresh detection."""
     EOS = 2
-    a = _make_adaptor(eos_token_id=EOS)
+    a = _make_adapter(eos_token_id=EOS)
 
     # B=3 prefill + decode where req 0 latches.
     input_ids = torch.tensor(

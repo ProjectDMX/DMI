@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from ...adapters.base import (
+    BackendAdapter,
     BackendAdaptor,
     StepPlan,
     StepReservation,
@@ -19,16 +20,10 @@ from ...adapters.base import (
 from ...storage.clickhouse import CHClickhouseDriverReadOnly
 from ...config import CaptureSchedule, MonitoringConfig
 from ...engine import HostEngineConfig, MonitoringEngine, RingCapacities
+from ...hooks.dispatch import install_ring_hooks
 from ...hooks.point import HookPoint
-from ...storage.internals import (
-    IncompleteInternalError,
-    InternalRequirement,
-    InternalRequirements,
-    LazyInternal,
-    make_lazy_internal as _make_lazy_internal,
-)
-from ...transport import ring as _ring_transport
-from ...transport.ring import (
+from ...hooks import specs as _specs
+from ...hooks.specs import (
     HOOK_TYPE_ATTN_OUT,
     HOOK_TYPE_ATTN_SCORES,
     HOOK_TYPE_EMBED,
@@ -56,8 +51,15 @@ from ...transport.ring import (
     HookSpec,
     ModelShapeConfig,
     hook_row_basis,
-    install_ring_hooks,
 )
+from ...storage.internals import (
+    IncompleteInternalError,
+    InternalRequirement,
+    InternalRequirements,
+    LazyInternal,
+    make_lazy_internal as _make_lazy_internal,
+)
+from ...transport import ring as _ring_transport
 from ...hooks import selection as _selection
 from ...hooks.selection import (
     hook_belongs_to_pp_rank,
@@ -74,10 +76,10 @@ DMI_INTEGRATION_API_VERSION = 1
 
 
 # Public names for behavior that predates the versioned facade.
-compute_hook_shape = _ring_transport._compute_hook_shape
-align_up = _ring_transport.align_up_py
+compute_hook_shape = _specs.compute_hook_shape
+align_up = _specs.align_up_py
 ALL_HOOK_TYPES = _selection._ALL_HOOK_TYPES
-ATTENTION_WEIGHT_HOOK_TYPES = _ring_transport._ATTN_WT_TYPES
+ATTENTION_WEIGHT_HOOK_TYPES = _specs._ATTN_WT_TYPES
 deactivate_ring_transport = _ring_transport.deactivate
 
 
@@ -158,6 +160,7 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "DMI_INTEGRATION_API_VERSION",
+    "BackendAdapter",
     "BackendAdaptor",
     "StepPlan",
     "StepReservation",

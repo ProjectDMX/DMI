@@ -19,6 +19,8 @@ from torch import Tensor
 
 
 from ..engine import MonitoringEngine
+from .dispatch import dispatch_producer
+from .specs import HOOK_TYPE_TO_SHORT_NAME
 
 try:
     from torch.cuda import nvtx as _nvtx
@@ -81,34 +83,6 @@ HookFunction = _HookFunctionProtocol  # Callable[..., _HookFunctionProtocol]
 
 DeviceType = Optional[torch.device]
 _grad_t = Union[tuple[Tensor, ...], Tensor]
-
-
-def _dispatch_producer(
-    ring_payload: torch.Tensor,
-    x_cont: torch.Tensor,
-    strip_tensor: Optional[torch.Tensor],
-    strip_row_bytes: int,
-    hook_type: int,
-    hook_id: int,
-) -> None:
-    """Dispatch to one of three ring producer ops based on per-HookPoint
-    strip-mode state.  Module-level so torch.compile can specialize the
-    branch per HookPoint without re-tracing the function body.
-
-    `ring_payload` is the shared `Tensor(a!)` mutation alias (same
-    tensor for every call from a given engine).  Successive producer
-    calls form a real R/W chain through this tensor, which inductor
-    cannot reorder.
-    """
-    if strip_tensor is None:
-        torch.ops.ring.producer(ring_payload, x_cont, hook_type, hook_id)
-    elif strip_row_bytes > 0:
-        torch.ops.ring.producer_prefix(
-            ring_payload, x_cont, strip_tensor, strip_row_bytes,
-            hook_type, hook_id)
-    else:
-        torch.ops.ring.producer_chunked(
-            ring_payload, x_cont, strip_tensor, hook_type, hook_id)
 
 
 class HookPoint(nn.Module):
@@ -207,7 +181,6 @@ class HookPoint(nn.Module):
                 dir == "bwd"
             ):  # For a backwards hook, module_output is a tuple of (grad,) - I don't know why.
                 module_output = module_output[0]
-            from ..transport.ring import HOOK_TYPE_TO_SHORT_NAME
             ht = self._ring_hook_type
             if ht is not None:
                 hook_label = f"{HOOK_TYPE_TO_SHORT_NAME.get(ht, ht)}@L{self._ring_hook_id}"
@@ -312,13 +285,13 @@ class HookPoint(nn.Module):
                 nbytes = x_cont.nbytes
                 if nbytes <= engine.available_capacity():
                     engine.reserve_one(nbytes)
-                    _dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
-                                       self._ring_hook_type, self._ring_hook_id)
+                    dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
+                                      self._ring_hook_type, self._ring_hook_id)
                 elif nbytes <= engine.payload_cap():
                     engine.flush_and_wait()
                     engine.reserve_one(nbytes)
-                    _dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
-                                       self._ring_hook_type, self._ring_hook_id)
+                    dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
+                                      self._ring_hook_type, self._ring_hook_id)
                 else:
                     # Single tensor larger than the whole ring -- bypass via
                     # cpu_direct.  Flush first so submit_cpu_direct consumes
@@ -336,8 +309,8 @@ class HookPoint(nn.Module):
         # Fast path: torch.compile-serializable, CUDA-graph captureable.
         # C++ ring_producer_* impls no-op when g_active_engine is null
         # (monitoring inactive); otherwise launch the producer kernel.
-        _dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
-                           self._ring_hook_type, self._ring_hook_id)
+        dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
+                          self._ring_hook_type, self._ring_hook_id)
         return x_cont
 
     def layer(self):

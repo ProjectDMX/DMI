@@ -15,7 +15,7 @@ python benchmarks/scripts/hf_generate.py \
 
 ## DMI monitoring (transport only or with persistence)
 
-Both flows go through `benchmark.bench_hf_transport`. Pick the mode that
+Both flows go through `benchmarks.bench_hf_transport`. Pick the mode that
 matches whether you want to persist captures:
 
 - `ring_null` — Ring² capture + transport, drop on the host. Isolates transport

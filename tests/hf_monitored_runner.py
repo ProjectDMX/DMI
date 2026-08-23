@@ -20,7 +20,7 @@ def main():
 
     from dmi import MonitoringEngine
     from dmi.transport.native import ClickHouseClientConfig
-    from dmi.adapters.huggingface.adapter import generate_with_monitoring
+    from dmi.adapters.huggingface.generation import generate_with_monitoring
     from transformers import AutoTokenizer
 
     # Config from env (same vars as the test)

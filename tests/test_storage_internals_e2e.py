@@ -47,7 +47,7 @@ def deps():
         from dmi.transport.native import ClickHouseClientConfig, StageConfig
         from dmi.storage.clickhouse import CHClickhouseDriverReadOnly
         from dmi.storage.internals import get_internal
-        from dmi.adapters.huggingface.adapter import generate_with_monitoring_dict
+        from dmi.adapters.huggingface.generation import generate_with_monitoring_dict
         import clickhouse_driver
     except Exception as exc:
         pytest.skip(f"DMI HF stack unavailable: {exc}")

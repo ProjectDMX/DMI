@@ -39,12 +39,13 @@ def _load_extension() -> Any:
     # Only load an already-built extension from this repository tree.
     pkg_dir = Path(__file__).resolve().parent
     package_root = pkg_dir.parent
-    repo_root = package_root.parent
+    source_root = package_root.parent
+    repo_root = source_root.parent if source_root.name == "src" else source_root
     native_dir = repo_root / "native"
     native_build_dir = native_dir / "build"
     candidates = []
     seen = set()
-    # The build writes the importable artifact into ``dmi/`` and keeps a local
+    # The build writes the importable artifact into ``src/dmi/`` and keeps a local
     # copy under ``native/``. Additional development locations are included so
     # incremental builds remain discoverable without installation.
     search_dirs = (

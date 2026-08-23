@@ -34,7 +34,7 @@ An integration follows this order:
 
 1. Create the optional ClickHouse host pipeline.
 2. Create one `MonitoringEngine`, which starts the host pipeline and GPU ring.
-3. Construct a framework-specific `BackendAdaptor` subclass.
+3. Construct a framework-specific `BackendAdapter` subclass.
 4. Call `attach_model()` after model loading and before compilation, warmup, or
    a monitored forward.
 5. If the framework performs warmup or graph capture, call
@@ -265,14 +265,17 @@ re-enabling or replacing the ring, recreating the adaptor, and reinstalling
 hooks. `set_capture_enabled(True)` does not reverse this teardown operation.
 This is teardown plumbing, not a substitute for `MonitoringEngine.close()`.
 
-### `BackendAdaptor`
+### `BackendAdapter`
 
 ```python
-BackendAdaptor(engine: MonitoringEngine, model_id: str)
+BackendAdapter(engine: MonitoringEngine, model_id: str)
 ```
 
 This abstract base implements hook attachment and the shared pre-forward
 driver. A framework integration implements:
+
+`BackendAdaptor` remains a compatibility alias for integrations written
+against the original API v1 spelling.
 
 ```python
 detect_model_shape(self, model) -> ModelShapeConfig

@@ -30,7 +30,7 @@ def main():
     from dmi import MonitoringEngine, MonitoringConfig, HostEngineConfig
     from dmi.transport.native import ClickHouseClientConfig, StageConfig, RingConfig
     from dmi.config import CaptureSchedule
-    from dmi.adapters.huggingface.adapter import generate_with_monitoring
+    from dmi.adapters.huggingface.generation import generate_with_monitoring
     from transformers import AutoTokenizer
 
     model_key = os.environ.get("E2E_MODEL", "gpt2")
@@ -238,7 +238,7 @@ class _StepSaver:
 
     def save_step(self):
         # Per the unified-adaptor refactor (commit e64a0aa79), per-batch
-        # request tracking moved off MonitoringEngine onto HFAdaptor.
+        # request tracking moved off MonitoringEngine onto HuggingFaceAdapter.
         # generate_with_monitoring now stashes the adaptor on the engine
         # as ``_hf_adaptor`` so external test harnesses can reach it.
         adaptor = getattr(self.engine, "_hf_adaptor", None)

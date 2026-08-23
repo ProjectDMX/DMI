@@ -16,11 +16,11 @@ def _mods() -> SimpleNamespace:
         from transformers.models.qwen2_moe_p.modeling_qwen2_moe import HookedQwen2MoeForCausalLM
 
         from dmi.adapters.huggingface.model_shape import _make_model_shape_from_hf_config
-        from dmi.transport.ring import (
+        from dmi.hooks.specs import (
             HOOK_TYPE_ROUTER_LOGITS,
             HOOK_TYPE_TOPK_IDS,
             HOOK_TYPE_TOPK_WEIGHTS,
-            _compute_hook_shape,
+            compute_hook_shape,
             _id_by_short,
         )
     except ImportError as exc:
@@ -53,13 +53,13 @@ def test_moe_v1_routing_shapes_from_qwen2_moe_config() -> None:
     q_len = 17
     kv_dim = 17
 
-    assert m._compute_hook_shape(
+    assert m.compute_hook_shape(
         m.HOOK_TYPE_ROUTER_LOGITS, model_shape, batch=0, q_len=q_len, kv_dim=kv_dim
     ) == [q_len, 60]
-    assert m._compute_hook_shape(
+    assert m.compute_hook_shape(
         m.HOOK_TYPE_TOPK_IDS, model_shape, batch=0, q_len=q_len, kv_dim=kv_dim
     ) == [q_len, 4]
-    assert m._compute_hook_shape(
+    assert m.compute_hook_shape(
         m.HOOK_TYPE_TOPK_WEIGHTS, model_shape, batch=0, q_len=q_len, kv_dim=kv_dim
     ) == [q_len, 4]
 

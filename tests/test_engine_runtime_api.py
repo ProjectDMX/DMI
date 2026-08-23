@@ -1,5 +1,6 @@
 """Focused tests for MonitoringEngine's narrow ring runtime surface."""
 
+import os
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError
@@ -211,6 +212,7 @@ def test_plain_dmi_import_does_not_load_native_or_transport_modules():
             ),
         ],
         cwd=repo_root,
+        env={**os.environ, "PYTHONPATH": str(repo_root / "src")},
         check=False,
         capture_output=True,
         text=True,

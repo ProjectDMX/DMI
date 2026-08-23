@@ -59,7 +59,7 @@ enum HookType : int {
 // Hook group — which sub-block produces this tensor.
 enum HookGroup : int { GROUP_ATTN = 0, GROUP_MLP = 1, GROUP_OTHER = 2 };
 
-// Shape class — determines the shape formula in _compute_hook_shape:
+// Shape class — determines the shape formula in compute_hook_shape:
 //   SHAPE_HIDDEN   : [batch, q_len, hidden_dim]
 //   SHAPE_QKV_Q    : [batch, q_len, num_heads/tp, head_dim]
 //   SHAPE_QKV_KV   : [batch, q_len, kv_heads/tp, head_dim]

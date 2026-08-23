@@ -61,7 +61,7 @@ class MonitoringConfig:
     ``debug``) were moved out in the Phase 4 cleanup:
       * ``no_strip_left_pad`` is now an explicit kwarg on the HF entry
         points (``generate_with_monitoring``,
-        ``generate_greedy_with_monitoring``, ``HFAdaptor.attach_model``).
+        ``generate_greedy_with_monitoring``, ``HuggingFaceAdapter.attach_model``).
       * NVTX ranges are toggled via
         ``dmi.hooks.set_monitoring_debug(True)``.
     """

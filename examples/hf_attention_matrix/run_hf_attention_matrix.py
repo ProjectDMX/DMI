@@ -82,7 +82,7 @@ def main() -> None:
 
     import matplotlib.pyplot as plt
 
-    from dmi.adapters.huggingface.adapter import generate_with_monitoring_dict
+    from dmi.adapters.huggingface.generation import generate_with_monitoring_dict
     from dmi import HostEngineConfig, MonitoringConfig, MonitoringEngine
     from dmi.transport.native import StageConfig
     from dmi.config import CaptureSchedule

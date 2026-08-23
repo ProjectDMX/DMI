@@ -1,4 +1,4 @@
-// tests/ring/test_rings.cu — Standalone CUDA unit tests for ring primitives.
+// tests/native/ring/test_rings.cu — Standalone CUDA unit tests for ring primitives.
 //
 // Covers all Milestone 1 acceptance criteria:
 //   - Payload wrap correctness (two-span)
@@ -6,8 +6,8 @@
 //   - ready_seq guard: consumer cannot read unpublished slot
 //   - DROP marker correctness
 //
-// Build with: make -C tests/ring
-// Run with:   ./tests/ring/test_rings
+// Build with: make -C tests/native/ring
+// Run with:   ./tests/native/ring/build/test_rings
 
 #include <cstdint>
 #include <cstdio>
@@ -18,10 +18,10 @@
 #include <cuda_runtime.h>
 
 // Include the ring headers under test.
-#include "../../native/csrc/ring/task_entry.h"
-#include "../../native/csrc/ring/ring_config.h"
-#include "../../native/csrc/ring/payload_ring.cuh"
-#include "../../native/csrc/ring/task_ring.cuh"
+#include "../../../native/csrc/ring/task_entry.h"
+#include "../../../native/csrc/ring/ring_config.h"
+#include "../../../native/csrc/ring/payload_ring.cuh"
+#include "../../../native/csrc/ring/task_ring.cuh"
 
 // ---------------------------------------------------------------------------
 // Helpers

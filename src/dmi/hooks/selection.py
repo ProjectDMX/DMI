@@ -1,7 +1,7 @@
 """Hook selection policy: presets, resolution, and PP/TP filters.
 
-The catalog-derived constants live in :mod:`dmi.transport.ring`; this module
-owns the policy layer that decides which hooks to enable in a configuration.
+Catalog-derived constants and specification types live in
+:mod:`dmi.hooks.specs`; this module decides which hooks to enable.
 
 Adapters extend the preset table at import time via ``register_preset``.
 """
@@ -9,10 +9,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, TYPE_CHECKING
 
-# Import catalog-derived constants from the transport module. These describe
-# the universe of hooks; selection policy lives here. Importing them does not
-# load the native extension.
-from ..transport.ring import (
+# These describe the universe of hooks without importing a transport runtime.
+from .specs import (
     _id_by_short,
     _ATTN_WT_TYPES,
     HOOK_TYPE_RESID_PRE,
@@ -29,7 +27,7 @@ from ..transport.ring import (
 )
 
 if TYPE_CHECKING:
-    from ..transport.ring import HookSpec, ModelShapeConfig
+    from .specs import HookSpec, ModelShapeConfig
 
 
 # ---------------------------------------------------------------------------

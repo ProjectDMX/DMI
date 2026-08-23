@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 import pytest
@@ -21,8 +22,12 @@ def test_canonical_core_types_are_available():
 
 
 def test_adapter_exports_preferred_and_existing_class_names():
+    from dmi.adapters import BackendAdapter, BackendAdaptor
     from dmi.adapters.huggingface import HFAdaptor, HuggingFaceAdapter
 
+    assert BackendAdapter.__name__ == "BackendAdapter"
+    assert BackendAdapter is BackendAdaptor
+    assert HuggingFaceAdapter.__name__ == "HuggingFaceAdapter"
     assert HuggingFaceAdapter is HFAdaptor
 
 
@@ -36,8 +41,16 @@ def test_source_tree_has_no_legacy_top_level_directories():
         "benchmark",
         "example",
         "Figures",
+        "dmi",
     )
-    canonical_names = ("dmi", "native", "third_party", "benchmarks", "examples")
+    canonical_names = (
+        "src/dmi",
+        "native",
+        "third_party",
+        "benchmarks",
+        "examples",
+        "tests/native/ring",
+    )
 
     assert all(not (repo_root / name).exists() for name in legacy_names)
     assert all((repo_root / name).is_dir() for name in canonical_names)
@@ -56,6 +69,7 @@ def test_plain_dmi_import_does_not_load_native_transport():
             ),
         ],
         cwd=repo_root,
+        env={**os.environ, "PYTHONPATH": str(repo_root / "src")},
         check=False,
         capture_output=True,
         text=True,

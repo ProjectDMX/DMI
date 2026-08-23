@@ -146,7 +146,7 @@ make -C native -j
 ```
 
 Artifacts are emitted as `_native_backend.<EXT_SUFFIX>.so` inside `native/`
-and as the importable `dmi/_native_backend.<EXT_SUFFIX>.so`.
+and as the importable `src/dmi/_native_backend.<EXT_SUFFIX>.so`.
 
 Smoke check (loads the built `.so`):
 

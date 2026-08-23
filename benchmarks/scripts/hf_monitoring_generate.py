@@ -27,7 +27,7 @@ from dmi import (
 )
 from dmi.config import CaptureSchedule
 from dmi.hooks.point import set_monitoring_debug
-from dmi.adapters.huggingface.adapter import generate_with_monitoring
+from dmi.adapters.huggingface.generation import generate_with_monitoring
 
 _MODEL_ALIASES = {
     # Convenience alias used in benchmark CLI.

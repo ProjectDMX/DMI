@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dmi.adapters.huggingface import adapter as hf_adapter
+from dmi.adapters.huggingface import generation as hf_generation
 from dmi.storage.internals import InternalRequirements
 
 
@@ -12,9 +12,9 @@ def test_generate_with_monitoring_returns_impl_output_unchanged(monkeypatch):
     def fake_impl(model, *args, **kwargs):
         return expected
 
-    monkeypatch.setattr(hf_adapter, "_generate_with_monitoring_impl", fake_impl)
+    monkeypatch.setattr(hf_generation, "_generate_with_monitoring_impl", fake_impl)
 
-    assert hf_adapter.generate_with_monitoring(object(), max_new_tokens=1) is expected
+    assert hf_generation.generate_with_monitoring(object(), max_new_tokens=1) is expected
 
 
 def test_generate_with_monitoring_dict_forces_dict_and_attaches_lazy(monkeypatch):
@@ -27,9 +27,9 @@ def test_generate_with_monitoring_dict_forces_dict_and_attaches_lazy(monkeypatch
         captured.update(kwargs)
         return output, "run-id", ("0:0",), {"0:0": ((0, 2),)}
 
-    monkeypatch.setattr(hf_adapter, "_generate_with_monitoring_impl", fake_impl)
+    monkeypatch.setattr(hf_generation, "_generate_with_monitoring_impl", fake_impl)
 
-    result = hf_adapter.generate_with_monitoring_dict(
+    result = hf_generation.generate_with_monitoring_dict(
         object(),
         max_new_tokens=1,
         reader=reader,
@@ -56,10 +56,10 @@ def test_generate_with_monitoring_dict_warns_when_false_is_overridden(monkeypatc
         captured.update(kwargs)
         return output, "run-id", (), {}
 
-    monkeypatch.setattr(hf_adapter, "_generate_with_monitoring_impl", fake_impl)
+    monkeypatch.setattr(hf_generation, "_generate_with_monitoring_impl", fake_impl)
 
     with pytest.warns(UserWarning, match="overriding the supplied False value"):
-        hf_adapter.generate_with_monitoring_dict(
+        hf_generation.generate_with_monitoring_dict(
             object(),
             return_dict_in_generate=False,
         )

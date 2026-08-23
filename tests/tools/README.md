@@ -23,7 +23,7 @@ LD_PRELOAD=/path/to/libstdc++.so.6 CUDA_VISIBLE_DEVICES=0,1 \
   bash tests/tools/run_regression.sh
 ```
 
-> Native CUDA ring tests live separately under `tests/ring/` (built via its
+> Native CUDA ring tests live separately under `tests/native/ring/` (built via its
 > `Makefile`, marker `ring_native`, needs `nvcc`) and are likewise excluded from
 > default pytest discovery.
 

@@ -1,7 +1,7 @@
-// tests/ring/test_producer.cu — M2 producer kernel correctness tests.
+// tests/native/ring/test_producer.cu — M2 producer kernel correctness tests.
 //
-// Build:  make -C tests/ring test_producer
-// Run:    ./tests/ring/build/test_producer
+// Build:  make -C tests/native/ring test_producer
+// Run:    ./tests/native/ring/build/test_producer
 //
 // All GPU tests run sequentially on a single stream (cudaStreamDefault) because
 // this GPU serialises kernels from the same process even across streams.

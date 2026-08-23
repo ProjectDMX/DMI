@@ -1,4 +1,4 @@
-// tests/ring/test_ring_engine.cu — End-to-end tests for the ring drain pipeline.
+// tests/native/ring/test_ring_engine.cu — End-to-end tests for the ring drain pipeline.
 //
 // Tests the full path:
 //   GPU producer kernel  →  drain thread (batch D2H into pinned staging)

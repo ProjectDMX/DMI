@@ -55,6 +55,7 @@ _HOOK_EXPORTS = {
 
 _NON_HOOK_EXPORTS = {
     "DMI_INTEGRATION_API_VERSION",
+    "BackendAdapter",
     "BackendAdaptor",
     "StepPlan",
     "StepReservation",
@@ -117,14 +118,16 @@ def test_v1_reexports_existing_objects_and_state() -> None:
     from dmi.storage import clickhouse
     from dmi import config
     from dmi import engine
+    from dmi.hooks import dispatch
     from dmi.hooks import point
+    from dmi.hooks import specs
     from dmi.storage import internals
-    from dmi.transport import ring
     from dmi.hooks import selection
     from dmi.adapters import types
     from dmi.api import v1
 
-    assert v1.BackendAdaptor is adapter_base.BackendAdaptor
+    assert v1.BackendAdapter is adapter_base.BackendAdapter
+    assert v1.BackendAdaptor is v1.BackendAdapter
     assert v1.StepPlan is adapter_base.StepPlan
     assert v1.StepReservation is adapter_base.StepReservation
     assert v1.StepContext is types.StepContext
@@ -134,11 +137,11 @@ def test_v1_reexports_existing_objects_and_state() -> None:
     assert v1.CaptureSchedule is config.CaptureSchedule
     assert v1.HostEngineConfig is engine.HostEngineConfig
     assert v1.HookPoint is point.HookPoint
-    assert v1.HookSpec is ring.HookSpec
-    assert v1.HookRowBasis is ring.HookRowBasis
-    assert v1.ModelShapeConfig is ring.ModelShapeConfig
-    assert v1.hook_row_basis is ring.hook_row_basis
-    assert v1.install_ring_hooks is ring.install_ring_hooks
+    assert v1.HookSpec is specs.HookSpec
+    assert v1.HookRowBasis is specs.HookRowBasis
+    assert v1.ModelShapeConfig is specs.ModelShapeConfig
+    assert v1.hook_row_basis is specs.hook_row_basis
+    assert v1.install_ring_hooks is dispatch.install_ring_hooks
     assert v1.register_preset is selection.register_preset
     assert v1.select_hook_specs is selection.select_hook_specs
     assert v1.hook_belongs_to_pp_rank is selection.hook_belongs_to_pp_rank
@@ -161,7 +164,7 @@ def test_v1_reexports_existing_objects_and_state() -> None:
     )
 
     for name in _HOOK_EXPORTS:
-        assert getattr(v1, name) == getattr(ring, name)
+        assert getattr(v1, name) == getattr(specs, name)
 
     native = _native_engine._load_extension()
     for name in {
@@ -204,8 +207,8 @@ def test_v1_public_surface_is_documented() -> None:
 
 
 def test_v1_public_names_preserve_existing_shape_and_selection_behavior() -> None:
-    from dmi.transport import ring as ring_transport
     from dmi.hooks import selection
+    from dmi.hooks import specs
     from dmi.api import v1
 
     cfg = v1.ModelShapeConfig(
@@ -219,12 +222,10 @@ def test_v1_public_names_preserve_existing_shape_and_selection_behavior() -> Non
         tp_size=2,
     )
     args = (v1.HOOK_TYPE_Q, cfg, 0, 7, 11)
-    assert v1.compute_hook_shape(*args) == ring_transport._compute_hook_shape(
-        *args
-    )
-    assert v1.align_up(33, 16) == ring_transport.align_up_py(33, 16)
+    assert v1.compute_hook_shape(*args) == specs.compute_hook_shape(*args)
+    assert v1.align_up(33, 16) == specs.align_up_py(33, 16)
     assert v1.ALL_HOOK_TYPES == selection._ALL_HOOK_TYPES
-    assert v1.ATTENTION_WEIGHT_HOOK_TYPES == ring_transport._ATTN_WT_TYPES
+    assert v1.ATTENTION_WEIGHT_HOOK_TYPES == specs._ATTN_WT_TYPES
     assert v1.is_preset_registered("full")
     assert not v1.is_preset_registered("not-a-real-preset")
 

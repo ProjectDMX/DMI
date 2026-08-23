@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 import torch
 
-from ...transport.ring import ModelShapeConfig
+from ...hooks.specs import ModelShapeConfig
 
 
 def _make_model_shape_from_hf_config(

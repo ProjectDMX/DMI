@@ -1,7 +1,7 @@
 """Shared per-forward-pass metadata produced by framework adapters.
 
 Carved out as part of the unified-adaptor refactor (Phase 1).  Every
-``BackendAdaptor.build_step_context`` returns one of these objects; the
+``BackendAdapter.build_step_context`` returns one of these objects; the
 driver feeds it to ``RingTransport.set_step_context`` and
 ``RingTransport.pre_push_all_metas``.
 
