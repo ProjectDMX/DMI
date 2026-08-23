@@ -47,19 +47,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 _COMPARE_MODEL_PATHS = {
     ("hf", "gpt2"): (
         REPO_ROOT
-        / "integration/transformers/src/transformers/models/gpt2_compare/modeling_gpt2.py"
+        / "third_party/transformers/src/transformers/models/gpt2_compare/modeling_gpt2.py"
     ),
     ("hf", "qwen3"): (
         REPO_ROOT
-        / "integration/transformers/src/transformers/models/qwen3_compare/modeling_qwen3.py"
+        / "third_party/transformers/src/transformers/models/qwen3_compare/modeling_qwen3.py"
     ),
     ("hf", "llama"): (
         REPO_ROOT
-        / "integration/transformers/src/transformers/models/llama_compare/modeling_llama.py"
+        / "third_party/transformers/src/transformers/models/llama_compare/modeling_llama.py"
     ),
     ("hf", "qwen2_moe"): (
         REPO_ROOT
-        / "integration/transformers/src/transformers/models/qwen2_moe_compare/modeling_qwen2_moe.py"
+        / "third_party/transformers/src/transformers/models/qwen2_moe_compare/modeling_qwen2_moe.py"
     ),
 }
 

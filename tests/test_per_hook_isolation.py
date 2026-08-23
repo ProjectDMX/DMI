@@ -341,10 +341,10 @@ _HF_RUNNER = dedent("""
     if args.rollout == 'ours':
         # Drive monitoring through HFAdaptor with hook_selection=H.  The
         # ring transport runs without ClickHouse (no db_config).
-        from monitoring import MonitoringEngine, MonitoringConfig
-        from monitoring.config import CaptureSchedule
-        from monitoring._native_engine import RingConfig
-        from integration.hf_adapter import generate_with_monitoring
+        from dmi import MonitoringEngine, MonitoringConfig
+        from dmi.config import CaptureSchedule
+        from dmi.transport.native import RingConfig
+        from dmi.adapters.huggingface.adapter import generate_with_monitoring
         cfg = MonitoringConfig(schedule=CaptureSchedule(capture_prefill=True, capture_decode=True))
         engine = MonitoringEngine(config=cfg, model_id='per_hook_isolation')
         ring_cfg = RingConfig()

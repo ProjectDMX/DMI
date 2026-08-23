@@ -83,8 +83,8 @@ pytestmark = [
     pytest.mark.hf,
 ]
 
-from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
-from monitoring.segment_merger import merge_segments, parse_internal_id
+from dmi.storage.clickhouse import CHClickhouseDriverReadOnly
+from dmi.storage.reassembly import merge_segments, parse_internal_id
 
 from .hf_reference import (
     _HFGenRef,
@@ -167,7 +167,7 @@ def _canon_layer_and_act(act_name_raw: str, layer_no_raw: int) -> Tuple[int, str
 
 def _make_ring_cfg():
     """Build RingConfig from E2E_RING_* environment variables."""
-    from monitoring._native_engine import RingConfig  # type: ignore
+    from dmi.transport.native import RingConfig  # type: ignore
     rc = RingConfig()
     rc.task_ring_entries          = int(os.environ.get("E2E_RING_TASK_ENTRIES", "16384"))
     rc.payload_ring_bytes         = int(os.environ.get("E2E_RING_PAYLOAD_BYTES", str(4 * 1024**3)))
@@ -186,8 +186,8 @@ def _make_ring_cfg():
 
 def _make_host_cfg(db_cfg_native):
     """Build HostEngineConfig with clickhouse insert stage from env vars."""
-    from monitoring import HostEngineConfig  # type: ignore
-    from monitoring._native_engine import StageConfig  # type: ignore
+    from dmi import HostEngineConfig  # type: ignore
+    from dmi.transport.native import StageConfig  # type: ignore
     parallelism = int(os.environ.get("E2E_CH_PARALLELISM", "10"))
     stage = StageConfig.clickhouse_insert(db_cfg_native, parallelism=parallelism,
                                           name="clickhouse_insert")
@@ -280,13 +280,13 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
         pytest.skip("clickhouse-driver is required")
 
     try:
-        from monitoring import (  # type: ignore
+        from dmi import (  # type: ignore
             MonitoringConfig,
             MonitoringEngine,
         )
-        from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
-        from monitoring.config import CaptureSchedule  # type: ignore
-        from integration.hf_adapter import generate_with_monitoring  # type: ignore
+        from dmi.transport.native import ClickHouseClientConfig  # type: ignore
+        from dmi.config import CaptureSchedule  # type: ignore
+        from dmi.adapters.huggingface.adapter import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
 
@@ -411,7 +411,7 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
         engine.close()
 
     # -----------------------------------------------------------------------
-    # Read DB (monitoring.clickhouse_reader + monitoring.segment_merger)
+    # Read DB (dmi.storage.clickhouse + dmi.storage.reassembly)
     # -----------------------------------------------------------------------
 
     ch = CHClickhouseDriverReadOnly(
@@ -861,13 +861,13 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
         pytest.skip("clickhouse-driver is required")
 
     try:
-        from monitoring import (  # type: ignore
+        from dmi import (  # type: ignore
             MonitoringConfig,
             MonitoringEngine,
         )
-        from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
-        from monitoring.config import CaptureSchedule  # type: ignore
-        from integration.hf_adapter import generate_with_monitoring  # type: ignore
+        from dmi.transport.native import ClickHouseClientConfig  # type: ignore
+        from dmi.config import CaptureSchedule  # type: ignore
+        from dmi.adapters.huggingface.adapter import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
 
@@ -993,8 +993,8 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     # -----------------------------------------------------------------------
     # Read DB
     # -----------------------------------------------------------------------
-    from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
-    from monitoring.segment_merger import merge_segments, parse_internal_id
+    from dmi.storage.clickhouse import CHClickhouseDriverReadOnly
+    from dmi.storage.reassembly import merge_segments, parse_internal_id
 
     ch = CHClickhouseDriverReadOnly(
         host=str(db_cfg_native.host),
@@ -1359,13 +1359,13 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
         pytest.skip("clickhouse-driver is required")
 
     try:
-        from monitoring import (  # type: ignore
+        from dmi import (  # type: ignore
             MonitoringConfig,
             MonitoringEngine,
         )
-        from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
-        from monitoring.config import CaptureSchedule  # type: ignore
-        from integration.hf_adapter import generate_with_monitoring  # type: ignore
+        from dmi.transport.native import ClickHouseClientConfig  # type: ignore
+        from dmi.config import CaptureSchedule  # type: ignore
+        from dmi.adapters.huggingface.adapter import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import sys
+import importlib
 from typing import Any, Optional, Sequence
 
 from .config import MonitoringConfig
@@ -13,23 +13,13 @@ DEFAULT_DRAIN_FLUSH_TIMEOUT_US = 0
 
 
 def _native_module() -> Any:
-    """Resolve the native module, honoring legacy test/integration overrides."""
-    legacy = sys.modules.get("monitoring._native_engine")
-    if legacy is not None:
-        return legacy
-    from .transport import native
-
-    return native
+    """Load the native-extension facade only when the engine needs it."""
+    return importlib.import_module("dmi.transport.native")
 
 
 def _ring_module() -> Any:
-    """Resolve the ring module, honoring legacy test/integration overrides."""
-    legacy = sys.modules.get("monitoring.ring_transport")
-    if legacy is not None:
-        return legacy
-    from .transport import ring
-
-    return ring
+    """Load the ring transport only when the engine needs it."""
+    return importlib.import_module("dmi.transport.ring")
 
 
 @dataclass(frozen=True, slots=True)

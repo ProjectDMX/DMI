@@ -1,8 +1,8 @@
-"""Unit tests for monitoring.internal_mapper -- pure reassembly logic, no DB."""
+"""Unit tests for dmi.storage.internals -- pure reassembly logic, no DB."""
 import pytest
 import torch
 
-from monitoring.internal_mapper import (
+from dmi.storage.internals import (
     IncompleteInternalError,
     InternalRequirements,
     get_internal,

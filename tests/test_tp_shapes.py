@@ -9,7 +9,7 @@ import pytest
 import torch
 
 try:
-    from monitoring.ring_transport import (
+    from dmi.transport.ring import (
         HOOK_TYPE_RESID_PRE,
         HOOK_TYPE_LN1,
         HOOK_TYPE_ATTN_OUT,

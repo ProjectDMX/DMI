@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from monitoring.engine import MonitoringEngine, RingCapacities
+from dmi.engine import MonitoringEngine, RingCapacities
 
 pytestmark = pytest.mark.cpu
 
@@ -143,8 +143,6 @@ def test_close_restores_device_global_null_mode_before_ring_stop():
 
 
 def test_replacing_disabled_ring_restores_native_null_mode(monkeypatch):
-    import monitoring
-
     engine, _transport, old_ring = _engine_with_fake_ring(null_offload=True)
     new_ring = _FakeRingEngine()
     activated = []
@@ -160,28 +158,21 @@ def test_replacing_disabled_ring_restores_native_null_mode(monkeypatch):
         def set_model_cfg(self, _model_shape):
             pass
 
-    fake_transport_module = ModuleType("monitoring.ring_transport")
+    fake_transport_module = ModuleType("dmi.transport.ring")
     fake_transport_module.RingTransport = _FakeTransport
     fake_transport_module.activate = activated.append
     fake_transport_module.deactivate = lambda: deactivated.append(True)
 
-    fake_native_module = ModuleType("monitoring._native_engine")
+    fake_native_module = ModuleType("dmi.transport.native")
     fake_native_module.RingEngine = lambda _config, _host: new_ring
     fake_native_module.DMXHostEngine = type("DMXHostEngine", (), {})
 
     monkeypatch.setitem(
-        sys.modules, "monitoring.ring_transport", fake_transport_module
+        sys.modules, "dmi.transport.ring", fake_transport_module
     )
     monkeypatch.setitem(
-        sys.modules, "monitoring._native_engine", fake_native_module
+        sys.modules, "dmi.transport.native", fake_native_module
     )
-    monkeypatch.setattr(
-        monitoring, "ring_transport", fake_transport_module, raising=False
-    )
-    monkeypatch.setattr(
-        monitoring, "_native_engine", fake_native_module, raising=False
-    )
-
     engine.enable_ring_transport(object())
 
     assert old_ring.null_mode_calls == [(False, True, False)]
@@ -207,16 +198,16 @@ def test_ring_runtime_api_requires_an_enabled_transport():
         engine.set_capture_enabled(True)
 
 
-def test_plain_monitoring_import_does_not_load_native_or_transport_modules():
+def test_plain_dmi_import_does_not_load_native_or_transport_modules():
     repo_root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import sys; import monitoring; "
-                "assert 'monitoring._native_engine' not in sys.modules; "
-                "assert 'monitoring.ring_transport' not in sys.modules"
+                "import sys; import dmi; "
+                "assert 'dmi.transport.native' not in sys.modules; "
+                "assert 'dmi.transport.ring' not in sys.modules"
             ),
         ],
         cwd=repo_root,

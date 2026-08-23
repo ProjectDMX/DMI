@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -15,28 +15,17 @@ dependencies = { file = ["requirements.txt"] }
 [tool.setuptools]
 include-package-data = true
 
-[tool.setuptools.package-data]
-monitoring = [
-    "csrc/*.cpp",    "csrc/*.h",    "csrc/*.hpp",
-    "csrc/*.cu",     "csrc/*.cuh",
-    "csrc/**/*.cpp", "csrc/**/*.h", "csrc/**/*.hpp",
-    "csrc/**/*.cu",  "csrc/**/*.cuh",
-    "Makefile",
-]
-
 [tool.setuptools.packages.find]
-# ``dmi`` is the canonical package. ``monitoring`` and ``integration`` remain
-# compatibility namespaces for the 1.x API. Using ``integration`` without a
-# wildcard keeps the separately distributed framework submodules out of the
-# DMI wheel.
-include = ["dmi*", "monitoring*", "benchmarks*", "integration"]
+# Runtime code has one canonical namespace. Native sources and external
+# repositories live under ``native/`` and ``third_party/``.
+include = ["dmi*", "benchmarks*"]
 
 [tool.pytest.ini_options]
 # `manual` tools and native-ring sources are not collected by default. The
 # lightweight PR gate should select true CPU tests explicitly:
 #   python -m pytest -m "cpu" -q
 addopts = "-ra -m 'not manual'"
-norecursedirs = ["tests/tools", "tests/ring", ".venv", "integration", "build"]
+norecursedirs = ["tests/tools", "tests/ring", ".venv", "native", "third_party", "build"]
 markers = [
     "cpu: pure-CPU contract/unit test (no CUDA / ClickHouse / model weights / native extension build required)",
     "gpu: requires a CUDA device",

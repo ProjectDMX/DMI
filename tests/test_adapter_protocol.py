@@ -20,12 +20,12 @@ import dataclasses
 import pytest
 
 try:
-    from monitoring.adaptor_base import (
+    from dmi.adapters.base import (
         BackendAdaptor,
         StepPlan,
         StepReservation,
     )
-    from monitoring.step_context import StepContext
+    from dmi.adapters.types import StepContext
     _NATIVE_IMPORT_ERROR = None
 except ImportError as exc:
     BackendAdaptor = object
@@ -381,7 +381,7 @@ def test_null_offload_short_circuits():
 def test_register_preset_raises_on_duplicate():
     """selection.register_preset is strict-by-default."""
     import pytest
-    from monitoring import selection
+    from dmi.hooks import selection
 
     # "full" is registered at module load -- re-registering must raise.
     with pytest.raises(ValueError, match="already registered"):
@@ -390,7 +390,7 @@ def test_register_preset_raises_on_duplicate():
 
 def test_register_preset_adds_new_name():
     """A novel name registers successfully and is resolvable."""
-    from monitoring import selection
+    from dmi.hooks import selection
 
     name = "_test_phase1_preset"
     assert name not in selection._HOOK_SELECTIONS

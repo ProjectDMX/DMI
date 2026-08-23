@@ -1,4 +1,4 @@
-"""Package-layout and legacy-import compatibility checks."""
+"""Canonical package and clean source-tree layout checks."""
 
 from __future__ import annotations
 
@@ -11,26 +11,36 @@ import pytest
 pytestmark = pytest.mark.cpu
 
 
-def test_canonical_and_legacy_core_types_are_identical():
-    from dmi.config import CaptureSchedule as CanonicalSchedule
-    from dmi.engine import MonitoringEngine as CanonicalEngine
-    from dmi.storage.internals import InternalRequirements as CanonicalRequirements
-    from monitoring.config import CaptureSchedule as LegacySchedule
-    from monitoring.engine import MonitoringEngine as LegacyEngine
-    from monitoring.internal_mapper import InternalRequirements as LegacyRequirements
+def test_canonical_core_types_are_available():
+    from dmi import CaptureSchedule, MonitoringEngine
+    from dmi.storage.internals import InternalRequirements
 
-    assert CanonicalSchedule is LegacySchedule
-    assert CanonicalEngine is LegacyEngine
-    assert CanonicalRequirements is LegacyRequirements
+    assert CaptureSchedule.__module__ == "dmi.config"
+    assert MonitoringEngine.__module__ == "dmi.engine"
+    assert InternalRequirements.__module__ == "dmi.storage.internals"
 
 
-def test_canonical_and_legacy_adapter_modules_share_state():
-    from dmi.adapters.huggingface import adapter as canonical
-    from integration import hf_adapter as legacy
+def test_adapter_exports_preferred_and_existing_class_names():
+    from dmi.adapters.huggingface import HFAdaptor, HuggingFaceAdapter
 
-    assert canonical is legacy
-    assert canonical.HuggingFaceAdapter is canonical.HFAdaptor
-    assert canonical._prepare_profile_times is legacy._prepare_profile_times
+    assert HuggingFaceAdapter is HFAdaptor
+
+
+def test_source_tree_has_no_legacy_top_level_directories():
+    repo_root = Path(__file__).resolve().parents[1]
+
+    legacy_names = (
+        "monitoring",
+        "integration",
+        "libs",
+        "benchmark",
+        "example",
+        "Figures",
+    )
+    canonical_names = ("dmi", "native", "third_party", "benchmarks", "examples")
+
+    assert all(not (repo_root / name).exists() for name in legacy_names)
+    assert all((repo_root / name).is_dir() for name in canonical_names)
 
 
 def test_plain_dmi_import_does_not_load_native_transport():

@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 
 try:
-    from monitoring.ring_transport import HookSpec, ModelShapeConfig, RingTransport
+    from dmi.transport.ring import HookSpec, ModelShapeConfig, RingTransport
     _NATIVE_IMPORT_ERROR = None
 except ImportError as exc:
     HookSpec = ModelShapeConfig = RingTransport = None

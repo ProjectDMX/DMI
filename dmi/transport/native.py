@@ -1,4 +1,4 @@
-"""Loader for DMI's native monitoring engine extension."""
+"""Lazy loader for DMI's compiled C++/CUDA backend."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import importlib.machinery
 import importlib.util
 import glob
 
-_EXTENSION_NAME = "monitoring_native_backend"
+_EXTENSION_NAME = "_native_backend"
 _EXTENSION_MODULE: Optional[Any] = None
 
 
@@ -40,13 +40,20 @@ def _load_extension() -> Any:
     pkg_dir = Path(__file__).resolve().parent
     package_root = pkg_dir.parent
     repo_root = package_root.parent
-    legacy_package_dir = repo_root / "monitoring"
+    native_dir = repo_root / "native"
+    native_build_dir = native_dir / "build"
     candidates = []
     seen = set()
-    # Search both the canonical package and legacy build locations.  The
-    # existing Makefile intentionally remains under ``monitoring/`` during the
-    # compatibility window and writes a second copy at the repository root.
-    search_dirs = (pkg_dir, package_root, legacy_package_dir, repo_root)
+    # The build writes the importable artifact into ``dmi/`` and keeps a local
+    # copy under ``native/``. Additional development locations are included so
+    # incremental builds remain discoverable without installation.
+    search_dirs = (
+        package_root,
+        pkg_dir,
+        native_dir,
+        native_build_dir,
+        repo_root,
+    )
     for suffix in importlib.machinery.EXTENSION_SUFFIXES:
         for search_dir in search_dirs:
             path = search_dir / f"{_EXTENSION_NAME}{suffix}"
@@ -73,8 +80,8 @@ def _load_extension() -> Any:
             pass
 
     raise ImportError(
-        "monitoring native backend .so not found in repository. "
-        "Build it first with `make -C monitoring`."
+        "DMI native backend shared library not found. "
+        "Build it first with `make -C native`."
     )
 
 

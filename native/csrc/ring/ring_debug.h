@@ -3,7 +3,7 @@
 // Set RING_DEBUG to 1 at compile time to enable verbose logging.
 // When 0 (default), all RING_DBG calls are compiled out completely.
 //
-// Build with debug:  make -C monitoring/ CXXFLAGS+=-DRING_DEBUG=1 NVCCFLAGS+=-DRING_DEBUG=1
+// Build with debug:  make -C native CXXFLAGS+=-DRING_DEBUG=1 NVCCFLAGS+=-DRING_DEBUG=1
 
 #pragma once
 #include <cstdio>

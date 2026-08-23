@@ -24,7 +24,7 @@ import pytest
 import torch
 
 try:
-    from integration.hf_adapter import HFAdaptor
+    from dmi.adapters.huggingface.adapter import HFAdaptor
     _NATIVE_IMPORT_ERROR = None
 except ImportError as exc:
     HFAdaptor = None

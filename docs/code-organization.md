@@ -1,66 +1,61 @@
 # Code organization
 
-DMI uses one canonical Python package and keeps its original import paths as a
-compatibility layer. New code should import from `dmi`; existing applications
-using `monitoring` or `integration.hf_adapter` continue to resolve to the same
-implementation objects.
+DMI has one canonical Python namespace. Runtime code belongs under `dmi`,
+compiled backend sources belong under `native`, and external repositories are
+isolated under `third_party`.
 
 ```text
 dmi/
-├── adapters/                 Framework-neutral adapter contracts
+├── adapters/                 Framework-neutral contracts and implementations
 │   └── huggingface/          HuggingFace adapter and generation helpers
 ├── api/v1/                   Stable integration facade for framework plugins
 ├── hooks/                    Hook primitives, ABI catalog, and selection policy
 ├── storage/                  ClickHouse access and captured-state reassembly
-├── transport/                Ring transport and lazy native-extension loader
+├── transport/                Ring transport and native-extension loader
 ├── config.py                 User-facing configuration models
 └── engine.py                 Runtime orchestration
 
-monitoring/                   DMI 1.x Python shims and native C++/CUDA sources
-integration/                  DMI 1.x HuggingFace shims and external submodules
+native/                       C++/CUDA backend sources and Makefile
+third_party/                  Git submodules and other external source trees
 examples/                     Runnable end-user examples
 benchmarks/                   Reproduction and profiling tools
-tests/                        Unit, compatibility, native, and end-to-end tests
+tests/                        Unit, native, integration, and end-to-end tests
 docs/                         Architecture and usage documentation
 ```
 
-## Import policy
+## Boundaries
 
-- Use `dmi` for core configuration and engine APIs.
-- Use `dmi.api.v1` from framework integrations that need the stable facade.
-- Use `dmi.adapters.huggingface` for the HuggingFace adapter and generation
-  helpers.
-- Treat `monitoring.*` and the root `integration` Python modules as deprecated
-  compatibility paths. They are module aliases, so class identity, module
-  state, monkeypatching, and serialized qualified names continue to behave as
-  they did before the reorganization.
-- Keep framework-independent code out of adapter packages. Keep native loading
-  isolated in `dmi.transport.native` so ordinary imports work without CUDA or a
-  built extension.
+- Import runtime functionality only from `dmi` or one of its documented
+  subpackages.
+- Framework plugins use `dmi.api.v1` as their stable integration boundary.
+- Framework-specific behavior stays inside `dmi.adapters`; reusable hooks,
+  transport, and storage code must remain framework-neutral.
+- Native loading stays isolated in `dmi.transport.native`, so ordinary package
+  imports do not require CUDA or a compiled shared library.
+- Code under `third_party` is owned by its upstream repository. The DMI package
+  must not discover or distribute those trees as Python namespaces.
 
-## Native source compatibility
+## Native backend
 
-The native C++/CUDA sources and Makefile intentionally remain under
-`monitoring/` during the 1.x compatibility window. This preserves existing
-build commands and extension lookup locations:
+Build the C++/CUDA backend from the repository root or directly from its source
+directory:
 
 ```bash
-make -C monitoring
+make
+# equivalent to: make -C native
 ```
 
-Hook IDs and their metadata form a native ABI. The pure-Python catalog in
-`dmi/hooks/catalog.py` mirrors `monitoring/csrc/ring/tensor_meta.h`, allowing
-CPU-only imports; a native test verifies that both tables agree whenever the
-extension is available.
+The build keeps an intermediate copy in `native/` and places the importable
+`_native_backend` shared library in `dmi/`. Hook IDs and metadata form a native
+ABI; `dmi/hooks/catalog.py` mirrors `native/csrc/ring/tensor_meta.h`, and the
+native test suite verifies both definitions agree when the extension exists.
 
 ## Change checklist
 
-Before merging an organizational change:
-
-1. Preserve or deliberately version every public import path.
-2. Keep compatibility shims free of independent mutable state.
-3. Run `python -m compileall -q dmi monitoring integration benchmarks examples`.
-4. Run `python -m pytest -m cpu -q`, then `python -m pytest -q` where the
-   required native and framework dependencies are available.
-5. Build a wheel and inspect it for both the canonical package and the 1.x
-   compatibility namespaces.
+1. Keep every Python import rooted at `dmi`.
+2. Keep generated artifacts and external dependencies out of runtime packages.
+3. Run `python -m compileall -q dmi benchmarks examples`.
+4. Run `python -m pytest -m cpu -q`, followed by `python -m pytest -q` where
+   native and framework dependencies are available.
+5. Build the source distribution and confirm that it contains `dmi` and
+   `native`, but no external submodule contents.

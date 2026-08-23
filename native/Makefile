@@ -5,7 +5,7 @@ CXX ?= g++
 #   LTO=1      -> enable link-time optimization (-flto)
 LTO ?= 0
 
-TARGET := monitoring_native_backend
+TARGET := _native_backend
 SRCS := csrc/bindings.cpp \
         csrc/clickhouse_client.cpp \
         csrc/ring/drain_thread.cpp \
@@ -25,7 +25,7 @@ PROJECT_ROOT := $(abspath $(CURDIR)/..)
 EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 TARGET_SO := $(TARGET)$(EXT_SUFFIX)
 LOCAL_TARGET := $(CURDIR)/$(TARGET_SO)
-FINAL_TARGET := $(PROJECT_ROOT)/$(TARGET_SO)
+FINAL_TARGET := $(PROJECT_ROOT)/dmi/$(TARGET_SO)
 
 TORCH_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join(f'-I{path}' for path in include_paths()))")
 
@@ -57,10 +57,10 @@ LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPAT
 
 
 # ---- ClickHouse C++ client (fixed in-repo paths) ----
-CLICKHOUSE_INCLUDE := $(abspath $(CURDIR)/../libs/clickhouse-cpp)
-CLICKHOUSE_LIB_DIR := $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/clickhouse)
+CLICKHOUSE_INCLUDE := $(PROJECT_ROOT)/third_party/clickhouse-cpp
+CLICKHOUSE_LIB_DIR := $(CLICKHOUSE_INCLUDE)/build/clickhouse
 CLICKHOUSE_LIBS    := -lclickhouse-cpp-lib
-CLICKHOUSE_CONTRIB := $(abspath $(CURDIR)/../libs/clickhouse-cpp/build/contrib)
+CLICKHOUSE_CONTRIB := $(CLICKHOUSE_INCLUDE)/build/contrib
 
 ifneq ($(CLICKHOUSE_INCLUDE),)
 CXXFLAGS += -I$(CLICKHOUSE_INCLUDE) -I$(CLICKHOUSE_INCLUDE)/contrib/absl

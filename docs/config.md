@@ -3,8 +3,8 @@
 All parameters are set on `RingConfig` before constructing `RingEngine`.
 Changing them does not require re-capturing the CUDA graph.
 
-Source: `monitoring/csrc/ring/ring_config.h`
-Python binding: `monitoring/csrc/bindings.cpp` -> `RingConfig`
+Source: `native/csrc/ring/ring_config.h`
+Python binding: `native/csrc/bindings.cpp` -> `RingConfig`
 
 ---
 

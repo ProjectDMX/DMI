@@ -2,8 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from integration import hf_adapter
-from monitoring.internal_mapper import InternalRequirements
+from dmi.adapters.huggingface import adapter as hf_adapter
+from dmi.storage.internals import InternalRequirements
 
 
 def test_generate_with_monitoring_returns_impl_output_unchanged(monkeypatch):

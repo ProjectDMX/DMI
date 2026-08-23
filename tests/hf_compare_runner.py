@@ -27,10 +27,10 @@ _MODEL_ALIASES = {
 
 
 def main():
-    from monitoring import MonitoringEngine, MonitoringConfig, HostEngineConfig
-    from monitoring._native_engine import ClickHouseClientConfig, StageConfig, RingConfig
-    from monitoring.config import CaptureSchedule
-    from integration.hf_adapter import generate_with_monitoring
+    from dmi import MonitoringEngine, MonitoringConfig, HostEngineConfig
+    from dmi.transport.native import ClickHouseClientConfig, StageConfig, RingConfig
+    from dmi.config import CaptureSchedule
+    from dmi.adapters.huggingface.adapter import generate_with_monitoring
     from transformers import AutoTokenizer
 
     model_key = os.environ.get("E2E_MODEL", "gpt2")

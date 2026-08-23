@@ -1,8 +1,8 @@
-"""End-to-end tests for the get_internal read path.
+"""End-to-end tests for the dmi.storage.internals read path.
 
 Runs Qwen3-0.6B through generate_with_monitoring (writing captures to
 ClickHouse via the native ring), then reads them back with
-monitoring.internal_mapper.get_internal and checks the result lines up with
+dmi.storage.internals.get_internal and checks the result lines up with
 HuggingFace's native output.
 
 Requires a CUDA device, a reachable ClickHouse, the patched transformers fork,
@@ -41,13 +41,13 @@ def deps():
     try:
         from transformers import AutoTokenizer
         from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM
-        from monitoring import (
+        from dmi import (
             CaptureSchedule, HostEngineConfig, MonitoringConfig, MonitoringEngine,
         )
-        from monitoring._native_engine import ClickHouseClientConfig, StageConfig
-        from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
-        from monitoring.internal_mapper import get_internal
-        from integration.hf_adapter import generate_with_monitoring_dict
+        from dmi.transport.native import ClickHouseClientConfig, StageConfig
+        from dmi.storage.clickhouse import CHClickhouseDriverReadOnly
+        from dmi.storage.internals import get_internal
+        from dmi.adapters.huggingface.adapter import generate_with_monitoring_dict
         import clickhouse_driver
     except Exception as exc:
         pytest.skip(f"DMI HF stack unavailable: {exc}")

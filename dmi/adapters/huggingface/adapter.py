@@ -16,8 +16,6 @@ Key pieces:
     touching transport state directly.
   * ``_make_model_shape_from_hf_config`` -- Hugging Face model-shape helper in
     ``dmi.adapters.huggingface.model_shape``.
-
-Legacy ``integration.hf_adapter`` imports resolve to this module.
 """
 from __future__ import annotations
 
@@ -51,7 +49,7 @@ from .model_shape import _make_model_shape_from_hf_config
 
 
 # ---------------------------------------------------------------------------
-# Profiling helpers (moved from monitoring/generate.py)
+# Prepare-step profiling helpers
 # ---------------------------------------------------------------------------
 
 # Module-level profiling list for the prepare-step wrapper.  Enabled by
@@ -89,7 +87,7 @@ def print_prepare_profile() -> None:
 
 
 # ---------------------------------------------------------------------------
-# GreedyGenerateTimings (moved from monitoring/generate.py)
+# Greedy generation timing model
 # ---------------------------------------------------------------------------
 
 @dataclass

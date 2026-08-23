@@ -47,9 +47,9 @@ git submodule update --init --recursive
 
 Expected submodule paths:
 
-- `integration/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`, `llama_p`)
-- `integration/vllm_integration/` — DMI integration for an unmodified official vLLM installation
-- `libs/clickhouse-cpp/` — ClickHouse C++ client linked into the native backend
+- `third_party/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`, `llama_p`)
+- `third_party/vllm-integration/` — DMI integration for an unmodified official vLLM installation
+- `third_party/clickhouse-cpp/` — ClickHouse C++ client linked into the native backend
 
 ## 2. Install ClickHouse server
 
@@ -116,7 +116,7 @@ pip install -r requirements.txt
 Install the modified Transformers submodule, then DMI itself:
 
 ```bash
-pip install -e integration/transformers/
+pip install -e third_party/transformers/
 pip install -e .
 ```
 
@@ -124,7 +124,7 @@ For the vLLM path, install the versioned integration. Its dependency metadata
 installs the matching official vLLM release:
 
 ```bash
-pip install -e integration/vllm_integration/
+pip install -e third_party/vllm-integration/
 ```
 
 ## 5. Build native dependencies
@@ -132,21 +132,21 @@ pip install -e integration/vllm_integration/
 Build the ClickHouse C++ client:
 
 ```bash
-cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build \
+cmake -S third_party/clickhouse-cpp -B third_party/clickhouse-cpp/build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-cmake --build libs/clickhouse-cpp/build -j
+cmake --build third_party/clickhouse-cpp/build -j
 ```
 
 Build the DMI native backend:
 
 ```bash
-make -C monitoring -j
+make -C native -j
 # or simply: make
 ```
 
-Artifacts are emitted as `monitoring_native_backend.<EXT_SUFFIX>.so` at the
-project root and inside `monitoring/`.
+Artifacts are emitted as `_native_backend.<EXT_SUFFIX>.so` inside `native/`
+and as the importable `dmi/_native_backend.<EXT_SUFFIX>.so`.
 
 Smoke check (loads the built `.so`):
 
@@ -154,9 +154,6 @@ Smoke check (loads the built `.so`):
 python -c "import dmi; print(dmi.__file__)"
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
-
-The legacy `monitoring` and `integration.hf_adapter` import paths remain
-available during the DMI 1.x compatibility window.
 
 ## 6. End-to-end smoke check
 
@@ -172,13 +169,13 @@ Expect the generated text on stdout and a non-zero row count.
 
 ## Troubleshooting
 
-- **`ImportError` on `monitoring_native_backend`** — rebuild with
-  `make -C monitoring clean && make -C monitoring -j`, then confirm `pip install -e .`
+- **`ImportError` on `_native_backend`** — rebuild with
+  `make -C native clean && make -C native -j`, then confirm `pip install -e .`
   used the active conda env.
 - **Linker errors against `libclickhouse-cpp-lib`** — rerun step 5 and confirm
-  `libs/clickhouse-cpp/build/clickhouse/` exists.
+  `third_party/clickhouse-cpp/build/clickhouse/` exists.
 - **`Connection refused` to ClickHouse** — check
   `sudo systemctl status clickhouse-server`; DMI uses TCP port `9000`, not HTTP
   port `8123`.
 - **CUDA arch mismatch** — the Makefile uses `SM_ARCH=native`. Override with
-  `make -C monitoring SM_ARCH=sm_89` for a fixed target such as RTX 4090.
+  `make -C native SM_ARCH=sm_89` for a fixed target such as RTX 4090.

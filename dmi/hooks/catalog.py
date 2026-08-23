@@ -1,7 +1,7 @@
 """Framework-neutral catalog of DMI hook definitions.
 
 The numeric values are part of the native ABI and mirror ``HOOK_DEFS`` in
-``monitoring/csrc/ring/tensor_meta.h``. Keeping the catalog in pure Python
+``native/csrc/ring/tensor_meta.h``. Keeping the catalog in pure Python
 allows shape planning and adapter imports without loading the CUDA extension.
 Native-enabled tests validate this table against the compiled definition.
 """

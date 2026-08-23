@@ -15,8 +15,8 @@ def _mods() -> SimpleNamespace:
         from transformers.models.qwen2_moe_compare.modeling_qwen2_moe import CompareQwen2MoeForCausalLM
         from transformers.models.qwen2_moe_p.modeling_qwen2_moe import HookedQwen2MoeForCausalLM
 
-        from integration.model_shape import _make_model_shape_from_hf_config
-        from monitoring.ring_transport import (
+        from dmi.adapters.huggingface.model_shape import _make_model_shape_from_hf_config
+        from dmi.transport.ring import (
             HOOK_TYPE_ROUTER_LOGITS,
             HOOK_TYPE_TOPK_IDS,
             HOOK_TYPE_TOPK_WEIGHTS,

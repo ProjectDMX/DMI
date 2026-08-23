@@ -20,7 +20,7 @@ pytestmark = pytest.mark.native_backend
 @pytest.fixture(scope="module", autouse=True)
 def _require_native_backend() -> None:
     try:
-        from monitoring import _native_engine
+        from dmi.transport import native as _native_engine
 
         _native_engine._load_extension()
     except Exception as exc:
@@ -101,7 +101,7 @@ _NON_HOOK_EXPORTS = {
 
 
 def test_v1_public_surface_is_exact() -> None:
-    from monitoring.integration_api import v1
+    from dmi.api import v1
 
     expected = _NON_HOOK_EXPORTS | _HOOK_EXPORTS
     assert len(v1.__all__) == len(set(v1.__all__))
@@ -112,47 +112,47 @@ def test_v1_public_surface_is_exact() -> None:
 
 
 def test_v1_reexports_existing_objects_and_state() -> None:
-    from monitoring import _native_engine
-    from monitoring import adaptor_base
-    from monitoring import clickhouse_reader
-    from monitoring import config
-    from monitoring import engine
-    from monitoring import hook_points
-    from monitoring import internal_mapper
-    from monitoring import ring_transport
-    from monitoring import selection
-    from monitoring import step_context
-    from monitoring.integration_api import v1
+    from dmi.transport import native as _native_engine
+    from dmi.adapters import base as adapter_base
+    from dmi.storage import clickhouse
+    from dmi import config
+    from dmi import engine
+    from dmi.hooks import point
+    from dmi.storage import internals
+    from dmi.transport import ring
+    from dmi.hooks import selection
+    from dmi.adapters import types
+    from dmi.api import v1
 
-    assert v1.BackendAdaptor is adaptor_base.BackendAdaptor
-    assert v1.StepPlan is adaptor_base.StepPlan
-    assert v1.StepReservation is adaptor_base.StepReservation
-    assert v1.StepContext is step_context.StepContext
+    assert v1.BackendAdaptor is adapter_base.BackendAdaptor
+    assert v1.StepPlan is adapter_base.StepPlan
+    assert v1.StepReservation is adapter_base.StepReservation
+    assert v1.StepContext is types.StepContext
     assert v1.MonitoringEngine is engine.MonitoringEngine
     assert v1.RingCapacities is engine.RingCapacities
     assert v1.MonitoringConfig is config.MonitoringConfig
     assert v1.CaptureSchedule is config.CaptureSchedule
     assert v1.HostEngineConfig is engine.HostEngineConfig
-    assert v1.HookPoint is hook_points.HookPoint
-    assert v1.HookSpec is ring_transport.HookSpec
-    assert v1.HookRowBasis is ring_transport.HookRowBasis
-    assert v1.ModelShapeConfig is ring_transport.ModelShapeConfig
-    assert v1.hook_row_basis is ring_transport.hook_row_basis
-    assert v1.install_ring_hooks is ring_transport.install_ring_hooks
+    assert v1.HookPoint is point.HookPoint
+    assert v1.HookSpec is ring.HookSpec
+    assert v1.HookRowBasis is ring.HookRowBasis
+    assert v1.ModelShapeConfig is ring.ModelShapeConfig
+    assert v1.hook_row_basis is ring.hook_row_basis
+    assert v1.install_ring_hooks is ring.install_ring_hooks
     assert v1.register_preset is selection.register_preset
     assert v1.select_hook_specs is selection.select_hook_specs
     assert v1.hook_belongs_to_pp_rank is selection.hook_belongs_to_pp_rank
     assert v1.hook_belongs_to_tp_rank is selection.hook_belongs_to_tp_rank
     assert v1.CHClickhouseDriverReadOnly is (
-        clickhouse_reader.CHClickhouseDriverReadOnly
+        clickhouse.CHClickhouseDriverReadOnly
     )
-    assert v1.InternalRequirement is internal_mapper.InternalRequirement
-    assert internal_mapper._Requirement is internal_mapper.InternalRequirement
+    assert v1.InternalRequirement is internals.InternalRequirement
+    assert internals._Requirement is internals.InternalRequirement
     assert v1.InternalRequirement.__name__ == "InternalRequirement"
-    assert v1.InternalRequirements is internal_mapper.InternalRequirements
-    assert v1.IncompleteInternalError is internal_mapper.IncompleteInternalError
-    assert v1.LazyInternal is internal_mapper.LazyInternal
-    assert internal_mapper._LazyInternal is internal_mapper.LazyInternal
+    assert v1.InternalRequirements is internals.InternalRequirements
+    assert v1.IncompleteInternalError is internals.IncompleteInternalError
+    assert v1.LazyInternal is internals.LazyInternal
+    assert internals._LazyInternal is internals.LazyInternal
     assert v1.LazyInternal.__name__ == "LazyInternal"
     assert isinstance(v1.make_lazy_internal("model"), v1.LazyInternal)
     assert get_type_hints(v1.make_lazy_internal)["return"] is v1.LazyInternal
@@ -161,7 +161,7 @@ def test_v1_reexports_existing_objects_and_state() -> None:
     )
 
     for name in _HOOK_EXPORTS:
-        assert getattr(v1, name) == getattr(ring_transport, name)
+        assert getattr(v1, name) == getattr(ring, name)
 
     native = _native_engine._load_extension()
     for name in {
@@ -179,7 +179,7 @@ def test_v1_reexports_existing_objects_and_state() -> None:
 
 
 def test_v1_public_surface_is_documented() -> None:
-    from monitoring.integration_api import v1
+    from dmi.api import v1
 
     root = Path(__file__).resolve().parents[1]
     document = (root / "docs" / "integration-api-v1.md").read_text()
@@ -204,9 +204,9 @@ def test_v1_public_surface_is_documented() -> None:
 
 
 def test_v1_public_names_preserve_existing_shape_and_selection_behavior() -> None:
-    from monitoring import ring_transport
-    from monitoring import selection
-    from monitoring.integration_api import v1
+    from dmi.transport import ring as ring_transport
+    from dmi.hooks import selection
+    from dmi.api import v1
 
     cfg = v1.ModelShapeConfig(
         hidden_dim=64,
@@ -230,7 +230,7 @@ def test_v1_public_names_preserve_existing_shape_and_selection_behavior() -> Non
 
 
 def test_v1_padding_strip_configuration_preserves_existing_modes() -> None:
-    from monitoring.integration_api import v1
+    from dmi.api import v1
 
     hook = v1.HookPoint()
     row_count = torch.tensor([7], dtype=torch.int64)
@@ -274,8 +274,8 @@ def test_v1_padding_strip_configuration_preserves_existing_modes() -> None:
     ],
 )
 def test_v1_model_shape_helper_matches_existing_helper(config) -> None:
-    from integration.model_shape import _make_model_shape_from_hf_config
-    from monitoring.integration_api import v1
+    from dmi.adapters.huggingface.model_shape import _make_model_shape_from_hf_config
+    from dmi.api import v1
 
     assert v1.make_model_shape_from_hf_config(config) == (
         _make_model_shape_from_hf_config(config)
@@ -289,7 +289,7 @@ def test_v1_import_has_no_framework_or_preset_side_effects() -> None:
         import importlib.abc
         import sys
 
-        from monitoring import selection
+        from dmi.hooks import selection
 
         before = dict(selection._HOOK_SELECTIONS)
 
@@ -298,20 +298,20 @@ def test_v1_import_has_no_framework_or_preset_side_effects() -> None:
                 blocked = (
                     fullname == "vllm"
                     or fullname.startswith("vllm.")
-                    or fullname == "integration.hf_adapter"
+                    or fullname == "dmi.adapters.huggingface.adapter"
                 )
                 if blocked:
                     raise AssertionError(f"unexpected framework import: {fullname}")
                 return None
 
         sys.meta_path.insert(0, RejectFrameworkImports())
-        import monitoring.integration_api.v1 as api
+        import dmi.api.v1 as api
 
         assert api.DMI_INTEGRATION_API_VERSION == 1
         assert selection._HOOK_SELECTIONS == before
         assert not any(name == "vllm" or name.startswith("vllm.")
                        for name in sys.modules)
-        assert "integration.hf_adapter" not in sys.modules
+        assert "dmi.adapters.huggingface.adapter" not in sys.modules
         """
     )
     result = subprocess.run(

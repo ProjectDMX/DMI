@@ -1,0 +1,3 @@
+include Makefile
+include native/Makefile
+recursive-include native/csrc *.cpp *.cu *.cuh *.h *.hpp

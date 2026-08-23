@@ -2,7 +2,7 @@
 
 DMI supports official vLLM 0.27.1 through the separately installed
 `DMI-vLLM-Integration` 0.27.1 package. The source checkout pins that package at
-`integration/vllm_integration/`; it does not contain a vLLM fork.
+`third_party/vllm-integration/`; it does not contain a vLLM fork.
 
 Install the matching releases:
 
@@ -16,7 +16,7 @@ For a source checkout, install DMI and then the integration submodule:
 
 ```bash
 pip install -e .
-pip install -e integration/vllm_integration/
+pip install -e third_party/vllm-integration/
 ```
 
 DMI supports vLLM's V1 model runner only. Set this before importing or starting

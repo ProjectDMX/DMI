@@ -18,10 +18,10 @@
 #include <cuda_runtime.h>
 
 // Include the ring headers under test.
-#include "../../monitoring/csrc/ring/task_entry.h"
-#include "../../monitoring/csrc/ring/ring_config.h"
-#include "../../monitoring/csrc/ring/payload_ring.cuh"
-#include "../../monitoring/csrc/ring/task_ring.cuh"
+#include "../../native/csrc/ring/task_entry.h"
+#include "../../native/csrc/ring/ring_config.h"
+#include "../../native/csrc/ring/payload_ring.cuh"
+#include "../../native/csrc/ring/task_ring.cuh"
 
 // ---------------------------------------------------------------------------
 // Helpers

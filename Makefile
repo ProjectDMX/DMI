@@ -1,11 +1,11 @@
-.PHONY: all monitoring clean
+.PHONY: all native clean
 
-MONITORING_DIR ?= $(CURDIR)/monitoring
+NATIVE_DIR ?= $(CURDIR)/native
 
-all: monitoring
+all: native
 
-monitoring:
-	$(MAKE) -C $(MONITORING_DIR)
+native:
+	$(MAKE) -C $(NATIVE_DIR)
 
 clean:
-	$(MAKE) -C $(MONITORING_DIR) clean
+	$(MAKE) -C $(NATIVE_DIR) clean

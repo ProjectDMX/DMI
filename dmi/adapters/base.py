@@ -1,8 +1,8 @@
 """Backend adapter base class for framework-specific DMI integrations.
 
 Each concrete adapter converts framework-specific batch state into the
-``RingTransport`` step protocol. Root-owned adapters may live under
-``integration/``; external adapters consume the public integration API.
+``RingTransport`` step protocol. Built-in adapters live under
+``dmi.adapters``; external adapters consume the public integration API.
 
 The driver in ``before_forward`` is the canonical per-step flow shared by
 every concrete adapter:
