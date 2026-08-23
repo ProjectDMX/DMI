@@ -27,24 +27,65 @@ TARGET_SO := $(TARGET)$(EXT_SUFFIX)
 LOCAL_TARGET := $(CURDIR)/$(TARGET_SO)
 FINAL_TARGET := $(PROJECT_ROOT)/src/dmi/$(TARGET_SO)
 
-TORCH_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join(f'-I{path}' for path in include_paths()))")
+# Resolve one complete CUDA toolkit. Do not combine a compiler, headers, and
+# libraries from unrelated installations: that can produce an extension linked
+# against multiple libcudart major versions.
+CUDA_RESOLVER := $(CURDIR)/cuda_toolkit.py
+CUDA_CONFIG_STAMP := $(BUILD_DIR)/cuda-toolkit.config
+CUDA_RESOLVE_REQUIRED := 1
+ifneq ($(strip $(MAKECMDGOALS)),)
+ifeq ($(strip $(filter-out clean,$(MAKECMDGOALS))),)
+CUDA_RESOLVE_REQUIRED := 0
+endif
+endif
+
+ifeq ($(CUDA_RESOLVE_REQUIRED),1)
+CUDA_INPUT_CUDACXX := $(CUDACXX)
+CUDA_INPUT_NVCC := $(NVCC)
+CUDA_INPUT_TOOLKIT_ROOT := $(CUDA_TOOLKIT_ROOT)
+CUDA_INPUT_CMAKE_TOOLKIT_ROOT := $(CUDAToolkit_ROOT)
+CUDA_INPUT_HOME := $(CUDA_HOME)
+CUDA_INPUT_PATH := $(CUDA_PATH)
+
+CUDA_CONFIG_RAW := $(strip $(shell \
+	$(PYTHON) $(CUDA_RESOLVER) resolve --format record \
+		--cudacxx "$(CUDA_INPUT_CUDACXX)" \
+		--nvcc "$(CUDA_INPUT_NVCC)" \
+		--cuda-toolkit-root "$(CUDA_INPUT_TOOLKIT_ROOT)" \
+		--cmake-toolkit-root "$(CUDA_INPUT_CMAKE_TOOLKIT_ROOT)" \
+		--cuda-home "$(CUDA_INPUT_HOME)" \
+		--cuda-path "$(CUDA_INPUT_PATH)"))
+empty :=
+space := $(empty) $(empty)
+CUDA_CONFIG := $(subst |,$(space),$(CUDA_CONFIG_RAW))
+ifneq ($(words $(CUDA_CONFIG)),9)
+$(error CUDA toolkit resolution failed; see the diagnostic above)
+endif
+
+CUDA_TOOLKIT_ROOT_RESOLVED := $(word 1,$(CUDA_CONFIG))
+CUDA_NVCC := $(word 2,$(CUDA_CONFIG))
+CUDA_INCLUDE_DIR := $(word 3,$(CUDA_CONFIG))
+CUDA_LIBRARY_DIR := $(word 4,$(CUDA_CONFIG))
+CUDA_VERSION := $(word 5,$(CUDA_CONFIG))
+TORCH_CUDA_VERSION := $(word 6,$(CUDA_CONFIG))
+CUDA_EXPECTED_MAJOR := $(word 1,$(subst .,$(space),$(TORCH_CUDA_VERSION)))
+TORCH_INCLUDE_DIRS := $(subst ;,$(space),$(word 7,$(CUDA_CONFIG)))
+TORCH_LIBRARY_DIRS := $(subst ;,$(space),$(word 8,$(CUDA_CONFIG)))
+TORCH_CXX11_ABI := $(word 9,$(CUDA_CONFIG))
+
+CUDA_INCLUDE_FLAGS := -I$(CUDA_INCLUDE_DIR)
+CUDA_LIB_FLAGS := -L$(CUDA_LIBRARY_DIR)
+TORCH_INCLUDE_FLAGS := $(addprefix -I,$(TORCH_INCLUDE_DIRS))
+TORCH_LIB_FLAGS := $(addprefix -L,$(TORCH_LIBRARY_DIRS))
+comma := ,
+CUDA_RPATH_FLAGS := -Wl$(comma)-rpath$(comma)$(CUDA_LIBRARY_DIR)
+TORCH_RPATH_FLAGS := $(foreach path,$(TORCH_LIBRARY_DIRS),-Wl$(comma)-rpath$(comma)$(path))
+ABI_FLAG := -D_GLIBCXX_USE_CXX11_ABI=$(TORCH_CXX11_ABI)
+
+$(info DMI CUDA toolkit: $(CUDA_TOOLKIT_ROOT_RESOLVED) (CUDA $(CUDA_VERSION), PyTorch $(TORCH_CUDA_VERSION)))
+endif
 
 PYTHON_INCLUDE_FLAGS := $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); includes = {paths.get('include'), paths.get('platinclude')}; print(' '.join(f'-I{p}' for p in includes if p))")
-
-CUDA_INCLUDE_DIRS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import glob, os, site, sys; roots=list(dict.fromkeys(p for p in (CUDA_HOME, sys.prefix) if p)); sites=[*site.getsitepackages(), site.getusersitepackages()]; paths=[os.path.join(root, 'include') for root in roots]; paths += [path for root in roots for path in glob.glob(os.path.join(root, 'targets', '*', 'include'))]; paths += [path for base in sites for path in glob.glob(os.path.join(base, 'nvidia', '*', 'include'))]; print(' '.join(dict.fromkeys(path for path in paths if os.path.isdir(path))))")
-CUDA_INCLUDE_FLAGS := $(addprefix -I,$(CUDA_INCLUDE_DIRS))
-
-TORCH_LIB_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join(f'-L{path}' for path in library_paths()))")
-
-TORCH_RPATH_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join(f'-Wl,-rpath,{path}' for path in library_paths()))")
-
-CUDA_LIBRARY_DIRS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import glob, os, site, sys, sysconfig; roots=list(dict.fromkeys(p for p in (CUDA_HOME, sys.prefix) if p)); sites=[*site.getsitepackages(), site.getusersitepackages()]; multiarch=sysconfig.get_config_var('MULTIARCH'); paths=[os.path.join(root, leaf) for root in roots for leaf in ('lib64', 'lib')]; paths += [path for root in roots for path in glob.glob(os.path.join(root, 'targets', '*', 'lib*'))]; paths += [path for base in sites for path in glob.glob(os.path.join(base, 'nvidia', '*', 'lib'))]; paths += [path for path in (os.path.join('/usr/lib', multiarch) if multiarch else '', '/usr/lib64', '/usr/lib', '/usr/local/nvidia/lib64') if path]; print(' '.join(dict.fromkeys(path for path in paths if os.path.isdir(path))))")
-CUDA_LIB_FLAGS := $(addprefix -L,$(CUDA_LIBRARY_DIRS))
-
-comma := ,
-CUDA_RPATH_FLAGS := $(foreach path,$(CUDA_LIBRARY_DIRS),-Wl$(comma)-rpath$(comma)$(path))
-
-ABI_FLAG := $(shell $(PYTHON) -c "import torch; print(f'-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}')")
 
 # Pybind11 ABI flags
 PYBIND_FLAGS := $(shell $(PYTHON) -c "import pybind11; print(' '.join([f'-DPYBIND11_COMPILER_TYPE=\\\"{pybind11.get_compiler_type()}\\\"', f'-DPYBIND11_STDLIB=\\\"{pybind11.get_stdlib()}\\\"', f'-DPYBIND11_BUILD_ABI=\\\"{pybind11.get_build_abi()}\\\"']))" 2>/dev/null || echo "")
@@ -78,27 +119,7 @@ LDFLAGS += -L$(CLICKHOUSE_CONTRIB)/lz4/lz4 -llz4 \
            -L$(CLICKHOUSE_CONTRIB)/absl/absl -labsl_int128 \
            -L$(CLICKHOUSE_CONTRIB)/zstd/zstd -lzstdstatic
 
-CONDA_PREFIX ?= $(shell $(PYTHON) -c "import os; print(os.environ.get('CONDA_PREFIX',''))")
-ifneq ($(CONDA_PREFIX),)
-CXXFLAGS += -I$(CONDA_PREFIX)/include
-LDFLAGS  += -L$(CONDA_PREFIX)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib
-endif
-
-
-# venv/virtualenv support (adds include/lib paths for the active interpreter)
-VENV_PREFIX ?= $(shell $(PYTHON) -c "import sys; in_venv = (getattr(sys,'base_prefix',sys.prefix) != sys.prefix) or hasattr(sys,'real_prefix'); print(sys.prefix if in_venv else '')")
-ifneq ($(VENV_PREFIX),)
-CXXFLAGS += -I$(VENV_PREFIX)/include
-ifneq ($(wildcard $(VENV_PREFIX)/lib64),)
-LDFLAGS  += -L$(VENV_PREFIX)/lib64 -Wl,-rpath,$(VENV_PREFIX)/lib64
-endif
-ifneq ($(wildcard $(VENV_PREFIX)/lib),)
-LDFLAGS  += -L$(VENV_PREFIX)/lib -Wl,-rpath,$(VENV_PREFIX)/lib
-endif
-endif
-
 # ---- CUDA kernel compilation (nvcc) ----------------------------------------
-NVCC    ?= $(shell $(PYTHON) -c "from torch.utils.cpp_extension import CUDA_HOME; import os, shutil, sys; paths=[shutil.which('nvcc'), os.path.join(CUDA_HOME, 'bin', 'nvcc') if CUDA_HOME else None, os.path.join(sys.prefix, 'bin', 'nvcc'), '/usr/local/cuda/bin/nvcc']; print(next((path for path in paths if path and (shutil.which(path) or os.path.isfile(path))), 'nvcc'))")
 SM_ARCH ?= native
 
 NVCCFLAGS := \
@@ -119,25 +140,39 @@ RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
 
 OBJS += $(RING_OBJS)
 
-.PHONY: all build clean
+.PHONY: all build clean cuda-info FORCE
 
 all: $(FINAL_TARGET)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) | $(BUILD_DIR)
+FORCE:
+
+$(CUDA_CONFIG_STAMP): FORCE | $(BUILD_DIR)
+	$(PYTHON) $(CUDA_RESOLVER) write-stamp --output $@ --record "$(CUDA_CONFIG_RAW)"
+
+$(BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) $(CUDA_CONFIG_STAMP) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/ring/%.o: csrc/ring/%.cu | $(BUILD_DIR)
+$(BUILD_DIR)/ring/%.o: csrc/ring/%.cu $(CUDA_CONFIG_STAMP) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
-	$(NVCC) $(NVCCFLAGS) -MMD -MP -MF $(@:.o=.d) -c $< -o $@
+	$(CUDA_NVCC) $(NVCCFLAGS) -MMD -MP -MF $(@:.o=.d) -c $< -o $@
 
 $(FINAL_TARGET): $(OBJS)
 	$(CXX) -shared $^ -o $(BUILD_DIR)/$(TARGET_SO) $(LDFLAGS)
+	$(PYTHON) $(CUDA_RESOLVER) check-link --binary $(BUILD_DIR)/$(TARGET_SO) --expected-major $(CUDA_EXPECTED_MAJOR)
 	cp $(BUILD_DIR)/$(TARGET_SO) $(LOCAL_TARGET)
 	cp $(BUILD_DIR)/$(TARGET_SO) $(FINAL_TARGET)
+
+cuda-info:
+	@echo "CUDA toolkit root: $(CUDA_TOOLKIT_ROOT_RESOLVED)"
+	@echo "CUDA compiler: $(CUDA_NVCC)"
+	@echo "CUDA version: $(CUDA_VERSION)"
+	@echo "PyTorch CUDA version: $(TORCH_CUDA_VERSION)"
+	@echo "CUDA include directory: $(CUDA_INCLUDE_DIR)"
+	@echo "CUDA library directory: $(CUDA_LIBRARY_DIR)"
 
 clean:
 	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET)
