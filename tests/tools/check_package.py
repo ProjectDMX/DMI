@@ -53,11 +53,11 @@ def _run(
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
-def _validate_archive(wheel: Path, native_members: set[str]) -> None:
+def _validate_archive(wheel: Path) -> None:
     with zipfile.ZipFile(wheel) as archive:
         members = set(archive.namelist())
 
-    missing = sorted((REQUIRED_MEMBERS | native_members) - members)
+    missing = sorted(REQUIRED_MEMBERS - members)
     if missing:
         raise RuntimeError(
             "wheel is missing canonical package files: " + ", ".join(missing)
@@ -74,9 +74,7 @@ def _validate_archive(wheel: Path, native_members: set[str]) -> None:
         )
 
 
-def _smoke_test_install(
-    wheel: Path, audit_root: Path, *, expect_native_backend: bool
-) -> None:
+def _smoke_test_install(wheel: Path, audit_root: Path) -> None:
     venv_root = audit_root / "venv"
     venv.EnvBuilder(with_pip=True, system_site_packages=True).create(venv_root)
 
@@ -119,11 +117,6 @@ for legacy_name in ("monitoring", "integration", "benchmark", "example"):
         for location in locations
     ), (legacy_name, locations)
 
-if sys.argv[2] == "1":
-    from dmi.transport.native import RingConfig
-
-    assert RingConfig is not None
-
 print(f"installed package smoke test passed: {package_file}")
 """
     clean_env = os.environ.copy()
@@ -135,7 +128,6 @@ print(f"installed package smoke test passed: {package_file}")
             "-c",
             smoke_code,
             str(venv_root),
-            "1" if expect_native_backend else "0",
         ],
         cwd=audit_root,
         env=clean_env,
@@ -166,14 +158,8 @@ def main() -> None:
         if len(wheels) != 1:
             raise RuntimeError(f"expected one wheel, found {len(wheels)}")
 
-        native_members = {
-            f"dmi/{path.name}"
-            for path in (REPO_ROOT / "src" / "dmi").glob("_native_backend*.so")
-        }
-        _validate_archive(wheels[0], native_members)
-        _smoke_test_install(
-            wheels[0], audit_root, expect_native_backend=bool(native_members)
-        )
+        _validate_archive(wheels[0])
+        _smoke_test_install(wheels[0], audit_root)
 
     print("package distribution check passed")
 

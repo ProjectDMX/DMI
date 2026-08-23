@@ -16,9 +16,6 @@ dependencies = { file = ["requirements.txt"] }
 include-package-data = true
 package-dir = {"" = "src"}
 
-[tool.setuptools.package-data]
-dmi = ["_native_backend*.so"]
-
 [tool.setuptools.packages.find]
 # Runtime code has one canonical namespace. Native sources and external
 # repositories live under ``native/`` and ``third_party/``.
