@@ -6,8 +6,8 @@ fork.
 
 ## Install the vLLM backend
 
-Use a dedicated environment and recursive DMI checkout for vLLM. Do not install
-the modified HuggingFace integration from `third_party/transformers/` in this
+Use a dedicated environment and DMI checkout for vLLM. Do not install the
+modified HuggingFace integration from `third_party/transformers/` in this
 environment. Complete the [core installation](install.md), then install the
 version-matched integration editable. Its dependency metadata installs the
 matching official vLLM release.
@@ -18,10 +18,6 @@ make -C native clean
 make -C native -j
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
-
-DMI and DMI-vLLM-Integration registry artifacts are not assumed or supported by
-this guide. The supported path is the recursive source checkout, editable
-installs, and the locally built native backend above.
 
 DMI supports vLLM's V1 model runner only. Set this before importing or starting
 vLLM:

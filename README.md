@@ -119,12 +119,10 @@ Full setup, additional results, and how to reproduce:
 
 Start with the [core installation guide](docs/install.md), then choose the
 HuggingFace or vLLM path depending on the runtime you want to inspect. The
-supported setup is a recursive source checkout, a locally built native backend,
-and editable Python packages; repository wheel and source-archive checks do not
-produce published runtime artifacts. Use a separate environment and checkout
-for each backend, and install only the integration you need. The snippet below
-shows the minimal vLLM entry point. The version-matched integration checkout
-connects DMI to an unmodified official vLLM installation.
+project currently supports installation from source. Use a separate environment
+and checkout for each backend, and install only the integration you need. The
+snippet below shows the minimal vLLM entry point. The version-matched integration
+checkout connects DMI to an unmodified official vLLM installation.
 
 ```python
 import os
@@ -152,7 +150,7 @@ for o in llm.generate(["The answer is"], SamplingParams(max_tokens=16)):
 
 | | |
 |---|---|
-| **[Core installation](docs/install.md)** | Clone recursively, install DMI editable, and build the native backend |
+| **[Core installation](docs/install.md)** | Install DMI from source and build the native backend |
 | **[HuggingFace](docs/huggingface.md)** | Run HF generation, monitored generation, and offline benchmark scripts |
 | **[vLLM](docs/vllm.md)** | Run DMI through the vLLM offline API or `vllm serve` |
 

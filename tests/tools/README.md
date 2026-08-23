@@ -17,7 +17,7 @@ canonical `dmi` package structure and rejects legacy top-level package paths
 that source-tree imports could otherwise hide. It does not build or qualify the
 native backend, and its wheel is neither a supported installation artifact nor
 a publication candidate. Follow the [installation guide](../../docs/install.md)
-for the supported recursive-source-checkout setup.
+for the source installation workflow.
 
 ## Manual GPU and release sweeps
 

@@ -2,8 +2,8 @@
 
 ## Install the HuggingFace backend
 
-Use a dedicated environment and recursive DMI checkout for the HuggingFace
-backend. Do not reuse the vLLM environment or checkout. Complete the
+Use a dedicated environment and DMI checkout for the HuggingFace backend. Do
+not reuse the vLLM environment or checkout. Complete the
 [core installation](install.md), then install the modified Transformers
 submodule editable and rebuild the environment-specific native extension:
 

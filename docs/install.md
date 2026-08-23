@@ -33,7 +33,7 @@ nvidia-smi
 
 The repo uses three git submodules: the DMI HuggingFace integration, the
 version-matched DMI-vLLM integration, and the `clickhouse-cpp` C++ client.
-Recursive checkout fetches all three repositories; it does not install either
+The commands below fetch all three repositories; they do not install either
 Python integration.
 
 The command below creates one backend checkout. If you plan to use both
@@ -44,7 +44,7 @@ backends, repeat it with distinct target directories such as `DMI-hf` and
 git clone --recursive https://github.com/ProjectDMX/DMI.git
 cd DMI
 
-# If you forgot --recursive:
+# Or initialize submodules after cloning:
 git submodule update --init --recursive
 ```
 
@@ -119,8 +119,8 @@ pip install -r requirements.txt
 The pip minimum is required for the PEP 660 editable install used below. Conda
 environments must provide the same or a newer pip version.
 
-With the environment active and the recursive checkout available, verify the
-PyTorch CUDA build and inspect the coherent toolkit DMI selected:
+With the environment active and the checkout available, verify the PyTorch CUDA
+build and inspect the coherent toolkit DMI selected:
 
 ```bash
 python -c "import torch; print(torch.version.cuda)"
@@ -176,11 +176,10 @@ python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ## 6. Choose one backend
 
 Continue with either the [HuggingFace guide](huggingface.md) or the
-[vLLM guide](vllm.md). A separate environment and recursive checkout are
-required for each backend. The HuggingFace path installs a modified
-Transformers checkout, whereas the vLLM path installs its own official
-dependency set; do not install the HuggingFace integration in the vLLM
-environment.
+[vLLM guide](vllm.md). Use a separate environment and checkout for each
+backend. The HuggingFace path installs a modified Transformers checkout,
+whereas the vLLM path installs its own official dependency set; do not install
+the HuggingFace integration in the vLLM environment.
 
 The native extension is also environment-specific: its Python suffix, Torch
 ABI, CUDA selection, and runtime paths come from the active environment. Each
