@@ -44,8 +44,8 @@ clickhouse-client --query "SELECT count() FROM default.offload"
 
 ### End-to-end persistence smoke check
 
-With ClickHouse enabled, run the visualization demo's HF offload script and
-verify that it persisted rows:
+Run the visualization demo's HF offload script and verify that it persisted
+rows to ClickHouse:
 
 ```bash
 python examples/visualization/run_offload_hf.py

@@ -1,7 +1,7 @@
 # Core installation
 
 Set up DMI from a fresh clone: fetch submodules, install DMI editable, build the
-native backend, and optionally prepare the ClickHouse sink.
+native backend, and prepare the ClickHouse sink.
 
 Tested on Linux + Python >=3.10. A CUDA-capable GPU is required because Ring² is
 a GPU-resident capture and transport pipeline.
@@ -54,10 +54,9 @@ Expected submodule paths:
 - `third_party/vllm-integration/` — DMI integration for an unmodified official vLLM installation
 - `third_party/clickhouse-cpp/` — ClickHouse C++ client linked into the native backend
 
-## 2. Optional: install ClickHouse server
+## 2. Install ClickHouse server
 
-DMI can write captured tensors into a ClickHouse table. Skip the server setup
-when you only need transport without persistence. Otherwise, follow the
+DMI writes captured tensors into a ClickHouse table. Follow the
 [ClickHouse installation guide](https://clickhouse.com/docs/install) for your
 platform.
 
