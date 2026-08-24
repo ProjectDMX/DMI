@@ -8,11 +8,17 @@ namespace dmx_host{
 
 // DMXHostEngine is a single-stage ClickHouse insert pipeline.
 // Pre-assembled ClickHouseRows are submitted via submit_direct().
-class DMXHostEngine : public PipelinedEngine<dmx_host_queue_item, uint64_t, 1, QueueOptions<false, false, false>, false,
+class DMXHostEngine : public PipelinedEngine<dmx_host_queue_item, uint64_t, 1, QueueOptions<false, false, false>, true,
 NoOutputHandler<dmx_host_queue_item> >{
 public:
     explicit DMXHostEngine(StageConfig insert_stage):
-    PipelinedEngine(std::array<StageConfig, 1>{std::move(insert_stage)}, EngineConfig{}){}
+   PipelinedEngine(
+       std::array<StageConfig, 1>{std::move(insert_stage)},
+       [] {
+           EngineConfig config{};
+           config.enable_stats = true;
+           return config;
+       }()){}
 
     // Submit a pre-assembled ClickHouseRow directly to the insert stage.
     // Fields must match the order expected by ClickHouseInsertStage:

@@ -56,6 +56,42 @@ class _FakeRingEngine:
     def stop(self):
         self.stop_calls += 1
 
+    def suppressed_submit_failures(self):
+        return 0
+
+
+class _FakeQueueStats:
+    def __init__(self, *, dropped=0, full_errors=0, retries=0):
+        self.dropped = dropped
+        self.full_errors = full_errors
+        self.retries = retries
+
+
+class _FakeProfiling:
+    def __init__(self, queue_stats):
+        self.queue_by_stage = [queue_stats]
+
+
+class _FakeHostEngine:
+    def __init__(self, *, failure=None, profiling=None):
+        self.failure = failure
+        self._profiling = profiling
+        self.close_input_calls = 0
+        self.stop_calls = 0
+
+    def close_input(self):
+        self.close_input_calls += 1
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def raise_if_failed(self):
+        if self.failure is not None:
+            raise self.failure
+
+    def profiling(self):
+        return self._profiling
+
 
 def _engine_with_fake_ring(
     *, null_offload=False, force_eager=False, fail_null_mode=False
@@ -141,6 +177,36 @@ def test_close_restores_device_global_null_mode_before_ring_stop():
     assert ring_engine.stop_calls == 1
     assert transport.null_offload is False
     assert engine.capture_enabled is False
+
+
+def test_close_raises_host_engine_failure_with_sink_stats():
+    engine, _transport, ring_engine = _engine_with_fake_ring()
+
+    class _CountingRing(_FakeRingEngine):
+        def suppressed_submit_failures(self):
+            return 7
+
+    ring_engine = _CountingRing()
+    engine._ring_engine = ring_engine
+    host_engine = _FakeHostEngine(
+        failure=RuntimeError("insert failed"),
+        profiling=_FakeProfiling(
+            _FakeQueueStats(dropped=3, full_errors=2, retries=1)
+        ),
+    )
+    engine._host_engine = host_engine
+
+    with pytest.raises(RuntimeError, match="DMX host sink failed during teardown") as excinfo:
+        engine.close()
+
+    message = str(excinfo.value)
+    assert "queue_stats=dropped=3 full_errors=2 retries=1" in message
+    assert "suppressed_submit_failures=7" in message
+    assert host_engine.close_input_calls == 1
+    assert host_engine.stop_calls == 1
+    assert ring_engine.stop_calls == 1
+    assert engine._host_engine is None
+    assert engine._ring_engine is None
 
 
 def test_replacing_disabled_ring_restores_native_null_mode(monkeypatch):

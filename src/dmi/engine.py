@@ -22,6 +22,51 @@ def _ring_module() -> Any:
     return importlib.import_module("dmi.transport.ring")
 
 
+def _format_host_engine_stats(host_engine: Any, ring_engine: Any) -> str:
+    details: list[str] = []
+
+    try:
+        profiling = host_engine.profiling()
+    except Exception:
+        profiling = None
+    if profiling is not None:
+        try:
+            queue_stats = profiling.queue_by_stage[0]
+        except Exception:
+            queue_stats = None
+        if queue_stats is not None:
+            details.append(
+                "queue_stats="
+                f"dropped={int(queue_stats.dropped)} "
+                f"full_errors={int(queue_stats.full_errors)} "
+                f"retries={int(queue_stats.retries)}"
+            )
+
+    if ring_engine is not None:
+        try:
+            suppressed = int(ring_engine.suppressed_submit_failures())
+        except Exception:
+            suppressed = None
+        if suppressed:
+            details.append(f"suppressed_submit_failures={suppressed}")
+
+    return "; ".join(details)
+
+
+def _host_engine_teardown_error(
+    host_engine: Any,
+    ring_engine: Any,
+    exc: Exception,
+) -> RuntimeError:
+    details = _format_host_engine_stats(host_engine, ring_engine)
+    message = "DMX host sink failed during teardown"
+    if details:
+        message = f"{message} ({details})"
+    error = RuntimeError(message)
+    error.__cause__ = exc
+    return error
+
+
 @dataclass(frozen=True, slots=True)
 class RingCapacities:
     """Immutable snapshot of the active ring transport's capacities."""
@@ -280,6 +325,9 @@ class MonitoringEngine:
     def close(self) -> None:
         """Tear down backend resources."""
 
+        teardown_error: Exception | None = None
+        ring_engine = getattr(self, "_ring_engine", None)
+
         if self._ring_transport is not None:
             # Best-effort reset of the device-global native null flag.  This is
             # needed only after callers explicitly disabled capture; the normal
@@ -290,26 +338,40 @@ class MonitoringEngine:
                 except Exception:
                     pass
             try:
-                ring_engine = getattr(self, "_ring_engine", None)
                 if ring_engine is not None:
                     ring_engine.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                teardown_error = teardown_error or exc
             try:
                 _rt = _ring_module()
                 _rt.deactivate()
-            except Exception:
-                pass
+            except Exception as exc:
+                teardown_error = teardown_error or exc
             self._ring_transport = None
             self._ring_engine = None
 
         if self._host_engine is not None:
+            host_engine = self._host_engine
             try:
-                self._host_engine.close_input()
-                self._host_engine.stop()
-            except Exception:
-                pass
+                host_engine.close_input()
+            except Exception as exc:
+                teardown_error = teardown_error or exc
+            try:
+                host_engine.stop()
+            except Exception as exc:
+                teardown_error = teardown_error or exc
+            try:
+                host_engine.raise_if_failed()
+            except Exception as exc:
+                teardown_error = _host_engine_teardown_error(
+                    host_engine,
+                    ring_engine,
+                    exc,
+                )
             self._host_engine = None
+
+        if teardown_error is not None:
+            raise teardown_error
 
 
 # ---------------------------------------------------------------------------

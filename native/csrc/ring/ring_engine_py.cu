@@ -268,6 +268,10 @@ uint64_t RingEnginePy::task_cap() const {
     return impl_->engine.task_cap();
 }
 
+uint64_t RingEnginePy::suppressed_submit_failures() const {
+    return impl_->engine.suppressed_submit_failures();
+}
+
 at::Tensor RingEnginePy::payload_tensor() const {
     return impl_->payload_view;
 }

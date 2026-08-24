@@ -198,7 +198,7 @@ class InternalRequirement:
     retry: bool = False
     timeout_s: float | None = 30.0
     poll_s: float = 0.25
-    match_token_ranges: bool = False
+    match_token_ranges: bool = True
 
 
 # Backward-compatible private name used before integration API v1.
@@ -210,8 +210,9 @@ class InternalRequirements:
 
     ``count`` validates ``len(field_value)``. For per-layer fields such as
     ``hidden_states``, that means layer count, not token completeness.
-    ``match_token_ranges=True`` additionally validates that captured row ranges
-    match this generate call's expected request token ranges.
+    When request IDs and token ranges are available, field reads validate the
+    captured row ranges against this generate call's expected token ranges by
+    default. ``match_token_ranges=False`` opts out for an individual field.
     """
 
     def __init__(
@@ -239,7 +240,7 @@ class InternalRequirements:
         retry: bool = False,
         timeout_s: float | None = 30.0,
         poll_s: float = 0.25,
-        match_token_ranges: bool = False,
+        match_token_ranges: bool = True,
     ) -> "InternalRequirements":
         if count < 0:
             raise ValueError("count must be non-negative")
@@ -305,7 +306,7 @@ class LazyInternal:
         retry: bool = False,
         timeout_s: float | None = 30.0,
         poll_s: float = 0.25,
-        match_token_ranges: bool = False,
+        match_token_ranges: bool = True,
     ) -> "LazyInternal":
         self._requirements.require(
             field,
@@ -437,8 +438,7 @@ class LazyInternal:
         requirement: InternalRequirement | None,
     ) -> None:
         if (
-            requirement is None
-            or not requirement.match_token_ranges
+            (requirement is not None and not requirement.match_token_ranges)
             or not self._request_ids
             or not self._token_ranges
         ):

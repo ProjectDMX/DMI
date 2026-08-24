@@ -372,6 +372,19 @@ def test_lazy_internal_requirement_detects_missing_token_ranges():
         internal.hidden_states
 
 
+def test_lazy_internal_validates_token_ranges_by_default_when_request_metadata_exists():
+    rows = [_row("0:0", 0, 0, torch.ones(2, 4))]
+    internal = make_lazy_internal(
+        "m",
+        PrefixReader(rows),
+        request_ids=("0:0",),
+        token_ranges={"0:0": ((0, 2), (2, 3))},
+    )
+
+    with pytest.raises(IncompleteInternalError, match="token ranges are incomplete"):
+        internal.hidden_states
+
+
 def test_lazy_internal_requirement_retries_missing_token_ranges_until_success():
     partial = [_row("0:0", 0, 0, torch.ones(2, 4))]
     complete = [

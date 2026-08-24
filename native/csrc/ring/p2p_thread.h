@@ -11,6 +11,7 @@
 #include "ring_config.h"
 #include "tensor_meta.h"
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -43,6 +44,7 @@ public:
 
     void start();
     void stop();
+    uint64_t suppressed_submit_failures() const noexcept;
 
 private:
     DrainThread&             drain_;
@@ -52,6 +54,7 @@ private:
 
     std::thread              thread_;
     ring_py::StepContext*    current_ctx_{nullptr};  // owned, freed on last_in_step
+    std::atomic<uint64_t>    suppressed_submit_failures_{0};
 
     void loop();
     void process(std::vector<DrainTask>& tasks);

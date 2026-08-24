@@ -139,6 +139,10 @@ void P2PThread::stop() {
     if (thread_.joinable()) thread_.join();
 }
 
+uint64_t P2PThread::suppressed_submit_failures() const noexcept {
+    return suppressed_submit_failures_.load(std::memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------------------
 void P2PThread::loop() {
     while (true) {
@@ -312,10 +316,12 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
                        db_start, db_end,
                        std::move(slice));
         } catch (const std::exception& e) {
+            suppressed_submit_failures_.fetch_add(1, std::memory_order_relaxed);
             log_submit_failure_once(current_ctx_->model_id, req.req_id,
                                     act_name, meta.layer_no, shard_rank,
                                     db_start, db_end, e.what());
         } catch (...) {
+            suppressed_submit_failures_.fetch_add(1, std::memory_order_relaxed);
             log_submit_failure_once(current_ctx_->model_id, req.req_id,
                                     act_name, meta.layer_no, shard_rank,
                                     db_start, db_end,

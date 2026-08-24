@@ -98,6 +98,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using QueueConfig = DMXHostEngine::QueueConfig;
   using EnqueuePolicy = DMXHostEngine::EnqueuePolicy;
   using Duration = DMXHostEngine::Duration;
+  using IngestStats = DMXHostEngine::IngestStats;
+  using QueueStats = DMXHostEngine::QueueStats;
+  using StageStats = DMXHostEngine::StageStats;
+  using StatsSnapshot = DMXHostEngine::StatsSnapshot;
 
   py::enum_<dmx_host::OnFullPolicy>(m, "OnFullPolicy")
       .value("RAISE", dmx_host::OnFullPolicy::RAISE)
@@ -159,6 +163,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly("exc_type", &ThreadFailure::exc_type)
       .def_readonly("exc_what", &ThreadFailure::exc_what);
 
+  py::class_<IngestStats>(m, "IngestStats")
+      .def_readonly("submit_calls", &IngestStats::submit_calls)
+      .def_readonly("items_submitted", &IngestStats::items_submitted)
+      .def_readonly("submit_enqueue_calls", &IngestStats::submit_enqueue_calls)
+      .def_readonly("submit_enqueue_s", &IngestStats::submit_enqueue_s);
+
+  py::class_<QueueStats>(m, "QueueStats")
+      .def_readonly("enqueued", &QueueStats::enqueued)
+      .def_readonly("dropped", &QueueStats::dropped)
+      .def_readonly("full_errors", &QueueStats::full_errors)
+      .def_readonly("closed_errors", &QueueStats::closed_errors)
+      .def_readonly("too_large_errors", &QueueStats::too_large_errors)
+      .def_readonly("retries", &QueueStats::retries);
+
+  py::class_<StageStats>(m, "StageStats")
+      .def_readonly("batches", &StageStats::batches)
+      .def_readonly("items_in", &StageStats::items_in)
+      .def_readonly("items_out", &StageStats::items_out)
+      .def_readonly("dequeue_calls", &StageStats::dequeue_calls)
+      .def_readonly("dequeue_timeouts", &StageStats::dequeue_timeouts)
+      .def_readonly("process_calls", &StageStats::process_calls)
+      .def_readonly("enqueue_calls", &StageStats::enqueue_calls)
+      .def_readonly("output_calls", &StageStats::output_calls)
+      .def_readonly("output_items", &StageStats::output_items)
+      .def_readonly("dequeue_s", &StageStats::dequeue_s)
+      .def_readonly("dequeue_idle_s", &StageStats::dequeue_idle_s)
+      .def_readonly("process_s", &StageStats::process_s)
+      .def_readonly("enqueue_s", &StageStats::enqueue_s)
+      .def_readonly("output_s", &StageStats::output_s);
+
+  py::class_<StatsSnapshot>(m, "StatsSnapshot")
+      .def_readonly("ingest", &StatsSnapshot::ingest)
+      .def_readonly("queue_by_stage", &StatsSnapshot::queue_by_stage)
+      .def_readonly("stage_by_stage", &StatsSnapshot::stage_by_stage);
+
   py::class_<StageConfig>(m, "StageConfig")
       .def(py::init<>())
       .def_readwrite("name", &StageConfig::name)
@@ -213,6 +252,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("failures", &DMXHostEngine::failures)
       .def("raise_if_failed", &DMXHostEngine::raise_if_failed)
+      .def("profiling", &DMXHostEngine::profiling)
+      .def("reset_metrics", &DMXHostEngine::reset_metrics)
       // Submit a pre-formatted ClickHouseRow directly to the insert stage.
       // Called from the ring transport drain callback after format processing.
       .def("submit_direct",
@@ -304,6 +345,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("payload_cap", &ring_py::RingEnginePy::payload_cap)
       .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
       .def("task_cap",    &ring_py::RingEnginePy::task_cap)
+      .def("suppressed_submit_failures",
+           &ring_py::RingEnginePy::suppressed_submit_failures)
       .def("payload_tensor", &ring_py::RingEnginePy::payload_tensor)
       // Safety-net surface (eager only).  available_capacity() and
       // reserve_one() are CPU-only and fast -- no GIL release needed.

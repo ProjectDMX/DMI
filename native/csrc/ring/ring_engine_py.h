@@ -136,6 +136,7 @@ public:
     uint64_t payload_cap() const;
     uint64_t staging_cap() const;
     uint64_t task_cap() const;
+    uint64_t suppressed_submit_failures() const;
 
     // Return a torch.Tensor view of the GPU payload buffer (uint8,
     // length = payload_cap()).  No copy, no ownership transfer -- the

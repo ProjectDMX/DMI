@@ -1164,7 +1164,7 @@ handle.require(
     retry: bool = False,
     timeout_s: float | None = 30.0,
     poll_s: float = 0.25,
-    match_token_ranges: bool = False,
+    match_token_ranges: bool = True,
 ) -> handle
 ```
 
@@ -1172,10 +1172,11 @@ handle.require(
 and a batch count for global tensors, not a token or database-row count. With
 `retry=True`, synchronous field access polls missing/incomplete data until
 success or timeout. `timeout_s=None` can block forever. Database/runtime errors
-are not retried. `match_token_ranges=True` performs validation only when both
-nonempty request IDs and ranges were supplied; otherwise it is a no-op. For a
-per-layer field the current v1 implementation checks only its highest present
-layer, not every layer.
+are not retried. When both nonempty request IDs and ranges were supplied,
+token-range validation runs by default; `match_token_ranges=False` opts out for
+an individual field, and otherwise the flag is a no-op. For a per-layer field
+the current v1 implementation checks only its highest present layer, not every
+layer.
 
 Mapped dynamic attributes are:
 
