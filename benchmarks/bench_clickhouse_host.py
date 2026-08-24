@@ -103,10 +103,10 @@ class BenchmarkConfig:
                 raise ValueError(f"{name} must be positive")
         if self.warmup_rows < 0:
             raise ValueError("warmup_rows must be non-negative")
-        if self.max_linger_ms < 0:
-            raise ValueError("max_linger_ms must be non-negative")
-        if self.drain_timeout_seconds <= 0:
-            raise ValueError("drain_timeout_seconds must be positive")
+        if not math.isfinite(self.max_linger_ms) or self.max_linger_ms < 0:
+            raise ValueError("max_linger_ms must be a finite non-negative number")
+        if not math.isfinite(self.drain_timeout_seconds) or self.drain_timeout_seconds <= 0:
+            raise ValueError("drain_timeout_seconds must be a finite positive number")
         if not 1 <= self.port <= 65535:
             raise ValueError("port must be between 1 and 65535")
         if self.dtype not in _DTYPE_BYTES:
@@ -361,7 +361,7 @@ def _parts_metrics(client: Any, config: BenchmarkConfig) -> dict[str, int]:
     values = client.execute(
         """
         SELECT count(), sum(rows), sum(bytes_on_disk), sum(data_compressed_bytes),
-               sum(data_uncompressed_bytes), sum(primary_key_size)
+               sum(data_uncompressed_bytes), sum(primary_key_bytes_in_memory)
         FROM system.parts
         WHERE active AND database = %(database)s AND table = %(table)s
         """,
@@ -438,9 +438,45 @@ def _safe_config(config: BenchmarkConfig) -> dict[str, Any]:
     return values
 
 
+def _ensure_table(client: Any, config: BenchmarkConfig) -> None:
+    """Explicitly create the capture table if it does not yet exist.
+
+    The native backend guards its own DDL with a process-wide once_flag, so a
+    second ``run()`` call in the same process will not recreate a table that
+    was dropped by a previous run.  Pre-creating the table here means every
+    ``run()`` starts with a live table regardless of the once_flag state.
+    """
+    table = f"{quote_identifier(config.database)}.{quote_identifier(config.table)}"
+    cols = ", ".join([
+        f"{quote_identifier('model_id')} String",
+        f"{quote_identifier('request_id')} String",
+        f"{quote_identifier('act_name')} String",
+        f"{quote_identifier('layer_no')} Int32",
+        f"{quote_identifier('shard_rank')} Int32",
+        f"{quote_identifier('start_token_idx')} Int32",
+        f"{quote_identifier('end_token_idx')} Int32",
+        f"{quote_identifier('dtype')} String",
+        f"{quote_identifier('shape')} Array(Int64)",
+        f"{quote_identifier('bytes')} String",
+    ])
+    pk_cols = ", ".join(
+        quote_identifier(c)
+        for c in ("model_id", "request_id", "act_name", "layer_no",
+                  "shard_rank", "start_token_idx", "end_token_idx")
+    )
+    client.execute(
+        f"CREATE TABLE IF NOT EXISTS {table} ({cols})"
+        f" ENGINE = MergeTree"
+        f" PRIMARY KEY ({pk_cols})"
+        f" ORDER BY ({pk_cols})"
+        f" SETTINGS index_granularity = {config.index_granularity}"
+    )
+
+
 def run(config: BenchmarkConfig) -> dict[str, Any]:
     payloads = generate_payload_pool(config)
     client = _connect(config)
+    _ensure_table(client, config)
     table = f"{quote_identifier(config.database)}.{quote_identifier(config.table)}"
     measured_model_id = f"host-bench-{uuid.uuid4().hex}"
     warnings: list[str] = []

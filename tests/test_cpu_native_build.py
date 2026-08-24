@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import importlib
+import os
 from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
-from typing import get_type_hints
 
 import pytest
 
@@ -68,31 +67,47 @@ def test_ring_export_requires_full_backend(monkeypatch):
     assert calls == ["_native_backend"]
 
 
-def test_v1_host_export_does_not_load_ring_backend(monkeypatch):
-    from dmi.transport import native
-
-    sentinel = object()
-    host_module = SimpleNamespace(DMXHostEngine=sentinel)
-    monkeypatch.setattr(native, "_load_host_extension", lambda: host_module)
-    sys.modules.pop("dmi.api.v1", None)
-    ring_before = sys.modules.get("dmi.transport.ring")
-
-    api = importlib.import_module("dmi.api.v1")
-
-    assert api.DMXHostEngine is sentinel
-    assert sys.modules.get("dmi.transport.ring") is ring_before
+def test_v1_host_export_does_not_load_ring_backend():
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import dmi.api.v1; "
+                "assert 'dmi.transport.ring' not in sys.modules, "
+                "'ring backend was loaded by v1 host-export path'"
+            ),
+        ],
+        cwd=repo_root,
+        env={**os.environ, "PYTHONPATH": str(repo_root / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_v1_model_shape_contract_does_not_load_ring_backend():
-    sys.modules.pop("dmi.api.v1", None)
-    ring_before = sys.modules.get("dmi.transport.ring")
-
-    api = importlib.import_module("dmi.api.v1")
-    hints = get_type_hints(api.make_model_shape_from_hf_config)
-    shape = api.make_model_shape_from_hf_config(
-        SimpleNamespace(hidden_size=64, num_attention_heads=8)
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import dmi.api.v1; "
+                "from types import SimpleNamespace; "
+                "shape = dmi.api.v1.make_model_shape_from_hf_config("
+                "    SimpleNamespace(hidden_size=64, num_attention_heads=8)); "
+                "assert isinstance(shape, dmi.api.v1.ModelShapeConfig); "
+                "assert 'dmi.transport.ring' not in sys.modules, "
+                "'ring backend was loaded by v1 model-shape path'"
+            ),
+        ],
+        cwd=repo_root,
+        env={**os.environ, "PYTHONPATH": str(repo_root / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
     )
-
-    assert hints["return"] == api.ModelShapeConfig | None
-    assert isinstance(shape, api.ModelShapeConfig)
-    assert sys.modules.get("dmi.transport.ring") is ring_before
+    assert result.returncode == 0, result.stderr

@@ -22,8 +22,11 @@ if dmi.DMI_INTEGRATION_API_VERSION != 1:
 DMI package version or native-extension ABI version. This module always
 exports `1`, even after a future `v2` module is added.
 
-Importing the facade loads DMI's pure-Python mirror of the native hook
-definitions. It does not load the compiled extension, construct an engine,
+Importing the facade resolves the host-engine binding and pure-Python hook
+definitions lazily: a CPU-only host engine and hook metadata are available
+immediately, while ring-transport and GPU-specific bindings are resolved only
+when an engine that needs them is actually constructed. It does not load the
+compiled extension, construct an engine,
 allocate ring buffers, start host threads, import an inference framework, or
 register framework-specific presets. Re-exported objects use the same
 transport and selection state as DMI core.

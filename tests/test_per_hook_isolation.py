@@ -59,6 +59,7 @@ import pytest
 
 from tests._requirements import (
     require_cuda,
+    require_model_cache,
     require_native_backend,
     require_transformers_fork,
 )
@@ -422,10 +423,12 @@ def _run_rollout(
 @pytest.mark.gpu
 @pytest.mark.framework_fork
 @pytest.mark.native_backend
+@pytest.mark.hf
 @pytest.mark.slow
 @require_cuda()
 @require_native_backend()
 @require_transformers_fork()
+@require_model_cache("Qwen/Qwen3-0.6B")
 @pytest.mark.parametrize(
     "framework,model_key,hook,mode", SMOKE_CELLS,
     ids=lambda c: f"{c[0]}-{c[1]}-{c[2]}-{c[3]}" if isinstance(c, tuple) else str(c),
