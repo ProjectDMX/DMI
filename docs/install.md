@@ -1,10 +1,12 @@
-# Installation
+# Core installation
 
-Set up DMI from a fresh clone: fetch submodules, install the Python packages,
-build the native backend, and prepare the optional ClickHouse sink.
+Set up DMI from a fresh clone: fetch submodules, install DMI editable, build the
+native backend, and prepare the ClickHouse sink.
 
-Tested on Linux + CUDA 12.x + Python >=3.10. A CUDA-capable GPU is required because
-Ring² is a GPU-resident capture and transport pipeline.
+Tested on Linux + Python >=3.10. A CUDA-capable GPU is required because Ring² is
+a GPU-resident capture and transport pipeline.
+
+DMI currently supports installation from source.
 
 ## 0. System prerequisites
 
@@ -16,8 +18,9 @@ sudo apt-get update
 sudo apt-get install -y build-essential cmake git
 ```
 
-Plus a working CUDA toolkit (NVCC) matching your driver. DMI is tested
-against CUDA 12.x; install per the
+Plus a complete CUDA toolkit whose major version matches the CUDA version used
+to build PyTorch (`torch.version.cuda`) and is supported by your driver. Install
+it per the
 [official NVIDIA instructions](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/).
 Verify:
 
@@ -26,30 +29,30 @@ nvcc --version
 nvidia-smi
 ```
 
-If `nvcc` is not on `PATH`, point the build at it explicitly:
-
-```bash
-export NVCC=/usr/local/cuda/bin/nvcc
-```
-
 ## 1. Clone the repository
 
 The repo uses three git submodules: the DMI HuggingFace integration, the
 version-matched DMI-vLLM integration, and the `clickhouse-cpp` C++ client.
+The commands below fetch all three repositories; they do not install either
+Python integration.
+
+The command below creates one backend checkout. If you plan to use both
+backends, repeat it with distinct target directories such as `DMI-hf` and
+`DMI-vllm`; do not share one checkout between their environments.
 
 ```bash
 git clone --recursive https://github.com/ProjectDMX/DMI.git
 cd DMI
 
-# If you forgot --recursive:
+# Or initialize submodules after cloning:
 git submodule update --init --recursive
 ```
 
 Expected submodule paths:
 
-- `integration/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`, `llama_p`)
-- `integration/vllm_integration/` — DMI integration for an unmodified official vLLM installation
-- `libs/clickhouse-cpp/` — ClickHouse C++ client linked into the native backend
+- `third_party/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`, `llama_p`)
+- `third_party/vllm-integration/` — DMI integration for an unmodified official vLLM installation
+- `third_party/clickhouse-cpp/` — ClickHouse C++ client linked into the native backend
 
 ## 2. Install ClickHouse server
 
@@ -91,8 +94,9 @@ If conda is not already installed, follow the
 first. Then:
 
 ```bash
-conda env create -f environment.yml
-conda activate proj-dmx
+DMI_BACKEND_ENV=dmi-hf  # Example; use dmi-vllm in the vLLM checkout.
+conda env create -f environment.yml --name "$DMI_BACKEND_ENV"
+conda activate "$DMI_BACKEND_ENV"
 ```
 
 ### 3b. venv
@@ -108,23 +112,37 @@ Then create the environment, activate it, and install requirements:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade "pip>=21.3"
 pip install -r requirements.txt
 ```
 
-## 4. Install Python packages
+The pip minimum is required for the PEP 660 editable install used below. Conda
+environments must provide the same or a newer pip version.
 
-Install the modified Transformers submodule, then DMI itself:
+With the environment active and the checkout available, verify the PyTorch CUDA
+build and inspect the coherent toolkit DMI selected:
 
 ```bash
-pip install -e integration/transformers/
-pip install -e .
+python -c "import torch; print(torch.version.cuda)"
+make -C native cuda-info
 ```
 
-For the vLLM path, install the versioned integration. Its dependency metadata
-installs the matching official vLLM release:
+If multiple matching toolkits are installed, select one explicitly and rerun
+`cuda-info`:
 
 ```bash
-pip install -e integration/vllm_integration/
+export CUDA_HOME=/usr/local/cuda-12.8
+# Alternatively: export CUDACXX=/usr/local/cuda-12.8/bin/nvcc
+make -C native cuda-info
+```
+
+## 4. Install DMI core
+
+Install the root checkout editable. The native build in the next step writes
+its importable extension directly into this source tree.
+
+```bash
+pip install -e .
 ```
 
 ## 5. Build native dependencies
@@ -132,54 +150,51 @@ pip install -e integration/vllm_integration/
 Build the ClickHouse C++ client:
 
 ```bash
-cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build \
+cmake -S third_party/clickhouse-cpp -B third_party/clickhouse-cpp/build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-cmake --build libs/clickhouse-cpp/build -j
+cmake --build third_party/clickhouse-cpp/build -j
 ```
 
 For host-side ClickHouse ingestion and benchmarking without CUDA, build the
 CPU-only backend:
 
 ```bash
-make -C monitoring host -j
+make -C native host -j
 # or: make host
 ```
 
-This emits `monitoring_host_backend.<EXT_SUFFIX>.so` at the project root and
-inside `monitoring/`. It contains `DMXHostEngine`, stage and queue
-configuration, and the ClickHouse client, but no ring transport or CUDA
-symbols.
+This emits `_host_backend.<EXT_SUFFIX>.so` inside `native/` and as the
+importable `src/dmi/_host_backend.<EXT_SUFFIX>.so`. It contains the host
+pipeline and ClickHouse client but no ring transport or CUDA symbols.
 
 For GPU capture and ring transport, build the full backend:
 
 ```bash
-make -C monitoring -j
+make -C native -j
 # or simply: make
 ```
 
-This emits `monitoring_native_backend.<EXT_SUFFIX>.so` at the project root and
-inside `monitoring/`. When both extensions exist, host exports use the full
-backend; otherwise they fall back to the CPU-only backend. Ring exports always
-require the full backend. The v1 facade resolves host and ring names lazily, so
-importing a host type does not initialize ring support. See the
-[native build layout](native-build-layout.html).
+Artifacts are emitted as `_native_backend.<EXT_SUFFIX>.so` inside `native/`
+and as the importable `src/dmi/_native_backend.<EXT_SUFFIX>.so`. Host exports
+prefer the full backend and fall back to `_host_backend`; ring exports always
+require the full backend.
 
 Smoke check the package and host backend:
 
 ```bash
-python -c "import monitoring; print(monitoring.__file__)"
-python -c "from monitoring.integration_api.v1 import DMXHostEngine; print(DMXHostEngine.__module__)"
+python -c "import dmi; print(dmi.__file__)"
+python -c "from dmi.api.v1 import DMXHostEngine; print(DMXHostEngine.__module__)"
 ```
 
 After a full build, smoke check the ring backend:
 
 ```bash
-python -c "from monitoring._native_engine import RingConfig; print(RingConfig())"
+python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
 
 Run the dependency-free CPU gate without CUDA, ClickHouse, native artifacts,
-or initialized framework forks:
+model weights, or initialized framework forks:
 
 ```bash
 make test-cpu
@@ -191,34 +206,34 @@ Build and verify the CPU-only native host backend:
 make test-host
 ```
 
-Tests requiring the modified Transformers fork, the full CUDA backend, model
-weights, or ClickHouse carry separate markers and skip when their prerequisites
-are unavailable. `make test-host` does not download or start ClickHouse; use the
-host benchmark separately when a server is already available.
+Tests with optional runtime prerequisites carry separate markers and skip when
+those resources are unavailable. `make test-host` does not download or start
+ClickHouse; use the host benchmark separately with a running server.
 
-## 6. End-to-end smoke check
+## 6. Choose one backend
 
-Runs the visualization demo's HF offload script, captures activations into
-ClickHouse, then queries the row count:
+Continue with either the [HuggingFace guide](huggingface.md) or the
+[vLLM guide](vllm.md). Use a separate environment and checkout for each
+backend. The HuggingFace path installs a modified Transformers checkout,
+whereas the vLLM path installs its own official dependency set; do not install
+the HuggingFace integration in the vLLM environment.
 
-```bash
-python example/visualization/run_offload_hf.py
-clickhouse-client --query "SELECT count() FROM default.offload WHERE model_id='demo_hf'"
-```
-
-Expect the generated text on stdout and a non-zero row count.
+The native extension is also environment-specific: its Python suffix, Torch
+ABI, CUDA selection, and runtime paths come from the active environment. Each
+backend guide therefore finishes by rebuilding the extension in that backend's
+checkout.
 
 ## Troubleshooting
 
-- **`ImportError` on `monitoring_native_backend`** — rebuild with
-  `make -C monitoring clean && make -C monitoring -j`, then confirm `pip install -e .`
+- **`ImportError` on `_native_backend`** — rebuild with
+  `make -C native clean && make -C native -j`, then confirm `pip install -e .`
   used the active conda env.
-- **`ImportError` on `monitoring_host_backend`** — build with
-  `make -C monitoring host -j`; this target does not require CUDA or `nvcc`.
+- **`ImportError` on `_host_backend`** — build with
+  `make -C native host -j`; this target does not require CUDA or `nvcc`.
 - **Linker errors against `libclickhouse-cpp-lib`** — rerun step 5 and confirm
-  `libs/clickhouse-cpp/build/clickhouse/` exists.
+  `third_party/clickhouse-cpp/build/clickhouse/` exists.
 - **`Connection refused` to ClickHouse** — check
   `sudo systemctl status clickhouse-server`; DMI uses TCP port `9000`, not HTTP
   port `8123`.
 - **CUDA arch mismatch** — the Makefile uses `SM_ARCH=native`. Override with
-  `make -C monitoring SM_ARCH=sm_89` for a fixed target such as RTX 4090.
+  `make -C native SM_ARCH=sm_89` for a fixed target such as RTX 4090.

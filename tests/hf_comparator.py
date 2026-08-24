@@ -31,8 +31,8 @@ def main():
         _parse_request_id,
         _strip_left_pad,
     )
-    from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
-    from monitoring.segment_merger import merge_segments
+    from dmi.storage.clickhouse import CHClickhouseDriverReadOnly
+    from dmi.storage.reassembly import merge_segments
 
     # Tolerance: eager comparison is tight (0.01), CUDA graph vs eager
     # allows bf16 rounding (0.5) due to different accumulation order

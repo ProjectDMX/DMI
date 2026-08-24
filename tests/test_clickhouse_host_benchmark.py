@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from benchmark.bench_clickhouse_host import (
+from benchmarks.bench_clickhouse_host import (
     BenchmarkConfig,
     TrialMeasurement,
     _server_time,

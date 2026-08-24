@@ -90,9 +90,9 @@ def require_native_backend():
     """Skip unless the full native ring backend is loadable."""
     error = None
     try:
-        from monitoring import _native_engine
+        from dmi.transport import native
 
-        _native_engine._load_extension()
+        native._load_extension()
     except Exception as exc:
         error = exc
     return pytest.mark.skipif(
@@ -104,9 +104,9 @@ def require_native_backend():
 def require_transformers_fork():
     """Skip unless the in-repo Transformers fork is initialized."""
     root = Path(__file__).resolve().parents[1]
-    models = root / "integration/transformers/src/transformers/models"
+    models = root / "third_party/transformers/src/transformers/models"
     required = (
-        root / "integration/transformers/src/transformers/__init__.py",
+        root / "third_party/transformers/src/transformers/__init__.py",
         models / "gpt2_compare/modeling_gpt2.py",
         models / "llama_compare/modeling_llama.py",
         models / "qwen3_compare/modeling_qwen3.py",
@@ -117,7 +117,7 @@ def require_transformers_fork():
         bool(missing),
         reason=(
             "modified Transformers fork unavailable; run `git submodule "
-            "update --init integration/transformers`"
+            "update --init third_party/transformers`"
         ),
     )
 

@@ -1,5 +1,5 @@
 # tests/test_e2e_correctness_hf.py
-# PYTHONPATH=./:./monitoring:$PYTHONPATH E2E_PRINT_TEXT=1 E2E_HF_DROP_LAST_TOKEN=1 E2E_PRINT_TOPK_LOGITS=1 pytest -q -s tests/test_e2e_correctness_vs_hf.py
+# PYTHONPATH=./src:$PYTHONPATH E2E_PRINT_TEXT=1 E2E_HF_DROP_LAST_TOKEN=1 E2E_PRINT_TOPK_LOGITS=1 pytest -q -s tests/test_e2e_correctness_vs_hf.py
 """E2E correctness test: monitoring DB vs HuggingFace Transformers (HF-driven ground truth).
 
 This test runs the repo monitoring pipeline end-to-end (native backend + host engine + ClickHouse),
@@ -83,8 +83,8 @@ pytestmark = [
     pytest.mark.hf,
 ]
 
-from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
-from monitoring.segment_merger import merge_segments, parse_internal_id
+from dmi.storage.clickhouse import CHClickhouseDriverReadOnly
+from dmi.storage.reassembly import merge_segments, parse_internal_id
 
 from .hf_reference import (
     _HFGenRef,
@@ -112,6 +112,24 @@ def _resolve_model_id(model: str) -> str:
 # ---------------------------------------------------------------------------
 # Small utils (inlined to avoid test-only deps)
 # ---------------------------------------------------------------------------
+
+
+def _source_subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Return a child environment that imports DMI and HF from this checkout."""
+
+    env = os.environ.copy()
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    source_roots = (
+        os.path.join(repo_root, "src"),
+        os.path.join(repo_root, "third_party", "transformers", "src"),
+    )
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (*source_roots, existing) if value
+    )
+    if extra:
+        env.update(extra)
+    return env
 
 
 def bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -167,7 +185,7 @@ def _canon_layer_and_act(act_name_raw: str, layer_no_raw: int) -> Tuple[int, str
 
 def _make_ring_cfg():
     """Build RingConfig from E2E_RING_* environment variables."""
-    from monitoring._native_engine import RingConfig  # type: ignore
+    from dmi.transport.native import RingConfig  # type: ignore
     rc = RingConfig()
     rc.task_ring_entries          = int(os.environ.get("E2E_RING_TASK_ENTRIES", "16384"))
     rc.payload_ring_bytes         = int(os.environ.get("E2E_RING_PAYLOAD_BYTES", str(4 * 1024**3)))
@@ -186,8 +204,8 @@ def _make_ring_cfg():
 
 def _make_host_cfg(db_cfg_native):
     """Build HostEngineConfig with clickhouse insert stage from env vars."""
-    from monitoring import HostEngineConfig  # type: ignore
-    from monitoring._native_engine import StageConfig  # type: ignore
+    from dmi import HostEngineConfig  # type: ignore
+    from dmi.transport.native import StageConfig  # type: ignore
     parallelism = int(os.environ.get("E2E_CH_PARALLELISM", "10"))
     stage = StageConfig.clickhouse_insert(db_cfg_native, parallelism=parallelism,
                                           name="clickhouse_insert")
@@ -231,7 +249,7 @@ def test_e2e_correctness_hf(subtests) -> None:
         r1 = subprocess.run(
             [sys.executable, "-m", "tests.hf_reference_runner",
              "--output-dir", ref_dir],
-            env=os.environ, capture_output=True, text=True, cwd=project_root,
+            env=_source_subprocess_env(), capture_output=True, text=True, cwd=project_root,
         )
         if r1.returncode != 0:
             pytest.fail(f"Reference runner failed:\n{r1.stderr[-2000:]}")
@@ -241,7 +259,7 @@ def test_e2e_correctness_hf(subtests) -> None:
         r2 = subprocess.run(
             [sys.executable, "-m", "tests.hf_monitored_runner",
              "--output-dir", mon_dir],
-            env=os.environ, capture_output=True, text=True, cwd=project_root,
+            env=_source_subprocess_env(), capture_output=True, text=True, cwd=project_root,
         )
         if r2.returncode != 0:
             pytest.fail(f"Monitored runner failed:\n{r2.stderr[-2000:]}")
@@ -253,7 +271,7 @@ def test_e2e_correctness_hf(subtests) -> None:
              "--ref-dir", ref_dir,
              "--mon-dir", mon_dir,
              "--result-file", result_file],
-            env=os.environ, capture_output=True, text=True, cwd=project_root,
+            env=_source_subprocess_env(), capture_output=True, text=True, cwd=project_root,
         )
         if r3.returncode != 0:
             pytest.fail(f"Comparator failed:\n{r3.stderr[-2000:]}")
@@ -280,13 +298,13 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
         pytest.skip("clickhouse-driver is required")
 
     try:
-        from monitoring import (  # type: ignore
+        from dmi import (  # type: ignore
             MonitoringConfig,
             MonitoringEngine,
         )
-        from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
-        from monitoring.config import CaptureSchedule  # type: ignore
-        from integration.hf_adapter import generate_with_monitoring  # type: ignore
+        from dmi.transport.native import ClickHouseClientConfig  # type: ignore
+        from dmi.config import CaptureSchedule  # type: ignore
+        from dmi.adapters.huggingface.generation import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
 
@@ -411,7 +429,7 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
         engine.close()
 
     # -----------------------------------------------------------------------
-    # Read DB (monitoring.clickhouse_reader + monitoring.segment_merger)
+    # Read DB (dmi.storage.clickhouse + dmi.storage.reassembly)
     # -----------------------------------------------------------------------
 
     ch = CHClickhouseDriverReadOnly(
@@ -536,9 +554,11 @@ def _test_e2e_correctness_hf_legacy(subtests) -> None:
     # and ensures clean GPU memory isolation.
     import subprocess, tempfile
     ref_dir = tempfile.mkdtemp(prefix="hf_ref_")
-    ref_env = {**os.environ, "E2E_BATCH_SIZE": str(batch_size),
-               "E2E_MAX_NEW_TOKENS": str(max_new_tokens),
-               "E2E_MODEL": os.environ.get("E2E_MODEL", "gpt2")}
+    ref_env = _source_subprocess_env({
+        "E2E_BATCH_SIZE": str(batch_size),
+        "E2E_MAX_NEW_TOKENS": str(max_new_tokens),
+        "E2E_MODEL": os.environ.get("E2E_MODEL", "gpt2"),
+    })
     ref_result = subprocess.run(
         [sys.executable, "-m", "tests.hf_reference_runner", "--output-dir", ref_dir],
         env=ref_env, capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(__file__)),
@@ -861,13 +881,13 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
         pytest.skip("clickhouse-driver is required")
 
     try:
-        from monitoring import (  # type: ignore
+        from dmi import (  # type: ignore
             MonitoringConfig,
             MonitoringEngine,
         )
-        from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
-        from monitoring.config import CaptureSchedule  # type: ignore
-        from integration.hf_adapter import generate_with_monitoring  # type: ignore
+        from dmi.transport.native import ClickHouseClientConfig  # type: ignore
+        from dmi.config import CaptureSchedule  # type: ignore
+        from dmi.adapters.huggingface.generation import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
 
@@ -993,8 +1013,8 @@ def test_e2e_correctness_hf_cuda_graphs(subtests) -> None:
     # -----------------------------------------------------------------------
     # Read DB
     # -----------------------------------------------------------------------
-    from monitoring.clickhouse_reader import CHClickhouseDriverReadOnly
-    from monitoring.segment_merger import merge_segments, parse_internal_id
+    from dmi.storage.clickhouse import CHClickhouseDriverReadOnly
+    from dmi.storage.reassembly import merge_segments, parse_internal_id
 
     ch = CHClickhouseDriverReadOnly(
         host=str(db_cfg_native.host),
@@ -1307,15 +1327,15 @@ def test_e2e_cuda_graphs_vs_eager_hf(subtests) -> None:
     # CUDA graph mode: monitored runs with static cache + torch.compile.
     # Reference runs eager.  Relaxed tolerance for bf16 rounding from
     # different accumulation order (compiled vs uncompiled).
-    mon_env = {**os.environ, "E2E_CUDA_GRAPHS": "1"}
-    cmp_env = {**os.environ, "E2E_TOLERANCE": "0.5"}
+    mon_env = _source_subprocess_env({"E2E_CUDA_GRAPHS": "1"})
+    cmp_env = _source_subprocess_env({"E2E_TOLERANCE": "0.5"})
 
     try:
         print("\n  [1/3] Reference run (original model, eager)...", flush=True)
         r1 = subprocess.run(
             [sys.executable, "-m", "tests.hf_reference_runner",
              "--output-dir", ref_dir],
-            env=os.environ, capture_output=True, text=True, cwd=project_root,
+            env=_source_subprocess_env(), capture_output=True, text=True, cwd=project_root,
         )
         if r1.returncode != 0:
             pytest.fail(f"Reference runner failed:\n{r1.stderr[-2000:]}")
@@ -1359,13 +1379,13 @@ def _test_e2e_cuda_graphs_vs_eager_hf_legacy(subtests) -> None:
         pytest.skip("clickhouse-driver is required")
 
     try:
-        from monitoring import (  # type: ignore
+        from dmi import (  # type: ignore
             MonitoringConfig,
             MonitoringEngine,
         )
-        from monitoring._native_engine import ClickHouseClientConfig  # type: ignore
-        from monitoring.config import CaptureSchedule  # type: ignore
-        from integration.hf_adapter import generate_with_monitoring  # type: ignore
+        from dmi.transport.native import ClickHouseClientConfig  # type: ignore
+        from dmi.config import CaptureSchedule  # type: ignore
+        from dmi.adapters.huggingface.generation import generate_with_monitoring  # type: ignore
     except Exception as exc:
         pytest.skip(f"monitoring native extension not available: {exc}")
 

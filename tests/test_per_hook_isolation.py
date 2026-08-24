@@ -64,6 +64,7 @@ from tests._requirements import (
 )
 from tests.isolate_hook import (
     _COPY_LINE_RE,
+    _COMPARE_MODEL_PATHS,
     _patched_source,
     compare_model_path,
     isolated_hook,
@@ -267,7 +268,6 @@ _HF_RUNNER = dedent("""
     MODEL_ALIASES = {
         'gpt2': 'gpt2',
         'qwen3': 'Qwen/Qwen3-0.6B',
-        'qwen2_moe': 'Qwen/Qwen1.5-MoE-A2.7B',
         'llama': 'meta-llama/Llama-3.1-8B',
     }
     hf_id = MODEL_ALIASES[args.model_key]
@@ -287,8 +287,6 @@ _HF_RUNNER = dedent("""
         # file before launching this subprocess and unpatches after.
         if args.model_key == 'qwen3':
             from transformers.models.qwen3_compare.modeling_qwen3 import CompareQwen3ForCausalLM as model_cls
-        elif args.model_key == 'qwen2_moe':
-            from transformers.models.qwen2_moe_compare.modeling_qwen2_moe import CompareQwen2MoeForCausalLM as model_cls
         elif args.model_key == 'gpt2':
             from transformers.models.gpt2_compare.modeling_gpt2 import CompareGPT2LMHeadModel as model_cls
         elif args.model_key == 'llama':
@@ -307,10 +305,10 @@ _HF_RUNNER = dedent("""
     elif args.rollout == 'ours':
         if args.model_key == 'qwen3':
             from transformers.models.qwen3_p.modeling_qwen3 import HookedQwen3ForCausalLM as model_cls
-        elif args.model_key == 'qwen2_moe':
-            from transformers.models.qwen2_moe_p.modeling_qwen2_moe import HookedQwen2MoeForCausalLM as model_cls
         elif args.model_key == 'gpt2':
             from transformers.models.gpt2_p.modeling_gpt2 import HookedGPT2LMHeadModel as model_cls
+        elif args.model_key == 'llama':
+            from transformers.models.llama_p.modeling_llama import HookedLlamaForCausalLM as model_cls
         else:
             raise ValueError(f'unsupported model_key={args.model_key!r} for HF ours rollout')
         from transformers import AutoTokenizer
@@ -339,12 +337,12 @@ _HF_RUNNER = dedent("""
         gen_kwargs['compile_config'] = CompileConfig(mode='reduce-overhead', fullgraph=False)
 
     if args.rollout == 'ours':
-        # Drive monitoring through HFAdaptor with hook_selection=H.  The
+        # Drive monitoring through HuggingFaceAdapter with hook_selection=H. The
         # ring transport runs without ClickHouse (no db_config).
-        from monitoring import MonitoringEngine, MonitoringConfig
-        from monitoring.config import CaptureSchedule
-        from monitoring._native_engine import RingConfig
-        from integration.hf_adapter import generate_with_monitoring
+        from dmi import MonitoringEngine, MonitoringConfig
+        from dmi.config import CaptureSchedule
+        from dmi.transport.native import RingConfig
+        from dmi.adapters.huggingface.generation import generate_with_monitoring
         cfg = MonitoringConfig(schedule=CaptureSchedule(capture_prefill=True, capture_decode=True))
         engine = MonitoringEngine(config=cfg, model_id='per_hook_isolation')
         ring_cfg = RingConfig()
@@ -376,6 +374,15 @@ _HF_RUNNER = dedent("""
 def _build_subprocess_env() -> dict:
     """Pin GPU 0 and use the active environment's native libraries."""
     env = os.environ.copy()
+    source_paths = (
+        REPO_ROOT / "src",
+        REPO_ROOT / "third_party" / "transformers" / "src",
+    )
+    pythonpath = [str(path) for path in source_paths]
+    existing_pythonpath = env.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     conda_prefix = env.get("CONDA_PREFIX")
     if conda_prefix:
         ld = env.get("LD_LIBRARY_PATH", "")

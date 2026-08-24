@@ -1,21 +1,34 @@
-# HuggingFace Usage
+# HuggingFace usage
 
-Run DMI through the HuggingFace path after completing
-[`install.md`](install.md). The HF path uses the modified Transformers submodule
-and DMI's generation wrapper.
+## Install the HuggingFace backend
+
+Use a dedicated environment and DMI checkout for the HuggingFace backend. Do
+not reuse the vLLM environment or checkout. Complete the
+[core installation](install.md), then install the modified Transformers
+submodule editable and rebuild the environment-specific native extension:
+
+```bash
+pip install -e third_party/transformers/
+make -C native clean
+make -C native -j
+python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
+```
+
+The HuggingFace path uses that modified Transformers checkout and DMI's
+generation wrapper.
 
 ## Sanity check
 
 Run vanilla HF generation first:
 
 ```bash
-python benchmark/scripts/hf_generate.py \
+python benchmarks/scripts/hf_generate.py \
     --model gpt2 --device cuda --batch-size 8 --max-new-tokens 16
 ```
 
 ## DMI monitoring (transport only or with persistence)
 
-Both flows go through `benchmark.bench_hf_transport`. Pick the mode that
+Both flows go through `benchmarks.bench_hf_transport`. Pick the mode that
 matches whether you want to persist captures:
 
 - `ring_null` — Ring² capture + transport, drop on the host. Isolates transport
@@ -29,6 +42,18 @@ Inspect captured rows after a `ring_db` run:
 clickhouse-client --query "SELECT count() FROM default.offload"
 ```
 
+### End-to-end persistence smoke check
+
+Run the visualization demo's HF offload script and verify that it persisted
+rows to ClickHouse:
+
+```bash
+python examples/visualization/run_offload_hf.py
+clickhouse-client --query "SELECT count() FROM default.offload WHERE model_id='demo_hf'"
+```
+
+Expect generated text on stdout and a non-zero row count.
+
 ## Reading internals from HF generation output
 
 `generate_with_monitoring(...)` preserves Hugging Face's normal return behavior.
@@ -36,8 +61,8 @@ Use `generate_with_monitoring_dict(...)` when you want a dict-style generation
 output with DMI internals attached:
 
 ```python
-from integration.hf_adapter import generate_with_monitoring_dict
-from monitoring.internal_mapper import InternalRequirements
+from dmi.adapters.huggingface import generate_with_monitoring_dict
+from dmi.storage.internals import InternalRequirements
 
 requirements = InternalRequirements().require(
     "hidden_states",
@@ -204,7 +229,7 @@ The benchmark compares:
 | `hf_offload` | HF's `output_hidden_states=True` path |
 
 ```bash
-python -m benchmark.bench_hf_transport \
+python -m benchmarks.bench_hf_transport \
     --model qwen3 --batch-size 4 \
     --prefill-len 1 --decode-len 16 \
     --warmup 1 --iters 3 \

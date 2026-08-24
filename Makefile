@@ -1,15 +1,21 @@
-.PHONY: all monitoring host test-cpu test-host clean
-
-MONITORING_DIR ?= $(CURDIR)/monitoring
 PYTHON ?= python
 
-all: monitoring
+.PHONY: all native host clean check check-compile test test-all test-cpu test-host test-package
 
-monitoring:
-	$(MAKE) -C $(MONITORING_DIR)
+NATIVE_DIR ?= $(CURDIR)/native
+
+all: native
+
+native:
+	$(MAKE) -C $(NATIVE_DIR)
 
 host:
-	$(MAKE) -C $(MONITORING_DIR) host
+	$(MAKE) -C $(NATIVE_DIR) host
+
+clean:
+	$(MAKE) -C $(NATIVE_DIR) clean
+
+test: test-cpu
 
 test-cpu:
 	$(PYTHON) -m pytest -m cpu -q
@@ -17,8 +23,17 @@ test-cpu:
 test-host: host
 	$(PYTHON) -m pytest tests/test_cpu_native_build.py \
 		tests/test_clickhouse_host_benchmark.py tests/test_test_harness.py -q
-	$(PYTHON) -c "from monitoring import _native_engine as n; host = n._load_named_extension(n._HOST_EXTENSION_NAME); assert host.DMXHostEngine.__module__ == 'monitoring_host_backend'"
-	$(PYTHON) -c "import sys; from monitoring.integration_api.v1 import DMXHostEngine; assert DMXHostEngine.__module__ in {'monitoring_host_backend', 'monitoring_native_backend'}; assert 'monitoring.ring_transport' not in sys.modules"
+	$(PYTHON) -c "import sys; sys.path.insert(0, '$(CURDIR)/src'); from dmi.transport import native; host = native._load_named_extension(native._HOST_EXTENSION_NAME); assert host.DMXHostEngine.__module__ == '_host_backend'"
+	$(PYTHON) -c "import sys; sys.path.insert(0, '$(CURDIR)/src'); from dmi.api.v1 import DMXHostEngine; assert DMXHostEngine.__module__ in {'_host_backend', '_native_backend'}; assert 'dmi.transport.ring' not in sys.modules"
 
-clean:
-	$(MAKE) -C $(MONITORING_DIR) clean
+test-all:
+	$(PYTHON) -m pytest -q
+
+# Internal Python package-layout regression; this does not qualify a release artifact.
+test-package:
+	$(PYTHON) tests/tools/check_package.py
+
+check-compile:
+	$(PYTHON) -m compileall -q src/dmi tests benchmarks examples
+
+check: check-compile test-cpu test-package

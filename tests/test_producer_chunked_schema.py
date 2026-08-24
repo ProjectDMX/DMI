@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from monitoring._native_engine import _load_extension
+from dmi.transport.native import _load_extension
 
 pytestmark = pytest.mark.native_backend
 
@@ -41,7 +41,7 @@ def test_producer_chunked_op_registered():
 
 def test_hook_point_strip_attrs_default_to_static():
     """HookPoint instances default to the static path."""
-    from monitoring.hook_points import HookPoint
+    from dmi.hooks.point import HookPoint
     hp = HookPoint()
     assert hp._strip_tensor is None
     assert hp._strip_row_bytes == 0
@@ -88,7 +88,7 @@ def test_hook_point_strip_attrs_settable_for_prefix_mode():
     """Setting _strip_tensor + _strip_row_bytes > 0 selects prefix mode."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    from monitoring.hook_points import HookPoint
+    from dmi.hooks.point import HookPoint
     hp = HookPoint()
     rc = torch.tensor([3], dtype=torch.int64, device="cuda")
     hp._strip_tensor = rc
@@ -102,7 +102,7 @@ def test_hook_point_strip_attrs_settable_for_chunked_mode():
     """Setting _strip_tensor + _strip_row_bytes == 0 selects chunked mode."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    from monitoring.hook_points import HookPoint
+    from dmi.hooks.point import HookPoint
     hp = HookPoint()
     cb = torch.tensor([3, 7, 0, 5], dtype=torch.int64, device="cuda")
     hp._strip_tensor = cb

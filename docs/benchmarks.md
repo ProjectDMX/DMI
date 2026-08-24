@@ -5,7 +5,7 @@ observation-enabled baselines.
 
 ## Host-to-ClickHouse throughput
 
-`benchmark.bench_clickhouse_host` isolates the host sink from model execution
+`benchmarks.bench_clickhouse_host` isolates the host sink from model execution
 and CUDA. It prepares a deterministic pool of CPU tensors, submits a fixed row
 count through `DMXHostEngine`, drains the native queue, and verifies the stored
 row and payload-byte counts.
@@ -25,11 +25,11 @@ for support tiers. Build the CPU-only host backend, install
 `clickhouse-driver`, and run:
 
 ```bash
-make -C monitoring host -j
+make -C native host -j
 ```
 
 ```bash
-python -m benchmark.bench_clickhouse_host \
+python -m benchmarks.bench_clickhouse_host \
   --rows 10000 \
   --payload-bytes 64KiB \
   --min-batch-bytes 16MiB \
@@ -81,7 +81,7 @@ Setup: 1 hidden-state hook per layer + final-LN + logits (38 / 34 / 42 hooks
 total on Qwen3-4B / Llama-3.1-8B / Qwen3-14B). Normalized to HuggingFace Ideal.
 
 <p align="center">
-  <img src="../Figures/offline_hs_logits_real.png" alt="Offline throughput with limited hooks, normalized to HF ideal" width="100%" />
+  <img src="assets/images/offline_hs_logits_real.png" alt="Offline throughput with limited hooks, normalized to HF ideal" width="100%" />
 </p>
 
 DMI stays close to the HF-ideal line across all configurations. Python-callback
@@ -95,7 +95,7 @@ is bottlenecked similarly — it materializes internals on the hot path.
 Setup: vLLM serve, varying request rate on ShareGPT and WildChat.
 
 <p align="center">
-  <img src="../Figures/tpot_comparison.png" alt="Online TPOT vs request rate" width="100%" />
+  <img src="assets/images/tpot_comparison.png" alt="Online TPOT vs request rate" width="100%" />
 </p>
 
 DMI tracks the no-monitor baseline closely. The synchronous hook/debug baselines

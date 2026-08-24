@@ -74,8 +74,8 @@
     <section class="flow" aria-label="Native extension selection flow">
       <div class="card">
         <h2>Python import surfaces</h2>
-        <p><code>monitoring._native_engine</code> and host exports from
-          <code>integration_api.v1</code> resolve lazily.</p>
+        <p><code>dmi.transport.native</code> and host exports from
+          <code>dmi.api.v1</code> resolve lazily.</p>
         <span class="tag">DMXHostEngine</span>
         <span class="tag">StageConfig</span>
         <span class="tag">RingEngine</span>
@@ -84,14 +84,14 @@
       <div class="stack">
         <article class="card host">
           <h2>CPU-only host backend</h2>
-          <p><code>make -C monitoring host</code></p>
+          <p><code>make -C native host</code></p>
           <span class="tag">PyTorch CPU</span>
           <span class="tag">clickhouse-cpp</span>
           <span class="tag">no nvcc</span>
         </article>
         <article class="card full">
           <h2>Full capture backend</h2>
-          <p><code>make -C monitoring</code></p>
+          <p><code>make -C native</code></p>
           <span class="tag">host backend</span>
           <span class="tag">CUDA ring</span>
           <span class="tag">torch ops</span>
@@ -104,14 +104,14 @@
         <h2>Host export requested</h2>
         <ul>
           <li>Use the full backend when it is loadable.</li>
-          <li>Otherwise fall back to <code>monitoring_host_backend</code>.</li>
+          <li>Otherwise fall back to <code>_host_backend</code>.</li>
           <li>Supports local ClickHouse benchmarking on CPU-only machines.</li>
         </ul>
       </article>
       <article class="card">
         <h2>Ring export requested</h2>
         <ul>
-          <li>Load only <code>monitoring_native_backend</code>.</li>
+          <li>Load only <code>_native_backend</code>.</li>
           <li>Fail with the full-build command when CUDA support is absent.</li>
           <li>Never present a partial ring implementation.</li>
         </ul>

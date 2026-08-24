@@ -1,6 +1,6 @@
 # DMI integration API v1
 
-`monitoring.integration_api.v1` is the supported boundary between DMI core and
+`dmi.api.v1` is the supported boundary between DMI core and
 an external framework integration. It specifies how an integration constructs
 the runtime, describes model hooks, publishes metadata before a forward pass,
 and reads captured tensors back.
@@ -12,7 +12,7 @@ integration repository.
 ## Import and version check
 
 ```python
-import monitoring.integration_api.v1 as dmi
+import dmi.api.v1 as dmi
 
 if dmi.DMI_INTEGRATION_API_VERSION != 1:
     raise RuntimeError("This integration requires DMI integration API v1")
@@ -22,10 +22,11 @@ if dmi.DMI_INTEGRATION_API_VERSION != 1:
 DMI package version or native-extension ABI version. This module always
 exports `1`, even after a future `v2` module is added.
 
-Importing the facade loads DMI's native hook definitions. It does not construct
-an engine, allocate ring buffers, start host threads, import an inference
-framework, or register framework-specific presets. Re-exported objects use the
-same transport and selection state as DMI core.
+Importing the facade loads DMI's pure-Python mirror of the native hook
+definitions. It does not load the compiled extension, construct an engine,
+allocate ring buffers, start host threads, import an inference framework, or
+register framework-specific presets. Re-exported objects use the same
+transport and selection state as DMI core.
 
 ## Complete lifecycle
 
@@ -33,7 +34,7 @@ An integration follows this order:
 
 1. Create the optional ClickHouse host pipeline.
 2. Create one `MonitoringEngine`, which starts the host pipeline and GPU ring.
-3. Construct a framework-specific `BackendAdaptor` subclass.
+3. Construct a framework-specific `BackendAdapter` subclass.
 4. Call `attach_model()` after model loading and before compilation, warmup, or
    a monitored forward.
 5. If the framework performs warmup or graph capture, call
@@ -52,7 +53,7 @@ replaced, recreate the adaptor and reinstall hooks.
 ### Minimal construction
 
 ```python
-import monitoring.integration_api.v1 as dmi
+import dmi.api.v1 as dmi
 
 clickhouse = dmi.ClickHouseClientConfig()
 clickhouse.host = "localhost"
@@ -264,14 +265,17 @@ re-enabling or replacing the ring, recreating the adaptor, and reinstalling
 hooks. `set_capture_enabled(True)` does not reverse this teardown operation.
 This is teardown plumbing, not a substitute for `MonitoringEngine.close()`.
 
-### `BackendAdaptor`
+### `BackendAdapter`
 
 ```python
-BackendAdaptor(engine: MonitoringEngine, model_id: str)
+BackendAdapter(engine: MonitoringEngine, model_id: str)
 ```
 
 This abstract base implements hook attachment and the shared pre-forward
 driver. A framework integration implements:
+
+`BackendAdaptor` remains a compatibility alias for integrations written
+against the original API v1 spelling.
 
 ```python
 detect_model_shape(self, model) -> ModelShapeConfig
@@ -1218,7 +1222,7 @@ finally:
 ## Compatibility policy
 
 External integration code should import DMI functionality only from
-`monitoring.integration_api.v1`.
+`dmi.api.v1`.
 
 Compatible additions to v1 include a new export that does not change existing
 behavior, an optional argument with a backward-compatible default, or new hook
@@ -1242,4 +1246,4 @@ DMI package release number.
 This contract does not define framework scheduler ordering, worker lifecycle,
 model implementations, compilation or graph-dispatch behavior, serving
 endpoints, or supported framework versions. It does not make unexported
-`monitoring.*` implementation details stable.
+`dmi.*` implementation details stable.

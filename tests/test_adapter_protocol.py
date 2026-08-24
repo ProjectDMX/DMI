@@ -1,4 +1,4 @@
-"""Unit tests for BackendAdaptor step planning and commit ordering.
+"""Unit tests for BackendAdapter step planning and commit ordering.
 
 Uses fakes for MonitoringEngine, RingTransport, and RingEngine to verify
 the driver flow:
@@ -10,8 +10,9 @@ the driver flow:
     set transport.force_eager from (result == 2) OR needs_eager.
     -> set_step_context -> pre_push_all_metas
 
-No GPU required; imports the native hook-definition layer through
-BackendAdaptor's ring_transport dependency.
+No GPU or compiled backend is required.  The adapter base depends only on the
+Python hook-definition and dispatch layers, so this suite belongs in the CPU
+PR gate.
 """
 from __future__ import annotations
 
@@ -19,26 +20,10 @@ import dataclasses
 
 import pytest
 
-try:
-    from monitoring.adaptor_base import (
-        BackendAdaptor,
-        StepPlan,
-        StepReservation,
-    )
-    from monitoring.step_context import StepContext
-    _NATIVE_IMPORT_ERROR = None
-except ImportError as exc:
-    BackendAdaptor = object
-    StepContext = None
-    _NATIVE_IMPORT_ERROR = exc
+from dmi.adapters.base import BackendAdapter, StepPlan, StepReservation
+from dmi.adapters.types import StepContext
 
-pytestmark = [
-    pytest.mark.native_backend,
-    pytest.mark.skipif(
-        _NATIVE_IMPORT_ERROR is not None,
-        reason=f"DMI native backend required: {_NATIVE_IMPORT_ERROR}",
-    ),
-]
+pytestmark = pytest.mark.cpu
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +67,8 @@ class FakeEngine:
         self._ring_engine = FakeRingEngine(prepare_step_result)
 
 
-class StubAdaptor(BackendAdaptor):
-    """Concrete BackendAdaptor with fixed StepContext + recordable callbacks."""
+class StubAdapter(BackendAdapter):
+    """Concrete BackendAdapter with fixed StepContext and recorded callbacks."""
 
     def __init__(self, engine, model_id, ctx, step_plan=(1024, 3, False)):
         super().__init__(engine, model_id)
@@ -149,7 +134,7 @@ def _make_ctx() -> StepContext:
 def _make_adaptor(prepare_result, ctx_override=..., step_plan=(1024, 3, False)):
     engine = FakeEngine(prepare_step_result=prepare_result)
     ctx = _make_ctx() if ctx_override is ... else ctx_override
-    return StubAdaptor(engine, "test_model", ctx, step_plan=step_plan)
+    return StubAdapter(engine, "test_model", ctx, step_plan=step_plan)
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +287,7 @@ def test_capacity_exceeded_result_two():
     assert a.transport.force_eager is True
     assert len(a.adapt_for_cpu_direct_calls) == 1
     assert len(a.on_capacity_exceeded_calls) == 1
-    # on_capacity_exceeded receives the post-adapt ctx (StubAdaptor.adapt_for_cpu_direct
+    # on_capacity_exceeded receives the post-adapt ctx (StubAdapter.adapt_for_cpu_direct
     # bumps q_len by 100).
     assert a.on_capacity_exceeded_calls[0].q_len == 4 + 100
     assert a.warn_calls[0][1:] == (1024, 3)
@@ -381,7 +366,7 @@ def test_null_offload_short_circuits():
 def test_register_preset_raises_on_duplicate():
     """selection.register_preset is strict-by-default."""
     import pytest
-    from monitoring import selection
+    from dmi.hooks import selection
 
     # "full" is registered at module load -- re-registering must raise.
     with pytest.raises(ValueError, match="already registered"):
@@ -390,7 +375,7 @@ def test_register_preset_raises_on_duplicate():
 
 def test_register_preset_adds_new_name():
     """A novel name registers successfully and is resolvable."""
-    from monitoring import selection
+    from dmi.hooks import selection
 
     name = "_test_phase1_preset"
     assert name not in selection._HOOK_SELECTIONS
