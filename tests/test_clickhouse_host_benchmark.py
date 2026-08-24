@@ -172,6 +172,30 @@ def test_query_log_selects_one_insert_event_kind(async_insert, query_kind):
     assert client.params["query_kind"] == query_kind
 
 
+def test_query_log_preserves_measurement_start_microseconds():
+    class Client:
+        def __init__(self):
+            self.query = None
+            self.params = None
+
+        def execute(self, query, params=None):
+            if query == "SYSTEM FLUSH LOGS":
+                return []
+            self.query = query
+            self.params = params
+            return [(0, 0, 0, float("nan"), float("nan"))]
+
+    client = Client()
+    _query_log_metrics(
+        client,
+        BenchmarkConfig(),
+        datetime(2026, 8, 24, 15, 53, 50, 408123),
+    )
+
+    assert "toDateTime64(%(started_at)s, 6)" in client.query
+    assert client.params["started_at"] == "2026-08-24 15:53:50.408123"
+
+
 def test_trial_measurement_reports_enqueue_and_drain_separately():
     trial = TrialMeasurement(
         rows=4,

@@ -23,6 +23,7 @@ importing this file costs nothing.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import shutil
 import socket
 
@@ -32,8 +33,10 @@ __all__ = [
     "require_cuda",
     "require_gpus",
     "require_clickhouse",
+    "require_native_backend",
     "require_model_cache",
     "require_nvcc",
+    "require_transformers_fork",
 ]
 
 
@@ -80,6 +83,42 @@ def require_clickhouse(host: str | None = None, port: int | None = None):
         reachable = False
     return pytest.mark.skipif(
         not reachable, reason=f"ClickHouse unreachable at {host}:{port}"
+    )
+
+
+def require_native_backend():
+    """Skip unless the full native ring backend is loadable."""
+    error = None
+    try:
+        from monitoring import _native_engine
+
+        _native_engine._load_extension()
+    except Exception as exc:
+        error = exc
+    return pytest.mark.skipif(
+        error is not None,
+        reason=f"DMI full native backend unavailable: {error}",
+    )
+
+
+def require_transformers_fork():
+    """Skip unless the in-repo Transformers fork is initialized."""
+    root = Path(__file__).resolve().parents[1]
+    models = root / "integration/transformers/src/transformers/models"
+    required = (
+        root / "integration/transformers/src/transformers/__init__.py",
+        models / "gpt2_compare/modeling_gpt2.py",
+        models / "llama_compare/modeling_llama.py",
+        models / "qwen3_compare/modeling_qwen3.py",
+        models / "qwen3_p/modeling_qwen3.py",
+    )
+    missing = [path.relative_to(root) for path in required if not path.is_file()]
+    return pytest.mark.skipif(
+        bool(missing),
+        reason=(
+            "modified Transformers fork unavailable; run `git submodule "
+            "update --init integration/transformers`"
+        ),
     )
 
 

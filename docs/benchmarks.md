@@ -21,8 +21,12 @@ host platform and keep it outside this repository:
 - [Docker image](https://hub.docker.com/r/clickhouse/clickhouse-server/)
 
 See ClickHouse's [supported-platform matrix](https://clickhouse.com/support/platforms)
-for support tiers. Build the native backend, install `clickhouse-driver`, and
-run:
+for support tiers. Build the CPU-only host backend, install
+`clickhouse-driver`, and run:
+
+```bash
+make -C monitoring host -j
+```
 
 ```bash
 python -m benchmark.bench_clickhouse_host \
@@ -57,6 +61,9 @@ reach practical byte limits earlier. See ClickHouse's
 [`system.query_log`](https://clickhouse.com/docs/reference/system-tables/query_log),
 and [`system.parts`](https://clickhouse.com/docs/reference/system-tables/parts)
 documentation when interpreting results.
+
+See the [native build layout](native-build-layout.html) for the host/full
+extension boundary and loader behavior.
 
 Baselines:
 

@@ -23,6 +23,8 @@ import torch
 import torch.library
 from torch import nn
 
+from .model_shape import ModelShapeConfig
+
 
 # ---------------------------------------------------------------------------
 # Hook-type constants (values match C++ HookType enum in tensor_meta.h)
@@ -170,26 +172,6 @@ HOOK_TYPE_TO_SHORT_NAME: Dict[int, str] = {
 def align_up_py(x: int, a: int) -> int:
     """Python equivalent of ring::align_up (a must be a power of 2)."""
     return (x + a - 1) & ~(a - 1)
-
-
-# ---------------------------------------------------------------------------
-# ModelShapeConfig -- provided at hook-installation time
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ModelShapeConfig:
-    """Describes attention geometry for analytical shape computation."""
-    hidden_dim:   int
-    num_heads:    int
-    num_kv_heads: int   # == num_heads for MHA; < num_heads for GQA
-    head_dim:     int
-    dtype:        torch.dtype
-    vocab_size:   int = 0  # required for final_logits shape
-    intermediate_dim: int = 0  # MLP intermediate size (for mlp_post shape)
-    num_experts:  int = 0  # router_logits final dim
-    top_k:        int = 0  # topk_ids / topk_weights final dim
-    tp_size:      int = 1  # tensor parallel world size
-    tp_rank:      int = 0  # this rank's TP index
 
 
 # ---------------------------------------------------------------------------

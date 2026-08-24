@@ -394,14 +394,14 @@ def _query_log_metrics(
             SELECT count(), sum(written_rows), sum(written_bytes),
                    avg(query_duration_ms), quantileExact(0.95)(query_duration_ms)
             FROM system.query_log
-            WHERE event_time_microseconds >= %(started_at)s
+            WHERE event_time_microseconds >= toDateTime64(%(started_at)s, 6)
               AND type = 'QueryFinish'
               AND query_kind = %(query_kind)s
               AND written_rows > 0
               AND has(tables, %(table)s)
             """,
             {
-                "started_at": started_at,
+                "started_at": started_at.strftime("%Y-%m-%d %H:%M:%S.%f"),
                 "query_kind": "AsyncInsertFlush" if config.async_insert else "Insert",
                 "table": f"{config.database}.{config.table}",
             },

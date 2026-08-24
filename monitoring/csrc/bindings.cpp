@@ -1,17 +1,20 @@
 // Pybind11 module — ring transport + ClickHouse pipeline bindings
 
-#include <torch/extension.h>
+#include <torch/csrc/utils/pybind.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 namespace py = pybind11;
 
 #include "clickhouse_client.h"
 #include "dmx_host_engine.h"
+#ifndef DMI_HOST_ONLY
 #include "ring/ring_engine_py.h"
 #include "ring/ring_torch_op.h"
 #include "ring/tensor_meta.h"
+#endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+#ifndef DMI_HOST_ONLY
   // ---- Hook definitions (single source of truth from C++ HOOK_DEFS table) ----
   // Expose as list of (id, act_name, short_name, per_layer, group, tp_sharded,
   //                     shape_class, pp_stage) tuples — all ints except act_name/short_name.
@@ -26,6 +29,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("HOOK_DEFS") = defs;
     m.attr("HOOK_TYPE_COUNT") = (int)ring_py::HOOK_TYPE_COUNT;
   }
+#endif
   // ---- ClickHouseClientConfig (config only; stage is C++-only) ----
   py::class_<dmx_host::ClickHouseClientConfig>(m, "ClickHouseClientConfig")
       .def(py::init<>())
@@ -243,6 +247,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // -------------------------------------------------------------------------
   // Ring offload engine
   // -------------------------------------------------------------------------
+#ifndef DMI_HOST_ONLY
   py::class_<ring_py::RingConfig>(m, "RingConfig")
       .def(py::init<>())
       .def_readwrite("task_ring_entries",         &ring_py::RingConfig::task_ring_entries)
@@ -401,4 +406,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("ring_clear_active_engine",
         []() { ring_set_active_engine(nullptr); });
+#endif
 }

@@ -2,11 +2,21 @@ from types import SimpleNamespace
 
 import pytest
 
-from integration import hf_adapter
 from monitoring.internal_mapper import InternalRequirements
+from tests._requirements import require_native_backend
 
 
-def test_generate_with_monitoring_returns_impl_output_unchanged(monkeypatch):
+pytestmark = [pytest.mark.native_backend, require_native_backend()]
+
+
+@pytest.fixture(scope="module")
+def hf_adapter():
+    from integration import hf_adapter as module
+
+    return module
+
+
+def test_generate_with_monitoring_returns_impl_output_unchanged(monkeypatch, hf_adapter):
     expected = object()
 
     def fake_impl(model, *args, **kwargs):
@@ -17,7 +27,9 @@ def test_generate_with_monitoring_returns_impl_output_unchanged(monkeypatch):
     assert hf_adapter.generate_with_monitoring(object(), max_new_tokens=1) is expected
 
 
-def test_generate_with_monitoring_dict_forces_dict_and_attaches_lazy(monkeypatch):
+def test_generate_with_monitoring_dict_forces_dict_and_attaches_lazy(
+    monkeypatch, hf_adapter
+):
     output = SimpleNamespace(sequences="tokens")
     captured = {}
     reader = object()
@@ -48,7 +60,9 @@ def test_generate_with_monitoring_dict_forces_dict_and_attaches_lazy(monkeypatch
     assert requirements.expected_count("hidden_states") == 2
 
 
-def test_generate_with_monitoring_dict_warns_when_false_is_overridden(monkeypatch):
+def test_generate_with_monitoring_dict_warns_when_false_is_overridden(
+    monkeypatch, hf_adapter
+):
     output = SimpleNamespace(sequences="tokens")
     captured = {}
 

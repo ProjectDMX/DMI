@@ -138,22 +138,63 @@ cmake -S libs/clickhouse-cpp -B libs/clickhouse-cpp/build \
 cmake --build libs/clickhouse-cpp/build -j
 ```
 
-Build the DMI native backend:
+For host-side ClickHouse ingestion and benchmarking without CUDA, build the
+CPU-only backend:
+
+```bash
+make -C monitoring host -j
+# or: make host
+```
+
+This emits `monitoring_host_backend.<EXT_SUFFIX>.so` at the project root and
+inside `monitoring/`. It contains `DMXHostEngine`, stage and queue
+configuration, and the ClickHouse client, but no ring transport or CUDA
+symbols.
+
+For GPU capture and ring transport, build the full backend:
 
 ```bash
 make -C monitoring -j
 # or simply: make
 ```
 
-Artifacts are emitted as `monitoring_native_backend.<EXT_SUFFIX>.so` at the
-project root and inside `monitoring/`.
+This emits `monitoring_native_backend.<EXT_SUFFIX>.so` at the project root and
+inside `monitoring/`. When both extensions exist, host exports use the full
+backend; otherwise they fall back to the CPU-only backend. Ring exports always
+require the full backend. The v1 facade resolves host and ring names lazily, so
+importing a host type does not initialize ring support. See the
+[native build layout](native-build-layout.html).
 
-Smoke check (loads the built `.so`):
+Smoke check the package and host backend:
 
 ```bash
 python -c "import monitoring; print(monitoring.__file__)"
+python -c "from monitoring.integration_api.v1 import DMXHostEngine; print(DMXHostEngine.__module__)"
+```
+
+After a full build, smoke check the ring backend:
+
+```bash
 python -c "from monitoring._native_engine import RingConfig; print(RingConfig())"
 ```
+
+Run the dependency-free CPU gate without CUDA, ClickHouse, native artifacts,
+or initialized framework forks:
+
+```bash
+make test-cpu
+```
+
+Build and verify the CPU-only native host backend:
+
+```bash
+make test-host
+```
+
+Tests requiring the modified Transformers fork, the full CUDA backend, model
+weights, or ClickHouse carry separate markers and skip when their prerequisites
+are unavailable. `make test-host` does not download or start ClickHouse; use the
+host benchmark separately when a server is already available.
 
 ## 6. End-to-end smoke check
 
@@ -172,6 +213,8 @@ Expect the generated text on stdout and a non-zero row count.
 - **`ImportError` on `monitoring_native_backend`** — rebuild with
   `make -C monitoring clean && make -C monitoring -j`, then confirm `pip install -e .`
   used the active conda env.
+- **`ImportError` on `monitoring_host_backend`** — build with
+  `make -C monitoring host -j`; this target does not require CUDA or `nvcc`.
 - **Linker errors against `libclickhouse-cpp-lib`** — rerun step 5 and confirm
   `libs/clickhouse-cpp/build/clickhouse/` exists.
 - **`Connection refused` to ClickHouse** — check

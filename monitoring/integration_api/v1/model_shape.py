@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 import torch
 
-from monitoring.ring_transport import ModelShapeConfig
+from monitoring.model_shape import ModelShapeConfig
 
 
 def make_model_shape_from_hf_config(

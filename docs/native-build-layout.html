@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DMI native build layout</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0b1020;
+      --panel: #151c31;
+      --text: #edf2ff;
+      --muted: #aeb9d6;
+      --line: #3d4b70;
+      --host: #55d6be;
+      --full: #8aa7ff;
+      --accent: #ffc857;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top, #192342, var(--bg) 52%);
+      color: var(--text);
+      font: 16px/1.5 system-ui, sans-serif;
+    }
+    main { width: min(1080px, 92vw); margin: 0 auto; padding: 56px 0 72px; }
+    h1 { margin: 0 0 8px; font-size: clamp(2rem, 5vw, 3.5rem); }
+    h2 { margin-top: 0; font-size: 1.15rem; }
+    p { color: var(--muted); }
+    code { color: var(--accent); }
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr 64px 1fr;
+      gap: 18px;
+      align-items: stretch;
+      margin: 38px 0;
+    }
+    .stack { display: grid; gap: 18px; }
+    .card {
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 22px;
+      box-shadow: 0 18px 50px #0005;
+    }
+    .host { border-color: color-mix(in srgb, var(--host) 70%, var(--line)); }
+    .full { border-color: color-mix(in srgb, var(--full) 70%, var(--line)); }
+    .arrow { display: grid; place-items: center; color: var(--accent); font-size: 2rem; }
+    .tag {
+      display: inline-block;
+      margin: 4px 6px 4px 0;
+      padding: 4px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: .83rem;
+    }
+    .decision { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    ul { margin-bottom: 0; padding-left: 20px; color: var(--muted); }
+    strong { color: var(--text); }
+    @media (max-width: 760px) {
+      .flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); }
+      .decision { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>DMI native build layout</h1>
+    <p>Python import surfaces select the smallest native backend that can
+      satisfy each requested export.</p>
+
+    <section class="flow" aria-label="Native extension selection flow">
+      <div class="card">
+        <h2>Python import surfaces</h2>
+        <p><code>monitoring._native_engine</code> and host exports from
+          <code>integration_api.v1</code> resolve lazily.</p>
+        <span class="tag">DMXHostEngine</span>
+        <span class="tag">StageConfig</span>
+        <span class="tag">RingEngine</span>
+      </div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="stack">
+        <article class="card host">
+          <h2>CPU-only host backend</h2>
+          <p><code>make -C monitoring host</code></p>
+          <span class="tag">PyTorch CPU</span>
+          <span class="tag">clickhouse-cpp</span>
+          <span class="tag">no nvcc</span>
+        </article>
+        <article class="card full">
+          <h2>Full capture backend</h2>
+          <p><code>make -C monitoring</code></p>
+          <span class="tag">host backend</span>
+          <span class="tag">CUDA ring</span>
+          <span class="tag">torch ops</span>
+        </article>
+      </div>
+    </section>
+
+    <section class="decision">
+      <article class="card">
+        <h2>Host export requested</h2>
+        <ul>
+          <li>Use the full backend when it is loadable.</li>
+          <li>Otherwise fall back to <code>monitoring_host_backend</code>.</li>
+          <li>Supports local ClickHouse benchmarking on CPU-only machines.</li>
+        </ul>
+      </article>
+      <article class="card">
+        <h2>Ring export requested</h2>
+        <ul>
+          <li>Load only <code>monitoring_native_backend</code>.</li>
+          <li>Fail with the full-build command when CUDA support is absent.</li>
+          <li>Never present a partial ring implementation.</li>
+        </ul>
+      </article>
+    </section>
+  </main>
+</body>
+</html>
