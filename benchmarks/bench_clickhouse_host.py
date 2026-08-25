@@ -70,6 +70,7 @@ class BenchmarkConfig:
     max_linger_ms: float = 50.0
     queue_capacity_bytes: int = 512 * 1024**2
     queue_capacity_items: int = 20_000
+    index_granularity: int = 8192
     compression: str = "lz4"
     async_insert: bool = False
     drain_timeout_seconds: float = 300.0
@@ -97,6 +98,7 @@ class BenchmarkConfig:
             "max_batch_items": self.max_batch_items,
             "queue_capacity_bytes": self.queue_capacity_bytes,
             "queue_capacity_items": self.queue_capacity_items,
+            "index_granularity": self.index_granularity,
         }
         for name, value in positive.items():
             if value <= 0:
@@ -253,7 +255,7 @@ def _build_engine(config: BenchmarkConfig) -> Any:
     clickhouse.drop_existing_database = False
     clickhouse.client_side_compress = config.compression
     clickhouse.client_settings = build_client_settings(config.async_insert)
-    clickhouse.index_granularity = 8192
+    clickhouse.index_granularity = config.index_granularity
 
     stage = StageConfig.clickhouse_insert(
         clickhouse,
@@ -361,7 +363,7 @@ def _parts_metrics(client: Any, config: BenchmarkConfig) -> dict[str, int]:
     values = client.execute(
         """
         SELECT count(), sum(rows), sum(bytes_on_disk), sum(data_compressed_bytes),
-               sum(data_uncompressed_bytes), sum(primary_key_bytes_in_memory)
+               sum(data_uncompressed_bytes), sum(primary_key_size)
         FROM system.parts
         WHERE active AND database = %(database)s AND table = %(table)s
         """,
@@ -476,11 +478,11 @@ def _ensure_table(client: Any, config: BenchmarkConfig) -> None:
 def run(config: BenchmarkConfig) -> dict[str, Any]:
     payloads = generate_payload_pool(config)
     client = _connect(config)
-    _ensure_table(client, config)
     table = f"{quote_identifier(config.database)}.{quote_identifier(config.table)}"
     measured_model_id = f"host-bench-{uuid.uuid4().hex}"
     warnings: list[str] = []
     try:
+        _ensure_table(client, config)
         server_version = str(client.execute("SELECT version()")[0][0])
         if config.warmup_rows:
             warmup = _build_engine(config)
@@ -544,6 +546,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-linger-ms", type=float, default=50.0)
     parser.add_argument("--queue-capacity-bytes", type=parse_byte_size, default=512 * 1024**2)
     parser.add_argument("--queue-capacity-items", type=int, default=20_000)
+    parser.add_argument("--index-granularity", type=int, default=8192)
     parser.add_argument("--compression", choices=("none", "lz4", "zstd"), default="lz4")
     parser.add_argument("--async-insert", action="store_true")
     parser.add_argument("--drain-timeout-seconds", type=float, default=300.0)
@@ -580,6 +583,7 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         max_linger_ms=args.max_linger_ms,
         queue_capacity_bytes=args.queue_capacity_bytes,
         queue_capacity_items=args.queue_capacity_items,
+        index_granularity=args.index_granularity,
         compression=args.compression,
         async_insert=args.async_insert,
         drain_timeout_seconds=args.drain_timeout_seconds,

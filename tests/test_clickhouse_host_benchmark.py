@@ -6,9 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import benchmarks.bench_clickhouse_host as benchmark
 from benchmarks.bench_clickhouse_host import (
     BenchmarkConfig,
     TrialMeasurement,
+    _ensure_table,
+    _parts_metrics,
     _server_time,
     _query_log_metrics,
     _submit_and_drain,
@@ -54,6 +57,25 @@ def test_config_rejects_normal_pattern_for_integer_dtype():
 def test_config_rejects_invalid_native_tcp_port(port):
     with pytest.raises(ValueError, match="port"):
         BenchmarkConfig(port=port)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_linger_ms", float("nan")),
+        ("max_linger_ms", float("inf")),
+        ("drain_timeout_seconds", float("nan")),
+        ("drain_timeout_seconds", float("inf")),
+    ],
+)
+def test_config_rejects_non_finite_timings(field, value):
+    with pytest.raises(ValueError, match="finite"):
+        BenchmarkConfig(**{field: value})
+
+
+def test_config_rejects_non_positive_index_granularity():
+    with pytest.raises(ValueError, match="index_granularity"):
+        BenchmarkConfig(index_granularity=0)
 
 
 def test_config_uses_a_unique_benchmark_table_by_default():
@@ -127,6 +149,60 @@ def test_server_time_uses_clickhouse_clock():
             return [(datetime(2026, 8, 24, 15, 0),)]
 
     assert _server_time(Client()) == datetime(2026, 8, 24, 15, 0)
+
+
+def test_table_setup_uses_configured_index_granularity():
+    class Client:
+        query = None
+
+        def execute(self, query):
+            self.query = query
+
+    client = Client()
+    _ensure_table(client, BenchmarkConfig(index_granularity=4096))
+
+    assert "SETTINGS index_granularity = 4096" in client.query
+
+
+def test_parts_metrics_report_on_disk_primary_key_size():
+    class Client:
+        query = None
+
+        def execute(self, query, params):
+            self.query = query
+            return [(1, 2, 3, 4, 5, 6)]
+
+    client = Client()
+    metrics = _parts_metrics(client, BenchmarkConfig())
+
+    assert "primary_key_size" in client.query
+    assert "primary_key_bytes_in_memory" not in client.query
+    assert metrics["primary_key_bytes"] == 6
+
+
+def test_run_disconnects_client_when_table_setup_fails(monkeypatch):
+    class Client:
+        disconnected = False
+
+        def execute(self, query):
+            return []
+
+        def disconnect(self):
+            self.disconnected = True
+
+    client = Client()
+    monkeypatch.setattr(benchmark, "generate_payload_pool", lambda config: [])
+    monkeypatch.setattr(benchmark, "_connect", lambda config: client)
+
+    def fail_setup(client, config):
+        raise RuntimeError("setup failed")
+
+    monkeypatch.setattr(benchmark, "_ensure_table", fail_setup)
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        benchmark.run(BenchmarkConfig())
+
+    assert client.disconnected is True
 
 
 def test_empty_query_log_uses_json_safe_null_aggregates():
