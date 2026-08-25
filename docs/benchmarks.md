@@ -99,6 +99,25 @@ documentation when interpreting results.
 See the [native build layout](native-build-layout.html) for the host/full
 extension boundary and loader behavior.
 
+## Derived catalog throughput
+
+`benchmarks.bench_capture_catalog` measures the opt-in metadata projection; it
+does not exercise CUDA or write tensor payloads to ClickHouse. It creates
+temporary raw tables plus logically deduplicated views, inserts deterministic
+capture descriptors in bounded batches, reports every trial, and drops the
+objects afterward.
+
+```bash
+python -m benchmarks.bench_capture_catalog \
+  --rows 100000 --batch-rows 10000 --trials 3
+```
+
+On local ClickHouse 26.9.1, median throughput rose from 13,954 rows/s with
+1,000-row batches to 88,458 rows/s at 10,000 and 157,567 rows/s at 50,000.
+These loopback results validate client batching, not a production capacity
+claim. Repeat the sweep on the target server while observing part creation,
+merge load, CPU, and catalog lag.
+
 Baselines:
 
 - **HuggingFace Ideal** — vanilla HF `generate`, no observation (used as 1.0)
