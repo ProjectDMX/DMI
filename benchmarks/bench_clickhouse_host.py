@@ -241,7 +241,6 @@ def _client_metrics_as_dict(metrics: Any) -> dict[str, Any]:
 
 
 class ServerTelemetrySampler:
-    _PROCESS_QUERY = "SELECT count() FROM system.processes WHERE query_kind = 'Insert'"
     _METRICS_QUERY = """
         SELECT metric, value
         FROM system.metrics
@@ -259,11 +258,30 @@ class ServerTelemetrySampler:
                          'NetworkReceiveBytes', 'NetworkSendBytes')
     """
 
-    def __init__(self, client_factory: Callable[[], Any], interval_ms: int = 50):
+    def __init__(
+        self,
+        client_factory: Callable[[], Any],
+        interval_ms: int = 50,
+        database: str | None = None,
+        table: str | None = None,
+    ):
         if interval_ms <= 0:
             raise ValueError("interval_ms must be positive")
         self._client_factory = client_factory
         self._interval_seconds = interval_ms / 1000.0
+        if database is not None and table is not None:
+            qualified = f"{database}.{table}"
+            self._process_query = (
+                "SELECT count() FROM system.processes"
+                " WHERE query_kind = 'Insert'"
+                " AND has(tables, %(table)s)"
+            )
+            self._process_query_params: dict[str, Any] = {"table": qualified}
+        else:
+            self._process_query = (
+                "SELECT count() FROM system.processes WHERE query_kind = 'Insert'"
+            )
+            self._process_query_params = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._client: Any = None
@@ -307,7 +325,7 @@ class ServerTelemetrySampler:
         try:
             if self._client is None:
                 self._client = self._client_factory()
-            active = int(self._client.execute(self._PROCESS_QUERY)[0][0])
+            active = int(self._client.execute(self._process_query, self._process_query_params)[0][0])
             metrics = self._client.execute(self._METRICS_QUERY)
             async_metrics = self._client.execute(self._ASYNC_METRICS_QUERY)
             with self._lock:
@@ -681,6 +699,8 @@ def run(config: BenchmarkConfig) -> dict[str, Any]:
             sampler = ServerTelemetrySampler(
                 lambda: _connect(config, min(2.0, config.socket_timeout_seconds)),
                 interval_ms=config.server_sample_interval_ms,
+                database=config.database,
+                table=config.table,
             )
         measurement = _submit_and_drain(
             _build_engine(config),
