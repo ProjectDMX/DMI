@@ -12,7 +12,7 @@
 //
 // Publish protocol (producer):
 //   1. Write all TaskEntry data fields at slot (head % capacity).
-//   2. __threadfence() -- ensures data is visible before ready_seq.
+//   2. __threadfence_system() -- makes data visible to the CPU consumer.
 //   3. Write ready_seq = head  (the slot's logical sequence number).
 //   4. Increment head.
 //
@@ -73,7 +73,7 @@ inline void task_ring_init(TaskEntry* d_entries, uint64_t capacity,
 // task_publish -- write a TaskEntry and publish it to the consumer.
 //
 // Copies all non-ready_seq fields from `src` into the slot at `seq_no %
-// capacity`, issues a __threadfence() to enforce write ordering, then writes
+// capacity`, issues a system-scope fence to enforce write ordering, then writes
 // ready_seq = seq_no.
 // ---------------------------------------------------------------------------
 __device__ inline void task_publish(
@@ -93,7 +93,7 @@ __device__ inline void task_publish(
     slot.payload_len2       = src.payload_len2;
 
     // Release fence: all stores above must be visible before ready_seq.
-    __threadfence();
+    __threadfence_system();
 
     // Publish: consumer spins until it sees this value.
     *reinterpret_cast<volatile uint64_t*>(&slot.ready_seq) = seq_no;

@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DMI ClickHouse offload pipeline</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #09121d;
+      --panel: #122235;
+      --text: #eef7ff;
+      --muted: #a7bdd2;
+      --line: #35526c;
+      --gpu: #8aa7ff;
+      --host: #55d6be;
+      --db: #ffc857;
+      --error: #ff7b8b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top, #173653, var(--bg) 55%);
+      color: var(--text);
+      font: 16px/1.5 system-ui, sans-serif;
+    }
+    main { width: min(1180px, 94vw); margin: auto; padding: 48px 0 64px; }
+    h1 { margin: 0 0 8px; font-size: clamp(2rem, 5vw, 3.4rem); }
+    h2 { margin: 0 0 8px; font-size: 1.05rem; }
+    p { color: var(--muted); }
+    code { color: var(--db); }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 14px;
+      margin: 36px 0 24px;
+    }
+    .card {
+      min-height: 190px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: color-mix(in srgb, var(--panel) 94%, transparent);
+      box-shadow: 0 16px 40px #0004;
+    }
+    .gpu { border-color: var(--gpu); }
+    .host { border-color: var(--host); }
+    .db { border-color: var(--db); }
+    .tag {
+      display: inline-block;
+      margin: 4px 4px 0 0;
+      padding: 3px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: .8rem;
+    }
+    .rules { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .measure { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 14px; }
+    .error { border-color: var(--error); }
+    ul { margin: 10px 0 0; padding-left: 20px; color: var(--muted); }
+    @media (max-width: 900px) {
+      .flow { grid-template-columns: 1fr; }
+      .card { min-height: 0; }
+      .rules { grid-template-columns: 1fr; }
+      .measure { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>GPU capture to ClickHouse</h1>
+    <p>The offload path overlaps GPU capture, host transfer, reconstruction,
+      and native ClickHouse insertion while keeping ownership and failures explicit.</p>
+
+    <section class="flow" aria-label="DMI offload stages">
+      <article class="card gpu">
+        <h2>1. GPU producer</h2>
+        <p>Copies an activation into the payload ring and publishes its descriptor
+          with a system-scope release fence.</p>
+        <span class="tag">device memory</span><span class="tag">CUDA stream</span>
+      </article>
+      <article class="card gpu">
+        <h2>2. Capacity owner</h2>
+        <p>Atomically checks payload, pinned-staging, and task-slot capacity before
+          reserving the next step or eager hook.</p>
+        <span class="tag">one snapshot</span><span class="tag">backpressure</span>
+      </article>
+      <article class="card host">
+        <h2>3. Drain thread</h2>
+        <p>Batches checked D2H copies into pinned memory. Ring space is committed
+          only after the CUDA copy stream succeeds.</p>
+        <span class="tag">pinned ring</span><span class="tag">100 ms flush</span>
+      </article>
+      <article class="card host">
+        <h2>4. P2P thread</h2>
+        <p>Reconstructs pageable tensors, validates metadata, slices requests, and
+          submits rows to the host pipeline.</p>
+        <span class="tag">ATen CPU</span><span class="tag">request slices</span>
+      </article>
+      <article class="card db">
+        <h2>5. ClickHouse stage</h2>
+        <p>Targets 16 MiB batches with a 50 ms linger and bounded queueing. Each
+          stage initializes its own destination once.</p>
+        <span class="tag">native protocol</span><span class="tag">512 MiB queue</span>
+      </article>
+    </section>
+
+    <section class="rules">
+      <article class="card">
+        <h2>Ownership rules</h2>
+        <ul>
+          <li>GPU payload is reusable only after successful D2H completion.</li>
+          <li>Pinned bytes are reusable only after pageable reconstruction.</li>
+          <li>ClickHouse column views retain tensor storage through insertion.</li>
+        </ul>
+      </article>
+      <article class="card error">
+        <h2>Failure rules</h2>
+        <ul>
+          <li>The first CUDA, reconstruction, submission, or worker error wins.</li>
+          <li>New reservations stop after failure.</li>
+          <li>Shutdown cleans every stage, then raises the preserved error.</li>
+        </ul>
+      </article>
+    </section>
+
+    <h2 style="margin-top: 30px">CPU ingestion scaling</h2>
+    <p>Parallelism is useful only when requested workers become ready, perform
+      overlapping inserts, and move the ClickHouse throughput ceiling.</p>
+    <section class="measure" aria-label="CPU ingestion measurement stages">
+      <article class="card host">
+        <h2>Ready boundary</h2>
+        <p>The steady-state clock starts after every worker has connected,
+          selected the database, and applied its session settings.</p>
+        <span class="tag">startup separated</span><span class="tag">finite socket timeout</span>
+      </article>
+      <article class="card host">
+        <h2>Realized concurrency</h2>
+        <p>Snapshots retain per-worker batches, rows, bytes, insert time, and
+          peak simultaneous native inserts.</p>
+        <span class="tag">worker distribution</span><span class="tag">client peak</span>
+      </article>
+      <article class="card db">
+        <h2>Saturation evidence</h2>
+        <p>Repeated shuffled worker sweeps combine throughput variance with
+          sampled active inserts, queries, merges, and connections.</p>
+        <span class="tag">1 → 2 → 4 → 8</span><span class="tag">raw trials retained</span>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

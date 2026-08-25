@@ -1,17 +1,22 @@
 // CUDA integration tests for producer -> drain -> pinned-staging delivery.
 
 #include "ring/drain_thread.h"
+#include "ring/p2p_thread.h"
 #include "ring/pinned_staging.h"
 #include "ring/producer.cuh"
 #include "ring/ring_alloc.h"
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 static int g_pass = 0;
@@ -148,10 +153,11 @@ static void test_static_force_flush() {
     EXPECT(task.alloc_bytes == reserved);
     EXPECT(task.data_len1 + task.data_len2 == source.size());
     EXPECT(task_bytes(task) == source);
-    EXPECT(harness.drain->cpu_task_head() == 1);
-    EXPECT(harness.drain->cpu_task_tail_committed() == 1);
-    EXPECT(harness.drain->cpu_payload_head() == reserved);
-    EXPECT(harness.drain->cpu_payload_tail_committed() == reserved);
+    const auto capacity = harness.drain->capacity_snapshot();
+    EXPECT(capacity.task_head == 1);
+    EXPECT(capacity.task_tail_committed == 1);
+    EXPECT(capacity.payload_head == reserved);
+    EXPECT(capacity.payload_tail_committed == reserved);
 
     harness.release(task);
     CUDA_CHECK(cudaFree(device));
@@ -180,7 +186,7 @@ static void test_prefix_force_flush() {
     EXPECT(task.tensor_total_bytes == actual);
     EXPECT(task.alloc_bytes == actual);
     EXPECT(task_bytes(task) == expected);
-    EXPECT(harness.drain->cpu_payload_tail_committed() == actual);
+    EXPECT(harness.drain->capacity_snapshot().payload_tail_committed == actual);
 
     harness.release(task);
     CUDA_CHECK(cudaFree(device_count));
@@ -214,8 +220,9 @@ static void test_repeated_wrap_delivery() {
 
     EXPECT(*harness.allocated.state().task_head == 4);
     EXPECT(*harness.allocated.state().payload_head == 320);
-    EXPECT(harness.drain->cpu_task_tail_committed() == 4);
-    EXPECT(harness.drain->cpu_payload_tail_committed() == 320);
+    const auto capacity_snapshot = harness.drain->capacity_snapshot();
+    EXPECT(capacity_snapshot.task_tail_committed == 4);
+    EXPECT(capacity_snapshot.payload_tail_committed == 320);
     EXPECT(harness.staging.head() == 320);
     EXPECT(harness.staging.tail() == 320);
 }
@@ -234,9 +241,121 @@ static void test_zero_byte_delivery() {
     EXPECT(task.data_len1 == 0);
     EXPECT(task.data_ptr2 == nullptr);
     EXPECT(task.data_len2 == 0);
-    EXPECT(harness.drain->cpu_task_tail_committed() == 1);
-    EXPECT(harness.drain->cpu_payload_tail_committed() == 0);
+    const auto capacity = harness.drain->capacity_snapshot();
+    EXPECT(capacity.task_tail_committed == 1);
+    EXPECT(capacity.payload_tail_committed == 0);
     harness.release(task);
+}
+
+static void test_capacity_snapshot_is_consistent_during_reserve() {
+    banner("capacity snapshot is consistent during reserve");
+    DrainHarness harness(make_config(1ULL << 24));
+    constexpr uint64_t reservations = 10000;
+    constexpr uint64_t bytes_per_reservation = 64;
+    std::atomic<bool> done{false};
+
+    std::thread writer([&] {
+        for (uint64_t i = 0; i < reservations; ++i) {
+            harness.drain->reserve(bytes_per_reservation, 1);
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    while (!done.load(std::memory_order_acquire)) {
+        const auto snapshot = harness.drain->capacity_snapshot();
+        EXPECT(snapshot.payload_head ==
+               snapshot.task_head * bytes_per_reservation);
+    }
+    writer.join();
+
+    const auto snapshot = harness.drain->capacity_snapshot();
+    EXPECT(snapshot.payload_head == reservations * bytes_per_reservation);
+    EXPECT(snapshot.task_head == reservations);
+    EXPECT(snapshot.payload_tail_committed == 0);
+    EXPECT(snapshot.task_tail_committed == 0);
+}
+
+static void test_atomic_reservation_checks_effective_and_task_capacity() {
+    banner("atomic reservation checks effective and task capacity");
+    DrainHarness harness(make_config());
+
+    EXPECT(!harness.drain->try_reserve(257, 1, 256, 16));
+    for (uint32_t i = 0; i < 16; ++i) {
+        EXPECT(harness.drain->try_reserve(0, 1, 256, 16));
+    }
+    EXPECT(!harness.drain->try_reserve(0, 1, 256, 16));
+}
+
+static void test_force_flush_surfaces_invalid_d2h_source() {
+    banner("force flush surfaces invalid D2H source");
+    DrainHarness harness(make_config());
+    ring::RingState& state = harness.allocated.state();
+    uint8_t* payload_buf = state.payload_buf;
+    state.payload_buf = reinterpret_cast<uint8_t*>(1);
+
+    ring::TaskEntry& entry = state.task_entries[0];
+    entry.tensor_total_bytes = 64;
+    entry.payload_off1 = 0;
+    entry.payload_len1 = 64;
+    entry.payload_off2 = 0;
+    entry.payload_len2 = 0;
+    __atomic_store_n(&entry.ready_seq, uint64_t{0}, __ATOMIC_RELEASE);
+    harness.drain->reserve(64, 1);
+
+    bool threw = false;
+    try {
+        harness.drain->force_flush_and_wait();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    EXPECT(threw);
+
+    state.payload_buf = payload_buf;
+}
+
+static void throwing_submit(
+    const std::string&, int32_t, const std::string&, const std::string&,
+    int32_t, int32_t, int32_t, at::Tensor)
+{
+    throw std::runtime_error("host submission failed");
+}
+
+static void test_p2p_submission_failure_reaches_drain_owner() {
+    banner("P2P submission failure reaches drain owner");
+    DrainHarness harness(make_config());
+    ring_py::TensorMetaFifo fifo;
+    auto* context = new ring_py::StepContext();
+    context->model_id = "test";
+    context->requests.push_back({"request", 0, 1, 0, 0});
+    std::vector<ring_py::TensorMeta> metas(1);
+    metas[0].hook_type = ring_py::HOOK_TYPE_TOKEN_IDS;
+    metas[0].shape = {1, 1};
+    metas[0].dtype = static_cast<int>(at::kByte);
+    metas[0].last_in_step = true;
+    fifo.push_step(context, metas);
+
+    ring::P2PThread p2p(*harness.drain, fifo, harness.cfg, throwing_submit);
+    p2p.start();
+    harness.drain->submit_cpu_direct(
+        at::zeros({1, 1}, at::TensorOptions().dtype(at::kByte)), 1);
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    while (!harness.drain->has_failed() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT(harness.drain->has_failed());
+    bool threw = false;
+    try {
+        harness.drain->rethrow_if_failed();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    EXPECT(threw);
+
+    harness.drain->signal_p2p_stop();
+    p2p.stop();
 }
 
 int main() {
@@ -249,6 +368,10 @@ int main() {
     test_prefix_force_flush();
     test_repeated_wrap_delivery();
     test_zero_byte_delivery();
+    test_capacity_snapshot_is_consistent_during_reserve();
+    test_atomic_reservation_checks_effective_and_task_capacity();
+    test_force_flush_surfaces_invalid_d2h_source();
+    test_p2p_submission_failure_reaches_drain_owner();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

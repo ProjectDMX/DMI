@@ -9,7 +9,7 @@ from typing import Any, Optional, Sequence
 from .config import MonitoringConfig
 
 
-DEFAULT_DRAIN_FLUSH_TIMEOUT_US = 0
+DEFAULT_DRAIN_FLUSH_TIMEOUT_US = 100_000
 
 
 def _native_module() -> Any:
@@ -280,6 +280,13 @@ class MonitoringEngine:
     def close(self) -> None:
         """Tear down backend resources."""
 
+        first_error: Optional[BaseException] = None
+
+        def capture_error(exc: BaseException) -> None:
+            nonlocal first_error
+            if first_error is None:
+                first_error = exc
+
         if self._ring_transport is not None:
             # Best-effort reset of the device-global native null flag.  This is
             # needed only after callers explicitly disabled capture; the normal
@@ -287,29 +294,42 @@ class MonitoringEngine:
             if not self.capture_enabled:
                 try:
                     self.set_capture_enabled(True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    capture_error(exc)
             try:
                 ring_engine = getattr(self, "_ring_engine", None)
                 if ring_engine is not None:
                     ring_engine.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                capture_error(exc)
             try:
                 _rt = _ring_module()
                 _rt.deactivate()
-            except Exception:
-                pass
+            except Exception as exc:
+                capture_error(exc)
             self._ring_transport = None
             self._ring_engine = None
 
         if self._host_engine is not None:
+            host_engine = self._host_engine
             try:
-                self._host_engine.close_input()
-                self._host_engine.stop()
-            except Exception:
-                pass
+                host_engine.close_input()
+            except Exception as exc:
+                capture_error(exc)
+            try:
+                host_engine.stop()
+            except Exception as exc:
+                capture_error(exc)
+            try:
+                raise_if_failed = getattr(host_engine, "raise_if_failed", None)
+                if raise_if_failed is not None:
+                    raise_if_failed()
+            except Exception as exc:
+                capture_error(exc)
             self._host_engine = None
+
+        if first_error is not None:
+            raise first_error
 
 
 # ---------------------------------------------------------------------------

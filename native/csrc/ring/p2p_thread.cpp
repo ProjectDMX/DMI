@@ -6,46 +6,15 @@
 #include "pinned_staging.h"
 
 #include <ATen/ATen.h>
-#include <cstdio>
 #include <cstring>
 #include <exception>
-#include <mutex>
+#include <stdexcept>
 
 namespace ring {
 
 // ---------------------------------------------------------------------------
 // ATen helpers (no GIL required for CPU tensors)
 // ---------------------------------------------------------------------------
-
-static std::once_flag g_submit_failure_log_once;
-
-static void log_submit_failure_once(
-    const std::string& model_id,
-    const std::string& req_id,
-    const std::string& act_name,
-    int32_t layer_no,
-    int32_t shard_rank,
-    int32_t start_token,
-    int32_t end_token,
-    const char* error)
-{
-    std::call_once(g_submit_failure_log_once, [&] {
-        fprintf(stderr,
-                "[DMI][P2P] WARN: failed to submit tensor slice to host "
-                "engine; suppressing further submit errors. model_id=%s "
-                "request_id=%s act_name=%s layer_no=%d shard_rank=%d "
-                "token_range=[%d,%d) error=\"%s\"\n",
-                model_id.c_str(),
-                req_id.c_str(),
-                act_name.c_str(),
-                layer_no,
-                shard_rank,
-                start_token,
-                end_token,
-                error ? error : "unknown");
-        fflush(stderr);
-    });
-}
 
 // Build ClickHouse act_name from hook_type.
 // Per-layer: "blocks.<hook_type_name>"  (e.g. "blocks.attn.hook_pattern")
@@ -132,7 +101,13 @@ P2PThread::~P2PThread() noexcept {
 }
 
 void P2PThread::start() {
-    thread_ = std::thread([this] { loop(); });
+    thread_ = std::thread([this] {
+        try {
+            loop();
+        } catch (...) {
+            drain_.report_failure(std::current_exception());
+        }
+    });
 }
 
 void P2PThread::stop() {
@@ -190,14 +165,16 @@ void P2PThread::process(std::vector<DrainTask>& tasks) {
 void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_task) {
     ring_py::TensorMeta meta;
     if (!fifo_.pop(meta)) {
-        return;
+        throw std::runtime_error("P2PThread: tensor metadata queue is empty");
     }
 
     // Get step context -- pop from context queue if this is the first
     // hook in a new step (current_ctx_ is null).
     if (!current_ctx_) {
         current_ctx_ = fifo_.pop_context();
-        if (!current_ctx_) return;  // no context available
+        if (!current_ctx_) {
+            throw std::runtime_error("P2PThread: step context queue is empty");
+        }
     }
 
     if (meta.shape.empty() || first_task.tensor_total_bytes == 0) {
@@ -237,11 +214,11 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     }
 
     if (static_cast<uint64_t>(expected_bytes) != first_task.tensor_total_bytes) {
-        fprintf(stderr, "[p2p] WARN: shape/bytes mismatch: expected=%ld actual=%lu hook=%s\n",
-                (long)expected_bytes, (unsigned long)first_task.tensor_total_bytes,
-                ring_py::hook_type_name(meta.hook_type));
-        if (meta.last_in_step) { delete current_ctx_; current_ctx_ = nullptr; }
-        return;
+        throw std::runtime_error(
+            "P2PThread: shape/bytes mismatch for " +
+            std::string(ring_py::hook_type_name(meta.hook_type)) +
+            ": expected=" + std::to_string(expected_bytes) +
+            " actual=" + std::to_string(first_task.tensor_total_bytes));
     }
 
     tensor = tensor.view(dtype).reshape(
@@ -306,21 +283,10 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
             slice = slice.clone();
         }
 
-        try {
-            submit_fn_(current_ctx_->model_id, shard_rank,
-                       req.req_id, act_name, meta.layer_no,
-                       db_start, db_end,
-                       std::move(slice));
-        } catch (const std::exception& e) {
-            log_submit_failure_once(current_ctx_->model_id, req.req_id,
-                                    act_name, meta.layer_no, shard_rank,
-                                    db_start, db_end, e.what());
-        } catch (...) {
-            log_submit_failure_once(current_ctx_->model_id, req.req_id,
-                                    act_name, meta.layer_no, shard_rank,
-                                    db_start, db_end,
-                                    "unknown non-std exception");
-        }
+        submit_fn_(current_ctx_->model_id, shard_rank,
+                   req.req_id, act_name, meta.layer_no,
+                   db_start, db_end,
+                   std::move(slice));
     }
 
     // Last hook in step -- free context

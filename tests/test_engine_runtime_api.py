@@ -10,15 +10,17 @@ from types import SimpleNamespace
 
 import pytest
 
+import dmi.engine as engine_module
 from dmi.engine import MonitoringEngine, RingCapacities
 
 pytestmark = pytest.mark.cpu
 
 
 class _FakeRingEngine:
-    def __init__(self, transport=None, *, fail_null_mode=False):
+    def __init__(self, transport=None, *, fail_null_mode=False, fail_stop=False):
         self.transport = transport
         self.fail_null_mode = fail_null_mode
+        self.fail_stop = fail_stop
         self.null_mode_calls = []
         self.stop_calls = 0
         self.init_calls = 0
@@ -55,10 +57,12 @@ class _FakeRingEngine:
 
     def stop(self):
         self.stop_calls += 1
+        if self.fail_stop:
+            raise RuntimeError("ring drain failed")
 
 
 def _engine_with_fake_ring(
-    *, null_offload=False, force_eager=False, fail_null_mode=False
+    *, null_offload=False, force_eager=False, fail_null_mode=False, fail_stop=False
 ):
     engine = MonitoringEngine(enable_ring_transport=False)
     transport = SimpleNamespace(
@@ -68,6 +72,7 @@ def _engine_with_fake_ring(
     ring_engine = _FakeRingEngine(
         transport,
         fail_null_mode=fail_null_mode,
+        fail_stop=fail_stop,
     )
     engine._ring_transport = transport
     engine._ring_engine = ring_engine
@@ -88,6 +93,25 @@ def test_ring_capacities_is_frozen_snapshot_with_effective_limit():
     assert not hasattr(capacities, "__dict__")
     with pytest.raises(FrozenInstanceError):
         capacities.payload_bytes = 1
+
+
+def test_default_ring_flushes_small_workloads_with_bounded_linger(monkeypatch):
+    class _RingConfig:
+        pass
+
+    monkeypatch.setattr(
+        engine_module,
+        "_native_module",
+        lambda: SimpleNamespace(RingConfig=_RingConfig),
+    )
+
+    config = MonitoringEngine._make_default_ring_config(
+        payload_mb=64,
+        pinned_mb=32,
+        task_entries=128,
+    )
+
+    assert config.drain_flush_timeout_us == 100_000
 
 
 def test_capture_toggle_changes_metadata_flag_after_native_transition():
@@ -141,6 +165,75 @@ def test_close_restores_device_global_null_mode_before_ring_stop():
     assert ring_engine.stop_calls == 1
     assert transport.null_offload is False
     assert engine.capture_enabled is False
+
+
+def test_close_surfaces_host_worker_failure_after_cleanup(monkeypatch):
+    engine, _transport, ring_engine = _engine_with_fake_ring()
+    deactivated = []
+
+    class _FailingHostEngine:
+        def __init__(self):
+            self.calls = []
+
+        def close_input(self):
+            self.calls.append("close_input")
+
+        def stop(self):
+            self.calls.append("stop")
+
+        def raise_if_failed(self):
+            self.calls.append("raise_if_failed")
+            raise RuntimeError("clickhouse worker failed")
+
+    host_engine = _FailingHostEngine()
+    engine._host_engine = host_engine
+    fake_transport_module = ModuleType("dmi.transport.ring")
+    fake_transport_module.deactivate = lambda: deactivated.append(True)
+    monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
+
+    with pytest.raises(RuntimeError, match="clickhouse worker failed"):
+        engine.close()
+
+    assert ring_engine.stop_calls == 1
+    assert deactivated == [True]
+    assert host_engine.calls == ["close_input", "stop", "raise_if_failed"]
+    assert engine._ring_engine is None
+    assert engine._ring_transport is None
+    assert engine._host_engine is None
+
+
+def test_close_preserves_ring_failure_while_cleaning_up_host(monkeypatch):
+    engine, _transport, ring_engine = _engine_with_fake_ring(fail_stop=True)
+    deactivated = []
+
+    class _HostEngine:
+        def __init__(self):
+            self.calls = []
+
+        def close_input(self):
+            self.calls.append("close_input")
+
+        def stop(self):
+            self.calls.append("stop")
+
+        def raise_if_failed(self):
+            self.calls.append("raise_if_failed")
+
+    host_engine = _HostEngine()
+    engine._host_engine = host_engine
+    fake_transport_module = ModuleType("dmi.transport.ring")
+    fake_transport_module.deactivate = lambda: deactivated.append(True)
+    monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
+
+    with pytest.raises(RuntimeError, match="ring drain failed"):
+        engine.close()
+
+    assert ring_engine.stop_calls == 1
+    assert deactivated == [True]
+    assert host_engine.calls == ["close_input", "stop", "raise_if_failed"]
+    assert engine._ring_engine is None
+    assert engine._ring_transport is None
+    assert engine._host_engine is None
 
 
 def test_replacing_disabled_ring_restores_native_null_mode(monkeypatch):

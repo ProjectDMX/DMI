@@ -22,11 +22,19 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 namespace ring {
+
+struct CapacitySnapshot {
+    uint64_t payload_head;
+    uint64_t payload_tail_committed;
+    uint64_t task_head;
+    uint64_t task_tail_committed;
+};
 
 class DrainThread {
 public:
@@ -57,13 +65,18 @@ public:
 
     void notify_staging_freed_bytes(uint64_t nbytes);
 
+    void report_failure(std::exception_ptr failure) noexcept;
+    void rethrow_if_failed() const;
+    bool has_failed() const noexcept {
+        return failed_.load(std::memory_order_acquire);
+    }
+
     bool is_running() const { return running_.load(std::memory_order_relaxed); }
 
-    // Capacity query accessors (called from RingEnginePy::prepare_step).
-    uint64_t cpu_payload_head() const;
-    uint64_t cpu_payload_tail_committed() const;
-    uint64_t cpu_task_head() const;
-    uint64_t cpu_task_tail_committed() const;
+    CapacitySnapshot capacity_snapshot();
+
+    bool try_reserve(uint64_t payload_bytes, uint32_t num_tasks,
+                     uint64_t payload_capacity, uint64_t task_capacity);
 
     // Pre-allocate ring space for the next step's producer kernels.
     // Advances cpu_payload_head_ and cpu_task_head_ under mgmt_mu_.
@@ -115,6 +128,10 @@ private:
     std::mutex              staging_mu_;
     std::condition_variable staging_cv_;
 
+    mutable std::mutex      failure_mu_;
+    std::exception_ptr      failure_;
+    std::atomic<bool>       failed_{false};
+
     void loop();
 
     // Drain all pending entries -- called by the drain thread when
@@ -127,7 +144,7 @@ private:
     void flush_state_update(uint64_t flush_count, uint64_t flush_bytes);
 
     void sync_stream();
-    void enqueue_d2h(uint64_t flush_bytes);
+    void enqueue_d2h(uint64_t flush_bytes, uint64_t src_start);
 
     // Split into two: submit_to_p2p pushes DrainTasks to the p2p queue
     // (uses queue_mu_/pop_mu_, NOT mgmt_mu_).  trim_scanned updates

@@ -7,6 +7,7 @@
 #include "p2p_thread.h"
 #include "tensor_meta.h"
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -38,6 +39,7 @@ private:
     PinnedStaging   staging_;
     std::unique_ptr<DrainThread>  drain_;
     std::unique_ptr<P2PThread>    p2p_;
+    std::atomic<bool>             started_{false};
 };
 
 }  // namespace ring

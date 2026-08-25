@@ -54,6 +54,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                      &dmx_host::ClickHouseClientConfig::client_side_compress)
       .def_readwrite("index_granularity",
                      &dmx_host::ClickHouseClientConfig::index_granularity)
+      .def_readwrite("connect_timeout_ms",
+                     &dmx_host::ClickHouseClientConfig::connect_timeout_ms)
+      .def_readwrite("receive_timeout_ms",
+                     &dmx_host::ClickHouseClientConfig::receive_timeout_ms)
+      .def_readwrite("send_timeout_ms",
+                     &dmx_host::ClickHouseClientConfig::send_timeout_ms)
 
       // Expose client_settings as a dict, store internally as unordered_map<string, variant<...>>.
       // This avoids requiring <pybind11/stl_variant.h>.
@@ -106,6 +112,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using QueueConfig = DMXHostEngine::QueueConfig;
   using EnqueuePolicy = DMXHostEngine::EnqueuePolicy;
   using Duration = DMXHostEngine::Duration;
+
+  py::class_<dmx_host::ClickHouseWorkerMetrics>(m, "ClickHouseWorkerMetrics")
+      .def_readonly("worker_index", &dmx_host::ClickHouseWorkerMetrics::worker_index)
+      .def_readonly("batches", &dmx_host::ClickHouseWorkerMetrics::batches)
+      .def_readonly("rows", &dmx_host::ClickHouseWorkerMetrics::rows)
+      .def_readonly("logical_bytes", &dmx_host::ClickHouseWorkerMetrics::logical_bytes)
+      .def_readonly("insert_seconds", &dmx_host::ClickHouseWorkerMetrics::insert_seconds);
+
+  py::class_<dmx_host::ClickHouseMetricsSnapshot>(m, "ClickHouseMetricsSnapshot")
+      .def_readonly("expected_workers", &dmx_host::ClickHouseMetricsSnapshot::expected_workers)
+      .def_readonly("ready_workers", &dmx_host::ClickHouseMetricsSnapshot::ready_workers)
+      .def_readonly("active_inserts", &dmx_host::ClickHouseMetricsSnapshot::active_inserts)
+      .def_readonly("peak_active_inserts", &dmx_host::ClickHouseMetricsSnapshot::peak_active_inserts)
+      .def_readonly("batches", &dmx_host::ClickHouseMetricsSnapshot::batches)
+      .def_readonly("rows", &dmx_host::ClickHouseMetricsSnapshot::rows)
+      .def_readonly("logical_bytes", &dmx_host::ClickHouseMetricsSnapshot::logical_bytes)
+      .def_readonly("insert_seconds", &dmx_host::ClickHouseMetricsSnapshot::insert_seconds)
+      .def_readonly("workers", &dmx_host::ClickHouseMetricsSnapshot::workers);
 
   py::enum_<dmx_host::OnFullPolicy>(m, "OnFullPolicy")
       .value("RAISE", dmx_host::OnFullPolicy::RAISE)
@@ -184,11 +208,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             StageConfig cfg;
             cfg.name = std::move(name);
             cfg.parallelism = parallelism;
+            cfg.input_queue.min_batch_items.reset();
+            cfg.input_queue.min_batch_size = 16ULL * 1024 * 1024;
+            cfg.input_queue.max_linger = Duration(0.05);
+            cfg.input_queue.max_batch_items = 10000;
+            cfg.input_queue.high_watermark_items = 20000;
+            cfg.input_queue.high_watermark_size = 512ULL * 1024 * 1024;
             cfg.process_fn = [](std::vector<dmx_host::dmx_host_queue_item> batch, QueueT* next_q) {
               return dmx_host::ClickHouseInsertStage::ProcessFn<QueueT>(std::move(batch), next_q);
             };
-            // Stored by value in std::any; ClickHouseInsertStage::ThreadInitAny will any_cast it.
-            cfg.thread_init_config = ch_cfg;
+            auto thread_cfg = ch_cfg;
+            cfg.thread_init_config = std::move(thread_cfg);
             cfg.thread_init = &dmx_host::ClickHouseInsertStage::ThreadInitAny;
             cfg.thread_cleanup = &dmx_host::ClickHouseInsertStage::ThreadCleanupAny;
             return cfg;
@@ -200,6 +230,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<DMXHostEngine, std::shared_ptr<DMXHostEngine>>(m, "DMXHostEngine")
       .def(py::init<StageConfig>(), py::arg("insert_stage"))
       .def("start", &DMXHostEngine::start)
+      .def("wait_until_ready",
+           [](DMXHostEngine& self, double timeout_s) {
+             return self.wait_until_ready(DMXHostEngine::Duration(timeout_s));
+           },
+           py::arg("timeout_s"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("clickhouse_metrics", &DMXHostEngine::clickhouse_metrics)
       .def("stop",
            [](DMXHostEngine& self, bool graceful, std::optional<double> timeout_s) {
              if (timeout_s) {
@@ -314,13 +351,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
       .def("task_cap",    &ring_py::RingEnginePy::task_cap)
       .def("payload_tensor", &ring_py::RingEnginePy::payload_tensor)
-      // Safety-net surface (eager only).  available_capacity() and
-      // reserve_one() are CPU-only and fast -- no GIL release needed.
+      // Safety-net surface (eager only). CPU-only and fast.
       // flush_and_wait() blocks on cudaStreamSynchronize + drain flush --
       // GIL released so other Python threads aren't blocked.
-      .def("available_capacity", &ring_py::RingEnginePy::available_capacity)
-      .def("reserve_one",
-           &ring_py::RingEnginePy::reserve_one,
+      .def("effective_capacity", &ring_py::RingEnginePy::effective_capacity)
+      .def("try_reserve_one",
+           &ring_py::RingEnginePy::try_reserve_one,
            py::arg("nbytes"))
       .def("flush_and_wait",
            &ring_py::RingEnginePy::flush_and_wait,
