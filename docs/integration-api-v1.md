@@ -844,12 +844,15 @@ Construct `ClickHouseClientConfig()` and set all fields before passing it to
 | `drop_existing_database` | `False` | Drop the entire configured database before setup. Destructive; isolated tests only. |
 | `client_side_compress` | `none` | `none`, `lz4`, `zstd`, `true`, or `false`. |
 | `index_granularity` | `8192` | MergeTree index granularity for a created table. |
+| `connect_timeout_ms` | `5000` | Native socket connect timeout. |
+| `receive_timeout_ms` | `0` | Native socket receive timeout; `0` is unbounded. |
+| `send_timeout_ms` | `0` | Native socket send timeout; `0` is unbounded. |
 
 Database connection and schema initialization occur asynchronously in stage
 worker threads after host start, not in the config/factory constructor.
-Existing incompatible tables are not migrated. Current v1 also protects schema
-DDL with one process-global one-time guard: use one writer destination per
-process or pre-create any later destination yourself.
+Existing incompatible tables are not migrated. Schema DDL runs once per
+ClickHouse stage, so separate stages may target separate destinations in one
+process.
 
 ### `StageConfig`
 
@@ -873,6 +876,11 @@ The object also exposes mutable `name`, `parallelism`, and
 `ingress_policy: EnqueuePolicy`. `thread_name_prefix` changes only diagnostic
 worker labels. Configure all fields before constructing `DMXHostEngine`; the
 engine copies the stage.
+
+The ClickHouse factory targets 16 MiB batches with a 50 ms linger, caps batches
+at 10,000 rows, and applies backpressure at 20,000 rows or 512 MiB. It leaves
+`max_batch_size` unset so a larger activation can be inserted as a singleton.
+Callers may override these values before constructing `DMXHostEngine`.
 
 ### `QueueConfig`
 
@@ -925,6 +933,8 @@ database. Public lifecycle and diagnostics are:
 
 ```python
 start() -> None
+wait_until_ready(timeout_s: float) -> bool
+clickhouse_metrics() -> ClickHouseMetricsSnapshot
 close_input() -> None
 stop(graceful: bool = True, timeout_s: float | None = None) -> bool
 request_abort() -> None
@@ -934,9 +944,24 @@ raise_if_failed() -> None
 ```
 
 `start()` is asynchronous: it can return before a worker fails to connect or
-initialize. `stop()` returning true means threads joined, not that inserts
-succeeded. After shutdown, call `raise_if_failed()`; `failures()` returns
-records with `stage`, `thread_name`, `where`, `exc_type`, and `exc_what`.
+initialize. `wait_until_ready()` returns when every configured ClickHouse
+worker has initialized, a worker fails, or the timeout expires. On false, call
+`raise_if_failed()` to distinguish failure from timeout. `stop()` returning true
+means threads joined, not that inserts succeeded. After shutdown, call
+`raise_if_failed()`; `failures()` returns records with `stage`, `thread_name`,
+`where`, `exc_type`, and `exc_what`.
+
+`clickhouse_metrics()` returns a read-only snapshot with `expected_workers`,
+`ready_workers`, `active_inserts`, `peak_active_inserts`, `batches`, `rows`,
+`logical_bytes`, `insert_seconds`, and a `workers` list. Each worker record has
+`worker_index`, `batches`, `rows`, `logical_bytes`, and `insert_seconds`.
+Insert time covers the synchronous native ClickHouse call; it excludes queue
+wait, column construction, and worker initialization.
+
+Host-engine construction creates fresh schema-initialization and metrics state
+using the stage's final `parallelism`. Mutating a factory-created stage before
+construction therefore keeps readiness and per-worker metrics aligned; engines
+constructed from the same stage do not share accumulated metrics.
 
 ### `ThreadFailure`
 

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -19,6 +20,75 @@
 #include <clickhouse/types/types.h>
 
 namespace dmx_host {
+
+ClickHouseRuntimeMetrics::ClickHouseRuntimeMetrics(int expected_workers)
+    : expected_workers_(expected_workers),
+      ready_(static_cast<std::size_t>(std::max(0, expected_workers)), false),
+      workers_(static_cast<std::size_t>(std::max(0, expected_workers))) {
+  if (expected_workers < 0) {
+    throw std::invalid_argument("expected_workers must be non-negative");
+  }
+  for (int i = 0; i < expected_workers; ++i) workers_[i].worker_index = i;
+}
+
+void ClickHouseRuntimeMetrics::WorkerReady(int worker_index) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (worker_index < 0 || worker_index >= expected_workers_) {
+    throw std::out_of_range("ClickHouse worker index is out of range");
+  }
+  if (!ready_[worker_index]) {
+    ready_[worker_index] = true;
+    ++ready_workers_;
+    ready_cv_.notify_all();
+  }
+}
+
+bool ClickHouseRuntimeMetrics::WaitUntilReady(std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(mu_);
+  return ready_cv_.wait_for(lock, timeout, [&] {
+    return ready_workers_ == expected_workers_;
+  });
+}
+
+void ClickHouseRuntimeMetrics::BeginInsert() {
+  std::lock_guard<std::mutex> lock(mu_);
+  ++active_inserts_;
+  peak_active_inserts_ = std::max(peak_active_inserts_, active_inserts_);
+}
+
+void ClickHouseRuntimeMetrics::EndInsert(int worker_index, std::uint64_t rows,
+                                         std::uint64_t logical_bytes,
+                                         double seconds) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (active_inserts_ > 0) --active_inserts_;
+  ++batches_;
+  rows_ += rows;
+  logical_bytes_ += logical_bytes;
+  insert_seconds_ += seconds;
+  if (worker_index >= 0 && worker_index < expected_workers_) {
+    auto& worker = workers_[worker_index];
+    ++worker.batches;
+    worker.rows += rows;
+    worker.logical_bytes += logical_bytes;
+    worker.insert_seconds += seconds;
+  }
+}
+
+ClickHouseMetricsSnapshot ClickHouseRuntimeMetrics::Snapshot() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  ClickHouseMetricsSnapshot snapshot;
+  snapshot.expected_workers = expected_workers_;
+  snapshot.ready_workers = ready_workers_;
+  snapshot.active_inserts = active_inserts_;
+  snapshot.peak_active_inserts = peak_active_inserts_;
+  snapshot.batches = batches_;
+  snapshot.rows = rows_;
+  snapshot.logical_bytes = logical_bytes_;
+  snapshot.insert_seconds = insert_seconds_;
+  snapshot.workers = workers_;
+  return snapshot;
+}
+
 namespace {
 
 thread_local std::unique_ptr<clickhouse::Client> tl_client;
@@ -26,8 +96,8 @@ thread_local bool tl_inited = false;
 thread_local bool tl_cleaned = false;
 thread_local std::string tl_db;
 thread_local std::string tl_table;
-
-std::once_flag g_schema_once;
+thread_local int tl_worker_index = -1;
+thread_local std::shared_ptr<ClickHouseRuntimeMetrics> tl_runtime_metrics;
 
 // --------------------- SQL helpers ---------------------
 
@@ -377,7 +447,7 @@ StagedRow StageOneRow(ClickHouseRow&& row) {
 
 // ===================== Stage API =====================
 
-void ClickHouseInsertStage::ThreadInit(int /*thread_idx*/, const ClickHouseClientConfig& cfg) {
+void ClickHouseInsertStage::ThreadInit(int thread_idx, const ClickHouseClientConfig& cfg) {
   if (tl_inited) {
     throw std::runtime_error("ClickHouseInsertStage::ThreadInit() called more than once in the same thread");
   }
@@ -393,6 +463,13 @@ void ClickHouseInsertStage::ThreadInit(int /*thread_idx*/, const ClickHouseClien
   opts.SetPort(static_cast<uint16_t>(cfg.port));
   opts.SetUser(cfg.username);
   opts.SetPassword(cfg.password);
+  if (cfg.connect_timeout_ms < 0 || cfg.receive_timeout_ms < 0 ||
+      cfg.send_timeout_ms < 0) {
+    throw std::invalid_argument("ClickHouse socket timeouts must be non-negative");
+  }
+  opts.SetConnectionConnectTimeout(std::chrono::milliseconds(cfg.connect_timeout_ms));
+  opts.SetConnectionRecvTimeout(std::chrono::milliseconds(cfg.receive_timeout_ms));
+  opts.SetConnectionSendTimeout(std::chrono::milliseconds(cfg.send_timeout_ms));
 
   // stable default database for handshake
   opts.SetDefaultDatabase("default");
@@ -416,8 +493,8 @@ void ClickHouseInsertStage::ThreadInit(int /*thread_idx*/, const ClickHouseClien
   }
 
   try {
-    // DDL init once globally (copy cfg/opts into the call_once closure)
-    std::call_once(g_schema_once, [cfg, opts]() { RunSchemaInitOnce(cfg, opts); });
+    std::call_once(*cfg.schema_once,
+                   [cfg, opts]() { RunSchemaInitOnce(cfg, opts); });
 
     // Per-thread client
     tl_client = std::make_unique<clickhouse::Client>(opts);
@@ -435,18 +512,27 @@ void ClickHouseInsertStage::ThreadInit(int /*thread_idx*/, const ClickHouseClien
     throw;
   }
 
+  tl_worker_index = thread_idx;
+  tl_runtime_metrics = cfg.runtime_metrics;
   tl_inited = true;
+  tl_runtime_metrics->WorkerReady(thread_idx);
 }
 
 void ClickHouseInsertStage::ThreadCleanup() noexcept {
   if (!tl_inited || tl_cleaned) return;
   tl_cleaned = true;
   try { tl_client.reset(); } catch (...) {}
+  tl_runtime_metrics.reset();
+  tl_worker_index = -1;
 }
 
 void ClickHouseInsertStage::InsertBatch(std::vector<dmx_host_queue_item>&& batch) {
   clickhouse::Client& client = ClientOrThrow();
   if (batch.empty()) return;
+
+  std::uint64_t logical_bytes = 0;
+  for (const auto& item : batch) logical_bytes += item.item_size;
+  const std::uint64_t row_count = batch.size();
 
   // Stage rows (keeps tensor memory alive for AppendNoManagedLifetime)
   std::vector<StagedRow> rows;
@@ -511,7 +597,19 @@ void ClickHouseInsertStage::InsertBatch(std::vector<dmx_host_queue_item>&& batch
   block.AppendColumn("shape", col_shape);
   block.AppendColumn("bytes", col_bytes);
 
-  client.Insert(fq_table, block);
+  const auto started = std::chrono::steady_clock::now();
+  tl_runtime_metrics->BeginInsert();
+  try {
+    client.Insert(fq_table, block);
+  } catch (...) {
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    tl_runtime_metrics->EndInsert(tl_worker_index, row_count, logical_bytes, seconds);
+    throw;
+  }
+  const double seconds = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - started).count();
+  tl_runtime_metrics->EndInsert(tl_worker_index, row_count, logical_bytes, seconds);
 }
 
 // Force emission of the specialization referenced from bindings.cpp:

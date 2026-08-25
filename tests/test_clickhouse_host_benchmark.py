@@ -9,6 +9,7 @@ import torch
 import benchmarks.bench_clickhouse_host as benchmark
 from benchmarks.bench_clickhouse_host import (
     BenchmarkConfig,
+    ServerTelemetrySampler,
     TrialMeasurement,
     _ensure_table,
     _parts_metrics,
@@ -18,8 +19,11 @@ from benchmarks.bench_clickhouse_host import (
     build_client_settings,
     configure_stage,
     generate_payload_pool,
+    parse_parallelism_sweep,
     parse_byte_size,
     quote_identifier,
+    run_sweep,
+    summarize_scaling_trials,
 )
 
 pytestmark = pytest.mark.cpu
@@ -78,6 +82,13 @@ def test_config_rejects_non_positive_index_granularity():
         BenchmarkConfig(index_granularity=0)
 
 
+def test_config_rejects_invalid_socket_and_sampling_timeouts():
+    with pytest.raises(ValueError, match="socket_timeout_seconds"):
+        BenchmarkConfig(socket_timeout_seconds=0)
+    with pytest.raises(ValueError, match="server_sample_interval_ms"):
+        BenchmarkConfig(server_sample_interval_ms=-1)
+
+
 def test_config_uses_a_unique_benchmark_table_by_default():
     first = BenchmarkConfig().table
     second = BenchmarkConfig().table
@@ -132,14 +143,29 @@ def test_stage_configuration_sets_batching_and_backpressure():
     assert queue.high_watermark_items == 100
     assert queue.high_watermark_size == 256
     assert policy.block is True
+    assert policy.timeout_s == cfg.socket_timeout_seconds
 
 
 def test_async_insert_settings_wait_for_durability():
-    assert build_client_settings(False) == {}
+    assert build_client_settings(False) == {"async_insert": 0}
     assert build_client_settings(True) == {
         "async_insert": 1,
         "wait_for_async_insert": 1,
     }
+
+
+def test_single_value_sweep_uses_requested_parallelism(monkeypatch, capsys):
+    seen = []
+
+    def runner(config):
+        seen.append(config.parallelism)
+        return {"parallelism": config.parallelism}
+
+    monkeypatch.setattr(benchmark, "run", runner)
+
+    assert benchmark.main(["--parallelism-sweep", "8"]) == 0
+    assert seen == [8]
+    assert '"parallelism": 8' in capsys.readouterr().out
 
 
 def test_server_time_uses_clickhouse_clock():
@@ -279,6 +305,8 @@ def test_trial_measurement_reports_enqueue_and_drain_separately():
         enqueue_seconds=2.0,
         total_seconds=5.0,
         enqueue_latencies_ns=(1_000_000, 2_000_000, 3_000_000, 4_000_000),
+        startup_seconds=0.25,
+        client_metrics={"peak_active_inserts": 3},
     )
 
     report = trial.as_dict()
@@ -289,6 +317,8 @@ def test_trial_measurement_reports_enqueue_and_drain_separately():
     assert report["enqueue"]["latency_ms"]["p50"] == 2.5
     assert report["enqueue"]["latency_ms"]["p95"] == pytest.approx(3.85)
     assert report["enqueue"]["latency_samples"] == 4
+    assert report["startup_seconds"] == 0.25
+    assert report["client"]["peak_active_inserts"] == 3
 
 
 def test_submit_and_drain_uses_graceful_lifecycle():
@@ -298,6 +328,10 @@ def test_submit_and_drain_uses_graceful_lifecycle():
 
         def start(self):
             self.calls.append("start")
+
+        def wait_until_ready(self, timeout):
+            self.calls.append(("wait_until_ready", timeout))
+            return True
 
         def submit_direct(self, *args):
             self.calls.append(("submit", args))
@@ -312,10 +346,30 @@ def test_submit_and_drain_uses_graceful_lifecycle():
         def raise_if_failed(self):
             self.calls.append("raise_if_failed")
 
+        def clickhouse_metrics(self):
+            return SimpleNamespace(
+                expected_workers=2,
+                ready_workers=2,
+                active_inserts=0,
+                peak_active_inserts=2,
+                batches=2,
+                rows=2,
+                logical_bytes=32,
+                insert_seconds=0.5,
+                workers=[],
+            )
+
         def request_abort(self):
             self.calls.append("request_abort")
 
-    ticks = iter((0, 10, 15, 20, 30, 40, 70))
+    class Sampler:
+        def start(self):
+            engine.calls.append("sampler_start")
+
+        def stop(self):
+            engine.calls.append("sampler_stop")
+
+    ticks = iter((0, 10, 20, 30, 40, 50, 60, 70, 90))
     engine = Engine()
     payload = SimpleNamespace(nbytes=16)
 
@@ -326,9 +380,12 @@ def test_submit_and_drain_uses_graceful_lifecycle():
         model_id="run",
         timeout_seconds=5.0,
         clock=lambda: next(ticks),
+        deadline_clock=lambda: 0.0,
+        sampler=Sampler(),
     )
 
     assert [call[0] for call in engine.calls if isinstance(call, tuple)] == [
+        "wait_until_ready",
         "submit",
         "submit",
         "join",
@@ -336,8 +393,144 @@ def test_submit_and_drain_uses_graceful_lifecycle():
     assert "close_input" in engine.calls
     assert "raise_if_failed" in engine.calls
     assert "request_abort" not in engine.calls
-    assert result.enqueue_seconds == 40 / 1_000_000_000
+    assert engine.calls.index("sampler_start") > engine.calls.index(("wait_until_ready", 5.0))
+    assert engine.calls.index("sampler_stop") > engine.calls.index(("join", 5.0))
+    assert result.startup_seconds == 10 / 1_000_000_000
+    assert result.enqueue_seconds == 50 / 1_000_000_000
     assert result.total_seconds == 70 / 1_000_000_000
+    assert result.client_metrics["peak_active_inserts"] == 2
+
+
+def test_submit_and_drain_does_not_restart_timeout_during_abort():
+    class Engine:
+        def __init__(self):
+            self.join_timeouts = []
+
+        def start(self):
+            pass
+
+        def wait_until_ready(self, timeout):
+            return True
+
+        def submit_direct(self, *args):
+            pass
+
+        def close_input(self):
+            pass
+
+        def join(self, timeout):
+            self.join_timeouts.append(timeout)
+            return False
+
+        def request_abort(self):
+            pass
+
+    deadlines = iter((0.0, 0.0, 0.0, 0.0, 5.0))
+    engine = Engine()
+
+    with pytest.raises(TimeoutError, match="drain exceeded"):
+        _submit_and_drain(
+            engine,
+            [SimpleNamespace(nbytes=16)],
+            rows=1,
+            model_id="run",
+            timeout_seconds=5.0,
+            clock=iter(range(20)).__next__,
+            deadline_clock=lambda: next(deadlines),
+        )
+
+    assert engine.join_timeouts == [5.0, 0.0]
+
+
+def test_parallelism_sweep_is_unique_and_positive():
+    assert parse_parallelism_sweep("1,2,4,2,8") == (1, 2, 4, 8)
+    with pytest.raises(ValueError, match="positive"):
+        parse_parallelism_sweep("1,0,4")
+
+
+def test_scaling_summary_reports_speedup_and_variance():
+    trials = [
+        {"parallelism": 1, "throughput": 1.0},
+        {"parallelism": 1, "throughput": 1.2},
+        {"parallelism": 2, "throughput": 1.8},
+        {"parallelism": 2, "throughput": 2.0},
+    ]
+
+    summary = summarize_scaling_trials(trials, plateau_threshold_percent=5.0)
+
+    assert summary[0]["parallelism"] == 1
+    assert summary[0]["median_gib_per_second"] == pytest.approx(1.1)
+    assert summary[1]["speedup_vs_one"] == pytest.approx(1.9 / 1.1)
+    assert summary[1]["gain_vs_previous_percent"] == pytest.approx((1.9 / 1.1 - 1) * 100)
+    assert summary[1]["plateau"] is False
+
+
+def test_scaling_summary_does_not_invent_one_worker_baseline():
+    summary = summarize_scaling_trials(
+        [
+            {"parallelism": 2, "throughput": 2.0},
+            {"parallelism": 4, "throughput": 3.0},
+        ]
+    )
+
+    assert summary[0]["baseline_parallelism"] == 2
+    assert summary[0]["speedup_vs_one"] is None
+    assert summary[1]["speedup_vs_baseline"] == pytest.approx(1.5)
+
+
+def test_run_sweep_keeps_raw_trials_and_uses_unique_tables():
+    calls = []
+
+    def runner(config):
+        calls.append(config)
+        return {
+            "measurement": {
+                "total": {"logical_gib_per_second": float(config.parallelism)}
+            }
+        }
+
+    report = run_sweep(
+        BenchmarkConfig(rows=1, payload_bytes=16, min_batch_bytes=16,
+                        max_batch_bytes=16, queue_capacity_bytes=32,
+                        warmup_rows=0),
+        parallelisms=(1, 2),
+        trials=2,
+        runner=runner,
+    )
+
+    assert len(report["trials"]) == 4
+    assert {trial["parallelism"] for trial in report["trials"]} == {1, 2}
+    assert len({config.table for config in calls}) == 4
+    assert report["summary"][1]["speedup_vs_one"] == 2.0
+
+
+def test_server_sampler_tracks_insert_concurrency_and_metric_peaks():
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, query):
+            self.calls += 1
+            if "system.processes" in query:
+                return [(2,)]
+            if "system.asynchronous_metrics" in query:
+                return [("OSUserTimeNormalized", 0.5)]
+            return [("Merge", 3), ("Query", 5)]
+
+        def disconnect(self):
+            pass
+
+    sampler = ServerTelemetrySampler(lambda: Client(), interval_ms=1)
+    sampler.sample_once()
+    snapshot = sampler.snapshot()
+
+    assert snapshot["samples"] == 1
+    assert snapshot["peak_active_inserts"] == 2
+    assert snapshot["metric_peaks"] == {
+        "Merge": 3.0,
+        "Query": 5.0,
+        "async.OSUserTimeNormalized": 0.5,
+    }
 
 
 def test_identifier_quoting_rejects_sql_fragments():
