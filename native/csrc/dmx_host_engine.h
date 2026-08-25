@@ -73,7 +73,6 @@ private:
         }
         auto config =
             std::any_cast<ClickHouseClientConfig>(stage.thread_init_config);
-        config.schema_once = std::make_shared<std::once_flag>();
         auto metrics =
             std::make_shared<ClickHouseRuntimeMetrics>(stage.parallelism);
         config.runtime_metrics = metrics;

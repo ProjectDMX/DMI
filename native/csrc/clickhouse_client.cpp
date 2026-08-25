@@ -503,15 +503,28 @@ void ClickHouseInsertStage::ThreadInit(int thread_idx, const ClickHouseClientCon
   }
 
   try {
-    // DDL init: DB-level ops guarded once per database,
-    // table-level ops guarded once per database\0table (null separator avoids dot collisions)
+    // DDL init: DB-level ops guarded once per (host, port, secure, database),
+    // table-level ops guarded once per (host, port, secure, database, table).
+    // Null-byte separators avoid collisions with identifiers that contain dots.
+    // The endpoint prefix ensures engines targeting different servers are not
+    // incorrectly treated as already initialised.
     {
+      const std::string endpoint_prefix =
+          cfg.host + '\0' + std::to_string(cfg.port) + '\0' +
+          (cfg.secure ? "1" : "0") + '\0';
+      const std::string db_key = endpoint_prefix + cfg.database;
+      const std::string table_key = db_key + '\0' + cfg.table;
+
       std::lock_guard<std::mutex> lock(g_schema_mutex);
-      if (g_schema_inited_dbs.find(cfg.database) == g_schema_inited_dbs.end()) {
+      if (g_schema_inited_dbs.find(db_key) == g_schema_inited_dbs.end()) {
         RunDbInitOnce(cfg, opts);
-        g_schema_inited_dbs.insert(cfg.database);
+        // Only mark as initialised when DB-level DDL was (or would be) executed.
+        // If neither flag is set, no DDL runs; skip the mark so a later engine
+        // that does set one of these flags is not incorrectly suppressed.
+        if (cfg.create_database_if_missing || cfg.drop_existing_database) {
+          g_schema_inited_dbs.insert(db_key);
+        }
       }
-      const std::string table_key = cfg.database + '\0' + cfg.table;
       if (g_schema_inited_tables.find(table_key) == g_schema_inited_tables.end()) {
         RunTableInitOnce(cfg, opts);
         g_schema_inited_tables.insert(table_key);
