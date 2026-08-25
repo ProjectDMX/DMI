@@ -9,6 +9,7 @@
 #include <charconv>
 #include <chrono>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -98,6 +99,10 @@ thread_local std::string tl_db;
 thread_local std::string tl_table;
 thread_local int tl_worker_index = -1;
 thread_local std::shared_ptr<ClickHouseRuntimeMetrics> tl_runtime_metrics;
+
+std::mutex g_schema_mutex;
+std::set<std::string> g_schema_inited_dbs;
+std::set<std::string> g_schema_inited_tables;
 
 // --------------------- SQL helpers ---------------------
 
@@ -341,12 +346,9 @@ void ApplySessionSettings(clickhouse::Client& client, const ClickHouseClientConf
   }
 }
 
-void RunSchemaInitOnce(const ClickHouseClientConfig& cfg, const clickhouse::ClientOptions& opts) {
+void RunDbInitOnce(const ClickHouseClientConfig& cfg, const clickhouse::ClientOptions& opts) {
   auto client = std::make_unique<clickhouse::Client>(opts);
-
   const std::string db_q = QuoteIdent(cfg.database);
-  const std::string table_q = QuoteIdent(cfg.table);
-  const std::string fq_table_q = db_q + "." + table_q;
 
   if (cfg.drop_existing_database) {
     client->Execute("DROP DATABASE IF EXISTS " + db_q);
@@ -355,6 +357,14 @@ void RunSchemaInitOnce(const ClickHouseClientConfig& cfg, const clickhouse::Clie
   if (cfg.create_database_if_missing || cfg.drop_existing_database) {
     client->Execute("CREATE DATABASE IF NOT EXISTS " + db_q);
   }
+}
+
+void RunTableInitOnce(const ClickHouseClientConfig& cfg, const clickhouse::ClientOptions& opts) {
+  auto client = std::make_unique<clickhouse::Client>(opts);
+
+  const std::string db_q = QuoteIdent(cfg.database);
+  const std::string table_q = QuoteIdent(cfg.table);
+  const std::string fq_table_q = db_q + "." + table_q;
 
   // Schema:
   // dtype: String
@@ -493,8 +503,33 @@ void ClickHouseInsertStage::ThreadInit(int thread_idx, const ClickHouseClientCon
   }
 
   try {
-    std::call_once(*cfg.schema_once,
-                   [cfg, opts]() { RunSchemaInitOnce(cfg, opts); });
+    // DDL init: DB-level ops guarded once per (host, port, secure, database),
+    // table-level ops guarded once per (host, port, secure, database, table).
+    // Null-byte separators avoid collisions with identifiers that contain dots.
+    // The endpoint prefix ensures engines targeting different servers are not
+    // incorrectly treated as already initialised.
+    {
+      const std::string endpoint_prefix =
+          cfg.host + '\0' + std::to_string(cfg.port) + '\0' +
+          (cfg.secure ? "1" : "0") + '\0';
+      const std::string db_key = endpoint_prefix + cfg.database;
+      const std::string table_key = db_key + '\0' + cfg.table;
+
+      std::lock_guard<std::mutex> lock(g_schema_mutex);
+      if (g_schema_inited_dbs.find(db_key) == g_schema_inited_dbs.end()) {
+        RunDbInitOnce(cfg, opts);
+        // Only mark as initialised when DB-level DDL was (or would be) executed.
+        // If neither flag is set, no DDL runs; skip the mark so a later engine
+        // that does set one of these flags is not incorrectly suppressed.
+        if (cfg.create_database_if_missing || cfg.drop_existing_database) {
+          g_schema_inited_dbs.insert(db_key);
+        }
+      }
+      if (g_schema_inited_tables.find(table_key) == g_schema_inited_tables.end()) {
+        RunTableInitOnce(cfg, opts);
+        g_schema_inited_tables.insert(table_key);
+      }
+    }
 
     // Per-thread client
     tl_client = std::make_unique<clickhouse::Client>(opts);

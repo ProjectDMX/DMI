@@ -97,8 +97,6 @@ struct ClickHouseClientConfig {
   int receive_timeout_ms = 0;
   int send_timeout_ms = 0;
 
-  std::shared_ptr<std::once_flag> schema_once =
-      std::make_shared<std::once_flag>();
   std::shared_ptr<ClickHouseRuntimeMetrics> runtime_metrics =
       std::make_shared<ClickHouseRuntimeMetrics>();
 };
