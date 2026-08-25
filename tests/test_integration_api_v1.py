@@ -52,6 +52,7 @@ _NON_HOOK_EXPORTS = {
     "StepContext",
     "MonitoringEngine",
     "RingCapacities",
+    "SinkStats",
     "MonitoringConfig",
     "CaptureSchedule",
     "HostEngineConfig",
@@ -122,6 +123,7 @@ def test_v1_reexports_existing_objects_and_state() -> None:
     assert v1.StepContext is types.StepContext
     assert v1.MonitoringEngine is engine.MonitoringEngine
     assert v1.RingCapacities is engine.RingCapacities
+    assert v1.SinkStats is engine.SinkStats
     assert v1.MonitoringConfig is config.MonitoringConfig
     assert v1.CaptureSchedule is config.CaptureSchedule
     assert v1.HostEngineConfig is engine.HostEngineConfig

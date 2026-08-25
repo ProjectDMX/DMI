@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import warnings
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import ModuleType
@@ -10,15 +11,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from dmi.engine import MonitoringEngine, RingCapacities
+from dmi.engine import MonitoringEngine, RingCapacities, SinkStats
 
 pytestmark = pytest.mark.cpu
 
 
 class _FakeRingEngine:
-    def __init__(self, transport=None, *, fail_null_mode=False):
+    def __init__(
+        self, transport=None, *, fail_null_mode=False, suppressed=0,
+        fail_stop=False,
+    ):
         self.transport = transport
         self.fail_null_mode = fail_null_mode
+        self.suppressed = suppressed
+        self.fail_stop = fail_stop
         self.null_mode_calls = []
         self.stop_calls = 0
         self.init_calls = 0
@@ -55,15 +61,27 @@ class _FakeRingEngine:
 
     def stop(self):
         self.stop_calls += 1
+        if self.fail_stop:
+            raise RuntimeError("ring stop failed")
 
     def suppressed_submit_failures(self):
-        return 0
+        return self.suppressed
 
 
 class _FakeQueueStats:
-    def __init__(self, *, dropped=0, full_errors=0, retries=0):
+    def __init__(
+        self,
+        *,
+        dropped=0,
+        full_errors=0,
+        closed_errors=0,
+        too_large_errors=0,
+        retries=0,
+    ):
         self.dropped = dropped
         self.full_errors = full_errors
+        self.closed_errors = closed_errors
+        self.too_large_errors = too_large_errors
         self.retries = retries
 
 
@@ -94,7 +112,12 @@ class _FakeHostEngine:
 
 
 def _engine_with_fake_ring(
-    *, null_offload=False, force_eager=False, fail_null_mode=False
+    *,
+    null_offload=False,
+    force_eager=False,
+    fail_null_mode=False,
+    suppressed=0,
+    fail_stop=False,
 ):
     engine = MonitoringEngine(enable_ring_transport=False)
     transport = SimpleNamespace(
@@ -104,6 +127,8 @@ def _engine_with_fake_ring(
     ring_engine = _FakeRingEngine(
         transport,
         fail_null_mode=fail_null_mode,
+        suppressed=suppressed,
+        fail_stop=fail_stop,
     )
     engine._ring_transport = transport
     engine._ring_engine = ring_engine
@@ -180,14 +205,7 @@ def test_close_restores_device_global_null_mode_before_ring_stop():
 
 
 def test_close_raises_host_engine_failure_with_sink_stats():
-    engine, _transport, ring_engine = _engine_with_fake_ring()
-
-    class _CountingRing(_FakeRingEngine):
-        def suppressed_submit_failures(self):
-            return 7
-
-    ring_engine = _CountingRing()
-    engine._ring_engine = ring_engine
+    engine, _transport, ring_engine = _engine_with_fake_ring(suppressed=7)
     host_engine = _FakeHostEngine(
         failure=RuntimeError("insert failed"),
         profiling=_FakeProfiling(
@@ -196,17 +214,206 @@ def test_close_raises_host_engine_failure_with_sink_stats():
     )
     engine._host_engine = host_engine
 
-    with pytest.raises(RuntimeError, match="DMX host sink failed during teardown") as excinfo:
+    with pytest.raises(
+        RuntimeError, match="DMX host sink failed during teardown"
+    ) as excinfo:
         engine.close()
 
     message = str(excinfo.value)
-    assert "queue_stats=dropped=3 full_errors=2 retries=1" in message
-    assert "suppressed_submit_failures=7" in message
+    assert "dropped=3" in message
+    assert "suppressed=7" in message
+    assert "full_errors=2" in message
+    assert "retries=1" in message
+    assert excinfo.value.__cause__ is host_engine.failure
     assert host_engine.close_input_calls == 1
     assert host_engine.stop_calls == 1
     assert ring_engine.stop_calls == 1
     assert engine._host_engine is None
     assert engine._ring_engine is None
+
+
+def test_close_raises_on_suppressed_submits_without_a_worker_failure():
+    """The counters must not be gated behind an unrelated worker failure.
+
+    ``log_submit_failure_once`` prints at most one warning per process, so a
+    silent ``close()`` here would hide unbounded row loss.
+    """
+    engine, _transport, _ring_engine = _engine_with_fake_ring(suppressed=4)
+    engine._host_engine = _FakeHostEngine(
+        profiling=_FakeProfiling(_FakeQueueStats())
+    )
+
+    with pytest.raises(RuntimeError, match=r"lost 4 row\(s\)") as excinfo:
+        engine.close()
+
+    assert "suppressed=4" in str(excinfo.value)
+
+
+def test_close_warns_on_dropped_rows_without_a_worker_failure():
+    # Drops are reachable through a configured OnFullPolicy.DROP, so they warn
+    # rather than raise -- but they must not be silent.
+    engine, _transport, _ring_engine = _engine_with_fake_ring()
+    engine._host_engine = _FakeHostEngine(
+        profiling=_FakeProfiling(_FakeQueueStats(dropped=2, full_errors=2))
+    )
+
+    with pytest.warns(RuntimeWarning, match=r"dropped 2 row\(s\)"):
+        engine.close()
+
+    assert engine._host_engine is None
+
+
+def test_close_is_silent_when_nothing_was_lost():
+    engine, _transport, _ring_engine = _engine_with_fake_ring()
+    engine._host_engine = _FakeHostEngine(
+        profiling=_FakeProfiling(_FakeQueueStats(retries=5))
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        engine.close()
+
+
+def test_close_keeps_an_earlier_teardown_error_in_the_traceback():
+    engine, _transport, _ring_engine = _engine_with_fake_ring(fail_stop=True)
+    engine._host_engine = _FakeHostEngine(
+        failure=RuntimeError("insert failed"),
+        profiling=_FakeProfiling(_FakeQueueStats()),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="DMX host sink failed during teardown"
+    ) as excinfo:
+        engine.close()
+
+    context = excinfo.value.__context__
+    assert isinstance(context, RuntimeError)
+    assert "ring stop failed" in str(context)
+
+
+def test_close_reports_a_ring_failure_when_the_sink_is_healthy():
+    engine, _transport, _ring_engine = _engine_with_fake_ring(fail_stop=True)
+    engine._host_engine = _FakeHostEngine(
+        profiling=_FakeProfiling(_FakeQueueStats())
+    )
+
+    with pytest.raises(RuntimeError, match="ring stop failed"):
+        engine.close()
+
+
+def test_close_stays_idempotent_after_raising():
+    engine, _transport, _ring_engine = _engine_with_fake_ring(suppressed=1)
+    engine._host_engine = _FakeHostEngine(
+        profiling=_FakeProfiling(_FakeQueueStats())
+    )
+
+    with pytest.raises(RuntimeError):
+        engine.close()
+
+    engine.close()  # handles were cleared before the raise
+
+
+def test_a_second_close_does_not_erase_the_final_sink_stats():
+    """close() is idempotent and callers invoke it from finally blocks, so a
+    repeat call must not overwrite the forensic record with zeros."""
+    engine, _transport, _ring_engine = _engine_with_fake_ring(suppressed=4)
+    engine._host_engine = _FakeHostEngine(
+        profiling=_FakeProfiling(_FakeQueueStats(dropped=5, retries=2))
+    )
+
+    with pytest.raises(RuntimeError):
+        engine.close()
+    first = engine.sink_stats()
+    assert (first.dropped, first.suppressed, first.retries) == (5, 4, 2)
+
+    engine.close()  # no engines left to read
+    assert engine.sink_stats() == first
+
+
+def test_a_second_close_does_not_re_warn(recwarn):
+    engine, _transport, _ring_engine = _engine_with_fake_ring()
+    engine._host_engine = _FakeHostEngine(
+        profiling=_FakeProfiling(_FakeQueueStats(dropped=3))
+    )
+
+    with pytest.warns(RuntimeWarning):
+        engine.close()
+    recwarn.clear()
+    engine.close()
+    assert len(recwarn) == 0
+
+
+def test_sink_stats_is_readable_before_and_after_close():
+    engine, _transport, _ring_engine = _engine_with_fake_ring(suppressed=6)
+    engine._host_engine = _FakeHostEngine(
+        profiling=_FakeProfiling(_FakeQueueStats(dropped=1, retries=3))
+    )
+
+    live = engine.sink_stats()
+    assert (live.dropped, live.suppressed, live.retries) == (1, 6, 3)
+    assert live.lost_rows == 7
+
+    with pytest.raises(RuntimeError):
+        engine.close()
+
+    # The engines are gone, but the final snapshot is still available.
+    assert engine.sink_stats() == live
+
+
+def test_sink_stats_handles_a_backend_whose_profiling_returns_none():
+    """profiling() returns None when the engine carries no stats.
+
+    The ring counter must still be read, and the queue counters must report
+    zero rather than blowing up.
+    """
+    engine, _transport, _ring_engine = _engine_with_fake_ring(suppressed=2)
+    engine._host_engine = _FakeHostEngine(profiling=None)
+
+    stats = engine.sink_stats()
+
+    assert stats == SinkStats(suppressed=2)
+    assert stats.lost_rows == 2
+
+
+def test_sink_stats_reads_the_pybind_snapshot_shape():
+    """queue_by_stage is a list (from std::array<QueueStats, NumStages>) whose
+    entries expose exactly the six read-only counters bound in bindings.cpp."""
+
+    class _PybindQueueStats:
+        __slots__ = (
+            "enqueued", "dropped", "full_errors",
+            "closed_errors", "too_large_errors", "retries",
+        )
+
+        def __init__(self):
+            self.enqueued, self.dropped, self.full_errors = 100, 3, 2
+            self.closed_errors, self.too_large_errors, self.retries = 1, 4, 5
+
+    class _PybindSnapshot:
+        def __init__(self):
+            self.ingest = object()
+            self.queue_by_stage = [_PybindQueueStats()]
+            self.stage_by_stage = [object()]
+
+    engine, _transport, _ring_engine = _engine_with_fake_ring(suppressed=7)
+    engine._host_engine = _FakeHostEngine(profiling=_PybindSnapshot())
+
+    assert engine.sink_stats() == SinkStats(
+        dropped=3,
+        suppressed=7,
+        full_errors=2,
+        closed_errors=1,
+        too_large_errors=4,
+        retries=5,
+    )
+
+
+def test_sink_stats_tolerates_a_backend_without_the_counters():
+    engine, _transport, _ring_engine = _engine_with_fake_ring()
+    engine._ring_engine = SimpleNamespace()  # no suppressed_submit_failures()
+    engine._host_engine = SimpleNamespace()  # no profiling()
+
+    assert engine.sink_stats() == SinkStats()
 
 
 def test_replacing_disabled_ring_restores_native_null_mode(monkeypatch):

@@ -5,7 +5,12 @@ resources are imported lazily when an engine or transport is constructed.
 """
 
 from .config import CaptureSchedule, MonitoringConfig
-from .engine import HostEngineConfig, MonitoringEngine, RingCapacities
+from .engine import (
+    HostEngineConfig,
+    MonitoringEngine,
+    RingCapacities,
+    SinkStats,
+)
 
 _NATIVE_EXPORTS = (
     "StageConfig",
@@ -30,6 +35,7 @@ __all__ = [
     "MonitoringEngine",
     "HostEngineConfig",
     "RingCapacities",
+    "SinkStats",
     "CaptureSchedule",
     "MonitoringConfig",
     *_NATIVE_EXPORTS,

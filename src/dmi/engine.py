@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import warnings
 from typing import Any, Optional, Sequence
 
 from .config import MonitoringConfig
@@ -22,49 +23,95 @@ def _ring_module() -> Any:
     return importlib.import_module("dmi.transport.ring")
 
 
-def _format_host_engine_stats(host_engine: Any, ring_engine: Any) -> str:
-    details: list[str] = []
+@dataclass(frozen=True, slots=True)
+class SinkStats:
+    """Immutable snapshot of the host sink's loss and backpressure counters.
 
-    try:
-        profiling = host_engine.profiling()
-    except Exception:
-        profiling = None
+    ``dropped`` and ``suppressed`` are the two counters that mean rows were
+    produced but never reached ClickHouse:
+
+    * ``dropped`` -- the insert queue discarded rows, either because the stage
+      was configured with ``OnFullPolicy.DROP`` or because the engine was
+      already stopping when they were submitted.
+    * ``suppressed`` -- the native P2P thread caught an exception out of
+      ``submit_direct()`` and dropped the row.  This is never a configured
+      behavior; a nonzero value always means something went wrong.
+
+    The remaining fields are diagnostics that explain *why*, and may overlap
+    with the two above.
+    """
+
+    dropped: int = 0
+    suppressed: int = 0
+    full_errors: int = 0
+    closed_errors: int = 0
+    too_large_errors: int = 0
+    retries: int = 0
+
+    @property
+    def lost_rows(self) -> int:
+        """Rows that provably never reached the sink."""
+        return self.dropped + self.suppressed
+
+    def __str__(self) -> str:
+        return (
+            f"dropped={self.dropped} suppressed={self.suppressed} "
+            f"full_errors={self.full_errors} "
+            f"closed_errors={self.closed_errors} "
+            f"too_large_errors={self.too_large_errors} "
+            f"retries={self.retries}"
+        )
+
+
+def _read_sink_stats(host_engine: Any, ring_engine: Any) -> SinkStats:
+    """Best-effort read of the sink counters; never raises."""
+
+    fields: dict[str, int] = {}
+
+    profiling = None
+    if host_engine is not None:
+        try:
+            profiling = host_engine.profiling()
+        except Exception:
+            profiling = None
     if profiling is not None:
         try:
             queue_stats = profiling.queue_by_stage[0]
         except Exception:
             queue_stats = None
         if queue_stats is not None:
-            details.append(
-                "queue_stats="
-                f"dropped={int(queue_stats.dropped)} "
-                f"full_errors={int(queue_stats.full_errors)} "
-                f"retries={int(queue_stats.retries)}"
-            )
+            for name in (
+                "dropped",
+                "full_errors",
+                "closed_errors",
+                "too_large_errors",
+                "retries",
+            ):
+                try:
+                    fields[name] = int(getattr(queue_stats, name))
+                except Exception:
+                    pass
 
     if ring_engine is not None:
         try:
-            suppressed = int(ring_engine.suppressed_submit_failures())
+            fields["suppressed"] = int(ring_engine.suppressed_submit_failures())
         except Exception:
-            suppressed = None
-        if suppressed:
-            details.append(f"suppressed_submit_failures={suppressed}")
+            pass
 
-    return "; ".join(details)
+    return SinkStats(**fields)
 
 
-def _host_engine_teardown_error(
-    host_engine: Any,
-    ring_engine: Any,
-    exc: Exception,
-) -> RuntimeError:
-    details = _format_host_engine_stats(host_engine, ring_engine)
-    message = "DMX host sink failed during teardown"
-    if details:
-        message = f"{message} ({details})"
-    error = RuntimeError(message)
+def _host_engine_teardown_error(stats: SinkStats, exc: Exception) -> RuntimeError:
+    error = RuntimeError(f"DMX host sink failed during teardown ({stats})")
     error.__cause__ = exc
     return error
+
+
+def _lost_rows_error(stats: SinkStats) -> RuntimeError:
+    return RuntimeError(
+        f"DMX host sink lost {stats.lost_rows} row(s) during this run; "
+        f"captured internals are incomplete ({stats})"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,7 +179,9 @@ class MonitoringEngine:
         self.config = config
         self._model_id = model_id
         self._auto_batch_group_id = 0
-
+        # Final sink counters, captured during close() so sink_stats() keeps
+        # working after the engines are gone.
+        self._final_sink_stats: Optional[SinkStats] = None
 
         # Host-side DB engine (optional; C++ backend only)
         self._host_engine: Optional[Any] = None
@@ -322,8 +371,28 @@ class MonitoringEngine:
         self._auto_batch_group_id += 1
         return gid
 
+    def sink_stats(self) -> SinkStats:
+        """Snapshot the host sink's loss and backpressure counters.
+
+        Safe to call at any point in the run, and after ``close()`` -- the
+        final counts are cached during teardown, so the snapshot survives the
+        engines being torn down.
+        """
+
+        if self._final_sink_stats is not None:
+            return self._final_sink_stats
+        return _read_sink_stats(
+            self._host_engine, getattr(self, "_ring_engine", None)
+        )
+
     def close(self) -> None:
-        """Tear down backend resources."""
+        """Tear down backend resources.
+
+        Raises ``RuntimeError`` if teardown failed, if the sink recorded a
+        worker failure, or if rows were produced but never reached the sink.
+        Both engine handles are cleared before raising, so ``close()`` stays
+        idempotent and a second call is a no-op.
+        """
 
         teardown_error: Exception | None = None
         ring_engine = getattr(self, "_ring_engine", None)
@@ -350,8 +419,8 @@ class MonitoringEngine:
             self._ring_transport = None
             self._ring_engine = None
 
-        if self._host_engine is not None:
-            host_engine = self._host_engine
+        host_engine = self._host_engine
+        if host_engine is not None:
             try:
                 host_engine.close_input()
             except Exception as exc:
@@ -360,18 +429,52 @@ class MonitoringEngine:
                 host_engine.stop()
             except Exception as exc:
                 teardown_error = teardown_error or exc
+
+        # Read the counters after both engines are stopped and joined, so the
+        # snapshot is final rather than a moving target.  Only the close() that
+        # actually had engines reads and reports them: a repeat call must
+        # neither overwrite the snapshot with zeros nor re-report it.
+        stats = None
+        if host_engine is not None or ring_engine is not None:
+            stats = _read_sink_stats(host_engine, ring_engine)
+            self._final_sink_stats = stats
+
+        if host_engine is not None:
+            # stats is always set here: host_engine being non-None satisfies the
+            # condition above.  Spelled out so a future edit cannot quietly
+            # pass None into the error builder.
+            assert stats is not None
             try:
                 host_engine.raise_if_failed()
             except Exception as exc:
-                teardown_error = _host_engine_teardown_error(
-                    host_engine,
-                    ring_engine,
-                    exc,
-                )
+                sink_error = _host_engine_teardown_error(stats, exc)
+                # Prefer the sink failure -- it is the more actionable one --
+                # but keep an earlier teardown error visible in the traceback
+                # instead of discarding it.
+                sink_error.__context__ = teardown_error
+                teardown_error = sink_error
             self._host_engine = None
 
         if teardown_error is not None:
             raise teardown_error
+
+        if stats is None:
+            return  # already closed; nothing new to report
+
+        # A clean shutdown is not the same as a complete capture: rows the
+        # queue dropped or the P2P thread failed to submit are silent
+        # otherwise (the native warning fires at most once per process).
+        if stats.suppressed:
+            raise _lost_rows_error(stats)
+        if stats.dropped:
+            # Reachable through a configured OnFullPolicy.DROP, so warn rather
+            # than raise -- the caller may have opted into shedding load.
+            warnings.warn(
+                f"DMX host sink dropped {stats.dropped} row(s); captured "
+                f"internals are incomplete ({stats})",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
 
 # ---------------------------------------------------------------------------

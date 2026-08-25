@@ -199,6 +199,7 @@ engine.ring_capacities() -> RingCapacities
 engine.capture_enabled -> bool
 engine.set_capture_enabled(enabled: bool) -> None
 engine.next_auto_group_id() -> int
+engine.sink_stats() -> SinkStats
 engine.close() -> None
 ```
 
@@ -240,11 +241,48 @@ fails, Python-visible capture flags remain unchanged.
 `next_auto_group_id()` returns engine-scoped integers starting at zero. It is
 not synchronized for concurrent callers.
 
+`sink_stats()` returns an immutable `SinkStats` snapshot of the host sink's
+loss and backpressure counters:
+
+| Field | Meaning |
+| --- | --- |
+| `dropped` | Rows the insert queue discarded, via a configured `OnFullPolicy.DROP` or because the engine was already stopping. |
+| `suppressed` | Rows the native P2P thread failed to submit and swallowed. Never a configured behavior. |
+| `full_errors` | Enqueue attempts that hit a full queue. |
+| `closed_errors` | Enqueue attempts against a closed queue. |
+| `too_large_errors` | Rows rejected as larger than the queue's item cap. |
+| `retries` | Enqueue retries under `OnFullPolicy.RETRY`. |
+| `lost_rows` | `dropped + suppressed` -- rows that provably never reached the sink. |
+
+The counters are cumulative for the life of the engine, never reset by DMI,
+and read best-effort: a backend that does not expose them reports zeros rather
+than raising. `close()` caches the final snapshot, so `sink_stats()` keeps
+working after teardown. Prefer it over the native warning: the P2P thread's
+submit-failure message is printed at most once per process no matter how many
+rows are lost.
+
 `close()` stops and flushes the ring, clears the active binding, closes host
-input, and stops the host engine. It is terminal and effectively idempotent.
-Shutdown exceptions are suppressed, so an integration requiring an
-authoritative final read must ensure every worker reaches this close path and
-should separately check native host failures.
+input, and stops the host engine. It is terminal and idempotent -- both engine
+handles are cleared before any exception leaves the method, so a second call is
+a no-op: it neither re-reads the counters nor re-reports them. Only the first
+close sees the engines, so `sink_stats()` keeps returning that snapshot however
+many times `close()` is called.
+
+`close()` raises `RuntimeError` when:
+
+- the ring or host engine raised during teardown;
+- `raise_if_failed()` reports a host worker failure, in which case the message
+  carries the `SinkStats` snapshot and the original failure is chained as
+  `__cause__`; or
+- `sink_stats().suppressed` is nonzero, meaning rows were produced but never
+  submitted.
+
+When a teardown failure and a sink failure coincide, the sink failure is the
+one raised and the earlier error is attached as `__context__`. A nonzero
+`dropped` count raises no exception -- it is reachable through a configured
+drop policy -- but emits a `RuntimeWarning`. Integrations that treat a run as
+authoritative should call `close()` inside their own error handling rather
+than a bare `finally`, since it can now replace an in-flight exception.
 
 Closing does not disable or uninstall HookPoints: they retain hook IDs and the
 old payload tensor. Treat the attached model as terminal too. A later CUDA
@@ -919,7 +957,9 @@ DMXHostEngine(insert_stage: StageConfig)
 ```
 
 Construction validates/copies stage configuration but does not connect to the
-database. Public lifecycle and diagnostics are:
+database. The engine always keeps the ingest and queue counters that
+`MonitoringEngine.close()` uses to report silently lost rows; they measured
+below noise on the submit path. Public lifecycle and diagnostics are:
 
 ```python
 start() -> None
@@ -929,12 +969,36 @@ request_abort() -> None
 join(timeout_s: float | None = None) -> bool
 failures() -> list[ThreadFailure]
 raise_if_failed() -> None
+profiling() -> StatsSnapshot | None
+reset_metrics() -> None
 ```
 
 `start()` is asynchronous: it can return before a worker fails to connect or
 initialize. `stop()` returning true means threads joined, not that inserts
 succeeded. After shutdown, call `raise_if_failed()`; `failures()` returns
 records with `stage`, `thread_name`, `where`, `exc_type`, and `exc_what`.
+
+`profiling()` returns a `StatsSnapshot` by value, or `None` when the engine was
+built without stats. Counters are cumulative; `reset_metrics()` zeroes them.
+Both are safe to call after `stop()`. Prefer `MonitoringEngine.sink_stats()`
+unless you need the per-stage timing fields.
+
+### `StatsSnapshot`, `IngestStats`, `QueueStats`, and `StageStats`
+
+`StatsSnapshot` is the immutable value returned by `DMXHostEngine.profiling()`.
+Its fields are `ingest` (an `IngestStats`), `queue_by_stage`, and
+`stage_by_stage` (lists of `QueueStats` and `StageStats`, one entry per stage;
+the host engine has exactly one). All fields on all four classes are read-only
+and the classes cannot be constructed from Python.
+
+| Class | Read-only fields |
+| --- | --- |
+| `IngestStats` | `submit_calls`, `items_submitted`, `submit_enqueue_calls`, `submit_enqueue_s` |
+| `QueueStats` | `enqueued`, `dropped`, `full_errors`, `closed_errors`, `too_large_errors`, `retries` |
+| `StageStats` | `batches`, `items_in`, `items_out`, `dequeue_calls`, `dequeue_timeouts`, `process_calls`, `enqueue_calls`, `output_calls`, `output_items`, `dequeue_s`, `dequeue_idle_s`, `process_s`, `enqueue_s`, `output_s` |
+
+The `_s` fields are seconds and stay zero unless the engine was also built with
+timing enabled, which DMI does not do.
 
 ### `ThreadFailure`
 
