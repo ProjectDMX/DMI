@@ -252,7 +252,7 @@ static void CUDART_CB blocking_host_callback(void* data) {
     auto* state = static_cast<BlockingCallbackState*>(data);
     state->entered.store(true, std::memory_order_release);
     while (!state->release.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
@@ -281,7 +281,7 @@ static void test_drain_worker_binds_owner_device() {
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!callback.entered.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < callback_deadline) {
-        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     const bool callback_entered =
         callback.entered.load(std::memory_order_acquire);
