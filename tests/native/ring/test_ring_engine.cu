@@ -7,11 +7,15 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
+#include <thread>
 #include <vector>
 
 static int g_pass = 0;
@@ -239,6 +243,88 @@ static void test_zero_byte_delivery() {
     harness.release(task);
 }
 
+struct BlockingCallbackState {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+};
+
+static void CUDART_CB blocking_host_callback(void* data) {
+    auto* state = static_cast<BlockingCallbackState*>(data);
+    state->entered.store(true, std::memory_order_release);
+    while (!state->release.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+static void test_drain_worker_binds_owner_device() {
+    banner("drain worker binds the ring owner device");
+
+    int device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    if (device_count < 2) {
+        std::printf("[ SKIP ] requires two CUDA devices\n");
+        return;
+    }
+
+    int original_device = 0;
+    CUDA_CHECK(cudaGetDevice(&original_device));
+
+    BlockingCallbackState callback;
+    cudaStream_t blocked_stream{};
+    CUDA_CHECK(cudaSetDevice(0));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&blocked_stream,
+                                         cudaStreamNonBlocking));
+    CUDA_CHECK(cudaLaunchHostFunc(blocked_stream, blocking_host_callback,
+                                  &callback));
+
+    const auto callback_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!callback.entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < callback_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool callback_entered =
+        callback.entered.load(std::memory_order_acquire);
+    EXPECT(callback_entered);
+
+    bool stopped_without_waiting_for_device_zero = false;
+    if (callback_entered) {
+        CUDA_CHECK(cudaSetDevice(1));
+        ring::RingConfig cfg = make_config();
+        ring::AllocatedRing allocated(cfg);
+        allocated.init();
+        ring::PinnedStaging staging;
+        staging.init(cfg.effective_staging_bytes());
+        auto drain = std::make_unique<ring::DrainThread>(
+            allocated.state(), staging, cfg);
+
+        CUDA_CHECK(cudaSetDevice(0));
+        drain->start();
+        auto stopped = std::async(std::launch::async, [&drain] {
+            drain->stop();
+        });
+        stopped_without_waiting_for_device_zero =
+            stopped.wait_for(std::chrono::seconds(2)) ==
+            std::future_status::ready;
+
+        callback.release.store(true, std::memory_order_release);
+        CUDA_CHECK(cudaSetDevice(0));
+        CUDA_CHECK(cudaStreamSynchronize(blocked_stream));
+        stopped.get();
+
+        CUDA_CHECK(cudaSetDevice(1));
+        drain.reset();
+    } else {
+        callback.release.store(true, std::memory_order_release);
+        CUDA_CHECK(cudaStreamSynchronize(blocked_stream));
+    }
+
+    CUDA_CHECK(cudaSetDevice(0));
+    CUDA_CHECK(cudaStreamDestroy(blocked_stream));
+    CUDA_CHECK(cudaSetDevice(original_device));
+    EXPECT(stopped_without_waiting_for_device_zero);
+}
+
 int main() {
     setbuf(stdout, nullptr);
     ring::set_ring_null_mode(false);
@@ -249,6 +335,7 @@ int main() {
     test_prefix_force_flush();
     test_repeated_wrap_delivery();
     test_zero_byte_delivery();
+    test_drain_worker_binds_owner_device();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

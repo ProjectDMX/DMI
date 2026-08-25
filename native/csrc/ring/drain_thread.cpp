@@ -13,16 +13,36 @@
 #include <ATen/ATen.h>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <future>
+#include <string>
 #include <stdexcept>
 
 namespace ring {
+
+namespace {
+
+void report_cuda_failure(const char* operation, cudaError_t error) {
+    if (error == cudaSuccess) return;
+    std::fprintf(stderr, "[drain] ERROR: %s failed: %s\n",
+                 operation, cudaGetErrorString(error));
+    std::fflush(stderr);
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 DrainThread::DrainThread(RingState& rs, PinnedStaging& staging,
                          const RingConfig& cfg)
     : ring_(rs), staging_(staging), cfg_(cfg)
 {
+    cudaError_t error = cudaGetDevice(&owner_device_);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("DrainThread: cudaGetDevice failed: ") +
+            cudaGetErrorString(error));
+    }
     if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess)
         throw std::runtime_error("DrainThread: cudaStreamCreate failed");
 }
@@ -33,8 +53,32 @@ DrainThread::~DrainThread() noexcept {
 }
 
 void DrainThread::start() {
+    std::promise<cudaError_t> startup;
+    std::future<cudaError_t> startup_result = startup.get_future();
     running_.store(true, std::memory_order_relaxed);
-    thread_ = std::thread([this] { loop(); });
+    try {
+        thread_ = std::thread(
+            [this, startup = std::move(startup)]() mutable {
+                cudaError_t error = cudaSetDevice(owner_device_);
+                startup.set_value(error);
+                if (error != cudaSuccess) {
+                    running_.store(false, std::memory_order_relaxed);
+                    return;
+                }
+                loop();
+            });
+    } catch (...) {
+        running_.store(false, std::memory_order_relaxed);
+        throw;
+    }
+
+    cudaError_t error = startup_result.get();
+    if (error != cudaSuccess) {
+        if (thread_.joinable()) thread_.join();
+        throw std::runtime_error(
+            std::string("DrainThread: cudaSetDevice failed: ") +
+            cudaGetErrorString(error));
+    }
 }
 
 void DrainThread::stop() {
@@ -289,7 +333,7 @@ void DrainThread::loop() {
     }
 
     // Final flush
-    cudaDeviceSynchronize();
+    report_cuda_failure("cudaDeviceSynchronize", cudaDeviceSynchronize());
     do_full_flush();
 }
 
@@ -357,7 +401,8 @@ void DrainThread::flush_state_update(uint64_t flush_count, uint64_t flush_bytes)
 }
 
 void DrainThread::sync_stream() {
-    cudaStreamSynchronize(stream_);
+    report_cuda_failure("cudaStreamSynchronize",
+                        cudaStreamSynchronize(stream_));
 }
 
 // ---------------------------------------------------------------------------
@@ -384,10 +429,10 @@ void DrainThread::enqueue_d2h(uint64_t flush_bytes) {
                         ring_.payload_buf + gpu_cursor,
                         chunk, cudaMemcpyDeviceToHost, stream_);
         if (err != cudaSuccess) {
-            RING_DBG("[enqueue_d2h] cudaMemcpyAsync FAILED: %s\n",
-                    cudaGetErrorString(err));
+            report_cuda_failure("cudaMemcpyAsync", err);
+        } else {
+            RING_DBG("[enqueue_d2h] chunk=%d enqueued OK\n", chunk_idx);
         }
-        RING_DBG("[enqueue_d2h] chunk=%d enqueued OK\n", chunk_idx);
 
         remaining  -= chunk;
         gpu_cursor  = (gpu_cursor + chunk) % gpu_cap;

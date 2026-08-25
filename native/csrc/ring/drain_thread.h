@@ -74,6 +74,7 @@ private:
     RingState&      ring_;
     PinnedStaging&  staging_;
     RingConfig      cfg_;
+    int             owner_device_{-1};
     cudaStream_t    stream_{};
 
     std::thread             thread_;
