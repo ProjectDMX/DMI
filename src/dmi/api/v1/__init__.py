@@ -154,7 +154,7 @@ def __getattr__(name: str) -> Any:
     if name in _NATIVE_EXPORTS:
         from ...transport import native as _native_engine
 
-        value = getattr(_native_engine._load_extension(), name)
+        value = getattr(_native_engine, name)
         globals()[name] = value
         return value
     raise AttributeError(name)

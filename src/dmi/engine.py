@@ -44,7 +44,7 @@ class HostEngineConfig:
     receives pre-assembled rows from the ring transport drain thread.
 
     Notes:
-      - Requires the native monitoring extension (CUDA + pybind11).
+      - Requires the CPU host extension or the full CUDA extension.
       - Expects exactly **one** stage (clickhouse_insert).
     """
 

@@ -57,6 +57,12 @@ from textwrap import dedent
 
 import pytest
 
+from tests._requirements import (
+    require_cuda,
+    require_model_cache,
+    require_native_backend,
+    require_transformers_fork,
+)
 from tests.isolate_hook import (
     _COPY_LINE_RE,
     _COMPARE_MODEL_PATHS,
@@ -66,14 +72,6 @@ from tests.isolate_hook import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-requires_compare_models = pytest.mark.skipif(
-    not all(
-        _COMPARE_MODEL_PATHS[("hf", model)].is_file()
-        for model in ("gpt2", "qwen3", "llama")
-    ),
-    reason="Transformers comparison-model submodule is not initialized",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -136,26 +134,8 @@ class TestPatcherCorrectness:
 
 
 @pytest.mark.cpu
-@requires_compare_models
 class TestPatcherRoundTrip:
     """Verify the on-disk patch / unpatch context manager."""
-
-    @pytest.mark.parametrize("framework,model_key", [
-        ("hf", "gpt2"), ("hf", "qwen3"), ("hf", "llama"),
-    ])
-    def test_round_trip_byte_identical(self, framework, model_key):
-        """File contents before and after isolated_hook must match."""
-        p = compare_model_path(framework, model_key)
-        original = p.read_bytes()
-        with isolated_hook(framework, model_key, "q") as (model_path, commented):
-            assert p.read_bytes() != original, "patch did not modify the file"
-            assert len(commented) > 0, "no _buf_* capture lines were commented"
-            assert "q" not in commented, "q itself should not be in commented list"
-        # Restored
-        assert p.read_bytes() == original
-        # Backup is gone
-        backup = p.with_suffix(p.suffix + ".copy_isolate_backup")
-        assert not backup.exists()
 
     def test_dirty_restore_raises_loudly(self, tmp_path, monkeypatch):
         """If the file can't be restored byte-identically, exit must raise.
@@ -195,8 +175,27 @@ class TestPatcherRoundTrip:
             isolate_hook.patch("test", "fake", "q")
 
 
-@pytest.mark.cpu
-@requires_compare_models
+@pytest.mark.framework_fork
+@require_transformers_fork()
+class TestFrameworkForkRoundTrip:
+    @pytest.mark.parametrize("framework,model_key", [
+        ("hf", "gpt2"), ("hf", "qwen3"), ("hf", "llama"),
+    ])
+    def test_round_trip_byte_identical(self, framework, model_key):
+        """File contents before and after isolated_hook must match."""
+        p = compare_model_path(framework, model_key)
+        original = p.read_bytes()
+        with isolated_hook(framework, model_key, "q") as (model_path, commented):
+            assert p.read_bytes() != original, "patch did not modify the file"
+            assert len(commented) > 0, "no _buf_* capture lines were commented"
+            assert "q" not in commented, "q itself should not be in commented list"
+        assert p.read_bytes() == original
+        backup = p.with_suffix(p.suffix + ".copy_isolate_backup")
+        assert not backup.exists()
+
+
+@pytest.mark.framework_fork
+@require_transformers_fork()
 class TestRealCompareModelsContainAllExpectedHooks:
     """The smoke cells assume specific hooks have a `.copy_()` line in the
     real _compare files.  If a hook is missing the smoke fails opaquely,
@@ -422,7 +421,14 @@ def _run_rollout(
 
 
 @pytest.mark.gpu
+@pytest.mark.framework_fork
+@pytest.mark.native_backend
+@pytest.mark.hf
 @pytest.mark.slow
+@require_cuda()
+@require_native_backend()
+@require_transformers_fork()
+@require_model_cache("Qwen/Qwen3-0.6B")
 @pytest.mark.parametrize(
     "framework,model_key,hook,mode", SMOKE_CELLS,
     ids=lambda c: f"{c[0]}-{c[1]}-{c[2]}-{c[3]}" if isinstance(c, tuple) else str(c),
@@ -435,9 +441,6 @@ def test_per_hook_isolation_smoke(
     path patched to capture H only).
     """
     import torch  # local import: this test is GPU-only
-
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
 
     env = _build_subprocess_env()
 

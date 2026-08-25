@@ -156,7 +156,19 @@ cmake -S third_party/clickhouse-cpp -B third_party/clickhouse-cpp/build \
 cmake --build third_party/clickhouse-cpp/build -j
 ```
 
-Build the DMI native backend:
+For host-side ClickHouse ingestion and benchmarking without CUDA, build the
+CPU-only backend:
+
+```bash
+make -C native host -j
+# or: make host
+```
+
+This emits `_host_backend.<EXT_SUFFIX>.so` inside `native/` and as the
+importable `src/dmi/_host_backend.<EXT_SUFFIX>.so`. It contains the host
+pipeline and ClickHouse client but no ring transport or CUDA symbols.
+
+For GPU capture and ring transport, build the full backend:
 
 ```bash
 make -C native -j
@@ -164,14 +176,39 @@ make -C native -j
 ```
 
 Artifacts are emitted as `_native_backend.<EXT_SUFFIX>.so` inside `native/`
-and as the importable `src/dmi/_native_backend.<EXT_SUFFIX>.so`.
+and as the importable `src/dmi/_native_backend.<EXT_SUFFIX>.so`. Host exports
+prefer the full backend and fall back to `_host_backend`; ring exports always
+require the full backend.
 
-Smoke check (loads the built `.so`):
+Smoke check the package and host backend:
 
 ```bash
 python -c "import dmi; print(dmi.__file__)"
+python -c "from dmi.api.v1 import DMXHostEngine; print(DMXHostEngine.__module__)"
+```
+
+After a full build, smoke check the ring backend:
+
+```bash
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
+
+Run the dependency-free CPU gate without CUDA, ClickHouse, native artifacts,
+model weights, or initialized framework forks:
+
+```bash
+make test-cpu
+```
+
+Build and verify the CPU-only native host backend:
+
+```bash
+make test-host
+```
+
+Tests with optional runtime prerequisites carry separate markers and skip when
+those resources are unavailable. `make test-host` does not download or start
+ClickHouse; use the host benchmark separately with a running server.
 
 ## 6. Choose one backend
 
@@ -191,6 +228,8 @@ checkout.
 - **`ImportError` on `_native_backend`** — rebuild with
   `make -C native clean && make -C native -j`, then confirm `pip install -e .`
   used the active conda env.
+- **`ImportError` on `_host_backend`** — build with
+  `make -C native host -j`; this target does not require CUDA or `nvcc`.
 - **Linker errors against `libclickhouse-cpp-lib`** — rerun step 5 and confirm
   `third_party/clickhouse-cpp/build/clickhouse/` exists.
 - **`Connection refused` to ClickHouse** — check

@@ -9,9 +9,22 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.cpu
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+requires_pinned_integrations = pytest.mark.skipif(
+    not (
+        REPO_ROOT / "third_party/transformers/src/transformers/__init__.py"
+    ).is_file()
+    or not (
+        REPO_ROOT
+        / "third_party/vllm-integration/src/dmi_vllm_integration/__init__.py"
+    ).is_file(),
+    reason="pinned framework integrations are not initialized",
+)
 
 
+@pytest.mark.framework_fork
+@requires_pinned_integrations
 def test_pinned_framework_integrations_use_the_dmi_namespace():
     repo_root = Path(__file__).resolve().parents[1]
     vllm_integration_root = (
@@ -46,6 +59,7 @@ def test_pinned_framework_integrations_use_the_dmi_namespace():
                 assert name not in source, source_path
 
 
+@pytest.mark.cpu
 def test_canonical_core_types_are_available():
     from dmi import CaptureSchedule, MonitoringEngine
     from dmi.storage.internals import InternalRequirements
@@ -55,6 +69,7 @@ def test_canonical_core_types_are_available():
     assert InternalRequirements.__module__ == "dmi.storage.internals"
 
 
+@pytest.mark.cpu
 def test_adapter_exports_preferred_and_existing_class_names():
     from dmi.adapters import BackendAdapter, BackendAdaptor
     from dmi.adapters.huggingface import HFAdaptor, HuggingFaceAdapter
@@ -65,6 +80,7 @@ def test_adapter_exports_preferred_and_existing_class_names():
     assert HuggingFaceAdapter is HFAdaptor
 
 
+@pytest.mark.cpu
 def test_source_tree_has_no_legacy_top_level_directories():
     repo_root = Path(__file__).resolve().parents[1]
 
@@ -90,6 +106,7 @@ def test_source_tree_has_no_legacy_top_level_directories():
     assert all((repo_root / name).is_dir() for name in canonical_names)
 
 
+@pytest.mark.cpu
 def test_plain_dmi_import_does_not_load_native_transport():
     repo_root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
@@ -111,6 +128,7 @@ def test_plain_dmi_import_does_not_load_native_transport():
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.cpu
 def test_hook_catalog_is_available_without_native_extension():
     from dmi.hooks.catalog import HOOK_DEFS
 

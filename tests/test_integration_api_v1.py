@@ -5,16 +5,12 @@ from __future__ import annotations
 import importlib
 import importlib.abc
 from pathlib import Path
-import subprocess
 import sys
 from types import SimpleNamespace
 from typing import get_type_hints
 
 import pytest
 import torch
-
-
-pytestmark = pytest.mark.cpu
 
 
 _HOOK_EXPORTS = {
@@ -91,6 +87,7 @@ _NON_HOOK_EXPORTS = {
 }
 
 
+@pytest.mark.cpu
 def test_v1_public_surface_is_exact() -> None:
     from dmi.api import v1
 
@@ -102,6 +99,7 @@ def test_v1_public_surface_is_exact() -> None:
     assert not hasattr(v1, "RingEngine")
 
 
+@pytest.mark.cpu
 def test_v1_reexports_existing_objects_and_state() -> None:
     from dmi.adapters import base as adapter_base
     from dmi.storage import clickhouse
@@ -181,6 +179,7 @@ def test_v1_native_exports_reexport_compiled_objects() -> None:
         assert getattr(v1, name) is getattr(native, name)
 
 
+@pytest.mark.cpu
 def test_v1_public_surface_is_documented() -> None:
     from dmi.api import v1
 
@@ -206,6 +205,7 @@ def test_v1_public_surface_is_documented() -> None:
     assert missing_members == []
 
 
+@pytest.mark.cpu
 def test_v1_public_names_preserve_existing_shape_and_selection_behavior() -> None:
     from dmi.hooks import selection
     from dmi.hooks import specs
@@ -230,6 +230,7 @@ def test_v1_public_names_preserve_existing_shape_and_selection_behavior() -> Non
     assert not v1.is_preset_registered("not-a-real-preset")
 
 
+@pytest.mark.cpu
 def test_v1_padding_strip_configuration_preserves_existing_modes() -> None:
     from dmi.api import v1
 
@@ -274,6 +275,7 @@ def test_v1_padding_strip_configuration_preserves_existing_modes() -> None:
         ),
     ],
 )
+@pytest.mark.cpu
 def test_v1_model_shape_helper_matches_existing_helper(config) -> None:
     from dmi.adapters.huggingface.model_shape import _make_model_shape_from_hf_config
     from dmi.api import v1
@@ -283,26 +285,7 @@ def test_v1_model_shape_helper_matches_existing_helper(config) -> None:
     )
 
 
-def test_v1_import_does_not_load_native_transport() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    source_root = repo_root / "src"
-    code = (
-        "import sys; "
-        f"sys.path.insert(0, {str(source_root)!r}); "
-        "import dmi.api.v1; "
-        "assert 'dmi.transport.ring' not in sys.modules; "
-        "assert 'dmi.transport.native' not in sys.modules"
-    )
-    result = subprocess.run(
-        [sys.executable, "-I", "-c", code],
-        cwd=repo_root,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-
-
+@pytest.mark.cpu
 def test_v1_import_has_no_framework_or_preset_side_effects() -> None:
     from dmi import api as api_package
     from dmi.hooks import selection
@@ -317,6 +300,8 @@ def test_v1_import_has_no_framework_or_preset_side_effects() -> None:
         if name == "dmi.api.v1"
         or name.startswith("dmi.api.v1.")
         or name == "dmi.adapters.huggingface.adapter"
+        or name == "dmi.transport.native"
+        or name == "dmi.transport.ring"
         or name == "vllm"
         or name.startswith("vllm.")
     }
@@ -328,6 +313,8 @@ def test_v1_import_has_no_framework_or_preset_side_effects() -> None:
                 fullname == "vllm"
                 or fullname.startswith("vllm.")
                 or fullname == "dmi.adapters.huggingface.adapter"
+                or fullname == "dmi.transport.native"
+                or fullname == "dmi.transport.ring"
             )
             if blocked:
                 raise AssertionError(f"unexpected framework import: {fullname}")
@@ -350,6 +337,8 @@ def test_v1_import_has_no_framework_or_preset_side_effects() -> None:
             for name in sys.modules
         )
         assert "dmi.adapters.huggingface.adapter" not in sys.modules
+        assert "dmi.transport.native" not in sys.modules
+        assert "dmi.transport.ring" not in sys.modules
     finally:
         sys.meta_path.remove(finder)
         for name in list(sys.modules):

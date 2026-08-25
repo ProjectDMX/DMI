@@ -6,11 +6,13 @@ CXX ?= g++
 LTO ?= 0
 
 TARGET := _native_backend
+HOST_TARGET := _host_backend
 SRCS := csrc/bindings.cpp \
         csrc/clickhouse_client.cpp \
         csrc/ring/drain_thread.cpp \
         csrc/ring/p2p_thread.cpp \
         csrc/ring/ring_torch_op.cpp
+HOST_SRCS := csrc/bindings.cpp csrc/clickhouse_client.cpp
 HEADERS := csrc/dmx_host_utils.h \
            csrc/clickhouse_client.h csrc/dmx_host_engine.h \
            csrc/ring/ring_config.h csrc/ring/ring_state.h csrc/ring/ring_alloc.h \
@@ -19,13 +21,18 @@ HEADERS := csrc/dmx_host_utils.h \
            csrc/ring/ring_engine.h csrc/ring/ring_engine_py.h \
            csrc/ring/ring_torch_op.h csrc/ring/tensor_meta.h
 BUILD_DIR := build
+HOST_BUILD_DIR := $(BUILD_DIR)/host
 OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
+HOST_OBJS := $(patsubst csrc/%.cpp,$(HOST_BUILD_DIR)/%.o,$(HOST_SRCS))
 PROJECT_ROOT := $(abspath $(CURDIR)/..)
 
 EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 TARGET_SO := $(TARGET)$(EXT_SUFFIX)
 LOCAL_TARGET := $(CURDIR)/$(TARGET_SO)
 FINAL_TARGET := $(PROJECT_ROOT)/src/dmi/$(TARGET_SO)
+HOST_TARGET_SO := $(HOST_TARGET)$(EXT_SUFFIX)
+HOST_LOCAL_TARGET := $(CURDIR)/$(HOST_TARGET_SO)
+HOST_FINAL_TARGET := $(PROJECT_ROOT)/src/dmi/$(HOST_TARGET_SO)
 
 # Resolve one complete CUDA toolkit. Do not combine a compiler, headers, and
 # libraries from unrelated installations: that can produce an extension linked
@@ -34,11 +41,12 @@ CUDA_RESOLVER := $(CURDIR)/cuda_toolkit.py
 CUDA_CONFIG_STAMP := $(BUILD_DIR)/cuda-toolkit.config
 CUDA_RESOLVE_REQUIRED := 1
 ifneq ($(strip $(MAKECMDGOALS)),)
-ifeq ($(strip $(filter-out clean,$(MAKECMDGOALS))),)
+ifeq ($(strip $(filter-out clean host,$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
 endif
 endif
 
+comma := ,
 ifeq ($(CUDA_RESOLVE_REQUIRED),1)
 CUDA_INPUT_CUDACXX := $(CUDACXX)
 CUDA_INPUT_NVCC := $(NVCC)
@@ -77,12 +85,19 @@ CUDA_INCLUDE_FLAGS := -I$(CUDA_INCLUDE_DIR)
 CUDA_LIB_FLAGS := -L$(CUDA_LIBRARY_DIR)
 TORCH_INCLUDE_FLAGS := $(addprefix -I,$(TORCH_INCLUDE_DIRS))
 TORCH_LIB_FLAGS := $(addprefix -L,$(TORCH_LIBRARY_DIRS))
-comma := ,
 CUDA_RPATH_FLAGS := -Wl$(comma)-rpath$(comma)$(CUDA_LIBRARY_DIR)
 TORCH_RPATH_FLAGS := $(foreach path,$(TORCH_LIBRARY_DIRS),-Wl$(comma)-rpath$(comma)$(path))
 ABI_FLAG := -D_GLIBCXX_USE_CXX11_ABI=$(TORCH_CXX11_ABI)
 
 $(info DMI CUDA toolkit: $(CUDA_TOOLKIT_ROOT_RESOLVED) (CUDA $(CUDA_VERSION), PyTorch $(TORCH_CUDA_VERSION)))
+else ifneq ($(filter host,$(MAKECMDGOALS)),)
+TORCH_INCLUDE_DIRS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join(include_paths()))")
+TORCH_LIBRARY_DIRS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join(library_paths()))")
+TORCH_CXX11_ABI := $(shell $(PYTHON) -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))")
+TORCH_INCLUDE_FLAGS := $(addprefix -I,$(TORCH_INCLUDE_DIRS))
+TORCH_LIB_FLAGS := $(addprefix -L,$(TORCH_LIBRARY_DIRS))
+TORCH_RPATH_FLAGS := $(foreach path,$(TORCH_LIBRARY_DIRS),-Wl$(comma)-rpath$(comma)$(path))
+ABI_FLAG := -D_GLIBCXX_USE_CXX11_ABI=$(TORCH_CXX11_ABI)
 endif
 
 PYTHON_INCLUDE_FLAGS := $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); includes = {paths.get('include'), paths.get('platinclude')}; print(' '.join(f'-I{p}' for p in includes if p))")
@@ -95,9 +110,19 @@ CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused
             $(ABI_FLAG) $(PYBIND_FLAGS) \
             $(TORCH_INCLUDE_FLAGS) $(PYTHON_INCLUDE_FLAGS) $(CUDA_INCLUDE_FLAGS) -Icsrc \
             -MMD -MP
+HOST_CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
+                 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=$(HOST_TARGET) \
+                 -DDMI_HOST_ONLY=1 $(ABI_FLAG) $(PYBIND_FLAGS) \
+                 $(TORCH_INCLUDE_FLAGS) $(PYTHON_INCLUDE_FLAGS) -Icsrc \
+                 -MMD -MP
 
 LDFLAGS := $(TORCH_LIB_FLAGS) $(CUDA_LIB_FLAGS) $(TORCH_RPATH_FLAGS) $(CUDA_RPATH_FLAGS) \
            -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -lcudart -lcuda -lpthread
+HOST_LDFLAGS := $(TORCH_LIB_FLAGS) $(TORCH_RPATH_FLAGS) \
+                -lc10 -ltorch_cpu -ltorch -ltorch_python -lpthread
+ifeq ($(shell uname -s),Darwin)
+HOST_LDFLAGS += -Wl,-undefined,dynamic_lookup
+endif
 
 
 # ---- ClickHouse C++ client (fixed in-repo paths) ----
@@ -108,16 +133,23 @@ CLICKHOUSE_CONTRIB := $(CLICKHOUSE_INCLUDE)/build/contrib
 
 ifneq ($(CLICKHOUSE_INCLUDE),)
 CXXFLAGS += -I$(CLICKHOUSE_INCLUDE) -I$(CLICKHOUSE_INCLUDE)/contrib/absl
+HOST_CXXFLAGS += -I$(CLICKHOUSE_INCLUDE) -I$(CLICKHOUSE_INCLUDE)/contrib/absl
 endif
 ifneq ($(CLICKHOUSE_LIB_DIR),)
 LDFLAGS += -L$(CLICKHOUSE_LIB_DIR) -Wl,-rpath,$(CLICKHOUSE_LIB_DIR)
+HOST_LDFLAGS += -L$(CLICKHOUSE_LIB_DIR) -Wl,-rpath,$(CLICKHOUSE_LIB_DIR)
 endif
 LDFLAGS += $(CLICKHOUSE_LIBS)
+HOST_LDFLAGS += $(CLICKHOUSE_LIBS)
 # clickhouse-cpp transitive deps (static libs built by its cmake)
 LDFLAGS += -L$(CLICKHOUSE_CONTRIB)/lz4/lz4 -llz4 \
            -L$(CLICKHOUSE_CONTRIB)/cityhash/cityhash -lcityhash \
            -L$(CLICKHOUSE_CONTRIB)/absl/absl -labsl_int128 \
            -L$(CLICKHOUSE_CONTRIB)/zstd/zstd -lzstdstatic
+HOST_LDFLAGS += -L$(CLICKHOUSE_CONTRIB)/lz4/lz4 -llz4 \
+                -L$(CLICKHOUSE_CONTRIB)/cityhash/cityhash -lcityhash \
+                -L$(CLICKHOUSE_CONTRIB)/absl/absl -labsl_int128 \
+                -L$(CLICKHOUSE_CONTRIB)/zstd/zstd -lzstdstatic
 
 # ---- CUDA kernel compilation (nvcc) ----------------------------------------
 SM_ARCH ?= native
@@ -140,9 +172,11 @@ RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
 
 OBJS += $(RING_OBJS)
 
-.PHONY: all build clean cuda-info FORCE
+.PHONY: all host clean cuda-info FORCE
 
 all: $(FINAL_TARGET)
+
+host: $(HOST_FINAL_TARGET)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -156,6 +190,10 @@ $(BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) $(CUDA_CONFIG_STAMP) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(HOST_BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	$(CXX) $(HOST_CXXFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/ring/%.o: csrc/ring/%.cu $(CUDA_CONFIG_STAMP) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CUDA_NVCC) $(NVCCFLAGS) -MMD -MP -MF $(@:.o=.d) -c $< -o $@
@@ -166,6 +204,11 @@ $(FINAL_TARGET): $(OBJS)
 	cp $(BUILD_DIR)/$(TARGET_SO) $(LOCAL_TARGET)
 	cp $(BUILD_DIR)/$(TARGET_SO) $(FINAL_TARGET)
 
+$(HOST_FINAL_TARGET): $(HOST_OBJS)
+	$(CXX) -shared $^ -o $(HOST_BUILD_DIR)/$(HOST_TARGET_SO) $(HOST_LDFLAGS)
+	cp $(HOST_BUILD_DIR)/$(HOST_TARGET_SO) $(HOST_LOCAL_TARGET)
+	cp $(HOST_BUILD_DIR)/$(HOST_TARGET_SO) $(HOST_FINAL_TARGET)
+
 cuda-info:
 	@echo "CUDA toolkit root: $(CUDA_TOOLKIT_ROOT_RESOLVED)"
 	@echo "CUDA compiler: $(CUDA_NVCC)"
@@ -175,12 +218,15 @@ cuda-info:
 	@echo "CUDA library directory: $(CUDA_LIBRARY_DIR)"
 
 clean:
-	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET)
+	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET) \
+		$(HOST_LOCAL_TARGET) $(HOST_FINAL_TARGET)
 
 # Overrides --------------------------------------------------------------
 ifeq ($(LTO),1)
 CXXFLAGS += -flto
 LDFLAGS += -flto
+HOST_CXXFLAGS += -flto
+HOST_LDFLAGS += -flto
 endif
 
 # Optional NVTX runtime linking (default off). The code compiles without the
@@ -193,4 +239,4 @@ endif
 # Automatic header dependency tracking.
 # -MMD -MP (g++) and -MMD -MF (nvcc) above generate .d files alongside .o files.
 # Including them here makes make rebuild any .o whose headers have changed.
--include $(wildcard $(BUILD_DIR)/*.d $(BUILD_DIR)/ring/*.d)
+-include $(wildcard $(BUILD_DIR)/*.d $(BUILD_DIR)/ring/*.d $(HOST_BUILD_DIR)/*.d)
