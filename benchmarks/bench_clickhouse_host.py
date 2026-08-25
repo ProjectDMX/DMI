@@ -325,7 +325,13 @@ class ServerTelemetrySampler:
         try:
             if self._client is None:
                 self._client = self._client_factory()
-            active = int(self._client.execute(self._process_query, self._process_query_params)[0][0])
+            if self._process_query_params:
+                active_result = self._client.execute(
+                    self._process_query, self._process_query_params
+                )
+            else:
+                active_result = self._client.execute(self._process_query)
+            active = int(active_result[0][0])
             metrics = self._client.execute(self._METRICS_QUERY)
             async_metrics = self._client.execute(self._ASYNC_METRICS_QUERY)
             with self._lock:
