@@ -30,11 +30,14 @@ make -C native host -j
 
 ```bash
 python -m benchmarks.bench_clickhouse_host \
-  --rows 10000 \
+  --rows 100000 \
   --payload-bytes 64KiB \
+  --parallelism-sweep 1,2,4,8 \
+  --trials 5 \
   --min-batch-bytes 16MiB \
   --max-batch-bytes 64MiB \
   --compression lz4 \
+  --socket-timeout-seconds 30 \
   --json-output host-clickhouse.json
 ```
 
@@ -43,22 +46,53 @@ connecting to ClickHouse. The benchmark creates a uniquely named table and
 drops it after collection; `--keep-table` preserves it for inspection. Set the
 password with `DMI_CLICKHOUSE_PASSWORD` to keep it out of shell history.
 
-The JSON separates enqueue time from total drain time. It also reports logical
-payload throughput, sampled submit latency, DMI process CPU and peak RSS, active
-MergeTree parts, compression size, primary-key size, and insert batching from
-`system.query_log`. Query-log metrics degrade to a warning when the account
-lacks access. The process measurements include the Python-to-C++ call used by
-this synthetic driver; they do not include a ClickHouse server running in a
-different process.
+The scaling report retains every raw trial and summarizes median throughput,
+variance, speedup over the reported baseline, and gain over the preceding
+worker count. `speedup_vs_one` is populated only when the sweep includes one
+worker. Trial order is deterministically shuffled. Startup ends only after
+every native worker has connected and initialized, so steady-state throughput
+does not mix in connection setup.
 
-Compare one setting at a time with the same row count, payload pattern, seed,
-and pool size. Useful sweeps are `--parallelism`, batch byte limits,
-`--compression`, and `--async-insert`. Synchronous batching remains the default.
+Each trial reports enqueue and total drain time, sampled submit latency, DMI
+process CPU, process-lifetime peak RSS, per-worker batches/rows/bytes/insert
+time, and peak simultaneous native inserts. The RSS value is not an isolated
+per-trial peak, so do not use later values in an in-process sweep for memory
+scaling. A 50 ms sampler records server-side active inserts,
+query/merge/connection gauges, normalized CPU and I/O wait, resident memory,
+part pressure, and block/network counter deltas over the same steady-state
+interval as throughput. Set
+`--server-sample-interval-ms 0` when the benchmark account cannot read those
+tables. Query-log and server metrics degrade to warnings when unavailable.
+
+Treat saturation as evidence from several signals, not the first flat number:
+throughput gain should fall below the configured plateau threshold across
+repeated trials, realized insert concurrency should reach the requested worker
+count, and client CPU/backpressure plus ClickHouse query/merge metrics should
+identify which side is limiting progress. The process measurements include the
+Python-to-C++ synthetic producer but not ClickHouse server CPU when the server
+runs in another process.
+
+Queue admission uses a finite timeout. The drain deadline is not restarted
+during abort cleanup, and native connect/send/receive calls use the configured
+socket timeout. An in-flight native call cannot be cancelled, so failure
+cleanup can extend past the drain deadline by up to the socket timeout.
+
+Use `--parallelism-sweep` for worker scaling, then compare one additional
+setting at a time with the same row count, payload pattern, seed, and pool size.
+Useful follow-up sweeps are batch byte limits, `--compression`, and
+`--async-insert`. The benchmark explicitly sets `async_insert=0` for
+synchronous trials instead of inheriting the server or user profile; the JSON
+records the effective client settings. This matters on releases such as
+[ClickHouse 26.3](https://clickhouse.com/blog/clickhouse-release-26-03), which
+changed the server default.
 ClickHouse recommends batching synchronous inserts, commonly at least 1,000
 rows and ideally 10,000–100,000 where row size permits; tensor workloads may
 reach practical byte limits earlier. See ClickHouse's
 [insert strategy](https://clickhouse.com/docs/concepts/best-practices/selecting-an-insert-strategy),
 [`system.query_log`](https://clickhouse.com/docs/reference/system-tables/query_log),
+[`system.processes`](https://clickhouse.com/docs/reference/system-tables/processes),
+[`system.metrics`](https://clickhouse.com/docs/reference/system-tables/metrics),
+[`system.asynchronous_metrics`](https://clickhouse.com/docs/reference/system-tables/asynchronous_metrics),
 and [`system.parts`](https://clickhouse.com/docs/reference/system-tables/parts)
 documentation when interpreting results.
 

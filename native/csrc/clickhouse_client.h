@@ -2,7 +2,11 @@
 #define DMX_HOST_CLICKHOUSE_CLIENT_H_
 
 #include <any>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -18,6 +22,52 @@ namespace dmx_host {
 
 // Settings value types for session SET ... (bound from Python too).
 using ClickHouseSettingValue = std::variant<std::string, std::int64_t, bool>;
+
+struct ClickHouseWorkerMetrics {
+  int worker_index = 0;
+  std::uint64_t batches = 0;
+  std::uint64_t rows = 0;
+  std::uint64_t logical_bytes = 0;
+  double insert_seconds = 0.0;
+};
+
+struct ClickHouseMetricsSnapshot {
+  int expected_workers = 0;
+  int ready_workers = 0;
+  std::uint64_t active_inserts = 0;
+  std::uint64_t peak_active_inserts = 0;
+  std::uint64_t batches = 0;
+  std::uint64_t rows = 0;
+  std::uint64_t logical_bytes = 0;
+  double insert_seconds = 0.0;
+  std::vector<ClickHouseWorkerMetrics> workers;
+};
+
+class ClickHouseRuntimeMetrics {
+ public:
+  explicit ClickHouseRuntimeMetrics(int expected_workers = 0);
+
+  void WorkerReady(int worker_index);
+  bool WaitUntilReady(std::chrono::milliseconds timeout);
+  void BeginInsert();
+  void EndInsert(int worker_index, std::uint64_t rows,
+                 std::uint64_t logical_bytes, double seconds);
+  ClickHouseMetricsSnapshot Snapshot() const;
+
+ private:
+  mutable std::mutex mu_;
+  std::condition_variable ready_cv_;
+  int expected_workers_ = 0;
+  int ready_workers_ = 0;
+  std::uint64_t active_inserts_ = 0;
+  std::uint64_t peak_active_inserts_ = 0;
+  std::uint64_t batches_ = 0;
+  std::uint64_t rows_ = 0;
+  std::uint64_t logical_bytes_ = 0;
+  double insert_seconds_ = 0.0;
+  std::vector<bool> ready_;
+  std::vector<ClickHouseWorkerMetrics> workers_;
+};
 
 /**
  * ClickHouse connection + schema init configuration.
@@ -43,6 +93,14 @@ struct ClickHouseClientConfig {
   std::string client_side_compress = "none";
 
   int index_granularity = 8192;
+  int connect_timeout_ms = 5000;
+  int receive_timeout_ms = 0;
+  int send_timeout_ms = 0;
+
+  std::shared_ptr<std::once_flag> schema_once =
+      std::make_shared<std::once_flag>();
+  std::shared_ptr<ClickHouseRuntimeMetrics> runtime_metrics =
+      std::make_shared<ClickHouseRuntimeMetrics>();
 };
 
 /**

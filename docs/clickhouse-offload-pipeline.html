@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DMI host-to-ClickHouse benchmark</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #09121d;
+      --panel: #122235;
+      --text: #eef7ff;
+      --muted: #a7bdd2;
+      --line: #35526c;
+      --host: #55d6be;
+      --db: #ffc857;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top, #173653, var(--bg) 55%);
+      color: var(--text);
+      font: 16px/1.5 system-ui, sans-serif;
+    }
+    main { width: min(1120px, 94vw); margin: auto; padding: 48px 0 64px; }
+    h1 { margin: 0 0 8px; font-size: clamp(2rem, 5vw, 3.4rem); }
+    h2 { margin: 0 0 8px; font-size: 1.05rem; }
+    p { color: var(--muted); }
+    .flow, .measure { display: grid; gap: 14px; margin-top: 28px; }
+    .flow { grid-template-columns: repeat(4, 1fr); }
+    .measure { grid-template-columns: repeat(3, 1fr); }
+    .card {
+      min-height: 180px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: color-mix(in srgb, var(--panel) 94%, transparent);
+      box-shadow: 0 16px 40px #0004;
+    }
+    .host { border-color: var(--host); }
+    .db { border-color: var(--db); }
+    .tag {
+      display: inline-block;
+      margin: 4px 4px 0 0;
+      padding: 3px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: .8rem;
+    }
+    @media (max-width: 900px) {
+      .flow, .measure { grid-template-columns: 1fr; }
+      .card { min-height: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>CPU host to ClickHouse</h1>
+    <p>The benchmark isolates ClickHouse ingestion from model execution and
+      accelerator transport. Deterministic CPU tensors exercise the same native
+      host queue and ClickHouse clients used by DMI.</p>
+
+    <section class="flow" aria-label="Host benchmark stages">
+      <article class="card host">
+        <h2>1. Synthetic producer</h2>
+        <p>Reuses a seeded pool of contiguous CPU tensors and submits a fixed
+          logical payload without model or device variance.</p>
+        <span class="tag">CPU tensors</span><span class="tag">repeatable</span>
+      </article>
+      <article class="card host">
+        <h2>2. Bounded queue</h2>
+        <p>Applies byte and row watermarks, finite admission waits, and
+          configurable batch size and linger thresholds.</p>
+        <span class="tag">backpressure</span><span class="tag">16–64 MiB batches</span>
+      </article>
+      <article class="card host">
+        <h2>3. Native clients</h2>
+        <p>Each worker owns one ClickHouse connection. Readiness, per-worker
+          rows and bytes, insert time, and realized concurrency are recorded.</p>
+        <span class="tag">1 / 2 / 4 / 8 workers</span><span class="tag">socket timeouts</span>
+      </article>
+      <article class="card db">
+        <h2>4. ClickHouse</h2>
+        <p>Stores tensor metadata and binary payloads in a MergeTree table,
+          then verifies row and byte counts after the queue drains.</p>
+        <span class="tag">native protocol</span><span class="tag">verified output</span>
+      </article>
+    </section>
+
+    <section class="measure" aria-label="Scaling evidence">
+      <article class="card host">
+        <h2>Steady-state boundary</h2>
+        <p>Throughput starts only after every worker connects, selects the
+          database, and applies session settings.</p>
+      </article>
+      <article class="card host">
+        <h2>Repeated scaling sweep</h2>
+        <p>Shuffled trials retain raw results and summarize median throughput,
+          variance, speedup, and marginal gain.</p>
+      </article>
+      <article class="card db">
+        <h2>Server evidence</h2>
+        <p>Active inserts, queries, merges, connections, CPU, I/O wait, memory,
+          and network counters are sampled over the measured interval.</p>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

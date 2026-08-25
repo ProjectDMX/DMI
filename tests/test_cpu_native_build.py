@@ -9,9 +9,7 @@ from typing import get_type_hints
 import pytest
 
 
-pytestmark = pytest.mark.cpu
-
-
+@pytest.mark.cpu
 def test_host_build_plan_has_no_cuda_toolchain_or_libraries():
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
@@ -31,6 +29,7 @@ def test_host_build_plan_has_no_cuda_toolchain_or_libraries():
         assert forbidden not in output
 
 
+@pytest.mark.cpu
 def test_host_export_falls_back_to_cpu_backend(monkeypatch):
     from dmi.transport import native
 
@@ -50,6 +49,53 @@ def test_host_export_falls_back_to_cpu_backend(monkeypatch):
     assert calls == ["_native_backend", "_host_backend"]
 
 
+@pytest.mark.native_backend
+def test_clickhouse_stage_has_bounded_batching_defaults():
+    from dmi.transport.native import ClickHouseClientConfig, StageConfig
+
+    stage = StageConfig.clickhouse_insert(ClickHouseClientConfig())
+    queue = stage.input_queue
+
+    assert queue.min_batch_items is None
+    assert queue.min_batch_size == 16 * 1024**2
+    assert queue.max_linger_s == pytest.approx(0.05)
+    assert queue.max_batch_items == 10_000
+    assert queue.max_batch_size is None
+    assert queue.high_watermark_items == 20_000
+    assert queue.high_watermark_size == 512 * 1024**2
+
+
+@pytest.mark.native_backend
+def test_clickhouse_client_exposes_socket_timeouts_and_worker_metrics():
+    from dmi.transport.native import ClickHouseClientConfig, DMXHostEngine, StageConfig
+
+    config = ClickHouseClientConfig()
+    assert config.connect_timeout_ms == 5000
+    assert config.receive_timeout_ms == 0
+    assert config.send_timeout_ms == 0
+
+    engine = DMXHostEngine(StageConfig.clickhouse_insert(config, parallelism=3))
+    metrics = engine.clickhouse_metrics()
+    assert metrics.expected_workers == 3
+    assert metrics.ready_workers == 0
+    assert metrics.peak_active_inserts == 0
+    assert [worker.worker_index for worker in metrics.workers] == [0, 1, 2]
+
+
+@pytest.mark.native_backend
+def test_engine_metrics_follow_mutated_stage_parallelism():
+    from dmi.transport.native import ClickHouseClientConfig, DMXHostEngine, StageConfig
+
+    stage = StageConfig.clickhouse_insert(ClickHouseClientConfig(), parallelism=1)
+    stage.parallelism = 3
+
+    metrics = DMXHostEngine(stage).clickhouse_metrics()
+
+    assert metrics.expected_workers == 3
+    assert [worker.worker_index for worker in metrics.workers] == [0, 1, 2]
+
+
+@pytest.mark.cpu
 def test_ring_export_requires_full_backend(monkeypatch):
     from dmi.transport import native
 
@@ -67,6 +113,7 @@ def test_ring_export_requires_full_backend(monkeypatch):
     assert calls == ["_native_backend"]
 
 
+@pytest.mark.cpu
 def test_v1_host_export_does_not_load_ring_backend(monkeypatch):
     import dmi.api.v1 as api
     from dmi.transport import native
@@ -85,6 +132,7 @@ def test_v1_host_export_does_not_load_ring_backend(monkeypatch):
             api.__dict__["DMXHostEngine"] = cached
 
 
+@pytest.mark.cpu
 def test_v1_model_shape_contract_does_not_load_ring_backend():
     import dmi.api.v1 as api
 
