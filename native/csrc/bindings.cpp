@@ -252,8 +252,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("failures", &DMXHostEngine::failures)
       .def("raise_if_failed", &DMXHostEngine::raise_if_failed)
-      .def("profiling", &DMXHostEngine::profiling)
-      .def("reset_metrics", &DMXHostEngine::reset_metrics)
+      // Both take the engine's profiling mutex, which C++ worker threads
+      // also hold; release the GIL like every other blocking method here.
+      .def("profiling", &DMXHostEngine::profiling,
+           py::call_guard<py::gil_scoped_release>())
+      .def("reset_metrics", &DMXHostEngine::reset_metrics,
+           py::call_guard<py::gil_scoped_release>())
       // Submit a pre-formatted ClickHouseRow directly to the insert stage.
       // Called from the ring transport drain callback after format processing.
       .def("submit_direct",
