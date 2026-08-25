@@ -7,6 +7,7 @@
 #endif
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <cmath>
 namespace py = pybind11;
 
 #include "clickhouse_client.h"
@@ -232,6 +233,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("start", &DMXHostEngine::start)
       .def("wait_until_ready",
            [](DMXHostEngine& self, double timeout_s) {
+             if (!std::isfinite(timeout_s)) {
+               throw std::invalid_argument("timeout_s must be finite and non-negative");
+             }
              return self.wait_until_ready(DMXHostEngine::Duration(timeout_s));
            },
            py::arg("timeout_s"),
@@ -240,6 +244,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("stop",
            [](DMXHostEngine& self, bool graceful, std::optional<double> timeout_s) {
              if (timeout_s) {
+               if (!std::isfinite(*timeout_s)) {
+                 throw std::invalid_argument("timeout_s must be finite and non-negative");
+               }
                return self.stop(graceful, DMXHostEngine::Duration(*timeout_s));
              }
              return self.stop(graceful, std::nullopt);
@@ -251,7 +258,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("request_abort", &DMXHostEngine::request_abort)
       .def("join",
            [](DMXHostEngine& self, std::optional<double> timeout_s) {
-             if (timeout_s) return self.join(DMXHostEngine::Duration(*timeout_s));
+             if (timeout_s) {
+               if (!std::isfinite(*timeout_s)) {
+                 throw std::invalid_argument("timeout_s must be finite and non-negative");
+               }
+               return self.join(DMXHostEngine::Duration(*timeout_s));
+             }
              return self.join(std::nullopt);
            },
            py::arg("timeout_s") = std::optional<double>(),
