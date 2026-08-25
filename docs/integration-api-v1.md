@@ -1107,7 +1107,7 @@ InternalRequirement(
     retry: bool = False,
     timeout_s: float | None = 30.0,
     poll_s: float = 0.25,
-    match_token_ranges: bool = False,
+    match_token_ranges: bool = True,
 )
 ```
 
@@ -1124,7 +1124,7 @@ requirements.require(
     retry: bool = False,
     timeout_s: float | None = 30.0,
     poll_s: float = 0.25,
-    match_token_ranges: bool = False,
+    match_token_ranges: bool = True,
 ) -> InternalRequirements
 ```
 
@@ -1173,10 +1173,23 @@ and a batch count for global tensors, not a token or database-row count. With
 `retry=True`, synchronous field access polls missing/incomplete data until
 success or timeout. `timeout_s=None` can block forever. Database/runtime errors
 are not retried. When both nonempty request IDs and ranges were supplied,
-token-range validation runs by default; `match_token_ranges=False` opts out for
-an individual field, and otherwise the flag is a no-op. For a per-layer field
-the current v1 implementation checks only its highest present layer, not every
-layer.
+token-range validation runs by default -- including for a field with no
+requirement registered at all. `match_token_ranges=False` opts out for an
+individual field, and otherwise the flag is a no-op. For a per-layer field
+every layer present in the result is checked, and the error names the offending
+`layer=`.
+
+One loss the range check cannot see: a layer that wrote no rows at all leaves
+nothing to compare against, so it is silently absent from the reassembled
+tuple. Only a declared `count` catches that -- pass one when layer
+completeness matters.
+
+`logits` is validated on range *ends* only. Its rows are re-based natively to
+the trailing positions of each step, because HF generate passes
+`logits_to_keep=1` and vLLM computes one logit per request, so a full-range
+comparison would fail on every prefill with a prompt longer than one token.
+The relaxed check still detects a missing step; it does not detect a wrong
+start offset.
 
 Mapped dynamic attributes are:
 

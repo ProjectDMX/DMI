@@ -90,7 +90,14 @@ each layer tensor unless token-range validation runs. Lazy reads attached to
 `generate_with_monitoring_dict(...)` now perform that validation by default
 whenever request IDs and token ranges were recorded for the generate call.
 `match_token_ranges=False` opts out for a specific requirement. For per-layer
-fields the current implementation uses a fast representative-layer check.
+fields every layer present is checked and the error names the offending layer.
+A layer that wrote no rows at all is not detectable this way -- it is simply
+absent from the tuple -- so pass `count=` when layer completeness matters.
+
+`logits` is a special case: `generate()` passes `logits_to_keep=1`, so the
+prefill logits row covers only the last prompt position rather than the whole
+prompt. Its rows are therefore validated on token-range *ends* only, which
+still catches a missing decode step.
 
 Supported mapped fields are:
 
@@ -149,10 +156,18 @@ norm = hidden_states[0].float().norm(dim=-1)[token_mask].mean()
 
 If a tensor field and `token_mask` have different `[batch, seq]` shapes, it
 usually means the tensor field was read before all rows for that field arrived.
-Use `retry=True` to wait for expected token ranges after an incomplete read. If
-you intentionally want to skip token-range validation for a field, set
-`match_token_ranges=False` on that field's requirement. If you already cached a
-partial field, clear that field's cache and read it again:
+Use `retry=True` to wait for expected token ranges after an incomplete read.
+If you intentionally want to skip token-range validation for a field, set
+`match_token_ranges=False` on that field's requirement. Both are set through
+`require()`, which also needs the expected `count`:
+
+```python
+out.dmi_internal.require(
+    "hidden_states", count=model.config.num_hidden_layers, retry=True
+)
+```
+ If you already cached a partial field, clear that
+field's cache and read it again:
 
 ```python
 out.dmi_internal.clear_cache("hidden_states")

@@ -165,6 +165,17 @@ _FIELDS = {
 }
 
 
+# Acts whose stored row range is narrower than the step's token range.
+# ``final_logits`` rows are re-based in the native P2P thread to
+# ``(end - logits_count, end)`` because both HF generate (logits_to_keep=1) and
+# vLLM (always one logit per request) compute logits for only the trailing
+# positions of the step.  Comparing full ranges for these acts would fail on
+# every prefill with a prompt longer than one token, so token-range validation
+# compares range *ends* instead -- which still catches a missing step, just not
+# a wrong start offset.
+_TRAILING_RANGE_ACTS = frozenset({"final_logits"})
+
+
 class Internal:
     """Captured internals for one run, presented like HF's model output: each
     field mirrors its HF counterpart (e.g. ``hidden_states`` is a tuple indexed
@@ -417,19 +428,25 @@ class LazyInternal:
             if int(end) > int(start)
         )
 
-    def _actual_ranges_for_request(
-        self,
+    @staticmethod
+    def _ranges_by_request_and_layer(
         rows: list,
-        request_id: str,
-        layer: int | None,
-    ) -> tuple[tuple[int, int], ...]:
-        ranges = {
-            (int(key[5]), int(key[6]))
-            for key, _ in rows
-            if key[1] == request_id and (layer is None or int(key[3]) == layer)
-            and int(key[6]) > int(key[5])
-        }
-        return tuple(sorted(ranges))
+    ) -> dict[tuple[str, int | None], tuple[tuple[int, int], ...]]:
+        """Group non-empty row ranges by (request_id, layer) in one pass.
+
+        ``layer`` is None for global (non-per-layer) acts, which store -1.
+        """
+        grouped: dict[tuple[str, int | None], set] = {}
+        for key, _ in rows:
+            layer = int(key[3])
+            start, end = int(key[5]), int(key[6])
+            if end <= start:
+                continue
+            bucket = grouped.setdefault(
+                (key[1], layer if layer >= 0 else None), set()
+            )
+            bucket.add((start, end))
+        return {k: tuple(sorted(v)) for k, v in grouped.items()}
 
     def _validate_token_ranges(
         self,
@@ -443,19 +460,47 @@ class LazyInternal:
             or not self._token_ranges
         ):
             return
-        layers = sorted({int(key[3]) for key, _ in rows if int(key[3]) >= 0})
-        # Fast check for per-layer fields: validating the last layer catches the
-        # common "writer still pending" case without scanning every layer.
-        check_layer = layers[-1] if layers else None
+        # Every layer is checked, not just a representative one.  Picking the
+        # highest *present* layer would let the reference point follow the
+        # damage: if a layer went missing entirely the check would silently
+        # re-base onto a lower, intact layer.  One grouping pass over rows we
+        # already hold costs no extra queries.
+        by_layer = self._ranges_by_request_and_layer(rows)
+        layers = sorted({layer for _, layer in by_layer if layer is not None})
+        act = _FIELDS[field][0] if field in _FIELDS else None
+        trailing = act in _TRAILING_RANGE_ACTS
         for request_id in self._request_ids:
             expected = self._expected_non_empty_ranges(request_id)
-            actual = self._actual_ranges_for_request(rows, request_id, check_layer)
-            if actual != expected:
-                raise IncompleteInternalError(
-                    f"{field} token ranges are incomplete for "
-                    f"model_id={self._model_id!r}, request_id={request_id!r}: "
-                    f"expected {list(expected)}, found {list(actual)}."
+            for layer in (layers or [None]):
+                actual = by_layer.get((request_id, layer), ())
+                if trailing:
+                    # See _TRAILING_RANGE_ACTS: rows cover only the trailing
+                    # positions of each step, so only the range ends line up.
+                    mismatch = tuple(e for _, e in actual) != tuple(
+                        e for _, e in expected
+                    )
+                    detail = (
+                        f"expected token range ends "
+                        f"{[e for _, e in expected]}, found {[e for _, e in actual]}"
+                    )
+                else:
+                    mismatch = actual != expected
+                    detail = f"expected {list(expected)}, found {list(actual)}"
+                if not mismatch:
+                    continue
+                where = (
+                    f"model_id={self._model_id!r}, request_id={request_id!r}"
+                    if layer is None
+                    else f"model_id={self._model_id!r}, "
+                    f"request_id={request_id!r}, layer={layer}"
                 )
+                error = IncompleteInternalError(
+                    f"{field} token ranges are incomplete for "
+                    f"{where}: {detail}."
+                )
+                error.field = field  # type: ignore[attr-defined]
+                error.token_ranges_incomplete = True  # type: ignore[attr-defined]
+                raise error
 
     def _read_field(
         self,
@@ -503,6 +548,23 @@ class LazyInternal:
                     mask[batch_i, offset + start_i: offset + end_i] = True
         return mask
 
+    def _token_range_timeout_error(
+        self,
+        field: str,
+        requirement: InternalRequirement,
+        cause: Exception,
+    ) -> IncompleteInternalError:
+        timeout_text = (
+            "without timeout"
+            if requirement.timeout_s is None
+            else f"within {requirement.timeout_s:.3g}s"
+        )
+        error = IncompleteInternalError(f"{cause} Not resolved {timeout_text}.")
+        error.field = field  # type: ignore[attr-defined]
+        error.token_ranges_incomplete = True  # type: ignore[attr-defined]
+        error.__cause__ = cause
+        return error
+
     def _load_field_with_retry(
         self,
         field: str,
@@ -528,6 +590,13 @@ class LazyInternal:
                 last_error = exc
 
             if deadline is not None and time.monotonic() >= deadline:
+                if getattr(last_error, "token_ranges_incomplete", False):
+                    # The entry count may well be correct -- reporting this as
+                    # "expected N entries, found none" would send the caller
+                    # looking for the wrong problem.
+                    raise self._token_range_timeout_error(
+                        field, requirement, last_error
+                    )
                 raise self._incomplete_error(
                     field,
                     requirement,

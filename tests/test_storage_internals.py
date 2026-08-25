@@ -1,8 +1,11 @@
 """Unit tests for dmi.storage.internals -- pure reassembly logic, no DB."""
+from pathlib import Path
+
 import pytest
 import torch
 
 from dmi.storage.internals import (
+    _TRAILING_RANGE_ACTS,
     IncompleteInternalError,
     InternalRequirements,
     get_internal,
@@ -383,6 +386,226 @@ def test_lazy_internal_validates_token_ranges_by_default_when_request_metadata_e
 
     with pytest.raises(IncompleteInternalError, match="token ranges are incomplete"):
         internal.hidden_states
+
+
+def test_pipeline_parallel_lag_is_reported_and_clears_on_retry():
+    """PP splits layers across ranks that flush independently.
+
+    A lagging rank must be reported rather than silently yielding a short
+    tuple, and ``retry=True`` must clear it once the rank flushes.
+    """
+    ranges = ((0, 2), (2, 3))
+    def rows(partial=()):
+        return [
+            _row("0:0", layer, start, torch.ones(n, 4))
+            for layer in range(8)
+            for start, n in ((0, 2), (2, 1))
+            if not (layer in partial and start == 2)
+        ]
+
+    lagging = rows(partial=(4, 5, 6, 7))       # rank1 decode rows not flushed
+    internal = make_lazy_internal(
+        "m", PrefixReader(lagging),
+        request_ids=("0:0",), token_ranges={"0:0": ranges},
+    )
+    with pytest.raises(IncompleteInternalError, match="layer=4"):
+        internal.hidden_states
+
+    internal = make_lazy_internal(
+        "m", SequenceReader([lagging, rows()]),
+        request_ids=("0:0",), token_ranges={"0:0": ranges},
+    )
+    internal.require(
+        "hidden_states", count=8, retry=True, timeout_s=2.0, poll_s=0.01
+    )
+    assert len(internal.hidden_states) == 8
+
+
+def test_trailing_range_acts_matches_the_native_rewrite_sites():
+    """Guard the hardcoded exemption against native drift.
+
+    ``_TRAILING_RANGE_ACTS`` only stays correct while ``final_logits`` is the
+    single act whose stored row range is re-based away from the step's token
+    range.  If someone narrows another act in p2p_thread.cpp, this fails.
+    """
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "native" / "csrc" / "ring" / "p2p_thread.cpp"
+    )
+    if not source.is_file():
+        pytest.skip("native sources not present")
+    text = source.read_text()
+
+    rewrites = [
+        line.strip() for line in text.splitlines()
+        if "db_start =" in line and "req.start_token" not in line
+    ]
+    assert len(rewrites) == 1, (
+        f"native db_start rewrite sites changed: {rewrites}. "
+        "Update _TRAILING_RANGE_ACTS in dmi/storage/internals.py to match."
+    )
+    guard = text.split("db_start = req.end_token")[0].splitlines()[-3:]
+    assert any("HOOK_TYPE_FINAL_LOGITS" in line for line in guard), (
+        "the db_start rewrite is no longer guarded by HOOK_TYPE_FINAL_LOGITS"
+    )
+    assert _TRAILING_RANGE_ACTS == frozenset({"final_logits"})
+
+
+def test_token_range_check_covers_every_layer_not_just_the_highest():
+    # Layer 0 is missing its decode row; layers 1 and 2 are complete.  A
+    # representative-layer check that only looked at the highest layer would
+    # pass this.
+    rows = [
+        _row("0:0", layer, start, torch.ones(n, 4))
+        for layer in (0, 1, 2)
+        for start, n in ((0, 2), (2, 1))
+        if not (layer == 0 and start == 2)
+    ]
+    internal = make_lazy_internal(
+        "m",
+        PrefixReader(rows),
+        request_ids=("0:0",),
+        token_ranges={"0:0": ((0, 2), (2, 3))},
+    )
+
+    with pytest.raises(IncompleteInternalError, match="layer=0"):
+        internal.hidden_states
+
+
+def test_token_range_check_names_the_offending_layer():
+    rows = [
+        _row("0:0", layer, start, torch.ones(n, 4))
+        for layer in (0, 1)
+        for start, n in ((0, 2), (2, 1))
+        if not (layer == 1 and start == 0)
+    ]
+    internal = make_lazy_internal(
+        "m",
+        PrefixReader(rows),
+        request_ids=("0:0",),
+        token_ranges={"0:0": ((0, 2), (2, 3))},
+    )
+
+    with pytest.raises(IncompleteInternalError) as excinfo:
+        internal.hidden_states
+
+    assert "layer=1" in str(excinfo.value)
+
+
+def test_global_field_errors_do_not_mention_a_layer():
+    rows = [_row_act("0:0", "hook_embed", -1, 0, 2, torch.ones(2, 4))]
+    internal = make_lazy_internal(
+        "m",
+        PrefixReader(rows),
+        request_ids=("0:0",),
+        token_ranges={"0:0": ((0, 2), (2, 3))},
+    )
+
+    with pytest.raises(IncompleteInternalError) as excinfo:
+        internal.embeddings
+
+    assert "layer=" not in str(excinfo.value)
+
+
+def test_a_layer_that_left_no_rows_at_all_is_not_detectable_by_range_check():
+    """Documents the one loss the range check inherently cannot see.
+
+    If a layer never wrote a single row it is absent from the data, so there
+    is nothing to compare.  Only a declared ``count`` closes this.
+    """
+    rows = [
+        _row("0:0", layer, start, torch.ones(n, 4))
+        for layer in (0, 1)
+        for start, n in ((0, 2), (2, 1))
+    ]
+    internal = make_lazy_internal(
+        "m",
+        PrefixReader(rows),
+        request_ids=("0:0",),
+        token_ranges={"0:0": ((0, 2), (2, 3))},
+    )
+
+    assert len(internal.hidden_states) == 2  # silent: layer 2 never landed
+
+    internal.clear_cache()
+    internal.require("hidden_states", count=3)
+    with pytest.raises(IncompleteInternalError, match="expected 3 entries"):
+        internal.hidden_states
+
+
+LOGITS_ACT = "final_logits"
+
+
+def _logits_internal(rows, ranges):
+    return make_lazy_internal(
+        "m",
+        PrefixReader(rows),
+        request_ids=("0:0",),
+        token_ranges={"0:0": ranges},
+    )
+
+
+def test_lazy_internal_accepts_narrowed_final_logits_rows():
+    """HF generate passes logits_to_keep=1, so the prefill logits row covers
+    only the last prompt position while the step range covers the whole
+    prompt.  Comparing full ranges would fail on every real generate call."""
+    rows = [
+        _row_act("0:0", LOGITS_ACT, -1, 3, 4, torch.ones(1, 8)),   # prefill
+        _row_act("0:0", LOGITS_ACT, -1, 4, 5, torch.ones(1, 8)),   # decode
+        _row_act("0:0", LOGITS_ACT, -1, 5, 6, torch.ones(1, 8)),   # decode
+    ]
+
+    logits = _logits_internal(rows, ((0, 4), (4, 5), (5, 6))).logits
+
+    assert logits.shape == (1, 3, 8)
+
+
+def test_lazy_internal_still_detects_a_missing_final_logits_step():
+    rows = [
+        _row_act("0:0", LOGITS_ACT, -1, 3, 4, torch.ones(1, 8)),
+        _row_act("0:0", LOGITS_ACT, -1, 4, 5, torch.ones(1, 8)),
+    ]
+
+    with pytest.raises(IncompleteInternalError, match="token range ends"):
+        _logits_internal(rows, ((0, 4), (4, 5), (5, 6))).logits
+
+
+def test_lazy_internal_accepts_full_width_prefill_logits():
+    # logits_to_keep=0 keeps every prefill position; the relaxed check must
+    # still pass for the unnarrowed case.
+    rows = [
+        _row_act("0:0", LOGITS_ACT, -1, 0, 4, torch.ones(4, 8)),
+        _row_act("0:0", LOGITS_ACT, -1, 4, 5, torch.ones(1, 8)),
+    ]
+
+    assert _logits_internal(rows, ((0, 4), (4, 5))).logits.shape == (1, 5, 8)
+
+
+def test_lazy_internal_keeps_strict_range_matching_for_non_logits_fields():
+    rows = [_row("0:0", 0, 3, torch.ones(1, 4))]
+    internal = make_lazy_internal(
+        "m",
+        PrefixReader(rows),
+        request_ids=("0:0",),
+        token_ranges={"0:0": ((0, 4),)},
+    )
+
+    with pytest.raises(IncompleteInternalError, match=r"expected \[\(0, 4\)\]"):
+        internal.hidden_states
+
+
+def test_retry_timeout_reports_the_token_range_reason_not_a_count_mismatch():
+    rows = [_row_act("0:0", LOGITS_ACT, -1, 3, 4, torch.ones(1, 8))]
+    internal = _logits_internal(rows, ((0, 4), (4, 5)))
+    internal.require("logits", count=1, retry=True, timeout_s=0.02, poll_s=0.001)
+
+    with pytest.raises(IncompleteInternalError) as excinfo:
+        internal.logits
+
+    message = str(excinfo.value)
+    assert "token range ends" in message
+    assert "found none" not in message
+    assert isinstance(excinfo.value.__cause__, IncompleteInternalError)
 
 
 def test_lazy_internal_requirement_retries_missing_token_ranges_until_success():
