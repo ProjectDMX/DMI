@@ -13,12 +13,24 @@
 #include <ATen/ATen.h>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <future>
 #include <string>
 #include <stdexcept>
 
 namespace ring {
+
+namespace {
+
+void report_cuda_failure(const char* operation, cudaError_t error) {
+    if (error == cudaSuccess) return;
+    std::fprintf(stderr, "[drain] ERROR: %s failed: %s\n",
+                 operation, cudaGetErrorString(error));
+    std::fflush(stderr);
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 DrainThread::DrainThread(RingState& rs, PinnedStaging& staging,
@@ -321,7 +333,7 @@ void DrainThread::loop() {
     }
 
     // Final flush
-    cudaDeviceSynchronize();
+    report_cuda_failure("cudaDeviceSynchronize", cudaDeviceSynchronize());
     do_full_flush();
 }
 
@@ -389,7 +401,8 @@ void DrainThread::flush_state_update(uint64_t flush_count, uint64_t flush_bytes)
 }
 
 void DrainThread::sync_stream() {
-    cudaStreamSynchronize(stream_);
+    report_cuda_failure("cudaStreamSynchronize",
+                        cudaStreamSynchronize(stream_));
 }
 
 // ---------------------------------------------------------------------------
@@ -416,10 +429,10 @@ void DrainThread::enqueue_d2h(uint64_t flush_bytes) {
                         ring_.payload_buf + gpu_cursor,
                         chunk, cudaMemcpyDeviceToHost, stream_);
         if (err != cudaSuccess) {
-            RING_DBG("[enqueue_d2h] cudaMemcpyAsync FAILED: %s\n",
-                    cudaGetErrorString(err));
+            report_cuda_failure("cudaMemcpyAsync", err);
+        } else {
+            RING_DBG("[enqueue_d2h] chunk=%d enqueued OK\n", chunk_idx);
         }
-        RING_DBG("[enqueue_d2h] chunk=%d enqueued OK\n", chunk_idx);
 
         remaining  -= chunk;
         gpu_cursor  = (gpu_cursor + chunk) % gpu_cap;
