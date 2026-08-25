@@ -9,9 +9,7 @@ from typing import get_type_hints
 import pytest
 
 
-pytestmark = pytest.mark.cpu
-
-
+@pytest.mark.cpu
 def test_host_build_plan_has_no_cuda_toolchain_or_libraries():
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
@@ -31,6 +29,7 @@ def test_host_build_plan_has_no_cuda_toolchain_or_libraries():
         assert forbidden not in output
 
 
+@pytest.mark.cpu
 def test_host_export_falls_back_to_cpu_backend(monkeypatch):
     from dmi.transport import native
 
@@ -50,6 +49,7 @@ def test_host_export_falls_back_to_cpu_backend(monkeypatch):
     assert calls == ["_native_backend", "_host_backend"]
 
 
+@pytest.mark.native_backend
 def test_clickhouse_stage_has_bounded_batching_defaults():
     from dmi.transport.native import ClickHouseClientConfig, StageConfig
 
@@ -65,6 +65,7 @@ def test_clickhouse_stage_has_bounded_batching_defaults():
     assert queue.high_watermark_size == 512 * 1024**2
 
 
+@pytest.mark.native_backend
 def test_clickhouse_client_exposes_socket_timeouts_and_worker_metrics():
     from dmi.transport.native import ClickHouseClientConfig, DMXHostEngine, StageConfig
 
@@ -81,6 +82,7 @@ def test_clickhouse_client_exposes_socket_timeouts_and_worker_metrics():
     assert [worker.worker_index for worker in metrics.workers] == [0, 1, 2]
 
 
+@pytest.mark.native_backend
 def test_engine_metrics_follow_mutated_stage_parallelism():
     from dmi.transport.native import ClickHouseClientConfig, DMXHostEngine, StageConfig
 
@@ -93,6 +95,7 @@ def test_engine_metrics_follow_mutated_stage_parallelism():
     assert [worker.worker_index for worker in metrics.workers] == [0, 1, 2]
 
 
+@pytest.mark.cpu
 def test_ring_export_requires_full_backend(monkeypatch):
     from dmi.transport import native
 
@@ -110,6 +113,7 @@ def test_ring_export_requires_full_backend(monkeypatch):
     assert calls == ["_native_backend"]
 
 
+@pytest.mark.cpu
 def test_v1_host_export_does_not_load_ring_backend(monkeypatch):
     import dmi.api.v1 as api
     from dmi.transport import native
@@ -128,6 +132,7 @@ def test_v1_host_export_does_not_load_ring_backend(monkeypatch):
             api.__dict__["DMXHostEngine"] = cached
 
 
+@pytest.mark.cpu
 def test_v1_model_shape_contract_does_not_load_ring_backend():
     import dmi.api.v1 as api
 
