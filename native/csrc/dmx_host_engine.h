@@ -11,14 +11,17 @@ namespace dmx_host{
 class DMXHostEngine : public PipelinedEngine<dmx_host_queue_item, uint64_t, 1, QueueOptions<false, false, false>, true,
 NoOutputHandler<dmx_host_queue_item> >{
 public:
+    // Stats are always on: they are what lets teardown report silently lost
+    // rows, and they measured below noise (+33ns/row against an 86ns/row
+    // spread) on the submit path.  Counts only; timing stays off.
     explicit DMXHostEngine(StageConfig insert_stage):
-   PipelinedEngine(
-       std::array<StageConfig, 1>{std::move(insert_stage)},
-       [] {
-           EngineConfig config{};
-           config.enable_stats = true;
-           return config;
-       }()){}
+    PipelinedEngine(
+        std::array<StageConfig, 1>{std::move(insert_stage)},
+        [] {
+            EngineConfig config{};
+            config.enable_stats = true;
+            return config;
+        }()){}
 
     // Submit a pre-assembled ClickHouseRow directly to the insert stage.
     // Fields must match the order expected by ClickHouseInsertStage:

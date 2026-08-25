@@ -167,6 +167,71 @@ struct EngineConfigT {
 //   with a mutex externally (the engine will not serialize output by default).
 // ============================================================
 
+// -------- Engine profiling types --------
+// These live at namespace scope rather than nested inside PipelinedEngine
+// because the class names them in its own base-clause below.  A member type is
+// not in scope there, so an elaborated-type-specifier (`struct Foo`) written
+// inline would declare a *different*, never-defined namespace-scope type.  That
+// stays harmless only while EnableEngineProfiling is false and the
+// std::optional branch is never selected; the moment it is true,
+// std::optional over an incomplete type is ill-formed.
+struct EngineProfilingConfig_ {
+  bool enable_stats = false;
+  bool enable_timing = false;
+
+  bool timing_profile_submit = true;
+  bool timing_profile_dequeue = true;
+  bool timing_profile_process = true;
+  bool timing_profile_enqueue = true;
+  bool timing_profile_output = true;
+};
+
+struct IngestStats {
+  std::uint64_t submit_calls = 0;
+  std::uint64_t items_submitted = 0;
+
+  std::uint64_t submit_enqueue_calls = 0;
+  double submit_enqueue_s = 0.0;
+};
+
+struct QueueStats {
+  std::uint64_t enqueued = 0;
+  std::uint64_t dropped = 0;
+  std::uint64_t full_errors = 0;
+  std::uint64_t closed_errors = 0;
+  std::uint64_t too_large_errors = 0;
+  std::uint64_t retries = 0;
+};
+
+struct StageStats {
+  std::uint64_t batches = 0;
+  std::uint64_t items_in = 0;
+  std::uint64_t items_out = 0;
+
+  std::uint64_t dequeue_calls = 0;
+  std::uint64_t dequeue_timeouts = 0;
+  std::uint64_t process_calls = 0;
+  std::uint64_t enqueue_calls = 0;
+  std::uint64_t output_calls = 0;
+  std::uint64_t output_items = 0;
+
+  double dequeue_s = 0.0;
+  double dequeue_idle_s = 0.0;
+  double process_s = 0.0;
+  double enqueue_s = 0.0;
+  double output_s = 0.0;
+};
+
+// The engine's live counters and the snapshot handed out by profiling() have
+// the same shape, so they are one type rather than two identical ones.
+template <std::size_t NumStages>
+struct EngineStats_ {
+  IngestStats ingest{};
+  std::array<QueueStats, NumStages> queue_by_stage{};
+  std::array<StageStats, NumStages> stage_by_stage{};
+};
+
+
 template <typename ItemT,
           typename SizeT,
           std::size_t NumStages,
@@ -175,8 +240,8 @@ template <typename ItemT,
           typename OutputHandlerT = NoOutputHandler<ItemT>>
 class PipelinedEngine
     : private ebo_storage<OutputHandlerT, 0>,
-      private ebo_storage<std::conditional_t<EnableEngineProfiling, std::optional<struct EngineProfilingConfig_>, empty_profiling_storage>, 1>,
-      private ebo_storage<std::conditional_t<EnableEngineProfiling, std::optional<struct EngineProfile_>, empty_profiling_storage>, 2> {
+      private ebo_storage<std::conditional_t<EnableEngineProfiling, std::optional<EngineProfilingConfig_>, empty_profiling_storage>, 1>,
+      private ebo_storage<std::conditional_t<EnableEngineProfiling, std::optional<EngineStats_<NumStages>>, empty_profiling_storage>, 2> {
  public:
   static_assert(NumStages > 0, "NumStages must be > 0");
 
@@ -226,67 +291,18 @@ class PipelinedEngine
   };
 
   // -------- Engine profiling (compile-time optional) --------
-  struct EngineProfilingConfig_ {
-    bool enable_stats = false;
-    bool enable_timing = false;
-
-    bool timing_profile_submit = true;
-    bool timing_profile_dequeue = true;
-    bool timing_profile_process = true;
-    bool timing_profile_enqueue = true;
-    bool timing_profile_output = true;
-  };
-
-  struct IngestStats {
-    std::uint64_t submit_calls = 0;
-    std::uint64_t items_submitted = 0;
-
-    std::uint64_t submit_enqueue_calls = 0;
-    double submit_enqueue_s = 0.0;
-  };
-
-  struct QueueStats {
-    std::uint64_t enqueued = 0;
-    std::uint64_t dropped = 0;
-    std::uint64_t full_errors = 0;
-    std::uint64_t closed_errors = 0;
-    std::uint64_t too_large_errors = 0;
-    std::uint64_t retries = 0;
-  };
-
-  struct StageStats {
-    std::uint64_t batches = 0;
-    std::uint64_t items_in = 0;
-    std::uint64_t items_out = 0;
-
-    std::uint64_t dequeue_calls = 0;
-    std::uint64_t dequeue_timeouts = 0;
-    std::uint64_t process_calls = 0;
-    std::uint64_t enqueue_calls = 0;
-    std::uint64_t output_calls = 0;
-    std::uint64_t output_items = 0;
-
-    double dequeue_s = 0.0;
-    double dequeue_idle_s = 0.0;
-    double process_s = 0.0;
-    double enqueue_s = 0.0;
-    double output_s = 0.0;
-  };
-
-  struct StatsSnapshot {
-    IngestStats ingest{};
-    std::array<QueueStats, NumStages> queue_by_stage{};
-    std::array<StageStats, NumStages> stage_by_stage{};
-  };
+  // Defined at namespace scope above; re-exported here because callers and the
+  // pybind layer refer to them as PipelinedEngine<...>::QueueStats.
+  using EngineProfilingConfig_ = dmx_host::EngineProfilingConfig_;
+  using IngestStats = dmx_host::IngestStats;
+  using QueueStats = dmx_host::QueueStats;
+  using StageStats = dmx_host::StageStats;
+  using StatsSnapshot = EngineStats_<NumStages>;
 
   using QueueProfilingSnapshotArray = std::array<std::optional<ProfilingSnapshot>, NumStages>;
 
  private:
-  struct EngineProfile_ {
-    IngestStats ingest{};
-    std::array<QueueStats, NumStages> queue_by_stage{};
-    std::array<StageStats, NumStages> stage_by_stage{};
-  };
+  using EngineProfile_ = EngineStats_<NumStages>;
 
   using OutBase = ebo_storage<OutputHandlerT, 0>;
   using ProfCfgStorage = std::conditional_t<EnableEngineProfiling, std::optional<EngineProfilingConfig_>, empty_profiling_storage>;
