@@ -509,7 +509,7 @@ def test_server_sampler_tracks_insert_concurrency_and_metric_peaks():
         def __init__(self):
             self.calls = 0
 
-        def execute(self, query):
+        def execute(self, query, params=None):
             self.calls += 1
             if "system.processes" in query:
                 return [(2,)]
