@@ -8,6 +8,7 @@
 #include <cctype>
 #include <charconv>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -27,7 +28,8 @@ thread_local bool tl_cleaned = false;
 thread_local std::string tl_db;
 thread_local std::string tl_table;
 
-std::once_flag g_schema_once;
+std::mutex g_schema_mutex;
+std::set<std::string> g_schema_inited_tables;
 
 // --------------------- SQL helpers ---------------------
 
@@ -416,8 +418,15 @@ void ClickHouseInsertStage::ThreadInit(int /*thread_idx*/, const ClickHouseClien
   }
 
   try {
-    // DDL init once globally (copy cfg/opts into the call_once closure)
-    std::call_once(g_schema_once, [cfg, opts]() { RunSchemaInitOnce(cfg, opts); });
+    // DDL init once per database.table (not process-global)
+    {
+      const std::string table_key = cfg.database + "." + cfg.table;
+      std::lock_guard<std::mutex> lock(g_schema_mutex);
+      if (g_schema_inited_tables.find(table_key) == g_schema_inited_tables.end()) {
+        RunSchemaInitOnce(cfg, opts);
+        g_schema_inited_tables.insert(table_key);
+      }
+    }
 
     // Per-thread client
     tl_client = std::make_unique<clickhouse::Client>(opts);
