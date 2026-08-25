@@ -164,8 +164,8 @@ class RingTransport:
 
         # When True, HookPoint.forward takes the runtime safety-net branch
         # instead of the fast path:
-        #   1. fits in current slack        -> try_reserve_one + ring
-        #   2. fits after flushing the ring -> flush + try_reserve_one + ring
+        #   1. fits in current slack       -> reserve_one + ring
+        #   2. fits after flushing the ring -> flush_and_wait + reserve_one + ring
         #   3. single tensor > ring        -> flush_and_wait + submit_cpu_direct
         # Owned by adaptor_base.before_forward (per-batch reassignment based
         # on prepare_step result and dynamic-spec presence).  Dispatch

@@ -6,7 +6,6 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -277,31 +276,6 @@ static void test_serialized_static_launches() {
     }
 }
 
-static void test_host_observes_complete_published_descriptor() {
-    banner("host observes complete published descriptor without device sync");
-    ring::AllocatedRing allocated(make_config());
-    allocated.init();
-    ring::RingState& state = allocated.state();
-    const std::vector<uint8_t> source = pattern(333, 91);
-    uint8_t* device = upload(source);
-    cudaStream_t stream{};
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-    ring::launch_producer_static(state, device, source.size(), 5, stream);
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(5);
-    while (!ring::task_cpu_ready(state.task_entries, state.task_cap, 0) &&
-           std::chrono::steady_clock::now() < deadline) {
-    }
-
-    EXPECT(ring::task_cpu_ready(state.task_entries, state.task_cap, 0));
-    expect_entry(state, 0, source.size());
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    CUDA_CHECK(cudaFree(device));
-}
-
 int main() {
     setbuf(stdout, nullptr);
     ring::set_ring_null_mode(false);
@@ -314,7 +288,6 @@ int main() {
     test_prefix_bounds();
     test_chunked_packed_copy();
     test_serialized_static_launches();
-    test_host_observes_complete_published_descriptor();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

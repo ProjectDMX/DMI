@@ -814,7 +814,7 @@ do not reconfigure it.
 | `drain_flush_payload_ratio` | `0.5` | Payload-capacity flush fraction. |
 | `drain_flush_entry_threshold` | `0` | Absolute ready-entry trigger; zero disables it. |
 | `drain_flush_byte_threshold` | `0` | Absolute ready-byte trigger; zero disables it. |
-| `drain_flush_timeout_us` | `100000` | Pending-data age trigger; zero disables it. |
+| `drain_flush_timeout_us` | `0` | Pending-data age trigger; zero disables it. |
 | `clone_slices` | `False` | Clone multi-request slices so full assembled tensors can be released sooner. |
 | `insert_queue_max_bytes` | `4 GiB` | Reserved field; current v1 does not apply it to host queue limits. |
 | `insert_queue_max_items` | `65536` | Reserved field; current v1 does not apply it to host queue limits. |

@@ -17,7 +17,7 @@ namespace ring {
 // Sentinel value for ready_seq -- indicates slot has not been published yet.
 //
 // Publish protocol:
-//   producer: write fields -> __threadfence_system() -> publish ready_seq
+//   producer: write all data fields -> __threadfence() -> write ready_seq = seq_no
 //   consumer: poll until __atomic_load_n(ready_seq) == expected -> read fields
 // ---------------------------------------------------------------------------
 static constexpr uint64_t READY_SEQ_SENTINEL = ~uint64_t(0);

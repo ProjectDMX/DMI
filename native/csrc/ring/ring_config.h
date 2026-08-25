@@ -36,7 +36,7 @@ struct DrainFlushConfig {
 
     // Time-based flush: if a complete tensor has been pending for longer
     // than this many microseconds, flush unconditionally.  0 = disabled.
-    uint64_t timeout_us = 100000;
+    uint64_t timeout_us = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,8 @@ struct RingConfig {
     // that keep the full tensor alive until consumed.
     bool clone_slices = false;
 
-    // Reserved for compatibility. StageConfig.input_queue owns host limits.
+    // ClickHouse insert queue limits (host engine).
+    // P2p thread blocks on submit_direct() when queue is full.
     uint64_t insert_queue_max_bytes = 4096ULL * 1024 * 1024;  // 4 GiB
     uint64_t insert_queue_max_items = 65536;
 

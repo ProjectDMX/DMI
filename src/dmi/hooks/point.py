@@ -283,13 +283,13 @@ class HookPoint(nn.Module):
             engine = transport._ring_engine
             if engine is not None:
                 nbytes = x_cont.nbytes
-                if engine.try_reserve_one(nbytes):
+                if nbytes <= engine.available_capacity():
+                    engine.reserve_one(nbytes)
                     dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
                                       self._ring_hook_type, self._ring_hook_id)
-                elif nbytes <= engine.effective_capacity():
+                elif nbytes <= engine.payload_cap():
                     engine.flush_and_wait()
-                    if not engine.try_reserve_one(nbytes):
-                        raise RuntimeError("Ring reservation failed after flush")
+                    engine.reserve_one(nbytes)
                     dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
                                       self._ring_hook_type, self._ring_hook_id)
                 else:

@@ -38,22 +38,20 @@ ring. Force flush at 100% capacity is always active (prevents deadlock).
 | `drain_flush_payload_ratio` | `float` | 0.5 | Flush when scanned payload bytes >= this fraction of `payload_ring_bytes`. 0 = disabled. |
 | `drain_flush_entry_threshold` | `uint64_t` | 0 | Flush after N entries ready. 0 = disabled. |
 | `drain_flush_byte_threshold` | `uint64_t` | 0 | Flush after N payload bytes ready. 0 = disabled. |
-| `drain_flush_timeout_us` | `uint64_t` | 100000 | Flush completed tensors after this many microseconds. 0 disables the timer. |
+| `drain_flush_timeout_us` | `uint64_t` | 0 | If a complete tensor has been pending for longer than this many microseconds, flush unconditionally. 0 = disabled. |
 
-By default, the drain thread flushes after 100 ms or at 50% payload-ring usage.
-If all thresholds and the timeout are explicitly set to 0, it flushes only when
-the ring is full or at `stop()` time.
+By default, timeout-based flushing is disabled and the drain thread flushes at
+50% payload-ring usage. If `drain_flush_payload_ratio` and all other thresholds
+are explicitly set to 0, the drain thread only flushes when the ring is 100%
+full or at `stop()` time.
 
 ## P2P Thread / Output
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `clone_slices` | `bool` | false | Clone per-request slices before submitting to the host engine. When true (and batch > 1), each slice is an independent tensor so the full assembled tensor can be freed immediately. When false, slices are views that keep the full tensor alive until consumed. |
-| `insert_queue_max_bytes` | `uint64_t` | 4 GiB | Reserved; does not configure the host queue. |
-| `insert_queue_max_items` | `uint64_t` | 65536 | Reserved; does not configure the host queue. |
-
-Configure ClickHouse batching and backpressure through
-`StageConfig.input_queue`.
+| `insert_queue_max_bytes` | `uint64_t` | 4 GiB | ClickHouse insert queue byte limit. The p2p thread blocks when the queue is full. |
+| `insert_queue_max_items` | `uint64_t` | 65536 | ClickHouse insert queue item-count limit. |
 
 ## Constants (not configurable)
 
@@ -61,7 +59,7 @@ Configure ClickHouse batching and backpressure through
 |----------|-------|----------|-------------|
 | `PAYLOAD_ALIGN` | 16 bytes | `ring_config.h` | Payload allocation alignment. Every reservation is rounded up to this for vectorized uint4 D2D copies. `payload_ring_bytes` must be a multiple of this. |
 | `READY_SEQ_SENTINEL` | `UINT64_MAX` | `task_entry.h` | Sentinel value for `TaskEntry::ready_seq` (slot not yet published). |
-| `TaskEntry` size | 64 bytes | `task_entry.h` | Fixed slot size, `alignas(64)` for cache-line isolation. |
+| `TaskEntry` size | 128 bytes | `task_entry.h` | Fixed slot size, `alignas(128)` for cache-line isolation. |
 
 ## Python Usage
 
@@ -76,6 +74,7 @@ cfg.drain_poll_timeout_us = 100
 cfg.drain_flush_entry_threshold = 64
 cfg.drain_flush_timeout_us = 1000
 cfg.clone_slices = False
+cfg.insert_queue_max_items = 4096
 
 engine = RingEngine(cfg, host_engine)
 engine.init(stream_handle)

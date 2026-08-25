@@ -54,7 +54,6 @@ NVCC_FLAGS := \
 
 PRODUCER_CU  := ../../../native/csrc/ring/producer.cu
 DRAIN_SRC    := ../../../native/csrc/ring/drain_thread.cpp
-P2P_SRC      := ../../../native/csrc/ring/p2p_thread.cpp
 
 TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer \
            $(BUILD)/test_ring_engine $(BUILD)/test_null_mode
@@ -77,7 +76,7 @@ $(BUILD)/test_rings: test_rings.cu $(CUDA_CONFIG_STAMP) | $(BUILD)
 $(BUILD)/test_producer: test_producer.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
 
-$(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRC) $(P2P_SRC) $(CUDA_CONFIG_STAMP) | $(BUILD)
+$(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRC) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(TORCH_INCLUDE_FLAGS) $(TORCH_LIB_FLAGS) \
 		$(TORCH_RPATH_FLAGS) -ltorch -ltorch_cpu -lc10 -lpthread \
 		$(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@

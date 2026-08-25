@@ -30,10 +30,10 @@ struct RingConfig {
     float    drain_flush_payload_ratio  = 0.5f;
     uint64_t drain_flush_entry_threshold = 0;
     uint64_t drain_flush_byte_threshold  = 0;
-    uint64_t drain_flush_timeout_us      = 100000;
+    uint64_t drain_flush_timeout_us      = 0;
     // Clone per-request slices
     bool     clone_slices               = false;
-    // Reserved for compatibility; StageConfig owns host queue limits.
+    // ClickHouse insert queue limits
     uint64_t insert_queue_max_bytes     = 4096ULL * 1024 * 1024;
     uint64_t insert_queue_max_items     = 65536;
 };
@@ -149,10 +149,15 @@ public:
     //      HookPoint.forward (eager-only path).  Never called during
     //      CUDA-graph capture or replay.
 
-    uint64_t effective_capacity() const;
+    // Free bytes in the payload ring not currently reserved and not
+    // pending drain.  CPU-only read.
+    uint64_t available_capacity() const;
 
-    // Atomically check and reserve payload plus one task slot.
-    bool try_reserve_one(uint64_t nbytes);
+    // Per-hook reservation: claim `nbytes` of payload ring + 1 task entry
+    // for an upcoming producer kernel launch.  Used by the safety net
+    // when force_eager is on and the spec is dynamic-shape.  Advances
+    // cpu_payload_head/cpu_task_head atomically.
+    void reserve_one(uint64_t nbytes);
 
     // Synchronise the current CUDA stream + force drain to process all
     // outstanding entries.  Blocking; the Python binding releases the

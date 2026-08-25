@@ -11,8 +11,6 @@
 #include "ring/producer.cuh"
 #include "ring/ring_debug.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
-#include <stdexcept>
-#include <string>
 
 // Forward-declare symbols from producer.cu
 namespace ring {
@@ -20,14 +18,6 @@ void set_ring_null_mode(bool enabled);
 }  // namespace ring
 
 namespace ring_py {
-
-static void check_cuda(cudaError_t error, const char* operation) {
-    if (error != cudaSuccess) {
-        throw std::runtime_error(
-            std::string("RingEngine: ") + operation + " failed: " +
-            cudaGetErrorString(error));
-    }
-}
 
 // ---------------------------------------------------------------------------
 struct RingEnginePy::Impl {
@@ -53,7 +43,7 @@ struct RingEnginePy::Impl {
     {
         const auto& state = engine.ring_state();
         int dev_idx = 0;
-        check_cuda(cudaGetDevice(&dev_idx), "cudaGetDevice");
+        cudaGetDevice(&dev_idx);
         payload_view = at::from_blob(
             state.payload_buf,
             {static_cast<int64_t>(state.payload_cap)},
@@ -107,9 +97,9 @@ void RingEnginePy::set_null_mode(bool enabled) {
     // NOT synchronize with PyTorch's non-blocking compute streams.  Sync
     // before to drain pending producer kernels that need the old value,
     // and after to ensure the new value is visible before the next launch.
-    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    cudaDeviceSynchronize();
     ring::set_ring_null_mode(enabled);
-    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    cudaDeviceSynchronize();
 }
 
 
@@ -184,8 +174,8 @@ void RingEnginePy::notify_drain() {
 // ---------------------------------------------------------------------------
 // prepare_step -- single Python->C++ call for pre-forward capacity check.
 //
-// Fast path (STEP_RING_OK): reads one locked capacity snapshot.
-// No CUDA stream resolution, sync, or flush.
+// Fast path (STEP_RING_OK): reads two uint64_t counters, returns immediately.
+// No stream resolution, no sync, no flush.
 //
 // Slow path (STEP_RING_FLUSHED / STEP_OVERSIZED): resolves the current CUDA
 // stream via at::cuda::getCurrentCUDAStream(), synchronises it, then asks the
@@ -234,23 +224,28 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     // net starts firing.
     if (step_total_bytes > effective_cap || num_hooks > tcap) {
         cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
-        check_cuda(cudaStreamSynchronize(ms), "cudaStreamSynchronize");
+        cudaStreamSynchronize(ms);
         drain.force_flush_and_wait();
         return STEP_OVERSIZED;
     }
 
-    if (drain.try_reserve(step_total_bytes, num_hooks, pcap, tcap)) {
-        return STEP_RING_OK;  // fast path -- no CUDA interaction
+    // Case A: step fits.  Check available space for BOTH payload AND tasks.
+    const uint64_t payload_avail = pcap -
+        (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
+    const uint64_t task_avail = tcap -
+        (drain.cpu_task_head() - drain.cpu_task_tail_committed());
+
+    if (step_total_bytes <= payload_avail && num_hooks <= task_avail) {
+        drain.reserve(step_total_bytes, num_hooks);
+        return STEP_RING_OK;  // fast path -- no CUDA or thread interaction
     }
 
     // Either payload or task ring full from prior steps.  Sync main
     // stream so all producer kernels finish writing, then flush.
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
-    check_cuda(cudaStreamSynchronize(ms), "cudaStreamSynchronize");
+    cudaStreamSynchronize(ms);
     drain.force_flush_and_wait();
-    if (!drain.try_reserve(step_total_bytes, num_hooks, pcap, tcap)) {
-        throw std::logic_error("RingEngine: empty ring cannot fit step");
-    }
+    drain.reserve(step_total_bytes, num_hooks);
     return STEP_RING_FLUSHED;
 }
 
@@ -282,16 +277,43 @@ at::Tensor RingEnginePy::payload_tensor() const {
 // HookPoint.forward.  All three are called only when force_eager is active
 // (eager mode); never run during CUDA-graph capture or replay.
 //
-// try_reserve_one() checks payload, staging, and task capacity atomically.
+// Thread safety of the check-and-reserve pattern used by the safety net:
+//
+//   if nbytes <= available_capacity():
+//       reserve_one(nbytes)
+//
+// The main thread (this thread) is the only writer of cpu_payload_head_
+// (it advances only through reserve / reserve_one calls).  The drain
+// thread only ever advances cpu_payload_tail_committed_ forward as it
+// frees ring space.  Between the check and the reserve:
+//   - tail may move forward (drain freed more): actual available at
+//     reserve time is >= what we observed.
+//   - head is unchanged (single-threaded writer).
+// So the check's "fits" decision remains valid at reserve time.  No extra
+// locking around the pair is required.
+//
+// Within available_capacity(), the two accessor calls happen under
+// separate mutex acquires (drain.cpu_payload_head() and
+// drain.cpu_payload_tail_committed() each take mgmt_mu_ internally).
+// The observed snapshot is non-atomic: if drain advances tail between
+// the two reads, available_observed = pcap - head + tail_later, which
+// is >= the true available at the time of the head read.  That is, the
+// non-atomicity errs on the "over-estimate available" side -- the
+// reserve will still succeed because the actual ring state has at least
+// as much room as we computed.
 // ---------------------------------------------------------------------------
 
-uint64_t RingEnginePy::effective_capacity() const {
-    return std::min(impl_->engine.payload_cap(), impl_->engine.staging_cap());
+uint64_t RingEnginePy::available_capacity() const {
+    auto& drain = impl_->engine.drain_thread();
+    const uint64_t pcap = impl_->engine.payload_cap();
+    return pcap - (drain.cpu_payload_head() - drain.cpu_payload_tail_committed());
 }
 
-bool RingEnginePy::try_reserve_one(uint64_t nbytes) {
-    return impl_->engine.drain_thread().try_reserve(
-        nbytes, 1, effective_capacity(), impl_->engine.task_cap());
+// Per-hook reservation: claim nbytes of payload + 1 task entry for an
+// upcoming producer kernel launch.  Caller must have checked
+// available_capacity() first.  drain.reserve takes mgmt_mu_ internally.
+void RingEnginePy::reserve_one(uint64_t nbytes) {
+    impl_->engine.drain_thread().reserve(nbytes, 1);
 }
 
 // Synchronise the current CUDA stream so all queued producer kernels
@@ -300,7 +322,7 @@ bool RingEnginePy::try_reserve_one(uint64_t nbytes) {
 // Python binding releases the GIL.
 void RingEnginePy::flush_and_wait() {
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
-    check_cuda(cudaStreamSynchronize(ms), "cudaStreamSynchronize");
+    cudaStreamSynchronize(ms);
     impl_->engine.drain_thread().force_flush_and_wait();
 }
 

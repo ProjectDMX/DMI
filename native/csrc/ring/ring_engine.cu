@@ -3,9 +3,7 @@
 
 #include "ring_engine.h"
 
-#include <exception>
 #include <stdexcept>
-#include <string>
 
 namespace ring {
 
@@ -50,49 +48,20 @@ void RingEngine::init(cudaStream_t stream) {
 }
 
 void RingEngine::start() {
-    if (started_.exchange(true)) return;
     drain_->start();
     p2p_->start();
 }
 
 void RingEngine::stop() {
-    if (!started_.exchange(false)) {
-        drain_->rethrow_if_failed();
-        return;
-    }
+    // Guard against double-stop (benchmark _timed_close + engine.close).
+    if (!drain_->is_running()) return;
 
-    std::exception_ptr failure;
-    auto capture = [&failure] {
-        if (!failure) failure = std::current_exception();
-    };
+    cudaDeviceSynchronize();
+    drain_->force_flush_and_wait();
 
-    if (!drain_->has_failed()) {
-        cudaError_t error = cudaDeviceSynchronize();
-        if (error != cudaSuccess) {
-            try {
-                throw std::runtime_error(
-                    std::string("RingEngine: cudaDeviceSynchronize failed: ") +
-                    cudaGetErrorString(error));
-            } catch (...) {
-                capture();
-            }
-        } else {
-            try {
-                drain_->force_flush_and_wait();
-            } catch (...) {
-                capture();
-            }
-        }
-    }
     drain_->stop();
     drain_->signal_p2p_stop();
     p2p_->stop();
-    try {
-        drain_->rethrow_if_failed();
-    } catch (...) {
-        capture();
-    }
-    if (failure) std::rethrow_exception(failure);
 }
 
 }  // namespace ring
