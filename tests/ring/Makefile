@@ -2,7 +2,7 @@ NVCC     ?= /usr/local/cuda/bin/nvcc
 SM_ARCH  ?= native
 CXX_STD  ?= c++17
 BUILD    := build
-INCLUDES := -I../.. -I../../monitoring/csrc
+INCLUDES := -I../.. -I../../native/csrc
 
 NVCC_FLAGS := \
     -std=$(CXX_STD) \
@@ -14,8 +14,8 @@ NVCC_FLAGS := \
     -lineinfo \
     $(INCLUDES)
 
-PRODUCER_CU  := ../../monitoring/csrc/ring/producer.cu
-DRAIN_SRC    := ../../monitoring/csrc/ring/drain_thread.cpp
+PRODUCER_CU  := ../../native/csrc/ring/producer.cu
+DRAIN_SRC    := ../../native/csrc/ring/drain_thread.cpp
 
 # test_ring_engine needs ATen headers + libtorch for DrainTask (contains at::Tensor).
 # Use torch.utils.cmake_prefix_path to locate them.  The Python E2E tests
