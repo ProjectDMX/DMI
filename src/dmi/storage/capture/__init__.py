@@ -14,6 +14,7 @@ from .model import (
     HydratedCapture,
     HydrationEstimate,
     HydrationLimitError,
+    InvalidCursorError,
     ObjectInfo,
     ObjectPage,
     PackConflictError,
@@ -58,6 +59,7 @@ from .catalog import (
     ReconcileResult,
 )
 from .clickhouse_catalog import ClickHouseCatalogConfig, ClickHouseCatalogWriter
+from .cursor import Cursor, CursorKey, decode_cursor, encode_cursor
 from .s3 import S3PackStore, S3StoreConfig
 from .spool import (
     DurablePackSink,
@@ -92,6 +94,8 @@ __all__ = [
     "CatalogWriter",
     "ClickHouseCatalogConfig",
     "ClickHouseCatalogWriter",
+    "Cursor",
+    "CursorKey",
     "DuplicateCaptureError",
     "DirectPackSink",
     "DurablePackSink",
@@ -106,6 +110,7 @@ __all__ = [
     "IndexEvent",
     "IndexFailure",
     "IndexResult",
+    "InvalidCursorError",
     "ObjectInfo",
     "ObjectPage",
     "OverloadPolicy",
@@ -144,5 +149,7 @@ __all__ = [
     "UploadEvent",
     "UploadFailure",
     "UploadSnapshot",
+    "decode_cursor",
+    "encode_cursor",
     "object_key_for",
 ]
