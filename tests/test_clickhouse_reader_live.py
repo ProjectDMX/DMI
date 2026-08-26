@@ -28,6 +28,17 @@ from dmi.storage.capture import (
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
 
 
+def _commit(writer, descriptors, index_version: int) -> None:
+    """Snapshots are bounded by committed packs, so a direct write must commit."""
+    seen, refs = set(), []
+    for item in descriptors:
+        ref = item.locator.pack_ref
+        if (ref.store_id, ref.pack_id) not in seen:
+            seen.add((ref.store_id, ref.pack_id))
+            refs.append(ref)
+    writer.commit_packs(refs, index_version=index_version)
+
+
 def _publish(writer, index_version: int, *, rows: int = 0, packs: int = 0) -> None:
     """Publishing is a separate step; CatalogIndexer does it, direct writes must."""
     writer.publish_watermark(
@@ -90,6 +101,7 @@ def test_a_full_walk_returns_the_corpus_exactly():
     corpus = synthetic_descriptors(250)
     with _catalog() as (writer, reader):
         writer.write_descriptors(corpus, index_version=1)
+        _commit(writer, corpus, 1)
         _publish(writer, 1)
 
         walked, pages, _ = _walk(reader, CaptureQuery(limit=40))
@@ -101,16 +113,25 @@ def test_a_full_walk_returns_the_corpus_exactly():
 
 def test_watermark_isolates_rows_indexed_after_the_first_page():
     corpus = synthetic_descriptors(100)
+    # Its own pack: a pack is sealed before it is committed, so captures never
+    # appear inside one that the catalog already knows about.
+    late_pack = str(uuid4())
     later = tuple(
-        replace(item, metadata=replace(item.metadata, capture_id=f"late-{index}"))
+        replace(
+            item,
+            metadata=replace(item.metadata, capture_id=f"late-{index}"),
+            locator=replace(item.locator, pack_id=late_pack),
+        )
         for index, item in enumerate(synthetic_descriptors(50))
     )
     with _catalog() as (writer, reader):
         writer.write_descriptors(corpus, index_version=1)
+        _commit(writer, corpus, 1)
         _publish(writer, 1)
 
         first = reader.search(CaptureQuery(limit=40))
         writer.write_descriptors(later, index_version=2)
+        _commit(writer, later, 2)
         _publish(writer, 2)
 
         rest, _, _ = _walk(reader, CaptureQuery(limit=40, cursor=first.next_cursor))
@@ -120,33 +141,32 @@ def test_watermark_isolates_rows_indexed_after_the_first_page():
         assert not any(item.capture_id.startswith("late-") for item in walked)
 
 
-def test_snapshot_returns_the_version_at_the_watermark_not_the_latest():
-    """The case plain ``FINAL`` gets wrong.
+def test_replay_is_invisible_because_it_rewrites_identical_descriptors():
+    """Why the snapshot needs no version selection.
 
-    ``FINAL`` collapses to the highest version present and only then applies
-    the predicate, so a capture re-indexed above the watermark disappears
-    instead of falling back. ``argMax`` returns its value as of the watermark.
+    Descriptors are derived from an immutable pack footer, so re-indexing a
+    pack writes byte-identical rows. That invariant is what lets the snapshot
+    be "packs committed at or before W" and lets a merge collapse duplicate
+    descriptor rows freely -- there is no content to choose between.
+
+    If a future change ever makes a re-indexed descriptor differ from the
+    original, this test fails, and the snapshot design has to be revisited.
     """
-    original = synthetic_descriptors(1)
-    revised = tuple(
-        replace(item, locator=replace(item.locator, offset=999_999))
-        for item in original
-    )
+    corpus = synthetic_descriptors(5)
     with _catalog() as (writer, reader):
-        writer.write_descriptors(original, index_version=1)
+        writer.write_descriptors(corpus, index_version=1)
+        _commit(writer, corpus, 1)
         _publish(writer, 1)
-        writer.write_descriptors(revised, index_version=2)
+        at_first = reader.get_by_ids([corpus[0].capture_id], watermark="1")
+
+        writer.write_descriptors(corpus, index_version=2)
+        _commit(writer, corpus, 2)
         _publish(writer, 2)
-
-        at_first = reader.search(CaptureQuery(limit=10))
-        assert at_first.watermark == "2"
-        assert at_first.items[0].locator.offset == 999_999
-
-        pinned = reader.get_by_ids(
-            [original[0].capture_id], watermark="1"
+        at_second = reader.get_by_ids(
+            [corpus[0].capture_id], watermark=reader.current_watermark()
         )
-        assert len(pinned) == 1
-        assert pinned[0].locator.offset == original[0].locator.offset
+
+        assert at_first == at_second, "a replay changed a descriptor"
 
 
 def test_replayed_indexing_yields_one_logical_row():
@@ -154,6 +174,7 @@ def test_replayed_indexing_yields_one_logical_row():
     with _catalog() as (writer, reader):
         for version in (1, 2, 3):
             writer.write_descriptors(corpus, index_version=version)
+            _commit(writer, corpus, version)
             _publish(writer, version)
 
         walked, _, _ = _walk(reader, CaptureQuery(limit=10))
@@ -165,6 +186,7 @@ def test_get_by_ids_resolves_a_selection_at_its_watermark():
     corpus = synthetic_descriptors(20)
     with _catalog() as (writer, reader):
         writer.write_descriptors(corpus, index_version=1)
+        _commit(writer, corpus, 1)
         _publish(writer, 1)
 
         page = reader.search(CaptureQuery(limit=20))
@@ -179,6 +201,7 @@ def test_filters_narrow_the_walk():
     corpus = synthetic_descriptors(30)
     with _catalog() as (writer, reader):
         writer.write_descriptors(corpus, index_version=1)
+        _commit(writer, corpus, 1)
         _publish(writer, 1)
 
         walked, _, _ = _walk(

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from os import environ
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
@@ -37,6 +38,17 @@ from dmi.storage.capture import (
 
 
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
+
+
+def _commit(writer, descriptors, index_version: int) -> None:
+    """Snapshots are bounded by committed packs, so a direct write must commit."""
+    seen, refs = set(), []
+    for item in descriptors:
+        ref = item.locator.pack_ref
+        if (ref.store_id, ref.pack_id) not in seen:
+            seen.add((ref.store_id, ref.pack_id))
+            refs.append(ref)
+    writer.commit_packs(refs, index_version=index_version)
 
 
 def _publish(writer, index_version: int, *, rows: int = 0, packs: int = 0) -> None:
@@ -100,46 +112,71 @@ def _raw_rows(client, config) -> int:
 # --- merges versus pinned watermarks -----------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Open design problem: argMax(...) WHERE index_version <= W needs rows "
-        "ReplacingMergeTree is defined to delete on merge, so a pinned snapshot "
-        "expires at a time nobody controls. Needs a snapshot mechanism that does "
-        "not depend on superseded versions surviving."
-    ),
-)
 def test_a_merge_does_not_destroy_a_pinned_snapshot():
     """A watermark must keep resolving after ClickHouse deduplicates.
 
-    ReplacingMergeTree keeps only the highest version per sorting key, so any
-    snapshot that reads superseded versions has an expiry no caller controls.
+    The snapshot is the set of packs committed at or before the watermark, so
+    it survives a merge collapsing duplicate descriptor rows. Replay writes
+    byte-identical descriptors, which is why it does not matter which copy the
+    merge keeps.
     """
-    original = synthetic_descriptors(1)
-    revised = tuple(
-        d.__class__(metadata=d.metadata, locator=d.locator.__class__(
-            **{**{f: getattr(d.locator, f) for f in d.locator.__slots__},
-               "offset": 999_999}))
-        for d in original
-    )
+    corpus = synthetic_descriptors(3)
     with _catalog() as (writer, reader, client, config):
-        writer.write_descriptors(original, index_version=1)
+        writer.write_descriptors(corpus, index_version=1)
+        _commit(writer, corpus, 1)
         _publish(writer, 1)
-        writer.write_descriptors(revised, index_version=2)
+
+        # Replay the identical batch, as an ambiguous commit would.
+        writer.write_descriptors(corpus, index_version=2)
+        _commit(writer, corpus, 2)
         _publish(writer, 2)
 
-        before = reader.get_by_ids([original[0].capture_id], watermark="1")
+        before = reader.get_by_ids([corpus[0].capture_id], watermark="1")
         assert len(before) == 1, "precondition: the pinned read works pre-merge"
-        assert before[0].locator.offset == original[0].locator.offset
 
         _merge(client, config)
 
-        after = reader.get_by_ids([original[0].capture_id], watermark="1")
+        after = reader.get_by_ids([corpus[0].capture_id], watermark="1")
         assert len(after) == 1, (
             "a pinned watermark stopped resolving after a merge: "
             f"raw rows went to {_raw_rows(client, config)}"
         )
-        assert after[0].locator.offset == original[0].locator.offset
+        assert after[0] == before[0], "the resolved descriptor changed under a merge"
+
+
+def test_a_pack_committed_after_the_watermark_is_not_visible():
+    """The snapshot boundary has to actually exclude later work."""
+    early = synthetic_descriptors(2)
+    # A genuinely later pack: its own pack id, and its own captures. A capture
+    # id belongs to exactly one pack, so reusing ids across packs would be an
+    # invalid corpus rather than a harder test.
+    late_pack = str(uuid4())
+    later = tuple(
+        replace(
+            item,
+            metadata=replace(item.metadata, capture_id=f"late-{index}"),
+            locator=replace(item.locator, pack_id=late_pack),
+        )
+        for index, item in enumerate(synthetic_descriptors(2))
+    )
+    with _catalog() as (writer, reader, client, config):
+        writer.write_descriptors(early, index_version=1)
+        _commit(writer, early, 1)
+        _publish(writer, 1)
+        pinned = reader.current_watermark()
+
+        writer.write_descriptors(later, index_version=2)
+        _commit(writer, later, 2)
+        _publish(writer, 2)
+        _merge(client, config)
+
+        # The pinned snapshot sees the early pack and nothing after it.
+        assert len(reader.get_by_ids([early[0].capture_id], watermark=pinned)) == 1
+        assert reader.get_by_ids([later[0].capture_id], watermark=pinned) == ()
+
+        # And the later watermark sees both.
+        current = reader.current_watermark()
+        assert len(reader.get_by_ids([later[0].capture_id], watermark=current)) == 1
 
 
 def test_a_walk_still_completes_after_a_merge_mid_pagination():
@@ -147,9 +184,11 @@ def test_a_walk_still_completes_after_a_merge_mid_pagination():
     corpus = synthetic_descriptors(60)
     with _catalog() as (writer, reader, client, config):
         writer.write_descriptors(corpus, index_version=1)
+        _commit(writer, corpus, 1)
         _publish(writer, 1)
         # Re-index everything, so every row has a superseded version to lose.
         writer.write_descriptors(corpus, index_version=2)
+        _commit(writer, corpus, 2)
         _publish(writer, 2)
 
         first = reader.search(CaptureQuery(limit=20))
@@ -183,6 +222,7 @@ def test_a_watermark_is_not_published_before_its_batch_completes():
         mid_batch = reader.current_watermark()
         rows_visible = _raw_rows(client, config)
         writer.write_descriptors(corpus[2:], index_version=123)
+        _commit(writer, corpus[2:], 123)
         _publish(writer, 123, rows=len(corpus))
 
         # Mid-batch the version must not be readable at all: two of four rows
@@ -205,6 +245,7 @@ def test_an_indexed_batch_is_visible_all_at_once():
     with _catalog() as (writer, reader, client, config):
         for start in range(0, len(corpus), 7):
             writer.write_descriptors(corpus[start : start + 7], index_version=9)
+        _commit(writer, corpus[start : start + 7], 9)
         _publish(writer, 9, rows=len(corpus))
 
         page = reader.search(CaptureQuery(limit=100))
@@ -220,6 +261,7 @@ def test_a_watermark_below_every_row_returns_nothing():
     corpus = synthetic_descriptors(5)
     with _catalog() as (writer, reader, _, _):
         writer.write_descriptors(corpus, index_version=10)
+        _commit(writer, corpus, 10)
         _publish(writer, 10)
 
         assert reader.get_by_ids([corpus[0].capture_id], watermark="9") == ()

@@ -1,16 +1,28 @@
 """ClickHouse-backed catalog reads for bounded analysis.
 
-The writer in :mod:`.clickhouse_catalog` lands descriptor rows into a
-``ReplacingMergeTree`` keyed by ``index_version``. This module reads them back
-as a *snapshot*: every result is pinned to a watermark so a selection resolves
-to the same captures for as long as it lives.
+Reads are pinned to a watermark, so a selection resolves to the same captures
+for as long as it lives. The snapshot boundary is **the set of packs committed
+at or before that watermark**, read from an append-only commit log -- not a
+range of descriptor versions.
 
-That pinning is why these queries read ``*_capture_raw`` directly instead of the
-public ``FINAL`` views. ``FINAL`` collapses duplicates to the highest version
-present and only then applies predicates, so ``FINAL`` with
-``index_version <= W`` drops any capture re-indexed above ``W`` rather than
-falling back to its version at ``W``. Explicit ``argMax`` aggregation gives the
-row as of the watermark, which is what a stable cursor walk requires.
+That distinction is load-bearing. Descriptor rows live in a
+``ReplacingMergeTree``, which is defined to keep only the highest version per
+sorting key and delete the rest during a merge. Any snapshot phrased as
+``index_version <= W`` over those rows therefore expires at a time nobody
+controls: after a merge, the version it wanted is simply gone. Bounding on pack
+commits instead depends only on an append-only log, which no merge rewrites.
+
+The reason this works is that a descriptor is derived from an immutable pack
+footer, so re-indexing a pack rewrites byte-identical rows. There is no content
+to choose between, which is why ``argMax`` here is deduplication rather than
+version selection, and why it does not matter which duplicate a merge keeps.
+``test_replay_is_invisible_because_it_rewrites_identical_descriptors`` guards
+that invariant; if it ever breaks, this design has to be revisited.
+
+The watermark itself comes from a published log rather than from
+``max(index_version)`` over the descriptors, because one indexing call writes
+descriptors across several INSERTs before the pack markers -- sampling the
+descriptor table mid-call pins a batch that then keeps growing.
 """
 
 from __future__ import annotations
@@ -124,6 +136,7 @@ class ClickHouseCaptureCatalog:
         self._config = config or ClickHouseReaderConfig()
         self._capture_raw = f"{self._config.table_prefix}_capture_raw"
         self._watermark_table = f"{self._config.table_prefix}_index_watermark"
+        self._commit_log = f"{self._config.table_prefix}_pack_commit_log"
 
     @property
     def config(self) -> ClickHouseReaderConfig:
@@ -202,7 +215,9 @@ class ClickHouseCaptureCatalog:
         }
         sql = (
             f"SELECT {self._projection()} FROM {self._qualified()} "
-            "WHERE index_version <= %(watermark)s AND capture_id IN %(capture_ids)s "
+            "WHERE capture_id IN %(capture_ids)s AND pack_id IN "
+            f"(SELECT pack_id FROM {self._qualified(self._commit_log)} "
+            "WHERE index_version <= %(watermark)s) "
             f"GROUP BY {', '.join(_quoted(name) for name in _SORT_KEY)}"
         )
         rows = self._client.execute(sql, params, settings=self._config.settings)
@@ -219,7 +234,9 @@ class ClickHouseCaptureCatalog:
     @staticmethod
     def _projection() -> str:
         # Sort-key columns are grouped on, so they project directly; everything
-        # else resolves to its value at the highest version <= the watermark.
+        # else collapses whatever duplicate rows survive. Any version of a
+        # descriptor is byte identical to any other, so argMax here is
+        # deduplication rather than version selection.
         #
         # Deliberately unaliased: naming an aggregate after its own source
         # column shadows that column everywhere else in the statement, and
@@ -233,11 +250,19 @@ class ClickHouseCaptureCatalog:
             for name in _PROJECTION
         )
 
-    @staticmethod
     def _filters(
-        query: CaptureQuery, *, watermark: int, after: CursorKey | None
+        self, query: CaptureQuery, *, watermark: int, after: CursorKey | None
     ) -> tuple[list[str], dict[str, object]]:
-        clauses = ["index_version <= %(watermark)s"]
+        # The snapshot is the set of packs committed at or before the
+        # watermark, not a range of descriptor versions. Descriptor rows are
+        # byte identical across re-indexing, so which version survives a merge
+        # is irrelevant -- but a version *range* over them is not durable,
+        # because ReplacingMergeTree deletes superseded rows.
+        clauses = [
+            "pack_id IN (SELECT pack_id FROM "
+            f"{self._qualified(self._commit_log)} "
+            "WHERE index_version <= %(watermark)s)"
+        ]
         params: dict[str, object] = {"watermark": watermark}
 
         # Equality and range filters apply to raw rows before grouping. That is

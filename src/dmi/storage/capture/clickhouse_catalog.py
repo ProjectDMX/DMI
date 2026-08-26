@@ -95,6 +95,7 @@ class ClickHouseCatalogWriter:
         self._pack_raw = f"{prefix}_pack_inventory_raw"
         self._pack_view = f"{prefix}_pack_inventory"
         self._watermark = f"{prefix}_index_watermark"
+        self._commit_log = f"{prefix}_pack_commit_log"
 
     def ensure_schema(self) -> None:
         database = _quoted(self._config.database)
@@ -147,6 +148,18 @@ ORDER BY (store_id, pack_id)"""
             f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._watermark)} (
 index_version UInt64, published_at_ns UInt64, indexed_rows UInt64, indexed_packs UInt32
 ) ENGINE = MergeTree ORDER BY index_version"""
+        )
+
+        # The snapshot boundary. A capture belongs to exactly one immutable
+        # pack, so "the catalog as of W" is "the packs committed at or before
+        # W" -- a fact about packs, not about descriptor rows. Keeping it here,
+        # append-only, is what lets the descriptor table stay a
+        # ReplacingMergeTree: every version of a descriptor row is byte
+        # identical, so it does not matter which one a merge keeps.
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._commit_log)} (
+pack_id UUID, store_id LowCardinality(String), index_version UInt64
+) ENGINE = MergeTree ORDER BY (index_version, store_id, pack_id)"""
         )
 
         capture_public = ", ".join(_CAPTURE_COLUMNS[:-1])
@@ -222,6 +235,14 @@ index_version UInt64, published_at_ns UInt64, indexed_rows UInt64, indexed_packs
             f"INSERT INTO {self._qualified(self._pack_raw)} "
             f"({', '.join(_PACK_COLUMNS)}) VALUES",
             rows,
+        )
+        # Append the same commit to the log the snapshot reads. A pack
+        # committed twice appends twice; the reader treats it as a set, so
+        # replay is absorbed without needing deduplication here.
+        self._client.execute(
+            f"INSERT INTO {self._qualified(self._commit_log)} "
+            "(pack_id, store_id, index_version) VALUES",
+            [(ref.pack_id, ref.store_id, index_version) for ref in refs],
         )
 
     def _qualified(self, table: str) -> str:
