@@ -55,6 +55,9 @@ class _Client:
     def execute(self, query, params=None, **kwargs):
         self.calls.append((" ".join(query.split()), params, kwargs))
         if "max(index_version)" in query:
+            # The watermark now comes from the published log, not the
+            # descriptor table.
+            assert "_index_watermark" in query, query
             return [(self._watermark,)]
         page = self._pages.pop(0) if self._pages else []
         return [_row(item) for item in page]

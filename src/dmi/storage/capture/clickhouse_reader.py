@@ -123,6 +123,7 @@ class ClickHouseCaptureCatalog:
         self._client = client
         self._config = config or ClickHouseReaderConfig()
         self._capture_raw = f"{self._config.table_prefix}_capture_raw"
+        self._watermark_table = f"{self._config.table_prefix}_index_watermark"
 
     @property
     def config(self) -> ClickHouseReaderConfig:
@@ -131,14 +132,16 @@ class ClickHouseCaptureCatalog:
     # -- public API ---------------------------------------------------------
 
     def current_watermark(self) -> str:
-        """The catalog's high-water ``index_version``.
+        """The newest version whose indexing batch is fully committed.
 
-        ``index_version`` is not part of the sort key, so this is a full-column
-        aggregate rather than an index lookup -- cheap in a columnar engine, but
-        not free, and it runs once per search.
+        Read from the published watermark log, never from the descriptor table.
+        One indexing call writes descriptors across several INSERTs and then the
+        pack markers; ``max(index_version)`` over the descriptors would expose
+        that version between those writes, letting a reader pin a half-written
+        batch that keeps growing under it.
         """
         rows = self._client.execute(
-            f"SELECT max(index_version) FROM {self._qualified()}",
+            f"SELECT max(index_version) FROM {self._qualified(self._watermark_table)}",
             settings=self._config.settings,
         )
         if not rows or rows[0][0] is None:
@@ -207,8 +210,11 @@ class ClickHouseCaptureCatalog:
 
     # -- SQL construction ---------------------------------------------------
 
-    def _qualified(self) -> str:
-        return f"{_quoted(self._config.database)}.{_quoted(self._capture_raw)}"
+    def _qualified(self, table: str | None = None) -> str:
+        return (
+            f"{_quoted(self._config.database)}."
+            f"{_quoted(table or self._capture_raw)}"
+        )
 
     @staticmethod
     def _projection() -> str:

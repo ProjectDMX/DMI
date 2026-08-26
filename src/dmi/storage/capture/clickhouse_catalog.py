@@ -94,6 +94,7 @@ class ClickHouseCatalogWriter:
         self._capture_view = f"{prefix}_capture"
         self._pack_raw = f"{prefix}_pack_inventory_raw"
         self._pack_view = f"{prefix}_pack_inventory"
+        self._watermark = f"{prefix}_index_watermark"
 
     def ensure_schema(self) -> None:
         database = _quoted(self._config.database)
@@ -135,6 +136,19 @@ ORDER BY (store_id, pack_id)"""
                 f"{name} {kind} MATERIALIZED {expression}"
             )
 
+        # A version becomes readable only once its whole batch is durable, so
+        # the watermark cannot be derived from the descriptor table: a reader
+        # sampling max(index_version) there sees a version mid-batch, between
+        # the INSERTs that make it up. This table is written as the last step of
+        # an indexing call instead. Plain MergeTree, because it is a log --
+        # ReplacingMergeTree would eventually collapse the history a pinned
+        # snapshot reads.
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._watermark)} (
+index_version UInt64, published_at_ns UInt64, indexed_rows UInt64, indexed_packs UInt32
+) ENGINE = MergeTree ORDER BY index_version"""
+        )
+
         capture_public = ", ".join(_CAPTURE_COLUMNS[:-1])
         pack_public = ", ".join(_PACK_COLUMNS[:-1])
         self._client.execute(
@@ -172,6 +186,23 @@ ORDER BY (store_id, pack_id)"""
             f"INSERT INTO {self._qualified(self._capture_raw)} "
             f"({', '.join(_CAPTURE_COLUMNS)}) VALUES",
             rows,
+        )
+
+    def publish_watermark(
+        self,
+        *,
+        index_version: int,
+        published_at_ns: int,
+        indexed_rows: int,
+        indexed_packs: int,
+    ) -> None:
+        """Make a version readable, after everything it covers is durable."""
+        self._validate_version(index_version)
+        self._validate_version(published_at_ns)
+        self._client.execute(
+            f"INSERT INTO {self._qualified(self._watermark)} "
+            "(index_version, published_at_ns, indexed_rows, indexed_packs) VALUES",
+            [(index_version, published_at_ns, indexed_rows, indexed_packs)],
         )
 
     def commit_packs(

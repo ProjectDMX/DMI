@@ -30,6 +30,15 @@ class CatalogWriter(Protocol):
         self, refs: Sequence[PackRef], *, index_version: int
     ) -> None: ...
 
+    def publish_watermark(
+        self,
+        *,
+        index_version: int,
+        published_at_ns: int,
+        indexed_rows: int,
+        indexed_packs: int,
+    ) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class CatalogIndexerConfig:
@@ -221,6 +230,18 @@ class CatalogIndexer:
             descriptor_inserts += 1
         if valid_refs:
             self._writer.commit_packs(valid_refs, index_version=version)
+        # Publish last. Descriptors go out across several INSERTs and the pack
+        # markers after them, so the version is only a truthful snapshot once
+        # all of that is durable. A reader that derived the watermark from the
+        # descriptor table itself would see this version mid-batch.
+        publish = getattr(self._writer, "publish_watermark", None)
+        if publish is not None:
+            publish(
+                index_version=version,
+                published_at_ns=self._clock_ns(),
+                indexed_rows=len(descriptors),
+                indexed_packs=len(valid_refs),
+            )
         result = IndexResult(
             requested_packs=len(unique),
             skipped_packs=len(unique) - len(pending),

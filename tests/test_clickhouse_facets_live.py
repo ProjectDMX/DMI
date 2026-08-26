@@ -23,6 +23,16 @@ from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS, _FACET_COLU
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
 
 
+def _publish(writer, index_version: int, *, rows: int = 0, packs: int = 0) -> None:
+    """Publishing is a separate step; CatalogIndexer does it, direct writes must."""
+    writer.publish_watermark(
+        index_version=index_version,
+        published_at_ns=index_version,
+        indexed_rows=rows,
+        indexed_packs=packs,
+    )
+
+
 @contextmanager
 def _writer():
     clickhouse_driver = pytest.importorskip("clickhouse_driver")
