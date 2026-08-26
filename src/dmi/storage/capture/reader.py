@@ -67,7 +67,7 @@ class CaptureReader:
         return CaptureSelection.create(
             page.items,
             catalog_watermark=page.watermark,
-            query_hash=query.query_hash,
+            filter_hash=query.filter_hash,
         )
 
     def estimate(self, selection: CaptureSelection) -> HydrationEstimate:

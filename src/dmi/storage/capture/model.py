@@ -21,6 +21,11 @@ _DTYPE_BYTES = {
     "float64": 8,
 }
 _TEXT_LIMIT = 512
+# A keyset cursor carries the whole catalog sort key, so it cannot fit the
+# per-identifier text limit that bounds the fields it encodes.
+_CURSOR_LIMIT = 2048
+# Fields of CaptureQuery that address a page rather than describe the filters.
+_NON_FILTER_QUERY_FIELDS = frozenset({"cursor", "limit"})
 _MAX_RANK = 32
 
 
@@ -48,13 +53,19 @@ class HydrationLimitError(CaptureStorageError):
     """A hydration plan exceeds the caller's byte limit."""
 
 
-def _validate_text(name: str, value: str | None, *, optional: bool = False) -> None:
+class InvalidCursorError(CaptureStorageError):
+    """A pagination cursor is malformed or belongs to a different query."""
+
+
+def _validate_text(
+    name: str, value: str | None, *, optional: bool = False, limit: int = _TEXT_LIMIT
+) -> None:
     if value is None:
         if optional:
             return
         raise ValueError(f"{name} is required")
-    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > _TEXT_LIMIT:
-        raise ValueError(f"{name} must be non-empty UTF-8 within {_TEXT_LIMIT} bytes")
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > limit:
+        raise ValueError(f"{name} must be non-empty UTF-8 within {limit} bytes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,10 +253,12 @@ class CaptureQuery:
     limit: int = 1000
 
     def __post_init__(self) -> None:
-        for name in ("tenant_id", "experiment_id", "run_id", "session_id", "model_id", "cursor"):
+        for name in ("tenant_id", "experiment_id", "run_id", "session_id", "model_id"):
             value = getattr(self, name)
             if value is not None:
                 _validate_text(name, value)
+        if self.cursor is not None:
+            _validate_text("cursor", self.cursor, limit=_CURSOR_LIMIT)
         if not 1 <= self.limit <= 10_000:
             raise ValueError("limit must be between 1 and 10000")
         if len(self.hook_names) > 128 or len(self.layer_numbers) > 1024:
@@ -270,6 +283,22 @@ class CaptureQuery:
         encoded = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
         return sha256(encoded).hexdigest()
 
+    @property
+    def filter_hash(self) -> str:
+        """Identity of the filters alone, excluding cursor and page size.
+
+        ``query_hash`` covers the whole request, so it changes from page to
+        page. Cursors and selections bind to this instead, which is what makes
+        a paginated walk one identifiable query.
+        """
+        selected = {
+            name: value
+            for name, value in asdict(self).items()
+            if name not in _NON_FILTER_QUERY_FIELDS
+        }
+        encoded = json.dumps(selected, sort_keys=True, separators=(",", ":")).encode()
+        return sha256(encoded).hexdigest()
+
 
 @dataclass(frozen=True, slots=True)
 class CapturePage:
@@ -283,7 +312,7 @@ class CaptureSelection:
     selection_id: str
     capture_ids: tuple[str, ...]
     catalog_watermark: str
-    query_hash: str
+    filter_hash: str
 
     @classmethod
     def create(
@@ -291,7 +320,7 @@ class CaptureSelection:
         descriptors: Sequence[CaptureDescriptor],
         *,
         catalog_watermark: str,
-        query_hash: str,
+        filter_hash: str,
     ) -> CaptureSelection:
         ids = tuple(item.capture_id for item in descriptors)
         seen: set[str] = set()
@@ -303,9 +332,9 @@ class CaptureSelection:
             seen.add(capture_id)
         identity = json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "catalog_watermark": catalog_watermark,
-                "query_hash": query_hash,
+                "filter_hash": filter_hash,
                 "capture_ids": ids,
             },
             sort_keys=True,
@@ -315,7 +344,7 @@ class CaptureSelection:
             selection_id=sha256(identity).hexdigest(),
             capture_ids=ids,
             catalog_watermark=catalog_watermark,
-            query_hash=query_hash,
+            filter_hash=filter_hash,
         )
 
 
