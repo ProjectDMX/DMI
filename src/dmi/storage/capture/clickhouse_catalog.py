@@ -49,6 +49,34 @@ _CAPTURE_COLUMNS = (
     "codec", "payload_checksum", "index_version",
 )
 
+# Catalog facets: descriptor-derived columns that make the catalog filterable
+# and sortable server-side. They are pure functions of columns the writer
+# already stores, so MATERIALIZED computes them at insert with no indexer
+# change and no extra object reads.
+#
+# The casts are not decoration. On ClickHouse 26.9 ``arrayProduct`` returns
+# Float64, ``UInt64 - UInt64`` returns Int64, and ``nullIf`` makes an
+# expression Nullable -- none of which fit these column types.
+_FACET_COLUMNS = (
+    ("facet_version", "UInt16", "1"),
+    ("element_count", "UInt64", "toUInt64(arrayProduct(shape))"),
+    ("tensor_rank", "UInt8", "toUInt8(length(shape))"),
+    ("token_span", "UInt64", "toUInt64(token_end - token_start)"),
+    (
+        "compression_ratio",
+        "Float32",
+        "toFloat32(if(stored_length = 0, 0, decoded_length / stored_length))",
+    ),
+)
+
+
+def _facet_ddl() -> str:
+    return ",\n".join(
+        f"{name} {kind} MATERIALIZED {expression}"
+        for name, kind, expression in _FACET_COLUMNS
+    )
+
+
 _PACK_COLUMNS = (
     "pack_id", "store_id", "object_key", "object_bytes", "pack_checksum",
     "record_count", "index_version",
@@ -85,7 +113,8 @@ batch_position UInt32, dtype LowCardinality(String), shape Array(UInt32),
 captured_at_ns UInt64, pack_id UUID, store_id LowCardinality(String), object_key String,
 object_bytes UInt64, pack_checksum FixedString(64), pack_record_count UInt32,
 payload_offset UInt64, stored_length UInt64, decoded_length UInt64,
-codec LowCardinality(String), payload_checksum FixedString(8), index_version UInt64
+codec LowCardinality(String), payload_checksum FixedString(8), index_version UInt64,
+{_facet_ddl()}
 ) ENGINE = ReplacingMergeTree(index_version)
 ORDER BY (tenant_id, experiment_id, run_id, captured_at_ns, capture_id)"""
         )
@@ -97,6 +126,15 @@ index_version UInt64
 ) ENGINE = ReplacingMergeTree(index_version)
 ORDER BY (store_id, pack_id)"""
         )
+        # Tables created by an earlier build predate the facet columns, and
+        # CREATE TABLE IF NOT EXISTS will not add them. ADD COLUMN IF NOT
+        # EXISTS is idempotent, so this is safe on every start.
+        for name, kind, expression in _FACET_COLUMNS:
+            self._client.execute(
+                f"ALTER TABLE {capture_raw} ADD COLUMN IF NOT EXISTS "
+                f"{name} {kind} MATERIALIZED {expression}"
+            )
+
         capture_public = ", ".join(_CAPTURE_COLUMNS[:-1])
         pack_public = ", ".join(_PACK_COLUMNS[:-1])
         self._client.execute(
