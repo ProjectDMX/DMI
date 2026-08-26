@@ -683,6 +683,80 @@ PYTHONPATH=src python -m benchmarks.bench_capture_search \
 - Switch the default only after compatibility, recovery, and throughput gates
   pass; preserve configuration rollback.
 
+Status: not started. Two of the instruments it depends on now exist; the
+comparison itself has not been run, and the production writer it compares
+against has not been built.
+
+#### Decision: the production writer is native
+
+The Python implementation is a **reference implementation and conformance
+suite**, permanently -- not a candidate production writer. The reason is
+structural rather than performance-related: the ring transport reconstructs
+tensors on a native callback thread specifically to avoid touching Python or the
+GIL, and `DMXHostEngine` receives pre-assembled rows from that thread. There is
+no hot-path caller for a Python pack sink, and creating one would reintroduce
+per-tensor GIL contention that the ring exists to avoid.
+
+The pack-and-upload plane will therefore be written in C++ alongside the
+existing `ClickHouseInsertStage`, reusing `batching_queue.hpp` and
+`pipelined_engine.hpp`. This supersedes the Phase 2 limitation describing the
+Python pipeline as an interim stand-in for "the final reusable native slab
+allocator": that is now the plan of record rather than a gap.
+
+#### Fault injection
+
+`tests/_faults.py` wraps the three boundaries that can misbehave -- object
+store, ClickHouse client, and pack sink. Faults are scripted rather than random:
+a schedule names which calls fail and how, so a failure reproduces exactly.
+
+The characterised behaviour, which a native writer must reproduce:
+
+| Fault | Required behaviour |
+|---|---|
+| Short read from the store | Refused, not silently truncated |
+| Read failure mid-index | Aborts that pack; no partial pack is produced |
+| Immutable key written twice | Converges; not a conflict |
+| Sink failure | Pipeline fails loudly and refuses further admission |
+| Insert failure | Pack left uncommitted; the batch is replayable |
+| Duplicated insert | Absorbed by replay semantics |
+| One corrupt pack in a batch | Fails only itself; the batch still indexes |
+
+```bash
+python -m pytest tests/test_capture_faults.py -q
+```
+
+#### Conformance manifest
+
+`tests/tools/golden_workload.py` produces the golden-workload comparison this
+phase requires, as a single JSON document over a deterministic corpus covering
+every dtype the format accepts: pack identity and checksum, per-capture payload
+sha256 and crc32, decoded-tensor sha256, placement, and the full summary
+contract. Every value is language-neutral -- byte counts, hex digests and
+integers -- so a native writer is conformant exactly when the same corpus
+produces the same manifest.
+
+```bash
+python tests/tools/golden_workload.py generate --out golden.json
+python tests/tools/golden_workload.py verify --manifest golden.json
+```
+
+The recorded manifest lives at `tests/data/capture_golden_manifest.json` and is
+checked on every CPU run. `verify` diffs field by field, so a mismatch names the
+capture and field that moved.
+
+#### Remaining before the default can switch
+
+- The native pack-and-upload plane, and configuration to select a sink with
+  rollback preserved. Until a sink is selectable, "keep the current sink as the
+  default initially" has nothing to compare against.
+- Phase 3's capacity gate, which is still pending hardware. A throughput gate
+  cannot pass while the 1.2x requirement is unmeasured.
+- Performance variance under fault injection, which is not yet recorded.
+- Three decisions the migration forces: whether the public views keep `FINAL`
+  now that its cost is measured at 1.85x; where `index_version` comes from once
+  more than one indexer runs, since the current per-process clock assumes a
+  single writer; and whether catalog facets belong in the public views.
+
 No phase requires a CUDA-side change.
 
 ## Operating signals
@@ -718,7 +792,10 @@ bytes, and retained failure details all have explicit caps.
 ## Phase 2 limitations
 
 - The implementation is a Python CPU reference, not the final reusable native
-  slab allocator.
+  slab allocator. As of the Phase 6 decision this is permanent: the Python
+  implementation is the reference and conformance suite, and the production
+  writer will be native. See *Phase 6 -- Decision: the production writer is
+  native*.
 - One process owns a spool directory; cross-process locking is not implemented.
 - Durable mode stages synchronously and uploads through a separate explicit
   uploader, so remote backpressure is isolated from local commit.
@@ -772,7 +849,10 @@ bytes, and retained failure details all have explicit caps.
 - The per-extension time budget is checked after each call. A runaway extension
   is reported, not interrupted; preemption needs a worker boundary.
 - Core summary statistics cover finite elements only, with `nan_count`,
-  `inf_count` and `finite_count` reported alongside.
+  `inf_count` and `finite_count` reported alongside. `l2_norm` factors out the
+  largest magnitude before squaring, because the direct `sqrt(sum(x**2))` form
+  overflows float64 for large-magnitude tensors and returns infinity where the
+  true norm is finite.
 - A selection is one bounded page. Callers paginate explicitly.
 
 ## Alternatives considered
