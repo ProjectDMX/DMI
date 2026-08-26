@@ -639,3 +639,27 @@ def test_registry_refuses_duplicate_names():
 def test_registry_refuses_malformed_identities(name: str, version: int):
     with pytest.raises(ExtensionError):
         ScalarMetric(name=name, version=version, compute=lambda x: 1.0)
+
+
+def test_l2_norm_survives_large_magnitude_float64(tmp_path: Path):
+    # sqrt(sum(x**2)) overflows float64 well before the true norm does: squaring
+    # 1e200 needs 1e400. The scaled form keeps every squared term <= 1.
+    source = np.array([1e200, -1e200], dtype=np.float64)
+    _, descriptor = _descriptor_for(source, "float64", tmp_path)
+
+    summary = summarize_tensor(descriptor, source.tobytes())
+
+    assert np.isfinite(summary.l2_norm)
+    assert summary.l2_norm == pytest.approx(np.sqrt(2.0) * 1e200, rel=1e-12)
+    assert summary.abs_max == pytest.approx(1e200)
+
+
+def test_l2_norm_still_matches_the_plain_formula_at_normal_scale(tmp_path: Path):
+    rng = np.random.default_rng(seed=101)
+    source = (rng.random(256) * 10 - 5).astype(np.float64)
+    _, descriptor = _descriptor_for(source, "float64", tmp_path)
+
+    summary = summarize_tensor(descriptor, source.tobytes())
+
+    # Scaling must not cost accuracy where the naive form was already fine.
+    assert summary.l2_norm == pytest.approx(float(np.sqrt((source**2).sum())))

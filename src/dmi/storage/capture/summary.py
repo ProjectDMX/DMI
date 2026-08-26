@@ -179,6 +179,16 @@ def summarize_tensor(
         )
 
     absolute = numpy.abs(finite)
+    # Scale before squaring. float64 holds values up to ~1e308, so squaring a
+    # large-magnitude tensor overflows and the naive sqrt(sum(x**2)) returns inf
+    # where the true norm is perfectly finite. Factoring out the largest
+    # magnitude keeps every squared term at or below 1.
+    abs_max = float(absolute.max())
+    if abs_max == 0.0:
+        l2_norm = 0.0
+    else:
+        l2_norm = abs_max * float(numpy.sqrt(numpy.square(absolute / abs_max).sum()))
+
     return CoreTensorSummaryV1(
         summary_version=CORE_SUMMARY_VERSION,
         element_count=element_count,
@@ -189,8 +199,8 @@ def summarize_tensor(
         mean=float(finite.mean()),
         minimum=float(finite.min()),
         maximum=float(finite.max()),
-        abs_max=float(absolute.max()),
-        l2_norm=float(numpy.sqrt(numpy.square(finite).sum())),
+        abs_max=abs_max,
+        l2_norm=l2_norm,
     )
 
 
