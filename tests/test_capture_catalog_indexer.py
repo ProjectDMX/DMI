@@ -265,3 +265,24 @@ def test_rebuild_caps_failure_details_without_losing_failure_count(tmp_path: Pat
 
     assert result.failed_packs == 2
     assert len(result.failures) == 1
+
+
+def test_an_oversized_batch_raises_instead_of_blaming_a_pack(tmp_path: Path):
+    inventory, refs = _packs(tmp_path)
+    writer = _CatalogWriter()
+    indexer = CatalogIndexer(
+        inventory,
+        writer,
+        # Small enough that the second pack pushes the batch over.
+        config=CatalogIndexerConfig(max_packs=8, max_estimated_bytes=1),
+        clock_ns=lambda: 42,
+    )
+
+    # A batch-level bound is a caller error. Reporting it as a per-pack failure
+    # would blame an innocent pack and silently skip the rest of the batch while
+    # index() still returned normally.
+    with pytest.raises(ValueError, match="max_estimated_bytes"):
+        indexer.index(refs)
+
+    assert writer.descriptor_batches == []
+    assert writer.pack_batches == []

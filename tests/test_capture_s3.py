@@ -288,3 +288,47 @@ def test_s3_listing_rejects_a_truncated_page_without_a_cursor():
 
     with pytest.raises(PackIntegrityError, match="cursor"):
         _store(client).list_objects(limit=1)
+
+
+class _LyingPack:
+    """A pack source whose bytes do not match the checksum it declares."""
+
+    def __init__(self, sealed):
+        self.pack_id = sealed.pack_id
+        self.created_at_ns = sealed.created_at_ns
+        self.record_count = sealed.record_count
+        self.checksum = sealed.checksum
+        self._data = b"\x00" * len(sealed.data)
+
+    @property
+    def object_bytes(self) -> int:
+        return len(self._data)
+
+    def open(self):
+        from io import BytesIO
+
+        return BytesIO(self._data)
+
+
+def test_s3_put_verifies_the_bytes_it_uploads():
+    client = _S3Client()
+    store = _store(client)
+
+    # upload_fileobj hands the stream to the transfer manager, so put never sees
+    # the bytes. Without hashing the source it would happily store content that
+    # contradicts the checksum it writes into object metadata -- and stat()
+    # compares against that same metadata, so nothing downstream could tell.
+    with pytest.raises(PackIntegrityError, match="checksum"):
+        store.put(_LyingPack(_pack()), "packs/lying.dmi-pack")
+
+    assert client.objects == {}
+
+
+def test_s3_put_still_accepts_a_faithful_source():
+    client = _S3Client()
+    store = _store(client)
+
+    ref = store.put(_pack(), "packs/honest.dmi-pack")
+
+    assert ref.checksum == _pack().checksum
+    assert len(client.objects) == 1

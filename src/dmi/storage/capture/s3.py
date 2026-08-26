@@ -7,7 +7,7 @@ from typing import Mapping, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from .filesystem import validate_object_key, validate_pack_source
+from .filesystem import validate_object_key, validate_pack_source, verify_pack_source
 from .model import (
     ObjectInfo,
     ObjectPage,
@@ -182,6 +182,13 @@ class S3PackStore:
         if existing is not None:
             return self._existing_ref(pack, key, existing)
 
+        # upload_fileobj hands the stream straight to the transfer manager, so
+        # unlike FilesystemPackStore.put nothing here ever sees the bytes. Hash
+        # the source first: the object metadata below is written from
+        # pack.checksum, so a later stat() comparison against it is tautological
+        # and cannot notice a source that lied about its own contents.
+        verify_pack_source(pack)
+
         metadata = {
             "dmi-format": "dmi-pack-v1",
             "dmi-pack-id": pack.pack_id,
@@ -218,6 +225,10 @@ class S3PackStore:
             raise PackIntegrityError("S3 object is missing DMI checksum metadata")
         if size != ref.object_bytes or checksum != ref.checksum:
             raise PackIntegrityError("S3 object does not match its pack reference")
+        # NOTE: this checksum is object metadata written at upload time, not a
+        # digest S3 recomputed from stored bytes. It proves identity and size,
+        # not that the stored content is intact -- detecting silent corruption
+        # would take a server-side checksum or a read-back.
         return ObjectInfo(size=size, checksum=checksum)
 
     def inspect(self, object_key: str) -> PackRef:

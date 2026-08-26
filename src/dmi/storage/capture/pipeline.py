@@ -481,6 +481,14 @@ class HostCapturePipeline:
             self._counters["submitted_records"] += 1
         if error is not None:
             raise PipelineFailedError("capture pipeline failed") from error
+        if len(record.payload) > self._config.max_pack_bytes:
+            # Queue admission bounds max_queue_bytes, which is unrelated to
+            # max_pack_bytes. Without this, a payload no pack could ever hold is
+            # admitted here and only rejected on the persistence thread, where
+            # it reads as a fatal pipeline error.
+            with self._lock:
+                self._counters["oversized_records"] += 1
+            return AdmissionResult.TOO_LARGE
         started = self._clock_ns()
         result = self._queue.put(
             record,
@@ -546,9 +554,22 @@ class HostCapturePipeline:
                         self._assembler.flush_expired(now_ns=self._clock_ns())
                     )
                     continue
-                self._persist(
-                    self._assembler.append(record, now_ns=self._clock_ns())
-                )
+                try:
+                    packs = self._assembler.append(record, now_ns=self._clock_ns())
+                except OversizedRecordError:
+                    # Framing overhead can push a payload that cleared admission
+                    # past max_pack_bytes. PackAssembler is written to survive
+                    # this with its buffered pack intact, so drop the one record
+                    # and keep going rather than failing the pipeline.
+                    with self._lock:
+                        self._counters["oversized_records"] += 1
+                    self._emit(
+                        "record_oversized",
+                        capture_id=record.metadata.capture_id,
+                        bytes=len(record.payload),
+                    )
+                    continue
+                self._persist(packs)
         except BaseException as exc:
             with self._lock:
                 self._error = exc

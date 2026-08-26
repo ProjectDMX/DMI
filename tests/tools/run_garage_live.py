@@ -29,11 +29,23 @@ def _ports(count: int) -> list[int]:
             listener.close()
 
 
-def _wait_for_port(port: int, process: subprocess.Popen, timeout: float = 20) -> None:
+def _log_tail(log_path, limit: int = 2000) -> str:
+    try:
+        return log_path.read_text(errors="replace")[-limit:]
+    except OSError:
+        return "(no Garage log)"
+
+
+def _wait_for_port(
+    port: int, process: subprocess.Popen, log_path, timeout: float = 20
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError(f"Garage exited with status {process.returncode}")
+            raise RuntimeError(
+                f"Garage exited with status {process.returncode}\n"
+                f"{_log_tail(log_path)}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
@@ -109,16 +121,21 @@ metrics_token = "{secrets.token_urlsafe(32)}"
                 "PYTHONPATH": str(REPO_ROOT / "src"),
             }
         )
+        # Garage logs to stderr for the whole run. A PIPE nobody reads fills its
+        # buffer and blocks the server mid-benchmark, so send it to a file that
+        # has no such limit and can still be shown on failure.
+        log_path = Path(root) / "garage.log"
+        log_handle = log_path.open("w")
         process = subprocess.Popen(
             [binary, "server", "--single-node", "--default-bucket"],
             cwd=root,
             env=environment,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=log_handle,
             text=True,
         )
         try:
-            _wait_for_port(s3_port, process)
+            _wait_for_port(s3_port, process, log_path)
             command = (
                 [
                     sys.executable,
@@ -149,6 +166,7 @@ metrics_token = "{secrets.token_urlsafe(32)}"
             )
             return completed.returncode
         finally:
+            log_handle.close()
             process.terminate()
             try:
                 process.wait(timeout=5)

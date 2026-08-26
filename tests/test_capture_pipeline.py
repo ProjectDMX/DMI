@@ -368,3 +368,66 @@ def test_pipeline_flushes_an_idle_pack_at_its_linger_deadline(tmp_path: Path):
 
     assert snapshot.flush_linger == 1
     assert snapshot.flush_shutdown == 0
+
+
+def test_pipeline_rejects_a_capture_no_pack_could_hold(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path / "objects", store_id="local")
+    pipeline = HostCapturePipeline(
+        PipelineConfig(
+            max_queue_records=4,
+            # The queue would happily take it; max_pack_bytes is what it cannot
+            # satisfy, and the two bounds are unrelated.
+            max_queue_bytes=1 << 20,
+            max_pack_bytes=4096,
+            max_pack_records=4,
+            max_linger_ns=1_000_000_000,
+        ),
+        DirectPackSink(store),
+        pack_id_factory=_ids(),
+    )
+    pipeline.start()
+
+    oversized = CaptureRecord(
+        metadata=replace(_metadata("capture-big"), shape=(2048,)),
+        payload=b"\x00" * 8192,
+    )
+    assert pipeline.submit(oversized) is AdmissionResult.TOO_LARGE
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+    snapshot = pipeline.close(timeout=2)
+
+    # Rejected at admission, so the caller knows, and the pipeline lives.
+    assert snapshot.oversized_records == 1
+    assert snapshot.failures == 0
+    assert snapshot.persisted_records == 1
+
+
+def test_pipeline_survives_a_capture_only_framing_pushes_over(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path / "objects", store_id="local")
+    payload = b"\x00" * 4096
+    pipeline = HostCapturePipeline(
+        PipelineConfig(
+            max_queue_records=4,
+            max_queue_bytes=1 << 20,
+            # The payload itself fits, so admission passes; header, footer and
+            # trailer are what take it past the limit inside the assembler.
+            max_pack_bytes=len(payload) + 64,
+            max_pack_records=4,
+            max_linger_ns=1_000_000_000,
+        ),
+        DirectPackSink(store),
+        pack_id_factory=_ids(),
+    )
+    pipeline.start()
+
+    big = CaptureRecord(
+        metadata=replace(_metadata("capture-big"), shape=(1024,)), payload=payload
+    )
+    assert pipeline.submit(big) is AdmissionResult.ACCEPTED
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+    snapshot = pipeline.close(timeout=2)
+
+    # The one record is dropped and counted; the pipeline is not failed and the
+    # following capture still persists.
+    assert snapshot.oversized_records == 1
+    assert snapshot.failures == 0
+    assert snapshot.persisted_records == 1

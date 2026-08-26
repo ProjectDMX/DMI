@@ -58,7 +58,7 @@ def validate_pack_source(pack: PackSource) -> None:
         raise ValueError("pack source has an invalid checksum")
 
 
-def copy_pack_source(pack: PackSource, destination: BinaryIO) -> None:
+def _drain_pack_source(pack: PackSource, destination: BinaryIO | None) -> None:
     validate_pack_source(pack)
     digest = sha256()
     remaining = pack.object_bytes
@@ -68,13 +68,28 @@ def copy_pack_source(pack: PackSource, destination: BinaryIO) -> None:
             chunk = source.read(requested)
             if not isinstance(chunk, bytes) or not chunk or len(chunk) > requested:
                 raise PackIntegrityError("pack source returned an invalid byte stream")
-            destination.write(chunk)
+            if destination is not None:
+                destination.write(chunk)
             digest.update(chunk)
             remaining -= len(chunk)
         if source.read(1):
             raise PackIntegrityError("pack source exceeds its declared size")
     if digest.hexdigest() != pack.checksum:
         raise PackIntegrityError("pack source checksum does not match its metadata")
+
+
+def copy_pack_source(pack: PackSource, destination: BinaryIO) -> None:
+    _drain_pack_source(pack, destination)
+
+
+def verify_pack_source(pack: PackSource) -> None:
+    """Read a pack source end to end and check it against its own checksum.
+
+    Stores that hand the stream to someone else -- an S3 transfer manager, say --
+    never see the bytes, so without this they cannot tell a corrupt or
+    mis-declared source from a good one.
+    """
+    _drain_pack_source(pack, None)
 
 
 class FilesystemPackStore:

@@ -185,8 +185,6 @@ class CatalogIndexer:
             try:
                 pack_descriptors = PackIndex.from_store(self._store, ref).descriptors()
                 pack_bytes = sum(_estimated_bytes(item) for item in pack_descriptors)
-                if estimated_bytes + pack_bytes > self._config.max_estimated_bytes:
-                    raise ValueError("catalog batch exceeds max_estimated_bytes")
             except Exception as exc:
                 failures.append(
                     IndexFailure(
@@ -197,6 +195,16 @@ class CatalogIndexer:
                     )
                 )
                 continue
+            # A batch that is too large is a caller error, not a property of the
+            # pack being read. Reporting it as a per-pack failure would blame an
+            # innocent pack and, because the loop continues, silently skip every
+            # remaining pack while index() still returned normally.
+            if estimated_bytes + pack_bytes > self._config.max_estimated_bytes:
+                raise ValueError(
+                    "catalog batch exceeds max_estimated_bytes: "
+                    f"{estimated_bytes + pack_bytes} > "
+                    f"{self._config.max_estimated_bytes}"
+                )
             estimated_bytes += pack_bytes
             descriptors.extend(pack_descriptors)
             valid_refs.append(ref)
