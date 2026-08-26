@@ -45,7 +45,22 @@ from .pipeline import (
     ReadyPack,
     object_key_for,
 )
-from .reader import CaptureReader
+from .extensions import (
+    ArtifactProducer,
+    ArtifactSink,
+    ExtensionError,
+    ExtensionFailure,
+    ExtensionRegistry,
+    ScalarMetric,
+)
+from .reader import CaptureReader, CaptureSummary
+from .summary import (
+    CORE_SUMMARY_VERSION,
+    ArtifactRef,
+    CoreTensorSummaryV1,
+    decode_tensor,
+    summarize_tensor,
+)
 from .catalog import (
     CatalogIndexer,
     CatalogIndexerConfig,
@@ -78,6 +93,9 @@ from .spool import (
 )
 
 __all__ = [
+    "ArtifactProducer",
+    "ArtifactRef",
+    "ArtifactSink",
     "AdmissionResult",
     "BoundedRecordQueue",
     "CaptureCatalog",
@@ -88,6 +106,7 @@ __all__ = [
     "CaptureReader",
     "CaptureRecord",
     "CaptureSelection",
+    "CaptureSummary",
     "CaptureStorageError",
     "CatalogIndexer",
     "CatalogIndexerConfig",
@@ -99,10 +118,15 @@ __all__ = [
     "ClickHouseReaderConfig",
     "Cursor",
     "CursorKey",
+    "CoreTensorSummaryV1",
+    "CORE_SUMMARY_VERSION",
     "DuplicateCaptureError",
     "DirectPackSink",
     "DurablePackSink",
     "DurablePackSpool",
+    "ExtensionError",
+    "ExtensionFailure",
+    "ExtensionRegistry",
     "FilesystemPackStore",
     "FlushReason",
     "HistogramSnapshot",
@@ -140,6 +164,7 @@ __all__ = [
     "QueueSnapshot",
     "ReadyPack",
     "ReconcileResult",
+    "ScalarMetric",
     "S3PackStore",
     "S3StoreConfig",
     "SealedPack",
@@ -154,5 +179,7 @@ __all__ = [
     "UploadSnapshot",
     "decode_cursor",
     "encode_cursor",
+    "decode_tensor",
+    "summarize_tensor",
     "object_key_for",
 ]
