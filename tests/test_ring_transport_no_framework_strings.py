@@ -30,7 +30,7 @@ pytestmark = pytest.mark.cpu
 SOURCE_ROOT = Path(__file__).resolve().parent.parent / "src" / "dmi"
 CORE_MODULES = (
     SOURCE_ROOT / "hooks" / "specs.py",
-    SOURCE_ROOT / "hooks" / "dynamic.py",
+    SOURCE_ROOT / "hooks" / "record.py",
     SOURCE_ROOT / "hooks" / "producer_plan.py",
     SOURCE_ROOT / "records.py",
     SOURCE_ROOT / "transport" / "ring.py",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from dmi.hooks.dynamic import OutputStorage
+from dmi.hooks.record import OutputStorage
 from dmi.records import (
     PayloadSlice,
     RecordCellType,

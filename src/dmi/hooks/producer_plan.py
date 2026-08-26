@@ -7,7 +7,7 @@ from typing import Any, Sequence
 
 import torch
 
-from .dynamic import HookOutput, OutputStorage, RecordType, TransportSpec, TransportType
+from .record import HookOutput, OutputStorage, RecordType, TransportSpec, TransportType
 
 
 def _align_up(value: int, alignment: int = 16) -> int:

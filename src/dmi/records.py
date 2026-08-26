@@ -11,7 +11,7 @@ from typing import Any, Generic, Protocol, Sequence, TypeVar, runtime_checkable
 import torch
 
 from .adapters.base import StepReservation
-from .hooks.dynamic import (
+from .hooks.record import (
     HookOutput,
     HookPointV1,
     HookRuntime,

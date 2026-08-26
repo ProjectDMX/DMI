@@ -22,7 +22,7 @@ from ...config import CaptureSchedule, MonitoringConfig
 from ...engine import HostEngineConfig, MonitoringEngine, RingCapacities
 from ...hooks.dispatch import install_ring_hooks
 from ...hooks.point import HookPoint
-from ...hooks.dynamic import (
+from ...hooks.record import (
     HookOutput,
     HookPointV1,
     HookRuntime,

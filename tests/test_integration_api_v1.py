@@ -127,7 +127,7 @@ def test_v1_reexports_existing_objects_and_state() -> None:
     from dmi import engine
     from dmi.hooks import dispatch
     from dmi.hooks import point
-    from dmi.hooks import dynamic
+    from dmi.hooks import record
     from dmi.hooks import producer_plan
     from dmi.hooks import specs
     from dmi import records
@@ -147,14 +147,14 @@ def test_v1_reexports_existing_objects_and_state() -> None:
     assert v1.CaptureSchedule is config.CaptureSchedule
     assert v1.HostEngineConfig is engine.HostEngineConfig
     assert v1.HookPoint is point.HookPoint
-    assert v1.HookPointV1 is dynamic.HookPointV1
-    assert v1.HookSpecV1 is dynamic.HookSpecV1
-    assert v1.HookOutput is dynamic.HookOutput
-    assert v1.HookRuntime is dynamic.HookRuntime
-    assert v1.TransportSpec is dynamic.TransportSpec
-    assert v1.TransportType is dynamic.TransportType
-    assert v1.OutputStorage is dynamic.OutputStorage
-    assert v1.RecordType is dynamic.RecordType
+    assert v1.HookPointV1 is record.HookPointV1
+    assert v1.HookSpecV1 is record.HookSpecV1
+    assert v1.HookOutput is record.HookOutput
+    assert v1.HookRuntime is record.HookRuntime
+    assert v1.TransportSpec is record.TransportSpec
+    assert v1.TransportType is record.TransportType
+    assert v1.OutputStorage is record.OutputStorage
+    assert v1.RecordType is record.RecordType
     assert v1.ProducerPlanEntry is producer_plan.ProducerPlanEntry
     assert v1.ProducerPlan is producer_plan.ProducerPlan
     assert v1.ProducerPlanBuilder is producer_plan.ProducerPlanBuilder

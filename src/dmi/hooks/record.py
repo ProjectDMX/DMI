@@ -1,4 +1,4 @@
-"""Framework-neutral dynamic hooks for the opt-in record runtime.
+"""Framework-neutral hooks for the opt-in record runtime.
 
 The released :class:`dmi.hooks.point.HookPoint` path remains independent of
 this module.  ``HookPointV1`` is a side-effect-only tap: an integration owns
@@ -118,7 +118,7 @@ class TransportSpec:
 
 @dataclass(frozen=True, slots=True)
 class HookSpecV1:
-    """Declarative definition of one dynamic hook and its ordered outputs."""
+    """Declarative definition of one record hook and its ordered outputs."""
 
     name: str
     outputs: tuple[TransportSpec, ...]

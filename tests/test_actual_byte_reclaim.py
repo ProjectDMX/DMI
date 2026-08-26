@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from dmi.hooks.dynamic import HookOutput, TransportSpec, TransportType
+from dmi.hooks.record import HookOutput, TransportSpec, TransportType
 from dmi.hooks.producer_plan import ProducerPlanBuilder
 from dmi.transport.ring import RingTransport
 

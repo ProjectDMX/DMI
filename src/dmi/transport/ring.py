@@ -415,7 +415,7 @@ class RingTransport:
     def _record_cpu_tensor(output: Any, entry: Any) -> torch.Tensor:
         """Apply the selected producer transformation for CPU-direct fallback."""
 
-        from ..hooks.dynamic import TransportType
+        from ..hooks.record import TransportType
 
         source = output.tensor.detach().cpu().contiguous()
         transport_type = entry.transport_type

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from dmi.adapters.base import StepReservation
-from dmi.hooks.dynamic import (
+from dmi.hooks.record import (
     HookOutput,
     HookPointV1,
     HookSpecV1,
