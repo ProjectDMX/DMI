@@ -636,7 +636,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("reserve_record",
            &ring_py::RingEnginePy::reserve_record,
-           py::arg("reservation_bytes"), py::arg("num_tasks"),
+           py::arg("reservation_items"),
            py::call_guard<py::gil_scoped_release>())
       .def("push_record_descriptors",
            [](ring_py::RingEnginePy& self, py::sequence descriptors,

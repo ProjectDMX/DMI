@@ -31,6 +31,11 @@
 
 namespace ring {
 
+struct RecordReservationItem {
+    uint64_t reserved_payload_bytes{0};
+    bool needs_reclaim{false};
+};
+
 class DrainThread {
 public:
     DrainThread(RingState& rs, PinnedStaging& staging, const RingConfig& cfg);
@@ -80,12 +85,10 @@ public:
     // Called from prepare_step after confirming space is available.
     void reserve(uint64_t payload_bytes, uint32_t num_tasks);
 
-    // Record-mode reservation.  Unlike the released exact-size reservation,
-    // payload_bytes is a conservative upper bound.  Reclamation occurs only
-    // after ready TaskEntries prove completion of every task in this group.
-    void reserve_record(uint64_t payload_bytes, uint32_t num_tasks);
-    uint64_t pending_record_reservations() const;
-    uint64_t reclaimed_record_bytes() const;
+    // Record-mode reservation preserves each possibly-short task's upper bound.
+    void reserve_record(const std::vector<RecordReservationItem>& items);
+    void apply_pending_record_reclaims();
+    uint64_t pending_record_reclaims() const;
     void rethrow_record_reclaim_failure() const;
     void rethrow_drain_failure();
 
@@ -116,15 +119,12 @@ private:
     uint64_t                cpu_payload_tail_{0};           // pending
     uint64_t                cpu_payload_tail_committed_{0}; // safe after D2H
 
-    struct RecordReservation {
-        uint64_t first_task_sequence{0};
+    struct PendingTaskReclaim {
+        uint64_t task_sequence{0};
         uint64_t reserved_payload_bytes{0};
-        uint64_t actual_aligned_bytes{0};
-        uint32_t task_count{0};
-        uint32_t completed_tasks{0};
     };
-    std::deque<RecordReservation> record_reservations_;
-    uint64_t                reclaimed_record_bytes_{0};
+    std::deque<PendingTaskReclaim> pending_task_reclaims_;
+    uint64_t                pending_reclaim_bytes_{0};
     std::exception_ptr      record_reclaim_failure_;
 
     std::chrono::steady_clock::time_point first_complete_time_{};

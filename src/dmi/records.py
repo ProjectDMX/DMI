@@ -4,13 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from math import prod
 import re
 from typing import Any, Generic, Protocol, Sequence, TypeVar, runtime_checkable
 
 import torch
 
 from .adapters.base import StepReservation
-from .hooks.dynamic import HookOutput, HookPointV1, HookRuntime, OutputStorage
+from .hooks.dynamic import (
+    HookOutput,
+    HookPointV1,
+    HookRuntime,
+    OutputStorage,
+    TransportType,
+)
 from .hooks.producer_plan import ProducerPlan, ProducerPlanEntry
 
 
@@ -240,6 +247,7 @@ class RecordRuntime(Generic[MetadataT]):
         self._output_specs_by_name: dict[str, Any] = {}
         self._bound_output_ids: set[int] = set()
         self._bound_hooks: set[int] = set()
+        self._device_gated_output_ids: set[int] = set()
 
     def bind_hook(
         self,
@@ -291,6 +299,8 @@ class RecordRuntime(Generic[MetadataT]):
                 self._output_name_to_id[output.name] = new_ids[output.name]
                 self._output_specs_by_name[output.name] = output
         self._bound_output_ids.update(output_ids)
+        if gate_tensor is not None:
+            self._device_gated_output_ids.update(output_ids)
         self._bound_hooks.add(id(hook))
 
     def emit_output(
@@ -309,10 +319,7 @@ class RecordRuntime(Generic[MetadataT]):
         self._validate_entry_output(entry, output)
         descriptor = self._encode(metadata, entry)
         reservation = StepReservation(
-            self._transport.reserve_record(
-                entry.aligned_reservation_bytes,
-                entry.task_count,
-            )
+            self._transport.reserve_record(self._reservation_items((entry,)))
         )
         self._transport.push_record_descriptors((descriptor,))
         if reservation is StepReservation.OVERSIZED:
@@ -341,14 +348,32 @@ class RecordRuntime(Generic[MetadataT]):
             for item, entry in zip(metadata_items, plan.entries)
         )
         reservation = StepReservation(
-            self._transport.reserve_record(
-                plan.total_reservation_bytes,
-                plan.task_count,
-            )
+            self._transport.reserve_record(self._reservation_items(plan.entries))
         )
         if reservation is not StepReservation.OVERSIZED:
             self._transport.push_record_descriptors(descriptors)
         return reservation
+
+    def _reservation_items(
+        self,
+        entries: Sequence[ProducerPlanEntry],
+    ) -> tuple[tuple[int, bool], ...]:
+        return tuple(
+            (entry.aligned_reservation_bytes, self._needs_reclaim(entry))
+            for entry in entries
+        )
+
+    def _needs_reclaim(self, entry: ProducerPlanEntry) -> bool:
+        tensor_bytes = (
+            prod(entry.input_shape)
+            * torch.empty((), dtype=entry.dtype).element_size()
+        )
+        tensor_aligned_bytes = (tensor_bytes + 15) & ~15
+        return not (
+            entry.transport_type is TransportType.IDENTITY
+            and entry.output_id not in self._device_gated_output_ids
+            and entry.aligned_reservation_bytes == tensor_aligned_bytes
+        )
 
     def _encode(
         self,

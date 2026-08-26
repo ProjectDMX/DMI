@@ -383,10 +383,10 @@ class RingTransport:
             raise RuntimeError("record schema is already configured")
         self._record_schema = schema
 
-    def reserve_record(self, upper_bytes: int, task_count: int) -> int:
-        """Reserve one encoded-record producer group."""
+    def reserve_record(self, reservation_items: Any) -> int:
+        """Reserve ordered encoded-record producer entries."""
 
-        return int(self._ring_engine.reserve_record(upper_bytes, task_count))
+        return int(self._ring_engine.reserve_record(tuple(reservation_items)))
 
     def push_record_descriptors(self, descriptors: Any) -> None:
         """Publish descriptors in the exact order of their producer tasks."""

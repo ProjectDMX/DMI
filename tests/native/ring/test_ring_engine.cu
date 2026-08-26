@@ -251,8 +251,8 @@ static void test_zero_byte_delivery() {
     harness.release(task);
 }
 
-static void test_record_reservation_reclaims_after_group_completion() {
-    banner("record reservation reclaims only after every grouped task is ready");
+static void test_record_reservation_reclaims_per_entry() {
+    banner("record reservation reclaims each possibly-short task independently");
     DrainHarness harness(make_config());
 
     constexpr uint64_t row_bytes = 32;
@@ -266,10 +266,15 @@ static void test_record_reservation_reclaims_after_group_completion() {
     CUDA_CHECK(cudaMemcpyAsync(device_count, &row_count, sizeof(row_count),
                                cudaMemcpyHostToDevice, harness.stream));
 
-    const uint64_t upper =
-        ring::align_up(dynamic_source.size(), ring::PAYLOAD_ALIGN) +
+    const uint64_t dynamic_upper =
+        ring::align_up(dynamic_source.size(), ring::PAYLOAD_ALIGN);
+    const uint64_t fixed_bytes =
         ring::align_up(fixed_source.size(), ring::PAYLOAD_ALIGN);
-    harness.drain->reserve_record(upper, 2);
+    const uint64_t upper = dynamic_upper + fixed_bytes;
+    harness.drain->reserve_record({
+        {dynamic_upper, true},
+        {fixed_bytes, false},
+    });
 
     ring::launch_record_producer_prefix(
         harness.allocated.state(), dynamic_device, dynamic_source.size(),
@@ -277,22 +282,21 @@ static void test_record_reservation_reclaims_after_group_completion() {
     ring::DrainTask first = harness.flush_one();
     EXPECT(first.tensor_total_bytes == row_bytes);
     EXPECT(harness.drain->cpu_payload_head() == upper);
-    EXPECT(harness.drain->pending_record_reservations() == 1);
-    EXPECT(harness.drain->reclaimed_record_bytes() == 0);
+    EXPECT(harness.drain->pending_record_reclaims() == 0);
+    harness.drain->apply_pending_record_reclaims();
+    const uint64_t actual_aligned =
+        ring::align_up(row_bytes, ring::PAYLOAD_ALIGN) + fixed_bytes;
+    EXPECT(harness.drain->cpu_payload_head() == actual_aligned);
     harness.release(first);
 
     ring::launch_record_producer_static(
         harness.allocated.state(), fixed_device, fixed_source.size(),
         nullptr, 0, harness.stream);
     ring::DrainTask second = harness.flush_one();
-    const uint64_t actual_aligned =
-        ring::align_up(row_bytes, ring::PAYLOAD_ALIGN) +
-        ring::align_up(fixed_source.size(), ring::PAYLOAD_ALIGN);
     EXPECT(second.tensor_total_bytes == fixed_source.size());
-    EXPECT(harness.drain->pending_record_reservations() == 0);
+    EXPECT(harness.drain->pending_record_reclaims() == 0);
     EXPECT(harness.drain->cpu_payload_head() == actual_aligned);
     EXPECT(harness.drain->cpu_payload_tail_committed() == actual_aligned);
-    EXPECT(harness.drain->reclaimed_record_bytes() == upper - actual_aligned);
     harness.drain->rethrow_record_reclaim_failure();
     harness.release(second);
 
@@ -315,7 +319,7 @@ static void test_false_gated_record_reclaims_its_full_reservation() {
 
     const uint64_t reserved =
         ring::align_up(source.size(), ring::PAYLOAD_ALIGN);
-    harness.drain->reserve_record(reserved, 1);
+    harness.drain->reserve_record({{reserved, true}});
     ring::launch_record_producer_static(
         harness.allocated.state(), device, source.size(), gate, 1,
         harness.stream);
@@ -323,10 +327,11 @@ static void test_false_gated_record_reclaims_its_full_reservation() {
 
     EXPECT(task.tensor_total_bytes == 0);
     EXPECT(task.alloc_bytes == 0);
-    EXPECT(harness.drain->pending_record_reservations() == 0);
+    EXPECT(harness.drain->pending_record_reclaims() == 0);
+    EXPECT(harness.drain->cpu_payload_head() == reserved);
+    harness.drain->apply_pending_record_reclaims();
     EXPECT(harness.drain->cpu_payload_head() == 0);
     EXPECT(harness.drain->cpu_payload_tail_committed() == 0);
-    EXPECT(harness.drain->reclaimed_record_bytes() == reserved);
     harness.drain->rethrow_record_reclaim_failure();
     harness.release(task);
 
@@ -548,7 +553,7 @@ int main() {
     test_prefix_force_flush();
     test_repeated_wrap_delivery();
     test_zero_byte_delivery();
-    test_record_reservation_reclaims_after_group_completion();
+    test_record_reservation_reclaims_per_entry();
     test_false_gated_record_reclaims_its_full_reservation();
     test_timed_drain_flush_uses_request_generations();
     test_drain_worker_binds_owner_device();

@@ -246,37 +246,43 @@ void DrainThread::reserve(uint64_t payload_bytes, uint32_t num_tasks) {
     cpu_task_head_    += num_tasks;
 }
 
-void DrainThread::reserve_record(uint64_t payload_bytes, uint32_t num_tasks) {
-    if (payload_bytes % PAYLOAD_ALIGN != 0) {
-        throw std::invalid_argument(
-            "DrainThread::reserve_record payload bytes must be aligned");
-    }
-    if (num_tasks == 0) {
-        if (payload_bytes != 0) {
+void DrainThread::reserve_record(
+    const std::vector<RecordReservationItem>& items) {
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
+    uint64_t payload_bytes = 0;
+    for (uint64_t index = 0; index < items.size(); ++index) {
+        const auto& item = items[index];
+        if (item.reserved_payload_bytes % PAYLOAD_ALIGN != 0) {
             throw std::invalid_argument(
-                "DrainThread::reserve_record cannot reserve payload without tasks");
+                "DrainThread::reserve_record payload bytes must be aligned");
         }
-        return;
+        if (payload_bytes > std::numeric_limits<uint64_t>::max() -
+                                item.reserved_payload_bytes) {
+            throw std::overflow_error(
+                "DrainThread::reserve_record payload byte total overflow");
+        }
+        payload_bytes += item.reserved_payload_bytes;
+        if (item.needs_reclaim) {
+            pending_task_reclaims_.push_back(
+                {cpu_task_head_ + index, item.reserved_payload_bytes});
+        }
     }
-
-    std::lock_guard<std::mutex> lk(mgmt_mu_);
-    RecordReservation reservation{};
-    reservation.first_task_sequence = cpu_task_head_;
-    reservation.reserved_payload_bytes = payload_bytes;
-    reservation.task_count = num_tasks;
-    record_reservations_.push_back(reservation);
     cpu_payload_head_ += payload_bytes;
-    cpu_task_head_ += num_tasks;
+    cpu_task_head_ += items.size();
 }
 
-uint64_t DrainThread::pending_record_reservations() const {
+void DrainThread::apply_pending_record_reclaims() {
     std::lock_guard<std::mutex> lk(mgmt_mu_);
-    return record_reservations_.size();
+    if (pending_reclaim_bytes_ > cpu_payload_head_) {
+        throw std::logic_error("record reclaim exceeds CPU payload head");
+    }
+    cpu_payload_head_ -= pending_reclaim_bytes_;
+    pending_reclaim_bytes_ = 0;
 }
 
-uint64_t DrainThread::reclaimed_record_bytes() const {
+uint64_t DrainThread::pending_record_reclaims() const {
     std::lock_guard<std::mutex> lk(mgmt_mu_);
-    return reclaimed_record_bytes_;
+    return pending_task_reclaims_.size();
 }
 
 void DrainThread::rethrow_record_reclaim_failure() const {
@@ -512,49 +518,33 @@ void DrainThread::scan_ready() {
 
 void DrainThread::account_record_task(uint64_t sequence,
                                       const TaskEntry& entry) {
-    if (record_reservations_.empty() || record_reclaim_failure_) return;
+    if (pending_task_reclaims_.empty() || record_reclaim_failure_) return;
 
-    RecordReservation& reservation = record_reservations_.front();
-    const uint64_t expected = reservation.first_task_sequence +
-        reservation.completed_tasks;
-
-    // A legacy task can precede the first record reservation.  Record-mode
-    // task ranges themselves are contiguous because reserve_record advances
-    // the task head once for the complete group.
-    if (sequence < reservation.first_task_sequence) return;
-    if (sequence != expected) {
+    const PendingTaskReclaim& pending = pending_task_reclaims_.front();
+    if (sequence < pending.task_sequence) return;
+    if (sequence != pending.task_sequence) {
         record_reclaim_failure_ = std::make_exception_ptr(std::runtime_error(
-            "record reservation task sequence does not match ready TaskEntry"));
+            "record reclaim task sequence does not match ready TaskEntry"));
         return;
     }
 
     const uint64_t actual = align_up(entry.tensor_total_bytes, PAYLOAD_ALIGN);
-    if (reservation.actual_aligned_bytes >
-        std::numeric_limits<uint64_t>::max() - actual) {
-        record_reclaim_failure_ = std::make_exception_ptr(std::runtime_error(
-            "record reservation actual byte accounting overflow"));
-        return;
-    }
-    reservation.actual_aligned_bytes += actual;
-    ++reservation.completed_tasks;
-
-    if (reservation.completed_tasks != reservation.task_count) return;
-
-    if (reservation.actual_aligned_bytes <=
-        reservation.reserved_payload_bytes) {
-        const uint64_t unused = reservation.reserved_payload_bytes -
-            reservation.actual_aligned_bytes;
-        cpu_payload_head_ -= unused;
-        reclaimed_record_bytes_ += unused;
-    } else {
-        // Preserve CPU/GPU logical-head agreement before surfacing the
-        // violated upper-bound invariant through checked completion.
-        cpu_payload_head_ += reservation.actual_aligned_bytes -
-            reservation.reserved_payload_bytes;
+    if (actual > pending.reserved_payload_bytes) {
         record_reclaim_failure_ = std::make_exception_ptr(std::runtime_error(
             "record producer exceeded its conservative payload reservation"));
+        pending_task_reclaims_.pop_front();
+        return;
     }
-    record_reservations_.pop_front();
+    const uint64_t unused = pending.reserved_payload_bytes - actual;
+    if (pending_reclaim_bytes_ >
+        std::numeric_limits<uint64_t>::max() - unused) {
+        record_reclaim_failure_ = std::make_exception_ptr(std::runtime_error(
+            "record reclaim byte accounting overflow"));
+        pending_task_reclaims_.pop_front();
+        return;
+    }
+    pending_reclaim_bytes_ += unused;
+    pending_task_reclaims_.pop_front();
 }
 
 // ---------------------------------------------------------------------------

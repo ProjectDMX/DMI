@@ -33,18 +33,19 @@ def test_dynamic_plan_reserves_upper_bound_not_current_device_count():
     assert entry.task_count == 1
 
 
-def test_record_transport_delegates_one_upper_bound_reservation_group():
+def test_record_transport_delegates_ordered_per_entry_reservations():
     calls = []
 
     class _Ring:
         def payload_tensor(self):
             return torch.empty(0, dtype=torch.uint8)
 
-        def reserve_record(self, nbytes, tasks):
-            calls.append((nbytes, tasks))
+        def reserve_record(self, items):
+            calls.append(items)
             return 0
 
     transport = RingTransport(_Ring())
 
-    assert transport.reserve_record(256, 1) == 0
-    assert calls == [(256, 1)]
+    items = ((64, False), (256, True))
+    assert transport.reserve_record(items) == 0
+    assert calls == [items]

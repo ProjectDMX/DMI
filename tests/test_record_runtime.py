@@ -6,7 +6,13 @@ import pytest
 import torch
 
 from dmi.adapters.base import StepReservation
-from dmi.hooks.dynamic import HookOutput, HookPointV1, HookSpecV1, TransportSpec
+from dmi.hooks.dynamic import (
+    HookOutput,
+    HookPointV1,
+    HookSpecV1,
+    TransportSpec,
+    TransportType,
+)
 from dmi.hooks.producer_plan import ProducerPlan, ProducerPlanBuilder
 from dmi.records import (
     PayloadSlice,
@@ -33,8 +39,8 @@ class _Transport:
     def configure_record_schema(self, schema):
         self.schema = schema
 
-    def reserve_record(self, nbytes, tasks):
-        self.events.append(("reserve", nbytes, tasks))
+    def reserve_record(self, items):
+        self.events.append(("reserve", tuple(items)))
         return int(self.result)
 
     def push_record_descriptors(self, descriptors):
@@ -136,7 +142,7 @@ def test_eager_descriptor_is_published_after_reservation_before_producer():
     result = runtime.emit_output(entry, "batch-7", output)
 
     assert result is StepReservation.RESERVED
-    assert transport.events[0] == ("reserve", 16, 1)
+    assert transport.events[0] == ("reserve", ((16, False),))
     assert transport.events[1][0] == "descriptors"
     assert len(transport.events) == 2
 
@@ -161,7 +167,7 @@ def test_replay_encodes_complete_batch_before_descriptor_publication():
     result = runtime.prepare_replay(ProducerPlan((entry,)), ("fresh",))
 
     assert result is StepReservation.RESERVED
-    assert transport.events[0] == ("reserve", 16, 1)
+    assert transport.events[0] == ("reserve", ((16, False),))
     descriptor = transport.events[1][1][0]
     assert descriptor.rows[0][0] == "fresh"
 
@@ -177,7 +183,10 @@ def test_replay_publishes_one_empty_descriptor_per_producer_occurrence():
     )
 
     assert result is StepReservation.RESERVED
-    assert transport.events[0] == ("reserve", 32, 2)
+    assert transport.events[0] == (
+        "reserve",
+        ((16, False), (16, False)),
+    )
     descriptors = transport.events[1][1]
     assert len(descriptors) == 2
     assert all(descriptor.rows == () for descriptor in descriptors)
@@ -192,6 +201,32 @@ def test_nonempty_producer_descriptor_requires_payload_slice():
         runtime.emit_output(entry, "batch-7", output)
 
     assert transport.events == []
+
+
+def test_dynamic_producer_is_individually_marked_for_reclaim():
+    transport = _Transport()
+    runtime = RecordRuntime(transport, _Format())
+    spec = TransportSpec(
+        "out",
+        transport_type=TransportType.CHUNKED,
+        reservation_upper_bytes=64,
+        output_shape=(-1,),
+    )
+    hook = HookPointV1(HookSpecV1("hook", (spec,)))
+    runtime.bind_hook(hook, hook_runtime=_HookRuntime())
+    output = HookOutput(
+        torch.arange(4, dtype=torch.float32),
+        (torch.tensor(16, dtype=torch.int64),),
+    )
+    entry = ProducerPlanBuilder().record_output(
+        output_id=hook._output_ids[0],
+        output_spec=spec,
+        output=output,
+    )
+
+    runtime.emit_output(entry, "dynamic", output)
+
+    assert transport.events[0] == ("reserve", ((64, True),))
 
 
 def test_two_independent_formats_do_not_share_schema_or_output_registry():

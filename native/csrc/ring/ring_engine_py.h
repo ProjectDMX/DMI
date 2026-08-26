@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "ring/tensor_meta.h"   // TensorMeta, TensorMetaFifo
@@ -164,9 +165,9 @@ public:
 
     int prepare_step(uint64_t step_total_bytes, uint32_t num_hooks);
 
-    // Record-mode reservation uses conservative aligned upper bounds and is
-    // reconciled from ready TaskEntry byte counts by the drain thread.
-    int reserve_record(uint64_t reservation_bytes, uint32_t num_tasks);
+    // Each item is (aligned upper bound, needs actual-byte reconciliation).
+    int reserve_record(
+        const std::vector<std::pair<uint64_t, bool>>& reservation_items);
 
     void push_record_descriptors(std::vector<ring::RecordDescriptor> descriptors);
     void submit_record_cpu_direct(at::Tensor cpu_tensor,

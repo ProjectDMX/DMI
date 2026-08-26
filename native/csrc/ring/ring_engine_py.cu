@@ -13,6 +13,7 @@
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -434,22 +435,28 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     return STEP_RING_FLUSHED;
 }
 
-int RingEnginePy::reserve_record(uint64_t reservation_bytes,
-                                 uint32_t num_tasks) {
+int RingEnginePy::reserve_record(
+    const std::vector<std::pair<uint64_t, bool>>& reservation_items) {
     if (!impl_->record_mode) {
         throw std::logic_error("record reservation requires a record ring");
     }
-    if (reservation_bytes % ring::PAYLOAD_ALIGN != 0) {
-        throw std::invalid_argument(
-            "record reservation bytes must be PAYLOAD_ALIGN-aligned");
-    }
-    if (num_tasks == 0) {
-        if (reservation_bytes != 0) {
+    uint64_t reservation_bytes = 0;
+    std::vector<ring::RecordReservationItem> items;
+    items.reserve(reservation_items.size());
+    for (const auto& item : reservation_items) {
+        if (item.first % ring::PAYLOAD_ALIGN != 0) {
             throw std::invalid_argument(
-                "record reservation cannot contain bytes without tasks");
+                "record reservation bytes must be PAYLOAD_ALIGN-aligned");
         }
-        return STEP_RING_OK;
+        if (reservation_bytes >
+            std::numeric_limits<uint64_t>::max() - item.first) {
+            throw std::overflow_error("record reservation byte total overflow");
+        }
+        reservation_bytes += item.first;
+        items.push_back({item.first, item.second});
     }
+    if (items.empty()) return STEP_RING_OK;
+    const uint64_t num_tasks = items.size();
 
     const uint64_t payload_cap = impl_->engine.payload_cap();
     const uint64_t staging_cap = impl_->engine.staging_cap();
@@ -458,6 +465,7 @@ int RingEnginePy::reserve_record(uint64_t reservation_bytes,
     auto& drain = impl_->engine.drain_thread();
     drain.rethrow_drain_failure();
     drain.rethrow_record_reclaim_failure();
+    drain.apply_pending_record_reclaims();
 
     if (reservation_bytes > effective_cap || num_tasks > task_cap) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -465,9 +473,10 @@ int RingEnginePy::reserve_record(uint64_t reservation_bytes,
         drain.force_flush_and_wait();
         drain.rethrow_drain_failure();
         drain.rethrow_record_reclaim_failure();
-        if (drain.pending_record_reservations() != 0) {
+        drain.apply_pending_record_reclaims();
+        if (drain.pending_record_reclaims() != 0) {
             throw std::runtime_error(
-                "record flush found incomplete producer reservations");
+                "record flush found incomplete producer reclaims");
         }
         return STEP_OVERSIZED;
     }
@@ -478,7 +487,7 @@ int RingEnginePy::reserve_record(uint64_t reservation_bytes,
         drain.cpu_task_head() - drain.cpu_task_tail_committed();
     if (reservation_bytes <= payload_cap - payload_used &&
         num_tasks <= task_cap - task_used) {
-        drain.reserve_record(reservation_bytes, num_tasks);
+        drain.reserve_record(items);
         return STEP_RING_OK;
     }
 
@@ -487,11 +496,12 @@ int RingEnginePy::reserve_record(uint64_t reservation_bytes,
     drain.force_flush_and_wait();
     drain.rethrow_drain_failure();
     drain.rethrow_record_reclaim_failure();
-    if (drain.pending_record_reservations() != 0) {
+    drain.apply_pending_record_reclaims();
+    if (drain.pending_record_reclaims() != 0) {
         throw std::runtime_error(
-            "record flush found incomplete producer reservations");
+            "record flush found incomplete producer reclaims");
     }
-    drain.reserve_record(reservation_bytes, num_tasks);
+    drain.reserve_record(items);
     return STEP_RING_FLUSHED;
 }
 
@@ -528,9 +538,10 @@ bool RingEnginePy::flush_records_and_wait(uint64_t timeout_ms) {
     if (!drain.force_flush_and_wait_until(deadline)) return false;
     drain.rethrow_record_reclaim_failure();
 
-    if (drain.pending_record_reservations() != 0) {
+    drain.apply_pending_record_reclaims();
+    if (drain.pending_record_reclaims() != 0) {
         throw std::runtime_error(
-            "record flush found incomplete producer reservations");
+            "record flush found incomplete producer reclaims");
     }
 
     const auto now = FlushClock::now();
