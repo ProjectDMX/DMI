@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Mapping, Sequence
 
 from .model import (
@@ -17,7 +18,24 @@ from .model import (
     PackIntegrityError,
     PackStore,
 )
+from .extensions import (
+    ArtifactSink,
+    ExtensionFailure,
+    ExtensionRegistry,
+)
 from .pack import verify_payload
+from .summary import ArtifactRef, CoreTensorSummaryV1, decode_tensor, summarize_tensor
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureSummary:
+    """A versioned core summary plus whatever extensions contributed."""
+
+    capture_id: str
+    core: CoreTensorSummaryV1
+    scalars: Mapping[str, float]
+    artifacts: tuple[ArtifactRef, ...]
+    failures: tuple[ExtensionFailure, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +152,68 @@ class CaptureReader:
             for descriptor, payload in zip(descriptors, payloads)
             if payload is not None
         )
+
+    def summarize(
+        self,
+        selection: CaptureSelection,
+        *,
+        byte_limit: int,
+        request_limit: int = 1024,
+        registry: ExtensionRegistry | None = None,
+        artifact_sink: ArtifactSink | None = None,
+        max_summary_captures: int = 1000,
+        max_summary_elements: int = 64_000_000,
+    ) -> tuple[CaptureSummary, ...]:
+        """Summarise a selection from payloads fetched under the same limits.
+
+        Hydration is the only thing that reads bytes, so summarising cannot
+        widen the read set: whatever the byte and request limits allowed is
+        exactly what gets decoded.
+        """
+        if max_summary_captures <= 0:
+            raise ValueError("max_summary_captures must be positive")
+        if max_summary_elements <= 0:
+            raise ValueError("max_summary_elements must be positive")
+        if len(selection.capture_ids) > max_summary_captures:
+            raise HydrationLimitError(
+                f"summary capture limit exceeded: "
+                f"{len(selection.capture_ids)} > {max_summary_captures}"
+            )
+
+        hydrated = self.hydrate(
+            selection, byte_limit=byte_limit, request_limit=request_limit
+        )
+        total_elements = sum(
+            math.prod(item.descriptor.metadata.shape) for item in hydrated
+        )
+        if total_elements > max_summary_elements:
+            raise HydrationLimitError(
+                f"summary element limit exceeded: "
+                f"{total_elements} > {max_summary_elements}"
+            )
+
+        summaries: list[CaptureSummary] = []
+        for item in hydrated:
+            core = summarize_tensor(item.descriptor, item.payload)
+            scalars: dict[str, float] = {}
+            artifacts: tuple[ArtifactRef, ...] = ()
+            failures: tuple[ExtensionFailure, ...] = ()
+            if registry is not None:
+                scalars, artifacts, failures = registry.evaluate(
+                    decode_tensor(item.descriptor, item.payload),
+                    capture_id=item.capture_id,
+                    sink=artifact_sink,
+                )
+            summaries.append(
+                CaptureSummary(
+                    capture_id=item.capture_id,
+                    core=core,
+                    scalars=dict(scalars),
+                    artifacts=artifacts,
+                    failures=failures,
+                )
+            )
+        return tuple(summaries)
 
     def _resolve(self, selection: CaptureSelection) -> tuple[CaptureDescriptor, ...]:
         resolved = self._catalog.get_by_ids(
