@@ -1,0 +1,176 @@
+"""Live snapshot and pagination tests for the ClickHouse catalog reader.
+
+Run against a reachable ClickHouse:
+
+    DMI_CLICKHOUSE_HOST=127.0.0.1 python -m pytest tests/test_clickhouse_reader_live.py \
+        -m "manual and clickhouse" -q
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import replace
+from os import environ
+from uuid import uuid4
+
+import pytest
+
+from benchmarks.bench_capture_catalog import synthetic_descriptors
+from dmi.storage.capture import (
+    CaptureQuery,
+    ClickHouseCaptureCatalog,
+    ClickHouseCatalogConfig,
+    ClickHouseCatalogWriter,
+    ClickHouseReaderConfig,
+)
+
+
+pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
+
+
+@contextmanager
+def _catalog():
+    clickhouse_driver = pytest.importorskip("clickhouse_driver")
+    client = clickhouse_driver.Client(
+        host=environ.get("DMI_CLICKHOUSE_HOST", "127.0.0.1"),
+        port=int(environ.get("DMI_CLICKHOUSE_PORT", "9000")),
+    )
+    prefix = f"dmi_reader_test_{uuid4().hex}"
+    config = ClickHouseCatalogConfig(
+        database=environ.get("DMI_CLICKHOUSE_DATABASE", "default"),
+        table_prefix=prefix,
+    )
+    writer = ClickHouseCatalogWriter(client, config)
+    reader = ClickHouseCaptureCatalog(
+        client, ClickHouseReaderConfig.from_catalog(config)
+    )
+    created = False
+    try:
+        writer.ensure_schema()
+        created = True
+        yield writer, reader
+    finally:
+        if created:
+            database = config.database
+            for kind, suffix in (
+                ("VIEW", "capture"),
+                ("VIEW", "pack_inventory"),
+                ("TABLE", "capture_raw"),
+                ("TABLE", "pack_inventory_raw"),
+            ):
+                client.execute(
+                    f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`"
+                )
+
+
+def _walk(reader, query: CaptureQuery):
+    """Page through a query, returning every descriptor and the page count."""
+    items, pages, cursor = [], 0, query.cursor
+    while True:
+        page = reader.search(replace(query, cursor=cursor))
+        items.extend(page.items)
+        pages += 1
+        cursor = page.next_cursor
+        if cursor is None:
+            return tuple(items), pages, page.watermark
+        assert pages < 1000, "pagination failed to terminate"
+
+
+def test_a_full_walk_returns_the_corpus_exactly():
+    corpus = synthetic_descriptors(250)
+    with _catalog() as (writer, reader):
+        writer.write_descriptors(corpus, index_version=1)
+
+        walked, pages, _ = _walk(reader, CaptureQuery(limit=40))
+
+        assert pages == 7
+        assert walked == corpus
+        assert len({item.capture_id for item in walked}) == len(corpus)
+
+
+def test_watermark_isolates_rows_indexed_after_the_first_page():
+    corpus = synthetic_descriptors(100)
+    later = tuple(
+        replace(item, metadata=replace(item.metadata, capture_id=f"late-{index}"))
+        for index, item in enumerate(synthetic_descriptors(50))
+    )
+    with _catalog() as (writer, reader):
+        writer.write_descriptors(corpus, index_version=1)
+
+        first = reader.search(CaptureQuery(limit=40))
+        writer.write_descriptors(later, index_version=2)
+
+        rest, _, _ = _walk(reader, CaptureQuery(limit=40, cursor=first.next_cursor))
+
+        walked = first.items + rest
+        assert walked == corpus
+        assert not any(item.capture_id.startswith("late-") for item in walked)
+
+
+def test_snapshot_returns_the_version_at_the_watermark_not_the_latest():
+    """The case plain ``FINAL`` gets wrong.
+
+    ``FINAL`` collapses to the highest version present and only then applies
+    the predicate, so a capture re-indexed above the watermark disappears
+    instead of falling back. ``argMax`` returns its value as of the watermark.
+    """
+    original = synthetic_descriptors(1)
+    revised = tuple(
+        replace(item, locator=replace(item.locator, offset=999_999))
+        for item in original
+    )
+    with _catalog() as (writer, reader):
+        writer.write_descriptors(original, index_version=1)
+        writer.write_descriptors(revised, index_version=2)
+
+        at_first = reader.search(CaptureQuery(limit=10))
+        assert at_first.watermark == "2"
+        assert at_first.items[0].locator.offset == 999_999
+
+        pinned = reader.get_by_ids(
+            [original[0].capture_id], watermark="1"
+        )
+        assert len(pinned) == 1
+        assert pinned[0].locator.offset == original[0].locator.offset
+
+
+def test_replayed_indexing_yields_one_logical_row():
+    corpus = synthetic_descriptors(10)
+    with _catalog() as (writer, reader):
+        for version in (1, 2, 3):
+            writer.write_descriptors(corpus, index_version=version)
+
+        walked, _, _ = _walk(reader, CaptureQuery(limit=10))
+
+        assert walked == corpus
+
+
+def test_get_by_ids_resolves_a_selection_at_its_watermark():
+    corpus = synthetic_descriptors(20)
+    with _catalog() as (writer, reader):
+        writer.write_descriptors(corpus, index_version=1)
+
+        page = reader.search(CaptureQuery(limit=20))
+        wanted = [item.capture_id for item in page.items[:5]]
+
+        resolved = reader.get_by_ids(wanted, watermark=page.watermark)
+
+        assert {item.capture_id for item in resolved} == set(wanted)
+
+
+def test_filters_narrow_the_walk():
+    corpus = synthetic_descriptors(30)
+    with _catalog() as (writer, reader):
+        writer.write_descriptors(corpus, index_version=1)
+
+        walked, _, _ = _walk(
+            reader,
+            CaptureQuery(
+                limit=10,
+                hook_names=("resid_pre",),
+                captured_after_ns=corpus[10].metadata.captured_at_ns,
+                captured_before_ns=corpus[19].metadata.captured_at_ns,
+            ),
+        )
+
+        assert walked == corpus[10:20]

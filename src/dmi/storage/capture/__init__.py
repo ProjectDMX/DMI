@@ -59,6 +59,7 @@ from .catalog import (
     ReconcileResult,
 )
 from .clickhouse_catalog import ClickHouseCatalogConfig, ClickHouseCatalogWriter
+from .clickhouse_reader import ClickHouseCaptureCatalog, ClickHouseReaderConfig
 from .cursor import Cursor, CursorKey, decode_cursor, encode_cursor
 from .s3 import S3PackStore, S3StoreConfig
 from .spool import (
@@ -94,6 +95,8 @@ __all__ = [
     "CatalogWriter",
     "ClickHouseCatalogConfig",
     "ClickHouseCatalogWriter",
+    "ClickHouseCaptureCatalog",
+    "ClickHouseReaderConfig",
     "Cursor",
     "CursorKey",
     "DuplicateCaptureError",
