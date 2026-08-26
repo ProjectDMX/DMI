@@ -4,9 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
-from typing import Any, Optional, Sequence
+import time
+from typing import Any, Optional, Sequence, TYPE_CHECKING, TypeVar
 
 from .config import MonitoringConfig
+
+if TYPE_CHECKING:
+    from .records import RecordFormat, RecordRuntime
+
+
+MetadataT = TypeVar("MetadataT")
 
 
 DEFAULT_DRAIN_FLUSH_TIMEOUT_US = 0
@@ -93,6 +100,8 @@ class MonitoringEngine:
         self._host_engine: Optional[Any] = None
 
         self._ring_transport: Optional[Any] = None
+        self._ring_config: Optional[Any] = None
+        self._record_mode = False
 
         if host_engine is not None and db_config is not None:
             raise ValueError("Provide either host_engine or db_config, not both")
@@ -109,7 +118,9 @@ class MonitoringEngine:
                     raise RuntimeError("Failed to import native DMXHostEngine") from exc
                 stages = tuple(db_config.stages)
                 if len(stages) != 1:
-                    raise ValueError("db_config.stages must contain exactly 1 StageConfig object (clickhouse_insert)")
+                    raise ValueError(
+                        "db_config.stages must contain exactly 1 StageConfig object"
+                    )
 
                 try:
                     self._host_engine = DMXHostEngine(stages[0])  # type: ignore[call-arg]
@@ -180,6 +191,80 @@ class MonitoringEngine:
         # null_offload.  Never carry a prior oversized-step decision across a
         # lifecycle toggle; the next committed step recomputes it.
         transport.force_eager = False
+
+    def create_record_runtime(
+        self,
+        record_format: "RecordFormat[MetadataT]",
+    ) -> "RecordRuntime[MetadataT]":
+        """Create an opt-in, non-owning runtime for encoded records."""
+
+        transport = self._ring_transport
+        ring_config = self._ring_config
+        if transport is None or ring_config is None:
+            raise RuntimeError("Ring transport is not enabled")
+        if self._record_mode:
+            raise RuntimeError("A record runtime is already active")
+
+        from .records import RecordFormat, RecordRuntime, RecordSchema
+
+        if not isinstance(record_format, RecordFormat):
+            raise TypeError("record_format must implement RecordFormat")
+        record_schema = record_format.schema
+        if not isinstance(record_schema, RecordSchema):
+            raise TypeError("record_format.schema must be a RecordSchema")
+
+        _native_engine = _native_module()
+        if self._host_engine is not None:
+            _native_engine._load_extension()._validate_record_host_schema(
+                self._host_engine,
+                record_schema,
+            )
+        _rt = _ring_module()
+        if not self.capture_enabled:
+            self.set_capture_enabled(True)
+        ring_engine = getattr(self, "_ring_engine", None)
+        if ring_engine is not None:
+            ring_engine.stop()
+        _rt.deactivate()
+        self._ring_transport = None
+        self._ring_engine = None
+
+        record_engine = _native_engine.RingEngine.create_record(
+            ring_config,
+            self._host_engine,
+        )
+        record_engine.init()
+        record_engine.start()
+        record_transport = _rt.RingTransport(record_engine)
+        self._ring_engine = record_engine
+        self._ring_transport = record_transport
+        self._record_mode = True
+        _rt.activate(record_transport)
+        return RecordRuntime(record_transport, record_format)
+
+    def flush_and_wait(self, timeout_s: float = 600.0) -> None:
+        """Durably complete generic-record work and surface async failures."""
+
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive")
+        transport = self._ring_transport
+        if transport is None:
+            raise RuntimeError("Ring transport is not enabled")
+        if not self._record_mode:
+            raise RuntimeError("Record runtime is not active")
+        deadline = time.monotonic() + float(timeout_s)
+        transport.flush_records_and_wait(float(timeout_s))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("durable record flush timed out")
+        host_engine = self._host_engine
+        if host_engine is None:
+            return
+        completed = host_engine.flush_and_wait(remaining)
+        if completed is False:
+            raise TimeoutError("durable record flush timed out")
+        if time.monotonic() > deadline:
+            raise TimeoutError("durable record flush timed out")
 
     @staticmethod
     def _make_default_ring_config(
@@ -260,6 +345,8 @@ class MonitoringEngine:
             transport.set_model_cfg(model_shape)
         self._ring_engine = ring_engine
         self._ring_transport = transport
+        self._ring_config = ring_config
+        self._record_mode = False
 
         _rt.activate(transport)
         return transport
@@ -302,6 +389,7 @@ class MonitoringEngine:
                 pass
             self._ring_transport = None
             self._ring_engine = None
+            self._record_mode = False
 
         if self._host_engine is not None:
             try:

@@ -75,6 +75,13 @@ static int64_t* upload_counts(const std::vector<int64_t>& counts) {
     return device;
 }
 
+static int32_t* upload_gate(int32_t value) {
+    int32_t* device = nullptr;
+    CUDA_CHECK(cudaMalloc(&device, sizeof(value)));
+    CUDA_CHECK(cudaMemcpy(device, &value, sizeof(value), cudaMemcpyHostToDevice));
+    return device;
+}
+
 static std::vector<uint8_t> read_payload(const ring::RingState& state,
                                          const ring::TaskEntry& entry) {
     std::vector<uint8_t> result(entry.tensor_total_bytes);
@@ -276,6 +283,152 @@ static void test_serialized_static_launches() {
     }
 }
 
+static void test_record_chunked_compacts_payload_head() {
+    banner("record chunked producer advances by actual aligned bytes");
+    ring::AllocatedRing allocated(make_config());
+    allocated.init();
+    ring::RingState& state = allocated.state();
+
+    constexpr uint32_t chunks = 4;
+    constexpr uint64_t input_chunk = 64;
+    const std::vector<int64_t> selected = {16, 32, 0, 8};
+    const std::vector<uint8_t> source = pattern(chunks * input_chunk, 91);
+    uint8_t* device = upload(source);
+    int64_t* device_selected = upload_counts(selected);
+
+    ring::launch_record_producer_chunked(
+        state, device, source.size(), device_selected, chunks,
+        nullptr, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    constexpr uint64_t actual = 56;
+    expect_entry(state, 0, actual);
+    EXPECT(*state.payload_head == ring::align_up(actual, ring::PAYLOAD_ALIGN));
+
+    std::vector<uint8_t> expected;
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        const auto begin = source.begin() + chunk * input_chunk;
+        expected.insert(expected.end(), begin, begin + selected[chunk]);
+    }
+    EXPECT(read_payload(state, state.task_entries[0]) == expected);
+
+    CUDA_CHECK(cudaFree(device_selected));
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_record_sequence_and_segmented_pack() {
+    banner("record row packers preserve declared row order");
+    ring::AllocatedRing allocated(make_config());
+    allocated.init();
+    ring::RingState& state = allocated.state();
+
+    // Source is [S=3, B=2, feature=4 bytes], one distinct byte pattern per row.
+    constexpr uint64_t feature_bytes = 4;
+    std::vector<uint8_t> source(3 * 2 * feature_bytes);
+    for (uint64_t row = 0; row < 6; ++row) {
+        std::fill(source.begin() + row * feature_bytes,
+                  source.begin() + (row + 1) * feature_bytes,
+                  static_cast<uint8_t>(10 + row));
+    }
+    uint8_t* device = upload(source);
+    int64_t* valid_count = upload_counts({2, 1});
+    int64_t* valid_prefix = upload_counts({0, 2, 3});
+    ring::launch_record_producer_seq_prefix_pack(
+        state, device, source.size(), valid_count, valid_prefix, 2,
+        feature_bytes, nullptr, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // [sample0 token0, sample0 token1, sample1 token0] maps to source rows
+    // [0, 2, 1] in contiguous [S, B, ...] storage.
+    std::vector<uint8_t> expected_sequence;
+    for (uint64_t row : {uint64_t(0), uint64_t(2), uint64_t(1)}) {
+        expected_sequence.insert(
+            expected_sequence.end(), source.begin() + row * feature_bytes,
+            source.begin() + (row + 1) * feature_bytes);
+    }
+    expect_entry(state, 0, expected_sequence.size());
+    EXPECT(read_payload(state, state.task_entries[0]) == expected_sequence);
+
+    int64_t* starts = upload_counts({1, 4});
+    int64_t* ends = upload_counts({3, 6});
+    ring::launch_record_producer_segmented_pack(
+        state, device, source.size(), starts, ends, 2, feature_bytes,
+        nullptr, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<uint8_t> expected_segments;
+    for (uint64_t row : {uint64_t(1), uint64_t(2), uint64_t(4), uint64_t(5)}) {
+        expected_segments.insert(
+            expected_segments.end(), source.begin() + row * feature_bytes,
+            source.begin() + (row + 1) * feature_bytes);
+    }
+    expect_entry(state, 1, expected_segments.size());
+    EXPECT(read_payload(state, state.task_entries[1]) == expected_segments);
+
+    CUDA_CHECK(cudaFree(ends));
+    CUDA_CHECK(cudaFree(starts));
+    CUDA_CHECK(cudaFree(valid_prefix));
+    CUDA_CHECK(cudaFree(valid_count));
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_record_device_gate_publishes_zero_byte_entries() {
+    banner("false record gates publish zero-byte entries in FIFO order");
+    ring::AllocatedRing allocated(make_config());
+    allocated.init();
+    ring::RingState& state = allocated.state();
+    const std::vector<uint8_t> source = pattern(64, 123);
+    uint8_t* device = upload(source);
+    int32_t* gate = upload_gate(0);
+    constexpr uint64_t initial_payload_head = 32;
+    constexpr uint64_t initial_actual_bytes = 17;
+    *state.payload_head = initial_payload_head;
+    *state.actual_bytes_counter = initial_actual_bytes;
+    const std::vector<uint8_t> payload_before(state.payload_cap, 0xA5);
+    CUDA_CHECK(cudaMemcpy(state.payload_buf, payload_before.data(),
+                          payload_before.size(), cudaMemcpyHostToDevice));
+
+    ring::launch_record_producer_static(
+        state, device, source.size(), gate, 1);
+    ring::launch_record_producer_prefix(
+        state, device, source.size(), nullptr, 16, gate, 1);
+    ring::launch_record_producer_chunked(
+        state, device, source.size(), nullptr, 2, gate, 1);
+    ring::launch_record_producer_seq_prefix_pack(
+        state, device, source.size(), nullptr, nullptr, 2, 8, gate, 1);
+    ring::launch_record_producer_segmented_pack(
+        state, device, source.size(), nullptr, nullptr, 2, 8, gate, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    constexpr uint64_t gated_variants = 5;
+    for (uint64_t sequence = 0; sequence < gated_variants; ++sequence) {
+        expect_entry(state, sequence, 0);
+    }
+    EXPECT(*state.task_head == gated_variants);
+    EXPECT(*state.payload_head == initial_payload_head);
+    EXPECT(*state.actual_bytes_counter == initial_actual_bytes);
+    std::vector<uint8_t> payload_after(state.payload_cap);
+    CUDA_CHECK(cudaMemcpy(payload_after.data(), state.payload_buf,
+                          payload_after.size(), cudaMemcpyDeviceToHost));
+    EXPECT(payload_after == payload_before);
+
+    const int32_t enabled = 1;
+    CUDA_CHECK(cudaMemcpy(gate, &enabled, sizeof(enabled),
+                          cudaMemcpyHostToDevice));
+    ring::launch_record_producer_static(
+        state, device, source.size(), gate, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    expect_entry(state, gated_variants, source.size());
+    EXPECT(read_payload(state, state.task_entries[gated_variants]) == source);
+    EXPECT(*state.task_head == gated_variants + 1);
+    EXPECT(*state.payload_head == initial_payload_head +
+           ring::align_up(source.size(), ring::PAYLOAD_ALIGN));
+    EXPECT(*state.actual_bytes_counter == initial_actual_bytes + source.size());
+
+    CUDA_CHECK(cudaFree(gate));
+    CUDA_CHECK(cudaFree(device));
+}
+
 int main() {
     setbuf(stdout, nullptr);
     ring::set_ring_null_mode(false);
@@ -288,6 +441,9 @@ int main() {
     test_prefix_bounds();
     test_chunked_packed_copy();
     test_serialized_static_launches();
+    test_record_chunked_compacts_payload_head();
+    test_record_sequence_and_segmented_pack();
+    test_record_device_gate_publishes_zero_byte_entries();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

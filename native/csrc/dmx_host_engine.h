@@ -45,6 +45,17 @@ public:
         return metrics_->Snapshot();
     }
 
+    void validate_record_schema(const RecordSchema& schema) const {
+        if (!record_stage_) {
+            throw std::logic_error(
+                "record runtime requires a schema-driven record stage");
+        }
+        if (RecordSchemaIdentity(schema) != record_schema_identity_) {
+            throw std::invalid_argument(
+                "record runtime schema does not match the host record stage");
+        }
+    }
+
     // Submit a pre-assembled ClickHouseRow directly to the insert stage.
     // Fields must match the order expected by ClickHouseInsertStage:
     //   [0] model_id     (string)
@@ -58,33 +69,75 @@ public:
     void submit_direct(ClickHouseRow row, uint64_t nbytes) {
         std::vector<dmx_host_queue_item> items;
         items.emplace_back(std::move(row), nbytes);
-        submit_items(std::move(items));
+        Base::submit_items(std::move(items));
+    }
+
+    void submit_record(GenericRecordRow row, uint64_t nbytes) {
+        std::vector<dmx_host_queue_item> items;
+        items.emplace_back(std::move(row), nbytes);
+        Base::submit_items(std::move(items));
+    }
+
+    bool flush_and_wait(Duration timeout) {
+        if (timeout.count() < 0.0) {
+            throw std::invalid_argument("timeout must be non-negative");
+        }
+        if (!record_stage_) {
+            throw std::logic_error(
+                "durable record flush requires a schema-driven record stage");
+        }
+        return Base::flush_and_wait(timeout);
     }
 
 private:
     struct PreparedStage {
         StageConfig stage;
         std::shared_ptr<ClickHouseRuntimeMetrics> metrics;
+        bool record_stage{false};
+        std::string record_schema_identity;
     };
 
     static PreparedStage Prepare(StageConfig stage) {
         if (stage.parallelism <= 0) {
             throw std::invalid_argument("parallelism must be positive");
         }
-        auto config =
-            std::any_cast<ClickHouseClientConfig>(stage.thread_init_config);
         auto metrics =
             std::make_shared<ClickHouseRuntimeMetrics>(stage.parallelism);
-        config.runtime_metrics = metrics;
-        stage.thread_init_config = std::move(config);
-        return PreparedStage{std::move(stage), std::move(metrics)};
+        bool record_stage = false;
+        std::string record_schema_identity;
+        if (stage.thread_init_config.type() == typeid(ClickHouseClientConfig)) {
+            auto config =
+                std::any_cast<ClickHouseClientConfig>(stage.thread_init_config);
+            config.runtime_metrics = metrics;
+            stage.thread_init_config = std::move(config);
+        } else if (stage.thread_init_config.type() ==
+                   typeid(ClickHouseRecordStageConfig)) {
+            record_stage = true;
+            auto config =
+                std::any_cast<ClickHouseRecordStageConfig>(
+                    stage.thread_init_config);
+            record_schema_identity = RecordSchemaIdentity(config.schema);
+            config.client.runtime_metrics = metrics;
+            stage.thread_init_config = std::move(config);
+        } else {
+            throw std::invalid_argument(
+                "unsupported DMXHostEngine stage initialization config");
+        }
+        return PreparedStage{
+            std::move(stage), std::move(metrics), record_stage,
+            std::move(record_schema_identity)};
     }
 
     explicit DMXHostEngine(PreparedStage prepared)
         : Base(std::array<StageConfig, 1>{std::move(prepared.stage)}, EngineConfig{}),
-          metrics_(std::move(prepared.metrics)) {}
+          metrics_(std::move(prepared.metrics)),
+          record_stage_(prepared.record_stage),
+          record_schema_identity_(
+              std::move(prepared.record_schema_identity)) {}
 
     std::shared_ptr<ClickHouseRuntimeMetrics> metrics_;
+    bool record_stage_{false};
+    std::string record_schema_identity_;
 };
 
 }

@@ -11,12 +11,14 @@ SRCS := csrc/bindings.cpp \
         csrc/clickhouse_client.cpp \
         csrc/ring/drain_thread.cpp \
         csrc/ring/p2p_thread.cpp \
+        csrc/ring/record_consumer.cpp \
         csrc/ring/ring_torch_op.cpp
 HOST_SRCS := csrc/bindings.cpp csrc/clickhouse_client.cpp
 HEADERS := csrc/dmx_host_utils.h \
-           csrc/clickhouse_client.h csrc/dmx_host_engine.h \
+           csrc/clickhouse_client.h csrc/dmx_host_engine.h csrc/record_schema.h \
            csrc/ring/ring_config.h csrc/ring/ring_state.h csrc/ring/ring_alloc.h \
            csrc/ring/task_entry.h csrc/ring/drain_task.h csrc/ring/drain_thread.h \
+           csrc/ring/record_descriptor.h csrc/ring/record_consumer.h \
            csrc/ring/p2p_thread.h csrc/ring/pinned_staging.h \
            csrc/ring/ring_engine.h csrc/ring/ring_engine_py.h \
            csrc/ring/ring_torch_op.h csrc/ring/tensor_meta.h

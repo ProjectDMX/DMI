@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <string>
 #include <stdexcept>
 
@@ -23,11 +24,11 @@ namespace ring {
 
 namespace {
 
-void report_cuda_failure(const char* operation, cudaError_t error) {
+void throw_cuda_failure(const char* operation, cudaError_t error) {
     if (error == cudaSuccess) return;
-    std::fprintf(stderr, "[drain] ERROR: %s failed: %s\n",
-                 operation, cudaGetErrorString(error));
-    std::fflush(stderr);
+    throw std::runtime_error(
+        std::string("DrainThread: ") + operation + " failed: " +
+        cudaGetErrorString(error));
 }
 
 }  // namespace
@@ -82,7 +83,10 @@ void DrainThread::start() {
 }
 
 void DrainThread::stop() {
-    if (!running_.exchange(false)) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!running_.exchange(false)) return;
+    }
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
 }
@@ -102,17 +106,72 @@ void DrainThread::notify() {
 // cudaStreamSynchronize(main_stream) first so all GPU writes are visible.
 // ---------------------------------------------------------------------------
 void DrainThread::force_flush_and_wait() {
+    uint64_t generation = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        flush_requested_ = true;
-        flush_done_      = false;
-        notified_        = true;
+        // The legacy completion path historically reported drain CUDA errors
+        // to stderr instead of throwing.  Preserve that API behavior while
+        // allowing stop() to clean up a terminally failed drain worker.
+        if (drain_failure_) return;
+        generation = ++flush_requested_generation_;
+        notified_ = true;
     }
     cv_.notify_one();  // wake drain thread
 
     // Block until drain thread completes the flush
     std::unique_lock<std::mutex> lk(mu_);
-    flush_done_cv_.wait(lk, [this] { return flush_done_; });
+    flush_done_cv_.wait(lk, [this, generation] {
+        return flush_completed_generation_ >= generation;
+    });
+}
+
+bool DrainThread::force_flush_and_wait_until(
+    std::chrono::steady_clock::time_point deadline) {
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (drain_failure_) std::rethrow_exception(drain_failure_);
+        generation = ++flush_requested_generation_;
+        notified_ = true;
+    }
+    cv_.notify_one();
+
+    std::unique_lock<std::mutex> lk(mu_);
+    const bool completed = flush_done_cv_.wait_until(
+        lk, deadline, [this, generation] {
+            return flush_completed_generation_ >= generation ||
+                   static_cast<bool>(drain_failure_);
+        });
+    if (!completed) return false;
+    std::exception_ptr failure = drain_failure_;
+    lk.unlock();
+    if (failure) std::rethrow_exception(failure);
+    return true;
+}
+
+void DrainThread::record_drain_failure(std::exception_ptr failure) {
+    bool first_failure = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!drain_failure_) {
+            drain_failure_ = failure;
+            first_failure = true;
+        }
+        // Wake an already-issued checked flush.  Its waiter observes and
+        // rethrows drain_failure_ instead of treating this as completion.
+        flush_completed_generation_ = flush_requested_generation_;
+    }
+    flush_done_cv_.notify_all();
+
+    if (!first_failure) return;
+    try {
+        std::rethrow_exception(failure);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[drain] ERROR: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "[drain] ERROR: unknown drain failure\n");
+    }
+    std::fflush(stderr);
 }
 
 // ---------------------------------------------------------------------------
@@ -158,18 +217,22 @@ void DrainThread::notify_staging_freed_bytes(uint64_t nbytes) {
 // Capacity query accessors
 // ---------------------------------------------------------------------------
 uint64_t DrainThread::cpu_payload_head() const {
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
     return cpu_payload_head_;
 }
 
 uint64_t DrainThread::cpu_payload_tail_committed() const {
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
     return cpu_payload_tail_committed_;
 }
 
 uint64_t DrainThread::cpu_task_head() const {
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
     return cpu_task_head_;
 }
 
 uint64_t DrainThread::cpu_task_tail_committed() const {
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
     return cpu_task_tail_;
 }
 
@@ -181,6 +244,57 @@ void DrainThread::reserve(uint64_t payload_bytes, uint32_t num_tasks) {
     std::lock_guard<std::mutex> lk(mgmt_mu_);
     cpu_payload_head_ += payload_bytes;
     cpu_task_head_    += num_tasks;
+}
+
+void DrainThread::reserve_record(uint64_t payload_bytes, uint32_t num_tasks) {
+    if (payload_bytes % PAYLOAD_ALIGN != 0) {
+        throw std::invalid_argument(
+            "DrainThread::reserve_record payload bytes must be aligned");
+    }
+    if (num_tasks == 0) {
+        if (payload_bytes != 0) {
+            throw std::invalid_argument(
+                "DrainThread::reserve_record cannot reserve payload without tasks");
+        }
+        return;
+    }
+
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
+    RecordReservation reservation{};
+    reservation.first_task_sequence = cpu_task_head_;
+    reservation.reserved_payload_bytes = payload_bytes;
+    reservation.task_count = num_tasks;
+    record_reservations_.push_back(reservation);
+    cpu_payload_head_ += payload_bytes;
+    cpu_task_head_ += num_tasks;
+}
+
+uint64_t DrainThread::pending_record_reservations() const {
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
+    return record_reservations_.size();
+}
+
+uint64_t DrainThread::reclaimed_record_bytes() const {
+    std::lock_guard<std::mutex> lk(mgmt_mu_);
+    return reclaimed_record_bytes_;
+}
+
+void DrainThread::rethrow_record_reclaim_failure() const {
+    std::exception_ptr failure;
+    {
+        std::lock_guard<std::mutex> lk(mgmt_mu_);
+        failure = record_reclaim_failure_;
+    }
+    if (failure) std::rethrow_exception(failure);
+}
+
+void DrainThread::rethrow_drain_failure() {
+    std::exception_ptr failure;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        failure = drain_failure_;
+    }
+    if (failure) std::rethrow_exception(failure);
 }
 
 // ---------------------------------------------------------------------------
@@ -251,23 +365,40 @@ void DrainThread::loop() {
     while (running_.load(std::memory_order_relaxed)) {
         ++loop_iter;
 
-        // Check for force-flush request
-        bool flush_now = false;
         {
-            std::lock_guard<std::mutex> lk(mu_);
-            if (flush_requested_) {
-                flush_now = true;
-                flush_requested_ = false;
+            std::unique_lock<std::mutex> lk(mu_);
+            if (drain_failure_) {
+                // A failed copy leaves the already-released task/payload
+                // accounting unusable.  Keep the worker alive for orderly
+                // stop, but never attempt or submit another drain batch.
+                cv_.wait(lk, [this] {
+                    return !running_.load(std::memory_order_relaxed);
+                });
+                continue;
             }
         }
 
-        if (flush_now) {
-            do_full_flush();
+        // Check for force-flush request
+        uint64_t flush_generation = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (flush_requested_generation_ > flush_completed_generation_) {
+                flush_generation = flush_requested_generation_;
+            }
+        }
+
+        if (flush_generation != 0) {
+            try {
+                do_full_flush();
+            } catch (...) {
+                record_drain_failure(std::current_exception());
+                continue;
+            }
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                flush_done_ = true;
+                flush_completed_generation_ = flush_generation;
             }
-            flush_done_cv_.notify_one();
+            flush_done_cv_.notify_all();
             continue;  // skip normal sleep, re-check immediately
         }
 
@@ -299,32 +430,38 @@ void DrainThread::loop() {
         }
 
         if (needs_flush) {
-            {
-                std::unique_lock<std::mutex> lk(staging_mu_);
-                staging_cv_.wait(lk, [&] {
-                    return staging_.free_bytes() >= flush_bytes;
-                });
-            }
+            try {
+                {
+                    std::unique_lock<std::mutex> lk(staging_mu_);
+                    staging_cv_.wait(lk, [&] {
+                        return staging_.free_bytes() >= flush_bytes;
+                    });
+                }
 
-            enqueue_d2h(flush_bytes);
-            sync_stream();
+                enqueue_d2h(flush_bytes);
+                sync_stream();
 
-            {
-                std::lock_guard<std::mutex> lk(mgmt_mu_);
-                cpu_payload_tail_committed_ = cpu_payload_tail_;
-            }
+                {
+                    std::lock_guard<std::mutex> lk(mgmt_mu_);
+                    cpu_payload_tail_committed_ = cpu_payload_tail_;
+                }
 
-            submit_to_p2p(flush_count, flush_bytes);
-            {
-                std::lock_guard<std::mutex> lk(mgmt_mu_);
-                trim_scanned(flush_count, flush_bytes);
+                submit_to_p2p(flush_count, flush_bytes);
+                {
+                    std::lock_guard<std::mutex> lk(mgmt_mu_);
+                    trim_scanned(flush_count, flush_bytes);
+                }
+            } catch (...) {
+                record_drain_failure(std::current_exception());
             }
         }
 
         {
             std::unique_lock<std::mutex> lk(mu_);
             auto pred = [this] {
-                return notified_ || flush_requested_ ||
+                return notified_ ||
+                       flush_requested_generation_ >
+                           flush_completed_generation_ ||
                        !running_.load(std::memory_order_relaxed);
             };
             cv_.wait_for(lk, std::chrono::microseconds(cfg_.drain_poll_timeout_us), pred);
@@ -332,9 +469,18 @@ void DrainThread::loop() {
         }
     }
 
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (drain_failure_) return;
+    }
+
     // Final flush
-    report_cuda_failure("cudaDeviceSynchronize", cudaDeviceSynchronize());
-    do_full_flush();
+    try {
+        throw_cuda_failure("cudaDeviceSynchronize", cudaDeviceSynchronize());
+        do_full_flush();
+    } catch (...) {
+        record_drain_failure(std::current_exception());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +496,8 @@ void DrainThread::scan_ready() {
         const uint64_t idx = visible_head_ % task_cap;
         TaskEntry ec = ring_.task_entries[idx];
 
+        account_record_task(visible_head_, ec);
+
         scanned_.push_back(ec);
         pending_entries_++;
         pending_bytes_ += align_up(ec.tensor_total_bytes, PAYLOAD_ALIGN);
@@ -360,6 +508,53 @@ void DrainThread::scan_ready() {
             has_complete_time_ = true;
         }
     }
+}
+
+void DrainThread::account_record_task(uint64_t sequence,
+                                      const TaskEntry& entry) {
+    if (record_reservations_.empty() || record_reclaim_failure_) return;
+
+    RecordReservation& reservation = record_reservations_.front();
+    const uint64_t expected = reservation.first_task_sequence +
+        reservation.completed_tasks;
+
+    // A legacy task can precede the first record reservation.  Record-mode
+    // task ranges themselves are contiguous because reserve_record advances
+    // the task head once for the complete group.
+    if (sequence < reservation.first_task_sequence) return;
+    if (sequence != expected) {
+        record_reclaim_failure_ = std::make_exception_ptr(std::runtime_error(
+            "record reservation task sequence does not match ready TaskEntry"));
+        return;
+    }
+
+    const uint64_t actual = align_up(entry.tensor_total_bytes, PAYLOAD_ALIGN);
+    if (reservation.actual_aligned_bytes >
+        std::numeric_limits<uint64_t>::max() - actual) {
+        record_reclaim_failure_ = std::make_exception_ptr(std::runtime_error(
+            "record reservation actual byte accounting overflow"));
+        return;
+    }
+    reservation.actual_aligned_bytes += actual;
+    ++reservation.completed_tasks;
+
+    if (reservation.completed_tasks != reservation.task_count) return;
+
+    if (reservation.actual_aligned_bytes <=
+        reservation.reserved_payload_bytes) {
+        const uint64_t unused = reservation.reserved_payload_bytes -
+            reservation.actual_aligned_bytes;
+        cpu_payload_head_ -= unused;
+        reclaimed_record_bytes_ += unused;
+    } else {
+        // Preserve CPU/GPU logical-head agreement before surfacing the
+        // violated upper-bound invariant through checked completion.
+        cpu_payload_head_ += reservation.actual_aligned_bytes -
+            reservation.reserved_payload_bytes;
+        record_reclaim_failure_ = std::make_exception_ptr(std::runtime_error(
+            "record producer exceeded its conservative payload reservation"));
+    }
+    record_reservations_.pop_front();
 }
 
 // ---------------------------------------------------------------------------
@@ -401,8 +596,8 @@ void DrainThread::flush_state_update(uint64_t flush_count, uint64_t flush_bytes)
 }
 
 void DrainThread::sync_stream() {
-    report_cuda_failure("cudaStreamSynchronize",
-                        cudaStreamSynchronize(stream_));
+    throw_cuda_failure("cudaStreamSynchronize",
+                       cudaStreamSynchronize(stream_));
 }
 
 // ---------------------------------------------------------------------------
@@ -428,11 +623,8 @@ void DrainThread::enqueue_d2h(uint64_t flush_bytes) {
         cudaError_t err = cudaMemcpyAsync(staging_.base() + stg_cursor,
                         ring_.payload_buf + gpu_cursor,
                         chunk, cudaMemcpyDeviceToHost, stream_);
-        if (err != cudaSuccess) {
-            report_cuda_failure("cudaMemcpyAsync", err);
-        } else {
-            RING_DBG("[enqueue_d2h] chunk=%d enqueued OK\n", chunk_idx);
-        }
+        throw_cuda_failure("cudaMemcpyAsync", err);
+        RING_DBG("[enqueue_d2h] chunk=%d enqueued OK\n", chunk_idx);
 
         remaining  -= chunk;
         gpu_cursor  = (gpu_cursor + chunk) % gpu_cap;

@@ -355,6 +355,10 @@ class PipelinedEngine
     validate_config_();
     build_queues_();
     init_engine_profiling_();
+    if constexpr (NumStages == 1) {
+      acknowledged_generation_by_worker_.assign(
+          static_cast<std::size_t>(stages_[0].parallelism), 0);
+    }
   }
 
   ~PipelinedEngine() noexcept {
@@ -482,24 +486,31 @@ class PipelinedEngine
   }
 
   void close_input() {
-    std::lock_guard<std::mutex> lk(state_mu_);
-    if (input_closed_) return;
-    input_closed_ = true;
-    queues_[0]->close();
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      if (input_closed_) return;
+      input_closed_ = true;
+      queues_[0]->close();
+    }
+    fail_active_flush_noexcept_("input closed during durable flush");
   }
 
   void request_abort() {
+    bool already_stopping = false;
     {
       std::lock_guard<std::mutex> lk(state_mu_);
       if (stop_event_.load(std::memory_order_acquire)) {
         input_closed_ = true;
-        return;
+        already_stopping = true;
+      } else {
+        stop_event_.store(true, std::memory_order_release);
+        input_closed_ = true;
       }
-      stop_event_.store(true, std::memory_order_release);
-      input_closed_ = true;
     }
 
-    if (cfg_.close_queues_on_abort) {
+    mark_flush_terminal_failure_noexcept_("engine stopped or aborted");
+
+    if (!already_stopping && cfg_.close_queues_on_abort) {
       for (auto& q : queues_) {
         try {
           q->close();
@@ -603,6 +614,140 @@ class PipelinedEngine
     if (want_stats) {
       prof_ingest_add_submit_enqueue_(want_timing ? std::chrono::duration<double>(Clock::now() - t0).count() : 0.0);
     }
+  }
+
+  // Force the currently queued items through the one-stage sink and wait until
+  // every worker has reached the resulting empty-queue rendezvous.
+  bool flush_and_wait(std::optional<Duration> timeout = std::nullopt) {
+    static_assert(
+        NumStages == 1,
+        "PipelinedEngine::flush_and_wait is supported only for one-stage engines");
+
+    if (timeout && timeout->count() < 0.0) {
+      throw std::invalid_argument("flush timeout must be nonnegative");
+    }
+    TimePoint end_at;
+    const bool have_deadline = timeout.has_value();
+    if (have_deadline) {
+      end_at = Clock::now() +
+          std::chrono::duration_cast<Clock::duration>(*timeout);
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      if (!started_) {
+        throw std::runtime_error("cannot flush an engine that has not started");
+      }
+      if (input_closed_) {
+        throw std::runtime_error("cannot flush an engine with closed input");
+      }
+      if (stop_event_.load(std::memory_order_acquire)) {
+        throw std::runtime_error("cannot flush a stopped or aborted engine");
+      }
+    }
+    raise_if_failed();
+
+    std::uint64_t generation = 0;
+    {
+      std::lock_guard<std::mutex> lk(flush_mu_);
+      if (flush_terminal_failure_) {
+        throw std::runtime_error(
+            "durable flush is unavailable after terminal failure: " +
+            flush_terminal_reason_);
+      }
+      if (flush_in_progress_) {
+        throw std::runtime_error("concurrent durable flush is unsupported");
+      }
+      if (acknowledged_generation_by_worker_.size() !=
+          static_cast<std::size_t>(stages_[0].parallelism)) {
+        throw std::logic_error("durable-flush worker registry is inconsistent");
+      }
+
+      generation = ++next_flush_generation_;
+      active_flush_generation_ = generation;
+      remaining_flush_workers_ =
+          static_cast<std::size_t>(stages_[0].parallelism);
+      flush_in_progress_ = true;
+    }
+
+    try {
+      queues_[0]->begin_flush();
+    } catch (...) {
+      {
+        std::lock_guard<std::mutex> lk(flush_mu_);
+        flush_terminal_failure_ = true;
+        flush_terminal_reason_ = "failed to enable queue flush mode";
+        flush_in_progress_ = false;
+      }
+      flush_cv_.notify_all();
+      request_abort();
+      throw;
+    }
+
+    bool timed_out = false;
+    std::string failure_reason;
+    {
+      std::unique_lock<std::mutex> lk(flush_mu_);
+      const auto completed_or_failed = [this] {
+        return remaining_flush_workers_ == 0 || flush_terminal_failure_;
+      };
+      bool ready = true;
+      if (have_deadline) {
+        ready = flush_cv_.wait_until(lk, end_at, completed_or_failed);
+      } else {
+        flush_cv_.wait(lk, completed_or_failed);
+      }
+      if (!ready) {
+        timed_out = true;
+        flush_terminal_failure_ = true;
+        flush_terminal_reason_ = "durable flush timed out";
+      }
+      if (flush_terminal_failure_) {
+        failure_reason = flush_terminal_reason_;
+      }
+    }
+
+    try {
+      queues_[0]->end_flush();
+    } catch (...) {
+      {
+        std::lock_guard<std::mutex> lk(flush_mu_);
+        flush_terminal_failure_ = true;
+        flush_terminal_reason_ = "failed to disable queue flush mode";
+        flush_in_progress_ = false;
+      }
+      flush_cv_.notify_all();
+      request_abort();
+      throw;
+    }
+
+    bool success = false;
+    {
+      std::lock_guard<std::mutex> lk(flush_mu_);
+      if (!flush_terminal_failure_ && have_deadline &&
+          Clock::now() > end_at) {
+        timed_out = true;
+        flush_terminal_failure_ = true;
+        flush_terminal_reason_ = "durable flush timed out";
+        failure_reason = flush_terminal_reason_;
+      }
+      success = !flush_terminal_failure_ && remaining_flush_workers_ == 0;
+      if (success) {
+        completed_flush_generation_ = generation;
+      } else if (failure_reason.empty()) {
+        failure_reason = flush_terminal_reason_.empty()
+            ? "durable flush failed"
+            : flush_terminal_reason_;
+      }
+      flush_in_progress_ = false;
+    }
+    flush_cv_.notify_all();
+
+    if (success) return true;
+
+    request_abort();
+    if (timed_out) return false;
+    throw std::runtime_error(failure_reason);
   }
 
   // ------------------------------------------------------------
@@ -752,6 +897,75 @@ class PipelinedEngine
     } catch (...) {
       // swallow
     }
+    mark_flush_terminal_failure_noexcept_("engine worker failure");
+  }
+
+  void fail_active_flush_noexcept_(const char* reason) noexcept {
+    bool notify = false;
+    try {
+      std::lock_guard<std::mutex> lk(flush_mu_);
+      if (flush_in_progress_) {
+        flush_terminal_failure_ = true;
+        if (flush_terminal_reason_.empty()) flush_terminal_reason_ = reason;
+        notify = true;
+      }
+    } catch (...) {
+    }
+    if (notify) flush_cv_.notify_all();
+  }
+
+  void mark_flush_terminal_failure_noexcept_(const char* reason) noexcept {
+    try {
+      {
+        std::lock_guard<std::mutex> lk(flush_mu_);
+        flush_terminal_failure_ = true;
+        if (flush_terminal_reason_.empty()) flush_terminal_reason_ = reason;
+      }
+      flush_cv_.notify_all();
+    } catch (...) {
+    }
+  }
+
+  bool acknowledge_and_wait_for_flush_release_(
+      std::size_t stage_idx, int thread_idx) {
+    static_assert(
+        NumStages == 1,
+        "durable-flush worker rendezvous is supported only for one-stage engines");
+    if (stage_idx != 0 || thread_idx < 0) {
+      throw std::logic_error("invalid durable-flush worker identity");
+    }
+
+    std::unique_lock<std::mutex> lk(flush_mu_);
+    if (flush_terminal_failure_) return false;
+    if (!flush_in_progress_) {
+      throw std::logic_error(
+          "open-empty dequeue observed without an active durable flush");
+    }
+
+    const std::size_t worker_id = static_cast<std::size_t>(thread_idx);
+    if (worker_id >= acknowledged_generation_by_worker_.size()) {
+      throw std::logic_error("durable-flush worker identity is out of range");
+    }
+
+    const std::uint64_t generation = active_flush_generation_;
+    if (acknowledged_generation_by_worker_[worker_id] == generation) {
+      throw std::logic_error(
+          "worker acknowledged the same durable-flush generation twice");
+    }
+    if (remaining_flush_workers_ == 0) {
+      throw std::logic_error("durable-flush worker count underflow");
+    }
+
+    acknowledged_generation_by_worker_[worker_id] = generation;
+    --remaining_flush_workers_;
+    if (remaining_flush_workers_ == 0) flush_cv_.notify_all();
+
+    flush_cv_.wait(lk, [this, generation] {
+      return flush_terminal_failure_ || !flush_in_progress_ ||
+             active_flush_generation_ != generation;
+    });
+    return !flush_terminal_failure_ &&
+           completed_flush_generation_ >= generation;
   }
 
   void warn_once_no_output_handler_(const std::string& stage_name, std::size_t n_items) {
@@ -860,7 +1074,19 @@ class PipelinedEngine
         }
 
         if (stop_event_.load(std::memory_order_acquire)) return;
-        if (batch.empty()) return;  // closed and empty
+        if (batch.empty()) {
+          if (in_q.closed()) return;
+
+          if constexpr (NumStages == 1) {
+            if (!acknowledge_and_wait_for_flush_release_(stage_idx, thread_idx)) {
+              return;
+            }
+            continue;
+          } else {
+            throw std::logic_error(
+                "open-empty dequeue is unsupported for multi-stage engines");
+          }
+        }
 
         if (want_stats) {
           prof_stage_batched_io_(stage_idx, /*batches=*/1,
@@ -1209,6 +1435,18 @@ class PipelinedEngine
   // failures
   mutable std::mutex fail_mu_;
   std::vector<ThreadFailure> failures_;
+
+  // Nonterminal durable flush. Normal batches never acquire this mutex.
+  mutable std::mutex flush_mu_;
+  std::condition_variable flush_cv_;
+  std::uint64_t next_flush_generation_ = 0;
+  std::uint64_t active_flush_generation_ = 0;
+  std::uint64_t completed_flush_generation_ = 0;
+  bool flush_in_progress_ = false;
+  bool flush_terminal_failure_ = false;
+  std::string flush_terminal_reason_;
+  std::size_t remaining_flush_workers_ = 0;
+  std::vector<std::uint64_t> acknowledged_generation_by_worker_;
 
   // warnings
   mutable std::mutex warn_mu_;

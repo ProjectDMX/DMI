@@ -4,7 +4,10 @@
 #include "ring/pinned_staging.h"
 #include "ring/producer.cuh"
 #include "ring/ring_alloc.h"
+#include "ring/ring_engine_py.h"
 
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -20,6 +23,11 @@
 
 static int g_pass = 0;
 static int g_fail = 0;
+
+// RingEnginePy's diagnostic hooks are irrelevant to this focused native
+// executable; the extension supplies their real definitions.
+void ring_diag_reset_host_counters() {}
+void ring_diag_print_host_counters() {}
 
 #define CUDA_CHECK(expr)                                                    \
     do {                                                                    \
@@ -243,6 +251,142 @@ static void test_zero_byte_delivery() {
     harness.release(task);
 }
 
+static void test_record_reservation_reclaims_after_group_completion() {
+    banner("record reservation reclaims only after every grouped task is ready");
+    DrainHarness harness(make_config());
+
+    constexpr uint64_t row_bytes = 32;
+    const std::vector<uint8_t> dynamic_source = pattern(256, 111);
+    const std::vector<uint8_t> fixed_source = pattern(64, 137);
+    uint8_t* dynamic_device = upload(dynamic_source, harness.stream);
+    uint8_t* fixed_device = upload(fixed_source, harness.stream);
+    int64_t row_count = 1;
+    int64_t* device_count = nullptr;
+    CUDA_CHECK(cudaMalloc(&device_count, sizeof(row_count)));
+    CUDA_CHECK(cudaMemcpyAsync(device_count, &row_count, sizeof(row_count),
+                               cudaMemcpyHostToDevice, harness.stream));
+
+    const uint64_t upper =
+        ring::align_up(dynamic_source.size(), ring::PAYLOAD_ALIGN) +
+        ring::align_up(fixed_source.size(), ring::PAYLOAD_ALIGN);
+    harness.drain->reserve_record(upper, 2);
+
+    ring::launch_record_producer_prefix(
+        harness.allocated.state(), dynamic_device, dynamic_source.size(),
+        device_count, row_bytes, nullptr, 0, harness.stream);
+    ring::DrainTask first = harness.flush_one();
+    EXPECT(first.tensor_total_bytes == row_bytes);
+    EXPECT(harness.drain->cpu_payload_head() == upper);
+    EXPECT(harness.drain->pending_record_reservations() == 1);
+    EXPECT(harness.drain->reclaimed_record_bytes() == 0);
+    harness.release(first);
+
+    ring::launch_record_producer_static(
+        harness.allocated.state(), fixed_device, fixed_source.size(),
+        nullptr, 0, harness.stream);
+    ring::DrainTask second = harness.flush_one();
+    const uint64_t actual_aligned =
+        ring::align_up(row_bytes, ring::PAYLOAD_ALIGN) +
+        ring::align_up(fixed_source.size(), ring::PAYLOAD_ALIGN);
+    EXPECT(second.tensor_total_bytes == fixed_source.size());
+    EXPECT(harness.drain->pending_record_reservations() == 0);
+    EXPECT(harness.drain->cpu_payload_head() == actual_aligned);
+    EXPECT(harness.drain->cpu_payload_tail_committed() == actual_aligned);
+    EXPECT(harness.drain->reclaimed_record_bytes() == upper - actual_aligned);
+    harness.drain->rethrow_record_reclaim_failure();
+    harness.release(second);
+
+    CUDA_CHECK(cudaFree(device_count));
+    CUDA_CHECK(cudaFree(fixed_device));
+    CUDA_CHECK(cudaFree(dynamic_device));
+}
+
+static void test_false_gated_record_reclaims_its_full_reservation() {
+    banner("false-gated record publishes and reclaims a zero-byte task");
+    DrainHarness harness(make_config());
+
+    const std::vector<uint8_t> source = pattern(64, 173);
+    uint8_t* device = upload(source, harness.stream);
+    int32_t* gate = nullptr;
+    const int32_t disabled = 0;
+    CUDA_CHECK(cudaMalloc(&gate, sizeof(disabled)));
+    CUDA_CHECK(cudaMemcpyAsync(gate, &disabled, sizeof(disabled),
+                               cudaMemcpyHostToDevice, harness.stream));
+
+    const uint64_t reserved =
+        ring::align_up(source.size(), ring::PAYLOAD_ALIGN);
+    harness.drain->reserve_record(reserved, 1);
+    ring::launch_record_producer_static(
+        harness.allocated.state(), device, source.size(), gate, 1,
+        harness.stream);
+    ring::DrainTask task = harness.flush_one();
+
+    EXPECT(task.tensor_total_bytes == 0);
+    EXPECT(task.alloc_bytes == 0);
+    EXPECT(harness.drain->pending_record_reservations() == 0);
+    EXPECT(harness.drain->cpu_payload_head() == 0);
+    EXPECT(harness.drain->cpu_payload_tail_committed() == 0);
+    EXPECT(harness.drain->reclaimed_record_bytes() == reserved);
+    harness.drain->rethrow_record_reclaim_failure();
+    harness.release(task);
+
+    CUDA_CHECK(cudaFree(gate));
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_timed_drain_flush_uses_request_generations() {
+    banner("timed drain flush does not reuse another request generation");
+    ring::RingConfig cfg = make_config(512);
+    cfg.pinned_staging_bytes = 256;
+    DrainHarness harness(cfg);
+
+    const std::vector<uint8_t> first_source = pattern(256, 191);
+    uint8_t* first_device = upload(first_source, harness.stream);
+    harness.drain->reserve(first_source.size(), 1);
+    ring::launch_producer_static(
+        harness.allocated.state(), first_device, first_source.size(), 0,
+        harness.stream);
+    ring::DrainTask first = harness.flush_one();
+
+    // Keep the first task's staging allocation outstanding so the next flush
+    // generation has a deterministic wait point inside the drain worker.
+    const std::vector<uint8_t> second_source = pattern(64, 211);
+    uint8_t* second_device = upload(second_source, harness.stream);
+    harness.drain->reserve(second_source.size(), 1);
+    ring::launch_producer_static(
+        harness.allocated.state(), second_device, second_source.size(), 0,
+        harness.stream);
+    CUDA_CHECK(cudaStreamSynchronize(harness.stream));
+
+    const bool blocked_generation_completed =
+        harness.drain->force_flush_and_wait_until(
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(25));
+    EXPECT(!blocked_generation_completed);
+
+    harness.release(first);
+    bool next_generation_completed =
+        harness.drain->force_flush_and_wait_until(
+            std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    EXPECT(next_generation_completed);
+    if (!next_generation_completed) {
+        harness.drain->force_flush_and_wait();
+    }
+
+    const uint64_t count = harness.drain->wait_for_tasks();
+    EXPECT(count == 1);
+    std::vector<ring::DrainTask> tasks;
+    harness.drain->pop_tasks(count, tasks);
+    EXPECT(tasks.size() == 1);
+    if (!tasks.empty()) {
+        EXPECT(task_bytes(tasks.front()) == second_source);
+        harness.release(tasks.front());
+    }
+
+    CUDA_CHECK(cudaFree(second_device));
+    CUDA_CHECK(cudaFree(first_device));
+}
+
 struct BlockingCallbackState {
     std::atomic<bool> entered{false};
     std::atomic<bool> release{false};
@@ -325,6 +469,75 @@ static void test_drain_worker_binds_owner_device() {
     EXPECT(stopped_without_waiting_for_device_zero);
 }
 
+static void test_record_flush_bounds_current_stream_prefix_wait() {
+    banner("record flush bounds its exact current-stream prefix wait");
+
+    const c10::cuda::CUDAStream test_stream =
+        c10::cuda::getStreamFromPool();
+    c10::cuda::CUDAStreamGuard stream_guard(test_stream);
+
+    ring_py::RingConfig cfg;
+    cfg.task_ring_entries = 16;
+    cfg.payload_ring_bytes = 4096;
+    cfg.pinned_staging_bytes = 4096;
+    cfg.drain_poll_timeout_us = 100;
+    ring_py::RingEnginePy engine(cfg, ring_py::RecordSubmitFn{});
+    engine.init();
+    engine.start();
+
+    BlockingCallbackState callback;
+    cudaStream_t stream = test_stream.stream();
+    CUDA_CHECK(cudaLaunchHostFunc(stream, blocking_host_callback, &callback));
+
+    const auto callback_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!callback.entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < callback_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool callback_entered =
+        callback.entered.load(std::memory_order_acquire);
+    EXPECT(callback_entered);
+
+    bool completed = true;
+    bool threw = false;
+    std::chrono::steady_clock::duration elapsed{};
+    if (callback_entered) {
+        std::atomic<bool> flush_returned{false};
+        std::thread watchdog([&] {
+            const auto watchdog_deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(500);
+            while (!flush_returned.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < watchdog_deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            callback.release.store(true, std::memory_order_release);
+        });
+
+        const auto started = std::chrono::steady_clock::now();
+        try {
+            completed = engine.flush_records_and_wait(20);
+        } catch (...) {
+            threw = true;
+        }
+        elapsed = std::chrono::steady_clock::now() - started;
+        flush_returned.store(true, std::memory_order_release);
+        callback.release.store(true, std::memory_order_release);
+        watchdog.join();
+    } else {
+        callback.release.store(true, std::memory_order_release);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    EXPECT(!threw);
+    if (!threw && callback_entered) {
+        EXPECT(!completed);
+        EXPECT(elapsed < std::chrono::milliseconds(250));
+    }
+    engine.stop();
+}
+
 int main() {
     setbuf(stdout, nullptr);
     ring::set_ring_null_mode(false);
@@ -335,7 +548,11 @@ int main() {
     test_prefix_force_flush();
     test_repeated_wrap_delivery();
     test_zero_byte_delivery();
+    test_record_reservation_reclaims_after_group_completion();
+    test_false_gated_record_reclaims_its_full_reservation();
+    test_timed_drain_flush_uses_request_generations();
     test_drain_worker_binds_owner_device();
+    test_record_flush_bounds_current_stream_prefix_wait();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -13,9 +13,11 @@
 #include <vector>
 
 #include "ring/tensor_meta.h"   // TensorMeta, TensorMetaFifo
+#include "ring/record_descriptor.h"
 
 // Forward-declare at::Tensor so SubmitFn can use it without including ATen here.
 namespace at { class Tensor; }
+namespace dmx_host { struct GenericRecordRow; }
 
 namespace ring_py {
 
@@ -49,10 +51,15 @@ using SubmitFn = std::function<void(
     int32_t            end_token,
     at::Tensor         slice)>;
 
+using RecordSubmitFn = std::function<void(
+    dmx_host::GenericRecordRow row,
+    uint64_t                   payload_bytes)>;
+
 // Opaque RAII engine.
 class RingEnginePy {
 public:
     explicit RingEnginePy(RingConfig cfg, SubmitFn submit_fn);
+    explicit RingEnginePy(RingConfig cfg, RecordSubmitFn submit_fn);
     ~RingEnginePy();
 
     RingEnginePy(const RingEnginePy&)            = delete;
@@ -94,6 +101,34 @@ public:
                                  uint32_t hook_type,
                                  uint64_t stream_handle);
 
+    // Additive schema-driven producers.  These methods are reachable only
+    // through the separately registered ring::record_producer* operations.
+    void record_no_notify(uint64_t d_ptr, uint64_t nbytes,
+                          uint64_t emit_gate_ptr, int32_t emit_value,
+                          uint64_t stream_handle);
+    void record_no_notify_prefix(uint64_t d_ptr, uint64_t nbytes_upper,
+                                 uint64_t row_count_dev_ptr,
+                                 uint64_t row_bytes,
+                                 uint64_t emit_gate_ptr, int32_t emit_value,
+                                 uint64_t stream_handle);
+    void record_no_notify_chunked(uint64_t d_ptr, uint64_t nbytes_upper,
+                                  uint64_t chunk_bytes_dev_ptr,
+                                  uint32_t chunk_count,
+                                  uint64_t emit_gate_ptr, int32_t emit_value,
+                                  uint64_t stream_handle);
+    void record_no_notify_seq_prefix_pack(
+        uint64_t d_ptr, uint64_t nbytes_upper,
+        uint64_t valid_count_dev_ptr, uint64_t valid_prefix_sum_dev_ptr,
+        uint32_t batch, uint64_t feature_bytes,
+        uint64_t emit_gate_ptr, int32_t emit_value,
+        uint64_t stream_handle);
+    void record_no_notify_segmented_pack(
+        uint64_t d_ptr, uint64_t nbytes_upper,
+        uint64_t segment_start_dev_ptr, uint64_t segment_end_dev_ptr,
+        uint32_t segment_count, uint64_t feature_bytes,
+        uint64_t emit_gate_ptr, int32_t emit_value,
+        uint64_t stream_handle);
+
     // Lightweight wake-up for the drain thread.
     void notify_drain();
 
@@ -128,6 +163,20 @@ public:
     static constexpr int STEP_OVERSIZED    = 2;
 
     int prepare_step(uint64_t step_total_bytes, uint32_t num_hooks);
+
+    // Record-mode reservation uses conservative aligned upper bounds and is
+    // reconciled from ready TaskEntry byte counts by the drain thread.
+    int reserve_record(uint64_t reservation_bytes, uint32_t num_tasks);
+
+    void push_record_descriptors(std::vector<ring::RecordDescriptor> descriptors);
+    void submit_record_cpu_direct(at::Tensor cpu_tensor,
+                                  uint64_t tensor_bytes);
+
+    // Complete the GPU-to-host record prefix and validate descriptor and
+    // reservation accounting within one timeout.  Returns false only on
+    // timeout.  Database durability is checked separately by MonitoringEngine
+    // through DMXHostEngine.flush_and_wait().
+    bool flush_records_and_wait(uint64_t timeout_ms);
 
     // Submit a CPU-direct tensor to drain -> p2p pipeline.
     void submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes);

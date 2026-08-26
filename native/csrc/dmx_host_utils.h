@@ -11,22 +11,36 @@
 
 namespace dmx_host{
 
-// Input cell types for a row.
+// Released fixed inference row cell types. Keep this alias and its eight-cell
+// contract unchanged.
 using ClickHouseValue = std::variant<std::string, int32_t, std::vector<int64_t>, at::Tensor>;
-
-// One item == one row (vector of cells).
 using ClickHouseRow = std::vector<ClickHouseValue>;
+
+// Additive schema-driven record cells. The integration has already encoded
+// semantic metadata before this host-only representation is constructed.
+using RecordValue = std::variant<std::string, int32_t, int64_t, double,
+                                 std::vector<int64_t>, at::Tensor>;
+
+struct GenericRecordRow {
+    std::string layout;
+    std::vector<RecordValue> cells;
+};
+
+using DmxHostRow = std::variant<ClickHouseRow, GenericRecordRow>;
 
 struct dmx_host_queue_item{
     uint64_t item_size;
-    ClickHouseRow core;
-    dmx_host_queue_item(ClickHouseRow queued_core, uint64_t size){
-        this->item_size = size;
-        this->core = std::move(queued_core);
-    };
+    DmxHostRow row;
+
+    dmx_host_queue_item(ClickHouseRow queued_core, uint64_t size)
+        : item_size(size), row(std::move(queued_core)) {}
+
+    dmx_host_queue_item(GenericRecordRow queued_record, uint64_t size)
+        : item_size(size), row(std::move(queued_record)) {}
+
     uint64_t size() const {
         return this->item_size;
-    };
+    }
 };
 
 }

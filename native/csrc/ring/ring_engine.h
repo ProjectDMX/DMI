@@ -16,6 +16,7 @@ class RingEngine {
 public:
     RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
                SubmitFn submit_fn);
+    RingEngine(const RingConfig& cfg, RecordConsumer::SubmitFn submit_fn);
     ~RingEngine() noexcept;
 
     RingEngine(const RingEngine&)            = delete;
@@ -27,6 +28,9 @@ public:
 
     RingState&   ring_state()    { return ring_.state(); }
     DrainThread& drain_thread()  { return *drain_; }
+    RecordConsumer& record_consumer();
+    const RecordConsumer& record_consumer() const;
+    bool record_mode() const { return static_cast<bool>(record_p2p_); }
 
     uint64_t  payload_cap() const { return cfg_.payload_ring_bytes; }
     uint64_t  staging_cap() const { return staging_.capacity(); }
@@ -38,6 +42,7 @@ private:
     PinnedStaging   staging_;
     std::unique_ptr<DrainThread>  drain_;
     std::unique_ptr<P2PThread>    p2p_;
+    std::unique_ptr<RecordP2PThread> record_p2p_;
 };
 
 }  // namespace ring

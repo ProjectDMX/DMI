@@ -17,6 +17,7 @@
 #include <clickhouse/client.h>
 
 #include "dmx_host_utils.h"
+#include "record_schema.h"
 
 namespace dmx_host {
 
@@ -101,6 +102,14 @@ struct ClickHouseClientConfig {
       std::make_shared<ClickHouseRuntimeMetrics>();
 };
 
+// Internal, immutable worker initialization value for the additive generic
+// record stage. ClickHouseClientConfig itself remains the released connection
+// configuration and is intentionally not extended with schema state.
+struct ClickHouseRecordStageConfig {
+  ClickHouseClientConfig client;
+  RecordSchema schema;
+};
+
 /**
  * ClickHouse sink stage for PipelinedEngine.
  *
@@ -143,6 +152,32 @@ class ClickHouseInsertStage final {
                                                                     QueueT* /*next_q*/) {
     InsertBatch(std::move(batch));
     return std::vector<dmx_host_queue_item>{};  // sink: no outputs
+  }
+};
+
+/** Schema-driven typed-row sink. This is a separate opt-in stage; it does not
+ * route through or reinterpret ClickHouseInsertStage's fixed inference row.
+ */
+class ClickHouseRecordInsertStage final {
+ public:
+  static void ThreadInit(int thread_idx,
+                         const ClickHouseRecordStageConfig& cfg);
+  static void ThreadCleanup() noexcept;
+  static void InsertBatch(std::vector<dmx_host_queue_item>&& batch);
+
+  static inline void ThreadInitAny(int thread_idx, const std::any& cfg_any) {
+    ThreadInit(
+        thread_idx,
+        std::any_cast<const ClickHouseRecordStageConfig&>(cfg_any));
+  }
+
+  static inline void ThreadCleanupAny() noexcept { ThreadCleanup(); }
+
+  template <typename QueueT>
+  static inline std::optional<std::vector<dmx_host_queue_item>> ProcessFn(
+      std::vector<dmx_host_queue_item> batch, QueueT* /*next_q*/) {
+    InsertBatch(std::move(batch));
+    return std::vector<dmx_host_queue_item>{};
   }
 };
 
