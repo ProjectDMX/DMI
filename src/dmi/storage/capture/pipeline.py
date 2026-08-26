@@ -279,7 +279,11 @@ def object_key_for(ready: ReadyPack) -> str:
 
 
 def _key_component(value: str) -> str:
-    encoded = quote(value, safe="-_.=")
+    # quote() treats "~" as always-safe per RFC 3986 and ignores `safe` for it,
+    # but the object-key pattern does not allow it. Left alone, an identifier
+    # containing "~" produces a key every store rejects, and the sink failure
+    # is fatal to the whole pipeline.
+    encoded = quote(value, safe="-_.=").replace("~", "%7E")
     if len(encoded.encode()) <= 160:
         return encoded
     return "sha256-" + sha256(value.encode()).hexdigest()

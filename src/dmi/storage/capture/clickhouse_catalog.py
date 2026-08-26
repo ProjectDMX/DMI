@@ -231,18 +231,20 @@ pack_id UUID, store_id LowCardinality(String), index_version UInt64
             )
             for ref in refs
         ]
-        self._client.execute(
-            f"INSERT INTO {self._qualified(self._pack_raw)} "
-            f"({', '.join(_PACK_COLUMNS)}) VALUES",
-            rows,
-        )
-        # Append the same commit to the log the snapshot reads. A pack
-        # committed twice appends twice; the reader treats it as a set, so
-        # replay is absorbed without needing deduplication here.
+        # Order matters. committed_pack_ids reads the inventory to skip replays,
+        # and readers bound the snapshot by the commit log. Writing the
+        # inventory first would mean a crash in between leaves the pack skipped
+        # forever *and* never visible -- silent, permanent loss. This way round
+        # the same crash only costs redundant work on the next pass.
         self._client.execute(
             f"INSERT INTO {self._qualified(self._commit_log)} "
             "(pack_id, store_id, index_version) VALUES",
             [(ref.pack_id, ref.store_id, index_version) for ref in refs],
+        )
+        self._client.execute(
+            f"INSERT INTO {self._qualified(self._pack_raw)} "
+            f"({', '.join(_PACK_COLUMNS)}) VALUES",
+            rows,
         )
 
     def _qualified(self, table: str) -> str:

@@ -159,6 +159,7 @@ class CatalogIndexer:
         self._timer_ns = timer_ns
         self._on_event = on_event
         self._callback_failures = 0
+        self._published_version: int | None = None
 
     @property
     def store_id(self) -> str:
@@ -221,6 +222,16 @@ class CatalogIndexer:
         version = self._clock_ns()
         if type(version) is not int or version < 0:
             raise ValueError("clock_ns must return a non-negative integer")
+        # index_version has to increase strictly, or a batch lands underneath a
+        # watermark a reader already pinned and that snapshot grows after the
+        # fact. A wall clock does not guarantee that: NTP steps backwards, and
+        # a coarse clock can return the same value twice in a row. Advance past
+        # the last published version rather than failing -- the version is an
+        # ordering token, not a timestamp, and published_at_ns still records the
+        # real time. Cross-process skew is a separate problem, documented under
+        # the Phase 5 limitations.
+        if self._published_version is not None and version <= self._published_version:
+            version = self._published_version + 1
         step = self._config.max_rows_per_insert
         descriptor_inserts = 0
         for start in range(0, len(descriptors), step):
@@ -234,6 +245,7 @@ class CatalogIndexer:
         # markers after them, so the version is only a truthful snapshot once
         # all of that is durable. A reader that derived the watermark from the
         # descriptor table itself would see this version mid-batch.
+        self._published_version = version
         publish = getattr(self._writer, "publish_watermark", None)
         if publish is not None:
             publish(
@@ -288,7 +300,40 @@ class CatalogReconciler:
         if len(object_keys) > self._indexer.max_packs:
             raise ValueError("object notification batch exceeds max_packs")
         keys = tuple(dict.fromkeys(object_keys))
-        return self._indexer.index([self._inventory.inspect(key) for key in keys])
+        # A bucket holds whatever anyone put in it. Inspection runs outside
+        # CatalogIndexer.index's per-pack handling, so without this one foreign
+        # object would abort an entire rebuild instead of being one failure.
+        refs: list[PackRef] = []
+        failures: list[IndexFailure] = []
+        for key in keys:
+            try:
+                refs.append(self._inventory.inspect(key))
+            except Exception as exc:
+                failures.append(
+                    IndexFailure(
+                        pack_id="",
+                        object_key=key,
+                        error_type=type(exc).__name__,
+                        message=str(exc)[:512],
+                    )
+                )
+        result = self._indexer.index(refs)
+        if not failures:
+            return result
+        rejected = IndexResult(
+            requested_packs=len(failures),
+            skipped_packs=0,
+            indexed_packs=0,
+            indexed_rows=0,
+            failed_packs=len(failures),
+            descriptor_inserts=0,
+            estimated_bytes=0,
+            elapsed_ns=0,
+            failures=tuple(failures),
+        )
+        return result.merge(
+            rejected, failure_limit=self._indexer.max_failure_details
+        )
 
     def reconcile_page(
         self, *, prefix: str = "", cursor: str | None = None, limit: int = 64

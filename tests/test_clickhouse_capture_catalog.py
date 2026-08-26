@@ -96,7 +96,11 @@ def test_clickhouse_catalog_inserts_descriptors_before_pack_commit():
 
     inserts = [call for call in client.calls if call[0].startswith("INSERT")]
     assert "dmi_capture_raw" in inserts[0][0]
-    assert "dmi_pack_inventory_raw" in inserts[1][0]
+    # Commit log before inventory: the inventory is the replay guard, so a crash
+    # between the two writes must not leave a pack skipped forever *and* never
+    # visible to readers.
+    assert "dmi_pack_commit_log" in inserts[1][0]
+    assert "dmi_pack_inventory_raw" in inserts[2][0]
     assert inserts[0][1][0][0] == "capture-a"
     assert inserts[1][1][0][0] == ref.pack_id
 
