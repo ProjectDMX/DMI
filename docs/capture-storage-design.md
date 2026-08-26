@@ -1,6 +1,6 @@
 # Capture storage design
 
-Status: Accepted; host storage reference through Phase 3 implemented
+Status: Accepted; host storage reference through Phase 5 implemented
 
 This document defines a clean-slate host persistence architecture after Ring².
 It does not change the CUDA producer, ring layout, or device-to-host transport.
@@ -608,10 +608,71 @@ PYTHONPATH=src python -m benchmarks.bench_capture_catalog \
 ### Phase 5 — reader and summaries
 
 - Implement bounded search, estimation, and coalesced range hydration.
-- Add versioned core summaries, scalar extensions, and object artifacts.
+- Add the core tensor summarizer, plus scalar metric and artifact extension
+  points.
 - Add agent-safe query and hydration limits.
 
-Exit gate: analysis reads only explicitly selected payload ranges.
+Exit gate: selected hydration returns identical decoded tensors while avoiding
+unrelated payload bytes.
+
+Status: exit gate passed in the CPU contract suite, with snapshot and
+pagination behaviour proven against ClickHouse 26.9.1.
+
+Both halves of the gate are tested. *Identical decoded tensors* is a full round
+trip per dtype -- tensor, pack, store, catalog, search, select, hydrate,
+decode -- asserting array and byte equality; `bfloat16` is checked against
+hand-chosen bit patterns including both NaN encodings and both infinities.
+*No unrelated payload bytes* is not literal, because coalescing deliberately
+spans small gaps: with `max_coalesce_gap_bytes = 0` every read falls exactly
+inside a selected extent, and with the 4 KiB default the unrelated bytes stay
+within `gap x joins` and match `HydrationEstimate.request_bytes` exactly.
+
+Reads are pinned to a watermark. `CaptureQuery.filter_hash` identifies a query
+independently of its page, keyset cursors carry that hash and the pinned
+watermark, and `ClickHouseCaptureCatalog` resolves each column with `argMax`
+over `*_capture_raw`.
+
+`FINAL` is not a snapshot mechanism. It collapses duplicates to the highest
+version present and only then applies predicates, so
+`FINAL ... WHERE index_version <= W` drops a capture re-indexed above `W`
+instead of returning its value at `W`. Measured on 26.9.1, snapshotting at
+watermark 1 where `capture-a` was re-indexed at v2:
+
+| Query shape | Result |
+|---|---|
+| `FINAL` + `index_version <= 1` | `capture-b` only; `capture-a` missing |
+| `argMax` at watermark 1 | `capture-a@64`, `capture-b@128` |
+
+Catalog facets -- `element_count`, `tensor_rank`, `token_span`,
+`compression_ratio` -- are `MATERIALIZED` columns derived from data the writer
+already stores, so they cost no indexer change and no extra object reads.
+Anything derived from tensor *contents* runs at hydration time instead, because
+`CatalogIndexer.index` range-reads pack footers only.
+
+The 50,000-row, two-version measurement:
+
+| Measurement | Median |
+|---|---:|
+| `argMax` snapshot read | 22.3 ms |
+| `FINAL` read (not a snapshot) | 12.1 ms |
+| `max(index_version)` watermark | 1.7 ms |
+| Page, `limit=100` | 21.4 ms |
+| Page, `limit=1000` | 78.8 ms |
+| Page 1 vs page 25 at `limit=100` | 21.5 ms vs 24.4 ms |
+
+Correctness costs about 1.85x a plain `FINAL` read at this size, on a laptop
+build with one replay -- it is not a production figure and should be repeated on
+representative hardware and duplicate ratios. Page cost is flat with depth,
+which is the property keyset pagination exists to provide. The watermark
+aggregate is a second round trip per search but under a tenth of a page's cost,
+so caching it is not yet worth the staleness.
+
+Run the benchmark with:
+
+```bash
+PYTHONPATH=src python -m benchmarks.bench_capture_search \
+  --rows 50000 --replays 2 --trials 3
+```
 
 ### Phase 6 — migration
 
@@ -686,6 +747,33 @@ bytes, and retained failure details all have explicit caps.
   ClickHouse wire size.
 - The current public views use `FINAL` for immediate replay correctness. Hot
   query workloads must measure its cost before choosing a different projection.
+
+## Phase 5 limitations
+
+- `index_version` is `time_ns()` from the indexing process's own clock. With
+  more than one indexer, clock skew makes versions non-monotone across writers,
+  and a watermark taken from one indexer can permanently exclude rows written by
+  another. Phase 5 assumes a single indexer owns a catalog; coordinating the
+  version source is deferred to Phase 6, which already revisits indexer
+  topology.
+- Cursors are validated, not authenticated. A tampered cursor is rejected as
+  malformed -- strict base64 and envelope checks -- but nothing binds a cursor to
+  the caller who received it. A cursor can only address the keyspace its own
+  filters already reach.
+- Query filters apply before aggregation. That is safe only because a descriptor
+  derives from an immutable pack footer, so re-indexing a capture rewrites
+  identical values. Mutable descriptors would require filtering after `argMax`.
+- Each search issues a second round trip for `max(index_version)`, needed to
+  reject cursors ahead of the catalog.
+- `get_by_ids` matches on `capture_id`, the last element of the sort key, so it
+  does not benefit from the primary index.
+- Catalog facets are on `*_capture_raw` only; the public `FINAL` views are
+  unchanged.
+- The per-extension time budget is checked after each call. A runaway extension
+  is reported, not interrupted; preemption needs a worker boundary.
+- Core summary statistics cover finite elements only, with `nan_count`,
+  `inf_count` and `finite_count` reported alongside.
+- A selection is one bounded page. Callers paginate explicitly.
 
 ## Alternatives considered
 
