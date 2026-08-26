@@ -37,11 +37,21 @@ def synthetic_descriptors(rows: int) -> tuple[CaptureDescriptor, ...]:
         pack_record_count=rows, offset=64, stored_length=16_384,
         decoded_length=16_384, codec="none", checksum="00000000",
     )
+    # Every independent field gets its own disjoint value range. Two columns
+    # that always carry the same value make a projection swap between them
+    # undetectable, which is exactly the class of bug a catalog round trip
+    # exists to catch.
     return tuple(
         CaptureDescriptor(
             replace(
-                base, capture_id=f"capture-{index}", step_number=index,
-                token_start=index, token_end=index + 1,
+                base,
+                capture_id=f"capture-{index}",
+                layer_number=3 + index % 29,
+                producer_rank=100 + index % 7,
+                batch_position=900 + index % 11,
+                step_number=100_000 + index,
+                token_start=200_000 + index,
+                token_end=300_000 + index,
                 captured_at_ns=base.captured_at_ns + index,
             ),
             replace(locator, offset=64 + index * 16_384),
