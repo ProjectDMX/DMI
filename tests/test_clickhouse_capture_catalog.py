@@ -119,3 +119,48 @@ def test_clickhouse_catalog_rejects_unsafe_identifiers(name: str):
     with pytest.raises(ValueError, match="identifier"):
         ClickHouseCatalogConfig(database=name)
 
+
+
+# --- catalog facets ---------------------------------------------------------
+
+
+def test_ensure_schema_declares_every_facet_as_a_materialized_column():
+    from dmi.storage.capture.clickhouse_catalog import _FACET_COLUMNS
+
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    writer.ensure_schema()
+
+    create = [
+        call[0] for call in client.calls if call[0].startswith("CREATE TABLE")
+    ][0]
+    for name, kind, expression in _FACET_COLUMNS:
+        assert f"{name} {kind} MATERIALIZED {expression}" in create
+
+
+def test_ensure_schema_upgrades_pre_facet_tables_idempotently():
+    from dmi.storage.capture.clickhouse_catalog import _FACET_COLUMNS
+
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    writer.ensure_schema()
+
+    alters = [call[0] for call in client.calls if call[0].startswith("ALTER TABLE")]
+    assert len(alters) == len(_FACET_COLUMNS)
+    for statement in alters:
+        # Without IF NOT EXISTS a second start would fail on an upgraded table.
+        assert "ADD COLUMN IF NOT EXISTS" in statement
+        assert "`default`.`dmi_capture_raw`" in statement
+
+
+def test_facets_never_collide_with_an_inserted_column():
+    from dmi.storage.capture.clickhouse_catalog import (
+        _CAPTURE_COLUMNS,
+        _FACET_COLUMNS,
+    )
+
+    # A MATERIALIZED column cannot be written to, so a collision with the
+    # writer's column list would break every insert.
+    assert {name for name, _, _ in _FACET_COLUMNS}.isdisjoint(_CAPTURE_COLUMNS)
