@@ -5,6 +5,7 @@
 #include "pinned_staging.h"
 #include "drain_thread.h"
 #include "p2p_thread.h"
+#include "record_sink.h"
 #include "tensor_meta.h"
 
 #include <memory>
@@ -16,7 +17,7 @@ class RingEngine {
 public:
     RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
                SubmitFn submit_fn);
-    RingEngine(const RingConfig& cfg, RecordConsumer::SubmitFn submit_fn);
+    RingEngine(const RingConfig& cfg, std::shared_ptr<RecordSink> sink);
     ~RingEngine() noexcept;
 
     RingEngine(const RingEngine&)            = delete;
@@ -30,6 +31,7 @@ public:
     DrainThread& drain_thread()  { return *drain_; }
     RecordConsumer& record_consumer();
     const RecordConsumer& record_consumer() const;
+    std::shared_ptr<RecordSink> record_sink() const { return record_sink_; }
     bool record_mode() const { return static_cast<bool>(record_p2p_); }
 
     uint64_t  payload_cap() const { return cfg_.payload_ring_bytes; }
@@ -42,6 +44,7 @@ private:
     PinnedStaging   staging_;
     std::unique_ptr<DrainThread>  drain_;
     std::unique_ptr<P2PThread>    p2p_;
+    std::shared_ptr<RecordSink> record_sink_;
     std::unique_ptr<RecordP2PThread> record_p2p_;
 };
 

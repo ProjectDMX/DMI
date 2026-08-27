@@ -327,10 +327,18 @@ and a zero-byte task.
 A nonempty producer descriptor must contain a `PayloadSlice`; an empty
 producer descriptor is permitted.
 
+After device-to-host transfer, the native ring pairs each descriptor with its
+owned contiguous CPU payload as a backend-neutral record envelope. A native
+`RecordSink` receives that envelope before any backend-specific row
+materialization. `ClickHouseRecordSink` is the current adapter; another native
+sink can be passed to `RingEngine.create_record()` without changing the
+producer, drain, or descriptor consumer.
+
 `MonitoringEngine.flush_and_wait()` is a checked, non-closing completion
-operation. Success means the ring, descriptor consumer, host queues, and
-ClickHouse sink completed within one timeout. A timeout raises `TimeoutError`;
-asynchronous failures propagate unchanged.
+operation. Success means the ring, descriptor consumer, and configured record
+sink reached that sink's durability boundary within one timeout. The current
+ClickHouse adapter waits for acknowledged inserts. A timeout raises
+`TimeoutError`; asynchronous failures propagate unchanged.
 
 ### `deactivate_ring_transport`
 

@@ -16,9 +16,10 @@
 #include "ring/tensor_meta.h"   // TensorMeta, TensorMetaFifo
 #include "ring/record_descriptor.h"
 
-// Forward-declare at::Tensor so SubmitFn can use it without including ATen here.
+// Forward-declare ATen and the generic sink so this plain interface does not
+// expose their implementation headers.
 namespace at { class Tensor; }
-namespace dmx_host { struct GenericRecordRow; }
+namespace ring { class RecordSink; }
 
 namespace ring_py {
 
@@ -52,15 +53,12 @@ using SubmitFn = std::function<void(
     int32_t            end_token,
     at::Tensor         slice)>;
 
-using RecordSubmitFn = std::function<void(
-    dmx_host::GenericRecordRow row,
-    uint64_t                   payload_bytes)>;
-
 // Opaque RAII engine.
 class RingEnginePy {
 public:
     explicit RingEnginePy(RingConfig cfg, SubmitFn submit_fn);
-    explicit RingEnginePy(RingConfig cfg, RecordSubmitFn submit_fn);
+    explicit RingEnginePy(RingConfig cfg,
+                          std::shared_ptr<ring::RecordSink> sink);
     ~RingEnginePy();
 
     RingEnginePy(const RingEnginePy&)            = delete;
@@ -174,9 +172,8 @@ public:
                                   uint64_t tensor_bytes);
 
     // Complete the GPU-to-host record prefix and validate descriptor and
-    // reservation accounting within one timeout.  Returns false only on
-    // timeout.  Database durability is checked separately by MonitoringEngine
-    // through DMXHostEngine.flush_and_wait().
+    // reservation accounting and the configured sink's durability boundary
+    // within one timeout.  Returns false only on timeout.
     bool flush_records_and_wait(uint64_t timeout_ms);
 
     // Submit a CPU-direct tensor to drain -> p2p pipeline.

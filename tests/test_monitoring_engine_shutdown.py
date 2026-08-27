@@ -36,7 +36,7 @@ def test_ring_transport_maps_native_timeout_to_timeout_error():
         flush_records_and_wait=lambda timeout_s: False
     )
 
-    with pytest.raises(TimeoutError, match="record ring completion"):
+    with pytest.raises(TimeoutError, match="durable record completion"):
         transport.flush_records_and_wait(0.25)
 
 
@@ -48,22 +48,16 @@ def test_flush_and_wait_rejects_nonpositive_deadline():
         engine.flush_and_wait(0)
 
 
-def test_flush_and_wait_uses_remaining_deadline_for_host_durability(monkeypatch):
+def test_flush_and_wait_uses_one_native_deadline_and_does_not_flush_host_twice():
     calls = []
-    monotonic_times = iter((100.0, 101.75, 102.0))
-    monkeypatch.setattr(
-        "dmi.engine.time.monotonic", lambda: next(monotonic_times)
-    )
 
     class _Transport:
         def flush_records_and_wait(self, timeout_s):
-            calls.append(("ring", timeout_s))
-            return True
+            calls.append(("record_sink", timeout_s))
 
     class _Host:
-        def flush_and_wait(self, timeout_s):
-            calls.append(("host", timeout_s))
-            return True
+        def flush_and_wait(self, timeout_s):  # pragma: no cover - must not run
+            calls.append(("legacy_host", timeout_s))
 
     engine = MonitoringEngine(enable_ring_transport=False)
     engine._ring_transport = _Transport()
@@ -72,72 +66,7 @@ def test_flush_and_wait_uses_remaining_deadline_for_host_durability(monkeypatch)
 
     engine.flush_and_wait(5.0)
 
-    assert calls[0] == ("ring", 5.0)
-    assert calls[1][0] == "host"
-    assert calls[1][1] == pytest.approx(3.25)
-
-
-def test_flush_and_wait_rejects_host_success_after_caller_deadline(monkeypatch):
-    monotonic_times = iter((100.0, 101.0, 105.01))
-    monkeypatch.setattr(
-        "dmi.engine.time.monotonic", lambda: next(monotonic_times)
-    )
-
-    class _Transport:
-        def flush_records_and_wait(self, timeout_s):
-            return True
-
-    class _Host:
-        def flush_and_wait(self, timeout_s):
-            assert timeout_s == pytest.approx(4.0)
-            return True
-
-    engine = MonitoringEngine(enable_ring_transport=False)
-    engine._ring_transport = _Transport()
-    engine._host_engine = _Host()
-    engine._record_mode = True
-
-    with pytest.raises(TimeoutError, match="durable record flush timed out"):
-        engine.flush_and_wait(5.0)
-
-
-def test_flush_and_wait_raises_when_host_reports_timeout():
-    class _Transport:
-        def flush_records_and_wait(self, timeout_s):
-            return True
-
-    class _Host:
-        def flush_and_wait(self, timeout_s):
-            return False
-
-    engine = MonitoringEngine(enable_ring_transport=False)
-    engine._ring_transport = _Transport()
-    engine._host_engine = _Host()
-    engine._record_mode = True
-
-    with pytest.raises(TimeoutError, match="durable record flush timed out"):
-        engine.flush_and_wait(1.0)
-
-
-def test_flush_and_wait_preserves_host_exception():
-    failure = RuntimeError("host insert failed")
-
-    class _Transport:
-        def flush_records_and_wait(self, timeout_s):
-            return True
-
-    class _Host:
-        def flush_and_wait(self, timeout_s):
-            raise failure
-
-    engine = MonitoringEngine(enable_ring_transport=False)
-    engine._ring_transport = _Transport()
-    engine._host_engine = _Host()
-    engine._record_mode = True
-
-    with pytest.raises(RuntimeError) as raised:
-        engine.flush_and_wait(1.0)
-    assert raised.value is failure
+    assert calls == [("record_sink", 5.0)]
 
 
 def test_close_remains_best_effort_when_native_stop_fails(monkeypatch):

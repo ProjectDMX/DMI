@@ -64,7 +64,7 @@ private:
 // payload.  Construction fixes the consumer for the lifetime of the ring.
 class RecordP2PThread {
 public:
-    RecordP2PThread(DrainThread& drain, RecordConsumer::SubmitFn submit_fn);
+    RecordP2PThread(DrainThread& drain, std::shared_ptr<RecordSink> sink);
     ~RecordP2PThread() noexcept;
 
     RecordP2PThread(const RecordP2PThread&) = delete;

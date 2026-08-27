@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
-import time
 from typing import Any, Optional, Sequence, TYPE_CHECKING, TypeVar
 
 from .config import MonitoringConfig
@@ -243,7 +242,7 @@ class MonitoringEngine:
         return RecordRuntime(record_transport, record_format)
 
     def flush_and_wait(self, timeout_s: float = 600.0) -> None:
-        """Durably complete generic-record work and surface async failures."""
+        """Complete the record ring and its configured sink durability boundary."""
 
         if timeout_s <= 0:
             raise ValueError("timeout_s must be positive")
@@ -252,19 +251,7 @@ class MonitoringEngine:
             raise RuntimeError("Ring transport is not enabled")
         if not self._record_mode:
             raise RuntimeError("Record runtime is not active")
-        deadline = time.monotonic() + float(timeout_s)
         transport.flush_records_and_wait(float(timeout_s))
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("durable record flush timed out")
-        host_engine = self._host_engine
-        if host_engine is None:
-            return
-        completed = host_engine.flush_and_wait(remaining)
-        if completed is False:
-            raise TimeoutError("durable record flush timed out")
-        if time.monotonic() > deadline:
-            raise TimeoutError("durable record flush timed out")
 
     @staticmethod
     def _make_default_ring_config(

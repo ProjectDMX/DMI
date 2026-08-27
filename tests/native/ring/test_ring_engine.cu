@@ -5,6 +5,7 @@
 #include "ring/producer.cuh"
 #include "ring/ring_alloc.h"
 #include "ring/ring_engine_py.h"
+#include "ring/record_sink.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -23,6 +24,24 @@
 
 static int g_pass = 0;
 static int g_fail = 0;
+
+class TrackingRecordSink final : public ring::RecordSink {
+public:
+    void submit(ring::RecordEnvelope) override { ++submissions; }
+
+    bool flush_and_wait(Duration timeout) override {
+        observed_timeout = timeout;
+        ++flushes;
+        return true;
+    }
+
+    void rethrow_if_failed() const override { ++failure_checks; }
+
+    std::atomic<int> submissions{0};
+    std::atomic<int> flushes{0};
+    mutable std::atomic<int> failure_checks{0};
+    Duration observed_timeout{0};
+};
 
 // RingEnginePy's diagnostic hooks are irrelevant to this focused native
 // executable; the extension supplies their real definitions.
@@ -486,7 +505,8 @@ static void test_record_flush_bounds_current_stream_prefix_wait() {
     cfg.payload_ring_bytes = 4096;
     cfg.pinned_staging_bytes = 4096;
     cfg.drain_poll_timeout_us = 100;
-    ring_py::RingEnginePy engine(cfg, ring_py::RecordSubmitFn{});
+    ring_py::RingEnginePy engine(
+        cfg, std::shared_ptr<ring::RecordSink>{});
     engine.init();
     engine.start();
 
@@ -543,6 +563,30 @@ static void test_record_flush_bounds_current_stream_prefix_wait() {
     engine.stop();
 }
 
+static void test_record_flush_reaches_sink_durability_boundary() {
+    banner("record flush reaches the configured sink boundary");
+
+    ring_py::RingConfig cfg;
+    cfg.task_ring_entries = 16;
+    cfg.payload_ring_bytes = 4096;
+    cfg.pinned_staging_bytes = 4096;
+    cfg.drain_poll_timeout_us = 100;
+    auto sink = std::make_shared<TrackingRecordSink>();
+    ring_py::RingEnginePy engine(cfg, sink);
+    engine.init();
+    engine.start();
+
+    const bool completed = engine.flush_records_and_wait(1000);
+
+    EXPECT(completed);
+    EXPECT(sink->submissions.load(std::memory_order_acquire) == 0);
+    EXPECT(sink->flushes.load(std::memory_order_acquire) == 1);
+    EXPECT(sink->failure_checks.load(std::memory_order_acquire) == 2);
+    EXPECT(sink->observed_timeout > std::chrono::milliseconds(0));
+    EXPECT(sink->observed_timeout <= std::chrono::milliseconds(1000));
+    engine.stop();
+}
+
 int main() {
     setbuf(stdout, nullptr);
     ring::set_ring_null_mode(false);
@@ -558,6 +602,7 @@ int main() {
     test_timed_drain_flush_uses_request_generations();
     test_drain_worker_binds_owner_device();
     test_record_flush_bounds_current_stream_prefix_wait();
+    test_record_flush_reaches_sink_durability_boundary();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

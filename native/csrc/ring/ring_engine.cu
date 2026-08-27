@@ -36,8 +36,8 @@ RingEngine::RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
 }
 
 RingEngine::RingEngine(const RingConfig& cfg,
-                       RecordConsumer::SubmitFn submit_fn)
-    : cfg_(cfg), ring_(cfg)
+                       std::shared_ptr<RecordSink> sink)
+    : cfg_(cfg), ring_(cfg), record_sink_(std::move(sink))
 {
     if (cfg_.payload_ring_bytes % PAYLOAD_ALIGN != 0) {
         throw std::runtime_error(
@@ -61,7 +61,7 @@ RingEngine::RingEngine(const RingConfig& cfg,
     staging_.init(cfg.effective_staging_bytes());
     drain_ = std::make_unique<DrainThread>(ring_.state(), staging_, cfg_);
     record_p2p_ = std::make_unique<RecordP2PThread>(
-        *drain_, std::move(submit_fn));
+        *drain_, record_sink_);
 }
 
 RingEngine::~RingEngine() noexcept {

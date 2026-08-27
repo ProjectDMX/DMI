@@ -134,8 +134,8 @@ struct RingEnginePy::Impl {
             at::TensorOptions().dtype(at::kByte).device(at::kCUDA, dev_idx));
     }
 
-    Impl(ring::RingConfig cfg, RecordSubmitFn sf)
-        : engine(std::move(cfg), std::move(sf)), record_mode(true)
+    Impl(ring::RingConfig cfg, std::shared_ptr<ring::RecordSink> sink)
+        : engine(std::move(cfg), std::move(sink)), record_mode(true)
     {
         const auto& state = engine.ring_state();
         int dev_idx = 0;
@@ -170,8 +170,9 @@ RingEnginePy::RingEnginePy(RingConfig cfg, SubmitFn submit_fn) {
     impl_ = std::make_unique<Impl>(convert(cfg), std::move(submit_fn));
 }
 
-RingEnginePy::RingEnginePy(RingConfig cfg, RecordSubmitFn submit_fn) {
-    impl_ = std::make_unique<Impl>(convert(cfg), std::move(submit_fn));
+RingEnginePy::RingEnginePy(
+    RingConfig cfg, std::shared_ptr<ring::RecordSink> sink) {
+    impl_ = std::make_unique<Impl>(convert(cfg), std::move(sink));
 }
 
 RingEnginePy::~RingEnginePy() = default;
@@ -550,6 +551,18 @@ bool RingEnginePy::flush_records_and_wait(uint64_t timeout_ms) {
         : std::chrono::milliseconds::zero();
     if (!consumer.wait_until_idle(remaining)) return false;
     consumer.finish();
+
+    const auto sink = impl_->engine.record_sink();
+    if (sink) {
+        sink->rethrow_if_failed();
+        const auto before_sink = FlushClock::now();
+        if (before_sink >= deadline) return false;
+        const auto sink_timeout =
+            std::chrono::duration_cast<ring::RecordSink::Duration>(
+                deadline - before_sink);
+        if (!sink->flush_and_wait(sink_timeout)) return false;
+        sink->rethrow_if_failed();
+    }
     if (FlushClock::now() > deadline) return false;
     return true;
 }

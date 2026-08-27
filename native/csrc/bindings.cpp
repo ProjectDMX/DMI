@@ -7,6 +7,7 @@
 #endif
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <type_traits>
@@ -15,6 +16,7 @@ namespace py = pybind11;
 #include "clickhouse_client.h"
 #include "dmx_host_engine.h"
 #ifndef DMI_HOST_ONLY
+#include "clickhouse_record_sink.h"
 #include "ring/ring_engine_py.h"
 #include "ring/ring_torch_op.h"
 #include "ring/tensor_meta.h"
@@ -117,6 +119,24 @@ bool IsPayloadSlice(const py::handle& value) {
          py::hasattr(value, "storage") &&
          py::hasattr(value, "dtype") &&
          py::hasattr(value, "shape");
+}
+
+std::shared_ptr<dmx_host::ClickHouseRecordSink> MakeClickHouseRecordSink(
+    std::shared_ptr<dmx_host::DMXHostEngine> host) {
+  if (!host) {
+    throw std::invalid_argument("ClickHouse record sink requires a host engine");
+  }
+  return std::make_shared<dmx_host::ClickHouseRecordSink>(
+      [host](dmx_host::GenericRecordRow row, uint64_t payload_bytes) {
+        host->submit_record(std::move(row), payload_bytes);
+      },
+      [host](ring::RecordSink::Duration timeout) {
+        const double timeout_s =
+            std::chrono::duration<double>(timeout).count();
+        return host->flush_and_wait(
+            dmx_host::DMXHostEngine::Duration(timeout_s));
+      },
+      [host] { host->raise_if_failed(); });
 }
 
 ring::RecordDescriptor CopyRecordDescriptor(
@@ -582,6 +602,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
       .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
 
+  // Native-only extension point.  No Python trampoline is registered: sink
+  // callbacks stay off the GIL-bound Python hot path.
+  py::class_<ring::RecordSink, std::shared_ptr<ring::RecordSink>>(
+      m, "RecordSink");
+  py::class_<dmx_host::ClickHouseRecordSink, ring::RecordSink,
+             std::shared_ptr<dmx_host::ClickHouseRecordSink>>(
+      m, "ClickHouseRecordSink")
+      .def(py::init([](std::shared_ptr<dmx_host::DMXHostEngine> host) {
+             return MakeClickHouseRecordSink(std::move(host));
+           }),
+           py::arg("host_engine"));
+
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
              ring_py::SubmitFn submit_fn;
@@ -610,20 +642,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("config"), py::arg("host_engine") = py::none())
       .def_static(
           "create_record",
-          [](ring_py::RingConfig cfg, py::object host_engine_obj) {
-            ring_py::RecordSubmitFn submit_fn;
-            if (!host_engine_obj.is_none()) {
-              auto host = host_engine_obj.cast<
-                  std::shared_ptr<dmx_host::DMXHostEngine>>();
-              submit_fn = [host](dmx_host::GenericRecordRow row,
-                                 uint64_t payload_bytes) {
-                host->submit_record(std::move(row), payload_bytes);
-              };
+          [](ring_py::RingConfig cfg, py::object sink_or_host) {
+            std::shared_ptr<ring::RecordSink> sink;
+            if (!sink_or_host.is_none()) {
+              if (py::isinstance<ring::RecordSink>(sink_or_host)) {
+                sink = sink_or_host.cast<std::shared_ptr<ring::RecordSink>>();
+              } else {
+                auto host = sink_or_host.cast<
+                    std::shared_ptr<dmx_host::DMXHostEngine>>();
+                sink = MakeClickHouseRecordSink(std::move(host));
+              }
             }
             return std::make_shared<ring_py::RingEnginePy>(
-                std::move(cfg), std::move(submit_fn));
+                std::move(cfg), std::move(sink));
           },
-          py::arg("config"), py::arg("host_engine") = py::none())
+          py::arg("config"), py::arg("sink_or_host") = py::none())
       .def("init",  &ring_py::RingEnginePy::init,
            py::arg("stream_handle") = uint64_t{0})
       .def("start", &ring_py::RingEnginePy::start)

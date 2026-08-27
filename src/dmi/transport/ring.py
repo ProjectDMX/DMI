@@ -405,11 +405,11 @@ class RingTransport:
         )
 
     def flush_records_and_wait(self, timeout_s: float) -> None:
-        """Durably finish all generic-record work or raise its async error."""
+        """Finish ring work and the configured sink durability boundary."""
 
         completed = self._ring_engine.flush_records_and_wait(float(timeout_s))
         if completed is False:
-            raise TimeoutError("timed out waiting for record ring completion")
+            raise TimeoutError("timed out waiting for durable record completion")
 
     @staticmethod
     def _record_cpu_tensor(output: Any, entry: Any) -> torch.Tensor:

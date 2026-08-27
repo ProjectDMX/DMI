@@ -334,8 +334,8 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
 // RecordP2PThread -- fixed schema-driven consumer path.
 // ---------------------------------------------------------------------------
 RecordP2PThread::RecordP2PThread(
-    DrainThread& drain, RecordConsumer::SubmitFn submit_fn)
-    : drain_(drain), consumer_(std::move(submit_fn)) {}
+    DrainThread& drain, std::shared_ptr<RecordSink> sink)
+    : drain_(drain), consumer_(std::move(sink)) {}
 
 RecordP2PThread::~RecordP2PThread() noexcept {
     stop();
@@ -398,7 +398,7 @@ void RecordP2PThread::process(std::vector<DrainTask>& tasks) {
                 drain_.notify_staging_freed_bytes(task.alloc_bytes);
                 task.alloc_bytes = 0;
             }
-            consumer_.consume_payload(payload);
+            consumer_.consume_payload(std::move(payload));
         } catch (...) {
             if (task.alloc_bytes > 0) {
                 drain_.notify_staging_freed_bytes(task.alloc_bytes);

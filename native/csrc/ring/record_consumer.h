@@ -1,9 +1,9 @@
-// FIFO descriptor-to-payload association and generic materialization.
+// FIFO descriptor-to-payload association at the backend-neutral sink boundary.
 
 #pragma once
 
 #include "record_descriptor.h"
-#include "../dmx_host_utils.h"
+#include "record_sink.h"
 
 #include <ATen/ATen.h>
 
@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
-#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -22,9 +22,7 @@ namespace ring {
 
 class RecordConsumer {
 public:
-    using SubmitFn = std::function<void(dmx_host::GenericRecordRow, uint64_t)>;
-
-    explicit RecordConsumer(SubmitFn submit_fn);
+    explicit RecordConsumer(std::shared_ptr<RecordSink> sink);
 
     RecordConsumer(const RecordConsumer&) = delete;
     RecordConsumer& operator=(const RecordConsumer&) = delete;
@@ -36,7 +34,7 @@ public:
     // Consume exactly one descriptor for one physical payload.  The payload
     // must be a contiguous CPU byte tensor containing the actual produced
     // bytes from its ready TaskEntry.
-    void consume_payload(const at::Tensor& payload);
+    void consume_payload(at::Tensor payload);
 
     // Latch an asynchronous worker failure.  The first failure is retained.
     void record_failure(std::exception_ptr failure) noexcept;
@@ -48,16 +46,13 @@ public:
     size_t pending_descriptors() const;
 
 private:
-    SubmitFn submit_fn_;
+    std::shared_ptr<RecordSink> sink_;
 
     mutable std::mutex mu_;
     mutable std::condition_variable idle_cv_;
     std::deque<RecordDescriptor> descriptors_;
     std::exception_ptr failure_;
     size_t active_payloads_{0};
-
-    void materialize_and_submit(const RecordDescriptor& descriptor,
-                                const at::Tensor& payload);
 };
 
 }  // namespace ring
