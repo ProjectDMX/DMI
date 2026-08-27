@@ -7,16 +7,217 @@
 #endif
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <chrono>
 #include <cmath>
+#include <limits>
+#include <type_traits>
 namespace py = pybind11;
 
 #include "clickhouse_client.h"
 #include "dmx_host_engine.h"
 #ifndef DMI_HOST_ONLY
+#include "clickhouse_record_sink.h"
 #include "ring/ring_engine_py.h"
 #include "ring/ring_torch_op.h"
 #include "ring/tensor_meta.h"
 #endif
+
+namespace {
+
+std::string EnumValueString(const py::handle& value) {
+  if (py::hasattr(value, "value")) {
+    return py::cast<std::string>(value.attr("value"));
+  }
+  return py::cast<std::string>(value);
+}
+
+dmx_host::RecordCellType ParseRecordCellType(const py::handle& value) {
+  const std::string name = EnumValueString(value);
+  if (name == "string") return dmx_host::RecordCellType::STRING;
+  if (name == "int32") return dmx_host::RecordCellType::INT32;
+  if (name == "int64") return dmx_host::RecordCellType::INT64;
+  if (name == "float64") return dmx_host::RecordCellType::FLOAT64;
+  if (name == "int64_array") return dmx_host::RecordCellType::INT64_ARRAY;
+  if (name == "tensor") return dmx_host::RecordCellType::TENSOR;
+  throw py::value_error("unsupported RecordCellType: " + name);
+}
+
+std::string OptionalStringAttr(const py::handle& object, const char* name) {
+  py::object value = object.attr(name);
+  return value.is_none() ? std::string{} : py::cast<std::string>(value);
+}
+
+dmx_host::RecordSchema CopyRecordSchema(const py::handle& schema_py) {
+  dmx_host::RecordSchema schema;
+  schema.index_granularity =
+      py::cast<int>(schema_py.attr("index_granularity"));
+  for (const py::handle layout_py : schema_py.attr("layouts")) {
+    dmx_host::RecordLayout layout;
+    layout.name = py::cast<std::string>(layout_py.attr("name"));
+    layout.table = py::cast<std::string>(layout_py.attr("table"));
+    layout.primary_key = py::cast<std::vector<std::string>>(
+        layout_py.attr("primary_key"));
+    layout.order_by = py::cast<std::vector<std::string>>(
+        layout_py.attr("order_by"));
+    for (const py::handle column_py : layout_py.attr("columns")) {
+      dmx_host::RecordColumn column;
+      column.name = py::cast<std::string>(column_py.attr("name"));
+      column.type = ParseRecordCellType(column_py.attr("type"));
+      column.dtype_column = OptionalStringAttr(column_py, "dtype_column");
+      column.shape_column = OptionalStringAttr(column_py, "shape_column");
+      column.bytes_column = OptionalStringAttr(column_py, "bytes_column");
+      layout.columns.push_back(std::move(column));
+    }
+    schema.layouts.push_back(std::move(layout));
+  }
+  dmx_host::ValidateRecordSchema(schema);
+  return schema;
+}
+
+dmx_host::RecordValue CopyLiteralRecordValue(
+    const py::handle& value, dmx_host::RecordCellType type) {
+  switch (type) {
+    case dmx_host::RecordCellType::STRING:
+      return py::cast<std::string>(value);
+    case dmx_host::RecordCellType::INT32: {
+      const int64_t parsed = py::cast<int64_t>(value);
+      if (parsed < std::numeric_limits<int32_t>::min() ||
+          parsed > std::numeric_limits<int32_t>::max()) {
+        throw py::value_error("record INT32 value is out of range");
+      }
+      return static_cast<int32_t>(parsed);
+    }
+    case dmx_host::RecordCellType::INT64:
+      return py::cast<int64_t>(value);
+    case dmx_host::RecordCellType::FLOAT64:
+      return py::cast<double>(value);
+    case dmx_host::RecordCellType::INT64_ARRAY:
+      return py::cast<std::vector<int64_t>>(value);
+    case dmx_host::RecordCellType::TENSOR:
+      return py::cast<at::Tensor>(value);
+  }
+  throw py::value_error("unsupported record cell type");
+}
+
+#ifndef DMI_HOST_ONLY
+ring::PayloadMaterialization ParsePayloadMaterialization(
+    const py::handle& slice_py, dmx_host::RecordCellType column_type) {
+  const int storage = py::cast<int>(slice_py.attr("storage"));
+  if (column_type == dmx_host::RecordCellType::TENSOR && storage == 0)
+    return ring::PayloadMaterialization::TENSOR;
+  if (column_type == dmx_host::RecordCellType::FLOAT64 && storage == 1)
+    return ring::PayloadMaterialization::FLOAT_SCALAR;
+  if (column_type == dmx_host::RecordCellType::INT64 && storage == 2)
+    return ring::PayloadMaterialization::INT_SCALAR;
+  throw py::type_error(
+      "PayloadSlice storage does not match its record column type");
+}
+
+bool IsPayloadSlice(const py::handle& value) {
+  return py::hasattr(value, "offset_bytes") &&
+         py::hasattr(value, "nbytes") &&
+         py::hasattr(value, "storage") &&
+         py::hasattr(value, "dtype") &&
+         py::hasattr(value, "shape");
+}
+
+std::shared_ptr<dmx_host::ClickHouseRecordSink> MakeClickHouseRecordSink(
+    std::shared_ptr<dmx_host::DMXHostEngine> host) {
+  if (!host) {
+    throw std::invalid_argument("ClickHouse record sink requires a host engine");
+  }
+  return std::make_shared<dmx_host::ClickHouseRecordSink>(
+      [host](dmx_host::GenericRecordRow row, uint64_t payload_bytes) {
+        host->submit_record(std::move(row), payload_bytes);
+      },
+      [host](ring::RecordSink::Duration timeout) {
+        const double timeout_s =
+            std::chrono::duration<double>(timeout).count();
+        return host->flush_and_wait(
+            dmx_host::DMXHostEngine::Duration(timeout_s));
+      },
+      [host] { host->raise_if_failed(); });
+}
+
+ring::RecordDescriptor CopyRecordDescriptor(
+    const py::handle& descriptor_py,
+    const dmx_host::RecordSchema& schema) {
+  ring::RecordDescriptor descriptor;
+  descriptor.layout = py::cast<std::string>(descriptor_py.attr("layout"));
+  const auto& layout = dmx_host::FindRecordLayout(schema, descriptor.layout);
+
+  for (const py::handle row_py : descriptor_py.attr("rows")) {
+    const py::sequence row = py::reinterpret_borrow<py::sequence>(row_py);
+    if (static_cast<size_t>(py::len(row)) != layout.columns.size()) {
+      throw py::value_error(
+          "record descriptor row width does not match its layout");
+    }
+    ring::EncodedRecordRow encoded_row;
+    encoded_row.cells.reserve(layout.columns.size());
+    for (size_t i = 0; i < layout.columns.size(); ++i) {
+      py::handle value = row[i];
+      const auto column_type = layout.columns[i].type;
+      if (IsPayloadSlice(value)) {
+        ring::PayloadSlice slice;
+        slice.offset_bytes = py::cast<uint64_t>(value.attr("offset_bytes"));
+        py::object nbytes = value.attr("nbytes");
+        if (!nbytes.is_none()) {
+          slice.length_bytes = py::cast<uint64_t>(nbytes);
+        }
+        slice.materialization =
+            ParsePayloadMaterialization(value, column_type);
+        py::object dtype = value.attr("dtype");
+        if (dtype.is_none()) {
+          throw py::value_error("PayloadSlice dtype is required");
+        }
+        slice.dtype = static_cast<int32_t>(dtype.cast<at::ScalarType>());
+        slice.logical_shape = py::cast<std::vector<int64_t>>(
+            value.attr("shape"));
+        for (size_t dim = 0; dim < slice.logical_shape.size(); ++dim) {
+          if (slice.logical_shape[dim] == -1) {
+            if (slice.inferred_dynamic_dim >= 0) {
+              throw py::value_error(
+                  "PayloadSlice supports at most one dynamic dimension");
+            }
+            slice.inferred_dynamic_dim = static_cast<int32_t>(dim);
+          }
+        }
+        encoded_row.cells.emplace_back(std::move(slice));
+        continue;
+      }
+
+      dmx_host::RecordValue literal =
+          CopyLiteralRecordValue(value, column_type);
+      std::visit(
+          [&](auto&& item) {
+            using T = std::decay_t<decltype(item)>;
+            if constexpr (std::is_same_v<T, at::Tensor>) {
+              throw py::type_error(
+                  "record tensor columns require a PayloadSlice");
+            } else {
+              encoded_row.cells.emplace_back(std::forward<decltype(item)>(item));
+            }
+          },
+          std::move(literal));
+    }
+    descriptor.rows.push_back(std::move(encoded_row));
+  }
+  return descriptor;
+}
+
+std::vector<ring::RecordDescriptor> CopyRecordDescriptors(
+    const py::handle& descriptors_py,
+    const py::handle& schema_py) {
+  const auto schema = CopyRecordSchema(schema_py);
+  std::vector<ring::RecordDescriptor> descriptors;
+  for (const py::handle descriptor_py : descriptors_py) {
+    descriptors.push_back(CopyRecordDescriptor(descriptor_py, schema));
+  }
+  return descriptors;
+}
+#endif
+
+}  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #ifndef DMI_HOST_ONLY
@@ -226,7 +427,42 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           },
           py::arg("clickhouse_config"),
           py::arg("parallelism") = 1,
-          py::arg("name") = "clickhouse_insert");
+          py::arg("name") = "clickhouse_insert")
+      .def_static(
+          "clickhouse_records",
+          [](const dmx_host::ClickHouseClientConfig& ch_cfg,
+             py::object schema_py, int parallelism, std::string name) {
+            if (parallelism <= 0) {
+              throw py::value_error("parallelism must be positive");
+            }
+            StageConfig cfg;
+            cfg.name = std::move(name);
+            cfg.parallelism = parallelism;
+            cfg.input_queue.min_batch_items.reset();
+            cfg.input_queue.min_batch_size = 16ULL * 1024 * 1024;
+            cfg.input_queue.max_linger = Duration(0.05);
+            cfg.input_queue.max_batch_items = 10000;
+            cfg.input_queue.high_watermark_items = 20000;
+            cfg.input_queue.high_watermark_size = 512ULL * 1024 * 1024;
+            cfg.process_fn = [](
+                std::vector<dmx_host::dmx_host_queue_item> batch,
+                QueueT* next_q) {
+              return dmx_host::ClickHouseRecordInsertStage::ProcessFn<QueueT>(
+                  std::move(batch), next_q);
+            };
+            dmx_host::ClickHouseRecordStageConfig stage_cfg;
+            stage_cfg.client = ch_cfg;
+            stage_cfg.schema = CopyRecordSchema(schema_py);
+            cfg.thread_init_config = std::move(stage_cfg);
+            cfg.thread_init =
+                &dmx_host::ClickHouseRecordInsertStage::ThreadInitAny;
+            cfg.thread_cleanup =
+                &dmx_host::ClickHouseRecordInsertStage::ThreadCleanupAny;
+            return cfg;
+          },
+          py::arg("clickhouse_config"), py::arg("schema"),
+          py::arg("parallelism") = 1,
+          py::arg("name") = "clickhouse_records");
 
   py::class_<DMXHostEngine, std::shared_ptr<DMXHostEngine>>(m, "DMXHostEngine")
       .def(py::init<StageConfig>(), py::arg("insert_stage"))
@@ -270,6 +506,49 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("failures", &DMXHostEngine::failures)
       .def("raise_if_failed", &DMXHostEngine::raise_if_failed)
+      .def("flush_and_wait",
+           [](DMXHostEngine& self, double timeout_s) {
+             if (!std::isfinite(timeout_s) || timeout_s <= 0.0) {
+               throw std::invalid_argument(
+                   "timeout_s must be finite and positive");
+             }
+             return self.flush_and_wait(DMXHostEngine::Duration(timeout_s));
+           },
+           py::arg("timeout_s") = 600.0,
+           py::call_guard<py::gil_scoped_release>())
+      .def("submit_record",
+           [](DMXHostEngine& self, const std::string& layout,
+              py::sequence cells, py::sequence cell_types,
+              uint64_t nbytes) {
+             if (py::len(cells) != py::len(cell_types)) {
+               throw py::value_error(
+                   "cells and cell_types must have the same length");
+             }
+             dmx_host::GenericRecordRow row;
+             row.layout = layout;
+             row.cells.reserve(static_cast<size_t>(py::len(cells)));
+             uint64_t accounted = nbytes;
+             for (py::ssize_t i = 0; i < py::len(cells); ++i) {
+               const auto type = ParseRecordCellType(cell_types[i]);
+               dmx_host::RecordValue value =
+                   CopyLiteralRecordValue(cells[i], type);
+               if (auto* tensor = std::get_if<at::Tensor>(&value)) {
+                 if (!tensor->device().is_cpu()) {
+                   throw py::value_error(
+                       "submit_record tensor cells must already be on CPU");
+                 }
+                 if (!tensor->is_contiguous()) *tensor = tensor->contiguous();
+                 if (nbytes == 0) {
+                   accounted += static_cast<uint64_t>(tensor->nbytes());
+                 }
+               }
+               row.cells.push_back(std::move(value));
+             }
+             py::gil_scoped_release release;
+             self.submit_record(std::move(row), accounted);
+           },
+           py::arg("layout"), py::arg("cells"), py::arg("cell_types"),
+           py::arg("nbytes") = uint64_t{0})
       // Submit a pre-formatted ClickHouseRow directly to the insert stage.
       // Called from the ring transport drain callback after format processing.
       .def("submit_direct",
@@ -297,6 +576,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("tensor"),
            py::call_guard<py::gil_scoped_release>());
 
+  m.def(
+      "_validate_record_host_schema",
+      [](DMXHostEngine& host_engine, py::object schema) {
+        host_engine.validate_record_schema(CopyRecordSchema(schema));
+      },
+      py::arg("host_engine"), py::arg("schema"));
+
   // -------------------------------------------------------------------------
   // Ring offload engine
   // -------------------------------------------------------------------------
@@ -315,6 +601,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("clone_slices",              &ring_py::RingConfig::clone_slices)
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
       .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
+
+  // Native-only extension point.  No Python trampoline is registered: sink
+  // callbacks stay off the GIL-bound Python hot path.
+  py::class_<ring::RecordSink, std::shared_ptr<ring::RecordSink>>(
+      m, "RecordSink");
+  py::class_<dmx_host::ClickHouseRecordSink, ring::RecordSink,
+             std::shared_ptr<dmx_host::ClickHouseRecordSink>>(
+      m, "ClickHouseRecordSink")
+      .def(py::init([](std::shared_ptr<dmx_host::DMXHostEngine> host) {
+             return MakeClickHouseRecordSink(std::move(host));
+           }),
+           py::arg("host_engine"));
 
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
@@ -342,6 +640,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  std::move(cfg), std::move(submit_fn));
            }),
            py::arg("config"), py::arg("host_engine") = py::none())
+      .def_static(
+          "create_record",
+          [](ring_py::RingConfig cfg, py::object sink_or_host) {
+            std::shared_ptr<ring::RecordSink> sink;
+            if (!sink_or_host.is_none()) {
+              if (py::isinstance<ring::RecordSink>(sink_or_host)) {
+                sink = sink_or_host.cast<std::shared_ptr<ring::RecordSink>>();
+              } else {
+                auto host = sink_or_host.cast<
+                    std::shared_ptr<dmx_host::DMXHostEngine>>();
+                sink = MakeClickHouseRecordSink(std::move(host));
+              }
+            }
+            return std::make_shared<ring_py::RingEnginePy>(
+                std::move(cfg), std::move(sink));
+          },
+          py::arg("config"), py::arg("sink_or_host") = py::none())
       .def("init",  &ring_py::RingEnginePy::init,
            py::arg("stream_handle") = uint64_t{0})
       .def("start", &ring_py::RingEnginePy::start)
@@ -351,6 +666,52 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ring_py::RingEnginePy::prepare_step,
            py::arg("step_total_bytes"),
            py::arg("num_hooks"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("reserve_record",
+           &ring_py::RingEnginePy::reserve_record,
+           py::arg("reservation_items"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("push_record_descriptors",
+           [](ring_py::RingEnginePy& self, py::sequence descriptors,
+              py::object schema) {
+             auto encoded = CopyRecordDescriptors(descriptors, schema);
+             py::gil_scoped_release release;
+             self.push_record_descriptors(std::move(encoded));
+           },
+           py::arg("descriptors"), py::arg("schema"))
+      .def("submit_record_cpu_direct",
+           [](ring_py::RingEnginePy& self, at::Tensor cpu_tensor,
+              uint64_t tensor_bytes) {
+             if (!cpu_tensor.device().is_cpu()) {
+               throw py::value_error(
+                   "record CPU-direct tensor must already be on CPU");
+             }
+             at::Tensor contiguous = cpu_tensor.is_contiguous()
+                 ? std::move(cpu_tensor) : cpu_tensor.contiguous();
+             if (tensor_bytes != static_cast<uint64_t>(contiguous.nbytes())) {
+               throw py::value_error(
+                   "record CPU-direct byte count does not match tensor");
+             }
+             py::gil_scoped_release release;
+             self.submit_record_cpu_direct(
+                 std::move(contiguous), tensor_bytes);
+           },
+           py::arg("cpu_tensor"), py::arg("tensor_bytes"))
+      .def("flush_records_and_wait",
+           [](ring_py::RingEnginePy& self, double timeout_s) {
+             if (!std::isfinite(timeout_s) || timeout_s <= 0.0) {
+               throw std::invalid_argument(
+                   "timeout_s must be finite and positive");
+             }
+             const double milliseconds = std::ceil(timeout_s * 1000.0);
+             if (milliseconds >
+                 static_cast<double>(std::numeric_limits<int64_t>::max())) {
+               throw std::invalid_argument("timeout_s is too large");
+             }
+             return self.flush_records_and_wait(
+                 static_cast<uint64_t>(milliseconds));
+           },
+           py::arg("timeout_s") = 600.0,
            py::call_guard<py::gil_scoped_release>())
       .def("submit_cpu_direct",
            [](ring_py::RingEnginePy& self, at::Tensor cpu_tensor) {

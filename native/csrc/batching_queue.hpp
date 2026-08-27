@@ -431,6 +431,32 @@ class WatermarkBatchingQueue
     return closed_;
   }
 
+  // Enter a nonterminal flush rendezvous.  While active, all buffered items
+  // are immediately eligible for dequeue and an open, empty queue returns an
+  // empty batch so each worker can acknowledge that all preceding work has
+  // completed.  The engine serializes submission with this operation.
+  void begin_flush() {
+    {
+      std::unique_lock<std::mutex> lk(mu_);
+      if (closed_) {
+        throw QueueClosedError("cannot begin flush on a closed queue");
+      }
+      if (flush_active_) {
+        throw std::logic_error("flush is already active");
+      }
+      flush_active_ = true;
+    }
+    cv_can_dequeue_.notify_all();
+  }
+
+  void end_flush() {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (!flush_active_) {
+      throw std::logic_error("no active flush to end");
+    }
+    flush_active_ = false;
+  }
+
   std::size_t size() const {
     std::unique_lock<std::mutex> lk(mu_);
     return static_cast<std::size_t>(buffered_items_);
@@ -704,8 +730,8 @@ class WatermarkBatchingQueue
   // Contract:
   // - Returns a NON-empty batch when items are available and batching triggers are met
   //   (min_batch_items/min_batch_size/max_linger) or high-watermark forces a flush.
-  // - Returns an empty vector ONLY when the queue is closed AND empty (drained). This is
-  //   intended as a shutdown sentinel for worker loops.
+  // - Returns an empty vector when the queue is closed and empty (terminal),
+  //   or when an active nonterminal flush reaches an open, empty queue.
   // - If block=false and a batch is not ready, throws QueueEmptyError.
   // - If timeout is provided and expires, throws QueueEmptyError.
   std::vector<ItemT> dequeue_batch(bool block = true, std::optional<Duration> timeout = std::nullopt) {
@@ -802,6 +828,10 @@ class WatermarkBatchingQueue
             auto& prof_opt = prof_storage_();
             if (prof_opt) prof_opt->dequeue_returned_empty_on_close += 1;
           }
+          finish_total();
+          return {};
+        }
+        if (flush_active_) {
           finish_total();
           return {};
         }
@@ -1011,7 +1041,7 @@ class WatermarkBatchingQueue
   }
 
   bool dequeue_allowed_(Tick now, Count cnt, const SizeT& size) const {
-    if (closed_) return true;
+    if (closed_ || flush_active_) return true;
     std::optional<Tick> oldest = q_.empty() ? std::nullopt : std::optional<Tick>(q_.front().enq_at);
     if (flush_triggers_met_(now, cnt, size, oldest)) return true;
     if (high_watermark_reached_(cnt, size)) return true;
@@ -1152,6 +1182,7 @@ class WatermarkBatchingQueue
   Count buffered_items_ = 0;
   SizeT buffered_size_ = SizeT{0};
   bool closed_ = false;
+  bool flush_active_ = false;
 };
 
 }  // namespace dmx_host

@@ -22,6 +22,21 @@ from ...config import CaptureSchedule, MonitoringConfig
 from ...engine import HostEngineConfig, MonitoringEngine, RingCapacities
 from ...hooks.dispatch import install_ring_hooks
 from ...hooks.point import HookPoint
+from ...hooks.record import (
+    HookOutput,
+    HookPointV1,
+    HookRuntime,
+    HookSpecV1,
+    OutputStorage,
+    RecordType,
+    TransportSpec,
+    TransportType,
+)
+from ...hooks.producer_plan import (
+    ProducerPlan,
+    ProducerPlanBuilder,
+    ProducerPlanEntry,
+)
 from ...hooks import specs as _specs
 from ...hooks.specs import (
     HOOK_TYPE_ATTN_OUT,
@@ -67,6 +82,17 @@ from ...hooks.selection import (
     select_hook_specs,
 )
 from ...adapters.types import StepContext
+from ...records import (
+    PayloadSlice,
+    RecordCell,
+    RecordCellType,
+    RecordColumn,
+    RecordDescriptor,
+    RecordFormat,
+    RecordLayout,
+    RecordRuntime,
+    RecordSchema,
+)
 
 from .model_shape import make_model_shape_from_hf_config
 
@@ -178,6 +204,26 @@ __all__ = [
     "HostEngineConfig",
     "deactivate_ring_transport",
     "HookPoint",
+    "HookPointV1",
+    "HookSpecV1",
+    "HookOutput",
+    "HookRuntime",
+    "TransportSpec",
+    "TransportType",
+    "OutputStorage",
+    "RecordType",
+    "ProducerPlanEntry",
+    "ProducerPlan",
+    "ProducerPlanBuilder",
+    "PayloadSlice",
+    "RecordCell",
+    "RecordCellType",
+    "RecordColumn",
+    "RecordDescriptor",
+    "RecordFormat",
+    "RecordLayout",
+    "RecordRuntime",
+    "RecordSchema",
     "HookSpec",
     "HookRowBasis",
     "ModelShapeConfig",

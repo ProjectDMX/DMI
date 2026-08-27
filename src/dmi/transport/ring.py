@@ -74,6 +74,60 @@ try:
     ) -> None:
         return None
 
+    @torch.library.register_fake("ring::record_producer")
+    def _record_producer_fake(
+        ring_payload: torch.Tensor,
+        tensor: torch.Tensor,
+        emit_gate: Optional[torch.Tensor] = None,
+        emit_value: int = 0,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("ring::record_producer_prefix")
+    def _record_producer_prefix_fake(
+        ring_payload: torch.Tensor,
+        tensor: torch.Tensor,
+        row_count: torch.Tensor,
+        row_bytes: int,
+        emit_gate: Optional[torch.Tensor] = None,
+        emit_value: int = 0,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("ring::record_producer_chunked")
+    def _record_producer_chunked_fake(
+        ring_payload: torch.Tensor,
+        tensor: torch.Tensor,
+        chunk_bytes: torch.Tensor,
+        emit_gate: Optional[torch.Tensor] = None,
+        emit_value: int = 0,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("ring::record_producer_seq_prefix_pack")
+    def _record_producer_seq_prefix_pack_fake(
+        ring_payload: torch.Tensor,
+        tensor: torch.Tensor,
+        valid_count: torch.Tensor,
+        valid_prefix_sum: torch.Tensor,
+        feature_bytes: int,
+        emit_gate: Optional[torch.Tensor] = None,
+        emit_value: int = 0,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("ring::record_producer_segmented_pack")
+    def _record_producer_segmented_pack_fake(
+        ring_payload: torch.Tensor,
+        tensor: torch.Tensor,
+        segment_start: torch.Tensor,
+        segment_end: torch.Tensor,
+        feature_bytes: int,
+        emit_gate: Optional[torch.Tensor] = None,
+        emit_value: int = 0,
+    ) -> None:
+        return None
+
     del _ne
 except Exception:
     pass
@@ -312,6 +366,145 @@ class RingTransport:
         CPU memory; it bypasses the ring and staging entirely.
         """
         self._ring_engine.submit_cpu_direct(cpu_tensor)
+
+    # ------------------------------------------------------------------
+    # Opt-in generic-record path.  None of these methods is used by the
+    # released inference adapters.
+
+    def _record_payload_tensor(self) -> torch.Tensor:
+        """Return the stable payload alias to the core ``RecordRuntime``."""
+
+        return self._ring_payload
+
+    def configure_record_schema(self, schema: Any) -> None:
+        """Install the immutable schema used to encode Python descriptors."""
+
+        if hasattr(self, "_record_schema"):
+            raise RuntimeError("record schema is already configured")
+        self._record_schema = schema
+
+    def reserve_record(self, reservation_items: Any) -> int:
+        """Reserve ordered encoded-record producer entries."""
+
+        return int(self._ring_engine.reserve_record(tuple(reservation_items)))
+
+    def push_record_descriptors(self, descriptors: Any) -> None:
+        """Publish descriptors in the exact order of their producer tasks."""
+
+        self._ring_engine.push_record_descriptors(
+            tuple(descriptors), self._record_schema
+        )
+
+    def submit_record_cpu_direct(self, output: Any, entry: Any) -> None:
+        """Materialize one oversized physical output and submit it directly."""
+
+        cpu_tensor = self._record_cpu_tensor(output, entry)
+        self._ring_engine.submit_record_cpu_direct(
+            cpu_tensor,
+            int(cpu_tensor.numel()) * int(cpu_tensor.element_size()),
+        )
+
+    def flush_records_and_wait(self, timeout_s: float) -> None:
+        """Finish ring work and the configured sink durability boundary."""
+
+        completed = self._ring_engine.flush_records_and_wait(float(timeout_s))
+        if completed is False:
+            raise TimeoutError("timed out waiting for durable record completion")
+
+    @staticmethod
+    def _record_cpu_tensor(output: Any, entry: Any) -> torch.Tensor:
+        """Apply the selected producer transformation for CPU-direct fallback."""
+
+        from ..hooks.record import TransportType
+
+        source = output.tensor.detach().cpu().contiguous()
+        transport_type = entry.transport_type
+        if transport_type is TransportType.IDENTITY:
+            return source
+
+        byte_source = source.view(torch.uint8).reshape(-1)
+        if transport_type is TransportType.PREFIX_STRIP:
+            row_count = int(output.producer_meta[0].detach().cpu().item())
+            row_bytes = int(entry.transport_args[0])
+            nbytes = min(byte_source.numel(), max(0, row_count) * row_bytes)
+            return byte_source[:nbytes].clone()
+
+        if transport_type is TransportType.CHUNKED:
+            counts = output.producer_meta[0].detach().cpu().reshape(-1)
+            chunks = int(counts.numel())
+            if chunks <= 0 or byte_source.numel() % chunks != 0:
+                raise ValueError("CHUNKED CPU fallback requires equal input chunks")
+            chunk_bytes = byte_source.numel() // chunks
+            pieces = []
+            for index, value in enumerate(counts.tolist()):
+                count = max(0, min(chunk_bytes, int(value)))
+                begin = index * chunk_bytes
+                pieces.append(byte_source[begin : begin + count])
+            return torch.cat(pieces).contiguous() if pieces else byte_source[:0].clone()
+
+        if transport_type is TransportType.SEQ_PREFIX_PACK:
+            if source.dim() < 2:
+                raise ValueError("SEQ_PREFIX_PACK requires [S, B, ...] input")
+            counts = output.producer_meta[0].detach().cpu().reshape(-1)
+            if source.size(1) != counts.numel():
+                raise ValueError("SEQ_PREFIX_PACK valid-count length mismatch")
+            prefix = output.producer_meta[1].detach().cpu().reshape(-1)
+            batch = int(counts.numel())
+            if prefix.numel() != batch + 1:
+                raise ValueError("SEQ_PREFIX_PACK prefix length must equal batch + 1")
+            feature_bytes = int(entry.transport_args[0])
+            physical_batch_bytes = batch * feature_bytes
+            if (
+                batch <= 0
+                or feature_bytes <= 0
+                or byte_source.numel() % physical_batch_bytes != 0
+            ):
+                raise ValueError("SEQ_PREFIX_PACK payload has incompatible feature bytes")
+            max_rows = byte_source.numel() // feature_bytes
+            total_rows = max(0, min(max_rows, int(prefix[-1].item())))
+            prefix_values = [int(value) for value in prefix.tolist()]
+            pieces = []
+            for row in range(total_rows):
+                sample = 0
+                while sample + 1 < batch and row >= prefix_values[sample + 1]:
+                    sample += 1
+                sample_row = row - prefix_values[sample]
+                source_row = sample_row * batch + sample
+                begin = source_row * feature_bytes
+                pieces.append(byte_source[begin : begin + feature_bytes])
+            return (
+                torch.cat(pieces).contiguous()
+                if pieces
+                else byte_source[:0].clone()
+            )
+
+        if transport_type is TransportType.SEGMENTED_PACK:
+            starts = output.producer_meta[0].detach().cpu().reshape(-1)
+            ends = output.producer_meta[1].detach().cpu().reshape(-1)
+            if starts.numel() == 0 or starts.numel() != ends.numel():
+                raise ValueError("SEGMENTED_PACK start/end length mismatch")
+            feature_bytes = int(entry.transport_args[0])
+            if feature_bytes <= 0 or byte_source.numel() % feature_bytes != 0:
+                raise ValueError("SEGMENTED_PACK payload has incompatible feature bytes")
+            input_rows = byte_source.numel() // feature_bytes
+            pieces = []
+            for start, end in zip(starts.tolist(), ends.tolist()):
+                first_row = max(0, min(input_rows, int(start)))
+                last_row = max(first_row, min(input_rows, int(end)))
+                for source_row in range(first_row, last_row):
+                    begin = source_row * feature_bytes
+                    pieces.append(byte_source[begin : begin + feature_bytes])
+                    if len(pieces) == input_rows:
+                        break
+                if len(pieces) == input_rows:
+                    break
+            return (
+                torch.cat(pieces).contiguous()
+                if pieces
+                else byte_source[:0].clone()
+            )
+
+        raise ValueError(f"Unsupported transport type {transport_type!r}")
 
 
 

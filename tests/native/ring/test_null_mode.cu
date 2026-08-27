@@ -86,6 +86,10 @@ static void test_all_variants_are_noops() {
     uint8_t* source = upload_bytes(256);
     int64_t* row_count = upload_counts({3});
     int64_t* chunk_counts = upload_counts({16, 32, 0, 8});
+    int64_t* valid_count = upload_counts({2, 1});
+    int64_t* valid_prefix = upload_counts({0, 2, 3});
+    int64_t* segment_start = upload_counts({0, 4});
+    int64_t* segment_end = upload_counts({2, 6});
     cudaStream_t stream{};
     CUDA_CHECK(cudaStreamCreate(&stream));
 
@@ -94,10 +98,26 @@ static void test_all_variants_are_noops() {
     ring::launch_producer_prefix(state, source, 256, row_count, 32, 0, stream);
     ring::launch_producer_chunked(state, source, 256, chunk_counts, 4, 0,
                                   stream);
+    ring::launch_record_producer_static(
+        state, source, 256, nullptr, 0, stream);
+    ring::launch_record_producer_prefix(
+        state, source, 256, row_count, 32, nullptr, 0, stream);
+    ring::launch_record_producer_chunked(
+        state, source, 256, chunk_counts, 4, nullptr, 0, stream);
+    ring::launch_record_producer_seq_prefix_pack(
+        state, source, 256, valid_count, valid_prefix, 2, 32,
+        nullptr, 0, stream);
+    ring::launch_record_producer_segmented_pack(
+        state, source, 256, segment_start, segment_end, 2, 32,
+        nullptr, 0, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     expect_empty(state);
 
     set_null_mode(false);
+    CUDA_CHECK(cudaFree(segment_end));
+    CUDA_CHECK(cudaFree(segment_start));
+    CUDA_CHECK(cudaFree(valid_prefix));
+    CUDA_CHECK(cudaFree(valid_count));
     CUDA_CHECK(cudaFree(chunk_counts));
     CUDA_CHECK(cudaFree(row_count));
     CUDA_CHECK(cudaFree(source));

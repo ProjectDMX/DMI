@@ -53,6 +53,26 @@ _NON_HOOK_EXPORTS = {
     "HostEngineConfig",
     "deactivate_ring_transport",
     "HookPoint",
+    "HookPointV1",
+    "HookSpecV1",
+    "HookOutput",
+    "HookRuntime",
+    "TransportSpec",
+    "TransportType",
+    "OutputStorage",
+    "RecordType",
+    "ProducerPlanEntry",
+    "ProducerPlan",
+    "ProducerPlanBuilder",
+    "PayloadSlice",
+    "RecordCell",
+    "RecordCellType",
+    "RecordColumn",
+    "RecordDescriptor",
+    "RecordFormat",
+    "RecordLayout",
+    "RecordRuntime",
+    "RecordSchema",
     "HookSpec",
     "HookRowBasis",
     "ModelShapeConfig",
@@ -107,7 +127,10 @@ def test_v1_reexports_existing_objects_and_state() -> None:
     from dmi import engine
     from dmi.hooks import dispatch
     from dmi.hooks import point
+    from dmi.hooks import record
+    from dmi.hooks import producer_plan
     from dmi.hooks import specs
+    from dmi import records
     from dmi.storage import internals
     from dmi.hooks import selection
     from dmi.adapters import types
@@ -124,6 +147,28 @@ def test_v1_reexports_existing_objects_and_state() -> None:
     assert v1.CaptureSchedule is config.CaptureSchedule
     assert v1.HostEngineConfig is engine.HostEngineConfig
     assert v1.HookPoint is point.HookPoint
+    assert v1.HookPointV1 is record.HookPointV1
+    assert v1.HookSpecV1 is record.HookSpecV1
+    assert v1.HookOutput is record.HookOutput
+    assert v1.HookRuntime is record.HookRuntime
+    assert v1.TransportSpec is record.TransportSpec
+    assert v1.TransportType is record.TransportType
+    assert v1.OutputStorage is record.OutputStorage
+    assert v1.RecordType is record.RecordType
+    assert v1.ProducerPlanEntry is producer_plan.ProducerPlanEntry
+    assert v1.ProducerPlan is producer_plan.ProducerPlan
+    assert v1.ProducerPlanBuilder is producer_plan.ProducerPlanBuilder
+    assert v1.PayloadSlice is records.PayloadSlice
+    assert v1.RecordCell is records.RecordCell
+    assert v1.RecordCellType is records.RecordCellType
+    assert v1.RecordColumn is records.RecordColumn
+    assert v1.RecordDescriptor is records.RecordDescriptor
+    assert v1.RecordFormat is records.RecordFormat
+    assert v1.RecordLayout is records.RecordLayout
+    assert v1.RecordRuntime is records.RecordRuntime
+    assert v1.RecordSchema is records.RecordSchema
+    assert not hasattr(v1.RecordRuntime, "record_format")
+    assert not hasattr(v1.ProducerPlanBuilder, "reset")
     assert v1.HookSpec is specs.HookSpec
     assert v1.HookRowBasis is specs.HookRowBasis
     assert v1.ModelShapeConfig is specs.ModelShapeConfig
@@ -189,10 +234,15 @@ def test_v1_public_surface_is_documented() -> None:
     assert missing == []
     member_names = {
         "active_hook_specs",
+        "bind_hook",
         "capture_enabled",
         "commit_step",
+        "create_record_runtime",
+        "emit_output",
+        "flush_and_wait",
         "model_shape",
         "plan_step",
+        "prepare_replay",
         "ring_capacities",
         "set_capture_enabled",
     }
