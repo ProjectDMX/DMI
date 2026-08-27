@@ -59,7 +59,6 @@ std::vector<std::int64_t> resolve_shape(const ring::PayloadSlice& slice,
                                         std::uint64_t length_bytes,
                                         at::ScalarType dtype) {
     std::vector<std::int64_t> shape = slice.logical_shape;
-    if (shape.empty()) invalid("tensor payload requires a logical shape");
 
     const auto element_bytes =
         static_cast<std::uint64_t>(at::elementSize(dtype));

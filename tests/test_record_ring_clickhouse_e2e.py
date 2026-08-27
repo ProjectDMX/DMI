@@ -159,8 +159,16 @@ def test_record_producer_ring_descriptor_and_clickhouse_readback():
         hook_runtime = _EagerHookRuntime(runtime, ("run-a", 7))
         runtime.bind_hook(hook, hook_runtime=hook_runtime)
 
+        scalar_hook = HookPointV1(
+            HookSpecV1("phase2_scalar_tensor", (TransportSpec("scalar_payload"),))
+        )
+        scalar_hook_runtime = _EagerHookRuntime(runtime, ("run-a", 8))
+        runtime.bind_hook(scalar_hook, hook_runtime=scalar_hook_runtime)
+
         expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        expected_scalar = torch.tensor(3.5, dtype=torch.float32)
         hook(expected.cuda())
+        scalar_hook(expected_scalar.cuda())
         engine.flush_and_wait(30.0)
 
         client = clickhouse_driver.Client(
@@ -170,15 +178,24 @@ def test_record_producer_ring_descriptor_and_clickhouse_readback():
         )
         rows = client.execute(
             f"SELECT run_id, record_id, payload_dtype, payload_shape, "
-            f"hex(payload_bytes) FROM `{table}`"
+            f"hex(payload_bytes) FROM `{table}` ORDER BY run_id, record_id"
         )
-        assert rows == [(
-            "run-a",
-            7,
-            "torch.float",
-            [3, 4],
-            expected.numpy().tobytes().hex().upper(),
-        )]
+        assert rows == [
+            (
+                "run-a",
+                7,
+                "torch.float",
+                [3, 4],
+                expected.numpy().tobytes().hex().upper(),
+            ),
+            (
+                "run-a",
+                8,
+                "torch.float",
+                [],
+                expected_scalar.numpy().tobytes().hex().upper(),
+            ),
+        ]
     finally:
         try:
             if engine is not None:

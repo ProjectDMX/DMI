@@ -34,6 +34,7 @@
 #include "task_ring.cuh"
 #include "ring_config.h"
 
+#include <cstdint>
 #include <stdexcept>
 
 namespace ring {
@@ -330,6 +331,54 @@ __device__ inline bool record_emit_allowed(const int32_t* emit_gate,
     return emit_gate == nullptr || *emit_gate == emit_value;
 }
 
+// Generic records may pack rows or chunk prefixes whose byte widths are not
+// multiples of PAYLOAD_ALIGN.  Keep the vectorized copy when both addresses
+// are aligned, and use byte copies for an unaligned source or destination.
+__device__ inline void record_d2d_copy_grid_stride(
+    uint8_t*       dst,
+    const uint8_t* src,
+    uint64_t       nbytes,
+    uint64_t       gtid,
+    uint64_t       stride) {
+    const uintptr_t address_bits =
+        reinterpret_cast<uintptr_t>(dst) |
+        reinterpret_cast<uintptr_t>(src);
+    if ((address_bits & (PAYLOAD_ALIGN - 1)) == 0) {
+        d2d_copy_grid_stride(dst, src, nbytes, gtid, stride);
+        return;
+    }
+
+    for (uint64_t i = gtid; i < nbytes; i += stride) {
+        dst[i] = src[i];
+    }
+}
+
+__device__ inline void record_copy_chunk_with_wrap(
+    uint8_t*       payload_buf,
+    const TwoSpan& spans,
+    uint64_t       dst_off,
+    uint64_t       nbytes,
+    const uint8_t* src,
+    uint64_t       gtid,
+    uint64_t       stride) {
+    uint64_t in_span1 = 0;
+    if (dst_off < spans.len1) {
+        const uint64_t avail = spans.len1 - dst_off;
+        in_span1 = nbytes < avail ? nbytes : avail;
+        record_d2d_copy_grid_stride(
+            payload_buf + spans.off1 + dst_off,
+            src, in_span1, gtid, stride);
+    }
+    const uint64_t in_span2 = nbytes - in_span1;
+    if (in_span2 > 0) {
+        const uint64_t span2_off =
+            dst_off >= spans.len1 ? dst_off - spans.len1 : 0;
+        record_d2d_copy_grid_stride(
+            payload_buf + spans.off2 + span2_off,
+            src + in_span1, in_span2, gtid, stride);
+    }
+}
+
 // A false record gate still consumes the task reservation made by the host.
 // Publish an empty entry in FIFO order without touching payload state.
 __device__ inline void record_publish_zero_byte_task(RingState& ring) {
@@ -367,8 +416,8 @@ __device__ inline void record_copy_row_block(
     uint64_t       dst_offset,
     const uint8_t* src,
     uint64_t       row_bytes) {
-    copy_chunk_with_wrap(payload_buf, spans, dst_offset, row_bytes, src,
-                         threadIdx.x, blockDim.x);
+    record_copy_chunk_with_wrap(payload_buf, spans, dst_offset, row_bytes, src,
+                                threadIdx.x, blockDim.x);
 }
 
 __global__ void record_producer_static_kernel(
@@ -482,7 +531,7 @@ __global__ void record_producer_chunked_kernel(
     const uint64_t stride = uint64_t(blocks_per_chunk) * blockDim.x;
     const uint64_t selected_bytes = static_cast<uint64_t>(selected[chunk]);
     if (selected_bytes > 0) {
-        copy_chunk_with_wrap(
+        record_copy_chunk_with_wrap(
             ring.payload_buf, spans, static_cast<uint64_t>(prefix[chunk]),
             selected_bytes, src + uint64_t(chunk) * input_chunk, gtid, stride);
     }

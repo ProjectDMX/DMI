@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from ..adapters.base import StepReservation
+from . import point as _hook_point
 
 
 class TransportType(str, Enum):
@@ -260,6 +261,8 @@ class HookPointV1(nn.Module):
             zip(spec.outputs, self._output_ids, outputs)
         ):
             output = _as_hook_output(value)
+            if _hook_point._MONITORING_DEBUG:
+                self._validate_producer_metadata(output_spec, output)
             reservation = runtime.prepare_output(
                 hook=self,
                 output_index=index,
@@ -285,7 +288,7 @@ class HookPointV1(nn.Module):
             )
             return
         if spec.transport_type is TransportType.PREFIX_STRIP:
-            row_count = self._producer_tensor(output, 0, "row_count")
+            row_count = output.producer_meta[0]
             torch.ops.ring.record_producer_prefix(
                 ring_payload,
                 tensor,
@@ -296,14 +299,13 @@ class HookPointV1(nn.Module):
             )
             return
         if spec.transport_type is TransportType.CHUNKED:
-            chunk_bytes = self._producer_tensor(output, 0, "chunk_bytes")
+            chunk_bytes = output.producer_meta[0]
             torch.ops.ring.record_producer_chunked(
                 ring_payload, tensor, chunk_bytes, gate, gate_value
             )
             return
         if spec.transport_type is TransportType.SEQ_PREFIX_PACK:
-            valid_count = self._producer_tensor(output, 0, "valid_count")
-            valid_prefix_sum = self._producer_tensor(output, 1, "valid_prefix_sum")
+            valid_count, valid_prefix_sum = output.producer_meta
             torch.ops.ring.record_producer_seq_prefix_pack(
                 ring_payload,
                 tensor,
@@ -315,8 +317,7 @@ class HookPointV1(nn.Module):
             )
             return
         if spec.transport_type is TransportType.SEGMENTED_PACK:
-            starts = self._producer_tensor(output, 0, "segment_start")
-            ends = self._producer_tensor(output, 1, "segment_end")
+            starts, ends = output.producer_meta
             torch.ops.ring.record_producer_segmented_pack(
                 ring_payload,
                 tensor,
@@ -330,14 +331,89 @@ class HookPointV1(nn.Module):
         raise ValueError(f"Unsupported transport type {spec.transport_type!r}")
 
     @staticmethod
-    def _producer_tensor(output: HookOutput, index: int, name: str) -> torch.Tensor:
-        try:
-            value = output.producer_meta[index]
-        except IndexError as exc:
-            raise ValueError(f"record producer requires {name} tensor") from exc
-        if not isinstance(value, torch.Tensor):
-            raise TypeError(f"{name} must be a Tensor")
-        return value
+    def _validate_producer_metadata(
+        spec: TransportSpec,
+        output: HookOutput,
+    ) -> None:
+        transport_type = spec.transport_type
+        if transport_type is TransportType.IDENTITY:
+            names = ()
+        elif transport_type is TransportType.PREFIX_STRIP:
+            names = ("row_count",)
+        elif transport_type is TransportType.CHUNKED:
+            names = ("chunk_bytes",)
+        elif transport_type is TransportType.SEQ_PREFIX_PACK:
+            names = ("valid_count", "valid_prefix_sum")
+        elif transport_type is TransportType.SEGMENTED_PACK:
+            names = ("segment_start", "segment_end")
+        else:
+            raise ValueError(f"Unsupported transport type {transport_type!r}")
+
+        metadata = output.producer_meta
+        if len(metadata) < len(names):
+            raise ValueError(
+                f"record producer requires {names[len(metadata)]} tensor"
+            )
+        if len(metadata) > len(names):
+            raise ValueError(
+                f"{transport_type.value} expects {len(names)} producer metadata "
+                f"tensor(s), got {len(metadata)}"
+            )
+
+        payload = output.tensor
+        for name, value in zip(names, metadata):
+            if value.dtype is not torch.int64:
+                raise TypeError(f"{name} must have dtype int64")
+            if not value.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+            if value.device != payload.device:
+                raise ValueError(f"{name} must be on the payload device")
+
+        if transport_type is TransportType.IDENTITY:
+            return
+        if transport_type is TransportType.PREFIX_STRIP:
+            if metadata[0].numel() != 1:
+                raise ValueError("row_count must contain one element")
+            return
+
+        payload_bytes = int(payload.numel()) * int(payload.element_size())
+        if transport_type is TransportType.CHUNKED:
+            chunk_bytes = metadata[0]
+            if chunk_bytes.dim() != 1:
+                raise ValueError("chunk_bytes must be one-dimensional")
+            chunks = int(chunk_bytes.numel())
+            if chunks < 1:
+                raise ValueError("chunk_bytes must be non-empty")
+            if payload_bytes % chunks != 0:
+                raise ValueError("payload bytes must divide evenly into chunks")
+            return
+
+        if transport_type is TransportType.SEQ_PREFIX_PACK:
+            valid_count, valid_prefix_sum = metadata
+            if valid_count.dim() != 1 or valid_count.numel() == 0:
+                raise ValueError(
+                    "valid_count must be a non-empty one-dimensional tensor"
+                )
+            batch = int(valid_count.numel())
+            if valid_prefix_sum.dim() != 1 or valid_prefix_sum.numel() != batch + 1:
+                raise ValueError("valid_prefix_sum length must equal batch + 1")
+            if payload.dim() < 2 or payload.size(1) != batch:
+                raise ValueError("sequence-pack payload must be [S, B, ...]")
+            if payload_bytes % (batch * int(spec.feature_bytes)) != 0:
+                raise ValueError(
+                    "sequence-pack payload has incompatible feature bytes"
+                )
+            return
+
+        starts, ends = metadata
+        if starts.dim() != 1 or starts.numel() == 0:
+            raise ValueError(
+                "segment_start must be a non-empty one-dimensional tensor"
+            )
+        if ends.dim() != 1 or ends.numel() != starts.numel():
+            raise ValueError("segment_start/end lengths must match")
+        if payload_bytes % int(spec.feature_bytes) != 0:
+            raise ValueError("segmented-pack payload has incompatible feature bytes")
 
 
 __all__ = [

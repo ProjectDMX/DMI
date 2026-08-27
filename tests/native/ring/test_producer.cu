@@ -316,14 +316,47 @@ static void test_record_chunked_compacts_payload_head() {
     CUDA_CHECK(cudaFree(device));
 }
 
+static void test_record_chunked_unaligned_boundaries() {
+    banner("record chunked producer copies unaligned chunk boundaries");
+    ring::AllocatedRing allocated(make_config());
+    allocated.init();
+    ring::RingState& state = allocated.state();
+
+    constexpr uint32_t chunks = 2;
+    constexpr uint64_t input_chunk = 33;
+    const std::vector<int64_t> selected = {17, 17};
+    const std::vector<uint8_t> source = pattern(chunks * input_chunk, 107);
+    std::vector<uint8_t> expected;
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        const auto begin = source.begin() + chunk * input_chunk;
+        expected.insert(expected.end(), begin, begin + selected[chunk]);
+    }
+
+    uint8_t* device = upload(source);
+    int64_t* device_selected = upload_counts(selected);
+    ring::launch_record_producer_chunked(
+        state, device, source.size(), device_selected, chunks,
+        nullptr, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    expect_entry(state, 0, expected.size());
+    EXPECT(read_payload(state, state.task_entries[0]) == expected);
+    EXPECT(*state.actual_bytes_counter == expected.size());
+    EXPECT(*state.payload_head ==
+           ring::align_up(expected.size(), ring::PAYLOAD_ALIGN));
+
+    CUDA_CHECK(cudaFree(device_selected));
+    CUDA_CHECK(cudaFree(device));
+}
+
 static void test_record_sequence_and_segmented_pack() {
     banner("record row packers preserve declared row order");
     ring::AllocatedRing allocated(make_config());
     allocated.init();
     ring::RingState& state = allocated.state();
 
-    // Source is [S=3, B=2, feature=4 bytes], one distinct byte pattern per row.
-    constexpr uint64_t feature_bytes = 4;
+    // Source is [S=3, B=2, feature=20 bytes], one distinct byte pattern per row.
+    constexpr uint64_t feature_bytes = 20;
     std::vector<uint8_t> source(3 * 2 * feature_bytes);
     for (uint64_t row = 0; row < 6; ++row) {
         std::fill(source.begin() + row * feature_bytes,
@@ -442,6 +475,7 @@ int main() {
     test_chunked_packed_copy();
     test_serialized_static_launches();
     test_record_chunked_compacts_payload_head();
+    test_record_chunked_unaligned_boundaries();
     test_record_sequence_and_segmented_pack();
     test_record_device_gate_publishes_zero_byte_entries();
 

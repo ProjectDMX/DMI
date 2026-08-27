@@ -13,7 +13,9 @@ from dmi.hooks.record import (
     HookPointV1,
     HookSpecV1,
     TransportSpec,
+    TransportType,
 )
+from dmi.hooks import set_monitoring_debug
 
 pytestmark = pytest.mark.cpu
 
@@ -118,6 +120,134 @@ def test_hook_output_preserves_device_side_producer_metadata():
 
     assert runtime.prepared[0]["output"] is output
     assert dispatched[0][1].producer_meta == (meta,)
+
+
+@pytest.mark.parametrize(
+    ("spec", "output", "error"),
+    (
+        (
+            TransportSpec("identity"),
+            HookOutput(
+                torch.ones(4),
+                (torch.ones(1, dtype=torch.int64),),
+            ),
+            "identity expects 0 producer metadata tensor",
+        ),
+        (
+            TransportSpec(
+                "prefix", transport_type=TransportType.PREFIX_STRIP, row_bytes=4
+            ),
+            HookOutput(torch.ones(4)),
+            "requires row_count tensor",
+        ),
+        (
+            TransportSpec(
+                "prefix", transport_type=TransportType.PREFIX_STRIP, row_bytes=4
+            ),
+            HookOutput(torch.ones(4), (torch.ones(1),)),
+            "row_count must have dtype int64",
+        ),
+        (
+            TransportSpec(
+                "prefix", transport_type=TransportType.PREFIX_STRIP, row_bytes=4
+            ),
+            HookOutput(
+                torch.ones(4),
+                (torch.ones(1, dtype=torch.int64, device="meta"),),
+            ),
+            "row_count must be on the payload device",
+        ),
+        (
+            TransportSpec("chunked", transport_type=TransportType.CHUNKED),
+            HookOutput(
+                torch.ones(4),
+                (torch.ones((1, 2), dtype=torch.int64),),
+            ),
+            "chunk_bytes must be one-dimensional",
+        ),
+        (
+            TransportSpec("chunked", transport_type=TransportType.CHUNKED),
+            HookOutput(
+                torch.ones(3),
+                (torch.ones(5, dtype=torch.int64),),
+            ),
+            "payload bytes must divide evenly into chunks",
+        ),
+        (
+            TransportSpec(
+                "sequence",
+                transport_type=TransportType.SEQ_PREFIX_PACK,
+                feature_bytes=4,
+            ),
+            HookOutput(
+                torch.ones((2, 2)),
+                (
+                    torch.ones(2, dtype=torch.int64),
+                    torch.ones(2, dtype=torch.int64),
+                ),
+            ),
+            r"valid_prefix_sum length must equal batch \+ 1",
+        ),
+        (
+            TransportSpec(
+                "segmented",
+                transport_type=TransportType.SEGMENTED_PACK,
+                feature_bytes=4,
+            ),
+            HookOutput(
+                torch.ones(4),
+                (
+                    torch.ones(2, dtype=torch.int64),
+                    torch.ones(1, dtype=torch.int64),
+                ),
+            ),
+            "segment_start/end lengths must match",
+        ),
+    ),
+)
+def test_invalid_producer_metadata_fails_before_runtime_preparation(
+    spec, output, error
+):
+    hook = HookPointV1(HookSpecV1("invalid_metadata", (spec,)))
+    runtime = _Runtime()
+    dispatched = _bind_for_cpu(hook, runtime)
+
+    set_monitoring_debug(True)
+    try:
+        with pytest.raises((TypeError, ValueError), match=error):
+            hook(output)
+    finally:
+        set_monitoring_debug(False)
+
+    assert runtime.prepared == []
+    assert dispatched == []
+
+
+def test_producer_metadata_validation_is_skipped_outside_debug_mode():
+    spec = TransportSpec(
+        "prefix", transport_type=TransportType.PREFIX_STRIP, row_bytes=4
+    )
+    hook = HookPointV1(HookSpecV1("production_metadata", (spec,)))
+    runtime = _Runtime()
+    dispatched = _bind_for_cpu(hook, runtime)
+    output = HookOutput(
+        torch.ones(4),
+        (torch.ones(1, dtype=torch.int64),),
+    )
+    validator_calls = []
+    hook._validate_producer_metadata = MethodType(
+        lambda self, output_spec, hook_output: validator_calls.append(
+            (output_spec, hook_output)
+        ),
+        hook,
+    )
+
+    set_monitoring_debug(False)
+    hook(output)
+
+    assert validator_calls == []
+    assert len(runtime.prepared) == 1
+    assert len(dispatched) == 1
 
 
 def test_wrong_preprocess_arity_fails_before_dispatch():
