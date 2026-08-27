@@ -8,3 +8,7 @@
 void ring_set_active_engine(ring_py::RingEnginePy* e);
 void ring_diag_reset_host_counters();
 void ring_diag_print_host_counters();
+
+// The additive ring::record_producer* torch ops use the same explicitly
+// activated engine pointer.  They are registered separately from the released
+// inference producer ops; no legacy schema is widened or reinterpreted.

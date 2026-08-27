@@ -11,6 +11,12 @@
 #include "ring/producer.cuh"
 #include "ring/ring_debug.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
+#include <algorithm>
+#include <chrono>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <thread>
 
 // Forward-declare symbols from producer.cu
 namespace ring {
@@ -18,6 +24,83 @@ void set_ring_null_mode(bool enabled);
 }  // namespace ring
 
 namespace ring_py {
+
+namespace {
+
+using FlushClock = std::chrono::steady_clock;
+
+void check_flush_cuda(cudaError_t error, const char* operation) {
+    if (error == cudaSuccess) return;
+    throw std::runtime_error(
+        std::string("record flush ") + operation + " failed: " +
+        cudaGetErrorString(error));
+}
+
+class ScopedFlushEvent {
+public:
+    ScopedFlushEvent() {
+        check_flush_cuda(
+            cudaEventCreateWithFlags(&event_, cudaEventDisableTiming),
+            "cudaEventCreateWithFlags");
+    }
+
+    ~ScopedFlushEvent() noexcept {
+        if (event_ != nullptr) cudaEventDestroy(event_);
+    }
+
+    ScopedFlushEvent(const ScopedFlushEvent&) = delete;
+    ScopedFlushEvent& operator=(const ScopedFlushEvent&) = delete;
+
+    cudaEvent_t get() const { return event_; }
+
+    cudaError_t destroy() noexcept {
+        if (event_ == nullptr) return cudaSuccess;
+        cudaEvent_t event = event_;
+        event_ = nullptr;
+        return cudaEventDestroy(event);
+    }
+
+private:
+    cudaEvent_t event_{nullptr};
+};
+
+bool wait_for_stream_prefix_until(
+    cudaStream_t stream, FlushClock::time_point deadline) {
+    ScopedFlushEvent event;
+    check_flush_cuda(cudaEventRecord(event.get(), stream), "cudaEventRecord");
+
+    for (;;) {
+        const cudaError_t status = cudaEventQuery(event.get());
+        if (status == cudaSuccess) {
+            check_flush_cuda(event.destroy(), "cudaEventDestroy");
+            return true;
+        }
+        if (status != cudaErrorNotReady) {
+            check_flush_cuda(status, "cudaEventQuery");
+        }
+
+        const auto now = FlushClock::now();
+        if (now >= deadline) {
+            check_flush_cuda(event.destroy(), "cudaEventDestroy");
+            return false;
+        }
+        std::this_thread::sleep_until(
+            std::min(deadline, now + std::chrono::microseconds(50)));
+    }
+}
+
+FlushClock::time_point record_flush_deadline(uint64_t timeout_ms) {
+    const auto now = FlushClock::now();
+    const auto max_remaining = FlushClock::time_point::max() - now;
+    const auto max_milliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(max_remaining);
+    if (timeout_ms >= static_cast<uint64_t>(max_milliseconds.count())) {
+        return FlushClock::time_point::max();
+    }
+    return now + std::chrono::milliseconds(timeout_ms);
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 struct RingEnginePy::Impl {
@@ -37,9 +120,22 @@ struct RingEnginePy::Impl {
     // engine init; returned by payload_tensor().  Used as the
     // Tensor(a!) mutation alias passed to every producer op call.
     at::Tensor       payload_view;
+    bool             record_mode{false};
 
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
+    {
+        const auto& state = engine.ring_state();
+        int dev_idx = 0;
+        cudaGetDevice(&dev_idx);
+        payload_view = at::from_blob(
+            state.payload_buf,
+            {static_cast<int64_t>(state.payload_cap)},
+            at::TensorOptions().dtype(at::kByte).device(at::kCUDA, dev_idx));
+    }
+
+    Impl(ring::RingConfig cfg, std::shared_ptr<ring::RecordSink> sink)
+        : engine(std::move(cfg), std::move(sink)), record_mode(true)
     {
         const auto& state = engine.ring_state();
         int dev_idx = 0;
@@ -74,6 +170,11 @@ RingEnginePy::RingEnginePy(RingConfig cfg, SubmitFn submit_fn) {
     impl_ = std::make_unique<Impl>(convert(cfg), std::move(submit_fn));
 }
 
+RingEnginePy::RingEnginePy(
+    RingConfig cfg, std::shared_ptr<ring::RecordSink> sink) {
+    impl_ = std::make_unique<Impl>(convert(cfg), std::move(sink));
+}
+
 RingEnginePy::~RingEnginePy() = default;
 
 void RingEnginePy::init(uint64_t stream_handle) {
@@ -105,6 +206,10 @@ void RingEnginePy::set_null_mode(bool enabled) {
 
 
 void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
+    if (impl_->record_mode) {
+        delete ctx;
+        throw std::logic_error("legacy metadata cannot be pushed to a record ring");
+    }
     impl_->fifo.push_step(ctx, metas);
 }
 
@@ -165,6 +270,88 @@ void RingEnginePy::hook_no_notify_chunked(uint64_t d_ptr, uint64_t nbytes_upper,
         reinterpret_cast<const int64_t*>(chunk_bytes_dev_ptr),
         K,
         hook_type, stream);
+}
+
+void RingEnginePy::record_no_notify(
+    uint64_t d_ptr, uint64_t nbytes,
+    uint64_t emit_gate_ptr, int32_t emit_value,
+    uint64_t stream_handle) {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record producer requires a record ring");
+    }
+    ring::launch_record_producer_static(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr), nbytes,
+        reinterpret_cast<const int32_t*>(emit_gate_ptr), emit_value,
+        reinterpret_cast<cudaStream_t>(stream_handle));
+}
+
+void RingEnginePy::record_no_notify_prefix(
+    uint64_t d_ptr, uint64_t nbytes_upper,
+    uint64_t row_count_dev_ptr, uint64_t row_bytes,
+    uint64_t emit_gate_ptr, int32_t emit_value,
+    uint64_t stream_handle) {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record producer requires a record ring");
+    }
+    ring::launch_record_producer_prefix(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr), nbytes_upper,
+        reinterpret_cast<const int64_t*>(row_count_dev_ptr), row_bytes,
+        reinterpret_cast<const int32_t*>(emit_gate_ptr), emit_value,
+        reinterpret_cast<cudaStream_t>(stream_handle));
+}
+
+void RingEnginePy::record_no_notify_chunked(
+    uint64_t d_ptr, uint64_t nbytes_upper,
+    uint64_t chunk_bytes_dev_ptr, uint32_t chunk_count,
+    uint64_t emit_gate_ptr, int32_t emit_value,
+    uint64_t stream_handle) {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record producer requires a record ring");
+    }
+    ring::launch_record_producer_chunked(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr), nbytes_upper,
+        reinterpret_cast<const int64_t*>(chunk_bytes_dev_ptr), chunk_count,
+        reinterpret_cast<const int32_t*>(emit_gate_ptr), emit_value,
+        reinterpret_cast<cudaStream_t>(stream_handle));
+}
+
+void RingEnginePy::record_no_notify_seq_prefix_pack(
+    uint64_t d_ptr, uint64_t nbytes_upper,
+    uint64_t valid_count_dev_ptr, uint64_t valid_prefix_sum_dev_ptr,
+    uint32_t batch, uint64_t feature_bytes,
+    uint64_t emit_gate_ptr, int32_t emit_value,
+    uint64_t stream_handle) {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record producer requires a record ring");
+    }
+    ring::launch_record_producer_seq_prefix_pack(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr), nbytes_upper,
+        reinterpret_cast<const int64_t*>(valid_count_dev_ptr),
+        reinterpret_cast<const int64_t*>(valid_prefix_sum_dev_ptr), batch,
+        feature_bytes, reinterpret_cast<const int32_t*>(emit_gate_ptr),
+        emit_value, reinterpret_cast<cudaStream_t>(stream_handle));
+}
+
+void RingEnginePy::record_no_notify_segmented_pack(
+    uint64_t d_ptr, uint64_t nbytes_upper,
+    uint64_t segment_start_dev_ptr, uint64_t segment_end_dev_ptr,
+    uint32_t segment_count, uint64_t feature_bytes,
+    uint64_t emit_gate_ptr, int32_t emit_value,
+    uint64_t stream_handle) {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record producer requires a record ring");
+    }
+    ring::launch_record_producer_segmented_pack(
+        impl_->engine.ring_state(),
+        reinterpret_cast<const uint8_t*>(d_ptr), nbytes_upper,
+        reinterpret_cast<const int64_t*>(segment_start_dev_ptr),
+        reinterpret_cast<const int64_t*>(segment_end_dev_ptr), segment_count,
+        feature_bytes, reinterpret_cast<const int32_t*>(emit_gate_ptr),
+        emit_value, reinterpret_cast<cudaStream_t>(stream_handle));
 }
 
 void RingEnginePy::notify_drain() {
@@ -247,6 +434,137 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     drain.force_flush_and_wait();
     drain.reserve(step_total_bytes, num_hooks);
     return STEP_RING_FLUSHED;
+}
+
+int RingEnginePy::reserve_record(
+    const std::vector<std::pair<uint64_t, bool>>& reservation_items) {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record reservation requires a record ring");
+    }
+    uint64_t reservation_bytes = 0;
+    std::vector<ring::RecordReservationItem> items;
+    items.reserve(reservation_items.size());
+    for (const auto& item : reservation_items) {
+        if (item.first % ring::PAYLOAD_ALIGN != 0) {
+            throw std::invalid_argument(
+                "record reservation bytes must be PAYLOAD_ALIGN-aligned");
+        }
+        if (reservation_bytes >
+            std::numeric_limits<uint64_t>::max() - item.first) {
+            throw std::overflow_error("record reservation byte total overflow");
+        }
+        reservation_bytes += item.first;
+        items.push_back({item.first, item.second});
+    }
+    if (items.empty()) return STEP_RING_OK;
+    const uint64_t num_tasks = items.size();
+
+    const uint64_t payload_cap = impl_->engine.payload_cap();
+    const uint64_t staging_cap = impl_->engine.staging_cap();
+    const uint64_t effective_cap = std::min(payload_cap, staging_cap);
+    const uint64_t task_cap = impl_->engine.task_cap();
+    auto& drain = impl_->engine.drain_thread();
+    drain.rethrow_drain_failure();
+    drain.rethrow_record_reclaim_failure();
+    drain.apply_pending_record_reclaims();
+
+    if (reservation_bytes > effective_cap || num_tasks > task_cap) {
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+        cudaStreamSynchronize(stream);
+        drain.force_flush_and_wait();
+        drain.rethrow_drain_failure();
+        drain.rethrow_record_reclaim_failure();
+        drain.apply_pending_record_reclaims();
+        if (drain.pending_record_reclaims() != 0) {
+            throw std::runtime_error(
+                "record flush found incomplete producer reclaims");
+        }
+        return STEP_OVERSIZED;
+    }
+
+    const uint64_t payload_used =
+        drain.cpu_payload_head() - drain.cpu_payload_tail_committed();
+    const uint64_t task_used =
+        drain.cpu_task_head() - drain.cpu_task_tail_committed();
+    if (reservation_bytes <= payload_cap - payload_used &&
+        num_tasks <= task_cap - task_used) {
+        drain.reserve_record(items);
+        return STEP_RING_OK;
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStreamSynchronize(stream);
+    drain.force_flush_and_wait();
+    drain.rethrow_drain_failure();
+    drain.rethrow_record_reclaim_failure();
+    drain.apply_pending_record_reclaims();
+    if (drain.pending_record_reclaims() != 0) {
+        throw std::runtime_error(
+            "record flush found incomplete producer reclaims");
+    }
+    drain.reserve_record(items);
+    return STEP_RING_FLUSHED;
+}
+
+void RingEnginePy::push_record_descriptors(
+    std::vector<ring::RecordDescriptor> descriptors) {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record descriptors require a record ring");
+    }
+    impl_->engine.record_consumer().push_descriptors(std::move(descriptors));
+}
+
+void RingEnginePy::submit_record_cpu_direct(
+    at::Tensor cpu_tensor, uint64_t tensor_bytes) {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record CPU submission requires a record ring");
+    }
+    impl_->engine.drain_thread().submit_cpu_direct(
+        std::move(cpu_tensor), tensor_bytes);
+}
+
+bool RingEnginePy::flush_records_and_wait(uint64_t timeout_ms) {
+    if (!impl_->record_mode) {
+        throw std::logic_error("record flush requires a record ring");
+    }
+    const auto deadline = record_flush_deadline(timeout_ms);
+    auto& drain = impl_->engine.drain_thread();
+    auto& consumer = impl_->engine.record_consumer();
+    drain.rethrow_drain_failure();
+    drain.rethrow_record_reclaim_failure();
+    consumer.rethrow_if_failed();
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    if (!wait_for_stream_prefix_until(stream, deadline)) return false;
+    if (!drain.force_flush_and_wait_until(deadline)) return false;
+    drain.rethrow_record_reclaim_failure();
+
+    drain.apply_pending_record_reclaims();
+    if (drain.pending_record_reclaims() != 0) {
+        throw std::runtime_error(
+            "record flush found incomplete producer reclaims");
+    }
+
+    const auto now = FlushClock::now();
+    const auto remaining = now < deadline
+        ? std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+        : std::chrono::milliseconds::zero();
+    if (!consumer.wait_until_idle(remaining)) return false;
+    consumer.finish();
+
+    const auto sink = impl_->engine.record_sink();
+    if (sink) {
+        sink->rethrow_if_failed();
+        const auto before_sink = FlushClock::now();
+        if (before_sink >= deadline) return false;
+        const auto sink_timeout =
+            std::chrono::duration_cast<ring::RecordSink::Duration>(
+                deadline - before_sink);
+        if (!sink->flush_and_wait(sink_timeout)) return false;
+        sink->rethrow_if_failed();
+    }
+    if (FlushClock::now() > deadline) return false;
+    return true;
 }
 
 void RingEnginePy::submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes) {

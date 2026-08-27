@@ -10,12 +10,16 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "ring/tensor_meta.h"   // TensorMeta, TensorMetaFifo
+#include "ring/record_descriptor.h"
 
-// Forward-declare at::Tensor so SubmitFn can use it without including ATen here.
+// Forward-declare ATen and the generic sink so this plain interface does not
+// expose their implementation headers.
 namespace at { class Tensor; }
+namespace ring { class RecordSink; }
 
 namespace ring_py {
 
@@ -53,6 +57,8 @@ using SubmitFn = std::function<void(
 class RingEnginePy {
 public:
     explicit RingEnginePy(RingConfig cfg, SubmitFn submit_fn);
+    explicit RingEnginePy(RingConfig cfg,
+                          std::shared_ptr<ring::RecordSink> sink);
     ~RingEnginePy();
 
     RingEnginePy(const RingEnginePy&)            = delete;
@@ -94,6 +100,34 @@ public:
                                  uint32_t hook_type,
                                  uint64_t stream_handle);
 
+    // Additive schema-driven producers.  These methods are reachable only
+    // through the separately registered ring::record_producer* operations.
+    void record_no_notify(uint64_t d_ptr, uint64_t nbytes,
+                          uint64_t emit_gate_ptr, int32_t emit_value,
+                          uint64_t stream_handle);
+    void record_no_notify_prefix(uint64_t d_ptr, uint64_t nbytes_upper,
+                                 uint64_t row_count_dev_ptr,
+                                 uint64_t row_bytes,
+                                 uint64_t emit_gate_ptr, int32_t emit_value,
+                                 uint64_t stream_handle);
+    void record_no_notify_chunked(uint64_t d_ptr, uint64_t nbytes_upper,
+                                  uint64_t chunk_bytes_dev_ptr,
+                                  uint32_t chunk_count,
+                                  uint64_t emit_gate_ptr, int32_t emit_value,
+                                  uint64_t stream_handle);
+    void record_no_notify_seq_prefix_pack(
+        uint64_t d_ptr, uint64_t nbytes_upper,
+        uint64_t valid_count_dev_ptr, uint64_t valid_prefix_sum_dev_ptr,
+        uint32_t batch, uint64_t feature_bytes,
+        uint64_t emit_gate_ptr, int32_t emit_value,
+        uint64_t stream_handle);
+    void record_no_notify_segmented_pack(
+        uint64_t d_ptr, uint64_t nbytes_upper,
+        uint64_t segment_start_dev_ptr, uint64_t segment_end_dev_ptr,
+        uint32_t segment_count, uint64_t feature_bytes,
+        uint64_t emit_gate_ptr, int32_t emit_value,
+        uint64_t stream_handle);
+
     // Lightweight wake-up for the drain thread.
     void notify_drain();
 
@@ -128,6 +162,19 @@ public:
     static constexpr int STEP_OVERSIZED    = 2;
 
     int prepare_step(uint64_t step_total_bytes, uint32_t num_hooks);
+
+    // Each item is (aligned upper bound, needs actual-byte reconciliation).
+    int reserve_record(
+        const std::vector<std::pair<uint64_t, bool>>& reservation_items);
+
+    void push_record_descriptors(std::vector<ring::RecordDescriptor> descriptors);
+    void submit_record_cpu_direct(at::Tensor cpu_tensor,
+                                  uint64_t tensor_bytes);
+
+    // Complete the GPU-to-host record prefix and validate descriptor and
+    // reservation accounting and the configured sink's durability boundary
+    // within one timeout.  Returns false only on timeout.
+    bool flush_records_and_wait(uint64_t timeout_ms);
 
     // Submit a CPU-direct tensor to drain -> p2p pipeline.
     void submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes);

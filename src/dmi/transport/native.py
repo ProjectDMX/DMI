@@ -27,6 +27,8 @@ _HOST_EXPORTS = frozenset(
 )
 _RING_EXPORTS = frozenset(
     {
+        "ClickHouseRecordSink",
+        "RecordSink",
         "RingConfig",
         "RingEngine",
         "ring_set_active_engine",

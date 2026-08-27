@@ -330,4 +330,83 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     }
 }
 
+// ---------------------------------------------------------------------------
+// RecordP2PThread -- fixed schema-driven consumer path.
+// ---------------------------------------------------------------------------
+RecordP2PThread::RecordP2PThread(
+    DrainThread& drain, std::shared_ptr<RecordSink> sink)
+    : drain_(drain), consumer_(std::move(sink)) {}
+
+RecordP2PThread::~RecordP2PThread() noexcept {
+    stop();
+}
+
+void RecordP2PThread::start() {
+    thread_ = std::thread([this] { loop(); });
+}
+
+void RecordP2PThread::stop() {
+    if (thread_.joinable()) thread_.join();
+}
+
+void RecordP2PThread::loop() {
+    while (true) {
+        const uint64_t n = drain_.wait_for_tasks();
+        if (n == 0) break;
+
+        std::vector<DrainTask> local;
+        drain_.pop_tasks(n, local);
+        process(local);
+    }
+}
+
+void RecordP2PThread::process(std::vector<DrainTask>& tasks) {
+    for (DrainTask& task : tasks) {
+        try {
+            at::Tensor payload;
+            if (task.cpu_paged_tensor.defined()) {
+                payload = std::move(task.cpu_paged_tensor);
+                if (payload.scalar_type() != at::kByte || payload.dim() != 1) {
+                    at::Tensor source = payload.is_contiguous()
+                        ? payload : payload.contiguous();
+                    payload = at::empty(
+                        {static_cast<int64_t>(task.tensor_total_bytes)},
+                        at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+                    if (task.tensor_total_bytes > 0) {
+                        std::memcpy(payload.data_ptr<uint8_t>(),
+                                    source.data_ptr(),
+                                    task.tensor_total_bytes);
+                    }
+                }
+            } else {
+                payload = at::empty(
+                    {static_cast<int64_t>(task.tensor_total_bytes)},
+                    at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+                uint8_t* dst = payload.data_ptr<uint8_t>();
+                if (task.data_len1 > 0) {
+                    std::memcpy(dst, task.data_ptr1, task.data_len1);
+                }
+                if (task.data_len2 > 0) {
+                    std::memcpy(dst + task.data_len1,
+                                task.data_ptr2, task.data_len2);
+                }
+            }
+
+            // Once bytes are copied into pageable memory, the pinned range can
+            // be reused independently of record materialization and storage.
+            if (task.alloc_bytes > 0) {
+                drain_.notify_staging_freed_bytes(task.alloc_bytes);
+                task.alloc_bytes = 0;
+            }
+            consumer_.consume_payload(std::move(payload));
+        } catch (...) {
+            if (task.alloc_bytes > 0) {
+                drain_.notify_staging_freed_bytes(task.alloc_bytes);
+                task.alloc_bytes = 0;
+            }
+            consumer_.record_failure(std::current_exception());
+        }
+    }
+}
+
 }  // namespace ring

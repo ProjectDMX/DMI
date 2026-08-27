@@ -35,12 +35,42 @@ RingEngine::RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
     p2p_   = std::make_unique<P2PThread>(*drain_, fifo, cfg_, std::move(submit_fn));
 }
 
+RingEngine::RingEngine(const RingConfig& cfg,
+                       std::shared_ptr<RecordSink> sink)
+    : cfg_(cfg), ring_(cfg), record_sink_(std::move(sink))
+{
+    if (cfg_.payload_ring_bytes % PAYLOAD_ALIGN != 0) {
+        throw std::runtime_error(
+            "RingConfig: payload_ring_bytes must be a multiple of "
+            "PAYLOAD_ALIGN (wrap offset alignment)");
+    }
+    if (cfg_.drain_poll_timeout_us == 0) {
+        throw std::runtime_error(
+            "RingConfig: drain_poll_timeout_us must be > 0. "
+            "The drain thread must poll periodically to process entries "
+            "published mid-forward.");
+    }
+
+    auto* buf = ring_.state().payload_buf;
+    if (reinterpret_cast<uintptr_t>(buf) % PAYLOAD_ALIGN != 0) {
+        throw std::runtime_error(
+            "RingEngine: payload_buf is not PAYLOAD_ALIGN-aligned "
+            "(unexpected: cudaMalloc guarantees >= 256-byte alignment)");
+    }
+
+    staging_.init(cfg.effective_staging_bytes());
+    drain_ = std::make_unique<DrainThread>(ring_.state(), staging_, cfg_);
+    record_p2p_ = std::make_unique<RecordP2PThread>(
+        *drain_, record_sink_);
+}
+
 RingEngine::~RingEngine() noexcept {
     if (drain_) {
         drain_->stop();
         drain_->signal_p2p_stop();
     }
     if (p2p_) p2p_->stop();
+    if (record_p2p_) record_p2p_->stop();
 }
 
 void RingEngine::init(cudaStream_t stream) {
@@ -49,7 +79,8 @@ void RingEngine::init(cudaStream_t stream) {
 
 void RingEngine::start() {
     drain_->start();
-    p2p_->start();
+    if (p2p_) p2p_->start();
+    if (record_p2p_) record_p2p_->start();
 }
 
 void RingEngine::stop() {
@@ -61,7 +92,22 @@ void RingEngine::stop() {
 
     drain_->stop();
     drain_->signal_p2p_stop();
-    p2p_->stop();
+    if (p2p_) p2p_->stop();
+    if (record_p2p_) record_p2p_->stop();
+}
+
+RecordConsumer& RingEngine::record_consumer() {
+    if (!record_p2p_) {
+        throw std::logic_error("record consumer requested from legacy ring");
+    }
+    return record_p2p_->consumer();
+}
+
+const RecordConsumer& RingEngine::record_consumer() const {
+    if (!record_p2p_) {
+        throw std::logic_error("record consumer requested from legacy ring");
+    }
+    return record_p2p_->consumer();
 }
 
 }  // namespace ring

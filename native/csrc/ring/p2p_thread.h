@@ -9,6 +9,7 @@
 #include "drain_thread.h"
 #include "drain_task.h"
 #include "ring_config.h"
+#include "record_consumer.h"
 #include "tensor_meta.h"
 
 #include <functional>
@@ -56,6 +57,32 @@ private:
     void loop();
     void process(std::vector<DrainTask>& tasks);
     void do_post_processing(at::Tensor& tensor, const DrainTask& first_task);
+};
+
+// Schema-driven record path.  It intentionally has a distinct worker class
+// from P2PThread so the released inference path never selects a consumer per
+// payload.  Construction fixes the consumer for the lifetime of the ring.
+class RecordP2PThread {
+public:
+    RecordP2PThread(DrainThread& drain, std::shared_ptr<RecordSink> sink);
+    ~RecordP2PThread() noexcept;
+
+    RecordP2PThread(const RecordP2PThread&) = delete;
+    RecordP2PThread& operator=(const RecordP2PThread&) = delete;
+
+    void start();
+    void stop();
+
+    RecordConsumer& consumer() { return consumer_; }
+    const RecordConsumer& consumer() const { return consumer_; }
+
+private:
+    DrainThread&  drain_;
+    RecordConsumer consumer_;
+    std::thread   thread_;
+
+    void loop();
+    void process(std::vector<DrainTask>& tasks);
 };
 
 }  // namespace ring

@@ -40,6 +40,8 @@ def main():
     cuda_graphs = os.environ.get("E2E_CUDA_GRAPHS", "0") == "1"
     db_host = os.environ.get("DMX_DB_HOST", "localhost")
     db_port = int(os.environ.get("DMX_DB_PORT", "9000"))
+    db_database = os.environ.get("DMX_DB_DATABASE", "default")
+    db_table = os.environ.get("DMX_DB_TABLE", "offload")
     tp_size = int(os.environ.get("E2E_TP_SIZE", "1"))
 
     # Init distributed for TP
@@ -96,7 +98,7 @@ def main():
     if tp_rank == 0:
         ch_client = clickhouse_driver.Client(db_host, port=db_port)
         try:
-            ch_client.execute("DROP TABLE IF EXISTS default.offload")
+            ch_client.execute(f"DROP TABLE IF EXISTS {db_database}.{db_table}")
         except Exception:
             pass
     if tp_size > 1:
@@ -108,8 +110,8 @@ def main():
     ch_cfg.port = db_port
     ch_cfg.username = os.environ.get("DMX_DB_USER", "default")
     ch_cfg.password = os.environ.get("DMX_DB_PASSWORD", "")
-    ch_cfg.database = "default"
-    ch_cfg.table = "offload"
+    ch_cfg.database = db_database
+    ch_cfg.table = db_table
     ch_cfg.secure = False
     ch_cfg.client_side_compress = "none"
     ch_cfg.client_settings = None
@@ -206,7 +208,9 @@ def main():
     if tp_rank == 0:
         print("\n[compare] Comparing disk vs ClickHouse...", flush=True)
         from tests.compare_disk_vs_ch import read_clickhouse, compare
-        ch_data_all, total_rows = read_clickhouse(db_host, db_port)
+        ch_data_all, total_rows = read_clickhouse(
+            db_host, db_port, database=db_database, table=db_table
+        )
         passed, failed = compare(compare_dir, ch_data_all, total_rows)
 
         if failed > 0:

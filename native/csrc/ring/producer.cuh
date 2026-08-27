@@ -23,6 +23,17 @@
 // (caller's contract; see ring_torch_op.cpp).
 
 #pragma once
+
+#include <cstdint>
+
+namespace ring {
+
+// Upper bound on K (chunk count) for shared-memory sizing in the
+// chunked kernel and host-side argument validation.
+static constexpr uint32_t PRODUCER_MAX_K = 64;
+
+}  // namespace ring
+
 #ifdef __CUDACC__
 
 #include "ring_state.h"
@@ -43,9 +54,9 @@ static constexpr uint32_t TIER1_BLOCKS =  4;  // <= 4 MB
 static constexpr uint32_t TIER2_BLOCKS = 16;  // <= 32 MB
 static constexpr uint32_t TIER3_BLOCKS = 64;  // > 32 MB
 
-// Upper bound on K (chunk count) for shared-memory sizing in the
-// chunked kernel.  Covers expected num_local_experts under EP.
-static constexpr uint32_t PRODUCER_MAX_K = 64;
+// Record-only row packers use one block per logical output row and cap the
+// grid so a conservative upper bound cannot create an unbounded launch.
+static constexpr uint32_t RECORD_PACK_MAX_BLOCKS = 1024;
 
 // Static: copy all `nbytes`; no actual_dev_ptr, no row_bytes.
 __global__ void producer_static_kernel(
@@ -97,6 +108,114 @@ void launch_producer_chunked(
     const int64_t*   chunk_bytes_dev_ptr,
     uint32_t         K,
     uint32_t         hook_type,
+    cudaStream_t     stream = 0);
+
+// ---------------------------------------------------------------------------
+// Additive generic-record producers.
+//
+// These are separately named so the released inference torch-op schemas and
+// kernels above remain unchanged.  The optional int32 device scalar gates
+// emission without a host read: nullptr emits unconditionally; otherwise the
+// producer emits only when *emit_gate == emit_value.
+// ---------------------------------------------------------------------------
+
+__global__ void record_producer_static_kernel(
+    RingState        ring,
+    const uint8_t*   src,
+    uint64_t         nbytes,
+    const int32_t*   emit_gate,
+    int32_t          emit_value);
+
+void launch_record_producer_static(
+    const RingState& ring,
+    const uint8_t*   d_src,
+    uint64_t         nbytes,
+    const int32_t*   emit_gate,
+    int32_t          emit_value,
+    cudaStream_t     stream = 0);
+
+__global__ void record_producer_prefix_kernel(
+    RingState        ring,
+    const uint8_t*   src,
+    uint64_t         nbytes_upper,
+    const int64_t*   row_count_dev_ptr,
+    uint64_t         row_bytes,
+    const int32_t*   emit_gate,
+    int32_t          emit_value);
+
+void launch_record_producer_prefix(
+    const RingState& ring,
+    const uint8_t*   d_src,
+    uint64_t         nbytes_upper,
+    const int64_t*   row_count_dev_ptr,
+    uint64_t         row_bytes,
+    const int32_t*   emit_gate,
+    int32_t          emit_value,
+    cudaStream_t     stream = 0);
+
+__global__ void record_producer_chunked_kernel(
+    RingState        ring,
+    const uint8_t*   src,
+    uint64_t         nbytes_upper,
+    const int64_t*   chunk_bytes_dev_ptr,
+    uint32_t         chunk_count,
+    const int32_t*   emit_gate,
+    int32_t          emit_value);
+
+void launch_record_producer_chunked(
+    const RingState& ring,
+    const uint8_t*   d_src,
+    uint64_t         nbytes_upper,
+    const int64_t*   chunk_bytes_dev_ptr,
+    uint32_t         chunk_count,
+    const int32_t*   emit_gate,
+    int32_t          emit_value,
+    cudaStream_t     stream = 0);
+
+__global__ void record_producer_seq_prefix_pack_kernel(
+    RingState        ring,
+    const uint8_t*   src,
+    uint64_t         nbytes_upper,
+    const int64_t*   valid_count_dev_ptr,
+    const int64_t*   valid_prefix_sum_dev_ptr,
+    uint32_t         batch,
+    uint64_t         feature_bytes,
+    const int32_t*   emit_gate,
+    int32_t          emit_value);
+
+void launch_record_producer_seq_prefix_pack(
+    const RingState& ring,
+    const uint8_t*   d_src,
+    uint64_t         nbytes_upper,
+    const int64_t*   valid_count_dev_ptr,
+    const int64_t*   valid_prefix_sum_dev_ptr,
+    uint32_t         batch,
+    uint64_t         feature_bytes,
+    const int32_t*   emit_gate,
+    int32_t          emit_value,
+    cudaStream_t     stream = 0);
+
+__global__ void record_producer_segmented_pack_kernel(
+    RingState        ring,
+    const uint8_t*   src,
+    uint64_t         nbytes_upper,
+    const int64_t*   segment_start_dev_ptr,
+    const int64_t*   segment_end_dev_ptr,
+    uint32_t         segment_count,
+    uint64_t         feature_bytes,
+    const int32_t*   emit_gate,
+    int32_t          emit_value);
+
+void launch_record_producer_segmented_pack(
+    const RingState& ring,
+    const uint8_t*   d_src,
+    uint64_t         nbytes_upper,
+    const int64_t*   segment_start_dev_ptr,
+    const int64_t*   segment_end_dev_ptr,
+    uint32_t         segment_count,
+    uint64_t         feature_bytes,
+    const int32_t*   emit_gate,
+    int32_t          emit_value,
     cudaStream_t     stream = 0);
 
 void set_ring_null_mode(bool enabled);

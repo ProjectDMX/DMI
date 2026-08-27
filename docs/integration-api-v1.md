@@ -253,6 +253,93 @@ old payload tensor. Treat the attached model as terminal too. A later CUDA
 forward—especially after another engine becomes active—can combine stale hook
 bindings with the new global engine.
 
+### Generic record runtime
+
+The generic record path is opt-in and independent of the legacy inference
+path. It is selected only by constructing a schema-driven stage with
+`StageConfig.clickhouse_records()` and then calling
+`MonitoringEngine.create_record_runtime()`.
+The returned `RecordRuntime` owns descriptor association for that record ring.
+
+`RecordCellType` supports `STRING`, `INT32`, `INT64`, `FLOAT64`,
+`INT64_ARRAY`, and `TENSOR`. A `RecordColumn` declares one logical column.
+A tensor column additionally names its dtype, shape, and bytes columns.
+`RecordLayout` declares one named table layout, its ordered columns, primary
+key, and ordering key. `RecordSchema` contains the layouts and index
+granularity.
+
+`RecordCell` is the accepted encoded-cell union. `PayloadSlice` describes how
+one cell is materialized from its associated producer payload.
+`RecordDescriptor` contains a layout name, encoded rows, and an optional
+producer output ID. `RecordFormat` supplies the immutable schema and converts
+integration metadata into descriptors.
+
+At record-runtime startup, the runtime schema must exactly match the schema
+retained by the host stage. Layout declaration order is irrelevant, but layout
+names, target tables, ordered logical columns and types, tensor physical-column
+names, keys, and index granularity must match. Each live ClickHouse table is
+also checked for its ordered physical columns and types, primary key,
+`ORDER BY`, and effective index granularity before the stage becomes ready.
+
+`TransportType` supports `IDENTITY`, `PREFIX_STRIP`, `CHUNKED`,
+`SEQ_PREFIX_PACK`, and `SEGMENTED_PACK`. `OutputStorage` selects tensor,
+floating-scalar, or integer-scalar materialization. `RecordType` describes the
+integration-owned row granularity. A `TransportSpec` declares one physical
+output, and `HookOutput` carries its source tensor and any device-side producer
+metadata.
+
+`HookSpecV1` declares one generic hook and its ordered outputs. `HookRuntime`
+decides eligibility and associates metadata before each producer launch.
+`HookPointV1` checks eligibility before preprocessing, dispatches each output
+in declaration order, and returns `None`.
+
+`ProducerPlanBuilder` records physical outputs during capture and builds an
+immutable `ProducerPlan`. Each `ProducerPlanEntry` retains the output ID,
+shapes, dtype, transport, storage, reservation bound, and task count required
+for replay.
+
+```python
+runtime = engine.create_record_runtime(record_format)
+
+runtime.bind_hook(
+    hook,
+    hook_runtime=hook_runtime,
+    gate_tensor=None,
+    gate_value=0,
+)
+
+runtime.emit_output(entry, metadata, output)
+runtime.prepare_replay(plan, metadata)
+
+engine.flush_and_wait(timeout_s=600.0)
+```
+
+The public operations are `create_record_runtime()`, `bind_hook()`,
+`emit_output()`, `prepare_replay()`, and `flush_and_wait()`.
+
+`RecordRuntime.bind_hook()` assigns stable output IDs and binds the hook to the
+record ring. `RecordRuntime.emit_output()` reserves and publishes one eager
+descriptor before its producer. `RecordRuntime.prepare_replay()` publishes
+fresh descriptors for an existing physical plan. Every producer occurrence
+has exactly one descriptor; a gated-off occurrence uses an empty descriptor
+and a zero-byte task.
+
+A nonempty producer descriptor must contain a `PayloadSlice`; an empty
+producer descriptor is permitted.
+
+After device-to-host transfer, the native ring pairs each descriptor with its
+owned contiguous CPU payload as a backend-neutral record envelope. A native
+`RecordSink` receives that envelope before any backend-specific row
+materialization. `ClickHouseRecordSink` is the current adapter; another native
+sink can be passed to `RingEngine.create_record()` without changing the
+producer, drain, or descriptor consumer.
+
+`MonitoringEngine.flush_and_wait()` is a checked, non-closing completion
+operation. Success means the ring, descriptor consumer, and configured record
+sink reached that sink's durability boundary within one timeout. The current
+ClickHouse adapter waits for acknowledged inserts. A timeout raises
+`TimeoutError`; asynchronous failures propagate unchanged.
+
 ### `deactivate_ring_transport`
 
 ```python

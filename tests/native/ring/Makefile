@@ -54,11 +54,19 @@ NVCC_FLAGS := \
 
 PRODUCER_CU  := ../../../native/csrc/ring/producer.cu
 DRAIN_SRC    := ../../../native/csrc/ring/drain_thread.cpp
+P2P_SRC      := ../../../native/csrc/ring/p2p_thread.cpp
+RECORD_CONSUMER_SRC := ../../../native/csrc/ring/record_consumer.cpp
+CLICKHOUSE_RECORD_SINK_SRC := ../../../native/csrc/clickhouse_record_sink.cpp
+RING_ENGINE_CU := ../../../native/csrc/ring/ring_engine.cu
+RING_ENGINE_PY_CU := ../../../native/csrc/ring/ring_engine_py.cu
 
 TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer \
-           $(BUILD)/test_ring_engine $(BUILD)/test_null_mode
+           $(BUILD)/test_ring_engine $(BUILD)/test_null_mode \
+           $(BUILD)/test_record_consumer \
+           $(BUILD)/test_clickhouse_record_sink
 
-.PHONY: all test_rings test_producer test_ring_engine test_null_mode run clean FORCE
+.PHONY: all test_rings test_producer test_ring_engine test_null_mode \
+        test_record_consumer test_clickhouse_record_sink run clean FORCE
 
 all: $(TARGETS)
 
@@ -76,13 +84,25 @@ $(BUILD)/test_rings: test_rings.cu $(CUDA_CONFIG_STAMP) | $(BUILD)
 $(BUILD)/test_producer: test_producer.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
 
-$(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRC) $(CUDA_CONFIG_STAMP) | $(BUILD)
+$(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRC) \
+		$(P2P_SRC) $(RECORD_CONSUMER_SRC) $(RING_ENGINE_CU) \
+		$(RING_ENGINE_PY_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(TORCH_INCLUDE_FLAGS) $(TORCH_LIB_FLAGS) \
-		$(TORCH_RPATH_FLAGS) -ltorch -ltorch_cpu -lc10 -lpthread \
-		$(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
+		$(filter-out $(CUDA_CONFIG_STAMP),$^) $(TORCH_RPATH_FLAGS) \
+		-ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -lpthread -o $@
 
 $(BUILD)/test_null_mode: test_null_mode.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(filter-out $(CUDA_CONFIG_STAMP),$^) -o $@
+
+$(BUILD)/test_record_consumer: test_record_consumer.cpp $(RECORD_CONSUMER_SRC) $(CUDA_CONFIG_STAMP) | $(BUILD)
+	$(CUDA_NVCC) $(NVCC_FLAGS) $(TORCH_INCLUDE_FLAGS) $(TORCH_LIB_FLAGS) \
+		$(filter-out $(CUDA_CONFIG_STAMP),$^) $(TORCH_RPATH_FLAGS) \
+		-ltorch -ltorch_cpu -lc10 -lpthread -o $@
+
+$(BUILD)/test_clickhouse_record_sink: test_clickhouse_record_sink.cpp $(CLICKHOUSE_RECORD_SINK_SRC) $(CUDA_CONFIG_STAMP) | $(BUILD)
+	$(CUDA_NVCC) $(NVCC_FLAGS) $(TORCH_INCLUDE_FLAGS) $(TORCH_LIB_FLAGS) \
+		$(filter-out $(CUDA_CONFIG_STAMP),$^) $(TORCH_RPATH_FLAGS) \
+		-ltorch -ltorch_cpu -lc10 -lpthread -o $@
 
 test_rings: $(BUILD)/test_rings
 	$(BUILD)/test_rings
@@ -96,11 +116,19 @@ test_ring_engine: $(BUILD)/test_ring_engine
 test_null_mode: $(BUILD)/test_null_mode
 	$(BUILD)/test_null_mode
 
+test_record_consumer: $(BUILD)/test_record_consumer
+	$(BUILD)/test_record_consumer
+
+test_clickhouse_record_sink: $(BUILD)/test_clickhouse_record_sink
+	$(BUILD)/test_clickhouse_record_sink
+
 run: all
 	$(BUILD)/test_rings
 	$(BUILD)/test_producer
 	$(BUILD)/test_ring_engine
 	$(BUILD)/test_null_mode
+	$(BUILD)/test_record_consumer
+	$(BUILD)/test_clickhouse_record_sink
 
 clean:
 	rm -rf $(BUILD)
