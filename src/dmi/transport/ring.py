@@ -448,16 +448,34 @@ class RingTransport:
             counts = output.producer_meta[0].detach().cpu().reshape(-1)
             if source.size(1) != counts.numel():
                 raise ValueError("SEQ_PREFIX_PACK valid-count length mismatch")
+            prefix = output.producer_meta[1].detach().cpu().reshape(-1)
+            batch = int(counts.numel())
+            if prefix.numel() != batch + 1:
+                raise ValueError("SEQ_PREFIX_PACK prefix length must equal batch + 1")
+            feature_bytes = int(entry.transport_args[0])
+            physical_batch_bytes = batch * feature_bytes
+            if (
+                batch <= 0
+                or feature_bytes <= 0
+                or byte_source.numel() % physical_batch_bytes != 0
+            ):
+                raise ValueError("SEQ_PREFIX_PACK payload has incompatible feature bytes")
+            max_rows = byte_source.numel() // feature_bytes
+            total_rows = max(0, min(max_rows, int(prefix[-1].item())))
+            prefix_values = [int(value) for value in prefix.tolist()]
             pieces = []
-            for batch_index, value in enumerate(counts.tolist()):
-                count = max(0, min(source.size(0), int(value)))
-                if count:
-                    pieces.append(source[:count, batch_index, ...].contiguous())
-            if pieces:
-                return torch.cat(pieces, dim=0).contiguous()
-            return torch.empty(
-                (0, *tuple(source.shape[2:])),
-                dtype=source.dtype,
+            for row in range(total_rows):
+                sample = 0
+                while sample + 1 < batch and row >= prefix_values[sample + 1]:
+                    sample += 1
+                sample_row = row - prefix_values[sample]
+                source_row = sample_row * batch + sample
+                begin = source_row * feature_bytes
+                pieces.append(byte_source[begin : begin + feature_bytes])
+            return (
+                torch.cat(pieces).contiguous()
+                if pieces
+                else byte_source[:0].clone()
             )
 
         if transport_type is TransportType.SEGMENTED_PACK:
@@ -465,18 +483,25 @@ class RingTransport:
             ends = output.producer_meta[1].detach().cpu().reshape(-1)
             if starts.numel() == 0 or starts.numel() != ends.numel():
                 raise ValueError("SEGMENTED_PACK start/end length mismatch")
+            feature_bytes = int(entry.transport_args[0])
+            if feature_bytes <= 0 or byte_source.numel() % feature_bytes != 0:
+                raise ValueError("SEGMENTED_PACK payload has incompatible feature bytes")
+            input_rows = byte_source.numel() // feature_bytes
             pieces = []
-            rows = source.size(0)
             for start, end in zip(starts.tolist(), ends.tolist()):
-                begin = max(0, min(rows, int(start)))
-                finish = max(begin, min(rows, int(end)))
-                if finish > begin:
-                    pieces.append(source[begin:finish, ...].contiguous())
-            if pieces:
-                return torch.cat(pieces, dim=0).contiguous()
-            return torch.empty(
-                (0, *tuple(source.shape[1:])),
-                dtype=source.dtype,
+                first_row = max(0, min(input_rows, int(start)))
+                last_row = max(first_row, min(input_rows, int(end)))
+                for source_row in range(first_row, last_row):
+                    begin = source_row * feature_bytes
+                    pieces.append(byte_source[begin : begin + feature_bytes])
+                    if len(pieces) == input_rows:
+                        break
+                if len(pieces) == input_rows:
+                    break
+            return (
+                torch.cat(pieces).contiguous()
+                if pieces
+                else byte_source[:0].clone()
             )
 
         raise ValueError(f"Unsupported transport type {transport_type!r}")

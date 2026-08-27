@@ -154,12 +154,13 @@ void RecordConsumer::consume_payload(const at::Tensor& payload) {
         }
         idle_cv_.notify_all();
     } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
         {
             std::lock_guard<std::mutex> lock(mu_);
+            if (!failure_) failure_ = failure;
             --active_payloads_;
         }
         idle_cv_.notify_all();
-        record_failure(std::current_exception());
         throw;
     }
 }

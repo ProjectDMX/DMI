@@ -2,11 +2,14 @@
 
 #include <ATen/ATen.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -174,6 +177,58 @@ static void test_exact_association_failures() {
     EXPECT(leftover_failed);
 }
 
+static void test_submit_failure_precedes_durable_idle() {
+    std::printf("[ TEST ] submit failure precedes durable idle\n");
+    ring::RecordConsumer consumer(
+        [](dmx_host::GenericRecordRow, uint64_t) {
+            throw std::runtime_error("injected submit failure");
+        });
+    ring::RecordDescriptor descriptor;
+    descriptor.layout = "submit_failure";
+    descriptor.rows = {{std::vector<ring::EncodedRecordCell>{
+        tensor_slice(0, sizeof(float), {1})}}};
+    consumer.push_descriptor(std::move(descriptor));
+
+    constexpr int kWaiters = 64;
+    std::atomic<int> ready{0};
+    std::atomic<int> observed_failures{0};
+    std::atomic<int> false_successes{0};
+    std::atomic<int> timeouts{0};
+    std::vector<std::thread> waiters;
+    waiters.reserve(kWaiters);
+    for (int index = 0; index < kWaiters; ++index) {
+        waiters.emplace_back([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            try {
+                if (!consumer.wait_until_idle(std::chrono::seconds(5))) {
+                    timeouts.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                consumer.finish();
+                false_successes.fetch_add(1, std::memory_order_relaxed);
+            } catch (const std::runtime_error&) {
+                observed_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kWaiters) {
+        std::this_thread::yield();
+    }
+
+    bool consume_failed = false;
+    try {
+        consumer.consume_payload(byte_payload({1}));
+    } catch (const std::runtime_error&) {
+        consume_failed = true;
+    }
+    for (auto& waiter : waiters) waiter.join();
+
+    EXPECT(consume_failed);
+    EXPECT(observed_failures.load(std::memory_order_relaxed) == kWaiters);
+    EXPECT(false_successes.load(std::memory_order_relaxed) == 0);
+    EXPECT(timeouts.load(std::memory_order_relaxed) == 0);
+}
+
 int main() {
     setbuf(stdout, nullptr);
     std::printf("test_record_consumer\n");
@@ -181,6 +236,7 @@ int main() {
     test_zero_row_descriptor_consumes_zero_byte_task();
     test_scalar_materialization();
     test_exact_association_failures();
+    test_submit_failure_precedes_durable_idle();
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

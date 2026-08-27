@@ -32,6 +32,8 @@ class _Transport:
         self.result = result
         self.events = []
         self.payload = torch.empty(0, dtype=torch.uint8)
+        self.null_offload = False
+        self.pending_tasks = 0
 
     def _record_payload_tensor(self):
         return self.payload
@@ -41,6 +43,7 @@ class _Transport:
 
     def reserve_record(self, items):
         self.events.append(("reserve", tuple(items)))
+        self.pending_tasks += len(items)
         return int(self.result)
 
     def push_record_descriptors(self, descriptors):
@@ -48,6 +51,11 @@ class _Transport:
 
     def submit_record_cpu_direct(self, output, entry):
         self.events.append(("direct", output, entry))
+
+    def flush_records_and_wait(self, timeout_s):
+        self.events.append(("flush", timeout_s))
+        if self.pending_tasks:
+            raise TimeoutError("unmatched reserved record tasks")
 
 class _Format:
     def __init__(self, layout_name="tensor_rows"):
@@ -170,6 +178,25 @@ def test_replay_encodes_complete_batch_before_descriptor_publication():
     assert transport.events[0] == ("reserve", ((16, False),))
     descriptor = transport.events[1][1][0]
     assert descriptor.rows[0][0] == "fresh"
+
+
+def test_capture_disabled_skips_eager_and_replay_until_reenabled():
+    runtime, transport, output, entry = _runtime_and_entry()
+    plan = ProducerPlan((entry,))
+    transport.null_offload = True
+
+    assert runtime.emit_output(entry, "eager-disabled", output) is StepReservation.SKIPPED
+    assert runtime.prepare_replay(plan, ("replay-disabled",)) is StepReservation.SKIPPED
+    transport.flush_records_and_wait(0.25)
+    assert transport.events == [("flush", 0.25)]
+
+    transport.null_offload = False
+    assert runtime.emit_output(entry, "enabled", output) is StepReservation.RESERVED
+    assert [event[0] for event in transport.events] == [
+        "flush",
+        "reserve",
+        "descriptors",
+    ]
 
 
 def test_replay_publishes_one_empty_descriptor_per_producer_occurrence():

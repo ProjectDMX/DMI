@@ -316,6 +316,8 @@ class RecordRuntime(Generic[MetadataT]):
         CPU-direct submission.  The hook therefore skips its producer launch.
         """
 
+        if self._transport.null_offload:
+            return StepReservation.SKIPPED
         self._validate_entry_output(entry, output)
         descriptor = self._encode(metadata, entry)
         reservation = StepReservation(
@@ -342,6 +344,8 @@ class RecordRuntime(Generic[MetadataT]):
                 f"expected {len(plan.entries)}, got {len(metadata_items)}"
             )
         if not plan.entries:
+            return StepReservation.SKIPPED
+        if self._transport.null_offload:
             return StepReservation.SKIPPED
         descriptors = tuple(
             self._encode(item, entry)
