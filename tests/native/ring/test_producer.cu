@@ -405,8 +405,8 @@ static void test_record_sequence_and_segmented_pack() {
     CUDA_CHECK(cudaFree(device));
 }
 
-static void test_record_device_gate_publishes_zero_byte_entries() {
-    banner("false record gates publish zero-byte entries in FIFO order");
+static void test_record_device_gate_rejects_without_publication() {
+    banner("false record gates leave ring state unchanged");
     ring::AllocatedRing allocated(make_config());
     allocated.init();
     ring::RingState& state = allocated.state();
@@ -434,10 +434,11 @@ static void test_record_device_gate_publishes_zero_byte_entries() {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     constexpr uint64_t gated_variants = 5;
+    EXPECT(*state.task_head == 0);
     for (uint64_t sequence = 0; sequence < gated_variants; ++sequence) {
-        expect_entry(state, sequence, 0);
+        EXPECT(state.task_entries[sequence].ready_seq ==
+               ring::READY_SEQ_SENTINEL);
     }
-    EXPECT(*state.task_head == gated_variants);
     EXPECT(*state.payload_head == initial_payload_head);
     EXPECT(*state.actual_bytes_counter == initial_actual_bytes);
     std::vector<uint8_t> payload_after(state.payload_cap);
@@ -451,9 +452,9 @@ static void test_record_device_gate_publishes_zero_byte_entries() {
     ring::launch_record_producer_static(
         state, device, source.size(), gate, 1);
     CUDA_CHECK(cudaDeviceSynchronize());
-    expect_entry(state, gated_variants, source.size());
-    EXPECT(read_payload(state, state.task_entries[gated_variants]) == source);
-    EXPECT(*state.task_head == gated_variants + 1);
+    expect_entry(state, 0, source.size());
+    EXPECT(read_payload(state, state.task_entries[0]) == source);
+    EXPECT(*state.task_head == 1);
     EXPECT(*state.payload_head == initial_payload_head +
            ring::align_up(source.size(), ring::PAYLOAD_ALIGN));
     EXPECT(*state.actual_bytes_counter == initial_actual_bytes + source.size());
@@ -477,7 +478,7 @@ int main() {
     test_record_chunked_compacts_payload_head();
     test_record_chunked_unaligned_boundaries();
     test_record_sequence_and_segmented_pack();
-    test_record_device_gate_publishes_zero_byte_entries();
+    test_record_device_gate_rejects_without_publication();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

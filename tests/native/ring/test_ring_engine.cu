@@ -324,40 +324,6 @@ static void test_record_reservation_reclaims_per_entry() {
     CUDA_CHECK(cudaFree(dynamic_device));
 }
 
-static void test_false_gated_record_reclaims_its_full_reservation() {
-    banner("false-gated record publishes and reclaims a zero-byte task");
-    DrainHarness harness(make_config());
-
-    const std::vector<uint8_t> source = pattern(64, 173);
-    uint8_t* device = upload(source, harness.stream);
-    int32_t* gate = nullptr;
-    const int32_t disabled = 0;
-    CUDA_CHECK(cudaMalloc(&gate, sizeof(disabled)));
-    CUDA_CHECK(cudaMemcpyAsync(gate, &disabled, sizeof(disabled),
-                               cudaMemcpyHostToDevice, harness.stream));
-
-    const uint64_t reserved =
-        ring::align_up(source.size(), ring::PAYLOAD_ALIGN);
-    harness.drain->reserve_record({{reserved, true}});
-    ring::launch_record_producer_static(
-        harness.allocated.state(), device, source.size(), gate, 1,
-        harness.stream);
-    ring::DrainTask task = harness.flush_one();
-
-    EXPECT(task.tensor_total_bytes == 0);
-    EXPECT(task.alloc_bytes == 0);
-    EXPECT(harness.drain->pending_record_reclaims() == 0);
-    EXPECT(harness.drain->cpu_payload_head() == reserved);
-    harness.drain->apply_pending_record_reclaims();
-    EXPECT(harness.drain->cpu_payload_head() == 0);
-    EXPECT(harness.drain->cpu_payload_tail_committed() == 0);
-    harness.drain->rethrow_record_reclaim_failure();
-    harness.release(task);
-
-    CUDA_CHECK(cudaFree(gate));
-    CUDA_CHECK(cudaFree(device));
-}
-
 static void test_timed_drain_flush_uses_request_generations() {
     banner("timed drain flush does not reuse another request generation");
     ring::RingConfig cfg = make_config(512);
@@ -598,7 +564,6 @@ int main() {
     test_repeated_wrap_delivery();
     test_zero_byte_delivery();
     test_record_reservation_reclaims_per_entry();
-    test_false_gated_record_reclaims_its_full_reservation();
     test_timed_drain_flush_uses_request_generations();
     test_drain_worker_binds_owner_device();
     test_record_flush_bounds_current_stream_prefix_wait();
