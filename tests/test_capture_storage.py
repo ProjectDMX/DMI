@@ -158,6 +158,34 @@ def test_capture_metadata_rejects_boolean_numeric_fields():
         replace(_metadata("capture-a"), shape=(True,))
 
 
+def test_capture_metadata_rejects_values_beyond_their_storage_columns():
+    # producer_rank/batch_position land in UInt32 catalog columns, the
+    # counters and captured_at_ns in UInt64 (and the pack header packs
+    # created_at_ns as a uint64 struct field), layer_number in Int32. A value
+    # beyond those bounds must fail here, at metadata construction, not on
+    # the persistence thread or in the catalog INSERT.
+    with pytest.raises(ValueError, match="producer_rank"):
+        replace(_metadata("capture-a"), producer_rank=2**32)
+    with pytest.raises(ValueError, match="batch_position"):
+        replace(_metadata("capture-a"), batch_position=2**32)
+    with pytest.raises(ValueError, match="captured_at_ns"):
+        replace(_metadata("capture-a"), captured_at_ns=2**64)
+    with pytest.raises(ValueError, match="step_number"):
+        replace(_metadata("capture-a"), step_number=2**64)
+    with pytest.raises(ValueError, match="token_end"):
+        replace(_metadata("capture-a"), token_end=2**64)
+    with pytest.raises(ValueError, match="layer_number"):
+        replace(_metadata("capture-a"), layer_number=2**31)
+
+    # The maxima themselves remain valid.
+    replace(
+        _metadata("capture-a"),
+        producer_rank=2**32 - 1,
+        batch_position=2**32 - 1,
+        layer_number=2**31 - 1,
+    )
+
+
 def test_filesystem_store_is_idempotent_and_rejects_conflicts(tmp_path: Path):
     store = FilesystemPackStore(tmp_path, store_id="local")
     sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))

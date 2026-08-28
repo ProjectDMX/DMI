@@ -117,19 +117,32 @@ class CaptureMetadata:
             raise ValueError(f"shape rank must not exceed {_MAX_RANK}")
         if any(type(dim) is not int or dim < 0 or dim > 2**31 - 1 for dim in self.shape):
             raise ValueError("shape dimensions must be integers in [0, 2^31 - 1]")
-        non_negative = (
-            "producer_rank",
-            "step_number",
-            "token_start",
-            "token_end",
-            "batch_position",
-            "captured_at_ns",
+        # Upper bounds mirror where these fields ultimately land: the catalog
+        # stores producer_rank/batch_position as UInt32, the counters and
+        # captured_at_ns as UInt64, and layer_number as Int32, while the pack
+        # header packs created_at_ns (= captured_at_ns) into a uint64 struct
+        # field. Rejecting out-of-range values here keeps one poison record
+        # from failing the persistence thread or wedging catalog indexing.
+        bounded = (
+            ("producer_rank", 2**32 - 1),
+            ("batch_position", 2**32 - 1),
+            ("step_number", 2**64 - 1),
+            ("token_start", 2**64 - 1),
+            ("token_end", 2**64 - 1),
+            ("captured_at_ns", 2**64 - 1),
         )
-        for name in non_negative:
-            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
-                raise ValueError(f"{name} must be a non-negative integer")
-        if type(self.layer_number) is not int or self.layer_number < -1:
-            raise ValueError("layer_number must be an integer >= -1")
+        for name, upper in bounded:
+            value = getattr(self, name)
+            if type(value) is not int or value < 0 or value > upper:
+                raise ValueError(
+                    f"{name} must be a non-negative integer <= {upper}"
+                )
+        if (
+            type(self.layer_number) is not int
+            or self.layer_number < -1
+            or self.layer_number > 2**31 - 1
+        ):
+            raise ValueError("layer_number must be an integer in [-1, 2^31 - 1]")
         if self.token_end < self.token_start:
             raise ValueError("token_end must be >= token_start")
 

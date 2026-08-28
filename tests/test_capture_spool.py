@@ -12,7 +12,6 @@ from dmi.storage.capture import (
     DurablePackSpool,
     FilesystemPackStore,
     FlushReason,
-    PackIntegrityError,
     PackWriter,
     ReadyPack,
     SpoolFullError,
@@ -131,23 +130,35 @@ def test_spool_upload_retry_resolves_an_ambiguous_remote_commit(tmp_path: Path):
     assert spool.snapshot().bytes == 0
 
 
-def test_spool_recovery_rejects_corrupt_ready_pack(tmp_path: Path):
-    pack, metadata = _sealed(
+def test_spool_recovery_quarantines_corrupt_ready_pack(tmp_path: Path):
+    corrupt_pack, corrupt_metadata = _sealed(
         "018f0000-0000-7000-8000-000000000001", "capture-a"
     )
-    root = tmp_path / "spool"
-    spool = DurablePackSpool(root, max_bytes=len(pack.data) * 2)
-    staged = DurablePackSink(spool).persist(
-        ReadyPack(pack, metadata, FlushReason.SHUTDOWN)
+    healthy_pack, healthy_metadata = _sealed(
+        "018f0000-0000-7000-8000-000000000002", "capture-b"
     )
+    root = tmp_path / "spool"
+    spool = DurablePackSpool(
+        root, max_bytes=(len(corrupt_pack.data) + len(healthy_pack.data)) * 2
+    )
+    sink = DurablePackSink(spool)
+    staged = sink.persist(ReadyPack(corrupt_pack, corrupt_metadata, FlushReason.SHUTDOWN))
+    healthy = sink.persist(ReadyPack(healthy_pack, healthy_metadata, FlushReason.SHUTDOWN))
     with staged.path.open("r+b") as handle:
         handle.seek(64)
         handle.write(b"\xff")
 
-    with pytest.raises(PackIntegrityError, match="checksum"):
-        DurablePackSpool(root, max_bytes=len(pack.data) * 2).recover()
+    recovered = DurablePackSpool(
+        root, max_bytes=(len(corrupt_pack.data) + len(healthy_pack.data)) * 2
+    ).recover()
 
-    assert staged.path.exists()
+    # One corrupt file must not block the healthy pack behind it: it is
+    # sidelined with its bytes intact, and only the healthy entry returns.
+    assert [entry.pack_id for entry in recovered] == [healthy.pack_id]
+    assert not staged.path.exists()
+    quarantined = staged.path.with_suffix(".quarantined")
+    assert quarantined.exists()
+    assert quarantined.stat().st_size == staged.object_bytes
 
 
 def test_spool_recovery_removes_incomplete_open_files(tmp_path: Path):

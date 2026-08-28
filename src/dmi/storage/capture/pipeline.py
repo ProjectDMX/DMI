@@ -12,7 +12,14 @@ from typing import Callable, Mapping, Protocol
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
-from .model import CaptureMetadata, CaptureRecord, PackRef, PackSource, PackStore
+from .model import (
+    CaptureMetadata,
+    CaptureRecord,
+    DuplicateCaptureError,
+    PackRef,
+    PackSource,
+    PackStore,
+)
 from .pack import PackCapacityError, PackWriter, SealedPack
 
 
@@ -394,6 +401,7 @@ class PipelineSnapshot:
     dropped_records: int
     timed_out_records: int
     oversized_records: int
+    duplicate_records: int
     rejected_closed_records: int
     persisted_records: int
     packs_persisted: int
@@ -453,6 +461,7 @@ class HostCapturePipeline:
             "dropped_records": 0,
             "timed_out_records": 0,
             "oversized_records": 0,
+            "duplicate_records": 0,
             "rejected_closed_records": 0,
             "persisted_records": 0,
             "packs_persisted": 0,
@@ -571,6 +580,19 @@ class HostCapturePipeline:
                         "record_oversized",
                         capture_id=record.metadata.capture_id,
                         bytes=len(record.payload),
+                    )
+                    continue
+                except DuplicateCaptureError:
+                    # A repeated capture_id in one open pack (e.g. a producer
+                    # retry after an ambiguous admission) is a fault of that
+                    # one record. The buffered pack is untouched, so drop the
+                    # duplicate and keep going rather than failing the whole
+                    # pipeline and losing every queued record.
+                    with self._lock:
+                        self._counters["duplicate_records"] += 1
+                    self._emit(
+                        "record_duplicate",
+                        capture_id=record.metadata.capture_id,
                     )
                     continue
                 self._persist(packs)

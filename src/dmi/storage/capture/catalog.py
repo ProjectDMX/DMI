@@ -246,14 +246,15 @@ class CatalogIndexer:
         # all of that is durable. A reader that derived the watermark from the
         # descriptor table itself would see this version mid-batch.
         self._published_version = version
-        publish = getattr(self._writer, "publish_watermark", None)
-        if publish is not None:
-            publish(
-                index_version=version,
-                published_at_ns=self._clock_ns(),
-                indexed_rows=len(descriptors),
-                indexed_packs=len(valid_refs),
-            )
+        # publish_watermark is a required part of the CatalogWriter contract:
+        # skipping it silently would leave every row this call wrote durably
+        # stored but permanently invisible to readers, with no error anywhere.
+        self._writer.publish_watermark(
+            index_version=version,
+            published_at_ns=self._clock_ns(),
+            indexed_rows=len(descriptors),
+            indexed_packs=len(valid_refs),
+        )
         result = IndexResult(
             requested_packs=len(unique),
             skipped_packs=len(unique) - len(pending),

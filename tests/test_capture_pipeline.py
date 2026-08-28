@@ -431,3 +431,31 @@ def test_pipeline_survives_a_capture_only_framing_pushes_over(tmp_path: Path):
     assert snapshot.oversized_records == 1
     assert snapshot.failures == 0
     assert snapshot.persisted_records == 1
+
+
+def test_pipeline_survives_a_duplicate_capture_id(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path / "objects", store_id="local")
+    pipeline = HostCapturePipeline(
+        PipelineConfig(
+            max_queue_records=4,
+            max_queue_bytes=1 << 20,
+            max_pack_bytes=1 << 20,
+            max_pack_records=4,
+            max_linger_ns=60_000_000_000,
+        ),
+        DirectPackSink(store),
+        pack_id_factory=_ids(),
+    )
+    pipeline.start()
+
+    # A producer retry after an ambiguous admission lands the same capture_id
+    # twice in one open pack. That is a fault of the one record: the duplicate
+    # is dropped and counted, and the pipeline keeps running.
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+    assert pipeline.submit(_record("capture-b")) is AdmissionResult.ACCEPTED
+    snapshot = pipeline.close(timeout=2)
+
+    assert snapshot.duplicate_records == 1
+    assert snapshot.failures == 0
+    assert snapshot.persisted_records == 2

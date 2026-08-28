@@ -88,6 +88,7 @@ class _CatalogWriter:
         self.committed: set[tuple[str, str]] = set()
         self.descriptor_batches: list[tuple] = []
         self.pack_batches: list[tuple[PackRef, ...]] = []
+        self.watermarks: list[tuple[int, int, int, int]] = []
         self.fail_commit_once = False
 
     def committed_pack_ids(self, identities):
@@ -102,6 +103,13 @@ class _CatalogWriter:
             self.fail_commit_once = False
             raise RuntimeError("ambiguous commit")
         self.committed.update((ref.store_id, ref.pack_id) for ref in refs)
+
+    def publish_watermark(
+        self, *, index_version, published_at_ns, indexed_rows, indexed_packs
+    ):
+        self.watermarks.append(
+            (index_version, published_at_ns, indexed_rows, indexed_packs)
+        )
 
 
 def _packs(tmp_path: Path, counts: tuple[int, ...] = (2, 1)):
@@ -147,6 +155,9 @@ def test_indexer_reads_only_footers_and_batches_rows(tmp_path: Path):
     assert sum(length for _, _, length in inventory.ranges) < sum(
         ref.object_bytes for ref in refs
     )
+    # Publication is not optional: without it the rows above are durably
+    # stored but permanently invisible to readers pinned to the watermark log.
+    assert writer.watermarks == [(42, 42, 3, 2)]
 
 
 def test_duplicate_event_and_missed_event_converge_on_rebuild(tmp_path: Path):

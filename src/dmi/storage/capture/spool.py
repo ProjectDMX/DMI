@@ -125,14 +125,47 @@ class DurablePackSpool:
             for parent in {path.parent for path in stale}:
                 self._fsync_directory(parent)
             paths = tuple(sorted(self.root.rglob("*.dmi-pack.ready")))
-            self._bytes = sum(path.lstat().st_size for path in paths)
-            self._entries = len(paths)
+        entries: list[StagedPack] = []
+        for path in paths:
+            # Validate each entry independently. One corrupt file must not
+            # block every healthy pack behind it -- it is quarantined for
+            # offline inspection instead -- and a concurrent uploader may
+            # legitimately remove entries while this pass runs, which is
+            # completed work rather than corruption.
+            try:
+                entry = self._entry(path)
+                checksum = self._checksum(path)
+            except FileNotFoundError:
+                continue
+            except (PackIntegrityError, ValueError):
+                if path.exists():
+                    self._quarantine(path)
+                continue
+            if checksum != entry.checksum:
+                self._quarantine(path)
+                continue
+            entries.append(entry)
+        with self._lock:
+            self._bytes = sum(entry.object_bytes for entry in entries)
+            self._entries = len(entries)
             self._peak_bytes = max(self._peak_bytes, self._bytes)
-        entries = tuple(self._entry(path) for path in paths)
-        for entry in entries:
-            if self._checksum(entry.path) != entry.checksum:
-                raise PackIntegrityError(f"spool checksum mismatch: {entry.pack_id}")
-        return entries
+        return tuple(entries)
+
+    def _quarantine(self, path: Path) -> None:
+        """Sideline a ready file that failed integrity validation.
+
+        The bytes are kept for diagnosis but the ``.ready`` suffix is
+        dropped, so later passes neither upload the file nor fail on it.
+        Quarantined files are no longer counted against ``max_bytes``;
+        cleaning them up is an operator action.
+        """
+
+        target = path.with_suffix(".quarantined")
+        try:
+            os.replace(path, target)
+        except FileNotFoundError:
+            return
+        self._fsync_directory(path.parent)
 
     def remove(self, staged: StagedPack) -> None:
         if staged.path.is_symlink():
