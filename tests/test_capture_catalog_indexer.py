@@ -111,6 +111,9 @@ class _CatalogWriter:
             (index_version, published_at_ns, indexed_rows, indexed_packs)
         )
 
+    def last_published_version(self):
+        return self.watermarks[-1][0] if self.watermarks else 0
+
 
 def _packs(tmp_path: Path, counts: tuple[int, ...] = (2, 1)):
     store = FilesystemPackStore(tmp_path, store_id="local")
@@ -193,13 +196,28 @@ def test_ambiguous_pack_commit_replays_descriptors_but_converges(tmp_path: Path)
     assert writer.committed == {(refs[0].store_id, refs[0].pack_id)}
 
 
-def test_indexer_rejects_conflicting_pack_identity(tmp_path: Path):
-    inventory, refs = _packs(tmp_path, (1,))
-    indexer = CatalogIndexer(inventory, _CatalogWriter())
+def test_indexer_contains_a_conflicting_pack_identity_as_failures(tmp_path: Path):
+    inventory, refs = _packs(tmp_path, (1, 1))
+    writer = _CatalogWriter()
+    indexer = CatalogIndexer(inventory, writer)
     conflict = replace(refs[0], checksum="f" * 64)
 
-    with pytest.raises(ValueError, match="conflicting pack identity"):
-        indexer.index([refs[0], conflict])
+    result = indexer.index([refs[0], conflict, refs[1]])
+
+    # Neither claimant of the shared identity is trustworthy, so both fail
+    # and nothing is committed for it -- but one duplicated object must not
+    # abort the batch: the healthy pack still indexes.
+    assert result.indexed_packs == 1
+    assert result.failed_packs == 2
+    assert {failure.error_type for failure in result.failures} == {
+        "PackConflictError"
+    }
+    assert {failure.object_key for failure in result.failures} == {
+        refs[0].object_key,
+        conflict.object_key,
+    }
+    committed = {identity for batch in writer.pack_batches for identity in batch}
+    assert committed == {refs[1]}
 
 
 def test_indexer_bounds_notification_batch(tmp_path: Path):
@@ -297,3 +315,22 @@ def test_an_oversized_batch_raises_instead_of_blaming_a_pack(tmp_path: Path):
 
     assert writer.descriptor_batches == []
     assert writer.pack_batches == []
+
+
+def test_a_restarted_indexer_cannot_publish_under_the_durable_watermark(
+    tmp_path: Path,
+):
+    inventory, refs = _packs(tmp_path, (1, 1))
+    writer = _CatalogWriter()
+
+    CatalogIndexer(inventory, writer, clock_ns=lambda: 2_000).index([refs[0]])
+    # A new process starts with no in-memory guard state and a wall clock
+    # stepped back below the last published version. It must seed from the
+    # durable watermark, or its batch lands inside snapshots readers have
+    # already pinned.
+    CatalogIndexer(inventory, writer, clock_ns=lambda: 1_000).index([refs[1]])
+
+    published = [watermark[0] for watermark in writer.watermarks]
+    assert published == sorted(published), f"versions went backwards: {published}"
+    assert len(set(published)) == len(published), "a version was reused"
+    assert published[0] == 2_000 and published[1] > 2_000

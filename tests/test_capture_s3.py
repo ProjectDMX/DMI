@@ -332,3 +332,22 @@ def test_s3_put_still_accepts_a_faithful_source():
 
     assert ref.checksum == _pack().checksum
     assert len(client.objects) == 1
+
+
+def test_s3_put_retry_rejects_an_object_missing_the_format_marker():
+    client = _S3Client()
+    store = _store(client)
+    pack = _pack()
+    key = "v1/tenant=tenant-a/pack.dmi-pack"
+    store.put(pack, key)
+    data, metadata = client.objects[key]
+    client.objects[key] = (
+        data,
+        {name: value for name, value in metadata.items() if name != "dmi-format"},
+    )
+
+    # An object accepted by a put() retry must be one inspect() will accept
+    # later; a format-less object would otherwise have its local copy deleted
+    # while reconciliation can never index the remote one.
+    with pytest.raises(PackConflictError, match="different content"):
+        store.put(pack, key)

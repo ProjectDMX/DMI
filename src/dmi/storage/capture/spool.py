@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+import errno
 import math
 import os
 from pathlib import Path
@@ -15,11 +16,34 @@ from typing import BinaryIO, Callable, Mapping
 from .filesystem import (
     FilesystemPackStore,
     copy_pack_source,
+    fsync_path_to_root,
     validate_object_key,
     validate_pack_source,
 )
 from .model import PackConflictError, PackIntegrityError, PackRef, PackSource, PackStore
 from .pipeline import ReadyPack, object_key_for
+
+
+_PERMANENT_ERRNOS = frozenset(
+    (
+        errno.EACCES,
+        errno.EPERM,
+        errno.ENOENT,
+        errno.EROFS,
+        errno.EISDIR,
+        errno.ENOTDIR,
+    )
+)
+
+
+def _is_transient_transport_error(exc: Exception) -> bool:
+    """True for botocore connection-level failures, which carry no response."""
+
+    try:
+        from botocore.exceptions import ConnectionError as _TransportError
+    except ImportError:
+        return False
+    return isinstance(exc, _TransportError)
 
 
 _READY_NAME = re.compile(
@@ -108,7 +132,10 @@ class DurablePackSpool:
                     return self._existing(pack, object_key, ready)
                 temp_path.unlink()
                 temp_path = None
-                self._fsync_directory(ready.parent)
+                # The key's tenant/date/session directories may all be new;
+                # each level must be fsynced or power loss can drop the
+                # subtree after stage() reported the pack durable.
+                fsync_path_to_root(ready.parent, self.root)
             finally:
                 if temp_path is not None:
                     temp_path.unlink(missing_ok=True)
@@ -523,6 +550,15 @@ class ParallelSpoolUploader:
     @staticmethod
     def _retryable(exc: Exception) -> bool:
         if isinstance(exc, OSError):
+            # Local I/O errors are mostly transient (EIO under load, EAGAIN,
+            # interrupted syscalls), but a deterministic failure must not
+            # burn every attempt at full backoff.
+            return exc.errno not in _PERMANENT_ERRNOS
+        if _is_transient_transport_error(exc):
+            # Botocore connection failures carry no HTTP response for the
+            # shape-based classification below, yet they are the archetypal
+            # retryable error -- without this branch a network blip is
+            # classified permanent while local permission errors retried.
             return True
         response = getattr(exc, "response", None)
         if not isinstance(response, Mapping):

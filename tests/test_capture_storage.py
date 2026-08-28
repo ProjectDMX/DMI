@@ -413,3 +413,31 @@ def test_reader_detects_corruption_in_a_partial_range(tmp_path: Path):
 
     with pytest.raises(PackIntegrityError, match="record checksum"):
         reader.hydrate(selection, byte_limit=descriptor.locator.stored_length)
+
+
+def test_fsync_path_to_root_covers_every_new_directory(tmp_path: Path, monkeypatch):
+    import os
+
+    from dmi.storage.capture.filesystem import fsync_path_to_root
+
+    root = (tmp_path / "store").resolve()
+    leaf = root / "tenant=a" / "date=2026-08-28" / "session=s" / "rank=0"
+    leaf.mkdir(parents=True)
+    synced: list[Path] = []
+    real_fsync = os.fsync
+
+    def record(fd: int) -> None:
+        synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        real_fsync(fd)
+
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.fsync", record)
+
+    fsync_path_to_root(leaf, root)
+
+    # mkdir(parents=True) may have created any level of the chain, and each
+    # new directory is durable only once its parent's entry is fsynced too.
+    expected = [leaf, leaf.parent, leaf.parent.parent, leaf.parent.parent.parent, root]
+    assert synced == expected
+
+    with pytest.raises(ValueError, match="not under root"):
+        fsync_path_to_root(tmp_path.resolve(), root)

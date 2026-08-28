@@ -39,6 +39,8 @@ class CatalogWriter(Protocol):
         indexed_packs: int,
     ) -> None: ...
 
+    def last_published_version(self) -> int: ...
+
 
 @dataclass(frozen=True, slots=True)
 class CatalogIndexerConfig:
@@ -122,15 +124,45 @@ def _identity(ref: PackRef) -> PackIdentity:
     return ref.store_id, ref.pack_id
 
 
-def _deduplicate_refs(refs: Sequence[PackRef]) -> tuple[PackRef, ...]:
+def _partition_refs(
+    refs: Sequence[PackRef],
+) -> tuple[tuple[PackRef, ...], tuple[IndexFailure, ...]]:
+    """Deduplicate refs, containing identity conflicts as per-pack failures.
+
+    Two different refs claiming one (store_id, pack_id) means at least one of
+    them is wrong, with no way to tell which, so every claimant is failed and
+    none indexed. Raising here instead would let one duplicated bucket object
+    abort each reconcile pass that lists it, forever.
+    """
+
     by_identity: dict[PackIdentity, PackRef] = {}
+    conflicted: dict[PackIdentity, list[PackRef]] = {}
     for ref in refs:
         identity = _identity(ref)
         current = by_identity.get(identity)
-        if current is not None and current != ref:
-            raise ValueError(f"conflicting pack identity: {identity!r}")
-        by_identity[identity] = ref
-    return tuple(by_identity.values())
+        if current is None:
+            by_identity[identity] = ref
+            continue
+        if current != ref:
+            claimants = conflicted.setdefault(identity, [current])
+            if ref not in claimants:
+                claimants.append(ref)
+    unique = tuple(
+        ref
+        for identity, ref in by_identity.items()
+        if identity not in conflicted
+    )
+    failures = tuple(
+        IndexFailure(
+            pack_id=ref.pack_id,
+            object_key=ref.object_key,
+            error_type="PackConflictError",
+            message=f"conflicting pack identity: {identity!r}",
+        )
+        for identity, claimants in conflicted.items()
+        for ref in claimants
+    )
+    return unique, failures
 
 
 def _estimated_bytes(descriptor: CaptureDescriptor) -> int:
@@ -183,13 +215,13 @@ class CatalogIndexer:
             raise ValueError(
                 f"pack batch exceeds max_packs: {len(refs)} > {self._config.max_packs}"
             )
-        unique = _deduplicate_refs(refs)
+        unique, conflict_failures = _partition_refs(refs)
         identities = tuple(_identity(ref) for ref in unique)
         committed = self._writer.committed_pack_ids(identities) if identities else set()
         pending = tuple(ref for ref in unique if _identity(ref) not in committed)
         descriptors: list[CaptureDescriptor] = []
         valid_refs: list[PackRef] = []
-        failures: list[IndexFailure] = []
+        failures: list[IndexFailure] = list(conflict_failures)
         estimated_bytes = 0
         for ref in pending:
             try:
@@ -230,7 +262,13 @@ class CatalogIndexer:
         # ordering token, not a timestamp, and published_at_ns still records the
         # real time. Cross-process skew is a separate problem, documented under
         # the Phase 5 limitations.
-        if self._published_version is not None and version <= self._published_version:
+        if self._published_version is None:
+            # Seed from durable state: an in-memory guard alone resets on
+            # restart, so a wall clock stepped back across a crash/redeploy
+            # (or a second indexer with skew) could publish underneath a
+            # watermark a reader already pinned.
+            self._published_version = self._writer.last_published_version()
+        if version <= self._published_version:
             version = self._published_version + 1
         step = self._config.max_rows_per_insert
         descriptor_inserts = 0
@@ -256,7 +294,7 @@ class CatalogIndexer:
             indexed_packs=len(valid_refs),
         )
         result = IndexResult(
-            requested_packs=len(unique),
+            requested_packs=len(unique) + len(conflict_failures),
             skipped_packs=len(unique) - len(pending),
             indexed_packs=len(valid_refs),
             indexed_rows=len(descriptors),

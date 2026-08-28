@@ -206,3 +206,26 @@ def test_parallel_uploader_rejects_a_pack_larger_than_its_byte_budget(
 
     with pytest.raises(ValueError, match="in-flight byte limit"):
         uploader.upload_pending()
+
+
+def test_retry_classifier_distinguishes_permanent_from_transient_errors():
+    import errno
+
+    retryable = ParallelSpoolUploader._retryable
+
+    # Unclassified and plausibly transient local I/O errors retry.
+    assert retryable(OSError("transient upload failure"))
+    assert retryable(OSError(errno.EIO, "disk hiccup"))
+    # Deterministic local failures must not burn every attempt at backoff.
+    assert not retryable(PermissionError(errno.EACCES, "denied"))
+    assert not retryable(FileNotFoundError(errno.ENOENT, "gone"))
+    assert not retryable(OSError(errno.EROFS, "read-only spool"))
+
+
+def test_retry_classifier_treats_transport_failures_as_transient():
+    # Botocore connection failures carry no HTTP response, yet they are the
+    # archetypal retryable error.
+    botocore_exceptions = pytest.importorskip("botocore.exceptions")
+    assert ParallelSpoolUploader._retryable(
+        botocore_exceptions.ConnectionError(error="unreachable")
+    )

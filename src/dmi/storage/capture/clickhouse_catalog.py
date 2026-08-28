@@ -218,6 +218,18 @@ pack_id UUID, store_id LowCardinality(String), index_version UInt64
             [(index_version, published_at_ns, indexed_rows, indexed_packs)],
         )
 
+    def last_published_version(self) -> int:
+        """Highest published index_version, or 0 when nothing is published."""
+        rows = self._client.execute(
+            f"SELECT max(index_version) FROM {self._qualified(self._watermark)}"
+        )
+        if not rows or not rows[0] or rows[0][0] is None:
+            return 0
+        value = rows[0][0]
+        if type(value) is not int or value < 0:
+            raise ValueError("watermark table returned an invalid version")
+        return value
+
     def commit_packs(
         self, refs: Sequence[PackRef], *, index_version: int
     ) -> None:

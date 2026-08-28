@@ -372,6 +372,11 @@ class S3PackStore:
     ) -> PackRef:
         size, metadata = self._parse_head(response)
         expected = {
+            # The format marker must be part of this check: an object put()
+            # accepts here is one inspect() must also accept later, or a
+            # retry deletes the local copy of a pack reconciliation can
+            # never index.
+            "dmi-format": "dmi-pack-v1",
             "dmi-pack-id": pack.pack_id,
             "dmi-sha256": pack.checksum,
             "dmi-record-count": str(pack.record_count),

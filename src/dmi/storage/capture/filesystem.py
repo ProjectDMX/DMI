@@ -37,6 +37,31 @@ def validate_object_key(object_key: str) -> PurePosixPath:
     return key
 
 
+def fsync_path_to_root(leaf: Path, root: Path) -> None:
+    """Fsync every directory from ``leaf`` up to and including ``root``.
+
+    ``mkdir(parents=True)`` may have created any part of that chain, and a
+    new directory is only durable once the directory holding its entry is
+    fsynced. Syncing the leaf alone leaves freshly created ancestors in the
+    page cache, where a power loss can drop the whole subtree -- including a
+    file whose staging was already reported durable.
+    """
+
+    current = leaf
+    while True:
+        fd = os.open(current, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if current == root:
+            return
+        parent = current.parent
+        if parent == current:
+            raise ValueError("leaf is not under root")
+        current = parent
+
+
 def validate_pack_source(pack: PackSource) -> None:
     if not isinstance(pack, PackSource):
         raise TypeError("pack must implement PackSource")
@@ -177,11 +202,7 @@ class FilesystemPackStore:
                 os.link(temp_path, path)
             except FileExistsError:
                 return self._existing_ref(pack, object_key, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_path_to_root(path.parent, self.root)
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
