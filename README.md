@@ -23,8 +23,8 @@
 We are working to make DMI useful across more backends, more models, and more
 stages of the model lifecycle.
 
-- **What's next** — **SGLang**, multimodal models, and end-to-end observability
-  from inference to large-scale training with **Megatron**.
+- **What's next** — **SGLang**, multimodal models, a pluggable observability storage
+  stack, and end-to-end observability from inference to large-scale training with **Megatron**.
 - **From observation to action** — Low-latency streaming/pluggable APIs enables more downstream applications like online monitoring, activation steering,
     distillation, and speculative decoding.
 - **Broader PCIe-aware scheduling** — Extend DMI's serving-first drain governor
