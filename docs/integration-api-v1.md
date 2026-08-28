@@ -319,13 +319,18 @@ The public operations are `create_record_runtime()`, `bind_hook()`,
 
 `RecordRuntime.bind_hook()` assigns stable output IDs and binds the hook to the
 record ring. `RecordRuntime.emit_output()` reserves and publishes one eager
-descriptor before its producer. `RecordRuntime.prepare_replay()` publishes
-fresh descriptors for an existing physical plan. Every producer occurrence
-has exactly one descriptor; a gated-off occurrence uses an empty descriptor
-and a zero-byte task.
+descriptor before its host-selected producer occurrence.
+`RecordRuntime.prepare_replay()` publishes fresh descriptors for the
+host-selected entries in an existing physical plan. Every accepted producer
+occurrence has exactly one descriptor and one task.
 
-A nonempty producer descriptor must contain a `PayloadSlice`; an empty
-producer descriptor is permitted.
+When a hook uses a device gate, the integration must apply the same selection
+before host reservation and descriptor publication. A gated-off occurrence is
+absent from the record stream: it has no reservation, descriptor, task,
+payload write, or ring-counter advancement. This is distinct from an accepted
+zero-row occurrence, which has a real empty descriptor and publishes its
+descriptor-backed zero-byte task. A nonempty producer descriptor must contain
+a `PayloadSlice`; an empty producer descriptor is permitted.
 
 After device-to-host transfer, the native ring pairs each descriptor with its
 owned contiguous CPU payload as a backend-neutral record envelope. A native
