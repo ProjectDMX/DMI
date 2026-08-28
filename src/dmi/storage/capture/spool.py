@@ -298,10 +298,11 @@ class SpoolUploader:
         self._store = store
 
     def upload(self, staged: StagedPack) -> PackRef:
+        # put() already verifies the source and the resulting object; a
+        # post-upload stat() would only re-read metadata put() itself wrote
+        # (a full re-hash on filesystem stores, a tautological HeadObject on
+        # S3), so the ref put() returns is trusted as-is.
         ref = self._store.put(staged, staged.object_key)
-        info = self._store.stat(ref)
-        if info.size != staged.object_bytes or info.checksum != staged.checksum:
-            raise PackIntegrityError("remote object verification failed")
         self._spool.remove(staged)
         return ref
 
@@ -434,9 +435,13 @@ class ParallelSpoolUploader:
         active_bytes = 0
         peak_active = 0
         peak_bytes = 0
-        outcomes: dict[str, _UploadOutcome] = {}
-        futures: dict[Future[_UploadOutcome], StagedPack] = {}
-        remaining = pending.copy()
+        # Outcomes are stored by list position, never by pack_id: recover()
+        # walks the whole tree, so two ready files sharing a pack_id (however
+        # unlikely) must not overwrite each other's outcome -- that could
+        # report a failed upload as succeeded.
+        ordered: list[_UploadOutcome | None] = [None] * len(pending)
+        futures: dict[Future[_UploadOutcome], tuple[int, StagedPack]] = {}
+        remaining = list(enumerate(pending))
         with ThreadPoolExecutor(
             max_workers=self._config.max_workers,
             thread_name_prefix="dmi-pack-upload",
@@ -445,36 +450,42 @@ class ParallelSpoolUploader:
                 while len(futures) < self._config.max_workers:
                     selected = next(
                         (
-                            (index, staged)
-                            for index, staged in enumerate(remaining)
-                            if active_bytes + staged.object_bytes
+                            (slot, entry)
+                            for slot, entry in enumerate(remaining)
+                            if active_bytes + entry[1].object_bytes
                             <= self._config.max_in_flight_bytes
                         ),
                         None,
                     )
                     if selected is None:
                         break
-                    index, staged = selected
-                    remaining.pop(index)
+                    slot, (index, staged) = selected
+                    remaining.pop(slot)
                     future = executor.submit(self._upload, staged)
-                    futures[future] = staged
+                    futures[future] = (index, staged)
                     active_bytes += staged.object_bytes
                     peak_active = max(peak_active, len(futures))
                     peak_bytes = max(peak_bytes, active_bytes)
                 completed, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in completed:
-                    staged = futures.pop(future)
+                    index, staged = futures.pop(future)
                     active_bytes -= staged.object_bytes
-                    outcomes[staged.pack_id] = future.result()
+                    ordered[index] = future.result()
 
-        ordered = [outcomes[staged.pack_id] for staged in pending]
-        refs = tuple(outcome.ref for outcome in ordered if outcome.ref is not None)
+        assert all(outcome is not None for outcome in ordered)
+        refs = tuple(
+            outcome.ref
+            for outcome in ordered
+            if outcome is not None and outcome.ref is not None
+        )
         failures = tuple(
             outcome.failure
             for outcome in ordered
-            if outcome.failure is not None
+            if outcome is not None and outcome.failure is not None
         )
-        durations = [outcome.duration_ns for outcome in ordered]
+        durations = [
+            outcome.duration_ns for outcome in ordered if outcome is not None
+        ]
         snapshot = UploadSnapshot(
             attempted_packs=len(ordered),
             uploaded_packs=len(refs),

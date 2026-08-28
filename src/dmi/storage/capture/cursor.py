@@ -16,6 +16,7 @@ from base64 import b64decode, urlsafe_b64encode
 from binascii import Error as BinasciiError
 from dataclasses import dataclass
 import json
+import re
 
 from .model import _CURSOR_LIMIT, InvalidCursorError
 
@@ -23,6 +24,7 @@ from .model import _CURSOR_LIMIT, InvalidCursorError
 _CURSOR_VERSION = 1
 _ENVELOPE_FIELDS = frozenset({"v", "w", "fh", "k"})
 _UINT64_MAX = 2**64 - 1
+_URLSAFE_ALPHABET = re.compile(r"[A-Za-z0-9_-]+\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +103,15 @@ def decode_cursor(cursor: str, *, filter_hash: str, max_watermark: int) -> Curso
 
     # ``validate=True`` matters here: the default decoder silently discards
     # characters outside the base64 alphabet, so a cursor with injected junk
-    # would decode to the same payload and pass every check below.
+    # would decode to the same payload and pass every check below. It is not
+    # sufficient on its own, though -- with altchars, CPython still accepts
+    # literal '+' and '/', so a non-canonical spelling of a cursor would
+    # alias the same page position. encode_cursor emits unpadded url-safe
+    # base64, and only exactly that alphabet is accepted back.
+    _require(
+        _URLSAFE_ALPHABET.fullmatch(cursor) is not None,
+        "cursor is not canonical url-safe base64",
+    )
     padding = "=" * (-len(cursor) % 4)
     try:
         raw = b64decode(cursor + padding, altchars=b"-_", validate=True)
@@ -119,7 +129,12 @@ def decode_cursor(cursor: str, *, filter_hash: str, max_watermark: int) -> Curso
     missing = _ENVELOPE_FIELDS - set(payload)
     _require(not missing, f"cursor is missing fields: {sorted(missing)}")
 
-    _require(payload["v"] == _CURSOR_VERSION, f"unsupported cursor version: {payload['v']!r}")
+    # type(...) is int rejects JSON true, which Python would otherwise
+    # accept because True == 1.
+    _require(
+        type(payload["v"]) is int and payload["v"] == _CURSOR_VERSION,
+        f"unsupported cursor version: {payload['v']!r}",
+    )
 
     watermark = _uint64(payload["w"], "cursor watermark")
     _require(

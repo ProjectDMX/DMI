@@ -209,3 +209,39 @@ def test_invalid_cursor_error_is_a_capture_storage_error():
     from dmi.storage.capture import CaptureStorageError
 
     assert issubclass(InvalidCursorError, CaptureStorageError)
+
+
+def test_decode_rejects_a_non_canonical_base64_spelling():
+    from base64 import b64decode, b64encode
+
+    encoded = encode_cursor(_key(), watermark=_WATERMARK, filter_hash=_FILTER_HASH)
+    padding = "=" * (-len(encoded) % 4)
+    raw = b64decode(encoded + padding, altchars=b"-_")
+    standard = b64encode(raw).rstrip(b"=").decode("ascii")
+
+    if standard == encoded:
+        # No '+' or '/' arose from this payload; force a non-canonical
+        # character to prove the alphabet check itself.
+        standard = encoded[:-1] + "+"
+
+    # CPython's b64decode(altchars=..., validate=True) still accepts literal
+    # '+' and '/', so without an explicit alphabet check two spellings would
+    # alias the same page position.
+    with pytest.raises(InvalidCursorError, match="canonical"):
+        decode_cursor(
+            standard, filter_hash=_FILTER_HASH, max_watermark=_MAX_WATERMARK
+        )
+
+
+def test_decode_rejects_a_boolean_cursor_version():
+    encoded = encode_cursor(_key(), watermark=_WATERMARK, filter_hash=_FILTER_HASH)
+    from base64 import b64decode as _b64decode
+
+    padding = "=" * (-len(encoded) % 4)
+    payload = json.loads(_b64decode(encoded + padding, altchars=b"-_"))
+    payload["v"] = True  # True == 1 in Python; the version check must reject it
+
+    with pytest.raises(InvalidCursorError, match="version"):
+        decode_cursor(
+            _encoded(payload), filter_hash=_FILTER_HASH, max_watermark=_MAX_WATERMARK
+        )

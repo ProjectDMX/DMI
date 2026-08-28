@@ -233,30 +233,34 @@ class PackWriter:
         if len(footer) > MAX_FOOTER_BYTES:
             raise ValueError("pack footer exceeds its size limit")
         buffer.extend(footer)
-        body_checksum = sha256(buffer).digest()
-        buffer.extend(
-            _TRAILER.pack(
-                _TRAILER_MAGIC,
-                PACK_MAJOR_VERSION,
-                PACK_MINOR_VERSION,
-                footer_offset,
-                len(footer),
-                zlib.crc32(footer) & 0xFFFFFFFF,
-                body_checksum,
-            )
+        # One hash pass: the object checksum covers body || trailer, so the
+        # body hasher is extended with the trailer instead of re-reading the
+        # whole pack a second time.
+        hasher = sha256(buffer)
+        body_checksum = hasher.digest()
+        trailer = _TRAILER.pack(
+            _TRAILER_MAGIC,
+            PACK_MAJOR_VERSION,
+            PACK_MINOR_VERSION,
+            footer_offset,
+            len(footer),
+            zlib.crc32(footer) & 0xFFFFFFFF,
+            body_checksum,
         )
+        buffer.extend(trailer)
         if len(buffer) > self._max_pack_bytes:
             raise ValueError("sealed pack exceeds max_pack_bytes")
         self._sealed = True
         self._buffer = buffer
         data = bytes(buffer)
+        hasher.update(trailer)
         return SealedPack(
             pack_id=self._pack_id,
             created_at_ns=self._created_at_ns,
             data=data,
             record_count=len(self._records),
             footer_offset=footer_offset,
-            checksum=sha256(data).hexdigest(),
+            checksum=hasher.hexdigest(),
         )
 
 
@@ -370,7 +374,12 @@ class PackReader:
             raise PackFormatError("pack footer exceeds its size limit")
         if footer_offset < _HEADER.size or footer_offset + footer_length != trailer_offset:
             raise PackFormatError("pack footer range is invalid")
-        if sha256(data[:trailer_offset]).digest() != body_hash:
+        # memoryview avoids copying the whole body for the hash, and the
+        # object checksum (body || trailer) reuses the body hasher instead of
+        # re-reading the pack from offset zero.
+        view = memoryview(data)
+        hasher = sha256(view[:trailer_offset])
+        if hasher.digest() != body_hash:
             raise PackIntegrityError("pack checksum mismatch")
         footer = data[footer_offset:trailer_offset]
         if zlib.crc32(footer) & 0xFFFFFFFF != footer_crc:
@@ -382,12 +391,13 @@ class PackReader:
             raise PackFormatError("pack footer identity does not match the header")
         records = _parse_records(decoded, footer_offset)
 
+        hasher.update(view[trailer_offset:])
         return cls(
             data,
             pack_id=pack_id,
             created_at_ns=created_at_ns,
             records=records,
-            object_checksum=sha256(data).hexdigest(),
+            object_checksum=hasher.hexdigest(),
         )
 
     @staticmethod

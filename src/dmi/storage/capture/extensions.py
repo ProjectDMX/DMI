@@ -182,6 +182,21 @@ class ExtensionRegistry:
 
         for producer in self._producers.values():
             if sink is None:
+                # A registered producer that never runs must be visible: a
+                # silent skip is indistinguishable from "produced nothing",
+                # and the module contract says failures are recorded.
+                failures.append(
+                    ExtensionFailure(
+                        name=producer.kind,
+                        version=producer.version,
+                        error_type="MissingArtifactSink",
+                        message=(
+                            "artifact producer is registered but no artifact "
+                            "sink was provided to evaluate()/summarize()"
+                        ),
+                        elapsed_ns=0,
+                    )
+                )
                 continue
             started = self._timer_ns()
             try:

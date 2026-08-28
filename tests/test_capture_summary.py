@@ -585,7 +585,7 @@ def test_an_artifact_producer_writes_through_the_sink(tmp_path: Path):
     assert sink.written[0][0] == "capture-a"
 
 
-def test_artifact_producers_are_skipped_without_a_sink(tmp_path: Path):
+def test_artifact_producers_without_a_sink_record_a_failure(tmp_path: Path):
     reader, selection = _one_capture(tmp_path)
     registry = ExtensionRegistry()
     registry.register_producer(
@@ -594,9 +594,13 @@ def test_artifact_producers_are_skipped_without_a_sink(tmp_path: Path):
 
     summaries = reader.summarize(selection, byte_limit=1 << 20, registry=registry)
 
-    # Nothing to write to means nothing produced, and no failure either.
+    # A registered producer that never ran must be visible -- a silent skip
+    # would be indistinguishable from "produced nothing".
     assert summaries[0].artifacts == ()
-    assert summaries[0].failures == ()
+    assert [failure.error_type for failure in summaries[0].failures] == [
+        "MissingArtifactSink"
+    ]
+    assert summaries[0].failures[0].name == "raw"
 
 
 def test_a_producer_returning_the_wrong_shape_is_a_failure(tmp_path: Path):
