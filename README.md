@@ -13,7 +13,7 @@
 > collaborators to explore downstream applications built on DMI such as **interpretability**, **speculative decoding**,
 > **hallucination analysis**, **distillation**, **activation steering**, and beyond. If you're interested, please [contact us](mailto:ynn1999@umd.edu,sixianx@umd.edu,zaoxing@umd.edu).
 
-> **Project Status — research preview.** DMI supports Hugging Face and official vLLM integrations across 20+ dense and MoE model families, including Qwen3, Llama, Gemma, Mistral, GPT-OSS, Phi, and Granite, with early support for emerging architectures such as Qwen3.6, Llama 4, DeepSeek V4 Flash, GLM-5.2, Kimi K3, and MiniMax-M2.7. SGLang support is on the way. APIs may change. Contributions, bug reports, and feature requests are welcome.
+> **Project Status — research preview.** DMI supports HuggingFace and official vLLM integrations across 20+ dense and MoE model families, including Qwen3, Llama, Gemma, Mistral, GPT-OSS, Phi, and Granite, with early support for emerging architectures such as Qwen3.6, Llama 4, DeepSeek V4 Flash, GLM-5.2, Kimi K3, and MiniMax-M2.7. SGLang support is on the way. APIs may change. Contributions, bug reports, and feature requests are welcome.
 
 > **👀Technical Report Available:** https://arxiv.org/abs/2605.11093
 
