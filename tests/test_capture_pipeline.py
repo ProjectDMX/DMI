@@ -459,3 +459,23 @@ def test_pipeline_survives_a_duplicate_capture_id(tmp_path: Path):
     assert snapshot.duplicate_records == 1
     assert snapshot.failures == 0
     assert snapshot.persisted_records == 2
+
+
+def test_pack_assembler_flushes_an_expired_pack_under_continuous_traffic():
+    assembler = PackAssembler(
+        max_pack_bytes=1024 * 1024,
+        max_records=100,
+        max_linger_ns=10,
+        pack_id_factory=_ids(),
+    )
+
+    assert assembler.append(_record("capture-a"), now_ns=0) == ()
+    # The queue never goes idle, so expiry must be enforced on the append
+    # path itself: the expired pack flushes as LINGER before the new record
+    # opens a fresh one.
+    emitted = assembler.append(_record("capture-b"), now_ns=25)
+
+    assert [ready.reason for ready in emitted] == [FlushReason.LINGER]
+    assert emitted[0].pack.record_count == 1
+    flushed = assembler.flush(FlushReason.SHUTDOWN)
+    assert flushed[0].pack.record_count == 1

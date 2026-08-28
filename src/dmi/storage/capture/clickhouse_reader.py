@@ -209,14 +209,24 @@ class ClickHouseCaptureCatalog:
             )
         if not capture_ids:
             return ()
+        requested = _parse_watermark(watermark)
+        # A selection is caller data. Its watermark must be one the indexer
+        # actually published -- accepting an arbitrary value would read packs
+        # whose commit-log rows are written but not yet covered by a
+        # publish, defeating the publish-last ordering (the paginated path
+        # already enforces this bound in decode_cursor).
+        if requested > int(self.current_watermark()):
+            raise ValueError(
+                "selection watermark exceeds the published watermark"
+            )
         params = {
-            "watermark": _parse_watermark(watermark),
+            "watermark": requested,
             "capture_ids": list(capture_ids),
         }
         sql = (
             f"SELECT {self._projection()} FROM {self._qualified()} "
-            "WHERE capture_id IN %(capture_ids)s AND pack_id IN "
-            f"(SELECT pack_id FROM {self._qualified(self._commit_log)} "
+            "WHERE capture_id IN %(capture_ids)s AND (store_id, pack_id) IN "
+            f"(SELECT store_id, pack_id FROM {self._qualified(self._commit_log)} "
             "WHERE index_version <= %(watermark)s) "
             f"GROUP BY {', '.join(_quoted(name) for name in _SORT_KEY)}"
         )
@@ -259,7 +269,10 @@ class ClickHouseCaptureCatalog:
         # is irrelevant -- but a version *range* over them is not durable,
         # because ReplacingMergeTree deletes superseded rows.
         clauses = [
-            "pack_id IN (SELECT pack_id FROM "
+            # Pack identity is (store_id, pack_id): matching on pack_id alone
+            # would let the same UUID committed by a second store at a later
+            # version slip inside a pinned snapshot.
+            "(store_id, pack_id) IN (SELECT store_id, pack_id FROM "
             f"{self._qualified(self._commit_log)} "
             "WHERE index_version <= %(watermark)s)"
         ]

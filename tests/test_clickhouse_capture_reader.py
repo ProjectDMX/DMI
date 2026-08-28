@@ -393,3 +393,34 @@ def test_capture_reader_refuses_a_selection_that_spans_pages():
 
     with pytest.raises(ValueError, match="one bounded page"):
         reader.select(CaptureQuery(limit=3))
+
+
+def test_get_by_ids_matches_commit_membership_on_store_and_pack():
+    expected = synthetic_descriptors(1)
+    catalog, client = _catalog(descriptors=expected)
+
+    catalog.get_by_ids([expected[0].capture_id], watermark=str(_WATERMARK))
+
+    sql = client.selects[0]
+    # Pack identity is (store_id, pack_id); matching pack_id alone would let
+    # the same UUID committed by a second store slip inside a pinned snapshot.
+    assert "(store_id, pack_id) IN (SELECT store_id, pack_id FROM" in sql
+
+
+def test_search_matches_commit_membership_on_store_and_pack():
+    catalog, client = _catalog(descriptors=synthetic_descriptors(1))
+
+    catalog.search(CaptureQuery(limit=10))
+
+    sql = client.selects[0]
+    assert "(store_id, pack_id) IN (SELECT store_id, pack_id FROM" in sql
+
+
+def test_get_by_ids_rejects_an_unpublished_watermark():
+    catalog, client = _catalog(descriptors=synthetic_descriptors(1))
+
+    with pytest.raises(ValueError, match="published watermark"):
+        catalog.get_by_ids(["capture-0"], watermark=str(_WATERMARK + 1))
+
+    # Nothing was read beyond the watermark log itself.
+    assert client.selects == []

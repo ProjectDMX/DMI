@@ -187,6 +187,10 @@ class PackAssembler:
         if now_ns < 0:
             raise ValueError("now_ns must be non-negative")
         emitted: list[ReadyPack] = []
+        # Enforce max_linger_ns on the append path as well: the drain loop
+        # only checks expiry when the queue goes idle, so under continuous
+        # traffic an open pack would otherwise linger unbounded.
+        emitted.extend(self.flush_expired(now_ns=now_ns))
         scope = self._record_scope(record)
         if self._writer is None:
             writer = self._writer_with(record)
