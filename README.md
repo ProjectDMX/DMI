@@ -13,9 +13,7 @@
 > collaborators to explore downstream applications built on DMI such as **interpretability**, **speculative decoding**,
 > **hallucination analysis**, **distillation**, **activation steering**, and beyond. If you're interested, please [contact us](mailto:ynn1999@umd.edu,sixianx@umd.edu,zaoxing@umd.edu).
 
-> **Project Status — research preview.** DMI currently supports HuggingFace
-> and vLLM backends for Qwen3 / Llama3.1 and GPT-2-family. SGLang support is on the way. APIs may change. Contributions, bug
-> reports, and feature requests are welcome.
+> **Project Status — research preview.** DMI supports Hugging Face and official vLLM integrations across 20+ dense and MoE model families, including Qwen3, Llama, Gemma, Mistral, GPT-OSS, Phi, and Granite, with early support for emerging architectures such as Qwen3.6, Llama 4, DeepSeek V4 Flash, GLM-5.2, Kimi K3, and MiniMax-M2.7. SGLang support is on the way. APIs may change. Contributions, bug reports, and feature requests are welcome.
 
 > **👀Technical Report Available:** https://arxiv.org/abs/2605.11093
 
@@ -25,10 +23,8 @@
 We are working to make DMI useful across more backends, more models, and more
 stages of the model lifecycle.
 
-- **More backend support and models** — Bring DMI to **SGLang** and expand support for
-  more widely used model families, including multimodal models.
-- **From inference to training** — Extend DMI's low-overhead inspection to
-  large-scale training framework. (**Megatron**).
+- **What's next** — **SGLang**, multimodal models, and end-to-end observability
+  from inference to large-scale training with **Megatron**.
 - **From observation to action** — Low-latency streaming/pluggable APIs enables more downstream applications like online monitoring, activation steering,
     distillation, and speculative decoding.
 - **Broader PCIe-aware scheduling** — Extend DMI's serving-first drain governor
@@ -62,6 +58,8 @@ That's the gap DMI fills.
 
 ## Key features
 
+- **Broad model coverage** — 20+ dense and MoE model families across Hugging Face
+  and vLLM, from Qwen and Llama to Gemma, Mistral, GPT-OSS, and emerging architectures.
 - **`HookPoint`** — drop-in observation primitive. Place it anywhere in a PyTorch
   model; works under CUDA Graphs and survives `torch.compile`.
 - **`Ring²`** — GPU↔CPU co-designed staging. A dedicated GPU-side payload ring
