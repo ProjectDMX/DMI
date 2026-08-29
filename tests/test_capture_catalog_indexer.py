@@ -334,3 +334,102 @@ def test_a_restarted_indexer_cannot_publish_under_the_durable_watermark(
     assert published == sorted(published), f"versions went backwards: {published}"
     assert len(set(published)) == len(published), "a version was reused"
     assert published[0] == 2_000 and published[1] > 2_000
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["max_packs", "max_rows_per_insert", "max_estimated_bytes", "max_failure_details"],
+)
+@pytest.mark.parametrize("value", [0, -1, 1.5])
+def test_indexer_config_rejects_non_positive_fields(field: str, value):
+    with pytest.raises(ValueError, match="must be positive"):
+        CatalogIndexerConfig(**{field: value})
+
+
+@pytest.mark.parametrize("bad_clock", [lambda: -1, lambda: "42"])
+def test_indexer_rejects_an_invalid_clock_value(tmp_path: Path, bad_clock):
+    inventory, refs = _packs(tmp_path, (1,))
+    indexer = CatalogIndexer(inventory, _CatalogWriter(), clock_ns=bad_clock)
+
+    with pytest.raises(ValueError, match="clock_ns"):
+        indexer.index(refs)
+
+
+def test_indexer_emits_a_completion_event_per_index_call(tmp_path: Path):
+    inventory, refs = _packs(tmp_path, (1,))
+    events = []
+    indexer = CatalogIndexer(
+        inventory, _CatalogWriter(), clock_ns=lambda: 42, on_event=events.append
+    )
+
+    result = indexer.index(refs)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.event == "catalog_index_completed"
+    assert event.indexed_packs == result.indexed_packs == 1
+    assert event.indexed_rows == result.indexed_rows
+    assert event.estimated_bytes == result.estimated_bytes
+    assert indexer.callback_failures == 0
+
+
+def test_indexer_contains_a_raising_event_callback(tmp_path: Path):
+    inventory, refs = _packs(tmp_path, (1,))
+
+    def broken_observer(event):
+        raise RuntimeError("observer down")
+
+    indexer = CatalogIndexer(
+        inventory, _CatalogWriter(), clock_ns=lambda: 42, on_event=broken_observer
+    )
+
+    result = indexer.index(refs)
+
+    assert result.indexed_packs == 1
+    assert indexer.callback_failures == 1
+
+
+def test_reconciler_rejects_mismatched_store_ids(tmp_path: Path):
+    inventory, _ = _packs(tmp_path, (1,))
+    (tmp_path / "other").mkdir()
+    other = FilesystemPackStore(tmp_path / "other", store_id="other")
+    indexer = CatalogIndexer(other, _CatalogWriter())
+
+    with pytest.raises(ValueError, match="store IDs differ"):
+        CatalogReconciler(inventory, indexer)
+
+
+def test_reconcile_page_bounds_the_listing_limit(tmp_path: Path):
+    inventory, _ = _packs(tmp_path, (1,))
+    reconciler = CatalogReconciler(
+        inventory,
+        CatalogIndexer(
+            inventory, _CatalogWriter(), config=CatalogIndexerConfig(max_packs=1)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="max_packs"):
+        reconciler.reconcile_page(limit=2)
+
+
+def test_rebuild_rejects_a_non_positive_max_pages(tmp_path: Path):
+    inventory, _ = _packs(tmp_path, (1,))
+    reconciler = CatalogReconciler(
+        inventory, CatalogIndexer(inventory, _CatalogWriter())
+    )
+
+    with pytest.raises(ValueError, match="max_pages"):
+        reconciler.rebuild(max_pages=0)
+
+
+def test_rebuild_raises_when_the_listing_never_terminates(tmp_path: Path):
+    inventory, _ = _packs(tmp_path, (1,))
+    inventory.list_objects = lambda *, prefix="", cursor=None, limit=1000: ObjectPage(
+        items=(), next_cursor="0"
+    )
+    reconciler = CatalogReconciler(
+        inventory, CatalogIndexer(inventory, _CatalogWriter(), clock_ns=lambda: 42)
+    )
+
+    with pytest.raises(RuntimeError, match="max_pages"):
+        reconciler.rebuild(max_pages=3)

@@ -667,3 +667,151 @@ def test_l2_norm_still_matches_the_plain_formula_at_normal_scale(tmp_path: Path)
 
     # Scaling must not cost accuracy where the naive form was already fine.
     assert summary.l2_norm == pytest.approx(float(np.sqrt((source**2).sum())))
+
+
+# --- registry construction and introspection -----------------------------------
+
+
+def test_registry_rejects_non_positive_bounds():
+    with pytest.raises(ValueError, match="max_extensions"):
+        ExtensionRegistry(max_extensions=0)
+    with pytest.raises(ValueError, match="time_budget_ns"):
+        ExtensionRegistry(time_budget_ns=0)
+
+
+def test_registry_exposes_its_bounds_and_registrations():
+    registry = ExtensionRegistry(max_extensions=4, time_budget_ns=123)
+    metric = registry.register_metric(
+        ScalarMetric(name="mean", version=1, compute=lambda a: float(a.mean()))
+    )
+    producer = registry.register_producer(
+        ArtifactProducer(kind="raw", version=1, produce=lambda a: (b"", "text/plain"))
+    )
+
+    assert registry.max_extensions == 4
+    assert registry.time_budget_ns == 123
+    assert registry.metrics == (metric,)
+    assert registry.producers == (producer,)
+    assert len(registry) == 2
+
+
+def test_registry_refuses_duplicate_producer_kinds():
+    registry = ExtensionRegistry()
+    registry.register_producer(
+        ArtifactProducer(kind="raw", version=1, produce=lambda a: (b"", "text/plain"))
+    )
+
+    with pytest.raises(ExtensionError, match="already registered"):
+        registry.register_producer(
+            ArtifactProducer(
+                kind="raw", version=2, produce=lambda a: (b"", "text/plain")
+            )
+        )
+
+
+# --- reader construction and limit validation -----------------------------------
+
+
+def test_reader_rejects_a_negative_coalesce_gap(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+
+    with pytest.raises(ValueError, match="max_coalesce_gap_bytes"):
+        CaptureReader(_Catalog(()), {"local": store}, max_coalesce_gap_bytes=-1)
+
+
+def test_reader_requires_at_least_one_store():
+    with pytest.raises(ValueError, match="at least one pack store"):
+        CaptureReader(_Catalog(()), {})
+
+
+def test_reader_rejects_a_mismatched_store_mapping(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+
+    with pytest.raises(ValueError, match="store mapping key"):
+        CaptureReader(_Catalog(()), {"other": store})
+
+
+def test_hydrate_validates_its_limits(tmp_path: Path):
+    reader, selection = _one_capture(tmp_path)
+
+    with pytest.raises(ValueError, match="byte_limit"):
+        reader.hydrate(selection, byte_limit=-1)
+    with pytest.raises(ValueError, match="request_limit"):
+        reader.hydrate(selection, byte_limit=1 << 20, request_limit=0)
+
+
+def test_summarize_validates_its_limits(tmp_path: Path):
+    reader, selection = _one_capture(tmp_path)
+
+    with pytest.raises(ValueError, match="max_summary_captures"):
+        reader.summarize(selection, byte_limit=1 << 20, max_summary_captures=0)
+    with pytest.raises(ValueError, match="max_summary_elements"):
+        reader.summarize(selection, byte_limit=1 << 20, max_summary_elements=0)
+
+
+def test_hydrate_rejects_a_descriptor_naming_an_unknown_store(tmp_path: Path):
+    from dmi.storage.capture.model import PackFormatError
+
+    _, _, descriptors = _build(
+        tmp_path / "packs",
+        [_tensor_record("capture-a", np.zeros(2, dtype=np.float32), "float32")],
+    )
+    other = FilesystemPackStore(tmp_path / "other", store_id="other")
+    reader = CaptureReader(_Catalog(descriptors), {"other": other})
+    selection = reader.select(CaptureQuery(limit=10))
+
+    with pytest.raises(PackFormatError, match="unknown pack store"):
+        reader.hydrate(selection, byte_limit=1 << 20)
+
+
+def test_hydrate_rejects_a_catalog_returning_duplicates(tmp_path: Path):
+    from dmi.storage.capture.model import DuplicateCaptureError
+
+    _, store, descriptors = _build(
+        tmp_path,
+        [_tensor_record("capture-a", np.zeros(2, dtype=np.float32), "float32")],
+    )
+    reader = CaptureReader(_Catalog(descriptors + descriptors), {"local": store})
+    selection = CaptureSelection.create(
+        descriptors, catalog_watermark=WATERMARK, filter_hash="f" * 64
+    )
+
+    with pytest.raises(DuplicateCaptureError, match="duplicate capture"):
+        reader.hydrate(selection, byte_limit=1 << 20)
+
+
+# --- decoding preconditions -----------------------------------------------------
+
+
+def test_decode_tensor_rejects_a_compressed_locator(tmp_path: Path):
+    from dataclasses import replace
+
+    from dmi.storage.capture.model import PackFormatError
+
+    source = np.zeros(2, dtype=np.float32)
+    _, descriptor = _descriptor_for(source, "float32", tmp_path)
+    compressed = replace(descriptor, locator=replace(descriptor.locator, codec="zstd"))
+
+    with pytest.raises(PackFormatError, match="unsupported codec"):
+        decode_tensor(compressed, source.tobytes())
+
+
+def test_decode_tensor_rejects_a_payload_of_the_wrong_length(tmp_path: Path):
+    from dmi.storage.capture.model import PackIntegrityError
+
+    source = np.zeros(2, dtype=np.float32)
+    _, descriptor = _descriptor_for(source, "float32", tmp_path)
+
+    with pytest.raises(PackIntegrityError, match="payload length"):
+        decode_tensor(descriptor, source.tobytes()[:-1])
+
+
+def test_core_summary_of_an_all_zero_tensor_has_zero_norm(tmp_path: Path):
+    source = np.zeros(4, dtype=np.float32)
+    _, descriptor = _descriptor_for(source, "float32", tmp_path)
+
+    summary = summarize_tensor(descriptor, source.tobytes())
+
+    assert summary.l2_norm == 0.0
+    assert summary.abs_max == 0.0
+    assert summary.zero_fraction == 1.0

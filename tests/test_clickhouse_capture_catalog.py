@@ -168,3 +168,92 @@ def test_facets_never_collide_with_an_inserted_column():
     # A MATERIALIZED column cannot be written to, so a collision with the
     # writer's column list would break every insert.
     assert {name for name, _, _ in _FACET_COLUMNS}.isdisjoint(_CAPTURE_COLUMNS)
+
+
+def test_clickhouse_catalog_config_rejects_non_positive_query_pack_limit():
+    with pytest.raises(ValueError, match="query_pack_limit"):
+        ClickHouseCatalogConfig(query_pack_limit=0)
+
+
+def test_committed_pack_ids_short_circuits_on_empty_input():
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    assert writer.committed_pack_ids([]) == set()
+    assert client.calls == []
+
+
+def test_committed_pack_ids_bounds_the_identity_batch():
+    client = _Client()
+    writer = ClickHouseCatalogWriter(
+        client, ClickHouseCatalogConfig(query_pack_limit=1)
+    )
+
+    with pytest.raises(ValueError, match="query_pack_limit"):
+        writer.committed_pack_ids([("garage", "a"), ("garage", "b")])
+    assert client.calls == []
+
+
+def test_committed_pack_ids_decodes_bytes_identities():
+    client = _Client()
+    client.committed = [(b"garage", b"018f0000-0000-7000-8000-000000000001")]
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    found = writer.committed_pack_ids(
+        [("garage", "018f0000-0000-7000-8000-000000000001")]
+    )
+
+    assert found == {("garage", "018f0000-0000-7000-8000-000000000001")}
+
+
+def test_committed_pack_ids_rejects_non_text_identities():
+    client = _Client()
+    client.committed = [(5, "018f0000-0000-7000-8000-000000000001")]
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    with pytest.raises(ValueError, match="pack identity"):
+        writer.committed_pack_ids([("garage", "a")])
+
+
+def test_write_descriptors_short_circuits_on_empty_input():
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    writer.write_descriptors([], index_version=42)
+
+    assert client.calls == []
+
+
+def test_commit_packs_short_circuits_on_empty_input():
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    writer.commit_packs([], index_version=42)
+
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("version", [-1, 2**64, "42"])
+def test_index_versions_must_fit_uint64(version):
+    _, descriptor = _descriptor()
+    writer = ClickHouseCatalogWriter(_Client(), ClickHouseCatalogConfig())
+
+    with pytest.raises(ValueError, match="UInt64"):
+        writer.write_descriptors([descriptor], index_version=version)
+
+
+def test_last_published_version_returns_the_reported_maximum():
+    client = _Client()
+    client.committed = [(5,)]
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    assert writer.last_published_version() == 5
+
+
+def test_last_published_version_rejects_a_non_integer_watermark():
+    client = _Client()
+    client.committed = [("5",)]
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    with pytest.raises(ValueError, match="invalid version"):
+        writer.last_published_version()

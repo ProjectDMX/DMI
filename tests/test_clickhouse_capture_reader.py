@@ -424,3 +424,96 @@ def test_get_by_ids_rejects_an_unpublished_watermark():
 
     # Nothing was read beyond the watermark log itself.
     assert client.selects == []
+
+
+# --- row value normalisation --------------------------------------------------
+
+
+def _patched_row(descriptor: CaptureDescriptor, **overrides) -> tuple:
+    row = list(_row(descriptor))
+    for name, value in overrides.items():
+        row[_PROJECTION.index(name)] = value
+    return tuple(row)
+
+
+def _raw_row_catalog(row: tuple) -> ClickHouseCaptureCatalog:
+    """A catalog whose page query returns one raw row, bypassing _row()."""
+    client = _Client()
+    original = client.execute
+
+    def execute(query, params=None, **kwargs):
+        if "max(index_version)" in query:
+            return original(query, params, **kwargs)
+        client.calls.append((" ".join(query.split()), params, kwargs))
+        return [row]
+
+    client.execute = execute  # type: ignore[method-assign]
+    return ClickHouseCaptureCatalog(client, ClickHouseReaderConfig())
+
+
+def test_row_mapping_strips_nul_padding_from_fixedstring_columns():
+    descriptor = synthetic_descriptors(1)[0]
+    padded = descriptor.locator.pack_checksum.encode() + b"\x00" * 4
+    catalog = _raw_row_catalog(_patched_row(descriptor, pack_checksum=padded))
+
+    page = catalog.search(CaptureQuery(limit=10))
+
+    assert page.items == (descriptor,)
+
+
+def test_row_mapping_converts_uuid_columns_to_text():
+    from uuid import UUID
+
+    descriptor = synthetic_descriptors(1)[0]
+    catalog = _raw_row_catalog(
+        _patched_row(descriptor, pack_id=UUID(descriptor.locator.pack_id))
+    )
+
+    page = catalog.search(CaptureQuery(limit=10))
+
+    assert page.items[0].locator.pack_id == descriptor.locator.pack_id
+
+
+def test_row_mapping_rejects_a_non_text_column():
+    descriptor = synthetic_descriptors(1)[0]
+    catalog = _raw_row_catalog(_patched_row(descriptor, capture_id=5))
+
+    with pytest.raises(PackFormatError, match="non-text capture_id"):
+        catalog.search(CaptureQuery(limit=10))
+
+
+def test_row_mapping_rejects_a_non_integer_column():
+    descriptor = synthetic_descriptors(1)[0]
+    catalog = _raw_row_catalog(_patched_row(descriptor, layer_number=True))
+
+    with pytest.raises(PackFormatError, match="non-integer layer_number"):
+        catalog.search(CaptureQuery(limit=10))
+
+
+def test_row_mapping_rejects_a_non_array_shape():
+    descriptor = synthetic_descriptors(1)[0]
+    catalog = _raw_row_catalog(_patched_row(descriptor, shape=5))
+
+    with pytest.raises(PackFormatError, match="non-array shape"):
+        catalog.search(CaptureQuery(limit=10))
+
+
+@pytest.mark.parametrize("value", (True, "5"))
+def test_current_watermark_rejects_a_non_integer_version(value):
+    catalog, _ = _catalog(watermark=value)
+
+    with pytest.raises(PackFormatError, match="non-integer watermark"):
+        catalog.current_watermark()
+
+
+def test_current_watermark_reports_zero_before_any_publish():
+    catalog, _ = _catalog(watermark=None)
+
+    assert catalog.current_watermark() == "0"
+
+
+def test_reader_catalog_exposes_its_config():
+    config = ClickHouseReaderConfig(max_capture_ids=7)
+    catalog = ClickHouseCaptureCatalog(_Client(), config)
+
+    assert catalog.config is config

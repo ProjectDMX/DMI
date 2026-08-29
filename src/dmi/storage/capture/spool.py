@@ -546,7 +546,9 @@ class ParallelSpoolUploader:
                 attempts=attempt,
                 duration_ns=max(0, self._clock_ns() - started),
             )
-        raise AssertionError("unreachable upload attempt state")
+        raise AssertionError(  # pragma: no cover - loop always returns or raises
+            "unreachable upload attempt state"
+        )
 
     def _backoff(self, attempt: int) -> float:
         base = min(

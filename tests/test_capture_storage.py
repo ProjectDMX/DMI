@@ -441,3 +441,248 @@ def test_fsync_path_to_root_covers_every_new_directory(tmp_path: Path, monkeypat
 
     with pytest.raises(ValueError, match="not under root"):
         fsync_path_to_root(tmp_path.resolve(), root)
+
+
+# --- metadata and query validation ---------------------------------------------
+
+
+def test_capture_metadata_requires_its_text_fields():
+    with pytest.raises(ValueError, match="tenant_id is required"):
+        replace(_metadata("capture-a"), tenant_id=None)
+
+
+def test_capture_metadata_rejects_an_unsupported_dtype():
+    with pytest.raises(ValueError, match="unsupported dtype"):
+        replace(_metadata("capture-a"), dtype="complex64")
+
+
+def test_capture_metadata_normalises_list_shapes():
+    assert replace(_metadata("capture-a"), shape=[2]).shape == (2,)
+
+
+def test_capture_metadata_bounds_shape_rank():
+    with pytest.raises(ValueError, match="rank"):
+        replace(_metadata("capture-a"), shape=(1,) * 33)
+
+
+def test_capture_metadata_rejects_a_reversed_token_span():
+    with pytest.raises(ValueError, match="token_end must be >= token_start"):
+        replace(_metadata("capture-a"), token_start=2)
+
+
+def test_capture_metadata_from_mapping_validates_its_input():
+    mapping = _metadata("capture-a").to_mapping()
+
+    incomplete = dict(mapping)
+    del incomplete["run_id"]
+    with pytest.raises(PackFormatError, match="missing: run_id"):
+        CaptureMetadata.from_mapping(incomplete)
+
+    with pytest.raises(PackFormatError, match="integer list"):
+        CaptureMetadata.from_mapping(dict(mapping, shape=(2,)))
+    with pytest.raises(PackFormatError, match="integer list"):
+        CaptureMetadata.from_mapping(dict(mapping, shape=[1.5]))
+
+    with pytest.raises(PackFormatError, match="invalid capture metadata"):
+        CaptureMetadata.from_mapping(dict(mapping, tenant_id=""))
+
+
+def test_capture_record_coerces_buffer_payloads_to_bytes():
+    coerced = CaptureRecord(
+        metadata=_metadata("capture-a"), payload=bytearray(b"\x00" * 8)
+    )
+    assert type(coerced.payload) is bytes
+
+    view = CaptureRecord(
+        metadata=_metadata("capture-b"), payload=memoryview(b"\x01" * 8)
+    )
+    assert view.payload == b"\x01" * 8
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    (
+        ({"limit": 0}, "limit"),
+        ({"limit": 10_001}, "limit"),
+        ({"hook_names": tuple(f"hook-{i}" for i in range(129))}, "cardinality"),
+        ({"layer_numbers": tuple(range(1025))}, "cardinality"),
+        ({"layer_numbers": (-2,)}, "layer numbers"),
+        ({"captured_after_ns": -1}, "captured_after_ns"),
+        ({"captured_before_ns": True}, "captured_before_ns"),
+        ({"captured_after_ns": 5, "captured_before_ns": 4}, "captured_before_ns"),
+    ),
+)
+def test_capture_query_validates_its_bounds(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        CaptureQuery(**kwargs)
+
+
+# --- filesystem store validation --------------------------------------------------
+
+
+class _ScriptedStream:
+    """A byte stream that returns exactly the scripted chunks."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def read(self, size=-1):
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _LyingPack:
+    """Metadata copied from a real pack, a stream that disagrees with it."""
+
+    def __init__(self, sealed, chunks):
+        self.pack_id = sealed.pack_id
+        self.created_at_ns = sealed.created_at_ns
+        self.record_count = sealed.record_count
+        self.checksum = sealed.checksum
+        self._object_bytes = sealed.object_bytes
+        self._chunks = tuple(chunks)
+
+    @property
+    def object_bytes(self):
+        return self._object_bytes
+
+    def open(self):
+        return _ScriptedStream(self._chunks)
+
+
+def test_filesystem_store_validates_its_store_id(tmp_path: Path):
+    with pytest.raises(ValueError, match="store_id"):
+        FilesystemPackStore(tmp_path, store_id="")
+    with pytest.raises(ValueError, match="store_id"):
+        FilesystemPackStore(tmp_path, store_id="x" * 129)
+
+
+def test_put_rejects_a_non_pack_source(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+
+    with pytest.raises(TypeError, match="PackSource"):
+        store.put(object(), "packs/a.dmi-pack")
+
+
+def test_put_validates_the_pack_source_metadata(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+
+    with pytest.raises(ValueError, match="invalid pack ID"):
+        store.put(replace(sealed, pack_id="not-a-uuid"), "packs/a.dmi-pack")
+    with pytest.raises(ValueError, match="canonical pack ID"):
+        store.put(replace(sealed, pack_id=str(PACK_ID).upper()), "packs/a.dmi-pack")
+    with pytest.raises(ValueError, match="numeric metadata"):
+        store.put(replace(sealed, created_at_ns=-1), "packs/a.dmi-pack")
+    with pytest.raises(ValueError, match="records and bytes"):
+        store.put(replace(sealed, record_count=0), "packs/a.dmi-pack")
+    with pytest.raises(ValueError, match="invalid checksum"):
+        store.put(replace(sealed, checksum="nope"), "packs/a.dmi-pack")
+
+
+def test_put_rejects_a_pack_source_whose_stream_lies(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+
+    # Ends early, returns text, returns more than asked for.
+    with pytest.raises(PackIntegrityError, match="invalid byte stream"):
+        store.put(_LyingPack(sealed, []), "packs/a.dmi-pack")
+    with pytest.raises(PackIntegrityError, match="invalid byte stream"):
+        store.put(_LyingPack(sealed, ["text"]), "packs/b.dmi-pack")
+    with pytest.raises(PackIntegrityError, match="invalid byte stream"):
+        store.put(_LyingPack(sealed, [sealed.data + b"!"]), "packs/c.dmi-pack")
+    # Declared size reached with bytes still in the stream.
+    with pytest.raises(PackIntegrityError, match="declared size"):
+        store.put(_LyingPack(sealed, [sealed.data, b"!"]), "packs/d.dmi-pack")
+
+
+def test_put_rejects_a_key_whose_parent_escapes_the_root(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path / "store", store_id="local")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (store.root / "link").symlink_to(outside, target_is_directory=True)
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+
+    with pytest.raises(ValueError, match="escapes the store root"):
+        store.put(sealed, "link/a.dmi-pack")
+
+
+def test_open_regular_refuses_symlinks_and_propagates_other_errors(
+    tmp_path: Path, monkeypatch
+):
+    import errno
+
+    target = tmp_path / "target"
+    target.write_bytes(b"data")
+    link = tmp_path / "link.dmi-pack"
+    link.symlink_to(target)
+
+    with pytest.raises(PackFormatError, match="regular file"):
+        FilesystemPackStore._open_regular(link)
+
+    def denied(path, flags):
+        raise OSError(errno.EACCES, "denied")
+
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.open", denied)
+    with pytest.raises(OSError, match="denied"):
+        FilesystemPackStore._open_regular(target)
+
+
+def test_open_regular_refuses_a_non_regular_file(tmp_path: Path):
+    with pytest.raises(PackFormatError, match="regular file"):
+        FilesystemPackStore._open_regular(tmp_path)
+
+
+def test_put_survives_losing_the_link_race_to_an_identical_writer(
+    tmp_path: Path, monkeypatch
+):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+
+    def concurrent_link(src, dst, *args, **kwargs):
+        # The other writer wins the race with the same content.
+        Path(dst).write_bytes(sealed.data)
+        raise FileExistsError(dst)
+
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.link", concurrent_link)
+
+    ref = store.put(sealed, "packs/a.dmi-pack")
+
+    assert ref.object_bytes == len(sealed.data)
+    assert ref.checksum == sealed.checksum
+
+
+def test_read_range_validates_its_arguments(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    ref = store.put(sealed, "packs/a.dmi-pack")
+
+    with pytest.raises(ValueError, match="non-negative integers"):
+        store.read_range(ref, -1, 4)
+    with pytest.raises(ValueError, match="non-negative integers"):
+        store.read_range(ref, 0, 4.0)
+    with pytest.raises(PackFormatError, match="exceeds object size"):
+        store.read_range(ref, 0, len(sealed.data) + 1)
+    with pytest.raises(ValueError, match="pack store mismatch"):
+        store.read_range(replace(ref, store_id="other"), 0, 4)
+
+
+def test_read_range_detects_a_short_filesystem_read(tmp_path: Path, monkeypatch):
+    from io import BytesIO
+
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    ref = store.put(sealed, "packs/a.dmi-pack")
+    monkeypatch.setattr(
+        FilesystemPackStore,
+        "_open_regular",
+        staticmethod(lambda path: BytesIO(sealed.data[: len(sealed.data) // 2])),
+    )
+
+    with pytest.raises(PackIntegrityError, match="short range"):
+        store.read_range(ref, len(sealed.data) - 8, 8)

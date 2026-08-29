@@ -229,3 +229,105 @@ def test_retry_classifier_treats_transport_failures_as_transient():
     assert ParallelSpoolUploader._retryable(
         botocore_exceptions.ConnectionError(error="unreachable")
     )
+
+
+# --- configuration and limit validation ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    (
+        ({"max_workers": 0}, "max_workers"),
+        ({"max_in_flight_bytes": 0}, "max_in_flight_bytes"),
+        ({"max_attempts": True}, "max_attempts"),
+        ({"base_backoff_seconds": -1.0}, "finite and non-negative"),
+        ({"jitter_ratio": True}, "finite and non-negative"),
+        (
+            {"base_backoff_seconds": 5.0, "max_backoff_seconds": 1.0},
+            "cover base_backoff_seconds",
+        ),
+        ({"jitter_ratio": 1.5}, "exceed one"),
+    ),
+)
+def test_parallel_upload_config_validates_its_settings(kwargs, match):
+    settings = dict(max_workers=1, max_in_flight_bytes=1024)
+    settings.update(kwargs)
+
+    with pytest.raises(ValueError, match=match):
+        ParallelUploadConfig(**settings)
+
+
+def test_parallel_uploader_validates_and_applies_its_limit(tmp_path: Path):
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=1024 * 1024)
+    staged = [_stage(spool, index) for index in range(2)]
+    uploader = ParallelSpoolUploader(
+        spool,
+        FilesystemPackStore(tmp_path / "remote"),
+        ParallelUploadConfig(
+            max_workers=1,
+            max_in_flight_bytes=max(item.object_bytes for item in staged),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="limit"):
+        uploader.upload_pending(limit=0)
+
+    result = uploader.upload_pending(limit=1)
+
+    assert result.snapshot.attempted_packs == 1
+    assert len(result.refs) == 1
+    assert spool.snapshot().entries == 1
+
+
+# --- retry classification of HTTP-shaped errors -------------------------------------
+
+
+class _ResponseError(Exception):
+    """An exception shaped like a botocore ClientError."""
+
+    def __init__(self, response):
+        self.response = response
+        super().__init__("scripted")
+
+
+@pytest.mark.parametrize(
+    "response,expected",
+    (
+        ({"ResponseMetadata": {"HTTPStatusCode": 503}}, True),
+        ({"ResponseMetadata": {"HTTPStatusCode": 408}}, True),
+        ({"ResponseMetadata": {"HTTPStatusCode": 429}}, True),
+        ({"Error": {"Code": "SlowDown"}}, True),
+        (
+            {
+                "ResponseMetadata": {"HTTPStatusCode": 403},
+                "Error": {"Code": "AccessDenied"},
+            },
+            False,
+        ),
+        ({"ResponseMetadata": "bogus", "Error": "bogus"}, False),
+    ),
+)
+def test_retry_classifier_reads_http_shaped_responses(response, expected):
+    assert ParallelSpoolUploader._retryable(_ResponseError(response)) is expected
+
+
+def test_retry_classifier_treats_a_bare_exception_as_permanent():
+    assert ParallelSpoolUploader._retryable(RuntimeError("boom")) is False
+
+
+def test_parallel_uploader_contains_a_raising_event_callback(tmp_path: Path):
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=1024 * 1024)
+    staged = _stage(spool, 1)
+
+    def broken(event):
+        raise RuntimeError("telemetry down")
+
+    result = ParallelSpoolUploader(
+        spool,
+        FilesystemPackStore(tmp_path / "remote"),
+        ParallelUploadConfig(max_workers=1, max_in_flight_bytes=staged.object_bytes),
+        event_callback=broken,
+    ).upload_pending()
+
+    assert len(result.refs) == 1
+    assert result.snapshot.event_callback_failures == 1

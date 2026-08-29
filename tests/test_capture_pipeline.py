@@ -479,3 +479,170 @@ def test_pack_assembler_flushes_an_expired_pack_under_continuous_traffic():
     assert emitted[0].pack.record_count == 1
     flushed = assembler.flush(FlushReason.SHUTDOWN)
     assert flushed[0].pack.record_count == 1
+
+
+# --- construction and admission validation --------------------------------------
+
+
+def _config(**overrides) -> PipelineConfig:
+    settings = dict(
+        max_queue_records=4,
+        max_queue_bytes=64,
+        max_pack_bytes=1024 * 1024,
+        max_pack_records=4,
+        max_linger_ns=60_000_000_000,
+    )
+    settings.update(overrides)
+    return PipelineConfig(**settings)
+
+
+def test_bounded_queue_validates_construction_and_timeouts():
+    with pytest.raises(ValueError, match="queue limits"):
+        BoundedRecordQueue(max_records=0, max_bytes=8)
+    with pytest.raises(ValueError, match="queue limits"):
+        BoundedRecordQueue(max_records=1, max_bytes="8")  # type: ignore[arg-type]
+
+    queue = BoundedRecordQueue(max_records=1, max_bytes=8)
+    with pytest.raises(ValueError, match="timeout"):
+        queue.put(_record("capture-a"), policy=OverloadPolicy.BLOCK, timeout=-1)
+    with pytest.raises(ValueError, match="timeout"):
+        queue.get(timeout=True)
+
+
+def test_pack_assembler_validates_its_limits_and_clock():
+    with pytest.raises(ValueError, match="must be positive"):
+        PackAssembler(max_pack_bytes=0, max_records=10, max_linger_ns=100)
+
+    assembler = PackAssembler(
+        max_pack_bytes=1024 * 1024, max_records=10, max_linger_ns=100
+    )
+    with pytest.raises(ValueError, match="now_ns"):
+        assembler.append(_record("capture-a"), now_ns=-1)
+
+
+def test_pipeline_config_validates_bounds_and_admission_timeout():
+    with pytest.raises(ValueError, match="bounds must be positive"):
+        _config(max_queue_records=0)
+    with pytest.raises(ValueError, match="admission_timeout"):
+        _config(admission_timeout=-1.0)
+    with pytest.raises(ValueError, match="admission_timeout"):
+        _config(admission_timeout=True)
+
+
+def test_pipeline_lifecycle_guards(tmp_path: Path):
+    sink = DirectPackSink(FilesystemPackStore(tmp_path, store_id="local"))
+    pipeline = HostCapturePipeline(_config(), sink, pack_id_factory=_ids())
+
+    with pytest.raises(RuntimeError, match="not started"):
+        pipeline.submit(_record("capture-a"))
+    with pytest.raises(RuntimeError, match="not started"):
+        pipeline.close()
+
+    pipeline.start()
+    with pytest.raises(RuntimeError, match="already been started"):
+        pipeline.start()
+    pipeline.close(timeout=2)
+
+
+def test_pipeline_counts_records_dropped_under_overload(tmp_path: Path):
+    from tests._faults import BlockingPackSink
+
+    sink = BlockingPackSink(
+        DirectPackSink(FilesystemPackStore(tmp_path, store_id="local"))
+    )
+    pipeline = HostCapturePipeline(
+        _config(max_queue_records=1, max_pack_records=1),
+        sink,
+        pack_id_factory=_ids(),
+    )
+    pipeline.start()
+    try:
+        assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+        # Once the sink is entered, capture-a is out of the queue and the
+        # persistence thread is stuck, so the next admissions are deterministic.
+        assert sink.entered.wait(timeout=2)
+        assert pipeline.submit(_record("capture-b")) is AdmissionResult.ACCEPTED
+        assert pipeline.submit(_record("capture-c")) is AdmissionResult.DROPPED
+    finally:
+        sink.release.set()
+    snapshot = pipeline.close(timeout=2)
+
+    assert snapshot.dropped_records == 1
+    assert snapshot.admitted_records == 2
+
+
+def test_pipeline_counts_admissions_that_time_out(tmp_path: Path):
+    from tests._faults import BlockingPackSink
+
+    sink = BlockingPackSink(
+        DirectPackSink(FilesystemPackStore(tmp_path, store_id="local"))
+    )
+    pipeline = HostCapturePipeline(
+        _config(
+            max_queue_records=1,
+            max_pack_records=1,
+            overload_policy=OverloadPolicy.BLOCK,
+            admission_timeout=0.0,
+        ),
+        sink,
+        pack_id_factory=_ids(),
+    )
+    pipeline.start()
+    try:
+        assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+        assert sink.entered.wait(timeout=2)
+        assert pipeline.submit(_record("capture-b")) is AdmissionResult.ACCEPTED
+        assert pipeline.submit(_record("capture-c")) is AdmissionResult.TIMED_OUT
+    finally:
+        sink.release.set()
+    snapshot = pipeline.close(timeout=2)
+
+    assert snapshot.timed_out_records == 1
+
+
+def test_pipeline_counts_records_the_queue_cannot_ever_hold(tmp_path: Path):
+    sink = DirectPackSink(FilesystemPackStore(tmp_path, store_id="local"))
+    # The 8-byte payload fits a pack but never the queue.
+    pipeline = HostCapturePipeline(
+        _config(max_queue_bytes=4), sink, pack_id_factory=_ids()
+    )
+    pipeline.start()
+
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.TOO_LARGE
+    snapshot = pipeline.close(timeout=2)
+
+    assert snapshot.oversized_records == 1
+    assert snapshot.admitted_records == 0
+
+
+def test_pipeline_counts_submissions_after_close(tmp_path: Path):
+    sink = DirectPackSink(FilesystemPackStore(tmp_path, store_id="local"))
+    pipeline = HostCapturePipeline(_config(), sink, pack_id_factory=_ids())
+    pipeline.start()
+    pipeline.close(timeout=2)
+
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.CLOSED
+    assert pipeline.snapshot().rejected_closed_records == 1
+
+
+def test_close_times_out_while_the_sink_hangs(tmp_path: Path):
+    from tests._faults import BlockingPackSink
+
+    sink = BlockingPackSink(
+        DirectPackSink(FilesystemPackStore(tmp_path, store_id="local"))
+    )
+    pipeline = HostCapturePipeline(
+        _config(max_pack_records=1), sink, pack_id_factory=_ids()
+    )
+    pipeline.start()
+    pipeline.submit(_record("capture-a"))
+    assert sink.entered.wait(timeout=2)
+
+    with pytest.raises(TimeoutError, match="did not stop"):
+        pipeline.close(timeout=0.01)
+
+    # Release the sink so the thread exits and a full close succeeds.
+    sink.release.set()
+    snapshot = pipeline.close(timeout=2)
+
+    assert snapshot.packs_persisted == 1

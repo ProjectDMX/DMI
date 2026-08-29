@@ -203,3 +203,259 @@ def test_durable_pipeline_commits_to_spool_without_remote_storage(tmp_path: Path
 
     assert snapshot.persisted_records == 1
     assert len(spool.recover()) == 1
+
+
+# --- staging edge cases ------------------------------------------------------------
+
+
+class _LyingSpoolPack:
+    """Metadata copied from a real pack, bytes that contradict its checksum."""
+
+    def __init__(self, sealed):
+        self.pack_id = sealed.pack_id
+        self.created_at_ns = sealed.created_at_ns
+        self.record_count = sealed.record_count
+        self.checksum = sealed.checksum
+        self._data = b"\x00" * len(sealed.data)
+
+    @property
+    def object_bytes(self) -> int:
+        return len(self._data)
+
+    def open(self):
+        from io import BytesIO
+
+        return BytesIO(self._data)
+
+
+def test_transport_classifier_returns_false_without_botocore(monkeypatch):
+    import sys
+
+    from dmi.storage.capture.spool import _is_transient_transport_error
+
+    monkeypatch.setitem(sys.modules, "botocore.exceptions", None)
+
+    assert _is_transient_transport_error(RuntimeError("unreachable")) is False
+
+
+def test_spool_rejects_a_non_positive_byte_budget(tmp_path: Path):
+    with pytest.raises(ValueError, match="max_bytes"):
+        DurablePackSpool(tmp_path / "spool", max_bytes=0)
+
+
+def test_stage_is_idempotent_for_identical_content(tmp_path: Path):
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    key = f"packs/{pack.pack_id}.dmi-pack"
+
+    first = spool.stage(pack, key)
+    second = spool.stage(pack, key)
+
+    assert first == second
+    assert spool.snapshot().entries == 1
+
+
+def test_stage_rejects_a_conflicting_intent_for_the_same_pack_id(tmp_path: Path):
+    from dataclasses import replace
+
+    from dmi.storage.capture import PackConflictError
+
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 4)
+    key = f"packs/{pack.pack_id}.dmi-pack"
+    spool.stage(pack, key)
+
+    with pytest.raises(PackConflictError, match="different pack intent"):
+        spool.stage(replace(pack, created_at_ns=pack.created_at_ns + 1), key)
+
+
+def test_stage_rejects_a_ready_file_holding_different_bytes(tmp_path: Path):
+    from dmi.storage.capture import PackConflictError
+
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    key = f"packs/{pack.pack_id}.dmi-pack"
+    staged = spool.stage(pack, key)
+    staged.path.write_bytes(b"\xff" * staged.object_bytes)
+
+    with pytest.raises(PackConflictError, match="different content"):
+        spool.stage(pack, key)
+
+
+def test_stage_survives_losing_the_link_race_to_an_identical_writer(
+    tmp_path: Path, monkeypatch
+):
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+
+    def concurrent_link(src, dst, *args, **kwargs):
+        # The other writer wins the race with identical content.
+        Path(dst).write_bytes(pack.data)
+        raise FileExistsError(dst)
+
+    monkeypatch.setattr("dmi.storage.capture.spool.os.link", concurrent_link)
+
+    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+
+    assert staged.object_bytes == len(pack.data)
+    assert staged.path.exists()
+
+
+def test_stage_cleans_up_its_temp_file_when_the_source_lies(tmp_path: Path):
+    from dmi.storage.capture import PackIntegrityError
+
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+
+    with pytest.raises(PackIntegrityError, match="checksum"):
+        spool.stage(_LyingSpoolPack(pack), f"packs/{pack.pack_id}.dmi-pack")
+
+    assert not tuple(spool.root.rglob("*.open"))
+    assert spool.snapshot().entries == 0
+
+
+def test_stage_rejects_a_key_escaping_through_a_symlinked_directory(tmp_path: Path):
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (spool.root / "link").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="escapes the spool root"):
+        spool.stage(pack, f"link/{pack.pack_id}.dmi-pack")
+
+
+# --- recovery edge cases -------------------------------------------------------------
+
+
+def test_recover_quarantines_a_ready_file_with_an_invalid_name(tmp_path: Path):
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=1024)
+    bogus = spool.root / "bogus.dmi-pack.ready"
+    bogus.write_bytes(b"junk")
+
+    assert spool.recover() == ()
+    assert not bogus.exists()
+    assert bogus.with_suffix(".quarantined").exists()
+
+
+def test_recover_skips_entries_removed_by_a_concurrent_uploader(
+    tmp_path: Path, monkeypatch
+):
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+
+    def gone(path):
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(DurablePackSpool, "_checksum", staticmethod(gone))
+
+    # Completed work elsewhere, not corruption: skipped, never quarantined.
+    assert spool.recover() == ()
+    assert staged.path.exists()
+
+
+def test_quarantine_tolerates_a_file_already_gone(tmp_path: Path):
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=1024)
+
+    spool._quarantine(spool.root / "ghost.dmi-pack.ready")
+
+    assert tuple(spool.root.iterdir()) == ()
+
+
+# --- removal edge cases ----------------------------------------------------------------
+
+
+def test_remove_validates_the_staged_path(tmp_path: Path):
+    from dataclasses import replace
+
+    from dmi.storage.capture import PackIntegrityError
+
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+
+    link = tmp_path / "link.dmi-pack.ready"
+    link.symlink_to(staged.path)
+    with pytest.raises(PackIntegrityError, match="regular spool file"):
+        spool.remove(replace(staged, path=link))
+
+    outside = tmp_path / staged.path.name
+    outside.write_bytes(pack.data)
+    with pytest.raises(ValueError, match="outside the spool root"):
+        spool.remove(replace(staged, path=outside))
+
+
+def test_remove_tolerates_an_entry_already_uploaded_elsewhere(tmp_path: Path):
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+    staged.path.unlink()
+
+    spool.remove(staged)  # a second removal is a no-op, not an error
+
+
+def test_remove_rejects_an_entry_whose_identity_changed(tmp_path: Path):
+    from dataclasses import replace
+
+    from dmi.storage.capture import PackIntegrityError
+
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+
+    with pytest.raises(PackIntegrityError, match="identity changed"):
+        spool.remove(replace(staged, created_at_ns=staged.created_at_ns + 1))
+
+
+def test_remove_rejects_an_entry_whose_size_changed(tmp_path: Path, monkeypatch):
+    from dmi.storage.capture import PackIntegrityError
+
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+    monkeypatch.setattr(DurablePackSpool, "_entry", lambda self, path: staged)
+    with staged.path.open("ab") as handle:
+        handle.write(b"x")
+
+    with pytest.raises(PackIntegrityError, match="size changed"):
+        spool.remove(staged)
+
+
+def test_entry_rejects_non_regular_files_and_unparseable_names(tmp_path: Path):
+    from dmi.storage.capture import PackIntegrityError
+
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=1024)
+
+    with pytest.raises(PackIntegrityError, match="regular spool file"):
+        spool._entry(spool.root)
+
+    stray = spool.root / "stray.dmi-pack.ready"
+    stray.write_bytes(b"x")
+    with pytest.raises(PackIntegrityError, match="invalid ready-pack name"):
+        spool._entry(stray)
+
+
+# --- serial uploader -----------------------------------------------------------------
+
+
+def test_spool_uploader_drains_pending_entries_with_a_limit(tmp_path: Path):
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=1024 * 1024)
+    for index in (1, 2, 3):
+        pack, _ = _sealed(
+            f"018f0000-0000-7000-8000-{index:012d}", f"capture-{index}"
+        )
+        spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+    uploader = SpoolUploader(
+        spool, FilesystemPackStore(tmp_path / "remote", store_id="remote")
+    )
+
+    with pytest.raises(ValueError, match="limit"):
+        uploader.upload_pending(limit=0)
+
+    first = uploader.upload_pending(limit=2)
+    rest = uploader.upload_pending()
+
+    assert len(first) == 2
+    assert len(rest) == 1
+    assert spool.snapshot().entries == 0

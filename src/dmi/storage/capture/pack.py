@@ -340,7 +340,7 @@ class PackReader:
 
         try:
             header = _HEADER.unpack_from(data)
-        except struct.error as exc:
+        except struct.error as exc:  # pragma: no cover - unreachable after the length check
             raise PackFormatError("pack header is truncated") from exc
         magic, major, minor, header_size, pack_bytes, created_at_ns, flags, reserved = header
         if magic != _HEADER_MAGIC:
@@ -355,7 +355,7 @@ class PackReader:
         trailer_offset = len(data) - _TRAILER.size
         try:
             trailer = _TRAILER.unpack_from(data, trailer_offset)
-        except struct.error as exc:
+        except struct.error as exc:  # pragma: no cover - unreachable after the length check
             raise PackFormatError("pack trailer is truncated") from exc
         (
             trailer_magic,

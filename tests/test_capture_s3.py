@@ -351,3 +351,330 @@ def test_s3_put_retry_rejects_an_object_missing_the_format_marker():
     # while reconciliation can never index the remote one.
     with pytest.raises(PackConflictError, match="different content"):
         store.put(pack, key)
+
+
+# --- configuration validation ---------------------------------------------------
+
+
+def test_s3_config_requires_both_credential_halves():
+    with pytest.raises(ValueError, match="set together"):
+        S3StoreConfig(
+            endpoint_url="https://garage.example.com",
+            bucket="captures",
+            region="garage",
+            access_key_id="access",
+        )
+
+
+def test_s3_config_accepts_a_default_endpoint():
+    config = S3StoreConfig(endpoint_url=None, bucket="captures", region="garage")
+
+    assert config.endpoint_url is None
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    (
+        ({"multipart_concurrency": 0}, "must be positive"),
+        ({"max_attempts": True}, "must be positive"),
+        ({"multipart_chunk_bytes": 1024 * 1024}, "at least"),
+        (
+            {"max_pool_connections": 2, "multipart_concurrency": 4},
+            "cover multipart_concurrency",
+        ),
+        ({"connect_timeout_seconds": 0}, "must be positive"),
+        ({"read_timeout_seconds": True}, "must be positive"),
+    ),
+)
+def test_s3_config_validates_transfer_and_timeout_settings(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        S3StoreConfig(
+            endpoint_url=None, bucket="captures", region="garage", **kwargs
+        )
+
+
+# --- from_config -----------------------------------------------------------------
+
+
+def test_s3_from_config_requires_the_optional_dependency(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "boto3", None)
+
+    with pytest.raises(RuntimeError, match="optional 's3' dependencies"):
+        S3PackStore.from_config(
+            S3StoreConfig(endpoint_url=None, bucket="captures", region="garage")
+        )
+
+
+def test_s3_from_config_builds_a_bounded_client(monkeypatch):
+    import sys
+    import types
+
+    recorded: dict[str, object] = {}
+
+    class _TransferConfig:
+        def __init__(self, **kwargs):
+            recorded["transfer"] = kwargs
+
+    class _Config:
+        def __init__(self, **kwargs):
+            recorded["config"] = kwargs
+
+    def client(service, **kwargs):
+        recorded["service"] = service
+        recorded["client"] = kwargs
+        return _S3Client()
+
+    boto3_module = types.ModuleType("boto3")
+    boto3_module.client = client
+    boto3_s3 = types.ModuleType("boto3.s3")
+    boto3_transfer = types.ModuleType("boto3.s3.transfer")
+    boto3_transfer.TransferConfig = _TransferConfig
+    boto3_module.s3 = boto3_s3
+    boto3_s3.transfer = boto3_transfer
+    botocore_config = types.ModuleType("botocore.config")
+    botocore_config.Config = _Config
+
+    monkeypatch.setitem(sys.modules, "boto3", boto3_module)
+    monkeypatch.setitem(sys.modules, "boto3.s3", boto3_s3)
+    monkeypatch.setitem(sys.modules, "boto3.s3.transfer", boto3_transfer)
+    monkeypatch.setitem(sys.modules, "botocore.config", botocore_config)
+
+    config = S3StoreConfig(
+        endpoint_url="http://127.0.0.1:3900",
+        bucket="captures",
+        region="garage",
+        access_key_id="access",
+        secret_access_key="secret",
+        allow_insecure_http=True,
+        multipart_concurrency=2,
+    )
+    store = S3PackStore.from_config(config)
+
+    assert store.store_id == "s3"
+    assert recorded["service"] == "s3"
+    client_kwargs = recorded["client"]
+    assert client_kwargs["endpoint_url"] == "http://127.0.0.1:3900"
+    assert client_kwargs["region_name"] == "garage"
+    assert client_kwargs["aws_access_key_id"] == "access"
+    assert client_kwargs["aws_secret_access_key"] == "secret"
+    config_kwargs = recorded["config"]
+    assert config_kwargs["signature_version"] == "s3v4"
+    assert config_kwargs["retries"] == {"mode": "standard", "max_attempts": 4}
+    assert config_kwargs["s3"] == {"addressing_style": "path"}
+    assert config_kwargs["max_pool_connections"] == config.max_pool_connections
+    transfer_kwargs = recorded["transfer"]
+    assert transfer_kwargs["multipart_threshold"] == config.multipart_threshold_bytes
+    assert transfer_kwargs["multipart_chunksize"] == config.multipart_chunk_bytes
+    assert transfer_kwargs["max_concurrency"] == 2
+    assert transfer_kwargs["use_threads"] is True
+
+
+# --- response validation ----------------------------------------------------------
+
+
+def _ref_for(pack, key: str) -> PackRef:
+    return PackRef(
+        pack_id=pack.pack_id,
+        store_id="garage-local",
+        object_key=key,
+        object_bytes=len(pack.data),
+        checksum=pack.checksum,
+        record_count=pack.record_count,
+    )
+
+
+def test_s3_put_detects_an_upload_that_never_became_visible():
+    client = _S3Client()
+    original = client.upload_fileobj
+
+    def vanish(Fileobj, Bucket, Key, ExtraArgs, Config):
+        original(Fileobj, Bucket, Key, ExtraArgs=ExtraArgs, Config=Config)
+        del client.objects[Key]
+
+    client.upload_fileobj = vanish  # type: ignore[method-assign]
+
+    with pytest.raises(PackIntegrityError, match="not visible"):
+        _store(client).put(_pack(), "packs/a.dmi-pack")
+
+
+def test_s3_put_reraises_a_non_404_head_failure():
+    client = _S3Client()
+
+    def unavailable(**_):
+        raise _ClientError(500, "InternalError")
+
+    client.head_object = unavailable  # type: ignore[method-assign]
+
+    with pytest.raises(_ClientError, match="InternalError"):
+        _store(client).put(_pack(), "packs/a.dmi-pack")
+
+
+def test_s3_put_reraises_a_failure_without_an_http_response():
+    client = _S3Client()
+
+    def broken(**_):
+        raise RuntimeError("client exploded")
+
+    client.head_object = broken  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="client exploded"):
+        _store(client).put(_pack(), "packs/a.dmi-pack")
+
+
+def test_s3_put_rejects_a_malformed_head_response():
+    client = _S3Client()
+    client.head_object = lambda **_: []  # type: ignore[method-assign]
+
+    with pytest.raises(PackIntegrityError, match="HeadObject"):
+        _store(client).put(_pack(), "packs/a.dmi-pack")
+
+
+def test_s3_stat_rejects_a_reference_that_no_longer_matches():
+    from dataclasses import replace
+
+    client = _S3Client()
+    store = _store(client)
+    pack = _pack()
+    ref = store.put(pack, "packs/a.dmi-pack")
+
+    with pytest.raises(PackIntegrityError, match="does not match its pack reference"):
+        store.stat(replace(ref, object_bytes=ref.object_bytes + 1))
+
+
+def test_s3_stat_rejects_a_foreign_store_reference():
+    from dataclasses import replace
+
+    client = _S3Client()
+    store = _store(client)
+    ref = store.put(_pack(), "packs/a.dmi-pack")
+
+    with pytest.raises(ValueError, match="pack store mismatch"):
+        store.stat(replace(ref, store_id="other"))
+
+
+def test_s3_inspect_rejects_a_malformed_head_response():
+    client = _S3Client()
+    client.head_object = lambda **_: []  # type: ignore[method-assign]
+
+    with pytest.raises(PackIntegrityError, match="HeadObject"):
+        _store(client).inspect("packs/a.dmi-pack")
+
+
+def test_s3_inspect_rejects_missing_or_unparseable_dmi_metadata():
+    client = _S3Client()
+    store = _store(client)
+    client.objects["packs/bare.dmi-pack"] = (b"x" * 8, {})
+    client.objects["packs/mangled.dmi-pack"] = (
+        b"x" * 8,
+        {
+            "dmi-format": "dmi-pack-v1",
+            "dmi-pack-id": "not-a-uuid",
+            "dmi-sha256": "f" * 64,
+            "dmi-record-count": "1",
+            "dmi-created-at-ns": "1",
+        },
+    )
+
+    with pytest.raises(PackIntegrityError, match="invalid DMI metadata"):
+        store.inspect("packs/bare.dmi-pack")
+    with pytest.raises(PackIntegrityError, match="invalid DMI metadata"):
+        store.inspect("packs/mangled.dmi-pack")
+
+
+def test_s3_head_metadata_must_be_well_typed():
+    client = _S3Client()
+    store = _store(client)
+    client.head_object = lambda **_: {"ContentLength": "8", "Metadata": {}}  # type: ignore[method-assign]
+    with pytest.raises(PackIntegrityError, match="invalid object metadata"):
+        store.inspect("packs/a.dmi-pack")
+
+    client.head_object = lambda **_: {"ContentLength": 8, "Metadata": {"a": 1}}  # type: ignore[method-assign]
+    with pytest.raises(PackIntegrityError, match="invalid object metadata"):
+        store.inspect("packs/a.dmi-pack")
+
+
+def test_s3_read_range_validates_its_arguments():
+    client = _S3Client()
+    store = _store(client)
+    ref = store.put(_pack(), "packs/a.dmi-pack")
+
+    with pytest.raises(ValueError, match="non-negative integers"):
+        store.read_range(ref, -1, 4)
+    with pytest.raises(ValueError, match="non-negative integers"):
+        store.read_range(ref, 0, 4.0)
+
+
+def test_s3_read_range_rejects_a_malformed_or_lying_body():
+    client = _S3Client()
+    store = _store(client)
+    ref = store.put(_pack(), "packs/a.dmi-pack")
+
+    client.get_object = lambda **_: {}  # type: ignore[method-assign]
+    with pytest.raises(PackIntegrityError, match="invalid range response"):
+        store.read_range(ref, 0, 8)
+
+    client.get_object = lambda **_: {"Body": _Body(b"xy")}  # type: ignore[method-assign]
+    with pytest.raises(PackIntegrityError, match="short or oversized"):
+        store.read_range(ref, 0, 8)
+
+    client.get_object = lambda **_: {"Body": _Body(b"x" * 16)}  # type: ignore[method-assign]
+    with pytest.raises(PackIntegrityError, match="short or oversized"):
+        store.read_range(ref, 0, 8)
+
+
+def test_s3_listing_validates_its_arguments():
+    store = _store(_S3Client())
+
+    with pytest.raises(ValueError, match="cursor"):
+        store.list_objects(cursor="")
+    with pytest.raises(ValueError, match="cursor"):
+        store.list_objects(cursor="x" * 4096)
+    with pytest.raises(ValueError, match="limit"):
+        store.list_objects(limit=0)
+    with pytest.raises(ValueError, match="limit"):
+        store.list_objects(limit=1001)
+
+
+@pytest.mark.parametrize("prefix", ("/absolute", "a\\b", "a/../b", "a//b"))
+def test_s3_listing_rejects_hostile_prefixes(prefix: str):
+    with pytest.raises(ValueError, match="prefix"):
+        _store(_S3Client()).list_objects(prefix=prefix)
+
+
+@pytest.mark.parametrize(
+    "response,match",
+    (
+        ([], "invalid listing response"),
+        ({"Contents": "bogus", "IsTruncated": False}, "listing contents"),
+        ({"Contents": [5], "IsTruncated": False}, "listing item"),
+        (
+            {"Contents": [{"Key": 5, "Size": 1}], "IsTruncated": False},
+            "listing item",
+        ),
+        (
+            {"Contents": [{"Key": "a.dmi-pack", "Size": "1"}], "IsTruncated": False},
+            "listing item",
+        ),
+        ({"Contents": [], "IsTruncated": "yes"}, "truncation state"),
+        (
+            {"Contents": [], "IsTruncated": True, "NextContinuationToken": ""},
+            "listing cursor",
+        ),
+        (
+            {
+                "Contents": [],
+                "IsTruncated": True,
+                "NextContinuationToken": "x" * 4096,
+            },
+            "listing cursor",
+        ),
+    ),
+)
+def test_s3_listing_rejects_malformed_responses(response, match):
+    client = _S3Client()
+    client.list_objects_v2 = lambda **_: response  # type: ignore[method-assign]
+
+    with pytest.raises(PackIntegrityError, match=match):
+        _store(client).list_objects(limit=1)

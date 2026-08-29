@@ -146,7 +146,9 @@ class CaptureReader:
                     payloads[index] = bytes(payload)
 
         if any(payload is None for payload in payloads):
-            raise PackFormatError("hydration plan did not resolve every capture")
+            raise PackFormatError(  # pragma: no cover - defensive invariant
+                "hydration plan did not resolve every capture"
+            )
         return tuple(
             HydratedCapture(descriptor=descriptor, payload=payload)
             for descriptor, payload in zip(descriptors, payloads)

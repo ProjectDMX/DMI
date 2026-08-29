@@ -20,6 +20,7 @@ has: they describe the failure behaviour a native writer has to reproduce.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import threading
 from typing import Any, Mapping, Sequence
 
 
@@ -248,12 +249,35 @@ class FaultyPackSink:
         return getattr(self._inner, name)
 
 
+class BlockingPackSink:
+    """Wraps a pack sink so persistence blocks until the test releases it.
+
+    ``entered`` is set when a persist call reaches the sink, so a test can wait
+    deterministically for the persistence thread to be stuck; ``release`` must
+    be set afterwards or the thread (and the test run) hangs.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def persist(self, ready: Any) -> Any:
+        self.entered.set()
+        self.release.wait()
+        return self._inner.persist(ready)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 def call_sequence(store: FaultyPackStore) -> Sequence[tuple[str, int]]:
     """The recorded call counts, sorted -- handy in assertion messages."""
     return sorted(store.call_counts.items())
 
 
 __all__ = [
+    "BlockingPackSink",
     "FaultInjected",
     "FaultyClickHouseClient",
     "FaultyPackSink",
