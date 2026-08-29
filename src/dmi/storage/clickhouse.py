@@ -50,7 +50,7 @@ class CHClickhouseDriverReadOnly:
                                    NO effect on `custom_select`.
         """
         from clickhouse_driver import Client as ClickHouseClient
-        if ClickHouseClient is None:
+        if ClickHouseClient is None:  # pragma: no cover - unreachable after a successful import
             raise ImportError("clickhouse-driver is required. Install with: pip install clickhouse-driver")
 
         if port in self._HTTP_PORTS:

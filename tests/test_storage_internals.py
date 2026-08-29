@@ -2,9 +2,13 @@
 import pytest
 import torch
 
+import dmi.storage.internals as internals_module
 from dmi.storage.internals import (
     IncompleteInternalError,
+    InternalRequirement,
     InternalRequirements,
+    _default_reader,
+    _request_sort_key,
     get_internal,
     make_lazy_internal,
 )
@@ -460,3 +464,185 @@ def test_lazy_internal_copies_reusable_requirements():
     with pytest.raises(IncompleteInternalError, match="expected 1 entries, found 2"):
         first.hidden_states
     assert len(second.hidden_states) == 2
+
+
+def test_default_reader_plumbs_env_host_and_port(monkeypatch):
+    captured = {}
+
+    class _RecordingReader:
+        def __init__(self, host, port):
+            captured["host"] = host
+            captured["port"] = port
+
+    monkeypatch.setattr(internals_module, "CHClickhouseDriverReadOnly", _RecordingReader)
+    monkeypatch.setenv("DMX_DB_HOST", "db.example")
+    monkeypatch.setenv("DMX_DB_PORT", "9440")
+
+    reader = _default_reader()
+
+    assert isinstance(reader, _RecordingReader)
+    assert captured == {"host": "db.example", "port": 9440}
+
+
+def test_default_reader_defaults_without_env(monkeypatch):
+    captured = {}
+
+    class _RecordingReader:
+        def __init__(self, host, port):
+            captured["host"] = host
+            captured["port"] = port
+
+    monkeypatch.setattr(internals_module, "CHClickhouseDriverReadOnly", _RecordingReader)
+    monkeypatch.delenv("DMX_DB_HOST", raising=False)
+    monkeypatch.delenv("DMX_DB_PORT", raising=False)
+
+    _default_reader()
+
+    assert captured == {"host": "localhost", "port": 9000}
+
+
+def test_request_sort_key_orders_numeric_before_non_numeric():
+    assert _request_sort_key("req:1") < _request_sort_key("req:abc")
+    assert sorted(["req:abc", "req:10", "req:2"], key=_request_sort_key) == [
+        "req:2",
+        "req:10",
+        "req:abc",
+    ]
+
+
+def test_requirements_coerce_plain_int_counts():
+    reqs = InternalRequirements({"hidden_states": 2})
+
+    assert reqs.expected_count("hidden_states") == 2
+    assert reqs.requirement("hidden_states") == InternalRequirement(count=2)
+
+
+def test_requirements_keep_requirement_instances_as_is():
+    requirement = InternalRequirement(count=3, retry=True)
+    reqs = InternalRequirements({"hidden_states": requirement})
+
+    assert reqs.requirement("hidden_states") is requirement
+
+
+def test_requirements_expected_count_missing_field_is_none():
+    reqs = InternalRequirements()
+
+    assert reqs.expected_count("hidden_states") is None
+    assert reqs.requirement("hidden_states") is None
+
+
+def test_require_rejects_negative_count():
+    with pytest.raises(ValueError, match="count must be non-negative"):
+        InternalRequirements().require("hidden_states", count=-1)
+
+
+def test_require_rejects_negative_timeout():
+    with pytest.raises(ValueError, match="timeout_s must be non-negative or None"):
+        InternalRequirements().require("hidden_states", count=1, timeout_s=-0.5)
+
+
+def test_require_rejects_non_positive_poll():
+    with pytest.raises(ValueError, match="poll_s must be positive"):
+        InternalRequirements().require("hidden_states", count=1, poll_s=0.0)
+
+
+def test_count_value_without_len_raises_incomplete():
+    internal = make_lazy_internal("m", FakeReader([]))
+
+    with pytest.raises(IncompleteInternalError, match="has no length"):
+        internal._count_value("hidden_states", object())
+
+
+def test_retry_timeout_on_missing_field_reports_found_none():
+    reader = FakeReader([])
+    internal = make_lazy_internal("m", reader)
+    internal.require("hidden_states", count=1, retry=True, timeout_s=0.0, poll_s=0.001)
+
+    with pytest.raises(IncompleteInternalError, match="expected 1 entries, found none"):
+        internal.hidden_states
+
+
+def test_read_rows_for_unmapped_field_raises_attribute_error():
+    internal = make_lazy_internal("m", FakeReader([]))
+
+    with pytest.raises(AttributeError, match="not a supported DMI internal field"):
+        internal._read_rows_for_field("bogus")
+
+
+def test_lazy_internal_unmapped_attribute_raises_attribute_error():
+    internal = make_lazy_internal("m", FakeReader([]))
+
+    with pytest.raises(AttributeError, match="not a supported"):
+        internal.bogus_field
+
+
+def test_lazy_internal_token_mask_without_ranges_raises():
+    internal = make_lazy_internal("m", FakeReader([]))
+
+    with pytest.raises(AttributeError, match="token_mask"):
+        internal.token_mask
+
+
+def test_retry_loop_evicts_stale_cached_field():
+    one_layer = [_row("0:0", 0, 0, torch.ones(3, 4))]
+    two_layers = [
+        _row("0:0", 0, 0, torch.ones(3, 4)),
+        _row("0:0", 1, 0, torch.ones(3, 4)),
+    ]
+    reader = SequenceReader([one_layer, two_layers])
+    internal = make_lazy_internal("m", reader)
+    internal.require("hidden_states", count=2, retry=True, timeout_s=1.0, poll_s=0.001)
+    internal._field_cache["hidden_states"] = ("stale",)
+    requirement = internal._requirements.requirement("hidden_states")
+
+    value = internal._load_field_with_retry("hidden_states", requirement)
+
+    assert len(value) == 2
+    assert internal._field_cache["hidden_states"] is value
+
+
+def test_stale_cache_failing_tightened_requirement_falls_to_retry_loop():
+    one_layer = [_row("0:0", 0, 0, torch.ones(3, 4))]
+    two_layers = [
+        _row("0:0", 0, 0, torch.ones(3, 4)),
+        _row("0:0", 1, 0, torch.ones(3, 4)),
+    ]
+    reader = SequenceReader([one_layer, one_layer, two_layers])
+    internal = make_lazy_internal("m", reader)
+
+    assert len(internal.hidden_states) == 1  # cached from call 1
+    internal.require("hidden_states", count=2, retry=True, timeout_s=1.0, poll_s=0.001)
+
+    assert len(internal.hidden_states) == 2
+    assert reader.calls == 3
+
+
+def test_lazy_internal_available_delegates_without_request_ids():
+    rows = [_row("0:0", 0, 0, torch.ones(3, 4))]
+    internal = make_lazy_internal("m", FakeReader(rows))
+
+    assert internal.available == ["hidden_states"]
+
+
+def test_lazy_internal_available_probes_fields_with_request_ids():
+    rows = [
+        _row("0:0", 0, 0, torch.ones(3, 4)),
+        _row_act("0:0", "final_logits", -1, 0, 3, torch.ones(3, 10)),
+    ]
+    reader = PrefixReader(rows)
+    internal = make_lazy_internal(
+        "m",
+        reader,
+        request_ids=("0:0",),
+        token_ranges={"0:0": ((0, 3),)},
+    )
+
+    assert internal.available == ["hidden_states", "logits", "token_mask"]
+
+
+def test_lazy_internal_available_with_request_ids_but_no_ranges_omits_token_mask():
+    rows = [_row("0:0", 0, 0, torch.ones(3, 4))]
+    reader = PrefixReader(rows)
+    internal = make_lazy_internal("m", reader, request_ids=("0:0",))
+
+    assert internal.available == ["hidden_states"]
