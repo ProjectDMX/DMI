@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from uuid import UUID
 
@@ -632,6 +633,98 @@ def test_put_rejects_a_pack_source_whose_stream_lies(tmp_path: Path):
         store.put(_LyingPack(sealed, [sealed.data, b"!"]), "packs/d.dmi-pack")
 
 
+class _VerifiedPack:
+    """A source that offers ``verified_bytes``, counting the streamed reads.
+
+    ``offer`` is exactly what ``verified_bytes()`` returns, so a test can hand
+    over honest bytes, ``None``, or something that breaks the contract.
+    ``opened`` records how often the store fell back to streaming.
+    """
+
+    def __init__(self, sealed, offer):
+        self.pack_id = sealed.pack_id
+        self.created_at_ns = sealed.created_at_ns
+        self.record_count = sealed.record_count
+        self.checksum = sealed.checksum
+        self._data = sealed.data
+        self._offer = offer
+        self.opened = 0
+
+    @property
+    def object_bytes(self) -> int:
+        return len(self._data)
+
+    def open(self):
+        self.opened += 1
+        return BytesIO(self._data)
+
+    def verified_bytes(self):
+        return self._offer
+
+
+def test_a_verified_source_is_written_without_being_hashed_again(tmp_path: Path):
+    """The pack seal() just hashed is not read back and hashed a second time.
+
+    PackWriter.seal() computes the object checksum over the very bytes
+    SealedPack carries, and ``bytes`` cannot change afterwards, so a second
+    SHA-256 pass here would re-derive a digest of an object that never left
+    the process. The store writes them straight through -- it never opens the
+    stream at all -- and what lands on disk still matches the declaration.
+    """
+
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    pack = _VerifiedPack(sealed, sealed.data)
+
+    ref = store.put(pack, "packs/a.dmi-pack")
+
+    assert pack.opened == 0
+    assert (tmp_path / "packs" / "a.dmi-pack").read_bytes() == sealed.data
+    assert store.stat(ref).checksum == sealed.checksum
+
+
+def test_a_source_offering_no_verified_bytes_is_streamed_and_hashed(tmp_path: Path):
+    """``None`` means "stream and verify me" -- the contract every other
+    source gets, and the one a file- or network-backed source must keep."""
+
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    pack = _VerifiedPack(sealed, None)
+
+    ref = store.put(pack, "packs/a.dmi-pack")
+
+    assert pack.opened == 1
+    assert ref.checksum == sealed.checksum
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    (
+        pytest.param(lambda data: data[:-1], id="short"),
+        pytest.param(lambda data: data + b"!", id="long"),
+        pytest.param(bytearray, id="mutable"),
+    ),
+)
+def test_put_rejects_verified_bytes_that_break_their_contract(tmp_path: Path, corrupt):
+    """The fast path trusts the hash but never the length or the type.
+
+    A store sizes an object from ``object_bytes`` independently of the
+    checksum, so bytes that contradict the declaration must not reach storage.
+    A mutable buffer is refused outright: the promise is that nothing can
+    change the bytes between the assertion and the write, and only ``bytes``
+    can make it.
+    """
+
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+
+    with pytest.raises(PackIntegrityError, match="invalid verified bytes"):
+        store.put(_VerifiedPack(sealed, corrupt(sealed.data)), "packs/a.dmi-pack")
+
+    assert not (tmp_path / "packs" / "a.dmi-pack").exists()
+    assert not tuple(tmp_path.rglob("*.open"))
+
+
 def test_put_rejects_a_key_whose_parent_escapes_the_root(tmp_path: Path):
     store = FilesystemPackStore(tmp_path / "store", store_id="local")
     outside = tmp_path / "outside"
@@ -717,3 +810,18 @@ def test_read_range_detects_a_short_filesystem_read(tmp_path: Path, monkeypatch)
 
     with pytest.raises(PackIntegrityError, match="short range"):
         store.read_range(ref, len(sealed.data) - 8, 8)
+
+
+def test_verify_pack_source_still_hashes_a_verified_source():
+    # The write path trusts verified_bytes, but a caller asking to *verify*
+    # gets the digest recomputed: a sealed pack whose checksum was tampered
+    # with is caught here even though the write path would have trusted it.
+    from dmi.storage.capture.filesystem import verify_pack_source
+
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    tampered = replace(sealed, checksum="0" * 64)
+
+    verify_pack_source(sealed)  # a faithful source still passes
+
+    with pytest.raises(PackIntegrityError, match="checksum"):
+        verify_pack_source(tampered)

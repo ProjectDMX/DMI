@@ -402,6 +402,20 @@ class HydratedCapture:
 
 @runtime_checkable
 class PackSource(Protocol):
+    """A pack's bytes together with the metadata a store records about them.
+
+    ``open()`` must yield exactly ``object_bytes`` bytes whose SHA-256 is
+    ``checksum``. A source is not trusted to describe itself honestly: stores
+    read the stream and check that themselves.
+
+    ``verified_bytes()`` is an *optional* extra member, described by
+    :class:`VerifiedPackSource`, which lets an in-memory producer hand over
+    bytes it has already hashed. Sources that do not implement it are streamed
+    and verified as usual, so it is deliberately absent from this protocol --
+    requiring it would make ``isinstance(source, PackSource)`` reject every
+    source that does not offer the fast path.
+    """
+
     pack_id: str
     created_at_ns: int
     record_count: int
@@ -410,6 +424,35 @@ class PackSource(Protocol):
     @property
     def object_bytes(self) -> int: ...
     def open(self) -> BinaryIO: ...
+
+
+@runtime_checkable
+class VerifiedPackSource(PackSource, Protocol):
+    """A ``PackSource`` that can hand over pack bytes it has already verified.
+
+    Implementing ``verified_bytes`` is a promise, and only a producer that
+    computed the pack itself can make it honestly. Returning a ``bytes``
+    object asserts all of:
+
+    * those bytes are the complete pack object -- every one of its
+      ``object_bytes`` bytes, in order, nothing more;
+    * their SHA-256 already equals ``checksum``, computed by this producer
+      over these very bytes;
+    * ``bytes`` is immutable, so nothing can change them between the promise
+      and the write.
+
+    A store may therefore write them straight through without re-hashing.
+    Returning ``None`` -- or not implementing the member at all -- means
+    "stream and verify me" and costs nothing but the hash.
+
+    A source whose bytes come back from outside the process (a file, a socket,
+    an object store) must NOT make this promise, however confident it is in
+    what it wrote: that round trip is precisely what the re-hash exists to
+    check, and it is the check that catches a spool file corrupted on disk
+    between staging and upload.
+    """
+
+    def verified_bytes(self) -> bytes | None: ...
 
 
 @runtime_checkable

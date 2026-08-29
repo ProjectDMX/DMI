@@ -25,6 +25,7 @@ from .model import (
     PackStore,
     PayloadLocator,
     StoredObject,
+    VerifiedPackSource,
 )
 from .pack import PackIndex, PackReader, PackWriter, SealedPack
 from .pipeline import (
@@ -177,6 +178,7 @@ __all__ = [
     "UploadEvent",
     "UploadFailure",
     "UploadSnapshot",
+    "VerifiedPackSource",
     "decode_cursor",
     "encode_cursor",
     "decode_tensor",

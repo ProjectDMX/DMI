@@ -60,6 +60,18 @@ class SealedPack:
     def open(self) -> BytesIO:
         return BytesIO(self.data)
 
+    def verified_bytes(self) -> bytes:
+        """The pack bytes ``seal()`` hashed into ``checksum``. See
+        :class:`~dmi.storage.capture.model.VerifiedPackSource`.
+
+        ``data`` is an immutable ``bytes`` object built in the same call that
+        produced ``checksum``, from the same buffer, and never leaves this
+        process on the way to a store. Re-reading and re-hashing it could only
+        confirm what ``seal()`` computed microseconds earlier.
+        """
+
+        return self.data
+
 
 @dataclass(frozen=True, slots=True)
 class _IndexedRecord:
@@ -220,9 +232,6 @@ class PackWriter:
             raise _PackStateError("pack is already sealed")
         if not self._records:
             raise ValueError("cannot seal an empty pack")
-        buffer = bytearray(self._buffer)
-        _align(buffer)
-        footer_offset = len(buffer)
         footer = (
             self._footer_prefix
             + b"["
@@ -230,8 +239,19 @@ class PackWriter:
             + b"]"
             + self._footer_suffix
         )
+        footer_offset = _aligned_length(len(self._buffer))
+        # Both limits are decided before a single byte of self._buffer moves.
+        # A seal that raises must leave the writer exactly as it found it --
+        # otherwise a rejected seal would corrupt the pack it refused to
+        # write. Checking the projected sealed length here buys that atomicity
+        # without the defensive whole-buffer copy this used to make.
         if len(footer) > MAX_FOOTER_BYTES:
             raise ValueError("pack footer exceeds its size limit")
+        if footer_offset + len(footer) + _TRAILER.size > self._max_pack_bytes:
+            raise ValueError("sealed pack exceeds max_pack_bytes")
+
+        buffer = self._buffer
+        _align(buffer)
         buffer.extend(footer)
         # One hash pass: the object checksum covers body || trailer, so the
         # body hasher is extended with the trailer instead of re-reading the
@@ -248,10 +268,7 @@ class PackWriter:
             body_checksum,
         )
         buffer.extend(trailer)
-        if len(buffer) > self._max_pack_bytes:
-            raise ValueError("sealed pack exceeds max_pack_bytes")
         self._sealed = True
-        self._buffer = buffer
         data = bytes(buffer)
         hasher.update(trailer)
         return SealedPack(

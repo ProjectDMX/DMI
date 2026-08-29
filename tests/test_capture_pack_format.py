@@ -229,6 +229,39 @@ def test_seal_rechecks_max_pack_bytes():
         writer.seal()
 
 
+def test_a_failed_seal_leaves_the_writer_byte_identical(monkeypatch):
+    """A refused seal must cost the writer nothing -- not one mutated byte.
+
+    seal() assembles the sealed pack in the writer's own buffer rather than in
+    a defensive copy, so both size limits are decided before the first byte
+    moves. Were either ever to raise after the fact, the writer would be left
+    holding a half-sealed pack -- footer appended, no trailer -- and whoever
+    retried would emit that instead of a valid one.
+    """
+
+    writer = _writer()
+    writer.append(_record("capture-a", b"\x00" * 8))
+    before = bytes(writer._buffer)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("dmi.storage.capture.pack.MAX_FOOTER_BYTES", 8)
+        with pytest.raises(ValueError, match="footer exceeds"):
+            writer.seal()
+    assert bytes(writer._buffer) == before
+    assert writer.record_count == 1
+
+    with monkeypatch.context() as patch:
+        patch.setattr(writer, "_max_pack_bytes", 130)
+        with pytest.raises(ValueError, match="sealed pack exceeds"):
+            writer.seal()
+    assert bytes(writer._buffer) == before
+    assert writer.record_count == 1
+
+    # Neither refusal sealed the writer, and what it goes on to produce is
+    # byte-for-byte the pack a writer that never failed would have produced.
+    assert writer.seal().data == _sealed_pack(_record("capture-a", b"\x00" * 8)).data
+
+
 # --- PackReader.from_bytes: header and trailer fields ----------------------------
 
 

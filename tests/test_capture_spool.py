@@ -130,6 +130,38 @@ def test_spool_upload_retry_resolves_an_ambiguous_remote_commit(tmp_path: Path):
     assert spool.snapshot().bytes == 0
 
 
+def test_a_staged_pack_is_always_re_hashed_on_its_way_out_of_the_spool(
+    tmp_path: Path,
+):
+    """The disk round trip is verified before upload, and nothing may skip it.
+
+    A staged pack's bytes come back from the filesystem, so ``StagedPack``
+    must never claim the ``verified_bytes`` fast path however confidently the
+    spool wrote them: re-hashing what actually came off disk is the check that
+    catches bit-rot, a truncated write, or a tampered spool between staging
+    and upload. That check is the whole reason spool mode is durable.
+    """
+
+    from dmi.storage.capture import PackIntegrityError, VerifiedPackSource
+
+    pack, metadata = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    staged = DurablePackSink(spool).persist(
+        ReadyPack(pack, metadata, FlushReason.SHUTDOWN)
+    )
+    assert not isinstance(staged, VerifiedPackSource)
+
+    store = FilesystemPackStore(tmp_path / "objects", store_id="local")
+    staged.path.write_bytes(b"\xff" * staged.object_bytes)
+
+    with pytest.raises(PackIntegrityError, match="checksum does not match"):
+        SpoolUploader(spool, store).upload(staged)
+
+    # The corrupt pack is still spooled: a failed upload must not be mistaken
+    # for a delivered one.
+    assert staged.path.exists()
+
+
 def test_spool_recovery_quarantines_corrupt_ready_pack(tmp_path: Path):
     corrupt_pack, corrupt_metadata = _sealed(
         "018f0000-0000-7000-8000-000000000001", "capture-a"

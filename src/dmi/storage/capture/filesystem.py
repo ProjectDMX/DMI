@@ -17,6 +17,7 @@ from .model import (
     PackIntegrityError,
     PackRef,
     PackSource,
+    VerifiedPackSource,
 )
 
 
@@ -83,8 +84,29 @@ def validate_pack_source(pack: PackSource) -> None:
         raise ValueError("pack source has an invalid checksum")
 
 
-def _drain_pack_source(pack: PackSource, destination: BinaryIO | None) -> None:
+def _drain_pack_source(
+    pack: PackSource, destination: BinaryIO | None, *, trust_verified: bool = True
+) -> None:
     validate_pack_source(pack)
+    verified = (
+        pack.verified_bytes()
+        if trust_verified and isinstance(pack, VerifiedPackSource)
+        else None
+    )
+    if verified is not None:
+        # The source promises (see VerifiedPackSource) that these exact,
+        # immutable bytes are the whole pack and that it hashed them into
+        # pack.checksum itself. Only an in-memory producer can promise that,
+        # and nothing has been able to touch a bytes object since, so a
+        # re-hash here would recompute a digest over data that never left the
+        # process. The declared length is still checked: stores size objects
+        # from it independently of the hash, so a source contradicting itself
+        # there must not reach storage.
+        if type(verified) is not bytes or len(verified) != pack.object_bytes:
+            raise PackIntegrityError("pack source returned invalid verified bytes")
+        if destination is not None:
+            destination.write(verified)
+        return
     digest = sha256()
     remaining = pack.object_bytes
     with pack.open() as source:
@@ -113,8 +135,14 @@ def verify_pack_source(pack: PackSource) -> None:
     Stores that hand the stream to someone else -- an S3 transfer manager, say --
     never see the bytes, so without this they cannot tell a corrupt or
     mis-declared source from a good one.
+
+    Every source is hashed here, including one offering ``verified_bytes``.
+    The write path trusts that promise because it is only moving bytes it
+    just produced, but a caller who reaches for a function named "verify" is
+    asking for the digest to be recomputed, and answering with a length check
+    would defeat the reason they called it.
     """
-    _drain_pack_source(pack, None)
+    _drain_pack_source(pack, None, trust_verified=False)
 
 
 class FilesystemPackStore:
