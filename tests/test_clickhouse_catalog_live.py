@@ -55,6 +55,8 @@ def test_duplicate_catalog_replay_is_logically_deduplicated():
                 ("TABLE", "capture_raw"),
                 ("TABLE", "pack_inventory_raw"),
                 ("TABLE", "capture_version_claims"),
+                ("TABLE", "index_watermark"),
+                ("TABLE", "pack_commit_log"),
             ):
                 client.execute(
                     f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`"
