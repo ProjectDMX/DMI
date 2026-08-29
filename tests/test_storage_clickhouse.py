@@ -8,6 +8,8 @@ canned rows.
 import pytest
 import torch
 
+pytest.importorskip("clickhouse_driver")
+
 from dmi.storage.clickhouse import CHClickhouseDriverReadOnly
 
 pytestmark = pytest.mark.cpu
