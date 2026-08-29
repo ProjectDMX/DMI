@@ -14,8 +14,9 @@
 > **hallucination analysis**, **distillation**, **activation steering**, and beyond. If you're interested, please [contact us](mailto:ynn1999@umd.edu,sixianx@umd.edu,zaoxing@umd.edu).
 
 > **Project Status — research preview.** DMI currently supports HuggingFace
-> and vLLM backends for Qwen3 / Llama3.1 and GPT-2-family. SGLang support is on the way. APIs may change. Contributions, bug
-> reports, and feature requests are welcome.
+> and vLLM inference for Qwen3 / Llama3.1 and GPT-2-family, plus Megatron-LM
+> training. SGLang support is on the way. APIs may change.
+> Contributions, bug reports, and feature requests are welcome.
 
 > **👀Technical Report Available:** https://arxiv.org/abs/2605.11093
 
@@ -27,8 +28,6 @@ stages of the model lifecycle.
 
 - **More backend support and models** — Bring DMI to **SGLang** and expand support for
   more widely used model families, including multimodal models.
-- **From inference to training** — Extend DMI's low-overhead inspection to
-  large-scale training framework. (**Megatron**).
 - **From observation to action** — Low-latency streaming/pluggable APIs enables more downstream applications like online monitoring, activation steering,
     distillation, and speculative decoding.
 - **Broader PCIe-aware scheduling** — Extend DMI's serving-first drain governor
@@ -37,13 +36,13 @@ stages of the model lifecycle.
 
 ## About
 
-**DMI is a full-feature observability layer for LLM inference.** It gives real-time access to
+**DMI is a full-feature observability layer for LLM inference and training.** It gives real-time access to
 *any* internal model state — residual streams, attention patterns, MLP outputs,
-KV-cache slices, logits — during real serving, with minimal overhead and without
-forking the inference engine.
+KV-cache slices, logits — during inference or training, with minimal overhead.
 
-Right now, DMI works in **HuggingFace Transformers** and **vLLM** out of the box, captures
-internal tensors through CUDA-Graph–compatible hooks, and streams them off the
+Right now, DMI supports inference through **HuggingFace Transformers** and
+**vLLM**, and training through **Megatron-LM**. It captures
+internal tensors through CUDA-Graph–compatible hooks and streams them off the
 GPU via a dedicated ring buffer to a host-side drain that pushes into a
 queryable store (or drops them, for transport-only profiling).
 
@@ -67,8 +66,9 @@ That's the gap DMI fills.
 - **`Ring²`** — GPU↔CPU co-designed staging. A dedicated GPU-side payload ring
   isolates captured tensors from the KV-cache memory pool; an on-host meta ring
   is drained asynchronously.
-- **HF + vLLM integration** — no engine fork required by the user. Plug in
-  through a worker class (vLLM) or a thin generation wrapper (HF).
+- **HF, vLLM, and Megatron-LM integrations** — use a thin generation wrapper
+  for HF, a worker integration for an unmodified official vLLM installation,
+  or the version-matched Megatron-LM training integration.
 - **Configurable offloading** — capture your hidden states on GPU, stage on host,
   and stream into a queryable store; visualize from notebooks (check out the [Demo](#demo) below).
 - **Quantified overhead** — measured against vanilla HF, HF's `output_hidden_states`,
@@ -118,11 +118,12 @@ Full setup, additional results, and how to reproduce:
 ## Get started
 
 Start with the [core installation guide](docs/install.md), then choose the
-HuggingFace or vLLM path depending on the runtime you want to inspect. The
-project currently supports installation from source. Use a separate environment
-and checkout for each backend, and install only the integration you need. The
-snippet below shows the minimal vLLM entry point. The version-matched integration
-checkout connects DMI to an unmodified official vLLM installation.
+HuggingFace, vLLM, or Megatron-LM path depending on the runtime you want to
+inspect. The project currently supports installation from source. Use a
+separate environment and checkout for each backend, and install only the
+integration you need. The snippet below shows the minimal vLLM entry point. The
+version-matched integration checkout connects DMI to an unmodified official
+vLLM installation.
 
 ```python
 import os
@@ -153,6 +154,7 @@ for o in llm.generate(["The answer is"], SamplingParams(max_tokens=16)):
 | **[Core installation](docs/install.md)** | Install DMI from source and build the native backend |
 | **[HuggingFace](docs/huggingface.md)** | Run HF generation, monitored generation, and offline benchmark scripts |
 | **[vLLM](docs/vllm.md)** | Run DMI through the vLLM offline API or `vllm serve` |
+| **[Megatron-LM](docs/megatron.md)** | Run DMI during Megatron-LM training |
 
 ## Contribute
 
@@ -160,7 +162,7 @@ DMI is an early research system from FrootLab at the University of Maryland, and
 we welcome contributions from users, researchers, and systems builders. Useful
 contributions include bug reports, documentation fixes, benchmark reproduction
 notes, new model integrations, and backend-specific improvements for
-HuggingFace or vLLM.
+HuggingFace, vLLM, or Megatron-LM.
 
 - **Questions, bugs, and feature requests.** Please open a GitHub issue with the
   model, backend, hardware, and reproduction steps when applicable.
