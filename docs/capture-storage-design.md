@@ -499,6 +499,13 @@ five local trials it reported:
 | Direct filesystem | 0.328 GiB/s | 0 | 256 records / 16 MiB |
 | Durable spool | 0.345 GiB/s | 0 | 256 records / 16 MiB |
 
+Those two figures are from the original Apple Silicon run and predate the
+removal of the write path's redundant hashing and buffer copies. Re-measured
+on the Linux reference host afterwards, with interleaved A/B sampling, the
+same shape of workload sustains 0.291 GiB/s direct and 0.282 GiB/s spooled;
+the pack writer alone reaches 0.472 GiB/s. The capacity gate later in this
+document uses the post-change numbers.
+
 Both modes produced 1.0095× space amplification. The difference between local
 modes is within filesystem and scheduling variance; it is not treated as an
 optimization result. Neither number includes Garage or network upload.
@@ -683,30 +690,35 @@ decode throughput rises. Attention-pattern hooks are excluded because they
 scale with sequence length squared rather than per token; any policy capturing
 them must sample aggressively and needs its own budget.
 
-Against the measured plane capacity on this host:
+Against the measured plane capacity on this host, after the redundant hashing
+and buffer copies were removed from the write path (the figures the earlier
+sections of this document quote, 0.216 and 0.370 GiB/s, predate that change):
 
 | Stage | Capacity | Supported input at the 1.2x gate |
 |---|---:|---:|
-| Pipeline, spool mode, one instance | 0.216 GiB/s | 0.180 GiB/s |
-| Pack writer alone | 0.370 GiB/s | 0.308 GiB/s |
+| Pipeline, spool mode, one instance | 0.282 GiB/s | 0.235 GiB/s |
+| Pipeline, direct mode, one instance | 0.291 GiB/s | 0.243 GiB/s |
+| Pack writer alone | 0.472 GiB/s | 0.393 GiB/s |
 | Garage upload, 4 workers, 64 MiB packs | 0.438 GiB/s | 0.365 GiB/s |
 
-**Adopted target: 0.18 GiB/s of sustained capture per pipeline instance**, the
-binding constraint being the pipeline rather than packing or upload.
+**Adopted target: 0.235 GiB/s of sustained capture per pipeline instance**,
+taking the durable spool path as the production shape and leaving the pipeline
+as the binding constraint rather than packing or upload.
 
 The gate outcome follows directly:
 
 - A sampled policy -- every 4th layer, all tokens -- passes on one 4090 for
-  every model above, with 1.4x to 4.4x margin beyond the required 1.2x.
-- Full-fidelity capture of every layer does not pass on a single pipeline
-  instance: 0.369 GiB/s of input against a 0.180 GiB/s budget. It needs either
-  two to three pipeline instances sharded by layer range or producer rank, or a
-  native writer.
+  every model above, with 1.8x to 5.7x margin beyond the required 1.2x.
+- Full-fidelity capture of every layer passes for Qwen3-14B (0.165 GiB/s of
+  input against a 0.235 GiB/s budget) but not for the smaller, faster-decoding
+  models: Llama-3.1-8B needs 0.369 GiB/s and Qwen3-4B 0.519 GiB/s. Those need
+  either two to three pipeline instances sharded by layer range or producer
+  rank, or a native writer.
 
 The pipeline ceiling is a Python-side limit -- the pack writer alone runs at
-0.370 GiB/s, so roughly 42% of achievable throughput is lost between the queue
-and persistence. That gap, not the object store, is where full-fidelity single
-instance capture would have to be won, and it is the same boundary the
+0.472 GiB/s, so roughly 40% of achievable throughput is still lost between the
+queue and persistence. That gap, not the object store, is where full-fidelity
+single instance capture would have to be won, and it is the same boundary the
 production-writer discussion in this document points at.
 
 On a three-GPU host these numbers multiply: full capture across three 4090s is
