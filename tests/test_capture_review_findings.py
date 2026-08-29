@@ -157,11 +157,26 @@ class _Client:
     def __init__(self):
         self.statements: list[str] = []
         self.published: list[tuple[str, list]] = []
+        self.claims: list[tuple[int, str]] = []
 
     def execute(self, query, params=None, **kwargs):
         self.statements.append(query)
         if query.lstrip().upper().startswith("INSERT"):
             self.published.append((query, list(params or [])))
+            if "version_claims" in query:
+                self.claims.extend((row[0], str(row[1])) for row in params)
+            return []
+        # The version allocator's three queries need real state to answer.
+        if "version_claims" in query:
+            if "max(version)" in query:
+                return [(max((v for v, _ in self.claims), default=None),)]
+            wanted = params["version"]
+            return [(cid,) for v, cid in self.claims if v == wanted]
+        if "index_watermark" in query:
+            versions = [
+                p[0][0] for q, p in self.published if "index_watermark" in q
+            ]
+            return [(max(versions, default=None),)]
         return []
 
 
@@ -261,12 +276,14 @@ def test_one_foreign_object_in_the_bucket_does_not_abort_reconciliation(
 def test_a_clock_that_steps_backwards_cannot_publish_under_a_pinned_watermark(
     tmp_path: Path,
 ):
-    """index_version is wall-clock, and wall clocks move backwards.
+    """Wall clocks move backwards; versions must not.
 
-    An NTP correction (or a second indexer with a skewed clock) lets a newer
-    batch take a version below one a reader already pinned, so rows appear
-    inside a snapshot that was taken before they existed -- the same defect the
-    published-watermark change fixed for the mid-batch case.
+    An NTP correction (or a second indexer with a skewed clock) once let a
+    newer batch take a version below one a reader already pinned, so rows
+    appeared inside a snapshot that was taken before they existed. Versions
+    now come from the catalog's own allocator, so no wall-clock value
+    participates in the ordering at all -- the clock stamps published_at_ns
+    only, and a rollback must leave publications strictly increasing.
     """
     store = FilesystemPackStore(tmp_path, store_id="local")
     first = store.put(_sealed(_record(_metadata())), "packs/first.dmi-pack")
@@ -277,7 +294,7 @@ def test_a_clock_that_steps_backwards_cannot_publish_under_a_pinned_watermark(
 
     client = _Client()
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
-    clock = iter([2_000, 2_001, 1_000, 1_001])  # second batch stamped *earlier*
+    clock = iter([2_000, 1_000])  # second batch stamped *earlier*
     indexer = CatalogIndexer(store, writer, clock_ns=lambda: next(clock))
 
     first_result = indexer.index([first])

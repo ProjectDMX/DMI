@@ -202,15 +202,32 @@ def test_admission_is_refused_once_the_pipeline_has_failed(tmp_path: Path):
 
 
 class _Client:
-    """Minimal in-memory ClickHouse stand-in that records inserted rows."""
+    """Minimal in-memory ClickHouse stand-in that records inserted rows.
+
+    Holds just enough state to answer the version allocator's three queries:
+    the max-claim select, the claim insert, and the per-version owner select.
+    """
 
     def __init__(self):
         self.inserted: list[tuple[str, list]] = []
+        self.claims: list[tuple[int, str]] = []
 
     def execute(self, query, params=None, **kwargs):
         if query.lstrip().upper().startswith("INSERT"):
             self.inserted.append((query, list(params or [])))
+            if "version_claims" in query:
+                self.claims.extend((row[0], str(row[1])) for row in params)
             return []
+        if "version_claims" in query:
+            if "max(version)" in query:
+                return [(max((v for v, _ in self.claims), default=None),)]
+            wanted = params["version"]
+            return [(cid,) for v, cid in self.claims if v == wanted]
+        if "index_watermark" in query:
+            published = [
+                p[0][0] for q, p in self.inserted if "index_watermark" in q
+            ]
+            return [(max(published, default=None),)]
         return []
 
 
@@ -222,21 +239,23 @@ def _indexer(store, client, **config):
 def test_an_insert_failure_does_not_commit_the_pack(tmp_path: Path):
     inner = FilesystemPackStore(tmp_path, store_id="local")
     ref = inner.put(_sealed(_record("capture-a")), "packs/a.dmi-pack")
-    client = FaultyClickHouseClient(_Client(), insert=fail_on(1))
+    # Insert 1 is the version claim; insert 2 is the descriptor batch.
+    client = FaultyClickHouseClient(_Client(), insert=fail_on(2))
 
     with pytest.raises(FaultInjected):
         _indexer(inner, client).index([ref])
 
     # Descriptors are written before the pack commit marker precisely so a
     # failure here leaves the pack uncommitted and the batch replayable.
-    assert client.call_counts.get("insert") == 1
+    assert client.call_counts.get("insert") == 2
 
 
 def test_a_duplicated_insert_is_absorbed_by_replay_semantics(tmp_path: Path):
     inner = FilesystemPackStore(tmp_path, store_id="local")
     ref = inner.put(_sealed(_record("capture-a")), "packs/a.dmi-pack")
     backing = _Client()
-    client = FaultyClickHouseClient(backing, insert=duplicate_on(1))
+    # Insert 1 is the version claim; duplicate the descriptor insert (2).
+    client = FaultyClickHouseClient(backing, insert=duplicate_on(2))
 
     result = _indexer(inner, client).index([ref])
 

@@ -78,6 +78,7 @@ def _catalog():
                 ("VIEW", "pack_inventory"),
                 ("TABLE", "capture_raw"),
                 ("TABLE", "pack_inventory_raw"),
+                ("TABLE", "capture_version_claims"),
             ):
                 client.execute(
                     f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`"

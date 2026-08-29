@@ -90,6 +90,7 @@ class _CatalogWriter:
         self.pack_batches: list[tuple[PackRef, ...]] = []
         self.watermarks: list[tuple[int, int, int, int]] = []
         self.fail_commit_once = False
+        self.allocations = 0
 
     def committed_pack_ids(self, identities):
         return self.committed.intersection(identities)
@@ -113,6 +114,12 @@ class _CatalogWriter:
 
     def last_published_version(self):
         return self.watermarks[-1][0] if self.watermarks else 0
+
+    def allocate_version(self):
+        # Deterministic and monotonic: strictly above everything published,
+        # counting prior allocations so an unpublished claim is never reused.
+        self.allocations += 1
+        return self.last_published_version() + self.allocations
 
 
 def _packs(tmp_path: Path, counts: tuple[int, ...] = (2, 1)):
@@ -160,7 +167,9 @@ def test_indexer_reads_only_footers_and_batches_rows(tmp_path: Path):
     )
     # Publication is not optional: without it the rows above are durably
     # stored but permanently invisible to readers pinned to the watermark log.
-    assert writer.watermarks == [(42, 42, 3, 2)]
+    # The version is allocator-owned (first allocation on a fresh catalog is
+    # 1); the clock stamps only published_at_ns.
+    assert writer.watermarks == [(1, 42, 3, 2)]
 
 
 def test_duplicate_event_and_missed_event_converge_on_rebuild(tmp_path: Path):
@@ -325,15 +334,16 @@ def test_a_restarted_indexer_cannot_publish_under_the_durable_watermark(
 
     CatalogIndexer(inventory, writer, clock_ns=lambda: 2_000).index([refs[0]])
     # A new process starts with no in-memory guard state and a wall clock
-    # stepped back below the last published version. It must seed from the
-    # durable watermark, or its batch lands inside snapshots readers have
-    # already pinned.
+    # stepped back below the previous indexer's. Versions come from the
+    # catalog's own allocator, so the clock rollback cannot land this batch
+    # inside snapshots readers have already pinned -- the clock stamps only
+    # published_at_ns.
     CatalogIndexer(inventory, writer, clock_ns=lambda: 1_000).index([refs[1]])
 
     published = [watermark[0] for watermark in writer.watermarks]
     assert published == sorted(published), f"versions went backwards: {published}"
     assert len(set(published)) == len(published), "a version was reused"
-    assert published[0] == 2_000 and published[1] > 2_000
+    assert published[1] > published[0]
 
 
 @pytest.mark.parametrize(

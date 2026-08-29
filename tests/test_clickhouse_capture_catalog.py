@@ -22,9 +22,20 @@ class _Client:
     def __init__(self):
         self.calls = []
         self.committed = []
+        self.claims = []
 
     def execute(self, query, params=None, **kwargs):
         self.calls.append((query, params, kwargs))
+        if query.lstrip().startswith("INSERT"):
+            if "version_claims" in query:
+                self.claims.extend((row[0], str(row[1])) for row in params)
+            return []
+        # The version allocator's queries are answered from real claim state;
+        # every other SELECT returns the canned rows.
+        if "version_claims" in query:
+            if "max(version)" in query:
+                return [(max((v for v, _ in self.claims), default=None),)]
+            return [(cid,) for v, cid in self.claims if v == params["version"]]
         if query.lstrip().startswith("SELECT"):
             return self.committed
         return []
@@ -84,6 +95,10 @@ def test_clickhouse_catalog_creates_replay_safe_raw_tables_and_final_views():
     assert "ReplacingMergeTree(index_version)" in ddl
     assert "FROM `default`.`dmi_capture_raw` FINAL" in ddl
     assert "FROM `default`.`dmi_pack_inventory_raw` FINAL" in ddl
+    # The allocator's claim ledger is append-only and ordered by the claim
+    # itself -- claimed_at_ns is diagnostic, never part of the ordering.
+    assert "`dmi_capture_version_claims`" in ddl
+    assert "ORDER BY (version, claim_id)" in ddl
 
 
 def test_clickhouse_catalog_inserts_descriptors_before_pack_commit():

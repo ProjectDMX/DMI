@@ -41,6 +41,8 @@ class CatalogWriter(Protocol):
 
     def last_published_version(self) -> int: ...
 
+    def allocate_version(self) -> int: ...
+
 
 @dataclass(frozen=True, slots=True)
 class CatalogIndexerConfig:
@@ -251,25 +253,24 @@ class CatalogIndexer:
             descriptors.extend(pack_descriptors)
             valid_refs.append(ref)
 
-        version = self._clock_ns()
+        # index_version has to increase strictly across every live indexer, or
+        # a batch lands underneath a watermark a reader already pinned and that
+        # snapshot grows after the fact. The version is a DB-allocated
+        # generation owned by the catalog itself -- no wall-clock value
+        # participates in the ordering, so clock skew between indexers (or an
+        # NTP step on one of them) cannot reorder publications. The wall clock
+        # only stamps published_at_ns below.
+        version = self._writer.allocate_version()
         if type(version) is not int or version < 0:
-            raise ValueError("clock_ns must return a non-negative integer")
-        # index_version has to increase strictly, or a batch lands underneath a
-        # watermark a reader already pinned and that snapshot grows after the
-        # fact. A wall clock does not guarantee that: NTP steps backwards, and
-        # a coarse clock can return the same value twice in a row. Advance past
-        # the last published version rather than failing -- the version is an
-        # ordering token, not a timestamp, and published_at_ns still records the
-        # real time. Cross-process skew is a separate problem, documented under
-        # the Phase 5 limitations.
+            raise ValueError("allocate_version must return a non-negative integer")
         if self._published_version is None:
-            # Seed from durable state: an in-memory guard alone resets on
-            # restart, so a wall clock stepped back across a crash/redeploy
-            # (or a second indexer with skew) could publish underneath a
-            # watermark a reader already pinned.
+            # Cross-check against durable state: a broken allocator must fail
+            # loudly here rather than publish under a pinned watermark.
             self._published_version = self._writer.last_published_version()
         if version <= self._published_version:
-            version = self._published_version + 1
+            raise RuntimeError(
+                "catalog version allocator returned a non-monotonic version"
+            )
         step = self._config.max_rows_per_insert
         descriptor_inserts = 0
         for start in range(0, len(descriptors), step):
@@ -284,12 +285,17 @@ class CatalogIndexer:
         # all of that is durable. A reader that derived the watermark from the
         # descriptor table itself would see this version mid-batch.
         self._published_version = version
+        # The wall clock stamps published_at_ns only -- a human-readable record
+        # of when the version was published, never part of its ordering.
+        published_at_ns = self._clock_ns()
+        if type(published_at_ns) is not int or published_at_ns < 0:
+            raise ValueError("clock_ns must return a non-negative integer")
         # publish_watermark is a required part of the CatalogWriter contract:
         # skipping it silently would leave every row this call wrote durably
         # stored but permanently invisible to readers, with no error anywhere.
         self._writer.publish_watermark(
             index_version=version,
-            published_at_ns=self._clock_ns(),
+            published_at_ns=published_at_ns,
             indexed_rows=len(descriptors),
             indexed_packs=len(valid_refs),
         )

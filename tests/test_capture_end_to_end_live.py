@@ -175,6 +175,8 @@ def _stack(tmp_path: Path):
             "store": store,
             "reader": reader,
             "catalog": catalog,
+            "client": client,
+            "config": config,
         }
     finally:
         if created:
@@ -184,6 +186,9 @@ def _stack(tmp_path: Path):
                 ("VIEW", "pack_inventory"),
                 ("TABLE", "capture_raw"),
                 ("TABLE", "pack_inventory_raw"),
+                ("TABLE", "index_watermark"),
+                ("TABLE", "pack_commit_log"),
+                ("TABLE", "capture_version_claims"),
             ):
                 client.execute(
                     f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`"
@@ -285,11 +290,62 @@ def test_a_replayed_index_does_not_change_the_analysis(tmp_path: Path):
 
         # A second indexing pass at a higher version, as reconciliation would do.
         page = catalog.search(CaptureQuery(tenant_id="tenant-e2e", limit=100))
-        assert page.watermark == "7"
+        # The first allocator-owned version on a fresh catalog; the clock
+        # (fixed at 7 here) stamps published_at_ns only.
+        assert page.watermark == "1"
 
         after = reader.select(CaptureQuery(tenant_id="tenant-e2e", limit=100))
         assert after.capture_ids == before.capture_ids
         assert after.selection_id == before.selection_id
+
+
+def test_a_pinned_watermark_is_isolated_from_a_later_skewed_indexer(tmp_path: Path):
+    """Snapshot isolation across two indexers with skewed clocks, live.
+
+    A reader pins the current watermark; a second indexer -- separate
+    CatalogIndexer and writer instances, with a wall clock BEHIND the first
+    indexer's -- then publishes more packs. Versions are allocated by the
+    catalog itself, so the late publication must land strictly above the
+    pinned watermark: reads at the pin never see it, a fresh watermark does.
+    """
+    with _stack(tmp_path) as env:
+        catalog, store = env["catalog"], env["store"]
+        pinned = catalog.current_watermark()
+        known = [record.metadata.capture_id for record in env["records"]]
+
+        late_id = "capture-e2e-late"
+        array = np.arange(16, dtype=np.float32)
+        pack = PackWriter(
+            pack_id=UUID(int=PACK_ID.int + 1),
+            created_at_ns=1_700_000_000_000_000_000,
+            max_pack_bytes=8 * 1024 * 1024,
+        )
+        pack.append(
+            CaptureRecord(
+                metadata=_metadata(late_id, dtype="float32", shape=(16,), index=50),
+                payload=array.tobytes(),
+            )
+        )
+        late_ref = store.put(pack.seal(), "packs/end-to-end-late.dmi-pack")
+
+        # Indexer B: fresh instances over the same catalog, clock LOWER than
+        # indexer A's (7 in _stack). The clock must not matter.
+        late_writer = ClickHouseCatalogWriter(env["client"], env["config"])
+        late_indexer = CatalogIndexer(store, late_writer, clock_ns=lambda: 3)
+        result = late_indexer.index([late_ref])
+        assert result.indexed_packs == 1, result.failures
+
+        # The pinned snapshot must not grow after the fact.
+        at_pin = catalog.get_by_ids(known + [late_id], watermark=pinned)
+        assert {item.capture_id for item in at_pin} == set(known)
+
+        # A fresh watermark is strictly newer and does see the late capture.
+        fresh = catalog.current_watermark()
+        assert int(fresh) > int(pinned)
+        at_fresh = catalog.get_by_ids(known + [late_id], watermark=fresh)
+        assert {item.capture_id for item in at_fresh} == set(known) | {late_id}
+        page = catalog.search(CaptureQuery(tenant_id="tenant-e2e", limit=100))
+        assert late_id in {item.capture_id for item in page.items}
 
 
 def test_the_catalog_reports_the_pack_as_committed(tmp_path: Path):

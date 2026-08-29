@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import secrets
+from time import time_ns
 from typing import Protocol, Sequence
+from uuid import uuid4
 
 from .catalog import PackIdentity
 from .model import CaptureDescriptor, PackRef
@@ -30,12 +33,15 @@ class ClickHouseCatalogConfig:
     database: str = "default"
     table_prefix: str = "dmi"
     query_pack_limit: int = 10_000
+    allocation_attempts: int = 16
 
     def __post_init__(self) -> None:
         _identifier(self.database)
         _identifier(self.table_prefix)
         if type(self.query_pack_limit) is not int or self.query_pack_limit <= 0:
             raise ValueError("query_pack_limit must be positive")
+        if type(self.allocation_attempts) is not int or self.allocation_attempts <= 0:
+            raise ValueError("allocation_attempts must be positive")
 
 
 _CAPTURE_COLUMNS = (
@@ -96,6 +102,7 @@ class ClickHouseCatalogWriter:
         self._pack_view = f"{prefix}_pack_inventory"
         self._watermark = f"{prefix}_index_watermark"
         self._commit_log = f"{prefix}_pack_commit_log"
+        self._version_claims = f"{prefix}_capture_version_claims"
 
     def ensure_schema(self) -> None:
         database = _quoted(self._config.database)
@@ -148,6 +155,16 @@ ORDER BY (store_id, pack_id)"""
             f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._watermark)} (
 index_version UInt64, published_at_ns UInt64, indexed_rows UInt64, indexed_packs UInt32
 ) ENGINE = MergeTree ORDER BY index_version"""
+        )
+
+        # The version allocator's append-only claim ledger. A claimant owns a
+        # version only when its post-insert read shows it is that version's
+        # sole claimant; claimed_at_ns is diagnostic only -- no wall clock
+        # participates in ordering.
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._version_claims)} (
+version UInt64, claim_id UUID, claimed_at_ns UInt64
+) ENGINE = MergeTree ORDER BY (version, claim_id)"""
         )
 
         # The snapshot boundary. A capture belongs to exactly one immutable
@@ -220,14 +237,69 @@ pack_id UUID, store_id LowCardinality(String), index_version UInt64
 
     def last_published_version(self) -> int:
         """Highest published index_version, or 0 when nothing is published."""
+        return self._max_version(
+            self._watermark,
+            "index_version",
+            "watermark table returned an invalid version",
+        )
+
+    def allocate_version(self) -> int:
+        """Allocate the next catalog version: strictly monotonic and unique.
+
+        Sole-claimant protocol over the append-only claims table. Each attempt
+        picks a candidate above everything already claimed or published,
+        inserts a claim for it, then reads the claims for that version back: a
+        claimant proceeds ONLY when its post-insert read shows it is the sole
+        claimant. On a server with monotonic read-your-writes visibility
+        (single node; replicated setups need select_sequential_consistency),
+        for two claimants of the same version the later insert always observes
+        the earlier one, so at most one of them sees a singleton -- contested
+        versions are abandoned by everyone who sees the contest. Every
+        RETURNED version is durably in the claims table, so later allocations
+        always start above it: monotonic + unique, with no clock anywhere in
+        the ordering. ``claimed_at_ns`` is diagnostic only.
+        """
+        attempts = self._config.allocation_attempts
+        for attempt in range(attempts):
+            claimed = self._max_version(
+                self._version_claims,
+                "version",
+                "claims table returned an invalid version",
+            )
+            floor = max(claimed, self.last_published_version())
+            # A randomized skip only after a collision, so two contenders that
+            # keep colliding spread out instead of racing for floor + 1 again.
+            candidate = floor + 1 + (secrets.randbelow(8 * attempt + 1) if attempt else 0)
+            self._validate_version(candidate)
+            claim_id = str(uuid4())
+            self._client.execute(
+                f"INSERT INTO {self._qualified(self._version_claims)} "
+                "(version, claim_id, claimed_at_ns) VALUES",
+                [(candidate, claim_id, time_ns())],
+            )
+            owners = self._client.execute(
+                f"SELECT toString(claim_id) FROM "
+                f"{self._qualified(self._version_claims)} "
+                "WHERE version = %(version)s",
+                {"version": candidate},
+            )
+            if {self._text(row[0]) for row in owners} == {claim_id}:
+                return candidate
+            # Contested: someone else claimed the same version -- abandon it
+            # entirely and retry above it.
+        raise RuntimeError(
+            f"could not allocate a catalog version after {attempts} attempts"
+        )
+
+    def _max_version(self, table: str, column: str, message: str) -> int:
         rows = self._client.execute(
-            f"SELECT max(index_version) FROM {self._qualified(self._watermark)}"
+            f"SELECT max({column}) FROM {self._qualified(table)}"
         )
         if not rows or not rows[0] or rows[0][0] is None:
             return 0
         value = rows[0][0]
         if type(value) is not int or value < 0:
-            raise ValueError("watermark table returned an invalid version")
+            raise ValueError(message)
         return value
 
     def commit_packs(
