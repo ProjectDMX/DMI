@@ -40,6 +40,7 @@ class _S3Client:
     def __init__(self):
         self.objects: dict[str, tuple[bytes, dict[str, str]]] = {}
         self.upload_configs: list[object] = []
+        self.upload_extra_args: list[dict[str, object]] = []
         self.deleted: list[str] = []
 
     def head_object(self, *, Bucket: str, Key: str):
@@ -58,6 +59,7 @@ class _S3Client:
         Config: object,
     ) -> None:
         self.upload_configs.append(Config)
+        self.upload_extra_args.append(dict(ExtraArgs))
         # Consume the stream in small chunks the way a transfer manager would,
         # so the hashing tee is exercised across several reads.
         chunks = []
@@ -376,6 +378,20 @@ def test_s3_put_integrity_error_survives_a_failing_delete():
     # error that actually matters.
     with pytest.raises(PackIntegrityError, match="do not match"):
         _store(client).put(_LyingPack(_pack()), "packs/lying.dmi-pack")
+
+
+def test_s3_put_asks_the_server_to_verify_the_upload():
+    # Server-side verification is a second, independent check: the hashing tee
+    # catches a source that contradicts its own declaration, this catches
+    # corruption between the bytes boto read and the bytes the server stored.
+    # Garage 2.3 honours it (rejecting a mismatch with InvalidDigest) on both
+    # the single-part and multipart paths.
+    client = _S3Client()
+    store = _store(client)
+
+    store.put(_pack(), "packs/checksum.dmi-pack")
+
+    assert client.upload_extra_args[0]["ChecksumAlgorithm"] == "SHA256"
 
 
 def test_s3_put_still_accepts_a_faithful_source():

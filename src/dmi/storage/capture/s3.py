@@ -242,6 +242,19 @@ class S3PackStore:
                 ExtraArgs={
                     "ContentType": "application/vnd.dmi.pack",
                     "Metadata": metadata,
+                    # Defence in depth, on a different failure than the tee
+                    # above: the client-side digest catches a source whose
+                    # bytes contradict its declaration, this catches
+                    # corruption between the bytes boto read and the bytes the
+                    # server stored (each multipart part is checked on
+                    # arrival). Verified against Garage 2.3, which rejects a
+                    # mismatching digest with InvalidDigest, on both the
+                    # single-part and multipart paths and with the
+                    # non-seekable stream this reader presents. Note the
+                    # stored value for a multipart object is S3's composite
+                    # checksum-of-checksums, not the whole-object digest, so
+                    # it is never compared against PackRef.checksum.
+                    "ChecksumAlgorithm": "SHA256",
                 },
                 Config=self._transfer_config,
             )

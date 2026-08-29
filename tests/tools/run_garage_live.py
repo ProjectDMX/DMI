@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -71,7 +72,12 @@ def main(argv: list[str] | None = None) -> int:
             [binary, "--version"], capture_output=True, text=True, check=True
         ).stdout
         expected_version = os.environ.get("DMI_GARAGE_VERSION", "2.3.0")
-        if f"cargo:{expected_version}" not in version:
+        # Source builds report "cargo:2.3.0"; the official published binary
+        # reports "garage v2.3.0 [features: ...]". Accept either, or the pin
+        # rejects exactly the download the documentation points at.
+        if not re.search(
+            rf"(?:cargo:|v){re.escape(expected_version)}\b", version
+        ):
             raise RuntimeError(
                 f"expected Garage {expected_version}, got {version.strip()}"
             )
