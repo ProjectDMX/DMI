@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import PurePosixPath
 import re
 from typing import Mapping, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from .filesystem import validate_object_key, validate_pack_source, verify_pack_source
+from .filesystem import validate_object_key, validate_pack_source
 from .model import (
     ObjectInfo,
     ObjectPage,
@@ -69,6 +70,41 @@ class S3Client(Protocol):
     def upload_fileobj(self, *args, **kwargs) -> None: ...
     def get_object(self, **kwargs): ...
     def list_objects_v2(self, **kwargs): ...
+    def delete_object(self, **kwargs): ...
+
+
+class _HashingReader:
+    """Tee a pack stream through SHA-256 while the transfer manager reads it.
+
+    ``seekable()`` is False on purpose: a non-seekable stream forces boto's
+    transfer manager into sequential reads, so this tee sees every byte exactly
+    once and in order.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self._digest = sha256()
+        self._bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._inner.read(size)
+        self._digest.update(chunk)
+        self._bytes_read += len(chunk)
+        return chunk
+
+    @property
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+    @property
+    def bytes_read(self) -> int:
+        return self._bytes_read
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,12 +219,13 @@ class S3PackStore:
             return self._existing_ref(pack, key, existing)
 
         # upload_fileobj hands the stream straight to the transfer manager, so
-        # unlike FilesystemPackStore.put nothing here ever sees the bytes. Hash
-        # the source first: the object metadata below is written from
-        # pack.checksum, so a later stat() comparison against it is tautological
-        # and cannot notice a source that lied about its own contents.
-        verify_pack_source(pack)
-
+        # unlike FilesystemPackStore.put nothing here would otherwise see the
+        # bytes. PackRef.sha256 == SHA256(bytes actually uploaded) is enforced
+        # by hashing the single upload stream itself: a separate verification
+        # pass would read the source twice, and PackSource does not promise
+        # identical repeated reads. The dmi-sha256 object metadata below is a
+        # stored assertion for later identity checks, not proof of server-side
+        # verification.
         metadata = {
             "dmi-format": "dmi-pack-v1",
             "dmi-pack-id": pack.pack_id,
@@ -197,8 +234,9 @@ class S3PackStore:
             "dmi-created-at-ns": str(pack.created_at_ns),
         }
         with pack.open() as source:
+            reader = _HashingReader(source)
             self._client.upload_fileobj(
-                source,
+                reader,
                 self._bucket,
                 key,
                 ExtraArgs={
@@ -207,10 +245,27 @@ class S3PackStore:
                 },
                 Config=self._transfer_config,
             )
+        if (
+            reader.bytes_read != pack.object_bytes
+            or reader.hexdigest != pack.checksum
+        ):
+            self._delete_uploaded(key)
+            raise PackIntegrityError(
+                "uploaded bytes do not match the pack source declaration"
+            )
         uploaded = self._head_or_none(key)
         if uploaded is None:
             raise PackIntegrityError("uploaded object is not visible to HeadObject")
         return self._existing_ref(pack, key, uploaded)
+
+    def _delete_uploaded(self, key: str) -> None:
+        # Best effort: the object contradicts its own metadata, so inspect()
+        # would reject it anyway; removal is cleanup, not correctness -- and a
+        # raised delete error must not mask the integrity error.
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=key)
+        except Exception:
+            pass
 
     def stat(self, ref: PackRef) -> ObjectInfo:
         self._validate_ref(ref)

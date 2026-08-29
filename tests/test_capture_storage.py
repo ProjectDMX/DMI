@@ -415,6 +415,33 @@ def test_reader_detects_corruption_in_a_partial_range(tmp_path: Path):
         reader.hydrate(selection, byte_limit=descriptor.locator.stored_length)
 
 
+def test_verify_pack_source_checks_the_stream_against_its_own_checksum():
+    """The standalone utility: a full read-and-hash of a pack source.
+
+    S3 uploads now hash their single upload stream instead of calling this,
+    but the utility remains public for stores that need an out-of-band check.
+    """
+    from io import BytesIO
+
+    from dmi.storage.capture.filesystem import verify_pack_source
+
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    verify_pack_source(sealed)  # a faithful source passes
+
+    class _Lying:
+        pack_id = sealed.pack_id
+        created_at_ns = sealed.created_at_ns
+        record_count = sealed.record_count
+        checksum = "0" * 64
+        object_bytes = len(sealed.data)
+
+        def open(self):
+            return BytesIO(sealed.data)
+
+    with pytest.raises(PackIntegrityError, match="checksum"):
+        verify_pack_source(_Lying())
+
+
 def test_fsync_path_to_root_covers_every_new_directory(tmp_path: Path, monkeypatch):
     import os
 

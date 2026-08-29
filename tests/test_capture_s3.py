@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 from io import BytesIO
 from uuid import UUID
 
@@ -39,6 +40,7 @@ class _S3Client:
     def __init__(self):
         self.objects: dict[str, tuple[bytes, dict[str, str]]] = {}
         self.upload_configs: list[object] = []
+        self.deleted: list[str] = []
 
     def head_object(self, *, Bucket: str, Key: str):
         try:
@@ -56,7 +58,20 @@ class _S3Client:
         Config: object,
     ) -> None:
         self.upload_configs.append(Config)
-        self.objects[Key] = (Fileobj.read(), dict(ExtraArgs["Metadata"]))
+        # Consume the stream in small chunks the way a transfer manager would,
+        # so the hashing tee is exercised across several reads.
+        chunks = []
+        while True:
+            chunk = Fileobj.read(64)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        self.objects[Key] = (b"".join(chunks), dict(ExtraArgs["Metadata"]))
+
+    def delete_object(self, *, Bucket: str, Key: str):
+        self.deleted.append(Key)
+        self.objects.pop(Key, None)
+        return {}
 
     def get_object(self, *, Bucket: str, Key: str, Range: str):
         start, end = (int(value) for value in Range.removeprefix("bytes=").split("-"))
@@ -291,22 +306,29 @@ def test_s3_listing_rejects_a_truncated_page_without_a_cursor():
 
 
 class _LyingPack:
-    """A pack source whose bytes do not match the checksum it declares."""
+    """A pack source whose stream does not match the metadata it declares.
 
-    def __init__(self, sealed):
+    ``stream`` overrides the bytes actually yielded; ``declared_bytes``
+    overrides the advertised object size. By default the stream is the right
+    length but the wrong content, so the declared checksum is a lie.
+    """
+
+    def __init__(self, sealed, *, stream: bytes | None = None,
+                 declared_bytes: int | None = None):
         self.pack_id = sealed.pack_id
         self.created_at_ns = sealed.created_at_ns
         self.record_count = sealed.record_count
         self.checksum = sealed.checksum
-        self._data = b"\x00" * len(sealed.data)
+        self._data = b"\x00" * len(sealed.data) if stream is None else stream
+        self._declared = (
+            len(sealed.data) if declared_bytes is None else declared_bytes
+        )
 
     @property
     def object_bytes(self) -> int:
-        return len(self._data)
+        return self._declared
 
     def open(self):
-        from io import BytesIO
-
         return BytesIO(self._data)
 
 
@@ -314,14 +336,46 @@ def test_s3_put_verifies_the_bytes_it_uploads():
     client = _S3Client()
     store = _store(client)
 
-    # upload_fileobj hands the stream to the transfer manager, so put never sees
-    # the bytes. Without hashing the source it would happily store content that
-    # contradicts the checksum it writes into object metadata -- and stat()
-    # compares against that same metadata, so nothing downstream could tell.
-    with pytest.raises(PackIntegrityError, match="checksum"):
+    # upload_fileobj hands the stream to the transfer manager, so put never
+    # sees the bytes except through the hashing tee. Without it the store would
+    # happily keep content that contradicts the checksum it writes into object
+    # metadata -- and stat() compares against that same metadata, so nothing
+    # downstream could tell. The lie is detected after the upload, and the
+    # contradictory object is removed.
+    with pytest.raises(PackIntegrityError, match="do not match"):
         store.put(_LyingPack(_pack()), "packs/lying.dmi-pack")
 
+    assert client.deleted == ["packs/lying.dmi-pack"]
     assert client.objects == {}
+
+
+@pytest.mark.parametrize("delta", [-1, 1])
+def test_s3_put_rejects_a_stream_whose_size_contradicts_the_declaration(delta: int):
+    client = _S3Client()
+    store = _store(client)
+    sealed = _pack()
+    stream = sealed.data[:delta] if delta < 0 else sealed.data + b"\x00"
+    pack = _LyingPack(sealed, stream=stream)
+
+    with pytest.raises(PackIntegrityError, match="do not match"):
+        store.put(pack, "packs/short.dmi-pack")
+
+    assert client.deleted == ["packs/short.dmi-pack"]
+    assert client.objects == {}
+
+
+def test_s3_put_integrity_error_survives_a_failing_delete():
+    client = _S3Client()
+
+    def broken_delete(**_):
+        raise _ClientError(500, "InternalError")
+
+    client.delete_object = broken_delete  # type: ignore[method-assign]
+
+    # Cleanup is best effort: the delete error must not mask the integrity
+    # error that actually matters.
+    with pytest.raises(PackIntegrityError, match="do not match"):
+        _store(client).put(_LyingPack(_pack()), "packs/lying.dmi-pack")
 
 
 def test_s3_put_still_accepts_a_faithful_source():
@@ -332,6 +386,66 @@ def test_s3_put_still_accepts_a_faithful_source():
 
     assert ref.checksum == _pack().checksum
     assert len(client.objects) == 1
+    # The proof is over the stored bytes themselves, not the metadata echo.
+    stored = client.objects["packs/honest.dmi-pack"][0]
+    assert sha256(stored).hexdigest() == ref.checksum
+    assert client.deleted == []
+
+
+class _ShapeshiftingPack:
+    """A source whose repeated reads differ: open() yields new bytes each time.
+
+    The declared checksum and size describe the FIRST stream only. If put()
+    verified one read and uploaded another, the stored object would be the
+    second stream -- undetectably, because the metadata is written from the
+    declaration.
+    """
+
+    def __init__(self, sealed):
+        self.pack_id = sealed.pack_id
+        self.created_at_ns = sealed.created_at_ns
+        self.record_count = sealed.record_count
+        self.checksum = sealed.checksum
+        self._first = sealed.data
+        self._later = bytes(len(sealed.data))  # same length, different content
+        self.opens = 0
+
+    @property
+    def object_bytes(self) -> int:
+        return len(self._first)
+
+    def open(self):
+        self.opens += 1
+        return BytesIO(self._first if self.opens == 1 else self._later)
+
+
+def test_s3_put_opens_the_source_once_and_uploads_the_verified_bytes():
+    client = _S3Client()
+    store = _store(client)
+    pack = _ShapeshiftingPack(_pack())
+
+    ref = store.put(pack, "packs/one-read.dmi-pack")
+
+    # A verify-then-upload sequence would read the source twice and store the
+    # second stream; hashing the single upload stream makes that impossible.
+    assert pack.opens == 1
+    stored = client.objects["packs/one-read.dmi-pack"][0]
+    assert sha256(stored).hexdigest() == pack.checksum == ref.checksum
+
+
+def test_hashing_reader_is_a_sequential_tee():
+    from dmi.storage.capture.s3 import _HashingReader
+
+    reader = _HashingReader(BytesIO(b"abcdefgh"))
+
+    # Non-seekable on purpose: it forces boto's transfer manager into
+    # sequential reads, so the tee sees every byte exactly once and in order.
+    assert reader.readable() is True
+    assert reader.seekable() is False
+    assert reader.read(3) == b"abc"
+    assert reader.read() == b"defgh"
+    assert reader.bytes_read == 8
+    assert reader.hexdigest == sha256(b"abcdefgh").hexdigest()
 
 
 def test_s3_put_retry_rejects_an_object_missing_the_format_marker():
