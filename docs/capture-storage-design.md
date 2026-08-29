@@ -521,9 +521,10 @@ PYTHONPATH=src python -m benchmarks.bench_capture_pipeline \
 
 Exit gate: pack and upload capacity exceeds target input by at least 1.2 times.
 
-Status: implementation and local compatibility gates passed; the production
-capacity gate remains pending because no target device-to-host rate or
-representative network/storage hardware has been supplied. The pinned Garage
+Status: implementation and local compatibility gates passed. A reference
+device-to-host rate for a single RTX 4090 host is derived below and the gate is
+evaluated against it; the gate remains open for production hardware, where the
+network and storage path differ from this loopback single-node setup. The pinned Garage
 v2.3.0 live test covers multipart upload, retry idempotency, object metadata,
 listing, and the two range reads used to load a pack footer.
 
@@ -649,6 +650,68 @@ DMI_GARAGE_BINARY=/path/to/garage \
   --upload-workers 1,2,4 --packs-per-trial 4 \
   --multipart-chunk-bytes 16MiB --multipart-concurrency 2 --trials 3
 ```
+
+
+#### Reference capture rate: single RTX 4090 server
+
+The capacity gate needs a target input rate. This section derives one for a
+single-GPU RTX 4090 host so the gate can be evaluated; it is a derived figure
+from measured hardware limits and model shapes, not a measurement of a
+production capture workload.
+
+The PCIe link is not the constraint. Measured device-to-host bandwidth on an
+RTX 4090 (PCIe 4.0 x16, pinned host memory) is 24.5 GiB/s at 16 MiB transfers
+and above, 20.8 GiB/s at 1 MiB, and 9.3 GiB/s for pageable memory. That is two
+orders of magnitude above anything the capture plane needs, so the link only
+matters as a reason to keep hook copies pinned and batched, not as a capacity
+bound.
+
+What bounds capture volume is decode throughput times bytes captured per token.
+Decode is weight-read bound, so tokens per second is approximately
+(memory bandwidth / weight bytes) x batch, derated to 75% for attention, KV
+traffic, and scheduling. With 1008 GB/s of device bandwidth:
+
+| Model (bf16) | Batch | Decode | resid, all layers | resid, every 4th layer |
+|---|---:|---:|---:|---:|
+| Qwen3-4B (36 layers, d=2560) | 32 | ~3,000 tok/s | 0.519 GiB/s | 0.130 GiB/s |
+| Llama-3.1-8B (32 layers, d=4096) | 32 | ~1,500 tok/s | 0.369 GiB/s | 0.092 GiB/s |
+| Qwen3-14B (40 layers, d=5120) | 16 | ~430 tok/s | 0.165 GiB/s | 0.041 GiB/s |
+
+A smaller model produces more capture bytes per second, not fewer: it decodes
+proportionally faster, and per-token capture volume falls more slowly than
+decode throughput rises. Attention-pattern hooks are excluded because they
+scale with sequence length squared rather than per token; any policy capturing
+them must sample aggressively and needs its own budget.
+
+Against the measured plane capacity on this host:
+
+| Stage | Capacity | Supported input at the 1.2x gate |
+|---|---:|---:|
+| Pipeline, spool mode, one instance | 0.216 GiB/s | 0.180 GiB/s |
+| Pack writer alone | 0.370 GiB/s | 0.308 GiB/s |
+| Garage upload, 4 workers, 64 MiB packs | 0.438 GiB/s | 0.365 GiB/s |
+
+**Adopted target: 0.18 GiB/s of sustained capture per pipeline instance**, the
+binding constraint being the pipeline rather than packing or upload.
+
+The gate outcome follows directly:
+
+- A sampled policy -- every 4th layer, all tokens -- passes on one 4090 for
+  every model above, with 1.4x to 4.4x margin beyond the required 1.2x.
+- Full-fidelity capture of every layer does not pass on a single pipeline
+  instance: 0.369 GiB/s of input against a 0.180 GiB/s budget. It needs either
+  two to three pipeline instances sharded by layer range or producer rank, or a
+  native writer.
+
+The pipeline ceiling is a Python-side limit -- the pack writer alone runs at
+0.370 GiB/s, so roughly 42% of achievable throughput is lost between the queue
+and persistence. That gap, not the object store, is where full-fidelity single
+instance capture would have to be won, and it is the same boundary the
+production-writer discussion in this document points at.
+
+On a three-GPU host these numbers multiply: full capture across three 4090s is
+about 1.1 GiB/s, requiring roughly six pipeline instances at the current
+per-instance rate, or the native path.
 
 ### Phase 4 — derived ClickHouse catalog
 
