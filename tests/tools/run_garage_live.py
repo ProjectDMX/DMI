@@ -58,6 +58,20 @@ def _wait_for_port(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark", action="store_true")
+    # The ephemeral server is useful for more than the isolated store contract
+    # -- the pipeline and the Garage+ClickHouse end-to-end suite run under it
+    # too -- so the selection is overridable. Defaults reproduce the original
+    # fixed command exactly.
+    parser.add_argument(
+        "--tests",
+        default="tests/test_garage_live.py",
+        help="pytest target to run under the ephemeral server",
+    )
+    parser.add_argument(
+        "--marker",
+        default="garage and manual",
+        help="pytest -m marker expression for the selected tests",
+    )
     parser.add_argument("benchmark_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     binary = os.environ.get("DMI_GARAGE_BINARY") or shutil.which("garage")
@@ -158,9 +172,9 @@ metrics_token = "{secrets.token_urlsafe(32)}"
                     sys.executable,
                     "-m",
                     "pytest",
-                    "tests/test_garage_live.py",
+                    args.tests,
                     "-m",
-                    "garage and manual",
+                    args.marker,
                     "-q",
                 ]
             )

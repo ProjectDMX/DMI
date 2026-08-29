@@ -527,6 +527,70 @@ representative network/storage hardware has been supplied. The pinned Garage
 v2.3.0 live test covers multipart upload, retry idempotency, object metadata,
 listing, and the two range reads used to load a pack footer.
 
+The released Garage binary is now verified on Linux as well as from source.
+`garage v2.3.0 [features: bundled-libs, consul-discovery, fjall, journald, k2v,
+kubernetes-discovery, lmdb, metrics, sqlite, syslog, telemetry-otlp]`, the
+published x86-64 Linux download, runs the whole live suite unmodified; the
+harness accepts both that version string and the `cargo:2.3.0` a source build
+reports.
+
+#### Server-side checksums
+
+`S3PackStore.put` sends `ChecksumAlgorithm=SHA256`, and Garage 2.3.0 both
+supports and enforces it, measured against the ephemeral server:
+
+- A `PutObject` whose `ChecksumSHA256` contradicts the body is rejected with
+  `InvalidDigest` (HTTP 400); a matching one is stored and returned verbatim by
+  `HeadObject` with `ChecksumMode=ENABLED`.
+- An `UploadPart` whose `ChecksumSHA256` contradicts the part is rejected the
+  same way, so every part of a multipart pack is checked on arrival rather than
+  only at completion.
+- For a multipart object the stored `ChecksumSHA256` is S3's composite
+  checksum-of-checksums — `SHA256` of the concatenated per-part digests, which
+  reproduces Garage's value exactly — and therefore is **not** the digest of the
+  whole object. Garage returns that composite without the `-<parts>` suffix AWS
+  appends, so it cannot even be recognised as composite by shape. It is
+  consequently never compared against `PackRef.checksum`; DMI identity keeps
+  using the client-side `dmi-sha256` object metadata, which the upload tee
+  computes over the exact byte stream boto3 sends.
+
+The server-side checksum is therefore defence in depth against corruption
+between the bytes boto3 read and the bytes Garage stored, not a replacement for
+the DMI digest.
+
+#### Live coverage
+
+`tests/test_garage_live.py` (markers `garage` + `manual`) covers the isolated
+store contract and the production write path end to end:
+
+- `test_garage_multipart_retry_listing_and_two_range_footer_read` — multipart
+  upload, idempotent retry, object metadata, listing, footer range reads.
+- `test_garage_pipeline_spool_upload_commits_every_pack` —
+  `HostCapturePipeline` -> `DurablePackSpool` -> `ParallelSpoolUploader` ->
+  Garage. Every staged pack becomes exactly one object, the stored bytes are
+  byte-identical to the sealed pack, `HeadObject` agrees with the `PackRef`, the
+  spool is empty afterwards, and the uploader reports zero retries and zero
+  failures.
+- `test_garage_restart_recovers_exactly_the_un_uploaded_packs` — a batch is
+  interrupted part way, then a fresh spool and uploader over the same directory
+  recover exactly the packs that were never uploaded and complete them. No
+  duplicated objects, no lost packs.
+- `test_garage_failed_upload_keeps_the_local_copy` — a scripted permanent
+  upload failure leaves the pack staged and its object absent, and the next
+  pass uploads it successfully. Local durability survives a failed commit.
+
+`tests/test_capture_garage_e2e.py` (markers `garage` + `clickhouse` + `manual`)
+closes the loop through the catalog. It uploads real packs to Garage, discovers
+them by bucket listing only — `S3PackStore` acting as the `PackInventory` a
+`CatalogReconciler` reads, so every `PackRef` is rebuilt from Garage object
+metadata — indexes them into ClickHouse under a unique table prefix, pins a
+watermark, searches and resolves by ID at that pin, hydrates payloads by range
+read out of Garage, and asserts both the raw bytes and the decoded tensors match
+what was captured. It also asserts that re-reconciling the same bucket indexes
+nothing new, and that a foreign object in the prefix is reported as one failure
+without holding back the healthy packs. Both the ClickHouse tables and the
+bucket objects it created are removed on teardown.
+
 An Apple Silicon local sweep used four packs per trial, a 16 MiB multipart
 threshold and chunk, two multipart requests per pack, and three trials per
 point. All objects and byte caps verified with zero retries:
@@ -536,7 +600,16 @@ point. All objects and byte caps verified with zero retries:
 | 32 MiB | 0.248 GiB/s | 0.388 GiB/s | 0.473 GiB/s |
 | 64 MiB | 0.265 GiB/s | 0.397 GiB/s | 0.502 GiB/s |
 
-These results show useful parallel scaling and saturation beginning near four
+The same sweep against the released Linux binary (AMD Ryzen Threadripper PRO
+5955WX, Linux 5.15, loopback, single node, `sqlite` metadata engine), median of
+three trials per point, again with zero retries:
+
+| Pack payload | 1 outer worker | 2 outer workers | 4 outer workers |
+|---:|---:|---:|---:|
+| 32 MiB | 0.207 GiB/s | 0.327 GiB/s | 0.363 GiB/s |
+| 64 MiB | 0.259 GiB/s | 0.394 GiB/s | 0.438 GiB/s |
+
+Both platforms show useful parallel scaling and saturation beginning near four
 outer workers on this loopback, single-node setup. They do not establish a
 production default. Outer pack concurrency and per-pack multipart concurrency
 multiply; their product and the configured HTTP connection pool bound the
@@ -552,8 +625,19 @@ DMI_GARAGE_BINARY=/path/to/garage \
 
 The harness pins Garage 2.3.0 by default, creates temporary credentials and
 storage, and deletes the entire instance on exit. The official Garage download
-page currently publishes Linux binaries; macOS can build the same pinned tag
-from source using Garage's documented Cargo workflow.
+page publishes Linux binaries; macOS can build the same pinned tag from source
+using Garage's documented Cargo workflow.
+
+`--tests` and `--marker` select what runs under that ephemeral server; the
+defaults reproduce the isolated store and pipeline suite. The Garage plus
+ClickHouse end-to-end suite needs both, so it is selected explicitly:
+
+```bash
+DMI_CLICKHOUSE_HOST=127.0.0.1 DMI_GARAGE_BINARY=/path/to/garage \
+  python tests/tools/run_garage_live.py \
+  --tests tests/test_capture_garage_e2e.py \
+  --marker "garage and clickhouse and manual"
+```
 
 Run a sweep against the same ephemeral server with:
 
