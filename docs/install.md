@@ -31,14 +31,15 @@ nvidia-smi
 
 ## 1. Clone the repository
 
-The repo uses three git submodules: the DMI HuggingFace integration, the
-version-matched DMI-vLLM integration, and the `clickhouse-cpp` C++ client.
-The commands below fetch all three repositories; they do not install either
-Python integration.
+The repo uses four git submodules: the DMI HuggingFace integration, the
+version-matched DMI-vLLM integration, the version-matched DMI-Megatron
+integration, and the `clickhouse-cpp` C++ client. The commands below fetch all
+four repositories; they do not install any Python integration.
 
-The command below creates one backend checkout. If you plan to use both
-backends, repeat it with distinct target directories such as `DMI-hf` and
-`DMI-vllm`; do not share one checkout between their environments.
+The command below creates one backend checkout. If you plan to use multiple
+backends, repeat it with distinct target directories such as `DMI-hf`,
+`DMI-vllm`, and `DMI-megatron`; do not share one checkout between their
+environments.
 
 ```bash
 git clone --recursive https://github.com/ProjectDMX/DMI.git
@@ -52,6 +53,7 @@ Expected submodule paths:
 
 - `third_party/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`, `llama_p`)
 - `third_party/vllm-integration/` — DMI integration for an unmodified official vLLM installation
+- `third_party/DMI-Megatron-Integration/` — DMI integration with its pinned Megatron-LM fork at `third_party/DMI-Megatron-Integration/third_party/megatron-lm/`
 - `third_party/clickhouse-cpp/` — ClickHouse C++ client linked into the native backend
 
 ## 2. Install ClickHouse server
@@ -94,7 +96,7 @@ If conda is not already installed, follow the
 first. Then:
 
 ```bash
-DMI_BACKEND_ENV=dmi-hf  # Example; use dmi-vllm in the vLLM checkout.
+DMI_BACKEND_ENV=dmi-hf  # Example; use dmi-vllm or dmi-megatron for those checkouts.
 conda env create -f environment.yml --name "$DMI_BACKEND_ENV"
 conda activate "$DMI_BACKEND_ENV"
 ```
@@ -212,11 +214,12 @@ ClickHouse; use the host benchmark separately with a running server.
 
 ## 6. Choose one backend
 
-Continue with either the [HuggingFace guide](huggingface.md) or the
-[vLLM guide](vllm.md). Use a separate environment and checkout for each
-backend. The HuggingFace path installs a modified Transformers checkout,
-whereas the vLLM path installs its own official dependency set; do not install
-the HuggingFace integration in the vLLM environment.
+Continue with the [HuggingFace guide](huggingface.md), [vLLM guide](vllm.md),
+or [Megatron-LM guide](megatron.md). Use a separate environment and checkout
+for each backend. The HuggingFace path installs a modified Transformers
+checkout, the vLLM path installs its own official dependency set, and the
+Megatron-LM path installs its version-matched integration and pinned fork. Do
+not mix their framework dependencies in one environment.
 
 The native extension is also environment-specific: its Python suffix, Torch
 ABI, CUDA selection, and runtime paths come from the active environment. Each

@@ -379,21 +379,6 @@ __device__ inline void record_copy_chunk_with_wrap(
     }
 }
 
-// A false record gate still consumes the task reservation made by the host.
-// Publish an empty entry in FIFO order without touching payload state.
-__device__ inline void record_publish_zero_byte_task(RingState& ring) {
-    if (threadIdx.x != 0) return;
-    const uint32_t finished = atomicAdd(&g_block_done_counter, 1);
-    if (finished != gridDim.x - 1) return;
-
-    const uint64_t task_head = *ring.task_head;
-    const TaskEntry entry{};
-    task_publish(ring.task_entries, ring.task_cap, task_head, entry);
-    *ring.task_head = task_head + 1;
-
-    g_block_done_counter = 0;
-}
-
 __device__ inline void record_copy_contiguous(
     uint8_t*       payload_buf,
     const TwoSpan& spans,
@@ -427,10 +412,7 @@ __global__ void record_producer_static_kernel(
     const int32_t*   emit_gate,
     int32_t          emit_value) {
     if (g_ring_null_mode) return;
-    if (!record_emit_allowed(emit_gate, emit_value)) {
-        record_publish_zero_byte_task(ring);
-        return;
-    }
+    if (!record_emit_allowed(emit_gate, emit_value)) return;
 
     const uint64_t gtid = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
@@ -456,10 +438,7 @@ __global__ void record_producer_prefix_kernel(
     const int32_t*   emit_gate,
     int32_t          emit_value) {
     if (g_ring_null_mode) return;
-    if (!record_emit_allowed(emit_gate, emit_value)) {
-        record_publish_zero_byte_task(ring);
-        return;
-    }
+    if (!record_emit_allowed(emit_gate, emit_value)) return;
 
     int64_t rows = *row_count_dev_ptr;
     if (rows < 0) rows = 0;
@@ -494,10 +473,7 @@ __global__ void record_producer_chunked_kernel(
     const int32_t*   emit_gate,
     int32_t          emit_value) {
     if (g_ring_null_mode) return;
-    if (!record_emit_allowed(emit_gate, emit_value)) {
-        record_publish_zero_byte_task(ring);
-        return;
-    }
+    if (!record_emit_allowed(emit_gate, emit_value)) return;
 
     __shared__ int64_t selected[PRODUCER_MAX_K];
     __shared__ int64_t prefix[PRODUCER_MAX_K + 1];
@@ -553,10 +529,7 @@ __global__ void record_producer_seq_prefix_pack_kernel(
     const int32_t*   emit_gate,
     int32_t          emit_value) {
     if (g_ring_null_mode) return;
-    if (!record_emit_allowed(emit_gate, emit_value)) {
-        record_publish_zero_byte_task(ring);
-        return;
-    }
+    if (!record_emit_allowed(emit_gate, emit_value)) return;
     (void)valid_count_dev_ptr;
 
     int64_t encoded_rows = valid_prefix_sum_dev_ptr[batch];
@@ -604,10 +577,7 @@ __global__ void record_producer_segmented_pack_kernel(
     const int32_t*   emit_gate,
     int32_t          emit_value) {
     if (g_ring_null_mode) return;
-    if (!record_emit_allowed(emit_gate, emit_value)) {
-        record_publish_zero_byte_task(ring);
-        return;
-    }
+    if (!record_emit_allowed(emit_gate, emit_value)) return;
 
     const uint64_t input_rows = feature_bytes == 0
         ? 0 : nbytes_upper / feature_bytes;
