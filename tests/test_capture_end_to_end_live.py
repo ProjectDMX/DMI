@@ -23,8 +23,10 @@ Set DMI_S3_ENDPOINT (plus DMI_S3_BUCKET / key env) to include the S3 store.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from os import environ
 from pathlib import Path
+import re
 from uuid import UUID, uuid4
 
 import numpy as np
@@ -336,16 +338,105 @@ def test_a_pinned_watermark_is_isolated_from_a_later_skewed_indexer(tmp_path: Pa
         assert result.indexed_packs == 1, result.failures
 
         # The pinned snapshot must not grow after the fact.
-        at_pin = catalog.get_by_ids(known + [late_id], watermark=pinned)
+        at_pin = catalog.get_by_ids(
+            known + [late_id], tenant_id="tenant-e2e", watermark=pinned
+        )
         assert {item.capture_id for item in at_pin} == set(known)
 
         # A fresh watermark is strictly newer and does see the late capture.
         fresh = catalog.current_watermark()
         assert int(fresh) > int(pinned)
-        at_fresh = catalog.get_by_ids(known + [late_id], watermark=fresh)
+        at_fresh = catalog.get_by_ids(
+            known + [late_id], tenant_id="tenant-e2e", watermark=fresh
+        )
         assert {item.capture_id for item in at_fresh} == set(known) | {late_id}
         page = catalog.search(CaptureQuery(tenant_id="tenant-e2e", limit=100))
         assert late_id in {item.capture_id for item in page.items}
+
+
+class _RecordingClient:
+    """Delegates to a real driver while keeping every statement it saw."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls: list[tuple[str, dict | None]] = []
+
+    def execute(self, query, params=None, **kwargs):
+        self.calls.append((query, params))
+        return self._inner.execute(query, params, **kwargs)
+
+
+def test_selection_resolve_prunes_to_the_tenant_range(tmp_path: Path):
+    """get_by_ids must read a tenant's slice of the index, not the table.
+
+    tenant_id leads the WHERE clause and is the first ORDER BY column, so the
+    primary index has to select fewer granules than the table holds once other
+    tenants dominate the catalog. Without the tenant predicate every selection
+    resolve scanned all of it (and tripped max_rows_to_read at scale).
+    """
+    from benchmarks.bench_capture_catalog import synthetic_descriptors
+
+    with _stack(tmp_path) as env:
+        client, config = env["client"], env["config"]
+
+        # Seed two bulk tenants, each large enough for several granules
+        # (default index_granularity is 8192 rows), so tenant-e2e is a thin
+        # slice of a multi-granule, multi-tenant table.
+        writer = ClickHouseCatalogWriter(client, config)
+        version = writer.allocate_version()
+        rows_per_tenant = 12_000
+        for offset, tenant in enumerate(("tenant-bulk-a", "tenant-bulk-b")):
+            pack_id = str(UUID(int=PACK_ID.int + 100 + offset))
+            bulk = tuple(
+                replace(
+                    item,
+                    metadata=replace(item.metadata, tenant_id=tenant),
+                    locator=replace(item.locator, pack_id=pack_id),
+                )
+                for item in synthetic_descriptors(rows_per_tenant)
+            )
+            writer.write_descriptors(bulk, index_version=version)
+            writer.commit_packs([bulk[0].locator.pack_ref], index_version=version)
+        writer.publish_watermark(
+            index_version=version,
+            published_at_ns=version,
+            indexed_rows=2 * rows_per_tenant,
+            indexed_packs=2,
+        )
+
+        # (a) The selection carries its tenant and resolves end to end.
+        recording = _RecordingClient(client)
+        catalog = ClickHouseCaptureCatalog(
+            recording, ClickHouseReaderConfig.from_catalog(config)
+        )
+        store = env["store"]
+        reader = CaptureReader(
+            catalog, {store.store_id: store}, max_coalesce_gap_bytes=0
+        )
+        selection = reader.select(CaptureQuery(tenant_id="tenant-e2e", limit=100))
+        assert selection.tenant_id == "tenant-e2e"
+        hydrated = reader.hydrate(selection, byte_limit=8 << 20)
+        assert {item.capture_id for item in hydrated} == set(selection.capture_ids)
+
+        # (b) The plan for the resolve statement prunes on the primary key.
+        sql, params = next(
+            (query, sent)
+            for query, sent in recording.calls
+            if "capture_id IN %(capture_ids)s" in query
+        )
+        assert "tenant_id = %(tenant_id)s" in sql
+        plan = "\n".join(
+            row[0] for row in client.execute("EXPLAIN indexes = 1 " + sql, params)
+        )
+        assert "PrimaryKey" in plan, plan
+        # The first Granules line after the PrimaryKey entry is its selection.
+        # Skip-index visibility varies across server versions, so the bloom
+        # filter's own entry is deliberately not pinned here.
+        granules = re.search(r"PrimaryKey.*?Granules:\s*(\d+)/(\d+)", plan, re.S)
+        assert granules is not None, plan
+        selected, total = int(granules.group(1)), int(granules.group(2))
+        assert total > 1, plan  # the seed really did span several granules
+        assert selected < total, plan
 
 
 def test_the_catalog_reports_the_pack_as_committed(tmp_path: Path):

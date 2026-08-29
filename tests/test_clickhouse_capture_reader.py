@@ -270,6 +270,7 @@ def test_get_by_ids_refuses_an_oversized_lookup():
     with pytest.raises(ValueError, match="max_capture_ids"):
         catalog.get_by_ids(
             [f"capture-{index}" for index in range(config.max_capture_ids + 1)],
+            tenant_id="tenant-a",
             watermark=str(_WATERMARK),
         )
 
@@ -279,7 +280,9 @@ def test_get_by_ids_pins_the_watermark_and_parameterises_ids():
     catalog, client = _catalog(descriptors=expected)
 
     resolved = catalog.get_by_ids(
-        [item.capture_id for item in expected], watermark=str(_WATERMARK)
+        [item.capture_id for item in expected],
+        tenant_id="tenant-a",
+        watermark=str(_WATERMARK),
     )
 
     sql, params, _ = client.calls[-1]
@@ -289,10 +292,41 @@ def test_get_by_ids_pins_the_watermark_and_parameterises_ids():
     assert resolved == expected
 
 
+def test_get_by_ids_filters_on_the_tenant_before_anything_else():
+    expected = synthetic_descriptors(1)
+    catalog, client = _catalog(descriptors=expected)
+
+    catalog.get_by_ids(
+        [expected[0].capture_id], tenant_id="tenant-a", watermark=str(_WATERMARK)
+    )
+
+    sql, params, _ = client.calls[-1]
+    # tenant_id is the first ORDER BY column, so leading with it is what lets
+    # the primary index prune the read to one tenant's range instead of
+    # scanning the whole table for a capture_id match.
+    assert "WHERE tenant_id = %(tenant_id)s AND capture_id IN %(capture_ids)s" in sql
+    assert params["tenant_id"] == "tenant-a"
+    # The tenant value is parameterised, never interpolated.
+    assert "tenant-a" not in sql
+
+
+@pytest.mark.parametrize("tenant_id", ("", None, 7))
+def test_get_by_ids_rejects_a_blank_or_non_string_tenant(tenant_id):
+    catalog, client = _catalog()
+
+    with pytest.raises(ValueError, match="tenant_id"):
+        catalog.get_by_ids(
+            ["capture-0"], tenant_id=tenant_id, watermark=str(_WATERMARK)
+        )
+    assert client.calls == []
+
+
 def test_get_by_ids_short_circuits_on_an_empty_request():
     catalog, client = _catalog()
 
-    assert catalog.get_by_ids([], watermark=str(_WATERMARK)) == ()
+    assert (
+        catalog.get_by_ids([], tenant_id="tenant-a", watermark=str(_WATERMARK)) == ()
+    )
     assert client.calls == []
 
 
@@ -301,7 +335,7 @@ def test_get_by_ids_rejects_a_malformed_watermark(watermark: str):
     catalog, _ = _catalog()
 
     with pytest.raises(ValueError, match="watermark"):
-        catalog.get_by_ids(["capture-0"], watermark=watermark)
+        catalog.get_by_ids(["capture-0"], tenant_id="tenant-a", watermark=watermark)
 
 
 @pytest.mark.parametrize(
@@ -380,6 +414,7 @@ def test_capture_reader_selects_through_the_clickhouse_catalog():
 
     assert selection.capture_ids == tuple(item.capture_id for item in expected)
     assert selection.catalog_watermark == str(_WATERMARK)
+    assert selection.tenant_id == "tenant-a"
 
 
 def test_capture_reader_refuses_a_selection_that_spans_pages():
@@ -399,7 +434,9 @@ def test_get_by_ids_matches_commit_membership_on_store_and_pack():
     expected = synthetic_descriptors(1)
     catalog, client = _catalog(descriptors=expected)
 
-    catalog.get_by_ids([expected[0].capture_id], watermark=str(_WATERMARK))
+    catalog.get_by_ids(
+        [expected[0].capture_id], tenant_id="tenant-a", watermark=str(_WATERMARK)
+    )
 
     sql = client.selects[0]
     # Pack identity is (store_id, pack_id); matching pack_id alone would let
@@ -420,7 +457,9 @@ def test_get_by_ids_rejects_an_unpublished_watermark():
     catalog, client = _catalog(descriptors=synthetic_descriptors(1))
 
     with pytest.raises(ValueError, match="published watermark"):
-        catalog.get_by_ids(["capture-0"], watermark=str(_WATERMARK + 1))
+        catalog.get_by_ids(
+            ["capture-0"], tenant_id="tenant-a", watermark=str(_WATERMARK + 1)
+        )
 
     # Nothing was read beyond the watermark log itself.
     assert client.selects == []

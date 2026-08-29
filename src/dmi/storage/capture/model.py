@@ -326,6 +326,13 @@ class CaptureSelection:
     capture_ids: tuple[str, ...]
     catalog_watermark: str
     filter_hash: str
+    # Selections come from tenant-scoped queries, and carrying that identity is
+    # what lets resolving one address the catalog by its primary-key prefix
+    # instead of scanning every tenant for a capture_id match.
+    tenant_id: str
+
+    def __post_init__(self) -> None:
+        _validate_text("tenant_id", self.tenant_id)
 
     @classmethod
     def create(
@@ -335,6 +342,12 @@ class CaptureSelection:
         catalog_watermark: str,
         filter_hash: str,
     ) -> CaptureSelection:
+        if not descriptors:
+            raise ValueError("selection requires at least one capture")
+        tenants = {item.metadata.tenant_id for item in descriptors}
+        if len(tenants) > 1:
+            raise ValueError("selection spans multiple tenants")
+        (tenant_id,) = tenants
         ids = tuple(item.capture_id for item in descriptors)
         seen: set[str] = set()
         for capture_id in ids:
@@ -345,9 +358,10 @@ class CaptureSelection:
             seen.add(capture_id)
         identity = json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "catalog_watermark": catalog_watermark,
                 "filter_hash": filter_hash,
+                "tenant_id": tenant_id,
                 "capture_ids": ids,
             },
             sort_keys=True,
@@ -358,6 +372,7 @@ class CaptureSelection:
             capture_ids=ids,
             catalog_watermark=catalog_watermark,
             filter_hash=filter_hash,
+            tenant_id=tenant_id,
         )
 
 
@@ -410,5 +425,5 @@ class PackStore(Protocol):
 class CaptureCatalog(Protocol):
     def search(self, query: CaptureQuery) -> CapturePage: ...
     def get_by_ids(
-        self, capture_ids: Sequence[str], *, watermark: str
+        self, capture_ids: Sequence[str], *, tenant_id: str, watermark: str
     ) -> Sequence[CaptureDescriptor]: ...

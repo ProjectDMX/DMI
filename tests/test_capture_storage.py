@@ -261,10 +261,14 @@ class _Catalog(CaptureCatalog):
         )[: query.limit]
         return CapturePage(items=items, next_cursor=None, watermark="catalog-7")
 
-    def get_by_ids(self, capture_ids, *, watermark):
+    def get_by_ids(self, capture_ids, *, tenant_id, watermark):
         assert watermark == "catalog-7"
         wanted = set(capture_ids)
-        return tuple(item for item in self._descriptors if item.capture_id in wanted)
+        return tuple(
+            item
+            for item in self._descriptors
+            if item.capture_id in wanted and item.metadata.tenant_id == tenant_id
+        )
 
 
 class _RecordingStore(FilesystemPackStore):

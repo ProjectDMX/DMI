@@ -220,6 +220,7 @@ class CaptureReader:
     def _resolve(self, selection: CaptureSelection) -> tuple[CaptureDescriptor, ...]:
         resolved = self._catalog.get_by_ids(
             selection.capture_ids,
+            tenant_id=selection.tenant_id,
             watermark=selection.catalog_watermark,
         )
         by_id: dict[str, CaptureDescriptor] = {}

@@ -132,9 +132,13 @@ class _Catalog:
             items=self._descriptors[: query.limit], next_cursor=None, watermark="1"
         )
 
-    def get_by_ids(self, capture_ids, *, watermark):
+    def get_by_ids(self, capture_ids, *, tenant_id, watermark):
         wanted = set(capture_ids)
-        return tuple(i for i in self._descriptors if i.capture_id in wanted)
+        return tuple(
+            i
+            for i in self._descriptors
+            if i.capture_id in wanted and i.metadata.tenant_id == tenant_id
+        )
 
 
 def build_manifest() -> dict[str, Any]:

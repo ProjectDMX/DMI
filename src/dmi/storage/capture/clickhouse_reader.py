@@ -200,13 +200,15 @@ class ClickHouseCaptureCatalog:
         )
 
     def get_by_ids(
-        self, capture_ids: Sequence[str], *, watermark: str
+        self, capture_ids: Sequence[str], *, tenant_id: str, watermark: str
     ) -> tuple[CaptureDescriptor, ...]:
         if len(capture_ids) > self._config.max_capture_ids:
             raise ValueError(
                 f"capture id lookup exceeds max_capture_ids: "
                 f"{len(capture_ids)} > {self._config.max_capture_ids}"
             )
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise ValueError("tenant_id must be a non-empty string")
         if not capture_ids:
             return ()
         requested = _parse_watermark(watermark)
@@ -221,11 +223,19 @@ class ClickHouseCaptureCatalog:
             )
         params = {
             "watermark": requested,
+            "tenant_id": tenant_id,
             "capture_ids": list(capture_ids),
         }
+        # tenant_id leads the WHERE clause because it is the first ORDER BY
+        # column: without it, a capture_id-only filter -- the LAST sort-key
+        # column -- prunes nothing, and every lookup scans the whole table
+        # (then trips max_rows_to_read once the catalog is large). With it,
+        # the primary index narrows the read to one tenant's range, and the
+        # capture_id bloom-filter skip index prunes granules inside it.
         sql = (
             f"SELECT {self._projection()} FROM {self._qualified()} "
-            "WHERE capture_id IN %(capture_ids)s AND (store_id, pack_id) IN "
+            "WHERE tenant_id = %(tenant_id)s AND "
+            "capture_id IN %(capture_ids)s AND (store_id, pack_id) IN "
             f"(SELECT store_id, pack_id FROM {self._qualified(self._commit_log)} "
             "WHERE index_version <= %(watermark)s) "
             f"GROUP BY {', '.join(_quoted(name) for name in _SORT_KEY)}"

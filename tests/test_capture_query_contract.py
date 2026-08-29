@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 
@@ -138,3 +138,62 @@ def test_selection_identity_separates_watermarks():
     )
 
     assert first.selection_id != second.selection_id
+
+
+def test_selection_carries_the_tenant_of_its_descriptors():
+    descriptors = synthetic_descriptors(2)
+
+    selection = CaptureSelection.create(
+        descriptors, catalog_watermark="w-1", filter_hash=_query().filter_hash
+    )
+
+    assert selection.tenant_id == descriptors[0].metadata.tenant_id
+
+
+def test_selection_identity_separates_tenants():
+    descriptors = synthetic_descriptors(2)
+    retenanted = tuple(
+        replace(item, metadata=replace(item.metadata, tenant_id="tenant-z"))
+        for item in descriptors
+    )
+    filter_hash = _query().filter_hash
+
+    first = CaptureSelection.create(
+        descriptors, catalog_watermark="w-1", filter_hash=filter_hash
+    )
+    second = CaptureSelection.create(
+        retenanted, catalog_watermark="w-1", filter_hash=filter_hash
+    )
+
+    # Identity v3: the tenant participates in selection_id, so the same
+    # capture ids under another tenant are a different selection.
+    assert first.selection_id != second.selection_id
+
+
+def test_selection_refuses_descriptors_spanning_tenants():
+    first, second = synthetic_descriptors(2)
+    foreign = replace(second, metadata=replace(second.metadata, tenant_id="tenant-z"))
+
+    with pytest.raises(ValueError, match="spans multiple tenants"):
+        CaptureSelection.create(
+            (first, foreign), catalog_watermark="w-1", filter_hash=_query().filter_hash
+        )
+
+
+def test_selection_refuses_an_empty_descriptor_set():
+    # No descriptors means no tenant to bind the lookup to.
+    with pytest.raises(ValueError, match="at least one capture"):
+        CaptureSelection.create(
+            (), catalog_watermark="w-1", filter_hash=_query().filter_hash
+        )
+
+
+def test_selection_validates_its_tenant_like_any_text_field():
+    with pytest.raises(ValueError, match="tenant_id"):
+        CaptureSelection(
+            selection_id="s" * 64,
+            capture_ids=("capture-0",),
+            catalog_watermark="w-1",
+            filter_hash="f" * 64,
+            tenant_id="",
+        )

@@ -167,11 +167,36 @@ def test_ensure_schema_upgrades_pre_facet_tables_idempotently():
     writer.ensure_schema()
 
     alters = [call[0] for call in client.calls if call[0].startswith("ALTER TABLE")]
-    assert len(alters) == len(_FACET_COLUMNS)
-    for statement in alters:
+    column_alters = [item for item in alters if "ADD COLUMN" in item]
+    assert len(column_alters) == len(_FACET_COLUMNS)
+    for statement in column_alters:
         # Without IF NOT EXISTS a second start would fail on an upgraded table.
         assert "ADD COLUMN IF NOT EXISTS" in statement
         assert "`default`.`dmi_capture_raw`" in statement
+
+
+def test_ensure_schema_adds_a_bloom_filter_index_on_capture_id():
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    writer.ensure_schema()
+
+    alters = [call[0] for call in client.calls if call[0].startswith("ALTER TABLE")]
+    # Point lookups arrive with tenant + capture_id; the primary key prunes to
+    # the tenant range and the bloom filter prunes granules within it.
+    added = [item for item in alters if "ADD INDEX" in item]
+    assert added == [
+        "ALTER TABLE `default`.`dmi_capture_raw` ADD INDEX IF NOT EXISTS "
+        "capture_id_bloom capture_id TYPE bloom_filter(0.01) GRANULARITY 4"
+    ]
+    # Existing parts only get the index through MATERIALIZE; new parts are
+    # indexed at insert.
+    materialized = [item for item in alters if "MATERIALIZE INDEX" in item]
+    assert materialized == [
+        "ALTER TABLE `default`.`dmi_capture_raw` MATERIALIZE INDEX capture_id_bloom"
+    ]
+    # And the index lands after the ADD, never before it.
+    assert alters.index(added[0]) < alters.index(materialized[0])
 
 
 def test_facets_never_collide_with_an_inserted_column():

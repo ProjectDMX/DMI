@@ -132,12 +132,17 @@ def test_a_merge_does_not_destroy_a_pinned_snapshot():
         _commit(writer, corpus, 2)
         _publish(writer, 2)
 
-        before = reader.get_by_ids([corpus[0].capture_id], watermark="1")
+        tenant = corpus[0].metadata.tenant_id
+        before = reader.get_by_ids(
+            [corpus[0].capture_id], tenant_id=tenant, watermark="1"
+        )
         assert len(before) == 1, "precondition: the pinned read works pre-merge"
 
         _merge(client, config)
 
-        after = reader.get_by_ids([corpus[0].capture_id], watermark="1")
+        after = reader.get_by_ids(
+            [corpus[0].capture_id], tenant_id=tenant, watermark="1"
+        )
         assert len(after) == 1, (
             "a pinned watermark stopped resolving after a merge: "
             f"raw rows went to {_raw_rows(client, config)}"
@@ -172,12 +177,32 @@ def test_a_pack_committed_after_the_watermark_is_not_visible():
         _merge(client, config)
 
         # The pinned snapshot sees the early pack and nothing after it.
-        assert len(reader.get_by_ids([early[0].capture_id], watermark=pinned)) == 1
-        assert reader.get_by_ids([later[0].capture_id], watermark=pinned) == ()
+        tenant = early[0].metadata.tenant_id
+        assert (
+            len(
+                reader.get_by_ids(
+                    [early[0].capture_id], tenant_id=tenant, watermark=pinned
+                )
+            )
+            == 1
+        )
+        assert (
+            reader.get_by_ids(
+                [later[0].capture_id], tenant_id=tenant, watermark=pinned
+            )
+            == ()
+        )
 
         # And the later watermark sees both.
         current = reader.current_watermark()
-        assert len(reader.get_by_ids([later[0].capture_id], watermark=current)) == 1
+        assert (
+            len(
+                reader.get_by_ids(
+                    [later[0].capture_id], tenant_id=tenant, watermark=current
+                )
+            )
+            == 1
+        )
 
 
 def test_a_walk_still_completes_after_a_merge_mid_pagination():
@@ -265,7 +290,14 @@ def test_a_watermark_below_every_row_returns_nothing():
         _commit(writer, corpus, 10)
         _publish(writer, 10)
 
-        assert reader.get_by_ids([corpus[0].capture_id], watermark="9") == ()
+        assert (
+            reader.get_by_ids(
+                [corpus[0].capture_id],
+                tenant_id=corpus[0].metadata.tenant_id,
+                watermark="9",
+            )
+            == ()
+        )
 
 
 def test_an_empty_catalog_reports_a_zero_watermark():

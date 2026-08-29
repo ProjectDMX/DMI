@@ -144,6 +144,21 @@ ORDER BY (store_id, pack_id)"""
                 f"{name} {kind} MATERIALIZED {expression}"
             )
 
+        # Point lookups arrive with tenant + capture_id. The primary key
+        # prunes to the tenant's range, but capture_id is the LAST ORDER BY
+        # column, so inside a large tenant the primary index cannot narrow
+        # further; the bloom filter prunes granules within that range.
+        self._client.execute(
+            f"ALTER TABLE {capture_raw} ADD INDEX IF NOT EXISTS "
+            "capture_id_bloom capture_id TYPE bloom_filter(0.01) GRANULARITY 4"
+        )
+        # Parts written after ADD INDEX are indexed at insert; MATERIALIZE
+        # builds it for the parts that already exist, and is a no-op once
+        # they are covered, so this is safe on every start.
+        self._client.execute(
+            f"ALTER TABLE {capture_raw} MATERIALIZE INDEX capture_id_bloom"
+        )
+
         # A version becomes readable only once its whole batch is durable, so
         # the watermark cannot be derived from the descriptor table: a reader
         # sampling max(index_version) there sees a version mid-batch, between

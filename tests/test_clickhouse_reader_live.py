@@ -158,13 +158,19 @@ def test_replay_is_invisible_because_it_rewrites_identical_descriptors():
         writer.write_descriptors(corpus, index_version=1)
         _commit(writer, corpus, 1)
         _publish(writer, 1)
-        at_first = reader.get_by_ids([corpus[0].capture_id], watermark="1")
+        at_first = reader.get_by_ids(
+            [corpus[0].capture_id],
+            tenant_id=corpus[0].metadata.tenant_id,
+            watermark="1",
+        )
 
         writer.write_descriptors(corpus, index_version=2)
         _commit(writer, corpus, 2)
         _publish(writer, 2)
         at_second = reader.get_by_ids(
-            [corpus[0].capture_id], watermark=reader.current_watermark()
+            [corpus[0].capture_id],
+            tenant_id=corpus[0].metadata.tenant_id,
+            watermark=reader.current_watermark(),
         )
 
         assert at_first == at_second, "a replay changed a descriptor"
@@ -193,7 +199,11 @@ def test_get_by_ids_resolves_a_selection_at_its_watermark():
         page = reader.search(CaptureQuery(limit=20))
         wanted = [item.capture_id for item in page.items[:5]]
 
-        resolved = reader.get_by_ids(wanted, watermark=page.watermark)
+        resolved = reader.get_by_ids(
+            wanted,
+            tenant_id=corpus[0].metadata.tenant_id,
+            watermark=page.watermark,
+        )
 
         assert {item.capture_id for item in resolved} == set(wanted)
 
