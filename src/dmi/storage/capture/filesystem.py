@@ -63,6 +63,34 @@ def fsync_path_to_root(leaf: Path, root: Path) -> None:
         current = parent
 
 
+def fsync_new_root(root: Path) -> None:
+    """Make a possibly just-created root directory durable.
+
+    ``mkdir(parents=True, exist_ok=True)`` returns before either the new
+    directory or the parent entry naming it reaches disk, so a store or spool
+    root could vanish on power loss after construction reported success. The
+    root itself must fsync. Its entry lives in the parent directory, which is
+    fsynced best-effort only: the parent is often outside the caller's control
+    (a system temp directory, a mount point) and may deny opening -- raising
+    on EACCES there would refuse service over a directory this process never
+    promised durability for, while an openable parent still gets synced.
+    """
+
+    fd = os.open(root, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        parent_fd = os.open(root.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def validate_pack_source(pack: PackSource) -> None:
     if not isinstance(pack, PackSource):
         raise TypeError("pack must implement PackSource")
@@ -151,6 +179,7 @@ class FilesystemPackStore:
             raise ValueError("store_id must be non-empty and at most 128 bytes")
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        fsync_new_root(self.root)
         self.store_id = store_id
 
     @staticmethod
@@ -211,7 +240,14 @@ class FilesystemPackStore:
         path = self._path(object_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
-            return self._existing_ref(pack, object_key, path)
+            ref = self._existing_ref(pack, object_key, path)
+            # The writer that linked this object may not have fsynced the
+            # directory chain yet (or crashed before it could), so returning
+            # its ref without syncing would acknowledge a dirent power loss
+            # can still drop. Re-syncing an already-durable chain is cheap
+            # and idempotent.
+            fsync_path_to_root(path.parent, self.root)
+            return ref
 
         temp_path: Path | None = None
         try:
@@ -229,7 +265,12 @@ class FilesystemPackStore:
             try:
                 os.link(temp_path, path)
             except FileExistsError:
-                return self._existing_ref(pack, object_key, path)
+                ref = self._existing_ref(pack, object_key, path)
+                # Same as the exists() branch above: the link-race winner may
+                # not have made the dirent durable before this loser
+                # acknowledges it.
+                fsync_path_to_root(path.parent, self.root)
+                return ref
             fsync_path_to_root(path.parent, self.root)
         finally:
             if temp_path is not None:

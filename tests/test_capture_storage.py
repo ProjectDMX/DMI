@@ -284,7 +284,12 @@ class _RecordingStore(FilesystemPackStore):
 
 class _ShortReadStore(_RecordingStore):
     def read_range(self, ref, offset, length):
-        return super().read_range(ref, offset, length)[:-1]
+        data = super().read_range(ref, offset, length)
+        # The footer-binding reads (trailer + footer) come first and must be
+        # whole, so hydration reaches the payload read this store shortens.
+        if len(self.ranges) <= 2:
+            return data
+        return data[:-1]
 
 
 def test_selection_is_stable_and_rejects_duplicate_logical_captures(tmp_path: Path):
@@ -345,7 +350,13 @@ def test_reader_coalesces_ranges_and_enforces_fetch_budget(tmp_path: Path):
 
     assert [item.capture_id for item in hydrated] == ["capture-a", "capture-b"]
     assert [item.payload for item in hydrated] == [first_payload, second_payload]
+    # Hydration first binds the catalog descriptors to the pack footer (two
+    # small range reads: trailer, then footer), then fetches the one
+    # coalesced payload range the estimate priced.
+    trailer_size = PackIndex.trailer_size()
     assert store.ranges == [
+        (len(sealed.data) - trailer_size, trailer_size),
+        (sealed.footer_offset, len(sealed.data) - trailer_size - sealed.footer_offset),
         (descriptors[0].locator.offset, estimate.request_bytes),
     ]
 
@@ -420,6 +431,134 @@ def test_reader_detects_corruption_in_a_partial_range(tmp_path: Path):
         reader.hydrate(selection, byte_limit=descriptor.locator.stored_length)
 
 
+def test_hydration_rejects_a_catalog_row_that_re_describes_the_tensor(
+    tmp_path: Path,
+):
+    """A re-described catalog row must not decode garbage.
+
+    verify_payload checks length and CRC32 of the bytes only, so a catalog
+    row claiming int32 (1, 2) for a payload the footer says is float32 (2,)
+    -- same bytes, same CRC, same logical_bytes -- passed every check and
+    decoded garbage. Hydration must bind the row to the authoritative footer
+    before any payload is read.
+    """
+    store = _RecordingStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00\x00\x80?\x00\x00\x00@"))
+    ref = store.put(sealed, "packs/a.dmi-pack")
+    descriptor = PackReader.from_bytes(sealed.data).descriptors(
+        store_id=ref.store_id, object_key=ref.object_key
+    )[0]
+    lying = replace(
+        descriptor,
+        metadata=replace(descriptor.metadata, dtype="int32", shape=(1, 2)),
+    )
+    reader = CaptureReader(_Catalog((lying,)), {"local": store})
+    selection = reader.select(CaptureQuery(limit=10))
+
+    with pytest.raises(
+        PackFormatError,
+        match="does not match the pack footer: metadata for capture-a",
+    ):
+        reader.hydrate(selection, byte_limit=1 << 20)
+
+    # The mismatch is caught pre-payload: only the trailer and footer were
+    # read, never the record bytes.
+    trailer_size = PackIndex.trailer_size()
+    assert store.ranges == [
+        (len(sealed.data) - trailer_size, trailer_size),
+        (sealed.footer_offset, len(sealed.data) - trailer_size - sealed.footer_offset),
+    ]
+
+
+def test_hydration_rejects_a_catalog_locator_contradicting_the_footer(
+    tmp_path: Path,
+):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    ref = store.put(sealed, "packs/a.dmi-pack")
+    descriptor = PackReader.from_bytes(sealed.data).descriptors(
+        store_id=ref.store_id, object_key=ref.object_key
+    )[0]
+    lying = replace(
+        descriptor, locator=replace(descriptor.locator, checksum="00000000")
+    )
+    reader = CaptureReader(_Catalog((lying,)), {"local": store})
+    selection = reader.select(CaptureQuery(limit=10))
+
+    with pytest.raises(
+        PackFormatError,
+        match="does not match the pack footer: locator for capture-a",
+    ):
+        reader.hydrate(selection, byte_limit=1 << 20)
+
+
+def test_hydration_rejects_a_catalog_capture_absent_from_the_footer(
+    tmp_path: Path,
+):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    ref = store.put(sealed, "packs/a.dmi-pack")
+    descriptor = PackReader.from_bytes(sealed.data).descriptors(
+        store_id=ref.store_id, object_key=ref.object_key
+    )[0]
+    renamed = replace(
+        descriptor, metadata=replace(descriptor.metadata, capture_id="capture-x")
+    )
+    reader = CaptureReader(_Catalog((renamed,)), {"local": store})
+    selection = reader.select(CaptureQuery(limit=10))
+
+    with pytest.raises(PackFormatError, match="capture-x is not in pack"):
+        reader.hydrate(selection, byte_limit=1 << 20)
+
+
+def test_hydration_fetches_the_footer_once_per_pack(tmp_path: Path):
+    store = _RecordingStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(
+        _record("capture-a", b"\x00" * 8),
+        _record("capture-b", b"\x01" * 8, step=1),
+    )
+    ref = store.put(sealed, "packs/a.dmi-pack")
+    descriptors = PackReader.from_bytes(sealed.data).descriptors(
+        store_id=ref.store_id, object_key=ref.object_key
+    )
+    reader = CaptureReader(_Catalog(descriptors), {"local": store})
+    selection = reader.select(CaptureQuery(limit=10))
+
+    reader.hydrate(selection, byte_limit=1 << 20)
+    reader.hydrate(selection, byte_limit=1 << 20)
+
+    trailer_offset = len(sealed.data) - PackIndex.trailer_size()
+    trailer_reads = [item for item in store.ranges if item[0] == trailer_offset]
+    assert len(trailer_reads) == 1, "the second hydration must hit the cache"
+    assert list(reader._footer_cache) == [(ref.store_id, ref.pack_id, ref.checksum)]
+
+
+def test_the_footer_cache_evicts_its_least_recent_pack(tmp_path: Path):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    descriptors = []
+    for index, capture_id in enumerate(("capture-a", "capture-b"), start=1):
+        writer = PackWriter(
+            pack_id=UUID(int=index),
+            created_at_ns=1_700_000_000_000_000_000,
+            max_pack_bytes=1024 * 1024,
+        )
+        writer.append(_record(capture_id, b"\x00" * 8, step=index))
+        sealed = writer.seal()
+        ref = store.put(sealed, f"packs/{index}.dmi-pack")
+        descriptors.extend(
+            PackReader.from_bytes(sealed.data).descriptors(
+                store_id=ref.store_id, object_key=ref.object_key
+            )
+        )
+    reader = CaptureReader(_Catalog(tuple(descriptors)), {"local": store})
+    reader._footer_cache_limit = 1
+    selection = reader.select(CaptureQuery(limit=10))
+
+    reader.hydrate(selection, byte_limit=1 << 20)
+
+    assert len(reader._footer_cache) == 1
+
+
 def test_verify_pack_source_checks_the_stream_against_its_own_checksum():
     """The standalone utility: a full read-and-hash of a pack source.
 
@@ -445,6 +584,102 @@ def test_verify_pack_source_checks_the_stream_against_its_own_checksum():
 
     with pytest.raises(PackIntegrityError, match="checksum"):
         verify_pack_source(_Lying())
+
+
+def test_put_fsyncs_the_chain_before_acknowledging_an_existing_object(
+    tmp_path: Path, monkeypatch
+):
+    """The exists() fast path must not acknowledge a dirent nobody synced.
+
+    The writer that linked the object may not have reached its
+    fsync_path_to_root yet (or crashed before it), so a second put() that
+    finds the object and returns without syncing acknowledges a pack a power
+    loss can still drop.
+    """
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    synced: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        "dmi.storage.capture.filesystem.fsync_path_to_root",
+        lambda leaf, root: synced.append((leaf, root)),
+    )
+    expected = (store.root / "packs", store.root)
+
+    store.put(sealed, "packs/a.dmi-pack")
+    assert synced == [expected], "the writing path itself must sync the chain"
+
+    ref = store.put(sealed, "packs/a.dmi-pack")
+
+    assert ref.checksum == sealed.checksum
+    assert synced == [expected, expected]
+
+
+def test_the_link_race_loser_fsyncs_the_winners_dirent_before_acknowledging(
+    tmp_path: Path, monkeypatch
+):
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    synced: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        "dmi.storage.capture.filesystem.fsync_path_to_root",
+        lambda leaf, root: synced.append((leaf, root)),
+    )
+
+    def concurrent_link(src, dst, *args, **kwargs):
+        # The winner has linked its dirent but not yet fsynced anything.
+        Path(dst).write_bytes(sealed.data)
+        raise FileExistsError(dst)
+
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.link", concurrent_link)
+
+    ref = store.put(sealed, "packs/a.dmi-pack")
+
+    assert ref.checksum == sealed.checksum
+    assert synced == [(store.root / "packs", store.root)]
+
+
+def test_a_new_store_root_is_fsynced_at_construction(tmp_path: Path, monkeypatch):
+    import os
+
+    synced: list[Path] = []
+    real_fsync = os.fsync
+
+    def record(fd: int) -> None:
+        synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        real_fsync(fd)
+
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.fsync", record)
+    root = (tmp_path / "store").resolve()
+
+    FilesystemPackStore(root, store_id="local")
+
+    # mkdir(parents=True) returned before the new root or the parent entry
+    # naming it hit disk; both must be synced before the store reports ready.
+    assert synced == [root, root.parent]
+
+
+def test_a_new_root_survives_a_parent_that_cannot_be_opened(
+    tmp_path: Path, monkeypatch
+):
+    import errno
+    import os
+
+    from dmi.storage.capture.filesystem import fsync_new_root
+
+    root = (tmp_path / "store").resolve()
+    root.mkdir()
+    real_open = os.open
+
+    def deny_parent(path, flags, *args, **kwargs):
+        if Path(path) == root.parent:
+            raise PermissionError(errno.EACCES, "denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.open", deny_parent)
+
+    # Best effort on the parent only: a system temp directory may deny the
+    # open, and that must not refuse construction -- the root still syncs.
+    fsync_new_root(root)
 
 
 def test_fsync_path_to_root_covers_every_new_directory(tmp_path: Path, monkeypatch):

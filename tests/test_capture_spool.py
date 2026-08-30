@@ -270,6 +270,26 @@ def test_transport_classifier_returns_false_without_botocore(monkeypatch):
     assert _is_transient_transport_error(RuntimeError("unreachable")) is False
 
 
+def test_a_new_spool_root_is_fsynced_at_construction(tmp_path: Path, monkeypatch):
+    import os
+
+    synced: list[Path] = []
+    real_fsync = os.fsync
+
+    def record(fd: int) -> None:
+        synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        real_fsync(fd)
+
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.fsync", record)
+    root = (tmp_path / "spool").resolve()
+
+    DurablePackSpool(root, max_bytes=1024)
+
+    # Same root-creation gap as FilesystemPackStore: the spool's whole
+    # durability promise hangs off a root mkdir() alone never made durable.
+    assert synced == [root, root.parent]
+
+
 def test_spool_rejects_a_non_positive_byte_budget(tmp_path: Path):
     with pytest.raises(ValueError, match="max_bytes"):
         DurablePackSpool(tmp_path / "spool", max_bytes=0)
@@ -393,6 +413,95 @@ def test_quarantine_tolerates_a_file_already_gone(tmp_path: Path):
     spool._quarantine(spool.root / "ghost.dmi-pack.ready")
 
     assert tuple(spool.root.iterdir()) == ()
+
+
+def test_recover_does_not_erase_accounting_for_a_pack_staged_mid_pass(
+    tmp_path: Path, monkeypatch
+):
+    """recover() validates without the lock, so a stage() may land mid-pass.
+
+    The pass's aggregate is then stale: assigning it unconditionally erases
+    the concurrent stage's accounting, and the next over-budget stage()
+    overfills the spool instead of raising SpoolFullError.
+    """
+    import threading
+
+    first, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    second, _ = _sealed("018f0000-0000-7000-8000-000000000002", "capture-b")
+    third, _ = _sealed("018f0000-0000-7000-8000-000000000003", "capture-c")
+    budget = len(first.data) + len(second.data) + len(third.data) - 1
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=budget)
+    spool.stage(first, f"packs/{first.pack_id}.dmi-pack")
+
+    in_checksum = threading.Event()
+    release = threading.Event()
+    real_checksum = FilesystemPackStore._checksum
+
+    def gated(path):
+        in_checksum.set()
+        assert release.wait(timeout=10)
+        return real_checksum(path)
+
+    monkeypatch.setattr(DurablePackSpool, "_checksum", staticmethod(gated))
+
+    recovering = threading.Thread(target=spool.recover)
+    recovering.start()
+    try:
+        assert in_checksum.wait(timeout=10)
+        # The reviewer's repro: recovery is blocked mid-checksum, a second
+        # pack is staged, then recovery finishes and assigns its aggregate.
+        spool.stage(second, f"packs/{second.pack_id}.dmi-pack")
+    finally:
+        release.set()
+        recovering.join(timeout=10)
+    assert not recovering.is_alive()
+
+    snapshot = spool.snapshot()
+    assert snapshot.entries == 2
+    assert snapshot.bytes == len(first.data) + len(second.data)
+    with pytest.raises(SpoolFullError, match="spool byte limit"):
+        spool.stage(third, f"packs/{third.pack_id}.dmi-pack")
+
+
+def test_recover_falls_back_to_a_locked_pass_under_constant_churn(
+    tmp_path: Path, monkeypatch
+):
+    """When every optimistic pass is invalidated, the last one holds the lock.
+
+    A corrupt ready file planted during the final optimistic pass also proves
+    the locked pass still quarantines -- without trying to retake the lock it
+    already holds.
+    """
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+    bogus = spool.root / "bogus.dmi-pack.ready"
+    real_checksum = FilesystemPackStore._checksum
+    calls = {"count": 0}
+
+    def churning(path):
+        calls["count"] += 1
+        # Simulate an accounting mutation landing during every unlocked
+        # pass. Once the final pass holds the lock this acquire fails, so
+        # that pass cannot be invalidated.
+        if spool._lock.acquire(blocking=False):
+            try:
+                spool._mutation_generation += 1
+            finally:
+                spool._lock.release()
+        if calls["count"] == 8:
+            bogus.write_bytes(b"junk")
+        return real_checksum(path)
+
+    monkeypatch.setattr(DurablePackSpool, "_checksum", staticmethod(churning))
+
+    recovered = spool.recover()
+
+    assert calls["count"] == 9, "8 optimistic passes, then the locked one"
+    assert [entry.pack_id for entry in recovered] == [staged.pack_id]
+    assert not bogus.exists()
+    assert bogus.with_suffix(".quarantined").exists()
+    assert spool.snapshot().bytes == len(pack.data)
 
 
 # --- removal edge cases ----------------------------------------------------------------

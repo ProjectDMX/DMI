@@ -16,6 +16,7 @@ from typing import BinaryIO, Callable, Mapping
 from .filesystem import (
     FilesystemPackStore,
     copy_pack_source,
+    fsync_new_root,
     fsync_path_to_root,
     validate_object_key,
     validate_pack_source,
@@ -57,6 +58,11 @@ class SpoolFullError(RuntimeError):
     pass
 
 
+# Optimistic recovery passes before recover() falls back to holding the lock
+# for one final, necessarily consistent pass.
+_RECOVER_ATTEMPTS = 8
+
+
 @dataclass(frozen=True, slots=True)
 class SpoolSnapshot:
     entries: int
@@ -85,8 +91,14 @@ class DurablePackSpool:
             raise ValueError("max_bytes must be positive")
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        fsync_new_root(self.root)
         self.max_bytes = max_bytes
         self._lock = threading.Lock()
+        # Incremented under the lock by every accounting mutation (stage,
+        # remove, quarantine, recovery commit). recover() validates entries
+        # without the lock, so this is what tells it whether the aggregate it
+        # computed is still the truth when it comes back to assign it.
+        self._mutation_generation = 0
         ready = tuple(self.root.rglob("*.dmi-pack.ready"))
         stale = tuple(self.root.rglob("*.open"))
         self._bytes = sum(path.lstat().st_size for path in (*ready, *stale))
@@ -142,16 +154,47 @@ class DurablePackSpool:
             self._bytes += pack.object_bytes
             self._entries += 1
             self._peak_bytes = max(self._peak_bytes, self._bytes)
+            self._mutation_generation += 1
             return self._entry(ready)
 
     def recover(self) -> tuple[StagedPack, ...]:
+        # Per-entry validation re-hashes every ready file, so it must run
+        # without the lock -- holding it would block stage() behind a full
+        # re-hash of the backlog. That leaves the final accounting assignment
+        # racing any stage()/remove() that lands mid-pass: assigning the
+        # pass's aggregate would erase their updates and defeat max_bytes.
+        # Each pass therefore records the mutation generation with its
+        # listing and only assigns if nothing moved; otherwise it re-runs,
+        # and after _RECOVER_ATTEMPTS optimistic tries the last pass holds
+        # the lock throughout, which cannot race but may briefly stall
+        # staging behind the re-hash.
+        for _ in range(_RECOVER_ATTEMPTS):
+            with self._lock:
+                generation = self._mutation_generation
+                paths = self._begin_recovery_locked()
+            entries = self._validate_ready(paths, locked=False)
+            with self._lock:
+                if self._mutation_generation != generation:
+                    continue
+                self._commit_recovery_locked(entries)
+            return tuple(entries)
         with self._lock:
-            stale = tuple(self.root.rglob("*.open"))
-            for path in stale:
-                path.unlink(missing_ok=True)
-            for parent in {path.parent for path in stale}:
-                self._fsync_directory(parent)
-            paths = tuple(sorted(self.root.rglob("*.dmi-pack.ready")))
+            paths = self._begin_recovery_locked()
+            entries = self._validate_ready(paths, locked=True)
+            self._commit_recovery_locked(entries)
+        return tuple(entries)
+
+    def _begin_recovery_locked(self) -> tuple[Path, ...]:
+        stale = tuple(self.root.rglob("*.open"))
+        for path in stale:
+            path.unlink(missing_ok=True)
+        for parent in {path.parent for path in stale}:
+            self._fsync_directory(parent)
+        return tuple(sorted(self.root.rglob("*.dmi-pack.ready")))
+
+    def _validate_ready(
+        self, paths: tuple[Path, ...], *, locked: bool
+    ) -> list[StagedPack]:
         entries: list[StagedPack] = []
         for path in paths:
             # Validate each entry independently. One corrupt file must not
@@ -166,25 +209,31 @@ class DurablePackSpool:
                 continue
             except (PackIntegrityError, ValueError):
                 if path.exists():
-                    self._quarantine(path)
+                    self._quarantine(path, locked=locked)
                 continue
             if checksum != entry.checksum:
-                self._quarantine(path)
+                self._quarantine(path, locked=locked)
                 continue
             entries.append(entry)
-        with self._lock:
-            self._bytes = sum(entry.object_bytes for entry in entries)
-            self._entries = len(entries)
-            self._peak_bytes = max(self._peak_bytes, self._bytes)
-        return tuple(entries)
+        return entries
 
-    def _quarantine(self, path: Path) -> None:
+    def _commit_recovery_locked(self, entries: list[StagedPack]) -> None:
+        self._bytes = sum(entry.object_bytes for entry in entries)
+        self._entries = len(entries)
+        self._peak_bytes = max(self._peak_bytes, self._bytes)
+        self._mutation_generation += 1
+
+    def _quarantine(self, path: Path, *, locked: bool = False) -> None:
         """Sideline a ready file that failed integrity validation.
 
         The bytes are kept for diagnosis but the ``.ready`` suffix is
         dropped, so later passes neither upload the file nor fail on it.
         Quarantined files are no longer counted against ``max_bytes``;
         cleaning them up is an operator action.
+
+        ``locked`` says whether the caller already holds ``self._lock``:
+        removing a ready file is an accounting mutation, so the generation
+        must move either way, and the lock is not reentrant.
         """
 
         target = path.with_suffix(".quarantined")
@@ -193,6 +242,11 @@ class DurablePackSpool:
         except FileNotFoundError:
             return
         self._fsync_directory(path.parent)
+        if locked:
+            self._mutation_generation += 1
+        else:
+            with self._lock:
+                self._mutation_generation += 1
 
     def remove(self, staged: StagedPack) -> None:
         if staged.path.is_symlink():
@@ -212,6 +266,7 @@ class DurablePackSpool:
             self._fsync_directory(path.parent)
             self._bytes -= staged.object_bytes
             self._entries -= 1
+            self._mutation_generation += 1
 
     def snapshot(self) -> SpoolSnapshot:
         with self._lock:
