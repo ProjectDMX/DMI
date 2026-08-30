@@ -36,6 +36,7 @@ def test_duplicate_catalog_replay_is_logically_deduplicated():
         # down a partial or empty schema is safe.
         schema_created = True
         writer.ensure_schema()
+        writer.acquire_publisher_lease("catalog-suite")
         for version in (1, 2):
             writer.write_descriptors([descriptor], index_version=version)
             # The publish is what admits the pack to the public view, which is
@@ -70,6 +71,7 @@ def test_duplicate_catalog_replay_is_logically_deduplicated():
                 ("TABLE", "capture_raw"),
                 ("TABLE", "pack_inventory_raw"),
                 ("TABLE", "capture_version_claims"),
+                ("TABLE", "publisher_lease"),
                 ("TABLE", "index_watermark"),
                 ("TABLE", "snapshot_manifest"),
                 ("TABLE", "schema_version"),

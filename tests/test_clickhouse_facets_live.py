@@ -51,7 +51,8 @@ def _writer():
         table_prefix=prefix,
     )
     try:
-        yield ClickHouseCatalogWriter(client, config), client, config
+        writer = ClickHouseCatalogWriter(client, config)
+        yield writer, client, config
     finally:
         database = config.database
         for kind, suffix in (
@@ -60,6 +61,7 @@ def _writer():
             ("TABLE", "capture_raw"),
             ("TABLE", "pack_inventory_raw"),
             ("TABLE", "capture_version_claims"),
+            ("TABLE", "publisher_lease"),
             ("TABLE", "index_watermark"),
             ("TABLE", "snapshot_manifest"),
             ("TABLE", "schema_version"),

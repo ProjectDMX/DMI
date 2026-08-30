@@ -179,14 +179,15 @@ checkpointing to stay cheap as publishes accumulate. It is the table-format
 answer, and worth reaching for if the catalog ever grows a second writer that
 cannot be serialised.
 
-### What shipped, and what it does not do
+### What shipped
 
 None of this is reachable with a single indexer: one writer cannot race itself.
 The whole concern is about the multi-indexer future the version allocator was
-built for.
+built for -- and "single indexer" was an assumption nothing enforced, which is
+what the publisher lease below changes.
 
-The marker-gated variant shipped, with the barrier tightened as far as it goes
-without a contract change:
+The marker-gated variant shipped first, with the barrier tightened as far as it
+goes without a contract change:
 
 - Membership moved to `{prefix}_snapshot_manifest`, written by
   `publish_snapshot` rather than by `commit_packs`, and a row counts only once
@@ -221,13 +222,145 @@ without a contract change:
   would let a crash leave a pack skipped forever *and* invisible. Last means a
   crash costs redundant work, never invisibility.
 
-**This narrows the gap. It does not close it, and it must not be described as
-fixed.** The window went from the whole descriptor-writing phase -- seconds,
-many INSERTs -- down to the server-side overlap of two conditional INSERTs. Two
-publishers can still both evaluate `max(index_version) < V` before either row
-is durable and both land; the lower one then becomes visible underneath a
-watermark that was already pinned, and **it happens silently**. The three sound
-repairs above remain the options for actually closing it.
+**That narrowed the gap and did not close it.** The window went from the whole
+descriptor-writing phase -- seconds, many INSERTs -- down to the server-side
+overlap of two conditional INSERTs. Two publishers could still both evaluate
+`max(index_version) < V` before either row was durable and both land; the lower
+one then became visible underneath a watermark that was already pinned, and it
+happened silently.
+
+Measured on 25.12, on the statement shape itself: two clients issuing the
+conditional publish from a barrier, with a third polling `max(index_version)`
+throughout, 200 trials. In **2 of them (1%)** the poller saw the higher version
+alone -- a pin a reader would have taken -- and the lower version landed
+underneath it afterwards. That is the residual, and one percent of concurrent
+publishes is not a rounding error.
+
+### The fenced publisher lease
+
+The residual has a precondition: **two publishers writing concurrently.** All
+three sound repairs above attack the other half of it -- they change the shape
+of the data so that concurrent publication is safe. The lease attacks the
+precondition instead, and enforces the single-indexer invariant the design has
+assumed from the start rather than merely documenting it.
+
+`{prefix}_publisher_lease` holds `(term, lease_id, holder, acquired_at_ns,
+expires_at_ns)`. It is append-only and claimed by the **same sole-claimant
+protocol as a version**, which is safe here for the same reason: a lease claim
+row is inert. Writing one confers nothing on its own, because the only thing
+that ever reads the table is the fencing predicate inside a publish, and that
+predicate names a single row. A term claimed by two publishers is abandoned by
+both, holds no lease, and is takeable at once by whoever claims a higher term.
+
+`term` is the monotonic slot, not the clock -- a wall-clock ordering could tie,
+and then "the head of the table" would be ambiguous. `acquired_at_ns` and
+`expires_at_ns` are stamped by the **server**, and the fence compares them
+against the **server's** clock, so no publisher's own clock, and no skew between
+two of them, decides whether a lease is live.
+
+The point of the whole thing is one sentence:
+
+> **The fencing check rides inside the same server-side statement as the
+> visibility write. A publisher whose lease has been taken over writes NOTHING
+> -- it does not write and then discover it lost.**
+
+That is what separates it from the two designs this document has already
+rejected. Both of those wrote first and checked afterwards, and no check that
+runs after a write can withdraw what the write already made durable.
+
+```sql
+INSERT INTO {prefix}_index_watermark (...)
+SELECT ... FROM system.one
+WHERE (SELECT max(index_version) FROM {prefix}_index_watermark) < V
+  AND (SELECT lease_id     FROM {prefix}_publisher_lease
+       ORDER BY term DESC, lease_id DESC LIMIT 1) = :my_lease
+  AND (SELECT expires_at_ns FROM {prefix}_publisher_lease
+       ORDER BY term DESC, lease_id DESC LIMIT 1) > toUnixTimestamp64Nano(now64(9))
+```
+
+The manifest INSERT carries the same predicate, over an `arrayJoin` of the
+packs it is admitting. Those rows would be inert either way -- membership pairs
+them with a watermark row that would never exist -- but "wrote nothing" is a
+property a test can assert directly, and "wrote something harmless" is one that
+has to be re-argued every time the membership clause changes.
+
+A publisher renews before every publish, which costs a round trip and buys the
+entire safety margin: at the moment the fence is evaluated its lease has
+essentially a full `lease_ttl_ns` left, and a takeover cannot happen until that
+expires. The publish statement carries `max_execution_time = publish_timeout_ns`
+(required to be below the TTL), so the server itself aborts a publish that has
+been in flight that long.
+
+**Measured, with the lease in place**: 200 trials, two writers each racing to
+acquire the lease, allocate a version and publish from a barrier. Both published
+in the same trial **0 times**; 173 publishes succeeded, 227 attempts were
+refused at the lease, and **0** reached the version barrier. The lease
+serialises publication before the barrier's window can open. Removing the fence
+from the two writing statements and rerunning
+`test_a_taken_over_publisher_writes_nothing_at_all` makes it fail with `DID NOT
+RAISE`: the publisher that had demonstrably lost the lease published anyway.
+
+#### What it costs
+
+Measured on 25.12 against a local server, base = the same code without the
+lease:
+
+| | before | after | |
+|---|---:|---:|---|
+| one `publish_snapshot` (16 packs) | 6.7 ms | 15.2 ms | +8.5 ms |
+| one `index()` pass (16 packs, 4096 rows) | 160 ms | 173 ms | +8% |
+| `bench_capture_search` pages and selectivity | -- | -- | inside the base's own 4-25% run-to-run spread |
+
+The read path is untouched, as it should be: the lease is on the write path, and
+the membership clause gained one column in a join between two tables that hold
+one row per publish.
+
+The 8.5 ms is three round trips of renewal (head read, claim, read-back) plus
+0.8 ms of fence on each of the two writing statements. It is paid once per
+`index()` call, not once per pack or per row, which is why it disappears into a
+pass that already spends 160 ms reading footers and inserting descriptors.
+
+Renewing on **every** publish rather than only when the lease is close to
+expiring is deliberate. It removes the client clock from the design entirely --
+this branch has spent two rounds getting wall clocks out of the ordering -- and
+it maximises the margin the residual argument below depends on. Renew-when-stale
+would recover most of the 8.5 ms and needs a monotonic clock and a staleness
+branch to do it; that is a trade worth making only if publish frequency ever
+rises enough for 8.5 ms to matter.
+
+#### What this does not close
+
+Two things, stated as precisely as the rest of this document tries to be.
+
+**The takeover instant.** For both publishers to write, publisher A's publish
+statement must evaluate the fence before B's lease row commits, and still be in
+flight when B publishes. Every timestamp in that sequence is on the server's own
+clock, and it forces A's single INSERT to stay in flight from before its lease
+expired until after B took over -- essentially a whole `lease_ttl_ns`, when A
+renewed immediately before issuing it, and past a `max_execution_time` set below
+that. So the window is bounded by two knobs rather than by an unbounded
+scheduler artifact. It is not *zero*: `max_execution_time` is checked between
+processing blocks rather than pre-empted, so a statement blocked in a lock can
+overrun it. This has not been reproduced; it also has not been proven
+impossible, and the difference matters.
+
+**Lease acquisition is not the window it looks like.** Two publishers claiming
+one term both abandon it, so a contested term holds no lease and the fence
+matches nobody -- the same argument that makes the version allocator sound. The
+cost is liveness, not safety: a contested term locks *everyone* out, including a
+previous holder whose lease was still live, until somebody claims a higher term.
+That is deliberate. A contested head means the catalog does not know who is in
+charge, and refusing to publish is the conservative answer.
+
+**A crash between a claim and its read-back** leaves a claim row nobody uses.
+It looks like a live lease until it expires, so the next publisher waits out one
+`lease_ttl_ns`. `release_publisher_lease()` exists so an orderly restart does
+not pay that; a crash does.
+
+**Replication.** All of this rests on a later write observing an earlier one.
+The read-backs carry `select_sequential_consistency`, which is the read half. The
+write half -- `insert_quorum`, and quorum-durable descriptor inserts before their
+watermark row -- is a deployment decision and is deliberately not claimed here.
 
 Two consequences to carry forward:
 
@@ -238,17 +371,20 @@ that version later -- but they are never collected. That is a new GC
 obligation: any retention job may delete manifest rows whose `index_version` is
 absent from the watermark table. Nothing does today.
 
-**Detection is the next step, and it costs a contract change.** The residual
-can be made loud instead of silent: pin `(W, generation)` where the generation
-counts watermark rows `<= W`, carried as a scalar subquery in the same
-statement as the page so the number is consistent with the rows returned --
-checking it in a separate round trip has its own window and is a false
-guarantee. Verified live: a late lower publish moves the count, and the scalar
-folds as a constant alongside the `GROUP BY`/`argMax`/`LIMIT` the reader
-already emits. It was left out deliberately, because it changes what a pinned
-read promises -- a walk becomes "stable, or `SnapshotMoved` and re-pin" -- and
-it bumps the cursor format, invalidating in-flight cursors. That is a reviewer
-decision, not an implementation detail.
+**Detection remains available, and it still costs a contract change.** The
+takeover-instant residual can be made loud instead of silent by the same means
+the wider race could: pin `(W, generation)` where the generation counts
+watermark rows `<= W`, carried as a scalar subquery in the same statement as
+the page so the number is consistent with the rows returned -- checking it in a
+separate round trip has its own window and is a false guarantee. Verified live:
+a late lower publish moves the count, and the scalar folds as a constant
+alongside the `GROUP BY`/`argMax`/`LIMIT` the reader already emits. It is still
+left out, because it changes what a pinned read promises -- a walk becomes
+"stable, or `SnapshotMoved` and re-pin" -- and it bumps the cursor format,
+invalidating in-flight cursors. That is a reviewer decision, not an
+implementation detail. It is a much smaller prize now than it was: the thing it
+would detect went from one percent of concurrent publishes to a window nobody
+has managed to reach.
 
 ## Where the catalog goes later
 

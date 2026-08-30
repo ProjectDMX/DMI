@@ -16,6 +16,7 @@ from dmi.storage.capture import (
     SnapshotPublishRaceError,
 )
 from dmi.storage.capture.clickhouse_catalog import _SCHEMA_VERSION
+from tests._catalog_fakes import FakeLeaseTable
 
 
 pytestmark = pytest.mark.cpu
@@ -31,6 +32,7 @@ _CURRENT_OBJECTS = (
     "dmi_capture_raw",
     "dmi_pack_inventory_raw",
     "dmi_capture_version_claims",
+    "dmi_publisher_lease",
     "dmi_index_watermark",
     "dmi_snapshot_manifest",
     "dmi_schema_version",
@@ -64,6 +66,7 @@ class _Client:
         # overlapped. The point of reading publish_id back is that these are
         # not success.
         self.foreign_publishes = []
+        self.lease = FakeLeaseTable()
         self.tables = tuple(tables)
         self.schema_version = schema_version
         self.inventory_rows = inventory_rows
@@ -71,6 +74,9 @@ class _Client:
 
     def execute(self, query, params=None, **kwargs):
         self.calls.append((query, params, kwargs))
+        leased = self.lease.execute(query, params)
+        if leased is not None:
+            return leased
         if "system.tables" in query:
             return [(name,) for name in self.tables]
         if "dmi_schema_version` ORDER BY version DESC" in query:
@@ -81,10 +87,13 @@ class _Client:
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
             elif "index_watermark" in query:
-                # The publish barrier is a server-side condition, so the fake
-                # has to enforce it or every publish test would pass vacuously.
+                # The barrier and the fence are server-side conditions, so the
+                # fake has to enforce them or every publish test would pass
+                # vacuously.
                 version = params["index_version"]
-                if version > max(self.watermarks, default=0):
+                if version > max(self.watermarks, default=0) and (
+                    self.lease.fence_passes(params["lease_id"])
+                ):
                     self.watermarks.append(version)
                     self.publishes.append((version, params["publish_id"]))
             return []
@@ -105,6 +114,13 @@ class _Client:
         if query.lstrip().startswith("SELECT"):
             return self.committed
         return []
+
+
+def _leased(client) -> ClickHouseCatalogWriter:
+    """A writer holding the publisher lease, which every publish requires."""
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer.acquire_publisher_lease("indexer-a")
+    return writer
 
 
 def _descriptor():
@@ -246,7 +262,7 @@ def test_publish_writes_membership_before_the_watermark_that_admits_it():
     """
     ref, descriptor = _descriptor()
     client = _Client()
-    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer = _leased(client)
 
     writer.write_descriptors([descriptor], index_version=42)
     writer.publish_snapshot(
@@ -255,7 +271,10 @@ def test_publish_writes_membership_before_the_watermark_that_admits_it():
     )
     writer.commit_packs([ref], index_version=42)
 
-    inserts = [call for call in client.calls if call[0].startswith("INSERT")]
+    inserts = [
+        call for call in client.calls
+        if call[0].startswith("INSERT") and "publisher_lease` (term" not in call[0]
+    ]
     assert "dmi_capture_raw" in inserts[0][0]
     assert "dmi_snapshot_manifest" in inserts[1][0]
     assert "dmi_index_watermark" in inserts[2][0]
@@ -265,8 +284,9 @@ def test_publish_writes_membership_before_the_watermark_that_admits_it():
     assert "dmi_pack_inventory_raw" in inserts[3][0]
     assert inserts[0][1][0][0] == "capture-a"
     # One publish identity on both rows, so membership pairs with the watermark.
-    version, publish_id, store_id, pack_id = inserts[1][1][0]
-    assert (version, store_id, pack_id) == (42, ref.store_id, ref.pack_id)
+    assert inserts[1][1]["index_version"] == 42
+    assert inserts[1][1]["members"] == [(ref.store_id, ref.pack_id)]
+    publish_id = inserts[1][1]["publish_id"]
     assert inserts[2][1]["publish_id"] == publish_id
     assert client.publishes == [(42, publish_id)]
 
@@ -279,7 +299,7 @@ def test_publish_is_a_single_statement_barrier_over_the_watermark():
     conditional INSERT the server evaluates both together.
     """
     client = _Client()
-    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer = _leased(client)
 
     writer.publish_snapshot(
         index_version=42, refs=(), published_at_ns=7,
@@ -300,7 +320,7 @@ def test_publish_is_a_single_statement_barrier_over_the_watermark():
 def test_publish_below_the_published_head_raises_the_race_error():
     """The barrier fires, and says nothing was made visible."""
     client = _Client()
-    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer = _leased(client)
     writer.publish_snapshot(
         index_version=9, refs=(), published_at_ns=1,
         indexed_rows=0, indexed_packs=0,
@@ -326,7 +346,7 @@ def test_publish_verifies_the_row_at_its_version_is_its_own():
     this attempt minted.
     """
     client = _Client()
-    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer = _leased(client)
 
     writer.publish_snapshot(
         index_version=42, refs=(), published_at_ns=7,
@@ -360,7 +380,7 @@ def test_a_foreign_row_at_the_published_version_is_not_success():
     """
     client = _Client()
     client.foreign_publishes = ["ffffffff-ffff-ffff-ffff-ffffffffffff"]
-    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer = _leased(client)
 
     with pytest.raises(SnapshotPublishRaceError, match="lost the publish race"):
         writer.publish_snapshot(
@@ -377,7 +397,7 @@ def test_each_publish_attempt_mints_its_own_identity():
     inserted nothing.
     """
     client = _Client()
-    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer = _leased(client)
 
     writer.publish_snapshot(
         index_version=42, refs=(), published_at_ns=7,
@@ -408,7 +428,7 @@ def test_the_deciding_reads_carry_sequential_consistency():
 
     ref, descriptor = _descriptor()
     client = _Client()
-    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer = _leased(client)
 
     version = writer.allocate_version()
     writer.write_descriptors([descriptor], index_version=version)
@@ -426,16 +446,27 @@ def test_the_deciding_reads_carry_sequential_consistency():
         ]
 
     assert _DECIDING_READ == {"select_sequential_consistency": 1}
-    # The claim read-back, the published-head reads, the conditional publish and
-    # its verification.
+    # The claim and lease read-backs, the published-head reads and the publish
+    # verification.
     assert _settings("toString(claim_id)", "SELECT") == [_DECIDING_READ]
     assert _settings("max(version)", "SELECT") == [_DECIDING_READ]
     assert _settings("max(index_version)", "SELECT") == [_DECIDING_READ]
-    assert _settings("dmi_index_watermark", "INSERT") == [_DECIDING_READ]
     assert _settings("toString(publish_id)", "SELECT") == [_DECIDING_READ]
+    assert _settings("ORDER BY term DESC", "SELECT") == [_DECIDING_READ] * 2
+    assert _settings("acquired_at_ns, expires_at_ns", "SELECT") == [_DECIDING_READ] * 2
+    # The two fenced writes carry the same consistency AND the statement cap
+    # that keeps the fence from being evaluated long before the row lands.
+    fenced = {
+        "select_sequential_consistency": 1,
+        "max_execution_time": 5.0,
+        "timeout_overflow_mode": "throw",
+    }
+    assert _settings("dmi_snapshot_manifest", "INSERT") == [fenced]
+    assert _settings("dmi_index_watermark", "INSERT") == [fenced]
     # Bulk writes decide nothing and pay nothing.
     assert _settings("dmi_capture_raw", "INSERT") == [None]
     assert _settings("dmi_pack_inventory_raw", "INSERT") == [None]
+    assert _settings("publisher_lease` (term", "INSERT") == [None] * 2
 
 
 def test_commit_packs_writes_only_the_replay_inventory():

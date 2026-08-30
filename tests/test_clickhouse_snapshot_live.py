@@ -23,6 +23,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from os import environ
 from dataclasses import replace
+from time import sleep
 from uuid import uuid4
 
 import pytest
@@ -34,6 +35,8 @@ from dmi.storage.capture import (
     ClickHouseCatalogConfig,
     ClickHouseCatalogWriter,
     ClickHouseReaderConfig,
+    PublisherLeaseError,
+    PublisherLeaseHeldError,
     SnapshotPublishRaceError,
 )
 from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS
@@ -73,17 +76,22 @@ def _publish(writer, index_version: int, *, refs=(), rows: int = 0) -> None:
     )
 
 
-@contextmanager
-def _catalog():
+def _client():
     clickhouse_driver = pytest.importorskip("clickhouse_driver")
-    client = clickhouse_driver.Client(
+    return clickhouse_driver.Client(
         host=environ.get("DMI_CLICKHOUSE_HOST", "127.0.0.1"),
         port=int(environ.get("DMI_CLICKHOUSE_PORT", "9000")),
     )
+
+
+@contextmanager
+def _catalog(**overrides):
+    client = _client()
     prefix = f"dmi_snapshot_test_{uuid4().hex}"
     config = ClickHouseCatalogConfig(
         database=environ.get("DMI_CLICKHOUSE_DATABASE", "default"),
         table_prefix=prefix,
+        **overrides,
     )
     writer = ClickHouseCatalogWriter(client, config)
     reader = ClickHouseCaptureCatalog(
@@ -99,6 +107,11 @@ def _catalog():
         # below is IF EXISTS, so tearing down a partial or empty schema is safe.
         created = True
         writer.ensure_schema()
+        # Only the lease holder can make a snapshot visible, and the check
+        # rides inside the publish statement, so a fixture that skipped this
+        # would write nothing and every assertion here would be about an empty
+        # catalog.
+        writer.acquire_publisher_lease("snapshot-suite")
         yield writer, reader, client, config
     finally:
         if created:
@@ -109,6 +122,7 @@ def _catalog():
                 ("TABLE", "capture_raw"),
                 ("TABLE", "pack_inventory_raw"),
                 ("TABLE", "capture_version_claims"),
+                ("TABLE", "publisher_lease"),
                 ("TABLE", "index_watermark"),
                 ("TABLE", "snapshot_manifest"),
                 ("TABLE", "schema_version"),
@@ -235,6 +249,221 @@ def test_a_pinned_snapshot_does_not_gain_a_slower_indexers_packs():
         assert reader.get_by_ids(late_ids, tenant_id=tenant, watermark=pinned) == ()
 
 
+# --- the publisher lease, over a live server ---------------------------------
+#
+# The in-memory fake in tests/test_capture_version_allocation.py serialises two
+# publishers in the interpreter, so it can drive the PROTOCOL but never the
+# window the fence exists for. These do, against a real ClickHouse: the
+# takeover lands inside the window between one publisher renewing its lease and
+# the server executing its write, which is the only place a takeover can slip
+# past the client-side check.
+
+
+def _lease_rows(client, config):
+    return client.execute(
+        "SELECT term, toString(lease_id), holder FROM "
+        f"`{config.database}`.`{config.table_prefix}_publisher_lease` "
+        "ORDER BY term, lease_id"
+    )
+
+
+def _catalog_state(client, config):
+    """Everything a publish would change, as one comparable value."""
+    return {
+        table: client.execute(
+            f"SELECT * FROM `{config.database}`.`{config.table_prefix}_{table}` "
+            "ORDER BY ALL"
+        )
+        for table in ("index_watermark", "snapshot_manifest")
+    }
+
+
+def test_a_taken_over_publisher_writes_nothing_at_all():
+    """The load-bearing one: the fence rides inside the write.
+
+    Publisher A holds the lease and renews it, so its client-side check passes.
+    B then takes it over -- legitimately, once A's short lease has expired --
+    in the window between that renewal and the statements A is about to issue.
+    A's manifest INSERT and its watermark INSERT both carry the fence, so the
+    server evaluates it and A writes NOTHING: not an inert manifest row, not a
+    watermark row, nothing. That is what separates this from the two designs
+    this branch has already rejected, where the loser wrote first and
+    discovered afterwards.
+
+    Asserted directly against the tables rather than through the exception,
+    because "it raised" is exactly what the rejected designs also did.
+    """
+    corpus = synthetic_descriptors(3)
+    tenant = corpus[0].metadata.tenant_id
+    later = _retried_into_a_new_pack(corpus)
+
+    # A short lease so the takeover is a real expiry rather than a forced one,
+    # and a publish cap comfortably above a one-row INSERT.
+    with _catalog(
+        lease_ttl_ns=200_000_000, publish_timeout_ns=100_000_000
+    ) as (writer, reader, client, config):
+        version = writer.allocate_version()
+        writer.write_descriptors(corpus, index_version=version)
+        _publish(writer, version, refs=_refs(corpus), rows=len(corpus))
+        pinned = reader.current_watermark()
+        before_state = _catalog_state(client, config)
+        before_page = reader.search(CaptureQuery(limit=100, tenant_id=tenant))
+        assert len(before_page.items) == len(corpus)
+
+        writer.release_publisher_lease()
+        successor = ClickHouseCatalogWriter(_client(), config)
+        armed = []
+
+        class _TakeOverAfterTheRenewal:
+            """A's client, with B's takeover wedged into the one open window."""
+
+            def execute(self, query, params=None, **kwargs):
+                rows = client.execute(query, params, **kwargs)
+                if armed and "acquired_at_ns, expires_at_ns" in query:
+                    armed.clear()
+                    # A's renewal has just succeeded by its own reckoning. Wait
+                    # out the short lease and let B take it, exactly as a
+                    # successor would.
+                    sleep(0.25)
+                    successor.acquire_publisher_lease("successor")
+                return rows
+
+        stalled = ClickHouseCatalogWriter(_TakeOverAfterTheRenewal(), config)
+        stalled.acquire_publisher_lease("stalled")
+        lost = stalled.allocate_version()
+        stalled.write_descriptors(later, index_version=lost)
+
+        armed.append(True)
+        with pytest.raises(PublisherLeaseError) as raised:
+            _publish(stalled, lost, refs=_refs(later), rows=len(later))
+
+        assert not armed, "the takeover never ran; the test proved nothing"
+        assert "fenced out and wrote nothing" in str(raised.value)
+        assert "'successor'" in str(raised.value)
+
+        # Nothing landed. Not a watermark row, and not one inert manifest row.
+        assert _catalog_state(client, config) == before_state
+        assert not any(
+            row[0] == lost
+            for row in client.execute(
+                "SELECT index_version FROM "
+                f"`{config.database}`.`{config.table_prefix}_snapshot_manifest`"
+            )
+        )
+        # The descriptors it wrote ARE durable, which is the point: they are
+        # invisible because nothing admitted them, not because they are gone.
+        assert client.execute(
+            f"SELECT count() FROM `{config.database}`.`{config.table_prefix}"
+            "_capture_raw`"
+        ) == [(len(corpus) + len(later),)]
+
+        # And the reader pinned before any of this sees exactly what it saw.
+        assert reader.current_watermark() == pinned
+        assert reader.search(
+            CaptureQuery(limit=100, tenant_id=tenant, cursor=None)
+        ).items == before_page.items
+        assert reader.get_by_ids(
+            [item.capture_id for item in corpus], tenant_id=tenant, watermark=pinned
+        ) == reader.get_by_ids(
+            [item.capture_id for item in corpus], tenant_id=tenant, watermark=pinned
+        )
+
+        # The successor publishes normally over the same catalog.
+        successor_version = successor.allocate_version()
+        _publish(
+            successor, successor_version, refs=_refs(later), rows=len(later)
+        )
+        assert int(reader.current_watermark()) == successor_version
+        successor.release_publisher_lease()
+
+
+def test_a_contested_lease_term_is_held_by_nobody():
+    """Sole-claimant, over a live server, with a real competing row.
+
+    A competing claim lands between the claimant's INSERT and its read-back.
+    Resolving the tie either way would let both sides keep the term when each
+    sees only its own insert first, so both walk away -- and the contested term
+    then holds no lease at all, which the fence has to agree with: publishing
+    under it writes nothing.
+    """
+    competitor = str(uuid4())
+    with _catalog() as (writer, reader, client, config):
+        writer.release_publisher_lease()
+        contested: list[int] = []
+
+        class _ContestTheFirstClaim:
+            def execute(self, query, params=None, **kwargs):
+                if not contested and "acquired_at_ns, expires_at_ns" in query:
+                    contested.append(params["term"])
+                    client.execute(
+                        "INSERT INTO "
+                        f"`{config.database}`.`{config.table_prefix}"
+                        "_publisher_lease` (term, lease_id, holder, "
+                        "acquired_at_ns, expires_at_ns) SELECT "
+                        "toUInt64(%(term)s), toUUID(%(lease_id)s), 'rival', "
+                        "now_ns, now_ns + toUInt64(600000000000) FROM "
+                        "(SELECT toUnixTimestamp64Nano(now64(9)) AS now_ns)",
+                        {"term": params["term"], "lease_id": competitor},
+                    )
+                return client.execute(query, params, **kwargs)
+
+        claimant = ClickHouseCatalogWriter(_ContestTheFirstClaim(), config)
+        lease = claimant.acquire_publisher_lease("claimant")
+
+        assert contested, "the first claim should have been contested"
+        assert lease.term > contested[0], "a contested term must never be held"
+        # The contested term really does hold two rows and neither is a lease.
+        terms = [row[0] for row in _lease_rows(client, config)]
+        assert terms.count(contested[0]) == 2
+        # And the claimant, holding the term above it, publishes normally.
+        version = claimant.allocate_version()
+        _publish(claimant, version, refs=(), rows=0)
+        assert int(reader.current_watermark()) == version
+
+
+def test_a_lease_is_taken_over_on_expiry_and_given_back_on_release():
+    """Expiry, takeover, and a re-acquiring publisher that republishes.
+
+    A live lease cannot be stolen. An expired one can be taken, which is what
+    makes a crashed indexer recoverable rather than terminal. A release hands
+    it back at once, so an orderly restart does not cost a whole TTL.
+    """
+    corpus = synthetic_descriptors(2)
+    tenant = corpus[0].metadata.tenant_id
+    with _catalog(
+        lease_ttl_ns=200_000_000, publish_timeout_ns=100_000_000
+    ) as (writer, reader, client, config):
+        successor = ClickHouseCatalogWriter(_client(), config)
+        with pytest.raises(PublisherLeaseHeldError, match="snapshot-suite"):
+            successor.acquire_publisher_lease("successor")
+
+        sleep(0.25)
+        taken = successor.acquire_publisher_lease("successor")
+        assert taken.term > writer.publisher_lease.term
+
+        # The previous holder is refused. Here it is the renewal at the head of
+        # every publish that catches it, one round trip before the fence;
+        # test_a_taken_over_publisher_writes_nothing_at_all drives the case the
+        # renewal cannot see, where the takeover lands behind it.
+        with pytest.raises(PublisherLeaseHeldError, match="'successor'"):
+            _publish(writer, writer.allocate_version(), refs=(), rows=0)
+        assert reader.current_watermark() == "0"
+        assert writer.publisher_lease is None
+
+        # A release hands the lease straight back rather than making the next
+        # publisher wait out the TTL.
+        successor.release_publisher_lease()
+        writer.acquire_publisher_lease("snapshot-suite")
+        version = writer.allocate_version()
+        writer.write_descriptors(corpus, index_version=version)
+        _publish(writer, version, refs=_refs(corpus), rows=len(corpus))
+
+        assert int(reader.current_watermark()) == version
+        assert len(reader.search(CaptureQuery(limit=10, tenant_id=tenant)).items) == (
+            len(corpus)
+        )
+
+
 def test_a_foreign_row_at_this_version_is_not_reported_as_a_publish():
     """"Does a row for V exist?" is not "is V mine?", over a live server.
 
@@ -313,7 +542,10 @@ def test_the_deciding_reads_carry_sequential_consistency_to_the_server():
                 recorded.append((query, kwargs.get("settings")))
                 return client.execute(query, params, **kwargs)
 
+        # One publisher at a time, so the fixture's writer hands the lease over.
+        writer.release_publisher_lease()
         taps = ClickHouseCatalogWriter(_Recording(), config)
+        taps.acquire_publisher_lease("recording-proxy")
         version = taps.allocate_version()
         taps.write_descriptors(corpus, index_version=version)
         _publish(taps, version, refs=_refs(corpus), rows=len(corpus))
@@ -327,14 +559,25 @@ def test_the_deciding_reads_carry_sequential_consistency_to_the_server():
             ]
 
         consistent = {"select_sequential_consistency": 1}
+        fenced = {
+            "select_sequential_consistency": 1,
+            "max_execution_time": 5.0,
+            "timeout_overflow_mode": "throw",
+        }
         assert _settings("toString(claim_id)", "SELECT") == [consistent]
         assert _settings("max(version)", "SELECT") == [consistent]
         assert _settings("max(index_version)", "SELECT") == [consistent]
-        assert _settings("index_watermark", "INSERT") == [consistent]
         assert _settings("toString(publish_id)", "SELECT") == [consistent]
+        assert _settings("ORDER BY term DESC", "SELECT") == [consistent] * 2
+        assert _settings("acquired_at_ns, expires_at_ns", "SELECT") == [consistent] * 2
+        # The fenced writes carry the consistency AND the statement cap that
+        # keeps the fence from being evaluated long before the row lands.
+        assert _settings("snapshot_manifest", "INSERT") == [fenced]
+        assert _settings("index_watermark", "INSERT") == [fenced]
         # Bulk writes decide nothing and pay nothing.
         assert _settings("capture_raw", "INSERT") == [None]
         assert _settings("pack_inventory_raw", "INSERT") == [None]
+        assert _settings("publisher_lease` (term", "INSERT") == [None] * 2
         # And the batch really is readable, so the settings did not merely fail
         # quietly on the way.
         assert len(reader.search(CaptureQuery(limit=10)).items) == len(corpus)

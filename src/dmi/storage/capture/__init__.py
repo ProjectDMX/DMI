@@ -73,10 +73,16 @@ from .catalog import (
     IndexResult,
     PackIdentity,
     PackInventory,
+    PublisherLeaseError,
+    PublisherLeaseHeldError,
     ReconcileResult,
     SnapshotPublishRaceError,
 )
-from .clickhouse_catalog import ClickHouseCatalogConfig, ClickHouseCatalogWriter
+from .clickhouse_catalog import (
+    ClickHouseCatalogConfig,
+    ClickHouseCatalogWriter,
+    PublisherLease,
+)
 from .clickhouse_reader import ClickHouseCaptureCatalog, ClickHouseReaderConfig
 from .cursor import Cursor, CursorKey, decode_cursor, encode_cursor
 from .s3 import S3PackStore, S3StoreConfig
@@ -185,6 +191,9 @@ __all__ = [
     "PipelineEvent",
     "PipelineFailedError",
     "PipelineSnapshot",
+    "PublisherLease",
+    "PublisherLeaseError",
+    "PublisherLeaseHeldError",
     "QueueSnapshot",
     "ReadyPack",
     "ReconcileResult",

@@ -193,6 +193,10 @@ def main(argv=None) -> int:
         # tables leak onto the shared server. Every drop is IF EXISTS, so
         # tearing down a partial or empty schema is safe.
         writer.ensure_schema()
+        # Only the lease holder can publish, and the fence rides inside the
+        # publish statement -- without one the corpus below would never become
+        # visible and every page measured would be empty.
+        writer.acquire_publisher_lease("search-bench")
         descriptors = synthetic_descriptors(args.rows)
         # Descriptors alone are not readable. A snapshot is bounded by the
         # packs a publish made members and the watermark comes from the
@@ -235,7 +239,8 @@ def main(argv=None) -> int:
             ("VIEW", "capture"), ("VIEW", "pack_inventory"),
             ("TABLE", "capture_raw"), ("TABLE", "pack_inventory_raw"),
             ("TABLE", "index_watermark"), ("TABLE", "snapshot_manifest"),
-            ("TABLE", "capture_version_claims"), ("TABLE", "schema_version"),
+            ("TABLE", "capture_version_claims"), ("TABLE", "publisher_lease"),
+            ("TABLE", "schema_version"),
         ):
             client.execute(
                 f"DROP {kind} IF EXISTS `{args.database}`.`{prefix}_{suffix}`"

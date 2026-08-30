@@ -84,6 +84,7 @@ def _catalog():
         # down a partial or empty schema is safe.
         created = True
         writer.ensure_schema()
+        writer.acquire_publisher_lease("reader-suite")
         yield writer, reader
     finally:
         if created:
@@ -94,6 +95,7 @@ def _catalog():
                 ("TABLE", "capture_raw"),
                 ("TABLE", "pack_inventory_raw"),
                 ("TABLE", "capture_version_claims"),
+                ("TABLE", "publisher_lease"),
                 ("TABLE", "index_watermark"),
                 ("TABLE", "snapshot_manifest"),
                 ("TABLE", "schema_version"),

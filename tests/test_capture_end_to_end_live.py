@@ -149,6 +149,10 @@ def _stack(tmp_path: Path):
         # down a partial or empty schema is safe.
         created = True
         writer.ensure_schema()
+        # Only the lease holder can make a snapshot visible. Tests below that
+        # publish through a SECOND writer take it over from this one, which is
+        # what one indexer replacing another looks like.
+        writer.acquire_publisher_lease("e2e-fixture")
 
         tensors, records = _corpus()
         pack = PackWriter(
@@ -184,6 +188,7 @@ def _stack(tmp_path: Path):
             "catalog": catalog,
             "client": client,
             "config": config,
+            "writer": writer,
         }
     finally:
         if created:
@@ -197,6 +202,7 @@ def _stack(tmp_path: Path):
                 ("TABLE", "snapshot_manifest"),
                 ("TABLE", "schema_version"),
                 ("TABLE", "capture_version_claims"),
+                ("TABLE", "publisher_lease"),
             ):
                 client.execute(
                     f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`"
@@ -294,6 +300,8 @@ def test_hydration_rejects_a_re_described_catalog_row(tmp_path: Path):
         )
 
         writer = ClickHouseCatalogWriter(env["client"], env["config"])
+        env["writer"].release_publisher_lease()
+        writer.acquire_publisher_lease("liar")
         version = writer.allocate_version()
         writer.write_descriptors((lying,), index_version=version)
         writer.publish_snapshot(
@@ -383,8 +391,12 @@ def test_a_pinned_watermark_is_isolated_from_a_later_skewed_indexer(tmp_path: Pa
         late_ref = store.put(pack.seal(), "packs/end-to-end-late.dmi-pack")
 
         # Indexer B: fresh instances over the same catalog, clock LOWER than
-        # indexer A's (7 in _stack). The clock must not matter.
+        # indexer A's (7 in _stack). The clock must not matter. It takes the
+        # publisher lease over from A, because only one publisher at a time may
+        # make a snapshot visible.
         late_writer = ClickHouseCatalogWriter(env["client"], env["config"])
+        env["writer"].release_publisher_lease()
+        late_writer.acquire_publisher_lease("indexer-b")
         late_indexer = CatalogIndexer(store, late_writer, clock_ns=lambda: 3)
         result = late_indexer.index([late_ref])
         assert result.indexed_packs == 1, result.failures
@@ -435,6 +447,8 @@ def test_selection_resolve_prunes_to_the_tenant_range(tmp_path: Path):
         # (default index_granularity is 8192 rows), so tenant-e2e is a thin
         # slice of a multi-granule, multi-tenant table.
         writer = ClickHouseCatalogWriter(client, config)
+        env["writer"].release_publisher_lease()
+        writer.acquire_publisher_lease("bulk-seeder")
         version = writer.allocate_version()
         rows_per_tenant = 12_000
         bulk_refs = []

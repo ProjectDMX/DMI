@@ -132,6 +132,7 @@ _ALL_OBJECTS = (
     ("TABLE", "capture_raw"),
     ("TABLE", "pack_inventory_raw"),
     ("TABLE", "capture_version_claims"),
+    ("TABLE", "publisher_lease"),
     ("TABLE", "index_watermark"),
     ("TABLE", "snapshot_manifest"),
     ("TABLE", "schema_version"),
@@ -372,6 +373,7 @@ def test_the_documented_rebuild_restores_a_version_one_catalog(tmp_path: Path):
         # The procedure, exactly as documented.
         _drop_everything(client, config)
         writer.ensure_schema()
+        writer.acquire_publisher_lease("rebuild")
         result = CatalogReconciler(
             inventory, CatalogIndexer(store, writer)
         ).rebuild(prefix="packs/", page_size=8)
@@ -416,6 +418,7 @@ def test_a_rebuild_that_keeps_the_inventory_is_refused_before_it_empties_the_cat
             client, ClickHouseReaderConfig.from_catalog(config)
         )
         writer.ensure_schema()
+        writer.acquire_publisher_lease("rebuild")
         indexer = CatalogIndexer(store, writer)
         CatalogReconciler(inventory, indexer).rebuild(prefix="packs/", page_size=8)
         assert len(reader.search(CaptureQuery(limit=100)).items) == len(descriptors)
@@ -464,6 +467,7 @@ def test_a_fresh_install_records_this_builds_version_and_stays_idempotent(
         writer = ClickHouseCatalogWriter(client, config)
 
         writer.ensure_schema()
+        writer.acquire_publisher_lease("fresh-install")
         assert _recorded_version(client, config) == _SCHEMA_VERSION
 
         writer.write_descriptors(descriptors, index_version=1)

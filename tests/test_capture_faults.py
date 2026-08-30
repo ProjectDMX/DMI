@@ -15,6 +15,7 @@ from uuid import UUID
 
 import pytest
 
+from tests._catalog_fakes import FakeLeaseTable
 from tests._faults import (
     FaultInjected,
     FaultyClickHouseClient,
@@ -212,8 +213,12 @@ class _Client:
         self.inserted: list[tuple[str, list]] = []
         self.claims: list[tuple[int, str]] = []
         self.watermarks: list[tuple[int, str]] = []
+        self.lease = FakeLeaseTable()
 
     def execute(self, query, params=None, **kwargs):
+        leased = self.lease.execute(query, params)
+        if leased is not None:
+            return leased
         if query.lstrip().upper().startswith("INSERT"):
             self.inserted.append((query, list(params or [])))
             if "version_claims" in query:
@@ -223,7 +228,9 @@ class _Client:
                 # a version lands only strictly above the published head, and
                 # the row carries the identity the publisher will read back.
                 version = params["index_version"]
-                if version > max((v for v, _ in self.watermarks), default=0):
+                if version > max(
+                    (v for v, _ in self.watermarks), default=0
+                ) and self.lease.fence_passes(params["lease_id"]):
                     self.watermarks.append((version, params["publish_id"]))
             return []
         if "version_claims" in query:
@@ -244,29 +251,35 @@ class _Client:
 
 def _indexer(store, client, **config):
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig(**config))
+    # Insert 1 of every one of these tests: only the lease holder may publish,
+    # and the check rides inside the publish statement, so an indexer without
+    # one writes nothing.
+    writer.acquire_publisher_lease("indexer-under-fault")
     return CatalogIndexer(store, writer, clock_ns=lambda: 7)
 
 
 def test_an_insert_failure_does_not_commit_the_pack(tmp_path: Path):
     inner = FilesystemPackStore(tmp_path, store_id="local")
     ref = inner.put(_sealed(_record("capture-a")), "packs/a.dmi-pack")
-    # Insert 1 is the version claim; insert 2 is the descriptor batch.
-    client = FaultyClickHouseClient(_Client(), insert=fail_on(2))
+    # Insert 1 is the lease claim, 2 is the version claim, 3 is the descriptor
+    # batch.
+    client = FaultyClickHouseClient(_Client(), insert=fail_on(3))
 
     with pytest.raises(FaultInjected):
         _indexer(inner, client).index([ref])
 
     # Descriptors are written before the pack commit marker precisely so a
     # failure here leaves the pack uncommitted and the batch replayable.
-    assert client.call_counts.get("insert") == 2
+    assert client.call_counts.get("insert") == 3
 
 
 def test_a_duplicated_insert_is_absorbed_by_replay_semantics(tmp_path: Path):
     inner = FilesystemPackStore(tmp_path, store_id="local")
     ref = inner.put(_sealed(_record("capture-a")), "packs/a.dmi-pack")
     backing = _Client()
-    # Insert 1 is the version claim; duplicate the descriptor insert (2).
-    client = FaultyClickHouseClient(backing, insert=duplicate_on(2))
+    # Inserts 1 and 2 are the lease and version claims; duplicate the
+    # descriptor insert (3).
+    client = FaultyClickHouseClient(backing, insert=duplicate_on(3))
 
     result = _indexer(inner, client).index([ref])
 

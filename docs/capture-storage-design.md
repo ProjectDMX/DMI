@@ -359,6 +359,75 @@ from the reader's without either side failing.
 the inventory only after a successful publish, so every pack in it is already
 published.
 
+### The publisher lease
+
+**Only the holder of the publisher lease can make a snapshot visible, and the
+check rides inside the statement that makes it visible.**
+
+`{prefix}_publisher_lease` holds `(term, lease_id, holder, acquired_at_ns,
+expires_at_ns)`, append-only. A publisher calls `acquire_publisher_lease(holder)`
+before it indexes anything; `publish_snapshot` refuses without one. Both of the
+statements a publish writes -- the manifest rows and the watermark row -- carry
+the same predicate:
+
+```sql
+  AND (SELECT lease_id      FROM {prefix}_publisher_lease
+       ORDER BY term DESC, lease_id DESC LIMIT 1) = :my_lease
+  AND (SELECT expires_at_ns FROM {prefix}_publisher_lease
+       ORDER BY term DESC, lease_id DESC LIMIT 1) > toUnixTimestamp64Nano(now64(9))
+```
+
+so a publisher whose lease has been taken over writes **nothing**. It does not
+write and then discover it lost, which is the failure mode every post-write
+check in this design's history has had.
+
+The lease is claimed by the same sole-claimant append-and-read-back protocol as
+a catalog version, and it is safe here for the same reason: a lease claim row is
+inert. Nothing reads the table except the fence, and the fence names one row, so
+a term claimed by two publishers is abandoned by both, holds no lease, and is
+takeable at once by whoever claims a higher term.
+
+| Concept | Where it lives |
+|---|---|
+| the monotonic slot a takeover has to beat | `term` |
+| the fencing token the publish statement checks | `lease_id` |
+| when the lease was taken and when it lapses | `acquired_at_ns`, `expires_at_ns`, both stamped by the **server** |
+
+Clocks: `term` orders the table, so a wall-clock tie can never make the head
+ambiguous. Expiry is decided by the server's clock on both sides -- the row is
+stamped server-side and the fence compares against `now64(9)` -- so no
+publisher's own clock, and no skew between two of them, participates.
+
+Lifecycle:
+
+- **Acquire.** A live lease held by somebody else raises
+  `PublisherLeaseHeldError`, naming the holder and the remaining time. An
+  expired lease, or a contested (and therefore inert) head term, is taken over.
+- **Renew.** Every publish renews first, keeping the same `lease_id` at a fresh
+  term. This costs a round trip and buys the safety margin: at the moment the
+  fence runs, the lease has essentially a full `lease_ttl_ns` left.
+- **Fail.** A publish fenced out raises `PublisherLeaseError`, deliberately
+  *not* `SnapshotPublishRaceError` -- a lost version is repaired by allocating a
+  higher one, which `CatalogIndexer` does automatically, while a lost lease
+  would fail the same fence at every version. The recovery is to acquire again
+  and re-index, and there is nothing to undo because nothing was written.
+- **Release.** `release_publisher_lease()` writes an already-expired tombstone
+  so an orderly restart does not cost the next publisher a whole TTL. A crash
+  does; that is what expiry is for.
+
+`publish_timeout_ns` caps the publish statement's `max_execution_time` and must
+be below `lease_ttl_ns`. The gap between them is what keeps a publish statement
+from still running when its own lease becomes takeable.
+
+Cost: `publish_snapshot` goes from 6.7 ms to 15.2 ms and a 16-pack, 4096-row
+`index()` pass from 160 ms to 173 ms (+8%), measured on 25.12. It is paid once
+per indexing call rather than per pack or per row. The read path is unchanged.
+
+What this does **not** close is written up in
+docs/catalog-descriptor-key.md, "The fenced publisher lease", with the
+measurements: the takeover instant, the liveness cost of a contested term, a
+crash between a claim and its read-back, and the write half of replication.
+
 ### Publish identity
 
 Every call to `publish_snapshot` mints one `publish_id` and writes it on both
@@ -415,7 +484,7 @@ deployment, not something this module can pick.
 ### Catalog schema versions and rebuild
 
 `{prefix}_schema_version` holds one row naming the schema the catalog was
-created with. The current version is **3**. `ensure_schema` writes that row
+created with. The current version is **4**. `ensure_schema` writes that row
 last, once every other object exists, so a stamped catalog is a complete one.
 A catalog with no such table is version 1 by definition -- that is the only
 thing it can be, because version 1 never had one.
@@ -425,6 +494,7 @@ thing it can be, because version 1 never had one.
 | 1 | the original schema; membership in `{prefix}_pack_commit_log`, descriptors sorted on capture identity alone |
 | 2 | `(store_id, pack_id)` appended to the descriptor sort key; membership moved to `{prefix}_snapshot_manifest` |
 | 3 | `publish_id` added to the watermark and the manifest |
+| 4 | `{prefix}_publisher_lease` added |
 
 `ensure_schema` checks compatibility before issuing any DDL and refuses
 anything it did not create, raising `CatalogSchemaVersionError`:
@@ -440,9 +510,13 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 | pack inventory populated, snapshot manifest empty | refuse -- membership is gone |
 
 No version is reachable from the one below it by any statement `ensure_schema`
-could issue: each one changes the shape of a table that already exists, and
-neither `CREATE TABLE IF NOT EXISTS` nor `CREATE OR REPLACE VIEW` alters a live
-table's columns or sort key. The version 1 to version 2 step is the worked
+could issue. Between them the versions change the descriptor sort key, the
+membership table, the publish identity columns and the set of tables, and
+`CREATE TABLE IF NOT EXISTS` alters neither an existing table's columns nor its
+sort key. Version 4 adds only a new table and could in principle be created in
+place, but the compatibility check runs before any DDL and cannot tell a table
+that was never written from one that was dropped -- and one of those is the
+state that hides every capture. The version 1 to version 2 step is the worked
 example, and both ways it fails are silent. `CREATE TABLE IF NOT EXISTS` is
 a no-op against a live table, so the descriptor table keeps the version 1 sort
 key and stays open to the merge deletion the new key exists to prevent.
@@ -467,8 +541,9 @@ store again:
 2. Drop all of its objects, views before the tables they read:
    `{prefix}_capture`, `{prefix}_pack_inventory`, `{prefix}_capture_raw`,
    `{prefix}_pack_inventory_raw`, `{prefix}_capture_version_claims`,
-   `{prefix}_index_watermark`, `{prefix}_snapshot_manifest`,
-   `{prefix}_schema_version`, and version 1's `{prefix}_pack_commit_log`.
+   `{prefix}_publisher_lease`, `{prefix}_index_watermark`,
+   `{prefix}_snapshot_manifest`, `{prefix}_schema_version`, and version 1's
+   `{prefix}_pack_commit_log`.
 3. Run `ensure_schema()`. It finds nothing, creates the current schema, and
    stamps it.
 4. Run `CatalogReconciler.rebuild(prefix=...)` once per pack store. It lists

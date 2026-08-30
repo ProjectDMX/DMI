@@ -13,6 +13,7 @@ from uuid import UUID
 
 import pytest
 
+from tests._catalog_fakes import FakeLeaseTable
 from tests._faults import FaultInjected, FaultyClickHouseClient, fail_on
 
 from dmi.storage.capture import (
@@ -160,16 +161,22 @@ class _Client:
         self.claims: list[tuple[int, str]] = []
         self.watermarks: list[int] = []
         self.publishes: list[tuple[int, str]] = []
+        self.lease = FakeLeaseTable()
 
     def execute(self, query, params=None, **kwargs):
         self.statements.append(query)
+        leased = self.lease.execute(query, params)
+        if leased is not None:
+            return leased
         if query.lstrip().upper().startswith("INSERT"):
             self.published.append((query, params))
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
             elif "index_watermark" in query:
                 version = params["index_version"]
-                if version > max(self.watermarks, default=0):
+                if version > max(self.watermarks, default=0) and (
+                    self.lease.fence_passes(params["lease_id"])
+                ):
                     self.watermarks.append(version)
                     self.publishes.append((version, params["publish_id"]))
             return []
@@ -206,10 +213,12 @@ def test_a_pack_is_never_both_skipped_on_replay_and_invisible_to_readers(
     ref = store.put(_sealed(_record(_metadata())), "packs/a.dmi-pack")
 
     backing = _Client()
-    # index() inserts: version claim, descriptors, manifest, watermark, then
-    # the inventory. Fail the last one -- the crash this ordering exists for.
-    client = FaultyClickHouseClient(backing, insert=fail_on(5))
+    # index() inserts: version claim, descriptors, lease renewal, manifest,
+    # watermark, then the inventory. Fail the last one -- the crash this
+    # ordering exists for. The lease claim below is insert 1.
+    client = FaultyClickHouseClient(backing, insert=fail_on(7))
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer.acquire_publisher_lease("indexer-a")
 
     with pytest.raises(FaultInjected):
         CatalogIndexer(store, writer, clock_ns=lambda: 7).index([ref])
@@ -226,8 +235,12 @@ def test_a_pack_is_never_both_skipped_on_replay_and_invisible_to_readers(
     )
 
     # The next pass sees no inventory row, so it re-indexes rather than
-    # skipping a pack it never made visible.
+    # skipping a pack it never made visible. It is a different publisher, so it
+    # waits out the crashed one's lease -- reached here by moving the fake
+    # server clock rather than by sleeping.
     healthy = ClickHouseCatalogWriter(backing, ClickHouseCatalogConfig())
+    backing.lease.now_ns += ClickHouseCatalogConfig().lease_ttl_ns + 1
+    healthy.acquire_publisher_lease("indexer-b")
     result = CatalogIndexer(store, healthy, clock_ns=lambda: 8).index([ref])
 
     assert result.indexed_packs == 1, "the crashed pack was skipped on replay"
@@ -276,8 +289,9 @@ def test_one_foreign_object_in_the_bucket_does_not_abort_reconciliation(
     store = FilesystemPackStore(tmp_path, store_id="local")
     good = store.put(_sealed(_record(_metadata())), "packs/good.dmi-pack")
     inventory = _Inventory(store, [good], bad_key="packs/README.txt")
-    indexer = CatalogIndexer(inventory, ClickHouseCatalogWriter(_Client(),
-                                                                ClickHouseCatalogConfig()),
+    writer = ClickHouseCatalogWriter(_Client(), ClickHouseCatalogConfig())
+    writer.acquire_publisher_lease("indexer-a")
+    indexer = CatalogIndexer(inventory, writer,
                              config=CatalogIndexerConfig(max_packs=8),
                              clock_ns=lambda: 7)
     reconciler = CatalogReconciler(inventory, indexer)
@@ -315,6 +329,7 @@ def test_a_clock_that_steps_backwards_cannot_publish_under_a_pinned_watermark(
 
     client = _Client()
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer.acquire_publisher_lease("indexer-a")
     clock = iter([2_000, 1_000])  # second batch stamped *earlier*
     indexer = CatalogIndexer(store, writer, clock_ns=lambda: next(clock))
 

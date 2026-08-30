@@ -22,6 +22,29 @@ class SnapshotPublishRaceError(CaptureStorageError):
     """
 
 
+class PublisherLeaseError(CaptureStorageError):
+    """This publisher does not hold the lease a publish requires.
+
+    Raised when no lease was ever acquired, when acquiring one was contested
+    past its attempt bound, and -- the case that matters -- when a fenced
+    publish wrote nothing because the lease had been taken over or had expired.
+    That last one is NOT a lost version race: re-allocating a version and
+    trying again would fail the same fence every time, so this is deliberately
+    not a ``SnapshotPublishRaceError`` and the indexer's publish retry does not
+    absorb it. The recovery is to acquire a lease again, which republishes
+    everything the fenced attempt failed to write -- and it wrote nothing.
+    """
+
+
+class PublisherLeaseHeldError(PublisherLeaseError):
+    """Another publisher holds a live lease on this catalog.
+
+    Not retryable until that lease expires or its holder gives it back. The
+    message names the holder and the expiry so an operator can tell a healthy
+    handover from a wedged one.
+    """
+
+
 class CatalogSchemaVersionError(CaptureStorageError):
     """The catalog on the server is not a schema this build can read or write.
 
@@ -338,6 +361,14 @@ class CatalogIndexer:
         Publishing is a required part of the CatalogWriter contract: skipping
         it would leave every row this call wrote durably stored but permanently
         invisible to readers, with no error anywhere.
+
+        Whatever authority a writer needs in order to publish is the writer's
+        own affair and is acquired before an indexer is handed one -- the
+        ClickHouse writer takes a publisher lease. Only a lost VERSION race is
+        retried here: it is repaired by allocating a higher version, which is
+        exactly what this loop does. A writer that has lost its authority to
+        publish raises something else, and it propagates, because every retry
+        would fail the same way.
 
         A losing publish made nothing visible, so recovery is simply a fresh
         version and another attempt. Only the manifest rows are rewritten --

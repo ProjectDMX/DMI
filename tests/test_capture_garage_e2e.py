@@ -76,6 +76,7 @@ _SCHEMA_OBJECTS = (
     ("TABLE", "capture_raw"),
     ("TABLE", "pack_inventory_raw"),
     ("TABLE", "capture_version_claims"),
+    ("TABLE", "publisher_lease"),
     ("TABLE", "index_watermark"),
     ("TABLE", "snapshot_manifest"),
     ("TABLE", "schema_version"),
@@ -203,6 +204,9 @@ def _stack(tmp_path: Path):
         # so tearing down a partial or empty schema is safe.
         created = True
         writer.ensure_schema()
+        # Only the lease holder can make a snapshot visible, and the check
+        # rides inside the publish statement.
+        writer.acquire_publisher_lease("garage-e2e")
 
         tensors, records = _corpus(tenant)
 
