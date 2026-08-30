@@ -320,6 +320,37 @@ At-least-once discovery can produce physical duplicates. Private raw tables may
 use `ReplacingMergeTree`, but public views must provide deterministic logical
 deduplication. Correctness does not depend on asynchronous merges having run.
 
+`{prefix}_capture` means **published descriptor rows, engine-deduplicated**.
+`FINAL` supplies the deduplication; it applies no membership, so the view is
+additionally bounded to the packs the latest published snapshot contains:
+
+```sql
+WHERE (store_id, pack_id) IN (
+  SELECT store_id, pack_id FROM {prefix}_snapshot_manifest
+  WHERE index_version <= (SELECT max(index_version) FROM {prefix}_index_watermark))
+```
+
+Without that bound the view showed descriptor rows from batches that were
+written and never published, and rows orphaned by a crashed indexing pass --
+data the reader correctly reports as nonexistent. Filtering under `FINAL` is
+sound here only because `(store_id, pack_id)` belongs to the table's sort key:
+rows a merge may collapse into one all share those columns, so the predicate
+keeps or drops a whole group and can never delete the representative `FINAL`
+would have kept. A predicate on `index_version` has no such guarantee, which is
+why `FINAL ... WHERE index_version <= W` is not a snapshot (see *Phase 5*).
+
+The view emits **one row per `(capture, store, pack)`**, not one per capture. A
+capture described by two packs -- a pack mirrored to a second store, or a
+producer retrying a `capture_id` after the first pack was sealed -- is two
+published rows and appears twice. Choosing between them is supersession, which
+belongs to the reader (`argMax` over `index_version`, grouped on capture
+identity); a second copy of those semantics in the view's SQL could drift away
+from the reader's without either side failing.
+
+`{prefix}_pack_inventory` carries no such bound and needs none: `index()` writes
+the inventory only after a successful publish, so every pack in it is already
+published.
+
 ClickHouse stores:
 
 - pack inventory and integrity state;
@@ -1043,6 +1074,11 @@ bytes, and retained failure details all have explicit caps.
   ClickHouse wire size.
 - The current public views use `FINAL` for immediate replay correctness. Hot
   query workloads must measure its cost before choosing a different projection.
+- `{prefix}_capture` re-evaluates `max(index_version)` over the watermark log on
+  every query, so it tracks the latest published snapshot rather than pinning
+  one. Two reads of the view a moment apart can therefore see different
+  snapshots; a caller that needs a stable selection uses the reader, which pins
+  a watermark and carries it in the cursor.
 
 ## Phase 5 limitations
 

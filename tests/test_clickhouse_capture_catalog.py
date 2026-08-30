@@ -120,6 +120,64 @@ def test_clickhouse_catalog_creates_replay_safe_raw_tables_and_final_views():
     assert "ORDER BY (version, claim_id)" in ddl
 
 
+def test_the_capture_view_is_bounded_to_the_published_snapshot():
+    """`FINAL` deduplicates; it does not decide what exists.
+
+    Unbounded, the view showed rows from batches that were written and never
+    published, and rows orphaned by a crashed indexing pass -- data the reader
+    correctly reports as nonexistent, offered to anyone querying the catalog by
+    hand as though it were catalog contents.
+    """
+    from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS
+
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    writer.ensure_schema()
+
+    view = next(
+        call[0] for call in client.calls if "`default`.`dmi_capture` AS" in call[0]
+    )
+    # IF NOT EXISTS would leave an earlier build's unbounded view in place,
+    # serving unpublished rows for the life of the deployment.
+    assert view.startswith(
+        "CREATE OR REPLACE VIEW `default`.`dmi_capture` AS SELECT "
+        + ", ".join(_CAPTURE_COLUMNS[:-1])
+        + " FROM `default`.`dmi_capture_raw` FINAL "
+    )
+    assert (
+        "WHERE (store_id, pack_id) IN ("
+        "SELECT store_id, pack_id FROM `default`.`dmi_snapshot_manifest` "
+        "WHERE index_version <= "
+        "(SELECT max(index_version) FROM `default`.`dmi_index_watermark`))"
+    ) in view
+    # No grouping, deliberately. The view's meaning is "published descriptor
+    # rows, engine-deduplicated" -- one row per (capture, store, pack).
+    # Supersession lives in the reader; a second copy of it here could drift.
+    assert "argMax" not in view
+    assert "GROUP BY" not in view
+
+
+def test_the_capture_view_is_created_after_the_tables_it_reads():
+    """The view names the manifest and the watermark, so both must precede it.
+
+    Reordered, ensure_schema breaks on a fresh server only -- a rerun finds the
+    tables already there and passes -- so the order is pinned rather than left
+    to whoever edits the method next.
+    """
+    client = _Client()
+    ClickHouseCatalogWriter(client, ClickHouseCatalogConfig()).ensure_schema()
+
+    statements = [call[0] for call in client.calls]
+
+    def _position(fragment: str) -> int:
+        return next(i for i, item in enumerate(statements) if fragment in item)
+
+    view = _position("`default`.`dmi_capture` AS")
+    assert _position("CREATE TABLE IF NOT EXISTS `default`.`dmi_snapshot_manifest`") < view
+    assert _position("CREATE TABLE IF NOT EXISTS `default`.`dmi_index_watermark`") < view
+
+
 def test_publish_writes_membership_before_the_watermark_that_admits_it():
     """Order is the whole mechanism, so it is pinned rather than assumed.
 

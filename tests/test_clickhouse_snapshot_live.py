@@ -36,6 +36,7 @@ from dmi.storage.capture import (
     ClickHouseReaderConfig,
     SnapshotPublishRaceError,
 )
+from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS
 
 
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
@@ -558,3 +559,131 @@ def test_an_empty_catalog_reports_a_zero_watermark():
     with _catalog() as (_, reader, _, _):
         assert reader.current_watermark() == "0"
         assert reader.search(CaptureQuery(limit=10)).items == ()
+
+
+# --- the public capture view -------------------------------------------------
+#
+# `{prefix}_capture` is what anything querying the catalog by hand reads --
+# dashboards, ad-hoc SQL, the operator debugging an indexing pass. It is not on
+# the reader's path, so nothing else in this suite would notice it disagreeing
+# with the reader about what exists.
+
+
+_PUBLIC_COLUMNS = ", ".join(_CAPTURE_COLUMNS[:-1])
+
+
+def _view_rows(client, config):
+    return client.execute(
+        f"SELECT {_PUBLIC_COLUMNS} FROM "
+        f"`{config.database}`.`{config.table_prefix}_capture` "
+        "ORDER BY capture_id, store_id, pack_id"
+    )
+
+
+def _identities(client, config, table: str):
+    """(capture_id, store_id, pack_id) as `table` reports it."""
+    return sorted(
+        client.execute(
+            f"SELECT capture_id, store_id, toString(pack_id) FROM "
+            f"`{config.database}`.`{config.table_prefix}_{table}`"
+        )
+    )
+
+
+def test_the_public_view_hides_a_batch_until_it_is_published():
+    """Written is not published, and the view has to tell the difference.
+
+    Descriptor rows become durable several INSERTs before the publish that
+    admits them, and a pass that crashes in between leaves them durable
+    forever. `FINAL` alone applies no membership, so the view showed both --
+    rows a reader correctly reports as nonexistent, offered to anyone querying
+    the catalog by hand as though they were catalog contents.
+    """
+    corpus = synthetic_descriptors(3)
+    with _catalog() as (writer, reader, client, config):
+        writer.write_descriptors(corpus, index_version=1)
+
+        # Durable in the raw table, and that is the whole point: the view is
+        # not hiding missing rows, it is declining to publish unpublished ones.
+        raw = _identities(client, config, "capture_raw")
+        assert len(raw) == len(corpus)
+        assert _view_rows(client, config) == []
+        assert reader.current_watermark() == "0"
+
+        _publish(writer, 1, refs=_refs(corpus), rows=len(corpus))
+
+        assert _identities(client, config, "capture") == raw
+
+
+def test_the_public_view_keeps_both_packs_describing_one_capture():
+    """One row per (capture, store, pack) -- deliberately not one per capture.
+
+    The view's meaning is "published descriptor rows, engine-deduplicated". A
+    capture described by two packs is two published rows and appears twice;
+    deciding which one wins is supersession, and that lives in the reader
+    (argMax over index_version, grouped on capture identity). Grouping here
+    too would be a second copy of those semantics in SQL, free to drift. This
+    pins the meaning so a later change to it has to be deliberate.
+    """
+    original = synthetic_descriptors(3)
+    retried = _retried_into_a_new_pack(original)
+    with _catalog() as (writer, reader, client, config):
+        writer.write_descriptors(original, index_version=1)
+        _publish(writer, 1, refs=_refs(original), rows=len(original))
+        writer.write_descriptors(retried, index_version=2)
+        _publish(writer, 2, refs=_refs(retried), rows=len(retried))
+
+        rows = _identities(client, config, "capture")
+
+        assert len(rows) == len(original) + len(retried)
+        for item in original:
+            assert sum(1 for row in rows if row[0] == item.capture_id) == 2
+        # And the reader, over the same data, still resolves one row per
+        # capture: the two answers differ because they answer different
+        # questions.
+        page = reader.search(
+            CaptureQuery(limit=10, tenant_id=original[0].metadata.tenant_id)
+        )
+        assert len(page.items) == len(original)
+
+
+def test_the_public_view_of_an_empty_catalog_is_empty():
+    """max() over an empty UInt64 watermark is 0, and versions start at 1.
+
+    So the bound admits nothing rather than everything -- the failure mode a
+    NULL or a missing row would produce.
+    """
+    with _catalog() as (_, _, client, config):
+        assert client.execute(
+            "SELECT max(index_version) FROM "
+            f"`{config.database}`.`{config.table_prefix}_index_watermark`"
+        ) == [(0,)]
+        assert _view_rows(client, config) == []
+
+
+def test_the_public_view_is_the_raw_rows_of_published_packs():
+    """The bound is exactly membership: no row more, no row fewer."""
+    published = synthetic_descriptors(4)
+    unpublished = _retried_into_a_new_pack(published)
+    with _catalog() as (writer, _, client, config):
+        writer.write_descriptors(published, index_version=1)
+        _publish(writer, 1, refs=_refs(published), rows=len(published))
+        _commit(writer, published, 1)
+        # Written at a version that never publishes: durable, never a member.
+        writer.write_descriptors(unpublished, index_version=2)
+        _merge(client, config)
+
+        identities = [
+            (ref.store_id, ref.pack_id) for ref in _refs(published)
+        ]
+        expected = client.execute(
+            f"SELECT {_PUBLIC_COLUMNS} FROM "
+            f"`{config.database}`.`{config.table_prefix}_capture_raw` FINAL "
+            "WHERE (store_id, pack_id) IN %(identities)s "
+            "ORDER BY capture_id, store_id, pack_id",
+            {"identities": identities},
+        )
+
+        assert len(expected) == len(published)
+        assert _view_rows(client, config) == expected
+        assert _raw_rows(client, config) == len(published) + len(unpublished)

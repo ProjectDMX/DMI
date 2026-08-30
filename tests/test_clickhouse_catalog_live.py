@@ -38,6 +38,16 @@ def test_duplicate_catalog_replay_is_logically_deduplicated():
         writer.ensure_schema()
         for version in (1, 2):
             writer.write_descriptors([descriptor], index_version=version)
+            # The publish is what admits the pack to the public view, which is
+            # now bounded by snapshot membership rather than showing every row
+            # the raw table holds. commit_packs is only the replay guard.
+            writer.publish_snapshot(
+                index_version=version,
+                refs=[ref],
+                published_at_ns=version,
+                indexed_rows=1,
+                indexed_packs=1,
+            )
             writer.commit_packs([ref], index_version=version)
 
         assert client.execute(

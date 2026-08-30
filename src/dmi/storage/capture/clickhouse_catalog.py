@@ -131,6 +131,8 @@ class ClickHouseCatalogWriter:
         capture_view = f"{database}.{_quoted(self._capture_view)}"
         pack_raw = f"{database}.{_quoted(self._pack_raw)}"
         pack_view = f"{database}.{_quoted(self._pack_view)}"
+        watermark = f"{database}.{_quoted(self._watermark)}"
+        manifest = f"{database}.{_quoted(self._manifest)}"
         self._client.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
         self._client.execute(
             f"""CREATE TABLE IF NOT EXISTS {capture_raw} (
@@ -189,7 +191,7 @@ ORDER BY (store_id, pack_id)"""
         # ReplacingMergeTree would eventually collapse the history a pinned
         # snapshot reads.
         self._client.execute(
-            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._watermark)} (
+            f"""CREATE TABLE IF NOT EXISTS {watermark} (
 index_version UInt64, published_at_ns UInt64, indexed_rows UInt64, indexed_packs UInt32
 ) ENGINE = MergeTree ORDER BY index_version"""
         )
@@ -220,17 +222,58 @@ version UInt64, claim_id UUID, claimed_at_ns UInt64
         # that loses the race never writes that watermark row -- so the rows it
         # left behind are inert.
         self._client.execute(
-            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._manifest)} (
+            f"""CREATE TABLE IF NOT EXISTS {manifest} (
 index_version UInt64, store_id LowCardinality(String), pack_id UUID
 ) ENGINE = MergeTree ORDER BY (index_version, store_id, pack_id)"""
         )
 
         capture_public = ", ".join(_CAPTURE_COLUMNS[:-1])
         pack_public = ", ".join(_PACK_COLUMNS[:-1])
+        # The public descriptor view: PUBLISHED descriptor rows,
+        # engine-deduplicated. Both halves are needed and neither substitutes
+        # for the other.
+        #
+        # FINAL hides the storage engine's transient duplicates, so a replayed
+        # batch reads as one row without waiting for a merge. It applies no
+        # membership at all, which is why this view used to show rows from
+        # batches that were written and never published, and rows orphaned by a
+        # crashed indexing pass -- data every reader correctly treats as
+        # nonexistent. The bound is the same membership test the reader
+        # applies, so the view and the reader now agree on what exists.
+        #
+        # Filtering under FINAL is sound here only because (store_id, pack_id)
+        # is part of the table's sort key: rows a merge may collapse into one
+        # all share those columns, so the predicate keeps or drops a whole
+        # group and can never delete the representative FINAL would have kept.
+        # A predicate on index_version has no such guarantee -- FINAL collapses
+        # to the highest version and only then filters -- which is why
+        # ``FINAL ... WHERE index_version <= W`` is not a snapshot.
+        #
+        # This deliberately does NOT group on capture identity. One row per
+        # (capture, store, pack): a capture described by two packs legitimately
+        # appears twice, and choosing between them is supersession, which
+        # belongs to the reader (argMax over index_version, grouped on capture
+        # identity). An argMax here would be a second copy of the reader's
+        # semantics living in SQL, free to drift away from it silently.
+        #
+        # CREATE OR REPLACE rather than IF NOT EXISTS: a catalog created by an
+        # earlier build already holds the unbounded view, and IF NOT EXISTS
+        # would leave it serving unpublished rows forever.
+        #
+        # The statement reads the manifest and the watermark, which is why both
+        # tables are created above it. Reordered, ensure_schema breaks on a
+        # fresh server only -- a rerun finds them already there.
         self._client.execute(
-            f"CREATE VIEW IF NOT EXISTS {capture_view} AS "
-            f"SELECT {capture_public} FROM {capture_raw} FINAL"
+            f"CREATE OR REPLACE VIEW {capture_view} AS "
+            f"SELECT {capture_public} FROM {capture_raw} FINAL "
+            "WHERE (store_id, pack_id) IN ("
+            f"SELECT store_id, pack_id FROM {manifest} "
+            f"WHERE index_version <= (SELECT max(index_version) FROM {watermark})"
+            ")"
         )
+        # The inventory needs no such bound. CatalogIndexer.index writes it
+        # only after a successful publish -- descriptors, publish, inventory --
+        # so a pack reaches this table only once it is already published.
         self._client.execute(
             f"CREATE VIEW IF NOT EXISTS {pack_view} AS "
             f"SELECT {pack_public} FROM {pack_raw} FINAL"
