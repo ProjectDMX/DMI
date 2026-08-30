@@ -1,0 +1,1128 @@
+# Capture storage design
+
+Status: Accepted; host storage reference through Phase 5 implemented
+
+This document defines a clean-slate host persistence architecture after Ring².
+It does not change the CUDA producer, ring layout, or device-to-host transport.
+The new path remains opt-in until CPU-only, live-store, and compatibility gates
+pass.
+
+The visual companion is
+[`capture-storage-pipeline.html`](capture-storage-pipeline.html).
+
+## Implementation status
+
+The first host-only slice is available under `dmi.storage.capture`:
+
+| Capability | Status |
+|---|---|
+| Versioned pack writer and full validator | Implemented |
+| Two-range footer index | Implemented |
+| Immutable filesystem store | Implemented |
+| Stable selection, byte estimation, and range hydration | Implemented |
+| CPU pack benchmark and package checks | Implemented |
+| Bounded asynchronous pack pipeline and spool recovery | Implemented |
+| Garage/S3 store and bounded parallel uploader | Implemented |
+| ClickHouse metadata projection | Implemented and live-tested |
+| Opt-in Ring² to Python pack adapter | Reference implementation |
+| Summaries | Planned |
+
+This slice remains opt-in. A reference adapter can now connect the generic
+record sink boundary to the Python pack pipeline without changing the CUDA
+producer or the existing ClickHouse payload sink.
+
+The Phase 2 implementation adds `HostCapturePipeline`, bounded blocking or
+drop-newest admission, size/record/linger/session/shutdown sealing, direct local
+persistence, and a durable filesystem spool. The durable sink commits locally;
+`SpoolUploader` independently retries staged packs and removes them only after
+remote size and SHA-256 verification. One process owns a spool directory.
+
+Phase 3 adds `S3PackStore` and `ParallelSpoolUploader`. The store streams packs
+through Boto3 managed multipart transfers, persists DMI SHA-256 and pack
+identity as object metadata, supports exact byte ranges and bounded paginated
+listing, and resolves ambiguous retries by checking the existing key. The
+uploader bounds outer workers and aggregate bytes in flight, applies bounded
+backoff only to transient failures, and leaves permanent failures in the spool.
+
+Phase 4 adds bounded notification and prefix-scan discovery, footer-only pack
+indexing, client-side ClickHouse batching, and pack commit markers. Descriptor
+rows are inserted before their pack marker. An interrupted or ambiguous batch
+may replay physical rows, while `ReplacingMergeTree` tables and public `FINAL`
+views preserve immediate logical results. Object storage remains sufficient to
+rebuild the projection.
+
+## Decision
+
+Treat immutable, self-describing tensor packs in object storage as the only
+durable source of truth. A successful object upload is the capture commit.
+ClickHouse is a rebuildable analytical projection populated by an independent
+catalog indexer.
+
+```text
+Ring² host drain
+      |
+      v
+bounded slabs -> pack assembler -> direct upload or NVMe spool
+                                      |
+                                      v
+                         canonical object-store packs
+                                      |
+                    +-----------------+-----------------+
+                    |                                   |
+                    v                                   v
+            catalog indexer                      summary workers
+                    |                                   |
+                    v                                   v
+            ClickHouse catalog             scalar rows + object artifacts
+                    |
+                    v
+       metadata-first query -> estimate -> selective range hydration
+```
+
+The capture host does not run a ClickHouse client, compute summaries, or
+coordinate two durable writes. Object-created notifications reduce indexing
+latency, while periodic listing and reconciliation provide completeness.
+
+## Goals
+
+- Keep persistence and analytics off the inference path.
+- Scale payload upload, catalog indexing, and summarization independently.
+- Avoid one object-store request or ClickHouse insert per tensor.
+- Bound host memory, disk, concurrency, retries, and read amplification.
+- Make the catalog reconstructable from canonical packs.
+- Let users and agents inspect summaries before transferring tensor bytes.
+- Add storage providers and summarizers without changing Ring².
+- Prove the design on CPU-only hosts before changing CUDA code.
+
+## Non-goals
+
+- Changing hook placement, the CUDA producer, or Ring².
+- Querying arbitrary tensor contents directly in ClickHouse.
+- Providing a cross-system exactly-once transaction.
+- Using an embedded database as a second source of truth.
+- Selecting production pack sizes or codecs without measurement.
+
+## Performance model
+
+The hot path is deliberately short:
+
+```text
+drain -> acquire reusable slab -> append record -> seal pack -> enqueue upload
+```
+
+The architecture removes four scaling costs from capture hosts:
+
+- per-tensor network requests;
+- ClickHouse insert latency and merge behavior;
+- summary computation;
+- coordination between payload and catalog durability.
+
+Packs amortize object-store request and protocol overhead. An independent
+indexer reads only pack footers and batches rows across all producers before
+inserting into ClickHouse. Readers coalesce adjacent selected ranges instead of
+downloading complete packs.
+
+Initial tuning ranges are hypotheses:
+
+| Setting | Initial sweep | Purpose |
+|---|---:|---|
+| Target pack size | 64–256 MiB | Amortize upload and object overhead |
+| Maximum linger | 50–100 ms | Bound visibility latency at low volume |
+| Upload workers | 1–16 | Find the store/network saturation point |
+| Index batch rows | 10k–100k | Avoid small ClickHouse inserts |
+| Index batch bytes | 16–64 MiB | Bound memory while preserving batch efficiency |
+
+The pack-and-upload plane must sustain at least 1.2 times the expected
+device-to-host rate on representative hardware. A value becomes a default only
+after repeated measurements exceed run-to-run variance and correctness tests
+remain green.
+
+## Host capture agent
+
+### Admission
+
+The drain thread hands each `CaptureRecord` to a queue bounded by both bytes and
+record count. A record owns or references a contiguous CPU payload and immutable
+metadata. Queue saturation follows an explicit policy: bounded blocking,
+sampling, or dropping. The system never silently grows memory or disk.
+
+### Pack assembly
+
+Pack assemblers use reusable slabs and partition work by stable producer scope
+so independent capture streams do not share a global lock. They seal on target
+size, linger deadline, session boundary, or shutdown.
+
+Each record is independently encoded. Whole-pack streaming compression is not
+used because it would require preceding bytes to decode one selected tensor.
+The first implementation supports `none` and one measured block codec.
+
+### Direct and durable modes
+
+Both modes implement the same `PackSink` contract. Direct mode writes a
+`PackSource` to a `PackStore`; durable mode first writes that source to the
+local spool and exposes the staged file as another streaming `PackSource`.
+
+Direct mode uploads sealed packs from bounded memory. Durable mode writes sealed
+packs to local NVMe and uses atomic rename:
+
+```text
+.open -> .ready -> upload -> remote verification -> delete
+```
+
+At restart, valid `.ready` packs are retried with the same deterministic key.
+Ambiguous uploads use remote metadata and checksum verification. The filesystem
+state machine is sufficient initially; RocksDB or SQLite is added only if
+measurements demonstrate a recovery or scheduling bottleneck.
+
+The spool absorbs bursts and process failure. It cannot compensate for
+sustained object-store throughput below the capture rate.
+
+The CPU reference exposes the modes through a common `PackSink` boundary:
+
+```python
+config = PipelineConfig(
+    max_queue_records=256,
+    max_queue_bytes=16 * 1024**2,
+    max_pack_bytes=128 * 1024**2,
+    max_pack_records=10_000,
+    max_linger_ns=100_000_000,
+)
+
+sink = DirectPackSink(store)
+# Or: sink = DurablePackSink(DurablePackSpool(path, max_bytes=...))
+
+pipeline = HostCapturePipeline(config, sink)
+pipeline.start()
+result = pipeline.submit(record)
+snapshot = pipeline.close(timeout=30)
+```
+
+### Opt-in Ring² reference adapter
+
+`CapturePackReferenceSink` is a correctness bridge for exercising this storage
+path from a real record ring. It is selected explicitly; omitting
+`record_sink` preserves the existing native ClickHouse path, and the two sinks
+are never active at the same time.
+
+```python
+pipeline = HostCapturePipeline(config, sink)
+pipeline.start()
+reference = CapturePackReferenceSink(pipeline)
+
+runtime = engine.create_record_runtime(
+    reference.record_format,
+    record_sink=reference.native_sink,
+)
+
+# Bind HookPointV1 and run normal single-worker, single-stream forwards.
+engine.flush_and_wait(30.0)  # non-closing; earlier records are durable
+engine.close()               # stop Ring/drain/P2P before the Python queue
+reference.close(timeout=30.0)
+```
+
+The versioned reference wire carries canonical `CaptureMetadata` JSON beside
+one or more fixed-shape tensor payload slices. The native sink validates each
+slice, then acquires the GIL; the Python target copies it to immutable `bytes`
+before admission to the dedicated `HostCapturePipeline`. This adds one copy
+and a Python callback per row, so it is intentionally separate from the future
+production native pack writer.
+
+The generic record engine owns an exclusive sink lease. Acquisition happens
+before replacing an active Ring, while release happens only after the record
+worker stops; the reference adapter does not add a separate lifecycle path.
+
+`HostCapturePipeline.flush()` is a FIFO, repeatable, non-closing barrier. It
+seals the current pack and waits for `PackSink.persist()` for every earlier
+admission. With `DirectPackSink` that means object-store commit; with
+`DurablePackSink` it means local spool fsync/rename, not remote upload.
+
+The adapter does not broaden Ring² concurrency: each process/rank owns its own
+Ring and pipeline, and producers retain DMI's existing serialized CUDA-stream
+contract. The reference format rejects device-gated hooks because the current
+record envelope cannot distinguish a gated-off empty tensor from a real empty
+capture; adding an explicit skip marker belongs to the future native protocol.
+
+Admission returns an explicit `AdmissionResult`. It never silently expands the
+queue. Durable mode intentionally separates local commit from remote upload so
+a remote outage cannot invalidate a completed local commit.
+
+## Pack format
+
+`dmi-pack-v1` is one immutable object:
+
+```text
++------------------------+
+| fixed header           | magic, format version, pack ID
++------------------------+
+| independently encoded  | tensor record 0
++------------------------+
+| independently encoded  | tensor record 1
++------------------------+
+| ...                    |
++------------------------+
+| footer manifest        | IDs, provenance, shape, offsets, codecs, checksums
++------------------------+
+| fixed trailer          | footer offset/length, pack checksum
++------------------------+
+```
+
+The fixed trailer allows an indexer to locate the footer with one small suffix
+range read. A second range read retrieves the footer. Tensor bytes are not read
+during catalog indexing.
+
+The footer is authoritative for reconstruction. It includes stable capture
+identity, format identity, object-relative ranges, and sufficient metadata to
+recreate catalog rows. Readers reject unknown major versions and allow only
+documented additive minor changes.
+
+Object keys are immutable and deterministic for one persistence intent:
+
+```text
+v1/tenant=<tenant-id>/date=<yyyy-mm-dd>/session=<session-id>/rank=<rank>/<pack-id>.dmi-pack
+```
+
+Key components are percent-encoded. Values that would exceed portable
+filesystem component limits use a stable SHA-256 component; the full value
+remains in the pack footer and catalog.
+
+The same retry reuses the key and checksum. A different pack never reuses that
+key.
+
+## Commit and discovery semantics
+
+Successful completion of the pack upload is the commit. There is no separate
+manifest object or catalog acknowledgement.
+
+Discovery combines:
+
+1. Object-created notifications for low latency.
+2. Periodic prefix scans for correctness.
+3. Stable pack IDs for idempotent replay.
+
+Notifications may be delayed, duplicated, or reordered. The indexer therefore
+treats them as hints. Reconciliation scans recent time partitions and scheduled
+older partitions, compares pack identities with indexed state, and replays any
+missing work.
+
+## Catalog indexer
+
+The indexer is isolated from capture hosts and scales independently. For each
+discovered pack it:
+
+1. Reads the fixed trailer.
+2. Reads and validates the footer.
+3. Converts descriptors into catalog rows.
+4. Batches rows across many packs.
+5. Inserts into ClickHouse using stable IDs and versions.
+6. Reports discovery lag, validation failures, and batch health.
+
+At-least-once discovery can produce physical duplicates. Private raw tables may
+use `ReplacingMergeTree`, but public views must provide deterministic logical
+deduplication. Correctness does not depend on asynchronous merges having run.
+
+ClickHouse stores:
+
+- pack inventory and integrity state;
+- capture descriptors and payload ranges;
+- stable core summaries;
+- extensible scalar metrics;
+- references to large summary artifacts;
+- indexing and enrichment health.
+
+ClickHouse does not store raw tensor payloads or the only copy of essential
+capture metadata.
+
+## Summary model
+
+Summary computation is asynchronous and versioned by:
+
+```text
+(capture_id, summarizer_name, summarizer_version, config_hash)
+```
+
+Stable, commonly filtered values such as minimum, maximum, mean, standard
+deviation, norms, sparsity, NaN count, and infinity count use typed ClickHouse
+columns. Extensible scalar metrics use a bounded long-form table. Large arrays,
+histograms, embeddings, sketches, and sampled tensors remain immutable objects
+with catalog locators.
+
+New summarizers do not change the capture host or pack format.
+
+## Reader and agent workflow
+
+The public API is metadata-first and bounded:
+
+```text
+search(filters, page)
+query_metrics(filters, metric_names, page)
+estimate_hydration(capture_ids)
+hydrate(capture_ids, byte_limit, request_limit)
+get_artifacts(capture_ids)
+export(capture_ids, format)
+```
+
+A typical flow is:
+
+1. Query ClickHouse with bounded filters and pagination.
+2. Inspect core or custom summaries.
+3. Select capture IDs.
+4. Estimate total read bytes and request count.
+5. Coalesce adjacent ranges within each pack.
+6. Fetch with byte, request, and concurrency limits.
+7. Verify checksums and decode selected records.
+
+Hydration also binds every catalog descriptor to the pack footer before any
+payload range is fetched: the footer index is loaded with the usual two small
+range reads (trailer, then footer), cached per pack in an LRU bounded by both
+pack count and serialized footer bytes, and charged to the same request and
+byte limits as payload reads. The zero-I/O estimate uses a safe cold-cache
+upper bound because the exact footer length is available only after reading
+the trailer. A descriptor whose metadata or record locator contradicts the
+footer fails hydration as a format error. This closes the catalog-trust gap
+where a re-described row (same bytes and CRC, different dtype or shape) would
+decode garbage. The catalog remains the query index and the footer the
+authority; estimation stays metadata-only and reads nothing.
+
+List and summary operations never hydrate tensor bytes implicitly. Storage
+credentials and provider endpoints are resolved from deployment configuration,
+not returned in catalog rows.
+
+## Extension contracts
+
+```python
+class PackWriter(Protocol):
+    def append(self, record: CaptureRecord) -> None: ...
+    def seal(self) -> SealedPack: ...
+
+
+class PackSource(Protocol):
+    pack_id: str
+    object_bytes: int
+    checksum: str
+    def open(self) -> BinaryIO: ...
+
+
+class PackStore(Protocol):
+    def put(self, pack: PackSource, object_key: str) -> PackRef: ...
+    def stat(self, ref: PackRef) -> ObjectInfo: ...
+    def read_range(self, ref: PackRef, offset: int, length: int) -> bytes: ...
+    def list_committed(self, cursor: ScanCursor) -> Page[PackRef]: ...
+
+
+class PackSink(Protocol):
+    def persist(self, ready: ReadyPack) -> object: ...
+
+
+class CommitFeed(Protocol):
+    def watch(self, cursor: EventCursor) -> Iterable[PackRef]: ...
+    def scan(self, cursor: ScanCursor) -> Page[PackRef]: ...
+
+
+class CatalogIndexer(Protocol):
+    def index(self, packs: Sequence[PackRef]) -> IndexResult: ...
+
+
+class CaptureSummarizer(Protocol):
+    name: str
+    version: str
+    def summarize(self, capture: CaptureDescriptor, tensor: TensorView) -> SummaryBatch: ...
+
+
+class CaptureReader(Protocol):
+    def search(self, query: CaptureQuery) -> Page[CaptureDescriptor]: ...
+    def estimate(self, ids: Sequence[CaptureId]) -> HydrationEstimate: ...
+    def hydrate(self, request: HydrationRequest) -> Iterable[TensorRecord]: ...
+```
+
+Initial implementations:
+
+```text
+PackStore
+  - FilesystemPackStore
+  - S3PackStore
+
+CatalogIndexer
+  - ClickHouseCatalogIndexer
+
+CaptureSummarizer
+  - CoreTensorStatsSummarizer
+```
+
+External configuration and provider responses are validated at their
+boundaries. Internal stages exchange typed records without repeated validation.
+
+`S3PackStore` is the Garage implementation; Garage is selected through its
+endpoint, region, and credentials rather than a provider-specific subclass.
+This avoids duplicating the S3 contract while keeping provider compatibility in
+the live test matrix.
+
+## Failure semantics
+
+| Failure | Visible result | Recovery |
+|---|---|---|
+| Upload fails | Pack is not committed | Retry the deterministic key with bounded backoff |
+| Upload succeeds, event is lost | Pack exists but catalog is late | Prefix reconciliation discovers it |
+| Event is duplicated | Same pack may be indexed again | Stable IDs and public deduplication preserve logical results |
+| ClickHouse is unavailable | Capture continues; catalog lag grows | Indexer retries and replays canonical packs |
+| Footer is corrupt | Pack is not indexed | Quarantine identity and emit an integrity failure |
+| Reader gets a short range | Hydration fails closed | Retry, then report pack and range |
+| Checksum mismatches | Tensor is not decoded | Quarantine pack and emit an integrity failure |
+| Host queue or spool fills | Configured overload policy applies | Report pressure and drops; never grow without bound |
+| Process exits with `.ready` packs | Packs remain locally recoverable | Restart uploader and verify ambiguous remote writes |
+
+Deleting a pack requires a separate retention workflow. Garbage collection and
+pack compaction never run in capture or indexing critical paths.
+
+## Observability and acceptance gates
+
+| Plane | Required measurements |
+|---|---|
+| Admission | enqueue latency, blocked time, drops, queue bytes |
+| Packing | GiB/s, CPU, copies, compression ratio, flush reason |
+| Upload | GiB/s, p50/p95 latency, active requests, retries, spool growth |
+| Indexing | catalog lag, rows/s, rows/insert, bytes/insert, duplicate rate |
+| Hydration | range latency, useful GiB/s, read amplification, checksum failures |
+| Process | CPU, peak RSS, network, local-spool I/O |
+| End-to-end | capture-to-committed and capture-to-queryable p50/p95/p99 |
+
+Correctness gates every performance result. A faster path that loses required
+records, skips validation, or changes reader semantics is a regression.
+
+## Package layout
+
+```text
+src/dmi/storage/capture/
+  model.py                 # contracts and bounded request types
+  pack.py                  # dmi-pack-v1 writer, validator, footer index
+  filesystem.py            # immutable local reference store
+  reader.py                # selection, estimation, coalesced hydration
+  pipeline.py              # bounded admission, assembly, sinks, metrics
+  spool.py                 # atomic local commit, recovery, retry upload
+  s3.py                    # Garage/S3 streaming, listing, exact range reads
+  catalog.py               # discovery, reconciliation, footer indexing
+  clickhouse_catalog.py    # raw tables, logical views, batched inserts
+
+# Planned additions
+src/dmi/storage/
+  summaries/
+    contracts.py
+    core.py
+
+native/csrc/storage/
+  capture_record.h
+  pack_builder.h
+  persistence_pipeline.h
+  spool.h
+```
+
+## Implementation plan
+
+### Phase 1 — contract and format
+
+- Specify `dmi-pack-v1`, stable identifiers, checksums, and compatibility.
+- Implement writer/reader round trips and filesystem storage.
+- Test truncation, corruption, unknown versions, and deterministic retries.
+
+Exit gate: CPU-only format tests pass and pack throughput is reproducible.
+
+Status: CPU reference exit gate passed. The local five-trial, 2,000-record
+baseline used 64 KiB payloads and one roughly 126 MiB pack per trial. It measured
+0.521 GiB/s median construction throughput and 1.009× space amplification. This
+is a regression baseline for the Python reference, not evidence that the future
+native pipeline meets the 1.2× production-capacity gate.
+
+Run it from a source checkout with:
+
+```bash
+PYTHONPATH=src python -m benchmarks.bench_capture_pack \
+  --records 2000 --payload-bytes 64KiB \
+  --target-pack-bytes 128MiB --trials 5
+```
+
+### Phase 2 — bounded CPU pipeline
+
+- Implement reusable slabs and size/linger sealing.
+- Add direct upload and durable-spool policies behind an opt-in mode.
+- Add saturation, restart, and ambiguous-upload tests.
+
+Exit gate: memory and disk remain bounded under sustained overload.
+
+Status: CPU reference exit gate passed. Queue tests sustain 100 submissions
+against a three-record/24-byte queue and preserve the exact bound under
+drop-newest overload. The measured blocking-admission workload used 2,000 ×
+64 KiB records, a 256-record/16 MiB queue, and one roughly 126 MiB pack. Across
+five local trials it reported:
+
+| Mode | Median logical throughput | Drops | Peak queue |
+|---|---:|---:|---:|
+| Direct filesystem | 0.328 GiB/s | 0 | 256 records / 16 MiB |
+| Durable spool | 0.345 GiB/s | 0 | 256 records / 16 MiB |
+
+Those two figures are from the original Apple Silicon run and predate the
+removal of the write path's redundant hashing and buffer copies. Re-measured
+on the Linux reference host afterwards, with interleaved A/B sampling, the
+same shape of workload sustains 0.291 GiB/s direct and 0.282 GiB/s spooled;
+the pack writer alone reaches 0.472 GiB/s. The capacity gate later in this
+document uses the post-change numbers.
+
+Both modes produced 1.0095× space amplification. The difference between local
+modes is within filesystem and scheduling variance; it is not treated as an
+optimization result. Neither number includes Garage or network upload.
+
+Run the same workload with:
+
+```bash
+PYTHONPATH=src python -m benchmarks.bench_capture_pipeline \
+  --mode direct --records 2000 --payload-bytes 64KiB \
+  --target-pack-bytes 128MiB --queue-records 256 \
+  --queue-bytes 16MiB --trials 5
+```
+
+### Phase 3 — Garage integration
+
+- Implement the S3-compatible store contract.
+- Sweep pack size, multipart threshold, and upload concurrency.
+- Test retries, restart recovery, listing, and range reads against a pinned
+  Garage single-node release.
+
+Exit gate: pack and upload capacity exceeds target input by at least 1.2 times.
+
+Status: implementation and local compatibility gates passed. A reference
+device-to-host rate for a single RTX 4090 host is derived below and the gate is
+evaluated against it; the gate remains open for production hardware, where the
+network and storage path differ from this loopback single-node setup. The pinned Garage
+v2.3.0 live test covers multipart upload, retry idempotency, object metadata,
+listing, and the two range reads used to load a pack footer.
+
+The released Garage binary is now verified on Linux as well as from source.
+`garage v2.3.0 [features: bundled-libs, consul-discovery, fjall, journald, k2v,
+kubernetes-discovery, lmdb, metrics, sqlite, syslog, telemetry-otlp]`, the
+published x86-64 Linux download, runs the whole live suite unmodified; the
+harness accepts both that version string and the `cargo:2.3.0` a source build
+reports.
+
+#### Server-side checksums
+
+`S3PackStore.put` sends `ChecksumAlgorithm=SHA256`, and Garage 2.3.0 both
+supports and enforces it, measured against the ephemeral server:
+
+- A `PutObject` whose `ChecksumSHA256` contradicts the body is rejected with
+  `InvalidDigest` (HTTP 400); a matching one is stored and returned verbatim by
+  `HeadObject` with `ChecksumMode=ENABLED`.
+- An `UploadPart` whose `ChecksumSHA256` contradicts the part is rejected the
+  same way, so every part of a multipart pack is checked on arrival rather than
+  only at completion.
+- For a multipart object the stored `ChecksumSHA256` is S3's composite
+  checksum-of-checksums — `SHA256` of the concatenated per-part digests, which
+  reproduces Garage's value exactly — and therefore is **not** the digest of the
+  whole object. Garage returns that composite without the `-<parts>` suffix AWS
+  appends, so it cannot even be recognised as composite by shape. It is
+  consequently never compared against `PackRef.checksum`; DMI identity keeps
+  using the client-side `dmi-sha256` object metadata, which the upload tee
+  computes over the exact byte stream boto3 sends.
+
+The server-side checksum is therefore defence in depth against corruption
+between the bytes boto3 read and the bytes Garage stored, not a replacement for
+the DMI digest.
+
+#### Live coverage
+
+`tests/test_garage_live.py` (markers `garage` + `manual`) covers the isolated
+store contract and the production write path end to end:
+
+- `test_garage_multipart_retry_listing_and_two_range_footer_read` — multipart
+  upload, idempotent retry, object metadata, listing, footer range reads.
+- `test_garage_pipeline_spool_upload_commits_every_pack` —
+  `HostCapturePipeline` -> `DurablePackSpool` -> `ParallelSpoolUploader` ->
+  Garage. Every staged pack becomes exactly one object, the stored bytes are
+  byte-identical to the sealed pack, `HeadObject` agrees with the `PackRef`, the
+  spool is empty afterwards, and the uploader reports zero retries and zero
+  failures.
+- `test_garage_restart_recovers_exactly_the_un_uploaded_packs` — a batch is
+  interrupted part way, then a fresh spool and uploader over the same directory
+  recover exactly the packs that were never uploaded and complete them. No
+  duplicated objects, no lost packs.
+- `test_garage_failed_upload_keeps_the_local_copy` — a scripted permanent
+  upload failure leaves the pack staged and its object absent, and the next
+  pass uploads it successfully. Local durability survives a failed commit.
+
+`tests/test_capture_garage_e2e.py` (markers `garage` + `clickhouse` + `manual`)
+closes the loop through the catalog. It uploads real packs to Garage, discovers
+them by bucket listing only — `S3PackStore` acting as the `PackInventory` a
+`CatalogReconciler` reads, so every `PackRef` is rebuilt from Garage object
+metadata — indexes them into ClickHouse under a unique table prefix, pins a
+watermark, searches and resolves by ID at that pin, hydrates payloads by range
+read out of Garage, and asserts both the raw bytes and the decoded tensors match
+what was captured. It also asserts that re-reconciling the same bucket indexes
+nothing new, and that a foreign object in the prefix is reported as one failure
+without holding back the healthy packs. Both the ClickHouse tables and the
+bucket objects it created are removed on teardown.
+
+An Apple Silicon local sweep used four packs per trial, a 16 MiB multipart
+threshold and chunk, two multipart requests per pack, and three trials per
+point. All objects and byte caps verified with zero retries:
+
+| Pack payload | 1 outer worker | 2 outer workers | 4 outer workers |
+|---:|---:|---:|---:|
+| 32 MiB | 0.248 GiB/s | 0.388 GiB/s | 0.473 GiB/s |
+| 64 MiB | 0.265 GiB/s | 0.397 GiB/s | 0.502 GiB/s |
+
+The same sweep against the released Linux binary (AMD Ryzen Threadripper PRO
+5955WX, Linux 5.15, loopback, single node, `sqlite` metadata engine), median of
+three trials per point, again with zero retries:
+
+| Pack payload | 1 outer worker | 2 outer workers | 4 outer workers |
+|---:|---:|---:|---:|
+| 32 MiB | 0.207 GiB/s | 0.327 GiB/s | 0.363 GiB/s |
+| 64 MiB | 0.259 GiB/s | 0.394 GiB/s | 0.438 GiB/s |
+
+Both platforms show useful parallel scaling and saturation beginning near four
+outer workers on this loopback, single-node setup. They do not establish a
+production default. Outer pack concurrency and per-pack multipart concurrency
+multiply; their product and the configured HTTP connection pool bound the
+potential active S3 requests.
+
+Install the optional client and run the isolated live contract with:
+
+```bash
+python -m pip install -e '.[s3]'
+DMI_GARAGE_BINARY=/path/to/garage \
+  python tests/tools/run_garage_live.py
+```
+
+The harness pins Garage 2.3.0 by default, creates temporary credentials and
+storage, and deletes the entire instance on exit. The official Garage download
+page publishes Linux binaries; macOS can build the same pinned tag from source
+using Garage's documented Cargo workflow.
+
+`--tests` and `--marker` select what runs under that ephemeral server; the
+defaults reproduce the isolated store and pipeline suite. The Garage plus
+ClickHouse end-to-end suite needs both, so it is selected explicitly:
+
+```bash
+DMI_CLICKHOUSE_HOST=127.0.0.1 DMI_GARAGE_BINARY=/path/to/garage \
+  python tests/tools/run_garage_live.py \
+  --tests tests/test_capture_garage_e2e.py \
+  --marker "garage and clickhouse and manual"
+```
+
+Run a sweep against the same ephemeral server with:
+
+```bash
+DMI_GARAGE_BINARY=/path/to/garage \
+  python tests/tools/run_garage_live.py --benchmark -- \
+  --pack-payload-bytes 32MiB,64MiB \
+  --multipart-threshold-bytes 16MiB \
+  --upload-workers 1,2,4 --packs-per-trial 4 \
+  --multipart-chunk-bytes 16MiB --multipart-concurrency 2 --trials 3
+```
+
+
+#### Reference capture rate: single RTX 4090 server
+
+The capacity gate needs a target input rate. This section derives one for a
+single-GPU RTX 4090 host so the gate can be evaluated; it is a derived figure
+from measured hardware limits and model shapes, not a measurement of a
+production capture workload.
+
+The PCIe link is not the constraint. Measured device-to-host bandwidth on an
+RTX 4090 (PCIe 4.0 x16, pinned host memory) is 24.5 GiB/s at 16 MiB transfers
+and above, 20.8 GiB/s at 1 MiB, and 9.3 GiB/s for pageable memory. That is two
+orders of magnitude above anything the capture plane needs, so the link only
+matters as a reason to keep hook copies pinned and batched, not as a capacity
+bound.
+
+What bounds capture volume is decode throughput times bytes captured per token.
+Decode is weight-read bound, so tokens per second is approximately
+(memory bandwidth / weight bytes) x batch, derated to 75% for attention, KV
+traffic, and scheduling. With 1008 GB/s of device bandwidth:
+
+| Model (bf16) | Batch | Decode | resid, all layers | resid, every 4th layer |
+|---|---:|---:|---:|---:|
+| Qwen3-4B (36 layers, d=2560) | 32 | ~3,000 tok/s | 0.519 GiB/s | 0.130 GiB/s |
+| Llama-3.1-8B (32 layers, d=4096) | 32 | ~1,500 tok/s | 0.369 GiB/s | 0.092 GiB/s |
+| Qwen3-14B (40 layers, d=5120) | 16 | ~430 tok/s | 0.165 GiB/s | 0.041 GiB/s |
+
+A smaller model produces more capture bytes per second, not fewer: it decodes
+proportionally faster, and per-token capture volume falls more slowly than
+decode throughput rises. Attention-pattern hooks are excluded because they
+scale with sequence length squared rather than per token; any policy capturing
+them must sample aggressively and needs its own budget.
+
+Against the measured plane capacity on this host, after the redundant hashing
+and buffer copies were removed from the write path (the figures the earlier
+sections of this document quote, 0.216 and 0.370 GiB/s, predate that change):
+
+| Stage | Capacity | Supported input at the 1.2x gate |
+|---|---:|---:|
+| Pipeline, spool mode, one instance | 0.282 GiB/s | 0.235 GiB/s |
+| Pipeline, direct mode, one instance | 0.291 GiB/s | 0.243 GiB/s |
+| Pack writer alone | 0.472 GiB/s | 0.393 GiB/s |
+| Garage upload, 4 workers, 64 MiB packs | 0.438 GiB/s | 0.365 GiB/s |
+
+**Adopted target: 0.235 GiB/s of sustained capture per pipeline instance**,
+taking the durable spool path as the production shape and leaving the pipeline
+as the binding constraint rather than packing or upload.
+
+The gate outcome follows directly:
+
+- A sampled policy -- every 4th layer, all tokens -- passes on one 4090 for
+  every model above, with 1.8x to 5.7x margin beyond the required 1.2x.
+- Full-fidelity capture of every layer passes for Qwen3-14B (0.165 GiB/s of
+  input against a 0.235 GiB/s budget) but not for the smaller, faster-decoding
+  models: Llama-3.1-8B needs 0.369 GiB/s and Qwen3-4B 0.519 GiB/s. Those need
+  either two to three pipeline instances sharded by layer range or producer
+  rank, or a native writer.
+
+The pipeline ceiling is a Python-side limit -- the pack writer alone runs at
+0.472 GiB/s, so roughly 40% of achievable throughput is still lost between the
+queue and persistence. That gap, not the object store, is where full-fidelity
+single instance capture would have to be won, and it is the same boundary the
+production-writer discussion in this document points at.
+
+On a three-GPU host these numbers multiply: full capture across three 4090s is
+about 1.1 GiB/s, requiring roughly six pipeline instances at the current
+per-instance rate, or the native path.
+
+### Phase 4 — derived ClickHouse catalog
+
+- Implement notification and reconciliation discovery.
+- Range-read and validate pack footers.
+- Batch catalog rows across packs and expose logically deduplicated views.
+- Prove full catalog rebuild from object storage.
+
+Exit gate: forced missed and duplicate events converge to the expected catalog.
+
+Status: exit gate passed in the CPU contract suite and against ClickHouse
+26.9.1. Duplicate notifications are collapsed before footer work; missed
+notifications are recovered by bounded prefix scans; corrupt footers never get
+a pack commit marker; and an ambiguous marker insert safely replays descriptor
+rows. Two physical descriptor and pack rows returned one logical row through
+each public `FINAL` view in the live test.
+
+The local 100,000-row, three-trial batch sweep measured:
+
+| Rows per insert | Inserts per trial | Median rows/s |
+|---:|---:|---:|
+| 1,000 | 100 | 13,954 |
+| 10,000 | 10 | 88,458 |
+| 50,000 | 2 | 157,567 |
+
+The result supports large client batches and the existing 10k–100k tuning
+range, but does not establish a production default. It excludes object-store
+discovery time and should be repeated on representative ClickHouse hardware.
+ClickHouse recommends client batching and documents `FINAL` as the query-time
+correctness mechanism for `ReplacingMergeTree` data; see its
+[insert guidance](https://clickhouse.com/docs/concepts/best-practices/selecting-an-insert-strategy)
+and [`FINAL` guidance](https://clickhouse.com/resources/engineering/clickhouse-optimize-table-final).
+
+Run the benchmark with:
+
+```bash
+PYTHONPATH=src python -m benchmarks.bench_capture_catalog \
+  --rows 100000 --batch-rows 10000 --trials 3
+```
+
+### Phase 5 — reader and summaries
+
+- Implement bounded search, estimation, and coalesced range hydration.
+- Add the core tensor summarizer, plus scalar metric and artifact extension
+  points.
+- Add agent-safe query and hydration limits.
+
+Exit gate: selected hydration returns identical decoded tensors while avoiding
+unrelated payload bytes.
+
+Status: exit gate passed in the CPU contract suite, with snapshot and
+pagination behaviour proven against ClickHouse 26.9.1.
+
+Both halves of the gate are tested. *Identical decoded tensors* is a full round
+trip per dtype -- tensor, pack, store, catalog, search, select, hydrate,
+decode -- asserting array and byte equality; `bfloat16` is checked against
+hand-chosen bit patterns including both NaN encodings and both infinities.
+*No unrelated payload bytes* is not literal, because coalescing deliberately
+spans small gaps: with `max_coalesce_gap_bytes = 0` every read falls exactly
+inside a selected extent, and with the 4 KiB default the unrelated bytes stay
+within `gap x joins`. `HydrationEstimate.request_bytes` additionally includes
+a conservative cold-cache bound for footer verification.
+
+Reads are pinned to a watermark. `CaptureQuery.filter_hash` identifies a query
+independently of its page, keyset cursors carry that hash and the pinned
+watermark, and `ClickHouseCaptureCatalog` resolves each column with `argMax`
+over `*_capture_raw`.
+
+`FINAL` is not a snapshot mechanism. It collapses duplicates to the highest
+version present and only then applies predicates, so
+`FINAL ... WHERE index_version <= W` drops a capture re-indexed above `W`
+instead of returning its value at `W`. Measured on 26.9.1, snapshotting at
+watermark 1 where `capture-a` was re-indexed at v2:
+
+| Query shape | Result |
+|---|---|
+| `FINAL` + `index_version <= 1` | `capture-b` only; `capture-a` missing |
+| `argMax` at watermark 1 | `capture-a@64`, `capture-b@128` |
+
+Catalog facets -- `element_count`, `tensor_rank`, `token_span`,
+`compression_ratio` -- are `MATERIALIZED` columns derived from data the writer
+already stores, so they cost no indexer change and no extra object reads.
+Anything derived from tensor *contents* runs at hydration time instead, because
+`CatalogIndexer.index` range-reads pack footers only.
+
+The 50,000-row, two-version measurement:
+
+| Measurement | Median |
+|---|---:|
+| `argMax` snapshot read | 22.3 ms |
+| `FINAL` read (not a snapshot) | 12.1 ms |
+| `max(index_version)` watermark | 1.7 ms |
+| Page, `limit=100` | 21.4 ms |
+| Page, `limit=1000` | 78.8 ms |
+| Page 1 vs page 25 at `limit=100` | 21.5 ms vs 24.4 ms |
+
+Correctness costs about 1.85x a plain `FINAL` read at this size, on a laptop
+build with one replay -- it is not a production figure and should be repeated on
+representative hardware and duplicate ratios. Page cost is flat with depth,
+which is the property keyset pagination exists to provide. The watermark
+aggregate is a second round trip per search but under a tenth of a page's cost,
+so caching it is not yet worth the staleness.
+
+Run the benchmark with:
+
+```bash
+PYTHONPATH=src python -m benchmarks.bench_capture_search \
+  --rows 50000 --replays 2 --trials 3
+```
+
+### Phase 6 — migration
+
+- Keep the current ClickHouse payload sink as the default initially.
+- Compare golden workloads by identity, logical bytes, checksums, decoded
+  tensors, and query results.
+- Run fault injection and record performance variance.
+- Switch the default only after compatibility, recovery, and throughput gates
+  pass; preserve configuration rollback.
+
+Status: not started. Two of the instruments it depends on now exist; the
+comparison itself has not been run, and the production writer it compares
+against has not been built.
+
+#### Decision: the production writer is native
+
+The Python implementation is a **reference implementation and conformance
+suite**, permanently -- not a candidate production writer. The reason is
+structural rather than performance-related: the ring transport reconstructs
+tensors on a native callback thread specifically to avoid touching Python or the
+GIL, and `DMXHostEngine` receives pre-assembled rows from that thread. There is
+no hot-path caller for a Python pack sink, and creating one would reintroduce
+per-tensor GIL contention that the ring exists to avoid.
+
+The pack-and-upload plane will therefore be written in C++ alongside the
+existing `ClickHouseInsertStage`, reusing `batching_queue.hpp` and
+`pipelined_engine.hpp`. This supersedes the Phase 2 limitation describing the
+Python pipeline as an interim stand-in for "the final reusable native slab
+allocator": that is now the plan of record rather than a gap.
+
+#### Fault injection
+
+`tests/_faults.py` wraps the three boundaries that can misbehave -- object
+store, ClickHouse client, and pack sink. Faults are scripted rather than random:
+a schedule names which calls fail and how, so a failure reproduces exactly.
+
+The characterised behaviour, which a native writer must reproduce:
+
+| Fault | Required behaviour |
+|---|---|
+| Short read from the store | Refused, not silently truncated |
+| Read failure mid-index | Aborts that pack; no partial pack is produced |
+| Immutable key written twice | Converges; not a conflict |
+| Sink failure | Pipeline fails loudly and refuses further admission |
+| Insert failure | Pack left uncommitted; the batch is replayable |
+| Duplicated insert | Absorbed by replay semantics |
+| One corrupt pack in a batch | Fails only itself; the batch still indexes |
+
+```bash
+python -m pytest tests/test_capture_faults.py -q
+```
+
+#### Conformance manifest
+
+`tests/tools/golden_workload.py` produces the golden-workload comparison this
+phase requires, as a single JSON document over a deterministic corpus covering
+every dtype the format accepts: pack identity and checksum, per-capture payload
+sha256 and crc32, decoded-tensor sha256, placement, and the full summary
+contract. Every value is language-neutral -- byte counts, hex digests and
+integers -- so a native writer is conformant exactly when the same corpus
+produces the same manifest.
+
+```bash
+python tests/tools/golden_workload.py generate --out golden.json
+python tests/tools/golden_workload.py verify --manifest golden.json
+```
+
+The recorded manifest lives at `tests/data/capture_golden_manifest.json` and is
+checked on every CPU run. `verify` diffs field by field, so a mismatch names the
+capture and field that moved.
+
+#### Remaining before the default can switch
+
+- The native pack-and-upload plane, and configuration to select a sink with
+  rollback preserved. Until a sink is selectable, "keep the current sink as the
+  default initially" has nothing to compare against.
+- Phase 3's capacity gate, which is still pending hardware. A throughput gate
+  cannot pass while the 1.2x requirement is unmeasured.
+- Performance variance under fault injection, which is not yet recorded.
+- Three decisions the migration forces: whether the public views keep `FINAL`
+  now that its cost is measured at 1.85x; where `index_version` comes from once
+  more than one indexer runs, since the current per-process clock assumes a
+  single writer; and whether catalog facets belong in the public views.
+
+No phase requires a CUDA-side change.
+
+## Operating signals
+
+The Phase 2 metrics answer four initial on-call questions:
+
+| Question | Signal |
+|---|---|
+| Is admission saturated? | accepted, dropped, timed-out, oversized, and closed counters; queue peaks; admission histogram |
+| Is persistence keeping up? | persisted records/bytes, pack counts, flush reasons, persistence histogram |
+| Did the worker fail? | failure counter and typed `pipeline_failed` event |
+| Is durable work accumulating? | current/peak spool bytes and pending entry count |
+
+Event callbacks receive bounded structured fields. They include pack identity for
+correlation but never tensor payloads or capture metadata. Callback failures are
+counted and cannot fail persistence. Deployment adapters can export these
+snapshots and events to OpenTelemetry without coupling the storage core to one
+telemetry vendor.
+
+Phase 3 adds upload attempts, successful packs and bytes, failures, retries,
+peak active uploads, peak bytes in flight, duration totals/maxima, and callback
+failures. Events are `pack_upload_retry`, `pack_upload_committed`, and
+`pack_upload_failed`; they contain pack identity and bounded diagnostic fields,
+never tensor contents or credentials.
+
+Phase 4 returns requested, skipped, indexed, and failed pack counts; indexed
+rows; descriptor insert count; estimated metadata bytes; elapsed time; and a
+bounded set of failure details. The `catalog_index_completed` event exposes the
+same aggregate fields without object keys, capture metadata, or payloads.
+Notification size, page size, packs per indexing call, estimated metadata
+bytes, and retained failure details all have explicit caps.
+
+## Phase 2 limitations
+
+- The implementation is a Python CPU reference, not the final reusable native
+  slab allocator. As of the Phase 6 decision this is permanent: the Python
+  implementation is the reference and conformance suite, and the production
+  writer will be native. See *Phase 6 -- Decision: the production writer is
+  native*.
+- One process owns a spool directory; cross-process locking is not implemented.
+- Durable mode stages synchronously and uploads through a separate explicit
+  uploader, so remote backpressure is isolated from local commit.
+- The pipeline remains opt-in and is not connected to Ring².
+
+## Phase 3 limitations
+
+- Garage has no object versioning or object locks. UUID-based object keys have
+  one designated writer; preflight and post-upload metadata checks detect
+  retries and conflicts but are not a cross-writer compare-and-swap primitive.
+- Boto3 is an optional dependency. Importing `dmi.storage.capture` does not
+  require it; constructing an S3 client does.
+- One uploader owns a spool. Cross-process scheduling and locking remain out of
+  scope.
+- The benchmark measures upload from recovered spool files. It deliberately
+  excludes pack construction so pack and store saturation can be diagnosed
+  independently.
+- The Phase 3 code remains opt-in and does not change CUDA or the current
+  ClickHouse payload sink.
+
+## Phase 4 limitations
+
+- Reconciliation is an explicit bounded call; deployment scheduling and event
+  transport remain outside the storage library.
+- The metadata byte bound is a conservative serialized-size estimate, not
+  ClickHouse wire size.
+- The current public views use `FINAL` for immediate replay correctness. Hot
+  query workloads must measure its cost before choosing a different projection.
+
+## Phase 5 limitations
+
+- `index_version` is `time_ns()` from the indexing process's own clock. With
+  more than one indexer, clock skew makes versions non-monotone across writers,
+  and a watermark taken from one indexer can permanently exclude rows written by
+  another. Phase 5 assumes a single indexer owns a catalog; coordinating the
+  version source is deferred to Phase 6, which already revisits indexer
+  topology.
+- Cursors are validated, not authenticated. A tampered cursor is rejected as
+  malformed -- strict base64 and envelope checks -- but nothing binds a cursor to
+  the caller who received it. A cursor can only address the keyspace its own
+  filters already reach.
+- Query filters apply before aggregation. That is safe only because a descriptor
+  derives from an immutable pack footer, so re-indexing a capture rewrites
+  identical values. Mutable descriptors would require filtering after `argMax`.
+- Each search issues a second round trip for `max(index_version)`, needed to
+  reject cursors ahead of the catalog.
+- `get_by_ids` matches on `capture_id`, the last element of the sort key, so it
+  does not benefit from the primary index.
+- Catalog facets are on `*_capture_raw` only; the public `FINAL` views are
+  unchanged.
+- The per-extension time budget is checked after each call. A runaway extension
+  is reported, not interrupted; preemption needs a worker boundary.
+- Core summary statistics cover finite elements only, with `nan_count`,
+  `inf_count` and `finite_count` reported alongside. `l2_norm` factors out the
+  largest magnitude before squaring, because the direct `sqrt(sum(x**2))` form
+  overflows float64 for large-magnitude tensors and returns infinity where the
+  true norm is finite.
+- A selection is one bounded page. Callers paginate explicitly.
+
+## Alternatives considered
+
+### Host writes payload and catalog directly
+
+This makes ClickHouse latency, availability, and schema part of the capture
+commit path. It also fragments inserts across inference hosts. Rejected in favor
+of a centralized, independently scalable indexer.
+
+### Separate payload and manifest objects
+
+Standard manifest formats can be convenient, but object storage does not offer
+an atomic transaction across two keys. A footer inside one pack supplies the
+same reconstruction data with one commit boundary. Parquet manifest export can
+remain an optional downstream interoperability feature.
+
+### Raw payloads in ClickHouse
+
+Operationally simple, but large binary columns compete with searchable metadata
+for inserts, merges, caches, and storage. ClickHouse remains the derived catalog
+rather than the raw byte store.
+
+### One object per tensor
+
+Simple addressing, but request rate and object count dominate for small
+tensors. Packs amortize those costs while retaining record-level range reads.
+
+### RocksDB or SQLite in the host path
+
+An embedded index introduces another recovery and compaction surface. Bounded
+pack files plus atomic rename are sufficient for the initial spool. Reconsider
+only after measurement identifies a concrete need.
+
+### Object storage without ClickHouse
+
+Durable and inexpensive, but poorly suited to interactive high-cardinality
+discovery and aggregation. ClickHouse supplies the rebuildable hot query layer.
+
+## References
+
+- [Amazon S3 data consistency model](https://docs.aws.amazon.com/console/s3/UsingObjects.html)
+- [Amazon S3 event notifications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html)
+- [Amazon S3 event ordering and duplication](https://docs.aws.amazon.com/AmazonS3/latest/userguide/notification-how-to-event-types-and-destinations.html)
+- [Amazon S3 performance guidance](https://docs.aws.amazon.com/pdfs/whitepapers/latest/s3-optimizing-performance-best-practices/s3-optimizing-performance-best-practices.pdf)
+- [ClickHouse insert strategy](https://clickhouse.com/docs/concepts/best-practices/selecting-an-insert-strategy)
+- [ClickHouse ReplacingMergeTree and FINAL](https://clickhouse.com/resources/engineering/clickhouse-optimize-table-final)
+- [ClickHouse and Amazon S3](https://clickhouse.com/integrations/amazon_s3)
+- [Garage documentation](https://garagehq.deuxfleurs.fr/)
+- [Garage 2.3 quick start](https://garagehq.deuxfleurs.fr/documentation/quick-start/)
+- [Garage S3 compatibility](https://garagehq.deuxfleurs.fr/documentation/reference-manual/s3-compatibility/)
+- [Garage release downloads](https://garagehq.deuxfleurs.fr/download/)
+- [Boto3 managed S3 transfers](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/s3.html#file-transfer-configuration)
+- [Amazon S3 multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html)

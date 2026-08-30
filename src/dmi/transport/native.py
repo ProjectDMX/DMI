@@ -29,6 +29,7 @@ _RING_EXPORTS = frozenset(
     {
         "ClickHouseRecordSink",
         "RecordSink",
+        "ReferencePythonCaptureSink",
         "RingConfig",
         "RingEngine",
         "ring_set_active_engine",

@@ -36,8 +36,8 @@ RingEngine::RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
 }
 
 RingEngine::RingEngine(const RingConfig& cfg,
-                       std::shared_ptr<RecordSink> sink)
-    : cfg_(cfg), ring_(cfg), record_sink_(std::move(sink))
+                       std::shared_ptr<RecordSinkLease> lease)
+    : cfg_(cfg), ring_(cfg), record_sink_lease_(std::move(lease))
 {
     if (cfg_.payload_ring_bytes % PAYLOAD_ALIGN != 0) {
         throw std::runtime_error(
@@ -60,8 +60,15 @@ RingEngine::RingEngine(const RingConfig& cfg,
 
     staging_.init(cfg.effective_staging_bytes());
     drain_ = std::make_unique<DrainThread>(ring_.state(), staging_, cfg_);
-    record_p2p_ = std::make_unique<RecordP2PThread>(
-        *drain_, record_sink_);
+    record_sink_ = record_sink_lease_
+        ? record_sink_lease_->claim() : nullptr;
+    try {
+        record_p2p_ = std::make_unique<RecordP2PThread>(
+            *drain_, record_sink_);
+    } catch (...) {
+        release_record_sink();
+        throw;
+    }
 }
 
 RingEngine::~RingEngine() noexcept {
@@ -71,6 +78,7 @@ RingEngine::~RingEngine() noexcept {
     }
     if (p2p_) p2p_->stop();
     if (record_p2p_) record_p2p_->stop();
+    release_record_sink();
 }
 
 void RingEngine::init(cudaStream_t stream) {
@@ -78,6 +86,10 @@ void RingEngine::init(cudaStream_t stream) {
 }
 
 void RingEngine::start() {
+    if (record_mode() && record_sink_released_) {
+        throw std::logic_error(
+            "record RingEngine cannot restart after stop");
+    }
     drain_->start();
     if (p2p_) p2p_->start();
     if (record_p2p_) record_p2p_->start();
@@ -85,7 +97,10 @@ void RingEngine::start() {
 
 void RingEngine::stop() {
     // Guard against double-stop (benchmark _timed_close + engine.close).
-    if (!drain_->is_running()) return;
+    if (!drain_->is_running()) {
+        release_record_sink();
+        return;
+    }
 
     cudaDeviceSynchronize();
     drain_->force_flush_and_wait();
@@ -94,6 +109,13 @@ void RingEngine::stop() {
     drain_->signal_p2p_stop();
     if (p2p_) p2p_->stop();
     if (record_p2p_) record_p2p_->stop();
+    release_record_sink();
+}
+
+void RingEngine::release_record_sink() noexcept {
+    if (record_sink_released_) return;
+    if (record_sink_lease_) record_sink_lease_->release();
+    record_sink_released_ = true;
 }
 
 RecordConsumer& RingEngine::record_consumer() {

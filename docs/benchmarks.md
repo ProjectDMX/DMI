@@ -99,6 +99,60 @@ documentation when interpreting results.
 See the [native build layout](native-build-layout.html) for the host/full
 extension boundary and loader behavior.
 
+## Derived catalog throughput
+
+`benchmarks.bench_capture_catalog` measures the opt-in metadata projection; it
+does not exercise CUDA or write tensor payloads to ClickHouse. It creates
+temporary raw tables plus logically deduplicated views, inserts deterministic
+capture descriptors in bounded batches, reports every trial, and drops the
+objects afterward.
+
+```bash
+python -m benchmarks.bench_capture_catalog \
+  --rows 100000 --batch-rows 10000 --trials 3
+```
+
+On local ClickHouse 26.9.1, median throughput rose from 13,954 rows/s with
+1,000-row batches to 88,458 rows/s at 10,000 and 157,567 rows/s at 50,000.
+These loopback results validate client batching, not a production capacity
+claim. Repeat the sweep on the target server while observing part creation,
+merge load, CPU, and catalog lag.
+
+## Bounded catalog search
+
+`benchmarks.bench_capture_search` measures the read side of the same opt-in
+catalog: snapshot cost, page latency, filter selectivity, and core summary
+throughput. It creates temporary tables, indexes a corpus several times to
+create duplicate versions, and drops the objects afterward.
+
+```bash
+PYTHONPATH=src python -m benchmarks.bench_capture_search \
+  --rows 50000 --replays 2 --trials 3
+```
+
+On local ClickHouse 26.9.1 with 50,000 rows written twice:
+
+| Measurement | Median |
+|---|---:|
+| `argMax` snapshot read | 22.3 ms |
+| `FINAL` read (not a snapshot) | 12.1 ms |
+| `max(index_version)` watermark | 1.7 ms |
+| Page, `limit=100` | 21.4 ms |
+| Page, `limit=1000` | 78.8 ms |
+| Page, `limit=5000` | 145.2 ms |
+| Page 1 vs page 25 at `limit=100` | 21.5 ms vs 24.4 ms |
+
+The two snapshot rows are not alternatives. `FINAL` drops any capture
+re-indexed above the watermark, so the 1.85x gap is what correctness costs, not
+a choice between query shapes. Page cost is flat with depth -- the property
+keyset pagination exists to provide -- and grows with page size, not position.
+
+Core summaries run at roughly 140–210 M elements/s depending on dtype
+(`int64` fastest, `bfloat16` slowest because of the widening shift). As with
+the insert sweep, these are loopback numbers on a laptop build: repeat them on
+representative hardware and duplicate ratios before treating any as a capacity
+claim.
+
 Baselines:
 
 - **HuggingFace Ideal** — vanilla HF `generate`, no observation (used as 1.0)

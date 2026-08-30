@@ -82,3 +82,21 @@ def test_close_remains_best_effort_when_native_stop_fails(monkeypatch):
     engine.close()
     assert engine._ring_transport is None
     assert engine._ring_engine is None
+
+
+def test_close_keeps_record_ring_when_native_worker_may_be_alive():
+    class _Ring:
+        def stop(self):
+            raise RuntimeError("stop failed before join")
+
+    engine = MonitoringEngine(enable_ring_transport=False)
+    transport = SimpleNamespace(null_offload=False, force_eager=False)
+    ring = _Ring()
+    engine._ring_transport = transport
+    engine._ring_engine = ring
+    engine._record_mode = True
+
+    engine.close()
+
+    assert engine._ring_transport is transport
+    assert engine._ring_engine is ring

@@ -533,6 +533,40 @@ def test_server_sampler_tracks_insert_concurrency_and_metric_peaks():
     }
 
 
+def test_server_sampler_filters_current_insert_without_removed_tables_column():
+    class Client:
+        process_query = None
+        process_params = None
+
+        def execute(self, query, params=None):
+            if "system.processes" in query:
+                self.process_query = query
+                self.process_params = params
+                return [(1,)]
+            return []
+
+        def disconnect(self):
+            pass
+
+    client = Client()
+    sampler = ServerTelemetrySampler(
+        lambda: client,
+        interval_ms=1,
+        database="default",
+        table="offload",
+    )
+
+    sampler.sample_once()
+
+    assert "tables" not in client.process_query
+    assert "current_database" in client.process_query
+    assert "position(query" in client.process_query
+    assert client.process_params == {
+        "database": "default",
+        "qualified_table": "`default`.`offload`",
+    }
+
+
 def test_identifier_quoting_rejects_sql_fragments():
     assert quote_identifier("bench_2026") == "`bench_2026`"
     with pytest.raises(ValueError, match="identifier"):

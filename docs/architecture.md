@@ -80,6 +80,14 @@ and payload copying; the native producer path remains in no-op/null mode.
 For active transport without persistence, use `dmx_null_mode=False` and leave
 the database host empty.
 
+The opt-in next-generation host sink makes immutable, self-describing tensor
+packs in S3-compatible object storage the canonical capture log. An independent
+indexer now rebuilds a logically deduplicated ClickHouse metadata projection by
+reading only pack trailers and footers. Scalar summaries remain a later phase.
+This work is host-side, opt-in, and does not change Ring². See the
+[`capture storage design`](capture-storage-design.md) and its
+[`HTML explainer`](capture-storage-pipeline.html).
+
 The drain pipeline is independent of the inference loop: backpressure on the
 sink does not block the GPU producer as long as the rings are sized for the
 workload. Sizing knobs (`dmx_ring_payload_mb`, `dmx_ring_pinned_mb`) are

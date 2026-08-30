@@ -270,13 +270,17 @@ class ServerTelemetrySampler:
         self._client_factory = client_factory
         self._interval_seconds = interval_ms / 1000.0
         if database is not None and table is not None:
-            qualified = f"{database}.{table}"
+            qualified = f"{quote_identifier(database)}.{quote_identifier(table)}"
             self._process_query = (
                 "SELECT count() FROM system.processes"
                 " WHERE query_kind = 'Insert'"
-                " AND has(tables, %(table)s)"
+                " AND current_database = %(database)s"
+                " AND position(query, %(qualified_table)s) > 0"
             )
-            self._process_query_params: dict[str, Any] = {"table": qualified}
+            self._process_query_params: dict[str, Any] = {
+                "database": database,
+                "qualified_table": qualified,
+            }
         else:
             self._process_query = (
                 "SELECT count() FROM system.processes WHERE query_kind = 'Insert'"

@@ -177,12 +177,16 @@ def main() -> None:
                 args.gpu_id,
                 extra_pids,
             )
-        try:
+            try:
+                mon_start_ts = _now_epoch()
+                mon_result = _run_script("benchmarks/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
+                mon_end_ts = _now_epoch()
+            finally:
+                _stop_monitors(procs)
+        else:
             mon_start_ts = _now_epoch()
             mon_result = _run_script("benchmarks/scripts/hf_monitoring_generate.py", mon_args, env=base_env)
             mon_end_ts = _now_epoch()
-        finally:
-            _stop_monitors(procs)
 
     # Run monitoring with --no-db
     gpu_csv_mon_nodb = os.path.join(args.out_dir, f"gpu_mem_monitoring_nodb_{tag}.csv")
