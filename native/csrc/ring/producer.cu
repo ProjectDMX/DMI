@@ -125,8 +125,12 @@ __device__ inline void publish_last_block_arrives(
     uint32_t finished = atomicAdd(&g_block_done_counter, 1);
     if (finished != gridDim.x - 1) return;
 
-    // Last block: all copy stores are globally visible (caller __threadfence'd
-    // before calling this helper).
+    // Pair with every block's pre-arrival device fence. The relaxed arrival
+    // counter identifies the last block; this acquire fence imports the
+    // payload writes completed by all preceding blocks before publication.
+    cuda::atomic_thread_fence(cuda::memory_order_acquire,
+                              cuda::thread_scope_device);
+
     uint64_t ph = payload_head;
     payload_advance_head(ph, alloc_bytes);
 
@@ -134,9 +138,9 @@ __device__ inline void publish_last_block_arrives(
     *ring.task_head    = task_head + 1;
     *ring.payload_head = ph;
 
-    // Monotonic accumulator of actual bytes written.  The __threadfence()
-    // before publish orders D2D stores before this work; a CPU observer that
-    // sees the counter also sees the bytes whose write it accounts for.
+    // Monotonic accumulator of actual bytes written. The per-block release
+    // fences, last-block acquire, and system release publication order all
+    // joined D2D stores before this accounting work.
     atomicAdd(reinterpret_cast<unsigned long long*>(ring.actual_bytes_counter),
               static_cast<unsigned long long>(actual_total));
 

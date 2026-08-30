@@ -78,8 +78,9 @@ __device__ inline void task_publish(
     const uint64_t idx = seq_no % capacity;
     cuda::atomic_ref<uint64_t, cuda::thread_scope_system> ready(
         slots[idx]);
-    // No separate __threadfence(): the system-scope release store orders all
-    // preceding payload writes before the CPU can acquire this publication.
+    // The caller has already acquired the cross-block completion join. No
+    // additional fence is needed here: this system-scope release store orders
+    // the joined payload writes before the CPU can acquire the publication.
     ready.store(PUBLICATION_READY | actual_bytes,
                 cuda::memory_order_release);
 }
