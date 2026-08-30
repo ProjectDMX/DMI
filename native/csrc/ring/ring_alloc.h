@@ -70,6 +70,12 @@ private:
     }
 
     void allocate() {
+        if (cfg_.payload_ring_bytes == 0 ||
+            cfg_.payload_ring_bytes % PAYLOAD_ALIGN != 0) {
+            throw std::invalid_argument(
+                "AllocatedRing payload capacity must be a positive multiple "
+                "of PAYLOAD_ALIGN");
+        }
         int dev = 0;
         chk(cudaGetDevice(&dev), "cudaGetDevice");
         int concurrent_managed_access = 0;
@@ -88,6 +94,11 @@ private:
             "cudaMallocManaged publication_slots");
         chk(cudaMalloc(&state_.payload_buf, cfg_.payload_ring_bytes),
             "cudaMalloc payload_buf");
+        if (reinterpret_cast<uintptr_t>(state_.payload_buf) % PAYLOAD_ALIGN != 0) {
+            free_all();
+            throw std::runtime_error(
+                "AllocatedRing payload buffer is not PAYLOAD_ALIGN-aligned");
+        }
 
         auto mg = [&](uint64_t** pp, const char* name) {
             chk(cudaMallocManaged(pp, sizeof(uint64_t)), name);

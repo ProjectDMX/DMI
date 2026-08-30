@@ -8,6 +8,8 @@
 // (owned externally by the ring engine).
 
 #pragma once
+#include "ring_config.h"
+
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <stdexcept>
@@ -25,10 +27,21 @@ public:
     PinnedStaging& operator=(const PinnedStaging&) = delete;
 
     void init(uint64_t total_bytes) {
+        if (total_bytes == 0 || total_bytes % PAYLOAD_ALIGN != 0) {
+            throw std::invalid_argument(
+                "PinnedStaging capacity must be a positive multiple of "
+                "PAYLOAD_ALIGN");
+        }
         capacity_ = total_bytes;
         void* p = nullptr;
         if (cudaHostAlloc(&p, capacity_, cudaHostAllocDefault) != cudaSuccess)
             throw std::runtime_error("PinnedStaging: cudaHostAlloc failed");
+        if (reinterpret_cast<uintptr_t>(p) % PAYLOAD_ALIGN != 0) {
+            cudaFreeHost(p);
+            capacity_ = 0;
+            throw std::runtime_error(
+                "PinnedStaging base is not PAYLOAD_ALIGN-aligned");
+        }
         base_ = static_cast<uint8_t*>(p);
         head_ = 0;
         tail_ = 0;

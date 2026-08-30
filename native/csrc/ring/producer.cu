@@ -61,8 +61,10 @@ static_assert(PAYLOAD_ALIGN == sizeof(uint4),
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-// Grid-stride vectorized D2D copy.  Uses global thread ID (gtid) and total
-// thread count (stride) so all blocks in the grid participate.
+// Grid-stride D2D copy. Use uint4 only when both effective addresses satisfy
+// its alignment requirement; tensor views, packed offsets, or wrap spans may
+// make either address unaligned even when the ring allocation itself is
+// aligned.
 __device__ inline void d2d_copy_grid_stride(
     uint8_t*       dst,
     const uint8_t* src,
@@ -71,6 +73,15 @@ __device__ inline void d2d_copy_grid_stride(
     uint64_t       stride)
 {
     constexpr uint64_t VEC = sizeof(uint4);
+    const uintptr_t address_bits =
+        reinterpret_cast<uintptr_t>(dst) |
+        reinterpret_cast<uintptr_t>(src);
+    if ((address_bits & (VEC - 1)) != 0) {
+        for (uint64_t i = gtid; i < nbytes; i += stride)
+            dst[i] = src[i];
+        return;
+    }
+
     const uint64_t n_vec = nbytes / VEC;
     const uint64_t tail  = nbytes - n_vec * VEC;
 
@@ -295,7 +306,7 @@ __global__ void producer_chunked_kernel(
     const uint64_t actual_total = static_cast<uint64_t>(s_prefix[K]);
     const uint64_t chunk_in_bytes = nbytes_upper / K;
 
-    const uint64_t alloc_bytes  = align_up(nbytes_upper, PAYLOAD_ALIGN);
+    const uint64_t alloc_bytes  = align_up(actual_total, PAYLOAD_ALIGN);
     const uint64_t task_head    = *ring.task_head;
     const uint64_t payload_head = *ring.payload_head;
     const TwoSpan  spans        = payload_compute_spans(payload_head,

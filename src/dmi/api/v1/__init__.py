@@ -129,9 +129,16 @@ def configure_hook_padding_strip(
     """Configure an existing HookPoint's producer padding-strip mode.
 
     ``row_count_tensor=None`` selects the static producer. A tensor with a
-    positive ``row_bytes`` selects prefix stripping; a tensor with a
-    non-positive ``row_bytes`` selects chunked stripping.
+    positive ``row_bytes`` selects prefix stripping. The legacy device-count
+    chunked mode is not supported because v0 hooks have no upper-bound
+    reservation reclaim.
     """
+
+    if row_count_tensor is not None and row_bytes <= 0:
+        raise ValueError(
+            "v0 device-count chunked stripping is unsupported; use a v1 "
+            "record producer for dynamic upper-bound reservations"
+        )
 
     hook_point._strip_tensor = row_count_tensor
     hook_point._strip_row_bytes = row_bytes

@@ -153,3 +153,97 @@ def test_hook_point_strip_attrs_settable_for_chunked_mode():
     # _strip_row_bytes stays at default 0
     assert hp._strip_tensor is cb
     assert hp._strip_row_bytes == 0
+
+
+class _FakeEagerRingEngine:
+    def __init__(self, available: int, capacity: int):
+        self.available = available
+        self.capacity = capacity
+        self.reserved: list[int] = []
+        self.flushes = 0
+
+    def available_capacity(self) -> int:
+        return self.available
+
+    def payload_cap(self) -> int:
+        return self.capacity
+
+    def reserve_one(self, nbytes: int) -> None:
+        self.reserved.append(nbytes)
+
+    def flush_and_wait(self) -> None:
+        self.flushes += 1
+
+
+class _FakeEagerTransport:
+    force_eager = True
+
+    def __init__(self, engine: _FakeEagerRingEngine):
+        self._ring_engine = engine
+        self.direct: list[torch.Tensor] = []
+
+    def submit_cpu_direct(self, tensor, hook_type, hook_id) -> None:
+        self.direct.append(tensor)
+
+
+@pytest.mark.gpu
+def test_eager_ring_capacity_uses_padded_transport_size(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from dmi.hooks.point import HookPoint
+    from dmi.transport import ring as ring_transport
+
+    engine = _FakeEagerRingEngine(available=17, capacity=64)
+    transport = _FakeEagerTransport(engine)
+    monkeypatch.setattr(ring_transport, "_active_transport", transport)
+    dispatched = []
+    monkeypatch.setattr(
+        "dmi.hooks.point.dispatch_producer",
+        lambda *args: dispatched.append(args),
+    )
+
+    hook = HookPoint()
+    hook._ring_hook_type = 1
+    hook._ring_hook_id = 2
+    hook._ring_payload = torch.empty(64, dtype=torch.uint8, device="cuda")
+    value = torch.arange(17, dtype=torch.uint8, device="cuda")
+    result = hook(value)
+
+    assert result.data_ptr() == value.data_ptr()
+    assert engine.flushes == 1
+    assert engine.reserved == [17]
+    assert len(dispatched) == 1
+    assert transport.direct == []
+
+
+@pytest.mark.gpu
+def test_eager_stripped_v0_uses_cpu_direct_without_reservation(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from dmi.hooks.point import HookPoint
+    from dmi.transport import ring as ring_transport
+
+    engine = _FakeEagerRingEngine(available=4096, capacity=4096)
+    transport = _FakeEagerTransport(engine)
+    monkeypatch.setattr(ring_transport, "_active_transport", transport)
+    dispatched = []
+    monkeypatch.setattr(
+        "dmi.hooks.point.dispatch_producer",
+        lambda *args: dispatched.append(args),
+    )
+
+    hook = HookPoint()
+    hook._ring_hook_type = 1
+    hook._ring_hook_id = 2
+    hook._ring_payload = torch.empty(64, dtype=torch.uint8, device="cuda")
+    hook._strip_tensor = torch.tensor([1], dtype=torch.int64, device="cuda")
+    hook._strip_row_bytes = 8
+    value = torch.arange(17, dtype=torch.uint8, device="cuda")
+    result = hook(value)
+
+    assert result.data_ptr() == value.data_ptr()
+    assert engine.flushes == 1
+    assert engine.reserved == []
+    assert dispatched == []
+    assert len(transport.direct) == 1
+    assert torch.equal(transport.direct[0], value.cpu())

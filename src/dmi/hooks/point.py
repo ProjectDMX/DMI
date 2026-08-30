@@ -20,7 +20,7 @@ from torch import Tensor
 
 from ..engine import MonitoringEngine
 from .dispatch import dispatch_producer
-from .specs import HOOK_TYPE_TO_SHORT_NAME
+from .specs import HOOK_TYPE_TO_SHORT_NAME, align_up_py
 
 try:
     from torch.cuda import nvtx as _nvtx
@@ -265,8 +265,9 @@ class HookPoint(nn.Module):
         x_cont = x.contiguous()
 
         # Eager safety-net path: when the active transport asks for it,
-        # dispatch dynamically based on whether the hook's tensor fits.
-        # CPU knows x_cont.nbytes exactly; no upper-bound math.
+        # dispatch dynamically based on whether the hook's padded transport
+        # size fits. v0 has no upper-bound reclaim, so stripped producers use
+        # CPU-direct instead of reserving the full input and writing less.
         # Strip-mode dispatch.  Three branches signaled by attrs:
         #   _strip_tensor is None                    -> producer (static)
         #   _strip_tensor set, _strip_row_bytes > 0  -> producer_prefix
@@ -283,11 +284,21 @@ class HookPoint(nn.Module):
             engine = transport._ring_engine
             if engine is not None:
                 nbytes = x_cont.nbytes
-                if nbytes <= engine.available_capacity():
+                transport_bytes = align_up_py(nbytes, 16)
+                if strip_t is not None:
+                    # CPU-direct bypasses ring/staging accounting. Flush older
+                    # ring tasks first so the shared metadata FIFO stays in
+                    # producer order. The legacy consumer applies its normal
+                    # CPU-side request slicing to the full tensor.
+                    engine.flush_and_wait()
+                    transport.submit_cpu_direct(
+                        x_cont.cpu(),
+                        self._ring_hook_type, self._ring_hook_id)
+                elif transport_bytes <= engine.available_capacity():
                     engine.reserve_one(nbytes)
                     dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
                                       self._ring_hook_type, self._ring_hook_id)
-                elif nbytes <= engine.payload_cap():
+                elif transport_bytes <= engine.payload_cap():
                     engine.flush_and_wait()
                     engine.reserve_one(nbytes)
                     dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
@@ -297,9 +308,6 @@ class HookPoint(nn.Module):
                     # cpu_direct.  Flush first so submit_cpu_direct consumes
                     # the FIFO meta for THIS hook (prior ring entries finish
                     # first; this hook's pre-pushed meta becomes the head).
-                    # The strip is not applied here -- bypass path sends the
-                    # full tensor to the consumer; consumer's CPU-side
-                    # slicing handles request-level demux as today.
                     engine.flush_and_wait()
                     transport.submit_cpu_direct(
                         x_cont.cpu(),

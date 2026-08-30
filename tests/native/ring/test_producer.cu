@@ -68,6 +68,21 @@ static uint8_t* upload(const std::vector<uint8_t>& source) {
     return device;
 }
 
+struct DeviceBytes {
+    uint8_t* allocation = nullptr;
+    uint8_t* data = nullptr;
+};
+
+static DeviceBytes upload_with_offset(const std::vector<uint8_t>& source,
+                                      uint64_t offset) {
+    DeviceBytes result;
+    CUDA_CHECK(cudaMalloc(&result.allocation, source.size() + offset));
+    result.data = result.allocation + offset;
+    CUDA_CHECK(cudaMemcpy(result.data, source.data(), source.size(),
+                          cudaMemcpyHostToDevice));
+    return result;
+}
+
 static int64_t* upload_counts(const std::vector<int64_t>& counts) {
     int64_t* device = nullptr;
     CUDA_CHECK(cudaMalloc(&device, counts.size() * sizeof(int64_t)));
@@ -109,6 +124,142 @@ static void expect_publication(const ring::RingState& state, uint64_t sequence,
         &state.publication_slots[sequence % state.task_cap], __ATOMIC_ACQUIRE);
     EXPECT((word & ring::PUBLICATION_READY) != 0);
     EXPECT((word & ring::PUBLICATION_SIZE_MASK) == expected_bytes);
+}
+
+enum class ProducerVariant {
+    Static,
+    Prefix,
+    Chunked,
+    RecordStatic,
+    RecordPrefix,
+    RecordChunked,
+    RecordSequencePrefix,
+    RecordSegmented,
+};
+
+struct ProducerVariantCase {
+    ProducerVariant variant;
+    const char* name;
+};
+
+static const ProducerVariantCase kProducerVariants[] = {
+    {ProducerVariant::Static, "static"},
+    {ProducerVariant::Prefix, "prefix"},
+    {ProducerVariant::Chunked, "chunked"},
+    {ProducerVariant::RecordStatic, "record static"},
+    {ProducerVariant::RecordPrefix, "record prefix"},
+    {ProducerVariant::RecordChunked, "record chunked"},
+    {ProducerVariant::RecordSequencePrefix, "record sequence-prefix"},
+    {ProducerVariant::RecordSegmented, "record segmented"},
+};
+
+static std::vector<uint8_t> expected_for_variant(
+        ProducerVariant variant, const std::vector<uint8_t>& source) {
+    if (variant != ProducerVariant::Chunked &&
+        variant != ProducerVariant::RecordChunked) {
+        return source;
+    }
+
+    // Both chunked cases select 32 bytes from each 48-byte input chunk.
+    std::vector<uint8_t> expected;
+    expected.insert(expected.end(), source.begin(), source.begin() + 32);
+    expected.insert(expected.end(), source.begin() + 48,
+                    source.begin() + 80);
+    return expected;
+}
+
+static void launch_alignment_case(ProducerVariant variant,
+                                  const ring::RingState& state,
+                                  const uint8_t* source,
+                                  uint64_t source_bytes) {
+    int64_t* aux1 = nullptr;
+    int64_t* aux2 = nullptr;
+
+    switch (variant) {
+        case ProducerVariant::Static:
+            ring::launch_producer_static(state, source, source_bytes, 0);
+            break;
+        case ProducerVariant::Prefix:
+            aux1 = upload_counts({3});
+            ring::launch_producer_prefix(
+                state, source, source_bytes, aux1, 32, 0);
+            break;
+        case ProducerVariant::Chunked:
+            aux1 = upload_counts({32, 32});
+            ring::launch_producer_chunked(
+                state, source, source_bytes, aux1, 2, 0);
+            break;
+        case ProducerVariant::RecordStatic:
+            ring::launch_record_producer_static(
+                state, source, source_bytes, nullptr, 0);
+            break;
+        case ProducerVariant::RecordPrefix:
+            aux1 = upload_counts({3});
+            ring::launch_record_producer_prefix(
+                state, source, source_bytes, aux1, 32, nullptr, 0);
+            break;
+        case ProducerVariant::RecordChunked:
+            aux1 = upload_counts({32, 32});
+            ring::launch_record_producer_chunked(
+                state, source, source_bytes, aux1, 2, nullptr, 0);
+            break;
+        case ProducerVariant::RecordSequencePrefix:
+            aux1 = upload_counts({3});
+            aux2 = upload_counts({0, 3});
+            ring::launch_record_producer_seq_prefix_pack(
+                state, source, source_bytes, aux1, aux2, 1, 32, nullptr, 0);
+            break;
+        case ProducerVariant::RecordSegmented:
+            aux1 = upload_counts({0});
+            aux2 = upload_counts({3});
+            ring::launch_record_producer_segmented_pack(
+                state, source, source_bytes, aux1, aux2, 1, 32, nullptr, 0);
+            break;
+    }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (aux2 != nullptr) CUDA_CHECK(cudaFree(aux2));
+    if (aux1 != nullptr) CUDA_CHECK(cudaFree(aux1));
+}
+
+static void test_all_producers_handle_unaligned_addresses() {
+    constexpr uint64_t source_bytes = 96;
+    const std::vector<uint8_t> source = pattern(source_bytes, 149);
+
+    for (const ProducerVariantCase& producer : kProducerVariants) {
+        for (uint64_t source_offset : {uint64_t(1), uint64_t(0)}) {
+            const bool test_source = source_offset != 0;
+            std::printf("[ TEST ] %s producer with unaligned %s address\n",
+                        producer.name, test_source ? "source" : "destination");
+
+            ring::AllocatedRing allocated(make_config());
+            allocated.init();
+            ring::RingState& state = allocated.state();
+            const uint64_t logical_start = test_source ? 0 : 1;
+            *state.payload_head = logical_start;
+
+            const DeviceBytes device_source =
+                upload_with_offset(source, source_offset);
+            EXPECT((reinterpret_cast<uintptr_t>(device_source.data) &
+                    (ring::PAYLOAD_ALIGN - 1)) ==
+                   (test_source ? 1 : 0));
+            EXPECT((reinterpret_cast<uintptr_t>(state.payload_buf +
+                                                logical_start) &
+                    (ring::PAYLOAD_ALIGN - 1)) ==
+                   (test_source ? 0 : 1));
+
+            launch_alignment_case(producer.variant, state,
+                                  device_source.data, source.size());
+
+            const std::vector<uint8_t> expected =
+                expected_for_variant(producer.variant, source);
+            expect_publication(state, 0, expected.size());
+            EXPECT(read_payload(state, logical_start, expected.size()) ==
+                   expected);
+
+            CUDA_CHECK(cudaFree(device_source.allocation));
+        }
+    }
 }
 
 static void test_static_copy() {
@@ -239,9 +390,41 @@ static void test_chunked_packed_copy() {
     expect_publication(state, 0, expected.size());
     EXPECT(read_payload(state, 0, expected.size()) == expected);
     EXPECT(*state.actual_bytes_counter == expected.size());
-    EXPECT(*state.payload_head == ring::align_up(source.size(), ring::PAYLOAD_ALIGN));
+    EXPECT(*state.payload_head ==
+           ring::align_up(expected.size(), ring::PAYLOAD_ALIGN));
 
     CUDA_CHECK(cudaFree(device_counts));
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_chunked_unaligned_internal_boundaries() {
+    banner("legacy chunked producer checks effective chunk addresses");
+    ring::AllocatedRing allocated(make_config());
+    allocated.init();
+    ring::RingState& state = allocated.state();
+
+    constexpr uint32_t chunks = 2;
+    constexpr uint64_t input_chunk = 33;
+    const std::vector<int64_t> selected = {17, 17};
+    const std::vector<uint8_t> source = pattern(chunks * input_chunk, 103);
+    std::vector<uint8_t> expected;
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        const auto begin = source.begin() + chunk * input_chunk;
+        expected.insert(expected.end(), begin, begin + selected[chunk]);
+    }
+
+    uint8_t* device = upload(source);
+    int64_t* device_selected = upload_counts(selected);
+    ring::launch_producer_chunked(
+        state, device, source.size(), device_selected, chunks, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    expect_publication(state, 0, expected.size());
+    EXPECT(read_payload(state, 0, expected.size()) == expected);
+    EXPECT(*state.payload_head ==
+           ring::align_up(expected.size(), ring::PAYLOAD_ALIGN));
+
+    CUDA_CHECK(cudaFree(device_selected));
     CUDA_CHECK(cudaFree(device));
 }
 
@@ -472,11 +655,13 @@ int main() {
     test_prefix_copy();
     test_prefix_bounds();
     test_chunked_packed_copy();
+    test_chunked_unaligned_internal_boundaries();
     test_serialized_static_launches();
     test_record_chunked_compacts_payload_head();
     test_record_chunked_unaligned_boundaries();
     test_record_sequence_and_segmented_pack();
     test_record_device_gate_rejects_without_publication();
+    test_all_producers_handle_unaligned_addresses();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
