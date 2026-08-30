@@ -189,9 +189,10 @@ def main(argv=None) -> int:
     writer.ensure_schema()
     try:
         descriptors = synthetic_descriptors(args.rows)
-        # Descriptors alone are not readable. A snapshot is bounded by committed
-        # packs and the watermark comes from the published log, so a benchmark
-        # that only writes descriptors measures empty result sets.
+        # Descriptors alone are not readable. A snapshot is bounded by the
+        # packs a publish made members and the watermark comes from the
+        # published log, so a benchmark that only writes descriptors measures
+        # empty result sets.
         refs, seen = [], set()
         for item in descriptors:
             ref = item.locator.pack_ref
@@ -200,13 +201,14 @@ def main(argv=None) -> int:
                 refs.append(ref)
         for version in range(1, args.replays + 1):
             writer.write_descriptors(descriptors, index_version=version)
-            writer.commit_packs(refs, index_version=version)
-            writer.publish_watermark(
+            writer.publish_snapshot(
                 index_version=version,
+                refs=refs,
                 published_at_ns=version,
                 indexed_rows=len(descriptors),
                 indexed_packs=len(refs),
             )
+            writer.commit_packs(refs, index_version=version)
 
         result = {
             "rows": args.rows,
@@ -227,7 +229,8 @@ def main(argv=None) -> int:
         for kind, suffix in (
             ("VIEW", "capture"), ("VIEW", "pack_inventory"),
             ("TABLE", "capture_raw"), ("TABLE", "pack_inventory_raw"),
-            ("TABLE", "index_watermark"), ("TABLE", "pack_commit_log"),
+            ("TABLE", "index_watermark"), ("TABLE", "snapshot_manifest"),
+            ("TABLE", "capture_version_claims"),
         ):
             client.execute(
                 f"DROP {kind} IF EXISTS `{args.database}`.`{prefix}_{suffix}`"

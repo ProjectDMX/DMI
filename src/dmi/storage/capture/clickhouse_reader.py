@@ -2,8 +2,10 @@
 
 Reads are pinned to a watermark, so a selection resolves to the same captures
 for as long as it lives. The snapshot boundary is **the set of packs committed
-at or before that watermark**, read from an append-only commit log -- not a
-range of descriptor versions.
+at or before that watermark**, read from an append-only snapshot manifest --
+not a range of descriptor versions. A manifest row counts only once its version
+also appears in the watermark log, which is what keeps a publish that lost its
+race from leaking packs into an already-pinned snapshot.
 
 That distinction is load-bearing. Descriptor rows live in a
 ``ReplacingMergeTree``, which is defined to keep only the highest version per
@@ -153,7 +155,7 @@ class ClickHouseCaptureCatalog:
         self._config = config or ClickHouseReaderConfig()
         self._capture_raw = f"{self._config.table_prefix}_capture_raw"
         self._watermark_table = f"{self._config.table_prefix}_index_watermark"
-        self._commit_log = f"{self._config.table_prefix}_pack_commit_log"
+        self._manifest = f"{self._config.table_prefix}_snapshot_manifest"
 
     @property
     def config(self) -> ClickHouseReaderConfig:
@@ -231,9 +233,9 @@ class ClickHouseCaptureCatalog:
         requested = _parse_watermark(watermark)
         # A selection is caller data. Its watermark must be one the indexer
         # actually published -- accepting an arbitrary value would read packs
-        # whose commit-log rows are written but not yet covered by a
-        # publish, defeating the publish-last ordering (the paginated path
-        # already enforces this bound in decode_cursor).
+        # whose manifest rows are written but whose watermark row has not
+        # landed, defeating the publish ordering (the paginated path already
+        # enforces this bound in decode_cursor).
         if requested > int(self.current_watermark()):
             raise ValueError(
                 "selection watermark exceeds the published watermark"
@@ -253,9 +255,7 @@ class ClickHouseCaptureCatalog:
         sql = (
             f"SELECT {self._projection()} FROM {self._qualified()} "
             "WHERE tenant_id = %(tenant_id)s AND "
-            "capture_id IN %(capture_ids)s AND (store_id, pack_id) IN "
-            f"(SELECT store_id, pack_id FROM {self._qualified(self._commit_log)} "
-            "WHERE index_version <= %(watermark)s) "
+            f"capture_id IN %(capture_ids)s AND {self._membership()} "
             f"GROUP BY {', '.join(_quoted(name) for name in _SORT_KEY)}"
         )
         rows = self._client.execute(sql, params, settings=self._config.settings)
@@ -267,6 +267,27 @@ class ClickHouseCaptureCatalog:
         return (
             f"{_quoted(self._config.database)}."
             f"{_quoted(table or self._capture_raw)}"
+        )
+
+    def _membership(self) -> str:
+        """The packs inside the snapshot, as a subquery on (store_id, pack_id).
+
+        Two conditions, and the second is the whole point. A manifest row is
+        written before its watermark row, so requiring the version to appear in
+        the watermark table is what stops a publish that lost the race -- which
+        never wrote one -- from leaking its packs into a snapshot that was
+        pinned before it ran.
+
+        Pack identity is the PAIR: matching pack_id alone would let the same
+        UUID published by a second store at a later version slip inside a
+        pinned snapshot.
+        """
+        return (
+            "(store_id, pack_id) IN (SELECT store_id, pack_id FROM "
+            f"{self._qualified(self._manifest)} "
+            "WHERE index_version <= %(watermark)s AND index_version IN "
+            f"(SELECT index_version FROM {self._qualified(self._watermark_table)} "
+            "WHERE index_version <= %(watermark)s))"
         )
 
     @staticmethod
@@ -298,14 +319,7 @@ class ClickHouseCaptureCatalog:
         # rows sharing a sort key at a time nobody controls. Bounding on packs
         # is also what makes a pin resolve to the pack it was taken over when a
         # later pack re-describes the same capture.
-        clauses = [
-            # Pack identity is (store_id, pack_id): matching on pack_id alone
-            # would let the same UUID committed by a second store at a later
-            # version slip inside a pinned snapshot.
-            "(store_id, pack_id) IN (SELECT store_id, pack_id FROM "
-            f"{self._qualified(self._commit_log)} "
-            "WHERE index_version <= %(watermark)s)"
-        ]
+        clauses = [self._membership()]
         params: dict[str, object] = {"watermark": watermark}
 
         # Equality and range filters apply to raw rows before grouping. That is

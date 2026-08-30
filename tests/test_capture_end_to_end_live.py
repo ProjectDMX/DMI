@@ -189,7 +189,7 @@ def _stack(tmp_path: Path):
                 ("TABLE", "capture_raw"),
                 ("TABLE", "pack_inventory_raw"),
                 ("TABLE", "index_watermark"),
-                ("TABLE", "pack_commit_log"),
+                ("TABLE", "snapshot_manifest"),
                 ("TABLE", "capture_version_claims"),
             ):
                 client.execute(
@@ -290,8 +290,9 @@ def test_hydration_rejects_a_re_described_catalog_row(tmp_path: Path):
         writer = ClickHouseCatalogWriter(env["client"], env["config"])
         version = writer.allocate_version()
         writer.write_descriptors((lying,), index_version=version)
-        writer.publish_watermark(
+        writer.publish_snapshot(
             index_version=version,
+            refs=(),
             published_at_ns=version,
             indexed_rows=1,
             indexed_packs=0,
@@ -430,6 +431,7 @@ def test_selection_resolve_prunes_to_the_tenant_range(tmp_path: Path):
         writer = ClickHouseCatalogWriter(client, config)
         version = writer.allocate_version()
         rows_per_tenant = 12_000
+        bulk_refs = []
         for offset, tenant in enumerate(("tenant-bulk-a", "tenant-bulk-b")):
             pack_id = str(UUID(int=PACK_ID.int + 100 + offset))
             bulk = tuple(
@@ -441,13 +443,15 @@ def test_selection_resolve_prunes_to_the_tenant_range(tmp_path: Path):
                 for item in synthetic_descriptors(rows_per_tenant)
             )
             writer.write_descriptors(bulk, index_version=version)
-            writer.commit_packs([bulk[0].locator.pack_ref], index_version=version)
-        writer.publish_watermark(
+            bulk_refs.append(bulk[0].locator.pack_ref)
+        writer.publish_snapshot(
             index_version=version,
+            refs=bulk_refs,
             published_at_ns=version,
             indexed_rows=2 * rows_per_tenant,
             indexed_packs=2,
         )
+        writer.commit_packs(bulk_refs, index_version=version)
 
         # (a) The selection carries its tenant and resolves end to end.
         recording = _RecordingClient(client)

@@ -12,6 +12,7 @@ from dmi.storage.capture import (
     PackIndex,
     PackRef,
     PackWriter,
+    SnapshotPublishRaceError,
 )
 
 
@@ -23,13 +24,22 @@ class _Client:
         self.calls = []
         self.committed = []
         self.claims = []
+        self.watermarks = []
 
     def execute(self, query, params=None, **kwargs):
         self.calls.append((query, params, kwargs))
         if query.lstrip().startswith("INSERT"):
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
+            elif "index_watermark" in query:
+                # The publish barrier is a server-side condition, so the fake
+                # has to enforce it or every publish test would pass vacuously.
+                version = params["index_version"]
+                if version > max(self.watermarks, default=0):
+                    self.watermarks.append(version)
             return []
+        if "count()" in query and "index_watermark" in query:
+            return [(self.watermarks.count(params["version"]),)]
         # The version allocator's queries are answered from real claim state;
         # every other SELECT returns the canned rows.
         if "version_claims" in query:
@@ -110,23 +120,93 @@ def test_clickhouse_catalog_creates_replay_safe_raw_tables_and_final_views():
     assert "ORDER BY (version, claim_id)" in ddl
 
 
-def test_clickhouse_catalog_inserts_descriptors_before_pack_commit():
+def test_publish_writes_membership_before_the_watermark_that_admits_it():
+    """Order is the whole mechanism, so it is pinned rather than assumed.
+
+    A reader counts a manifest row only once its version also appears in the
+    watermark log. Writing the watermark first would open a window where the
+    version is readable but its packs are not yet members, so a snapshot pinned
+    there would gain them a moment later.
+    """
     ref, descriptor = _descriptor()
     client = _Client()
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
 
     writer.write_descriptors([descriptor], index_version=42)
+    writer.publish_snapshot(
+        index_version=42, refs=[ref], published_at_ns=7,
+        indexed_rows=1, indexed_packs=1,
+    )
     writer.commit_packs([ref], index_version=42)
 
     inserts = [call for call in client.calls if call[0].startswith("INSERT")]
     assert "dmi_capture_raw" in inserts[0][0]
-    # Commit log before inventory: the inventory is the replay guard, so a crash
-    # between the two writes must not leave a pack skipped forever *and* never
-    # visible to readers.
-    assert "dmi_pack_commit_log" in inserts[1][0]
-    assert "dmi_pack_inventory_raw" in inserts[2][0]
+    assert "dmi_snapshot_manifest" in inserts[1][0]
+    assert "dmi_index_watermark" in inserts[2][0]
+    # The inventory is only the replay guard now, and CatalogIndexer writes it
+    # after a successful publish: a crash in between costs redundant work, not
+    # a pack that is skipped forever and never visible.
+    assert "dmi_pack_inventory_raw" in inserts[3][0]
     assert inserts[0][1][0][0] == "capture-a"
-    assert inserts[1][1][0][0] == ref.pack_id
+    assert inserts[1][1][0] == (42, ref.store_id, ref.pack_id)
+
+
+def test_publish_is_a_single_statement_barrier_over_the_watermark():
+    """The check and the visibility write cannot be separated by a round trip.
+
+    A SELECT-then-INSERT leaves the whole client round trip -- network, driver,
+    a GC pause -- between "am I the highest?" and "I am now visible". As one
+    conditional INSERT the server evaluates both together.
+    """
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    writer.publish_snapshot(
+        index_version=42, refs=(), published_at_ns=7,
+        indexed_rows=0, indexed_packs=0,
+    )
+
+    watermark_insert = next(
+        call[0] for call in client.calls
+        if call[0].startswith("INSERT") and "index_watermark" in call[0]
+    )
+    assert "SELECT" in watermark_insert
+    assert (
+        "WHERE (SELECT max(index_version) FROM `default`.`dmi_index_watermark`) "
+        "< %(index_version)s"
+    ) in watermark_insert
+
+
+def test_publish_below_the_published_head_raises_the_race_error():
+    """The barrier fires, and says nothing was made visible."""
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer.publish_snapshot(
+        index_version=9, refs=(), published_at_ns=1,
+        indexed_rows=0, indexed_packs=0,
+    )
+
+    with pytest.raises(SnapshotPublishRaceError, match="lost the publish race"):
+        writer.publish_snapshot(
+            index_version=8, refs=(), published_at_ns=2,
+            indexed_rows=0, indexed_packs=0,
+        )
+
+    # The loser's watermark row never landed, which is exactly what makes the
+    # manifest rows it already wrote inert.
+    assert client.watermarks == [9]
+
+
+def test_commit_packs_writes_only_the_replay_inventory():
+    ref, _ = _descriptor()
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    writer.commit_packs([ref], index_version=42)
+
+    inserts = [call for call in client.calls if call[0].startswith("INSERT")]
+    assert len(inserts) == 1
+    assert "dmi_pack_inventory_raw" in inserts[0][0]
 
 
 def test_clickhouse_catalog_queries_committed_pack_ids_in_one_batch():

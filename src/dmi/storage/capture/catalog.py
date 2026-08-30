@@ -5,11 +5,21 @@ import json
 from time import monotonic_ns, time_ns
 from typing import Callable, Protocol, Sequence
 
-from .model import CaptureDescriptor, ObjectPage, PackRef, PackStore
+from .model import CaptureDescriptor, CaptureStorageError, ObjectPage, PackRef, PackStore
 from .pack import PackIndex
 
 
 PackIdentity = tuple[str, str]
+
+
+class SnapshotPublishRaceError(CaptureStorageError):
+    """A publish lost the race to a higher version and made nothing visible.
+
+    Retryable by construction: the losing version never reached the watermark
+    table, so the manifest rows it wrote are inert -- membership requires a
+    version to appear there before its rows count. Re-allocating and
+    re-publishing is the whole recovery.
+    """
 
 
 class PackInventory(PackStore, Protocol):
@@ -30,10 +40,11 @@ class CatalogWriter(Protocol):
         self, refs: Sequence[PackRef], *, index_version: int
     ) -> None: ...
 
-    def publish_watermark(
+    def publish_snapshot(
         self,
         *,
         index_version: int,
+        refs: Sequence[PackRef],
         published_at_ns: int,
         indexed_rows: int,
         indexed_packs: int,
@@ -50,6 +61,7 @@ class CatalogIndexerConfig:
     max_rows_per_insert: int = 10_000
     max_estimated_bytes: int = 128 * 1024**2
     max_failure_details: int = 128
+    max_publish_attempts: int = 8
 
     def __post_init__(self) -> None:
         for name in (
@@ -57,6 +69,7 @@ class CatalogIndexerConfig:
             "max_rows_per_insert",
             "max_estimated_bytes",
             "max_failure_details",
+            "max_publish_attempts",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -253,24 +266,7 @@ class CatalogIndexer:
             descriptors.extend(pack_descriptors)
             valid_refs.append(ref)
 
-        # index_version has to increase strictly across every live indexer, or
-        # a batch lands underneath a watermark a reader already pinned and that
-        # snapshot grows after the fact. The version is a DB-allocated
-        # generation owned by the catalog itself -- no wall-clock value
-        # participates in the ordering, so clock skew between indexers (or an
-        # NTP step on one of them) cannot reorder publications. The wall clock
-        # only stamps published_at_ns below.
-        version = self._writer.allocate_version()
-        if type(version) is not int or version < 0:
-            raise ValueError("allocate_version must return a non-negative integer")
-        if self._published_version is None:
-            # Cross-check against durable state: a broken allocator must fail
-            # loudly here rather than publish under a pinned watermark.
-            self._published_version = self._writer.last_published_version()
-        if version <= self._published_version:
-            raise RuntimeError(
-                "catalog version allocator returned a non-monotonic version"
-            )
+        version = self._allocate_version()
         step = self._config.max_rows_per_insert
         descriptor_inserts = 0
         for start in range(0, len(descriptors), step):
@@ -278,27 +274,16 @@ class CatalogIndexer:
                 descriptors[start : start + step], index_version=version
             )
             descriptor_inserts += 1
+        # Publish before the inventory, never after. committed_pack_ids reads
+        # the inventory to skip replays, so a pack recorded there but never
+        # made visible is skipped forever *and* invisible -- silent, permanent
+        # loss. This way round the same crash costs only redundant work on the
+        # next pass. Publishing is also what makes the descriptor rows above
+        # readable at all: it writes the membership rows for `valid_refs` and
+        # the watermark that admits them.
+        published = self._publish(version, valid_refs, len(descriptors))
         if valid_refs:
-            self._writer.commit_packs(valid_refs, index_version=version)
-        # Publish last. Descriptors go out across several INSERTs and the pack
-        # markers after them, so the version is only a truthful snapshot once
-        # all of that is durable. A reader that derived the watermark from the
-        # descriptor table itself would see this version mid-batch.
-        self._published_version = version
-        # The wall clock stamps published_at_ns only -- a human-readable record
-        # of when the version was published, never part of its ordering.
-        published_at_ns = self._clock_ns()
-        if type(published_at_ns) is not int or published_at_ns < 0:
-            raise ValueError("clock_ns must return a non-negative integer")
-        # publish_watermark is a required part of the CatalogWriter contract:
-        # skipping it silently would leave every row this call wrote durably
-        # stored but permanently invisible to readers, with no error anywhere.
-        self._writer.publish_watermark(
-            index_version=version,
-            published_at_ns=published_at_ns,
-            indexed_rows=len(descriptors),
-            indexed_packs=len(valid_refs),
-        )
+            self._writer.commit_packs(valid_refs, index_version=published)
         result = IndexResult(
             requested_packs=len(unique) + len(conflict_failures),
             skipped_packs=len(unique) - len(pending),
@@ -312,6 +297,73 @@ class CatalogIndexer:
         )
         self._emit(result)
         return result
+
+    def _allocate_version(self) -> int:
+        # index_version has to increase strictly across every live indexer, or
+        # a batch lands underneath a watermark a reader already pinned and that
+        # snapshot grows after the fact. The version is a DB-allocated
+        # generation owned by the catalog itself -- no wall-clock value
+        # participates in the ordering, so clock skew between indexers (or an
+        # NTP step on one of them) cannot reorder publications. The wall clock
+        # only stamps published_at_ns.
+        version = self._writer.allocate_version()
+        if type(version) is not int or version < 0:
+            raise ValueError("allocate_version must return a non-negative integer")
+        if self._published_version is None:
+            # Cross-check against durable state: a broken allocator must fail
+            # loudly here rather than publish under a pinned watermark.
+            self._published_version = self._writer.last_published_version()
+        if version <= self._published_version:
+            raise RuntimeError(
+                "catalog version allocator returned a non-monotonic version"
+            )
+        return version
+
+    def _publish(
+        self, version: int, refs: Sequence[PackRef], indexed_rows: int
+    ) -> int:
+        """Publish the batch, re-allocating around a lost publish race.
+
+        Publishing is a required part of the CatalogWriter contract: skipping
+        it would leave every row this call wrote durably stored but permanently
+        invisible to readers, with no error anywhere.
+
+        A losing publish made nothing visible, so recovery is simply a fresh
+        version and another attempt. Only the manifest rows are rewritten --
+        one per pack, not one per capture, which is the whole reason membership
+        moved off the per-capture path. The descriptors already written keep
+        the version they were written with, and that is harmless: since pack
+        identity joined the descriptor sort key, index_version on those rows is
+        only a tiebreaker among rows that are byte identical anyway, never the
+        thing that decides whether they are visible. Membership does that, and
+        membership is rewritten at the version that wins.
+        """
+        attempts = self._config.max_publish_attempts
+        for attempt in range(attempts):
+            # The wall clock stamps published_at_ns only -- a human-readable
+            # record of when the version was published, never part of its
+            # ordering.
+            published_at_ns = self._clock_ns()
+            if type(published_at_ns) is not int or published_at_ns < 0:
+                raise ValueError("clock_ns must return a non-negative integer")
+            try:
+                self._writer.publish_snapshot(
+                    index_version=version,
+                    refs=refs,
+                    published_at_ns=published_at_ns,
+                    indexed_rows=indexed_rows,
+                    indexed_packs=len(refs),
+                )
+            except SnapshotPublishRaceError:
+                if attempt + 1 == attempts:
+                    break
+                version = self._allocate_version()
+                continue
+            self._published_version = version
+            return version
+        raise RuntimeError(
+            f"could not publish a catalog snapshot after {attempts} attempts"
+        )
 
     def _emit(self, result: IndexResult) -> None:
         if self._on_event is None:

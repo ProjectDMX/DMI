@@ -34,30 +34,41 @@ from dmi.storage.capture import (
     ClickHouseCatalogConfig,
     ClickHouseCatalogWriter,
     ClickHouseReaderConfig,
+    SnapshotPublishRaceError,
 )
 
 
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
 
 
-def _commit(writer, descriptors, index_version: int) -> None:
-    """Snapshots are bounded by committed packs, so a direct write must commit."""
+def _refs(descriptors):
+    """The distinct packs a set of descriptors lives in."""
     seen, refs = set(), []
     for item in descriptors:
         ref = item.locator.pack_ref
         if (ref.store_id, ref.pack_id) not in seen:
             seen.add((ref.store_id, ref.pack_id))
             refs.append(ref)
-    writer.commit_packs(refs, index_version=index_version)
+    return refs
 
 
-def _publish(writer, index_version: int, *, rows: int = 0, packs: int = 0) -> None:
-    """Publishing is a separate step; CatalogIndexer does it, direct writes must."""
-    writer.publish_watermark(
+def _commit(writer, descriptors, index_version: int) -> None:
+    """Record the replay guard; visibility comes from _publish, not from here."""
+    writer.commit_packs(_refs(descriptors), index_version=index_version)
+
+
+def _publish(writer, index_version: int, *, refs=(), rows: int = 0) -> None:
+    """Publishing is a separate step; CatalogIndexer does it, direct writes must.
+
+    Membership rides on the publish now, so `refs` is what makes those packs
+    visible; commit_packs only records the replay guard.
+    """
+    writer.publish_snapshot(
         index_version=index_version,
+        refs=list(refs),
         published_at_ns=index_version,
         indexed_rows=rows,
-        indexed_packs=packs,
+        indexed_packs=len(refs),
     )
 
 
@@ -92,7 +103,7 @@ def _catalog():
                 ("TABLE", "pack_inventory_raw"),
                 ("TABLE", "capture_version_claims"),
                 ("TABLE", "index_watermark"),
-                ("TABLE", "pack_commit_log"),
+                ("TABLE", "snapshot_manifest"),
             ):
                 client.execute(
                     f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`"
@@ -126,13 +137,13 @@ def test_a_merge_does_not_destroy_a_pinned_snapshot():
     corpus = synthetic_descriptors(3)
     with _catalog() as (writer, reader, client, config):
         writer.write_descriptors(corpus, index_version=1)
+        _publish(writer, 1, refs=_refs(corpus))
         _commit(writer, corpus, 1)
-        _publish(writer, 1)
 
         # Replay the identical batch, as an ambiguous commit would.
         writer.write_descriptors(corpus, index_version=2)
+        _publish(writer, 2, refs=_refs(corpus))
         _commit(writer, corpus, 2)
-        _publish(writer, 2)
 
         tenant = corpus[0].metadata.tenant_id
         before = reader.get_by_ids(
@@ -150,6 +161,70 @@ def test_a_merge_does_not_destroy_a_pinned_snapshot():
             f"raw rows went to {_raw_rows(client, config)}"
         )
         assert after[0] == before[0], "the resolved descriptor changed under a merge"
+
+
+def test_a_pinned_snapshot_does_not_gain_a_slower_indexers_packs():
+    """The mid-batch gap, over a live server.
+
+    Indexer A allocates a version and spends time writing descriptors. Indexer
+    B allocates a higher one and publishes. A reader pins B. A then publishes.
+
+    Under the old design A's membership rows were written before its watermark
+    and admitted by ``index_version <= W``, so they appeared inside the already
+    pinned snapshot. Now A's publish loses the barrier, never writes a
+    watermark row, and its manifest rows stay inert -- membership requires
+    both. A retries above B and becomes visible only at a fresh watermark.
+    """
+    early = synthetic_descriptors(2)
+    late_pack = str(uuid4())
+    late = tuple(
+        replace(
+            item,
+            metadata=replace(item.metadata, capture_id=f"late-{index}"),
+            locator=replace(item.locator, pack_id=late_pack),
+        )
+        for index, item in enumerate(synthetic_descriptors(2))
+    )
+    tenant = early[0].metadata.tenant_id
+    late_ids = [item.capture_id for item in late]
+
+    with _catalog() as (writer, reader, _, _):
+        # A allocates first and is still writing when B publishes.
+        version_a = writer.allocate_version()
+        writer.write_descriptors(late, index_version=version_a)
+
+        version_b = writer.allocate_version()
+        assert version_b > version_a
+        writer.write_descriptors(early, index_version=version_b)
+        _publish(writer, version_b, refs=_refs(early), rows=len(early))
+
+        pinned = reader.current_watermark()
+        assert reader.get_by_ids(late_ids, tenant_id=tenant, watermark=pinned) == ()
+
+        # A publishes late, and loses.
+        with pytest.raises(SnapshotPublishRaceError):
+            _publish(writer, version_a, refs=_refs(late), rows=len(late))
+
+        assert reader.get_by_ids(late_ids, tenant_id=tenant, watermark=pinned) == (), (
+            "the snapshot pinned at the published watermark grew after the fact"
+        )
+        assert reader.current_watermark() == pinned, (
+            "a losing publish moved the watermark"
+        )
+
+        # Retrying above the winner is what makes A's packs visible, and only
+        # at a watermark taken after that.
+        version_retry = writer.allocate_version()
+        assert version_retry > version_b
+        _publish(writer, version_retry, refs=_refs(late), rows=len(late))
+
+        fresh = reader.current_watermark()
+        assert int(fresh) > int(pinned)
+        assert {
+            item.capture_id
+            for item in reader.get_by_ids(late_ids, tenant_id=tenant, watermark=fresh)
+        } == set(late_ids)
+        assert reader.get_by_ids(late_ids, tenant_id=tenant, watermark=pinned) == ()
 
 
 def _copied_to_another_store(descriptors):
@@ -212,13 +287,13 @@ def test_two_packs_describing_one_capture_both_survive_a_merge(second_descriptio
     copied = second_description(original)
     with _catalog() as (writer, reader, client, config):
         writer.write_descriptors(original, index_version=1)
+        _publish(writer, 1, refs=_refs(original))
         _commit(writer, original, 1)
-        _publish(writer, 1)
         pinned = reader.current_watermark()
 
         writer.write_descriptors(copied, index_version=2)
+        _publish(writer, 2, refs=_refs(copied))
         _commit(writer, copied, 2)
-        _publish(writer, 2)
 
         _merge(client, config)
 
@@ -264,16 +339,16 @@ def test_a_pin_ignores_a_second_store_holding_the_same_pack_id():
     tenant = original[0].metadata.tenant_id
     with _catalog() as (writer, reader, _, _):
         writer.write_descriptors(original, index_version=1)
+        _publish(writer, 1, refs=_refs(original))
         _commit(writer, original, 1)
-        _publish(writer, 1)
         pinned = reader.current_watermark()
         # A cursor carries the same pin through the paginated path.
         first = reader.search(CaptureQuery(limit=2, tenant_id=tenant))
         assert first.next_cursor is not None
 
         writer.write_descriptors(mirror, index_version=2)
+        _publish(writer, 2, refs=_refs(mirror))
         _commit(writer, mirror, 2)
-        _publish(writer, 2)
 
         # (a) get_by_ids at the pin resolves to the store that was committed.
         at_pin = reader.get_by_ids(
@@ -308,8 +383,8 @@ def test_re_indexing_one_pack_still_collapses_to_a_single_row():
     with _catalog() as (writer, reader, client, config):
         for version in (1, 2, 3):
             writer.write_descriptors(corpus, index_version=version)
+            _publish(writer, version, refs=_refs(corpus))
             _commit(writer, corpus, version)
-            _publish(writer, version)
         assert _raw_rows(client, config) == 3 * len(corpus)
 
         _merge(client, config)
@@ -340,13 +415,13 @@ def test_a_pack_committed_after_the_watermark_is_not_visible():
     )
     with _catalog() as (writer, reader, client, config):
         writer.write_descriptors(early, index_version=1)
+        _publish(writer, 1, refs=_refs(early))
         _commit(writer, early, 1)
-        _publish(writer, 1)
         pinned = reader.current_watermark()
 
         writer.write_descriptors(later, index_version=2)
+        _publish(writer, 2, refs=_refs(later))
         _commit(writer, later, 2)
-        _publish(writer, 2)
         _merge(client, config)
 
         # The pinned snapshot sees the early pack and nothing after it.
@@ -383,12 +458,12 @@ def test_a_walk_still_completes_after_a_merge_mid_pagination():
     corpus = synthetic_descriptors(60)
     with _catalog() as (writer, reader, client, config):
         writer.write_descriptors(corpus, index_version=1)
+        _publish(writer, 1, refs=_refs(corpus))
         _commit(writer, corpus, 1)
-        _publish(writer, 1)
         # Re-index everything, so every row has a superseded version to lose.
         writer.write_descriptors(corpus, index_version=2)
+        _publish(writer, 2, refs=_refs(corpus))
         _commit(writer, corpus, 2)
-        _publish(writer, 2)
 
         first = reader.search(CaptureQuery(limit=20))
         _merge(client, config)
@@ -421,8 +496,8 @@ def test_a_watermark_is_not_published_before_its_batch_completes():
         mid_batch = reader.current_watermark()
         rows_visible = _raw_rows(client, config)
         writer.write_descriptors(corpus[2:], index_version=123)
-        _commit(writer, corpus[2:], 123)
-        _publish(writer, 123, rows=len(corpus))
+        _publish(writer, 123, refs=_refs(corpus), rows=len(corpus))
+        _commit(writer, corpus, 123)
 
         # Mid-batch the version must not be readable at all: two of four rows
         # were durable, so publishing 123 there would pin a snapshot that keeps
@@ -444,8 +519,8 @@ def test_an_indexed_batch_is_visible_all_at_once():
     with _catalog() as (writer, reader, client, config):
         for start in range(0, len(corpus), 7):
             writer.write_descriptors(corpus[start : start + 7], index_version=9)
-        _commit(writer, corpus[start : start + 7], 9)
-        _publish(writer, 9, rows=len(corpus))
+        _publish(writer, 9, refs=_refs(corpus), rows=len(corpus))
+        _commit(writer, corpus, 9)
 
         page = reader.search(CaptureQuery(limit=100))
 
@@ -460,8 +535,8 @@ def test_a_watermark_below_every_row_returns_nothing():
     corpus = synthetic_descriptors(5)
     with _catalog() as (writer, reader, _, _):
         writer.write_descriptors(corpus, index_version=10)
+        _publish(writer, 10, refs=_refs(corpus))
         _commit(writer, corpus, 10)
-        _publish(writer, 10)
 
         assert (
             reader.get_by_ids(

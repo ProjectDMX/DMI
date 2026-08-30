@@ -8,6 +8,7 @@ import pytest
 
 from dmi.storage.capture import (
     CatalogIndexer,
+    SnapshotPublishRaceError,
     CatalogIndexerConfig,
     CatalogReconciler,
     CaptureMetadata,
@@ -89,7 +90,11 @@ class _CatalogWriter:
         self.descriptor_batches: list[tuple] = []
         self.pack_batches: list[tuple[PackRef, ...]] = []
         self.watermarks: list[tuple[int, int, int, int]] = []
+        self.manifests: list[tuple[int, tuple]] = []
+        self.descriptor_versions: list[int] = []
         self.fail_commit_once = False
+        self.fail_publish_once = False
+        self.fail_publish_always = False
         self.allocations = 0
 
     def committed_pack_ids(self, identities):
@@ -97,6 +102,7 @@ class _CatalogWriter:
 
     def write_descriptors(self, descriptors, *, index_version):
         self.descriptor_batches.append(tuple(descriptors))
+        self.descriptor_versions.append(index_version)
 
     def commit_packs(self, refs, *, index_version):
         self.pack_batches.append(tuple(refs))
@@ -105,9 +111,19 @@ class _CatalogWriter:
             raise RuntimeError("ambiguous commit")
         self.committed.update((ref.store_id, ref.pack_id) for ref in refs)
 
-    def publish_watermark(
-        self, *, index_version, published_at_ns, indexed_rows, indexed_packs
+    def publish_snapshot(
+        self, *, index_version, refs, published_at_ns, indexed_rows, indexed_packs
     ):
+        if index_version <= self.last_published_version():
+            # The server-side barrier, modelled: a publish is only visible if
+            # it is strictly above the published head.
+            raise SnapshotPublishRaceError(f"{index_version} lost the race")
+        if self.fail_publish_once:
+            self.fail_publish_once = False
+            raise SnapshotPublishRaceError("scripted lost race")
+        if self.fail_publish_always:
+            raise SnapshotPublishRaceError("scripted lost race")
+        self.manifests.append((index_version, tuple(refs)))
         self.watermarks.append(
             (index_version, published_at_ns, indexed_rows, indexed_packs)
         )
@@ -170,6 +186,59 @@ def test_indexer_reads_only_footers_and_batches_rows(tmp_path: Path):
     # The version is allocator-owned (first allocation on a fresh catalog is
     # 1); the clock stamps only published_at_ns.
     assert writer.watermarks == [(1, 42, 3, 2)]
+
+
+def test_a_lost_publish_is_retried_at_a_higher_version(tmp_path: Path):
+    """Losing the barrier costs a fresh version, not the batch.
+
+    A losing publish made nothing visible, so the recovery is another attempt
+    above the winner. Only the manifest is rewritten -- one row per pack, which
+    is the whole reason membership moved off the per-capture path.
+    """
+    inventory, refs = _packs(tmp_path, (2,))
+    writer = _CatalogWriter()
+    writer.fail_publish_once = True
+    indexer = CatalogIndexer(inventory, writer, clock_ns=lambda: 42)
+
+    result = indexer.index(refs)
+
+    assert result.indexed_packs == 1
+    assert writer.allocations == 2, "the retry must take a fresh version"
+    published = writer.watermarks[-1][0]
+    assert len(writer.watermarks) == 1, "only the winning publish is visible"
+    assert writer.manifests == [(published, tuple(refs))]
+
+    # Descriptors are written once, at the version that lost, and are NOT
+    # rewritten. That is safe because pack identity is part of the descriptor
+    # sort key: index_version there only breaks ties between byte-identical
+    # rows, and never decides visibility -- membership does, and membership was
+    # rewritten at the version that won.
+    assert len(writer.descriptor_batches) == 1
+    assert writer.descriptor_versions == [published - 1]
+    assert writer.descriptor_versions[0] != published
+
+    # The replay guard is recorded at the published version, after the publish.
+    assert writer.pack_batches == [tuple(refs)]
+
+
+def test_publishing_gives_up_after_its_bounded_retries(tmp_path: Path):
+    inventory, refs = _packs(tmp_path, (1,))
+    writer = _CatalogWriter()
+    writer.fail_publish_always = True
+    indexer = CatalogIndexer(
+        inventory,
+        writer,
+        config=CatalogIndexerConfig(max_publish_attempts=3),
+        clock_ns=lambda: 42,
+    )
+
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        indexer.index(refs)
+
+    # Nothing was made visible, and the replay guard was never written -- so
+    # the next pass re-indexes rather than skipping a pack nobody can see.
+    assert writer.watermarks == []
+    assert writer.pack_batches == []
 
 
 def test_duplicate_event_and_missed_event_converge_on_rebuild(tmp_path: Path):

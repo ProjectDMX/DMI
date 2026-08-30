@@ -304,8 +304,16 @@ def test_absent_filters_add_no_clauses():
     catalog.search(CaptureQuery(limit=10))
 
     sql, params, _ = client.calls[-1]
-    assert sql.count("AND") == 0
     assert set(params) == {"watermark", "row_limit"}
+    # The membership subquery carries its own AND (the manifest version must
+    # also appear in the watermark log), so counting the token no longer says
+    # anything. Assert on the filters themselves instead.
+    for fragment in (
+        "tenant_id = ", "experiment_id = ", "run_id = ", "session_id = ",
+        "model_id = ", "hook_name IN", "layer_number IN", "captured_at_ns >=",
+        "captured_at_ns <=",
+    ):
+        assert fragment not in sql
 
 
 # --- limits and injection ---------------------------------------------------

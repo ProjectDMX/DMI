@@ -7,7 +7,7 @@ from time import time_ns
 from typing import Protocol, Sequence
 from uuid import uuid4
 
-from .catalog import PackIdentity
+from .catalog import PackIdentity, SnapshotPublishRaceError
 from .model import CaptureDescriptor, PackRef
 
 
@@ -122,7 +122,7 @@ class ClickHouseCatalogWriter:
         self._pack_raw = f"{prefix}_pack_inventory_raw"
         self._pack_view = f"{prefix}_pack_inventory"
         self._watermark = f"{prefix}_index_watermark"
-        self._commit_log = f"{prefix}_pack_commit_log"
+        self._manifest = f"{prefix}_snapshot_manifest"
         self._version_claims = f"{prefix}_capture_version_claims"
 
     def ensure_schema(self) -> None:
@@ -204,15 +204,24 @@ version UInt64, claim_id UUID, claimed_at_ns UInt64
 ) ENGINE = MergeTree ORDER BY (version, claim_id)"""
         )
 
-        # The snapshot boundary. "The catalog as of W" is "the packs committed
-        # at or before W" -- a fact about packs, not about descriptor rows.
-        # Keeping it here, append-only, is what lets the descriptor table stay
-        # a ReplacingMergeTree: the only rows that table can now collapse are
-        # rows for one capture in one pack, and those are byte identical, so it
-        # does not matter which one a merge keeps.
+        # The snapshot boundary. "The catalog as of W" is "the packs whose
+        # membership rows were published at or before W" -- a fact about packs,
+        # not about descriptor rows. Keeping it here, append-only, is what lets
+        # the descriptor table stay a ReplacingMergeTree: the only rows that
+        # table can now collapse are rows for one capture in one pack, and
+        # those are byte identical, so it does not matter which one a merge
+        # keeps.
+        #
+        # These rows are written by publish_snapshot, not by commit_packs. The
+        # predecessor table was written before the watermark, which let a
+        # slower indexer's rows land underneath a watermark a reader had
+        # already pinned. A row here counts only once its version reaches the
+        # watermark table (see the reader's membership clause), and a publish
+        # that loses the race never writes that watermark row -- so the rows it
+        # left behind are inert.
         self._client.execute(
-            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._commit_log)} (
-pack_id UUID, store_id LowCardinality(String), index_version UInt64
+            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._manifest)} (
+index_version UInt64, store_id LowCardinality(String), pack_id UUID
 ) ENGINE = MergeTree ORDER BY (index_version, store_id, pack_id)"""
         )
 
@@ -255,22 +264,69 @@ pack_id UUID, store_id LowCardinality(String), index_version UInt64
             rows,
         )
 
-    def publish_watermark(
+    def publish_snapshot(
         self,
         *,
         index_version: int,
+        refs: Sequence[PackRef],
         published_at_ns: int,
         indexed_rows: int,
         indexed_packs: int,
     ) -> None:
-        """Make a version readable, after everything it covers is durable."""
+        """Make a version readable, after everything it covers is durable.
+
+        Membership rows first, then the watermark row that admits them. A
+        reader's membership clause requires both, so the order is what makes a
+        half-finished publish invisible rather than partially visible.
+        """
         self._validate_version(index_version)
         self._validate_version(published_at_ns)
+        watermark = self._qualified(self._watermark)
+        if refs:
+            self._client.execute(
+                f"INSERT INTO {self._qualified(self._manifest)} "
+                "(index_version, store_id, pack_id) VALUES",
+                [(index_version, ref.store_id, ref.pack_id) for ref in refs],
+            )
+        # The barrier and the visibility write are ONE server-side statement,
+        # so the gap between "am I the highest?" and "I am now visible" holds
+        # no client round trip -- no network hop, no GC pause, no scheduler
+        # stall. A separate SELECT then INSERT left that whole window open.
+        #
+        # This also subsumes the indexer's non-monotonic-version guard: the
+        # server itself now refuses a version that is not strictly above the
+        # published head, so a broken allocator cannot publish underneath a
+        # watermark a reader already pinned.
+        #
+        # It NARROWS the race, it does not close it. Two publishers can still
+        # both evaluate the condition inside the server-side overlap of their
+        # two statements and both insert; the lower one then becomes visible
+        # under a watermark that was pinned before it existed, silently. See
+        # docs/catalog-descriptor-key.md.
         self._client.execute(
-            f"INSERT INTO {self._qualified(self._watermark)} "
-            "(index_version, published_at_ns, indexed_rows, indexed_packs) VALUES",
-            [(index_version, published_at_ns, indexed_rows, indexed_packs)],
+            f"INSERT INTO {watermark} "
+            "(index_version, published_at_ns, indexed_rows, indexed_packs) "
+            "SELECT %(index_version)s, %(published_at_ns)s, "
+            "toUInt64(%(indexed_rows)s), toUInt32(%(indexed_packs)s) "
+            "FROM system.one "
+            f"WHERE (SELECT max(index_version) FROM {watermark}) "
+            "< %(index_version)s",
+            {
+                "index_version": index_version,
+                "published_at_ns": published_at_ns,
+                "indexed_rows": indexed_rows,
+                "indexed_packs": indexed_packs,
+            },
         )
+        landed = self._client.execute(
+            f"SELECT count() FROM {watermark} WHERE index_version = %(version)s",
+            {"version": index_version},
+        )
+        if not landed or not landed[0] or not landed[0][0]:
+            raise SnapshotPublishRaceError(
+                f"catalog version {index_version} lost the publish race; "
+                "nothing it wrote is visible"
+            )
 
     def last_published_version(self) -> int:
         """Highest published index_version, or 0 when nothing is published."""
@@ -352,16 +408,14 @@ pack_id UUID, store_id LowCardinality(String), index_version UInt64
             )
             for ref in refs
         ]
-        # Order matters. committed_pack_ids reads the inventory to skip replays,
-        # and readers bound the snapshot by the commit log. Writing the
-        # inventory first would mean a crash in between leaves the pack skipped
-        # forever *and* never visible -- silent, permanent loss. This way round
-        # the same crash only costs redundant work on the next pass.
-        self._client.execute(
-            f"INSERT INTO {self._qualified(self._commit_log)} "
-            "(pack_id, store_id, index_version) VALUES",
-            [(ref.pack_id, ref.store_id, index_version) for ref in refs],
-        )
+        # The replay guard, and nothing else: committed_pack_ids reads this
+        # inventory to skip packs it has already indexed. Snapshot membership
+        # used to be written here too; it now belongs to publish_snapshot, so
+        # that a pack becomes visible and becomes skippable at two clearly
+        # ordered moments rather than one. CatalogIndexer calls this AFTER a
+        # successful publish, so a crash in between leaves a pack that is
+        # visible but not yet skippable -- redundant work next pass, never the
+        # reverse.
         self._client.execute(
             f"INSERT INTO {self._qualified(self._pack_raw)} "
             f"({', '.join(_PACK_COLUMNS)}) VALUES",

@@ -73,6 +73,7 @@ from .catalog import (
     PackIdentity,
     PackInventory,
     ReconcileResult,
+    SnapshotPublishRaceError,
 )
 from .clickhouse_catalog import ClickHouseCatalogConfig, ClickHouseCatalogWriter
 from .clickhouse_reader import ClickHouseCaptureCatalog, ClickHouseReaderConfig
@@ -189,6 +190,7 @@ __all__ = [
     "S3PackStore",
     "S3StoreConfig",
     "SealedPack",
+    "SnapshotPublishRaceError",
     "SpoolFullError",
     "SpoolSnapshot",
     "SpoolUploader",

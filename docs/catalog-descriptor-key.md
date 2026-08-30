@@ -109,7 +109,8 @@ deployment.
 
 ## The mid-batch gap, and why the obvious fix fails
 
-Snapshot membership is a predicate over a live table:
+Snapshot membership was a predicate over a live table (`{prefix}_pack_commit_log`,
+since replaced by the manifest described below):
 
 ```
 (store_id, pack_id) IN (SELECT store_id, pack_id FROM {prefix}_pack_commit_log
@@ -178,19 +179,65 @@ checkpointing to stay cheap as publishes accumulate. It is the table-format
 answer, and worth reaching for if the catalog ever grows a second writer that
 cannot be serialised.
 
-### What to do now
+### What shipped, and what it does not do
 
-None of this is reachable with a single indexer: one writer cannot race
-itself. The whole concern is about the multi-indexer future the version
-allocator was built for, so the decision is really about when that future
-arrives.
+None of this is reachable with a single indexer: one writer cannot race itself.
+The whole concern is about the multi-indexer future the version allocator was
+built for.
 
-If it is near, take the contiguity rule -- it is the cheapest sound option and
-does not require a read-side chain walk. If it is not, the honest move is to
-leave the predicate as it is and keep this section as the record of why, rather
-than spend churn on a marker-gated variant that is smaller but still unsound.
-What should not happen is shipping the post-write check and calling the gap
-closed.
+The marker-gated variant shipped, with the barrier tightened as far as it goes
+without a contract change:
+
+- Membership moved to `{prefix}_snapshot_manifest`, written by
+  `publish_snapshot` rather than by `commit_packs`, and a row counts only once
+  its version also appears in `{prefix}_index_watermark`. A publish that loses
+  never writes that watermark row, so the rows it already wrote are inert.
+- The barrier and the visibility write are **one server-side statement**:
+  `INSERT INTO watermark SELECT ... WHERE (SELECT max(index_version) FROM
+  watermark) < V`. There is no client round trip between "am I the highest?"
+  and "I am now visible", so no network hop, GC pause or scheduler stall sits
+  inside the window. This also subsumes the indexer's non-monotonic-version
+  guard -- the server now refuses a version that is not strictly above the
+  head.
+- A losing publish raises `SnapshotPublishRaceError`; the indexer re-allocates
+  and republishes, bounded at `max_publish_attempts`. Only the manifest is
+  rewritten. Descriptors keep the version they were written with, which is
+  harmless now that pack identity is in the descriptor sort key: `index_version`
+  there is only a tiebreaker among byte-identical rows and never decides
+  visibility.
+- `index()` orders itself descriptors -> publish -> pack inventory. The
+  inventory is the replay guard, so writing it before a successful publish
+  would let a crash leave a pack skipped forever *and* invisible. Last means a
+  crash costs redundant work, never invisibility.
+
+**This narrows the gap. It does not close it, and it must not be described as
+fixed.** The window went from the whole descriptor-writing phase -- seconds,
+many INSERTs -- down to the server-side overlap of two conditional INSERTs. Two
+publishers can still both evaluate `max(index_version) < V` before either row
+is durable and both land; the lower one then becomes visible underneath a
+watermark that was already pinned, and **it happens silently**. The three sound
+repairs above remain the options for actually closing it.
+
+Two consequences to carry forward:
+
+**Dead manifest rows accumulate.** Every lost publish leaves membership rows at
+a version that will never reach the watermark table. They are inert -- no
+snapshot can ever admit them, and versions are unique so nobody will publish
+that version later -- but they are never collected. That is a new GC
+obligation: any retention job may delete manifest rows whose `index_version` is
+absent from the watermark table. Nothing does today.
+
+**Detection is the next step, and it costs a contract change.** The residual
+can be made loud instead of silent: pin `(W, generation)` where the generation
+counts watermark rows `<= W`, carried as a scalar subquery in the same
+statement as the page so the number is consistent with the rows returned --
+checking it in a separate round trip has its own window and is a false
+guarantee. Verified live: a late lower publish moves the count, and the scalar
+folds as a constant alongside the `GROUP BY`/`argMax`/`LIMIT` the reader
+already emits. It was left out deliberately, because it changes what a pinned
+read promises -- a walk becomes "stable, or `SnapshotMoved` and re-pin" -- and
+it bumps the cursor format, invalidating in-flight cursors. That is a reviewer
+decision, not an implementation detail.
 
 ## Where the catalog goes later
 

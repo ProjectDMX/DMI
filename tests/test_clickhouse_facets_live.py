@@ -23,13 +23,18 @@ from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS, _FACET_COLU
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
 
 
-def _publish(writer, index_version: int, *, rows: int = 0, packs: int = 0) -> None:
-    """Publishing is a separate step; CatalogIndexer does it, direct writes must."""
-    writer.publish_watermark(
+def _publish(writer, index_version: int, *, refs=(), rows: int = 0) -> None:
+    """Publishing is a separate step; CatalogIndexer does it, direct writes must.
+
+    Membership rides on the publish now, so `refs` is what makes those packs
+    visible; commit_packs only records the replay guard.
+    """
+    writer.publish_snapshot(
         index_version=index_version,
+        refs=list(refs),
         published_at_ns=index_version,
         indexed_rows=rows,
-        indexed_packs=packs,
+        indexed_packs=len(refs),
     )
 
 
@@ -56,7 +61,7 @@ def _writer():
             ("TABLE", "pack_inventory_raw"),
             ("TABLE", "capture_version_claims"),
             ("TABLE", "index_watermark"),
-            ("TABLE", "pack_commit_log"),
+            ("TABLE", "snapshot_manifest"),
         ):
             client.execute(f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`")
 

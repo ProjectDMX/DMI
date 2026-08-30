@@ -22,7 +22,9 @@ from dmi.storage.capture import (
     ClickHouseCatalogConfig,
     ClickHouseCatalogWriter,
     FilesystemPackStore,
+    PackRef,
     PackWriter,
+    SnapshotPublishRaceError,
 )
 
 
@@ -46,6 +48,7 @@ class _CatalogServer:
     def __init__(self):
         self.claims: list[tuple[int, str]] = []
         self.watermarks: list[int] = []
+        self.manifest: list[tuple[int, str, str]] = []
         self.inserts: list[str] = []
         self.on_owner_read = None
 
@@ -54,9 +57,19 @@ class _CatalogServer:
             self.inserts.append(query)
             if "version_claims" in query:
                 self.claims.extend((int(row[0]), str(row[1])) for row in params)
+            elif "snapshot_manifest" in query:
+                self.manifest.extend(
+                    (int(row[0]), str(row[1]), str(row[2])) for row in params
+                )
             elif "index_watermark" in query:
-                self.watermarks.extend(int(row[0]) for row in params)
+                # The conditional publish, enforced: a version only lands when
+                # it is strictly above the published head.
+                version = int(params["index_version"])
+                if version > max(self.watermarks, default=0):
+                    self.watermarks.append(version)
             return []
+        if "count()" in query and "index_watermark" in query:
+            return [(self.watermarks.count(params["version"]),)]
         if "version_claims" in query:
             if "max(version)" in query:
                 return [(max((v for v, _ in self.claims), default=None),)]
@@ -91,8 +104,9 @@ def test_allocations_interleaved_with_publications_stay_monotonic():
     writer = _writer(server)
 
     first = writer.allocate_version()
-    writer.publish_watermark(
-        index_version=first, published_at_ns=1, indexed_rows=0, indexed_packs=0
+    writer.publish_snapshot(
+        index_version=first, refs=(), published_at_ns=1, indexed_rows=0,
+        indexed_packs=0,
     )
     second = _writer(server).allocate_version()
 
@@ -141,8 +155,9 @@ def test_a_restarted_writer_allocates_above_previous_publications():
     server = _CatalogServer()
     first = _writer(server)
     version = first.allocate_version()
-    first.publish_watermark(
-        index_version=version, published_at_ns=1, indexed_rows=0, indexed_packs=0
+    first.publish_snapshot(
+        index_version=version, refs=(), published_at_ns=1, indexed_rows=0,
+        indexed_packs=0,
     )
 
     # A fresh instance holds no in-memory state; the claims table alone must
@@ -170,6 +185,48 @@ def test_allocation_attempts_must_be_a_positive_integer():
     for value in (0, -1, 1.5):
         with pytest.raises(ValueError, match="allocation_attempts"):
             ClickHouseCatalogConfig(allocation_attempts=value)
+
+
+def test_a_losing_publish_leaves_its_membership_rows_inert():
+    """Why a loser can leave its rows behind instead of cleaning up.
+
+    Indexer A allocates, then takes its time. B allocates higher and publishes.
+    A publishes last and loses the barrier. A's manifest rows are durable, but
+    its version never reaches the watermark table -- and the reader's
+    membership clause requires BOTH, so those rows can never enter a snapshot.
+    Cleaning them up is therefore unnecessary for correctness (though they do
+    accumulate; see docs/catalog-descriptor-key.md on the GC obligation).
+    """
+    server = _CatalogServer()
+    slow, fast = _writer(server), _writer(server)
+    ref = PackRef(
+        pack_id=str(UUID(int=7)), store_id="local",
+        object_key="packs/a.dmi-pack", object_bytes=1024,
+        checksum="0" * 64, record_count=1,
+    )
+
+    version_a = slow.allocate_version()
+    version_b = fast.allocate_version()
+    assert version_b > version_a
+
+    fast.publish_snapshot(
+        index_version=version_b, refs=(), published_at_ns=1,
+        indexed_rows=0, indexed_packs=0,
+    )
+    with pytest.raises(SnapshotPublishRaceError):
+        slow.publish_snapshot(
+            index_version=version_a, refs=[ref], published_at_ns=2,
+            indexed_rows=1, indexed_packs=1,
+        )
+
+    assert any(row[0] == version_a for row in server.manifest), (
+        "precondition: the loser really did write its membership rows"
+    )
+    assert version_a not in server.watermarks, (
+        "the loser wrote a watermark row, which would admit its rows into a "
+        "snapshot pinned at the winner's version"
+    )
+    assert server.watermarks == [version_b]
 
 
 # --- indexers over the shared server -------------------------------------------
@@ -255,8 +312,8 @@ class _HostileWriter:
     def commit_packs(self, refs, *, index_version):
         pass
 
-    def publish_watermark(
-        self, *, index_version, published_at_ns, indexed_rows, indexed_packs
+    def publish_snapshot(
+        self, *, index_version, refs, published_at_ns, indexed_rows, indexed_packs
     ):
         pass
 

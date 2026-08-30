@@ -156,16 +156,23 @@ def test_an_identifier_needing_no_escape_still_yields_a_usable_key(tmp_path: Pat
 class _Client:
     def __init__(self):
         self.statements: list[str] = []
-        self.published: list[tuple[str, list]] = []
+        self.published: list[tuple[str, object]] = []
         self.claims: list[tuple[int, str]] = []
+        self.watermarks: list[int] = []
 
     def execute(self, query, params=None, **kwargs):
         self.statements.append(query)
         if query.lstrip().upper().startswith("INSERT"):
-            self.published.append((query, list(params or [])))
+            self.published.append((query, params))
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
+            elif "index_watermark" in query:
+                version = params["index_version"]
+                if version > max(self.watermarks, default=0):
+                    self.watermarks.append(version)
             return []
+        if "count()" in query and "index_watermark" in query:
+            return [(self.watermarks.count(params["version"]),)]
         # The version allocator's three queries need real state to answer.
         if "version_claims" in query:
             if "max(version)" in query:
@@ -173,44 +180,52 @@ class _Client:
             wanted = params["version"]
             return [(cid,) for v, cid in self.claims if v == wanted]
         if "index_watermark" in query:
-            versions = [
-                p[0][0] for q, p in self.published if "index_watermark" in q
-            ]
-            return [(max(versions, default=None),)]
+            return [(max(self.watermarks, default=None),)]
         return []
 
 
-def test_a_pack_is_never_both_skipped_on_replay_and_invisible_to_readers():
-    """The durability window between the two commit writes.
+def test_a_pack_is_never_both_skipped_on_replay_and_invisible_to_readers(
+    tmp_path: Path,
+):
+    """The durability window between publishing and recording the replay guard.
 
     `committed_pack_ids` reads the inventory to skip replays; readers bound the
-    snapshot by the commit log. If the inventory is written first and the
-    process dies before the log, the pack is skipped forever *and* never
-    visible -- silent, permanent data loss. Writing the log first makes the
-    same crash merely redundant work.
+    snapshot by the manifest a publish writes. If the inventory landed first
+    and the process died before the publish, the pack would be skipped forever
+    *and* never visible -- silent, permanent data loss. Publishing first makes
+    the same crash merely redundant work, which this proves by crashing there
+    and then running the next pass.
     """
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    ref = store.put(_sealed(_record(_metadata())), "packs/a.dmi-pack")
+
     backing = _Client()
-    # Fail the second of the two INSERTs that commit_packs performs.
-    client = FaultyClickHouseClient(backing, insert=fail_on(2))
+    # index() inserts: version claim, descriptors, manifest, watermark, then
+    # the inventory. Fail the last one -- the crash this ordering exists for.
+    client = FaultyClickHouseClient(backing, insert=fail_on(5))
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
-    ref = PackRef(
-        pack_id=str(PACK_ID),
-        store_id="local",
-        object_key="packs/a.dmi-pack",
-        object_bytes=1024,
-        checksum="0" * 64,
-        record_count=1,
-    )
 
     with pytest.raises(FaultInjected):
-        writer.commit_packs([ref], index_version=1)
+        CatalogIndexer(store, writer, clock_ns=lambda: 7).index([ref])
 
     written = [s for s in backing.statements if s.startswith("INSERT")]
-    assert len(written) == 1, "expected exactly one of the two writes to land"
-    assert "pack_commit_log" in written[0], (
-        "the surviving write was the inventory, so this pack is now skipped on "
-        "replay and invisible to readers; the commit log must be written first"
+    assert any("snapshot_manifest" in s for s in written), (
+        "the pack was never made a member of a snapshot"
     )
+    assert any("index_watermark" in s for s in written), (
+        "the version was never published, so the descriptors are invisible"
+    )
+    assert not any("pack_inventory_raw" in s for s in written), (
+        "the inventory landed despite the injected failure"
+    )
+
+    # The next pass sees no inventory row, so it re-indexes rather than
+    # skipping a pack it never made visible.
+    healthy = ClickHouseCatalogWriter(backing, ClickHouseCatalogConfig())
+    result = CatalogIndexer(store, healthy, clock_ns=lambda: 8).index([ref])
+
+    assert result.indexed_packs == 1, "the crashed pack was skipped on replay"
+    assert result.skipped_packs == 0
 
 
 # --- indexer robustness ------------------------------------------------------
@@ -304,10 +319,6 @@ def test_a_clock_that_steps_backwards_cannot_publish_under_a_pinned_watermark(
     # clock correction -- but the second must not reuse or undercut a version a
     # reader may already have pinned.
     assert first_result.indexed_packs == 1 and second_result.indexed_packs == 1
-    published = [
-        params[0][0]
-        for query, params in client.published
-        if "index_watermark" in query
-    ]
+    published = client.watermarks
     assert published == sorted(published), f"versions went backwards: {published}"
     assert len(set(published)) == len(published), "a version was reused"
