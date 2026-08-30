@@ -367,6 +367,15 @@ A typical flow is:
 6. Fetch with byte, request, and concurrency limits.
 7. Verify checksums and decode selected records.
 
+Hydration also binds every catalog descriptor to the pack footer before any
+payload range is fetched: the footer index is loaded with the usual two small
+range reads (trailer, then footer), cached per pack in a bounded LRU on the
+reader, and a descriptor whose metadata or record locator contradicts the
+footer fails hydration as a format error. This closes the catalog-trust gap
+where a re-described row (same bytes and CRC, different dtype or shape) would
+decode garbage. The catalog remains the query index and the footer the
+authority; estimation stays metadata-only and reads nothing.
+
 List and summary operations never hydrate tensor bytes implicitly. Storage
 credentials and provider endpoints are resolved from deployment configuration,
 not returned in catalog rows.

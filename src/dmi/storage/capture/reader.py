@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import math
 from typing import Mapping, Sequence
@@ -16,6 +17,7 @@ from .model import (
     HydrationLimitError,
     PackFormatError,
     PackIntegrityError,
+    PackRef,
     PackStore,
 )
 from .extensions import (
@@ -23,8 +25,13 @@ from .extensions import (
     ExtensionFailure,
     ExtensionRegistry,
 )
-from .pack import verify_payload
+from .pack import PackIndex, verify_payload
 from .summary import ArtifactRef, CoreTensorSummaryV1, decode_tensor, summarize_tensor
+
+
+# Footer indexes verified during hydration are cached per pack, bounded so a
+# reader that touches many packs cannot hold every footer in memory at once.
+_FOOTER_CACHE_PACKS = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +43,23 @@ class CaptureSummary:
     scalars: Mapping[str, float]
     artifacts: tuple[ArtifactRef, ...]
     failures: tuple[ExtensionFailure, ...]
+
+
+def _record_locator(descriptor: CaptureDescriptor) -> tuple[int, int, int, str, str]:
+    """The per-record placement fields the footer is authoritative for.
+
+    The locator's pack-level fields (store id, object key, size, pack
+    checksum) came from the same catalog row under test, so comparing them
+    against a footer index built from that row would prove nothing.
+    """
+    locator = descriptor.locator
+    return (
+        locator.offset,
+        locator.stored_length,
+        locator.decoded_length,
+        locator.codec,
+        locator.checksum,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +96,13 @@ class CaptureReader:
         self._catalog = catalog
         self._stores = dict(stores)
         self._max_coalesce_gap_bytes = max_coalesce_gap_bytes
+        # LRU of {capture_id: descriptor} footer indexes keyed by pack
+        # identity, so repeated hydrations of the same pack verify against
+        # the footer without re-reading it.
+        self._footer_cache: OrderedDict[
+            tuple[str, str, str], dict[str, CaptureDescriptor]
+        ] = OrderedDict()
+        self._footer_cache_limit = _FOOTER_CACHE_PACKS
 
     def search(self, query: CaptureQuery) -> CapturePage:
         return self._catalog.search(query)
@@ -130,6 +161,17 @@ class CaptureReader:
             if store is None:
                 raise PackFormatError(f"unknown pack store: {plan.store_id}")
             ref = descriptors[plan.descriptor_indexes[0]].locator.pack_ref
+            # The catalog is the query index, but the pack footer is the
+            # authority for what each payload *is*: verify_payload checks
+            # length and CRC32 of the bytes only, so a re-described catalog
+            # row (same bytes, different dtype/shape) would otherwise decode
+            # garbage. Binding every catalog descriptor to the footer costs
+            # two small range reads (trailer + footer) per uncached pack per
+            # hydration -- the price of the footer being authoritative -- and
+            # happens before any payload range is fetched.
+            footer = self._footer_descriptors(store, ref)
+            for index in plan.descriptor_indexes:
+                self._require_footer_match(descriptors[index], footer)
             for read_range in plan.ranges:
                 block = store.read_range(ref, read_range.offset, read_range.length)
                 if len(block) != read_range.length:
@@ -216,6 +258,46 @@ class CaptureReader:
                 )
             )
         return tuple(summaries)
+
+    def _footer_descriptors(
+        self, store: PackStore, ref: PackRef
+    ) -> Mapping[str, CaptureDescriptor]:
+        key = (ref.store_id, ref.pack_id, ref.checksum)
+        cached = self._footer_cache.get(key)
+        if cached is not None:
+            self._footer_cache.move_to_end(key)
+            return cached
+        index = PackIndex.from_store(store, ref)
+        footer = {item.capture_id: item for item in index.descriptors()}
+        self._footer_cache[key] = footer
+        if len(self._footer_cache) > self._footer_cache_limit:
+            self._footer_cache.popitem(last=False)
+        return footer
+
+    @staticmethod
+    def _require_footer_match(
+        descriptor: CaptureDescriptor,
+        footer: Mapping[str, CaptureDescriptor],
+    ) -> None:
+        authoritative = footer.get(descriptor.capture_id)
+        if authoritative is None:
+            raise PackFormatError(
+                "catalog descriptor does not match the pack footer: "
+                f"{descriptor.capture_id} is not in pack {descriptor.locator.pack_id}"
+            )
+        for domain, catalog_value, footer_value in (
+            ("metadata", descriptor.metadata, authoritative.metadata),
+            (
+                "locator",
+                _record_locator(descriptor),
+                _record_locator(authoritative),
+            ),
+        ):
+            if catalog_value != footer_value:
+                raise PackFormatError(
+                    "catalog descriptor does not match the pack footer: "
+                    f"{domain} for {descriptor.capture_id}"
+                )
 
     def _resolve(self, selection: CaptureSelection) -> tuple[CaptureDescriptor, ...]:
         resolved = self._catalog.get_by_ids(

@@ -228,6 +228,10 @@ def test_gate_reads_no_unrelated_bytes_without_coalescing(tmp_path: Path):
     selection = CaptureSelection.create(
         wanted, catalog_watermark=WATERMARK, filter_hash="f" * 64
     )
+    # Warm the footer cache: the first hydration of a pack pays two extra
+    # range reads (trailer + footer) to verify catalog descriptors against
+    # the authoritative footer. The gate below measures payload discipline.
+    reader.hydrate(selection, byte_limit=1 << 20)
     store.ranges.clear()
     reader.hydrate(selection, byte_limit=1 << 20)
 
@@ -260,6 +264,8 @@ def test_gate_amplification_stays_within_the_coalescing_bound(tmp_path: Path):
         wanted, catalog_watermark=WATERMARK, filter_hash="f" * 64
     )
     estimate = reader.estimate(selection)
+    # Warm the footer cache (see test_gate_reads_no_unrelated_bytes above).
+    reader.hydrate(selection, byte_limit=1 << 20)
     store.ranges.clear()
     reader.hydrate(selection, byte_limit=1 << 20)
 
@@ -287,6 +293,9 @@ def test_estimate_predicts_reads_exactly_without_coalescing(tmp_path: Path):
 
     selection = reader.select(CaptureQuery(limit=10))
     estimate = reader.estimate(selection)
+    # Warm the footer cache (see test_gate_reads_no_unrelated_bytes above):
+    # estimate() prices payload requests only, never the footer binding.
+    reader.hydrate(selection, byte_limit=1 << 20)
     store.ranges.clear()
     reader.hydrate(selection, byte_limit=1 << 20)
 
@@ -431,6 +440,8 @@ def test_summarize_reads_nothing_beyond_the_selected_ranges(tmp_path: Path):
     reader, store, descriptors = _build(tmp_path, records, gap_bytes=0)
 
     selection = reader.select(CaptureQuery(limit=10))
+    # Warm the footer cache (see test_gate_reads_no_unrelated_bytes above).
+    reader.hydrate(selection, byte_limit=1 << 20)
     store.ranges.clear()
     reader.summarize(selection, byte_limit=1 << 20)
 

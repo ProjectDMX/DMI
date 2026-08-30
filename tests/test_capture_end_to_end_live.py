@@ -249,6 +249,10 @@ def test_analysis_reads_only_the_selected_ranges(tmp_path: Path):
         )
         estimate = reader.estimate(selection)
 
+        # Warm the footer cache: the first hydration of a pack pays two extra
+        # range reads (trailer + footer) to bind catalog descriptors to the
+        # authoritative footer. The gate below measures payload discipline.
+        reader.hydrate(selection, byte_limit=8 << 20)
         store.ranges.clear()
         reader.hydrate(selection, byte_limit=8 << 20)
 
@@ -262,6 +266,49 @@ def test_analysis_reads_only_the_selected_ranges(tmp_path: Path):
             ), f"range {(offset, length)} is outside every selected payload"
         assert sum(length for _, length in store.ranges) == estimate.request_bytes
         assert wanted  # the corpus really does interleave the two hooks
+
+
+def test_hydration_rejects_a_re_described_catalog_row(tmp_path: Path):
+    """The catalog-trust gap, over a live ClickHouse.
+
+    A second INSERT at a higher index version re-describes one capture --
+    float32 (16,) becomes int32 (4, 4), same byte count, same payload CRC --
+    exactly what a corrupted or hostile re-index would write. Hydration must
+    bind the row to the pack footer and refuse, not decode garbage.
+    """
+    from dmi.storage.capture import PackFormatError
+
+    with _stack(tmp_path) as env:
+        catalog, reader = env["catalog"], env["reader"]
+        page = catalog.search(CaptureQuery(tenant_id="tenant-e2e", limit=100))
+        target = next(
+            item for item in page.items if item.metadata.dtype == "float32"
+        )
+        assert target.metadata.shape == (16,)
+        lying = replace(
+            target, metadata=replace(target.metadata, dtype="int32", shape=(4, 4))
+        )
+
+        writer = ClickHouseCatalogWriter(env["client"], env["config"])
+        version = writer.allocate_version()
+        writer.write_descriptors((lying,), index_version=version)
+        writer.publish_watermark(
+            index_version=version,
+            published_at_ns=version,
+            indexed_rows=1,
+            indexed_packs=0,
+        )
+
+        selection = reader.select(CaptureQuery(tenant_id="tenant-e2e", limit=100))
+        resolved = {
+            item.capture_id: item for item in reader._resolve(selection)
+        }
+        assert resolved[target.capture_id].metadata.dtype == "int32"
+
+        with pytest.raises(
+            PackFormatError, match="does not match the pack footer"
+        ):
+            reader.hydrate(selection, byte_limit=8 << 20)
 
 
 def test_summaries_agree_with_the_source_tensors(tmp_path: Path):
