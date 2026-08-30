@@ -298,7 +298,9 @@ def test_a_taken_over_publisher_writes_nothing_at_all():
     later = _retried_into_a_new_pack(corpus)
 
     # A short lease so the takeover is a real expiry rather than a forced one,
-    # and a publish cap comfortably above a one-row INSERT.
+    # and a publish cap comfortably above a one-row INSERT. The one wall clock
+    # left in this test runs the safe way: the wedge sleeps 250 ms against a
+    # 200 ms TTL, and load only makes the expiry more certain, never less.
     with _catalog(
         lease_ttl_ns=200_000_000, publish_timeout_ns=100_000_000
     ) as (writer, reader, client, config):
@@ -311,7 +313,19 @@ def test_a_taken_over_publisher_writes_nothing_at_all():
         assert len(before_page.items) == len(corpus)
 
         writer.release_publisher_lease()
-        successor = ClickHouseCatalogWriter(_client(), config)
+        # The successor runs on the DEFAULT knobs. Only the stalled publisher's
+        # lease has to lapse, and its config is what decides that; giving the
+        # successor a 200 ms lease and a 100 ms publish cap would have put the
+        # closing publish below on a deadline for no reason.
+        default = ClickHouseCatalogConfig()
+        successor = ClickHouseCatalogWriter(
+            _client(),
+            replace(
+                config,
+                lease_ttl_ns=default.lease_ttl_ns,
+                publish_timeout_ns=default.publish_timeout_ns,
+            ),
+        )
         armed = []
 
         class _TakeOverAfterTheRenewal:
@@ -427,28 +441,54 @@ def test_a_lease_is_taken_over_on_expiry_and_given_back_on_release():
     A live lease cannot be stolen. An expired one can be taken, which is what
     makes a crashed indexer recoverable rather than terminal. A release hands
     it back at once, so an orderly restart does not cost a whole TTL.
+
+    Every clock here now runs in the direction load makes MORE true, which the
+    first version of this did not. It gave the fixture a 200 ms TTL and then
+    asserted, about five round trips later, that the lease was still live
+    enough to refuse a successor -- so a busy server made it fail with DID NOT
+    RAISE, and a correctness test that fails at random gets deleted by whoever
+    is unlucky enough to hit it. The leases that must be LIVE now carry the
+    default 30 s TTL; the lease that must be EXPIRED carries one of a
+    microsecond, over by the time its own read-back returns. Neither assertion
+    is racing a deadline any more.
     """
     corpus = synthetic_descriptors(2)
     tenant = corpus[0].metadata.tenant_id
-    with _catalog(
-        lease_ttl_ns=200_000_000, publish_timeout_ns=100_000_000
-    ) as (writer, reader, client, config):
+    with _catalog() as (writer, reader, client, config):
+        # A live lease is not takeable, and the refusal names who holds it.
         successor = ClickHouseCatalogWriter(_client(), config)
         with pytest.raises(PublisherLeaseHeldError, match="snapshot-suite"):
             successor.acquire_publisher_lease("successor")
 
-        sleep(0.25)
+        # A crashed holder leaves a lease that lapses. Reproduced by giving one
+        # a TTL of a microsecond rather than by waiting out a real TTL: the
+        # DURABLE state is identical -- a head row whose expires_at_ns is behind
+        # the server's own clock -- and it is reached without racing anything.
+        writer.release_publisher_lease()
+        crashed = ClickHouseCatalogWriter(
+            _client(), replace(config, lease_ttl_ns=1_000, publish_timeout_ns=999)
+        )
+        held = crashed.acquire_publisher_lease("crashed")
+        expires_at_ns, now_ns = client.execute(
+            "SELECT expires_at_ns, toUnixTimestamp64Nano(now64(9)) FROM "
+            f"`{config.database}`.`{config.table_prefix}_publisher_lease` "
+            "ORDER BY term DESC, lease_id DESC LIMIT 1"
+        )[0]
+        assert expires_at_ns <= now_ns, (
+            "precondition: the crashed holder's lease has to have lapsed"
+        )
+
         taken = successor.acquire_publisher_lease("successor")
-        assert taken.term > writer.publisher_lease.term
+        assert taken.term > held.term
 
         # The previous holder is refused. Here it is the renewal at the head of
         # every publish that catches it, one round trip before the fence;
         # test_a_taken_over_publisher_writes_nothing_at_all drives the case the
         # renewal cannot see, where the takeover lands behind it.
         with pytest.raises(PublisherLeaseHeldError, match="'successor'"):
-            _publish(writer, writer.allocate_version(), refs=(), rows=0)
+            _publish(crashed, crashed.allocate_version(), refs=(), rows=0)
         assert reader.current_watermark() == "0"
-        assert writer.publisher_lease is None
+        assert crashed.publisher_lease is None
 
         # A release hands the lease straight back rather than making the next
         # publisher wait out the TTL.
@@ -996,18 +1036,51 @@ def test_the_public_view_keeps_both_packs_describing_one_capture():
         assert len(page.items) == len(original)
 
 
-def test_the_public_view_of_an_empty_catalog_is_empty():
-    """max() over an empty UInt64 watermark is 0, and versions start at 1.
+def test_an_empty_membership_bound_admits_nothing_rather_than_everything():
+    """The degenerate case of the bound, with rows behind it to lose.
 
-    So the bound admits nothing rather than everything -- the failure mode a
-    NULL or a missing row would produce.
+    This was `test_the_public_view_of_an_empty_catalog_is_empty`, and it was
+    vacuous: over an empty catalog the view is empty with its entire WHERE
+    clause deleted, because the raw table is empty too. It also described a
+    mechanism the view no longer has -- there is no `max(index_version)` in it,
+    the bound pairs `(index_version, publish_id)` across two tables.
+
+    The question the degenerate case actually asks is what an EMPTY bound
+    admits. If the server read `IN (empty)` as unconditionally true, or if the
+    bound dropped out of the statement, "published rows only" would silently
+    become "every row in the raw table" -- so the catalog here holds rows, and
+    the bound is emptied in each of the two ways a half-finished publish
+    leaves it. The last step publishes for real, so "empty" is the bound
+    working rather than the view being broken.
     """
-    with _catalog() as (_, _, client, config):
-        assert client.execute(
-            "SELECT max(index_version) FROM "
-            f"`{config.database}`.`{config.table_prefix}_index_watermark`"
-        ) == [(0,)]
+    corpus = synthetic_descriptors(3)
+    with _catalog() as (writer, _, client, config):
+        writer.write_descriptors(corpus, index_version=1)
+
+        # (a) Nothing published: both sides of the pair are empty, and the raw
+        # table is not.
+        assert _raw_rows(client, config) == len(corpus)
+        assert _catalog_state(client, config) == {
+            "index_watermark": [], "snapshot_manifest": []
+        }
         assert _view_rows(client, config) == []
+
+        # (b) Membership written, watermark never reached -- what a publish
+        # that lost the race leaves behind. The manifest now names exactly the
+        # packs these descriptors are in, so a bound that asked only "is this
+        # pack in the manifest?" would admit every one of them.
+        client.execute(
+            f"INSERT INTO `{config.database}`.`{config.table_prefix}"
+            "_snapshot_manifest` (index_version, publish_id, store_id, pack_id) "
+            "VALUES",
+            [(1, uuid4(), ref.store_id, ref.pack_id) for ref in _refs(corpus)],
+        )
+        assert _catalog_state(client, config)["snapshot_manifest"] != []
+        assert _view_rows(client, config) == []
+
+        # And the view is not simply always empty.
+        _publish(writer, 1, refs=_refs(corpus), rows=len(corpus))
+        assert len(_view_rows(client, config)) == len(corpus)
 
 
 def test_the_public_view_is_the_raw_rows_of_published_packs():
