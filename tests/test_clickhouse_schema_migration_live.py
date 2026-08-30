@@ -34,8 +34,11 @@ Run against a reachable ClickHouse:
 from __future__ import annotations
 
 from contextlib import contextmanager
+import importlib.util
 from os import environ
 from pathlib import Path
+import subprocess
+import sys
 from uuid import UUID, uuid4
 
 import pytest
@@ -122,6 +125,10 @@ pack_id UUID, store_id LowCardinality(String), index_version UInt64
 )
 
 _VERSION_ONE_SORT_KEY = "tenant_id, experiment_id, run_id, captured_at_ns, capture_id"
+_CURRENT_SORT_KEY = (
+    "tenant_id, experiment_id, run_id, captured_at_ns, capture_id, "
+    "store_id, pack_id"
+)
 
 # The documented rebuild: every object either build creates, views before the
 # tables they read. Version 1's commit log is here because a drop that misses
@@ -299,6 +306,39 @@ def _recorded_version(client, config) -> int:
     )[0][0]
 
 
+def _object_names(client, config) -> set[str]:
+    """Every object of this prefix the server actually holds."""
+    return {
+        row[0]
+        for row in client.execute(
+            "SELECT name FROM system.tables WHERE database = %(database)s "
+            "AND name LIKE %(pattern)s",
+            {"database": config.database, "pattern": f"{config.table_prefix}\\_%"},
+        )
+    }
+
+
+def _columns(client, config, suffix: str) -> set[str]:
+    return {
+        row[0]
+        for row in client.execute(
+            "SELECT name FROM system.columns WHERE database = %(database)s "
+            "AND table = %(table)s",
+            {
+                "database": config.database,
+                "table": f"{config.table_prefix}_{suffix}",
+            },
+        )
+    }
+
+
+def _findings(message: str) -> list[str]:
+    """The bulleted differences a refusal claims it found in this catalog."""
+    return [
+        line.strip()[2:] for line in message.splitlines() if line.startswith("  - ")
+    ]
+
+
 # --- the upgrade that cannot happen ------------------------------------------
 
 
@@ -319,13 +359,28 @@ def test_starting_against_a_version_one_catalog_is_refused(tmp_path: Path):
             writer.ensure_schema()
 
         message = str(raised.value)
-        assert "schema version 1" in message
+        assert "carries no schema stamp" in message
         assert f"requires version {_SCHEMA_VERSION}" in message
         # Both incompatible changes, named: an operator has to know that no
-        # ALTER gets them out of this.
-        assert "ORDER BY" in message and "(store_id, pack_id)" in message
-        assert f"{config.table_prefix}_pack_commit_log" in message
-        assert f"{config.table_prefix}_snapshot_manifest" in message
+        # ALTER gets them out of this. Each one is a finding read off THIS
+        # catalog, and each is checked against the live schema first.
+        findings = _findings(message)
+        assert _sort_key(client, config) == _VERSION_ONE_SORT_KEY
+        assert any(
+            "ORDER BY" in item and _VERSION_ONE_SORT_KEY in item
+            for item in findings
+        ), findings
+        assert f"{config.table_prefix}_pack_commit_log" in _object_names(
+            client, config
+        )
+        assert f"{config.table_prefix}_snapshot_manifest" not in _object_names(
+            client, config
+        )
+        assert any(
+            f"membership is in `{config.table_prefix}_pack_commit_log`" in item
+            and f"`{config.table_prefix}_snapshot_manifest`, which is absent" in item
+            for item in findings
+        ), findings
         # And the exact recovery, including the step it is fatal to skip.
         assert "CatalogReconciler.rebuild()" in message
         assert "Dropping the pack inventory is mandatory" in message
@@ -349,6 +404,249 @@ def test_starting_against_a_version_one_catalog_is_refused(tmp_path: Path):
             )
             == [(0,)]
         )
+
+
+# --- the upgrade this build will really perform first -------------------------
+#
+# `_VERSION_ONE_SCHEMA` above is the oldest catalog anyone might still be
+# running. It is NOT the one this build meets first. That is this branch's own
+# immediate predecessor, and it is a different schema: it already has the new
+# descriptor sort key and the manifest, and it has no commit log at all. The
+# first refusal read the absent version stamp as "this is version 1" and
+# recited version 1's two differences at it -- both false of that catalog. An
+# operator who checks two named facts, finds both untrue and concludes the
+# guard is broken goes around it, which is the one path the guard exists to
+# prevent. So the diagnosis is now read off the live schema, and this is the
+# test whose absence let that ship.
+
+# `@{upstream}` at the time of writing. Pinned as a sha rather than as the
+# symbolic ref, because `@{upstream}` is a per-clone alias that moves.
+_UPSTREAM_COMMIT = "bea3ed828f69de0a56b2bf30023a8a49fc19745e"
+_UPSTREAM_SOURCE = "src/dmi/storage/capture/clickhouse_catalog.py"
+
+
+def _upstream_catalog_module(tmp_path: Path):
+    """`@{upstream}`'s own catalog writer, extracted with `git show`.
+
+    Not transcribed. A fixture written out by hand drifts towards whatever this
+    branch happens to create, which is the one thing a schema-upgrade fixture
+    must never do -- so the predecessor's DDL is the predecessor's code,
+    executed.
+
+    Loaded under a name inside `dmi.storage.capture` so its `from .catalog
+    import ...` resolves, and never written into the package directory.
+    """
+    root = Path(__file__).resolve().parents[1]
+    shown = subprocess.run(
+        ["git", "show", f"{_UPSTREAM_COMMIT}:{_UPSTREAM_SOURCE}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if shown.returncode != 0:
+        pytest.skip(
+            f"cannot read {_UPSTREAM_COMMIT} from git: {shown.stderr.strip()}"
+        )
+    source = tmp_path / "upstream_clickhouse_catalog.py"
+    source.write_text(shown.stdout)
+    name = "dmi.storage.capture._upstream_catalog_fixture"
+    spec = importlib.util.spec_from_file_location(name, source)
+    module = importlib.util.module_from_spec(spec)
+    # `dataclass` resolves annotations through `sys.modules`, so the module has
+    # to be registered before it is executed, and removed after so nothing else
+    # in the session can import the predecessor by accident.
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        del sys.modules[name]
+    return module
+
+
+def test_the_refusal_only_claims_differences_the_upstream_catalog_really_has(
+    tmp_path: Path,
+):
+    """Every specific claim, checked against the catalog it was made about.
+
+    The predecessor's catalog already has this build's descriptor sort key and
+    writes membership to the manifest, so a refusal that says otherwise is
+    simply wrong -- and being wrong here is worse than being vague, because the
+    operator can check it. What it really lacks is the publish-identity column
+    on the watermark and the manifest, the publisher lease, and the version
+    stamp; those are the claims the message is allowed to make.
+    """
+    upstream = _upstream_catalog_module(tmp_path)
+    store, _, refs, descriptors = _packs(tmp_path)
+    with _server() as (client, config):
+        # The predecessor builds and fills its own catalog, with its own code.
+        older = upstream.ClickHouseCatalogWriter(
+            client,
+            upstream.ClickHouseCatalogConfig(
+                database=config.database, table_prefix=config.table_prefix
+            ),
+        )
+        older.ensure_schema()
+        older.write_descriptors(descriptors, index_version=1)
+        older.publish_snapshot(
+            index_version=1,
+            refs=refs,
+            published_at_ns=1,
+            indexed_rows=len(descriptors),
+            indexed_packs=len(refs),
+        )
+        older.commit_packs(refs, index_version=1)
+        assert _count(client, config, "capture_raw") == len(descriptors)
+        assert _count(client, config, "snapshot_manifest") == len(refs)
+
+        with pytest.raises(CatalogSchemaVersionError) as raised:
+            ClickHouseCatalogWriter(client, config).ensure_schema()
+        message = str(raised.value)
+        findings = _findings(message)
+
+        # What is actually true of this catalog, read from the server.
+        present = _object_names(client, config)
+        sort_key = _sort_key(client, config)
+        assert sort_key == _CURRENT_SORT_KEY
+        assert f"{config.table_prefix}_pack_commit_log" not in present
+        assert f"{config.table_prefix}_snapshot_manifest" in present
+        assert f"{config.table_prefix}_publisher_lease" not in present
+        assert f"{config.table_prefix}_schema_version" not in present
+        assert "publish_id" not in _columns(client, config, "index_watermark")
+        assert "publish_id" not in _columns(client, config, "snapshot_manifest")
+
+        # ...and the refusal says exactly that, difference by difference.
+        assert "schema version 1" not in message
+        assert any(
+            sort_key in item and "NOT what is wrong" in item for item in findings
+        ), findings
+        assert any(
+            f"membership is already in `{config.table_prefix}_snapshot_manifest`"
+            in item
+            and "NO commit-log migration owed" in item
+            for item in findings
+        ), findings
+        assert not any(
+            f"membership is in `{config.table_prefix}_pack_commit_log`" in item
+            for item in findings
+        ), findings
+        assert any(
+            "no `publish_id` column" in item
+            and f"{config.table_prefix}_index_watermark" in item
+            and f"{config.table_prefix}_snapshot_manifest" in item
+            for item in findings
+        ), findings
+        assert any(
+            f"`{config.table_prefix}_publisher_lease`" in item
+            and f"`{config.table_prefix}_schema_version`" in item
+            and "present" in item
+            for item in findings
+        ), findings
+
+        # Refused all the same, with the reason for refusing a catalog whose
+        # every probed difference is already accounted for.
+        assert "refused whichever version it is" in message
+        assert "cannot know that the differences listed are all of them" in message
+
+        # And refused BEFORE any DDL: the predecessor's catalog is untouched,
+        # in particular not now carrying a stamp or a lease table that would
+        # make the next start read it as half-migrated.
+        assert _object_names(client, config) == present
+        assert _sort_key(client, config) == sort_key
+        assert _count(client, config, "capture_raw") == len(descriptors)
+
+        # The documented recovery works from here too, which is what makes the
+        # refusal actionable rather than terminal.
+        _drop_everything(client, config)
+        writer = ClickHouseCatalogWriter(client, config)
+        writer.ensure_schema()
+        writer.acquire_publisher_lease("rebuild")
+        result = CatalogReconciler(
+            _Inventory(store, refs), CatalogIndexer(store, writer)
+        ).rebuild(prefix="packs/", page_size=8)
+        assert result.failures == ()
+        assert result.indexed_packs == len(refs)
+        assert _recorded_version(client, config) == _SCHEMA_VERSION
+
+
+def test_a_lone_leftover_commit_log_names_itself_instead_of_wedging(tmp_path: Path):
+    """One inert table nothing reads, left by a drop that missed it.
+
+    It made the catalog non-empty, so `ensure_schema` did not treat the start
+    as a fresh install; it carried no version stamp, so the start read as an
+    old schema; and the refusal then prescribed the full rebuild the operator
+    had just finished, over tables that no longer exist. Nothing could be
+    created and no indexer could start until somebody noticed one table.
+    """
+    with _server() as (client, config):
+        client.execute(
+            f"CREATE TABLE `{config.database}`.`{config.table_prefix}"
+            "_pack_commit_log` (pack_id UUID, store_id LowCardinality(String), "
+            "index_version UInt64) ENGINE = MergeTree "
+            "ORDER BY (index_version, store_id, pack_id)"
+        )
+        writer = ClickHouseCatalogWriter(client, config)
+
+        with pytest.raises(CatalogSchemaVersionError) as raised:
+            writer.ensure_schema()
+
+        message = str(raised.value)
+        assert (
+            f"the only object present is `{config.database}`."
+            f"`{config.table_prefix}_pack_commit_log`"
+        ) in message
+        assert "Drop it and run ensure_schema() again" in message
+        # Not the rebuild: there is nothing left to rebuild from.
+        assert "CatalogReconciler.rebuild()" not in message
+
+        # And doing what it says gets the catalog started.
+        client.execute(
+            f"DROP TABLE `{config.database}`.`{config.table_prefix}_pack_commit_log`"
+        )
+        writer.ensure_schema()
+        assert _recorded_version(client, config) == _SCHEMA_VERSION
+
+
+def test_a_dropped_view_is_recreated_instead_of_forcing_a_rebuild(tmp_path: Path):
+    """A view is derived from the tables, so losing one is not a data loss.
+
+    The refusal used to treat every object alike, so a dropped view demanded
+    the full rebuild -- which re-reads every pack footer in the store and
+    leaves readers on an empty and then partial catalog while it runs. Missing
+    TABLES stay refused; that is where rows really are at stake.
+    """
+    store, inventory, refs, descriptors = _packs(tmp_path)
+    with _server() as (client, config):
+        writer = ClickHouseCatalogWriter(client, config)
+        reader = ClickHouseCaptureCatalog(
+            client, ClickHouseReaderConfig.from_catalog(config)
+        )
+        writer.ensure_schema()
+        writer.acquire_publisher_lease("rebuild")
+        CatalogReconciler(inventory, CatalogIndexer(store, writer)).rebuild(
+            prefix="packs/", page_size=8
+        )
+        assert _count(client, config, "capture") == len(descriptors)
+
+        for view in ("capture", "pack_inventory"):
+            client.execute(
+                f"DROP VIEW `{config.database}`.`{config.table_prefix}_{view}`"
+            )
+
+        writer.ensure_schema()
+
+        # Back, and serving exactly the published rows -- no rebuild, no
+        # re-read of a single pack footer.
+        assert _count(client, config, "capture") == len(descriptors)
+        assert _count(client, config, "pack_inventory") == len(refs)
+        assert len(reader.search(CaptureQuery(limit=100)).items) == len(descriptors)
+        assert _recorded_version(client, config) == _SCHEMA_VERSION
+        # A dropped TABLE is still refused: recreating one empty beside an
+        # inventory that kept its rows is the state that hides every capture.
+        client.execute(
+            f"DROP TABLE `{config.database}`.`{config.table_prefix}_snapshot_manifest`"
+        )
+        with pytest.raises(CatalogSchemaVersionError, match="is missing"):
+            writer.ensure_schema()
 
 
 def test_the_documented_rebuild_restores_a_version_one_catalog(tmp_path: Path):
@@ -385,10 +683,7 @@ def test_the_documented_rebuild_restores_a_version_one_catalog(tmp_path: Path):
 
         # Version 2, with the sort key that was unreachable by any upgrade.
         assert _recorded_version(client, config) == _SCHEMA_VERSION
-        assert _sort_key(client, config) == (
-            "tenant_id, experiment_id, run_id, captured_at_ns, capture_id, "
-            "store_id, pack_id"
-        )
+        assert _sort_key(client, config) == _CURRENT_SORT_KEY
 
         page = reader.search(CaptureQuery(limit=100, tenant_id="tenant-a"))
         assert {item.capture_id: item.locator for item in page.items} == expected

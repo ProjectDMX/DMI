@@ -486,15 +486,18 @@ deployment, not something this module can pick.
 `{prefix}_schema_version` holds one row naming the schema the catalog was
 created with. The current version is **4**. `ensure_schema` writes that row
 last, once every other object exists, so a stamped catalog is a complete one.
-A catalog with no such table is version 1 by definition -- that is the only
-thing it can be, because version 1 never had one.
+
+**Version 4 is the first version that stamps itself**, so a catalog with no such
+table is one of versions 1, 2 or 3 and the stamp cannot say which. It is not
+"version 1 by definition"; reading it that way is how a refusal comes to state
+differences the catalog in front of it does not have.
 
 | Version | What it changed |
 |---|---|
 | 1 | the original schema; membership in `{prefix}_pack_commit_log`, descriptors sorted on capture identity alone |
 | 2 | `(store_id, pack_id)` appended to the descriptor sort key; membership moved to `{prefix}_snapshot_manifest` |
 | 3 | `publish_id` added to the watermark and the manifest |
-| 4 | `{prefix}_publisher_lease` added |
+| 4 | `{prefix}_publisher_lease` and `{prefix}_schema_version` added |
 
 `ensure_schema` checks compatibility before issuing any DDL and refuses
 anything it did not create, raising `CatalogSchemaVersionError`:
@@ -504,16 +507,31 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 | no catalog objects at all | fresh install: create everything, stamp the current version |
 | version table stamped at the current version, all objects present | proceed; the DDL is idempotent |
 | version table present, no row | an install of this build that died before stamping: rerun the DDL, then stamp |
-| catalog objects present, no version table | refuse -- version 1 |
+| only superseded objects (`{prefix}_pack_commit_log`) | refuse -- naming that object and saying to drop it; there is nothing to rebuild |
+| an object present under the wrong kind (a table where a view belongs, or the reverse) | refuse -- naming the object and its engine |
+| catalog objects present, no version table | refuse -- unstamped, with the differences read off `system.tables` / `system.columns` |
 | stamped at any other version | refuse -- a newer writer owns this catalog, or an older one this build cannot upgrade |
-| stamped current, an object missing | refuse -- partially dropped |
+| stamped current, a TABLE missing | refuse -- partially dropped |
+| stamped current, a VIEW missing | recreate it; a view is a projection of the tables and holds no rows |
 | pack inventory populated, snapshot manifest empty | refuse -- membership is gone |
+
+**An unstamped catalog is diagnosed, not assumed.** The refusal reads the
+descriptor table's `sorting_key`, which of the two membership tables exist,
+whether the watermark and the manifest carry `publish_id`, and which of this
+build's objects are absent -- and reports the differences it actually found,
+including saying so where a difference is *not* there. An operator who checks a
+named fact, finds it false and concludes the guard is broken works around it,
+which lands them on the one path the guard exists to prevent; an inaccurate
+diagnosis is worse than a vague one. It is still refused whichever version it
+turns out to be: those probes compare object names, one sort key and one column,
+not column types, view definitions, codecs or skip indices, so "the differences
+listed are all of them" is not something this build can know.
 
 No version is reachable from the one below it by any statement `ensure_schema`
 could issue. Between them the versions change the descriptor sort key, the
 membership table, the publish identity columns and the set of tables, and
 `CREATE TABLE IF NOT EXISTS` alters neither an existing table's columns nor its
-sort key. Version 4 adds only a new table and could in principle be created in
+sort key. Version 4 adds only new tables and could in principle be created in
 place, but the compatibility check runs before any DDL and cannot tell a table
 that was never written from one that was dropped -- and one of those is the
 state that hides every capture. The version 1 to version 2 step is the worked
@@ -530,6 +548,15 @@ packs: `ensure_schema()` returned cleanly, the sort key was unchanged, the
 following rebuild reported `skipped=2 indexed=0`, and the reader returned 0 of
 4 captures.
 
+A **missing view** is the one recoverable state, and deliberately so.
+`{prefix}_capture` and `{prefix}_pack_inventory` hold no rows: `ensure_schema`
+recreates them outright (`CREATE OR REPLACE VIEW` / `CREATE VIEW IF NOT
+EXISTS`), and a recreated projection cannot disagree with the tables that
+survived. Demanding the full rebuild -- which re-reads every pack footer in the
+store and leaves readers on an empty and then partial catalog while it runs --
+because somebody dropped a view is a cost with no risk behind it. A missing
+TABLE is the opposite and stays refused.
+
 #### Rebuilding the catalog
 
 Every `{prefix}_` object is derived from immutable packs, so the supported
@@ -543,7 +570,11 @@ store again:
    `{prefix}_pack_inventory_raw`, `{prefix}_capture_version_claims`,
    `{prefix}_publisher_lease`, `{prefix}_index_watermark`,
    `{prefix}_snapshot_manifest`, `{prefix}_schema_version`, and version 1's
-   `{prefix}_pack_commit_log`.
+   `{prefix}_pack_commit_log`. This list and the one
+   `CatalogSchemaVersionError` prints are both checked against the writer's own
+   object table by `test_the_documented_rebuild_drops_exactly_what_the_writer_owns`,
+   because a table missed here is a table that survives the rebuild -- and one
+   superseded table left standing wedges every start after it.
 3. Run `ensure_schema()`. It finds nothing, creates the current schema, and
    stamps it.
 4. Run `CatalogReconciler.rebuild(prefix=...)` once per pack store. It lists

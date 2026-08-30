@@ -174,8 +174,11 @@ _CAPTURE_TABLE_ORDER = (
 
 # The catalog schema this build creates and reads.
 #
-# Version 1 is what earlier builds created. It is recognised by the absence of
-# a ``{prefix}_schema_version`` table, because it never had one.
+# Version 4 is the FIRST version that stamps itself: ``{prefix}_schema_version``
+# arrived with it. So an unstamped catalog is one of versions 1, 2 or 3, and
+# the stamp cannot say which -- which is why ``_verify_schema_compatibility``
+# diagnoses an unstamped catalog from what the server reports it actually
+# holds, and never from the absence of the stamp alone.
 #
 # Version 2 appends ``(store_id, pack_id)`` to the descriptor sort key and
 # moves snapshot membership from ``{prefix}_pack_commit_log`` to
@@ -191,12 +194,12 @@ _CAPTURE_TABLE_ORDER = (
 # publish can verify it OWNS the version it wrote rather than merely that a row
 # for that version exists, and so that membership pairs a manifest row with the
 # watermark row of the same publish. ``CREATE TABLE IF NOT EXISTS`` adds no
-# column to a live table, so a version 3 catalog would keep both tables in
+# column to a live table, so a version 2 catalog would keep both tables in
 # their old shape.
 #
 # Version 4 adds ``{prefix}_publisher_lease``. The table would be created by a
 # rerun of the DDL, but the compatibility check runs first and refuses a
-# catalog missing one of this build's objects -- correctly, because it cannot
+# catalog missing one of this build's TABLES -- correctly, because it cannot
 # tell an unwritten table apart from a dropped one, and one of those is the
 # state that hides every capture.
 #
@@ -234,6 +237,34 @@ _SCHEMA_VERSION = 4
 _DECIDING_READ = {"select_sequential_consistency": 1}
 
 
+@dataclass(frozen=True, slots=True)
+class _CatalogObject:
+    """One catalog object, as ``system.tables`` describes it.
+
+    Read rather than assumed. Every claim a schema refusal makes about a
+    catalog comes from here, because a diagnosis an operator can check and find
+    FALSE is worse than a vague one: they conclude the refusal is spurious,
+    work around it, and land on exactly the path the refusal exists to prevent.
+
+    ``sorting_key`` is empty for a view, which is why the kind is carried
+    beside it rather than inferred from it.
+    """
+
+    engine: str
+    sorting_key: str
+
+    @property
+    def kind(self) -> str:
+        # Every flavour of view ends in "View" (``View``, ``MaterializedView``,
+        # ``LiveView``); every table engine does not.
+        return "VIEW" if self.engine.endswith("View") else "TABLE"
+
+
+def _key_columns(sorting_key: str) -> tuple[str, ...]:
+    """A sort key as a comparable column tuple, whatever spacing it arrived in."""
+    return tuple(part.strip() for part in sorting_key.split(",") if part.strip())
+
+
 class ClickHouseCatalogWriter:
     def __init__(
         self, client: ClickHouseClient, config: ClickHouseCatalogConfig | None = None
@@ -256,7 +287,7 @@ class ClickHouseCatalogWriter:
         self._commit_log = f"{prefix}_pack_commit_log"
         # Everything ensure_schema owns, in drop order: views before the tables
         # they read, so replaying this list top to bottom always succeeds.
-        self._objects = (
+        self._objects: tuple[tuple[str, str], ...] = (
             ("VIEW", self._capture_view),
             ("VIEW", self._pack_view),
             ("TABLE", self._capture_raw),
@@ -266,6 +297,14 @@ class ClickHouseCatalogWriter:
             ("TABLE", self._watermark),
             ("TABLE", self._manifest),
             ("TABLE", self._schema_table),
+        )
+        # Objects an EARLIER schema created and this build never does. Probed
+        # for two reasons: one left standing after a half-finished cleanup can
+        # be the ONLY thing in the database, which is a state that has to be
+        # named rather than guessed at, and the rebuild instruction has to list
+        # every object an operator must drop.
+        self._legacy_objects: tuple[tuple[str, str], ...] = (
+            ("TABLE", self._commit_log),
         )
         # The lease this writer holds, or None. Per WRITER instance, not per
         # process: two writers over one server are two publishers as far as the
@@ -503,25 +542,21 @@ pack_id UUID
         indexing pass skips every pack the inventory still lists, leaving those
         captures durable in object storage and invisible to every reader with
         no error anywhere. Refusing is the only outcome an operator can act on.
+
+        A missing VIEW is the exception, and the only one: it holds no rows,
+        the DDL below recreates it outright, and a recreated projection cannot
+        disagree with data that survived. Everything else is refused, and the
+        refusal describes the catalog the server actually reports rather than
+        the one an absent table suggests -- see ``_unstamped_diagnosis``.
         """
-        present = self._present_objects()
-        if not present:
+        found = self._catalog_state()
+        if not found:
             return  # A fresh install: nothing of ours is there to be wrong.
-        if self._schema_table not in present:
-            raise CatalogSchemaVersionError(
-                f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
-                f"is at schema version 1 and this build requires version "
-                f"{_SCHEMA_VERSION}: it has no `{self._schema_table}` table, "
-                "which is what version 1 looks like. Version 1 cannot be "
-                "upgraded in place. Its descriptor table is sorted on capture "
-                "identity alone and this build requires (store_id, pack_id) on "
-                "the end of that key -- CREATE TABLE IF NOT EXISTS cannot alter "
-                "an existing ORDER BY, so the old key would survive silently "
-                "and a merge could still delete one of two rows describing one "
-                f"capture. Snapshot membership also moved from `{self._commit_log}` "
-                f"to `{self._manifest}`, and nothing backfills it. "
-                + self._rebuild_instruction()
-            )
+        self._reject_wrong_kinds(found)
+        if not any(name in found for _, name in self._objects):
+            raise CatalogSchemaVersionError(self._leftovers_only(found))
+        if self._schema_table not in found:
+            raise CatalogSchemaVersionError(self._unstamped_diagnosis(found))
         recorded = self._recorded_schema_version()
         if recorded is None:
             # The table exists and nothing stamped it: an install of THIS build
@@ -541,7 +576,18 @@ pack_id UUID
                 "nor its sort key. "
                 + self._rebuild_instruction()
             )
-        missing = [name for _, name in self._objects if name not in present]
+        # TABLES only. A view holds no rows: it is a projection of the tables
+        # below it, ``ensure_schema`` recreates it unconditionally
+        # (CREATE OR REPLACE / CREATE IF NOT EXISTS), and recreating it cannot
+        # disagree with anything that survived. Demanding a whole data rebuild
+        # because somebody dropped a view is a cost with no risk behind it.
+        # A missing TABLE is the opposite: recreating it EMPTY beside tables
+        # that kept their rows is the state that hides every capture.
+        missing = [
+            name
+            for kind, name in self._objects
+            if kind == "TABLE" and name not in found
+        ]
         if missing:
             raise CatalogSchemaVersionError(
                 f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
@@ -564,20 +610,224 @@ pack_id UUID
                 + self._rebuild_instruction()
             )
 
-    def _present_objects(self) -> set[str]:
-        """Which of this catalog's tables and views the server already holds.
+    def _catalog_state(self) -> dict[str, _CatalogObject]:
+        """What this catalog IS, as the server describes it.
 
-        Deliberately includes version 1's commit log: it is often the only
-        object left after a half-finished manual cleanup, and a catalog with it
-        still standing is not one to create tables next to.
+        Engine and sort key come back with the names, in one statement, because
+        every refusal below has to describe the catalog it actually met rather
+        than the one the absence of a single table suggests.
+
+        Objects of superseded schema versions are probed too: one left standing
+        after a half-finished manual cleanup is often the only thing in the
+        database, and a catalog with it still there is not one to create tables
+        next to.
         """
-        names = [name for _, name in self._objects] + [self._commit_log]
+        names = [name for _, name in self._objects + self._legacy_objects]
         rows = self._client.execute(
-            "SELECT name FROM system.tables "
+            "SELECT name, engine, sorting_key FROM system.tables "
             "WHERE database = %(database)s AND name IN %(names)s",
             {"database": self._config.database, "names": names},
         )
-        return {row[0] for row in rows} & set(names)
+        wanted = set(names)
+        found = {}
+        for name, engine, sorting_key in rows:
+            name = self._text(name)
+            if name in wanted:
+                found[name] = _CatalogObject(
+                    engine=self._text(engine), sorting_key=self._text(sorting_key)
+                )
+        return found
+
+    def _reject_wrong_kinds(self, found: dict[str, _CatalogObject]) -> None:
+        """Refuse an object that is there but is not the kind it should be.
+
+        ``CREATE OR REPLACE VIEW`` cannot replace a table, and a table this
+        build would write to cannot be a view, so either mismatch fails
+        somewhere further in with a ClickHouse error about the wrong object
+        kind. Naming it here costs nothing -- the engine came back with the
+        name -- and turns that into one sentence saying which object and what
+        it is.
+        """
+        wrong = [
+            f"`{name}` is a {found[name].kind} (engine {found[name].engine}) "
+            f"where this build creates a {kind}"
+            for kind, name in self._objects
+            if name in found and found[name].kind != kind
+        ]
+        if not wrong:
+            return
+        raise CatalogSchemaVersionError(
+            f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
+            "holds an object of the wrong kind: "
+            + ", ".join(wrong)
+            + ". Nothing this build issues converts one into the other, so the "
+            "DDL below would fail partway and leave the catalog half written. "
+            + self._rebuild_instruction()
+        )
+
+    def _leftovers_only(self, found: dict[str, _CatalogObject]) -> str:
+        """Nothing of this build's is here, but the database is not empty.
+
+        A drop that misses one superseded table wedges every start after it:
+        the catalog is not empty, so it is not a fresh install; it has no
+        version stamp, so it reads as an old schema; and the refusal then
+        prescribes the rebuild the operator has just finished, over tables that
+        no longer exist. Naming the one inert object and saying to drop it is
+        the whole recovery.
+        """
+        leftovers = [name for _, name in self._legacy_objects if name in found]
+        listed = ", ".join(
+            f"`{self._config.database}`.`{name}`" for name in leftovers
+        )
+        subject = (
+            f"the only object present is {listed}"
+            if len(leftovers) == 1
+            else f"the only objects present are {listed}"
+        )
+        it = "it" if len(leftovers) == 1 else "them"
+        return (
+            f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
+            f"holds none of the objects this build creates: {subject}, which no "
+            "schema this build knows how to write ever creates or reads -- a "
+            "superseded table a drop missed. It is why this start is not "
+            "treated as a fresh install, and it is the only thing standing in "
+            f"the way. Drop {it} and run ensure_schema() again. There is "
+            "nothing to rebuild first: no descriptor, membership, inventory or "
+            "watermark table of this catalog survives, so the next start "
+            "creates the current schema from nothing."
+        )
+
+    def _unstamped_diagnosis(self, found: dict[str, _CatalogObject]) -> str:
+        """Describe the differences THIS catalog actually has, and refuse.
+
+        The stamp only says "version 4 or later"; every earlier version left no
+        stamp at all, so its absence identifies a range, not a version. Reading
+        the range off as "this is version 1" and then reciting version 1's
+        differences is how a refusal comes to make claims an operator can check
+        and find false -- and an operator who checks two named facts, finds both
+        untrue and concludes the guard is broken goes around it, onto the path
+        the guard exists to prevent.
+
+        So every line below is read from ``system.tables`` /
+        ``system.columns`` for this catalog. Where a difference is already
+        absent it says so, because "this is NOT what is wrong" is information
+        too.
+        """
+        prefix = self._config.table_prefix
+        findings = []
+
+        required_key = ", ".join(_CAPTURE_TABLE_ORDER)
+        descriptor = found.get(self._capture_raw)
+        if descriptor is None:
+            findings.append(
+                f"`{self._capture_raw}` is absent, so this catalog holds no "
+                "descriptor rows at all"
+            )
+        elif _key_columns(descriptor.sorting_key) != _key_columns(required_key):
+            findings.append(
+                f"`{self._capture_raw}` is sorted on "
+                f"({descriptor.sorting_key}) and this build requires "
+                f"({required_key}). CREATE TABLE IF NOT EXISTS cannot alter an "
+                "existing ORDER BY, so the old key would survive silently and "
+                "a merge could still delete one of two rows describing one "
+                "capture"
+            )
+        else:
+            findings.append(
+                f"`{self._capture_raw}` is already sorted on ({required_key}), "
+                "the key this build requires -- so the descriptor sort key is "
+                "NOT what is wrong with this catalog"
+            )
+
+        commit_log = self._commit_log in found
+        manifest = self._manifest in found
+        if commit_log and not manifest:
+            findings.append(
+                f"snapshot membership is in `{self._commit_log}`, which this "
+                f"build never reads; it moved to `{self._manifest}`, which is "
+                "absent, and nothing backfills it -- `committed_pack_ids` "
+                f"reads `{self._pack_raw}`, so every pack already there would "
+                "be skipped as indexed and would never become a member of any "
+                "snapshot"
+            )
+        elif manifest and not commit_log:
+            findings.append(
+                f"snapshot membership is already in `{self._manifest}`, where "
+                f"this build reads it, and `{self._commit_log}` is absent -- so "
+                "there is NO commit-log migration owed here"
+            )
+        elif manifest and commit_log:
+            findings.append(
+                f"both membership tables are present: `{self._commit_log}`, "
+                f"which this build never reads, and `{self._manifest}`, which "
+                "it does -- so which packs are members depends on which table "
+                "the rows were written to"
+            )
+        else:
+            findings.append(
+                f"neither `{self._commit_log}` nor `{self._manifest}` is "
+                "present, so nothing in this catalog records which packs "
+                "belong to a snapshot"
+            )
+
+        identity_tables = [
+            name for name in (self._watermark, self._manifest) if name in found
+        ]
+        if identity_tables:
+            without = sorted(
+                set(identity_tables) - self._tables_with_publish_id(identity_tables)
+            )
+            if without:
+                findings.append(
+                    ", ".join(f"`{name}`" for name in without)
+                    + f" {'has' if len(without) == 1 else 'have'} no "
+                    "`publish_id` column, so a manifest row cannot be paired "
+                    "with the watermark row of the SAME publish; CREATE TABLE "
+                    "IF NOT EXISTS adds no column to a live table"
+                )
+            else:
+                findings.append(
+                    ", ".join(f"`{name}`" for name in identity_tables)
+                    + " already carry `publish_id`"
+                )
+
+        absent = [name for _, name in self._objects if name not in found]
+        if absent:
+            findings.append(
+                "this build also creates "
+                + ", ".join(f"`{name}`" for name in absent)
+                + f", {'which is' if len(absent) == 1 else 'none of which are'} "
+                "present"
+            )
+
+        return (
+            f"catalog `{self._config.database}`.`{prefix}_*` carries no schema "
+            f"stamp and this build requires version {_SCHEMA_VERSION}. Version "
+            f"{_SCHEMA_VERSION} is the first to write `{self._schema_table}`, "
+            "so an unstamped catalog is one of the versions before it and the "
+            "stamp cannot say which. What the server reports about THIS "
+            "catalog:\n"
+            + "".join(f"  - {finding}\n" for finding in findings)
+            + "It is refused whichever version it is, and deliberately: the "
+            "probes above compare object names, one sort key and one column. "
+            "They do not compare column types, view definitions, codecs or "
+            "skip indices, so this build cannot know that the differences "
+            "listed are all of them. "
+            + self._rebuild_instruction()
+        )
+
+    def _tables_with_publish_id(self, tables: list[str]) -> set[str]:
+        """Which of `tables` carry the publish-identity column.
+
+        Read from the server rather than inferred from the schema version,
+        because the version is exactly what an unstamped catalog will not say.
+        """
+        rows = self._client.execute(
+            "SELECT table FROM system.columns WHERE database = %(database)s "
+            "AND table IN %(tables)s AND name = 'publish_id'",
+            {"database": self._config.database, "tables": tables},
+        )
+        return {self._text(row[0]) for row in rows}
 
     def _recorded_schema_version(self) -> int | None:
         """The stamped version, or None when the table holds no row yet."""
@@ -602,11 +852,17 @@ pack_id UUID
         return bool(packs) and not members
 
     def _rebuild_instruction(self) -> str:
-        """The one supported recovery, named in full so nobody has to guess."""
+        """The one supported recovery, named in full so nobody has to guess.
+
+        Generated from ``self._objects`` rather than written out, so a table
+        added to this build cannot be left out of the drop list. This branch
+        leaked tables twice from exactly that omission, and the docs procedure
+        is held to the same list by a test.
+        """
         database = self._config.database
         objects = ", ".join(
             f"`{database}`.`{name}`"
-            for _, name in self._objects + (("TABLE", self._commit_log),)
+            for _, name in self._objects + self._legacy_objects
         )
         return (
             "The catalog is a derived projection over immutable packs, so "

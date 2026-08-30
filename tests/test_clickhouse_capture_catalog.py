@@ -38,6 +38,35 @@ _CURRENT_OBJECTS = (
     "dmi_schema_version",
 )
 
+# The kinds those objects have, so the fake can answer `system.tables` the way
+# the server does. The compatibility check reads the engine to tell a view from
+# a table, and a missing view is recoverable where a missing table is not.
+_VIEWS = ("dmi_capture", "dmi_pack_inventory")
+
+# This build's descriptor sort key, spelled out rather than imported, so a
+# change to the constant has to be restated here on purpose.
+_CURRENT_SORT_KEY = (
+    "tenant_id, experiment_id, run_id, captured_at_ns, capture_id, "
+    "store_id, pack_id"
+)
+_VERSION_ONE_SORT_KEY = (
+    "tenant_id, experiment_id, run_id, captured_at_ns, capture_id"
+)
+
+# Every object version 1 created, which is not the same set: it had a commit
+# log and no manifest, no publisher lease and no version stamp. Kept beside
+# `_CURRENT_OBJECTS` so the two schemas the refusal has to tell apart are both
+# written down rather than one being the other's negation.
+_VERSION_ONE_OBJECTS = (
+    "dmi_capture",
+    "dmi_pack_inventory",
+    "dmi_capture_raw",
+    "dmi_pack_inventory_raw",
+    "dmi_capture_version_claims",
+    "dmi_index_watermark",
+    "dmi_pack_commit_log",
+)
+
 
 class _Client:
     """A ClickHouse stand-in whose catalog state the test declares.
@@ -46,6 +75,13 @@ class _Client:
     describe a server the writer is about to meet: an empty default is a fresh
     install, and the other combinations are the upgrade states `ensure_schema`
     has to tell apart.
+
+    ``sort_key``, ``engines`` and ``publish_id_tables`` are the rest of what
+    `system.tables` and `system.columns` report, because the refusals now
+    describe the catalog they actually found instead of reciting one version's
+    differences. Their defaults are this build's own shape, so a test that says
+    nothing about them is describing a catalog that differs only in the ways it
+    named.
     """
 
     def __init__(
@@ -55,6 +91,9 @@ class _Client:
         schema_version=None,
         inventory_rows=0,
         manifest_rows=0,
+        sort_key=_CURRENT_SORT_KEY,
+        engines=None,
+        publish_id_tables=("dmi_index_watermark", "dmi_snapshot_manifest"),
     ):
         self.calls = []
         self.committed = []
@@ -71,14 +110,40 @@ class _Client:
         self.schema_version = schema_version
         self.inventory_rows = inventory_rows
         self.manifest_rows = manifest_rows
+        self.sort_key = sort_key
+        self.engines = dict(engines or {})
+        self.publish_id_tables = tuple(publish_id_tables)
+
+    def _engine(self, name: str) -> str:
+        if name in self.engines:
+            return self.engines[name]
+        if name in _VIEWS:
+            return "View"
+        return "ReplacingMergeTree" if name.endswith("_raw") else "MergeTree"
 
     def execute(self, query, params=None, **kwargs):
         self.calls.append((query, params, kwargs))
         leased = self.lease.execute(query, params)
         if leased is not None:
             return leased
+        if "system.columns" in query:
+            return [
+                (name,)
+                for name in params["tables"]
+                if name in self.publish_id_tables
+            ]
         if "system.tables" in query:
-            return [(name,) for name in self.tables]
+            # Only the descriptor table's sort key is ever read, so the others
+            # answer with a placeholder rather than a fiction that looks
+            # meaningful.
+            return [
+                (
+                    name,
+                    self._engine(name),
+                    self.sort_key if name == "dmi_capture_raw" else "",
+                )
+                for name in self.tables
+            ]
         if "dmi_schema_version` ORDER BY version DESC" in query:
             return [] if self.schema_version is None else [(self.schema_version,)]
         if "dmi_pack_inventory_raw`), (SELECT count()" in query:
@@ -566,27 +631,222 @@ def test_a_fresh_install_stamps_the_schema_version_last():
     assert statements[1].startswith("CREATE DATABASE")
 
 
+def _findings(message: str) -> list[str]:
+    """The bulleted differences a refusal claims it found."""
+    return [
+        line.strip()[2:] for line in message.splitlines() if line.startswith("  - ")
+    ]
+
+
 def test_a_version_one_catalog_is_refused_with_the_rebuild_procedure():
     """The upgrade this branch cannot perform, refused instead of half-done."""
     client = _Client(
-        tables=("dmi_capture_raw", "dmi_pack_inventory_raw", "dmi_pack_commit_log")
+        tables=_VERSION_ONE_OBJECTS,
+        sort_key=_VERSION_ONE_SORT_KEY,
+        publish_id_tables=(),
     )
 
     with pytest.raises(CatalogSchemaVersionError) as raised:
         _writer(client).ensure_schema()
 
     message = str(raised.value)
-    assert "schema version 1" in message
+    assert "carries no schema stamp" in message
     assert f"requires version {_SCHEMA_VERSION}" in message
+    findings = _findings(message)
     # Both incompatible changes are named, because an operator reading this has
-    # to know the catalog cannot simply be altered into shape.
-    assert "ORDER BY" in message and "(store_id, pack_id)" in message
-    assert "dmi_pack_commit_log" in message and "dmi_snapshot_manifest" in message
+    # to know the catalog cannot simply be altered into shape -- and both are
+    # named as this catalog's own state, not as version 1's by definition.
+    assert any(
+        "ORDER BY" in item and _VERSION_ONE_SORT_KEY in item for item in findings
+    )
+    assert any(
+        "membership is in `dmi_pack_commit_log`" in item
+        and "`dmi_snapshot_manifest`, which is absent" in item
+        for item in findings
+    )
     # And the exact recovery, including the part that is easy to skip.
     assert "CatalogReconciler.rebuild()" in message
     assert "Dropping the pack inventory is mandatory" in message
     assert "`default`.`dmi_pack_inventory_raw`" in message
-    # Nothing was created, altered or written on the way to the refusal.
+    # Nothing was created, altered or written on the way to the refusal. The
+    # only extra statement is the `system.columns` probe the diagnosis reads.
+    assert [call[0] for call in client.calls[1:]] == [
+        "SELECT table FROM system.columns WHERE database = %(database)s "
+        "AND table IN %(tables)s AND name = 'publish_id'"
+    ]
+
+
+def test_an_unstamped_catalog_is_not_told_its_sort_key_is_wrong_when_it_is_not():
+    """Defect A: the refusal that named two facts neither of which was true.
+
+    This branch's own immediate predecessor (`bea3ed8`) already creates the
+    descriptor table with `(store_id, pack_id)` on the sort key, writes
+    membership to `{prefix}_snapshot_manifest`, and creates no commit log --
+    and it stamps nothing, because the stamp arrived one commit later. The
+    first refusal read the absent stamp as "version 1" and recited version 1's
+    two differences at it. An operator who checks those two facts finds both
+    false, concludes the guard is broken, and goes around it -- onto the path
+    the guard exists to prevent.
+
+    So the diagnosis is read off the live schema, and where a difference is
+    NOT there it says so.
+    """
+    client = _Client(
+        tables=(
+            "dmi_capture",
+            "dmi_pack_inventory",
+            "dmi_capture_raw",
+            "dmi_pack_inventory_raw",
+            "dmi_capture_version_claims",
+            "dmi_index_watermark",
+            "dmi_snapshot_manifest",
+        ),
+        publish_id_tables=(),
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    findings = _findings(message)
+    assert "schema version 1" not in message
+    # The sort key it really has, described as already correct.
+    assert any(
+        _CURRENT_SORT_KEY in item and "NOT what is wrong" in item
+        for item in findings
+    ), findings
+    # No commit-log migration is described, because there is no commit log.
+    assert any(
+        "membership is already in `dmi_snapshot_manifest`" in item
+        and "NO commit-log migration owed" in item
+        for item in findings
+    ), findings
+    assert not any("membership is in `dmi_pack_commit_log`" in x for x in findings)
+    # What IS different: the publish identity columns and two absent tables.
+    assert any(
+        "no `publish_id` column" in item
+        and "dmi_index_watermark" in item
+        and "dmi_snapshot_manifest" in item
+        for item in findings
+    ), findings
+    assert any(
+        "dmi_publisher_lease" in item and "dmi_schema_version" in item
+        for item in findings
+    ), findings
+    # Refused all the same, and the reason for refusing anyway is stated.
+    assert "refused whichever version it is" in message
+    assert "cannot know that the differences listed are all of them" in message
+
+
+def test_an_unstamped_catalog_whose_shape_already_matches_is_still_refused():
+    """Everything this build can probe agrees, and it is refused anyway.
+
+    An unstamped catalog is one this build did not create. The probes compare
+    object names, one sort key and one column; column types, view definitions,
+    codecs and skip indices are not compared at all, so "the differences listed
+    are all of them" is not something this build is in a position to claim.
+    """
+    client = _Client(
+        tables=[name for name in _CURRENT_OBJECTS if name != "dmi_schema_version"]
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    findings = _findings(str(raised.value))
+    assert any("already carry `publish_id`" in item for item in findings), findings
+    assert any(
+        item == "this build also creates `dmi_schema_version`, which is present"
+        for item in findings
+    ) or any("`dmi_schema_version`" in item for item in findings), findings
+    assert "refused whichever version it is" in str(raised.value)
+
+
+def test_an_unstamped_catalog_with_no_descriptor_table_says_so():
+    """A membership table with no descriptors behind it, named as it is."""
+    client = _Client(tables=("dmi_snapshot_manifest", "dmi_pack_commit_log"))
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    findings = _findings(str(raised.value))
+    assert any(
+        "`dmi_capture_raw` is absent" in item for item in findings
+    ), findings
+    # Both membership tables are there, so neither is described as the one.
+    assert any(
+        "both membership tables are present" in item for item in findings
+    ), findings
+
+
+def test_an_unstamped_catalog_with_no_membership_table_at_all_says_so():
+    """Neither membership table exists, so no migration is described."""
+    client = _Client(tables=("dmi_capture_raw",), publish_id_tables=())
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    findings = _findings(str(raised.value))
+    assert any(
+        "neither `dmi_pack_commit_log` nor `dmi_snapshot_manifest` is present"
+        in item
+        for item in findings
+    ), findings
+    # And with no watermark and no manifest there is nothing to say about
+    # publish identity, so nothing is said.
+    assert not any("publish_id" in item for item in findings), findings
+
+
+def test_a_lone_version_one_commit_log_is_named_rather_than_misdiagnosed():
+    """Defect B: one inert leftover wedged every start after a clean rebuild.
+
+    `{prefix}_pack_commit_log` is probed but is not one of this build's
+    objects, so it could never be reported missing and never be named. Left
+    behind by a drop that missed it, it made the catalog non-empty (so not a
+    fresh install) and unstamped (so an old schema), and the refusal then
+    prescribed the rebuild the operator had just finished, over tables that no
+    longer exist. Nothing could be created and no indexer could start until
+    somebody noticed one table nothing reads.
+    """
+    client = _Client(tables=("dmi_pack_commit_log",))
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    assert "holds none of the objects this build creates" in message
+    assert "the only object present is `default`.`dmi_pack_commit_log`" in message
+    assert "Drop it and run ensure_schema() again" in message
+    assert "nothing to rebuild first" in message
+    # Emphatically NOT the version-1 recital, and not the rebuild procedure:
+    # there is nothing left to rebuild.
+    assert "CatalogReconciler.rebuild()" not in message
+    assert "carries no schema stamp" not in message
+    # Nothing was created or written on the way to the refusal.
+    assert [call[0] for call in client.calls[1:]] == []
+
+
+def test_an_object_of_the_wrong_kind_is_named_rather_than_left_to_the_server():
+    """A table standing where a view belongs fails the DDL halfway through.
+
+    `CREATE OR REPLACE VIEW` cannot replace a table, so without this the run
+    gets several statements in before ClickHouse objects, and the error names
+    SQL rather than the catalog.
+    """
+    client = _Client(
+        tables=_CURRENT_OBJECTS,
+        schema_version=_SCHEMA_VERSION,
+        engines={"dmi_capture": "MergeTree"},
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    assert (
+        "`dmi_capture` is a TABLE (engine MergeTree) where this build creates "
+        "a VIEW"
+    ) in message
     assert [call[0] for call in client.calls[1:]] == []
 
 
@@ -631,6 +891,46 @@ def test_a_stamped_catalog_with_a_dropped_table_is_refused():
 
     assert "missing `dmi_snapshot_manifest`" in str(raised.value)
     assert "CatalogReconciler.rebuild()" in str(raised.value)
+
+
+def test_a_stamped_catalog_with_a_dropped_view_recreates_it():
+    """Defect C: a view is derived, so losing one is not a data emergency.
+
+    Every object under this prefix is derived from the packs, but a view is
+    derived from the TABLES -- `ensure_schema` recreates it outright and the
+    result cannot disagree with rows that survived. Demanding a full rebuild,
+    which re-reads every pack footer in the store and leaves readers on an
+    empty and then partial catalog while it runs, is a cost with no risk
+    behind it. A missing TABLE stays refused, because recreating it empty
+    beside a surviving inventory is the state that hides every capture.
+    """
+    client = _Client(
+        tables=[name for name in _CURRENT_OBJECTS if name != "dmi_capture"],
+        schema_version=_SCHEMA_VERSION,
+        inventory_rows=4,
+        manifest_rows=2,
+    )
+
+    _writer(client).ensure_schema()
+
+    assert any("CREATE OR REPLACE VIEW" in call[0] for call in client.calls)
+
+
+@pytest.mark.parametrize("dropped", _VIEWS)
+def test_either_missing_view_is_recreated_rather_than_refused(dropped: str):
+    client = _Client(
+        tables=[name for name in _CURRENT_OBJECTS if name != dropped],
+        schema_version=_SCHEMA_VERSION,
+    )
+
+    _writer(client).ensure_schema()
+
+    created = [
+        call[0]
+        for call in client.calls
+        if call[0].startswith("CREATE") and f"`default`.`{dropped}` AS" in call[0]
+    ]
+    assert len(created) == 1 and "VIEW" in created[0]
 
 
 def test_a_populated_inventory_with_an_empty_manifest_is_refused():
@@ -832,3 +1132,63 @@ def test_last_published_version_rejects_a_non_integer_watermark():
 
     with pytest.raises(ValueError, match="invalid version"):
         writer.last_published_version()
+
+
+# --- the rebuild drop list ---------------------------------------------------
+#
+# The rebuild is the only supported recovery, and it is only a recovery if it
+# names EVERY object. An object left behind is not inert: a surviving pack
+# inventory makes the next pass skip every pack it lists, and a surviving
+# superseded table makes the next start refuse a catalog that is otherwise
+# empty. This branch has leaked tables twice from exactly that omission, once
+# in the code and once in the prose, so both lists are checked against
+# `self._objects` mechanically rather than read over by eye.
+
+
+def _writer_objects() -> tuple[str, ...]:
+    """Every object the writer owns, in drop order, superseded ones last."""
+    writer = _writer(_Client())
+    return tuple(
+        name for _, name in writer._objects + writer._legacy_objects
+    )
+
+
+def _documented_drop_list() -> tuple[str, ...]:
+    """Step 2 of the documented rebuild, as an ordered list of object names."""
+    from pathlib import Path
+    import re
+
+    document = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "capture-storage-design.md"
+    ).read_text()
+    step = re.search(
+        r"^2\. Drop all of its objects.*?(?=^\d+\. )",
+        document,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert step is not None, "the documented rebuild lost its drop step"
+    return tuple(
+        f"dmi_{suffix}" for suffix in re.findall(r"`\{prefix\}_(\w+)`", step.group(0))
+    )
+
+
+def test_the_rebuild_instruction_names_every_object_the_writer_owns():
+    instruction = _writer(_Client())._rebuild_instruction()
+
+    named = [name for name in _writer_objects() if f"`default`.`{name}`" in instruction]
+
+    assert named == list(_writer_objects())
+
+
+def test_the_documented_rebuild_drops_exactly_what_the_writer_owns():
+    """The prose and the code have to name the same objects, in the same order.
+
+    `docs/capture-storage-design.md` is the procedure an operator follows by
+    hand; `_rebuild_instruction()` is the one the refusal prints. A table added
+    to the writer and forgotten in either is a table that survives the rebuild,
+    and the states that survive a rebuild are the ones this whole check exists
+    to refuse.
+    """
+    assert _documented_drop_list() == _writer_objects()
