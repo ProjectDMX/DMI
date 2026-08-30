@@ -217,6 +217,33 @@ def test_a_walk_advances_past_the_last_row_of_the_previous_page():
     assert second.next_cursor is None
 
 
+def test_the_keyset_cursor_advances_with_a_strict_comparison():
+    """`>` not `>=`, asserted on the operator rather than the parameters.
+
+    A non-strict comparison re-reads the row the cursor was issued for, so
+    every page boundary duplicates one capture and the walk returns more rows
+    than the corpus holds. The parameter assertions above cannot see that --
+    they check which values are bound, not how they are compared -- so only the
+    live pagination walks caught it, and the PR gate (`-m cpu`) shipped green.
+    """
+    descriptors = synthetic_descriptors(4)
+    catalog, client = _catalog(pages=[descriptors, descriptors[3:]])
+
+    first = catalog.search(CaptureQuery(limit=3))
+    catalog.search(CaptureQuery(limit=3, cursor=first.next_cursor))
+
+    sql = client.selects[-1]
+    key = "(`tenant_id`, `experiment_id`, `run_id`, `captured_at_ns`, `capture_id`)"
+    bound = (
+        "(%(after_tenant_id)s, %(after_experiment_id)s, %(after_run_id)s, "
+        "%(after_captured_at_ns)s, %(after_capture_id)s)"
+    )
+    assert f"{key} > {bound}" in sql
+    # Spelled out, because a blanket ">=" search would also match the
+    # captured_after_ns range filter, which is legitimately non-strict.
+    assert f"{key} >= {bound}" not in sql
+
+
 def test_a_walk_stays_pinned_to_the_first_watermark():
     descriptors = synthetic_descriptors(4)
     catalog, client = _catalog(pages=[descriptors, descriptors[3:]])

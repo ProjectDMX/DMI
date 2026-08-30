@@ -242,6 +242,61 @@ def test_two_packs_describing_one_capture_both_survive_a_merge(second_descriptio
         assert at_fresh[0].locator == copied[0].locator
 
 
+def test_a_pin_ignores_a_second_store_holding_the_same_pack_id():
+    """Pack identity is the PAIR, proven by behaviour rather than by SQL text.
+
+    The unit tests assert the clause reads ``(store_id, pack_id) IN (SELECT
+    store_id, pack_id ...)``, which a rewrite could satisfy in text while
+    matching on ``pack_id`` alone. Only a server evaluating the predicate can
+    tell the difference, and it matters exactly here: the mirror carries the
+    SAME pack id as the original, committed at a later version. Matching the
+    id alone would admit the mirror's rows into a snapshot pinned before it
+    existed, and argMax would then resolve every capture to the mirror's store.
+
+    Both membership sites are covered: get_by_ids pins the watermark directly,
+    and search pins it through a cursor.
+    """
+    original = synthetic_descriptors(3)
+    mirror = _copied_to_another_store(original)
+    assert mirror[0].locator.pack_id == original[0].locator.pack_id
+    assert mirror[0].locator.store_id != original[0].locator.store_id
+
+    tenant = original[0].metadata.tenant_id
+    with _catalog() as (writer, reader, _, _):
+        writer.write_descriptors(original, index_version=1)
+        _commit(writer, original, 1)
+        _publish(writer, 1)
+        pinned = reader.current_watermark()
+        # A cursor carries the same pin through the paginated path.
+        first = reader.search(CaptureQuery(limit=2, tenant_id=tenant))
+        assert first.next_cursor is not None
+
+        writer.write_descriptors(mirror, index_version=2)
+        _commit(writer, mirror, 2)
+        _publish(writer, 2)
+
+        # (a) get_by_ids at the pin resolves to the store that was committed.
+        at_pin = reader.get_by_ids(
+            [original[0].capture_id], tenant_id=tenant, watermark=pinned
+        )
+        assert len(at_pin) == 1
+        assert at_pin[0].locator == original[0].locator
+
+        # (b) the pinned walk continues over the original store only.
+        rest = reader.search(
+            CaptureQuery(limit=2, tenant_id=tenant, cursor=first.next_cursor)
+        )
+        assert first.items + rest.items == original
+
+        # And a fresh watermark does see the mirror supersede it.
+        at_fresh = reader.get_by_ids(
+            [original[0].capture_id],
+            tenant_id=tenant,
+            watermark=reader.current_watermark(),
+        )
+        assert at_fresh[0].locator == mirror[0].locator
+
+
 def test_re_indexing_one_pack_still_collapses_to_a_single_row():
     """The case ReplacingMergeTree is actually here for.
 
