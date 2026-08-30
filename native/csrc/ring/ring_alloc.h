@@ -70,6 +70,18 @@ private:
     }
 
     void allocate() {
+        int dev = 0;
+        chk(cudaGetDevice(&dev), "cudaGetDevice");
+        int concurrent_managed_access = 0;
+        chk(cudaDeviceGetAttribute(&concurrent_managed_access,
+                                   cudaDevAttrConcurrentManagedAccess, dev),
+            "cudaDeviceGetAttribute concurrentManagedAccess");
+        if (concurrent_managed_access != 1) {
+            throw std::runtime_error(
+                "AllocatedRing requires concurrentManagedAccess for "
+                "CPU/GPU system-scope publication atomics");
+        }
+
         const size_t publication_sz =
             cfg_.task_ring_entries * sizeof(uint64_t);
         chk(cudaMallocManaged(&state_.publication_slots, publication_sz),
@@ -90,8 +102,6 @@ private:
         // Move head counters to GPU HBM so the producer reads them at L2/HBM
         // speed.  CPU writes (drain thread) use PCIe posted writes.
         // Publication slots stay on CPU for fast drain-thread polling.
-        int dev = 0;
-        chk(cudaGetDevice(&dev), "cudaGetDevice");
         const cudaMemLocation gpu_loc  = {cudaMemLocationTypeDevice, dev};
         const cudaMemLocation cpu_loc  = {cudaMemLocationTypeHost,   0};
         auto advise_gpu = [&](void* ptr) {

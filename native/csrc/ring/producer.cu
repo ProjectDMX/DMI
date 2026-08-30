@@ -41,9 +41,11 @@ namespace ring {
 
 __device__ bool g_ring_null_mode = false;
 
-// Counter for last-block-arrives pattern.  Reset by the last block after
-// publishing.  Safe without host-side reset because producers are serialized
-// on one stream -- the next launch cannot start until the current finishes.
+// IMPORTANT ASSUMPTION: Every producer kernel on this device runs on one
+// stream. This last-block-arrives counter is shared
+// by all launches, so overlapping launches would mix arrivals, publish early,
+// and let one launch reset another's count. The last block resets it only after
+// publishing, before the next producer launch on that stream can begin.
 __device__ uint32_t g_block_done_counter = 0;
 
 void set_ring_null_mode(bool enabled) {
@@ -122,12 +124,20 @@ __device__ inline void publish_last_block_arrives(
     uint64_t       actual_total)
 {
     if (threadIdx.x != 0) return;
+
+    // Every caller has just completed a block-wide __syncthreads(). This
+    // thread-0 release fence therefore orders the joined payload writes from
+    // the whole block before its relaxed arrival-counter RMW. The last block's
+    // acquire fence below completes the cross-block fence/fence join.
+    cuda::atomic_thread_fence(cuda::memory_order_release,
+                              cuda::thread_scope_device);
+
     uint32_t finished = atomicAdd(&g_block_done_counter, 1);
     if (finished != gridDim.x - 1) return;
 
-    // Pair with every block's pre-arrival device fence. The relaxed arrival
-    // counter identifies the last block; this acquire fence imports the
-    // payload writes completed by all preceding blocks before publication.
+    // Pair with every block's thread-0 pre-arrival release fence. The relaxed
+    // counter identifies the last block; this acquire fence imports every
+    // block's joined payload writes before publication.
     cuda::atomic_thread_fence(cuda::memory_order_acquire,
                               cuda::thread_scope_device);
 
@@ -144,8 +154,9 @@ __device__ inline void publish_last_block_arrives(
     atomicAdd(reinterpret_cast<unsigned long long*>(ring.actual_bytes_counter),
               static_cast<unsigned long long>(actual_total));
 
-    // Reset for the next launch on this stream.
-    g_block_done_counter = 0;
+    // Keep every access to the cross-block counter atomic. A plain store here
+    // would race with the other blocks' relaxed atomic RMWs.
+    atomicExch(&g_block_done_counter, 0);
 }
 
 // ---------------------------------------------------------------------------
