@@ -272,11 +272,21 @@ runs after a write can withdraw what the write already made durable.
 INSERT INTO {prefix}_index_watermark (...)
 SELECT ... FROM system.one
 WHERE (SELECT max(index_version) FROM {prefix}_index_watermark) < V
-  AND (SELECT lease_id     FROM {prefix}_publisher_lease
-       ORDER BY term DESC, lease_id DESC LIMIT 1) = :my_lease
-  AND (SELECT expires_at_ns FROM {prefix}_publisher_lease
-       ORDER BY term DESC, lease_id DESC LIMIT 1) > toUnixTimestamp64Nano(now64(9))
+  AND (SELECT (lease_id, expires_at_ns > toUnixTimestamp64Nano(now64(9)))
+       FROM {prefix}_publisher_lease
+       ORDER BY term DESC, lease_id DESC LIMIT 1) = (:my_lease, true)
 ```
+
+**One subquery returning a tuple, not two returning a column each.** The
+two-read form was implemented first and is unsound, which is worth stating
+because the shape is the obvious one to reach for: two scalar subqueries are two
+reads of the lease table, so a takeover landing between them answers with the
+OLD holder's `lease_id` and the NEW holder's `expires_at_ns`, and the fence
+passes for a publisher that has already been replaced -- the exact failure the
+fence exists to stop, reintroduced by the way it is written. One subquery reads
+one row, and the pair it returns describes that row. It is cheaper too, but that
+is the smaller half: 3.06 ms unfenced, 3.85 ms with this form, 4.84 ms with two
+subqueries, measured on 25.12.
 
 The manifest INSERT carries the same predicate, over an `arrayJoin` of the
 packs it is admitting. Those rows would be inert either way -- membership pairs

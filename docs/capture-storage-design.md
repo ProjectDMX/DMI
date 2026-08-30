@@ -371,15 +371,24 @@ statements a publish writes -- the manifest rows and the watermark row -- carry
 the same predicate:
 
 ```sql
-  AND (SELECT lease_id      FROM {prefix}_publisher_lease
-       ORDER BY term DESC, lease_id DESC LIMIT 1) = :my_lease
-  AND (SELECT expires_at_ns FROM {prefix}_publisher_lease
-       ORDER BY term DESC, lease_id DESC LIMIT 1) > toUnixTimestamp64Nano(now64(9))
+  AND (SELECT (lease_id, expires_at_ns > toUnixTimestamp64Nano(now64(9)))
+       FROM {prefix}_publisher_lease
+       ORDER BY term DESC, lease_id DESC LIMIT 1) = (:my_lease, true)
 ```
 
 so a publisher whose lease has been taken over writes **nothing**. It does not
 write and then discover it lost, which is the failure mode every post-write
 check in this design's history has had.
+
+**One subquery returning a tuple, not two subqueries returning a column each.**
+That is a correctness point before it is a cost one, and the two-read form was
+implemented before it was understood: two scalar subqueries are two reads of
+the lease table, and a takeover landing between them can be answered with the
+OLD holder's `lease_id` and the NEW holder's `expires_at_ns` -- so the fence
+passes for a publisher that has already been replaced. One subquery reads one
+row, and the pair it returns describes that row. It is also cheaper: measured on
+25.12, the conditional publish costs 3.06 ms unfenced, 3.85 ms with this form,
+and 4.84 ms with the two-subquery form.
 
 The lease is claimed by the same sole-claimant append-and-read-back protocol as
 a catalog version, and it is safe here for the same reason: a lease claim row is
@@ -1322,11 +1331,15 @@ bytes, and retained failure details all have explicit caps.
   ClickHouse wire size.
 - The current public views use `FINAL` for immediate replay correctness. Hot
   query workloads must measure its cost before choosing a different projection.
-- `{prefix}_capture` re-evaluates `max(index_version)` over the watermark log on
-  every query, so it tracks the latest published snapshot rather than pinning
-  one. Two reads of the view a moment apart can therefore see different
-  snapshots; a caller that needs a stable selection uses the reader, which pins
-  a watermark and carries it in the cursor.
+- `{prefix}_capture` re-evaluates its membership bound on every query. The bound
+  carries no `max()` and no version predicate: it pairs `(index_version,
+  publish_id)` between `{prefix}_snapshot_manifest` and
+  `{prefix}_index_watermark`, so the view shows every pack whose publish has
+  reached the watermark table *at the moment the query runs*. It therefore
+  tracks published state rather than pinning a snapshot, and two reads of the
+  view a moment apart can see different sets of packs. A caller that needs a
+  stable selection uses the reader, which pins a watermark and carries it in
+  the cursor.
 - The catalog schema is versioned and checked, never migrated. There is no
   in-place upgrade path and no online one: the recovery from a version mismatch
   is the full rebuild above, which re-reads every pack footer in the store, so
