@@ -90,8 +90,14 @@ def _catalog():
     )
     created = False
     try:
-        writer.ensure_schema()
+        # Armed BEFORE ensure_schema, not after: it issues many statements, so
+        # one that fails partway leaves every table created ahead of it behind.
+        # Arming afterwards skips teardown for exactly that case and the tables
+        # leak onto the shared server -- one mutation run left 39 orphaned
+        # `*_capture_raw` / `*_pack_inventory_raw` tables that way. Every drop
+        # below is IF EXISTS, so tearing down a partial or empty schema is safe.
         created = True
+        writer.ensure_schema()
         yield writer, reader, client, config
     finally:
         if created:

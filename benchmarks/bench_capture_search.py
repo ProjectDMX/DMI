@@ -186,8 +186,13 @@ def main(argv=None) -> int:
     writer = ClickHouseCatalogWriter(client, config)
     reader = ClickHouseCaptureCatalog(client, ClickHouseReaderConfig.from_catalog(config))
 
-    writer.ensure_schema()
     try:
+        # Inside the try, not above it: ensure_schema issues many statements,
+        # and one that fails partway leaves every table created ahead of it
+        # behind. Run outside, that failure skips the drops entirely and the
+        # tables leak onto the shared server. Every drop is IF EXISTS, so
+        # tearing down a partial or empty schema is safe.
+        writer.ensure_schema()
         descriptors = synthetic_descriptors(args.rows)
         # Descriptors alone are not readable. A snapshot is bounded by the
         # packs a publish made members and the watermark comes from the

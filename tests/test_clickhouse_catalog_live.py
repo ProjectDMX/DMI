@@ -29,8 +29,13 @@ def test_duplicate_catalog_replay_is_logically_deduplicated():
     ref = descriptor.locator.pack_ref
     schema_created = False
     try:
-        writer.ensure_schema()
+        # Armed BEFORE ensure_schema: it issues many statements, and one that
+        # fails partway leaves every table created ahead of it behind. Arming
+        # afterwards skips teardown for exactly that case and the tables leak
+        # onto the shared server. Every drop below is IF EXISTS, so tearing
+        # down a partial or empty schema is safe.
         schema_created = True
+        writer.ensure_schema()
         for version in (1, 2):
             writer.write_descriptors([descriptor], index_version=version)
             writer.commit_packs([ref], index_version=version)

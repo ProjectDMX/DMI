@@ -102,8 +102,13 @@ def main(argv=None) -> int:
         client,
         ClickHouseCatalogConfig(database=args.database, table_prefix=prefix),
     )
-    writer.ensure_schema()
     try:
+        # Inside the try, not above it: ensure_schema issues many statements,
+        # and one that fails partway leaves every table created ahead of it
+        # behind. Run outside, that failure skips the drops entirely and the
+        # tables leak onto the shared server. Every drop is IF EXISTS, so
+        # tearing down a partial or empty schema is safe.
+        writer.ensure_schema()
         result = measure_inserts(
             writer,
             synthetic_descriptors(args.rows),
@@ -112,9 +117,14 @@ def main(argv=None) -> int:
         )
         print(json.dumps(result, sort_keys=True))
     finally:
+        # Every object ensure_schema creates. A short list leaks the rest:
+        # this one dropped neither the watermark, the manifest nor the claims
+        # table, so each run left three tables behind.
         for kind, suffix in (
             ("VIEW", "capture"), ("VIEW", "pack_inventory"),
             ("TABLE", "capture_raw"), ("TABLE", "pack_inventory_raw"),
+            ("TABLE", "index_watermark"), ("TABLE", "snapshot_manifest"),
+            ("TABLE", "capture_version_claims"),
         ):
             client.execute(
                 f"DROP {kind} IF EXISTS `{args.database}`.`{prefix}_{suffix}`"
