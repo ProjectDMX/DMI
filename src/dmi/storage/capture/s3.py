@@ -24,6 +24,7 @@ from .model import (
 _MIN_MULTIPART_BYTES = 5 * 1024**2
 _MAX_CURSOR_BYTES = 2048
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_CONTENT_VERIFY_CHUNK_BYTES = 1024**2
 
 
 def _validate_bounded_text(name: str, value: object, limit: int = 255) -> None:
@@ -216,7 +217,17 @@ class S3PackStore:
         key = str(validate_object_key(object_key))
         existing = self._head_or_none(key)
         if existing is not None:
-            return self._existing_ref(pack, key, existing)
+            # The metadata comparison is a cheap pre-filter; the object's
+            # content is then hashed before it is blessed. Metadata alone is
+            # only an assertion recorded at upload time: a failed upload whose
+            # cleanup delete also failed leaves corrupt bytes wearing the
+            # declared checksum, and a retry finding them here must not turn
+            # that into silent corruption. The full read-back makes retries
+            # and idempotent replays more expensive, which is acceptable
+            # because they are rare.
+            ref = self._existing_ref(pack, key, existing)
+            self._verify_existing_content(pack, key)
+            return ref
 
         # upload_fileobj hands the stream straight to the transfer manager, so
         # unlike FilesystemPackStore.put nothing here would otherwise see the
@@ -271,10 +282,48 @@ class S3PackStore:
             raise PackIntegrityError("uploaded object is not visible to HeadObject")
         return self._existing_ref(pack, key, uploaded)
 
+    def _verify_existing_content(self, pack: PackSource, key: str) -> None:
+        """Hash an existing object's bytes before blessing it as ``pack``.
+
+        This process cannot prove it wrote the object, and the object's
+        metadata carries the checksum the uploader *declared*, not one the
+        server computed -- so only the content itself can prove the object is
+        the pack. The read is streamed in bounded chunks: packs run to
+        hundreds of MiB and must not be buffered whole.
+        """
+        response = self._client.get_object(
+            Bucket=self._bucket,
+            Key=key,
+            Range=f"bytes=0-{pack.object_bytes - 1}",
+        )
+        if not isinstance(response, Mapping) or "Body" not in response:
+            raise PackIntegrityError("S3 returned an invalid range response")
+        digest = sha256()
+        total = 0
+        body = response["Body"]
+        try:
+            while True:
+                chunk = body.read(_CONTENT_VERIFY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                total += len(chunk)
+        finally:
+            body.close()
+        # HeadObject already matched the size, so a short or long body is the
+        # transport lying rather than a conflicting object.
+        if total != pack.object_bytes:
+            raise PackIntegrityError("S3 returned a short or oversized range")
+        if digest.hexdigest() != pack.checksum:
+            raise PackConflictError(f"object key contains different content: {key}")
+
     def _delete_uploaded(self, key: str) -> None:
-        # Best effort: the object contradicts its own metadata, so inspect()
-        # would reject it anyway; removal is cleanup, not correctness -- and a
-        # raised delete error must not mask the integrity error.
+        # Best effort: removal is cleanup, not correctness -- a raised delete
+        # error must not mask the integrity error. Note the leftover object's
+        # metadata still asserts the DECLARED checksum (only the bytes lie),
+        # so inspect() and stat() would accept it from metadata alone; what
+        # keeps a later retry from blessing it is put() re-hashing an existing
+        # object's content in _verify_existing_content.
         try:
             self._client.delete_object(Bucket=self._bucket, Key=key)
         except Exception:

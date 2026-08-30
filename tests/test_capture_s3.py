@@ -380,6 +380,81 @@ def test_s3_put_integrity_error_survives_a_failing_delete():
         _store(client).put(_LyingPack(_pack()), "packs/lying.dmi-pack")
 
 
+def test_a_retry_never_blesses_a_corrupt_object_left_by_a_failed_cleanup():
+    """Metadata alone must not bless an object this process cannot vouch for.
+
+    The reviewer's sequence: same-length wrong bytes are uploaded, the
+    post-upload digest check fails, and the cleanup delete raises a 500
+    (swallowed) -- so the corrupt object stays behind wearing the DECLARED
+    checksum in its metadata. A retry with the correct source then finds an
+    object whose size and metadata all match; only the bytes lie.
+    """
+    client = _S3Client()
+
+    def broken_delete(**_):
+        raise _ClientError(500, "InternalError")
+
+    client.delete_object = broken_delete  # type: ignore[method-assign]
+    store = _store(client)
+    sealed = _pack()
+    key = "packs/corrupt.dmi-pack"
+
+    with pytest.raises(PackIntegrityError, match="do not match"):
+        store.put(_LyingPack(sealed), key)
+    assert key in client.objects, "the failed cleanup left the object behind"
+    assert client.objects[key][1]["dmi-sha256"] == sealed.checksum
+
+    with pytest.raises(PackConflictError, match="different content"):
+        store.put(sealed, key)
+
+
+def test_a_spooled_pack_survives_a_retry_that_finds_a_corrupt_remote_object(
+    tmp_path,
+):
+    """The spool must keep the staged copy when a retry hits the corrupt object.
+
+    Blessing it would delete the only good copy; raising PackConflictError
+    instead turns the corruption into an operator-visible upload failure.
+    """
+    from dmi.storage.capture import DurablePackSpool, SpoolUploader
+
+    client = _S3Client()
+
+    def broken_delete(**_):
+        raise _ClientError(500, "InternalError")
+
+    client.delete_object = broken_delete  # type: ignore[method-assign]
+    store = _store(client)
+    sealed = _pack()
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(sealed.data) * 2)
+    staged = spool.stage(sealed, f"packs/{sealed.pack_id}.dmi-pack")
+
+    with pytest.raises(PackIntegrityError, match="do not match"):
+        store.put(_LyingPack(sealed), staged.object_key)
+
+    with pytest.raises(PackConflictError, match="different content"):
+        SpoolUploader(spool, store).upload(staged)
+
+    assert staged.path.exists()
+    assert spool.snapshot().entries == 1
+
+
+def test_retry_content_verification_rejects_a_lying_transport():
+    client = _S3Client()
+    store = _store(client)
+    pack = _pack()
+    key = "packs/a.dmi-pack"
+    store.put(pack, key)
+
+    client.get_object = lambda **_: {}  # type: ignore[method-assign]
+    with pytest.raises(PackIntegrityError, match="invalid range response"):
+        store.put(pack, key)
+
+    client.get_object = lambda **_: {"Body": _Body(b"xy")}  # type: ignore[method-assign]
+    with pytest.raises(PackIntegrityError, match="short or oversized"):
+        store.put(pack, key)
+
+
 def test_s3_put_asks_the_server_to_verify_the_upload():
     # Server-side verification is a second, independent check: the hashing tee
     # catches a source that contradicts its own declaration, this catches
