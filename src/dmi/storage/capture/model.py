@@ -70,6 +70,27 @@ def _validate_text(
 
 @dataclass(frozen=True, slots=True)
 class CaptureMetadata:
+    """What a capture *is*, as opposed to where its bytes currently sit.
+
+    ``(tenant_id, capture_id)`` identifies a capture, and every field here is
+    immutable for that identity: the values are read back from a pack footer
+    that is written once, so describing the same capture again -- a replayed
+    indexing pass, a pack mirrored into a second store, a producer retrying a
+    capture id into a later pack -- reproduces them unchanged. Only the
+    :class:`PayloadLocator` beside it in a :class:`CaptureDescriptor` may differ
+    between two descriptions of one capture.
+
+    That split is a contract, not an observation, and the ClickHouse catalog
+    reader depends on both halves of it. It filters raw descriptor rows on these
+    fields *before* grouping them down to one row per capture, which is sound
+    only because every row for a capture agrees on them; and where two packs
+    describe one capture it answers with a single row, which is a complete
+    answer only because the rows it did not pick differ nowhere else. A field
+    added here that a later description could change would quietly break both,
+    so ``tests/test_clickhouse_capture_reader.py`` pins the split and
+    ``dmi.storage.capture.clickhouse_reader`` records the reasoning in full.
+    """
+
     capture_id: str
     tenant_id: str
     experiment_id: str

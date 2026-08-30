@@ -687,3 +687,124 @@ def test_the_public_view_is_the_raw_rows_of_published_packs():
         assert len(expected) == len(published)
         assert _view_rows(client, config) == expected
         assert _raw_rows(client, config) == len(published) + len(unpublished)
+
+
+# --- resolving two packs written at one version ------------------------------
+
+
+def _mirrored_into_a_second_store(descriptors):
+    """The same captures, in a second pack, with a wholly different locator.
+
+    Every locator field moves, so a projection that resolved its columns from
+    different rows would show up in any of them rather than in one lucky column.
+    """
+    pack_id = str(uuid4())
+    return tuple(
+        replace(
+            item,
+            locator=replace(
+                item.locator,
+                store_id="second-store",
+                pack_id=pack_id,
+                object_key=f"mirror/{pack_id}.dmi-pack",
+                object_bytes=item.locator.object_bytes + 4_096,
+                pack_checksum="b" * 64,
+                pack_record_count=item.locator.pack_record_count + 1,
+                offset=item.locator.offset + 1_048_576,
+                stored_length=item.locator.stored_length + 32,
+                decoded_length=item.locator.decoded_length + 32,
+                codec="zstd",
+                checksum="ffffffff",
+            ),
+        )
+        for item in descriptors
+    )
+
+
+def test_two_packs_written_at_one_version_resolve_to_one_pack_stably():
+    """The tie ``index_version`` alone cannot break, over a live server.
+
+    ``CatalogIndexer.index`` writes every pack of a batch at ONE version, so two
+    packs describing the same capture in one call produce rows whose
+    ``index_version`` is EQUAL -- reproduced here by writing both at version 1,
+    which is the same physical state without needing two real pack objects. The
+    projection resolves each column with its own ``argMax``, and ClickHouse does
+    not say which row an ``argMax`` picks out of a tie, so two things can go
+    wrong: the columns can come from different rows, and the row they come from
+    can change between reads.
+
+    Both are asserted, because only the second is reachable on this engine.
+    ClickHouse 25.12 does break every tie in a query the same way -- the columns
+    agree -- but *which* row wins moves with the physical layout: with the two
+    packs in separate parts the later-inserted one won, and after a merge put
+    both rows in one part the lower sort key did. A background merge does that
+    at a time nobody controls, so pre-fix this is a pinned selection that
+    resolves to one pack now and the other pack later. The coherence assertion
+    is kept as a guard: it pins behaviour the engine does not promise, and an
+    upgrade that starts resolving argMax per column is free to break it.
+    """
+    original = synthetic_descriptors(40)
+    mirror = _mirrored_into_a_second_store(original)
+    locators = {
+        item.capture_id: {original[index].locator, mirror[index].locator}
+        for index, item in enumerate(original)
+    }
+    tenant = original[0].metadata.tenant_id
+    ids = [item.capture_id for item in original]
+
+    with _catalog() as (writer, reader, client, config):
+        # One version for both packs, one publish: exactly what index() emits.
+        writer.write_descriptors(original, index_version=1)
+        writer.write_descriptors(mirror, index_version=1)
+        _publish(
+            writer,
+            1,
+            refs=_refs(original) + _refs(mirror),
+            rows=len(original) + len(mirror),
+        )
+        _commit(writer, original + mirror, 1)
+        assert _raw_rows(client, config) == len(original) + len(mirror)
+
+        def resolved():
+            by_id = reader.get_by_ids(ids, tenant_id=tenant, watermark="1")
+            assert len(by_id) == len(original), "a capture split across two rows"
+            page = reader.search(CaptureQuery(limit=100, tenant_id=tenant))
+            assert [item.capture_id for item in page.items] == ids
+            return {item.capture_id: item.locator for item in by_id}, {
+                item.capture_id: item.locator for item in page.items
+            }
+
+        def coherent(mapping):
+            for capture_id, locator in mapping.items():
+                assert locator in locators[capture_id], (
+                    f"{capture_id} resolved to a locator belonging to neither "
+                    f"pack -- columns came from different rows: {locator}"
+                )
+
+        first_lookup, first_page = resolved()
+        coherent(first_lookup)
+        coherent(first_page)
+        assert first_lookup == first_page, (
+            "a lookup and a page resolved the same capture to different packs"
+        )
+        for _ in range(3):
+            again_lookup, again_page = resolved()
+            assert (again_lookup, again_page) == (first_lookup, first_page), (
+                "repeating the query at one watermark moved the answer"
+            )
+
+        # A merge does not delete either row -- pack identity is in the sort key
+        # -- but it does put both in one part, which is enough to change which
+        # one an untied argMax picks.
+        _merge(client, config)
+        assert _raw_rows(client, config) == len(original) + len(mirror)
+
+        merged_lookup, merged_page = resolved()
+        coherent(merged_lookup)
+        coherent(merged_page)
+        assert merged_lookup == first_lookup, (
+            "a merge changed which pack a pinned selection resolves to"
+        )
+        assert merged_page == first_page, (
+            "a merge changed which pack a pinned page resolves to"
+        )

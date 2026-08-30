@@ -14,8 +14,18 @@ from dmi.storage.capture import (
     InvalidCursorError,
     PackFormatError,
 )
-from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS
-from dmi.storage.capture.clickhouse_reader import _PROJECTION
+from dmi.storage.capture.clickhouse_catalog import (
+    _CAPTURE_COLUMNS,
+    _CAPTURE_TABLE_ORDER,
+)
+from dmi.storage.capture.clickhouse_reader import (
+    _EQUALITY_FILTERS,
+    _PROJECTION,
+    _RESOLUTION_ORDER,
+    _RESOLVED,
+    _SORT_KEY,
+)
+from dmi.storage.capture.model import PayloadLocator
 
 
 pytestmark = pytest.mark.cpu
@@ -23,11 +33,16 @@ pytestmark = pytest.mark.cpu
 
 _WATERMARK = 1_756_142_093_000_000_000
 
+# The ordering argument the projection's argMax must carry. Spelled out here
+# rather than imported so that a change to it fails these tests instead of
+# silently travelling through them.
+_ORDER = "(index_version, store_id, pack_id)"
 
-def _row(descriptor: CaptureDescriptor) -> tuple:
-    """The row a catalog read returns, in projection order."""
+
+def _source(descriptor: CaptureDescriptor) -> dict:
+    """Every catalog column of one descriptor, keyed by column name."""
     metadata, locator = descriptor.metadata, descriptor.locator
-    source = {
+    return {
         **metadata.to_mapping(),
         "pack_id": locator.pack_id,
         "store_id": locator.store_id,
@@ -41,7 +56,27 @@ def _row(descriptor: CaptureDescriptor) -> tuple:
         "codec": locator.codec,
         "payload_checksum": locator.checksum,
     }
-    return tuple(source[name] for name in _PROJECTION)
+
+
+def _shaped(source: dict) -> tuple:
+    """The row a catalog read returns: identity columns, then one tuple.
+
+    Everything that is not grouped on comes back inside a single aggregate, so
+    the row is six wide however many columns the catalog gains.
+    """
+    return tuple(source[name] for name in _SORT_KEY) + (
+        tuple(source[name] for name in _RESOLVED),
+    )
+
+
+def _row(descriptor: CaptureDescriptor) -> tuple:
+    return _shaped(_source(descriptor))
+
+
+def _resolved_tuple(sql: str) -> str:
+    """The column list inside the projection's single argMax tuple."""
+    assert sql.count("argMax(") == 1, f"expected exactly one aggregate: {sql}"
+    return sql.split("argMax(tuple(")[1].split("), ")[0]
 
 
 class _Client:
@@ -78,6 +113,11 @@ def _catalog(**kwargs) -> tuple[ClickHouseCaptureCatalog, _Client]:
 def test_projection_covers_every_written_column_but_the_version():
     assert _PROJECTION == _CAPTURE_COLUMNS[:-1]
     assert "index_version" not in _PROJECTION
+    # Grouped on, or resolved: every column is exactly one of the two, so a
+    # column added to the writer cannot fall out of the read.
+    assert set(_SORT_KEY) | set(_RESOLVED) == set(_PROJECTION)
+    assert not set(_SORT_KEY) & set(_RESOLVED)
+    assert _RESOLVED == tuple(n for n in _PROJECTION if n not in _SORT_KEY)
 
 
 def test_search_reconstructs_descriptors_exactly():
@@ -96,6 +136,29 @@ def test_search_rejects_a_row_of_the_wrong_width():
     client.execute = lambda *a, **k: [(1, 2, 3)]  # type: ignore[method-assign]
 
     with pytest.raises(PackFormatError, match="columns"):
+        catalog.search(CaptureQuery(limit=10))
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    (
+        pytest.param("not-a-tuple", id="scalar"),
+        pytest.param((1, 2, 3), id="too-few-columns"),
+    ),
+)
+def test_search_rejects_a_malformed_resolved_tuple(resolved):
+    """Everything not grouped on arrives as one aggregate, so its width matters.
+
+    A row of the right *outer* width can still carry a tuple of the wrong
+    length -- a catalog written by a build with different columns, say -- and
+    zipping it against the column names would then silently slide every field
+    onto the wrong one.
+    """
+    descriptor = synthetic_descriptors(1)[0]
+    row = tuple(_source(descriptor)[name] for name in _SORT_KEY) + (resolved,)
+    catalog = _raw_row_catalog(row)
+
+    with pytest.raises(PackFormatError, match="resolved-column tuple"):
         catalog.search(CaptureQuery(limit=10))
 
 
@@ -120,11 +183,13 @@ def test_search_resolves_columns_with_argmax_at_the_watermark():
     sql, params, _ = [call for call in client.calls if "argMax" in call[0]][0]
     assert "index_version <= %(watermark)s" in sql
     assert params["watermark"] == _WATERMARK
-    # Every non-sort-key column resolves through argMax rather than an
-    # arbitrary row from the group, and is never aliased back to its own name
-    # -- that would shadow the raw column and break filters on it.
+    # Every non-sort-key column is resolved inside the one aggregate rather than
+    # taken from an arbitrary row of the group, and nothing is aliased back to
+    # a source column name -- that would shadow the raw column and break the
+    # filters on it.
+    resolved = _resolved_tuple(sql)
     for name in ("pack_id", "payload_offset", "stored_length", "dtype"):
-        assert f"argMax(`{name}`, index_version)" in sql
+        assert f"`{name}`" in resolved
         assert f"AS `{name}`" not in sql
 
 
@@ -156,9 +221,106 @@ def test_pack_identity_is_resolved_by_argmax_not_grouped_on():
 
     sql = client.selects[0]
     group_by = sql.split("GROUP BY")[1].split("ORDER BY")[0]
+    resolved = _resolved_tuple(sql)
     for name in ("store_id", "pack_id"):
-        assert f"argMax(`{name}`, index_version)" in sql
+        assert f"`{name}`" in resolved
         assert name not in group_by
+
+
+def test_one_aggregate_on_a_total_order_resolves_both_query_sites():
+    """The two properties the projection's shape buys, at both query sites.
+
+    ONE aggregate over a tuple of every resolved column, rather than one
+    aggregate per column. Separate aggregates each pick their own row out of a
+    tie, and ClickHouse does not say which -- nothing in that shape forbids
+    ``store_id`` coming from one row and ``object_key`` from another, a
+    descriptor describing no pack that exists. A single aggregate keeps a single
+    row, so a mixed descriptor is impossible rather than merely unobserved.
+
+    A TOTAL ordering argument, rather than ``index_version``. One
+    ``CatalogIndexer.index`` call writes every pack of a batch at one version,
+    so two packs describing the same capture in one batch tie on it, and the row
+    the engine then keeps moves with the physical layout -- the live suite pins
+    a merge changing it. Appending pack identity, which is what a capture's rows
+    differ by, leaves exactly one maximum.
+
+    Asserted at both sites, because a page and a lookup that resolved
+    differently would make a selection stop round-tripping.
+    """
+    expected = synthetic_descriptors(1)
+    catalog, client = _catalog(pages=[expected, expected])
+
+    catalog.search(CaptureQuery(limit=10))
+    catalog.get_by_ids(
+        [expected[0].capture_id], tenant_id="tenant-a", watermark=str(_WATERMARK)
+    )
+
+    assert len(client.selects) == 2
+    for sql in client.selects:
+        # Exactly one aggregate (asserted inside _resolved_tuple), carrying
+        # every resolved column, in _RESOLVED order so the row maps positionally.
+        assert _resolved_tuple(sql) == ", ".join(f"`{n}`" for n in _RESOLVED)
+        assert f"argMax(tuple({_resolved_tuple(sql)}), {_ORDER})" in sql
+        # And nothing is left resolving on the version alone.
+        assert ", index_version)" not in sql
+        # The grouping columns still project directly, not through the tuple.
+        for name in _SORT_KEY:
+            assert f"`{name}`" in sql.split("argMax(")[0]
+    # The ordering key is exactly (index_version, store_id, pack_id): version
+    # first, so a later pack still supersedes an earlier one, then the columns
+    # the table is physically ordered on beyond capture identity -- the only
+    # ones a capture's rows can differ in, and therefore the only ones that can
+    # break the tie a shared version leaves.
+    assert _RESOLUTION_ORDER == _ORDER
+    tail = _CAPTURE_TABLE_ORDER[len(_SORT_KEY) :]
+    assert _ORDER == "(" + ", ".join(("index_version",) + tail) + ")"
+
+
+def test_only_the_locator_may_differ_between_a_captures_rows():
+    """The identity rule the query shape rests on, pinned column by column.
+
+    ``(tenant_id, capture_id)`` identifies a capture. Every descriptor field
+    except the locator is immutable for that identity, so two rows describing
+    one capture differ only in where its bytes are. That is what reconciles a
+    five-column ``GROUP BY`` with a ``CaptureSelection`` that dedups on
+    ``capture_id`` alone, and -- the load-bearing half -- what makes the
+    reader's pre-aggregation ``WHERE`` filters safe: a filter on an immutable
+    column cannot match only the row that loses the argMax, because every row
+    for the capture carries the same value.
+
+    Asserted as an exact set rather than a subset. A new column that a later
+    description could change has to land in one of these two lists, and landing
+    in the immutable one is a claim someone has to make on purpose.
+    """
+    locator = frozenset(
+        {
+            "store_id", "pack_id", "object_key", "object_bytes", "pack_checksum",
+            "pack_record_count", "payload_offset", "stored_length",
+            "decoded_length", "codec", "payload_checksum",
+        }
+    )
+    immutable = frozenset(
+        {
+            "session_id", "request_id", "sequence_id", "model_id",
+            "model_revision", "adapter_revision", "capture_policy_version",
+            "hook_name", "layer_number", "producer_rank", "step_number",
+            "token_start", "token_end", "batch_position", "dtype", "shape",
+        }
+    )
+    assert frozenset(_RESOLVED) - locator == immutable
+    # The locator list is the PayloadLocator's own fields, so growing the
+    # dataclass cannot quietly reclassify a mutable field as immutable. Two
+    # fields are stored under a prefixed column name.
+    renamed = {"offset": "payload_offset", "checksum": "payload_checksum"}
+    assert locator == {
+        renamed.get(name, name) for name in PayloadLocator.__dataclass_fields__
+    }
+    # And every filter the reader applies before grouping reads an immutable
+    # column or a grouping column -- never a locator column.
+    filtered = frozenset(_EQUALITY_FILTERS) | {
+        "hook_name", "layer_number", "captured_at_ns"
+    }
+    assert not filtered & locator
 
 
 def test_search_groups_and_orders_by_the_sort_key():
@@ -537,10 +699,7 @@ def test_get_by_ids_rejects_an_unpublished_watermark():
 
 
 def _patched_row(descriptor: CaptureDescriptor, **overrides) -> tuple:
-    row = list(_row(descriptor))
-    for name, value in overrides.items():
-        row[_PROJECTION.index(name)] = value
-    return tuple(row)
+    return _shaped({**_source(descriptor), **overrides})
 
 
 def _raw_row_catalog(row: tuple) -> ClickHouseCaptureCatalog:

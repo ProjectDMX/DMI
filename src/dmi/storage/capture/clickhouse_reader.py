@@ -21,11 +21,48 @@ merge can destroy a row a pinned snapshot still needs.
 ``test_replay_is_invisible_because_it_rewrites_identical_descriptors`` guards
 that invariant; if it ever breaks, this design has to be revisited.
 
-Rows describing one capture in DIFFERENT packs survive side by side, and
-``argMax(..., index_version)`` grouped on capture identity picks between them:
+Rows describing one capture in DIFFERENT packs survive side by side, and the
+``argMax`` projection grouped on capture identity picks between them:
 newest-wins. A reader pinned before the second pack was committed never sees
 its rows at all, because the membership clause excludes that pack, so the pin
-still resolves to the pack it was taken over.
+still resolves to the pack it was taken over. Two packs indexed in one batch
+share an ``index_version``, so version alone does not order those rows; what
+does is described at :meth:`ClickHouseCaptureCatalog._projection`.
+
+The identity rule
+-----------------
+
+``(tenant_id, capture_id)`` identifies a capture. Every descriptor field except
+the locator -- ``store_id``, ``pack_id``, ``object_key``, ``object_bytes``,
+``pack_checksum``, ``pack_record_count``, ``payload_offset``,
+``stored_length``, ``decoded_length``, ``codec``, ``payload_checksum`` -- is
+immutable for that identity. Two rows describing one capture may differ ONLY in
+where its bytes are, because everything else is read back from a pack footer
+that was written once.
+
+Two things rest on that rule, and neither is visible in the SQL.
+
+The first is that the layers disagree about identity by inspection and are
+nonetheless consistent. This module groups on the five-column ``_SORT_KEY``,
+``CaptureSelection`` dedups on ``capture_id`` alone, and ``get_by_ids`` filters
+on ``tenant_id`` plus ``capture_id``. Under the rule the three extra grouping
+columns are functions of ``(tenant_id, capture_id)``, so grouping on five
+columns partitions the rows exactly as grouping on two would: no capture can
+split across two result rows, and no result row can mix two captures.
+
+The second is that it is what makes the pre-aggregation ``WHERE`` filters in
+``_filters`` safe, which is the load-bearing assumption behind the current
+query shape. Those predicates run on raw rows, before the grouping that
+resolves a capture to one pack. If a filtered column could differ between a
+capture's rows, a filter could match only the row that loses the ``argMax`` --
+admitting a capture on the strength of a description the reader will not return
+-- or match none of them and drop a capture the winning row satisfies. Because
+every filtered column is immutable, all of a capture's rows agree on it and the
+filter's answer cannot depend on which row wins. Filtering after aggregation
+would be the alternative, and it would forfeit the primary index.
+``test_only_the_locator_may_differ_between_a_captures_rows`` pins the split
+between the two kinds of column so that adding a mutable one has to be
+deliberate.
 
 The watermark itself comes from a published log rather than from
 ``max(index_version)`` over the descriptors, because one indexing call writes
@@ -74,11 +111,24 @@ from .model import (
 _SORT_KEY = ("tenant_id", "experiment_id", "run_id", "captured_at_ns", "capture_id")
 _SORT_KEY_SET = frozenset(_SORT_KEY)
 
-# Projection order is the writer's column order minus ``index_version``, so a
-# result row maps positionally onto the descriptor fields.
+# Every column the reader reads: the writer's column order minus
+# ``index_version``, which orders the rows rather than describing a capture.
 _PROJECTION = _CAPTURE_COLUMNS[:-1]
 
+# The columns that are not grouped on, and so have to be resolved out of a
+# capture's rows. They travel as ONE tuple; see ``_projection``.
+_RESOLVED = tuple(name for name in _PROJECTION if name not in _SORT_KEY_SET)
+
+# A result row is the grouping columns in sort-key order followed by a single
+# tuple holding every resolved column in ``_RESOLVED`` order.
+_ROW_WIDTH = len(_SORT_KEY) + 1
+
 _EQUALITY_FILTERS = ("tenant_id", "experiment_id", "run_id", "session_id", "model_id")
+
+# The ordering argument the projection's argMax resolves on. It is a tuple, not
+# ``index_version``, because it has to be a TOTAL order over the rows in one
+# group; ``_projection`` explains why, and what breaks without it.
+_RESOLUTION_ORDER = "(index_version, store_id, pack_id)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,22 +342,77 @@ class ClickHouseCaptureCatalog:
 
     @staticmethod
     def _projection() -> str:
-        # Capture-identity columns are grouped on, so they project directly;
-        # everything else resolves through argMax. Within one pack that is
-        # deduplication (the rows are byte identical); across packs it is
-        # version selection, and picking newest-wins is what makes a capture
-        # re-described by a later pack resolve to that pack.
-        #
-        # Deliberately unaliased: naming an aggregate after its own source
-        # column shadows that column everywhere else in the statement, and
-        # ClickHouse then rejects a filter on it with "Aggregate function ...
-        # is found in WHERE in query". Rows map onto descriptors positionally,
-        # so the server-side column names are never read.
+        """The SELECT list: identity columns direct, the rest as ONE aggregate.
+
+        Capture-identity columns are grouped on, so they project directly.
+        Everything else is resolved by a single ``argMax`` over a tuple of all
+        of them. Both halves of that -- one aggregate, and the ordering argument
+        it uses -- are load-bearing, each for a different reason.
+
+        **One aggregate, so a row cannot be mixed.** A projection of
+        twenty-seven separate ``argMax`` calls resolves each column
+        independently, and ClickHouse does not define which row an ``argMax``
+        picks out of a tie. Nothing in that shape forbids ``store_id`` coming
+        from one row and ``object_key`` from another: a descriptor describing no
+        pack that exists. Aggregating the whole tuple at once makes that
+        impossible by construction rather than merely unobserved -- one
+        aggregate keeps one row, and every column comes out of it.
+
+        Stated plainly because it was checked: a mixed row could NOT be
+        reproduced on 25.12. Forty-two combinations of ``max_threads``,
+        two-level and external aggregation, JIT-compiled aggregates and block
+        size produced none, and the reason looks structural (a group's aggregate
+        states share one block and merge in lockstep, so every ``argMax`` in it
+        keeps the same row). That is an observation about one build, not a
+        promise the engine makes, and it is not why this shape is cheap -- so it
+        is not a reason to unpick the tuple back into per-column aggregates.
+
+        **A total ordering argument, so the row that wins cannot move.** This is
+        the failure that reproduces. Ordering on ``index_version`` alone ties
+        routinely: every pack indexed in one ``CatalogIndexer.index`` call is
+        written at one version, so two packs describing the same capture in one
+        batch produce rows whose ``index_version`` is equal. The engine breaks
+        those ties consistently within a query but not across physical layouts:
+        one pinned corpus resolved to a different pack at ``max_threads=1`` than
+        it did above it, and to a different one again once a merge had put both
+        rows in one part. A background merge does that at a time nobody
+        controls, so a selection resolved before one and hydrated after it
+        resolves to different bytes with nothing reporting a change.
+
+        ``(index_version, store_id, pack_id)`` is a total order over the rows in
+        a group. They differ by pack identity -- that is exactly why it is in
+        the table's physical sort key -- so the tuple is unique per distinct row
+        and the maximum is one row. Rows that still tie on the whole tuple are
+        one pack re-indexed at one version, which rewrites byte-identical rows,
+        so which of those wins cannot be observed.
+
+        Across versions this is unchanged newest-wins: ``index_version`` leads
+        the tuple, so a later pack still supersedes an earlier one. Within a
+        version the winner is the highest ``(store_id, pack_id)`` -- there is no
+        version ordering left to honour, and an arbitrary but FIXED choice is
+        what a reader needs, so that a selection resolved twice resolves to the
+        same bytes.
+
+        The shape is also what keeps determinism affordable, which is why the
+        two halves arrived together. ClickHouse compares a tuple ordering
+        argument through a generic ``Field``, once per row per aggregate, and
+        the ``GROUP BY`` completes before ``LIMIT`` applies, so every page pays
+        for every row. On ``benchmarks.bench_capture_search`` at 50k rows, a
+        100-row page costs 140.1 ms ordering twenty-seven aggregates on
+        ``index_version``, 548.3 ms ordering twenty-seven of them on the tuple,
+        and 171.7 ms ordering one -- +22.6% for determinism where the per-column
+        form cost +291%. Across page sizes, pagination depth and the selectivity
+        cases this shape runs +17% to +43%.
+        """
+        # Deliberately unaliased: naming an aggregate after a source column
+        # shadows that column everywhere else in the statement, and ClickHouse
+        # then rejects a filter on it with "Aggregate function ... is found in
+        # WHERE in query". _descriptor maps the row positionally, so the
+        # server-side column names are never read.
+        resolved = ", ".join(_quoted(name) for name in _RESOLVED)
         return ", ".join(
-            _quoted(name)
-            if name in _SORT_KEY_SET
-            else f"argMax({_quoted(name)}, index_version)"
-            for name in _PROJECTION
+            [_quoted(name) for name in _SORT_KEY]
+            + [f"argMax(tuple({resolved}), {_RESOLUTION_ORDER})"]
         )
 
     def _filters(
@@ -363,11 +468,23 @@ class ClickHouseCaptureCatalog:
 
     @staticmethod
     def _descriptor(row: Sequence[object]) -> CaptureDescriptor:
-        if len(row) != len(_PROJECTION):
+        # The grouping columns, then the one aggregate holding the rest. Flatten
+        # the two back into a single mapping so the field reads below do not
+        # have to know which side a column arrived on.
+        if len(row) != _ROW_WIDTH:
             raise PackFormatError(
-                f"catalog row has {len(row)} columns, expected {len(_PROJECTION)}"
+                f"catalog row has {len(row)} columns, expected {_ROW_WIDTH}"
             )
-        value: Mapping[str, object] = dict(zip(_PROJECTION, row))
+        resolved = row[-1]
+        if not isinstance(resolved, (list, tuple)) or len(resolved) != len(_RESOLVED):
+            raise PackFormatError(
+                "catalog returned a malformed resolved-column tuple, expected "
+                f"{len(_RESOLVED)} columns"
+            )
+        value: Mapping[str, object] = {
+            **dict(zip(_SORT_KEY, row)),
+            **dict(zip(_RESOLVED, resolved)),
+        }
         shape = value["shape"]
         if not isinstance(shape, (list, tuple)):
             raise PackFormatError("catalog returned a non-array shape")
