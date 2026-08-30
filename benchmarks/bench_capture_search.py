@@ -235,7 +235,7 @@ def main(argv=None) -> int:
             ("VIEW", "capture"), ("VIEW", "pack_inventory"),
             ("TABLE", "capture_raw"), ("TABLE", "pack_inventory_raw"),
             ("TABLE", "index_watermark"), ("TABLE", "snapshot_manifest"),
-            ("TABLE", "capture_version_claims"),
+            ("TABLE", "capture_version_claims"), ("TABLE", "schema_version"),
         ):
             client.execute(
                 f"DROP {kind} IF EXISTS `{args.database}`.`{prefix}_{suffix}`"

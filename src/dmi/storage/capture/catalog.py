@@ -22,6 +22,17 @@ class SnapshotPublishRaceError(CaptureStorageError):
     """
 
 
+class CatalogSchemaVersionError(CaptureStorageError):
+    """The catalog on the server is not a schema this build can read or write.
+
+    Not retryable: the state it reports is durable and an indexer that carried
+    on would make it worse. The message names the version found, the version
+    required, and the rebuild that resolves it -- the catalog is a derived
+    projection over immutable packs, so dropping it and reconciling the object
+    store again loses nothing.
+    """
+
+
 class PackInventory(PackStore, Protocol):
     def inspect(self, object_key: str) -> PackRef: ...
     def list_objects(

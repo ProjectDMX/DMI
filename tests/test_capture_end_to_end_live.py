@@ -195,6 +195,7 @@ def _stack(tmp_path: Path):
                 ("TABLE", "pack_inventory_raw"),
                 ("TABLE", "index_watermark"),
                 ("TABLE", "snapshot_manifest"),
+                ("TABLE", "schema_version"),
                 ("TABLE", "capture_version_claims"),
             ):
                 client.execute(

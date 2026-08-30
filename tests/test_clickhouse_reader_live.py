@@ -96,6 +96,7 @@ def _catalog():
                 ("TABLE", "capture_version_claims"),
                 ("TABLE", "index_watermark"),
                 ("TABLE", "snapshot_manifest"),
+                ("TABLE", "schema_version"),
             ):
                 client.execute(
                     f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`"

@@ -7,6 +7,7 @@ import pytest
 from dmi.storage.capture import (
     CaptureMetadata,
     CaptureRecord,
+    CatalogSchemaVersionError,
     ClickHouseCatalogConfig,
     ClickHouseCatalogWriter,
     PackIndex,
@@ -19,15 +20,56 @@ from dmi.storage.capture import (
 pytestmark = pytest.mark.cpu
 
 
+# Every object `ensure_schema` owns, spelled out rather than derived from the
+# writer: the compatibility check exists to notice one of them missing, so a
+# test that asked the writer which objects it expects could not see the writer
+# forget one.
+_V2_OBJECTS = (
+    "dmi_capture",
+    "dmi_pack_inventory",
+    "dmi_capture_raw",
+    "dmi_pack_inventory_raw",
+    "dmi_capture_version_claims",
+    "dmi_index_watermark",
+    "dmi_snapshot_manifest",
+    "dmi_schema_version",
+)
+
+
 class _Client:
-    def __init__(self):
+    """A ClickHouse stand-in whose catalog state the test declares.
+
+    ``tables``, ``schema_version``, ``inventory_rows`` and ``manifest_rows``
+    describe a server the writer is about to meet: an empty default is a fresh
+    install, and the other combinations are the upgrade states `ensure_schema`
+    has to tell apart.
+    """
+
+    def __init__(
+        self,
+        *,
+        tables=(),
+        schema_version=None,
+        inventory_rows=0,
+        manifest_rows=0,
+    ):
         self.calls = []
         self.committed = []
         self.claims = []
         self.watermarks = []
+        self.tables = tuple(tables)
+        self.schema_version = schema_version
+        self.inventory_rows = inventory_rows
+        self.manifest_rows = manifest_rows
 
     def execute(self, query, params=None, **kwargs):
         self.calls.append((query, params, kwargs))
+        if "system.tables" in query:
+            return [(name,) for name in self.tables]
+        if "dmi_schema_version` ORDER BY version DESC" in query:
+            return [] if self.schema_version is None else [(self.schema_version,)]
+        if "dmi_pack_inventory_raw`), (SELECT count()" in query:
+            return [(self.inventory_rows, self.manifest_rows)]
         if query.lstrip().startswith("INSERT"):
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
@@ -286,6 +328,175 @@ def test_clickhouse_catalog_rejects_unsafe_identifiers(name: str):
         ClickHouseCatalogConfig(database=name)
 
 
+# --- schema version ----------------------------------------------------------
+#
+# `CREATE TABLE IF NOT EXISTS` cannot alter an existing table, so this build's
+# descriptor sort key and its membership table are unreachable by any statement
+# `ensure_schema` could issue against a catalog an older build created. Running
+# anyway is silent: the DDL succeeds, the old sort key survives, and the
+# populated pack inventory then makes every pre-existing pack look already
+# indexed, so none of them ever reaches the new manifest and every capture in
+# them becomes invisible. The catalog is derived, so the answer is to refuse
+# and rebuild -- these pin the refusal.
+
+
+def _writer(client) -> ClickHouseCatalogWriter:
+    return ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+
+def test_compatibility_is_checked_before_any_ddl_is_issued():
+    """A refusal after `CREATE DATABASE` would already have changed the server."""
+    client = _Client()
+
+    _writer(client).ensure_schema()
+
+    assert "system.tables" in client.calls[0][0]
+    # Version 1's membership table is looked for too: after a half-finished
+    # manual cleanup it is often the only object left standing, and a catalog
+    # with it still there is not one to create tables beside.
+    assert client.calls[0][1] == {
+        "database": "default",
+        "names": list(_V2_OBJECTS) + ["dmi_pack_commit_log"],
+    }
+
+
+def test_a_fresh_install_stamps_the_schema_version_last():
+    """The stamp means "every object exists", so it cannot be written earlier.
+
+    Written first, an install that died partway would leave a catalog claiming
+    to be complete, and the next start would trust it.
+    """
+    client = _Client()
+
+    _writer(client).ensure_schema()
+
+    statements = [call[0] for call in client.calls]
+    stamp = next(
+        index
+        for index, item in enumerate(statements)
+        if item.startswith("INSERT") and "dmi_schema_version" in item
+    )
+    assert stamp == len(statements) - 1
+    assert client.calls[stamp][1]["version"] == 2
+    # Conditional server-side, so a rerun against a stamped catalog inserts
+    # nothing and no read-then-write window exists between the two.
+    assert (
+        "WHERE (SELECT count() FROM `default`.`dmi_schema_version`) = 0"
+    ) in statements[stamp]
+    # And the table itself is created first, so an install interrupted below
+    # leaves a catalog that reads as "this build, unfinished" rather than one
+    # indistinguishable from version 1 and refused forever.
+    assert statements[2] == (
+        "CREATE TABLE IF NOT EXISTS `default`.`dmi_schema_version` (\n"
+        "version UInt32, applied_at_ns UInt64\n"
+        ") ENGINE = MergeTree ORDER BY version"
+    )
+    assert statements[1].startswith("CREATE DATABASE")
+
+
+def test_a_version_one_catalog_is_refused_with_the_rebuild_procedure():
+    """The upgrade this branch cannot perform, refused instead of half-done."""
+    client = _Client(
+        tables=("dmi_capture_raw", "dmi_pack_inventory_raw", "dmi_pack_commit_log")
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    assert "schema version 1" in message
+    assert "requires version 2" in message
+    # Both incompatible changes are named, because an operator reading this has
+    # to know the catalog cannot simply be altered into shape.
+    assert "ORDER BY" in message and "(store_id, pack_id)" in message
+    assert "dmi_pack_commit_log" in message and "dmi_snapshot_manifest" in message
+    # And the exact recovery, including the part that is easy to skip.
+    assert "CatalogReconciler.rebuild()" in message
+    assert "Dropping the pack inventory is mandatory" in message
+    assert "`default`.`dmi_pack_inventory_raw`" in message
+    # Nothing was created, altered or written on the way to the refusal.
+    assert [call[0] for call in client.calls[1:]] == []
+
+
+def test_an_unstamped_install_of_this_build_is_completed_not_refused():
+    """A crash between creating the objects and stamping them is recoverable.
+
+    The version table exists and holds no row only when THIS build got that
+    far, so re-running the (idempotent) DDL is the repair, not a refusal that
+    would wedge a half-created catalog forever.
+    """
+    client = _Client(tables=_V2_OBJECTS, schema_version=None)
+
+    _writer(client).ensure_schema()
+
+    assert any(call[0].startswith("CREATE TABLE") for call in client.calls)
+    assert client.calls[-1][1]["version"] == 2
+
+
+def test_a_catalog_written_by_a_newer_build_is_refused():
+    client = _Client(tables=_V2_OBJECTS, schema_version=3)
+
+    with pytest.raises(CatalogSchemaVersionError, match="schema version 3"):
+        _writer(client).ensure_schema()
+
+
+def test_a_stamped_catalog_with_a_dropped_table_is_refused():
+    """Half a drop is worse than none, so it is not quietly completed.
+
+    Recreating the manifest empty beside a populated inventory is exactly the
+    state that publishes nothing and hides everything.
+    """
+    client = _Client(
+        tables=[name for name in _V2_OBJECTS if name != "dmi_snapshot_manifest"],
+        schema_version=2,
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    assert "missing `dmi_snapshot_manifest`" in str(raised.value)
+    assert "CatalogReconciler.rebuild()" in str(raised.value)
+
+
+def test_a_populated_inventory_with_an_empty_manifest_is_refused():
+    """The defect this whole check exists for, in its purest form.
+
+    `committed_pack_ids` reads the inventory and reports every pack as already
+    indexed; readers bound their snapshot by the manifest, which names none of
+    them. Every capture in those packs is durable and invisible, and an
+    indexing pass over them reports success.
+    """
+    client = _Client(
+        tables=_V2_OBJECTS, schema_version=2, inventory_rows=4, manifest_rows=0
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    assert "dmi_pack_inventory_raw" in message and "dmi_snapshot_manifest" in message
+    assert "empty but reports success" in message
+
+
+def test_a_version_two_catalog_is_accepted():
+    client = _Client(
+        tables=_V2_OBJECTS, schema_version=2, inventory_rows=4, manifest_rows=2
+    )
+
+    _writer(client).ensure_schema()
+
+    assert any("CREATE OR REPLACE VIEW" in call[0] for call in client.calls)
+
+
+def test_an_empty_version_two_catalog_is_accepted():
+    """Nothing indexed yet is not the same state as membership gone missing."""
+    client = _Client(tables=_V2_OBJECTS, schema_version=2)
+
+    _writer(client).ensure_schema()
+
+    assert any("CREATE OR REPLACE VIEW" in call[0] for call in client.calls)
+
+
 
 # --- catalog facets ---------------------------------------------------------
 
@@ -298,9 +509,11 @@ def test_ensure_schema_declares_every_facet_as_a_materialized_column():
 
     writer.ensure_schema()
 
-    create = [
-        call[0] for call in client.calls if call[0].startswith("CREATE TABLE")
-    ][0]
+    create = next(
+        call[0]
+        for call in client.calls
+        if call[0].startswith("CREATE TABLE") and "dmi_capture_raw" in call[0]
+    )
     for name, kind, expression in _FACET_COLUMNS:
         assert f"{name} {kind} MATERIALIZED {expression}" in create
 

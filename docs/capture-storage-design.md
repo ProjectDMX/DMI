@@ -351,6 +351,78 @@ from the reader's without either side failing.
 the inventory only after a successful publish, so every pack in it is already
 published.
 
+### Catalog schema versions and rebuild
+
+`{prefix}_schema_version` holds one row naming the schema the catalog was
+created with. The current version is **2**. `ensure_schema` writes that row
+last, once every other object exists, so a stamped catalog is a complete one.
+A catalog with no such table is version 1 by definition -- that is the only
+thing it can be, because version 1 never had one.
+
+`ensure_schema` checks compatibility before issuing any DDL and refuses
+anything it did not create, raising `CatalogSchemaVersionError`:
+
+| State found | Outcome |
+|---|---|
+| no catalog objects at all | fresh install: create everything, stamp version 2 |
+| version table stamped 2, all objects present | proceed; the DDL is idempotent |
+| version table present, no row | an install of this build that died before stamping: rerun the DDL, then stamp |
+| catalog objects present, no version table | refuse -- version 1 |
+| stamped anything but 2 | refuse -- a newer writer owns this catalog |
+| stamped 2, an object missing | refuse -- partially dropped |
+| pack inventory populated, snapshot manifest empty | refuse -- membership is gone |
+
+Version 2 is not reachable from version 1 by any statement `ensure_schema`
+could issue, and both ways it fails are silent. `CREATE TABLE IF NOT EXISTS` is
+a no-op against a live table, so the descriptor table keeps the version 1 sort
+key and stays open to the merge deletion the new key exists to prevent.
+Membership is worse: it moved from `{prefix}_pack_commit_log` to
+`{prefix}_snapshot_manifest`, and on an upgraded catalog the manifest is empty
+while `{prefix}_pack_inventory_raw` is full, so the next indexing pass skips
+every pre-existing pack as already committed, no pack ever reaches the
+manifest, and every capture indexed before the upgrade becomes invisible to
+every reader. Measured on a version 1 catalog holding four captures in two
+packs: `ensure_schema()` returned cleanly, the sort key was unchanged, the
+following rebuild reported `skipped=2 indexed=0`, and the reader returned 0 of
+4 captures.
+
+#### Rebuilding the catalog
+
+Every `{prefix}_` object is derived from immutable packs, so the supported
+recovery -- from a version mismatch, from a partial drop, from any catalog
+state that is not trusted -- is to delete all of it and reconcile the object
+store again:
+
+1. Stop every indexer writing that prefix.
+2. Drop all of its objects, views before the tables they read:
+   `{prefix}_capture`, `{prefix}_pack_inventory`, `{prefix}_capture_raw`,
+   `{prefix}_pack_inventory_raw`, `{prefix}_capture_version_claims`,
+   `{prefix}_index_watermark`, `{prefix}_snapshot_manifest`,
+   `{prefix}_schema_version`, and version 1's `{prefix}_pack_commit_log`.
+3. Run `ensure_schema()`. It finds nothing, creates the version 2 schema, and
+   stamps it.
+4. Run `CatalogReconciler.rebuild(prefix=...)` once per pack store. It lists
+   the objects, range-reads each pack footer, and repopulates the descriptors,
+   the snapshot manifest, the pack inventory and the watermark from them.
+
+**Dropping `{prefix}_pack_inventory_raw` is mandatory, not optional.**
+`committed_pack_ids` reads that inventory to decide which packs are already
+indexed. An inventory left in place reports every pre-existing pack as done, so
+step 4 skips all of them, writes no descriptors, publishes an empty version,
+and returns an `IndexResult` with no failures -- a rebuild that reports success
+and produces an empty catalog, while the captures stay durable in object
+storage and unreachable through every reader. That state is why the last row of
+the table above exists: an inventory with rows beside an empty manifest is
+refused at `ensure_schema`, which is the earliest point at which anything can
+still see the mistake.
+
+The check lives there rather than in `CatalogReconciler` deliberately.
+`rebuild()` is also the periodic full sweep of a healthy catalog -- it is
+expected to skip everything it has already indexed -- so it cannot refuse a
+populated catalog, and it reaches the writer only through `CatalogWriter`,
+which exposes no way to ask whether membership is intact. `ensure_schema` runs
+before any indexer starts and sees the tables directly.
+
 ClickHouse stores:
 
 - pack inventory and integrity state;
@@ -1079,6 +1151,12 @@ bytes, and retained failure details all have explicit caps.
   one. Two reads of the view a moment apart can therefore see different
   snapshots; a caller that needs a stable selection uses the reader, which pins
   a watermark and carries it in the cursor.
+- The catalog schema is versioned and checked, never migrated. There is no
+  in-place upgrade path and no online one: the recovery from a version mismatch
+  is the full rebuild above, which re-reads every pack footer in the store, so
+  its cost scales with the corpus and readers see a catalog that is empty and
+  then partial while it runs. Nothing is lost -- the packs are the durable copy
+  -- but a large deployment needs to plan the window.
 
 ## Phase 5 limitations
 

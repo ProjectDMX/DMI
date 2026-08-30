@@ -7,7 +7,11 @@ from time import time_ns
 from typing import Protocol, Sequence
 from uuid import uuid4
 
-from .catalog import PackIdentity, SnapshotPublishRaceError
+from .catalog import (
+    CatalogSchemaVersionError,
+    PackIdentity,
+    SnapshotPublishRaceError,
+)
 from .model import CaptureDescriptor, PackRef
 
 
@@ -109,6 +113,27 @@ _CAPTURE_TABLE_ORDER = (
     "store_id", "pack_id",
 )
 
+# The catalog schema this build creates and reads.
+#
+# Version 1 is what earlier builds created. It is recognised by the absence of
+# a ``{prefix}_schema_version`` table, because it never had one.
+#
+# Version 2 appends ``(store_id, pack_id)`` to the descriptor sort key and
+# moves snapshot membership from ``{prefix}_pack_commit_log`` to
+# ``{prefix}_snapshot_manifest``. NEITHER change can be applied to a catalog
+# that already exists: ``CREATE TABLE IF NOT EXISTS`` is a no-op against a live
+# table, so the old ORDER BY survives silently, and nothing backfills the
+# manifest for the packs the inventory already lists -- ``committed_pack_ids``
+# would skip every one of them as already indexed, so they would never become
+# members of any snapshot and every pre-existing capture would be permanently
+# invisible, with no error anywhere.
+#
+# So the schema is checked, not migrated: ``ensure_schema`` refuses anything it
+# did not create, and the catalog is rebuilt from the packs instead. That is
+# affordable precisely because the catalog is derived -- see
+# ``_rebuild_instruction`` and docs/capture-storage-design.md.
+_SCHEMA_VERSION = 2
+
 
 class ClickHouseCatalogWriter:
     def __init__(
@@ -124,8 +149,29 @@ class ClickHouseCatalogWriter:
         self._watermark = f"{prefix}_index_watermark"
         self._manifest = f"{prefix}_snapshot_manifest"
         self._version_claims = f"{prefix}_capture_version_claims"
+        self._schema_table = f"{prefix}_schema_version"
+        # Version 1's membership table. Nothing here reads or writes it; it is
+        # named so that a version 1 catalog is recognised and so the rebuild
+        # instruction lists every table an operator has to drop.
+        self._commit_log = f"{prefix}_pack_commit_log"
+        # Everything ensure_schema owns, in drop order: views before the tables
+        # they read, so replaying this list top to bottom always succeeds.
+        self._objects = (
+            ("VIEW", self._capture_view),
+            ("VIEW", self._pack_view),
+            ("TABLE", self._capture_raw),
+            ("TABLE", self._pack_raw),
+            ("TABLE", self._version_claims),
+            ("TABLE", self._watermark),
+            ("TABLE", self._manifest),
+            ("TABLE", self._schema_table),
+        )
 
     def ensure_schema(self) -> None:
+        # Before any DDL: a statement issued against an incompatible catalog is
+        # either a silent no-op (CREATE ... IF NOT EXISTS) or an edit to
+        # something this build does not understand.
+        self._verify_schema_compatibility()
         database = _quoted(self._config.database)
         capture_raw = f"{database}.{_quoted(self._capture_raw)}"
         capture_view = f"{database}.{_quoted(self._capture_view)}"
@@ -134,6 +180,15 @@ class ClickHouseCatalogWriter:
         watermark = f"{database}.{_quoted(self._watermark)}"
         manifest = f"{database}.{_quoted(self._manifest)}"
         self._client.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
+        # First, so an install interrupted partway leaves a catalog that says
+        # "this build, unfinished" rather than one that is indistinguishable
+        # from version 1 and refused forever. The row that stamps it is written
+        # last, once every object below exists.
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._schema_table)} (
+version UInt32, applied_at_ns UInt64
+) ENGINE = MergeTree ORDER BY version"""
+        )
         self._client.execute(
             f"""CREATE TABLE IF NOT EXISTS {capture_raw} (
 capture_id String, tenant_id String, experiment_id String, run_id String,
@@ -277,6 +332,144 @@ index_version UInt64, store_id LowCardinality(String), pack_id UUID
         self._client.execute(
             f"CREATE VIEW IF NOT EXISTS {pack_view} AS "
             f"SELECT {pack_public} FROM {pack_raw} FINAL"
+        )
+        # Last, and conditional: the stamp means "every object above exists",
+        # so an install that died partway is never mistaken for a finished one.
+        # The condition is server-side, which is what makes a rerun idempotent
+        # without a read-then-write window.
+        self._client.execute(
+            f"INSERT INTO {database}.{_quoted(self._schema_table)} "
+            "(version, applied_at_ns) "
+            "SELECT toUInt32(%(version)s), toUInt64(%(applied_at_ns)s) "
+            "FROM system.one WHERE (SELECT count() FROM "
+            f"{database}.{_quoted(self._schema_table)}) = 0",
+            {"version": _SCHEMA_VERSION, "applied_at_ns": time_ns()},
+        )
+
+    def _verify_schema_compatibility(self) -> None:
+        """Refuse a catalog this build cannot read, instead of half-upgrading it.
+
+        Every failure here is a state where carrying on would be silent. The
+        DDL below cannot repair any of them: ``CREATE TABLE IF NOT EXISTS`` is
+        a no-op against a live table, so it leaves an older table exactly as it
+        found it, and where a table is missing it creates an empty one beside
+        rows that assume it is full. Either way the run succeeds and the next
+        indexing pass skips every pack the inventory still lists, leaving those
+        captures durable in object storage and invisible to every reader with
+        no error anywhere. Refusing is the only outcome an operator can act on.
+        """
+        present = self._present_objects()
+        if not present:
+            return  # A fresh install: nothing of ours is there to be wrong.
+        if self._schema_table not in present:
+            raise CatalogSchemaVersionError(
+                f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
+                f"is at schema version 1 and this build requires version "
+                f"{_SCHEMA_VERSION}: it has no `{self._schema_table}` table, "
+                "which is what version 1 looks like. Version 1 cannot be "
+                "upgraded in place. Its descriptor table is sorted on capture "
+                "identity alone and this build requires (store_id, pack_id) on "
+                "the end of that key -- CREATE TABLE IF NOT EXISTS cannot alter "
+                "an existing ORDER BY, so the old key would survive silently "
+                "and a merge could still delete one of two rows describing one "
+                f"capture. Snapshot membership also moved from `{self._commit_log}` "
+                f"to `{self._manifest}`, and nothing backfills it. "
+                + self._rebuild_instruction()
+            )
+        recorded = self._recorded_schema_version()
+        if recorded is None:
+            # The table exists and nothing stamped it: an install of THIS build
+            # that died between creating the objects and recording the version.
+            # Re-running the DDL is exactly the right recovery.
+            return
+        if recorded != _SCHEMA_VERSION:
+            raise CatalogSchemaVersionError(
+                f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
+                f"is at schema version {recorded} and this build reads version "
+                f"{_SCHEMA_VERSION}. A higher version means a newer writer owns "
+                "this catalog: upgrade this build rather than writing to it. A "
+                "lower one cannot be upgraded in place -- the descriptor sort "
+                "key and the snapshot membership table both changed "
+                "incompatibly. " + self._rebuild_instruction()
+            )
+        missing = [name for _, name in self._objects if name not in present]
+        if missing:
+            raise CatalogSchemaVersionError(
+                f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
+                f"is stamped schema version {_SCHEMA_VERSION} but is missing "
+                + ", ".join(f"`{name}`" for name in missing)
+                + ". Recreating those empty beside tables that kept their rows "
+                "is not a repair, it is the dangerous state: a surviving pack "
+                "inventory makes the next pass skip every pack it lists, so "
+                "nothing refills what was dropped and those captures stay "
+                "durable in object storage and invisible to every reader. "
+                + self._rebuild_instruction()
+            )
+        if self._inventory_without_membership():
+            raise CatalogSchemaVersionError(
+                f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
+                f"lists packs in `{self._pack_raw}` while `{self._manifest}` is "
+                "empty, so every pack is already marked indexed and none belongs "
+                "to any snapshot. An indexing pass would skip all of them and "
+                "leave a catalog that is empty but reports success. "
+                + self._rebuild_instruction()
+            )
+
+    def _present_objects(self) -> set[str]:
+        """Which of this catalog's tables and views the server already holds.
+
+        Deliberately includes version 1's commit log: it is often the only
+        object left after a half-finished manual cleanup, and a catalog with it
+        still standing is not one to create tables next to.
+        """
+        names = [name for _, name in self._objects] + [self._commit_log]
+        rows = self._client.execute(
+            "SELECT name FROM system.tables "
+            "WHERE database = %(database)s AND name IN %(names)s",
+            {"database": self._config.database, "names": names},
+        )
+        return {row[0] for row in rows} & set(names)
+
+    def _recorded_schema_version(self) -> int | None:
+        """The stamped version, or None when the table holds no row yet."""
+        rows = self._client.execute(
+            f"SELECT version FROM {self._qualified(self._schema_table)} "
+            "ORDER BY version DESC LIMIT 1"
+        )
+        return rows[0][0] if rows else None
+
+    def _inventory_without_membership(self) -> bool:
+        """Is the replay guard populated while snapshot membership is empty?
+
+        That pair is the signature of a catalog whose membership was dropped or
+        never migrated: ``committed_pack_ids`` reads the inventory and reports
+        every pack as done, while readers bound their snapshot by a manifest
+        that names none of them.
+        """
+        packs, members = self._client.execute(
+            f"SELECT (SELECT count() FROM {self._qualified(self._pack_raw)}), "
+            f"(SELECT count() FROM {self._qualified(self._manifest)})"
+        )[0]
+        return bool(packs) and not members
+
+    def _rebuild_instruction(self) -> str:
+        """The one supported recovery, named in full so nobody has to guess."""
+        database = self._config.database
+        objects = ", ".join(
+            f"`{database}`.`{name}`"
+            for _, name in self._objects + (("TABLE", self._commit_log),)
+        )
+        return (
+            "The catalog is a derived projection over immutable packs, so "
+            "rebuilding it loses nothing: stop every indexer, drop ALL of its "
+            f"objects in this order (views first) -- {objects} -- then run "
+            "ensure_schema() and CatalogReconciler.rebuild() over each pack "
+            "store. Dropping the pack inventory is mandatory, not optional: "
+            "committed_pack_ids reads it to skip replays, so an inventory left "
+            "behind makes the rebuild skip every pack it exists to re-read and "
+            "publish an empty catalog without failing. See "
+            "docs/capture-storage-design.md, 'Catalog schema versions and "
+            "rebuild'."
         )
 
     def committed_pack_ids(

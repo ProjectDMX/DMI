@@ -78,6 +78,7 @@ _SCHEMA_OBJECTS = (
     ("TABLE", "capture_version_claims"),
     ("TABLE", "index_watermark"),
     ("TABLE", "snapshot_manifest"),
+    ("TABLE", "schema_version"),
 )
 
 
