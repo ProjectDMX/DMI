@@ -128,11 +128,45 @@ _CAPTURE_TABLE_ORDER = (
 # members of any snapshot and every pre-existing capture would be permanently
 # invisible, with no error anywhere.
 #
+# Version 3 adds ``publish_id`` to the watermark and the manifest, so that a
+# publish can verify it OWNS the version it wrote rather than merely that a row
+# for that version exists, and so that membership pairs a manifest row with the
+# watermark row of the same publish. ``CREATE TABLE IF NOT EXISTS`` adds no
+# column to a live table, so a version 2 catalog would keep both tables in
+# their old shape.
+#
 # So the schema is checked, not migrated: ``ensure_schema`` refuses anything it
 # did not create, and the catalog is rebuilt from the packs instead. That is
 # affordable precisely because the catalog is derived -- see
 # ``_rebuild_instruction`` and docs/capture-storage-design.md.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+
+# Settings for the statements whose answers DECIDE something: which claimant
+# owns a version, whether a publish landed, what the published head is. Each of
+# those is a read-back of the reader's own write, and the sole-claimant
+# protocols are only sound while a later write always observes an earlier one.
+#
+# A single ClickHouse node gives that for free. A ReplicatedMergeTree does not:
+# a replica serves reads from whatever log entries it has fetched, so a
+# read-back can miss a row another publisher has already committed and two
+# claimants can both see themselves alone. ``select_sequential_consistency``
+# makes the read wait for the replica to reach the latest committed log entry,
+# or throw -- either is an outcome the protocol can act on, where a stale answer
+# is not.
+#
+# Set on the reads rather than validated at construction, deliberately. There is
+# nothing to validate at construction: the tables need not exist yet, an
+# operator can convert them to Replicated afterwards, and a warning nobody reads
+# is not enforcement. Setting it is unconditional and costs nothing on a
+# non-replicated table, where the server accepts and ignores it (verified on
+# 25.12).
+#
+# The write-side half is NOT set here and is not claimed: ClickHouse pairs
+# ``select_sequential_consistency`` with ``insert_quorum`` on the writes, and a
+# replicated deployment also has to make the DESCRIPTOR inserts quorum-durable
+# before their watermark row, which is a deployment decision about latency, not
+# something this module can pick. See docs/catalog-descriptor-key.md.
+_DECIDING_READ = {"select_sequential_consistency": 1}
 
 
 class ClickHouseCatalogWriter:
@@ -245,10 +279,15 @@ ORDER BY (store_id, pack_id)"""
         # an indexing call instead. Plain MergeTree, because it is a log --
         # ReplacingMergeTree would eventually collapse the history a pinned
         # snapshot reads.
+        #
+        # ``publish_id`` names the publish that wrote the row. Verifying it is
+        # what turns "a row for version V exists" into "version V is MINE"; see
+        # publish_snapshot.
         self._client.execute(
             f"""CREATE TABLE IF NOT EXISTS {watermark} (
-index_version UInt64, published_at_ns UInt64, indexed_rows UInt64, indexed_packs UInt32
-) ENGINE = MergeTree ORDER BY index_version"""
+index_version UInt64, publish_id UUID, published_at_ns UInt64,
+indexed_rows UInt64, indexed_packs UInt32
+) ENGINE = MergeTree ORDER BY (index_version, publish_id)"""
         )
 
         # The version allocator's append-only claim ledger. A claimant owns a
@@ -276,10 +315,17 @@ version UInt64, claim_id UUID, claimed_at_ns UInt64
         # watermark table (see the reader's membership clause), and a publish
         # that loses the race never writes that watermark row -- so the rows it
         # left behind are inert.
+        #
+        # ``publish_id`` carries the same identity the watermark row carries, so
+        # membership pairs the two: a manifest row counts only when the SAME
+        # publish also reached the watermark table. Keying on index_version
+        # alone would make the contents of snapshot V whatever anyone wrote at
+        # V, which is a weaker claim than owning V.
         self._client.execute(
             f"""CREATE TABLE IF NOT EXISTS {manifest} (
-index_version UInt64, store_id LowCardinality(String), pack_id UUID
-) ENGINE = MergeTree ORDER BY (index_version, store_id, pack_id)"""
+index_version UInt64, publish_id UUID, store_id LowCardinality(String),
+pack_id UUID
+) ENGINE = MergeTree ORDER BY (index_version, publish_id, store_id, pack_id)"""
         )
 
         capture_public = ", ".join(_CAPTURE_COLUMNS[:-1])
@@ -318,12 +364,19 @@ index_version UInt64, store_id LowCardinality(String), pack_id UUID
         # The statement reads the manifest and the watermark, which is why both
         # tables are created above it. Reordered, ensure_schema breaks on a
         # fresh server only -- a rerun finds them already there.
+        #
+        # The bound is the publish PAIR, matching the reader's membership
+        # clause: a manifest row counts once the publish that wrote it also
+        # reached the watermark table. Every row in the watermark table is at or
+        # below the published head by definition, so the pair test subsumes the
+        # ``index_version <= max`` bound this used to carry.
         self._client.execute(
             f"CREATE OR REPLACE VIEW {capture_view} AS "
             f"SELECT {capture_public} FROM {capture_raw} FINAL "
             "WHERE (store_id, pack_id) IN ("
             f"SELECT store_id, pack_id FROM {manifest} "
-            f"WHERE index_version <= (SELECT max(index_version) FROM {watermark})"
+            "WHERE (index_version, publish_id) IN "
+            f"(SELECT index_version, publish_id FROM {watermark})"
             ")"
         )
         # The inventory needs no such bound. CatalogIndexer.index writes it
@@ -388,9 +441,12 @@ index_version UInt64, store_id LowCardinality(String), pack_id UUID
                 f"is at schema version {recorded} and this build reads version "
                 f"{_SCHEMA_VERSION}. A higher version means a newer writer owns "
                 "this catalog: upgrade this build rather than writing to it. A "
-                "lower one cannot be upgraded in place -- the descriptor sort "
-                "key and the snapshot membership table both changed "
-                "incompatibly. " + self._rebuild_instruction()
+                "lower one cannot be upgraded in place -- every version below "
+                "this one differs in the shape of a table that already exists "
+                "(the descriptor sort key, the membership table, the publish "
+                "identity columns), and neither CREATE TABLE IF NOT EXISTS nor "
+                "any statement ensure_schema issues can alter one. "
+                + self._rebuild_instruction()
             )
         missing = [name for _, name in self._objects if name not in present]
         if missing:
@@ -514,15 +570,28 @@ index_version UInt64, store_id LowCardinality(String), pack_id UUID
         Membership rows first, then the watermark row that admits them. A
         reader's membership clause requires both, so the order is what makes a
         half-finished publish invisible rather than partially visible.
+
+        Both rows carry one ``publish_id``, minted here and used again to check
+        the result, so that what this call verifies is "version V is MINE" and
+        not merely "some row for V exists".
         """
         self._validate_version(index_version)
         self._validate_version(published_at_ns)
         watermark = self._qualified(self._watermark)
+        # One identity per ATTEMPT, not per allocated version: what has to be
+        # verified is that this particular statement's row is the one standing
+        # at V, and a second attempt at one version is a different write. Reusing
+        # the allocator's claim_id would make a duplicate publish at V read back
+        # as its own, which is the failure this identity exists to catch.
+        publish_id = str(uuid4())
         if refs:
             self._client.execute(
                 f"INSERT INTO {self._qualified(self._manifest)} "
-                "(index_version, store_id, pack_id) VALUES",
-                [(index_version, ref.store_id, ref.pack_id) for ref in refs],
+                "(index_version, publish_id, store_id, pack_id) VALUES",
+                [
+                    (index_version, publish_id, ref.store_id, ref.pack_id)
+                    for ref in refs
+                ],
             )
         # The barrier and the visibility write are ONE server-side statement,
         # so the gap between "am I the highest?" and "I am now visible" holds
@@ -541,24 +610,38 @@ index_version UInt64, store_id LowCardinality(String), pack_id UUID
         # docs/catalog-descriptor-key.md.
         self._client.execute(
             f"INSERT INTO {watermark} "
-            "(index_version, published_at_ns, indexed_rows, indexed_packs) "
-            "SELECT %(index_version)s, %(published_at_ns)s, "
+            "(index_version, publish_id, published_at_ns, indexed_rows, "
+            "indexed_packs) "
+            "SELECT %(index_version)s, toUUID(%(publish_id)s), "
+            "%(published_at_ns)s, "
             "toUInt64(%(indexed_rows)s), toUInt32(%(indexed_packs)s) "
             "FROM system.one "
             f"WHERE (SELECT max(index_version) FROM {watermark}) "
             "< %(index_version)s",
             {
                 "index_version": index_version,
+                "publish_id": publish_id,
                 "published_at_ns": published_at_ns,
                 "indexed_rows": indexed_rows,
                 "indexed_packs": indexed_packs,
             },
+            settings=_DECIDING_READ,
         )
-        landed = self._client.execute(
-            f"SELECT count() FROM {watermark} WHERE index_version = %(version)s",
+        # Ownership, not occupancy. ``count() > 0`` answers "does a row for V
+        # exist?", and a row written by anything else -- a stray operator
+        # INSERT, a second build, a publisher whose statement overlapped this
+        # one -- reads as success. The sole-claimant allocator makes a foreign
+        # row at V unlikely, not impossible, and reading the identity back costs
+        # exactly what counting cost: the same one-row scan of the same key
+        # range. So this asks whether the row standing at V is the one this
+        # statement wrote, and treats anything else as a lost race.
+        owners = self._client.execute(
+            f"SELECT toString(publish_id) FROM {watermark} "
+            "WHERE index_version = %(version)s",
             {"version": index_version},
+            settings=_DECIDING_READ,
         )
-        if not landed or not landed[0] or not landed[0][0]:
+        if {self._text(row[0]) for row in owners} != {publish_id}:
             raise SnapshotPublishRaceError(
                 f"catalog version {index_version} lost the publish race; "
                 "nothing it wrote is visible"
@@ -579,10 +662,11 @@ index_version UInt64, store_id LowCardinality(String), pack_id UUID
         picks a candidate above everything already claimed or published,
         inserts a claim for it, then reads the claims for that version back: a
         claimant proceeds ONLY when its post-insert read shows it is the sole
-        claimant. On a server with monotonic read-your-writes visibility
-        (single node; replicated setups need select_sequential_consistency),
+        claimant. On a server with monotonic read-your-writes visibility -- a
+        single node gives it, and the read-back below carries
+        ``select_sequential_consistency`` so that a replica does too --
         for two claimants of the same version the later insert always observes
-        the earlier one, so at most one of them sees a singleton -- contested
+        the earlier one, so at most one of them sees a singleton; contested
         versions are abandoned by everyone who sees the contest. Every
         RETURNED version is durably in the claims table, so later allocations
         always start above it: monotonic + unique, with no clock anywhere in
@@ -611,6 +695,7 @@ index_version UInt64, store_id LowCardinality(String), pack_id UUID
                 f"{self._qualified(self._version_claims)} "
                 "WHERE version = %(version)s",
                 {"version": candidate},
+                settings=_DECIDING_READ,
             )
             if {self._text(row[0]) for row in owners} == {claim_id}:
                 return candidate
@@ -621,8 +706,11 @@ index_version UInt64, store_id LowCardinality(String), pack_id UUID
         )
 
     def _max_version(self, table: str, column: str, message: str) -> int:
+        # A deciding read: the answer becomes the floor a claim is picked above,
+        # and the head a publish must beat.
         rows = self._client.execute(
-            f"SELECT max({column}) FROM {self._qualified(table)}"
+            f"SELECT max({column}) FROM {self._qualified(table)}",
+            settings=_DECIDING_READ,
         )
         if not rows or not rows[0] or rows[0][0] is None:
             return 0
@@ -671,7 +759,7 @@ index_version UInt64, store_id LowCardinality(String), pack_id UUID
         if isinstance(value, bytes):
             return value.decode("utf-8")
         if not isinstance(value, str):
-            raise ValueError("ClickHouse returned an invalid pack identity")
+            raise ValueError("ClickHouse returned a non-text identifier")
         return value
 
     @staticmethod

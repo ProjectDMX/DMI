@@ -327,8 +327,16 @@ additionally bounded to the packs the latest published snapshot contains:
 ```sql
 WHERE (store_id, pack_id) IN (
   SELECT store_id, pack_id FROM {prefix}_snapshot_manifest
-  WHERE index_version <= (SELECT max(index_version) FROM {prefix}_index_watermark))
+  WHERE (index_version, publish_id) IN (
+    SELECT index_version, publish_id FROM {prefix}_index_watermark))
 ```
+
+The bound pairs `(index_version, publish_id)` rather than matching the version
+alone, exactly as the reader's membership clause does. Every row in the
+watermark table is at or below the published head by definition, so the pair
+test subsumes an `index_version <= max(...)` bound and additionally requires the
+manifest row and the watermark row to come from the **same publish**. See
+*Publish identity* below.
 
 Without that bound the view showed descriptor rows from batches that were
 written and never published, and rows orphaned by a crashed indexing pass --
@@ -351,29 +359,91 @@ from the reader's without either side failing.
 the inventory only after a successful publish, so every pack in it is already
 published.
 
+### Publish identity
+
+Every call to `publish_snapshot` mints one `publish_id` and writes it on both
+rows it produces: the manifest rows for the packs it is admitting, and the
+watermark row that admits them. It then reads that column back and compares it
+to its own value.
+
+That check answers *"is version V mine?"*. The one it replaced -- `SELECT
+count() FROM {prefix}_index_watermark WHERE index_version = V` -- answered
+*"does a row for V exist?"*, and a row written by anything else read as success:
+an operator's `INSERT`, a second build sharing the prefix, a publisher whose
+conditional statement overlapped this one. The caller was then told it had
+published a snapshot it did not publish, and `CatalogIndexer` went on to record
+those packs in the replay inventory, so no later pass would index them again.
+The sole-claimant allocator makes a foreign row at V unlikely, not impossible,
+and reading the identity back costs what counting cost: the same one-row scan
+of the same key range.
+
+The identity is per **attempt**, not per allocated version. A second attempt at
+one version is a different write, and reusing the allocator's `claim_id` would
+let it read the first attempt's row back as its own and report success for a
+statement that inserted nothing.
+
+Carrying the same identity on the manifest rows is what makes membership a
+claim about a publish rather than about a number. On `index_version` alone the
+*contents* of snapshot V would be whatever anyone wrote at V, while the winner
+of V unwittingly published them; owning a version and owning its membership are
+separate claims and the catalog needs both.
+
+#### Reads that decide something
+
+The claim read-back in `allocate_version`, the published-head reads, the
+conditional watermark `INSERT` and the publish verification all carry
+`select_sequential_consistency`. Each is a read-back of the reader's own write,
+and the sole-claimant protocols are sound only while a later write always
+observes an earlier one. A single ClickHouse node gives that; a
+`ReplicatedMergeTree` replica serves reads from whatever log entries it has
+fetched, so a read-back can miss a row another claimant has already committed
+and both claimants can see themselves alone.
+
+It is set on the reads rather than validated at construction because there is
+nothing to validate at construction: the tables need not exist yet, an operator
+can convert them to `Replicated` afterwards, and a warning nobody reads is not
+enforcement. Setting it is unconditional and costs nothing on a non-replicated
+table, where the server accepts and ignores it.
+
+The write-side half is **not** set and is not claimed. ClickHouse pairs
+`select_sequential_consistency` with `insert_quorum` on the writes, and a
+replicated deployment also has to make the descriptor inserts quorum-durable
+before their watermark row, or a failover can leave a published version whose
+rows are on a replica that is gone. Both are latency decisions about a
+deployment, not something this module can pick.
+
 ### Catalog schema versions and rebuild
 
 `{prefix}_schema_version` holds one row naming the schema the catalog was
-created with. The current version is **2**. `ensure_schema` writes that row
+created with. The current version is **3**. `ensure_schema` writes that row
 last, once every other object exists, so a stamped catalog is a complete one.
 A catalog with no such table is version 1 by definition -- that is the only
 thing it can be, because version 1 never had one.
+
+| Version | What it changed |
+|---|---|
+| 1 | the original schema; membership in `{prefix}_pack_commit_log`, descriptors sorted on capture identity alone |
+| 2 | `(store_id, pack_id)` appended to the descriptor sort key; membership moved to `{prefix}_snapshot_manifest` |
+| 3 | `publish_id` added to the watermark and the manifest |
 
 `ensure_schema` checks compatibility before issuing any DDL and refuses
 anything it did not create, raising `CatalogSchemaVersionError`:
 
 | State found | Outcome |
 |---|---|
-| no catalog objects at all | fresh install: create everything, stamp version 2 |
-| version table stamped 2, all objects present | proceed; the DDL is idempotent |
+| no catalog objects at all | fresh install: create everything, stamp the current version |
+| version table stamped at the current version, all objects present | proceed; the DDL is idempotent |
 | version table present, no row | an install of this build that died before stamping: rerun the DDL, then stamp |
 | catalog objects present, no version table | refuse -- version 1 |
-| stamped anything but 2 | refuse -- a newer writer owns this catalog |
-| stamped 2, an object missing | refuse -- partially dropped |
+| stamped at any other version | refuse -- a newer writer owns this catalog, or an older one this build cannot upgrade |
+| stamped current, an object missing | refuse -- partially dropped |
 | pack inventory populated, snapshot manifest empty | refuse -- membership is gone |
 
-Version 2 is not reachable from version 1 by any statement `ensure_schema`
-could issue, and both ways it fails are silent. `CREATE TABLE IF NOT EXISTS` is
+No version is reachable from the one below it by any statement `ensure_schema`
+could issue: each one changes the shape of a table that already exists, and
+neither `CREATE TABLE IF NOT EXISTS` nor `CREATE OR REPLACE VIEW` alters a live
+table's columns or sort key. The version 1 to version 2 step is the worked
+example, and both ways it fails are silent. `CREATE TABLE IF NOT EXISTS` is
 a no-op against a live table, so the descriptor table keeps the version 1 sort
 key and stays open to the merge deletion the new key exists to prevent.
 Membership is worse: it moved from `{prefix}_pack_commit_log` to
@@ -399,7 +469,7 @@ store again:
    `{prefix}_pack_inventory_raw`, `{prefix}_capture_version_claims`,
    `{prefix}_index_watermark`, `{prefix}_snapshot_manifest`,
    `{prefix}_schema_version`, and version 1's `{prefix}_pack_commit_log`.
-3. Run `ensure_schema()`. It finds nothing, creates the version 2 schema, and
+3. Run `ensure_schema()`. It finds nothing, creates the current schema, and
    stamps it.
 4. Run `CatalogReconciler.rebuild(prefix=...)` once per pack store. It lists
    the objects, range-reads each pack footer, and repopulates the descriptors,

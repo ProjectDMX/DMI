@@ -48,7 +48,8 @@ class _CatalogServer:
     def __init__(self):
         self.claims: list[tuple[int, str]] = []
         self.watermarks: list[int] = []
-        self.manifest: list[tuple[int, str, str]] = []
+        self.publishes: list[tuple[int, str]] = []
+        self.manifest: list[tuple[int, str, str, str]] = []
         self.inserts: list[str] = []
         self.on_owner_read = None
 
@@ -59,7 +60,8 @@ class _CatalogServer:
                 self.claims.extend((int(row[0]), str(row[1])) for row in params)
             elif "snapshot_manifest" in query:
                 self.manifest.extend(
-                    (int(row[0]), str(row[1]), str(row[2])) for row in params
+                    (int(row[0]), str(row[1]), str(row[2]), str(row[3]))
+                    for row in params
                 )
             elif "index_watermark" in query:
                 # The conditional publish, enforced: a version only lands when
@@ -67,9 +69,14 @@ class _CatalogServer:
                 version = int(params["index_version"])
                 if version > max(self.watermarks, default=0):
                     self.watermarks.append(version)
+                    self.publishes.append((version, params["publish_id"]))
             return []
-        if "count()" in query and "index_watermark" in query:
-            return [(self.watermarks.count(params["version"]),)]
+        if "publish_id" in query and "index_watermark" in query:
+            return [
+                (publish_id,)
+                for version, publish_id in self.publishes
+                if version == params["version"]
+            ]
         if "version_claims" in query:
             if "max(version)" in query:
                 return [(max((v for v, _ in self.claims), default=None),)]

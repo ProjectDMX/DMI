@@ -205,6 +205,17 @@ without a contract change:
   harmless now that pack identity is in the descriptor sort key: `index_version`
   there is only a tiebreaker among byte-identical rows and never decides
   visibility.
+- **The publish verifies that it owns the version, not that the version is
+  occupied.** Each attempt mints a `publish_id`, writes it on its manifest rows
+  and on its watermark row, and reads that column back. The check it replaced --
+  `count() > 0` for the version -- treated a row written by anything else as
+  success, so a publisher could be told it had published a snapshot it did not
+  publish and would then record those packs in the replay inventory, where no
+  later pass would pick them up. Membership pairs `(index_version, publish_id)`
+  for the same reason: on the version alone, the *contents* of snapshot V are
+  whatever anyone wrote at V. The sole-claimant allocator makes a foreign row at
+  V unlikely, not impossible, and reading the identity back costs exactly what
+  counting cost.
 - `index()` orders itself descriptors -> publish -> pack inventory. The
   inventory is the replay guard, so writing it before a successful publish
   would let a crash leave a pack skipped forever *and* invisible. Last means a

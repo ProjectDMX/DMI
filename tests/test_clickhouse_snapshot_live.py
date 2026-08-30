@@ -235,6 +235,111 @@ def test_a_pinned_snapshot_does_not_gain_a_slower_indexers_packs():
         assert reader.get_by_ids(late_ids, tenant_id=tenant, watermark=pinned) == ()
 
 
+def test_a_foreign_row_at_this_version_is_not_reported_as_a_publish():
+    """"Does a row for V exist?" is not "is V mine?", over a live server.
+
+    A row for the version arrives from somewhere this publisher does not
+    control -- an operator's INSERT, a second build, a publisher whose
+    statement overlapped this one. The conditional INSERT then writes nothing,
+    because V is no longer strictly above the head, and a ``count()`` check sees
+    the foreign row and calls that success: the caller is told it published a
+    snapshot it did not publish, and `CatalogIndexer` records the packs in the
+    replay inventory so no later pass ever indexes them again.
+
+    Reading ``publish_id`` back turns that into the lost race it is. The
+    manifest rows this attempt left behind are inert twice over -- the publish
+    that wrote them never reached the watermark, and membership pairs the two.
+    """
+    corpus = synthetic_descriptors(3)
+    tenant = corpus[0].metadata.tenant_id
+    ids = [item.capture_id for item in corpus]
+    foreign = str(uuid4())
+
+    with _catalog() as (writer, reader, client, config):
+        version = writer.allocate_version()
+        writer.write_descriptors(corpus, index_version=version)
+
+        # Somebody else's row lands at this publisher's version.
+        client.execute(
+            f"INSERT INTO `{config.database}`.`{config.table_prefix}_index_watermark` "
+            "(index_version, publish_id, published_at_ns, indexed_rows, "
+            "indexed_packs) VALUES",
+            [(version, foreign, 1, 0, 0)],
+        )
+
+        with pytest.raises(SnapshotPublishRaceError):
+            _publish(writer, version, refs=_refs(corpus), rows=len(corpus))
+
+        # The foreign row is still the only one at V: nothing this publisher
+        # wrote is visible under it.
+        assert client.execute(
+            "SELECT toString(publish_id) FROM "
+            f"`{config.database}`.`{config.table_prefix}_index_watermark` "
+            "WHERE index_version = %(version)s",
+            {"version": version},
+        ) == [(foreign,)]
+        current = reader.current_watermark()
+        assert int(current) == version
+        assert reader.get_by_ids(ids, tenant_id=tenant, watermark=current) == (), (
+            "manifest rows entered a snapshot under a watermark row written by "
+            "someone else"
+        )
+
+        # And retrying above it publishes normally.
+        retry = writer.allocate_version()
+        _publish(writer, retry, refs=_refs(corpus), rows=len(corpus))
+        fresh = reader.current_watermark()
+        assert {
+            item.capture_id
+            for item in reader.get_by_ids(ids, tenant_id=tenant, watermark=fresh)
+        } == set(ids)
+
+
+def test_the_deciding_reads_carry_sequential_consistency_to_the_server():
+    """The setting is applied, and the server accepts it on these tables.
+
+    Asserting the kwarg alone would pass against a server that rejects the
+    setting; asserting only that the suite runs would pass against code that
+    never sets it. This does both at once: a proxy records what rides on each
+    statement while a real ClickHouse executes it.
+    """
+    corpus = synthetic_descriptors(2)
+
+    with _catalog() as (writer, reader, client, config):
+        recorded: list[tuple[str, object]] = []
+
+        class _Recording:
+            def execute(self, query, params=None, **kwargs):
+                recorded.append((query, kwargs.get("settings")))
+                return client.execute(query, params, **kwargs)
+
+        taps = ClickHouseCatalogWriter(_Recording(), config)
+        version = taps.allocate_version()
+        taps.write_descriptors(corpus, index_version=version)
+        _publish(taps, version, refs=_refs(corpus), rows=len(corpus))
+        taps.commit_packs(_refs(corpus), index_version=version)
+
+        def _settings(fragment: str, kind: str) -> list:
+            return [
+                settings
+                for query, settings in recorded
+                if fragment in query and query.lstrip().startswith(kind)
+            ]
+
+        consistent = {"select_sequential_consistency": 1}
+        assert _settings("toString(claim_id)", "SELECT") == [consistent]
+        assert _settings("max(version)", "SELECT") == [consistent]
+        assert _settings("max(index_version)", "SELECT") == [consistent]
+        assert _settings("index_watermark", "INSERT") == [consistent]
+        assert _settings("toString(publish_id)", "SELECT") == [consistent]
+        # Bulk writes decide nothing and pay nothing.
+        assert _settings("capture_raw", "INSERT") == [None]
+        assert _settings("pack_inventory_raw", "INSERT") == [None]
+        # And the batch really is readable, so the settings did not merely fail
+        # quietly on the way.
+        assert len(reader.search(CaptureQuery(limit=10)).items) == len(corpus)
+
+
 def _copied_to_another_store(descriptors):
     """An operator copies the pack object into a second bucket, then reconciles.
 

@@ -3,9 +3,10 @@
 Reads are pinned to a watermark, so a selection resolves to the same captures
 for as long as it lives. The snapshot boundary is **the set of packs committed
 at or before that watermark**, read from an append-only snapshot manifest --
-not a range of descriptor versions. A manifest row counts only once its version
-also appears in the watermark log, which is what keeps a publish that lost its
-race from leaking packs into an already-pinned snapshot.
+not a range of descriptor versions. A manifest row counts only once the publish
+that wrote it -- ``(index_version, publish_id)``, not the version alone -- also
+appears in the watermark log, which is what keeps a publish that lost its race
+from leaking packs into an already-pinned snapshot.
 
 That distinction is load-bearing. Descriptor rows live in a
 ``ReplacingMergeTree``, which is defined to keep only the highest version per
@@ -323,20 +324,30 @@ class ClickHouseCaptureCatalog:
         """The packs inside the snapshot, as a subquery on (store_id, pack_id).
 
         Two conditions, and the second is the whole point. A manifest row is
-        written before its watermark row, so requiring the version to appear in
+        written before its watermark row, so requiring the publish to appear in
         the watermark table is what stops a publish that lost the race -- which
         never wrote one -- from leaking its packs into a snapshot that was
         pinned before it ran.
 
-        Pack identity is the PAIR: matching pack_id alone would let the same
+        That second test pairs ``(index_version, publish_id)`` rather than
+        matching the version alone, so a manifest row counts only when the SAME
+        publish reached the watermark. On the version alone, the CONTENTS of
+        snapshot V would be whatever anyone wrote at V -- a losing publisher's
+        rows, an operator's stray INSERT -- while the winner of V unwittingly
+        published them. Owning a version and owning its membership are separate
+        claims and both are needed.
+
+        Pack identity is the PAIR too: matching pack_id alone would let the same
         UUID published by a second store at a later version slip inside a
         pinned snapshot.
         """
         return (
             "(store_id, pack_id) IN (SELECT store_id, pack_id FROM "
             f"{self._qualified(self._manifest)} "
-            "WHERE index_version <= %(watermark)s AND index_version IN "
-            f"(SELECT index_version FROM {self._qualified(self._watermark_table)} "
+            "WHERE index_version <= %(watermark)s AND "
+            "(index_version, publish_id) IN "
+            "(SELECT index_version, publish_id FROM "
+            f"{self._qualified(self._watermark_table)} "
             "WHERE index_version <= %(watermark)s))"
         )
 

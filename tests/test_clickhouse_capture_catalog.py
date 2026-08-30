@@ -15,6 +15,7 @@ from dmi.storage.capture import (
     PackWriter,
     SnapshotPublishRaceError,
 )
+from dmi.storage.capture.clickhouse_catalog import _SCHEMA_VERSION
 
 
 pytestmark = pytest.mark.cpu
@@ -24,7 +25,7 @@ pytestmark = pytest.mark.cpu
 # writer: the compatibility check exists to notice one of them missing, so a
 # test that asked the writer which objects it expects could not see the writer
 # forget one.
-_V2_OBJECTS = (
+_CURRENT_OBJECTS = (
     "dmi_capture",
     "dmi_pack_inventory",
     "dmi_capture_raw",
@@ -57,6 +58,12 @@ class _Client:
         self.committed = []
         self.claims = []
         self.watermarks = []
+        self.publishes = []
+        # Rows at the version under test that this writer did not write: an
+        # operator's INSERT, a second build, a publisher whose statement
+        # overlapped. The point of reading publish_id back is that these are
+        # not success.
+        self.foreign_publishes = []
         self.tables = tuple(tables)
         self.schema_version = schema_version
         self.inventory_rows = inventory_rows
@@ -79,9 +86,16 @@ class _Client:
                 version = params["index_version"]
                 if version > max(self.watermarks, default=0):
                     self.watermarks.append(version)
+                    self.publishes.append((version, params["publish_id"]))
             return []
-        if "count()" in query and "index_watermark" in query:
-            return [(self.watermarks.count(params["version"]),)]
+        if "publish_id" in query and "index_watermark" in query:
+            return [
+                (publish_id,)
+                for version, publish_id in self.publishes
+                if version == params["version"]
+            ] + [
+                (publish_id,) for publish_id in self.foreign_publishes
+            ]
         # The version allocator's queries are answered from real claim state;
         # every other SELECT returns the canned rows.
         if "version_claims" in query:
@@ -187,11 +201,13 @@ def test_the_capture_view_is_bounded_to_the_published_snapshot():
         + ", ".join(_CAPTURE_COLUMNS[:-1])
         + " FROM `default`.`dmi_capture_raw` FINAL "
     )
+    # The bound is the publish PAIR, exactly as the reader's membership clause
+    # spells it: owning a version and owning its membership are separate claims.
     assert (
         "WHERE (store_id, pack_id) IN ("
         "SELECT store_id, pack_id FROM `default`.`dmi_snapshot_manifest` "
-        "WHERE index_version <= "
-        "(SELECT max(index_version) FROM `default`.`dmi_index_watermark`))"
+        "WHERE (index_version, publish_id) IN "
+        "(SELECT index_version, publish_id FROM `default`.`dmi_index_watermark`))"
     ) in view
     # No grouping, deliberately. The view's meaning is "published descriptor
     # rows, engine-deduplicated" -- one row per (capture, store, pack).
@@ -248,7 +264,11 @@ def test_publish_writes_membership_before_the_watermark_that_admits_it():
     # a pack that is skipped forever and never visible.
     assert "dmi_pack_inventory_raw" in inserts[3][0]
     assert inserts[0][1][0][0] == "capture-a"
-    assert inserts[1][1][0] == (42, ref.store_id, ref.pack_id)
+    # One publish identity on both rows, so membership pairs with the watermark.
+    version, publish_id, store_id, pack_id = inserts[1][1][0]
+    assert (version, store_id, pack_id) == (42, ref.store_id, ref.pack_id)
+    assert inserts[2][1]["publish_id"] == publish_id
+    assert client.publishes == [(42, publish_id)]
 
 
 def test_publish_is_a_single_statement_barrier_over_the_watermark():
@@ -295,6 +315,127 @@ def test_publish_below_the_published_head_raises_the_race_error():
     # The loser's watermark row never landed, which is exactly what makes the
     # manifest rows it already wrote inert.
     assert client.watermarks == [9]
+
+
+def test_publish_verifies_the_row_at_its_version_is_its_own():
+    """Ownership, not occupancy.
+
+    ``count() > 0`` answers "does a row for V exist?", so a row written by
+    anything else reads as success and the publisher reports a snapshot it did
+    not make. The check reads ``publish_id`` back and compares it to the one
+    this attempt minted.
+    """
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    writer.publish_snapshot(
+        index_version=42, refs=(), published_at_ns=7,
+        indexed_rows=0, indexed_packs=0,
+    )
+
+    check = next(
+        call for call in client.calls
+        if call[0].startswith("SELECT") and "index_watermark" in call[0]
+        and "publish_id" in call[0]
+    )
+    assert check[0] == (
+        "SELECT toString(publish_id) FROM `default`.`dmi_index_watermark` "
+        "WHERE index_version = %(version)s"
+    )
+    assert check[1] == {"version": 42}
+    # And nothing counts rows any more: a count cannot tell whose row it is.
+    assert not any(
+        "count()" in call[0] and "dmi_index_watermark" in call[0]
+        for call in client.calls
+    )
+
+
+def test_a_foreign_row_at_the_published_version_is_not_success():
+    """The failure a count could not see.
+
+    The sole-claimant allocator makes a foreign row at V unlikely, not
+    impossible -- a stray operator INSERT, a second build, a publisher whose
+    statement overlapped this one. A publisher that finds anything but its own
+    identity standing at V has not published V and must say so.
+    """
+    client = _Client()
+    client.foreign_publishes = ["ffffffff-ffff-ffff-ffff-ffffffffffff"]
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    with pytest.raises(SnapshotPublishRaceError, match="lost the publish race"):
+        writer.publish_snapshot(
+            index_version=42, refs=(), published_at_ns=7,
+            indexed_rows=0, indexed_packs=0,
+        )
+
+
+def test_each_publish_attempt_mints_its_own_identity():
+    """A retry at one version is a different write, and must not read as its own.
+
+    Reusing the allocator's claim id would make a second attempt at V read the
+    FIRST attempt's row back as its own and report success for a statement that
+    inserted nothing.
+    """
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    writer.publish_snapshot(
+        index_version=42, refs=(), published_at_ns=7,
+        indexed_rows=0, indexed_packs=0,
+    )
+    with pytest.raises(SnapshotPublishRaceError):
+        writer.publish_snapshot(
+            index_version=42, refs=(), published_at_ns=8,
+            indexed_rows=0, indexed_packs=0,
+        )
+
+    identities = [
+        call[1]["publish_id"] for call in client.calls
+        if call[0].startswith("INSERT") and "dmi_index_watermark" in call[0]
+    ]
+    assert len(set(identities)) == 2
+
+
+def test_the_deciding_reads_carry_sequential_consistency():
+    """The read-backs the sole-claimant protocols rest on, and only those.
+
+    A replica answers from the log entries it has fetched, so a read-back can
+    miss a row another claimant has already committed and two claimants can both
+    see themselves alone. Descriptor and inventory inserts carry nothing: they
+    decide nothing.
+    """
+    from dmi.storage.capture.clickhouse_catalog import _DECIDING_READ
+
+    ref, descriptor = _descriptor()
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+
+    version = writer.allocate_version()
+    writer.write_descriptors([descriptor], index_version=version)
+    writer.publish_snapshot(
+        index_version=version, refs=[ref], published_at_ns=7,
+        indexed_rows=1, indexed_packs=1,
+    )
+    writer.commit_packs([ref], index_version=version)
+
+    def _settings(fragment: str, kind: str) -> list:
+        return [
+            call[2].get("settings")
+            for call in client.calls
+            if fragment in call[0] and call[0].lstrip().startswith(kind)
+        ]
+
+    assert _DECIDING_READ == {"select_sequential_consistency": 1}
+    # The claim read-back, the published-head reads, the conditional publish and
+    # its verification.
+    assert _settings("toString(claim_id)", "SELECT") == [_DECIDING_READ]
+    assert _settings("max(version)", "SELECT") == [_DECIDING_READ]
+    assert _settings("max(index_version)", "SELECT") == [_DECIDING_READ]
+    assert _settings("dmi_index_watermark", "INSERT") == [_DECIDING_READ]
+    assert _settings("toString(publish_id)", "SELECT") == [_DECIDING_READ]
+    # Bulk writes decide nothing and pay nothing.
+    assert _settings("dmi_capture_raw", "INSERT") == [None]
+    assert _settings("dmi_pack_inventory_raw", "INSERT") == [None]
 
 
 def test_commit_packs_writes_only_the_replay_inventory():
@@ -356,7 +497,7 @@ def test_compatibility_is_checked_before_any_ddl_is_issued():
     # with it still there is not one to create tables beside.
     assert client.calls[0][1] == {
         "database": "default",
-        "names": list(_V2_OBJECTS) + ["dmi_pack_commit_log"],
+        "names": list(_CURRENT_OBJECTS) + ["dmi_pack_commit_log"],
     }
 
 
@@ -377,7 +518,7 @@ def test_a_fresh_install_stamps_the_schema_version_last():
         if item.startswith("INSERT") and "dmi_schema_version" in item
     )
     assert stamp == len(statements) - 1
-    assert client.calls[stamp][1]["version"] == 2
+    assert client.calls[stamp][1]["version"] == _SCHEMA_VERSION
     # Conditional server-side, so a rerun against a stamped catalog inserts
     # nothing and no read-then-write window exists between the two.
     assert (
@@ -405,7 +546,7 @@ def test_a_version_one_catalog_is_refused_with_the_rebuild_procedure():
 
     message = str(raised.value)
     assert "schema version 1" in message
-    assert "requires version 2" in message
+    assert f"requires version {_SCHEMA_VERSION}" in message
     # Both incompatible changes are named, because an operator reading this has
     # to know the catalog cannot simply be altered into shape.
     assert "ORDER BY" in message and "(store_id, pack_id)" in message
@@ -425,18 +566,21 @@ def test_an_unstamped_install_of_this_build_is_completed_not_refused():
     far, so re-running the (idempotent) DDL is the repair, not a refusal that
     would wedge a half-created catalog forever.
     """
-    client = _Client(tables=_V2_OBJECTS, schema_version=None)
+    client = _Client(tables=_CURRENT_OBJECTS, schema_version=None)
 
     _writer(client).ensure_schema()
 
     assert any(call[0].startswith("CREATE TABLE") for call in client.calls)
-    assert client.calls[-1][1]["version"] == 2
+    assert client.calls[-1][1]["version"] == _SCHEMA_VERSION
 
 
 def test_a_catalog_written_by_a_newer_build_is_refused():
-    client = _Client(tables=_V2_OBJECTS, schema_version=3)
+    newer = _SCHEMA_VERSION + 1
+    client = _Client(tables=_CURRENT_OBJECTS, schema_version=newer)
 
-    with pytest.raises(CatalogSchemaVersionError, match="schema version 3"):
+    with pytest.raises(
+        CatalogSchemaVersionError, match=f"schema version {newer}"
+    ):
         _writer(client).ensure_schema()
 
 
@@ -447,8 +591,8 @@ def test_a_stamped_catalog_with_a_dropped_table_is_refused():
     state that publishes nothing and hides everything.
     """
     client = _Client(
-        tables=[name for name in _V2_OBJECTS if name != "dmi_snapshot_manifest"],
-        schema_version=2,
+        tables=[name for name in _CURRENT_OBJECTS if name != "dmi_snapshot_manifest"],
+        schema_version=_SCHEMA_VERSION,
     )
 
     with pytest.raises(CatalogSchemaVersionError) as raised:
@@ -467,7 +611,7 @@ def test_a_populated_inventory_with_an_empty_manifest_is_refused():
     indexing pass over them reports success.
     """
     client = _Client(
-        tables=_V2_OBJECTS, schema_version=2, inventory_rows=4, manifest_rows=0
+        tables=_CURRENT_OBJECTS, schema_version=_SCHEMA_VERSION, inventory_rows=4, manifest_rows=0
     )
 
     with pytest.raises(CatalogSchemaVersionError) as raised:
@@ -478,9 +622,9 @@ def test_a_populated_inventory_with_an_empty_manifest_is_refused():
     assert "empty but reports success" in message
 
 
-def test_a_version_two_catalog_is_accepted():
+def test_a_catalog_at_this_builds_version_is_accepted():
     client = _Client(
-        tables=_V2_OBJECTS, schema_version=2, inventory_rows=4, manifest_rows=2
+        tables=_CURRENT_OBJECTS, schema_version=_SCHEMA_VERSION, inventory_rows=4, manifest_rows=2
     )
 
     _writer(client).ensure_schema()
@@ -488,9 +632,9 @@ def test_a_version_two_catalog_is_accepted():
     assert any("CREATE OR REPLACE VIEW" in call[0] for call in client.calls)
 
 
-def test_an_empty_version_two_catalog_is_accepted():
+def test_an_empty_catalog_at_this_builds_version_is_accepted():
     """Nothing indexed yet is not the same state as membership gone missing."""
-    client = _Client(tables=_V2_OBJECTS, schema_version=2)
+    client = _Client(tables=_CURRENT_OBJECTS, schema_version=_SCHEMA_VERSION)
 
     _writer(client).ensure_schema()
 
@@ -611,7 +755,7 @@ def test_committed_pack_ids_rejects_non_text_identities():
     client.committed = [(5, "018f0000-0000-7000-8000-000000000001")]
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
 
-    with pytest.raises(ValueError, match="pack identity"):
+    with pytest.raises(ValueError, match="non-text identifier"):
         writer.committed_pack_ids([("garage", "a")])
 
 

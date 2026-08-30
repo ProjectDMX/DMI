@@ -211,23 +211,34 @@ class _Client:
     def __init__(self):
         self.inserted: list[tuple[str, list]] = []
         self.claims: list[tuple[int, str]] = []
+        self.watermarks: list[tuple[int, str]] = []
 
     def execute(self, query, params=None, **kwargs):
         if query.lstrip().upper().startswith("INSERT"):
             self.inserted.append((query, list(params or [])))
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
+            elif "index_watermark" in query:
+                # The publish barrier is server-side, so the fake enforces it:
+                # a version lands only strictly above the published head, and
+                # the row carries the identity the publisher will read back.
+                version = params["index_version"]
+                if version > max((v for v, _ in self.watermarks), default=0):
+                    self.watermarks.append((version, params["publish_id"]))
             return []
         if "version_claims" in query:
             if "max(version)" in query:
                 return [(max((v for v, _ in self.claims), default=None),)]
             wanted = params["version"]
             return [(cid,) for v, cid in self.claims if v == wanted]
-        if "index_watermark" in query:
-            published = [
-                p[0][0] for q, p in self.inserted if "index_watermark" in q
+        if "publish_id" in query and "index_watermark" in query:
+            return [
+                (publish_id,)
+                for version, publish_id in self.watermarks
+                if version == params["version"]
             ]
-            return [(max(published, default=None),)]
+        if "index_watermark" in query:
+            return [(max((v for v, _ in self.watermarks), default=None),)]
         return []
 
 

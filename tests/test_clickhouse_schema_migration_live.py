@@ -57,6 +57,7 @@ from dmi.storage.capture import (
     PackWriter,
     StoredObject,
 )
+from dmi.storage.capture.clickhouse_catalog import _SCHEMA_VERSION
 
 
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
@@ -318,7 +319,7 @@ def test_starting_against_a_version_one_catalog_is_refused(tmp_path: Path):
 
         message = str(raised.value)
         assert "schema version 1" in message
-        assert "requires version 2" in message
+        assert f"requires version {_SCHEMA_VERSION}" in message
         # Both incompatible changes, named: an operator has to know that no
         # ALTER gets them out of this.
         assert "ORDER BY" in message and "(store_id, pack_id)" in message
@@ -381,7 +382,7 @@ def test_the_documented_rebuild_restores_a_version_one_catalog(tmp_path: Path):
         assert result.indexed_rows == len(descriptors)
 
         # Version 2, with the sort key that was unreachable by any upgrade.
-        assert _recorded_version(client, config) == 2
+        assert _recorded_version(client, config) == _SCHEMA_VERSION
         assert _sort_key(client, config) == (
             "tenant_id, experiment_id, run_id, captured_at_ns, capture_id, "
             "store_id, pack_id"
@@ -455,13 +456,15 @@ def test_a_rebuild_that_keeps_the_inventory_is_refused_before_it_empties_the_cat
 # --- the version stamp -------------------------------------------------------
 
 
-def test_a_fresh_install_records_version_two_and_stays_idempotent(tmp_path: Path):
+def test_a_fresh_install_records_this_builds_version_and_stays_idempotent(
+    tmp_path: Path,
+):
     _, _, refs, descriptors = _packs(tmp_path, packs=1)
     with _server() as (client, config):
         writer = ClickHouseCatalogWriter(client, config)
 
         writer.ensure_schema()
-        assert _recorded_version(client, config) == 2
+        assert _recorded_version(client, config) == _SCHEMA_VERSION
 
         writer.write_descriptors(descriptors, index_version=1)
         writer.publish_snapshot(
@@ -479,7 +482,7 @@ def test_a_fresh_install_records_version_two_and_stays_idempotent(tmp_path: Path
         writer.ensure_schema()
 
         assert _count(client, config, "schema_version") == 1
-        assert _recorded_version(client, config) == 2
+        assert _recorded_version(client, config) == _SCHEMA_VERSION
         assert _count(client, config, "capture_raw") == len(descriptors)
         assert _count(client, config, "capture") == len(descriptors)
 
@@ -492,14 +495,14 @@ def test_a_catalog_stamped_by_a_newer_build_is_refused():
         client.execute(
             f"INSERT INTO `{config.database}`.`{config.table_prefix}_schema_version` "
             "(version, applied_at_ns) VALUES",
-            [(3, 2)],
+            [(_SCHEMA_VERSION + 1, 2)],
         )
 
         with pytest.raises(CatalogSchemaVersionError) as raised:
             writer.ensure_schema()
 
-        assert "schema version 3" in str(raised.value)
-        assert "reads version 2" in str(raised.value)
+        assert f"schema version {_SCHEMA_VERSION + 1}" in str(raised.value)
+        assert f"reads version {_SCHEMA_VERSION}" in str(raised.value)
 
 
 def test_a_catalog_missing_one_of_its_tables_is_refused():

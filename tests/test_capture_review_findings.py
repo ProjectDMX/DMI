@@ -159,6 +159,7 @@ class _Client:
         self.published: list[tuple[str, object]] = []
         self.claims: list[tuple[int, str]] = []
         self.watermarks: list[int] = []
+        self.publishes: list[tuple[int, str]] = []
 
     def execute(self, query, params=None, **kwargs):
         self.statements.append(query)
@@ -170,9 +171,14 @@ class _Client:
                 version = params["index_version"]
                 if version > max(self.watermarks, default=0):
                     self.watermarks.append(version)
+                    self.publishes.append((version, params["publish_id"]))
             return []
-        if "count()" in query and "index_watermark" in query:
-            return [(self.watermarks.count(params["version"]),)]
+        if "publish_id" in query and "index_watermark" in query:
+            return [
+                (publish_id,)
+                for version, publish_id in self.publishes
+                if version == params["version"]
+            ]
         # The version allocator's three queries need real state to answer.
         if "version_claims" in query:
             if "max(version)" in query:
