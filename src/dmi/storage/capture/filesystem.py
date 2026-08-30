@@ -48,47 +48,45 @@ def fsync_path_to_root(leaf: Path, root: Path) -> None:
     file whose staging was already reported durable.
     """
 
+    if leaf != root and root not in leaf.parents:
+        raise ValueError("leaf is not under root")
+
     current = leaf
     while True:
-        fd = os.open(current, os.O_RDONLY)
+        fd = os.open(current, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
         if current == root:
             return
+        current = current.parent
+
+
+def _filesystem_root(path: Path) -> Path:
+    """Return the highest ancestor on the filesystem containing ``path``."""
+
+    device = path.stat().st_dev
+    current = path
+    while current.parent != current:
         parent = current.parent
-        if parent == current:
-            raise ValueError("leaf is not under root")
+        if parent.stat().st_dev != device:
+            break
         current = parent
+    return current
 
 
 def fsync_new_root(root: Path) -> None:
-    """Make a possibly just-created root directory durable.
+    """Create ``root`` and durably publish its full filesystem path.
 
-    ``mkdir(parents=True, exist_ok=True)`` returns before either the new
-    directory or the parent entry naming it reaches disk, so a store or spool
-    root could vanish on power loss after construction reported success. The
-    root itself must fsync. Its entry lives in the parent directory, which is
-    fsynced best-effort only: the parent is often outside the caller's control
-    (a system temp directory, a mount point) and may deny opening -- raising
-    on EACCES there would refuse service over a directory this process never
-    promised durability for, while an openable parent still gets synced.
+    The durability boundary cannot depend on which ancestors happen to exist
+    at call time. A previous constructor may have created them and failed
+    before syncing their parent entries. Syncing to the filesystem root on
+    every construction makes retries and concurrent constructors safe too.
     """
 
-    fd = os.open(root, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    try:
-        parent_fd = os.open(root.parent, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
+    root.mkdir(parents=True, exist_ok=True)
+    fsync_path_to_root(root, _filesystem_root(root))
 
 
 def validate_pack_source(pack: PackSource) -> None:
@@ -178,7 +176,6 @@ class FilesystemPackStore:
         if not store_id or len(store_id.encode("utf-8")) > 128:
             raise ValueError("store_id must be non-empty and at most 128 bytes")
         self.root = Path(root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
         fsync_new_root(self.root)
         self.store_id = store_id
 

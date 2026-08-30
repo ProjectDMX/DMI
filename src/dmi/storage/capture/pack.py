@@ -282,14 +282,28 @@ class PackWriter:
 
 
 class PackIndex:
-    def __init__(self, ref: PackRef, records: Iterable[_IndexedRecord]) -> None:
+    def __init__(
+        self,
+        ref: PackRef,
+        records: Iterable[_IndexedRecord],
+        *,
+        footer_read_bytes: int = 0,
+    ) -> None:
         self.ref = ref
         self.pack_id = ref.pack_id
         self._records = tuple(records)
+        self.footer_read_bytes = footer_read_bytes
 
     @staticmethod
     def trailer_size() -> int:
         return _TRAILER.size
+
+    @staticmethod
+    def max_footer_read_bytes(ref: PackRef) -> int:
+        """Return a metadata-only upper bound for a cold footer lookup."""
+
+        body_bytes = max(0, ref.object_bytes - _TRAILER.size)
+        return _TRAILER.size + min(MAX_FOOTER_BYTES, body_bytes)
 
     @classmethod
     def from_store(cls, store: PackStore, ref: PackRef) -> PackIndex:
@@ -325,7 +339,11 @@ class PackIndex:
         records = _parse_records(decoded, footer_offset)
         if len(records) != ref.record_count:
             raise PackFormatError("pack record count does not match its object metadata")
-        return cls(ref, records)
+        return cls(
+            ref,
+            records,
+            footer_read_bytes=_TRAILER.size + footer_length,
+        )
 
     def descriptors(self) -> tuple[CaptureDescriptor, ...]:
         return _descriptors(self.ref, self._records)
@@ -476,6 +494,8 @@ class PackReader:
         indexed = self._by_capture_id.get(descriptor.capture_id)
         if indexed is None:
             raise PackFormatError("descriptor is not present in this pack")
+        if descriptor.metadata != indexed.metadata:
+            raise PackFormatError("descriptor does not match the pack footer")
         expected = (
             indexed.offset,
             indexed.stored_length,

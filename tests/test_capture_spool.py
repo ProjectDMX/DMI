@@ -285,9 +285,23 @@ def test_a_new_spool_root_is_fsynced_at_construction(tmp_path: Path, monkeypatch
 
     DurablePackSpool(root, max_bytes=1024)
 
-    # Same root-creation gap as FilesystemPackStore: the spool's whole
-    # durability promise hangs off a root mkdir() alone never made durable.
-    assert synced == [root, root.parent]
+    boundary = root
+    device = root.stat().st_dev
+    while boundary.parent != boundary:
+        if boundary.parent.stat().st_dev != device:
+            break
+        boundary = boundary.parent
+    expected = []
+    current = root
+    while True:
+        expected.append(current)
+        if current == boundary:
+            break
+        current = current.parent
+
+    # A retry cannot tell whether an existing ancestor was previously made
+    # durable, so construction always syncs through a stable boundary.
+    assert synced == expected
 
 
 def test_spool_rejects_a_non_positive_byte_budget(tmp_path: Path):

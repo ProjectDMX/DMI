@@ -90,7 +90,6 @@ class DurablePackSpool:
         if type(max_bytes) is not int or max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
         self.root = Path(root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
         fsync_new_root(self.root)
         self.max_bytes = max_bytes
         self._lock = threading.Lock()

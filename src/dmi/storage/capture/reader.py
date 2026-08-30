@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import math
+import threading
 from typing import Mapping, Sequence
 
 from .model import (
@@ -32,6 +33,7 @@ from .summary import ArtifactRef, CoreTensorSummaryV1, decode_tensor, summarize_
 # Footer indexes verified during hydration are cached per pack, bounded so a
 # reader that touches many packs cannot hold every footer in memory at once.
 _FOOTER_CACHE_PACKS = 128
+_FOOTER_CACHE_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +80,41 @@ class _ObjectPlan:
     ranges: tuple[_ReadRange, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _FooterCacheEntry:
+    descriptors: Mapping[str, CaptureDescriptor]
+    wire_bytes: int
+
+
+class _ReadBudget:
+    """Budget metadata reads after reserving every planned payload read."""
+
+    def __init__(self, *, requests: int, bytes_: int) -> None:
+        self._requests = requests
+        self._bytes = bytes_
+
+    def consume(self, length: int) -> None:
+        if self._requests < 1:
+            raise HydrationLimitError("hydration request limit exceeded")
+        if length > self._bytes:
+            raise HydrationLimitError("hydration byte limit exceeded")
+        self._requests -= 1
+        self._bytes -= length
+
+
+class _BudgetedPackStore:
+    """The footer-only PackStore surface with pre-read budget checks."""
+
+    def __init__(self, store: PackStore, budget: _ReadBudget) -> None:
+        self._store = store
+        self._budget = budget
+        self.store_id = store.store_id
+
+    def read_range(self, ref: PackRef, offset: int, length: int) -> bytes:
+        self._budget.consume(length)
+        return self._store.read_range(ref, offset, length)
+
+
 class CaptureReader:
     def __init__(
         self,
@@ -100,9 +137,12 @@ class CaptureReader:
         # identity, so repeated hydrations of the same pack verify against
         # the footer without re-reading it.
         self._footer_cache: OrderedDict[
-            tuple[str, str, str], dict[str, CaptureDescriptor]
+            tuple[str, str, str], _FooterCacheEntry
         ] = OrderedDict()
         self._footer_cache_limit = _FOOTER_CACHE_PACKS
+        self._footer_cache_bytes_limit = _FOOTER_CACHE_BYTES
+        self._footer_cache_bytes = 0
+        self._footer_cache_lock = threading.Lock()
 
     def search(self, query: CaptureQuery) -> CapturePage:
         return self._catalog.search(query)
@@ -122,13 +162,21 @@ class CaptureReader:
     def estimate(self, selection: CaptureSelection) -> HydrationEstimate:
         descriptors = self._resolve(selection)
         plans = self._plan(descriptors)
+        payload_requests = sum(len(plan.ranges) for plan in plans)
+        payload_bytes = sum(item.length for plan in plans for item in plan.ranges)
+        footer_bytes = sum(
+            PackIndex.max_footer_read_bytes(
+                descriptors[plan.descriptor_indexes[0]].locator.pack_ref
+            )
+            for plan in plans
+        )
         return HydrationEstimate(
             capture_count=len(descriptors),
             object_count=len(plans),
-            request_count=sum(len(plan.ranges) for plan in plans),
+            request_count=payload_requests + 2 * len(plans),
             logical_bytes=sum(item.locator.decoded_length for item in descriptors),
             stored_bytes=sum(item.locator.stored_length for item in descriptors),
-            request_bytes=sum(item.length for plan in plans for item in plan.ranges),
+            request_bytes=payload_bytes + footer_bytes,
         )
 
     def hydrate(
@@ -144,18 +192,25 @@ class CaptureReader:
             raise ValueError("request_limit must be positive")
         descriptors = self._resolve(selection)
         plans = self._plan(descriptors)
-        request_count = sum(len(plan.ranges) for plan in plans)
-        if request_count > request_limit:
+        payload_requests = sum(len(plan.ranges) for plan in plans)
+        if payload_requests > request_limit:
             raise HydrationLimitError(
-                f"hydration request limit exceeded: {request_count} > {request_limit}"
+                f"hydration request limit exceeded: "
+                f"{payload_requests} > {request_limit}"
             )
-        request_bytes = sum(item.length for plan in plans for item in plan.ranges)
-        if request_bytes > byte_limit:
+        payload_bytes = sum(item.length for plan in plans for item in plan.ranges)
+        if payload_bytes > byte_limit:
             raise HydrationLimitError(
-                f"hydration byte limit exceeded: {request_bytes} > {byte_limit}"
+                f"hydration byte limit exceeded: {payload_bytes} > {byte_limit}"
             )
 
+        footer_budget = _ReadBudget(
+            requests=request_limit - payload_requests,
+            bytes_=byte_limit - payload_bytes,
+        )
+
         payloads: list[bytes | None] = [None] * len(descriptors)
+        verified_plans: list[tuple[_ObjectPlan, PackStore, PackRef]] = []
         for plan in plans:
             store = self._stores.get(plan.store_id)
             if store is None:
@@ -169,9 +224,15 @@ class CaptureReader:
             # two small range reads (trailer + footer) per uncached pack per
             # hydration -- the price of the footer being authoritative -- and
             # happens before any payload range is fetched.
-            footer = self._footer_descriptors(store, ref)
+            footer = self._footer_descriptors(store, ref, footer_budget)
             for index in plan.descriptor_indexes:
                 self._require_footer_match(descriptors[index], footer)
+            verified_plans.append((plan, store, ref))
+
+        # Footer verification is a separate first phase. A later pack cannot
+        # fail its metadata budget or descriptor check after earlier payloads
+        # have already been fetched.
+        for plan, store, ref in verified_plans:
             for read_range in plan.ranges:
                 block = store.read_range(ref, read_range.offset, read_range.length)
                 if len(block) != read_range.length:
@@ -260,18 +321,39 @@ class CaptureReader:
         return tuple(summaries)
 
     def _footer_descriptors(
-        self, store: PackStore, ref: PackRef
+        self,
+        store: PackStore,
+        ref: PackRef,
+        budget: _ReadBudget,
     ) -> Mapping[str, CaptureDescriptor]:
         key = (ref.store_id, ref.pack_id, ref.checksum)
-        cached = self._footer_cache.get(key)
-        if cached is not None:
-            self._footer_cache.move_to_end(key)
-            return cached
-        index = PackIndex.from_store(store, ref)
+        with self._footer_cache_lock:
+            cached = self._footer_cache.get(key)
+            if cached is not None:
+                self._footer_cache.move_to_end(key)
+                return cached.descriptors
+
+        index = PackIndex.from_store(_BudgetedPackStore(store, budget), ref)
         footer = {item.capture_id: item for item in index.descriptors()}
-        self._footer_cache[key] = footer
-        if len(self._footer_cache) > self._footer_cache_limit:
-            self._footer_cache.popitem(last=False)
+        entry = _FooterCacheEntry(footer, index.footer_read_bytes)
+        with self._footer_cache_lock:
+            cached = self._footer_cache.get(key)
+            if cached is not None:
+                self._footer_cache.move_to_end(key)
+                return cached.descriptors
+            if (
+                self._footer_cache_limit > 0
+                and entry.wire_bytes <= self._footer_cache_bytes_limit
+            ):
+                while self._footer_cache and (
+                    len(self._footer_cache) >= self._footer_cache_limit
+                    or self._footer_cache_bytes + entry.wire_bytes
+                    > self._footer_cache_bytes_limit
+                ):
+                    _, evicted = self._footer_cache.popitem(last=False)
+                    self._footer_cache_bytes -= evicted.wire_bytes
+                self._footer_cache[key] = entry
+                self._footer_cache_bytes += entry.wire_bytes
         return footer
 
     @staticmethod

@@ -73,6 +73,11 @@ def _sealed_pack(*records: CaptureRecord):
     return writer.seal()
 
 
+def _footer_read_bytes(sealed) -> int:
+    trailer_bytes = PackIndex.trailer_size()
+    return trailer_bytes + len(sealed.data) - trailer_bytes - sealed.footer_offset
+
+
 def test_pack_round_trip_preserves_analysis_coordinates_and_payloads():
     first = _record("capture-a", b"\x00\x00\x80?\x00\x00\x00@")
     second = _record("capture-b", b"\x00\x00@@\x00\x00\x80@", step=1)
@@ -87,6 +92,21 @@ def test_pack_round_trip_preserves_analysis_coordinates_and_payloads():
     assert descriptors[1].metadata.step_number == 1
     assert reader.read_payload(descriptors[0]) == first.payload
     assert reader.read_payload(descriptors[1]) == second.payload
+
+
+def test_pack_reader_rejects_metadata_that_contradicts_the_footer():
+    sealed = _sealed_pack(_record("capture-a", b"\x00\x00\x80?\x00\x00\x00@"))
+    reader = PackReader.from_bytes(sealed.data)
+    descriptor = reader.descriptors(
+        store_id="local", object_key="packs/a.dmi-pack"
+    )[0]
+    lying = replace(
+        descriptor,
+        metadata=replace(descriptor.metadata, dtype="int32", shape=(1, 2)),
+    )
+
+    with pytest.raises(PackFormatError, match="does not match the pack footer"):
+        reader.read_payload(lying)
 
 
 def test_pack_rejects_truncation_and_unknown_major_version():
@@ -340,13 +360,28 @@ def test_reader_coalesces_ranges_and_enforces_fetch_budget(tmp_path: Path):
 
     assert estimate.capture_count == 2
     assert estimate.object_count == 1
-    assert estimate.request_count == 1
+    assert estimate.request_count == 3
     assert estimate.request_bytes >= estimate.stored_bytes
+    assert store.ranges == [], "estimate must remain metadata-only"
+
+    payload_bytes = descriptors[1].locator.offset + 8 - descriptors[0].locator.offset
+    exact_read_bytes = payload_bytes + _footer_read_bytes(sealed)
+    assert estimate.request_bytes >= exact_read_bytes
 
     with pytest.raises(HydrationLimitError, match="byte limit"):
-        reader.hydrate(selection, byte_limit=estimate.request_bytes - 1)
+        reader.hydrate(
+            selection,
+            byte_limit=exact_read_bytes - 1,
+            request_limit=estimate.request_count,
+        )
+    assert sum(length for _, length in store.ranges) <= exact_read_bytes - 1
 
-    hydrated = reader.hydrate(selection, byte_limit=estimate.request_bytes)
+    store.ranges.clear()
+    hydrated = reader.hydrate(
+        selection,
+        byte_limit=exact_read_bytes,
+        request_limit=estimate.request_count,
+    )
 
     assert [item.capture_id for item in hydrated] == ["capture-a", "capture-b"]
     assert [item.payload for item in hydrated] == [first_payload, second_payload]
@@ -357,8 +392,90 @@ def test_reader_coalesces_ranges_and_enforces_fetch_budget(tmp_path: Path):
     assert store.ranges == [
         (len(sealed.data) - trailer_size, trailer_size),
         (sealed.footer_offset, len(sealed.data) - trailer_size - sealed.footer_offset),
-        (descriptors[0].locator.offset, estimate.request_bytes),
+        (descriptors[0].locator.offset, payload_bytes),
     ]
+
+
+def test_cold_footer_reads_are_bounded_before_any_payload_fetch(tmp_path: Path):
+    store = _RecordingStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    ref = store.put(sealed, "packs/a.dmi-pack")
+    descriptor = PackReader.from_bytes(sealed.data).descriptors(
+        store_id=ref.store_id, object_key=ref.object_key
+    )[0]
+    reader = CaptureReader(_Catalog((descriptor,)), {"local": store})
+    selection = reader.select(CaptureQuery(limit=10))
+    estimate = reader.estimate(selection)
+    exact_read_bytes = descriptor.locator.stored_length + _footer_read_bytes(sealed)
+
+    assert store.ranges == []
+    assert estimate.request_count == 3
+    assert estimate.request_bytes >= exact_read_bytes
+
+    with pytest.raises(HydrationLimitError, match="request limit"):
+        reader.hydrate(
+            selection,
+            byte_limit=estimate.request_bytes,
+            request_limit=1,
+        )
+    assert store.ranges == []
+
+    with pytest.raises(HydrationLimitError, match="byte limit"):
+        reader.hydrate(
+            selection,
+            byte_limit=exact_read_bytes - 1,
+            request_limit=estimate.request_count,
+        )
+    assert sum(length for _, length in store.ranges) <= exact_read_bytes - 1
+    assert all(offset != descriptor.locator.offset for offset, _ in store.ranges)
+
+    store.ranges.clear()
+    hydrated = reader.hydrate(
+        selection,
+        byte_limit=exact_read_bytes,
+        request_limit=estimate.request_count,
+    )
+    assert hydrated[0].payload == b"\x00" * 8
+    assert sum(length for _, length in store.ranges) == exact_read_bytes
+
+
+def test_all_pack_footers_are_verified_before_payload_reads(tmp_path: Path):
+    store = _RecordingStore(tmp_path, store_id="local")
+    descriptors = []
+    sealed_packs = []
+    for index, capture_id in enumerate(("capture-a", "capture-b"), start=1):
+        writer = PackWriter(
+            pack_id=UUID(int=index),
+            created_at_ns=1_700_000_000_000_000_000,
+            max_pack_bytes=1024 * 1024,
+        )
+        writer.append(_record(capture_id, b"\x00" * 8, step=index))
+        sealed = writer.seal()
+        sealed_packs.append(sealed)
+        ref = store.put(sealed, f"packs/{index}.dmi-pack")
+        descriptors.extend(
+            PackReader.from_bytes(sealed.data).descriptors(
+                store_id=ref.store_id, object_key=ref.object_key
+            )
+        )
+
+    reader = CaptureReader(_Catalog(tuple(descriptors)), {"local": store})
+    selection = reader.select(CaptureQuery(limit=10))
+    first_footer = _footer_read_bytes(sealed_packs[0])
+    trailer_bytes = PackIndex.trailer_size()
+
+    with pytest.raises(HydrationLimitError, match="byte limit"):
+        reader.hydrate(
+            selection,
+            byte_limit=16 + first_footer + trailer_bytes,
+            request_limit=6,
+        )
+
+    payload_offsets = {item.locator.offset for item in descriptors}
+    assert all(offset not in payload_offsets for offset, _ in store.ranges)
+    assert sum(length for _, length in store.ranges) <= (
+        16 + first_footer + trailer_bytes
+    )
 
 
 def test_reader_enforces_request_budget_before_fetching(tmp_path: Path):
@@ -409,7 +526,7 @@ def test_reader_rejects_a_short_object_store_range(tmp_path: Path):
     selection = reader.select(CaptureQuery(limit=10))
 
     with pytest.raises(PackIntegrityError, match="short range"):
-        reader.hydrate(selection, byte_limit=8)
+        reader.hydrate(selection, byte_limit=reader.estimate(selection).request_bytes)
 
 
 def test_reader_detects_corruption_in_a_partial_range(tmp_path: Path):
@@ -428,7 +545,7 @@ def test_reader_detects_corruption_in_a_partial_range(tmp_path: Path):
         handle.write(b"\xff")
 
     with pytest.raises(PackIntegrityError, match="record checksum"):
-        reader.hydrate(selection, byte_limit=descriptor.locator.stored_length)
+        reader.hydrate(selection, byte_limit=reader.estimate(selection).request_bytes)
 
 
 def test_hydration_rejects_a_catalog_row_that_re_describes_the_tensor(
@@ -531,6 +648,27 @@ def test_hydration_fetches_the_footer_once_per_pack(tmp_path: Path):
     trailer_reads = [item for item in store.ranges if item[0] == trailer_offset]
     assert len(trailer_reads) == 1, "the second hydration must hit the cache"
     assert list(reader._footer_cache) == [(ref.store_id, ref.pack_id, ref.checksum)]
+
+
+def test_an_oversized_footer_entry_is_not_cached(tmp_path: Path):
+    store = _RecordingStore(tmp_path, store_id="local")
+    sealed = _sealed_pack(_record("capture-a", b"\x00" * 8))
+    ref = store.put(sealed, "packs/a.dmi-pack")
+    descriptor = PackReader.from_bytes(sealed.data).descriptors(
+        store_id=ref.store_id, object_key=ref.object_key
+    )[0]
+    reader = CaptureReader(_Catalog((descriptor,)), {"local": store})
+    reader._footer_cache_bytes_limit = PackIndex.trailer_size()
+    selection = reader.select(CaptureQuery(limit=10))
+    limit = reader.estimate(selection).request_bytes
+
+    reader.hydrate(selection, byte_limit=limit)
+    reader.hydrate(selection, byte_limit=limit)
+
+    assert not reader._footer_cache
+    assert reader._footer_cache_bytes == 0
+    trailer_offset = len(sealed.data) - PackIndex.trailer_size()
+    assert sum(offset == trailer_offset for offset, _ in store.ranges) == 2
 
 
 def test_the_footer_cache_evicts_its_least_recent_pack(tmp_path: Path):
@@ -638,7 +776,9 @@ def test_the_link_race_loser_fsyncs_the_winners_dirent_before_acknowledging(
     assert synced == [(store.root / "packs", store.root)]
 
 
-def test_a_new_store_root_is_fsynced_at_construction(tmp_path: Path, monkeypatch):
+def test_a_nested_new_store_root_is_fsynced_to_its_filesystem_boundary(
+    tmp_path: Path, monkeypatch
+):
     import os
 
     synced: list[Path] = []
@@ -649,16 +789,27 @@ def test_a_new_store_root_is_fsynced_at_construction(tmp_path: Path, monkeypatch
         real_fsync(fd)
 
     monkeypatch.setattr("dmi.storage.capture.filesystem.os.fsync", record)
-    root = (tmp_path / "store").resolve()
+    root = (tmp_path / "new-a" / "new-b" / "store").resolve()
 
     FilesystemPackStore(root, store_id="local")
 
-    # mkdir(parents=True) returned before the new root or the parent entry
-    # naming it hit disk; both must be synced before the store reports ready.
-    assert synced == [root, root.parent]
+    boundary = root
+    device = root.stat().st_dev
+    while boundary.parent != boundary:
+        if boundary.parent.stat().st_dev != device:
+            break
+        boundary = boundary.parent
+    expected = []
+    current = root
+    while True:
+        expected.append(current)
+        if current == boundary:
+            break
+        current = current.parent
+    assert synced == expected
 
 
-def test_a_new_root_survives_a_parent_that_cannot_be_opened(
+def test_an_existing_root_fails_closed_without_ancestor_access(
     tmp_path: Path, monkeypatch
 ):
     import errno
@@ -677,9 +828,117 @@ def test_a_new_root_survives_a_parent_that_cannot_be_opened(
 
     monkeypatch.setattr("dmi.storage.capture.filesystem.os.open", deny_parent)
 
-    # Best effort on the parent only: a system temp directory may deny the
-    # open, and that must not refuse construction -- the root still syncs.
+    # The root might be left behind by an earlier constructor that failed
+    # before its parent entry became durable, so existence is not proof.
+    with pytest.raises(PermissionError):
+        fsync_new_root(root)
+
+
+def test_a_new_root_fails_closed_when_ancestor_fsync_is_denied(
+    tmp_path: Path, monkeypatch
+):
+    import errno
+    import os
+
+    from dmi.storage.capture.filesystem import fsync_new_root
+
+    root = (tmp_path / "new-a" / "new-b" / "store").resolve()
+    real_open = os.open
+
+    def deny_existing_ancestor(path, flags, *args, **kwargs):
+        if Path(path) == tmp_path.resolve():
+            raise PermissionError(errno.EACCES, "denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.open", deny_existing_ancestor)
+
+    with pytest.raises(PermissionError):
+        fsync_new_root(root)
+
+
+def test_root_creation_retry_resyncs_the_full_stable_chain(
+    tmp_path: Path, monkeypatch
+):
+    import errno
+    import os
+
+    from dmi.storage.capture.filesystem import fsync_new_root
+
+    root = (tmp_path / "new-a" / "new-b" / "store").resolve()
+    real_open = os.open
+    real_fsync = os.fsync
+    deny = True
+    synced: list[Path] = []
+
+    def fail_once(path, flags, *args, **kwargs):
+        if deny and Path(path) == tmp_path.resolve():
+            raise PermissionError(errno.EACCES, "denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    def record(fd: int) -> None:
+        synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        real_fsync(fd)
+
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.open", fail_once)
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.fsync", record)
+
+    with pytest.raises(PermissionError):
+        fsync_new_root(root)
+    assert root.is_dir(), "mkdir survives the failed durability acknowledgement"
+
+    deny = False
+    synced.clear()
     fsync_new_root(root)
+
+    assert synced[:4] == [root, root.parent, root.parent.parent, tmp_path.resolve()]
+
+
+def test_concurrent_root_constructor_fsyncs_independently(
+    tmp_path: Path, monkeypatch
+):
+    import os
+    import threading
+
+    from dmi.storage.capture.filesystem import fsync_new_root
+
+    root = (tmp_path / "new-a" / "new-b" / "store").resolve()
+    first_at_fsync = threading.Event()
+    release_first = threading.Event()
+    real_fsync = os.fsync
+    synced: dict[str, list[Path]] = {}
+    errors: list[BaseException] = []
+
+    def record(fd: int) -> None:
+        name = threading.current_thread().name
+        synced.setdefault(name, []).append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        if name == "first-constructor" and not first_at_fsync.is_set():
+            first_at_fsync.set()
+            if not release_first.wait(5):
+                raise TimeoutError("second constructor did not finish")
+        real_fsync(fd)
+
+    def create_first() -> None:
+        try:
+            fsync_new_root(root)
+        except BaseException as exc:  # surfaced in the parent test thread
+            errors.append(exc)
+
+    monkeypatch.setattr("dmi.storage.capture.filesystem.os.fsync", record)
+    first = threading.Thread(target=create_first, name="first-constructor")
+    first.start()
+    assert first_at_fsync.wait(5)
+
+    try:
+        # The directory already exists, but the first constructor has not
+        # made even its leaf durable. This constructor must not trust exists().
+        fsync_new_root(root)
+    finally:
+        release_first.set()
+        first.join(5)
+
+    assert not first.is_alive()
+    assert errors == []
+    assert synced[threading.current_thread().name] == synced["first-constructor"]
 
 
 def test_fsync_path_to_root_covers_every_new_directory(tmp_path: Path, monkeypatch):

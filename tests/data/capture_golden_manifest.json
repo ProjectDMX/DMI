@@ -285,8 +285,8 @@
     "capture_count": 10,
     "logical_bytes": 528,
     "object_count": 1,
-    "request_bytes": 528,
-    "request_count": 7,
+    "request_bytes": 7848,
+    "request_count": 9,
     "stored_bytes": 528
   },
   "manifest_version": 1,

@@ -366,15 +366,18 @@ A typical flow is:
 1. Query ClickHouse with bounded filters and pagination.
 2. Inspect core or custom summaries.
 3. Select capture IDs.
-4. Estimate payload bytes and request count.
+4. Estimate total read bytes and request count.
 5. Coalesce adjacent ranges within each pack.
 6. Fetch with byte, request, and concurrency limits.
 7. Verify checksums and decode selected records.
 
 Hydration also binds every catalog descriptor to the pack footer before any
 payload range is fetched: the footer index is loaded with the usual two small
-range reads (trailer, then footer), cached per pack in a bounded LRU on the
-reader, and a descriptor whose metadata or record locator contradicts the
+range reads (trailer, then footer), cached per pack in an LRU bounded by both
+pack count and serialized footer bytes, and charged to the same request and
+byte limits as payload reads. The zero-I/O estimate uses a safe cold-cache
+upper bound because the exact footer length is available only after reading
+the trailer. A descriptor whose metadata or record locator contradicts the
 footer fails hydration as a format error. This closes the catalog-trust gap
 where a re-described row (same bytes and CRC, different dtype or shape) would
 decode garbage. The catalog remains the query index and the footer the
@@ -840,7 +843,8 @@ hand-chosen bit patterns including both NaN encodings and both infinities.
 *No unrelated payload bytes* is not literal, because coalescing deliberately
 spans small gaps: with `max_coalesce_gap_bytes = 0` every read falls exactly
 inside a selected extent, and with the 4 KiB default the unrelated bytes stay
-within `gap x joins` and match `HydrationEstimate.request_bytes` exactly.
+within `gap x joins`. `HydrationEstimate.request_bytes` additionally includes
+a conservative cold-cache bound for footer verification.
 
 Reads are pinned to a watermark. `CaptureQuery.filter_hash` identifies a query
 independently of its page, keyset cursors carry that hash and the pinned

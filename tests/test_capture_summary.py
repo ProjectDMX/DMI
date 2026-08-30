@@ -264,7 +264,7 @@ def test_gate_amplification_stays_within_the_coalescing_bound(tmp_path: Path):
         wanted, catalog_watermark=WATERMARK, filter_hash="f" * 64
     )
     estimate = reader.estimate(selection)
-    # Warm the footer cache (see test_gate_reads_no_unrelated_bytes above).
+    # Warm the footer cache so the ranges below isolate payload coalescing.
     reader.hydrate(selection, byte_limit=1 << 20)
     store.ranges.clear()
     reader.hydrate(selection, byte_limit=1 << 20)
@@ -274,11 +274,12 @@ def test_gate_amplification_stays_within_the_coalescing_bound(tmp_path: Path):
     unrelated = read_bytes - stored_bytes
 
     # Coalescing does pull in unselected bytes -- that is the point -- but only
-    # up to the configured gap per join, and the estimate must predict it.
+    # up to the configured gap per join. The zero-I/O estimate is a safe cold
+    # upper bound that also includes trailer/footer verification.
     assert unrelated > 0, "expected coalescing to span the unselected payloads"
     assert unrelated <= gap * max(0, len(wanted) - 1)
-    assert read_bytes == estimate.request_bytes
-    assert estimate.read_amplification == pytest.approx(read_bytes / stored_bytes)
+    assert read_bytes <= estimate.request_bytes
+    assert estimate.read_amplification >= read_bytes / stored_bytes
 
 
 def test_estimate_predicts_reads_exactly_without_coalescing(tmp_path: Path):
@@ -293,15 +294,17 @@ def test_estimate_predicts_reads_exactly_without_coalescing(tmp_path: Path):
 
     selection = reader.select(CaptureQuery(limit=10))
     estimate = reader.estimate(selection)
-    # Warm the footer cache (see test_gate_reads_no_unrelated_bytes above):
-    # estimate() prices payload requests only, never the footer binding.
+    # The estimate remains zero-I/O and prices the cold footer conservatively;
+    # the warmed read below therefore uses no more than the estimate.
     reader.hydrate(selection, byte_limit=1 << 20)
     store.ranges.clear()
     reader.hydrate(selection, byte_limit=1 << 20)
 
-    assert sum(length for _, length in store.ranges) == estimate.request_bytes
-    assert len(store.ranges) == estimate.request_count
-    assert estimate.read_amplification == pytest.approx(1.0)
+    actual_bytes = sum(length for _, length in store.ranges)
+    assert actual_bytes == estimate.stored_bytes
+    assert actual_bytes <= estimate.request_bytes
+    assert len(store.ranges) <= estimate.request_count
+    assert estimate.read_amplification >= 1.0
 
 
 # --- core summary numerics ----------------------------------------------------
