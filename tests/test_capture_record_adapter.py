@@ -94,13 +94,13 @@ class _CollectingSink:
 
 
 class _FakeNativeReferenceSink:
-    def __init__(self, target) -> None:
+    def __init__(self, target, layout) -> None:
         self.target = target
-        self.release_calls = 0
+        self.layout = layout
 
-    def _release_target(self) -> None:
-        self.release_calls += 1
-        self.target = None
+    @property
+    def attached(self) -> bool:
+        return self.target.attached
 
 
 def _pipeline(sink, *, queue_bytes: int = 64) -> HostCapturePipeline:
@@ -210,6 +210,8 @@ def test_reference_sink_owns_bytes_and_flush_is_nonterminal_and_repeatable(
     pipeline = _pipeline(collecting)
     sink = CapturePackReferenceSink(pipeline)
     native_sink = sink.native_sink
+    assert sink.record_format.schema is CaptureRecordFormat.schema
+    assert native_sink.layout == CaptureRecordFormat.LAYOUT_NAME
     callback = native_sink.target
     callback._attach()
 
@@ -237,9 +239,7 @@ def test_reference_sink_owns_bytes_and_flush_is_nonterminal_and_repeatable(
     snapshot = sink.close(timeout=2)
     assert snapshot.persisted_records == 2
     assert snapshot.flush_manual == 2
-    assert native_sink.release_calls == 1
     assert sink.close(timeout=2) == snapshot
-    assert native_sink.release_calls == 1
 
 
 def test_reference_sink_surfaces_any_non_durable_admission(
@@ -267,7 +267,6 @@ def test_reference_sink_surfaces_any_non_durable_admission(
     snapshot = pipeline.snapshot()
     assert snapshot.oversized_records == 1
     assert snapshot.persisted_records == 0
-    assert native_sink.release_calls == 1
 
 
 def test_capture_package_keeps_reference_adapter_and_native_backend_lazy():

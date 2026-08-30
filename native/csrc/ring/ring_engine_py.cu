@@ -134,8 +134,8 @@ struct RingEnginePy::Impl {
             at::TensorOptions().dtype(at::kByte).device(at::kCUDA, dev_idx));
     }
 
-    Impl(ring::RingConfig cfg, std::shared_ptr<ring::RecordSink> sink)
-        : engine(std::move(cfg), std::move(sink)), record_mode(true)
+    Impl(ring::RingConfig cfg, std::shared_ptr<ring::RecordSinkLease> lease)
+        : engine(std::move(cfg), std::move(lease)), record_mode(true)
     {
         const auto& state = engine.ring_state();
         int dev_idx = 0;
@@ -171,8 +171,13 @@ RingEnginePy::RingEnginePy(RingConfig cfg, SubmitFn submit_fn) {
 }
 
 RingEnginePy::RingEnginePy(
-    RingConfig cfg, std::shared_ptr<ring::RecordSink> sink) {
-    impl_ = std::make_unique<Impl>(convert(cfg), std::move(sink));
+    RingConfig cfg, std::shared_ptr<ring::RecordSink> sink)
+    : RingEnginePy(
+          std::move(cfg), ring::RecordSinkLease::acquire(std::move(sink))) {}
+
+RingEnginePy::RingEnginePy(
+    RingConfig cfg, std::shared_ptr<ring::RecordSinkLease> lease) {
+    impl_ = std::make_unique<Impl>(convert(cfg), std::move(lease));
 }
 
 RingEnginePy::~RingEnginePy() = default;

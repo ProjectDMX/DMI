@@ -302,6 +302,31 @@ class _NativeValidationTarget:
         pass
 
 
+def test_record_sink_lease_rejects_reuse_without_detaching_owner():
+    from dmi.storage.capture import CaptureRecordFormat
+    from dmi.transport import native
+
+    sink = native.ReferencePythonCaptureSink(
+        _NativeValidationTarget(), CaptureRecordFormat.LAYOUT_NAME
+    )
+    lease = sink._acquire_engine()
+    config = native.RingConfig()
+    config.task_ring_entries = 8
+    config.payload_ring_bytes = 256
+    config.pinned_staging_bytes = 256
+    owner = native.RingEngine.create_record(config, lease)
+    assert sink.attached is True
+
+    with pytest.raises(RuntimeError, match="lease has already been claimed"):
+        native.RingEngine.create_record(config, lease)
+    assert sink.attached is True
+
+    owner.stop()
+    assert sink.attached is False
+    with pytest.raises(RuntimeError, match="cannot restart after stop"):
+        owner.start()
+
+
 @pytest.mark.parametrize(
     ("payload_slice", "metadata_json", "message"),
     (
@@ -344,18 +369,20 @@ def test_reference_native_sink_rejects_wire_drift_stably(
     from dmi.transport import native
 
     target = _NativeValidationTarget()
-    sink = native.ReferencePythonCaptureSink(target)
-    sink._attach_target()
+    sink = native.ReferencePythonCaptureSink(
+        target, CaptureRecordFormat.LAYOUT_NAME
+    )
     config = native.RingConfig()
     config.task_ring_entries = 8
     config.payload_ring_bytes = 256
     config.pinned_staging_bytes = 256
     engine = native.RingEngine.create_record(config, sink)
+    assert sink.attached is True
     engine.init()
     engine.start()
     source = torch.zeros(512, dtype=torch.uint8)
     descriptor = RecordDescriptor(
-        "capture_pack_reference_v1",
+        CaptureRecordFormat.LAYOUT_NAME,
         ((metadata_json, payload_slice),),
         output_id=7,
     )
@@ -372,8 +399,7 @@ def test_reference_native_sink_rejects_wire_drift_stably(
         assert errors[0] == errors[1]
     finally:
         engine.stop()
-        sink._detach_target()
-        sink._release_target()
+        assert sink.attached is False
 
 
 def _run_reference_gc_probe(root: Path) -> None:

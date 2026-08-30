@@ -17,7 +17,7 @@ class RingEngine {
 public:
     RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
                SubmitFn submit_fn);
-    RingEngine(const RingConfig& cfg, std::shared_ptr<RecordSink> sink);
+    RingEngine(const RingConfig& cfg, std::shared_ptr<RecordSinkLease> lease);
     ~RingEngine() noexcept;
 
     RingEngine(const RingEngine&)            = delete;
@@ -44,8 +44,12 @@ private:
     PinnedStaging   staging_;
     std::unique_ptr<DrainThread>  drain_;
     std::unique_ptr<P2PThread>    p2p_;
+    std::shared_ptr<RecordSinkLease> record_sink_lease_;
     std::shared_ptr<RecordSink> record_sink_;
     std::unique_ptr<RecordP2PThread> record_p2p_;
+    bool record_sink_released_{false};
+
+    void release_record_sink() noexcept;
 };
 
 }  // namespace ring

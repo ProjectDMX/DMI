@@ -35,19 +35,6 @@ from .pipeline import (
     PipelineSnapshot,
 )
 
-_LAYOUT = "capture_pack_reference_v1"
-_DTYPES = {
-    "bool": torch.bool,
-    "uint8": torch.uint8,
-    "int8": torch.int8,
-    "int16": torch.int16,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "int32": torch.int32,
-    "float32": torch.float32,
-    "int64": torch.int64,
-    "float64": torch.float64,
-}
 _LOSS_COUNTERS = (
     "dropped_records",
     "timed_out_records",
@@ -56,6 +43,13 @@ _LOSS_COUNTERS = (
     "rejected_closed_records",
     "failures",
 )
+
+
+def _torch_dtype_name(dtype: torch.dtype) -> str:
+    name = str(dtype)
+    if not name.startswith("torch."):
+        raise ValueError(f"unsupported torch dtype: {dtype!r}")
+    return name.removeprefix("torch.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,12 +77,13 @@ class CaptureRecordFormat:
     # particular, a gated-off empty tensor is indistinguishable from a real
     # empty capture, so this reference format rejects gates at bind time.
     supports_device_gate = False
+    LAYOUT_NAME = "capture_pack_reference_v1"
 
     schema = RecordSchema(
         (
             RecordLayout(
-                name=_LAYOUT,
-                table=_LAYOUT,
+                name=LAYOUT_NAME,
+                table=LAYOUT_NAME,
                 columns=(
                     RecordColumn("metadata_json", RecordCellType.STRING),
                     RecordColumn(
@@ -136,7 +131,7 @@ class CaptureRecordFormat:
         rows = []
         for item in slices:
             capture = item.metadata
-            if entry.dtype != _DTYPES[capture.dtype]:
+            if _torch_dtype_name(entry.dtype) != capture.dtype:
                 raise ValueError(
                     "capture metadata dtype does not match producer: "
                     f"{capture.dtype} != {entry.dtype}"
@@ -160,7 +155,7 @@ class CaptureRecordFormat:
                 ),
             ))
         return RecordDescriptor(
-            layout=_LAYOUT,
+            layout=self.LAYOUT_NAME,
             rows=tuple(rows),
             output_id=entry.output_id,
         )
@@ -267,7 +262,7 @@ class _CapturePackTarget:
             raise TypeError("reference capture payload must be a CPU tensor")
         if not payload.is_contiguous():
             raise ValueError("reference capture payload must be contiguous")
-        if payload.dtype != _DTYPES[metadata.dtype]:
+        if _torch_dtype_name(payload.dtype) != metadata.dtype:
             raise ValueError("capture metadata dtype does not match payload")
         if tuple(payload.shape) != metadata.shape:
             raise ValueError("capture metadata shape does not match payload")
@@ -326,9 +321,17 @@ class CapturePackReferenceSink:
 
     def __init__(self, pipeline: HostCapturePipeline) -> None:
         self._target = _CapturePackTarget(pipeline)
-        self._native_sink = native.ReferencePythonCaptureSink(self._target)
-        self._lock = threading.Lock()
-        self._closed = False
+        self._record_format = CaptureRecordFormat()
+        self._native_sink = native.ReferencePythonCaptureSink(
+            self._target,
+            self._record_format.LAYOUT_NAME,
+        )
+
+    @property
+    def record_format(self) -> CaptureRecordFormat:
+        """The format paired with this sink's versioned wire contract."""
+
+        return self._record_format
 
     @property
     def native_sink(self) -> Any:
@@ -339,26 +342,9 @@ class CapturePackReferenceSink:
     def close(self, *, timeout: float | None = None) -> PipelineSnapshot:
         """Terminally close the pipeline after checked engine completion."""
 
-        if self._target.attached:
+        if self._native_sink.attached:
             raise RuntimeError("close MonitoringEngine before the reference sink")
-        try:
-            snapshot = self._target.close(timeout=timeout)
-        except TimeoutError:
-            # The persistence worker is still running; retain the callback so
-            # callers can release the sink and retry terminal close.
-            raise
-        except BaseException:
-            self._release_target()
-            raise
-        self._release_target()
-        return snapshot
-
-    def _release_target(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-        self._native_sink._release_target()
+        return self._target.close(timeout=timeout)
 
 
 __all__ = [

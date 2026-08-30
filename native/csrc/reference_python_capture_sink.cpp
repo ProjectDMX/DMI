@@ -16,8 +16,6 @@ namespace py = pybind11;
 namespace dmi_capture {
 namespace {
 
-constexpr const char* kLayout = "capture_pack_reference_v1";
-
 [[noreturn]] void invalid(const std::string& message) {
     throw std::runtime_error("reference Python capture sink: " + message);
 }
@@ -100,31 +98,34 @@ py::object target_method(PyObject* target, const char* name) {
 
 }  // namespace
 
-ReferencePythonCaptureSink::ReferencePythonCaptureSink(PyObject* target)
-    : target_(target) {
+ReferencePythonCaptureSink::ReferencePythonCaptureSink(
+    PyObject* target, std::string layout)
+    : target_(target), layout_(std::move(layout)) {
     if (target == nullptr || target == Py_None) {
         throw std::invalid_argument(
             "ReferencePythonCaptureSink requires a Python target");
+    }
+    if (layout_.empty()) {
+        throw std::invalid_argument(
+            "ReferencePythonCaptureSink requires a record layout");
     }
     Py_INCREF(target);
 }
 
 ReferencePythonCaptureSink::~ReferencePythonCaptureSink() {
-    PyObject* target = target_.exchange(nullptr);
-    if (target == nullptr) return;
     if (!Py_IsInitialized()) {
         // Interpreter teardown cannot safely run arbitrary decref callbacks.
         return;
     }
     const PyGILState_STATE state = PyGILState_Ensure();
-    Py_DECREF(target);
+    Py_DECREF(target_);
     PyGILState_Release(state);
 }
 
 void ReferencePythonCaptureSink::submit(ring::RecordEnvelope envelope) {
-    if (!attached()) invalid("sink is not attached to a MonitoringEngine");
+    if (!engine_owned()) invalid("sink is not attached to a RingEngine");
     const auto& descriptor = envelope.descriptor;
-    if (descriptor.layout != kLayout) invalid("unexpected record layout");
+    if (descriptor.layout != layout_) invalid("unexpected record layout");
     if (descriptor.rows.empty()) invalid("descriptor must contain at least one row");
 
     for (const auto& row : descriptor.rows) {
@@ -142,7 +143,7 @@ void ReferencePythonCaptureSink::submit(ring::RecordEnvelope envelope) {
 
         py::gil_scoped_acquire gil;
         try {
-            target_method(target_.load(), "_submit_capture")(
+            target_method(target_, "_submit_capture")(
                 *metadata_json, std::move(typed_payload));
         } catch (const py::error_already_set& error) {
             // RecordConsumer stores submit failures in an exception_ptr and
@@ -157,47 +158,35 @@ void ReferencePythonCaptureSink::submit(ring::RecordEnvelope envelope) {
 }
 
 bool ReferencePythonCaptureSink::flush_and_wait(Duration timeout) {
-    if (!attached()) invalid("sink is not attached to a MonitoringEngine");
+    if (!engine_owned()) invalid("sink is not attached to a RingEngine");
     py::gil_scoped_acquire gil;
     const double timeout_s = std::chrono::duration<double>(timeout).count();
     return py::cast<bool>(
-        target_method(target_.load(), "_flush_capture")(timeout_s));
+        target_method(target_, "_flush_capture")(timeout_s));
 }
 
 void ReferencePythonCaptureSink::rethrow_if_failed() const {
-    if (!attached()) invalid("sink is not attached to a MonitoringEngine");
+    if (!engine_owned()) invalid("sink is not attached to a RingEngine");
     py::gil_scoped_acquire gil;
-    target_method(target_.load(), "_rethrow_capture")();
+    target_method(target_, "_rethrow_capture")();
 }
 
-void ReferencePythonCaptureSink::attach_target() {
-    std::lock_guard<std::mutex> lock(lifecycle_mu_);
-    if (attached_.load()) {
-        throw std::runtime_error(
-            "reference Python capture sink is already attached");
+void ReferencePythonCaptureSink::on_engine_acquire() {
+    py::gil_scoped_acquire gil;
+    target_method(target_, "_attach")();
+}
+
+void ReferencePythonCaptureSink::on_engine_release() noexcept {
+    if (!Py_IsInitialized()) return;
+    try {
+        py::gil_scoped_acquire gil;
+        target_method(target_, "_detach")();
+    } catch (py::error_already_set& error) {
+        error.discard_as_unraisable("ReferencePythonCaptureSink._detach");
+    } catch (...) {
+        // Engine teardown cannot leave a worker alive merely because an
+        // observability-only detach callback failed.
     }
-    py::gil_scoped_acquire gil;
-    target_method(target_.load(), "_attach")();
-    attached_.store(true);
-}
-
-void ReferencePythonCaptureSink::detach_target() {
-    std::lock_guard<std::mutex> lock(lifecycle_mu_);
-    if (!attached_.exchange(false)) return;
-    py::gil_scoped_acquire gil;
-    target_method(target_.load(), "_detach")();
-}
-
-void ReferencePythonCaptureSink::release_target() {
-    std::lock_guard<std::mutex> lock(lifecycle_mu_);
-    if (attached_.load()) {
-        throw std::runtime_error(
-            "cannot release an attached reference Python capture sink");
-    }
-    PyObject* target = target_.exchange(nullptr);
-    if (target == nullptr) return;
-    py::gil_scoped_acquire gil;
-    Py_DECREF(target);
 }
 
 }  // namespace dmi_capture

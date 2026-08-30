@@ -101,7 +101,6 @@ class MonitoringEngine:
         self._ring_transport: Optional[Any] = None
         self._ring_config: Optional[Any] = None
         self._record_mode = False
-        self._record_sink: Optional[Any] = None
 
         if host_engine is not None and db_config is not None:
             raise ValueError("Provide either host_engine or db_config, not both")
@@ -230,12 +229,9 @@ class MonitoringEngine:
                 self._host_engine,
                 record_schema,
             )
-        attach = getattr(record_sink, "_attach_target", None)
-        detach = getattr(record_sink, "_detach_target", None)
-        attached = False
-        if attach is not None:
-            attach()
-            attached = True
+        sink_lease = (
+            None if record_sink is None else record_sink._acquire_engine()
+        )
         record_engine = None
         record_transport = None
         runtime = None
@@ -252,7 +248,7 @@ class MonitoringEngine:
             self._ring_engine = None
             switched = True
 
-            sink_or_host = self._host_engine if record_sink is None else record_sink
+            sink_or_host = self._host_engine if record_sink is None else sink_lease
             record_engine = _native_engine.RingEngine.create_record(
                 ring_config,
                 sink_or_host,
@@ -264,7 +260,6 @@ class MonitoringEngine:
             self._ring_engine = record_engine
             self._ring_transport = record_transport
             self._record_mode = True
-            self._record_sink = record_sink
             _rt.activate(record_transport)
             return runtime
         except BaseException:
@@ -282,15 +277,11 @@ class MonitoringEngine:
                 self._ring_transport = None
                 self._ring_engine = None
                 self._record_mode = False
-                self._record_sink = None
-            # Drop every Python owner of the new native engine before
-            # detaching its callback target.  Its destructor is the final
-            # safety net if an explicit stop failed part-way through setup.
+            # Drop every Python owner of the new native engine.  Its native
+            # lease joins the record worker before releasing the sink.
             runtime = None
             record_transport = None
             record_engine = None
-            if attached and detach is not None:
-                detach()
             raise
 
     def flush_and_wait(self, timeout_s: float = 600.0) -> None:
@@ -347,7 +338,7 @@ class MonitoringEngine:
         _native_engine = _native_module()
 
         if self._ring_transport is not None:
-            old_record_sink = self._record_sink
+            old_record_mode = self._record_mode
             # Native null mode is device-global rather than RingEngine-local.
             # Restore its default before destroying a disabled transport so a
             # replacement starts capture-enabled without an extra startup sync.
@@ -358,11 +349,9 @@ class MonitoringEngine:
                 if ring_engine is not None:
                     ring_engine.stop()
             except Exception:
-                if old_record_sink is not None:
-                    # A Python-backed sink cannot be detached while its record
-                    # worker may still call it.  Preserve the old transport so
-                    # the caller can retry shutdown instead of switching under
-                    # a live worker.
+                if old_record_mode:
+                    # A record sink remains leased while its worker may still
+                    # call it. Preserve the transport so shutdown can retry.
                     raise
             try:
                 _rt.deactivate()
@@ -370,13 +359,6 @@ class MonitoringEngine:
                 pass
             self._ring_transport = None
             self._ring_engine = None
-            self._record_sink = None
-            detach = getattr(old_record_sink, "_detach_target", None)
-            if detach is not None:
-                try:
-                    detach()
-                except Exception:
-                    pass
 
         # Pass the DMXHostEngine C++ object directly; RingEngine builds a
         # SubmitFn that calls submit_direct without touching Python/GIL.
@@ -420,7 +402,7 @@ class MonitoringEngine:
         """Tear down backend resources."""
 
         if self._ring_transport is not None:
-            record_sink = self._record_sink
+            record_mode = self._record_mode
             stopped = False
             # Best-effort reset of the device-global native null flag.  This is
             # needed only after callers explicitly disabled capture; the normal
@@ -437,10 +419,9 @@ class MonitoringEngine:
                 stopped = True
             except Exception:
                 pass
-            # An explicit Python-backed sink must stay attached while a native
-            # worker may still be alive.  Leave the state intact so close can
-            # be retried; the adapter's close() will also refuse this order.
-            if record_sink is not None and not stopped:
+            # A record sink remains leased while a native worker may still be
+            # alive. Leave the state intact so close can be retried.
+            if record_mode and not stopped:
                 return
             try:
                 _rt = _ring_module()
@@ -450,13 +431,6 @@ class MonitoringEngine:
             self._ring_transport = None
             self._ring_engine = None
             self._record_mode = False
-            self._record_sink = None
-            detach = getattr(record_sink, "_detach_target", None)
-            if detach is not None:
-                try:
-                    detach()
-                except Exception:
-                    pass
 
         if self._host_engine is not None:
             try:

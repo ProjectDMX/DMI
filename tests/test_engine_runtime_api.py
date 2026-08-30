@@ -189,7 +189,7 @@ def test_replacing_disabled_ring_restores_native_null_mode(monkeypatch):
     assert deactivated == [True, True]
 
 
-def test_replacing_explicit_sink_keeps_it_attached_when_stop_fails(monkeypatch):
+def test_replacing_record_ring_preserves_it_when_stop_fails(monkeypatch):
     engine, old_transport, _old_ring = _engine_with_fake_ring()
     events = []
 
@@ -198,14 +198,8 @@ def test_replacing_explicit_sink_keeps_it_attached_when_stop_fails(monkeypatch):
             self.stop_calls += 1
             raise RuntimeError("stop failed before join")
 
-    class _Sink:
-        def _detach_target(self):
-            events.append("detach")
-
     old_ring = _FailingRing(old_transport)
-    sink = _Sink()
     engine._ring_engine = old_ring
-    engine._record_sink = sink
     engine._record_mode = True
 
     fake_transport_module = ModuleType("dmi.transport.ring")
@@ -224,7 +218,6 @@ def test_replacing_explicit_sink_keeps_it_attached_when_stop_fails(monkeypatch):
     assert old_ring.stop_calls == 1
     assert engine._ring_engine is old_ring
     assert engine._ring_transport is old_transport
-    assert engine._record_sink is sink
     assert events == []
 
 
@@ -413,7 +406,7 @@ def _explicit_sink_format():
     return _Format()
 
 
-def test_explicit_record_sink_isolated_from_host_and_detached_on_close(monkeypatch):
+def test_explicit_record_sink_lease_is_owned_by_native_ring(monkeypatch):
     engine, _old_transport, old_ring = _engine_with_fake_ring()
     ring_config = object()
     host_engine = object()
@@ -424,17 +417,30 @@ def test_explicit_record_sink_isolated_from_host_and_detached_on_close(monkeypat
     activated = []
     deactivated = []
 
-    class _RecordSink:
+    class _Lease:
         def __init__(self):
             self.events = []
 
-        def _attach_target(self):
-            self.events.append(("attach", old_ring.stop_calls))
+        def release(self):
+            self.events.append(("release", new_ring.stop_calls))
 
-        def _detach_target(self):
-            self.events.append(("detach", new_ring.stop_calls))
+    class _RecordSink:
+        def __init__(self):
+            self.lease = _Lease()
+
+        def _acquire_engine(self):
+            self.lease.events.append(("acquire", old_ring.stop_calls))
+            return self.lease
 
     sink = _RecordSink()
+
+    original_stop = new_ring.stop
+
+    def stop_and_release():
+        original_stop()
+        sink.lease.release()
+
+    new_ring.stop = stop_and_release
 
     class _Factory:
         @staticmethod
@@ -471,16 +477,15 @@ def test_explicit_record_sink_isolated_from_host_and_detached_on_close(monkeypat
 
     engine.create_record_runtime(_explicit_sink_format(), record_sink=sink)
 
-    assert created == [(ring_config, sink)]
-    assert sink.events == [("attach", 0)]
+    assert created == [(ring_config, sink.lease)]
+    assert sink.lease.events == [("acquire", 0)]
     assert old_ring.stop_calls == 1
-    assert engine._record_sink is sink
     assert activated == [engine._ring_transport]
 
     engine.close()
 
     assert new_ring.stop_calls == 1
-    assert sink.events == [("attach", 0), ("detach", 1)]
+    assert sink.lease.events == [("acquire", 0), ("release", 1)]
     assert deactivated == [True, True]
 
 
@@ -489,7 +494,7 @@ def test_explicit_sink_preflight_failure_preserves_the_active_ring(monkeypatch):
     engine._ring_config = object()
 
     class _RecordSink:
-        def _attach_target(self):
+        def _acquire_engine(self):
             raise RuntimeError("sink is not ready")
 
     sink = _RecordSink()
@@ -509,7 +514,6 @@ def test_explicit_sink_preflight_failure_preserves_the_active_ring(monkeypatch):
     assert engine._ring_engine is old_ring
     assert engine._ring_transport is old_transport
     assert engine._record_mode is False
-    assert engine._record_sink is None
 
 
 def test_plain_dmi_import_does_not_load_native_or_transport_modules():

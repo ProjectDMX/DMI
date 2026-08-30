@@ -342,7 +342,8 @@ native sink can be passed through
 `MonitoringEngine.create_record_runtime(..., record_sink=...)` without
 changing the producer, drain, or descriptor consumer. The capture-pack module
 provides an explicitly reference-only Python bridge for storage E2E;
-production sinks remain native-only.
+production sinks remain native-only. The record engine owns a generic,
+exclusive sink lease and releases it only after its record worker stops.
 
 `MonitoringEngine.flush_and_wait()` is a checked, non-closing completion
 operation. Success means the ring, descriptor consumer, and configured record

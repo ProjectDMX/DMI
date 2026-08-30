@@ -19,7 +19,10 @@
 // Forward-declare ATen and the generic sink so this plain interface does not
 // expose their implementation headers.
 namespace at { class Tensor; }
-namespace ring { class RecordSink; }
+namespace ring {
+class RecordSink;
+class RecordSinkLease;
+}
 
 namespace ring_py {
 
@@ -59,6 +62,8 @@ public:
     explicit RingEnginePy(RingConfig cfg, SubmitFn submit_fn);
     explicit RingEnginePy(RingConfig cfg,
                           std::shared_ptr<ring::RecordSink> sink);
+    explicit RingEnginePy(RingConfig cfg,
+                          std::shared_ptr<ring::RecordSinkLease> lease);
     ~RingEnginePy();
 
     RingEnginePy(const RingEnginePy&)            = delete;

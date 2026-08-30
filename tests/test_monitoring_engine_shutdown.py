@@ -84,29 +84,19 @@ def test_close_remains_best_effort_when_native_stop_fails(monkeypatch):
     assert engine._ring_engine is None
 
 
-def test_close_keeps_explicit_sink_attached_when_native_worker_may_be_alive():
-    events = []
-
+def test_close_keeps_record_ring_when_native_worker_may_be_alive():
     class _Ring:
         def stop(self):
             raise RuntimeError("stop failed before join")
 
-    class _Sink:
-        def _detach_target(self):
-            events.append("detach")
-
     engine = MonitoringEngine(enable_ring_transport=False)
     transport = SimpleNamespace(null_offload=False, force_eager=False)
     ring = _Ring()
-    sink = _Sink()
     engine._ring_transport = transport
     engine._ring_engine = ring
     engine._record_mode = True
-    engine._record_sink = sink
 
     engine.close()
 
-    assert events == []
     assert engine._ring_transport is transport
     assert engine._ring_engine is ring
-    assert engine._record_sink is sink

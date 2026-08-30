@@ -11,6 +11,7 @@
 #include <cmath>
 #include <limits>
 #include <type_traits>
+#include <utility>
 namespace py = pybind11;
 
 #include "clickhouse_client.h"
@@ -140,21 +141,14 @@ std::shared_ptr<dmx_host::ClickHouseRecordSink> MakeClickHouseRecordSink(
       [host] { host->raise_if_failed(); });
 }
 
-std::shared_ptr<ring_py::RingEnginePy> MakeRecordRingEngine(
-    ring_py::RingConfig cfg, std::shared_ptr<ring::RecordSink> sink) {
-  if (!std::dynamic_pointer_cast<
-          dmi_capture::ReferencePythonCaptureSink>(sink)) {
-    return std::make_shared<ring_py::RingEnginePy>(
-        std::move(cfg), std::move(sink));
-  }
-  // Only the Python-backed reference sink can wait for the GIL from its
-  // record worker.  Release it around destruction so an omitted explicit
-  // close cannot deadlock GC.  Production/native sinks retain their original
-  // construction and destruction path.
+template <typename... Args>
+std::shared_ptr<ring_py::RingEnginePy> MakeRingEngine(Args&&... args) {
+  // Ring destruction may join a worker that is completing a callback.  Never
+  // hold the Python GIL across that join, regardless of the concrete sink.
   return std::shared_ptr<ring_py::RingEnginePy>(
-      new ring_py::RingEnginePy(std::move(cfg), std::move(sink)),
+      new ring_py::RingEnginePy(std::forward<Args>(args)...),
       [](ring_py::RingEnginePy* engine) {
-        if (PyGILState_Check()) {
+        if (Py_IsInitialized() && PyGILState_Check()) {
           py::gil_scoped_release release;
           delete engine;
         } else {
@@ -628,8 +622,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // Production sinks remain native-only.  The explicitly named reference
   // bridge below is opt-in and intentionally pays the Python GIL/copy cost.
+  py::class_<ring::RecordSinkLease,
+             std::shared_ptr<ring::RecordSinkLease>>(
+      m, "_RecordSinkLease");
   py::class_<ring::RecordSink, std::shared_ptr<ring::RecordSink>>(
-      m, "RecordSink");
+      m, "RecordSink")
+      .def("_acquire_engine",
+           [](std::shared_ptr<ring::RecordSink> sink) {
+             return ring::RecordSinkLease::acquire(std::move(sink));
+           });
   py::class_<dmx_host::ClickHouseRecordSink, ring::RecordSink,
              std::shared_ptr<dmx_host::ClickHouseRecordSink>>(
       m, "ClickHouseRecordSink")
@@ -640,19 +641,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<dmi_capture::ReferencePythonCaptureSink, ring::RecordSink,
              std::shared_ptr<dmi_capture::ReferencePythonCaptureSink>>(
       m, "ReferencePythonCaptureSink")
-      .def(py::init([](py::object target) {
+      .def(py::init([](py::object target, std::string layout) {
              return std::make_shared<
-                 dmi_capture::ReferencePythonCaptureSink>(target.ptr());
+                 dmi_capture::ReferencePythonCaptureSink>(
+                     target.ptr(), std::move(layout));
            }),
-           py::arg("target"))
-      .def("_attach_target",
-           &dmi_capture::ReferencePythonCaptureSink::attach_target)
-      .def("_detach_target",
-           &dmi_capture::ReferencePythonCaptureSink::detach_target)
-      .def("_release_target",
-           &dmi_capture::ReferencePythonCaptureSink::release_target)
+           py::arg("target"), py::arg("layout"))
       .def_property_readonly(
-          "attached", &dmi_capture::ReferencePythonCaptureSink::attached);
+          "attached", &dmi_capture::ReferencePythonCaptureSink::engine_owned);
 
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
@@ -676,24 +672,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                      host->submit_direct(std::move(row), nbytes);
                  };
              }
-             return std::make_shared<ring_py::RingEnginePy>(
+             return MakeRingEngine(
                  std::move(cfg), std::move(submit_fn));
            }),
            py::arg("config"), py::arg("host_engine") = py::none())
       .def_static(
           "create_record",
           [](ring_py::RingConfig cfg, py::object sink_or_host) {
-            std::shared_ptr<ring::RecordSink> sink;
+            std::shared_ptr<ring::RecordSinkLease> lease;
             if (!sink_or_host.is_none()) {
-              if (py::isinstance<ring::RecordSink>(sink_or_host)) {
-                sink = sink_or_host.cast<std::shared_ptr<ring::RecordSink>>();
+              if (py::isinstance<ring::RecordSinkLease>(sink_or_host)) {
+                lease = sink_or_host.cast<
+                    std::shared_ptr<ring::RecordSinkLease>>();
+              } else if (py::isinstance<ring::RecordSink>(sink_or_host)) {
+                lease = ring::RecordSinkLease::acquire(
+                    sink_or_host.cast<std::shared_ptr<ring::RecordSink>>());
               } else {
                 auto host = sink_or_host.cast<
                     std::shared_ptr<dmx_host::DMXHostEngine>>();
-                sink = MakeClickHouseRecordSink(std::move(host));
+                lease = ring::RecordSinkLease::acquire(
+                    MakeClickHouseRecordSink(std::move(host)));
               }
             }
-            return MakeRecordRingEngine(std::move(cfg), std::move(sink));
+            return MakeRingEngine(std::move(cfg), std::move(lease));
           },
           py::arg("config"), py::arg("sink_or_host") = py::none())
       .def("init",  &ring_py::RingEnginePy::init,

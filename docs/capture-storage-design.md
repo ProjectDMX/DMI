@@ -210,7 +210,7 @@ pipeline.start()
 reference = CapturePackReferenceSink(pipeline)
 
 runtime = engine.create_record_runtime(
-    CaptureRecordFormat(),
+    reference.record_format,
     record_sink=reference.native_sink,
 )
 
@@ -226,6 +226,10 @@ slice, then acquires the GIL; the Python target copies it to immutable `bytes`
 before admission to the dedicated `HostCapturePipeline`. This adds one copy
 and a Python callback per row, so it is intentionally separate from the future
 production native pack writer.
+
+The generic record engine owns an exclusive sink lease. Acquisition happens
+before replacing an active Ring, while release happens only after the record
+worker stops; the reference adapter does not add a separate lifecycle path.
 
 `HostCapturePipeline.flush()` is a FIFO, repeatable, non-closing barrier. It
 seals the current pack and waits for `PackSink.persist()` for every earlier

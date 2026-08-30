@@ -6,14 +6,13 @@
 
 #include <Python.h>
 
-#include <atomic>
-#include <mutex>
+#include <string>
 
 namespace dmi_capture {
 
 class ReferencePythonCaptureSink final : public ring::RecordSink {
 public:
-    explicit ReferencePythonCaptureSink(PyObject* target);
+    ReferencePythonCaptureSink(PyObject* target, std::string layout);
     ~ReferencePythonCaptureSink() override;
 
     ReferencePythonCaptureSink(const ReferencePythonCaptureSink&) = delete;
@@ -24,15 +23,13 @@ public:
     bool flush_and_wait(Duration timeout) override;
     void rethrow_if_failed() const override;
 
-    void attach_target();
-    void detach_target();
-    void release_target();
-    bool attached() const noexcept { return attached_.load(); }
+protected:
+    void on_engine_acquire() override;
+    void on_engine_release() noexcept override;
 
 private:
-    std::atomic<PyObject*> target_{nullptr};
-    std::atomic<bool> attached_{false};
-    mutable std::mutex lifecycle_mu_;
+    PyObject* target_;
+    const std::string layout_;
 };
 
 }  // namespace dmi_capture
