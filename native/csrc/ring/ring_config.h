@@ -43,7 +43,7 @@ struct DrainFlushConfig {
 // RingConfig -- all tunable parameters.
 // ---------------------------------------------------------------------------
 struct RingConfig {
-    // Task/control ring: number of fixed-size TaskEntry slots (power of 2
+    // Task/control ring: number of 64-bit publication slots (power of 2
     // recommended for efficient modular index arithmetic).
     uint64_t task_ring_entries = 1024;
 

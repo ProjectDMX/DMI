@@ -119,7 +119,6 @@ __device__ inline void publish_last_block_arrives(
     uint64_t       task_head,
     uint64_t       payload_head,
     uint64_t       alloc_bytes,
-    const TwoSpan& spans,
     uint64_t       actual_total)
 {
     if (threadIdx.x != 0) return;
@@ -131,16 +130,7 @@ __device__ inline void publish_last_block_arrives(
     uint64_t ph = payload_head;
     payload_advance_head(ph, alloc_bytes);
 
-    const uint64_t len1 = (actual_total < spans.len1) ? actual_total : spans.len1;
-
-    TaskEntry entry{};
-    entry.tensor_total_bytes = actual_total;
-    entry.payload_off1       = spans.off1;
-    entry.payload_len1       = len1;
-    entry.payload_off2       = spans.off2;
-    entry.payload_len2       = actual_total - len1;
-
-    task_publish(ring.task_entries, ring.task_cap, task_head, entry);
+    task_publish(ring.publication_slots, ring.task_cap, task_head, actual_total);
     *ring.task_head    = task_head + 1;
     *ring.payload_head = ph;
 
@@ -195,7 +185,7 @@ __global__ void producer_static_kernel(
     __syncthreads();
 
     publish_last_block_arrives(ring, task_head, payload_head, alloc_bytes,
-                               spans, nbytes);
+                               nbytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +244,7 @@ __global__ void producer_prefix_kernel(
     __syncthreads();
 
     publish_last_block_arrives(ring, task_head, payload_head, alloc_bytes,
-                               spans, actual_bytes);
+                               actual_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +308,7 @@ __global__ void producer_chunked_kernel(
     __syncthreads();
 
     publish_last_block_arrives(ring, task_head, payload_head, alloc_bytes,
-                               spans, actual_total);
+                               actual_total);
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +416,7 @@ __global__ void record_producer_static_kernel(
     __threadfence();
     __syncthreads();
     publish_last_block_arrives(
-        ring, task_head, payload_head, alloc_bytes, spans, nbytes);
+        ring, task_head, payload_head, alloc_bytes, nbytes);
 }
 
 __global__ void record_producer_prefix_kernel(
@@ -461,7 +451,7 @@ __global__ void record_producer_prefix_kernel(
     __threadfence();
     __syncthreads();
     publish_last_block_arrives(
-        ring, task_head, payload_head, alloc_bytes, spans, actual_bytes);
+        ring, task_head, payload_head, alloc_bytes, actual_bytes);
 }
 
 __global__ void record_producer_chunked_kernel(
@@ -515,7 +505,7 @@ __global__ void record_producer_chunked_kernel(
     __threadfence();
     __syncthreads();
     publish_last_block_arrives(
-        ring, task_head, payload_head, alloc_bytes, spans, actual_bytes);
+        ring, task_head, payload_head, alloc_bytes, actual_bytes);
 }
 
 __global__ void record_producer_seq_prefix_pack_kernel(
@@ -563,7 +553,7 @@ __global__ void record_producer_seq_prefix_pack_kernel(
     __threadfence();
     __syncthreads();
     publish_last_block_arrives(
-        ring, task_head, payload_head, alloc_bytes, spans, actual_bytes);
+        ring, task_head, payload_head, alloc_bytes, actual_bytes);
 }
 
 __global__ void record_producer_segmented_pack_kernel(
@@ -633,7 +623,7 @@ __global__ void record_producer_segmented_pack_kernel(
     __threadfence();
     __syncthreads();
     publish_last_block_arrives(
-        ring, task_head, payload_head, alloc_bytes, spans, actual_bytes);
+        ring, task_head, payload_head, alloc_bytes, actual_bytes);
 }
 
 // ---------------------------------------------------------------------------

@@ -73,7 +73,7 @@ static void expect_empty(const ring::RingState& state) {
     EXPECT(*state.payload_head == 0);
     EXPECT(*state.actual_bytes_counter == 0);
     for (uint64_t i = 0; i < state.task_cap; ++i) {
-        EXPECT(state.task_entries[i].ready_seq == ring::READY_SEQ_SENTINEL);
+        EXPECT(state.publication_slots[i] == 0);
     }
 }
 
@@ -142,8 +142,8 @@ static void test_disabling_restores_delivery() {
     EXPECT(*state.task_head == 1);
     EXPECT(*state.payload_head == 128);
     EXPECT(*state.actual_bytes_counter == 128);
-    EXPECT(state.task_entries[0].ready_seq == 0);
-    EXPECT(state.task_entries[0].tensor_total_bytes == 128);
+    EXPECT(state.publication_slots[0] ==
+           ring::encode_publication(128));
 
     CUDA_CHECK(cudaFree(source));
 }
@@ -171,8 +171,8 @@ static void test_toggle_preserves_sequence() {
     EXPECT(*state.task_head == 2);
     EXPECT(*state.payload_head == 128);
     EXPECT(*state.actual_bytes_counter == 128);
-    EXPECT(state.task_entries[0].ready_seq == 0);
-    EXPECT(state.task_entries[1].ready_seq == 1);
+    EXPECT(state.publication_slots[0] == ring::encode_publication(64));
+    EXPECT(state.publication_slots[1] == ring::encode_publication(64));
 
     CUDA_CHECK(cudaFree(source));
 }

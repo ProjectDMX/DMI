@@ -6,7 +6,7 @@
 //   producer_chunked_kernel   -- K>1 chunked-suffix; per-chunk parallel.
 //
 // All blocks: grid-stride D2D copy (vectorized via uint4).
-// Last block to finish (atomicAdd counter): publishes TaskEntry,
+// Last block to finish (atomicAdd counter): publishes actual bytes,
 // advances heads, atomicAdd's actual_bytes_counter.
 //
 // The kernels never spin.  Space is guaranteed by the pre-forward

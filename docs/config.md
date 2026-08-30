@@ -12,7 +12,7 @@ Python binding: `native/csrc/bindings.cpp` -> `RingConfig`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `task_ring_entries` | `uint64_t` | 1024 | Number of fixed-size TaskEntry slots in the GPU task/control ring. Power of 2 recommended. |
+| `task_ring_entries` | `uint64_t` | 1024 | Number of 64-bit publication slots in the GPU task/control ring. Power of 2 recommended. |
 | `payload_ring_bytes` | `uint64_t` | 256 MiB | Total size of the GPU circular payload byte buffer (HBM). Must be a multiple of `PAYLOAD_ALIGN` (16). |
 
 ## Pinned Staging
@@ -58,8 +58,9 @@ full or at `stop()` time.
 | Constant | Value | Location | Description |
 |----------|-------|----------|-------------|
 | `PAYLOAD_ALIGN` | 16 bytes | `ring_config.h` | Payload allocation alignment. Every reservation is rounded up to this for vectorized uint4 D2D copies. `payload_ring_bytes` must be a multiple of this. |
-| `READY_SEQ_SENTINEL` | `UINT64_MAX` | `task_entry.h` | Sentinel value for `TaskEntry::ready_seq` (slot not yet published). |
-| `TaskEntry` size | 128 bytes | `task_entry.h` | Fixed slot size, `alignas(128)` for cache-line isolation. |
+| `PUBLICATION_READY` | `1 << 63` | `publication_word.h` | Ready bit in the atomic publication word. |
+| `PUBLICATION_SIZE_MASK` | `(1 << 63) - 1` | `publication_word.h` | Mask for the actual tensor size in a publication word. |
+| Publication slot size | 8 bytes | `publication_word.h` | One CPU-preferred managed `uint64_t` per task slot. |
 
 ## Python Usage
 

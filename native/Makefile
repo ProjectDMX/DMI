@@ -19,7 +19,7 @@ HEADERS := csrc/dmx_host_utils.h \
            csrc/clickhouse_client.h csrc/clickhouse_record_sink.h \
            csrc/dmx_host_engine.h csrc/record_schema.h \
            csrc/ring/ring_config.h csrc/ring/ring_state.h csrc/ring/ring_alloc.h \
-           csrc/ring/task_entry.h csrc/ring/drain_task.h csrc/ring/drain_thread.h \
+           csrc/ring/publication_word.h csrc/ring/drain_task.h csrc/ring/drain_thread.h \
            csrc/ring/record_descriptor.h csrc/ring/record_consumer.h \
            csrc/ring/record_sink.h \
            csrc/ring/p2p_thread.h csrc/ring/pinned_staging.h \

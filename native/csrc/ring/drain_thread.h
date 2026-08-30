@@ -16,7 +16,6 @@
 #include "ring_config.h"
 #include "pinned_staging.h"
 #include "drain_task.h"
-#include "task_entry.h"
 
 #include <cuda_runtime.h>
 #include <atomic>
@@ -111,7 +110,7 @@ private:
     uint64_t                visible_head_{0};
     uint64_t                pending_entries_{0};
     uint64_t                pending_bytes_{0};
-    std::deque<TaskEntry>   scanned_;
+    std::deque<uint64_t>    scanned_;
 
     uint64_t                cpu_task_head_{0};
     uint64_t                cpu_payload_head_{0};
@@ -157,7 +156,7 @@ private:
 
     // Called under mgmt_mu_:
     void scan_ready();
-    void account_record_task(uint64_t sequence, const TaskEntry& entry);
+    void account_record_task(uint64_t sequence, uint64_t actual_bytes);
     bool should_flush() const;
     void flush_state_update(uint64_t flush_count, uint64_t flush_bytes);
 

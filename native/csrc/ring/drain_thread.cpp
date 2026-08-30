@@ -5,8 +5,7 @@
 // Space is guaranteed by the pre-forward capacity check in Python.
 
 #include "drain_thread.h"
-#include "task_ring.cuh"
-#include "task_entry.h"
+#include "publication_word.h"
 #include "ring_config.h"
 #include "ring_debug.h"
 
@@ -23,6 +22,20 @@
 namespace ring {
 
 namespace {
+
+static inline bool publication_try_acquire(
+    const uint64_t* slot, uint64_t& acquired_word) {
+    acquired_word = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    return (acquired_word & PUBLICATION_READY) != 0;
+}
+
+static constexpr uint64_t publication_size(uint64_t acquired_word) {
+    return acquired_word & PUBLICATION_SIZE_MASK;
+}
+
+static inline void publication_clear(uint64_t* slot) {
+    __atomic_store_n(slot, uint64_t{0}, __ATOMIC_RELEASE);
+}
 
 void throw_cuda_failure(const char* operation, cudaError_t error) {
     if (error == cudaSuccess) return;
@@ -333,7 +346,7 @@ void DrainThread::do_full_flush() {
             scan_ready();
             if (pending_entries_ == 0) break;
             for (size_t i = 0; i < scanned_.size(); ++i) {
-                uint64_t ab = align_up(scanned_[i].tensor_total_bytes, PAYLOAD_ALIGN);
+                uint64_t ab = align_up(scanned_[i], PAYLOAD_ALIGN);
                 if (flush_bytes + ab > staging_.capacity()) break;
                 flush_bytes += ab;
                 flush_count++;
@@ -417,7 +430,7 @@ void DrainThread::loop() {
 
             if (should_flush()) {
                 for (size_t i = 0; i < scanned_.size(); ++i) {
-                    uint64_t ab = align_up(scanned_[i].tensor_total_bytes, PAYLOAD_ALIGN);
+                    uint64_t ab = align_up(scanned_[i], PAYLOAD_ALIGN);
                     if (flush_bytes + ab > staging_.capacity()) break;
                     flush_bytes += ab;
                     flush_count++;
@@ -497,16 +510,17 @@ void DrainThread::scan_ready() {
 
     while (true) {
         if (pending_entries_ >= task_cap) break;
-        if (!task_cpu_ready(ring_.task_entries, task_cap, visible_head_)) break;
-
         const uint64_t idx = visible_head_ % task_cap;
-        TaskEntry ec = ring_.task_entries[idx];
+        uint64_t publication = 0;
+        if (!publication_try_acquire(
+                &ring_.publication_slots[idx], publication)) break;
+        const uint64_t actual_bytes = publication_size(publication);
 
-        account_record_task(visible_head_, ec);
+        account_record_task(visible_head_, actual_bytes);
 
-        scanned_.push_back(ec);
+        scanned_.push_back(actual_bytes);
         pending_entries_++;
-        pending_bytes_ += align_up(ec.tensor_total_bytes, PAYLOAD_ALIGN);
+        pending_bytes_ += align_up(actual_bytes, PAYLOAD_ALIGN);
         visible_head_++;
 
         if (!has_complete_time_) {
@@ -517,18 +531,18 @@ void DrainThread::scan_ready() {
 }
 
 void DrainThread::account_record_task(uint64_t sequence,
-                                      const TaskEntry& entry) {
+                                      uint64_t actual_bytes) {
     if (pending_task_reclaims_.empty() || record_reclaim_failure_) return;
 
     const PendingTaskReclaim& pending = pending_task_reclaims_.front();
     if (sequence < pending.task_sequence) return;
     if (sequence != pending.task_sequence) {
         record_reclaim_failure_ = std::make_exception_ptr(std::runtime_error(
-            "record reclaim task sequence does not match ready TaskEntry"));
+            "record reclaim task sequence does not match ready publication"));
         return;
     }
 
-    const uint64_t actual = align_up(entry.tensor_total_bytes, PAYLOAD_ALIGN);
+    const uint64_t actual = align_up(actual_bytes, PAYLOAD_ALIGN);
     if (actual > pending.reserved_payload_bytes) {
         record_reclaim_failure_ = std::make_exception_ptr(std::runtime_error(
             "record producer exceeded its conservative payload reservation"));
@@ -579,7 +593,8 @@ bool DrainThread::should_flush() const {
 // ---------------------------------------------------------------------------
 void DrainThread::flush_state_update(uint64_t flush_count, uint64_t flush_bytes) {
     for (uint64_t i = 0; i < flush_count; ++i) {
-        task_release_cpu(ring_.task_entries, ring_.task_cap, cpu_task_tail_);
+        const uint64_t idx = cpu_task_tail_ % ring_.task_cap;
+        publication_clear(&ring_.publication_slots[idx]);
         ++cpu_task_tail_;
     }
     cpu_payload_tail_ += flush_bytes;
@@ -632,12 +647,12 @@ void DrainThread::submit_to_p2p(uint64_t flush_count, uint64_t flush_bytes) {
     const uint64_t staging_batch_start = staging_.head();
 
     for (uint64_t i = 0; i < flush_count; ++i) {
-        const TaskEntry& ec = scanned_[i];
-        uint64_t data_len = ec.payload_len1 + ec.payload_len2;
-        uint64_t alloc    = align_up(ec.tensor_total_bytes, PAYLOAD_ALIGN);
+        const uint64_t actual_bytes = scanned_[i];
+        const uint64_t data_len = actual_bytes;
+        const uint64_t alloc = align_up(actual_bytes, PAYLOAD_ALIGN);
 
         DrainTask task{};
-        task.tensor_total_bytes = ec.tensor_total_bytes;
+        task.tensor_total_bytes = actual_bytes;
         task.alloc_bytes        = alloc;
 
         if (data_len > 0) {

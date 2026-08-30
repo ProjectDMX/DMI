@@ -33,7 +33,7 @@ public:
 
     // Consume exactly one descriptor for one physical payload.  The payload
     // must be a contiguous CPU byte tensor containing the actual produced
-    // bytes from its ready TaskEntry.
+    // bytes from its ready publication.
     void consume_payload(at::Tensor payload);
 
     // Latch an asynchronous worker failure.  The first failure is retained.

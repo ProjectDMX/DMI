@@ -1,13 +1,13 @@
 // ring/ring_alloc.h -- CPU-side RAII owner of all ring device memory.
 //
 // AllocatedRing allocates and initialises all buffers for one ring pair:
-//   - task entry array          (cudaMallocManaged -- GPU writes, CPU drain reads)
+//   - publication word array    (cudaMallocManaged -- GPU writes, CPU drain reads)
 //   - payload byte buffer       (cudaMalloc -- device-only, D2H via copy engine)
 //   - head counters             (cudaMallocManaged -- GPU writes heads)
 //
 // Usage:
 //   AllocatedRing ar(cfg);
-//   ar.init();                     // memset entries to SENTINEL, zero counters
+//   ar.init();                     // clear publication slots, zero counters
 //   RingState rs = ar.state();     // capture-safe snapshot of pointers
 //   launch_producer(rs, ...);      // pass rs into kernel
 //
@@ -33,21 +33,22 @@ public:
     AllocatedRing(const AllocatedRing&)            = delete;
     AllocatedRing& operator=(const AllocatedRing&) = delete;
 
-    // Zero all counters and set every task entry byte to 0xFF (SENTINEL).
+    // Zero all counters and clear every publication slot.
     // Call once on host before the first graph capture.
     void init(cudaStream_t stream = 0) {
-        task_ring_init(state_.task_entries, cfg_.task_ring_entries, stream);
+        task_ring_init(state_.publication_slots, cfg_.task_ring_entries, stream);
         *state_.task_head           = 0;
         *state_.payload_head        = 0;
         *state_.actual_bytes_counter = 0;
         // Trigger page migration: move counter pages to GPU HBM and
-        // task_entry pages to CPU RAM, then synchronise.
+        // publication pages to CPU RAM, then synchronise.
         int dev = 0;
         cudaGetDevice(&dev);
-        const size_t          entries_sz = cfg_.task_ring_entries * sizeof(TaskEntry);
+        const size_t          publication_sz =
+            cfg_.task_ring_entries * sizeof(uint64_t);
         const cudaMemLocation gpu_loc    = {cudaMemLocationTypeDevice, dev};
         const cudaMemLocation cpu_loc    = {cudaMemLocationTypeHost,   0};
-        cudaMemPrefetchAsync(state_.task_entries,         entries_sz,        cpu_loc, 0, stream);
+        cudaMemPrefetchAsync(state_.publication_slots,    publication_sz,    cpu_loc, 0, stream);
         cudaMemPrefetchAsync(state_.task_head,            sizeof(uint64_t),  gpu_loc, 0, stream);
         cudaMemPrefetchAsync(state_.payload_head,         sizeof(uint64_t),  gpu_loc, 0, stream);
         cudaMemPrefetchAsync(state_.actual_bytes_counter, sizeof(uint64_t),  gpu_loc, 0, stream);
@@ -69,9 +70,10 @@ private:
     }
 
     void allocate() {
-        const size_t entries_sz = cfg_.task_ring_entries * sizeof(TaskEntry);
-        chk(cudaMallocManaged(&state_.task_entries, entries_sz),
-            "cudaMallocManaged task_entries");
+        const size_t publication_sz =
+            cfg_.task_ring_entries * sizeof(uint64_t);
+        chk(cudaMallocManaged(&state_.publication_slots, publication_sz),
+            "cudaMallocManaged publication_slots");
         chk(cudaMalloc(&state_.payload_buf, cfg_.payload_ring_bytes),
             "cudaMalloc payload_buf");
 
@@ -87,7 +89,7 @@ private:
 
         // Move head counters to GPU HBM so the producer reads them at L2/HBM
         // speed.  CPU writes (drain thread) use PCIe posted writes.
-        // Task entries stay on CPU for fast drain-thread polling.
+        // Publication slots stay on CPU for fast drain-thread polling.
         int dev = 0;
         chk(cudaGetDevice(&dev), "cudaGetDevice");
         const cudaMemLocation gpu_loc  = {cudaMemLocationTypeDevice, dev};
@@ -104,16 +106,16 @@ private:
         advise_gpu(state_.payload_head);
         advise_gpu(state_.actual_bytes_counter);
 
-        chk(cudaMemAdvise(state_.task_entries, entries_sz,
+        chk(cudaMemAdvise(state_.publication_slots, publication_sz,
                           cudaMemAdviseSetPreferredLocation, cpu_loc),
-            "cudaMemAdvise SetPreferredLocation task_entries CPU");
-        chk(cudaMemAdvise(state_.task_entries, entries_sz,
+            "cudaMemAdvise SetPreferredLocation publication_slots CPU");
+        chk(cudaMemAdvise(state_.publication_slots, publication_sz,
                           cudaMemAdviseSetAccessedBy, gpu_loc),
-            "cudaMemAdvise SetAccessedBy task_entries GPU");
+            "cudaMemAdvise SetAccessedBy publication_slots GPU");
     }
 
     void free_all() noexcept {
-        cudaFree(state_.task_entries);
+        cudaFree(state_.publication_slots);
         cudaFree(state_.payload_buf);
         cudaFree(state_.task_head);
         cudaFree(state_.payload_head);

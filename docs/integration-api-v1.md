@@ -217,7 +217,7 @@ gone.
 | --- | --- |
 | `payload_bytes` | GPU payload-ring capacity. |
 | `staging_bytes` | Pinned host staging capacity. |
-| `task_entries` | Metadata/task-ring entry capacity. |
+| `task_entries` | Task-publication slot capacity. |
 | `effective_bytes` | `min(payload_bytes, staging_bytes)`, the per-step byte ceiling. |
 
 It raises `RuntimeError` if no ring is active. Reading it calls three native
