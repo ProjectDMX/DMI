@@ -217,7 +217,7 @@ gone.
 | --- | --- |
 | `payload_bytes` | GPU payload-ring capacity. |
 | `staging_bytes` | Pinned host staging capacity. |
-| `task_entries` | Metadata/task-ring entry capacity. |
+| `task_entries` | Task-publication slot capacity. |
 | `effective_bytes` | `min(payload_bytes, staging_bytes)`, the per-step byte ceiling. |
 
 It raises `RuntimeError` if no ring is active. Reading it calls three native
@@ -298,6 +298,34 @@ in declaration order, and returns `None`.
 immutable `ProducerPlan`. Each `ProducerPlanEntry` retains the output ID,
 shapes, dtype, transport, storage, reservation bound, and task count required
 for replay.
+
+### Payload-size terminology
+
+- `actual_size` is the meaningful byte count produced by the GPU. The producer
+  publishes it, and the consumer uses it for shape validation and final tensor
+  reconstruction.
+- `transport_size = align_up(actual_size, 16)` is the tensor's virtual padded
+  footprint. GPU payload-head advancement, D2H, staging placement, transport
+  capacity accounting, and normal payload release use this size.
+  Reconstruction strips the padding and exposes only `actual_size` bytes.
+- `reserved_transport_size` is the CPU reservation for one task. It equals
+  `transport_size` when `actual_size` is CPU-known. Only a producer whose size
+  is unknown before launch may use a larger, aligned upper bound. CPU
+  reservation and CPU payload-head accounting use `reserved_transport_size`.
+- `release` is normal completion accounting. Payload-ring capacity becomes
+  reusable after D2H completion, by `transport_size`; staging capacity becomes
+  reusable after the `actual_size` meaningful bytes have been copied to
+  pageable memory. This occurs for every ring task.
+- `reclaim` only corrects a conservative CPU reservation that exceeded the
+  produced footprint. It subtracts
+  `reserved_transport_size - transport_size` from CPU reservation accounting;
+  it does not release produced payload or staging data.
+
+The generic record transport retains machinery for such conservative
+reservations, but there is currently no reclaim in an integrated hook path.
+CUDA-graph hooks have no dynamically sized EP producer, while eager v1 EP hooks
+know `actual_size` before reservation. Both therefore reserve exactly
+`transport_size` and require only normal release.
 
 ```python
 runtime = engine.create_record_runtime(record_format)
@@ -445,7 +473,7 @@ Otherwise it:
 
 1. builds a `StepContext`;
 2. calls `plan_step()` to compute each firing hook's shape and 16-byte-aligned
-   payload size;
+   `transport_size`;
 3. calls `commit_step()` to reserve the complete step;
 4. invokes capacity fallback callbacks if one step cannot fit;
 5. publishes request/range/rank context; and
@@ -482,10 +510,10 @@ adaptor.commit_step(
 ```
 
 `StepPlan` is an immutable tuple value describing one forward's reservation.
-Its fields are the aligned payload bytes, the number of nonempty hook tensors,
-and whether any selected hook requires eager execution. `plan_step()` walks
-`active_hook_specs` once. It performs no ring operation, CUDA synchronization,
-tensor allocation, or database work.
+Its fields are the sum of the selected tensors' `transport_size` values, the
+number of nonempty hook tensors, and whether any selected hook requires eager
+execution. `plan_step()` walks `active_hook_specs` once. It performs no ring
+operation, CUDA synchronization, tensor allocation, or database work.
 
 `commit_step()` owns reservation, eager-fallback selection, request/range
 context publication, and FIFO hook-metadata publication. Passing a plan avoids
@@ -583,10 +611,15 @@ Integration-relevant state is:
   `install_ring_hooks()`; and
 - padding-strip state, installed by `configure_hook_padding_strip()`.
 
-With the eager safety net active, a HookPoint reserves current capacity,
-flushes if needed, or copies the complete tensor through CPU-direct fallback
-when one tensor is larger than the ring. CPU-direct fallback does not apply GPU
-padding stripping.
+With the eager safety net active, an unstripped HookPoint computes
+`transport_size` from the CPU-known tensor size, reserves that amount when it
+fits, and flushes first if necessary. An oversized tensor uses CPU-direct
+fallback. A stripped v0 HookPoint also uses CPU-direct because v0 has no
+upper-bound reclaim contract. CPU-direct submits the full CPU tensor using
+`tensor.nbytes`, without transport padding, ring reservation, release, reclaim,
+or ring advancement. For stripped v0 hooks, downstream processing performs the
+normal slicing. Older ring work is flushed first to preserve FIFO metadata
+order.
 
 Legacy Python forward/backward callbacks are not a CUDA-graph replay mechanism.
 DMI capture uses the native producer called directly from
@@ -764,14 +797,14 @@ configure_hook_padding_strip(
 | --- | --- |
 | `row_count_tensor is None` | Static producer copies the full tensor. |
 | Tensor present and `row_bytes > 0` | Prefix producer copies `row_count_tensor[0] * row_bytes`. |
-| Tensor present and `row_bytes <= 0` | Chunked producer treats each of the tensor's `K` values as one chunk's byte count. |
+| Tensor present and `row_bytes <= 0` | Unsupported for v0; raises `ValueError`. Use a v1 record producer for a dynamic producer contract. |
 
-The function only assigns HookPoint state. It validates neither dtype, device,
-shape, values, nor `row_bytes`. Prefix mode expects a one-element device
-`int64` tensor; chunked mode expects a device `int64[K]` tensor. During
-compilation/CUDA-graph replay, tensor address and element count and the Python
-`row_bytes` value must remain fixed. Update only tensor values on the correct
-stream between steps.
+The function rejects a tensor with nonpositive `row_bytes`; otherwise it assigns
+HookPoint state. It does not validate the tensor's dtype, device, shape, or
+values. Prefix mode expects a one-element device `int64` tensor. During
+compilation/CUDA-graph replay, the tensor address and element count and the
+Python `row_bytes` value must remain fixed. Update only tensor values on the
+correct stream between steps.
 
 ## Selection and rank ownership
 
@@ -911,7 +944,7 @@ do not reconfigure it.
 | --- | ---: | --- |
 | `task_ring_entries` | `1024` | Task/control slots; power of two is recommended. |
 | `payload_ring_bytes` | `256 MiB` | GPU circular payload capacity; must be 16-byte aligned. |
-| `pinned_staging_bytes` | `0` | Pinned host staging; zero inherits payload capacity. |
+| `pinned_staging_bytes` | `0` | Pinned host staging; zero inherits payload capacity, and the effective capacity must be 16-byte aligned. |
 | `drain_poll_timeout_us` | `100` | Drain poll cadence; must be positive, not a persistence deadline. |
 | `drain_flush_task_ratio` | `0.0` | Task-capacity flush fraction; zero disables it. |
 | `drain_flush_payload_ratio` | `0.5` | Payload-capacity flush fraction. |

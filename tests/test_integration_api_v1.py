@@ -281,7 +281,7 @@ def test_v1_public_names_preserve_existing_shape_and_selection_behavior() -> Non
 
 
 @pytest.mark.cpu
-def test_v1_padding_strip_configuration_preserves_existing_modes() -> None:
+def test_v1_padding_strip_configuration_rejects_v0_chunked_mode() -> None:
     from dmi.api import v1
 
     hook = v1.HookPoint()
@@ -291,9 +291,8 @@ def test_v1_padding_strip_configuration_preserves_existing_modes() -> None:
     assert hook._strip_tensor is row_count
     assert hook._strip_row_bytes == 128
 
-    v1.configure_hook_padding_strip(hook, row_count)
-    assert hook._strip_tensor is row_count
-    assert hook._strip_row_bytes == 0
+    with pytest.raises(ValueError, match="v0 device-count chunked"):
+        v1.configure_hook_padding_strip(hook, row_count)
 
     v1.configure_hook_padding_strip(hook, None)
     assert hook._strip_tensor is None

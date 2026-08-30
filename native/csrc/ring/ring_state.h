@@ -11,15 +11,14 @@
 // pre-forward capacity check before kernel launch.
 
 #pragma once
-#include "task_entry.h"
 #include <cstdint>
 
 namespace ring {
 
 struct RingState {
     // Task/control ring
-    TaskEntry*  task_entries;   // managed memory: task_cap slots
-    uint64_t    task_cap;       // number of task slots
+    uint64_t*   publication_slots; // CPU-preferred managed publication words
+    uint64_t    task_cap;          // number of publication slots
 
     uint64_t*   task_head;      // monotonically increasing; producer writes
 

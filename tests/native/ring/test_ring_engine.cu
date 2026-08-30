@@ -19,6 +19,7 @@
 #include <cstring>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -163,6 +164,60 @@ public:
     cudaStream_t stream{};
 };
 
+static void test_ring_geometry_requires_payload_alignment() {
+    banner("payload and staging rings enforce transport alignment");
+
+    bool payload_rejected = false;
+    try {
+        ring::AllocatedRing invalid(make_config(255));
+    } catch (const std::invalid_argument&) {
+        payload_rejected = true;
+    }
+    EXPECT(payload_rejected);
+
+    bool staging_rejected = false;
+    try {
+        ring::PinnedStaging invalid;
+        invalid.init(255);
+    } catch (const std::invalid_argument&) {
+        staging_rejected = true;
+    }
+    EXPECT(staging_rejected);
+
+    ring::AllocatedRing payload(make_config());
+    ring::PinnedStaging staging;
+    staging.init(make_config().effective_staging_bytes());
+    EXPECT(reinterpret_cast<uintptr_t>(payload.state().payload_buf) %
+               ring::PAYLOAD_ALIGN == 0);
+    EXPECT(payload.state().payload_cap % ring::PAYLOAD_ALIGN == 0);
+    EXPECT(reinterpret_cast<uintptr_t>(staging.base()) % ring::PAYLOAD_ALIGN ==
+           0);
+    EXPECT(staging.capacity() % ring::PAYLOAD_ALIGN == 0);
+}
+
+static void test_native_reservation_uses_transport_alignment() {
+    banner("native reservation accepts only aligned step totals");
+    ring_py::RingConfig cfg;
+    cfg.task_ring_entries = 16;
+    cfg.payload_ring_bytes = 4096;
+    cfg.pinned_staging_bytes = 4096;
+    cfg.drain_poll_timeout_us = 100;
+    ring_py::RingEnginePy engine(cfg, std::shared_ptr<ring::RecordSink>{});
+    engine.init();
+
+    bool rejected = false;
+    try {
+        (void)engine.prepare_step(17, 1);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    EXPECT(rejected);
+
+    const uint64_t before = engine.available_capacity();
+    engine.reserve_one(17);
+    EXPECT(before - engine.available_capacity() == 32);
+}
+
 static void test_static_force_flush() {
     banner("static producer drains exact data");
     DrainHarness harness(make_config());
@@ -218,6 +273,55 @@ static void test_prefix_force_flush() {
     CUDA_CHECK(cudaFree(device));
 }
 
+static void test_chunked_short_then_static_preserves_payload_offset() {
+    banner("short chunked producer preserves the next payload offset");
+    DrainHarness harness(make_config());
+
+    constexpr uint32_t chunks = 4;
+    constexpr uint64_t chunk_bytes = 64;
+    const std::vector<uint8_t> chunked_source =
+        pattern(chunks * chunk_bytes, 41);
+    const std::vector<int64_t> selected = {16, 32, 0, 8};
+    std::vector<uint8_t> chunked_expected;
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        const auto begin = chunked_source.begin() + chunk * chunk_bytes;
+        chunked_expected.insert(
+            chunked_expected.end(), begin, begin + selected[chunk]);
+    }
+
+    uint8_t* chunked_device = upload(chunked_source, harness.stream);
+    int64_t* selected_device = nullptr;
+    CUDA_CHECK(cudaMalloc(&selected_device,
+                          selected.size() * sizeof(int64_t)));
+    CUDA_CHECK(cudaMemcpyAsync(selected_device, selected.data(),
+                               selected.size() * sizeof(int64_t),
+                               cudaMemcpyHostToDevice, harness.stream));
+
+    harness.drain->reserve(
+        ring::align_up(chunked_source.size(), ring::PAYLOAD_ALIGN), 1);
+    ring::launch_producer_chunked(
+        harness.allocated.state(), chunked_device, chunked_source.size(),
+        selected_device, chunks, 0, harness.stream);
+    ring::DrainTask first = harness.flush_one();
+    EXPECT(task_bytes(first) == chunked_expected);
+    harness.release(first);
+
+    const std::vector<uint8_t> static_source = pattern(64, 173);
+    uint8_t* static_device = upload(static_source, harness.stream);
+    harness.drain->reserve(
+        ring::align_up(static_source.size(), ring::PAYLOAD_ALIGN), 1);
+    ring::launch_producer_static(
+        harness.allocated.state(), static_device, static_source.size(), 0,
+        harness.stream);
+    ring::DrainTask second = harness.flush_one();
+    EXPECT(task_bytes(second) == static_source);
+    harness.release(second);
+
+    CUDA_CHECK(cudaFree(static_device));
+    CUDA_CHECK(cudaFree(selected_device));
+    CUDA_CHECK(cudaFree(chunked_device));
+}
+
 static void test_repeated_wrap_delivery() {
     banner("repeated flushes preserve data across GPU and staging wraps");
     constexpr uint64_t capacity = 256;
@@ -268,6 +372,66 @@ static void test_zero_byte_delivery() {
     EXPECT(harness.drain->cpu_task_tail_committed() == 1);
     EXPECT(harness.drain->cpu_payload_tail_committed() == 0);
     harness.release(task);
+}
+
+static void test_zero_byte_record_reclaims_full_upper_bound() {
+    banner("zero-byte record reclaims its full upper-bound reservation");
+    DrainHarness harness(make_config());
+    constexpr uint64_t upper = 256;
+    constexpr uint64_t row_bytes = 32;
+    const std::vector<uint8_t> source = pattern(upper, 101);
+    uint8_t* device = upload(source, harness.stream);
+    int64_t row_count = 0;
+    int64_t* device_count = nullptr;
+    CUDA_CHECK(cudaMalloc(&device_count, sizeof(row_count)));
+    CUDA_CHECK(cudaMemcpyAsync(device_count, &row_count, sizeof(row_count),
+                               cudaMemcpyHostToDevice, harness.stream));
+
+    harness.drain->reserve_record({{upper, true}});
+    ring::launch_record_producer_prefix(
+        harness.allocated.state(), device, source.size(), device_count,
+        row_bytes, nullptr, 0, harness.stream);
+    ring::DrainTask task = harness.flush_one();
+
+    EXPECT(task.tensor_total_bytes == 0);
+    EXPECT(task.alloc_bytes == 0);
+    harness.drain->apply_pending_record_reclaims();
+    EXPECT(harness.drain->cpu_payload_head() == 0);
+    EXPECT(harness.drain->cpu_payload_tail_committed() == 0);
+    harness.drain->rethrow_record_reclaim_failure();
+
+    harness.release(task);
+    CUDA_CHECK(cudaFree(device_count));
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_cpu_direct_does_not_touch_ring_accounting() {
+    banner("CPU-direct carries real bytes without a ring allocation");
+    DrainHarness harness(make_config());
+    constexpr uint64_t actual_bytes = 17;
+    at::Tensor tensor = at::empty(
+        {static_cast<int64_t>(actual_bytes)},
+        at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+
+    const uint64_t payload_head_before = harness.drain->cpu_payload_head();
+    const uint64_t payload_tail_before =
+        harness.drain->cpu_payload_tail_committed();
+    harness.drain->submit_cpu_direct(tensor, actual_bytes);
+
+    const uint64_t count = harness.drain->wait_for_tasks();
+    EXPECT(count == 1);
+    std::vector<ring::DrainTask> tasks;
+    harness.drain->pop_tasks(count, tasks);
+    EXPECT(tasks.size() == 1);
+    if (!tasks.empty()) {
+        EXPECT(tasks.front().tensor_total_bytes == actual_bytes);
+        EXPECT(tasks.front().alloc_bytes == 0);
+        EXPECT(tasks.front().cpu_paged_tensor.defined());
+    }
+    EXPECT(harness.drain->cpu_payload_head() == payload_head_before);
+    EXPECT(harness.drain->cpu_payload_tail_committed() == payload_tail_before);
+    EXPECT(harness.staging.head() == 0);
+    EXPECT(harness.staging.tail() == 0);
 }
 
 static void test_record_reservation_reclaims_per_entry() {
@@ -559,10 +723,15 @@ int main() {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::printf("test_ring_engine (current drain pipeline)\n");
+    test_ring_geometry_requires_payload_alignment();
+    test_native_reservation_uses_transport_alignment();
     test_static_force_flush();
     test_prefix_force_flush();
+    test_chunked_short_then_static_preserves_payload_offset();
     test_repeated_wrap_delivery();
     test_zero_byte_delivery();
+    test_zero_byte_record_reclaims_full_upper_bound();
+    test_cpu_direct_does_not_touch_ring_accounting();
     test_record_reservation_reclaims_per_entry();
     test_timed_drain_flush_uses_request_generations();
     test_drain_worker_binds_owner_device();

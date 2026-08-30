@@ -89,8 +89,7 @@ __host__ __device__ inline TwoSpan payload_compute_spans(
 // payload_advance_head -- commit a reservation of `nbytes` bytes.
 //
 // Call AFTER writing data into the spans returned by payload_compute_spans(),
-// but BEFORE publishing the corresponding TaskEntry (ready_seq must be the
-// last thing written so the consumer sees consistent spans).
+// but BEFORE publishing the corresponding ready/size word.
 // ---------------------------------------------------------------------------
 __host__ __device__ inline void payload_advance_head(
     uint64_t& head, uint64_t nbytes)
@@ -112,7 +111,7 @@ __host__ __device__ inline void payload_release(
 }
 
 // ---------------------------------------------------------------------------
-// payload_chunk_bytes -- payload bytes consumed by a TaskEntry.
+// payload_chunk_bytes -- payload bytes consumed by a published task.
 //
 // Convenience: just len1 + len2 (which equals the original nbytes argument
 // passed to payload_compute_spans).

@@ -2,7 +2,7 @@
 
 #include "ring/payload_ring.cuh"
 #include "ring/ring_config.h"
-#include "ring/task_entry.h"
+#include "ring/publication_word.h"
 #include "ring/task_ring.cuh"
 
 #include <cuda_runtime.h>
@@ -84,7 +84,7 @@ static void test_payload_spans() {
 }
 
 static void test_task_accounting_and_layout() {
-    banner("task accounting and 64-byte layout");
+    banner("task accounting and publication word layout");
     using namespace ring;
 
     EXPECT(task_free_slots(0, 0, 16) == 16);
@@ -92,14 +92,11 @@ static void test_task_accounting_and_layout() {
     EXPECT(task_free_slots(16, 0, 16) == 0);
     EXPECT(task_free_slots(1024, 1020, 16) == 12);
 
-    EXPECT(sizeof(TaskEntry) == 64);
-    EXPECT(alignof(TaskEntry) == 64);
-    EXPECT(offsetof(TaskEntry, ready_seq) == 0);
-    EXPECT(offsetof(TaskEntry, tensor_total_bytes) == 8);
-    EXPECT(offsetof(TaskEntry, payload_off1) == 16);
-    EXPECT(offsetof(TaskEntry, payload_len1) == 24);
-    EXPECT(offsetof(TaskEntry, payload_off2) == 32);
-    EXPECT(offsetof(TaskEntry, payload_len2) == 40);
+    EXPECT(sizeof(uint64_t) == 8);
+    EXPECT(PUBLICATION_READY == (uint64_t{1} << 63));
+    EXPECT(PUBLICATION_SIZE_MASK == PUBLICATION_READY - 1);
+    EXPECT(encode_publication(0) == PUBLICATION_READY);
+    EXPECT(encode_publication(123) == (PUBLICATION_READY | 123));
 }
 
 static void test_config_defaults() {
@@ -118,29 +115,32 @@ static void test_config_defaults() {
     EXPECT(cfg.effective_staging_bytes() == 4096);
 }
 
-__global__ void publish_range(ring::TaskEntry* entries, uint64_t capacity,
+__global__ void publish_range(uint64_t* slots, uint64_t capacity,
                               uint64_t start, uint64_t count) {
     if (blockIdx.x != 0 || threadIdx.x != 0) {
         return;
     }
     for (uint64_t i = 0; i < count; ++i) {
         const uint64_t sequence = start + i;
-        ring::TaskEntry entry{};
-        entry.tensor_total_bytes = 1000 + sequence;
-        entry.payload_off1 = sequence * 16;
-        entry.payload_len1 = 900 + sequence;
-        entry.payload_off2 = 0;
-        entry.payload_len2 = 100;
-        ring::task_publish(entries, capacity, sequence, entry);
+        ring::task_publish(slots, capacity, sequence, 1000 + sequence);
     }
 }
 
-static ring::TaskEntry* allocate_entries(uint64_t capacity) {
-    ring::TaskEntry* entries = nullptr;
-    CUDA_CHECK(cudaMallocManaged(&entries, capacity * sizeof(ring::TaskEntry)));
-    ring::task_ring_init(entries, capacity);
+static uint64_t* allocate_slots(uint64_t capacity) {
+    uint64_t* slots = nullptr;
+    CUDA_CHECK(cudaMallocManaged(&slots, capacity * sizeof(uint64_t)));
+    ring::task_ring_init(slots, capacity);
     CUDA_CHECK(cudaDeviceSynchronize());
-    return entries;
+    return slots;
+}
+
+static bool acquire_publication(const uint64_t* slot, uint64_t& word) {
+    word = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    return (word & ring::PUBLICATION_READY) != 0;
+}
+
+static void clear_publication(uint64_t* slot) {
+    __atomic_store_n(slot, uint64_t{0}, __ATOMIC_RELEASE);
 }
 
 static void test_task_fifo_and_ready_lifecycle() {
@@ -149,25 +149,23 @@ static void test_task_fifo_and_ready_lifecycle() {
 
     constexpr uint64_t capacity = 64;
     constexpr uint64_t count = 50;
-    TaskEntry* entries = allocate_entries(capacity);
+    uint64_t* slots = allocate_slots(capacity);
 
-    EXPECT(!task_cpu_ready(entries, capacity, 0));
-    publish_range<<<1, 1>>>(entries, capacity, 0, count);
+    uint64_t word = 0;
+    EXPECT(!acquire_publication(&slots[0], word));
+    publish_range<<<1, 1>>>(slots, capacity, 0, count);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     for (uint64_t sequence = 0; sequence < count; ++sequence) {
-        EXPECT(task_cpu_ready(entries, capacity, sequence));
-        const TaskEntry& entry = entries[sequence % capacity];
-        EXPECT(entry.ready_seq == sequence);
-        EXPECT(entry.tensor_total_bytes == 1000 + sequence);
-        EXPECT(entry.payload_off1 == sequence * 16);
-        EXPECT(entry.payload_len1 + entry.payload_len2 == 1000 + sequence);
-        task_release_cpu(entries, capacity, sequence);
-        EXPECT(!task_cpu_ready(entries, capacity, sequence));
-        EXPECT(entry.ready_seq == READY_SEQ_SENTINEL);
+        uint64_t* slot = &slots[sequence % capacity];
+        EXPECT(acquire_publication(slot, word));
+        EXPECT((word & PUBLICATION_SIZE_MASK) == 1000 + sequence);
+        clear_publication(slot);
+        EXPECT(!acquire_publication(slot, word));
+        EXPECT(*slot == 0);
     }
-    EXPECT(!task_cpu_ready(entries, capacity, count));
-    CUDA_CHECK(cudaFree(entries));
+    EXPECT(!acquire_publication(&slots[count % capacity], word));
+    CUDA_CHECK(cudaFree(slots));
 }
 
 static void test_task_wrap_reuse() {
@@ -175,17 +173,19 @@ static void test_task_wrap_reuse() {
     using namespace ring;
 
     constexpr uint64_t capacity = 4;
-    TaskEntry* entries = allocate_entries(capacity);
+    uint64_t* slots = allocate_slots(capacity);
+    uint64_t word = 0;
 
     for (uint64_t sequence = 0; sequence < capacity * 3; ++sequence) {
-        publish_range<<<1, 1>>>(entries, capacity, sequence, 1);
+        publish_range<<<1, 1>>>(slots, capacity, sequence, 1);
         CUDA_CHECK(cudaDeviceSynchronize());
-        EXPECT(task_cpu_ready(entries, capacity, sequence));
-        EXPECT(entries[sequence % capacity].tensor_total_bytes == 1000 + sequence);
-        task_release_cpu(entries, capacity, sequence);
-        EXPECT(entries[sequence % capacity].ready_seq == READY_SEQ_SENTINEL);
+        uint64_t* slot = &slots[sequence % capacity];
+        EXPECT(acquire_publication(slot, word));
+        EXPECT((word & PUBLICATION_SIZE_MASK) == 1000 + sequence);
+        clear_publication(slot);
+        EXPECT(*slot == 0);
     }
-    CUDA_CHECK(cudaFree(entries));
+    CUDA_CHECK(cudaFree(slots));
 }
 
 int main() {

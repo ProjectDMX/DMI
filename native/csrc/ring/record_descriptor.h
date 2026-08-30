@@ -28,7 +28,7 @@ struct PayloadSlice {
 
     // A missing length means "all actual payload bytes after offset".  This is
     // required for a dynamic producer whose exact byte count is device-known
-    // only when its TaskEntry becomes ready.  An explicit zero remains a real
+    // only when its publication becomes ready. An explicit zero remains a real
     // zero-length slice.
     std::optional<uint64_t> length_bytes;
 

@@ -377,6 +377,11 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
                                uint32_t num_hooks)
 {
     impl_->current_hook_idx = 0;
+    if (step_total_bytes % ring::PAYLOAD_ALIGN != 0) {
+        throw std::invalid_argument(
+            "prepare_step total must be a sum of per-tensor aligned "
+            "transport sizes");
+    }
 
     // actual_bytes_counter reclamation: DISABLED for now (see below).
     //
@@ -636,7 +641,8 @@ uint64_t RingEnginePy::available_capacity() const {
 // upcoming producer kernel launch.  Caller must have checked
 // available_capacity() first.  drain.reserve takes mgmt_mu_ internally.
 void RingEnginePy::reserve_one(uint64_t nbytes) {
-    impl_->engine.drain_thread().reserve(nbytes, 1);
+    impl_->engine.drain_thread().reserve(
+        ring::align_up(nbytes, ring::PAYLOAD_ALIGN), 1);
 }
 
 // Synchronise the current CUDA stream so all queued producer kernels

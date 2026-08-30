@@ -2,7 +2,6 @@
 // Compiled with g++ (not nvcc); uses ATen for tensor operations.
 
 #include "p2p_thread.h"
-#include "task_entry.h"
 #include "pinned_staging.h"
 
 #include <ATen/ATen.h>

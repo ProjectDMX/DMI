@@ -41,9 +41,11 @@ namespace ring {
 
 __device__ bool g_ring_null_mode = false;
 
-// Counter for last-block-arrives pattern.  Reset by the last block after
-// publishing.  Safe without host-side reset because producers are serialized
-// on one stream -- the next launch cannot start until the current finishes.
+// IMPORTANT ASSUMPTION: Every producer kernel on this device runs on one
+// stream. This last-block-arrives counter is shared
+// by all launches, so overlapping launches would mix arrivals, publish early,
+// and let one launch reset another's count. The last block resets it only after
+// publishing, before the next producer launch on that stream can begin.
 __device__ uint32_t g_block_done_counter = 0;
 
 void set_ring_null_mode(bool enabled) {
@@ -59,8 +61,10 @@ static_assert(PAYLOAD_ALIGN == sizeof(uint4),
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-// Grid-stride vectorized D2D copy.  Uses global thread ID (gtid) and total
-// thread count (stride) so all blocks in the grid participate.
+// Grid-stride D2D copy. Use uint4 only when both effective addresses satisfy
+// its alignment requirement; tensor views, packed offsets, or wrap spans may
+// make either address unaligned even when the ring allocation itself is
+// aligned.
 __device__ inline void d2d_copy_grid_stride(
     uint8_t*       dst,
     const uint8_t* src,
@@ -69,6 +73,15 @@ __device__ inline void d2d_copy_grid_stride(
     uint64_t       stride)
 {
     constexpr uint64_t VEC = sizeof(uint4);
+    const uintptr_t address_bits =
+        reinterpret_cast<uintptr_t>(dst) |
+        reinterpret_cast<uintptr_t>(src);
+    if ((address_bits & (VEC - 1)) != 0) {
+        for (uint64_t i = gtid; i < nbytes; i += stride)
+            dst[i] = src[i];
+        return;
+    }
+
     const uint64_t n_vec = nbytes / VEC;
     const uint64_t tail  = nbytes - n_vec * VEC;
 
@@ -119,39 +132,42 @@ __device__ inline void publish_last_block_arrives(
     uint64_t       task_head,
     uint64_t       payload_head,
     uint64_t       alloc_bytes,
-    const TwoSpan& spans,
     uint64_t       actual_total)
 {
     if (threadIdx.x != 0) return;
+
+    // Every caller has just completed a block-wide __syncthreads(). This
+    // thread-0 release fence therefore orders the joined payload writes from
+    // the whole block before its relaxed arrival-counter RMW. The last block's
+    // acquire fence below completes the cross-block fence/fence join.
+    cuda::atomic_thread_fence(cuda::memory_order_release,
+                              cuda::thread_scope_device);
+
     uint32_t finished = atomicAdd(&g_block_done_counter, 1);
     if (finished != gridDim.x - 1) return;
 
-    // Last block: all copy stores are globally visible (caller __threadfence'd
-    // before calling this helper).
+    // Pair with every block's thread-0 pre-arrival release fence. The relaxed
+    // counter identifies the last block; this acquire fence imports every
+    // block's joined payload writes before publication.
+    cuda::atomic_thread_fence(cuda::memory_order_acquire,
+                              cuda::thread_scope_device);
+
     uint64_t ph = payload_head;
     payload_advance_head(ph, alloc_bytes);
 
-    const uint64_t len1 = (actual_total < spans.len1) ? actual_total : spans.len1;
-
-    TaskEntry entry{};
-    entry.tensor_total_bytes = actual_total;
-    entry.payload_off1       = spans.off1;
-    entry.payload_len1       = len1;
-    entry.payload_off2       = spans.off2;
-    entry.payload_len2       = actual_total - len1;
-
-    task_publish(ring.task_entries, ring.task_cap, task_head, entry);
+    task_publish(ring.publication_slots, ring.task_cap, task_head, actual_total);
     *ring.task_head    = task_head + 1;
     *ring.payload_head = ph;
 
-    // Monotonic accumulator of actual bytes written.  The __threadfence()
-    // before publish orders D2D stores before this work; a CPU observer that
-    // sees the counter also sees the bytes whose write it accounts for.
+    // Monotonic accumulator of actual bytes written. The per-block release
+    // fences, last-block acquire, and system release publication order all
+    // joined D2D stores before this accounting work.
     atomicAdd(reinterpret_cast<unsigned long long*>(ring.actual_bytes_counter),
               static_cast<unsigned long long>(actual_total));
 
-    // Reset for the next launch on this stream.
-    g_block_done_counter = 0;
+    // Keep every access to the cross-block counter atomic. A plain store here
+    // would race with the other blocks' relaxed atomic RMWs.
+    atomicExch(&g_block_done_counter, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +211,7 @@ __global__ void producer_static_kernel(
     __syncthreads();
 
     publish_last_block_arrives(ring, task_head, payload_head, alloc_bytes,
-                               spans, nbytes);
+                               nbytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +270,7 @@ __global__ void producer_prefix_kernel(
     __syncthreads();
 
     publish_last_block_arrives(ring, task_head, payload_head, alloc_bytes,
-                               spans, actual_bytes);
+                               actual_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +306,7 @@ __global__ void producer_chunked_kernel(
     const uint64_t actual_total = static_cast<uint64_t>(s_prefix[K]);
     const uint64_t chunk_in_bytes = nbytes_upper / K;
 
-    const uint64_t alloc_bytes  = align_up(nbytes_upper, PAYLOAD_ALIGN);
+    const uint64_t alloc_bytes  = align_up(actual_total, PAYLOAD_ALIGN);
     const uint64_t task_head    = *ring.task_head;
     const uint64_t payload_head = *ring.payload_head;
     const TwoSpan  spans        = payload_compute_spans(payload_head,
@@ -318,7 +334,7 @@ __global__ void producer_chunked_kernel(
     __syncthreads();
 
     publish_last_block_arrives(ring, task_head, payload_head, alloc_bytes,
-                               spans, actual_total);
+                               actual_total);
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +442,7 @@ __global__ void record_producer_static_kernel(
     __threadfence();
     __syncthreads();
     publish_last_block_arrives(
-        ring, task_head, payload_head, alloc_bytes, spans, nbytes);
+        ring, task_head, payload_head, alloc_bytes, nbytes);
 }
 
 __global__ void record_producer_prefix_kernel(
@@ -461,7 +477,7 @@ __global__ void record_producer_prefix_kernel(
     __threadfence();
     __syncthreads();
     publish_last_block_arrives(
-        ring, task_head, payload_head, alloc_bytes, spans, actual_bytes);
+        ring, task_head, payload_head, alloc_bytes, actual_bytes);
 }
 
 __global__ void record_producer_chunked_kernel(
@@ -515,7 +531,7 @@ __global__ void record_producer_chunked_kernel(
     __threadfence();
     __syncthreads();
     publish_last_block_arrives(
-        ring, task_head, payload_head, alloc_bytes, spans, actual_bytes);
+        ring, task_head, payload_head, alloc_bytes, actual_bytes);
 }
 
 __global__ void record_producer_seq_prefix_pack_kernel(
@@ -563,7 +579,7 @@ __global__ void record_producer_seq_prefix_pack_kernel(
     __threadfence();
     __syncthreads();
     publish_last_block_arrives(
-        ring, task_head, payload_head, alloc_bytes, spans, actual_bytes);
+        ring, task_head, payload_head, alloc_bytes, actual_bytes);
 }
 
 __global__ void record_producer_segmented_pack_kernel(
@@ -633,7 +649,7 @@ __global__ void record_producer_segmented_pack_kernel(
     __threadfence();
     __syncthreads();
     publish_last_block_arrives(
-        ring, task_head, payload_head, alloc_bytes, spans, actual_bytes);
+        ring, task_head, payload_head, alloc_bytes, actual_bytes);
 }
 
 // ---------------------------------------------------------------------------
