@@ -107,6 +107,91 @@ concurrent indexers, and it forbids re-packing rather than supporting it.
 reachable today, and the cost of the fix rises sharply after the first
 deployment.
 
+## The mid-batch gap, and why the obvious fix fails
+
+Snapshot membership is a predicate over a live table:
+
+```
+(store_id, pack_id) IN (SELECT store_id, pack_id FROM {prefix}_pack_commit_log
+                        WHERE index_version <= W)
+```
+
+Commit rows are written before the watermark is published, so indexer A can
+write its rows at version 5, indexer B can publish version 6, a reader can pin
+W = 6, and A's rows then appear inside that pinned snapshot. The snapshot grew
+after it was pinned.
+
+The natural repair -- write membership rows at publish time instead, and have
+the publisher verify afterwards that it is the highest published version --
+does not work, and this was demonstrated against a live server rather than
+argued:
+
+```
+pinned watermark          : 6
+packs in pinned snapshot  : one
+publisher of 5 detects it lost the race to 6, as designed
+packs in pinned snapshot  : two
+```
+
+The loser writes its membership rows before it discovers it lost. Those rows
+sit at a version below W, the clause admits everything below W, and the check
+that would have vetoed them runs after they are already durable.
+
+The general form is worth stating, because it rules out a whole family of
+attempted fixes: **no `<= W` predicate over an append-only table can be made
+sound by a post-write check.** The write that confers visibility necessarily
+precedes the check that would withdraw it. Soundness has to come from the
+shape of the data, not from a verification step.
+
+### Three repairs, in increasing cost
+
+**Gate visibility on a marker written after the check.** Order the publish as
+membership rows, then verify, then the watermark row, and require a version to
+appear in the watermark table before its rows count. A loser never writes that
+row, so its rows are permanently inert. This closes the window that is
+reachable today -- the whole descriptor-writing phase, seconds wide -- and
+leaves a residual of roughly one round trip, when two publishers both read the
+barrier before either writes its watermark row. Cheap, strictly better than
+today, still not sound.
+
+**Write the full membership set per version.** Each publish enumerates every
+pack in the snapshot, and membership becomes `index_version = W` exactly. The
+set for W is complete before W's watermark row exists, so nothing another
+publisher does later can alter it. Airtight, and it pays a per-publish cost
+proportional to the whole catalog rather than to the batch, which grows without
+bound.
+
+**Require contiguity.** Publish version V only once every lower version is
+either published or durably abandoned. Then publish order equals version order
+by construction and `<= W` is sound again, at O(new packs) per publish and with
+no chain to walk at read time. The cost moves to liveness: a publisher that
+crashes holding a version blocks the ones behind it until an abandonment
+protocol reclaims it, and abandonment has to be raced correctly against a
+publish that is merely slow. The same append-and-read-back pattern the version
+allocator already uses works here, because an abandonment marker is inert --
+unlike membership rows, writing one confers nothing.
+
+Parent chaining -- each publish records the snapshot it builds on, and
+membership follows the chain back from W -- is sound at the same write cost,
+and moves the expense to resolving the chain at pin time, which needs periodic
+checkpointing to stay cheap as publishes accumulate. It is the table-format
+answer, and worth reaching for if the catalog ever grows a second writer that
+cannot be serialised.
+
+### What to do now
+
+None of this is reachable with a single indexer: one writer cannot race
+itself. The whole concern is about the multi-indexer future the version
+allocator was built for, so the decision is really about when that future
+arrives.
+
+If it is near, take the contiguity rule -- it is the cheapest sound option and
+does not require a read-side chain walk. If it is not, the honest move is to
+leave the predicate as it is and keep this section as the record of why, rather
+than spend churn on a marker-gated variant that is smaller but still unsound.
+What should not happen is shipping the post-write check and calling the gap
+closed.
+
 ## Where the catalog goes later
 
 The deeper version of this problem is that immutable facts ("capture X is in
