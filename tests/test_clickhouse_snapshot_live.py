@@ -152,6 +152,122 @@ def test_a_merge_does_not_destroy_a_pinned_snapshot():
         assert after[0] == before[0], "the resolved descriptor changed under a merge"
 
 
+def _copied_to_another_store(descriptors):
+    """An operator copies the pack object into a second bucket, then reconciles.
+
+    Replay dedup keys on (store_id, pack_id), so a new store is not a replay:
+    the indexer writes a fresh descriptor row for every capture in the pack.
+    Same pack id, same captures, different store and object key. Reachable
+    today with shipped components.
+    """
+    return tuple(
+        replace(
+            item,
+            locator=replace(
+                item.locator,
+                store_id="second-store",
+                object_key="mirror/" + item.locator.object_key,
+            ),
+        )
+        for item in descriptors
+    )
+
+
+def _retried_into_a_new_pack(descriptors):
+    """A producer retries a capture_id after the first pack was sealed.
+
+    Within one open pack a repeat raises DuplicateCaptureError, but a sealed
+    pack is forgotten, so retry-after-ambiguity lands the same capture in a
+    second pack with a different offset.
+    """
+    pack_id = str(uuid4())
+    return tuple(
+        replace(
+            item,
+            locator=replace(
+                item.locator,
+                pack_id=pack_id,
+                object_key=f"packs/{pack_id}.dmi-pack",
+                offset=item.locator.offset + 1_048_576,
+            ),
+        )
+        for item in descriptors
+    )
+
+
+@pytest.mark.parametrize(
+    "second_description", (_copied_to_another_store, _retried_into_a_new_pack)
+)
+def test_two_packs_describing_one_capture_both_survive_a_merge(second_description):
+    """The reason pack identity is in the sort key.
+
+    ReplacingMergeTree deletes rows sharing a sort key. On capture identity
+    alone these two rows share one, so a merge would keep the higher version
+    and silently delete the other -- and a snapshot pinned to the deleted row's
+    pack then fails with "selection no longer resolves". A forced OPTIMIZE is
+    the honest test: a background merge does the same at a time nobody
+    controls, so a read-immediately test could never see it.
+    """
+    original = synthetic_descriptors(3)
+    copied = second_description(original)
+    with _catalog() as (writer, reader, client, config):
+        writer.write_descriptors(original, index_version=1)
+        _commit(writer, original, 1)
+        _publish(writer, 1)
+        pinned = reader.current_watermark()
+
+        writer.write_descriptors(copied, index_version=2)
+        _commit(writer, copied, 2)
+        _publish(writer, 2)
+
+        _merge(client, config)
+
+        assert _raw_rows(client, config) == len(original) + len(copied), (
+            "a merge collapsed two packs' descriptions of one capture; the "
+            "pinned snapshot over the losing pack can no longer resolve"
+        )
+
+        # And the pin still resolves to the pack it was taken over, while a
+        # fresh watermark sees the newer pack win.
+        tenant = original[0].metadata.tenant_id
+        capture_id = original[0].capture_id
+        at_pin = reader.get_by_ids([capture_id], tenant_id=tenant, watermark=pinned)
+        assert len(at_pin) == 1
+        assert at_pin[0].locator == original[0].locator
+
+        at_fresh = reader.get_by_ids(
+            [capture_id], tenant_id=tenant, watermark=reader.current_watermark()
+        )
+        assert len(at_fresh) == 1, "supersession must still yield one row"
+        assert at_fresh[0].locator == copied[0].locator
+
+
+def test_re_indexing_one_pack_still_collapses_to_a_single_row():
+    """The case ReplacingMergeTree is actually here for.
+
+    Rows for one capture in the SAME pack share the whole sort key, pack
+    identity included, and are byte identical -- so a merge is free to keep
+    either. Losing that would make every replay grow the table forever.
+    """
+    corpus = synthetic_descriptors(4)
+    with _catalog() as (writer, reader, client, config):
+        for version in (1, 2, 3):
+            writer.write_descriptors(corpus, index_version=version)
+            _commit(writer, corpus, version)
+            _publish(writer, version)
+        assert _raw_rows(client, config) == 3 * len(corpus)
+
+        _merge(client, config)
+
+        assert _raw_rows(client, config) == len(corpus), (
+            "replayed descriptor rows stopped collapsing"
+        )
+        page = reader.search(
+            CaptureQuery(limit=10, tenant_id=corpus[0].metadata.tenant_id)
+        )
+        assert page.items == corpus
+
+
 def test_a_pack_committed_after_the_watermark_is_not_visible():
     """The snapshot boundary has to actually exclude later work."""
     early = synthetic_descriptors(2)

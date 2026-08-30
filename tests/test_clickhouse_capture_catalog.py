@@ -95,6 +95,15 @@ def test_clickhouse_catalog_creates_replay_safe_raw_tables_and_final_views():
     assert "ReplacingMergeTree(index_version)" in ddl
     assert "FROM `default`.`dmi_capture_raw` FINAL" in ddl
     assert "FROM `default`.`dmi_pack_inventory_raw` FINAL" in ddl
+    # Pack identity closes the sort key. Without it ReplacingMergeTree would be
+    # free to delete one of two rows describing one capture in two packs, and a
+    # snapshot pinned to the deleted row's pack would stop resolving. ORDER BY
+    # cannot be altered in place, so this pin is the thing that keeps a
+    # deployment from needing a copy migration.
+    assert (
+        "ORDER BY (tenant_id, experiment_id, run_id, captured_at_ns, "
+        "capture_id, store_id, pack_id)"
+    ) in ddl
     # The allocator's claim ledger is append-only and ordered by the claim
     # itself -- claimed_at_ns is diagnostic, never part of the ordering.
     assert "`dmi_capture_version_claims`" in ddl

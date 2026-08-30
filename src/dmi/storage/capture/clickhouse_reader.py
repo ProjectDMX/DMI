@@ -12,12 +12,18 @@ sorting key and delete the rest during a merge. Any snapshot phrased as
 controls: after a merge, the version it wanted is simply gone. Bounding on pack
 commits instead depends only on an append-only log, which no merge rewrites.
 
-The reason this works is that a descriptor is derived from an immutable pack
-footer, so re-indexing a pack rewrites byte-identical rows. There is no content
-to choose between, which is why ``argMax`` here is deduplication rather than
-version selection, and why it does not matter which duplicate a merge keeps.
+A merge can only ever collapse rows describing one capture in ONE pack, because
+pack identity is part of the table's sort key, and those rows are byte
+identical -- re-indexing a pack reads the same immutable footer twice. So no
+merge can destroy a row a pinned snapshot still needs.
 ``test_replay_is_invisible_because_it_rewrites_identical_descriptors`` guards
 that invariant; if it ever breaks, this design has to be revisited.
+
+Rows describing one capture in DIFFERENT packs survive side by side, and
+``argMax(..., index_version)`` grouped on capture identity picks between them:
+newest-wins. A reader pinned before the second pack was committed never sees
+its rows at all, because the membership clause excludes that pack, so the pin
+still resolves to the pack it was taken over.
 
 The watermark itself comes from a published log rather than from
 ``max(index_version)`` over the descriptors, because one indexing call writes
@@ -49,9 +55,20 @@ from .model import (
 )
 
 
-# The catalog sort key, and therefore the keyset pagination order. These are the
-# table's ORDER BY prefix, so the tuple comparison that advances a page prunes
-# granules on the primary index instead of scanning.
+# Capture identity: what one result row is one of, and therefore the GROUP BY,
+# the result ORDER BY and the keyset pagination order.
+#
+# Deliberately NOT the descriptor table's physical sort key
+# (``clickhouse_catalog._CAPTURE_TABLE_ORDER``, which appends store_id and
+# pack_id so a merge cannot collapse two packs' rows for one capture). Grouping
+# on the physical key instead would emit one row per pack for a capture
+# described in two of them: supersession would stop resolving newest-wins, and
+# a page could carry the same capture twice with different locators.
+#
+# It is still a *prefix* of that physical key, which is what lets the tuple
+# comparison that advances a page prune granules on the primary index instead
+# of scanning; ``test_the_logical_sort_key_is_a_prefix_of_the_table_order``
+# pins the two together.
 _SORT_KEY = ("tenant_id", "experiment_id", "run_id", "captured_at_ns", "capture_id")
 _SORT_KEY_SET = frozenset(_SORT_KEY)
 
@@ -227,8 +244,9 @@ class ClickHouseCaptureCatalog:
             "capture_ids": list(capture_ids),
         }
         # tenant_id leads the WHERE clause because it is the first ORDER BY
-        # column: without it, a capture_id-only filter -- the LAST sort-key
-        # column -- prunes nothing, and every lookup scans the whole table
+        # column: without it, a capture_id-only filter -- capture_id sits
+        # behind captured_at_ns in the sort key, and a lookup supplies no time
+        # bound -- prunes nothing, and every lookup scans the whole table
         # (then trips max_rows_to_read once the catalog is large). With it,
         # the primary index narrows the read to one tenant's range, and the
         # capture_id bloom-filter skip index prunes granules inside it.
@@ -253,10 +271,11 @@ class ClickHouseCaptureCatalog:
 
     @staticmethod
     def _projection() -> str:
-        # Sort-key columns are grouped on, so they project directly; everything
-        # else collapses whatever duplicate rows survive. Any version of a
-        # descriptor is byte identical to any other, so argMax here is
-        # deduplication rather than version selection.
+        # Capture-identity columns are grouped on, so they project directly;
+        # everything else resolves through argMax. Within one pack that is
+        # deduplication (the rows are byte identical); across packs it is
+        # version selection, and picking newest-wins is what makes a capture
+        # re-described by a later pack resolve to that pack.
         #
         # Deliberately unaliased: naming an aggregate after its own source
         # column shadows that column everywhere else in the statement, and
@@ -274,10 +293,11 @@ class ClickHouseCaptureCatalog:
         self, query: CaptureQuery, *, watermark: int, after: CursorKey | None
     ) -> tuple[list[str], dict[str, object]]:
         # The snapshot is the set of packs committed at or before the
-        # watermark, not a range of descriptor versions. Descriptor rows are
-        # byte identical across re-indexing, so which version survives a merge
-        # is irrelevant -- but a version *range* over them is not durable,
-        # because ReplacingMergeTree deletes superseded rows.
+        # watermark, not a range of descriptor versions: a version *range* over
+        # descriptor rows is not durable, because ReplacingMergeTree deletes
+        # rows sharing a sort key at a time nobody controls. Bounding on packs
+        # is also what makes a pin resolve to the pack it was taken over when a
+        # later pack re-describes the same capture.
         clauses = [
             # Pack identity is (store_id, pack_id): matching on pack_id alone
             # would let the same UUID committed by a second store at a later

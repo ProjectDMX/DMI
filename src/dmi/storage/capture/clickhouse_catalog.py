@@ -88,6 +88,27 @@ _PACK_COLUMNS = (
     "record_count", "index_version",
 )
 
+# The descriptor table's PHYSICAL sort key, which is not the same thing as the
+# logical capture identity the reader groups, orders and paginates on
+# (``clickhouse_reader._SORT_KEY``, the five columns this starts with).
+#
+# ReplacingMergeTree deletes rows that share a sort key, keeping the highest
+# index_version. On capture identity alone that is only safe while two rows for
+# one capture are byte identical -- which nothing enforces. A pack copied to a
+# second store and reconciled, or a producer retrying a capture_id after the
+# first pack was sealed, both produce two rows for one capture with different
+# locators; a merge would then silently delete one, and a snapshot pinned to the
+# deleted row's pack fails with "selection no longer resolves". Appending pack
+# identity gives those rows different keys, so no merge can collapse them.
+#
+# Rows for one capture in the SAME pack still share the full key and still
+# collapse -- and those really are byte identical, which is the replay case the
+# engine is here for.
+_CAPTURE_TABLE_ORDER = (
+    "tenant_id", "experiment_id", "run_id", "captured_at_ns", "capture_id",
+    "store_id", "pack_id",
+)
+
 
 class ClickHouseCatalogWriter:
     def __init__(
@@ -125,7 +146,7 @@ payload_offset UInt64, stored_length UInt64, decoded_length UInt64,
 codec LowCardinality(String), payload_checksum FixedString(8), index_version UInt64,
 {_facet_ddl()}
 ) ENGINE = ReplacingMergeTree(index_version)
-ORDER BY (tenant_id, experiment_id, run_id, captured_at_ns, capture_id)"""
+ORDER BY ({', '.join(_CAPTURE_TABLE_ORDER)})"""
         )
         self._client.execute(
             f"""CREATE TABLE IF NOT EXISTS {pack_raw} (
@@ -145,8 +166,9 @@ ORDER BY (store_id, pack_id)"""
             )
 
         # Point lookups arrive with tenant + capture_id. The primary key
-        # prunes to the tenant's range, but capture_id is the LAST ORDER BY
-        # column, so inside a large tenant the primary index cannot narrow
+        # prunes to the tenant's range, but capture_id sits behind
+        # captured_at_ns in the ORDER BY and a point lookup supplies no time
+        # bound, so inside a large tenant the primary index cannot narrow
         # further; the bloom filter prunes granules within that range.
         self._client.execute(
             f"ALTER TABLE {capture_raw} ADD INDEX IF NOT EXISTS "
@@ -182,12 +204,12 @@ version UInt64, claim_id UUID, claimed_at_ns UInt64
 ) ENGINE = MergeTree ORDER BY (version, claim_id)"""
         )
 
-        # The snapshot boundary. A capture belongs to exactly one immutable
-        # pack, so "the catalog as of W" is "the packs committed at or before
-        # W" -- a fact about packs, not about descriptor rows. Keeping it here,
-        # append-only, is what lets the descriptor table stay a
-        # ReplacingMergeTree: every version of a descriptor row is byte
-        # identical, so it does not matter which one a merge keeps.
+        # The snapshot boundary. "The catalog as of W" is "the packs committed
+        # at or before W" -- a fact about packs, not about descriptor rows.
+        # Keeping it here, append-only, is what lets the descriptor table stay
+        # a ReplacingMergeTree: the only rows that table can now collapse are
+        # rows for one capture in one pack, and those are byte identical, so it
+        # does not matter which one a merge keeps.
         self._client.execute(
             f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._commit_log)} (
 pack_id UUID, store_id LowCardinality(String), index_version UInt64

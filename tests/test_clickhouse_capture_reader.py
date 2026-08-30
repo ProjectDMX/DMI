@@ -128,6 +128,39 @@ def test_search_resolves_columns_with_argmax_at_the_watermark():
         assert f"AS `{name}`" not in sql
 
 
+def test_the_logical_sort_key_is_a_prefix_of_the_table_order():
+    """The two keys are decoupled, but only in one direction.
+
+    The reader groups, orders and paginates on capture identity; the table is
+    physically ordered on capture identity *plus* pack identity, so a merge
+    cannot collapse two packs' rows for one capture. Those must stay in a
+    prefix relationship: if the logical key ever stopped being a prefix, the
+    keyset comparison that advances a page would stop pruning on the primary
+    index and every page would scan the table.
+    """
+    from dmi.storage.capture.clickhouse_catalog import _CAPTURE_TABLE_ORDER
+    from dmi.storage.capture.clickhouse_reader import _SORT_KEY
+
+    assert _CAPTURE_TABLE_ORDER[: len(_SORT_KEY)] == _SORT_KEY
+    # And the extra columns really are pack identity, resolved by argMax rather
+    # than grouped on -- grouping on them would emit one row per pack for a
+    # re-described capture instead of one newest-wins row.
+    assert _CAPTURE_TABLE_ORDER[len(_SORT_KEY) :] == ("store_id", "pack_id")
+
+
+def test_pack_identity_is_resolved_by_argmax_not_grouped_on():
+    """Supersession lives here: newest pack wins, one row per capture."""
+    catalog, client = _catalog(descriptors=synthetic_descriptors(1))
+
+    catalog.search(CaptureQuery(limit=10))
+
+    sql = client.selects[0]
+    group_by = sql.split("GROUP BY")[1].split("ORDER BY")[0]
+    for name in ("store_id", "pack_id"):
+        assert f"argMax(`{name}`, index_version)" in sql
+        assert name not in group_by
+
+
 def test_search_groups_and_orders_by_the_sort_key():
     catalog, client = _catalog(descriptors=synthetic_descriptors(1))
 
