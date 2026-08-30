@@ -17,6 +17,7 @@ namespace py = pybind11;
 #include "dmx_host_engine.h"
 #ifndef DMI_HOST_ONLY
 #include "clickhouse_record_sink.h"
+#include "reference_python_capture_sink.h"
 #include "ring/ring_engine_py.h"
 #include "ring/ring_torch_op.h"
 #include "ring/tensor_meta.h"
@@ -137,6 +138,29 @@ std::shared_ptr<dmx_host::ClickHouseRecordSink> MakeClickHouseRecordSink(
             dmx_host::DMXHostEngine::Duration(timeout_s));
       },
       [host] { host->raise_if_failed(); });
+}
+
+std::shared_ptr<ring_py::RingEnginePy> MakeRecordRingEngine(
+    ring_py::RingConfig cfg, std::shared_ptr<ring::RecordSink> sink) {
+  if (!std::dynamic_pointer_cast<
+          dmi_capture::ReferencePythonCaptureSink>(sink)) {
+    return std::make_shared<ring_py::RingEnginePy>(
+        std::move(cfg), std::move(sink));
+  }
+  // Only the Python-backed reference sink can wait for the GIL from its
+  // record worker.  Release it around destruction so an omitted explicit
+  // close cannot deadlock GC.  Production/native sinks retain their original
+  // construction and destruction path.
+  return std::shared_ptr<ring_py::RingEnginePy>(
+      new ring_py::RingEnginePy(std::move(cfg), std::move(sink)),
+      [](ring_py::RingEnginePy* engine) {
+        if (PyGILState_Check()) {
+          py::gil_scoped_release release;
+          delete engine;
+        } else {
+          delete engine;
+        }
+      });
 }
 
 ring::RecordDescriptor CopyRecordDescriptor(
@@ -602,8 +626,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
       .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
 
-  // Native-only extension point.  No Python trampoline is registered: sink
-  // callbacks stay off the GIL-bound Python hot path.
+  // Production sinks remain native-only.  The explicitly named reference
+  // bridge below is opt-in and intentionally pays the Python GIL/copy cost.
   py::class_<ring::RecordSink, std::shared_ptr<ring::RecordSink>>(
       m, "RecordSink");
   py::class_<dmx_host::ClickHouseRecordSink, ring::RecordSink,
@@ -613,6 +637,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              return MakeClickHouseRecordSink(std::move(host));
            }),
            py::arg("host_engine"));
+  py::class_<dmi_capture::ReferencePythonCaptureSink, ring::RecordSink,
+             std::shared_ptr<dmi_capture::ReferencePythonCaptureSink>>(
+      m, "ReferencePythonCaptureSink")
+      .def(py::init([](py::object target) {
+             return std::make_shared<
+                 dmi_capture::ReferencePythonCaptureSink>(target.ptr());
+           }),
+           py::arg("target"))
+      .def("_attach_target",
+           &dmi_capture::ReferencePythonCaptureSink::attach_target)
+      .def("_detach_target",
+           &dmi_capture::ReferencePythonCaptureSink::detach_target)
+      .def("_release_target",
+           &dmi_capture::ReferencePythonCaptureSink::release_target)
+      .def_property_readonly(
+          "attached", &dmi_capture::ReferencePythonCaptureSink::attached);
 
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
@@ -653,8 +693,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 sink = MakeClickHouseRecordSink(std::move(host));
               }
             }
-            return std::make_shared<ring_py::RingEnginePy>(
-                std::move(cfg), std::move(sink));
+            return MakeRecordRingEngine(std::move(cfg), std::move(sink));
           },
           py::arg("config"), py::arg("sink_or_host") = py::none())
       .def("init",  &ring_py::RingEnginePy::init,

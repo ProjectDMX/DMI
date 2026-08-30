@@ -93,6 +93,23 @@ from .spool import (
     UploadSnapshot,
 )
 
+
+_REFERENCE_ADAPTER_EXPORTS = frozenset(
+    {"CapturePackReferenceSink", "CapturePayloadSlice", "CaptureRecordFormat"}
+)
+
+
+def __getattr__(name: str):
+    if name in _REFERENCE_ADAPTER_EXPORTS:
+        from . import record_adapter
+
+        return getattr(record_adapter, name)
+    raise AttributeError(name)
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _REFERENCE_ADAPTER_EXPORTS)
+
 __all__ = [
     "ArtifactProducer",
     "ArtifactRef",
@@ -103,9 +120,12 @@ __all__ = [
     "CaptureDescriptor",
     "CaptureMetadata",
     "CapturePage",
+    "CapturePackReferenceSink",
+    "CapturePayloadSlice",
     "CaptureQuery",
     "CaptureReader",
     "CaptureRecord",
+    "CaptureRecordFormat",
     "CaptureSelection",
     "CaptureSummary",
     "CaptureStorageError",

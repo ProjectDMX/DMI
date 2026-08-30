@@ -189,6 +189,45 @@ def test_replacing_disabled_ring_restores_native_null_mode(monkeypatch):
     assert deactivated == [True, True]
 
 
+def test_replacing_explicit_sink_keeps_it_attached_when_stop_fails(monkeypatch):
+    engine, old_transport, _old_ring = _engine_with_fake_ring()
+    events = []
+
+    class _FailingRing(_FakeRingEngine):
+        def stop(self):
+            self.stop_calls += 1
+            raise RuntimeError("stop failed before join")
+
+    class _Sink:
+        def _detach_target(self):
+            events.append("detach")
+
+    old_ring = _FailingRing(old_transport)
+    sink = _Sink()
+    engine._ring_engine = old_ring
+    engine._record_sink = sink
+    engine._record_mode = True
+
+    fake_transport_module = ModuleType("dmi.transport.ring")
+    fake_transport_module.deactivate = lambda: events.append("deactivate")
+    fake_native_module = ModuleType("dmi.transport.native")
+    fake_native_module.DMXHostEngine = type("DMXHostEngine", (), {})
+    fake_native_module.RingEngine = lambda *_args: pytest.fail(
+        "replacement ring must not be created while the old worker may be alive"
+    )
+    monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
+
+    with pytest.raises(RuntimeError, match="stop failed before join"):
+        engine.enable_ring_transport(object())
+
+    assert old_ring.stop_calls == 1
+    assert engine._ring_engine is old_ring
+    assert engine._ring_transport is old_transport
+    assert engine._record_sink is sink
+    assert events == []
+
+
 def test_ring_runtime_api_requires_an_enabled_transport():
     engine = MonitoringEngine(enable_ring_transport=False)
 
@@ -345,6 +384,132 @@ def test_flush_and_wait_forwards_one_checked_deadline():
     engine.flush_and_wait(17.25)
 
     assert calls == [17.25]
+
+
+def _explicit_sink_format():
+    from dmi.records import (
+        RecordCellType,
+        RecordColumn,
+        RecordLayout,
+        RecordSchema,
+    )
+
+    class _Format:
+        schema = RecordSchema(
+            (
+                RecordLayout(
+                    "events",
+                    "events",
+                    (RecordColumn("event_id", RecordCellType.INT64),),
+                    primary_key=("event_id",),
+                    order_by=("event_id",),
+                ),
+            )
+        )
+
+        def encode(self, metadata, entry):
+            raise AssertionError("encoding is not part of runtime construction")
+
+    return _Format()
+
+
+def test_explicit_record_sink_isolated_from_host_and_detached_on_close(monkeypatch):
+    engine, _old_transport, old_ring = _engine_with_fake_ring()
+    ring_config = object()
+    host_engine = object()
+    engine._ring_config = ring_config
+    engine._host_engine = host_engine
+    new_ring = _FakeRingEngine()
+    created = []
+    activated = []
+    deactivated = []
+
+    class _RecordSink:
+        def __init__(self):
+            self.events = []
+
+        def _attach_target(self):
+            self.events.append(("attach", old_ring.stop_calls))
+
+        def _detach_target(self):
+            self.events.append(("detach", new_ring.stop_calls))
+
+    sink = _RecordSink()
+
+    class _Factory:
+        @staticmethod
+        def create_record(config, target):
+            created.append((config, target))
+            return new_ring
+
+    class _FakeTransport:
+        def __init__(self, native_ring):
+            self._ring_payload = native_ring.payload_tensor()
+            self.null_offload = False
+            self.force_eager = False
+
+        def _record_payload_tensor(self):
+            return self._ring_payload
+
+        def configure_record_schema(self, schema):
+            self._record_schema = schema
+
+    fake_transport_module = ModuleType("dmi.transport.ring")
+    fake_transport_module.RingTransport = _FakeTransport
+    fake_transport_module.activate = activated.append
+    fake_transport_module.deactivate = lambda: deactivated.append(True)
+    fake_native_module = ModuleType("dmi.transport.native")
+    fake_native_module.RecordSink = _RecordSink
+    fake_native_module.RingEngine = _Factory
+
+    def reject_host_validation():
+        pytest.fail("an explicit sink must not validate or use the ClickHouse host")
+
+    fake_native_module._load_extension = reject_host_validation
+    monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
+
+    engine.create_record_runtime(_explicit_sink_format(), record_sink=sink)
+
+    assert created == [(ring_config, sink)]
+    assert sink.events == [("attach", 0)]
+    assert old_ring.stop_calls == 1
+    assert engine._record_sink is sink
+    assert activated == [engine._ring_transport]
+
+    engine.close()
+
+    assert new_ring.stop_calls == 1
+    assert sink.events == [("attach", 0), ("detach", 1)]
+    assert deactivated == [True, True]
+
+
+def test_explicit_sink_preflight_failure_preserves_the_active_ring(monkeypatch):
+    engine, old_transport, old_ring = _engine_with_fake_ring()
+    engine._ring_config = object()
+
+    class _RecordSink:
+        def _attach_target(self):
+            raise RuntimeError("sink is not ready")
+
+    sink = _RecordSink()
+    fake_native_module = ModuleType("dmi.transport.native")
+    fake_native_module.RecordSink = _RecordSink
+    fake_native_module.RingEngine = SimpleNamespace(
+        create_record=lambda *_args: pytest.fail(
+            "record ring must not be created after sink preflight fails"
+        )
+    )
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
+
+    with pytest.raises(RuntimeError, match="sink is not ready"):
+        engine.create_record_runtime(_explicit_sink_format(), record_sink=sink)
+
+    assert old_ring.stop_calls == 0
+    assert engine._ring_engine is old_ring
+    assert engine._ring_transport is old_transport
+    assert engine._record_mode is False
+    assert engine._record_sink is None
 
 
 def test_plain_dmi_import_does_not_load_native_or_transport_modules():

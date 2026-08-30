@@ -646,3 +646,73 @@ def test_close_times_out_while_the_sink_hangs(tmp_path: Path):
     snapshot = pipeline.close(timeout=2)
 
     assert snapshot.packs_persisted == 1
+
+
+def test_manual_flush_is_repeatable_and_does_not_close_pipeline(tmp_path: Path):
+    pipeline = HostCapturePipeline(
+        _config(max_linger_ns=60_000_000_000),
+        DirectPackSink(FilesystemPackStore(tmp_path, store_id="local")),
+        pack_id_factory=_ids(),
+    )
+    pipeline.start()
+
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+    assert pipeline.flush(timeout=2)
+    first = pipeline.snapshot()
+    assert first.persisted_records == 1
+    assert first.flush_manual == 1
+    assert pipeline.is_running
+
+    assert pipeline.submit(_record("capture-b")) is AdmissionResult.ACCEPTED
+    assert pipeline.flush(timeout=2)
+    second = pipeline.snapshot()
+    assert second.persisted_records == 2
+    assert second.flush_manual == 2
+    assert pipeline.is_running
+
+    closed = pipeline.close(timeout=2)
+    assert closed.persisted_records == 2
+
+
+def test_manual_flush_timeout_reuses_prefix_then_flushes_later_records(
+    tmp_path: Path,
+):
+    from tests._faults import BlockingPackSink
+
+    sink = BlockingPackSink(
+        DirectPackSink(FilesystemPackStore(tmp_path, store_id="local"))
+    )
+    pipeline = HostCapturePipeline(
+        _config(max_linger_ns=60_000_000_000),
+        sink,
+        pack_id_factory=_ids(),
+    )
+    pipeline.start()
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+
+    assert not pipeline.flush(timeout=0.01)
+    assert sink.entered.wait(timeout=2)
+    assert pipeline.submit(_record("capture-b")) is AdmissionResult.ACCEPTED
+    sink.release.set()
+
+    assert pipeline.flush(timeout=2)
+    snapshot = pipeline.snapshot()
+    assert snapshot.persisted_records == 2
+    assert snapshot.flush_manual == 2
+    pipeline.close(timeout=2)
+
+
+def test_manual_flush_surfaces_worker_failure_without_hanging():
+    pipeline = HostCapturePipeline(
+        _config(max_linger_ns=60_000_000_000),
+        _FailingSink(),
+        pack_id_factory=_ids(),
+    )
+    pipeline.start()
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+
+    with pytest.raises(PipelineFailedError, match="pipeline failed"):
+        pipeline.flush(timeout=2)
+
+    with pytest.raises(PipelineFailedError, match="pipeline failed"):
+        pipeline.close(timeout=2)

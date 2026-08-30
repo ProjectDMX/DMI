@@ -24,10 +24,12 @@ The first host-only slice is available under `dmi.storage.capture`:
 | Bounded asynchronous pack pipeline and spool recovery | Implemented |
 | Garage/S3 store and bounded parallel uploader | Implemented |
 | ClickHouse metadata projection | Implemented and live-tested |
+| Opt-in Ring² to Python pack adapter | Reference implementation |
 | Summaries | Planned |
 
-This slice is opt-in and has no connection to the CUDA producer or current
-ClickHouse payload sink.
+This slice remains opt-in. A reference adapter can now connect the generic
+record sink boundary to the Python pack pipeline without changing the CUDA
+producer or the existing ClickHouse payload sink.
 
 The Phase 2 implementation adds `HostCapturePipeline`, bounded blocking or
 drop-newest admission, size/record/linger/session/shutdown sealing, direct local
@@ -194,6 +196,47 @@ pipeline.start()
 result = pipeline.submit(record)
 snapshot = pipeline.close(timeout=30)
 ```
+
+### Opt-in Ring² reference adapter
+
+`CapturePackReferenceSink` is a correctness bridge for exercising this storage
+path from a real record ring. It is selected explicitly; omitting
+`record_sink` preserves the existing native ClickHouse path, and the two sinks
+are never active at the same time.
+
+```python
+pipeline = HostCapturePipeline(config, sink)
+pipeline.start()
+reference = CapturePackReferenceSink(pipeline)
+
+runtime = engine.create_record_runtime(
+    CaptureRecordFormat(),
+    record_sink=reference.native_sink,
+)
+
+# Bind HookPointV1 and run normal single-worker, single-stream forwards.
+engine.flush_and_wait(30.0)  # non-closing; earlier records are durable
+engine.close()               # stop Ring/drain/P2P before the Python queue
+reference.close(timeout=30.0)
+```
+
+The versioned reference wire carries canonical `CaptureMetadata` JSON beside
+one or more fixed-shape tensor payload slices. The native sink validates each
+slice, then acquires the GIL; the Python target copies it to immutable `bytes`
+before admission to the dedicated `HostCapturePipeline`. This adds one copy
+and a Python callback per row, so it is intentionally separate from the future
+production native pack writer.
+
+`HostCapturePipeline.flush()` is a FIFO, repeatable, non-closing barrier. It
+seals the current pack and waits for `PackSink.persist()` for every earlier
+admission. With `DirectPackSink` that means object-store commit; with
+`DurablePackSink` it means local spool fsync/rename, not remote upload.
+
+The adapter does not broaden Ring² concurrency: each process/rank owns its own
+Ring and pipeline, and producers retain DMI's existing serialized CUDA-stream
+contract. The reference format rejects device-gated hooks because the current
+record envelope cannot distinguish a gated-off empty tensor from a real empty
+capture; adding an explicit skip marker belongs to the future native protocol.
 
 Admission returns an explicit `AdmissionResult`. It never silently expands the
 queue. Durable mode intentionally separates local commit from remote upload so

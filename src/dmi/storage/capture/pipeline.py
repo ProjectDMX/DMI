@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from hashlib import sha256
@@ -41,6 +41,7 @@ class FlushReason(str, Enum):
     RECORDS = "records"
     LINGER = "linger"
     SESSION = "session"
+    MANUAL = "manual"
     SHUTDOWN = "shutdown"
 
 
@@ -72,7 +73,8 @@ class BoundedRecordQueue:
             raise ValueError("queue limits must be positive")
         self._max_records = max_records
         self._max_bytes = max_bytes
-        self._items: deque[CaptureRecord] = deque()
+        self._items: deque[CaptureRecord | _FlushBarrier] = deque()
+        self._records = 0
         self._bytes = 0
         self._peak_records = 0
         self._peak_bytes = 0
@@ -102,8 +104,9 @@ class BoundedRecordQueue:
                     return AdmissionResult.CLOSED
                 if self._fits(record_bytes):
                     self._items.append(record)
+                    self._records += 1
                     self._bytes += record_bytes
-                    self._peak_records = max(self._peak_records, len(self._items))
+                    self._peak_records = max(self._peak_records, self._records)
                     self._peak_bytes = max(self._peak_bytes, self._bytes)
                     self._condition.notify()
                     return AdmissionResult.ACCEPTED
@@ -114,7 +117,19 @@ class BoundedRecordQueue:
                     return AdmissionResult.TIMED_OUT
                 self._condition.wait(remaining)
 
-    def get(self, timeout: float | None = None) -> CaptureRecord | None:
+    def put_barrier(self, barrier: _FlushBarrier) -> AdmissionResult:
+        """Append one control item without consuming record capacity."""
+
+        with self._condition:
+            if self._closed:
+                return AdmissionResult.CLOSED
+            self._items.append(barrier)
+            self._condition.notify()
+            return AdmissionResult.ACCEPTED
+
+    def get(
+        self, timeout: float | None = None
+    ) -> CaptureRecord | _FlushBarrier | None:
         if timeout is not None and (
             isinstance(timeout, bool) or not math.isfinite(timeout) or timeout < 0
         ):
@@ -128,10 +143,12 @@ class BoundedRecordQueue:
                 if remaining is not None and remaining <= 0:
                     return None
                 self._condition.wait(remaining)
-            record = self._items.popleft()
-            self._bytes -= len(record.payload)
+            item = self._items.popleft()
+            if isinstance(item, CaptureRecord):
+                self._records -= 1
+                self._bytes -= len(item.payload)
             self._condition.notify_all()
-            return record
+            return item
 
     def close(self) -> None:
         with self._condition:
@@ -141,7 +158,7 @@ class BoundedRecordQueue:
     def snapshot(self) -> QueueSnapshot:
         with self._condition:
             return QueueSnapshot(
-                records=len(self._items),
+                records=self._records,
                 bytes=self._bytes,
                 peak_records=self._peak_records,
                 peak_bytes=self._peak_bytes,
@@ -150,7 +167,7 @@ class BoundedRecordQueue:
 
     def _fits(self, record_bytes: int) -> bool:
         return (
-            len(self._items) < self._max_records
+            self._records < self._max_records
             and self._bytes + record_bytes <= self._max_bytes
         )
 
@@ -414,6 +431,7 @@ class PipelineSnapshot:
     flush_records: int
     flush_linger: int
     flush_session: int
+    flush_manual: int
     flush_shutdown: int
     failures: int
     event_callback_failures: int
@@ -429,6 +447,13 @@ class PipelineSnapshot:
 class PipelineEvent:
     event: str
     fields: Mapping[str, int | str]
+
+
+@dataclass(slots=True)
+class _FlushBarrier:
+    target_admitted: int
+    completed: threading.Event = field(default_factory=threading.Event)
+    error: BaseException | None = None
 
 
 class HostCapturePipeline:
@@ -456,7 +481,9 @@ class HostCapturePipeline:
             pack_id_factory=pack_id_factory,
         )
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._pending_flush: _FlushBarrier | None = None
         self._error: BaseException | None = None
         self._counters = {
             "submitted_records": 0,
@@ -474,6 +501,7 @@ class HostCapturePipeline:
             "flush_records": 0,
             "flush_linger": 0,
             "flush_session": 0,
+            "flush_manual": 0,
             "flush_shutdown": 0,
             "failures": 0,
             "event_callback_failures": 0,
@@ -489,6 +517,20 @@ class HostCapturePipeline:
                 target=self._run, name="dmi-capture-persistence", daemon=True
             )
             self._thread.start()
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the persistence worker is alive and still accepts records."""
+
+        with self._lock:
+            thread = self._thread
+            error = self._error
+        return (
+            thread is not None
+            and thread.is_alive()
+            and error is None
+            and not self._queue.snapshot().closed
+        )
 
     def submit(self, record: CaptureRecord) -> AdmissionResult:
         with self._lock:
@@ -543,6 +585,90 @@ class HostCapturePipeline:
             raise PipelineFailedError("capture pipeline failed") from error
         return self.snapshot()
 
+    def flush(self, *, timeout: float | None = None) -> bool:
+        """Persist all records admitted before this non-closing barrier.
+
+        The capture pipeline remains open after a successful flush.  Calls are
+        serialized and reuse a timed-out in-flight barrier, so repeated
+        timeouts cannot grow an unbounded control queue.
+        """
+
+        if timeout is not None and (
+            isinstance(timeout, bool) or not math.isfinite(timeout) or timeout < 0
+        ):
+            raise ValueError("timeout must be non-negative")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._lock:
+            if self._thread is None:
+                raise RuntimeError("pipeline is not started")
+            requested_target = self._counters["admitted_records"]
+        acquired = self._flush_lock.acquire(
+            timeout=-1 if deadline is None else max(0.0, deadline - time.monotonic())
+        )
+        if not acquired:
+            return False
+        try:
+            with self._lock:
+                error = self._error
+                pending = self._pending_flush
+            if error is not None:
+                raise PipelineFailedError("capture pipeline failed") from error
+
+            if pending is not None:
+                remaining = (
+                    None
+                    if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                )
+                if not pending.completed.wait(remaining):
+                    return False
+                if pending.error is not None:
+                    raise PipelineFailedError("capture pipeline failed") from pending.error
+                with self._lock:
+                    if self._pending_flush is pending:
+                        self._pending_flush = None
+                if pending.target_admitted >= requested_target:
+                    return True
+
+            pending = _FlushBarrier(target_admitted=requested_target)
+            with self._lock:
+                # Publish the waiter before the queue item.  Otherwise the
+                # worker could fail an earlier record in the small window
+                # between enqueue and assignment, leaving this waiter asleep.
+                self._pending_flush = pending
+            if self._queue.put_barrier(pending) is AdmissionResult.CLOSED:
+                with self._lock:
+                    error = self._error
+                    if self._pending_flush is pending:
+                        self._pending_flush = None
+                if error is not None:
+                    raise PipelineFailedError("capture pipeline failed") from error
+                return False
+
+            remaining = (
+                None
+                if deadline is None
+                else max(0.0, deadline - time.monotonic())
+            )
+            if not pending.completed.wait(remaining):
+                return False
+            if pending.error is not None:
+                raise PipelineFailedError("capture pipeline failed") from pending.error
+            with self._lock:
+                if self._pending_flush is pending:
+                    self._pending_flush = None
+            return True
+        finally:
+            self._flush_lock.release()
+
+    def raise_if_failed(self) -> None:
+        """Raise the pipeline's latched asynchronous failure, if any."""
+
+        with self._lock:
+            error = self._error
+        if error is not None:
+            raise PipelineFailedError("capture pipeline failed") from error
+
     def snapshot(self) -> PipelineSnapshot:
         queue = self._queue.snapshot()
         with self._lock:
@@ -561,8 +687,8 @@ class HostCapturePipeline:
             while True:
                 now_ns = self._clock_ns()
                 timeout = self._assembler.seconds_until_expiry(now_ns=now_ns)
-                record = self._queue.get(timeout=timeout)
-                if record is None:
+                item = self._queue.get(timeout=timeout)
+                if item is None:
                     queue = self._queue.snapshot()
                     if queue.closed and queue.records == 0:
                         self._persist(self._assembler.flush(FlushReason.SHUTDOWN))
@@ -571,6 +697,16 @@ class HostCapturePipeline:
                         self._assembler.flush_expired(now_ns=self._clock_ns())
                     )
                     continue
+                if isinstance(item, _FlushBarrier):
+                    try:
+                        self._persist(self._assembler.flush(FlushReason.MANUAL))
+                    except BaseException as exc:
+                        item.error = exc
+                        item.completed.set()
+                        raise
+                    item.completed.set()
+                    continue
+                record = item
                 try:
                     packs = self._assembler.append(record, now_ns=self._clock_ns())
                 except OversizedRecordError:
@@ -604,7 +740,11 @@ class HostCapturePipeline:
             with self._lock:
                 self._error = exc
                 self._counters["failures"] += 1
+                pending = self._pending_flush
             self._queue.close()
+            if pending is not None and not pending.completed.is_set():
+                pending.error = exc
+                pending.completed.set()
             self._emit("pipeline_failed", error_type=type(exc).__name__)
 
     def _persist(self, packs: tuple[ReadyPack, ...]) -> None:

@@ -37,6 +37,7 @@ REQUIRED_MEMBERS = {
     "dmi/storage/capture/pack.py",
     "dmi/storage/capture/pipeline.py",
     "dmi/storage/capture/reader.py",
+    "dmi/storage/capture/record_adapter.py",
     "dmi/storage/capture/s3.py",
     "dmi/storage/capture/spool.py",
     "dmi/storage/internals.py",
@@ -124,6 +125,7 @@ for module_name in (
     "dmi.storage.capture",
     "dmi.storage.capture.catalog",
     "dmi.storage.capture.clickhouse_catalog",
+    "dmi.storage.capture.record_adapter",
     "dmi.storage.internals",
     "dmi.transport.native",
 ):

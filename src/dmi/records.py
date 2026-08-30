@@ -265,6 +265,12 @@ class RecordRuntime(Generic[MetadataT]):
             raise TypeError("hook_runtime must implement HookRuntime")
         if id(hook) in self._bound_hooks:
             raise RuntimeError("HookPointV1 is already bound to this runtime")
+        if gate_tensor is not None and not getattr(
+            self._format, "supports_device_gate", True
+        ):
+            raise ValueError(
+                f"{type(self._format).__name__} does not support device-gated outputs"
+            )
         spec = hook.spec
         if spec is None:
             raise RuntimeError("HookPointV1 must have a HookSpecV1 before binding")

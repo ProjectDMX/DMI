@@ -256,9 +256,10 @@ bindings with the new global engine.
 ### Generic record runtime
 
 The generic record path is opt-in and independent of the legacy inference
-path. It is selected only by constructing a schema-driven stage with
-`StageConfig.clickhouse_records()` and then calling
-`MonitoringEngine.create_record_runtime()`.
+path. The default backend is selected by constructing a schema-driven stage
+with `StageConfig.clickhouse_records()` and then calling
+`MonitoringEngine.create_record_runtime()`. An explicit native `RecordSink`
+can instead be supplied for a separate backend.
 The returned `RecordRuntime` owns descriptor association for that record ring.
 
 `RecordCellType` supports `STRING`, `INT32`, `INT64`, `FLOAT64`,
@@ -301,6 +302,12 @@ for replay.
 ```python
 runtime = engine.create_record_runtime(record_format)
 
+# Or select one explicit sink; this does not also write to ClickHouse.
+runtime = engine.create_record_runtime(
+    record_format,
+    record_sink=explicit_native_sink,
+)
+
 runtime.bind_hook(
     hook,
     hook_runtime=hook_runtime,
@@ -330,9 +337,12 @@ producer descriptor is permitted.
 After device-to-host transfer, the native ring pairs each descriptor with its
 owned contiguous CPU payload as a backend-neutral record envelope. A native
 `RecordSink` receives that envelope before any backend-specific row
-materialization. `ClickHouseRecordSink` is the current adapter; another native
-sink can be passed to `RingEngine.create_record()` without changing the
-producer, drain, or descriptor consumer.
+materialization. `ClickHouseRecordSink` remains the default adapter. Another
+native sink can be passed through
+`MonitoringEngine.create_record_runtime(..., record_sink=...)` without
+changing the producer, drain, or descriptor consumer. The capture-pack module
+provides an explicitly reference-only Python bridge for storage E2E;
+production sinks remain native-only.
 
 `MonitoringEngine.flush_and_wait()` is a checked, non-closing completion
 operation. Success means the ring, descriptor consumer, and configured record
