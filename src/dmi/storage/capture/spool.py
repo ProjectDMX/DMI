@@ -100,9 +100,17 @@ class DurablePackSpool:
         self._mutation_generation = 0
         ready = tuple(self.root.rglob("*.dmi-pack.ready"))
         stale = tuple(self.root.rglob("*.open"))
-        self._bytes = sum(path.lstat().st_size for path in (*ready, *stale))
+        ready_bytes = {path: path.lstat().st_size for path in ready}
+        self._bytes = sum(ready_bytes.values()) + sum(
+            path.lstat().st_size for path in stale
+        )
         self._entries = len(ready)
         self._peak_bytes = self._bytes
+        # Track which ready paths contribute to the aggregate.  The aggregate
+        # alone cannot distinguish an idempotent retry from a ready file that
+        # appeared after construction (or from our own link surviving a later
+        # fsync failure), so it cannot safely decide whether to add the bytes.
+        self._accounted_ready: dict[Path, int] = ready_bytes
 
     def stage(self, pack: PackSource, object_key: str) -> StagedPack:
         validate_pack_source(pack)
@@ -112,7 +120,14 @@ class DurablePackSpool:
         ready = self._ready_path(key, pack)
         with self._lock:
             if ready.exists():
-                return self._existing(pack, object_key, ready)
+                staged = self._existing(pack, object_key, ready)
+                self._account_ready_locked(ready, staged.object_bytes)
+                # A prior attempt may have linked the ready file and failed
+                # before syncing its directory chain.  Finding valid bytes is
+                # not enough to call them durable; every successful retry must
+                # close that window itself.
+                fsync_path_to_root(ready.parent, self.root)
+                return staged
             conflicts = tuple(ready.parent.glob(f"{pack.pack_id}.*.dmi-pack.ready"))
             if conflicts:
                 raise PackConflictError(
@@ -140,7 +155,18 @@ class DurablePackSpool:
                 try:
                     os.link(temp_path, ready)
                 except FileExistsError:
-                    return self._existing(pack, object_key, ready)
+                    staged = self._existing(pack, object_key, ready)
+                    self._account_ready_locked(ready, staged.object_bytes)
+                    # The winner may still be between link() and its own fsync.
+                    # The loser must not acknowledge the winner's dirent before
+                    # independently making the complete chain durable.
+                    fsync_path_to_root(ready.parent, self.root)
+                    return staged
+                # Account immediately after the link exists, before any later
+                # operation can fail.  If unlinking the temporary name or
+                # syncing the directory raises, a retry sees an already-counted
+                # ready path instead of silently losing it from max_bytes.
+                self._account_ready_locked(ready, pack.object_bytes)
                 temp_path.unlink()
                 temp_path = None
                 # The key's tenant/date/session directories may all be new;
@@ -150,10 +176,6 @@ class DurablePackSpool:
             finally:
                 if temp_path is not None:
                     temp_path.unlink(missing_ok=True)
-            self._bytes += pack.object_bytes
-            self._entries += 1
-            self._peak_bytes = max(self._peak_bytes, self._bytes)
-            self._mutation_generation += 1
             return self._entry(ready)
 
     def recover(self) -> tuple[StagedPack, ...]:
@@ -220,6 +242,30 @@ class DurablePackSpool:
         self._bytes = sum(entry.object_bytes for entry in entries)
         self._entries = len(entries)
         self._peak_bytes = max(self._peak_bytes, self._bytes)
+        self._accounted_ready = {
+            entry.path: entry.object_bytes for entry in entries
+        }
+        self._mutation_generation += 1
+
+    def _account_ready_locked(self, path: Path, object_bytes: int) -> None:
+        """Count one ready path exactly once; ``self._lock`` must be held."""
+
+        if path in self._accounted_ready:
+            return
+        self._accounted_ready[path] = object_bytes
+        self._bytes += object_bytes
+        self._entries += 1
+        self._peak_bytes = max(self._peak_bytes, self._bytes)
+        self._mutation_generation += 1
+
+    def _unaccount_ready_locked(self, path: Path) -> None:
+        """Remove one ready path from the aggregate; ``self._lock`` is held."""
+
+        object_bytes = self._accounted_ready.pop(path, None)
+        if object_bytes is None:
+            return
+        self._bytes -= object_bytes
+        self._entries -= 1
         self._mutation_generation += 1
 
     def _quarantine(self, path: Path, *, locked: bool = False) -> None:
@@ -235,17 +281,27 @@ class DurablePackSpool:
         must move either way, and the lock is not reentrant.
         """
 
+        if locked:
+            self._quarantine_locked(path)
+            return
+        with self._lock:
+            self._quarantine_locked(path)
+
+    def _quarantine_locked(self, path: Path) -> None:
+        """Move and unaccount a corrupt ready path while holding the lock."""
+
         target = path.with_suffix(".quarantined")
         try:
             os.replace(path, target)
         except FileNotFoundError:
             return
-        self._fsync_directory(path.parent)
-        if locked:
+        was_accounted = path in self._accounted_ready
+        self._unaccount_ready_locked(path)
+        # Moving an unaccounted path is still a filesystem mutation that must
+        # invalidate an optimistic recovery pass.
+        if not was_accounted:
             self._mutation_generation += 1
-        else:
-            with self._lock:
-                self._mutation_generation += 1
+        self._fsync_directory(path.parent)
 
     def remove(self, staged: StagedPack) -> None:
         if staged.path.is_symlink():
@@ -255,6 +311,7 @@ class DurablePackSpool:
             raise ValueError("staged pack is outside the spool root")
         with self._lock:
             if not path.exists():
+                self._unaccount_ready_locked(path)
                 return
             current = self._entry(path)
             if current != staged:
@@ -262,10 +319,8 @@ class DurablePackSpool:
             if path.stat().st_size != staged.object_bytes:
                 raise PackIntegrityError("staged pack size changed before removal")
             path.unlink()
+            self._unaccount_ready_locked(path)
             self._fsync_directory(path.parent)
-            self._bytes -= staged.object_bytes
-            self._entries -= 1
-            self._mutation_generation += 1
 
     def snapshot(self) -> SpoolSnapshot:
         with self._lock:

@@ -9,6 +9,8 @@ import pytest
 from dmi.storage.capture import (
     CaptureMetadata,
     CaptureRecord,
+    CatalogIndexer,
+    CatalogReconciler,
     PackConflictError,
     PackFormatError,
     PackIntegrityError,
@@ -17,7 +19,6 @@ from dmi.storage.capture import (
     S3PackStore,
     S3StoreConfig,
 )
-
 
 pytestmark = pytest.mark.cpu
 
@@ -294,6 +295,60 @@ def test_s3_listing_is_prefix_scoped_and_cursor_bounded():
         "v1/day=2026-08-25/2.dmi-pack"
     ]
     assert second.next_cursor is None
+
+
+def test_s3_reconcile_page_contains_a_legal_foreign_key():
+    client = _S3Client()
+    store = _store(client)
+    pack = _pack()
+    healthy_key = "v1/packs/healthy.dmi-pack"
+    foreign_key = "v1/foreign objects/read me.txt"
+    store.put(pack, healthy_key)
+    # Spaces are legal in S3 keys but intentionally outside DMI's object-key
+    # grammar. The listing must return this key so inspect() can reject only
+    # this object without hiding the healthy pack on the same page.
+    client.objects[foreign_key] = (b"not a DMI pack", {})
+
+    class _Writer:
+        def __init__(self):
+            self.descriptors = []
+            self.packs = []
+
+        def committed_pack_ids(self, _identities):
+            return set()
+
+        def write_descriptors(self, descriptors, *, index_version):
+            self.descriptors.extend(descriptors)
+
+        def commit_packs(self, refs, *, index_version):
+            self.packs.extend(refs)
+
+        def publish_watermark(self, **_kwargs):
+            pass
+
+        def last_published_version(self):
+            return 0
+
+        def allocate_version(self):
+            return 1
+
+    writer = _Writer()
+    reconciler = CatalogReconciler(
+        store,
+        CatalogIndexer(store, writer, clock_ns=lambda: 1),
+    )
+
+    page = reconciler.reconcile_page(prefix="v1/", limit=2)
+
+    assert page.next_cursor is None
+    assert page.index.indexed_packs == 1
+    assert page.index.indexed_rows == 1
+    assert page.index.failed_packs == 1
+    assert [item.metadata.capture_id for item in writer.descriptors] == ["capture-a"]
+    assert [item.object_key for item in writer.packs] == [healthy_key]
+    assert len(page.index.failures) == 1
+    assert page.index.failures[0].object_key == foreign_key
+    assert page.index.failures[0].error_type == "ValueError"
 
 
 def test_s3_listing_rejects_a_truncated_page_without_a_cursor():
@@ -860,6 +915,17 @@ def test_s3_listing_rejects_hostile_prefixes(prefix: str):
         ),
         (
             {"Contents": [{"Key": "a.dmi-pack", "Size": "1"}], "IsTruncated": False},
+            "listing item",
+        ),
+        (
+            {"Contents": [{"Key": "", "Size": 1}], "IsTruncated": False},
+            "listing item",
+        ),
+        (
+            {
+                "Contents": [{"Key": "x" * 1025, "Size": 1}],
+                "IsTruncated": False,
+            },
             "listing item",
         ),
         ({"Contents": [], "IsTruncated": "yes"}, "truncation state"),

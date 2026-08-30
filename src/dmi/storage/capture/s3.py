@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import PurePosixPath
-import re
-from typing import Mapping, Protocol
+from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -20,9 +21,9 @@ from .model import (
     StoredObject,
 )
 
-
 _MIN_MULTIPART_BYTES = 5 * 1024**2
 _MAX_CURSOR_BYTES = 2048
+_MAX_OBJECT_KEY_BYTES = 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _CONTENT_VERIFY_CHUNK_BYTES = 1024**2
 
@@ -453,7 +454,16 @@ class S3PackStore:
             size = raw.get("Size")
             if not isinstance(key, str) or type(size) is not int or size < 0:
                 raise PackIntegrityError("S3 listing item is invalid")
-            validate_object_key(key)
+            # A bucket may contain keys owned by another application. Listing
+            # validates only S3's structural key contract; ``inspect()`` owns
+            # the narrower DMI object-key grammar, allowing reconciliation to
+            # contain a foreign key as one per-object failure.
+            try:
+                encoded_key = key.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise PackIntegrityError("S3 listing item is invalid") from exc
+            if not encoded_key or len(encoded_key) > _MAX_OBJECT_KEY_BYTES:
+                raise PackIntegrityError("S3 listing item is invalid")
             items.append(StoredObject(object_key=key, object_bytes=size))
         return tuple(items)
 

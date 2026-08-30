@@ -319,6 +319,32 @@ def test_stage_is_idempotent_for_identical_content(tmp_path: Path):
 
     assert first == second
     assert spool.snapshot().entries == 1
+    assert spool.snapshot().bytes == len(pack.data)
+
+
+def test_existing_ready_is_resynced_without_double_accounting(
+    tmp_path: Path, monkeypatch
+):
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    root = tmp_path / "spool"
+    key = f"packs/{pack.pack_id}.dmi-pack"
+    DurablePackSpool(root, max_bytes=len(pack.data) * 2).stage(pack, key)
+
+    # A restarted process counts the ready file during construction.  stage()
+    # must still close a possible pre-crash directory-fsync window, without
+    # adding the same file to the aggregate a second time.
+    restarted = DurablePackSpool(root, max_bytes=len(pack.data) * 2)
+    synced: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        "dmi.storage.capture.spool.fsync_path_to_root",
+        lambda leaf, boundary: synced.append((leaf, boundary)),
+    )
+
+    restarted.stage(pack, key)
+
+    assert synced == [((root / "packs").resolve(), root.resolve())]
+    assert restarted.snapshot().entries == 1
+    assert restarted.snapshot().bytes == len(pack.data)
 
 
 def test_stage_rejects_a_conflicting_intent_for_the_same_pack_id(tmp_path: Path):
@@ -352,7 +378,9 @@ def test_stage_survives_losing_the_link_race_to_an_identical_writer(
     tmp_path: Path, monkeypatch
 ):
     pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
-    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    second, _ = _sealed("018f0000-0000-7000-8000-000000000002", "capture-b")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data))
+    synced: list[tuple[Path, Path]] = []
 
     def concurrent_link(src, dst, *args, **kwargs):
         # The other writer wins the race with identical content.
@@ -360,11 +388,71 @@ def test_stage_survives_losing_the_link_race_to_an_identical_writer(
         raise FileExistsError(dst)
 
     monkeypatch.setattr("dmi.storage.capture.spool.os.link", concurrent_link)
+    monkeypatch.setattr(
+        "dmi.storage.capture.spool.fsync_path_to_root",
+        lambda leaf, boundary: synced.append((leaf, boundary)),
+    )
 
-    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+    key = f"packs/{pack.pack_id}.dmi-pack"
+    staged = spool.stage(pack, key)
 
     assert staged.object_bytes == len(pack.data)
     assert staged.path.exists()
+    assert synced == [(spool.root / "packs", spool.root)]
+    assert spool.snapshot().entries == 1
+    assert spool.snapshot().bytes == len(pack.data)
+
+    # The idempotent retry re-syncs, but path-keyed accounting prevents a
+    # second charge for the same ready file.
+    assert spool.stage(pack, key) == staged
+    assert synced == [
+        (spool.root / "packs", spool.root),
+        (spool.root / "packs", spool.root),
+    ]
+    assert spool.snapshot().entries == 1
+    assert spool.snapshot().bytes == len(pack.data)
+
+    # The winner's bytes count against capacity immediately.
+    with pytest.raises(SpoolFullError, match="spool byte limit"):
+        spool.stage(second, f"packs/{second.pack_id}.dmi-pack")
+
+
+def test_stage_retry_after_directory_fsync_failure_is_counted_once(
+    tmp_path: Path, monkeypatch
+):
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    second, _ = _sealed("018f0000-0000-7000-8000-000000000002", "capture-b")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data))
+    calls = 0
+
+    def fail_once(leaf: Path, boundary: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected directory fsync failure")
+
+    monkeypatch.setattr(
+        "dmi.storage.capture.spool.fsync_path_to_root", fail_once
+    )
+    key = f"packs/{pack.pack_id}.dmi-pack"
+
+    with pytest.raises(OSError, match="injected directory fsync failure"):
+        spool.stage(pack, key)
+
+    # link() already created disk usage.  Even though durability was not
+    # acknowledged, the failed attempt must remain in the capacity aggregate.
+    assert len(tuple(spool.root.rglob("*.dmi-pack.ready"))) == 1
+    assert spool.snapshot().entries == 1
+    assert spool.snapshot().bytes == len(pack.data)
+
+    staged = spool.stage(pack, key)
+
+    assert staged.path.exists()
+    assert calls == 2, "the retry must execute its own successful fsync"
+    assert spool.snapshot().entries == 1
+    assert spool.snapshot().bytes == len(pack.data)
+    with pytest.raises(SpoolFullError, match="spool byte limit"):
+        spool.stage(second, f"packs/{second.pack_id}.dmi-pack")
 
 
 def test_stage_cleans_up_its_temp_file_when_the_source_lies(tmp_path: Path):
@@ -402,6 +490,30 @@ def test_recover_quarantines_a_ready_file_with_an_invalid_name(tmp_path: Path):
     assert spool.recover() == ()
     assert not bogus.exists()
     assert bogus.with_suffix(".quarantined").exists()
+    # This path appeared after construction and was never in the accounting
+    # map.  Quarantining it must invalidate recovery without subtracting bytes
+    # that were never charged.
+    assert spool.snapshot().entries == 0
+    assert spool.snapshot().bytes == 0
+
+
+def test_recover_subtracts_the_accounted_size_after_a_corrupt_file_grows(
+    tmp_path: Path,
+):
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+
+    # The ready file was charged at its original size.  Quarantine must pop
+    # that stored charge, not subtract the now-corrupt lstat size and drive the
+    # aggregate negative.
+    with staged.path.open("ab") as handle:
+        handle.write(b"corrupt-growth")
+
+    assert spool.recover() == ()
+    assert staged.path.with_suffix(".quarantined").exists()
+    assert spool.snapshot().entries == 0
+    assert spool.snapshot().bytes == 0
 
 
 def test_recover_skips_entries_removed_by_a_concurrent_uploader(
@@ -427,6 +539,31 @@ def test_quarantine_tolerates_a_file_already_gone(tmp_path: Path):
     spool._quarantine(spool.root / "ghost.dmi-pack.ready")
 
     assert tuple(spool.root.iterdir()) == ()
+
+
+def test_quarantine_fsync_failure_does_not_leave_phantom_accounting(
+    tmp_path: Path, monkeypatch
+):
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+
+    def fail(_path: Path) -> None:
+        raise OSError("injected quarantine fsync failure")
+
+    monkeypatch.setattr(DurablePackSpool, "_fsync_directory", staticmethod(fail))
+    with pytest.raises(OSError, match="injected quarantine fsync failure"):
+        spool._quarantine(staged.path)
+
+    assert not staged.path.exists()
+    assert staged.path.with_suffix(".quarantined").exists()
+    assert spool.snapshot().entries == 0
+    assert spool.snapshot().bytes == 0
+
+    monkeypatch.undo()
+    assert spool.recover() == ()
+    assert spool.snapshot().entries == 0
+    assert spool.snapshot().bytes == 0
 
 
 def test_recover_does_not_erase_accounting_for_a_pack_staged_mid_pass(
@@ -548,6 +685,8 @@ def test_remove_tolerates_an_entry_already_uploaded_elsewhere(tmp_path: Path):
     staged.path.unlink()
 
     spool.remove(staged)  # a second removal is a no-op, not an error
+    assert spool.snapshot().entries == 0
+    assert spool.snapshot().bytes == 0
 
 
 def test_remove_rejects_an_entry_whose_identity_changed(tmp_path: Path):
@@ -575,6 +714,36 @@ def test_remove_rejects_an_entry_whose_size_changed(tmp_path: Path, monkeypatch)
 
     with pytest.raises(PackIntegrityError, match="size changed"):
         spool.remove(staged)
+
+
+def test_remove_fsync_failure_does_not_leave_phantom_accounting(
+    tmp_path: Path, monkeypatch
+):
+    pack, _ = _sealed("018f0000-0000-7000-8000-000000000001", "capture-a")
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=len(pack.data) * 2)
+    staged = spool.stage(pack, f"packs/{pack.pack_id}.dmi-pack")
+
+    def fail(_path: Path) -> None:
+        raise OSError("injected removal fsync failure")
+
+    monkeypatch.setattr(DurablePackSpool, "_fsync_directory", staticmethod(fail))
+    with pytest.raises(OSError, match="injected removal fsync failure"):
+        spool.remove(staged)
+
+    # The unlink happened even though its durability acknowledgement failed.
+    # Accounting follows the ready set exactly, and an idempotent retry remains
+    # a no-op rather than subtracting twice.
+    assert not staged.path.exists()
+    assert spool.snapshot().entries == 0
+    assert spool.snapshot().bytes == 0
+    spool.remove(staged)
+    assert spool.snapshot().entries == 0
+    assert spool.snapshot().bytes == 0
+
+    monkeypatch.undo()
+    assert spool.recover() == ()
+    assert spool.snapshot().entries == 0
+    assert spool.snapshot().bytes == 0
 
 
 def test_entry_rejects_non_regular_files_and_unparseable_names(tmp_path: Path):
