@@ -64,6 +64,19 @@ class CoreTensorSummaryV1:
     over the **finite** elements only; ``nan_count`` and ``inf_count`` account
     for the rest. A tensor with no finite elements reports zeros, so a caller
     reads the counts to tell "all zero" from "all NaN".
+
+    Exactness differs by statistic, and the difference is visible in the types:
+
+    * ``minimum``, ``maximum`` and ``abs_max`` are order statistics -- they pick
+      an element rather than combining elements, so nothing can overflow. For a
+      non-float dtype they are **exact**, and carry a Python ``int``; ``abs_max``
+      of an all-``-2**63`` int64 tensor is therefore ``2**63``, a value no int64
+      can hold but a Python int can. For a float dtype they carry the selected
+      ``float`` itself, equally exact.
+    * ``mean`` and ``l2_norm`` accumulate across elements, which overflows int64
+      (and, squared, overflows float64 too), so both are computed in float64 and
+      are **approximate** for integer inputs above 2**53. ``zero_fraction`` is a
+      ratio and is float by nature.
     """
 
     summary_version: int
@@ -73,9 +86,9 @@ class CoreTensorSummaryV1:
     inf_count: int
     zero_fraction: float
     mean: float
-    minimum: float
-    maximum: float
-    abs_max: float
+    minimum: float | int
+    maximum: float | int
+    abs_max: float | int
     l2_norm: float
 
 
@@ -147,12 +160,16 @@ def summarize_tensor(
             l2_norm=0.0,
         )
 
-    # float64 throughout: int64 magnitudes and squared sums both overflow their
-    # own dtype long before they trouble a double.
-    values = array.reshape(-1).astype(numpy.float64)
+    # float64 for the *accumulating* statistics: int64 magnitudes and squared
+    # sums both overflow their own dtype long before they trouble a double.
+    # The order statistics do not accumulate and so do not need the widening --
+    # which is lossy above 2**53 -- and are taken from ``flat`` further down.
+    flat = array.reshape(-1)
+    values = flat.astype(numpy.float64)
     zero_fraction = float(numpy.count_nonzero(values == 0.0) / element_count)
 
-    if descriptor.metadata.dtype in _FLOAT_DTYPES:
+    is_float = descriptor.metadata.dtype in _FLOAT_DTYPES
+    if is_float:
         nan_mask = numpy.isnan(values)
         inf_mask = numpy.isinf(values)
         nan_count = int(numpy.count_nonzero(nan_mask))
@@ -183,11 +200,29 @@ def summarize_tensor(
     # large-magnitude tensor overflows and the naive sqrt(sum(x**2)) returns inf
     # where the true norm is perfectly finite. Factoring out the largest
     # magnitude keeps every squared term at or below 1.
-    abs_max = float(absolute.max())
-    if abs_max == 0.0:
+    scale = float(absolute.max())
+    if scale == 0.0:
         l2_norm = 0.0
     else:
-        l2_norm = abs_max * float(numpy.sqrt(numpy.square(absolute / abs_max).sum()))
+        l2_norm = scale * float(numpy.sqrt(numpy.square(absolute / scale).sum()))
+
+    if is_float:
+        minimum: float | int = float(finite.min())
+        maximum: float | int = float(finite.max())
+        abs_max: float | int = scale
+    else:
+        # Order statistics off the raw integers. numpy's integer min/max cannot
+        # overflow, and skipping the float64 widening keeps magnitudes above
+        # 2**53 exact instead of silently rounded. A non-float dtype admits no
+        # NaN or Inf, so ``finite`` is the whole tensor and ``flat`` is the same
+        # elements in their own dtype.
+        minimum = int(flat.min())
+        maximum = int(flat.max())
+        # abs() in Python int space, not numpy's: |-2**63| has no int64
+        # representation and would wrap back to -2**63. Python ints are
+        # unbounded, so the true magnitude survives. The largest absolute value
+        # is always at one end or the other, so the extremes suffice.
+        abs_max = max(abs(minimum), abs(maximum))
 
     return CoreTensorSummaryV1(
         summary_version=CORE_SUMMARY_VERSION,
@@ -197,8 +232,8 @@ def summarize_tensor(
         inf_count=inf_count,
         zero_fraction=zero_fraction,
         mean=float(finite.mean()),
-        minimum=float(finite.min()),
-        maximum=float(finite.max()),
+        minimum=minimum,
+        maximum=maximum,
         abs_max=abs_max,
         l2_norm=l2_norm,
     )

@@ -388,9 +388,82 @@ def test_int64_extremes_do_not_overflow_the_summary(tmp_path: Path):
 
     summary = summarize_tensor(descriptor, source.tobytes())
 
-    # abs() of int64 min overflows in int64; the summary works in float64.
-    assert summary.abs_max == pytest.approx(float(abs(int(np.iinfo(np.int64).min))))
+    # |int64 min| == 2**63, which no int64 can hold -- numpy's abs() wraps it
+    # straight back to the negative value. Computing it in Python int space,
+    # where integers are unbounded, is what makes the true magnitude reportable.
+    assert summary.abs_max == 2**63
+    assert isinstance(summary.abs_max, int)
+    assert summary.minimum == -(2**63) and summary.maximum == 2**63 - 1
     assert summary.l2_norm > 0
+
+
+def test_int64_order_statistics_stay_exact_above_the_float64_mantissa(
+    tmp_path: Path,
+):
+    # Neither value is representable in float64: both round to 2**63. Reporting
+    # a rounded number as if it were the element itself is the bug -- these two
+    # tensors have different extremes and must not summarise identically.
+    source = np.array([2**63 - 2, 2**63 - 1], dtype=np.int64)
+    _, descriptor = _descriptor_for(source, "int64", tmp_path)
+
+    summary = summarize_tensor(descriptor, source.tobytes())
+
+    assert summary.minimum == 2**63 - 2
+    assert summary.maximum == 2**63 - 1
+    assert summary.abs_max == 2**63 - 1
+    assert summary.minimum != summary.maximum
+    # The float64 widening is exactly what loses them.
+    assert float(summary.minimum) == float(summary.maximum)
+
+
+def test_an_all_negative_int64_tensor_takes_abs_max_from_its_minimum(
+    tmp_path: Path,
+):
+    # The largest magnitude sits at the *lower* end here, so an abs_max read off
+    # the maximum alone would understate it.
+    source = np.array([-(2**63), -1], dtype=np.int64)
+    _, descriptor = _descriptor_for(source, "int64", tmp_path)
+
+    summary = summarize_tensor(descriptor, source.tobytes())
+
+    assert summary.abs_max == 2**63
+    assert summary.maximum == -1
+
+
+@pytest.mark.parametrize("dtype", ("bool", "uint8", "int8", "int16", "int32", "int64"))
+def test_non_float_order_statistics_are_exact_integers(tmp_path: Path, dtype: str):
+    source = np.array([0, 1], dtype=_SOURCE_DTYPES[dtype])
+    _, descriptor = _descriptor_for(source, dtype, tmp_path)
+
+    summary = summarize_tensor(descriptor, source.tobytes())
+
+    # An exact statistic is typed as one: a caller can tell the two apart.
+    for value in (summary.minimum, summary.maximum, summary.abs_max):
+        assert isinstance(value, int) and not isinstance(value, bool)
+    assert (summary.minimum, summary.maximum, summary.abs_max) == (0, 1, 1)
+    # The accumulating statistics stay float64 -- they have to, they overflow.
+    assert isinstance(summary.mean, float)
+    assert isinstance(summary.l2_norm, float)
+
+
+@pytest.mark.parametrize("dtype", ("float16", "bfloat16", "float32", "float64"))
+def test_float_order_statistics_are_unchanged_floats(tmp_path: Path, dtype: str):
+    # Regression guard: splitting the non-float path off must not have moved the
+    # float path, in value or in type. Every value below is exact in all four
+    # dtypes, so the expectation is the same for each.
+    reference = np.array([-2.5, 0.0, 1.25], dtype=np.float32)
+    if dtype == "bfloat16":
+        # No native dtype: the pack stores the top 16 bits of the float32 form.
+        stored = (reference.view(np.uint32) >> 16).astype("<u2")
+    else:
+        stored = reference.astype(_SOURCE_DTYPES[dtype])
+    _, descriptor = _descriptor_for(stored, dtype, tmp_path)
+
+    summary = summarize_tensor(descriptor, stored.tobytes())
+
+    assert (summary.minimum, summary.maximum, summary.abs_max) == (-2.5, 1.25, 2.5)
+    for value in (summary.minimum, summary.maximum, summary.abs_max):
+        assert isinstance(value, float)
 
 
 def test_summary_element_count_agrees_with_the_catalog_facet(tmp_path: Path):
