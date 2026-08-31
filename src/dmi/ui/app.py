@@ -19,10 +19,10 @@ from ..configuration import (
     DMIConfig,
     ModelDescriptor,
     catalog_payload,
+    resolve_descriptor,
     config_to_dict,
     dump_config,
     load_config,
-    load_descriptor,
     parse_config,
     save_config,
     validate_config,
@@ -47,24 +47,35 @@ class UIState:
     """
 
     descriptor: ModelDescriptor
-    descriptor_path: Path
+    source: str
     save_path: Path
     initial_config: Optional[DMIConfig] = None
 
 
-def default_save_path(descriptor_path: Path, descriptor: ModelDescriptor) -> Path:
-    return descriptor_path.parent / f"{descriptor.model.id}.dmi.yaml"
+def default_save_path(source: str | Path, descriptor: ModelDescriptor) -> Path:
+    """Put the configuration beside its source, or in the CWD for a model id."""
+    target = Path(source)
+    if target.is_dir():
+        base = target
+    elif target.exists():
+        base = target.parent
+    else:
+        base = Path.cwd()  # a bare Hugging Face model id has no local directory
+    return base / f"{descriptor.model.id}.dmi.yaml"
 
 
 def build_state(
-    descriptor_path: str | Path, config_path: Optional[str | Path] = None
+    source: str | Path, config_path: Optional[str | Path] = None
 ) -> UIState:
-    """Load the descriptor and any starting configuration."""
-    descriptor_path = Path(descriptor_path)
-    descriptor = load_descriptor(descriptor_path)
+    """Load the model description and any starting configuration.
+
+    ``source`` is anything :func:`resolve_descriptor` accepts: a DMI descriptor
+    YAML, a model directory, a ``config.json``, or a Hugging Face model id.
+    """
+    descriptor = resolve_descriptor(source)
 
     initial = None
-    save_path = default_save_path(descriptor_path, descriptor)
+    save_path = default_save_path(source, descriptor)
     if config_path is not None:
         save_path = Path(config_path)
         if save_path.exists():
@@ -72,13 +83,13 @@ def build_state(
 
     return UIState(
         descriptor=descriptor,
-        descriptor_path=descriptor_path,
+        source=str(source),
         save_path=save_path,
         initial_config=initial,
     )
 
 
-def create_app(descriptor_path: str | Path, config_path: Optional[str | Path] = None):
+def create_app(source: str | Path, config_path: Optional[str | Path] = None):
     """Build the FastAPI application."""
     try:
         from fastapi import FastAPI, HTTPException
@@ -87,7 +98,7 @@ def create_app(descriptor_path: str | Path, config_path: Optional[str | Path] = 
     except ImportError as exc:  # pragma: no cover - exercised by install state
         raise RuntimeError(_FASTAPI_MISSING) from exc
 
-    state = build_state(descriptor_path, config_path)
+    state = build_state(source, config_path)
 
     app = FastAPI(title="DMI-configurator", docs_url=None, redoc_url=None)
     app.state.ui = state

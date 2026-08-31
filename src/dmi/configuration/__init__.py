@@ -33,6 +33,12 @@ from .catalog_adapter import (
 )
 from .compatibility import from_legacy_hook_selection, to_legacy_hook_selection
 from .compiler import CompiledDMIConfig, ModelContext, compile_config
+from .introspect import (
+    describe_model,
+    descriptor_from_hf_config,
+    load_hf_config_document,
+    resolve_descriptor,
+)
 from .errors import (
     ConfigurationError,
     ConfigValidationError,
@@ -86,6 +92,10 @@ __all__ = [
     "descriptor_to_dict",
     "save_descriptor",
     "to_model_shape_config",
+    "describe_model",
+    "descriptor_from_hf_config",
+    "load_hf_config_document",
+    "resolve_descriptor",
     # catalog
     "HookInfo",
     "hook_ids",

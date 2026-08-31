@@ -19,6 +19,7 @@ from dmi.configuration import (
 pytestmark = pytest.mark.cpu
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "model_descriptors"
+DATA = Path(__file__).resolve().parent / "data"
 
 VALID = {
     "schema_version": 1,
@@ -105,16 +106,13 @@ class TestDescriptorIO:
 
 
 class TestShippedExamples:
-    @pytest.mark.parametrize(
-        "name", ["llama3-8b", "qwen3-8b", "qwen3-30b-a3b"]
-    )
-    def test_example_descriptors_load(self, name):
-        descriptor = load_descriptor(EXAMPLES / f"{name}.yaml")
-        assert descriptor.topology.num_layers > 0
+    def test_example_descriptor_loads(self):
+        descriptor = load_descriptor(EXAMPLES / "llama3-8b.yaml")
+        assert descriptor.topology.num_layers == 32
         assert descriptor.model.architecture == "decoder_transformer"
 
-    def test_moe_example_actually_has_experts(self):
-        descriptor = load_descriptor(EXAMPLES / "qwen3-30b-a3b.yaml")
+    def test_moe_fixture_actually_has_experts(self):
+        descriptor = load_descriptor(DATA / "moe-decoder.model.yaml")
         assert descriptor.topology.is_moe
         assert descriptor.topology.top_k > 0
 

@@ -12,7 +12,7 @@ DEFAULT_PORT = 8000
 
 
 def serve(
-    descriptor_path: str | Path,
+    source: str | Path,
     config_path: Optional[str | Path] = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -30,10 +30,10 @@ def serve(
             'with:\n    pip install "DMI[ui]"'
         ) from exc
 
-    app = create_app(descriptor_path, config_path)
+    app = create_app(source, config_path)
     ui = app.state.ui
     print(f"DMI-configurator  ·  {ui.descriptor.model.name}")
-    print(f"  descriptor : {ui.descriptor_path}")
+    print(f"  model from : {ui.source}")
     print(f"  saves to   : {ui.save_path}")
     print(f"  serving    : http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")

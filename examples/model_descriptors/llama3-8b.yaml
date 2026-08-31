@@ -1,4 +1,7 @@
 # Meta Llama 3 8B -- dense decoder transformer.
+#
+# Equivalent to `dmi describe-model ./Meta-Llama-3-8B`. Kept in the repo so
+# the UI and test suite have a model to work against without a checkout.
 schema_version: 1
 
 model:
