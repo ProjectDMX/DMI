@@ -12,6 +12,7 @@ from .catalog import (
     PackIdentity,
     PublisherLeaseError,
     PublisherLeaseHeldError,
+    SnapshotPublishConflictError,
     SnapshotPublishRaceError,
 )
 from .model import CaptureDescriptor, PackRef
@@ -1012,23 +1013,53 @@ pack_id UUID
         # one -- reads as success. The sole-claimant allocator makes a foreign
         # row at V unlikely, not impossible, and reading the identity back costs
         # exactly what counting cost: the same one-row scan of the same key
-        # range. So this asks whether the row standing at V is the one this
-        # statement wrote, and treats anything else as a lost race.
-        owners = self._client.execute(
-            f"SELECT toString(publish_id) FROM {watermark} "
-            "WHERE index_version = %(version)s",
-            {"version": index_version},
-            settings=_DECIDING_READ,
-        )
-        if {self._text(row[0]) for row in owners} != {publish_id}:
+        # range.
+        #
+        # Two questions, not one, because the answers need opposite recoveries.
+        # "Is MY row there?" decides whether anything was published at all;
+        # "is it the ONLY row there?" decides whether the version is solely
+        # this publish's. Collapsing them into ``!= {publish_id}`` reported a
+        # foreign row arriving AFTER this one as a lost race, which is the one
+        # thing it is not: the watermark row is standing, its manifest rows are
+        # paired with it, and its packs are visible.
+        owners = {
+            self._text(row[0])
+            for row in self._client.execute(
+                f"SELECT toString(publish_id) FROM {watermark} "
+                "WHERE index_version = %(version)s",
+                {"version": index_version},
+                settings=_DECIDING_READ,
+            )
+        }
+        if publish_id not in owners:
             # Two different failures wear the same shape here, and the caller's
             # recovery differs. A lost VERSION race is repaired by allocating a
             # higher one, which the indexer does. A lost LEASE is not: every
             # retry would fail the same fence, so it has to say so instead.
             self._reject_if_the_lease_is_gone(lease)
             raise SnapshotPublishRaceError(
-                f"catalog version {index_version} lost the publish race; "
-                "nothing it wrote is visible"
+                f"catalog version {index_version} lost the publish race: the "
+                "conditional watermark INSERT was refused, so no row carrying "
+                f"publish {publish_id} stands at that version and no snapshot "
+                "can admit anything this attempt wrote. Allocate a higher "
+                "version and publish again."
+            )
+        if owners != {publish_id}:
+            # The opposite outcome, and it is NOT a lost race: this publish's
+            # row IS standing at the version, its manifest rows are paired with
+            # it, and its packs are visible. Reporting that as a loss would be
+            # false -- and the indexer would retry it, publishing the same
+            # batch a second time underneath a snapshot that already contains
+            # it. So it is surfaced as what it is: a version whose contents
+            # came from more than one publish.
+            foreign = ", ".join(sorted(owners - {publish_id}))
+            raise SnapshotPublishConflictError(
+                f"catalog version {index_version} was published by this writer "
+                f"(publish {publish_id}) AND by {foreign}. This publish is "
+                "visible and must not be retried; the version's membership is "
+                "now the union of both publishes. Something else is writing "
+                f"`{self._config.database}`.`{self._config.table_prefix}_*` -- "
+                "a second indexer sharing the prefix, or a hand-written INSERT."
             )
 
     # -- the publisher lease ------------------------------------------------
@@ -1050,12 +1081,25 @@ pack_id UUID
 
         A lease can be taken over once it has expired by the SERVER's clock, or
         immediately if the head term is contested, since a contested term is
-        inert. A live lease held by somebody else raises
+        inert. A live lease held by SOMEBODY ELSE raises
         :class:`PublisherLeaseHeldError` rather than being stolen.
+
+        A writer that already holds a lease is re-acquiring its OWN, and that
+        must succeed: the operating instructions say to acquire before
+        publishing, so "acquire twice" is the documented path after a restart
+        of anything above this object. Minting a fresh ``lease_id`` here would
+        make this writer a stranger to the row it already owns -- the claim
+        would be refused as held by itself, and there would be no API left to
+        release the row it just orphaned. So a held lease keeps its fencing
+        identity and the claim below refreshes it at a new term, exactly as a
+        renewal does.
         """
         if not isinstance(holder, str) or not 0 < len(holder) <= 256:
             raise ValueError("holder must be a non-empty string of at most 256 bytes")
-        return self._claim_lease(holder, lease_id=str(uuid4()))
+        held = self._lease
+        return self._claim_lease(
+            holder, lease_id=held.lease_id if held is not None else str(uuid4())
+        )
 
     def renew_publisher_lease(self) -> PublisherLease:
         """Extend the held lease, keeping its fencing identity.
@@ -1078,34 +1122,58 @@ pack_id UUID
         return self._claim_lease(lease.holder, lease_id=lease.lease_id)
 
     def release_publisher_lease(self) -> None:
-        """Give the lease back, so the next publisher need not wait it out.
+        """Give back the lease THIS writer holds, and only that one.
 
         A tombstone: a fresh term with the same ``lease_id`` that is already
         expired when it lands. No read-back, because a release wins nothing --
         if a takeover contests the term, the head is inert and the lease is
         gone either way, which is the outcome a release wanted. Idempotent, and
         a no-op when no lease is held.
+
+        **Fenced on the head being this writer's lease.** The tombstone lands
+        at ``head.term + 1``, so it becomes the head whatever was there before:
+        released blind, a writer whose lease lapsed long ago revokes whoever
+        holds the catalog now, simply by shutting down in an orderly way. The
+        successor is not told -- its next publish is fenced out, and any third
+        publisher can take the lease off it at once, because the head the
+        fence resolves to is now an expired row belonging to neither.
+
+        The local state is dropped only after the tombstone is durable. The
+        other order loses the lease locally while it stays live on the server:
+        a failed INSERT would leave nothing able to release it and nothing able
+        to publish under it until it expired.
         """
         lease = self._lease
         if lease is None:
             return
-        self._lease = None
         head = self._lease_head()
+        if head.lease_id != lease.lease_id:
+            # Not ours any more. Somebody else's row is what the fence
+            # resolves to, so there is nothing here to give back -- and
+            # tombstoning above it would take THEIR lease away.
+            self._lease = None
+            return
         self._insert_lease_row(
             term=head.term + 1, lease_id=lease.lease_id, holder=lease.holder,
             ttl_ns=0,
         )
+        self._lease = None
 
     def _claim_lease(self, holder: str, *, lease_id: str) -> PublisherLease:
         table = self._qualified(self._lease_table)
         attempts = self._config.lease_attempts
-        for _ in range(attempts):
+        for attempt in range(attempts):
             head = self._lease_head()
             if (
                 head.claimants == 1
                 and head.expires_at_ns > head.now_ns
                 and head.lease_id != lease_id
             ):
+                # A live lease that is not this writer's. Whatever it thought
+                # it held is not the row the fence resolves to, so saying so is
+                # the honest answer -- and note what justifies dropping the
+                # local lease: the HEAD proves it is gone, not the mere fact
+                # that a claim did not go through.
                 self._lease = None
                 raise PublisherLeaseHeldError(
                     f"publisher lease on `{self._config.database}`."
@@ -1115,7 +1183,15 @@ pack_id UUID
                     "one publisher may make snapshots visible; wait for it to "
                     "expire or stop it."
                 )
-            term = head.term + 1
+            # A randomized skip after a collision, exactly as the version
+            # allocator does it and for the same reason: every contender that
+            # abandons a contested term recomputes ``head.term + 1`` and
+            # collides on the next one too. Without the skip, six publishers
+            # taking a cold lease failed ~48% of the time with "every term was
+            # contested" -- a liveness failure invented entirely by the retry.
+            term = head.term + 1 + (
+                secrets.randbelow(8 * attempt + 1) if attempt else 0
+            )
             self._validate_version(term)
             self._insert_lease_row(
                 term=term, lease_id=lease_id, holder=holder,
@@ -1202,27 +1278,41 @@ pack_id UUID
         """The fencing predicate, for use INSIDE a writing statement.
 
         Two conditions on ONE row: the head of the lease table is this
-        publisher's lease, and it has not expired by the server's own clock. A
-        contested head term satisfies neither -- the row it resolves to belongs
-        to a claimant that abandoned it -- so nobody publishes under it until
-        someone claims a higher term. An empty lease table yields NULL, and
-        ``NULL = (...)`` is not true, so a publisher that never took a lease
-        writes nothing.
+        publisher's lease, and it has not expired by the server's own clock.
 
-        One subquery returning a tuple, not two subqueries returning a column
+        **One subquery reading one row**, not two subqueries returning a column
         each, and that is a correctness point before it is a cost one. Two
         scalar subqueries are two reads: a takeover landing between them could
         be answered with the OLD holder's ``lease_id`` and the NEW holder's
         ``expires_at_ns``, and the fence would pass for a publisher that had
-        already been replaced. One subquery reads one row. It is also cheaper --
-        measured on 25.12, the conditional publish costs 3.06 ms unfenced,
-        3.85 ms with this, and 4.84 ms with the two-subquery form.
+        already been replaced. Here the ordered ``LIMIT 1`` resolves the head
+        once and both conditions are asked of that one row. It is also cheaper
+        -- measured on 25.12, the conditional publish costs 3.06 ms unfenced
+        and 3.85 ms with a fence, against 4.84 ms for the two-subquery form.
+
+        ``count() ... = 1`` rather than comparing a tuple, because an empty
+        lease table has to make this FALSE and a tuple cannot. A scalar
+        subquery selecting a tuple from no rows is not NULL on 25.12; it is
+        ``Code: 125, Scalar subquery returned empty result of type
+        Tuple(UUID, UInt8) which cannot be Nullable`` -- a raw ServerException,
+        not a CaptureStorageError, thrown before the write is even considered.
+        ``count()`` over the same one-row read always returns a row, so an
+        empty table answers 0 and a publisher that never took a lease writes
+        nothing, which is what this predicate is for.
+
+        What it does NOT do is resolve a CONTESTED head term. The subquery
+        names one row, so the higher ``lease_id`` of two claimants at the top
+        term satisfies it. Safety there comes from ``_claim_lease``: both
+        claimants see the contest in their read-back and neither returns a
+        lease, so neither is holding the ``lease_id`` the fence would accept.
         """
         return (
-            "(SELECT (lease_id, expires_at_ns > toUnixTimestamp64Nano(now64(9))) "
-            f"FROM {self._qualified(self._lease_table)} "
-            "ORDER BY term DESC, lease_id DESC LIMIT 1) "
-            "= (toUUID(%(lease_id)s), true)"
+            "(SELECT count() FROM ("
+            "SELECT lease_id, expires_at_ns FROM "
+            f"{self._qualified(self._lease_table)} "
+            "ORDER BY term DESC, lease_id DESC LIMIT 1"
+            ") WHERE lease_id = toUUID(%(lease_id)s) "
+            "AND expires_at_ns > toUnixTimestamp64Nano(now64(9))) = 1"
         )
 
     def _publish_timeout(self) -> dict[str, object]:

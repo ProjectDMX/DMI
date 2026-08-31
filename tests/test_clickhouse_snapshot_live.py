@@ -435,6 +435,50 @@ def test_a_contested_lease_term_is_held_by_nobody():
         assert int(reader.current_watermark()) == version
 
 
+def test_the_fence_refuses_on_an_empty_lease_table_rather_than_throwing():
+    """An empty lease table must make the fence FALSE, not raise.
+
+    The predicate used to select a tuple, and a scalar subquery over no rows is
+    not NULL on 25.12 -- it is `Code: 125, Scalar subquery returned empty result
+    of type Tuple(UUID, UInt8) which cannot be Nullable`, a raw ServerException
+    that is not a `CaptureStorageError` and that nothing in this package
+    catches.
+
+    No public call reaches it today, because `publish_snapshot` renews first
+    and a renewal leaves a row behind. The GC obligation this branch created
+    makes it reachable: a retention job that collects lease rows -- the
+    document says any of these tables may be swept -- hands the next publish an
+    empty table. Asserted at the statement, which is where the branch lives.
+    """
+    with _catalog() as (writer, reader, client, config):
+        version = writer.allocate_version()
+        lease = writer.publisher_lease
+        table = f"`{config.database}`.`{config.table_prefix}_publisher_lease`"
+        watermark = f"`{config.database}`.`{config.table_prefix}_index_watermark`"
+        client.execute(f"TRUNCATE TABLE {table}")
+        assert client.execute(f"SELECT count() FROM {table}") == [(0,)]
+
+        fence = writer._lease_fence()
+        # Evaluating it is not an error, and the answer is "no".
+        assert client.execute(
+            f"SELECT {fence}", {"lease_id": lease.lease_id}
+        ) == [(0,)]
+        # And the statement it guards writes nothing rather than throwing.
+        client.execute(
+            f"INSERT INTO {watermark} (index_version, publish_id, "
+            "published_at_ns, indexed_rows, indexed_packs) SELECT "
+            "%(index_version)s, toUUID(%(publish_id)s), 1, 0, 0 FROM system.one "
+            f"WHERE {fence}",
+            {
+                "index_version": version,
+                "publish_id": str(uuid4()),
+                "lease_id": lease.lease_id,
+            },
+        )
+        assert client.execute(f"SELECT count() FROM {watermark}") == [(0,)]
+        assert int(reader.current_watermark()) == 0
+
+
 def test_a_lease_is_taken_over_on_expiry_and_given_back_on_release():
     """Expiry, takeover, and a re-acquiring publisher that republishes.
 

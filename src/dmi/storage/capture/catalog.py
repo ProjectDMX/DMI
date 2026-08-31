@@ -13,12 +13,40 @@ PackIdentity = tuple[str, str]
 
 
 class SnapshotPublishRaceError(CaptureStorageError):
-    """A publish lost the race to a higher version and made nothing visible.
+    """A publish lost the race to a higher version: no snapshot became visible.
 
-    Retryable by construction: the losing version never reached the watermark
-    table, so the manifest rows it wrote are inert -- membership requires a
-    version to appear there before its rows count. Re-allocating and
-    re-publishing is the whole recovery.
+    Raised when the watermark table holds no row carrying this attempt's
+    ``publish_id`` -- the conditional INSERT was refused, either by the version
+    barrier or by the lease fence. Nothing this publish wrote can enter a
+    snapshot: membership pairs a manifest row with the watermark row of the
+    same publish, and that watermark row does not exist.
+
+    Retryable by construction, and re-allocating a higher version and
+    republishing is the whole recovery. What it does NOT promise is that the
+    catalog is byte for byte as the publish found it: ``publish_snapshot``
+    issues the manifest INSERT and the watermark INSERT as two separately
+    fenced statements, so a takeover landing between them leaves the manifest
+    rows of the first behind. They are inert -- no snapshot can ever admit them
+    -- but they are durable, and collecting them is the GC obligation
+    docs/catalog-descriptor-key.md records.
+    """
+
+
+class SnapshotPublishConflictError(CaptureStorageError):
+    """This publish landed, and so did somebody else's, at the same version.
+
+    The read-back found this attempt's ``publish_id`` on a watermark row for
+    the version AND at least one row it did not write. That is not a lost race
+    and must not be retried as one: this publish IS visible -- its watermark
+    row admits its manifest rows and its packs are in the snapshot -- so
+    republishing at a higher version would add a second visible copy rather
+    than repair anything.
+
+    It is still an anomaly, because the *contents* of that version are now the
+    union of two publishes rather than this one's batch. Every protocol that
+    should have prevented it -- the sole-claimant allocator, the version
+    barrier, the publisher lease -- has been bypassed or shares its prefix with
+    a second writer, so the catalog needs an operator rather than a retry.
     """
 
 

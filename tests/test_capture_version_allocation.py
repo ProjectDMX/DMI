@@ -276,6 +276,99 @@ def test_a_lease_claim_gives_up_after_exhausting_its_attempts():
     assert len(server.lease.rows) == 6, "three claims, each contested once"
 
 
+def test_a_holder_re_acquiring_its_own_live_lease_refreshes_it():
+    """Acquiring twice is the documented path, not a contest.
+
+    Both `capture-storage-design.md` and `renew_publisher_lease`'s own refusal
+    tell an operator to acquire before publishing, so anything that restarts
+    above this object calls acquire on a writer that already holds one.
+
+    Minting a fresh `lease_id` there made the writer a stranger to its own row:
+    the claim was refused as held by ITSELF, the local lease was dropped on the
+    way out, and `release_publisher_lease()` then had nothing to release -- so
+    the orphaned row stood for a whole `lease_ttl_ns` with no API left to clear
+    it and every retry hit the same row.
+    """
+    server = _CatalogServer()
+    writer = _publisher(server, "indexer-a")
+    before = writer.publisher_lease
+
+    after = writer.acquire_publisher_lease("indexer-a")
+
+    assert after.lease_id == before.lease_id, "a refresh keeps the fencing token"
+    assert after.term > before.term
+    assert writer.publisher_lease == after
+    # And the writer can still give it back, which is what the orphan denied.
+    writer.release_publisher_lease()
+    assert writer.publisher_lease is None
+    assert _publisher(server, "indexer-b").publisher_lease is not None
+
+
+def test_a_release_by_a_writer_that_no_longer_holds_the_lease_revokes_nothing():
+    """A stale writer's orderly shutdown must not evict the current holder.
+
+    The tombstone lands at `head.term + 1`, so it becomes the head whatever was
+    there before. Written blind, a writer whose lease lapsed long ago takes the
+    catalog away from whoever holds it now simply by shutting down cleanly: the
+    successor is not told, its next publish is fenced out, and any third
+    publisher can take the lease off it at once.
+    """
+    server = _CatalogServer()
+    stale = _publisher(server, "stale")
+
+    _expire_the_lease(server)
+    healthy = _publisher(server, "healthy")
+    rows_before = len(server.lease.rows)
+
+    stale.release_publisher_lease()
+
+    assert stale.publisher_lease is None, "the stale writer still gives up its own"
+    assert len(server.lease.rows) == rows_before, "a non-holder wrote a tombstone"
+    # The healthy holder is untouched: its lease still fences, and a third
+    # publisher is still refused.
+    assert server.lease.fence_passes(healthy.publisher_lease.lease_id)
+    with pytest.raises(PublisherLeaseHeldError, match="'healthy'"):
+        _publisher(server, "third")
+
+
+def test_a_contested_lease_claim_retries_at_a_randomized_term(monkeypatch):
+    """The retry must not send every contender back to the same next term.
+
+    `head.term + 1` is what every contender computes, so a term abandoned by
+    all of them is followed by a term all of them collide on again. Measured
+    against a live 25.12: six publishers taking a cold lease 25 times each hard
+    -failed 45% of the time with "every term was contested" -- a liveness
+    failure invented entirely by the retry. `allocate_version` already adds
+    `secrets.randbelow(8 * attempt + 1)` for exactly this reason; the lease
+    claim now mirrors it, window for window.
+    """
+    import dmi.storage.capture.clickhouse_catalog as module
+
+    draws: list[int] = []
+
+    def top_of_the_window(bound: int) -> int:
+        draws.append(bound)
+        return bound - 1
+
+    monkeypatch.setattr(module.secrets, "randbelow", top_of_the_window)
+
+    server = _CatalogServer()
+    writer = _writer(server, lease_attempts=3)
+    server.lease.on_claim_read = lambda term: server.lease.rows.append(
+        (term, _LARGE_CLAIM, "competitor", 0, 0)
+    )
+
+    with pytest.raises(PublisherLeaseError, match="after 3 attempts"):
+        writer.acquire_publisher_lease("indexer-a")
+
+    # The first attempt takes head + 1 unskipped; every later one draws from
+    # the same widening window the allocator uses.
+    assert draws == [8 * 1 + 1, 8 * 2 + 1]
+    claimed = sorted({term for term, _, holder, _, _ in server.lease.rows
+                      if holder == "indexer-a"})
+    assert claimed == [1, 10, 27], claimed
+
+
 def test_a_released_lease_is_available_at_once():
     """An orderly handover must not cost the next publisher a whole TTL."""
     server = _CatalogServer()

@@ -13,6 +13,7 @@ from dmi.storage.capture import (
     PackIndex,
     PackRef,
     PackWriter,
+    SnapshotPublishConflictError,
     SnapshotPublishRaceError,
 )
 from dmi.storage.capture.clickhouse_catalog import _SCHEMA_VERSION
@@ -428,30 +429,72 @@ def test_publish_verifies_the_row_at_its_version_is_its_own():
         "WHERE index_version = %(version)s"
     )
     assert check[1] == {"version": 42}
-    # And nothing counts rows any more: a count cannot tell whose row it is.
+    # And nothing READS the watermark by counting any more: a count cannot tell
+    # whose row it is. (The lease fence counts, but over the lease table, and
+    # only inside the statements that write.)
     assert not any(
-        "count()" in call[0] and "dmi_index_watermark" in call[0]
+        call[0].lstrip().startswith("SELECT")
+        and "count()" in call[0]
+        and "dmi_index_watermark" in call[0]
         for call in client.calls
     )
 
 
-def test_a_foreign_row_at_the_published_version_is_not_success():
+def test_a_foreign_row_where_this_publish_is_absent_is_a_lost_race():
     """The failure a count could not see.
 
     The sole-claimant allocator makes a foreign row at V unlikely, not
     impossible -- a stray operator INSERT, a second build, a publisher whose
-    statement overlapped this one. A publisher that finds anything but its own
-    identity standing at V has not published V and must say so.
+    statement overlapped this one. Here this publish's own conditional INSERT
+    was refused (the barrier: 42 is below a published head of 100), so the only
+    row standing at V belongs to somebody else. Nothing this attempt wrote can
+    enter a snapshot, and re-allocating above the head is the recovery.
+    """
+    client = _Client()
+    client.watermarks = [100]
+    client.foreign_publishes = ["ffffffff-ffff-ffff-ffff-ffffffffffff"]
+    writer = _leased(client)
+
+    with pytest.raises(SnapshotPublishRaceError) as raised:
+        writer.publish_snapshot(
+            index_version=42, refs=(), published_at_ns=7,
+            indexed_rows=0, indexed_packs=0,
+        )
+
+    assert "lost the publish race" in str(raised.value)
+    assert "Allocate a higher version" in str(raised.value)
+
+
+def test_a_foreign_row_BESIDE_this_publish_is_not_a_lost_race():
+    """The other half of the same read-back, and the opposite recovery.
+
+    A foreign row arriving at V *after* this publish's landed does not undo it:
+    the watermark row carrying this ``publish_id`` is standing, its manifest
+    rows are paired with it, and its packs are in the snapshot. Calling that a
+    lost race told the caller "nothing it wrote is visible" -- false -- and had
+    `CatalogIndexer` republish the same batch underneath a snapshot that
+    already contained it. It is an anomaly, so it is raised; it is not
+    retryable, so it is not a ``SnapshotPublishRaceError``.
     """
     client = _Client()
     client.foreign_publishes = ["ffffffff-ffff-ffff-ffff-ffffffffffff"]
     writer = _leased(client)
 
-    with pytest.raises(SnapshotPublishRaceError, match="lost the publish race"):
+    with pytest.raises(SnapshotPublishConflictError) as raised:
         writer.publish_snapshot(
             index_version=42, refs=(), published_at_ns=7,
             indexed_rows=0, indexed_packs=0,
         )
+
+    assert not isinstance(raised.value, SnapshotPublishRaceError), (
+        "the indexer's publish retry absorbs SnapshotPublishRaceError, and "
+        "retrying this one republishes a batch that is already visible"
+    )
+    message = str(raised.value)
+    assert "ffffffff-ffff-ffff-ffff-ffffffffffff" in message
+    assert "must not be retried" in message
+    # The publish really did land: this is not a loss dressed up as an anomaly.
+    assert client.watermarks == [42]
 
 
 def test_each_publish_attempt_mints_its_own_identity():
