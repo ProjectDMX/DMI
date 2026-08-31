@@ -515,14 +515,25 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 |---|---|
 | no catalog objects at all | fresh install: create everything, stamp the current version |
 | version table stamped at the current version, all objects present | proceed; the DDL is idempotent |
-| version table present, no row | an install of this build that died before stamping: rerun the DDL, then stamp |
+| version table present, no row | an install of this build that died before stamping: rerun the DDL, then stamp -- *after* the last three rows below, which an empty stamp does not skip |
 | only superseded objects (`{prefix}_pack_commit_log`) | refuse -- naming that object and saying to drop it; there is nothing to rebuild |
 | an object present under the wrong kind (a table where a view belongs, or the reverse) | refuse -- naming the object and its engine |
 | catalog objects present, no version table | refuse -- unstamped, with the differences read off `system.tables` / `system.columns` |
 | stamped at any other version | refuse -- a newer writer owns this catalog, or an older one this build cannot upgrade |
-| stamped current, a TABLE missing | refuse -- partially dropped |
-| stamped current, a VIEW missing | recreate it; a view is a projection of the tables and holds no rows |
+| a TABLE missing | refuse -- partially dropped |
+| a VIEW missing | recreate it; a view is a projection of the tables and holds no rows |
 | pack inventory populated, snapshot manifest empty | refuse -- membership is gone |
+
+**An empty stamp narrows the version; it does not excuse anything else.** The
+last three rows apply whether or not `{prefix}_schema_version` holds a row.
+Returning as soon as it was empty skipped both refusals, and clearing the stamp
+is the obvious workaround for an operator who has just been refused -- which
+made it the likeliest route into the state this check exists to prevent.
+Measured on 25.12: with the stamp truncated, a version 3 catalog was accepted
+and re-stamped as 4 with no `{prefix}_publisher_lease` table, performing the
+in-place upgrade this design says is never performed; on a version 2 catalog
+the DDL then died mid-way with `Code: 47` over `publish_id`, leaving the
+catalog half written; and an inventory beside an empty manifest was accepted.
 
 **An unstamped catalog is diagnosed, not assumed.** The refusal reads the
 descriptor table's `sorting_key`, which of the two membership tables exist,

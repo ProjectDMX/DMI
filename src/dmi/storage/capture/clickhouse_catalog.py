@@ -549,6 +549,13 @@ pack_id UUID
         disagree with data that survived. Everything else is refused, and the
         refusal describes the catalog the server actually reports rather than
         the one an absent table suggests -- see ``_unstamped_diagnosis``.
+
+        An EMPTY stamp table is not an exception either. It narrows what the
+        version means -- an install of this build that died before stamping,
+        rather than a version this build cannot read -- and nothing more: the
+        checks for a missing table and for an inventory without membership
+        still have to run, because both describe states no rerun of the DDL
+        repairs.
         """
         found = self._catalog_state()
         if not found:
@@ -559,12 +566,7 @@ pack_id UUID
         if self._schema_table not in found:
             raise CatalogSchemaVersionError(self._unstamped_diagnosis(found))
         recorded = self._recorded_schema_version()
-        if recorded is None:
-            # The table exists and nothing stamped it: an install of THIS build
-            # that died between creating the objects and recording the version.
-            # Re-running the DDL is exactly the right recovery.
-            return
-        if recorded != _SCHEMA_VERSION:
+        if recorded is not None and recorded != _SCHEMA_VERSION:
             raise CatalogSchemaVersionError(
                 f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
                 f"is at schema version {recorded} and this build reads version "
@@ -577,6 +579,28 @@ pack_id UUID
                 "nor its sort key. "
                 + self._rebuild_instruction()
             )
+        # The two checks below run whether or not the stamp table holds a row.
+        # An EMPTY stamp table means an install of this build died between
+        # creating the objects and recording the version, and re-running the
+        # DDL is the right recovery -- but only over a catalog that is
+        # otherwise whole, which is what these two decide.
+        #
+        # Returning early on the empty stamp skipped both of them, and clearing
+        # the stamp is the obvious operator workaround for a refusal. Measured:
+        # truncating it on a version 3 catalog made ensure_schema ACCEPT a
+        # catalog with no `{prefix}_publisher_lease` and re-stamp it as 4 --
+        # the in-place upgrade this design says is never performed. On a
+        # version 2 catalog the DDL then died mid-way with `Code: 47, Unknown
+        # expression or function identifier 'publish_id'`, leaving the catalog
+        # half written: exactly the outcome ``_reject_wrong_kinds`` and this
+        # whole method exist to prevent. And it made an inventory beside an
+        # empty manifest -- the state that hides every capture -- accepted.
+        stamp = (
+            f"is stamped schema version {_SCHEMA_VERSION}"
+            if recorded is not None
+            else f"holds `{self._schema_table}` with no row in it (an install "
+            "of this build that died before stamping)"
+        )
         # TABLES only. A view holds no rows: it is a projection of the tables
         # below it, ``ensure_schema`` recreates it unconditionally
         # (CREATE OR REPLACE / CREATE IF NOT EXISTS), and recreating it cannot
@@ -592,7 +616,7 @@ pack_id UUID
         if missing:
             raise CatalogSchemaVersionError(
                 f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
-                f"is stamped schema version {_SCHEMA_VERSION} but is missing "
+                f"{stamp} but is missing "
                 + ", ".join(f"`{name}`" for name in missing)
                 + ". Recreating those empty beside tables that kept their rows "
                 "is not a repair, it is the dangerous state: a surviving pack "
@@ -794,10 +818,13 @@ pack_id UUID
 
         absent = [name for _, name in self._objects if name not in found]
         if absent:
+            # ``absent`` is what is NOT here, so both branches have to say so.
+            # The singular one read "..., which is present" and fired in the
+            # single-difference case, which is the one an operator checks.
             findings.append(
                 "this build also creates "
                 + ", ".join(f"`{name}`" for name in absent)
-                + f", {'which is' if len(absent) == 1 else 'none of which are'} "
+                + f", {'which is not' if len(absent) == 1 else 'none of which are'} "
                 "present"
             )
 

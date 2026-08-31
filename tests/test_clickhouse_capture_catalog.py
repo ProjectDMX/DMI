@@ -798,10 +798,15 @@ def test_an_unstamped_catalog_whose_shape_already_matches_is_still_refused():
 
     findings = _findings(str(raised.value))
     assert any("already carry `publish_id`" in item for item in findings), findings
-    assert any(
-        item == "this build also creates `dmi_schema_version`, which is present"
-        for item in findings
-    ) or any("`dmi_schema_version`" in item for item in findings), findings
+    # `absent` holds what is NOT here, so the sentence has to say so. The
+    # singular branch read ", which is present" -- and this assertion used to
+    # spell that out as the first half of an `or` whose second half matched any
+    # sentence naming the table, so it codified the defect AND could not have
+    # failed on it. No escape hatch now.
+    assert (
+        "this build also creates `dmi_schema_version`, which is not present"
+        in findings
+    ), findings
     assert "refused whichever version it is" in str(raised.value)
 
 
@@ -906,6 +911,60 @@ def test_an_unstamped_install_of_this_build_is_completed_not_refused():
 
     assert any(call[0].startswith("CREATE TABLE") for call in client.calls)
     assert client.calls[-1][1]["version"] == _SCHEMA_VERSION
+
+
+def test_an_unstamped_install_missing_a_table_is_still_refused():
+    """An empty stamp narrows the version; it does not excuse a missing table.
+
+    Returning as soon as the stamp table held no row skipped both remaining
+    checks -- and clearing the stamp is the obvious operator workaround for a
+    refusal, which makes this the most likely route into the state the guard
+    exists to prevent. Measured against 25.12: truncating the stamp on a
+    version 3 catalog made `ensure_schema` accept a catalog with no
+    `{prefix}_publisher_lease` and re-stamp it as 4, performing the in-place
+    upgrade this design says is never performed; on a version 2 catalog the DDL
+    then died mid-way with `Code: 47` over `publish_id` and left the catalog
+    half written.
+    """
+    client = _Client(
+        tables=[name for name in _CURRENT_OBJECTS if name != "dmi_publisher_lease"],
+        schema_version=None,
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    assert "missing `dmi_publisher_lease`" in message
+    # And it says which state it is in, rather than claiming a stamp it does
+    # not have -- a refusal an operator can check and find false gets worked
+    # around, onto the path it exists to prevent.
+    assert "holds `dmi_schema_version` with no row in it" in message
+    assert f"stamped schema version {_SCHEMA_VERSION}" not in message
+    assert "CatalogReconciler.rebuild()" in message
+    assert not any(
+        call[0].startswith(("CREATE TABLE", "CREATE OR REPLACE", "ALTER"))
+        for call in client.calls
+    ), "the DDL ran against a catalog this build cannot complete"
+
+
+def test_an_unstamped_install_with_an_empty_manifest_is_still_refused():
+    """The catalog-hiding state, reached by clearing the stamp.
+
+    Same early return, other check: an inventory with rows beside an empty
+    manifest reports every pack as indexed and admits none to a snapshot.
+    """
+    client = _Client(
+        tables=_CURRENT_OBJECTS,
+        schema_version=None,
+        inventory_rows=4,
+        manifest_rows=0,
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    assert "empty but reports success" in str(raised.value)
 
 
 def test_a_catalog_written_by_a_newer_build_is_refused():
