@@ -175,7 +175,7 @@ class _Client:
             elif "index_watermark" in query:
                 version = params["index_version"]
                 if version > max(self.watermarks, default=0) and (
-                    self.lease.fence_passes(params["lease_id"])
+                    self.lease.fence_admits(query, params)
                 ):
                     self.watermarks.append(version)
                     self.publishes.append((version, params["publish_id"]))

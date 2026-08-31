@@ -89,6 +89,11 @@ class _CatalogWriter:
         self.committed: set[tuple[str, str]] = set()
         self.descriptor_batches: list[tuple] = []
         self.pack_batches: list[tuple[PackRef, ...]] = []
+        # The version `commit_packs` was called with. Recorded because the
+        # replay guard has to carry the version that WON: discarded here, the
+        # claim that it is "recorded at the published version" was untestable
+        # and `commit_packs(index_version=0)` passed every test in this file.
+        self.pack_versions: list[int] = []
         self.watermarks: list[tuple[int, int, int, int]] = []
         self.manifests: list[tuple[int, tuple]] = []
         self.descriptor_versions: list[int] = []
@@ -106,6 +111,7 @@ class _CatalogWriter:
 
     def commit_packs(self, refs, *, index_version):
         self.pack_batches.append(tuple(refs))
+        self.pack_versions.append(index_version)
         if self.fail_commit_once:
             self.fail_commit_once = False
             raise RuntimeError("ambiguous commit")
@@ -217,8 +223,12 @@ def test_a_lost_publish_is_retried_at_a_higher_version(tmp_path: Path):
     assert writer.descriptor_versions == [published - 1]
     assert writer.descriptor_versions[0] != published
 
-    # The replay guard is recorded at the published version, after the publish.
+    # The replay guard is recorded at the published version, after the publish
+    # -- at the version that WON, not the one the descriptors were written
+    # with. This used to be a comment over an assertion that only looked at the
+    # refs, so the version half of the claim was never checked at all.
     assert writer.pack_batches == [tuple(refs)]
+    assert writer.pack_versions == [published]
 
 
 def test_publishing_gives_up_after_its_bounded_retries(tmp_path: Path):

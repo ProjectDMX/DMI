@@ -230,7 +230,7 @@ class _Client:
                 version = params["index_version"]
                 if version > max(
                     (v for v, _ in self.watermarks), default=0
-                ) and self.lease.fence_passes(params["lease_id"]):
+                ) and self.lease.fence_admits(query, params):
                     self.watermarks.append((version, params["publish_id"]))
             return []
         if "version_claims" in query:

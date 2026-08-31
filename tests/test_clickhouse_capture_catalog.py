@@ -158,7 +158,7 @@ class _Client:
                 # vacuously.
                 version = params["index_version"]
                 if version > max(self.watermarks, default=0) and (
-                    self.lease.fence_passes(params["lease_id"])
+                    self.lease.fence_admits(query, params)
                 ):
                     self.watermarks.append(version)
                     self.publishes.append((version, params["publish_id"]))
@@ -674,6 +674,23 @@ def test_a_fresh_install_stamps_the_schema_version_last():
     assert statements[1].startswith("CREATE DATABASE")
 
 
+def _created_objects(client) -> set[str]:
+    """Every `{prefix}_` object the DDL just created, read off the statements.
+
+    `CREATE ... IF NOT EXISTS` is a no-op against a live object, so the writer
+    issues the whole DDL every time; what this asserts is that the whole DDL is
+    what it issues.
+    """
+    created = set()
+    for query, _, _ in client.calls:
+        if not query.startswith("CREATE"):
+            continue
+        for name in _CURRENT_OBJECTS:
+            if f"`{name}`" in query.split(" AS ")[0]:
+                created.add(name)
+    return created
+
+
 def _findings(message: str) -> list[str]:
     """The bulleted differences a refusal claims it found."""
     return [
@@ -1015,7 +1032,11 @@ def test_a_stamped_catalog_with_a_dropped_view_recreates_it():
 
     _writer(client).ensure_schema()
 
-    assert any("CREATE OR REPLACE VIEW" in call[0] for call in client.calls)
+    # The DROPPED view is recreated, which "some CREATE OR REPLACE VIEW ran"
+    # could not say: `ensure_schema` issues one on every call, so that
+    # assertion held for any input that did not raise.
+    assert _created_objects(client) == set(_CURRENT_OBJECTS)
+    assert client.calls[-1][0].startswith("INSERT INTO `default`.`dmi_schema_version`")
 
 
 @pytest.mark.parametrize("dropped", _VIEWS)
@@ -1055,23 +1076,37 @@ def test_a_populated_inventory_with_an_empty_manifest_is_refused():
     assert "empty but reports success" in message
 
 
-def test_a_catalog_at_this_builds_version_is_accepted():
+@pytest.mark.parametrize(
+    "inventory_rows, manifest_rows",
+    [(4, 2), (0, 0)],
+    ids=["populated", "empty"],
+)
+def test_a_catalog_at_this_builds_version_is_accepted(inventory_rows, manifest_rows):
+    """Nothing indexed yet is not the same state as membership gone missing.
+
+    Both of these used to assert only that SOME `CREATE OR REPLACE VIEW` was
+    issued, which `ensure_schema` does on every call -- so they said "it did
+    not raise" and nothing else. What they are for is that the full DDL runs
+    and the stamp is rewritten, idempotently, over a catalog already at this
+    version.
+    """
     client = _Client(
-        tables=_CURRENT_OBJECTS, schema_version=_SCHEMA_VERSION, inventory_rows=4, manifest_rows=2
+        tables=_CURRENT_OBJECTS,
+        schema_version=_SCHEMA_VERSION,
+        inventory_rows=inventory_rows,
+        manifest_rows=manifest_rows,
     )
 
     _writer(client).ensure_schema()
 
-    assert any("CREATE OR REPLACE VIEW" in call[0] for call in client.calls)
-
-
-def test_an_empty_catalog_at_this_builds_version_is_accepted():
-    """Nothing indexed yet is not the same state as membership gone missing."""
-    client = _Client(tables=_CURRENT_OBJECTS, schema_version=_SCHEMA_VERSION)
-
-    _writer(client).ensure_schema()
-
-    assert any("CREATE OR REPLACE VIEW" in call[0] for call in client.calls)
+    assert _created_objects(client) == set(_CURRENT_OBJECTS)
+    # The stamp is written last and is conditional server-side, so a rerun
+    # against a stamped catalog inserts nothing without a read-then-write
+    # window.
+    stamp = client.calls[-1]
+    assert stamp[0].startswith("INSERT INTO `default`.`dmi_schema_version`")
+    assert "WHERE (SELECT count() FROM `default`.`dmi_schema_version`) = 0" in stamp[0]
+    assert stamp[1]["version"] == _SCHEMA_VERSION
 
 
 

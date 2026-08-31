@@ -7,6 +7,13 @@ four have to APPLY the fence rather than ignore it -- a fake that lets a fenced
 statement through makes every publish test pass vacuously, which is the mistake
 the version barrier's comment already warns about.
 
+Applying it means reading it off the STATEMENT. Keyed on the `lease_id`
+parameter instead -- which `publish_snapshot` passes unconditionally -- the
+fence could be deleted from the source outright and every CPU test still
+passed, because the fakes were enforcing it on the writer's behalf. So
+`fence_admits` matches the predicate the writer emits and raises
+`MissingLeaseFence` when a statement that must carry it does not.
+
 What this cannot model is the thing the fence exists for. Two publishers here
 are serialised by the Python interpreter, so their statements never overlap on a
 server and no amount of fake state reproduces the window. The load-bearing tests
@@ -16,17 +23,60 @@ ClickHouse.
 
 from __future__ import annotations
 
+import re
+
 
 # A fixed starting point rather than a real clock: expiry is something the tests
 # drive by moving `now_ns`, so nothing here depends on how long a test takes.
 _EPOCH_NS = 1_700_000_000_000_000_000
 
 
+class MissingLeaseFence(AssertionError):
+    """A statement that has to carry the lease fence was issued without it."""
+
+
+# The predicate `ClickHouseCatalogWriter._lease_fence()` emits, as a pattern.
+# Everything the fence DOES is matched exactly; only the table name is loose,
+# because each suite runs under its own prefix. Exactness is the point: the
+# fence is the whole safety property, so a rewrite of it has to be restated
+# here on purpose rather than silently accepted.
+# `test_the_fake_matches_the_fence_the_writer_actually_emits` pins this pattern
+# against the writer's own output, so drift fails as one clear test rather than
+# as four suites going quietly vacuous.
+_FENCE = re.compile(
+    r"\(SELECT count\(\) FROM \("
+    r"SELECT lease_id, expires_at_ns FROM `[^`]+`\.`[^`]+_publisher_lease` "
+    r"ORDER BY term DESC, lease_id DESC LIMIT 1"
+    r"\) WHERE lease_id = toUUID\(%\(lease_id\)s\) "
+    r"AND expires_at_ns > toUnixTimestamp64Nano\(now64\(9\)\)\) = 1"
+)
+
+_LIMIT = re.compile(r"\bLIMIT\s+(\d+)")
+
+
+def uuid_order(text: str) -> tuple[int, int]:
+    """ClickHouse's UUID collation, which is NOT the text order.
+
+    A `UUID` is two `UInt64`s and ClickHouse compares the LOW half first, so
+    `ORDER BY lease_id DESC` ranks `00000000-0000-0000-ffff-ffffffffffff`
+    ABOVE `ffffffff-ffff-ffff-0000-000000000000` while Python's string order
+    ranks it below. Verified on 25.12 against `ORDER BY u DESC LIMIT 1`.
+
+    It matters because the fence and `_lease_head` both resolve a contested
+    head term with `ORDER BY term DESC, lease_id DESC`, and a fake that
+    resolved it by text order would model a different row than the server
+    picks -- so any test reaching a contested head would be asserting the
+    wrong outcome.
+    """
+    raw = text.replace("-", "")
+    return int(raw[16:], 16), int(raw[:16], 16)
+
+
 class FakeLeaseTable:
     """`{prefix}_publisher_lease`, with the server clock the tests control.
 
     ``rows`` is the append-only table, ``now_ns`` is the server's clock, and
-    ``fence_passes`` is the predicate the real statements evaluate server-side.
+    ``fence_admits`` is the predicate the real statements evaluate server-side.
     """
 
     def __init__(self) -> None:
@@ -50,15 +100,39 @@ class FakeLeaseTable:
         return [row for row in self.rows if row[0] == top]
 
     def fence_passes(self, lease_id: object) -> bool:
-        """The fencing predicate: the head row is this lease, and it is live."""
+        """The fencing predicate over the model, ignoring any statement."""
         if self.on_fence is not None:
             self.on_fence(lease_id)
         head = self.head()
         if not head:
             return False
-        # The statement resolves the head with ORDER BY term DESC, lease_id DESC.
-        term, resolved, _, _, expires_at_ns = max(head, key=lambda row: row[1])
+        # The statement resolves the head with ORDER BY term DESC, lease_id
+        # DESC, and ClickHouse orders UUIDs by their low half first.
+        _, resolved, _, _, expires_at_ns = max(
+            head, key=lambda row: uuid_order(row[1])
+        )
         return resolved == lease_id and expires_at_ns > self.now_ns
+
+    def fence_admits(self, statement: str, params) -> bool:
+        """Evaluate the fence THIS STATEMENT carries.
+
+        Keyed on the SQL, never on the presence of the `lease_id` parameter.
+        `publish_snapshot` passes that parameter whether or not the statement
+        uses it, so a fake that keyed on it enforced the fence on the writer's
+        behalf: deleting `_lease_fence()` from the source left every CPU test
+        passing, which is the one thing these fakes must never do.
+        """
+        if _FENCE.search(statement) is None:
+            raise MissingLeaseFence(
+                "a statement that must be fenced on the publisher lease was "
+                "issued without the fence. Only the lease holder may make a "
+                "snapshot visible, and the check has to ride inside the "
+                "statement that writes -- a publisher fenced out after the "
+                "write has already made it durable is the failure mode this "
+                "design has rejected twice.\n"
+                f"statement: {statement}"
+            )
+        return self.fence_passes(params["lease_id"])
 
     # -- the client interface -----------------------------------------------
 
@@ -87,12 +161,20 @@ class FakeLeaseTable:
         if not statement.startswith("SELECT") or "publisher_lease" not in query:
             return None
         if "ORDER BY term DESC" in query:
-            # The head, in the order the fence resolves it, and at most two
-            # rows -- the second only says whether the head term is contested.
-            ordered = sorted(self.rows, key=lambda row: row[:2], reverse=True)
+            # The head, in the order the fence resolves it, cut to the LIMIT
+            # the statement actually asked for. Hardcoding two rows here made
+            # the head read's own LIMIT untestable: narrowed to one, a
+            # contested term reads as a lease held by its higher claimant and
+            # nothing noticed.
+            limit = int(_LIMIT.search(query).group(1))
+            ordered = sorted(
+                self.rows,
+                key=lambda row: (row[0], uuid_order(row[1])),
+                reverse=True,
+            )
             return [
                 (term, lease_id, holder, expires_at_ns, self.now_ns)
-                for term, lease_id, holder, _, expires_at_ns in ordered[:2]
+                for term, lease_id, holder, _, expires_at_ns in ordered[:limit]
             ]
         term = int(params["term"])
         if self.on_claim_read is not None:

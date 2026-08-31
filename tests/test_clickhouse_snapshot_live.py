@@ -391,14 +391,179 @@ def test_a_taken_over_publisher_writes_nothing_at_all():
         successor.release_publisher_lease()
 
 
+def test_a_takeover_between_the_two_publish_statements_leaves_orphan_rows():
+    """The guarantee is per STATEMENT, not per publish, and this is the gap.
+
+    `publish_snapshot` issues two separately fenced statements: the manifest
+    rows, then the watermark row that admits them. Both carry the fence, so
+    neither can land after a takeover -- but the gap between them is a full
+    client round trip, which `max_execution_time` does not bound because it
+    caps each statement rather than the pair.
+
+    A takeover wedged there leaves the manifest rows of the first statement
+    behind while the second is refused. Those rows are INERT -- membership
+    pairs them with a watermark row that will never exist, so no snapshot can
+    admit them and no reader can see them -- but they are durable, and they
+    are what the "a fenced-out publisher writes nothing" claim gets wrong.
+    That is the difference between the safety property, which holds, and the
+    stronger property the documents used to claim.
+    """
+    corpus = synthetic_descriptors(3)
+    tenant = corpus[0].metadata.tenant_id
+    later = _retried_into_a_new_pack(corpus)
+
+    with _catalog(
+        lease_ttl_ns=200_000_000, publish_timeout_ns=100_000_000
+    ) as (writer, reader, client, config):
+        version = writer.allocate_version()
+        writer.write_descriptors(corpus, index_version=version)
+        _publish(writer, version, refs=_refs(corpus), rows=len(corpus))
+        pinned = reader.current_watermark()
+        before_page = reader.search(CaptureQuery(limit=100, tenant_id=tenant))
+
+        writer.release_publisher_lease()
+        default = ClickHouseCatalogConfig()
+        successor = ClickHouseCatalogWriter(
+            _client(),
+            replace(
+                config,
+                lease_ttl_ns=default.lease_ttl_ns,
+                publish_timeout_ns=default.publish_timeout_ns,
+            ),
+        )
+        armed = []
+
+        class _TakeOverBetweenTheTwoStatements:
+            """A's client, with B's takeover wedged AFTER the manifest INSERT."""
+
+            def execute(self, query, params=None, **kwargs):
+                rows = client.execute(query, params, **kwargs)
+                if armed and query.lstrip().startswith(
+                    "INSERT INTO "
+                    f"`{config.database}`.`{config.table_prefix}_snapshot_manifest`"
+                ):
+                    armed.clear()
+                    # A's manifest rows are durable. Its lease lapses here and
+                    # B takes over before A issues its watermark INSERT.
+                    sleep(0.25)
+                    successor.acquire_publisher_lease("successor")
+                return rows
+
+        stalled = ClickHouseCatalogWriter(_TakeOverBetweenTheTwoStatements(), config)
+        stalled.acquire_publisher_lease("stalled")
+        lost = stalled.allocate_version()
+        stalled.write_descriptors(later, index_version=lost)
+
+        armed.append(True)
+        with pytest.raises(PublisherLeaseError) as raised:
+            _publish(stalled, lost, refs=_refs(later), rows=len(later))
+
+        assert not armed, "the takeover never ran; the test proved nothing"
+        assert "fenced out" in str(raised.value)
+
+        manifest = f"`{config.database}`.`{config.table_prefix}_snapshot_manifest`"
+        orphans = client.execute(
+            f"SELECT count() FROM {manifest} WHERE index_version = %(v)s",
+            {"v": lost},
+        )
+        # The rows the first statement wrote ARE there. This is the assertion
+        # that separates "wrote nothing" from what actually happens.
+        assert orphans == [(len(_refs(later)),)], (
+            "precondition: the manifest INSERT must have landed before the "
+            "takeover, or this test is exercising the other window"
+        )
+        # And they are inert: no watermark row carries that version, so no
+        # snapshot admits them and every reader is unmoved.
+        assert client.execute(
+            "SELECT count() FROM "
+            f"`{config.database}`.`{config.table_prefix}_index_watermark` "
+            "WHERE index_version = %(v)s",
+            {"v": lost},
+        ) == [(0,)]
+        assert reader.current_watermark() == pinned
+        assert reader.search(
+            CaptureQuery(limit=100, tenant_id=tenant, cursor=None)
+        ).items == before_page.items
+        # The public view agrees with the reader: unpaired membership admits
+        # nothing.
+        assert client.execute(
+            "SELECT count() FROM "
+            f"`{config.database}`.`{config.table_prefix}_capture`"
+        ) == [(len(corpus),)]
+        successor.release_publisher_lease()
+
+
+def test_a_contested_head_term_is_made_safe_by_the_read_back_not_the_fence():
+    """Where the safety of a contested term actually comes from.
+
+    Both documents said "a contested head term satisfies neither condition" of
+    the fence. It is not true and the difference matters to anyone reasoning
+    from it: the fence resolves ONE row with `ORDER BY term DESC, lease_id
+    DESC`, so a contested term's higher-ordering claimant satisfies it exactly
+    as an uncontested holder would.
+
+    What makes the term safe is `_claim_lease`: both claimants see two rows in
+    their read-back, both abandon the term, and neither is ever handed a
+    `PublisherLease`. Nobody is holding the `lease_id` the fence would accept.
+    Asserted on the server, because the ordering here is ClickHouse's UUID
+    collation -- the low half first -- and not text order.
+    """
+    with _catalog() as (writer, reader, client, config):
+        writer.release_publisher_lease()
+        lease_table = f"`{config.database}`.`{config.table_prefix}_publisher_lease`"
+        client.execute(f"TRUNCATE TABLE {lease_table}")
+        # Two live claimants at one term, and nothing above it: the shape a
+        # contested head has before anybody claims higher. Chosen so that
+        # ClickHouse's UUID order and Python's text order disagree, which is
+        # the trap a fake resolving this in Python would fall into.
+        low_text_high_uuid = "00000000-0000-0000-ffff-ffffffffffff"
+        high_text_low_uuid = "ffffffff-ffff-ffff-0000-000000000000"
+        for lease_id in (low_text_high_uuid, high_text_low_uuid):
+            client.execute(
+                f"INSERT INTO {lease_table} (term, lease_id, holder, "
+                "acquired_at_ns, expires_at_ns) SELECT toUInt64(7), "
+                "toUUID(%(lease_id)s), 'claimant', now_ns, "
+                "now_ns + toUInt64(600000000000) FROM "
+                "(SELECT toUnixTimestamp64Nano(now64(9)) AS now_ns)",
+                {"lease_id": lease_id},
+            )
+
+        fence = writer._lease_fence()
+        # The fence admits one of them, which is the claim both documents got
+        # wrong. It is the UUID-order winner, not the text-order winner.
+        assert client.execute(
+            f"SELECT {fence}", {"lease_id": low_text_high_uuid}
+        ) == [(1,)]
+        assert client.execute(
+            f"SELECT {fence}", {"lease_id": high_text_low_uuid}
+        ) == [(0,)]
+
+        # And it is safe anyway, because no protocol run ever returns that
+        # lease: a claimant that sees the contest abandons the term and claims
+        # above it, so the id the fence would accept is one nobody holds.
+        successor = ClickHouseCatalogWriter(_client(), config)
+        lease = successor.acquire_publisher_lease("successor")
+        assert lease.term > 7 and lease.lease_id not in (
+            low_text_high_uuid, high_text_low_uuid
+        )
+        version = successor.allocate_version()
+        _publish(successor, version, refs=(), rows=0)
+        assert int(reader.current_watermark()) == version
+        successor.release_publisher_lease()
+
+
 def test_a_contested_lease_term_is_held_by_nobody():
     """Sole-claimant, over a live server, with a real competing row.
 
     A competing claim lands between the claimant's INSERT and its read-back.
     Resolving the tie either way would let both sides keep the term when each
-    sees only its own insert first, so both walk away -- and the contested term
-    then holds no lease at all, which the fence has to agree with: publishing
-    under it writes nothing.
+    sees only its own insert first, so both walk away and claim above it.
+
+    What this does NOT show is a publish under the contested term: by the time
+    the claimant publishes it holds a HIGHER term, so the fence is resolving
+    that row and not the contested one. The docstring used to claim otherwise.
+    `test_a_contested_head_term_is_made_safe_by_the_read_back_not_the_fence`
+    covers the contested head itself.
     """
     competitor = str(uuid4())
     with _catalog() as (writer, reader, client, config):

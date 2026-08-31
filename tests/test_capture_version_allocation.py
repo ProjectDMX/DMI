@@ -74,7 +74,7 @@ class _CatalogServer:
                 self.claims.extend((int(row[0]), str(row[1])) for row in params)
             elif "snapshot_manifest" in query:
                 # Fenced too, so a fenced-out publisher records nothing here.
-                if self.lease.fence_passes(params["lease_id"]):
+                if self.lease.fence_admits(query, params):
                     self.manifest.extend(
                         (int(params["index_version"]), str(params["publish_id"]),
                          str(store_id), str(pack_id))
@@ -86,7 +86,7 @@ class _CatalogServer:
                 # still holds the lease.
                 version = int(params["index_version"])
                 if version > max(self.watermarks, default=0) and (
-                    self.lease.fence_passes(params["lease_id"])
+                    self.lease.fence_admits(query, params)
                 ):
                     self.watermarks.append(version)
                     self.publishes.append((version, params["publish_id"]))
@@ -173,12 +173,18 @@ def test_a_lease_holder_must_be_a_short_non_empty_name(holder):
         _writer(_CatalogServer()).acquire_publisher_lease(holder)
 
 
-def test_an_expired_lease_is_taken_over_and_fences_out_the_old_holder():
+def test_an_expired_lease_is_taken_over_and_the_old_holder_never_reaches_a_write():
     """Expiry is what makes a crashed indexer recoverable rather than terminal.
 
-    The old holder is not told; it finds out when its next publish writes
-    nothing. Both of its statements carry the fence, so "writes nothing" is
-    literal -- no manifest row either.
+    The old holder is not told; it finds out at its next publish. The stop
+    happens at the RENEWAL, client-side: `publish_snapshot` renews first, the
+    renewal reads a head that is a live lease belonging to somebody else, and
+    it refuses before any statement is issued. This test therefore says nothing
+    about the fence -- it passed unchanged with `_lease_fence()` replaced by
+    `1 = 1`, and its docstring used to claim the fence was what made "writes
+    nothing" literal. The fence is exercised by
+    `test_a_takeover_after_the_renewal_is_reported_as_a_lost_lease` below, and
+    for real by tests/test_clickhouse_snapshot_live.py.
     """
     server = _CatalogServer()
     stalled = _publisher(server, "stalled")
@@ -187,13 +193,19 @@ def test_an_expired_lease_is_taken_over_and_fences_out_the_old_holder():
     _expire_the_lease(server)
     successor = _publisher(server, "successor")
     assert successor.publisher_lease.term > stalled.publisher_lease.term
+    issued = len(server.inserts)
 
-    with pytest.raises(PublisherLeaseHeldError):
+    with pytest.raises(PublisherLeaseHeldError, match="'successor'"):
         stalled.publish_snapshot(
             index_version=version, refs=(), published_at_ns=1, indexed_rows=0,
             indexed_packs=0,
         )
 
+    # The mechanism, pinned: not one statement was issued, so nothing was
+    # written for the fence to have to reject.
+    assert server.inserts[issued:] == [], (
+        "the refusal happened after a statement was issued, not before"
+    )
     assert server.watermarks == []
     assert server.manifest == []
     assert stalled.publisher_lease is None, (
@@ -398,17 +410,27 @@ def test_a_renewal_keeps_the_fencing_identity_and_extends_the_term():
     """Renewal is a fresh term under the same identity, not a new lease.
 
     The fence names the lease, so a renewal has to keep it; the term has to
-    move, because that is what a takeover would have to beat.
+    move, because that is what a takeover would have to beat; and the expiry
+    has to move, because the whole point of renewing before every publish is
+    that the fence runs with essentially a full TTL left.
+
+    The clock is advanced deliberately. Asserted against a fake clock that
+    never moves, `expires_at_ns >= expires_at_ns` is `x >= x` and the half of
+    this test its name promises was not tested at all.
     """
     server = _CatalogServer()
     writer = _publisher(server, "indexer-a")
     before = writer.publisher_lease
+    server.lease.now_ns += 1_000_000_000  # a second of the SERVER's clock
 
     after = writer.renew_publisher_lease()
 
     assert after.lease_id == before.lease_id
     assert after.term > before.term
-    assert after.expires_at_ns >= before.expires_at_ns
+    assert after.expires_at_ns > before.expires_at_ns
+    assert after.expires_at_ns - after.acquired_at_ns == (
+        ClickHouseCatalogConfig().lease_ttl_ns
+    ), "a renewal has to buy a whole TTL, or the safety margin is not what it says"
 
 
 @pytest.mark.parametrize(
@@ -423,6 +445,65 @@ def test_a_renewal_keeps_the_fencing_identity_and_extends_the_term():
 def test_the_lease_settings_are_validated(config, message):
     with pytest.raises(ValueError, match=message):
         ClickHouseCatalogConfig(**config)
+
+
+def test_the_fake_matches_the_fence_the_writer_actually_emits():
+    """The fakes are only worth anything while they enforce the REAL predicate.
+
+    `FakeLeaseTable.fence_admits` matches the fence in the statement rather
+    than trusting the `lease_id` parameter, which `publish_snapshot` passes
+    unconditionally. That only works while the pattern and `_lease_fence()`
+    agree, so the agreement is asserted here: a rewrite of the fence fails as
+    one clear test instead of turning four suites vacuous.
+    """
+    from tests._catalog_fakes import _FENCE, MissingLeaseFence
+
+    writer = _writer(_CatalogServer())
+    assert _FENCE.fullmatch(writer._lease_fence()) is not None, (
+        "tests/_catalog_fakes._FENCE no longer matches "
+        "ClickHouseCatalogWriter._lease_fence(); update it deliberately"
+    )
+    # And a statement without it is refused rather than quietly admitted.
+    with pytest.raises(MissingLeaseFence, match="must be fenced"):
+        FakeLeaseTable().fence_admits(
+            "INSERT INTO `default`.`dmi_index_watermark` SELECT 1 FROM "
+            "system.one WHERE 1 = 1",
+            {"lease_id": "irrelevant"},
+        )
+
+
+def test_the_indexer_does_not_absorb_a_lost_lease_as_a_lost_version(tmp_path: Path):
+    """The two failures need different recoveries, so only one is retried.
+
+    A lost VERSION is repaired by allocating a higher one, which `_publish`
+    does. A lost LEASE is not: every retry would fail the same fence at every
+    version, so absorbing it would spin `max_publish_attempts` times and then
+    raise `RuntimeError("could not publish ... after N attempts")` -- burying
+    the one message that names the holder and says to acquire again.
+    """
+    store, refs = _refs(tmp_path, 1)
+    server = _CatalogServer()
+    writer = _publisher(server, "stalled")
+    indexer = CatalogIndexer(store, writer, clock_ns=lambda: 7)
+
+    # A legitimate takeover lands between the renewal and the write, which is
+    # the window the fence exists for.
+    def take_over(_lease_id) -> None:
+        server.lease.on_fence = None
+        _expire_the_lease(server)
+        _publisher(server, "successor")
+
+    server.lease.on_fence = take_over
+
+    with pytest.raises(PublisherLeaseError) as raised:
+        indexer.index(refs)
+
+    assert not isinstance(raised.value, SnapshotPublishRaceError)
+    assert "'successor'" in str(raised.value)
+    assert "Acquire a lease again" in str(raised.value)
+    # It gave up at the first attempt rather than burning the retry budget.
+    assert server.watermarks == []
+    assert sum("version_claims" in q for q in server.inserts) == 1
 
 
 # --- the allocator over a shared server ---------------------------------------
