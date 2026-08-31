@@ -1508,12 +1508,13 @@ bytes, and retained failure details all have explicit caps.
 
 ## Phase 5 limitations
 
-- `index_version` is `time_ns()` from the indexing process's own clock. With
-  more than one indexer, clock skew makes versions non-monotone across writers,
-  and a watermark taken from one indexer can permanently exclude rows written by
-  another. Phase 5 assumes a single indexer owns a catalog; coordinating the
-  version source is deferred to Phase 6, which already revisits indexer
-  topology.
+- `index_version` no longer comes from any process clock. It is allocated by
+  the catalog itself through the sole-claimant protocol in `allocate_version`,
+  so it is unique and monotonic across writers; the wall clock stamps only the
+  diagnostic `published_at_ns`. Making a snapshot visible is additionally
+  fenced on a durable publisher lease, so only the lease holder can publish.
+  What remains is not clock skew but the residual publication windows recorded
+  in `catalog-descriptor-key.md` under "What this does not close".
 - Cursors are validated, not authenticated. A tampered cursor is rejected as
   malformed -- strict base64 and envelope checks -- but nothing binds a cursor to
   the caller who received it. A cursor can only address the keyspace its own
