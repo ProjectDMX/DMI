@@ -25,7 +25,7 @@ pytestmark = pytest.mark.cpu
 
 REPO = Path(__file__).resolve().parents[1]
 DENSE = REPO / "examples" / "model_descriptors" / "llama3-8b.yaml"
-MOE = REPO / "examples" / "model_descriptors" / "qwen3-30b-a3b.yaml"
+MOE = REPO / "tests" / "data" / "moe-decoder.model.yaml"
 
 VALID_CONFIG = {
     "version": 1,

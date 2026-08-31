@@ -8,19 +8,34 @@ Verified against: `cb4e490`
 
 ```bash
 pip install -e ".[ui]"
-dmi ui examples/model_descriptors/qwen3-8b.yaml
+dmi ui ./Qwen3-8B
 ```
 
-Then open <http://127.0.0.1:8000>. To start from an existing configuration and
-save back to it:
+Then open <http://127.0.0.1:8000>. `dmi ui` takes the model however you have
+it — a model directory, a `config.json`, a Hugging Face model id (needs
+`transformers`), or a DMI descriptor YAML:
 
 ```bash
-dmi ui examples/model_descriptors/qwen3-8b.yaml --config attention-debug.dmi.yaml
+dmi ui ./Qwen3-8B/config.json
+dmi ui Qwen/Qwen3-8B
+dmi ui examples/model_descriptors/llama3-8b.yaml
 ```
 
-Without an install, `python -m dmi.cli ui ...` works from a checkout with
-`src` on `PYTHONPATH`. `--host` and `--port` move the bind address; the default
-is loopback only.
+To start from an existing configuration and save back to it:
+
+```bash
+dmi ui ./Qwen3-8B --config attention-debug.dmi.yaml
+```
+
+Descriptors are generated, never hand-typed:
+
+```bash
+dmi describe-model ./Qwen3-8B --output qwen3-8b.yaml
+```
+
+Without an install, `python -m dmi.cli ...` works from a checkout with `src` on
+`PYTHONPATH`. `--host` and `--port` move the bind address; the default is
+loopback only.
 
 Using the configuration from Python, with no browser involved:
 
@@ -113,6 +128,19 @@ choices from the catalog through a backend adapter.
 ## 4. Model descriptor
 
 Declarative. No screen coordinates, no frontend-specific information.
+
+**Derived from the framework, not written by hand.** The framework already
+knows the model, and DMI already reads a Hugging-Face-shaped config:
+`make_model_shape_from_hf_config` extracts every topology field except the
+layer count. `dmi describe-model` adds the layer count and identity, reusing
+that extractor rather than duplicating it, and `dmi ui` accepts the same
+framework sources directly so a descriptor file is optional.
+
+A descriptor file still earns its place: the configurator runs where the model
+is not loaded — pick layers on a laptop, run the capture on a cluster. The
+runtime never reads it; `compile_config` takes its shape from the adapter's
+live `detect_model_shape(model)`. So a stale descriptor can mislead you while
+authoring, but it cannot corrupt a capture.
 
 ```yaml
 schema_version: 1
@@ -450,8 +478,8 @@ Grafana integration (stays downstream), runtime dashboard, payload estimator,
 live model introspection, model editing, drag-and-drop model editing,
 experiment management, authentication, multi-user server.
 
-`dmi describe-model Qwen/Qwen3-8B --output qwen3-8b.yaml` is deferred; v1
-accepts manually authored descriptors.
+Model descriptor generation is **not** deferred: `dmi describe-model` ships,
+and `dmi ui` reads framework configs directly.
 
 ---
 
@@ -593,6 +621,7 @@ The five open questions were resolved as follows when phases 1-7 were built.
 | Layer filter | `dmi/hooks/selection.py` (`filter_by_layers`) |
 | Backend | `dmi/ui/app.py`, `dmi/ui/server.py` |
 | Front end | `dmi/ui/static/` (no build step) |
+| Descriptor derivation | `dmi/configuration/introspect.py` |
 | CLI | `dmi/cli.py` |
 
 The only change to existing code is additive: `filter_by_layers` and
@@ -609,5 +638,6 @@ spec's hook point, raise on unbound specs).
   directly. This is the one signature change the design calls for.
 * **Runtime policy (phase 8).** `policy.objective` round-trips and is shown in
   the UI behind an explicit notice that it does not yet change behaviour.
-* **`dmi describe-model`.** Descriptors are hand-authored; the shipped examples
-  should be checked against each model's `config.json`.
+* **Architecture coverage.** Only `decoder_transformer` is supported.
+  Encoder-decoder configs are detected and refused rather than mis-rendered;
+  vision and encoder-decoder layouts are future node tables.
