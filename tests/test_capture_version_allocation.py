@@ -240,7 +240,7 @@ def test_a_takeover_after_the_renewal_is_reported_as_a_lost_lease():
             indexed_packs=0,
         )
 
-    assert "fenced out and wrote nothing" in str(raised.value)
+    assert "fenced out and made no snapshot visible" in str(raised.value)
     assert "'successor'" in str(raised.value)
     assert not isinstance(raised.value, SnapshotPublishRaceError)
     assert server.watermarks == []

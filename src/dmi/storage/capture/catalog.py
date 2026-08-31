@@ -55,12 +55,21 @@ class PublisherLeaseError(CaptureStorageError):
 
     Raised when no lease was ever acquired, when acquiring one was contested
     past its attempt bound, and -- the case that matters -- when a fenced
-    publish wrote nothing because the lease had been taken over or had expired.
-    That last one is NOT a lost version race: re-allocating a version and
-    trying again would fail the same fence every time, so this is deliberately
-    not a ``SnapshotPublishRaceError`` and the indexer's publish retry does not
-    absorb it. The recovery is to acquire a lease again, which republishes
-    everything the fenced attempt failed to write -- and it wrote nothing.
+    publish made NO SNAPSHOT VISIBLE because the lease had been taken over or
+    had expired. That last one is NOT a lost version race: re-allocating a
+    version and trying again would fail the same fence every time, so this is
+    deliberately not a ``SnapshotPublishRaceError`` and the indexer's publish
+    retry does not absorb it. The recovery is to acquire a lease again and
+    re-index.
+
+    It does NOT promise the catalog is byte for byte as the publish found it.
+    ``publish_snapshot`` issues the manifest rows and the watermark row as two
+    separately fenced statements, so a takeover before the first leaves nothing
+    behind, while one landing in the gap between them leaves the manifest rows
+    of the first. Those rows are inert -- membership pairs a manifest row with
+    the watermark row of the SAME publish, and that row will never exist -- so
+    there is nothing to undo, but they are durable and they accumulate. See
+    docs/catalog-descriptor-key.md, "What this does not close".
     """
 
 
@@ -402,11 +411,20 @@ class CatalogIndexer:
         version and another attempt. Only the manifest rows are rewritten --
         one per pack, not one per capture, which is the whole reason membership
         moved off the per-capture path. The descriptors already written keep
-        the version they were written with, and that is harmless: since pack
-        identity joined the descriptor sort key, index_version on those rows is
-        only a tiebreaker among rows that are byte identical anyway, never the
-        thing that decides whether they are visible. Membership does that, and
-        membership is rewritten at the version that wins.
+        the version they were written with, and that is harmless because
+        VISIBILITY is decided by membership: a descriptor row is in a snapshot
+        when its pack is in the manifest of a publish that reached the
+        watermark table, whatever version the row itself carries. Membership is
+        rewritten at the version that wins.
+
+        `index_version` is not idle on those rows, and it is worth being exact
+        because the reader depends on it: it LEADS
+        `clickhouse_reader._RESOLUTION_ORDER`, so it is the primary supersession
+        key between two rows describing one capture in two DIFFERENT packs --
+        rows that are explicitly not identical, and that pack identity in the
+        sort key exists to keep alive. It is a mere tiebreaker only in the case
+        the sort key still collapses: one pack re-indexed, where the rows really
+        are byte identical and the winner is unobservable.
         """
         attempts = self._config.max_publish_attempts
         for attempt in range(attempts):

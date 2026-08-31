@@ -19,8 +19,18 @@ A merge can only ever collapse rows describing one capture in ONE pack, because
 pack identity is part of the table's sort key, and those rows are byte
 identical -- re-indexing a pack reads the same immutable footer twice. So no
 merge can destroy a row a pinned snapshot still needs.
-``test_replay_is_invisible_because_it_rewrites_identical_descriptors`` guards
-that invariant; if it ever breaks, this design has to be revisited.
+
+Three live tests hold that down, and between them they cover both halves.
+``test_a_merge_does_not_destroy_a_pinned_snapshot`` and
+``test_two_packs_describing_one_capture_both_survive_a_merge`` force the merge
+with ``OPTIMIZE ... FINAL`` and assert the pinned read still resolves and that
+neither pack's row was collapsed into the other;
+``test_re_indexing_one_pack_still_collapses_to_a_single_row`` asserts the
+collapse that IS wanted still happens, so the sort key has not simply stopped
+deduplicating. ``test_replay_is_invisible_because_it_rewrites_identical_
+descriptors`` -- which this paragraph used to cite alone -- covers the premise
+rather than the conclusion: it shows a replay writes the same descriptor, and
+it neither forces a merge nor involves two packs.
 
 Rows describing one capture in DIFFERENT packs survive side by side, and the
 ``argMax`` projection grouped on capture identity picks between them:

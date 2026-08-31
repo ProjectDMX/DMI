@@ -5,11 +5,15 @@ on where the catalog goes after that.
 
 ## The problem
 
+**This section describes the schema as it was when this document was written.
+The proposal below shipped**, so the sort key here is version 1's and not the
+one `ensure_schema` creates; the current key is in *The proposal*.
+
 Every capture gets one row in the descriptor table saying, in effect, "capture
-X lives in pack P at offset N". The table is a `ReplacingMergeTree` ordered by
+X lives in pack P at offset N". The table was a `ReplacingMergeTree` ordered by
 
 ```
-(tenant_id, experiment_id, run_id, captured_at_ns, capture_id)
+(tenant_id, experiment_id, run_id, captured_at_ns, capture_id)     -- since replaced
 ```
 
 which is a capture's identity and nothing more. That engine collapses rows
@@ -65,12 +69,32 @@ still collapse, and those rows really are identical.
 
 Supersession then falls out of machinery the reader already has. Keep the
 `GROUP BY` on the five capture-identity columns, decoupled from the now longer
-sort key, and `argMax(..., index_version)` still picks one row per capture. A
-reader pinned before the new pack was committed does not see its rows at all,
-because the commit-log membership clause excludes that pack; a reader on a
-fresh watermark sees both and takes the newer. Re-packing goes from "would
-corrupt pinned snapshots" to "supported, under the same commit-log rules as
-everything else".
+sort key, and an `argMax` grouped on capture identity still picks one row per
+capture. A reader pinned before the new pack was committed does not see its
+rows at all, because the commit-log membership clause excludes that pack; a
+reader on a fresh watermark sees both and takes the newer. Re-packing goes from
+"would corrupt pinned snapshots" to "supported, under the same commit-log rules
+as everything else".
+
+> **What shipped is not the per-column `argMax(..., index_version)` this
+> section originally specified.** `e93a2c8` replaced it, because
+> `index_version` does not order the rows it was being asked to order: one
+> `index()` call allocates ONE version for a whole batch, so two packs
+> describing a capture in a single indexing pass produce rows whose ordering
+> key is EQUAL, and ClickHouse leaves the winner of a tie undefined. Measured
+> on 25.12, one corpus pinned at a single watermark resolved to a different
+> pack at `max_threads = 1` than above it, and to a different one again once a
+> merge had put both rows in one part.
+>
+> The shipped projection is **one** `argMax` over a tuple of every resolved
+> column, ordered on the tuple `(index_version, store_id, pack_id)`. The tuple
+> key restores a total order (supersession is unchanged -- `index_version`
+> still leads); the single aggregate makes a mixed descriptor -- `store_id`
+> from one row and `object_key` from another -- structurally impossible rather
+> than merely unobserved. Twenty-seven aggregates ordered on the tuple are also
+> correct and cost +291% at a 100-row page, because ClickHouse compares a tuple
+> ordering argument through a generic `Field` once per row per aggregate. See
+> `clickhouse_reader._projection`.
 
 ### What it costs
 
@@ -83,9 +107,19 @@ everything else".
   under a fresh one.
 - **Disk: slightly more rows** if re-packing ever happens, since superseded
   pointers are kept rather than collapsed. Negligible.
-- **The public `FINAL` views** would show one row per pack for a superseded
-  capture, since `FINAL` collapses on the new key. That extends the existing
-  caveat that those views bypass the snapshot bound; it is not a new problem.
+- **The public `FINAL` views** show one row per pack for a superseded capture,
+  since `FINAL` collapses on the new key. That is deliberate: `{prefix}_capture`
+  means "published descriptor rows, engine-deduplicated", one row per
+  `(capture, store, pack)`, and choosing between two packs is supersession,
+  which belongs to the reader. *(This bullet used to add that those views
+  "bypass the snapshot bound". `d50c778` bounded `{prefix}_capture` to the
+  packs the published snapshot contains, using the same `(index_version,
+  publish_id)` pair the reader's membership clause uses.
+  `{prefix}_pack_inventory` still carries no bound and needs none: `index()`
+  writes the inventory only after a successful publish. What the view still
+  does not do is PIN -- it re-evaluates membership on every query, so two reads
+  a moment apart can see different sets of packs; a caller that needs a stable
+  selection uses the reader.)*
 
 ### Why the timing matters
 
@@ -203,9 +237,15 @@ goes without a contract change:
 - A losing publish raises `SnapshotPublishRaceError`; the indexer re-allocates
   and republishes, bounded at `max_publish_attempts`. Only the manifest is
   rewritten. Descriptors keep the version they were written with, which is
-  harmless now that pack identity is in the descriptor sort key: `index_version`
-  there is only a tiebreaker among byte-identical rows and never decides
-  visibility.
+  harmless because **visibility is decided by membership, never by
+  `index_version`**: a descriptor row is in a snapshot when its pack is in the
+  manifest of a publish that reached the watermark table, whatever version the
+  row itself carries. `index_version` is not idle on those rows -- it leads
+  `_RESOLUTION_ORDER`, so it is the primary supersession key between two rows
+  describing one capture in two DIFFERENT packs, which are not identical and
+  are exactly the rows pack identity in the sort key exists to keep. It is a
+  tiebreaker only in the case the sort key still collapses: one pack re-indexed,
+  where the rows really are byte identical and the choice is unobservable.
 - **The publish verifies that it owns the version, not that the version is
   occupied.** Each attempt mints a `publish_id`, writes it on its manifest rows
   and on its watermark row, and reads that column back. The check it replaced --
@@ -249,8 +289,22 @@ expires_at_ns)`. It is append-only and claimed by the **same sole-claimant
 protocol as a version**, which is safe here for the same reason: a lease claim
 row is inert. Writing one confers nothing on its own, because the only thing
 that ever reads the table is the fencing predicate inside a publish, and that
-predicate names a single row. A term claimed by two publishers is abandoned by
-both, holds no lease, and is takeable at once by whoever claims a higher term.
+predicate accepts a `lease_id` no claimant of a contested term is ever handed.
+A term claimed by two publishers is abandoned by both, holds no lease, and is
+takeable at once by whoever claims a higher term.
+
+**Where that safety comes from is the read-back, not the fence.** Both this
+document and `capture-storage-design.md` used to say that a contested head term
+"satisfies neither" of the fence's two conditions. It does not: the fence
+resolves ONE row with `ORDER BY term DESC, lease_id DESC`, so the
+higher-ordering of two claimants at the top term satisfies it exactly as a real
+holder would. Verified on 25.12, and note that the ordering is ClickHouse's UUID
+collation -- the low 64 bits first -- so it is not the text order either. What
+makes the term safe is `_claim_lease`: both claimants see two rows in their
+read-back, both abandon the term, and neither is ever returned a
+`PublisherLease`. Nobody is holding the token the fence would accept.
+`test_a_contested_head_term_is_made_safe_by_the_read_back_not_the_fence` drives
+both halves against a live server.
 
 `term` is the monotonic slot, not the clock -- a wall-clock ordering could tie,
 and then "the head of the table" would be ambiguous. `acquired_at_ns` and
@@ -261,45 +315,68 @@ two of them, decides whether a lease is live.
 The point of the whole thing is one sentence:
 
 > **The fencing check rides inside the same server-side statement as the
-> visibility write. A publisher whose lease has been taken over writes NOTHING
-> -- it does not write and then discover it lost.**
+> visibility write. A publisher whose lease has been taken over makes NO
+> SNAPSHOT VISIBLE -- it does not make something visible and then discover it
+> lost.**
 
 That is what separates it from the two designs this document has already
 rejected. Both of those wrote first and checked afterwards, and no check that
 runs after a write can withdraw what the write already made durable.
 
+The sentence used to read "writes NOTHING", and that is a stronger claim than
+the code makes. A publish is TWO fenced statements, the manifest rows and then
+the watermark row, so the guarantee is per statement: a takeover landing
+between them leaves the manifest rows of the first behind while the second is
+refused. Those rows are inert -- membership pairs them with a watermark row
+that will never exist -- so the safety claim holds exactly as stated. See
+*What this does not close*.
+
 ```sql
 INSERT INTO {prefix}_index_watermark (...)
 SELECT ... FROM system.one
 WHERE (SELECT max(index_version) FROM {prefix}_index_watermark) < V
-  AND (SELECT (lease_id, expires_at_ns > toUnixTimestamp64Nano(now64(9)))
-       FROM {prefix}_publisher_lease
-       ORDER BY term DESC, lease_id DESC LIMIT 1) = (:my_lease, true)
+  AND (SELECT count() FROM (SELECT lease_id, expires_at_ns
+                            FROM {prefix}_publisher_lease
+                            ORDER BY term DESC, lease_id DESC LIMIT 1)
+       WHERE lease_id = :my_lease
+         AND expires_at_ns > toUnixTimestamp64Nano(now64(9))) = 1
 ```
 
-**One subquery returning a tuple, not two returning a column each.** The
-two-read form was implemented first and is unsound, which is worth stating
-because the shape is the obvious one to reach for: two scalar subqueries are two
-reads of the lease table, so a takeover landing between them answers with the
-OLD holder's `lease_id` and the NEW holder's `expires_at_ns`, and the fence
-passes for a publisher that has already been replaced -- the exact failure the
-fence exists to stop, reintroduced by the way it is written. One subquery reads
-one row, and the pair it returns describes that row. It is cheaper too, but that
-is the smaller half: 3.06 ms unfenced, 3.85 ms with this form, 4.84 ms with two
-subqueries, measured on 25.12.
+**One subquery reading one row, not two returning a column each.** The two-read
+form was implemented first and is unsound, which is worth stating because the
+shape is the obvious one to reach for: two scalar subqueries are two reads of
+the lease table, so a takeover landing between them answers with the OLD
+holder's `lease_id` and the NEW holder's `expires_at_ns`, and the fence passes
+for a publisher that has already been replaced -- the exact failure the fence
+exists to stop, reintroduced by the way it is written. Here the ordered
+`LIMIT 1` resolves the head once and both conditions are asked of that one row.
+It is cheaper too, but that is the smaller half: 3.06 ms unfenced, 3.85 ms with
+a fence, 4.84 ms with two subqueries, measured on 25.12.
+
+`count() ... = 1` rather than a tuple comparison, because an empty lease table
+has to make the predicate FALSE and a tuple cannot. A scalar subquery selecting
+a tuple from no rows is not NULL on 25.12; it raises `Code: 125, Scalar
+subquery returned empty result of type Tuple(UUID, UInt8) which cannot be
+Nullable` -- a raw `ServerException`, not a `CaptureStorageError`. `count()`
+over the same one-row read always returns a row, so an empty table answers 0.
+No publish reaches that state today, because a publish renews first and a
+renewal leaves a row; the GC obligation below makes it reachable.
 
 The manifest INSERT carries the same predicate, over an `arrayJoin` of the
-packs it is admitting. Those rows would be inert either way -- membership pairs
-them with a watermark row that would never exist -- but "wrote nothing" is a
-property a test can assert directly, and "wrote something harmless" is one that
-has to be re-argued every time the membership clause changes.
+packs it is admitting. Those rows are inert either way -- membership pairs them
+with a watermark row that would never exist -- and the fence is what keeps a
+publisher fenced out *before* its first statement from writing them at all.
+What it cannot do is make the pair of statements atomic; see *What this does
+not close*.
 
-A publisher renews before every publish, which costs a round trip and buys the
-entire safety margin: at the moment the fence is evaluated its lease has
-essentially a full `lease_ttl_ns` left, and a takeover cannot happen until that
-expires. The publish statement carries `max_execution_time = publish_timeout_ns`
-(required to be below the TTL), so the server itself aborts a publish that has
-been in flight that long.
+A publisher renews before every publish. That costs **three** round trips --
+the head read, the claim INSERT and the read-back -- measured at 5.69 ms median
+on 25.12, and it buys the entire safety margin: at the moment the fence is
+evaluated its lease has essentially a full `lease_ttl_ns` left, and a takeover
+cannot happen until that expires. Both publish statements carry
+`max_execution_time`, set to `publish_timeout_ns` converted to the **seconds**
+that setting takes (`publish_timeout_ns / 1e9`, required to be below the TTL),
+so the server itself aborts a statement that has been in flight that long.
 
 **Measured, with the lease in place**: 200 trials, two writers each racing to
 acquire the lease, allocate a version and publish from a barrier. Both published
@@ -340,27 +417,68 @@ rises enough for 8.5 ms to matter.
 
 #### What this does not close
 
-Two things, stated as precisely as the rest of this document tries to be.
+Stated as precisely as the rest of this document tries to be.
 
-**The takeover instant.** For both publishers to write, publisher A's publish
-statement must evaluate the fence before B's lease row commits, and still be in
-flight when B publishes. Every timestamp in that sequence is on the server's own
-clock, and it forces A's single INSERT to stay in flight from before its lease
-expired until after B took over -- essentially a whole `lease_ttl_ns`, when A
-renewed immediately before issuing it, and past a `max_execution_time` set below
-that. So the window is bounded by two knobs rather than by an unbounded
-scheduler artifact. It is not *zero*: `max_execution_time` is checked between
-processing blocks rather than pre-empted, so a statement blocked in a lock can
-overrun it. This has not been reproduced; it also has not been proven
-impossible, and the difference matters.
+**The fence is per STATEMENT, not per publish.** A publish issues two of them:
+the manifest rows for the packs it is admitting, then the watermark row that
+admits them. Both carry the fence, so neither can land after a takeover -- but
+the gap between them is a full client round trip, and `max_execution_time`
+bounds each statement rather than the pair, so nothing bounds the gap. A
+takeover landing there leaves the first statement's manifest rows behind while
+the second is refused.
+
+Those rows are **inert**: membership requires the manifest row and a watermark
+row from the SAME publish, and that watermark row does not exist, so no
+snapshot admits them, no reader sees them and the public view does not show
+them. The safety claim -- no snapshot becomes visible -- is unaffected. What is
+wrong is the stronger claim, which this document, `capture-storage-design.md`,
+`catalog.py` and the writer's own refusal message all used to make: that such a
+publisher "wrote nothing".
+
+Reproduced on 25.12 by wedging a takeover into the gap
+(`test_a_takeover_between_the_two_publish_statements_leaves_orphan_rows`), and
+quantified with a hostile TTL -- 7 ms, just long enough for the renewal and the
+manifest INSERT and not for the watermark INSERT -- over 50 publishes of three
+packs each: **150 orphan manifest rows, 0 published versions**, every attempt
+refused. They fall under the GC obligation below, which already covers manifest
+rows whose version never reached the watermark table.
+
+Closing it properly means making the two statements one, which means
+`arrayJoin`-ing the membership rows and the watermark row out of a single
+INSERT into two tables -- ClickHouse has no such statement -- or moving
+membership into the watermark row itself, which changes the read path. Neither
+is worth doing for rows that are inert.
+
+**The takeover instant.** For both publishers to make a snapshot visible,
+publisher A's watermark statement must evaluate the fence before B's lease row
+commits, and still be in flight when B publishes. Every timestamp in that
+sequence is on the server's own clock, and it forces A's single INSERT to stay
+in flight from before its lease expired until after B took over -- essentially a
+whole `lease_ttl_ns`, when A renewed immediately before issuing it, and past a
+`max_execution_time` set below that. So the window is bounded by two knobs
+rather than by an unbounded scheduler artifact. It is not *zero*:
+`max_execution_time` is checked between processing blocks rather than
+pre-empted, so a statement blocked in a lock can overrun it. This has not been
+reproduced; it also has not been proven impossible, and the difference matters.
 
 **Lease acquisition is not the window it looks like.** Two publishers claiming
-one term both abandon it, so a contested term holds no lease and the fence
-matches nobody -- the same argument that makes the version allocator sound. The
-cost is liveness, not safety: a contested term locks *everyone* out, including a
-previous holder whose lease was still live, until somebody claims a higher term.
-That is deliberate. A contested head means the catalog does not know who is in
-charge, and refusing to publish is the conservative answer.
+one term both abandon it, so a contested term is held by nobody -- the same
+argument that makes the version allocator sound, and see above for why the
+credit belongs to the read-back rather than to the fence. The cost is liveness,
+not safety: a contested term locks *everyone* out, including a previous holder
+whose lease was still live, until somebody claims a higher term. That is
+deliberate. A contested head means the catalog does not know who is in charge,
+and refusing to publish is the conservative answer.
+
+**Two writers can both believe they hold a lease.** The sole-claimant read-back
+proves a claimant is alone at ITS term, not that its term is the head. A
+claimant whose head read preceded a rival's row claims below that rival, reads
+back alone, and is handed a live `PublisherLease` while the rival sits above it.
+Verified on 25.12: two writers holding terms 1 and 9, both live by their own
+reckoning. Safety holds -- only the head publishes, the fence says so, and the
+loser is refused at its next renewal with a message naming the actual holder --
+but "only one publisher holds the lease" is not literally true of the client
+objects, only of the row the fence resolves.
 
 **A crash between a claim and its read-back** leaves a claim row nobody uses.
 It looks like a live lease until it expires, so the next publisher waits out one

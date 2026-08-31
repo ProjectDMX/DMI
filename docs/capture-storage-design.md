@@ -25,7 +25,8 @@ The first host-only slice is available under `dmi.storage.capture`:
 | Garage/S3 store and bounded parallel uploader | Implemented |
 | ClickHouse metadata projection | Implemented and live-tested |
 | Opt-in Ring² to Python pack adapter | Reference implementation |
-| Summaries | Planned |
+| Core tensor summaries and the extension registry | Implemented |
+| Summary artifact stores and long-form scalar metric tables | Planned |
 
 This slice remains opt-in. A reference adapter can now connect the generic
 record sink boundary to the Python pack pipeline without changing the CUDA
@@ -351,9 +352,10 @@ The view emits **one row per `(capture, store, pack)`**, not one per capture. A
 capture described by two packs -- a pack mirrored to a second store, or a
 producer retrying a `capture_id` after the first pack was sealed -- is two
 published rows and appears twice. Choosing between them is supersession, which
-belongs to the reader (`argMax` over `index_version`, grouped on capture
-identity); a second copy of those semantics in the view's SQL could drift away
-from the reader's without either side failing.
+belongs to the reader (one `argMax` grouped on capture identity, ordered on
+`(index_version, store_id, pack_id)` -- see *Phase 5*); a second copy of those
+semantics in the view's SQL could drift away from the reader's without either
+side failing.
 
 `{prefix}_pack_inventory` carries no such bound and needs none: `index()` writes
 the inventory only after a successful publish, so every pack in it is already
@@ -371,30 +373,54 @@ statements a publish writes -- the manifest rows and the watermark row -- carry
 the same predicate:
 
 ```sql
-  AND (SELECT (lease_id, expires_at_ns > toUnixTimestamp64Nano(now64(9)))
-       FROM {prefix}_publisher_lease
-       ORDER BY term DESC, lease_id DESC LIMIT 1) = (:my_lease, true)
+  AND (SELECT count() FROM (SELECT lease_id, expires_at_ns
+                            FROM {prefix}_publisher_lease
+                            ORDER BY term DESC, lease_id DESC LIMIT 1)
+       WHERE lease_id = :my_lease
+         AND expires_at_ns > toUnixTimestamp64Nano(now64(9))) = 1
 ```
 
-so a publisher whose lease has been taken over writes **nothing**. It does not
-write and then discover it lost, which is the failure mode every post-write
-check in this design's history has had.
+so a publisher whose lease has been taken over makes **no snapshot visible**.
+It does not make one visible and then discover it lost, which is the failure
+mode every post-write check in this design's history has had.
 
-**One subquery returning a tuple, not two subqueries returning a column each.**
+That is per STATEMENT, not per publish, and the two are not the same claim.
+This paragraph used to say such a publisher "writes nothing"; a takeover
+landing in the gap between the two statements leaves the manifest rows of the
+first behind. They are inert -- membership needs the manifest row and the
+watermark row of the SAME publish -- so the safety claim is unaffected, but the
+rows are durable. See docs/catalog-descriptor-key.md, *What this does not
+close*.
+
+**One subquery reading one row, not two subqueries returning a column each.**
 That is a correctness point before it is a cost one, and the two-read form was
 implemented before it was understood: two scalar subqueries are two reads of
 the lease table, and a takeover landing between them can be answered with the
 OLD holder's `lease_id` and the NEW holder's `expires_at_ns` -- so the fence
-passes for a publisher that has already been replaced. One subquery reads one
-row, and the pair it returns describes that row. It is also cheaper: measured on
-25.12, the conditional publish costs 3.06 ms unfenced, 3.85 ms with this form,
-and 4.84 ms with the two-subquery form.
+passes for a publisher that has already been replaced. The ordered `LIMIT 1`
+resolves the head once and both conditions are asked of that one row. It is
+also cheaper: measured on 25.12, the conditional publish costs 3.06 ms
+unfenced, 3.85 ms with a fence, and 4.84 ms with the two-subquery form.
+
+`count() ... = 1` rather than a tuple comparison, because an empty lease table
+has to make this false and a tuple cannot: a scalar subquery selecting a tuple
+from no rows raises `Code: 125 ... cannot be Nullable` on 25.12 rather than
+answering NULL.
 
 The lease is claimed by the same sole-claimant append-and-read-back protocol as
 a catalog version, and it is safe here for the same reason: a lease claim row is
-inert. Nothing reads the table except the fence, and the fence names one row, so
-a term claimed by two publishers is abandoned by both, holds no lease, and is
-takeable at once by whoever claims a higher term.
+inert. Nothing reads the table except the fence, and the fence accepts a
+`lease_id` that no claimant of a contested term is ever handed, so a term
+claimed by two publishers is abandoned by both, holds no lease, and is takeable
+at once by whoever claims a higher term.
+
+**The credit there belongs to the read-back, not to the fence.** This section
+used to argue that because the fence names one row, a contested term satisfies
+neither of its conditions. It satisfies both, for the claimant whose `lease_id`
+sorts higher under ClickHouse's UUID collation -- which compares the low 64 bits
+first and is therefore not the text order either. What makes the term safe is
+that `_claim_lease` returns a `PublisherLease` to neither claimant, so nobody
+holds the token the fence would accept.
 
 | Concept | Where it lives |
 |---|---|
@@ -412,21 +438,42 @@ Lifecycle:
 - **Acquire.** A live lease held by somebody else raises
   `PublisherLeaseHeldError`, naming the holder and the remaining time. An
   expired lease, or a contested (and therefore inert) head term, is taken over.
+  A writer that already holds a lease is re-acquiring its OWN and refreshes it,
+  keeping the same `lease_id`, because "acquire before publishing" is the
+  documented path and anything restarting above the writer calls it again.
 - **Renew.** Every publish renews first, keeping the same `lease_id` at a fresh
-  term. This costs a round trip and buys the safety margin: at the moment the
+  term. That costs **three** round trips -- head read, claim INSERT, read-back,
+  5.69 ms median on 25.12 -- and buys the safety margin: at the moment the
   fence runs, the lease has essentially a full `lease_ttl_ns` left.
 - **Fail.** A publish fenced out raises `PublisherLeaseError`, deliberately
   *not* `SnapshotPublishRaceError` -- a lost version is repaired by allocating a
   higher one, which `CatalogIndexer` does automatically, while a lost lease
   would fail the same fence at every version. The recovery is to acquire again
-  and re-index, and there is nothing to undo because nothing was written.
+  and re-index; no snapshot became visible, though a takeover between the two
+  publish statements can leave inert manifest rows behind.
 - **Release.** `release_publisher_lease()` writes an already-expired tombstone
   so an orderly restart does not cost the next publisher a whole TTL. A crash
-  does; that is what expiry is for.
+  does; that is what expiry is for. It is **fenced on the head being this
+  writer's own lease**: the tombstone lands at `head.term + 1` and so becomes
+  the head whatever was there before, which unfenced let a writer whose lease
+  had long since lapsed revoke the current holder's live one just by shutting
+  down cleanly.
 
-`publish_timeout_ns` caps the publish statement's `max_execution_time` and must
+**One publisher holds the lease, but two client objects can believe they do.**
+The sole-claimant read-back proves a claimant is alone at ITS term, not that its
+term is the head: a claimant whose head read preceded a rival's row claims below
+that rival, reads back alone, and is handed a live lease while the rival sits
+above it. Verified on 25.12 with two writers holding terms 1 and 9. Only the
+head publishes -- the fence says so, and the loser is refused at its next
+renewal with a message naming the actual holder -- so this is a statement about
+the client objects rather than about safety.
+
+`publish_timeout_ns` caps each publish statement's `max_execution_time` and must
 be below `lease_ttl_ns`. The gap between them is what keeps a publish statement
-from still running when its own lease becomes takeable.
+from still running when its own lease becomes takeable. `max_execution_time` is
+in **seconds**, so the writer passes `publish_timeout_ns / 1e9`; and it caps
+each statement individually, not the pair, so it does not bound the client round
+trip between them.
 
 Cost: `publish_snapshot` goes from 6.7 ms to 15.2 ms and a 16-pack, 4096-row
 `index()` pass from 160 ms to 173 ms (+8%), measured on 25.12. It is paid once
@@ -689,62 +736,111 @@ not returned in catalog rows.
 ## Extension contracts
 
 ```python
-class PackWriter(Protocol):
+class PackWriter:                      # pack.PackWriter, a concrete class
     def append(self, record: CaptureRecord) -> None: ...
     def seal(self) -> SealedPack: ...
 
 
-class PackSource(Protocol):
+class PackSource(Protocol):            # model.PackSource
     pack_id: str
-    object_bytes: int
     checksum: str
+    @property
+    def object_bytes(self) -> int: ...
     def open(self) -> BinaryIO: ...
 
 
-class PackStore(Protocol):
+class PackStore(Protocol):             # model.PackStore
+    store_id: str
     def put(self, pack: PackSource, object_key: str) -> PackRef: ...
     def stat(self, ref: PackRef) -> ObjectInfo: ...
     def read_range(self, ref: PackRef, offset: int, length: int) -> bytes: ...
-    def list_committed(self, cursor: ScanCursor) -> Page[PackRef]: ...
 
 
-class PackSink(Protocol):
-    def persist(self, ready: ReadyPack) -> object: ...
+class PackInventory(PackStore, Protocol):          # catalog.PackInventory
+    def inspect(self, object_key: str) -> PackRef: ...
+    def list_objects(
+        self, *, prefix: str = "", cursor: str | None = None, limit: int = 1000
+    ) -> ObjectPage: ...
 
 
-class CommitFeed(Protocol):
-    def watch(self, cursor: EventCursor) -> Iterable[PackRef]: ...
-    def scan(self, cursor: ScanCursor) -> Page[PackRef]: ...
+class PackSink(Protocol):              # pipeline.PackSink
+    def persist(self, ready: ReadyPack) -> PackRef | PackSource: ...
 
 
-class CatalogIndexer(Protocol):
-    def index(self, packs: Sequence[PackRef]) -> IndexResult: ...
+class CatalogWriter(Protocol):         # catalog.CatalogWriter
+    def committed_pack_ids(self, identities) -> set[PackIdentity]: ...
+    def write_descriptors(self, descriptors, *, index_version: int) -> None: ...
+    def commit_packs(self, refs, *, index_version: int) -> None: ...
+    def publish_snapshot(
+        self, *, index_version: int, refs, published_at_ns: int,
+        indexed_rows: int, indexed_packs: int,
+    ) -> None: ...
+    def last_published_version(self) -> int: ...
+    def allocate_version(self) -> int: ...
 
 
-class CaptureSummarizer(Protocol):
+class CaptureReader:                   # reader.CaptureReader, a concrete class
+    def search(self, query: CaptureQuery) -> CapturePage: ...
+    def select(self, query: CaptureQuery) -> CaptureSelection: ...
+    def estimate(self, selection: CaptureSelection) -> HydrationEstimate: ...
+    def hydrate(
+        self, selection: CaptureSelection, *, byte_limit: int,
+        request_limit: int = 1024,
+    ) -> tuple[HydratedCapture, ...]: ...
+    def summarize(
+        self, selection: CaptureSelection, *, byte_limit: int, ...
+    ) -> tuple[CaptureSummary, ...]: ...
+
+
+# Summaries are extension VALUES registered with ExtensionRegistry rather than
+# a summarizer protocol: a named, versioned callable over a decoded tensor.
+@dataclass(frozen=True, slots=True)
+class ScalarMetric:                    # extensions.ScalarMetric
     name: str
-    version: str
-    def summarize(self, capture: CaptureDescriptor, tensor: TensorView) -> SummaryBatch: ...
+    version: int
+    compute: Callable[[np.ndarray], float]
 
 
-class CaptureReader(Protocol):
-    def search(self, query: CaptureQuery) -> Page[CaptureDescriptor]: ...
-    def estimate(self, ids: Sequence[CaptureId]) -> HydrationEstimate: ...
-    def hydrate(self, request: HydrationRequest) -> Iterable[TensorRecord]: ...
+@dataclass(frozen=True, slots=True)
+class ArtifactProducer:                # extensions.ArtifactProducer
+    kind: str
+    version: int
+    produce: Callable[[np.ndarray], tuple[bytes, str]]
+
+
+class ArtifactSink(Protocol):          # extensions.ArtifactSink
+    def put(
+        self, *, capture_id: str, kind: str, version: int, data: bytes,
+        content_type: str,
+    ) -> ArtifactRef: ...
 ```
+
+*(This block used to name about a dozen types that were never written --
+`CommitFeed`, `CaptureSummarizer`, `ScanCursor`, `Page`, `EventCursor`,
+`TensorView`, `SummaryBatch`, `CaptureId`, `HydrationRequest`, `TensorRecord`,
+`ClickHouseCatalogIndexer`, `CoreTensorStatsSummarizer`. What shipped instead
+is above: discovery is `CatalogReconciler` over a `PackInventory` rather than a
+`CommitFeed`; paging is `CapturePage` / `ObjectPage` and an opaque cursor
+string rather than a generic `Page[T]`; hydration takes a `CaptureSelection`
+rather than a request object; and summarization is the extension registry
+rather than a summarizer protocol.)*
 
 Initial implementations:
 
 ```text
-PackStore
+PackStore / PackInventory
   - FilesystemPackStore
   - S3PackStore
 
-CatalogIndexer
-  - ClickHouseCatalogIndexer
+CatalogWriter
+  - ClickHouseCatalogWriter          (driven by CatalogIndexer/CatalogReconciler)
 
-CaptureSummarizer
-  - CoreTensorStatsSummarizer
+CaptureCatalog (the reader's query side)
+  - ClickHouseCaptureCatalog
+
+Summaries
+  - summarize_tensor -> CoreTensorSummaryV1
+  - ExtensionRegistry, for ScalarMetric and ArtifactProducer
 ```
 
 External configuration and provider responses are validated at their
@@ -800,19 +896,23 @@ src/dmi/storage/capture/
   s3.py                    # Garage/S3 streaming, listing, exact range reads
   catalog.py               # discovery, reconciliation, footer indexing
   clickhouse_catalog.py    # raw tables, logical views, batched inserts
+  clickhouse_reader.py     # pinned snapshot reads, keyset pagination
+  cursor.py                # opaque validated keyset cursors
+  summary.py               # core tensor statistics, tensor decode
+  extensions.py            # scalar metric / artifact extension registry
+  record_adapter.py        # opt-in Ring² reference bridge
 
 # Planned additions
-src/dmi/storage/
-  summaries/
-    contracts.py
-    core.py
-
 native/csrc/storage/
   capture_record.h
   pack_builder.h
   persistence_pipeline.h
   spool.h
 ```
+
+*(The five modules after `clickhouse_catalog.py` shipped without this list
+being updated. The `summaries/` package this section used to plan was never
+created; `summary.py` and `extensions.py` are what filled that role.)*
 
 ## Implementation plan
 
@@ -1147,8 +1247,38 @@ a conservative cold-cache bound for footer verification.
 
 Reads are pinned to a watermark. `CaptureQuery.filter_hash` identifies a query
 independently of its page, keyset cursors carry that hash and the pinned
-watermark, and `ClickHouseCaptureCatalog` resolves each column with `argMax`
-over `*_capture_raw`.
+watermark, and `ClickHouseCaptureCatalog` resolves a capture out of
+`*_capture_raw` with **one** `argMax` over a tuple of every non-grouped column,
+ordered on the tuple `(index_version, store_id, pack_id)`.
+
+Both halves of that shape are load-bearing, and the per-column
+`argMax(<column>, index_version)` this document used to describe has been
+removed:
+
+- **The tuple ordering key.** One `index()` call allocates one `index_version`
+  for the whole batch, so two packs describing a capture in a single pass
+  produce rows whose ordering key is EQUAL, and ClickHouse leaves the winner of
+  a tie undefined. Measured on 26.9/25.12, one corpus pinned at a single
+  watermark resolved to a different pack at `max_threads = 1` than above it, and
+  to a different one again once a merge had put both rows in one part -- a
+  pinned selection silently reading different bytes before and after a
+  background merge. `(index_version, store_id, pack_id)` is a total order over
+  the rows in a group, and `index_version` still leads, so supersession is
+  unchanged.
+- **One aggregate, not one per column.** Twenty-seven separate `argMax` calls
+  leave nothing forbidding `store_id` from one row and `object_key` from
+  another -- a descriptor describing no pack that exists. It could not be
+  reproduced on 25.12 across forty-two aggregation configurations, and the
+  reason looks structural, but that is an observation about one build rather
+  than a promise the engine makes. Keeping the per-column form and merely
+  giving it the tuple key is also correct and costs +291% at a 100-row page,
+  because ClickHouse compares a tuple ordering argument through a generic
+  `Field` once per row per aggregate.
+
+Every descriptor field except the locator is immutable for a
+`(tenant_id, capture_id)`, which is what makes the pre-aggregation `WHERE`
+filters safe; the rule is written out in `clickhouse_reader`'s module
+docstring and pinned by a test.
 
 `FINAL` is not a snapshot mechanism. It collapses duplicates to the highest
 version present and only then applies predicates, so
@@ -1167,23 +1297,40 @@ already stores, so they cost no indexer change and no extra object reads.
 Anything derived from tensor *contents* runs at hydration time instead, because
 `CatalogIndexer.index` range-reads pack footers only.
 
-The 50,000-row, two-version measurement:
+The 50,000-row, two-version measurement, re-run on the Linux reference host
+against ClickHouse 25.12 after `e93a2c8` changed the projection shape, median
+of three rounds of `--trials 3`:
 
 | Measurement | Median |
 |---|---:|
-| `argMax` snapshot read | 22.3 ms |
-| `FINAL` read (not a snapshot) | 12.1 ms |
-| `max(index_version)` watermark | 1.7 ms |
-| Page, `limit=100` | 21.4 ms |
-| Page, `limit=1000` | 78.8 ms |
-| Page 1 vs page 25 at `limit=100` | 21.5 ms vs 24.4 ms |
+| `argMax` snapshot read | 35.6 ms |
+| `FINAL` read (not a snapshot) | 16.8 ms |
+| `max(index_version)` watermark | 2.3 ms |
+| Page, `limit=100` | 171.7 ms |
+| Page, `limit=1000` | 188.5 ms |
+| Page, `limit=5000` | 256.9 ms |
+| Page 1 vs page 25 at `limit=100` | 176.8 ms vs 173.9 ms |
 
-Correctness costs about 1.85x a plain `FINAL` read at this size, on a laptop
-build with one replay -- it is not a production figure and should be repeated on
-representative hardware and duplicate ratios. Page cost is flat with depth,
-which is the property keyset pagination exists to provide. The watermark
-aggregate is a second round trip per search but under a tenth of a page's cost,
-so caching it is not yet worth the staleness.
+**These are not comparable with the figures this table used to carry** (22.3 /
+12.1 / 1.7 / 21.4 / 78.8 ms, and 21.5 vs 24.4 ms for depth). Those were taken
+on an Apple Silicon laptop against ClickHouse 26.9.1 and, more importantly,
+before `e93a2c8` -- so they describe a reader that resolved each column with its
+own `argMax(<column>, index_version)`, which is the shape that commit removed
+for the tie it left undefined. Two changes at once, and the hardware is the
+larger of them.
+
+The cost of the shape change alone was measured A/B on this host by that
+commit: a 100-row page went from 140.1 ms to 171.7 ms, **+22.6%**, and across
+page sizes, pagination depth and the selectivity cases the current shape runs
++17% to +43%, worst at `unfiltered` (136.4 -> 195.6 ms). That is what
+determinism and a structurally coherent descriptor cost.
+
+Correctness still costs about 2.1x a plain `FINAL` read at this size, with one
+replay -- not a production figure, and it should be repeated on representative
+hardware and duplicate ratios. Page cost remains flat with depth, which is the
+property keyset pagination exists to provide. The watermark aggregate is a
+second round trip per search but a small fraction of a page's cost, so caching
+it is not yet worth the staleness.
 
 Run the benchmark with:
 
@@ -1271,9 +1418,10 @@ capture and field that moved.
   cannot pass while the 1.2x requirement is unmeasured.
 - Performance variance under fault injection, which is not yet recorded.
 - Three decisions the migration forces: whether the public views keep `FINAL`
-  now that its cost is measured at 1.85x; where `index_version` comes from once
-  more than one indexer runs, since the current per-process clock assumes a
-  single writer; and whether catalog facets belong in the public views.
+  now that the correct read's cost against it is measured at 2.1x; where
+  `index_version` comes from once more than one indexer runs, since the current
+  per-process clock assumes a single writer; and whether catalog facets belong
+  in the public views.
 
 No phase requires a CUDA-side change.
 

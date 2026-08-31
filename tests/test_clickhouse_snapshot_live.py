@@ -290,6 +290,12 @@ def test_a_taken_over_publisher_writes_nothing_at_all():
     this branch has already rejected, where the loser wrote first and
     discovered afterwards.
 
+    "Nothing" is exact for THIS window -- the takeover lands before A's first
+    statement, so the fence rejects both. It is not a property of a publish in
+    general: the two statements are fenced separately, and
+    `test_a_takeover_between_the_two_publish_statements_leaves_orphan_rows`
+    drives the gap between them, where the first has already landed.
+
     Asserted directly against the tables rather than through the exception,
     because "it raised" is exactly what the rejected designs also did.
     """
@@ -352,7 +358,7 @@ def test_a_taken_over_publisher_writes_nothing_at_all():
             _publish(stalled, lost, refs=_refs(later), rows=len(later))
 
         assert not armed, "the takeover never ran; the test proved nothing"
-        assert "fenced out and wrote nothing" in str(raised.value)
+        assert "fenced out and made no snapshot visible" in str(raised.value)
         assert "'successor'" in str(raised.value)
 
         # Nothing landed. Not a watermark row, and not one inert manifest row.

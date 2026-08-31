@@ -124,9 +124,16 @@ _CAPTURE_COLUMNS = (
 # already stores, so MATERIALIZED computes them at insert with no indexer
 # change and no extra object reads.
 #
-# The casts are not decoration. On ClickHouse 26.9 ``arrayProduct`` returns
-# Float64, ``UInt64 - UInt64`` returns Int64, and ``nullIf`` makes an
-# expression Nullable -- none of which fit these column types.
+# The casts are not decoration. On ClickHouse 25.12/26.9 ``arrayProduct``
+# returns Float64 and ``UInt64 - UInt64`` returns Int64, neither of which fits
+# the declared column type.
+#
+# ``compression_ratio`` guards its own divisor with ``if(stored_length = 0, 0,
+# ...)`` rather than ``nullIf(stored_length, 0)``: the justification here used
+# to cite ``nullIf`` making the expression Nullable, which is true and is why
+# it is not used, but naming a function the DDL does not contain sent a reader
+# looking for it. A MATERIALIZED column of a non-Nullable type cannot take a
+# Nullable expression at all, so the branch is the form that compiles.
 _FACET_COLUMNS = (
     ("facet_version", "UInt16", "1"),
     ("element_count", "UInt64", "toUInt64(arrayProduct(shape))"),
@@ -486,9 +493,12 @@ pack_id UUID
         # This deliberately does NOT group on capture identity. One row per
         # (capture, store, pack): a capture described by two packs legitimately
         # appears twice, and choosing between them is supersession, which
-        # belongs to the reader (argMax over index_version, grouped on capture
-        # identity). An argMax here would be a second copy of the reader's
-        # semantics living in SQL, free to drift away from it silently.
+        # belongs to the reader -- ONE argMax over a tuple of every resolved
+        # column, grouped on capture identity and ordered on
+        # ``clickhouse_reader._RESOLUTION_ORDER``, which is
+        # ``(index_version, store_id, pack_id)`` and not index_version alone.
+        # An argMax here would be a second copy of those semantics living in
+        # SQL, free to drift away from the reader's silently.
         #
         # CREATE OR REPLACE rather than IF NOT EXISTS: a catalog created by an
         # earlier build already holds the unbounded view, and IF NOT EXISTS
@@ -954,21 +964,37 @@ pack_id UUID
 
         **Both statements are fenced on the publisher lease, inside the
         server-side statement that does the writing.** A publisher whose lease
-        has been taken over writes NOTHING -- it does not write and then
-        discover it lost. That is the difference between this and every
-        post-write check the design has rejected: a check that runs after the
-        write cannot withdraw what the write already made durable, and no
-        ``<= W`` predicate over an append-only table can be repaired that way.
+        has been taken over makes NO SNAPSHOT VISIBLE -- it does not make one
+        visible and then discover it lost. That is the difference between this
+        and every post-write check the design has rejected: a check that runs
+        after the write cannot withdraw what the write already made durable,
+        and no ``<= W`` predicate over an append-only table can be repaired
+        that way.
 
-        The lease is renewed first, every time. That costs a round trip and
-        buys the whole safety margin: at the moment the fence is evaluated the
-        lease has essentially a full ``lease_ttl_ns`` left, and a takeover
-        cannot happen before it expires. The publish statement is capped at
-        ``publish_timeout_ns``, which is required to be below the TTL, so for
-        both publishers to write, the server would have to keep one INSERT in
+        The guarantee is per STATEMENT rather than per publish, and the
+        difference is worth stating because the documents used to claim the
+        stronger one. A takeover before the manifest INSERT leaves nothing
+        behind; a takeover in the GAP between the two statements -- a full
+        client round trip, which ``max_execution_time`` does not bound because
+        it caps each statement rather than the pair -- leaves the manifest rows
+        of the first while the second is refused. Those rows are inert:
+        membership pairs a manifest row with the watermark row of the SAME
+        publish, and that row will never exist, so no snapshot admits them and
+        no reader sees them. What they are not is absent. See
+        docs/catalog-descriptor-key.md, "What this does not close".
+
+        The lease is renewed first, every time. That costs three round trips --
+        head read, claim INSERT, read-back, 5.69 ms median on 25.12 -- and buys
+        the whole safety margin: at the moment the fence is evaluated the lease
+        has essentially a full ``lease_ttl_ns`` left, and a takeover cannot
+        happen before it expires. Each publish statement is capped at
+        ``publish_timeout_ns`` (converted to the SECONDS ``max_execution_time``
+        takes), which is required to be below the TTL, so for both publishers
+        to make a snapshot visible, the server would have to keep one INSERT in
         flight past its own execution-time check and on past the expiry of a
-        lease renewed just before it started. See docs/catalog-descriptor-key.md
-        for what that does and does not close.
+        lease renewed just before it started. The cap is per statement, so it
+        does not bound the gap between the two. See
+        docs/catalog-descriptor-key.md for what that does and does not close.
         """
         self._validate_version(index_version)
         self._validate_version(published_at_ns)
@@ -982,12 +1008,16 @@ pack_id UUID
         publish_id = str(uuid4())
         settings = {**_DECIDING_READ, **self._publish_timeout()}
         if refs:
-            # Fenced too, so that a fenced-out publisher leaves the catalog
-            # byte for byte as it found it. These rows would be inert either
-            # way -- membership pairs them with a watermark row that will never
-            # exist -- but "wrote nothing" is a property that can be asserted
-            # directly, and "wrote something harmless" is one that has to be
-            # argued every time the membership clause changes.
+            # Fenced too, so that a publisher fenced out BEFORE this statement
+            # leaves the catalog byte for byte as it found it. These rows would
+            # be inert either way -- membership pairs them with a watermark row
+            # that will never exist -- but "wrote nothing" is a property a test
+            # can assert directly, and "wrote something harmless" is one that
+            # has to be argued every time the membership clause changes.
+            #
+            # It does not make the two statements atomic. A takeover landing in
+            # the gap between them leaves these rows behind, inert; that is the
+            # residual, and it is written up rather than glossed.
             self._client.execute(
                 f"INSERT INTO {self._qualified(self._manifest)} "
                 "(index_version, publish_id, store_id, pack_id) "
@@ -1110,6 +1140,15 @@ pack_id UUID
         immediately if the head term is contested, since a contested term is
         inert. A live lease held by SOMEBODY ELSE raises
         :class:`PublisherLeaseHeldError` rather than being stolen.
+
+        What that does NOT promise is that only one writer object believes it
+        holds a lease. The read-back proves a claimant is alone at ITS term, not
+        that its term is the head: a claimant whose head read preceded a rival's
+        row claims below that rival, reads back alone, and is handed a live
+        lease while the rival sits above it. Verified on 25.12 with two writers
+        holding terms 1 and 9. Only the head publishes -- the fence says so, and
+        the loser is refused at its next renewal with a message naming the
+        actual holder -- so this costs liveness on the loser, never safety.
 
         A writer that already holds a lease is re-acquiring its OWN, and that
         must succeed: the operating instructions say to acquire before
@@ -1367,8 +1406,11 @@ pack_id UUID
             f"stands at the head of `{self._config.database}`."
             f"`{self._config.table_prefix}_publisher_lease`, which is now term "
             f"{head.term} held by {head.holder!r}: the publish was fenced out "
-            "and wrote nothing. Acquire a lease again and re-index; retrying "
-            "with a higher version would fail the same fence."
+            "and made no snapshot visible. Acquire a lease again and re-index; "
+            "retrying with a higher version would fail the same fence. If the "
+            "takeover landed between the two publish statements, the manifest "
+            "rows of the first are still there -- inert, since no watermark "
+            "row will ever pair with them, and collectable by a retention job."
         )
 
     def last_published_version(self) -> int:

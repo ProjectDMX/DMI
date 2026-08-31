@@ -130,28 +130,40 @@ PYTHONPATH=src python -m benchmarks.bench_capture_search \
   --rows 50000 --replays 2 --trials 3
 ```
 
-On local ClickHouse 26.9.1 with 50,000 rows written twice:
+On the Linux reference host (AMD Ryzen Threadripper PRO 5955WX, ClickHouse
+25.12) with 50,000 rows written twice, median of three rounds of `--trials 3`:
 
 | Measurement | Median |
 |---|---:|
-| `argMax` snapshot read | 22.3 ms |
-| `FINAL` read (not a snapshot) | 12.1 ms |
-| `max(index_version)` watermark | 1.7 ms |
-| Page, `limit=100` | 21.4 ms |
-| Page, `limit=1000` | 78.8 ms |
-| Page, `limit=5000` | 145.2 ms |
-| Page 1 vs page 25 at `limit=100` | 21.5 ms vs 24.4 ms |
+| `argMax` snapshot read | 35.6 ms |
+| `FINAL` read (not a snapshot) | 16.8 ms |
+| `max(index_version)` watermark | 2.3 ms |
+| Page, `limit=100` | 171.7 ms |
+| Page, `limit=1000` | 188.5 ms |
+| Page, `limit=5000` | 256.9 ms |
+| Page 1 vs page 25 at `limit=100` | 176.8 ms vs 173.9 ms |
+
+**This table replaces an earlier one that is not comparable with it** (22.3 /
+12.1 / 1.7 / 21.4 / 78.8 / 145.2 ms, and 21.5 vs 24.4 ms for depth). Those
+numbers came from an Apple Silicon laptop against ClickHouse 26.9.1, and they
+predate `e93a2c8`, which replaced the reader's per-column
+`argMax(<column>, index_version)` with a single `argMax` over a tuple of every
+resolved column ordered on `(index_version, store_id, pack_id)`. The A/B for
+that change alone, on this host: a 100-row page went 140.1 ms -> 171.7 ms,
+**+22.6%**, and +17% to +43% across page sizes, depth and selectivity. The
+per-column form left the winner of a tie undefined, so a pinned selection could
+resolve to a different pack after a background merge; the delta is what fixing
+that cost.
 
 The two snapshot rows are not alternatives. `FINAL` drops any capture
-re-indexed above the watermark, so the 1.85x gap is what correctness costs, not
+re-indexed above the watermark, so the 2.1x gap is what correctness costs, not
 a choice between query shapes. Page cost is flat with depth -- the property
 keyset pagination exists to provide -- and grows with page size, not position.
 
-Core summaries run at roughly 140–210 M elements/s depending on dtype
+Core summaries run at roughly 80–140 M elements/s depending on dtype
 (`int64` fastest, `bfloat16` slowest because of the widening shift). As with
-the insert sweep, these are loopback numbers on a laptop build: repeat them on
-representative hardware and duplicate ratios before treating any as a capacity
-claim.
+the insert sweep, these are loopback numbers: repeat them on representative
+hardware and duplicate ratios before treating any as a capacity claim.
 
 Baselines:
 
