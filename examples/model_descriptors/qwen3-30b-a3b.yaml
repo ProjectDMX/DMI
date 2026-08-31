@@ -1,0 +1,22 @@
+# Qwen3 30B-A3B -- mixture-of-experts decoder transformer.
+#
+# Present so the configurator has a descriptor that exercises the MoE
+# observations (router logits, expert IDs, expert weights). Verify against the
+# model's config.json before using it for a real capture.
+schema_version: 1
+
+model:
+  id: qwen3-30b-a3b
+  name: Qwen3 30B-A3B
+  architecture: decoder_transformer
+
+topology:
+  num_layers: 48
+  hidden_size: 2048
+  num_attention_heads: 32
+  num_kv_heads: 4
+  intermediate_size: 768
+  num_experts: 128
+  top_k: 8
+  head_dim: 128
+  vocab_size: 151936

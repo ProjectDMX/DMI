@@ -1,0 +1,20 @@
+# Qwen3 8B -- dense decoder transformer.
+#
+# Descriptors are hand-authored in v1 (`dmi describe-model` is deferred), so
+# check these values against the model's own config.json before relying on
+# them for a real capture.
+schema_version: 1
+
+model:
+  id: qwen3-8b
+  name: Qwen3 8B
+  architecture: decoder_transformer
+
+topology:
+  num_layers: 36
+  hidden_size: 4096
+  num_attention_heads: 32
+  num_kv_heads: 8
+  intermediate_size: 12288
+  head_dim: 128
+  vocab_size: 151936
