@@ -1,0 +1,15 @@
+# Meta Llama 3 8B -- dense decoder transformer.
+schema_version: 1
+
+model:
+  id: llama3-8b
+  name: Llama 3 8B
+  architecture: decoder_transformer
+
+topology:
+  num_layers: 32
+  hidden_size: 4096
+  num_attention_heads: 32
+  num_kv_heads: 8
+  intermediate_size: 14336
+  vocab_size: 128256

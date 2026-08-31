@@ -1,8 +1,35 @@
 # DMI-configurator — Design & Implementation Plan
 
-Status: **design, not yet implemented**
+Status: **phases 1-7 implemented** (phase 8, runtime policy, deferred by design)
 Branch: `feat/dmi-configurator`
 Verified against: `cb4e490`
+
+## Running it
+
+```bash
+pip install -e ".[ui]"
+dmi ui examples/model_descriptors/qwen3-8b.yaml
+```
+
+Then open <http://127.0.0.1:8000>. To start from an existing configuration and
+save back to it:
+
+```bash
+dmi ui examples/model_descriptors/qwen3-8b.yaml --config attention-debug.dmi.yaml
+```
+
+Without an install, `python -m dmi.cli ui ...` works from a checkout with
+`src` on `PYTHONPATH`. `--host` and `--port` move the bind address; the default
+is loopback only.
+
+Using the configuration from Python, with no browser involved:
+
+```python
+from dmi.configuration import compile_config, load_config, ModelContext
+
+config = load_config("attention-debug.dmi.yaml")
+compiled = compile_config(config, ModelContext(specs=model.get_hook_specs(), shape=cfg))
+```
 
 ---
 
@@ -523,18 +550,64 @@ alongside the existing `hook_selection: str` default.
 
 ---
 
-## Appendix B — Open decisions before Phase 1
+## Appendix B — Decisions taken
 
-1. **Descriptor field naming** — HF names (`hidden_size`) or DMI internal names
-   (`hidden_dim`)? Recommendation: HF names in the descriptor, since descriptors
-   are authored from HF configs, with the mapping isolated in `manifest.py`.
-2. **Does the descriptor carry `num_layers` only, or a full topology block?**
-   Only `num_layers` is not derivable from `ModelShapeConfig`; everything else
-   duplicates it.
-3. **`compile_config()` model context** — it needs a bound spec list, so define
-   whether `model_context` is a live model, an adapter, or a spec list plus
-   `ModelShapeConfig`.
-4. **Inclusive or exclusive `layers.end`.** `start: 8, end: 15` reads as
-   inclusive in the UI. Must be stated in the schema and tested.
-5. **`RuntimeConfig` contents** — recommend omitting the block entirely from
-   YAML v1 rather than exposing `RingConfig` fields with unclear support status.
+The five open questions were resolved as follows when phases 1-7 were built.
+
+1. **Descriptor field naming — HF names.** Descriptors use `hidden_size`,
+   `intermediate_size`, `num_attention_heads`, because they are authored from
+   HF configs. The translation into `ModelShapeConfig`'s `hidden_dim` /
+   `intermediate_dim` is isolated in `manifest.to_model_shape_config()`, the
+   only place the two vocabularies meet.
+
+2. **The descriptor carries a full topology block**, not just `num_layers`.
+   The redundancy with `ModelShapeConfig` is worth it: the configurator runs
+   with no model loaded, and a descriptor that only carried the layer count
+   could not compute availability or head geometry on its own.
+
+3. **`ModelContext` = spec list + `ModelShapeConfig`.** Forced by
+   `select_hook_specs(specs, mode, cfg)`, which filters specs the model already
+   produced. `compile_config` cannot run from a descriptor alone.
+
+4. **`layers.end` is inclusive.** `LayerSelection(8, 15)` selects eight layers.
+   The UI labels it "Layers 8-15" and the label must not lie. Tested directly,
+   including that global hooks (`layer_no == -1`) are never swept up by a range.
+
+5. **No `runtime` block in YAML v1.** The existing runtime surface is
+   `RingConfig`, a native struct of transport parameters. Exposing a subset
+   would imply a support contract that does not exist. `DMIConfig` has no
+   `runtime` field.
+
+### What landed
+
+| Area | Module |
+|---|---|
+| Typed schema | `dmi/configuration/schema.py` |
+| Descriptors | `dmi/configuration/manifest.py` |
+| Catalog projection | `dmi/configuration/catalog_adapter.py` |
+| Diagram metadata | `dmi/configuration/architecture.py` |
+| Validation | `dmi/configuration/validation.py` |
+| YAML | `dmi/configuration/yaml.py` |
+| Legacy bridge | `dmi/configuration/compatibility.py` |
+| Compilation | `dmi/configuration/compiler.py` |
+| Layer filter | `dmi/hooks/selection.py` (`filter_by_layers`) |
+| Backend | `dmi/ui/app.py`, `dmi/ui/server.py` |
+| Front end | `dmi/ui/static/` (no build step) |
+| CLI | `dmi/cli.py` |
+
+The only change to existing code is additive: `filter_by_layers` and
+`hook_belongs_to_layers` in `dmi/hooks/selection.py`, following the same
+convention as `filter_by_pp_rank` and `filter_by_tp_rank` (disable the dropped
+spec's hook point, raise on unbound specs).
+
+### Still open
+
+* **Wiring into `attach_model`.** `compile_config` produces the filtered spec
+  list, but `BackendAdapter.attach_model(model, hook_selection: str)` has not
+  been given a way to accept a `CompiledDMIConfig`. Until it does, a layer range
+  authored in the UI is not applied by an integration that calls `attach_model`
+  directly. This is the one signature change the design calls for.
+* **Runtime policy (phase 8).** `policy.objective` round-trips and is shown in
+  the UI behind an explicit notice that it does not yet change behaviour.
+* **`dmi describe-model`.** Descriptors are hand-authored; the shipped examples
+  should be checked against each model's `config.json`.
