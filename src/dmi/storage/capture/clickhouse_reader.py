@@ -235,12 +235,20 @@ class ClickHouseCaptureCatalog:
         that version between those writes, letting a reader pin a half-written
         batch that keeps growing under it.
         """
-        return str(self._published_head(self._config.settings))
+        return str(self._published_head())
 
-    def _published_head(self, settings: Mapping[str, object]) -> int:
+    def _published_head(self, *, deciding: bool = False) -> int:
+        """The published head version, 0 when nothing is published yet.
+
+        ``deciding`` adds ``select_sequential_consistency`` for the one read
+        whose answer refuses a call rather than merely pinning a snapshot.
+        """
+        settings = dict(self._config.settings)
+        if deciding:
+            settings.update(_DECIDING_READ)
         rows = self._client.execute(
             f"SELECT max(index_version) FROM {self._qualified(self._watermark_table)}",
-            settings=dict(settings),
+            settings=settings,
         )
         if not rows or rows[0][0] is None:
             return 0
@@ -311,9 +319,7 @@ class ClickHouseCaptureCatalog:
         # replication lag -- so this read carries the same
         # select_sequential_consistency the writer's deciding reads do
         # (accepted and ignored by a non-replicated server).
-        if requested > self._published_head(
-            {**self._config.settings, **_DECIDING_READ}
-        ):
+        if requested > self._published_head(deciding=True):
             raise ValueError(
                 "selection watermark exceeds the published watermark"
             )

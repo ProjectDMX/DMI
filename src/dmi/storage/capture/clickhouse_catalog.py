@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import re
 import secrets
 from time import time_ns
-from typing import Protocol, Sequence
+from typing import Iterator, Protocol, Sequence
 from uuid import uuid4
 
 from .catalog import (
@@ -265,6 +265,12 @@ _DECIDING_READ = {"select_sequential_consistency": 1}
 # query_pack_limit (10,000) or a large publish batch would breach it and die
 # with Code 62 mid-statement.
 _MAX_INLINE_TUPLES = 1_000
+
+
+def _inline_chunks(items: list) -> Iterator[list]:
+    """``items`` in slices small enough to inline into statement text."""
+    for start in range(0, len(items), _MAX_INLINE_TUPLES):
+        yield items[start : start + _MAX_INLINE_TUPLES]
 
 
 def _membership_predicate(manifest: str, watermark: str, *, bounded: bool) -> str:
@@ -1000,12 +1006,11 @@ pack_id UUID
         committed: set[PackIdentity] = set()
         # Chunked: the identities land in the statement TEXT, and an unchunked
         # query_pack_limit's worth of tuples can breach max_query_size.
-        remaining = list(identities)
-        for start in range(0, len(remaining), _MAX_INLINE_TUPLES):
+        for chunk in _inline_chunks(list(identities)):
             rows = self._client.execute(
                 f"SELECT store_id, toString(pack_id) FROM {table} "
                 "WHERE (store_id, pack_id) IN %(identities)s",
-                {"identities": remaining[start : start + _MAX_INLINE_TUPLES]},
+                {"identities": chunk},
             )
             committed.update(
                 (self._text(row[0]), self._text(row[1])) for row in rows
@@ -1119,7 +1124,7 @@ pack_id UUID
             # refused mid-way leaves earlier chunks inert exactly as the
             # takeover gap does.
             members = [(ref.store_id, ref.pack_id) for ref in refs]
-            for start in range(0, len(members), _MAX_INLINE_TUPLES):
+            for chunk in _inline_chunks(members):
                 self._client.execute(
                     f"INSERT INTO {self._qualified(self._manifest)} "
                     "(index_version, publish_id, store_id, pack_id) "
@@ -1130,7 +1135,7 @@ pack_id UUID
                     {
                         "index_version": index_version,
                         "publish_id": publish_id,
-                        "members": members[start : start + _MAX_INLINE_TUPLES],
+                        "members": chunk,
                         "lease_id": lease.lease_id,
                     },
                     settings=settings,
