@@ -98,6 +98,16 @@ class _CatalogServer:
                 for version, publish_id in self.publishes
                 if version == params["version"]
             ]
+        if "snapshot_manifest" in query and "SELECT count()" in query:
+            wanted = set(params["members"])
+            found = {
+                (store_id, pack_id)
+                for version, publish_id, store_id, pack_id in self.manifest
+                if version == params["index_version"]
+                and publish_id == params["publish_id"]
+                and (store_id, pack_id) in wanted
+            }
+            return [(len(found),)]
         if "version_claims" in query:
             if "max(version)" in query:
                 return [(max((v for v, _ in self.claims), default=None),)]
@@ -217,8 +227,8 @@ def test_an_expired_lease_is_taken_over_and_the_old_holder_never_reaches_a_write
 def test_a_takeover_after_the_renewal_is_reported_as_a_lost_lease():
     """The failure the fence catches, and why it is not a lost version race.
 
-    Renewing before every publish leaves one window: between the renewal and
-    the server executing the write. A takeover there passes the client-side
+    Renewing before every fenced statement leaves one window: between renewal
+    and the server executing the write. A takeover there passes the client-side
     check and fails the server-side fence, and the two failures need different
     recoveries -- a lost VERSION is repaired by allocating a higher one, which
     the indexer does automatically, while a lost LEASE would fail the same
@@ -246,6 +256,64 @@ def test_a_takeover_after_the_renewal_is_reported_as_a_lost_lease():
     assert not isinstance(raised.value, SnapshotPublishRaceError)
     assert server.watermarks == []
     assert holder.publisher_lease is None
+
+
+def test_a_publish_requires_a_full_timeout_of_lease_remaining():
+    server = _CatalogServer()
+    timeout = 1_000_000_000
+    writer = _publisher(
+        server,
+        lease_ttl_ns=2_000_000_000,
+        publish_timeout_ns=timeout,
+    )
+
+    def age_lease(_lease_id) -> None:
+        server.lease.on_fence = None
+        expires_at_ns = max(row[4] for row in server.lease.head())
+        server.lease.now_ns = expires_at_ns - timeout
+
+    server.lease.on_fence = age_lease
+
+    with pytest.raises(SnapshotPublishRaceError):
+        writer.publish_snapshot(
+            index_version=1,
+            refs=(),
+            published_at_ns=1,
+            indexed_rows=0,
+            indexed_packs=0,
+        )
+
+    assert server.watermarks == []
+
+
+def test_a_publish_renews_between_fenced_statements(tmp_path: Path):
+    _, refs = _refs(tmp_path, 1)
+    server = _CatalogServer()
+    timeout = 1_000_000_000
+    writer = _publisher(
+        server,
+        lease_ttl_ns=2_000_000_000,
+        publish_timeout_ns=timeout,
+    )
+    execute = server.execute
+
+    def advance_after_manifest(query, params=None, **kwargs):
+        result = execute(query, params, **kwargs)
+        if query.lstrip().startswith("INSERT") and "snapshot_manifest" in query:
+            server.lease.now_ns += timeout
+        return result
+
+    server.execute = advance_after_manifest
+
+    writer.publish_snapshot(
+        index_version=1,
+        refs=refs,
+        published_at_ns=1,
+        indexed_rows=1,
+        indexed_packs=1,
+    )
+
+    assert server.watermarks == [1]
 
 
 def test_a_contested_lease_term_is_abandoned_by_everyone_who_sees_it():
@@ -412,7 +480,7 @@ def test_a_renewal_keeps_the_fencing_identity_and_extends_the_term():
 
     The fence names the lease, so a renewal has to keep it; the term has to
     move, because that is what a takeover would have to beat; and the expiry
-    has to move, because the whole point of renewing before every publish is
+    has to move, because the whole point of renewing before each fenced write is
     that the fence runs with essentially a full TTL left.
 
     The clock is advanced deliberately. Asserted against a fake clock that

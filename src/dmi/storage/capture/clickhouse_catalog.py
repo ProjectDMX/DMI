@@ -256,21 +256,38 @@ _SCHEMA_VERSION = 4
 # something this module can pick. See docs/catalog-descriptor-key.md.
 _DECIDING_READ = {"select_sequential_consistency": 1}
 
-# Identity tuples are inlined into a statement's TEXT: the driver substitutes
-# non-VALUES parameters client-side, and the server parses at most
-# max_query_size bytes of text (256 KiB by default) -- only the data stream
-# after INSERT ... VALUES is exempt. One (store_id, pack_id) member renders as
-# roughly 60-100 bytes, so chunks of this size stay an order of magnitude
-# under the limit even with generous store ids, where an unchunked
-# query_pack_limit (10,000) or a large publish batch would breach it and die
-# with Code 62 mid-statement.
-_MAX_INLINE_TUPLES = 1_000
+# Non-VALUES parameters are rendered into statement text. Keep their encoded
+# upper bound below ClickHouse's 256 KiB default max_query_size, leaving room
+# for the surrounding SQL.
+_MAX_INLINE_PARAMETER_BYTES = 192 * 1024
 
 
-def _inline_chunks(items: list) -> Iterator[list]:
-    """``items`` in slices small enough to inline into statement text."""
-    for start in range(0, len(items), _MAX_INLINE_TUPLES):
-        yield items[start : start + _MAX_INLINE_TUPLES]
+def _inline_tuple_bytes(item: PackIdentity) -> int:
+    if len(item) != 2 or any(not isinstance(value, str) for value in item):
+        raise ValueError("pack identities must contain two text values")
+    # Quotes and backslashes can double every encoded byte. The remaining
+    # constant covers quotes, tuple punctuation and separators.
+    return sum(2 * len(value.encode("utf-8")) for value in item) + 10
+
+
+def _inline_chunks(items: list[PackIdentity]) -> Iterator[list[PackIdentity]]:
+    """Yield chunks whose rendered parameter stays under the byte budget."""
+    chunk: list[PackIdentity] = []
+    size = 2
+    for item in items:
+        item_size = _inline_tuple_bytes(item)
+        if item_size + 2 > _MAX_INLINE_PARAMETER_BYTES:
+            raise ValueError("pack identity exceeds inline query byte budget")
+        separator = 2 if chunk else 0
+        if chunk and size + separator + item_size > _MAX_INLINE_PARAMETER_BYTES:
+            yield chunk
+            chunk = []
+            size = 2
+            separator = 0
+        chunk.append(item)
+        size += separator + item_size
+    if chunk:
+        yield chunk
 
 
 def _membership_predicate(manifest: str, watermark: str, *, bounded: bool) -> str:
@@ -686,13 +703,11 @@ pack_id UUID
         if self._inventory_without_membership():
             raise CatalogSchemaVersionError(
                 f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
-                f"lists packs in `{self._pack_raw}` while `{self._manifest}` "
-                f"holds no membership that any publish in `{self._watermark}` "
-                "admits -- the manifest is empty, or the watermark rows its "
-                "publishes need are gone -- so every pack is already marked "
-                "indexed and none belongs to any snapshot. An indexing pass "
-                "would skip all of them and leave a catalog that is empty but "
-                "reports success. "
+                f"lists one or more packs in `{self._pack_raw}` without "
+                f"membership in `{self._manifest}` admitted by a publish in "
+                f"`{self._watermark}`. Those packs are already marked indexed "
+                "but belong to no snapshot, so an indexing pass would skip "
+                "them and report success while their captures remain invisible. "
                 + self._rebuild_instruction()
             )
 
@@ -927,27 +942,18 @@ pack_id UUID
         return rows[0][0] if rows else None
 
     def _inventory_without_membership(self) -> bool:
-        """Is the replay guard populated while snapshot membership is empty?
-
-        That pair is the signature of a catalog whose membership was dropped or
-        never migrated: ``committed_pack_ids`` reads the inventory and reports
-        every pack as done, while readers bound their snapshot by a manifest
-        that names none of them.
-
-        Membership is counted EFFECTIVELY -- manifest rows whose publish also
-        reached the watermark table -- not as raw manifest rows. A raw count
-        waves through the same dangerous state entered from the other side: a
-        dropped or truncated watermark table beside a populated manifest
-        leaves every manifest row unpaired, so readers see nothing while the
-        inventory still marks every pack as indexed.
-        """
-        packs, members = self._client.execute(
-            f"SELECT (SELECT count() FROM {self._qualified(self._pack_raw)}), "
-            f"(SELECT count() FROM {self._qualified(self._manifest)} "
-            "WHERE (index_version, publish_id) IN "
-            f"(SELECT index_version, publish_id FROM {self._qualified(self._watermark)}))"
-        )[0]
-        return bool(packs) and not members
+        """Does any replay-guard identity lack effective membership?"""
+        rows = self._client.execute(
+            "SELECT count() FROM ("
+            "SELECT store_id, pack_id FROM "
+            f"{self._qualified(self._pack_raw)} FINAL "
+            "WHERE (store_id, pack_id) NOT IN ("
+            f"SELECT store_id, pack_id FROM {self._qualified(self._manifest)} "
+            "WHERE (index_version, publish_id) IN ("
+            "SELECT index_version, publish_id FROM "
+            f"{self._qualified(self._watermark)})) LIMIT 1)"
+        )
+        return bool(rows[0][0])
 
     def _rebuild_instruction(self) -> str:
         """The one supported recovery, named in full so nobody has to guess.
@@ -1070,17 +1076,12 @@ pack_id UUID
         no reader sees them. What they are not is absent. See
         docs/catalog-descriptor-key.md, "What this does not close".
 
-        The lease is renewed first, every time. That costs three round trips --
-        head read, claim INSERT, read-back, 5.69 ms median on 25.12 -- and buys
-        the whole safety margin: at the moment the fence is evaluated the lease
-        has essentially a full ``lease_ttl_ns`` left, and a takeover cannot
-        happen before it expires. Each publish statement is capped at
-        ``publish_timeout_ns`` (converted to the SECONDS ``max_execution_time``
-        takes), which is required to be below the TTL, so for both publishers
-        to make a snapshot visible, the server would have to keep one INSERT in
-        flight past its own execution-time check and on past the expiry of a
-        lease renewed just before it started. The cap is per statement, so it
-        does not bound the gap between the two. See
+        The lease is renewed before every fenced statement. Each fence requires
+        at least ``publish_timeout_ns`` of lease life remaining, and the
+        statement carries that same value as its ``max_execution_time``. Each
+        manifest chunk is read back before renewal, so a zero-row conditional
+        INSERT cannot be followed by a visible watermark. The cap is per
+        statement, so it does not bound the gap between two statements. See
         docs/catalog-descriptor-key.md for what that does and does not close.
 
         A statement that TRIPS the cap raises the driver's own exception
@@ -1137,9 +1138,23 @@ pack_id UUID
                         "publish_id": publish_id,
                         "members": chunk,
                         "lease_id": lease.lease_id,
+                        "publish_timeout_ns": self._config.publish_timeout_ns,
                     },
                     settings=settings,
                 )
+                if not self._manifest_chunk_published(
+                    index_version=index_version,
+                    publish_id=publish_id,
+                    members=chunk,
+                ):
+                    self._reject_if_the_lease_is_gone(lease)
+                    raise SnapshotPublishRaceError(
+                        f"catalog version {index_version} did not publish its "
+                        "complete manifest chunk, so no watermark was written "
+                        "and no snapshot became visible. Allocate a higher "
+                        "version and publish again."
+                    )
+                lease = self.renew_publisher_lease()
         # The barrier, the fence and the visibility write are ONE server-side
         # statement, so the gap between "am I the highest?", "do I still hold
         # the lease?" and "I am now visible" holds no client round trip -- no
@@ -1174,6 +1189,7 @@ pack_id UUID
                 "indexed_rows": indexed_rows,
                 "indexed_packs": indexed_packs,
                 "lease_id": lease.lease_id,
+                "publish_timeout_ns": self._config.publish_timeout_ns,
             },
             settings=settings,
         )
@@ -1481,7 +1497,8 @@ pack_id UUID
         """The fencing predicate, for use INSIDE a writing statement.
 
         Two conditions on ONE row: the head of the lease table is this
-        publisher's lease, and it has not expired by the server's own clock.
+        publisher's lease, and it has a full publish timeout left by the
+        server's own clock.
 
         **One subquery reading one row**, not two subqueries returning a column
         each, and that is a correctness point before it is a cost one. Two
@@ -1515,18 +1532,17 @@ pack_id UUID
             f"{self._qualified(self._lease_table)} "
             "ORDER BY term DESC, lease_id DESC LIMIT 1"
             ") WHERE lease_id = toUUID(%(lease_id)s) "
-            "AND expires_at_ns > toUnixTimestamp64Nano(now64(9))) = 1"
+            "AND expires_at_ns > "
+            "toUInt64(toUnixTimestamp64Nano(now64(9))) "
+            "+ toUInt64(%(publish_timeout_ns)s)) = 1"
         )
 
     def _publish_timeout(self) -> dict[str, object]:
         """Cap the publish statement below the lease TTL.
 
-        The fence is evaluated when the statement starts and the row lands when
-        it finishes, so the two are only separable by however long the server
-        keeps the statement in flight. Capping that below ``lease_ttl_ns`` is
-        what turns "unlikely" into "the server would have to overrun its own
-        execution-time check": a takeover cannot happen until the lease renewed
-        immediately before this statement expires.
+        Each fence requires this much lease life when its statement starts.
+        Capping the statement to the same duration keeps it from running into
+        a successor's lease without the server overrunning its own limit.
         """
         return {
             # An int, never a float: the config requires whole seconds so that
@@ -1534,6 +1550,29 @@ pack_id UUID
             "max_execution_time": self._config.publish_timeout_ns // 1_000_000_000,
             "timeout_overflow_mode": "throw",
         }
+
+    def _manifest_chunk_published(
+        self,
+        *,
+        index_version: int,
+        publish_id: str,
+        members: list[PackIdentity],
+    ) -> bool:
+        """Confirm a conditional manifest INSERT admitted every identity."""
+        rows = self._client.execute(
+            "SELECT count() FROM (SELECT DISTINCT store_id, pack_id FROM "
+            f"{self._qualified(self._manifest)} "
+            "WHERE index_version = %(index_version)s "
+            "AND publish_id = toUUID(%(publish_id)s) "
+            "AND (store_id, pack_id) IN %(members)s)",
+            {
+                "index_version": index_version,
+                "publish_id": publish_id,
+                "members": members,
+            },
+            settings=_DECIDING_READ,
+        )
+        return rows[0][0] == len(set(members))
 
     def _reject_if_the_lease_is_gone(self, lease: PublisherLease) -> None:
         head = self._lease_head()
@@ -1556,9 +1595,9 @@ pack_id UUID
             f"{head.term} held by {head.holder!r}: the publish was fenced out "
             "and made no snapshot visible. Acquire a lease again and re-index; "
             "retrying with a higher version would fail the same fence. If the "
-            "takeover landed between the two publish statements, the manifest "
-            "rows of the first are still there -- inert, since no watermark "
-            "row will ever pair with them, and collectable by a retention job."
+            "takeover landed after a manifest chunk, its rows are still there "
+            "-- inert, since no watermark row will ever pair with them, and "
+            "collectable by a retention job."
         )
 
     def last_published_version(self) -> int:

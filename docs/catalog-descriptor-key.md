@@ -373,16 +373,21 @@ publisher fenced out *before* its first statement from writing them at all.
 What it cannot do is make the pair of statements atomic; see *What this does
 not close*.
 
-A publisher renews before every publish. That costs **three** round trips --
-the head read, the claim INSERT and the read-back -- measured at 5.69 ms median
-on 25.12, and it buys the entire safety margin: at the moment the fence is
-evaluated its lease has essentially a full `lease_ttl_ns` left, and a takeover
-cannot happen until that expires. Both publish statements carry
-`max_execution_time`, set to `publish_timeout_ns` converted to the **seconds**
-that setting takes (whole seconds, validated at construction and sent as an
-integer -- a fractional value can truncate to 0 on older serialization paths,
-which ClickHouse reads as *no* limit -- and required to be below the TTL),
-so the server itself aborts a statement that has been in flight that long.
+A publisher renews before every manifest chunk and before the watermark. Each
+renewal costs **three** round trips -- the head read, the claim INSERT and the
+read-back -- measured at 5.69 ms median on 25.12. Every fenced statement
+requires more than `publish_timeout_ns` of lease life remaining and carries
+`max_execution_time` set to that same timeout converted to the **seconds** the
+setting takes (whole seconds, validated at construction and sent as an integer
+-- a fractional value can truncate to 0 on older serialization paths, which
+ClickHouse reads as *no* limit -- and required to be below the TTL). Thus a
+later statement cannot start on the tail of an earlier renewal, and the server
+aborts any admitted statement that remains in flight for the full margin.
+
+Every conditional manifest INSERT is read back before the next renewal. This
+matters because a fence refusal writes zero rows without raising: renewing and
+continuing without the read-back could make the watermark visible after one
+manifest chunk was silently omitted.
 A statement the server aborts this way raises the driver's own exception
 (`timeout_overflow_mode='throw'`, Code 159) out of `publish_snapshot` before
 the ownership read-back -- the same species as the Code 125 path above, and
@@ -402,8 +407,7 @@ RAISE`: the publisher that had demonstrably lost the lease published anyway.
 
 #### What it costs
 
-Measured on 25.12 against a local server, base = the same code without the
-lease:
+The earlier one-renewal implementation measured on 25.12 as follows:
 
 | | before | after | |
 |---|---:|---:|---|
@@ -415,18 +419,15 @@ The read path is untouched, as it should be: the lease is on the write path, and
 the membership clause gained one column in a join between two tables that hold
 one row per publish.
 
-The 8.5 ms is three round trips of renewal (head read, claim, read-back) plus
-0.8 ms of fence on each of the two writing statements. It is paid once per
-`index()` call, not once per pack or per row, which is why it disappears into a
-pass that already spends 160 ms reading footers and inserting descriptors.
+Those figures predate per-statement renewal and manifest read-back. The current
+protocol adds one renewal and one verification per manifest chunk, so it needs
+remeasurement; its write-path cost scales with the number of byte-budgeted
+chunks. The read path remains untouched.
 
-Renewing on **every** publish rather than only when the lease is close to
-expiring is deliberate. It removes the client clock from the design entirely --
-this branch has spent two rounds getting wall clocks out of the ordering -- and
-it maximises the margin the residual argument below depends on. Renew-when-stale
-would recover most of the 8.5 ms and needs a monotonic clock and a staleness
-branch to do it; that is a trade worth making only if publish frequency ever
-rises enough for 8.5 ms to matter.
+Renewing on **every fenced statement** is deliberate. It removes the client
+clock from the decision and restores the full margin before later chunks and
+the watermark. Renew-when-stale would need a trusted staleness decision between
+statements, which is the condition this protocol avoids.
 
 #### What this does not close
 

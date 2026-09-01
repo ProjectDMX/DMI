@@ -72,7 +72,7 @@ _VERSION_ONE_OBJECTS = (
 class _Client:
     """A ClickHouse stand-in whose catalog state the test declares.
 
-    ``tables``, ``schema_version``, ``inventory_rows`` and ``manifest_rows``
+    ``tables``, ``schema_version`` and ``inventory_without_membership``
     describe a server the writer is about to meet: an empty default is a fresh
     install, and the other combinations are the upgrade states `ensure_schema`
     has to tell apart.
@@ -90,8 +90,7 @@ class _Client:
         *,
         tables=(),
         schema_version=None,
-        inventory_rows=0,
-        manifest_rows=0,
+        inventory_without_membership=0,
         sort_key=_CURRENT_SORT_KEY,
         engines=None,
         publish_id_tables=("dmi_index_watermark", "dmi_snapshot_manifest"),
@@ -101,6 +100,7 @@ class _Client:
         self.claims = []
         self.watermarks = []
         self.publishes = []
+        self.manifest = []
         # Rows at the version under test that this writer did not write: an
         # operator's INSERT, a second build, a publisher whose statement
         # overlapped. The point of reading publish_id back is that these are
@@ -109,8 +109,7 @@ class _Client:
         self.lease = FakeLeaseTable()
         self.tables = tuple(tables)
         self.schema_version = schema_version
-        self.inventory_rows = inventory_rows
-        self.manifest_rows = manifest_rows
+        self.inventory_without_membership = inventory_without_membership
         self.sort_key = sort_key
         self.engines = dict(engines or {})
         self.publish_id_tables = tuple(publish_id_tables)
@@ -147,11 +146,22 @@ class _Client:
             ]
         if "dmi_schema_version` ORDER BY version DESC" in query:
             return [] if self.schema_version is None else [(self.schema_version,)]
-        if "dmi_pack_inventory_raw`), (SELECT count()" in query:
-            return [(self.inventory_rows, self.manifest_rows)]
+        if "dmi_pack_inventory_raw` FINAL" in query and "NOT IN" in query:
+            return [(self.inventory_without_membership,)]
         if query.lstrip().startswith("INSERT"):
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
+            elif "snapshot_manifest" in query:
+                if self.lease.fence_admits(query, params):
+                    self.manifest.extend(
+                        (
+                            params["index_version"],
+                            params["publish_id"],
+                            store_id,
+                            pack_id,
+                        )
+                        for store_id, pack_id in params["members"]
+                    )
             elif "index_watermark" in query:
                 # The barrier and the fence are server-side conditions, so the
                 # fake has to enforce them or every publish test would pass
@@ -172,6 +182,16 @@ class _Client:
             ] + [
                 (publish_id,) for publish_id in self.foreign_publishes
             ]
+        if "snapshot_manifest" in query and "SELECT count()" in query:
+            wanted = set(params["members"])
+            found = {
+                (store_id, pack_id)
+                for version, publish_id, store_id, pack_id in self.manifest
+                if version == params["index_version"]
+                and publish_id == params["publish_id"]
+                and (store_id, pack_id) in wanted
+            }
+            return [(len(found),)]
         # The version allocator's queries are answered from real claim state;
         # every other SELECT returns the canned rows.
         if "version_claims" in query:
@@ -565,8 +585,9 @@ def test_the_deciding_reads_carry_sequential_consistency():
     assert _settings("max(version)", "SELECT") == [_DECIDING_READ]
     assert _settings("max(index_version)", "SELECT") == [_DECIDING_READ]
     assert _settings("toString(publish_id)", "SELECT") == [_DECIDING_READ]
-    assert _settings("ORDER BY term DESC", "SELECT") == [_DECIDING_READ] * 2
-    assert _settings("acquired_at_ns, expires_at_ns", "SELECT") == [_DECIDING_READ] * 2
+    assert _settings("ORDER BY term DESC", "SELECT") == [_DECIDING_READ] * 3
+    assert _settings("acquired_at_ns, expires_at_ns", "SELECT") == [_DECIDING_READ] * 3
+    assert _settings("dmi_snapshot_manifest", "SELECT") == [_DECIDING_READ]
     # The two fenced writes carry the same consistency AND the statement cap
     # that keeps the fence from being evaluated long before the row lands.
     fenced = {
@@ -579,7 +600,7 @@ def test_the_deciding_reads_carry_sequential_consistency():
     # Bulk writes decide nothing and pay nothing.
     assert _settings("dmi_capture_raw", "INSERT") == [None]
     assert _settings("dmi_pack_inventory_raw", "INSERT") == [None]
-    assert _settings("publisher_lease` (term", "INSERT") == [None] * 2
+    assert _settings("publisher_lease` (term", "INSERT") == [None] * 3
 
 
 def test_the_fenced_release_resolves_the_head_with_sequential_consistency():
@@ -629,6 +650,63 @@ def test_clickhouse_catalog_queries_committed_pack_ids_in_one_batch():
 
     assert found == set(client.committed)
     assert "IN %(identities)s" in client.calls[0][0]
+
+
+def _rendered_bytes(name: str, value) -> int:
+    from clickhouse_driver.util.escape import escape_params
+
+    rendered = escape_params({name: value}, {"strings_as_bytes": False})[name]
+    return len(rendered.encode("utf-8"))
+
+
+def test_committed_pack_queries_are_chunked_by_rendered_size():
+    client = _Client()
+    writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    store_id = "s" * 255
+    identities = [(store_id, str(UUID(int=value))) for value in range(1, 1001)]
+
+    writer.committed_pack_ids(identities)
+
+    chunks = [
+        params["identities"]
+        for query, params, _ in client.calls
+        if "IN %(identities)s" in query
+    ]
+    assert len(chunks) > 1
+    assert max(_rendered_bytes("identities", chunk) for chunk in chunks) <= 192 * 1024
+
+
+def test_manifest_inserts_are_chunked_by_rendered_size():
+    client = _Client()
+    writer = _leased(client)
+    store_id = "s" * 255
+    refs = [
+        PackRef(
+            str(UUID(int=value)),
+            store_id,
+            f"packs/{value}.dmi-pack",
+            1,
+            "checksum",
+            1,
+        )
+        for value in range(1, 1001)
+    ]
+
+    writer.publish_snapshot(
+        index_version=1,
+        refs=refs,
+        published_at_ns=1,
+        indexed_rows=1000,
+        indexed_packs=1000,
+    )
+
+    chunks = [
+        params["members"]
+        for query, params, _ in client.calls
+        if query.startswith("INSERT") and "dmi_snapshot_manifest" in query
+    ]
+    assert len(chunks) > 1
+    assert max(_rendered_bytes("members", chunk) for chunk in chunks) <= 192 * 1024
 
 
 @pytest.mark.parametrize("name", ["bad-name", "x; DROP TABLE y", "`quoted`"])
@@ -1003,14 +1081,13 @@ def test_an_unstamped_install_with_an_empty_manifest_is_still_refused():
     client = _Client(
         tables=_CURRENT_OBJECTS,
         schema_version=None,
-        inventory_rows=4,
-        manifest_rows=0,
+        inventory_without_membership=4,
     )
 
     with pytest.raises(CatalogSchemaVersionError) as raised:
         _writer(client).ensure_schema()
 
-    assert "empty but reports success" in str(raised.value)
+    assert "remain invisible" in str(raised.value)
 
 
 def test_a_catalog_written_by_a_newer_build_is_refused():
@@ -1055,8 +1132,7 @@ def test_a_stamped_catalog_with_a_dropped_view_recreates_it():
     client = _Client(
         tables=[name for name in _CURRENT_OBJECTS if name != "dmi_capture"],
         schema_version=_SCHEMA_VERSION,
-        inventory_rows=4,
-        manifest_rows=2,
+        inventory_without_membership=0,
     )
 
     _writer(client).ensure_schema()
@@ -1094,7 +1170,9 @@ def test_a_populated_inventory_with_an_empty_manifest_is_refused():
     indexing pass over them reports success.
     """
     client = _Client(
-        tables=_CURRENT_OBJECTS, schema_version=_SCHEMA_VERSION, inventory_rows=4, manifest_rows=0
+        tables=_CURRENT_OBJECTS,
+        schema_version=_SCHEMA_VERSION,
+        inventory_without_membership=4,
     )
 
     with pytest.raises(CatalogSchemaVersionError) as raised:
@@ -1102,28 +1180,32 @@ def test_a_populated_inventory_with_an_empty_manifest_is_refused():
 
     message = str(raised.value)
     assert "dmi_pack_inventory_raw" in message and "dmi_snapshot_manifest" in message
-    assert "empty but reports success" in message
+    assert "remain invisible" in message
 
 
-@pytest.mark.parametrize(
-    "inventory_rows, manifest_rows",
-    [(4, 2), (0, 0)],
-    ids=["populated", "empty"],
-)
-def test_a_catalog_at_this_builds_version_is_accepted(inventory_rows, manifest_rows):
+def test_partial_membership_loss_is_refused():
+    client = _Client(
+        tables=_CURRENT_OBJECTS,
+        schema_version=_SCHEMA_VERSION,
+        inventory_without_membership=1,
+    )
+
+    with pytest.raises(CatalogSchemaVersionError, match="report success"):
+        _writer(client).ensure_schema()
+
+
+def test_a_catalog_at_this_builds_version_is_accepted():
     """Nothing indexed yet is not the same state as membership gone missing.
 
-    Both of these used to assert only that SOME `CREATE OR REPLACE VIEW` was
-    issued, which `ensure_schema` does on every call -- so they said "it did
-    not raise" and nothing else. What they are for is that the full DDL runs
-    and the stamp is rewritten, idempotently, over a catalog already at this
-    version.
+    This used to assert only that SOME `CREATE OR REPLACE VIEW` was issued,
+    which `ensure_schema` does on every call. What it is for is that the full
+    DDL runs and the stamp is rewritten, idempotently, over a catalog already
+    at this version.
     """
     client = _Client(
         tables=_CURRENT_OBJECTS,
         schema_version=_SCHEMA_VERSION,
-        inventory_rows=inventory_rows,
-        manifest_rows=manifest_rows,
+        inventory_without_membership=0,
     )
 
     _writer(client).ensure_schema()

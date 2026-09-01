@@ -739,7 +739,7 @@ def test_a_rebuild_that_keeps_the_inventory_is_refused_before_it_empties_the_cat
 
         with pytest.raises(CatalogSchemaVersionError) as raised:
             writer.ensure_schema()
-        assert "empty but reports success" in str(raised.value)
+        assert "remain invisible" in str(raised.value)
 
         # The damage the refusal prevents, demonstrated rather than asserted
         # from the design: an indexing pass over this state succeeds and hides

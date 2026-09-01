@@ -161,6 +161,7 @@ class _Client:
         self.claims: list[tuple[int, str]] = []
         self.watermarks: list[int] = []
         self.publishes: list[tuple[int, str]] = []
+        self.manifest: list[tuple[int, str, str, str]] = []
         self.lease = FakeLeaseTable()
 
     def execute(self, query, params=None, **kwargs):
@@ -172,6 +173,17 @@ class _Client:
             self.published.append((query, params))
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
+            elif "snapshot_manifest" in query:
+                if self.lease.fence_admits(query, params):
+                    self.manifest.extend(
+                        (
+                            params["index_version"],
+                            params["publish_id"],
+                            store_id,
+                            pack_id,
+                        )
+                        for store_id, pack_id in params["members"]
+                    )
             elif "index_watermark" in query:
                 version = params["index_version"]
                 # The fence check runs UNCONDITIONALLY: short-circuited behind
@@ -188,6 +200,16 @@ class _Client:
                 for version, publish_id in self.publishes
                 if version == params["version"]
             ]
+        if "snapshot_manifest" in query and "SELECT count()" in query:
+            wanted = set(params["members"])
+            found = {
+                (store_id, pack_id)
+                for version, publish_id, store_id, pack_id in self.manifest
+                if version == params["index_version"]
+                and publish_id == params["publish_id"]
+                and (store_id, pack_id) in wanted
+            }
+            return [(len(found),)]
         # The version allocator's three queries need real state to answer.
         if "version_claims" in query:
             if "max(version)" in query:
@@ -216,9 +238,9 @@ def test_a_pack_is_never_both_skipped_on_replay_and_invisible_to_readers(
 
     backing = _Client()
     # index() inserts: version claim, descriptors, lease renewal, manifest,
-    # watermark, then the inventory. Fail the last one -- the crash this
-    # ordering exists for. The lease claim below is insert 1.
-    client = FaultyClickHouseClient(backing, insert=fail_on(7))
+    # another renewal, watermark, then the inventory. Fail the last one -- the
+    # crash this ordering exists for. The lease claim below is insert 1.
+    client = FaultyClickHouseClient(backing, insert=fail_on(8))
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
     writer.acquire_publisher_lease("indexer-a")
 

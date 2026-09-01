@@ -473,17 +473,22 @@ renewal with a message naming the actual holder -- so this is a statement about
 the client objects rather than about safety.
 
 `publish_timeout_ns` caps each publish statement's `max_execution_time` and must
-be below `lease_ttl_ns`. The gap between them is what keeps a publish statement
-from still running when its own lease becomes takeable. `max_execution_time` is
-in **seconds**, so the writer requires `publish_timeout_ns` to be a whole number
+be below `lease_ttl_ns`. The writer renews before every fenced statement, and
+each fence requires more than that timeout of lease life remaining. A later
+manifest chunk or watermark therefore cannot start near the end of an earlier
+renewal. Each manifest chunk is read back before proceeding, so a conditional
+INSERT that wrote zero rows cannot be followed by the watermark.
+`max_execution_time` is in
+**seconds**, so the writer requires `publish_timeout_ns` to be a whole number
 of seconds and sends the integer -- a fractional value can truncate to 0 on
-older serialization paths, which the server reads as *no* limit; and it caps
-each statement individually, not the pair, so it does not bound the client round
-trip between them.
+older serialization paths, which the server reads as *no* limit. The cap is per
+statement, not the pair, so it does not bound the client round trip between
+them.
 
-Cost: `publish_snapshot` goes from 6.7 ms to 15.2 ms and a 16-pack, 4096-row
-`index()` pass from 160 ms to 173 ms (+8%), measured on 25.12. It is paid once
-per indexing call rather than per pack or per row. The read path is unchanged.
+The earlier one-renewal implementation measured 15.2 ms for a 16-pack publish
+and 173 ms for the full 4096-row indexing pass on 25.12. The current protocol
+adds one renewal and one manifest verification per chunk, so those figures are
+no longer representative and need remeasurement. The read path is unchanged.
 
 What this does **not** close is written up in
 docs/catalog-descriptor-key.md, "The fenced publisher lease", with the
@@ -575,7 +580,7 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 | stamped at any other version | refuse -- a newer writer owns this catalog, or an older one this build cannot upgrade |
 | a TABLE missing | refuse -- partially dropped |
 | a VIEW missing | recreate it; a view is a projection of the tables and holds no rows |
-| pack inventory populated, snapshot manifest empty | refuse -- membership is gone |
+| any pack inventory identity lacks effective published manifest membership | refuse -- membership is incomplete |
 
 **An empty stamp narrows the version; it does not excuse anything else.** The
 last three rows apply whether or not `{prefix}_schema_version` holds a row.
@@ -665,9 +670,9 @@ step 5 skips all of them, writes no descriptors, publishes nothing at all,
 and returns an `IndexResult` with no failures -- a rebuild that reports success
 and produces an empty catalog, while the captures stay durable in object
 storage and unreachable through every reader. That state is why the last row of
-the table above exists: an inventory with rows beside an empty manifest is
-refused at `ensure_schema`, which is the earliest point at which anything can
-still see the mistake.
+the table above exists: any inventory identity without effective manifest
+membership is refused at `ensure_schema`, which is the earliest point at which
+anything can still see the mistake.
 
 The check lives there rather than in `CatalogReconciler` deliberately.
 `rebuild()` is also the periodic full sweep of a healthy catalog -- it is

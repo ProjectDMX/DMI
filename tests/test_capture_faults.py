@@ -212,6 +212,7 @@ class _Client:
         self.inserted: list[tuple[str, list]] = []
         self.claims: list[tuple[int, str]] = []
         self.watermarks: list[tuple[int, str]] = []
+        self.manifest: list[tuple[int, str, str, str]] = []
         self.lease = FakeLeaseTable()
 
     def execute(self, query, params=None, **kwargs):
@@ -222,6 +223,17 @@ class _Client:
             self.inserted.append((query, list(params or [])))
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
+            elif "snapshot_manifest" in query:
+                if self.lease.fence_admits(query, params):
+                    self.manifest.extend(
+                        (
+                            params["index_version"],
+                            params["publish_id"],
+                            store_id,
+                            pack_id,
+                        )
+                        for store_id, pack_id in params["members"]
+                    )
             elif "index_watermark" in query:
                 # The publish barrier is server-side, so the fake enforces it:
                 # a version lands only strictly above the published head, and
@@ -247,6 +259,16 @@ class _Client:
                 for version, publish_id in self.watermarks
                 if version == params["version"]
             ]
+        if "snapshot_manifest" in query and "SELECT count()" in query:
+            wanted = set(params["members"])
+            found = {
+                (store_id, pack_id)
+                for version, publish_id, store_id, pack_id in self.manifest
+                if version == params["index_version"]
+                and publish_id == params["publish_id"]
+                and (store_id, pack_id) in wanted
+            }
+            return [(len(found),)]
         if "index_watermark" in query:
             return [(max((v for v, _ in self.watermarks), default=None),)]
         return []
@@ -317,20 +339,20 @@ def test_a_transient_outage_is_survivable_by_retrying_the_batch(tmp_path: Path):
     inner = FilesystemPackStore(tmp_path, store_id="local")
     ref = inner.put(_sealed(_record("capture-a")), "packs/a.dmi-pack")
     backing = _Client()
-    # Inserts 1-5 are the lease claim, version claim, descriptor batch, lease
-    # renewal and manifest rows; 6 is the watermark INSERT. The outage strikes
-    # THERE, mid-publish, so real partial state is at stake: descriptors and
+    # Inserts 1-6 are the lease claim, version claim, descriptor batch, lease
+    # renewal, manifest rows and the next renewal; 7 is the watermark INSERT.
+    # The outage strikes THERE, mid-publish, so real partial state is at stake:
     # membership rows are already durable, but no publish admits them and the
     # pack is uncommitted. (This used to fail insert 1 -- the lease claim, made
     # before index() runs at all -- so "nothing was committed" was trivially
     # true and the replay property was never exercised.)
-    client = FaultyClickHouseClient(backing, insert=fail_on(6))
+    client = FaultyClickHouseClient(backing, insert=fail_on(7))
     indexer = _indexer(inner, client)
 
     with pytest.raises(FaultInjected):
         indexer.index([ref])
 
-    assert client.call_counts.get("insert") == 6, (
+    assert client.call_counts.get("insert") == 7, (
         "the outage must strike the watermark INSERT, not the setup path"
     )
 

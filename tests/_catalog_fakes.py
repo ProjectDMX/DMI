@@ -58,7 +58,8 @@ _FENCE = re.compile(
     r"SELECT lease_id, expires_at_ns FROM `[^`]+`\.`[^`]+_publisher_lease` "
     r"ORDER BY term DESC, lease_id DESC LIMIT 1"
     r"\) WHERE lease_id = toUUID\(%\(lease_id\)s\) "
-    r"AND expires_at_ns > toUnixTimestamp64Nano\(now64\(9\)\)\) = 1"
+    r"AND expires_at_ns > toUInt64\(toUnixTimestamp64Nano\(now64\(9\)\)\) "
+    r"\+ toUInt64\(%\(publish_timeout_ns\)s\)\) = 1"
 )
 
 _LIMIT = re.compile(r"\bLIMIT\s+(\d+)")
@@ -124,7 +125,7 @@ class FakeLeaseTable:
         top = max(term for term, *_ in self.rows)
         return [row for row in self.rows if row[0] == top]
 
-    def fence_passes(self, lease_id: object) -> bool:
+    def fence_passes(self, lease_id: object, publish_timeout_ns: int = 0) -> bool:
         """The fencing predicate over the model, ignoring any statement."""
         if self.on_fence is not None:
             self.on_fence(lease_id)
@@ -136,7 +137,10 @@ class FakeLeaseTable:
         _, resolved, _, _, expires_at_ns = max(
             head, key=lambda row: uuid_order(row[1])
         )
-        return resolved == lease_id and expires_at_ns > self.now_ns
+        return (
+            resolved == lease_id
+            and expires_at_ns > self.now_ns + publish_timeout_ns
+        )
 
     def fence_admits(self, statement: str, params) -> bool:
         """Evaluate the fence THIS STATEMENT carries.
@@ -187,7 +191,9 @@ class FakeLeaseTable:
                 "statement would land rows for a publisher the fence refuses.\n"
                 f"statement: {statement}"
             )
-        return self.fence_passes(params["lease_id"])
+        return self.fence_passes(
+            params["lease_id"], params["publish_timeout_ns"]
+        )
 
     # -- the client interface -----------------------------------------------
 
