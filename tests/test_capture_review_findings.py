@@ -174,9 +174,11 @@ class _Client:
                 self.claims.extend((row[0], str(row[1])) for row in params)
             elif "index_watermark" in query:
                 version = params["index_version"]
-                if version > max(self.watermarks, default=0) and (
-                    self.lease.fence_admits(query, params)
-                ):
+                # The fence check runs UNCONDITIONALLY: short-circuited behind
+                # the barrier, a statement missing the fence would slip by
+                # whenever the barrier already refused it.
+                fenced = self.lease.fence_admits(query, params)
+                if fenced and version > max(self.watermarks, default=0):
                     self.watermarks.append(version)
                     self.publishes.append((version, params["publish_id"]))
             return []

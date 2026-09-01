@@ -83,11 +83,12 @@ class _CatalogServer:
             elif "index_watermark" in query:
                 # The conditional publish, enforced: a version lands only when
                 # it is strictly above the published head AND this publisher
-                # still holds the lease.
+                # still holds the lease. The fence check runs UNCONDITIONALLY
+                # -- short-circuited behind the barrier, a statement missing
+                # the fence would slip by whenever the barrier refused it.
                 version = int(params["index_version"])
-                if version > max(self.watermarks, default=0) and (
-                    self.lease.fence_admits(query, params)
-                ):
+                fenced = self.lease.fence_admits(query, params)
+                if fenced and version > max(self.watermarks, default=0):
                     self.watermarks.append(version)
                     self.publishes.append((version, params["publish_id"]))
             return []
@@ -477,6 +478,14 @@ def test_the_fake_matches_the_fence_the_writer_actually_emits():
         FakeLeaseTable().fence_admits(
             "INSERT INTO `default`.`dmi_index_watermark` SELECT 1 FROM "
             "system.one WHERE 1 = 1",
+            {"lease_id": "irrelevant"},
+        )
+    # So is a fence whose TEXT is intact but which no longer gates the write:
+    # a weakening AROUND the fence must fail the same way as its absence.
+    with pytest.raises(MissingLeaseFence, match="top-level AND conjunct"):
+        FakeLeaseTable().fence_admits(
+            "INSERT INTO `default`.`dmi_index_watermark` SELECT 1 FROM "
+            "system.one WHERE " + writer._lease_fence() + " OR 1 = 1",
             {"lease_id": "irrelevant"},
         )
 

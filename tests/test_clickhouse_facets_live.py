@@ -23,21 +23,11 @@ from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS, _FACET_COLU
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
 
 
-def _publish(writer, index_version: int, *, refs=(), rows: int = 0) -> None:
-    """Publishing is a separate step; CatalogIndexer does it, direct writes must.
-
-    Membership rides on the publish now, so `refs` is what makes those packs
-    visible; commit_packs only records the replay guard.
-    """
-    writer.publish_snapshot(
-        index_version=index_version,
-        refs=list(refs),
-        published_at_ns=index_version,
-        indexed_rows=rows,
-        indexed_packs=len(refs),
-    )
-
-
+# This suite never publishes, deliberately: the facet columns are MATERIALIZED
+# on the RAW descriptor table and are asserted there, so nothing here needs a
+# snapshot to be visible -- or the publisher lease a publish would require,
+# which is why the fixture does not acquire one. A test that needs published
+# rows belongs in test_clickhouse_reader_live.py, whose fixture holds a lease.
 @contextmanager
 def _writer():
     clickhouse_driver = pytest.importorskip("clickhouse_driver")

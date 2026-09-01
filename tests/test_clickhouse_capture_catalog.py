@@ -155,11 +155,12 @@ class _Client:
             elif "index_watermark" in query:
                 # The barrier and the fence are server-side conditions, so the
                 # fake has to enforce them or every publish test would pass
-                # vacuously.
+                # vacuously. The fence check runs UNCONDITIONALLY --
+                # short-circuited behind the barrier, a statement missing the
+                # fence would slip by whenever the barrier refused it.
                 version = params["index_version"]
-                if version > max(self.watermarks, default=0) and (
-                    self.lease.fence_admits(query, params)
-                ):
+                fenced = self.lease.fence_admits(query, params)
+                if fenced and version > max(self.watermarks, default=0):
                     self.watermarks.append(version)
                     self.publishes.append((version, params["publish_id"]))
             return []

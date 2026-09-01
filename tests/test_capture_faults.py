@@ -23,7 +23,6 @@ from tests._faults import (
     FaultyPackStore,
     duplicate_on,
     fail_on,
-    fail_then_succeed,
     truncate_on,
 )
 
@@ -227,10 +226,14 @@ class _Client:
                 # The publish barrier is server-side, so the fake enforces it:
                 # a version lands only strictly above the published head, and
                 # the row carries the identity the publisher will read back.
+                # The fence check runs UNCONDITIONALLY -- short-circuited
+                # behind the barrier, a statement missing the fence would slip
+                # by whenever the barrier refused it.
                 version = params["index_version"]
-                if version > max(
+                fenced = self.lease.fence_admits(query, params)
+                if fenced and version > max(
                     (v for v, _ in self.watermarks), default=0
-                ) and self.lease.fence_admits(query, params):
+                ):
                     self.watermarks.append((version, params["publish_id"]))
             return []
         if "version_claims" in query:
@@ -314,14 +317,35 @@ def test_a_transient_outage_is_survivable_by_retrying_the_batch(tmp_path: Path):
     inner = FilesystemPackStore(tmp_path, store_id="local")
     ref = inner.put(_sealed(_record("capture-a")), "packs/a.dmi-pack")
     backing = _Client()
-    client = FaultyClickHouseClient(backing, insert=fail_then_succeed(1))
+    # Inserts 1-5 are the lease claim, version claim, descriptor batch, lease
+    # renewal and manifest rows; 6 is the watermark INSERT. The outage strikes
+    # THERE, mid-publish, so real partial state is at stake: descriptors and
+    # membership rows are already durable, but no publish admits them and the
+    # pack is uncommitted. (This used to fail insert 1 -- the lease claim, made
+    # before index() runs at all -- so "nothing was committed" was trivially
+    # true and the replay property was never exercised.)
+    client = FaultyClickHouseClient(backing, insert=fail_on(6))
+    indexer = _indexer(inner, client)
 
     with pytest.raises(FaultInjected):
-        _indexer(inner, client).index([ref])
+        indexer.index([ref])
 
-    # Nothing was committed, so the identical call now succeeds -- indexing is
-    # replayable rather than requiring manual repair.
-    result = _indexer(inner, client).index([ref])
+    assert client.call_counts.get("insert") == 6, (
+        "the outage must strike the watermark INSERT, not the setup path"
+    )
+
+    # The pack was never committed, so the identical call re-reads it and
+    # converges -- indexing is replayable rather than requiring manual repair.
+    result = indexer.index([ref])
 
     assert result.indexed_packs == 1
     assert result.failed_packs == 0
+    # The partial state was real: the first attempt's descriptors were durable
+    # when it died, the retry wrote them again at its own version, and the
+    # pack entered the replay inventory exactly once.
+    descriptor_inserts = [q for q, _ in backing.inserted if "capture_raw" in q]
+    assert len(descriptor_inserts) == 2
+    inventory_inserts = [
+        q for q, _ in backing.inserted if "pack_inventory_raw" in q
+    ]
+    assert len(inventory_inserts) == 1

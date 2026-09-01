@@ -35,6 +35,16 @@ class MissingLeaseFence(AssertionError):
     """A statement that has to carry the lease fence was issued without it."""
 
 
+class ClientComputedClock(AssertionError):
+    """A lease row shipped timestamps the SERVER was supposed to compute.
+
+    Both lease timestamps come from the server's clock inside the writing
+    statement, so no publisher's wall clock -- or the skew between two of them
+    -- decides when a lease expires. A statement that carries them as client
+    parameters has lost that property, however correct the values look.
+    """
+
+
 # The predicate `ClickHouseCatalogWriter._lease_fence()` emits, as a pattern.
 # Everything the fence DOES is matched exactly; only the table name is loose,
 # because each suite runs under its own prefix. Exactness is the point: the
@@ -136,8 +146,18 @@ class FakeLeaseTable:
         uses it, so a fake that keyed on it enforced the fence on the writer's
         behalf: deleting `_lease_fence()` from the source left every CPU test
         passing, which is the one thing these fakes must never do.
+
+        The fence has to GATE the write, not merely appear in it, so beyond
+        the text being present this requires it to stand as the final
+        top-level AND conjunct of the WHERE clause: preceded by WHERE or AND,
+        followed by nothing, with no OR/NOT in the clause ahead of it. That is
+        a heuristic, not a SQL parser -- but it is exactly the shape both real
+        statements have, and it refuses the cheap weakenings (`... OR 1`,
+        `NOT (fence)`, a trailing `OR` clause) that would leave intact fence
+        TEXT deciding nothing.
         """
-        if _FENCE.search(statement) is None:
+        match = _FENCE.search(statement)
+        if match is None:
             raise MissingLeaseFence(
                 "a statement that must be fenced on the publisher lease was "
                 "issued without the fence. Only the lease holder may make a "
@@ -145,6 +165,26 @@ class FakeLeaseTable:
                 "statement that writes -- a publisher fenced out after the "
                 "write has already made it durable is the failure mode this "
                 "design has rejected twice.\n"
+                f"statement: {statement}"
+            )
+        prefix = statement[: match.start()].rstrip()
+        suffix = statement[match.end() :].strip()
+        # The outer WHERE clause ahead of the fence. The fence's own nested
+        # WHERE sits inside the matched span, so it cannot be picked up here.
+        where = prefix.rfind("WHERE")
+        clause = prefix[where:] if where != -1 else prefix
+        if (
+            suffix
+            or not prefix.endswith(("WHERE", "AND"))
+            or " OR " in clause
+            or " NOT " in clause
+            or "NOT(" in clause
+        ):
+            raise MissingLeaseFence(
+                "the lease fence must be the final top-level AND conjunct of "
+                "the WHERE clause. Wrapped in OR/NOT or followed by further "
+                "clauses, an intact fence no longer gates the write, and the "
+                "statement would land rows for a publisher the fence refuses.\n"
                 f"statement: {statement}"
             )
         return self.fence_passes(params["lease_id"])
@@ -194,6 +234,21 @@ class FakeLeaseTable:
                             )
                         )
                 return []
+            # The claim INSERT. Its timestamps are modelled off the fake's
+            # clock, which is only honest while the real statement computes
+            # them SERVER-side -- so, as with the fence, that is read off the
+            # statement rather than assumed.
+            if "toUnixTimestamp64Nano(now64(9))" not in statement or not {
+                "acquired_at_ns", "expires_at_ns", "now_ns"
+            }.isdisjoint(params):
+                raise ClientComputedClock(
+                    "a lease claim must compute acquired_at_ns/expires_at_ns "
+                    "on the SERVER, inside the INSERT ... SELECT "
+                    "(toUnixTimestamp64Nano(now64(9))); shipping them as "
+                    "client parameters lets a publisher's own clock decide "
+                    "when its lease expires.\n"
+                    f"statement: {statement}"
+                )
             self.rows.append(
                 (
                     int(params["term"]),
