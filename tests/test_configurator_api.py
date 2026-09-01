@@ -254,3 +254,137 @@ class TestServerState:
         state = build_state(DENSE, tmp_path / "not-created-yet.yaml")
         assert state.initial_config is None
         assert state.save_path == tmp_path / "not-created-yet.yaml"
+
+
+# ---------------------------------------------------------------------------
+# POST /api/estimate
+# ---------------------------------------------------------------------------
+
+
+def _estimate(client, config=None, **body):
+    request = {"config": config or VALID_CONFIG}
+    request.update(body)
+    return client.post("/api/estimate", json=request)
+
+
+def test_estimate_returns_a_peak_step_and_the_rank_that_carries_it():
+    with TestClient(create_app(DENSE)) as client:
+        response = _estimate(client)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["peak_step_bytes"] > 0
+    assert body["peak_step_rank"] == "pp0/tp0"
+    assert body["assumptions"]
+
+
+def test_estimate_defaults_the_workload_when_none_is_given():
+    with TestClient(create_app(DENSE)) as client:
+        response = _estimate(client)
+
+    assert response.status_code == 200
+    assert response.json()["peak_step_bytes"] > 0
+
+
+def test_estimate_honours_a_supplied_workload():
+    with TestClient(create_app(DENSE)) as client:
+        short = _estimate(client, workload={"prompt_tokens": 128}).json()
+        long = _estimate(client, workload={"prompt_tokens": 4096}).json()
+
+    assert long["peak_step_bytes"] > short["peak_step_bytes"]
+
+
+def test_estimate_reports_every_rank_under_tensor_parallelism():
+    with TestClient(create_app(DENSE)) as client:
+        body = _estimate(client, workload={"tensor_parallel_size": 4}).json()
+
+    labels = {rank["label"] for rank in body["ranks"]}
+    assert labels == {"pp0/tp0", "pp0/tp1"}
+    by_label = {rank["label"]: rank for rank in body["ranks"]}
+    assert (
+        by_label["pp0/tp0"]["prefill_step_bytes"]
+        >= by_label["pp0/tp1"]["prefill_step_bytes"]
+    )
+
+
+def test_estimate_rejects_an_invalid_workload():
+    with TestClient(create_app(DENSE)) as client:
+        response = _estimate(client, workload={"batch_size": 0})
+
+    assert response.status_code == 400
+    assert "Invalid workload" in response.json()["detail"]
+
+
+def test_estimate_rejects_an_unknown_dtype():
+    with TestClient(create_app(DENSE)) as client:
+        response = _estimate(client, workload={"dtype": "float13"})
+
+    assert response.status_code == 400
+    assert "Unknown dtype" in response.json()["detail"]
+
+
+def test_estimate_rejects_a_malformed_body():
+    with TestClient(create_app(DENSE)) as client:
+        response = client.post("/api/estimate", json={"nope": 1})
+
+    assert response.status_code == 400
+
+
+def test_estimate_omits_ring_fit_when_no_ring_size_is_given():
+    with TestClient(create_app(DENSE)) as client:
+        body = _estimate(client).json()
+
+    assert "ring_fit" not in body
+
+
+def test_estimate_includes_ring_fit_when_a_ring_size_is_given():
+    with TestClient(create_app(DENSE)) as client:
+        body = _estimate(
+            client, ring={"payload_bytes": 4096 * 1024 * 1024}
+        ).json()
+
+    assert body["ring_fit"]["fits"] is True
+    assert body["ring_fit"]["occupancy_percent"] >= 0
+
+
+def test_estimate_flags_a_step_that_will_not_fit_the_ring():
+    with TestClient(create_app(DENSE)) as client:
+        body = _estimate(client, ring={"payload_bytes": 1024}).json()
+
+    assert body["ring_fit"]["fits"] is False
+    assert "STEP_OVERSIZED" in body["ring_fit"]["detail"]
+
+
+def test_estimate_uses_the_smaller_of_payload_and_pinned():
+    with TestClient(create_app(DENSE)) as client:
+        body = _estimate(
+            client,
+            ring={
+                "payload_bytes": 4096 * 1024 * 1024,
+                "pinned_bytes": 64 * 1024 * 1024,
+            },
+        ).json()
+
+    assert body["ring_fit"]["effective_bytes"] == 64 * 1024 * 1024
+
+
+def test_estimate_rejects_a_zero_ring_size():
+    with TestClient(create_app(DENSE)) as client:
+        response = _estimate(client, ring={"payload_bytes": -5})
+
+    assert response.status_code == 400
+
+
+def test_estimate_matches_the_library_for_the_same_inputs():
+    """The UI must not be able to disagree with the Python API."""
+    from dmi.configuration import Workload, estimate_config, load_descriptor
+
+    descriptor = load_descriptor(DENSE)
+    config = parse_config(VALID_CONFIG)
+    direct = estimate_config(config, descriptor, Workload(prompt_tokens=512))
+
+    with TestClient(create_app(DENSE)) as client:
+        body = _estimate(client, workload={"prompt_tokens": 512}).json()
+
+    assert body["peak_step_bytes"] == direct.peak_step_bytes
+    assert body["decode_step_bytes"] == direct.decode_step_bytes

@@ -84,4 +84,38 @@ def compile_config(config: DMIConfig, model_context: ModelContext) -> CompiledDM
     )
 
 
-__all__ = ["ModelContext", "CompiledDMIConfig", "compile_config"]
+def attach_config(adapter, model, config: DMIConfig) -> None:
+    """Install hooks on ``model`` according to ``config``.
+
+    This is the *executing* counterpart to :func:`compile_config`. The two are
+    deliberately different operations on the same configuration:
+
+    ``compile_config``
+        Answers "what would this configuration select?" without touching the
+        model. Pure, rank-agnostic, and safe to call while authoring -- which
+        is why it skips PP/TP filtering.
+
+    ``attach_config``
+        Actually installs the hooks, through the adapter's own
+        ``attach_model``. That path additionally applies the PP/TP filters and
+        establishes the enabled/disabled state across *every* spec, so it --
+        not a pre-filtered spec list -- has to own selection.
+
+    Handing ``attach_model`` a spec list from ``compile_config`` would look
+    tempting and be wrong: ``HookPoint.enabled`` defaults to ``True``, and only
+    ``apply_hook_selection`` walks the unselected specs to turn them off. A
+    pre-filtered list would leave every deselected hook live.
+    """
+    adapter.attach_model(
+        model,
+        to_legacy_hook_selection(config.observations),
+        layers=config.observations.layers,
+    )
+
+
+__all__ = [
+    "ModelContext",
+    "CompiledDMIConfig",
+    "compile_config",
+    "attach_config",
+]

@@ -1,6 +1,10 @@
 # Optimization policy capture plan: design review
 
-Status: Review of a proposed design; no implementation accepted
+Status: Review of a proposed design; no policy implementation accepted
+
+Baseline: verified against `main` at `cb4e490`. See the addendum at the end for
+what `feat/dmi-configurator` -- merged into this branch after the review was
+written -- already resolves.
 
 This document reviews a proposed design that would make optimization policy a
 first-class part of the capture plan. The proposal introduces user-facing
@@ -245,3 +249,54 @@ Ship **Balanced** and **Custom** first. Hold **Fastest** until `drop` exists —
 it currently promises "never blocks" over a transport that only blocks. Hold
 **Complete** until accounting exists, not until backpressure exists; the
 backpressure is already there.
+
+---
+
+## Addendum: status on this branch
+
+The findings above were verified against `main`. `feat/dmi-configurator` has
+since been merged into this branch, and it already resolves several of them.
+The record above is left as written, because it reviews a proposal that
+targeted `main`; this addendum states what is no longer true.
+
+### Resolved by the configurator
+
+| Review point | Status on this branch |
+|---|---|
+| "No model manifest exists" | Resolved. `ModelDescriptor` + `dmi describe-model`. |
+| "No YAML configuration in the repository" | Resolved. `dmi.configuration.yaml`, golden fixtures under `tests/golden/`. |
+| "No CLI exists" | Partly resolved. `dmi ui` and `dmi describe-model` ship; `dmi plan …` does not. |
+| Finding 3, per-layer selection | Partly resolved. Inclusive layer *ranges* exist and are now applied by the runtime; arbitrary layer *sets* still are not. |
+| MoE hooks grouped as `GROUP_OTHER` | Resolved. `catalog_adapter` layers a presentation grouping over catalog groups. |
+| Availability reasons in the UI | Resolved. Derived from `select_hook_specs`, not reimplemented. |
+
+### Resolved by this branch
+
+**Finding 3, runtime application.** A layer range authored in the configurator
+was previously never applied: `attach_model` had no way to receive it. It now
+takes a keyword `layers` argument and applies `filter_by_layers` between
+`apply_hook_selection` and the PP/TP filters, driven from a `DMIConfig` by
+`dmi.configuration.attach_config`. This closes a silent over-promise -- the
+policy control in the UI was honestly disclaimed, but layer selection, the
+UI's central feature, was not.
+
+**Findings 6 and 7, made usable.** `dmi.configuration.estimate` reports the
+peak single step against `min(payload, pinned)` effective capacity and names
+the worst rank, rather than reporting only a rate or a model-wide average. The
+configurator shows both. It reuses `compute_hook_shape` and `plan_step`'s
+alignment so the estimate cannot drift from what `prepare_step` enforces.
+
+### Unchanged
+
+Every blocking finding that bears on *policy* still stands:
+
+* **Finding 1.** `CaptureSchedule` is still enforced by no shipped adapter. The
+  configurator authors a schedule; nothing applies it. This remains the
+  prerequisite for any policy that claims to change sampling.
+* **Finding 2.** The transport still blocks losslessly and still has no drop
+  path. `block` is the status quo; `drop` and `fail` are the new work.
+* **Findings 4, 5, 8, 9.** Untouched -- they concern the policy module, which
+  is deliberately deferred.
+
+The resequencing above therefore holds, with its first item now half done:
+layer selection is wired, schedule enforcement is not.

@@ -40,12 +40,14 @@ from ..hooks.specs import (
 )
 from ..hooks.selection import (
     apply_hook_selection,
+    filter_by_layers,
     filter_by_pp_rank,
     filter_by_tp_rank,
 )
 from .types import StepContext
 
 if TYPE_CHECKING:
+    from ..configuration.schema import LayerSelection
     from ..engine import MonitoringEngine
 
 
@@ -150,8 +152,30 @@ class BackendAdapter(abc.ABC):
         return False
 
     # --- shared (subclass never overrides) -------------------------------
-    def attach_model(self, model, hook_selection: str = "full") -> None:
-        """Resolve shape, install hooks per the selection + PP/TP filters."""
+    def attach_model(
+        self,
+        model,
+        hook_selection: str = "full",
+        *,
+        layers: Optional["LayerSelection"] = None,
+    ) -> None:
+        """Resolve shape, install hooks per the selection + layer/PP/TP filters.
+
+        ``hook_selection`` decides *which kinds* of observation to capture;
+        ``layers`` decides *where*.  The two are separate because a selection
+        string cannot express a layer range -- see
+        ``dmi.configuration.compatibility``.
+
+        ``layers`` is any object exposing inclusive ``start``/``end`` bounds
+        (``dmi.configuration.schema.LayerSelection``); ``None`` keeps every
+        layer.  Global hooks (``layer_no < 0``) are never layer-restricted, so
+        a range never drops ``final_logits`` or ``token_ids``.
+
+        Layer filtering runs *after* ``apply_hook_selection`` and *before* the
+        PP/TP filters.  Order matters: ``apply_hook_selection`` is what
+        establishes the enabled/disabled state across every spec, and each
+        later filter only ever disables further.
+        """
         if self.transport is None:
             raise RuntimeError(
                 "BackendAdapter.attach_model called before "
@@ -166,6 +190,8 @@ class BackendAdapter(abc.ABC):
 
         specs = model.get_hook_specs()
         specs = apply_hook_selection(specs, hook_selection, cfg=cfg)
+        if layers is not None:
+            specs = filter_by_layers(specs, layers.start, layers.end)
         specs = filter_by_pp_rank(specs, self.is_pp_first(), self.is_pp_last())
         specs = filter_by_tp_rank(specs, tp)
 

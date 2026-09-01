@@ -18,10 +18,14 @@ from ..configuration import (
     ConfigurationError,
     DMIConfig,
     ModelDescriptor,
+    Workload,
     catalog_payload,
+    check_ring_fit,
     resolve_descriptor,
     config_to_dict,
     dump_config,
+    estimate_config,
+    estimate_payload,
     load_config,
     parse_config,
     save_config,
@@ -142,6 +146,47 @@ def create_app(source: str | Path, config_path: Optional[str | Path] = None):
             "valid": not any(issue.is_error for issue in issues),
             "issues": [issue.to_dict() for issue in issues],
         }
+
+    @app.post("/api/estimate")
+    def post_estimate(payload: dict):
+        """Byte estimates for a configuration under a stated workload.
+
+        The workload is supplied per request rather than held in server state:
+        it describes the traffic the capture rides along with, not the capture,
+        so the same configuration legitimately has several answers.
+        """
+        config = _parse(payload)
+        try:
+            workload = Workload(**(payload.get("workload") or {}))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"Invalid workload: {exc}") from exc
+
+        try:
+            estimate = estimate_config(config, state.descriptor, workload)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        body = estimate_payload(estimate)
+
+        ring = payload.get("ring") or {}
+        payload_bytes = ring.get("payload_bytes")
+        if payload_bytes:
+            try:
+                fit = check_ring_fit(
+                    estimate,
+                    int(payload_bytes),
+                    int(ring.get("pinned_bytes") or 0),
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, f"Invalid ring sizes: {exc}") from exc
+            body["ring_fit"] = {
+                "effective_bytes": fit.effective_bytes,
+                "peak_step_bytes": fit.peak_step_bytes,
+                "fits": fit.fits,
+                "occupancy_percent": fit.occupancy_percent,
+                "detail": fit.detail,
+            }
+        return body
 
     @app.post("/api/config/serialize")
     def post_serialize(payload: dict):

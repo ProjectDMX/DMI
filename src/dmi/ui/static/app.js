@@ -15,6 +15,23 @@
   var focusedNode = null;
   var updateTimer = null;
 
+  /* Workload and ring sizes are UI-local on purpose. They describe the
+   * serving traffic and the transport, not the capture, and DMIConfig has no
+   * runtime block -- exposing a subset of RingConfig through the saved YAML
+   * would imply a support contract that does not exist. */
+  var workload = {
+    batch_size: 8,
+    prompt_tokens: 2048,
+    decode_tokens: 256,
+    decode_steps_per_second: 0,
+    tensor_parallel_size: 1,
+    pipeline_parallel_size: 1,
+    dtype: "float16",
+    packed: true
+  };
+
+  var ring = { payload_mib: 4096, pinned_mib: 4096 };
+
   var dom = {};
 
   function $(id) { return document.getElementById(id); }
@@ -25,9 +42,37 @@
      "issues", "issue-count", "toast", "file-input", "step-stride",
      "request-stride", "capture-prefill", "capture-decode", "step-offset",
      "warmup-steps", "request-offset", "warmup-requests", "policy",
-     "btn-open", "btn-save", "btn-copy"].forEach(function (id) {
+     "btn-open", "btn-save", "btn-copy",
+     "wl-batch", "wl-prompt", "wl-decode", "wl-rate", "wl-tp", "wl-pp",
+     "wl-dtype", "wl-packed", "ring-payload", "ring-pinned", "ring-meter",
+     "ring-fill", "ring-detail", "est-rank", "est-ranks", "est-ranks-wrap",
+     "est-notes", "fig-peak", "fig-decode", "fig-request", "fig-sustained",
+     "fig-day"].forEach(function (id) {
       dom[id] = $(id);
     });
+  }
+
+  var MIB = 1024 * 1024;
+
+  /* Binary units throughout: DMI sizes its rings in MiB. */
+  function formatBytes(value) {
+    if (value === null || value === undefined) return "—";
+    if (!value) return "0 B";
+    var units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    var scaled = value;
+    var index = 0;
+    while (scaled >= 1024 && index < units.length - 1) {
+      scaled /= 1024;
+      index += 1;
+    }
+    var digits = index === 0 || scaled >= 100 ? 0 : (scaled >= 10 ? 1 : 2);
+    return scaled.toFixed(digits) + " " + units[index];
+  }
+
+  function formatRate(value) {
+    return value === null || value === undefined
+      ? "—"
+      : formatBytes(value) + "/s";
   }
 
   function toast(message) {
@@ -71,6 +116,16 @@
   /* ---------- rendering ---------- */
 
   function renderArchitecture() {
+    // The renderer replaces the whole SVG, which drops keyboard focus. Note
+    // which node held it and put it back, so tabbing to a block and pressing
+    // Enter does not dump the user back at the top of the document.
+    var active = document.activeElement;
+    var refocus =
+      active && dom.architecture.contains(active)
+        ? active.closest("[data-node-id]")
+        : null;
+    var refocusId = refocus ? refocus.dataset.nodeId : null;
+
     DMIArchitecture.render(dom.architecture, layout, {
       selected: selectedHooks(),
       focused: focusedNode,
@@ -80,6 +135,13 @@
         renderDetail();
       }
     });
+
+    if (refocusId) {
+      var restored = dom.architecture.querySelector(
+        '[data-node-id="' + refocusId + '"]'
+      );
+      if (restored) restored.focus();
+    }
   }
 
   function findNode(nodeId) {
@@ -194,6 +256,110 @@
     dom["warmup-requests"].value = state.schedule.warmup_requests;
   }
 
+  function renderEstimate(payload) {
+    dom["fig-peak"].textContent = formatBytes(payload.peak_step_bytes);
+    dom["fig-decode"].textContent = formatBytes(payload.decode_step_bytes);
+    dom["fig-request"].textContent = formatBytes(payload.bytes_per_request);
+    dom["fig-sustained"].textContent = formatRate(
+      payload.sustained_bytes_per_second
+    );
+    dom["fig-day"].textContent = formatBytes(payload.bytes_per_day);
+
+    dom["est-rank"].textContent = payload.peak_step_rank
+      ? "peak on " + payload.peak_step_rank
+      : "";
+
+    renderRingFit(payload.ring_fit);
+    renderRanks(payload);
+    renderNotes(payload);
+  }
+
+  function renderRingFit(fit) {
+    if (!fit) {
+      dom["ring-fill"].style.width = "0%";
+      dom["ring-meter"].removeAttribute("data-tone");
+      dom["ring-detail"].textContent = "—";
+      dom["ring-detail"].removeAttribute("data-tone");
+      return;
+    }
+
+    var percent = Math.max(0, Math.min(100, fit.occupancy_percent));
+    dom["ring-fill"].style.width = percent + "%";
+    dom["ring-meter"].setAttribute(
+      "aria-label",
+      "Ring occupancy " + fit.occupancy_percent.toFixed(0) + " percent"
+    );
+
+    var tone = null;
+    if (!fit.fits) tone = "over";
+    else if (fit.occupancy_percent >= 50) tone = "warning";
+
+    if (tone) dom["ring-meter"].dataset.tone = tone;
+    else dom["ring-meter"].removeAttribute("data-tone");
+
+    dom["ring-detail"].textContent = fit.detail;
+    if (fit.fits) dom["ring-detail"].removeAttribute("data-tone");
+    else dom["ring-detail"].dataset.tone = "over";
+  }
+
+  function renderRanks(payload) {
+    var ranks = payload.ranks || [];
+    // One rank is the single-GPU case; the breakdown says nothing extra.
+    var interesting = ranks.length > 1;
+    dom["est-ranks-wrap"].hidden = !interesting;
+    if (!interesting) return;
+
+    var frag = document.createDocumentFragment();
+    ranks.forEach(function (rank) {
+      var row = document.createElement("tr");
+      if (rank.label === payload.peak_step_rank) row.dataset.worst = "true";
+      [
+        rank.label,
+        formatBytes(rank.prefill_step_bytes),
+        formatBytes(rank.decode_step_bytes),
+        String(rank.prefill_hooks)
+      ].forEach(function (value) {
+        var cell = document.createElement("td");
+        cell.textContent = value;
+        row.append(cell);
+      });
+      frag.append(row);
+    });
+    dom["est-ranks"].replaceChildren(frag);
+  }
+
+  function renderNotes(payload) {
+    var frag = document.createDocumentFragment();
+    (payload.warnings || []).forEach(function (message) {
+      frag.append(noteElement(message, "warning"));
+    });
+    (payload.assumptions || []).forEach(function (message) {
+      frag.append(noteElement(message, "assumption"));
+    });
+    dom["est-notes"].replaceChildren(frag);
+  }
+
+  function noteElement(message, kind) {
+    var note = document.createElement("p");
+    note.className = "est-note";
+    note.dataset.kind = kind;
+    var body = document.createElement("span");
+    body.textContent = message;
+    note.append(body);
+    return note;
+  }
+
+  function clearEstimate(message) {
+    ["fig-peak", "fig-decode", "fig-request", "fig-sustained", "fig-day"]
+      .forEach(function (id) { dom[id].textContent = "—"; });
+    dom["est-rank"].textContent = "";
+    dom["est-ranks-wrap"].hidden = true;
+    renderRingFit(null);
+    dom["est-notes"].replaceChildren(
+      noteElement(message, "warning")
+    );
+  }
+
   function renderIssues(issues) {
     var errors = issues.filter(function (i) { return i.severity === "error"; });
     var warnings = issues.filter(function (i) { return i.severity === "warning"; });
@@ -282,6 +448,29 @@
       dom.status.textContent = "Error";
       renderIssues([{ severity: "error", field: "request", message: error.message }]);
     }
+    // Estimated separately: a workload the estimator rejects should not blank
+    // the YAML preview, and an unserializable config should not blank this.
+    refreshEstimate();
+  }
+
+  async function refreshEstimate() {
+    try {
+      var payload = await api("/api/estimate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          config: state,
+          workload: workload,
+          ring: {
+            payload_bytes: ring.payload_mib * MIB,
+            pinned_bytes: ring.pinned_mib * MIB
+          }
+        })
+      });
+      renderEstimate(payload);
+    } catch (error) {
+      clearEstimate("Could not estimate: " + error.message);
+    }
   }
 
   function applyState(next) {
@@ -324,6 +513,51 @@
       state.schedule.capture_decode = dom["capture-decode"].checked;
       scheduleUpdate();
     });
+  }
+
+  function bindWorkload() {
+    var numeric = {
+      "wl-batch": "batch_size",
+      "wl-prompt": "prompt_tokens",
+      "wl-decode": "decode_tokens",
+      "wl-rate": "decode_steps_per_second",
+      "wl-tp": "tensor_parallel_size",
+      "wl-pp": "pipeline_parallel_size"
+    };
+    Object.keys(numeric).forEach(function (id) {
+      dom[id].addEventListener("input", function () {
+        var value = parseInt(dom[id].value, 10);
+        if (Number.isNaN(value)) return;
+        workload[numeric[id]] = value;
+        scheduleEstimate();
+      });
+    });
+
+    dom["wl-dtype"].addEventListener("change", function () {
+      workload.dtype = dom["wl-dtype"].value;
+      scheduleEstimate();
+    });
+    dom["wl-packed"].addEventListener("change", function () {
+      workload.packed = dom["wl-packed"].value === "packed";
+      scheduleEstimate();
+    });
+
+    var ringInputs = { "ring-payload": "payload_mib", "ring-pinned": "pinned_mib" };
+    Object.keys(ringInputs).forEach(function (id) {
+      dom[id].addEventListener("input", function () {
+        var value = parseInt(dom[id].value, 10);
+        if (Number.isNaN(value) || value < 0) return;
+        ring[ringInputs[id]] = value;
+        scheduleEstimate();
+      });
+    });
+  }
+
+  var estimateTimer = null;
+
+  function scheduleEstimate() {
+    clearTimeout(estimateTimer);
+    estimateTimer = setTimeout(refreshEstimate, 140);
   }
 
   function bindLayers() {
@@ -438,6 +672,7 @@
   async function boot() {
     cacheDom();
     bindSchedule();
+    bindWorkload();
     bindLayers();
     bindTabs();
     bindPolicy();
