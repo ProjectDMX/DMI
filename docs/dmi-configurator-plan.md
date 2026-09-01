@@ -6,14 +6,26 @@ Verified against: `cb4e490`
 
 ## Running it
 
+From a checkout, with nothing installed:
+
+```bash
+make ui
+```
+
+This runs the bundled Llama-3-8B descriptor, picks a free port starting at
+8000, and opens a browser once the server is actually accepting connections.
+Override the model with `make ui MODEL=./Qwen3-8B`.
+
+Installed, it is a normal command:
+
 ```bash
 pip install -e ".[ui]"
 dmi ui ./Qwen3-8B
 ```
 
-Then open <http://127.0.0.1:8000>. `dmi ui` takes the model however you have
-it — a model directory, a `config.json`, a Hugging Face model id (needs
-`transformers`), or a DMI descriptor YAML:
+`dmi ui` takes the model however you have it — a model directory, a
+`config.json`, a Hugging Face model id (needs `transformers`), or a DMI
+descriptor YAML:
 
 ```bash
 dmi ui ./Qwen3-8B/config.json
@@ -34,8 +46,12 @@ dmi describe-model ./Qwen3-8B --output qwen3-8b.yaml
 ```
 
 Without an install, `python -m dmi.cli ...` works from a checkout with `src` on
-`PYTHONPATH`. `--host` and `--port` move the bind address; the default is
-loopback only.
+`PYTHONPATH`; that is all `make ui` does.
+
+`--host` and `--port` move the bind address; the default is loopback only. An
+explicit `--port` that is busy fails rather than quietly serving somewhere
+else — only the automatic default walks forward to the next free port.
+`--no-browser` suppresses the browser.
 
 Using the configuration from Python, with no browser involved:
 

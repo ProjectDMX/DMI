@@ -114,6 +114,31 @@ at much lower request rates.
 Full setup, additional results, and how to reproduce:
 [`docs/benchmarks.md`](docs/benchmarks.md).
 
+## Configure a capture visually
+
+DMI-configurator turns a model plus a few clicks into a validated capture
+configuration, and estimates what it will cost before you run anything. From a
+checkout, with no install:
+
+```bash
+make ui
+```
+
+That opens a browser on <http://127.0.0.1:8000>. Point it at your own model
+with `make ui MODEL=./Qwen3-8B`.
+
+Installed, it is a normal command:
+
+```bash
+pip install -e ".[ui]"
+dmi ui ./Qwen3-8B
+```
+
+`dmi ui` accepts a model directory, a `config.json`, a Hugging Face model id,
+or a DMI descriptor YAML, and picks the descriptor out of the current directory
+when there is exactly one. See
+[the configurator plan](docs/dmi-configurator-plan.md) for the design.
+
 ## Get started
 
 Start with the [core installation guide](docs/install.md), then choose the
