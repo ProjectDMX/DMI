@@ -292,11 +292,12 @@ def test_a_taken_over_publisher_writes_nothing_at_all():
     later = _retried_into_a_new_pack(corpus)
 
     # A short lease so the takeover is a real expiry rather than a forced one,
-    # and a publish cap comfortably above a one-row INSERT. The one wall clock
-    # left in this test runs the safe way: the wedge sleeps 250 ms against a
-    # 200 ms TTL, and load only makes the expiry more certain, never less.
+    # and a publish cap comfortably above a one-row INSERT -- the shortest the
+    # whole-second publish cap admits. The one wall clock left in this test
+    # runs the safe way: the wedge sleeps 2.5 s against a 2 s TTL, and load
+    # only makes the expiry more certain, never less.
     with _catalog(
-        lease_ttl_ns=200_000_000, publish_timeout_ns=100_000_000
+        lease_ttl_ns=2_000_000_000, publish_timeout_ns=1_000_000_000
     ) as (writer, reader, client, config):
         version = writer.allocate_version()
         writer.write_descriptors(corpus, index_version=version)
@@ -332,7 +333,7 @@ def test_a_taken_over_publisher_writes_nothing_at_all():
                     # A's renewal has just succeeded by its own reckoning. Wait
                     # out the short lease and let B take it, exactly as a
                     # successor would.
-                    sleep(0.25)
+                    sleep(2.5)
                     successor.acquire_publisher_lease("successor")
                 return rows
 
@@ -407,7 +408,7 @@ def test_a_takeover_between_the_two_publish_statements_leaves_orphan_rows():
     later = _retried_into_a_new_pack(corpus)
 
     with _catalog(
-        lease_ttl_ns=200_000_000, publish_timeout_ns=100_000_000
+        lease_ttl_ns=2_000_000_000, publish_timeout_ns=1_000_000_000
     ) as (writer, reader, client, config):
         version = writer.allocate_version()
         writer.write_descriptors(corpus, index_version=version)
@@ -439,7 +440,7 @@ def test_a_takeover_between_the_two_publish_statements_leaves_orphan_rows():
                     armed.clear()
                     # A's manifest rows are durable. Its lease lapses here and
                     # B takes over before A issues its watermark INSERT.
-                    sleep(0.25)
+                    sleep(2.5)
                     successor.acquire_publisher_lease("successor")
                 return rows
 
@@ -651,9 +652,9 @@ def test_a_lease_is_taken_over_on_expiry_and_given_back_on_release():
     enough to refuse a successor -- so a busy server made it fail with DID NOT
     RAISE, and a correctness test that fails at random gets deleted by whoever
     is unlucky enough to hit it. The leases that must be LIVE now carry the
-    default 30 s TTL; the lease that must be EXPIRED carries one of a
-    microsecond, over by the time its own read-back returns. Neither assertion
-    is racing a deadline any more.
+    default 30 s TTL; the lease that must be EXPIRED carries the shortest TTL
+    the whole-second publish cap admits and is slept PAST, so load only makes
+    its expiry more certain. Neither assertion is racing a deadline.
     """
     corpus = synthetic_descriptors(2)
     tenant = corpus[0].metadata.tenant_id
@@ -663,15 +664,22 @@ def test_a_lease_is_taken_over_on_expiry_and_given_back_on_release():
         with pytest.raises(PublisherLeaseHeldError, match="snapshot-suite"):
             successor.acquire_publisher_lease("successor")
 
-        # A crashed holder leaves a lease that lapses. Reproduced by giving one
-        # a TTL of a microsecond rather than by waiting out a real TTL: the
-        # DURABLE state is identical -- a head row whose expires_at_ns is behind
-        # the server's own clock -- and it is reached without racing anything.
+        # A crashed holder leaves a lease that lapses. Reproduced with the
+        # shortest TTL the whole-second publish cap admits, slept past so the
+        # DURABLE state -- a head row whose expires_at_ns is behind the
+        # server's own clock -- is certain by the time it is read, and load
+        # only makes it more so.
         writer.release_publisher_lease()
         crashed = ClickHouseCatalogWriter(
-            _client(), replace(config, lease_ttl_ns=1_000, publish_timeout_ns=999)
+            _client(),
+            replace(
+                config,
+                lease_ttl_ns=1_100_000_000,
+                publish_timeout_ns=1_000_000_000,
+            ),
         )
         held = crashed.acquire_publisher_lease("crashed")
+        sleep(1.2)
         expires_at_ns, now_ns = client.execute(
             "SELECT expires_at_ns, toUnixTimestamp64Nano(now64(9)) FROM "
             f"`{config.database}`.`{config.table_prefix}_publisher_lease` "
