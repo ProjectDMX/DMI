@@ -436,12 +436,15 @@ def _upstream_catalog_module(tmp_path: Path):
     import ...` resolves, and never written into the package directory.
     """
     root = Path(__file__).resolve().parents[1]
-    shown = subprocess.run(
-        ["git", "show", f"{_UPSTREAM_COMMIT}:{_UPSTREAM_SOURCE}"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        shown = subprocess.run(
+            ["git", "show", f"{_UPSTREAM_COMMIT}:{_UPSTREAM_SOURCE}"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        pytest.skip(f"cannot run git: {error}")
     if shown.returncode != 0:
         pytest.skip(
             f"cannot read {_UPSTREAM_COMMIT} from git: {shown.stderr.strip()}"
@@ -450,6 +453,8 @@ def _upstream_catalog_module(tmp_path: Path):
     source.write_text(shown.stdout)
     name = "dmi.storage.capture._upstream_catalog_fixture"
     spec = importlib.util.spec_from_file_location(name, source)
+    if spec is None or spec.loader is None:
+        pytest.skip("importlib produced no loadable spec for the fixture")
     module = importlib.util.module_from_spec(spec)
     # `dataclass` resolves annotations through `sys.modules`, so the module has
     # to be registered before it is executed, and removed after so nothing else

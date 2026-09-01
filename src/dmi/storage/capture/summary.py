@@ -153,6 +153,12 @@ def summarize_tensor(
     element_count = int(array.size)
 
     if element_count == 0:
+        # The order statistics keep their dtype-determined type even when
+        # degenerate: a caller branching on int-vs-float must not see a float
+        # for an integer tensor just because it was empty.
+        zero: float | int = (
+            0.0 if descriptor.metadata.dtype in _FLOAT_DTYPES else 0
+        )
         return CoreTensorSummaryV1(
             summary_version=CORE_SUMMARY_VERSION,
             element_count=0,
@@ -161,9 +167,9 @@ def summarize_tensor(
             inf_count=0,
             zero_fraction=0.0,
             mean=0.0,
-            minimum=0.0,
-            maximum=0.0,
-            abs_max=0.0,
+            minimum=zero,
+            maximum=zero,
+            abs_max=zero,
             l2_norm=0.0,
         )
 

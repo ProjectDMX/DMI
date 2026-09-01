@@ -382,6 +382,19 @@ def test_core_summary_handles_an_empty_tensor(tmp_path: Path):
     assert summary.l2_norm == 0.0
 
 
+def test_an_empty_integer_tensor_keeps_integer_order_statistics(tmp_path: Path):
+    source = np.zeros((0,), dtype=np.int64)
+    _, descriptor = _descriptor_for(source, "int64", tmp_path)
+
+    summary = summarize_tensor(descriptor, source.tobytes())
+
+    # The int-vs-float contract of the order statistics is decided by the
+    # dtype, not by whether the tensor happened to have elements.
+    assert summary.element_count == 0
+    for value in (summary.minimum, summary.maximum, summary.abs_max):
+        assert value == 0 and isinstance(value, int)
+
+
 def test_int64_extremes_do_not_overflow_the_summary(tmp_path: Path):
     source = np.array([np.iinfo(np.int64).min, np.iinfo(np.int64).max], dtype=np.int64)
     _, descriptor = _descriptor_for(source, "int64", tmp_path)

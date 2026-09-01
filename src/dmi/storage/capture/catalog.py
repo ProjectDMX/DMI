@@ -407,8 +407,11 @@ class CatalogIndexer:
         # NTP step on one of them) cannot reorder publications. The wall clock
         # only stamps published_at_ns.
         version = self._writer.allocate_version()
-        if type(version) is not int or version < 0:
-            raise ValueError("allocate_version must return a non-negative integer")
+        if type(version) is not int or version < 1:
+            # Positive, not merely non-negative: last_published_version() is at
+            # least 0, so an allocator that can ever return 0 has already
+            # broken the strictly-above-the-head contract.
+            raise ValueError("allocate_version must return a positive integer")
         if self._published_version is None:
             # Cross-check against durable state: a broken allocator must fail
             # loudly here rather than publish under a pinned watermark.
