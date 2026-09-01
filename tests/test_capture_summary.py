@@ -502,7 +502,9 @@ def test_summarize_returns_one_summary_per_selected_capture(tmp_path: Path):
     assert [item.capture_id for item in summaries] == [
         f"capture-{index}" for index in range(3)
     ]
-    assert all(item.core.summary_version == 1 for item in summaries)
+    assert all(
+        item.core.summary_version == CORE_SUMMARY_VERSION for item in summaries
+    )
 
 
 def test_summarize_reads_nothing_beyond_the_selected_ranges(tmp_path: Path):

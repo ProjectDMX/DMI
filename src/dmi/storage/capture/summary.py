@@ -29,7 +29,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
 
 
-CORE_SUMMARY_VERSION = 1
+# Version 2: the order statistics (minimum, maximum, abs_max) of a non-float
+# tensor are exact Python ints instead of float64-rounded floats. The values a
+# summary serializes changed for integer magnitudes above 2**53 -- and abs_max
+# can now be 2**63, one past int64 -- so the version moves with them: two
+# builds writing different bytes under one version number would make a
+# cross-implementation manifest comparison report NON-CONFORMANT for corpora
+# that are byte-identical.
+CORE_SUMMARY_VERSION = 2
 
 # Explicit byte orders: a summary must not change meaning with the host.
 _NUMPY_DTYPES = {

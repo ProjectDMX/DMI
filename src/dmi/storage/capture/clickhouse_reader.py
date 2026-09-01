@@ -89,9 +89,11 @@ from uuid import UUID
 
 from .clickhouse_catalog import (
     _CAPTURE_COLUMNS,
+    _DECIDING_READ,
     ClickHouseCatalogConfig,
     ClickHouseClient,
     _identifier,
+    _membership_predicate,
     _quoted,
 )
 from .cursor import CursorKey, decode_cursor, encode_cursor
@@ -233,13 +235,16 @@ class ClickHouseCaptureCatalog:
         that version between those writes, letting a reader pin a half-written
         batch that keeps growing under it.
         """
+        return str(self._published_head(self._config.settings))
+
+    def _published_head(self, settings: Mapping[str, object]) -> int:
         rows = self._client.execute(
             f"SELECT max(index_version) FROM {self._qualified(self._watermark_table)}",
-            settings=self._config.settings,
+            settings=dict(settings),
         )
         if not rows or rows[0][0] is None:
-            return "0"
-        return str(_integer(rows[0][0], "watermark"))
+            return 0
+        return _integer(rows[0][0], "watermark")
 
     def search(self, query: CaptureQuery) -> CapturePage:
         max_watermark = int(self.current_watermark())
@@ -297,7 +302,18 @@ class ClickHouseCaptureCatalog:
         # whose manifest rows are written but whose watermark row has not
         # landed, defeating the publish ordering (the paginated path already
         # enforces this bound in decode_cursor).
-        if requested > int(self.current_watermark()):
+        #
+        # A DECIDING read, unlike search()'s: this answer refuses the call
+        # outright, where a stale head in search() merely pins a slightly
+        # older snapshot. Read from a lagging replica, a watermark the indexer
+        # genuinely published reads as "exceeds the published watermark" -- a
+        # hard, false rejection of valid caller data under ordinary
+        # replication lag -- so this read carries the same
+        # select_sequential_consistency the writer's deciding reads do
+        # (accepted and ignored by a non-replicated server).
+        if requested > self._published_head(
+            {**self._config.settings, **_DECIDING_READ}
+        ):
             raise ValueError(
                 "selection watermark exceeds the published watermark"
             )
@@ -350,15 +366,16 @@ class ClickHouseCaptureCatalog:
         Pack identity is the PAIR too: matching pack_id alone would let the same
         UUID published by a second store at a later version slip inside a
         pinned snapshot.
+
+        The predicate itself has ONE definition,
+        ``clickhouse_catalog._membership_predicate``, shared with the public
+        view's DDL so the two cannot drift apart about what exists; this
+        method only supplies the reader's snapshot bound.
         """
-        return (
-            "(store_id, pack_id) IN (SELECT store_id, pack_id FROM "
-            f"{self._qualified(self._manifest)} "
-            "WHERE index_version <= %(watermark)s AND "
-            "(index_version, publish_id) IN "
-            "(SELECT index_version, publish_id FROM "
-            f"{self._qualified(self._watermark_table)} "
-            "WHERE index_version <= %(watermark)s))"
+        return _membership_predicate(
+            self._qualified(self._manifest),
+            self._qualified(self._watermark_table),
+            bounded=True,
         )
 
     @staticmethod

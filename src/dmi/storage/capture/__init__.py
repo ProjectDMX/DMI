@@ -77,6 +77,7 @@ from .catalog import (
     PublisherLeaseHeldError,
     ReconcileResult,
     SnapshotPublishConflictError,
+    SnapshotPublishExhaustedError,
     SnapshotPublishRaceError,
 )
 from .clickhouse_catalog import (
@@ -203,6 +204,7 @@ __all__ = [
     "S3StoreConfig",
     "SealedPack",
     "SnapshotPublishConflictError",
+    "SnapshotPublishExhaustedError",
     "SnapshotPublishRaceError",
     "SpoolFullError",
     "SpoolSnapshot",

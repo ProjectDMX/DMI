@@ -235,17 +235,21 @@ goes without a contract change:
   guard -- the server now refuses a version that is not strictly above the
   head.
 - A losing publish raises `SnapshotPublishRaceError`; the indexer re-allocates
-  and republishes, bounded at `max_publish_attempts`. Only the manifest is
-  rewritten. Descriptors keep the version they were written with, which is
-  harmless because **visibility is decided by membership, never by
-  `index_version`**: a descriptor row is in a snapshot when its pack is in the
-  manifest of a publish that reached the watermark table, whatever version the
-  row itself carries. `index_version` is not idle on those rows -- it leads
-  `_RESOLUTION_ORDER`, so it is the primary supersession key between two rows
-  describing one capture in two DIFFERENT packs, which are not identical and
-  are exactly the rows pack identity in the sort key exists to keep. It is a
-  tiebreaker only in the case the sort key still collapses: one pack re-indexed,
-  where the rows really are byte identical and the choice is unobservable.
+  and republishes, bounded at `max_publish_attempts` and terminating in
+  `SnapshotPublishExhaustedError` (chained to the last race) when the budget
+  runs out. The manifest is rewritten at the new version, and so are the
+  DESCRIPTORS. Visibility would survive without the rewrite -- **it is decided
+  by membership, never by `index_version`**: a descriptor row is in a snapshot
+  when its pack is in the manifest of a publish that reached the watermark
+  table -- but supersession would not. `index_version` leads
+  `_RESOLUTION_ORDER`, the primary ordering between two rows describing one
+  capture in two DIFFERENT packs, so rows left at the lost version would rank
+  below another pack's rows written between the lost and the winning version:
+  the reader would resolve the capture to the OLDER publish's pack, and to its
+  locator, which is exactly the field that may differ. The rewrite is
+  byte-identical rows at the winning version; the superseded rows share their
+  full sort key with them (pack identity included), so the engine collapses
+  each pair and `argMax` resolves the new version in the meantime.
 - **The publish verifies that it owns the version, not that the version is
   occupied.** Each attempt mints a `publish_id`, writes it on its manifest rows
   and on its watermark row, and reads that column back. The check it replaced --
@@ -375,8 +379,17 @@ on 25.12, and it buys the entire safety margin: at the moment the fence is
 evaluated its lease has essentially a full `lease_ttl_ns` left, and a takeover
 cannot happen until that expires. Both publish statements carry
 `max_execution_time`, set to `publish_timeout_ns` converted to the **seconds**
-that setting takes (`publish_timeout_ns / 1e9`, required to be below the TTL),
+that setting takes (whole seconds, validated at construction and sent as an
+integer -- a fractional value can truncate to 0 on older serialization paths,
+which ClickHouse reads as *no* limit -- and required to be below the TTL),
 so the server itself aborts a statement that has been in flight that long.
+A statement the server aborts this way raises the driver's own exception
+(`timeout_overflow_mode='throw'`, Code 159) out of `publish_snapshot` before
+the ownership read-back -- the same species as the Code 125 path above, and
+like it outside the module's error taxonomy. The publish outcome is unknown at
+that point; the safe reading is "re-acquire and re-index", and because
+`commit_packs` has not run, a row that did land costs only redundant work on
+the next pass.
 
 **Measured, with the lease in place**: 200 trials, two writers each racing to
 acquire the lease, allocate a version and publish from a barrier. Both published

@@ -377,8 +377,12 @@ def test_publish_is_a_single_statement_barrier_over_the_watermark():
         if call[0].startswith("INSERT") and "index_watermark" in call[0]
     )
     assert "SELECT" in watermark_insert
+    # ifNull, not a bare scalar: on a profile where max() over an empty table
+    # answers NULL, a bare comparison is NULL and the FIRST publish into a
+    # fresh catalog would be refused forever as a phantom lost race.
     assert (
-        "WHERE (SELECT max(index_version) FROM `default`.`dmi_index_watermark`) "
+        "WHERE ifNull((SELECT max(index_version) FROM "
+        "`default`.`dmi_index_watermark`), 0) "
         "< %(index_version)s"
     ) in watermark_insert
 

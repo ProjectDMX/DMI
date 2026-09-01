@@ -8,6 +8,8 @@ import pytest
 
 from dmi.storage.capture import (
     CatalogIndexer,
+    SnapshotPublishConflictError,
+    SnapshotPublishExhaustedError,
     SnapshotPublishRaceError,
     CatalogIndexerConfig,
     CatalogReconciler,
@@ -100,6 +102,7 @@ class _CatalogWriter:
         self.fail_commit_once = False
         self.fail_publish_once = False
         self.fail_publish_always = False
+        self.conflict_once = False
         self.allocations = 0
 
     def committed_pack_ids(self, identities):
@@ -133,6 +136,11 @@ class _CatalogWriter:
         self.watermarks.append(
             (index_version, published_at_ns, indexed_rows, indexed_packs)
         )
+        if self.conflict_once:
+            # The conflict's contract: this publish IS visible (the rows above
+            # landed), and so is somebody else's at the same version.
+            self.conflict_once = False
+            raise SnapshotPublishConflictError(f"{index_version} was shared")
 
     def last_published_version(self):
         return self.watermarks[-1][0] if self.watermarks else 0
@@ -198,8 +206,12 @@ def test_a_lost_publish_is_retried_at_a_higher_version(tmp_path: Path):
     """Losing the barrier costs a fresh version, not the batch.
 
     A losing publish made nothing visible, so the recovery is another attempt
-    above the winner. Only the manifest is rewritten -- one row per pack, which
-    is the whole reason membership moved off the per-capture path.
+    above the winner -- and the DESCRIPTORS ride along: they are rewritten at
+    the version that publishes. index_version leads the reader's supersession
+    order between two packs describing one capture, so rows left at the lost
+    version would rank below another pack's rows written between the lost and
+    the winning version, and the reader would resolve a capture to the OLDER
+    publish's pack -- and to its locator, the one field that may differ.
     """
     inventory, refs = _packs(tmp_path, (2,))
     writer = _CatalogWriter()
@@ -214,19 +226,18 @@ def test_a_lost_publish_is_retried_at_a_higher_version(tmp_path: Path):
     assert len(writer.watermarks) == 1, "only the winning publish is visible"
     assert writer.manifests == [(published, tuple(refs))]
 
-    # Descriptors are written once, at the version that lost, and are NOT
-    # rewritten. That is safe because pack identity is part of the descriptor
-    # sort key: index_version there only breaks ties between byte-identical
-    # rows, and never decides visibility -- membership does, and membership was
-    # rewritten at the version that won.
-    assert len(writer.descriptor_batches) == 1
-    assert writer.descriptor_versions == [published - 1]
-    assert writer.descriptor_versions[0] != published
+    # Written at the lost version, rewritten at the winning one -- and the
+    # extra insert is reported, so descriptor_inserts stays an honest count.
+    assert len(writer.descriptor_batches) == 2
+    assert writer.descriptor_versions == [published - 1, published]
+    assert writer.descriptor_batches[0] == writer.descriptor_batches[1], (
+        "the rewrite must be byte-identical rows at the new version"
+    )
+    assert result.descriptor_inserts == 2
 
     # The replay guard is recorded at the published version, after the publish
-    # -- at the version that WON, not the one the descriptors were written
-    # with. This used to be a comment over an assertion that only looked at the
-    # refs, so the version half of the claim was never checked at all.
+    # -- at the version that WON, not the one the descriptors were first
+    # written with.
     assert writer.pack_batches == [tuple(refs)]
     assert writer.pack_versions == [published]
 
@@ -242,13 +253,70 @@ def test_publishing_gives_up_after_its_bounded_retries(tmp_path: Path):
         clock_ns=lambda: 42,
     )
 
-    with pytest.raises(RuntimeError, match="after 3 attempts"):
+    with pytest.raises(SnapshotPublishExhaustedError, match="after 3 attempts") as raised:
         indexer.index(refs)
+
+    # Inside the module's own taxonomy (a supervisor catching
+    # CaptureStorageError must see retry exhaustion), and chained to the last
+    # race so the traceback still names the terminal cause.
+    assert isinstance(raised.value.__cause__, SnapshotPublishRaceError)
 
     # Nothing was made visible, and the replay guard was never written -- so
     # the next pass re-indexes rather than skipping a pack nobody can see.
     assert writer.watermarks == []
     assert writer.pack_batches == []
+
+
+def test_a_conflicted_publish_is_committed_before_it_propagates(tmp_path: Path):
+    """A conflict IS visible, so its packs must be skippable before it raises.
+
+    SnapshotPublishConflictError's contract is that this publish landed --
+    its watermark row stands and its packs are in the snapshot -- and that it
+    must NOT be retried. Propagating it before commit_packs would leave the
+    packs out of the replay inventory, so the next scheduled pass would
+    re-index and re-publish the very batch the error forbids retrying, burying
+    the operator-required anomaly under a later success.
+    """
+    inventory, refs = _packs(tmp_path, (2,))
+    writer = _CatalogWriter()
+    writer.conflict_once = True
+    indexer = CatalogIndexer(inventory, writer, clock_ns=lambda: 42)
+
+    with pytest.raises(SnapshotPublishConflictError):
+        indexer.index(refs)
+
+    published = writer.watermarks[-1][0]
+    assert writer.pack_batches == [tuple(refs)], (
+        "a visible publish's packs must enter the replay inventory"
+    )
+    assert writer.pack_versions == [published]
+    # And the anomaly still surfaced: the error propagated, it was not
+    # absorbed as a retry.
+    assert writer.allocations == 1
+
+
+def test_a_batch_with_nothing_to_do_publishes_nothing(tmp_path: Path):
+    """A complete no-op performs no catalog writes at all.
+
+    Publishing requires the exclusive publisher lease, so a sweep that merely
+    CONFIRMS a catalog -- a periodic CatalogReconciler.rebuild over packs the
+    live indexer already committed -- must not contend for it, burn a version,
+    or advance the watermark on every page it has nothing to say about.
+    """
+    inventory, refs = _packs(tmp_path, (2,))
+    writer = _CatalogWriter()
+    indexer = CatalogIndexer(inventory, writer, clock_ns=lambda: 42)
+
+    first = indexer.index(refs)
+    watermarks = list(writer.watermarks)
+    second = indexer.index(refs)
+
+    assert first.indexed_packs == 1
+    assert second.indexed_packs == 0
+    assert second.skipped_packs == 1
+    assert second.descriptor_inserts == 0
+    assert writer.watermarks == watermarks, "a no-op pass must not publish"
+    assert writer.allocations == 1, "a no-op pass must not burn a version"
 
 
 def test_duplicate_event_and_missed_event_converge_on_rebuild(tmp_path: Path):

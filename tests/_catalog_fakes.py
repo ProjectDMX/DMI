@@ -53,6 +53,21 @@ _FENCE = re.compile(
 
 _LIMIT = re.compile(r"\bLIMIT\s+(\d+)")
 
+# The fenced release tombstone `ClickHouseCatalogWriter._release_statement()`
+# emits: the head is resolved and the tombstone written in ONE server-side
+# statement, so a successor acquiring between a read and a write has no window
+# to be contested in. Matched exactly for the same reason `_FENCE` is, and
+# pinned against the writer's own output by the same test.
+_RELEASE = re.compile(
+    r"INSERT INTO `[^`]+`\.`[^`]+_publisher_lease` "
+    r"\(term, lease_id, holder, acquired_at_ns, expires_at_ns\) "
+    r"SELECT term \+ 1, toUUID\(%\(lease_id\)s\), %\(holder\)s, "
+    r"toUnixTimestamp64Nano\(now64\(9\)\), toUnixTimestamp64Nano\(now64\(9\)\) "
+    r"FROM \(SELECT term, lease_id FROM `[^`]+`\.`[^`]+_publisher_lease` "
+    r"ORDER BY term DESC, lease_id DESC LIMIT 1\) "
+    r"WHERE lease_id = toUUID\(%\(lease_id\)s\)"
+)
+
 
 def uuid_order(text: str) -> tuple[int, int]:
     """ClickHouse's UUID collation, which is NOT the text order.
@@ -148,6 +163,37 @@ class FakeLeaseTable:
         if statement.startswith("INSERT INTO"):
             if "publisher_lease" not in statement.split(maxsplit=3)[2]:
                 return None
+            if "SELECT term + 1" in statement:
+                # The fenced release. Resolve the head exactly as the
+                # statement does (term DESC, lease_id DESC in ClickHouse's
+                # UUID order) and write the already-expired tombstone only
+                # when the head is this writer's row -- atomically, because
+                # the statement is one server-side unit. Matched off the SQL,
+                # like the publish fence, so deleting the fence from the
+                # source cannot pass quietly.
+                if _RELEASE.fullmatch(statement) is None:
+                    raise MissingLeaseFence(
+                        "a release tombstone must resolve the head and write "
+                        "it in one fenced statement; this one does not match "
+                        "the writer's fenced release.\n"
+                        f"statement: {statement}"
+                    )
+                head = self.head()
+                if head:
+                    top_term, resolved, *_ = max(
+                        head, key=lambda row: uuid_order(row[1])
+                    )
+                    if resolved == str(params["lease_id"]):
+                        self.rows.append(
+                            (
+                                top_term + 1,
+                                str(params["lease_id"]),
+                                str(params["holder"]),
+                                self.now_ns,
+                                self.now_ns,
+                            )
+                        )
+                return []
             self.rows.append(
                 (
                     int(params["term"]),

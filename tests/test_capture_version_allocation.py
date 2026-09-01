@@ -463,6 +463,15 @@ def test_the_fake_matches_the_fence_the_writer_actually_emits():
         "tests/_catalog_fakes._FENCE no longer matches "
         "ClickHouseCatalogWriter._lease_fence(); update it deliberately"
     )
+    # The fenced release is pinned the same way, for the same reason: the fake
+    # models the head-resolve-and-write as one atomic statement, which is only
+    # honest while the writer actually emits that statement.
+    from tests._catalog_fakes import _RELEASE
+
+    assert _RELEASE.fullmatch(writer._release_statement()) is not None, (
+        "tests/_catalog_fakes._RELEASE no longer matches "
+        "ClickHouseCatalogWriter._release_statement(); update it deliberately"
+    )
     # And a statement without it is refused rather than quietly admitted.
     with pytest.raises(MissingLeaseFence, match="must be fenced"):
         FakeLeaseTable().fence_admits(
@@ -478,8 +487,9 @@ def test_the_indexer_does_not_absorb_a_lost_lease_as_a_lost_version(tmp_path: Pa
     A lost VERSION is repaired by allocating a higher one, which `_publish`
     does. A lost LEASE is not: every retry would fail the same fence at every
     version, so absorbing it would spin `max_publish_attempts` times and then
-    raise `RuntimeError("could not publish ... after N attempts")` -- burying
-    the one message that names the holder and says to acquire again.
+    raise `SnapshotPublishExhaustedError("could not publish ... after N
+    attempts")` -- burying the one message that names the holder and says to
+    acquire again.
     """
     store, refs = _refs(tmp_path, 1)
     server = _CatalogServer()
@@ -504,6 +514,41 @@ def test_the_indexer_does_not_absorb_a_lost_lease_as_a_lost_version(tmp_path: Pa
     # It gave up at the first attempt rather than burning the retry budget.
     assert server.watermarks == []
     assert sum("version_claims" in q for q in server.inserts) == 1
+
+
+def test_a_barrier_refusal_with_an_expired_own_lease_is_still_a_race():
+    """An expiry between the fenced statement and the read-back is no takeover.
+
+    The refusal classifier used to demand that the head be this writer's row
+    AND still live at CHECK time, so an ordinary lost version race whose lease
+    merely expired during the read-back window -- a stall, a short TTL -- was
+    reported as a lost lease, with a message blaming this writer's own holder
+    for fencing it out. That bypasses the indexer's retry, which renews the
+    lease before every attempt and would have recovered. As long as the head
+    is still this writer's row, nobody took the lease, and the race retry is
+    the recovery.
+    """
+    server = _CatalogServer()
+    writer = _publisher(server, "indexer-a")
+    server.watermarks.append(10)  # somebody already published above this batch
+
+    real_execute = server.execute
+
+    def stalling_execute(query, params=None, **kwargs):
+        result = real_execute(query, params, **kwargs)
+        if query.lstrip().startswith("INSERT") and "index_watermark" in query:
+            # The stall: the lease runs out AFTER the fenced statement was
+            # evaluated and BEFORE the ownership read-back runs.
+            _expire_the_lease(server)
+        return result
+
+    server.execute = stalling_execute
+
+    with pytest.raises(SnapshotPublishRaceError):
+        writer.publish_snapshot(
+            index_version=5, refs=(), published_at_ns=7,
+            indexed_rows=0, indexed_packs=0,
+        )
 
 
 # --- the allocator over a shared server ---------------------------------------
@@ -763,20 +808,28 @@ class _Store:
 
 
 @pytest.mark.parametrize("value", [-1, "7", True, 4.0])
-def test_the_indexer_rejects_a_non_integer_or_negative_allocation(value):
-    indexer = CatalogIndexer(_Store(), _HostileWriter(lambda: value))
+def test_the_indexer_rejects_a_non_integer_or_negative_allocation(
+    tmp_path: Path, value
+):
+    # A real pack, because a batch with nothing to index no longer allocates
+    # (or publishes) at all -- the guard runs on the way to real writes.
+    store, refs = _refs(tmp_path, 1)
+    indexer = CatalogIndexer(store, _HostileWriter(lambda: value))
 
     with pytest.raises(ValueError, match="allocate_version"):
-        indexer.index([])
+        indexer.index(refs)
 
 
 @pytest.mark.parametrize("allocated", [5, 4])
-def test_the_indexer_refuses_a_non_monotonic_allocation(allocated: int):
+def test_the_indexer_refuses_a_non_monotonic_allocation(
+    tmp_path: Path, allocated: int
+):
     # The durable watermark says 5 has been published; an allocator handing
     # out 5 (or lower) again would let this batch land inside pinned snapshots.
+    store, refs = _refs(tmp_path, 1)
     indexer = CatalogIndexer(
-        _Store(), _HostileWriter(lambda: allocated, last_published=5)
+        store, _HostileWriter(lambda: allocated, last_published=5)
     )
 
     with pytest.raises(RuntimeError, match="non-monotonic"):
-        indexer.index([])
+        indexer.index(refs)

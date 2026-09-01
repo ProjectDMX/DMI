@@ -117,19 +117,11 @@ def main(argv=None) -> int:
         )
         print(json.dumps(result, sort_keys=True))
     finally:
-        # Every object ensure_schema creates. A short list leaks the rest:
-        # this one dropped neither the watermark, the manifest nor the claims
-        # table, so each run left three tables behind.
-        for kind, suffix in (
-            ("VIEW", "capture"), ("VIEW", "pack_inventory"),
-            ("TABLE", "capture_raw"), ("TABLE", "pack_inventory_raw"),
-            ("TABLE", "index_watermark"), ("TABLE", "snapshot_manifest"),
-            ("TABLE", "capture_version_claims"), ("TABLE", "publisher_lease"),
-            ("TABLE", "schema_version"),
-        ):
-            client.execute(
-                f"DROP {kind} IF EXISTS `{args.database}`.`{prefix}_{suffix}`"
-            )
+        # The writer owns the object list, in drop order. A hand-copied list
+        # here drifted twice -- one revision leaked neither more nor less than
+        # the watermark, the manifest and the claims table on every run -- so
+        # the teardown replays the writer's own list instead of naming one.
+        writer.drop_schema()
     return 0
 
 

@@ -235,16 +235,9 @@ def main(argv=None) -> int:
         }
         print(json.dumps(result, indent=2, sort_keys=True))
     finally:
-        for kind, suffix in (
-            ("VIEW", "capture"), ("VIEW", "pack_inventory"),
-            ("TABLE", "capture_raw"), ("TABLE", "pack_inventory_raw"),
-            ("TABLE", "index_watermark"), ("TABLE", "snapshot_manifest"),
-            ("TABLE", "capture_version_claims"), ("TABLE", "publisher_lease"),
-            ("TABLE", "schema_version"),
-        ):
-            client.execute(
-                f"DROP {kind} IF EXISTS `{args.database}`.`{prefix}_{suffix}`"
-            )
+        # The writer owns the object list, in drop order; a hand-copied list
+        # here has drifted and leaked tables twice.
+        writer.drop_schema()
     return 0
 
 

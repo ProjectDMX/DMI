@@ -247,11 +247,10 @@ def _server():
 
 
 def _drop_everything(client, config) -> None:
-    for kind, suffix in _ALL_OBJECTS:
-        client.execute(
-            f"DROP {kind} IF EXISTS "
-            f"`{config.database}`.`{config.table_prefix}_{suffix}`"
-        )
+    # The writer's own teardown, which replays its object list (current and
+    # superseded) in drop order. _ALL_OBJECTS above stays as this suite's
+    # independent statement of that list for the states it constructs by hand.
+    ClickHouseCatalogWriter(client, config).drop_schema()
 
 
 def _install_version_one(client, config) -> None:

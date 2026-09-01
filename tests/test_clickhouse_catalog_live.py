@@ -65,17 +65,6 @@ def test_duplicate_catalog_replay_is_logically_deduplicated():
         }
     finally:
         if schema_created:
-            for kind, suffix in (
-                ("VIEW", "capture"),
-                ("VIEW", "pack_inventory"),
-                ("TABLE", "capture_raw"),
-                ("TABLE", "pack_inventory_raw"),
-                ("TABLE", "capture_version_claims"),
-                ("TABLE", "publisher_lease"),
-                ("TABLE", "index_watermark"),
-                ("TABLE", "snapshot_manifest"),
-                ("TABLE", "schema_version"),
-            ):
-                client.execute(
-                    f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`"
-                )
+            # The writer owns the object list, in drop order; hand-copied
+            # lists here drifted from it and leaked tables.
+            writer.drop_schema()

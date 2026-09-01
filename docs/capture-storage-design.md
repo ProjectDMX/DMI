@@ -454,10 +454,14 @@ Lifecycle:
 - **Release.** `release_publisher_lease()` writes an already-expired tombstone
   so an orderly restart does not cost the next publisher a whole TTL. A crash
   does; that is what expiry is for. It is **fenced on the head being this
-  writer's own lease**: the tombstone lands at `head.term + 1` and so becomes
-  the head whatever was there before, which unfenced let a writer whose lease
-  had long since lapsed revoke the current holder's live one just by shutting
-  down cleanly.
+  writer's own lease, inside the statement that writes**: the tombstone lands
+  at `head.term + 1` and so becomes the head whatever was there before, which
+  unfenced let a writer whose lease had long since lapsed revoke the current
+  holder's live one just by shutting down cleanly -- and fenced by a client
+  read followed by a separate INSERT, the same revocation fit in the window
+  between the two, contesting a successor's freshly granted term. The head is
+  resolved and the tombstone written in one server-side statement, exactly as
+  the publish fence is.
 
 **One publisher holds the lease, but two client objects can believe they do.**
 The sole-claimant read-back proves a claimant is alone at ITS term, not that its
@@ -471,7 +475,9 @@ the client objects rather than about safety.
 `publish_timeout_ns` caps each publish statement's `max_execution_time` and must
 be below `lease_ttl_ns`. The gap between them is what keeps a publish statement
 from still running when its own lease becomes takeable. `max_execution_time` is
-in **seconds**, so the writer passes `publish_timeout_ns / 1e9`; and it caps
+in **seconds**, so the writer requires `publish_timeout_ns` to be a whole number
+of seconds and sends the integer -- a fractional value can truncate to 0 on
+older serialization paths, which the server reads as *no* limit; and it caps
 each statement individually, not the pair, so it does not bound the client round
 trip between them.
 
@@ -644,14 +650,18 @@ store again:
    superseded table left standing wedges every start after it.
 3. Run `ensure_schema()`. It finds nothing, creates the current schema, and
    stamps it.
-4. Run `CatalogReconciler.rebuild(prefix=...)` once per pack store. It lists
+4. Run `acquire_publisher_lease(holder)` on the writer the rebuild will use.
+   Only the lease holder can make a snapshot visible, and `rebuild()`
+   publishes every page it indexes, so a rebuild without the lease fails its
+   first page with `PublisherLeaseError`.
+5. Run `CatalogReconciler.rebuild(prefix=...)` once per pack store. It lists
    the objects, range-reads each pack footer, and repopulates the descriptors,
    the snapshot manifest, the pack inventory and the watermark from them.
 
 **Dropping `{prefix}_pack_inventory_raw` is mandatory, not optional.**
 `committed_pack_ids` reads that inventory to decide which packs are already
 indexed. An inventory left in place reports every pre-existing pack as done, so
-step 4 skips all of them, writes no descriptors, publishes an empty version,
+step 5 skips all of them, writes no descriptors, publishes nothing at all,
 and returns an `IndexResult` with no failures -- a rebuild that reports success
 and produces an empty catalog, while the captures stay durable in object
 storage and unreachable through every reader. That state is why the last row of

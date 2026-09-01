@@ -50,6 +50,24 @@ class SnapshotPublishConflictError(CaptureStorageError):
     """
 
 
+class SnapshotPublishExhaustedError(CaptureStorageError):
+    """Every bounded publish attempt lost its version race.
+
+    Raised by the indexer after ``max_publish_attempts`` allocations were each
+    refused by the version barrier, chained (``__cause__``) to the last
+    :class:`SnapshotPublishRaceError`. Each individual race is retryable, but
+    this many in a row means something is publishing continuously against this
+    catalog -- or the barrier itself is refusing everything, e.g. a server
+    profile where an aggregate over the empty watermark table answers NULL --
+    so it is surfaced through the module's own error taxonomy for a supervisor
+    to back off on, rather than as a bare RuntimeError that no
+    ``except CaptureStorageError`` handler sees.
+
+    The batch's descriptor rows are durable at this point and no snapshot
+    admits them; the next indexing pass re-reads the packs and tries again.
+    """
+
+
 class PublisherLeaseError(CaptureStorageError):
     """This publisher does not hold the lease a publish requires.
 
@@ -337,24 +355,35 @@ class CatalogIndexer:
             descriptors.extend(pack_descriptors)
             valid_refs.append(ref)
 
-        version = self._allocate_version()
-        step = self._config.max_rows_per_insert
-        descriptor_inserts = 0
-        for start in range(0, len(descriptors), step):
-            self._writer.write_descriptors(
-                descriptors[start : start + step], index_version=version
+        if descriptors or valid_refs:
+            version = self._allocate_version()
+            descriptor_inserts = self._write_descriptor_batches(
+                descriptors, version
             )
-            descriptor_inserts += 1
-        # Publish before the inventory, never after. committed_pack_ids reads
-        # the inventory to skip replays, so a pack recorded there but never
-        # made visible is skipped forever *and* invisible -- silent, permanent
-        # loss. This way round the same crash costs only redundant work on the
-        # next pass. Publishing is also what makes the descriptor rows above
-        # readable at all: it writes the membership rows for `valid_refs` and
-        # the watermark that admits them.
-        published = self._publish(version, valid_refs, len(descriptors))
-        if valid_refs:
-            self._writer.commit_packs(valid_refs, index_version=published)
+            # Publish before the inventory, never after. committed_pack_ids
+            # reads the inventory to skip replays, so a pack recorded there but
+            # never made visible is skipped forever *and* invisible -- silent,
+            # permanent loss. This way round the same crash costs only
+            # redundant work on the next pass. Publishing is also what makes
+            # the descriptor rows above readable at all: it writes the
+            # membership rows for `valid_refs` and the watermark that admits
+            # them.
+            published, rewrite_inserts = self._publish(
+                version, valid_refs, descriptors
+            )
+            descriptor_inserts += rewrite_inserts
+            if valid_refs:
+                self._writer.commit_packs(valid_refs, index_version=published)
+        else:
+            # A complete no-op: every pack was already committed (or failed to
+            # read), nothing was written, and nothing new could become visible
+            # -- so nothing is published. Publishing here anyway would burn a
+            # version and, since only the lease holder may publish, make a
+            # sweep that merely CONFIRMS a catalog contend for the publisher
+            # lease: a periodic CatalogReconciler.rebuild running beside the
+            # live indexer would hard-fail on pages it has nothing to say
+            # about. A no-op pass performs no catalog writes at all.
+            descriptor_inserts = 0
         result = IndexResult(
             requested_packs=len(unique) + len(conflict_failures),
             skipped_packs=len(unique) - len(pending),
@@ -390,10 +419,29 @@ class CatalogIndexer:
             )
         return version
 
-    def _publish(
-        self, version: int, refs: Sequence[PackRef], indexed_rows: int
+    def _write_descriptor_batches(
+        self, descriptors: Sequence[CaptureDescriptor], version: int
     ) -> int:
+        """Write the descriptors at ``version`` in bounded chunks; count them."""
+        step = self._config.max_rows_per_insert
+        inserts = 0
+        for start in range(0, len(descriptors), step):
+            self._writer.write_descriptors(
+                descriptors[start : start + step], index_version=version
+            )
+            inserts += 1
+        return inserts
+
+    def _publish(
+        self,
+        version: int,
+        refs: Sequence[PackRef],
+        descriptors: Sequence[CaptureDescriptor],
+    ) -> tuple[int, int]:
         """Publish the batch, re-allocating around a lost publish race.
+
+        Returns ``(published_version, rewrite_inserts)`` -- the version that
+        became visible and how many extra descriptor INSERTs the retries cost.
 
         Publishing is a required part of the CatalogWriter contract: skipping
         it would leave every row this call wrote durably stored but permanently
@@ -407,26 +455,30 @@ class CatalogIndexer:
         publish raises something else, and it propagates, because every retry
         would fail the same way.
 
-        A losing publish made nothing visible, so recovery is simply a fresh
-        version and another attempt. Only the manifest rows are rewritten --
-        one per pack, not one per capture, which is the whole reason membership
-        moved off the per-capture path. The descriptors already written keep
-        the version they were written with, and that is harmless because
-        VISIBILITY is decided by membership: a descriptor row is in a snapshot
-        when its pack is in the manifest of a publish that reached the
-        watermark table, whatever version the row itself carries. Membership is
-        rewritten at the version that wins.
+        A losing publish made nothing visible, so recovery is a fresh version
+        and another attempt -- and the DESCRIPTORS are rewritten at that
+        version, not only the manifest rows. VISIBILITY does not need the
+        rewrite (membership decides it, and membership is rewritten at the
+        version that wins), but SUPERSESSION does: ``index_version`` leads
+        ``clickhouse_reader._RESOLUTION_ORDER``, the primary ordering between
+        two rows describing one capture in two DIFFERENT packs. Rows left at
+        the lost version would rank below another pack's rows written between
+        the lost and the winning version, so the reader would resolve a capture
+        to the OLDER publish's pack -- and to its locator, which is exactly
+        what may differ. The rewrite is byte-identical rows at the new version;
+        the superseded rows share their full sort key with them (pack identity
+        included), so the ReplacingMergeTree collapses each pair to the new
+        version and ``argMax`` resolves the same rows in the meantime.
 
-        `index_version` is not idle on those rows, and it is worth being exact
-        because the reader depends on it: it LEADS
-        `clickhouse_reader._RESOLUTION_ORDER`, so it is the primary supersession
-        key between two rows describing one capture in two DIFFERENT packs --
-        rows that are explicitly not identical, and that pack identity in the
-        sort key exists to keep alive. It is a mere tiebreaker only in the case
-        the sort key still collapses: one pack re-indexed, where the rows really
-        are byte identical and the winner is unobservable.
+        A publish that CONFLICTED is the opposite of a loss: it is visible, by
+        that error's own contract, so its packs enter the replay inventory
+        before the error propagates. Skipping that would hand the next pass a
+        batch it re-indexes and re-publishes automatically -- the retry the
+        error exists to forbid -- while burying the anomaly under a success.
         """
         attempts = self._config.max_publish_attempts
+        rewrite_inserts = 0
+        last_race: SnapshotPublishRaceError | None = None
         for attempt in range(attempts):
             # The wall clock stamps published_at_ns only -- a human-readable
             # record of when the version was published, never part of its
@@ -439,19 +491,28 @@ class CatalogIndexer:
                     index_version=version,
                     refs=refs,
                     published_at_ns=published_at_ns,
-                    indexed_rows=indexed_rows,
+                    indexed_rows=len(descriptors),
                     indexed_packs=len(refs),
                 )
-            except SnapshotPublishRaceError:
+            except SnapshotPublishConflictError:
+                # Visible, so skippable: record the packs before propagating.
+                if refs:
+                    self._writer.commit_packs(refs, index_version=version)
+                raise
+            except SnapshotPublishRaceError as race:
+                last_race = race
                 if attempt + 1 == attempts:
                     break
                 version = self._allocate_version()
+                rewrite_inserts += self._write_descriptor_batches(
+                    descriptors, version
+                )
                 continue
             self._published_version = version
-            return version
-        raise RuntimeError(
+            return version, rewrite_inserts
+        raise SnapshotPublishExhaustedError(
             f"could not publish a catalog snapshot after {attempts} attempts"
-        )
+        ) from last_race
 
     def _emit(self, result: IndexResult) -> None:
         if self._on_event is None:

@@ -24,7 +24,7 @@
         "mean": 0.5,
         "minimum": 0,
         "nan_count": 0,
-        "version": 1,
+        "version": 2,
         "zero_fraction": 0.5
       }
     },
@@ -52,7 +52,7 @@
         "mean": 121.5,
         "minimum": 1,
         "nan_count": 0,
-        "version": 1,
+        "version": 2,
         "zero_fraction": 0.0
       }
     },
@@ -80,7 +80,7 @@
         "mean": -3.5,
         "minimum": -124,
         "nan_count": 0,
-        "version": 1,
+        "version": 2,
         "zero_fraction": 0.0
       }
     },
@@ -108,7 +108,7 @@
         "mean": 255.5,
         "minimum": -28529,
         "nan_count": 0,
-        "version": 1,
+        "version": 2,
         "zero_fraction": 0.0
       }
     },
@@ -136,7 +136,7 @@
         "mean": 2695.128854681,
         "minimum": -12160.0,
         "nan_count": 0,
-        "version": 1,
+        "version": 2,
         "zero_fraction": 0.0
       }
     },
@@ -164,7 +164,7 @@
         "mean": -2.616912803732729e+36,
         "minimum": -4.187068186722485e+37,
         "nan_count": 0,
-        "version": 1,
+        "version": 2,
         "zero_fraction": 0.0
       }
     },
@@ -192,7 +192,7 @@
         "mean": -67438087.5,
         "minimum": -2105442177,
         "nan_count": 0,
-        "version": 1,
+        "version": 2,
         "zero_fraction": 0.0
       }
     },
@@ -220,7 +220,7 @@
         "mean": 3.2642797422049176e+35,
         "minimum": -1.5462104171572421e+32,
         "nan_count": 0,
-        "version": 1,
+        "version": 2,
         "zero_fraction": 0.0
       }
     },
@@ -248,7 +248,7 @@
         "mean": 4.292360895432622e+17,
         "minimum": -8319403563331123579,
         "nan_count": 0,
-        "version": 1,
+        "version": 2,
         "zero_fraction": 0.0
       }
     },
@@ -276,7 +276,7 @@
         "mean": -3.2132635753564107e+302,
         "minimum": -5.141221720570257e+303,
         "nan_count": 0,
-        "version": 1,
+        "version": 2,
         "zero_fraction": 0.0
       }
     }

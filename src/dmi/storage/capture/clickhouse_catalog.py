@@ -70,6 +70,18 @@ class ClickHouseCatalogConfig:
                 "between them is what keeps a publish statement from still "
                 "running when its lease becomes takeable"
             )
+        if self.publish_timeout_ns % 1_000_000_000:
+            # max_execution_time is sent as WHOLE seconds. A fractional value
+            # is deployment roulette: modern servers parse the string, older
+            # typed-settings serialization coerces through int() -- where 0.5
+            # becomes 0, which ClickHouse reads as NO limit and the fence-vs-
+            # TTL margin this config promises is silently gone.
+            raise ValueError(
+                "publish_timeout_ns must be a whole number of seconds: it is "
+                "sent to the server as max_execution_time in seconds, and a "
+                "fraction either fails to parse or truncates -- 0.5s can reach "
+                "an older server as 0, which disables the cap entirely"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +255,40 @@ _SCHEMA_VERSION = 4
 # before their watermark row, which is a deployment decision about latency, not
 # something this module can pick. See docs/catalog-descriptor-key.md.
 _DECIDING_READ = {"select_sequential_consistency": 1}
+
+# Identity tuples are inlined into a statement's TEXT: the driver substitutes
+# non-VALUES parameters client-side, and the server parses at most
+# max_query_size bytes of text (256 KiB by default) -- only the data stream
+# after INSERT ... VALUES is exempt. One (store_id, pack_id) member renders as
+# roughly 60-100 bytes, so chunks of this size stay an order of magnitude
+# under the limit even with generous store ids, where an unchunked
+# query_pack_limit (10,000) or a large publish batch would breach it and die
+# with Code 62 mid-statement.
+_MAX_INLINE_TUPLES = 1_000
+
+
+def _membership_predicate(manifest: str, watermark: str, *, bounded: bool) -> str:
+    """The published-membership clause, the ONE definition of what exists.
+
+    A pack is inside the catalog when a manifest row names it AND the publish
+    that wrote that row -- the ``(index_version, publish_id)`` pair, not the
+    version alone -- also reached the watermark table. The reader's snapshot
+    bound (``bounded=True``) applies ``index_version <= %(watermark)s`` to both
+    halves; the public view (``bounded=False``) admits every published pack,
+    since every watermark row is at or below the published head by definition.
+
+    Shared by ``ClickHouseCaptureCatalog._membership`` and the view DDL in
+    ``ensure_schema`` so the two cannot drift: a view serving rows every reader
+    treats as nonexistent is the bug the bound exists to prevent.
+    """
+    manifest_bound = "index_version <= %(watermark)s AND " if bounded else ""
+    watermark_bound = " WHERE index_version <= %(watermark)s" if bounded else ""
+    return (
+        "(store_id, pack_id) IN ("
+        f"SELECT store_id, pack_id FROM {manifest} "
+        f"WHERE {manifest_bound}(index_version, publish_id) IN "
+        f"(SELECT index_version, publish_id FROM {watermark}{watermark_bound}))"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,11 +562,7 @@ pack_id UUID
         self._client.execute(
             f"CREATE OR REPLACE VIEW {capture_view} AS "
             f"SELECT {capture_public} FROM {capture_raw} FINAL "
-            "WHERE (store_id, pack_id) IN ("
-            f"SELECT store_id, pack_id FROM {manifest} "
-            "WHERE (index_version, publish_id) IN "
-            f"(SELECT index_version, publish_id FROM {watermark})"
-            ")"
+            f"WHERE {_membership_predicate(manifest, watermark, bounded=False)}"
         )
         # The inventory needs no such bound. CatalogIndexer.index writes it
         # only after a successful publish -- descriptors, publish, inventory --
@@ -638,10 +680,13 @@ pack_id UUID
         if self._inventory_without_membership():
             raise CatalogSchemaVersionError(
                 f"catalog `{self._config.database}`.`{self._config.table_prefix}_*` "
-                f"lists packs in `{self._pack_raw}` while `{self._manifest}` is "
-                "empty, so every pack is already marked indexed and none belongs "
-                "to any snapshot. An indexing pass would skip all of them and "
-                "leave a catalog that is empty but reports success. "
+                f"lists packs in `{self._pack_raw}` while `{self._manifest}` "
+                f"holds no membership that any publish in `{self._watermark}` "
+                "admits -- the manifest is empty, or the watermark rows its "
+                "publishes need are gone -- so every pack is already marked "
+                "indexed and none belongs to any snapshot. An indexing pass "
+                "would skip all of them and leave a catalog that is empty but "
+                "reports success. "
                 + self._rebuild_instruction()
             )
 
@@ -882,10 +927,19 @@ pack_id UUID
         never migrated: ``committed_pack_ids`` reads the inventory and reports
         every pack as done, while readers bound their snapshot by a manifest
         that names none of them.
+
+        Membership is counted EFFECTIVELY -- manifest rows whose publish also
+        reached the watermark table -- not as raw manifest rows. A raw count
+        waves through the same dangerous state entered from the other side: a
+        dropped or truncated watermark table beside a populated manifest
+        leaves every manifest row unpaired, so readers see nothing while the
+        inventory still marks every pack as indexed.
         """
         packs, members = self._client.execute(
             f"SELECT (SELECT count() FROM {self._qualified(self._pack_raw)}), "
-            f"(SELECT count() FROM {self._qualified(self._manifest)})"
+            f"(SELECT count() FROM {self._qualified(self._manifest)} "
+            "WHERE (index_version, publish_id) IN "
+            f"(SELECT index_version, publish_id FROM {self._qualified(self._watermark)}))"
         )[0]
         return bool(packs) and not members
 
@@ -906,14 +960,34 @@ pack_id UUID
             "The catalog is a derived projection over immutable packs, so "
             "rebuilding it loses nothing: stop every indexer, drop ALL of its "
             f"objects in this order (views first) -- {objects} -- then run "
-            "ensure_schema() and CatalogReconciler.rebuild() over each pack "
-            "store. Dropping the pack inventory is mandatory, not optional: "
+            "ensure_schema(), acquire_publisher_lease() on the rebuilding "
+            "writer (only the lease holder can publish, and rebuild() "
+            "publishes every page), and CatalogReconciler.rebuild() over each "
+            "pack store. Dropping the pack inventory is mandatory, not optional: "
             "committed_pack_ids reads it to skip replays, so an inventory left "
             "behind makes the rebuild skip every pack it exists to re-read and "
             "publish an empty catalog without failing. See "
             "docs/capture-storage-design.md, 'Catalog schema versions and "
             "rebuild'."
         )
+
+    def drop_schema(self) -> None:
+        """Drop every object this build creates, plus superseded ones.
+
+        Generated from ``self._objects`` and ``self._legacy_objects`` -- the
+        same lists ``ensure_schema`` and ``_rebuild_instruction`` are built
+        from -- in their documented drop order (views before the tables they
+        read), with ``IF EXISTS`` so a partial or absent catalog tears down
+        cleanly. This is the teardown the benchmarks and live-test fixtures
+        replay: hand-copied drop lists drifted from ``_objects`` twice and
+        leaked tables onto shared servers both times, so the list lives in
+        exactly one place.
+        """
+        database = _quoted(self._config.database)
+        for kind, name in self._objects + self._legacy_objects:
+            self._client.execute(
+                f"DROP {kind} IF EXISTS {database}.{_quoted(name)}"
+            )
 
     def committed_pack_ids(
         self, identities: Sequence[PackIdentity]
@@ -923,12 +997,20 @@ pack_id UUID
         if len(identities) > self._config.query_pack_limit:
             raise ValueError("pack identity query exceeds query_pack_limit")
         table = self._qualified(self._pack_view)
-        rows = self._client.execute(
-            f"SELECT store_id, toString(pack_id) FROM {table} "
-            "WHERE (store_id, pack_id) IN %(identities)s",
-            {"identities": list(identities)},
-        )
-        return {(self._text(row[0]), self._text(row[1])) for row in rows}
+        committed: set[PackIdentity] = set()
+        # Chunked: the identities land in the statement TEXT, and an unchunked
+        # query_pack_limit's worth of tuples can breach max_query_size.
+        remaining = list(identities)
+        for start in range(0, len(remaining), _MAX_INLINE_TUPLES):
+            rows = self._client.execute(
+                f"SELECT store_id, toString(pack_id) FROM {table} "
+                "WHERE (store_id, pack_id) IN %(identities)s",
+                {"identities": remaining[start : start + _MAX_INLINE_TUPLES]},
+            )
+            committed.update(
+                (self._text(row[0]), self._text(row[1])) for row in rows
+            )
+        return committed
 
     def write_descriptors(
         self, descriptors: Sequence[CaptureDescriptor], *, index_version: int
@@ -995,6 +1077,17 @@ pack_id UUID
         lease renewed just before it started. The cap is per statement, so it
         does not bound the gap between the two. See
         docs/catalog-descriptor-key.md for what that does and does not close.
+
+        A statement that TRIPS the cap raises the driver's own exception
+        (``timeout_overflow_mode='throw'``, Code 159), not a
+        ``CaptureStorageError`` -- the same species as the Code 125 path the
+        design doc records -- and it raises BEFORE the ownership read-back, so
+        whether the row landed is not known here. That is safe in the only
+        direction that matters: the indexer aborts without ``commit_packs``,
+        so if the row did land the pack is visible-but-not-yet-skippable and
+        the next pass costs redundant work, never loss. Callers routing on
+        this module's taxonomy should treat a driver exception from a publish
+        as "outcome unknown: re-acquire and re-index".
         """
         self._validate_version(index_version)
         self._validate_version(published_at_ns)
@@ -1018,21 +1111,30 @@ pack_id UUID
             # It does not make the two statements atomic. A takeover landing in
             # the gap between them leaves these rows behind, inert; that is the
             # residual, and it is written up rather than glossed.
-            self._client.execute(
-                f"INSERT INTO {self._qualified(self._manifest)} "
-                "(index_version, publish_id, store_id, pack_id) "
-                "SELECT %(index_version)s, toUUID(%(publish_id)s), "
-                "tupleElement(member, 1), toUUID(tupleElement(member, 2)) "
-                "FROM (SELECT arrayJoin(%(members)s) AS member) "
-                f"WHERE {self._lease_fence()}",
-                {
-                    "index_version": index_version,
-                    "publish_id": publish_id,
-                    "members": [(ref.store_id, ref.pack_id) for ref in refs],
-                    "lease_id": lease.lease_id,
-                },
-                settings=settings,
-            )
+            #
+            # Chunked, because the members ride in the statement TEXT (the
+            # driver substitutes non-VALUES parameters client-side) and an
+            # unbounded batch would breach the server's max_query_size. Every
+            # chunk carries the same publish_id and the same fence; a chunk
+            # refused mid-way leaves earlier chunks inert exactly as the
+            # takeover gap does.
+            members = [(ref.store_id, ref.pack_id) for ref in refs]
+            for start in range(0, len(members), _MAX_INLINE_TUPLES):
+                self._client.execute(
+                    f"INSERT INTO {self._qualified(self._manifest)} "
+                    "(index_version, publish_id, store_id, pack_id) "
+                    "SELECT %(index_version)s, toUUID(%(publish_id)s), "
+                    "tupleElement(member, 1), toUUID(tupleElement(member, 2)) "
+                    "FROM (SELECT arrayJoin(%(members)s) AS member) "
+                    f"WHERE {self._lease_fence()}",
+                    {
+                        "index_version": index_version,
+                        "publish_id": publish_id,
+                        "members": members[start : start + _MAX_INLINE_TUPLES],
+                        "lease_id": lease.lease_id,
+                    },
+                    settings=settings,
+                )
         # The barrier, the fence and the visibility write are ONE server-side
         # statement, so the gap between "am I the highest?", "do I still hold
         # the lease?" and "I am now visible" holds no client round trip -- no
@@ -1051,7 +1153,13 @@ pack_id UUID
             "%(published_at_ns)s, "
             "toUInt64(%(indexed_rows)s), toUInt32(%(indexed_packs)s) "
             "FROM system.one "
-            f"WHERE (SELECT max(index_version) FROM {watermark}) "
+            # ifNull, not a bare scalar: max() over the empty watermark table
+            # answers 0 on a default profile but NULL wherever
+            # aggregate_functions_null_for_empty rewrites it, and NULL < v is
+            # NULL -- which would refuse every FIRST publish into a fresh
+            # catalog and misreport it as a lost race, forever. The client-side
+            # _max_version already handles the None; the barrier has to match.
+            f"WHERE ifNull((SELECT max(index_version) FROM {watermark}), 0) "
             "< %(index_version)s "
             f"AND {self._lease_fence()}",
             {
@@ -1196,34 +1304,52 @@ pack_id UUID
         gone either way, which is the outcome a release wanted. Idempotent, and
         a no-op when no lease is held.
 
-        **Fenced on the head being this writer's lease.** The tombstone lands
-        at ``head.term + 1``, so it becomes the head whatever was there before:
-        released blind, a writer whose lease lapsed long ago revokes whoever
-        holds the catalog now, simply by shutting down in an orderly way. The
-        successor is not told -- its next publish is fenced out, and any third
-        publisher can take the lease off it at once, because the head the
-        fence resolves to is now an expired row belonging to neither.
+        **Fenced on the head being this writer's lease, INSIDE the statement
+        that writes.** The tombstone lands at ``head.term + 1``, so it becomes
+        the head whatever was there before: released blind, a writer whose
+        lease lapsed long ago revokes whoever holds the catalog now, simply by
+        shutting down in an orderly way. And fenced by a client-side read
+        followed by a separate INSERT, the same thing happens in the window
+        between the two: a successor legitimately acquiring the lapsed lease
+        at ``head.term + 1`` has its freshly granted live term contested by
+        the tombstone -- so, exactly as in ``publish_snapshot``, the head is
+        resolved and the row written in ONE server-side statement, and a head
+        that is not this writer's writes nothing.
 
-        The local state is dropped only after the tombstone is durable. The
-        other order loses the lease locally while it stays live on the server:
-        a failed INSERT would leave nothing able to release it and nothing able
+        The local state is dropped only after the statement returns. The other
+        order loses the lease locally while it stays live on the server: a
+        failed INSERT would leave nothing able to release it and nothing able
         to publish under it until it expired.
         """
         lease = self._lease
         if lease is None:
             return
-        head = self._lease_head()
-        if head.lease_id != lease.lease_id:
-            # Not ours any more. Somebody else's row is what the fence
-            # resolves to, so there is nothing here to give back -- and
-            # tombstoning above it would take THEIR lease away.
-            self._lease = None
-            return
-        self._insert_lease_row(
-            term=head.term + 1, lease_id=lease.lease_id, holder=lease.holder,
-            ttl_ns=0,
+        self._client.execute(
+            self._release_statement(),
+            {"lease_id": lease.lease_id, "holder": lease.holder},
         )
         self._lease = None
+
+    def _release_statement(self) -> str:
+        """The fenced tombstone INSERT, as one server-side statement.
+
+        Resolves the head in the same ``term DESC, lease_id DESC`` order the
+        fence uses, writes ``head.term + 1`` already expired (``expires_at_ns
+        = now``, and the fence requires strictly greater), and writes nothing
+        when the head is not this writer's row. Exposed as a method so the
+        fakes can pin the statement they model against the one the writer
+        actually emits, exactly as they pin ``_lease_fence()``.
+        """
+        table = self._qualified(self._lease_table)
+        return (
+            f"INSERT INTO {table} "
+            "(term, lease_id, holder, acquired_at_ns, expires_at_ns) "
+            "SELECT term + 1, toUUID(%(lease_id)s), %(holder)s, "
+            "toUnixTimestamp64Nano(now64(9)), toUnixTimestamp64Nano(now64(9)) "
+            f"FROM (SELECT term, lease_id FROM {table} "
+            "ORDER BY term DESC, lease_id DESC LIMIT 1) "
+            "WHERE lease_id = toUUID(%(lease_id)s)"
+        )
 
     def _claim_lease(self, holder: str, *, lease_id: str) -> PublisherLease:
         table = self._qualified(self._lease_table)
@@ -1392,13 +1518,24 @@ pack_id UUID
         immediately before this statement expires.
         """
         return {
-            "max_execution_time": self._config.publish_timeout_ns / 1_000_000_000,
+            # An int, never a float: the config requires whole seconds so that
+            # no serialization path can truncate a fraction to 0 (= unlimited).
+            "max_execution_time": self._config.publish_timeout_ns // 1_000_000_000,
             "timeout_overflow_mode": "throw",
         }
 
     def _reject_if_the_lease_is_gone(self, lease: PublisherLease) -> None:
         head = self._lease_head()
-        if head.lease_id == lease.lease_id and head.expires_at_ns > head.now_ns:
+        if head.lease_id == lease.lease_id:
+            # The head is still this writer's row -- nobody took the lease --
+            # so the refusal was the version barrier's, and the recovery is
+            # the version-race retry. Deliberately NOT conditioned on the
+            # lease still being live at THIS read: a lease that merely expired
+            # between the fenced statement and this check (a stall, a short
+            # TTL) is not a takeover, and the indexer's retry renews it before
+            # every attempt -- classifying it as lost would bypass the one
+            # recovery that works and blame this writer's own holder for
+            # fencing it out.
             return
         self._lease = None
         raise PublisherLeaseError(
