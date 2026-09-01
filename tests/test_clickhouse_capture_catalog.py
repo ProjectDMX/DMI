@@ -582,6 +582,30 @@ def test_the_deciding_reads_carry_sequential_consistency():
     assert _settings("publisher_lease` (term", "INSERT") == [None] * 2
 
 
+def test_the_fenced_release_resolves_the_head_with_sequential_consistency():
+    """The tombstone's in-statement head read decides who gets revoked.
+
+    The release resolves the lease head inside the INSERT ... SELECT and
+    fences on it. Answered from a replica that has not fetched a successor's
+    takeover row, that subquery resolves this writer's lapsed lease as the
+    head, passes the ``lease_id`` fence, and tombstones the successor's live
+    term -- so the read carries the same consistency every other deciding
+    read does.
+    """
+    from dmi.storage.capture.clickhouse_catalog import _DECIDING_READ
+
+    client = _Client()
+    writer = _leased(client)
+
+    writer.release_publisher_lease()
+
+    release = next(
+        call for call in client.calls
+        if call[0].startswith("INSERT") and "SELECT term + 1" in call[0]
+    )
+    assert release[2].get("settings") == _DECIDING_READ
+
+
 def test_commit_packs_writes_only_the_replay_inventory():
     ref, _ = _descriptor()
     client = _Client()

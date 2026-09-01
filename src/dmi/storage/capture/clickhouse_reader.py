@@ -143,6 +143,15 @@ _EQUALITY_FILTERS = ("tenant_id", "experiment_id", "run_id", "session_id", "mode
 # group; ``_projection`` explains why, and what breaks without it.
 _RESOLUTION_ORDER = "(index_version, store_id, pack_id)"
 
+# Capture ids are inlined into the statement's TEXT: the driver substitutes
+# non-VALUES parameters client-side, and the server parses at most
+# max_query_size bytes of it (256 KiB by default). A capture_id may be up to
+# 512 bytes (``model._TEXT_LIMIT``) and escaping can double it, so one member
+# can render at ~1 KiB: chunks of this size keep the rendered id list around
+# 200 KiB even at that ceiling, where an unchunked ``max_capture_ids`` lookup
+# (10,000 ids) breaches the limit and dies with Code 62 mid-statement.
+_MAX_INLINE_IDS = 200
+
 
 @dataclass(frozen=True, slots=True)
 class ClickHouseReaderConfig:
@@ -255,15 +264,25 @@ class ClickHouseCaptureCatalog:
         return _integer(rows[0][0], "watermark")
 
     def search(self, query: CaptureQuery) -> CapturePage:
-        max_watermark = int(self.current_watermark())
         filter_hash = query.filter_hash
 
         if query.cursor is None:
-            watermark = max_watermark
+            # A stale head here merely pins a slightly older snapshot, which a
+            # fresh search cannot tell from having run a moment earlier, so the
+            # read stays cheap rather than sequentially consistent.
+            watermark = self._published_head()
             after: CursorKey | None = None
         else:
+            # The head bounds decode_cursor, which REFUSES a cursor above it.
+            # A cursor is caller data stamped with a watermark the catalog
+            # itself issued; read from a lagging replica, that genuinely
+            # published watermark reads as "ahead of the catalog" -- a hard,
+            # false rejection of a valid cursor under ordinary replication lag
+            # -- so this bounding read is deciding, exactly as get_by_ids's is.
             cursor = decode_cursor(
-                query.cursor, filter_hash=filter_hash, max_watermark=max_watermark
+                query.cursor,
+                filter_hash=filter_hash,
+                max_watermark=self._published_head(deciding=True),
             )
             watermark = cursor.watermark
             after = cursor.key
@@ -323,11 +342,6 @@ class ClickHouseCaptureCatalog:
             raise ValueError(
                 "selection watermark exceeds the published watermark"
             )
-        params = {
-            "watermark": requested,
-            "tenant_id": tenant_id,
-            "capture_ids": list(capture_ids),
-        }
         # tenant_id leads the WHERE clause because it is the first ORDER BY
         # column: without it, a capture_id-only filter -- capture_id sits
         # behind captured_at_ns in the sort key, and a lookup supplies no time
@@ -341,8 +355,26 @@ class ClickHouseCaptureCatalog:
             f"capture_id IN %(capture_ids)s AND {self._membership()} "
             f"GROUP BY {', '.join(_quoted(name) for name in _SORT_KEY)}"
         )
-        rows = self._client.execute(sql, params, settings=self._config.settings)
-        return tuple(self._descriptor(row) for row in rows)
+        # Chunked, because the ids land in the statement TEXT and a full-size
+        # lookup would breach the server's max_query_size (see _MAX_INLINE_IDS).
+        # Each chunk reads the same pinned snapshot -- the membership bound is
+        # the immutable set of packs published at or before the watermark -- so
+        # the union of the chunk results is the unchunked result. Ids are sent
+        # once each: within one statement the GROUP BY collapses a repeated id,
+        # and two chunks naming the same id would return its row twice.
+        unique_ids = list(dict.fromkeys(capture_ids))
+        descriptors: list[CaptureDescriptor] = []
+        for start in range(0, len(unique_ids), _MAX_INLINE_IDS):
+            params = {
+                "watermark": requested,
+                "tenant_id": tenant_id,
+                "capture_ids": unique_ids[start : start + _MAX_INLINE_IDS],
+            }
+            rows = self._client.execute(
+                sql, params, settings=self._config.settings
+            )
+            descriptors.extend(self._descriptor(row) for row in rows)
+        return tuple(descriptors)
 
     # -- SQL construction ---------------------------------------------------
 

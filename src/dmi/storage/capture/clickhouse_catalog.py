@@ -1329,9 +1329,15 @@ pack_id UUID
         lease = self._lease
         if lease is None:
             return
+        # A deciding read, though it rides inside an INSERT: the in-statement
+        # head resolution is what the fence evaluates, and answered from a
+        # replica that has not fetched a successor's takeover row it resolves
+        # this writer's lapsed lease as the head -- passing the fence and
+        # tombstoning the successor's live term.
         self._client.execute(
             self._release_statement(),
             {"lease_id": lease.lease_id, "holder": lease.holder},
+            settings=_DECIDING_READ,
         )
         self._lease = None
 

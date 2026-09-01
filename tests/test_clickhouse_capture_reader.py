@@ -419,6 +419,74 @@ def test_a_walk_stays_pinned_to_the_first_watermark():
     assert params["watermark"] == _WATERMARK
 
 
+def test_only_a_cursor_bearing_search_reads_the_head_as_deciding():
+    """The head read that bounds a cursor refuses the call; the other pins.
+
+    A cursorless search that reads a stale head merely pins a slightly older
+    snapshot, indistinguishable from having run a moment earlier, so it stays
+    cheap. A cursor-bearing search hands that head to ``decode_cursor``, whose
+    answer is a hard rejection -- so that read carries the same
+    ``select_sequential_consistency`` the writer's deciding reads do.
+    """
+    from dmi.storage.capture.clickhouse_catalog import _DECIDING_READ
+
+    descriptors = synthetic_descriptors(4)
+    catalog, client = _catalog(pages=[descriptors, descriptors[3:]])
+    config = ClickHouseReaderConfig()
+
+    first = catalog.search(CaptureQuery(limit=3))
+    catalog.search(CaptureQuery(limit=3, cursor=first.next_cursor))
+
+    heads = [
+        kwargs["settings"]
+        for sql, _, kwargs in client.calls
+        if "max(index_version)" in sql
+    ]
+    assert heads == [config.settings, {**config.settings, **_DECIDING_READ}]
+
+
+def test_a_cursor_at_a_published_watermark_survives_replica_lag():
+    """A cursor stamped with a watermark the catalog issued must stay valid.
+
+    On a lagging replica the plain ``max(index_version)`` read answers below
+    the published head, so a cursor the catalog itself handed out would read
+    as "ahead of the catalog" and be rejected -- a false refusal of valid
+    caller data, where a stale cursorless search merely pins an older snapshot.
+    """
+    from dmi.storage.capture.cursor import CursorKey, encode_cursor
+
+    descriptors = synthetic_descriptors(1)
+
+    class _LaggingClient(_Client):
+        def execute(self, query, params=None, **kwargs):
+            if "max(index_version)" in query:
+                self.calls.append((" ".join(query.split()), params, kwargs))
+                settings = kwargs.get("settings") or {}
+                if settings.get("select_sequential_consistency"):
+                    return [(self._watermark,)]
+                return [(self._watermark - 1,)]
+            return super().execute(query, params, **kwargs)
+
+    client = _LaggingClient(descriptors=descriptors)
+    catalog = ClickHouseCaptureCatalog(client, ClickHouseReaderConfig())
+    cursor = encode_cursor(
+        CursorKey(
+            tenant_id="tenant-a",
+            experiment_id="exp-a",
+            run_id="run-a",
+            captured_at_ns=1,
+            capture_id="capture-0",
+        ),
+        watermark=_WATERMARK,
+        filter_hash=CaptureQuery(limit=3).filter_hash,
+    )
+
+    page = catalog.search(CaptureQuery(limit=3, cursor=cursor))
+
+    assert page.watermark == str(_WATERMARK)
+    assert page.items == tuple(descriptors)
+
+
 def test_a_cursor_cannot_be_replayed_against_different_filters():
     catalog, _ = _catalog(descriptors=synthetic_descriptors(4))
     page = catalog.search(CaptureQuery(limit=3, run_id="run-a"))
@@ -520,6 +588,98 @@ def test_get_by_ids_pins_the_watermark_and_parameterises_ids():
     assert "capture_id IN %(capture_ids)s" in sql
     assert params["watermark"] == _WATERMARK
     assert resolved == expected
+
+
+def test_get_by_ids_chunks_the_inlined_id_list():
+    """The ids ride in the statement TEXT, so a full lookup has to be split.
+
+    The driver substitutes non-VALUES parameters client-side, and the server
+    parses at most ``max_query_size`` bytes (256 KiB by default) -- an
+    unchunked ``max_capture_ids`` lookup breaches it and dies with Code 62.
+    Each chunk reads the same pinned snapshot, so the union of the chunk
+    results is the unchunked result.
+    """
+    from dmi.storage.capture.clickhouse_reader import _MAX_INLINE_IDS
+
+    ids = [f"capture-{index}" for index in range(2 * _MAX_INLINE_IDS + 1)]
+    expected = synthetic_descriptors(3)
+    catalog, client = _catalog(pages=[[expected[0]], [expected[1]], [expected[2]]])
+
+    resolved = catalog.get_by_ids(
+        ids, tenant_id="tenant-a", watermark=str(_WATERMARK)
+    )
+
+    batches = [
+        params["capture_ids"]
+        for _, params, _ in client.calls
+        if params is not None and "capture_ids" in params
+    ]
+    assert [len(batch) for batch in batches] == [
+        _MAX_INLINE_IDS, _MAX_INLINE_IDS, 1,
+    ]
+    # Every id is sent, in order, exactly once.
+    assert [item for batch in batches for item in batch] == ids
+    assert resolved == tuple(expected)
+    # Every chunk runs the same statement -- same tenant lead, same watermark
+    # bound, same membership subquery.
+    assert len(set(client.selects)) == 1
+    # And the published-head check runs once, not once per chunk.
+    heads = [sql for sql, _, _ in client.calls if "max(index_version)" in sql]
+    assert len(heads) == 1
+
+
+@pytest.mark.parametrize(
+    "extra, statements",
+    [
+        pytest.param(-1, 1, id="one-under-the-chunk"),
+        pytest.param(0, 1, id="exactly-one-chunk"),
+        pytest.param(1, 2, id="one-over-the-chunk"),
+    ],
+)
+def test_get_by_ids_splits_exactly_at_the_chunk_boundary(extra, statements):
+    from dmi.storage.capture.clickhouse_reader import _MAX_INLINE_IDS
+
+    ids = [f"capture-{index}" for index in range(_MAX_INLINE_IDS + extra)]
+    catalog, client = _catalog(pages=[[] for _ in range(statements)])
+
+    catalog.get_by_ids(ids, tenant_id="tenant-a", watermark=str(_WATERMARK))
+
+    assert len(client.selects) == statements
+
+
+def test_the_id_chunk_budget_holds_at_the_text_limit():
+    """The chunk size has to survive the largest id the model admits.
+
+    One inlined id renders as at most twice ``_TEXT_LIMIT`` (escaping can
+    double it) plus quotes and a separator, and the projection and membership
+    subquery share the same 256 KiB ``max_query_size`` budget.
+    """
+    from dmi.storage.capture.clickhouse_reader import _MAX_INLINE_IDS
+    from dmi.storage.capture.model import _TEXT_LIMIT
+
+    rendered = _MAX_INLINE_IDS * (2 * _TEXT_LIMIT + 4)
+    assert rendered <= 256 * 1024 - 8 * 1024
+
+
+def test_get_by_ids_sends_each_id_once():
+    """A repeated id must not surface a capture twice.
+
+    Within one statement the GROUP BY collapses a repeated id; two chunks
+    naming the same id would each return its row. Deduplicating before
+    chunking keeps the two shapes equivalent.
+    """
+    expected = synthetic_descriptors(1)
+    catalog, client = _catalog(descriptors=expected)
+
+    resolved = catalog.get_by_ids(
+        [expected[0].capture_id, expected[0].capture_id],
+        tenant_id="tenant-a",
+        watermark=str(_WATERMARK),
+    )
+
+    _, params, _ = client.calls[-1]
+    assert params["capture_ids"] == [expected[0].capture_id]
+    assert resolved == tuple(expected)
 
 
 def test_get_by_ids_filters_on_the_tenant_before_anything_else():
