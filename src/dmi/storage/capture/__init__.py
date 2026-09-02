@@ -58,6 +58,7 @@ from .reader import CaptureReader, CaptureSummary
 from .summary import (
     CORE_SUMMARY_VERSION,
     ArtifactRef,
+    CoreTensorSummary,
     CoreTensorSummaryV1,
     decode_tensor,
     summarize_tensor,
@@ -154,6 +155,7 @@ __all__ = [
     "ClickHouseReaderConfig",
     "Cursor",
     "CursorKey",
+    "CoreTensorSummary",
     "CoreTensorSummaryV1",
     "CORE_SUMMARY_VERSION",
     "DuplicateCaptureError",

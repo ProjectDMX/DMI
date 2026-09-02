@@ -138,6 +138,14 @@ class _Client:
                 for name in params["tables"]
                 if name in self.publish_id_tables
             ]
+        if query.startswith(("CREATE TABLE", "CREATE VIEW", "CREATE OR REPLACE VIEW")):
+            # Modelled, because ensure_schema now re-reads `system.tables`
+            # after a fresh install to prove the objects it created are
+            # visible -- a check a static table list would fail outright.
+            created = query.split("`")[3]
+            if created not in self.tables:
+                self.tables = self.tables + (created,)
+            return []
         if "system.tables" in query:
             # Only the descriptor table's sort key is ever read, so the others
             # answer with a placeholder rather than a fiction that looks
@@ -154,6 +162,11 @@ class _Client:
             return [] if self.schema_version is None else [(self.schema_version,)]
         if "dmi_pack_inventory_raw` FINAL" in query and "NOT IN" in query:
             return [(self.inventory_without_membership,)]
+        if query.startswith("SELECT count() FROM `") and " WHERE " in query:
+            # The retention pass counts what a predicate matches before it
+            # deletes exactly those rows. Answered as "none", so the fake never
+            # issues the mutation and the test can assert on the predicates.
+            return [(0,)]
         if query.startswith("SELECT count() FROM (SELECT 1 FROM"):
             # The surviving-data probe behind the missing-table refusal. Keyed
             # on the shape rather than on the UNION ALL, which a catalog with
@@ -776,7 +789,14 @@ def test_a_fresh_install_stamps_the_schema_version_last():
         for index, item in enumerate(statements)
         if item.startswith("INSERT") and "dmi_schema_version" in item
     )
-    assert stamp == len(statements) - 1
+    # The last statement that WRITES anything. A fresh install now ends with a
+    # read -- confirming the objects it created are visible in `system.tables`,
+    # since the emptiness it acted on came from that same view -- and a read
+    # cannot leave a catalog claiming to be complete before it is.
+    assert not any(
+        item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
+        for item in statements[stamp + 1 :]
+    ), statements[stamp + 1 :]
     assert client.calls[stamp][1]["version"] == _SCHEMA_VERSION
     # Conditional server-side, so a rerun against a stamped catalog inserts
     # nothing and no read-then-write window exists between the two.
@@ -1551,3 +1571,53 @@ def test_drop_schema_drops_every_object_whatever_kind_it_is():
     # leaves a broken projection for as long as the teardown takes.
     assert "dmi_capture`" in drops[0]
     assert len(drops) == len(_CURRENT_OBJECTS) + 1  # + the legacy commit log
+
+
+def test_collect_garbage_deletes_only_within_its_stated_bounds():
+    """The predicates, pinned. Widening one by a comparison is the whole risk.
+
+    Each bound below is what makes a deletion safe, and none of them is
+    observable in CI any other way: `ALTER TABLE ... DELETE` reports nothing,
+    and the live test that exercises the behaviour is not collected here. So
+    the statements themselves are the assertion.
+    """
+    client = _Client()
+    writer = _leased(client)
+
+    writer.collect_garbage()
+
+    deletes = {
+        query.split("`")[3]: query
+        for query, _, _ in client.calls
+        if query.startswith("ALTER TABLE") or (
+            query.startswith("SELECT count()") and " WHERE " in query
+        )
+    }
+    counted = [
+        (query, params)
+        for query, params, _ in client.calls
+        if query.startswith("SELECT count() FROM `") and " WHERE " in query
+    ]
+    by_table = {query.split("`")[3]: (query, params) for query, params in counted}
+
+    manifest_query, manifest_params = by_table["dmi_snapshot_manifest"]
+    # Strictly BELOW the published head: an in-flight publish always sits above
+    # it, so this cannot delete membership out from under one.
+    assert "index_version < %(published)s" in manifest_query
+    # And only rows no watermark row pairs with.
+    assert "NOT IN (SELECT index_version, publish_id FROM" in manifest_query
+    assert manifest_params["published"] == writer.last_published_version()
+
+    lease_query, _ = by_table["dmi_publisher_lease"]
+    # Strictly below the head TERM, so the row the fence resolves survives
+    # whether or not it has expired.
+    assert "term < %(term)s" in lease_query
+
+    claims_query, claims_params = by_table["dmi_capture_version_claims"]
+    # At or below the published head: the watermark keeps the allocator's floor
+    # once these are gone, and a claim ABOVE the head may be a version a pass
+    # has allocated and not yet published.
+    assert "version <= %(published)s" in claims_query
+    assert claims_params["published"] == writer.last_published_version()
+    # The watermark table is never collected -- it IS the floor.
+    assert "dmi_index_watermark" not in deletes

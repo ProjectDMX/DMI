@@ -157,6 +157,25 @@ class ClickHouseReaderConfig:
     max_rows_to_read: int = 50_000_000
     max_bytes_to_read: int = 4 * 1024**3
     max_execution_time: int = 15
+    # Whether the statement that reads DESCRIPTORS waits for its replica to
+    # catch up, as the watermark read before it already does.
+    #
+    # It is not redundant with that read, and this is the whole reason the
+    # setting exists: a ReplicatedMergeTree keeps a replication log PER TABLE,
+    # so a replica synced on `{prefix}_index_watermark` may still be behind on
+    # `{prefix}_snapshot_manifest` and `{prefix}_capture_raw`. Left plain, a
+    # read pinned to a genuinely published watermark returns a SHORT page --
+    # and `search` issues a cursor at that watermark, so the next page resumes
+    # PAST the rows that were missing. Captures are skipped in a walk that
+    # reports success. Lag can only omit, never invent, so nothing unpublished
+    # or cross-tenant is exposed either way.
+    #
+    # Costed rather than assumed: on a single node the server accepts and
+    # ignores it (verified on 25.12), so this is free unless the tables are
+    # replicated. On a replicated deployment it makes every page wait for the
+    # replica, which is the price of a walk that does not skip. An operator who
+    # would rather have the latency can turn it off and accept the gap.
+    consistent_snapshot_reads: bool = True
 
     def __post_init__(self) -> None:
         _identifier(self.database)
@@ -185,6 +204,13 @@ class ClickHouseReaderConfig:
             "read_overflow_mode": "throw",
             "timeout_overflow_mode": "throw",
         }
+
+    @property
+    def bounded_read_settings(self) -> dict[str, object]:
+        """Settings for a statement that resolves against a pinned watermark."""
+        if not self.consistent_snapshot_reads:
+            return self.settings
+        return {**self.settings, **_DECIDING_READ}
 
 
 def _text(value: object, name: str) -> str:
@@ -288,7 +314,9 @@ class ClickHouseCaptureCatalog:
             f"ORDER BY {', '.join(_quoted(name) for name in _SORT_KEY)} "
             "LIMIT %(row_limit)s"
         )
-        rows = self._client.execute(sql, params, settings=self._config.settings)
+        rows = self._client.execute(
+            sql, params, settings=self._config.bounded_read_settings
+        )
         descriptors = tuple(self._descriptor(row) for row in rows)
 
         next_cursor = None
@@ -361,7 +389,7 @@ class ClickHouseCaptureCatalog:
                 "capture_ids": chunk,
             }
             rows = self._client.execute(
-                sql, params, settings=self._config.settings
+                sql, params, settings=self._config.bounded_read_settings
             )
             descriptors.extend(self._descriptor(row) for row in rows)
         return tuple(descriptors)

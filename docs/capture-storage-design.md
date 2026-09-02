@@ -305,6 +305,30 @@ treats them as hints. Reconciliation scans recent time partitions and scheduled
 older partitions, compares pack identities with indexed state, and replays any
 missing work.
 
+### A pack's footer is not evidence of whose it is
+
+The footer names the tenant; the key prefix names where a writer with
+credentials for that tenant is allowed to put objects. Until descriptors are
+built, nothing compares them -- and integrity proves nothing here, because a
+forged pack is perfectly well formed. Anyone able to PUT into the bucket could
+therefore write a pack whose footer carried another tenant's `tenant_id` and
+`capture_id`, have it indexed under the victim's tenant, and -- since the
+reader resolves a capture with `argMax` over `(index_version, store_id,
+pack_id)` -- become the pack that capture resolves to at every fresh watermark.
+
+`_descriptors` now refuses a pack whose records name a tenant other than the
+one its key belongs to, comparing against the same `key_component` encoding
+that wrote the key (including the digest form an over-long identifier takes,
+which is one-way and so has to be re-encoded rather than decoded). A key with
+no `tenant=` segment is left alone: a filesystem store, a test fixture and a
+hand-placed object are all legitimately laid out some other way, and a check
+that guessed would refuse them all. What is enforced is that a key which DOES
+name a tenant names the pack's own.
+
+This is a bound on damage, not a substitute for object-store authorization.
+Per-tenant buckets or prefix-scoped credentials remain the primary control; the
+check is what makes a breach of that control visible instead of silent.
+
 ## Catalog indexer
 
 The indexer is isolated from capture hosts and scales independently. For each
@@ -552,6 +576,60 @@ replicated deployment also has to make the descriptor inserts quorum-durable
 before their watermark row, or a failover can leave a published version whose
 rows are on a replica that is gone. Both are latency decisions about a
 deployment, not something this module can pick.
+
+### Retention
+
+Three tables grow with every pass and nothing collected them: a publisher
+publishing once a second appends ~86k `{prefix}_publisher_lease` rows a day,
+every allocation leaves a `{prefix}_capture_version_claims` row, and every
+publish that loses its version race leaves a full set of manifest rows behind.
+The only removal path was `drop_schema()`, which destroys the catalog.
+
+`ClickHouseCatalogWriter.collect_garbage()` deletes exactly the rows that can
+never be resolved again, and returns how many it removed per table. It is
+explicit and belongs in a maintenance job, never on the write path: a mutation
+is a background rewrite of the parts it touches, and an indexer that ran one
+inline would pay for it in the middle of a publish.
+
+| Table | Deleted | Why it can never be resolved again |
+|---|---|---|
+| `{prefix}_snapshot_manifest` | rows below the published head whose `(index_version, publish_id)` has no watermark row | below the head, that publish's watermark INSERT can no longer land -- the barrier requires strictly above -- so the pair membership needs will never exist. An in-flight publish always sits ABOVE the head, which is what keeps this from deleting membership out from under one |
+| `{prefix}_publisher_lease` | rows below the head `term` | the fence resolves exactly one row, the highest `(term, lease_id)`, and terms only increase. The head is kept even when expired: it is what a takeover has to sort above |
+| `{prefix}_capture_version_claims` | rows at or below the published head | the allocator picks above `max(claims.version)` AND above `last_published_version()`, so the watermark keeps the floor once these are gone. Claims ABOVE the head stay -- one may be a version a pass has allocated and not yet published |
+
+`{prefix}_index_watermark` and the descriptor and inventory tables are never
+collected here. The watermark log IS the floor the other two bounds are
+measured against, and the descriptors are the catalog.
+
+### Reading under replication lag
+
+A bounded read resolves against a pinned watermark, and the statement that
+reads the watermark has always carried `select_sequential_consistency`. The
+statement that reads DESCRIPTORS now carries it too, because the first does not
+imply the second: a `ReplicatedMergeTree` keeps a replication log **per table**,
+so a replica caught up on `{prefix}_index_watermark` can still be behind on
+`{prefix}_snapshot_manifest` and `{prefix}_capture_raw`. Left plain, a read
+pinned to a genuinely published watermark returns a SHORT page -- and `search`
+issues its cursor at that watermark, so the next page resumes past the rows
+that were missing, and a walk skips captures while reporting success. Lag can
+only omit, never invent, so nothing unpublished or cross-tenant is exposed
+either way.
+
+On a single node the server accepts and ignores the setting (verified on
+25.12), so this is free unless the tables are replicated; there it makes every
+page wait for the replica. `ClickHouseReaderConfig.consistent_snapshot_reads`
+turns it off for an operator who would rather have the latency and accept the
+gap.
+
+The WRITE half is now available and still off by default:
+`ClickHouseCatalogConfig.insert_quorum` sets `insert_quorum` (and clears
+`insert_quorum_parallel`, which `select_sequential_consistency` does not work
+with) on the writes the protocols decide on -- version claims, lease claims,
+membership and the watermark. Without it the sole-claimant protocols are sound
+on a single node and on a quorum-writing cluster, and not in between. It is
+deliberately not applied to the descriptor and inventory bulk writes: those
+decide nothing, and quorum latency per batch is the cost that makes operators
+turn the whole thing off.
 
 ### Catalog schema versions and rebuild
 

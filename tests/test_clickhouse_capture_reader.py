@@ -557,8 +557,34 @@ def test_every_statement_carries_the_query_limits():
 
     assert client.calls, "expected at least one statement"
     for _, _, kwargs in client.calls:
-        assert kwargs["settings"] == config.settings
+        # Every statement carries the BOUNDS; a statement that resolves against
+        # a pinned watermark carries the snapshot consistency setting on top of
+        # them, which is a superset rather than a different map.
+        assert config.settings.items() <= kwargs["settings"].items()
+        assert set(kwargs["settings"]) - set(config.settings) <= {
+            "select_sequential_consistency"
+        }
     assert config.settings["read_overflow_mode"] == "throw"
+
+
+def test_a_bounded_read_can_be_told_not_to_wait_for_its_replica():
+    """The consistency the data statement pays for is an operator's choice.
+
+    On by default, because a replica synced on the watermark table can still be
+    behind on the manifest and descriptor tables -- ClickHouse keeps a
+    replication log per table -- and a short page under a cursor issued at that
+    watermark makes the NEXT page resume past the rows that were missing. An
+    operator who would rather have the latency can say so.
+    """
+    from dmi.storage.capture.clickhouse_catalog import _DECIDING_READ
+
+    strict = ClickHouseReaderConfig()
+    relaxed = ClickHouseReaderConfig(consistent_snapshot_reads=False)
+
+    assert _DECIDING_READ.items() <= strict.bounded_read_settings.items()
+    assert relaxed.bounded_read_settings == relaxed.settings
+    # The bounds survive either way; consistency is added, never substituted.
+    assert strict.settings.items() <= strict.bounded_read_settings.items()
 
 
 def test_get_by_ids_refuses_an_oversized_lookup():

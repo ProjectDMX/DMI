@@ -225,7 +225,21 @@ class ClickHouseLeaseCoordinator:
                 "holder": holder,
                 "ttl_ns": self._config.lease_ttl_ns,
             },
+            # A DECIDING write: the head read that follows decides whether this
+            # claimant holds the lease, and a read is only as sound as the
+            # durability of the write it is asked about. Empty unless an
+            # operator has opted in -- see ClickHouseCatalogConfig.
+            settings=self._quorum_write() or None,
         )
+
+    def _quorum_write(self) -> dict[str, object]:
+        quorum = getattr(self._config, "insert_quorum", None)
+        if quorum is None:
+            return {}
+        # insert_quorum_parallel is cleared alongside: ClickHouse's
+        # select_sequential_consistency does not work with it, so the quorum
+        # without this buys latency and no guarantee.
+        return {"insert_quorum": quorum, "insert_quorum_parallel": 0}
 
     @property
     def _qualified_table(self) -> str:

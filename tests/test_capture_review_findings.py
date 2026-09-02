@@ -27,6 +27,8 @@ from dmi.storage.capture import (
     ClickHouseCatalogWriter,
     DirectPackSink,
     FilesystemPackStore,
+    PackIndex,
+    PackIntegrityError,
     HostCapturePipeline,
     PackRef,
     PackWriter,
@@ -111,9 +113,12 @@ def test_every_character_key_encoding_passes_through_is_accepted(character: str)
     """
     metadata = _metadata(tenant_id=f"acme{character}lab")
 
-    from dmi.storage.capture.pipeline import _key_component
+    # The encoder moved to `pack`, which is where the verifier that has to
+    # agree with it lives: `_descriptors` compares a pack's footer against
+    # the key it was found under.
+    from dmi.storage.capture.pack import key_component
 
-    encoded = _key_component(metadata.tenant_id)
+    encoded = key_component(metadata.tenant_id)
     validate_object_key(f"tenant={encoded}/x.dmi-pack")
 
 
@@ -367,3 +372,89 @@ def test_a_clock_that_steps_backwards_cannot_publish_under_a_pinned_watermark(
     published = client.watermarks
     assert published == sorted(published), f"versions went backwards: {published}"
     assert len(set(published)) == len(published), "a version was reused"
+
+
+# --- a pack's footer is not evidence of whose it is -------------------------
+
+
+def _pack_at(tmp_path: Path, object_key: str, *, tenant_id: str):
+    """Put a pack for ``tenant_id`` at ``object_key``, whoever that key belongs to."""
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed(_record(_metadata(tenant_id=tenant_id)))
+    return store, store.put(sealed, object_key)
+
+
+def test_a_pack_whose_footer_names_another_tenant_is_refused(tmp_path: Path):
+    """The forgery the object store cannot prevent, refused where it is visible.
+
+    Anyone able to PUT into the bucket can write a well-formed pack whose
+    footer carries another tenant's `tenant_id` and `capture_id`. Integrity
+    proves nothing about it -- the pack is perfectly well formed -- and until
+    the descriptors are built, nothing has ever compared what the pack CLAIMS
+    to be against where it was found. Indexed, it would be admitted under the
+    victim's tenant, and since the reader resolves a capture with `argMax` over
+    `(index_version, store_id, pack_id)` it can become the pack that capture
+    resolves to at every fresh watermark.
+    """
+    store, ref = _pack_at(
+        tmp_path,
+        "v1/tenant=victim/date=2026-09-01/session=s/rank=0/"
+        f"{PACK_ID}.dmi-pack",
+        tenant_id="attacker",
+    )
+
+    with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+        PackIndex.from_store(store, ref).descriptors()
+
+
+def test_a_pack_under_its_own_tenants_prefix_is_accepted(tmp_path: Path):
+    """The other side: the check must not refuse the ordinary case."""
+    store, ref = _pack_at(
+        tmp_path,
+        "v1/tenant=tenant-a/date=2026-09-01/session=s/rank=0/"
+        f"{PACK_ID}.dmi-pack",
+        tenant_id="tenant-a",
+    )
+
+    descriptors = PackIndex.from_store(store, ref).descriptors()
+
+    assert [item.metadata.tenant_id for item in descriptors] == ["tenant-a"]
+
+
+def test_a_tenant_too_long_for_a_key_segment_still_binds(tmp_path: Path):
+    """`key_component` digests an identifier too long for a segment.
+
+    That encoding is one-way, so a comparison that only knew how to unquote
+    would silently stop checking exactly the tenants whose names are least
+    guessable. The verifier re-encodes instead.
+    """
+    from dmi.storage.capture.pack import key_component
+
+    tenant = "t" * 300
+    encoded = key_component(tenant)
+    assert encoded.startswith("sha256-")
+
+    store, ref = _pack_at(
+        tmp_path,
+        f"v1/tenant={encoded}/date=2026-09-01/session=s/rank=0/{PACK_ID}.dmi-pack",
+        tenant_id=tenant,
+    )
+    assert PackIndex.from_store(store, ref).descriptors()
+
+    other, forged = _pack_at(
+        tmp_path / "other",
+        f"v1/tenant={encoded}/date=2026-09-01/session=s/rank=0/{PACK_ID}.dmi-pack",
+        tenant_id="somebody-else",
+    )
+    with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+        PackIndex.from_store(other, forged).descriptors()
+
+
+def test_a_key_that_names_no_tenant_is_left_alone(tmp_path: Path):
+    """A filesystem store, a fixture and a hand-placed object are all
+    legitimately laid out some other way, and a check that guessed at those
+    would refuse every one of them. What is enforced is that a key which DOES
+    name a tenant names the pack's own."""
+    store, ref = _pack_at(tmp_path, "packs/a.dmi-pack", tenant_id="tenant-a")
+
+    assert PackIndex.from_store(store, ref).descriptors()

@@ -81,6 +81,24 @@ class ClickHouseCatalogConfig:
     publish_timeout_ns: int = 5_000_000_000
     # Compatibility-only: contested terms now wait for expiry instead of retrying.
     lease_attempts: int = 8
+    # The WRITE half of the consistency story, and off by default because it is
+    # a deployment decision rather than one this module can make.
+    #
+    # ``select_sequential_consistency`` is necessary but NOT sufficient on a
+    # ReplicatedMergeTree: ClickHouse defines it against inserts made with
+    # ``insert_quorum``, and it does not work with ``insert_quorum_parallel``
+    # (on by default). Without this, two claimants on two replicas can still
+    # each read themselves alone -- the sole-claimant protocols are sound on a
+    # single node and on a quorum-writing cluster, and not in between.
+    #
+    # Set to the quorum size (2 or more) on a replicated deployment. Every
+    # write the protocols DECIDE on -- version claims, lease claims, membership
+    # and the watermark -- then waits for that many replicas, and the reads
+    # above are answered against something durable. It is deliberately not
+    # applied to the descriptor and inventory bulk writes: those decide
+    # nothing, and paying quorum latency per batch is the cost that makes
+    # operators turn the whole thing off.
+    insert_quorum: int | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.database)
@@ -101,6 +119,14 @@ class ClickHouseCatalogConfig:
                 "between them is what keeps a publish statement from still "
                 "running when its lease becomes takeable"
             )
+        if self.insert_quorum is not None and (
+            type(self.insert_quorum) is not int or self.insert_quorum < 2
+        ):
+            raise ValueError(
+                "insert_quorum must be None or an integer of at least 2: a "
+                "quorum of one is what the default already gives, and setting "
+                "it to 1 reads as protection that is not there"
+            )
         if self.publish_timeout_ns % 1_000_000_000:
             # max_execution_time is sent as WHOLE seconds. A fractional value
             # is deployment roulette: modern servers parse the string, older
@@ -116,31 +142,6 @@ class ClickHouseCatalogConfig:
 
 
 
-# Settings for the statements whose answers DECIDE something: which claimant
-# owns a version, whether a publish landed, what the published head is. Each of
-# those is a read-back of the reader's own write, and the sole-claimant
-# protocols are only sound while a later write always observes an earlier one.
-#
-# A single ClickHouse node gives that for free. A ReplicatedMergeTree does not:
-# a replica serves reads from whatever log entries it has fetched, so a
-# read-back can miss a row another publisher has already committed and two
-# claimants can both see themselves alone. ``select_sequential_consistency``
-# makes the read wait for the replica to reach the latest committed log entry,
-# or throw -- either is an outcome the protocol can act on, where a stale answer
-# is not.
-#
-# Set on the reads rather than validated at construction, deliberately. There is
-# nothing to validate at construction: the tables need not exist yet, an
-# operator can convert them to Replicated afterwards, and a warning nobody reads
-# is not enforcement. Setting it is unconditional and costs nothing on a
-# non-replicated table, where the server accepts and ignores it (verified on
-# 25.12).
-#
-# The write-side half is NOT set here and is not claimed: ClickHouse pairs
-# ``select_sequential_consistency`` with ``insert_quorum`` on the writes, and a
-# replicated deployment also has to make the DESCRIPTOR inserts quorum-durable
-# before their watermark row, which is a deployment decision about latency, not
-# something this module can pick. See docs/catalog-descriptor-key.md.
 def _inline_chunks(items: list[PackIdentity]):
     return _inline_chunks_by_size(items, item_bytes=_inline_tuple_bytes)
 
@@ -276,6 +277,12 @@ class ClickHouseCatalogWriter:
         """
         self._validate_version(index_version)
         self._validate_version(published_at_ns)
+        # Interpolated into the statement TEXT like the version is, so they get
+        # the same guard. The driver renders an unknown type through str()
+        # WITHOUT escaping, so "these are always len(...) at the only call
+        # site" is a property of today's caller rather than of this method.
+        self._validate_count(indexed_rows, "indexed_rows")
+        self._validate_count(indexed_packs, "indexed_packs")
         lease = self.renew_publisher_lease()
         watermark = self._qualified(self._watermark)
         # One identity per ATTEMPT, not per allocated version: what has to be
@@ -284,7 +291,11 @@ class ClickHouseCatalogWriter:
         # the allocator's claim_id would make a duplicate publish at V read back
         # as its own, which is the failure this identity exists to catch.
         publish_id = str(uuid4())
-        settings = {**_DECIDING_READ, **self._publish_timeout()}
+        settings = {
+            **_DECIDING_READ,
+            **self._publish_timeout(),
+            **self._quorum_write(),
+        }
         if refs:
             # Fenced too, so that a publisher fenced out BEFORE this statement
             # leaves the catalog byte for byte as it found it. These rows would
@@ -482,6 +493,97 @@ class ClickHouseCatalogWriter:
     def _reject_if_the_lease_is_gone(self, lease: PublisherLease) -> None:
         self._leases.reject_if_gone(lease)
 
+    def collect_garbage(self) -> dict[str, int]:
+        """Delete the rows the protocols append and never need again.
+
+        Three tables grow with every pass and nothing collected them. A
+        publisher publishing once a second appends ~86k lease rows a day; each
+        publish that loses its version race leaves a full set of manifest rows
+        behind; every allocation leaves a claim. The only removal path in the
+        module was ``drop_schema()``, which destroys the catalog.
+
+        Explicit rather than automatic, and never called from the write path:
+        a mutation is a background rewrite of the parts it touches, so an
+        indexer that ran one inline would pay for it in the middle of a
+        publish. Run it from a maintenance job.
+
+        Returns the number of rows removed per table. Every bound below is
+        chosen so that the rows it deletes can never be resolved again by the
+        fence, the allocator, or a membership read -- not merely that they look
+        old.
+        """
+        removed: dict[str, int] = {}
+        published = self.last_published_version()
+        head = self._lease_head()
+        settings = {"mutations_sync": 1}
+
+        # Manifest rows of a publish that never reached the watermark, at a
+        # version BELOW the published head. Below the head, its watermark
+        # INSERT can no longer land -- the barrier requires strictly above --
+        # so the pair the membership predicate needs will never exist. An
+        # in-flight publish always sits ABOVE the head, which is what keeps
+        # this from deleting membership out from under it.
+        removed[self._manifest] = self._delete_rows(
+            self._manifest,
+            "index_version < %(published)s AND (index_version, publish_id) "
+            f"NOT IN (SELECT index_version, publish_id FROM "
+            f"{self._qualified(self._watermark)})",
+            {"published": published},
+            settings,
+        )
+
+        # Lease rows below the head TERM. The fence resolves exactly one row --
+        # the highest ``(term, lease_id)`` -- and terms only ever increase, so
+        # a row below the head can never become the head again. The head itself
+        # is kept whether or not it has expired: it is what a takeover has to
+        # sort above, and deleting it would let a stale claimant's next term
+        # collide with a live one's.
+        if head.term:
+            removed[self._schema.lease_table] = self._delete_rows(
+                self._schema.lease_table,
+                "term < %(term)s",
+                {"term": head.term},
+                settings,
+            )
+
+        # Version claims at or below the published head. The allocator picks
+        # above ``max(claims.version)`` AND above ``last_published_version()``,
+        # so the watermark keeps the floor once these are gone -- which is why
+        # the watermark table itself is never collected here, and why claims
+        # ABOVE the head stay: one of them may be a version allocated by a pass
+        # that has not published yet.
+        removed[self._version_claims] = self._delete_rows(
+            self._version_claims,
+            "version <= %(published)s",
+            {"published": published},
+            settings,
+        )
+        return removed
+
+    def _delete_rows(
+        self, table: str, predicate: str, params: dict, settings: dict
+    ) -> int:
+        """Count the rows a predicate matches, then delete exactly those.
+
+        Counted first because ``ALTER TABLE ... DELETE`` reports nothing about
+        what it removed, and a maintenance job that cannot say what it deleted
+        is one nobody runs twice. The count is a separate statement, so a row
+        written between the two is simply collected on the next run.
+        """
+        qualified = self._qualified(table)
+        matched = self._client.execute(
+            f"SELECT count() FROM {qualified} WHERE {predicate}",
+            params,
+            settings=_DECIDING_READ,
+        )[0][0]
+        if matched:
+            self._client.execute(
+                f"ALTER TABLE {qualified} DELETE WHERE {predicate}",
+                params,
+                settings=settings,
+            )
+        return int(matched)
+
     def last_published_version(self) -> int:
         """Highest published index_version, or 0 when nothing is published."""
         return self._max_version(
@@ -524,6 +626,7 @@ class ClickHouseCatalogWriter:
                 f"INSERT INTO {self._qualified(self._version_claims)} "
                 "(version, claim_id, claimed_at_ns) VALUES",
                 [(candidate, claim_id, time_ns())],
+                settings=self._quorum_write() or None,
             )
             owners = self._client.execute(
                 f"SELECT toString(claim_id) FROM "
@@ -583,6 +686,26 @@ class ClickHouseCatalogWriter:
 
     def _qualified(self, table: str) -> str:
         return f"{_quoted(self._config.database)}.{_quoted(table)}"
+
+    def _quorum_write(self) -> dict[str, object]:
+        """The settings that make a DECIDING write durable before it is read.
+
+        Empty unless an operator has opted in, so a single-node deployment
+        pays nothing and nothing changes for anyone who has not asked for it.
+        ``insert_quorum_parallel`` is turned OFF alongside, because
+        ``select_sequential_consistency`` does not work with it -- setting the
+        quorum without clearing the parallel flag would buy latency and no
+        guarantee at all.
+        """
+        quorum = self._config.insert_quorum
+        if quorum is None:
+            return {}
+        return {"insert_quorum": quorum, "insert_quorum_parallel": 0}
+
+    @staticmethod
+    def _validate_count(value: object, name: str) -> None:
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
 
     @staticmethod
     def _validate_version(index_version: int) -> None:

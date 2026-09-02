@@ -7,6 +7,7 @@ import json
 import re
 import struct
 from typing import Iterable
+from urllib.parse import quote
 from uuid import UUID
 import zlib
 
@@ -548,10 +549,74 @@ def _parse_records(decoded: dict[str, object], footer_offset: int) -> tuple[_Ind
     return tuple(records)
 
 
+def key_component(value: str) -> str:
+    """Encode one identifier as a single object-key segment.
+
+    Lives here rather than beside the key builder in :mod:`.pipeline` because
+    it now has a second caller: ``_descriptors`` compares a pack's footer
+    against the key it was found under, and a verifier that re-implemented the
+    encoding would drift from the writer that produced it.
+
+    ``quote()`` treats ``~`` as always-safe per RFC 3986 and ignores ``safe``
+    for it, but the object-key pattern does not allow it. Left alone, an
+    identifier containing ``~`` produces a key every store rejects, and the
+    sink failure is fatal to the whole pipeline. An identifier too long for a
+    key segment is replaced by a digest of itself, which is one-way -- so the
+    comparison below has to be able to recognise that form too.
+    """
+    encoded = quote(value, safe="-_.=").replace("~", "%7E")
+    if len(encoded.encode()) <= 160:
+        return encoded
+    return "sha256-" + sha256(value.encode()).hexdigest()
+
+
+def _tenant_segment(object_key: str) -> str | None:
+    """The ``tenant=`` segment of a key laid out by ``object_key_for``."""
+    for segment in object_key.split("/"):
+        if segment.startswith("tenant="):
+            return segment[len("tenant=") :]
+    return None
+
+
+def _reject_a_foreign_tenant(ref: PackRef, records: tuple[_IndexedRecord, ...]) -> None:
+    """Bind what a pack CLAIMS to be to where it was actually found.
+
+    The footer names the tenant; the key prefix names where a writer with
+    credentials for that tenant is allowed to put objects. Nothing compared
+    them, so anyone able to PUT into the bucket could write a well-formed pack
+    whose footer carried another tenant's ``tenant_id`` and ``capture_id``,
+    have it indexed under the victim's tenant, and -- because the reader
+    resolves a capture with ``argMax`` over ``(index_version, store_id,
+    pack_id)`` -- become the pack that capture resolves to for every fresh
+    watermark. Integrity of the pack proves nothing here: the attacker's pack
+    is perfectly well-formed. Only its LOCATION is evidence, and this is where
+    the two meet.
+
+    A key with no ``tenant=`` segment is left alone: a filesystem store, a
+    test fixture and a hand-placed object are all legitimately laid out some
+    other way, and a check that guessed would refuse them all. What this
+    enforces is that a key which DOES name a tenant names the pack's own.
+    """
+    encoded = _tenant_segment(ref.object_key)
+    if encoded is None:
+        return
+    for item in records:
+        tenant = item.metadata.tenant_id
+        if encoded != key_component(tenant):
+            raise PackIntegrityError(
+                f"pack {ref.pack_id} at {ref.object_key!r} carries a record "
+                f"for tenant {tenant!r}, which is not the tenant that key "
+                "belongs to. A pack's footer is not evidence of whose it is -- "
+                "the location it was written to is -- so this is refused "
+                "rather than indexed under the tenant named by the key."
+            )
+
+
 def _descriptors(
     ref: PackRef, records: Iterable[_IndexedRecord]
 ) -> tuple[CaptureDescriptor, ...]:
     records = tuple(records)
+    _reject_a_foreign_tenant(ref, records)
     return tuple(
         CaptureDescriptor(
             metadata=item.metadata,

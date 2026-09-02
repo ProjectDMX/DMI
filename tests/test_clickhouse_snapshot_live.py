@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from os import environ
 from dataclasses import replace
 from time import sleep
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -1437,3 +1437,102 @@ def test_two_packs_written_at_one_version_resolve_to_one_pack_stably():
         assert merged_page == first_page, (
             "a merge changed which pack a pinned page resolves to"
         )
+
+
+def test_collect_garbage_removes_only_what_can_never_be_resolved_again():
+    """The three tables that grow forever, and the bounds that make it safe.
+
+    Every publish renews the lease (a row), every allocation claims a version
+    (a row), and every publish that loses its race leaves a full set of
+    manifest rows behind. Nothing collected any of them, and the only removal
+    path was dropping the catalog.
+
+    What this test is really about is the KEEP side. Each bound is chosen so
+    that what it deletes can never be resolved again -- by the fence, by the
+    allocator, or by a membership read -- and the cheapest way to get that
+    wrong is to widen one by a single comparison.
+    """
+    corpus = synthetic_descriptors(2)
+    refs = _refs(corpus)
+    with _catalog() as (writer, reader, client, config):
+        prefix = f"`{config.database}`.`{config.table_prefix}"
+        manifest = f"{prefix}_snapshot_manifest`"
+        leases = f"{prefix}_publisher_lease`"
+        claims = f"{prefix}_capture_version_claims`"
+
+        # Allocated rather than hardcoded, so the claims table holds the spent
+        # claims a real pass leaves behind.
+        first = writer.allocate_version()
+        writer.write_descriptors(corpus, index_version=first)
+        _publish(writer, first, refs=refs, rows=len(corpus))
+        _commit(writer, corpus, first)
+        # A second published version, so the first sits strictly below the head.
+        second = writer.allocate_version()
+        writer.write_descriptors(corpus, index_version=second)
+        _publish(writer, second, refs=refs, rows=len(corpus))
+
+        # Membership from a publish that never reached the watermark, below the
+        # head -- exactly what a lost version race leaves behind.
+        orphan = uuid4()
+        client.execute(
+            f"INSERT INTO {manifest} "
+            "(index_version, publish_id, store_id, pack_id) VALUES",
+            [(first, orphan, ref.store_id, UUID(ref.pack_id)) for ref in refs],
+        )
+        # A version allocated but not yet published: its claim is ABOVE the
+        # published head and is the allocator's only record of it.
+        pending = writer.allocate_version()
+        assert pending > second
+
+        before_leases = client.execute(f"SELECT count() FROM {leases}")[0][0]
+        assert before_leases > 1, "precondition: renewals should have accrued"
+
+        removed = writer.collect_garbage()
+
+        # Gone: the inert membership, the superseded lease rows, the spent
+        # claims.
+        assert removed[f"{config.table_prefix}_snapshot_manifest"] == len(refs)
+        assert removed[f"{config.table_prefix}_publisher_lease"] >= 1
+        assert removed[f"{config.table_prefix}_capture_version_claims"] >= 1
+        assert client.execute(
+            f"SELECT count() FROM {manifest} WHERE publish_id = %(id)s",
+            {"id": orphan},
+        ) == [(0,)]
+
+        # Kept: the membership of both published versions, so nothing that was
+        # visible stopped being visible.
+        assert client.execute(
+            f"SELECT count() FROM {manifest} WHERE index_version IN "
+            "(%(first)s, %(second)s)",
+            {"first": first, "second": second},
+        ) == [(2 * len(refs),)]
+        assert len(reader.search(CaptureQuery(limit=10)).items) == len(corpus)
+        assert len(
+            reader.get_by_ids(
+                [corpus[0].capture_id],
+                tenant_id=corpus[0].metadata.tenant_id,
+                watermark=str(first),
+            )
+        ) == 1, "a pinned older snapshot still resolves"
+
+        # Kept: the head lease row. The fence resolves one row and terms only
+        # increase, so deleting it would let a stale claimant collide with a
+        # live one -- and the writer must still be able to publish.
+        assert client.execute(f"SELECT count() FROM {leases}")[0][0] >= 1
+        # Kept: the claim above the published head, which is the only record
+        # that `pending` was ever handed out.
+        assert client.execute(
+            f"SELECT count() FROM {claims} WHERE version = %(v)s", {"v": pending}
+        ) == [(1,)]
+
+        # And the catalog still works: the pending version publishes, and the
+        # allocator still hands out something above everything.
+        writer.write_descriptors(corpus, index_version=pending)
+        _publish(writer, pending, refs=refs, rows=len(corpus))
+        assert int(reader.current_watermark()) == pending
+        assert writer.allocate_version() > pending
+
+        # Idempotent: a second pass has nothing left to do.
+        assert writer.collect_garbage()[
+            f"{config.table_prefix}_snapshot_manifest"
+        ] == 0

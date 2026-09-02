@@ -64,7 +64,7 @@ def _numpy():
 
 
 @dataclass(frozen=True, slots=True)
-class CoreTensorSummaryV1:
+class CoreTensorSummary:
     """Statistics over one decoded tensor.
 
     ``mean``, ``minimum``, ``maximum``, ``abs_max`` and ``l2_norm`` are computed
@@ -113,6 +113,14 @@ class ArtifactRef:
     content_type: str
 
 
+# The name this class shipped under while ``CORE_SUMMARY_VERSION`` was 1. It is
+# kept as an alias rather than dropped: the class is re-exported from the
+# package, so a downstream ``isinstance`` or import would break for a rename
+# that changes nothing about the data. It is the same object, not a subclass,
+# so an existing check keeps passing.
+CoreTensorSummaryV1 = CoreTensorSummary
+
+
 def decode_tensor(descriptor: CaptureDescriptor, payload: bytes) -> "np.ndarray":
     """Decode a hydrated payload into its tensor.
 
@@ -146,7 +154,7 @@ def decode_tensor(descriptor: CaptureDescriptor, payload: bytes) -> "np.ndarray"
 
 def summarize_tensor(
     descriptor: CaptureDescriptor, payload: bytes
-) -> CoreTensorSummaryV1:
+) -> CoreTensorSummary:
     """Compute the versioned core summary for one hydrated capture."""
     numpy = _numpy()
     array = decode_tensor(descriptor, payload)
@@ -159,7 +167,7 @@ def summarize_tensor(
         zero: float | int = (
             0.0 if descriptor.metadata.dtype in _FLOAT_DTYPES else 0
         )
-        return CoreTensorSummaryV1(
+        return CoreTensorSummary(
             summary_version=CORE_SUMMARY_VERSION,
             element_count=0,
             finite_count=0,
@@ -194,7 +202,7 @@ def summarize_tensor(
 
     finite_count = int(finite.size)
     if finite_count == 0:
-        return CoreTensorSummaryV1(
+        return CoreTensorSummary(
             summary_version=CORE_SUMMARY_VERSION,
             element_count=element_count,
             finite_count=0,
@@ -237,7 +245,7 @@ def summarize_tensor(
         # is always at one end or the other, so the extremes suffice.
         abs_max = max(abs(minimum), abs(maximum))
 
-    return CoreTensorSummaryV1(
+    return CoreTensorSummary(
         summary_version=CORE_SUMMARY_VERSION,
         element_count=element_count,
         finite_count=finite_count,

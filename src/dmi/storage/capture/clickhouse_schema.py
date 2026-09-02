@@ -150,7 +150,7 @@ class ClickHouseCatalogSchema:
         return f"{_quoted(self.database)}.{_quoted(table)}"
 
     def ensure(self) -> None:
-        self._verify_compatibility()
+        fresh = self._verify_compatibility()
         database = _quoted(self.database)
         capture_raw = self.qualified(self.capture_raw)
         capture_view = self.qualified(self.capture_view)
@@ -240,11 +240,42 @@ pack_id UUID
             f"{self.qualified(self.schema_table)}) = 0",
             {"version": SCHEMA_VERSION, "applied_at_ns": time_ns()},
         )
+        if fresh:
+            self._confirm_the_catalog_became_visible()
 
-    def _verify_compatibility(self) -> None:
+    def _confirm_the_catalog_became_visible(self) -> None:
+        """A catalog that reads as EMPTY has to stop reading that way.
+
+        "Nothing of ours is in ``system.tables``" is the one verdict that
+        waives every other check and runs the DDL outright, and it is reached
+        by a read that can answer empty for a reason other than emptiness: a
+        role without the grant to see these tables gets no rows and no error.
+        Under that role the DDL is all ``CREATE ... IF NOT EXISTS``, so it
+        no-ops over a catalog of some other version and stamps this one's
+        version beside it -- the in-place upgrade this design never performs.
+
+        Confirming afterwards costs one read on the fresh path only, and it
+        cannot be confused by lag: these objects were created by the statements
+        immediately above.
+        """
+        found = self._catalog_state()
+        if found:
+            return
+        raise CatalogSchemaVersionError(
+            f"catalog `{self.database}`.`{self.prefix}_*` was created but is "
+            "still not visible in `system.tables`, so the emptiness this "
+            "install was based on was never evidence of an empty catalog -- "
+            "most likely this role cannot see these tables. Every check that "
+            "protects an existing catalog reads the same view, so none of them "
+            "can be trusted under this grant. Grant the writer visibility of "
+            "its own tables and run again."
+        )
+
+    def _verify_compatibility(self) -> bool:
+        """Returns True when this is a fresh install, i.e. nothing is there."""
         found = self._catalog_state()
         if not found:
-            return
+            return True
         self._reject_wrong_kinds(found)
         if not any(name in found for _, name in self.objects):
             raise CatalogSchemaVersionError(self._leftovers_only(found))
@@ -281,7 +312,7 @@ pack_id UUID
             #
             # Returned rather than fallen through: the membership check below
             # reads tables this catalog does not have yet.
-            return
+            return False
         if missing:
             raise CatalogSchemaVersionError(
                 f"catalog `{self.database}`.`{self.prefix}_*` {stamp} but is "
@@ -301,6 +332,7 @@ pack_id UUID
                 "success while their captures remain invisible. "
                 + self.rebuild_instruction()
             )
+        return False
 
     def _catalog_state(self) -> dict[str, CatalogObject]:
         names = [name for _, name in self.objects + self.legacy_objects]

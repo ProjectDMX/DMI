@@ -40,8 +40,10 @@ def _writer():
         database=environ.get("DMI_CLICKHOUSE_DATABASE", "default"),
         table_prefix=prefix,
     )
+    # Constructed BEFORE the try, so a construction failure surfaces as itself
+    # rather than as an UnboundLocalError raised by the teardown below.
+    writer = ClickHouseCatalogWriter(client, config)
     try:
-        writer = ClickHouseCatalogWriter(client, config)
         yield writer, client, config
     finally:
         # The writer owns the object list, in drop order; hand-copied lists

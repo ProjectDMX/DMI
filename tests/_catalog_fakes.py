@@ -267,6 +267,11 @@ class FakeLeaseTable:
             return []
         if not statement.startswith("SELECT") or "publisher_lease" not in query:
             return None
+        if statement.startswith("SELECT count()"):
+            # Not a lease statement: the retention pass counts rows in this
+            # table before deleting them. Answering it here would hand a
+            # caller lease columns for a question about a count.
+            return None
         if "max(expires_at_ns)" in query:
             term = int(params["term"])
             expires = [row[4] for row in self.rows if row[0] == term]
