@@ -34,9 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     ui.add_argument(
         "model",
         metavar="MODEL",
+        nargs="?",
+        default=None,
         help=(
             "A model directory, a config.json, a Hugging Face model id, or a "
-            "DMI descriptor YAML."
+            "DMI descriptor YAML. Omit it to use the descriptor in the current "
+            "directory when there is exactly one."
         ),
     )
     ui.add_argument(
@@ -49,7 +52,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     ui.add_argument("--host", default="127.0.0.1", help="Bind address.")
-    ui.add_argument("--port", type=int, default=8000, help="Bind port.")
+    ui.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port. Defaults to 8000, or the next free port after it.",
+    )
+    ui.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not open a browser window.",
+    )
     ui.set_defaults(handler=_run_ui)
 
     describe = subcommands.add_parser(
@@ -82,11 +95,53 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_ui_model(model: Optional[str]) -> str:
+    """Return the model to serve, discovering one if none was named.
+
+    Discovery only succeeds when the answer is unambiguous. Picking for the
+    user among several models would be worse than asking.
+    """
+    if model is not None:
+        return model
+
+    from .ui.server import DESCRIPTOR_GLOBS, find_descriptors
+
+    found = find_descriptors(".")
+    if len(found) == 1:
+        print(f"Using {found[0]}")
+        return str(found[0])
+
+    patterns = ", ".join(DESCRIPTOR_GLOBS)
+    if not found:
+        raise ConfigurationError(
+            "No model given and no descriptor found in the current directory "
+            f"(looked for {patterns}).\n"
+            "Name a model directly:\n"
+            "    dmi ui ./my-model\n"
+            "    dmi ui Qwen/Qwen3-8B\n"
+            "or write a descriptor first:\n"
+            "    dmi describe-model ./my-model --output my-model.model.yaml"
+        )
+
+    listing = "\n".join(f"    dmi ui {path}" for path in found)
+    raise ConfigurationError(
+        f"No model given and {len(found)} descriptors are present. "
+        f"Name one:\n{listing}"
+    )
+
+
 def _run_ui(args: argparse.Namespace) -> int:
     from .ui.server import serve
 
+    model = _resolve_ui_model(args.model)
     try:
-        serve(args.model, args.config, host=args.host, port=args.port)
+        serve(
+            model,
+            args.config,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_browser,
+        )
     except KeyboardInterrupt:
         print()  # leave the shell prompt on its own line after Ctrl-C
     return 0

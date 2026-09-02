@@ -10,6 +10,7 @@ from dmi.configuration import (
     CONFIG_VERSION,
     DMIConfig,
     LayerSelection,
+    ModelIdentity,
     ModelTopology,
     ObservationConfig,
     RuntimePolicy,
@@ -116,3 +117,33 @@ class TestDMIConfig:
         )
         assert isinstance(config.observations.layers, LayerSelection)
         assert config.observations.layers.start == 8
+
+
+class TestModelIdentity:
+    """``id`` becomes a filename, so it must stay a single path segment.
+
+    ``dmi.ui.app`` promises the browser cannot cause a write outside the
+    location named on the command line. Descriptors derived from a framework
+    config are already safe (``_slug`` reduces ``Qwen/Qwen3-8B`` to
+    ``qwen3-8b``), but a hand-written descriptor YAML reaches the same code
+    unchecked.
+    """
+
+    def test_a_plain_slug_is_accepted(self):
+        assert ModelIdentity("qwen3-8b", "Qwen3 8B", "decoder_transformer").id == "qwen3-8b"
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            "meta-llama/Llama-3-8B",  # the natural thing to hand-type
+            "../../etc/pwned",  # escapes the directory the user named
+            "a/b",
+            "..",
+            ".",
+            "",
+            "   ",
+        ],
+    )
+    def test_an_id_that_is_not_one_path_segment_is_rejected(self, bad_id):
+        with pytest.raises(ValueError):
+            ModelIdentity(bad_id, "M", "decoder_transformer")

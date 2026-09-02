@@ -24,7 +24,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
-from ..api.v1.model_shape import make_model_shape_from_hf_config
 from .errors import DescriptorError
 from .manifest import load_descriptor
 from .schema import (
@@ -65,6 +64,11 @@ def descriptor_from_hf_config(
     The object need not be a Transformers class; only the standard attributes
     are read, so a ``SimpleNamespace`` over a parsed ``config.json`` works.
     """
+    # Lazy: the extractor's module imports torch, and this package promises
+    # torch-free descriptor and validation paths (estimate.py and manifest.py
+    # defer their torch imports for the same reason).
+    from ..api.v1.model_shape import make_model_shape_from_hf_config
+
     if getattr(hf_config, "is_encoder_decoder", False):
         raise DescriptorError(
             f"{model_id!r} is an encoder-decoder model. DMI-configurator v1 "
@@ -105,12 +109,20 @@ def descriptor_from_hf_config(
     except ValueError as exc:
         raise DescriptorError(f"Config for {model_id!r} is inconsistent: {exc}") from exc
 
-    return ModelDescriptor(
-        model=ModelIdentity(
+    try:
+        identity = ModelIdentity(
             id=_slug(model_id),
             name=name or model_id.rstrip("/").split("/")[-1],
             architecture="decoder_transformer",
-        ),
+        )
+    except ValueError as exc:
+        # _slug of a degenerate id ("/" and friends) leaves nothing usable.
+        raise DescriptorError(
+            f"Could not derive a usable model id from {model_id!r}: {exc}"
+        ) from exc
+
+    return ModelDescriptor(
+        model=identity,
         topology=topology,
         schema_version=DESCRIPTOR_SCHEMA_VERSION,
     )

@@ -23,6 +23,9 @@ from dmi.configuration import (
     per_layer_hook_ids,
     validate_config,
 )
+from dmi.configuration import catalog_adapter
+from dmi.configuration.architecture import architecture_payload
+from dmi.hooks.catalog import GROUP_OTHER, HOOK_DEFS, PP_ANY, SHAPE_HIDDEN
 
 pytestmark = pytest.mark.cpu
 
@@ -292,3 +295,46 @@ class TestCatalogAdapter:
                     "available",
                     "reason",
                 }
+
+
+class TestArchitectureLayout:
+    """The diagram must stay reachable from the catalog.
+
+    ``architecture.py`` promises that "extending ``HOOK_DEFS`` can never make
+    an observation unreachable from the UI". That promise rests entirely on the
+    trailing "Other observations" node, which no fixture exercises: today every
+    catalog hook is assigned to a real block, so the fallback branch never runs
+    and could rot unnoticed until the day someone adds a hook.
+    """
+
+    def test_every_catalog_hook_is_reachable_from_some_node(self):
+        nodes = architecture_payload(DENSE)["nodes"]
+        placed = {hook["id"] for node in nodes for hook in node["hooks"]}
+        assert placed == set(hook_ids())
+
+    def test_a_hook_with_no_assigned_block_lands_in_other_observations(
+        self, monkeypatch
+    ):
+        # A hook the node list has never heard of -- exactly what adding an
+        # entry to HOOK_DEFS without touching architecture.py produces.
+        newcomer = (
+            99,
+            "hook_brand_new",
+            "brand_new",
+            True,
+            GROUP_OTHER,
+            False,
+            SHAPE_HIDDEN,
+            PP_ANY,
+        )
+        monkeypatch.setattr(
+            catalog_adapter, "HOOK_DEFS", HOOK_DEFS + (newcomer,)
+        )
+
+        nodes = architecture_payload(DENSE)["nodes"]
+        other = [node for node in nodes if node["id"] == "other"]
+        assert other, "an unassigned hook must not disappear from the diagram"
+        assert [hook["id"] for hook in other[0]["hooks"]] == ["brand_new"]
+        # and it is still reachable overall, which is the actual guarantee
+        placed = {hook["id"] for node in nodes for hook in node["hooks"]}
+        assert "brand_new" in placed
