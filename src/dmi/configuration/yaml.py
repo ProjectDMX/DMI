@@ -152,6 +152,15 @@ def parse_config(data: Any) -> DMIConfig:
             f"{CONFIG_VERSION}'."
         )
     version = data["version"]
+    # Reject a non-integer version as malformed rather than unsupported: YAML
+    # will happily hand back the string "1" from a quoted value, and
+    # "version '1' is not supported" would send the reader looking for a
+    # build that reads it instead of at the quotes.
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ConfigurationError(
+            f"Configuration 'version' must be an integer, got "
+            f"{type(version).__name__} ({version!r})."
+        )
     # Dispatch on version so files outlive the code that wrote them. When a
     # v2 arrives, branch here rather than teaching one parser both shapes.
     if version != CONFIG_VERSION:

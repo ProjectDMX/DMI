@@ -276,6 +276,13 @@ def test_the_missing_version_error_names_the_version_to_add():
         parse_config({"observations": {"hooks": ["q"]}})
 
 
+@pytest.mark.parametrize("bad", ["1", 1.0, True, None, [1]])
+def test_a_non_integer_version_is_malformed_not_unsupported(bad):
+    """A quoted YAML version is a typo, not a version from the future."""
+    with pytest.raises(ConfigurationError, match="must be an integer"):
+        parse_config({"version": bad, "observations": {"hooks": ["q"]}})
+
+
 def test_a_future_version_is_still_refused_as_unsupported():
     with pytest.raises(UnsupportedConfigVersion):
         parse_config({"version": 2, "observations": {"hooks": ["q"]}})
