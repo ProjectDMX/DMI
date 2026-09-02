@@ -5,7 +5,7 @@ from time import time_ns
 from typing import Protocol
 
 from .catalog import CatalogSchemaVersionError
-from .clickhouse_sql import membership_predicate
+from .clickhouse_sql import DECIDING_READ, membership_predicate
 
 
 class ClickHouseClient(Protocol):
@@ -265,9 +265,23 @@ pack_id UUID
             else f"holds `{self.schema_table}` with no row in it (an install "
             "of this build that died before stamping)"
         )
+        self._reject_legacy_objects_beside_this_build(found)
         missing = [
             name for kind, name in self.objects if kind == "TABLE" and name not in found
         ]
+        if missing and not self._holds_catalog_data(found):
+            # Nothing survived that recreating them empty could hide, so this is
+            # an unfinished install and the DDL completes it. That is the whole
+            # reason the stamp table is created FIRST -- "an install interrupted
+            # partway leaves a catalog that says this build, unfinished" -- and
+            # refusing regardless made it false: an install that died between
+            # two CREATEs was refused on every later start, reciting a surviving
+            # inventory that was itself one of the tables never created, with a
+            # manual drop of every object as the only offered recovery.
+            #
+            # Returned rather than fallen through: the membership check below
+            # reads tables this catalog does not have yet.
+            return
         if missing:
             raise CatalogSchemaVersionError(
                 f"catalog `{self.database}`.`{self.prefix}_*` {stamp} but is "
@@ -434,9 +448,80 @@ pack_id UUID
             "WHERE (store_id, pack_id) NOT IN (SELECT store_id, pack_id FROM "
             f"{self.qualified(self.manifest)} WHERE (index_version, publish_id) "
             "IN (SELECT index_version, publish_id FROM "
-            f"{self.qualified(self.watermark)})) LIMIT 1)"
+            f"{self.qualified(self.watermark)})) LIMIT 1)",
+            # A deciding read: this decides whether ensure_schema REFUSES.
+            # Answered from a replica that has not fetched a young catalog's
+            # membership yet, it refuses a healthy catalog and names a rebuild.
+            settings=DECIDING_READ,
         )
         return bool(rows[0][0])
+
+    def _reject_legacy_objects_beside_this_build(
+        self, found: dict[str, CatalogObject]
+    ) -> None:
+        """Refuse a catalog an EARLIER build has also been writing.
+
+        A superseded object standing beside this build's own is not a cleanup
+        that was never finished -- ``_leftovers_only`` covers that, where
+        nothing of this build is there. It is two builds sharing one prefix,
+        and the older one is the dangerous half: its ``ensure_schema`` is all
+        CREATE ... IF NOT EXISTS, so it no-ops over these tables and recreates
+        its own; its publish writes the pack inventory and an UNCONDITIONAL
+        watermark row carrying no publish identity, and never a manifest row.
+
+        Nothing else here notices. The stamp reads this version, no table is
+        missing, and ``_inventory_without_membership`` is a per-pack check, so
+        it reports the older writer's packs only once they are already durable
+        and invisible. Refusing costs a correct deployment nothing: the rebuild
+        instruction lists these objects, so a catalog rebuilt by this build has
+        none of them.
+        """
+        leftovers = [name for _, name in self.legacy_objects if name in found]
+        if not leftovers:
+            return
+        raise CatalogSchemaVersionError(
+            f"catalog `{self.database}`.`{self.prefix}_*` is at schema version "
+            f"{SCHEMA_VERSION} and "
+            + ", ".join(f"`{name}`" for name in leftovers)
+            + " stands beside it: an object only an earlier build creates. "
+            "Either that build is still writing this prefix -- in which case "
+            "its packs are entering the pack inventory with no snapshot "
+            "membership, so they are already invisible to every reader and "
+            "already skipped by every indexing pass -- or a previous rebuild "
+            "left it behind. Stop every writer that is not this build. "
+            + self.rebuild_instruction()
+        )
+
+    def _holds_catalog_data(self, found: dict[str, CatalogObject]) -> bool:
+        """Does any surviving table hold a row that a rerun could hide?
+
+        Only the DATA tables are asked. A stamp row, a version claim or a lease
+        row survives an interrupted install by design and hides nothing:
+        recreating an empty table beside them loses no captures. Asked as one
+        statement of existence probes, so a routine startup call does not count
+        rows it does not need.
+        """
+        tables = [
+            name
+            for name in (
+                self.capture_raw,
+                self.pack_raw,
+                self.watermark,
+                self.manifest,
+                self.commit_log,
+            )
+            if name in found
+        ]
+        if not tables:
+            return False
+        probes = " UNION ALL ".join(
+            f"SELECT 1 FROM {self.qualified(name)} LIMIT 1" for name in tables
+        )
+        return bool(
+            self._client.execute(
+                f"SELECT count() FROM ({probes})", settings=DECIDING_READ
+            )[0][0]
+        )
 
     def rebuild_instruction(self) -> str:
         objects = ", ".join(
@@ -453,5 +538,17 @@ pack_id UUID
         )
 
     def drop(self) -> None:
-        for kind, name in self.objects + self.legacy_objects:
-            self._client.execute(f"DROP {kind} IF EXISTS {self.qualified(name)}")
+        """Drop every object, whatever kind this build creates it as.
+
+        ``DROP TABLE`` for all of them, because the catalog that most needs
+        tearing down is the one whose kinds are WRONG: ``_reject_wrong_kinds``
+        refuses a prefix where a view stands as a table and then prescribes
+        exactly this method, and ``DROP VIEW`` against a table is refused even
+        with IF EXISTS (Code 80 on 25.12) -- so a kind-specific drop aborted on
+        its first statement against the only catalog that required it.
+        ``DROP TABLE`` removes a view just as well (verified on 25.12). Views
+        still go first: a table dropped out from under a surviving view leaves
+        a broken projection for as long as the teardown takes.
+        """
+        for _, name in self.objects + self.legacy_objects:
+            self._client.execute(f"DROP TABLE IF EXISTS {self.qualified(name)}")

@@ -583,7 +583,9 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 | an object present under the wrong kind (a table where a view belongs, or the reverse) | refuse -- naming the object and its engine |
 | catalog objects present, no version table | refuse -- unstamped, with the differences read off `system.tables` / `system.columns` |
 | stamped at any other version | refuse -- a newer writer owns this catalog, or an older one this build cannot upgrade |
-| a TABLE missing | refuse -- partially dropped |
+| a superseded object (`{prefix}_pack_commit_log`) standing BESIDE this build's own | refuse -- an earlier build has been writing this prefix |
+| a TABLE missing, and some data table holds rows | refuse -- partially dropped |
+| a TABLE missing, and every data table is empty | complete it: rerun the DDL |
 | a VIEW missing | recreate it; a view is a projection of the tables and holds no rows |
 | any pack inventory identity lacks effective published manifest membership | refuse -- membership is incomplete |
 
@@ -597,6 +599,32 @@ and re-stamped as 4 with no `{prefix}_publisher_lease` table, performing the
 in-place upgrade this design says is never performed; on a version 2 catalog
 the DDL then died mid-way with `Code: 47` over `publish_id`, leaving the
 catalog half written; and an inventory beside an empty manifest was accepted.
+
+**A missing table is dangerous because of what SURVIVED it.** Recreating one
+empty is the state that hides every capture only while its neighbours kept their
+rows: a surviving pack inventory makes the next pass skip every pack it lists,
+so nothing refills what was dropped. With every data table absent or empty there
+is nothing to hide and nothing to lose, and re-running the DDL is the
+completion -- which is the whole reason `{prefix}_schema_version` is created
+first, "so an install interrupted partway leaves a catalog that says *this
+build, unfinished* rather than one refused forever". Refusing regardless made
+that false: an install that died between two `CREATE`s was refused on every
+later start, reciting a surviving pack inventory that was itself one of the
+tables that had never been created, and the only recovery it offered was a
+manual drop of every object.
+
+**An earlier build sharing the prefix is refused, not tolerated.** A superseded
+object standing beside this build's own is not an unfinished cleanup -- that is
+the "only superseded objects" row above -- it is two builds writing one catalog,
+and the older one is the dangerous half. Its `ensure_schema` is all
+`CREATE ... IF NOT EXISTS`, so it no-ops over these tables and recreates its
+own; its publish writes the pack inventory and an unconditional watermark row
+carrying no publish identity, and never a manifest row. Every pack it touches is
+therefore recorded as indexed and admitted by no snapshot: invisible to every
+reader, and skipped by every later pass including a rebuild. Nothing else here
+notices -- the stamp reads this version, no table is missing, and the
+inventory-without-membership check reports those packs only once they are
+already durable and invisible.
 
 **An unstamped catalog is diagnosed, not assumed.** The refusal reads the
 descriptor table's `sorting_key`, which of the two membership tables exist,
@@ -657,7 +685,11 @@ store again:
    `CatalogSchemaVersionError` prints are both checked against the writer's own
    object table by `test_the_documented_rebuild_drops_exactly_what_the_writer_owns`,
    because a table missed here is a table that survives the rebuild -- and one
-   superseded table left standing wedges every start after it.
+   superseded table left standing wedges every start after it. `drop_schema()`
+   is the supported way to do this and issues `DROP TABLE IF EXISTS` for every
+   object regardless of the kind this build creates it as: the catalog that
+   most needs tearing down is the one whose kinds are WRONG, and `DROP VIEW`
+   against a table is refused even with IF EXISTS (Code 80 on 25.12).
 3. Run `ensure_schema()`. It finds nothing, creates the current schema, and
    stamps it.
 4. Run `acquire_publisher_lease(holder)` on the writer the rebuild will use.

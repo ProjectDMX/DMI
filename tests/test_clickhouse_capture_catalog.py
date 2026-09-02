@@ -91,6 +91,11 @@ class _Client:
         tables=(),
         schema_version=None,
         inventory_without_membership=0,
+        # Whether any surviving DATA table holds a row. The missing-table
+        # refusal turns on it: with every data table empty there is nothing a
+        # recreated-empty neighbour could hide, and re-running the DDL is the
+        # documented completion of an interrupted install.
+        data_rows=0,
         sort_key=_CURRENT_SORT_KEY,
         engines=None,
         publish_id_tables=("dmi_index_watermark", "dmi_snapshot_manifest"),
@@ -110,6 +115,7 @@ class _Client:
         self.tables = tuple(tables)
         self.schema_version = schema_version
         self.inventory_without_membership = inventory_without_membership
+        self.data_rows = data_rows
         self.sort_key = sort_key
         self.engines = dict(engines or {})
         self.publish_id_tables = tuple(publish_id_tables)
@@ -148,6 +154,13 @@ class _Client:
             return [] if self.schema_version is None else [(self.schema_version,)]
         if "dmi_pack_inventory_raw` FINAL" in query and "NOT IN" in query:
             return [(self.inventory_without_membership,)]
+        if query.startswith("SELECT count() FROM (SELECT 1 FROM"):
+            # The surviving-data probe behind the missing-table refusal. Keyed
+            # on the shape rather than on the UNION ALL, which a catalog with
+            # one surviving data table does not have.
+            return [(
+                1 if (self.data_rows or self.inventory_without_membership) else 0,
+            )]
         if query.lstrip().startswith("INSERT"):
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
@@ -1053,6 +1066,9 @@ def test_an_unstamped_install_missing_a_table_is_still_refused():
     client = _Client(
         tables=[name for name in _CURRENT_OBJECTS if name != "dmi_publisher_lease"],
         schema_version=None,
+        # A catalog that KEPT its rows, which is what makes recreating a table
+        # empty beside them dangerous rather than merely unfinished.
+        data_rows=1,
     )
 
     with pytest.raises(CatalogSchemaVersionError) as raised:
@@ -1109,6 +1125,7 @@ def test_a_stamped_catalog_with_a_dropped_table_is_refused():
     client = _Client(
         tables=[name for name in _CURRENT_OBJECTS if name != "dmi_snapshot_manifest"],
         schema_version=_SCHEMA_VERSION,
+        data_rows=1,
     )
 
     with pytest.raises(CatalogSchemaVersionError) as raised:
@@ -1440,3 +1457,97 @@ def test_the_documented_rebuild_drops_exactly_what_the_writer_owns():
     to refuse.
     """
     assert _documented_drop_list() == _writer_objects()
+
+
+def test_an_install_interrupted_between_two_creates_is_completed_not_refused():
+    """The reason the stamp table is created first, made true.
+
+    `ensure` writes `{prefix}_schema_version` before anything else so that an
+    install interrupted partway leaves a catalog that says "this build,
+    unfinished" rather than one refused forever. The missing-table check ran
+    regardless of whether anything survived, so it refused that catalog anyway
+    -- reciting a surviving pack inventory that was itself one of the MISSING
+    tables -- and the only recovery it offered was a manual drop of every
+    object. With no data anywhere there is nothing to hide and nothing to
+    lose: re-running the DDL is the completion.
+    """
+    client = _Client(
+        tables=("dmi_schema_version", "dmi_capture_raw"),
+        schema_version=None,
+    )
+
+    _writer(client).ensure_schema()
+
+    assert any(
+        call[0].startswith("CREATE TABLE") for call in client.calls
+    ), "the interrupted install was never completed"
+
+
+def test_a_missing_table_beside_surviving_rows_is_still_refused():
+    """The other side of the same gate: rows change the answer.
+
+    One row anywhere in the data tables makes recreating a missing one empty
+    the dangerous state again -- a surviving inventory makes the next pass skip
+    every pack it lists, and nothing refills what was dropped.
+    """
+    client = _Client(
+        tables=[name for name in _CURRENT_OBJECTS if name != "dmi_pack_inventory_raw"],
+        schema_version=_SCHEMA_VERSION,
+        data_rows=1,
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    assert "missing `dmi_pack_inventory_raw`" in str(raised.value)
+
+
+def test_a_legacy_object_beside_this_builds_catalog_is_refused():
+    """Two builds sharing one prefix, caught at the only moment it is cheap.
+
+    The pre-PR build's `ensure_schema` is all CREATE ... IF NOT EXISTS, so it
+    no-ops over a version 4 catalog and recreates its own
+    `{prefix}_pack_commit_log` beside it. Everything after that is silent: its
+    publish writes the pack inventory and an unconditional watermark row and
+    never a manifest row, so every pack it touches is recorded as indexed and
+    admitted by no snapshot -- invisible to every reader and skipped by every
+    later pass, rebuilds included.
+    """
+    client = _Client(
+        tables=_CURRENT_OBJECTS + ("dmi_pack_commit_log",),
+        schema_version=_SCHEMA_VERSION,
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    assert "dmi_pack_commit_log" in message
+    assert "an earlier build" in message
+    assert "CatalogReconciler.rebuild()" in message
+    assert not any(
+        call[0].startswith(("CREATE TABLE", "CREATE OR REPLACE", "ALTER"))
+        for call in client.calls
+    ), "the DDL ran beside a writer this build cannot coexist with"
+
+
+def test_drop_schema_drops_every_object_whatever_kind_it_is():
+    """The teardown has to work on the catalog that most needs it.
+
+    `_reject_wrong_kinds` refuses a prefix where a view stands as a table and
+    then prescribes `rebuild_instruction`, whose only implementation is this
+    method. `DROP VIEW` against a table is refused by ClickHouse even with IF
+    EXISTS (Code 80 on 25.12), so a kind-specific drop aborted on its first
+    statement against exactly that catalog. `DROP TABLE` removes both kinds.
+    """
+    client = _Client()
+
+    _writer(client).drop_schema()
+
+    drops = [call[0] for call in client.calls if call[0].startswith("DROP")]
+    assert drops, "nothing was dropped"
+    assert all(drop.startswith("DROP TABLE IF EXISTS") for drop in drops)
+    # Views still go first: a table dropped out from under a surviving view
+    # leaves a broken projection for as long as the teardown takes.
+    assert "dmi_capture`" in drops[0]
+    assert len(drops) == len(_CURRENT_OBJECTS) + 1  # + the legacy commit log

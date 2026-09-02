@@ -809,10 +809,22 @@ def test_a_catalog_stamped_by_a_newer_build_is_refused():
 
 
 def test_a_catalog_missing_one_of_its_tables_is_refused():
-    """Half a drop is the dangerous state, so it is not quietly completed."""
+    """Half a drop is the dangerous state, so it is not quietly completed.
+
+    "Dangerous" is what the surviving ROWS make it: recreating the manifest
+    empty beside an inventory that kept its packs is the state where the next
+    pass skips every pack it lists and nothing refills what was dropped. So the
+    catalog here holds data before the table goes.
+    """
     with _server() as (client, config):
         writer = ClickHouseCatalogWriter(client, config)
         writer.ensure_schema()
+        client.execute(
+            f"INSERT INTO `{config.database}`.`{config.table_prefix}"
+            "_pack_inventory_raw` (pack_id, store_id, object_key, "
+            "object_bytes, pack_checksum, record_count, index_version) VALUES",
+            [(uuid4(), "local", "packs/a.dmi-pack", 128, "a" * 64, 1, 1)],
+        )
         client.execute(
             f"DROP TABLE `{config.database}`.`{config.table_prefix}_snapshot_manifest`"
         )
@@ -823,3 +835,44 @@ def test_a_catalog_missing_one_of_its_tables_is_refused():
         message = str(raised.value)
         assert f"missing `{config.table_prefix}_snapshot_manifest`" in message
         assert "CatalogReconciler.rebuild()" in message
+
+
+def test_an_install_interrupted_between_two_creates_is_completed():
+    """The reason the stamp table is created first, over a real server.
+
+    `ensure` writes `{prefix}_schema_version` before anything else so an
+    interrupted install "leaves a catalog that says this build, unfinished
+    rather than one refused forever". The missing-table refusal ran regardless
+    of whether anything survived, so it refused that catalog too -- reciting a
+    surviving pack inventory that was itself one of the tables that had never
+    been created -- and the only recovery it offered was a manual drop of every
+    object. With every data table empty, re-running the DDL is the completion,
+    and the catalog works afterwards.
+    """
+    with _server() as (client, config):
+        writer = ClickHouseCatalogWriter(client, config)
+        writer.ensure_schema()
+        # An install that died before the manifest existed, with no rows
+        # anywhere -- exactly what a crash between two CREATEs leaves.
+        client.execute(
+            f"DROP TABLE `{config.database}`.`{config.table_prefix}_snapshot_manifest`"
+        )
+
+        writer.ensure_schema()
+
+        assert client.execute(
+            "SELECT count() FROM system.tables WHERE database = %(database)s "
+            "AND name = %(name)s",
+            {
+                "database": config.database,
+                "name": f"{config.table_prefix}_snapshot_manifest",
+            },
+        ) == [(1,)]
+        # And it is a working catalog, not merely a complete-looking one.
+        writer.acquire_publisher_lease("resumed")
+        version = writer.allocate_version()
+        writer.publish_snapshot(
+            index_version=version, refs=(), published_at_ns=1,
+            indexed_rows=0, indexed_packs=0,
+        )
+        writer.release_publisher_lease()

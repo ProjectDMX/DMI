@@ -5,8 +5,8 @@ from typing import Protocol
 from uuid import uuid4
 
 from .catalog import PublisherLeaseError, PublisherLeaseHeldError
+from .clickhouse_sql import DECIDING_READ
 
-DECIDING_READ = {"select_sequential_consistency": 1}
 
 
 class ClickHouseClient(Protocol):
@@ -54,7 +54,10 @@ class ClickHouseLeaseCoordinator:
         return self._lease
 
     def acquire(self, holder: str) -> PublisherLease:
-        if not isinstance(holder, str) or not 0 < len(holder) <= 256:
+        # Bounded in BYTES, which is what the column stores and what the
+        # message promises. ``len()`` counts code points, so it admitted a
+        # 256-character CJK or emoji holder at up to 1024 bytes.
+        if not isinstance(holder, str) or not 0 < len(holder.encode()) <= 256:
             raise ValueError("holder must be a non-empty string of at most 256 bytes")
         held = self._lease
         return self.claim(

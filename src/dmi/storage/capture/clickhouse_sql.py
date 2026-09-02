@@ -5,6 +5,19 @@ from typing import TypeVar
 
 MAX_INLINE_PARAMETER_BYTES = 192 * 1024
 
+# Settings for the statements whose answers DECIDE something: which claimant
+# owns a version, whether a publish landed, what the published head is, whether
+# ensure_schema refuses. Each is a read-back of the reader's own write, and the
+# sole-claimant protocols are only sound while a later write always observes an
+# earlier one. A single node gives that for free; a ReplicatedMergeTree serves
+# reads from whatever log entries a replica has fetched, so a read-back can miss
+# a row another writer has already committed.
+#
+# It lives here, in the module both the schema and the lease coordinator sit on
+# top of, so that "this read decides something" is one definition rather than an
+# import from whichever module happened to declare it first.
+DECIDING_READ = {"select_sequential_consistency": 1}
+
 T = TypeVar("T")
 
 

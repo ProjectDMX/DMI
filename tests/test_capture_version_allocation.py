@@ -26,6 +26,7 @@ from dmi.storage.capture import (
     CaptureMetadata,
     CaptureRecord,
     CatalogIndexer,
+    CatalogVersionAllocationError,
     ClickHouseCatalogConfig,
     ClickHouseCatalogWriter,
     FilesystemPackStore,
@@ -677,7 +678,10 @@ def test_allocation_raises_after_exhausting_its_attempts():
         (version, _LARGE_CLAIM)
     )
 
-    with pytest.raises(RuntimeError, match="after 3 attempts"):
+    # This module's own taxonomy, not a bare RuntimeError: a supervisor
+    # catching CaptureStorageError to back off on an exhausted PUBLISH would
+    # otherwise crash on an exhausted ALLOCATION one statement earlier.
+    with pytest.raises(CatalogVersionAllocationError, match="after 3 attempts"):
         writer.allocate_version()
 
     assert sum("version_claims" in q for q in server.inserts) == 3
@@ -874,7 +878,11 @@ class _Store:
     store_id = "local"
 
 
-@pytest.mark.parametrize("value", [-1, "7", True, 4.0])
+# 0 among them because the guard was tightened from `< 0` to `< 1` and the case
+# that tightening was FOR was never exercised: last_published_version() is at
+# least 0, so an allocator that can return 0 has already broken the
+# strictly-above-the-head contract.
+@pytest.mark.parametrize("value", [0, -1, "7", True, 4.0])
 def test_the_indexer_rejects_a_non_integer_or_negative_allocation(
     tmp_path: Path, value
 ):
@@ -898,5 +906,5 @@ def test_the_indexer_refuses_a_non_monotonic_allocation(
         store, _HostileWriter(lambda: allocated, last_published=5)
     )
 
-    with pytest.raises(RuntimeError, match="non-monotonic"):
+    with pytest.raises(CatalogVersionAllocationError, match="non-monotonic"):
         indexer.index(refs)

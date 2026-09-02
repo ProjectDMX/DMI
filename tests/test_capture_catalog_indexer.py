@@ -8,6 +8,8 @@ import pytest
 
 from dmi.storage.capture import (
     CatalogIndexer,
+    CatalogRebuildExhaustedError,
+    PublisherLeaseError,
     SnapshotPublishConflictError,
     SnapshotPublishExhaustedError,
     SnapshotPublishRaceError,
@@ -495,7 +497,16 @@ def test_a_restarted_indexer_cannot_publish_under_the_durable_watermark(
 
 @pytest.mark.parametrize(
     "field",
-    ["max_packs", "max_rows_per_insert", "max_estimated_bytes", "max_failure_details"],
+    [
+        "max_packs",
+        "max_rows_per_insert",
+        "max_estimated_bytes",
+        "max_failure_details",
+        # Left off this list when it was added, and it is not decorative: at 0
+        # the publish retry loop's body never runs, so index() would return
+        # having published nothing and raised nothing.
+        "max_publish_attempts",
+    ],
 )
 @pytest.mark.parametrize("value", [0, -1, 1.5])
 def test_indexer_config_rejects_non_positive_fields(field: str, value):
@@ -588,5 +599,68 @@ def test_rebuild_raises_when_the_listing_never_terminates(tmp_path: Path):
         inventory, CatalogIndexer(inventory, _CatalogWriter(), clock_ns=lambda: 42)
     )
 
-    with pytest.raises(RuntimeError, match="max_pages"):
+    # Through this module's taxonomy: a rebuild that stopped short leaves a
+    # PARTIAL catalog, which a supervisor catching CaptureStorageError has to
+    # see rather than take as an unrelated crash.
+    with pytest.raises(CatalogRebuildExhaustedError, match="max_pages"):
         reconciler.rebuild(max_pages=3)
+
+
+def test_a_commit_failure_inside_the_conflict_handler_keeps_the_conflict(
+    tmp_path: Path,
+):
+    """The conflict is the finding; a transport error must not bury it.
+
+    `SnapshotPublishConflictError` means this publish IS visible and must not
+    be retried, so the handler records its packs in the replay inventory before
+    propagating. If that call throws, a bare `raise` never runs: the driver's
+    exception propagates and the conflict is demoted to `__context__`, where no
+    `except SnapshotPublishConflictError` supervisor sees it -- while the packs
+    are visible and absent from the inventory, so the next pass re-publishes
+    exactly the batch this error forbids retrying.
+    """
+    inventory, refs = _packs(tmp_path, (1,))
+    writer = _CatalogWriter()
+    writer.conflict_once = True
+    writer.fail_commit_once = True
+
+    with pytest.raises(SnapshotPublishConflictError) as raised:
+        CatalogIndexer(inventory, writer).index(refs)
+
+    # The commit failure is not lost either -- it is the cause.
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert "ambiguous commit" in str(raised.value.__cause__)
+
+
+def test_an_indexer_whose_writer_cannot_publish_writes_nothing(tmp_path: Path):
+    """Refused before the work, not after it.
+
+    Publishing is the last thing a pass does and the only thing that needs
+    authority, so a writer without it used to discover that after allocating a
+    version -- permanently consumed -- and writing the whole descriptor batch,
+    up to `max_estimated_bytes`. A supervisor that restarts an indexer without
+    re-acquiring pays that on every scheduled pass.
+    """
+    inventory, refs = _packs(tmp_path, (1,))
+    writer = _CatalogWriter()
+    writer.publisher_lease = None
+
+    with pytest.raises(PublisherLeaseError, match="no publisher lease"):
+        CatalogIndexer(inventory, writer).index(refs)
+
+    assert writer.allocations == 0, "a version was burned anyway"
+    assert writer.descriptor_batches == [], "the batch was written anyway"
+
+
+def test_a_writer_that_does_not_answer_about_leases_is_left_alone(tmp_path: Path):
+    """`CatalogWriter` says nothing about how a writer earns the right to
+    publish -- the ClickHouse writer takes a lease, another may need nothing --
+    so the check reads an OPTIONAL property and a writer without one indexes
+    exactly as before."""
+    inventory, refs = _packs(tmp_path, (1,))
+    writer = _CatalogWriter()
+    assert not hasattr(writer, "publisher_lease")
+
+    result = CatalogIndexer(inventory, writer).index(refs)
+
+    assert result.indexed_packs == 1

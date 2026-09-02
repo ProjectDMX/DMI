@@ -11,6 +11,10 @@ from .pack import PackIndex
 
 PackIdentity = tuple[str, str]
 
+# Sentinel for "this writer does not answer that question", so a writer with no
+# publisher_lease property is not mistaken for one holding no lease.
+_NOT_ASKED = object()
+
 
 class SnapshotPublishRaceError(CaptureStorageError):
     """A publish lost the race to a higher version: no snapshot became visible.
@@ -65,6 +69,35 @@ class SnapshotPublishExhaustedError(CaptureStorageError):
 
     The batch's descriptor rows are durable at this point and no snapshot
     admits them; the next indexing pass re-reads the packs and tries again.
+    """
+
+
+class CatalogVersionAllocationError(CaptureStorageError):
+    """No usable ``index_version`` came back, so the pass cannot proceed.
+
+    Two shapes, one recovery. The allocator was contested past its attempt
+    bound -- something else is allocating continuously against this catalog --
+    or it returned a version at or below the published head, which breaks the
+    contract every snapshot bound depends on: a batch published underneath a
+    watermark a reader already pinned makes that snapshot grow after the fact.
+
+    A ``CaptureStorageError`` rather than the bare ``RuntimeError`` this used to
+    raise, for the same reason ``SnapshotPublishExhaustedError`` is one: a
+    supervisor that catches this module's taxonomy to back off would otherwise
+    absorb an exhausted publish and crash on an exhausted allocation, one
+    statement apart in the same call.
+    """
+
+
+class CatalogRebuildExhaustedError(CaptureStorageError):
+    """A rebuild hit ``max_pages`` before it finished the object store.
+
+    The bound exists so a rebuild over an unexpectedly large store stops rather
+    than running forever; reaching it means the store holds more pages than the
+    caller planned for, and the catalog is now PARTIAL -- every page that was
+    reconciled is published, and the rest are not. Raised through this module's
+    taxonomy so a supervisor sees it as the incomplete rebuild it is. Resume by
+    raising ``max_pages`` and rebuilding again.
     """
 
 
@@ -356,6 +389,7 @@ class CatalogIndexer:
             valid_refs.append(ref)
 
         if descriptors or valid_refs:
+            self._reject_a_writer_that_cannot_publish()
             version = self._allocate_version()
             descriptor_inserts = self._write_descriptor_batches(
                 descriptors, version
@@ -398,6 +432,31 @@ class CatalogIndexer:
         self._emit(result)
         return result
 
+    def _reject_a_writer_that_cannot_publish(self) -> None:
+        """Fail before the batch is written, not after it is wasted.
+
+        Publishing is the last thing a pass does and the only thing that
+        requires authority, so a writer that has none discovers it last --
+        after ``allocate_version`` has permanently consumed a version and
+        ``write_descriptors`` has written up to ``max_estimated_bytes`` of rows
+        that no snapshot will ever admit. A supervisor that restarts an indexer
+        without re-acquiring pays that on every scheduled pass; for
+        ``CatalogReconciler.rebuild`` it is once per page over the whole store.
+
+        Asked of the writer only if the writer answers the question at all.
+        ``CatalogWriter`` is deliberately silent about how a writer earns the
+        right to publish -- the ClickHouse writer takes a publisher lease,
+        another may need nothing -- so this reads an OPTIONAL property, and a
+        writer without one is left alone.
+        """
+        if getattr(self._writer, "publisher_lease", _NOT_ASKED) is None:
+            raise PublisherLeaseError(
+                "the catalog writer holds no publisher lease, and only the "
+                "lease holder can make a snapshot visible: acquire one before "
+                "indexing. Refused before allocating a version and writing "
+                "descriptors, neither of which this pass could have published."
+            )
+
     def _allocate_version(self) -> int:
         # index_version has to increase strictly across every live indexer, or
         # a batch lands underneath a watermark a reader already pinned and that
@@ -417,8 +476,10 @@ class CatalogIndexer:
             # loudly here rather than publish under a pinned watermark.
             self._published_version = self._writer.last_published_version()
         if version <= self._published_version:
-            raise RuntimeError(
-                "catalog version allocator returned a non-monotonic version"
+            raise CatalogVersionAllocationError(
+                "catalog version allocator returned a non-monotonic version: "
+                f"{version} is not above the published head "
+                f"{self._published_version}"
             )
         return version
 
@@ -497,10 +558,23 @@ class CatalogIndexer:
                     indexed_rows=len(descriptors),
                     indexed_packs=len(refs),
                 )
-            except SnapshotPublishConflictError:
+            except SnapshotPublishConflictError as conflict:
                 # Visible, so skippable: record the packs before propagating.
                 if refs:
-                    self._writer.commit_packs(refs, index_version=version)
+                    try:
+                        self._writer.commit_packs(refs, index_version=version)
+                    except Exception as commit_failure:
+                        # The conflict is the finding, and the bare ``raise``
+                        # below never runs if this call throws: the driver's
+                        # exception would propagate with the conflict demoted
+                        # to ``__context__``, where no `except
+                        # SnapshotPublishConflictError` supervisor sees it. The
+                        # anomaly the error exists to report -- a second writer
+                        # on this prefix -- would be buried under a transport
+                        # error, and the packs would be visible but absent from
+                        # the inventory, so the next pass re-publishes exactly
+                        # the batch this error forbids retrying.
+                        raise conflict from commit_failure
                 raise
             except SnapshotPublishRaceError as race:
                 last_race = race
@@ -608,4 +682,8 @@ class CatalogReconciler:
             cursor = page.next_cursor
             if cursor is None:
                 return total
-        raise RuntimeError("rebuild exceeded max_pages")
+        raise CatalogRebuildExhaustedError(
+            f"rebuild exceeded max_pages ({max_pages}) with pages still "
+            "unread: the catalog holds every page reconciled so far and none "
+            "of the rest"
+        )

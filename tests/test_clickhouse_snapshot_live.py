@@ -454,7 +454,13 @@ def test_a_takeover_between_the_two_publish_statements_leaves_orphan_rows():
             _publish(stalled, lost, refs=_refs(later), rows=len(later))
 
         assert not armed, "the takeover never ran; the test proved nothing"
-        assert "fenced out" in str(raised.value)
+        # Refused, and it names the writer that now holds the lease. WHICH
+        # refusal depends on where the takeover lands: a publish renews after
+        # each manifest chunk, so a takeover in this window is met by the
+        # renewal (`PublisherLeaseHeldError`) rather than by the watermark
+        # read-back's "fenced out". Both are `PublisherLeaseError`, and what
+        # this test is about is the rows below either way.
+        assert "successor" in str(raised.value)
 
         manifest = f"`{config.database}`.`{config.table_prefix}_snapshot_manifest`"
         orphans = client.execute(
@@ -525,11 +531,12 @@ def test_a_contested_head_is_quarantined_even_though_the_fence_selects_one():
         fence = writer._lease_fence()
         # The fence admits one of them, which is the claim both documents got
         # wrong. It is the UUID-order winner, not the text-order winner.
+        margin = {"publish_timeout_ns": config.publish_timeout_ns}
         assert client.execute(
-            f"SELECT {fence}", {"lease_id": low_text_high_uuid}
+            f"SELECT {fence}", {"lease_id": low_text_high_uuid, **margin}
         ) == [(1,)]
         assert client.execute(
-            f"SELECT {fence}", {"lease_id": high_text_low_uuid}
+            f"SELECT {fence}", {"lease_id": high_text_low_uuid, **margin}
         ) == [(0,)]
 
         # No successor can overlap a lease that may have returned before the
@@ -604,7 +611,11 @@ def test_the_fence_refuses_on_an_empty_lease_table_rather_than_throwing():
         fence = writer._lease_fence()
         # Evaluating it is not an error, and the answer is "no".
         assert client.execute(
-            f"SELECT {fence}", {"lease_id": lease.lease_id}
+            f"SELECT {fence}",
+            {
+                "lease_id": lease.lease_id,
+                "publish_timeout_ns": config.publish_timeout_ns,
+            },
         ) == [(0,)]
         # And the statement it guards writes nothing rather than throwing.
         client.execute(
@@ -616,6 +627,7 @@ def test_the_fence_refuses_on_an_empty_lease_table_rather_than_throwing():
                 "index_version": version,
                 "publish_id": str(uuid4()),
                 "lease_id": lease.lease_id,
+                "publish_timeout_ns": config.publish_timeout_ns,
             },
         )
         assert client.execute(f"SELECT count() FROM {watermark}") == [(0,)]

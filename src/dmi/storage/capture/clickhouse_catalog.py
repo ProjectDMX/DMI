@@ -9,6 +9,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from .catalog import (
+    CatalogVersionAllocationError,
     PackIdentity,
     SnapshotPublishConflictError,
     SnapshotPublishRaceError,
@@ -189,6 +190,12 @@ class ClickHouseCatalogWriter:
                 f"SELECT store_id, toString(pack_id) FROM {table} "
                 "WHERE (store_id, pack_id) IN %(identities)s",
                 {"identities": chunk},
+                # A deciding read: this answer decides which packs the indexer
+                # skips as already committed. Answered from a replica that has
+                # not caught up, it under-reports and the pass re-indexes packs
+                # that are already published -- redundant work, and a second
+                # publish of a batch that needed none.
+                settings=_DECIDING_READ,
             )
             committed.update(
                 (self._text(row[0]), self._text(row[1])) for row in rows
@@ -529,7 +536,7 @@ class ClickHouseCatalogWriter:
                 return candidate
             # Contested: someone else claimed the same version -- abandon it
             # entirely and retry above it.
-        raise RuntimeError(
+        raise CatalogVersionAllocationError(
             f"could not allocate a catalog version after {attempts} attempts"
         )
 
