@@ -215,3 +215,54 @@ class TestFromConfigObject:
         descriptor = descriptor_from_hf_config(Config(), "my/model")
         assert descriptor.model.id == "model"
         assert descriptor.topology.num_layers == 32
+
+
+# ---------------------------------------------------------------------------
+# A YAML path is a path, never a model id
+# ---------------------------------------------------------------------------
+
+
+def test_a_missing_descriptor_path_reports_the_missing_file(tmp_path):
+    """A shell typo must not be blamed on a missing transformers install."""
+    with pytest.raises(DescriptorError, match="does not exist"):
+        resolve_descriptor(tmp_path / "llama3-8b-typo.yaml")
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".yml"])
+def test_neither_yaml_suffix_falls_through_to_id_resolution(tmp_path, suffix):
+    with pytest.raises(DescriptorError) as excinfo:
+        resolve_descriptor(tmp_path / f"absent{suffix}")
+
+    message = str(excinfo.value)
+    assert "does not exist" in message
+    assert "transformers" not in message
+
+
+def test_a_bare_model_id_still_resolves_through_the_framework(monkeypatch):
+    """The id path must keep working; only YAML suffixes are redirected."""
+    import dmi.configuration.introspect as introspect
+
+    called = []
+    monkeypatch.setattr(
+        introspect,
+        "_load_hf_config_by_id",
+        lambda model_id: called.append(model_id) or _hf_namespace(),
+    )
+
+    descriptor = resolve_descriptor("Qwen/Qwen3-8B")
+
+    assert called == ["Qwen/Qwen3-8B"]
+    assert descriptor.model.id == "qwen3-8b"
+
+
+def _hf_namespace():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        hidden_size=4096,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        num_hidden_layers=32,
+        intermediate_size=14336,
+        vocab_size=128256,
+    )

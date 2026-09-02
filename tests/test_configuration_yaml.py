@@ -195,3 +195,120 @@ class TestGoldenFiles:
         assert config.schedule.capture_decode is False
         assert config.schedule.warmup_steps == 16
         assert config.policy is RuntimePolicy.PERFORMANCE
+
+
+# ---------------------------------------------------------------------------
+# Strictness: every section refuses keys this build does not understand
+# ---------------------------------------------------------------------------
+
+
+def test_a_misspelled_layers_key_is_refused_not_ignored():
+    """The dangerous typo: ignoring it would silently capture every layer."""
+    with pytest.raises(ConfigurationError, match="Unknown field.*layer"):
+        parse_config(
+            {
+                "version": 1,
+                "observations": {
+                    "hooks": ["q"],
+                    "layer": {"start": 8, "end": 15},
+                },
+            }
+        )
+
+
+def test_a_misspelled_hooks_key_is_refused():
+    with pytest.raises(ConfigurationError, match="Unknown field.*hook"):
+        parse_config({"version": 1, "observations": {"hook": ["q"]}})
+
+
+def test_a_misspelled_top_level_key_is_refused():
+    with pytest.raises(ConfigurationError, match="Unknown field.*polcy"):
+        parse_config(
+            {
+                "version": 1,
+                "observations": {"hooks": ["q"]},
+                "polcy": {"objective": "performance"},
+            }
+        )
+
+
+def test_the_unknown_field_error_lists_what_is_accepted():
+    with pytest.raises(ConfigurationError) as excinfo:
+        parse_config({"version": 1, "observations": {"nope": 1}})
+
+    message = str(excinfo.value)
+    assert "hooks" in message and "layers" in message
+
+
+def test_every_section_is_equally_strict():
+    """schedule was strict from the start; the others now match it."""
+    for document, where in [
+        ({"version": 1, "bogus": 1}, "top level"),
+        ({"version": 1, "observations": {"bogus": 1}}, "observations"),
+        ({"version": 1, "schedule": {"bogus": 1}}, "schedule"),
+    ]:
+        with pytest.raises(ConfigurationError, match="Unknown field"):
+            parse_config(document)
+
+
+def test_a_layers_key_set_to_null_is_still_accepted():
+    """The UI sends layers: null for "all layers"; that is a known key."""
+    config = parse_config(
+        {"version": 1, "observations": {"hooks": ["q"], "layers": None}}
+    )
+
+    assert config.observations.layers is None
+
+
+# ---------------------------------------------------------------------------
+# version is required, not defaulted
+# ---------------------------------------------------------------------------
+
+
+def test_a_document_without_a_version_is_refused():
+    """Defaulting is the guess that version dispatch exists to avoid."""
+    with pytest.raises(ConfigurationError, match="missing 'version'"):
+        parse_config({"observations": {"hooks": ["q"]}, "schedule": {}})
+
+
+def test_the_missing_version_error_names_the_version_to_add():
+    with pytest.raises(ConfigurationError, match="version: 1"):
+        parse_config({"observations": {"hooks": ["q"]}})
+
+
+def test_a_future_version_is_still_refused_as_unsupported():
+    with pytest.raises(UnsupportedConfigVersion):
+        parse_config({"version": 2, "observations": {"hooks": ["q"]}})
+
+
+def test_every_dumped_document_carries_a_version():
+    """dump must never produce a file its own parser would reject."""
+    text = dump_config(
+        DMIConfig(observations=ObservationConfig(hooks=["resid_pre"]))
+    )
+
+    assert "version:" in text
+    assert parse_config(pyyaml.safe_load(text)).version == 1
+
+
+# ---------------------------------------------------------------------------
+# save_config error contract matches load_config
+# ---------------------------------------------------------------------------
+
+
+def test_saving_into_a_missing_directory_reports_a_configuration_error(tmp_path):
+    config = DMIConfig(observations=ObservationConfig(hooks=["resid_pre"]))
+
+    with pytest.raises(ConfigurationError, match="Cannot write configuration"):
+        save_config(config, tmp_path / "no-such-dir" / "out.dmi.yaml")
+
+
+def test_save_and_load_report_filesystem_trouble_the_same_way(tmp_path):
+    """Both halves of the API raise ConfigurationError, not raw OSError."""
+    missing = tmp_path / "absent" / "out.dmi.yaml"
+    config = DMIConfig(observations=ObservationConfig(hooks=["resid_pre"]))
+
+    with pytest.raises(ConfigurationError):
+        save_config(config, missing)
+    with pytest.raises(ConfigurationError):
+        load_config(missing)
