@@ -84,6 +84,37 @@ The capture host does not run a ClickHouse client, compute summaries, or
 coordinate two durable writes. Object-created notifications reduce indexing
 latency, while periodic listing and reconciliation provide completeness.
 
+### The other sink, and how one is chosen
+
+This document describes ONE of two storage paths, and they are mutually
+exclusive per record runtime:
+
+| | native path | capture path (this document) |
+|---|---|---|
+| Sink | `ClickHouseRecordSink` (C++) | `ReferencePythonCaptureSink` (C++ bridge) → `CapturePackReferenceSink` (Python) |
+| Durable form | one ClickHouse row per record, tensor bytes inline | immutable packs in object storage |
+| ClickHouse role | the store itself | a rebuildable index over the packs |
+| ClickHouse footprint | one configured table (`offload` by default) | `{prefix}_*` (`dmi_*` by default) |
+| Selected by | `create_record_runtime(fmt)` with no `record_sink`, plus a `host_engine`/`db_config` on the engine | `create_record_runtime(fmt, record_sink=reference.native_sink)` |
+| Status | production | explicitly reference-only; production sinks remain native-only |
+
+Both are `ring::RecordSink` implementations and the record engine takes exactly
+one of them: `RingEngine.create_record` is handed either the host engine or a
+sink lease, never both, so no record can reach both backends. Passing an
+explicit `record_sink` bypasses the ClickHouse host entirely -- it is neither
+validated nor used, which
+`test_explicit_record_sink_lease_is_owned_by_native_ring` asserts by failing if
+the host is touched at all; `test_create_record_runtime_is_additive_and_uses_active_transport` pins
+the other direction.
+
+Their ClickHouse footprints are disjoint, so the two can share one server: the
+catalog's schema guard only ever names `{prefix}_*` objects, and `drop_schema`
+only drops what it owns.
+`test_the_capture_catalog_ignores_the_native_paths_offload_table` runs a full
+publish and teardown beside a populated `offload` table and asserts it is
+untouched. A deployment that wants both isolated further should give them
+separate databases.
+
 ## Goals
 
 - Keep persistence and analytics off the inference path.

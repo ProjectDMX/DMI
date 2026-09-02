@@ -876,3 +876,52 @@ def test_an_install_interrupted_between_two_creates_is_completed():
             indexed_rows=0, indexed_packs=0,
         )
         writer.release_publisher_lease()
+
+
+def test_the_capture_catalog_ignores_the_native_paths_offload_table():
+    """The two storage paths share a server without seeing each other.
+
+    DMI has two sinks and exactly one is ever active for a runtime: the native
+    `ClickHouseRecordSink`, which writes whole tensors into its own table
+    (`offload` by default), and the Python capture path, which writes packs to
+    an object store and uses this catalog as the index. They are selected at
+    `MonitoringEngine.create_record_runtime(..., record_sink=...)` and their
+    ClickHouse footprints are disjoint by construction -- `{prefix}_*` here,
+    one configured table there.
+
+    "By construction" is worth an assertion anyway, because the schema guard
+    refuses catalogs it does not recognise and `drop_schema` now issues
+    `DROP TABLE` for every object it owns. Either could reach a neighbour's
+    table by accident, and the failure would be somebody else's data.
+    """
+    with _server() as (client, config):
+        native_table = f"`{config.database}`.`offload_{uuid4().hex[:8]}`"
+        client.execute(
+            f"CREATE TABLE {native_table} (model_id String, request_id String, "
+            "payload String) ENGINE = MergeTree ORDER BY (model_id, request_id)"
+        )
+        try:
+            client.execute(
+                f"INSERT INTO {native_table} (model_id, request_id, payload) VALUES",
+                [("m", "r", "bytes")],
+            )
+            writer = ClickHouseCatalogWriter(client, config)
+
+            # The guard accepts a database that holds a stranger's table.
+            writer.ensure_schema()
+            writer.acquire_publisher_lease("coexistence")
+            version = writer.allocate_version()
+            writer.publish_snapshot(
+                index_version=version, refs=(), published_at_ns=1,
+                indexed_rows=0, indexed_packs=0,
+            )
+
+            # And the stranger is untouched by any of it.
+            assert client.execute(f"SELECT count() FROM {native_table}") == [(1,)]
+
+            # Including by the teardown, which drops every object it owns.
+            writer.release_publisher_lease()
+            writer.drop_schema()
+            assert client.execute(f"SELECT count() FROM {native_table}") == [(1,)]
+        finally:
+            client.execute(f"DROP TABLE IF EXISTS {native_table}")
