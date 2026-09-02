@@ -255,8 +255,7 @@ class ClickHouseLeaseCoordinator:
     @staticmethod
     def _validate_term(term: int) -> None:
         if type(term) is not int or not 0 <= term <= 2**64 - 1:
-            raise ValueError("index_version must be an integer in [0, 2^64 - 1]")
-
+            raise ValueError("lease term must be an integer in [0, 2^64 - 1]")
     @staticmethod
     def _text(value: object) -> str:
         if isinstance(value, bytes):
