@@ -1,0 +1,457 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from time import time_ns
+from typing import Protocol
+
+from .catalog import CatalogSchemaVersionError
+from .clickhouse_sql import membership_predicate
+
+
+class ClickHouseClient(Protocol):
+    def execute(self, query: str, params=None, **kwargs): ...
+
+
+CAPTURE_COLUMNS = (
+    "capture_id",
+    "tenant_id",
+    "experiment_id",
+    "run_id",
+    "session_id",
+    "request_id",
+    "sequence_id",
+    "model_id",
+    "model_revision",
+    "adapter_revision",
+    "capture_policy_version",
+    "hook_name",
+    "layer_number",
+    "producer_rank",
+    "step_number",
+    "token_start",
+    "token_end",
+    "batch_position",
+    "dtype",
+    "shape",
+    "captured_at_ns",
+    "pack_id",
+    "store_id",
+    "object_key",
+    "object_bytes",
+    "pack_checksum",
+    "pack_record_count",
+    "payload_offset",
+    "stored_length",
+    "decoded_length",
+    "codec",
+    "payload_checksum",
+    "index_version",
+)
+
+FACET_COLUMNS = (
+    ("facet_version", "UInt16", "1"),
+    ("element_count", "UInt64", "toUInt64(arrayProduct(shape))"),
+    ("tensor_rank", "UInt8", "toUInt8(length(shape))"),
+    ("token_span", "UInt64", "toUInt64(token_end - token_start)"),
+    (
+        "compression_ratio",
+        "Float32",
+        "toFloat32(if(stored_length = 0, 0, decoded_length / stored_length))",
+    ),
+)
+
+PACK_COLUMNS = (
+    "pack_id",
+    "store_id",
+    "object_key",
+    "object_bytes",
+    "pack_checksum",
+    "record_count",
+    "index_version",
+)
+
+CAPTURE_TABLE_ORDER = (
+    "tenant_id",
+    "experiment_id",
+    "run_id",
+    "captured_at_ns",
+    "capture_id",
+    "store_id",
+    "pack_id",
+)
+
+SCHEMA_VERSION = 4
+
+
+def _quoted(value: str) -> str:
+    return f"`{value}`"
+
+
+def _text(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if not isinstance(value, str):
+        raise ValueError(  # noqa: TRY004 - preserve the catalog API
+            "ClickHouse returned a non-text identifier"
+        )
+    return value
+
+
+def _facet_ddl() -> str:
+    return ",\n".join(
+        f"{name} {kind} MATERIALIZED {expression}"
+        for name, kind, expression in FACET_COLUMNS
+    )
+
+
+def _key_columns(sorting_key: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in sorting_key.split(",") if part.strip())
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogObject:
+    engine: str
+    sorting_key: str
+
+    @property
+    def kind(self) -> str:
+        return "VIEW" if self.engine.endswith("View") else "TABLE"
+
+
+class ClickHouseCatalogSchema:
+    def __init__(self, client: ClickHouseClient, database: str, prefix: str) -> None:
+        self._client = client
+        self.database = database
+        self.prefix = prefix
+        self.capture_raw = f"{prefix}_capture_raw"
+        self.capture_view = f"{prefix}_capture"
+        self.pack_raw = f"{prefix}_pack_inventory_raw"
+        self.pack_view = f"{prefix}_pack_inventory"
+        self.watermark = f"{prefix}_index_watermark"
+        self.manifest = f"{prefix}_snapshot_manifest"
+        self.version_claims = f"{prefix}_capture_version_claims"
+        self.lease_table = f"{prefix}_publisher_lease"
+        self.schema_table = f"{prefix}_schema_version"
+        self.commit_log = f"{prefix}_pack_commit_log"
+        self.objects: tuple[tuple[str, str], ...] = (
+            ("VIEW", self.capture_view),
+            ("VIEW", self.pack_view),
+            ("TABLE", self.capture_raw),
+            ("TABLE", self.pack_raw),
+            ("TABLE", self.version_claims),
+            ("TABLE", self.lease_table),
+            ("TABLE", self.watermark),
+            ("TABLE", self.manifest),
+            ("TABLE", self.schema_table),
+        )
+        self.legacy_objects: tuple[tuple[str, str], ...] = (("TABLE", self.commit_log),)
+
+    def qualified(self, table: str) -> str:
+        return f"{_quoted(self.database)}.{_quoted(table)}"
+
+    def ensure(self) -> None:
+        self._verify_compatibility()
+        database = _quoted(self.database)
+        capture_raw = self.qualified(self.capture_raw)
+        capture_view = self.qualified(self.capture_view)
+        pack_raw = self.qualified(self.pack_raw)
+        pack_view = self.qualified(self.pack_view)
+        watermark = self.qualified(self.watermark)
+        manifest = self.qualified(self.manifest)
+        self._client.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {self.qualified(self.schema_table)} (
+version UInt32, applied_at_ns UInt64
+) ENGINE = MergeTree ORDER BY version"""
+        )
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {capture_raw} (
+capture_id String, tenant_id String, experiment_id String, run_id String,
+session_id String, request_id String, sequence_id String, model_id String,
+model_revision String, adapter_revision Nullable(String),
+capture_policy_version String, hook_name LowCardinality(String), layer_number Int32,
+producer_rank UInt32, step_number UInt64, token_start UInt64, token_end UInt64,
+batch_position UInt32, dtype LowCardinality(String), shape Array(UInt32),
+captured_at_ns UInt64, pack_id UUID, store_id LowCardinality(String), object_key String,
+object_bytes UInt64, pack_checksum FixedString(64), pack_record_count UInt32,
+payload_offset UInt64, stored_length UInt64, decoded_length UInt64,
+codec LowCardinality(String), payload_checksum FixedString(8), index_version UInt64,
+{_facet_ddl()}
+) ENGINE = ReplacingMergeTree(index_version)
+ORDER BY ({", ".join(CAPTURE_TABLE_ORDER)})"""
+        )
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {pack_raw} (
+pack_id UUID, store_id LowCardinality(String), object_key String,
+object_bytes UInt64, pack_checksum FixedString(64), record_count UInt32,
+index_version UInt64
+) ENGINE = ReplacingMergeTree(index_version)
+ORDER BY (store_id, pack_id)"""
+        )
+        for name, kind, expression in FACET_COLUMNS:
+            self._client.execute(
+                f"ALTER TABLE {capture_raw} ADD COLUMN IF NOT EXISTS "
+                f"{name} {kind} MATERIALIZED {expression}"
+            )
+        self._client.execute(
+            f"ALTER TABLE {capture_raw} ADD INDEX IF NOT EXISTS "
+            "capture_id_bloom capture_id TYPE bloom_filter(0.01) GRANULARITY 4"
+        )
+        self._client.execute(
+            f"ALTER TABLE {capture_raw} MATERIALIZE INDEX capture_id_bloom"
+        )
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {watermark} (
+index_version UInt64, publish_id UUID, published_at_ns UInt64,
+indexed_rows UInt64, indexed_packs UInt32
+) ENGINE = MergeTree ORDER BY (index_version, publish_id)"""
+        )
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {self.qualified(self.version_claims)} (
+version UInt64, claim_id UUID, claimed_at_ns UInt64
+) ENGINE = MergeTree ORDER BY (version, claim_id)"""
+        )
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {self.qualified(self.lease_table)} (
+term UInt64, lease_id UUID, holder String, acquired_at_ns UInt64,
+expires_at_ns UInt64
+) ENGINE = MergeTree ORDER BY (term, lease_id)"""
+        )
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {manifest} (
+index_version UInt64, publish_id UUID, store_id LowCardinality(String),
+pack_id UUID
+) ENGINE = MergeTree ORDER BY (index_version, publish_id, store_id, pack_id)"""
+        )
+        self._client.execute(
+            f"CREATE OR REPLACE VIEW {capture_view} AS "
+            f"SELECT {', '.join(CAPTURE_COLUMNS[:-1])} FROM {capture_raw} FINAL "
+            f"WHERE {membership_predicate(manifest, watermark, bounded=False)}"
+        )
+        self._client.execute(
+            f"CREATE VIEW IF NOT EXISTS {pack_view} AS "
+            f"SELECT {', '.join(PACK_COLUMNS[:-1])} FROM {pack_raw} FINAL"
+        )
+        self._client.execute(
+            f"INSERT INTO {self.qualified(self.schema_table)} "
+            "(version, applied_at_ns) "
+            "SELECT toUInt32(%(version)s), toUInt64(%(applied_at_ns)s) "
+            "FROM system.one WHERE (SELECT count() FROM "
+            f"{self.qualified(self.schema_table)}) = 0",
+            {"version": SCHEMA_VERSION, "applied_at_ns": time_ns()},
+        )
+
+    def _verify_compatibility(self) -> None:
+        found = self._catalog_state()
+        if not found:
+            return
+        self._reject_wrong_kinds(found)
+        if not any(name in found for _, name in self.objects):
+            raise CatalogSchemaVersionError(self._leftovers_only(found))
+        if self.schema_table not in found:
+            raise CatalogSchemaVersionError(self._unstamped_diagnosis(found))
+        recorded = self._recorded_version()
+        if recorded is not None and recorded != SCHEMA_VERSION:
+            raise CatalogSchemaVersionError(
+                f"catalog `{self.database}`.`{self.prefix}_*` is at schema "
+                f"version {recorded} and this build reads version "
+                f"{SCHEMA_VERSION}. A higher version means a newer writer owns "
+                "this catalog: upgrade this build rather than writing to it. A "
+                "lower one is not upgraded in place. " + self.rebuild_instruction()
+            )
+        stamp = (
+            f"is stamped schema version {SCHEMA_VERSION}"
+            if recorded is not None
+            else f"holds `{self.schema_table}` with no row in it (an install "
+            "of this build that died before stamping)"
+        )
+        missing = [
+            name for kind, name in self.objects if kind == "TABLE" and name not in found
+        ]
+        if missing:
+            raise CatalogSchemaVersionError(
+                f"catalog `{self.database}`.`{self.prefix}_*` {stamp} but is "
+                "missing "
+                + ", ".join(f"`{name}`" for name in missing)
+                + ". Recreating those empty beside tables that kept their rows "
+                "is not a repair: surviving inventory would skip their packs. "
+                + self.rebuild_instruction()
+            )
+        if self._inventory_without_membership():
+            raise CatalogSchemaVersionError(
+                f"catalog `{self.database}`.`{self.prefix}_*` lists one or more "
+                f"packs in `{self.pack_raw}` without membership in "
+                f"`{self.manifest}` admitted by a publish in `{self.watermark}`. "
+                "Those packs are already marked indexed but belong to no "
+                "snapshot, so an indexing pass would skip them and report "
+                "success while their captures remain invisible. "
+                + self.rebuild_instruction()
+            )
+
+    def _catalog_state(self) -> dict[str, CatalogObject]:
+        names = [name for _, name in self.objects + self.legacy_objects]
+        rows = self._client.execute(
+            "SELECT name, engine, sorting_key FROM system.tables "
+            "WHERE database = %(database)s AND name IN %(names)s",
+            {"database": self.database, "names": names},
+        )
+        wanted = set(names)
+        return {
+            _text(name): CatalogObject(_text(engine), _text(sorting_key))
+            for name, engine, sorting_key in rows
+            if _text(name) in wanted
+        }
+
+    def _reject_wrong_kinds(self, found: dict[str, CatalogObject]) -> None:
+        wrong = [
+            f"`{name}` is a {found[name].kind} (engine {found[name].engine}) "
+            f"where this build creates a {kind}"
+            for kind, name in self.objects
+            if name in found and found[name].kind != kind
+        ]
+        if wrong:
+            raise CatalogSchemaVersionError(
+                f"catalog `{self.database}`.`{self.prefix}_*` holds an object "
+                "of the wrong kind: "
+                + ", ".join(wrong)
+                + ". "
+                + self.rebuild_instruction()
+            )
+
+    def _leftovers_only(self, found: dict[str, CatalogObject]) -> str:
+        leftovers = [name for _, name in self.legacy_objects if name in found]
+        listed = ", ".join(f"`{self.database}`.`{name}`" for name in leftovers)
+        subject = (
+            f"the only object present is {listed}"
+            if len(leftovers) == 1
+            else f"the only objects present are {listed}"
+        )
+        it = "it" if len(leftovers) == 1 else "them"
+        return (
+            f"catalog `{self.database}`.`{self.prefix}_*` holds none of the "
+            f"objects this build creates: {subject}. Drop {it} and run "
+            "ensure_schema() again. There is nothing to rebuild first."
+        )
+
+    def _unstamped_diagnosis(self, found: dict[str, CatalogObject]) -> str:
+        findings: list[str] = []
+        required_key = ", ".join(CAPTURE_TABLE_ORDER)
+        descriptor = found.get(self.capture_raw)
+        if descriptor is None:
+            findings.append(
+                f"`{self.capture_raw}` is absent, so this catalog holds no "
+                "descriptor rows at all"
+            )
+        elif _key_columns(descriptor.sorting_key) != _key_columns(required_key):
+            findings.append(
+                f"`{self.capture_raw}` has ORDER BY ({descriptor.sorting_key}) "
+                f"and this build requires ORDER BY ({required_key})"
+            )
+        else:
+            findings.append(
+                f"`{self.capture_raw}` is already sorted on ({required_key}), "
+                "the key this build requires -- so the descriptor sort key is "
+                "NOT what is wrong with this catalog"
+            )
+        commit_log = self.commit_log in found
+        manifest = self.manifest in found
+        if commit_log and not manifest:
+            findings.append(
+                f"snapshot membership is in `{self.commit_log}`, which this "
+                f"build never reads; it moved to `{self.manifest}`, which is absent"
+            )
+        elif manifest and not commit_log:
+            findings.append(
+                f"snapshot membership is already in `{self.manifest}`, where "
+                f"this build reads it, and `{self.commit_log}` is absent -- so "
+                "there is NO commit-log migration owed here"
+            )
+        elif manifest and commit_log:
+            findings.append(
+                f"both membership tables are present: `{self.commit_log}` and "
+                f"`{self.manifest}`"
+            )
+        else:
+            findings.append(
+                f"neither `{self.commit_log}` nor `{self.manifest}` is present, "
+                "so nothing records snapshot membership"
+            )
+        identity_tables = [
+            name for name in (self.watermark, self.manifest) if name in found
+        ]
+        if identity_tables:
+            without = sorted(
+                set(identity_tables) - self._tables_with_publish_id(identity_tables)
+            )
+            if without:
+                findings.append(
+                    ", ".join(f"`{name}`" for name in without)
+                    + " has no `publish_id` column"
+                )
+            else:
+                findings.append(
+                    ", ".join(f"`{name}`" for name in identity_tables)
+                    + " already carry `publish_id`"
+                )
+        absent = [name for _, name in self.objects if name not in found]
+        if absent:
+            findings.append(
+                "this build also creates "
+                + ", ".join(f"`{name}`" for name in absent)
+                + f", {'which is not' if len(absent) == 1 else 'none of which are'} present"
+            )
+        return (
+            f"catalog `{self.database}`.`{self.prefix}_*` carries no schema "
+            f"stamp and this build requires version {SCHEMA_VERSION}. Version "
+            f"{SCHEMA_VERSION} is the first to write `{self.schema_table}`, so "
+            "an unstamped catalog is one of the versions before it. What the "
+            "server reports about THIS catalog:\n"
+            + "".join(f"  - {finding}\n" for finding in findings)
+            + "It is refused whichever version it is, and deliberately: this "
+            "build cannot know that the differences listed are all of them. "
+            + self.rebuild_instruction()
+        )
+
+    def _tables_with_publish_id(self, tables: list[str]) -> set[str]:
+        rows = self._client.execute(
+            "SELECT table FROM system.columns WHERE database = %(database)s "
+            "AND table IN %(tables)s AND name = 'publish_id'",
+            {"database": self.database, "tables": tables},
+        )
+        return {_text(row[0]) for row in rows}
+
+    def _recorded_version(self) -> int | None:
+        rows = self._client.execute(
+            f"SELECT version FROM {self.qualified(self.schema_table)} "
+            "ORDER BY version DESC LIMIT 1"
+        )
+        return rows[0][0] if rows else None
+
+    def _inventory_without_membership(self) -> bool:
+        rows = self._client.execute(
+            "SELECT count() FROM (SELECT store_id, pack_id FROM "
+            f"{self.qualified(self.pack_raw)} FINAL "
+            "WHERE (store_id, pack_id) NOT IN (SELECT store_id, pack_id FROM "
+            f"{self.qualified(self.manifest)} WHERE (index_version, publish_id) "
+            "IN (SELECT index_version, publish_id FROM "
+            f"{self.qualified(self.watermark)})) LIMIT 1)"
+        )
+        return bool(rows[0][0])
+
+    def rebuild_instruction(self) -> str:
+        objects = ", ".join(
+            f"`{self.database}`.`{name}`"
+            for _, name in self.objects + self.legacy_objects
+        )
+        return (
+            "The catalog is a derived projection over immutable packs, so "
+            "rebuilding it loses nothing: stop every indexer, drop ALL of its "
+            f"objects in this order (views first) -- {objects} -- then run "
+            "ensure_schema(), acquire_publisher_lease() on the rebuilding "
+            "writer, and CatalogReconciler.rebuild() over each pack store. "
+            "Dropping the pack inventory is mandatory, not optional."
+        )
+
+    def drop(self) -> None:
+        for kind, name in self.objects + self.legacy_objects:
+            self._client.execute(f"DROP {kind} IF EXISTS {self.qualified(name)}")

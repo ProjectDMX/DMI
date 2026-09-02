@@ -71,8 +71,8 @@ class SnapshotPublishExhaustedError(CaptureStorageError):
 class PublisherLeaseError(CaptureStorageError):
     """This publisher does not hold the lease a publish requires.
 
-    Raised when no lease was ever acquired, when acquiring one was contested
-    past its attempt bound, and -- the case that matters -- when a fenced
+    Raised when no lease was ever acquired, when a live or contested term
+    prevents acquisition, and -- the case that matters -- when a fenced
     publish made NO SNAPSHOT VISIBLE because the lease had been taken over or
     had expired. That last one is NOT a lost version race: re-allocating a
     version and trying again would fail the same fence every time, so this is

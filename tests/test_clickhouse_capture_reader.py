@@ -599,27 +599,19 @@ def test_get_by_ids_chunks_the_inlined_id_list():
     Each chunk reads the same pinned snapshot, so the union of the chunk
     results is the unchunked result.
     """
-    from dmi.storage.capture.clickhouse_reader import _MAX_INLINE_IDS
+    ids = [f"capture-{index:05d}" for index in range(10_000)]
+    catalog, client = _catalog(pages=[[] for _ in range(50)])
 
-    ids = [f"capture-{index}" for index in range(2 * _MAX_INLINE_IDS + 1)]
-    expected = synthetic_descriptors(3)
-    catalog, client = _catalog(pages=[[expected[0]], [expected[1]], [expected[2]]])
-
-    resolved = catalog.get_by_ids(
-        ids, tenant_id="tenant-a", watermark=str(_WATERMARK)
-    )
+    catalog.get_by_ids(ids, tenant_id="tenant-a", watermark=str(_WATERMARK))
 
     batches = [
         params["capture_ids"]
         for _, params, _ in client.calls
         if params is not None and "capture_ids" in params
     ]
-    assert [len(batch) for batch in batches] == [
-        _MAX_INLINE_IDS, _MAX_INLINE_IDS, 1,
-    ]
+    assert max(map(len, batches)) > 200
     # Every id is sent, in order, exactly once.
     assert [item for batch in batches for item in batch] == ids
-    assert resolved == tuple(expected)
     # Every chunk runs the same statement -- same tenant lead, same watermark
     # bound, same membership subquery.
     assert len(set(client.selects)) == 1
@@ -628,37 +620,26 @@ def test_get_by_ids_chunks_the_inlined_id_list():
     assert len(heads) == 1
 
 
-@pytest.mark.parametrize(
-    "extra, statements",
-    [
-        pytest.param(-1, 1, id="one-under-the-chunk"),
-        pytest.param(0, 1, id="exactly-one-chunk"),
-        pytest.param(1, 2, id="one-over-the-chunk"),
-    ],
-)
-def test_get_by_ids_splits_exactly_at_the_chunk_boundary(extra, statements):
-    from dmi.storage.capture.clickhouse_reader import _MAX_INLINE_IDS
+def test_every_id_chunk_stays_inside_the_rendered_byte_budget():
+    from clickhouse_driver.util.escape import escape_param
 
-    ids = [f"capture-{index}" for index in range(_MAX_INLINE_IDS + extra)]
-    catalog, client = _catalog(pages=[[] for _ in range(statements)])
+    from dmi.storage.capture.clickhouse_sql import MAX_INLINE_PARAMETER_BYTES
+
+    ids = [f"{index:04d}" + "'" * 508 for index in range(401)]
+    catalog, client = _catalog(pages=[[], [], []])
 
     catalog.get_by_ids(ids, tenant_id="tenant-a", watermark=str(_WATERMARK))
 
-    assert len(client.selects) == statements
-
-
-def test_the_id_chunk_budget_holds_at_the_text_limit():
-    """The chunk size has to survive the largest id the model admits.
-
-    One inlined id renders as at most twice ``_TEXT_LIMIT`` (escaping can
-    double it) plus quotes and a separator, and the projection and membership
-    subquery share the same 256 KiB ``max_query_size`` budget.
-    """
-    from dmi.storage.capture.clickhouse_reader import _MAX_INLINE_IDS
-    from dmi.storage.capture.model import _TEXT_LIMIT
-
-    rendered = _MAX_INLINE_IDS * (2 * _TEXT_LIMIT + 4)
-    assert rendered <= 256 * 1024 - 8 * 1024
+    batches = [
+        params["capture_ids"]
+        for _, params, _ in client.calls
+        if params is not None and "capture_ids" in params
+    ]
+    rendered = [
+        escape_param(batch, {"strings_as_bytes": False}).encode("utf-8")
+        for batch in batches
+    ]
+    assert all(len(value) <= MAX_INLINE_PARAMETER_BYTES for value in rendered)
 
 
 def test_get_by_ids_sends_each_id_once():

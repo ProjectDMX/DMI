@@ -488,8 +488,8 @@ def test_a_takeover_between_the_two_publish_statements_leaves_orphan_rows():
         successor.release_publisher_lease()
 
 
-def test_a_contested_head_term_is_made_safe_by_the_read_back_not_the_fence():
-    """Where the safety of a contested term actually comes from.
+def test_a_contested_head_is_quarantined_even_though_the_fence_selects_one():
+    """A contested term stays put while its ordering winner can publish.
 
     Both documents said "a contested head term satisfies neither condition" of
     the fence. It is not true and the difference matters to anyone reasoning
@@ -497,13 +497,12 @@ def test_a_contested_head_term_is_made_safe_by_the_read_back_not_the_fence():
     DESC`, so a contested term's higher-ordering claimant satisfies it exactly
     as an uncontested holder would.
 
-    What makes the term safe is `_claim_lease`: both claimants see two rows in
-    their read-back, both abandon the term, and neither is ever handed a
-    `PublisherLease`. Nobody is holding the `lease_id` the fence would accept.
-    Asserted on the server, because the ordering here is ClickHouse's UUID
-    collation -- the low half first -- and not text order.
+    A late row can arrive after the winner's read-back. Safety therefore comes
+    from refusing every higher claim until both rows expire, not from assuming
+    nobody holds the `lease_id` the fence accepts. The ordering is asserted on
+    the server because ClickHouse compares the low UUID half first.
     """
-    with _catalog() as (writer, reader, client, config):
+    with _catalog() as (writer, _reader, client, config):
         writer.release_publisher_lease()
         lease_table = f"`{config.database}`.`{config.table_prefix}_publisher_lease`"
         client.execute(f"TRUNCATE TABLE {lease_table}")
@@ -533,35 +532,23 @@ def test_a_contested_head_term_is_made_safe_by_the_read_back_not_the_fence():
             f"SELECT {fence}", {"lease_id": high_text_low_uuid}
         ) == [(0,)]
 
-        # And it is safe anyway, because no protocol run ever returns that
-        # lease: a claimant that sees the contest abandons the term and claims
-        # above it, so the id the fence would accept is one nobody holds.
+        # No successor can overlap a lease that may have returned before the
+        # second row arrived.
         successor = ClickHouseCatalogWriter(_client(), config)
-        lease = successor.acquire_publisher_lease("successor")
-        assert lease.term > 7 and lease.lease_id not in (
-            low_text_high_uuid, high_text_low_uuid
-        )
-        version = successor.allocate_version()
-        _publish(successor, version, refs=(), rows=0)
-        assert int(reader.current_watermark()) == version
-        successor.release_publisher_lease()
+        with pytest.raises(PublisherLeaseHeldError, match="contested"):
+            successor.acquire_publisher_lease("successor")
 
 
-def test_a_contested_lease_term_is_held_by_nobody():
-    """Sole-claimant, over a live server, with a real competing row.
+def test_a_contested_lease_term_blocks_a_higher_claim_until_expiry():
+    """Late-claim quarantine over a live server.
 
     A competing claim lands between the claimant's INSERT and its read-back.
-    Resolving the tie either way would let both sides keep the term when each
-    sees only its own insert first, so both walk away and claim above it.
-
-    What this does NOT show is a publish under the contested term: by the time
-    the claimant publishes it holds a HIGHER term, so the fence is resolving
-    that row and not the contested one. The docstring used to claim otherwise.
-    `test_a_contested_head_term_is_made_safe_by_the_read_back_not_the_fence`
-    covers the contested head itself.
+    The claimant sees the tie and walks away. A higher claim is refused while
+    either row remains live because the rival could have completed read-back
+    before this row arrived.
     """
     competitor = str(uuid4())
-    with _catalog() as (writer, reader, client, config):
+    with _catalog() as (writer, _reader, client, config):
         writer.release_publisher_lease()
         contested: list[int] = []
 
@@ -582,17 +569,13 @@ def test_a_contested_lease_term_is_held_by_nobody():
                 return client.execute(query, params, **kwargs)
 
         claimant = ClickHouseCatalogWriter(_ContestTheFirstClaim(), config)
-        lease = claimant.acquire_publisher_lease("claimant")
+        with pytest.raises(PublisherLeaseHeldError, match="contested"):
+            claimant.acquire_publisher_lease("claimant")
 
         assert contested, "the first claim should have been contested"
-        assert lease.term > contested[0], "a contested term must never be held"
-        # The contested term really does hold two rows and neither is a lease.
         terms = [row[0] for row in _lease_rows(client, config)]
         assert terms.count(contested[0]) == 2
-        # And the claimant, holding the term above it, publishes normally.
-        version = claimant.allocate_version()
-        _publish(claimant, version, refs=(), rows=0)
-        assert int(reader.current_watermark()) == version
+        assert claimant.publisher_lease is None
 
 
 def test_the_fence_refuses_on_an_empty_lease_table_rather_than_throwing():

@@ -267,6 +267,10 @@ class FakeLeaseTable:
             return []
         if not statement.startswith("SELECT") or "publisher_lease" not in query:
             return None
+        if "max(expires_at_ns)" in query:
+            term = int(params["term"])
+            expires = [row[4] for row in self.rows if row[0] == term]
+            return [(max(expires, default=None), self.now_ns)]
         if "ORDER BY term DESC" in query:
             # The head, in the order the fence resolves it, cut to the LIMIT
             # the statement actually asked for. Hardcoding two rows here made

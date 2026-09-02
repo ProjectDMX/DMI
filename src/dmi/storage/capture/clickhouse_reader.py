@@ -83,8 +83,8 @@ descriptor table mid-call pins a batch that then keeps growing.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Mapping, Sequence
 from uuid import UUID
 
 from .clickhouse_catalog import (
@@ -96,6 +96,7 @@ from .clickhouse_catalog import (
     _membership_predicate,
     _quoted,
 )
+from .clickhouse_sql import inline_chunks, inline_text_bytes
 from .cursor import CursorKey, decode_cursor, encode_cursor
 from .model import (
     CaptureDescriptor,
@@ -105,7 +106,6 @@ from .model import (
     PackFormatError,
     PayloadLocator,
 )
-
 
 # Capture identity: what one result row is one of, and therefore the GROUP BY,
 # the result ORDER BY and the keyset pagination order.
@@ -142,16 +142,6 @@ _EQUALITY_FILTERS = ("tenant_id", "experiment_id", "run_id", "session_id", "mode
 # ``index_version``, because it has to be a TOTAL order over the rows in one
 # group; ``_projection`` explains why, and what breaks without it.
 _RESOLUTION_ORDER = "(index_version, store_id, pack_id)"
-
-# Capture ids are inlined into the statement's TEXT: the driver substitutes
-# non-VALUES parameters client-side, and the server parses at most
-# max_query_size bytes of it (256 KiB by default). A capture_id may be up to
-# 512 bytes (``model._TEXT_LIMIT``) and escaping can double it, so one member
-# can render at ~1 KiB: chunks of this size keep the rendered id list around
-# 200 KiB even at that ceiling, where an unchunked ``max_capture_ids`` lookup
-# (10,000 ids) breaches the limit and dies with Code 62 mid-statement.
-_MAX_INLINE_IDS = 200
-
 
 @dataclass(frozen=True, slots=True)
 class ClickHouseReaderConfig:
@@ -355,8 +345,8 @@ class ClickHouseCaptureCatalog:
             f"capture_id IN %(capture_ids)s AND {self._membership()} "
             f"GROUP BY {', '.join(_quoted(name) for name in _SORT_KEY)}"
         )
-        # Chunked, because the ids land in the statement TEXT and a full-size
-        # lookup would breach the server's max_query_size (see _MAX_INLINE_IDS).
+        # Chunked by rendered bytes, because the ids land in the statement TEXT
+        # and a full-size lookup can breach the server's max_query_size.
         # Each chunk reads the same pinned snapshot -- the membership bound is
         # the immutable set of packs published at or before the watermark -- so
         # the union of the chunk results is the unchunked result. Ids are sent
@@ -364,11 +354,11 @@ class ClickHouseCaptureCatalog:
         # and two chunks naming the same id would return its row twice.
         unique_ids = list(dict.fromkeys(capture_ids))
         descriptors: list[CaptureDescriptor] = []
-        for start in range(0, len(unique_ids), _MAX_INLINE_IDS):
+        for chunk in inline_chunks(unique_ids, item_bytes=inline_text_bytes):
             params = {
                 "watermark": requested,
                 "tenant_id": tenant_id,
-                "capture_ids": unique_ids[start : start + _MAX_INLINE_IDS],
+                "capture_ids": chunk,
             }
             rows = self._client.execute(
                 sql, params, settings=self._config.settings

@@ -316,13 +316,13 @@ def test_a_publish_renews_between_fenced_statements(tmp_path: Path):
     assert server.watermarks == [1]
 
 
-def test_a_contested_lease_term_is_abandoned_by_everyone_who_sees_it():
-    """The sole-claimant rule, applied to the lease.
+def test_a_contested_lease_term_is_quarantined_until_claims_expire():
+    """The sole-claimant rule plus the late-claim safety window.
 
     A competing claim lands between the claimant's INSERT and its read-back.
-    Resolving that tie in either direction would let both sides keep the term
-    when each sees only its own insert first, so the only safe answer is for
-    both to walk away and claim above it.
+    The claimant walks away, and nobody may claim above the contested term
+    until every row at it has expired: another claimant may have returned
+    before the competing row arrived.
     """
     server = _CatalogServer()
     writer = _writer(server)
@@ -336,25 +336,53 @@ def test_a_contested_lease_term_is_abandoned_by_everyone_who_sees_it():
         server.lease.on_claim_read = None  # contest the first attempt only
 
     server.lease.on_claim_read = contest
-    lease = writer.acquire_publisher_lease("indexer-a")
+    with pytest.raises(PublisherLeaseHeldError, match="contested"):
+        writer.acquire_publisher_lease("indexer-a")
 
     assert contested == [1], "the first term should have been contested"
-    assert lease.term > contested[0], "a contested term must never be held"
+    assert writer.publisher_lease is None
+
+    server.lease.now_ns += 10**12 + 1
+    lease = writer.acquire_publisher_lease("indexer-a")
+    assert lease.term > contested[0]
 
 
-def test_a_lease_claim_gives_up_after_exhausting_its_attempts():
-    """Bounded, and loud: an unbounded retry would spin against a live rival."""
+def test_a_late_same_term_claim_cannot_supersede_a_live_returned_lease():
+    """A claim arriving after read-back must not erase a live lease's margin."""
     server = _CatalogServer()
-    writer = _writer(server, lease_attempts=3)
+    holder = _publisher(server, "indexer-a")
+    held = holder.publisher_lease
+    delayed = _LARGE_CLAIM
+    server.lease.rows.append(
+        (
+            held.term,
+            delayed,
+            "indexer-b",
+            server.lease.now_ns,
+            held.expires_at_ns,
+        )
+    )
+    contender = _writer(server)
+
+    with pytest.raises(PublisherLeaseHeldError, match="contested"):
+        contender._claim_lease("indexer-b", lease_id=delayed)
+
+    assert server.lease.now_ns < held.expires_at_ns
+    assert contender.publisher_lease is None
+
+
+def test_a_newly_contested_claim_waits_for_its_own_expiry():
+    server = _CatalogServer()
+    writer = _writer(server)
     server.lease.on_claim_read = lambda term: server.lease.rows.append(
         (term, _LARGE_CLAIM, "competitor", 0, 0)
     )
 
-    with pytest.raises(PublisherLeaseError, match="after 3 attempts"):
+    with pytest.raises(PublisherLeaseHeldError, match="contested"):
         writer.acquire_publisher_lease("indexer-a")
 
     assert writer.publisher_lease is None
-    assert len(server.lease.rows) == 6, "three claims, each contested once"
+    assert len(server.lease.rows) == 2
 
 
 def test_a_holder_re_acquiring_its_own_live_lease_refreshes_it():
@@ -410,44 +438,6 @@ def test_a_release_by_a_writer_that_no_longer_holds_the_lease_revokes_nothing():
     assert server.lease.fence_passes(healthy.publisher_lease.lease_id)
     with pytest.raises(PublisherLeaseHeldError, match="'healthy'"):
         _publisher(server, "third")
-
-
-def test_a_contested_lease_claim_retries_at_a_randomized_term(monkeypatch):
-    """The retry must not send every contender back to the same next term.
-
-    `head.term + 1` is what every contender computes, so a term abandoned by
-    all of them is followed by a term all of them collide on again. Measured
-    against a live 25.12: six publishers taking a cold lease 25 times each hard
-    -failed 45% of the time with "every term was contested" -- a liveness
-    failure invented entirely by the retry. `allocate_version` already adds
-    `secrets.randbelow(8 * attempt + 1)` for exactly this reason; the lease
-    claim now mirrors it, window for window.
-    """
-    import dmi.storage.capture.clickhouse_catalog as module
-
-    draws: list[int] = []
-
-    def top_of_the_window(bound: int) -> int:
-        draws.append(bound)
-        return bound - 1
-
-    monkeypatch.setattr(module.secrets, "randbelow", top_of_the_window)
-
-    server = _CatalogServer()
-    writer = _writer(server, lease_attempts=3)
-    server.lease.on_claim_read = lambda term: server.lease.rows.append(
-        (term, _LARGE_CLAIM, "competitor", 0, 0)
-    )
-
-    with pytest.raises(PublisherLeaseError, match="after 3 attempts"):
-        writer.acquire_publisher_lease("indexer-a")
-
-    # The first attempt takes head + 1 unskipped; every later one draws from
-    # the same widening window the allocator uses.
-    assert draws == [8 * 1 + 1, 8 * 2 + 1]
-    claimed = sorted({term for term, _, holder, _, _ in server.lease.rows
-                      if holder == "indexer-a"})
-    assert claimed == [1, 10, 27], claimed
 
 
 def test_a_released_lease_is_available_at_once():

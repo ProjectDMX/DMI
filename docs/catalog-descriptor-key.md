@@ -290,12 +290,12 @@ assumed from the start rather than merely documenting it.
 
 `{prefix}_publisher_lease` holds `(term, lease_id, holder, acquired_at_ns,
 expires_at_ns)`. It is append-only and claimed by the **same sole-claimant
-protocol as a version**, which is safe here for the same reason: a lease claim
-row is inert. Writing one confers nothing on its own, because the only thing
-that ever reads the table is the fencing predicate inside a publish, and that
-predicate accepts a `lease_id` no claimant of a contested term is ever handed.
-A term claimed by two publishers is abandoned by both, holds no lease, and is
-takeable at once by whoever claims a higher term.
+protocol as a version**, but with an extra late-claim rule. Writing a row does
+not confer ownership until its read-back succeeds. A competing row can arrive
+after that success, however, and the fence resolves one row from a contested
+term. The protocol therefore quarantines a contested head until the latest
+`expires_at_ns` recorded at that term. Only after every possible returned lease
+has expired may a publisher claim a higher term.
 
 **Where that safety comes from is the read-back, not the fence.** Both this
 document and `capture-storage-design.md` used to say that a contested head term
@@ -304,11 +304,10 @@ resolves ONE row with `ORDER BY term DESC, lease_id DESC`, so the
 higher-ordering of two claimants at the top term satisfies it exactly as a real
 holder would. Verified on 25.12, and note that the ordering is ClickHouse's UUID
 collation -- the low 64 bits first -- so it is not the text order either. What
-makes the term safe is `_claim_lease`: both claimants see two rows in their
-read-back, both abandon the term, and neither is ever returned a
-`PublisherLease`. Nobody is holding the token the fence would accept.
-`test_a_contested_head_term_is_made_safe_by_the_read_back_not_the_fence` drives
-both halves against a live server.
+makes the term safe is `_claim_lease`: a claimant that sees two rows is not
+returned a `PublisherLease`, and nobody may advance past that term while a
+claim at it remains live. This also protects a claimant that completed
+read-back before the competing row arrived.
 
 `term` is the monotonic slot, not the clock -- a wall-clock ordering could tie,
 and then "the head of the table" would be ambiguous. `acquired_at_ns` and
@@ -475,14 +474,13 @@ rather than by an unbounded scheduler artifact. It is not *zero*:
 pre-empted, so a statement blocked in a lock can overrun it. This has not been
 reproduced; it also has not been proven impossible, and the difference matters.
 
-**Lease acquisition is not the window it looks like.** Two publishers claiming
-one term both abandon it, so a contested term is held by nobody -- the same
-argument that makes the version allocator sound, and see above for why the
-credit belongs to the read-back rather than to the fence. The cost is liveness,
-not safety: a contested term locks *everyone* out, including a previous holder
-whose lease was still live, until somebody claims a higher term. That is
-deliberate. A contested head means the catalog does not know who is in charge,
-and refusing to publish is the conservative answer.
+**Lease acquisition is not the window it looks like.** A claimant can complete
+its singleton read-back before a delayed competitor inserts at the same term.
+The contested head therefore locks *everyone* out of acquiring a higher term
+until the maximum expiry at that term. The fence may continue to admit its
+ordering winner during that interval, but no successor can overlap it. The cost
+is bounded liveness; the benefit is preserving the returned lease's full safety
+margin.
 
 **Two writers can both believe they hold a lease.** The sole-claimant read-back
 proves a claimant is alone at ITS term, not that its term is the head. A

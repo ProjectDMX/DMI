@@ -408,19 +408,19 @@ from no rows raises `Code: 125 ... cannot be Nullable` on 25.12 rather than
 answering NULL.
 
 The lease is claimed by the same sole-claimant append-and-read-back protocol as
-a catalog version, and it is safe here for the same reason: a lease claim row is
-inert. Nothing reads the table except the fence, and the fence accepts a
-`lease_id` that no claimant of a contested term is ever handed, so a term
-claimed by two publishers is abandoned by both, holds no lease, and is takeable
-at once by whoever claims a higher term.
+a catalog version, but with an extra late-claim rule. A claimant can finish a
+singleton read-back before a competitor inserts at the same term. Once a term
+is contested, no publisher may claim above it until the maximum expiry at that
+term; this preserves any lease returned before the second row arrived.
 
 **The credit there belongs to the read-back, not to the fence.** This section
 used to argue that because the fence names one row, a contested term satisfies
 neither of its conditions. It satisfies both, for the claimant whose `lease_id`
 sorts higher under ClickHouse's UUID collation -- which compares the low 64 bits
 first and is therefore not the text order either. What makes the term safe is
-that `_claim_lease` returns a `PublisherLease` to neither claimant, so nobody
-holds the token the fence would accept.
+that a claimant which sees the contest receives no `PublisherLease`, while a
+claimant that returned earlier remains protected by the contested term's expiry
+quarantine.
 
 | Concept | Where it lives |
 |---|---|
@@ -437,7 +437,8 @@ Lifecycle:
 
 - **Acquire.** A live lease held by somebody else raises
   `PublisherLeaseHeldError`, naming the holder and the remaining time. An
-  expired lease, or a contested (and therefore inert) head term, is taken over.
+  expired singleton lease is taken over. A contested head is unavailable until
+  every claim at that term has expired; only then is a higher term claimed.
   A writer that already holds a lease is re-acquiring its OWN and refreshes it,
   keeping the same `lease_id`, because "acquire before publishing" is the
   documented path and anything restarting above the writer calls it again.
@@ -484,6 +485,10 @@ of seconds and sends the integer -- a fractional value can truncate to 0 on
 older serialization paths, which the server reads as *no* limit. The cap is per
 statement, not the pair, so it does not bound the client round trip between
 them.
+
+`lease_attempts` remains accepted by `ClickHouseCatalogConfig` for compatibility
+but is deprecated and ignored. Contested terms now wait for expiry rather than
+retrying at randomized higher terms.
 
 The earlier one-renewal implementation measured 15.2 ms for a 16-pack publish
 and 173 ms for the full 4096-row indexing pass on 25.12. The current protocol
