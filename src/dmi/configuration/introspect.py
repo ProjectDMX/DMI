@@ -105,12 +105,20 @@ def descriptor_from_hf_config(
     except ValueError as exc:
         raise DescriptorError(f"Config for {model_id!r} is inconsistent: {exc}") from exc
 
-    return ModelDescriptor(
-        model=ModelIdentity(
+    try:
+        identity = ModelIdentity(
             id=_slug(model_id),
             name=name or model_id.rstrip("/").split("/")[-1],
             architecture="decoder_transformer",
-        ),
+        )
+    except ValueError as exc:
+        # _slug of a degenerate id ("/" and friends) leaves nothing usable.
+        raise DescriptorError(
+            f"Could not derive a usable model id from {model_id!r}: {exc}"
+        ) from exc
+
+    return ModelDescriptor(
+        model=identity,
         topology=topology,
         schema_version=DESCRIPTOR_SCHEMA_VERSION,
     )
