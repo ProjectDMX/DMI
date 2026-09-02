@@ -6,14 +6,32 @@ Verified against: `cb4e490`
 
 ## Running it
 
+The web dependencies are needed once (`fastapi` and `uvicorn`; DMI itself does
+not have to be installed):
+
 ```bash
 pip install -e ".[ui]"
+```
+
+Then, from a checkout:
+
+```bash
+make ui
+```
+
+This runs the bundled Llama-3-8B descriptor, picks a free port starting at
+8000, and opens a browser once the server is actually accepting connections.
+Override the model with `make ui MODEL=./Qwen3-8B`.
+
+With DMI itself installed, it is a normal command:
+
+```bash
 dmi ui ./Qwen3-8B
 ```
 
-Then open <http://127.0.0.1:8000>. `dmi ui` takes the model however you have
-it — a model directory, a `config.json`, a Hugging Face model id (needs
-`transformers`), or a DMI descriptor YAML:
+`dmi ui` takes the model however you have it — a model directory, a
+`config.json`, a Hugging Face model id (needs `transformers`), or a DMI
+descriptor YAML:
 
 ```bash
 dmi ui ./Qwen3-8B/config.json
@@ -34,8 +52,12 @@ dmi describe-model ./Qwen3-8B --output qwen3-8b.yaml
 ```
 
 Without an install, `python -m dmi.cli ...` works from a checkout with `src` on
-`PYTHONPATH`. `--host` and `--port` move the bind address; the default is
-loopback only.
+`PYTHONPATH`; that is all `make ui` does.
+
+`--host` and `--port` move the bind address; the default is loopback only. An
+explicit `--port` that is busy fails rather than quietly serving somewhere
+else — only the automatic default walks forward to the next free port.
+`--no-browser` suppresses the browser.
 
 Using the configuration from Python, with no browser involved:
 
@@ -626,15 +648,55 @@ The only change to existing code is additive: `filter_by_layers` and
 convention as `filter_by_pp_rank` and `filter_by_tp_rank` (disable the dropped
 spec's hook point, raise on unbound specs).
 
+### Closed since phases 1-7
+
+* **Wiring into `attach_model`.** Closed. `attach_model` now takes a keyword
+  `layers` argument and applies `filter_by_layers` between
+  `apply_hook_selection` and the PP/TP filters, and
+  `dmi.configuration.attach_config(adapter, model, config)` drives it from a
+  `DMIConfig`. A layer range authored in the UI is now applied by the runtime.
+
+  The signature takes the layer range rather than a `CompiledDMIConfig`, which
+  the original design assumed. Handing `attach_model` the spec list from
+  `compile_config` would have been wrong: `HookPoint.enabled` defaults to
+  `True`, and only `apply_hook_selection` walks the *unselected* specs to turn
+  them off, so a pre-filtered list leaves every deselected hook live.
+  `attach_model` therefore has to own selection. Keeping the parameter
+  primitive also preserves the layering -- `configuration` depends on the
+  runtime, not the reverse. See `tests/test_adapter_layer_selection.py`.
+
+* **Payload estimation.** Added as `dmi.configuration.estimate` and surfaced in
+  the UI, having been listed out of scope for the MVP. It reuses
+  `compute_hook_shape` and the same `align_up(_, 16)` rounding
+  `BackendAdapter.plan_step` uses to size a reservation, so the number the UI
+  shows and the number `prepare_step` enforces cannot drift.
+
+  Three things it deliberately does *not* do the naive way:
+
+  - Reports the **peak single step**, not just a rate. `prepare_step` compares
+    one step against `min(payload_cap, staging_cap)`; over that it returns
+    `STEP_OVERSIZED` and the adapter silently falls back to eager CPU-direct
+    dispatch. Prefill sets that peak.
+  - Reports the **worst rank**. `compute_hook_shape` divides TP-sharded hooks
+    by `tp_size` while `filter_by_tp_rank` keeps unsharded hooks on rank 0
+    only, so aggregate bytes are roughly TP-invariant but per-rank pressure is
+    not. `PP_FIRST`/`PP_LAST` skew the stages too.
+  - Carries its **assumptions and warnings** in the result. The workload is a
+    per-request input, not part of `DMIConfig`: it describes the serving the
+    capture rides along with. Nothing here predicts serving overhead, which
+    needs measurement.
+
 ### Still open
 
-* **Wiring into `attach_model`.** `compile_config` produces the filtered spec
-  list, but `BackendAdapter.attach_model(model, hook_selection: str)` has not
-  been given a way to accept a `CompiledDMIConfig`. Until it does, a layer range
-  authored in the UI is not applied by an integration that calls `attach_model`
-  directly. This is the one signature change the design calls for.
 * **Runtime policy (phase 8).** `policy.objective` round-trips and is shown in
   the UI behind an explicit notice that it does not yet change behaviour.
+
+  `docs/capture-policy-review.md` reviews a proposed design for this phase
+  against the runtime. Two findings bear directly on it: the transport already
+  provides lossless blocking backpressure through `prepare_step` and has no
+  drop path at all, so `block` is the status quo and `drop`/`fail` are the new
+  work; and `CaptureSchedule` is still not enforced by any shipped adapter,
+  which bounds what a policy can honestly claim to change.
 * **Architecture coverage.** Only `decoder_transformer` is supported.
   Encoder-decoder configs are detected and refused rather than mis-rendered;
   vision and encoder-decoder layouts are future node tables.

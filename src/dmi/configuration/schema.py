@@ -102,9 +102,30 @@ class ObservationConfig:
 
 @dataclass
 class ModelIdentity:
+    """Who the model is.
+
+    ``id`` is used as a filename stem -- the configurator writes
+    ``<id>.dmi.yaml`` beside the model. It must therefore be a single safe
+    path segment. Descriptors derived from a framework config always are
+    (``introspect._slug`` reduces ``Qwen/Qwen3-8B`` to ``qwen3-8b``), but a
+    hand-written descriptor is not checked by anything else, and a separator
+    there would move the write outside the directory the user named on the
+    command line -- the one guarantee ``dmi.ui.app`` makes about where it
+    writes.
+    """
+
     id: str
     name: str
     architecture: str
+
+    def __post_init__(self) -> None:
+        if not self.id or not self.id.strip():
+            raise ValueError("model id must not be empty.")
+        if self.id in (".", "..") or any(sep in self.id for sep in ("/", "\\")):
+            raise ValueError(
+                f"model id must be a single path segment, got {self.id!r}. "
+                f"It names the configuration file written beside the model."
+            )
 
 
 @dataclass

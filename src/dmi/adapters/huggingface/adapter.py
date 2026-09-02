@@ -9,12 +9,15 @@ import functools
 import os
 import time
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 
 from ..base import BackendAdapter
 from ..types import StepContext
+
+if TYPE_CHECKING:
+    from ...configuration.schema import LayerSelection
 from ...hooks.specs import (
     HookSpec,
     ModelShapeConfig,
@@ -231,6 +234,8 @@ class HuggingFaceAdapter(BackendAdapter):
         no_strip_left_pad: Optional[bool] = None,
         no_strip_right_pad: Optional[bool] = None,
         eos_token_id: Any = None,
+        *,
+        layers: Optional["LayerSelection"] = None,
     ) -> None:
         """Resolve shape, install ring hooks, and (optionally) wrap
         ``prepare_inputs_for_generation`` so each forward pass triggers
@@ -253,13 +258,16 @@ class HuggingFaceAdapter(BackendAdapter):
         set is empty and the post-EOS strip never latches.  Accepts
         ``int``, ``list[int]``, or ``torch.Tensor``; normalised to
         ``frozenset[int]``.
+
+        ``layers``: inclusive layer range restricting per-layer hooks, as in
+        :meth:`BackendAdapter.attach_model`.  ``None`` keeps every layer.
         """
         if no_strip_left_pad is not None:
             self._no_strip_left_pad = bool(no_strip_left_pad)
         if no_strip_right_pad is not None:
             self._no_strip_right_pad = bool(no_strip_right_pad)
         self._eos_token_ids = self._resolve_eos_token_ids(model, eos_token_id)
-        super().attach_model(model, hook_selection)
+        super().attach_model(model, hook_selection, layers=layers)
 
         # Startup validation: warn if pinned staging < GPU ring.
         try:

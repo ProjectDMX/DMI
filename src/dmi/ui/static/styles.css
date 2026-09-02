@@ -129,7 +129,8 @@ body {
   grid-template-columns: minmax(0, 1.35fr) minmax(300px, .95fr);
   grid-template-areas:
     "architecture detail"
-    "capture      output";
+    "capture      output"
+    "estimate     estimate";
   gap: 16px;
   padding: 16px 22px 32px;
   max-width: 1400px;
@@ -141,11 +142,12 @@ body {
 .detail { grid-area: detail; }
 .capture { grid-area: capture; }
 .output { grid-area: output; }
+.estimate { grid-area: estimate; }
 
 @media (max-width: 940px) {
   .layout {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: "architecture" "detail" "capture" "output";
+    grid-template-areas: "architecture" "detail" "capture" "estimate" "output";
   }
 }
 
@@ -411,4 +413,217 @@ input[type="number"] {
   font-size: 13px;
   box-shadow: var(--shadow-lift);
   z-index: 50;
+}
+
+/* ---------------------------------------------------------------------------
+   Estimated payload
+   --------------------------------------------------------------------------- */
+
+.workload { margin-bottom: 16px; }
+
+.workload .field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px 14px;
+}
+
+.workload select {
+  font: inherit;
+  color: var(--ink);
+  background: var(--surface-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+  min-width: 0;
+}
+
+.est-rank {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  letter-spacing: .04em;
+}
+
+.figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 10px;
+  margin: 0 0 18px;
+  padding: 0;
+}
+
+.figure {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  background: var(--surface-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  min-width: 0;
+}
+
+.figure dt {
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.figure dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.figure.is-peak {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.figure.is-peak dd { color: var(--accent-ink); }
+
+.figure-note {
+  font-size: 10.5px;
+  color: var(--ink-faint);
+}
+
+/* Ring occupancy */
+
+.ring { margin-bottom: 14px; }
+
+.ring-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin-bottom: 8px;
+}
+
+.ring-inputs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.meter {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.meter-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--ok);
+  transition: width .18s ease, background .18s ease;
+}
+
+.meter[data-tone="warning"] .meter-fill { background: var(--warn); }
+.meter[data-tone="over"] .meter-fill { background: var(--err); }
+
+.ring-detail {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-soft);
+}
+
+.ring-detail[data-tone="over"] { color: var(--err); }
+
+/* Per-rank table */
+
+.table-scroll { overflow-x: auto; }
+
+table.ranks {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 24rem;
+  font-size: 12px;
+}
+
+table.ranks th {
+  text-align: left;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+table.ranks td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);
+}
+
+table.ranks tr:last-child td { border-bottom: none; }
+table.ranks tr[data-worst="true"] td { color: var(--accent-ink); }
+
+/* Assumptions and warnings */
+
+.est-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.est-note {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-soft);
+}
+
+.est-note::before {
+  content: "";
+  flex: none;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--line);
+}
+
+.est-note[data-kind="warning"] { color: var(--ink); }
+.est-note[data-kind="warning"]::before { background: var(--warn); }
+
+/* ---------------------------------------------------------------------------
+   Focus and motion
+   --------------------------------------------------------------------------- */
+
+/* The architecture nodes carry tabindex, so they need a visible focus ring;
+   SVG does not inherit the document outline reliably, so style the box too. */
+:where(a, button, input, select, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.node:focus { outline: none; }
+
+.node:focus-visible .node-box {
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
 }

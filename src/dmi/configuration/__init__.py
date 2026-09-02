@@ -32,7 +32,21 @@ from .catalog_adapter import (
     per_layer_hook_ids,
 )
 from .compatibility import from_legacy_hook_selection, to_legacy_hook_selection
-from .compiler import CompiledDMIConfig, ModelContext, compile_config
+from .estimate import (
+    Estimate,
+    RankLoad,
+    RingFit,
+    Workload,
+    check_ring_fit,
+    estimate_config,
+    estimate_payload,
+)
+from .compiler import (
+    CompiledDMIConfig,
+    ModelContext,
+    attach_config,
+    compile_config,
+)
 from .introspect import (
     describe_model,
     descriptor_from_hf_config,
@@ -119,6 +133,15 @@ __all__ = [
     "ModelContext",
     "CompiledDMIConfig",
     "compile_config",
+    "attach_config",
+    # estimation
+    "Workload",
+    "RankLoad",
+    "Estimate",
+    "RingFit",
+    "estimate_config",
+    "check_ring_fit",
+    "estimate_payload",
     # compatibility
     "to_legacy_hook_selection",
     "from_legacy_hook_selection",

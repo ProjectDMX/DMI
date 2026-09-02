@@ -18,10 +18,14 @@ from ..configuration import (
     ConfigurationError,
     DMIConfig,
     ModelDescriptor,
+    Workload,
     catalog_payload,
+    check_ring_fit,
     resolve_descriptor,
     config_to_dict,
     dump_config,
+    estimate_config,
+    estimate_payload,
     load_config,
     parse_config,
     save_config,
@@ -74,12 +78,14 @@ def build_state(
     """
     descriptor = resolve_descriptor(source)
 
-    initial = None
+    # The save path doubles as the startup config: relaunching the
+    # configurator picks up the file the previous session saved, whether or
+    # not --config named it explicitly, so Save never silently clobbers an
+    # authored configuration with a blank default.
     save_path = default_save_path(source, descriptor)
     if config_path is not None:
         save_path = Path(config_path)
-        if save_path.exists():
-            initial = load_config(save_path)
+    initial = load_config(save_path) if save_path.exists() else None
 
     return UIState(
         descriptor=descriptor,
@@ -89,18 +95,42 @@ def build_state(
     )
 
 
-def create_app(source: str | Path, config_path: Optional[str | Path] = None):
-    """Build the FastAPI application."""
+# Host names a browser legitimately reaches a loopback bind under. Anything
+# else in the Host header means the request came through a name we never
+# served -- the DNS-rebinding pattern -- and is rejected before any endpoint
+# runs.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
+def create_app(
+    source: str | Path,
+    config_path: Optional[str | Path] = None,
+    bind_host: str = "127.0.0.1",
+):
+    """Build the FastAPI application.
+
+    ``bind_host`` is the address the server will listen on. For a loopback
+    bind (the default), requests whose ``Host`` header is not a loopback name
+    are rejected: a DNS-rebinding page resolves its own hostname to 127.0.0.1
+    and would otherwise be same-origin for the file-writing endpoints. A
+    non-loopback bind is an explicit choice to serve the network, where the
+    valid names cannot be enumerated, so no Host filter is applied.
+    """
     try:
         from fastapi import FastAPI, HTTPException
         from fastapi.responses import FileResponse
         from fastapi.staticfiles import StaticFiles
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
     except ImportError as exc:  # pragma: no cover - exercised by install state
         raise RuntimeError(_FASTAPI_MISSING) from exc
 
     state = build_state(source, config_path)
 
     app = FastAPI(title="DMI-configurator", docs_url=None, redoc_url=None)
+    if bind_host in _LOOPBACK_HOSTS:
+        app.add_middleware(
+            TrustedHostMiddleware, allowed_hosts=list(_LOOPBACK_HOSTS)
+        )
     app.state.ui = state
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -142,6 +172,60 @@ def create_app(source: str | Path, config_path: Optional[str | Path] = None):
             "valid": not any(issue.is_error for issue in issues),
             "issues": [issue.to_dict() for issue in issues],
         }
+
+    @app.post("/api/estimate")
+    def post_estimate(payload: dict):
+        """Byte estimates for a configuration under a stated workload.
+
+        The workload is supplied per request rather than held in server state:
+        it describes the traffic the capture rides along with, not the capture,
+        so the same configuration legitimately has several answers.
+        """
+        config = _parse(payload)
+        try:
+            workload = Workload(**(payload.get("workload") or {}))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"Invalid workload: {exc}") from exc
+
+        try:
+            estimate = estimate_config(config, state.descriptor, workload)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        body = estimate_payload(estimate)
+
+        # Type-check the raw value: `or {}` alone would let a truthy
+        # non-mapping such as a list or string through to `.get`, which raises
+        # AttributeError and surfaces as a 500 instead of a 400.
+        ring_raw = payload.get("ring")
+        if ring_raw is not None and not isinstance(ring_raw, dict):
+            raise HTTPException(
+                400,
+                f"'ring' must be a mapping, got {type(ring_raw).__name__}.",
+            )
+        ring = ring_raw or {}
+        # `is not None`, not truthiness: payload_bytes=0 is a client error that
+        # check_ring_fit rejects with a clear message, and treating it as
+        # "absent" would silently drop the ring-fit result the caller asked
+        # for.
+        payload_bytes = ring.get("payload_bytes")
+        if payload_bytes is not None:
+            try:
+                fit = check_ring_fit(
+                    estimate,
+                    int(payload_bytes),
+                    int(ring.get("pinned_bytes") or 0),
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, f"Invalid ring sizes: {exc}") from exc
+            body["ring_fit"] = {
+                "effective_bytes": fit.effective_bytes,
+                "peak_step_bytes": fit.peak_step_bytes,
+                "fits": fit.fits,
+                "occupancy_percent": fit.occupancy_percent,
+                "detail": fit.detail,
+            }
+        return body
 
     @app.post("/api/config/serialize")
     def post_serialize(payload: dict):
