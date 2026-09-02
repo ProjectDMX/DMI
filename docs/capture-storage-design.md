@@ -628,12 +628,10 @@ can convert them to `Replicated` afterwards, and a warning nobody reads is not
 enforcement. Setting it is unconditional and costs nothing on a non-replicated
 table, where the server accepts and ignores it.
 
-The write-side half is **not** set and is not claimed. ClickHouse pairs
-`select_sequential_consistency` with `insert_quorum` on the writes, and a
-replicated deployment also has to make the descriptor inserts quorum-durable
-before their watermark row, or a failover can leave a published version whose
-rows are on a replica that is gone. Both are latency decisions about a
-deployment, not something this module can pick.
+The write-side half is opt-in through `ClickHouseCatalogConfig.insert_quorum`.
+When configured, descriptor inserts and protocol writes are quorum-durable;
+pack inventory stays asynchronous because a stale replay check causes redundant
+work rather than a skipped capture.
 
 ### Retention
 
@@ -679,15 +677,14 @@ page wait for the replica. `ClickHouseReaderConfig.consistent_snapshot_reads`
 turns it off for an operator who would rather have the latency and accept the
 gap.
 
-The WRITE half is now available and still off by default:
+The WRITE half is available and still off by default:
 `ClickHouseCatalogConfig.insert_quorum` sets `insert_quorum` (and clears
 `insert_quorum_parallel`, which `select_sequential_consistency` does not work
-with) on the writes the protocols decide on -- version claims, lease claims,
-membership and the watermark. Without it the sole-claimant protocols are sound
-on a single node and on a quorum-writing cluster, and not in between. It is
-deliberately not applied to the descriptor and inventory bulk writes: those
-decide nothing, and quorum latency per batch is the cost that makes operators
-turn the whole thing off.
+with) on version claims, lease claims and releases, membership, the watermark,
+and descriptor inserts. Without it the sole-claimant protocols and consistent
+descriptor reads are sound on a single node and on a quorum-writing cluster,
+and not in between. Pack inventory remains asynchronous: it is only the replay
+guard, so lag there causes redundant indexing rather than an incomplete page.
 
 **It is a for-the-life-of-the-catalog setting, not a toggle.** Measured on
 25.12 against two replicas of each protocol table: once a replicated table has

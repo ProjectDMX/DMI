@@ -498,9 +498,9 @@ It looks like a live lease until it expires, so the next publisher waits out one
 not pay that; a crash does.
 
 **Replication.** All of this rests on a later write observing an earlier one.
-The read-backs carry `select_sequential_consistency`, which is the read half. The
-write half -- `insert_quorum`, and quorum-durable descriptor inserts before their
-watermark row -- is a deployment decision and is deliberately not claimed here.
+The read-backs carry `select_sequential_consistency`, which is the read half.
+`ClickHouseCatalogConfig.insert_quorum` supplies the opt-in write half for lease
+and descriptor rows, including the fenced release tombstone.
 
 Two consequences to carry forward:
 

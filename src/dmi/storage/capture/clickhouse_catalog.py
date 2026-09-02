@@ -91,13 +91,11 @@ class ClickHouseCatalogConfig:
     # each read themselves alone -- the sole-claimant protocols are sound on a
     # single node and on a quorum-writing cluster, and not in between.
     #
-    # Set to the quorum size (2 or more) on a replicated deployment. Every
-    # write the protocols DECIDE on -- version claims, lease claims, membership
-    # and the watermark -- then waits for that many replicas, and the reads
-    # above are answered against something durable. It is deliberately not
-    # applied to the descriptor and inventory bulk writes: those decide
-    # nothing, and paying quorum latency per batch is the cost that makes
-    # operators turn the whole thing off.
+    # Set to the quorum size (2 or more) on a replicated deployment. Version
+    # claims, leases, snapshot publication, and descriptors then wait for that
+    # many replicas. Descriptor reads use sequential consistency and therefore
+    # need the same write quorum. The replay-only pack inventory remains a cheap
+    # bulk write because a stale read there causes redundant work, not data loss.
     #
     # **Set it once, for the life of the catalog.** Measured on 25.12 against
     # two replicas: once a replicated table has taken a quorum insert, a later
@@ -226,6 +224,7 @@ class ClickHouseCatalogWriter:
             f"INSERT INTO {self._qualified(self._capture_raw)} "
             f"({', '.join(_CAPTURE_COLUMNS)}) VALUES",
             rows,
+            settings=self._quorum_write() or None,
         )
 
     def publish_snapshot(

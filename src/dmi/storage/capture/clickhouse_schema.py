@@ -159,6 +159,9 @@ class ClickHouseCatalogSchema:
         watermark = self.qualified(self.watermark)
         manifest = self.qualified(self.manifest)
         self._client.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
+        self._require_catalog_visibility()
+        if fresh:
+            self._verify_compatibility()
         self._client.execute(
             f"""CREATE TABLE IF NOT EXISTS {self.qualified(self.schema_table)} (
 version UInt32, applied_at_ns UInt64
@@ -232,6 +235,7 @@ pack_id UUID
             f"CREATE VIEW IF NOT EXISTS {pack_view} AS "
             f"SELECT {', '.join(PACK_COLUMNS[:-1])} FROM {pack_raw} FINAL"
         )
+        self._confirm_catalog_is_complete()
         self._client.execute(
             f"INSERT INTO {self.qualified(self.schema_table)} "
             "(version, applied_at_ns) "
@@ -240,36 +244,38 @@ pack_id UUID
             f"{self.qualified(self.schema_table)}) = 0",
             {"version": SCHEMA_VERSION, "applied_at_ns": time_ns()},
         )
-        if fresh:
-            self._confirm_the_catalog_became_visible()
+    def _require_catalog_visibility(self) -> None:
+        for _, name in self.objects + self.legacy_objects:
+            rows = self._client.execute(
+                f"CHECK GRANT SHOW TABLES ON {self.qualified(name)}"
+            )
+            if rows and rows[0] and rows[0][0]:
+                continue
+            raise CatalogSchemaVersionError(
+                f"catalog `{self.database}`.`{self.prefix}_*` cannot be checked "
+                f"safely because this role lacks SHOW TABLES on "
+                f"{self.qualified(name)}. Grant catalog visibility and run "
+                "ensure_schema() again."
+            )
 
-    def _confirm_the_catalog_became_visible(self) -> None:
-        """A catalog that reads as EMPTY has to stop reading that way.
-
-        "Nothing of ours is in ``system.tables``" is the one verdict that
-        waives every other check and runs the DDL outright, and it is reached
-        by a read that can answer empty for a reason other than emptiness: a
-        role without the grant to see these tables gets no rows and no error.
-        Under that role the DDL is all ``CREATE ... IF NOT EXISTS``, so it
-        no-ops over a catalog of some other version and stamps this one's
-        version beside it -- the in-place upgrade this design never performs.
-
-        Confirming afterwards costs one read on the fresh path only, and it
-        cannot be confused by lag: these objects were created by the statements
-        immediately above.
-        """
+    def _confirm_catalog_is_complete(self) -> None:
         found = self._catalog_state()
-        if found:
-            return
-        raise CatalogSchemaVersionError(
-            f"catalog `{self.database}`.`{self.prefix}_*` was created but is "
-            "still not visible in `system.tables`, so the emptiness this "
-            "install was based on was never evidence of an empty catalog -- "
-            "most likely this role cannot see these tables. Every check that "
-            "protects an existing catalog reads the same view, so none of them "
-            "can be trusted under this grant. Grant the writer visibility of "
-            "its own tables and run again."
-        )
+        expected = {name for _, name in self.objects}
+        missing = sorted(expected - found.keys())
+        legacy = sorted(name for _, name in self.legacy_objects if name in found)
+        if missing or legacy:
+            details = []
+            if missing:
+                details.append(
+                    "not visible: " + ", ".join(f"`{x}`" for x in missing)
+                )
+            if legacy:
+                details.append("superseded: " + ", ".join(f"`{x}`" for x in legacy))
+            raise CatalogSchemaVersionError(
+                f"catalog `{self.database}`.`{self.prefix}_*` is incomplete after "
+                "schema creation (" + "; ".join(details) + "). It was not stamped."
+            )
+        self._reject_wrong_kinds(found)
 
     def _verify_compatibility(self) -> bool:
         """Returns True when this is a fresh install, i.e. nothing is there."""

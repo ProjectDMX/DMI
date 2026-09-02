@@ -138,6 +138,8 @@ class _Client:
                 for name in params["tables"]
                 if name in self.publish_id_tables
             ]
+        if query.startswith("CHECK GRANT SHOW TABLES"):
+            return [(1,)]
         if query.startswith(("CREATE TABLE", "CREATE VIEW", "CREATE OR REPLACE VIEW")):
             # Modelled, because ensure_schema now re-reads `system.tables`
             # after a fresh install to prove the objects it created are
@@ -653,6 +655,48 @@ def test_the_fenced_release_resolves_the_head_with_sequential_consistency():
     assert release[2].get("settings") == _DECIDING_READ
 
 
+def test_descriptor_writes_use_the_configured_quorum():
+    _, descriptor = _descriptor()
+    client = _Client()
+    writer = ClickHouseCatalogWriter(
+        client, ClickHouseCatalogConfig(insert_quorum=2)
+    )
+
+    writer.write_descriptors([descriptor], index_version=42)
+
+    quorum = {
+        "insert_quorum": 2,
+        "insert_quorum_parallel": 0,
+        "insert_quorum_timeout": 5000,
+    }
+    descriptor_insert = next(
+        call for call in client.calls
+        if call[0].startswith("INSERT") and "dmi_capture_raw" in call[0]
+    )
+    assert descriptor_insert[2].get("settings") == quorum
+
+
+def test_fenced_release_uses_the_configured_quorum():
+    client = _Client()
+    writer = ClickHouseCatalogWriter(
+        client, ClickHouseCatalogConfig(insert_quorum=2)
+    )
+    writer.acquire_publisher_lease("indexer-a")
+
+    writer.release_publisher_lease()
+
+    release = next(
+        call for call in client.calls
+        if call[0].startswith("INSERT") and "SELECT term + 1" in call[0]
+    )
+    assert release[2].get("settings") == {
+        "select_sequential_consistency": 1,
+        "insert_quorum": 2,
+        "insert_quorum_parallel": 0,
+        "insert_quorum_timeout": 5000,
+    }
+
+
 def test_commit_packs_writes_only_the_replay_inventory():
     ref, _ = _descriptor()
     client = _Client()
@@ -773,6 +817,67 @@ def test_compatibility_is_checked_before_any_ddl_is_issued():
     }
 
 
+def test_a_fresh_install_refuses_without_complete_catalog_visibility():
+    class _NoCatalogVisibility(_Client):
+        def execute(self, query, params=None, **kwargs):
+            if query.startswith("CHECK GRANT SHOW TABLES"):
+                self.calls.append((query, params, kwargs))
+                return [(0,)]
+            return super().execute(query, params, **kwargs)
+
+    client = _NoCatalogVisibility()
+
+    with pytest.raises(CatalogSchemaVersionError, match="SHOW TABLES"):
+        _writer(client).ensure_schema()
+
+    assert not any(
+        call[0].startswith(("CREATE TABLE", "CREATE VIEW", "ALTER", "INSERT"))
+        for call in client.calls
+    )
+
+
+def test_catalog_visibility_needs_no_database_wide_grant():
+    class _ObjectOnlyVisibility(_Client):
+        def execute(self, query, params=None, **kwargs):
+            if query.startswith("CHECK GRANT SHOW TABLES") and query.endswith(".*"):
+                self.calls.append((query, params, kwargs))
+                return [(0,)]
+            return super().execute(query, params, **kwargs)
+
+    _writer(_ObjectOnlyVisibility()).ensure_schema()
+
+
+def test_a_fresh_install_requires_every_created_object_to_be_visible():
+    class _PartialCatalogVisibility(_Client):
+        def execute(self, query, params=None, **kwargs):
+            rows = super().execute(query, params, **kwargs)
+            if "system.tables" in query:
+                return [row for row in rows if row[0] == "dmi_schema_version"]
+            return rows
+
+    client = _PartialCatalogVisibility()
+
+    with pytest.raises(CatalogSchemaVersionError, match="not visible"):
+        _writer(client).ensure_schema()
+
+    assert not any(
+        call[0].startswith("INSERT") and "dmi_schema_version" in call[0]
+        for call in client.calls
+    ), "an incomplete catalog must not be stamped"
+
+
+def test_an_existing_catalog_runs_the_inventory_check_once():
+    client = _Client(tables=_CURRENT_OBJECTS, schema_version=_SCHEMA_VERSION)
+
+    _writer(client).ensure_schema()
+
+    checks = [
+        call for call in client.calls
+        if "dmi_pack_inventory_raw` FINAL" in call[0] and "NOT IN" in call[0]
+    ]
+    assert len(checks) == 1
+
+
 def test_a_fresh_install_stamps_the_schema_version_last():
     """The stamp means "every object exists", so it cannot be written earlier.
 
@@ -789,10 +894,8 @@ def test_a_fresh_install_stamps_the_schema_version_last():
         for index, item in enumerate(statements)
         if item.startswith("INSERT") and "dmi_schema_version" in item
     )
-    # The last statement that WRITES anything. A fresh install now ends with a
-    # read -- confirming the objects it created are visible in `system.tables`,
-    # since the emptiness it acted on came from that same view -- and a read
-    # cannot leave a catalog claiming to be complete before it is.
+    # The last statement that writes anything. The complete object set is
+    # validated immediately before this stamp.
     assert not any(
         item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
         for item in statements[stamp + 1 :]
@@ -806,10 +909,14 @@ def test_a_fresh_install_stamps_the_schema_version_last():
     # And the table itself is created first, so an install interrupted below
     # leaves a catalog that reads as "this build, unfinished" rather than one
     # indistinguishable from version 1 and refused forever.
-    assert statements[2] == (
+    schema_create = (
         "CREATE TABLE IF NOT EXISTS `default`.`dmi_schema_version` (\n"
         "version UInt32, applied_at_ns UInt64\n"
         ") ENGINE = MergeTree ORDER BY version"
+    )
+    assert statements.index(schema_create) == next(
+        index for index, item in enumerate(statements)
+        if item.startswith("CREATE TABLE")
     )
     assert statements[1].startswith("CREATE DATABASE")
 

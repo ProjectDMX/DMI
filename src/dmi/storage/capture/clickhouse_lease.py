@@ -18,6 +18,7 @@ class LeaseConfig(Protocol):
     table_prefix: str
     lease_ttl_ns: int
     publish_timeout_ns: int
+    insert_quorum: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +83,7 @@ class ClickHouseLeaseCoordinator:
         self._client.execute(
             self.release_statement(),
             {"lease_id": lease.lease_id, "holder": lease.holder},
-            settings=DECIDING_READ,
+            settings={**DECIDING_READ, **self._quorum_write()},
         )
         self._lease = None
 
@@ -233,7 +234,7 @@ class ClickHouseLeaseCoordinator:
         )
 
     def _quorum_write(self) -> dict[str, object]:
-        quorum = getattr(self._config, "insert_quorum", None)
+        quorum = self._config.insert_quorum
         if quorum is None:
             return {}
         # insert_quorum_parallel is cleared alongside: ClickHouse's
