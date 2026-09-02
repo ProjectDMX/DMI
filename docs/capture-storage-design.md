@@ -96,6 +96,7 @@ exclusive per record runtime:
 | ClickHouse role | the store itself | a rebuildable index over the packs |
 | ClickHouse footprint | one configured table (`offload` by default) | `{prefix}_*` (`dmi_*` by default) |
 | Selected by | `create_record_runtime(fmt)` with no `record_sink`, plus a `host_engine`/`db_config` on the engine | `create_record_runtime(fmt, record_sink=reference.native_sink)` |
+| Declared by | `MonitoringConfig(storage_backend="native")` | `MonitoringConfig(storage_backend="capture")` |
 | Status | production | explicitly reference-only; production sinks remain native-only |
 
 Both are `ring::RecordSink` implementations and the record engine takes exactly
@@ -106,6 +107,32 @@ validated nor used, which
 `test_explicit_record_sink_lease_is_owned_by_native_ring` asserts by failing if
 the host is touched at all; `test_create_record_runtime_is_additive_and_uses_active_transport` pins
 the other direction.
+
+`MonitoringConfig.storage_backend` declares which of the two an engine is for,
+and the engine holds the runtime to it. The choice is otherwise made in two
+different places -- a host engine at construction, a `record_sink` at
+`create_record_runtime` -- with nothing but the caller's memory connecting
+them, so a mismatch was a silent outcome rather than an error: passing a
+`record_sink` while a host engine is configured writes packs and leaves a
+ClickHouse insert pipeline started, connected and never fed.
+
+```python
+engine = MonitoringEngine(
+    config=MonitoringConfig(storage_backend="capture"),
+    model_id="...",
+    ring_config=ring_config,
+)                                    # a host_engine here is now refused
+runtime = engine.create_record_runtime(
+    reference.record_format,
+    record_sink=reference.native_sink,  # omitting it is now refused
+)
+```
+
+`"native"` is the mirror image: it requires a host engine and refuses an
+explicit sink. `"none"` is capture and transport with no persistence at all.
+The default is `"auto"`, which infers the backend from what was passed -- what
+every caller did before the field existed, so nothing that predates it
+changes.
 
 Their ClickHouse footprints are disjoint, so the two can share one server: the
 catalog's schema guard only ever names `{prefix}_*` objects, and `drop_schema`

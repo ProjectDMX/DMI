@@ -1,9 +1,16 @@
-"""Configuration helpers for DMI capture scheduling."""
+"""Configuration helpers for DMI capture scheduling and storage."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Literal
+
+
+StorageBackend = Literal["auto", "native", "capture", "none"]
+
+# The runtime copy of the annotation above: a Literal is not introspectable at
+# runtime without typing.get_args, and this is checked on every construction.
+_STORAGE_BACKENDS = ("auto", "native", "capture", "none")
 
 
 @dataclass
@@ -67,3 +74,33 @@ class MonitoringConfig:
     """
 
     schedule: CaptureSchedule = field(default_factory=CaptureSchedule)
+
+    # Which of the two storage paths this engine is for. They are mutually
+    # exclusive per record runtime and share nothing but the record envelope:
+    #
+    #   "native"  -- the C++ ``ClickHouseRecordSink``: one ClickHouse row per
+    #                record with the tensor bytes inline, into its own table.
+    #                Requires ``host_engine`` or ``db_config`` on the engine,
+    #                and refuses an explicit ``record_sink``.
+    #   "capture" -- the Python capture path: immutable packs in object
+    #                storage with the ClickHouse catalog as an index over
+    #                them. Requires an explicit ``record_sink``, and refuses a
+    #                host engine, which would otherwise sit started, connected
+    #                and unused.
+    #   "none"    -- capture and transport with no persistence at all.
+    #   "auto"    -- infer from what was passed, which is what every caller
+    #                did before this field existed and remains the default.
+    #
+    # The point of declaring it is that a mismatch becomes an error instead of
+    # a silent choice: passing a ``record_sink`` while a host engine is
+    # configured writes packs and leaves a ClickHouse insert pipeline running
+    # that nothing feeds, and "auto" cannot tell that apart from intent.
+    storage_backend: StorageBackend = "auto"
+
+    def __post_init__(self) -> None:
+        if self.storage_backend not in _STORAGE_BACKENDS:
+            raise ValueError(
+                "storage_backend must be one of "
+                + ", ".join(repr(name) for name in _STORAGE_BACKENDS)
+                + f"; got {self.storage_backend!r}"
+            )

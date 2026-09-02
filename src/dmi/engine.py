@@ -105,6 +105,23 @@ class MonitoringEngine:
         if host_engine is not None and db_config is not None:
             raise ValueError("Provide either host_engine or db_config, not both")
 
+        self._storage_backend = getattr(config, "storage_backend", "auto")
+        host_configured = host_engine is not None or db_config is not None
+        if self._storage_backend == "native" and not host_configured:
+            raise ValueError(
+                "config.storage_backend='native' selects the C++ "
+                "ClickHouseRecordSink, which needs a host engine: pass "
+                "host_engine= or db_config="
+            )
+        if self._storage_backend in ("capture", "none") and host_configured:
+            raise ValueError(
+                f"config.storage_backend={self._storage_backend!r} does not "
+                "use the C++ ClickHouse host, but host_engine/db_config was "
+                "given. Configured together, the host engine starts, connects "
+                "and is then never fed, because a record runtime is handed "
+                "either the host or an explicit record_sink and never both"
+            )
+
         if host_engine is not None or db_config is not None:
             if self._model_id is None:
                 raise ValueError("model_id is required when host_engine integration is enabled")
@@ -191,6 +208,37 @@ class MonitoringEngine:
         # lifecycle toggle; the next committed step recomputes it.
         transport.force_eager = False
 
+    def _reject_a_sink_the_config_did_not_ask_for(
+        self, record_sink: Optional[Any]
+    ) -> None:
+        """Hold the runtime to the storage path the config declared.
+
+        The two paths are chosen in two different places -- a host engine at
+        construction, a ``record_sink`` here -- so nothing but the caller's
+        memory connected them. Declaring the backend is what lets a mismatch
+        be an error: "I configured the object-store path and got ClickHouse
+        rows" is otherwise a silent outcome, and the engine is the only place
+        that can see both halves.
+
+        ``"auto"`` keeps the original inference, so every caller written
+        before the field existed is unaffected.
+        """
+        backend = getattr(self, "_storage_backend", "auto")
+        if backend == "auto":
+            return
+        if backend == "capture" and record_sink is None:
+            raise ValueError(
+                "config.storage_backend='capture' selects the object-store "
+                "path, which is reached by passing its sink: "
+                "create_record_runtime(fmt, record_sink=reference.native_sink)"
+            )
+        if backend in ("native", "none") and record_sink is not None:
+            raise ValueError(
+                f"config.storage_backend={backend!r} does not use an explicit "
+                "record_sink; passing one would send records to a backend the "
+                "configuration did not select"
+            )
+
     def create_record_runtime(
         self,
         record_format: "RecordFormat[MetadataT]",
@@ -224,6 +272,7 @@ class MonitoringEngine:
             record_sink, _native_engine.RecordSink
         ):
             raise TypeError("record_sink must be a native RecordSink")
+        self._reject_a_sink_the_config_did_not_ask_for(record_sink)
         if record_sink is None and self._host_engine is not None:
             _native_engine._load_extension()._validate_record_host_schema(
                 self._host_engine,
