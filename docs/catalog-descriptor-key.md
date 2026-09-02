@@ -304,7 +304,7 @@ resolves ONE row with `ORDER BY term DESC, lease_id DESC`, so the
 higher-ordering of two claimants at the top term satisfies it exactly as a real
 holder would. Verified on 25.12, and note that the ordering is ClickHouse's UUID
 collation -- the low 64 bits first -- so it is not the text order either. What
-makes the term safe is `_claim_lease`: a claimant that sees two rows is not
+makes the term safe is `ClickHouseLeaseCoordinator.claim`: a claimant that sees two rows is not
 returned a `PublisherLease`, and nobody may advance past that term while a
 claim at it remains live. This also protects a claimant that completed
 read-back before the competing row arrived.

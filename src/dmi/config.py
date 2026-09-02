@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, get_args
 
 
 StorageBackend = Literal["auto", "native", "capture", "none"]
-
-# The runtime copy of the annotation above: a Literal is not introspectable at
-# runtime without typing.get_args, and this is checked on every construction.
-_STORAGE_BACKENDS = ("auto", "native", "capture", "none")
 
 
 @dataclass
@@ -98,9 +94,10 @@ class MonitoringConfig:
     storage_backend: StorageBackend = "auto"
 
     def __post_init__(self) -> None:
-        if self.storage_backend not in _STORAGE_BACKENDS:
+        backends = get_args(StorageBackend)
+        if self.storage_backend not in backends:
             raise ValueError(
                 "storage_backend must be one of "
-                + ", ".join(repr(name) for name in _STORAGE_BACKENDS)
+                + ", ".join(repr(name) for name in backends)
                 + f"; got {self.storage_backend!r}"
             )

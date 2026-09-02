@@ -87,16 +87,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
-from .clickhouse_catalog import (
-    _CAPTURE_COLUMNS,
-    _DECIDING_READ,
-    ClickHouseCatalogConfig,
+from .clickhouse_catalog import ClickHouseCatalogConfig
+from .clickhouse_schema import CAPTURE_COLUMNS
+from .clickhouse_sql import (
+    DECIDING_READ,
     ClickHouseClient,
-    _identifier,
-    _membership_predicate,
-    _quoted,
+    identifier,
+    inline_chunks,
+    inline_text_bytes,
+    membership_predicate,
+    quoted,
 )
-from .clickhouse_sql import inline_chunks, inline_text_bytes
 from .cursor import CursorKey, decode_cursor, encode_cursor
 from .model import (
     CaptureDescriptor,
@@ -126,7 +127,7 @@ _SORT_KEY_SET = frozenset(_SORT_KEY)
 
 # Every column the reader reads: the writer's column order minus
 # ``index_version``, which orders the rows rather than describing a capture.
-_PROJECTION = _CAPTURE_COLUMNS[:-1]
+_PROJECTION = CAPTURE_COLUMNS[:-1]
 
 # The columns that are not grouped on, and so have to be resolved out of a
 # capture's rows. They travel as ONE tuple; see ``_projection``.
@@ -178,8 +179,8 @@ class ClickHouseReaderConfig:
     consistent_snapshot_reads: bool = True
 
     def __post_init__(self) -> None:
-        _identifier(self.database)
-        _identifier(self.table_prefix)
+        identifier(self.database)
+        identifier(self.table_prefix)
         for name in (
             "max_capture_ids",
             "max_rows_to_read",
@@ -210,7 +211,7 @@ class ClickHouseReaderConfig:
         """Settings for a statement that resolves against a pinned watermark."""
         if not self.consistent_snapshot_reads:
             return self.settings
-        return {**self.settings, **_DECIDING_READ}
+        return {**self.settings, **DECIDING_READ}
 
 
 def _text(value: object, name: str) -> str:
@@ -270,7 +271,7 @@ class ClickHouseCaptureCatalog:
         """
         settings = dict(self._config.settings)
         if deciding:
-            settings.update(_DECIDING_READ)
+            settings.update(DECIDING_READ)
         rows = self._client.execute(
             f"SELECT max(index_version) FROM {self._qualified(self._watermark_table)}",
             settings=settings,
@@ -310,8 +311,8 @@ class ClickHouseCaptureCatalog:
         sql = (
             f"SELECT {self._projection()} FROM {self._qualified()} "
             f"WHERE {' AND '.join(clauses)} "
-            f"GROUP BY {', '.join(_quoted(name) for name in _SORT_KEY)} "
-            f"ORDER BY {', '.join(_quoted(name) for name in _SORT_KEY)} "
+            f"GROUP BY {', '.join(quoted(name) for name in _SORT_KEY)} "
+            f"ORDER BY {', '.join(quoted(name) for name in _SORT_KEY)} "
             "LIMIT %(row_limit)s"
         )
         rows = self._client.execute(
@@ -371,7 +372,7 @@ class ClickHouseCaptureCatalog:
             f"SELECT {self._projection()} FROM {self._qualified()} "
             "WHERE tenant_id = %(tenant_id)s AND "
             f"capture_id IN %(capture_ids)s AND {self._membership()} "
-            f"GROUP BY {', '.join(_quoted(name) for name in _SORT_KEY)}"
+            f"GROUP BY {', '.join(quoted(name) for name in _SORT_KEY)}"
         )
         # Chunked by rendered bytes, because the ids land in the statement TEXT
         # and a full-size lookup can breach the server's max_query_size.
@@ -398,8 +399,8 @@ class ClickHouseCaptureCatalog:
 
     def _qualified(self, table: str | None = None) -> str:
         return (
-            f"{_quoted(self._config.database)}."
-            f"{_quoted(table or self._capture_raw)}"
+            f"{quoted(self._config.database)}."
+            f"{quoted(table or self._capture_raw)}"
         )
 
     def _membership(self) -> str:
@@ -424,11 +425,11 @@ class ClickHouseCaptureCatalog:
         pinned snapshot.
 
         The predicate itself has ONE definition,
-        ``clickhouse_catalog._membership_predicate``, shared with the public
+        ``clickhouse_catalog.membership_predicate``, shared with the public
         view's DDL so the two cannot drift apart about what exists; this
         method only supplies the reader's snapshot bound.
         """
-        return _membership_predicate(
+        return membership_predicate(
             self._qualified(self._manifest),
             self._qualified(self._watermark_table),
             bounded=True,
@@ -503,9 +504,9 @@ class ClickHouseCaptureCatalog:
         # then rejects a filter on it with "Aggregate function ... is found in
         # WHERE in query". _descriptor maps the row positionally, so the
         # server-side column names are never read.
-        resolved = ", ".join(_quoted(name) for name in _RESOLVED)
+        resolved = ", ".join(quoted(name) for name in _RESOLVED)
         return ", ".join(
-            [_quoted(name) for name in _SORT_KEY]
+            [quoted(name) for name in _SORT_KEY]
             + [f"argMax(tuple({resolved}), {_RESOLUTION_ORDER})"]
         )
 
@@ -528,7 +529,7 @@ class ClickHouseCaptureCatalog:
         for name in _EQUALITY_FILTERS:
             value = getattr(query, name)
             if value is not None:
-                clauses.append(f"{_quoted(name)} = %({name})s")
+                clauses.append(f"{quoted(name)} = %({name})s")
                 params[name] = value
         if query.hook_names:
             clauses.append("hook_name IN %(hook_names)s")
@@ -544,7 +545,7 @@ class ClickHouseCaptureCatalog:
             params["captured_before_ns"] = query.captured_before_ns
 
         if after is not None:
-            columns = ", ".join(_quoted(name) for name in _SORT_KEY)
+            columns = ", ".join(quoted(name) for name in _SORT_KEY)
             placeholders = ", ".join(f"%(after_{name})s" for name in _SORT_KEY)
             clauses.append(f"({columns}) > ({placeholders})")
             params.update(

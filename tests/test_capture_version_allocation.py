@@ -192,7 +192,7 @@ def test_an_expired_lease_is_taken_over_and_the_old_holder_never_reaches_a_write
     happens at the RENEWAL, client-side: `publish_snapshot` renews first, the
     renewal reads a head that is a live lease belonging to somebody else, and
     it refuses before any statement is issued. This test therefore says nothing
-    about the fence -- it passed unchanged with `_lease_fence()` replaced by
+    about the fence -- it passed unchanged with the fence replaced by
     `1 = 1`, and its docstring used to claim the fence was what made "writes
     nothing" literal. The fence is exercised by
     `test_a_takeover_after_the_renewal_is_reported_as_a_lost_lease` below, and
@@ -366,7 +366,7 @@ def test_a_late_same_term_claim_cannot_supersede_a_live_returned_lease():
     contender = _writer(server)
 
     with pytest.raises(PublisherLeaseHeldError, match="contested"):
-        contender._claim_lease("indexer-b", lease_id=delayed)
+        contender._leases.claim("indexer-b", lease_id=delayed)
 
     assert server.lease.now_ns < held.expires_at_ns
     assert contender.publisher_lease is None
@@ -498,7 +498,6 @@ def test_a_renewal_keeps_the_fencing_identity_and_extends_the_term():
     [
         ({"lease_ttl_ns": 0}, "lease_ttl_ns"),
         ({"publish_timeout_ns": -1}, "publish_timeout_ns"),
-        ({"lease_attempts": 1.5}, "lease_attempts"),
         ({"publish_timeout_ns": 30_000_000_000}, "must be below lease_ttl_ns"),
     ],
 )
@@ -512,25 +511,25 @@ def test_the_fake_matches_the_fence_the_writer_actually_emits():
 
     `FakeLeaseTable.fence_admits` matches the fence in the statement rather
     than trusting the `lease_id` parameter, which `publish_snapshot` passes
-    unconditionally. That only works while the pattern and `_lease_fence()`
+    unconditionally. That only works while the pattern and the emitted fence
     agree, so the agreement is asserted here: a rewrite of the fence fails as
     one clear test instead of turning four suites vacuous.
     """
     from tests._catalog_fakes import _FENCE, MissingLeaseFence
 
     writer = _writer(_CatalogServer())
-    assert _FENCE.fullmatch(writer._lease_fence()) is not None, (
+    assert _FENCE.fullmatch(writer._leases.fence()) is not None, (
         "tests/_catalog_fakes._FENCE no longer matches "
-        "ClickHouseCatalogWriter._lease_fence(); update it deliberately"
+        "the fence the writer emits; update it deliberately"
     )
     # The fenced release is pinned the same way, for the same reason: the fake
     # models the head-resolve-and-write as one atomic statement, which is only
     # honest while the writer actually emits that statement.
     from tests._catalog_fakes import _RELEASE
 
-    assert _RELEASE.fullmatch(writer._release_statement()) is not None, (
+    assert _RELEASE.fullmatch(writer._leases.release_statement()) is not None, (
         "tests/_catalog_fakes._RELEASE no longer matches "
-        "ClickHouseCatalogWriter._release_statement(); update it deliberately"
+        "the release statement the writer emits; update it deliberately"
     )
     # And a statement without it is refused rather than quietly admitted.
     with pytest.raises(MissingLeaseFence, match="must be fenced"):
@@ -544,7 +543,7 @@ def test_the_fake_matches_the_fence_the_writer_actually_emits():
     with pytest.raises(MissingLeaseFence, match="top-level AND conjunct"):
         FakeLeaseTable().fence_admits(
             "INSERT INTO `default`.`dmi_index_watermark` SELECT 1 FROM "
-            "system.one WHERE " + writer._lease_fence() + " OR 1 = 1",
+            "system.one WHERE " + writer._leases.fence() + " OR 1 = 1",
             {"lease_id": "irrelevant"},
         )
 
@@ -848,6 +847,8 @@ def test_clock_rollback_across_indexers_cannot_reorder_publications(tmp_path: Pa
 
 class _HostileWriter:
     """A CatalogWriter whose allocator misbehaves in a scripted way."""
+
+    publisher_lease = "held"
 
     def __init__(self, allocate, *, last_published: int = 0):
         self._allocate = allocate

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Iterator
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 MAX_INLINE_PARAMETER_BYTES = 192 * 1024
+
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 # Settings for the statements whose answers DECIDE something: which claimant
 # owns a version, whether a publish landed, what the published head is, whether
@@ -19,6 +22,28 @@ MAX_INLINE_PARAMETER_BYTES = 192 * 1024
 DECIDING_READ = {"select_sequential_consistency": 1}
 
 T = TypeVar("T")
+
+
+class ClickHouseClient(Protocol):
+    def execute(self, query: str, params=None, **kwargs): ...
+
+
+def identifier(value: str) -> str:
+    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
+        raise ValueError(f"invalid ClickHouse identifier: {value!r}")
+    return value
+
+
+def quoted(value: str) -> str:
+    return f"`{value}`"
+
+
+def text(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if not isinstance(value, str):
+        raise ValueError("ClickHouse returned a non-text identifier")
+    return value
 
 
 def inline_text_bytes(value: str) -> int:

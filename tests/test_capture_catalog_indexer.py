@@ -89,6 +89,8 @@ class _Inventory:
 
 
 class _CatalogWriter:
+    publisher_lease = "held"
+
     def __init__(self):
         self.committed: set[tuple[str, str]] = set()
         self.descriptor_batches: list[tuple] = []
@@ -652,14 +654,11 @@ def test_an_indexer_whose_writer_cannot_publish_writes_nothing(tmp_path: Path):
     assert writer.descriptor_batches == [], "the batch was written anyway"
 
 
-def test_a_writer_that_does_not_answer_about_leases_is_left_alone(tmp_path: Path):
-    """`CatalogWriter` says nothing about how a writer earns the right to
-    publish -- the ClickHouse writer takes a lease, another may need nothing --
-    so the check reads an OPTIONAL property and a writer without one indexes
-    exactly as before."""
+def test_a_writer_holding_a_lease_indexes_normally(tmp_path: Path):
+    """A writer that answers the authority question with a lease indexes."""
     inventory, refs = _packs(tmp_path, (1,))
     writer = _CatalogWriter()
-    assert not hasattr(writer, "publisher_lease")
+    assert writer.publisher_lease == "held"
 
     result = CatalogIndexer(inventory, writer).index(refs)
 

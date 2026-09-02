@@ -29,7 +29,7 @@ from dmi.storage.capture import (
     summarize_tensor,
 )
 from dmi.storage.capture.model import _DTYPE_BYTES
-from dmi.storage.capture.summary import numpy_dtypes
+
 
 
 pytestmark = pytest.mark.cpu
@@ -197,7 +197,9 @@ def test_gate_bfloat16_round_trips_every_bit_pattern(tmp_path: Path):
 def test_every_supported_dtype_is_decodable():
     # A dtype accepted by CaptureMetadata but unknown to the decoder would only
     # fail at analysis time, long after the capture was written.
-    assert set(numpy_dtypes()) | {"bfloat16"} == set(_DTYPE_BYTES)
+    from dmi.storage.capture.summary import _NUMPY_DTYPES
+
+    assert set(_NUMPY_DTYPES) | {"bfloat16"} == set(_DTYPE_BYTES)
 
 
 # --- gate B: no unrelated payload bytes --------------------------------------
@@ -480,7 +482,7 @@ def test_float_order_statistics_are_unchanged_floats(tmp_path: Path, dtype: str)
 
 
 def test_summary_element_count_agrees_with_the_catalog_facet(tmp_path: Path):
-    from dmi.storage.capture.clickhouse_catalog import _FACET_COLUMNS
+    from dmi.storage.capture.clickhouse_schema import FACET_COLUMNS as _FACET_COLUMNS
 
     source = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
     _, descriptor = _descriptor_for(source, "float32", tmp_path)

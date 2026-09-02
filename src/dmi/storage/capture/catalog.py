@@ -11,10 +11,6 @@ from .pack import PackIndex
 
 PackIdentity = tuple[str, str]
 
-# Sentinel for "this writer does not answer that question", so a writer with no
-# publisher_lease property is not mistaken for one holding no lease.
-_NOT_ASKED = object()
-
 
 class SnapshotPublishRaceError(CaptureStorageError):
     """A publish lost the race to a higher version: no snapshot became visible.
@@ -152,6 +148,9 @@ class PackInventory(PackStore, Protocol):
 
 
 class CatalogWriter(Protocol):
+    @property
+    def publisher_lease(self) -> object | None: ...
+
     def committed_pack_ids(
         self, identities: Sequence[PackIdentity]
     ) -> set[PackIdentity]: ...
@@ -443,13 +442,10 @@ class CatalogIndexer:
         without re-acquiring pays that on every scheduled pass; for
         ``CatalogReconciler.rebuild`` it is once per page over the whole store.
 
-        Asked of the writer only if the writer answers the question at all.
-        ``CatalogWriter`` is deliberately silent about how a writer earns the
-        right to publish -- the ClickHouse writer takes a publisher lease,
-        another may need nothing -- so this reads an OPTIONAL property, and a
-        writer without one is left alone.
+        Part of the ``CatalogWriter`` contract: the writer answers whether it
+        holds publishing authority. The ClickHouse writer's answer is its lease.
         """
-        if getattr(self._writer, "publisher_lease", _NOT_ASKED) is None:
+        if self._writer.publisher_lease is None:
             raise PublisherLeaseError(
                 "the catalog writer holds no publisher lease, and only the "
                 "lease holder can make a snapshot visible: acquire one before "

@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from time import time_ns
-from typing import Protocol
 
 from .catalog import CatalogSchemaVersionError
-from .clickhouse_sql import DECIDING_READ, membership_predicate
-
-
-class ClickHouseClient(Protocol):
-    def execute(self, query: str, params=None, **kwargs): ...
+from .clickhouse_sql import (
+    DECIDING_READ,
+    ClickHouseClient,
+    membership_predicate,
+    text,
+)
 
 
 CAPTURE_COLUMNS = (
@@ -85,16 +85,6 @@ SCHEMA_VERSION = 4
 
 def _quoted(value: str) -> str:
     return f"`{value}`"
-
-
-def _text(value: object) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8")
-    if not isinstance(value, str):
-        raise ValueError(  # noqa: TRY004 - preserve the catalog API
-            "ClickHouse returned a non-text identifier"
-        )
-    return value
 
 
 def _facet_ddl() -> str:
@@ -369,9 +359,9 @@ pack_id UUID
         )
         wanted = set(names)
         return {
-            _text(name): CatalogObject(_text(engine), _text(sorting_key))
+            text(name): CatalogObject(text(engine), text(sorting_key))
             for name, engine, sorting_key in rows
-            if _text(name) in wanted
+            if text(name) in wanted
         }
 
     def _reject_wrong_kinds(self, found: dict[str, CatalogObject]) -> None:
@@ -490,7 +480,7 @@ pack_id UUID
             "AND table IN %(tables)s AND name = 'publish_id'",
             {"database": self.database, "tables": tables},
         )
-        return {_text(row[0]) for row in rows}
+        return {text(row[0]) for row in rows}
 
     def _recorded_version(self) -> int | None:
         rows = self._client.execute(

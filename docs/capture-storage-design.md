@@ -568,9 +568,8 @@ older serialization paths, which the server reads as *no* limit. The cap is per
 statement, not the pair, so it does not bound the client round trip between
 them.
 
-`lease_attempts` remains accepted by `ClickHouseCatalogConfig` for compatibility
-but is deprecated and ignored. Contested terms now wait for expiry rather than
-retrying at randomized higher terms.
+Contested lease terms wait for expiry rather than retrying at randomized higher
+terms; the legacy `lease_attempts` retry knob was removed.
 
 The earlier one-renewal implementation measured 15.2 ms for a 16-pack publish
 and 173 ms for the full 4096-row indexing pass on 25.12. The current protocol
@@ -1068,7 +1067,7 @@ CaptureCatalog (the reader's query side)
   - ClickHouseCaptureCatalog
 
 Summaries
-  - summarize_tensor -> CoreTensorSummaryV1
+  - summarize_tensor -> CoreTensorSummary
   - ExtensionRegistry, for ScalarMetric and ArtifactProducer
 ```
 

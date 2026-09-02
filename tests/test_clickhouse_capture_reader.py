@@ -14,9 +14,9 @@ from dmi.storage.capture import (
     InvalidCursorError,
     PackFormatError,
 )
-from dmi.storage.capture.clickhouse_catalog import (
-    _CAPTURE_COLUMNS,
-    _CAPTURE_TABLE_ORDER,
+from dmi.storage.capture.clickhouse_schema import (
+    CAPTURE_COLUMNS as _CAPTURE_COLUMNS,
+    CAPTURE_TABLE_ORDER as _CAPTURE_TABLE_ORDER,
 )
 from dmi.storage.capture.clickhouse_reader import (
     _EQUALITY_FILTERS,
@@ -203,7 +203,7 @@ def test_the_logical_sort_key_is_a_prefix_of_the_table_order():
     keyset comparison that advances a page would stop pruning on the primary
     index and every page would scan the table.
     """
-    from dmi.storage.capture.clickhouse_catalog import _CAPTURE_TABLE_ORDER
+    from dmi.storage.capture.clickhouse_schema import CAPTURE_TABLE_ORDER as _CAPTURE_TABLE_ORDER
     from dmi.storage.capture.clickhouse_reader import _SORT_KEY
 
     assert _CAPTURE_TABLE_ORDER[: len(_SORT_KEY)] == _SORT_KEY
@@ -428,7 +428,7 @@ def test_only_a_cursor_bearing_search_reads_the_head_as_deciding():
     answer is a hard rejection -- so that read carries the same
     ``select_sequential_consistency`` the writer's deciding reads do.
     """
-    from dmi.storage.capture.clickhouse_catalog import _DECIDING_READ
+    from dmi.storage.capture.clickhouse_sql import DECIDING_READ as _DECIDING_READ
 
     descriptors = synthetic_descriptors(4)
     catalog, client = _catalog(pages=[descriptors, descriptors[3:]])
@@ -576,7 +576,7 @@ def test_a_bounded_read_can_be_told_not_to_wait_for_its_replica():
     watermark makes the NEXT page resume past the rows that were missing. An
     operator who would rather have the latency can say so.
     """
-    from dmi.storage.capture.clickhouse_catalog import _DECIDING_READ
+    from dmi.storage.capture.clickhouse_sql import DECIDING_READ as _DECIDING_READ
 
     strict = ClickHouseReaderConfig()
     relaxed = ClickHouseReaderConfig(consistent_snapshot_reads=False)

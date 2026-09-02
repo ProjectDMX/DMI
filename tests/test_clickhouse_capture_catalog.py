@@ -16,7 +16,7 @@ from dmi.storage.capture import (
     SnapshotPublishConflictError,
     SnapshotPublishRaceError,
 )
-from dmi.storage.capture.clickhouse_catalog import _SCHEMA_VERSION
+from dmi.storage.capture.clickhouse_schema import SCHEMA_VERSION as _SCHEMA_VERSION
 from tests._catalog_fakes import FakeLeaseTable
 
 
@@ -315,7 +315,7 @@ def test_the_capture_view_is_bounded_to_the_published_snapshot():
     correctly reports as nonexistent, offered to anyone querying the catalog by
     hand as though it were catalog contents.
     """
-    from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS
+    from dmi.storage.capture.clickhouse_schema import CAPTURE_COLUMNS as _CAPTURE_COLUMNS
 
     client = _Client()
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
@@ -585,7 +585,7 @@ def test_the_deciding_reads_carry_sequential_consistency():
     see themselves alone. Descriptor and inventory inserts carry nothing: they
     decide nothing.
     """
-    from dmi.storage.capture.clickhouse_catalog import _DECIDING_READ
+    from dmi.storage.capture.clickhouse_sql import DECIDING_READ as _DECIDING_READ
 
     ref, descriptor = _descriptor()
     client = _Client()
@@ -641,7 +641,7 @@ def test_the_fenced_release_resolves_the_head_with_sequential_consistency():
     term -- so the read carries the same consistency every other deciding
     read does.
     """
-    from dmi.storage.capture.clickhouse_catalog import _DECIDING_READ
+    from dmi.storage.capture.clickhouse_sql import DECIDING_READ as _DECIDING_READ
 
     client = _Client()
     writer = _leased(client)
@@ -1436,7 +1436,7 @@ def test_a_catalog_at_this_builds_version_is_accepted():
 
 
 def test_ensure_schema_declares_every_facet_as_a_materialized_column():
-    from dmi.storage.capture.clickhouse_catalog import _FACET_COLUMNS
+    from dmi.storage.capture.clickhouse_schema import FACET_COLUMNS as _FACET_COLUMNS
 
     client = _Client()
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
@@ -1453,7 +1453,7 @@ def test_ensure_schema_declares_every_facet_as_a_materialized_column():
 
 
 def test_ensure_schema_upgrades_pre_facet_tables_idempotently():
-    from dmi.storage.capture.clickhouse_catalog import _FACET_COLUMNS
+    from dmi.storage.capture.clickhouse_schema import FACET_COLUMNS as _FACET_COLUMNS
 
     client = _Client()
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
@@ -1494,9 +1494,9 @@ def test_ensure_schema_adds_a_bloom_filter_index_on_capture_id():
 
 
 def test_facets_never_collide_with_an_inserted_column():
-    from dmi.storage.capture.clickhouse_catalog import (
-        _CAPTURE_COLUMNS,
-        _FACET_COLUMNS,
+    from dmi.storage.capture.clickhouse_schema import (
+        CAPTURE_COLUMNS as _CAPTURE_COLUMNS,
+        FACET_COLUMNS as _FACET_COLUMNS,
     )
 
     # A MATERIALIZED column cannot be written to, so a collision with the

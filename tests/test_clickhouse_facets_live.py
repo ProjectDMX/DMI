@@ -17,7 +17,7 @@ import pytest
 
 from benchmarks.bench_capture_catalog import synthetic_descriptors
 from dmi.storage.capture import ClickHouseCatalogConfig, ClickHouseCatalogWriter
-from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS, _FACET_COLUMNS
+from dmi.storage.capture.clickhouse_schema import CAPTURE_COLUMNS as _CAPTURE_COLUMNS, FACET_COLUMNS as _FACET_COLUMNS
 
 
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]

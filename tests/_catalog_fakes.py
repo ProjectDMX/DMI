@@ -45,7 +45,7 @@ class ClientComputedClock(AssertionError):
     """
 
 
-# The predicate `ClickHouseCatalogWriter._lease_fence()` emits, as a pattern.
+# The predicate `the emitted fence` emits, as a pattern.
 # Everything the fence DOES is matched exactly; only the table name is loose,
 # because each suite runs under its own prefix. Exactness is the point: the
 # fence is the whole safety property, so a rewrite of it has to be restated
@@ -64,7 +64,7 @@ _FENCE = re.compile(
 
 _LIMIT = re.compile(r"\bLIMIT\s+(\d+)")
 
-# The fenced release tombstone `ClickHouseCatalogWriter._release_statement()`
+# The fenced release tombstone `the emitted release statement`
 # emits: the head is resolved and the tombstone written in ONE server-side
 # statement, so a successor acquiring between a read and a write has no window
 # to be contested in. Matched exactly for the same reason `_FENCE` is, and
@@ -88,7 +88,7 @@ def uuid_order(text: str) -> tuple[int, int]:
     ABOVE `ffffffff-ffff-ffff-0000-000000000000` while Python's string order
     ranks it below. Verified on 25.12 against `ORDER BY u DESC LIMIT 1`.
 
-    It matters because the fence and `_lease_head` both resolve a contested
+    It matters because the fence and the head read both resolve a contested
     head term with `ORDER BY term DESC, lease_id DESC`, and a fake that
     resolved it by text order would model a different row than the server
     picks -- so any test reaching a contested head would be asserting the
@@ -148,7 +148,7 @@ class FakeLeaseTable:
         Keyed on the SQL, never on the presence of the `lease_id` parameter.
         `publish_snapshot` passes that parameter whether or not the statement
         uses it, so a fake that keyed on it enforced the fence on the writer's
-        behalf: deleting `_lease_fence()` from the source left every CPU test
+        behalf: deleting the fence from the source left every CPU test
         passing, which is the one thing these fakes must never do.
 
         The fence has to GATE the write, not merely appear in it, so beyond

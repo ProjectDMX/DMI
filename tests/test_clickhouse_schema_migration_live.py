@@ -60,7 +60,7 @@ from dmi.storage.capture import (
     PackWriter,
     StoredObject,
 )
-from dmi.storage.capture.clickhouse_catalog import _SCHEMA_VERSION
+from dmi.storage.capture.clickhouse_schema import SCHEMA_VERSION as _SCHEMA_VERSION
 
 
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]

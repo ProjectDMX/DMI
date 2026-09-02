@@ -17,7 +17,7 @@ working in environments that only write packs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING
 
 from .model import (
     CaptureDescriptor,
@@ -111,14 +111,6 @@ class ArtifactRef:
     object_bytes: int
     checksum: str
     content_type: str
-
-
-# The name this class shipped under while ``CORE_SUMMARY_VERSION`` was 1. It is
-# kept as an alias rather than dropped: the class is re-exported from the
-# package, so a downstream ``isinstance`` or import would break for a rename
-# that changes nothing about the data. It is the same object, not a subclass,
-# so an existing check keeps passing.
-CoreTensorSummaryV1 = CoreTensorSummary
 
 
 def decode_tensor(descriptor: CaptureDescriptor, payload: bytes) -> "np.ndarray":
@@ -259,7 +251,3 @@ def summarize_tensor(
         l2_norm=l2_norm,
     )
 
-
-def numpy_dtypes() -> Mapping[str, str]:
-    """The dtype table, exposed so tests can assert full coverage."""
-    return dict(_NUMPY_DTYPES)

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import re
 import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass
 from time import time_ns
-from typing import Protocol
 from uuid import uuid4
 
 from .catalog import (
@@ -15,54 +13,27 @@ from .catalog import (
     SnapshotPublishRaceError,
 )
 from .clickhouse_lease import (
-    DECIDING_READ,
     ClickHouseLeaseCoordinator,
-    LeaseHead,
     PublisherLease,
 )
 from .clickhouse_schema import (
     CAPTURE_COLUMNS,
-    CAPTURE_TABLE_ORDER,
-    FACET_COLUMNS,
     PACK_COLUMNS,
-    SCHEMA_VERSION,
     ClickHouseCatalogSchema,
 )
 from .clickhouse_sql import (
-    MAX_INLINE_PARAMETER_BYTES,
+    DECIDING_READ,
+    ClickHouseClient,
+    identifier,
     inline_chunks,
     inline_tuple_bytes,
-    membership_predicate,
+    quoted,
+    text,
 )
 from .model import CaptureDescriptor, PackRef
 
-_CAPTURE_COLUMNS = CAPTURE_COLUMNS
-_CAPTURE_TABLE_ORDER = CAPTURE_TABLE_ORDER
-_DECIDING_READ = DECIDING_READ
-_FACET_COLUMNS = FACET_COLUMNS
-_MAX_INLINE_PARAMETER_BYTES = MAX_INLINE_PARAMETER_BYTES
-_PACK_COLUMNS = PACK_COLUMNS
-_SCHEMA_VERSION = SCHEMA_VERSION
-_LeaseHead = LeaseHead
-_inline_chunks_by_size = inline_chunks
-_inline_tuple_bytes = inline_tuple_bytes
-_membership_predicate = membership_predicate
-
-_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-
-
-class ClickHouseClient(Protocol):
-    def execute(self, query: str, params=None, **kwargs): ...
-
-
-def _identifier(value: str) -> str:
-    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
-        raise ValueError(f"invalid ClickHouse identifier: {value!r}")
-    return value
-
-
-def _quoted(value: str) -> str:
-    return f"`{value}`"
+def _inline_chunks(items: list[PackIdentity]):
+    return inline_chunks(items, item_bytes=inline_tuple_bytes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,8 +50,6 @@ class ClickHouseCatalogConfig:
     # execution-time check. See publish_snapshot.
     lease_ttl_ns: int = 30_000_000_000
     publish_timeout_ns: int = 5_000_000_000
-    # Compatibility-only: contested terms now wait for expiry instead of retrying.
-    lease_attempts: int = 8
     # The WRITE half of the consistency story, and off by default because it is
     # a deployment decision rather than one this module can make.
     #
@@ -111,14 +80,13 @@ class ClickHouseCatalogConfig:
     insert_quorum: int | None = None
 
     def __post_init__(self) -> None:
-        _identifier(self.database)
-        _identifier(self.table_prefix)
+        identifier(self.database)
+        identifier(self.table_prefix)
         for name in (
             "query_pack_limit",
             "allocation_attempts",
             "lease_ttl_ns",
             "publish_timeout_ns",
-            "lease_attempts",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -151,9 +119,8 @@ class ClickHouseCatalogConfig:
             )
 
 
-
 def _inline_chunks(items: list[PackIdentity]):
-    return _inline_chunks_by_size(items, item_bytes=_inline_tuple_bytes)
+    return inline_chunks(items, item_bytes=inline_tuple_bytes)
 
 
 class ClickHouseCatalogWriter:
@@ -206,10 +173,10 @@ class ClickHouseCatalogWriter:
                 # not caught up, it under-reports and the pass re-indexes packs
                 # that are already published -- redundant work, and a second
                 # publish of a batch that needed none.
-                settings=_DECIDING_READ,
+                settings=DECIDING_READ,
             )
             committed.update(
-                (self._text(row[0]), self._text(row[1])) for row in rows
+                (text(row[0]), text(row[1])) for row in rows
             )
         return committed
 
@@ -222,7 +189,7 @@ class ClickHouseCatalogWriter:
         rows = [self._descriptor_row(item, index_version) for item in descriptors]
         self._client.execute(
             f"INSERT INTO {self._qualified(self._capture_raw)} "
-            f"({', '.join(_CAPTURE_COLUMNS)}) VALUES",
+            f"({', '.join(CAPTURE_COLUMNS)}) VALUES",
             rows,
             settings=self._quorum_write() or None,
         )
@@ -303,8 +270,8 @@ class ClickHouseCatalogWriter:
         # as its own, which is the failure this identity exists to catch.
         publish_id = str(uuid4())
         settings = {
-            **_DECIDING_READ,
-            **self._publish_timeout(),
+            **DECIDING_READ,
+            **self._leases.publish_timeout(),
             **self._quorum_write(),
         }
         if refs:
@@ -333,7 +300,7 @@ class ClickHouseCatalogWriter:
                     "SELECT %(index_version)s, toUUID(%(publish_id)s), "
                     "tupleElement(member, 1), toUUID(tupleElement(member, 2)) "
                     "FROM (SELECT arrayJoin(%(members)s) AS member) "
-                    f"WHERE {self._lease_fence()}",
+                    f"WHERE {self._leases.fence()}",
                     {
                         "index_version": index_version,
                         "publish_id": publish_id,
@@ -348,7 +315,7 @@ class ClickHouseCatalogWriter:
                     publish_id=publish_id,
                     members=chunk,
                 ):
-                    self._reject_if_the_lease_is_gone(lease)
+                    self._leases.reject_if_gone(lease)
                     raise SnapshotPublishRaceError(
                         f"catalog version {index_version} did not publish its "
                         "complete manifest chunk, so no watermark was written "
@@ -382,7 +349,7 @@ class ClickHouseCatalogWriter:
             # _max_version already handles the None; the barrier has to match.
             f"WHERE ifNull((SELECT max(index_version) FROM {watermark}), 0) "
             "< %(index_version)s "
-            f"AND {self._lease_fence()}",
+            f"AND {self._leases.fence()}",
             {
                 "index_version": index_version,
                 "publish_id": publish_id,
@@ -410,12 +377,12 @@ class ClickHouseCatalogWriter:
         # thing it is not: the watermark row is standing, its manifest rows are
         # paired with it, and its packs are visible.
         owners = {
-            self._text(row[0])
+            text(row[0])
             for row in self._client.execute(
                 f"SELECT toString(publish_id) FROM {watermark} "
                 "WHERE index_version = %(version)s",
                 {"version": index_version},
-                settings=_DECIDING_READ,
+                settings=DECIDING_READ,
             )
         }
         if publish_id not in owners:
@@ -423,7 +390,7 @@ class ClickHouseCatalogWriter:
             # recovery differs. A lost VERSION race is repaired by allocating a
             # higher one, which the indexer does. A lost LEASE is not: every
             # retry would fail the same fence, so it has to say so instead.
-            self._reject_if_the_lease_is_gone(lease)
+            self._leases.reject_if_gone(lease)
             raise SnapshotPublishRaceError(
                 f"catalog version {index_version} lost the publish race: the "
                 "conditional watermark INSERT was refused, so no row carrying "
@@ -464,21 +431,6 @@ class ClickHouseCatalogWriter:
     def release_publisher_lease(self) -> None:
         self._leases.release()
 
-    def _release_statement(self) -> str:
-        return self._leases.release_statement()
-
-    def _claim_lease(self, holder: str, *, lease_id: str) -> PublisherLease:
-        return self._leases.claim(holder, lease_id=lease_id)
-
-    def _lease_head(self) -> _LeaseHead:
-        return self._leases.head()
-
-    def _lease_fence(self) -> str:
-        return self._leases.fence()
-
-    def _publish_timeout(self) -> dict[str, object]:
-        return self._leases.publish_timeout()
-
     def _manifest_chunk_published(
         self,
         *,
@@ -497,12 +449,9 @@ class ClickHouseCatalogWriter:
                 "publish_id": publish_id,
                 "members": members,
             },
-            settings=_DECIDING_READ,
+            settings=DECIDING_READ,
         )
         return rows[0][0] == len(set(members))
-
-    def _reject_if_the_lease_is_gone(self, lease: PublisherLease) -> None:
-        self._leases.reject_if_gone(lease)
 
     def collect_garbage(self) -> dict[str, int]:
         """Delete the rows the protocols append and never need again.
@@ -525,7 +474,7 @@ class ClickHouseCatalogWriter:
         """
         removed: dict[str, int] = {}
         published = self.last_published_version()
-        head = self._lease_head()
+        head = self._leases.head()
         settings = {"mutations_sync": 1}
 
         # Manifest rows of a publish that never reached the watermark, at a
@@ -585,7 +534,7 @@ class ClickHouseCatalogWriter:
         matched = self._client.execute(
             f"SELECT count() FROM {qualified} WHERE {predicate}",
             params,
-            settings=_DECIDING_READ,
+            settings=DECIDING_READ,
         )[0][0]
         if matched:
             self._client.execute(
@@ -644,9 +593,9 @@ class ClickHouseCatalogWriter:
                 f"{self._qualified(self._version_claims)} "
                 "WHERE version = %(version)s",
                 {"version": candidate},
-                settings=_DECIDING_READ,
+                settings=DECIDING_READ,
             )
-            if {self._text(row[0]) for row in owners} == {claim_id}:
+            if {text(row[0]) for row in owners} == {claim_id}:
                 return candidate
             # Contested: someone else claimed the same version -- abandon it
             # entirely and retry above it.
@@ -659,7 +608,7 @@ class ClickHouseCatalogWriter:
         # and the head a publish must beat.
         rows = self._client.execute(
             f"SELECT max({column}) FROM {self._qualified(table)}",
-            settings=_DECIDING_READ,
+            settings=DECIDING_READ,
         )
         if not rows or not rows[0] or rows[0][0] is None:
             return 0
@@ -691,12 +640,12 @@ class ClickHouseCatalogWriter:
         # reverse.
         self._client.execute(
             f"INSERT INTO {self._qualified(self._pack_raw)} "
-            f"({', '.join(_PACK_COLUMNS)}) VALUES",
+            f"({', '.join(PACK_COLUMNS)}) VALUES",
             rows,
         )
 
     def _qualified(self, table: str) -> str:
-        return f"{_quoted(self._config.database)}.{_quoted(table)}"
+        return f"{quoted(self._config.database)}.{quoted(table)}"
 
     def _quorum_write(self) -> dict[str, object]:
         """The settings that make a DECIDING write durable before it is read.
@@ -735,16 +684,6 @@ class ClickHouseCatalogWriter:
     def _validate_version(index_version: int) -> None:
         if type(index_version) is not int or not 0 <= index_version < 2**64:
             raise ValueError("index_version must fit UInt64")
-
-    @staticmethod
-    def _text(value: object) -> str:
-        if isinstance(value, bytes):
-            return value.decode("utf-8")
-        if not isinstance(value, str):
-            raise ValueError(  # noqa: TRY004 - preserve the catalog API
-                "ClickHouse returned a non-text identifier"
-            )
-        return value
 
     @staticmethod
     def _descriptor_row(item: CaptureDescriptor, index_version: int) -> tuple:

@@ -39,7 +39,7 @@ from dmi.storage.capture import (
     PublisherLeaseHeldError,
     SnapshotPublishRaceError,
 )
-from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS
+from dmi.storage.capture.clickhouse_schema import CAPTURE_COLUMNS as _CAPTURE_COLUMNS
 
 
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
@@ -528,7 +528,7 @@ def test_a_contested_head_is_quarantined_even_though_the_fence_selects_one():
                 {"lease_id": lease_id},
             )
 
-        fence = writer._lease_fence()
+        fence = writer._leases.fence()
         # The fence admits one of them, which is the claim both documents got
         # wrong. It is the UUID-order winner, not the text-order winner.
         margin = {"publish_timeout_ns": config.publish_timeout_ns}
@@ -608,7 +608,7 @@ def test_the_fence_refuses_on_an_empty_lease_table_rather_than_throwing():
         client.execute(f"TRUNCATE TABLE {table}")
         assert client.execute(f"SELECT count() FROM {table}") == [(0,)]
 
-        fence = writer._lease_fence()
+        fence = writer._leases.fence()
         # Evaluating it is not an error, and the answer is "no".
         assert client.execute(
             f"SELECT {fence}",
