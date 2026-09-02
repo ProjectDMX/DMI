@@ -489,6 +489,23 @@ def test_unknown_dtype_is_rejected():
         )
 
 
+def test_decode_step_comes_from_the_same_rank_as_the_peak():
+    """One result must not describe two different ranks.
+
+    Taking a max over ranks for decode while choosing the reported rank by
+    peak lets the two disagree whenever the prefill-heaviest stage is not the
+    decode-heaviest one.
+    """
+    estimate = estimate_config(
+        _config(["resid_pre", "final_logits"]),
+        _descriptor(),
+        _workload(decode_tokens=32, pipeline_parallel_size=2),
+    )
+
+    worst = [r for r in estimate.ranks if r.label == estimate.peak_step_rank][0]
+    assert estimate.decode_step_bytes == worst.decode_step_bytes
+
+
 def test_payload_is_json_safe():
     import json
 

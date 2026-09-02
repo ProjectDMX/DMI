@@ -396,10 +396,14 @@ def estimate_config(
 
     worst = max(ranks, key=_peak) if ranks else None
     peak_step_bytes = _peak(worst) if worst else 0
+    # The worst rank's decode step, not the maximum across ranks. Under
+    # pipeline parallelism the stage with the largest prefill step need not be
+    # the one with the largest decode step -- a first stage carrying many
+    # layers versus a last stage carrying final_logits -- so taking a max here
+    # would leave decode_step_bytes describing a different rank than
+    # peak_step_rank names and bytes_per_request is computed from.
     decode_step_bytes = (
-        max(load.decode_step_bytes for load in ranks)
-        if ranks and capture_decode
-        else 0
+        worst.decode_step_bytes if (worst and capture_decode) else 0
     )
 
     # Aggregate across every real rank: probes stand in for the tp ranks they
