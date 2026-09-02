@@ -453,7 +453,14 @@
     refreshEstimate();
   }
 
+  // Responses are not guaranteed to arrive in the order they were sent, and
+  // the estimate endpoint walks every rank, so a slow earlier request can
+  // land after a newer one and paint figures for a workload the user has
+  // already changed. Stamp each request and drop anything but the latest.
+  var estimateRequestId = 0;
+
   async function refreshEstimate() {
+    var requestId = (estimateRequestId += 1);
     try {
       var payload = await api("/api/estimate", {
         method: "POST",
@@ -467,8 +474,10 @@
           }
         })
       });
+      if (requestId !== estimateRequestId) return;
       renderEstimate(payload);
     } catch (error) {
+      if (requestId !== estimateRequestId) return;
       clearEstimate("Could not estimate: " + error.message);
     }
   }
