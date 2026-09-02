@@ -734,7 +734,7 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 
 | State found | Outcome |
 |---|---|
-| no catalog objects at all | fresh install: create everything, stamp the current version |
+| no catalog objects at all, with object visibility confirmed | fresh install: create everything, stamp the current version |
 | version table stamped at the current version, all objects present | proceed; the DDL is idempotent |
 | version table present, no row | an install of this build that died before stamping: rerun the DDL, then stamp -- *after* the last three rows below, which an empty stamp does not skip |
 | only superseded objects (`{prefix}_pack_commit_log`) | refuse -- naming that object and saying to drop it; there is nothing to rebuild |
@@ -746,6 +746,13 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 | a TABLE missing, and every data table is empty | complete it: rerun the DDL |
 | a VIEW missing | recreate it; a view is a projection of the tables and holds no rows |
 | any pack inventory identity lacks effective published manifest membership | refuse -- membership is incomplete |
+
+Before any catalog DDL, `ensure_schema` checks object-scoped `SHOW TABLES`
+access for every current and superseded object. After DDL it re-reads
+`system.tables` and requires the complete current object set, with no
+superseded object, before writing the stamp. An empty result caused by hidden
+objects therefore cannot be mistaken for a fresh install, and a partially
+visible catalog cannot be stamped as complete.
 
 **An empty stamp narrows the version; it does not excuse anything else.** The
 last three rows apply whether or not `{prefix}_schema_version` holds a row.

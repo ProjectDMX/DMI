@@ -1,13 +1,13 @@
 # Differential Security Review — PR #119 "Capture catalog: pack identity in the descriptor key, fenced snapshot publication"
 
 **Repository:** ProjectDMX/DMI · **Branch:** `design/catalog-descriptor-key` · **Range:** `cb4e490` (`origin/main`) … `a808812`
-**Date:** 2026-09-01 · **Method:** trailofbits `differential-review` (FOCUSED strategy) · **Status of this file:** untracked review artifact, not part of the PR
+**Date:** 2026-09-01 · **Method:** trailofbits `differential-review` (FOCUSED strategy) · **Status of this file:** preserved review artifact; section 0 records the later remediation
 
 ---
 
 ## 0. Resolution status (updated after remediation)
 
-Every finding below has been addressed on the branch, across three commits:
+Every finding below has been addressed on the branch:
 
 | Finding | Status | Where |
 |---|---|---|
@@ -20,7 +20,7 @@ Every finding below has been addressed on the branch, across three commits:
 | L2 `select_sequential_consistency` overstated | **Fixed** | opt-in `insert_quorum` on the deciding writes |
 | L3 lease wedge states | **Fixed** | early lease refusal, plus `collect_garbage()` for the rows the lease protocol appends |
 | L4 live fixture `UnboundLocalError` | **Fixed** | writer constructed before the `try` |
-| I1–I4 | **I1, I3, I4 fixed**; I2 fixed by confirming a fresh install became visible | count validation, byte-bounded holder, summary rename |
+| I1–I4 | **Fixed** | count validation, object-scoped visibility preflight and full post-DDL shape check, byte-bounded holder, summary rename |
 | R1 publish verified visibility but not membership | **Fixed** (independently) | per-chunk membership verification in `publish_snapshot` |
 | R3 interrupted install refused forever | **Fixed** | the missing-table refusal is gated on surviving rows |
 | R5 bare `RuntimeError`s outside the taxonomy | **Fixed** | `CatalogVersionAllocationError`, `CatalogRebuildExhaustedError` |
