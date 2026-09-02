@@ -114,10 +114,22 @@ def attach_config(adapter, model, config: DMIConfig) -> None:
     ``apply_hook_selection`` walks the unselected specs to turn them off. A
     pre-filtered list would leave every deselected hook live.
     """
+    # Pass `layers` only when there is a range to apply. Adapters are a public
+    # extension point (see the v1 integration API), and an adapter that
+    # overrides attach_model without the keyword would otherwise raise
+    # TypeError for *every* configuration -- including the majority that set
+    # no layer range and need nothing from it. A config that does set a range
+    # still fails loudly on such an adapter, which is correct: the range would
+    # not be honoured, and silently dropping it is the outcome this whole
+    # change exists to prevent.
+    kwargs = {}
+    if config.observations.layers is not None:
+        kwargs["layers"] = config.observations.layers
+
     adapter.attach_model(
         model,
         to_legacy_hook_selection(config.observations),
-        layers=config.observations.layers,
+        **kwargs,
     )
 
 

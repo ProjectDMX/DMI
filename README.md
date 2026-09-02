@@ -117,20 +117,27 @@ Full setup, additional results, and how to reproduce:
 ## Configure a capture visually
 
 DMI-configurator turns a model plus a few clicks into a validated capture
-configuration, and estimates what it will cost before you run anything. From a
-checkout, with no install:
+configuration, and estimates what it will cost before you run anything. It
+needs the optional web dependencies once:
+
+```bash
+pip install -e ".[ui]"
+```
+
+After that, from a checkout:
 
 ```bash
 make ui
 ```
 
 That opens a browser on <http://127.0.0.1:8000>. Point it at your own model
-with `make ui MODEL=./Qwen3-8B`.
+with `make ui MODEL=./Qwen3-8B`. `make ui` runs from the source tree without
+installing DMI itself, but the `[ui]` extra is required either way — the
+server raises a `RuntimeError` naming this command if it is missing.
 
-Installed, it is a normal command:
+With DMI installed, it is a normal command:
 
 ```bash
-pip install -e ".[ui]"
 dmi ui ./Qwen3-8B
 ```
 

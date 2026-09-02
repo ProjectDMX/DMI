@@ -194,9 +194,22 @@ def create_app(
 
         body = estimate_payload(estimate)
 
-        ring = payload.get("ring") or {}
+        # Type-check the raw value: `or {}` alone would let a truthy
+        # non-mapping such as a list or string through to `.get`, which raises
+        # AttributeError and surfaces as a 500 instead of a 400.
+        ring_raw = payload.get("ring")
+        if ring_raw is not None and not isinstance(ring_raw, dict):
+            raise HTTPException(
+                400,
+                f"'ring' must be a mapping, got {type(ring_raw).__name__}.",
+            )
+        ring = ring_raw or {}
+        # `is not None`, not truthiness: payload_bytes=0 is a client error that
+        # check_ring_fit rejects with a clear message, and treating it as
+        # "absent" would silently drop the ring-fit result the caller asked
+        # for.
         payload_bytes = ring.get("payload_bytes")
-        if payload_bytes:
+        if payload_bytes is not None:
             try:
                 fit = check_ring_fit(
                     estimate,

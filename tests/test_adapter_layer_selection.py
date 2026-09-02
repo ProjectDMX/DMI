@@ -360,3 +360,57 @@ def test_compile_config_accepts_unbound_authoring_time_specs():
     compiled = compile_config(config, ModelContext(specs=specs))
 
     assert compiled.selected_layers == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# attach_config against an adapter that does not know about layers
+# ---------------------------------------------------------------------------
+
+
+class LegacyAdapter(StubAdapter):
+    """A third-party adapter written before `layers` existed.
+
+    Adapters are a public extension point, so one overriding attach_model
+    without the keyword has to keep working for every configuration that does
+    not ask for a layer range.
+    """
+
+    def attach_model(self, model, hook_selection: str = "full") -> None:
+        self.received_selection = hook_selection
+        return BackendAdapter.attach_model(self, model, hook_selection)
+
+
+def test_attach_config_does_not_pass_layers_when_no_range_is_set():
+    adapter, model = _make_adapter(num_layers=4)
+    legacy = LegacyAdapter(adapter.engine)
+    config = DMIConfig(
+        observations=ObservationConfig(hooks=["resid_pre"], layers=None)
+    )
+
+    attach_config(legacy, model, config)
+
+    assert legacy.received_selection == "resid_pre"
+    assert _layers_of(legacy.active_specs) == set(range(4))
+
+
+def test_attach_config_fails_loudly_when_a_range_cannot_be_applied():
+    """Silently dropping the range is the outcome this wiring prevents."""
+    adapter, model = _make_adapter(num_layers=4)
+    legacy = LegacyAdapter(adapter.engine)
+    config = DMIConfig(
+        observations=ObservationConfig(
+            hooks=["resid_pre"], layers=LayerSelection(1, 2)
+        )
+    )
+
+    with pytest.raises(TypeError, match="layers"):
+        attach_config(legacy, model, config)
+
+
+def test_the_shipped_hf_adapter_accepts_layers():
+    """The concrete adapter must support the keyword end to end."""
+    import inspect
+
+    from dmi.adapters.huggingface.adapter import HuggingFaceAdapter
+
+    assert "layers" in inspect.signature(HuggingFaceAdapter.attach_model).parameters

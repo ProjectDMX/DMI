@@ -6,7 +6,14 @@ Verified against: `cb4e490`
 
 ## Running it
 
-From a checkout, with nothing installed:
+The web dependencies are needed once (`fastapi` and `uvicorn`; DMI itself does
+not have to be installed):
+
+```bash
+pip install -e ".[ui]"
+```
+
+Then, from a checkout:
 
 ```bash
 make ui

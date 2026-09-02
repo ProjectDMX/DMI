@@ -369,10 +369,28 @@ def test_estimate_uses_the_smaller_of_payload_and_pinned():
 
 
 def test_estimate_rejects_a_zero_ring_size():
+    """0 must be rejected, not silently treated as "no ring given"."""
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
+        response = _estimate(client, ring={"payload_bytes": 0})
+
+    assert response.status_code == 400
+
+
+def test_estimate_rejects_a_negative_ring_size():
     with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         response = _estimate(client, ring={"payload_bytes": -5})
 
     assert response.status_code == 400
+
+
+@pytest.mark.parametrize("bad", [[], [4096], "4096", 4096])
+def test_estimate_rejects_a_ring_that_is_not_a_mapping(bad):
+    """A malformed body is a 400, not an AttributeError behind a 500."""
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
+        response = _estimate(client, ring=bad)
+
+    assert response.status_code == 400
+    assert "must be a mapping" in response.json()["detail"]
 
 
 def test_estimate_matches_the_library_for_the_same_inputs():
