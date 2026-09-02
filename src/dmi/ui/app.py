@@ -78,12 +78,14 @@ def build_state(
     """
     descriptor = resolve_descriptor(source)
 
-    initial = None
+    # The save path doubles as the startup config: relaunching the
+    # configurator picks up the file the previous session saved, whether or
+    # not --config named it explicitly, so Save never silently clobbers an
+    # authored configuration with a blank default.
     save_path = default_save_path(source, descriptor)
     if config_path is not None:
         save_path = Path(config_path)
-        if save_path.exists():
-            initial = load_config(save_path)
+    initial = load_config(save_path) if save_path.exists() else None
 
     return UIState(
         descriptor=descriptor,
@@ -93,18 +95,42 @@ def build_state(
     )
 
 
-def create_app(source: str | Path, config_path: Optional[str | Path] = None):
-    """Build the FastAPI application."""
+# Host names a browser legitimately reaches a loopback bind under. Anything
+# else in the Host header means the request came through a name we never
+# served -- the DNS-rebinding pattern -- and is rejected before any endpoint
+# runs.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
+def create_app(
+    source: str | Path,
+    config_path: Optional[str | Path] = None,
+    bind_host: str = "127.0.0.1",
+):
+    """Build the FastAPI application.
+
+    ``bind_host`` is the address the server will listen on. For a loopback
+    bind (the default), requests whose ``Host`` header is not a loopback name
+    are rejected: a DNS-rebinding page resolves its own hostname to 127.0.0.1
+    and would otherwise be same-origin for the file-writing endpoints. A
+    non-loopback bind is an explicit choice to serve the network, where the
+    valid names cannot be enumerated, so no Host filter is applied.
+    """
     try:
         from fastapi import FastAPI, HTTPException
         from fastapi.responses import FileResponse
         from fastapi.staticfiles import StaticFiles
+        from starlette.middleware.trustedhost import TrustedHostMiddleware
     except ImportError as exc:  # pragma: no cover - exercised by install state
         raise RuntimeError(_FASTAPI_MISSING) from exc
 
     state = build_state(source, config_path)
 
     app = FastAPI(title="DMI-configurator", docs_url=None, redoc_url=None)
+    if bind_host in _LOOPBACK_HOSTS:
+        app.add_middleware(
+            TrustedHostMiddleware, allowed_hosts=list(_LOOPBACK_HOSTS)
+        )
     app.state.ui = state
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 

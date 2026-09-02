@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import Optional
@@ -69,19 +70,20 @@ def _open_when_ready(url: str, host: str, port: int, timeout: float = 20.0) -> N
     Polls rather than sleeping a fixed interval, so a slow first import does
     not open a browser on a page that is not being served yet.
     """
-    deadline = threading.Event()
 
     def wait_and_open() -> None:
         step = 0.1
-        waited = 0.0
-        while waited < timeout and not deadline.is_set():
+        # Wall-clock deadline: each iteration spends real time in both the
+        # connect probe and the sleep, so counting iterations would stretch
+        # the stated timeout to roughly double.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
                 probe.settimeout(step)
                 if probe.connect_ex((host, port)) == 0:
                     webbrowser.open(url)
                     return
-            deadline.wait(step)
-            waited += step
+            time.sleep(step)
 
     thread = threading.Thread(target=wait_and_open, name="dmi-ui-open", daemon=True)
     thread.start()
@@ -107,7 +109,7 @@ def serve(
             'with:\n    pip install "DMI[ui]"'
         ) from exc
 
-    app = create_app(source, config_path)
+    app = create_app(source, config_path, bind_host=host)
     ui = app.state.ui
     bound_port = resolve_port(host, port)
     url = f"http://{host}:{bound_port}"

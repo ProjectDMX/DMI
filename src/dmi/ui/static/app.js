@@ -526,7 +526,11 @@
     };
     Object.keys(numeric).forEach(function (id) {
       dom[id].addEventListener("input", function () {
-        var value = parseInt(dom[id].value, 10);
+        // The decode rate is a float on the server (0.5 steps/s is valid);
+        // everything else is a count.
+        var value = id === "wl-rate"
+          ? parseFloat(dom[id].value)
+          : parseInt(dom[id].value, 10);
         if (Number.isNaN(value)) return;
         workload[numeric[id]] = value;
         scheduleEstimate();
@@ -591,10 +595,16 @@
       chip.addEventListener("click", function () {
         var total = layout.num_layers;
         var third = Math.max(1, Math.floor(total / 3));
+        // Clamp so tiny models (1-2 layers) never produce start > end,
+        // which LayerSelection rejects.
+        var middleStart = Math.min(third, total - 1);
         var presets = {
           all: null,
           first: { start: 0, end: third - 1 },
-          middle: { start: third, end: Math.min(total - 1, 2 * third - 1) },
+          middle: {
+            start: middleStart,
+            end: Math.max(middleStart, Math.min(total - 1, 2 * third - 1))
+          },
           last: { start: Math.max(0, total - third), end: total - 1 }
         };
         setLayers(presets[chip.dataset.layers]);

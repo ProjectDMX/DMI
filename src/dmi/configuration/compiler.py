@@ -59,13 +59,18 @@ def compile_config(config: DMIConfig, model_context: ModelContext) -> CompiledDM
 
     1. ``select_hook_specs`` -- which *kinds* of observation, via the existing
        selection string interface, including its availability suppression.
-    2. ``filter_by_layers`` -- *where*, if a layer range was given.
+    2. ``hook_belongs_to_layers`` -- *where*, if a layer range was given.
+
+    Both stages are pure: unlike ``filter_by_layers`` (which additionally
+    disables the HookPoints it drops, and therefore belongs to
+    ``attach_model``), nothing here touches the model, so this stays safe to
+    call while authoring against a live model.
 
     PP/TP filtering is intentionally not applied here. It depends on rank
     placement the adapter owns, and ``attach_model`` already applies it after
     selection.
     """
-    from ..hooks.selection import filter_by_layers, select_hook_specs
+    from ..hooks.selection import hook_belongs_to_layers, select_hook_specs
 
     specs = select_hook_specs(
         model_context.specs,
@@ -75,7 +80,10 @@ def compile_config(config: DMIConfig, model_context: ModelContext) -> CompiledDM
 
     layers = config.observations.layers
     if layers is not None:
-        specs = filter_by_layers(specs, layers.start, layers.end)
+        specs = [
+            spec for spec in specs
+            if hook_belongs_to_layers(spec, layers.start, layers.end)
+        ]
 
     return CompiledDMIConfig(
         hook_specs=specs,

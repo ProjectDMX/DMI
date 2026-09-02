@@ -45,12 +45,12 @@ VALID_CONFIG = {
 
 @pytest.fixture
 def client():
-    return TestClient(create_app(DENSE))
+    return TestClient(create_app(DENSE), base_url="http://127.0.0.1")
 
 
 @pytest.fixture
 def moe_client():
-    return TestClient(create_app(MOE))
+    return TestClient(create_app(MOE), base_url="http://127.0.0.1")
 
 
 class TestStaticSurface:
@@ -209,13 +209,13 @@ class TestConfigLoadAndSave:
             (REPO / "tests" / "golden" / "qwen3-attention.yaml").read_text(),
             encoding="utf-8",
         )
-        client = TestClient(create_app(DENSE, target))
+        client = TestClient(create_app(DENSE, target), base_url="http://127.0.0.1")
         payload = client.get("/api/config").json()
         assert payload["config"]["observations"]["layers"] == {"start": 8, "end": 15}
 
     def test_save_writes_to_the_server_side_path(self, tmp_path):
         target = tmp_path / "out.dmi.yaml"
-        client = TestClient(create_app(DENSE, target))
+        client = TestClient(create_app(DENSE, target), base_url="http://127.0.0.1")
         response = client.post("/api/config/save", json={"config": VALID_CONFIG})
         assert response.status_code == 200
         assert response.json()["path"] == str(target)
@@ -226,7 +226,7 @@ class TestConfigLoadAndSave:
         # The browser gets no filesystem access; a path in the body is ignored.
         target = tmp_path / "allowed.yaml"
         attacker = tmp_path / "elsewhere.yaml"
-        client = TestClient(create_app(DENSE, target))
+        client = TestClient(create_app(DENSE, target), base_url="http://127.0.0.1")
         client.post(
             "/api/config/save",
             json={"config": VALID_CONFIG, "path": str(attacker)},
@@ -236,7 +236,7 @@ class TestConfigLoadAndSave:
 
     def test_saved_file_reloads_through_open(self, tmp_path):
         target = tmp_path / "cycle.dmi.yaml"
-        client = TestClient(create_app(DENSE, target))
+        client = TestClient(create_app(DENSE, target), base_url="http://127.0.0.1")
         client.post("/api/config/save", json={"config": VALID_CONFIG})
         reopened = client.post(
             "/api/config/parse", json={"yaml": target.read_text()}
@@ -268,7 +268,7 @@ def _estimate(client, config=None, **body):
 
 
 def test_estimate_returns_a_peak_step_and_the_rank_that_carries_it():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         response = _estimate(client)
 
     assert response.status_code == 200
@@ -279,7 +279,7 @@ def test_estimate_returns_a_peak_step_and_the_rank_that_carries_it():
 
 
 def test_estimate_defaults_the_workload_when_none_is_given():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         response = _estimate(client)
 
     assert response.status_code == 200
@@ -287,7 +287,7 @@ def test_estimate_defaults_the_workload_when_none_is_given():
 
 
 def test_estimate_honours_a_supplied_workload():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         short = _estimate(client, workload={"prompt_tokens": 128}).json()
         long = _estimate(client, workload={"prompt_tokens": 4096}).json()
 
@@ -295,7 +295,7 @@ def test_estimate_honours_a_supplied_workload():
 
 
 def test_estimate_reports_every_rank_under_tensor_parallelism():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         body = _estimate(client, workload={"tensor_parallel_size": 4}).json()
 
     labels = {rank["label"] for rank in body["ranks"]}
@@ -308,7 +308,7 @@ def test_estimate_reports_every_rank_under_tensor_parallelism():
 
 
 def test_estimate_rejects_an_invalid_workload():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         response = _estimate(client, workload={"batch_size": 0})
 
     assert response.status_code == 400
@@ -316,7 +316,7 @@ def test_estimate_rejects_an_invalid_workload():
 
 
 def test_estimate_rejects_an_unknown_dtype():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         response = _estimate(client, workload={"dtype": "float13"})
 
     assert response.status_code == 400
@@ -324,21 +324,21 @@ def test_estimate_rejects_an_unknown_dtype():
 
 
 def test_estimate_rejects_a_malformed_body():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         response = client.post("/api/estimate", json={"nope": 1})
 
     assert response.status_code == 400
 
 
 def test_estimate_omits_ring_fit_when_no_ring_size_is_given():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         body = _estimate(client).json()
 
     assert "ring_fit" not in body
 
 
 def test_estimate_includes_ring_fit_when_a_ring_size_is_given():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         body = _estimate(
             client, ring={"payload_bytes": 4096 * 1024 * 1024}
         ).json()
@@ -348,7 +348,7 @@ def test_estimate_includes_ring_fit_when_a_ring_size_is_given():
 
 
 def test_estimate_flags_a_step_that_will_not_fit_the_ring():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         body = _estimate(client, ring={"payload_bytes": 1024}).json()
 
     assert body["ring_fit"]["fits"] is False
@@ -356,7 +356,7 @@ def test_estimate_flags_a_step_that_will_not_fit_the_ring():
 
 
 def test_estimate_uses_the_smaller_of_payload_and_pinned():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         body = _estimate(
             client,
             ring={
@@ -369,7 +369,7 @@ def test_estimate_uses_the_smaller_of_payload_and_pinned():
 
 
 def test_estimate_rejects_a_zero_ring_size():
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         response = _estimate(client, ring={"payload_bytes": -5})
 
     assert response.status_code == 400
@@ -383,8 +383,71 @@ def test_estimate_matches_the_library_for_the_same_inputs():
     config = parse_config(VALID_CONFIG)
     direct = estimate_config(config, descriptor, Workload(prompt_tokens=512))
 
-    with TestClient(create_app(DENSE)) as client:
+    with TestClient(create_app(DENSE), base_url="http://127.0.0.1") as client:
         body = _estimate(client, workload={"prompt_tokens": 512}).json()
 
     assert body["peak_step_bytes"] == direct.peak_step_bytes
     assert body["decode_step_bytes"] == direct.decode_step_bytes
+
+
+class TestHostValidation:
+    """DNS-rebinding guard: a loopback server answers loopback names only."""
+
+    def test_loopback_hosts_are_served(self, client):
+        assert client.get("/api/model").status_code == 200
+
+    def test_localhost_is_served(self):
+        client = TestClient(create_app(DENSE), base_url="http://localhost")
+        assert client.get("/api/model").status_code == 200
+
+    def test_a_rebound_hostname_is_rejected(self):
+        client = TestClient(
+            create_app(DENSE), base_url="http://rebound.attacker.example"
+        )
+        response = client.get("/api/model")
+        assert response.status_code == 400
+
+    def test_a_rebound_hostname_cannot_save(self, tmp_path):
+        target = tmp_path / "victim.dmi.yaml"
+        client = TestClient(
+            create_app(DENSE, target),
+            base_url="http://rebound.attacker.example",
+        )
+        response = client.post(
+            "/api/config/save", json={"config": VALID_CONFIG}
+        )
+        assert response.status_code == 400
+        assert not target.exists()
+
+    def test_a_non_loopback_bind_serves_any_host(self):
+        # Serving the network is an explicit choice; the valid names cannot
+        # be enumerated, so the Host filter only guards loopback binds.
+        client = TestClient(
+            create_app(DENSE, bind_host="0.0.0.0"),
+            base_url="http://some.internal.name",
+        )
+        assert client.get("/api/model").status_code == 200
+
+
+class TestRelaunch:
+    def test_relaunch_without_config_reloads_the_saved_file(self, tmp_path):
+        """A second `dmi ui MODEL` must reopen what the first session saved,
+        not a blank default that Save would clobber it with."""
+        import shutil
+
+        descriptor = tmp_path / "llama3-8b.yaml"
+        shutil.copyfile(DENSE, descriptor)
+
+        first = TestClient(create_app(descriptor), base_url="http://127.0.0.1")
+        saved_to = Path(
+            first.post(
+                "/api/config/save", json={"config": VALID_CONFIG}
+            ).json()["path"]
+        )
+        assert saved_to.parent == tmp_path
+
+        state = build_state(descriptor)
+        assert state.initial_config is not None
+        assert state.initial_config == normalize_config(
+            parse_config(VALID_CONFIG)
+        )

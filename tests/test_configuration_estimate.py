@@ -511,3 +511,53 @@ def test_estimate_is_immutable():
     assert isinstance(estimate, Estimate)
     with pytest.raises(Exception):
         estimate.peak_step_bytes = 0  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Per-request accounting
+# ---------------------------------------------------------------------------
+
+
+def test_per_request_bytes_are_per_sequence_in_the_packed_convention():
+    single = estimate_config(
+        _config(["resid_pre"]), _descriptor(), _workload(batch_size=1)
+    )
+    batch = estimate_config(
+        _config(["resid_pre"]), _descriptor(), _workload(batch_size=8)
+    )
+
+    assert batch.bytes_per_request == single.bytes_per_request
+
+
+def test_per_request_bytes_are_per_sequence_in_the_batched_convention():
+    """Batched shapes carry the leading batch dimension, so the whole-batch
+    step total divides by batch_size exactly like the packed convention --
+    8 identical sequences must not report 8x the cost of one."""
+    single = estimate_config(
+        _config(["resid_pre"]),
+        _descriptor(),
+        _workload(packed=False, batch_size=1),
+    )
+    batch = estimate_config(
+        _config(["resid_pre"]),
+        _descriptor(),
+        _workload(packed=False, batch_size=8),
+    )
+
+    assert batch.bytes_per_request == single.bytes_per_request
+
+
+def test_aggregate_peak_follows_the_enabled_phases():
+    """The aggregate sums each rank's peak step over whichever phases are
+    enabled; with prefill capture off it is a decode figure, and the field is
+    named for that."""
+    estimate = estimate_config(
+        _config(["resid_pre"], capture_prefill=False),
+        _descriptor(),
+        _workload(prompt_tokens=2048, decode_tokens=128),
+    )
+
+    assert estimate.aggregate_peak_step_bytes == estimate.decode_step_bytes
+    assert estimate_payload(estimate)["aggregate_peak_step_bytes"] == (
+        estimate.decode_step_bytes
+    )

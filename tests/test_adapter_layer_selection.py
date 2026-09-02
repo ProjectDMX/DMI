@@ -257,3 +257,106 @@ def test_attach_config_disables_hooks_the_config_did_not_select():
     for spec in model.specs:
         if spec.hook_type == HOOK_TYPE_Q:
             assert spec.module.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# The shipped concrete adapter must accept the same wiring
+# ---------------------------------------------------------------------------
+
+
+class FakeHFModel(FakeModel):
+    """A FakeModel that also quacks like a Hugging Face model."""
+
+    def __init__(self, num_layers: int = 8) -> None:
+        super().__init__(num_layers=num_layers)
+        from types import SimpleNamespace
+
+        self.config = SimpleNamespace(
+            hidden_size=512,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            vocab_size=32000,
+            intermediate_size=1376,
+        )
+
+
+def test_hf_adapter_forwards_the_layer_range():
+    """attach_config drives the real HuggingFaceAdapter, so its attach_model
+    override must accept and forward ``layers`` -- a stub subclassing
+    BackendAdapter directly would not catch a dropped kwarg."""
+    from dmi.adapters.huggingface.adapter import HuggingFaceAdapter
+
+    adapter = HuggingFaceAdapter(FakeEngine(), "test_model")
+    model = FakeHFModel(num_layers=8)
+
+    adapter.attach_model(
+        model, "resid_pre,q",
+        install_prepare_wrapper=False,
+        layers=LayerSelection(2, 4),
+    )
+
+    assert _layers_of(adapter.active_specs) == {2, 3, 4}
+
+
+def test_attach_config_works_through_the_hf_adapter():
+    from dmi.adapters.huggingface.adapter import HuggingFaceAdapter
+
+    adapter = HuggingFaceAdapter(FakeEngine(), "test_model")
+    model = FakeHFModel(num_layers=8)
+    config = DMIConfig(
+        observations=ObservationConfig(
+            hooks=["resid_pre"], layers=LayerSelection(4, 6)
+        )
+    )
+
+    attach_config(adapter, model, config)
+
+    assert _layers_of(adapter.active_specs) == {4, 5, 6}
+
+
+# ---------------------------------------------------------------------------
+# compile_config stays pure
+# ---------------------------------------------------------------------------
+
+
+def test_compile_config_with_a_layer_range_does_not_touch_the_model():
+    """compile_config answers "what would this select?"; asking must never
+    disable hook points on a live model the way attach_model does."""
+    from dmi.configuration.compiler import ModelContext, compile_config
+
+    adapter, model = _make_adapter(num_layers=8)
+    adapter.attach_model(model, "full")
+    assert all(spec.module.enabled for spec in model.specs)
+
+    config = DMIConfig(
+        observations=ObservationConfig(
+            hooks=["resid_pre"], layers=LayerSelection(2, 4)
+        )
+    )
+    compiled = compile_config(
+        config, ModelContext(specs=model.get_hook_specs())
+    )
+
+    assert compiled.selected_layers == [2, 3, 4]
+    assert all(spec.module.enabled for spec in model.specs), (
+        "compile_config disabled live hook points"
+    )
+
+
+def test_compile_config_accepts_unbound_authoring_time_specs():
+    """Specs without a bound module (authoring time, no model) must compile."""
+    from dmi.configuration.compiler import ModelContext, compile_config
+
+    specs = [
+        HookSpec(hook_type=HOOK_TYPE_RESID_PRE, module=None, layer_no=layer)
+        for layer in range(6)
+    ]
+    config = DMIConfig(
+        observations=ObservationConfig(
+            hooks=["resid_pre"], layers=LayerSelection(1, 2)
+        )
+    )
+
+    compiled = compile_config(config, ModelContext(specs=specs))
+
+    assert compiled.selected_layers == [1, 2]

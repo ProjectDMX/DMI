@@ -139,7 +139,9 @@ class Estimate:
     peak_step_rank: str
     decode_step_bytes: int
     bytes_per_request: int
-    aggregate_prefill_step_bytes: int
+    # Sum of every rank's peak step (prefill or decode, whichever is enabled
+    # and larger) -- the cluster-wide burst, not a prefill-only figure.
+    aggregate_peak_step_bytes: int
     sustained_bytes_per_second: Optional[float]
     bytes_per_day: Optional[float]
     ranks: tuple[RankLoad, ...] = ()
@@ -435,11 +437,12 @@ def estimate_config(
         worst.decode_step_bytes * captured_decode_steps if worst else 0
     )
     per_request = per_request_prefill + per_request_decode
-    # A packed prefill step already covers the whole batch.
-    if workload.packed and workload.batch_size > 1:
+    # A step covers the whole batch in either convention: packed rows share
+    # dim 0, batched shapes carry the leading batch dimension.
+    if workload.batch_size > 1:
         per_request = per_request // workload.batch_size
         assumptions.append(
-            "per-request figures divide the packed batch total by "
+            "per-request figures divide the whole-batch step totals by "
             f"batch_size={workload.batch_size}"
         )
     if schedule.request_stride > 1:
@@ -493,7 +496,7 @@ def estimate_config(
         peak_step_rank=worst.label if worst else "",
         decode_step_bytes=decode_step_bytes,
         bytes_per_request=per_request,
-        aggregate_prefill_step_bytes=aggregate,
+        aggregate_peak_step_bytes=aggregate,
         sustained_bytes_per_second=sustained,
         bytes_per_day=per_day,
         ranks=tuple(ranks),
@@ -558,7 +561,7 @@ def estimate_payload(estimate: Estimate) -> dict:
         "peak_step_rank": estimate.peak_step_rank,
         "decode_step_bytes": estimate.decode_step_bytes,
         "bytes_per_request": estimate.bytes_per_request,
-        "aggregate_prefill_step_bytes": estimate.aggregate_prefill_step_bytes,
+        "aggregate_peak_step_bytes": estimate.aggregate_peak_step_bytes,
         "sustained_bytes_per_second": estimate.sustained_bytes_per_second,
         "bytes_per_day": estimate.bytes_per_day,
         "ranks": [
