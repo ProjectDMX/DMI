@@ -23,10 +23,9 @@ This runs the bundled Llama-3-8B descriptor, picks a free port starting at
 8000, and opens a browser once the server is actually accepting connections.
 Override the model with `make ui MODEL=./Qwen3-8B`.
 
-Installed, it is a normal command:
+With DMI itself installed, it is a normal command:
 
 ```bash
-pip install -e ".[ui]"
 dmi ui ./Qwen3-8B
 ```
 
