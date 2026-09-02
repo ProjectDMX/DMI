@@ -253,6 +253,38 @@ def _drop_everything(client, config) -> None:
     ClickHouseCatalogWriter(client, config).drop_schema()
 
 
+@contextmanager
+def _role_that_cannot_see(client, config, hidden: str):
+    """A real ClickHouse role granted every catalog object except `hidden`.
+
+    Grant filtering is a server behaviour, not a client one: `system.tables`
+    answers each role with only the objects it holds some privilege on, so a
+    missing grant is indistinguishable from a missing object to anything that
+    reads that table. Nothing but a second, restricted connection reproduces
+    it, which is why this lives here and not beside the fakes.
+    """
+    clickhouse_driver = pytest.importorskip("clickhouse_driver")
+    user = f"dmi_visibility_test_{uuid4().hex}"
+    client.execute(f"CREATE USER `{user}` IDENTIFIED WITH no_password")
+    try:
+        for _, suffix in _ALL_OBJECTS:
+            name = f"{config.table_prefix}_{suffix}"
+            if name == f"{config.table_prefix}_{hidden}":
+                continue
+            client.execute(
+                f"GRANT SHOW TABLES, SELECT, INSERT ON "
+                f"`{config.database}`.`{name}` TO `{user}`"
+            )
+        yield clickhouse_driver.Client(
+            host=environ.get("DMI_CLICKHOUSE_HOST", "127.0.0.1"),
+            port=int(environ.get("DMI_CLICKHOUSE_PORT", "9000")),
+            user=user,
+            database=config.database,
+        )
+    finally:
+        client.execute(f"DROP USER IF EXISTS `{user}`")
+
+
 def _install_version_one(client, config) -> None:
     for statement in _VERSION_ONE_SCHEMA:
         client.execute(
@@ -876,6 +908,76 @@ def test_an_install_interrupted_between_two_creates_is_completed():
             indexed_rows=0, indexed_packs=0,
         )
         writer.release_publisher_lease()
+
+
+# --- visibility, which `system.tables` cannot tell apart from absence --------
+
+
+def test_a_role_that_cannot_see_one_object_is_told_to_grant_it_not_to_rebuild():
+    """A missing grant must not be diagnosed as a missing table.
+
+    `system.tables` is grant-filtered per role, so an object this role holds
+    no privilege on simply is not in the answer -- identical, to every reader
+    of that table, to an object that was dropped. Every compatibility verdict
+    is read off that answer, so a healthy stamped catalog was refused with
+    "missing `{prefix}_snapshot_manifest` ... drop ALL of its objects", and an
+    operator who follows that instruction destroys a catalog whose only fault
+    was one absent GRANT. `_require_catalog_visibility` says the true thing,
+    and it must therefore be reached FIRST -- before any verdict can be drawn
+    from a filtered read.
+    """
+    with _server() as (client, config):
+        writer = ClickHouseCatalogWriter(client, config)
+        writer.ensure_schema()
+        # A published row, so this is a live catalog holding data rather than
+        # an unfinished install -- the state whose refusal names a rebuild.
+        writer.acquire_publisher_lease("visibility")
+        writer.publish_snapshot(
+            index_version=1, refs=(), published_at_ns=1,
+            indexed_rows=0, indexed_packs=0,
+        )
+        writer.release_publisher_lease()
+        assert _recorded_version(client, config) == _SCHEMA_VERSION
+
+        with _role_that_cannot_see(
+            client, config, hidden="snapshot_manifest"
+        ) as restricted:
+            # The fixture really does hide exactly one object from this role,
+            # and hides it in the one table every verdict is read from.
+            visible = {
+                row[0]
+                for row in restricted.execute(
+                    "SELECT name FROM system.tables WHERE database = "
+                    "%(database)s AND name LIKE %(pattern)s",
+                    {
+                        "database": config.database,
+                        "pattern": f"{config.table_prefix}\\_%",
+                    },
+                )
+            }
+            assert f"{config.table_prefix}_capture_raw" in visible
+            assert f"{config.table_prefix}_snapshot_manifest" not in visible
+
+            with pytest.raises(CatalogSchemaVersionError) as raised:
+                ClickHouseCatalogWriter(restricted, config).ensure_schema()
+
+        message = str(raised.value)
+        assert "lacks SHOW TABLES" in message
+        assert f"{config.table_prefix}_snapshot_manifest" in message
+        assert "Grant catalog visibility" in message
+        # And emphatically NOT the diagnosis that would have this operator
+        # tear down a catalog that is fine.
+        assert "missing" not in message
+        assert "drop ALL of its objects" not in message
+        assert "CatalogReconciler.rebuild()" not in message
+
+        # The catalog the restricted role could not check is untouched.
+        assert _object_names(client, config) == {
+            f"{config.table_prefix}_{suffix}"
+            for kind, suffix in _ALL_OBJECTS
+            if suffix != "pack_commit_log"
+        }
+        assert _recorded_version(client, config) == _SCHEMA_VERSION
 
 
 def test_the_capture_catalog_ignores_the_native_paths_offload_table():

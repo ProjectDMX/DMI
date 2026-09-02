@@ -747,12 +747,24 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 | a VIEW missing | recreate it; a view is a projection of the tables and holds no rows |
 | any pack inventory identity lacks effective published manifest membership | refuse -- membership is incomplete |
 
-Before any catalog DDL, `ensure_schema` checks object-scoped `SHOW TABLES`
-access for every current and superseded object. After DDL it re-reads
-`system.tables` and requires the complete current object set, with no
-superseded object, before writing the stamp. An empty result caused by hidden
-objects therefore cannot be mistaken for a fresh install, and a partially
-visible catalog cannot be stamped as complete.
+Before any verdict above -- and so before any catalog DDL -- `ensure_schema`
+checks object-scoped `SHOW TABLES` access for every current and superseded
+object. After DDL it re-reads `system.tables` and requires the complete current
+object set, with no superseded object, before writing the stamp. An empty
+result caused by hidden objects therefore cannot be mistaken for a fresh
+install, and a partially visible catalog cannot be stamped as complete.
+
+**"Before any verdict" is the load-bearing half.** `system.tables` is
+grant-filtered per role, so an object this role holds no privilege on is
+absent from the state every row of the table above is read off -- there,
+indistinguishable from an object that was dropped. Checked only before the
+DDL, this check was unreachable for exactly the catalog it exists for:
+measured on 25.12, a healthy stamped catalog whose `{prefix}_snapshot_manifest`
+was merely ungranted was refused as "missing `{prefix}_snapshot_manifest`" with
+the rebuild instruction, telling the operator to drop all ten objects of a
+catalog whose only fault was a missing `GRANT`. The grant probes name objects
+rather than resolving them, so they need neither the database nor the objects
+to exist and can run first on a fresh install too.
 
 **An empty stamp narrows the version; it does not excuse anything else.** The
 last three rows apply whether or not `{prefix}_schema_version` holds a row.

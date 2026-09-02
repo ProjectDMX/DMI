@@ -847,6 +847,45 @@ def test_catalog_visibility_needs_no_database_wide_grant():
     _writer(_ObjectOnlyVisibility()).ensure_schema()
 
 
+def test_an_existing_catalog_hidden_by_one_grant_names_the_grant():
+    """A missing grant is not a missing table, and must not read as one.
+
+    `system.tables` is grant-filtered per role, so an object this role holds no
+    privilege on is absent from the answer every compatibility verdict is read
+    off -- indistinguishable there from an object that was dropped. Verified
+    first, that read refused a healthy stamped catalog as "missing
+    `dmi_snapshot_manifest` ... drop ALL of its objects", so the visibility
+    check has to be reached before any verdict is drawn.
+    """
+
+    class _OneObjectHidden(_Client):
+        def execute(self, query, params=None, **kwargs):
+            if query.startswith("CHECK GRANT SHOW TABLES") and (
+                "dmi_snapshot_manifest" in query
+            ):
+                self.calls.append((query, params, kwargs))
+                return [(0,)]
+            rows = super().execute(query, params, **kwargs)
+            if "system.tables" in query:
+                return [row for row in rows if row[0] != "dmi_snapshot_manifest"]
+            return rows
+
+    # Stamped at this version and holding rows: a live catalog, not an
+    # unfinished install, so nothing else excuses the missing-table verdict.
+    client = _OneObjectHidden(
+        tables=_CURRENT_OBJECTS, schema_version=_SCHEMA_VERSION, data_rows=1
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    assert "lacks SHOW TABLES" in message
+    assert "dmi_snapshot_manifest" in message
+    assert "missing" not in message
+    assert "drop ALL of its objects" not in message
+
+
 def test_a_fresh_install_requires_every_created_object_to_be_visible():
     class _PartialCatalogVisibility(_Client):
         def execute(self, query, params=None, **kwargs):
@@ -918,7 +957,14 @@ def test_a_fresh_install_stamps_the_schema_version_last():
         index for index, item in enumerate(statements)
         if item.startswith("CREATE TABLE")
     )
-    assert statements[1].startswith("CREATE DATABASE")
+    # And the database is the first statement that changes the server at all:
+    # everything before it -- the state read and the grant probes -- is a read.
+    assert next(
+        item
+        for item in statements
+        if item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
+    ).startswith("CREATE DATABASE")
+    assert _past_the_visibility_checks(client)[0].startswith("CREATE DATABASE")
 
 
 def _created_objects(client) -> set[str]:
@@ -943,6 +989,27 @@ def _findings(message: str) -> list[str]:
     return [
         line.strip()[2:] for line in message.splitlines() if line.startswith("  - ")
     ]
+
+
+def _past_the_visibility_checks(client) -> list[str]:
+    """Every statement past the state read, minus the grant probes.
+
+    `ensure_schema` asks `CHECK GRANT SHOW TABLES` for every object it owns,
+    current and superseded, before it draws any conclusion from the state it
+    read: `system.tables` is grant-filtered per role, so an object this role
+    holds no privilege on reads there exactly like one that was dropped, and a
+    verdict formed first refuses a healthy catalog and names a rebuild. The
+    probes are reads and are always issued, so the tests below that pin
+    "nothing else happened on the way to this refusal" state them once here --
+    exactly, in the order `ensure_schema` owns its objects -- rather than
+    repeating ten statements each.
+    """
+    statements = [call[0] for call in client.calls[1:]]
+    assert [item for item in statements if item.startswith("CHECK GRANT")] == [
+        f"CHECK GRANT SHOW TABLES ON `default`.`{name}`"
+        for name in _CURRENT_OBJECTS + ("dmi_pack_commit_log",)
+    ]
+    return [item for item in statements if not item.startswith("CHECK GRANT")]
 
 
 def test_a_version_one_catalog_is_refused_with_the_rebuild_procedure():
@@ -977,7 +1044,7 @@ def test_a_version_one_catalog_is_refused_with_the_rebuild_procedure():
     assert "`default`.`dmi_pack_inventory_raw`" in message
     # Nothing was created, altered or written on the way to the refusal. The
     # only extra statement is the `system.columns` probe the diagnosis reads.
-    assert [call[0] for call in client.calls[1:]] == [
+    assert _past_the_visibility_checks(client) == [
         "SELECT table FROM system.columns WHERE database = %(database)s "
         "AND table IN %(tables)s AND name = 'publish_id'"
     ]
@@ -1135,7 +1202,7 @@ def test_a_lone_version_one_commit_log_is_named_rather_than_misdiagnosed():
     assert "CatalogReconciler.rebuild()" not in message
     assert "carries no schema stamp" not in message
     # Nothing was created or written on the way to the refusal.
-    assert [call[0] for call in client.calls[1:]] == []
+    assert _past_the_visibility_checks(client) == []
 
 
 def test_an_object_of_the_wrong_kind_is_named_rather_than_left_to_the_server():
@@ -1159,7 +1226,7 @@ def test_an_object_of_the_wrong_kind_is_named_rather_than_left_to_the_server():
         "`dmi_capture` is a TABLE (engine MergeTree) where this build creates "
         "a VIEW"
     ) in message
-    assert [call[0] for call in client.calls[1:]] == []
+    assert _past_the_visibility_checks(client) == []
 
 
 def test_an_unstamped_install_of_this_build_is_completed_not_refused():

@@ -150,7 +150,21 @@ class ClickHouseCatalogSchema:
         return f"{_quoted(self.database)}.{_quoted(table)}"
 
     def ensure(self) -> None:
-        fresh = self._verify_compatibility()
+        found = self._catalog_state()
+        # Visibility is required before any VERDICT, not merely before the DDL.
+        # `system.tables` is grant-filtered per role, so an object this role
+        # holds no privilege on is absent from the state above -- there,
+        # indistinguishable from one that was dropped -- and every refusal
+        # below is read off that state. Asked afterwards, this check was
+        # unreachable for exactly the catalog it exists for: a healthy stamped
+        # catalog missing one GRANT was refused as "missing `X` ... drop ALL of
+        # its objects", prescribing the teardown of a catalog whose only fault
+        # was an ungranted object (measured on 25.12). Reading the state first
+        # is safe because reading it refuses nothing, and `CHECK GRANT` names
+        # an object rather than resolving one, so it needs neither the database
+        # nor the objects to exist (also verified on 25.12).
+        self._require_catalog_visibility()
+        fresh = self._verify_compatibility(found)
         database = _quoted(self.database)
         capture_raw = self.qualified(self.capture_raw)
         capture_view = self.qualified(self.capture_view)
@@ -159,8 +173,11 @@ class ClickHouseCatalogSchema:
         watermark = self.qualified(self.watermark)
         manifest = self.qualified(self.manifest)
         self._client.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
-        self._require_catalog_visibility()
         if fresh:
+            # Re-read what looked like nothing at all, now that the database
+            # exists: a second installer that created objects between the two
+            # reads is met with the same refusals as any other catalog rather
+            # than with this build's DDL running over its work.
             self._verify_compatibility()
         self._client.execute(
             f"""CREATE TABLE IF NOT EXISTS {self.qualified(self.schema_table)} (
@@ -277,9 +294,12 @@ pack_id UUID
             )
         self._reject_wrong_kinds(found)
 
-    def _verify_compatibility(self) -> bool:
+    def _verify_compatibility(
+        self, found: dict[str, CatalogObject] | None = None
+    ) -> bool:
         """Returns True when this is a fresh install, i.e. nothing is there."""
-        found = self._catalog_state()
+        if found is None:
+            found = self._catalog_state()
         if not found:
             return True
         self._reject_wrong_kinds(found)
