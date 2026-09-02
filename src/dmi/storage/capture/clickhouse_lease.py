@@ -238,8 +238,14 @@ class ClickHouseLeaseCoordinator:
             return {}
         # insert_quorum_parallel is cleared alongside: ClickHouse's
         # select_sequential_consistency does not work with it, so the quorum
-        # without this buys latency and no guarantee.
-        return {"insert_quorum": quorum, "insert_quorum_parallel": 0}
+        # without this buys latency and no guarantee. The timeout is bounded
+        # for the reason the catalog's copy explains: the default is 600s, and
+        # nothing else caps a lease claim.
+        return {
+            "insert_quorum": quorum,
+            "insert_quorum_parallel": 0,
+            "insert_quorum_timeout": self._config.publish_timeout_ns // 1_000_000,
+        }
 
     @property
     def _qualified_table(self) -> str:

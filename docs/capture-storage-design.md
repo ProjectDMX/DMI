@@ -631,6 +631,31 @@ deliberately not applied to the descriptor and inventory bulk writes: those
 decide nothing, and quorum latency per batch is the cost that makes operators
 turn the whole thing off.
 
+**It is a for-the-life-of-the-catalog setting, not a toggle.** Measured on
+25.12 against two replicas of each protocol table: once a replicated table has
+taken a quorum insert, a later NON-quorum insert into it is invisible to a
+`select_sequential_consistency` read -- the plain read returns two rows and the
+sequential read returns one. Every read-back in this module is a sequential
+read of the writer's own insert, so turning `insert_quorum` off on a catalog
+that had it on leaves the sole-claimant protocols unable to confirm themselves:
+`allocate_version` exhausts its attempts and raises
+`CatalogVersionAllocationError`. That is the safe direction -- loud, not blind
+-- and it is still an outage. Turning it ON mid-life is safe; turning it off
+requires a rebuild.
+
+The same measurement is why `insert_quorum_timeout` is bounded to
+`publish_timeout_ns` rather than left at ClickHouse's 600-second default: the
+fenced publish statements are capped by `max_execution_time`, but a version or
+lease claim is not, so an unreachable replica would otherwise park a claim for
+ten minutes -- twenty times the publish cap and twenty times the lease TTL --
+while the writer believed it was mid-publish. With the bound, an unsatisfiable
+quorum is refused immediately (Code 285, `TOO_FEW_LIVE_REPLICAS`, measured at
+0.0s with one replica detached).
+
+`tests/tools/verify_replicated_quorum.py` drives all of this against two
+replicas and is the only way to exercise it: no CI here runs a replicated
+cluster.
+
 ### Catalog schema versions and rebuild
 
 `{prefix}_schema_version` holds one row naming the schema the catalog was

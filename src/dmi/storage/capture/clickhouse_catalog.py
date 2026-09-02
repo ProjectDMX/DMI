@@ -98,6 +98,18 @@ class ClickHouseCatalogConfig:
     # applied to the descriptor and inventory bulk writes: those decide
     # nothing, and paying quorum latency per batch is the cost that makes
     # operators turn the whole thing off.
+    #
+    # **Set it once, for the life of the catalog.** Measured on 25.12 against
+    # two replicas: once a replicated table has taken a quorum insert, a later
+    # NON-quorum insert into it is invisible to a
+    # ``select_sequential_consistency`` read -- plain read 2 rows, sequential
+    # read 1. Every read-back in this module is a sequential read of the
+    # writer's own insert, so turning this off on a catalog that had it on
+    # leaves the protocols unable to confirm themselves. They fail loudly
+    # (``CatalogVersionAllocationError``, "every candidate version was claimed
+    # by another writer") rather than proceeding blind, which is the safe
+    # direction and still an outage. Turning it ON mid-life is safe; turning it
+    # off requires a rebuild.
     insert_quorum: int | None = None
 
     def __post_init__(self) -> None:
@@ -700,7 +712,20 @@ class ClickHouseCatalogWriter:
         quorum = self._config.insert_quorum
         if quorum is None:
             return {}
-        return {"insert_quorum": quorum, "insert_quorum_parallel": 0}
+        return {
+            "insert_quorum": quorum,
+            "insert_quorum_parallel": 0,
+            # BOUNDED, and this is not a detail: ClickHouse waits
+            # ``insert_quorum_timeout`` for the replicas to acknowledge, and
+            # its default is 600 seconds. The fenced publish statements are
+            # already capped by ``max_execution_time``, but the version and
+            # lease claims are not -- so an unreachable replica would park a
+            # claim for ten minutes, twenty times the publish cap and twenty
+            # times the lease TTL, while the writer believes it is mid-publish.
+            # Capped at the publish timeout, so a quorum that cannot be met
+            # fails on the same clock everything else here does.
+            "insert_quorum_timeout": self._config.publish_timeout_ns // 1_000_000,
+        }
 
     @staticmethod
     def _validate_count(value: object, name: str) -> None:

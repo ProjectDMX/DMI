@@ -357,11 +357,15 @@ def test_reconciling_the_same_bucket_twice_indexes_nothing_new(tmp_path: Path):
 
         after = reader.select(CaptureQuery(tenant_id=tenant, limit=100))
         assert after.capture_ids == before.capture_ids
-        # The replay published a new (empty) version, so the catalog moved on
-        # -- the selection is taken at a later watermark -- without changing
-        # which captures it contains or what the pinned snapshot holds.
-        assert int(after.catalog_watermark) > int(before.catalog_watermark)
-        assert int(catalog.current_watermark()) > int(pinned)
+        # A pass with nothing to index performs NO catalog writes at all, so
+        # the watermark stands still. It used to publish an empty version and
+        # move on, which is what this asserted; that burns a version and, since
+        # only the lease holder may publish, makes a sweep that merely CONFIRMS
+        # a catalog contend for the publisher lease -- a periodic rebuild
+        # running beside the live indexer would hard-fail on every page it has
+        # nothing to say about.
+        assert int(after.catalog_watermark) == int(before.catalog_watermark)
+        assert int(catalog.current_watermark()) == int(pinned)
         assert {
             item.capture_id
             for item in catalog.get_by_ids(
