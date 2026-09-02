@@ -182,8 +182,19 @@ def create_app(
         so the same configuration legitimately has several answers.
         """
         config = _parse(payload)
+        workload_raw = payload.get("workload")
+        # Type-check before defaulting: `or {}` alone would let a falsy
+        # non-mapping such as `workload: []` slip through as "absent" instead
+        # of being reported as the malformed body it is.
+        if workload_raw is None:
+            workload_raw = {}
+        if not isinstance(workload_raw, dict):
+            raise HTTPException(
+                400,
+                f"'workload' must be a mapping, got {type(workload_raw).__name__}.",
+            )
         try:
-            workload = Workload(**(payload.get("workload") or {}))
+            workload = Workload(**workload_raw)
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, f"Invalid workload: {exc}") from exc
 
@@ -253,7 +264,9 @@ def create_app(
         config = _parse(payload)
         try:
             save_config(config, state.save_path)
-        except OSError as exc:
+        except ConfigurationError as exc:
+            # save_config reports filesystem trouble (OSError included) as
+            # ConfigurationError, so that is what actually arrives here.
             raise HTTPException(500, f"Could not write {state.save_path}: {exc}") from exc
         return {"path": str(state.save_path)}
 
