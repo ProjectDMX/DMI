@@ -427,7 +427,15 @@
     updateTimer = setTimeout(refreshOutput, 140);
   }
 
+  // Same stale-response guard as refreshEstimate. Two of these can be in
+  // flight at once -- the debounce shortens the window but does not close it
+  // -- and without a stamp a slow earlier reply paints last, leaving the YAML
+  // preview and Issues tab describing a configuration the user has already
+  // changed away from.
+  var outputRequestId = 0;
+
   async function refreshOutput() {
+    var requestId = (outputRequestId += 1);
     try {
       var results = await Promise.all([
         api("/api/config/serialize", {
@@ -441,9 +449,11 @@
           body: JSON.stringify({ config: state })
         })
       ]);
+      if (requestId !== outputRequestId) return;
       dom["yaml-preview"].textContent = results[0].yaml;
       renderIssues(results[1].issues);
     } catch (error) {
+      if (requestId !== outputRequestId) return;
       dom.status.dataset.state = "invalid";
       dom.status.textContent = "Error";
       renderIssues([{ severity: "error", field: "request", message: error.message }]);
