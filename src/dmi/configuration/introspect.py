@@ -187,7 +187,12 @@ def resolve_descriptor(source: str | Path) -> ModelDescriptor:
     descriptor file is the override for models the extractor cannot read.
     """
     target = Path(source)
-    if target.suffix in _DESCRIPTOR_SUFFIXES and target.exists():
+    if target.suffix in _DESCRIPTOR_SUFFIXES:
+        # A YAML suffix is a file path, never a Hugging Face model id. Say the
+        # file is missing instead of falling through to id resolution, which
+        # would blame a missing `transformers` install for a shell typo.
+        if not target.exists():
+            raise DescriptorError(f"Descriptor {target} does not exist.")
         return load_descriptor(target)
     return describe_model(source)
 

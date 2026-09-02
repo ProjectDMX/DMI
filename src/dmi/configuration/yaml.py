@@ -111,6 +111,26 @@ def config_to_dict(config: DMIConfig) -> dict:
     return document
 
 
+_KNOWN_TOP_LEVEL = ("version", "observations", "schedule", "policy")
+_KNOWN_OBSERVATION_FIELDS = ("hooks", "layers")
+
+
+def _reject_unknown(present, known, where: str) -> None:
+    """Refuse keys this build does not understand.
+
+    Every section is strict, not just ``schedule``. A silently ignored key is
+    the worst outcome for a configuration file: ``observations.layer`` (missing
+    the plural) would parse as "no layer range" and capture every layer, which
+    is a large, quiet payload increase from a file that still reads correctly.
+    """
+    unknown = sorted(set(present) - set(known))
+    if unknown:
+        raise ConfigurationError(
+            f"Unknown field(s) in {where}: {', '.join(unknown)}. "
+            f"Known fields: {', '.join(sorted(known))}."
+        )
+
+
 def parse_config(data: Any) -> DMIConfig:
     """Build a ``DMIConfig`` from an already-parsed document."""
     if data is None:
@@ -120,7 +140,18 @@ def parse_config(data: Any) -> DMIConfig:
             f"Configuration must be a mapping, got {type(data).__name__}."
         )
 
-    version = data.get("version", CONFIG_VERSION)
+    _reject_unknown(data, _KNOWN_TOP_LEVEL, "the configuration")
+
+    # Required, not defaulted. Research configuration files outlive the code
+    # that wrote them, so an unversioned document is refused rather than
+    # assumed to match this build -- defaulting is exactly the guess that
+    # version dispatch exists to avoid.
+    if "version" not in data:
+        raise ConfigurationError(
+            f"Configuration is missing 'version'. Add 'version: "
+            f"{CONFIG_VERSION}'."
+        )
+    version = data["version"]
     # Dispatch on version so files outlive the code that wrote them. When a
     # v2 arrives, branch here rather than teaching one parser both shapes.
     if version != CONFIG_VERSION:
@@ -135,6 +166,7 @@ def _parse_v1(data: dict, version: int) -> DMIConfig:
     observations_raw = data.get("observations") or {}
     if not isinstance(observations_raw, dict):
         raise ConfigurationError("'observations' must be a mapping.")
+    _reject_unknown(observations_raw, _KNOWN_OBSERVATION_FIELDS, "'observations'")
 
     hooks_raw = observations_raw.get("hooks") or []
     if isinstance(hooks_raw, str):
@@ -167,13 +199,9 @@ def _parse_v1(data: dict, version: int) -> DMIConfig:
     schedule_raw = data.get("schedule") or {}
     if not isinstance(schedule_raw, dict):
         raise ConfigurationError("'schedule' must be a mapping.")
-    known_schedule = set(CaptureSchedule.__dataclass_fields__)
-    unknown = sorted(set(schedule_raw) - known_schedule)
-    if unknown:
-        raise ConfigurationError(
-            f"Unknown field(s) in 'schedule': {', '.join(unknown)}. "
-            f"Known fields: {', '.join(sorted(known_schedule))}."
-        )
+    _reject_unknown(
+        schedule_raw, CaptureSchedule.__dataclass_fields__, "'schedule'"
+    )
     try:
         schedule = CaptureSchedule(**schedule_raw)
     except (TypeError, ValueError) as exc:
@@ -227,8 +255,20 @@ def load_config(path: str | Path) -> DMIConfig:
 
 
 def save_config(config: DMIConfig, path: str | Path) -> None:
-    """Write a configuration to disk in canonical form."""
-    Path(path).write_text(dump_config(config), encoding="utf-8")
+    """Write a configuration to disk in canonical form.
+
+    Wraps ``OSError`` the way :func:`load_config` does: both halves of this
+    API report filesystem trouble as ``ConfigurationError``, so the CLI's
+    top-level handler turns a bad path into one clean line rather than a
+    traceback.
+    """
+    target = Path(path)
+    try:
+        target.write_text(dump_config(config), encoding="utf-8")
+    except OSError as exc:
+        raise ConfigurationError(
+            f"Cannot write configuration {target}: {exc}"
+        ) from exc
 
 
 __all__ = [

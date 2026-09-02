@@ -120,15 +120,31 @@ def architecture_payload(descriptor: ModelDescriptor) -> dict:
 
     leftovers = [info for hook_id, info in info_by_id.items() if hook_id not in assigned]
     if leftovers:
-        payload_nodes.append(
-            {
-                "id": "other",
-                "label": "Other observations",
-                "scope": SCOPE_LAYER,
-                "available": any(info.available for info in leftovers),
-                "hooks": [info.to_dict() for info in leftovers],
-            }
-        )
+        # Split by scope rather than assuming per-layer. The renderer draws
+        # layer-scoped nodes inside the "Transformer layer x N" group, so a
+        # global hook landing here with SCOPE_LAYER would look as though it
+        # were captured once per layer and as though the layer range applied
+        # to it.
+        for scope, label in (
+            (SCOPE_LAYER, "Other observations"),
+            (SCOPE_GLOBAL, "Other model-wide observations"),
+        ):
+            in_scope = [
+                info
+                for info in leftovers
+                if (SCOPE_LAYER if info.per_layer else SCOPE_GLOBAL) == scope
+            ]
+            if not in_scope:
+                continue
+            payload_nodes.append(
+                {
+                    "id": "other" if scope == SCOPE_LAYER else "other-global",
+                    "label": label,
+                    "scope": scope,
+                    "available": any(info.available for info in in_scope),
+                    "hooks": [info.to_dict() for info in in_scope],
+                }
+            )
 
     return {
         "architecture": descriptor.model.architecture,

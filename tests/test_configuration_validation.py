@@ -182,6 +182,80 @@ class TestEnsureValid:
         ensure_valid(DMIConfig(observations=ObservationConfig(hooks=["q"])), DENSE)
 
 
+class TestArchitectureFallbackScope:
+    """An unassigned hook must be drawn at its own scope.
+
+    The renderer places every layer-scoped node inside the "Transformer layer
+    x N" group, so a *global* hook landing in the fallback with layer scope
+    would look as though it were captured once per layer, and as though the
+    layer-range control applied to it.
+    """
+
+    def _with_extra_hook(self, monkeypatch, *, per_layer):
+        from dmi.configuration import catalog_adapter
+        from dmi.hooks.catalog import GROUP_OTHER, HOOK_DEFS, PP_ANY, SHAPE_HIDDEN
+
+        newcomer = (
+            98,
+            "hook_unplaced",
+            "unplaced",
+            per_layer,
+            GROUP_OTHER,
+            False,
+            SHAPE_HIDDEN,
+            PP_ANY,
+        )
+        monkeypatch.setattr(
+            catalog_adapter, "HOOK_DEFS", HOOK_DEFS + (newcomer,)
+        )
+        from dmi.configuration.architecture import architecture_payload
+
+        return architecture_payload(_descriptor())["nodes"]
+
+    def _node_holding(self, nodes, hook_id):
+        for node in nodes:
+            if any(hook["id"] == hook_id for hook in node["hooks"]):
+                return node
+        raise AssertionError(f"{hook_id!r} is not reachable from any node")
+
+    def test_an_unassigned_per_layer_hook_is_layer_scoped(self, monkeypatch):
+        nodes = self._with_extra_hook(monkeypatch, per_layer=True)
+
+        node = self._node_holding(nodes, "unplaced")
+        assert node["scope"] == "layer"
+
+    def test_an_unassigned_global_hook_is_global_scoped(self, monkeypatch):
+        nodes = self._with_extra_hook(monkeypatch, per_layer=False)
+
+        node = self._node_holding(nodes, "unplaced")
+        assert node["scope"] == "global"
+
+    def test_fallback_hooks_of_both_scopes_are_separated(self, monkeypatch):
+        """Layer and global leftovers cannot share one node."""
+        from dmi.configuration import catalog_adapter
+        from dmi.hooks.catalog import GROUP_OTHER, HOOK_DEFS, PP_ANY, SHAPE_HIDDEN
+        from dmi.configuration.architecture import architecture_payload
+
+        extras = (
+            (98, "hook_a", "unplaced_layer", True, GROUP_OTHER, False, SHAPE_HIDDEN, PP_ANY),
+            (97, "hook_b", "unplaced_global", False, GROUP_OTHER, False, SHAPE_HIDDEN, PP_ANY),
+        )
+        monkeypatch.setattr(catalog_adapter, "HOOK_DEFS", HOOK_DEFS + extras)
+
+        nodes = architecture_payload(_descriptor())["nodes"]
+
+        layer_node = self._node_holding(nodes, "unplaced_layer")
+        global_node = self._node_holding(nodes, "unplaced_global")
+        assert layer_node["id"] != global_node["id"]
+        assert layer_node["scope"] == "layer"
+        assert global_node["scope"] == "global"
+
+    def test_every_node_scope_is_one_of_the_two_known_values(self, monkeypatch):
+        nodes = self._with_extra_hook(monkeypatch, per_layer=False)
+
+        assert {node["scope"] for node in nodes} <= {"layer", "global"}
+
+
 class TestCatalogAdapter:
     def test_every_catalog_hook_is_described(self):
         assert {info.id for info in describe_hooks()} == set(hook_ids())
