@@ -226,7 +226,6 @@ class DMIConfig:
     version: int
     observations: ObservationConfig
     schedule: CaptureSchedule
-    runtime: RuntimeConfig
     policy: RuntimePolicy | None = None
 ```
 
@@ -240,7 +239,6 @@ hook syntax such as `pattern@8-15` or `pattern[8:15]`.
 class CompiledDMIConfig:
     hook_specs: list[HookSpec]
     schedule: CaptureSchedule
-    runtime: RuntimeConfig
     policy: RuntimePolicy | None
 ```
 
@@ -255,7 +253,6 @@ def compile_config(config, model_context):
     return CompiledDMIConfig(
         hook_specs=specs,
         schedule=config.schedule,
-        runtime=config.runtime,
         policy=config.policy,
     )
 ```

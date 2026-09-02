@@ -12,10 +12,11 @@ dynamic = ["dependencies"]
 [project.optional-dependencies]
 s3 = ["boto3>=1.40,<2"]
 # DMI-configurator. A normal DMI install does not pull in a web framework.
+# JSON only -- the browser reads files itself and posts their contents, so
+# there is no multipart/form-data surface to support.
 ui = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
-    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]
