@@ -305,6 +305,25 @@ def estimate_config(
     assumptions: list[str] = []
     warnings: list[str] = []
 
+    # A range outside the model resolves to nothing, and every per-layer hook
+    # then contributes zero bytes. Zero reads as "free" rather than "selects
+    # nothing", so say which it is. Validation reports the range as an error
+    # separately; this is what the figures themselves have to explain.
+    requested = config.observations.layers
+    if requested is not None:
+        if not layer_set:
+            warnings.append(
+                f"Layer range {requested.start}-{requested.end} selects no "
+                f"layer of this {topology.num_layers}-layer model, so "
+                "per-layer observations contribute nothing to these figures."
+            )
+        elif len(layer_set) < requested.count:
+            warnings.append(
+                f"Layer range {requested.start}-{requested.end} was clipped "
+                f"to the model: {len(layer_set)} of {requested.count} "
+                f"requested layers exist (0-{topology.num_layers - 1})."
+            )
+
     convention = "packed" if workload.packed else "batched"
     assumptions.append(
         f"{convention} tensor convention "
@@ -413,24 +432,33 @@ def estimate_config(
         multiplier = 1 if load.tp_rank == 0 else tp_size - 1
         aggregate += _peak(load) * multiplier
 
-    # Schedule reduction. step_stride thins decode steps; a request has one
-    # prefill step, so stride cannot reliably thin it -- treat prefill as
-    # captured whenever it is enabled, and say so.
-    captured_decode_steps = 0
-    if capture_decode and workload.decode_tokens:
-        captured_decode_steps = max(
-            1, workload.decode_tokens // schedule.step_stride
+    # Sampling is NOT applied, because nothing applies it. `CaptureSchedule`
+    # is authored here and serialized into the YAML, but no shipped adapter
+    # enforces it: `should_capture_step` / `should_capture_request` have no
+    # callers outside `dmi.config`, and no adapter reads
+    # `CompiledDMIConfig.schedule`. Dividing by the stride would promise a
+    # reduction the capture never delivers and under-provision storage by
+    # exactly that factor.
+    #
+    # When schedule enforcement lands, apply the stride here and drop the
+    # warning below -- the two belong together, and the warning is how a
+    # reader finds this code.
+    captured_decode_steps = workload.decode_tokens if capture_decode else 0
+
+    unenforced = [
+        f"{name}={value}"
+        for name, value in (
+            ("step_stride", schedule.step_stride),
+            ("request_stride", schedule.request_stride),
         )
-    if capture_decode and schedule.step_stride > 1:
-        assumptions.append(
-            f"step_stride={schedule.step_stride} thins decode steps to "
-            f"~{captured_decode_steps} of {workload.decode_tokens}"
-        )
-    if capture_prefill and schedule.step_stride > 1:
-        assumptions.append(
-            "prefill counted in full: step_stride gates on a global step "
-            "counter, so it cannot be assumed to skip a request's single "
-            "prefill step"
+        if value > 1
+    ]
+    if unenforced:
+        warnings.append(
+            f"{', '.join(unenforced)} is set but not enforced by any adapter, "
+            "so it does not reduce these figures. Sampling is authored into "
+            "the configuration and ignored at capture time; size for the full "
+            "volume shown here."
         )
 
     # captured_decode_steps is already 0 when decode capture is off.
@@ -449,19 +477,13 @@ def estimate_config(
             "per-request figures divide the whole-batch step totals by "
             f"batch_size={workload.batch_size}"
         )
-    if schedule.request_stride > 1:
-        assumptions.append(
-            f"request_stride={schedule.request_stride} captures one request "
-            f"in {schedule.request_stride}"
-        )
 
     sustained: Optional[float] = None
     per_day: Optional[float] = None
     if workload.decode_steps_per_second > 0:
+        # Not divided by step_stride: see the sampling note above.
         effective_rate = (
-            workload.decode_steps_per_second / schedule.step_stride
-            if capture_decode
-            else 0.0
+            workload.decode_steps_per_second if capture_decode else 0.0
         )
         sustained = decode_step_bytes * effective_rate
         per_day = sustained * SECONDS_PER_DAY

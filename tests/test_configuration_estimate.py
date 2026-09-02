@@ -294,7 +294,14 @@ def test_rank_report_covers_every_pipeline_stage():
 # ---------------------------------------------------------------------------
 
 
-def test_step_stride_thins_the_sustained_rate():
+def test_step_stride_does_not_thin_the_sustained_rate():
+    """This test previously asserted the opposite, and was wrong.
+
+    It encoded the defect: the estimate divided by ``step_stride`` while no
+    adapter enforced the schedule, so it under-reported volume by exactly the
+    stride factor. See ``tests/test_estimate_runtime_fidelity.py`` for the
+    full reproduction suite and the reasoning.
+    """
     dense = estimate_config(
         _config(["resid_pre"], step_stride=1),
         _descriptor(),
@@ -307,7 +314,7 @@ def test_step_stride_thins_the_sustained_rate():
     )
 
     assert strided.sustained_bytes_per_second == pytest.approx(
-        dense.sustained_bytes_per_second / 4
+        dense.sustained_bytes_per_second
     )
 
 
