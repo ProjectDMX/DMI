@@ -268,10 +268,15 @@ class CompiledDMIConfig:
 def compile_config(config, model_context):
     specs = select_hook_specs(
         model_context.specs,
-        ",".join(config.observations.hooks),
+        to_legacy_hook_selection(config.observations),
         cfg=model_context.shape,
     )
-    specs = filter_by_layers(specs, config.observations.layers)
+    layers = config.observations.layers
+    if layers is not None:
+        specs = [
+            spec for spec in specs
+            if hook_belongs_to_layers(spec, layers.start, layers.end)
+        ]
     return CompiledDMIConfig(
         hook_specs=specs,
         schedule=config.schedule,

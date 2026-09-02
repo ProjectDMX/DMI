@@ -171,13 +171,28 @@ def parse_config(data: Any) -> DMIConfig:
     return _parse_v1(data, version)
 
 
+def _section(data: dict, key: str, where: str) -> dict:
+    """Read a required-to-be-mapping section, defaulting only true absence.
+
+    An explicit ``is None`` check, not ``or {}``: a falsy-but-wrong value
+    (``observations: []``, ``schedule: ""``) must be refused as malformed, not
+    silently defaulted into a configuration that never says what it means.
+    """
+    section = data.get(key)
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ConfigurationError(f"{where} must be a mapping.")
+    return section
+
+
 def _parse_v1(data: dict, version: int) -> DMIConfig:
-    observations_raw = data.get("observations") or {}
-    if not isinstance(observations_raw, dict):
-        raise ConfigurationError("'observations' must be a mapping.")
+    observations_raw = _section(data, "observations", "'observations'")
     _reject_unknown(observations_raw, _KNOWN_OBSERVATION_FIELDS, "'observations'")
 
-    hooks_raw = observations_raw.get("hooks") or []
+    hooks_raw = observations_raw.get("hooks")
+    if hooks_raw is None:
+        hooks_raw = []
     if isinstance(hooks_raw, str):
         raise ConfigurationError(
             "'observations.hooks' must be a list, not a comma-separated "
@@ -205,9 +220,7 @@ def _parse_v1(data: dict, version: int) -> DMIConfig:
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(f"Invalid layer range: {exc}") from exc
 
-    schedule_raw = data.get("schedule") or {}
-    if not isinstance(schedule_raw, dict):
-        raise ConfigurationError("'schedule' must be a mapping.")
+    schedule_raw = _section(data, "schedule", "'schedule'")
     _reject_unknown(
         schedule_raw, CaptureSchedule.__dataclass_fields__, "'schedule'"
     )
