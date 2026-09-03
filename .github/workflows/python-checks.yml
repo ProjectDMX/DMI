@@ -51,6 +51,20 @@ jobs:
         # and that ordering is what the lease fence resolves a contested head
         # with. A floating tag would move that out from under the fakes.
         image: clickhouse/clickhouse-server:25.12
+        env:
+          # Without this the image's entrypoint writes a users.d override
+          # restricting `default` to ::1 and 127.0.0.1 -- it says so in the
+          # container log: "neither CLICKHOUSE_USER nor CLICKHOUSE_PASSWORD is
+          # set, disabling network access for user 'default'". The health check
+          # below still passes, because clickhouse-client runs INSIDE the
+          # container and so connects from localhost, while the suites connect
+          # from the runner host and got `Code: 516, Authentication failed` on
+          # all 61 tests. Skipping the entrypoint's user setup leaves `default`
+          # as the stock config has it: no password, no network restriction.
+          # The suites take only host/port/database from the environment and
+          # have no way to present credentials, so opening `default` up is the
+          # fix rather than creating a user.
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
         ports:
           - 9000:9000
         options: >-
