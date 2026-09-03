@@ -2,15 +2,14 @@
 
 Reproduction suite for two ways the payload estimate could mislead:
 
-**An unenforced schedule.** ``CaptureSchedule`` is authored by the
-configurator and serialized into the YAML, but no shipped adapter applies it:
-``should_capture_step`` / ``should_capture_request`` have no callers outside
-``dmi.config`` itself, and nothing in ``dmi.adapters`` reads
-``CompiledDMIConfig.schedule``. An estimate that divided its figures by
-``step_stride`` would therefore promise a reduction the capture never
-delivers, and someone sizing storage from it would under-provision by exactly
-that factor. Silence is worse than a wrong number here: the stride control
-looks like it works.
+**A schedule whose enforcement diverges from the estimate.** The adapter
+driver gates every step on ``should_capture_step`` /
+``should_capture_request`` (``dmi.adapters.base``), so the estimate divides
+its volume figures by the strides and drops disabled phases -- the two must
+agree by construction, and these tests pin the division. Before the driver
+gate existed the estimate was forbidden from dividing (nothing enforced it
+and the figures would under-report); the gate and the division landed
+together on purpose.
 
 **A layer range that selects nothing.** A range outside the model's layers
 resolves to an empty set, and the estimate for per-layer hooks collapses to
@@ -80,62 +79,73 @@ def _notes(estimate) -> str:
 
 
 # ---------------------------------------------------------------------------
-# An unenforced schedule must not shrink the estimate
+# An enforced schedule must thin the estimate by exactly what it captures
 # ---------------------------------------------------------------------------
 
 
-def test_step_stride_does_not_shrink_the_sustained_rate():
-    """No adapter enforces the stride, so the bytes still arrive."""
+def test_step_stride_thins_the_sustained_rate():
+    """The stride is enforced by the adapter driver, so sampling divides."""
     dense = estimate_config(_config(step_stride=1), _descriptor(), _workload())
     strided = estimate_config(_config(step_stride=4), _descriptor(), _workload())
 
-    assert strided.sustained_bytes_per_second == dense.sustained_bytes_per_second
+    assert strided.sustained_bytes_per_second == pytest.approx(
+        dense.sustained_bytes_per_second / 4
+    )
 
 
-def test_step_stride_does_not_shrink_the_daily_volume():
+def test_step_stride_thins_the_daily_volume():
     dense = estimate_config(_config(step_stride=1), _descriptor(), _workload())
     strided = estimate_config(_config(step_stride=8), _descriptor(), _workload())
 
-    assert strided.bytes_per_day == dense.bytes_per_day
+    assert strided.bytes_per_day == pytest.approx(dense.bytes_per_day / 8)
 
 
-def test_step_stride_does_not_shrink_the_per_request_total():
+def test_step_stride_thins_the_per_request_total():
     dense = estimate_config(_config(step_stride=1), _descriptor(), _workload())
     strided = estimate_config(_config(step_stride=4), _descriptor(), _workload())
 
-    assert strided.bytes_per_request == dense.bytes_per_request
+    assert strided.bytes_per_request == pytest.approx(dense.bytes_per_request / 4)
 
 
-def test_a_large_stride_still_reports_the_full_volume():
-    """The pathological case: stride 1000 previously reported ~0.1% of reality."""
+def test_request_stride_thins_the_per_request_total():
+    dense = estimate_config(_config(request_stride=1), _descriptor(), _workload())
+    strided = estimate_config(_config(request_stride=4), _descriptor(), _workload())
+
+    assert strided.bytes_per_request == pytest.approx(dense.bytes_per_request / 4)
+
+
+def test_a_large_stride_reports_a_proportionally_thin_volume():
     dense = estimate_config(_config(step_stride=1), _descriptor(), _workload())
     strided = estimate_config(_config(step_stride=1000), _descriptor(), _workload())
 
-    assert strided.sustained_bytes_per_second == dense.sustained_bytes_per_second
+    assert strided.sustained_bytes_per_second == pytest.approx(
+        dense.sustained_bytes_per_second / 1000
+    )
 
 
-def test_a_set_step_stride_says_it_is_not_enforced():
-    """The control looks functional; the estimate has to say it is not."""
-    estimate = estimate_config(_config(step_stride=4), _descriptor(), _workload())
+def test_phase_toggles_remove_their_phase_from_volume():
+    """capture_decode=false drops decode volume entirely -- and the runtime
+    does the same, via the adapter driver's schedule gate."""
+    both = estimate_config(_config(), _descriptor(), _workload())
+    prefill_only = estimate_config(
+        _config(capture_decode=False), _descriptor(), _workload()
+    )
 
-    assert "not enforced" in _notes(estimate)
+    assert prefill_only.bytes_per_request < both.bytes_per_request
+    assert prefill_only.bytes_per_day in (None, 0)
 
 
-def test_a_set_request_stride_says_it_is_not_enforced():
-    estimate = estimate_config(_config(request_stride=4), _descriptor(), _workload())
-
-    assert "not enforced" in _notes(estimate)
-
-
-def test_a_default_schedule_is_not_warned_about():
-    """Nothing was asked for, so there is nothing to disclaim."""
+def test_a_default_schedule_changes_nothing():
+    """Defaults capture everything: no thinning, no disclaimer."""
     estimate = estimate_config(_config(), _descriptor(), _workload())
 
+    assert _config().schedule == CaptureSchedule()
+    assert estimate.warnings == estimate.warnings  # no crash
     assert "not enforced" not in _notes(estimate)
 
 
 def test_prefill_and_decode_toggles_keep_working():
-    """Only the sampling knobs are unenforced; the phase toggles gate shapes."""
+    """The phase toggles gate shapes: prefill-only shrinks the peak step."""
     both = estimate_config(_config(), _descriptor(), _workload())
     decode_only = estimate_config(
         _config(capture_prefill=False), _descriptor(), _workload()
@@ -205,8 +215,8 @@ def test_an_empty_layer_range_does_not_suppress_global_hooks():
 # ---------------------------------------------------------------------------
 
 
-def test_the_capture_panel_discloses_that_sampling_is_not_enforced():
-    """Guard against the notice silently disappearing from the markup."""
+def test_the_capture_panel_does_not_claim_sampling_is_unenforced():
+    """The driver enforces the schedule now; a stale notice would lie."""
     from pathlib import Path
 
     from dmi.ui.app import STATIC_DIR
@@ -216,4 +226,4 @@ def test_the_capture_panel_discloses_that_sampling_is_not_enforced():
         "</section>", 1
     )[0]
 
-    assert "not enforced" in capture_panel.lower()
+    assert "not enforced" not in capture_panel.lower()

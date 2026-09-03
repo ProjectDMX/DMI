@@ -154,6 +154,37 @@ class ModelTopology:
     vocab_size: int = 0
 
     def __post_init__(self) -> None:
+        # Exact integer types first: YAML floats and bools pass every
+        # magnitude comparison here and then explode downstream -- a
+        # num_layers of 1.5 raises TypeError inside range(), a True reads as
+        # layer count 1.
+        integral = (
+            "num_layers",
+            "hidden_size",
+            "num_attention_heads",
+            "num_kv_heads",
+            "intermediate_size",
+            "num_experts",
+            "top_k",
+            "vocab_size",
+        )
+        for name in integral:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    f"{name} must be an integer, got {type(value).__name__} "
+                    f"({value!r})."
+                )
+        if self.head_dim is not None:
+            if isinstance(self.head_dim, bool) or not isinstance(self.head_dim, int):
+                raise TypeError(
+                    f"head_dim must be an integer, got "
+                    f"{type(self.head_dim).__name__} ({self.head_dim!r})."
+                )
+            if self.head_dim < 1:
+                raise ValueError(
+                    f"head_dim must be >= 1, got {self.head_dim}."
+                )
         if self.num_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {self.num_layers}.")
         if self.hidden_size < 1:

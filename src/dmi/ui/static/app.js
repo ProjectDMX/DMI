@@ -493,9 +493,15 @@
   }
 
   function applyState(next) {
-    state = Object.assign(defaultState(), next);
+    // Section-by-section, not one shallow assign: defaultState() carries a
+    // balanced policy, and a shallow merge would inject it into a config
+    // that deliberately has none -- load then save would change the file's
+    // meaning and break the advertised round-trip. Policy comes from next
+    // only, so its absence stays absent.
+    state = Object.assign({}, next, { version: 1 });
     state.schedule = Object.assign(defaultState().schedule, next.schedule || {});
     state.observations = Object.assign({ hooks: [], layers: null }, next.observations || {});
+    state.policy = next.policy ? { objective: next.policy.objective } : undefined;
     renderSchedule();
     renderPolicy();
     renderLayers();
@@ -655,7 +661,16 @@
   function bindActions() {
     dom["btn-copy"].addEventListener("click", async function () {
       try {
-        await navigator.clipboard.writeText(dom["yaml-preview"].textContent);
+        // Serialize the CURRENT state, not the preview element: edits reach
+        // the preview only after debounce + request latency, so a Copy made
+        // right after a change would otherwise export the previous
+        // configuration with a success toast.
+        var payload = await api("/api/config/serialize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ config: state })
+        });
+        await navigator.clipboard.writeText(payload.yaml);
         toast("YAML copied to clipboard");
       } catch (error) {
         toast("Could not copy: " + error.message);

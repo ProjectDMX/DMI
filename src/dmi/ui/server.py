@@ -110,6 +110,7 @@ def serve(
         ) from exc
 
     app = create_app(source, config_path, bind_host=host)
+    token = app.state.launch_token
     ui = app.state.ui
     bound_port = resolve_port(host, port)
     url = f"http://{host}:{bound_port}"
@@ -126,6 +127,11 @@ def serve(
     ]
     if port is None and bound_port != DEFAULT_PORT:
         lines.append(f"  (port {DEFAULT_PORT} was busy)")
+    if token is not None:
+        # The mutating endpoints demand this. Printed exactly once, here: a
+        # network bind is an operator choice, and whoever made it holds this
+        # output.
+        lines.append(f"  token      : {token}  (send as X-DMI-Token on writes)")
     lines.append("  Ctrl-C to stop.")
     # Flushed explicitly: this banner carries the URL, and a piped or
     # make-wrapped stdout would otherwise hold it until the server exits.

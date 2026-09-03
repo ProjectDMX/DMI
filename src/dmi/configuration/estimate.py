@@ -89,6 +89,14 @@ class Workload:
     packed: bool = True
     dtype: str = "float16"
     decode_steps_per_second: float = 0.0
+    # Physical KV-cache width when the backend preallocates one (HF
+    # StaticCache: max_cache_len). The runtime sizes hooks off the cache it
+    # is handed, so a StaticCache prefill attention payload is
+    # [H, prompt, cache_max_len], NOT [H, prompt, prompt] -- with prompt 128
+    # and cache 2176 that is 17x this figure without the override. None
+    # means a dynamically grown cache (kv = current context length), which
+    # is the smaller shape and is called out in the warnings.
+    cache_max_len: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -115,6 +123,10 @@ class Workload:
             raise ValueError(
                 "decode_steps_per_second must be >= 0, got "
                 f"{self.decode_steps_per_second}."
+            )
+        if self.cache_max_len is not None and self.cache_max_len < 1:
+            raise ValueError(
+                f"cache_max_len must be >= 1, got {self.cache_max_len}."
             )
 
 
@@ -246,8 +258,18 @@ def _step_bytes(
         tp_rank=tp_rank,
     )
     model_elem = _element_size(workload.dtype)
-    # ring.py overrides only token_ids' dtype, from the framework's input_ids.
-    token_ids_elem = _element_size("int64")
+    # The runtime reserves per the dtype each framework actually writes: HF
+    # input_ids are int64; the pinned vLLM integration carries int32 token
+    # and top-k ids and float32 top-k weights. Everything else rides the
+    # model dtype in both conventions.
+    if workload.packed:
+        _dtype_overrides = {
+            "token_ids": "int32",
+            "topk_ids": "int32",
+            "topk_weights": "float32",
+        }
+    else:
+        _dtype_overrides = {"token_ids": "int64"}
 
     stage_layers = set(_stage_layers(
         topology.num_layers, workload.pipeline_parallel_size, stage
@@ -278,7 +300,7 @@ def _step_bytes(
         if not shape:
             continue
 
-        elem = token_ids_elem if short == "token_ids" else model_elem
+        elem = _element_size(_dtype_overrides.get(short, workload.dtype))
         nbytes = elem
         for dim in shape:
             nbytes *= dim
@@ -354,9 +376,28 @@ def estimate_config(
             )
 
     # Attention weights span the whole KV window. Decode peaks at the end of
-    # generation, which is the step that has to fit.
-    prefill_kv = workload.prompt_tokens
-    decode_kv = workload.prompt_tokens + workload.decode_tokens
+    # generation, which is the step that has to fit. A preallocated cache
+    # (StaticCache) is physically wide from the first prefill step, so its
+    # prefill attention shapes use the full cache length.
+    prefill_kv = (
+        workload.cache_max_len
+        if workload.cache_max_len is not None
+        else workload.prompt_tokens
+    )
+    decode_kv = (
+        workload.cache_max_len
+        if workload.cache_max_len is not None
+        else workload.prompt_tokens + workload.decode_tokens
+    )
+    if workload.cache_max_len is None and set(hooks) & _ATTN_WEIGHT_HOOKS:
+        warnings.append(
+            "Prefill attention shapes assume a dynamically grown cache. With "
+            "a preallocated cache (HF StaticCache) the KV window is "
+            "max_cache_len from the first step: set workload.cache_max_len "
+            f"to about {workload.prompt_tokens + workload.decode_tokens} "
+            "(prompt + decode) for that case, or these prefill figures are "
+            "low."
+        )
 
     selected_attn_weights = sorted(set(hooks) & _ATTN_WEIGHT_HOOKS)
     if selected_attn_weights and workload.packed:
@@ -431,44 +472,33 @@ def estimate_config(
     for load in ranks:
         multiplier = 1 if load.tp_rank == 0 else tp_size - 1
         aggregate += _peak(load) * multiplier
-
-    # Sampling is NOT applied, because nothing applies it. `CaptureSchedule`
-    # is authored here and serialized into the YAML, but no shipped adapter
-    # enforces it: `should_capture_step` / `should_capture_request` have no
-    # callers outside `dmi.config`, and no adapter reads
-    # `CompiledDMIConfig.schedule`. Dividing by the stride would promise a
-    # reduction the capture never delivers and under-provision storage by
-    # exactly that factor.
-    #
-    # When schedule enforcement lands, apply the stride here and drop the
-    # warning below -- the two belong together, and the warning is how a
-    # reader finds this code.
+    # VOLUME figures are sums over every real rank: every PP stage and every
+    # TP shard emits its own records, and the storage they land in sees the
+    # total. The peak-pressure rank decides ring capacity only -- TP/PP
+    # splitting divides per-rank pressure, not what is captured overall.
+    # Probes stand in for the tp ranks they represent, so a non-zero probe
+    # counts (tp_size - 1) times, exactly as the aggregate does.
     captured_decode_steps = workload.decode_tokens if capture_decode else 0
 
-    unenforced = [
-        f"{name}={value}"
-        for name, value in (
-            ("step_stride", schedule.step_stride),
-            ("request_stride", schedule.request_stride),
-        )
-        if value > 1
-    ]
-    if unenforced:
-        warnings.append(
-            f"{', '.join(unenforced)} is set but not enforced by any adapter, "
-            "so it does not reduce these figures. Sampling is authored into "
-            "the configuration and ignored at capture time; size for the full "
-            "volume shown here."
-        )
+    def _rank_volume(load: RankLoad) -> int:
+        volume = 0
+        if capture_prefill:
+            volume += load.prefill_step_bytes
+        if capture_decode:
+            volume += load.decode_step_bytes * captured_decode_steps
+        return volume
 
-    # captured_decode_steps is already 0 when decode capture is off.
-    per_request_prefill = (
-        worst.prefill_step_bytes if (worst and capture_prefill) else 0
-    )
-    per_request_decode = (
-        worst.decode_step_bytes * captured_decode_steps if worst else 0
-    )
-    per_request = per_request_prefill + per_request_decode
+    total_volume = 0
+    for load in ranks:
+        multiplier = 1 if load.tp_rank == 0 else tp_size - 1
+        total_volume += _rank_volume(load) * multiplier
+
+    # Step/request sampling IS enforced (the adapter driver gates on
+    # should_capture_step / should_capture_request), so the captured volume
+    # divides by both strides.
+    sampling_divisor = max(1, schedule.step_stride) * max(1, schedule.request_stride)
+
+    per_request = total_volume // sampling_divisor
     # A step covers the whole batch in either convention: packed rows share
     # dim 0, batched shapes carry the leading batch dimension.
     if workload.batch_size > 1:
@@ -480,16 +510,22 @@ def estimate_config(
 
     sustained: Optional[float] = None
     per_day: Optional[float] = None
-    if workload.decode_steps_per_second > 0:
-        # Not divided by step_stride: see the sampling note above.
-        effective_rate = (
-            workload.decode_steps_per_second if capture_decode else 0.0
+    if workload.decode_steps_per_second > 0 and capture_decode:
+        # Sustained decode volume across all ranks, with sampling applied.
+        decode_volume = sum(
+            load.decode_step_bytes * (1 if load.tp_rank == 0 else tp_size - 1)
+            for load in ranks
         )
-        sustained = decode_step_bytes * effective_rate
+        effective_rate = workload.decode_steps_per_second / max(1, schedule.step_stride)
+        sustained = decode_volume * effective_rate
         per_day = sustained * SECONDS_PER_DAY
         assumptions.append(
             "sustained rate covers decode only; prefill arrives in bursts "
             "that the peak-step figure bounds"
+        )
+    elif workload.decode_steps_per_second > 0:
+        assumptions.append(
+            "sustained rate is zero because decode capture is disabled"
         )
     else:
         warnings.append(

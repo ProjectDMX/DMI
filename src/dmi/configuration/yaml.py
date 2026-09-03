@@ -113,6 +113,21 @@ def config_to_dict(config: DMIConfig) -> dict:
 
 _KNOWN_TOP_LEVEL = ("version", "observations", "schedule", "policy")
 _KNOWN_OBSERVATION_FIELDS = ("hooks", "layers")
+_KNOWN_LAYERS_FIELDS = ("start", "end")
+_KNOWN_POLICY_FIELDS = ("objective",)
+
+# CaptureSchedule fields by the exact type the boundary requires. Booleans
+# and floats are not integers here: YAML `true` must not become layer 1 and
+# `2.9` must not become layer 2.
+_INT_SCHEDULE_FIELDS = (
+    "step_stride",
+    "step_offset",
+    "warmup_steps",
+    "request_stride",
+    "request_offset",
+    "warmup_requests",
+)
+_BOOL_SCHEDULE_FIELDS = ("capture_prefill", "capture_decode")
 
 
 def _reject_unknown(present, known, where: str) -> None:
@@ -129,6 +144,39 @@ def _reject_unknown(present, known, where: str) -> None:
             f"Unknown field(s) in {where}: {', '.join(unknown)}. "
             f"Known fields: {', '.join(sorted(known))}."
         )
+
+
+def _exact_int(value: Any, where: str) -> int:
+    """An integer, and nothing int()-shaped: no floats, no bools, no strings."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigurationError(
+            f"{where} must be an integer, got {type(value).__name__} "
+            f"({value!r})."
+        )
+    return value
+
+
+def _exact_bool(value: Any, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigurationError(
+            f"{where} must be a boolean, got {type(value).__name__} "
+            f"({value!r})."
+        )
+    return value
+
+
+def _typed_schedule(schedule_raw: dict) -> CaptureSchedule:
+    """Validate every scalar at the boundary, then construct."""
+    typed: dict[str, Any] = {}
+    for name, value in schedule_raw.items():
+        if name in _INT_SCHEDULE_FIELDS:
+            typed[name] = _exact_int(value, f"schedule.{name}")
+        elif name in _BOOL_SCHEDULE_FIELDS:
+            typed[name] = _exact_bool(value, f"schedule.{name}")
+    try:
+        return CaptureSchedule(**typed)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(f"Invalid schedule: {exc}") from exc
 
 
 def parse_config(data: Any) -> DMIConfig:
@@ -208,6 +256,7 @@ def _parse_v1(data: dict, version: int) -> DMIConfig:
     if layers_raw is not None:
         if not isinstance(layers_raw, dict):
             raise ConfigurationError("'observations.layers' must be a mapping.")
+        _reject_unknown(layers_raw, _KNOWN_LAYERS_FIELDS, "'observations.layers'")
         missing = [key for key in ("start", "end") if layers_raw.get(key) is None]
         if missing:
             raise ConfigurationError(
@@ -215,25 +264,23 @@ def _parse_v1(data: dict, version: int) -> DMIConfig:
             )
         try:
             layers = LayerSelection(
-                start=int(layers_raw["start"]), end=int(layers_raw["end"])
+                start=_exact_int(layers_raw["start"], "observations.layers.start"),
+                end=_exact_int(layers_raw["end"], "observations.layers.end"),
             )
-        except (TypeError, ValueError) as exc:
+        except ValueError as exc:
             raise ConfigurationError(f"Invalid layer range: {exc}") from exc
-
     schedule_raw = _section(data, "schedule", "'schedule'")
     _reject_unknown(
         schedule_raw, CaptureSchedule.__dataclass_fields__, "'schedule'"
     )
-    try:
-        schedule = CaptureSchedule(**schedule_raw)
-    except (TypeError, ValueError) as exc:
-        raise ConfigurationError(f"Invalid schedule: {exc}") from exc
+    schedule = _typed_schedule(schedule_raw)
 
     policy = None
     policy_raw = data.get("policy")
     if policy_raw is not None:
         if not isinstance(policy_raw, dict):
             raise ConfigurationError("'policy' must be a mapping.")
+        _reject_unknown(policy_raw, _KNOWN_POLICY_FIELDS, "'policy'")
         objective = policy_raw.get("objective")
         if objective is not None:
             try:
