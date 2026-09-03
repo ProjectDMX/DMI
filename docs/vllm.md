@@ -19,20 +19,18 @@ make -C native -j
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
 
-DMI supports vLLM's V1 model runner only. Set this before importing or starting
-vLLM:
-
-```bash
-export VLLM_USE_V2_MODEL_RUNNER=0
-```
+DMI supports both vLLM 0.27.1 GPU model runners. Use vLLM's normal
+architecture-dependent default, set `VLLM_USE_V2_MODEL_RUNNER=1` to require
+V2, or set it to `0` to require V1. V2 speculative decoding is not yet
+supported and is rejected before CUDA initialization.
 
 The integration fails before device initialization when it detects an
 unsupported runner, version, architecture, or parallel mode. See the
-versioned integration's [model support list](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/v0.27.1-r2/README.md#model-support)
+integration's [model support list](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/main/README.md#model-support)
 for available model families and their qualification status.
 
 The exact vLLM behavior assumed by this release is documented in the
-[vLLM contract](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/v0.27.1-r2/docs/vllm_contract.md).
+[vLLM contract](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/main/docs/vllm_contract.md).
 
 ## Offline API
 
@@ -119,7 +117,6 @@ Online serving needs both the model-registration plugin and the opt-in DMI
 finalization endpoint. Setting `VLLM_PLUGINS` is an allowlist, so include both:
 
 ```bash
-export VLLM_USE_V2_MODEL_RUNNER=0
 export VLLM_PLUGINS=dmi_models,dmi_stop_monitoring
 
 vllm serve Qwen/Qwen3-8B \
