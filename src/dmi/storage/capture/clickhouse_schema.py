@@ -338,6 +338,7 @@ pack_id UUID
                 "is not a repair: surviving inventory would skip their packs. "
                 + self.rebuild_instruction()
             )
+        self._reject_a_wrong_descriptor_sort_key(found, stamp)
         if self._inventory_without_membership():
             raise CatalogSchemaVersionError(
                 f"catalog `{self.database}`.`{self.prefix}_*` lists one or more "
@@ -363,6 +364,41 @@ pack_id UUID
             for name, engine, sorting_key in rows
             if text(name) in wanted
         }
+
+    def _reject_a_wrong_descriptor_sort_key(
+        self, found: dict[str, CatalogObject], stamp: str
+    ) -> None:
+        """The stamp is not evidence about the table standing next to it.
+
+        Every other sort-key check lived on the UNSTAMPED path, so a catalog
+        that says this version was taken at its word about the one table whose
+        key this branch changed. A partial restore is enough to separate the
+        two -- `{prefix}_capture_raw` recovered from a pre-`(store_id,
+        pack_id)` backup beside a surviving stamp -- and from there nothing
+        refuses it, `CREATE TABLE IF NOT EXISTS` cannot alter it, and
+        ReplacingMergeTree goes back to collapsing two packs' rows for one
+        capture on the next merge. `_catalog_state()` already reads
+        `sorting_key`; this is the comparison it was read for.
+
+        Only reached once the table is known present: a missing one is either
+        the unfinished install handled above or already refused there, and in
+        both cases the DDL creates it on this build's key.
+        """
+        descriptor = found.get(self.capture_raw)
+        required = ", ".join(CAPTURE_TABLE_ORDER)
+        if descriptor is None or _key_columns(descriptor.sorting_key) == _key_columns(
+            required
+        ):
+            return
+        raise CatalogSchemaVersionError(
+            f"catalog `{self.database}`.`{self.prefix}_*` {stamp} but "
+            f"`{self.capture_raw}` has ORDER BY ({descriptor.sorting_key}) "
+            f"where this build requires ORDER BY ({required}). The stamp "
+            "describes the build that wrote it, not the table beside it, and "
+            "`CREATE TABLE IF NOT EXISTS` cannot alter a live sort key: left "
+            "in place, a merge collapses two packs' rows for one capture. "
+            + self.rebuild_instruction()
+        )
 
     def _reject_wrong_kinds(self, found: dict[str, CatalogObject]) -> None:
         wrong = [

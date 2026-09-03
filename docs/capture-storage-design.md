@@ -734,12 +734,13 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 | State found | Outcome |
 |---|---|
 | no catalog objects at all, with object visibility confirmed | fresh install: create everything, stamp the current version |
-| version table stamped at the current version, all objects present | proceed; the DDL is idempotent |
+| version table stamped at the current version, all objects present, descriptor sort key this build's | proceed; the DDL is idempotent |
 | version table present, no row | an install of this build that died before stamping: rerun the DDL, then stamp -- *after* the last three rows below, which an empty stamp does not skip |
 | only superseded objects (`{prefix}_pack_commit_log`) | refuse -- naming that object and saying to drop it; there is nothing to rebuild |
 | an object present under the wrong kind (a table where a view belongs, or the reverse) | refuse -- naming the object and its engine |
 | catalog objects present, no version table | refuse -- unstamped, with the differences read off `system.tables` / `system.columns` |
 | stamped at any other version | refuse -- a newer writer owns this catalog, or an older one this build cannot upgrade |
+| stamped at the current version, but `{prefix}_capture_raw` carries any other `ORDER BY` | refuse -- the stamp describes the build that wrote it, not the table beside it, and `CREATE TABLE IF NOT EXISTS` cannot alter a live sort key |
 | a superseded object (`{prefix}_pack_commit_log`) standing BESIDE this build's own | refuse -- an earlier build has been writing this prefix |
 | a TABLE missing, and some data table holds rows | refuse -- partially dropped |
 | a TABLE missing, and every data table is empty | complete it: rerun the DDL |

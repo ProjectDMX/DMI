@@ -600,8 +600,12 @@ def _reject_a_foreign_tenant(ref: PackRef, records: tuple[_IndexedRecord, ...]) 
     encoded = _tenant_segment(ref.object_key)
     if encoded is None:
         return
-    for item in records:
-        tenant = item.metadata.tenant_id
+    # Distinct tenants, not records: a well-formed pack carries one, so this
+    # is a single encode rather than one per record. Not hoisted out of the
+    # loop altogether, because a pack holding two tenants is precisely what
+    # this refuses -- every tenant present is still compared, in the order
+    # they appear so the refusal names the same one every time.
+    for tenant in dict.fromkeys(item.metadata.tenant_id for item in records):
         if encoded != key_component(tenant):
             raise PackIntegrityError(
                 f"pack {ref.pack_id} at {ref.object_key!r} carries a record "

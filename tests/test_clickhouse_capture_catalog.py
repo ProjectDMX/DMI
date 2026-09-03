@@ -1050,6 +1050,48 @@ def test_a_version_one_catalog_is_refused_with_the_rebuild_procedure():
     ]
 
 
+def test_a_stamped_catalog_with_the_wrong_descriptor_sort_key_is_refused():
+    """The stamp is not evidence about the table it stands next to.
+
+    Every check on the descriptor sort key sat inside `_unstamped_diagnosis`,
+    i.e. on the path taken only when the stamp table is ABSENT. Reach
+    `ensure_schema()` with the stamp present and saying this version, and the
+    sort key was never looked at -- though `_catalog_state()` already reads
+    `sorting_key` for exactly this comparison.
+
+    A partial restore is enough to get there: `{prefix}_capture_raw` recovered
+    from a pre-`(store_id, pack_id)` backup beside a surviving stamp. Nothing
+    refuses it, `CREATE TABLE IF NOT EXISTS` cannot alter it, and the
+    descriptor table this branch exists to protect goes back to a key on which
+    ReplacingMergeTree collapses two packs' rows for one capture into one --
+    silently, on the next merge.
+    """
+    client = _Client(
+        tables=_CURRENT_OBJECTS,
+        schema_version=_SCHEMA_VERSION,
+        data_rows=1,
+        sort_key=_VERSION_ONE_SORT_KEY,
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    # Named as this catalog's own state and as what this build requires, the
+    # way every other refusal here names both sides.
+    assert _VERSION_ONE_SORT_KEY in message
+    assert _CURRENT_SORT_KEY in message
+    assert "CatalogReconciler.rebuild()" in message
+    # And refused before the DDL, like every other incompatibility: a
+    # `CREATE ... IF NOT EXISTS` pass over this catalog would report success
+    # while leaving the wrong key in place.
+    assert not [
+        item
+        for item, *_ in client.calls
+        if item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
+    ]
+
+
 def test_an_unstamped_catalog_is_not_told_its_sort_key_is_wrong_when_it_is_not():
     """Defect A: the refusal that named two facts neither of which was true.
 

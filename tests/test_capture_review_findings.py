@@ -421,6 +421,33 @@ def test_a_pack_under_its_own_tenants_prefix_is_accepted(tmp_path: Path):
     assert [item.metadata.tenant_id for item in descriptors] == ["tenant-a"]
 
 
+def test_a_pack_mixing_two_tenants_is_refused_on_the_one_that_does_not_match(
+    tmp_path: Path,
+):
+    """A pack is checked per tenant present, not per pack.
+
+    Nothing about a pack read back OUT of a bucket guarantees it holds one
+    tenant -- that is the writer's convention, and a forger is under no
+    obligation to follow it. So the comparison cannot be lifted to a single
+    tenant read off the first record: a pack whose first record matches the
+    key and whose second carries the victim's `tenant_id` would then be
+    admitted whole, which is the forgery this refuses with extra steps.
+    """
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed(
+        _record(_metadata(tenant_id="tenant-a")),
+        _record(_metadata(tenant_id="attacker", capture_id="capture-b")),
+    )
+    ref = store.put(
+        sealed,
+        "v1/tenant=tenant-a/date=2026-09-01/session=s/rank=0/"
+        f"{PACK_ID}.dmi-pack",
+    )
+
+    with pytest.raises(PackIntegrityError, match="tenant 'attacker'"):
+        PackIndex.from_store(store, ref).descriptors()
+
+
 def test_a_tenant_too_long_for_a_key_segment_still_binds(tmp_path: Path):
     """`key_component` digests an identifier too long for a segment.
 

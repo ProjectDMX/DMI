@@ -119,10 +119,6 @@ class ClickHouseCatalogConfig:
             )
 
 
-def _inline_chunks(items: list[PackIdentity]):
-    return inline_chunks(items, item_bytes=inline_tuple_bytes)
-
-
 class ClickHouseCatalogWriter:
     def __init__(
         self, client: ClickHouseClient, config: ClickHouseCatalogConfig | None = None
