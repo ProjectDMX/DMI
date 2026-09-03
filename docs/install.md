@@ -49,6 +49,20 @@ cd DMI
 git submodule update --init --recursive
 ```
 
+`.gitmodules` pins HTTPS URLs deliberately: it is the read path every user and
+every piece of automation inherits, and an HTTPS clone of these repositories
+needs no key setup. To use SSH instead, rewrite the remotes on your own machine
+rather than editing `.gitmodules` -- the rewrite applies to the superproject and
+every submodule, including nested ones, and survives a re-clone:
+
+```bash
+git config --global url."git@github.com:".insteadOf https://github.com/
+```
+
+If you already have a checkout and change either the URLs or that config, run
+`git submodule sync --recursive` once: `.git/config` and `.git/modules/*/config`
+keep whatever URL they were cloned with, so a plain `git pull` will not adopt it.
+
 Expected submodule paths:
 
 - `third_party/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`, `llama_p`)

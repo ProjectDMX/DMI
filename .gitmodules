@@ -1,12 +1,12 @@
 [submodule "third_party/transformers"]
 	path = third_party/transformers
-	url = git@github.com:ProjectDMX/transformers-DMI.git
+	url = https://github.com/ProjectDMX/transformers-DMI.git
 [submodule "third_party/clickhouse-cpp"]
 	path = third_party/clickhouse-cpp
-	url = git@github.com:ClickHouse/clickhouse-cpp.git
+	url = https://github.com/ClickHouse/clickhouse-cpp.git
 [submodule "third_party/vllm-integration"]
 	path = third_party/vllm-integration
-	url = git@github.com:ProjectDMX/DMI-vLLM-Integration.git
+	url = https://github.com/ProjectDMX/DMI-vLLM-Integration.git
 [submodule "third_party/DMI-Megatron-Integration"]
 	path = third_party/DMI-Megatron-Integration
-	url = git@github.com:ProjectDMX/DMI-Megatron-Integration.git
+	url = https://github.com/ProjectDMX/DMI-Megatron-Integration.git
