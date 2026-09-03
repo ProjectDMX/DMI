@@ -588,6 +588,7 @@ class HuggingFaceAdapter(BackendAdapter):
             kv_dim=kv_dim,
             logits_to_keep=logits_to_keep,
             token_ids_dtype=token_ids_dtype,
+            phase="prefill" if is_prefill else "decode",
         )
 
     # --- manual entry for generate_greedy --------------------------------

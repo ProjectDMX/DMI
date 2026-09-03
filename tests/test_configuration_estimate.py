@@ -111,13 +111,18 @@ def test_global_hook_is_counted_once_not_per_layer():
     assert estimate.peak_step_bytes == 1 * VOCAB * FP16
 
 
-def test_token_ids_uses_int64_not_the_model_dtype():
-    """ring.py overrides token_ids' dtype from the framework's input_ids."""
-    estimate = estimate_config(
+def test_token_ids_matches_the_framework_dtype():
+    """The runtime reserves what the framework writes: vLLM (packed) token
+    ids are int32, HF generate() (batched) input_ids are int64."""
+    packed = estimate_config(
         _config(["token_ids"]), _descriptor(), _workload()
     )
+    batched = estimate_config(
+        _config(["token_ids"]), _descriptor(), _workload(packed=False)
+    )
 
-    assert estimate.peak_step_bytes == 128 * INT64
+    assert packed.peak_step_bytes == 128 * 4
+    assert batched.peak_step_bytes == 128 * INT64
 
 
 def test_layer_range_does_not_reduce_a_global_hook():
@@ -258,7 +263,9 @@ def test_pp_last_hook_lands_on_the_final_stage():
 
 def test_pp_first_hook_lands_on_the_first_stage():
     estimate = estimate_config(
-        _config(["token_ids"]), _descriptor(), _workload(pipeline_parallel_size=2)
+        _config(["token_ids"]),
+        _descriptor(),
+        _workload(pipeline_parallel_size=2, packed=False),
     )
 
     by_stage = {load.pp_stage: load for load in estimate.ranks}
@@ -294,14 +301,9 @@ def test_rank_report_covers_every_pipeline_stage():
 # ---------------------------------------------------------------------------
 
 
-def test_step_stride_does_not_thin_the_sustained_rate():
-    """This test previously asserted the opposite, and was wrong.
-
-    It encoded the defect: the estimate divided by ``step_stride`` while no
-    adapter enforced the schedule, so it under-reported volume by exactly the
-    stride factor. See ``tests/test_estimate_runtime_fidelity.py`` for the
-    full reproduction suite and the reasoning.
-    """
+def test_step_stride_thins_the_sustained_rate():
+    """The stride IS enforced: the adapter driver gates on it, so sampling
+    fewer steps divides the sustained volume by exactly the stride."""
     dense = estimate_config(
         _config(["resid_pre"], step_stride=1),
         _descriptor(),
@@ -314,7 +316,7 @@ def test_step_stride_does_not_thin_the_sustained_rate():
     )
 
     assert strided.sustained_bytes_per_second == pytest.approx(
-        dense.sustained_bytes_per_second
+        dense.sustained_bytes_per_second / 4
     )
 
 

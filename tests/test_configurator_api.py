@@ -469,3 +469,170 @@ class TestRelaunch:
         assert state.initial_config == normalize_config(
             parse_config(VALID_CONFIG)
         )
+
+
+# ---------------------------------------------------------------------------
+# Blocking finding 3919326709: a non-loopback bind serves an unauthenticated
+# file-writing API to every reachable peer. Mutating endpoints must demand a
+# per-launch token whenever the server is bound beyond loopback.
+# ---------------------------------------------------------------------------
+
+
+class TestNetworkBindRequiresToken:
+    def _network_app(self):
+        return create_app(DENSE, bind_host="0.0.0.0")
+
+    def test_create_app_mints_a_token_for_non_loopback_binds(self):
+        app = self._network_app()
+        token = app.state.launch_token
+        assert token, "a network bind must mint a token to print at startup"
+
+    def test_loopback_bind_mints_no_token(self):
+        app = create_app(DENSE, bind_host="127.0.0.1")
+        assert app.state.launch_token is None, (
+            "loopback needs no token and must not print one"
+        )
+
+    def test_save_without_token_is_refused_on_a_network_bind(self):
+        app = self._network_app()
+        with TestClient(app, base_url="http://0.0.0.0") as client:
+            response = client.post("/api/config/save", json={"config": VALID_CONFIG})
+            assert response.status_code == 401
+
+    def test_save_with_wrong_token_is_refused(self):
+        app = self._network_app()
+        with TestClient(app, base_url="http://0.0.0.0") as client:
+            response = client.post(
+                "/api/config/save",
+                json={"config": VALID_CONFIG},
+                headers={"X-DMI-Token": "not-the-token"},
+            )
+            assert response.status_code == 401
+
+    def test_save_with_the_token_writes(self, tmp_path):
+        app = create_app(DENSE, tmp_path / "out.dmi.yaml", bind_host="0.0.0.0")
+        with TestClient(app, base_url="http://0.0.0.0") as client:
+            response = client.post(
+                "/api/config/save",
+                json={"config": VALID_CONFIG},
+                headers={"X-DMI-Token": app.state.launch_token},
+            )
+            assert response.status_code == 200
+
+    def test_token_gates_every_mutating_endpoint(self):
+        app = self._network_app()
+        with TestClient(app, base_url="http://0.0.0.0") as client:
+            for method, path, body in [
+                ("post", "/api/config/save", {"config": VALID_CONFIG}),
+                ("post", "/api/config/parse", {"yaml": "version: 1"}),
+                ("post", "/api/validate", {"config": VALID_CONFIG}),
+                ("post", "/api/estimate", {"config": VALID_CONFIG}),
+            ]:
+                response = getattr(client, method)(path, json=body)
+                assert response.status_code == 401, (method, path)
+
+    def test_read_endpoints_stay_open_on_a_network_bind(self):
+        app = self._network_app()
+        with TestClient(app, base_url="http://0.0.0.0") as client:
+            assert client.get("/api/model").status_code == 200
+            assert client.get("/api/catalog").status_code == 200
+            assert client.get("/").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Blocking finding 3919326705: a successful save left `GET /api/config`
+# serving the launch-time config, so a refresh restored stale YAML and a
+# second Save overwrote the just-saved file with it.
+# ---------------------------------------------------------------------------
+
+
+class TestSaveRefreshesReloadState:
+    def test_saved_config_is_what_a_refresh_gets(self, tmp_path):
+        target = tmp_path / "out.dmi.yaml"
+        client = TestClient(create_app(DENSE, target), base_url="http://127.0.0.1")
+
+        client.post("/api/config/save", json={"config": VALID_CONFIG})
+        payload = client.get("/api/config").json()
+
+        assert payload["config"] == config_to_dict(parse_config(VALID_CONFIG)), (
+            "a refresh after Save must return the saved configuration, not "
+            "the launch-time one"
+        )
+
+    def test_second_save_round_trips_through_a_refresh(self, tmp_path):
+        target = tmp_path / "out.dmi.yaml"
+        client = TestClient(create_app(DENSE, target), base_url="http://127.0.0.1")
+
+        first = {"version": 1, "observations": {"hooks": ["q"]}}
+        second = {"version": 1, "observations": {"hooks": ["k"], "layers": {"start": 1, "end": 2}}}
+        client.post("/api/config/save", json={"config": first})
+        client.post("/api/config/save", json={"config": second})
+        reloaded = client.get("/api/config").json()["config"]
+
+        # The pre-fix failure mode: refresh serves the LAUNCH config, and a
+        # client that then saves it overwrites B with A.
+        assert reloaded["observations"]["hooks"] == ["k"]
+        saved = load_config(target)
+        assert [h for h in saved.observations.hooks] == ["k"]
+
+    def test_failed_save_does_not_touch_the_reload_state(self, tmp_path, monkeypatch):
+        import dmi.ui.app as mod
+
+        app = create_app(DENSE, tmp_path / "fresh.yaml")
+        established = {"done": False}
+
+        real_save = mod.save_config
+
+        def save_once_then_fail(config, path):
+            if not established["done"]:
+                established["done"] = True
+                return real_save(config, path)
+            raise mod.ConfigurationError("disk on fire")
+
+        monkeypatch.setattr(mod, "save_config", save_once_then_fail)
+
+        with TestClient(app, base_url="http://127.0.0.1") as client:
+            assert client.post("/api/config/save", json={"config": VALID_CONFIG}).status_code == 200
+            response = client.post("/api/config/save", json={"config": VALID_CONFIG})
+            assert response.status_code == 500
+            payload = client.get("/api/config").json()
+            # The failed second save must not publish itself as the reload state.
+            assert payload["config"] == config_to_dict(parse_config(VALID_CONFIG))
+
+
+# ---------------------------------------------------------------------------
+# Blocking finding 3919326712: Save only parsed the document, so an empty
+# hook set or out-of-range layers was persisted with a success response even
+# though /api/validate calls it invalid.
+# ---------------------------------------------------------------------------
+
+
+class TestSaveValidatesAgainstTheModel:
+    def test_save_of_an_invalid_config_is_a_400(self, tmp_path):
+        target = tmp_path / "out.dmi.yaml"
+        client = TestClient(create_app(DENSE, target), base_url="http://127.0.0.1")
+        invalid = {"version": 1, "observations": {"hooks": []}}
+
+        response = client.post("/api/config/save", json={"config": invalid})
+
+        assert response.status_code == 400
+        assert not target.exists(), "nothing may be written for an invalid config"
+
+    def test_save_names_the_validation_issues(self, tmp_path):
+        client = TestClient(
+            create_app(DENSE, tmp_path / "out.dmi.yaml"), base_url="http://127.0.0.1"
+        )
+        out_of_range = {
+            "version": 1,
+            "observations": {"hooks": ["q"], "layers": {"start": 999, "end": 1000}},
+        }
+        response = client.post("/api/config/save", json={"config": out_of_range})
+        assert response.status_code == 400
+        assert "999" in response.json()["detail"] or "layer" in response.json()["detail"].lower()
+
+    def test_save_of_a_valid_config_still_writes(self, tmp_path):
+        target = tmp_path / "out.dmi.yaml"
+        client = TestClient(create_app(DENSE, target), base_url="http://127.0.0.1")
+        response = client.post("/api/config/save", json={"config": VALID_CONFIG})
+        assert response.status_code == 200
+        assert target.exists()

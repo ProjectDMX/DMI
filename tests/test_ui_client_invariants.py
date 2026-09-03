@@ -126,3 +126,67 @@ def test_every_repeatable_fetch_path_is_covered_by_these_guards():
         f"{sorted(RENDER_PATHS)}. Add a stale-response guard to any new one "
         "and list it in RENDER_PATHS."
     )
+
+
+# ---------------------------------------------------------------------------
+# Blocking-adjacent findings on the client: policy-less YAML must stay
+# policy-less through load/save (3919326729), and Copy must not export a
+# stale preview (3919326715). Same text-level mechanism assertion as above:
+# no JS runner exists in this repo, so presence is what CI can verify.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_state_preserves_policy_absence():
+    """`Object.assign(defaultState(), next)` keeps defaultState's balanced
+    policy when next.policy is absent -- a policy-less file silently gained
+    one, and saving it changed its meaning."""
+    source = _app_js()
+
+    assert not re.search(
+        r"state\s*=\s*Object\.assign\(defaultState\(\),\s*next\)", source
+    ), "applyState must not shallow-merge next over a default that carries a policy"
+
+
+def test_apply_state_sets_policy_from_next_only():
+    source = _app_js()
+    body = _plain_function_body(source, "applyState")
+
+    assert re.search(r"state\.policy\s*=.*next\.policy", body), (
+        "applyState must set policy from next explicitly (undefined stays "
+        "undefined) rather than inheriting the default policy"
+    )
+
+
+def _plain_function_body(source: str, name: str) -> str:
+    """Brace-matched body of one top-level (non-async) function."""
+    start = source.index(f"function {name}(")
+    open_brace = source.index("{", start)
+    depth = 0
+    for index in range(open_brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[open_brace : index + 1]
+    raise AssertionError(f"unbalanced braces in {name}")
+
+
+def test_copy_serializes_the_current_state_not_the_preview():
+    """Edits reach the preview only after debounce + request latency; a Copy
+    that reads the preview can export the previous configuration."""
+    source = _app_js()
+    body = _function_body(source, "btnCopyHandler") if "btnCopyHandler" in source else None
+
+    # The handler is inline in bindActions; find the copy listener.
+    bind_actions = _plain_function_body(source, "bindActions")
+    copy_start = bind_actions.index('"btn-copy"')
+    copy_slice = bind_actions[copy_start : copy_start + 900]
+
+    assert re.search(r"/api/config/serialize", copy_slice), (
+        "the Copy handler must serialize the current state server-side, not "
+        "copy the possibly-stale preview text"
+    )
+    assert not re.search(
+        r"writeText\(dom\[.yaml-preview.\]", copy_slice
+    ), "the Copy handler must not read the preview element directly"

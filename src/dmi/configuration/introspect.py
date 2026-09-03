@@ -54,6 +54,67 @@ def _slug(model_id: str) -> str:
     return tail.lower().replace("_", "-").replace(" ", "-")
 
 
+# Model families that are NOT causal decoder-only transformers, by the
+# ``model_type`` the HF config carries. ``is_encoder_decoder == False`` does
+# not imply a decoder: BERT is bidirectional, ViT has no causal LM head at
+# all, and both were previously labeled decoder_transformer and rendered with
+# decoder observations. Matching is prefix-based so the family variants
+# (`bert`, `bert-generation`, `vit_mae`, ...) are covered without listing
+# every one.
+_KNOWN_NON_DECODER_MODEL_TYPES = (
+    "bert",
+    "albert",
+    "distilbert",
+    "roberta",
+    "electra",
+    "vit",
+    "deit",
+    "beit",
+    "clip",
+    "siglip",
+    "swin",
+    "convnext",
+    "resnet",
+    "timm",
+    "whisper",
+    "wav2vec2",
+    "hubert",
+    "speecht5",
+    "t5",
+    "longt5",
+)
+
+
+def _reject_known_non_decoder(hf_config: Any, model_id: str) -> None:
+    """Refuse config shapes DMI-configurator v1 cannot observe correctly.
+
+    Only ``decoder_transformer`` is supported. A model_type known to name
+    something else -- masked LMs, encoders, vision backbones, audio models --
+    is refused even though its attention geometry would parse, because a
+    descriptor built from it would promise observations the model cannot
+    produce in the shapes DMI expects.
+    """
+    model_type = getattr(hf_config, "model_type", None)
+    if isinstance(model_type, str):
+        normalized = model_type.lower()
+        for family in _KNOWN_NON_DECODER_MODEL_TYPES:
+            if normalized == family or normalized.startswith(family + "_"):
+                raise DescriptorError(
+                    f"{model_id!r} is a {model_type!r} model, which is not a "
+                    "causal decoder-only transformer. DMI-configurator v1 "
+                    "supports decoder_transformer only."
+                )
+    architectures = getattr(hf_config, "architectures", None) or []
+    for architecture in architectures:
+        name = str(architecture).lower()
+        if "forencoding" in name or name.endswith("for_masked_lm"):
+            raise DescriptorError(
+                f"{model_id!r} declares {architecture!r}, which is not a "
+                "causal decoder-only transformer. DMI-configurator v1 "
+                "supports decoder_transformer only."
+            )
+
+
 def descriptor_from_hf_config(
     hf_config: Any,
     model_id: str,
@@ -74,6 +135,7 @@ def descriptor_from_hf_config(
             f"{model_id!r} is an encoder-decoder model. DMI-configurator v1 "
             f"supports decoder_transformer only."
         )
+    _reject_known_non_decoder(hf_config, model_id)
 
     shape = make_model_shape_from_hf_config(hf_config)
     if shape is None:

@@ -10,6 +10,7 @@ import pytest
 from dmi.config import CaptureSchedule
 from dmi.configuration import (
     CompiledDMIConfig,
+    ConfigValidationError,
     DMIConfig,
     LayerSelection,
     ModelContext,
@@ -182,8 +183,8 @@ class TestCompileConfig:
         assert compiled.policy is RuntimePolicy.PERFORMANCE
 
     def test_model_shape_suppresses_unavailable_hooks_at_compile_time(self):
-        # The same suppression the UI showed at design time, now applied
-        # against the live shape config.
+        # A dense model simply does not carry a router_logits spec; asking
+        # for one is refused rather than silently compiling to less.
         descriptor = load_descriptor(
             "examples/model_descriptors/llama3-8b.yaml"
         )
@@ -191,11 +192,11 @@ class TestCompileConfig:
         config = DMIConfig(
             observations=ObservationConfig(hooks=["q", "router_logits"])
         )
-        compiled = compile_config(
-            config,
-            ModelContext(specs=specs, shape=to_model_shape_config(descriptor.topology)),
-        )
-        assert {spec.hook_type for spec in compiled.hook_specs} == {HOOK_TYPE_Q}
+        with pytest.raises(ConfigValidationError, match="router_logits"):
+            compile_config(
+                config,
+                ModelContext(specs=specs, shape=to_model_shape_config(descriptor.topology)),
+            )
 
 
 class TestEndToEndIntegration:

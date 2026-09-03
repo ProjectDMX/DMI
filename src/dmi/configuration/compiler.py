@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 from ..config import CaptureSchedule
 from .compatibility import to_legacy_hook_selection
+from .errors import ConfigurationError
 from .schema import DMIConfig, RuntimePolicy
 
 
@@ -85,11 +86,52 @@ def compile_config(config: DMIConfig, model_context: ModelContext) -> CompiledDM
             if hook_belongs_to_layers(spec, layers.start, layers.end)
         ]
 
+    _reject_requested_hooks_that_cannot_fire(config, specs)
+
     return CompiledDMIConfig(
         hook_specs=specs,
         schedule=config.schedule,
         policy=config.policy,
     )
+
+
+def _reject_requested_hooks_that_cannot_fire(
+    config: DMIConfig, specs: list
+) -> None:
+    """Refuse a selection the live model cannot satisfy.
+
+    Topology-only availability (what the descriptor claims) can disagree with
+    what the attached model actually exposes: a decoder Llama carries no
+    ``pos_embed`` or ``mlp_post`` spec even when the descriptor marks them
+    available. Selection then returns zero specs for the request and nothing
+    anywhere complains -- 'valid' would certify captures that never fire.
+    The live spec list is the executable truth, so it decides: a requested
+    hook type absent from ``specs`` raises, naming the hook.
+    """
+    from ..hooks.catalog import HOOK_DEFS
+    from .errors import ConfigValidationError
+    from .validation import SEVERITY_ERROR, Issue
+
+    id_by_short = {short: hid for hid, _act, short, *_rest in HOOK_DEFS}
+    surviving = {spec.hook_type for spec in specs}
+    missing = [
+        short
+        for short in dict.fromkeys(config.observations.hooks)
+        if short in id_by_short and id_by_short[short] not in surviving
+    ]
+    if missing:
+        raise ConfigValidationError(
+            [
+                Issue(
+                    SEVERITY_ERROR,
+                    f"observations.hooks.{short}",
+                    f"{short!r} does not match any hook the attached model "
+                    "exposes, so it can never fire. Remove it or select an "
+                    "observation the model produces.",
+                )
+                for short in missing
+            ]
+        )
 
 
 def attach_config(adapter, model, config: DMIConfig) -> None:
@@ -126,10 +168,41 @@ def attach_config(adapter, model, config: DMIConfig) -> None:
     if config.observations.layers is not None:
         kwargs["layers"] = config.observations.layers
 
+    if kwargs and not _accepts_layers(adapter):
+        # The pinned vLLM integration is exactly this shape. A bare TypeError
+        # from inside attach_model names nothing; say here what the keyword
+        # means, which artifact carries the gap, and what resolves it.
+        raise ConfigurationError(
+            f"{type(adapter).__name__}.attach_model does not accept a "
+            "`layers` keyword, so this configuration's layer range "
+            f"{config.observations.layers.start}-"
+            f"{config.observations.layers.end} cannot be applied: a range "
+            "silently dropped would supersede captures with the unfiltered "
+            "pack. Update the adapter integration to a revision that accepts "
+            "attach_config(..., LayerSelection(...)), or clear "
+            "observations.layers in the configuration."
+        )
+
     adapter.attach_model(
         model,
         to_legacy_hook_selection(config.observations),
         **kwargs,
+    )
+
+
+def _accepts_layers(adapter) -> bool:
+    """Can this adapter's ``attach_model`` take a ``layers`` keyword?"""
+    import inspect
+
+    try:
+        parameters = inspect.signature(adapter.attach_model).parameters
+    except (TypeError, ValueError):
+        return False
+    if "layers" in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
     )
 
 

@@ -10,17 +10,20 @@ one descriptor and one optional configuration path for its lifetime.
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from ..configuration import (
+    ConfigValidationError,
     ConfigurationError,
     DMIConfig,
     ModelDescriptor,
     Workload,
     catalog_payload,
     check_ring_fit,
+    ensure_valid,
     resolve_descriptor,
     config_to_dict,
     dump_config,
@@ -106,19 +109,25 @@ def create_app(
     source: str | Path,
     config_path: Optional[str | Path] = None,
     bind_host: str = "127.0.0.1",
-):
+) -> Any:
     """Build the FastAPI application.
 
     ``bind_host`` is the address the server will listen on. For a loopback
     bind (the default), requests whose ``Host`` header is not a loopback name
     are rejected: a DNS-rebinding page resolves its own hostname to 127.0.0.1
     and would otherwise be same-origin for the file-writing endpoints. A
-    non-loopback bind is an explicit choice to serve the network, where the
-    valid names cannot be enumerated, so no Host filter is applied.
+    non-loopback bind is an explicit choice to serve the network, and a Host
+    allowlist is not authentication -- so the app then mints a per-launch
+    token and demands it on every non-read endpoint. The token is returned
+    alongside the app so the server can print it exactly once; without it,
+    any reachable peer could overwrite the configured file as the server user.
+
+    The token, if any, is on ``app.state.launch_token`` for the server to
+    print exactly once at startup; ``None`` for a loopback bind.
     """
     try:
-        from fastapi import FastAPI, HTTPException
-        from fastapi.responses import FileResponse
+        from fastapi import FastAPI, HTTPException, Request
+        from fastapi.responses import FileResponse, JSONResponse
         from fastapi.staticfiles import StaticFiles
         from starlette.middleware.trustedhost import TrustedHostMiddleware
     except ImportError as exc:  # pragma: no cover - exercised by install state
@@ -131,6 +140,34 @@ def create_app(
         app.add_middleware(
             TrustedHostMiddleware, allowed_hosts=list(_LOOPBACK_HOSTS)
         )
+        app.state.launch_token = None
+    else:
+        app.state.launch_token = secrets.token_urlsafe(24)
+
+        @app.middleware("http")
+        async def _require_launch_token(request: Request, call_next):
+            # Read-only surface stays open (the landing page, the model and
+            # catalog descriptions). Everything else demands the token; the
+            # browser itself does not send it -- a network deployment is
+            # driven with curl or a reverse proxy that injects the header.
+            if request.method in ("GET", "HEAD", "OPTIONS"):
+                return await call_next(request)
+            if request.headers.get("X-DMI-Token") != app.state.launch_token:
+                # Raised in the middleware, so returned as a response directly:
+                # an HTTPException raised inside BaseHTTPMiddleware dispatch
+                # escapes FastAPI's exception handlers.
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "detail": (
+                            "This server is bound beyond loopback, so mutating "
+                            "requests need the launch token: "
+                            "curl -H 'X-DMI-Token: <token from startup>' ..."
+                        )
+                    },
+                )
+            return await call_next(request)
+
     app.state.ui = state
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -262,12 +299,23 @@ def create_app(
     def post_save(payload: dict):
         """Write to the server-side path. The client cannot choose it."""
         config = _parse(payload)
+        # Model-aware validation before the write: the file this produces is
+        # the tool's output contract, so an empty hook set or an out-of-range
+        # layer must be refused here, not persisted and caught by the runtime.
+        try:
+            ensure_valid(config, state.descriptor)
+        except ConfigValidationError as exc:
+            raise HTTPException(
+                400,
+                "; ".join(issue.message for issue in exc.issues),
+            ) from exc
         try:
             save_config(config, state.save_path)
         except ConfigurationError as exc:
             # save_config reports filesystem trouble (OSError included) as
             # ConfigurationError, so that is what actually arrives here.
             raise HTTPException(500, f"Could not write {state.save_path}: {exc}") from exc
+        state.initial_config = config
         return {"path": str(state.save_path)}
 
     return app

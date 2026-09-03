@@ -87,6 +87,9 @@ class BackendAdapter(abc.ABC):
         self.model_cfg: Optional[ModelShapeConfig] = None
         self.active_specs: List[HookSpec] = []
         self._warned_shapes: set = set()
+        # Steps seen by this adapter since attach. Feeds the capture
+        # schedule's stride/warmup gate in before_forward.
+        self._step_counter: int = 0
 
     @property
     def active_hook_specs(self) -> tuple[HookSpec, ...]:
@@ -200,6 +203,40 @@ class BackendAdapter(abc.ABC):
         self.transport._active_specs = specs
         self.transport._using_forward_hooks = True
 
+    def _schedule_allows(self, ctx: StepContext) -> bool:
+        """The capture schedule's gate on this step, when one is configured.
+
+        The engine's ``MonitoringConfig.schedule`` decides whether this step
+        is captured at all: phase flags drop the prefill or decode half, the
+        strides sample, warmup skips the start. A step refused here is not
+        planned, reserved, or published.
+
+        No schedule (``engine.config`` None), and a step whose adapter did
+        not report a phase, always capture -- the gate only narrows what it
+        is told about.
+        """
+        schedule = getattr(getattr(self.engine, "config", None), "schedule", None)
+        if schedule is None:
+            return True
+        # Request gate first: dropping the whole request drops its steps too.
+        # Adapters mint "gid:i" ids (HF); a scheduler id without a numeric
+        # prefix cannot be gated numerically and always passes.
+        if ctx.req_ids:
+            prefix = str(ctx.req_ids[0]).split(":", 1)[0]
+            if prefix.isdigit() and not schedule.should_capture_request(int(prefix)):
+                return False
+        if ctx.phase is not None:
+            return schedule.should_capture_step(
+                self._step_counter, phase=ctx.phase
+            )
+        # No phase: apply the schedule's unconditional parts only.
+        if self._step_counter < schedule.warmup_steps:
+            return False
+        effective = self._step_counter - schedule.warmup_steps
+        if effective < schedule.step_offset:
+            return False
+        return (effective - schedule.step_offset) % schedule.step_stride == 0
+
     def before_forward(self, *raw) -> None:
         """Canonical per-step driver.  See module docstring for the flow."""
         if self.transport is None or self.transport.null_offload:
@@ -208,8 +245,13 @@ class BackendAdapter(abc.ABC):
         if ctx is None:
             return
 
+        if not self._schedule_allows(ctx):
+            self._step_counter += 1
+            return
+
         plan = self.plan_step(ctx)
         self.commit_step(ctx, plan)
+        self._step_counter += 1
 
     def commit_step(
         self, ctx: StepContext, plan: Optional[StepPlan] = None
