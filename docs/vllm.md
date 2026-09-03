@@ -26,11 +26,11 @@ supported and is rejected before CUDA initialization.
 
 The integration fails before device initialization when it detects an
 unsupported runner, version, architecture, or parallel mode. See the
-integration's [model support list](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/main/README.md#model-support)
+versioned integration's [model support list](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/v0.27.1-r3/README.md#model-support)
 for available model families and their qualification status.
 
 The exact vLLM behavior assumed by this release is documented in the
-[vLLM contract](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/main/docs/vllm_contract.md).
+[vLLM contract](https://github.com/ProjectDMX/DMI-vLLM-Integration/blob/v0.27.1-r3/docs/vllm_contract.md).
 
 ## Offline API
 
