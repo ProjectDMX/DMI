@@ -34,10 +34,10 @@ Run against a reachable ClickHouse:
 from __future__ import annotations
 
 from contextlib import contextmanager
+from hashlib import sha256
 import importlib.util
 from os import environ
 from pathlib import Path
-import subprocess
 import sys
 from uuid import UUID, uuid4
 
@@ -450,43 +450,59 @@ def test_starting_against_a_version_one_catalog_is_refused(tmp_path: Path):
 # prevent. So the diagnosis is now read off the live schema, and this is the
 # test whose absence let that ship.
 
-# `@{upstream}` at the time of writing. Pinned as a sha rather than as the
-# symbolic ref, because `@{upstream}` is a per-clone alias that moves.
+# The predecessor's catalog writer, vendored under tests/data rather than read
+# out of git history at run time.
+#
+# `git show bea3ed8:...` used to produce it, and could not keep producing it:
+# this repository squash-merges, so that commit is reachable only from the
+# feature branch and disappears when the branch is deleted. Every recent commit
+# on `main` is single-parent -- PR #113 landed as `08ea071` that way -- so after
+# a merge the extraction failed, the test skipped, and the workflow's
+# "Fail if any live test was skipped" step turned post-merge CI red.
+# `fetch-depth: 0` does not help: it retains history that exists, not an object
+# that no longer does.
+#
+# The checksum is what `git show` was really providing. This file is a
+# byte-exact snapshot of that commit's source, not a transcription, and the
+# digest is verified on every load -- so the fixture still cannot drift towards
+# whatever this branch happens to create, which is the one property a
+# schema-upgrade fixture must never lose. Regenerate only to track a different
+# predecessor, and then deliberately:
+#
+#     git show <commit>:src/dmi/storage/capture/clickhouse_catalog.py \
+#         > tests/data/upstream_clickhouse_catalog_<short>.py
+#     sha256sum tests/data/upstream_clickhouse_catalog_<short>.py
 _UPSTREAM_COMMIT = "bea3ed828f69de0a56b2bf30023a8a49fc19745e"
-_UPSTREAM_SOURCE = "src/dmi/storage/capture/clickhouse_catalog.py"
+_UPSTREAM_FIXTURE = "upstream_clickhouse_catalog_bea3ed8.py"
+_UPSTREAM_SHA256 = "9223310c2ad2b0a5ef8937f8e59da63dec400f530e557081bbbf79e22f989577"
 
 
-def _upstream_catalog_module(tmp_path: Path):
-    """`@{upstream}`'s own catalog writer, extracted with `git show`.
+def _upstream_catalog_module():
+    """The predecessor's own catalog writer, executed rather than described.
 
-    Not transcribed. A fixture written out by hand drifts towards whatever this
-    branch happens to create, which is the one thing a schema-upgrade fixture
-    must never do -- so the predecessor's DDL is the predecessor's code,
-    executed.
+    A byte-exact snapshot of `{_UPSTREAM_COMMIT}`'s source, verified against
+    `_UPSTREAM_SHA256` on every load: the predecessor's DDL is the
+    predecessor's code, and an edit to the fixture fails loudly instead of
+    quietly agreeing with this branch.
+
+    Nothing here can skip. A missing or altered fixture is a repository fault,
+    not an unavailable environment, and skipping on it is what let the old
+    `git show` extraction pass as coverage it was no longer providing.
 
     Loaded under a name inside `dmi.storage.capture` so its `from .catalog
     import ...` resolves, and never written into the package directory.
     """
-    root = Path(__file__).resolve().parents[1]
-    try:
-        shown = subprocess.run(
-            ["git", "show", f"{_UPSTREAM_COMMIT}:{_UPSTREAM_SOURCE}"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-        )
-    except OSError as error:
-        pytest.skip(f"cannot run git: {error}")
-    if shown.returncode != 0:
-        pytest.skip(
-            f"cannot read {_UPSTREAM_COMMIT} from git: {shown.stderr.strip()}"
-        )
-    source = tmp_path / "upstream_clickhouse_catalog.py"
-    source.write_text(shown.stdout)
+    source = Path(__file__).resolve().parent / "data" / _UPSTREAM_FIXTURE
+    digest = sha256(source.read_bytes()).hexdigest()
+    assert digest == _UPSTREAM_SHA256, (
+        f"{source} is not {_UPSTREAM_COMMIT}'s source: expected sha256 "
+        f"{_UPSTREAM_SHA256}, found {digest}. The fixture pins what this "
+        "build is being compared AGAINST, so an edit to it silently weakens "
+        "every assertion below."
+    )
     name = "dmi.storage.capture._upstream_catalog_fixture"
     spec = importlib.util.spec_from_file_location(name, source)
-    if spec is None or spec.loader is None:
-        pytest.skip("importlib produced no loadable spec for the fixture")
+    assert spec is not None and spec.loader is not None, source
     module = importlib.util.module_from_spec(spec)
     # `dataclass` resolves annotations through `sys.modules`, so the module has
     # to be registered before it is executed, and removed after so nothing else
@@ -511,7 +527,7 @@ def test_the_refusal_only_claims_differences_the_upstream_catalog_really_has(
     on the watermark and the manifest, the publisher lease, and the version
     stamp; those are the claims the message is allowed to make.
     """
-    upstream = _upstream_catalog_module(tmp_path)
+    upstream = _upstream_catalog_module()
     store, _, refs, descriptors = _packs(tmp_path)
     with _server() as (client, config):
         # The predecessor builds and fills its own catalog, with its own code.

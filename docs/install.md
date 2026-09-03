@@ -59,9 +59,17 @@ every submodule, including nested ones, and survives a re-clone:
 git config --global url."git@github.com:".insteadOf https://github.com/
 ```
 
-If you already have a checkout and change either the URLs or that config, run
-`git submodule sync --recursive` once: `.git/config` and `.git/modules/*/config`
-keep whatever URL they were cloned with, so a plain `git pull` will not adopt it.
+That config needs no follow-up in an existing checkout. Git applies an
+`insteadOf` rewrite when it RESOLVES a stored URL, so it takes effect
+immediately -- `git -c 'url.git@github.com:.insteadOf=https://github.com/'
+remote get-url origin` prints the SSH form against an origin stored as HTTPS.
+
+`git submodule sync --recursive` is for the other case only: when the URLs in
+`.gitmodules` themselves change. There it is needed, because `.git/config` and
+`.git/modules/*/config` keep whatever URL they were cloned with and a plain
+`git pull` will not adopt the new one. Do not run it just to pick up an
+`insteadOf` setting -- it would overwrite any submodule URL you had set
+deliberately in your own checkout, to no purpose.
 
 Expected submodule paths:
 
