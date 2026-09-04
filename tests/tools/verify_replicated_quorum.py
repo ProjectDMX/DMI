@@ -157,6 +157,11 @@ def create(client, prefix: str, replica: str, suffix: str) -> None:
 
 
 def drop(client, prefix: str) -> None:
+    # The views create() made, dropped BEFORE their sources so they never
+    # dangle over a dropped table -- which is what the ordering below used to
+    # claim while doing the opposite. DROP TABLE removes a view just as well.
+    client.execute(f"DROP TABLE IF EXISTS default.`{prefix}_capture` SYNC")
+    client.execute(f"DROP TABLE IF EXISTS default.`{prefix}_pack_inventory` SYNC")
     for name in TABLES:
         for suffix in ("_peer", ""):
             try:
@@ -164,10 +169,6 @@ def drop(client, prefix: str) -> None:
             except ServerException:
                 pass
             client.execute(f"DROP TABLE IF EXISTS default.`{prefix}_{name}{suffix}` SYNC")
-    # The views create() made; views first so they never dangle over their
-    # dropped sources, and DROP TABLE removes a view just as well.
-    client.execute(f"DROP TABLE IF EXISTS default.`{prefix}_capture` SYNC")
-    client.execute(f"DROP TABLE IF EXISTS default.`{prefix}_pack_inventory` SYNC")
 
 
 def _refs(descriptors):

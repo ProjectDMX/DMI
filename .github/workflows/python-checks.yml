@@ -122,15 +122,25 @@ jobs:
           import sys
           import xml.etree.ElementTree as ET
 
-          suite = ET.parse("live-results.xml").getroot().find("testsuite")
-          ran = int(suite.get("tests", 0))
-          skipped = int(suite.get("skipped", 0))
-          print(f"{ran} collected, {skipped} skipped")
+          # EVERY testsuite, not the first. pytest writes one today, but a
+          # plugin (xdist among them) can split the run across several, and
+          # reading only the first would report a subset as the whole -- which
+          # is the failure mode this gate exists to prevent. An absent node
+          # used to crash here with an AttributeError traceback; it is now a
+          # named failure, because a JUnit file this script cannot read is a
+          # gate that is not running.
+          suites = ET.parse("live-results.xml").getroot().findall("testsuite")
+          if not suites:
+              sys.exit("live-results.xml has no <testsuite>: the gate cannot read it")
+          ran = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          print(f"{ran} collected, {skipped} skipped, across {len(suites)} suite(s)")
           if ran == 0:
               sys.exit("no live tests ran: the marker selection matched nothing")
           if skipped:
-              for case in suite.iter("testcase"):
-                  for mark in case.iter("skipped"):
-                      print(f"  skipped: {case.get('name')}: {mark.get('message')}")
+              for suite in suites:
+                  for case in suite.iter("testcase"):
+                      for mark in case.iter("skipped"):
+                          print(f"  skipped: {case.get('name')}: {mark.get('message')}")
               sys.exit(f"{skipped} live test(s) skipped; a skip is not a pass")
           EOF
