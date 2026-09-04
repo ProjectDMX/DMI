@@ -828,7 +828,9 @@ def test_the_deciding_reads_carry_sequential_consistency_to_the_server():
         assert _settings("toString(publish_id)", "SELECT") == [consistent]
         assert _settings("GROUP BY term, lease_id", "SELECT") == [consistent] * 3
         assert _settings("acquired_at_ns, expires_at_ns", "SELECT") == [consistent] * 3
-        assert _settings("snapshot_manifest", "SELECT") == [consistent]
+        # The chunk read-back, and the whole-publish confirmation after the
+        # watermark row stands.
+        assert _settings("snapshot_manifest", "SELECT") == [consistent] * 2
         # The fenced writes carry the consistency AND the statement cap that
         # keeps the fence from being evaluated long before the row lands.
         assert _settings("snapshot_manifest", "INSERT") == [fenced]
