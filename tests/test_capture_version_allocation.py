@@ -1,4 +1,4 @@
-"""The catalog's DB-owned version allocator.
+"""The catalog's DB-owned version allocator and its publisher lease.
 
 Catalog versions used to be derived from the indexer's wall clock, so two live
 indexers with skewed clocks could publish a version below a watermark a reader
@@ -6,6 +6,13 @@ had already pinned. Versions are now handed out by the catalog itself through
 an append-only, sole-claimant claims table: monotonic and unique, with no
 clock anywhere in the ordering. These tests drive that protocol over a shared
 in-memory "server" with real state, so two writers contend for real.
+
+The publisher lease is claimed by the same protocol over the same kind of
+append-only table, and the tests for it live here for that reason. What they
+CANNOT reach is the window the lease fence exists for: two publishers in one
+interpreter are serialised by the interpreter, so their statements never
+overlap on a server. That is driven against a real ClickHouse in
+tests/test_clickhouse_snapshot_live.py.
 """
 
 from __future__ import annotations
@@ -19,11 +26,17 @@ from dmi.storage.capture import (
     CaptureMetadata,
     CaptureRecord,
     CatalogIndexer,
+    CatalogVersionAllocationError,
     ClickHouseCatalogConfig,
     ClickHouseCatalogWriter,
     FilesystemPackStore,
+    PackRef,
     PackWriter,
+    PublisherLeaseError,
+    PublisherLeaseHeldError,
+    SnapshotPublishRaceError,
 )
+from tests._catalog_fakes import FakeLeaseTable
 
 
 pytestmark = pytest.mark.cpu
@@ -46,17 +59,58 @@ class _CatalogServer:
     def __init__(self):
         self.claims: list[tuple[int, str]] = []
         self.watermarks: list[int] = []
+        self.publishes: list[tuple[int, str]] = []
+        self.manifest: list[tuple[int, str, str, str]] = []
         self.inserts: list[str] = []
         self.on_owner_read = None
+        self.lease = FakeLeaseTable()
 
     def execute(self, query, params=None, **kwargs):
+        leased = self.lease.execute(query, params)
+        if leased is not None:
+            return leased
         if query.lstrip().upper().startswith("INSERT"):
             self.inserts.append(query)
             if "version_claims" in query:
                 self.claims.extend((int(row[0]), str(row[1])) for row in params)
+            elif "snapshot_manifest" in query:
+                # Fenced too, so a fenced-out publisher records nothing here.
+                if self.lease.fence_admits(query, params):
+                    self.manifest.extend(
+                        (int(params["index_version"]), str(params["publish_id"]),
+                         str(store_id), str(pack_id))
+                        for store_id, pack_id in params["members"]
+                    )
             elif "index_watermark" in query:
-                self.watermarks.extend(int(row[0]) for row in params)
+                # The conditional publish, enforced: a version lands only when
+                # it is strictly above the published head AND this publisher
+                # still holds the lease. The fence check runs UNCONDITIONALLY
+                # -- short-circuited behind the barrier, a statement missing
+                # the fence would slip by whenever the barrier refused it.
+                version = int(params["index_version"])
+                fenced = self.lease.fence_admits(query, params)
+                if fenced and version > max(self.watermarks, default=0):
+                    self.watermarks.append(version)
+                    self.publishes.append((version, params["publish_id"]))
             return []
+        if "publish_id" in query and "index_watermark" in query:
+            return [
+                (publish_id,)
+                for version, publish_id in self.publishes
+                if version == params["version"]
+            ]
+        if "snapshot_manifest" in query and "SELECT count()" in query:
+            # The chunk read-back names its members; the whole-publish check
+            # after the watermark lands does not.
+            wanted = set(params["members"]) if "members" in params else None
+            found = {
+                (store_id, pack_id)
+                for version, publish_id, store_id, pack_id in self.manifest
+                if version == params["index_version"]
+                and publish_id == params["publish_id"]
+                and (wanted is None or (store_id, pack_id) in wanted)
+            }
+            return [(len(found),)]
         if "version_claims" in query:
             if "max(version)" in query:
                 return [(max((v for v, _ in self.claims), default=None),)]
@@ -71,6 +125,717 @@ class _CatalogServer:
 
 def _writer(server, **config) -> ClickHouseCatalogWriter:
     return ClickHouseCatalogWriter(server, ClickHouseCatalogConfig(**config))
+
+
+def _publisher(server, holder="indexer", **config) -> ClickHouseCatalogWriter:
+    """A writer holding the publisher lease, which every publish requires.
+
+    Only one of these can exist over a server at a time -- that is the whole
+    invariant. A second publisher takes over only once the first lease has
+    expired, which these tests reach by moving the fake server clock rather
+    than by sleeping.
+    """
+    writer = _writer(server, **config)
+    writer.acquire_publisher_lease(holder)
+    return writer
+
+
+def _expire_the_lease(server) -> None:
+    """Move the server clock past the held lease, as a stalled indexer would."""
+    server.lease.now_ns += ClickHouseCatalogConfig().lease_ttl_ns + 1
+
+
+# --- the publisher lease ------------------------------------------------------
+#
+# The protocol, over a shared in-memory server. What is NOT here is the thing
+# the fence exists for: two publishers in one interpreter are serialised by the
+# interpreter, so their statements never overlap on a server and no fake state
+# reproduces that window. tests/test_clickhouse_snapshot_live.py drives it
+# against a real ClickHouse.
+
+
+def test_only_one_publisher_can_hold_the_lease():
+    server = _CatalogServer()
+    first = _publisher(server, "indexer-a")
+
+    with pytest.raises(PublisherLeaseHeldError) as raised:
+        _publisher(server, "indexer-b")
+
+    message = str(raised.value)
+    assert "'indexer-a'" in message and first.publisher_lease.lease_id in message
+    assert "wait for it to expire or stop it" in message
+
+
+def test_publishing_without_a_lease_is_refused_before_anything_is_written():
+    server = _CatalogServer()
+    writer = _writer(server)
+
+    with pytest.raises(PublisherLeaseError, match="no publisher lease is held"):
+        writer.publish_snapshot(
+            index_version=1, refs=(), published_at_ns=1, indexed_rows=0,
+            indexed_packs=0,
+        )
+
+    assert server.inserts == [], "a publisher without a lease wrote something"
+    assert server.watermarks == []
+
+
+@pytest.mark.parametrize("holder", ["", 7, "x" * 257])
+def test_a_lease_holder_must_be_a_short_non_empty_name(holder):
+    """The name goes in the error another publisher reads, so it is bounded."""
+    with pytest.raises(ValueError, match="holder"):
+        _writer(_CatalogServer()).acquire_publisher_lease(holder)
+
+
+def test_an_expired_lease_is_taken_over_and_the_old_holder_never_reaches_a_write():
+    """Expiry is what makes a crashed indexer recoverable rather than terminal.
+
+    The old holder is not told; it finds out at its next publish. The stop
+    happens at the RENEWAL, client-side: `publish_snapshot` renews first, the
+    renewal reads a head that is a live lease belonging to somebody else, and
+    it refuses before any statement is issued. This test therefore says nothing
+    about the fence -- it passed unchanged with the fence replaced by
+    `1 = 1`, and its docstring used to claim the fence was what made "writes
+    nothing" literal. The fence is exercised by
+    `test_a_takeover_after_the_renewal_is_reported_as_a_lost_lease` below, and
+    for real by tests/test_clickhouse_snapshot_live.py.
+    """
+    server = _CatalogServer()
+    stalled = _publisher(server, "stalled")
+    version = stalled.allocate_version()
+
+    _expire_the_lease(server)
+    successor = _publisher(server, "successor")
+    assert successor.publisher_lease.term > stalled.publisher_lease.term
+    issued = len(server.inserts)
+
+    with pytest.raises(PublisherLeaseHeldError, match="'successor'"):
+        stalled.publish_snapshot(
+            index_version=version, refs=(), published_at_ns=1, indexed_rows=0,
+            indexed_packs=0,
+        )
+
+    # The mechanism, pinned: not one statement was issued, so nothing was
+    # written for the fence to have to reject.
+    assert server.inserts[issued:] == [], (
+        "the refusal happened after a statement was issued, not before"
+    )
+    assert server.watermarks == []
+    assert server.manifest == []
+    assert stalled.publisher_lease is None, (
+        "a publisher that lost its lease must not go on believing it holds one"
+    )
+
+
+def test_a_takeover_after_the_renewal_is_reported_as_a_lost_lease():
+    """The failure the fence catches, and why it is not a lost version race.
+
+    Renewing before every fenced statement leaves one window: between renewal
+    and the server executing the write. A takeover there passes the client-side
+    check and fails the server-side fence, and the two failures need different
+    recoveries -- a lost VERSION is repaired by allocating a higher one, which
+    the indexer does automatically, while a lost LEASE would fail the same
+    fence at every version. So it is deliberately not a
+    ``SnapshotPublishRaceError``.
+    """
+    server = _CatalogServer()
+    holder = _publisher(server, "indexer-a")
+    version = holder.allocate_version()
+
+    def take_over(_lease_id) -> None:
+        server.lease.on_fence = None
+        _expire_the_lease(server)
+        _publisher(server, "successor")
+
+    server.lease.on_fence = take_over
+    with pytest.raises(PublisherLeaseError) as raised:
+        holder.publish_snapshot(
+            index_version=version, refs=(), published_at_ns=1, indexed_rows=0,
+            indexed_packs=0,
+        )
+
+    assert "fenced out and made no snapshot visible" in str(raised.value)
+    assert "'successor'" in str(raised.value)
+    assert not isinstance(raised.value, SnapshotPublishRaceError)
+    assert server.watermarks == []
+    assert holder.publisher_lease is None
+
+
+def test_a_publish_requires_a_full_timeout_of_lease_remaining():
+    server = _CatalogServer()
+    timeout = 1_000_000_000
+    writer = _publisher(
+        server,
+        lease_ttl_ns=2_000_000_000,
+        publish_timeout_ns=timeout,
+    )
+
+    def age_lease(_lease_id) -> None:
+        server.lease.on_fence = None
+        expires_at_ns = max(row[4] for row in server.lease.head())
+        server.lease.now_ns = expires_at_ns - timeout
+
+    server.lease.on_fence = age_lease
+
+    with pytest.raises(SnapshotPublishRaceError):
+        writer.publish_snapshot(
+            index_version=1,
+            refs=(),
+            published_at_ns=1,
+            indexed_rows=0,
+            indexed_packs=0,
+        )
+
+    assert server.watermarks == []
+
+
+def test_a_publish_renews_between_fenced_statements(tmp_path: Path):
+    _, refs = _refs(tmp_path, 1)
+    server = _CatalogServer()
+    timeout = 1_000_000_000
+    writer = _publisher(
+        server,
+        lease_ttl_ns=2_000_000_000,
+        publish_timeout_ns=timeout,
+    )
+    execute = server.execute
+
+    def advance_after_manifest(query, params=None, **kwargs):
+        result = execute(query, params, **kwargs)
+        if query.lstrip().startswith("INSERT") and "snapshot_manifest" in query:
+            server.lease.now_ns += timeout
+        return result
+
+    server.execute = advance_after_manifest
+
+    writer.publish_snapshot(
+        index_version=1,
+        refs=refs,
+        published_at_ns=1,
+        indexed_rows=1,
+        indexed_packs=1,
+    )
+
+    assert server.watermarks == [1]
+
+
+def test_an_indexer_republishes_a_batch_whose_membership_was_collected(tmp_path: Path):
+    """The late lower commit, end to end: republished, never committed blind.
+
+    A retention pass that runs while a lower publisher's admitted watermark
+    statement is still in flight removes that publisher's manifest rows. The
+    watermark then lands and admits nothing. The publish refuses as a lost
+    race, the indexer allocates a higher version and publishes again, and the
+    inventory records the packs at the version that actually made them
+    visible -- never at the one that did not, which is what would have made
+    every later pass skip them for good.
+    """
+    store, refs = _refs(tmp_path, 2)
+    server = _CatalogServer()
+    execute = server.execute
+    collected: list[int] = []
+
+    def collect_between_the_watermark_and_its_confirmation(query, params=None, **kwargs):
+        result = execute(query, params, **kwargs)
+        if (
+            not collected
+            and query.lstrip().startswith("INSERT")
+            and "index_watermark" in query
+        ):
+            collected.append(int(params["index_version"]))
+            server.manifest = [
+                row for row in server.manifest if row[1] != str(params["publish_id"])
+            ]
+        return result
+
+    server.execute = collect_between_the_watermark_and_its_confirmation
+    indexer = CatalogIndexer(store, _publisher(server), clock_ns=lambda: 7)
+
+    result = indexer.index(refs)
+
+    assert result.indexed_packs == len(refs)
+    dead, = collected
+    assert server.watermarks == [dead, dead + 1] or server.watermarks[-1] > dead
+    committed = [
+        query for query in server.inserts if "pack_inventory_raw" in query
+    ]
+    assert len(committed) == 1, "committed exactly once, at the version that stuck"
+    live = server.watermarks[-1]
+    assert {row[0] for row in server.manifest} == {live}, (
+        "membership exists only at the version whose watermark admits it"
+    )
+    # The dead version's watermark row stands and pairs with nothing.
+    assert not [row for row in server.manifest if row[0] == dead]
+
+
+def test_a_contested_lease_term_is_quarantined_until_claims_expire():
+    """The sole-claimant rule plus the late-claim safety window.
+
+    A competing claim lands between the claimant's INSERT and its read-back.
+    The claimant walks away, and nobody may claim above the contested term
+    until every row at it has expired: another claimant may have returned
+    before the competing row arrived.
+    """
+    server = _CatalogServer()
+    writer = _writer(server)
+    contested: list[int] = []
+
+    def contest(term: int) -> None:
+        contested.append(term)
+        server.lease.rows.append(
+            (term, _LARGE_CLAIM, "competitor", 0, server.lease.now_ns + 10**12)
+        )
+        server.lease.on_claim_read = None  # contest the first attempt only
+
+    server.lease.on_claim_read = contest
+    with pytest.raises(PublisherLeaseHeldError, match="contested"):
+        writer.acquire_publisher_lease("indexer-a")
+
+    assert contested == [1], "the first term should have been contested"
+    assert writer.publisher_lease is None
+
+    server.lease.now_ns += 10**12 + 1
+    lease = writer.acquire_publisher_lease("indexer-a")
+    assert lease.term > contested[0]
+
+
+def test_a_late_same_term_claim_cannot_supersede_a_live_returned_lease():
+    """A claim arriving after read-back must not erase a live lease's margin."""
+    server = _CatalogServer()
+    holder = _publisher(server, "indexer-a")
+    held = holder.publisher_lease
+    delayed = _LARGE_CLAIM
+    server.lease.rows.append(
+        (
+            held.term,
+            delayed,
+            "indexer-b",
+            server.lease.now_ns,
+            held.expires_at_ns,
+        )
+    )
+    contender = _writer(server)
+
+    with pytest.raises(PublisherLeaseHeldError, match="contested"):
+        contender._leases.claim("indexer-b", lease_id=delayed)
+
+    assert server.lease.now_ns < held.expires_at_ns
+    assert contender.publisher_lease is None
+
+
+def test_a_newly_contested_claim_waits_for_its_own_expiry():
+    server = _CatalogServer()
+    writer = _writer(server)
+    server.lease.on_claim_read = lambda term: server.lease.rows.append(
+        (term, _LARGE_CLAIM, "competitor", 0, 0)
+    )
+
+    with pytest.raises(PublisherLeaseHeldError, match="contested"):
+        writer.acquire_publisher_lease("indexer-a")
+
+    assert writer.publisher_lease is None
+    assert len(server.lease.rows) == 2
+
+
+def test_a_holder_re_acquiring_its_own_live_lease_refreshes_it():
+    """Acquiring twice is the documented path, not a contest.
+
+    Both `capture-storage-design.md` and `renew_publisher_lease`'s own refusal
+    tell an operator to acquire before publishing, so anything that restarts
+    above this object calls acquire on a writer that already holds one.
+
+    Minting a fresh `lease_id` there made the writer a stranger to its own row:
+    the claim was refused as held by ITSELF, the local lease was dropped on the
+    way out, and `release_publisher_lease()` then had nothing to release -- so
+    the orphaned row stood for a whole `lease_ttl_ns` with no API left to clear
+    it and every retry hit the same row.
+    """
+    server = _CatalogServer()
+    writer = _publisher(server, "indexer-a")
+    before = writer.publisher_lease
+
+    after = writer.acquire_publisher_lease("indexer-a")
+
+    assert after.lease_id == before.lease_id, "a refresh keeps the fencing token"
+    assert after.term > before.term
+    assert writer.publisher_lease == after
+    # And the writer can still give it back, which is what the orphan denied.
+    writer.release_publisher_lease()
+    assert writer.publisher_lease is None
+    assert _publisher(server, "indexer-b").publisher_lease is not None
+
+
+def test_a_release_by_a_writer_that_no_longer_holds_the_lease_revokes_nothing():
+    """A stale writer's orderly shutdown must not evict the current holder.
+
+    The tombstone lands at the releasing writer's OWN term -- the one it was
+    granted -- never at ``head.term + 1``. A writer whose lease lapsed long ago
+    therefore writes an inert row below the head when it shuts down cleanly,
+    and the successor standing at the head is untouched.
+    """
+    server = _CatalogServer()
+    stale = _publisher(server, "stale")
+    stale_term = stale.publisher_lease.term
+
+    _expire_the_lease(server)
+    healthy = _publisher(server, "healthy")
+    head_before = server.lease.head()
+
+    stale.release_publisher_lease()
+
+    assert stale.publisher_lease is None, "the stale writer still gives up its own"
+    assert server.lease.head() == head_before, "a non-holder moved the head"
+    tombstones = [row for row in server.lease.rows if row[4] == row[3]]
+    assert [row[0] for row in tombstones] == [stale_term], (
+        "the tombstone belongs at the stale writer's own term and nowhere else"
+    )
+    # The healthy holder is untouched: its lease still fences, and a third
+    # publisher is still refused.
+    assert server.lease.fence_passes(healthy.publisher_lease.lease_id)
+    with pytest.raises(PublisherLeaseHeldError, match="'healthy'"):
+        _publisher(server, "third")
+
+
+def test_a_stale_release_landing_after_a_takeover_leaves_the_successor_at_the_head():
+    """The race the fenced INSERT ... SELECT release could not close.
+
+    A release that resolved the head inside its own statement was a
+    compare-and-set against the head AS OF ITS SELECT, not against a concurrent
+    insert: a stale release could read expired lease A at term T, claimant B
+    could insert T + 1 and pass its singleton read-back, and A's already-running
+    release could then land its expired row at that same T + 1 -- a contested
+    head until B's TTL, and B fenced out at once when A's UUID sorted higher
+    (reproduced on 25.12 with a `sleep(1)` in the release).
+
+    The repair is a representation, not a serialisation: the tombstone is
+    written at the releasing writer's own term, which can never be a
+    successor's term, so there is no head read left to race. Modelled here as
+    the same ordering -- takeover first, release second -- which is all the
+    fake can express, and exactly the ordering that used to break.
+    """
+    server = _CatalogServer()
+    stale = _publisher(server, "stale")
+    stale_term = stale.publisher_lease.term
+    _expire_the_lease(server)
+    successor = _publisher(server, "successor")
+    successor_lease = successor.publisher_lease
+
+    stale.release_publisher_lease()
+
+    head = server.lease.head()
+    assert {row[0] for row in head} == {successor_lease.term}
+    assert {row[1] for row in head} == {successor_lease.lease_id}, (
+        "the stale release must not share the successor's term"
+    )
+    assert server.lease.fence_passes(
+        successor_lease.lease_id, ClickHouseCatalogConfig().publish_timeout_ns
+    ), "the successor is still the head the fence resolves"
+    tombstones = [row for row in server.lease.rows if row[3] == row[4]]
+    assert [row[0] for row in tombstones] == [stale_term]
+    # And the successor's next renewal is not told it has been contested.
+    assert successor.renew_publisher_lease().lease_id == successor_lease.lease_id
+
+
+def test_a_released_lease_is_available_at_once():
+    """An orderly handover must not cost the next publisher a whole TTL."""
+    server = _CatalogServer()
+    first = _publisher(server, "indexer-a")
+
+    first.release_publisher_lease()
+
+    assert first.publisher_lease is None
+    second = _publisher(server, "indexer-b")
+    assert second.publisher_lease.term == 2, (
+        "the tombstone sits at the released term 1, so the retake is term 2"
+    )
+    # Idempotent: a second release with nothing held writes nothing more.
+    rows = len(server.lease.rows)
+    first.release_publisher_lease()
+    assert len(server.lease.rows) == rows
+
+
+def test_releasing_without_a_lease_writes_nothing():
+    server = _CatalogServer()
+    writer = _writer(server)
+
+    writer.release_publisher_lease()
+
+    assert server.lease.rows == []
+
+
+def test_a_renewal_keeps_the_fencing_identity_and_extends_the_term():
+    """Renewal is a fresh term under the same identity, not a new lease.
+
+    The fence names the lease, so a renewal has to keep it; the term has to
+    move, because that is what a takeover would have to beat; and the expiry
+    has to move, because the whole point of renewing before each fenced write is
+    that the fence runs with essentially a full TTL left.
+
+    The clock is advanced deliberately. Asserted against a fake clock that
+    never moves, `expires_at_ns >= expires_at_ns` is `x >= x` and the half of
+    this test its name promises was not tested at all.
+    """
+    server = _CatalogServer()
+    writer = _publisher(server, "indexer-a")
+    before = writer.publisher_lease
+    server.lease.now_ns += 1_000_000_000  # a second of the SERVER's clock
+
+    after = writer.renew_publisher_lease()
+
+    assert after.lease_id == before.lease_id
+    assert after.term > before.term
+    assert after.expires_at_ns > before.expires_at_ns
+    assert after.expires_at_ns - after.acquired_at_ns == (
+        ClickHouseCatalogConfig().lease_ttl_ns
+    ), "a renewal has to buy a whole TTL, or the safety margin is not what it says"
+
+
+def test_the_fence_requires_the_clock_skew_bound_beyond_the_publish_timeout():
+    """Host clock skew is part of the safety margin, not outside it.
+
+    ``expires_at_ns`` is stamped by ``now64()`` on the host that handled the
+    claim INSERT, and the fence compares it with a fresh ``now64()`` on the host
+    that handles the publish. On a multi-host replicated deployment those are
+    two clocks: a successor whose host runs ahead can consider the holder
+    expired while the holder's own fence, evaluated a moment earlier on a
+    slower host, still admitted a statement that is now in flight.
+
+    So the fence subtracts a configured skew bound as well as the publish cap:
+    with `clock_skew_ns` remaining on top of `publish_timeout_ns` the statement
+    is admitted, with less than that it is refused, and a fence that ignored
+    the bound would admit a publish exactly inside the band this test sits in.
+    """
+    server = _CatalogServer()
+    timeout, skew = 1_000_000_000, 500_000_000
+    writer = _publisher(
+        server,
+        lease_ttl_ns=3_000_000_000,
+        publish_timeout_ns=timeout,
+        clock_skew_ns=skew,
+    )
+
+    def age_into_the_skew_band(_lease_id) -> None:
+        server.lease.on_fence = None
+        expires_at_ns = max(row[4] for row in server.lease.head())
+        # More than the publish cap remains, but less than cap + skew bound.
+        server.lease.now_ns = expires_at_ns - timeout - skew // 2
+
+    server.lease.on_fence = age_into_the_skew_band
+
+    with pytest.raises(SnapshotPublishRaceError):
+        writer.publish_snapshot(
+            index_version=1, refs=(), published_at_ns=1, indexed_rows=0,
+            indexed_packs=0,
+        )
+
+    assert server.watermarks == []
+
+
+def test_the_fence_admits_a_publish_with_the_whole_margin_remaining():
+    """The complement: cap plus skew bound remaining is enough."""
+    server = _CatalogServer()
+    timeout, skew = 1_000_000_000, 500_000_000
+    writer = _publisher(
+        server,
+        lease_ttl_ns=3_000_000_000,
+        publish_timeout_ns=timeout,
+        clock_skew_ns=skew,
+    )
+
+    def age_to_the_edge(_lease_id) -> None:
+        server.lease.on_fence = None
+        expires_at_ns = max(row[4] for row in server.lease.head())
+        server.lease.now_ns = expires_at_ns - timeout - skew - 1
+
+    server.lease.on_fence = age_to_the_edge
+
+    writer.publish_snapshot(
+        index_version=1, refs=(), published_at_ns=1, indexed_rows=0,
+        indexed_packs=0,
+    )
+
+    assert server.watermarks == [1]
+
+
+def test_the_skew_bound_rides_in_the_fenced_statements_as_a_parameter():
+    """The bound is the server's to apply, inside the statement it gates."""
+    server = _CatalogServer()
+    writer = _publisher(server, clock_skew_ns=250_000_000)
+    seen = []
+    execute = server.execute
+
+    def record(query, params=None, **kwargs):
+        if query.lstrip().startswith("INSERT") and "index_watermark" in query:
+            seen.append(params)
+        return execute(query, params, **kwargs)
+
+    server.execute = record
+    writer.publish_snapshot(
+        index_version=1, refs=(), published_at_ns=1, indexed_rows=0,
+        indexed_packs=0,
+    )
+
+    assert seen and seen[0]["clock_skew_ns"] == 250_000_000
+    assert "%(clock_skew_ns)s" in writer._leases.fence()
+
+
+@pytest.mark.parametrize(
+    "config, message",
+    [
+        ({"lease_ttl_ns": 0}, "lease_ttl_ns"),
+        ({"publish_timeout_ns": -1}, "publish_timeout_ns"),
+        ({"publish_timeout_ns": 30_000_000_000}, "must exceed publish_timeout_ns"),
+        ({"clock_skew_ns": -1}, "clock_skew_ns"),
+        ({"clock_skew_ns": 1.5}, "clock_skew_ns"),
+        # The margin is what remains of the TTL after the publish cap AND the
+        # skew bound are both subtracted, so together they have to leave a
+        # usable one -- more than a client round trip, since the renewal that
+        # precedes every fenced statement has to reach the fence inside it.
+        ({"clock_skew_ns": 25_000_000_000}, "must exceed publish_timeout_ns"),
+        ({"clock_skew_ns": 24_999_999_999}, "this leaves 1 ns"),
+    ],
+)
+def test_the_lease_settings_are_validated(config, message):
+    with pytest.raises(ValueError, match=message):
+        ClickHouseCatalogConfig(**config)
+
+
+def test_a_margin_thinner_than_a_round_trip_is_refused_at_construction():
+    """A fence nothing can ever pass is a configuration error, not a race.
+
+    The fence is SAFE at any positive margin, so the old check only required
+    one. But the margin is also the whole time a renewal has to reach the
+    fence: below a round trip every publish is refused by its own fence, the
+    indexer burns each attempt rewriting descriptors at a higher version, and
+    the failure surfaces as SnapshotPublishExhaustedError blaming a competing
+    publisher.
+    """
+    from dmi.storage.capture.clickhouse_catalog import MINIMUM_FENCE_MARGIN_NS
+
+    with pytest.raises(ValueError, match="this leaves 1 ns"):
+        ClickHouseCatalogConfig(
+            lease_ttl_ns=6_000_000_000,
+            publish_timeout_ns=5_000_000_000,
+            clock_skew_ns=999_999_999,
+        )
+    # The smallest margin the live suites use is exactly the floor, so the
+    # floor cannot be raised without changing them.
+    assert ClickHouseCatalogConfig(
+        lease_ttl_ns=1_000_000_000 + MINIMUM_FENCE_MARGIN_NS,
+        publish_timeout_ns=1_000_000_000,
+    )
+
+
+def test_the_fake_matches_the_fence_the_writer_actually_emits():
+    """The fakes are only worth anything while they enforce the REAL predicate.
+
+    `FakeLeaseTable.fence_admits` matches the fence in the statement rather
+    than trusting the `lease_id` parameter, which `publish_snapshot` passes
+    unconditionally. That only works while the pattern and the emitted fence
+    agree, so the agreement is asserted here: a rewrite of the fence fails as
+    one clear test instead of turning four suites vacuous.
+    """
+    from tests._catalog_fakes import _FENCE, MissingLeaseFence
+
+    writer = _writer(_CatalogServer())
+    assert _FENCE.fullmatch(writer._leases.fence()) is not None, (
+        "tests/_catalog_fakes._FENCE no longer matches "
+        "the fence the writer emits; update it deliberately"
+    )
+    # The fenced release is pinned the same way, for the same reason: the fake
+    # models the head-resolve-and-write as one atomic statement, which is only
+    # honest while the writer actually emits that statement.
+    from tests._catalog_fakes import _RELEASE
+
+    assert _RELEASE.fullmatch(writer._leases.release_statement()) is not None, (
+        "tests/_catalog_fakes._RELEASE no longer matches "
+        "the release statement the writer emits; update it deliberately"
+    )
+    # And a statement without it is refused rather than quietly admitted.
+    with pytest.raises(MissingLeaseFence, match="must be fenced"):
+        FakeLeaseTable().fence_admits(
+            "INSERT INTO `default`.`dmi_index_watermark` SELECT 1 FROM "
+            "system.one WHERE 1 = 1",
+            {"lease_id": "irrelevant"},
+        )
+    # So is a fence whose TEXT is intact but which no longer gates the write:
+    # a weakening AROUND the fence must fail the same way as its absence.
+    with pytest.raises(MissingLeaseFence, match="top-level AND conjunct"):
+        FakeLeaseTable().fence_admits(
+            "INSERT INTO `default`.`dmi_index_watermark` SELECT 1 FROM "
+            "system.one WHERE " + writer._leases.fence() + " OR 1 = 1",
+            {"lease_id": "irrelevant"},
+        )
+
+
+def test_the_indexer_does_not_absorb_a_lost_lease_as_a_lost_version(tmp_path: Path):
+    """The two failures need different recoveries, so only one is retried.
+
+    A lost VERSION is repaired by allocating a higher one, which `_publish`
+    does. A lost LEASE is not: every retry would fail the same fence at every
+    version, so absorbing it would spin `max_publish_attempts` times and then
+    raise `SnapshotPublishExhaustedError("could not publish ... after N
+    attempts")` -- burying the one message that names the holder and says to
+    acquire again.
+    """
+    store, refs = _refs(tmp_path, 1)
+    server = _CatalogServer()
+    writer = _publisher(server, "stalled")
+    indexer = CatalogIndexer(store, writer, clock_ns=lambda: 7)
+
+    # A legitimate takeover lands between the renewal and the write, which is
+    # the window the fence exists for.
+    def take_over(_lease_id) -> None:
+        server.lease.on_fence = None
+        _expire_the_lease(server)
+        _publisher(server, "successor")
+
+    server.lease.on_fence = take_over
+
+    with pytest.raises(PublisherLeaseError) as raised:
+        indexer.index(refs)
+
+    assert not isinstance(raised.value, SnapshotPublishRaceError)
+    assert "'successor'" in str(raised.value)
+    assert "Acquire a lease again" in str(raised.value)
+    # It gave up at the first attempt rather than burning the retry budget.
+    assert server.watermarks == []
+    assert sum("version_claims" in q for q in server.inserts) == 1
+
+
+def test_a_barrier_refusal_with_an_expired_own_lease_is_still_a_race():
+    """An expiry between the fenced statement and the read-back is no takeover.
+
+    The refusal classifier used to demand that the head be this writer's row
+    AND still live at CHECK time, so an ordinary lost version race whose lease
+    merely expired during the read-back window -- a stall, a short TTL -- was
+    reported as a lost lease, with a message blaming this writer's own holder
+    for fencing it out. That bypasses the indexer's retry, which renews the
+    lease before every attempt and would have recovered. As long as the head
+    is still this writer's row, nobody took the lease, and the race retry is
+    the recovery.
+    """
+    server = _CatalogServer()
+    writer = _publisher(server, "indexer-a")
+    server.watermarks.append(10)  # somebody already published above this batch
+
+    real_execute = server.execute
+
+    def stalling_execute(query, params=None, **kwargs):
+        result = real_execute(query, params, **kwargs)
+        if query.lstrip().startswith("INSERT") and "index_watermark" in query:
+            # The stall: the lease runs out AFTER the fenced statement was
+            # evaluated and BEFORE the ownership read-back runs.
+            _expire_the_lease(server)
+        return result
+
+    server.execute = stalling_execute
+
+    with pytest.raises(SnapshotPublishRaceError):
+        writer.publish_snapshot(
+            index_version=5, refs=(), published_at_ns=7,
+            indexed_rows=0, indexed_packs=0,
+        )
 
 
 # --- the allocator over a shared server ---------------------------------------
@@ -88,11 +853,12 @@ def test_two_writers_allocate_distinct_strictly_increasing_versions():
 
 def test_allocations_interleaved_with_publications_stay_monotonic():
     server = _CatalogServer()
-    writer = _writer(server)
+    writer = _publisher(server)
 
     first = writer.allocate_version()
-    writer.publish_watermark(
-        index_version=first, published_at_ns=1, indexed_rows=0, indexed_packs=0
+    writer.publish_snapshot(
+        index_version=first, refs=(), published_at_ns=1, indexed_rows=0,
+        indexed_packs=0,
     )
     second = _writer(server).allocate_version()
 
@@ -131,7 +897,10 @@ def test_allocation_raises_after_exhausting_its_attempts():
         (version, _LARGE_CLAIM)
     )
 
-    with pytest.raises(RuntimeError, match="after 3 attempts"):
+    # This module's own taxonomy, not a bare RuntimeError: a supervisor
+    # catching CaptureStorageError to back off on an exhausted PUBLISH would
+    # otherwise crash on an exhausted ALLOCATION one statement earlier.
+    with pytest.raises(CatalogVersionAllocationError, match="after 3 attempts"):
         writer.allocate_version()
 
     assert sum("version_claims" in q for q in server.inserts) == 3
@@ -139,10 +908,11 @@ def test_allocation_raises_after_exhausting_its_attempts():
 
 def test_a_restarted_writer_allocates_above_previous_publications():
     server = _CatalogServer()
-    first = _writer(server)
+    first = _publisher(server)
     version = first.allocate_version()
-    first.publish_watermark(
-        index_version=version, published_at_ns=1, indexed_rows=0, indexed_packs=0
+    first.publish_snapshot(
+        index_version=version, refs=(), published_at_ns=1, indexed_rows=0,
+        indexed_packs=0,
     )
 
     # A fresh instance holds no in-memory state; the claims table alone must
@@ -170,6 +940,58 @@ def test_allocation_attempts_must_be_a_positive_integer():
     for value in (0, -1, 1.5):
         with pytest.raises(ValueError, match="allocation_attempts"):
             ClickHouseCatalogConfig(allocation_attempts=value)
+
+
+def test_a_losing_publish_leaves_its_membership_rows_inert():
+    """Why a loser can leave its rows behind instead of cleaning up.
+
+    The version barrier still has work to do under the lease, because a lease
+    hands over. Indexer A allocates and then stalls long enough to lose its
+    lease. B takes over, allocates higher and publishes. A comes back, takes
+    the lease again -- B's has expired by now -- and publishes the version it
+    allocated before any of this, which is below the published head.
+
+    A holds the lease, so the fence lets its manifest rows through; the version
+    barrier is what stops it. Those rows are durable and its version never
+    reaches the watermark table, and the reader's membership clause requires
+    BOTH, so they can never enter a snapshot. Cleaning them up is therefore
+    unnecessary for correctness (though they do accumulate; see
+    docs/catalog-descriptor-key.md on the GC obligation).
+    """
+    server = _CatalogServer()
+    slow = _publisher(server, "slow")
+    ref = PackRef(
+        pack_id=str(UUID(int=7)), store_id="local",
+        object_key="packs/a.dmi-pack", object_bytes=1024,
+        checksum="0" * 64, record_count=1,
+    )
+
+    version_a = slow.allocate_version()
+    _expire_the_lease(server)
+    fast = _publisher(server, "fast")
+    version_b = fast.allocate_version()
+    assert version_b > version_a
+
+    fast.publish_snapshot(
+        index_version=version_b, refs=(), published_at_ns=1,
+        indexed_rows=0, indexed_packs=0,
+    )
+    _expire_the_lease(server)
+    slow.acquire_publisher_lease("slow")
+    with pytest.raises(SnapshotPublishRaceError):
+        slow.publish_snapshot(
+            index_version=version_a, refs=[ref], published_at_ns=2,
+            indexed_rows=1, indexed_packs=1,
+        )
+
+    assert any(row[0] == version_a for row in server.manifest), (
+        "precondition: the loser really did write its membership rows"
+    )
+    assert version_a not in server.watermarks, (
+        "the loser wrote a watermark row, which would admit its rows into a "
+        "snapshot pinned at the winner's version"
+    )
+    assert server.watermarks == [version_b]
 
 
 # --- indexers over the shared server -------------------------------------------
@@ -217,18 +1039,22 @@ def _refs(tmp_path: Path, count: int):
 
 
 def test_clock_rollback_across_indexers_cannot_reorder_publications(tmp_path: Path):
-    """Two indexers with skewed clocks, then the skew reversed.
+    """Successive indexers with skewed clocks, then the skew reversed.
 
     Publications must be strictly increasing regardless of what any wall clock
     says: the version is allocator-owned and the clock stamps published_at_ns
-    only.
+    only. Each indexer takes the lease over from the last, which is what one
+    replacing another looks like.
     """
     server = _CatalogServer()
     store, refs = _refs(tmp_path, 4)
 
     for clock_value, ref in ((1_000, refs[0]), (100, refs[1]),
                              (100, refs[2]), (1_000, refs[3])):
-        indexer = CatalogIndexer(store, _writer(server), clock_ns=lambda v=clock_value: v)
+        _expire_the_lease(server)
+        indexer = CatalogIndexer(
+            store, _publisher(server), clock_ns=lambda v=clock_value: v
+        )
         result = indexer.index([ref])
         assert result.indexed_packs == 1
 
@@ -241,6 +1067,8 @@ def test_clock_rollback_across_indexers_cannot_reorder_publications(tmp_path: Pa
 
 class _HostileWriter:
     """A CatalogWriter whose allocator misbehaves in a scripted way."""
+
+    publisher_lease = "held"
 
     def __init__(self, allocate, *, last_published: int = 0):
         self._allocate = allocate
@@ -255,8 +1083,8 @@ class _HostileWriter:
     def commit_packs(self, refs, *, index_version):
         pass
 
-    def publish_watermark(
-        self, *, index_version, published_at_ns, indexed_rows, indexed_packs
+    def publish_snapshot(
+        self, *, index_version, refs, published_at_ns, indexed_rows, indexed_packs
     ):
         pass
 
@@ -271,21 +1099,82 @@ class _Store:
     store_id = "local"
 
 
-@pytest.mark.parametrize("value", [-1, "7", True, 4.0])
-def test_the_indexer_rejects_a_non_integer_or_negative_allocation(value):
-    indexer = CatalogIndexer(_Store(), _HostileWriter(lambda: value))
+# 0 among them because the guard was tightened from `< 0` to `< 1` and the case
+# that tightening was FOR was never exercised: last_published_version() is at
+# least 0, so an allocator that can return 0 has already broken the
+# strictly-above-the-head contract.
+@pytest.mark.parametrize("value", [0, -1, "7", True, 4.0])
+def test_the_indexer_rejects_a_non_integer_or_negative_allocation(
+    tmp_path: Path, value
+):
+    # A real pack, because a batch with nothing to index no longer allocates
+    # (or publishes) at all -- the guard runs on the way to real writes.
+    store, refs = _refs(tmp_path, 1)
+    indexer = CatalogIndexer(store, _HostileWriter(lambda: value))
 
     with pytest.raises(ValueError, match="allocate_version"):
-        indexer.index([])
+        indexer.index(refs)
+
+
+class _RacingWriter(_HostileWriter):
+    """Publishes are refused as lost races, and the durable head moves.
+
+    Models the situation the retry loop is for: this publisher is losing to
+    another one that keeps landing higher versions.
+    """
+
+    def __init__(self, allocate, *, last_published: int, head_after_race: int):
+        super().__init__(allocate, last_published=last_published)
+        self._head_after_race = head_after_race
+        self.publishes = 0
+
+    def publish_snapshot(self, **kwargs):
+        self.publishes += 1
+        # The competitor has advanced the durable head past anything this
+        # allocator will hand out.
+        self._last_published = self._head_after_race
+        raise SnapshotPublishRaceError("lost the race")
+
+
+def test_a_lost_race_rechecks_the_durable_head_before_retrying(tmp_path: Path):
+    """The cross-check must not be evaluated against a head known to be stale.
+
+    `_allocate_version` reads `last_published_version()` once and caches it,
+    and the retry path re-allocated without clearing that cache -- so the
+    "strictly above the durable head" guard was checked against the head as of
+    the FIRST attempt, at exactly the moment it was known to have moved.
+
+    With an allocator whose versions are above the stale head and below the
+    real one, every retry passed the guard, rewrote the whole descriptor batch
+    at a version the server would refuse, and the loop ended in
+    `SnapshotPublishExhaustedError` -- "something is publishing continuously"
+    -- rather than the allocation error this guard exists to raise.
+    """
+    store, refs = _refs(tmp_path, 1)
+    writer = _RacingWriter(
+        lambda: next(counter), last_published=10, head_after_race=20
+    )
+    counter = iter(range(11, 40))
+    indexer = CatalogIndexer(store, writer)
+
+    with pytest.raises(CatalogVersionAllocationError, match="non-monotonic"):
+        indexer.index(refs)
+
+    # It gave up on the SECOND attempt, once the refreshed head refused the
+    # allocation, rather than burning the whole budget.
+    assert writer.publishes == 1
 
 
 @pytest.mark.parametrize("allocated", [5, 4])
-def test_the_indexer_refuses_a_non_monotonic_allocation(allocated: int):
+def test_the_indexer_refuses_a_non_monotonic_allocation(
+    tmp_path: Path, allocated: int
+):
     # The durable watermark says 5 has been published; an allocator handing
     # out 5 (or lower) again would let this batch land inside pinned snapshots.
+    store, refs = _refs(tmp_path, 1)
     indexer = CatalogIndexer(
-        _Store(), _HostileWriter(lambda: allocated, last_published=5)
+        store, _HostileWriter(lambda: allocated, last_published=5)
     )
 
-    with pytest.raises(RuntimeError, match="non-monotonic"):
-        indexer.index([])
+    with pytest.raises(CatalogVersionAllocationError, match="non-monotonic"):
+        indexer.index(refs)

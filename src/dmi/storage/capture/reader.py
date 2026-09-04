@@ -27,7 +27,7 @@ from .extensions import (
     ExtensionRegistry,
 )
 from .pack import PackIndex, verify_payload
-from .summary import ArtifactRef, CoreTensorSummaryV1, decode_tensor, summarize_tensor
+from .summary import ArtifactRef, CoreTensorSummary, decode_tensor, summarize_tensor
 
 
 # Footer indexes verified during hydration are cached per pack, bounded so a
@@ -41,7 +41,7 @@ class CaptureSummary:
     """A versioned core summary plus whatever extensions contributed."""
 
     capture_id: str
-    core: CoreTensorSummaryV1
+    core: CoreTensorSummary
     scalars: Mapping[str, float]
     artifacts: tuple[ArtifactRef, ...]
     failures: tuple[ExtensionFailure, ...]

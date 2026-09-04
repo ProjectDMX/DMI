@@ -7,6 +7,7 @@ import json
 import re
 import struct
 from typing import Iterable
+from urllib.parse import quote
 from uuid import UUID
 import zlib
 
@@ -548,10 +549,119 @@ def _parse_records(decoded: dict[str, object], footer_offset: int) -> tuple[_Ind
     return tuple(records)
 
 
+_DIGEST_PREFIX = "sha256-"
+
+
+def key_component(value: str) -> str:
+    """Encode one identifier as a single object-key segment.
+
+    Lives here rather than beside the key builder in :mod:`.pipeline` because
+    it now has a second caller: ``_descriptors`` compares a pack's footer
+    against the key it was found under, and a verifier that re-implemented the
+    encoding would drift from the writer that produced it.
+
+    ``quote()`` treats ``~`` as always-safe per RFC 3986 and ignores ``safe``
+    for it, but the object-key pattern does not allow it. Left alone, an
+    identifier containing ``~`` produces a key every store rejects, and the
+    sink failure is fatal to the whole pipeline. An identifier too long for a
+    key segment is replaced by a digest of itself, which is one-way -- so the
+    comparison below has to be able to recognise that form too.
+    """
+    encoded = quote(value, safe="-_.=").replace("~", "%7E")
+    if len(encoded.encode()) <= 160 and not encoded.startswith(_DIGEST_PREFIX):
+        return encoded
+    # The digest prefix is RESERVED, so the two output forms cannot collide.
+    # Without this an identifier whose own text is `sha256-<64 hex>` -- short
+    # enough to pass directly, and well under the metadata length limit --
+    # encoded to exactly the segment some longer identifier digests to. Both
+    # then named the same `tenant=` segment, and `_reject_a_foreign_tenant`
+    # compares re-encoded values, so it could not tell the two apart: a pack
+    # for one was accepted under a key belonging to the other. Digesting any
+    # identifier that already looks like a digest keeps the mapping one-to-one.
+    # Only identifiers literally beginning with `sha256-` encode differently
+    # than before, so the v1 key layout is unchanged for every other one.
+    return _DIGEST_PREFIX + sha256(value.encode()).hexdigest()
+
+
+def _tenant_segment(object_key: str) -> str | None:
+    """The ``tenant=`` segment of a key laid out by ``object_key_for``."""
+    for segment in object_key.split("/"):
+        if segment.startswith("tenant="):
+            return segment[len("tenant=") :]
+    return None
+
+
+_DIGEST_SHAPE = re.compile(r"sha256-[0-9a-f]{64}\Z")
+
+
+def _segment_belongs_to(segment: str, tenant: str) -> bool:
+    """Whether a ``tenant=`` key segment is one this tenant could have written.
+
+    The current encoding, or -- for a tenant whose name begins with the
+    reserved digest prefix -- the literal encoding that preceded the
+    reservation. Before ``key_component`` reserved ``sha256-``, a short name
+    such as ``sha256-team-a`` was written literally, so every existing pack
+    for it sits under ``tenant=sha256-team-a``; comparing only against the
+    new digest form refused all of them, at indexing and at hydration, and the
+    captures already in the catalog became unreadable.
+
+    The one literal NOT grandfathered is a name of digest shape itself,
+    ``sha256-<64 hex>``: that exact shape is the collision the reservation
+    closed, and accepting its literal would reopen the forgery. No legitimate
+    tenant is named after a hex digest.
+    """
+    if segment == key_component(tenant):
+        return True
+    return (
+        tenant.startswith(_DIGEST_PREFIX)
+        and _DIGEST_SHAPE.match(tenant) is None
+        and segment == quote(tenant, safe="-_.=").replace("~", "%7E")
+    )
+
+
+def _reject_a_foreign_tenant(ref: PackRef, records: tuple[_IndexedRecord, ...]) -> None:
+    """Bind what a pack CLAIMS to be to where it was actually found.
+
+    The footer names the tenant; the key prefix names where a writer with
+    credentials for that tenant is allowed to put objects. Nothing compared
+    them, so anyone able to PUT into the bucket could write a well-formed pack
+    whose footer carried another tenant's ``tenant_id`` and ``capture_id``,
+    have it indexed under the victim's tenant, and -- because the reader
+    resolves a capture with ``argMax`` over ``(index_version, store_id,
+    pack_id)`` -- become the pack that capture resolves to for every fresh
+    watermark. Integrity of the pack proves nothing here: the attacker's pack
+    is perfectly well-formed. Only its LOCATION is evidence, and this is where
+    the two meet.
+
+    A key with no ``tenant=`` segment is left alone: a filesystem store, a
+    test fixture and a hand-placed object are all legitimately laid out some
+    other way, and a check that guessed would refuse them all. What this
+    enforces is that a key which DOES name a tenant names the pack's own.
+    """
+    encoded = _tenant_segment(ref.object_key)
+    if encoded is None:
+        return
+    # Distinct tenants, not records: a well-formed pack carries one, so this
+    # is a single encode rather than one per record. Not hoisted out of the
+    # loop altogether, because a pack holding two tenants is precisely what
+    # this refuses -- every tenant present is still compared, in the order
+    # they appear so the refusal names the same one every time.
+    for tenant in dict.fromkeys(item.metadata.tenant_id for item in records):
+        if not _segment_belongs_to(encoded, tenant):
+            raise PackIntegrityError(
+                f"pack {ref.pack_id} at {ref.object_key!r} carries a record "
+                f"for tenant {tenant!r}, which is not the tenant that key "
+                "belongs to. A pack's footer is not evidence of whose it is -- "
+                "the location it was written to is -- so this is refused "
+                "rather than indexed under the tenant named by the key."
+            )
+
+
 def _descriptors(
     ref: PackRef, records: Iterable[_IndexedRecord]
 ) -> tuple[CaptureDescriptor, ...]:
     records = tuple(records)
+    _reject_a_foreign_tenant(ref, records)
     return tuple(
         CaptureDescriptor(
             metadata=item.metadata,

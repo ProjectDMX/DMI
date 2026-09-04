@@ -15,6 +15,7 @@ from uuid import UUID
 
 import pytest
 
+from tests._catalog_fakes import FakeLeaseTable
 from tests._faults import (
     FaultInjected,
     FaultyClickHouseClient,
@@ -22,7 +23,6 @@ from tests._faults import (
     FaultyPackStore,
     duplicate_on,
     fail_on,
-    fail_then_succeed,
     truncate_on,
 )
 
@@ -211,51 +211,102 @@ class _Client:
     def __init__(self):
         self.inserted: list[tuple[str, list]] = []
         self.claims: list[tuple[int, str]] = []
+        self.watermarks: list[tuple[int, str]] = []
+        self.manifest: list[tuple[int, str, str, str]] = []
+        self.lease = FakeLeaseTable()
 
     def execute(self, query, params=None, **kwargs):
+        leased = self.lease.execute(query, params)
+        if leased is not None:
+            return leased
         if query.lstrip().upper().startswith("INSERT"):
             self.inserted.append((query, list(params or [])))
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
+            elif "snapshot_manifest" in query:
+                if self.lease.fence_admits(query, params):
+                    self.manifest.extend(
+                        (
+                            params["index_version"],
+                            params["publish_id"],
+                            store_id,
+                            pack_id,
+                        )
+                        for store_id, pack_id in params["members"]
+                    )
+            elif "index_watermark" in query:
+                # The publish barrier is server-side, so the fake enforces it:
+                # a version lands only strictly above the published head, and
+                # the row carries the identity the publisher will read back.
+                # The fence check runs UNCONDITIONALLY -- short-circuited
+                # behind the barrier, a statement missing the fence would slip
+                # by whenever the barrier refused it.
+                version = params["index_version"]
+                fenced = self.lease.fence_admits(query, params)
+                if fenced and version > max(
+                    (v for v, _ in self.watermarks), default=0
+                ):
+                    self.watermarks.append((version, params["publish_id"]))
             return []
         if "version_claims" in query:
             if "max(version)" in query:
                 return [(max((v for v, _ in self.claims), default=None),)]
             wanted = params["version"]
             return [(cid,) for v, cid in self.claims if v == wanted]
-        if "index_watermark" in query:
-            published = [
-                p[0][0] for q, p in self.inserted if "index_watermark" in q
+        if "publish_id" in query and "index_watermark" in query:
+            return [
+                (publish_id,)
+                for version, publish_id in self.watermarks
+                if version == params["version"]
             ]
-            return [(max(published, default=None),)]
+        if "snapshot_manifest" in query and "SELECT count()" in query:
+            # The chunk read-back names its members; the whole-publish check
+            # after the watermark lands does not.
+            wanted = set(params["members"]) if "members" in params else None
+            found = {
+                (store_id, pack_id)
+                for version, publish_id, store_id, pack_id in self.manifest
+                if version == params["index_version"]
+                and publish_id == params["publish_id"]
+                and (wanted is None or (store_id, pack_id) in wanted)
+            }
+            return [(len(found),)]
+        if "index_watermark" in query:
+            return [(max((v for v, _ in self.watermarks), default=None),)]
         return []
 
 
 def _indexer(store, client, **config):
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig(**config))
+    # Insert 1 of every one of these tests: only the lease holder may publish,
+    # and the check rides inside the publish statement, so an indexer without
+    # one writes nothing.
+    writer.acquire_publisher_lease("indexer-under-fault")
     return CatalogIndexer(store, writer, clock_ns=lambda: 7)
 
 
 def test_an_insert_failure_does_not_commit_the_pack(tmp_path: Path):
     inner = FilesystemPackStore(tmp_path, store_id="local")
     ref = inner.put(_sealed(_record("capture-a")), "packs/a.dmi-pack")
-    # Insert 1 is the version claim; insert 2 is the descriptor batch.
-    client = FaultyClickHouseClient(_Client(), insert=fail_on(2))
+    # Insert 1 is the lease claim, 2 is the version claim, 3 is the descriptor
+    # batch.
+    client = FaultyClickHouseClient(_Client(), insert=fail_on(3))
 
     with pytest.raises(FaultInjected):
         _indexer(inner, client).index([ref])
 
     # Descriptors are written before the pack commit marker precisely so a
     # failure here leaves the pack uncommitted and the batch replayable.
-    assert client.call_counts.get("insert") == 2
+    assert client.call_counts.get("insert") == 3
 
 
 def test_a_duplicated_insert_is_absorbed_by_replay_semantics(tmp_path: Path):
     inner = FilesystemPackStore(tmp_path, store_id="local")
     ref = inner.put(_sealed(_record("capture-a")), "packs/a.dmi-pack")
     backing = _Client()
-    # Insert 1 is the version claim; duplicate the descriptor insert (2).
-    client = FaultyClickHouseClient(backing, insert=duplicate_on(2))
+    # Inserts 1 and 2 are the lease and version claims; duplicate the
+    # descriptor insert (3).
+    client = FaultyClickHouseClient(backing, insert=duplicate_on(3))
 
     result = _indexer(inner, client).index([ref])
 
@@ -290,14 +341,35 @@ def test_a_transient_outage_is_survivable_by_retrying_the_batch(tmp_path: Path):
     inner = FilesystemPackStore(tmp_path, store_id="local")
     ref = inner.put(_sealed(_record("capture-a")), "packs/a.dmi-pack")
     backing = _Client()
-    client = FaultyClickHouseClient(backing, insert=fail_then_succeed(1))
+    # Inserts 1-6 are the lease claim, version claim, descriptor batch, lease
+    # renewal, manifest rows and the next renewal; 7 is the watermark INSERT.
+    # The outage strikes THERE, mid-publish, so real partial state is at stake:
+    # membership rows are already durable, but no publish admits them and the
+    # pack is uncommitted. (This used to fail insert 1 -- the lease claim, made
+    # before index() runs at all -- so "nothing was committed" was trivially
+    # true and the replay property was never exercised.)
+    client = FaultyClickHouseClient(backing, insert=fail_on(7))
+    indexer = _indexer(inner, client)
 
     with pytest.raises(FaultInjected):
-        _indexer(inner, client).index([ref])
+        indexer.index([ref])
 
-    # Nothing was committed, so the identical call now succeeds -- indexing is
-    # replayable rather than requiring manual repair.
-    result = _indexer(inner, client).index([ref])
+    assert client.call_counts.get("insert") == 7, (
+        "the outage must strike the watermark INSERT, not the setup path"
+    )
+
+    # The pack was never committed, so the identical call re-reads it and
+    # converges -- indexing is replayable rather than requiring manual repair.
+    result = indexer.index([ref])
 
     assert result.indexed_packs == 1
     assert result.failed_packs == 0
+    # The partial state was real: the first attempt's descriptors were durable
+    # when it died, the retry wrote them again at its own version, and the
+    # pack entered the replay inventory exactly once.
+    descriptor_inserts = [q for q, _ in backing.inserted if "capture_raw" in q]
+    assert len(descriptor_inserts) == 2
+    inventory_inserts = [
+        q for q, _ in backing.inserted if "pack_inventory_raw" in q
+    ]
+    assert len(inventory_inserts) == 1

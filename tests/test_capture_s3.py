@@ -310,6 +310,8 @@ def test_s3_reconcile_page_contains_a_legal_foreign_key():
     client.objects[foreign_key] = (b"not a DMI pack", {})
 
     class _Writer:
+        publisher_lease = "held"
+
         def __init__(self):
             self.descriptors = []
             self.packs = []
@@ -323,7 +325,7 @@ def test_s3_reconcile_page_contains_a_legal_foreign_key():
         def commit_packs(self, refs, *, index_version):
             self.packs.extend(refs)
 
-        def publish_watermark(self, **_kwargs):
+        def publish_snapshot(self, **_kwargs):
             pass
 
         def last_published_version(self):

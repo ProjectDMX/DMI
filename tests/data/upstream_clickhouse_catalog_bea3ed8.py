@@ -1,0 +1,457 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import re
+import secrets
+from time import time_ns
+from typing import Protocol, Sequence
+from uuid import uuid4
+
+from .catalog import PackIdentity, SnapshotPublishRaceError
+from .model import CaptureDescriptor, PackRef
+
+
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+class ClickHouseClient(Protocol):
+    def execute(self, query: str, params=None, **kwargs): ...
+
+
+def _identifier(value: str) -> str:
+    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
+        raise ValueError(f"invalid ClickHouse identifier: {value!r}")
+    return value
+
+
+def _quoted(value: str) -> str:
+    return f"`{value}`"
+
+
+@dataclass(frozen=True, slots=True)
+class ClickHouseCatalogConfig:
+    database: str = "default"
+    table_prefix: str = "dmi"
+    query_pack_limit: int = 10_000
+    allocation_attempts: int = 16
+
+    def __post_init__(self) -> None:
+        _identifier(self.database)
+        _identifier(self.table_prefix)
+        if type(self.query_pack_limit) is not int or self.query_pack_limit <= 0:
+            raise ValueError("query_pack_limit must be positive")
+        if type(self.allocation_attempts) is not int or self.allocation_attempts <= 0:
+            raise ValueError("allocation_attempts must be positive")
+
+
+_CAPTURE_COLUMNS = (
+    "capture_id", "tenant_id", "experiment_id", "run_id", "session_id",
+    "request_id", "sequence_id", "model_id", "model_revision",
+    "adapter_revision", "capture_policy_version", "hook_name", "layer_number",
+    "producer_rank", "step_number", "token_start", "token_end",
+    "batch_position", "dtype", "shape", "captured_at_ns", "pack_id",
+    "store_id", "object_key", "object_bytes", "pack_checksum",
+    "pack_record_count", "payload_offset", "stored_length", "decoded_length",
+    "codec", "payload_checksum", "index_version",
+)
+
+# Catalog facets: descriptor-derived columns that make the catalog filterable
+# and sortable server-side. They are pure functions of columns the writer
+# already stores, so MATERIALIZED computes them at insert with no indexer
+# change and no extra object reads.
+#
+# The casts are not decoration. On ClickHouse 26.9 ``arrayProduct`` returns
+# Float64, ``UInt64 - UInt64`` returns Int64, and ``nullIf`` makes an
+# expression Nullable -- none of which fit these column types.
+_FACET_COLUMNS = (
+    ("facet_version", "UInt16", "1"),
+    ("element_count", "UInt64", "toUInt64(arrayProduct(shape))"),
+    ("tensor_rank", "UInt8", "toUInt8(length(shape))"),
+    ("token_span", "UInt64", "toUInt64(token_end - token_start)"),
+    (
+        "compression_ratio",
+        "Float32",
+        "toFloat32(if(stored_length = 0, 0, decoded_length / stored_length))",
+    ),
+)
+
+
+def _facet_ddl() -> str:
+    return ",\n".join(
+        f"{name} {kind} MATERIALIZED {expression}"
+        for name, kind, expression in _FACET_COLUMNS
+    )
+
+
+_PACK_COLUMNS = (
+    "pack_id", "store_id", "object_key", "object_bytes", "pack_checksum",
+    "record_count", "index_version",
+)
+
+# The descriptor table's PHYSICAL sort key, which is not the same thing as the
+# logical capture identity the reader groups, orders and paginates on
+# (``clickhouse_reader._SORT_KEY``, the five columns this starts with).
+#
+# ReplacingMergeTree deletes rows that share a sort key, keeping the highest
+# index_version. On capture identity alone that is only safe while two rows for
+# one capture are byte identical -- which nothing enforces. A pack copied to a
+# second store and reconciled, or a producer retrying a capture_id after the
+# first pack was sealed, both produce two rows for one capture with different
+# locators; a merge would then silently delete one, and a snapshot pinned to the
+# deleted row's pack fails with "selection no longer resolves". Appending pack
+# identity gives those rows different keys, so no merge can collapse them.
+#
+# Rows for one capture in the SAME pack still share the full key and still
+# collapse -- and those really are byte identical, which is the replay case the
+# engine is here for.
+_CAPTURE_TABLE_ORDER = (
+    "tenant_id", "experiment_id", "run_id", "captured_at_ns", "capture_id",
+    "store_id", "pack_id",
+)
+
+
+class ClickHouseCatalogWriter:
+    def __init__(
+        self, client: ClickHouseClient, config: ClickHouseCatalogConfig | None = None
+    ) -> None:
+        self._client = client
+        self._config = config or ClickHouseCatalogConfig()
+        prefix = self._config.table_prefix
+        self._capture_raw = f"{prefix}_capture_raw"
+        self._capture_view = f"{prefix}_capture"
+        self._pack_raw = f"{prefix}_pack_inventory_raw"
+        self._pack_view = f"{prefix}_pack_inventory"
+        self._watermark = f"{prefix}_index_watermark"
+        self._manifest = f"{prefix}_snapshot_manifest"
+        self._version_claims = f"{prefix}_capture_version_claims"
+
+    def ensure_schema(self) -> None:
+        database = _quoted(self._config.database)
+        capture_raw = f"{database}.{_quoted(self._capture_raw)}"
+        capture_view = f"{database}.{_quoted(self._capture_view)}"
+        pack_raw = f"{database}.{_quoted(self._pack_raw)}"
+        pack_view = f"{database}.{_quoted(self._pack_view)}"
+        self._client.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {capture_raw} (
+capture_id String, tenant_id String, experiment_id String, run_id String,
+session_id String, request_id String, sequence_id String, model_id String,
+model_revision String, adapter_revision Nullable(String),
+capture_policy_version String, hook_name LowCardinality(String), layer_number Int32,
+producer_rank UInt32, step_number UInt64, token_start UInt64, token_end UInt64,
+batch_position UInt32, dtype LowCardinality(String), shape Array(UInt32),
+captured_at_ns UInt64, pack_id UUID, store_id LowCardinality(String), object_key String,
+object_bytes UInt64, pack_checksum FixedString(64), pack_record_count UInt32,
+payload_offset UInt64, stored_length UInt64, decoded_length UInt64,
+codec LowCardinality(String), payload_checksum FixedString(8), index_version UInt64,
+{_facet_ddl()}
+) ENGINE = ReplacingMergeTree(index_version)
+ORDER BY ({', '.join(_CAPTURE_TABLE_ORDER)})"""
+        )
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {pack_raw} (
+pack_id UUID, store_id LowCardinality(String), object_key String,
+object_bytes UInt64, pack_checksum FixedString(64), record_count UInt32,
+index_version UInt64
+) ENGINE = ReplacingMergeTree(index_version)
+ORDER BY (store_id, pack_id)"""
+        )
+        # Tables created by an earlier build predate the facet columns, and
+        # CREATE TABLE IF NOT EXISTS will not add them. ADD COLUMN IF NOT
+        # EXISTS is idempotent, so this is safe on every start.
+        for name, kind, expression in _FACET_COLUMNS:
+            self._client.execute(
+                f"ALTER TABLE {capture_raw} ADD COLUMN IF NOT EXISTS "
+                f"{name} {kind} MATERIALIZED {expression}"
+            )
+
+        # Point lookups arrive with tenant + capture_id. The primary key
+        # prunes to the tenant's range, but capture_id sits behind
+        # captured_at_ns in the ORDER BY and a point lookup supplies no time
+        # bound, so inside a large tenant the primary index cannot narrow
+        # further; the bloom filter prunes granules within that range.
+        self._client.execute(
+            f"ALTER TABLE {capture_raw} ADD INDEX IF NOT EXISTS "
+            "capture_id_bloom capture_id TYPE bloom_filter(0.01) GRANULARITY 4"
+        )
+        # Parts written after ADD INDEX are indexed at insert; MATERIALIZE
+        # builds it for the parts that already exist, and is a no-op once
+        # they are covered, so this is safe on every start.
+        self._client.execute(
+            f"ALTER TABLE {capture_raw} MATERIALIZE INDEX capture_id_bloom"
+        )
+
+        # A version becomes readable only once its whole batch is durable, so
+        # the watermark cannot be derived from the descriptor table: a reader
+        # sampling max(index_version) there sees a version mid-batch, between
+        # the INSERTs that make it up. This table is written as the last step of
+        # an indexing call instead. Plain MergeTree, because it is a log --
+        # ReplacingMergeTree would eventually collapse the history a pinned
+        # snapshot reads.
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._watermark)} (
+index_version UInt64, published_at_ns UInt64, indexed_rows UInt64, indexed_packs UInt32
+) ENGINE = MergeTree ORDER BY index_version"""
+        )
+
+        # The version allocator's append-only claim ledger. A claimant owns a
+        # version only when its post-insert read shows it is that version's
+        # sole claimant; claimed_at_ns is diagnostic only -- no wall clock
+        # participates in ordering.
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._version_claims)} (
+version UInt64, claim_id UUID, claimed_at_ns UInt64
+) ENGINE = MergeTree ORDER BY (version, claim_id)"""
+        )
+
+        # The snapshot boundary. "The catalog as of W" is "the packs whose
+        # membership rows were published at or before W" -- a fact about packs,
+        # not about descriptor rows. Keeping it here, append-only, is what lets
+        # the descriptor table stay a ReplacingMergeTree: the only rows that
+        # table can now collapse are rows for one capture in one pack, and
+        # those are byte identical, so it does not matter which one a merge
+        # keeps.
+        #
+        # These rows are written by publish_snapshot, not by commit_packs. The
+        # predecessor table was written before the watermark, which let a
+        # slower indexer's rows land underneath a watermark a reader had
+        # already pinned. A row here counts only once its version reaches the
+        # watermark table (see the reader's membership clause), and a publish
+        # that loses the race never writes that watermark row -- so the rows it
+        # left behind are inert.
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {database}.{_quoted(self._manifest)} (
+index_version UInt64, store_id LowCardinality(String), pack_id UUID
+) ENGINE = MergeTree ORDER BY (index_version, store_id, pack_id)"""
+        )
+
+        capture_public = ", ".join(_CAPTURE_COLUMNS[:-1])
+        pack_public = ", ".join(_PACK_COLUMNS[:-1])
+        self._client.execute(
+            f"CREATE VIEW IF NOT EXISTS {capture_view} AS "
+            f"SELECT {capture_public} FROM {capture_raw} FINAL"
+        )
+        self._client.execute(
+            f"CREATE VIEW IF NOT EXISTS {pack_view} AS "
+            f"SELECT {pack_public} FROM {pack_raw} FINAL"
+        )
+
+    def committed_pack_ids(
+        self, identities: Sequence[PackIdentity]
+    ) -> set[PackIdentity]:
+        if not identities:
+            return set()
+        if len(identities) > self._config.query_pack_limit:
+            raise ValueError("pack identity query exceeds query_pack_limit")
+        table = self._qualified(self._pack_view)
+        rows = self._client.execute(
+            f"SELECT store_id, toString(pack_id) FROM {table} "
+            "WHERE (store_id, pack_id) IN %(identities)s",
+            {"identities": list(identities)},
+        )
+        return {(self._text(row[0]), self._text(row[1])) for row in rows}
+
+    def write_descriptors(
+        self, descriptors: Sequence[CaptureDescriptor], *, index_version: int
+    ) -> None:
+        if not descriptors:
+            return
+        self._validate_version(index_version)
+        rows = [self._descriptor_row(item, index_version) for item in descriptors]
+        self._client.execute(
+            f"INSERT INTO {self._qualified(self._capture_raw)} "
+            f"({', '.join(_CAPTURE_COLUMNS)}) VALUES",
+            rows,
+        )
+
+    def publish_snapshot(
+        self,
+        *,
+        index_version: int,
+        refs: Sequence[PackRef],
+        published_at_ns: int,
+        indexed_rows: int,
+        indexed_packs: int,
+    ) -> None:
+        """Make a version readable, after everything it covers is durable.
+
+        Membership rows first, then the watermark row that admits them. A
+        reader's membership clause requires both, so the order is what makes a
+        half-finished publish invisible rather than partially visible.
+        """
+        self._validate_version(index_version)
+        self._validate_version(published_at_ns)
+        watermark = self._qualified(self._watermark)
+        if refs:
+            self._client.execute(
+                f"INSERT INTO {self._qualified(self._manifest)} "
+                "(index_version, store_id, pack_id) VALUES",
+                [(index_version, ref.store_id, ref.pack_id) for ref in refs],
+            )
+        # The barrier and the visibility write are ONE server-side statement,
+        # so the gap between "am I the highest?" and "I am now visible" holds
+        # no client round trip -- no network hop, no GC pause, no scheduler
+        # stall. A separate SELECT then INSERT left that whole window open.
+        #
+        # This also subsumes the indexer's non-monotonic-version guard: the
+        # server itself now refuses a version that is not strictly above the
+        # published head, so a broken allocator cannot publish underneath a
+        # watermark a reader already pinned.
+        #
+        # It NARROWS the race, it does not close it. Two publishers can still
+        # both evaluate the condition inside the server-side overlap of their
+        # two statements and both insert; the lower one then becomes visible
+        # under a watermark that was pinned before it existed, silently. See
+        # docs/catalog-descriptor-key.md.
+        self._client.execute(
+            f"INSERT INTO {watermark} "
+            "(index_version, published_at_ns, indexed_rows, indexed_packs) "
+            "SELECT %(index_version)s, %(published_at_ns)s, "
+            "toUInt64(%(indexed_rows)s), toUInt32(%(indexed_packs)s) "
+            "FROM system.one "
+            f"WHERE (SELECT max(index_version) FROM {watermark}) "
+            "< %(index_version)s",
+            {
+                "index_version": index_version,
+                "published_at_ns": published_at_ns,
+                "indexed_rows": indexed_rows,
+                "indexed_packs": indexed_packs,
+            },
+        )
+        landed = self._client.execute(
+            f"SELECT count() FROM {watermark} WHERE index_version = %(version)s",
+            {"version": index_version},
+        )
+        if not landed or not landed[0] or not landed[0][0]:
+            raise SnapshotPublishRaceError(
+                f"catalog version {index_version} lost the publish race; "
+                "nothing it wrote is visible"
+            )
+
+    def last_published_version(self) -> int:
+        """Highest published index_version, or 0 when nothing is published."""
+        return self._max_version(
+            self._watermark,
+            "index_version",
+            "watermark table returned an invalid version",
+        )
+
+    def allocate_version(self) -> int:
+        """Allocate the next catalog version: strictly monotonic and unique.
+
+        Sole-claimant protocol over the append-only claims table. Each attempt
+        picks a candidate above everything already claimed or published,
+        inserts a claim for it, then reads the claims for that version back: a
+        claimant proceeds ONLY when its post-insert read shows it is the sole
+        claimant. On a server with monotonic read-your-writes visibility
+        (single node; replicated setups need select_sequential_consistency),
+        for two claimants of the same version the later insert always observes
+        the earlier one, so at most one of them sees a singleton -- contested
+        versions are abandoned by everyone who sees the contest. Every
+        RETURNED version is durably in the claims table, so later allocations
+        always start above it: monotonic + unique, with no clock anywhere in
+        the ordering. ``claimed_at_ns`` is diagnostic only.
+        """
+        attempts = self._config.allocation_attempts
+        for attempt in range(attempts):
+            claimed = self._max_version(
+                self._version_claims,
+                "version",
+                "claims table returned an invalid version",
+            )
+            floor = max(claimed, self.last_published_version())
+            # A randomized skip only after a collision, so two contenders that
+            # keep colliding spread out instead of racing for floor + 1 again.
+            candidate = floor + 1 + (secrets.randbelow(8 * attempt + 1) if attempt else 0)
+            self._validate_version(candidate)
+            claim_id = str(uuid4())
+            self._client.execute(
+                f"INSERT INTO {self._qualified(self._version_claims)} "
+                "(version, claim_id, claimed_at_ns) VALUES",
+                [(candidate, claim_id, time_ns())],
+            )
+            owners = self._client.execute(
+                f"SELECT toString(claim_id) FROM "
+                f"{self._qualified(self._version_claims)} "
+                "WHERE version = %(version)s",
+                {"version": candidate},
+            )
+            if {self._text(row[0]) for row in owners} == {claim_id}:
+                return candidate
+            # Contested: someone else claimed the same version -- abandon it
+            # entirely and retry above it.
+        raise RuntimeError(
+            f"could not allocate a catalog version after {attempts} attempts"
+        )
+
+    def _max_version(self, table: str, column: str, message: str) -> int:
+        rows = self._client.execute(
+            f"SELECT max({column}) FROM {self._qualified(table)}"
+        )
+        if not rows or not rows[0] or rows[0][0] is None:
+            return 0
+        value = rows[0][0]
+        if type(value) is not int or value < 0:
+            raise ValueError(message)
+        return value
+
+    def commit_packs(
+        self, refs: Sequence[PackRef], *, index_version: int
+    ) -> None:
+        if not refs:
+            return
+        self._validate_version(index_version)
+        rows = [
+            (
+                ref.pack_id, ref.store_id, ref.object_key, ref.object_bytes,
+                ref.checksum, ref.record_count, index_version,
+            )
+            for ref in refs
+        ]
+        # The replay guard, and nothing else: committed_pack_ids reads this
+        # inventory to skip packs it has already indexed. Snapshot membership
+        # used to be written here too; it now belongs to publish_snapshot, so
+        # that a pack becomes visible and becomes skippable at two clearly
+        # ordered moments rather than one. CatalogIndexer calls this AFTER a
+        # successful publish, so a crash in between leaves a pack that is
+        # visible but not yet skippable -- redundant work next pass, never the
+        # reverse.
+        self._client.execute(
+            f"INSERT INTO {self._qualified(self._pack_raw)} "
+            f"({', '.join(_PACK_COLUMNS)}) VALUES",
+            rows,
+        )
+
+    def _qualified(self, table: str) -> str:
+        return f"{_quoted(self._config.database)}.{_quoted(table)}"
+
+    @staticmethod
+    def _validate_version(index_version: int) -> None:
+        if type(index_version) is not int or not 0 <= index_version < 2**64:
+            raise ValueError("index_version must fit UInt64")
+
+    @staticmethod
+    def _text(value: object) -> str:
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        if not isinstance(value, str):
+            raise ValueError("ClickHouse returned an invalid pack identity")
+        return value
+
+    @staticmethod
+    def _descriptor_row(item: CaptureDescriptor, index_version: int) -> tuple:
+        metadata = item.metadata
+        locator = item.locator
+        return (
+            metadata.capture_id, metadata.tenant_id, metadata.experiment_id,
+            metadata.run_id, metadata.session_id, metadata.request_id,
+            metadata.sequence_id, metadata.model_id, metadata.model_revision,
+            metadata.adapter_revision, metadata.capture_policy_version,
+            metadata.hook_name, metadata.layer_number, metadata.producer_rank,
+            metadata.step_number, metadata.token_start, metadata.token_end,
+            metadata.batch_position, metadata.dtype, list(metadata.shape),
+            metadata.captured_at_ns, locator.pack_id, locator.store_id,
+            locator.object_key, locator.object_bytes, locator.pack_checksum,
+            locator.pack_record_count, locator.offset, locator.stored_length,
+            locator.decoded_length, locator.codec, locator.checksum, index_version,
+        )
