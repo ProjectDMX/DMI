@@ -64,8 +64,10 @@ class SnapshotPublishExhaustedError(CaptureStorageError):
     refused by the version barrier, chained (``__cause__``) to the last
     :class:`SnapshotPublishRaceError`. Each individual race is retryable, but
     this many in a row means something is publishing continuously against this
-    catalog -- or the barrier itself is refusing everything, e.g. a server
-    profile where an aggregate over the empty watermark table answers NULL --
+    catalog -- or the barrier or the fence is refusing everything, e.g. a
+    server profile where an aggregate over the empty watermark table answers
+    NULL, or a lease TTL so close to ``publish_timeout_ns + clock_skew_ns``
+    that a renewal cannot reach the fence with the margin it demands --
     so it is surfaced through the module's own error taxonomy for a supervisor
     to back off on, rather than as a bare RuntimeError that no
     ``except CaptureStorageError`` handler sees.

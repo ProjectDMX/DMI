@@ -684,17 +684,46 @@ def test_the_skew_bound_rides_in_the_fenced_statements_as_a_parameter():
     [
         ({"lease_ttl_ns": 0}, "lease_ttl_ns"),
         ({"publish_timeout_ns": -1}, "publish_timeout_ns"),
-        ({"publish_timeout_ns": 30_000_000_000}, "must be below lease_ttl_ns"),
+        ({"publish_timeout_ns": 30_000_000_000}, "must exceed publish_timeout_ns"),
         ({"clock_skew_ns": -1}, "clock_skew_ns"),
         ({"clock_skew_ns": 1.5}, "clock_skew_ns"),
         # The margin is what remains of the TTL after the publish cap AND the
-        # skew bound are both subtracted, so together they have to leave some.
-        ({"clock_skew_ns": 25_000_000_000}, "must be below lease_ttl_ns"),
+        # skew bound are both subtracted, so together they have to leave a
+        # usable one -- more than a client round trip, since the renewal that
+        # precedes every fenced statement has to reach the fence inside it.
+        ({"clock_skew_ns": 25_000_000_000}, "must exceed publish_timeout_ns"),
+        ({"clock_skew_ns": 24_999_999_999}, "this leaves 1 ns"),
     ],
 )
 def test_the_lease_settings_are_validated(config, message):
     with pytest.raises(ValueError, match=message):
         ClickHouseCatalogConfig(**config)
+
+
+def test_a_margin_thinner_than_a_round_trip_is_refused_at_construction():
+    """A fence nothing can ever pass is a configuration error, not a race.
+
+    The fence is SAFE at any positive margin, so the old check only required
+    one. But the margin is also the whole time a renewal has to reach the
+    fence: below a round trip every publish is refused by its own fence, the
+    indexer burns each attempt rewriting descriptors at a higher version, and
+    the failure surfaces as SnapshotPublishExhaustedError blaming a competing
+    publisher.
+    """
+    from dmi.storage.capture.clickhouse_catalog import MINIMUM_FENCE_MARGIN_NS
+
+    with pytest.raises(ValueError, match="this leaves 1 ns"):
+        ClickHouseCatalogConfig(
+            lease_ttl_ns=6_000_000_000,
+            publish_timeout_ns=5_000_000_000,
+            clock_skew_ns=999_999_999,
+        )
+    # The smallest margin the live suites use is exactly the floor, so the
+    # floor cannot be raised without changing them.
+    assert ClickHouseCatalogConfig(
+        lease_ttl_ns=1_000_000_000 + MINIMUM_FENCE_MARGIN_NS,
+        publish_timeout_ns=1_000_000_000,
+    )
 
 
 def test_the_fake_matches_the_fence_the_writer_actually_emits():

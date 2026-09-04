@@ -5,12 +5,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from .catalog import PublisherLeaseError, PublisherLeaseHeldError
-from .clickhouse_sql import DECIDING_READ
-
-
-
-class ClickHouseClient(Protocol):
-    def execute(self, query: str, params=None, **kwargs): ...
+from .clickhouse_sql import DECIDING_READ, ClickHouseClient, quorum_write, text
 
 
 class LeaseConfig(Protocol):
@@ -54,6 +49,11 @@ class ClickHouseLeaseCoordinator:
     @property
     def lease(self) -> PublisherLease | None:
         return self._lease
+
+    @property
+    def ttl_ns(self) -> int:
+        """How long a claim stays live -- the bound on waiting out a dead one."""
+        return self._config.lease_ttl_ns
 
     def acquire(self, holder: str) -> PublisherLease:
         # Bounded in BYTES, which is what the column stores and what the
@@ -286,19 +286,7 @@ class ClickHouseLeaseCoordinator:
         )
 
     def _quorum_write(self) -> dict[str, object]:
-        quorum = self._config.insert_quorum
-        if quorum is None:
-            return {}
-        # insert_quorum_parallel is cleared alongside: ClickHouse's
-        # select_sequential_consistency does not work with it, so the quorum
-        # without this buys latency and no guarantee. The timeout is bounded
-        # for the reason the catalog's copy explains: the default is 600s, and
-        # nothing else caps a lease claim.
-        return {
-            "insert_quorum": quorum,
-            "insert_quorum_parallel": 0,
-            "insert_quorum_timeout": self._config.publish_timeout_ns // 1_000_000,
-        }
+        return quorum_write(self._config)
 
     @property
     def _qualified_table(self) -> str:
@@ -308,12 +296,4 @@ class ClickHouseLeaseCoordinator:
     def _validate_term(term: int) -> None:
         if type(term) is not int or not 0 <= term <= 2**64 - 1:
             raise ValueError("lease term must be an integer in [0, 2^64 - 1]")
-    @staticmethod
-    def _text(value: object) -> str:
-        if isinstance(value, bytes):
-            return value.decode("utf-8")
-        if not isinstance(value, str):
-            raise TypeError(
-                f"expected text from ClickHouse, got {type(value).__name__}"
-            )
-        return value
+    _text = staticmethod(text)

@@ -80,7 +80,13 @@ Expected submodule paths:
 
 ## 2. Install ClickHouse server
 
-DMI writes captured tensors into a ClickHouse table. Follow the
+DMI writes captured tensors into a ClickHouse table. **ClickHouse 24.11 or
+later is required**: the catalog's schema check asks `CHECK GRANT SHOW TABLES`
+about each object before it reaches a verdict, and that statement arrived in
+24.11. `system.tables` is grant-filtered per role, so without the probe an
+object this role cannot see is indistinguishable from one that was dropped,
+and there is nothing safe to fall back to. The suites and the published
+measurements run against 25.12. Follow the
 [ClickHouse installation guide](https://clickhouse.com/docs/install) for your
 platform.
 

@@ -24,6 +24,45 @@ DECIDING_READ = {"select_sequential_consistency": 1}
 T = TypeVar("T")
 
 
+class QuorumConfig(Protocol):
+    publish_timeout_ns: int
+    insert_quorum: int | None
+
+
+def quorum_write(config: QuorumConfig) -> dict[str, object]:
+    """The settings that make a DECIDING write durable before it is read.
+
+    Empty unless an operator has opted in, so a single-node deployment pays
+    nothing and nothing changes for anyone who has not asked for it.
+    ``insert_quorum_parallel`` is turned OFF alongside, because
+    ``select_sequential_consistency`` does not work with it -- setting the
+    quorum without clearing the parallel flag would buy latency and no
+    guarantee at all.
+
+    The timeout is BOUNDED, and this is not a detail: ClickHouse waits
+    ``insert_quorum_timeout`` for the replicas to acknowledge, and its default
+    is 600 seconds. The fenced publish statements are already capped by
+    ``max_execution_time``, but the version and lease claims are not -- so an
+    unreachable replica would park a claim for ten minutes, twenty times the
+    publish cap and twenty times the lease TTL, while the writer believes it is
+    mid-publish. Capped at the publish timeout, so a quorum that cannot be met
+    fails on the same clock everything else here does.
+
+    One definition, beside DECIDING_READ and for the same reason: the lease
+    coordinator and the catalog writer both make deciding writes, and the
+    replicated verifier requires every one of them to carry identical settings
+    -- a check that needs a Keeper-backed server and so cannot run in CI.
+    """
+    quorum = config.insert_quorum
+    if quorum is None:
+        return {}
+    return {
+        "insert_quorum": quorum,
+        "insert_quorum_parallel": 0,
+        "insert_quorum_timeout": config.publish_timeout_ns // 1_000_000,
+    }
+
+
 class ClickHouseClient(Protocol):
     def execute(self, query: str, params=None, **kwargs): ...
 

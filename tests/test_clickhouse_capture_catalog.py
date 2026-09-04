@@ -59,6 +59,8 @@ _VERSION_ONE_SORT_KEY = (
 # log and no manifest, no publisher lease and no version stamp. Kept beside
 # `_CURRENT_OBJECTS` so the two schemas the refusal has to tell apart are both
 # written down rather than one being the other's negation.
+_CURRENT_PACK_SORT_KEY = "store_id, pack_id"
+
 _VERSION_ONE_OBJECTS = (
     "dmi_capture",
     "dmi_pack_inventory",
@@ -98,6 +100,7 @@ class _Client:
         # documented completion of an interrupted install.
         data_rows=0,
         sort_key=_CURRENT_SORT_KEY,
+        pack_sort_key=_CURRENT_PACK_SORT_KEY,
         engines=None,
         engine_full=None,
         publish_id_tables=("dmi_index_watermark", "dmi_snapshot_manifest"),
@@ -123,6 +126,7 @@ class _Client:
         self.inventory_without_membership = inventory_without_membership
         self.data_rows = data_rows
         self.sort_key = sort_key
+        self.pack_sort_key = pack_sort_key
         self.engine_full = engine_full or {}
         self.engines = dict(engines or {})
         self.publish_id_tables = tuple(publish_id_tables)
@@ -150,9 +154,10 @@ class _Client:
             # arguments. A fake that answered `ReplacingMergeTree(index_version)`
             # bare let a parser that read to the LAST `)` pass here and refuse
             # every healthy catalog against a real server.
+            key = self.sort_key if name == "dmi_capture_raw" else self.pack_sort_key
             return (
                 "ReplacingMergeTree(index_version) "
-                f"ORDER BY ({self.sort_key or 'store_id, pack_id'}) "
+                f"ORDER BY ({key or 'store_id, pack_id'}) "
                 "SETTINGS index_granularity = 8192"
             )
         if engine == "MergeTree":
@@ -181,16 +186,19 @@ class _Client:
                 self.tables = self.tables + (created,)
             return []
         if "system.tables" in query:
-            # Only the descriptor table's sort key is ever read, so the others
-            # answer with a placeholder rather than a fiction that looks
+            # Both ReplacingMergeTree tables answer a real sort key: a merge
+            # collapses rows on it, so the inventory's key is load-bearing in
+            # the same way the descriptors' is, and a fake that answered a
+            # placeholder there left the check on it untestable. Everything
+            # else answers a placeholder rather than a fiction that looks
             # meaningful. `engine_full` is appended only when the statement
             # asks for it, so this fake answers the read either shape.
+            keys = {
+                "dmi_capture_raw": self.sort_key,
+                "dmi_pack_inventory_raw": self.pack_sort_key,
+            }
             rows = [
-                (
-                    name,
-                    self._engine(name),
-                    self.sort_key if name == "dmi_capture_raw" else "",
-                )
+                (name, self._engine(name), keys.get(name, ""))
                 for name in self.tables
             ]
             if "engine_full" in query:
@@ -1159,6 +1167,10 @@ def test_a_stamped_catalog_with_the_wrong_descriptor_sort_key_is_refused():
     ]
 
 
+def _never_sleeps(_seconds: float) -> None:
+    """A sleep for tests: the retry budget is counted in attempts, not seconds."""
+
+
 def _lease_claims(client) -> list[str]:
     return [
         query for query, params, _ in client.calls
@@ -1215,47 +1227,82 @@ def test_a_fresh_install_runs_under_the_publisher_lease_from_ddl_to_stamp():
     assert head and head[0][3] <= client.lease.now_ns
 
 
-def test_a_second_initialiser_is_refused_while_the_first_holds_the_prefix():
-    """The interleaving itself, driven: B starts while A is mid-install."""
+def test_a_second_initialiser_waits_for_the_first_rather_than_crashing():
+    """A cold fleet start must not lose every process but one.
+
+    Refusing outright made all but one initialiser raise
+    `PublisherLeaseHeldError` out of a call every caller treats as infallible
+    setup -- and the taxonomy's advice for a lease error, re-acquire and
+    re-index, is not the recovery here. So the second waits; when the first
+    finishes, the prefix reads complete and the second is simply done.
+    """
     client = _Client()
     first = _writer(client)
     second = _writer(client)
     execute = client.execute
-    refused: list[Exception] = []
+    outcome = []
 
     def start_the_second_initialiser_mid_install(query, params=None, **kwargs):
         result = execute(query, params, **kwargs)
-        if query.startswith("CREATE TABLE") and "dmi_capture_raw" in query and not refused:
+        if query.startswith("CREATE TABLE") and "dmi_capture_raw" in query and not outcome:
+            outcome.append("started")
             client.execute = execute
-            try:
-                second.ensure_schema()
-            except PublisherLeaseHeldError as held:
-                refused.append(held)
+            waits = []
+
+            def the_holder_finishes_while_the_second_waits(_seconds):
+                # What a real fleet start looks like from the second process:
+                # the holder completes its DDL and its stamp, so the prefix the
+                # second re-reads is a complete catalog.
+                waits.append(_seconds)
+                if len(waits) == 2:
+                    client.tables = tuple(_CURRENT_OBJECTS)
+                    client.schema_version = _SCHEMA_VERSION
+
+            second.ensure_schema(sleep=the_holder_finishes_while_the_second_waits)
+            outcome.append(("waited", len(waits)))
             client.execute = start_the_second_initialiser_mid_install
         return result
 
     client.execute = start_the_second_initialiser_mid_install
 
-    first.ensure_schema()
+    first.ensure_schema(sleep=_never_sleeps)
 
-    assert refused, "the second initialiser should have been refused"
-    assert "held by 'ensure_schema'" in str(refused[0])
-    # One stamp, written by the initialiser that held the lease.
+    assert outcome[1][0] == "waited" and outcome[1][1] >= 2, (
+        "the second initialiser should have waited, not raised"
+    )
+    # Every stamp is the conditional INSERT, so however many initialisers ran
+    # the row is written once by the server.
     stamps = [
-        call for call in client.calls
+        call[0] for call in client.calls
         if call[0].startswith("INSERT") and "dmi_schema_version" in call[0]
     ]
-    assert len(stamps) == 1
-    # And once the first has finished, the second finds a complete catalog and
-    # ensures it idempotently -- without a lease, since there is nothing left
-    # to serialise.
-    second.ensure_schema()
-    assert len(_lease_claims(client)) == 1
-    assert len(stamps) == 1 or all(
-        call[0].startswith("INSERT") and "WHERE (SELECT count() FROM" in call[0]
-        for call in client.calls
+    assert stamps and all(
+        "WHERE (SELECT count() FROM `default`.`dmi_schema_version`) = 0" in item
+        for item in stamps
+    )
+    assert len(_lease_claims(client)) == 1, "only the first took the install lease"
+
+
+def test_an_initialiser_that_waits_out_the_whole_budget_raises():
+    """A lease nobody gives back is not an install, and is worth raising about.
+
+    The budget spans one lease TTL plus a margin, which is when a dead holder's
+    row is takeable at the latest. Past that, something is renewing it.
+    """
+    client = _Client()
+    holder = _writer(client)
+    holder.acquire_publisher_lease("indexer-a")
+    waits = []
+
+    with pytest.raises(PublisherLeaseHeldError, match="indexer-a"):
+        _writer(client).ensure_schema(sleep=waits.append)
+
+    ttl = ClickHouseCatalogConfig().lease_ttl_ns / 1e9
+    assert len(waits) >= ttl / max(waits), "the budget must span a whole TTL"
+    assert not [
+        call for call in client.calls
         if call[0].startswith("INSERT") and "dmi_schema_version" in call[0]
-    ), "a re-stamp is conditional server-side and writes nothing"
+    ], "an initialiser that never held the lease must not stamp"
 
 
 def test_a_complete_catalog_is_ensured_without_taking_the_lease():
@@ -1422,6 +1469,85 @@ def test_a_stamped_catalog_whose_descriptor_engine_drops_the_version_is_refused(
         for item, *_ in client.calls
         if item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
     ]
+
+def test_a_replicated_engine_without_the_version_argument_is_still_refused():
+    """The property, not the prefix: Replicated does not excuse a lost version."""
+    client = _Client(
+        tables=_CURRENT_OBJECTS,
+        schema_version=_SCHEMA_VERSION,
+        data_rows=1,
+        engines={"dmi_capture_raw": "ReplicatedReplacingMergeTree"},
+        engine_full={
+            "dmi_capture_raw": (
+                "ReplicatedReplacingMergeTree('/clickhouse/tables/x', 'r1') "
+                f"ORDER BY ({_CURRENT_SORT_KEY}) SETTINGS index_granularity = 8192"
+            )
+        },
+    )
+
+    with pytest.raises(CatalogSchemaVersionError, match="index_version"):
+        _writer(client).ensure_schema()
+
+
+def test_a_stamped_catalog_with_the_wrong_inventory_sort_key_is_refused():
+    """The inventory's key is load-bearing for the same reason the descriptors' is.
+
+    Keyed on `pack_id` alone, a merge collapses the rows of one pack held in
+    two stores -- a supported state -- so `committed_pack_ids` stops reporting
+    the losing store's copy and that copy is re-indexed on every pass forever,
+    while `_inventory_without_membership` reads the same FINAL and cannot see
+    it. Only the descriptor table's key was ever compared.
+    """
+    client = _Client(
+        tables=_CURRENT_OBJECTS,
+        schema_version=_SCHEMA_VERSION,
+        data_rows=1,
+        pack_sort_key="pack_id",
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    assert "dmi_pack_inventory_raw" in message
+    assert "ORDER BY (pack_id)" in message
+    assert f"ORDER BY ({_CURRENT_PACK_SORT_KEY})" in message
+    assert "CatalogReconciler.rebuild()" in message
+    assert not [
+        item for item, *_ in client.calls
+        if item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
+    ]
+
+
+def test_a_server_without_check_grant_is_told_which_version_it_needs():
+    """An old server must not surface as a raw SQL syntax error.
+
+    `CHECK GRANT` arrived in ClickHouse 24.11 and is the first statement that
+    can fail on an older one, before any verdict or DDL -- so an operator on
+    24.8 met a driver exception outside this module's taxonomy, for a catalog
+    whose layout may be perfectly compatible. There is nothing to fall back to,
+    since every verdict is read off a grant-filtered `system.tables`, so the
+    requirement is named instead.
+    """
+    class _PreCheckGrantServer(_Client):
+        def execute(self, query, params=None, **kwargs):
+            if query.startswith("CHECK GRANT"):
+                raise RuntimeError("Code: 62. DB::Exception: Syntax error")
+            return super().execute(query, params, **kwargs)
+
+    client = _PreCheckGrantServer(tables=_CURRENT_OBJECTS, schema_version=_SCHEMA_VERSION)
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    assert "24.11" in message
+    assert "Syntax error" in message, "the server's own words are kept"
+    assert not [
+        item for item, *_ in client.calls
+        if item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
+    ]
+
 
 def test_an_unstamped_catalog_is_not_told_its_sort_key_is_wrong_when_it_is_not():
     """Defect A: the refusal that named two facts neither of which was true.
@@ -2142,7 +2268,7 @@ def test_collect_garbage_resolves_orphans_on_the_initiator_and_deletes_literal_p
     client.orphan_publishes = list(orphans)
     writer = _leased(client)
 
-    removed = writer.collect_garbage()
+    removed = writer.collect_garbage(sleep=_never_sleeps)
 
     orphan_read = next(
         (query, params)
@@ -2194,11 +2320,57 @@ def test_collect_garbage_resolves_orphans_on_the_initiator_and_deletes_literal_p
     ]
 
 
+def test_collect_garbage_deletes_only_membership_orphaned_in_both_reads():
+    """A publish whose watermark lands mid-sweep keeps its membership.
+
+    "Below the head" means no watermark statement can be ADMITTED for that
+    version any more; one admitted above the head and then stalled can still
+    LAND below it. The publisher confirms its membership after its watermark
+    row stands, but that confirmation can read rows this sweep is about to
+    delete -- and then the publish commits packs whose membership is gone,
+    which is the inventory-without-membership state ensure_schema refuses.
+
+    So the orphan set is intersected across two reads a publish timeout apart:
+    a statement admitted before the first read has landed or been aborted by
+    the second, and one landing puts a watermark row beside its pair, which
+    drops it from the second read.
+    """
+    client = _Client()
+    landed = (5, str(uuid4()))
+    still_orphaned = (3, str(uuid4()))
+    client.orphan_publishes = [still_orphaned, landed]
+    writer = _leased(client)
+
+    def the_stalled_watermark_lands(_seconds):
+        # Its pair now has a watermark row, so the second read omits it.
+        client.orphan_publishes = [still_orphaned]
+
+    removed = writer.collect_garbage(sleep=the_stalled_watermark_lands)
+
+    deleted = [
+        params["pairs"]
+        for query, params, _ in client.calls
+        if query.startswith("ALTER TABLE") and "dmi_snapshot_manifest" in query
+    ]
+    assert deleted == [[still_orphaned]], (
+        "membership whose watermark landed during the sweep must survive"
+    )
+    assert removed["dmi_snapshot_manifest"] == 1
+    # And the wait is the publish cap, which is what bounds an admitted
+    # statement's execution.
+    waits = []
+    _leased(_Client()).collect_garbage(sleep=waits.append)
+    assert waits == [], "an empty orphan set waits for nothing"
+    client.orphan_publishes = [still_orphaned]
+    writer.collect_garbage(sleep=waits.append)
+    assert waits == [ClickHouseCatalogConfig().publish_timeout_ns / 1e9]
+
+
 def test_collect_garbage_issues_no_manifest_mutation_when_nothing_is_orphaned():
     client = _Client()
     writer = _leased(client)
 
-    removed = writer.collect_garbage()
+    removed = writer.collect_garbage(sleep=_never_sleeps)
 
     assert removed["dmi_snapshot_manifest"] == 0
     assert not [
@@ -2216,7 +2388,7 @@ def test_collect_garbage_chunks_the_orphan_deletions_by_rendered_size():
     client.orphan_publishes = list(orphans)
     writer = _leased(client)
 
-    removed = writer.collect_garbage()
+    removed = writer.collect_garbage(sleep=_never_sleeps)
 
     deletes = [
         params["pairs"]

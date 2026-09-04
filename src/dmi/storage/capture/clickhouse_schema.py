@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from time import time_ns
+from math import ceil
+from time import sleep as _sleep, time_ns
 
-from .catalog import CatalogSchemaVersionError
+from .catalog import CatalogSchemaVersionError, PublisherLeaseHeldError
 from .clickhouse_lease import ClickHouseLeaseCoordinator
 from .clickhouse_sql import (
     DECIDING_READ,
@@ -78,6 +80,16 @@ CAPTURE_TABLE_ORDER = (
     "run_id",
     "captured_at_ns",
     "capture_id",
+    "store_id",
+    "pack_id",
+)
+
+# How long to wait between attempts on the install lease, and the slack added
+# to one TTL before a still-held lease is raised about rather than waited for.
+_INSTALL_LEASE_RETRY_S = 0.5
+_INSTALL_LEASE_MARGIN_S = 5.0
+
+PACK_TABLE_ORDER = (
     "store_id",
     "pack_id",
 )
@@ -202,23 +214,6 @@ def _engine_arguments(engine_full: str) -> tuple[str, tuple[str, ...]]:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _InstallerLeaseConfig:
-    """The lease knobs an installer uses when no writer supplies its own.
-
-    An install holds the lease for a few statements, so the defaults of
-    ClickHouseCatalogConfig are more than enough; they are restated here rather
-    than imported because that module imports this one.
-    """
-
-    database: str
-    table_prefix: str
-    lease_ttl_ns: int = 30_000_000_000
-    publish_timeout_ns: int = 5_000_000_000
-    clock_skew_ns: int = 0
-    insert_quorum: int | None = None
-
-
 # What `_verify_compatibility` concludes about a catalog it did not refuse.
 FRESH = "fresh"            # nothing there: create everything
 INCOMPLETE = "incomplete"  # an install of this build that stopped partway
@@ -271,13 +266,23 @@ class ClickHouseCatalogSchema:
     def qualified(self, table: str) -> str:
         return f"{_quoted(self.database)}.{_quoted(table)}"
 
-    def ensure(self, leases: ClickHouseLeaseCoordinator | None = None) -> None:
+    def ensure(
+        self,
+        leases: ClickHouseLeaseCoordinator,
+        *,
+        sleep: Callable[[float], None] = _sleep,
+    ) -> None:
         """Create or verify the catalog; installs are serialised per prefix.
 
-        ``leases`` is the calling writer's lease coordinator. A writer that
-        already holds the publisher lease keeps it and renews it around the
-        install; otherwise the installer takes the lease itself and gives it
-        back when the stamp is written.
+        ``leases`` is the calling writer's lease coordinator, and it is
+        required: an installer that minted its own would run on a second set of
+        lease knobs, which on a replicated deployment means claiming without
+        the writer's quorum. A writer that already holds the publisher lease
+        keeps it and renews it around the install; otherwise the install takes
+        the lease itself and gives it back when the stamp is written.
+
+        ``sleep`` is the wait between install-lease attempts; it is a parameter
+        only so a test can drive it.
         """
         found = self._catalog_state()
         # Visibility is required before any VERDICT, not merely before the DDL.
@@ -300,10 +305,7 @@ class ClickHouseCatalogSchema:
             # over it and the stamp is a server-side no-op. Taking the lease
             # here would refuse every second process for as long as an indexer
             # is publishing, which is most of the time.
-            self._create_stamp_and_lease_tables()
-            self._lay_out()
-            self._confirm_catalog_is_complete()
-            self._stamp()
+            self._complete_the_layout()
             return
         # An install -- fresh, or one of this build's that stopped partway.
         # Serialised on the publisher lease, per prefix: two initialisers that
@@ -328,14 +330,13 @@ class ClickHouseCatalogSchema:
         # re-checked immediately before the stamp, and why a catalog it did
         # write into is refused on the next call.
         self._create_stamp_and_lease_tables()
-        coordinator = leases or ClickHouseLeaseCoordinator(
-            self._client, _InstallerLeaseConfig(self.database, self.prefix)
-        )
-        borrowed = coordinator.lease is not None
+        borrowed = leases.lease is not None
         if borrowed:
-            coordinator.renew()
-        else:
-            coordinator.acquire("ensure_schema")
+            leases.renew()
+        elif not self._take_the_install_lease(leases, sleep):
+            # Another initialiser finished while this one waited, so there is
+            # no install left to serialise.
+            return
         try:
             # Re-read under the lease. What looked like nothing may now be
             # another initialiser's finished or half-finished work, and the
@@ -347,7 +348,49 @@ class ClickHouseCatalogSchema:
             self._stamp()
         finally:
             if not borrowed:
-                coordinator.release()
+                leases.release()
+
+    def _take_the_install_lease(
+        self, leases: ClickHouseLeaseCoordinator, sleep: Callable[[float], None]
+    ) -> bool:
+        """Wait for the install lease. False means somebody else finished it.
+
+        A cold fleet start has every process installing at once, and refusing
+        outright made all but one of them crash out of a call every caller
+        treats as infallible setup -- while the taxonomy's advice for a lease
+        error, re-acquire and re-index, is not the recovery here. So a refusal
+        is waited out rather than raised: either the holder finishes, in which
+        case the prefix reads COMPLETE and this process is done, or it dies and
+        its lease lapses within `lease_ttl_ns`, after which this process takes
+        the install itself.
+
+        The budget spans one TTL plus a margin, because that is when a dead
+        holder's row is takeable at the latest. Exhausting it means the lease is
+        being held by something that keeps renewing it, which is not an install
+        and is worth raising about. It is counted in attempts rather than
+        measured against a clock, so that a test can drive the whole budget
+        with a sleep that does not sleep.
+        """
+        budget = leases.ttl_ns / 1e9 + _INSTALL_LEASE_MARGIN_S
+        attempts = max(1, ceil(budget / _INSTALL_LEASE_RETRY_S))
+        for attempt in range(attempts):
+            try:
+                leases.acquire("ensure_schema")
+                return True
+            except PublisherLeaseHeldError:
+                if self._verify_compatibility() == COMPLETE:
+                    self._complete_the_layout()
+                    return False
+                if attempt + 1 == attempts:
+                    raise
+                sleep(_INSTALL_LEASE_RETRY_S)
+        raise AssertionError("unreachable: the last attempt re-raises")
+
+    def _complete_the_layout(self) -> None:
+        self._create_stamp_and_lease_tables()
+        self._lay_out()
+        self._confirm_catalog_is_complete()
+        self._stamp()
 
     def _create_stamp_and_lease_tables(self) -> None:
         self._client.execute(
@@ -392,7 +435,7 @@ pack_id UUID, store_id LowCardinality(String), object_key String,
 object_bytes UInt64, pack_checksum FixedString(64), record_count UInt32,
 index_version UInt64
 ) ENGINE = ReplacingMergeTree(index_version)
-ORDER BY (store_id, pack_id)"""
+ORDER BY ({", ".join(PACK_TABLE_ORDER)})"""
         )
         for name, kind, expression in FACET_COLUMNS:
             self._client.execute(
@@ -438,9 +481,30 @@ pack_id UUID
 
     def _require_catalog_visibility(self) -> None:
         for _, name in self.objects + self.legacy_objects:
-            rows = self._client.execute(
-                f"CHECK GRANT SHOW TABLES ON {self.qualified(name)}"
-            )
+            try:
+                rows = self._client.execute(
+                    f"CHECK GRANT SHOW TABLES ON {self.qualified(name)}"
+                )
+            except Exception as failure:
+                # `CHECK GRANT` arrived in ClickHouse 24.11. An older server
+                # rejects it while parsing, so an operator on 24.8 LTS met a
+                # raw driver SYNTAX_ERROR out of the first statement of
+                # ensure_schema -- outside this module's taxonomy, and against
+                # a catalog whose layout may be perfectly compatible. There is
+                # no fallback to degrade to: this probe is what separates "the
+                # object is not there" from "this role cannot see it", and
+                # every verdict below is read off a grant-filtered
+                # `system.tables`. So the requirement is stated instead.
+                raise CatalogSchemaVersionError(
+                    f"catalog `{self.database}`.`{self.prefix}_*` cannot be "
+                    "checked because this server refused `CHECK GRANT`, which "
+                    f"this build requires: {failure}. `CHECK GRANT` arrived in "
+                    "ClickHouse 24.11, so a server below that cannot run this "
+                    "build's schema check -- `system.tables` is grant-filtered "
+                    "per role, and without the probe an object this role "
+                    "cannot see is indistinguishable from one that was "
+                    "dropped. Upgrade the server to 24.11 or later."
+                ) from failure
             if rows and rows[0] and rows[0][0]:
                 continue
             raise CatalogSchemaVersionError(
@@ -482,7 +546,7 @@ pack_id UUID
         # over a layout this build can see is wrong, turning a silent
         # disagreement into the refusal any other incompatible catalog gets.
         just_created = "was just created by this build"
-        self._reject_a_wrong_descriptor_sort_key(found, just_created)
+        self._reject_a_wrong_sort_key(found, just_created)
         self._reject_a_wrong_engine(found, just_created)
 
     def _verify_compatibility(
@@ -539,7 +603,7 @@ pack_id UUID
                 "is not a repair: surviving inventory would skip their packs. "
                 + self.rebuild_instruction()
             )
-        self._reject_a_wrong_descriptor_sort_key(found, stamp)
+        self._reject_a_wrong_sort_key(found, stamp)
         self._reject_a_wrong_engine(found, stamp)
         if self._inventory_without_membership():
             raise CatalogSchemaVersionError(
@@ -586,6 +650,10 @@ pack_id UUID
         Checked against `engine_full` rather than reconstructed, and only for
         the tables whose correctness depends on the argument. Like every other
         incompatibility here, `CREATE TABLE IF NOT EXISTS` cannot repair it.
+
+        What is required is the PROPERTY -- see
+        `_keeps_newest_by_index_version` -- not the literal text this build's
+        DDL happens to emit.
         """
         required = "ReplacingMergeTree(index_version)"
         wrong = [
@@ -608,14 +676,14 @@ pack_id UUID
             "altered in place. " + self.rebuild_instruction()
         )
 
-    def _reject_a_wrong_descriptor_sort_key(
+    def _reject_a_wrong_sort_key(
         self, found: dict[str, CatalogObject], stamp: str
     ) -> None:
-        """The stamp is not evidence about the table standing next to it.
+        """The stamp is not evidence about the tables standing next to it.
 
         Every other sort-key check lived on the UNSTAMPED path, so a catalog
-        that says this version was taken at its word about the one table whose
-        key this branch changed. A partial restore is enough to separate the
+        that says this version was taken at its word about the tables whose
+        keys this branch changed. A partial restore is enough to separate the
         two -- `{prefix}_capture_raw` recovered from a pre-`(store_id,
         pack_id)` backup beside a surviving stamp -- and from there nothing
         refuses it, `CREATE TABLE IF NOT EXISTS` cannot alter it, and
@@ -623,24 +691,39 @@ pack_id UUID
         capture on the next merge. `_catalog_state()` already reads
         `sorting_key`; this is the comparison it was read for.
 
-        Only reached once the table is known present: a missing one is either
-        the unfinished install handled above or already refused there, and in
-        both cases the DDL creates it on this build's key.
+        BOTH ReplacingMergeTree tables are checked, not just the descriptors.
+        The inventory carries the same risk for the same reason: keyed on
+        `pack_id` alone, a merge collapses the rows of one pack held in two
+        stores, `committed_pack_ids` stops reporting the losing store's copy,
+        and that copy is re-indexed on every pass forever -- while
+        `_inventory_without_membership` reads the same FINAL and cannot see it.
+        One pack in two stores is a supported state, so this is not a
+        hypothetical key.
+
+        Only reached once a table is known present: a missing one is either the
+        unfinished install handled above or already refused there, and in both
+        cases the DDL creates it on this build's key.
         """
-        descriptor = found.get(self.capture_raw)
-        required = ", ".join(CAPTURE_TABLE_ORDER)
-        if descriptor is None or _key_columns(descriptor.sorting_key) == _key_columns(
-            required
-        ):
+        required = {
+            self.capture_raw: ", ".join(CAPTURE_TABLE_ORDER),
+            self.pack_raw: ", ".join(PACK_TABLE_ORDER),
+        }
+        wrong = [
+            f"`{name}` has ORDER BY ({found[name].sorting_key}) where this "
+            f"build requires ORDER BY ({key})"
+            for name, key in required.items()
+            if name in found
+            and _key_columns(found[name].sorting_key) != _key_columns(key)
+        ]
+        if not wrong:
             return
         raise CatalogSchemaVersionError(
             f"catalog `{self.database}`.`{self.prefix}_*` {stamp} but "
-            f"`{self.capture_raw}` has ORDER BY ({descriptor.sorting_key}) "
-            f"where this build requires ORDER BY ({required}). The stamp "
-            "describes the build that wrote it, not the table beside it, and "
-            "`CREATE TABLE IF NOT EXISTS` cannot alter a live sort key: left "
-            "in place, a merge collapses two packs' rows for one capture. "
-            + self.rebuild_instruction()
+            + ", ".join(wrong)
+            + ". The stamp describes the build that wrote it, not the tables "
+            "beside it, and `CREATE TABLE IF NOT EXISTS` cannot alter a live "
+            "sort key: left in place, a merge collapses rows that differ only "
+            "by the columns the key lost. " + self.rebuild_instruction()
         )
 
     def _reject_wrong_kinds(self, found: dict[str, CatalogObject]) -> None:

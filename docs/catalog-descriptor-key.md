@@ -549,9 +549,10 @@ snapshot can ever admit them, and versions are unique so nobody will publish
 that version later -- but nothing on the write path collects them.
 `ClickHouseCatalogWriter.collect_garbage()` does, from a maintenance job: it
 deletes manifest rows below the published head whose `(index_version,
-publish_id)` has no watermark row, resolving that set with a plain read on the
-initiator and deleting literal pairs, since a mutation whose predicate reads
-another replicated table is refused on `ReplicatedMergeTree`. See *Retention*
+publish_id)` has no watermark row **in two reads a `publish_timeout_ns`
+apart**, resolving that set with plain reads on the initiator and deleting
+literal pairs, since a mutation whose predicate reads another replicated table
+is refused on `ReplicatedMergeTree`. See *Retention*
 in `capture-storage-design.md`.
 
 **A late lower commit can outlive its own membership.** "Below the head" means
@@ -563,10 +564,13 @@ above. If the retention pass runs in that gap it removes the lower manifest,
 and the delayed watermark then lands with nothing to admit. Left there, the
 publish passed its ownership read-back and the indexer committed the packs to
 the inventory: skippable forever, visible in no snapshot, which is exactly the
-state `ensure_schema` refuses. Reproduced on 25.12 in that ordering. So
-`publish_snapshot` confirms, AFTER its watermark row stands, that its manifest
-still holds every pack it admitted, and raises `SnapshotPublishRaceError` when
-it does not; the indexer republishes at a higher version and never commits
+state `ensure_schema` refuses. Reproduced on 25.12 in that ordering. The sweep therefore
+intersects two orphan reads a publish cap apart -- a statement admitted before
+the first has landed or been aborted by then, and a landing puts a watermark
+row beside its pair -- and, for the residual where a statement blocked in a
+lock overruns the cap, `publish_snapshot` confirms AFTER its watermark row
+stands that its manifest still holds every pack it admitted, raising
+`SnapshotPublishRaceError` when it does not; the indexer republishes at a higher version and never commits
 the dead one. The standing watermark row is harmless -- membership requires
 the pair, and no manifest row carries that `publish_id` -- and once a
 watermark row stands, the pair is what the retention bound keeps.

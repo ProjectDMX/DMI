@@ -673,7 +673,7 @@ inline would pay for it in the middle of a publish.
 
 | Table | Deleted | Why it can never be resolved again |
 |---|---|---|
-| `{prefix}_snapshot_manifest` | rows below the published head whose `(index_version, publish_id)` has no watermark row | below the head, that publish's watermark INSERT can no longer be *admitted* -- the barrier requires strictly above -- so no new statement can create the pair membership needs. One already admitted above the head can still stall and *land* below it after the sweep; `publish_snapshot` therefore confirms its membership after the watermark row stands and refuses the publish (a lost race, republished higher) when it has been collected, so those packs are never committed without membership |
+| `{prefix}_snapshot_manifest` | rows below the published head whose `(index_version, publish_id)` has no watermark row **in two reads a `publish_timeout_ns` apart** | below the head, that publish's watermark INSERT can no longer be *admitted* -- the barrier requires strictly above -- so no new statement can create the pair membership needs. One already admitted above the head can still stall and *land* below it, and the publisher's own confirmation runs on its clock, so a single read could hand this sweep a pair the publisher is about to confirm. Intersecting two reads a publish cap apart settles it: a statement admitted before the first has landed (putting a watermark row beside the pair, which drops it from the second read) or been aborted by `max_execution_time`. `publish_snapshot` still confirms its membership after the watermark row stands and refuses the publish (a lost race, republished higher) if it has gone, which covers the residual where a statement blocked in a lock overruns the cap |
 | `{prefix}_publisher_lease` | rows below the head `term` | the fence resolves exactly one row, the highest `(term, lease_id)`, and terms only increase. The head is kept even when expired: it is what a takeover has to sort above |
 | `{prefix}_capture_version_claims` | rows at or below the published head | the allocator picks above `max(claims.version)` AND above `last_published_version()`, so the watermark keeps the floor once these are gone. Claims ABOVE the head stay -- one may be a version a pass has allocated and not yet published |
 
@@ -681,7 +681,7 @@ inline would pay for it in the middle of a publish.
 collected here. The watermark log IS the floor the other two bounds are
 measured against, and the descriptors are the catalog.
 
-The manifest sweep is two statements on purpose: a plain `SELECT` on the
+The manifest sweep is two reads and then a mutation on purpose: a plain `SELECT` on the
 initiator resolves the orphaned `(index_version, publish_id)` pairs with both
 bounds, and the mutation deletes those pairs as a literal `IN` list, in chunks
 bounded by the inline byte budget. The one-statement form -- `ALTER TABLE ...

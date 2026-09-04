@@ -196,14 +196,23 @@ def _expect(exception_type, call, *, code: int | None = None):
     )
 
 
-def _query_log_settings(client, prefix: str, statement_fragment: str) -> list[tuple]:
+def _query_log_settings(client, prefix: str, table: str) -> list[tuple]:
+    """The quorum settings recorded for INSERTs INTO this table.
+
+    Anchored on the statement's own `INSERT INTO ...` prefix, not on the table
+    name appearing anywhere in the text. Every fenced publish statement carries
+    the lease fence, which names `{prefix}_publisher_lease` twice, so a
+    substring match for that table returned the watermark INSERT instead -- and
+    the lease coordinator could have stopped sending quorum settings entirely
+    while this check went on passing.
+    """
     client.execute("SYSTEM FLUSH LOGS")
     return client.execute(
         "SELECT Settings['insert_quorum'], Settings['insert_quorum_parallel'], "
         "Settings['insert_quorum_timeout'] FROM system.query_log "
         "WHERE type = 'QueryFinish' AND query_kind = 'Insert' "
         "AND query LIKE %(like)s ORDER BY event_time DESC LIMIT 5",
-        {"like": f"%{prefix}_{statement_fragment}%"},
+        {"like": f"INSERT INTO `default`.`{prefix}_{table}`%"},
     )
 
 

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import secrets
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from time import time_ns
+from time import sleep as _sleep, time_ns
 from uuid import uuid4
 
 from .catalog import (
@@ -29,9 +29,19 @@ from .clickhouse_sql import (
     inline_tuple_bytes,
     inline_version_identity_bytes,
     quoted,
+    quorum_write,
     text,
 )
 from .model import CaptureDescriptor, PackRef
+
+# The least lease life a publish may be configured to reach the fence with.
+# The fence is safe at any positive margin, but a margin under a client round
+# trip is refused rather than accepted: the renewal that precedes every fenced
+# statement would land with less than `publish_timeout_ns + clock_skew_ns` left
+# on every attempt, so nothing could ever publish. 100 ms is a loopback round
+# trip with room to spare and the smallest margin the live suites use.
+MINIMUM_FENCE_MARGIN_NS = 100_000_000
+
 
 def _inline_chunks(items: list[PackIdentity]):
     return inline_chunks(items, item_bytes=inline_tuple_bytes)
@@ -117,13 +127,18 @@ class ClickHouseCatalogConfig:
                 raise ValueError(f"{name} must be positive")
         if type(self.clock_skew_ns) is not int or self.clock_skew_ns < 0:
             raise ValueError("clock_skew_ns must be a non-negative integer")
-        if self.publish_timeout_ns + self.clock_skew_ns >= self.lease_ttl_ns:
+        margin = self.lease_ttl_ns - (self.publish_timeout_ns + self.clock_skew_ns)
+        if margin < MINIMUM_FENCE_MARGIN_NS:
             raise ValueError(
-                "publish_timeout_ns plus clock_skew_ns must be below "
-                "lease_ttl_ns: the margin between them is what keeps a publish "
+                "lease_ttl_ns must exceed publish_timeout_ns plus "
+                f"clock_skew_ns by at least {MINIMUM_FENCE_MARGIN_NS} ns; this "
+                f"leaves {margin} ns. That margin is what keeps a publish "
                 "statement from still running when its lease becomes takeable, "
-                "and the skew bound is the part of that margin two hosts' "
-                "clocks can eat"
+                "and the skew bound is the part of it two hosts' clocks can "
+                "eat -- but it is also the whole time a renewed lease has to "
+                "reach the fence. Thinner than a round trip, every publish is "
+                "refused by its own fence and retried at a higher version "
+                "until the attempts run out"
             )
         if self.insert_quorum is not None and self.clock_skew_ns == 0:
             raise ValueError(
@@ -175,10 +190,12 @@ class ClickHouseCatalogWriter:
         self._legacy_objects = self._schema.legacy_objects
         self._leases = ClickHouseLeaseCoordinator(client, self._config)
 
-    def ensure_schema(self) -> None:
+    def ensure_schema(self, *, sleep: Callable[[float], None] = _sleep) -> None:
         # The writer's own coordinator, so an install is serialised on the
         # lease this writer may already hold rather than refused by it.
-        self._schema.ensure(self._leases)
+        # ``sleep`` is the wait between install-lease attempts, a parameter
+        # only so a test can drive it.
+        self._schema.ensure(self._leases, sleep=sleep)
 
     def _rebuild_instruction(self) -> str:
         return self._schema.rebuild_instruction()
@@ -503,40 +520,58 @@ class ClickHouseCatalogWriter:
         publish_id: str,
         members: list[PackIdentity],
     ) -> bool:
-        rows = self._client.execute(
-            "SELECT count() FROM (SELECT DISTINCT store_id, pack_id FROM "
-            f"{self._qualified(self._manifest)} "
-            "WHERE index_version = %(index_version)s "
-            "AND publish_id = toUUID(%(publish_id)s) "
-            "AND (store_id, pack_id) IN %(members)s)",
-            {
-                "index_version": index_version,
-                "publish_id": publish_id,
-                "members": members,
-            },
-            settings=DECIDING_READ,
-        )
-        return rows[0][0] == len(set(members))
+        return self._manifest_member_count(
+            index_version=index_version, publish_id=publish_id, members=members
+        ) == len(set(members))
 
     def _manifest_is_whole(
         self, *, index_version: int, publish_id: str, expected: int
     ) -> bool:
         """Does the publish still hold membership for every pack it admitted?
 
-        Unlike `_manifest_chunk_published` this names no members, so it is one
-        bounded statement however many packs the publish covered.
+        Named no members, so it is one bounded statement however many packs the
+        publish covered -- unlike the chunk read-back, which has to ask about
+        exactly the members its statement carried.
         """
+        return self._manifest_member_count(
+            index_version=index_version, publish_id=publish_id
+        ) == expected
+
+    def _manifest_member_count(
+        self,
+        *,
+        index_version: int,
+        publish_id: str,
+        members: list[PackIdentity] | None = None,
+    ) -> int:
+        """Distinct packs this publish holds membership for, optionally bounded.
+
+        ``members`` narrows the count to the identities a particular statement
+        carried; omitted, it counts everything the publish admitted. The
+        parameter is left out of the query entirely when it is not used, so the
+        statement text says which question was asked.
+        """
+        params: dict[str, object] = {
+            "index_version": index_version,
+            "publish_id": publish_id,
+        }
+        bound = ""
+        if members is not None:
+            params["members"] = members
+            bound = " AND (store_id, pack_id) IN %(members)s"
         rows = self._client.execute(
             "SELECT count() FROM (SELECT DISTINCT store_id, pack_id FROM "
             f"{self._qualified(self._manifest)} "
             "WHERE index_version = %(index_version)s "
-            "AND publish_id = toUUID(%(publish_id)s))",
-            {"index_version": index_version, "publish_id": publish_id},
+            f"AND publish_id = toUUID(%(publish_id)s){bound})",
+            params,
             settings=DECIDING_READ,
         )
-        return rows[0][0] == expected
+        return rows[0][0]
 
-    def collect_garbage(self) -> dict[str, int]:
+    def collect_garbage(
+        self, *, sleep: Callable[[float], None] = _sleep
+    ) -> dict[str, int]:
         """Delete the rows the protocols append and never need again.
 
         Three tables grow with every pass and nothing collected them. A
@@ -554,6 +589,9 @@ class ClickHouseCatalogWriter:
         chosen so that the rows it deletes can never be resolved again by the
         fence, the allocator, or a membership read -- not merely that they look
         old.
+
+        ``sleep`` is the settling wait the manifest bound needs; it is a
+        parameter only so a test can drive it.
         """
         removed: dict[str, int] = {}
         published = self.last_published_version()
@@ -577,12 +615,9 @@ class ClickHouseCatalogWriter:
         # ClickHouse refuses on ReplicatedMergeTree under the default settings
         # (allow_nondeterministic_mutations = 0 and
         # mutations_execute_subqueries_on_initiator = 0 on 25.12). A literal
-        # IN list is deterministic on every replica. A pair that gains a
-        # watermark row between the read and the delete cannot exist: below
-        # the head no statement can be admitted for it, and an in-flight one
-        # landing is the case the confirmation above handles.
+        # IN list is deterministic on every replica.
         removed[self._manifest] = self._delete_manifest_publishes(
-            self._orphaned_manifest_publishes(published), settings
+            self._settled_orphan_publishes(published, sleep), settings
         )
 
         # Lease rows below the head TERM. The fence resolves exactly one row --
@@ -629,6 +664,39 @@ class ClickHouseCatalogWriter:
         )
         return [(int(row[0]), text(row[1])) for row in rows]
 
+    def _settled_orphan_publishes(
+        self, published: int, sleep: Callable[[float], None]
+    ) -> list[tuple[int, str]]:
+        """Orphaned publishes that were still orphaned a publish timeout later.
+
+        One read is not enough, and this is the finding that says so. "Below
+        the head" means no watermark statement can be ADMITTED for that version
+        any more; a statement admitted above the head and then stalled can
+        still LAND below it. `publish_snapshot` confirms its membership after
+        its watermark row stands, but that confirmation happens on the
+        publisher's clock: it can read rows this pass is about to delete, and
+        the publish then commits packs whose membership is gone.
+
+        So the set is intersected across two reads a `publish_timeout_ns` apart.
+        Any statement admitted before the first read is capped at that timeout
+        by `max_execution_time`, so by the second read it has either landed --
+        putting a watermark row beside the pair, which drops it from the second
+        read -- or been aborted. Anything admitted afterwards is above the head
+        and outside the bound entirely.
+
+        The cap is checked between processing blocks rather than pre-empted, so
+        a statement blocked in a lock can overrun it (see "The takeover
+        instant" in docs/catalog-descriptor-key.md). This narrows the window to
+        that residual instead of leaving it a full round trip wide; it does not
+        claim to close it.
+        """
+        first = self._orphaned_manifest_publishes(published)
+        if not first:
+            return []
+        sleep(self._config.publish_timeout_ns / 1e9)
+        settled = set(first) & set(self._orphaned_manifest_publishes(published))
+        return sorted(settled)
+
     def _delete_manifest_publishes(
         self, pairs: list[tuple[int, str]], settings: dict
     ) -> int:
@@ -638,23 +706,15 @@ class ClickHouseCatalogWriter:
         breach the server's max_query_size; each chunk is counted and deleted
         on its own, and a pair straddles no chunk.
         """
-        removed = 0
-        qualified = self._qualified(self._manifest)
-        for chunk in _inline_publish_chunks(pairs):
-            predicate = "(index_version, publish_id) IN %(pairs)s"
-            matched = self._client.execute(
-                f"SELECT count() FROM {qualified} WHERE {predicate}",
+        return sum(
+            self._delete_rows(
+                self._manifest,
+                "(index_version, publish_id) IN %(pairs)s",
                 {"pairs": chunk},
-                settings=DECIDING_READ,
-            )[0][0]
-            if matched:
-                self._client.execute(
-                    f"ALTER TABLE {qualified} DELETE WHERE {predicate}",
-                    {"pairs": chunk},
-                    settings=settings,
-                )
-            removed += int(matched)
-        return removed
+                settings,
+            )
+            for chunk in _inline_publish_chunks(pairs)
+        )
 
     def _delete_rows(
         self, table: str, predicate: str, params: dict, settings: dict
@@ -784,32 +844,7 @@ class ClickHouseCatalogWriter:
         return f"{quoted(self._config.database)}.{quoted(table)}"
 
     def _quorum_write(self) -> dict[str, object]:
-        """The settings that make a DECIDING write durable before it is read.
-
-        Empty unless an operator has opted in, so a single-node deployment
-        pays nothing and nothing changes for anyone who has not asked for it.
-        ``insert_quorum_parallel`` is turned OFF alongside, because
-        ``select_sequential_consistency`` does not work with it -- setting the
-        quorum without clearing the parallel flag would buy latency and no
-        guarantee at all.
-        """
-        quorum = self._config.insert_quorum
-        if quorum is None:
-            return {}
-        return {
-            "insert_quorum": quorum,
-            "insert_quorum_parallel": 0,
-            # BOUNDED, and this is not a detail: ClickHouse waits
-            # ``insert_quorum_timeout`` for the replicas to acknowledge, and
-            # its default is 600 seconds. The fenced publish statements are
-            # already capped by ``max_execution_time``, but the version and
-            # lease claims are not -- so an unreachable replica would park a
-            # claim for ten minutes, twenty times the publish cap and twenty
-            # times the lease TTL, while the writer believes it is mid-publish.
-            # Capped at the publish timeout, so a quorum that cannot be met
-            # fails on the same clock everything else here does.
-            "insert_quorum_timeout": self._config.publish_timeout_ns // 1_000_000,
-        }
+        return quorum_write(self._config)
 
     @staticmethod
     def _validate_count(value: object, name: str) -> None:
