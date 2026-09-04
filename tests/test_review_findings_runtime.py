@@ -517,7 +517,7 @@ class TestAttachConfigDiagnosesUnsupportedLayers:
         with pytest.raises(
             ConfigurationError, match="does not accept.*layers"
         ):
-            compile_config and _attach(adapter, config)
+            _attach(adapter, config)
 
     def test_no_range_on_a_legacy_adapter_still_attaches(self):
         adapter = _LegacyVLLMStyleAdapter()

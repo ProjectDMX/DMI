@@ -152,7 +152,8 @@ def create_app(
             # driven with curl or a reverse proxy that injects the header.
             if request.method in ("GET", "HEAD", "OPTIONS"):
                 return await call_next(request)
-            if request.headers.get("X-DMI-Token") != app.state.launch_token:
+            supplied = request.headers.get("X-DMI-Token", "")
+            if not secrets.compare_digest(supplied, app.state.launch_token):
                 # Raised in the middleware, so returned as a response directly:
                 # an HTTPException raised inside BaseHTTPMiddleware dispatch
                 # escapes FastAPI's exception handlers.
