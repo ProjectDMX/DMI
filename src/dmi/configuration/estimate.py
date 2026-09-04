@@ -510,8 +510,17 @@ def estimate_config(
 
     # Step/request sampling IS enforced (the adapter driver gates on
     # should_capture_step / should_capture_request), so the captured volume
-    # divides by both strides.
+    # divides by both strides. The enforcement is conditional on what the
+    # adapter reports, and the figures say so when it matters: an adapter
+    # that reports no phase keeps both phase flags off the gate, and one
+    # whose scheduler ids have no numeric prefix passes every request.
     sampling_divisor = max(1, schedule.step_stride) * max(1, schedule.request_stride)
+    if sampling_divisor > 1 or not (capture_prefill and capture_decode):
+        assumptions.append(
+            "assumes the serving adapter reports a phase and numeric request "
+            "ids; an adapter that reports neither applies only the stride "
+            "and warmup parts of this schedule"
+        )
 
     per_request = total_volume // sampling_divisor
     # A step covers the whole batch in either convention: packed rows share
@@ -526,12 +535,17 @@ def estimate_config(
     sustained: Optional[float] = None
     per_day: Optional[float] = None
     if workload.decode_steps_per_second > 0 and capture_decode:
-        # Sustained decode volume across all ranks, with sampling applied.
+        # Sustained decode volume across all ranks, with both strides
+        # applied: the driver's request gate drops whole requests too, so
+        # request_stride thins the arriving stream exactly like step_stride.
         decode_volume = sum(
             load.decode_step_bytes * (1 if load.tp_rank == 0 else tp_size - 1)
             for load in ranks
         )
-        effective_rate = workload.decode_steps_per_second / max(1, schedule.step_stride)
+        effective_rate = (
+            workload.decode_steps_per_second
+            / (max(1, schedule.step_stride) * max(1, schedule.request_stride))
+        )
         sustained = decode_volume * effective_rate
         per_day = sustained * SECONDS_PER_DAY
         assumptions.append(

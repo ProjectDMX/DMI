@@ -106,8 +106,10 @@ def _reject_known_non_decoder(hf_config: Any, model_id: str) -> None:
                 )
     architectures = getattr(hf_config, "architectures", None) or []
     for architecture in architectures:
+        # HF names carry no underscores ("BertForMaskedLM"), so lower and
+        # match the unbroken suffixes.
         name = str(architecture).lower()
-        if "forencoding" in name or name.endswith("for_masked_lm"):
+        if name.endswith(("formaskedlm", "forconditionalgeneration")):
             raise DescriptorError(
                 f"{model_id!r} declares {architecture!r}, which is not a "
                 "causal decoder-only transformer. DMI-configurator v1 "

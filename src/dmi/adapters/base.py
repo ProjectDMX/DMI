@@ -241,6 +241,13 @@ class BackendAdapter(abc.ABC):
         """Canonical per-step driver.  See module docstring for the flow."""
         if self.transport is None or self.transport.null_offload:
             return
+        # Disarm the hooks FIRST: skipping plan/commit is not enough, because
+        # the model's HookPoints still fire during this step's forward and
+        # the fast path dispatches producers unconditionally -- unreserved
+        # ring writes and a task/meta FIFO that pairs the next captured
+        # step's tasks with this step's (missing) metas. Any step this
+        # driver does not plan re-arms nothing.
+        self.transport.capture_step = False
         ctx = self.build_step_context(*raw)
         if ctx is None:
             return
@@ -252,6 +259,7 @@ class BackendAdapter(abc.ABC):
         plan = self.plan_step(ctx)
         self.commit_step(ctx, plan)
         self._step_counter += 1
+        self.transport.capture_step = True
 
     def commit_step(
         self, ctx: StepContext, plan: Optional[StepPlan] = None
