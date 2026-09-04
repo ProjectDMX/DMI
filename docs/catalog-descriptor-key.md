@@ -432,13 +432,14 @@ statements, which is the condition this protocol avoids.
 
 Stated as precisely as the rest of this document tries to be.
 
-**The fence is per STATEMENT, not per publish.** A publish issues two of them:
-the manifest rows for the packs it is admitting, then the watermark row that
-admits them. Both carry the fence, so neither can land after a takeover -- but
-the gap between them is a full client round trip, and `max_execution_time`
-bounds each statement rather than the pair, so nothing bounds the gap. A
-takeover landing there leaves the first statement's manifest rows behind while
-the second is refused.
+**The fence is per STATEMENT, not per publish.** A publish issues one statement
+per manifest chunk -- a single one for a snapshot whose members fit the inline
+byte budget, more when they do not -- and then the watermark row that admits
+them. Every one of them carries the fence and the lease is renewed before each,
+so none can land after a takeover; but the gaps between them are full client
+round trips, and `max_execution_time` bounds each statement rather than the
+sequence, so nothing bounds the gaps. A takeover landing in one leaves the
+manifest rows already written behind while the rest are refused.
 
 Those rows are **inert**: membership requires the manifest row and a watermark
 row from the SAME publish, and that watermark row does not exist, so no
@@ -533,7 +534,11 @@ pack P") are stored in an engine whose job is keeping the latest version of a
 mutable thing, and that a snapshot is an open predicate (`index_version <= W`)
 over a table still being written. The sort-key change removes the sharp edge;
 it does not change that shape. The same shape is also behind the mid-batch
-membership gap and the fact that no retention or GC policy exists yet.
+membership gap. Retention does now exist --
+`ClickHouseCatalogWriter.collect_garbage()`, described under Retention in
+docs/capture-storage-design.md -- but it inherits the same shape rather than
+escaping it: what it may delete has to be argued from an open predicate over a
+table still being written, which is exactly where its bounds are delicate.
 
 The clean-slate alternative is the table-format design: publish an immutable
 manifest per snapshot ("snapshot 42 = 41 plus these packs"), advance a single

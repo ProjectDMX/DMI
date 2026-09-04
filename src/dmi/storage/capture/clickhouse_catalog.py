@@ -220,11 +220,12 @@ class ClickHouseCatalogWriter:
 
         The guarantee is per STATEMENT rather than per publish, and the
         difference is worth stating because the documents used to claim the
-        stronger one. A takeover before the manifest INSERT leaves nothing
-        behind; a takeover in the GAP between the two statements -- a full
-        client round trip, which ``max_execution_time`` does not bound because
-        it caps each statement rather than the pair -- leaves the manifest rows
-        of the first while the second is refused. Those rows are inert:
+        stronger one. A takeover before the first manifest INSERT
+        leaves nothing behind; a takeover in a GAP between statements -- one
+        per manifest chunk, then the watermark, each gap a full client round
+        trip which ``max_execution_time`` does not bound because it caps each
+        statement rather than the sequence -- leaves the manifest rows already
+        written while the rest are refused. Those rows are inert:
         membership pairs a manifest row with the watermark row of the SAME
         publish, and that row will never exist, so no snapshot admits them and
         no reader sees them. What they are not is absent. See

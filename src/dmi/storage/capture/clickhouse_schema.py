@@ -321,6 +321,20 @@ pack_id UUID
                 "schema creation (" + "; ".join(details) + "). It was not stamped."
             )
         self._reject_wrong_kinds(found)
+        # The layout, not just the inventory. Names and kinds were all this
+        # confirmed, so the DDL's own `IF NOT EXISTS` could no-op against a
+        # table another initializer had created with a pre-v4 sort key or a
+        # dropped engine argument, and the stamp went on over a layout it did
+        # not describe -- detected only on a LATER call, by which time this one
+        # had already told its caller to index.
+        #
+        # This does not close that race; only serialising initialisation per
+        # prefix does. It stops the stamp from being written over a layout this
+        # build can see is wrong, which turns a silent disagreement into the
+        # refusal any other incompatible catalog gets.
+        just_created = "was just created by this build"
+        self._reject_a_wrong_descriptor_sort_key(found, just_created)
+        self._reject_a_wrong_engine(found, just_created)
 
     def _verify_compatibility(
         self, found: dict[str, CatalogObject] | None = None

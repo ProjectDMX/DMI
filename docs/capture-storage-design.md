@@ -468,8 +468,8 @@ mode every post-write check in this design's history has had.
 
 That is per STATEMENT, not per publish, and the two are not the same claim.
 This paragraph used to say such a publisher "writes nothing"; a takeover
-landing in the gap between the two statements leaves the manifest rows of the
-first behind. They are inert -- membership needs the manifest row and the
+landing in a gap between statements -- a publish issues one per manifest chunk
+and then the watermark -- leaves the manifest rows already written behind. They are inert -- membership needs the manifest row and the
 watermark row of the SAME publish -- so the safety claim is unaffected, but the
 rows are durable. See docs/catalog-descriptor-key.md, *What this does not
 close*.

@@ -1123,6 +1123,39 @@ def test_a_stamped_catalog_with_the_wrong_descriptor_sort_key_is_refused():
     ]
 
 
+def test_a_fresh_install_rechecks_the_layout_before_it_stamps():
+    """The sort-key and engine checks ran only on the STAMPED path.
+
+    A fresh install reads an empty catalog, issues `CREATE TABLE IF NOT
+    EXISTS`, confirms the object names and kinds, and stamps. Nothing in that
+    sequence looks at the sort key or the engine arguments -- so if another
+    initializer created a pre-v4 `capture_raw` between the empty read and this
+    one's CREATE, the CREATE is a no-op, the names and kinds all check out, and
+    the stamp goes on over a layout it does not describe.
+
+    This does not close that race -- only serialising initialisation per prefix
+    does, and the reviewer who found it said so. What it does is stop the stamp
+    from being written over a layout this build can see is wrong, which turns a
+    silent disagreement into the same refusal any other incompatible catalog
+    gets.
+    """
+    client = _Client(sort_key=_VERSION_ONE_SORT_KEY)
+    # The fake grows `tables` as CREATE statements run, so this begins empty --
+    # a fresh install -- and the descriptor table it "creates" answers with the
+    # version 1 sort key, standing in for the concurrent initializer's table.
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    assert _VERSION_ONE_SORT_KEY in message
+    # And it refused BEFORE stamping: no row claims this build owns that layout.
+    assert not [
+        item
+        for item, *_ in client.calls
+        if item.startswith("INSERT") and "dmi_schema_version" in item
+    ]
+
 def test_a_stamped_catalog_whose_descriptor_engine_drops_the_version_is_refused():
     """A correct sort key on the wrong engine collapses rows just the same.
 

@@ -306,6 +306,11 @@ def test_a_taken_over_publisher_writes_nothing_at_all():
         before_state = _catalog_state(client, config)
         before_page = reader.search(CaptureQuery(limit=100, tenant_id=tenant))
         assert len(before_page.items) == len(corpus)
+        corpus_ids = [item.capture_id for item in corpus]
+        before_by_ids = reader.get_by_ids(
+            corpus_ids, tenant_id=tenant, watermark=pinned
+        )
+        assert len(before_by_ids) == len(corpus)
 
         writer.release_publisher_lease()
         # The successor runs on the DEFAULT knobs. Only the stalled publisher's
@@ -371,10 +376,12 @@ def test_a_taken_over_publisher_writes_nothing_at_all():
         assert reader.search(
             CaptureQuery(limit=100, tenant_id=tenant, cursor=None)
         ).items == before_page.items
-        assert reader.get_by_ids(
-            [item.capture_id for item in corpus], tenant_id=tenant, watermark=pinned
-        ) == reader.get_by_ids(
-            [item.capture_id for item in corpus], tenant_id=tenant, watermark=pinned
+        # Against the result taken BEFORE the takeover, not against a second
+        # call made after it: two post-takeover calls agree with each other
+        # whatever the takeover did to them, so that comparison could not fail.
+        assert (
+            reader.get_by_ids(corpus_ids, tenant_id=tenant, watermark=pinned)
+            == before_by_ids
         )
 
         # The successor publishes normally over the same catalog.
