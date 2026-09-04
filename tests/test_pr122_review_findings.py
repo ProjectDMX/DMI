@@ -17,7 +17,10 @@ Comments covered:
 """
 from __future__ import annotations
 
+import importlib.util
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +56,20 @@ pytestmark = pytest.mark.cpu
 REPO = Path(__file__).resolve().parents[1]
 DENSE = REPO / "examples" / "model_descriptors" / "llama3-8b.yaml"
 PLAN = REPO / "docs" / "dmi-configurator-plan.md"
+
+
+def _test_client():
+    """Skip, not error, when the UI extra or its test-only transport is absent.
+
+    fastapi.testclient needs httpx2 (or the deprecated httpx), which the [ui]
+    extra deliberately does not carry: the UI never makes HTTP requests.
+    """
+    pytest.importorskip("fastapi", reason="DMI-configurator UI extra not installed")
+    if not any(importlib.util.find_spec(name) for name in ("httpx2", "httpx")):
+        pytest.skip("fastapi.testclient needs httpx2 (or httpx); test-only, see CI install step")
+    from fastapi.testclient import TestClient
+
+    return TestClient
 
 UNVERSIONED = {"observations": {"hooks": ["resid_pre"]}}
 VALID_CONFIG = {
@@ -137,9 +154,7 @@ class TestFalsySectionsAreRejected:
 class TestSaveEndpointTranslatesConfigurationError:
     @pytest.fixture
     def doomed_client(self, tmp_path):
-        pytest.importorskip("fastapi", reason="DMI-configurator UI extra not installed")
-        from fastapi.testclient import TestClient
-
+        TestClient = _test_client()
         from dmi.ui.app import create_app
 
         # A save path whose parent does not exist: startup does not touch it
@@ -173,9 +188,7 @@ class TestSaveEndpointTranslatesConfigurationError:
 class TestWorkloadTypeIsChecked:
     @pytest.fixture
     def client(self):
-        pytest.importorskip("fastapi", reason="DMI-configurator UI extra not installed")
-        from fastapi.testclient import TestClient
-
+        TestClient = _test_client()
         from dmi.ui.app import create_app
 
         return TestClient(create_app(DENSE), base_url="http://127.0.0.1")
@@ -492,3 +505,48 @@ class TestArchitectureIsPositivelyIdentified:
         )
         descriptor = descriptor_from_hf_config(causal, "llama")
         assert descriptor.model.architecture == "decoder_transformer"
+
+
+# ---------------------------------------------------------------------------
+# Copilot's third pass (suppressed, "previously missed"): fastapi.testclient
+# needs an HTTP transport (httpx2, or the deprecated httpx) that is not part
+# of the [ui] extra -- the UI itself never makes HTTP requests. With the extra
+# installed but no transport, `from fastapi.testclient import TestClient`
+# raises at collection time and the whole API contract suite errors instead
+# of skipping like every other optional-dependency suite in this tree.
+# ---------------------------------------------------------------------------
+
+
+class TestApiSuiteSkipsWithoutTestClientTransport:
+    # Selected so the run covers every module that imports TestClient.
+    TARGETS = (
+        "tests/test_configurator_api.py",
+        "tests/test_pr122_review_findings.py::TestSaveEndpointTranslatesConfigurationError",
+        "tests/test_pr122_review_findings.py::TestWorkloadTypeIsChecked",
+    )
+
+    def test_missing_transport_skips_instead_of_erroring(self):
+        pytest.importorskip("fastapi", reason="DMI-configurator UI extra not installed")
+        # `sys.modules[name] = None` makes both `import name` fail and
+        # `importlib.util.find_spec(name)` return None, so the child sees a
+        # machine with the [ui] extra but neither transport installed.
+        program = (
+            "import sys, pytest\n"
+            "sys.modules['httpx'] = None\n"
+            "sys.modules['httpx2'] = None\n"
+            "sys.exit(pytest.main(['-q', '-p', 'no:cacheprovider', "
+            "'-o', 'addopts=', *sys.argv[1:]]))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", program, *self.TARGETS],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        summary = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+        detail = f"exit={result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        assert result.returncode == 0, detail
+        assert "skipped" in summary and "error" not in summary, detail
+        # A pass would mean the transport was not actually blocked.
+        assert "passed" not in summary, detail

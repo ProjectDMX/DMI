@@ -360,6 +360,21 @@ def estimate_config(
         # One logit row per request per step.
         prefill_logits = workload.batch_size
         decode_logits = workload.batch_size
+        if config.observations.layers is not None:
+            # The pinned vLLM integration's attach_model has no `layers`
+            # keyword, so attach_config refuses a ranged configuration on
+            # that backend at launch rather than dropping the range. The
+            # estimate itself is still meaningful (it is what the range
+            # *would* cost), so this is a warning, said here because the
+            # estimator is where the UI learns which backend is targeted.
+            warnings.append(
+                "The pinned vLLM integration does not accept a layer range "
+                "yet: attach_config will refuse this configuration on "
+                "Packed (vLLM) until third_party/vllm-integration is "
+                "updated (https://github.com/ProjectDMX/"
+                "DMI-vLLM-Integration/issues/20). Clear the layer range or "
+                "target Batched (Hugging Face) to run it today."
+            )
     else:
         prefill_batch = decode_batch = workload.batch_size
         prefill_q = workload.prompt_tokens
