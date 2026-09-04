@@ -232,7 +232,12 @@ class CatalogObject:
 
     @property
     def kind(self) -> str:
-        return "VIEW" if self.engine.endswith("View") else "TABLE"
+        # Exactly `View`, not anything ENDING in it. `MaterializedView`,
+        # `LiveView` and `WindowView` are all tables that hold rows, and none
+        # can be replaced by the `CREATE OR REPLACE VIEW` this build issues --
+        # so treating them as the view it creates skipped the kind refusal and
+        # died on the driver's error instead, with no rebuild instruction.
+        return "VIEW" if self.engine == "View" else "TABLE"
 
 
 class ClickHouseCatalogSchema:

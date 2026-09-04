@@ -1116,6 +1116,55 @@ def test_the_indexer_rejects_a_non_integer_or_negative_allocation(
         indexer.index(refs)
 
 
+class _RacingWriter(_HostileWriter):
+    """Publishes are refused as lost races, and the durable head moves.
+
+    Models the situation the retry loop is for: this publisher is losing to
+    another one that keeps landing higher versions.
+    """
+
+    def __init__(self, allocate, *, last_published: int, head_after_race: int):
+        super().__init__(allocate, last_published=last_published)
+        self._head_after_race = head_after_race
+        self.publishes = 0
+
+    def publish_snapshot(self, **kwargs):
+        self.publishes += 1
+        # The competitor has advanced the durable head past anything this
+        # allocator will hand out.
+        self._last_published = self._head_after_race
+        raise SnapshotPublishRaceError("lost the race")
+
+
+def test_a_lost_race_rechecks_the_durable_head_before_retrying(tmp_path: Path):
+    """The cross-check must not be evaluated against a head known to be stale.
+
+    `_allocate_version` reads `last_published_version()` once and caches it,
+    and the retry path re-allocated without clearing that cache -- so the
+    "strictly above the durable head" guard was checked against the head as of
+    the FIRST attempt, at exactly the moment it was known to have moved.
+
+    With an allocator whose versions are above the stale head and below the
+    real one, every retry passed the guard, rewrote the whole descriptor batch
+    at a version the server would refuse, and the loop ended in
+    `SnapshotPublishExhaustedError` -- "something is publishing continuously"
+    -- rather than the allocation error this guard exists to raise.
+    """
+    store, refs = _refs(tmp_path, 1)
+    writer = _RacingWriter(
+        lambda: next(counter), last_published=10, head_after_race=20
+    )
+    counter = iter(range(11, 40))
+    indexer = CatalogIndexer(store, writer)
+
+    with pytest.raises(CatalogVersionAllocationError, match="non-monotonic"):
+        indexer.index(refs)
+
+    # It gave up on the SECOND attempt, once the refreshed head refused the
+    # allocation, rather than burning the whole budget.
+    assert writer.publishes == 1
+
+
 @pytest.mark.parametrize("allocated", [5, 4])
 def test_the_indexer_refuses_a_non_monotonic_allocation(
     tmp_path: Path, allocated: int

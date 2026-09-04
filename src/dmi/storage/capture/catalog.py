@@ -585,6 +585,17 @@ class CatalogIndexer:
                 last_race = race
                 if attempt + 1 == attempts:
                     break
+                # Drop the cached head before re-allocating. The race means
+                # a competitor published, so the head this indexer read on its
+                # first allocation is stale at exactly the moment the
+                # strictly-above-the-head cross-check matters: a faulty
+                # allocator handing out versions above the STALE head passed
+                # that check on every retry, rewrote the whole batch at a
+                # version the server refuses, and the loop ended in
+                # SnapshotPublishExhaustedError -- "something is publishing
+                # continuously" -- instead of the allocation error this guard
+                # exists to raise.
+                self._published_version = None
                 version = self._allocate_version()
                 rewrite_inserts += self._write_descriptor_batches(
                     descriptors, version

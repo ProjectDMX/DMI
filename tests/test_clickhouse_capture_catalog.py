@@ -1704,6 +1704,33 @@ def test_a_lone_version_one_commit_log_is_named_rather_than_misdiagnosed():
     assert _past_the_visibility_checks(client) == []
 
 
+def test_a_materialized_view_is_not_mistaken_for_the_view_this_build_creates():
+    """`kind` was "does the engine name end in View", which is three engines.
+
+    `MaterializedView`, `LiveView` and `WindowView` all end in "View", so a
+    materialized view standing at `{prefix}_capture` passed `_reject_wrong_kinds`
+    and reached the DDL -- where `CREATE OR REPLACE VIEW` cannot replace it, so
+    every startup died on the driver's own error with no rebuild instruction.
+    That is precisely the outcome the kind check exists to prevent, and the one
+    the sibling test above pins for a table.
+    """
+    for engine in ("MaterializedView", "LiveView", "WindowView"):
+        client = _Client(
+            tables=_CURRENT_OBJECTS,
+            schema_version=_SCHEMA_VERSION,
+            engines={"dmi_capture": engine},
+        )
+
+        with pytest.raises(CatalogSchemaVersionError) as raised:
+            _writer(client).ensure_schema()
+
+        message = str(raised.value)
+        assert f"`dmi_capture` is a TABLE (engine {engine})" in message, engine
+        assert "where this build creates a VIEW" in message, engine
+        # And nothing was issued on the way to the refusal.
+        assert _past_the_visibility_checks(client) == [], engine
+
+
 def test_an_object_of_the_wrong_kind_is_named_rather_than_left_to_the_server():
     """A table standing where a view belongs fails the DDL halfway through.
 
