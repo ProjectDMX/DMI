@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from time import time_ns
 
@@ -95,6 +96,9 @@ def _facet_ddl() -> str:
     )
 
 
+_ENGINE_NAME = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*")
+
+
 def _key_columns(sorting_key: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in sorting_key.split(",") if part.strip())
 
@@ -109,13 +113,27 @@ def _engine_arguments(engine_full: str) -> tuple[str, tuple[str, ...]]:
     is read -- reading to the last ``)`` swept ORDER BY's own parenthesis in and
     refused every healthy catalog.
 
+    The engine NAME is the leading identifier, and the arguments are read only
+    when a ``(`` follows it directly. A bare call is rendered WITHOUT its
+    parentheses -- ``ReplacingMergeTree ORDER BY (...)`` for a table created as
+    ``ReplacingMergeTree()`` (observed on an embedded 26.7) -- so partitioning
+    on the first ``(`` in the string made ORDER BY's group the "arguments" and
+    ``ReplacingMergeTree ORDER BY`` the "name". The comparison happened to
+    still refuse that table, for the wrong reason and with a message naming a
+    non-existent engine.
+
     Whitespace-insensitive because the server renders what it stored rather than
     the text that created it, and an engine with no arguments at all yields an
     empty tuple rather than a parse error.
     """
-    head, separator, rest = engine_full.strip().partition("(")
-    if not separator:
-        return head.strip(), ()
+    match = _ENGINE_NAME.match(engine_full)
+    if match is None:
+        return engine_full.strip(), ()
+    name = match.group(1)
+    rest = engine_full[match.end():]
+    if not rest.startswith("("):
+        return name, ()
+    rest = rest[1:]
     depth = 1
     for index, character in enumerate(rest):
         depth += (character == "(") - (character == ")")
@@ -127,7 +145,7 @@ def _engine_arguments(engine_full: str) -> tuple[str, tuple[str, ...]]:
         # so a shape this parser does not understand still gets COMPARED and
         # reported instead of crashing the compatibility check.
         arguments = rest
-    return head.strip(), tuple(
+    return name, tuple(
         part.strip() for part in arguments.split(",") if part.strip()
     )
 

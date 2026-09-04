@@ -2226,3 +2226,37 @@ def test_a_publish_whose_membership_was_collected_before_its_watermark_landed_is
     assert client.manifest == []
     # And the lease is intact -- this was not a takeover.
     assert writer.publisher_lease is not None
+
+
+@pytest.mark.parametrize(
+    "engine_full, expected",
+    [
+        (
+            "ReplacingMergeTree(index_version) ORDER BY (tenant_id, experiment_id) "
+            "SETTINGS index_granularity = 8192",
+            ("ReplacingMergeTree", ("index_version",)),
+        ),
+        # A bare engine call is rendered WITHOUT its parentheses: an embedded
+        # ClickHouse 26.7 reported `ReplacingMergeTree ORDER BY ...` for a
+        # table created as `ReplacingMergeTree()`. Read naively, the first `(`
+        # in that string is ORDER BY's, and the engine "name" swallows the
+        # clause up to it.
+        (
+            "ReplacingMergeTree ORDER BY (tenant_id, experiment_id) "
+            "SETTINGS index_granularity = 8192",
+            ("ReplacingMergeTree", ()),
+        ),
+        ("ReplacingMergeTree() ORDER BY (a, b)", ("ReplacingMergeTree", ())),
+        ("MergeTree ORDER BY version SETTINGS index_granularity = 8192", ("MergeTree", ())),
+        (
+            "ReplicatedReplacingMergeTree('/clickhouse/tables/x', 'r1', index_version) "
+            "ORDER BY (a, b)",
+            ("ReplicatedReplacingMergeTree", ("'/clickhouse/tables/x'", "'r1'", "index_version")),
+        ),
+        ("View", ("View", ())),
+    ],
+)
+def test_engine_arguments_are_read_off_the_clause_the_server_renders(engine_full, expected):
+    from dmi.storage.capture.clickhouse_schema import _engine_arguments
+
+    assert _engine_arguments(engine_full) == expected

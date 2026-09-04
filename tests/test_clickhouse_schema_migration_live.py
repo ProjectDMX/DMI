@@ -61,6 +61,7 @@ from dmi.storage.capture import (
     StoredObject,
 )
 from dmi.storage.capture.clickhouse_schema import SCHEMA_VERSION as _SCHEMA_VERSION
+from dmi.storage.capture.clickhouse_schema import CAPTURE_TABLE_ORDER, _engine_arguments
 
 
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
@@ -836,6 +837,90 @@ def test_a_fresh_install_records_this_builds_version_and_stays_idempotent(
         assert _recorded_version(client, config) == _SCHEMA_VERSION
         assert _count(client, config, "capture_raw") == len(descriptors)
         assert _count(client, config, "capture") == len(descriptors)
+
+
+def test_a_stamped_catalog_whose_descriptor_engine_drops_the_version_is_refused():
+    """A correct sort key on the wrong engine collapses rows just the same.
+
+    The compatibility read used to capture `engine` and `sorting_key` only, and
+    `engine` is `ReplacingMergeTree` for both `ReplacingMergeTree(index_version)`
+    and a bare `ReplacingMergeTree()`. Reproduced on 25.12: a stamped v4
+    `capture_raw` replaced with the same columns and key but no version
+    argument passed `ensure_schema()`, and after `OPTIMIZE ... FINAL` a merge
+    kept an arbitrary row per key -- the reader-selected pack changed from the
+    version-3 pack to the version-2 one. The CPU regression for this was
+    written against a fake whose `engine_full` had a shape no server returns,
+    and it passed while the parser was wrong; this is the check against the
+    clause the server actually renders.
+
+    The wrong table is made from the server's own `SHOW CREATE TABLE`, with
+    only the engine call edited, so nothing else about it can differ from what
+    this build created.
+    """
+    with _server() as (client, config):
+        writer = ClickHouseCatalogWriter(client, config)
+        writer.ensure_schema()
+        table = f"`{config.database}`.`{config.table_prefix}_capture_raw`"
+        create = client.execute(f"SHOW CREATE TABLE {table}")[0][0]
+        assert "ENGINE = ReplacingMergeTree(index_version)" in create, create
+        client.execute(f"DROP TABLE {table}")
+        client.execute(
+            create.replace(
+                "ENGINE = ReplacingMergeTree(index_version)",
+                "ENGINE = ReplacingMergeTree()",
+            )
+        )
+        engine_full = client.execute(
+            "SELECT engine_full FROM system.tables WHERE database = %(database)s "
+            "AND name = %(name)s",
+            {"database": config.database, "name": f"{config.table_prefix}_capture_raw"},
+        )[0][0]
+        # The server renders a bare engine call WITHOUT its parentheses (an
+        # embedded 26.7 rendered `ReplacingMergeTree ORDER BY ...`), so the
+        # shape is asserted through the parser rather than as text.
+        assert _engine_arguments(engine_full) == ("ReplacingMergeTree", ()), engine_full
+        assert _sort_key(client, config) == ", ".join(CAPTURE_TABLE_ORDER)
+
+        with pytest.raises(CatalogSchemaVersionError) as raised:
+            writer.ensure_schema()
+
+        message = str(raised.value)
+        # Both sides named: the clause the server rendered, and the requirement.
+        assert engine_full in message
+        assert "ReplacingMergeTree(index_version)" in message
+        assert f"{config.table_prefix}_capture_raw" in message
+        assert "CatalogReconciler.rebuild()" in message
+        # Refused, not repaired: CREATE TABLE IF NOT EXISTS cannot alter an
+        # engine, and the table is exactly as the operator left it.
+        assert client.execute(
+            "SELECT engine_full FROM system.tables WHERE database = %(database)s "
+            "AND name = %(name)s",
+            {"database": config.database, "name": f"{config.table_prefix}_capture_raw"},
+        )[0][0] == engine_full
+
+
+def test_a_healthy_catalog_passes_the_engine_check_against_the_rendered_clause():
+    """The complement, against the server: the healthy clause is accepted.
+
+    A parser that read to the LAST `)` swept `ORDER BY (...)` into the engine
+    arguments and refused every healthy catalog; the fake agreed with it. So the
+    acceptance is asserted here on the shape the server renders, which is the
+    engine call followed by ORDER BY and SETTINGS in one string.
+    """
+    with _server() as (client, config):
+        writer = ClickHouseCatalogWriter(client, config)
+        writer.ensure_schema()
+        engine_full = client.execute(
+            "SELECT engine_full FROM system.tables WHERE database = %(database)s "
+            "AND name = %(name)s",
+            {"database": config.database, "name": f"{config.table_prefix}_capture_raw"},
+        )[0][0]
+        assert engine_full.startswith("ReplacingMergeTree(index_version)"), engine_full
+        assert "ORDER BY" in engine_full, "the server renders the whole clause"
+
+        writer.ensure_schema()  # idempotent, and not refused
+
+        assert _recorded_version(client, config) == _SCHEMA_VERSION
 
 
 def test_a_catalog_stamped_by_a_newer_build_is_refused():
