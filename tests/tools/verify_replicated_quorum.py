@@ -164,6 +164,10 @@ def drop(client, prefix: str) -> None:
             except ServerException:
                 pass
             client.execute(f"DROP TABLE IF EXISTS default.`{prefix}_{name}{suffix}` SYNC")
+    # The views create() made; views first so they never dangle over their
+    # dropped sources, and DROP TABLE removes a view just as well.
+    client.execute(f"DROP TABLE IF EXISTS default.`{prefix}_capture` SYNC")
+    client.execute(f"DROP TABLE IF EXISTS default.`{prefix}_pack_inventory` SYNC")
 
 
 def _refs(descriptors):
