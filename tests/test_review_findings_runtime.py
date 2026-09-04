@@ -553,3 +553,176 @@ def _attach(adapter, config) -> None:
     from dmi.configuration.compiler import attach_config
 
     attach_config(adapter, object(), config)
+
+
+# ---------------------------------------------------------------------------
+# Review follow-up on 3919326685: gating plan/commit is NOT enough. The
+# model's HookPoints still dispatch producers during the refused step's
+# forward -- unreserved ring writes and meta/FIFO desync. The refusal has to
+# reach the producer launch decision via a transport-level per-step flag.
+# ---------------------------------------------------------------------------
+
+
+class TestRefusedStepsSilenceProducers:
+    def test_refused_step_sets_capture_flag_false_on_the_transport(self):
+        adapter = StubAdapter(
+            FakeEngine(MonitoringConfig(
+                schedule=CaptureSchedule(capture_prefill=True, capture_decode=False),
+            )),
+            "test_model",
+            _make_ctx(phase="decode"),
+        )
+
+        adapter.before_forward(None)
+
+        assert adapter.transport.capture_step is False
+
+    def test_captured_step_sets_capture_flag_true(self):
+        adapter = StubAdapter(
+            FakeEngine(MonitoringConfig(schedule=CaptureSchedule())),
+            "test_model",
+            _make_ctx(phase="decode"),
+        )
+
+        adapter.before_forward(None)
+
+        assert adapter.transport.capture_step is True
+
+    def test_engine_without_a_config_leaves_capture_flag_true(self):
+        adapter = StubAdapter(FakeEngine(config=None), "test_model", _make_ctx())
+
+        adapter.before_forward(None)
+
+        assert adapter.transport.capture_step is True
+
+    def test_hook_point_does_not_dispatch_on_a_refused_step(self):
+        """The whole point: during a refused step's forward, the fast path in
+        HookPoint.forward must not launch a producer kernel.
+
+        A MagicMock tensor poses as CUDA input (truthy is_cuda), so the
+        re-armed path is observable on a CPU-only box: past the gate it
+        reaches dispatch_producer; through the gate it must not.
+        """
+        from unittest.mock import MagicMock
+
+        import torch
+
+        import dmi.hooks.point as hook_point
+        from dmi.hooks.point import HookPoint
+
+        dispatched: list = []
+        original = hook_point.dispatch_producer
+
+        def recording_producer(*args, **kwargs):
+            dispatched.append(args)
+
+        hp = HookPoint()
+        hp._ring_hook_type = 6
+        hp._ring_hook_id = 0
+        hp._strip_tensor = None
+        hp._strip_row_bytes = 0
+        hp._ring_payload = torch.zeros(16, dtype=torch.uint8)
+        x = MagicMock()
+
+        hook_point.dispatch_producer = recording_producer
+        try:
+            from dmi.transport import ring as _rt
+
+            class _T:
+                force_eager = False
+                capture_step = False
+                _ring_engine = None
+
+            _rt._active_transport = _T()
+            hp.forward(x)
+            assert dispatched == [], "producer fired on a refused step"
+
+            # A captured step re-arms the hook and dispatches.
+            _rt._active_transport.capture_step = True
+            hp.forward(x)
+            assert len(dispatched) == 1
+        finally:
+            hook_point.dispatch_producer = original
+            from dmi.transport import ring as _rt
+
+            _rt._active_transport = None
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups, minor: sustained rate must apply both strides (the
+# request gate drops whole requests too); the estimator must say when its
+# reductions are only conditionally enforced; the architecture refusal must
+# match real HF spellings.
+# ---------------------------------------------------------------------------
+
+
+class TestSustainedRateAppliesBothStrides:
+    def test_request_stride_thins_the_sustained_rate(self):
+        dense = estimate_config(
+            _config(request_stride=1), _descriptor(), _workload()
+        )
+        strided = estimate_config(
+            _config(request_stride=4), _descriptor(), _workload()
+        )
+
+        assert strided.sustained_bytes_per_second == pytest.approx(
+            dense.sustained_bytes_per_second / 4
+        )
+
+
+class TestEstimateDisclosesConditionalEnforcement:
+    def test_strides_on_packed_carry_an_enforcement_assumption(self):
+        estimate = estimate_config(
+            _config(step_stride=4), _descriptor(), _workload(packed=True)
+        )
+
+        notes = " ".join(estimate.assumptions).lower()
+        assert "assumes" in notes and ("phase" in notes or "request ids" in notes)
+
+    def test_default_schedule_makes_no_enforcement_claim(self):
+        estimate = estimate_config(_config(), _descriptor(), _workload())
+
+        assert not any("assumes" in a and "phase" in a for a in estimate.assumptions)
+
+
+class TestMaskedLMArchitecturesAreRefused:
+    def test_bertformaskedlm_architecture_is_refused(self):
+        from types import SimpleNamespace
+
+        # An unknown model_type whose architectures name the masked-LM head:
+        # HF names carry no underscores, so the lowered suffix check must
+        # match "formaskedlm".
+        masked = SimpleNamespace(
+            model_type="some_future_family",
+            architectures=["BertForMaskedLM"],
+            hidden_size=768,
+            num_attention_heads=12,
+            num_hidden_layers=2,
+            vocab_size=30522,
+            is_encoder_decoder=False,
+        )
+
+        from dmi.configuration.errors import DescriptorError
+        from dmi.configuration.introspect import descriptor_from_hf_config
+
+        with pytest.raises(DescriptorError, match="decoder_transformer|causal"):
+            descriptor_from_hf_config(masked, "some-future-family")
+
+
+def _config(hooks=("resid_pre",), layers=None, **schedule) -> DMIConfig:
+    return DMIConfig(
+        observations=ObservationConfig(hooks=list(hooks), layers=layers),
+        schedule=CaptureSchedule(**schedule),
+    )
+
+
+def _workload(**overrides) -> Workload:
+    base = dict(
+        batch_size=1,
+        prompt_tokens=128,
+        decode_tokens=64,
+        decode_steps_per_second=10.0,
+        packed=True,
+    )
+    base.update(overrides)
+    return Workload(**base)
