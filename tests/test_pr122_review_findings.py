@@ -550,3 +550,35 @@ class TestApiSuiteSkipsWithoutTestClientTransport:
         assert "skipped" in summary and "error" not in summary, detail
         # A pass would mean the transport was not actually blocked.
         assert "passed" not in summary, detail
+
+
+# ---------------------------------------------------------------------------
+# vLLM integration follow-up (#20 / DMI-vLLM-Integration#21): the facade
+# must export the layer-range pieces the integration imports through
+# dmi.api.v1. Internal import paths are not integration surface.
+# ---------------------------------------------------------------------------
+
+
+class TestFacadeExportsLayerRangeAPI:
+    def test_facade_exports_layer_range_api(self):
+        import dmi.api.v1 as facade
+
+        for name in (
+            "filter_by_layers",
+            "hook_belongs_to_layers",
+            "LayerSelection",
+        ):
+            assert name in facade.__all__, f"{name} must be in the facade __all__"
+            assert hasattr(facade, name)
+
+    def test_exports_are_the_real_implementations(self):
+        from dmi.api import v1 as facade
+        from dmi.configuration.schema import LayerSelection as _Real
+        from dmi.hooks.selection import (
+            filter_by_layers as _filter,
+            hook_belongs_to_layers as _belongs,
+        )
+
+        assert facade.filter_by_layers is _filter
+        assert facade.hook_belongs_to_layers is _belongs
+        assert facade.LayerSelection is _Real
