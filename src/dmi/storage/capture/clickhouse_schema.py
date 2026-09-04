@@ -99,13 +99,33 @@ def _key_columns(sorting_key: str) -> tuple[str, ...]:
 
 
 def _engine_arguments(engine_full: str) -> tuple[str, tuple[str, ...]]:
-    """`engine_full` split into its name and arguments, whitespace-insensitive.
+    """`engine_full` split into the engine name and ITS arguments.
 
-    The server renders the clause it stored rather than the text that created
-    it, so comparing strings would refuse a healthy catalog over a space.
+    `engine_full` is the whole engine clause, not just the call: the server
+    renders it as e.g. ``ReplacingMergeTree(index_version) ORDER BY (tenant_id,
+    ...) SETTINGS index_granularity = 8192``. So the arguments end at the
+    parenthesis that CLOSES the engine call, and only the first balanced group
+    is read -- reading to the last ``)`` swept ORDER BY's own parenthesis in and
+    refused every healthy catalog.
+
+    Whitespace-insensitive because the server renders what it stored rather than
+    the text that created it, and an engine with no arguments at all yields an
+    empty tuple rather than a parse error.
     """
-    head, _, rest = engine_full.strip().partition("(")
-    arguments = rest.rsplit(")", 1)[0] if rest else ""
+    head, separator, rest = engine_full.strip().partition("(")
+    if not separator:
+        return head.strip(), ()
+    depth = 1
+    for index, character in enumerate(rest):
+        depth += (character == "(") - (character == ")")
+        if depth == 0:
+            arguments = rest[:index]
+            break
+    else:
+        # Unbalanced: treat the remainder as the arguments rather than raise,
+        # so a shape this parser does not understand still gets COMPARED and
+        # reported instead of crashing the compatibility check.
+        arguments = rest
     return head.strip(), tuple(
         part.strip() for part in arguments.split(",") if part.strip()
     )

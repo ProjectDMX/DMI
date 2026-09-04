@@ -478,6 +478,40 @@ def test_a_tenant_too_long_for_a_key_segment_still_binds(tmp_path: Path):
         PackIndex.from_store(other, forged).descriptors()
 
 
+def test_engine_arguments_are_read_off_the_shape_the_server_renders():
+    """`engine_full` is the whole engine CLAUSE, not just the engine call.
+
+    The first version of this parser read to the LAST `)`, which is correct for
+    `ReplacingMergeTree(index_version)` and wrong for what a server actually
+    returns -- the arguments, then `ORDER BY (...)`, then `SETTINGS ...`. It
+    swept ORDER BY's own parenthesis into the argument list and so refused every
+    healthy catalog. The CPU fake had been answering the bare call, so nothing
+    here caught it and the live suite went red instead.
+
+    These are the shapes ClickHouse 25.12 renders, pinned so the parser is
+    tested against real text rather than against the fake's convenience.
+    """
+    from dmi.storage.capture.clickhouse_schema import _engine_arguments
+
+    rendered = (
+        "ReplacingMergeTree(index_version) ORDER BY (tenant_id, experiment_id, "
+        "run_id, captured_at_ns, capture_id, store_id, pack_id) "
+        "SETTINGS index_granularity = 8192"
+    )
+    assert _engine_arguments(rendered) == ("ReplacingMergeTree", ("index_version",))
+    # The bare call agrees with the rendered clause, so both are accepted.
+    assert _engine_arguments("ReplacingMergeTree(index_version)") == (
+        "ReplacingMergeTree",
+        ("index_version",),
+    )
+    # A dropped argument is what the check exists to catch, ORDER BY and all.
+    assert _engine_arguments(
+        "ReplacingMergeTree() ORDER BY (a, b) SETTINGS index_granularity = 8192"
+    ) == ("ReplacingMergeTree", ())
+    # An engine with no argument list at all parses rather than raising.
+    assert _engine_arguments("View") == ("View", ())
+
+
 def test_the_two_key_component_forms_cannot_collide(tmp_path: Path):
     """The direct and digest forms shared a namespace, so two ids named one key.
 

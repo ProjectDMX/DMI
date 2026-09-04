@@ -140,7 +140,18 @@ class _Client:
             return self.engine_full[name]
         engine = self._engine(name)
         if engine == "ReplacingMergeTree":
-            return "ReplacingMergeTree(index_version)"
+            # The shape the SERVER renders, not just the engine call: engine_full
+            # carries the whole engine clause, so ORDER BY and SETTINGS trail the
+            # arguments. A fake that answered `ReplacingMergeTree(index_version)`
+            # bare let a parser that read to the LAST `)` pass here and refuse
+            # every healthy catalog against a real server.
+            return (
+                "ReplacingMergeTree(index_version) "
+                f"ORDER BY ({self.sort_key or 'store_id, pack_id'}) "
+                "SETTINGS index_granularity = 8192"
+            )
+        if engine == "MergeTree":
+            return "MergeTree ORDER BY version SETTINGS index_granularity = 8192"
         return engine
 
     def execute(self, query, params=None, **kwargs):
@@ -1128,7 +1139,13 @@ def test_a_stamped_catalog_whose_descriptor_engine_drops_the_version_is_refused(
         tables=_CURRENT_OBJECTS,
         schema_version=_SCHEMA_VERSION,
         data_rows=1,
-        engine_full={"dmi_capture_raw": "ReplacingMergeTree()"},
+        engine_full={
+            "dmi_capture_raw": (
+                "ReplacingMergeTree() ORDER BY (tenant_id, experiment_id, "
+                "run_id, captured_at_ns, capture_id, store_id, pack_id) "
+                "SETTINGS index_granularity = 8192"
+            )
+        },
     )
 
     with pytest.raises(CatalogSchemaVersionError) as raised:
