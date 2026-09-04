@@ -506,9 +506,9 @@ def test_a_contested_head_is_quarantined_even_though_the_fence_selects_one():
 
     Both documents said "a contested head term satisfies neither condition" of
     the fence. It is not true and the difference matters to anyone reasoning
-    from it: the fence resolves ONE row with `ORDER BY term DESC, lease_id
-    DESC`, so a contested term's higher-ordering claimant satisfies it exactly
-    as an uncontested holder would.
+    from it: the fence resolves ONE lease at the head term with `ORDER BY
+    lease_id DESC`, so a contested term's higher-ordering claimant satisfies it
+    exactly as an uncontested holder would.
 
     A late row can arrive after the winner's read-back. Safety therefore comes
     from refusing every higher claim until both rows expire, not from assuming
@@ -538,7 +538,10 @@ def test_a_contested_head_is_quarantined_even_though_the_fence_selects_one():
         fence = writer._leases.fence()
         # The fence admits one of them, which is the claim both documents got
         # wrong. It is the UUID-order winner, not the text-order winner.
-        margin = {"publish_timeout_ns": config.publish_timeout_ns}
+        margin = {
+            "publish_timeout_ns": config.publish_timeout_ns,
+            "clock_skew_ns": config.clock_skew_ns,
+        }
         assert client.execute(
             f"SELECT {fence}", {"lease_id": low_text_high_uuid, **margin}
         ) == [(1,)]
@@ -622,6 +625,7 @@ def test_the_fence_refuses_on_an_empty_lease_table_rather_than_throwing():
             {
                 "lease_id": lease.lease_id,
                 "publish_timeout_ns": config.publish_timeout_ns,
+                "clock_skew_ns": config.clock_skew_ns,
             },
         ) == [(0,)]
         # And the statement it guards writes nothing rather than throwing.
@@ -635,6 +639,7 @@ def test_the_fence_refuses_on_an_empty_lease_table_rather_than_throwing():
                 "publish_id": str(uuid4()),
                 "lease_id": lease.lease_id,
                 "publish_timeout_ns": config.publish_timeout_ns,
+                "clock_skew_ns": config.clock_skew_ns,
             },
         )
         assert client.execute(f"SELECT count() FROM {watermark}") == [(0,)]
@@ -821,7 +826,7 @@ def test_the_deciding_reads_carry_sequential_consistency_to_the_server():
         assert _settings("max(version)", "SELECT") == [consistent]
         assert _settings("max(index_version)", "SELECT") == [consistent]
         assert _settings("toString(publish_id)", "SELECT") == [consistent]
-        assert _settings("ORDER BY term DESC", "SELECT") == [consistent] * 3
+        assert _settings("GROUP BY term, lease_id", "SELECT") == [consistent] * 3
         assert _settings("acquired_at_ns, expires_at_ns", "SELECT") == [consistent] * 3
         assert _settings("snapshot_manifest", "SELECT") == [consistent]
         # The fenced writes carry the consistency AND the statement cap that

@@ -50,6 +50,25 @@ class ClickHouseCatalogConfig:
     # execution-time check. See publish_snapshot.
     lease_ttl_ns: int = 30_000_000_000
     publish_timeout_ns: int = 5_000_000_000
+    # The bound on how far apart two ClickHouse HOSTS' clocks may be, and the
+    # third term of the margin above. Every lease timestamp is stamped by the
+    # server rather than by a publisher, which removes the publishers' clocks
+    # from the decision -- but on a replicated deployment "the server" is
+    # several hosts, and ``expires_at_ns`` stamped by one host's ``now64()`` is
+    # compared with another's inside the fence. Without this term a successor
+    # on a fast host could consider the holder expired while the holder's
+    # statement, admitted on a slow host, was still running:
+    # ``clock_B - clock_A > lease_ttl_ns - publish_timeout_ns`` was enough.
+    # The fence requires ``publish_timeout_ns + clock_skew_ns`` of lease life
+    # remaining, which makes an overlap require a real skew ABOVE this bound;
+    # see ClickHouseLeaseCoordinator.fence for the derivation.
+    #
+    # Zero is exact for a single host, which is what the defaults describe. A
+    # replicated deployment -- declared here by ``insert_quorum`` -- must set
+    # its measured bound (an NTP-disciplined cluster is typically well under
+    # a second; measure it, and leave headroom), and construction refuses a
+    # quorum without one.
+    clock_skew_ns: int = 0
     # The WRITE half of the consistency story, and off by default because it is
     # a deployment decision rather than one this module can make.
     #
@@ -91,11 +110,23 @@ class ClickHouseCatalogConfig:
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be positive")
-        if self.publish_timeout_ns >= self.lease_ttl_ns:
+        if type(self.clock_skew_ns) is not int or self.clock_skew_ns < 0:
+            raise ValueError("clock_skew_ns must be a non-negative integer")
+        if self.publish_timeout_ns + self.clock_skew_ns >= self.lease_ttl_ns:
             raise ValueError(
-                "publish_timeout_ns must be below lease_ttl_ns: the margin "
-                "between them is what keeps a publish statement from still "
-                "running when its lease becomes takeable"
+                "publish_timeout_ns plus clock_skew_ns must be below "
+                "lease_ttl_ns: the margin between them is what keeps a publish "
+                "statement from still running when its lease becomes takeable, "
+                "and the skew bound is the part of that margin two hosts' "
+                "clocks can eat"
+            )
+        if self.insert_quorum is not None and self.clock_skew_ns == 0:
+            raise ValueError(
+                "clock_skew_ns must be set alongside insert_quorum: a quorum "
+                "declares a replicated deployment, where lease expiries are "
+                "stamped by one host's clock and fenced against another's, and "
+                "a zero bound claims those clocks never disagree. Measure the "
+                "cluster's host skew and set the bound above it"
             )
         if self.insert_quorum is not None and (
             type(self.insert_quorum) is not int or self.insert_quorum < 2
@@ -302,8 +333,7 @@ class ClickHouseCatalogWriter:
                         "index_version": index_version,
                         "publish_id": publish_id,
                         "members": chunk,
-                        "lease_id": lease.lease_id,
-                        "publish_timeout_ns": self._config.publish_timeout_ns,
+                        **self._leases.fence_parameters(lease),
                     },
                     settings=settings,
                 )
@@ -353,8 +383,7 @@ class ClickHouseCatalogWriter:
                 "published_at_ns": published_at_ns,
                 "indexed_rows": indexed_rows,
                 "indexed_packs": indexed_packs,
-                "lease_id": lease.lease_id,
-                "publish_timeout_ns": self._config.publish_timeout_ns,
+                **self._leases.fence_parameters(lease),
             },
             settings=settings,
         )

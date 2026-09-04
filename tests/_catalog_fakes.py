@@ -35,6 +35,10 @@ class MissingLeaseFence(AssertionError):
     """A statement that has to carry the lease fence was issued without it."""
 
 
+class UnexpectedLeaseStatement(AssertionError):
+    """A lease-table write that is neither the claim nor the release."""
+
+
 class ClientComputedClock(AssertionError):
     """A lease row shipped timestamps the SERVER was supposed to compute.
 
@@ -53,30 +57,39 @@ class ClientComputedClock(AssertionError):
 # `test_the_fake_matches_the_fence_the_writer_actually_emits` pins this pattern
 # against the writer's own output, so drift fails as one clear test rather than
 # as four suites going quietly vacuous.
+#
+# The head is the highest term; within it, a lease's expiry is the MINIMUM
+# `expires_at_ns` written under its `(term, lease_id)`, so that a release --
+# an expired row at the holder's own term -- ends the lease without needing a
+# term of its own. The margin is the publish cap PLUS the configured host clock
+# skew bound, because `expires_at_ns` was stamped by one host's `now64()` and
+# is compared against another's.
 _FENCE = re.compile(
     r"\(SELECT count\(\) FROM \("
-    r"SELECT lease_id, expires_at_ns FROM `[^`]+`\.`[^`]+_publisher_lease` "
-    r"ORDER BY term DESC, lease_id DESC LIMIT 1"
+    r"SELECT lease_id, min\(expires_at_ns\) AS expires_at_ns "
+    r"FROM `[^`]+`\.`[^`]+_publisher_lease` "
+    r"WHERE term = \(SELECT max\(term\) FROM `[^`]+`\.`[^`]+_publisher_lease`\) "
+    r"GROUP BY lease_id ORDER BY lease_id DESC LIMIT 1"
     r"\) WHERE lease_id = toUUID\(%\(lease_id\)s\) "
     r"AND expires_at_ns > toUInt64\(toUnixTimestamp64Nano\(now64\(9\)\)\) "
-    r"\+ toUInt64\(%\(publish_timeout_ns\)s\)\) = 1"
+    r"\+ toUInt64\(%\(publish_timeout_ns\)s\) "
+    r"\+ toUInt64\(%\(clock_skew_ns\)s\)\) = 1"
 )
 
-_LIMIT = re.compile(r"\bLIMIT\s+(\d+)")
-
-# The fenced release tombstone `the emitted release statement`
-# emits: the head is resolved and the tombstone written in ONE server-side
-# statement, so a successor acquiring between a read and a write has no window
-# to be contested in. Matched exactly for the same reason `_FENCE` is, and
-# pinned against the writer's own output by the same test.
+# The release tombstone `the emitted release statement` emits: an already-
+# expired row at the releasing writer's OWN term, stamped by the server. It
+# reads nothing, because the earlier `INSERT ... SELECT term + 1` form resolved
+# the head as of its own SELECT and so was not a compare-and-set against a
+# concurrent claim -- a stale release could land at a successor's freshly
+# granted term. A row at the writer's own term can never be a successor's
+# term, so there is no read left to race. Matched exactly for the same reason
+# `_FENCE` is, and pinned against the writer's own output by the same test.
 _RELEASE = re.compile(
     r"INSERT INTO `[^`]+`\.`[^`]+_publisher_lease` "
     r"\(term, lease_id, holder, acquired_at_ns, expires_at_ns\) "
-    r"SELECT term \+ 1, toUUID\(%\(lease_id\)s\), %\(holder\)s, "
-    r"toUnixTimestamp64Nano\(now64\(9\)\), toUnixTimestamp64Nano\(now64\(9\)\) "
-    r"FROM \(SELECT term, lease_id FROM `[^`]+`\.`[^`]+_publisher_lease` "
-    r"ORDER BY term DESC, lease_id DESC LIMIT 1\) "
-    r"WHERE lease_id = toUUID\(%\(lease_id\)s\)"
+    r"SELECT toUInt64\(%\(term\)s\), toUUID\(%\(lease_id\)s\), %\(holder\)s, "
+    r"now_ns, now_ns "
+    r"FROM \(SELECT toUnixTimestamp64Nano\(now64\(9\)\) AS now_ns\)"
 )
 
 
@@ -119,27 +132,47 @@ class FakeLeaseTable:
     # -- the model ----------------------------------------------------------
 
     def head(self) -> list[tuple[int, str, str, int, int]]:
-        """Every row at the highest term. More than one means it was contested."""
+        """Every row at the highest term, release tombstones included.
+
+        More than one LEASE at it means it was contested; more than one row for
+        one lease means it was released.
+        """
         if not self.rows:
             return []
         top = max(term for term, *_ in self.rows)
         return [row for row in self.rows if row[0] == top]
 
-    def fence_passes(self, lease_id: object, publish_timeout_ns: int = 0) -> bool:
+    def claimants(self) -> list[tuple[int, str, str, int]]:
+        """The head as the statements see it: one entry per lease at the top
+        term, each with its EFFECTIVE expiry (the minimum written under that
+        `(term, lease_id)`, so a tombstone ends it), in the order the server
+        resolves -- ClickHouse's UUID collation, descending."""
+        grouped: dict[str, tuple[int, str, str, int]] = {}
+        for term, lease_id, holder, _, expires_at_ns in self.head():
+            seen = grouped.get(lease_id)
+            grouped[lease_id] = (
+                term,
+                lease_id,
+                holder,
+                expires_at_ns if seen is None else min(seen[3], expires_at_ns),
+            )
+        return sorted(
+            grouped.values(), key=lambda row: uuid_order(row[1]), reverse=True
+        )
+
+    def fence_passes(
+        self, lease_id: object, publish_timeout_ns: int = 0, clock_skew_ns: int = 0
+    ) -> bool:
         """The fencing predicate over the model, ignoring any statement."""
         if self.on_fence is not None:
             self.on_fence(lease_id)
-        head = self.head()
-        if not head:
+        claimants = self.claimants()
+        if not claimants:
             return False
-        # The statement resolves the head with ORDER BY term DESC, lease_id
-        # DESC, and ClickHouse orders UUIDs by their low half first.
-        _, resolved, _, _, expires_at_ns = max(
-            head, key=lambda row: uuid_order(row[1])
-        )
+        _, resolved, _, expires_at_ns = claimants[0]
         return (
             resolved == lease_id
-            and expires_at_ns > self.now_ns + publish_timeout_ns
+            and expires_at_ns > self.now_ns + publish_timeout_ns + clock_skew_ns
         )
 
     def fence_admits(self, statement: str, params) -> bool:
@@ -191,8 +224,10 @@ class FakeLeaseTable:
                 "statement would land rows for a publisher the fence refuses.\n"
                 f"statement: {statement}"
             )
+        # Both margins are REQUIRED parameters: a writer that stopped passing
+        # the skew bound would otherwise be modelled as a zero-skew deployment.
         return self.fence_passes(
-            params["lease_id"], params["publish_timeout_ns"]
+            params["lease_id"], params["publish_timeout_ns"], params["clock_skew_ns"]
         )
 
     # -- the client interface -----------------------------------------------
@@ -209,36 +244,30 @@ class FakeLeaseTable:
         if statement.startswith("INSERT INTO"):
             if "publisher_lease" not in statement.split(maxsplit=3)[2]:
                 return None
-            if "SELECT term + 1" in statement:
-                # The fenced release. Resolve the head exactly as the
-                # statement does (term DESC, lease_id DESC in ClickHouse's
-                # UUID order) and write the already-expired tombstone only
-                # when the head is this writer's row -- atomically, because
-                # the statement is one server-side unit. Matched off the SQL,
-                # like the publish fence, so deleting the fence from the
-                # source cannot pass quietly.
+            if "ttl_ns" not in params:
+                # The release tombstone: an already-expired row at the
+                # releasing writer's OWN term. It resolves nothing, so there is
+                # no head for it to be stale about -- a row at this writer's
+                # term cannot be a successor's term. Matched off the SQL, like
+                # the claim, so a release that grew a head read back could not
+                # pass quietly.
                 if _RELEASE.fullmatch(statement) is None:
-                    raise MissingLeaseFence(
-                        "a release tombstone must resolve the head and write "
-                        "it in one fenced statement; this one does not match "
-                        "the writer's fenced release.\n"
+                    raise UnexpectedLeaseStatement(
+                        "a release tombstone must be an expired row at the "
+                        "writer's own term, computed server-side and reading "
+                        "nothing; this statement does not match the writer's "
+                        "release.\n"
                         f"statement: {statement}"
                     )
-                head = self.head()
-                if head:
-                    top_term, resolved, *_ = max(
-                        head, key=lambda row: uuid_order(row[1])
+                self.rows.append(
+                    (
+                        int(params["term"]),
+                        str(params["lease_id"]),
+                        str(params["holder"]),
+                        self.now_ns,
+                        self.now_ns,
                     )
-                    if resolved == str(params["lease_id"]):
-                        self.rows.append(
-                            (
-                                top_term + 1,
-                                str(params["lease_id"]),
-                                str(params["holder"]),
-                                self.now_ns,
-                                self.now_ns,
-                            )
-                        )
+                )
                 return []
             # The claim INSERT. Its timestamps are modelled off the fake's
             # clock, which is only honest while the real statement computes
@@ -272,25 +301,12 @@ class FakeLeaseTable:
             # table before deleting them. Answering it here would hand a
             # caller lease columns for a question about a count.
             return None
-        if "max(expires_at_ns)" in query:
-            term = int(params["term"])
-            expires = [row[4] for row in self.rows if row[0] == term]
-            return [(max(expires, default=None), self.now_ns)]
-        if "ORDER BY term DESC" in query:
-            # The head, in the order the fence resolves it, cut to the LIMIT
-            # the statement actually asked for. Hardcoding two rows here made
-            # the head read's own LIMIT untestable: narrowed to one, a
-            # contested term reads as a lease held by its higher claimant and
-            # nothing noticed.
-            limit = int(_LIMIT.search(query).group(1))
-            ordered = sorted(
-                self.rows,
-                key=lambda row: (row[0], uuid_order(row[1])),
-                reverse=True,
-            )
+        if "GROUP BY term, lease_id" in query:
+            # The head read: every lease at the top term with its effective
+            # expiry, in the order the fence resolves them.
             return [
                 (term, lease_id, holder, expires_at_ns, self.now_ns)
-                for term, lease_id, holder, _, expires_at_ns in ordered[:limit]
+                for term, lease_id, holder, expires_at_ns in self.claimants()
             ]
         term = int(params["term"])
         if self.on_claim_read is not None:

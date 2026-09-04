@@ -644,7 +644,7 @@ def test_the_deciding_reads_carry_sequential_consistency():
     assert _settings("max(version)", "SELECT") == [_DECIDING_READ]
     assert _settings("max(index_version)", "SELECT") == [_DECIDING_READ]
     assert _settings("toString(publish_id)", "SELECT") == [_DECIDING_READ]
-    assert _settings("ORDER BY term DESC", "SELECT") == [_DECIDING_READ] * 3
+    assert _settings("GROUP BY term, lease_id", "SELECT") == [_DECIDING_READ] * 3
     assert _settings("acquired_at_ns, expires_at_ns", "SELECT") == [_DECIDING_READ] * 3
     assert _settings("dmi_snapshot_manifest", "SELECT") == [_DECIDING_READ]
     # The two fenced writes carry the same consistency AND the statement cap
@@ -662,35 +662,41 @@ def test_the_deciding_reads_carry_sequential_consistency():
     assert _settings("publisher_lease` (term", "INSERT") == [None] * 3
 
 
-def test_the_fenced_release_resolves_the_head_with_sequential_consistency():
-    """The tombstone's in-statement head read decides who gets revoked.
+def test_the_release_tombstone_is_written_at_the_writers_own_term_and_reads_nothing():
+    """A release cannot race a successor for a term it never reads.
 
-    The release resolves the lease head inside the INSERT ... SELECT and
-    fences on it. Answered from a replica that has not fetched a successor's
-    takeover row, that subquery resolves this writer's lapsed lease as the
-    head, passes the ``lease_id`` fence, and tombstones the successor's live
-    term -- so the read carries the same consistency every other deciding
-    read does.
+    The earlier release resolved the head inside an ``INSERT ... SELECT`` and
+    fenced on it, which was not a compare-and-set against a concurrent claim:
+    a stale release could land its expired row at a successor's freshly
+    granted term. The tombstone now goes to the term THIS writer was granted,
+    server-stamped and already expired, with no head read to be stale about.
     """
-    from dmi.storage.capture.clickhouse_sql import DECIDING_READ as _DECIDING_READ
-
     client = _Client()
     writer = _leased(client)
+    granted = writer.publisher_lease.term
 
     writer.release_publisher_lease()
 
     release = next(
         call for call in client.calls
-        if call[0].startswith("INSERT") and "SELECT term + 1" in call[0]
+        if call[0].startswith("INSERT") and "now_ns, now_ns FROM" in call[0]
     )
-    assert release[2].get("settings") == _DECIDING_READ
+    statement, params, kwargs = release
+    assert params["term"] == granted
+    assert "publisher_lease" not in statement.split("FROM", 1)[1], (
+        "the release must not read the lease table"
+    )
+    assert "%(ttl_ns)s" not in statement, "a tombstone buys no lease life"
+    # Nothing to read, so nothing to read consistently: the only settings a
+    # release carries are the deployment's write quorum, none by default.
+    assert kwargs.get("settings") is None
 
 
 def test_descriptor_writes_use_the_configured_quorum():
     _, descriptor = _descriptor()
     client = _Client()
     writer = ClickHouseCatalogWriter(
-        client, ClickHouseCatalogConfig(insert_quorum=2)
+        client, ClickHouseCatalogConfig(insert_quorum=2, clock_skew_ns=1)
     )
 
     writer.write_descriptors([descriptor], index_version=42)
@@ -707,10 +713,11 @@ def test_descriptor_writes_use_the_configured_quorum():
     assert descriptor_insert[2].get("settings") == quorum
 
 
-def test_fenced_release_uses_the_configured_quorum():
+def test_the_release_tombstone_uses_the_configured_quorum():
+    """A deciding WRITE: the successor's head read is what the row is for."""
     client = _Client()
     writer = ClickHouseCatalogWriter(
-        client, ClickHouseCatalogConfig(insert_quorum=2)
+        client, ClickHouseCatalogConfig(insert_quorum=2, clock_skew_ns=1)
     )
     writer.acquire_publisher_lease("indexer-a")
 
@@ -718,14 +725,19 @@ def test_fenced_release_uses_the_configured_quorum():
 
     release = next(
         call for call in client.calls
-        if call[0].startswith("INSERT") and "SELECT term + 1" in call[0]
+        if call[0].startswith("INSERT") and "now_ns, now_ns FROM" in call[0]
     )
     assert release[2].get("settings") == {
-        "select_sequential_consistency": 1,
         "insert_quorum": 2,
         "insert_quorum_parallel": 0,
         "insert_quorum_timeout": 5000,
     }
+
+
+def test_a_replicated_deployment_must_declare_its_clock_skew_bound():
+    """`insert_quorum` says "several hosts"; a zero skew bound says "one clock"."""
+    with pytest.raises(ValueError, match="clock_skew_ns must be set alongside"):
+        ClickHouseCatalogConfig(insert_quorum=2)
 
 
 def test_commit_packs_writes_only_the_replay_inventory():

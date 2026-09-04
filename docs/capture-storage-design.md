@@ -455,11 +455,13 @@ statements a publish writes -- the manifest rows and the watermark row -- carry
 the same predicate:
 
 ```sql
-  AND (SELECT count() FROM (SELECT lease_id, expires_at_ns
+  AND (SELECT count() FROM (SELECT lease_id, min(expires_at_ns) AS expires_at_ns
                             FROM {prefix}_publisher_lease
-                            ORDER BY term DESC, lease_id DESC LIMIT 1)
+                            WHERE term = (SELECT max(term) FROM {prefix}_publisher_lease)
+                            GROUP BY lease_id ORDER BY lease_id DESC LIMIT 1)
        WHERE lease_id = :my_lease
-         AND expires_at_ns > toUnixTimestamp64Nano(now64(9))) = 1
+         AND expires_at_ns > toUnixTimestamp64Nano(now64(9))
+                             + :publish_timeout_ns + :clock_skew_ns) = 1
 ```
 
 so a publisher whose lease has been taken over makes **no snapshot visible**.
@@ -513,7 +515,22 @@ quarantine.
 Clocks: `term` orders the table, so a wall-clock tie can never make the head
 ambiguous. Expiry is decided by the server's clock on both sides -- the row is
 stamped server-side and the fence compares against `now64(9)` -- so no
-publisher's own clock, and no skew between two of them, participates.
+publisher's own clock, and no skew between two of them, participates. What
+does participate, on a replicated deployment, is the skew between two
+**ClickHouse hosts**: `expires_at_ns` is stamped by `now64()` on the host that
+handled the claim and compared with `now64()` on whichever host handles the
+publish. `ClickHouseCatalogConfig.clock_skew_ns` is the operator's measured
+bound on that, and the fence requires `publish_timeout_ns + clock_skew_ns` of
+lease life remaining rather than the publish cap alone. With the cap alone the
+overlap condition was `clock_B - clock_A > lease_ttl_ns - publish_timeout_ns`;
+with the bound it is `clock_B - clock_A > clock_skew_ns`, i.e. a real skew
+above what the operator declared. A single host has one clock and the default
+of 0 is exact there; declaring `insert_quorum` without a bound is refused at
+construction, because a quorum says "several hosts".
+
+A lease's expiry is the **minimum** `expires_at_ns` written under its `(term,
+lease_id)`, which is what lets a release end a lease without a term of its own
+(below).
 
 Lifecycle:
 
@@ -536,15 +553,23 @@ Lifecycle:
   publish statements can leave inert manifest rows behind.
 - **Release.** `release_publisher_lease()` writes an already-expired tombstone
   so an orderly restart does not cost the next publisher a whole TTL. A crash
-  does; that is what expiry is for. It is **fenced on the head being this
-  writer's own lease, inside the statement that writes**: the tombstone lands
-  at `head.term + 1` and so becomes the head whatever was there before, which
-  unfenced let a writer whose lease had long since lapsed revoke the current
-  holder's live one just by shutting down cleanly -- and fenced by a client
-  read followed by a separate INSERT, the same revocation fit in the window
-  between the two, contesting a successor's freshly granted term. The head is
-  resolved and the tombstone written in one server-side statement, exactly as
-  the publish fence is.
+  does; that is what expiry is for. The tombstone is a row at the **releasing
+  writer's own term** -- the term it was granted -- stamped by the server with
+  `expires_at_ns = now`, and it reads nothing. Because a lease's expiry is the
+  minimum written under its key, that row ends the lease wherever it stands;
+  because a writer's own term is below every term granted after it, the row
+  can never share or supersede a successor's term. Two earlier forms were
+  wrong in ways worth recording. Unfenced, at `head.term + 1`, a writer whose
+  lease had long since lapsed revoked the current holder's live lease just by
+  shutting down cleanly. Fenced inside an `INSERT ... SELECT` over the head, it
+  looked like a compare-and-set and was not one: the WHERE was evaluated
+  against the head as of its own SELECT, so a stale release could read expired
+  lease A at term T while claimant B inserted T + 1 and passed its singleton
+  read-back, and then land its expired row at that same T + 1 -- a contested
+  head until B's TTL, with B fenced out at once whenever A's UUID sorted
+  higher. Reproduced on 25.12 with a `sleep(1)` in the release. ClickHouse has
+  no way to serialise the two statements, so the repair is a representation
+  with no head read left to race.
 
 **One publisher holds the lease, but two client objects can believe they do.**
 The sole-claimant read-back proves a claimant is alone at ITS term, not that its

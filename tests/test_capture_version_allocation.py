@@ -417,28 +417,72 @@ def test_a_holder_re_acquiring_its_own_live_lease_refreshes_it():
 def test_a_release_by_a_writer_that_no_longer_holds_the_lease_revokes_nothing():
     """A stale writer's orderly shutdown must not evict the current holder.
 
-    The tombstone lands at `head.term + 1`, so it becomes the head whatever was
-    there before. Written blind, a writer whose lease lapsed long ago takes the
-    catalog away from whoever holds it now simply by shutting down cleanly: the
-    successor is not told, its next publish is fenced out, and any third
-    publisher can take the lease off it at once.
+    The tombstone lands at the releasing writer's OWN term -- the one it was
+    granted -- never at ``head.term + 1``. A writer whose lease lapsed long ago
+    therefore writes an inert row below the head when it shuts down cleanly,
+    and the successor standing at the head is untouched.
     """
     server = _CatalogServer()
     stale = _publisher(server, "stale")
+    stale_term = stale.publisher_lease.term
 
     _expire_the_lease(server)
     healthy = _publisher(server, "healthy")
-    rows_before = len(server.lease.rows)
+    head_before = server.lease.head()
 
     stale.release_publisher_lease()
 
     assert stale.publisher_lease is None, "the stale writer still gives up its own"
-    assert len(server.lease.rows) == rows_before, "a non-holder wrote a tombstone"
+    assert server.lease.head() == head_before, "a non-holder moved the head"
+    tombstones = [row for row in server.lease.rows if row[4] == row[3]]
+    assert [row[0] for row in tombstones] == [stale_term], (
+        "the tombstone belongs at the stale writer's own term and nowhere else"
+    )
     # The healthy holder is untouched: its lease still fences, and a third
     # publisher is still refused.
     assert server.lease.fence_passes(healthy.publisher_lease.lease_id)
     with pytest.raises(PublisherLeaseHeldError, match="'healthy'"):
         _publisher(server, "third")
+
+
+def test_a_stale_release_landing_after_a_takeover_leaves_the_successor_at_the_head():
+    """The race the fenced INSERT ... SELECT release could not close.
+
+    A release that resolved the head inside its own statement was a
+    compare-and-set against the head AS OF ITS SELECT, not against a concurrent
+    insert: a stale release could read expired lease A at term T, claimant B
+    could insert T + 1 and pass its singleton read-back, and A's already-running
+    release could then land its expired row at that same T + 1 -- a contested
+    head until B's TTL, and B fenced out at once when A's UUID sorted higher
+    (reproduced on 25.12 with a `sleep(1)` in the release).
+
+    The repair is a representation, not a serialisation: the tombstone is
+    written at the releasing writer's own term, which can never be a
+    successor's term, so there is no head read left to race. Modelled here as
+    the same ordering -- takeover first, release second -- which is all the
+    fake can express, and exactly the ordering that used to break.
+    """
+    server = _CatalogServer()
+    stale = _publisher(server, "stale")
+    stale_term = stale.publisher_lease.term
+    _expire_the_lease(server)
+    successor = _publisher(server, "successor")
+    successor_lease = successor.publisher_lease
+
+    stale.release_publisher_lease()
+
+    head = server.lease.head()
+    assert {row[0] for row in head} == {successor_lease.term}
+    assert {row[1] for row in head} == {successor_lease.lease_id}, (
+        "the stale release must not share the successor's term"
+    )
+    assert server.lease.fence_passes(
+        successor_lease.lease_id, ClickHouseCatalogConfig().publish_timeout_ns
+    ), "the successor is still the head the fence resolves"
+    tombstones = [row for row in server.lease.rows if row[3] == row[4]]
+    assert [row[0] for row in tombstones] == [stale_term]
+    # And the successor's next renewal is not told it has been contested.
+    assert successor.renew_publisher_lease().lease_id == successor_lease.lease_id
 
 
 def test_a_released_lease_is_available_at_once():
@@ -450,7 +494,9 @@ def test_a_released_lease_is_available_at_once():
 
     assert first.publisher_lease is None
     second = _publisher(server, "indexer-b")
-    assert second.publisher_lease.term == 3, "the tombstone is term 2, the retake 3"
+    assert second.publisher_lease.term == 2, (
+        "the tombstone sits at the released term 1, so the retake is term 2"
+    )
     # Idempotent: a second release with nothing held writes nothing more.
     rows = len(server.lease.rows)
     first.release_publisher_lease()
@@ -493,12 +539,106 @@ def test_a_renewal_keeps_the_fencing_identity_and_extends_the_term():
     ), "a renewal has to buy a whole TTL, or the safety margin is not what it says"
 
 
+def test_the_fence_requires_the_clock_skew_bound_beyond_the_publish_timeout():
+    """Host clock skew is part of the safety margin, not outside it.
+
+    ``expires_at_ns`` is stamped by ``now64()`` on the host that handled the
+    claim INSERT, and the fence compares it with a fresh ``now64()`` on the host
+    that handles the publish. On a multi-host replicated deployment those are
+    two clocks: a successor whose host runs ahead can consider the holder
+    expired while the holder's own fence, evaluated a moment earlier on a
+    slower host, still admitted a statement that is now in flight.
+
+    So the fence subtracts a configured skew bound as well as the publish cap:
+    with `clock_skew_ns` remaining on top of `publish_timeout_ns` the statement
+    is admitted, with less than that it is refused, and a fence that ignored
+    the bound would admit a publish exactly inside the band this test sits in.
+    """
+    server = _CatalogServer()
+    timeout, skew = 1_000_000_000, 500_000_000
+    writer = _publisher(
+        server,
+        lease_ttl_ns=3_000_000_000,
+        publish_timeout_ns=timeout,
+        clock_skew_ns=skew,
+    )
+
+    def age_into_the_skew_band(_lease_id) -> None:
+        server.lease.on_fence = None
+        expires_at_ns = max(row[4] for row in server.lease.head())
+        # More than the publish cap remains, but less than cap + skew bound.
+        server.lease.now_ns = expires_at_ns - timeout - skew // 2
+
+    server.lease.on_fence = age_into_the_skew_band
+
+    with pytest.raises(SnapshotPublishRaceError):
+        writer.publish_snapshot(
+            index_version=1, refs=(), published_at_ns=1, indexed_rows=0,
+            indexed_packs=0,
+        )
+
+    assert server.watermarks == []
+
+
+def test_the_fence_admits_a_publish_with_the_whole_margin_remaining():
+    """The complement: cap plus skew bound remaining is enough."""
+    server = _CatalogServer()
+    timeout, skew = 1_000_000_000, 500_000_000
+    writer = _publisher(
+        server,
+        lease_ttl_ns=3_000_000_000,
+        publish_timeout_ns=timeout,
+        clock_skew_ns=skew,
+    )
+
+    def age_to_the_edge(_lease_id) -> None:
+        server.lease.on_fence = None
+        expires_at_ns = max(row[4] for row in server.lease.head())
+        server.lease.now_ns = expires_at_ns - timeout - skew - 1
+
+    server.lease.on_fence = age_to_the_edge
+
+    writer.publish_snapshot(
+        index_version=1, refs=(), published_at_ns=1, indexed_rows=0,
+        indexed_packs=0,
+    )
+
+    assert server.watermarks == [1]
+
+
+def test_the_skew_bound_rides_in_the_fenced_statements_as_a_parameter():
+    """The bound is the server's to apply, inside the statement it gates."""
+    server = _CatalogServer()
+    writer = _publisher(server, clock_skew_ns=250_000_000)
+    seen = []
+    execute = server.execute
+
+    def record(query, params=None, **kwargs):
+        if query.lstrip().startswith("INSERT") and "index_watermark" in query:
+            seen.append(params)
+        return execute(query, params, **kwargs)
+
+    server.execute = record
+    writer.publish_snapshot(
+        index_version=1, refs=(), published_at_ns=1, indexed_rows=0,
+        indexed_packs=0,
+    )
+
+    assert seen and seen[0]["clock_skew_ns"] == 250_000_000
+    assert "%(clock_skew_ns)s" in writer._leases.fence()
+
+
 @pytest.mark.parametrize(
     "config, message",
     [
         ({"lease_ttl_ns": 0}, "lease_ttl_ns"),
         ({"publish_timeout_ns": -1}, "publish_timeout_ns"),
         ({"publish_timeout_ns": 30_000_000_000}, "must be below lease_ttl_ns"),
+        ({"clock_skew_ns": -1}, "clock_skew_ns"),
+        ({"clock_skew_ns": 1.5}, "clock_skew_ns"),
+        # The margin is what remains of the TTL after the publish cap AND the
+        # skew bound are both subtracted, so together they have to leave some.
+        ({"clock_skew_ns": 25_000_000_000}, "must be below lease_ttl_ns"),
     ],
 )
 def test_the_lease_settings_are_validated(config, message):

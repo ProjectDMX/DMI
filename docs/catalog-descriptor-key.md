@@ -300,7 +300,7 @@ has expired may a publisher claim a higher term.
 **Where that safety comes from is the read-back, not the fence.** Both this
 document and `capture-storage-design.md` used to say that a contested head term
 "satisfies neither" of the fence's two conditions. It does not: the fence
-resolves ONE row with `ORDER BY term DESC, lease_id DESC`, so the
+resolves ONE lease at the head term with `ORDER BY lease_id DESC`, so the
 higher-ordering of two claimants at the top term satisfies it exactly as a real
 holder would. Verified on 25.12, and note that the ordering is ClickHouse's UUID
 collation -- the low 64 bits first -- so it is not the text order either. What
@@ -313,7 +313,18 @@ read-back before the competing row arrived.
 and then "the head of the table" would be ambiguous. `acquired_at_ns` and
 `expires_at_ns` are stamped by the **server**, and the fence compares them
 against the **server's** clock, so no publisher's own clock, and no skew between
-two of them, decides whether a lease is live.
+two of them, decides whether a lease is live. On a replicated deployment "the
+server" is several hosts, and the two `now64()` calls -- the one that stamped
+the expiry and the one the fence runs -- can be on different ones. That skew
+is bounded by `ClickHouseCatalogConfig.clock_skew_ns`, which the fence adds to
+its margin (below); it is 0 for a single host and required alongside
+`insert_quorum`.
+
+A lease's expiry at a term is the **minimum** `expires_at_ns` written under
+its `(term, lease_id)`. One row per claim gives the TTL; a second, already
+expired row at the same key is how a release ends the lease at its own term
+rather than claiming a fresh one -- see *Replication* under *What this does not
+close* for why that shape and not a fenced head write.
 
 The point of the whole thing is one sentence:
 
@@ -338,12 +349,27 @@ that will never exist -- so the safety claim holds exactly as stated. See
 INSERT INTO {prefix}_index_watermark (...)
 SELECT ... FROM system.one
 WHERE (SELECT max(index_version) FROM {prefix}_index_watermark) < V
-  AND (SELECT count() FROM (SELECT lease_id, expires_at_ns
+  AND (SELECT count() FROM (SELECT lease_id, min(expires_at_ns) AS expires_at_ns
                             FROM {prefix}_publisher_lease
-                            ORDER BY term DESC, lease_id DESC LIMIT 1)
+                            WHERE term = (SELECT max(term) FROM {prefix}_publisher_lease)
+                            GROUP BY lease_id ORDER BY lease_id DESC LIMIT 1)
        WHERE lease_id = :my_lease
-         AND expires_at_ns > toUnixTimestamp64Nano(now64(9))) = 1
+         AND expires_at_ns > toUnixTimestamp64Nano(now64(9))
+                             + :publish_timeout_ns + :clock_skew_ns) = 1
 ```
+
+The margin is the publish cap **plus the host clock skew bound**. Let the
+holder's host run ahead of true time by `a` and a successor's by `b`, with
+`|b - a| <= S = clock_skew_ns`. The holder's statement is admitted only while
+more than `timeout + S` remains on its host's clock and is capped at `timeout`
+on that same clock, so it finishes before true time `e - S - a`; the successor
+may claim once its clock passes `e`, i.e. after true time `e - b`. The gap is
+`S - (b - a) >= 0`, so the two cannot overlap unless the real skew exceeds the
+declared bound. With the cap alone, the overlap condition was `clock_B -
+clock_A > lease_ttl_ns - publish_timeout_ns`, which a 2 s TTL, 1 s cap and a
+host 1.1 s ahead already met. The single-server verifier cannot exercise this
+-- both replicas share one clock there -- so the bound is an operator
+measurement, not something this module can check.
 
 **One subquery reading one row, not two returning a column each.** The two-read
 form was implemented first and is unsound, which is worth stating because the
@@ -501,7 +527,19 @@ not pay that; a crash does.
 **Replication.** All of this rests on a later write observing an earlier one.
 The read-backs carry `select_sequential_consistency`, which is the read half.
 `ClickHouseCatalogConfig.insert_quorum` supplies the opt-in write half for lease
-and descriptor rows, including the fenced release tombstone.
+and descriptor rows, including the release tombstone. That tombstone is an
+expired row at the releasing writer's **own** term, and it reads nothing. It
+used to be a fenced `INSERT ... SELECT term + 1 ... WHERE lease_id = :me` over
+the head, which looked like a compare-and-set and was not one: its WHERE was
+evaluated against the head as of its own SELECT, not against a concurrent
+insert, so a stale release could read expired lease A at term T while claimant
+B inserted T + 1 and passed its singleton read-back, and then land its expired
+row at that same T + 1 -- a contested head until B's TTL, with B fenced out at
+once whenever A's UUID sorted higher (reproduced on 25.12 with a `sleep(1)` in
+the release). Omitting eager release would have closed it at the cost of a
+whole `lease_ttl_ns` on every orderly handover; a row at the writer's own term
+cannot share or supersede any term granted after it, so there is no head read
+left to race and the handover stays immediate.
 
 Two consequences to carry forward:
 
