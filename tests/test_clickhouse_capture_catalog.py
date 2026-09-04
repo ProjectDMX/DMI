@@ -98,6 +98,7 @@ class _Client:
         data_rows=0,
         sort_key=_CURRENT_SORT_KEY,
         engines=None,
+        engine_full=None,
         publish_id_tables=("dmi_index_watermark", "dmi_snapshot_manifest"),
     ):
         self.calls = []
@@ -117,6 +118,7 @@ class _Client:
         self.inventory_without_membership = inventory_without_membership
         self.data_rows = data_rows
         self.sort_key = sort_key
+        self.engine_full = engine_full or {}
         self.engines = dict(engines or {})
         self.publish_id_tables = tuple(publish_id_tables)
 
@@ -126,6 +128,20 @@ class _Client:
         if name in _VIEWS:
             return "View"
         return "ReplacingMergeTree" if name.endswith("_raw") else "MergeTree"
+
+    def _engine_full(self, name: str) -> str:
+        """What `system.tables.engine_full` reports: engine AND its arguments.
+
+        `engine` alone cannot distinguish `ReplacingMergeTree(index_version)`
+        from `ReplacingMergeTree()`, and only the first collapses duplicate
+        descriptor rows by version.
+        """
+        if name in self.engine_full:
+            return self.engine_full[name]
+        engine = self._engine(name)
+        if engine == "ReplacingMergeTree":
+            return "ReplacingMergeTree(index_version)"
+        return engine
 
     def execute(self, query, params=None, **kwargs):
         self.calls.append((query, params, kwargs))
@@ -151,8 +167,9 @@ class _Client:
         if "system.tables" in query:
             # Only the descriptor table's sort key is ever read, so the others
             # answer with a placeholder rather than a fiction that looks
-            # meaningful.
-            return [
+            # meaningful. `engine_full` is appended only when the statement
+            # asks for it, so this fake answers the read either shape.
+            rows = [
                 (
                     name,
                     self._engine(name),
@@ -160,6 +177,9 @@ class _Client:
                 )
                 for name in self.tables
             ]
+            if "engine_full" in query:
+                return [row + (self._engine_full(row[0]),) for row in rows]
+            return rows
         if "dmi_schema_version` ORDER BY version DESC" in query:
             return [] if self.schema_version is None else [(self.schema_version,)]
         if "dmi_pack_inventory_raw` FINAL" in query and "NOT IN" in query:
@@ -1091,6 +1111,40 @@ def test_a_stamped_catalog_with_the_wrong_descriptor_sort_key_is_refused():
         if item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
     ]
 
+
+def test_a_stamped_catalog_whose_descriptor_engine_drops_the_version_is_refused():
+    """A correct sort key on the wrong engine collapses rows just the same.
+
+    The compatibility read captured `engine` and `sorting_key` only, and
+    `engine` is `ReplacingMergeTree` for both `ReplacingMergeTree(index_version)`
+    and a bare `ReplacingMergeTree()`. Only the first keeps the row with the
+    highest `index_version` when a merge collapses a duplicate key; the second
+    keeps an arbitrary one. So a stamped catalog whose descriptor table had lost
+    the version argument passed every check this branch added -- the sort key
+    was right, which is all anything looked at -- and then resolved a capture to
+    whichever pack a merge happened to keep.
+    """
+    client = _Client(
+        tables=_CURRENT_OBJECTS,
+        schema_version=_SCHEMA_VERSION,
+        data_rows=1,
+        engine_full={"dmi_capture_raw": "ReplacingMergeTree()"},
+    )
+
+    with pytest.raises(CatalogSchemaVersionError) as raised:
+        _writer(client).ensure_schema()
+
+    message = str(raised.value)
+    # Both sides named, as every other refusal here names them.
+    assert "ReplacingMergeTree()" in message
+    assert "ReplacingMergeTree(index_version)" in message
+    assert "dmi_capture_raw" in message
+    assert "CatalogReconciler.rebuild()" in message
+    assert not [
+        item
+        for item, *_ in client.calls
+        if item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
+    ]
 
 def test_an_unstamped_catalog_is_not_told_its_sort_key_is_wrong_when_it_is_not():
     """Defect A: the refusal that named two facts neither of which was true.

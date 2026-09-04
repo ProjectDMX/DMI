@@ -7,6 +7,7 @@ outside a boundary the tests already exercised.
 
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 from urllib.parse import quote
 from uuid import UUID
@@ -475,6 +476,91 @@ def test_a_tenant_too_long_for_a_key_segment_still_binds(tmp_path: Path):
     )
     with pytest.raises(PackIntegrityError, match="not the tenant that key"):
         PackIndex.from_store(other, forged).descriptors()
+
+
+def test_the_two_key_component_forms_cannot_collide(tmp_path: Path):
+    """The direct and digest forms shared a namespace, so two ids named one key.
+
+    `key_component` passed an identifier through directly when it was short
+    enough and digested it as `sha256-<hex>` when it was not. Nothing stopped a
+    SHORT identifier from already reading as `sha256-<hex>` -- 71 bytes, well
+    inside the metadata limit -- and encoding directly to exactly the segment
+    some long identifier digests to. Both then named the same `tenant=`
+    segment, and `_reject_a_foreign_tenant` compares re-encoded values, so it
+    could not tell them apart: a pack for one was accepted under the other's
+    key, which is the forgery that check exists to refuse.
+
+    The prefix is now reserved -- anything that already looks like a digest is
+    digested -- so the forms are disjoint. Only identifiers literally beginning
+    with `sha256-` encode differently than before; the v1 layout is untouched
+    for everything else, which the last assertion pins.
+    """
+    from dmi.storage.capture.pack import key_component
+
+    long_id = "t" * 300
+    literal_id = "sha256-" + sha256(long_id.encode()).hexdigest()
+    assert len(literal_id) == 71
+
+    assert key_component(long_id) != key_component(literal_id)
+    # Both still land in the digest namespace, so neither is mistaken for a
+    # literal segment either.
+    assert key_component(long_id).startswith("sha256-")
+    assert key_component(literal_id).startswith("sha256-")
+    # And an ordinary identifier is encoded exactly as before.
+    assert key_component("tenant-a") == "tenant-a"
+
+
+def test_a_pack_under_a_colliding_digest_segment_is_refused(tmp_path: Path):
+    """The end of the same attack: the pack itself, not just the encoding."""
+    from dmi.storage.capture.pack import key_component
+
+    long_id = "t" * 300
+    literal_id = "sha256-" + sha256(long_id.encode()).hexdigest()
+    store, ref = _pack_at(
+        tmp_path,
+        f"v1/tenant={key_component(long_id)}/date=2026-09-01/session=s/rank=0/"
+        f"{PACK_ID}.dmi-pack",
+        tenant_id=literal_id,
+    )
+
+    with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+        PackIndex.from_store(store, ref).descriptors()
+
+
+def test_consistent_snapshot_reads_requires_a_real_boolean():
+    """`'false'` is truthy, so a truthiness test would turn the setting ON.
+
+    The flag decides whether a bounded read carries sequential consistency.
+    Read out of a config file or an environment variable it arrives as a
+    string, and every non-empty string is truthy -- so the value that most
+    plainly means "off" enabled it, visible only as latency on a replicated
+    deployment.
+    """
+    from dmi.storage.capture import ClickHouseReaderConfig
+
+    assert ClickHouseReaderConfig(consistent_snapshot_reads=False)
+    for value in ("false", "0", 0, 1, None):
+        with pytest.raises(ValueError, match="consistent_snapshot_reads"):
+            ClickHouseReaderConfig(consistent_snapshot_reads=value)
+
+
+def test_the_pre_rename_summary_type_is_still_importable():
+    """`CoreTensorSummaryV1` was exported through 1.2.0 and still is.
+
+    The serialized summary schema went from 1 to 2 on this branch, which is a
+    change to the STORED format rather than to the Python type. Dropping the
+    old name broke every existing `from dmi.storage.capture import
+    CoreTensorSummaryV1` while `pyproject.toml` still read 1.2.0 -- an
+    accidental breaking change. The alias makes the decision explicit and
+    pins it, so removing the name later has to be deliberate.
+    """
+    from dmi.storage.capture import CoreTensorSummary, CoreTensorSummaryV1
+    from dmi.storage.capture import summary as summary_module
+
+    assert CoreTensorSummaryV1 is CoreTensorSummary
+    assert "CoreTensorSummaryV1" in summary_module.__dict__
+    # The suffix names history; the schema version is its own constant.
+    assert summary_module.CORE_SUMMARY_VERSION == 2
 
 
 def test_a_key_that_names_no_tenant_is_left_alone(tmp_path: Path):

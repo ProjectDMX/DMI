@@ -59,6 +59,7 @@ from .summary import (
     CORE_SUMMARY_VERSION,
     ArtifactRef,
     CoreTensorSummary,
+    CoreTensorSummaryV1,
     decode_tensor,
     summarize_tensor,
 )
@@ -155,6 +156,7 @@ __all__ = [
     "Cursor",
     "CursorKey",
     "CoreTensorSummary",
+    "CoreTensorSummaryV1",
     "CORE_SUMMARY_VERSION",
     "DuplicateCaptureError",
     "DirectPackSink",

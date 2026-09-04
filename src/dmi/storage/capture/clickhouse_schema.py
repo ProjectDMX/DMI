@@ -98,10 +98,28 @@ def _key_columns(sorting_key: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in sorting_key.split(",") if part.strip())
 
 
+def _engine_arguments(engine_full: str) -> tuple[str, tuple[str, ...]]:
+    """`engine_full` split into its name and arguments, whitespace-insensitive.
+
+    The server renders the clause it stored rather than the text that created
+    it, so comparing strings would refuse a healthy catalog over a space.
+    """
+    head, _, rest = engine_full.strip().partition("(")
+    arguments = rest.rsplit(")", 1)[0] if rest else ""
+    return head.strip(), tuple(
+        part.strip() for part in arguments.split(",") if part.strip()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CatalogObject:
     engine: str
     sorting_key: str
+    # `engine` collapses `ReplacingMergeTree(index_version)` and a bare
+    # `ReplacingMergeTree()` into one string, and only the first keeps the row
+    # with the highest version when a merge collapses a duplicate key. The
+    # arguments are therefore part of the compatibility state, not decoration.
+    engine_full: str = ""
 
     @property
     def kind(self) -> str:
@@ -339,6 +357,7 @@ pack_id UUID
                 + self.rebuild_instruction()
             )
         self._reject_a_wrong_descriptor_sort_key(found, stamp)
+        self._reject_a_wrong_engine(found, stamp)
         if self._inventory_without_membership():
             raise CatalogSchemaVersionError(
                 f"catalog `{self.database}`.`{self.prefix}_*` lists one or more "
@@ -354,16 +373,56 @@ pack_id UUID
     def _catalog_state(self) -> dict[str, CatalogObject]:
         names = [name for _, name in self.objects + self.legacy_objects]
         rows = self._client.execute(
-            "SELECT name, engine, sorting_key FROM system.tables "
+            "SELECT name, engine, sorting_key, engine_full FROM system.tables "
             "WHERE database = %(database)s AND name IN %(names)s",
             {"database": self.database, "names": names},
         )
         wanted = set(names)
         return {
-            text(name): CatalogObject(text(engine), text(sorting_key))
-            for name, engine, sorting_key in rows
+            text(name): CatalogObject(
+                text(engine), text(sorting_key), text(engine_full)
+            )
+            for name, engine, sorting_key, engine_full in rows
             if text(name) in wanted
         }
+
+    def _reject_a_wrong_engine(
+        self, found: dict[str, CatalogObject], stamp: str
+    ) -> None:
+        """The engine's ARGUMENTS, which `engine` alone does not carry.
+
+        Both `ReplacingMergeTree(index_version)` and a bare
+        `ReplacingMergeTree()` report `engine` as `ReplacingMergeTree`, and the
+        compatibility state stopped there -- so a descriptor table that had lost
+        its version argument passed with a correct sort key, which was the only
+        thing examined. It does not behave the same: with the argument a merge
+        collapsing a duplicate key keeps the highest `index_version`, and
+        without it the row it keeps is arbitrary, so a capture resolves to
+        whichever pack a merge happened to leave behind.
+
+        Checked against `engine_full` rather than reconstructed, and only for
+        the tables whose correctness depends on the argument. Like every other
+        incompatibility here, `CREATE TABLE IF NOT EXISTS` cannot repair it.
+        """
+        required = "ReplacingMergeTree(index_version)"
+        wrong = [
+            f"`{name}` is {found[name].engine_full}"
+            for name in (self.capture_raw, self.pack_raw)
+            if name in found
+            and _engine_arguments(found[name].engine_full)
+            != _engine_arguments(required)
+        ]
+        if not wrong:
+            return
+        raise CatalogSchemaVersionError(
+            f"catalog `{self.database}`.`{self.prefix}_*` {stamp} but "
+            + ", ".join(wrong)
+            + f" where this build requires {required}. Without the version "
+            "argument a merge that collapses a duplicate key keeps an "
+            "arbitrary row rather than the newest, so a capture resolves to "
+            "whichever pack the merge left. An engine's arguments cannot be "
+            "altered in place. " + self.rebuild_instruction()
+        )
 
     def _reject_a_wrong_descriptor_sort_key(
         self, found: dict[str, CatalogObject], stamp: str

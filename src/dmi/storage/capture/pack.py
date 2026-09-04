@@ -549,6 +549,9 @@ def _parse_records(decoded: dict[str, object], footer_offset: int) -> tuple[_Ind
     return tuple(records)
 
 
+_DIGEST_PREFIX = "sha256-"
+
+
 def key_component(value: str) -> str:
     """Encode one identifier as a single object-key segment.
 
@@ -565,9 +568,19 @@ def key_component(value: str) -> str:
     comparison below has to be able to recognise that form too.
     """
     encoded = quote(value, safe="-_.=").replace("~", "%7E")
-    if len(encoded.encode()) <= 160:
+    if len(encoded.encode()) <= 160 and not encoded.startswith(_DIGEST_PREFIX):
         return encoded
-    return "sha256-" + sha256(value.encode()).hexdigest()
+    # The digest prefix is RESERVED, so the two output forms cannot collide.
+    # Without this an identifier whose own text is `sha256-<64 hex>` -- short
+    # enough to pass directly, and well under the metadata length limit --
+    # encoded to exactly the segment some longer identifier digests to. Both
+    # then named the same `tenant=` segment, and `_reject_a_foreign_tenant`
+    # compares re-encoded values, so it could not tell the two apart: a pack
+    # for one was accepted under a key belonging to the other. Digesting any
+    # identifier that already looks like a digest keeps the mapping one-to-one.
+    # Only identifiers literally beginning with `sha256-` encode differently
+    # than before, so the v1 key layout is unchanged for every other one.
+    return _DIGEST_PREFIX + sha256(value.encode()).hexdigest()
 
 
 def _tenant_segment(object_key: str) -> str | None:

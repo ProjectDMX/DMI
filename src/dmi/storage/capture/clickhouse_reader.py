@@ -190,6 +190,17 @@ class ClickHouseReaderConfig:
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if type(self.consistent_snapshot_reads) is not bool:
+            # Not a truthiness test: every non-empty string is truthy, so
+            # `'false'` read out of a config file or an environment variable
+            # would silently ENABLE sequential consistency -- the opposite of
+            # what it says, and visible only as latency on a replicated
+            # deployment.
+            raise ValueError(
+                "consistent_snapshot_reads must be a bool, not "
+                f"{type(self.consistent_snapshot_reads).__name__}: a string "
+                "like 'false' is truthy and would turn the setting on"
+            )
 
     @classmethod
     def from_catalog(cls, config: ClickHouseCatalogConfig) -> ClickHouseReaderConfig:

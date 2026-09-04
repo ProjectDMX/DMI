@@ -251,3 +251,16 @@ def summarize_tensor(
         l2_norm=l2_norm,
     )
 
+
+# The name this type was exported under through 1.2.0. Kept as an alias rather
+# than dropped, because the rename rode along with a SERIALIZED schema bump
+# from 1 to 2 and the two are not the same thing: the stored summary format
+# changed, the Python type did not. Removing the name broke
+# `from dmi.storage.capture import CoreTensorSummaryV1` for every existing
+# caller while `pyproject.toml` still said 1.2.0, which is an accidental
+# breaking change rather than a declared one.
+#
+# The `V1` suffix now names history, not the schema version -- read
+# CORE_SUMMARY_VERSION (currently 2) for that. Retire the alias in a release that says it
+# is removing it.
+CoreTensorSummaryV1 = CoreTensorSummary
