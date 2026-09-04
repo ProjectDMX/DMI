@@ -586,6 +586,72 @@ implementation detail. It is a much smaller prize now than it was: the thing it
 would detect went from one percent of concurrent publishes to a window nobody
 has managed to reach.
 
+#### Verification this repository cannot run
+
+Three claims made above rest on measurements that need hardware neither the
+CPU suite nor the `clickhouse-live` CI job has. They are recorded here so that
+nobody reads the green CI as covering them, with the procedure and the result
+that would confirm or refute each. None has been reproduced on real hardware
+by the author of the change.
+
+**1. The clock skew bound holds across two hosts.** The fence requires
+`publish_timeout_ns + clock_skew_ns` of lease life remaining, and the
+derivation above says two hosts whose clocks differ by less than the bound
+cannot overlap a holder's admitted statement with a successor's claim. Every
+server this repository has run against is a single process -- the live suite,
+the CI job, and the Keeper-backed verifier, whose two replicas share one
+clock -- so the bound has been exercised as a fence *parameter* and never as
+a *measured offset*. The CPU tests pin the predicate (a publish inside the
+skew band is refused; one outside it is admitted), which is a statement about
+the SQL, not about hosts.
+
+*To reproduce:* two ClickHouse hosts replicating the catalog tables, with
+`insert_quorum=2` and `clock_skew_ns` set to the measured bound. Step host
+B's clock ahead of host A's by `d`. Publisher A, connected to A, holds a lease
+with TTL `T` and publish cap `p`; run a statement with a long `sleep()` in the
+watermark predicate against A. Publisher B, connected to B, attempts a
+takeover once B's clock passes A's `expires_at_ns`. *Expected:* for
+`d <= clock_skew_ns` the sleeping statement is never admitted while B can
+claim -- A's publish is refused by its own fence or capped by
+`max_execution_time` before B's claim is possible -- and B's publish never
+overlaps it. For `d > clock_skew_ns` the overlap becomes possible, which is
+the documented condition and should be observed, so that the test
+distinguishes "bound enforced" from "race not reached".
+
+**2. The publish protocol and retention work on `ReplicatedMergeTree`.**
+`tests/tools/verify_replicated_quorum.py` is the only exercise of
+`insert_quorum`, of the claim that `select_sequential_consistency` is
+necessary but not sufficient, and now of `collect_garbage()` against
+replicated tables -- the mutation it issues was changed precisely because the
+previous form is refused on replicated tables under the default settings, and
+CI runs a single non-replicated server that accepts both forms. The verifier
+was rewritten so that every branch asserts, but it has not been run since:
+this environment has no Keeper.
+
+*To reproduce:* a Keeper on 9181 and a server on 9010 configured as the
+script's docstring describes, then `python tests/tools/verify_replicated_quorum.py`
+from the repository root. *Expected:* six `PASS` lines and exit status 0. In
+particular the retention step must be *admitted* -- an `ALTER TABLE ... DELETE`
+that ClickHouse refuses would raise a `ServerException` there -- and must
+remove exactly the orphan rows while both published versions keep theirs.
+Any `AssertionError` or non-zero exit is a finding, not noise.
+
+**3. The pinned read's cost relative to `FINAL`.** `docs/benchmarks.md`
+withdrew the snapshot-shape rows because the script that produced them did
+not measure the reader. The script now times the production statement, but
+the reference host (AMD Ryzen Threadripper PRO 5955WX, ClickHouse 25.12) has
+not re-run it, so the document currently makes *no* claim about that ratio.
+
+*To reproduce:* on the reference host,
+`PYTHONPATH=src python -m benchmarks.bench_capture_search --rows 50000 --replays 2 --trials 3`
+three times; report the medians of `snapshot.production_at_head`,
+`snapshot.production_at_historical_pin`, `snapshot.final_view` and
+`snapshot.watermark_read`, and confirm `snapshot.rows` shows one more row for
+`final_view` than for either pinned read (the re-indexed capture, once per
+pack). *Expected:* the two pinned reads cost about the same as each other;
+whatever their ratio to `final_view` turns out to be replaces the withdrawn
+2.1x, and the page-latency rows should reproduce within noise.
+
 ## Where the catalog goes later
 
 The deeper version of this problem is that immutable facts ("capture X is in
