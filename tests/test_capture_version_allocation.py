@@ -100,13 +100,15 @@ class _CatalogServer:
                 if version == params["version"]
             ]
         if "snapshot_manifest" in query and "SELECT count()" in query:
-            wanted = set(params["members"])
+            # The chunk read-back names its members; the whole-publish check
+            # after the watermark lands does not.
+            wanted = set(params["members"]) if "members" in params else None
             found = {
                 (store_id, pack_id)
                 for version, publish_id, store_id, pack_id in self.manifest
                 if version == params["index_version"]
                 and publish_id == params["publish_id"]
-                and (store_id, pack_id) in wanted
+                and (wanted is None or (store_id, pack_id) in wanted)
             }
             return [(len(found),)]
         if "version_claims" in query:
@@ -315,6 +317,55 @@ def test_a_publish_renews_between_fenced_statements(tmp_path: Path):
     )
 
     assert server.watermarks == [1]
+
+
+def test_an_indexer_republishes_a_batch_whose_membership_was_collected(tmp_path: Path):
+    """The late lower commit, end to end: republished, never committed blind.
+
+    A retention pass that runs while a lower publisher's admitted watermark
+    statement is still in flight removes that publisher's manifest rows. The
+    watermark then lands and admits nothing. The publish refuses as a lost
+    race, the indexer allocates a higher version and publishes again, and the
+    inventory records the packs at the version that actually made them
+    visible -- never at the one that did not, which is what would have made
+    every later pass skip them for good.
+    """
+    store, refs = _refs(tmp_path, 2)
+    server = _CatalogServer()
+    execute = server.execute
+    collected: list[int] = []
+
+    def collect_between_the_watermark_and_its_confirmation(query, params=None, **kwargs):
+        result = execute(query, params, **kwargs)
+        if (
+            not collected
+            and query.lstrip().startswith("INSERT")
+            and "index_watermark" in query
+        ):
+            collected.append(int(params["index_version"]))
+            server.manifest = [
+                row for row in server.manifest if row[1] != str(params["publish_id"])
+            ]
+        return result
+
+    server.execute = collect_between_the_watermark_and_its_confirmation
+    indexer = CatalogIndexer(store, _publisher(server), clock_ns=lambda: 7)
+
+    result = indexer.index(refs)
+
+    assert result.indexed_packs == len(refs)
+    dead, = collected
+    assert server.watermarks == [dead, dead + 1] or server.watermarks[-1] > dead
+    committed = [
+        query for query in server.inserts if "pack_inventory_raw" in query
+    ]
+    assert len(committed) == 1, "committed exactly once, at the version that stuck"
+    live = server.watermarks[-1]
+    assert {row[0] for row in server.manifest} == {live}, (
+        "membership exists only at the version whose watermark admits it"
+    )
+    # The dead version's watermark row stands and pairs with nothing.
+    assert not [row for row in server.manifest if row[0] == dead]
 
 
 def test_a_contested_lease_term_is_quarantined_until_claims_expire():

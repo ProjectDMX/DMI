@@ -58,6 +58,16 @@ def inline_tuple_bytes(item: tuple[str, str]) -> int:
     return sum(inline_text_bytes(value) for value in item) + 4
 
 
+def inline_version_identity_bytes(item: tuple[int, str]) -> int:
+    """Rendered size of a ``(index_version, publish_id)`` pair.
+
+    The version renders as decimal digits and the identity as a quoted string
+    with room for escaping, plus the tuple's own punctuation."""
+    if len(item) != 2 or type(item[0]) is not int:
+        raise ValueError("publish identities must be (version, publish_id) pairs")
+    return len(str(item[0])) + inline_text_bytes(item[1]) + 4
+
+
 def inline_chunks(
     items: Iterable[T], *, item_bytes: Callable[[T], int]
 ) -> Iterator[list[T]]:

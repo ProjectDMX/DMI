@@ -27,6 +27,7 @@ from .clickhouse_sql import (
     identifier,
     inline_chunks,
     inline_tuple_bytes,
+    inline_version_identity_bytes,
     quoted,
     text,
 )
@@ -34,6 +35,10 @@ from .model import CaptureDescriptor, PackRef
 
 def _inline_chunks(items: list[PackIdentity]):
     return inline_chunks(items, item_bytes=inline_tuple_bytes)
+
+
+def _inline_publish_chunks(items: list[tuple[int, str]]):
+    return inline_chunks(items, item_bytes=inline_version_identity_bytes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,6 +446,38 @@ class ClickHouseCatalogWriter:
                 f"`{self._config.database}`.`{self._config.table_prefix}_*` -- "
                 "a second indexer sharing the prefix, or a hand-written INSERT."
             )
+        if refs and not self._manifest_is_whole(
+            index_version=index_version,
+            publish_id=publish_id,
+            expected=len({(ref.store_id, ref.pack_id) for ref in refs}),
+        ):
+            # The watermark row stands, and admits nothing. The barrier and
+            # the fence are evaluated when the statement is ADMITTED, and the
+            # row lands later; a statement that stalled in between can land
+            # BELOW a head a faster publisher established meanwhile. That is
+            # the one ordering in which collect_garbage() -- which deletes
+            # manifest rows below the head with no watermark row -- can have
+            # removed this publish's membership before its watermark existed
+            # to protect it. Confirmed only now, because until the watermark
+            # row stood the manifest was collectable, and once it stands the
+            # pair is what the retention bound keeps.
+            #
+            # Reported as a lost race because the recovery is the same: a
+            # higher version, republished. It must NOT be committed: the packs
+            # are not visible at this version, and an inventory row would make
+            # every later pass skip them for good -- the exact
+            # inventory-without-membership state ensure_schema refuses. The
+            # standing watermark row is harmless: membership requires the
+            # pair, and no manifest row carries this publish_id.
+            raise SnapshotPublishRaceError(
+                f"catalog version {index_version} published its watermark but "
+                f"its membership (publish {publish_id}) had been collected "
+                "before the watermark row landed: a retention pass ran while "
+                "this statement was in flight below a newer head. The "
+                "watermark row stands and admits nothing, so no snapshot "
+                "contains these packs. Do not commit them; allocate a higher "
+                "version and publish again."
+            )
 
     # -- the publisher lease ------------------------------------------------
 
@@ -479,6 +516,24 @@ class ClickHouseCatalogWriter:
         )
         return rows[0][0] == len(set(members))
 
+    def _manifest_is_whole(
+        self, *, index_version: int, publish_id: str, expected: int
+    ) -> bool:
+        """Does the publish still hold membership for every pack it admitted?
+
+        Unlike `_manifest_chunk_published` this names no members, so it is one
+        bounded statement however many packs the publish covered.
+        """
+        rows = self._client.execute(
+            "SELECT count() FROM (SELECT DISTINCT store_id, pack_id FROM "
+            f"{self._qualified(self._manifest)} "
+            "WHERE index_version = %(index_version)s "
+            "AND publish_id = toUUID(%(publish_id)s))",
+            {"index_version": index_version, "publish_id": publish_id},
+            settings=DECIDING_READ,
+        )
+        return rows[0][0] == expected
+
     def collect_garbage(self) -> dict[str, int]:
         """Delete the rows the protocols append and never need again.
 
@@ -505,17 +560,27 @@ class ClickHouseCatalogWriter:
 
         # Manifest rows of a publish that never reached the watermark, at a
         # version BELOW the published head. Below the head, its watermark
-        # INSERT can no longer land -- the barrier requires strictly above --
-        # so the pair the membership predicate needs will never exist. An
-        # in-flight publish always sits ABOVE the head, which is what keeps
-        # this from deleting membership out from under it.
-        removed[self._manifest] = self._delete_rows(
-            self._manifest,
-            "index_version < %(published)s AND (index_version, publish_id) "
-            f"NOT IN (SELECT index_version, publish_id FROM "
-            f"{self._qualified(self._watermark)})",
-            {"published": published},
-            settings,
+        # INSERT can no longer be ADMITTED -- the barrier requires strictly
+        # above -- so the pair the membership predicate needs will never come
+        # into existence through a new statement. A watermark statement that
+        # was admitted above the head and then stalled can still LAND below it
+        # after this runs; publish_snapshot confirms its membership after the
+        # row stands and refuses the publish when that has happened, so those
+        # packs are republished rather than committed without membership.
+        #
+        # Resolved with a plain SELECT on the initiator and deleted as literal
+        # pairs, in two steps on purpose. The one-step form -- `ALTER TABLE
+        # ... DELETE WHERE ... NOT IN (SELECT ... FROM {watermark})` -- reads a
+        # second, independently replicated table inside the mutation, which
+        # ClickHouse refuses on ReplicatedMergeTree under the default settings
+        # (allow_nondeterministic_mutations = 0 and
+        # mutations_execute_subqueries_on_initiator = 0 on 25.12). A literal
+        # IN list is deterministic on every replica. A pair that gains a
+        # watermark row between the read and the delete cannot exist: below
+        # the head no statement can be admitted for it, and an in-flight one
+        # landing is the case the confirmation above handles.
+        removed[self._manifest] = self._delete_manifest_publishes(
+            self._orphaned_manifest_publishes(published), settings
         )
 
         # Lease rows below the head TERM. The fence resolves exactly one row --
@@ -544,6 +609,49 @@ class ClickHouseCatalogWriter:
             {"published": published},
             settings,
         )
+        return removed
+
+    def _orphaned_manifest_publishes(self, published: int) -> list[tuple[int, str]]:
+        """Every ``(index_version, publish_id)`` below the head with no watermark row."""
+        rows = self._client.execute(
+            "SELECT DISTINCT index_version, toString(publish_id) FROM "
+            f"{self._qualified(self._manifest)} "
+            "WHERE index_version < %(published)s "
+            "AND (index_version, publish_id) NOT IN "
+            f"(SELECT index_version, publish_id FROM {self._qualified(self._watermark)}) "
+            "ORDER BY index_version, publish_id",
+            {"published": published},
+            # Deciding: a replica behind on the watermark table would report a
+            # published pair as orphaned and delete live membership.
+            settings=DECIDING_READ,
+        )
+        return [(int(row[0]), text(row[1])) for row in rows]
+
+    def _delete_manifest_publishes(
+        self, pairs: list[tuple[int, str]], settings: dict
+    ) -> int:
+        """Delete the manifest rows of these publishes, bounded per statement.
+
+        The pairs ride in the statement TEXT, so an unbounded orphan set could
+        breach the server's max_query_size; each chunk is counted and deleted
+        on its own, and a pair straddles no chunk.
+        """
+        removed = 0
+        qualified = self._qualified(self._manifest)
+        for chunk in _inline_publish_chunks(pairs):
+            predicate = "(index_version, publish_id) IN %(pairs)s"
+            matched = self._client.execute(
+                f"SELECT count() FROM {qualified} WHERE {predicate}",
+                {"pairs": chunk},
+                settings=DECIDING_READ,
+            )[0][0]
+            if matched:
+                self._client.execute(
+                    f"ALTER TABLE {qualified} DELETE WHERE {predicate}",
+                    {"pairs": chunk},
+                    settings=settings,
+                )
+            removed += int(matched)
         return removed
 
     def _delete_rows(

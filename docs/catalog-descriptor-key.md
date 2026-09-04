@@ -546,9 +546,30 @@ Two consequences to carry forward:
 **Dead manifest rows accumulate.** Every lost publish leaves membership rows at
 a version that will never reach the watermark table. They are inert -- no
 snapshot can ever admit them, and versions are unique so nobody will publish
-that version later -- but they are never collected. That is a new GC
-obligation: any retention job may delete manifest rows whose `index_version` is
-absent from the watermark table. Nothing does today.
+that version later -- but nothing on the write path collects them.
+`ClickHouseCatalogWriter.collect_garbage()` does, from a maintenance job: it
+deletes manifest rows below the published head whose `(index_version,
+publish_id)` has no watermark row, resolving that set with a plain read on the
+initiator and deleting literal pairs, since a mutation whose predicate reads
+another replicated table is refused on `ReplicatedMergeTree`. See *Retention*
+in `capture-storage-design.md`.
+
+**A late lower commit can outlive its own membership.** "Below the head" means
+no watermark statement can be *admitted* for that version any more; it does
+not mean none is still in flight. A publisher whose watermark statement was
+admitted above the head can stall and land it below a head a faster publisher
+established meanwhile -- the same per-statement window as the takeover instant
+above. If the retention pass runs in that gap it removes the lower manifest,
+and the delayed watermark then lands with nothing to admit. Left there, the
+publish passed its ownership read-back and the indexer committed the packs to
+the inventory: skippable forever, visible in no snapshot, which is exactly the
+state `ensure_schema` refuses. Reproduced on 25.12 in that ordering. So
+`publish_snapshot` confirms, AFTER its watermark row stands, that its manifest
+still holds every pack it admitted, and raises `SnapshotPublishRaceError` when
+it does not; the indexer republishes at a higher version and never commits
+the dead one. The standing watermark row is harmless -- membership requires
+the pair, and no manifest row carries that `publish_id` -- and once a
+watermark row stands, the pair is what the retention bound keeps.
 
 **Detection remains available, and it still costs a contract change.** The
 takeover-instant residual can be made loud instead of silent by the same means

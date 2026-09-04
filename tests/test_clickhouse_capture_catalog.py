@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -112,6 +112,10 @@ class _Client:
         # overlapped. The point of reading publish_id back is that these are
         # not success.
         self.foreign_publishes = []
+        # `(index_version, publish_id)` pairs the retention pass's initiator-
+        # side read reports as orphaned: below the head with no watermark row.
+        # Each is modelled as one manifest row.
+        self.orphan_publishes: list[tuple[int, str]] = []
         self.lease = FakeLeaseTable()
         self.tables = tuple(tables)
         self.schema_version = schema_version
@@ -195,10 +199,21 @@ class _Client:
             return [] if self.schema_version is None else [(self.schema_version,)]
         if "dmi_pack_inventory_raw` FINAL" in query and "NOT IN" in query:
             return [(self.inventory_without_membership,)]
+        if "snapshot_manifest" in query and (
+            "NOT IN (SELECT index_version, publish_id FROM" in query
+        ):
+            # The retention pass's initiator-side read of orphaned membership.
+            # The anti-join lives HERE, in a plain SELECT, and never in the
+            # mutation that follows it.
+            return list(self.orphan_publishes)
         if query.startswith("SELECT count() FROM `") and " WHERE " in query:
             # The retention pass counts what a predicate matches before it
-            # deletes exactly those rows. Answered as "none", so the fake never
-            # issues the mutation and the test can assert on the predicates.
+            # deletes exactly those rows. Literal pair deletions match one
+            # modelled row per pair; the other predicates match nothing, so
+            # the fake never issues those mutations and the test can assert
+            # on the predicates.
+            if "IN %(pairs)s" in query:
+                return [(len(params["pairs"]),)]
             return [(0,)]
         if query.startswith("SELECT count() FROM (SELECT 1 FROM"):
             # The surviving-data probe behind the missing-table refusal. Keyed
@@ -242,13 +257,16 @@ class _Client:
                 (publish_id,) for publish_id in self.foreign_publishes
             ]
         if "snapshot_manifest" in query and "SELECT count()" in query:
-            wanted = set(params["members"])
+            # The chunk read-back names its members; the whole-publish check
+            # after the watermark lands does not, and counts every distinct
+            # pack the publish still has membership for.
+            wanted = set(params["members"]) if "members" in params else None
             found = {
                 (store_id, pack_id)
                 for version, publish_id, store_id, pack_id in self.manifest
                 if version == params["index_version"]
                 and publish_id == params["publish_id"]
-                and (store_id, pack_id) in wanted
+                and (wanted is None or (store_id, pack_id) in wanted)
             }
             return [(len(found),)]
         # The version allocator's queries are answered from real claim state;
@@ -646,7 +664,9 @@ def test_the_deciding_reads_carry_sequential_consistency():
     assert _settings("toString(publish_id)", "SELECT") == [_DECIDING_READ]
     assert _settings("GROUP BY term, lease_id", "SELECT") == [_DECIDING_READ] * 3
     assert _settings("acquired_at_ns, expires_at_ns", "SELECT") == [_DECIDING_READ] * 3
-    assert _settings("dmi_snapshot_manifest", "SELECT") == [_DECIDING_READ]
+    # The chunk read-back, and the whole-publish confirmation after the
+    # watermark row stands.
+    assert _settings("dmi_snapshot_manifest", "SELECT") == [_DECIDING_READ] * 2
     # The two fenced writes carry the same consistency AND the statement cap
     # that keeps the fence from being evaluated long before the row lands.
     fenced = {
@@ -1905,51 +1925,163 @@ def test_drop_schema_drops_every_object_whatever_kind_it_is():
     assert len(drops) == len(_CURRENT_OBJECTS) + 1  # + the legacy commit log
 
 
-def test_collect_garbage_deletes_only_within_its_stated_bounds():
-    """The predicates, pinned. Widening one by a comparison is the whole risk.
+def test_collect_garbage_resolves_orphans_on_the_initiator_and_deletes_literal_pairs():
+    """The mutation carries no subquery; the anti-join is a plain read first.
 
-    Each bound below is what makes a deletion safe, and none of them is
-    observable in CI any other way: `ALTER TABLE ... DELETE` reports nothing,
-    and the live test that exercises the behaviour is not collected here. So
-    the statements themselves are the assertion.
+    `ALTER TABLE ... DELETE WHERE ... NOT IN (SELECT ... FROM other_table)`
+    reads an independently replicated table inside the mutation predicate,
+    and on `ReplicatedMergeTree` ClickHouse refuses that form under the
+    default settings (`allow_nondeterministic_mutations` and
+    `mutations_execute_subqueries_on_initiator` both 0 on 25.12) -- so the
+    retention pass worked on a single node and failed on exactly the
+    deployment the rest of the module takes care over. The orphan set is now
+    resolved by an ordinary SELECT on the initiator, with the same two bounds,
+    and the mutation deletes those literal `(index_version, publish_id)` pairs
+    and nothing else.
+
+    The bounds are pinned here too, because widening one by a comparison is
+    the whole risk and `ALTER TABLE ... DELETE` reports nothing.
     """
     client = _Client()
+    orphans = [(3, str(uuid4())), (5, str(uuid4()))]
+    client.orphan_publishes = list(orphans)
     writer = _leased(client)
 
-    writer.collect_garbage()
+    removed = writer.collect_garbage()
 
-    deletes = {
-        query.split("`")[3]: query
-        for query, _, _ in client.calls
-        if query.startswith("ALTER TABLE") or (
-            query.startswith("SELECT count()") and " WHERE " in query
-        )
-    }
-    counted = [
+    orphan_read = next(
         (query, params)
         for query, params, _ in client.calls
-        if query.startswith("SELECT count() FROM `") and " WHERE " in query
-    ]
-    by_table = {query.split("`")[3]: (query, params) for query, params in counted}
-
-    manifest_query, manifest_params = by_table["dmi_snapshot_manifest"]
+        if query.startswith("SELECT") and "snapshot_manifest" in query
+        and "NOT IN (SELECT index_version, publish_id FROM" in query
+    )
     # Strictly BELOW the published head: an in-flight publish always sits above
-    # it, so this cannot delete membership out from under one.
-    assert "index_version < %(published)s" in manifest_query
-    # And only rows no watermark row pairs with.
-    assert "NOT IN (SELECT index_version, publish_id FROM" in manifest_query
-    assert manifest_params["published"] == writer.last_published_version()
+    # it, so this cannot select membership out from under one.
+    assert "index_version < %(published)s" in orphan_read[0]
+    assert orphan_read[1]["published"] == writer.last_published_version()
+    # And only pairs no watermark row admits.
+    assert "dmi_index_watermark" in orphan_read[0]
 
-    lease_query, _ = by_table["dmi_publisher_lease"]
+    deletes = [
+        (query, params, kwargs)
+        for query, params, kwargs in client.calls
+        if query.startswith("ALTER TABLE") and "dmi_snapshot_manifest" in query
+    ]
+    assert len(deletes) == 1
+    statement, params, kwargs = deletes[0]
+    assert "(index_version, publish_id) IN %(pairs)s" in statement
+    assert params["pairs"] == orphans
+    assert "SELECT" not in statement, (
+        "a replicated mutation must not read another table in its predicate"
+    )
+    assert kwargs.get("settings") == {"mutations_sync": 1}
+    assert removed["dmi_snapshot_manifest"] == len(orphans)
+
+    counted = {
+        query.split("`")[3]: (query, params)
+        for query, params, _ in client.calls
+        if query.startswith("SELECT count() FROM `") and " WHERE " in query
+    }
+    lease_query, _ = counted["dmi_publisher_lease"]
     # Strictly below the head TERM, so the row the fence resolves survives
     # whether or not it has expired.
     assert "term < %(term)s" in lease_query
-
-    claims_query, claims_params = by_table["dmi_capture_version_claims"]
+    claims_query, claims_params = counted["dmi_capture_version_claims"]
     # At or below the published head: the watermark keeps the allocator's floor
     # once these are gone, and a claim ABOVE the head may be a version a pass
     # has allocated and not yet published.
     assert "version <= %(published)s" in claims_query
     assert claims_params["published"] == writer.last_published_version()
     # The watermark table is never collected -- it IS the floor.
-    assert "dmi_index_watermark" not in deletes
+    assert not [
+        query for query, _, _ in client.calls
+        if query.startswith("ALTER TABLE") and "dmi_index_watermark" in query
+    ]
+
+
+def test_collect_garbage_issues_no_manifest_mutation_when_nothing_is_orphaned():
+    client = _Client()
+    writer = _leased(client)
+
+    removed = writer.collect_garbage()
+
+    assert removed["dmi_snapshot_manifest"] == 0
+    assert not [
+        query for query, _, _ in client.calls
+        if query.startswith("ALTER TABLE") and "dmi_snapshot_manifest" in query
+    ]
+
+
+def test_collect_garbage_chunks_the_orphan_deletions_by_rendered_size():
+    """The pairs ride in the statement TEXT, so a big orphan set is bounded."""
+    from dmi.storage.capture.clickhouse_sql import MAX_INLINE_PARAMETER_BYTES
+
+    client = _Client()
+    orphans = [(version, str(uuid4())) for version in range(1, 6001)]
+    client.orphan_publishes = list(orphans)
+    writer = _leased(client)
+
+    removed = writer.collect_garbage()
+
+    deletes = [
+        params["pairs"]
+        for query, params, _ in client.calls
+        if query.startswith("ALTER TABLE") and "dmi_snapshot_manifest" in query
+    ]
+    assert len(deletes) > 1, "6000 pairs should not fit one statement"
+    assert [pair for chunk in deletes for pair in chunk] == orphans
+    for chunk in deletes:
+        rendered = len(repr(chunk).encode())
+        assert rendered <= MAX_INLINE_PARAMETER_BYTES
+    assert removed["dmi_snapshot_manifest"] == len(orphans)
+
+
+def test_a_publish_whose_membership_was_collected_before_its_watermark_landed_is_refused():
+    """A late lower commit must not leave inventory with no membership.
+
+    The watermark barrier and fence are evaluated when the statement is
+    ADMITTED, and the row can land later. A lower publisher can therefore have
+    its watermark statement admitted, stall, and land below a head that a
+    higher publisher established in the meantime -- and `collect_garbage()`,
+    run in that gap, sees the lower manifest rows below the head with no
+    watermark row and removes them. When the delayed watermark lands, the
+    publish has a watermark row that admits nothing. Passing the ownership
+    read-back there and letting the caller `commit_packs` produced exactly the
+    inventory-without-membership state `ensure_schema` refuses (reproduced on
+    25.12 in that ordering).
+
+    So a publish confirms its membership AFTER its watermark row stands, and
+    refuses -- as a lost race, which is what re-allocating a higher version
+    repairs -- when the manifest it wrote is no longer whole.
+    """
+    ref, descriptor = _descriptor()
+    client = _Client()
+    writer = _leased(client)
+    execute = client.execute
+
+    def collect_between_the_watermark_and_its_confirmation(query, params=None, **kwargs):
+        result = execute(query, params, **kwargs)
+        if query.lstrip().startswith("INSERT") and "index_watermark" in query:
+            # The retention pass, having run while this watermark statement
+            # was in flight below a newer head.
+            client.manifest = [
+                row for row in client.manifest if row[1] != params["publish_id"]
+            ]
+        return result
+
+    client.execute = collect_between_the_watermark_and_its_confirmation
+
+    with pytest.raises(SnapshotPublishRaceError) as raised:
+        writer.publish_snapshot(
+            index_version=7, refs=[ref], published_at_ns=7,
+            indexed_rows=1, indexed_packs=1,
+        )
+
+    message = str(raised.value)
+    assert "membership" in message and "collected" in message
+    assert "higher version" in message
+    # The watermark row stands, and stands harmless: it admits nothing.
+    assert client.watermarks == [7]
+    assert client.manifest == []
+    # And the lease is intact -- this was not a takeover.
+    assert writer.publisher_lease is not None

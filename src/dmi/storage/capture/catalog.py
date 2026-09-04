@@ -29,6 +29,13 @@ class SnapshotPublishRaceError(CaptureStorageError):
     rows of the first behind. They are inert -- no snapshot can ever admit them
     -- but they are durable, and collecting them is the GC obligation
     docs/catalog-descriptor-key.md records.
+
+    One further case wears this class because it wants the same recovery: a
+    watermark statement admitted above the head that stalled and landed below
+    a newer one, after a retention pass had already collected its manifest
+    rows. Its watermark row STANDS -- and admits nothing, since no manifest row
+    pairs with it -- so the packs are not visible at that version and must not
+    be committed as if they were. The message says which case it is.
     """
 
 

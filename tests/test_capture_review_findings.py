@@ -207,13 +207,15 @@ class _Client:
                 if version == params["version"]
             ]
         if "snapshot_manifest" in query and "SELECT count()" in query:
-            wanted = set(params["members"])
+            # The chunk read-back names its members; the whole-publish check
+            # after the watermark lands does not.
+            wanted = set(params["members"]) if "members" in params else None
             found = {
                 (store_id, pack_id)
                 for version, publish_id, store_id, pack_id in self.manifest
                 if version == params["index_version"]
                 and publish_id == params["publish_id"]
-                and (store_id, pack_id) in wanted
+                and (wanted is None or (store_id, pack_id) in wanted)
             }
             return [(len(found),)]
         # The version allocator's three queries need real state to answer.
