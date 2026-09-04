@@ -5,11 +5,21 @@ answer comes from the same Python the runtime uses.
 """
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("fastapi", reason="DMI-configurator UI extra not installed")
+# fastapi.testclient needs an HTTP transport (httpx2, or the deprecated httpx)
+# that the [ui] extra deliberately does not carry: the UI itself never makes
+# HTTP requests. Without one the import raises RuntimeError at collection,
+# so check for it here and skip like every other optional-dependency suite.
+if not any(importlib.util.find_spec(name) for name in ("httpx2", "httpx")):
+    pytest.skip(
+        "fastapi.testclient needs httpx2 (or httpx); test-only, see CI install step",
+        allow_module_level=True,
+    )
 
 from fastapi.testclient import TestClient  # noqa: E402
 

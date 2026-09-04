@@ -180,7 +180,8 @@ def attach_config(adapter, model, config: DMIConfig) -> None:
             "silently dropped would supersede captures with the unfiltered "
             "pack. Update the adapter integration to a revision that accepts "
             "attach_config(..., LayerSelection(...)), or clear "
-            "observations.layers in the configuration."
+            "observations.layers in the configuration. (vLLM: "
+            "https://github.com/ProjectDMX/DMI-vLLM-Integration/issues/20)"
         )
 
     adapter.attach_model(
