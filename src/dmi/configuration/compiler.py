@@ -73,20 +73,25 @@ def compile_config(config: DMIConfig, model_context: ModelContext) -> CompiledDM
     """
     from ..hooks.selection import hook_belongs_to_layers, select_hook_specs
 
-    specs = select_hook_specs(
+    # Absent-hook rejection runs after SELECTION (which applies the model's
+    # own availability suppression) but BEFORE layer filtering, so the
+    # message "does not match any hook the attached model exposes" means
+    # exactly that: shape suppression says the hook cannot fire, and a hook
+    # merely outside the selected range is not misreported as absent.
+    selected = select_hook_specs(
         model_context.specs,
         to_legacy_hook_selection(config.observations),
         cfg=model_context.shape,
     )
+    _reject_requested_hooks_that_cannot_fire(config, selected)
 
+    specs = selected
     layers = config.observations.layers
     if layers is not None:
         specs = [
             spec for spec in specs
             if hook_belongs_to_layers(spec, layers.start, layers.end)
         ]
-
-    _reject_requested_hooks_that_cannot_fire(config, specs)
 
     return CompiledDMIConfig(
         hook_specs=specs,

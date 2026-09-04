@@ -223,7 +223,7 @@ class BackendAdapter(abc.ABC):
         # prefix cannot be gated numerically and always passes.
         if ctx.req_ids:
             prefix = str(ctx.req_ids[0]).split(":", 1)[0]
-            if prefix.isdigit() and not schedule.should_capture_request(int(prefix)):
+            if prefix.isdecimal() and not schedule.should_capture_request(int(prefix)):
                 return False
         if ctx.phase is not None:
             return schedule.should_capture_step(
