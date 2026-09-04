@@ -625,12 +625,19 @@ necessary but not sufficient, and now of `collect_garbage()` against
 replicated tables -- the mutation it issues was changed precisely because the
 previous form is refused on replicated tables under the default settings, and
 CI runs a single non-replicated server that accepts both forms. The verifier
-was rewritten so that every branch asserts, but it has not been run since:
-this environment has no Keeper.
+was rewritten so that every branch asserts, and it HAS been run: 2026-09-04
+against ClickHouse 25.12.2.54 with the harness configs now checked in at
+`tests/tools/quorum_harness/` (they were previously /tmp-only, which is why
+the first post-rewrite run found a real defect -- the hand-rolled DDL had
+lost the `{prefix}_pack_inventory` view `committed_pack_ids()` reads; the
+verifier now builds both public views from the production builder in
+`clickhouse_schema.py`, so that layer cannot drift again). All six stages
+pass, twice.
 
-*To reproduce:* a Keeper on 9181 and a server on 9010 configured as the
-script's docstring describes, then `python tests/tools/verify_replicated_quorum.py`
-from the repository root. *Expected:* six `PASS` lines and exit status 0. In
+*To reproduce:* the setup recipe is in the verifier's docstring -- a Keeper
+on 9181 and a server on 9010 from the checked-in configs, then
+`PYTHONPATH=src:. python tests/tools/verify_replicated_quorum.py` from the
+repository root. *Expected:* six `PASS` lines and exit status 0. In
 particular the retention step must be *admitted* -- an `ALTER TABLE ... DELETE`
 that ClickHouse refuses would raise a `ServerException` there -- and must
 remove exactly the orphan rows while both published versions keep theirs.

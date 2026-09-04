@@ -85,6 +85,32 @@ CAPTURE_TABLE_ORDER = (
 SCHEMA_VERSION = 4
 
 
+def capture_view_definition(database: str, prefix: str) -> str:
+    """The `{prefix}_capture` view DDL, shared with the quorum verifier.
+
+    Database-qualified exactly as ``_lay_out`` always emitted: the view body
+    must resolve in the catalog's database, not in whatever the connection's
+    current database happens to be.
+    """
+    return (
+        f"CREATE OR REPLACE VIEW {q(database, prefix + '_capture')} AS "
+        f"SELECT {', '.join(CAPTURE_COLUMNS[:-1])} FROM {q(database, prefix + '_capture_raw')} FINAL "
+        f"WHERE {membership_predicate(q(database, prefix + '_snapshot_manifest'), q(database, prefix + '_index_watermark'), bounded=False)}"
+    )
+
+
+def pack_view_definition(database: str, prefix: str) -> str:
+    """The `{prefix}_pack_inventory` view DDL, shared with the quorum verifier."""
+    return (
+        f"CREATE VIEW IF NOT EXISTS {q(database, prefix + '_pack_inventory')} AS "
+        f"SELECT {', '.join(PACK_COLUMNS[:-1])} FROM {q(database, prefix + '_pack_inventory_raw')} FINAL"
+    )
+
+
+def q(database: str, name: str) -> str:
+    return f"`{database}`.`{name}`"
+
+
 def _quoted(value: str) -> str:
     return f"`{value}`"
 
@@ -397,15 +423,8 @@ index_version UInt64, publish_id UUID, store_id LowCardinality(String),
 pack_id UUID
 ) ENGINE = MergeTree ORDER BY (index_version, publish_id, store_id, pack_id)"""
         )
-        self._client.execute(
-            f"CREATE OR REPLACE VIEW {capture_view} AS "
-            f"SELECT {', '.join(CAPTURE_COLUMNS[:-1])} FROM {capture_raw} FINAL "
-            f"WHERE {membership_predicate(manifest, watermark, bounded=False)}"
-        )
-        self._client.execute(
-            f"CREATE VIEW IF NOT EXISTS {pack_view} AS "
-            f"SELECT {', '.join(PACK_COLUMNS[:-1])} FROM {pack_raw} FINAL"
-        )
+        self._client.execute(capture_view_definition(self.database, self.prefix))
+        self._client.execute(pack_view_definition(self.database, self.prefix))
 
     def _stamp(self) -> None:
         self._client.execute(

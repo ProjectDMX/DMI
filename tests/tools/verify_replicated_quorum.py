@@ -13,17 +13,22 @@ consistency and replica loss all behave as they would across hosts, without
 needing a second machine. What one server CANNOT model is two hosts' clocks:
 `clock_skew_ns` is exercised as a parameter here, never as a measured skew.
 
-Setup (ports chosen to avoid a default install):
+Setup (ports chosen to avoid a default install). The configs live in
+``tests/tools/quorum_harness/`` and write everything under
+``/tmp/dmi-quorum-harness/``; copy ``users.xml`` next to the server's data
+root once, then start both:
 
-    clickhouse-keeper --config-file keeper.xml      # tcp_port 9181
-    clickhouse-server  --config-file server.xml     # tcp_port 9010, with
+    mkdir -p /tmp/dmi-quorum-harness/{keeper/{logs,snapshots,state,storage,auxiliary},server/{data,tmp,user_files,format_schemas},tmp}
+    cp tests/tools/quorum_harness/users.xml /tmp/dmi-quorum-harness/users.xml
+    clickhouse-keeper  --config-file tests/tools/quorum_harness/keeper.xml --daemon   # tcp 9181
+    clickhouse-server  --config-file tests/tools/quorum_harness/server.xml --daemon   # tcp 9010,
                                                     # <zookeeper> pointing at
                                                     # 9181 and
                                                     # <interserver_http_host>
                                                     # 127.0.0.1 so the replicas
                                                     # can fetch from each other
 
-    python tests/tools/verify_replicated_quorum.py
+    PYTHONPATH=src:. python tests/tools/verify_replicated_quorum.py
 
 Every check ASSERTS. An earlier version printed `FAIL` and exited 0, accepted
 any exception where a specific one was expected, published an empty snapshot,
@@ -67,7 +72,12 @@ from dmi.storage.capture import (
     ClickHouseCatalogWriter,
     ClickHouseReaderConfig,
 )
-from dmi.storage.capture.clickhouse_schema import CAPTURE_TABLE_ORDER, _facet_ddl
+from dmi.storage.capture.clickhouse_schema import (
+    CAPTURE_TABLE_ORDER,
+    _facet_ddl,
+    capture_view_definition,
+    pack_view_definition,
+)
 
 TOO_FEW_LIVE_REPLICAS = 285
 
@@ -136,6 +146,14 @@ def create(client, prefix: str, replica: str, suffix: str) -> None:
             f"CREATE TABLE IF NOT EXISTS default.`{prefix}_{name}{suffix}` "
             f"({columns}) ENGINE = {engine}({args}) ORDER BY ({order})"
         )
+    # The public views, built from the production builder so they cannot
+    # drift from what committed_pack_ids() and the reader actually read.
+    # Main replica only: nothing reads `{prefix}_peer_*` views (the peer's
+    # tables exist to satisfy quorum), and the verifier's peer naming
+    # (`{prefix}_capture_raw_peer`) is not the layout the builders emit.
+    if not suffix:
+        client.execute(capture_view_definition('default', prefix))
+        client.execute(pack_view_definition('default', prefix))
 
 
 def drop(client, prefix: str) -> None:
