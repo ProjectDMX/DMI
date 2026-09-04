@@ -770,9 +770,9 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 
 | State found | Outcome |
 |---|---|
-| no catalog objects at all, with object visibility confirmed | fresh install: create everything, stamp the current version |
+| no catalog objects at all, with object visibility confirmed | fresh install: create the stamp and lease tables, take the publisher lease, re-read, create everything else, stamp the current version, release |
 | version table stamped at the current version, all objects present, descriptor sort key this build's | proceed; the DDL is idempotent |
-| version table present, no row | an install of this build that died before stamping: rerun the DDL, then stamp -- *after* the last three rows below, which an empty stamp does not skip |
+| version table present, no row | an install of this build that died before stamping: under the publisher lease, rerun the DDL, then stamp -- *after* the last three rows below, which an empty stamp does not skip |
 | only superseded objects (`{prefix}_pack_commit_log`) | refuse -- naming that object and saying to drop it; there is nothing to rebuild |
 | an object present under the wrong kind (a table where a view belongs, or the reverse) | refuse -- naming the object and its engine |
 | catalog objects present, no version table | refuse -- unstamped, with the differences read off `system.tables` / `system.columns` |
@@ -783,6 +783,31 @@ anything it did not create, raising `CatalogSchemaVersionError`:
 | a TABLE missing, and every data table is empty | complete it: rerun the DDL |
 | a VIEW missing | recreate it; a view is a projection of the tables and holds no rows |
 | any pack inventory identity lacks effective published manifest membership | refuse -- membership is incomplete |
+
+**Installs are serialised per prefix, on the publisher lease.** Two
+initialisers that both read an empty prefix both proceeded to their DDL and
+their stamps, and a reviewer injected the ordering that made it matter: a
+compatibility read that found nothing, another initialiser's `CREATE
+{prefix}_capture_raw` with a pre-v4 sort key, this initialiser's `CREATE TABLE
+IF NOT EXISTS` no-op over it, names and kinds confirmed, and stamp 4 written
+over a layout it does not describe -- detected only by the *next* call, after
+this one had already told its caller to index. So a fresh or interrupted
+install now creates the stamp table and the lease table first (both
+idempotent, both this build's own; `CREATE TABLE IF NOT EXISTS` is atomic on
+the server, so two initialisers racing those two statements is harmless),
+takes the publisher lease as `ensure_schema` -- or renews the one the calling
+writer already holds -- re-reads the catalog under it, and only then issues the
+remaining DDL, re-checks the layout and stamps, releasing afterwards. Nobody
+can be publishing into a catalog that does not exist yet, so an install pays
+nothing for the lease; a **complete** catalog is ensured without it, because
+its DDL is idempotent and taking the lease there would refuse every second
+process for as long as an indexer is publishing.
+
+What this cannot serialise is an initialiser from an older build, which knows
+nothing of the lease. Against that the layout re-check immediately before the
+stamp is the whole defence -- it refuses rather than stamps -- and a catalog
+such a build did write into is refused on the next call as an older build's
+object standing beside this one's.
 
 Before any verdict above -- and so before any catalog DDL -- `ensure_schema`
 checks object-scoped `SHOW TABLES` access for every current and superseded

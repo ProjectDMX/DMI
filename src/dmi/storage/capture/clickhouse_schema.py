@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from time import time_ns
 
 from .catalog import CatalogSchemaVersionError
+from .clickhouse_lease import ClickHouseLeaseCoordinator
 from .clickhouse_sql import (
     DECIDING_READ,
     ClickHouseClient,
@@ -132,6 +133,29 @@ def _engine_arguments(engine_full: str) -> tuple[str, tuple[str, ...]]:
 
 
 @dataclass(frozen=True, slots=True)
+class _InstallerLeaseConfig:
+    """The lease knobs an installer uses when no writer supplies its own.
+
+    An install holds the lease for a few statements, so the defaults of
+    ClickHouseCatalogConfig are more than enough; they are restated here rather
+    than imported because that module imports this one.
+    """
+
+    database: str
+    table_prefix: str
+    lease_ttl_ns: int = 30_000_000_000
+    publish_timeout_ns: int = 5_000_000_000
+    clock_skew_ns: int = 0
+    insert_quorum: int | None = None
+
+
+# What `_verify_compatibility` concludes about a catalog it did not refuse.
+FRESH = "fresh"            # nothing there: create everything
+INCOMPLETE = "incomplete"  # an install of this build that stopped partway
+COMPLETE = "complete"      # this build's catalog; the DDL is idempotent over it
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogObject:
     engine: str
     sorting_key: str
@@ -177,7 +201,14 @@ class ClickHouseCatalogSchema:
     def qualified(self, table: str) -> str:
         return f"{_quoted(self.database)}.{_quoted(table)}"
 
-    def ensure(self) -> None:
+    def ensure(self, leases: ClickHouseLeaseCoordinator | None = None) -> None:
+        """Create or verify the catalog; installs are serialised per prefix.
+
+        ``leases`` is the calling writer's lease coordinator. A writer that
+        already holds the publisher lease keeps it and renews it around the
+        install; otherwise the installer takes the lease itself and gives it
+        back when the stamp is written.
+        """
         found = self._catalog_state()
         # Visibility is required before any VERDICT, not merely before the DDL.
         # `system.tables` is grant-filtered per role, so an object this role
@@ -192,26 +223,83 @@ class ClickHouseCatalogSchema:
         # an object rather than resolving one, so it needs neither the database
         # nor the objects to exist (also verified on 25.12).
         self._require_catalog_visibility()
-        fresh = self._verify_compatibility(found)
-        database = _quoted(self.database)
+        state = self._verify_compatibility(found)
+        self._client.execute(f"CREATE DATABASE IF NOT EXISTS {_quoted(self.database)}")
+        if state == COMPLETE:
+            # Nothing to serialise: every object exists, the DDL is idempotent
+            # over it and the stamp is a server-side no-op. Taking the lease
+            # here would refuse every second process for as long as an indexer
+            # is publishing, which is most of the time.
+            self._create_stamp_and_lease_tables()
+            self._lay_out()
+            self._confirm_catalog_is_complete()
+            self._stamp()
+            return
+        # An install -- fresh, or one of this build's that stopped partway.
+        # Serialised on the publisher lease, per prefix: two initialisers that
+        # both read an empty prefix used to both proceed to their DDL and their
+        # stamps, and the re-check before the stamp turns THEIR interleavings
+        # into refusals but does not prevent them. The lease is the catalog's
+        # one mutual-exclusion primitive already; nobody can be publishing
+        # into a catalog that does not exist yet, so an install pays nothing
+        # for it, and a writer that acquired first keeps its own.
+        #
+        # The two tables an installer needs to take the lease are created
+        # first, both idempotent and both this build's own: the stamp table so
+        # that an install interrupted anywhere below reads as "this build,
+        # unfinished", and the lease table so that the lease can be claimed.
+        # Two initialisers racing THESE two statements is harmless -- CREATE
+        # TABLE IF NOT EXISTS is atomic on the server -- and everything after
+        # them is under the lease.
+        #
+        # What this cannot serialise is an initialiser from an OLDER build,
+        # which knows nothing of the lease: its `CREATE TABLE IF NOT EXISTS`
+        # landing between this read and this build's own is why the layout is
+        # re-checked immediately before the stamp, and why a catalog it did
+        # write into is refused on the next call.
+        self._create_stamp_and_lease_tables()
+        coordinator = leases or ClickHouseLeaseCoordinator(
+            self._client, _InstallerLeaseConfig(self.database, self.prefix)
+        )
+        borrowed = coordinator.lease is not None
+        if borrowed:
+            coordinator.renew()
+        else:
+            coordinator.acquire("ensure_schema")
+        try:
+            # Re-read under the lease. What looked like nothing may now be
+            # another initialiser's finished or half-finished work, and the
+            # rules above already classify both: complete is idempotent, this
+            # build's unfinished install is completed, anything else refused.
+            self._verify_compatibility()
+            self._lay_out()
+            self._confirm_catalog_is_complete()
+            self._stamp()
+        finally:
+            if not borrowed:
+                coordinator.release()
+
+    def _create_stamp_and_lease_tables(self) -> None:
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {self.qualified(self.schema_table)} (
+version UInt32, applied_at_ns UInt64
+) ENGINE = MergeTree ORDER BY version"""
+        )
+        self._client.execute(
+            f"""CREATE TABLE IF NOT EXISTS {self.qualified(self.lease_table)} (
+term UInt64, lease_id UUID, holder String, acquired_at_ns UInt64,
+expires_at_ns UInt64
+) ENGINE = MergeTree ORDER BY (term, lease_id)"""
+        )
+
+    def _lay_out(self) -> None:
+        """Every object but the two `_create_stamp_and_lease_tables` makes."""
         capture_raw = self.qualified(self.capture_raw)
         capture_view = self.qualified(self.capture_view)
         pack_raw = self.qualified(self.pack_raw)
         pack_view = self.qualified(self.pack_view)
         watermark = self.qualified(self.watermark)
         manifest = self.qualified(self.manifest)
-        self._client.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
-        if fresh:
-            # Re-read what looked like nothing at all, now that the database
-            # exists: a second installer that created objects between the two
-            # reads is met with the same refusals as any other catalog rather
-            # than with this build's DDL running over its work.
-            self._verify_compatibility()
-        self._client.execute(
-            f"""CREATE TABLE IF NOT EXISTS {self.qualified(self.schema_table)} (
-version UInt32, applied_at_ns UInt64
-) ENGINE = MergeTree ORDER BY version"""
-        )
         self._client.execute(
             f"""CREATE TABLE IF NOT EXISTS {capture_raw} (
 capture_id String, tenant_id String, experiment_id String, run_id String,
@@ -260,12 +348,6 @@ version UInt64, claim_id UUID, claimed_at_ns UInt64
 ) ENGINE = MergeTree ORDER BY (version, claim_id)"""
         )
         self._client.execute(
-            f"""CREATE TABLE IF NOT EXISTS {self.qualified(self.lease_table)} (
-term UInt64, lease_id UUID, holder String, acquired_at_ns UInt64,
-expires_at_ns UInt64
-) ENGINE = MergeTree ORDER BY (term, lease_id)"""
-        )
-        self._client.execute(
             f"""CREATE TABLE IF NOT EXISTS {manifest} (
 index_version UInt64, publish_id UUID, store_id LowCardinality(String),
 pack_id UUID
@@ -280,7 +362,8 @@ pack_id UUID
             f"CREATE VIEW IF NOT EXISTS {pack_view} AS "
             f"SELECT {', '.join(PACK_COLUMNS[:-1])} FROM {pack_raw} FINAL"
         )
-        self._confirm_catalog_is_complete()
+
+    def _stamp(self) -> None:
         self._client.execute(
             f"INSERT INTO {self.qualified(self.schema_table)} "
             "(version, applied_at_ns) "
@@ -289,6 +372,7 @@ pack_id UUID
             f"{self.qualified(self.schema_table)}) = 0",
             {"version": SCHEMA_VERSION, "applied_at_ns": time_ns()},
         )
+
     def _require_catalog_visibility(self) -> None:
         for _, name in self.objects + self.legacy_objects:
             rows = self._client.execute(
@@ -328,22 +412,24 @@ pack_id UUID
         # not describe -- detected only on a LATER call, by which time this one
         # had already told its caller to index.
         #
-        # This does not close that race; only serialising initialisation per
-        # prefix does. It stops the stamp from being written over a layout this
-        # build can see is wrong, which turns a silent disagreement into the
-        # refusal any other incompatible catalog gets.
+        # Installs are now serialised on the publisher lease (see `ensure`),
+        # which closes that race between initialisers of THIS build. An older
+        # build's initialiser knows nothing of the lease, so against it this
+        # re-check is the whole defence: it stops the stamp from being written
+        # over a layout this build can see is wrong, turning a silent
+        # disagreement into the refusal any other incompatible catalog gets.
         just_created = "was just created by this build"
         self._reject_a_wrong_descriptor_sort_key(found, just_created)
         self._reject_a_wrong_engine(found, just_created)
 
     def _verify_compatibility(
         self, found: dict[str, CatalogObject] | None = None
-    ) -> bool:
-        """Returns True when this is a fresh install, i.e. nothing is there."""
+    ) -> str:
+        """FRESH, INCOMPLETE or COMPLETE; anything else is refused by raising."""
         if found is None:
             found = self._catalog_state()
         if not found:
-            return True
+            return FRESH
         self._reject_wrong_kinds(found)
         if not any(name in found for _, name in self.objects):
             raise CatalogSchemaVersionError(self._leftovers_only(found))
@@ -380,7 +466,7 @@ pack_id UUID
             #
             # Returned rather than fallen through: the membership check below
             # reads tables this catalog does not have yet.
-            return False
+            return INCOMPLETE
         if missing:
             raise CatalogSchemaVersionError(
                 f"catalog `{self.database}`.`{self.prefix}_*` {stamp} but is "
@@ -402,7 +488,7 @@ pack_id UUID
                 "success while their captures remain invisible. "
                 + self.rebuild_instruction()
             )
-        return False
+        return COMPLETE
 
     def _catalog_state(self) -> dict[str, CatalogObject]:
         names = [name for _, name in self.objects + self.legacy_objects]

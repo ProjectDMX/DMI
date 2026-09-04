@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from dmi.storage.capture import (
+    PublisherLeaseHeldError,
     CaptureMetadata,
     CaptureRecord,
     CatalogSchemaVersionError,
@@ -996,10 +997,13 @@ def test_a_fresh_install_stamps_the_schema_version_last():
         for index, item in enumerate(statements)
         if item.startswith("INSERT") and "dmi_schema_version" in item
     )
-    # The last statement that writes anything. The complete object set is
-    # validated immediately before this stamp.
+    # The last statement that writes to the LAYOUT. The complete object set is
+    # validated immediately before this stamp. What may follow it is the
+    # initialiser giving back the lease it held around the whole install --
+    # a row in the lease table, not an object.
     assert not any(
         item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
+        and "publisher_lease" not in item
         for item in statements[stamp + 1 :]
     ), statements[stamp + 1 :]
     assert client.calls[stamp][1]["version"] == _SCHEMA_VERSION
@@ -1153,6 +1157,143 @@ def test_a_stamped_catalog_with_the_wrong_descriptor_sort_key_is_refused():
         for item, *_ in client.calls
         if item.startswith(("CREATE", "ALTER", "INSERT", "DROP"))
     ]
+
+
+def _lease_claims(client) -> list[str]:
+    return [
+        query for query, params, _ in client.calls
+        if query.startswith("INSERT") and "publisher_lease` (term" in query
+        and params is not None and "ttl_ns" in params
+    ]
+
+
+def _lease_releases(client) -> list[str]:
+    return [
+        query for query, params, _ in client.calls
+        if query.startswith("INSERT") and "publisher_lease` (term" in query
+        and params is not None and "ttl_ns" not in params
+    ]
+
+
+def test_a_fresh_install_runs_under_the_publisher_lease_from_ddl_to_stamp():
+    """Initialisation of a prefix is serialised, not merely re-checked.
+
+    Two initialisers reading an empty prefix both proceeded to their DDL. The
+    layout re-check before the stamp turns the ordering the reviewer injected
+    into a refusal, but it does not stop two of THIS build's initialisers
+    from interleaving their DDL and their stamps. So a fresh install creates
+    the stamp table and the lease table -- both idempotent, both this build's
+    own -- and then takes the publisher lease before any other DDL, holding it
+    until the stamp is written. The lease is the catalog's one mutual-exclusion
+    primitive already; nobody can be publishing into a catalog that does not
+    exist yet, so taking it costs a fresh install nothing.
+    """
+    client = _Client()
+
+    _writer(client).ensure_schema()
+
+    statements = [call[0] for call in client.calls]
+    claims = _lease_claims(client)
+    releases = _lease_releases(client)
+    assert len(claims) == 1 and len(releases) == 1
+    claim = statements.index(claims[0])
+    release = statements.index(releases[0])
+    stamp = next(
+        index for index, item in enumerate(statements)
+        if item.startswith("INSERT") and "dmi_schema_version" in item
+    )
+    layout = [
+        index for index, item in enumerate(statements)
+        if item.startswith(("CREATE TABLE", "ALTER", "CREATE OR REPLACE", "CREATE VIEW"))
+        and "dmi_schema_version" not in item
+        and "dmi_publisher_lease" not in item
+    ]
+    assert claim < min(layout), "the lease is taken before the layout DDL"
+    assert max(layout) < stamp < release, "and held until the stamp is written"
+    # Given back: the next publisher does not wait out a TTL for an installer.
+    head = client.lease.claimants()
+    assert head and head[0][3] <= client.lease.now_ns
+
+
+def test_a_second_initialiser_is_refused_while_the_first_holds_the_prefix():
+    """The interleaving itself, driven: B starts while A is mid-install."""
+    client = _Client()
+    first = _writer(client)
+    second = _writer(client)
+    execute = client.execute
+    refused: list[Exception] = []
+
+    def start_the_second_initialiser_mid_install(query, params=None, **kwargs):
+        result = execute(query, params, **kwargs)
+        if query.startswith("CREATE TABLE") and "dmi_capture_raw" in query and not refused:
+            client.execute = execute
+            try:
+                second.ensure_schema()
+            except PublisherLeaseHeldError as held:
+                refused.append(held)
+            client.execute = start_the_second_initialiser_mid_install
+        return result
+
+    client.execute = start_the_second_initialiser_mid_install
+
+    first.ensure_schema()
+
+    assert refused, "the second initialiser should have been refused"
+    assert "held by 'ensure_schema'" in str(refused[0])
+    # One stamp, written by the initialiser that held the lease.
+    stamps = [
+        call for call in client.calls
+        if call[0].startswith("INSERT") and "dmi_schema_version" in call[0]
+    ]
+    assert len(stamps) == 1
+    # And once the first has finished, the second finds a complete catalog and
+    # ensures it idempotently -- without a lease, since there is nothing left
+    # to serialise.
+    second.ensure_schema()
+    assert len(_lease_claims(client)) == 1
+    assert len(stamps) == 1 or all(
+        call[0].startswith("INSERT") and "WHERE (SELECT count() FROM" in call[0]
+        for call in client.calls
+        if call[0].startswith("INSERT") and "dmi_schema_version" in call[0]
+    ), "a re-stamp is conditional server-side and writes nothing"
+
+
+def test_a_complete_catalog_is_ensured_without_taking_the_lease():
+    """Routine startup must not fail because an indexer is publishing.
+
+    Serialisation is for installs. Against a complete, stamped catalog the DDL
+    is idempotent and the stamp is a server-side no-op, so there is nothing to
+    serialise -- and taking the lease there would refuse every second process
+    for as long as the indexer holds it.
+    """
+    client = _Client(tables=_CURRENT_OBJECTS, schema_version=_SCHEMA_VERSION)
+
+    _writer(client).ensure_schema()
+
+    assert _lease_claims(client) == []
+    assert _lease_releases(client) == []
+
+
+def test_completing_an_interrupted_install_runs_under_the_lease():
+    client = _Client(tables=("dmi_schema_version", "dmi_capture_raw"), schema_version=None)
+
+    _writer(client).ensure_schema()
+
+    assert len(_lease_claims(client)) == 1
+    assert len(_lease_releases(client)) == 1
+
+
+def test_ensure_schema_renews_a_lease_the_writer_already_holds_and_keeps_it():
+    """A rebuilding writer that acquired first is not locked out of its own install."""
+    client = _Client()
+    writer = _writer(client)
+    held = writer.acquire_publisher_lease("rebuilder")
+
+    writer.ensure_schema()
+
+    assert writer.publisher_lease is not None
+    assert writer.publisher_lease.lease_id == held.lease_id
+    assert _lease_releases(client) == [], "the writer's own lease is not given back"
 
 
 def test_a_fresh_install_rechecks_the_layout_before_it_stamps():

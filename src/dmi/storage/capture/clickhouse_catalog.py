@@ -176,7 +176,9 @@ class ClickHouseCatalogWriter:
         self._leases = ClickHouseLeaseCoordinator(client, self._config)
 
     def ensure_schema(self) -> None:
-        self._schema.ensure()
+        # The writer's own coordinator, so an install is serialised on the
+        # lease this writer may already hold rather than refused by it.
+        self._schema.ensure(self._leases)
 
     def _rebuild_instruction(self) -> str:
         return self._schema.rebuild_instruction()
