@@ -135,30 +135,51 @@ On the Linux reference host (AMD Ryzen Threadripper PRO 5955WX, ClickHouse
 
 | Measurement | Median |
 |---|---:|
-| `argMax` snapshot read | 35.6 ms |
-| `FINAL` read (not a snapshot) | 16.8 ms |
-| `max(index_version)` watermark | 2.3 ms |
 | Page, `limit=100` | 171.7 ms |
 | Page, `limit=1000` | 188.5 ms |
 | Page, `limit=5000` | 256.9 ms |
 | Page 1 vs page 25 at `limit=100` | 176.8 ms vs 173.9 ms |
 
-**This table replaces an earlier one that is not comparable with it** (22.3 /
-12.1 / 1.7 / 21.4 / 78.8 / 145.2 ms, and 21.5 vs 24.4 ms for depth). Those
-numbers came from an Apple Silicon laptop against ClickHouse 26.9.1, and they
-predate `e93a2c8`, which replaced the reader's per-column
-`argMax(<column>, index_version)` with a single `argMax` over a tuple of every
-resolved column ordered on `(index_version, store_id, pack_id)`. The A/B for
-that change alone, on this host: a 100-row page went 140.1 ms -> 171.7 ms,
-**+22.6%**, and +17% to +43% across page sizes, depth and selectivity. The
-per-column form left the winner of a tie undefined, so a pinned selection could
-resolve to a different pack after a background merge; the delta is what fixing
-that cost.
+Page cost is flat with depth -- the property keyset pagination exists to
+provide -- and grows with page size, not position. These rows call the real
+reader (`ClickHouseCaptureCatalog.search`) and are unaffected by what follows.
 
-The two snapshot rows are not alternatives. `FINAL` drops any capture
-re-indexed above the watermark, so the 2.1x gap is what correctness costs, not
-a choice between query shapes. Page cost is flat with depth -- the property
-keyset pagination exists to provide -- and grows with page size, not position.
+**The snapshot-shape rows this table used to carry have been withdrawn.** They
+read 35.6 ms for an "`argMax` snapshot read", 16.8 ms for a "`FINAL` read" and
+2.3 ms for a "`max(index_version)` watermark", and the text drew a 2.1x
+"cost of correctness" from the first two. None of the three measured the
+reader. The script's `measure_snapshot_shapes()` read `max(index_version)` from
+`{prefix}_capture_raw` rather than from `{prefix}_index_watermark`, so the
+"watermark" row timed a descriptor-table aggregate; it used two separate
+per-column `argMax` expressions where the reader resolves one `argMax` over a
+tuple of every column ordered on `(index_version, store_id, pack_id)`; it
+carried no manifest membership, which is half of what a pinned read pays for;
+and it pinned at the raw maximum, so the historical case -- a pin below a later
+publish that re-indexed a capture -- never arose. Those numbers established a
+ratio between two queries neither of which the catalog issues.
+
+The script now times the reader's own statement, captured as issued and re-run
+with the LIMIT raised to the whole corpus, at the published head and at a
+historical pin below a version that re-indexed one capture into a new pack;
+against it, the public `{prefix}_capture` view, which is `FINAL` plus unbounded
+membership over the same rows and is not a snapshot; and the reader's
+`current_watermark()`, which reads the watermark log. The row counts come out
+with the timings and are the proof the shapes differ: the pinned reads resolve
+one row per capture, the view one per (capture, pack). **The corresponding
+numbers have not yet been re-measured on the reference host**; until they are,
+this document makes no claim about what a pinned read costs relative to
+`FINAL`. The earlier Apple Silicon / ClickHouse 26.9.1 table (22.3 / 12.1 / 1.7
+/ 21.4 / 78.8 / 145.2 ms, and 21.5 vs 24.4 ms for depth) is likewise withdrawn
+for the same reason, and additionally predates `e93a2c8`.
+
+What is still measured, and stands: the A/B for `e93a2c8`, which replaced the
+reader's per-column `argMax(<column>, index_version)` with a single `argMax`
+over a tuple of every resolved column ordered on `(index_version, store_id,
+pack_id)`. On this host a 100-row page went 140.1 ms -> 171.7 ms, **+22.6%**,
+and +17% to +43% across page sizes, depth and selectivity. The per-column form
+left the winner of a tie undefined, so a pinned selection could resolve to a
+different pack after a background merge; the delta is what fixing that cost.
+Both sides of that A/B were the real reader.
 
 Core summaries run at roughly 80–140 M elements/s depending on dtype
 (`int64` fastest, `bfloat16` slowest because of the widening shift). As with

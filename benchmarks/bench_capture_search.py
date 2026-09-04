@@ -1,8 +1,18 @@
 """Measure bounded catalog search: snapshot cost, page latency, summary throughput.
 
-The headline number is the argMax snapshot read against a plain FINAL read.
-Phase 6 has to decide whether the public views keep FINAL, and that decision
-needs a measured cost rather than an assumption.
+The headline number is the PRODUCTION pinned read -- the statement
+`ClickHouseCaptureCatalog.search` actually issues, with the real watermark and
+manifest membership -- against the public `{prefix}_capture` view, which is a
+plain `FINAL` over the same rows and is not a snapshot. Phase 6 has to decide
+whether the public views keep FINAL, and that decision needs a measured cost
+rather than an assumption.
+
+An earlier version of this file measured something else and reported it under
+this name: `max(index_version)` over the DESCRIPTOR table rather than the
+watermark log, separate per-column `argMax` expressions rather than the
+reader's single tuple ordering, no manifest membership at all, and a pin at the
+raw maximum so the historical case never arose. Its numbers did not describe
+the reader. Everything here now goes through the reader's own statement.
 """
 
 from __future__ import annotations
@@ -38,38 +48,80 @@ def _timed(call, *, trials: int) -> dict:
     }
 
 
-def measure_snapshot_shapes(client, database: str, prefix: str, *, trials: int) -> dict:
-    """argMax at a watermark against FINAL, on identical data.
+class _RecordingClient:
+    """Pass every statement through, remembering the last descriptor read.
 
-    These are not interchangeable -- FINAL silently drops captures re-indexed
-    above the watermark -- so this measures what correctness costs, not which
-    query to prefer.
+    The reader builds its statement inline, so the only way to time exactly
+    that statement -- projection, membership bound, ordering argument and
+    settings -- with a different pin or limit is to capture it as issued.
     """
-    table = f"`{database}`.`{prefix}_capture_raw`"
-    watermark = client.execute(f"SELECT max(index_version) FROM {table}")[0][0]
-    projection = (
-        "capture_id, argMax(payload_offset, index_version), "
-        "argMax(stored_length, index_version)"
-    )
+
+    def __init__(self, client) -> None:
+        self._client = client
+        self.last_search = None
+
+    def execute(self, query, params=None, **kwargs):
+        if query.startswith("SELECT") and "argMax(tuple(" in query:
+            self.last_search = (query, dict(params or {}), dict(kwargs))
+        return self._client.execute(query, params, **kwargs)
+
+
+def measure_snapshot_shapes(
+    client, reader, database: str, prefix: str, *, historical_pin: int, trials: int
+) -> dict:
+    """The production pinned read against a plain FINAL read, on identical rows.
+
+    Three statements are timed, all over the same table:
+
+    * ``production_at_head``: the reader's own statement, pinned at the
+      published head, with the LIMIT raised to cover the whole corpus so it
+      returns as many rows as the FINAL read does.
+    * ``production_at_historical_pin``: the same statement pinned at
+      ``historical_pin``, a version BELOW a later publish that re-indexed a
+      capture into a new pack. The pinned read must exclude that pack; that is
+      the case the design document describes and the one FINAL cannot answer.
+    * ``final_view``: ``SELECT <the same columns> FROM {prefix}_capture``, the
+      public view -- FINAL plus unbounded membership. Not a snapshot: it shows
+      the re-indexed capture twice, once per pack.
+
+    ``watermark_read`` is the reader's `current_watermark()`, i.e. the real
+    watermark log, not an aggregate over the descriptor table.
+    """
+    from dmi.storage.capture.clickhouse_schema import CAPTURE_COLUMNS
+
+    recording = _RecordingClient(client)
+    probe = ClickHouseCaptureCatalog(recording, reader.config)
+    head = int(probe.current_watermark())
+    probe.search(CaptureQuery(limit=1))
+    if recording.last_search is None:
+        raise RuntimeError("the reader issued no descriptor read to record")
+    sql, params, kwargs = recording.last_search
+    settings = kwargs.get("settings")
+    total = client.execute(f"SELECT count() FROM `{database}`.`{prefix}_capture_raw`")[0][0]
+    whole_corpus = {**params, "row_limit": total + 1}
+
+    def production(pin: int):
+        return client.execute(sql, {**whole_corpus, "watermark": pin}, settings=settings)
+
+    columns = ", ".join(f"`{name}`" for name in CAPTURE_COLUMNS[:-1])
+    view = f"`{database}`.`{prefix}_capture`"
+    at_head = _timed(lambda: production(head), trials=trials)
+    at_pin = _timed(lambda: production(historical_pin), trials=trials)
+    final = _timed(lambda: client.execute(f"SELECT {columns} FROM {view}"), trials=trials)
     return {
-        "argmax_at_watermark": _timed(
-            lambda: client.execute(
-                f"SELECT {projection} FROM {table} "
-                f"WHERE index_version <= {watermark} "
-                "GROUP BY tenant_id, experiment_id, run_id, captured_at_ns, capture_id"
-            ),
-            trials=trials,
-        ),
-        "final_no_watermark": _timed(
-            lambda: client.execute(
-                f"SELECT capture_id, payload_offset, stored_length FROM {table} FINAL"
-            ),
-            trials=trials,
-        ),
-        "watermark_aggregate": _timed(
-            lambda: client.execute(f"SELECT max(index_version) FROM {table}"),
-            trials=trials,
-        ),
+        "head": head,
+        "historical_pin": historical_pin,
+        "production_at_head": at_head,
+        "production_at_historical_pin": at_pin,
+        "final_view": final,
+        "watermark_read": _timed(reader.current_watermark, trials=trials),
+        # The row counts are the proof the shapes differ: the pinned reads
+        # resolve one row per capture, the FINAL view one per (capture, pack).
+        "rows": {
+            "production_at_head": at_head["rows"],
+            "production_at_historical_pin": at_pin["rows"],
+            "final_view": final["rows"],
+        },
     }
 
 
@@ -218,12 +270,36 @@ def main(argv=None) -> int:
                 indexed_packs=len(refs),
             )
             writer.commit_packs(refs, index_version=version)
+        # The historical case: one capture re-indexed into a NEW pack at a
+        # later version. A read pinned at `historical_pin` must resolve it to
+        # the old pack; the head resolves it to the new one; FINAL shows both.
+        historical_pin = args.replays
+        new_pack = str(uuid4())
+        moved = replace(
+            descriptors[0],
+            locator=replace(
+                descriptors[0].locator,
+                pack_id=new_pack,
+                object_key=f"packs/{new_pack}.dmi-pack",
+            ),
+        )
+        later = historical_pin + 1
+        writer.write_descriptors([moved], index_version=later)
+        writer.publish_snapshot(
+            index_version=later,
+            refs=[moved.locator.pack_ref],
+            published_at_ns=later,
+            indexed_rows=1,
+            indexed_packs=1,
+        )
+        writer.commit_packs([moved.locator.pack_ref], index_version=later)
 
         result = {
             "rows": args.rows,
             "replays": args.replays,
             "snapshot": measure_snapshot_shapes(
-                client, args.database, prefix, trials=args.trials
+                client, reader, args.database, prefix,
+                historical_pin=historical_pin, trials=args.trials,
             ),
             "pages": measure_page_latency(
                 reader, page_sizes=page_sizes, trials=args.trials
