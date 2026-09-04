@@ -1296,6 +1296,60 @@ def test_ensure_schema_renews_a_lease_the_writer_already_holds_and_keeps_it():
     assert _lease_releases(client) == [], "the writer's own lease is not given back"
 
 
+def test_a_replicated_descriptor_table_with_the_version_argument_is_accepted():
+    """`ReplicatedReplacingMergeTree(path, replica, index_version)` is healthy.
+
+    The engine check compared the parsed name against exactly
+    `ReplacingMergeTree`, so the Replicated and Shared members of the family
+    -- which keep the version argument and collapse duplicates identically --
+    were refused with a rebuild instruction that reproduces the refusal.
+    docs/capture-storage-design.md tells operators they may convert to
+    `Replicated`; and under a `Replicated` database engine or ClickHouse Cloud
+    the server converts this build's OWN `CREATE`, so the pre-stamp recheck
+    refused the catalog it had just created and never stamped it.
+
+    What the check exists for is the version argument, so that is what it
+    compares: the family name may carry a `Replicated`/`Shared` prefix and the
+    replication arguments precede the version column.
+    """
+    replicated = (
+        "ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/x', "
+        "'{replica}', index_version) ORDER BY (tenant_id, experiment_id, "
+        "run_id, captured_at_ns, capture_id, store_id, pack_id) "
+        "SETTINGS index_granularity = 8192"
+    )
+    shared = (
+        "SharedReplacingMergeTree('/x', '{replica}', index_version) "
+        "ORDER BY (store_id, pack_id) SETTINGS index_granularity = 8192"
+    )
+    client = _Client(
+        tables=_CURRENT_OBJECTS,
+        schema_version=_SCHEMA_VERSION,
+        data_rows=1,
+        engine_full={
+            "dmi_capture_raw": replicated,
+            "dmi_pack_inventory_raw": shared,
+        },
+    )
+
+    _writer(client).ensure_schema()  # must not raise
+
+    # And a Replicated table that DROPPED the version argument is still refused.
+    client = _Client(
+        tables=_CURRENT_OBJECTS,
+        schema_version=_SCHEMA_VERSION,
+        data_rows=1,
+        engine_full={
+            "dmi_capture_raw": (
+                "ReplicatedReplacingMergeTree('/x', '{replica}') ORDER BY "
+                "(tenant_id, experiment_id, run_id, captured_at_ns, "
+                "capture_id, store_id, pack_id) SETTINGS index_granularity = 8192"
+            )
+        },
+    )
+    with pytest.raises(CatalogSchemaVersionError, match="index_version"):
+        _writer(client).ensure_schema()
+
 def test_a_fresh_install_rechecks_the_layout_before_it_stamps():
     """The sort-key and engine checks ran only on the STAMPED path.
 

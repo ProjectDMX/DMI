@@ -591,6 +591,34 @@ def _tenant_segment(object_key: str) -> str | None:
     return None
 
 
+_DIGEST_SHAPE = re.compile(r"sha256-[0-9a-f]{64}\Z")
+
+
+def _segment_belongs_to(segment: str, tenant: str) -> bool:
+    """Whether a ``tenant=`` key segment is one this tenant could have written.
+
+    The current encoding, or -- for a tenant whose name begins with the
+    reserved digest prefix -- the literal encoding that preceded the
+    reservation. Before ``key_component`` reserved ``sha256-``, a short name
+    such as ``sha256-team-a`` was written literally, so every existing pack
+    for it sits under ``tenant=sha256-team-a``; comparing only against the
+    new digest form refused all of them, at indexing and at hydration, and the
+    captures already in the catalog became unreadable.
+
+    The one literal NOT grandfathered is a name of digest shape itself,
+    ``sha256-<64 hex>``: that exact shape is the collision the reservation
+    closed, and accepting its literal would reopen the forgery. No legitimate
+    tenant is named after a hex digest.
+    """
+    if segment == key_component(tenant):
+        return True
+    return (
+        tenant.startswith(_DIGEST_PREFIX)
+        and _DIGEST_SHAPE.match(tenant) is None
+        and segment == quote(tenant, safe="-_.=").replace("~", "%7E")
+    )
+
+
 def _reject_a_foreign_tenant(ref: PackRef, records: tuple[_IndexedRecord, ...]) -> None:
     """Bind what a pack CLAIMS to be to where it was actually found.
 
@@ -619,7 +647,7 @@ def _reject_a_foreign_tenant(ref: PackRef, records: tuple[_IndexedRecord, ...]) 
     # this refuses -- every tenant present is still compared, in the order
     # they appear so the refusal names the same one every time.
     for tenant in dict.fromkeys(item.metadata.tenant_id for item in records):
-        if encoded != key_component(tenant):
+        if not _segment_belongs_to(encoded, tenant):
             raise PackIntegrityError(
                 f"pack {ref.pack_id} at {ref.object_key!r} carries a record "
                 f"for tenant {tenant!r}, which is not the tenant that key "

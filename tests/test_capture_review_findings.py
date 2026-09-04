@@ -514,6 +514,56 @@ def test_engine_arguments_are_read_off_the_shape_the_server_renders():
     assert _engine_arguments("View") == ("View", ())
 
 
+def test_a_legacy_pack_for_a_sha256_prefixed_tenant_is_still_readable(
+    tmp_path: Path,
+):
+    """Reserving the digest prefix must not orphan data written before it.
+
+    `main` encoded any short identifier literally, so a tenant named
+    `sha256-team-a` wrote every pack under `tenant=sha256-team-a`. Reserving
+    the prefix makes `key_component` digest that name now -- and the location
+    check compares re-encoded values, so every one of those existing packs
+    failed `_reject_a_foreign_tenant` at indexing AND at hydration
+    (reader.py calls `PackIndex.from_store(...).descriptors()`): captures
+    already in the catalog became unreadable.
+
+    The check now also accepts the pre-reservation literal, but ONLY when the
+    identifier is not itself of the digest shape `sha256-<64 hex>`: that exact
+    shape is the collision the reservation closed, and accepting its literal
+    would reopen the forgery. A realistic legacy name like `sha256-team-a`
+    keeps its data; the pathological one never legitimately existed.
+    """
+    from dmi.storage.capture.pack import key_component
+
+    # Old layout: literal segment, as main wrote it.
+    store, ref = _pack_at(
+        tmp_path,
+        f"v1/tenant=sha256-team-a/date=2026-09-01/session=s/rank=0/{PACK_ID}.dmi-pack",
+        tenant_id="sha256-team-a",
+    )
+    assert PackIndex.from_store(store, ref).descriptors()
+
+    # New layout: the digest segment key_component now produces.
+    store2, ref2 = _pack_at(
+        tmp_path / "new",
+        f"v1/tenant={key_component('sha256-team-a')}/date=2026-09-01/session=s/"
+        f"rank=0/{PACK_ID}.dmi-pack",
+        tenant_id="sha256-team-a",
+    )
+    assert PackIndex.from_store(store2, ref2).descriptors()
+
+    # The forgery stays closed: a literal of digest shape is NOT grandfathered.
+    long_id = "t" * 300
+    literal = "sha256-" + sha256(long_id.encode()).hexdigest()
+    store3, ref3 = _pack_at(
+        tmp_path / "forged",
+        f"v1/tenant={literal}/date=2026-09-01/session=s/rank=0/{PACK_ID}.dmi-pack",
+        tenant_id=literal,
+    )
+    with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+        PackIndex.from_store(store3, ref3).descriptors()
+
+
 def test_the_two_key_component_forms_cannot_collide(tmp_path: Path):
     """The direct and digest forms shared a namespace, so two ids named one key.
 

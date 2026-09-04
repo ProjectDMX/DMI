@@ -103,6 +103,32 @@ def _key_columns(sorting_key: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in sorting_key.split(",") if part.strip())
 
 
+_REPLACING_FAMILY = frozenset({
+    "ReplacingMergeTree",
+    "ReplicatedReplacingMergeTree",
+    "SharedReplacingMergeTree",
+})
+
+
+def _keeps_newest_by_index_version(engine_full: str) -> bool:
+    """Whether a merge on this engine keeps the highest ``index_version``.
+
+    That is the property the check exists for, and it is not "the engine is
+    spelled ReplacingMergeTree(index_version)". The Replicated and Shared
+    members of the family behave identically on merge and carry the same
+    version argument LAST, after their replication arguments -- and a server
+    under a ``Replicated`` database engine, or ClickHouse Cloud, converts this
+    build's own ``CREATE ... ReplacingMergeTree(index_version)`` into one of
+    them. An exact-name comparison therefore refused healthy converted
+    catalogs, and refused the catalog this build had just created, with a
+    rebuild instruction that reproduced the refusal.
+    """
+    name, arguments = _engine_arguments(engine_full)
+    return name in _REPLACING_FAMILY and bool(arguments) and (
+        arguments[-1] == "index_version"
+    )
+
+
 def _engine_arguments(engine_full: str) -> tuple[str, tuple[str, ...]]:
     """`engine_full` split into the engine name and ITS arguments.
 
@@ -546,18 +572,19 @@ pack_id UUID
         wrong = [
             f"`{name}` is {found[name].engine_full}"
             for name in (self.capture_raw, self.pack_raw)
-            if name in found
-            and _engine_arguments(found[name].engine_full)
-            != _engine_arguments(required)
+            if name in found and not _keeps_newest_by_index_version(
+                found[name].engine_full
+            )
         ]
         if not wrong:
             return
         raise CatalogSchemaVersionError(
             f"catalog `{self.database}`.`{self.prefix}_*` {stamp} but "
             + ", ".join(wrong)
-            + f" where this build requires {required}. Without the version "
-            "argument a merge that collapses a duplicate key keeps an "
-            "arbitrary row rather than the newest, so a capture resolves to "
+            + f" where this build requires {required} -- or its Replicated/"
+            "Shared form with index_version as the version column. Without "
+            "the version argument a merge that collapses a duplicate key keeps "
+            "an arbitrary row rather than the newest, so a capture resolves to "
             "whichever pack the merge left. An engine's arguments cannot be "
             "altered in place. " + self.rebuild_instruction()
         )
