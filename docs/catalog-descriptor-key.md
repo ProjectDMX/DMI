@@ -215,10 +215,14 @@ cannot be serialised.
 
 ### What shipped
 
-None of this is reachable with a single indexer: one writer cannot race itself.
-The whole concern is about the multi-indexer future the version allocator was
-built for -- and "single indexer" was an assumption nothing enforced, which is
-what the publisher lease below changes.
+None of this is reachable with a single indexer, provided one writer cannot
+race itself -- and that is now a property the writer enforces rather than an
+assumption: `ClickHouseCatalogWriter` serialises `publish_snapshot`,
+`allocate_version` and every lease operation on one re-entrant lock, and
+refuses those operations from any process other than the one that created it
+(see *One writer racing itself* below). The wider concern is the multi-indexer
+future the version allocator was built for -- and "single indexer" was an
+assumption nothing enforced, which is what the publisher lease below changes.
 
 The marker-gated variant shipped first, with the barrier tightened as far as it
 goes without a contract change:
@@ -518,6 +522,66 @@ reckoning. Safety holds -- only the head publishes, the fence says so, and the
 loser is refused at its next renewal with a message naming the actual holder --
 but "only one publisher holds the lease" is not literally true of the client
 objects, only of the row the fence resolves.
+
+**One writer racing itself.** Found after merge, against a real ClickHouse
+(2026-09-05): the fence identifies a *holder*, not an *operation*. Two
+concurrent `publish_snapshot()` calls on one public `ClickHouseCatalogWriter`
+both renew the same `lease_id`, both pass the fence, and the version barrier
+inside each `INSERT ... SELECT` is evaluated when that statement is admitted,
+not serialised against the other statement -- so both watermark rows land, in
+either order. Observed: an already-pinned watermark grew (`W=36: 35→36`,
+`W=74: 73→74`); in 300 rounds both adjacent watermarks landed every time, and
+57 rounds exposed the higher watermark before the lower one arrived. Nothing
+in the client serialised the two calls, and this document asserted that one
+writer could not race itself with nothing enforcing it.
+
+ClickHouse offers no statement-level serialisation to lean on, so the
+exclusion sits where the shared identity is minted. `ClickHouseCatalogWriter`
+holds one re-entrant lock across `publish_snapshot`, `allocate_version`,
+`ensure_schema`, the lease operations, and every other method that reaches the
+server: one publish is in flight per writer, and therefore per lease, and a
+second caller waits. The lock is wider than the lease because what a writer's
+methods share is one driver client, and clickhouse-driver's `Client` is not
+thread-safe -- its only guard is a flag check that raises
+`PartiallyConsumedQueryError` when it happens to notice an overlap, and takes
+its lock non-blocking without reading the result. A writer shared between
+threads with only its publishes serialised would still let the indexer's
+inventory read, descriptor write or inventory commit on one thread interleave
+packets with a publish in flight on another; `publisher_lease` is the one
+unlocked read, of a Python attribute rather than the server. Allocation shares
+the lock so one attempt's floor read, claim and read-back do not interleave
+with another's; it does not order allocation against publication, and need not
+-- a thread that allocated the lower version and publishes second is refused
+by the barrier as before and re-allocated by the indexer. The writer also
+records its owning PID and refuses every operation that reaches the server from
+another process, because a forked child inherits the parent's `PublisherLease`
+and would publish under the same `lease_id` from an address space no lock
+reaches -- and inherits the parent's socket, on which its packets would
+interleave with the parent's. That check runs before the lock is taken, not
+under it: a fork copies the lock in whatever state it was in, and a child
+forked while another parent thread was mid-publish inherits a lock held by a
+thread it does not have -- a check under the lock would never run, and the
+child would hang instead of being refused; reproduced with the fake client and
+pinned by
+`test_a_forked_child_is_refused_even_when_the_parent_holds_the_lock`. The
+contract this states: **a writer, its connection and its lease belong to one
+process, and the writer may be shared between threads of that process.** A
+per-operation token carried through renew and fence was considered and not
+taken: it turns the race into a fence-out for one side but leaves the in-flight
+window -- a statement that evaluated its fence before the other operation's
+renewal still lands afterwards -- so it adds complexity without adding
+exclusion the lock does not already give.
+
+Regression: `test_two_concurrent_publishes_on_one_writer_are_serialised`
+asserts that while one publisher is inside a fenced statement, a second
+publisher on the same writer issues nothing, not even its lease renewal; the
+fake cannot model the server-side overlap itself, so the test pins the
+writer's half of the argument.
+`test_every_client_operation_waits_behind_a_publish_in_flight` does the same
+for the indexer's neighbours of a publish -- inventory read, head read,
+descriptor write, inventory commit, collection -- on a second thread. The live
+reproduction (two threads, one writer, adjacent versions, 300 rounds) is the
+check that closes it on a real server.
 
 **A crash between a claim and its read-back** leaves a claim row nobody uses.
 It looks like a live lease until it expires, so the next publisher waits out one

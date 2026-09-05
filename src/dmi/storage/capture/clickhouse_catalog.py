@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import secrets
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from time import sleep as _sleep, time_ns
@@ -9,6 +11,7 @@ from uuid import uuid4
 from .catalog import (
     CatalogVersionAllocationError,
     PackIdentity,
+    PublisherLeaseError,
     SnapshotPublishConflictError,
     SnapshotPublishRaceError,
 )
@@ -189,19 +192,77 @@ class ClickHouseCatalogWriter:
         self._objects = self._schema.objects
         self._legacy_objects = self._schema.legacy_objects
         self._leases = ClickHouseLeaseCoordinator(client, self._config)
+        # One publish in flight per writer, and so per lease. The server-side
+        # fence identifies a HOLDER, not an operation: two publishes issued
+        # under one ``lease_id`` both renew it, both pass the fence, and the
+        # version barrier inside each INSERT ... SELECT is evaluated when that
+        # statement is admitted rather than serialised against the other, so
+        # both watermark rows land -- in either order. A reader pinned at the
+        # higher one then watches the lower version's membership arrive
+        # underneath it. Reproduced against ClickHouse 25.12 with two threads
+        # on one writer: 300 of 300 rounds landed both adjacent watermarks,
+        # 57 exposed the higher before the lower. ClickHouse offers nothing to
+        # serialise the two statements, so the exclusion has to sit where the
+        # shared identity is minted: here, in the process that owns the lease.
+        # Re-entrant, because ``publish_snapshot`` renews the lease and
+        # ``ensure_schema`` acquires it, both under the same lock.
+        #
+        # Every operation that reaches the client takes it, not only the
+        # lease-bearing ones. The writer is documented as shareable between
+        # the threads of its process, and the one thing all of its methods
+        # share is ``self._client``: clickhouse-driver's ``Client`` is not
+        # thread-safe -- its only guard is ``check_query_execution``, a flag
+        # test that raises ``PartiallyConsumedQueryError`` when it notices an
+        # overlap and takes its lock non-blocking without checking the result.
+        # So an unlocked ``committed_pack_ids`` or ``commit_packs`` from a
+        # second thread would interleave its packets with a publish in flight
+        # on the same connection. ``publisher_lease`` is the one unlocked
+        # read, and it reads a Python attribute rather than the server.
+        self._serial = threading.RLock()
+        # The lease belongs to THIS process. A forked child inherits
+        # ``self._leases.lease`` byte for byte, and its publishes would share
+        # the parent's ``lease_id`` across two address spaces that no lock can
+        # reach -- the same race, with no way to observe it from either side.
+        self._owner_pid = os.getpid()
+
+    def _owned_by_this_process(self) -> None:
+        # Checked BEFORE ``_serial`` is taken, never inside it. A fork copies
+        # the lock in whatever state it was in, and a fork taken while another
+        # thread of the parent was mid-publish hands the child a lock held by
+        # a thread that does not exist in the child: a check under the lock
+        # would never run, and the child would hang on the inherited lock
+        # forever instead of being refused. Reproduced with the fake client:
+        # holder thread parked inside a fenced statement, fork, child publish
+        # -- the child never returned.
+        if os.getpid() == self._owner_pid:
+            return
+        raise PublisherLeaseError(
+            f"this ClickHouseCatalogWriter was created in process "
+            f"{self._owner_pid} and is being used from process {os.getpid()}. "
+            "A writer, its connection and the publisher lease it holds belong "
+            "to one process: a forked copy would publish under the same "
+            "lease_id as its parent, and two publishes under one lease are not "
+            "excluded by the fence; it would also write to the same socket the "
+            "parent is using. Create a writer, and acquire a lease, in the "
+            "process that publishes."
+        )
 
     def ensure_schema(self, *, sleep: Callable[[float], None] = _sleep) -> None:
         # The writer's own coordinator, so an install is serialised on the
         # lease this writer may already hold rather than refused by it.
         # ``sleep`` is the wait between install-lease attempts, a parameter
         # only so a test can drive it.
-        self._schema.ensure(self._leases, sleep=sleep)
+        self._owned_by_this_process()
+        with self._serial:
+            self._schema.ensure(self._leases, sleep=sleep)
 
     def _rebuild_instruction(self) -> str:
         return self._schema.rebuild_instruction()
 
     def drop_schema(self) -> None:
-        self._schema.drop()
+        self._owned_by_this_process()
+        with self._serial:
+            self._schema.drop()
 
     def committed_pack_ids(
         self, identities: Sequence[PackIdentity]
@@ -210,6 +271,13 @@ class ClickHouseCatalogWriter:
             return set()
         if len(identities) > self._config.query_pack_limit:
             raise ValueError("pack identity query exceeds query_pack_limit")
+        self._owned_by_this_process()
+        with self._serial:
+            return self._committed_pack_ids_serialised(identities)
+
+    def _committed_pack_ids_serialised(
+        self, identities: Sequence[PackIdentity]
+    ) -> set[PackIdentity]:
         table = self._qualified(self._pack_view)
         committed: set[PackIdentity] = set()
         # Chunked: the identities land in the statement TEXT, and an unchunked
@@ -238,12 +306,14 @@ class ClickHouseCatalogWriter:
             return
         self._validate_version(index_version)
         rows = [self._descriptor_row(item, index_version) for item in descriptors]
-        self._client.execute(
-            f"INSERT INTO {self._qualified(self._capture_raw)} "
-            f"({', '.join(CAPTURE_COLUMNS)}) VALUES",
-            rows,
-            settings=self._quorum_write() or None,
-        )
+        self._owned_by_this_process()
+        with self._serial:
+            self._client.execute(
+                f"INSERT INTO {self._qualified(self._capture_raw)} "
+                f"({', '.join(CAPTURE_COLUMNS)}) VALUES",
+                rows,
+                settings=self._quorum_write() or None,
+            )
 
     def publish_snapshot(
         self,
@@ -255,6 +325,10 @@ class ClickHouseCatalogWriter:
         indexed_packs: int,
     ) -> None:
         """Make a version readable, after everything it covers is durable.
+
+        Serialised per writer: one publish is in flight under this writer's
+        lease at a time, and a second caller waits for it. See ``_serial`` in
+        the constructor for why the fence alone does not give this.
 
         Membership rows first, then the watermark row that admits them. A
         reader's membership clause requires both, so the order is what makes a
@@ -305,6 +379,25 @@ class ClickHouseCatalogWriter:
         this module's taxonomy should treat a driver exception from a publish
         as "outcome unknown: re-acquire and re-index".
         """
+        self._owned_by_this_process()
+        with self._serial:
+            self._publish_snapshot_serialised(
+                index_version=index_version,
+                refs=refs,
+                published_at_ns=published_at_ns,
+                indexed_rows=indexed_rows,
+                indexed_packs=indexed_packs,
+            )
+
+    def _publish_snapshot_serialised(
+        self,
+        *,
+        index_version: int,
+        refs: Sequence[PackRef],
+        published_at_ns: int,
+        indexed_rows: int,
+        indexed_packs: int,
+    ) -> None:
         self._validate_version(index_version)
         self._validate_version(published_at_ns)
         # Interpolated into the statement TEXT like the version is, so they get
@@ -505,13 +598,19 @@ class ClickHouseCatalogWriter:
         return self._leases.lease
 
     def acquire_publisher_lease(self, holder: str) -> PublisherLease:
-        return self._leases.acquire(holder)
+        self._owned_by_this_process()
+        with self._serial:
+            return self._leases.acquire(holder)
 
     def renew_publisher_lease(self) -> PublisherLease:
-        return self._leases.renew()
+        self._owned_by_this_process()
+        with self._serial:
+            return self._leases.renew()
 
     def release_publisher_lease(self) -> None:
-        self._leases.release()
+        self._owned_by_this_process()
+        with self._serial:
+            self._leases.release()
 
     def _manifest_chunk_published(
         self,
@@ -593,6 +692,13 @@ class ClickHouseCatalogWriter:
         ``sleep`` is the settling wait the manifest bound needs; it is a
         parameter only so a test can drive it.
         """
+        self._owned_by_this_process()
+        with self._serial:
+            return self._collect_garbage_serialised(sleep)
+
+    def _collect_garbage_serialised(
+        self, sleep: Callable[[float], None]
+    ) -> dict[str, int]:
         removed: dict[str, int] = {}
         published = self.last_published_version()
         head = self._leases.head()
@@ -742,11 +848,13 @@ class ClickHouseCatalogWriter:
 
     def last_published_version(self) -> int:
         """Highest published index_version, or 0 when nothing is published."""
-        return self._max_version(
-            self._watermark,
-            "index_version",
-            "watermark table returned an invalid version",
-        )
+        self._owned_by_this_process()
+        with self._serial:
+            return self._max_version(
+                self._watermark,
+                "index_version",
+                "watermark table returned an invalid version",
+            )
 
     def allocate_version(self) -> int:
         """Allocate the next catalog version: strictly monotonic and unique.
@@ -764,7 +872,21 @@ class ClickHouseCatalogWriter:
         RETURNED version is durably in the claims table, so later allocations
         always start above it: monotonic + unique, with no clock anywhere in
         the ordering. ``claimed_at_ns`` is diagnostic only.
+
+        Serialised on the writer's lock, so two threads sharing a writer do
+        not interleave the floor read, the claim and the read-back of one
+        attempt with another's. This does not order allocation against
+        publication -- a thread may allocate the lower version and publish
+        second -- and does not need to: the barrier inside the watermark
+        statement refuses a version that is not above the published head, and
+        the indexer re-allocates. What the lock removes is the case the fence
+        cannot see, two publishes in flight at once under one lease.
         """
+        self._owned_by_this_process()
+        with self._serial:
+            return self._allocate_version_serialised()
+
+    def _allocate_version_serialised(self) -> int:
         attempts = self._config.allocation_attempts
         for attempt in range(attempts):
             claimed = self._max_version(
@@ -834,11 +956,13 @@ class ClickHouseCatalogWriter:
         # successful publish, so a crash in between leaves a pack that is
         # visible but not yet skippable -- redundant work next pass, never the
         # reverse.
-        self._client.execute(
-            f"INSERT INTO {self._qualified(self._pack_raw)} "
-            f"({', '.join(PACK_COLUMNS)}) VALUES",
-            rows,
-        )
+        self._owned_by_this_process()
+        with self._serial:
+            self._client.execute(
+                f"INSERT INTO {self._qualified(self._pack_raw)} "
+                f"({', '.join(PACK_COLUMNS)}) VALUES",
+                rows,
+            )
 
     def _qualified(self, table: str) -> str:
         return f"{quoted(self._config.database)}.{quoted(table)}"
