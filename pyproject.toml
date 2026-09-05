@@ -11,6 +11,17 @@ dynamic = ["dependencies"]
 
 [project.optional-dependencies]
 s3 = ["boto3>=1.40,<2"]
+# DMI-configurator. A normal DMI install does not pull in a web framework.
+# JSON only -- the browser reads files itself and posts their contents, so
+# there is no multipart/form-data surface to support. httpx (used by
+# fastapi.testclient) is already a core runtime dependency.
+ui = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+dmi = "dmi.cli:main"
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
@@ -18,6 +29,10 @@ dependencies = { file = ["requirements.txt"] }
 [tool.setuptools]
 include-package-data = true
 package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+# DMI-configurator's browser assets ship with the package; there is no build step.
+"dmi.ui" = ["static/*"]
 
 [tool.setuptools.packages.find]
 # Runtime code has one canonical namespace. Native sources and external

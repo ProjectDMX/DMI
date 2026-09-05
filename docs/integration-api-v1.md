@@ -866,6 +866,46 @@ specs must already correspond to layers owned by the local PP stage.
 The TP function keeps all hooks on rank 0 and only TP-sharded hooks on nonzero
 ranks. Neither function validates rank bounds or mutates the spec.
 
+### `filter_by_layers` and `hook_belongs_to_layers`
+
+```python
+filter_by_layers(
+    hook_points: Sequence[HookPoint],
+    start: int,
+    end: int,
+) -> None
+
+hook_belongs_to_layers(spec: HookSpec, start: int, end: int) -> bool
+```
+
+An inclusive layer range restricting per-layer specs and HookPoints, as
+forwarded by DMI-configurator's `attach_config`. `filter_by_layers` drops and
+disables out-of-range per-layer HookPoints in place (it owns the enabled flag
+for the range, like `apply_hook_selection` owns it for selection).
+`hook_belongs_to_layers` is the pure predicate: global hooks (`layer_no < 0`)
+always belong, per-layer hooks must fall inside `start..end` inclusive.
+Neither validates that the range exists in the model; layer bounds are the
+caller's responsibility. `compile_config` does check: a range that removes
+every spec of a selected hook raises `ConfigValidationError` naming the live
+layer span, so a stale descriptor cannot compile to a silently empty capture.
+
+`attach_config` is the single runtime-apply path, and it applies the whole
+configuration: it installs the `CaptureSchedule` on `adapter.engine.config`
+(where `_schedule_allows` reads it) and then attaches hooks with the layer
+range. It also records the owning adapter on the model, and an entry point
+that would build its own adapter over an attached model -- notably
+`generate_with_monitoring` -- refuses instead of re-owning it.
+
+### `LayerSelection`
+
+```python
+LayerSelection(start: int, end: int)
+```
+
+An inclusive range of layer indices (`LayerSelection(8, 15)` selects eight
+layers). End is inclusive so a UI label like "Layers 8-15" does not lie.
+Carries `contains(layer_no)` and `count`.
+
 `ALL_HOOK_TYPES` is the frozen set of all native hook IDs.
 `ATTENTION_WEIGHT_HOOK_TYPES` is the frozen subset containing only attention
 scores and attention patterns; it is not every hook in the attention group.

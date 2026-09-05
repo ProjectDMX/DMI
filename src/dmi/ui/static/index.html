@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DMI-configurator</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <h1>DMI-configurator</h1>
+    <p class="subtitle" id="model-summary">Loading model&hellip;</p>
+  </div>
+  <div class="topbar-actions">
+    <span class="status" id="status" data-state="pending">Checking&hellip;</span>
+    <button type="button" id="btn-open" class="btn">Open</button>
+    <button type="button" id="btn-save" class="btn">Save</button>
+    <button type="button" id="btn-copy" class="btn btn-primary">Copy YAML</button>
+    <input type="file" id="file-input" accept=".yaml,.yml" hidden>
+  </div>
+</header>
+
+<main class="layout">
+
+  <section class="panel architecture" aria-label="Model architecture">
+    <h2 class="panel-title">Model architecture</h2>
+    <div class="architecture-canvas" id="architecture"></div>
+  </section>
+
+  <section class="panel detail" aria-label="Selected component">
+    <h2 class="panel-title" id="detail-title">Selected component</h2>
+    <div id="detail-body" class="detail-body">
+      <p class="hint">Select a block in the architecture to choose observations.</p>
+    </div>
+
+    <div class="layers">
+      <h3 class="section-title">Layers</h3>
+      <div class="layer-controls">
+        <label>From <input type="number" id="layer-start" min="0" step="1"></label>
+        <label>To <input type="number" id="layer-end" min="0" step="1"></label>
+      </div>
+      <div class="layer-rail" id="layer-rail" role="img" aria-label="Selected layer range"></div>
+      <p class="layer-readout" id="layer-readout">All layers</p>
+      <div class="chip-row">
+        <button type="button" class="chip" data-layers="all">All</button>
+        <button type="button" class="chip" data-layers="first">First</button>
+        <button type="button" class="chip" data-layers="middle">Middle</button>
+        <button type="button" class="chip" data-layers="last">Last</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel capture" aria-label="Capture schedule">
+    <h2 class="panel-title">Capture</h2>
+    <div class="field-row">
+      <label>Every <input type="number" id="step-stride" min="1" step="1" value="1"> steps</label>
+      <label>Every <input type="number" id="request-stride" min="1" step="1" value="1"> requests</label>
+    </div>
+    <div class="field-row">
+      <label class="check"><input type="checkbox" id="capture-prefill" checked> Prefill</label>
+      <label class="check"><input type="checkbox" id="capture-decode" checked> Decode</label>
+    </div>
+
+    <details class="advanced">
+      <summary>Advanced scheduling</summary>
+      <div class="field-grid">
+        <label>Step offset <input type="number" id="step-offset" min="0" step="1" value="0"></label>
+        <label>Warmup steps <input type="number" id="warmup-steps" min="0" step="1" value="0"></label>
+        <label>Request offset <input type="number" id="request-offset" min="0" step="1" value="0"></label>
+        <label>Warmup requests <input type="number" id="warmup-requests" min="0" step="1" value="0"></label>
+      </div>
+    </details>
+
+    <p class="notice">
+      Strides, offsets, warmup and the prefill/decode toggles are enforced at
+      capture time: the adapter driver consults the schedule before every step,
+      and the estimate below applies the same arithmetic.
+    </p>
+
+    <h2 class="panel-title spaced">System objective</h2>
+    <div class="policy" id="policy">
+      <label class="radio">
+        <input type="radio" name="policy" value="completeness">
+        <span><strong>Completeness</strong><em>Prefer preserving requested observations.</em></span>
+      </label>
+      <label class="radio">
+        <input type="radio" name="policy" value="balanced" checked>
+        <span><strong>Balanced</strong><em>Balance observation delivery and inference performance.</em></span>
+      </label>
+      <label class="radio">
+        <input type="radio" name="policy" value="performance">
+        <span><strong>Performance</strong><em>Prefer inference performance.</em></span>
+      </label>
+    </div>
+    <p class="notice">
+      Recorded in the configuration file, but not yet connected to runtime
+      behaviour. Selecting an objective does not change what DMI captures.
+    </p>
+  </section>
+
+  <section class="panel estimate" aria-label="Estimated payload">
+    <div class="output-head">
+      <h2 class="panel-title">Estimated payload</h2>
+      <span class="est-rank" id="est-rank"></span>
+    </div>
+
+    <div class="workload">
+      <div class="field-grid">
+        <label>Batch size <input type="number" id="wl-batch" min="1" step="1" value="8"></label>
+        <label>Prompt tokens <input type="number" id="wl-prompt" min="1" step="1" value="2048"></label>
+        <label>Decode tokens <input type="number" id="wl-decode" min="0" step="1" value="256"></label>
+        <label>Decode rate <input type="number" id="wl-rate" min="0" step="any" value="0"> steps/s</label>
+        <label>Tensor parallel <input type="number" id="wl-tp" min="1" step="1" value="1"></label>
+        <label>Pipeline parallel <input type="number" id="wl-pp" min="1" step="1" value="1"></label>
+        <label>Activation dtype
+          <select id="wl-dtype">
+            <option value="float16" selected>float16</option>
+            <option value="bfloat16">bfloat16</option>
+            <option value="float32">float32</option>
+            <option value="float8_e4m3fn">float8_e4m3fn</option>
+          </select>
+        </label>
+        <label>Tensor layout
+          <select id="wl-packed">
+            <option value="packed" selected>Packed (vLLM)</option>
+            <option value="batched">Batched (HF generate)</option>
+          </select>
+        </label>
+      </div>
+      <p class="hint">
+        Describes the traffic capture rides along with, not the capture itself.
+        Not written to the configuration file.
+      </p>
+    </div>
+
+    <dl class="figures" id="figures">
+      <div class="figure is-peak">
+        <dt>Peak step</dt>
+        <dd id="fig-peak">&mdash;</dd>
+        <span class="figure-note">Sets ring sizing</span>
+      </div>
+      <div class="figure">
+        <dt>Decode step</dt>
+        <dd id="fig-decode">&mdash;</dd>
+        <span class="figure-note">Per captured step</span>
+      </div>
+      <div class="figure">
+        <dt>Per request</dt>
+        <dd id="fig-request">&mdash;</dd>
+        <span class="figure-note">Schedule applied</span>
+      </div>
+      <div class="figure">
+        <dt>Sustained</dt>
+        <dd id="fig-sustained">&mdash;</dd>
+        <span class="figure-note">Decode only</span>
+      </div>
+      <div class="figure">
+        <dt>Per day</dt>
+        <dd id="fig-day">&mdash;</dd>
+        <span class="figure-note">At that rate</span>
+      </div>
+    </dl>
+
+    <div class="ring">
+      <div class="ring-head">
+        <h3 class="section-title">Ring capacity</h3>
+        <div class="ring-inputs">
+          <label>Payload <input type="number" id="ring-payload" min="1" step="1" value="4096"> MiB</label>
+          <label>Pinned <input type="number" id="ring-pinned" min="0" step="1" value="4096"> MiB</label>
+        </div>
+      </div>
+      <div class="meter" id="ring-meter" role="img" aria-label="Ring occupancy">
+        <span class="meter-fill" id="ring-fill"></span>
+      </div>
+      <p class="ring-detail" id="ring-detail">&mdash;</p>
+    </div>
+
+    <details class="advanced" id="est-ranks-wrap" hidden>
+      <summary>Per-rank load</summary>
+      <div class="table-scroll">
+        <table class="ranks">
+          <thead>
+            <tr>
+              <th scope="col">Rank</th>
+              <th scope="col">Prefill step</th>
+              <th scope="col">Decode step</th>
+              <th scope="col">Hooks</th>
+            </tr>
+          </thead>
+          <tbody id="est-ranks"></tbody>
+        </table>
+      </div>
+    </details>
+
+    <div class="est-notes" id="est-notes"></div>
+  </section>
+
+  <section class="panel output" aria-label="Configuration output">
+    <div class="output-head">
+      <h2 class="panel-title">Configuration</h2>
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab is-active" data-tab="yaml" role="tab">YAML</button>
+        <button type="button" class="tab" data-tab="issues" role="tab">Issues <span class="badge" id="issue-count">0</span></button>
+      </div>
+    </div>
+    <pre class="yaml-preview" id="yaml-preview" data-tab-panel="yaml" role="tabpanel" aria-label="YAML preview"></pre>
+    <div class="issues" id="issues" data-tab-panel="issues" role="tabpanel" aria-label="Validation issues" hidden></div>
+  </section>
+
+</main>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/static/architecture.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

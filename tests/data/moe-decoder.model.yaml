@@ -1,0 +1,22 @@
+# Synthetic MoE decoder descriptor.
+#
+# Deliberately not a real model: it exists so the MoE observations (router
+# logits, expert IDs, expert weights) have something to be available against.
+# Real descriptors come from `dmi describe-model`.
+schema_version: 1
+
+model:
+  id: moe-decoder
+  name: Synthetic MoE Decoder
+  architecture: decoder_transformer
+
+topology:
+  num_layers: 48
+  hidden_size: 2048
+  num_attention_heads: 32
+  num_kv_heads: 4
+  intermediate_size: 768
+  num_experts: 128
+  top_k: 8
+  head_dim: 128
+  vocab_size: 151936

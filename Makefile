@@ -1,8 +1,12 @@
 PYTHON ?= python
 
-.PHONY: all native host clean check check-compile test test-all test-cpu test-host test-package
+.PHONY: all native host clean check check-compile test test-all test-cpu test-host test-package ui
 
 NATIVE_DIR ?= $(CURDIR)/native
+
+# DMI-configurator. Runs straight from the checkout -- no install needed.
+# Point it somewhere else with: make ui MODEL=./my-model
+MODEL ?= examples/model_descriptors/llama3-8b.yaml
 
 all: native
 
@@ -14,6 +18,9 @@ host:
 
 clean:
 	$(MAKE) -C $(NATIVE_DIR) clean
+
+ui:
+	PYTHONPATH=$(CURDIR)/src $(PYTHON) -m dmi.cli ui $(MODEL)
 
 test: test-cpu
 

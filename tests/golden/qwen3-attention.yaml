@@ -1,0 +1,19 @@
+version: 1
+observations:
+  layers:
+    start: 8
+    end: 15
+  hooks:
+  - resid_pre
+  - pattern
+  - q
+  - k
+  - v
+  - mlp_out
+schedule:
+  step_stride: 4
+  request_stride: 1
+  capture_prefill: true
+  capture_decode: true
+policy:
+  objective: balanced

@@ -205,6 +205,25 @@ def _generate_with_monitoring_impl(
             "generate_with_monitoring() requires model.monitoring_engine to "
             "be set to a MonitoringEngine instance."
         )
+    # One owner per model. This helper builds its OWN adapter and reconfigures
+    # the shared transport (model cfg, active specs, every HookPoint's enabled
+    # flag), and its `finally` detaches. Run on a model somebody else already
+    # attached -- dmi.configuration.attach_config, or a bare
+    # adapter.attach_model -- and the forward ends up with one caller's
+    # reservation and this call's producers, then loses the first attachment
+    # entirely. Refuse instead of silently re-owning it.
+    _owner = getattr(target, "_dmi_active_adapter", None)
+    if _owner is not None:
+        raise RuntimeError(
+            "generate_with_monitoring() was called on a model that is already "
+            f"attached by {type(_owner).__name__}. This entry point installs "
+            "its own hooks and replaces the transport's selection, which "
+            "would desynchronize the ring against the existing reservation. "
+            "Either drive generation through the existing attachment "
+            "(model.generate(...) directly -- the installed hooks already "
+            "capture), or detach it first "
+            "(adapter.detach_model(model)) and let this call own the model."
+        )
     if engine._ring_transport is None:
         raise RuntimeError(
             "generate_with_monitoring() found model.monitoring_engine, but "
@@ -286,7 +305,23 @@ def _generate_with_monitoring_impl(
 
             decode_bytes = adaptor.decode_step_bytes(batch, kv_dim_estimate)
 
-            if decode_bytes > effective_cap:
+            # The capture-schedule gate is a PYTHON branch in HookPoint.forward.
+            # Under torch.compile + CUDA graphs, replay never runs Python: the
+            # flag is baked at the first decode trace, so a refusal (or a
+            # capture) at step one would apply to EVERY later step. The
+            # capacity path below has the same problem and already disables
+            # compilation; a non-default schedule takes the same fail-safe.
+            schedule = getattr(
+                getattr(getattr(adaptor.engine, "config", None), "schedule", None),
+                "__dataclass_fields__",
+                None,
+            )
+            non_default_schedule = schedule is not None and (
+                adaptor.engine.config.schedule
+                != __import__("dmi.config", fromlist=["CaptureSchedule"]).CaptureSchedule()
+            )
+
+            if decode_bytes > effective_cap or non_default_schedule:
                 # Decode steps will overflow.  Force eager dispatch so
                 # before_forward's per-batch capacity check + HookPoint's
                 # safety net (ring D2D where it fits, submit_cpu_direct
@@ -296,11 +331,20 @@ def _generate_with_monitoring_impl(
                     or kwargs.pop("cache_implementation", None) is not None
                 )
                 kwargs["disable_compile"] = True
-                msg = (
-                    f"[ring_transport] Decode step ({decode_bytes / 1e6:.1f} MB) "
-                    f"exceeds ring capacity ({effective_cap / 1e6:.0f} MB). "
-                    f"Using eager dispatch + per-hook safety net."
-                )
+                if decode_bytes > effective_cap:
+                    msg = (
+                        f"[ring_transport] Decode step ({decode_bytes / 1e6:.1f} MB) "
+                        f"exceeds ring capacity ({effective_cap / 1e6:.0f} MB). "
+                        f"Using eager dispatch + per-hook safety net."
+                    )
+                else:
+                    msg = (
+                        "[ring_transport] The capture schedule is not the "
+                        "default (phase flags / strides / warmup). The gate is "
+                        "a Python branch that CUDA-graph replay would bake at "
+                        "the first decode trace, so compilation is disabled "
+                        "for this generate() call."
+                    )
                 if had_compile:
                     msg += " Disabled CUDA graph compilation for this generate() call."
                 warnings.warn(msg, stacklevel=2)
@@ -480,6 +524,18 @@ def generate_greedy_with_monitoring(
 
     adaptor: Optional[HuggingFaceAdapter] = None
     if monitoring:
+        # One owner, as in generate_with_monitoring: this loop builds its own
+        # adapter and detaches on the way out, so running it over somebody
+        # else's attachment would reconfigure the shared transport and then
+        # take their hooks down with it.
+        _owner = getattr(model, "_dmi_active_adapter", None)
+        if _owner is not None:
+            raise RuntimeError(
+                "generate_greedy_with_monitoring() was called on a model that "
+                f"is already attached by {type(_owner).__name__}. Detach it "
+                "first (adapter.detach_model(model)), or run the loop with "
+                "monitoring=False and let the existing attachment capture."
+            )
         engine = getattr(model, "monitoring_engine", None)
         if engine is not None and engine._ring_transport is not None:
             adaptor = HuggingFaceAdapter(

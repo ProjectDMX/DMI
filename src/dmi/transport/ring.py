@@ -226,6 +226,15 @@ class RingTransport:
         # wrappers and HookPoint.forward read only.
         self.force_eager: bool = False
 
+        # When False, the capture schedule refused the CURRENT step and
+        # HookPoint.forward must not dispatch a producer: the driver skipped
+        # plan/commit, so nothing reserved ring space and no meta was pushed
+        # -- an unrefused producer here would write unreserved bytes and
+        # desync the task/meta FIFO. Owned by adaptor_base.before_forward,
+        # re-set every step it drives; HookPoint.forward reads only. Steps
+        # committed directly (bypassing before_forward) never see False.
+        self.capture_step: bool = True
+
         # New-path state
         self._model_cfg: Optional[ModelShapeConfig] = None
         self._active_specs: List[HookSpec] = []
