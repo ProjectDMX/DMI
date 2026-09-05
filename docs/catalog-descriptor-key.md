@@ -546,14 +546,20 @@ thread that allocated the lower version and publishes second is refused by the
 barrier as before and re-allocated by the indexer. The writer also records its
 owning PID and refuses every lease-bearing operation from another process,
 because a forked child inherits the parent's `PublisherLease` and would publish
-under the same `lease_id` from an address space no lock reaches. The contract
-this states: **a writer and its lease belong to one process, and the writer
-may be shared between threads of that process.** A per-operation token carried
-through renew and fence was considered and not taken: it turns the race into a
-fence-out for one side but leaves the in-flight window -- a statement that
-evaluated its fence before the other operation's renewal still lands afterwards
--- so it adds complexity without adding exclusion the lock does not already
-give.
+under the same `lease_id` from an address space no lock reaches. That check
+runs before the lock is taken, not under it: a fork copies the lock in whatever
+state it was in, and a child forked while another parent thread was mid-publish
+inherits a lock held by a thread it does not have -- a check under the lock
+would never run, and the child would hang instead of being refused; reproduced
+with the fake client and pinned by
+`test_a_forked_child_is_refused_even_when_the_parent_holds_the_lock`.
+The contract this states: **a writer and its lease belong to one
+process, and the writer may be shared between threads of that process.** A
+per-operation token carried through renew and fence was considered and not
+taken: it turns the race into a fence-out for one side but leaves the in-flight
+window -- a statement that evaluated its fence before the other operation's
+renewal still lands afterwards -- so it adds complexity without adding
+exclusion the lock does not already give.
 
 Regression: `test_two_concurrent_publishes_on_one_writer_are_serialised`
 asserts that while one publisher is inside a fenced statement, a second

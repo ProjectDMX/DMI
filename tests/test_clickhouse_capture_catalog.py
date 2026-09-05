@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from uuid import UUID, uuid4
@@ -826,8 +827,10 @@ def test_a_publish_that_fails_releases_the_writer_for_the_next_one():
         _publish(writer, 6)
         done.set()
 
-    threading.Thread(target=next_publish, name="publisher-b").start()
+    publisher_b = threading.Thread(target=next_publish, name="publisher-b")
+    publisher_b.start()
     assert done.wait(5), "the failed publish left the writer locked"
+    publisher_b.join(5)
     assert client.watermarks == [5, 6]
 
 
@@ -873,6 +876,74 @@ def test_a_writer_used_from_another_process_refuses_to_publish(monkeypatch):
     assert writer.publisher_lease is not None, (
         "the refusal must not drop the parent's lease from under it"
     )
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_a_forked_child_is_refused_even_when_the_parent_holds_the_lock():
+    """The ownership check runs BEFORE the lock, or a fork can hang the child.
+
+    A fork copies the writer's lock in whatever state it was in. Taken while
+    another thread of the parent is mid-publish, the child's copy is held by a
+    thread that does not exist in the child, so a check placed UNDER the lock
+    never runs and the child blocks on the inherited lock forever -- a hang
+    where the contract promises a refusal. This holds the lock in a parent
+    thread, forks, and requires the child to be refused promptly.
+    """
+    from dmi.storage.capture import PublisherLeaseError
+
+    client = _Client()
+    writer = _leased(client)
+    parent_is_inside_a_fenced_statement = threading.Event()
+    let_parent_finish = threading.Event()
+
+    def hold_the_lock(_lease_id):
+        if threading.current_thread().name == "holder":
+            parent_is_inside_a_fenced_statement.set()
+            let_parent_finish.wait(10)
+
+    client.lease.on_fence = hold_the_lock
+    holder = threading.Thread(
+        target=_publish, args=(writer, 1), name="holder", daemon=True
+    )
+    holder.start()
+    assert parent_is_inside_a_fenced_statement.wait(5)
+    try:
+        read_end, write_end = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - the child reports through the pipe
+            os.close(read_end)
+            try:
+                _publish(writer, 2)
+                os.write(write_end, b"published")
+            except PublisherLeaseError:
+                os.write(write_end, b"refused")
+            except BaseException as exc:
+                os.write(write_end, f"raised {type(exc).__name__}".encode())
+            finally:
+                os._exit(0)
+        os.close(write_end)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            finished, _ = os.waitpid(pid, os.WNOHANG)
+            if finished:
+                break
+            time.sleep(0.01)
+        else:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+            pytest.fail(
+                "the forked child hung on the writer lock it inherited held, "
+                "instead of being refused for using a foreign process's writer"
+            )
+        outcome = os.read(read_end, 64).decode()
+        os.close(read_end)
+    finally:
+        let_parent_finish.set()
+        holder.join(5)
+    assert outcome == "refused"
+    # The parent's own publish, held open across the fork, completes untouched.
+    assert client.watermarks == [1]
+    assert writer.publisher_lease is not None
 
 
 def test_descriptor_writes_use_the_configured_quorum():

@@ -214,6 +214,14 @@ class ClickHouseCatalogWriter:
         self._owner_pid = os.getpid()
 
     def _owned_by_this_process(self) -> None:
+        # Checked BEFORE ``_serial`` is taken, never inside it. A fork copies
+        # the lock in whatever state it was in, and a fork taken while another
+        # thread of the parent was mid-publish hands the child a lock held by
+        # a thread that does not exist in the child: a check under the lock
+        # would never run, and the child would hang on the inherited lock
+        # forever instead of being refused. Reproduced with the fake client:
+        # holder thread parked inside a fenced statement, fork, child publish
+        # -- the child never returned.
         if os.getpid() == self._owner_pid:
             return
         raise PublisherLeaseError(
@@ -231,8 +239,8 @@ class ClickHouseCatalogWriter:
         # lease this writer may already hold rather than refused by it.
         # ``sleep`` is the wait between install-lease attempts, a parameter
         # only so a test can drive it.
+        self._owned_by_this_process()
         with self._serial:
-            self._owned_by_this_process()
             self._schema.ensure(self._leases, sleep=sleep)
 
     def _rebuild_instruction(self) -> str:
@@ -347,8 +355,8 @@ class ClickHouseCatalogWriter:
         this module's taxonomy should treat a driver exception from a publish
         as "outcome unknown: re-acquire and re-index".
         """
+        self._owned_by_this_process()
         with self._serial:
-            self._owned_by_this_process()
             self._publish_snapshot_serialised(
                 index_version=index_version,
                 refs=refs,
@@ -566,18 +574,18 @@ class ClickHouseCatalogWriter:
         return self._leases.lease
 
     def acquire_publisher_lease(self, holder: str) -> PublisherLease:
+        self._owned_by_this_process()
         with self._serial:
-            self._owned_by_this_process()
             return self._leases.acquire(holder)
 
     def renew_publisher_lease(self) -> PublisherLease:
+        self._owned_by_this_process()
         with self._serial:
-            self._owned_by_this_process()
             return self._leases.renew()
 
     def release_publisher_lease(self) -> None:
+        self._owned_by_this_process()
         with self._serial:
-            self._owned_by_this_process()
             self._leases.release()
 
     def _manifest_chunk_published(
@@ -841,8 +849,8 @@ class ClickHouseCatalogWriter:
         the indexer re-allocates. What the lock removes is the case the fence
         cannot see, two publishes in flight at once under one lease.
         """
+        self._owned_by_this_process()
         with self._serial:
-            self._owned_by_this_process()
             return self._allocate_version_serialised()
 
     def _allocate_version_serialised(self) -> int:
