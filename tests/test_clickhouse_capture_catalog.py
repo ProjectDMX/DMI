@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from uuid import UUID, uuid4
 
 import pytest
@@ -719,6 +721,148 @@ def test_the_release_tombstone_is_written_at_the_writers_own_term_and_reads_noth
     # Nothing to read, so nothing to read consistently: the only settings a
     # release carries are the deployment's write quorum, none by default.
     assert kwargs.get("settings") is None
+
+
+def _publish(writer: ClickHouseCatalogWriter, version: int) -> None:
+    writer.publish_snapshot(
+        index_version=version,
+        refs=(),
+        published_at_ns=version,
+        indexed_rows=0,
+        indexed_packs=0,
+    )
+
+
+def test_two_concurrent_publishes_on_one_writer_are_serialised():
+    """One publish in flight per writer, and so per lease.
+
+    The fence identifies a HOLDER, not an operation. Two publishes issued under
+    one ``lease_id`` both renew it and both pass the fence, and the version
+    barrier inside each statement is evaluated when that statement is admitted
+    rather than against the other, so on a real server both watermark rows
+    land in either order and a reader pinned at the higher one watches the
+    lower version's membership arrive underneath it (300 of 300 rounds on
+    ClickHouse 25.12; 57 exposed the higher watermark first). ClickHouse has
+    nothing that serialises the two statements, so the writer does.
+
+    The fake cannot model the server-side overlap -- its statements run under
+    the interpreter lock -- so the test asserts the thing the writer is
+    responsible for: while publisher A is inside a fenced statement, publisher
+    B on the same writer issues NOTHING, not even the lease renewal that
+    precedes its first write.
+    """
+    client = _Client()
+    writer = _leased(client)
+    by_thread: dict[str, list[str]] = {}
+    real_execute = client.execute
+
+    def recording_execute(query, params=None, **kwargs):
+        by_thread.setdefault(threading.current_thread().name, []).append(query)
+        return real_execute(query, params, **kwargs)
+
+    client.execute = recording_execute
+
+    a_is_inside_a_fenced_statement = threading.Event()
+    let_a_finish = threading.Event()
+
+    def hold_a_at_the_fence(_lease_id):
+        if threading.current_thread().name == "publisher-a":
+            a_is_inside_a_fenced_statement.set()
+            assert let_a_finish.wait(5), "the test never released publisher A"
+
+    client.lease.on_fence = hold_a_at_the_fence
+    failures: list[BaseException] = []
+
+    def run(version: int) -> None:
+        try:
+            _publish(writer, version)
+        except BaseException as exc:  # pragma: no cover - reported below
+            failures.append(exc)
+
+    a = threading.Thread(target=run, args=(1,), name="publisher-a")
+    b = threading.Thread(target=run, args=(2,), name="publisher-b")
+    a.start()
+    assert a_is_inside_a_fenced_statement.wait(5)
+    b.start()
+    # A negative assertion needs a window in which B COULD have run: on the
+    # unserialised writer B issues its lease renewal within microseconds of
+    # starting, so a quarter second is generous rather than tight.
+    deadline = time.monotonic() + 0.25
+    while time.monotonic() < deadline and "publisher-b" not in by_thread:
+        time.sleep(0.005)
+    issued_by_b_while_a_was_publishing = list(by_thread.get("publisher-b", ()))
+    let_a_finish.set()
+    a.join(5)
+    b.join(5)
+
+    assert not a.is_alive() and not b.is_alive()
+    # The load-bearing assertion first, so an unserialised writer fails on the
+    # statement B issued rather than on whatever the fake's barrier made of
+    # the resulting order.
+    assert issued_by_b_while_a_was_publishing == [], (
+        "publisher B issued statements while publisher A's publish was in "
+        "flight on the same writer; two publishes under one lease both pass "
+        "the fence and are not ordered by the server"
+    )
+    assert failures == []
+    # Serialised, both publish -- in the order they took the lock, so the
+    # barrier admits each: A at 1, then B at 2 above it.
+    assert client.watermarks == [1, 2]
+    assert writer.publisher_lease is not None
+
+
+def test_a_publish_that_fails_releases_the_writer_for_the_next_one():
+    """The exclusion is scoped to one call, including its failure path."""
+    client = _Client()
+    writer = _leased(client)
+    client.watermarks.append(5)
+
+    with pytest.raises(SnapshotPublishRaceError):
+        _publish(writer, 3)  # refused by the barrier: 3 is not above 5
+
+    done = threading.Event()
+
+    def next_publish() -> None:
+        _publish(writer, 6)
+        done.set()
+
+    threading.Thread(target=next_publish, name="publisher-b").start()
+    assert done.wait(5), "the failed publish left the writer locked"
+    assert client.watermarks == [5, 6]
+
+
+def test_a_writer_used_from_another_process_refuses_to_publish(monkeypatch):
+    """A writer and its lease belong to the process that created them.
+
+    A forked child inherits the parent's ``PublisherLease`` byte for byte, so
+    its publishes would carry the parent's ``lease_id`` from a second address
+    space that no in-process lock can reach -- the same double-publish, with
+    no way to observe it from either side. The writer records its owning PID
+    and refuses every lease-bearing operation from any other.
+    """
+    from dmi.storage.capture import PublisherLeaseError
+    from dmi.storage.capture import clickhouse_catalog as module
+
+    client = _Client()
+    writer = _leased(client)
+    owner = module.os.getpid()
+    monkeypatch.setattr(module.os, "getpid", lambda: owner + 1)
+
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        _publish(writer, 1)
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.renew_publisher_lease()
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.acquire_publisher_lease("child")
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.release_publisher_lease()
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.ensure_schema()
+    # Nothing reached the server from the wrong process.
+    assert client.watermarks == []
+    assert writer.publisher_lease is not None, (
+        "the refusal must not drop the parent's lease from under it"
+    )
 
 
 def test_descriptor_writes_use_the_configured_quorum():
