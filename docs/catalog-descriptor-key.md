@@ -538,22 +538,33 @@ writer could not race itself with nothing enforcing it.
 ClickHouse offers no statement-level serialisation to lean on, so the
 exclusion sits where the shared identity is minted. `ClickHouseCatalogWriter`
 holds one re-entrant lock across `publish_snapshot`, `allocate_version`,
-`ensure_schema` and the lease operations: one publish is in flight per writer,
-and therefore per lease, and a second caller waits. Allocation shares the lock
-so one attempt's floor read, claim and read-back do not interleave with
-another's; it does not order allocation against publication, and need not -- a
-thread that allocated the lower version and publishes second is refused by the
-barrier as before and re-allocated by the indexer. The writer also records its
-owning PID and refuses every lease-bearing operation from another process,
-because a forked child inherits the parent's `PublisherLease` and would publish
-under the same `lease_id` from an address space no lock reaches. That check
-runs before the lock is taken, not under it: a fork copies the lock in whatever
-state it was in, and a child forked while another parent thread was mid-publish
-inherits a lock held by a thread it does not have -- a check under the lock
-would never run, and the child would hang instead of being refused; reproduced
-with the fake client and pinned by
-`test_a_forked_child_is_refused_even_when_the_parent_holds_the_lock`.
-The contract this states: **a writer and its lease belong to one
+`ensure_schema`, the lease operations, and every other method that reaches the
+server: one publish is in flight per writer, and therefore per lease, and a
+second caller waits. The lock is wider than the lease because what a writer's
+methods share is one driver client, and clickhouse-driver's `Client` is not
+thread-safe -- its only guard is a flag check that raises
+`PartiallyConsumedQueryError` when it happens to notice an overlap, and takes
+its lock non-blocking without reading the result. A writer shared between
+threads with only its publishes serialised would still let the indexer's
+inventory read, descriptor write or inventory commit on one thread interleave
+packets with a publish in flight on another; `publisher_lease` is the one
+unlocked read, of a Python attribute rather than the server. Allocation shares
+the lock so one attempt's floor read, claim and read-back do not interleave
+with another's; it does not order allocation against publication, and need not
+-- a thread that allocated the lower version and publishes second is refused
+by the barrier as before and re-allocated by the indexer. The writer also
+records its owning PID and refuses every operation that reaches the server from
+another process, because a forked child inherits the parent's `PublisherLease`
+and would publish under the same `lease_id` from an address space no lock
+reaches -- and inherits the parent's socket, on which its packets would
+interleave with the parent's. That check runs before the lock is taken, not
+under it: a fork copies the lock in whatever state it was in, and a child
+forked while another parent thread was mid-publish inherits a lock held by a
+thread it does not have -- a check under the lock would never run, and the
+child would hang instead of being refused; reproduced with the fake client and
+pinned by
+`test_a_forked_child_is_refused_even_when_the_parent_holds_the_lock`. The
+contract this states: **a writer, its connection and its lease belong to one
 process, and the writer may be shared between threads of that process.** A
 per-operation token carried through renew and fence was considered and not
 taken: it turns the race into a fence-out for one side but leaves the in-flight
@@ -565,8 +576,12 @@ Regression: `test_two_concurrent_publishes_on_one_writer_are_serialised`
 asserts that while one publisher is inside a fenced statement, a second
 publisher on the same writer issues nothing, not even its lease renewal; the
 fake cannot model the server-side overlap itself, so the test pins the
-writer's half of the argument. The live reproduction (two threads, one writer,
-adjacent versions, 300 rounds) is the check that closes it on a real server.
+writer's half of the argument.
+`test_every_client_operation_waits_behind_a_publish_in_flight` does the same
+for the indexer's neighbours of a publish -- inventory read, head read,
+descriptor write, inventory commit, collection -- on a second thread. The live
+reproduction (two threads, one writer, adjacent versions, 300 rounds) is the
+check that closes it on a real server.
 
 **A crash between a claim and its read-back** leaves a claim row nobody uses.
 It looks like a live lease until it expires, so the next publisher waits out one

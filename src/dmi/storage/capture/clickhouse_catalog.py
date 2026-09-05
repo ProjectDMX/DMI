@@ -206,6 +206,18 @@ class ClickHouseCatalogWriter:
         # shared identity is minted: here, in the process that owns the lease.
         # Re-entrant, because ``publish_snapshot`` renews the lease and
         # ``ensure_schema`` acquires it, both under the same lock.
+        #
+        # Every operation that reaches the client takes it, not only the
+        # lease-bearing ones. The writer is documented as shareable between
+        # the threads of its process, and the one thing all of its methods
+        # share is ``self._client``: clickhouse-driver's ``Client`` is not
+        # thread-safe -- its only guard is ``check_query_execution``, a flag
+        # test that raises ``PartiallyConsumedQueryError`` when it notices an
+        # overlap and takes its lock non-blocking without checking the result.
+        # So an unlocked ``committed_pack_ids`` or ``commit_packs`` from a
+        # second thread would interleave its packets with a publish in flight
+        # on the same connection. ``publisher_lease`` is the one unlocked
+        # read, and it reads a Python attribute rather than the server.
         self._serial = threading.RLock()
         # The lease belongs to THIS process. A forked child inherits
         # ``self._leases.lease`` byte for byte, and its publishes would share
@@ -227,11 +239,12 @@ class ClickHouseCatalogWriter:
         raise PublisherLeaseError(
             f"this ClickHouseCatalogWriter was created in process "
             f"{self._owner_pid} and is being used from process {os.getpid()}. "
-            "A writer and the publisher lease it holds belong to one process: "
-            "a forked copy would publish under the same lease_id as its "
-            "parent, and two publishes under one lease are not excluded by "
-            "the fence. Create a writer, and acquire a lease, in the process "
-            "that publishes."
+            "A writer, its connection and the publisher lease it holds belong "
+            "to one process: a forked copy would publish under the same "
+            "lease_id as its parent, and two publishes under one lease are not "
+            "excluded by the fence; it would also write to the same socket the "
+            "parent is using. Create a writer, and acquire a lease, in the "
+            "process that publishes."
         )
 
     def ensure_schema(self, *, sleep: Callable[[float], None] = _sleep) -> None:
@@ -247,7 +260,9 @@ class ClickHouseCatalogWriter:
         return self._schema.rebuild_instruction()
 
     def drop_schema(self) -> None:
-        self._schema.drop()
+        self._owned_by_this_process()
+        with self._serial:
+            self._schema.drop()
 
     def committed_pack_ids(
         self, identities: Sequence[PackIdentity]
@@ -256,6 +271,13 @@ class ClickHouseCatalogWriter:
             return set()
         if len(identities) > self._config.query_pack_limit:
             raise ValueError("pack identity query exceeds query_pack_limit")
+        self._owned_by_this_process()
+        with self._serial:
+            return self._committed_pack_ids_serialised(identities)
+
+    def _committed_pack_ids_serialised(
+        self, identities: Sequence[PackIdentity]
+    ) -> set[PackIdentity]:
         table = self._qualified(self._pack_view)
         committed: set[PackIdentity] = set()
         # Chunked: the identities land in the statement TEXT, and an unchunked
@@ -284,12 +306,14 @@ class ClickHouseCatalogWriter:
             return
         self._validate_version(index_version)
         rows = [self._descriptor_row(item, index_version) for item in descriptors]
-        self._client.execute(
-            f"INSERT INTO {self._qualified(self._capture_raw)} "
-            f"({', '.join(CAPTURE_COLUMNS)}) VALUES",
-            rows,
-            settings=self._quorum_write() or None,
-        )
+        self._owned_by_this_process()
+        with self._serial:
+            self._client.execute(
+                f"INSERT INTO {self._qualified(self._capture_raw)} "
+                f"({', '.join(CAPTURE_COLUMNS)}) VALUES",
+                rows,
+                settings=self._quorum_write() or None,
+            )
 
     def publish_snapshot(
         self,
@@ -668,6 +692,13 @@ class ClickHouseCatalogWriter:
         ``sleep`` is the settling wait the manifest bound needs; it is a
         parameter only so a test can drive it.
         """
+        self._owned_by_this_process()
+        with self._serial:
+            return self._collect_garbage_serialised(sleep)
+
+    def _collect_garbage_serialised(
+        self, sleep: Callable[[float], None]
+    ) -> dict[str, int]:
         removed: dict[str, int] = {}
         published = self.last_published_version()
         head = self._leases.head()
@@ -817,11 +848,13 @@ class ClickHouseCatalogWriter:
 
     def last_published_version(self) -> int:
         """Highest published index_version, or 0 when nothing is published."""
-        return self._max_version(
-            self._watermark,
-            "index_version",
-            "watermark table returned an invalid version",
-        )
+        self._owned_by_this_process()
+        with self._serial:
+            return self._max_version(
+                self._watermark,
+                "index_version",
+                "watermark table returned an invalid version",
+            )
 
     def allocate_version(self) -> int:
         """Allocate the next catalog version: strictly monotonic and unique.
@@ -923,11 +956,13 @@ class ClickHouseCatalogWriter:
         # successful publish, so a crash in between leaves a pack that is
         # visible but not yet skippable -- redundant work next pass, never the
         # reverse.
-        self._client.execute(
-            f"INSERT INTO {self._qualified(self._pack_raw)} "
-            f"({', '.join(PACK_COLUMNS)}) VALUES",
-            rows,
-        )
+        self._owned_by_this_process()
+        with self._serial:
+            self._client.execute(
+                f"INSERT INTO {self._qualified(self._pack_raw)} "
+                f"({', '.join(PACK_COLUMNS)}) VALUES",
+                rows,
+            )
 
     def _qualified(self, table: str) -> str:
         return f"{quoted(self._config.database)}.{quoted(table)}"

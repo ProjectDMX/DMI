@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import warnings
 from uuid import UUID, uuid4
 
 import pytest
@@ -812,6 +813,84 @@ def test_two_concurrent_publishes_on_one_writer_are_serialised():
     assert writer.publisher_lease is not None
 
 
+def test_every_client_operation_waits_behind_a_publish_in_flight():
+    """The lock covers the CONNECTION, not only the lease.
+
+    The writer may be shared between the threads of its process, and what its
+    methods share is one driver client that is not thread-safe: its only guard
+    is a flag check that raises when it happens to notice an overlap. So the
+    indexer's unlocked neighbours of a publish -- the inventory read that
+    decides what to skip, the descriptor write, the inventory commit, the head
+    read -- must wait for a publish in flight on another thread rather than
+    interleave their packets with it. Asserted the same way as for a second
+    publish: while A is inside a fenced statement, B issues NOTHING.
+    """
+    ref, descriptor = _descriptor()
+    client = _Client()
+    writer = _leased(client)
+    by_thread: dict[str, list[str]] = {}
+    real_execute = client.execute
+
+    def recording_execute(query, params=None, **kwargs):
+        by_thread.setdefault(threading.current_thread().name, []).append(query)
+        return real_execute(query, params, **kwargs)
+
+    client.execute = recording_execute
+    a_is_inside_a_fenced_statement = threading.Event()
+    let_a_finish = threading.Event()
+
+    def hold_a_at_the_fence(_lease_id):
+        if threading.current_thread().name == "publisher-a":
+            a_is_inside_a_fenced_statement.set()
+            assert let_a_finish.wait(5), "the test never released publisher A"
+
+    client.lease.on_fence = hold_a_at_the_fence
+    failures: list[BaseException] = []
+    results: dict[str, object] = {}
+
+    def neighbours() -> None:
+        try:
+            results["skip"] = writer.committed_pack_ids([(ref.store_id, ref.pack_id)])
+            results["head"] = writer.last_published_version()
+            writer.write_descriptors([descriptor], index_version=2)
+            writer.commit_packs([ref], index_version=2)
+            results["gc"] = writer.collect_garbage(sleep=lambda _s: None)
+        except BaseException as exc:  # pragma: no cover - reported below
+            failures.append(exc)
+
+    a = threading.Thread(target=_publish, args=(writer, 1), name="publisher-a")
+    b = threading.Thread(target=neighbours, name="neighbour-b")
+    a.start()
+    assert a_is_inside_a_fenced_statement.wait(5)
+    b.start()
+    deadline = time.monotonic() + 0.25
+    while time.monotonic() < deadline and "neighbour-b" not in by_thread:
+        time.sleep(0.005)
+    issued_by_b_while_a_was_publishing = list(by_thread.get("neighbour-b", ()))
+    let_a_finish.set()
+    a.join(5)
+    b.join(5)
+
+    assert not a.is_alive() and not b.is_alive()
+    assert issued_by_b_while_a_was_publishing == [], (
+        "a second thread reached the shared client while a publish was in "
+        "flight on it; the driver client is not thread-safe"
+    )
+    assert failures == []
+    # Once A is done, every one of B's calls ran to completion against the
+    # server: waiting is not refusing.
+    assert client.watermarks == [1]
+    issued_by_b = by_thread["neighbour-b"]
+    assert any("pack_inventory`" in q and q.startswith("SELECT") for q in issued_by_b)
+    assert any("max(index_version)" in q for q in issued_by_b)
+    assert any(q.startswith("INSERT INTO") and "capture_raw" in q for q in issued_by_b)
+    assert any(q.startswith("INSERT INTO") and "pack_inventory_raw" in q for q in issued_by_b)
+    # Collection's orphan scan; the fake counts nothing to delete, so no ALTER.
+    assert any("snapshot_manifest" in q and "DISTINCT index_version" in q for q in issued_by_b)
+    assert results["skip"] == set()
+    assert isinstance(results["gc"], dict)
+
+
 def test_a_publish_that_fails_releases_the_writer_for_the_next_one():
     """The exclusion is scoped to one call, including its failure path."""
     client = _Client()
@@ -849,6 +928,7 @@ def test_a_writer_used_from_another_process_refuses_to_publish(monkeypatch):
 
     client = _Client()
     writer = _leased(client)
+    issued_before_the_fork = len(client.calls)
     owner = os.getpid()
     # Patched on ``os`` itself rather than through the writer's module, so a
     # writer that never consults the PID fails this test with DID NOT RAISE
@@ -870,9 +950,31 @@ def test_a_writer_used_from_another_process_refuses_to_publish(monkeypatch):
     # route, and the contract names allocate_version explicitly.
     with pytest.raises(PublisherLeaseError, match="belong to one process"):
         writer.allocate_version()
+    # And every other operation that reaches the server: a forked child shares
+    # the parent's SOCKET as well as its lease, and a descriptor write or an
+    # inventory read from the child would interleave its packets with whatever
+    # the parent has in flight on that connection.
+    ref, descriptor = _descriptor()
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.write_descriptors([descriptor], index_version=1)
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.commit_packs([ref], index_version=1)
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.committed_pack_ids([(ref.store_id, ref.pack_id)])
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.last_published_version()
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.collect_garbage(sleep=lambda _s: None)
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.drop_schema()
     # Nothing reached the server from the wrong process.
     assert client.watermarks == []
     assert client.claims == []
+    assert client.committed == []
+    assert not any(
+        query.startswith(("INSERT", "ALTER", "DROP"))
+        for query, _, _ in client.calls[issued_before_the_fork:]
+    )
     assert writer.publisher_lease is not None, (
         "the refusal must not drop the parent's lease from under it"
     )
@@ -909,7 +1011,13 @@ def test_a_forked_child_is_refused_even_when_the_parent_holds_the_lock():
     assert parent_is_inside_a_fenced_statement.wait(5)
     try:
         read_end, write_end = os.pipe()
-        pid = os.fork()
+        with warnings.catch_warnings():
+            # Python 3.12+ warns that forking a multi-threaded process may
+            # deadlock the child. A second live thread is the scenario under
+            # test, not an accident, and a deadlocked child is exactly what the
+            # bounded wait below detects and reports.
+            warnings.simplefilter("ignore", DeprecationWarning)
+            pid = os.fork()
         if pid == 0:  # pragma: no cover - the child reports through the pipe
             os.close(read_end)
             try:
