@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import sys
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -664,3 +665,50 @@ class TestDescriptorBoundaryMatchesConfigStrictness:
                              "num_attention_heads": 2, "num_kv_heads": 2,
                              "num_experts": 8},
             })
+
+
+# ---------------------------------------------------------------------------
+# Independent-review round: the CLI's top-level `except RuntimeError` turns
+# a genuine bug (RecursionError is a RuntimeError) into one stderr line with
+# no traceback; compile_config raises bare ValueError for an unknown hook
+# selection while every other pipeline failure is a ConfigurationError.
+# ---------------------------------------------------------------------------
+
+
+class TestCliReportsGenuineBugs:
+    def test_cli_does_not_catch_runtime_error(self):
+        """The CLI's except-clause must not include RuntimeError: that class
+        carries genuine bugs (RecursionError is one, and every internal
+        lifecycle misuse raises it). Optional-dependency failures are raised
+        as their own error type instead."""
+        import inspect
+
+        from dmi import cli
+
+        handler_source = inspect.getsource(cli.main)
+        assert not re.search(r"except\s+RuntimeError", handler_source), (
+            "main() must not catch bare RuntimeError; genuine bugs (a "
+            "RecursionError is one) would surface as one clean stderr line "
+            "with exit 1 and no traceback"
+        )
+        assert "except UIDependencyError" in handler_source, (
+            "the optional-dependency failure gets its own type so the CLI "
+            "can print the install command without catching RuntimeError"
+        )
+
+
+class TestUnknownSelectionIsConfigError:
+    def test_compile_config_unknown_hook_is_configuration_error(self):
+        import sys
+
+        from dmi.configuration.compiler import ModelContext
+        from dmi.configuration.errors import ConfigurationError
+        from dmi.hooks.specs import HOOK_TYPE_RESID_PRE
+
+        config = DMIConfig(observations=ObservationConfig(hooks=["not-a-preset"]))
+
+        with pytest.raises(ConfigurationError):
+            compile_config(
+                config,
+                ModelContext(specs=[_StubSpec(HOOK_TYPE_RESID_PRE, 0)]),
+            )

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from .configuration.errors import ConfigurationError
+from .ui.errors import UIDependencyError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -178,7 +179,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except ConfigurationError as exc:
         print(f"dmi {args.command}: {exc}", file=sys.stderr)
         return 1
-    except RuntimeError as exc:
+    except UIDependencyError as exc:
+        # The optional-dependency failures serve()/create_app() raise. They
+        # were historically RuntimeError, but that class also carries
+        # genuine bugs (RecursionError is one), and a traceback is the right
+        # output for those.
         print(f"dmi {args.command}: {exc}", file=sys.stderr)
         return 1
 

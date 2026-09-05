@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
+from types import SimpleNamespace
 
 from dmi.adapters.base import BackendAdapter, StepPlan
 from dmi.adapters.types import StepContext
@@ -885,3 +886,96 @@ class TestNoPhaseGateTail:
 
         assert len(adapter.transport.set_step_context_calls) == 1
         assert adapter.transport.capture_step is True
+
+
+# ---------------------------------------------------------------------------
+# Independent-review round: the schedule gate is a Python branch inside the
+# compiled region. Under torch.compile + CUDA graphs, replay never runs
+# Python -- the flag is baked at the FIRST decode trace. A first-step
+# refusal would compile producers out of every later captured step; a
+# first-step capture would leave every later refused step dispatching. The
+# runtime fix mirrors the existing capacity-overflow path: a non-default
+# schedule disables compilation for the generate() call.
+# ---------------------------------------------------------------------------
+
+
+class TestCompileDisabledUnderNonDefaultSchedule:
+    def _run(self, schedule):
+        """Drive generate_with_monitoring far enough to inspect kwargs.
+
+        Stubs the model and adapter so the capacity preflight runs with a
+        tiny ring and the compile-config phase is observable without a GPU.
+        """
+        import torch
+
+        from dmi.adapters.huggingface import generation as gen_module
+
+        seen = {}
+
+        class _FakeEngine:
+            config = MonitoringConfig(schedule=schedule) if schedule is not None else None
+            _model_id = "m"
+
+            def next_auto_group_id(self):
+                return 0
+
+        class _FakeAdaptor:
+            engine = _FakeEngine()
+            model_cfg = SimpleNamespace(dtype=torch.float16)
+            active_specs = [object()]
+            ring_engine = SimpleNamespace(
+                payload_cap=lambda: 1 << 20,
+                staging_cap=lambda: 1 << 20,
+            )
+
+            def decode_step_bytes(self, batch, kv_dim):
+                return 16
+
+            def attach_model(self, *a, **k):
+                pass
+
+            def detach_model(self, *a):
+                pass
+
+        adaptor = _FakeAdaptor()
+
+        class _FakeTransport:
+            pass
+
+        class _FakeEngine2:
+            _ring_transport = _FakeTransport()
+            _model_id = "m"
+
+        class _FakeModel:
+            generation_config = None
+            monitoring_engine = _FakeEngine2()
+
+            def generate(self, *a, **kw):
+                seen.update(kw)
+                return "gen"
+
+        model = _FakeModel()
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(gen_module, "HuggingFaceAdapter", lambda *a, **k: adaptor)
+        try:
+            gen_module.generate_with_monitoring(
+                model,
+                input_ids=torch.zeros(1, 4, dtype=torch.long),
+                attention_mask=torch.ones(1, 4, dtype=torch.long),
+                max_new_tokens=2,
+            )
+        finally:
+            monkey.undo()
+        return seen
+
+    def test_non_default_schedule_disables_compilation(self):
+        seen = self._run(CaptureSchedule(step_stride=2))
+        assert seen.get("disable_compile") is True, (
+            "the schedule gate is a Python branch; CUDA-graph replay bakes it "
+            "at the first decode trace, so a non-default schedule must "
+            "disable compilation for this generate() call"
+        )
+
+    def test_default_schedule_keeps_compilation(self):
+        seen = self._run(CaptureSchedule())
+        assert "disable_compile" not in seen
