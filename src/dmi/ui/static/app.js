@@ -377,14 +377,21 @@
       dom.status.textContent = warnings.length === 1 ? "1 warning" : warnings.length + " warnings";
     } else {
       dom.status.dataset.state = "valid";
-      dom.status.textContent = "Valid";
+      dom.status.textContent = "Valid (descriptor)";
     }
 
     if (!issues.length) {
+      // Design-time wording on purpose. Validation runs against the model
+      // DESCRIPTOR, and the live model can expose fewer hooks than the
+      // descriptor advertises -- "ready to run" would be a promise this
+      // check is not in a position to make.
       dom.issues.replaceChildren(
         Object.assign(document.createElement("p"), {
           className: "hint",
-          textContent: "No issues. This configuration is ready to run."
+          textContent:
+            "No issues against this model descriptor. The attached model " +
+            "has the final say: compiling it there can still reject a hook " +
+            "the descriptor marks available."
         })
       );
       return;

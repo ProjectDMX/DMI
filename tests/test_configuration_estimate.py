@@ -302,17 +302,19 @@ def test_rank_report_covers_every_pipeline_stage():
 
 
 def test_step_stride_thins_the_sustained_rate():
-    """The stride IS enforced: the adapter driver gates on it, so sampling
-    fewer steps divides the sustained volume by exactly the stride."""
+    """The stride IS enforced on the BATCHED path: BackendAdapter's driver
+    gates every step, so sampling fewer of them divides the sustained volume
+    by exactly the stride. Packed (vLLM) commits steps without consulting the
+    schedule, so packed=False is the convention this claim holds for."""
     dense = estimate_config(
         _config(["resid_pre"], step_stride=1),
         _descriptor(),
-        _workload(decode_tokens=64, decode_steps_per_second=20.0),
+        _workload(decode_tokens=64, decode_steps_per_second=20.0, packed=False),
     )
     strided = estimate_config(
         _config(["resid_pre"], step_stride=4),
         _descriptor(),
-        _workload(decode_tokens=64, decode_steps_per_second=20.0),
+        _workload(decode_tokens=64, decode_steps_per_second=20.0, packed=False),
     )
 
     assert strided.sustained_bytes_per_second == pytest.approx(

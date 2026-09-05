@@ -205,6 +205,25 @@ def _generate_with_monitoring_impl(
             "generate_with_monitoring() requires model.monitoring_engine to "
             "be set to a MonitoringEngine instance."
         )
+    # One owner per model. This helper builds its OWN adapter and reconfigures
+    # the shared transport (model cfg, active specs, every HookPoint's enabled
+    # flag), and its `finally` detaches. Run on a model somebody else already
+    # attached -- dmi.configuration.attach_config, or a bare
+    # adapter.attach_model -- and the forward ends up with one caller's
+    # reservation and this call's producers, then loses the first attachment
+    # entirely. Refuse instead of silently re-owning it.
+    _owner = getattr(target, "_dmi_active_adapter", None)
+    if _owner is not None:
+        raise RuntimeError(
+            "generate_with_monitoring() was called on a model that is already "
+            f"attached by {type(_owner).__name__}. This entry point installs "
+            "its own hooks and replaces the transport's selection, which "
+            "would desynchronize the ring against the existing reservation. "
+            "Either drive generation through the existing attachment "
+            "(model.generate(...) directly -- the installed hooks already "
+            "capture), or detach it first "
+            "(adapter.detach_model(model)) and let this call own the model."
+        )
     if engine._ring_transport is None:
         raise RuntimeError(
             "generate_with_monitoring() found model.monitoring_engine, but "
@@ -480,6 +499,18 @@ def generate_greedy_with_monitoring(
 
     adaptor: Optional[HuggingFaceAdapter] = None
     if monitoring:
+        # One owner, as in generate_with_monitoring: this loop builds its own
+        # adapter and detaches on the way out, so running it over somebody
+        # else's attachment would reconfigure the shared transport and then
+        # take their hooks down with it.
+        _owner = getattr(model, "_dmi_active_adapter", None)
+        if _owner is not None:
+            raise RuntimeError(
+                "generate_greedy_with_monitoring() was called on a model that "
+                f"is already attached by {type(_owner).__name__}. Detach it "
+                "first (adapter.detach_model(model)), or run the loop with "
+                "monitoring=False and let the existing attachment capture."
+            )
         engine = getattr(model, "monitoring_engine", None)
         if engine is not None and engine._ring_transport is not None:
             adaptor = HuggingFaceAdapter(

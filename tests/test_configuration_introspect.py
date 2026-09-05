@@ -205,7 +205,10 @@ class TestResolveDescriptor:
 
 class TestFromConfigObject:
     def test_accepts_any_duck_typed_config(self):
+        """No transformers class required -- only the standard attributes."""
+
         class Config:
+            model_type = "llama"
             hidden_size = 4096
             num_attention_heads = 32
             num_key_value_heads = 8
@@ -215,6 +218,25 @@ class TestFromConfigObject:
         descriptor = descriptor_from_hf_config(Config(), "my/model")
         assert descriptor.model.id == "model"
         assert descriptor.topology.num_layers == 32
+
+    def test_a_config_without_a_model_type_is_refused(self):
+        """Detection fails closed: geometry alone does not prove causality.
+
+        Every real HF config.json carries model_type -- it is how AutoConfig
+        dispatches -- so its absence means the object cannot be classified,
+        and labelling it decoder_transformer anyway is the guess this must
+        not make.
+        """
+
+        class Config:
+            hidden_size = 4096
+            num_attention_heads = 32
+            num_key_value_heads = 8
+            num_hidden_layers = 32
+            intermediate_size = 14336
+
+        with pytest.raises(DescriptorError, match="model_type"):
+            descriptor_from_hf_config(Config(), "my/model")
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +281,7 @@ def _hf_namespace():
     from types import SimpleNamespace
 
     return SimpleNamespace(
+        model_type="qwen3",
         hidden_size=4096,
         num_attention_heads=32,
         num_key_value_heads=8,

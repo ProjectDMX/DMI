@@ -83,6 +83,7 @@ from .yaml import (
     config_to_dict,
     dump_config,
     load_config,
+    load_yaml_document,
     normalize_config,
     parse_config,
     save_config,
@@ -122,6 +123,7 @@ __all__ = [
     "save_config",
     "dump_config",
     "parse_config",
+    "load_yaml_document",
     "config_to_dict",
     "normalize_config",
     # validation

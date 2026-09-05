@@ -202,6 +202,16 @@ class BackendAdapter(abc.ABC):
         self.active_specs = specs
         self.transport._active_specs = specs
         self.transport._using_forward_hooks = True
+        # Record the owner. Attachment reconfigures shared state -- the
+        # transport's model cfg, its active spec list, every HookPoint's
+        # enabled flag -- so a second, independent attach on the same model
+        # silently supersedes the first: one reservation, several producers.
+        # Entry points that would create their own adapter check this marker
+        # and refuse rather than re-own a configured model.
+        try:
+            model._dmi_active_adapter = self
+        except AttributeError:  # pragma: no cover - exotic read-only model
+            pass
 
     def _schedule_allows(self, ctx: StepContext) -> bool:
         """The capture schedule's gate on this step, when one is configured.

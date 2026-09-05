@@ -92,6 +92,7 @@ def compile_config(config: DMIConfig, model_context: ModelContext) -> CompiledDM
             spec for spec in specs
             if hook_belongs_to_layers(spec, layers.start, layers.end)
         ]
+        _reject_hooks_the_layer_range_removed(config, selected, specs)
 
     return CompiledDMIConfig(
         hook_specs=specs,
@@ -137,6 +138,98 @@ def _reject_requested_hooks_that_cannot_fire(
                 for short in missing
             ]
         )
+
+
+def _reject_hooks_the_layer_range_removed(
+    config: DMIConfig, before: list, after: list
+) -> None:
+    """Refuse a layer range that silently empties a requested observation.
+
+    ``_reject_requested_hooks_that_cannot_fire`` runs before layer filtering
+    on purpose -- "the model does not expose this hook" and "your range misses
+    it" are different diagnoses and deserve different messages. But the second
+    one still has to be a diagnosis: a descriptor claiming 32 layers against a
+    model that exposes 16 compiles ``layers: 20-25`` to an empty spec list,
+    which installs nothing and reports nothing. The range is authored against
+    the LIVE layers, so it is checked against them.
+    """
+    from .errors import ConfigValidationError
+    from .validation import SEVERITY_ERROR, Issue
+
+    surviving = {spec.hook_type for spec in after}
+    lost = sorted(
+        {spec.hook_type for spec in before if spec.hook_type not in surviving}
+    )
+    if not lost:
+        return
+
+    layers = config.observations.layers
+    live = sorted({spec.layer_no for spec in before if spec.layer_no >= 0})
+    span = f"{live[0]}-{live[-1]}" if live else "none"
+    from ..hooks.catalog import HOOK_DEFS
+
+    short_by_id = {hid: short for hid, _act, short, *_rest in HOOK_DEFS}
+    names = ", ".join(
+        repr(short_by_id.get(hook_type, hook_type)) for hook_type in lost
+    )
+    raise ConfigValidationError(
+        [
+            Issue(
+                SEVERITY_ERROR,
+                "observations.layers",
+                f"layer range {layers.start}-{layers.end} removes every "
+                f"selected {names} hook: the attached model exposes layers "
+                f"{span}. The configuration would install nothing and capture "
+                "nothing -- widen the range, or drop it to keep every layer.",
+            )
+        ]
+    )
+
+
+def _install_schedule(adapter, schedule: CaptureSchedule) -> None:
+    """Put the configuration's schedule where ``_schedule_allows`` reads it.
+
+    The gate consults ``adapter.engine.config.schedule`` and nothing else, so
+    a schedule that is only carried on the ``DMIConfig`` (or only returned by
+    ``compile_config``) is a schedule the runtime never applies:
+    ``capture_prefill: false`` with a ``None`` engine config captures prefill.
+    """
+    import dataclasses
+
+    from ..config import MonitoringConfig
+
+    engine = getattr(adapter, "engine", None)
+    if engine is None:
+        # Same rule as the `layers` keyword below, for the same reason.
+        # Adapters are a public extension point, and one that carries no
+        # engine cannot be given a schedule -- but the DEFAULT schedule asks
+        # for nothing (stride 1, both phases, no warmup), so refusing there
+        # would break every adapter over a configuration that never wanted a
+        # schedule. A schedule that does say something and cannot be
+        # installed is the silent-drop this whole change exists to prevent.
+        if schedule == CaptureSchedule():
+            return
+        raise ConfigurationError(
+            f"{type(adapter).__name__} has no `engine`, so this "
+            "configuration's capture schedule (step_stride="
+            f"{schedule.step_stride}, request_stride={schedule.request_stride}, "
+            f"capture_prefill={schedule.capture_prefill}, "
+            f"capture_decode={schedule.capture_decode}) cannot be installed, "
+            "and a schedule silently dropped would capture everything it "
+            "asked to sample. attach_config needs an adapter built over a "
+            "MonitoringEngine."
+        )
+
+    existing = getattr(engine, "config", None)
+    if existing is None:
+        engine.config = MonitoringConfig(schedule=schedule)
+        return
+    try:
+        engine.config = dataclasses.replace(existing, schedule=schedule)
+    except TypeError:
+        # A non-dataclass config object (a test double, a subclass with a
+        # custom __init__): set the field rather than losing the schedule.
+        existing.schedule = schedule
 
 
 def attach_config(adapter, model, config: DMIConfig) -> None:
@@ -189,11 +282,27 @@ def attach_config(adapter, model, config: DMIConfig) -> None:
             "https://github.com/ProjectDMX/DMI-vLLM-Integration/issues/20)"
         )
 
+    # Schedule first, hooks second, and both from this one call: the whole
+    # point of the finding is that "the natural path leaves the schedule
+    # unapplied". Installing before the attach also means no hook is ever live
+    # under the PREVIOUS schedule -- if attach_model then fails, the engine
+    # carries a schedule but no hooks, which captures nothing.
+    _install_schedule(adapter, config.schedule)
+
     adapter.attach_model(
         model,
         to_legacy_hook_selection(config.observations),
         **kwargs,
     )
+
+    # ``BackendAdapter.attach_model`` records the owner, but adapters are a
+    # public extension point and one that overrides attach_model without
+    # calling super() would leave the model unmarked -- and an unmarked model
+    # is one ``generate_with_monitoring`` will happily re-own.
+    try:
+        model._dmi_active_adapter = adapter
+    except AttributeError:  # pragma: no cover - exotic read-only model
+        pass
 
 
 def _accepts_layers(adapter) -> bool:

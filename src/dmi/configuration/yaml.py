@@ -250,7 +250,17 @@ def _parse_v1(data: dict, version: int) -> DMIConfig:
         )
     if not isinstance(hooks_raw, list):
         raise ConfigurationError("'observations.hooks' must be a list.")
-    hooks = [str(hook) for hook in hooks_raw]
+    # str() would invent hook names out of authoring mistakes: [q, 1, true,
+    # null] became ["q", "1", "True", "None"], four "unknown hook" issues
+    # deep in validation instead of one message at the boundary that says
+    # which element is wrong. A typed list[str] rejects non-strings.
+    for index, hook in enumerate(hooks_raw):
+        if not isinstance(hook, str):
+            raise ConfigurationError(
+                f"'observations.hooks[{index}]' must be a string, got "
+                f"{type(hook).__name__} ({hook!r})."
+            )
+    hooks = list(hooks_raw)
 
     layers = None
     layers_raw = observations_raw.get("layers")
@@ -308,6 +318,52 @@ def dump_config(config: DMIConfig) -> str:
     )
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """SafeLoader that refuses duplicate mapping keys.
+
+    PyYAML's default is last-wins and silent. In a capture configuration that
+    is a scope change nobody sees: a hand edit or a merge conflict leaving two
+    ``observations.hooks`` keys quietly discards one of them. A configuration
+    file is a contract, so an ambiguous document is an error, not a merge.
+    """
+
+
+def _no_duplicate_keys(loader: yaml.SafeLoader, node, deep: bool = False) -> dict:
+    mapping: dict = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found a duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate_keys
+)
+
+
+def load_yaml_document(text: str, where: str = "Configuration") -> Any:
+    """Parse one YAML document the way DMI configurations are parsed.
+
+    Shared by the file path and the HTTP boundary so both refuse the same
+    documents: safe tags only, and no duplicate mapping keys.
+    """
+    if not isinstance(text, str):
+        raise ConfigurationError(
+            f"{where} must be a YAML string, got {type(text).__name__}."
+        )
+    try:
+        return yaml.load(text, Loader=_StrictLoader)
+    except yaml.YAMLError as exc:
+        raise ConfigurationError(f"{where} is not valid YAML: {exc}") from exc
+
+
 def load_config(path: str | Path) -> DMIConfig:
     """Read a configuration from disk."""
     target = Path(path)
@@ -315,13 +371,7 @@ def load_config(path: str | Path) -> DMIConfig:
         raw = target.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigurationError(f"Cannot read configuration {target}: {exc}") from exc
-    try:
-        data = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
-        raise ConfigurationError(
-            f"Configuration {target} is not valid YAML: {exc}"
-        ) from exc
-    return parse_config(data)
+    return parse_config(load_yaml_document(raw, f"Configuration {target}"))
 
 
 def save_config(config: DMIConfig, path: str | Path) -> None:
@@ -347,6 +397,7 @@ def save_config(config: DMIConfig, path: str | Path) -> None:
 
 __all__ = [
     "normalize_config",
+    "load_yaml_document",
     "config_to_dict",
     "parse_config",
     "dump_config",

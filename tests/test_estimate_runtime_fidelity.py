@@ -83,10 +83,22 @@ def _notes(estimate) -> str:
 # ---------------------------------------------------------------------------
 
 
+# The stride division belongs to BackendAdapter's driver, which is the
+# BATCHED (Hugging Face) path: it gates every step on
+# ``should_capture_step`` / ``should_capture_request``. The packed (vLLM)
+# integrations pinned by this repo build their engine with ``config=None``
+# and commit steps directly, so no stride reaches them -- these tests
+# therefore state the convention they are about instead of inheriting the
+# packed default. The packed side is pinned in
+# ``test_pr122_round3_review_findings.py``.
+def _batched(**overrides) -> Workload:
+    return _workload(packed=False, **overrides)
+
+
 def test_step_stride_thins_the_sustained_rate():
     """The stride is enforced by the adapter driver, so sampling divides."""
-    dense = estimate_config(_config(step_stride=1), _descriptor(), _workload())
-    strided = estimate_config(_config(step_stride=4), _descriptor(), _workload())
+    dense = estimate_config(_config(step_stride=1), _descriptor(), _batched())
+    strided = estimate_config(_config(step_stride=4), _descriptor(), _batched())
 
     assert strided.sustained_bytes_per_second == pytest.approx(
         dense.sustained_bytes_per_second / 4
@@ -94,33 +106,46 @@ def test_step_stride_thins_the_sustained_rate():
 
 
 def test_step_stride_thins_the_daily_volume():
-    dense = estimate_config(_config(step_stride=1), _descriptor(), _workload())
-    strided = estimate_config(_config(step_stride=8), _descriptor(), _workload())
+    dense = estimate_config(_config(step_stride=1), _descriptor(), _batched())
+    strided = estimate_config(_config(step_stride=8), _descriptor(), _batched())
 
     assert strided.bytes_per_day == pytest.approx(dense.bytes_per_day / 8)
 
 
 def test_step_stride_thins_the_per_request_total():
-    dense = estimate_config(_config(step_stride=1), _descriptor(), _workload())
-    strided = estimate_config(_config(step_stride=4), _descriptor(), _workload())
+    dense = estimate_config(_config(step_stride=1), _descriptor(), _batched())
+    strided = estimate_config(_config(step_stride=4), _descriptor(), _batched())
 
     assert strided.bytes_per_request == pytest.approx(dense.bytes_per_request / 4)
 
 
 def test_request_stride_thins_the_per_request_total():
-    dense = estimate_config(_config(request_stride=1), _descriptor(), _workload())
-    strided = estimate_config(_config(request_stride=4), _descriptor(), _workload())
+    dense = estimate_config(_config(request_stride=1), _descriptor(), _batched())
+    strided = estimate_config(_config(request_stride=4), _descriptor(), _batched())
 
     assert strided.bytes_per_request == pytest.approx(dense.bytes_per_request / 4)
 
 
 def test_a_large_stride_reports_a_proportionally_thin_volume():
-    dense = estimate_config(_config(step_stride=1), _descriptor(), _workload())
-    strided = estimate_config(_config(step_stride=1000), _descriptor(), _workload())
+    dense = estimate_config(_config(step_stride=1), _descriptor(), _batched())
+    strided = estimate_config(
+        _config(step_stride=1000), _descriptor(), _batched()
+    )
 
     assert strided.sustained_bytes_per_second == pytest.approx(
         dense.sustained_bytes_per_second / 1000
     )
+
+
+def test_a_packed_stride_is_not_applied_and_says_so():
+    """vLLM bypasses the gate, so the packed figures must stay unsampled."""
+    dense = estimate_config(_config(step_stride=1), _descriptor(), _workload())
+    strided = estimate_config(
+        _config(step_stride=1000), _descriptor(), _workload()
+    )
+
+    assert strided.bytes_per_request == dense.bytes_per_request
+    assert any("vLLM" in warning for warning in strided.warnings)
 
 
 def test_phase_toggles_remove_their_phase_from_volume():

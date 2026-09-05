@@ -85,25 +85,125 @@ _KNOWN_NON_DECODER_MODEL_TYPES = (
 )
 
 
+# Causal decoder-only families DMI-configurator v1 positively supports, by
+# the ``model_type`` the HF config carries. This is an ALLOWLIST, and the
+# direction matters: a blacklist can only refuse the non-decoders somebody
+# thought to list, so every family nobody has seen yet -- `dinov2`,
+# `modernbert`, the next release's encoder -- was accepted and emitted as
+# `decoder_transformer`. Being wrong here is not a parse failure; it is a
+# descriptor that promises observations the model cannot produce.
+#
+# Variants are matched by separator, so `qwen3_moe`, `deepseek_v3` and
+# `llama-2` need no entry of their own -- but `bert-generation` gets no free
+# ride from `bert`, because `bert` is not in this list at all.
+_SUPPORTED_DECODER_MODEL_TYPES = (
+    "llama",
+    "mistral",
+    "mixtral",
+    "qwen",
+    "qwen2",
+    "qwen3",
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "phi",
+    "phi3",
+    "phi4",
+    "gpt2",
+    "gptj",
+    "gpt_neo",
+    "gpt_neox",
+    "gpt_bigcode",
+    "falcon",
+    "mpt",
+    "opt",
+    "bloom",
+    "olmo",
+    "olmo2",
+    "starcoder2",
+    "stablelm",
+    "codegen",
+    "persimmon",
+    "deepseek",
+    "baichuan",
+    "internlm",
+    "internlm2",
+    "yi",
+    "cohere",
+    "cohere2",
+    "command_r",
+    "dbrx",
+    "granite",
+    "granitemoe",
+    "minicpm",
+    "exaone",
+    "glm",
+    "chatglm",
+    "nemotron",
+    "arctic",
+    "xverse",
+    "aquila",
+    "skywork",
+    "orion",
+    "solar",
+    "zamba",
+)
+
+_DESCRIPTOR_ESCAPE_HATCH = (
+    "If it IS a causal decoder-only transformer, write the descriptor "
+    "directly (see examples/model_descriptors/) and pass the YAML file "
+    "instead -- `dmi ui my-model.model.yaml` -- which skips this detection."
+)
+
+
+def _is_supported_decoder(model_type: str) -> bool:
+    """Allowlist match, tolerating the usual family-variant separators."""
+    normalized = model_type.lower().replace("-", "_")
+    return any(
+        normalized == family or normalized.startswith(family + "_")
+        for family in _SUPPORTED_DECODER_MODEL_TYPES
+    )
+
+
 def _reject_known_non_decoder(hf_config: Any, model_id: str) -> None:
     """Refuse config shapes DMI-configurator v1 cannot observe correctly.
 
-    Only ``decoder_transformer`` is supported. A model_type known to name
-    something else -- masked LMs, encoders, vision backbones, audio models --
-    is refused even though its attention geometry would parse, because a
-    descriptor built from it would promise observations the model cannot
-    produce in the shapes DMI expects.
+    Only ``decoder_transformer`` is supported, and support is established
+    positively: a ``model_type`` outside
+    :data:`_SUPPORTED_DECODER_MODEL_TYPES` is refused whether or not anyone
+    has classified it, because its attention geometry parsing successfully
+    says nothing about whether the model is causal. Known non-decoders keep
+    their specific message -- "this is a BERT" is a better diagnosis than
+    "this is not on the list".
     """
     model_type = getattr(hf_config, "model_type", None)
     if isinstance(model_type, str):
         normalized = model_type.lower()
         for family in _KNOWN_NON_DECODER_MODEL_TYPES:
-            if normalized == family or normalized.startswith(family + "_"):
+            if (
+                normalized == family
+                or normalized.startswith(family + "_")
+                or normalized.startswith(family + "-")
+            ):
                 raise DescriptorError(
                     f"{model_id!r} is a {model_type!r} model, which is not a "
                     "causal decoder-only transformer. DMI-configurator v1 "
                     "supports decoder_transformer only."
                 )
+        if not _is_supported_decoder(normalized):
+            raise DescriptorError(
+                f"{model_id!r} declares model_type {model_type!r}, which is "
+                "not a causal decoder-only family DMI-configurator v1 "
+                "recognizes, so it cannot be described automatically: "
+                "detection fails closed rather than labelling an unknown "
+                f"architecture decoder_transformer. {_DESCRIPTOR_ESCAPE_HATCH}"
+            )
+    else:
+        raise DescriptorError(
+            f"The config for {model_id!r} declares no model_type, so this "
+            "cannot be confirmed as a causal decoder-only transformer. "
+            f"{_DESCRIPTOR_ESCAPE_HATCH}"
+        )
     architectures = getattr(hf_config, "architectures", None) or []
     for architecture in architectures:
         # HF names carry no underscores ("BertForMaskedLM"), so lower and

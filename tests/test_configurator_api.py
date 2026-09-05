@@ -128,7 +128,14 @@ class TestCatalogEndpoint:
 class TestValidateEndpoint:
     def test_valid_configuration(self, client):
         payload = client.post("/api/validate", json={"config": VALID_CONFIG}).json()
-        assert payload == {"valid": True, "issues": []}
+        assert payload["valid"] is True
+        assert payload["issues"] == []
+
+    def test_a_verdict_names_the_scope_it_was_reached_in(self, client):
+        """Validation runs against the descriptor, not a loaded model."""
+        payload = client.post("/api/validate", json={"config": VALID_CONFIG}).json()
+        assert payload["scope"] == "design-time"
+        assert "descriptor" in payload["note"].lower()
 
     def test_issues_name_the_control_that_caused_them(self, client):
         bad = {
