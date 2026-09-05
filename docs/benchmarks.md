@@ -226,3 +226,99 @@ because their capture paths block the hot stream.
 For local setup of this repo's native backend and ClickHouse sink, see
 [`install.md`](install.md). For simple API examples, see
 [`huggingface.md`](huggingface.md) and [`vllm.md`](vllm.md).
+## Native capture pipeline ledger
+
+Working ledger for the end-to-end native capture pipeline (branch
+`feat/native-capture-pipeline`, plan in `tasks/plan.md`). Every attempt — kept
+or reverted — is logged here so dead ideas stay dead. Baselines are medians of
+5 trials on the reference host (AMD Ryzen Threadripper PRO 5955WX, 32 threads),
+same harness (`bench_capture_pipeline`, defaults: 10k records × 64 KiB), JSON
+artifacts under `benchmarks/data/native-pipeline/`.
+
+### Baselines (2026-09-05, this host)
+
+| Stage | Median throughput | Artifact |
+|---|---:|---|
+| Pipeline, spool mode | 0.2349 GiB/s | `baseline-spool.json` |
+| Pipeline, direct mode | 0.2318 GiB/s | `baseline-direct.json` |
+
+Both sit at the design doc's adopted target (0.235 GiB/s) rather than its
+reported 0.282/0.291 — same harness, same host family; the gap to the pack
+writer alone (0.472 GiB/s) is the attribution target for T0.2.
+
+| Idea | Baseline → Result | Verdict | Why |
+|---|---|---|---|
+
+### T0.2 attribution (2026-09-05, same host, 10k × 64 KiB, median of 3)
+
+| Stage (single-threaded unless noted) | Throughput | Share of writer time (cProfile) |
+|---|---:|---|
+| `zlib.crc32` over payloads | 1.168 GiB/s | 24% of `append` |
+| metadata dict build (`asdict`+`deepcopy`) | 0.68 s/640 MiB | **29%** |
+| `json.dumps` of metadata | 0.31 s/640 MiB | 4.5% |
+| `sha256` at seal (per 128 MiB pack) | 2.1 GiB/s | 13% |
+| `PackWriter` append+seal alone | **0.359 GiB/s** | — |
+| `PackAssembler` loop | 0.335 GiB/s | — |
+| `FilesystemPackStore.put` (fsync-heavy) | 0.199 GiB/s | — |
+| Spool stage (`.open`+fsync+`.ready`, NVMe) | **1.148 GiB/s** | — |
+| Full pipeline (producer+worker threads) | 0.211–0.225 GiB/s | — |
+
+**Findings.**
+1. The binding constraint is the Python packer: full pipeline 0.235 vs 0.359
+   writer-only — the ~35% gap is GIL tax + queue handoff between the two
+   active threads, not I/O.
+2. Inside the writer, 29% is `dataclasses.asdict`+`deepcopy` building the
+   metadata dict — pure-Python dict construction, not encoding.
+3. `zlib.crc32` (24%) runs at 1.17 GiB/s; hardware CRC32 is ~10x. `sha256`
+   (SHA-NI) at 2.1 GiB/s is the fastest per-byte kernel.
+4. Durable spool staging is 1.15 GiB/s on NVMe — 5x the pipeline; NOT the
+   bottleneck. Direct mode's `FilesystemPackStore.put` (0.199) IS slow from
+   fsyncs, which is why spool mode is the production shape.
+
+| Idea | Baseline → Result | Verdict | Why |
+|---|---|---|---|
+| Optimize `asdict`→hand-rolled mapping in Python | n/a | skipped | Oracle code; perf irrelevant; byte output unchanged either way |
+| Profile only with py-spy | n/a | reverted | Not installed; deterministic stage decomposition + cProfile is stronger evidence |
+
+### T0.3 native kernel ceiling (2026-09-05, same host, g++ 11.4 -O3 -march=native)
+
+| Kernel | Measured | Note |
+|---|---:|---|
+| CRC32C hw, 8 interleaved chains, streaming 640 MiB | **13.7 GiB/s** | latency-hidden; serial chain only 6–11 |
+| SHA-256 (OpenSSL 1.1.1f, no SHA-NI on this build) | 2.09 GiB/s | best-of-5; ≈ Python's hashlib — parity, not a win |
+| Payload append (memcpy + 32B header) | 2.59 GiB/s | memory-bandwidth bound |
+| Footer JSON build (10k records) | 247 GiB/s | negligible |
+| Spool write `.open`→fsync→`.ready` (NVMe, O_DIRECT ref) | 0.88–0.91 GiB/s | fsync-bound; 3.2 GiB/s without |
+| Python `zlib.crc32` (same step) | 1.17 GiB/s | for comparison |
+
+**Discarded readings (logged to keep them dead):** two earlier harness versions
+reported CRC32 at 1.4–4.9 TiB/s and SHA at 325 GiB/s — a 64-payload corpus fit
+in cache and the timing window collapsed (640 MiB ÷ 0.14 ms). All numbers above
+use distinct/`volatile`-consumed results with corpora sized to defeat the
+optimizer. Lesson recorded for A1: benchmark with the production corpus shape.
+
+### T0.3 synthesis — modeled native ceiling
+
+Per-pack byte cost is dominated by SHA-256 at seal (2.09 GiB/s) and payload
+append (2.59 GiB/s); CRC32C at 13.7 GiB/s is 6.5× the Python kernel. Modeled
+end-to-end native pipeline on this host: **~1.5–2.0 GiB/s per instance** vs
+0.235 GiB/s Python — an ~8× headroom, far beyond the 1.2× capacity gate. The
+measured sha256 ceiling (2.09) still bounds single-instance worst case well
+above the 3×4090 requirement of 0.37 GiB/s/instance.
+
+| Idea | Baseline → Result | Verdict | Why |
+|---|---|---|---|
+| Naive serial-chain CRC32C | 6–11 GiB/s | kept as fallback | latency-bound; 8-chain variant 1.4× better |
+| First kernel_bench harness | 1.4–4.9 TiB/s CRC, 325 GiB/s SHA | reverted | cache-resident corpus + collapsed timing window; measurements invalid |
+| OpenSSL SHA-256 as seal-hash win | assumed win → measured parity (2.09 vs Python 2.1) | reverted as motivation | not a bottleneck either way; irrelevant to scope |
+
+### T0.4 scope decision (2026-09-05)
+
+Derived target: full-fidelity 3×4090 capture needs 1.1 GiB/s per host.
+Python delivers 0.235; native modeled ceiling ~1.5–2.0 GiB/s per instance
+(bounded below by SHA-256 seal at 2.09 and memcpy at 2.6, above by spool at
+0.9–3.2). **Decision: proceed with the full native port (Phases A+B)** — the
+profile confirms interpreter/GIL tax (~35% between threads), a 29%
+`asdict`+deepcopy metadata cost, and a 6.5× CRC kernel gap. Every modeled stage
+clears the target with margin; parallelism via scope-partitioned workers and
+pipelined seal→stage overlaps the SHA-256 bound across packs.
