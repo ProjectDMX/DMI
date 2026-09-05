@@ -858,8 +858,14 @@ def test_a_writer_used_from_another_process_refuses_to_publish(monkeypatch):
         writer.release_publisher_lease()
     with pytest.raises(PublisherLeaseError, match="belong to one process"):
         writer.ensure_schema()
+    # Allocation too: a version claimed from a forked child would be published
+    # under the parent's lease, which is the same double-publish by another
+    # route, and the contract names allocate_version explicitly.
+    with pytest.raises(PublisherLeaseError, match="belong to one process"):
+        writer.allocate_version()
     # Nothing reached the server from the wrong process.
     assert client.watermarks == []
+    assert client.claims == []
     assert writer.publisher_lease is not None, (
         "the refusal must not drop the parent's lease from under it"
     )

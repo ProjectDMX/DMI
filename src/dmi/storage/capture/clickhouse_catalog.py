@@ -842,6 +842,7 @@ class ClickHouseCatalogWriter:
         cannot see, two publishes in flight at once under one lease.
         """
         with self._serial:
+            self._owned_by_this_process()
             return self._allocate_version_serialised()
 
     def _allocate_version_serialised(self) -> int:
