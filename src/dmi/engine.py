@@ -65,6 +65,8 @@ class MonitoringEngine:
       * ``__init__(config, model_id, host_engine|db_config)``
       * ``enable_ring_transport(ring_config, model_shape=None) -> RingTransport``
         (enabled by default from ``__init__`` with a default RingConfig)
+      * ``record_mode_v1=True`` retains the ring configuration until
+        ``create_record_runtime()`` constructs the encoded-record ring.
       * ``next_auto_group_id() -> int``  -- engine-scoped counter for HF;
         vLLM passes its own scheduler-assigned request IDs.
       * ``close()``
@@ -85,6 +87,7 @@ class MonitoringEngine:
         host_engine: Optional[Any] = None,
         db_config: Optional[HostEngineConfig] = None,
         enable_ring_transport: bool = True,
+        record_mode_v1: bool = False,
         ring_config: Optional[Any] = None,
         ring_payload_mb: int = 4096,
         ring_pinned_mb: int = 4096,
@@ -101,6 +104,7 @@ class MonitoringEngine:
         self._ring_transport: Optional[Any] = None
         self._ring_config: Optional[Any] = None
         self._record_mode = False
+        self._record_mode_v1 = bool(record_mode_v1)
 
         if host_engine is not None and db_config is not None:
             raise ValueError("Provide either host_engine or db_config, not both")
@@ -139,7 +143,10 @@ class MonitoringEngine:
                     pinned_mb=ring_pinned_mb,
                     task_entries=ring_task_entries,
                 )
-            self.enable_ring_transport(ring_config)
+            if self._record_mode_v1:
+                self._ring_config = ring_config
+            else:
+                self.enable_ring_transport(ring_config)
 
 
     # ------------------------------------------------------------------
@@ -206,7 +213,7 @@ class MonitoringEngine:
 
         transport = self._ring_transport
         ring_config = self._ring_config
-        if transport is None or ring_config is None:
+        if ring_config is None:
             raise RuntimeError("Ring transport is not enabled")
         if self._record_mode:
             raise RuntimeError("A record runtime is already active")
@@ -238,12 +245,13 @@ class MonitoringEngine:
         switched = False
         try:
             _rt = _ring_module()
-            if not self.capture_enabled:
+            if transport is not None and not self.capture_enabled:
                 self.set_capture_enabled(True)
             ring_engine = getattr(self, "_ring_engine", None)
             if ring_engine is not None:
                 ring_engine.stop()
-            _rt.deactivate()
+            if transport is not None:
+                _rt.deactivate()
             self._ring_transport = None
             self._ring_engine = None
             switched = True

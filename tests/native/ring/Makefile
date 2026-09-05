@@ -59,14 +59,27 @@ RECORD_CONSUMER_SRC := ../../../native/csrc/ring/record_consumer.cpp
 CLICKHOUSE_RECORD_SINK_SRC := ../../../native/csrc/clickhouse_record_sink.cpp
 RING_ENGINE_CU := ../../../native/csrc/ring/ring_engine.cu
 RING_ENGINE_PY_CU := ../../../native/csrc/ring/ring_engine_py.cu
+D2H_WINDOW_CPU_SRCS := \
+	../../../native/csrc/ring/d2h_window_debug.cpp \
+	../../../native/csrc/ring/d2h_window_grant_policy.cpp \
+	../../../native/csrc/ring/d2h_window_mode.cpp \
+	../../../native/csrc/ring/d2h_window_pattern.cpp \
+	../../../native/csrc/ring/recurring_d2h_grant_controller.cpp
+D2H_WINDOW_ENGINE_SRCS := \
+	$(D2H_WINDOW_CPU_SRCS) \
+	../../../native/csrc/ring/d2h_window_progress.cpp \
+	../../../native/csrc/ring/d2h_window_subsystem.cpp \
+	../../../native/csrc/ring/d2h_window_marker.cu
 
 TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer \
-           $(BUILD)/test_ring_engine $(BUILD)/test_null_mode \
-           $(BUILD)/test_record_consumer \
-           $(BUILD)/test_clickhouse_record_sink
+	       $(BUILD)/test_ring_engine $(BUILD)/test_null_mode \
+	       $(BUILD)/test_record_consumer \
+	       $(BUILD)/test_clickhouse_record_sink \
+	       $(BUILD)/test_d2h_windows
 
 .PHONY: all test_rings test_producer test_ring_engine test_null_mode \
-        test_record_consumer test_clickhouse_record_sink run clean FORCE
+		test_record_consumer test_clickhouse_record_sink test_d2h_windows \
+		run clean FORCE
 
 all: $(TARGETS)
 
@@ -86,7 +99,8 @@ $(BUILD)/test_producer: test_producer.cu $(PRODUCER_CU) $(CUDA_CONFIG_STAMP) | $
 
 $(BUILD)/test_ring_engine: test_ring_engine.cu $(PRODUCER_CU) $(DRAIN_SRC) \
 		$(P2P_SRC) $(RECORD_CONSUMER_SRC) $(RING_ENGINE_CU) \
-		$(RING_ENGINE_PY_CU) $(CUDA_CONFIG_STAMP) | $(BUILD)
+		$(RING_ENGINE_PY_CU) $(D2H_WINDOW_ENGINE_SRCS) \
+		$(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(TORCH_INCLUDE_FLAGS) $(TORCH_LIB_FLAGS) \
 		$(filter-out $(CUDA_CONFIG_STAMP),$^) $(TORCH_RPATH_FLAGS) \
 		-ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -lpthread -o $@
@@ -100,6 +114,12 @@ $(BUILD)/test_record_consumer: test_record_consumer.cpp $(RECORD_CONSUMER_SRC) $
 		-ltorch -ltorch_cpu -lc10 -lpthread -o $@
 
 $(BUILD)/test_clickhouse_record_sink: test_clickhouse_record_sink.cpp $(CLICKHOUSE_RECORD_SINK_SRC) $(CUDA_CONFIG_STAMP) | $(BUILD)
+	$(CUDA_NVCC) $(NVCC_FLAGS) $(TORCH_INCLUDE_FLAGS) $(TORCH_LIB_FLAGS) \
+		$(filter-out $(CUDA_CONFIG_STAMP),$^) $(TORCH_RPATH_FLAGS) \
+		-ltorch -ltorch_cpu -lc10 -lpthread -o $@
+
+$(BUILD)/test_d2h_windows: test_d2h_windows.cpp $(D2H_WINDOW_CPU_SRCS) \
+		$(CUDA_CONFIG_STAMP) | $(BUILD)
 	$(CUDA_NVCC) $(NVCC_FLAGS) $(TORCH_INCLUDE_FLAGS) $(TORCH_LIB_FLAGS) \
 		$(filter-out $(CUDA_CONFIG_STAMP),$^) $(TORCH_RPATH_FLAGS) \
 		-ltorch -ltorch_cpu -lc10 -lpthread -o $@
@@ -122,6 +142,9 @@ test_record_consumer: $(BUILD)/test_record_consumer
 test_clickhouse_record_sink: $(BUILD)/test_clickhouse_record_sink
 	$(BUILD)/test_clickhouse_record_sink
 
+test_d2h_windows: $(BUILD)/test_d2h_windows
+	$(BUILD)/test_d2h_windows
+
 run: all
 	$(BUILD)/test_rings
 	$(BUILD)/test_producer
@@ -129,6 +152,7 @@ run: all
 	$(BUILD)/test_null_mode
 	$(BUILD)/test_record_consumer
 	$(BUILD)/test_clickhouse_record_sink
+	$(BUILD)/test_d2h_windows
 
 clean:
 	rm -rf $(BUILD)

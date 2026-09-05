@@ -7,9 +7,32 @@
 
 namespace ring {
 
+namespace {
+
+RingConfig validate_legacy_config(const RingConfig& config) {
+    if (config.recurring_d2h_windows.enabled) {
+        throw std::invalid_argument(
+            "recurring D2H windows require the HookPointV1 record engine");
+    }
+    return config;
+}
+
+int current_device() {
+    int device = -1;
+    const cudaError_t error = cudaGetDevice(&device);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("RingEngine: cudaGetDevice failed: ") +
+            cudaGetErrorString(error));
+    }
+    return device;
+}
+
+}  // namespace
+
 RingEngine::RingEngine(const RingConfig& cfg, ring_py::TensorMetaFifo& fifo,
                        SubmitFn submit_fn)
-    : cfg_(cfg), ring_(cfg)
+    : cfg_(validate_legacy_config(cfg)), ring_(cfg_)
 {
     if (cfg_.payload_ring_bytes % PAYLOAD_ALIGN != 0) {
         throw std::runtime_error("RingConfig: payload_ring_bytes must be a multiple of "
@@ -59,7 +82,21 @@ RingEngine::RingEngine(const RingConfig& cfg,
     }
 
     staging_.init(cfg.effective_staging_bytes());
-    drain_ = std::make_unique<DrainThread>(ring_.state(), staging_, cfg_);
+    recurring_d2h_windows_ = make_recurring_d2h_subsystem(
+        cfg_.recurring_d2h_windows, current_device());
+    drain_ = std::make_unique<DrainThread>(
+        ring_.state(),
+        staging_,
+        cfg_,
+        recurring_d2h_windows_
+            ? &recurring_d2h_windows_->grant_controller() : nullptr,
+        recurring_d2h_windows_
+            ? &recurring_d2h_windows_->mode_controller() : nullptr,
+        recurring_d2h_windows_
+            ? std::function<void()>([this] {
+                  recurring_d2h_windows_->record_capacity_forced_flush();
+              })
+            : std::function<void()>());
     record_sink_ = record_sink_lease_
         ? record_sink_lease_->claim() : nullptr;
     try {
@@ -130,6 +167,36 @@ const RecordConsumer& RingEngine::record_consumer() const {
         throw std::logic_error("record consumer requested from legacy ring");
     }
     return record_p2p_->consumer();
+}
+
+void RingEngine::define_d2h_window_pattern(
+    uint64_t period,
+    std::vector<D2HWindowOffset> windows,
+    std::optional<uint64_t> initial_counter,
+    cudaStream_t framework_stream) {
+    if (!recurring_d2h_windows_) {
+        throw std::logic_error("recurring D2H windows are not enabled");
+    }
+    recurring_d2h_windows_->define_pattern(
+        period,
+        std::move(windows),
+        initial_counter,
+        framework_stream,
+        *drain_);
+}
+
+D2HWindowProgressState RingEngine::d2h_window_progress_state() const {
+    if (!recurring_d2h_windows_) {
+        throw std::logic_error("recurring D2H windows are not enabled");
+    }
+    return recurring_d2h_windows_->progress_state();
+}
+
+D2HWindowRuntimeSnapshot RingEngine::d2h_window_runtime_snapshot() const noexcept {
+    if (!recurring_d2h_windows_) {
+        return D2HWindowRuntimeSnapshot{};
+    }
+    return recurring_d2h_windows_->snapshot();
 }
 
 }  // namespace ring

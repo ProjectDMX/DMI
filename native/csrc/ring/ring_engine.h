@@ -7,6 +7,7 @@
 #include "p2p_thread.h"
 #include "record_sink.h"
 #include "tensor_meta.h"
+#include "d2h_window_subsystem.h"
 
 #include <memory>
 #include <vector>
@@ -34,6 +35,20 @@ public:
     std::shared_ptr<RecordSink> record_sink() const { return record_sink_; }
     bool record_mode() const { return static_cast<bool>(record_p2p_); }
 
+    bool recurring_d2h_windows_enabled() const noexcept {
+        return static_cast<bool>(recurring_d2h_windows_);
+    }
+    D2HWindowProgressKind d2h_window_progress_kind() const noexcept {
+        return cfg_.recurring_d2h_windows.progress;
+    }
+    void define_d2h_window_pattern(
+        uint64_t period,
+        std::vector<D2HWindowOffset> windows,
+        std::optional<uint64_t> initial_counter,
+        cudaStream_t framework_stream);
+    D2HWindowProgressState d2h_window_progress_state() const;
+    D2HWindowRuntimeSnapshot d2h_window_runtime_snapshot() const noexcept;
+
     uint64_t  payload_cap() const { return cfg_.payload_ring_bytes; }
     uint64_t  staging_cap() const { return staging_.capacity(); }
     uint64_t  task_cap()    const { return cfg_.task_ring_entries; }
@@ -42,6 +57,7 @@ private:
     RingConfig      cfg_;
     AllocatedRing   ring_;
     PinnedStaging   staging_;
+    std::unique_ptr<RecurringD2HWindowSubsystem> recurring_d2h_windows_;
     std::unique_ptr<DrainThread>  drain_;
     std::unique_ptr<P2PThread>    p2p_;
     std::shared_ptr<RecordSinkLease> record_sink_lease_;

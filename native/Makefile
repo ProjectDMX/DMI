@@ -12,7 +12,14 @@ SRCS := csrc/bindings.cpp \
         csrc/reference_python_capture_sink.cpp \
         csrc/clickhouse_client.cpp \
         csrc/ring/drain_thread.cpp \
+        csrc/ring/d2h_window_debug.cpp \
+        csrc/ring/d2h_window_grant_policy.cpp \
+        csrc/ring/d2h_window_mode.cpp \
+        csrc/ring/d2h_window_pattern.cpp \
+        csrc/ring/d2h_window_progress.cpp \
+        csrc/ring/d2h_window_subsystem.cpp \
         csrc/ring/p2p_thread.cpp \
+        csrc/ring/recurring_d2h_grant_controller.cpp \
         csrc/ring/record_consumer.cpp \
         csrc/ring/ring_torch_op.cpp
 HOST_SRCS := csrc/bindings.cpp csrc/clickhouse_client.cpp
@@ -22,6 +29,13 @@ HEADERS := csrc/dmx_host_utils.h \
            csrc/dmx_host_engine.h csrc/record_schema.h \
            csrc/ring/ring_config.h csrc/ring/ring_state.h csrc/ring/ring_alloc.h \
            csrc/ring/publication_word.h csrc/ring/drain_task.h csrc/ring/drain_thread.h \
+           csrc/ring/d2h_window_config.h csrc/ring/d2h_window_debug.h \
+           csrc/ring/d2h_window_grant_policy.h csrc/ring/d2h_window_marker.h \
+           csrc/ring/d2h_window_mode.h csrc/ring/d2h_window_pattern.h \
+           csrc/ring/d2h_window_pause.h csrc/ring/d2h_window_progress.h \
+           csrc/ring/d2h_window_progress_layout.h \
+           csrc/ring/d2h_window_subsystem.h \
+           csrc/ring/recurring_d2h_grant_controller.h \
            csrc/ring/record_descriptor.h csrc/ring/record_consumer.h \
            csrc/ring/record_sink.h \
            csrc/ring/p2p_thread.h csrc/ring/pinned_staging.h \
@@ -173,6 +187,7 @@ NVCCFLAGS := \
     -Icsrc
 
 RING_SRCS := csrc/ring/producer.cu \
+             csrc/ring/d2h_window_marker.cu \
              csrc/ring/ring_engine.cu \
              csrc/ring/ring_engine_py.cu
 RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))

@@ -16,6 +16,7 @@
 #include "ring_config.h"
 #include "pinned_staging.h"
 #include "drain_task.h"
+#include "d2h_window_pause.h"
 
 #include <cuda_runtime.h>
 #include <atomic>
@@ -23,6 +24,7 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -30,14 +32,23 @@
 
 namespace ring {
 
+class D2HGrantController;
+class D2HWindowModeController;
+
 struct RecordReservationItem {
     uint64_t reserved_payload_bytes{0};
     bool needs_reclaim{false};
 };
 
-class DrainThread {
+class DrainThread : public DrainPauseControl {
 public:
-    DrainThread(RingState& rs, PinnedStaging& staging, const RingConfig& cfg);
+    DrainThread(
+        RingState& rs,
+        PinnedStaging& staging,
+        const RingConfig& cfg,
+        D2HGrantController* grant_controller = nullptr,
+        D2HWindowModeController* mode_controller = nullptr,
+        std::function<void()> capacity_flush_callback = {});
     ~DrainThread() noexcept;
 
     DrainThread(const DrainThread&)            = delete;
@@ -51,14 +62,18 @@ public:
     // Request the drain thread to flush all pending entries, then block
     // until it finishes.  Caller must have done cudaStreamSynchronize on
     // the main stream first so all GPU writes are visible.
-    void force_flush_and_wait();
+    void force_flush_and_wait(bool counts_for_fallback = false);
 
     // Deadline-aware form used only by checked generic-record completion.
     // Returns false only when this request's flush generation has not
     // completed by deadline.  A timed-out request remains owned by the drain
     // thread; record-mode callers do not reuse the runtime after timeout.
     bool force_flush_and_wait_until(
-        std::chrono::steady_clock::time_point deadline);
+        std::chrono::steady_clock::time_point deadline,
+        bool counts_for_fallback = false);
+
+    DrainPauseToken pause_after_flush_and_wait() override;
+    void resume(DrainPauseToken token) override;
 
     // Submit a CPU-direct tensor to drain -> p2p pipeline.
     // The tensor is already in pageable CPU memory; skips D2H and staging.
@@ -95,6 +110,9 @@ private:
     RingState&      ring_;
     PinnedStaging&  staging_;
     RingConfig      cfg_;
+    D2HGrantController* grant_controller_{nullptr};
+    D2HWindowModeController* mode_controller_{nullptr};
+    std::function<void()> capacity_flush_callback_;
     int             owner_device_{-1};
     cudaStream_t    stream_{};
 
@@ -135,6 +153,10 @@ private:
     // waiter.
     uint64_t                flush_requested_generation_{0};  // guarded by mu_
     uint64_t                flush_completed_generation_{0};  // guarded by mu_
+    bool                    pending_flush_counts_for_fallback_{false};
+    uint64_t                pause_requested_generation_{0};  // guarded by mu_
+    uint64_t                pause_acknowledged_generation_{0}; // guarded by mu_
+    uint64_t                pause_resumed_generation_{0};    // guarded by mu_
     std::exception_ptr      drain_failure_;                  // guarded by mu_
     std::condition_variable flush_done_cv_;
 
@@ -152,7 +174,8 @@ private:
 
     // Drain all pending entries -- called by the drain thread for an
     // outstanding flush generation.  Flushes repeatedly until empty.
-    void do_full_flush();
+    bool do_full_flush();
+    bool do_window_decision();
 
     // Called under mgmt_mu_:
     void scan_ready();

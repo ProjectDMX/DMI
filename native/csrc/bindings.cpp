@@ -605,6 +605,43 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Ring offload engine
   // -------------------------------------------------------------------------
 #ifndef DMI_HOST_ONLY
+  py::enum_<ring::D2HWindowProgressKind>(m, "D2HWindowProgressKind")
+      .value("PACKED_VERSION_COUNTER",
+             ring::D2HWindowProgressKind::PACKED_VERSION_COUNTER);
+  py::enum_<ring::D2HWindowGrantPolicyKind>(m, "D2HWindowGrantPolicyKind")
+      .value("LAST_K_ADAPTIVE",
+             ring::D2HWindowGrantPolicyKind::LAST_K_ADAPTIVE);
+  py::class_<ring::RecurringD2HWindowConfig>(m, "RecurringD2HWindowConfig")
+      .def(py::init<>())
+      .def_readwrite("enabled", &ring::RecurringD2HWindowConfig::enabled)
+      .def_readwrite("progress", &ring::RecurringD2HWindowConfig::progress)
+      .def_readwrite("grant_policy",
+                     &ring::RecurringD2HWindowConfig::grant_policy)
+      .def_readwrite("history_size",
+                     &ring::RecurringD2HWindowConfig::history_size)
+      .def_readwrite(
+          "minimum_record_probe_retry_interval_occurrences",
+          &ring::RecurringD2HWindowConfig::
+              minimum_record_probe_retry_interval_occurrences)
+      .def_readwrite(
+          "capacity_flush_fallback_threshold",
+          &ring::RecurringD2HWindowConfig::capacity_flush_fallback_threshold)
+      .def_readwrite("debug_enabled",
+                     &ring::RecurringD2HWindowConfig::debug_enabled);
+  py::enum_<ring::D2HWindowMode>(m, "D2HWindowMode")
+      .value("DISABLED", ring::D2HWindowMode::DISABLED)
+      .value("ENABLED_NO_PATTERN", ring::D2HWindowMode::ENABLED_NO_PATTERN)
+      .value("ENABLED_ACTIVE", ring::D2HWindowMode::ENABLED_ACTIVE)
+      .value("ENABLED_FALLBACK", ring::D2HWindowMode::ENABLED_FALLBACK);
+  py::class_<ring::D2HWindowRuntimeSnapshot>(m, "D2HWindowRuntimeSnapshot")
+      .def_readonly("mode", &ring::D2HWindowRuntimeSnapshot::mode)
+      .def_readonly(
+          "capacity_forced_flush_count",
+          &ring::D2HWindowRuntimeSnapshot::capacity_forced_flush_count)
+      .def_readonly(
+          "capacity_flush_fallback_threshold",
+          &ring::D2HWindowRuntimeSnapshot::capacity_flush_fallback_threshold);
+
   py::class_<ring_py::RingConfig>(m, "RingConfig")
       .def(py::init<>())
       .def_readwrite("task_ring_entries",         &ring_py::RingConfig::task_ring_entries)
@@ -618,7 +655,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("drain_flush_timeout_us",     &ring_py::RingConfig::drain_flush_timeout_us)
       .def_readwrite("clone_slices",              &ring_py::RingConfig::clone_slices)
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
-      .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
+      .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items)
+      .def_readwrite("recurring_d2h_windows",
+                     &ring_py::RingConfig::recurring_d2h_windows);
 
   // Production sinks remain native-only.  The explicitly named reference
   // bridge below is opt-in and intentionally pays the Python GIL/copy cost.
@@ -764,6 +803,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
       .def("task_cap",    &ring_py::RingEnginePy::task_cap)
       .def("payload_tensor", &ring_py::RingEnginePy::payload_tensor)
+      .def("define_d2h_window_pattern",
+           [](ring_py::RingEnginePy& self,
+              uint64_t period,
+              const std::vector<std::pair<uint64_t, uint64_t>>& windows,
+              std::optional<uint64_t> initial_counter) {
+             std::vector<ring::D2HWindowOffset> offsets;
+             offsets.reserve(windows.size());
+             for (const auto& window : windows) {
+               offsets.push_back({window.first, window.second});
+             }
+             py::gil_scoped_release release;
+             self.define_d2h_window_pattern(
+                 period, std::move(offsets), initial_counter);
+           },
+           py::arg("period"),
+           py::arg("windows"),
+           py::arg("initial_counter") = std::nullopt)
+      .def("_recurring_d2h_windows_enabled",
+           &ring_py::RingEnginePy::recurring_d2h_windows_enabled)
+      .def("_d2h_window_device_progress_tensor",
+           &ring_py::RingEnginePy::d2h_window_device_progress_tensor)
+      .def("_d2h_window_cpu_visible_progress_tensor",
+           &ring_py::RingEnginePy::d2h_window_cpu_visible_progress_tensor)
+      .def("_d2h_window_progress_kind",
+           &ring_py::RingEnginePy::d2h_window_progress_kind)
+      .def("d2h_window_runtime_snapshot",
+           &ring_py::RingEnginePy::d2h_window_runtime_snapshot)
       // Safety-net surface (eager only).  available_capacity() and
       // reserve_one() are CPU-only and fast -- no GIL release needed.
       // flush_and_wait() blocks on cudaStreamSynchronize + drain flush --

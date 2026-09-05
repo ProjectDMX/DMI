@@ -128,6 +128,14 @@ try:
     ) -> None:
         return None
 
+    @torch.library.register_fake("ring::advance_boundary")
+    def _advance_boundary_fake(
+        ring_payload: torch.Tensor,
+        device_packed_progress: torch.Tensor,
+        cpu_visible_packed_progress: torch.Tensor,
+    ) -> None:
+        return None
+
     del _ne
 except Exception:
     pass
@@ -199,6 +207,31 @@ class RingTransport:
         # graph, which inductor cannot reorder.  Pinned at engine init;
         # the data_ptr is stable across cudagraph replays.
         self._ring_payload: torch.Tensor = ring_engine.payload_tensor()
+
+        self._d2h_window_marker = None
+        self._d2h_window_pattern_defined = False
+        self._d2h_window_device_progress: Optional[torch.Tensor] = None
+        self._d2h_window_cpu_visible_progress: Optional[torch.Tensor] = None
+        window_enabled = getattr(
+            ring_engine, "_recurring_d2h_windows_enabled", None
+        )
+        if window_enabled is not None and bool(window_enabled()):
+            marker_registry = {
+                0: torch.ops.ring.advance_boundary.default,
+            }
+            marker_kind = int(ring_engine._d2h_window_progress_kind())
+            try:
+                self._d2h_window_marker = marker_registry[marker_kind]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"unsupported D2H window progress kind: {marker_kind}"
+                ) from exc
+            self._d2h_window_device_progress = (
+                ring_engine._d2h_window_device_progress_tensor()
+            )
+            self._d2h_window_cpu_visible_progress = (
+                ring_engine._d2h_window_cpu_visible_progress_tensor()
+            )
 
         # Current step context -- set before each forward pass
         self._current_model_id: Optional[str] = None
@@ -382,6 +415,37 @@ class RingTransport:
         if hasattr(self, "_record_schema"):
             raise RuntimeError("record schema is already configured")
         self._record_schema = schema
+
+    def define_d2h_window_pattern(
+        self,
+        *,
+        period: int,
+        windows: Any,
+        initial_counter: Optional[int] = None,
+    ) -> None:
+        """Install one recurring-window pattern on the record engine."""
+
+        if self._d2h_window_marker is None:
+            raise RuntimeError("recurring D2H windows are not enabled")
+        self._ring_engine.define_d2h_window_pattern(
+            int(period), tuple(windows), initial_counter
+        )
+        self._d2h_window_pattern_defined = True
+
+    def advance_boundary(self) -> None:
+        """Publish one ordered framework boundary."""
+
+        if self._d2h_window_marker is None:
+            raise RuntimeError("recurring D2H windows are not enabled")
+        if not self._d2h_window_pattern_defined:
+            raise RuntimeError("a D2H window pattern has not been defined")
+        assert self._d2h_window_device_progress is not None
+        assert self._d2h_window_cpu_visible_progress is not None
+        self._d2h_window_marker(
+            self._ring_payload,
+            self._d2h_window_device_progress,
+            self._d2h_window_cpu_visible_progress,
+        )
 
     def reserve_record(self, reservation_items: Any) -> int:
         """Reserve ordered encoded-record producer entries."""

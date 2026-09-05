@@ -167,6 +167,7 @@ MonitoringEngine(
     host_engine=None,
     db_config=None,
     enable_ring_transport: bool = True,
+    record_mode_v1: bool = False,
     ring_config=None,
     ring_payload_mb: int = 4096,
     ring_pinned_mb: int = 4096,
@@ -189,6 +190,9 @@ accessing those objects.
 - `host_engine` and `db_config` are mutually exclusive.
 - Supplying `ring_config` starts a ring even when
   `enable_ring_transport=False`.
+- `record_mode_v1=True` retains the ring configuration without constructing a
+  legacy ring. A later `create_record_runtime()` constructs the encoded-record
+  ring directly. Recurring D2H windows require this mode.
 - With no explicit `ring_config`, the wrapper defaults to a 4096 MiB GPU
   payload ring, 4096 MiB pinned staging ring, and 65,536 task entries. These
   are much larger than raw `RingConfig()` defaults.
@@ -350,7 +354,8 @@ engine.flush_and_wait(timeout_s=600.0)
 ```
 
 The public operations are `create_record_runtime()`, `bind_hook()`,
-`emit_output()`, `prepare_replay()`, and `flush_and_wait()`.
+`emit_output()`, `prepare_replay()`, `define_d2h_window_pattern()`,
+`advance_boundary()`, and `flush_and_wait()`.
 
 `RecordRuntime.bind_hook()` assigns stable output IDs and binds the hook to the
 record ring. `RecordRuntime.emit_output()` reserves and publishes one eager
@@ -358,6 +363,54 @@ descriptor before its host-selected producer occurrence.
 `RecordRuntime.prepare_replay()` publishes fresh descriptors for the
 host-selected entries in an existing physical plan. Every accepted producer
 occurrence has exactly one descriptor and one task.
+
+### Recurring D2H windows
+
+Recurring D2H windows constrain record-mode transfers to framework-supplied,
+repeating execution windows. The integration defines the pattern once and
+publishes one boundary at each ordered execution point:
+
+```python
+windows = dmi.RecurringD2HWindowConfig()
+windows.enabled = True
+windows.history_size = 4
+windows.minimum_record_probe_retry_interval_occurrences = 4
+windows.capacity_flush_fallback_threshold = 3
+windows.debug_enabled = False
+
+ring = dmi.RingConfig()
+ring.recurring_d2h_windows = windows
+engine = dmi.MonitoringEngine(
+    model_id="my-run",
+    host_engine=host,
+    ring_config=ring,
+    record_mode_v1=True,
+)
+runtime = engine.create_record_runtime(record_format)
+
+runtime.define_d2h_window_pattern(
+    period=100,
+    windows=[(20, 30), (70, 80)],
+)
+
+# Enqueue this on the same ordered framework CUDA stream used by producers.
+runtime.advance_boundary()
+```
+
+`period` and every window endpoint are boundary-counter values. Windows must
+be nonempty, sorted, non-overlapping half-open ranges satisfying
+`0 <= begin < end <= period`. `initial_counter` defaults to zero and may be
+provided when defining a new pattern version. Pattern definition and every
+`advance_boundary()` call must use the same ordered framework CUDA stream.
+Define a pattern before the first boundary call and before CUDA Graph capture.
+
+The drain learns a transferable byte grant independently for each recurring
+window. While the feature is active, ordinary batch thresholds and timeout
+flushes do not initiate D2H. Full ring capacity can still force a flush; after
+`capacity_flush_fallback_threshold` such completed flushes, the engine
+permanently returns to existing batched draining. A too-small learned window
+periodically probes one complete record according to
+`minimum_record_probe_retry_interval_occurrences`.
 
 When a hook uses a device gate, the integration must apply the same selection
 before host reservation and descriptor publication. A gated-off occurrence is
@@ -954,6 +1007,7 @@ do not reconfigure it.
 | `clone_slices` | `False` | Clone multi-request slices so full assembled tensors can be released sooner. |
 | `insert_queue_max_bytes` | `4 GiB` | Reserved field; current v1 does not apply it to host queue limits. |
 | `insert_queue_max_items` | `65536` | Reserved field; current v1 does not apply it to host queue limits. |
+| `recurring_d2h_windows` | disabled configuration | Grouped `RecurringD2HWindowConfig`; supported only by the encoded-record ring. |
 
 Flush triggers are ORed, and full ring capacity always forces a flush. For
 live readback of small workloads, configure `drain_flush_timeout_us`; the poll
@@ -963,6 +1017,21 @@ configuration can fail during ring construction.
 Actual ClickHouse queue batching/backpressure is controlled by
 `StageConfig.input_queue` and its public `QueueConfig`; do not rely on the two
 reserved ring fields.
+
+### `RecurringD2HWindowConfig`
+
+The grouped recurring-window configuration is copied with `RingConfig` during
+ring construction.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `False` | Enable recurring-window scheduling. |
+| `progress` | packed version/counter | Fixed progress backend for v1; leave unchanged. |
+| `grant_policy` | last-K adaptive | Fixed grant policy for v1; leave unchanged. |
+| `history_size` | `0` | Number of recent attempts used by the policy; must be at least two when enabled. |
+| `minimum_record_probe_retry_interval_occurrences` | `0` | Recurring-window occurrences between minimum-record probes; must be positive when enabled. |
+| `capacity_flush_fallback_threshold` | `0` | Completed capacity-forced flushes before permanent batched fallback; must be positive when enabled. |
+| `debug_enabled` | `False` | Log each real recurring-window D2H issue and completion. |
 
 ### `ClickHouseClientConfig`
 

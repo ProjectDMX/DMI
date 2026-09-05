@@ -235,6 +235,92 @@ def test_ring_runtime_api_requires_an_enabled_transport():
         engine.flush_and_wait()
 
 
+def test_record_mode_v1_defers_legacy_ring_construction():
+    ring_config = object()
+
+    engine = MonitoringEngine(
+        record_mode_v1=True,
+        ring_config=ring_config,
+    )
+
+    assert engine._ring_config is ring_config
+    assert engine._ring_transport is None
+    assert getattr(engine, "_ring_engine", None) is None
+
+
+def test_record_mode_v1_constructs_record_ring_directly(monkeypatch):
+    from dmi.records import (
+        RecordCellType,
+        RecordColumn,
+        RecordLayout,
+        RecordSchema,
+    )
+
+    ring_config = object()
+    engine = MonitoringEngine(
+        record_mode_v1=True,
+        ring_config=ring_config,
+    )
+    new_ring = _FakeRingEngine()
+    created = []
+    activated = []
+    deactivated = []
+
+    class _Format:
+        schema = RecordSchema(
+            (
+                RecordLayout(
+                    "events",
+                    "events",
+                    (RecordColumn("event_id", RecordCellType.INT64),),
+                    primary_key=("event_id",),
+                    order_by=("event_id",),
+                ),
+            )
+        )
+
+        def encode(self, metadata, entry):
+            raise AssertionError("encoding is not part of runtime construction")
+
+    class _FakeTransport:
+        def __init__(self, native_ring):
+            self._ring_payload = native_ring.payload_tensor()
+            self.null_offload = False
+            self.force_eager = False
+
+        def _record_payload_tensor(self):
+            return self._ring_payload
+
+        def configure_record_schema(self, schema):
+            self._record_schema = schema
+
+    class _Factory:
+        @staticmethod
+        def create_record(config, target):
+            created.append((config, target))
+            return new_ring
+
+    fake_transport_module = ModuleType("dmi.transport.ring")
+    fake_transport_module.RingTransport = _FakeTransport
+    fake_transport_module.activate = activated.append
+    fake_transport_module.deactivate = lambda: deactivated.append(True)
+    fake_native_module = ModuleType("dmi.transport.native")
+    fake_native_module.RecordSink = type("RecordSink", (), {})
+    fake_native_module.RingEngine = _Factory
+    monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
+
+    runtime = engine.create_record_runtime(_Format())
+
+    assert runtime is not None
+    assert created == [(ring_config, None)]
+    assert deactivated == []
+    assert new_ring.init_calls == 1
+    assert new_ring.start_calls == 1
+    assert activated == [engine._ring_transport]
+    assert engine._record_mode is True
+
+
 def test_create_record_runtime_is_additive_and_uses_active_transport(monkeypatch):
     from dmi.records import (
         RecordCellType,

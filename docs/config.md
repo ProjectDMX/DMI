@@ -77,6 +77,51 @@ By default, timeout-based flushing is disabled and the drain thread flushes at
 are explicitly set to 0, the drain thread only flushes when the ring is 100%
 full or at `stop()` time.
 
+## Recurring D2H Windows (`recurring_d2h_windows`)
+
+This grouped configuration is disabled by default and is supported only by the
+HookPointV1 encoded-record path. Construct `MonitoringEngine` with
+`record_mode_v1=True`, then create a `RecordRuntime` before defining a pattern.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | `bool` | false | Enable recurring-window scheduling. |
+| `progress` | native enum | packed version/counter | Fixed progress backend for this version; leave unchanged. |
+| `grant_policy` | native enum | last-K adaptive | Fixed byte-grant policy for this version; leave unchanged. |
+| `history_size` | `uint64_t` | 0 | Recent attempts retained by the policy; must be at least 2 when enabled. |
+| `minimum_record_probe_retry_interval_occurrences` | `uint64_t` | 0 | Window occurrences between minimum-record probes; must be positive when enabled. |
+| `capacity_flush_fallback_threshold` | `uint64_t` | 0 | Completed capacity-forced flushes before permanent batched fallback; must be positive when enabled. |
+| `debug_enabled` | `bool` | false | Log every real window-scheduled D2H issue and completion. |
+
+The integration defines sorted, non-overlapping half-open window offsets
+within a positive period, then calls `RecordRuntime.advance_boundary()` at each
+ordered framework boundary. Both operations must use the same framework CUDA
+stream, and the pattern must be defined before the first marker or CUDA Graph
+capture.
+
+```python
+from dmi.api import v1 as dmi
+
+windows = dmi.RecurringD2HWindowConfig()
+windows.enabled = True
+windows.history_size = 4
+windows.minimum_record_probe_retry_interval_occurrences = 4
+windows.capacity_flush_fallback_threshold = 3
+
+cfg = dmi.RingConfig()
+cfg.recurring_d2h_windows = windows
+
+engine = dmi.MonitoringEngine(
+    model_id="my-run",
+    host_engine=host,
+    ring_config=cfg,
+    record_mode_v1=True,
+)
+runtime = engine.create_record_runtime(record_format)
+runtime.define_d2h_window_pattern(period=100, windows=[(20, 30), (70, 80)])
+runtime.advance_boundary()
+```
+
 ## P2P Thread / Output
 
 | Parameter | Type | Default | Description |

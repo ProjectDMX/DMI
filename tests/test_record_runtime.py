@@ -57,6 +57,12 @@ class _Transport:
         if self.pending_tasks:
             raise TimeoutError("unmatched reserved record tasks")
 
+    def define_d2h_window_pattern(self, **kwargs):
+        self.events.append(("define_d2h_window_pattern", kwargs))
+
+    def advance_boundary(self):
+        self.events.append(("advance_boundary",))
+
 class _Format:
     def __init__(self, layout_name="tensor_rows"):
         self.schema = RecordSchema(
@@ -254,6 +260,29 @@ def test_dynamic_producer_is_individually_marked_for_reclaim():
     runtime.emit_output(entry, "dynamic", output)
 
     assert transport.events[0] == ("reserve", ((64, True),))
+
+
+def test_d2h_window_operations_delegate_without_exposing_transport_state():
+    runtime, transport, _output, _entry = _runtime_and_entry()
+
+    runtime.define_d2h_window_pattern(
+        period=12,
+        windows=((1, 3), (8, 10)),
+        initial_counter=7,
+    )
+    runtime.advance_boundary()
+
+    assert transport.events == [
+        (
+            "define_d2h_window_pattern",
+            {
+                "period": 12,
+                "windows": ((1, 3), (8, 10)),
+                "initial_counter": 7,
+            },
+        ),
+        ("advance_boundary",),
+    ]
 
 
 def test_two_independent_formats_do_not_share_schema_or_output_registry():

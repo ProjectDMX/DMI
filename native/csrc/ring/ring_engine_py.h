@@ -9,12 +9,15 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "ring/tensor_meta.h"   // TensorMeta, TensorMetaFifo
 #include "ring/record_descriptor.h"
+#include "ring/d2h_window_config.h"
+#include "ring/d2h_window_mode.h"
 
 // Forward-declare ATen and the generic sink so this plain interface does not
 // expose their implementation headers.
@@ -43,6 +46,7 @@ struct RingConfig {
     // ClickHouse insert queue limits
     uint64_t insert_queue_max_bytes     = 4096ULL * 1024 * 1024;
     uint64_t insert_queue_max_items     = 65536;
+    ring::RecurringD2HWindowConfig recurring_d2h_windows;
 };
 
 // Called by the p2p thread for each per-request tensor slice.
@@ -216,6 +220,16 @@ public:
     // GIL.  Used by safety-net branches that need to free ring space or
     // ensure FIFO ordering before consuming the next meta out-of-band.
     void flush_and_wait();
+
+    void define_d2h_window_pattern(
+        uint64_t period,
+        std::vector<ring::D2HWindowOffset> windows,
+        std::optional<uint64_t> initial_counter = std::nullopt);
+    bool recurring_d2h_windows_enabled() const;
+    at::Tensor d2h_window_device_progress_tensor() const;
+    at::Tensor d2h_window_cpu_visible_progress_tensor() const;
+    uint8_t d2h_window_progress_kind() const;
+    ring::D2HWindowRuntimeSnapshot d2h_window_runtime_snapshot() const;
 
 private:
     struct Impl;

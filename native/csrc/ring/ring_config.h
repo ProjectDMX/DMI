@@ -4,6 +4,7 @@
 // re-capturing the CUDA graph (Milestone 5 constraint).
 
 #pragma once
+#include "d2h_window_config.h"
 #include <cstdint>
 
 namespace ring {
@@ -69,6 +70,8 @@ struct RingConfig {
     // P2p thread blocks on submit_direct() when queue is full.
     uint64_t insert_queue_max_bytes = 4096ULL * 1024 * 1024;  // 4 GiB
     uint64_t insert_queue_max_items = 65536;
+
+    RecurringD2HWindowConfig recurring_d2h_windows;
 
     // Effective staging capacity (resolved at init time).
     // If pinned_staging_bytes == 0, defaults to payload_ring_bytes.

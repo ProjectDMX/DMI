@@ -5,6 +5,8 @@
 // Space is guaranteed by the pre-forward capacity check in Python.
 
 #include "drain_thread.h"
+#include "d2h_window_mode.h"
+#include "recurring_d2h_grant_controller.h"
 #include "publication_word.h"
 #include "ring_config.h"
 #include "ring_debug.h"
@@ -47,9 +49,19 @@ void throw_cuda_failure(const char* operation, cudaError_t error) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-DrainThread::DrainThread(RingState& rs, PinnedStaging& staging,
-                         const RingConfig& cfg)
-    : ring_(rs), staging_(staging), cfg_(cfg)
+DrainThread::DrainThread(
+    RingState& rs,
+    PinnedStaging& staging,
+    const RingConfig& cfg,
+    D2HGrantController* grant_controller,
+    D2HWindowModeController* mode_controller,
+    std::function<void()> capacity_flush_callback)
+    : ring_(rs),
+      staging_(staging),
+      cfg_(cfg),
+      grant_controller_(grant_controller),
+      mode_controller_(mode_controller),
+      capacity_flush_callback_(std::move(capacity_flush_callback))
 {
     cudaError_t error = cudaGetDevice(&owner_device_);
     if (error != cudaSuccess) {
@@ -118,7 +130,7 @@ void DrainThread::notify() {
 // Called from Python thread with GIL released.  Caller must have done
 // cudaStreamSynchronize(main_stream) first so all GPU writes are visible.
 // ---------------------------------------------------------------------------
-void DrainThread::force_flush_and_wait() {
+void DrainThread::force_flush_and_wait(bool counts_for_fallback) {
     uint64_t generation = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -127,6 +139,8 @@ void DrainThread::force_flush_and_wait() {
         // allowing stop() to clean up a terminally failed drain worker.
         if (drain_failure_) return;
         generation = ++flush_requested_generation_;
+        pending_flush_counts_for_fallback_ =
+            pending_flush_counts_for_fallback_ || counts_for_fallback;
         notified_ = true;
     }
     cv_.notify_one();  // wake drain thread
@@ -139,12 +153,15 @@ void DrainThread::force_flush_and_wait() {
 }
 
 bool DrainThread::force_flush_and_wait_until(
-    std::chrono::steady_clock::time_point deadline) {
+    std::chrono::steady_clock::time_point deadline,
+    bool counts_for_fallback) {
     uint64_t generation = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (drain_failure_) std::rethrow_exception(drain_failure_);
         generation = ++flush_requested_generation_;
+        pending_flush_counts_for_fallback_ =
+            pending_flush_counts_for_fallback_ || counts_for_fallback;
         notified_ = true;
     }
     cv_.notify_one();
@@ -160,6 +177,38 @@ bool DrainThread::force_flush_and_wait_until(
     lk.unlock();
     if (failure) std::rethrow_exception(failure);
     return true;
+}
+
+DrainPauseToken DrainThread::pause_after_flush_and_wait() {
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (drain_failure_) std::rethrow_exception(drain_failure_);
+        generation = ++pause_requested_generation_;
+        notified_ = true;
+    }
+    cv_.notify_one();
+
+    std::unique_lock<std::mutex> lock(mu_);
+    flush_done_cv_.wait(lock, [this, generation] {
+        return pause_acknowledged_generation_ >= generation ||
+            static_cast<bool>(drain_failure_);
+    });
+    if (drain_failure_) std::rethrow_exception(drain_failure_);
+    return DrainPauseToken{generation};
+}
+
+void DrainThread::resume(DrainPauseToken token) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (token.generation == 0 ||
+            token.generation != pause_acknowledged_generation_ ||
+            token.generation <= pause_resumed_generation_) {
+            return;
+        }
+        pause_resumed_generation_ = token.generation;
+    }
+    cv_.notify_one();
 }
 
 void DrainThread::record_drain_failure(std::exception_ptr failure) {
@@ -338,7 +387,8 @@ void DrainThread::submit_cpu_direct(at::Tensor cpu_tensor, uint64_t tensor_bytes
 // ---------------------------------------------------------------------------
 // do_full_flush -- drain all pending entries.  Called by drain thread only.
 // ---------------------------------------------------------------------------
-void DrainThread::do_full_flush() {
+bool DrainThread::do_full_flush() {
+    bool moved_data = false;
     for (;;) {
         uint64_t flush_count = 0, flush_bytes = 0;
         {
@@ -360,6 +410,7 @@ void DrainThread::do_full_flush() {
         }
         enqueue_d2h(flush_bytes);
         sync_stream();
+        moved_data = moved_data || flush_bytes != 0;
         {
             std::lock_guard<std::mutex> lk(mgmt_mu_);
             cpu_payload_tail_committed_ = cpu_payload_tail_;
@@ -370,6 +421,87 @@ void DrainThread::do_full_flush() {
             trim_scanned(flush_count, flush_bytes);
         }
     }
+    return moved_data;
+}
+
+bool DrainThread::do_window_decision() {
+    if (!grant_controller_ || !mode_controller_) return false;
+
+    const D2HWindowMode before = mode_controller_->mode();
+    if (before == D2HWindowMode::ENABLED_NO_PATTERN ||
+        before == D2HWindowMode::ENABLED_ACTIVE) {
+        grant_controller_->reconcile_progress();
+    }
+    if (!mode_controller_->window_scheduling_in_effect()) return false;
+
+    uint64_t flush_count = 0;
+    uint64_t flush_bytes = 0;
+    std::optional<D2HWindowAdmission> admission;
+    {
+        std::lock_guard<std::mutex> lock(mgmt_mu_);
+        scan_ready();
+
+        uint64_t staging_free = 0;
+        {
+            std::lock_guard<std::mutex> staging_lock(staging_mu_);
+            staging_free = staging_.free_bytes();
+        }
+
+        uint64_t full_count = 0;
+        uint64_t full_bytes = 0;
+        for (const uint64_t actual_bytes : scanned_) {
+            const uint64_t aligned = align_up(actual_bytes, PAYLOAD_ALIGN);
+            if (aligned > staging_free - full_bytes) break;
+            full_bytes += aligned;
+            ++full_count;
+        }
+
+        D2HWindowAvailability availability{};
+        availability.full_grant_bytes = full_bytes;
+        if (full_count != 0) {
+            availability.first_record_bytes =
+                align_up(scanned_.front(), PAYLOAD_ALIGN);
+        }
+        admission = grant_controller_->consider(availability);
+        if (!admission.has_value() || full_count == 0) return true;
+
+        if (admission->minimum_record_probe) {
+            const uint64_t aligned =
+                align_up(scanned_.front(), PAYLOAD_ALIGN);
+            if (aligned <= admission->byte_limit) {
+                flush_count = 1;
+                flush_bytes = aligned;
+            }
+        } else {
+            for (uint64_t index = 0; index < full_count; ++index) {
+                const uint64_t aligned =
+                    align_up(scanned_[index], PAYLOAD_ALIGN);
+                if (aligned > admission->byte_limit - flush_bytes) break;
+                flush_bytes += aligned;
+                ++flush_count;
+            }
+        }
+
+        if (flush_count == 0 ||
+            !grant_controller_->commit(*admission, flush_bytes)) {
+            return true;
+        }
+        flush_state_update(flush_count, flush_bytes);
+    }
+
+    enqueue_d2h(flush_bytes);
+    sync_stream();
+    grant_controller_->complete(*admission, flush_bytes);
+    {
+        std::lock_guard<std::mutex> lock(mgmt_mu_);
+        cpu_payload_tail_committed_ = cpu_payload_tail_;
+    }
+    submit_to_p2p(flush_count, flush_bytes);
+    {
+        std::lock_guard<std::mutex> lock(mgmt_mu_);
+        trim_scanned(flush_count, flush_bytes);
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -397,28 +529,77 @@ void DrainThread::loop() {
             }
         }
 
-        // Check for force-flush request
+        // Check for force-flush and pause requests together so one physical
+        // full flush can satisfy the generations observed in this snapshot.
         uint64_t flush_generation = 0;
+        uint64_t pause_generation = 0;
+        bool counts_for_fallback = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (flush_requested_generation_ > flush_completed_generation_) {
                 flush_generation = flush_requested_generation_;
+                counts_for_fallback = pending_flush_counts_for_fallback_;
+                pending_flush_counts_for_fallback_ = false;
+            }
+            if (pause_requested_generation_ >
+                pause_acknowledged_generation_) {
+                pause_generation = pause_requested_generation_;
             }
         }
 
-        if (flush_generation != 0) {
+        if (flush_generation != 0 || pause_generation != 0) {
+            bool moved_data = false;
             try {
-                do_full_flush();
+                moved_data = do_full_flush();
+                if (moved_data && counts_for_fallback &&
+                    capacity_flush_callback_) {
+                    capacity_flush_callback_();
+                }
             } catch (...) {
                 record_drain_failure(std::current_exception());
                 continue;
             }
             {
-                std::lock_guard<std::mutex> lk(mu_);
-                flush_completed_generation_ = flush_generation;
+                std::unique_lock<std::mutex> lk(mu_);
+                if (flush_generation != 0) {
+                    flush_completed_generation_ = flush_generation;
+                }
+                if (pause_generation != 0) {
+                    pause_acknowledged_generation_ = pause_generation;
+                }
+                flush_done_cv_.notify_all();
+                if (pause_generation != 0) {
+                    cv_.wait(lk, [this, pause_generation] {
+                        return pause_resumed_generation_ >= pause_generation ||
+                            !running_.load(std::memory_order_relaxed) ||
+                            static_cast<bool>(drain_failure_);
+                    });
+                }
             }
-            flush_done_cv_.notify_all();
             continue;  // skip normal sleep, re-check immediately
+        }
+
+        try {
+            if (do_window_decision()) {
+                std::unique_lock<std::mutex> lk(mu_);
+                auto pred = [this] {
+                    return notified_ ||
+                        flush_requested_generation_ >
+                            flush_completed_generation_ ||
+                        pause_requested_generation_ >
+                            pause_acknowledged_generation_ ||
+                        !running_.load(std::memory_order_relaxed);
+                };
+                cv_.wait_for(
+                    lk,
+                    std::chrono::microseconds(cfg_.drain_poll_timeout_us),
+                    pred);
+                notified_ = false;
+                continue;
+            }
+        } catch (...) {
+            record_drain_failure(std::current_exception());
+            continue;
         }
 
         uint64_t flush_count = 0, flush_bytes = 0;
@@ -481,6 +662,8 @@ void DrainThread::loop() {
                 return notified_ ||
                        flush_requested_generation_ >
                            flush_completed_generation_ ||
+                       pause_requested_generation_ >
+                           pause_acknowledged_generation_ ||
                        !running_.load(std::memory_order_relaxed);
             };
             cv_.wait_for(lk, std::chrono::microseconds(cfg_.drain_poll_timeout_us), pred);

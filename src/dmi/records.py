@@ -249,6 +249,26 @@ class RecordRuntime(Generic[MetadataT]):
         self._bound_hooks: set[int] = set()
         self._device_gated_output_ids: set[int] = set()
 
+    def define_d2h_window_pattern(
+        self,
+        *,
+        period: int,
+        windows: Sequence[tuple[int, int]],
+        initial_counter: int | None = None,
+    ) -> None:
+        """Define a recurring contention-friendly D2H pattern."""
+
+        self._transport.define_d2h_window_pattern(
+            period=period,
+            windows=windows,
+            initial_counter=initial_counter,
+        )
+
+    def advance_boundary(self) -> None:
+        """Publish one ordered boundary for the active D2H pattern."""
+
+        self._transport.advance_boundary()
+
     def bind_hook(
         self,
         hook: HookPointV1,

@@ -162,6 +162,7 @@ static ring::RingConfig convert(const RingConfig& c) {
     r.clone_slices                = c.clone_slices;
     r.insert_queue_max_bytes      = c.insert_queue_max_bytes;
     r.insert_queue_max_items      = c.insert_queue_max_items;
+    r.recurring_d2h_windows       = c.recurring_d2h_windows;
     return r;
 }
 
@@ -441,7 +442,7 @@ int RingEnginePy::prepare_step(uint64_t step_total_bytes,
     // stream so all producer kernels finish writing, then flush.
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
     cudaStreamSynchronize(ms);
-    drain.force_flush_and_wait();
+    drain.force_flush_and_wait(true);
     drain.reserve(step_total_bytes, num_hooks);
     return STEP_RING_FLUSHED;
 }
@@ -504,7 +505,7 @@ int RingEnginePy::reserve_record(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     cudaStreamSynchronize(stream);
-    drain.force_flush_and_wait();
+    drain.force_flush_and_wait(true);
     drain.rethrow_drain_failure();
     drain.rethrow_record_reclaim_failure();
     drain.apply_pending_record_reclaims();
@@ -653,6 +654,39 @@ void RingEnginePy::flush_and_wait() {
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
     cudaStreamSynchronize(ms);
     impl_->engine.drain_thread().force_flush_and_wait();
+}
+
+void RingEnginePy::define_d2h_window_pattern(
+    uint64_t period,
+    std::vector<ring::D2HWindowOffset> windows,
+    std::optional<uint64_t> initial_counter) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    impl_->engine.define_d2h_window_pattern(
+        period, std::move(windows), initial_counter, stream);
+}
+
+bool RingEnginePy::recurring_d2h_windows_enabled() const {
+    return impl_->engine.recurring_d2h_windows_enabled();
+}
+
+at::Tensor RingEnginePy::d2h_window_device_progress_tensor() const {
+    return impl_->engine.d2h_window_progress_state().device_packed_progress;
+}
+
+at::Tensor RingEnginePy::d2h_window_cpu_visible_progress_tensor() const {
+    return impl_->engine.d2h_window_progress_state().cpu_visible_packed_progress;
+}
+
+uint8_t RingEnginePy::d2h_window_progress_kind() const {
+    if (!impl_->engine.recurring_d2h_windows_enabled()) {
+        throw std::logic_error("recurring D2H windows are not enabled");
+    }
+    return static_cast<uint8_t>(impl_->engine.d2h_window_progress_kind());
+}
+
+ring::D2HWindowRuntimeSnapshot
+RingEnginePy::d2h_window_runtime_snapshot() const {
+    return impl_->engine.d2h_window_runtime_snapshot();
 }
 
 }  // namespace ring_py
