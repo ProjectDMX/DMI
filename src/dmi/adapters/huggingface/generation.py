@@ -305,7 +305,23 @@ def _generate_with_monitoring_impl(
 
             decode_bytes = adaptor.decode_step_bytes(batch, kv_dim_estimate)
 
-            if decode_bytes > effective_cap:
+            # The capture-schedule gate is a PYTHON branch in HookPoint.forward.
+            # Under torch.compile + CUDA graphs, replay never runs Python: the
+            # flag is baked at the first decode trace, so a refusal (or a
+            # capture) at step one would apply to EVERY later step. The
+            # capacity path below has the same problem and already disables
+            # compilation; a non-default schedule takes the same fail-safe.
+            schedule = getattr(
+                getattr(getattr(adaptor.engine, "config", None), "schedule", None),
+                "__dataclass_fields__",
+                None,
+            )
+            non_default_schedule = schedule is not None and (
+                adaptor.engine.config.schedule
+                != __import__("dmi.config", fromlist=["CaptureSchedule"]).CaptureSchedule()
+            )
+
+            if decode_bytes > effective_cap or non_default_schedule:
                 # Decode steps will overflow.  Force eager dispatch so
                 # before_forward's per-batch capacity check + HookPoint's
                 # safety net (ring D2D where it fits, submit_cpu_direct
@@ -315,11 +331,20 @@ def _generate_with_monitoring_impl(
                     or kwargs.pop("cache_implementation", None) is not None
                 )
                 kwargs["disable_compile"] = True
-                msg = (
-                    f"[ring_transport] Decode step ({decode_bytes / 1e6:.1f} MB) "
-                    f"exceeds ring capacity ({effective_cap / 1e6:.0f} MB). "
-                    f"Using eager dispatch + per-hook safety net."
-                )
+                if decode_bytes > effective_cap:
+                    msg = (
+                        f"[ring_transport] Decode step ({decode_bytes / 1e6:.1f} MB) "
+                        f"exceeds ring capacity ({effective_cap / 1e6:.0f} MB). "
+                        f"Using eager dispatch + per-hook safety net."
+                    )
+                else:
+                    msg = (
+                        "[ring_transport] The capture schedule is not the "
+                        "default (phase flags / strides / warmup). The gate is "
+                        "a Python branch that CUDA-graph replay would bake at "
+                        "the first decode trace, so compilation is disabled "
+                        "for this generate() call."
+                    )
                 if had_compile:
                     msg += " Disabled CUDA graph compilation for this generate() call."
                 warnings.warn(msg, stacklevel=2)

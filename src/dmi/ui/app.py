@@ -37,6 +37,7 @@ from ..configuration import (
     validate_config,
 )
 from ..configuration.architecture import model_payload
+from .errors import UIDependencyError
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -147,7 +148,7 @@ def create_app(
         from fastapi.staticfiles import StaticFiles
         from starlette.middleware.trustedhost import TrustedHostMiddleware
     except ImportError as exc:  # pragma: no cover - exercised by install state
-        raise RuntimeError(_FASTAPI_MISSING) from exc
+        raise UIDependencyError(_FASTAPI_MISSING) from exc
 
     state = build_state(source, config_path)
 

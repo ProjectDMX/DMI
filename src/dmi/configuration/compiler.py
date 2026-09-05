@@ -78,11 +78,19 @@ def compile_config(config: DMIConfig, model_context: ModelContext) -> CompiledDM
     # message "does not match any hook the attached model exposes" means
     # exactly that: shape suppression says the hook cannot fire, and a hook
     # merely outside the selected range is not misreported as absent.
-    selected = select_hook_specs(
-        model_context.specs,
-        to_legacy_hook_selection(config.observations),
-        cfg=model_context.shape,
-    )
+    # Selection raises bare ValueError for an unknown preset/hook name;
+    # every other pipeline failure is a ConfigurationError -- callers funnel
+    # on that type (the UI's 400 mapping) -- so it joins the taxonomy here.
+    try:
+        selected = select_hook_specs(
+            model_context.specs,
+            to_legacy_hook_selection(config.observations),
+            cfg=model_context.shape,
+        )
+    except ValueError as exc:
+        from .errors import ConfigurationError
+
+        raise ConfigurationError(str(exc)) from exc
     _reject_requested_hooks_that_cannot_fire(config, selected)
 
     specs = selected
