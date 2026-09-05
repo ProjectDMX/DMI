@@ -117,6 +117,25 @@ class Workload:
                 )
         if self.dtype is not None and not isinstance(self.dtype, str):
             raise ValueError(f"dtype must be a string, got {type(self.dtype).__name__}.")
+        # `packed` selects the tensor convention, so a truthy string is not a
+        # harmless coercion: JSON `"false"` would silently estimate the vLLM
+        # convention for a Hugging Face workload (and vice versa).
+        if not isinstance(self.packed, bool):
+            raise ValueError(
+                f"packed must be a boolean, got "
+                f"{type(self.packed).__name__} ({self.packed!r})."
+            )
+        # A bool here reads as 1.0 steps/s and a string explodes inside the
+        # comparison below as a TypeError, which escapes the ValueError
+        # boundary every caller of this constructor handles.
+        if isinstance(self.decode_steps_per_second, bool) or not isinstance(
+            self.decode_steps_per_second, (int, float)
+        ):
+            raise ValueError(
+                "decode_steps_per_second must be a number, got "
+                f"{type(self.decode_steps_per_second).__name__} "
+                f"({self.decode_steps_per_second!r})."
+            )
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}.")
         if self.prompt_tokens < 1:
@@ -534,19 +553,69 @@ def estimate_config(
         multiplier = 1 if load.tp_rank == 0 else tp_size - 1
         total_volume += _rank_volume(load) * multiplier
 
-    # Step/request sampling IS enforced (the adapter driver gates on
-    # should_capture_step / should_capture_request), so the captured volume
-    # divides by both strides. The enforcement is conditional on what the
-    # adapter reports, and the figures say so when it matters: an adapter
-    # that reports no phase keeps both phase flags off the gate, and one
-    # whose scheduler ids have no numeric prefix passes every request.
-    sampling_divisor = max(1, schedule.step_stride) * max(1, schedule.request_stride)
-    if sampling_divisor > 1 or not (capture_prefill and capture_decode):
+    # Step/request sampling is enforced by BackendAdapter's driver, which
+    # gates on should_capture_step / should_capture_request -- but ONLY by
+    # that driver. The pinned vLLM integrations (V1 and V2) construct
+    # MonitoringEngine(config=None) and call commit_step directly, so no
+    # schedule reaches _schedule_allows and production captures every step.
+    # Dividing packed figures by the strides would report a reduction the
+    # shipped runtime does not perform, on the UI's DEFAULT convention.
+    stride_divisor = max(1, schedule.step_stride) * max(1, schedule.request_stride)
+    schedule_is_enforced = not workload.packed
+    if schedule_is_enforced:
+        sampling_divisor = stride_divisor
+    else:
+        sampling_divisor = 1
+        if stride_divisor > 1:
+            warnings.append(
+                "step_stride/request_stride are NOT applied to these packed "
+                "figures: the pinned vLLM integration builds its engine with "
+                "config=None and commits steps directly, bypassing the "
+                "schedule gate, so production captures every step. These "
+                "bytes are the unsampled cost. (Gating vLLM needs graph-safe "
+                "producer gating, not only a host-side predicate.)"
+            )
+        if not (capture_prefill and capture_decode):
+            warnings.append(
+                "capture_prefill/capture_decode are applied here as the "
+                "authored intent, but the pinned vLLM integration does not "
+                "consult the schedule -- verify the phase flags are honoured "
+                "by the integration revision you deploy."
+            )
+    if schedule_is_enforced and (
+        sampling_divisor > 1 or not (capture_prefill and capture_decode)
+    ):
         assumptions.append(
             "assumes the serving adapter reports a phase and numeric request "
             "ids; an adapter that reports neither applies only the stride "
             "and warmup parts of this schedule"
         )
+    if schedule_is_enforced and sampling_divisor > 1:
+        # A stride is not a uniform per-request discount. Step 0 IS captured,
+        # and its prefill alone can exceed the averaged figure by orders of
+        # magnitude; the honest reading of the divided number is a long-run
+        # average over many requests, bounded per step by the peak figure.
+        assumptions.append(
+            "per-request and sustained figures divide by "
+            f"step_stride*request_stride={sampling_divisor}: that is a "
+            "long-run average over many requests, NOT the cost of any one "
+            "request -- an accepted step costs the peak-step figure in full, "
+            "and a request that lands on an accepted step pays it"
+        )
+        offsets = {
+            "step_offset": schedule.step_offset,
+            "warmup_steps": schedule.warmup_steps,
+            "request_offset": schedule.request_offset,
+            "warmup_requests": schedule.warmup_requests,
+        }
+        set_offsets = sorted(name for name, value in offsets.items() if value)
+        if set_offsets:
+            warnings.append(
+                f"{', '.join(set_offsets)} shift WHICH steps and requests are "
+                "captured, and this average does not model them: early "
+                "traffic inside the offset/warmup window captures nothing, "
+                "and the long-run average above is only reached after it."
+            )
 
     per_request = total_volume // sampling_divisor
     # A step covers the whole batch in either convention: packed rows share
@@ -568,10 +637,9 @@ def estimate_config(
             load.decode_step_bytes * (1 if load.tp_rank == 0 else tp_size - 1)
             for load in ranks
         )
-        effective_rate = (
-            workload.decode_steps_per_second
-            / (max(1, schedule.step_stride) * max(1, schedule.request_stride))
-        )
+        # The same divisor the volume figures used: on packed workloads it is
+        # 1, because the pinned vLLM integration never consults the schedule.
+        effective_rate = workload.decode_steps_per_second / sampling_divisor
         sustained = decode_volume * effective_rate
         per_day = sustained * SECONDS_PER_DAY
         assumptions.append(
@@ -604,8 +672,15 @@ def estimate_config(
         )
     if pp_size > 1:
         assumptions.append(
-            f"pipeline_parallel_size={pp_size}: layers split evenly and "
-            "contiguously across stages"
+            f"pipeline_parallel_size={pp_size}: layers split contiguously "
+            "across stages by vLLM's get_pp_indices rule (the remainder goes "
+            "to the FIRST stages)"
+        )
+        warnings.append(
+            "A serving host that sets VLLM_PP_LAYER_PARTITION overrides that "
+            "split, and this estimate cannot see it: per-stage peaks move "
+            "with the partition, so re-check the busiest rank against the "
+            "partition you deploy."
         )
 
     return Estimate(

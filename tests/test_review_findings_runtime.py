@@ -657,12 +657,20 @@ class TestRefusedStepsSilenceProducers:
 
 
 class TestSustainedRateAppliesBothStrides:
+    """Batched (Hugging Face) only: that is the driver that gates on them.
+
+    Sampling divides where ``BackendAdapter.before_forward`` runs. The pinned
+    vLLM integrations commit steps directly with ``config=None``, so the
+    packed side must NOT divide -- pinned in
+    ``test_pr122_round3_review_findings.py``.
+    """
+
     def test_request_stride_thins_the_sustained_rate(self):
         dense = estimate_config(
-            _config(request_stride=1), _descriptor(), _workload()
+            _config(request_stride=1), _descriptor(), _workload(packed=False)
         )
         strided = estimate_config(
-            _config(request_stride=4), _descriptor(), _workload()
+            _config(request_stride=4), _descriptor(), _workload(packed=False)
         )
 
         assert strided.sustained_bytes_per_second == pytest.approx(
@@ -671,13 +679,25 @@ class TestSustainedRateAppliesBothStrides:
 
 
 class TestEstimateDisclosesConditionalEnforcement:
-    def test_strides_on_packed_carry_an_enforcement_assumption(self):
+    def test_strides_on_batched_carry_an_enforcement_assumption(self):
+        """The HF gate is conditional on what the adapter reports."""
         estimate = estimate_config(
-            _config(step_stride=4), _descriptor(), _workload(packed=True)
+            _config(step_stride=4), _descriptor(), _workload(packed=False)
         )
 
         notes = " ".join(estimate.assumptions).lower()
         assert "assumes" in notes and ("phase" in notes or "request ids" in notes)
+
+    def test_strides_on_packed_say_the_schedule_is_not_applied(self):
+        """A packed estimate must not imply a reduction vLLM never performs."""
+        estimate = estimate_config(
+            _config(step_stride=4), _descriptor(), _workload(packed=True)
+        )
+
+        assert any(
+            "vLLM" in warning and "not applied" in warning.lower()
+            for warning in estimate.warnings
+        ), estimate.warnings
 
     def test_default_schedule_makes_no_enforcement_claim(self):
         estimate = estimate_config(_config(), _descriptor(), _workload())

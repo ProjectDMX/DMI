@@ -331,6 +331,13 @@ class HuggingFaceAdapter(BackendAdapter):
             model.prepare_inputs_for_generation = _prepare_wrapper
 
     def detach_model(self, model: Any) -> None:
+        # Release ownership first, and only our own: a nested caller that
+        # detaches someone else's attachment must not clear their marker.
+        if getattr(model, "_dmi_active_adapter", None) is self:
+            try:
+                model._dmi_active_adapter = None
+            except AttributeError:  # pragma: no cover - exotic read-only model
+                pass
         orig = getattr(model, "_monitoring_orig_prepare", None)
         if orig is not None:
             model.prepare_inputs_for_generation = orig

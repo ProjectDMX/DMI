@@ -9,6 +9,7 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
+from ..configuration.errors import ConfigurationError
 from .app import create_app
 
 DEFAULT_HOST = "127.0.0.1"
@@ -55,8 +56,24 @@ def resolve_port(host: str, port: Optional[int]) -> int:
     An explicit ``port`` is returned unchanged -- if it is busy, uvicorn should
     say so. ``None`` means "the usual one, or the next free one after it", so
     that a second configurator does not fail with an address-in-use trace.
+
+    An explicit port outside 1-65535 is refused here rather than passed on:
+    ``--port 0`` would bind an ephemeral port and then advertise
+    ``http://127.0.0.1:0``, a URL nobody can open and which does not name the
+    port actually bound; ``--port 65536`` reaches uvicorn as an OverflowError
+    from deep inside the socket layer.
     """
     if port is not None:
+        if isinstance(port, bool) or not isinstance(port, int):
+            raise ConfigurationError(
+                f"port must be an integer, got {type(port).__name__} ({port!r})."
+            )
+        if not 1 <= port <= 65535:
+            raise ConfigurationError(
+                f"port must be between 1 and 65535, got {port}. "
+                "(Port 0 would bind an arbitrary free port and leave the "
+                "printed URL pointing at nothing.)"
+            )
         return port
     for candidate in range(DEFAULT_PORT, DEFAULT_PORT + PORT_SEARCH_RANGE):
         if port_is_free(host, candidate):
@@ -109,10 +126,12 @@ def serve(
             'with:\n    pip install "DMI[ui]"'
         ) from exc
 
+    # Port first: an unusable --port should fail before the descriptor is
+    # read and a config file is opened.
+    bound_port = resolve_port(host, port)
     app = create_app(source, config_path, bind_host=host)
     token = app.state.launch_token
     ui = app.state.ui
-    bound_port = resolve_port(host, port)
     url = f"http://{host}:{bound_port}"
 
     topology = ui.descriptor.topology

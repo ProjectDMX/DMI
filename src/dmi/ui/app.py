@@ -11,6 +11,7 @@ one descriptor and one optional configuration path for its lifetime.
 from __future__ import annotations
 
 import secrets
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -30,6 +31,7 @@ from ..configuration import (
     estimate_config,
     estimate_payload,
     load_config,
+    load_yaml_document,
     parse_config,
     save_config,
     validate_config,
@@ -37,6 +39,20 @@ from ..configuration import (
 from ..configuration.architecture import model_payload
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# What "valid" means on this server. Validation runs against the DESCRIPTOR --
+# the portable, design-time record -- because the configurator runs where the
+# model is not loaded. The live model is the executable truth and can expose
+# fewer hooks than the descriptor advertises, so `compile_config` against it
+# is what certifies a configuration as runtime-ready. Every verdict this API
+# returns carries the distinction rather than implying the stronger one.
+DESIGN_TIME_SCOPE = "design-time"
+DESIGN_TIME_NOTE = (
+    "Validated against the model descriptor, not a loaded model. The live "
+    "model decides what can actually fire: compile_config() against the "
+    "attached model is the runtime check, and it can still reject hooks the "
+    "descriptor marks available."
+)
 
 _FASTAPI_MISSING = (
     "DMI-configurator needs the optional UI dependencies. Install them with:\n"
@@ -204,6 +220,8 @@ def create_app(
             return await call_next(request)
 
     app.state.ui = state
+    _save_lock = threading.Lock()
+    app.state.save_lock = _save_lock
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     def _parse(payload: Any) -> DMIConfig:
@@ -243,6 +261,8 @@ def create_app(
         return {
             "valid": not any(issue.is_error for issue in issues),
             "issues": [issue.to_dict() for issue in issues],
+            "scope": DESIGN_TIME_SCOPE,
+            "note": DESIGN_TIME_NOTE,
         }
 
     @app.post("/api/estimate")
@@ -354,13 +374,13 @@ def create_app(
             raise HTTPException(
                 400, f"'yaml' must be a string, got {type(payload['yaml']).__name__}."
             )
-        import yaml as _yaml
-
+        # load_yaml_document, not yaml.safe_load: the file path and this
+        # boundary must refuse the same documents. Duplicate mapping keys are
+        # last-wins in PyYAML, so a merge conflict leaving two
+        # `observations.hooks` keys would silently change capture scope.
         try:
-            document = _yaml.safe_load(payload["yaml"])
+            document = load_yaml_document(payload["yaml"], "Document")
             config = parse_config(document)
-        except _yaml.YAMLError as exc:
-            raise HTTPException(400, f"Not valid YAML: {exc}") from exc
         except ConfigurationError as exc:
             raise HTTPException(400, str(exc)) from exc
         return {"config": config_to_dict(config)}
@@ -372,6 +392,10 @@ def create_app(
         # Model-aware validation before the write: the file this produces is
         # the tool's output contract, so an empty hook set or an out-of-range
         # layer must be refused here, not persisted and caught by the runtime.
+        # DESIGN-TIME validation: the descriptor is a portable record, not the
+        # live model, and the two can disagree (a decoder Llama exposes no
+        # `pos_embed` spec however the descriptor marks it). The response says
+        # so rather than presenting the verdict as runtime-ready.
         try:
             ensure_valid(config, state.descriptor)
         except ConfigValidationError as exc:
@@ -379,14 +403,24 @@ def create_app(
                 400,
                 "; ".join(issue.message for issue in exc.issues),
             ) from exc
-        try:
-            save_config(config, state.save_path)
-        except ConfigurationError as exc:
-            # save_config reports filesystem trouble (OSError included) as
-            # ConfigurationError, so that is what actually arrives here.
-            raise HTTPException(500, f"Could not write {state.save_path}: {exc}") from exc
-        state.initial_config = config
-        return {"path": str(state.save_path)}
+        # One lock over write-then-publish. Without it two concurrent saves
+        # interleave as write(A), write(B), state=B, state=A: both callers get
+        # a 200, the file holds B, and the server reports A until restart.
+        with _save_lock:
+            try:
+                save_config(config, state.save_path)
+            except ConfigurationError as exc:
+                # save_config reports filesystem trouble (OSError included) as
+                # ConfigurationError, so that is what actually arrives here.
+                raise HTTPException(
+                    500, f"Could not write {state.save_path}: {exc}"
+                ) from exc
+            state.initial_config = config
+        return {
+            "path": str(state.save_path),
+            "validated": DESIGN_TIME_SCOPE,
+            "note": DESIGN_TIME_NOTE,
+        }
 
     return app
 

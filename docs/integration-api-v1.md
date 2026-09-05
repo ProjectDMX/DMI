@@ -885,7 +885,16 @@ for the range, like `apply_hook_selection` owns it for selection).
 `hook_belongs_to_layers` is the pure predicate: global hooks (`layer_no < 0`)
 always belong, per-layer hooks must fall inside `start..end` inclusive.
 Neither validates that the range exists in the model; layer bounds are the
-caller's responsibility.
+caller's responsibility. `compile_config` does check: a range that removes
+every spec of a selected hook raises `ConfigValidationError` naming the live
+layer span, so a stale descriptor cannot compile to a silently empty capture.
+
+`attach_config` is the single runtime-apply path, and it applies the whole
+configuration: it installs the `CaptureSchedule` on `adapter.engine.config`
+(where `_schedule_allows` reads it) and then attaches hooks with the layer
+range. It also records the owning adapter on the model, and an entry point
+that would build its own adapter over an attached model -- notably
+`generate_with_monitoring` -- refuses instead of re-owning it.
 
 ### `LayerSelection`
 

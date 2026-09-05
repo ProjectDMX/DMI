@@ -280,6 +280,23 @@ takes a keyword `layers` argument and applies `filter_by_layers` between
 policy control in the UI was honestly disclaimed, but layer selection, the
 UI's central feature, was not.
 
+The same call now also installs the configuration's `CaptureSchedule` on the
+adapter's engine (`MonitoringConfig.schedule`), which is the only place
+`BackendAdapter._schedule_allows` reads it from. Before that, `attach_config`
+applied *where* to capture and silently dropped *when*: a YAML declaring
+`capture_prefill: false` or `step_stride: 17` attached hooks and captured
+everything. Attachment is also single-owner now -- the shared attach path
+records the owning adapter on the model, and `generate_with_monitoring`
+refuses a model somebody else already attached rather than building a second
+adapter over the same transport.
+
+**Not resolved: the packed (vLLM) path does not consult the schedule at all.**
+The pinned V1 and V2 integrations construct `MonitoringEngine(config=None)`
+and call `commit_step` directly, so no host-side predicate runs. The estimator
+therefore does not divide packed figures by `step_stride`/`request_stride` and
+says why; gating vLLM needs graph-safe producer gating, not only a host-side
+check.
+
 **Findings 6 and 7, made usable.** `dmi.configuration.estimate` reports the
 peak single step against `min(payload, pinned)` effective capacity and names
 the worst rank, rather than reporting only a rate or a model-wide average. The
