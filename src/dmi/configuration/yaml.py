@@ -22,6 +22,7 @@ with ``normalize`` idempotent.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -326,15 +327,19 @@ def load_config(path: str | Path) -> DMIConfig:
 def save_config(config: DMIConfig, path: str | Path) -> None:
     """Write a configuration to disk in canonical form.
 
-    Wraps ``OSError`` the way :func:`load_config` does: both halves of this
-    API report filesystem trouble as ``ConfigurationError``, so the CLI's
-    top-level handler turns a bad path into one clean line rather than a
-    traceback.
+    Atomic: the payload is written to a sibling temp file and renamed, so a
+    mid-write failure (ENOSPC, permission) leaves the PREVIOUS configuration
+    on disk instead of a truncated file that reads as broken on the next
+    launch. Wraps ``OSError`` the way :func:`load_config` does: both halves
+    of this API report filesystem trouble as ``ConfigurationError``.
     """
     target = Path(path)
+    temp = target.with_name(target.name + ".tmp")
     try:
-        target.write_text(dump_config(config), encoding="utf-8")
+        temp.write_text(dump_config(config), encoding="utf-8")
+        os.replace(temp, target)
     except OSError as exc:
+        temp.unlink(missing_ok=True)
         raise ConfigurationError(
             f"Cannot write configuration {target}: {exc}"
         ) from exc

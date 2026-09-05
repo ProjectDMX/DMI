@@ -468,6 +468,7 @@
   // land after a newer one and paint figures for a workload the user has
   // already changed. Stamp each request and drop anything but the latest.
   var estimateRequestId = 0;
+  var copyRequestId = 0;
 
   async function refreshEstimate() {
     var requestId = (estimateRequestId += 1);
@@ -512,6 +513,12 @@
 
   /* ---------- wiring ---------- */
 
+  // Listeners bind before startup resolves the model; every handler below
+  // reads state/layout, so until boot fills them the event is dropped
+  // rather than crashing (a dropped keystroke is recovered by applyState's
+  // render; a TypeError mid-applyState would discard a loaded file).
+  var uiReady = false;
+
   function bindSchedule() {
     var numeric = {
       "step-stride": "step_stride",
@@ -523,6 +530,7 @@
     };
     Object.keys(numeric).forEach(function (id) {
       dom[id].addEventListener("input", function () {
+        if (!uiReady) return;
         var value = parseInt(dom[id].value, 10);
         if (Number.isNaN(value)) return;
         state.schedule[numeric[id]] = value;
@@ -531,10 +539,12 @@
     });
 
     dom["capture-prefill"].addEventListener("change", function () {
+      if (!uiReady) return;
       state.schedule.capture_prefill = dom["capture-prefill"].checked;
       scheduleUpdate();
     });
     dom["capture-decode"].addEventListener("change", function () {
+      if (!uiReady) return;
       state.schedule.capture_decode = dom["capture-decode"].checked;
       scheduleUpdate();
     });
@@ -597,11 +607,18 @@
       if (end < start) end = start;
       setLayers({ start: start, end: end });
     }
-    dom["layer-start"].addEventListener("change", readInputs);
-    dom["layer-end"].addEventListener("change", readInputs);
+    dom["layer-start"].addEventListener("change", function (event) {
+      if (!uiReady) return;
+      readInputs();
+    });
+    dom["layer-end"].addEventListener("change", function (event) {
+      if (!uiReady) return;
+      readInputs();
+    });
 
     // Click picks one layer; shift-click extends from the current start.
     dom["layer-rail"].addEventListener("click", function (event) {
+      if (!uiReady) return;
       var target = event.target.closest(".tick");
       if (!target) return;
       var layer = parseInt(target.dataset.layer, 10);
@@ -642,6 +659,7 @@
       tab.addEventListener("click", function () {
         document.querySelectorAll(".tab").forEach(function (other) {
           other.classList.toggle("is-active", other === tab);
+          other.setAttribute("aria-selected", other === tab ? "true" : "false");
         });
         document.querySelectorAll("[data-tab-panel]").forEach(function (panel) {
           panel.hidden = panel.dataset.tabPanel !== tab.dataset.tab;
@@ -660,6 +678,11 @@
 
   function bindActions() {
     dom["btn-copy"].addEventListener("click", async function () {
+      if (!uiReady) return;
+      // Same stale-response guard as refreshOutput: two rapid Copies with
+      // an edit between them can complete out of order (sync endpoints run
+      // in a threadpool), and the older response must not win the clipboard.
+      var requestId = (copyRequestId += 1);
       try {
         // Serialize the CURRENT state, not the preview element: edits reach
         // the preview only after debounce + request latency, so a Copy made
@@ -670,9 +693,11 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ config: state })
         });
+        if (requestId !== copyRequestId) return;
         await navigator.clipboard.writeText(payload.yaml);
         toast("YAML copied to clipboard");
       } catch (error) {
+        if (requestId !== copyRequestId) return;
         toast("Could not copy: " + error.message);
       }
     });
@@ -680,6 +705,7 @@
     dom["btn-open"].addEventListener("click", function () { dom["file-input"].click(); });
 
     dom["file-input"].addEventListener("change", async function () {
+      if (!uiReady) return;
       var file = dom["file-input"].files[0];
       if (!file) return;
       try {
@@ -698,6 +724,7 @@
     });
 
     dom["btn-save"].addEventListener("click", async function () {
+      if (!uiReady) return;
       try {
         var payload = await api("/api/config/save", {
           method: "POST",
@@ -741,6 +768,7 @@
 
     var initial = await api("/api/config").catch(function () { return { config: null }; });
     applyState(initial.config || defaultState());
+    uiReady = true;
   }
 
   document.addEventListener("DOMContentLoaded", boot);

@@ -211,9 +211,15 @@ class BackendAdapter(abc.ABC):
         strides sample, warmup skips the start. A step refused here is not
         planned, reserved, or published.
 
-        No schedule (``engine.config`` None), and a step whose adapter did
-        not report a phase, always capture -- the gate only narrows what it
-        is told about.
+        The gate narrows only what it is told about: a step whose adapter
+        reported no phase skips the phase flags but is still gated on
+        warmup/offset/stride (the estimator's stride division assumes this),
+        and a phase VALUE the schedule does not recognize is treated as
+        unreported rather than crashing the driver and silently disarming
+        every later step. Request gating keys on the numeric group-id
+        prefix (``"gid:i"``) adapters mint -- one gate decision per
+        generate() call on HF, so ``warmup_requests``/``request_stride``
+        count calls, not individual requests.
         """
         schedule = getattr(getattr(self.engine, "config", None), "schedule", None)
         if schedule is None:
@@ -225,11 +231,11 @@ class BackendAdapter(abc.ABC):
             prefix = str(ctx.req_ids[0]).split(":", 1)[0]
             if prefix.isdecimal() and not schedule.should_capture_request(int(prefix)):
                 return False
-        if ctx.phase is not None:
+        if ctx.phase in ("prefill", "decode"):
             return schedule.should_capture_step(
                 self._step_counter, phase=ctx.phase
             )
-        # No phase: apply the schedule's unconditional parts only.
+        # No (or unrecognized) phase: apply the schedule's unconditional parts.
         if self._step_counter < schedule.warmup_steps:
             return False
         effective = self._step_counter - schedule.warmup_steps

@@ -646,3 +646,129 @@ class TestSaveValidatesAgainstTheModel:
         response = client.post("/api/config/save", json={"config": VALID_CONFIG})
         assert response.status_code == 200
         assert target.exists()
+
+
+# ---------------------------------------------------------------------------
+# Independent-review round: malformed JSON bodies surfaced as raw 500s, the
+# token compare crashed on non-ASCII, ring fit ignored pinned-only input,
+# and the loopback bind had no Origin defense (sendBeacon CSRF).
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedBodiesAre400Not500:
+    def test_parse_rejects_non_string_yaml(self, client):
+        for bad in ({"a": 1}, 42, ["x"], None):
+            response = client.post("/api/config/parse", json={"yaml": bad})
+            assert response.status_code == 400, bad
+
+    def test_estimate_rejects_float_and_bool_scalars(self, client):
+        base = {
+            "batch_size": 1, "prompt_tokens": 8, "decode_tokens": 2,
+            "packed": True, "tensor_parallel_size": 1,
+        }
+        for field, value in (
+            ("batch_size", 2.5),
+            ("prompt_tokens", 2048.0),
+            ("tensor_parallel_size", True),
+            ("decode_tokens", 1e3),
+            ("decode_steps_per_second", "fast"),
+            ("dtype", 123),
+        ):
+            workload = {**base, field: value}
+            response = _estimate(client, workload=workload)
+            assert response.status_code == 400, (field, value, response.text)
+
+    def test_estimate_rejects_nonfinite_numbers(self, client):
+        # Raw bodies: Python json.loads accepts Infinity/NaN literals that
+        # a hostile client can send, but this venv's httpx refuses to
+        # encode them -- so the body goes as text.
+        for literal in ("Infinity", "NaN"):
+            body = (
+                '{"config": {"version": 1, "observations": {"hooks": '
+                '["resid_pre"]}}, "workload": {"batch_size": 1, '
+                '"prompt_tokens": 8, "decode_tokens": 2, "packed": true, '
+                f'"tensor_parallel_size": {literal}}}}}'
+            )
+            response = client.post(
+                "/api/estimate", content=body,
+                headers={"Content-Type": "application/json"},
+            )
+            assert response.status_code == 400, literal
+
+    def test_estimate_rejects_overflowing_ring_bytes(self, client):
+        response = _estimate(client, ring={"payload_bytes": 10**400})
+        assert response.status_code == 400
+        body = (
+            '{"config": {"version": 1, "observations": {"hooks": '
+            '["resid_pre"]}}, "ring": {"payload_bytes": Infinity}}'
+        )
+        response = client.post(
+            "/api/estimate", content=body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 400
+
+    def test_ring_pinned_only_is_an_error_not_silence(self, client):
+        response = _estimate(client, ring={"pinned_bytes": 1024})
+        assert response.status_code == 400
+        assert "payload_bytes" in response.json()["detail"]
+
+
+class TestTokenCompareNeverCrashes:
+    def test_non_ascii_token_header_is_a_401_not_a_500(self):
+        app = create_app(DENSE, bind_host="0.0.0.0")
+        with TestClient(app, base_url="http://0.0.0.0") as client:
+            # Raw header bytes: HTTP headers are latin-1 on the wire, and
+            # httpx refuses to encode non-ASCII str headers.
+            response = client.post(
+                "/api/config/save",
+                json={"config": VALID_CONFIG},
+                headers={"X-DMI-Token": b"t\xf3k\xe9n-\xfc"},
+            )
+            assert response.status_code == 401
+
+
+class TestOriginDefenseOnLoopback:
+    def test_foreign_origin_post_is_refused(self, tmp_path):
+        client = TestClient(
+            create_app(DENSE, tmp_path / "out.yaml"), base_url="http://127.0.0.1"
+        )
+        response = client.post(
+            "/api/config/save",
+            json={"config": VALID_CONFIG},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert response.status_code == 403
+        assert not (tmp_path / "out.yaml").exists()
+
+    def test_loopback_origin_post_is_accepted(self, tmp_path):
+        client = TestClient(
+            create_app(DENSE, tmp_path / "out.yaml"), base_url="http://127.0.0.1"
+        )
+        response = client.post(
+            "/api/config/save",
+            json={"config": VALID_CONFIG},
+            headers={"Origin": "http://127.0.0.1"},
+        )
+        assert response.status_code == 200
+
+    def test_no_origin_header_still_works(self, tmp_path):
+        """curl and same-origin fetches often omit Origin; only a FOREIGN
+        origin is evidence of a cross-site write."""
+        client = TestClient(
+            create_app(DENSE, tmp_path / "out.yaml"), base_url="http://127.0.0.1"
+        )
+        response = client.post("/api/config/save", json={"config": VALID_CONFIG})
+        assert response.status_code == 200
+
+
+class TestNetworkBindGatesConfigRead:
+    def test_api_config_requires_the_token_on_a_network_bind(self):
+        app = create_app(DENSE, bind_host="0.0.0.0")
+        with TestClient(app, base_url="http://0.0.0.0") as client:
+            response = client.get("/api/config")
+            assert response.status_code == 401
+            authorized = client.get(
+                "/api/config", headers={"X-DMI-Token": app.state.launch_token}
+            )
+            assert authorized.status_code == 200

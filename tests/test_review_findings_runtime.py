@@ -726,3 +726,142 @@ def _workload(**overrides) -> Workload:
     )
     base.update(overrides)
     return Workload(**base)
+
+
+# ---------------------------------------------------------------------------
+# Independent-review round: validation/compile/estimate all certified
+# final_logits on a descriptor with vocab_size=0 (the default for a
+# hand-written descriptor), while compute_hook_shape returns [] for it --
+# the exact "valid certifies a capture that never fires" class the
+# absent-hook rejection exists for.
+# ---------------------------------------------------------------------------
+
+
+class TestFinalLogitsRequiresVocabSize:
+    def test_final_logits_is_unavailable_without_vocab_size(self):
+        from dmi.configuration import describe_hooks
+
+        infos = {i.id: i for i in describe_hooks(
+            ModelTopology(num_layers=4, hidden_size=64, num_attention_heads=4,
+                          num_kv_heads=4, vocab_size=0)
+        )}
+        assert infos["final_logits"].available is False
+        assert "vocab_size" in (infos["final_logits"].reason or "")
+
+    def test_final_logits_is_available_with_vocab_size(self):
+        from dmi.configuration import describe_hooks
+
+        infos = {i.id: i for i in describe_hooks(
+            ModelTopology(num_layers=4, hidden_size=64, num_attention_heads=4,
+                          num_kv_heads=4, vocab_size=32000)
+        )}
+        assert infos["final_logits"].available is True
+
+
+# ---------------------------------------------------------------------------
+# Independent-review round on the estimator: (1) check_ring_fit ignored the
+# task-entry cap prepare_step also enforces (a wide full-preset model "fit"
+# on bytes while every runtime step returned OVERSIZED); (2) the PP layer
+# split put the remainder on the last stages while vLLM's get_pp_indices
+# puts it on the first, mislocating the peak rank; (3) batched final_logits
+# counted every prefill row while HF generate() materializes one.
+# ---------------------------------------------------------------------------
+
+
+class TestRingFitCountsTaskEntries:
+    def test_hook_count_over_the_task_cap_does_not_fit(self):
+        from dmi.configuration.estimate import RankLoad, RingFit, check_ring_fit
+
+        estimate = estimate_config.__wrapped__ if hasattr(estimate_config, "__wrapped__") else None
+        from dmi.configuration.estimate import Estimate
+
+        est = Estimate(
+            peak_step_bytes=1024,
+            peak_step_rank="pp0/tp0",
+            decode_step_bytes=512,
+            bytes_per_request=1024,
+            aggregate_peak_step_bytes=2048,
+            sustained_bytes_per_second=None,
+            bytes_per_day=None,
+            ranks=(
+                RankLoad(label="pp0/tp0", pp_stage=0, tp_rank=0,
+                         prefill_step_bytes=1024, decode_step_bytes=512,
+                         prefill_hooks=1126, decode_hooks=1126),
+            ),
+        )
+        fit = check_ring_fit(est, payload_bytes=1024 * 1024, task_entries=1024)
+        assert fit.fits is False, (
+            "1126 hooks cannot fit 1024 task entries no matter how many "
+            "bytes are free -- prepare_step returns OVERSIZED"
+        )
+        assert "task" in fit.detail.lower()
+
+    def test_hooks_within_the_cap_fit_on_bytes_alone(self):
+        from dmi.configuration.estimate import Estimate, RankLoad, check_ring_fit
+
+        est = Estimate(
+            peak_step_bytes=1024,
+            peak_step_rank="pp0/tp0",
+            decode_step_bytes=512,
+            bytes_per_request=1024,
+            aggregate_peak_step_bytes=2048,
+            sustained_bytes_per_second=None,
+            bytes_per_day=None,
+            ranks=(
+                RankLoad(label="pp0/tp0", pp_stage=0, tp_rank=0,
+                         prefill_step_bytes=1024, decode_step_bytes=512,
+                         prefill_hooks=900, decode_hooks=900),
+            ),
+        )
+        fit = check_ring_fit(est, payload_bytes=1024 * 1024, task_entries=1024)
+        assert fit.fits is True
+
+
+class TestPPSplitMatchesVLLM:
+    def test_remainder_layers_land_on_the_first_stages(self):
+        from dmi.configuration.estimate import _stage_layers
+
+        # vLLM's get_pp_indices: 8 layers over 3 stages -> [3, 3, 2].
+        sizes = [len(_stage_layers(8, 3, stage)) for stage in range(3)]
+        assert sizes == [3, 3, 2], sizes
+
+
+# ---------------------------------------------------------------------------
+# Independent-review round on the gate: the no-phase tail (warmup/stride for
+# adapters that report no phase) had no pin; the docstring claimed no-phase
+# steps "always capture" while they are stride-gated; a foreign phase value
+# killed capture silently via the HF wrapper's bare except.
+# ---------------------------------------------------------------------------
+
+
+class TestNoPhaseGateTail:
+    def test_no_phase_steps_respect_warmup_and_stride(self):
+        """A phase-less adapter must still be schedule-gated on the
+        unconditional parts -- the estimator divides by the stride, so an
+        adapter ignoring it would over-capture what the estimate promises."""
+        adapter = StubAdapter(
+            FakeEngine(MonitoringConfig(
+                schedule=CaptureSchedule(step_stride=2, warmup_steps=1),
+            )),
+            "test_model",
+            _make_ctx(phase=None),
+        )
+        for _ in range(4):
+            adapter.before_forward(None)
+
+        # Step 0 warmup, 1 first captured, 2 skipped, 3 captured.
+        assert len(adapter.transport.set_step_context_calls) == 2
+
+    def test_foreign_phase_value_does_not_kill_capture(self):
+        """An unknown phase string must capture-as-unreported, not raise
+        through the HF wrapper's exception guard leaving capture disarmed."""
+        adapter = StubAdapter(
+            FakeEngine(MonitoringConfig(schedule=CaptureSchedule())),
+            "test_model",
+            _make_ctx(phase="speculative-decode"),
+        )
+
+        adapter.before_forward(None)
+
+        assert len(adapter.transport.set_step_context_calls) == 1
+        assert adapter.transport.capture_step is True

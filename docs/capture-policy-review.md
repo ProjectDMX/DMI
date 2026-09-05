@@ -290,13 +290,19 @@ alignment so the estimate cannot drift from what `prepare_step` enforces.
 
 Every blocking finding that bears on *policy* still stands:
 
-* **Finding 1.** `CaptureSchedule` is still enforced by no shipped adapter. The
-  configurator authors a schedule; nothing applies it. This remains the
-  prerequisite for any policy that claims to change sampling.
+* **Finding 1. RESOLVED on this branch.** The capture schedule is now
+  enforced: `BackendAdapter.before_forward` consults
+  `should_capture_step()`/`should_capture_request()` before every step, the
+  transport disarms producers on refused steps (a driver-level skip alone
+  left the model's HookPoints firing unreserved writes), and the estimator
+  divides its volume figures by the same strides. This was the prerequisite
+  for any policy that claims to change sampling; the policy module itself
+  remains deferred.
 * **Finding 2.** The transport still blocks losslessly and still has no drop
   path. `block` is the status quo; `drop` and `fail` are the new work.
 * **Findings 4, 5, 8, 9.** Untouched -- they concern the policy module, which
   is deliberately deferred.
 
 The resequencing above therefore holds, with its first item now half done:
-layer selection is wired, schedule enforcement is not.
+layer selection is wired, and schedule enforcement landed with it (see
+Finding 1 above).

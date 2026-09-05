@@ -582,3 +582,85 @@ class TestFacadeExportsLayerRangeAPI:
         assert facade.filter_by_layers is _filter
         assert facade.hook_belongs_to_layers is _belongs
         assert facade.LayerSelection is _Real
+
+
+# ---------------------------------------------------------------------------
+# Independent-review round: save_config truncates the old file before
+# writing, so a mid-write failure destroys the user's config; the
+# descriptor parser accepts bool/float schema_version, ignores unknown keys
+# in `model` and at the root, and lets a bad model.id escape as ValueError.
+# ---------------------------------------------------------------------------
+
+
+class TestSaveIsAtomic:
+    def test_a_failed_write_leaves_the_previous_file_intact(self, tmp_path, monkeypatch):
+        target = tmp_path / "config.dmi.yaml"
+        target.write_text("version: 1\nobservations:\n  hooks: [q]\n", encoding="utf-8")
+        original = target.read_text()
+
+        import dmi.configuration.yaml as config_yaml
+
+        real_dump = config_yaml.dump_config
+
+        def failing_dump(config):
+            data = real_dump(config)
+            # Simulate ENOSPC mid-write: full payload, then boom.
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(config_yaml, "dump_config", failing_dump)
+        config = parse_config({"version": 1, "observations": {"hooks": ["k"]}})
+
+        with pytest.raises(config_yaml.ConfigurationError):
+            config_yaml.save_config(config, target)
+
+        assert target.read_text() == original, (
+            "a failed save must not destroy the previous configuration"
+        )
+
+
+class TestDescriptorBoundaryMatchesConfigStrictness:
+    def test_schema_version_must_be_exact_int(self):
+        for bad in (True, 1.0):
+            with pytest.raises(DescriptorError, match="schema_version"):
+                parse_descriptor({
+                    "schema_version": bad,
+                    "model": {"id": "m", "name": "M", "architecture": "decoder_transformer"},
+                    "topology": {"num_layers": 2, "hidden_size": 8,
+                                 "num_attention_heads": 2, "num_kv_heads": 2},
+                })
+
+    def test_unknown_keys_in_model_section_are_refused(self):
+        with pytest.raises(DescriptorError, match="Unknown field"):
+            parse_descriptor({
+                "model": {"id": "m", "name": "M", "architecture": "decoder_transformer",
+                          "context_length": 131072},
+                "topology": {"num_layers": 2, "hidden_size": 8,
+                             "num_attention_heads": 2, "num_kv_heads": 2},
+            })
+
+    def test_unknown_root_keys_are_refused(self):
+        with pytest.raises(DescriptorError, match="Unknown field"):
+            parse_descriptor({
+                "model": {"id": "m", "name": "M", "architecture": "decoder_transformer"},
+                "topology": {"num_layers": 2, "hidden_size": 8,
+                             "num_attention_heads": 2, "num_kv_heads": 2},
+                "quantization": "fp8",
+            })
+
+    def test_bad_model_id_is_a_descriptor_error_not_valueerror(self):
+        with pytest.raises(DescriptorError, match="path segment"):
+            parse_descriptor({
+                "model": {"id": "org/model", "name": "M",
+                          "architecture": "decoder_transformer"},
+                "topology": {"num_layers": 2, "hidden_size": 8,
+                             "num_attention_heads": 2, "num_kv_heads": 2},
+            })
+
+    def test_num_experts_without_top_k_is_refused(self):
+        with pytest.raises((DescriptorError, ValueError), match="top_k"):
+            parse_descriptor({
+                "model": {"id": "m", "name": "M", "architecture": "decoder_transformer"},
+                "topology": {"num_layers": 2, "hidden_size": 8,
+                             "num_attention_heads": 2, "num_kv_heads": 2,
+                             "num_experts": 8},
+            })

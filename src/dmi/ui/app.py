@@ -141,19 +141,53 @@ def create_app(
             TrustedHostMiddleware, allowed_hosts=list(_LOOPBACK_HOSTS)
         )
         app.state.launch_token = None
+
+        # Cross-site write defense: TrustedHostMiddleware stops DNS
+        # rebinding, but a page at https://evil.example POSTing directly to
+        # 127.0.0.1 sends Host: 127.0.0.1 -- which IS allowlisted -- and
+        # navigator.sendBeacon can even send application/json without a
+        # preflight. A browser always attaches Origin on cross-site
+        # requests; curl and same-origin fetches legitimately omit it. So:
+        # a mutating request that NAMES a foreign origin is refused.
+        @app.middleware("http")
+        async def _reject_cross_site_writes(request: Request, call_next):
+            if request.method in ("GET", "HEAD", "OPTIONS"):
+                return await call_next(request)
+            origin = request.headers.get("Origin")
+            if origin is not None:
+                hostname = origin.split("://", 1)[-1].split("/", 1)[0]
+                host = hostname.rsplit(":", 1)[0].strip("[]")
+                if host not in ("127.0.0.1", "localhost", "::1"):
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "Cross-site configuration writes "
+                                 "are refused by this local server."},
+                    )
+            return await call_next(request)
     else:
         app.state.launch_token = secrets.token_urlsafe(24)
 
         @app.middleware("http")
         async def _require_launch_token(request: Request, call_next):
             # Read-only surface stays open (the landing page, the model and
-            # catalog descriptions). Everything else demands the token; the
-            # browser itself does not send it -- a network deployment is
-            # driven with curl or a reverse proxy that injects the header.
-            if request.method in ("GET", "HEAD", "OPTIONS"):
+            # catalog descriptions) EXCEPT /api/config, whose response names
+            # a server filesystem path and carries the starting config --
+            # metadata a LAN peer has no business reading. Everything else
+            # that is not a static asset demands the token; the browser
+            # itself does not send it -- a network deployment is driven with
+            # curl or a reverse proxy that injects the header.
+            open_paths = ("/", "/api/model", "/api/catalog")
+            if (
+                request.method in ("GET", "HEAD", "OPTIONS")
+                and request.url.path in open_paths
+            ):
                 return await call_next(request)
-            supplied = request.headers.get("X-DMI-Token", "")
-            if not secrets.compare_digest(supplied, app.state.launch_token):
+            if request.url.path.startswith("/static"):
+                return await call_next(request)
+            supplied = request.headers.get("X-DMI-Token", "").encode("utf-8", "replace")
+            if not secrets.compare_digest(
+                supplied, str(app.state.launch_token).encode("utf-8")
+            ):
                 # Raised in the middleware, so returned as a response directly:
                 # an HTTPException raised inside BaseHTTPMiddleware dispatch
                 # escapes FastAPI's exception handlers.
@@ -238,7 +272,7 @@ def create_app(
 
         try:
             estimate = estimate_config(config, state.descriptor, workload)
-        except ValueError as exc:
+        except (ValueError, TypeError, OverflowError) as exc:
             raise HTTPException(400, str(exc)) from exc
 
         body = estimate_payload(estimate)
@@ -258,14 +292,45 @@ def create_app(
         # "absent" would silently drop the ring-fit result the caller asked
         # for.
         payload_bytes = ring.get("payload_bytes")
+        if payload_bytes is None and ring.get("pinned_bytes") is not None:
+            raise HTTPException(
+                400,
+                "'ring.pinned_bytes' was given without 'ring.payload_bytes': "
+                "a fit verdict needs the payload ring to compare against.",
+            )
         if payload_bytes is not None:
+            if isinstance(payload_bytes, bool) or not isinstance(payload_bytes, int):
+                raise HTTPException(
+                    400,
+                    f"'ring.payload_bytes' must be an integer, got "
+                    f"{type(payload_bytes).__name__}.",
+                )
+            pinned_bytes = ring.get("pinned_bytes") or 0
+            if isinstance(pinned_bytes, bool) or not isinstance(pinned_bytes, int):
+                raise HTTPException(
+                    400,
+                    f"'ring.pinned_bytes' must be an integer, got "
+                    f"{type(pinned_bytes).__name__}.",
+                )
             try:
+                task_entries = ring.get("task_entries")
+                if task_entries is not None and (
+                    isinstance(task_entries, bool)
+                    or not isinstance(task_entries, int)
+                    or task_entries < 1
+                ):
+                    raise HTTPException(
+                        400,
+                        f"'ring.task_entries' must be a positive integer, got "
+                        f"{task_entries!r}.",
+                    )
                 fit = check_ring_fit(
                     estimate,
-                    int(payload_bytes),
-                    int(ring.get("pinned_bytes") or 0),
+                    payload_bytes,
+                    pinned_bytes,
+                    task_entries=task_entries,
                 )
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise HTTPException(400, f"Invalid ring sizes: {exc}") from exc
             body["ring_fit"] = {
                 "effective_bytes": fit.effective_bytes,
@@ -285,6 +350,10 @@ def create_app(
     def post_parse(payload: dict):
         if not isinstance(payload, dict) or "yaml" not in payload:
             raise HTTPException(400, "Request body must be {'yaml': '...'}.")
+        if not isinstance(payload["yaml"], str):
+            raise HTTPException(
+                400, f"'yaml' must be a string, got {type(payload['yaml']).__name__}."
+            )
         import yaml as _yaml
 
         try:

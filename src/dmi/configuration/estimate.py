@@ -99,6 +99,24 @@ class Workload:
     cache_max_len: Optional[int] = None
 
     def __post_init__(self) -> None:
+        # Exact types first, mirroring ModelTopology: a JSON `8192.0` passes
+        # every magnitude comparison here and then explodes with TypeError
+        # inside the byte arithmetic (float & int), and `True` reads as 1.
+        for name in (
+            "batch_size",
+            "prompt_tokens",
+            "decode_tokens",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"{name} must be an integer, got "
+                    f"{type(value).__name__} ({value!r})."
+                )
+        if self.dtype is not None and not isinstance(self.dtype, str):
+            raise ValueError(f"dtype must be a string, got {type(self.dtype).__name__}.")
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}.")
         if self.prompt_tokens < 1:
@@ -119,10 +137,14 @@ class Workload:
                 "pipeline_parallel_size must be >= 1, got "
                 f"{self.pipeline_parallel_size}."
             )
-        if self.decode_steps_per_second < 0:
+        import math
+
+        if self.decode_steps_per_second < 0 or not math.isfinite(
+            self.decode_steps_per_second
+        ):
             raise ValueError(
-                "decode_steps_per_second must be >= 0, got "
-                f"{self.decode_steps_per_second}."
+                "decode_steps_per_second must be a finite number >= 0, got "
+                f"{self.decode_steps_per_second!r}."
             )
         if self.cache_max_len is not None and self.cache_max_len < 1:
             raise ValueError(
@@ -195,9 +217,16 @@ def _element_size(dtype_name: str) -> int:
 
 
 def _stage_layers(num_layers: int, pp_size: int, stage: int) -> range:
-    """Contiguous even split of layers across pipeline stages."""
-    start = stage * num_layers // pp_size
-    end = (stage + 1) * num_layers // pp_size
+    """Contiguous split of layers across pipeline stages.
+
+    Matches vLLM's ``get_pp_indices``: the remainder layers go to the FIRST
+    stages (8 layers / 3 stages -> [3, 3, 2], not [2, 3, 3]). Per-rank peaks
+    move with the split, so this has to agree with the serving backend.
+    """
+    base = num_layers // pp_size
+    extra = num_layers % pp_size
+    start = stage * base + min(stage, extra)
+    end = start + base + (1 if stage < extra else 0)
     return range(start, end)
 
 
@@ -379,16 +408,13 @@ def estimate_config(
         prefill_batch = decode_batch = workload.batch_size
         prefill_q = workload.prompt_tokens
         decode_q = 1
-        # logits_to_keep=0 means "every q_len row". Backends that materialize
-        # only the last-token logits per request cost far less, so this is an
-        # upper bound on final_logits rather than a prediction.
-        prefill_logits = decode_logits = 0
-        if "final_logits" in hooks:
-            assumptions.append(
-                "final_logits counted for every prefill position "
-                "(logits_to_keep=0); a backend that keeps only last-token "
-                "logits costs much less"
-            )
+        # HF generate() materializes ONLY the last token's logits per request
+        # (logits_to_keep=1) for every model that supports it, so that is the
+        # shape the runtime actually reserves; counting every prefill row
+        # over-counted the prefill peak by vocab x (prompt-1) bytes -- the
+        # largest single tensor on a large-vocab model, ~1000x the reality.
+        prefill_logits = 1
+        decode_logits = 1
 
     # Attention weights span the whole KV window. Decode peaks at the end of
     # generation, which is the step that has to fit. A preallocated cache
@@ -600,12 +626,15 @@ def check_ring_fit(
     estimate: Estimate,
     payload_bytes: int,
     pinned_bytes: int = 0,
+    task_entries: Optional[int] = None,
 ) -> RingFit:
     """Judge a peak step against ring capacity.
 
-    ``prepare_step`` compares a step against ``min(payload_cap, staging_cap)``,
-    so the smaller of the two rings is the real ceiling -- a generous payload
-    ring paired with a small pinned ring buys nothing.
+    ``prepare_step`` compares a step against ``min(payload_cap, staging_cap)``
+    AND against the task ring's entry count, so the verdict here mirrors
+    both: pass the ring's ``task_ring_entries`` as ``task_entries`` and a
+    step whose firing-hook count exceeds it reports OVERSIZED in the runtime
+    no matter how many bytes were free.
     """
     if payload_bytes < 1:
         raise ValueError(f"payload_bytes must be >= 1, got {payload_bytes}.")
@@ -614,10 +643,33 @@ def check_ring_fit(
     fits = peak <= effective
     occupancy = (peak / effective * 100.0) if effective else 0.0
 
+    # prepare_step refuses on the TASK ring too: more firing hooks in one
+    # step than task_ring_entries returns OVERSIZED regardless of bytes.
+    # The hook counts are already on every rank; the cap is the caller's
+    # ring configuration, so it arrives as an argument.
+    over_task_cap = 0
+    if task_entries is not None and task_entries >= 1:
+        for load in estimate.ranks:
+            worst_hooks = max(load.prefill_hooks, load.decode_hooks)
+            if worst_hooks > over_task_cap:
+                over_task_cap = worst_hooks
+        if over_task_cap > task_entries:
+            fits = False
+
     if fits:
         detail = (
             f"Peak step uses {occupancy:.1f}% of the {_mib(effective)} "
             "effective ring."
+        )
+    elif over_task_cap:
+        detail = (
+            f"The busiest rank fires {over_task_cap} hooks in one step, "
+            f"above the {task_entries} task entries the ring was configured "
+            "with. prepare_step returns STEP_OVERSIZED regardless of bytes "
+            "and the adapter falls back to eager CPU-direct dispatch -- "
+            "capture keeps working, but the serving path pays for it. "
+            "Raise ring task entries, narrow the layer range, or deselect "
+            "observations."
         )
     else:
         detail = (

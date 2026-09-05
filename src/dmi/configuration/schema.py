@@ -207,6 +207,12 @@ class ModelTopology:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}.")
         if self.top_k and not self.num_experts:
             raise ValueError("top_k is set but num_experts is 0.")
+        if self.num_experts and not self.top_k:
+            raise ValueError(
+                f"num_experts is set ({self.num_experts}) but top_k is 0: "
+                "the expert-routing observations would never fire. Set "
+                "top_k or drop num_experts."
+            )
 
     @property
     def effective_head_dim(self) -> int:
