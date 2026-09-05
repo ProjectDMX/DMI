@@ -35,6 +35,7 @@ they are not CPU-safe.
 | `run_regression.sh` | Full root release sweep: CPU unit tests + HF transport correctness across models/modes/TP. |
 | `run_tp_compare_hf.sh` | Single HF transport-correctness run (`.copy_()` buffers vs ClickHouse) for one model/mode/TP. |
 | `verify_hf.sh` | HF E2E correctness sweep across ring sizes. |
+| `verify_replicated_quorum.py` | Catalog publish protocol and retention against two `ReplicatedMergeTree` replicas on one server. Needs ClickHouse **with Keeper**, no GPU; every branch asserts and the exit status is the verdict. The only exercise of `insert_quorum`; see *Verification this repository cannot run* in `docs/catalog-descriptor-key.md`. |
 
 Example:
 

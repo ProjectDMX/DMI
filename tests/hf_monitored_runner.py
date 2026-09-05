@@ -108,7 +108,13 @@ def main():
 
     unique_run_model_id = f"e2e_correctness_hf::{uuid.uuid4().hex}"[:120]
     engine = MonitoringEngine(
-        config=mon_cfg, model_id=unique_run_model_id, db_config=host_cfg
+        config=mon_cfg, model_id=unique_run_model_id, db_config=host_cfg,
+        # NO auto-enable ring here: the engine's default 4 GiB allocation
+        # OOMs on a busy GPU before the tuned config could apply, and a
+        # second enable_ring_transport() would tear that ring down and
+        # reallocate -- 2x the transient peak and a discarded config. The
+        # ring is built exactly once, below, from ring_cfg alone.
+        enable_ring_transport=False,
     )
     engine.enable_ring_transport(ring_cfg)
     model.monitoring_engine = engine

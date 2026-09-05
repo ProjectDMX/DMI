@@ -535,3 +535,91 @@ def test_plain_dmi_import_does_not_load_native_or_transport_modules():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+# --- the declarative storage switch ------------------------------------------
+
+
+def _config(backend: str):
+    from dmi.config import MonitoringConfig
+
+    return MonitoringConfig(storage_backend=backend)
+
+
+def test_storage_backend_rejects_an_unknown_name():
+    from dmi.config import MonitoringConfig
+
+    with pytest.raises(ValueError, match="storage_backend must be one of"):
+        MonitoringConfig(storage_backend="object-store")
+
+
+def test_native_backend_requires_a_host_engine():
+    """Declaring the C++ path without one is a configuration error, not a
+    silently transport-only engine."""
+    with pytest.raises(ValueError, match="needs a host engine"):
+        MonitoringEngine(
+            config=_config("native"),
+            model_id="m",
+            enable_ring_transport=False,
+        )
+
+
+@pytest.mark.parametrize("backend", ["capture", "none"])
+def test_a_non_native_backend_refuses_a_host_engine(backend: str):
+    """Configured together, the host engine starts, connects and is never fed.
+
+    A record runtime is handed either the host or an explicit record_sink and
+    never both, so the ClickHouse insert pipeline would sit there holding
+    threads and connections while every record went to the other backend.
+    """
+    with pytest.raises(ValueError, match="does not use the C\\+\\+ ClickHouse host"):
+        MonitoringEngine(
+            config=_config(backend),
+            model_id="m",
+            host_engine=object(),
+            enable_ring_transport=False,
+        )
+
+
+def test_capture_backend_requires_the_sink_that_selects_it(monkeypatch):
+    """The two halves of the choice are made in two different places; this is
+    the one that actually routes the records."""
+    engine, _old, _ring = _engine_with_fake_ring()
+    engine._ring_config = object()
+    engine._storage_backend = "capture"
+
+    with pytest.raises(ValueError, match="reached by passing its sink"):
+        engine.create_record_runtime(_explicit_sink_format())
+
+
+def test_native_backend_refuses_an_explicit_sink(monkeypatch):
+    engine, _old, _ring = _engine_with_fake_ring()
+    engine._ring_config = object()
+    engine._storage_backend = "native"
+
+    fake_native_module = ModuleType("dmi.transport.native")
+
+    class _RecordSink:
+        pass
+
+    fake_native_module.RecordSink = _RecordSink
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
+
+    with pytest.raises(ValueError, match="does not use an explicit"):
+        engine.create_record_runtime(
+            _explicit_sink_format(), record_sink=_RecordSink()
+        )
+
+
+def test_auto_keeps_the_inference_every_earlier_caller_relied_on():
+    """The default has to be a no-op: the field is additive, and every caller
+    written before it existed passes no config at all."""
+    from dmi.config import MonitoringConfig
+
+    assert MonitoringConfig().storage_backend == "auto"
+    engine = MonitoringEngine(model_id="m", enable_ring_transport=False)
+    assert engine._storage_backend == "auto"
+    # Both combinations stay legal under "auto", which is what the existing
+    # host-path and explicit-sink tests above exercise.
+    engine._reject_a_sink_the_config_did_not_ask_for(None)
+    engine._reject_a_sink_the_config_did_not_ask_for(object())

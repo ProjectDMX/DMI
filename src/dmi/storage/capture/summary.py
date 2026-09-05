@@ -17,7 +17,7 @@ working in environments that only write packs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING
 
 from .model import (
     CaptureDescriptor,
@@ -29,7 +29,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
 
 
-CORE_SUMMARY_VERSION = 1
+# Version 2: the order statistics (minimum, maximum, abs_max) of a non-float
+# tensor are exact Python ints instead of float64-rounded floats. The values a
+# summary serializes changed for integer magnitudes above 2**53 -- and abs_max
+# can now be 2**63, one past int64 -- so the version moves with them: two
+# builds writing different bytes under one version number would make a
+# cross-implementation manifest comparison report NON-CONFORMANT for corpora
+# that are byte-identical.
+CORE_SUMMARY_VERSION = 2
 
 # Explicit byte orders: a summary must not change meaning with the host.
 _NUMPY_DTYPES = {
@@ -57,13 +64,26 @@ def _numpy():
 
 
 @dataclass(frozen=True, slots=True)
-class CoreTensorSummaryV1:
+class CoreTensorSummary:
     """Statistics over one decoded tensor.
 
     ``mean``, ``minimum``, ``maximum``, ``abs_max`` and ``l2_norm`` are computed
     over the **finite** elements only; ``nan_count`` and ``inf_count`` account
     for the rest. A tensor with no finite elements reports zeros, so a caller
     reads the counts to tell "all zero" from "all NaN".
+
+    Exactness differs by statistic, and the difference is visible in the types:
+
+    * ``minimum``, ``maximum`` and ``abs_max`` are order statistics -- they pick
+      an element rather than combining elements, so nothing can overflow. For a
+      non-float dtype they are **exact**, and carry a Python ``int``; ``abs_max``
+      of an all-``-2**63`` int64 tensor is therefore ``2**63``, a value no int64
+      can hold but a Python int can. For a float dtype they carry the selected
+      ``float`` itself, equally exact.
+    * ``mean`` and ``l2_norm`` accumulate across elements, which overflows int64
+      (and, squared, overflows float64 too), so both are computed in float64 and
+      are **approximate** for integer inputs above 2**53. ``zero_fraction`` is a
+      ratio and is float by nature.
     """
 
     summary_version: int
@@ -73,9 +93,9 @@ class CoreTensorSummaryV1:
     inf_count: int
     zero_fraction: float
     mean: float
-    minimum: float
-    maximum: float
-    abs_max: float
+    minimum: float | int
+    maximum: float | int
+    abs_max: float | int
     l2_norm: float
 
 
@@ -126,14 +146,20 @@ def decode_tensor(descriptor: CaptureDescriptor, payload: bytes) -> "np.ndarray"
 
 def summarize_tensor(
     descriptor: CaptureDescriptor, payload: bytes
-) -> CoreTensorSummaryV1:
+) -> CoreTensorSummary:
     """Compute the versioned core summary for one hydrated capture."""
     numpy = _numpy()
     array = decode_tensor(descriptor, payload)
     element_count = int(array.size)
 
     if element_count == 0:
-        return CoreTensorSummaryV1(
+        # The order statistics keep their dtype-determined type even when
+        # degenerate: a caller branching on int-vs-float must not see a float
+        # for an integer tensor just because it was empty.
+        zero: float | int = (
+            0.0 if descriptor.metadata.dtype in _FLOAT_DTYPES else 0
+        )
+        return CoreTensorSummary(
             summary_version=CORE_SUMMARY_VERSION,
             element_count=0,
             finite_count=0,
@@ -141,18 +167,22 @@ def summarize_tensor(
             inf_count=0,
             zero_fraction=0.0,
             mean=0.0,
-            minimum=0.0,
-            maximum=0.0,
-            abs_max=0.0,
+            minimum=zero,
+            maximum=zero,
+            abs_max=zero,
             l2_norm=0.0,
         )
 
-    # float64 throughout: int64 magnitudes and squared sums both overflow their
-    # own dtype long before they trouble a double.
-    values = array.reshape(-1).astype(numpy.float64)
+    # float64 for the *accumulating* statistics: int64 magnitudes and squared
+    # sums both overflow their own dtype long before they trouble a double.
+    # The order statistics do not accumulate and so do not need the widening --
+    # which is lossy above 2**53 -- and are taken from ``flat`` further down.
+    flat = array.reshape(-1)
+    values = flat.astype(numpy.float64)
     zero_fraction = float(numpy.count_nonzero(values == 0.0) / element_count)
 
-    if descriptor.metadata.dtype in _FLOAT_DTYPES:
+    is_float = descriptor.metadata.dtype in _FLOAT_DTYPES
+    if is_float:
         nan_mask = numpy.isnan(values)
         inf_mask = numpy.isinf(values)
         nan_count = int(numpy.count_nonzero(nan_mask))
@@ -164,7 +194,7 @@ def summarize_tensor(
 
     finite_count = int(finite.size)
     if finite_count == 0:
-        return CoreTensorSummaryV1(
+        return CoreTensorSummary(
             summary_version=CORE_SUMMARY_VERSION,
             element_count=element_count,
             finite_count=0,
@@ -183,13 +213,31 @@ def summarize_tensor(
     # large-magnitude tensor overflows and the naive sqrt(sum(x**2)) returns inf
     # where the true norm is perfectly finite. Factoring out the largest
     # magnitude keeps every squared term at or below 1.
-    abs_max = float(absolute.max())
-    if abs_max == 0.0:
+    scale = float(absolute.max())
+    if scale == 0.0:
         l2_norm = 0.0
     else:
-        l2_norm = abs_max * float(numpy.sqrt(numpy.square(absolute / abs_max).sum()))
+        l2_norm = scale * float(numpy.sqrt(numpy.square(absolute / scale).sum()))
 
-    return CoreTensorSummaryV1(
+    if is_float:
+        minimum: float | int = float(finite.min())
+        maximum: float | int = float(finite.max())
+        abs_max: float | int = scale
+    else:
+        # Order statistics off the raw integers. numpy's integer min/max cannot
+        # overflow, and skipping the float64 widening keeps magnitudes above
+        # 2**53 exact instead of silently rounded. A non-float dtype admits no
+        # NaN or Inf, so ``finite`` is the whole tensor and ``flat`` is the same
+        # elements in their own dtype.
+        minimum = int(flat.min())
+        maximum = int(flat.max())
+        # abs() in Python int space, not numpy's: |-2**63| has no int64
+        # representation and would wrap back to -2**63. Python ints are
+        # unbounded, so the true magnitude survives. The largest absolute value
+        # is always at one end or the other, so the extremes suffice.
+        abs_max = max(abs(minimum), abs(maximum))
+
+    return CoreTensorSummary(
         summary_version=CORE_SUMMARY_VERSION,
         element_count=element_count,
         finite_count=finite_count,
@@ -197,13 +245,22 @@ def summarize_tensor(
         inf_count=inf_count,
         zero_fraction=zero_fraction,
         mean=float(finite.mean()),
-        minimum=float(finite.min()),
-        maximum=float(finite.max()),
+        minimum=minimum,
+        maximum=maximum,
         abs_max=abs_max,
         l2_norm=l2_norm,
     )
 
 
-def numpy_dtypes() -> Mapping[str, str]:
-    """The dtype table, exposed so tests can assert full coverage."""
-    return dict(_NUMPY_DTYPES)
+# The name this type was exported under through 1.2.0. Kept as an alias rather
+# than dropped, because the rename rode along with a SERIALIZED schema bump
+# from 1 to 2 and the two are not the same thing: the stored summary format
+# changed, the Python type did not. Removing the name broke
+# `from dmi.storage.capture import CoreTensorSummaryV1` for every existing
+# caller while `pyproject.toml` still said 1.2.0, which is an accidental
+# breaking change rather than a declared one.
+#
+# The `V1` suffix now names history, not the schema version -- read
+# CORE_SUMMARY_VERSION (currently 2) for that. Retire the alias in a release that says it
+# is removing it.
+CoreTensorSummaryV1 = CoreTensorSummary

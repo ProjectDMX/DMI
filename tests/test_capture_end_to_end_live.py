@@ -142,8 +142,17 @@ def _stack(tmp_path: Path):
     writer = ClickHouseCatalogWriter(client, config)
     created = False
     try:
-        writer.ensure_schema()
+        # Armed BEFORE ensure_schema: it issues many statements, and one that
+        # fails partway leaves every table created ahead of it behind. Arming
+        # afterwards skips teardown for exactly that case and the tables leak
+        # onto the shared server. Every drop below is IF EXISTS, so tearing
+        # down a partial or empty schema is safe.
         created = True
+        writer.ensure_schema()
+        # Only the lease holder can make a snapshot visible. Tests below that
+        # publish through a SECOND writer take it over from this one, which is
+        # what one indexer replacing another looks like.
+        writer.acquire_publisher_lease("e2e-fixture")
 
         tensors, records = _corpus()
         pack = PackWriter(
@@ -179,22 +188,13 @@ def _stack(tmp_path: Path):
             "catalog": catalog,
             "client": client,
             "config": config,
+            "writer": writer,
         }
     finally:
         if created:
-            database = config.database
-            for kind, suffix in (
-                ("VIEW", "capture"),
-                ("VIEW", "pack_inventory"),
-                ("TABLE", "capture_raw"),
-                ("TABLE", "pack_inventory_raw"),
-                ("TABLE", "index_watermark"),
-                ("TABLE", "pack_commit_log"),
-                ("TABLE", "capture_version_claims"),
-            ):
-                client.execute(
-                    f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`"
-                )
+            # The writer owns the object list, in drop order; hand-copied
+            # lists here drifted from it and leaked tables.
+            writer.drop_schema()
 
 
 def test_catalog_descriptors_match_the_pack_exactly(tmp_path: Path):
@@ -288,10 +288,13 @@ def test_hydration_rejects_a_re_described_catalog_row(tmp_path: Path):
         )
 
         writer = ClickHouseCatalogWriter(env["client"], env["config"])
+        env["writer"].release_publisher_lease()
+        writer.acquire_publisher_lease("liar")
         version = writer.allocate_version()
         writer.write_descriptors((lying,), index_version=version)
-        writer.publish_watermark(
+        writer.publish_snapshot(
             index_version=version,
+            refs=(),
             published_at_ns=version,
             indexed_rows=1,
             indexed_packs=0,
@@ -376,8 +379,12 @@ def test_a_pinned_watermark_is_isolated_from_a_later_skewed_indexer(tmp_path: Pa
         late_ref = store.put(pack.seal(), "packs/end-to-end-late.dmi-pack")
 
         # Indexer B: fresh instances over the same catalog, clock LOWER than
-        # indexer A's (7 in _stack). The clock must not matter.
+        # indexer A's (7 in _stack). The clock must not matter. It takes the
+        # publisher lease over from A, because only one publisher at a time may
+        # make a snapshot visible.
         late_writer = ClickHouseCatalogWriter(env["client"], env["config"])
+        env["writer"].release_publisher_lease()
+        late_writer.acquire_publisher_lease("indexer-b")
         late_indexer = CatalogIndexer(store, late_writer, clock_ns=lambda: 3)
         result = late_indexer.index([late_ref])
         assert result.indexed_packs == 1, result.failures
@@ -428,8 +435,11 @@ def test_selection_resolve_prunes_to_the_tenant_range(tmp_path: Path):
         # (default index_granularity is 8192 rows), so tenant-e2e is a thin
         # slice of a multi-granule, multi-tenant table.
         writer = ClickHouseCatalogWriter(client, config)
+        env["writer"].release_publisher_lease()
+        writer.acquire_publisher_lease("bulk-seeder")
         version = writer.allocate_version()
         rows_per_tenant = 12_000
+        bulk_refs = []
         for offset, tenant in enumerate(("tenant-bulk-a", "tenant-bulk-b")):
             pack_id = str(UUID(int=PACK_ID.int + 100 + offset))
             bulk = tuple(
@@ -441,13 +451,15 @@ def test_selection_resolve_prunes_to_the_tenant_range(tmp_path: Path):
                 for item in synthetic_descriptors(rows_per_tenant)
             )
             writer.write_descriptors(bulk, index_version=version)
-            writer.commit_packs([bulk[0].locator.pack_ref], index_version=version)
-        writer.publish_watermark(
+            bulk_refs.append(bulk[0].locator.pack_ref)
+        writer.publish_snapshot(
             index_version=version,
+            refs=bulk_refs,
             published_at_ns=version,
             indexed_rows=2 * rows_per_tenant,
             indexed_packs=2,
         )
+        writer.commit_packs(bulk_refs, index_version=version)
 
         # (a) The selection carries its tenant and resolves end to end.
         recording = _RecordingClient(client)

@@ -76,8 +76,10 @@ _SCHEMA_OBJECTS = (
     ("TABLE", "capture_raw"),
     ("TABLE", "pack_inventory_raw"),
     ("TABLE", "capture_version_claims"),
+    ("TABLE", "publisher_lease"),
     ("TABLE", "index_watermark"),
-    ("TABLE", "pack_commit_log"),
+    ("TABLE", "snapshot_manifest"),
+    ("TABLE", "schema_version"),
 )
 
 
@@ -195,8 +197,16 @@ def _stack(tmp_path: Path):
     writer = ClickHouseCatalogWriter(client, config)
     created = False
     try:
-        writer.ensure_schema()
+        # Armed BEFORE ensure_schema: it issues many statements, and one that
+        # fails partway leaves every table created ahead of it behind. Arming
+        # afterwards skips teardown for exactly that case and the tables leak
+        # onto the shared server. Every drop in _SCHEMA_OBJECTS is IF EXISTS,
+        # so tearing down a partial or empty schema is safe.
         created = True
+        writer.ensure_schema()
+        # Only the lease holder can make a snapshot visible, and the check
+        # rides inside the publish statement.
+        writer.acquire_publisher_lease("garage-e2e")
 
         tensors, records = _corpus(tenant)
 
@@ -347,11 +357,15 @@ def test_reconciling_the_same_bucket_twice_indexes_nothing_new(tmp_path: Path):
 
         after = reader.select(CaptureQuery(tenant_id=tenant, limit=100))
         assert after.capture_ids == before.capture_ids
-        # The replay published a new (empty) version, so the catalog moved on
-        # -- the selection is taken at a later watermark -- without changing
-        # which captures it contains or what the pinned snapshot holds.
-        assert int(after.catalog_watermark) > int(before.catalog_watermark)
-        assert int(catalog.current_watermark()) > int(pinned)
+        # A pass with nothing to index performs NO catalog writes at all, so
+        # the watermark stands still. It used to publish an empty version and
+        # move on, which is what this asserted; that burns a version and, since
+        # only the lease holder may publish, makes a sweep that merely CONFIRMS
+        # a catalog contend for the publisher lease -- a periodic rebuild
+        # running beside the live indexer would hard-fail on every page it has
+        # nothing to say about.
+        assert int(after.catalog_watermark) == int(before.catalog_watermark)
+        assert int(catalog.current_watermark()) == int(pinned)
         assert {
             item.capture_id
             for item in catalog.get_by_ids(

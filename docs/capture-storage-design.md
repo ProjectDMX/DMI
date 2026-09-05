@@ -25,7 +25,8 @@ The first host-only slice is available under `dmi.storage.capture`:
 | Garage/S3 store and bounded parallel uploader | Implemented |
 | ClickHouse metadata projection | Implemented and live-tested |
 | Opt-in Ring² to Python pack adapter | Reference implementation |
-| Summaries | Planned |
+| Core tensor summaries and the extension registry | Implemented |
+| Summary artifact stores and long-form scalar metric tables | Planned |
 
 This slice remains opt-in. A reference adapter can now connect the generic
 record sink boundary to the Python pack pipeline without changing the CUDA
@@ -82,6 +83,64 @@ bounded slabs -> pack assembler -> direct upload or NVMe spool
 The capture host does not run a ClickHouse client, compute summaries, or
 coordinate two durable writes. Object-created notifications reduce indexing
 latency, while periodic listing and reconciliation provide completeness.
+
+### The other sink, and how one is chosen
+
+This document describes ONE of two storage paths, and they are mutually
+exclusive per record runtime:
+
+| | native path | capture path (this document) |
+|---|---|---|
+| Sink | `ClickHouseRecordSink` (C++) | `ReferencePythonCaptureSink` (C++ bridge) → `CapturePackReferenceSink` (Python) |
+| Durable form | one ClickHouse row per record, tensor bytes inline | immutable packs in object storage |
+| ClickHouse role | the store itself | a rebuildable index over the packs |
+| ClickHouse footprint | one configured table (`offload` by default) | `{prefix}_*` (`dmi_*` by default) |
+| Selected by | `create_record_runtime(fmt)` with no `record_sink`, plus a `host_engine`/`db_config` on the engine | `create_record_runtime(fmt, record_sink=reference.native_sink)` |
+| Declared by | `MonitoringConfig(storage_backend="native")` | `MonitoringConfig(storage_backend="capture")` |
+| Status | production | explicitly reference-only; production sinks remain native-only |
+
+Both are `ring::RecordSink` implementations and the record engine takes exactly
+one of them: `RingEngine.create_record` is handed either the host engine or a
+sink lease, never both, so no record can reach both backends. Passing an
+explicit `record_sink` bypasses the ClickHouse host entirely -- it is neither
+validated nor used, which
+`test_explicit_record_sink_lease_is_owned_by_native_ring` asserts by failing if
+the host is touched at all; `test_create_record_runtime_is_additive_and_uses_active_transport` pins
+the other direction.
+
+`MonitoringConfig.storage_backend` declares which of the two an engine is for,
+and the engine holds the runtime to it. The choice is otherwise made in two
+different places -- a host engine at construction, a `record_sink` at
+`create_record_runtime` -- with nothing but the caller's memory connecting
+them, so a mismatch was a silent outcome rather than an error: passing a
+`record_sink` while a host engine is configured writes packs and leaves a
+ClickHouse insert pipeline started, connected and never fed.
+
+```python
+engine = MonitoringEngine(
+    config=MonitoringConfig(storage_backend="capture"),
+    model_id="...",
+    ring_config=ring_config,
+)                                    # a host_engine here is now refused
+runtime = engine.create_record_runtime(
+    reference.record_format,
+    record_sink=reference.native_sink,  # omitting it is now refused
+)
+```
+
+`"native"` is the mirror image: it requires a host engine and refuses an
+explicit sink. `"none"` is capture and transport with no persistence at all.
+The default is `"auto"`, which infers the backend from what was passed -- what
+every caller did before the field existed, so nothing that predates it
+changes.
+
+Their ClickHouse footprints are disjoint, so the two can share one server: the
+catalog's schema guard only ever names `{prefix}_*` objects, and `drop_schema`
+only drops what it owns.
+`test_the_capture_catalog_ignores_the_native_paths_offload_table` runs a full
+publish and teardown beside a populated `offload` table and asserts it is
+untouched. A deployment that wants both isolated further should give them
+separate databases.
 
 ## Goals
 
@@ -304,6 +363,30 @@ treats them as hints. Reconciliation scans recent time partitions and scheduled
 older partitions, compares pack identities with indexed state, and replays any
 missing work.
 
+### A pack's footer is not evidence of whose it is
+
+The footer names the tenant; the key prefix names where a writer with
+credentials for that tenant is allowed to put objects. Until descriptors are
+built, nothing compares them -- and integrity proves nothing here, because a
+forged pack is perfectly well formed. Anyone able to PUT into the bucket could
+therefore write a pack whose footer carried another tenant's `tenant_id` and
+`capture_id`, have it indexed under the victim's tenant, and -- since the
+reader resolves a capture with `argMax` over `(index_version, store_id,
+pack_id)` -- become the pack that capture resolves to at every fresh watermark.
+
+`_descriptors` now refuses a pack whose records name a tenant other than the
+one its key belongs to, comparing against the same `key_component` encoding
+that wrote the key (including the digest form an over-long identifier takes,
+which is one-way and so has to be re-encoded rather than decoded). A key with
+no `tenant=` segment is left alone: a filesystem store, a test fixture and a
+hand-placed object are all legitimately laid out some other way, and a check
+that guessed would refuse them all. What is enforced is that a key which DOES
+name a tenant names the pack's own.
+
+This is a bound on damage, not a substitute for object-store authorization.
+Per-tenant buckets or prefix-scoped credentials remain the primary control; the
+check is what makes a breach of that control visible instead of silent.
+
 ## Catalog indexer
 
 The indexer is isolated from capture hosts and scales independently. For each
@@ -319,6 +402,560 @@ discovered pack it:
 At-least-once discovery can produce physical duplicates. Private raw tables may
 use `ReplacingMergeTree`, but public views must provide deterministic logical
 deduplication. Correctness does not depend on asynchronous merges having run.
+
+`{prefix}_capture` means **published descriptor rows, engine-deduplicated**.
+`FINAL` supplies the deduplication; it applies no membership, so the view is
+additionally bounded to the packs the latest published snapshot contains:
+
+```sql
+WHERE (store_id, pack_id) IN (
+  SELECT store_id, pack_id FROM {prefix}_snapshot_manifest
+  WHERE (index_version, publish_id) IN (
+    SELECT index_version, publish_id FROM {prefix}_index_watermark))
+```
+
+The bound pairs `(index_version, publish_id)` rather than matching the version
+alone, exactly as the reader's membership clause does. Every row in the
+watermark table is at or below the published head by definition, so the pair
+test subsumes an `index_version <= max(...)` bound and additionally requires the
+manifest row and the watermark row to come from the **same publish**. See
+*Publish identity* below.
+
+Without that bound the view showed descriptor rows from batches that were
+written and never published, and rows orphaned by a crashed indexing pass --
+data the reader correctly reports as nonexistent. Filtering under `FINAL` is
+sound here only because `(store_id, pack_id)` belongs to the table's sort key:
+rows a merge may collapse into one all share those columns, so the predicate
+keeps or drops a whole group and can never delete the representative `FINAL`
+would have kept. A predicate on `index_version` has no such guarantee, which is
+why `FINAL ... WHERE index_version <= W` is not a snapshot (see *Phase 5*).
+
+The view emits **one row per `(capture, store, pack)`**, not one per capture. A
+capture described by two packs -- a pack mirrored to a second store, or a
+producer retrying a `capture_id` after the first pack was sealed -- is two
+published rows and appears twice. Choosing between them is supersession, which
+belongs to the reader (one `argMax` grouped on capture identity, ordered on
+`(index_version, store_id, pack_id)` -- see *Phase 5*); a second copy of those
+semantics in the view's SQL could drift away from the reader's without either
+side failing.
+
+`{prefix}_pack_inventory` carries no such bound and needs none: `index()` writes
+the inventory only after a successful publish, so every pack in it is already
+published.
+
+### The publisher lease
+
+**Only the holder of the publisher lease can make a snapshot visible, and the
+check rides inside the statement that makes it visible.**
+
+`{prefix}_publisher_lease` holds `(term, lease_id, holder, acquired_at_ns,
+expires_at_ns)`, append-only. A publisher calls `acquire_publisher_lease(holder)`
+before it indexes anything; `publish_snapshot` refuses without one. Both of the
+statements a publish writes -- the manifest rows and the watermark row -- carry
+the same predicate:
+
+```sql
+  AND (SELECT count() FROM (SELECT lease_id, min(expires_at_ns) AS expires_at_ns
+                            FROM {prefix}_publisher_lease
+                            WHERE term = (SELECT max(term) FROM {prefix}_publisher_lease)
+                            GROUP BY lease_id ORDER BY lease_id DESC LIMIT 1)
+       WHERE lease_id = :my_lease
+         AND expires_at_ns > toUnixTimestamp64Nano(now64(9))
+                             + :publish_timeout_ns + :clock_skew_ns) = 1
+```
+
+so a publisher whose lease has been taken over makes **no snapshot visible**.
+It does not make one visible and then discover it lost, which is the failure
+mode every post-write check in this design's history has had.
+
+That is per STATEMENT, not per publish, and the two are not the same claim.
+This paragraph used to say such a publisher "writes nothing"; a takeover
+landing in a gap between statements -- a publish issues one per manifest chunk
+and then the watermark -- leaves the manifest rows already written behind. They are inert -- membership needs the manifest row and the
+watermark row of the SAME publish -- so the safety claim is unaffected, but the
+rows are durable. See docs/catalog-descriptor-key.md, *What this does not
+close*.
+
+**One subquery reading one row, not two subqueries returning a column each.**
+That is a correctness point before it is a cost one, and the two-read form was
+implemented before it was understood: two scalar subqueries are two reads of
+the lease table, and a takeover landing between them can be answered with the
+OLD holder's `lease_id` and the NEW holder's `expires_at_ns` -- so the fence
+passes for a publisher that has already been replaced. The ordered `LIMIT 1`
+resolves the head once and both conditions are asked of that one row. It is
+also cheaper: measured on 25.12, the conditional publish costs 3.06 ms
+unfenced, 3.85 ms with a fence, and 4.84 ms with the two-subquery form.
+
+`count() ... = 1` rather than a tuple comparison, because an empty lease table
+has to make this false and a tuple cannot: a scalar subquery selecting a tuple
+from no rows raises `Code: 125 ... cannot be Nullable` on 25.12 rather than
+answering NULL.
+
+The lease is claimed by the same sole-claimant append-and-read-back protocol as
+a catalog version, but with an extra late-claim rule. A claimant can finish a
+singleton read-back before a competitor inserts at the same term. Once a term
+is contested, no publisher may claim above it until the maximum expiry at that
+term; this preserves any lease returned before the second row arrived.
+
+**The credit there belongs to the read-back, not to the fence.** This section
+used to argue that because the fence names one row, a contested term satisfies
+neither of its conditions. It satisfies both, for the claimant whose `lease_id`
+sorts higher under ClickHouse's UUID collation -- which compares the low 64 bits
+first and is therefore not the text order either. What makes the term safe is
+that a claimant which sees the contest receives no `PublisherLease`, while a
+claimant that returned earlier remains protected by the contested term's expiry
+quarantine.
+
+| Concept | Where it lives |
+|---|---|
+| the monotonic slot a takeover has to beat | `term` |
+| the fencing token the publish statement checks | `lease_id` |
+| when the lease was taken and when it lapses | `acquired_at_ns`, `expires_at_ns`, both stamped by the **server** |
+
+Clocks: `term` orders the table, so a wall-clock tie can never make the head
+ambiguous. Expiry is decided by the server's clock on both sides -- the row is
+stamped server-side and the fence compares against `now64(9)` -- so no
+publisher's own clock, and no skew between two of them, participates. What
+does participate, on a replicated deployment, is the skew between two
+**ClickHouse hosts**: `expires_at_ns` is stamped by `now64()` on the host that
+handled the claim and compared with `now64()` on whichever host handles the
+publish. `ClickHouseCatalogConfig.clock_skew_ns` is the operator's measured
+bound on that, and the fence requires `publish_timeout_ns + clock_skew_ns` of
+lease life remaining rather than the publish cap alone. With the cap alone the
+overlap condition was `clock_B - clock_A > lease_ttl_ns - publish_timeout_ns`;
+with the bound it is `clock_B - clock_A > clock_skew_ns`, i.e. a real skew
+above what the operator declared. A single host has one clock and the default
+of 0 is exact there; declaring `insert_quorum` without a bound is refused at
+construction, because a quorum says "several hosts".
+
+A lease's expiry is the **minimum** `expires_at_ns` written under its `(term,
+lease_id)`, which is what lets a release end a lease without a term of its own
+(below).
+
+Lifecycle:
+
+- **Acquire.** A live lease held by somebody else raises
+  `PublisherLeaseHeldError`, naming the holder and the remaining time. An
+  expired singleton lease is taken over. A contested head is unavailable until
+  every claim at that term has expired; only then is a higher term claimed.
+  A writer that already holds a lease is re-acquiring its OWN and refreshes it,
+  keeping the same `lease_id`, because "acquire before publishing" is the
+  documented path and anything restarting above the writer calls it again.
+- **Renew.** Every publish renews first, keeping the same `lease_id` at a fresh
+  term. That costs **three** round trips -- head read, claim INSERT, read-back,
+  5.69 ms median on 25.12 -- and buys the safety margin: at the moment the
+  fence runs, the lease has essentially a full `lease_ttl_ns` left.
+- **Fail.** A publish fenced out raises `PublisherLeaseError`, deliberately
+  *not* `SnapshotPublishRaceError` -- a lost version is repaired by allocating a
+  higher one, which `CatalogIndexer` does automatically, while a lost lease
+  would fail the same fence at every version. The recovery is to acquire again
+  and re-index; no snapshot became visible, though a takeover between the two
+  publish statements can leave inert manifest rows behind.
+- **Release.** `release_publisher_lease()` writes an already-expired tombstone
+  so an orderly restart does not cost the next publisher a whole TTL. A crash
+  does; that is what expiry is for. The tombstone is a row at the **releasing
+  writer's own term** -- the term it was granted -- stamped by the server with
+  `expires_at_ns = now`, and it reads nothing. Because a lease's expiry is the
+  minimum written under its key, that row ends the lease wherever it stands;
+  because a writer's own term is below every term granted after it, the row
+  can never share or supersede a successor's term. Two earlier forms were
+  wrong in ways worth recording. Unfenced, at `head.term + 1`, a writer whose
+  lease had long since lapsed revoked the current holder's live lease just by
+  shutting down cleanly. Fenced inside an `INSERT ... SELECT` over the head, it
+  looked like a compare-and-set and was not one: the WHERE was evaluated
+  against the head as of its own SELECT, so a stale release could read expired
+  lease A at term T while claimant B inserted T + 1 and passed its singleton
+  read-back, and then land its expired row at that same T + 1 -- a contested
+  head until B's TTL, with B fenced out at once whenever A's UUID sorted
+  higher. Reproduced on 25.12 with a `sleep(1)` in the release. ClickHouse has
+  no way to serialise the two statements, so the repair is a representation
+  with no head read left to race.
+
+**One publisher holds the lease, but two client objects can believe they do.**
+The sole-claimant read-back proves a claimant is alone at ITS term, not that its
+term is the head: a claimant whose head read preceded a rival's row claims below
+that rival, reads back alone, and is handed a live lease while the rival sits
+above it. Verified on 25.12 with two writers holding terms 1 and 9. Only the
+head publishes -- the fence says so, and the loser is refused at its next
+renewal with a message naming the actual holder -- so this is a statement about
+the client objects rather than about safety.
+
+`publish_timeout_ns` caps each publish statement's `max_execution_time` and must
+be below `lease_ttl_ns`. The writer renews before every fenced statement, and
+each fence requires more than that timeout of lease life remaining. A later
+manifest chunk or watermark therefore cannot start near the end of an earlier
+renewal. Each manifest chunk is read back before proceeding, so a conditional
+INSERT that wrote zero rows cannot be followed by the watermark.
+`max_execution_time` is in
+**seconds**, so the writer requires `publish_timeout_ns` to be a whole number
+of seconds and sends the integer -- a fractional value can truncate to 0 on
+older serialization paths, which the server reads as *no* limit. The cap is per
+statement, not the pair, so it does not bound the client round trip between
+them.
+
+Contested lease terms wait for expiry rather than retrying at randomized higher
+terms; the legacy `lease_attempts` retry knob was removed.
+
+The earlier one-renewal implementation measured 15.2 ms for a 16-pack publish
+and 173 ms for the full 4096-row indexing pass on 25.12. The current protocol
+adds one renewal and one manifest verification per chunk, so those figures are
+no longer representative and need remeasurement. The read path is unchanged.
+
+What this does **not** close is written up in
+docs/catalog-descriptor-key.md, "The fenced publisher lease", with the
+measurements: the takeover instant, the liveness cost of a contested term, a
+crash between a claim and its read-back, and the write half of replication.
+
+### Publish identity
+
+Every call to `publish_snapshot` mints one `publish_id` and writes it on both
+rows it produces: the manifest rows for the packs it is admitting, and the
+watermark row that admits them. It then reads that column back and compares it
+to its own value.
+
+That check answers *"is version V mine?"*. The one it replaced -- `SELECT
+count() FROM {prefix}_index_watermark WHERE index_version = V` -- answered
+*"does a row for V exist?"*, and a row written by anything else read as success:
+an operator's `INSERT`, a second build sharing the prefix, a publisher whose
+conditional statement overlapped this one. The caller was then told it had
+published a snapshot it did not publish, and `CatalogIndexer` went on to record
+those packs in the replay inventory, so no later pass would index them again.
+The sole-claimant allocator makes a foreign row at V unlikely, not impossible,
+and reading the identity back costs what counting cost: the same one-row scan
+of the same key range.
+
+The identity is per **attempt**, not per allocated version. A second attempt at
+one version is a different write, and reusing the allocator's `claim_id` would
+let it read the first attempt's row back as its own and report success for a
+statement that inserted nothing.
+
+Carrying the same identity on the manifest rows is what makes membership a
+claim about a publish rather than about a number. On `index_version` alone the
+*contents* of snapshot V would be whatever anyone wrote at V, while the winner
+of V unwittingly published them; owning a version and owning its membership are
+separate claims and the catalog needs both.
+
+#### Reads that decide something
+
+The claim read-back in `allocate_version`, the published-head reads, the
+conditional watermark `INSERT` and the publish verification all carry
+`select_sequential_consistency`. Each is a read-back of the reader's own write,
+and the sole-claimant protocols are sound only while a later write always
+observes an earlier one. A single ClickHouse node gives that; a
+`ReplicatedMergeTree` replica serves reads from whatever log entries it has
+fetched, so a read-back can miss a row another claimant has already committed
+and both claimants can see themselves alone.
+
+It is set on the reads rather than validated at construction because there is
+nothing to validate at construction: the tables need not exist yet, an operator
+can convert them to `Replicated` afterwards, and a warning nobody reads is not
+enforcement. Setting it is unconditional and costs nothing on a non-replicated
+table, where the server accepts and ignores it.
+
+The write-side half is opt-in through `ClickHouseCatalogConfig.insert_quorum`.
+When configured, descriptor inserts and protocol writes are quorum-durable;
+pack inventory stays asynchronous because a stale replay check causes redundant
+work rather than a skipped capture.
+
+### Retention
+
+Three tables grow with every pass and nothing collected them: a publisher
+publishing once a second appends ~86k `{prefix}_publisher_lease` rows a day,
+every allocation leaves a `{prefix}_capture_version_claims` row, and every
+publish that loses its version race leaves a full set of manifest rows behind.
+The only removal path was `drop_schema()`, which destroys the catalog.
+
+`ClickHouseCatalogWriter.collect_garbage()` deletes exactly the rows that can
+never be resolved again, and returns how many it removed per table. It is
+explicit and belongs in a maintenance job, never on the write path: a mutation
+is a background rewrite of the parts it touches, and an indexer that ran one
+inline would pay for it in the middle of a publish.
+
+| Table | Deleted | Why it can never be resolved again |
+|---|---|---|
+| `{prefix}_snapshot_manifest` | rows below the published head whose `(index_version, publish_id)` has no watermark row **in two reads a `publish_timeout_ns` apart** | below the head, that publish's watermark INSERT can no longer be *admitted* -- the barrier requires strictly above -- so no new statement can create the pair membership needs. One already admitted above the head can still stall and *land* below it, and the publisher's own confirmation runs on its clock, so a single read could hand this sweep a pair the publisher is about to confirm. Intersecting two reads a publish cap apart settles it: a statement admitted before the first has landed (putting a watermark row beside the pair, which drops it from the second read) or been aborted by `max_execution_time`. `publish_snapshot` still confirms its membership after the watermark row stands and refuses the publish (a lost race, republished higher) if it has gone, which covers the residual where a statement blocked in a lock overruns the cap |
+| `{prefix}_publisher_lease` | rows below the head `term` | the fence resolves exactly one row, the highest `(term, lease_id)`, and terms only increase. The head is kept even when expired: it is what a takeover has to sort above |
+| `{prefix}_capture_version_claims` | rows at or below the published head | the allocator picks above `max(claims.version)` AND above `last_published_version()`, so the watermark keeps the floor once these are gone. Claims ABOVE the head stay -- one may be a version a pass has allocated and not yet published |
+
+`{prefix}_index_watermark` and the descriptor and inventory tables are never
+collected here. The watermark log IS the floor the other two bounds are
+measured against, and the descriptors are the catalog.
+
+The manifest sweep is two reads and then a mutation on purpose: a plain `SELECT` on the
+initiator resolves the orphaned `(index_version, publish_id)` pairs with both
+bounds, and the mutation deletes those pairs as a literal `IN` list, in chunks
+bounded by the inline byte budget. The one-statement form -- `ALTER TABLE ...
+DELETE WHERE ... NOT IN (SELECT ... FROM {prefix}_index_watermark)` -- reads a
+second, independently replicated table inside the mutation predicate, and on
+`ReplicatedMergeTree` ClickHouse refuses that under the default settings
+(`allow_nondeterministic_mutations` and `mutations_execute_subqueries_on_initiator`
+are both 0 on 25.12). It worked on a single node and failed on exactly the
+deployment the rest of this module takes care over. A literal list is
+deterministic on every replica.
+
+### Reading under replication lag
+
+A bounded read resolves against a pinned watermark, and the statement that
+reads the watermark has always carried `select_sequential_consistency`. The
+statement that reads DESCRIPTORS now carries it too, because the first does not
+imply the second: a `ReplicatedMergeTree` keeps a replication log **per table**,
+so a replica caught up on `{prefix}_index_watermark` can still be behind on
+`{prefix}_snapshot_manifest` and `{prefix}_capture_raw`. Left plain, a read
+pinned to a genuinely published watermark returns a SHORT page -- and `search`
+issues its cursor at that watermark, so the next page resumes past the rows
+that were missing, and a walk skips captures while reporting success. Lag can
+only omit, never invent, so nothing unpublished or cross-tenant is exposed
+either way.
+
+On a single node the server accepts and ignores the setting (verified on
+25.12), so this is free unless the tables are replicated; there it makes every
+page wait for the replica. `ClickHouseReaderConfig.consistent_snapshot_reads`
+turns it off for an operator who would rather have the latency and accept the
+gap.
+
+The WRITE half is available and still off by default:
+`ClickHouseCatalogConfig.insert_quorum` sets `insert_quorum` (and clears
+`insert_quorum_parallel`, which `select_sequential_consistency` does not work
+with) on version claims, lease claims and releases, membership, the watermark,
+and descriptor inserts. Without it the sole-claimant protocols and consistent
+descriptor reads are sound on a single node and on a quorum-writing cluster,
+and not in between. Pack inventory remains asynchronous: it is only the replay
+guard, so lag there causes redundant indexing rather than an incomplete page.
+
+**It is a for-the-life-of-the-catalog setting, not a toggle.** Measured on
+25.12 against two replicas of each protocol table: once a replicated table has
+taken a quorum insert, a later NON-quorum insert into it is invisible to a
+`select_sequential_consistency` read -- the plain read returns two rows and the
+sequential read returns one. Every read-back in this module is a sequential
+read of the writer's own insert, so turning `insert_quorum` off on a catalog
+that had it on leaves the sole-claimant protocols unable to confirm themselves:
+`allocate_version` exhausts its attempts and raises
+`CatalogVersionAllocationError`. That is the safe direction -- loud, not blind
+-- and it is still an outage. Turning it ON mid-life is safe; turning it off
+requires a rebuild.
+
+The same measurement is why `insert_quorum_timeout` is bounded to
+`publish_timeout_ns` rather than left at ClickHouse's 600-second default: the
+fenced publish statements are capped by `max_execution_time`, but a version or
+lease claim is not, so an unreachable replica would otherwise park a claim for
+ten minutes -- twenty times the publish cap and twenty times the lease TTL --
+while the writer believed it was mid-publish. With the bound, an unsatisfiable
+quorum is refused immediately (Code 285, `TOO_FEW_LIVE_REPLICAS`, measured at
+0.0s with one replica detached).
+
+`tests/tools/verify_replicated_quorum.py` drives all of this against two
+replicas and is the only way to exercise it: no CI here runs a replicated
+cluster.
+
+### Catalog schema versions and rebuild
+
+`{prefix}_schema_version` holds one row naming the schema the catalog was
+created with. The current version is **4**. `ensure_schema` writes that row
+last, once every other object exists, so a stamped catalog is a complete one.
+
+**Version 4 is the first version that stamps itself**, so a catalog with no such
+table is one of versions 1, 2 or 3 and the stamp cannot say which. It is not
+"version 1 by definition"; reading it that way is how a refusal comes to state
+differences the catalog in front of it does not have.
+
+| Version | What it changed |
+|---|---|
+| 1 | the original schema; membership in `{prefix}_pack_commit_log`, descriptors sorted on capture identity alone |
+| 2 | `(store_id, pack_id)` appended to the descriptor sort key; membership moved to `{prefix}_snapshot_manifest` |
+| 3 | `publish_id` added to the watermark and the manifest |
+| 4 | `{prefix}_publisher_lease` and `{prefix}_schema_version` added |
+
+`ensure_schema` checks compatibility before issuing any DDL and refuses
+anything it did not create, raising `CatalogSchemaVersionError`:
+
+| State found | Outcome |
+|---|---|
+| no catalog objects at all, with object visibility confirmed | fresh install: create the stamp and lease tables, take the publisher lease, re-read, create everything else, stamp the current version, release |
+| version table stamped at the current version, all objects present, descriptor sort key this build's | proceed; the DDL is idempotent |
+| version table present, no row | an install of this build that died before stamping: under the publisher lease, rerun the DDL, then stamp -- *after* the last three rows below, which an empty stamp does not skip |
+| only superseded objects (`{prefix}_pack_commit_log`) | refuse -- naming that object and saying to drop it; there is nothing to rebuild |
+| an object present under the wrong kind (a table where a view belongs, or the reverse) | refuse -- naming the object and its engine |
+| catalog objects present, no version table | refuse -- unstamped, with the differences read off `system.tables` / `system.columns` |
+| stamped at any other version | refuse -- a newer writer owns this catalog, or an older one this build cannot upgrade |
+| stamped at the current version, but `{prefix}_capture_raw` carries any other `ORDER BY` | refuse -- the stamp describes the build that wrote it, not the table beside it, and `CREATE TABLE IF NOT EXISTS` cannot alter a live sort key |
+| a superseded object (`{prefix}_pack_commit_log`) standing BESIDE this build's own | refuse -- an earlier build has been writing this prefix |
+| a TABLE missing, and some data table holds rows | refuse -- partially dropped |
+| a TABLE missing, and every data table is empty | complete it: rerun the DDL |
+| a VIEW missing | recreate it; a view is a projection of the tables and holds no rows |
+| any pack inventory identity lacks effective published manifest membership | refuse -- membership is incomplete |
+
+**Installs are serialised per prefix, on the publisher lease.** Two
+initialisers that both read an empty prefix both proceeded to their DDL and
+their stamps, and a reviewer injected the ordering that made it matter: a
+compatibility read that found nothing, another initialiser's `CREATE
+{prefix}_capture_raw` with a pre-v4 sort key, this initialiser's `CREATE TABLE
+IF NOT EXISTS` no-op over it, names and kinds confirmed, and stamp 4 written
+over a layout it does not describe -- detected only by the *next* call, after
+this one had already told its caller to index. So a fresh or interrupted
+install now creates the stamp table and the lease table first (both
+idempotent, both this build's own; `CREATE TABLE IF NOT EXISTS` is atomic on
+the server, so two initialisers racing those two statements is harmless),
+takes the publisher lease as `ensure_schema` -- or renews the one the calling
+writer already holds -- re-reads the catalog under it, and only then issues the
+remaining DDL, re-checks the layout and stamps, releasing afterwards. Nobody
+can be publishing into a catalog that does not exist yet, so an install pays
+nothing for the lease; a **complete** catalog is ensured without it, because
+its DDL is idempotent and taking the lease there would refuse every second
+process for as long as an indexer is publishing.
+
+What this cannot serialise is an initialiser from an older build, which knows
+nothing of the lease. Against that the layout re-check immediately before the
+stamp is the whole defence -- it refuses rather than stamps -- and a catalog
+such a build did write into is refused on the next call as an older build's
+object standing beside this one's.
+
+Before any verdict above -- and so before any catalog DDL -- `ensure_schema`
+checks object-scoped `SHOW TABLES` access for every current and superseded
+object. After DDL it re-reads `system.tables` and requires the complete current
+object set, with no superseded object, before writing the stamp. An empty
+result caused by hidden objects therefore cannot be mistaken for a fresh
+install, and a partially visible catalog cannot be stamped as complete.
+
+**"Before any verdict" is the load-bearing half.** `system.tables` is
+grant-filtered per role, so an object this role holds no privilege on is
+absent from the state every row of the table above is read off -- there,
+indistinguishable from an object that was dropped. Checked only before the
+DDL, this check was unreachable for exactly the catalog it exists for:
+measured on 25.12, a healthy stamped catalog whose `{prefix}_snapshot_manifest`
+was merely ungranted was refused as "missing `{prefix}_snapshot_manifest`" with
+the rebuild instruction, telling the operator to drop all ten objects of a
+catalog whose only fault was a missing `GRANT`. The grant probes name objects
+rather than resolving them, so they need neither the database nor the objects
+to exist and can run first on a fresh install too.
+
+**An empty stamp narrows the version; it does not excuse anything else.** The
+last three rows apply whether or not `{prefix}_schema_version` holds a row.
+Returning as soon as it was empty skipped both refusals, and clearing the stamp
+is the obvious workaround for an operator who has just been refused -- which
+made it the likeliest route into the state this check exists to prevent.
+Measured on 25.12: with the stamp truncated, a version 3 catalog was accepted
+and re-stamped as 4 with no `{prefix}_publisher_lease` table, performing the
+in-place upgrade this design says is never performed; on a version 2 catalog
+the DDL then died mid-way with `Code: 47` over `publish_id`, leaving the
+catalog half written; and an inventory beside an empty manifest was accepted.
+
+**A missing table is dangerous because of what SURVIVED it.** Recreating one
+empty is the state that hides every capture only while its neighbours kept their
+rows: a surviving pack inventory makes the next pass skip every pack it lists,
+so nothing refills what was dropped. With every data table absent or empty there
+is nothing to hide and nothing to lose, and re-running the DDL is the
+completion -- which is the whole reason `{prefix}_schema_version` is created
+first, "so an install interrupted partway leaves a catalog that says *this
+build, unfinished* rather than one refused forever". Refusing regardless made
+that false: an install that died between two `CREATE`s was refused on every
+later start, reciting a surviving pack inventory that was itself one of the
+tables that had never been created, and the only recovery it offered was a
+manual drop of every object.
+
+**An earlier build sharing the prefix is refused, not tolerated.** A superseded
+object standing beside this build's own is not an unfinished cleanup -- that is
+the "only superseded objects" row above -- it is two builds writing one catalog,
+and the older one is the dangerous half. Its `ensure_schema` is all
+`CREATE ... IF NOT EXISTS`, so it no-ops over these tables and recreates its
+own; its publish writes the pack inventory and an unconditional watermark row
+carrying no publish identity, and never a manifest row. Every pack it touches is
+therefore recorded as indexed and admitted by no snapshot: invisible to every
+reader, and skipped by every later pass including a rebuild. Nothing else here
+notices -- the stamp reads this version, no table is missing, and the
+inventory-without-membership check reports those packs only once they are
+already durable and invisible.
+
+**An unstamped catalog is diagnosed, not assumed.** The refusal reads the
+descriptor table's `sorting_key`, which of the two membership tables exist,
+whether the watermark and the manifest carry `publish_id`, and which of this
+build's objects are absent -- and reports the differences it actually found,
+including saying so where a difference is *not* there. An operator who checks a
+named fact, finds it false and concludes the guard is broken works around it,
+which lands them on the one path the guard exists to prevent; an inaccurate
+diagnosis is worse than a vague one. It is still refused whichever version it
+turns out to be: those probes compare object names, one sort key and one column,
+not column types, view definitions, codecs or skip indices, so "the differences
+listed are all of them" is not something this build can know.
+
+No version is reachable from the one below it by any statement `ensure_schema`
+could issue. Between them the versions change the descriptor sort key, the
+membership table, the publish identity columns and the set of tables, and
+`CREATE TABLE IF NOT EXISTS` alters neither an existing table's columns nor its
+sort key. Version 4 adds only new tables and could in principle be created in
+place, but the compatibility check runs before any DDL and cannot tell a table
+that was never written from one that was dropped -- and one of those is the
+state that hides every capture. The version 1 to version 2 step is the worked
+example, and both ways it fails are silent. `CREATE TABLE IF NOT EXISTS` is
+a no-op against a live table, so the descriptor table keeps the version 1 sort
+key and stays open to the merge deletion the new key exists to prevent.
+Membership is worse: it moved from `{prefix}_pack_commit_log` to
+`{prefix}_snapshot_manifest`, and on an upgraded catalog the manifest is empty
+while `{prefix}_pack_inventory_raw` is full, so the next indexing pass skips
+every pre-existing pack as already committed, no pack ever reaches the
+manifest, and every capture indexed before the upgrade becomes invisible to
+every reader. Measured on a version 1 catalog holding four captures in two
+packs: `ensure_schema()` returned cleanly, the sort key was unchanged, the
+following rebuild reported `skipped=2 indexed=0`, and the reader returned 0 of
+4 captures.
+
+A **missing view** is the one recoverable state, and deliberately so.
+`{prefix}_capture` and `{prefix}_pack_inventory` hold no rows: `ensure_schema`
+recreates them outright (`CREATE OR REPLACE VIEW` / `CREATE VIEW IF NOT
+EXISTS`), and a recreated projection cannot disagree with the tables that
+survived. Demanding the full rebuild -- which re-reads every pack footer in the
+store and leaves readers on an empty and then partial catalog while it runs --
+because somebody dropped a view is a cost with no risk behind it. A missing
+TABLE is the opposite and stays refused.
+
+#### Rebuilding the catalog
+
+Every `{prefix}_` object is derived from immutable packs, so the supported
+recovery -- from a version mismatch, from a partial drop, from any catalog
+state that is not trusted -- is to delete all of it and reconcile the object
+store again:
+
+1. Stop every indexer writing that prefix.
+2. Drop all of its objects, views before the tables they read:
+   `{prefix}_capture`, `{prefix}_pack_inventory`, `{prefix}_capture_raw`,
+   `{prefix}_pack_inventory_raw`, `{prefix}_capture_version_claims`,
+   `{prefix}_publisher_lease`, `{prefix}_index_watermark`,
+   `{prefix}_snapshot_manifest`, `{prefix}_schema_version`, and version 1's
+   `{prefix}_pack_commit_log`. This list and the one
+   `CatalogSchemaVersionError` prints are both checked against the writer's own
+   object table by `test_the_documented_rebuild_drops_exactly_what_the_writer_owns`,
+   because a table missed here is a table that survives the rebuild -- and one
+   superseded table left standing wedges every start after it. `drop_schema()`
+   is the supported way to do this and issues `DROP TABLE IF EXISTS` for every
+   object regardless of the kind this build creates it as: the catalog that
+   most needs tearing down is the one whose kinds are WRONG, and `DROP VIEW`
+   against a table is refused even with IF EXISTS (Code 80 on 25.12).
+3. Run `ensure_schema()`. It finds nothing, creates the current schema, and
+   stamps it.
+4. Run `acquire_publisher_lease(holder)` on the writer the rebuild will use.
+   Only the lease holder can make a snapshot visible, and `rebuild()`
+   publishes every page it indexes, so a rebuild without the lease fails its
+   first page with `PublisherLeaseError`.
+5. Run `CatalogReconciler.rebuild(prefix=...)` once per pack store. It lists
+   the objects, range-reads each pack footer, and repopulates the descriptors,
+   the snapshot manifest, the pack inventory and the watermark from them.
+
+**Dropping `{prefix}_pack_inventory_raw` is mandatory, not optional.**
+`committed_pack_ids` reads that inventory to decide which packs are already
+indexed. An inventory left in place reports every pre-existing pack as done, so
+step 5 skips all of them, writes no descriptors, publishes nothing at all,
+and returns an `IndexResult` with no failures -- a rebuild that reports success
+and produces an empty catalog, while the captures stay durable in object
+storage and unreachable through every reader. That state is why the last row of
+the table above exists: any inventory identity without effective manifest
+membership is refused at `ensure_schema`, which is the earliest point at which
+anything can still see the mistake.
+
+The check lives there rather than in `CatalogReconciler` deliberately.
+`rebuild()` is also the periodic full sweep of a healthy catalog -- it is
+expected to skip everything it has already indexed -- so it cannot refuse a
+populated catalog, and it reaches the writer only through `CatalogWriter`,
+which exposes no way to ask whether membership is intact. `ensure_schema` runs
+before any indexer starts and sees the tables directly.
 
 ClickHouse stores:
 
@@ -390,62 +1027,111 @@ not returned in catalog rows.
 ## Extension contracts
 
 ```python
-class PackWriter(Protocol):
+class PackWriter:                      # pack.PackWriter, a concrete class
     def append(self, record: CaptureRecord) -> None: ...
     def seal(self) -> SealedPack: ...
 
 
-class PackSource(Protocol):
+class PackSource(Protocol):            # model.PackSource
     pack_id: str
-    object_bytes: int
     checksum: str
+    @property
+    def object_bytes(self) -> int: ...
     def open(self) -> BinaryIO: ...
 
 
-class PackStore(Protocol):
+class PackStore(Protocol):             # model.PackStore
+    store_id: str
     def put(self, pack: PackSource, object_key: str) -> PackRef: ...
     def stat(self, ref: PackRef) -> ObjectInfo: ...
     def read_range(self, ref: PackRef, offset: int, length: int) -> bytes: ...
-    def list_committed(self, cursor: ScanCursor) -> Page[PackRef]: ...
 
 
-class PackSink(Protocol):
-    def persist(self, ready: ReadyPack) -> object: ...
+class PackInventory(PackStore, Protocol):          # catalog.PackInventory
+    def inspect(self, object_key: str) -> PackRef: ...
+    def list_objects(
+        self, *, prefix: str = "", cursor: str | None = None, limit: int = 1000
+    ) -> ObjectPage: ...
 
 
-class CommitFeed(Protocol):
-    def watch(self, cursor: EventCursor) -> Iterable[PackRef]: ...
-    def scan(self, cursor: ScanCursor) -> Page[PackRef]: ...
+class PackSink(Protocol):              # pipeline.PackSink
+    def persist(self, ready: ReadyPack) -> PackRef | PackSource: ...
 
 
-class CatalogIndexer(Protocol):
-    def index(self, packs: Sequence[PackRef]) -> IndexResult: ...
+class CatalogWriter(Protocol):         # catalog.CatalogWriter
+    def committed_pack_ids(self, identities) -> set[PackIdentity]: ...
+    def write_descriptors(self, descriptors, *, index_version: int) -> None: ...
+    def commit_packs(self, refs, *, index_version: int) -> None: ...
+    def publish_snapshot(
+        self, *, index_version: int, refs, published_at_ns: int,
+        indexed_rows: int, indexed_packs: int,
+    ) -> None: ...
+    def last_published_version(self) -> int: ...
+    def allocate_version(self) -> int: ...
 
 
-class CaptureSummarizer(Protocol):
+class CaptureReader:                   # reader.CaptureReader, a concrete class
+    def search(self, query: CaptureQuery) -> CapturePage: ...
+    def select(self, query: CaptureQuery) -> CaptureSelection: ...
+    def estimate(self, selection: CaptureSelection) -> HydrationEstimate: ...
+    def hydrate(
+        self, selection: CaptureSelection, *, byte_limit: int,
+        request_limit: int = 1024,
+    ) -> tuple[HydratedCapture, ...]: ...
+    def summarize(
+        self, selection: CaptureSelection, *, byte_limit: int, ...
+    ) -> tuple[CaptureSummary, ...]: ...
+
+
+# Summaries are extension VALUES registered with ExtensionRegistry rather than
+# a summarizer protocol: a named, versioned callable over a decoded tensor.
+@dataclass(frozen=True, slots=True)
+class ScalarMetric:                    # extensions.ScalarMetric
     name: str
-    version: str
-    def summarize(self, capture: CaptureDescriptor, tensor: TensorView) -> SummaryBatch: ...
+    version: int
+    compute: Callable[[np.ndarray], float]
 
 
-class CaptureReader(Protocol):
-    def search(self, query: CaptureQuery) -> Page[CaptureDescriptor]: ...
-    def estimate(self, ids: Sequence[CaptureId]) -> HydrationEstimate: ...
-    def hydrate(self, request: HydrationRequest) -> Iterable[TensorRecord]: ...
+@dataclass(frozen=True, slots=True)
+class ArtifactProducer:                # extensions.ArtifactProducer
+    kind: str
+    version: int
+    produce: Callable[[np.ndarray], tuple[bytes, str]]
+
+
+class ArtifactSink(Protocol):          # extensions.ArtifactSink
+    def put(
+        self, *, capture_id: str, kind: str, version: int, data: bytes,
+        content_type: str,
+    ) -> ArtifactRef: ...
 ```
+
+*(This block used to name about a dozen types that were never written --
+`CommitFeed`, `CaptureSummarizer`, `ScanCursor`, `Page`, `EventCursor`,
+`TensorView`, `SummaryBatch`, `CaptureId`, `HydrationRequest`, `TensorRecord`,
+`ClickHouseCatalogIndexer`, `CoreTensorStatsSummarizer`. What shipped instead
+is above: discovery is `CatalogReconciler` over a `PackInventory` rather than a
+`CommitFeed`; paging is `CapturePage` / `ObjectPage` and an opaque cursor
+string rather than a generic `Page[T]`; hydration takes a `CaptureSelection`
+rather than a request object; and summarization is the extension registry
+rather than a summarizer protocol.)*
 
 Initial implementations:
 
 ```text
-PackStore
+PackStore / PackInventory
   - FilesystemPackStore
   - S3PackStore
 
-CatalogIndexer
-  - ClickHouseCatalogIndexer
+CatalogWriter
+  - ClickHouseCatalogWriter          (driven by CatalogIndexer/CatalogReconciler)
 
-CaptureSummarizer
-  - CoreTensorStatsSummarizer
+CaptureCatalog (the reader's query side)
+  - ClickHouseCaptureCatalog
+
+Summaries
+  - summarize_tensor -> CoreTensorSummary
+  - ExtensionRegistry, for ScalarMetric and ArtifactProducer
 ```
 
 External configuration and provider responses are validated at their
@@ -501,19 +1187,23 @@ src/dmi/storage/capture/
   s3.py                    # Garage/S3 streaming, listing, exact range reads
   catalog.py               # discovery, reconciliation, footer indexing
   clickhouse_catalog.py    # raw tables, logical views, batched inserts
+  clickhouse_reader.py     # pinned snapshot reads, keyset pagination
+  cursor.py                # opaque validated keyset cursors
+  summary.py               # core tensor statistics, tensor decode
+  extensions.py            # scalar metric / artifact extension registry
+  record_adapter.py        # opt-in Ring² reference bridge
 
 # Planned additions
-src/dmi/storage/
-  summaries/
-    contracts.py
-    core.py
-
 native/csrc/storage/
   capture_record.h
   pack_builder.h
   persistence_pipeline.h
   spool.h
 ```
+
+*(The five modules after `clickhouse_catalog.py` shipped without this list
+being updated. The `summaries/` package this section used to plan was never
+created; `summary.py` and `extensions.py` are what filled that role.)*
 
 ## Implementation plan
 
@@ -848,8 +1538,38 @@ a conservative cold-cache bound for footer verification.
 
 Reads are pinned to a watermark. `CaptureQuery.filter_hash` identifies a query
 independently of its page, keyset cursors carry that hash and the pinned
-watermark, and `ClickHouseCaptureCatalog` resolves each column with `argMax`
-over `*_capture_raw`.
+watermark, and `ClickHouseCaptureCatalog` resolves a capture out of
+`*_capture_raw` with **one** `argMax` over a tuple of every non-grouped column,
+ordered on the tuple `(index_version, store_id, pack_id)`.
+
+Both halves of that shape are load-bearing, and the per-column
+`argMax(<column>, index_version)` this document used to describe has been
+removed:
+
+- **The tuple ordering key.** One `index()` call allocates one `index_version`
+  for the whole batch, so two packs describing a capture in a single pass
+  produce rows whose ordering key is EQUAL, and ClickHouse leaves the winner of
+  a tie undefined. Measured on 26.9/25.12, one corpus pinned at a single
+  watermark resolved to a different pack at `max_threads = 1` than above it, and
+  to a different one again once a merge had put both rows in one part -- a
+  pinned selection silently reading different bytes before and after a
+  background merge. `(index_version, store_id, pack_id)` is a total order over
+  the rows in a group, and `index_version` still leads, so supersession is
+  unchanged.
+- **One aggregate, not one per column.** Twenty-seven separate `argMax` calls
+  leave nothing forbidding `store_id` from one row and `object_key` from
+  another -- a descriptor describing no pack that exists. It could not be
+  reproduced on 25.12 across forty-two aggregation configurations, and the
+  reason looks structural, but that is an observation about one build rather
+  than a promise the engine makes. Keeping the per-column form and merely
+  giving it the tuple key is also correct and costs +291% at a 100-row page,
+  because ClickHouse compares a tuple ordering argument through a generic
+  `Field` once per row per aggregate.
+
+Every descriptor field except the locator is immutable for a
+`(tenant_id, capture_id)`, which is what makes the pre-aggregation `WHERE`
+filters safe; the rule is written out in `clickhouse_reader`'s module
+docstring and pinned by a test.
 
 `FINAL` is not a snapshot mechanism. It collapses duplicates to the highest
 version present and only then applies predicates, so
@@ -868,23 +1588,40 @@ already stores, so they cost no indexer change and no extra object reads.
 Anything derived from tensor *contents* runs at hydration time instead, because
 `CatalogIndexer.index` range-reads pack footers only.
 
-The 50,000-row, two-version measurement:
+The 50,000-row, two-version measurement, re-run on the Linux reference host
+against ClickHouse 25.12 after `e93a2c8` changed the projection shape, median
+of three rounds of `--trials 3`:
 
 | Measurement | Median |
 |---|---:|
-| `argMax` snapshot read | 22.3 ms |
-| `FINAL` read (not a snapshot) | 12.1 ms |
-| `max(index_version)` watermark | 1.7 ms |
-| Page, `limit=100` | 21.4 ms |
-| Page, `limit=1000` | 78.8 ms |
-| Page 1 vs page 25 at `limit=100` | 21.5 ms vs 24.4 ms |
+| `argMax` snapshot read | 35.6 ms |
+| `FINAL` read (not a snapshot) | 16.8 ms |
+| `max(index_version)` watermark | 2.3 ms |
+| Page, `limit=100` | 171.7 ms |
+| Page, `limit=1000` | 188.5 ms |
+| Page, `limit=5000` | 256.9 ms |
+| Page 1 vs page 25 at `limit=100` | 176.8 ms vs 173.9 ms |
 
-Correctness costs about 1.85x a plain `FINAL` read at this size, on a laptop
-build with one replay -- it is not a production figure and should be repeated on
-representative hardware and duplicate ratios. Page cost is flat with depth,
-which is the property keyset pagination exists to provide. The watermark
-aggregate is a second round trip per search but under a tenth of a page's cost,
-so caching it is not yet worth the staleness.
+**These are not comparable with the figures this table used to carry** (22.3 /
+12.1 / 1.7 / 21.4 / 78.8 ms, and 21.5 vs 24.4 ms for depth). Those were taken
+on an Apple Silicon laptop against ClickHouse 26.9.1 and, more importantly,
+before `e93a2c8` -- so they describe a reader that resolved each column with its
+own `argMax(<column>, index_version)`, which is the shape that commit removed
+for the tie it left undefined. Two changes at once, and the hardware is the
+larger of them.
+
+The cost of the shape change alone was measured A/B on this host by that
+commit: a 100-row page went from 140.1 ms to 171.7 ms, **+22.6%**, and across
+page sizes, pagination depth and the selectivity cases the current shape runs
++17% to +43%, worst at `unfiltered` (136.4 -> 195.6 ms). That is what
+determinism and a structurally coherent descriptor cost.
+
+Correctness still costs about 2.1x a plain `FINAL` read at this size, with one
+replay -- not a production figure, and it should be repeated on representative
+hardware and duplicate ratios. Page cost remains flat with depth, which is the
+property keyset pagination exists to provide. The watermark aggregate is a
+second round trip per search but a small fraction of a page's cost, so caching
+it is not yet worth the staleness.
 
 Run the benchmark with:
 
@@ -972,9 +1709,10 @@ capture and field that moved.
   cannot pass while the 1.2x requirement is unmeasured.
 - Performance variance under fault injection, which is not yet recorded.
 - Three decisions the migration forces: whether the public views keep `FINAL`
-  now that its cost is measured at 1.85x; where `index_version` comes from once
-  more than one indexer runs, since the current per-process clock assumes a
-  single writer; and whether catalog facets belong in the public views.
+  now that the correct read's cost against it is measured at 2.1x; where
+  `index_version` comes from once more than one indexer runs, since the current
+  per-process clock assumes a single writer; and whether catalog facets belong
+  in the public views.
 
 No phase requires a CUDA-side change.
 
@@ -1043,15 +1781,31 @@ bytes, and retained failure details all have explicit caps.
   ClickHouse wire size.
 - The current public views use `FINAL` for immediate replay correctness. Hot
   query workloads must measure its cost before choosing a different projection.
+- `{prefix}_capture` re-evaluates its membership bound on every query. The bound
+  carries no `max()` and no version predicate: it pairs `(index_version,
+  publish_id)` between `{prefix}_snapshot_manifest` and
+  `{prefix}_index_watermark`, so the view shows every pack whose publish has
+  reached the watermark table *at the moment the query runs*. It therefore
+  tracks published state rather than pinning a snapshot, and two reads of the
+  view a moment apart can see different sets of packs. A caller that needs a
+  stable selection uses the reader, which pins a watermark and carries it in
+  the cursor.
+- The catalog schema is versioned and checked, never migrated. There is no
+  in-place upgrade path and no online one: the recovery from a version mismatch
+  is the full rebuild above, which re-reads every pack footer in the store, so
+  its cost scales with the corpus and readers see a catalog that is empty and
+  then partial while it runs. Nothing is lost -- the packs are the durable copy
+  -- but a large deployment needs to plan the window.
 
 ## Phase 5 limitations
 
-- `index_version` is `time_ns()` from the indexing process's own clock. With
-  more than one indexer, clock skew makes versions non-monotone across writers,
-  and a watermark taken from one indexer can permanently exclude rows written by
-  another. Phase 5 assumes a single indexer owns a catalog; coordinating the
-  version source is deferred to Phase 6, which already revisits indexer
-  topology.
+- `index_version` no longer comes from any process clock. It is allocated by
+  the catalog itself through the sole-claimant protocol in `allocate_version`,
+  so it is unique and monotonic across writers; the wall clock stamps only the
+  diagnostic `published_at_ns`. Making a snapshot visible is additionally
+  fenced on a durable publisher lease, so only the lease holder can publish.
+  What remains is not clock skew but the residual publication windows recorded
+  in `catalog-descriptor-key.md` under "What this does not close".
 - Cursors are validated, not authenticated. A tampered cursor is rejected as
   malformed -- strict base64 and envelope checks -- but nothing binds a cursor to
   the caller who received it. A cursor can only address the keyspace its own
