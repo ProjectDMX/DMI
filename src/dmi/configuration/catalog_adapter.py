@@ -118,6 +118,8 @@ def _unavailable_reason(
         return "Model has no experts"
     if short_name in ("topk_ids", "topk_weights") and topology.top_k == 0:
         return "Model has no top-k expert routing"
+    if short_name == "final_logits" and topology.vocab_size == 0:
+        return "Model descriptor has no vocab_size, so final logits have no shape"
     return None
 
 

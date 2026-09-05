@@ -44,8 +44,8 @@ def _descriptor(**topology):
     )
 
 
-DENSE = _descriptor(intermediate_size=14336)
-MOE = _descriptor(intermediate_size=768, num_experts=128, top_k=8)
+DENSE = _descriptor(intermediate_size=14336, vocab_size=32000)
+MOE = _descriptor(intermediate_size=768, num_experts=128, top_k=8, vocab_size=32000)
 
 
 def _fields(issues):

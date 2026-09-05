@@ -190,3 +190,44 @@ def test_copy_serializes_the_current_state_not_the_preview():
     assert not re.search(
         r"writeText\(dom\[.yaml-preview.\]", copy_slice
     ), "the Copy handler must not read the preview element directly"
+
+
+# ---------------------------------------------------------------------------
+# Independent-review round: boot-race guard, Copy stale-response stamp,
+# tab a11y state.
+# ---------------------------------------------------------------------------
+
+
+def test_input_handlers_guard_on_initialization():
+    """Listeners bind before the model fetch resolves; an unguarded handler
+    reads a null state and dies, silently eating the event (and a mid-
+    applyState crash would discard a loaded file)."""
+    source = _app_js()
+    body = _plain_function_body(source, "bindSchedule")
+
+    assert "if (!uiReady) return;" in body
+    assert re.search(r"var uiReady = false;", source)
+    assert "uiReady = true;" in source
+
+
+def test_copy_carries_a_stale_response_stamp():
+    source = _app_js()
+    bind_actions = _plain_function_body(source, "bindActions")
+    copy_slice = bind_actions[bind_actions.index('"btn-copy"'):]
+    copy_slice = copy_slice[:copy_slice.index("btn-open")]
+
+    assert "requestId" in copy_slice and "copyRequestId" in copy_slice, (
+        "Copy must stamp its serialize call like refreshOutput does, or two "
+        "rapid copies can land out of order and leave the older YAML on the "
+        "clipboard"
+    )
+
+
+def test_tabs_expose_selection_to_assistive_tech():
+    source = _app_js()
+    bind_tabs = _plain_function_body(source, "bindTabs")
+    assert 'setAttribute("aria-selected"' in bind_tabs
+
+    from dmi.ui.app import STATIC_DIR as _STATIC_DIR
+    markup = (Path(STATIC_DIR) / "index.html").read_text(encoding="utf-8")
+    assert 'role="tabpanel"' in markup

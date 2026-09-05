@@ -483,7 +483,8 @@ def test_longer_prompts_never_lower_the_estimate():
         ({"decode_tokens": -1}, "decode_tokens must be >= 0"),
         ({"tensor_parallel_size": 0}, "tensor_parallel_size must be >= 1"),
         ({"pipeline_parallel_size": 0}, "pipeline_parallel_size must be >= 1"),
-        ({"decode_steps_per_second": -1.0}, "decode_steps_per_second must be >= 0"),
+        ({"decode_steps_per_second": -1.0}, "decode_steps_per_second must be a finite number >= 0"),
+        ({"decode_steps_per_second": float("inf")}, "finite number"),
     ],
 )
 def test_invalid_workload_is_rejected_at_construction(kwargs, match):

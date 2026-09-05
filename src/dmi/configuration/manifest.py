@@ -8,6 +8,7 @@ vocabulary.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -41,6 +42,24 @@ _REQUIRED_TOPOLOGY = (
     "num_kv_heads",
 )
 
+_KNOWN_MODEL_FIELDS = ("id", "name", "architecture")
+_KNOWN_DESCRIPTOR_ROOT = ("schema_version", "model", "topology")
+
+
+def _reject_unknown(present, known, where: str) -> None:
+    """Refuse keys the descriptor grammar does not define, per section.
+
+    The same rule the config parser applies everywhere: a silently ignored
+    key is the worst outcome for an authored file. Non-string keys are
+    reported as their repr rather than crashing the join.
+    """
+    unknown = sorted(repr(key) for key in set(present) - set(known))
+    if unknown:
+        raise DescriptorError(
+            f"Unknown field(s) in {where}: {', '.join(unknown)}. "
+            f"Known fields: {', '.join(sorted(map(repr, known)))}."
+        )
+
 
 def _require_mapping(value: Any, where: str) -> dict:
     if value is None:
@@ -57,7 +76,17 @@ def parse_descriptor(data: Any) -> ModelDescriptor:
     """Build a ``ModelDescriptor`` from an already-parsed document."""
     document = _require_mapping(data, "descriptor")
 
+    _reject_unknown(document, _KNOWN_DESCRIPTOR_ROOT, "the descriptor")
+
     version = document.get("schema_version", DESCRIPTOR_SCHEMA_VERSION)
+    # Exact integer only, mirroring the config boundary: YAML `true` compares
+    # equal to 1 and `1.0` equals 1, so a bare `!=` would accept both and a
+    # future version file with a mistyped key would silently parse as v1.
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise DescriptorError(
+            f"Descriptor 'schema_version' must be an integer, got "
+            f"{type(version).__name__} ({version!r})."
+        )
     if version != DESCRIPTOR_SCHEMA_VERSION:
         raise UnsupportedConfigVersion(
             f"Descriptor schema_version {version!r} is not supported by this "
@@ -65,6 +94,7 @@ def parse_descriptor(data: Any) -> ModelDescriptor:
         )
 
     model = _require_mapping(document.get("model"), "model")
+    _reject_unknown(model, _KNOWN_MODEL_FIELDS, "'model'")
     for key in ("id", "name", "architecture"):
         if not model.get(key):
             raise DescriptorError(f"Descriptor field 'model.{key}' is required.")
@@ -84,27 +114,29 @@ def parse_descriptor(data: Any) -> ModelDescriptor:
             f"{', '.join(missing)}."
         )
 
-    known = set(ModelTopology.__dataclass_fields__)
-    unknown = sorted(set(topology) - known)
-    if unknown:
-        raise DescriptorError(
-            f"Unknown field(s) in 'topology': {', '.join(unknown)}. "
-            f"Known fields: {', '.join(sorted(known))}."
-        )
+    _reject_unknown(topology, set(ModelTopology.__dataclass_fields__), "topology")
 
     try:
         parsed_topology = ModelTopology(**topology)
     except (TypeError, ValueError) as exc:
         raise DescriptorError(f"Invalid topology: {exc}") from exc
 
-    return ModelDescriptor(
-        model=ModelIdentity(
+    try:
+        identity = ModelIdentity(
             id=str(model["id"]),
             name=str(model["name"]),
             architecture=str(architecture),
-        ),
+        )
+    except ValueError as exc:
+        # The config boundary raises ConfigurationError for exactly these;
+        # the descriptor boundary must not leak a bare ValueError past the
+        # documented DescriptorError hierarchy.
+        raise DescriptorError(f"Invalid model identity: {exc}") from exc
+
+    return ModelDescriptor(
+        model=identity,
         topology=parsed_topology,
-        schema_version=int(version),
+        schema_version=version,
     )
 
 
@@ -149,10 +181,23 @@ def descriptor_to_dict(descriptor: ModelDescriptor) -> dict:
 
 
 def save_descriptor(descriptor: ModelDescriptor, path: str | Path) -> None:
-    Path(path).write_text(
-        yaml.safe_dump(descriptor_to_dict(descriptor), sort_keys=False),
-        encoding="utf-8",
-    )
+    """Write a descriptor to disk, atomically, like ``save_config``.
+
+    Same contract as the config half of the package: filesystem trouble is
+    a ``DescriptorError``, and the write never truncates the previous file
+    on failure.
+    """
+    target = Path(path)
+    temp = target.with_name(target.name + ".tmp")
+    try:
+        temp.write_text(
+            yaml.safe_dump(descriptor_to_dict(descriptor), sort_keys=False),
+            encoding="utf-8",
+        )
+        os.replace(temp, target)
+    except OSError as exc:
+        temp.unlink(missing_ok=True)
+        raise DescriptorError(f"Cannot write descriptor {target}: {exc}") from exc
 
 
 def to_model_shape_config(
