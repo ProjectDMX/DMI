@@ -840,13 +840,17 @@ def test_a_writer_used_from_another_process_refuses_to_publish(monkeypatch):
     no way to observe it from either side. The writer records its owning PID
     and refuses every lease-bearing operation from any other.
     """
+    import os
+
     from dmi.storage.capture import PublisherLeaseError
-    from dmi.storage.capture import clickhouse_catalog as module
 
     client = _Client()
     writer = _leased(client)
-    owner = module.os.getpid()
-    monkeypatch.setattr(module.os, "getpid", lambda: owner + 1)
+    owner = os.getpid()
+    # Patched on ``os`` itself rather than through the writer's module, so a
+    # writer that never consults the PID fails this test with DID NOT RAISE
+    # instead of tripping over an attribute the module does not import.
+    monkeypatch.setattr(os, "getpid", lambda: owner + 1)
 
     with pytest.raises(PublisherLeaseError, match="belong to one process"):
         _publish(writer, 1)

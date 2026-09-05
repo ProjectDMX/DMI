@@ -543,16 +543,17 @@ and therefore per lease, and a second caller waits. Allocation shares the lock
 so one attempt's floor read, claim and read-back do not interleave with
 another's; it does not order allocation against publication, and need not -- a
 thread that allocated the lower version and publishes second is refused by the
-barrier as before and re-allocated by the indexer. The writer also records its owning PID and refuses every
-lease-bearing operation from another process, because a forked child inherits
-the parent's `PublisherLease` and would publish under the same `lease_id` from
-an address space no lock reaches. The contract this states: **a writer and its
-lease belong to one process, and the writer may be shared between threads of
-that process.** A per-operation token carried through renew and fence was
-considered and not taken: it turns the race into a fence-out for one side but
-leaves the in-flight window -- a statement that evaluated its fence before the
-other operation's renewal still lands afterwards -- so it adds complexity
-without adding exclusion the lock does not already give.
+barrier as before and re-allocated by the indexer. The writer also records its
+owning PID and refuses every lease-bearing operation from another process,
+because a forked child inherits the parent's `PublisherLease` and would publish
+under the same `lease_id` from an address space no lock reaches. The contract
+this states: **a writer and its lease belong to one process, and the writer
+may be shared between threads of that process.** A per-operation token carried
+through renew and fence was considered and not taken: it turns the race into a
+fence-out for one side but leaves the in-flight window -- a statement that
+evaluated its fence before the other operation's renewal still lands afterwards
+-- so it adds complexity without adding exclusion the lock does not already
+give.
 
 Regression: `test_two_concurrent_publishes_on_one_writer_are_serialised`
 asserts that while one publisher is inside a fenced statement, a second
