@@ -38,14 +38,18 @@ std::string escape_sql_string(const std::string& value) {
 }
 
 // Python's clickhouse-driver renders a list of (str, str) tuples as
-// [('a','b'), ...]; the manifest INSERT arrayJoins exactly that.
+// `[('a', 'b'), ('c', 'd')]` -- a comma AND a space, both inside a tuple
+// and between tuples. Byte-for-byte, because every statement carrying
+// this list is one the port claims textual identity for, and the server
+// accepting a tighter spelling is not the same thing as sending the same
+// bytes. Measured against escape_params rather than assumed.
 std::string render_members(const std::vector<PackIdentity>& members) {
   std::string out = "[";
   bool first = true;
   for (const auto& [store_id, pack_id] : members) {
-    if (!first) out += ",";
+    if (!first) out += ", ";
     first = false;
-    out += "(" + escape_sql_string(store_id) + "," +
+    out += "(" + escape_sql_string(store_id) + ", " +
            escape_sql_string(pack_id) + ")";
   }
   out += "]";
@@ -384,7 +388,7 @@ std::set<PackIdentity> CatalogWriter::committed_pack_ids(
     const std::vector<Row> rows = client_->execute(
         "SELECT store_id, toString(pack_id) FROM " +
             qualified("pack_inventory") +
-            " WHERE (store_id, pack_id) IN (" + render_members(chunk) + ")",
+            " WHERE (store_id, pack_id) IN " + render_members(chunk),
         {},
         // A deciding read: this answer decides which packs the indexer
         // skips as already committed.
@@ -434,7 +438,7 @@ int CatalogWriter::manifest_member_count(
     const std::vector<PackIdentity>* members) const {
   std::string bound;
   if (members != nullptr) {
-    bound = " AND (store_id, pack_id) IN (" + render_members(*members) + ")";
+    bound = " AND (store_id, pack_id) IN " + render_members(*members);
   }
   const std::vector<Row> rows = client_->execute(
       "SELECT count() FROM (SELECT DISTINCT store_id, pack_id FROM " +

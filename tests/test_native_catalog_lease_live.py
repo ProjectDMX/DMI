@@ -289,6 +289,61 @@ def test_the_ported_statements_are_byte_identical_to_the_python_ones():
             driver.close()
 
 
+def _last_queries_like(client, fragment, limit=2):
+    """The most recent statements the SERVER received matching a fragment."""
+    client.execute("SYSTEM FLUSH LOGS")
+    rows = client.execute(
+        "SELECT query FROM system.query_log WHERE query LIKE "
+        f"'%{fragment}%' AND type = 'QueryFinish' AND query NOT LIKE "
+        "'%system.query_log%' ORDER BY event_time_microseconds DESC "
+        f"LIMIT {limit}")
+    return [row[0] for row in rows]
+
+
+def test_the_parameterized_statements_are_byte_identical_too():
+    """The gate the risk table's claim actually needs.
+
+    `release` and `fence` are compared above, and those are the two the
+    coordinator renders itself. Every OTHER ported statement carries its
+    values through clickhouse-driver's own `%(name)s` substitution, and
+    that is where the native port had drifted: the driver renders a list
+    of tuples as `[('a', 'b'), ('c', 'd')]`, and the native renderer
+    emitted `[('a','b'),('c','d')]` inside an extra pair of parentheses.
+    ClickHouse accepts both, so nothing failed -- which is exactly why
+    "textual SQL identity" needed a gate rather than an assurance.
+
+    Read off the SERVER, not off an accessor: what the claim is about is
+    the bytes ClickHouse receives, and the two implementations reach it
+    over different protocols (native over HTTP, Python over TCP).
+    """
+    from dmi.storage.capture.clickhouse_catalog import ClickHouseCatalogWriter
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            # Two identities, one carrying a quote and a backslash, so the
+            # escaping is part of what is compared.
+            identities = [
+                {"store_id": "garage", "pack_id": _refs_of(1)[0]["pack_id"]},
+                {"store_id": "it's\\odd", "pack_id": str(uuid.uuid4())},
+            ]
+            tuples = [(i["store_id"], i["pack_id"]) for i in identities]
+
+            native = driver.call(op="committed_pack_ids",
+                                 identities=identities)
+            assert native["ok"], native
+            ClickHouseCatalogWriter(client, config).committed_pack_ids(tuples)
+
+            seen = _last_queries_like(client, f"{prefix}_pack_inventory")
+            assert len(seen) == 2, seen
+            assert seen[0] == seen[1], (
+                "the two implementations sent different text:\n"
+                f"  {seen[0]}\n  {seen[1]}")
+        finally:
+            driver.close()
+
+
 def test_allocated_versions_are_strictly_monotonic():
     with _catalog() as (client, config, prefix):
         driver = CatalogDriver()
