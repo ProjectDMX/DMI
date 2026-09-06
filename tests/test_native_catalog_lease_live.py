@@ -388,9 +388,9 @@ def test_concurrent_claimants_get_distinct_versions():
             # claimancy means here is decided at read-back time and cannot
             # be re-read afterwards; what survives is that every handed-out
             # version is distinct (asserted above) and durably recorded.
-            assert client.execute(
-                f"SELECT count() FROM {claims} WHERE version = {v}"
-            ) >= [(1,)]
+            (claimed,), = client.execute(
+                f"SELECT count() FROM {claims} WHERE version = {v}")
+            assert claimed >= 1, (v, claimed)
 
 
 # --- B2: descriptor batches, replay guard, fenced publish -------------------
