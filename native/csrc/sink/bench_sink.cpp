@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <random>
 #include <string>
 #include <vector>
@@ -151,9 +152,17 @@ int main(int argc, char** argv) {
     flush_best = std::min(flush_best, flush_s - submit_s);
     close_best = std::min(close_best, s - flush_s);
     packs = snapshot.packs_persisted;
-      // Clean the spool dir for the next trial.
-      std::string rm = std::string("rm -rf ") + spool_dir;
-      if (system(rm.c_str()) != 0) return 1;
+      // Clean the spool dir for the next trial. No shell: the prefix
+      // comes from argv (`spooldir=`), and `system(("rm -rf ") + argv)`
+      // executed whatever the caller concatenated — shell injection in a
+      // repo binary. remove_all takes the path itself.
+      std::error_code ec;
+      std::filesystem::remove_all(spool_dir, ec);
+      if (ec) {
+        std::fprintf(stderr, "spool cleanup failed: %s\n",
+                     ec.message().c_str());
+        return 1;
+      }
     }
     std::printf("workers=%d: %8.3f GiB/s  (%llu packs, submit %.2fs flush %.2fs close %.2fs)\n",
                 workers, gib_per_s(kLogical, best),

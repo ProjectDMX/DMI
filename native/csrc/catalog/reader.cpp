@@ -467,10 +467,18 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
                          "cursor key must hold five fields");
     }
     // The key holds (tenant, experiment, run, captured_at_ns, capture_id);
-    // strings are JSON literals, captured_at_ns is a JSON number.
+    // strings are JSON literals, captured_at_ns is a JSON number. Each
+    // string must decode NON-EMPTY, as cursor._text requires: falling back
+    // to the raw token when the decode came up empty accepted a crafted
+    // `""` component and paged after a two-character position no encoder
+    // ever issues.
     auto literal = [&](size_t i) {
       const std::string text = jc::ParseLiteral(parts[i]);
-      return text.empty() ? parts[i] : text;
+      if (text.empty()) {
+        throw CatalogError(CatalogError::Kind::kValue,
+                           "cursor key components must be non-empty strings");
+      }
+      return text;
     };
     after = {literal(0), literal(1), literal(2), parts[3], literal(4)};
     watermark = cursor_watermark;

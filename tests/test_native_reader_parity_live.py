@@ -515,6 +515,47 @@ def test_a_cursor_envelope_is_validated_the_way_python_validates_it():
             driver.close()
 
 
+def test_a_cursor_key_with_an_empty_component_is_refused():
+    """An empty key string is a malformed cursor, not a position.
+
+    Python's decoder requires every key string to be non-empty. The native
+    fallback returned the RAW JSON token whenever the decoded value was
+    empty, so a crafted cursor with `""` in its key paged after the
+    two-character string `\"\"` -- an accepted cursor naming a position no
+    encoder can ever have issued.
+    """
+    import base64
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            _publish_native(driver, prefix, _descriptor_dicts(3), 7)
+
+            first = driver.call(op="search", limit=1)
+            assert first["ok"] and first["next_cursor"], first
+            good = first["next_cursor"]
+            payload = json.loads(base64.urlsafe_b64decode(
+                good + "=" * (-len(good) % 4)))
+            payload["k"][0] = ""
+            raw = json.dumps(payload, sort_keys=True,
+                             separators=(",", ":")).encode()
+            crafted = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+            refused = driver.call(op="search", limit=1, cursor=crafted)
+            assert not refused["ok"], refused
+            assert refused["error"] == "ValueError", refused
+
+            # The oracle refuses the same cursor.
+            from dmi.storage.capture.cursor import InvalidCursorError
+            from dmi.storage.capture.model import CaptureQuery
+            with pytest.raises(InvalidCursorError):
+                _python_reader(client, config).search(
+                    CaptureQuery(limit=1, cursor=crafted))
+        finally:
+            driver.close()
+
+
 def test_cursor_parity_across_implementations():
     """A cursor either side issues, the other side accepts and walks."""
     with _catalog() as (client, config, prefix):
