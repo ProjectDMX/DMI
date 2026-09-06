@@ -12,6 +12,7 @@
 #define DMI_CATALOG_READER_H
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
