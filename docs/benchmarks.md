@@ -356,3 +356,15 @@ GET range, HEAD, DELETE, ListV2, botocore-standard retry taxonomy).
 |---|---|---|---|
 | Depend on system curl-dev | unavailable (no root, no headers) | reverted | dev .deb extracted to a local sysroot (`CURL_INCDIR`/`CURL_LIBDIR` make vars); runtime libcurl.so.4 ships with the OS |
 | Verify all received headers server-side | false 403s | reverted | S3 semantics: only SignedHeaders participate; verifier parses them from Authorization |
+
+### A3a native spool (2026-09-05)
+
+`native/csrc/store/spool.{h,cpp}`: the Python spool contract ported —
+ready naming, hash-then-link staging, idempotent retry, conflict/capacity
+errors, recovery with quarantine, removal. 7 tests, both cross directions:
+Python drains native-written spools (through `PackReader`) and native
+recovers Python-written ones.
+
+| Idea | Baseline → Result | Verdict | Why |
+|---|---|---|---|
+| Hand-rolled 16-char suffix compare | ready files invisible to recovery | fixed, not reverted | `".dmi-pack.ready"` is 15 chars; replaced with a `HasSuffix` helper at all 3 sites — the conformance test caught it, which is exactly its job |

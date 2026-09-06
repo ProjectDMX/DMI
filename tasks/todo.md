@@ -48,7 +48,10 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       3 MiB multipart, pagination, retry taxonomy, short-body refusal).
       Gates: `make -C native build/conformance_sign build/conformance_store`
       (no CUDA; libcurl headers via CURL_INCDIR sysroot).
-- [ ] A3a Spool state machine + restart recovery; Python SpoolUploader drains native spool
+- [x] A3a Spool state machine + restart recovery; Python drains native spool.
+      Evidence: `tests/test_native_spool.py` 7/7 (both cross directions,
+      idempotence, capacity, quarantine, stale-.open cleanup, removal).
+      Gate: `make -C native build/conformance_spool`.
 - [ ] A3b NativePackSink : RecordSink (single worker → spool), latched failure, counters
 - [ ] A4 Uploader: bounded workers, bytes-in-flight, checksum verify; e2e ring→Garage
 - [ ] A5a Scope-hash worker pool via pipelined_engine; N-scaling curve
