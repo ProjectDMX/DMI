@@ -25,7 +25,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
-import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -330,14 +329,31 @@ class FakeS3Handler(BaseHTTPRequestHandler):
         self._send(200, {"ETag": f'"{hashlib.md5(body).hexdigest()}"'})
 
     def _handle_complete(self, key: str, query: dict, body: bytes):
+        import re
+
         with STATE.lock:
             upload = STATE.uploads.pop(query.get("uploadId", ""), None)
         if upload is None or upload["key"] != key:
             self._send(404, {}, b"no upload")
             return
-        root = ET.fromstring(body)
-        ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
-        numbers = [int(p.find("s3:PartNumber", ns).text) for p in root.findall("s3:Part", ns)]
+        xml = body.decode("utf-8")
+        if "<!DOCTYPE" in xml or "<!ENTITY" in xml:
+            self._send(400, {}, b"unsafe xml")
+            return
+        try:
+            numbers = [
+                int(part)
+                for part in re.findall(
+                    r"<(?:\w+:)?PartNumber>\s*(\d+)\s*</(?:\w+:)?PartNumber>",
+                    xml,
+                )
+            ]
+        except ValueError:
+            self._send(400, {}, b"invalid xml")
+            return
+        if not numbers:
+            self._send(400, {}, b"invalid xml")
+            return
         assembled = b"".join(upload["parts"][n] for n in sorted(numbers))
         meta = upload["meta"]
         with STATE.lock:
