@@ -27,9 +27,12 @@ void D2HWindowModeController::record_pattern_version_activation() noexcept {
     mode_.store(D2HWindowMode::ENABLED_ACTIVE, std::memory_order_release);
 }
 
-bool D2HWindowModeController::record_capacity_forced_flush() noexcept {
+bool D2HWindowModeController::record_capacity_forced_flush(
+    bool reset_accumulated_count) noexcept {
     if (mode() != D2HWindowMode::ENABLED_ACTIVE)
         return false;
+    if (reset_accumulated_count)
+        capacity_forced_flush_count_.store(0, std::memory_order_relaxed);
     const uint64_t count =
         capacity_forced_flush_count_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (count < capacity_flush_fallback_threshold_)

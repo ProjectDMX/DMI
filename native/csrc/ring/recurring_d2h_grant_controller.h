@@ -50,6 +50,7 @@ class RecurringD2HGrantController final : public D2HGrantController {
     void cancel_pending(D2HWindowPackedProgressLayout::Version version) noexcept;
     void reset_for_version_reuse();
     void cancel_pending_for_fallback() noexcept;
+    bool record_capacity_forced_flush(uint64_t count_reset_interval_periods);
 
     void reconcile_progress() override;
     std::optional<D2HWindowAdmission>
@@ -67,6 +68,7 @@ class RecurringD2HGrantController final : public D2HGrantController {
         D2HWindowPackedProgressLayout::Version version;
         D2HWindowPatternMatcher matcher;
         std::vector<WindowState> windows;
+        std::optional<uint64_t> last_capacity_forced_flush_counter;
     };
 
     std::unique_ptr<VersionBundle>

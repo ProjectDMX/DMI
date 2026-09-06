@@ -29,6 +29,10 @@ void validate_configuration(const RecurringD2HWindowConfig& config) {
         throw std::invalid_argument(
             "recurring D2H window capacity flush fallback threshold must be > 0");
     }
+    if (config.capacity_flush_count_reset_interval_periods == 0) {
+        throw std::invalid_argument(
+            "recurring D2H window capacity flush count reset interval must be > 0");
+    }
     switch (config.progress) {
     case D2HWindowProgressKind::PACKED_VERSION_COUNTER:
         break;
@@ -157,7 +161,8 @@ bool RecurringD2HWindowSubsystem::define_after_version_exhaustion(
 
 void RecurringD2HWindowSubsystem::record_capacity_forced_flush() {
     std::lock_guard<std::mutex> lock(control_mu_);
-    if (!mode_controller_->record_capacity_forced_flush())
+    if (!grant_controller_->record_capacity_forced_flush(
+            config_.capacity_flush_count_reset_interval_periods))
         return;
     grant_controller_->cancel_pending_for_fallback();
     const auto state = mode_controller_->snapshot();

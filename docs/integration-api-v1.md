@@ -376,6 +376,7 @@ windows.enabled = True
 windows.history_size = 4
 windows.minimum_record_probe_retry_interval_occurrences = 4
 windows.capacity_flush_fallback_threshold = 3
+windows.capacity_flush_count_reset_interval_periods = 32
 windows.debug_enabled = False
 
 ring = dmi.RingConfig()
@@ -1034,6 +1035,7 @@ ring construction.
 | `history_size` | `0` | Number of recent attempts used by the policy; must be at least two when enabled. |
 | `minimum_record_probe_retry_interval_occurrences` | `0` | Recurring-window occurrences between minimum-record probes; must be positive when enabled. |
 | `capacity_flush_fallback_threshold` | `0` | Completed capacity-forced flushes before permanent batched fallback; must be positive when enabled. |
+| `capacity_flush_count_reset_interval_periods` | `32` | Reset accumulated capacity-forced-flush evidence when consecutive events are separated by at least this many complete pattern periods; must be positive when enabled. |
 | `debug_enabled` | `False` | Log each real recurring-window D2H issue and completion. |
 
 ### `ClickHouseClientConfig`

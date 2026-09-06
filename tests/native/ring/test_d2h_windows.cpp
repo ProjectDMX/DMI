@@ -177,20 +177,22 @@ void test_runtime_modes() {
     ring::D2HWindowModeController mode(2);
     EXPECT(mode.mode() == ring::D2HWindowMode::ENABLED_NO_PATTERN);
     EXPECT(!mode.window_scheduling_in_effect());
-    EXPECT(!mode.record_capacity_forced_flush());
+    EXPECT(!mode.record_capacity_forced_flush(false));
     mode.record_pattern_version_activation();
     EXPECT(mode.mode() == ring::D2HWindowMode::ENABLED_ACTIVE);
     EXPECT(mode.window_scheduling_in_effect());
-    EXPECT(!mode.record_capacity_forced_flush());
-    EXPECT(mode.record_capacity_forced_flush());
+    EXPECT(!mode.record_capacity_forced_flush(false));
+    EXPECT(mode.record_capacity_forced_flush(false));
     EXPECT(mode.mode() == ring::D2HWindowMode::ENABLED_FALLBACK);
-    EXPECT(!mode.record_capacity_forced_flush());
+    EXPECT(!mode.record_capacity_forced_flush(false));
     mode.record_pattern_version_activation();
     EXPECT(mode.mode() == ring::D2HWindowMode::ENABLED_FALLBACK);
 
     ring::D2HWindowModeController resettable(3);
     resettable.record_pattern_version_activation();
-    EXPECT(!resettable.record_capacity_forced_flush());
+    EXPECT(!resettable.record_capacity_forced_flush(false));
+    EXPECT(!resettable.record_capacity_forced_flush(true));
+    EXPECT(resettable.snapshot().capacity_forced_flush_count == 1);
     resettable.reset_for_version_reuse();
     const auto snapshot = resettable.snapshot();
     EXPECT(snapshot.mode == ring::D2HWindowMode::ENABLED_NO_PATTERN);
@@ -289,6 +291,36 @@ void test_grant_controller() {
     controller.complete(*second_window, 64);
     EXPECT(logs[1]->attempts.size() == 1);
     EXPECT(logs[2]->attempts.empty());
+}
+
+void test_capacity_forced_flush_count_aging_uses_pattern_period() {
+    auto factory = []() -> std::unique_ptr<ring::D2HWindowGrantPolicy> {
+        return std::make_unique<TrackingPolicy>(std::make_shared<PolicyLog>());
+    };
+
+    FakeProgress progress;
+    ring::D2HWindowModeController mode(2);
+    ring::RecurringD2HGrantController controller(progress, mode, factory, nullptr);
+    controller.install_pending(1, 10, {{1, 4}});
+    progress.snapshot = {1, 5};
+    controller.reconcile_progress();
+    EXPECT(!controller.record_capacity_forced_flush(32));
+    progress.snapshot.counter = 5 + 32 * 10;
+    EXPECT(!controller.record_capacity_forced_flush(32));
+    EXPECT(mode.snapshot().capacity_forced_flush_count == 1);
+    ++progress.snapshot.counter;
+    EXPECT(controller.record_capacity_forced_flush(32));
+
+    FakeProgress within_progress;
+    ring::D2HWindowModeController within_mode(2);
+    ring::RecurringD2HGrantController within_controller(
+        within_progress, within_mode, factory, nullptr);
+    within_controller.install_pending(1, 10, {{1, 4}});
+    within_progress.snapshot = {1, 5};
+    within_controller.reconcile_progress();
+    EXPECT(!within_controller.record_capacity_forced_flush(32));
+    within_progress.snapshot.counter = 5 + 32 * 10 - 1;
+    EXPECT(within_controller.record_capacity_forced_flush(32));
 }
 
 void test_pending_pattern_queue_promotes_versions_in_order() {
@@ -419,6 +451,7 @@ int main() {
     test_minimum_record_probes();
     test_runtime_modes();
     test_grant_controller();
+    test_capacity_forced_flush_count_aging_uses_pattern_period();
     test_pending_pattern_queue_promotes_versions_in_order();
     test_pending_pattern_queue_skips_obsolete_versions();
     test_pending_pattern_queue_enforces_epochs_and_clears();

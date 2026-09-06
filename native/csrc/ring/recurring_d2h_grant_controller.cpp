@@ -24,6 +24,7 @@ RecurringD2HGrantController::make_bundle(
         version,
         D2HWindowPatternMatcher(period, windows),
         {},
+        std::nullopt,
     });
     bundle->windows.reserve(windows.size());
     for (size_t index = 0; index < windows.size(); ++index) {
@@ -77,6 +78,28 @@ void RecurringD2HGrantController::reset_for_version_reuse() {
 void RecurringD2HGrantController::cancel_pending_for_fallback() noexcept {
     std::lock_guard<std::mutex> lock(bundle_control_mu_);
     pending_bundles_.clear();
+}
+
+bool RecurringD2HGrantController::record_capacity_forced_flush(
+    uint64_t count_reset_interval_periods) {
+    const auto observed = progress_.load();
+    bool reset_accumulated_count = false;
+    if (current_bundle_ && observed.version == current_bundle_->version) {
+        const auto previous = current_bundle_->last_capacity_forced_flush_counter;
+        if (previous.has_value() && observed.counter >= *previous) {
+            const uint64_t elapsed_periods =
+                (observed.counter - *previous) / current_bundle_->matcher.period();
+            reset_accumulated_count =
+                elapsed_periods >= count_reset_interval_periods;
+        }
+        current_bundle_->last_capacity_forced_flush_counter = observed.counter;
+    }
+
+    // This v1 fallback signal uses the distance between completed
+    // capacity-forced flushes. A future pressure policy can instead use
+    // ring/staging byte occupancy to determine more precisely whether the
+    // recurring pattern has enough capacity to keep ring pressure low.
+    return mode_.record_capacity_forced_flush(reset_accumulated_count);
 }
 
 void RecurringD2HGrantController::reconcile_progress() {

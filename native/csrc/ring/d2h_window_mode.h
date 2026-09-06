@@ -25,7 +25,7 @@ class D2HWindowModeController {
     D2HWindowMode mode() const noexcept;
     bool window_scheduling_in_effect() const noexcept;
     void record_pattern_version_activation() noexcept;
-    bool record_capacity_forced_flush() noexcept;
+    bool record_capacity_forced_flush(bool reset_accumulated_count) noexcept;
     void reset_for_version_reuse() noexcept;
     D2HWindowRuntimeSnapshot snapshot() const noexcept;
 

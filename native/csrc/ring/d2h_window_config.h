@@ -24,6 +24,9 @@ struct RecurringD2HWindowConfig {
     uint64_t history_size{0};
     uint64_t minimum_record_probe_retry_interval_occurrences{0};
     uint64_t capacity_flush_fallback_threshold{0};
+    // Age out isolated fallback evidence after this many complete pattern
+    // periods. The progress-distance threshold is this value times T.
+    uint64_t capacity_flush_count_reset_interval_periods{32};
     bool debug_enabled{false};
 };
 

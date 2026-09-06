@@ -626,6 +626,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite(
           "capacity_flush_fallback_threshold",
           &ring::RecurringD2HWindowConfig::capacity_flush_fallback_threshold)
+      .def_readwrite(
+          "capacity_flush_count_reset_interval_periods",
+          &ring::RecurringD2HWindowConfig::
+              capacity_flush_count_reset_interval_periods)
       .def_readwrite("debug_enabled",
                      &ring::RecurringD2HWindowConfig::debug_enabled);
   py::enum_<ring::D2HWindowMode>(m, "D2HWindowMode")
