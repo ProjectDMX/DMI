@@ -124,7 +124,10 @@ class FakeS3Handler(BaseHTTPRequestHandler):
     def _send(self, status: int, headers: dict, body: bytes = b""):
         payload = body
         self.send_response(status)
-        self.send_header("Content-Length", str(len(payload)))
+        # HEAD responses carry the OBJECT's size with an empty body: never
+        # emit a second Content-Length for the (absent) payload.
+        if not any(name.lower() == "content-length" for name in headers):
+            self.send_header("Content-Length", str(len(payload)))
         for name, value in headers.items():
             self.send_header(name, value)
         self.end_headers()

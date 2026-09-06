@@ -347,3 +347,35 @@ def test_native_crc32_matches_zlib():
         response = json.loads(proc.stdout.strip())
         expected = f"{zlib.crc32(data) & 0xFFFFFFFF:08x}"
         assert response["ok"] and response["crc32"] == expected, (size, response)
+
+
+def test_native_pack_matches_recorded_golden_manifest():
+    """Close the loop to the recorded artifact, not just to live Python.
+
+    tests/data/capture_golden_manifest.json pins the whole-object sha256
+    (53a087...) produced by the reference writer. The native writer must
+    produce the identical digest for the identical corpus — transitively
+    proven by the byte-equality tests, asserted directly here so a drift
+    in either direction names itself.
+    """
+    import hashlib
+    import json as _json
+
+    with open(
+        REPO_ROOT / "tests" / "data" / "capture_golden_manifest.json"
+    ) as handle:
+        manifest = _json.load(handle)
+    expected = manifest["pack"]["sha256"]
+    assert expected == "53a0873af5b5932ceb3e44223492aec11eadfb1d9298cb4cef81d8ca5337fd4e"
+
+    records = []
+    for record in _corpus():
+        row = _meta_mapping(record.metadata)
+        row["payload_b64"] = _b64(record.payload)
+        records.append(row)
+    response = _native_build(
+        str(PACK_ID), 1_700_000_000_000_000_000, 8 * 1024 * 1024, records
+    )
+    assert response["ok"], response
+    assert response["data_sha256"] == expected
+    assert hashlib.sha256(_unb64(response["data_b64"])).hexdigest() == expected

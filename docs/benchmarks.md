@@ -449,3 +449,20 @@ packs with the Python CatalogIndexer (byte-identical descriptors).
 Deferred to a follow-up initiative (Checkpoint A review): CRC+memcpy
 fusion (3 instances → 2 for the 1.1 GiB/s host), Phase B (catalog/indexer
 native), Phase C (reader native).
+
+### Differential round: native vs Python reference, same corpus (2026-09-05)
+
+Head-to-head tests added on top of the oracle-style conformance:
+
+- **Pack**: native build of the golden corpus reproduces the RECORDED
+  manifest digest `53a087...` (not just live-Python equality).
+- **Pipeline**: same 200-record/4-session corpus through `HostCapturePipeline`
+  and the native sink — equal submitted/admitted/persisted/pack counts and
+  identical descriptor unions (pack ids excluded: random UUIDs both sides).
+- **Uploader**: same staged pack through `SpoolUploader` (boto3) and the
+  native uploader against the fake S3 — identical object bytes and DMI
+  metadata, matching refs.
+
+| Idea | Baseline → Result | Verdict | Why |
+|---|---|---|---|
+| boto3 against the fake S3 | worked after one fix | kept | The fake's `_send` unconditionally added `Content-Length: 0`, doubling the HEAD object-size header — urllib3 rightfully refused. Real S3-faithfulness improved for all client tests |

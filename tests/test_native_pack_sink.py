@@ -421,3 +421,92 @@ def test_submit_row_rejects_mismatches(sink, tmp_path):
     assert response["ok"], response
     snapshot = sink.call(op="close", timeout=30)["snapshot"]
     assert snapshot["persisted_records"] == 1
+
+
+def test_pipeline_head_to_head_with_python_reference(tmp_path):
+    """Same corpus through both pipelines; descriptor-level equality.
+
+    Pack ids and object keys legitimately differ (random UUIDs), so the
+    comparison is semantic: the union of (capture_id -> metadata mapping +
+    payload bytes) staged by each pipeline must match exactly, plus equal
+    submitted/admitted/persisted/pack counts.
+    """
+    from dmi.storage.capture import (
+        DurablePackSink,
+        DurablePackSpool,
+        HostCapturePipeline,
+        OverloadPolicy,
+        PipelineConfig,
+    )
+    from dmi.storage.capture.pipeline import AdmissionResult
+
+    payload = bytes(4096)
+    records = []
+    for session in range(4):
+        for i in range(50):
+            index = session * 50 + i
+            records.append(_record(index, session_id=f"h2h-{session}"))
+
+    def _pack_contents(spool_root: Path) -> dict:
+        spool = DurablePackSpool(spool_root, max_bytes=1 << 40)
+        union = {}
+        for entry in spool.recover():
+            with entry.open() as handle:
+                for descriptor in PackReader.from_bytes(
+                    handle.read()
+                ).descriptors(store_id="x", object_key=entry.object_key):
+                    meta = descriptor.metadata
+                    union[meta.capture_id] = (
+                        json.dumps(meta.to_mapping(), sort_keys=True),
+                        descriptor.locator.checksum,
+                        descriptor.locator.stored_length,
+                    )
+        return union
+
+    # Reference pipeline, spool mode, same bounds.
+    reference_root = tmp_path / "reference"
+    python_spool = DurablePackSpool(reference_root / "spool",
+                                    max_bytes=1 << 40)
+    pipeline = HostCapturePipeline(
+        PipelineConfig(
+            max_queue_records=256,
+            max_queue_bytes=16 * 1024 * 1024,
+            max_pack_bytes=256 * 1024,
+            max_pack_records=10_000,
+            max_linger_ns=1_000_000_000,
+            overload_policy=OverloadPolicy.DROP_NEWEST,
+        ),
+        DurablePackSink(python_spool),
+    )
+    pipeline.start()
+    for record in records:
+        assert pipeline.submit(record) is AdmissionResult.ACCEPTED
+    python_snapshot = pipeline.close(timeout=30)
+
+    # Native pipeline, same corpus and bounds.
+    session = SinkSession()
+    try:
+        _open(session, tmp_path / "native",
+              max_pack_bytes=256 * 1024)
+        for record in records:
+            assert _submit(session, record) == "accepted"
+        assert session.call(op="flush", timeout=30)["ok"]
+        native_snapshot = session.call(op="close", timeout=30)["snapshot"]
+    finally:
+        session.close()
+
+    assert native_snapshot["submitted_records"] == \
+        python_snapshot.submitted_records == len(records)
+    assert native_snapshot["admitted_records"] == \
+        python_snapshot.admitted_records == len(records)
+    assert native_snapshot["persisted_records"] == \
+        python_snapshot.persisted_records == len(records)
+    assert native_snapshot["packs_persisted"] == \
+        python_snapshot.packs_persisted == 4
+    assert native_snapshot["failures"] == python_snapshot.failures == 0
+
+    python_union = _pack_contents(reference_root / "spool")
+    native_union = _pack_contents(tmp_path / "native")
+    assert set(native_union) == set(python_union) == \
+        {f"capture-{i:06d}" for i in range(len(records))}
+    assert native_union == python_union

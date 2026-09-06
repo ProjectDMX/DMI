@@ -26,6 +26,7 @@ if str(REPO_ROOT / "src") not in sys.path:
 from dmi.storage.capture import (  # noqa: E402
     CaptureMetadata,
     CaptureRecord,
+    DurablePackSpool,
     PackReader,
 )
 
@@ -315,3 +316,88 @@ def test_pack_over_the_byte_gate_fails_fast(fake_s3, tmp_path):
     finally:
         sink.close()
         store.close()
+
+
+def test_uploader_head_to_head_with_python_reference(fake_s3, tmp_path):
+    """Same staged bytes through both uploaders; identical objects land.
+
+    One pack is staged into two spool dirs (same pack id, checksum, bytes).
+    The Python SpoolUploader (boto3) takes one, the native uploader the
+    other. The objects must match byte-for-byte with equal DMI metadata,
+    and both refs must describe the same pack.
+    """
+    import boto3
+    from botocore.config import Config as BotoConfig
+
+    from dmi.storage.capture import (
+        CaptureMetadata,
+        CaptureRecord,
+        PackWriter,
+        S3PackStore,
+        S3StoreConfig,
+        SpoolUploader,
+    )
+    from tests.tools.golden_workload import PACK_ID, _corpus
+
+    writer = PackWriter(
+        pack_id=PACK_ID, created_at_ns=1_700_000_000_000_000_000,
+        max_pack_bytes=8 * 1024 * 1024,
+    )
+    for record in _corpus():
+        writer.append(record)
+    sealed = writer.seal()
+
+    roots = [tmp_path / "py-spool", tmp_path / "native-spool"]
+    for root in roots:
+        spool = DurablePackSpool(root, max_bytes=1 << 40)
+        spool.stage(
+            sealed,
+            f"v1/tenant=tenant-golden/date=2026-09-05/session=session-golden"
+            f"/rank=0/{PACK_ID}.dmi-pack",
+        )
+
+    py_config = S3StoreConfig(
+        endpoint_url=fake_s3, bucket=BUCKET, region=REGION,
+        access_key_id=ACCESS, secret_access_key=SECRET,
+        store_id="py-ref", allow_insecure_http=True,
+    )
+    py_store = S3PackStore.from_config(py_config)
+    py_refs = SpoolUploader(
+        DurablePackSpool(roots[0], max_bytes=1 << 40), py_store
+    ).upload_pending()
+    assert len(py_refs) == 1
+
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        result = _upload_pending(store, fake_s3, roots[1])
+        assert result["ok"], result
+        assert result["snapshot"]["uploaded_packs"] == 1
+        native_ref = result["refs"][0]
+    finally:
+        sink.close()
+        store.close()
+
+    assert native_ref["pack_id"] == py_refs[0].pack_id == str(PACK_ID)
+    assert native_ref["checksum"] == py_refs[0].checksum == sealed.checksum
+    assert native_ref["object_bytes"] == py_refs[0].object_bytes
+    assert native_ref["object_key"] == py_refs[0].object_key
+
+    client = boto3.client(
+        "s3", endpoint_url=fake_s3, region_name=REGION,
+        aws_access_key_id=ACCESS, aws_secret_access_key=SECRET,
+        config=BotoConfig(signature_version="s3v4",
+                          s3={"addressing_style": "path"}),
+    )
+    bodies = {}
+    metas = {}
+    for ref in (py_refs[0], native_ref):
+        key = ref["object_key"] if isinstance(ref, dict) else ref.object_key
+        response = client.get_object(Bucket=BUCKET, Key=key)
+        bodies[key] = response["Body"].read()
+        metas[key] = {k.lower(): v for k, v in response["Metadata"].items()}
+    assert bodies[py_refs[0].object_key] == bodies[native_ref["object_key"]]
+    assert bodies[native_ref["object_key"]] == sealed.data
+    assert metas[py_refs[0].object_key] == metas[native_ref["object_key"]]
+    assert metas[native_ref["object_key"]]["dmi-sha256"] == sealed.checksum
+    assert metas[native_ref["object_key"]]["dmi-format"] == "dmi-pack-v1"

@@ -101,6 +101,9 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
   green, N-scaling monotonic, rollback proven. Commits cdc774a..A5b.
   Open follow-ups: CRC+memcpy fusion, Phase B (catalog-native),
   Phase C (reader-native + default-switch).
+- Differential round (2026-09-05): native vs Python reference head-to-head
+  — recorded manifest digest, pipeline descriptor unions, uploader object
+  bytes+metadata all identical. 77 native tests, CPU suite 1190 green.
 
 ## Escalations
 
