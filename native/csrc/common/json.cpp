@@ -276,4 +276,4 @@ void EscapeJson(const std::string& value, std::string* out) {
   out->push_back('"');
 }
 
-}  // namespace dmi_conformance
+}  // namespace dmi_common

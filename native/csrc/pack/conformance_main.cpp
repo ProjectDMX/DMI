@@ -162,11 +162,11 @@ int main() {
       meta.dtype = meta_string(rt, "dtype");
       meta.shape = meta_shape(rt);
       meta.captured_at_ns = static_cast<uint64_t>(meta_int(rt, "captured_at_ns"));
-      // payload
-      static std::vector<std::vector<uint8_t>> payload_storage;
-      payload_storage.push_back(meta_payload(rt));
-      rec.payload = payload_storage.back().data();
-      rec.payload_bytes = payload_storage.back().size();
+      // Append copies the payload into its buffer synchronously, so the
+      // bytes only need to live through the call — a local per record.
+      const std::vector<uint8_t> payload = meta_payload(rt);
+      rec.payload = payload.data();
+      rec.payload_bytes = payload.size();
       const dmi_pack::Status st = builder.Append(rec);
       if (st != dmi_pack::Status::kOk) {
         fail_status = dmi_pack::StatusName(st);

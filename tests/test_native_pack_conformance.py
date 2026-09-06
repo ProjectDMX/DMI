@@ -254,6 +254,9 @@ def test_native_and_reference_agree_on_multi_dim_shape():
         captured_at_ns=1,
     )
     records = [CaptureRecord(metadata=CaptureMetadata(**meta), payload=bytes(6))]
+    _assert_packs_match(
+        "018f0000-0000-7000-8000-000000000002", 1, records, 8 * 1024 * 1024
+    )
 
 
 def test_native_rejects_what_the_reference_rejects():

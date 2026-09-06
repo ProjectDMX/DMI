@@ -318,6 +318,54 @@ def test_pack_over_the_byte_gate_fails_fast(fake_s3, tmp_path):
         store.close()
 
 
+def test_mixed_batch_reports_oversized_pack_at_its_position(fake_s3, tmp_path):
+    """refs[i] pairs with failures[i] positionally, in recover() order.
+
+    One oversized pack mid-batch must be refused at ITS position: the
+    failure named there, every position holding exactly one of
+    ref/failure. (The single-oversized-pack case passes by construction;
+    mixing oversized and normal packs is what orders the outcome writes.)
+    """
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        spool_root = tmp_path / "spool"
+        for i in range(3):
+            _stage(sink, spool_root, 20 + i)
+        _stage(sink, spool_root, 30, payload=b"\0" * (1 << 18))
+        recover = subprocess.run(
+            [str(STORE_DRIVER.parent / "conformance_spool")],
+            input=json.dumps({"op": "recover", "root": str(spool_root),
+                              "max_bytes": 1 << 40}) + "\n",
+            capture_output=True, text=True, timeout=30,
+        )
+        staged = json.loads(recover.stdout.strip())["staged"]
+        big = [i for i, e in enumerate(staged) if e["object_bytes"] > 64 << 10]
+        assert len(big) == 1
+        big_index, big_pack_id = big[0], staged[big[0]]["pack_id"]
+
+        result = _upload_pending(store, fake_s3, spool_root,
+                                 max_in_flight_bytes=64 << 10)
+        assert result["ok"], result
+        snap = result["snapshot"]
+        assert snap["attempted_packs"] == 4
+        assert snap["uploaded_packs"] == 3
+        assert snap["failed_packs"] == 1
+        assert len(result["refs"]) == 4, result
+        assert len(result["failures"]) == 4, result
+        for i in range(4):
+            has_ref = bool(result["refs"][i]["pack_id"])
+            has_failure = bool(result["failures"][i]["pack_id"])
+            assert has_ref != has_failure, (i, result["failures"])
+        failure = result["failures"][big_index]
+        assert failure["pack_id"] == big_pack_id, result["failures"]
+        assert failure["attempts"] == 0
+        assert "in-flight" in failure["error"]
+    finally:
+        sink.close()
+        store.close()
+
+
 def test_uploader_head_to_head_with_python_reference(fake_s3, tmp_path):
     """Same staged bytes through both uploaders; identical objects land.
 

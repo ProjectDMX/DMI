@@ -53,7 +53,7 @@ OBJECT_KEY = (
 )
 
 
-def _golden_pack() -> bytes:
+def _golden_pack() -> tuple[bytes, str, int]:
     writer = PackWriter(
         pack_id=PACK_ID, created_at_ns=1_700_000_000_000_000_000,
         max_pack_bytes=8 * 1024 * 1024,

@@ -57,6 +57,6 @@ void EncodeBase64(const std::vector<uint8_t>& data, std::string* out);
 void EncodeBase64(const uint8_t* data, size_t n, std::string* out);
 void EscapeJson(const std::string& value, std::string* out);
 
-}  // namespace dmi_conformance
+}  // namespace dmi_common
 
 #endif  // DMI_COMMON_JSON_H_

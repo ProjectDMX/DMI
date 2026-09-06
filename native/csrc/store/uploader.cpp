@@ -212,21 +212,21 @@ UploadBatchResult SpoolUploader::UploadPending(int limit) {
   if (limit != -1 && static_cast<size_t>(limit) < pending.size()) {
     pending.resize(static_cast<size_t>(limit));
   }
-  for (const auto& staged : pending) {
-    if (staged.object_bytes > config_.max_in_flight_bytes) {
+  // Both vectors are positional from the start: sized to the recover()
+  // order up front, oversized refusals written into their own slot, and
+  // workers below fill the rest by index.
+  result.refs.assign(pending.size(), PackRef{});
+  result.failures.assign(pending.size(), UploadFailure{});
+  for (size_t i = 0; i < pending.size(); ++i) {
+    if (pending[i].object_bytes > config_.max_in_flight_bytes) {
       // A pack that can never be admitted must fail the batch loudly, not
       // stall it: same rule as the Python uploader's up-front refusal.
-      result.refs.emplace_back();
-      result.failures.push_back(
-          {staged.pack_id, staged.object_key, 0,
-           "pack exceeds the in-flight byte limit"});
+      result.failures[i] = {pending[i].pack_id, pending[i].object_key, 0,
+                            "pack exceeds the in-flight byte limit"};
       ++result.snapshot.attempted_packs;
       ++result.snapshot.failed_packs;
-      continue;
     }
   }
-  result.refs.resize(pending.size());
-  result.failures.resize(pending.size());
 
   struct Slot {
     size_t index = 0;
