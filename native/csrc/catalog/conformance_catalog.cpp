@@ -1,14 +1,20 @@
-// B1 conformance driver: the native lease coordinator and version
-// allocator over a newline-JSON protocol, the same shape as the other
-// conformance drivers. One process is one coordinator instance; `open`
-// (re)initializes it from the request's config fields.
+// B1/B2 conformance driver: the native lease coordinator, version
+// allocator, and catalog writer over a newline-JSON protocol, the same
+// shape as the other conformance drivers. One process is one writer
+// instance; `open` (re)initializes it from the request's config fields.
+// The coordinator-level ops (head/claim/claim_contested) route through
+// the writer's coordinator, so B1 tests exercise the bare protocol and
+// B2 tests the writer's quarantine-wrapped surface.
 
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <string>
+#include <vector>
 
 #include "../common/json.h"
+#include "catalog_writer.h"
 #include "clickhouse_client.h"
 #include "lease_coordinator.h"
 #include "version_allocator.h"
@@ -18,8 +24,9 @@ namespace jc = dmi_common;
 namespace {
 
 using dmi_catalog::CatalogError;
+using dmi_catalog::CatalogWriter;
 using dmi_catalog::ClickHouseError;
-using dmi_catalog::LeaseCoordinator;
+using dmi_catalog::PackIdentity;
 using dmi_catalog::PublisherLease;
 
 const char* error_kind(CatalogError::Kind kind) {
@@ -28,6 +35,10 @@ const char* error_kind(CatalogError::Kind kind) {
     case CatalogError::Kind::kLease: return "PublisherLeaseError";
     case CatalogError::Kind::kAllocation:
       return "CatalogVersionAllocationError";
+    case CatalogError::Kind::kPublishRace: return "SnapshotPublishRaceError";
+    case CatalogError::Kind::kPublishConflict:
+      return "SnapshotPublishConflictError";
+    case CatalogError::Kind::kQuarantined: return "WriterQuarantinedError";
     case CatalogError::Kind::kValue: return "ValueError";
   }
   return "CatalogError";
@@ -45,47 +56,183 @@ void emit_lease(const PublisherLease& lease, std::string* out) {
           ",\"expires_at_ns\":" + std::to_string(lease.expires_at_ns) + "}";
 }
 
+std::string render_sql_string(const std::string& value) {
+  std::string out = "'";
+  for (const char c : value) {
+    if (c == '\\' || c == '\'') out.push_back('\\');
+    if (c == '\n') {
+      out += "\\n";
+      continue;
+    }
+    if (c == '\t') {
+      out += "\\t";
+      continue;
+    }
+    out.push_back(c);
+  }
+  out.push_back('\'');
+  return out;
+}
+
+std::string sql_string_or_null(const std::string& line, const char* key) {
+  if (jc::FindNull(line, key)) return "NULL";
+  return render_sql_string(jc::FindString(line, key));
+}
+
+std::string sql_int_or_string(const std::string& line, const char* key) {
+  // Strings ride as quoted literals; everything numeric renders as-is.
+  const std::string raw = jc::FindString(line, key);
+  bool numeric = !raw.empty();
+  for (const char c : raw) {
+    if ((c < '0' || c > '9') && c != '-') numeric = false;
+  }
+  return numeric ? raw : render_sql_string(raw);
+}
+
+std::vector<PackIdentity> read_identities(const std::string& line,
+                                          const char* key) {
+  std::vector<PackIdentity> out;
+  for (const std::string& element :
+       jc::SplitElements(jc::Unwrap(jc::FindArray(line, key)))) {
+    const std::string store = jc::FindString(element, "store_id");
+    const std::string pack = jc::FindString(element, "pack_id");
+    if (!store.empty() || !pack.empty()) out.emplace_back(store, pack);
+  }
+  return out;
+}
+
+// The 33 capture_raw columns in CAPTURE_COLUMNS order, rendered as one
+// VALUES row. Facet columns are MATERIALIZED — the server computes them.
+std::string render_descriptor_row(const std::string& descriptor,
+                                  uint64_t index_version) {
+  std::vector<std::string> fields;
+  const auto text_field = [&](const char* key) {
+    fields.push_back(render_sql_string(jc::FindString(descriptor, key)));
+  };
+  const auto int_field = [&](const char* key) {
+    fields.push_back(std::to_string(jc::FindInt(descriptor, key)));
+  };
+  text_field("capture_id");
+  text_field("tenant_id");
+  text_field("experiment_id");
+  text_field("run_id");
+  text_field("session_id");
+  text_field("request_id");
+  text_field("sequence_id");
+  text_field("model_id");
+  text_field("model_revision");
+  fields.push_back(sql_string_or_null(descriptor, "adapter_revision"));
+  text_field("capture_policy_version");
+  text_field("hook_name");
+  fields.push_back(std::to_string(jc::FindInt(descriptor, "layer_number")));
+  int_field("producer_rank");
+  int_field("step_number");
+  int_field("token_start");
+  int_field("token_end");
+  int_field("batch_position");
+  text_field("dtype");
+  std::string shape = "[";
+  bool first = true;
+  for (const std::string& dim : jc::SplitElements(
+           jc::Unwrap(jc::FindArray(descriptor, "shape")))) {
+    if (!first) shape += ",";
+    first = false;
+    // Dims are JSON numbers; the raw element text is already valid SQL.
+    shape += dim;
+  }
+  shape += "]";
+  fields.push_back(shape);
+  int_field("captured_at_ns");
+  fields.push_back("toUUID('" + jc::FindString(descriptor, "pack_id") + "')");
+  text_field("store_id");
+  text_field("object_key");
+  int_field("object_bytes");
+  text_field("pack_checksum");
+  int_field("pack_record_count");
+  int_field("payload_offset");
+  int_field("stored_length");
+  int_field("decoded_length");
+  text_field("codec");
+  text_field("payload_checksum");
+  // index_version is the op's parameter, not a descriptor field: the
+  // batch carries the version it belongs to.
+  fields.push_back(std::to_string(index_version));
+  std::string row;
+  for (size_t i = 0; i < fields.size(); ++i) {
+    if (i > 0) row += ",";
+    row += fields[i];
+  }
+  return row;
+}
+
+std::string render_pack_row(const std::string& ref, uint64_t index_version) {
+  std::vector<std::string> fields;
+  fields.push_back("toUUID('" + jc::FindString(ref, "pack_id") + "')");
+  fields.push_back(render_sql_string(jc::FindString(ref, "store_id")));
+  fields.push_back(render_sql_string(jc::FindString(ref, "object_key")));
+  fields.push_back(std::to_string(jc::FindInt(ref, "object_bytes")));
+  fields.push_back(render_sql_string(jc::FindString(ref, "pack_checksum")));
+  fields.push_back(std::to_string(jc::FindInt(ref, "record_count")));
+  fields.push_back(std::to_string(index_version));
+  std::string row;
+  for (size_t i = 0; i < fields.size(); ++i) {
+    if (i > 0) row += ",";
+    row += fields[i];
+  }
+  return row;
+}
+
+std::string rows_to_json(const std::vector<dmi_catalog::Row>& rows) {
+  std::string out = ",\"rows\":[";
+  bool first_row = true;
+  for (const auto& row : rows) {
+    if (!first_row) out += ",";
+    first_row = false;
+    out += "[";
+    bool first_field = true;
+    for (const auto& field : row) {
+      if (!first_field) out += ",";
+      first_field = false;
+      escape_into(field, &out);
+    }
+    out += "]";
+  }
+  return out + "]";
+}
+
 struct Session {
   std::shared_ptr<const dmi_catalog::ClickHouseClient> client;
-  std::unique_ptr<LeaseCoordinator> leases;
-  std::unique_ptr<dmi_catalog::VersionAllocator> allocator;
+  std::unique_ptr<CatalogWriter> writer;
 };
 
 Session make_session(const std::string& line) {
   Session session;
-  dmi_catalog::LeaseConfig leases;
-  leases.database = jc::FindString(line, "database");
-  leases.table_prefix = jc::FindString(line, "table_prefix");
-  leases.lease_ttl_ns =
-      static_cast<uint64_t>(jc::FindInt(line, "lease_ttl_ns"));
-  leases.publish_timeout_ns =
+  dmi_catalog::WriterConfig config;
+  config.database = jc::FindString(line, "database");
+  config.table_prefix = jc::FindString(line, "table_prefix");
+  config.lease_ttl_ns = static_cast<uint64_t>(jc::FindInt(line, "lease_ttl_ns"));
+  config.publish_timeout_ns =
       static_cast<uint64_t>(jc::FindInt(line, "publish_timeout_ns"));
-  leases.clock_skew_ns =
-      static_cast<uint64_t>(jc::FindInt(line, "clock_skew_ns"));
-  dmi_catalog::AllocatorConfig alloc;
-  alloc.database = leases.database;
-  alloc.table_prefix = leases.table_prefix;
-  alloc.allocation_attempts =
+  config.clock_skew_ns = static_cast<uint64_t>(jc::FindInt(line, "clock_skew_ns"));
+  config.allocation_attempts =
       static_cast<int>(jc::FindInt(line, "allocation_attempts"));
-  alloc.publish_timeout_ns = leases.publish_timeout_ns;
+  if (jc::HasKey(line, "query_pack_limit")) {
+    config.query_pack_limit = static_cast<int>(jc::FindInt(line, "query_pack_limit"));
+  }
   if (jc::HasKey(line, "insert_quorum") &&
       !jc::FindNull(line, "insert_quorum")) {
-    const auto quorum =
+    config.insert_quorum =
         static_cast<uint64_t>(jc::FindInt(line, "insert_quorum"));
-    leases.insert_quorum = quorum;
-    alloc.insert_quorum = quorum;
   }
+  const char* host = getenv("DMI_CLICKHOUSE_HOST");
+  const char* port = getenv("DMI_CLICKHOUSE_HTTP_PORT");
   // HTTP interface: the driver speaks HTTP (libcurl), not the native TCP
   // protocol clickhouse-driver uses, so the port differs from the
   // Python-side suites' DMI_CLICKHOUSE_PORT. 8123 is ClickHouse's default.
-  const char* host = getenv("DMI_CLICKHOUSE_HOST");
-  const char* port = getenv("DMI_CLICKHOUSE_HTTP_PORT");
   session.client = std::make_shared<const dmi_catalog::ClickHouseClient>(
       host != nullptr ? host : "127.0.0.1",
       static_cast<uint16_t>(port != nullptr ? std::atoi(port) : 8123));
-  session.leases = std::make_unique<LeaseCoordinator>(session.client, leases);
-  session.allocator = std::make_unique<dmi_catalog::VersionAllocator>(
-      session.client, alloc);
+  session.writer = std::make_unique<CatalogWriter>(session.client, config);
   return session;
 }
 
@@ -98,12 +245,13 @@ std::string respond(const std::string& line, Session* session) {
       *session = make_session(line);
       return prefix + "true}";
     }
-    if (session->leases == nullptr) {
+    if (session->writer == nullptr) {
       return prefix + "false,\"what\":\"call open first\"}";
     }
+    CatalogWriter& writer = *session->writer;
 
     if (op == "head") {
-      const auto head = session->leases->head();
+      const auto head = writer.leases().head();
       out = ",\"head\":{\"term\":" + std::to_string(head.term) +
             ",\"claimants\":" + std::to_string(head.claimants) +
             ",\"lease_id\":\"" + head.lease_id + "\",\"holder\":";
@@ -112,71 +260,104 @@ std::string respond(const std::string& line, Session* session) {
              ",\"live_until_ns\":" + std::to_string(head.live_until_ns) +
              ",\"now_ns\":" + std::to_string(head.now_ns) + "}";
     } else if (op == "acquire") {
-      emit_lease(session->leases->acquire(jc::FindString(line, "holder")),
-                 &out);
+      emit_lease(writer.acquire_lease(jc::FindString(line, "holder")), &out);
     } else if (op == "renew") {
-      emit_lease(session->leases->renew(), &out);
+      emit_lease(writer.renew_lease(), &out);
     } else if (op == "release") {
-      session->leases->release();
+      writer.release_lease();
     } else if (op == "lease") {
-      const PublisherLease* held = session->leases->lease();
+      const PublisherLease* held = writer.held_lease();
       if (held != nullptr) emit_lease(*held, &out);
       else out = ",\"lease\":null";
     } else if (op == "discard_local_lease") {
-      session->leases->discard_local_lease();
+      writer.leases().discard_local_lease();
     } else if (op == "claim") {
-      emit_lease(session->leases->claim(jc::FindString(line, "holder"),
-                                        jc::FindString(line, "lease_id")),
+      emit_lease(writer.leases().claim(jc::FindString(line, "holder"),
+                                       jc::FindString(line, "lease_id")),
                  &out);
     } else if (op == "claim_contested") {
-      emit_lease(session->leases->claim_contested(
+      emit_lease(writer.leases().claim_contested(
                      jc::FindString(line, "holder"),
                      jc::FindString(line, "rival_lease_id")),
                  &out);
     } else if (op == "reject_if_gone") {
-      session->leases->reject_if_gone();
+      writer.leases().reject_if_gone();
     } else if (op == "statements") {
-      // The audited statements, placeholders intact — a ported test
-      // compares these byte-for-byte against the Python module's, so any
-      // drift between the two implementations fails a gate instead of a
-      // protocol assumption.
       out = ",\"release\":";
-      escape_into(session->leases->release_statement(), &out);
+      escape_into(writer.leases().release_statement(), &out);
       out += ",\"fence\":";
-      escape_into(session->leases->fence(), &out);
+      escape_into(writer.leases().fence(), &out);
+    } else if (op == "allocate_version") {
+      out = ",\"version\":" + std::to_string(writer.allocate_version());
+    } else if (op == "last_published_version") {
+      out = ",\"version\":" + std::to_string(writer.last_published_version());
+    } else if (op == "max_version") {
+      out = ",\"version\":" + std::to_string(writer.max_version(
+                jc::FindString(line, "table"),
+                jc::FindString(line, "column")));
+    } else if (op == "quarantined") {
+      out = std::string(",\"quarantined\":") +
+            (writer.quarantined() ? "true" : "false");
+    } else if (op == "write_descriptors") {
+      std::vector<std::string> rows;
+      const uint64_t index_version =
+          static_cast<uint64_t>(jc::FindInt(line, "index_version"));
+      for (const std::string& descriptor : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "descriptors")))) {
+        rows.push_back(render_descriptor_row(descriptor, index_version));
+      }
+      writer.write_descriptors(rows, index_version);
+    } else if (op == "commit_packs") {
+      std::vector<std::string> rows;
+      for (const std::string& ref : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "refs")))) {
+        rows.push_back(render_pack_row(
+            ref, static_cast<uint64_t>(jc::FindInt(line, "index_version"))));
+      }
+      writer.commit_packs(
+          rows, static_cast<uint64_t>(jc::FindInt(line, "index_version")));
+    } else if (op == "committed_pack_ids") {
+      const auto committed = writer.committed_pack_ids(
+          read_identities(line, "identities"));
+      out = ",\"committed\":[";
+      bool first = true;
+      for (const auto& [store_id, pack_id] : committed) {
+        if (!first) out += ",";
+        first = false;
+        out += "{\"store_id\":\"" + store_id + "\",\"pack_id\":\"" +
+               pack_id + "\"}";
+      }
+      out += "]";
+    } else if (op == "publish_snapshot") {
+      const std::string* takeover_after_renew = nullptr;
+      const std::string* takeover_after_chunks = nullptr;
+      std::string renew_holder, chunks_holder;
+      if (jc::HasKey(line, "takeover_after_renew")) {
+        renew_holder = jc::FindString(line, "takeover_after_renew");
+        takeover_after_renew = &renew_holder;
+      }
+      if (jc::HasKey(line, "takeover_after_chunks")) {
+        chunks_holder = jc::FindString(line, "takeover_after_chunks");
+        takeover_after_chunks = &chunks_holder;
+      }
+      writer.publish_snapshot(
+          static_cast<uint64_t>(jc::FindInt(line, "index_version")),
+          read_identities(line, "refs"),
+          static_cast<uint64_t>(jc::FindInt(line, "published_at_ns")),
+          static_cast<uint64_t>(jc::FindInt(line, "indexed_rows")),
+          static_cast<uint64_t>(jc::FindInt(line, "indexed_packs")),
+          static_cast<uint64_t>(jc::FindInt(line, "wedge_ns")),
+          takeover_after_renew, takeover_after_chunks,
+          jc::FindBool(line, "inject_transport_error"));
     } else if (op == "fence_eval") {
-      const bool admits = session->leases->fence_eval(
+      const bool admits = writer.leases().fence_eval(
           jc::FindString(line, "lease_id"),
           static_cast<uint64_t>(jc::FindInt(line, "publish_timeout_ns")),
           static_cast<uint64_t>(jc::FindInt(line, "clock_skew_ns")));
       out = std::string(",\"admits\":") + (admits ? "1" : "0");
-    } else if (op == "allocate_version") {
-      out = ",\"version\":" +
-            std::to_string(session->allocator->allocate_version());
-    } else if (op == "max_version") {
-      out = ",\"version\":" + std::to_string(session->allocator->max_version(
-                jc::FindString(line, "table"),
-                jc::FindString(line, "column")));
     } else if (op == "execute") {
-      const auto rows = session->client->execute(
-          jc::FindString(line, "query"));
-      out = ",\"rows\":[";
-      bool first_row = true;
-      for (const auto& row : rows) {
-        if (!first_row) out += ",";
-        first_row = false;
-        out += "[";
-        bool first_field = true;
-        for (const auto& field : row) {
-          if (!first_field) out += ",";
-          first_field = false;
-          out += "\"";
-          escape_into(field, &out);
-          out += "\"";
-        }
-        out += "]";
-      }
-      out += "]";
+      out = rows_to_json(session->client->execute(
+          jc::FindString(line, "query")));
     } else {
       return prefix + "false,\"what\":\"unknown op\"}";
     }

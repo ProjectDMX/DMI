@@ -55,7 +55,15 @@ struct LeaseHead {
 
 class CatalogError : public std::runtime_error {
  public:
-  enum class Kind { kValue, kHeld, kLease, kAllocation };
+  enum class Kind {
+    kValue,
+    kHeld,
+    kLease,
+    kAllocation,
+    kPublishRace,
+    kPublishConflict,
+    kQuarantined
+  };
 
   CatalogError(Kind kind, const std::string& what)
       : std::runtime_error(what), kind_(kind) {}

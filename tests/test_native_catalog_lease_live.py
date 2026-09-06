@@ -358,3 +358,296 @@ def test_concurrent_claimants_get_distinct_versions():
             assert client.execute(
                 f"SELECT count() FROM {claims} WHERE version = {v}"
             ) == [(1,)]
+
+
+# --- B2: descriptor batches, replay guard, fenced publish -------------------
+#
+# The Python live suites drive these through client wrappers (a takeover
+# wedged into a client's execute, a renewal that lapses, a transport that
+# dies mid-publish). The native driver reproduces the same wedges through
+# publish-op fields: takeover_after_renow / takeover_after_chunks perform a
+# successor's claim in-process at those exact points, and
+# inject_transport_error kills the publish after its renewal. The
+# statements and the control flow are what is under test; the wedge
+# mechanism is scaffolding, not behavior.
+
+
+def _descriptor_dicts(count):
+    from benchmarks.bench_capture_catalog import synthetic_descriptors
+
+    out = []
+    for item in synthetic_descriptors(count):
+        meta = item.metadata
+        loc = item.locator
+        out.append({
+            "capture_id": meta.capture_id, "tenant_id": meta.tenant_id,
+            "experiment_id": meta.experiment_id, "run_id": meta.run_id,
+            "session_id": meta.session_id, "request_id": meta.request_id,
+            "sequence_id": meta.sequence_id, "model_id": meta.model_id,
+            "model_revision": meta.model_revision,
+            "adapter_revision": meta.adapter_revision,
+            "capture_policy_version": meta.capture_policy_version,
+            "hook_name": meta.hook_name, "layer_number": meta.layer_number,
+            "producer_rank": meta.producer_rank, "step_number": meta.step_number,
+            "token_start": meta.token_start, "token_end": meta.token_end,
+            "batch_position": meta.batch_position, "dtype": meta.dtype,
+            "shape": list(meta.shape), "captured_at_ns": meta.captured_at_ns,
+            "pack_id": loc.pack_id, "store_id": loc.store_id,
+            "object_key": loc.object_key, "object_bytes": loc.object_bytes,
+            "pack_checksum": loc.pack_checksum,
+            "pack_record_count": loc.pack_record_count,
+            "payload_offset": loc.offset, "stored_length": loc.stored_length,
+            "decoded_length": loc.decoded_length, "codec": loc.codec,
+            "payload_checksum": loc.checksum,
+        })
+    return out
+
+
+def _refs_of(count):
+    # synthetic_descriptors stages every row into the same pack, so the
+    # publish's membership is that one (store_id, pack_id) identity.
+    from benchmarks.bench_capture_catalog import synthetic_descriptors
+
+    loc = synthetic_descriptors(count)[0].locator
+    return [{"store_id": loc.store_id, "pack_id": loc.pack_id}]
+
+
+def test_descriptor_batches_match_the_reference_row_for_row():
+    """B2a head-to-head: same descriptors, byte-identical capture_raw rows.
+
+    The Python writer and the native driver each write the synthetic
+    corpus into their own prefix; every column of every row — the
+    MATERIALIZED facets included — must agree.
+    """
+    from benchmarks.bench_capture_catalog import synthetic_descriptors
+    from dmi.storage.capture.clickhouse_catalog import (
+        ClickHouseCatalogConfig,
+        ClickHouseCatalogWriter,
+    )
+
+    with _catalog() as (client, config, prefix):
+        native_prefix = prefix + "_nat"
+        native_writer = ClickHouseCatalogWriter(
+            client,
+            ClickHouseCatalogConfig(database=config.database,
+                                    table_prefix=native_prefix))
+        try:
+            native_writer.ensure_schema()
+            descriptors = _descriptor_dicts(3)
+            reference = ClickHouseCatalogWriter(client, config)
+            reference.write_descriptors(list(synthetic_descriptors(3)),
+                                        index_version=7)
+            driver = CatalogDriver()
+            try:
+                _open(driver, native_prefix)
+                driver.call(op="write_descriptors", descriptors=descriptors,
+                            index_version=7)
+            finally:
+                driver.close()
+
+            def rows(table_prefix):
+                return client.execute(
+                    f"SELECT * FROM `{config.database}`."
+                    f"`{table_prefix}_capture_raw` ORDER BY ALL")
+
+            assert rows(prefix) == rows(native_prefix), (
+                "native descriptor rows diverge from the reference")
+        finally:
+            native_writer.drop_schema()
+
+
+def test_commit_packs_and_the_committed_readback():
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            version = driver.call(op="allocate_version")["version"]
+            driver.call(op="commit_packs",
+                        refs=_refs_of(3), index_version=version)
+            committed = driver.call(
+                op="committed_pack_ids", identities=_refs_of(3))
+            assert committed["committed"] == _refs_of(3), committed
+            # A pack never committed is not reported as committed.
+            other = driver.call(
+                op="committed_pack_ids",
+                identities=[{"store_id": "garage",
+                             "pack_id": str(uuid.uuid4())}])
+            assert other["committed"] == []
+        finally:
+            driver.close()
+
+
+def test_a_publish_below_the_published_head_loses_the_race():
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="writer")
+            first = driver.call(op="allocate_version")["version"]
+            second = driver.call(op="allocate_version")["version"]
+            assert second > first
+            driver.call(op="write_descriptors", descriptors=_descriptor_dicts(2),
+                        index_version=second)
+            driver.call(op="publish_snapshot", index_version=second,
+                        refs=_refs_of(2), published_at_ns=second,
+                        indexed_rows=2, indexed_packs=1)
+            assert driver.call(op="last_published_version")["version"] == second
+
+            lost = driver.call(op="publish_snapshot", index_version=first,
+                               refs=_refs_of(2), published_at_ns=first,
+                               indexed_rows=2, indexed_packs=1)
+            assert not lost["ok"]
+            assert lost["error"] == "SnapshotPublishRaceError", lost
+            assert driver.call(op="last_published_version")["version"] == second
+        finally:
+            driver.close()
+
+
+def test_a_taken_over_publisher_writes_nothing_at_all():
+    """The load-bearing fence: the check rides inside the write.
+
+    A's takeover lands (in-process, as the Python wrapper does it) between
+    its renewal and its fenced statements: the manifest INSERT is refused,
+    the read-back sees zero rows, and the writer is fenced out with
+    NOTHING written — not one inert manifest row.
+    """
+    with _catalog(lease_ttl_ns=2_000_000_000,
+                  publish_timeout_ns=1_000_000_000) as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            # The stalled publisher runs on the fixture's short TTL — the
+            # wedge depends on ITS lease lapsing, not the default 30 s.
+            _open(driver, prefix, lease_ttl_ns=2_000_000_000,
+                  publish_timeout_ns=1_000_000_000)
+            driver.call(op="acquire", holder="stalled")
+            pinned = driver.call(op="allocate_version")["version"]
+            driver.call(op="write_descriptors", descriptors=_descriptor_dicts(3),
+                        index_version=pinned)
+            driver.call(op="publish_snapshot", index_version=pinned,
+                        refs=_refs_of(3), published_at_ns=pinned,
+                        indexed_rows=3, indexed_packs=1)
+            before = _catalog_state(client, config)
+
+            lost = driver.call(op="allocate_version")["version"]
+            driver.call(op="write_descriptors", descriptors=_descriptor_dicts(2),
+                        index_version=lost)
+            refused = driver.call(
+                op="publish_snapshot", index_version=lost, refs=_refs_of(2),
+                published_at_ns=lost, indexed_rows=2, indexed_packs=1,
+                wedge_ns=2_500_000_000, takeover_after_renew="successor")
+            assert not refused["ok"]
+            assert refused["error"] == "PublisherLeaseError", refused
+            assert "fenced out and made no snapshot visible" in refused["message"]
+            assert "'successor'" in refused["message"]
+
+            assert _catalog_state(client, config) == before
+            assert client.execute(
+                "SELECT count() FROM "
+                f"`{config.database}`.`{prefix}_snapshot_manifest` "
+                f"WHERE index_version = {lost}") == [(0,)]
+            # The descriptors it wrote ARE durable: invisible because
+            # nothing admitted them, not because they are gone.
+            assert client.execute(
+                "SELECT count() FROM "
+                f"`{config.database}`.`{prefix}_capture_raw`"
+            ) == [(5,)]
+            assert driver.call(
+                op="last_published_version")["version"] == pinned
+        finally:
+            driver.close()
+
+
+def _catalog_state(client, config):
+    return {
+        table: client.execute(
+            f"SELECT * FROM `{config.database}`."
+            f"`{config.table_prefix}_{table}` ORDER BY ALL")
+        for table in ("index_watermark", "snapshot_manifest")
+    }
+
+
+def test_a_takeover_between_the_two_publish_statements_leaves_orphan_rows():
+    """The guarantee is per STATEMENT, not per publish.
+
+    The takeover wedged after the manifest INSERT leaves those rows behind
+    while the watermark is refused. They are inert — membership pairs them
+    with a watermark row of the same publish that will never exist — but
+    they are durable, and that is what "writes nothing" gets wrong.
+    """
+    with _catalog(lease_ttl_ns=2_000_000_000,
+                  publish_timeout_ns=1_000_000_000) as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            # The stalled publisher runs on the fixture's short TTL — the
+            # wedge depends on ITS lease lapsing, not the default 30 s.
+            _open(driver, prefix, lease_ttl_ns=2_000_000_000,
+                  publish_timeout_ns=1_000_000_000)
+            driver.call(op="acquire", holder="stalled")
+            pinned = driver.call(op="allocate_version")["version"]
+            driver.call(op="write_descriptors", descriptors=_descriptor_dicts(3),
+                        index_version=pinned)
+            driver.call(op="publish_snapshot", index_version=pinned,
+                        refs=_refs_of(3), published_at_ns=pinned,
+                        indexed_rows=3, indexed_packs=1)
+
+            lost = driver.call(op="allocate_version")["version"]
+            driver.call(op="write_descriptors", descriptors=_descriptor_dicts(2),
+                        index_version=lost)
+            refused = driver.call(
+                op="publish_snapshot", index_version=lost, refs=_refs_of(2),
+                published_at_ns=lost, indexed_rows=2, indexed_packs=1,
+                wedge_ns=2_500_000_000, takeover_after_chunks="successor")
+            assert not refused["ok"], refused
+            # WHICH refusal depends on where the takeover lands: the
+            # post-chunk renewal meets the successor (Held), the fenced
+            # statements' read-back is fenced out (Lease). Both are the
+            # PublisherLeaseError family; what this test is about is the
+            # orphan rows either way.
+            assert refused["error"] in ("PublisherLeaseError",
+                                        "PublisherLeaseHeldError"), refused
+            assert "successor" in refused["message"]
+
+            manifest = f"`{config.database}`.`{prefix}_snapshot_manifest`"
+            assert client.execute(
+                f"SELECT count() FROM {manifest} WHERE index_version = {lost}"
+            ) == [(1,)], "the manifest INSERT must have landed before the takeover"
+            assert client.execute(
+                "SELECT count() FROM "
+                f"`{config.database}`.`{prefix}_index_watermark` "
+                f"WHERE index_version = {lost}") == [(0,)]
+            # And the public view agrees: unpaired membership admits nothing.
+            assert client.execute(
+                f"SELECT count() FROM `{config.database}`.`{prefix}_capture`"
+            ) == [(3,)]
+        finally:
+            driver.close()
+
+
+def test_an_outcome_unknown_failure_quarantines_the_writer():
+    with _catalog(lease_ttl_ns=1_100_000_000,
+                  publish_timeout_ns=1_000_000_000) as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix, lease_ttl_ns=1_100_000_000,
+                  publish_timeout_ns=1_000_000_000)
+            driver.call(op="acquire", holder="writer")
+            refused = driver.call(
+                op="publish_snapshot", index_version=11, refs=(),
+                published_at_ns=11, indexed_rows=0, indexed_packs=0,
+                inject_transport_error=True)
+            assert not refused["ok"]
+            assert refused["error"] == "ClickHouseError", refused
+            # Quarantined: every publish-path entry is refused while the
+            # server statements may still be running past their fences.
+            assert driver.call(op="quarantined")["quarantined"] is True
+            still = driver.call(op="acquire", holder="again")
+            assert not still["ok"]
+            assert still["error"] == "WriterQuarantinedError", still
+            assert driver.call(op="renew")["error"] == "WriterQuarantinedError"
+            # The quarantine window is the lease TTL: past it, a fresh
+            # lease may be taken (the discarded row has expired too).
+            sleep(1.2)
+            fresh = driver.call(op="acquire", holder="after-window")
+            assert fresh["ok"], fresh
+        finally:
+            driver.close()
