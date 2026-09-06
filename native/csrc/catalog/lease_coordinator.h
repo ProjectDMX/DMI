@@ -62,7 +62,8 @@ class CatalogError : public std::runtime_error {
     kAllocation,
     kPublishRace,
     kPublishConflict,
-    kQuarantined
+    kQuarantined,
+    kSchema
   };
 
   CatalogError(Kind kind, const std::string& what)

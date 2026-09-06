@@ -18,6 +18,7 @@
 #include "catalog_writer.h"
 #include "clickhouse_client.h"
 #include "indexer.h"
+#include "schema.h"
 #include "lease_coordinator.h"
 #include "version_allocator.h"
 
@@ -41,6 +42,7 @@ const char* error_kind(CatalogError::Kind kind) {
     case CatalogError::Kind::kPublishConflict:
       return "SnapshotPublishConflictError";
     case CatalogError::Kind::kQuarantined: return "WriterQuarantinedError";
+    case CatalogError::Kind::kSchema: return "CatalogSchemaVersionError";
     case CatalogError::Kind::kValue: return "ValueError";
   }
   return "CatalogError";
@@ -201,6 +203,8 @@ std::string rows_to_json(const std::vector<dmi_catalog::Row>& rows) {
 struct Session {
   std::shared_ptr<const dmi_catalog::ClickHouseClient> client;
   std::unique_ptr<CatalogWriter> writer;
+  std::string database;
+  std::string table_prefix;
 };
 
 Session make_session(const std::string& line) {
@@ -231,6 +235,8 @@ Session make_session(const std::string& line) {
       host != nullptr ? host : "127.0.0.1",
       static_cast<uint16_t>(port != nullptr ? std::atoi(port) : 8123));
   session.writer = std::make_unique<CatalogWriter>(session.client, config);
+  session.database = config.database;
+  session.table_prefix = config.table_prefix;
   return session;
 }
 
@@ -287,6 +293,18 @@ std::string respond(const std::string& line, Session* session) {
       escape_into(writer.leases().fence(), &out);
     } else if (op == "allocate_version") {
       out = ",\"version\":" + std::to_string(writer.allocate_version());
+    } else if (op == "ensure_schema") {
+      uint64_t retry_sleep_ns = 500'000'000ull;
+      if (jc::HasKey(line, "retry_sleep_ns")) {
+        retry_sleep_ns = static_cast<uint64_t>(jc::FindInt(line, "retry_sleep_ns"));
+      }
+      dmi_catalog::CatalogSchema schema(session->client, session->database,
+                                        session->table_prefix);
+      schema.ensure(&writer.leases(), retry_sleep_ns);
+    } else if (op == "drop_schema") {
+      dmi_catalog::CatalogSchema schema(session->client, session->database,
+                                        session->table_prefix);
+      schema.drop();
     } else if (op == "collect_garbage") {
       const auto removed = writer.collect_garbage(
           static_cast<uint64_t>(jc::FindInt(line, "settle_sleep_ns")));

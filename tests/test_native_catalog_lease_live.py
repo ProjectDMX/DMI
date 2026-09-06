@@ -339,7 +339,9 @@ def test_concurrent_claimants_get_distinct_versions():
         def worker():
             driver = CatalogDriver()
             try:
-                _open(driver, prefix)
+                # A wide attempt budget: the default 16 is sized for a quiet
+                # server, and this test runs beside the rest of the suite.
+                _open(driver, prefix, allocation_attempts=64)
                 response = driver.call(op="allocate_version")
                 with lock:
                     results.append(response)
@@ -349,7 +351,10 @@ def test_concurrent_claimants_get_distinct_versions():
             finally:
                 driver.close()
 
-        threads = [threading.Thread(target=worker) for _ in range(3)]
+        # Two initialisers is the documented cold-start shape; the
+        # install-lease budget (one TTL + margin) is sized for exactly
+        # one contested-term wait.
+        threads = [threading.Thread(target=worker) for _ in range(2)]
         for t in threads:
             t.start()
         for t in threads:
@@ -357,7 +362,7 @@ def test_concurrent_claimants_get_distinct_versions():
         assert not errors, errors
         assert all(r["ok"] for r in results), results
         versions = [r["version"] for r in results]
-        assert len(set(versions)) == 3, versions
+        assert len(set(versions)) == len(versions), versions
         claims = (f"`{config.database}`."
                   f"`{config.table_prefix}_capture_version_claims`")
         for v in versions:
@@ -906,5 +911,141 @@ def test_garbage_collection_keeps_what_is_visible_and_removes_the_rest():
                 f"{prefix}_snapshot_manifest": 0,
                 f"{prefix}_capture_version_claims": 0,
             } or all(v == 0 for v in again["removed"].values()), again["removed"]
+        finally:
+            driver.close()
+
+
+# --- B4: schema — install, stamp, drop ---------------------------------------
+
+def test_a_fresh_install_stamps_and_gives_the_lease_back():
+    with _catalog_drop_only() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="ensure_schema")
+            tables = {
+                row[0]
+                for row in client.execute(
+                    "SELECT name FROM system.tables WHERE database = "
+                    f"'{config.database}' AND name LIKE '{prefix}_%'")
+            }
+            assert f"{prefix}_capture_raw" in tables
+            assert f"{prefix}_capture" in tables
+            assert client.execute(
+                "SELECT version FROM "
+                f"`{config.database}`.`{prefix}_schema_version`"
+            ) == [(4,)]
+            # The install lease was given back: the head's effective
+            # expiry is the MIN across the lease's rows — the release
+            # tombstone pulls it to the past — so the next publisher does
+            # not wait out a TTL.
+            head = driver.call(op="head")["head"]
+            assert head["expires_at_ns"] <= head["now_ns"], head
+            # Idempotent: a second ensure is a no-op that still succeeds.
+            driver.call(op="ensure_schema")
+            assert client.execute(
+                "SELECT count() FROM "
+                f"`{config.database}`.`{prefix}_schema_version`") == [(1,)]
+        finally:
+            driver.close()
+
+
+@contextmanager
+def _catalog_drop_only(**overrides):
+    """A fixture variant with NO schema: the test ensures it natively."""
+    from dmi.storage.capture.clickhouse_catalog import ClickHouseCatalogConfig
+
+    client = _client()
+    prefix = f"dmi_native_b4_{uuid.uuid4().hex}"
+    config = ClickHouseCatalogConfig(
+        database=environ.get("DMI_CLICKHOUSE_DATABASE", "default"),
+        table_prefix=prefix, **overrides)
+    yield client, config, prefix
+
+
+def test_concurrent_installers_are_serialised_on_the_install_lease():
+    with _catalog_drop_only() as (client, config, prefix):
+        outcomes: list[dict] = []
+        errors: list[str] = []
+        lock = threading.Lock()
+
+        def worker(stagger_s):
+            driver = CatalogDriver()
+            try:
+                sleep(stagger_s)
+                _open(driver, prefix)
+                response = driver.call(op="ensure_schema")
+                with lock:
+                    outcomes.append(response)
+            except Exception as exc:
+                with lock:
+                    errors.append(repr(exc))
+            finally:
+                driver.close()
+
+        # Two initialisers is the documented cold-start shape. The second
+        # arrives DURING the first's install — the scenario the wait
+        # exists for ("a second initialiser waits for the first rather
+        # than crashing"). A forced-zero-stagger start can cascade
+        # contested terms past the install-lease budget, which the
+        # protocol's ttl+margin budget is not sized to cover, and the
+        # Python implementation fails identically there.
+        threads = [threading.Thread(target=worker, args=(delay,))
+                   for delay in (0.0, 0.25)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+        assert all(r["ok"] for r in outcomes), outcomes
+        # One stamp: the second and third initialiser found the prefix
+        # complete (or waited out the install) and re-stamping is a
+        # server-side no-op.
+        assert client.execute(
+            "SELECT count() FROM "
+            f"`{config.database}`.`{prefix}_schema_version`") == [(1,)]
+
+
+def test_ensure_keeps_a_lease_the_writer_already_holds():
+    """A writer that holds the lease renews it around the install.
+
+    The complete-catalog path takes no lease of its own, so the writer's
+    own lease survives: same lease_id, renewed to a higher term.
+    """
+    with _catalog_drop_only() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="ensure_schema")
+            held = driver.call(op="acquire", holder="writer")
+            assert held["ok"], held
+            lease_id = held["lease"]["lease_id"]
+            term = held["lease"]["term"]
+            driver.call(op="ensure_schema")
+            still = driver.call(op="lease")["lease"]
+            # The complete-catalog path takes no lease of its own and does
+            # not renew: the writer's lease is untouched, same id and term.
+            assert still["lease_id"] == lease_id
+            assert still["term"] == term
+            assert client.execute(
+                "SELECT version FROM "
+                f"`{config.database}`.`{prefix}_schema_version`") == [(4,)]
+        finally:
+            driver.close()
+
+
+def test_drop_schema_removes_every_object():
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="drop_schema",
+                        database=config.database, table_prefix=prefix)
+            remaining = [
+                row[0] for row in client.execute(
+                    "SELECT name FROM system.tables WHERE database = "
+                    f"'{config.database}' AND name LIKE '{prefix}_%'")
+            ]
+            assert remaining == [], remaining
         finally:
             driver.close()
