@@ -83,16 +83,6 @@ std::string sql_string_or_null(const std::string& line, const char* key) {
   return render_sql_string(jc::FindString(line, key));
 }
 
-std::string sql_int_or_string(const std::string& line, const char* key) {
-  // Strings ride as quoted literals; everything numeric renders as-is.
-  const std::string raw = jc::FindString(line, key);
-  bool numeric = !raw.empty();
-  for (const char c : raw) {
-    if ((c < '0' || c > '9') && c != '-') numeric = false;
-  }
-  return numeric ? raw : render_sql_string(raw);
-}
-
 std::vector<PackIdentity> read_identities(const std::string& line,
                                           const char* key) {
   std::vector<PackIdentity> out;
@@ -165,7 +155,9 @@ std::string render_descriptor_row(const std::string& descriptor) {
   return row;
 }
 
-std::string render_pack_row(const std::string& ref, uint64_t index_version) {
+// The six version-independent pack columns; commit_packs appends the
+// batch's index_version itself, the same convention as write_descriptors.
+std::string render_pack_row(const std::string& ref) {
   std::vector<std::string> fields;
   fields.push_back("toUUID('" + jc::FindString(ref, "pack_id") + "')");
   fields.push_back(render_sql_string(jc::FindString(ref, "store_id")));
@@ -173,7 +165,6 @@ std::string render_pack_row(const std::string& ref, uint64_t index_version) {
   fields.push_back(std::to_string(jc::FindInt(ref, "object_bytes")));
   fields.push_back(render_sql_string(jc::FindString(ref, "pack_checksum")));
   fields.push_back(std::to_string(jc::FindInt(ref, "record_count")));
-  fields.push_back(std::to_string(index_version));
   std::string row;
   for (size_t i = 0; i < fields.size(); ++i) {
     if (i > 0) row += ",";
@@ -350,8 +341,7 @@ std::string respond(const std::string& line, Session* session) {
       std::vector<std::string> rows;
       for (const std::string& ref : jc::SplitElements(
                jc::Unwrap(jc::FindArray(line, "refs")))) {
-        rows.push_back(render_pack_row(
-            ref, static_cast<uint64_t>(jc::FindInt(line, "index_version"))));
+        rows.push_back(render_pack_row(ref));
       }
       writer.commit_packs(
           rows, static_cast<uint64_t>(jc::FindInt(line, "index_version")));
@@ -442,8 +432,7 @@ std::string respond(const std::string& line, Session* session) {
         };
       }
       const dmi_catalog::IndexResultData result =
-          dmi_catalog::NativeIndexer(&s3, s3_config.bucket, &writer,
-                                     index_config)
+          dmi_catalog::NativeIndexer(&s3, &writer, index_config)
               .index(refs);
       out = ",\"result\":{\"requested_packs\":" +
             std::to_string(result.requested_packs) +

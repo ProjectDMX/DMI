@@ -54,8 +54,8 @@ struct IndexResultData {
 
 class NativeIndexer {
  public:
-  NativeIndexer(dmi_store::S3Client* s3, std::string bucket,
-                CatalogWriter* writer, IndexerConfig config);
+  NativeIndexer(dmi_store::S3Client* s3, CatalogWriter* writer,
+                IndexerConfig config);
 
   IndexResultData index(const std::vector<PackRefData>& refs);
 
@@ -63,7 +63,6 @@ class NativeIndexer {
   uint64_t allocate_version();
 
   dmi_store::S3Client* s3_;
-  std::string bucket_;
   CatalogWriter* writer_;
   IndexerConfig config_;
   std::optional<uint64_t> published_version_;

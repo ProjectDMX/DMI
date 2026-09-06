@@ -199,8 +199,7 @@ std::string render_record_row(const std::string& raw, const PackRefData& ref,
 }  // namespace
 
 std::vector<std::string> read_pack_descriptor_rows(
-    dmi_store::S3Client* s3, const std::string& bucket,
-    const PackRefData& ref) {
+    dmi_store::S3Client* s3, const PackRefData& ref) {
   if (ref.object_bytes < kHeaderSize + kTrailerSize + 2) {
     format_error("pack is truncated");
   }

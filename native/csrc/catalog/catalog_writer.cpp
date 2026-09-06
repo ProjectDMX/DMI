@@ -90,9 +90,102 @@ std::string sql_quote(const std::string& value) {
   return escape_sql_string(value);
 }
 
+namespace {
+
+// clickhouse_catalog.MINIMUM_FENCE_MARGIN_NS: what has to remain of the
+// lease after the statement cap and the skew bound are spent -- the whole
+// time a renewed lease has to reach the fence.
+constexpr uint64_t kMinimumFenceMarginNs = 100'000'000;
+
+// clickhouse_sql.identifier: both names are interpolated into backticked
+// qualified names, so anything outside [A-Za-z_][A-Za-z0-9_]* escapes the
+// quoting.
+void require_identifier(const std::string& value, const char* what) {
+  const auto word = [](char c, bool first) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+           (!first && c >= '0' && c <= '9');
+  };
+  bool valid = !value.empty();
+  for (size_t i = 0; valid && i < value.size(); ++i) {
+    valid = word(value[i], i == 0);
+  }
+  if (!valid) {
+    throw CatalogError(CatalogError::Kind::kValue,
+                       std::string("invalid ClickHouse identifier for ") +
+                           what + ": '" + value + "'");
+  }
+}
+
+// ClickHouseCatalogConfig.__post_init__, ported rule for rule: everything
+// here refuses at construction what would otherwise silently void a
+// guarantee mid-protocol.
+void validate(const WriterConfig& config) {
+  require_identifier(config.database, "database");
+  require_identifier(config.table_prefix, "table_prefix");
+  const std::pair<const char*, uint64_t> positive[] = {
+      {"query_pack_limit", static_cast<uint64_t>(
+                               config.query_pack_limit > 0
+                                   ? config.query_pack_limit : 0)},
+      {"allocation_attempts", static_cast<uint64_t>(
+                                  config.allocation_attempts > 0
+                                      ? config.allocation_attempts : 0)},
+      {"lease_ttl_ns", config.lease_ttl_ns},
+      {"publish_timeout_ns", config.publish_timeout_ns},
+  };
+  for (const auto& [name, value] : positive) {
+    if (value == 0) {
+      throw CatalogError(CatalogError::Kind::kValue,
+                         std::string(name) + " must be positive");
+    }
+  }
+  const uint64_t spent = config.publish_timeout_ns + config.clock_skew_ns;
+  if (config.lease_ttl_ns < spent ||
+      config.lease_ttl_ns - spent < kMinimumFenceMarginNs) {
+    throw CatalogError(
+        CatalogError::Kind::kValue,
+        "lease_ttl_ns must exceed publish_timeout_ns plus clock_skew_ns "
+        "by at least " + std::to_string(kMinimumFenceMarginNs) + " ns. "
+        "That margin is what keeps a publish statement from still running "
+        "when its lease becomes takeable, and it is also the whole time a "
+        "renewed lease has to reach the fence. Thinner than a round trip, "
+        "every publish is refused by its own fence and retried at a higher "
+        "version until the attempts run out");
+  }
+  if (config.insert_quorum.has_value() && config.clock_skew_ns == 0) {
+    throw CatalogError(
+        CatalogError::Kind::kValue,
+        "clock_skew_ns must be set alongside insert_quorum: a quorum "
+        "declares a replicated deployment, where lease expiries are "
+        "stamped by one host's clock and fenced against another's, and a "
+        "zero bound claims those clocks never disagree. Measure the "
+        "cluster's host skew and set the bound above it");
+  }
+  if (config.insert_quorum.has_value() && *config.insert_quorum < 2) {
+    throw CatalogError(
+        CatalogError::Kind::kValue,
+        "insert_quorum must be unset or an integer of at least 2: a quorum "
+        "of one is what the default already gives, and setting it to 1 "
+        "reads as protection that is not there");
+  }
+  if (config.publish_timeout_ns % 1'000'000'000 != 0) {
+    // max_execution_time is sent as WHOLE seconds. A fraction truncates
+    // to 0 on the way, and ClickHouse reads 0 as NO limit -- silently
+    // dropping the cap the fence-vs-TTL margin depends on.
+    throw CatalogError(
+        CatalogError::Kind::kValue,
+        "publish_timeout_ns must be a whole number of seconds: it is sent "
+        "to the server as max_execution_time in seconds, and a fraction "
+        "either fails to parse or truncates -- 0.5s can reach an older "
+        "server as 0, which disables the cap entirely");
+  }
+}
+
+}  // namespace
+
 CatalogWriter::CatalogWriter(std::shared_ptr<const ClickHouseClient> client,
                              WriterConfig config)
     : client_(std::move(client)), config_(std::move(config)) {
+  validate(config_);
   LeaseConfig leases;
   leases.database = config_.database;
   leases.table_prefix = config_.table_prefix;
@@ -264,10 +357,15 @@ void CatalogWriter::commit_packs(
     const std::vector<std::string>& rendered_rows, uint64_t index_version) {
   if (rendered_rows.empty()) return;
   require_not_quarantined();
+  // The batch's index_version is the final column, appended here — the
+  // same convention as write_descriptors, so a caller renders the six
+  // version-independent columns and never the version. Taking the
+  // parameter and ignoring it invited exactly that caller to render a row
+  // that draws a column-count error at runtime.
   std::string values;
   for (const auto& row : rendered_rows) {
     if (!values.empty()) values += ",";
-    values += "(" + row + ")";
+    values += "(" + row + "," + std::to_string(index_version) + ")";
   }
   try {
     client_->execute(
@@ -601,7 +699,15 @@ std::map<std::string, uint64_t> CatalogWriter::collect_garbage(
   std::vector<std::pair<uint64_t, std::string>> orphans =
       orphaned_manifest_publishes(published);
   if (!orphans.empty()) {
-    std::this_thread::sleep_for(std::chrono::nanoseconds(settle_sleep_ns));
+    // Floored at one publish timeout, whatever the caller passed: any
+    // statement admitted before the first read has either landed or been
+    // capped by max_execution_time once that long has passed, and that is
+    // the whole soundness of the two-read intersection. The Python
+    // implementation derives the wait from publish_timeout_ns internally
+    // (`sleep(self._config.publish_timeout_ns / 1e9)`); here the parameter
+    // may only lengthen it.
+    std::this_thread::sleep_for(std::chrono::nanoseconds(
+        std::max(settle_sleep_ns, config_.publish_timeout_ns)));
     std::set<std::pair<uint64_t, std::string>> settled;
     for (const auto& pair : orphaned_manifest_publishes(published)) {
       if (std::find(orphans.begin(), orphans.end(), pair) != orphans.end()) {
@@ -616,7 +722,13 @@ std::map<std::string, uint64_t> CatalogWriter::collect_garbage(
       for (const auto& [version, publish_id] : chunk) {
         if (!first) inner += ",";
         first = false;
-        inner += "(" + std::to_string(version) + ",'" + publish_id + "')";
+        // Escaped like every other identity in this file, even though the
+        // value came from toString() of a UUID column and is well-formed
+        // today: this is the one DELETE predicate in the module, and
+        // server-provided text reaching an ALTER ... DELETE unescaped is
+        // not a property to leave resting on a column type.
+        inner += "(" + std::to_string(version) + "," +
+                 sql_quote(publish_id) + ")";
       }
       removed_manifest += delete_rows(
           "snapshot_manifest",

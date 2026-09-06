@@ -494,10 +494,8 @@ void CatalogSchema::lay_out() const {
       "index_version UInt64\n) ENGINE = ReplacingMergeTree(index_version)\n"
       "ORDER BY (" + kPackTableOrder + ")");
   for (const char* facet : kFacetDdl) {
-    const std::string text = facet;
-    const size_t kind_at = text.find(" MATERIALIZED ");
     client_->execute("ALTER TABLE " + capture_raw +
-                     " ADD COLUMN IF NOT EXISTS " + text);
+                     " ADD COLUMN IF NOT EXISTS " + std::string(facet));
   }
   client_->execute("ALTER TABLE " + capture_raw +
                    " ADD INDEX IF NOT EXISTS capture_id_bloom capture_id "

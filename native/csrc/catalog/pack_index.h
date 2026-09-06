@@ -29,9 +29,11 @@ struct PackRefData {
 // record — the 33 capture_raw columns in schema order, without
 // index_version (the batch's own version). Throws CatalogError (kValue)
 // on any format violation, mirroring PackFormatError / PackIntegrityError.
+// The bucket is the S3Client's own config; a bucket parameter here would
+// only invite a caller to believe passing a different one redirects the
+// read.
 std::vector<std::string> read_pack_descriptor_rows(
-    dmi_store::S3Client* s3, const std::string& bucket,
-    const PackRefData& ref);
+    dmi_store::S3Client* s3, const PackRefData& ref);
 
 }  // namespace dmi_catalog
 

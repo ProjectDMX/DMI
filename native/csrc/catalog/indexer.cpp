@@ -27,27 +27,26 @@ std::vector<PackIdentity> PackIdentitiesFrom(
   return out;
 }
 
+// The six version-independent pack columns; commit_packs appends the
+// batch's index_version itself, the same convention as write_descriptors.
 std::vector<std::string> RenderPackRows(
-    const std::vector<const PackRefData*>& refs, uint64_t index_version) {
+    const std::vector<const PackRefData*>& refs) {
   std::vector<std::string> rows;
   for (const PackRefData* ref : refs) {
     rows.push_back("toUUID('" + ref->pack_id + "')," + sql_quote(ref->store_id) +
                    "," + sql_quote(ref->object_key) + "," +
                    std::to_string(ref->object_bytes) + "," +
                    sql_quote(ref->checksum) + "," +
-                   std::to_string(ref->record_count) + "," +
-                   std::to_string(index_version));
+                   std::to_string(ref->record_count));
   }
   return rows;
 }
 
 }  // namespace
 
-NativeIndexer::NativeIndexer(dmi_store::S3Client* s3,
-                             std::string bucket, CatalogWriter* writer,
+NativeIndexer::NativeIndexer(dmi_store::S3Client* s3, CatalogWriter* writer,
                              IndexerConfig config)
-    : s3_(s3), bucket_(std::move(bucket)), writer_(writer),
-      config_(config) {}
+    : s3_(s3), writer_(writer), config_(config) {}
 
 uint64_t NativeIndexer::allocate_version() {
   const uint64_t version = writer_->allocate_version();
@@ -123,7 +122,6 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
   }
 
   std::vector<const PackRefData*> pending;
-  std::vector<std::vector<std::string>> row_batches;
   uint64_t estimated_bytes = 0;
   for (const PackRefData* ref : unique) {
     if (committed.count({ref->store_id, ref->pack_id})) continue;
@@ -142,7 +140,7 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
   for (const PackRefData* ref : pending) {
     std::vector<std::string> rows;
     try {
-      rows = read_pack_descriptor_rows(s3_, bucket_, *ref);
+      rows = read_pack_descriptor_rows(s3_, *ref);
     } catch (const CatalogError& e) {
       std::string message = e.what();
       if (message.size() > 512) message.resize(512);
@@ -218,7 +216,7 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
           if (e.kind() == CatalogError::Kind::kPublishConflict) {
             // Visible, so skippable: record the packs before propagating.
             if (!indexed.empty()) {
-              writer_->commit_packs(RenderPackRows(indexed, version), version);
+              writer_->commit_packs(RenderPackRows(indexed), version);
             }
           }
           throw;
@@ -252,7 +250,7 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
               std::to_string(config_.max_publish_attempts) + " attempts");
     }
     if (!indexed.empty()) {
-      writer_->commit_packs(RenderPackRows(indexed, version), version);
+      writer_->commit_packs(RenderPackRows(indexed), version);
     }
     result.descriptor_inserts = descriptor_inserts;
   }

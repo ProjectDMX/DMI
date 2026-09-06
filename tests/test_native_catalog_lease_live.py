@@ -1108,7 +1108,153 @@ def test_a_batch_that_never_publishes_is_never_committed(fake_s3):
             driver.close()
 
 
+# --- writer config validation --------------------------------------------------
+#
+# The Python config refuses at construction whatever would silently void a
+# guarantee later: identifiers that break out of their backticks, a
+# publish timeout the server would read as "no limit", a quorum without a
+# clock-skew bound, a fence margin thinner than a round trip. The native
+# WriterConfig must refuse the same shapes at `open`, and each case here
+# carries the Python oracle beside it.
+
+def _refused_open(**overrides):
+    driver = CatalogDriver()
+    try:
+        fields = {"op": "open", "table_prefix": "dmi_cfg_refusals",
+                  "database": environ.get("DMI_CLICKHOUSE_DATABASE", "default"),
+                  **DEFAULTS, **overrides}
+        return driver.call(**fields)
+    finally:
+        driver.close()
+
+
+def _oracle_refuses(**overrides):
+    from dmi.storage.capture.clickhouse_catalog import ClickHouseCatalogConfig
+
+    fields = {"table_prefix": "dmi_cfg_refusals",
+              "database": environ.get("DMI_CLICKHOUSE_DATABASE", "default"),
+              "lease_ttl_ns": DEFAULTS["lease_ttl_ns"],
+              "publish_timeout_ns": DEFAULTS["publish_timeout_ns"],
+              "clock_skew_ns": DEFAULTS["clock_skew_ns"],
+              **overrides}
+    with pytest.raises(ValueError) as refusal:
+        ClickHouseCatalogConfig(**fields)
+    return str(refusal.value)
+
+
+def test_an_identifier_that_escapes_its_backticks_is_refused():
+    # Both names are interpolated into backticked qualified names; a
+    # backtick or hyphen in either escapes the quoting.
+    refused = _refused_open(table_prefix="dmi`; DROP TABLE x; --")
+    assert not refused["ok"], refused
+    assert refused["error"] == "ValueError", refused
+    assert "identifier" in refused["message"], refused
+    assert "identifier" in _oracle_refuses(
+        table_prefix="dmi`; DROP TABLE x; --")
+
+
+def test_a_fractional_publish_timeout_is_refused():
+    # max_execution_time rides as WHOLE seconds; 0.5s coerced through
+    # int() reaches an older server as 0, which disables the cap and the
+    # fence-vs-TTL margin with it.
+    refused = _refused_open(publish_timeout_ns=500_000_000)
+    assert not refused["ok"], refused
+    assert refused["error"] == "ValueError", refused
+    assert "whole number of seconds" in refused["message"], refused
+    assert "whole number of seconds" in _oracle_refuses(
+        publish_timeout_ns=500_000_000)
+
+
+def test_a_quorum_without_a_clock_skew_bound_is_refused():
+    refused = _refused_open(insert_quorum=2, clock_skew_ns=0)
+    assert not refused["ok"], refused
+    assert refused["error"] == "ValueError", refused
+    assert "clock_skew_ns" in refused["message"], refused
+    assert "clock_skew_ns" in _oracle_refuses(insert_quorum=2, clock_skew_ns=0)
+
+
+def test_a_quorum_of_one_is_refused():
+    refused = _refused_open(insert_quorum=1, clock_skew_ns=1_000_000)
+    assert not refused["ok"], refused
+    assert refused["error"] == "ValueError", refused
+    assert "at least 2" in refused["message"], refused
+    assert "at least 2" in _oracle_refuses(
+        insert_quorum=1, clock_skew_ns=1_000_000)
+
+
+def test_a_fence_margin_thinner_than_a_round_trip_is_refused():
+    # ttl == timeout leaves zero margin: the lease is takeable the moment
+    # the statement's own cap expires, and a renewed lease has no time at
+    # all to reach the fence.
+    refused = _refused_open(lease_ttl_ns=1_000_000_000,
+                            publish_timeout_ns=1_000_000_000)
+    assert not refused["ok"], refused
+    assert refused["error"] == "ValueError", refused
+    assert "margin" in refused["message"], refused
+    assert "margin" in _oracle_refuses(lease_ttl_ns=1_000_000_000,
+                                       publish_timeout_ns=1_000_000_000)
+
+
+def test_a_zero_lease_ttl_is_refused():
+    refused = _refused_open(lease_ttl_ns=0)
+    assert not refused["ok"], refused
+    assert refused["error"] == "ValueError", refused
+    assert "positive" in refused["message"], refused
+    assert "positive" in _oracle_refuses(lease_ttl_ns=0)
+
+
 # --- B4: maintenance — garbage collection ------------------------------------
+
+def test_garbage_collection_never_settles_for_less_than_the_publish_timeout():
+    """The two-read intersection is only sound one publish timeout apart.
+
+    Any statement admitted before the first read has either landed or been
+    capped by max_execution_time once that long has passed -- that is what
+    makes a publish orphaned in BOTH reads safe to collect. The Python
+    implementation derives the wait from publish_timeout_ns internally; the
+    native port takes the wait as a parameter, so a short value must be
+    clamped up to the timeout or a maintenance job passing 0 deletes
+    manifest rows out from under a publish whose watermark statement is
+    still in flight.
+    """
+    from time import monotonic
+
+    with _catalog(publish_timeout_ns=1_000_000_000) as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix, publish_timeout_ns=1_000_000_000)
+            driver.call(op="acquire", holder="writer")
+            # An orphan BELOW the published head, so the settle wait
+            # actually runs: only sub-head orphans are collectable, and
+            # with none in the first read there is nothing to settle.
+            first = driver.call(op="allocate_version")["version"]
+            driver.call(op="publish_snapshot", index_version=first, refs=(),
+                        published_at_ns=first, indexed_rows=0,
+                        indexed_packs=0)
+            second = driver.call(op="allocate_version")["version"]
+            driver.call(op="publish_snapshot", index_version=second, refs=(),
+                        published_at_ns=second, indexed_rows=0,
+                        indexed_packs=0)
+            manifest = f"`{config.database}`.`{prefix}_snapshot_manifest`"
+            driver.call(
+                op="execute",
+                query=(f"INSERT INTO {manifest} "
+                       "(index_version, publish_id, store_id, pack_id) VALUES "
+                       f"({first}, '{uuid.uuid4()}', 'garage', "
+                       f"'{uuid.uuid4()}')"),
+            )
+
+            began = monotonic()
+            collected = driver.call(op="collect_garbage", settle_sleep_ns=0)
+            elapsed = monotonic() - began
+
+            assert collected["ok"], collected
+            assert elapsed >= 0.95, (
+                f"settle wait ran {elapsed:.3f}s with settle_sleep_ns=0; the "
+                "floor is publish_timeout_ns (1s)")
+        finally:
+            driver.close()
+
 
 def test_garbage_collection_keeps_what_is_visible_and_removes_the_rest():
     """The retention port, against the same scenario the Python suite drives.
