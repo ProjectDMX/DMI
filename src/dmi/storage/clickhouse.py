@@ -6,6 +6,21 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, overload, 
 import torch
 
 
+# torch dtype names DMI writers can put in the ClickHouse `dtype` column: the
+# aliases emitted by ScalarTypeToTorchDtypeString() in
+# native/csrc/clickhouse_client.cpp, plus the canonical ``str(torch.dtype)``
+# spellings the Python capture path produces for the same set. `dtype` is read
+# back out of the database, so it is matched against this list rather than
+# handed to getattr(torch, ...) unrestricted.
+_ALLOWED_TORCH_DTYPE_NAMES = frozenset(
+    {
+        "float", "float32", "double", "float64", "half", "float16", "bfloat16",
+        "uint8", "int8", "short", "int16", "int", "int32", "long", "int64", "bool",
+        "chalf", "complex32", "cfloat", "complex64", "cdouble", "complex128",
+    }
+)
+
+
 class CHClickhouseDriverReadOnly:
     """
     Read-only ClickHouse interface using `clickhouse-driver` (native protocol).
@@ -63,7 +78,7 @@ class CHClickhouseDriverReadOnly:
         self._port = port
         self._username = username
         self._password = password
-        self._database = database
+        self._database = self._validate_ident(database)
         self._table = self._validate_ident(table)
 
         self._primary_key_column_names = tuple(self._validate_ident(c) for c in primary_key_column_names)
@@ -122,7 +137,9 @@ class CHClickhouseDriverReadOnly:
 
     @staticmethod
     def _backtick(name: str) -> str:
-        return f"`{name}`"
+        # Double any embedded backtick so the quoting cannot be escaped.
+        # Mirrors QuoteIdent() in native/csrc/clickhouse_client.cpp.
+        return "`" + name.replace("`", "``") + "`"
 
     @classmethod
     def _build_select_sql(
@@ -181,8 +198,12 @@ class CHClickhouseDriverReadOnly:
 
         if not dtype_str.startswith("torch."):
             raise ValueError(f"Expected dtype string starting with 'torch.', got {dtype_str!r}")
-        
-        return getattr(torch, dtype_str.split(".")[1])
+
+        name = dtype_str.split(".", 1)[1]
+        if name not in _ALLOWED_TORCH_DTYPE_NAMES:
+            raise ValueError(f"Unsupported torch dtype: {dtype_str!r}")
+
+        return getattr(torch, name)
 
     @classmethod
     def torch_decode(

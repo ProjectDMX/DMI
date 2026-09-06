@@ -291,9 +291,12 @@ def _generate_with_monitoring_impl(
                 # before_forward's per-batch capacity check + HookPoint's
                 # safety net (ring D2D where it fits, submit_cpu_direct
                 # where it doesn't) can run.
-                had_compile = bool(
-                    kwargs.pop("compile_config", None) is not None
-                    or kwargs.pop("cache_implementation", None) is not None
+                # Both pops must run: `or` would short-circuit the second
+                # and leave cache_implementation in kwargs.
+                popped_compile_config = kwargs.pop("compile_config", None)
+                popped_cache_impl = kwargs.pop("cache_implementation", None)
+                had_compile = (
+                    popped_compile_config is not None or popped_cache_impl is not None
                 )
                 kwargs["disable_compile"] = True
                 msg = (

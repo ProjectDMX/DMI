@@ -46,6 +46,22 @@ static void log_submit_failure_once(
     });
 }
 
+static std::once_flag g_task_failure_log_once;
+
+// A throw out of process() would escape the std::thread entry point and hit
+// std::terminate(), taking the whole inference process down.  Log once and
+// drop the task instead.
+static void log_task_failure_once(const char* error) {
+    std::call_once(g_task_failure_log_once, [&] {
+        fprintf(stderr,
+                "[DMI][P2P] WARN: failed to post-process a drain task; "
+                "dropping it and suppressing further task errors. "
+                "error=\"%s\"\n",
+                error ? error : "unknown");
+        fflush(stderr);
+    });
+}
+
 // Build ClickHouse act_name from hook_type.
 // Per-layer: "blocks.<hook_type_name>"  (e.g. "blocks.attn.hook_pattern")
 // Global:    "<hook_type_name>"         (e.g. "hook_embed", "token_ids")
@@ -155,33 +171,50 @@ void P2PThread::process(std::vector<DrainTask>& tasks) {
     for (size_t i = 0; i < tasks.size(); ++i) {
         DrainTask& task = tasks[i];
 
-        if (task.cpu_paged_tensor.defined()) {
-            // CPU-direct tensor -- already in pageable memory, skip staging copy
-            at::Tensor tensor = std::move(task.cpu_paged_tensor);
+        try {
+            if (task.cpu_paged_tensor.defined()) {
+                // CPU-direct tensor -- already in pageable memory, skip staging copy
+                at::Tensor tensor = std::move(task.cpu_paged_tensor);
+                do_post_processing(tensor, task);
+                continue;
+            }
+
+            // Normal tensor: copy from pinned staging to pageable
+            uint64_t total_bytes = task.tensor_total_bytes;
+
+            auto tensor = at::empty({static_cast<int64_t>(total_bytes)},
+                                    at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+            uint8_t* dst = tensor.data_ptr<uint8_t>();
+
+            if (task.data_len1 > 0) {
+                std::memcpy(dst, task.data_ptr1, task.data_len1);
+            }
+            if (task.data_len2 > 0) {
+                std::memcpy(dst + task.data_len1, task.data_ptr2, task.data_len2);
+            }
+
+            // Release staging space
+            if (task.alloc_bytes > 0) {
+                drain_.notify_staging_freed_bytes(task.alloc_bytes);
+                task.alloc_bytes = 0;
+            }
+
             do_post_processing(tensor, task);
-            continue;
+        } catch (const std::exception& e) {
+            // Give the staging range back before dropping the task, or the
+            // drain thread waits forever on bytes that will never be freed.
+            if (task.alloc_bytes > 0) {
+                drain_.notify_staging_freed_bytes(task.alloc_bytes);
+                task.alloc_bytes = 0;
+            }
+            log_task_failure_once(e.what());
+        } catch (...) {
+            if (task.alloc_bytes > 0) {
+                drain_.notify_staging_freed_bytes(task.alloc_bytes);
+                task.alloc_bytes = 0;
+            }
+            log_task_failure_once("unknown exception");
         }
-
-        // Normal tensor: copy from pinned staging to pageable
-        uint64_t total_bytes = task.tensor_total_bytes;
-
-        auto tensor = at::empty({static_cast<int64_t>(total_bytes)},
-                                at::TensorOptions().dtype(at::kByte).device(at::kCPU));
-        uint8_t* dst = tensor.data_ptr<uint8_t>();
-
-        if (task.data_len1 > 0) {
-            std::memcpy(dst, task.data_ptr1, task.data_len1);
-        }
-        if (task.data_len2 > 0) {
-            std::memcpy(dst + task.data_len1, task.data_ptr2, task.data_len2);
-        }
-
-        // Release staging space
-        if (task.alloc_bytes > 0) {
-            drain_.notify_staging_freed_bytes(task.alloc_bytes);
-        }
-
-        do_post_processing(tensor, task);
     }
 }
 

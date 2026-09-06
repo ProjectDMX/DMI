@@ -63,7 +63,7 @@ def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
     out = []
     for layer in sorted(layers):
         per_request = [
-            torch.cat([t for _, t in sorted(chunks)], dim=0)
+            torch.cat([t for _, t in sorted(chunks, key=lambda chunk: chunk[0])], dim=0)
             for _, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
         ]
         out.append(_left_pad_stack(per_request))
@@ -96,7 +96,7 @@ def _reassemble_attention_per_layer(rows: list, act_name: str) -> tuple[torch.Te
     for layer in sorted(layers):
         per_request = [
             merge_segments(
-                [t for _, t in sorted(chunks)],
+                [t for _, t in sorted(chunks, key=lambda chunk: chunk[0])],
                 act_name,
             )
             for _, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
@@ -117,7 +117,7 @@ def _reassemble_global(rows: list) -> torch.Tensor:
     for key, tensor in rows:
         requests.setdefault(key[1], []).append((key[5], tensor))
     per_request = [
-        torch.cat([t for _, t in sorted(chunks)], dim=0)
+        torch.cat([t for _, t in sorted(chunks, key=lambda chunk: chunk[0])], dim=0)
         for _, chunks in sorted(requests.items(), key=lambda item: _request_sort_key(item[0]))
     ]
     if per_request[0].ndim == 1:

@@ -202,6 +202,26 @@ def test_chunks_concat_by_start():
     assert torch.equal(hs[0][0, 2], torch.full((4,), 9.0))
 
 
+def test_duplicate_start_index_sorts_without_comparing_tensors():
+    # Two rows sharing a start index: sorting the (start, tensor) pairs must
+    # not fall through to comparing the tensors themselves.
+    rows = [
+        _row("0:0", 0, 0, torch.full((2, 4), 1.0)),
+        _row("0:0", 0, 0, torch.full((2, 4), 2.0)),
+    ]
+    hs = get_internal("m", FakeReader(rows)).hidden_states
+    assert tuple(hs[0].shape) == (1, 4, 4)
+
+
+def test_duplicate_start_index_global_sorts_without_comparing_tensors():
+    rows = [
+        _row_act("0:0", "token_ids", -1, 0, 2, torch.ones(2)),
+        _row_act("0:0", "token_ids", -1, 0, 2, torch.ones(2) * 2),
+    ]
+    token_ids = get_internal("m", FakeReader(rows)).token_ids
+    assert tuple(token_ids.shape) == (1, 4)
+
+
 def test_ragged_batch_left_pads():
     rows = [
         _row("0:0", 0, 0, torch.ones(3, 4)),   # 3 tokens

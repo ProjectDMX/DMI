@@ -117,6 +117,16 @@ def test_backtick():
     assert CHClickhouseDriverReadOnly._backtick("col") == "`col`"
 
 
+def test_backtick_doubles_embedded_backticks():
+    assert CHClickhouseDriverReadOnly._backtick("a`b") == "`a``b`"
+
+
+@pytest.mark.parametrize("bad_db", ["evil`,`x", "a b", "d;drop", "9db", ""])
+def test_database_identifier_is_validated(bad_db):
+    with pytest.raises(ValueError, match="Invalid identifier"):
+        CHClickhouseDriverReadOnly(database=bad_db)
+
+
 def test_build_select_sql_no_prefix_no_order():
     sql = CHClickhouseDriverReadOnly._build_select_sql(
         db="d", table="t", pk_names=(), select_col_names=("a", "b"), order_by=None,
@@ -191,6 +201,29 @@ def test_bytes_to_torch_dtype(raw, expected):
 def test_bytes_to_torch_dtype_requires_torch_prefix():
     with pytest.raises(ValueError, match="starting with 'torch.'"):
         CHClickhouseDriverReadOnly.bytes_to_torch_dtype(b"float32")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"torch.nn",              # a real torch attribute that is not a dtype
+        b"torch.load",            # a callable
+        b"torch.float32.itemsize",
+        b"torch.not_a_dtype",
+        b"torch.",
+    ],
+)
+def test_bytes_to_torch_dtype_rejects_names_outside_the_allowlist(raw):
+    with pytest.raises(ValueError, match="Unsupported torch dtype"):
+        CHClickhouseDriverReadOnly.bytes_to_torch_dtype(raw)
+
+
+def test_bytes_to_torch_dtype_accepts_every_allowlisted_writer_name():
+    from dmi.storage.clickhouse import _ALLOWED_TORCH_DTYPE_NAMES
+
+    for name in _ALLOWED_TORCH_DTYPE_NAMES:
+        decoded = CHClickhouseDriverReadOnly.bytes_to_torch_dtype(f"torch.{name}")
+        assert isinstance(decoded, torch.dtype)
 
 
 def test_torch_decode_round_trip():
