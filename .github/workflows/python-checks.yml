@@ -121,13 +121,17 @@ jobs:
         # libcurl.so.4 but not the dev headers; install those and build
         # against the system paths.
         #
-        # The sink and store drivers are here because the ported catalog
-        # suite reaches them too: its indexer tests stage packs through the
-        # sink, upload them through the store driver to the in-process fake
-        # S3, and then index what came back. Built only conformance_catalog,
-        # those five tests do not skip -- they fail on a missing binary at
-        # Popen, which is how they would have failed the moment the
-        # botocore collection error above stopped hiding them.
+        # ALL FOUR CPU-only conformance drivers, not just the catalog one:
+        # the ported catalog suite reaches the others through its indexer
+        # tests, which stage packs through the sink, recover the staged
+        # entry through the spool driver, upload through the store driver
+        # to the in-process fake S3, and then index what came back. A
+        # missing binary there is not a skip -- it is FileNotFoundError at
+        # Popen -- and the spool one is reached by a path built from
+        # STORE_DRIVER.parent rather than a module constant, so it does not
+        # show up by grepping for driver names. Build the set; the marginal
+        # cost is seconds and it ends a class of failure that was found one
+        # binary per CI round.
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libcurl4-openssl-dev
@@ -135,6 +139,7 @@ jobs:
             build/conformance_catalog \
             build/conformance_store \
             build/conformance_sink \
+            build/conformance_spool \
             CURL_INCDIR=/usr/include/x86_64-linux-gnu \
             CURL_LIBDIR=/usr/lib/x86_64-linux-gnu
 
