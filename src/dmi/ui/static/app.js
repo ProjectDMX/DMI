@@ -39,7 +39,7 @@
   function cacheDom() {
     ["model-summary", "status", "architecture", "detail-title", "detail-body",
      "layer-start", "layer-end", "layer-rail", "layer-readout", "yaml-preview",
-     "issues", "issue-count", "toast", "file-input", "step-stride",
+     "issues", "issue-count", "toast", "auth-banner", "file-input", "step-stride",
      "request-stride", "capture-prefill", "capture-decode", "step-offset",
      "warmup-steps", "request-offset", "warmup-requests", "policy",
      "btn-open", "btn-save", "btn-copy",
@@ -85,6 +85,13 @@
   async function api(path, options) {
     var response = await fetch(path, options);
     var payload = await response.json().catch(function () { return {}; });
+    if (response.status === 401) {
+      // Token-gated (network) bind: the browser never carries the launch
+      // token, so every mutating request fails by design. Say so once,
+      // persistently, instead of painting the curl hint as a config error
+      // on every panel.
+      dom["auth-banner"].hidden = false;
+    }
     if (!response.ok) {
       throw new Error(payload.detail || payload.message || response.statusText);
     }
@@ -224,9 +231,16 @@
     var rail = document.createDocumentFragment();
     for (var i = 0; i < total; i += 1) {
       var tick = document.createElement("span");
-      tick.className = "tick" + (!range || (i >= range.start && i <= range.end) ? " is-on" : "");
+      var on = !range || (i >= range.start && i <= range.end);
+      tick.className = "tick" + (on ? " is-on" : "");
       tick.title = "Layer " + i;
       tick.dataset.layer = String(i);
+      // Same keyboard contract as the architecture nodes: a tick is a
+      // checkbox a keyboard user can operate, not a mouse-only span.
+      tick.setAttribute("role", "checkbox");
+      tick.setAttribute("tabindex", "0");
+      tick.setAttribute("aria-checked", on ? "true" : "false");
+      tick.setAttribute("aria-label", "Layer " + i);
       rail.append(tick);
     }
     dom["layer-rail"].replaceChildren(rail);
@@ -277,6 +291,7 @@
   function renderRingFit(fit) {
     if (!fit) {
       dom["ring-fill"].style.width = "0%";
+      dom["ring-meter"].setAttribute("aria-valuenow", "0");
       dom["ring-meter"].removeAttribute("data-tone");
       dom["ring-detail"].textContent = "—";
       dom["ring-detail"].removeAttribute("data-tone");
@@ -285,6 +300,7 @@
 
     var percent = Math.max(0, Math.min(100, fit.occupancy_percent));
     dom["ring-fill"].style.width = percent + "%";
+    dom["ring-meter"].setAttribute("aria-valuenow", String(Math.round(percent)));
     dom["ring-meter"].setAttribute(
       "aria-label",
       "Ring occupancy " + fit.occupancy_percent.toFixed(0) + " percent"
@@ -337,6 +353,7 @@
       frag.append(noteElement(message, "assumption"));
     });
     dom["est-notes"].replaceChildren(frag);
+    dom["est-notes"].removeAttribute("aria-busy");
   }
 
   function noteElement(message, kind) {
@@ -358,6 +375,7 @@
     dom["est-notes"].replaceChildren(
       noteElement(message, "warning")
     );
+    dom["est-notes"].removeAttribute("aria-busy");
   }
 
   function renderIssues(issues) {
@@ -479,6 +497,13 @@
 
   async function refreshEstimate() {
     var requestId = (estimateRequestId += 1);
+    // The estimate walks every rank and can take seconds; mark the panel
+    // loading so stale figures are never mistaken for fresh ones. Cleared
+    // on the guarded response below, whichever way it settles.
+    dom["est-notes"].replaceChildren(
+      noteElement("Estimating…", null)
+    );
+    dom["est-notes"].setAttribute("aria-busy", "true");
     try {
       var payload = await api("/api/estimate", {
         method: "POST",
@@ -624,19 +649,33 @@
     });
 
     // Click picks one layer; shift-click extends from the current start.
-    dom["layer-rail"].addEventListener("click", function (event) {
-      if (!uiReady) return;
-      var target = event.target.closest(".tick");
-      if (!target) return;
+    // Keyboard (Enter/Space) picks one layer, matching the architecture
+    // nodes' contract.
+    function pickLayerFromTick(target, extend) {
       var layer = parseInt(target.dataset.layer, 10);
       var current = state.observations.layers;
-      if (event.shiftKey && current) {
+      if (extend && current) {
         setLayers({
           start: Math.min(current.start, layer),
           end: Math.max(current.start, layer)
         });
       } else {
         setLayers({ start: layer, end: layer });
+      }
+    }
+    dom["layer-rail"].addEventListener("click", function (event) {
+      if (!uiReady) return;
+      var target = event.target.closest(".tick");
+      if (!target) return;
+      pickLayerFromTick(target, event.shiftKey);
+    });
+    dom["layer-rail"].addEventListener("keydown", function (event) {
+      if (!uiReady) return;
+      var target = event.target.closest(".tick");
+      if (!target) return;
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        pickLayerFromTick(target, event.shiftKey);
       }
     });
 
@@ -732,6 +771,11 @@
 
     dom["btn-save"].addEventListener("click", async function () {
       if (!uiReady) return;
+      // One save at a time: the disk write is atomic (last writer wins
+      // cleanly), but two concurrent toasts/status updates interleave and
+      // the user cannot tell which save landed. Re-armed in finally so a
+      // failed save never bricks the control.
+      dom["btn-save"].disabled = true;
       try {
         var payload = await api("/api/config/save", {
           method: "POST",
@@ -741,6 +785,8 @@
         toast("Saved to " + payload.path);
       } catch (error) {
         toast("Could not save: " + error.message);
+      } finally {
+        dom["btn-save"].disabled = false;
       }
     });
   }

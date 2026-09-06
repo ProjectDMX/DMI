@@ -231,3 +231,103 @@ def test_tabs_expose_selection_to_assistive_tech():
     from dmi.ui.app import STATIC_DIR as _STATIC_DIR
     markup = (Path(STATIC_DIR) / "index.html").read_text(encoding="utf-8")
     assert 'role="tabpanel"' in markup
+
+
+# ---------------------------------------------------------------------------
+# Frontend review round: save in-flight guard, tick keyboard path, estimate
+# loading state, status live region, meter value semantics, curl-only mode
+# banner. Same text-level mechanism convention as above: presence pins for
+# invariants whose behavior is verified in a real browser.
+# ---------------------------------------------------------------------------
+
+
+def _bind_actions_body():
+    return _plain_function_body(_app_js(), "bindActions")
+
+
+def test_save_disables_itself_while_the_request_is_in_flight():
+    """Two rapid Saves fire two concurrent writes; the disk survives (atomic
+    replace) but the toasts interleave. The button must go inert for the
+    round trip."""
+    body = _bind_actions_body()
+    save_slice = body[body.index('"btn-save"'):]
+
+    assert 'dom["btn-save"].disabled = true' in save_slice
+    assert 'dom["btn-save"].disabled = false' in save_slice, (
+        "the button must re-arm however the request settles, or one failed "
+        "save bricks the control for the session"
+    )
+
+
+def test_layer_ticks_are_keyboard_operable():
+    """The rail ticks are the only interactive elements without a keyboard
+    path (architecture nodes already have role/tabindex/keydown). A keyboard
+    user otherwise cannot select layers at all."""
+    source = _app_js()
+
+    assert 'setAttribute("role", "checkbox")' in source.replace(
+        "'checkbox'", '"checkbox"'
+    ), "ticks must expose checkbox semantics"
+    assert "aria-checked" in source, "ticks must report selection state"
+    assert re.search(r'tick\.setAttribute\("tabindex", "0"\)', source), (
+        "ticks must be focusable"
+    )
+    assert re.search(
+        r'layer-rail"\]\.addEventListener\("keydown"[\s\S]{0,600}?pickLayerFromTick',
+        source,
+    ), "ticks need a keydown path into the same layer-picking logic as click"
+    assert re.search(
+        r'layer-rail"\]\.addEventListener\("click"[\s\S]{0,600}?pickLayerFromTick',
+        source,
+    ), "click and keyboard must share one picking function, not two copies"
+
+
+def test_estimate_shows_a_loading_state_while_in_flight():
+    """refreshEstimate can take seconds (it walks every rank); the panel
+    must not sit on stale figures with no indication."""
+    body = _function_body(_app_js(), "refreshEstimate")
+
+    assert re.search(r"[Ll]oading|estimating|aria-busy", body), (
+        "refreshEstimate must mark the panel loading before the fetch and "
+        "clear it on the guarded response"
+    )
+
+
+def test_status_chip_is_a_live_region():
+    """'Valid / N issues / Error' updates are text-only; a screen reader
+    never hears them without a live region."""
+    markup = (Path(STATIC_DIR) / "index.html").read_text(encoding="utf-8")
+
+    assert re.search(
+        r'id="status"[^>]*aria-live="polite"', markup
+    ) or re.search(r'aria-live="polite"[^>]*id="status"', markup), (
+        "the status chip must announce its updates"
+    )
+
+
+def test_ring_meter_exposes_its_value():
+    """role=img with a rewritten label has no value semantics; a meter with
+    aria-valuenow does."""
+    markup = (Path(STATIC_DIR) / "index.html").read_text(encoding="utf-8")
+
+    assert 'role="meter"' in markup, "the occupancy meter needs meter semantics"
+    body = _app_js()
+    assert 'setAttribute("aria-valuenow"' in body, (
+        "the meter value must track the rendered fill"
+    )
+
+
+def test_curl_only_mode_has_a_banner():
+    """On a token-gated (network) bind every mutating request 401s by
+    design, and the panels currently render the curl hint as config errors.
+    A persistent banner must say the server is in curl-only mode."""
+    markup = (Path(STATIC_DIR) / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="auth-banner"' in markup
+    assert re.search(r'id="auth-banner"[^>]*hidden', markup), (
+        "the banner must start hidden on loopback binds"
+    )
+    body = _app_js()
+    assert re.search(r"401", body) and re.search(r"auth-banner", body), (
+        "a 401 response must reveal the banner"
+    )

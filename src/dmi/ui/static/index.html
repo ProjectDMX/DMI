@@ -8,13 +8,17 @@
 </head>
 <body>
 
+<p class="auth-banner" id="auth-banner" hidden>
+  This server requires a launch token for writes and runs in curl-only
+  mode here: send it as <code>X-DMI-Token</code> (printed at startup).
+</p>
 <header class="topbar">
   <div class="brand">
     <h1>DMI-configurator</h1>
     <p class="subtitle" id="model-summary">Loading model&hellip;</p>
   </div>
   <div class="topbar-actions">
-    <span class="status" id="status" data-state="pending">Checking&hellip;</span>
+    <span class="status" id="status" data-state="pending" aria-live="polite">Checking&hellip;</span>
     <button type="button" id="btn-open" class="btn">Open</button>
     <button type="button" id="btn-save" class="btn">Save</button>
     <button type="button" id="btn-copy" class="btn btn-primary">Copy YAML</button>
@@ -171,7 +175,7 @@
           <label>Pinned <input type="number" id="ring-pinned" min="0" step="1" value="4096"> MiB</label>
         </div>
       </div>
-      <div class="meter" id="ring-meter" role="img" aria-label="Ring occupancy">
+      <div class="meter" id="ring-meter" role="meter" aria-label="Ring occupancy" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
         <span class="meter-fill" id="ring-fill"></span>
       </div>
       <p class="ring-detail" id="ring-detail">&mdash;</p>
