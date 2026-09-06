@@ -32,6 +32,14 @@ jobs:
           # missing-driver skip is a mark, evaluated after the import), and
           # `--no-deps -e .` would otherwise leave them erroring here.
           python -m pip install "botocore>=1.34"
+          # boto3 too, and it is a DIFFERENT dependency: the uploader's
+          # head-to-head test drives the Python reference SpoolUploader,
+          # which imports boto3. That test skipped here until the compile
+          # step below started building the drivers its skipif looks for,
+          # so the gap only became visible once the test could run at all.
+          # Pinned to the range pyproject's `s3` extra declares; a pip line
+          # rather than the extra because `--no-deps -e .` installs none.
+          python -m pip install "boto3>=1.40,<2"
           python -m pip install --no-deps -e .
 
       - name: Compile every CPU-only native target
