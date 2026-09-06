@@ -225,7 +225,18 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       on the row BEYOND the page, and the base64url encoder emitted a
       phantom trailing byte in both remainder branches. 44/44 native
       catalog tests; CPU gate 1202 passed.
-- [ ] C2 hydration/summary/extensions native
+- [~] C2 hydration/summary/extensions native.
+      Scope (from reader.py, 445 lines): select (search → one bounded page
+      → CaptureSelection), estimate, hydrate (plan per pack with coalesced
+      ranges, footer-authoritative verification phase before any payload
+      fetch, byte/request budgets, per-descriptor verify_payload), summarize
+      (decode_tensor + core tensor stats; the ExtensionRegistry stays
+      Python-side — extensions are Python pluggables, the native leg covers
+      hydrate + core stats). Parity tests must pin: identical payload bytes
+      native vs Python hydrate, identical core summary numbers, budget
+      refusals both sides. Native pieces already in place: pack_index
+      (footer read + validation), S3Client GetRange, reader search/select
+      surface. NOT started.
 - [ ] C3 default-switch + final docs
 
 ## Checkpoints log
