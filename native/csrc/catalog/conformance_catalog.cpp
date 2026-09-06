@@ -85,6 +85,18 @@ std::string sql_string_or_null(const std::string& line, const char* key) {
   return render_sql_string(jc::FindString(line, key));
 }
 
+// The elements of a JSON array, with an EMPTY array yielding none.
+// SplitElements("") answers one empty element -- correct for splitting,
+// wrong for "was anything listed" -- so an empty filter list became a
+// filter on the empty string (matching nothing) rather than no filter at
+// all, where the Python query treats an empty tuple as absent.
+std::vector<std::string> read_array(const std::string& line,
+                                    const char* key) {
+  const std::string inside = jc::Unwrap(jc::FindArray(line, key));
+  if (inside.find_first_not_of(" \t\n") == std::string::npos) return {};
+  return jc::SplitElements(inside);
+}
+
 std::vector<PackIdentity> read_identities(const std::string& line,
                                           const char* key) {
   std::vector<PackIdentity> out;
@@ -445,264 +457,13 @@ std::string respond(const std::string& line, Session* session) {
         }
       }
       if (jc::HasKey(line, "hook_names") && !jc::FindNull(line, "hook_names")) {
-        for (const std::string& hook : jc::SplitElements(
-                 jc::Unwrap(jc::FindArray(line, "hook_names")))) {
+        for (const std::string& hook : read_array(line, "hook_names")) {
           filters.hook_names.push_back(jc::ParseLiteral(hook));
         }
       }
       if (jc::HasKey(line, "layer_numbers") &&
           !jc::FindNull(line, "layer_numbers")) {
-        for (const std::string& layer : jc::SplitElements(
-                 jc::Unwrap(jc::FindArray(line, "layer_numbers")))) {
-          filters.layer_numbers.push_back(
-              static_cast<int64_t>(std::atoll(layer.c_str())));
-        }
-      }
-      if (jc::HasKey(line, "captured_after_ns") &&
-          !jc::FindNull(line, "captured_after_ns")) {
-        filters.captured_after_ns = static_cast<uint64_t>(
-            jc::FindInt(line, "captured_after_ns"));
-      }
-      if (jc::HasKey(line, "captured_before_ns") &&
-          !jc::FindNull(line, "captured_before_ns")) {
-        filters.captured_before_ns = static_cast<uint64_t>(
-            jc::FindInt(line, "captured_before_ns"));
-      }
-      if (jc::HasKey(line, "cursor") && !jc::FindNull(line, "cursor")) {
-        filters.cursor = jc::FindString(line, "cursor");
-      }
-      filters.limit = static_cast<int>(jc::FindInt(line, "limit"));
-      const dmi_catalog::SearchPage page = reader.search(filters);
-      out = ",\"items\":[";
-      bool first_item = true;
-      for (const auto& item : page.items) {
-        if (!first_item) out += ",";
-        first_item = false;
-        out += "[";
-        bool first_field = true;
-        for (const auto& field : item) {
-          if (!first_field) out += ",";
-          first_field = false;
-          escape_into(field, &out);
-        }
-        out += "]";
-      }
-      out += "],\"next_cursor\":";
-      if (page.next_cursor.has_value()) {
-        escape_into(*page.next_cursor, &out);
-      } else {
-        out += "null";
-      }
-      out += ",\"watermark\":";
-      escape_into(page.watermark, &out);
-    } else if (op == "get_by_ids") {
-      dmi_catalog::ReaderConfig rc;
-      rc.database = session->database;
-      rc.table_prefix = session->table_prefix;
-      dmi_catalog::NativeCaptureCatalog reader(session->client, rc);
-      std::vector<std::string> capture_ids;
-      for (const std::string& id : jc::SplitElements(
-               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
-        capture_ids.push_back(jc::ParseLiteral(id));
-      }
-      const auto items = reader.get_by_ids(
-          capture_ids, jc::FindString(line, "tenant_id"),
-          jc::FindString(line, "watermark"));
-      out = ",\"items\":[";
-      bool first_item = true;
-      for (const auto& item : items) {
-        if (!first_item) out += ",";
-        first_item = false;
-        out += "[";
-        bool first_field = true;
-        for (const auto& field : item) {
-          if (!first_field) out += ",";
-          first_field = false;
-          escape_into(field, &out);
-        }
-        out += "]";
-      }
-      out += "]";
-    } else if (op == "verify_compatibility") {
-      dmi_catalog::CatalogSchema schema(session->client, session->database,
-                                        session->table_prefix);
-      out = ",\"state\":\"" + schema.verify_compatibility() + "\"";
-    } else if (op == "ensure_schema") {
-      uint64_t retry_sleep_ns = 500'000'000ull;
-      if (jc::HasKey(line, "retry_sleep_ns")) {
-        retry_sleep_ns = static_cast<uint64_t>(jc::FindInt(line, "retry_sleep_ns"));
-      }
-      dmi_catalog::CatalogSchema schema(session->client, session->database,
-                                        session->table_prefix);
-      schema.ensure(&writer.leases(), retry_sleep_ns);
-    } else if (op == "select") {
-      dmi_catalog::ReaderConfig rc;
-      rc.database = session->database;
-      rc.table_prefix = session->table_prefix;
-      dmi_store::S3Config s3_config;
-      s3_config.endpoint = jc::FindString(line, "endpoint");
-      s3_config.bucket = jc::FindString(line, "bucket");
-      s3_config.access_key = jc::FindString(line, "access");
-      s3_config.secret_key = jc::FindString(line, "secret");
-      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
-      dmi_store::S3Client s3(s3_config);
-      dmi_catalog::NativeCaptureReader reader(
-          &s3, s3_config.bucket, session->client, rc);
-      dmi_catalog::SearchFilters filters;
-      if (jc::HasKey(line, "tenant_id") && !jc::FindNull(line, "tenant_id")) {
-        filters.tenant_id = jc::FindString(line, "tenant_id");
-      }
-      filters.limit = static_cast<int>(jc::FindInt(line, "limit"));
-      const dmi_catalog::Selection selection = reader.select(filters);
-      out = ",\"selection\":{\"selection_id\":";
-      escape_into(selection.selection_id, &out);
-      out += ",\"capture_ids\":[";
-      for (size_t i = 0; i < selection.capture_ids.size(); ++i) {
-        if (i) out += ",";
-        escape_into(selection.capture_ids[i], &out);
-      }
-      out += "],\"catalog_watermark\":";
-      escape_into(selection.catalog_watermark, &out);
-      out += ",\"filter_hash\":";
-      escape_into(selection.filter_hash, &out);
-      out += ",\"tenant_id\":";
-      escape_into(selection.tenant_id, &out);
-      out += "}";
-    } else if (op == "hydrate") {
-      dmi_catalog::ReaderConfig rc;
-      rc.database = session->database;
-      rc.table_prefix = session->table_prefix;
-      dmi_store::S3Config s3_config;
-      s3_config.endpoint = jc::FindString(line, "endpoint");
-      s3_config.bucket = jc::FindString(line, "bucket");
-      s3_config.access_key = jc::FindString(line, "access");
-      s3_config.secret_key = jc::FindString(line, "secret");
-      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
-      dmi_store::S3Client s3(s3_config);
-      dmi_catalog::NativeCaptureReader reader(
-          &s3, s3_config.bucket, session->client, rc);
-      dmi_catalog::Selection selection;
-      selection.selection_id = jc::FindString(line, "selection_id");
-      for (const std::string& id : jc::SplitElements(
-               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
-        selection.capture_ids.push_back(jc::ParseLiteral(id));
-      }
-      selection.catalog_watermark = jc::FindString(line, "catalog_watermark");
-      selection.filter_hash = jc::FindString(line, "filter_hash");
-      selection.tenant_id = jc::FindString(line, "tenant_id");
-      const auto payloads = reader.hydrate(
-          selection, jc::FindInt(line, "byte_limit"),
-          jc::HasKey(line, "request_limit")
-              ? jc::FindInt(line, "request_limit")
-              : 1024);
-      out = ",\"payloads\":[";
-      for (size_t i = 0; i < payloads.size(); ++i) {
-        if (i) out += ",";
-        std::string encoded;
-        jc::EncodeBase64(
-            reinterpret_cast<const uint8_t*>(payloads[i].data()),
-            payloads[i].size(), &encoded);
-        out += "\"" + encoded + "\"";
-      }
-      out += "]";
-    } else if (op == "summarize_core") {
-      dmi_catalog::ReaderConfig rc;
-      rc.database = session->database;
-      rc.table_prefix = session->table_prefix;
-      dmi_store::S3Config s3_config;
-      s3_config.endpoint = jc::FindString(line, "endpoint");
-      s3_config.bucket = jc::FindString(line, "bucket");
-      s3_config.access_key = jc::FindString(line, "access");
-      s3_config.secret_key = jc::FindString(line, "secret");
-      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
-      dmi_store::S3Client s3(s3_config);
-      dmi_catalog::NativeCaptureReader reader(
-          &s3, s3_config.bucket, session->client, rc);
-      dmi_catalog::Selection selection;
-      selection.selection_id = jc::FindString(line, "selection_id");
-      for (const std::string& id : jc::SplitElements(
-               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
-        selection.capture_ids.push_back(jc::ParseLiteral(id));
-      }
-      selection.catalog_watermark = jc::FindString(line, "catalog_watermark");
-      selection.filter_hash = jc::FindString(line, "filter_hash");
-      selection.tenant_id = jc::FindString(line, "tenant_id");
-      const auto summaries = reader.summarize_core(
-          selection, jc::FindInt(line, "byte_limit"),
-          jc::HasKey(line, "request_limit")
-              ? jc::FindInt(line, "request_limit")
-              : 1024,
-          1000, 64'000'000ull);
-      out = ",\"summaries\":[";
-      for (size_t i = 0; i < summaries.size(); ++i) {
-        if (i) out += ",";
-        const auto& [capture_id, s] = summaries[i];
-        out += "{\"capture_id\":";
-        escape_into(capture_id, &out);
-        // %.17g round-trips a double exactly; std::to_string would truncate
-        // to six places and the parity comparison would fail on precision.
-        const auto real = [](double value) {
-          char buffer[40];
-          std::snprintf(buffer, sizeof(buffer), "%.17g", value);
-          return std::string(buffer);
-        };
-        out += ",\"summary_version\":" + std::to_string(s.summary_version) +
-               ",\"element_count\":" + std::to_string(s.element_count) +
-               ",\"finite_count\":" + std::to_string(s.finite_count) +
-               ",\"nan_count\":" + std::to_string(s.nan_count) +
-               ",\"inf_count\":" + std::to_string(s.inf_count) +
-               ",\"zero_fraction\":" + real(s.zero_fraction) +
-               ",\"mean\":" + real(s.mean) +
-               ",\"minimum\":" + real(s.minimum) +
-               ",\"maximum\":" + real(s.maximum) +
-               ",\"abs_max\":" + real(s.abs_max) +
-               ",\"l2_norm\":" + real(s.l2_norm) +
-               ",\"minimum_int\":" + std::to_string(s.minimum_int) +
-               ",\"maximum_int\":" + std::to_string(s.maximum_int) +
-               ",\"abs_max_int\":" + std::to_string(s.abs_max_int) + "}";
-      }
-      out += "]";
-    } else if (op == "current_watermark") {
-      dmi_catalog::NativeCaptureCatalog reader(session->client, [&] {
-        dmi_catalog::ReaderConfig rc;
-        rc.database = session->database;
-        rc.table_prefix = session->table_prefix;
-        return rc;
-      }());
-      out = ",\"watermark\":";
-      escape_into(reader.current_watermark(), &out);
-    } else if (op == "search") {
-      dmi_catalog::ReaderConfig rc;
-      rc.database = session->database;
-      rc.table_prefix = session->table_prefix;
-      dmi_catalog::NativeCaptureCatalog reader(session->client, rc);
-      dmi_catalog::SearchFilters filters;
-      for (const char* key : {"tenant_id", "experiment_id", "run_id",
-                              "session_id", "model_id"}) {
-        if (jc::HasKey(line, key) && !jc::FindNull(line, key)) {
-          if (key == std::string("tenant_id")) {
-            filters.tenant_id = jc::FindString(line, key);
-          } else if (key == std::string("experiment_id")) {
-            filters.experiment_id = jc::FindString(line, key);
-          } else if (key == std::string("run_id")) {
-            filters.run_id = jc::FindString(line, key);
-          } else if (key == std::string("session_id")) {
-            filters.session_id = jc::FindString(line, key);
-          } else if (key == std::string("model_id")) {
-            filters.model_id = jc::FindString(line, key);
-          }
-        }
-      }
-      if (jc::HasKey(line, "hook_names") && !jc::FindNull(line, "hook_names")) {
-        for (const std::string& hook : jc::SplitElements(
-                 jc::Unwrap(jc::FindArray(line, "hook_names")))) {
-          filters.hook_names.push_back(jc::ParseLiteral(hook));
-        }
-      }
-      if (jc::HasKey(line, "layer_numbers") &&
-          !jc::FindNull(line, "layer_numbers")) {
-        for (const std::string& layer : jc::SplitElements(
-                 jc::Unwrap(jc::FindArray(line, "layer_numbers")))) {
+        for (const std::string& layer : read_array(line, "layer_numbers")) {
           filters.layer_numbers.push_back(
               static_cast<int64_t>(std::atoll(layer.c_str())));
         }
@@ -780,6 +541,14 @@ std::string respond(const std::string& line, Session* session) {
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);
       out = ",\"state\":\"" + schema.verify_compatibility() + "\"";
+    } else if (op == "ensure_schema") {
+      uint64_t retry_sleep_ns = 500'000'000ull;
+      if (jc::HasKey(line, "retry_sleep_ns")) {
+        retry_sleep_ns = static_cast<uint64_t>(jc::FindInt(line, "retry_sleep_ns"));
+      }
+      dmi_catalog::CatalogSchema schema(session->client, session->database,
+                                        session->table_prefix);
+      schema.ensure(&writer.leases(), retry_sleep_ns);
     } else if (op == "drop_schema") {
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);

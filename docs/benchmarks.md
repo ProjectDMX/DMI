@@ -228,6 +228,20 @@ For local setup of this repo's native backend and ClickHouse sink, see
 [`huggingface.md`](huggingface.md) and [`vllm.md`](vllm.md).
 ## Native capture pipeline ledger
 
+### C3 — default switch (2026-09-06)
+
+`storage_backend="capture"` now defaults to the native pack writer, built
+from the config's `capture_sink_config`; an explicit `record_sink`
+overrides it (the reference sink is the documented rollback). Gates the
+flip rode on: Checkpoint A, Checkpoint B (human review of #127/#128),
+the quorum verifier against the C++ writer, the C1 read-parity suite,
+and the C2 hydration/summary parity — all green before the flip. The
+ClickHouse host record path (`storage_backend="native"`) and "auto" are
+untouched. Measured on this host earlier in the cycle, shared and NOT
+quiet: pipeline 0.50 GiB/s at N=1 (single-scope) to 0.56 at N=8 vs the
+0.212 fresh Python baseline, writer-only 0.60 vs 0.359 — re-measure on a
+quiet host before publishing numbers.
+
 Working ledger for the end-to-end native capture pipeline (branch
 `feat/native-capture-pipeline`, plan in `tasks/plan.md`). Every attempt — kept
 or reverted — is logged here so dead ideas stay dead. Baselines are medians of

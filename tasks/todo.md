@@ -247,9 +247,21 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       stats (%.17g emission; float64 accumulators, scale-before-square L2,
       raw-integer order stats). Budget refusals both sides. Extension
       registry stays Python-side by scope.
-- [ ] C3 default-switch + final docs
+- [x] C3 default-switch + final docs.
+      Evidence: `storage_backend="capture"` defaults to the native pack
+      writer from `capture_sink_config`; explicit record_sink overrides
+      (the reference sink is the documented rollback); the host record
+      path and "auto" untouched. test_engine_runtime_api 22/22 (the new
+      default test + the updated refusal test); CPU gate 1203 passed.
+      Ledger entry added to docs/benchmarks.md with the quiet-host
+      re-measure obligation restated.
 
 ## Checkpoints log
+
+- Checkpoint C / Phase C complete (2026-09-06): C1 read-parity, C2
+  hydration/summary parity, C3 default-switch. PR #129. The plan's end
+  state: the native capture path is the production writer; the Python
+  path is the conformance oracle and the documented rollback.
 
 - Checkpoint B (2026-09-06): PASS (human review of #127 + #128). Phase C
   authorized: C1 reader-native next.

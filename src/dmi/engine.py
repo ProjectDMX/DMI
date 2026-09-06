@@ -106,6 +106,13 @@ class MonitoringEngine:
             raise ValueError("Provide either host_engine or db_config, not both")
 
         self._storage_backend = getattr(config, "storage_backend", "auto")
+        self._capture_sink_config = getattr(config, "capture_sink_config", None)
+        if self._capture_sink_config is not None:
+            from .storage.capture.native_sink import NativeSinkConfig
+
+            if not isinstance(self._capture_sink_config, NativeSinkConfig):
+                raise TypeError(
+                    "config.capture_sink_config must be a NativeSinkConfig")
         host_configured = host_engine is not None or db_config is not None
         if self._storage_backend == "native" and not host_configured:
             raise ValueError(
@@ -229,8 +236,10 @@ class MonitoringEngine:
         if backend == "capture" and record_sink is None:
             raise ValueError(
                 "config.storage_backend='capture' selects the object-store "
-                "path, which is reached by passing its sink: "
-                "create_record_runtime(fmt, record_sink=reference.native_sink)"
+                "path, whose default writer is the native pack sink — pass "
+                "capture_sink_config=NativeSinkConfig(...) in the config, or "
+                "a record_sink explicitly (the reference sink is the "
+                "documented rollback)"
             )
         if backend in ("native", "none") and record_sink is not None:
             raise ValueError(
@@ -266,6 +275,21 @@ class MonitoringEngine:
         record_schema = record_format.schema
         if not isinstance(record_schema, RecordSchema):
             raise TypeError("record_format.schema must be a RecordSchema")
+
+        # D4's flip: the capture backend's default writer is the native
+        # pack sink, built from the config's bounds. An explicit
+        # record_sink overrides it — the reference sink is the documented
+        # rollback — and the ClickHouse host path is untouched.
+        if (
+            record_sink is None
+            and self._storage_backend == "capture"
+            and self._capture_sink_config is not None
+        ):
+            from .storage.capture.native_sink import create_native_pack_sink
+
+            record_sink = create_native_pack_sink(
+                self._capture_sink_config
+            ).native_sink
 
         _native_engine = _native_module()
         if record_sink is not None and not isinstance(

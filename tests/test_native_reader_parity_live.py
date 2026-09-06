@@ -323,6 +323,38 @@ def test_search_parity_with_filters():
             driver.close()
 
 
+def test_an_empty_filter_list_is_absent_rather_than_impossible():
+    """`hook_names: []` means "no hook filter", not "hook_name IN ('')".
+
+    An empty JSON array splits into ONE empty element, so the driver built
+    a filter matching the empty string -- nothing -- and an empty
+    layer_numbers filtered to layer 0 through atoll(""). Python treats an
+    empty filter tuple as absent, so a caller clearing a filter got every
+    row from one reader and none from the other.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            descriptors = _descriptor_dicts(4)
+            _publish_native(driver, prefix, descriptors, 7)
+
+            reader = _python_reader(client, config)
+            unfiltered = _python_page_items(reader)
+            assert len(unfiltered.items) == 4, unfiltered
+
+            for native_fields in ({"hook_names": []},
+                                  {"layer_numbers": []},
+                                  {"hook_names": [], "layer_numbers": []}):
+                native = driver.call(op="search", limit=100, **native_fields)
+                assert native["ok"], native
+                assert len(native["items"]) == 4, (native_fields, native)
+                assert _normalize(native["items"]) == _normalize(
+                    unfiltered.items), native_fields
+        finally:
+            driver.close()
+
+
 def test_cursor_parity_across_implementations():
     """A cursor either side issues, the other side accepts and walks."""
     with _catalog() as (client, config, prefix):

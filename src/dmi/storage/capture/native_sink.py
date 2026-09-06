@@ -6,11 +6,11 @@ envelope and exists to exercise the format end to end. This module selects
 the native writer instead: envelopes travel the ring's record worker
 straight into pack assembly with no Python on the capture path.
 
-Selection is explicit at the call site — pass ``handle.native_sink`` to
-``MonitoringEngine.create_record_runtime(record_sink=...)`` exactly as with
-the reference sink. Rolling back is the same call with the other sink; packs
-staged by either writer are readable by the same Python reader, which the
-rollback test pins.
+Selection defaults to this writer under ``storage_backend="capture"``
+(built from the config's ``capture_sink_config``), since Checkpoint B and
+C1/C2 passed. An explicit ``record_sink`` at the call site overrides it —
+pass the reference sink to roll back. Packs staged by either writer are
+readable by the same Python reader, which the rollback test pins.
 
 The extension (``native/build/_dmi_native_sink*.so``) loads lazily so that
 importing :mod:`dmi.storage.capture` never requires torch.
