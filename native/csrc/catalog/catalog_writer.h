@@ -10,9 +10,12 @@
 #ifndef DMI_CATALOG_CATALOG_WRITER_H
 #define DMI_CATALOG_CATALOG_WRITER_H
 
+#include <sys/types.h>
+
 #include <cstdint>
 #include <memory>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -45,17 +48,18 @@ class CatalogWriter {
   CatalogWriter(std::shared_ptr<const ClickHouseClient> client,
                 WriterConfig config);
 
-  // SINGLE-THREADED EMBEDDING ASSUMED, and this is a real limit rather
-  // than a restatement of the Python design. #125 gave the Python writer
-  // two client-side guarantees: publishes are serialised per writer
-  // (`_serial`), and the writer is bound to the process that built it
-  // (`_owned_by_this_process`, which refuses use from a forked child).
-  // Neither is reproduced here. The conformance driver executes ops one
-  // at a time in one process, so the shipped path is safe; a host that
-  // calls publish_snapshot from two threads, or across a fork, has
-  // NOTHING holding it back. Port the lock and the process guard before
-  // embedding this class anywhere that can do either -- see the #125
-  // concurrency trio deferred at Checkpoint B in tasks/todo.md.
+  // #125's two client-side guarantees, ported: publishes are serialised
+  // per writer, and a writer belongs to the process that built it. The
+  // fence is a per-STATEMENT property and does not exclude two publishes
+  // from ONE writer -- both renew the same lease, both pass the fence --
+  // so these live here rather than on the server. Every method below takes
+  // the process check FIRST and the lock second; see
+  // require_owned_by_this_process for why that order is load-bearing.
+  //
+  // One surface is deliberately outside the guarantee: `leases()` hands
+  // out the bare coordinator, and calls made through it bypass this lock.
+  // That exists so the B1 suite can drive the raw protocol; it is not the
+  // writer's guaranteed surface.
 
   void write_descriptors(const std::vector<std::string>& rendered_rows,
                          uint64_t index_version);
@@ -65,7 +69,7 @@ class CatalogWriter {
                     uint64_t index_version);
   PublisherLease acquire_lease(const std::string& holder);
   PublisherLease renew_lease();
-  void release_lease() { leases_->release(); }
+  void release_lease();
   const PublisherLease* held_lease() const { return leases_->lease(); }
   uint64_t allocate_version();
   uint64_t max_version(const std::string& table,
@@ -103,6 +107,13 @@ class CatalogWriter {
   LeaseCoordinator& leases() { return *leases_; }
 
  private:
+  // Refuses a call from any process but the one that constructed this
+  // writer. Called BEFORE serial_ is taken, never under it: a fork copies
+  // the mutex in whatever state it was in, so a fork taken while another
+  // thread was mid-publish hands the child a lock held by a thread that
+  // does not exist there. A check behind the lock would never run and the
+  // child would block on it forever instead of being refused.
+  void require_owned_by_this_process() const;
   // Clears a quarantine whose window has passed; returns whether one is
   // still in force. Every quarantine read goes through it.
   bool quarantine_in_force() const;
@@ -128,6 +139,13 @@ class CatalogWriter {
   // that answer never sees it recover.
   mutable bool quarantined_ = false;
   mutable uint64_t quarantine_until_ns_ = 0;
+  // Recursive, matching the RLock the Python writer uses: a guarded method
+  // may call another (publish renews, renew checks quarantine), and a
+  // plain mutex would deadlock on itself the first time it did.
+  mutable std::recursive_mutex serial_;
+  // The process that built this writer. The lease id, the connection and
+  // the quarantine state all belong to it.
+  pid_t owner_pid_;
 };
 
 }  // namespace dmi_catalog

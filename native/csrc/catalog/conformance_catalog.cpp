@@ -6,11 +6,16 @@
 // the writer's coordinator, so B1 tests exercise the bare protocol and
 // B2 tests the writer's quarantine-wrapped surface.
 
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../common/json.h"
@@ -640,6 +645,120 @@ std::string respond(const std::string& line, Session* session) {
           static_cast<uint64_t>(jc::FindInt(line, "wedge_ns")),
           takeover_after_renew, takeover_after_chunks,
           jc::FindBool(line, "inject_transport_error"));
+    } else if (op == "publish_concurrent") {
+      // #125, in the only shape that can test it: the driver runs one op at
+      // a time, so two publishes can only overlap if THIS process runs them
+      // on two threads. Each thread reports when it entered and left
+      // publish_snapshot, and the test reads the intervals -- serialised
+      // means they do not overlap, whatever the wedge asks for.
+      struct Attempt {
+        uint64_t started_ns = 0;
+        uint64_t finished_ns = 0;
+        bool ok = false;
+        std::string error;
+        std::string message;
+      };
+      const auto now_ns = [] {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+      };
+      const std::vector<PackIdentity> refs = read_identities(line, "refs");
+      const uint64_t rows =
+          static_cast<uint64_t>(jc::FindInt(line, "indexed_rows"));
+      const uint64_t packs =
+          static_cast<uint64_t>(jc::FindInt(line, "indexed_packs"));
+      const uint64_t wedge =
+          static_cast<uint64_t>(jc::FindInt(line, "wedge_ns"));
+      Attempt first, second;
+      const auto publish = [&](Attempt* attempt, uint64_t version,
+                               uint64_t wedge_ns) {
+        attempt->started_ns = now_ns();
+        try {
+          writer.publish_snapshot(version, refs, version, rows, packs,
+                                  wedge_ns);
+          attempt->ok = true;
+        } catch (const CatalogError& e) {
+          attempt->error = error_kind(e.kind());
+          attempt->message = e.what();
+        } catch (const std::exception& e) {
+          attempt->error = "DriverError";
+          attempt->message = e.what();
+        }
+        attempt->finished_ns = now_ns();
+      };
+      const uint64_t version_a =
+          static_cast<uint64_t>(jc::FindInt(line, "index_version_a"));
+      const uint64_t version_b =
+          static_cast<uint64_t>(jc::FindInt(line, "index_version_b"));
+      std::thread a(publish, &first, version_a, wedge);
+      // A short stagger so the wedged publish is demonstrably first; the
+      // point is whether the second WAITS, not who wins a start race.
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      std::thread b(publish, &second, version_b, 0ull);
+      a.join();
+      b.join();
+      const auto emit = [&](const char* name, const Attempt& attempt) {
+        std::string part = std::string(",\"") + name + "\":{\"ok\":" +
+                           (attempt.ok ? "true" : "false") +
+                           ",\"started_ns\":" +
+                           std::to_string(attempt.started_ns) +
+                           ",\"finished_ns\":" +
+                           std::to_string(attempt.finished_ns);
+        if (!attempt.ok) {
+          part += ",\"error\":\"" + attempt.error + "\",\"message\":";
+          std::string escaped;
+          escape_into(attempt.message, &escaped);
+          part += escaped;
+        }
+        return part + "}";
+      };
+      out = emit("first", first) + emit("second", second);
+    } else if (op == "publish_from_forked_child") {
+      // The other half of #125: a writer belongs to the process that built
+      // it. The child inherits the lease id and the socket, and the pid
+      // check must refuse it BEFORE any lock is taken -- a fork during a
+      // publish copies a held lock whose owner thread does not exist in the
+      // child, so a check behind the lock would hang there forever.
+      int fds[2];
+      if (pipe(fds) != 0) {
+        return prefix + "false,\"what\":\"pipe failed\"}";
+      }
+      const pid_t child = fork();
+      if (child == 0) {
+        close(fds[0]);
+        std::string report = "ok";
+        try {
+          writer.publish_snapshot(
+              static_cast<uint64_t>(jc::FindInt(line, "index_version")),
+              read_identities(line, "refs"),
+              static_cast<uint64_t>(jc::FindInt(line, "published_at_ns")),
+              static_cast<uint64_t>(jc::FindInt(line, "indexed_rows")),
+              static_cast<uint64_t>(jc::FindInt(line, "indexed_packs")));
+        } catch (const CatalogError& e) {
+          report = std::string(error_kind(e.kind())) + ":" + e.what();
+        } catch (const std::exception& e) {
+          report = std::string("DriverError:") + e.what();
+        }
+        const ssize_t written =
+            write(fds[1], report.data(), report.size());
+        (void)written;
+        close(fds[1]);
+        _exit(0);
+      }
+      close(fds[1]);
+      std::string report;
+      char buffer[4096];
+      ssize_t got;
+      while ((got = read(fds[0], buffer, sizeof(buffer))) > 0) {
+        report.append(buffer, static_cast<size_t>(got));
+      }
+      close(fds[0]);
+      int status = 0;
+      waitpid(child, &status, 0);
+      out = ",\"child\":";
+      escape_into(report, &out);
     } else if (op == "index") {
       // B3: read the packs through the store and run the indexer loop.
       dmi_store::S3Config s3_config;

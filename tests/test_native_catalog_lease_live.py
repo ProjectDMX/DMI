@@ -694,6 +694,129 @@ def test_a_takeover_between_the_two_publish_statements_leaves_orphan_rows():
             driver.close()
 
 
+# --- #125: the publish protocol's client-side half ---------------------------
+#
+# The fence is a per-STATEMENT guarantee. It does not exclude two publishes
+# issued by ONE writer, because both renew the same lease and both pass the
+# fence — the finding #125 was opened for. The writer closes that itself:
+# publishes are serialised per writer, and a writer belongs to the process
+# that built it. Ported here because the native writer is a library another
+# host embeds, where neither property comes for free.
+
+def test_two_concurrent_publishes_on_one_writer_are_serialised():
+    """One writer, two threads: the second must wait, not interleave.
+
+    Both publishes renew the same lease and both would pass the fence, so
+    nothing on the server separates them; what separates them is the
+    writer's own lock.
+
+    The evidence is the SECOND publish's elapsed time, not the two
+    intervals: a thread's clock starts when it begins waiting, so the
+    intervals overlap whether or not the lock works. What cannot happen
+    under a lock is the second publish finishing quickly — it starts 50ms
+    into a 400ms wedge, so it must spend the rest of that wedge blocked
+    before doing its own work, and it must finish after the first one.
+    Unserialised, its own statements take tens of milliseconds.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="writer")
+            first = driver.call(op="allocate_version")["version"]
+            second = driver.call(op="allocate_version")["version"]
+            assert second > first
+
+            result = driver.call(
+                op="publish_concurrent",
+                index_version_a=first, index_version_b=second,
+                refs=_refs_of(1), indexed_rows=1, indexed_packs=1,
+                wedge_ns=400_000_000)
+            assert result["ok"], result
+            a, b = result["first"], result["second"]
+
+            # The wedged publish really did hold the writer open...
+            assert a["finished_ns"] - a["started_ns"] >= 400_000_000, a
+            # ...the second could not finish before it did...
+            assert b["finished_ns"] >= a["finished_ns"], (a, b)
+            # ...and it spent that wait blocked rather than publishing:
+            # 300ms is well above its own work (tens of ms) and below the
+            # 350ms it waits when the lock holds, so the two outcomes are
+            # not close to each other.
+            assert b["finished_ns"] - b["started_ns"] >= 300_000_000, (a, b)
+        finally:
+            driver.close()
+
+
+def test_a_publish_that_fails_releases_the_writer_for_the_next_one():
+    """Serialisation must not become a deadlock on the failure path.
+
+    The lock has to be given back however the publish ends, or one lost
+    race takes the writer out of service for good.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="writer")
+            low = driver.call(op="allocate_version")["version"]
+            high = driver.call(op="allocate_version")["version"]
+
+            # Publish the higher version first, so the lower one loses.
+            assert driver.call(
+                op="publish_snapshot", index_version=high, refs=_refs_of(1),
+                published_at_ns=high, indexed_rows=1, indexed_packs=1)["ok"]
+            lost = driver.call(
+                op="publish_snapshot", index_version=low, refs=_refs_of(1),
+                published_at_ns=low, indexed_rows=1, indexed_packs=1)
+            assert not lost["ok"]
+            assert lost["error"] == "SnapshotPublishRaceError", lost
+
+            # The writer still works: a fresh version publishes.
+            after = driver.call(op="allocate_version")["version"]
+            assert driver.call(
+                op="publish_snapshot", index_version=after, refs=_refs_of(1),
+                published_at_ns=after, indexed_rows=1,
+                indexed_packs=1)["ok"]
+        finally:
+            driver.close()
+
+
+def test_a_writer_used_from_a_forked_child_refuses_to_publish():
+    """A writer, its socket and its lease belong to one process.
+
+    A forked child inherits the lease id byte for byte and would publish
+    under the parent's identity, on the parent's socket — two publishes
+    under one lease, which the fence does not exclude. The refusal has to
+    come from the pid check BEFORE the lock: a fork taken mid-publish
+    copies a held lock whose owner thread does not exist in the child, so
+    a check behind the lock would never run and the child would hang.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="writer")
+            version = driver.call(op="allocate_version")["version"]
+
+            result = driver.call(
+                op="publish_from_forked_child", index_version=version,
+                refs=_refs_of(1), published_at_ns=version,
+                indexed_rows=1, indexed_packs=1)
+            assert result["ok"], result
+            child = result["child"]
+            assert child.startswith("PublisherLeaseError:"), child
+            assert "process" in child, child
+
+            # And the parent's writer is untouched by the refusal.
+            assert driver.call(
+                op="publish_snapshot", index_version=version,
+                refs=_refs_of(1), published_at_ns=version, indexed_rows=1,
+                indexed_packs=1)["ok"]
+        finally:
+            driver.close()
+
+
 def test_an_outcome_unknown_failure_quarantines_the_writer():
     with _catalog(lease_ttl_ns=1_100_000_000,
                   publish_timeout_ns=1_000_000_000) as (client, config, prefix):
