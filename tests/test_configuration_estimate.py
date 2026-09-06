@@ -631,3 +631,62 @@ def test_packed_without_a_layer_range_carries_no_vllm_warning():
     )
 
     assert not any("vLLM" in w and "layer range" in w for w in estimate.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Workload.sliding_window: sliding-window attention caps the attended KV
+# range, so pattern/attn_scores are shaped against the window, not the full
+# context. Only those hooks consume kv_dim; everything else is unaffected.
+# ---------------------------------------------------------------------------
+
+
+def test_sliding_window_halves_prefill_attention():
+    full = estimate_config(
+        _config(["pattern"]), _descriptor(),
+        _workload(prompt_tokens=128, decode_tokens=0, packed=False),
+    )
+    windowed = estimate_config(
+        _config(["pattern"]), _descriptor(),
+        _workload(prompt_tokens=128, decode_tokens=0, packed=False,
+                  sliding_window=64),
+    )
+
+    # [HEADS, 128, 64] vs [HEADS, 128, 128], fp16, both 16-aligned.
+    assert windowed.peak_step_bytes * 2 == full.peak_step_bytes
+
+
+def test_sliding_window_must_be_a_positive_exact_integer():
+    for bad in (True, 1.5, 0, -64):
+        with pytest.raises(ValueError, match="sliding_window"):
+            _workload(sliding_window=bad)
+
+
+def test_window_at_or_above_context_changes_nothing():
+    full = estimate_config(
+        _config(["pattern"]), _descriptor(),
+        _workload(prompt_tokens=128, decode_tokens=32, packed=False),
+    )
+    windowed = estimate_config(
+        _config(["pattern"]), _descriptor(),
+        _workload(prompt_tokens=128, decode_tokens=32, packed=False,
+                  sliding_window=1024),
+    )
+
+    assert windowed.peak_step_bytes == full.peak_step_bytes
+    assert windowed.bytes_per_request == full.bytes_per_request
+
+
+def test_window_leaves_non_attention_hooks_untouched():
+    for hooks in (["q"], ["k"], ["v"], ["resid_pre"], ["token_ids"]):
+        full = estimate_config(
+            _config(hooks), _descriptor(),
+            _workload(prompt_tokens=128, decode_tokens=32, packed=False),
+        )
+        windowed = estimate_config(
+            _config(hooks), _descriptor(),
+            _workload(prompt_tokens=128, decode_tokens=32, packed=False,
+                      sliding_window=64),
+        )
+
+        assert windowed.peak_step_bytes == full.peak_step_bytes, hooks
+        assert windowed.bytes_per_request == full.bytes_per_request, hooks
