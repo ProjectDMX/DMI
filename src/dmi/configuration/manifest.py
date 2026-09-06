@@ -22,6 +22,7 @@ from .schema import (
     ModelIdentity,
     ModelTopology,
 )
+from .yaml import _reject_unknown, _write_text_atomic
 
 # Descriptor field -> ModelShapeConfig field. The two documents disagree on
 # naming by design: descriptors are authored from HF configs, DMI core is not.
@@ -46,21 +47,6 @@ _KNOWN_MODEL_FIELDS = ("id", "name", "architecture")
 _KNOWN_DESCRIPTOR_ROOT = ("schema_version", "model", "topology")
 
 
-def _reject_unknown(present, known, where: str) -> None:
-    """Refuse keys the descriptor grammar does not define, per section.
-
-    The same rule the config parser applies everywhere: a silently ignored
-    key is the worst outcome for an authored file. Non-string keys are
-    reported as their repr rather than crashing the join.
-    """
-    unknown = sorted(repr(key) for key in set(present) - set(known))
-    if unknown:
-        raise DescriptorError(
-            f"Unknown field(s) in {where}: {', '.join(unknown)}. "
-            f"Known fields: {', '.join(sorted(map(repr, known)))}."
-        )
-
-
 def _require_mapping(value: Any, where: str) -> dict:
     if value is None:
         raise DescriptorError(f"Descriptor is missing the {where!r} section.")
@@ -76,7 +62,8 @@ def parse_descriptor(data: Any) -> ModelDescriptor:
     """Build a ``ModelDescriptor`` from an already-parsed document."""
     document = _require_mapping(data, "descriptor")
 
-    _reject_unknown(document, _KNOWN_DESCRIPTOR_ROOT, "the descriptor")
+    _reject_unknown(document, _KNOWN_DESCRIPTOR_ROOT, "the descriptor",
+                      error=DescriptorError)
 
     version = document.get("schema_version", DESCRIPTOR_SCHEMA_VERSION)
     # Exact integer only, mirroring the config boundary: YAML `true` compares
@@ -94,7 +81,8 @@ def parse_descriptor(data: Any) -> ModelDescriptor:
         )
 
     model = _require_mapping(document.get("model"), "model")
-    _reject_unknown(model, _KNOWN_MODEL_FIELDS, "'model'")
+    _reject_unknown(model, _KNOWN_MODEL_FIELDS, "'model'",
+                      error=DescriptorError)
     for key in ("id", "name", "architecture"):
         if not model.get(key):
             raise DescriptorError(f"Descriptor field 'model.{key}' is required.")
@@ -114,7 +102,8 @@ def parse_descriptor(data: Any) -> ModelDescriptor:
             f"{', '.join(missing)}."
         )
 
-    _reject_unknown(topology, set(ModelTopology.__dataclass_fields__), "topology")
+    _reject_unknown(topology, set(ModelTopology.__dataclass_fields__), "topology",
+                      error=DescriptorError)
 
     try:
         parsed_topology = ModelTopology(**topology)
@@ -192,16 +181,12 @@ def save_descriptor(descriptor: ModelDescriptor, path: str | Path) -> None:
     on failure.
     """
     target = Path(path)
-    temp = target.with_name(target.name + ".tmp")
-    try:
-        temp.write_text(
-            yaml.safe_dump(descriptor_to_dict(descriptor), sort_keys=False),
-            encoding="utf-8",
-        )
-        os.replace(temp, target)
-    except OSError as exc:
-        temp.unlink(missing_ok=True)
-        raise DescriptorError(f"Cannot write descriptor {target}: {exc}") from exc
+    _write_text_atomic(
+        target,
+        yaml.safe_dump(descriptor_to_dict(descriptor), sort_keys=False),
+        "descriptor",
+        DescriptorError,
+    )
 
 
 def to_model_shape_config(

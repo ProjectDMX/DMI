@@ -131,19 +131,22 @@ _INT_SCHEDULE_FIELDS = (
 _BOOL_SCHEDULE_FIELDS = ("capture_prefill", "capture_decode")
 
 
-def _reject_unknown(present, known, where: str) -> None:
+def _reject_unknown(
+    present, known, where: str, *, error: type = ConfigurationError
+) -> None:
     """Refuse keys this build does not understand.
 
     Every section is strict, not just ``schedule``. A silently ignored key is
     the worst outcome for a configuration file: ``observations.layer`` (missing
     the plural) would parse as "no layer range" and capture every layer, which
     is a large, quiet payload increase from a file that still reads correctly.
+    Non-string keys are reported as their repr rather than crashing the join.
     """
-    unknown = sorted(set(present) - set(known))
+    unknown = sorted(repr(key) for key in set(present) - set(known))
     if unknown:
-        raise ConfigurationError(
+        raise error(
             f"Unknown field(s) in {where}: {', '.join(unknown)}. "
-            f"Known fields: {', '.join(sorted(known))}."
+            f"Known fields: {', '.join(sorted(map(repr, known)))}."
         )
 
 
@@ -386,25 +389,31 @@ def load_config(path: str | Path) -> DMIConfig:
     return parse_config(load_yaml_document(raw, f"Configuration {target}"))
 
 
-def save_config(config: DMIConfig, path: str | Path) -> None:
-    """Write a configuration to disk in canonical form.
-
-    Atomic: the payload is written to a sibling temp file and renamed, so a
-    mid-write failure (ENOSPC, permission) leaves the PREVIOUS configuration
-    on disk instead of a truncated file that reads as broken on the next
-    launch. Wraps ``OSError`` the way :func:`load_config` does: both halves
-    of this API report filesystem trouble as ``ConfigurationError``.
-    """
-    target = Path(path)
+def _write_text_atomic(
+    target: Path, text: str, what: str, error: type
+) -> None:
+    """Write ``text`` to ``target`` without ever truncating it on failure."""
     temp = target.with_name(target.name + ".tmp")
     try:
-        temp.write_text(dump_config(config), encoding="utf-8")
+        temp.write_text(text, encoding="utf-8")
         os.replace(temp, target)
     except OSError as exc:
         temp.unlink(missing_ok=True)
-        raise ConfigurationError(
-            f"Cannot write configuration {target}: {exc}"
-        ) from exc
+        raise error(f"Cannot write {what} {target}: {exc}") from exc
+
+
+def save_config(config: DMIConfig, path: str | Path) -> None:
+    """Write a configuration to disk in canonical form.
+
+    Atomic: a mid-write failure (ENOSPC, permission) leaves the PREVIOUS
+    configuration on disk instead of a truncated file that reads as broken
+    on the next launch. Wraps ``OSError`` the way :func:`load_config` does:
+    both halves of this API report filesystem trouble as
+    ``ConfigurationError``.
+    """
+    _write_text_atomic(
+        Path(path), dump_config(config), "configuration", ConfigurationError
+    )
 
 
 __all__ = [
