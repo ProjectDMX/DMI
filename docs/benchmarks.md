@@ -469,7 +469,7 @@ Host variance note: this is a shared box (48 users, load 18–27); expect
 | broadcast notify_all everywhere | flat-to-negative scaling | fixed | Per-worker + per-stage CVs; producer signals only the routed worker. ~180k thundering-herd wakeups per trial at N=8 were the inhibitor |
 | Raw FNV `% workers` routing | all 8 scopes on worker 0 (flat "scaling") | fixed | fmix64 finalizer; low bits of FNV are weak for similar inputs. Verified distribution in the ledger review, then in code |
 | Spool mutex across file writes | serialized all stagers on fsync | fixed | Lock covers accounting decisions only; byte reservation keeps max_bytes exact. Also fixed a double-count on the EEXIST race path |
-| CRC+memcpy fusion, metadata moves | writer 0.63 → est. ~0.9 | deferred | Would move 3 instances → 2 for the 1.1 GiB/s host, but no gate demands it yet — Checkpoint A decision |
+| CRC+memcpy fusion (crc-from-destination during copy) | 0.606 → 0.590 best-of-5, interleaved A/B | **reverted** | Measured 2026-09-06: the store→load dependency makes the CRC walk with the copy, while the separate pass already overlaps across records under OOO. The upper-bound arm (CRC stubbed out entirely) measured 0.686 (+13%), so the CRC+its second read IS worth ~13% — but fusion is the wrong shape. Follow-up candidate: a hardware-accelerated CRC (PCLMULQDQ for the 0xEDB88320 polynomial), which attacks the 13% directly. Interleaved 5×3 trials; correctness gates re-run (conformance 8/8) after the revert |
 
 ### A5b adapter + selection + Checkpoint A (2026-09-05)
 
