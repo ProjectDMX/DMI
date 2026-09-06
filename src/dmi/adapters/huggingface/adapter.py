@@ -556,6 +556,13 @@ class HuggingFaceAdapter(BackendAdapter):
             )
 
         for rid, token_range in zip(req_ids, token_ranges):
+            # The per-request capture index, recorded for every driven step
+            # INCLUDING schedule-refused ones: the driver gates plan/commit
+            # downstream of here and cannot un-record. Consumers must treat
+            # this as the attempted-traffic index, not the captured-traffic
+            # index -- a refused step's ranges describe tokens the ring never
+            # received. (Known ceiling: moving the recording below the gate
+            # would couple this adapter to the driver's refusal internals.)
             self.token_ranges_in_this_generate.setdefault(rid, []).append(
                 (int(token_range[0]), int(token_range[1]))
             )

@@ -331,7 +331,16 @@ def attach_config(adapter, model, config: DMIConfig) -> None:
 
 
 def _accepts_layers(adapter) -> bool:
-    """Can this adapter's ``attach_model`` take a ``layers`` keyword?"""
+    """Can this adapter's ``attach_model`` take a ``layers`` keyword?
+
+    Best-effort probe, and known as such: an adapter that accepts
+    ``**kwargs`` but never forwards ``layers`` passes this check while
+    silently dropping the range -- the one outcome the caller exists to
+    prevent. No signature probe can distinguish "forwards" from
+    "tolerates", so the backstop is the integration contract (the keyword
+    is part of the v1 API surface) plus the live-hook rejection at
+    compile time, not this predicate.
+    """
     import inspect
 
     try:
