@@ -105,17 +105,36 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "torch>=2.8,<3" --index-url https://download.pytorch.org/whl/cpu
           python -m pip install pytest wheel numpy "clickhouse-driver>=0.2.0"
+          # Same reason as the cpu job above, and it reaches this job through
+          # the ported catalog suite: it imports the fake-S3 fixture at MODULE
+          # level (a fixture imported inside a function does not register), and
+          # that module imports botocore at import time. Missing, it is not the
+          # S3-backed tests that skip -- collection of the whole module errors
+          # and the live job dies at exit code 2 with every other ported test
+          # uncollected.
+          python -m pip install "botocore>=1.34"
           python -m pip install --no-deps -e .
 
-      - name: Build the native catalog driver
+      - name: Build the native drivers the live suites drive
         # The ported lease/allocator suites drive the native coordinator
         # over ClickHouse's HTTP interface. The runner ships the runtime
         # libcurl.so.4 but not the dev headers; install those and build
         # against the system paths.
+        #
+        # The sink and store drivers are here because the ported catalog
+        # suite reaches them too: its indexer tests stage packs through the
+        # sink, upload them through the store driver to the in-process fake
+        # S3, and then index what came back. Built only conformance_catalog,
+        # those five tests do not skip -- they fail on a missing binary at
+        # Popen, which is how they would have failed the moment the
+        # botocore collection error above stopped hiding them.
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libcurl4-openssl-dev
-          make -C native build/conformance_catalog \
+          make -C native \
+            build/conformance_catalog \
+            build/conformance_store \
+            build/conformance_sink \
             CURL_INCDIR=/usr/include/x86_64-linux-gnu \
             CURL_LIBDIR=/usr/lib/x86_64-linux-gnu
 
