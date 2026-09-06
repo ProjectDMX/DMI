@@ -41,7 +41,7 @@ public:
     D2HWindowProgressKind d2h_window_progress_kind() const noexcept {
         return cfg_.recurring_d2h_windows.progress;
     }
-    void define_d2h_window_pattern(
+    bool define_d2h_window_pattern(
         uint64_t period,
         std::vector<D2HWindowOffset> windows,
         std::optional<uint64_t> initial_counter,

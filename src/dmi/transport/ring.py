@@ -422,15 +422,19 @@ class RingTransport:
         period: int,
         windows: Any,
         initial_counter: Optional[int] = None,
-    ) -> None:
-        """Install one recurring-window pattern on the record engine."""
+    ) -> bool:
+        """Return whether a recurring-window pattern was accepted."""
 
         if self._d2h_window_marker is None:
             raise RuntimeError("recurring D2H windows are not enabled")
-        self._ring_engine.define_d2h_window_pattern(
-            int(period), tuple(windows), initial_counter
+        accepted = bool(
+            self._ring_engine.define_d2h_window_pattern(
+                int(period), tuple(windows), initial_counter
+            )
         )
-        self._d2h_window_pattern_defined = True
+        if accepted:
+            self._d2h_window_pattern_defined = True
+        return accepted
 
     def advance_boundary(self) -> None:
         """Publish one ordered framework boundary."""

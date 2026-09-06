@@ -169,7 +169,7 @@ const RecordConsumer& RingEngine::record_consumer() const {
     return record_p2p_->consumer();
 }
 
-void RingEngine::define_d2h_window_pattern(
+bool RingEngine::define_d2h_window_pattern(
     uint64_t period,
     std::vector<D2HWindowOffset> windows,
     std::optional<uint64_t> initial_counter,
@@ -177,7 +177,7 @@ void RingEngine::define_d2h_window_pattern(
     if (!recurring_d2h_windows_) {
         throw std::logic_error("recurring D2H windows are not enabled");
     }
-    recurring_d2h_windows_->define_pattern(
+    return recurring_d2h_windows_->define_pattern(
         period,
         std::move(windows),
         initial_counter,

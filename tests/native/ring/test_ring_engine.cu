@@ -4,6 +4,7 @@
 #include "ring/d2h_window_marker.h"
 #include "ring/d2h_window_mode.h"
 #include "ring/d2h_window_progress.h"
+#include "ring/d2h_window_subsystem.h"
 #include "ring/pinned_staging.h"
 #include "ring/producer.cuh"
 #include "ring/recurring_d2h_grant_controller.h"
@@ -48,6 +49,15 @@ public:
     std::atomic<int> flushes{0};
     mutable std::atomic<int> failure_checks{0};
     Duration observed_timeout{0};
+};
+
+class UnusedDrainPause final : public ring::DrainPauseControl {
+public:
+    ring::DrainPauseToken pause_after_flush_and_wait() override {
+        return ring::DrainPauseToken{1};
+    }
+
+    void resume(ring::DrainPauseToken) override {}
 };
 
 // RingEnginePy's diagnostic hooks are irrelevant to this focused native
@@ -947,6 +957,93 @@ static void test_packed_progress_reset_marker_and_graph_replay() {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+static void test_multiple_pending_window_definitions() {
+    banner("multiple pending window definitions are queued");
+    ring_py::RingConfig cfg;
+    cfg.task_ring_entries = 16;
+    cfg.payload_ring_bytes = 4096;
+    cfg.pinned_staging_bytes = 4096;
+    cfg.drain_poll_timeout_us = 100;
+    cfg.recurring_d2h_windows.enabled = true;
+    cfg.recurring_d2h_windows.history_size = 2;
+    cfg.recurring_d2h_windows
+        .minimum_record_probe_retry_interval_occurrences = 1;
+    cfg.recurring_d2h_windows.capacity_flush_fallback_threshold = 2;
+
+    ring_py::RingEnginePy engine(cfg, std::shared_ptr<ring::RecordSink>{});
+    engine.init();
+    engine.start();
+
+    bool threw = false;
+    bool accepted_first = false;
+    bool accepted_second = false;
+    try {
+        accepted_first = engine.define_d2h_window_pattern(4, {{1, 3}}, 0);
+        accepted_second = engine.define_d2h_window_pattern(6, {{1, 4}}, 0);
+    } catch (...) {
+        threw = true;
+    }
+    EXPECT(!threw);
+    EXPECT(accepted_first);
+    EXPECT(accepted_second);
+
+    CUDA_CHECK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream().stream()));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (engine.d2h_window_runtime_snapshot().mode !=
+               ring::D2HWindowMode::ENABLED_ACTIVE &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT(engine.d2h_window_runtime_snapshot().mode ==
+           ring::D2HWindowMode::ENABLED_ACTIVE);
+
+    const at::Tensor progress = engine.d2h_window_cpu_visible_progress_tensor();
+    ring::D2HWindowPackedProgressLayout::Word packed = 0;
+    CUDA_CHECK(cudaMemcpy(
+        &packed,
+        progress.data_ptr<int64_t>(),
+        sizeof(packed),
+        cudaMemcpyDeviceToHost));
+    EXPECT(ring::D2HWindowPackedProgressLayout::version(packed) == 2);
+    EXPECT(ring::D2HWindowPackedProgressLayout::counter(packed) == 0);
+    engine.stop();
+}
+
+static void test_terminal_fallback_definition_returns_false() {
+    banner("terminal fallback ignores later pattern definitions");
+    int device = -1;
+    CUDA_CHECK(cudaGetDevice(&device));
+    ring::RecurringD2HWindowConfig cfg;
+    cfg.enabled = true;
+    cfg.history_size = 2;
+    cfg.minimum_record_probe_retry_interval_occurrences = 1;
+    cfg.capacity_flush_fallback_threshold = 1;
+    ring::RecurringD2HWindowSubsystem subsystem(cfg, device);
+    UnusedDrainPause drain_pause;
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    EXPECT(subsystem.define_pattern(4, {{1, 3}}, 0, stream, drain_pause));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    subsystem.grant_controller().reconcile_progress();
+    EXPECT(subsystem.snapshot().mode == ring::D2HWindowMode::ENABLED_ACTIVE);
+
+    subsystem.record_capacity_forced_flush();
+    EXPECT(subsystem.snapshot().mode == ring::D2HWindowMode::ENABLED_FALLBACK);
+
+    bool threw = false;
+    bool accepted = true;
+    try {
+        accepted = subsystem.define_pattern(6, {{1, 4}}, 0, stream, drain_pause);
+    } catch (...) {
+        threw = true;
+    }
+    EXPECT(!threw);
+    EXPECT(!accepted);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
 static void test_legacy_engine_rejects_recurring_window_configuration() {
     banner("legacy engine rejects recurring-window configuration");
     ring_py::RingConfig cfg;
@@ -988,6 +1085,8 @@ int main() {
     test_window_admission_rounds_to_complete_record_prefix();
     test_generic_pause_blocks_decisions_until_matching_resume();
     test_packed_progress_reset_marker_and_graph_replay();
+    test_multiple_pending_window_definitions();
+    test_terminal_fallback_definition_returns_false();
     test_legacy_engine_rejects_recurring_window_configuration();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);

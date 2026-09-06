@@ -221,7 +221,7 @@ public:
     // ensure FIFO ordering before consuming the next meta out-of-band.
     void flush_and_wait();
 
-    void define_d2h_window_pattern(
+    bool define_d2h_window_pattern(
         uint64_t period,
         std::vector<ring::D2HWindowOffset> windows,
         std::optional<uint64_t> initial_counter = std::nullopt);

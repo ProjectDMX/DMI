@@ -21,7 +21,7 @@ class RecurringD2HWindowSubsystem {
   public:
     RecurringD2HWindowSubsystem(RecurringD2HWindowConfig config, int owner_device);
 
-    void define_pattern(uint64_t period, std::vector<D2HWindowOffset> windows,
+    bool define_pattern(uint64_t period, std::vector<D2HWindowOffset> windows,
                         std::optional<uint64_t> initial_counter,
                         cudaStream_t framework_stream, DrainPauseControl& drain_pause);
 
@@ -40,7 +40,7 @@ class RecurringD2HWindowSubsystem {
                                         const std::vector<D2HWindowOffset>& windows,
                                         uint64_t initial_counter,
                                         cudaStream_t framework_stream);
-    void define_after_version_exhaustion(uint64_t period,
+    bool define_after_version_exhaustion(uint64_t period,
                                          const std::vector<D2HWindowOffset>& windows,
                                          uint64_t initial_counter,
                                          cudaStream_t framework_stream,

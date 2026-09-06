@@ -41,6 +41,16 @@ template <typename Fn> void expect_invalid(Fn&& fn) {
     EXPECT(rejected);
 }
 
+template <typename Fn> void expect_logic(Fn&& fn) {
+    bool rejected = false;
+    try {
+        fn();
+    } catch (const std::logic_error&) {
+        rejected = true;
+    }
+    EXPECT(rejected);
+}
+
 ring::D2HWindowAvailability available(uint64_t full, std::optional<uint64_t> first) {
     return ring::D2HWindowAvailability{full, first};
 }
@@ -281,6 +291,125 @@ void test_grant_controller() {
     EXPECT(logs[2]->attempts.empty());
 }
 
+void test_pending_pattern_queue_promotes_versions_in_order() {
+    FakeProgress progress;
+    ring::D2HWindowModeController mode(3);
+    std::vector<std::shared_ptr<PolicyLog>> logs;
+    auto factory = [&logs]() -> std::unique_ptr<ring::D2HWindowGrantPolicy> {
+        auto log = std::make_shared<PolicyLog>();
+        logs.push_back(log);
+        return std::make_unique<TrackingPolicy>(std::move(log));
+    };
+    ring::RecurringD2HGrantController controller(progress, mode, factory, nullptr);
+
+    controller.install_pending(1, 4, {{1, 3}});
+    controller.install_pending(2, 6, {{1, 4}});
+    controller.install_pending(3, 8, {{1, 5}});
+    EXPECT(logs.size() == 3);
+
+    progress.snapshot = {1, 1};
+    controller.reconcile_progress();
+    auto admission = controller.consider(available(64, 32));
+    EXPECT(admission.has_value() && admission->version == 1);
+
+    progress.snapshot = {2, 1};
+    controller.reconcile_progress();
+    admission = controller.consider(available(64, 32));
+    EXPECT(admission.has_value() && admission->version == 2);
+
+    progress.snapshot = {3, 1};
+    controller.reconcile_progress();
+    admission = controller.consider(available(64, 32));
+    EXPECT(admission.has_value() && admission->version == 3);
+}
+
+void test_pending_pattern_queue_skips_obsolete_versions() {
+    FakeProgress progress;
+    ring::D2HWindowModeController mode(3);
+    std::vector<std::shared_ptr<PolicyLog>> logs;
+    auto factory = [&logs]() -> std::unique_ptr<ring::D2HWindowGrantPolicy> {
+        auto log = std::make_shared<PolicyLog>();
+        logs.push_back(log);
+        return std::make_unique<TrackingPolicy>(std::move(log));
+    };
+    ring::RecurringD2HGrantController controller(progress, mode, factory, nullptr);
+
+    controller.install_pending(1, 4, {{1, 3}});
+    controller.install_pending(2, 6, {{1, 4}});
+    controller.install_pending(3, 8, {{1, 5}});
+
+    progress.snapshot = {2, 1};
+    controller.reconcile_progress();
+    auto admission = controller.consider(available(64, 32));
+    EXPECT(admission.has_value() && admission->version == 2);
+
+    progress.snapshot = {3, 1};
+    controller.reconcile_progress();
+    admission = controller.consider(available(64, 32));
+    EXPECT(admission.has_value() && admission->version == 3);
+
+    progress.snapshot = {1, 1};
+    controller.reconcile_progress();
+    EXPECT(!controller.consider(available(64, 32)).has_value());
+}
+
+void test_pending_pattern_queue_enforces_epochs_and_clears() {
+    FakeProgress progress;
+    ring::D2HWindowModeController mode(3);
+    auto factory = []() -> std::unique_ptr<ring::D2HWindowGrantPolicy> {
+        return std::make_unique<TrackingPolicy>(std::make_shared<PolicyLog>());
+    };
+    ring::RecurringD2HGrantController controller(progress, mode, factory, nullptr);
+
+    controller.install_pending(2, 4, {{1, 3}});
+    expect_logic([&] { controller.install_pending(2, 4, {{1, 3}}); });
+    expect_logic([&] { controller.install_pending(1, 4, {{1, 3}}); });
+
+    progress.snapshot = {2, 1};
+    controller.reconcile_progress();
+    controller.install_pending(3, 4, {{1, 3}});
+    controller.install_pending(4, 4, {{1, 3}});
+    controller.cancel_pending_for_fallback();
+    progress.snapshot = {3, 1};
+    controller.reconcile_progress();
+    EXPECT(!controller.consider(available(64, 32)).has_value());
+
+    controller.reset_for_version_reuse();
+    controller.install_pending(1, 4, {{1, 3}});
+    progress.snapshot = {1, 1};
+    controller.reconcile_progress();
+    auto admission = controller.consider(available(64, 32));
+    EXPECT(admission.has_value() && admission->version == 1);
+}
+
+void test_pending_pattern_queue_cancels_only_the_requested_version() {
+    FakeProgress progress;
+    ring::D2HWindowModeController mode(3);
+    auto factory = []() -> std::unique_ptr<ring::D2HWindowGrantPolicy> {
+        return std::make_unique<TrackingPolicy>(std::make_shared<PolicyLog>());
+    };
+    ring::RecurringD2HGrantController controller(progress, mode, factory, nullptr);
+
+    controller.install_pending(1, 4, {{1, 3}});
+    controller.install_pending(2, 4, {{1, 3}});
+    controller.install_pending(3, 4, {{1, 3}});
+    controller.cancel_pending(2);
+
+    progress.snapshot = {1, 1};
+    controller.reconcile_progress();
+    auto admission = controller.consider(available(64, 32));
+    EXPECT(admission.has_value() && admission->version == 1);
+
+    progress.snapshot = {2, 1};
+    controller.reconcile_progress();
+    EXPECT(!controller.consider(available(64, 32)).has_value());
+
+    progress.snapshot = {3, 1};
+    controller.reconcile_progress();
+    admission = controller.consider(available(64, 32));
+    EXPECT(admission.has_value() && admission->version == 3);
+}
+
 }  // namespace
 
 int main() {
@@ -290,6 +419,10 @@ int main() {
     test_minimum_record_probes();
     test_runtime_modes();
     test_grant_controller();
+    test_pending_pattern_queue_promotes_versions_in_order();
+    test_pending_pattern_queue_skips_obsolete_versions();
+    test_pending_pattern_queue_enforces_epochs_and_clears();
+    test_pending_pattern_queue_cancels_only_the_requested_version();
     std::printf("Results: %d passed, %d failed\n", passed, failed);
     return failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

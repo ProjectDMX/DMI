@@ -814,7 +814,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                offsets.push_back({window.first, window.second});
              }
              py::gil_scoped_release release;
-             self.define_d2h_window_pattern(
+             return self.define_d2h_window_pattern(
                  period, std::move(offsets), initial_counter);
            },
            py::arg("period"),

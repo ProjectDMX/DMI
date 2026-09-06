@@ -255,10 +255,10 @@ class RecordRuntime(Generic[MetadataT]):
         period: int,
         windows: Sequence[tuple[int, int]],
         initial_counter: int | None = None,
-    ) -> None:
-        """Define a recurring contention-friendly D2H pattern."""
+    ) -> bool:
+        """Return whether a recurring contention-friendly pattern was accepted."""
 
-        self._transport.define_d2h_window_pattern(
+        return self._transport.define_d2h_window_pattern(
             period=period,
             windows=windows,
             initial_counter=initial_counter,

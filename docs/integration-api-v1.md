@@ -388,7 +388,7 @@ engine = dmi.MonitoringEngine(
 )
 runtime = engine.create_record_runtime(record_format)
 
-runtime.define_d2h_window_pattern(
+accepted = runtime.define_d2h_window_pattern(
     period=100,
     windows=[(20, 30), (70, 80)],
 )
@@ -403,6 +403,9 @@ be nonempty, sorted, non-overlapping half-open ranges satisfying
 provided when defining a new pattern version. Pattern definition and every
 `advance_boundary()` call must use the same ordered framework CUDA stream.
 Define a pattern before the first boundary call and before CUDA Graph capture.
+The definition returns `True` when the pattern is queued. It returns `False`
+without reactivating window scheduling when the engine has already entered
+terminal fallback. Invalid arguments and CUDA/runtime failures still raise.
 
 The drain learns a transferable byte grant independently for each recurring
 window. While the feature is active, ordinary batch thresholds and timeout

@@ -656,12 +656,12 @@ void RingEnginePy::flush_and_wait() {
     impl_->engine.drain_thread().force_flush_and_wait();
 }
 
-void RingEnginePy::define_d2h_window_pattern(
+bool RingEnginePy::define_d2h_window_pattern(
     uint64_t period,
     std::vector<ring::D2HWindowOffset> windows,
     std::optional<uint64_t> initial_counter) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    impl_->engine.define_d2h_window_pattern(
+    return impl_->engine.define_d2h_window_pattern(
         period, std::move(windows), initial_counter, stream);
 }
 

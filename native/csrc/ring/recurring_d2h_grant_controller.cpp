@@ -43,35 +43,40 @@ void RecurringD2HGrantController::install_pending(
     const std::vector<D2HWindowOffset>& windows) {
     auto bundle = make_bundle(version, period, windows);
     std::lock_guard<std::mutex> lock(bundle_control_mu_);
-    if (pending_bundle_) {
-        throw std::logic_error("a D2H window pattern version is already pending");
+    if (!pending_bundles_.empty() &&
+        version <= pending_bundles_.back()->version) {
+        throw std::logic_error(
+            "pending D2H window pattern versions must increase monotonically");
     }
-    pending_bundle_ = std::move(bundle);
-}
-
-bool RecurringD2HGrantController::has_pending() const {
-    std::lock_guard<std::mutex> lock(bundle_control_mu_);
-    return static_cast<bool>(pending_bundle_);
+    if (pending_bundles_.empty() && current_bundle_ &&
+        version <= current_bundle_->version) {
+        throw std::logic_error(
+            "pending D2H window pattern version must exceed the current version");
+    }
+    pending_bundles_.push_back(std::move(bundle));
 }
 
 void RecurringD2HGrantController::cancel_pending(
     D2HWindowPackedProgressLayout::Version version) noexcept {
     std::lock_guard<std::mutex> lock(bundle_control_mu_);
-    if (pending_bundle_ && pending_bundle_->version == version) {
-        pending_bundle_.reset();
+    for (auto it = pending_bundles_.begin(); it != pending_bundles_.end(); ++it) {
+        if ((*it)->version == version) {
+            pending_bundles_.erase(it);
+            return;
+        }
     }
 }
 
 void RecurringD2HGrantController::reset_for_version_reuse() {
     std::lock_guard<std::mutex> lock(bundle_control_mu_);
     current_bundle_.reset();
-    pending_bundle_.reset();
+    pending_bundles_.clear();
     cached_progress_.reset();
 }
 
 void RecurringD2HGrantController::cancel_pending_for_fallback() noexcept {
     std::lock_guard<std::mutex> lock(bundle_control_mu_);
-    pending_bundle_.reset();
+    pending_bundles_.clear();
 }
 
 void RecurringD2HGrantController::reconcile_progress() {
@@ -87,8 +92,17 @@ void RecurringD2HGrantController::reconcile_progress() {
         cached_progress_ = observed;
         return;
     }
-    if (pending_bundle_ && observed.version == pending_bundle_->version) {
-        current_bundle_ = std::move(pending_bundle_);
+    size_t matching_index = 0;
+    while (matching_index < pending_bundles_.size() &&
+           pending_bundles_[matching_index]->version != observed.version) {
+        ++matching_index;
+    }
+    if (matching_index < pending_bundles_.size()) {
+        for (size_t index = 0; index < matching_index; ++index) {
+            pending_bundles_.pop_front();
+        }
+        current_bundle_ = std::move(pending_bundles_.front());
+        pending_bundles_.pop_front();
         cached_progress_ = observed;
         mode_.record_pattern_version_activation();
         std::fprintf(stderr, "[d2h_window] active version=%u\n",

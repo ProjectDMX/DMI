@@ -7,6 +7,7 @@
 #include "d2h_window_progress.h"
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -46,7 +47,6 @@ class RecurringD2HGrantController final : public D2HGrantController {
 
     void install_pending(D2HWindowPackedProgressLayout::Version version,
                          uint64_t period, const std::vector<D2HWindowOffset>& windows);
-    bool has_pending() const;
     void cancel_pending(D2HWindowPackedProgressLayout::Version version) noexcept;
     void reset_for_version_reuse();
     void cancel_pending_for_fallback() noexcept;
@@ -80,7 +80,8 @@ class RecurringD2HGrantController final : public D2HGrantController {
 
     mutable std::mutex bundle_control_mu_;
     std::unique_ptr<VersionBundle> current_bundle_;
-    std::unique_ptr<VersionBundle> pending_bundle_;
+    // Strictly increasing within one version epoch.
+    std::deque<std::unique_ptr<VersionBundle>> pending_bundles_;
     std::optional<D2HWindowProgressSnapshot> cached_progress_;
 };
 

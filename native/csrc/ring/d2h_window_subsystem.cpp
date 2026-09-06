@@ -80,7 +80,7 @@ void RecurringD2HWindowSubsystem::define_with_new_version_locked(
     last_allocated_version_ = version;
 }
 
-void RecurringD2HWindowSubsystem::define_pattern(
+bool RecurringD2HWindowSubsystem::define_pattern(
     uint64_t period, std::vector<D2HWindowOffset> windows,
     std::optional<uint64_t> initial_counter, cudaStream_t framework_stream,
     DrainPauseControl& drain_pause) {
@@ -96,27 +96,23 @@ void RecurringD2HWindowSubsystem::define_pattern(
         throw std::logic_error("D2H window version reuse is already in progress");
     }
     if (mode_controller_->mode() == D2HWindowMode::ENABLED_FALLBACK) {
-        throw std::logic_error(
-            "D2H window pattern cannot be defined after terminal fallback");
-    }
-    if (grant_controller_->has_pending()) {
-        throw std::logic_error("a D2H window pattern version is already pending");
+        return false;
     }
     if (last_allocated_version_ < D2HWindowPackedProgressLayout::kMaxPatternVersion) {
         const auto version = static_cast<D2HWindowPackedProgressLayout::Version>(
             last_allocated_version_ + 1);
         define_with_new_version_locked(version, period, windows, counter,
                                        framework_stream);
-        return;
+        return true;
     }
 
     version_reuse_in_progress_ = true;
     lock.unlock();
-    define_after_version_exhaustion(period, windows, counter, framework_stream,
-                                    drain_pause);
+    return define_after_version_exhaustion(
+        period, windows, counter, framework_stream, drain_pause);
 }
 
-void RecurringD2HWindowSubsystem::define_after_version_exhaustion(
+bool RecurringD2HWindowSubsystem::define_after_version_exhaustion(
     uint64_t period, const std::vector<D2HWindowOffset>& windows,
     uint64_t initial_counter, cudaStream_t framework_stream,
     DrainPauseControl& drain_pause) {
@@ -132,8 +128,7 @@ void RecurringD2HWindowSubsystem::define_after_version_exhaustion(
             lock.unlock();
             drain_pause.resume(*pause_token);
             pause_token.reset();
-            throw std::logic_error(
-                "D2H window version reuse lost to terminal fallback");
+            return false;
         }
 
         grant_controller_->reset_for_version_reuse();
@@ -148,6 +143,7 @@ void RecurringD2HWindowSubsystem::define_after_version_exhaustion(
         lock.unlock();
         drain_pause.resume(*pause_token);
         pause_token.reset();
+        return true;
     } catch (...) {
         {
             std::lock_guard<std::mutex> lock(control_mu_);
