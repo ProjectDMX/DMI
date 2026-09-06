@@ -70,9 +70,14 @@ def _verify_signature(handler, body: bytes) -> bool:
     Mirrors S3 verification: only the headers named in the request's own
     SignedHeaders list enter the rebuilt canonical request. libcurl adds
     unsigned headers (Accept, Content-Length) that must not participate.
+    The path is percent-DECODED once first, exactly like S3: the client
+    wires the encoded form (tenant%3Dt) and S3 verifies against the key
+    (tenant=t). Feeding the encoded path to botocore would double-encode
+    (%25) and reject every key carrying a reserved character.
     """
     import datetime as datetime_module
     import re
+    from urllib.parse import unquote, urlsplit
 
     received_auth = handler.headers.get("Authorization", "")
     signed = re.search(r"SignedHeaders=([^,]+)", received_auth)
@@ -86,7 +91,11 @@ def _verify_signature(handler, body: bytes) -> bool:
         return False
     headers = {k.lower(): v for k, v in handler.headers.items()
                if k.lower() in wanted}
-    url = f"http://{handler.headers.get('Host', 'localhost')}{handler.path}"
+    parts = urlsplit(handler.path)
+    decoded = unquote(parts.path)
+    url = f"http://{handler.headers.get('Host', 'localhost')}{decoded}"
+    if parts.query:
+        url += "?" + parts.query
     credentials = botocore.credentials.Credentials(ACCESS, SECRET, None)
     auth = botocore.auth.SigV4Auth(credentials, "s3", REGION)
     request = botocore.awsrequest.AWSRequest(
@@ -136,6 +145,10 @@ class FakeS3Handler(BaseHTTPRequestHandler):
         from urllib.parse import unquote
 
         parts = urlsplit(self.path)
+        # Decode %XX once for routing/storage, exactly like S3: the client
+        # wires the encoded form and S3 routes on the key. (unquote, never
+        # unquote_plus: '+' in a path is a literal plus, not a space.)
+        path = unquote(parts.path)
         query = {}
         for part in parts.query.split("&"):
             if not part:
@@ -144,20 +157,28 @@ class FakeS3Handler(BaseHTTPRequestHandler):
             # S3 query values arrive percent-encoded (prefix=v1%2F); the
             # server must decode before comparing, exactly like S3 does.
             query[unquote(name)] = unquote(value)
-        return parts.path, query
+        return path, query
 
     def _maybe_fault(self, key: str):
-        """Returns a (status, body) override, or None for normal handling."""
+        """Returns a (status, body) override, or None for normal handling.
+
+        Fault keys match by segment: any key under fault/<name>/ behaves the
+        same, so spool-layout keys (which must end in <pack_id>.dmi-pack)
+        can trigger faults too.
+        """
+        def under(name: str) -> bool:
+            return key == name or key.startswith(name + "/")
+
         with STATE.lock:
             n = STATE.fault_counts.get(key, 0)
             STATE.fault_counts[key] = n + 1
-        if key == "fault/once-500" and n == 0:
+        if under("fault/once-500") and n == 0:
             return 500, b"boom"
-        if key == "fault/always-500":
+        if under("fault/always-500"):
             return 500, b"boom"
-        if key == "fault/forbidden":
+        if under("fault/forbidden"):
             return 403, b"no"
-        if key == "fault/hang":
+        if under("fault/hang"):
             time.sleep(5)
             return None
         return None

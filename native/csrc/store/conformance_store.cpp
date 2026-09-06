@@ -20,6 +20,8 @@
 #include "s3_client.h"
 
 #include "../conformance/json_scan.h"
+#include "spool.h"
+#include "uploader.h"
 
 #include <iostream>
 #include <map>
@@ -79,6 +81,49 @@ dmi_store::S3Config ReadConfig(const std::string& line) {
   }
   const int64_t chunk = jc::FindInt(line, "multipart_chunk");
   if (chunk > 0) config.multipart_chunk_bytes = static_cast<uint64_t>(chunk);
+  return config;
+}
+
+dmi_store::StagedPack ParseStaged(const std::string& obj) {
+  dmi_store::StagedPack s;
+  s.pack_id = jc::FindString(obj, "pack_id");
+  s.created_at_ns = static_cast<uint64_t>(jc::FindInt(obj, "created_at_ns"));
+  s.record_count = static_cast<uint64_t>(jc::FindInt(obj, "record_count"));
+  s.checksum = jc::FindString(obj, "checksum");
+  s.object_key = jc::FindString(obj, "object_key");
+  s.path = jc::FindString(obj, "path");
+  s.object_bytes = static_cast<uint64_t>(jc::FindInt(obj, "object_bytes"));
+  return s;
+}
+
+void EmitRef(const dmi_store::PackRef& ref, std::string* out) {
+  out->append("{\"pack_id\":");
+  jc::EscapeJson(ref.pack_id, out);
+  out->append(",\"store_id\":");
+  jc::EscapeJson(ref.store_id, out);
+  out->append(",\"object_key\":");
+  jc::EscapeJson(ref.object_key, out);
+  out->append(",\"object_bytes\":" + std::to_string(ref.object_bytes));
+  out->append(",\"checksum\":");
+  jc::EscapeJson(ref.checksum, out);
+  out->append(",\"record_count\":" + std::to_string(ref.record_count) + "}");
+}
+
+dmi_store::UploaderConfig ReadUploaderConfig(const std::string& line) {
+  dmi_store::UploaderConfig config;
+  const int64_t workers = jc::FindInt(line, "max_workers");
+  config.max_workers = static_cast<int>(workers > 0 ? workers : 4);
+  const int64_t in_flight = jc::FindInt(line, "max_in_flight_bytes");
+  if (in_flight > 0) {
+    config.max_in_flight_bytes = static_cast<uint64_t>(in_flight);
+  }
+  // Uploader-level attempts are keyed separately from the transport's
+  // "max_attempts": the transport absorbs single 5xx inside one upload
+  // attempt (like botocore), and only its exhaustion surfaces here.
+  const int64_t attempts = jc::FindInt(line, "upload_max_attempts");
+  if (attempts > 0) config.max_attempts = static_cast<int>(attempts);
+  config.store_id = jc::FindString(line, "store_id");
+  if (config.store_id.empty()) config.store_id = "s3";
   return config;
 }
 
@@ -179,6 +224,90 @@ int main() {
       } else {
         out += ",\"what\":";
         jc::EscapeJson(error, &out);
+      }
+    } else if (op == "upload_one") {
+      // Upload one staged entry (parsed from the nested "staged" object).
+      dmi_store::SpoolConfig spool_config;
+      spool_config.root = jc::FindString(line, "root");
+      spool_config.max_bytes =
+          static_cast<uint64_t>(jc::FindInt(line, "spool_max_bytes"));
+      if (spool_config.max_bytes == 0) spool_config.max_bytes = 1ull << 40;
+      dmi_store::Spool spool;
+      std::string spool_error;
+      if (dmi_store::Spool::Open(spool_config, &spool, &spool_error) !=
+          dmi_store::SpoolStatus::kOk) {
+        out += "false,\"what\":";
+        jc::EscapeJson("spool open: " + spool_error, &out);
+      } else {
+        dmi_store::SpoolUploader uploader(&spool, &client,
+                                          ReadUploaderConfig(line));
+        dmi_store::PackRef ref;
+        int attempts = 0;
+        std::string error;
+        const bool ok = uploader.UploadOne(
+            ParseStaged(jc::FindObject(line, "staged")), &ref, &attempts,
+            &error);
+        out += ok ? "true" : "false";
+        if (ok) {
+          out += ",\"ref\":";
+          EmitRef(ref, &out);
+        } else {
+          out += ",\"what\":";
+          jc::EscapeJson(error, &out);
+        }
+        out += ",\"upload_attempts\":" + std::to_string(attempts);
+      }
+    } else if (op == "upload_pending") {
+      dmi_store::SpoolConfig spool_config;
+      spool_config.root = jc::FindString(line, "root");
+      spool_config.max_bytes =
+          static_cast<uint64_t>(jc::FindInt(line, "spool_max_bytes"));
+      if (spool_config.max_bytes == 0) spool_config.max_bytes = 1ull << 40;
+      dmi_store::Spool spool;
+      std::string spool_error;
+      if (dmi_store::Spool::Open(spool_config, &spool, &spool_error) !=
+          dmi_store::SpoolStatus::kOk) {
+        out += "false,\"what\":";
+        jc::EscapeJson("spool open: " + spool_error, &out);
+      } else {
+        dmi_store::SpoolUploader uploader(&spool, &client,
+                                          ReadUploaderConfig(line));
+        const int64_t limit = jc::FindInt(line, "limit");
+        const dmi_store::UploadBatchResult result =
+            uploader.UploadPending(limit < 0 ? -1 : static_cast<int>(limit));
+        out += "true,\"refs\":[";
+        bool first = true;
+        for (const auto& ref : result.refs) {
+          if (!first) out.push_back(',');
+          EmitRef(ref, &out);
+          first = false;
+        }
+        out += "],\"failures\":[";
+        first = true;
+        for (const auto& failure : result.failures) {
+          if (!first) out.push_back(',');
+          out += "{\"pack_id\":";
+          jc::EscapeJson(failure.pack_id, &out);
+          out += ",\"object_key\":";
+          jc::EscapeJson(failure.object_key, &out);
+          out += ",\"attempts\":" + std::to_string(failure.attempts);
+          out += ",\"error\":";
+          jc::EscapeJson(failure.error, &out);
+          out += "}";
+          first = false;
+        }
+        const auto& snap = result.snapshot;
+        out += "],\"snapshot\":{\"attempted_packs\":" +
+               std::to_string(snap.attempted_packs) + ",\"uploaded_packs\":" +
+               std::to_string(snap.uploaded_packs) + ",\"uploaded_bytes\":" +
+               std::to_string(snap.uploaded_bytes) + ",\"failed_packs\":" +
+               std::to_string(snap.failed_packs) + ",\"retries\":" +
+               std::to_string(snap.retries) + ",\"peak_active_uploads\":" +
+               std::to_string(snap.peak_active_uploads) +
+               ",\"peak_in_flight_bytes\":" +
+               std::to_string(snap.peak_in_flight_bytes) +
+               ",\"duration_count\":" +
+               std::to_string(snap.duration_count) + "}";
       }
     } else {
       out += "false,\"what\":\"unknown op\"";

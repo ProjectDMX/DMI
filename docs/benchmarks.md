@@ -382,3 +382,18 @@ packs back with the Python PackReader (ids, checksums, tenant binding).
 | Reuse WatermarkBatchingQueue | n/a | reverted before code | Batch-dequeue + linger-release semantics fight the capture pattern (strict FIFO, per-item, barrier interleaving); a 90-line ordered queue is honest. Revisit worker management at A5a |
 | Shared JSON scanners across 4 drivers | ~600 lines of parsers → 1 shared lib | kept | Forced by the third driver; all 33 tests stayed green through the migration |
 | Close() calling Snapshot() under lock | self-deadlock on close | fixed | Split SnapshotLocked (lock held) from Snapshot (locks); the gdb-less debug took an instrumented binary because ptrace is unavailable here |
+
+### A4 native uploader (2026-09-05)
+
+`native/csrc/store/uploader.{h,cpp}`: recover → byte-gated admission → N
+workers with per-pack retry → remove-after-commit, outcomes by position.
+Preflight HEAD + re-hash blessing, upload-stream hash check, post-upload
+visibility — the same three integrity gates as the Python put(). 6 tests
+sink→spool→fake-S3 end to end.
+
+| Idea | Baseline → Result | Verdict | Why |
+|---|---|---|---|
+| Single max_attempts key for both layers | uploader retry untestable | fixed | Transport (curl-level, like botocore) absorbs single 5xx inside one upload attempt; uploader-level retry needs its own `upload_max_attempts`. Test pins the layering: transport=1 + one 500 → attempts=2, retries=1 |
+| upload_pending for the corrupt-bytes case | recover() quarantines first | fixed | Corrupt staged bytes must reach UploadOne directly (upload_one op); recover-time quarantine is separately pinned in the spool suite |
+| Oversized packs counted only in failures[] | failed_packs==0 with a failure present | fixed | Byte-gate refusal increments attempted+failed up front |
+| Fake verifies/signs the encoded path | 403 on every key with reserved chars | fixed | S3 decodes %XX once before routing/verifying; the fake now unquotes the path (unquote, never unquote_plus) before handing it to botocore |

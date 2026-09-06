@@ -267,11 +267,11 @@ build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp c
 # The link needs only -L; the runtime libcurl.so.4 ships with the OS. Override:
 #   make CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu ...
 CURL_LIBDIR ?= /tmp/opencode/sysroot/usr/lib/x86_64-linux-gnu
-build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h
+build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/store/spool.h csrc/store/uploader.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
-	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/conformance_store.cpp csrc/conformance/json_scan.cpp \
-	    -Icsrc/store -Icsrc/conformance -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl
+	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/conformance/json_scan.cpp \
+	    -Icsrc/store -Icsrc/conformance -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
 
 # A3a spool conformance driver: no network, no torch; runs in any CI job.
 build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h

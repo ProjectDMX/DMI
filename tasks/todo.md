@@ -58,7 +58,11 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       policies, duplicates, oversized, size splits, object-key parity).
       CPU suite green (1155 passed). Gate:
       `make -C native build/conformance_sink`.
-- [ ] A4 Uploader: bounded workers, bytes-in-flight, checksum verify; e2e ring→Garage
+- [x] A4 Uploader: bounded workers, bytes-in-flight, checksum verify; e2e ring→Garage.
+      Evidence: `tests/test_native_uploader.py` 6/6 (sink→spool→fake-S3
+      e2e with Python PackReader read-back, preflight idempotence with
+      PUT-count proof, parallel batch by position, layered retry,
+      corrupt refusal, byte gate). Native suite 48/48.
 - [ ] A5a Scope-hash worker pool via pipelined_engine; N-scaling curve
 - [ ] A5b Sink-selection config (opt-in) + rollback demo
 - **Checkpoint A** (human review): byte-equality ✓, CPU suite green ✓, N=1 ≥ derived
