@@ -113,6 +113,14 @@ jobs:
           # and the live job dies at exit code 2 with every other ported test
           # uncollected.
           python -m pip install "botocore>=1.34"
+          # boto3 as well, and note this is NOT the same dependency: the
+          # reader-parity suite compares the native reader against the
+          # PYTHON one, and the Python side hydrates through S3PackStore,
+          # which imports boto3 and raises "S3 support requires the optional
+          # 's3' dependencies" without it. The pip line rather than the `s3`
+          # extra because `--no-deps -e .` below installs no extras. Pinned
+          # to the range pyproject's `s3` extra declares.
+          python -m pip install "boto3>=1.40,<2"
           python -m pip install --no-deps -e .
 
       - name: Build the native drivers the live suites drive
