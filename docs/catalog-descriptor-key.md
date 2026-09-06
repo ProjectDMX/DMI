@@ -572,6 +572,24 @@ window -- a statement that evaluated its fence before the other operation's
 renewal still lands afterwards -- so it adds complexity without adding
 exclusion the lock does not already give.
 
+The lock covers the Python call, not the server statement. When a fenced
+write has reached ClickHouse but `execute()` raises a transport or interrupt
+error while that statement is still running, the call exits with the lease
+intact and a waiter that renews the SAME `lease_id` can publish a higher
+watermark before the first statement lands -- reproduced on 25.12, where B
+returned with only W=2 visible, A's delayed W=1 then landed, and the pinned
+W=2 membership grew 1 -> 2. Calling `acquire_publisher_lease()` at once does
+not help: the local lease deliberately reuses its ID. So an outcome-unknown
+failure quarantines the writer: it discards the identity WITHOUT the release
+tombstone (which would hand a successor a fresh term at once) and refuses
+`publish_snapshot`, `renew_publisher_lease` and `acquire_publisher_lease`
+until a full `lease_ttl_ns` has passed, by which time the old statement has
+landed or been capped by `max_execution_time`. The server row stays live for
+the same interval, so a different writer's claim is refused there too.
+Known-complete failures -- the barrier or fence refusing
+(`SnapshotPublishRaceError`), a conflicting publish, a lost lease -- release
+the writer normally and the next publish proceeds at once.
+
 Regression: `test_two_concurrent_publishes_on_one_writer_are_serialised`
 asserts that while one publisher is inside a fenced statement, a second
 publisher on the same writer issues nothing, not even its lease renewal; the
@@ -582,6 +600,11 @@ for the indexer's neighbours of a publish -- inventory read, head read,
 descriptor write, inventory commit, collection -- on a second thread. The live
 reproduction (two threads, one writer, adjacent versions, 300 rounds) is the
 check that closes it on a real server.
+`test_an_outcome_unknown_publish_quarantines_the_lease_until_its_window_expires`
+pins the ambiguous-outcome half: a watermark INSERT that lands and then raises
+leaves the writer leaseless with no tombstone written, refuses every
+lease-bearing operation, and publishes again only under a fresh identity past
+the window.
 
 **A crash between a claim and its read-back** leaves a claim row nobody uses.
 It looks like a live lease until it expires, so the next publisher waits out one

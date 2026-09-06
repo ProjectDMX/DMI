@@ -900,6 +900,11 @@ def test_a_publish_that_fails_releases_the_writer_for_the_next_one():
     with pytest.raises(SnapshotPublishRaceError):
         _publish(writer, 3)  # refused by the barrier: 3 is not above 5
 
+    # A known-complete refusal must not quarantine: the read-back proved
+    # nothing became visible, so the next publish may proceed at once.
+    assert writer.publisher_lease is not None
+    assert writer._quarantined_until_monotonic is None
+
     done = threading.Event()
 
     def next_publish() -> None:
@@ -911,6 +916,83 @@ def test_a_publish_that_fails_releases_the_writer_for_the_next_one():
     assert done.wait(5), "the failed publish left the writer locked"
     publisher_b.join(5)
     assert client.watermarks == [5, 6]
+
+
+def test_an_outcome_unknown_publish_quarantines_the_lease_until_its_window_expires():
+    """A transport error mid-publish must not hand the same lease to a waiter.
+
+    The lock covers the Python call, not the server statement: when the
+    watermark INSERT has reached ClickHouse but ``execute()`` raises while
+    that statement is still running, the call exits with the lease intact and
+    a waiter that renews the SAME ``lease_id`` can publish a higher watermark
+    before the first statement lands (pinned W=2 membership growing 1 -> 2 on
+    25.12). Re-acquiring at once does not help -- the local lease deliberately
+    reuses its ID -- so the writer discards the identity WITHOUT the release
+    tombstone and refuses to publish, renew or acquire until the lease window
+    has expired.
+    """
+    from dmi.storage.capture import PublisherLeaseError
+
+    client = _Client()
+    writer = _leased(client)
+    original_lease_id = writer.publisher_lease.lease_id
+    real_execute = client.execute
+
+    def land_then_lose_the_connection(query, params=None, **kwargs):
+        if query.lstrip().startswith("INSERT INTO") and "index_watermark" in query:
+            try:
+                return real_execute(query, params, **kwargs)
+            finally:
+                raise RuntimeError(
+                    "transport lost while the statement was still running"
+                )
+        return real_execute(query, params, **kwargs)
+
+    client.execute = land_then_lose_the_connection
+    with pytest.raises(RuntimeError, match="transport lost"):
+        _publish(writer, 1)
+
+    # The delayed row did land: the outcome is unknown to the caller, not to
+    # the server. The writer must treat it as such.
+    assert client.watermarks == [1]
+    # The identity is gone, and no early tombstone ended the server row: every
+    # lease row is still a live claim, so another writer's claim is refused
+    # there until the TTL expires too.
+    assert writer.publisher_lease is None
+    assert client.lease.rows, "the publish renewed before writing"
+    assert all(
+        expires > acquired for _, _, _, acquired, expires in client.lease.rows
+    ), "quarantine must not write the release tombstone"
+    assert writer._quarantined_until_monotonic is not None
+
+    # A successor on the same writer cannot reuse the identity, whatever entry
+    # point it tries -- and an immediate re-acquire is refused rather than
+    # handed a fresh term over the still-running statement.
+    with pytest.raises(PublisherLeaseError, match="quarantin"):
+        _publish(writer, 2)
+    with pytest.raises(PublisherLeaseError, match="quarantin"):
+        writer.renew_publisher_lease()
+    with pytest.raises(PublisherLeaseError, match="quarantin"):
+        writer.acquire_publisher_lease("indexer-a")
+    assert client.watermarks == [1], "a quarantined writer must issue nothing"
+
+    # Releasing while quarantined must stay a no-op: the tombstone would end
+    # the server row at once and let a successor publish into the window.
+    rows_while_quarantined = list(client.lease.rows)
+    writer.release_publisher_lease()
+    assert list(client.lease.rows) == rows_while_quarantined
+    with pytest.raises(PublisherLeaseError, match="quarantin"):
+        _publish(writer, 2)
+
+    # Past the window, a fresh identity publishes normally above the delayed
+    # row -- the statement has either landed or been capped by then.
+    writer._quarantined_until_monotonic = time.monotonic() - 1
+    client.lease.now_ns += ClickHouseCatalogConfig().lease_ttl_ns + 1
+    client.execute = real_execute
+    fresh = writer.acquire_publisher_lease("indexer-a")
+    assert fresh.lease_id != original_lease_id
+    _publish(writer, 2)
+    assert client.watermarks == [1, 2]
 
 
 def test_a_writer_used_from_another_process_refuses_to_publish(monkeypatch):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from time import sleep as _sleep, time_ns
@@ -35,7 +36,7 @@ from .clickhouse_sql import (
     quorum_write,
     text,
 )
-from .model import CaptureDescriptor, PackRef
+from .model import CaptureDescriptor, CaptureStorageError, PackRef
 
 # The least lease life a publish may be configured to reach the fence with.
 # The fence is safe at any positive margin, but a margin under a client round
@@ -224,6 +225,23 @@ class ClickHouseCatalogWriter:
         # the parent's ``lease_id`` across two address spaces that no lock can
         # reach -- the same race, with no way to observe it from either side.
         self._owner_pid = os.getpid()
+        # Outcome-unknown quarantine. The lock serialises the Python call, not
+        # the server statement: when a fenced write reaches ClickHouse but
+        # ``execute()`` raises a transport/interrupt error while that statement
+        # is still running, the call exits with the lease intact and a waiter
+        # that renews the SAME ``lease_id`` can publish a higher watermark
+        # before the first statement lands. Reproduced on 25.12: B returned
+        # with only W=2 visible, A's delayed W=1 then landed, and the pinned
+        # W=2 membership grew 1 -> 2. Calling ``acquire_publisher_lease()``
+        # does not help while the local lease is kept -- it deliberately reuses
+        # its ID -- so an ambiguous outcome discards the identity WITHOUT the
+        # release tombstone (which would hand a successor a fresh term at
+        # once) and refuses every lease-bearing operation until a full TTL has
+        # passed, by which time the old statement has either landed or been
+        # capped by ``max_execution_time``. The server row stays live for the
+        # same interval, so a DIFFERENT writer's claim is refused there too.
+        self._quarantined_until_monotonic: float | None = None
+        self._quarantined_lease_id: str | None = None
 
     def _owned_by_this_process(self) -> None:
         # Checked BEFORE ``_serial`` is taken, never inside it. A fork copies
@@ -245,6 +263,47 @@ class ClickHouseCatalogWriter:
             "excluded by the fence; it would also write to the same socket the "
             "parent is using. Create a writer, and acquire a lease, in the "
             "process that publishes."
+        )
+
+    def _require_not_quarantined_locked(self) -> None:
+        # Call with ``_serial`` held. Clears an expired quarantine so a writer
+        # that waited out the window recovers with a fresh lease; refuses
+        # while the old operation's window is still open.
+        deadline = self._quarantined_until_monotonic
+        if deadline is None:
+            return
+        if time.monotonic() >= deadline:
+            self._quarantined_until_monotonic = None
+            self._quarantined_lease_id = None
+            return
+        remaining = deadline - time.monotonic()
+        identity = self._quarantined_lease_id or "unknown"
+        raise PublisherLeaseError(
+            "this writer's publisher lease is quarantined after a publish "
+            f"whose outcome is unknown (lease {identity}); it will not publish, "
+            f"renew or acquire for another {remaining:.1f}s. The fenced statement may "
+            "still be running on the server past its fence evaluation, and a "
+            "successor that renewed the same lease_id could publish a higher "
+            "watermark before it lands. Wait out the lease window instead of "
+            "re-acquiring at once -- an immediate re-acquire would reuse the "
+            "same identity -- and then acquire a fresh lease and re-index. "
+            "No release tombstone was written, so the server row stays live "
+            "for the same interval and refuses other claimants there too."
+        )
+
+    def _quarantine_locked(self) -> None:
+        # Call with ``_serial`` held, on an outcome-unknown failure. Drops the
+        # local identity WITHOUT the release tombstone and blocks successors
+        # for a full TTL from now, which covers whatever remains of the old
+        # lease's window. Known-complete failures -- the barrier or fence
+        # refusing (SnapshotPublishRaceError), a conflicting publish, a lost
+        # lease -- must NOT come through here: their read-backs proved the
+        # outcome, and the next publish may proceed at once.
+        lease = self._leases.discard_local_lease()
+        if lease is not None:
+            self._quarantined_lease_id = lease.lease_id
+        self._quarantined_until_monotonic = (
+            time.monotonic() + self._config.lease_ttl_ns / 1_000_000_000
         )
 
     def ensure_schema(self, *, sleep: Callable[[float], None] = _sleep) -> None:
@@ -372,22 +431,43 @@ class ClickHouseCatalogWriter:
         (``timeout_overflow_mode='throw'``, Code 159), not a
         ``CaptureStorageError`` -- the same species as the Code 125 path the
         design doc records -- and it raises BEFORE the ownership read-back, so
-        whether the row landed is not known here. That is safe in the only
-        direction that matters: the indexer aborts without ``commit_packs``,
-        so if the row did land the pack is visible-but-not-yet-skippable and
-        the next pass costs redundant work, never loss. Callers routing on
-        this module's taxonomy should treat a driver exception from a publish
-        as "outcome unknown: re-acquire and re-index".
+        whether the row landed is not known here. The same holds for any
+        transport or interrupt error raised while a fenced statement is still
+        running on the server past its fence evaluation: the Python call is
+        over, the server statement may not be. That outcome-unknown failure
+        QUARANTINES this writer -- it discards the lease WITHOUT the release
+        tombstone and refuses ``publish_snapshot``, ``renew_publisher_lease``
+        and ``acquire_publisher_lease`` until a full ``lease_ttl_ns`` has
+        passed, by which time the old statement has landed or been capped and
+        the server row has expired too. A waiting publish that renewed the same
+        ``lease_id`` could otherwise publish a higher watermark before the old
+        statement lands, growing a pinned snapshot from underneath. Known-
+        complete failures -- ``SnapshotPublishRaceError``,
+        ``SnapshotPublishConflictError``, a lost lease -- release the writer
+        normally and the next publish may proceed at once. Callers routing on
+        this module's taxonomy must therefore NOT treat a driver exception as
+        "re-acquire and re-index at once": an immediate re-acquire is refused
+        while the quarantine holds; wait out the window, acquire a fresh lease,
+        and re-index. The indexer aborts without ``commit_packs``, so if the
+        row did land the pack is visible-but-not-yet-skippable and the next
+        pass costs redundant work, never loss.
         """
         self._owned_by_this_process()
         with self._serial:
-            self._publish_snapshot_serialised(
-                index_version=index_version,
-                refs=refs,
-                published_at_ns=published_at_ns,
-                indexed_rows=indexed_rows,
-                indexed_packs=indexed_packs,
-            )
+            self._require_not_quarantined_locked()
+            try:
+                self._publish_snapshot_serialised(
+                    index_version=index_version,
+                    refs=refs,
+                    published_at_ns=published_at_ns,
+                    indexed_rows=indexed_rows,
+                    indexed_packs=indexed_packs,
+                )
+            except (CaptureStorageError, ValueError):
+                raise
+            except BaseException:
+                self._quarantine_locked()
+                raise
 
     def _publish_snapshot_serialised(
         self,
@@ -600,16 +680,34 @@ class ClickHouseCatalogWriter:
     def acquire_publisher_lease(self, holder: str) -> PublisherLease:
         self._owned_by_this_process()
         with self._serial:
-            return self._leases.acquire(holder)
+            self._require_not_quarantined_locked()
+            try:
+                return self._leases.acquire(holder)
+            except (CaptureStorageError, ValueError):
+                raise
+            except BaseException:
+                self._quarantine_locked()
+                raise
 
     def renew_publisher_lease(self) -> PublisherLease:
         self._owned_by_this_process()
         with self._serial:
-            return self._leases.renew()
+            self._require_not_quarantined_locked()
+            try:
+                return self._leases.renew()
+            except (CaptureStorageError, ValueError):
+                raise
+            except BaseException:
+                self._quarantine_locked()
+                raise
 
     def release_publisher_lease(self) -> None:
         self._owned_by_this_process()
         with self._serial:
+            # No quarantine check and no tombstone while quarantined: the
+            # local lease is already None, so this is a no-op, which is the
+            # point -- an early release would hand a successor a fresh term
+            # while the outcome-unknown statement may still be running.
             self._leases.release()
 
     def _manifest_chunk_published(
