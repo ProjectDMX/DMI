@@ -287,6 +287,18 @@ std::string respond(const std::string& line, Session* session) {
       escape_into(writer.leases().fence(), &out);
     } else if (op == "allocate_version") {
       out = ",\"version\":" + std::to_string(writer.allocate_version());
+    } else if (op == "collect_garbage") {
+      const auto removed = writer.collect_garbage(
+          static_cast<uint64_t>(jc::FindInt(line, "settle_sleep_ns")));
+      out = ",\"removed\":{";
+      bool first_table = true;
+      for (const auto& [table, count] : removed) {
+        if (!first_table) out += ",";
+        first_table = false;
+        escape_into(table, &out);
+        out += ":" + std::to_string(count);
+      }
+      out += "}";
     } else if (op == "last_published_version") {
       out = ",\"version\":" + std::to_string(writer.last_published_version());
     } else if (op == "max_version") {

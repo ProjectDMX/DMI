@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -74,6 +75,22 @@ class CatalogWriter {
                         const std::string* takeover_after_chunks = nullptr,
                         bool inject_transport_error = false);
   uint64_t last_published_version() const;
+  // B4: delete the rows the protocols append and never need again —
+  // manifest rows of publishes that never reached the watermark (settled
+  // across two reads a publish timeout apart), lease rows below the head
+  // term (the head itself is kept), and version claims at or below the
+  // published head. Explicit, never called from the write path. Returns
+  // the rows removed per table.
+  std::map<std::string, uint64_t> collect_garbage(uint64_t settle_sleep_ns);
+
+ private:
+  uint64_t delete_rows(const char* table, const std::string& predicate,
+                       const Params& params,
+                       const std::map<std::string, std::string>& settings);
+  std::vector<std::pair<uint64_t, std::string>> orphaned_manifest_publishes(
+      uint64_t published) const;
+
+ public:
   bool quarantined(uint64_t* until_ns = nullptr) const;
   LeaseCoordinator& leases() { return *leases_; }
 
@@ -101,3 +118,4 @@ class CatalogWriter {
 }  // namespace dmi_catalog
 
 #endif  // DMI_CATALOG_CATALOG_WRITER_H
+// (B4 additions appended)

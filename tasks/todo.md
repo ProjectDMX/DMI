@@ -153,7 +153,15 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       watermark; no-lease refusal burns no version. Pack-index validation
       ported from PackIndex.from_store (trailer/footer/ranges/dtype-size/
       dup-ids), external data refused at the boundary. 18/18 live ×2 runs.
-- [ ] B4 schema-native + maintenance-native (GC)
+- [x] B4 maintenance-native (GC port); schema DDL port deferred to Checkpoint B.
+      Evidence: orphan manifest rows below the head collected after the
+      two-read settle (publish timeout apart); superseded lease rows and
+      spent claims collected; membership of published versions, the head
+      lease row, and the pending claim above the head kept; second pass
+      idempotent. Counted-then-deleted per table, literal-pair chunks.
+      19/19 live ×2 runs. The schema DDL/install port (ensure/drop,
+      install serialisation, stamps) is not started — it re-opens the
+      largest #119 surface and waits on Checkpoint B.
 - **Checkpoint B** (human review) — criteria (cold-path, defined 2026-09-06):
   ported live suites green next to their Python oracles ✓ (lease, allocator,
   descriptors, publish incl. the #125 concurrency trio) · statement

@@ -831,3 +831,80 @@ def test_index_without_a_lease_is_refused_before_any_writes(fake_s3):
             sink.close()
             store.close()
             driver.close()
+
+
+# --- B4: maintenance — garbage collection ------------------------------------
+
+def test_garbage_collection_keeps_what_is_visible_and_removes_the_rest():
+    """The retention port, against the same scenario the Python suite drives.
+
+    Collected: orphan manifest rows below the head, superseded lease rows,
+    spent claims at or below the published head. Kept: the membership of
+    every published version, the head lease row, and the claim above the
+    head — the only record that a version was allocated but not yet
+    published. Idempotent: a second pass removes nothing.
+    """
+    with _catalog(publish_timeout_ns=1_000_000_000) as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix, publish_timeout_ns=1_000_000_000)
+            driver.call(op="acquire", holder="writer")
+            refs = _refs_of(3)
+            descriptors = _descriptor_dicts(3)
+            first = driver.call(op="allocate_version")["version"]
+            driver.call(op="write_descriptors", descriptors=descriptors,
+                        index_version=first)
+            driver.call(op="publish_snapshot", index_version=first, refs=refs,
+                        published_at_ns=first, indexed_rows=3, indexed_packs=1)
+            driver.call(op="commit_packs", refs=refs, index_version=first)
+            second = driver.call(op="allocate_version")["version"]
+            driver.call(op="write_descriptors", descriptors=descriptors,
+                        index_version=second)
+            driver.call(op="publish_snapshot", index_version=second, refs=refs,
+                        published_at_ns=second, indexed_rows=3, indexed_packs=1)
+
+            # Membership from a publish that never reached the watermark,
+            # below the head — the shape a lost version race leaves.
+            orphan_publish = str(uuid.uuid4())
+            manifest = f"`{config.database}`.`{prefix}_snapshot_manifest`"
+            driver.call(
+                op="execute",
+                query=(f"INSERT INTO {manifest} "
+                       "(index_version, publish_id, store_id, pack_id) VALUES "
+                       f"({first}, '{orphan_publish}', 'garage', "
+                       f"'{refs[0]['pack_id']}')"),
+            )
+            pending = driver.call(op="allocate_version")["version"]
+            assert pending > second
+
+            collected = driver.call(
+                op="collect_garbage", settle_sleep_ns=1_100_000_000)
+            removed = collected["removed"]
+            assert removed[f"{prefix}_snapshot_manifest"] == 1, removed
+            assert removed[f"{prefix}_publisher_lease"] >= 1, removed
+            assert removed[f"{prefix}_capture_version_claims"] >= 1, removed
+            assert client.execute(
+                f"SELECT count() FROM {manifest} WHERE publish_id = "
+                f"'{orphan_publish}'") == [(0,)]
+
+            # Kept: the membership of both published versions...
+            assert client.execute(
+                f"SELECT count() FROM {manifest} WHERE index_version IN "
+                f"({first}, {second})") == [(2,)]
+            # ...the head lease row, and the pending claim above it.
+            assert client.execute(
+                "SELECT count() FROM "
+                f"`{config.database}`.`{prefix}_publisher_lease`")[0][0] >= 1
+            assert client.execute(
+                "SELECT count() FROM "
+                f"`{config.database}`.`{prefix}_capture_version_claims` "
+                f"WHERE version = {pending}") == [(1,)]
+
+            # Idempotent: a second pass has nothing left to do.
+            again = driver.call(op="collect_garbage", settle_sleep_ns=1_100_000_000)
+            assert again["removed"] == {
+                f"{prefix}_snapshot_manifest": 0,
+                f"{prefix}_capture_version_claims": 0,
+            } or all(v == 0 for v in again["removed"].values()), again["removed"]
+        finally:
+            driver.close()

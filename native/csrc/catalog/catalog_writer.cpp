@@ -484,3 +484,154 @@ void CatalogWriter::publish_snapshot(
 }
 
 }  // namespace dmi_catalog
+
+// -- B4: garbage collection -------------------------------------------------
+
+namespace dmi_catalog {
+namespace {
+
+// Rendered size of one (index_version, publish_id) pair in statement
+// text: decimal digits plus a quoted uuid with escaping room, plus the
+// tuple's own punctuation (clickhouse_sql.inline_version_identity_bytes).
+size_t inline_pair_bytes(uint64_t version, const std::string& publish_id) {
+  size_t digits = 1;
+  for (uint64_t v = version; v >= 10; v /= 10) ++digits;
+  return digits + 2 * publish_id.size() + 2 + 4;
+}
+
+std::vector<std::vector<std::pair<uint64_t, std::string>>> inline_publish_chunks(
+    const std::vector<std::pair<uint64_t, std::string>>& pairs) {
+  std::vector<std::vector<std::pair<uint64_t, std::string>>> chunks;
+  std::vector<std::pair<uint64_t, std::string>> chunk;
+  size_t size = 2;
+  for (const auto& pair : pairs) {
+    const size_t encoded = inline_pair_bytes(pair.first, pair.second);
+    if (encoded + 2 > kMaxInlineParameterBytes) {
+      throw CatalogError(CatalogError::Kind::kValue,
+                         "item exceeds inline query byte budget");
+    }
+    const size_t separator = chunk.empty() ? 0 : 2;
+    if (!chunk.empty() && size + separator + encoded > kMaxInlineParameterBytes) {
+      chunks.push_back(chunk);
+      chunk.clear();
+      size = 2;
+    }
+    chunk.push_back(pair);
+    size += (chunk.size() == 1 ? 0 : 2) + encoded;
+  }
+  if (!chunk.empty()) chunks.push_back(chunk);
+  return chunks;
+}
+
+}  // namespace
+
+uint64_t CatalogWriter::delete_rows(const char* table,
+                                    const std::string& predicate,
+                                    const Params& params,
+                                    const std::map<std::string, std::string>& settings) {
+  // Counted first because ALTER TABLE ... DELETE reports nothing about
+  // what it removed; a maintenance job that cannot say what it deleted is
+  // one nobody runs twice. A row written between the two statements is
+  // simply collected on the next run.
+  const std::string qualified_table = qualified(table);
+  const std::vector<Row> counted = client_->execute(
+      "SELECT count() FROM " + qualified_table + " WHERE " + predicate,
+      params, deciding_read());
+  const uint64_t matched =
+      counted.empty() ? 0 : parse_u64_field(counted[0][0], "count");
+  if (matched != 0) {
+    client_->execute("ALTER TABLE " + qualified_table + " DELETE WHERE " +
+                         predicate,
+                     params, settings);
+  }
+  return matched;
+}
+
+std::vector<std::pair<uint64_t, std::string>>
+CatalogWriter::orphaned_manifest_publishes(uint64_t published) const {
+  // Every (index_version, publish_id) below the head with no watermark
+  // row. Deciding read: a replica behind on the watermark table would
+  // report a published pair as orphaned and delete live membership.
+  const std::vector<Row> rows = client_->execute(
+      "SELECT DISTINCT index_version, toString(publish_id) FROM " +
+          qualified("snapshot_manifest") +
+          " WHERE index_version < %(published)s "
+          "AND (index_version, publish_id) NOT IN "
+          "(SELECT index_version, publish_id FROM " +
+          qualified("index_watermark") + ") "
+          "ORDER BY index_version, publish_id",
+      {{"published", published}}, deciding_read());
+  std::vector<std::pair<uint64_t, std::string>> out;
+  for (const Row& row : rows) {
+    out.emplace_back(parse_u64_field(row[0], "index_version"), row[1]);
+  }
+  return out;
+}
+
+std::map<std::string, uint64_t> CatalogWriter::collect_garbage(
+    uint64_t settle_sleep_ns) {
+  std::map<std::string, uint64_t> removed;
+  const uint64_t published = last_published_version();
+  const LeaseHead head = leases_->head();
+  const std::map<std::string, std::string> settings = {{"mutations_sync", "1"}};
+
+  // Manifest rows of a publish that never reached the watermark, at a
+  // version BELOW the published head: below the head its watermark INSERT
+  // can no longer be admitted, so the membership pair can never come into
+  // existence through a new statement. The set is intersected across two
+  // reads a publish timeout apart — a statement admitted above the head
+  // and then stalled can still LAND below it, and publish_snapshot
+  // confirms its membership after the row stands. The pairs are deleted
+  // as literals in bounded chunks: a subquery inside the mutation is
+  // refused on ReplicatedMergeTree, and a literal list is deterministic
+  // on every replica.
+  std::vector<std::pair<uint64_t, std::string>> orphans =
+      orphaned_manifest_publishes(published);
+  if (!orphans.empty()) {
+    std::this_thread::sleep_for(std::chrono::nanoseconds(settle_sleep_ns));
+    std::set<std::pair<uint64_t, std::string>> settled;
+    for (const auto& pair : orphaned_manifest_publishes(published)) {
+      if (std::find(orphans.begin(), orphans.end(), pair) != orphans.end()) {
+        settled.insert(pair);
+      }
+    }
+    uint64_t removed_manifest = 0;
+    for (const auto& chunk : inline_publish_chunks(
+             {settled.begin(), settled.end()})) {
+      std::string inner;
+      bool first = true;
+      for (const auto& [version, publish_id] : chunk) {
+        if (!first) inner += ",";
+        first = false;
+        inner += "(" + std::to_string(version) + ",'" + publish_id + "')";
+      }
+      removed_manifest += delete_rows(
+          "snapshot_manifest",
+          "(index_version, publish_id) IN (" + inner + ")", {}, settings);
+    }
+    removed[config_.table_prefix + "_snapshot_manifest"] = removed_manifest;
+  }
+
+  // Lease rows below the head TERM: the fence resolves exactly one row —
+  // the highest (term, lease_id) — and terms only increase, so a row
+  // below the head can never become the head again. The head itself is
+  // kept whether or not it has expired: deleting it would let a stale
+  // claimant's next term collide with a live one's.
+  if (head.term != 0) {
+    removed[config_.table_prefix + "_publisher_lease"] = delete_rows(
+        "publisher_lease", "term < %(term)s", {{"term", head.term}},
+        settings);
+  }
+
+  // Version claims at or below the published head: the allocator picks
+  // above max(claims) AND above the watermark, so the watermark keeps the
+  // floor. Claims ABOVE the head stay — one of them may belong to a pass
+  // that has not published yet. The watermark table itself is never
+  // collected here.
+  removed[config_.table_prefix + "_capture_version_claims"] = delete_rows(
+      "capture_version_claims", "version <= %(published)s",
+      {{"published", published}}, settings);
+  return removed;
+}
+
+}  // namespace dmi_catalog
