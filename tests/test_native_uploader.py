@@ -33,14 +33,14 @@ from dmi.storage.capture import (  # noqa: E402
 STORE_DRIVER = REPO_ROOT / "native" / "build" / "conformance_store"
 SINK_DRIVER = REPO_ROOT / "native" / "build" / "conformance_sink"
 
-pytestmark = pytest.mark.cpu
-
-if not STORE_DRIVER.exists() or not SINK_DRIVER.exists():
-    pytest.skip(
-        "native store/sink drivers are not built; run "
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skipif(
+        not STORE_DRIVER.exists() or not SINK_DRIVER.exists(),
+        reason="native store/sink drivers are not built; run "
         "`make -C native build/conformance_store build/conformance_sink`",
-        allow_module_level=True,
-    )
+    ),
+]
 
 # Reuse the fake S3 server (signature-verifying) from the client tests.
 from tests.test_native_s3_client import (  # noqa: E402

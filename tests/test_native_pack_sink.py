@@ -35,14 +35,14 @@ from tests.tools.golden_workload import _corpus  # noqa: E402
 
 DRIVER = REPO_ROOT / "native" / "build" / "conformance_sink"
 
-pytestmark = pytest.mark.cpu
-
-if not DRIVER.exists():
-    pytest.skip(
-        "native/build/conformance_sink is not built; run "
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skipif(
+        not DRIVER.exists(),
+        reason="native/build/conformance_sink is not built; run "
         "`make -C native build/conformance_sink`",
-        allow_module_level=True,
-    )
+    ),
+]
 
 
 class SinkSession:

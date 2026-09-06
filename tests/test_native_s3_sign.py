@@ -26,14 +26,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DRIVER = REPO_ROOT / "native" / "build" / "conformance_sign"
 
-pytestmark = pytest.mark.cpu
-
-if not DRIVER.exists():
-    pytest.skip(
-        "native/build/conformance_sign is not built; run "
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skipif(
+        not DRIVER.exists(),
+        reason="native/build/conformance_sign is not built; run "
         "`make -C native build/conformance_sign`",
-        allow_module_level=True,
-    )
+    ),
+]
 
 import botocore.auth  # noqa: E402
 import botocore.awsrequest  # noqa: E402

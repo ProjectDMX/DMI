@@ -28,6 +28,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "torch>=2.8,<3" --index-url https://download.pytorch.org/whl/cpu
           python -m pip install pytest wheel numpy "clickhouse-driver>=0.2.0"
+          # The native capture suites import botocore at collection (their
+          # missing-driver skip is a mark, evaluated after the import), and
+          # `--no-deps -e .` would otherwise leave them erroring here.
+          python -m pip install "botocore>=1.34"
           python -m pip install --no-deps -e .
 
       - name: Run compile, CPU, and package-layout checks

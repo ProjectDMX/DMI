@@ -28,6 +28,8 @@ MATCHES = sorted((REPO_ROOT / "native" / "build").glob("_dmi_native_sink*.so"))
 
 pytestmark = pytest.mark.cpu
 
+# Module-level skip, not per-test: this module imports the built .so
+# below, which must not execute at collection when the build is absent.
 if not MATCHES:
     pytest.skip(
         "native/build/_dmi_native_sink*.so is not built; run "

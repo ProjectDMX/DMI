@@ -34,14 +34,14 @@ from tests.tools.golden_workload import PACK_ID, _corpus  # noqa: E402
 
 DRIVER = REPO_ROOT / "native" / "build" / "conformance_spool"
 
-pytestmark = pytest.mark.cpu
-
-if not DRIVER.exists():
-    pytest.skip(
-        "native/build/conformance_spool is not built; run "
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skipif(
+        not DRIVER.exists(),
+        reason="native/build/conformance_spool is not built; run "
         "`make -C native build/conformance_spool`",
-        allow_module_level=True,
-    )
+    ),
+]
 
 MAX_BYTES = 256 * 1024 * 1024
 # The key must end in "<pack_id>.dmi-pack" — both spools enforce this — and
