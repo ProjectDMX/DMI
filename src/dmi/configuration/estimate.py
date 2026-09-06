@@ -97,13 +97,6 @@ class Workload:
     # means a dynamically grown cache (kv = current context length), which
     # is the smaller shape and is called out in the warnings.
     cache_max_len: Optional[int] = None
-    # Sliding-window attention cap (Mistral/Mixtral-style): attention-weight
-    # hooks (pattern, attn_scores) attend at most this many KV positions, so
-    # they are shaped against min(context, window) instead of the full
-    # context. None means the full window. A serving choice, like
-    # cache_max_len -- not model geometry -- so it lives here rather than
-    # in the descriptor.
-    sliding_window: Optional[int] = None
     # Explicit per-stage layer counts for deployments that override vLLM's
     # default partition via VLLM_PP_LAYER_PARTITION. Validated to cover the
     # model exactly (len == pipeline_parallel_size, sum == num_layers);
@@ -208,16 +201,6 @@ class Workload:
         if self.cache_max_len is not None and self.cache_max_len < 1:
             raise ValueError(
                 f"cache_max_len must be >= 1, got {self.cache_max_len}."
-            )
-        if self.sliding_window is not None and (
-            isinstance(self.sliding_window, bool)
-            or not isinstance(self.sliding_window, int)
-            or self.sliding_window < 1
-        ):
-            raise ValueError(
-                f"sliding_window must be an integer >= 1, got "
-                f"{type(self.sliding_window).__name__} "
-                f"({self.sliding_window!r})."
             )
 
 
@@ -512,30 +495,17 @@ def estimate_config(
     # Attention weights span the whole KV window. Decode peaks at the end of
     # generation, which is the step that has to fit. A preallocated cache
     # (StaticCache) is physically wide from the first prefill step, so its
-    # prefill attention shapes use the full cache length. Sliding-window
-    # attention caps the attended range instead: only kv_dim is affected,
-    # and only the attention-weight shapes consume it.
-    def _windowed(kv: int) -> int:
-        if workload.sliding_window is not None:
-            return min(kv, workload.sliding_window)
-        return kv
-
-    prefill_kv = _windowed(
+    # prefill attention shapes use the full cache length.
+    prefill_kv = (
         workload.cache_max_len
         if workload.cache_max_len is not None
         else workload.prompt_tokens
     )
-    decode_kv = _windowed(
+    decode_kv = (
         workload.cache_max_len
         if workload.cache_max_len is not None
         else workload.prompt_tokens + workload.decode_tokens
     )
-    if workload.sliding_window is not None and set(hooks) & _ATTN_WEIGHT_HOOKS:
-        assumptions.append(
-            f"sliding_window={workload.sliding_window}: attention-weight "
-            "shapes use min(context, window) for their KV dimension; every "
-            "other hook is unaffected"
-        )
     if workload.cache_max_len is None and set(hooks) & _ATTN_WEIGHT_HOOKS:
         warnings.append(
             "Prefill attention shapes assume a dynamically grown cache. With "
