@@ -594,25 +594,22 @@ def test_aggregate_peak_follows_the_enabled_phases():
 
 
 # ---------------------------------------------------------------------------
-# Packed/vLLM cannot apply a layer range yet: the pinned integration's
-# attach_model has no `layers` keyword, so attach_config refuses the
-# configuration at launch. The estimator is where the UI learns about the
-# backend (Workload.packed), so it is the place to say so before Save.
-# Tracked in https://github.com/ProjectDMX/DMI-vLLM-Integration/issues/20.
+# Packed/vLLM accepts a layer range: DMI-vLLM-Integration PR #21 (squashed as
+# 23717cb) gave attach_model a `layers` keyword, so a ranged configuration
+# runs on the packed backend and the estimator must not warn about a refusal
+# that no longer exists. attach_config keeps its fail-closed guard for
+# genuinely older integration checkouts.
 # ---------------------------------------------------------------------------
 
 
-def test_packed_layer_range_warns_that_the_pinned_vllm_integration_refuses_it():
+def test_packed_layer_range_carries_no_refusal_warning():
     estimate = estimate_config(
         _config(["resid_pre"], layers=LayerSelection(0, 1)),
         _descriptor(),
         _workload(packed=True),
     )
 
-    matching = [w for w in estimate.warnings if "layer range" in w and "vLLM" in w]
-    assert len(matching) == 1, estimate.warnings
-    assert "attach_config" in matching[0]
-    assert "DMI-vLLM-Integration/issues/20" in matching[0]
+    assert not any("layer range" in w and "vLLM" in w for w in estimate.warnings)
 
 
 def test_batched_layer_range_carries_no_vllm_warning():

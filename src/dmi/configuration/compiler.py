@@ -292,7 +292,8 @@ def attach_config(adapter, model, config: DMIConfig) -> None:
         kwargs["layers"] = config.observations.layers
 
     if kwargs and not _accepts_layers(adapter):
-        # The pinned vLLM integration is exactly this shape. A bare TypeError
+        # An integration older than DMI-vLLM-Integration #21 is exactly this
+        # shape (the pinned one now accepts the keyword). A bare TypeError
         # from inside attach_model names nothing; say here what the keyword
         # means, which artifact carries the gap, and what resolves it.
         raise ConfigurationError(
