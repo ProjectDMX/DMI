@@ -368,3 +368,17 @@ recovers Python-written ones.
 | Idea | Baseline → Result | Verdict | Why |
 |---|---|---|---|
 | Hand-rolled 16-char suffix compare | ready files invisible to recovery | fixed, not reverted | `".dmi-pack.ready"` is 15 chars; replaced with a `HasSuffix` helper at all 3 sites — the conformance test caught it, which is exactly its job |
+
+### A3b native sink (2026-09-05)
+
+`native/csrc/sink/`: bounded queue → single assembler → spool staging, with
+linger/size/record/session sealing, non-closing flush barriers, terminal
+close, latched failures, and the reference's counter snapshot. 9 tests;
+the killer test submits the golden corpus through C++ and reads the staged
+packs back with the Python PackReader (ids, checksums, tenant binding).
+
+| Idea | Baseline → Result | Verdict | Why |
+|---|---|---|---|
+| Reuse WatermarkBatchingQueue | n/a | reverted before code | Batch-dequeue + linger-release semantics fight the capture pattern (strict FIFO, per-item, barrier interleaving); a 90-line ordered queue is honest. Revisit worker management at A5a |
+| Shared JSON scanners across 4 drivers | ~600 lines of parsers → 1 shared lib | kept | Forced by the third driver; all 33 tests stayed green through the migration |
+| Close() calling Snapshot() under lock | self-deadlock on close | fixed | Split SnapshotLocked (lock held) from Snapshot (locks); the gdb-less debug took an instrumented binary because ptrace is unavailable here |

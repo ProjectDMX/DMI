@@ -55,7 +55,7 @@ endif
 # Pure-CPU drivers build without a CUDA toolkit (or torch): the test suite
 # drives them over stdin/stdout. When EVERY requested goal is CPU-only (or
 # clean/host), skip CUDA resolution entirely.
-CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/bench_builder
+CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder
 ifneq ($(strip $(MAKECMDGOALS)),)
 ifeq ($(strip $(filter-out clean host $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
@@ -237,11 +237,11 @@ cuda-info:
 # A1 conformance driver: dependency-free stdin/stdout harness the Python suite
 # uses to drive the native pack builder and compare bytes against the
 # reference. No torch/pybind needed; runs in any shell or CI job.
-build/conformance_main: csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp csrc/pack/pack_builder.h
+build/conformance_main: csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp csrc/pack/pack_builder.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
-	    -o $@ csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp \
-	    -Icsrc/pack -lcrypto
+	    -o $@ csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp csrc/conformance/json_scan.cpp \
+	    -Icsrc/pack -Icsrc/conformance -lcrypto
 
 # A1 throughput gate: PackBuilder on the bench corpus shape (10k x 64 KiB).
 build/bench_builder: csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp csrc/pack/pack_builder.h
@@ -255,11 +255,11 @@ build/bench_builder: csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp csrc
 # libcurl.so.4 ships with the OS. Override on machines with system curl-dev:
 #   make CURL_INCDIR=/usr/include/x86_64-linux-gnu ...
 CURL_INCDIR ?= /tmp/opencode/sysroot/usr/include/x86_64-linux-gnu
-build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/store/s3_sign.h
+build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/store/s3_sign.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
-	    csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp \
-	    -Icsrc/store -lcrypto
+	    csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/conformance/json_scan.cpp \
+	    -Icsrc/store -Icsrc/conformance -lcrypto
 
 # A2 store conformance driver + fault-matrix target. libcurl headers come from
 # the dev .deb extracted to a sysroot (no root needed):
@@ -267,18 +267,27 @@ build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp c
 # The link needs only -L; the runtime libcurl.so.4 ships with the OS. Override:
 #   make CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu ...
 CURL_LIBDIR ?= /tmp/opencode/sysroot/usr/lib/x86_64-linux-gnu
-build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h
+build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
-	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/conformance_store.cpp \
-	    -Icsrc/store -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl
+	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/conformance_store.cpp csrc/conformance/json_scan.cpp \
+	    -Icsrc/store -Icsrc/conformance -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl
 
 # A3a spool conformance driver: no network, no torch; runs in any CI job.
-build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h
+build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
-	    csrc/store/spool.cpp csrc/store/conformance_spool.cpp \
-	    -Icsrc/store -lcrypto
+	    csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/conformance/json_scan.cpp \
+	    -Icsrc/store -Icsrc/conformance -lcrypto
+
+# A3b sink conformance driver: queue + assembler + spool staging in one
+# process, driven over stdin/stdout. Needs only libcrypto + pthreads.
+build/conformance_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/conformance_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/conformance/json_scan.cpp csrc/sink/pack_sink.h csrc/sink/object_key.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/conformance_sink.cpp \
+	    csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/conformance/json_scan.cpp \
+	    -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/conformance -lcrypto -lpthread
 
 clean:
 	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET) \

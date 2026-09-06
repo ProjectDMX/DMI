@@ -52,7 +52,12 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       Evidence: `tests/test_native_spool.py` 7/7 (both cross directions,
       idempotence, capacity, quarantine, stale-.open cleanup, removal).
       Gate: `make -C native build/conformance_spool`.
-- [ ] A3b NativePackSink : RecordSink (single worker → spool), latched failure, counters
+- [x] A3b NativePackSink single worker → spool, latched failure, counters.
+      Evidence: `tests/test_native_pack_sink.py` 9/9 (golden e2e with
+      Python PackReader read-back, session/linger sealing, drop/block
+      policies, duplicates, oversized, size splits, object-key parity).
+      CPU suite green (1155 passed). Gate:
+      `make -C native build/conformance_sink`.
 - [ ] A4 Uploader: bounded workers, bytes-in-flight, checksum verify; e2e ring→Garage
 - [ ] A5a Scope-hash worker pool via pipelined_engine; N-scaling curve
 - [ ] A5b Sink-selection config (opt-in) + rollback demo

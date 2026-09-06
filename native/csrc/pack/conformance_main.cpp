@@ -17,6 +17,8 @@
 
 #include "pack_builder.h"
 
+#include "../conformance/json_scan.h"
+
 #include <openssl/sha.h>
 
 #include <cstdio>
@@ -24,63 +26,7 @@
 #include <sstream>
 #include <string>
 
-namespace {
-
-bool DecodeBase64(const std::string& in, std::vector<uint8_t>* out) {
-  auto nib = [](char c) -> int {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1;
-  };
-  out->clear();
-  uint32_t acc = 0;
-  int bits = 0;
-  for (char c : in) {
-    if (c == '=' || c == '\n' || c == '\r') continue;
-    const int v = nib(c);
-    if (v < 0) return false;
-    acc = acc << 6 | static_cast<uint32_t>(v);
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out->push_back(static_cast<uint8_t>(acc >> bits));
-    }
-  }
-  return true;
-}
-
-void EncodeBase64(const std::vector<uint8_t>& data, std::string* out) {
-  static const char* kAlpha =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  out->clear();
-  out->reserve((data.size() + 2) / 3 * 4);
-  size_t i = 0;
-  for (; i + 2 < data.size(); i += 3) {
-    const uint32_t v = data[i] << 16 | data[i + 1] << 8 | data[i + 2];
-    out->push_back(kAlpha[(v >> 18) & 63]);
-    out->push_back(kAlpha[(v >> 12) & 63]);
-    out->push_back(kAlpha[(v >> 6) & 63]);
-    out->push_back(kAlpha[v & 63]);
-  }
-  if (i + 1 == data.size()) {
-    const uint32_t v = data[i] << 16;
-    out->push_back(kAlpha[(v >> 18) & 63]);
-    out->push_back(kAlpha[(v >> 12) & 63]);
-    out->push_back('=');
-    out->push_back('=');
-  } else if (i + 2 == data.size()) {
-    const uint32_t v = data[i] << 16 | data[i + 1] << 8;
-    out->push_back(kAlpha[(v >> 18) & 63]);
-    out->push_back(kAlpha[(v >> 12) & 63]);
-    out->push_back(kAlpha[(v >> 6) & 63]);
-    out->push_back('=');
-  }
-}
-
-}  // namespace
+namespace jc = dmi_conformance;
 
 int main() {
   std::string line;
@@ -100,21 +46,9 @@ int main() {
       continue;
     }
     if (has_op("crc32")) {
-      // Extract "data_b64" with either separator style.
-      auto find_value = [](const std::string& text, const char* k) -> std::string {
-        for (const char* sep : {": ", ":"}) {
-          const std::string needle = std::string("\"") + k + "\"" + sep + "\"";
-          const size_t at = text.find(needle);
-          if (at == std::string::npos) continue;
-          const size_t start = at + needle.size();
-          const size_t end = text.find('"', start);
-          return text.substr(start, end - start);
-        }
-        return "";
-      };
-      const std::string b64 = find_value(line, "data_b64");
+      const std::string b64 = jc::FindString(line, "data_b64");
       std::vector<uint8_t> data;
-      if (!DecodeBase64(b64, &data)) {
+      if (!jc::DecodeBase64(b64, &data)) {
         std::cout << "{\"ok\":false,\"what\":\"bad base64\"}\n";
         continue;
       }
@@ -135,60 +69,16 @@ int main() {
     // meta_*, find_array), which handle both JSON separator styles. No
     // general JSON parser is needed — or wanted — in a conformance driver.
     auto extract_string = [&](const std::string& k) -> std::string {
-      const std::string needle = "\"" + k + "\":";
-      const size_t at = line.find(needle);
-      if (at == std::string::npos) return "";
-      size_t j = at + needle.size();
-      while (j < line.size() && line[j] == ' ') ++j;
-      if (j >= line.size() || line[j] != '"') return "";
-      ++j;
-      std::string out;
-      while (j < line.size() && line[j] != '"') {
-        if (line[j] == '\\' && j + 1 < line.size()) { out.push_back(line[++j]); ++j; }
-        else out.push_back(line[j++]);
-      }
-      return out;
+      return jc::FindString(line, k);
     };
     auto extract_int = [&](const std::string& k) -> int64_t {
-      const std::string needle = "\"" + k + "\":";
-      const size_t at = line.find(needle);
-      if (at == std::string::npos) return -1;
-      size_t j = at + needle.size();
-      while (j < line.size() && line[j] == ' ') ++j;
-      int64_t v = 0;
-      while (j < line.size() && line[j] >= '0' && line[j] <= '9') {
-        v = v * 10 + (line[j] - '0'); ++j;
-      }
-      return v;
+      return jc::FindInt(line, k);
     };
 
     // Parse the records array: "records": [ {...}, ... ] — with either
-    // separator style. Extract the payload array first, then rebuild a
-    // compact text we can scan reliably.
-    auto find_array = [](const std::string& text, const char* k) -> std::string {
-      for (const char* sep : {": ", ":"}) {
-        const std::string needle = std::string("\"") + k + "\"" + sep + "[";
-        const size_t at = text.find(needle);
-        if (at == std::string::npos) continue;
-        size_t j = at + needle.size();
-        int depth = 1;
-        bool instr = false;
-        for (; j < text.size(); ++j) {
-          if (instr) {
-            if (text[j] == '\\') ++j;
-            else if (text[j] == '"') instr = false;
-            continue;
-          }
-          if (text[j] == '"') instr = true;
-          else if (text[j] == '[') ++depth;
-          else if (text[j] == ']') {
-            if (--depth == 0) return text.substr(at + needle.size(), j - (at + needle.size()));
-          }
-        }
-      }
-      return "";
-    };
-    const std::string records_text = find_array(line, "records");
+    // separator style.
+    const std::string records_text =
+        jc::Unwrap(jc::FindArray(line, "records"));
     if (records_text.empty()) {
       std::cout << "{\"ok\":false,\"what\":\"missing records\"}\n";
       continue;
@@ -196,19 +86,10 @@ int main() {
 
     // Split top-level record objects.
     std::vector<std::string> record_texts;
-    {
-      int d = 0; bool instr = false; size_t start = 0;
-      for (size_t k = 0; k < records_text.size(); ++k) {
-        const char c = records_text[k];
-        if (instr) {
-          if (c == '\\') ++k;
-          else if (c == '"') instr = false;
-          continue;
-        }
-        if (c == '"') instr = true;
-        else if (c == '{') { if (d == 0) start = k; ++d; }
-        else if (c == '}') { --d; if (d == 0) record_texts.push_back(records_text.substr(start, k - start + 1)); }
-      }
+    for (const auto& item : jc::SplitElements(records_text)) {
+      // Items are {...} objects (whitespace around them is harmless).
+      size_t start = item.find('{');
+      if (start != std::string::npos) record_texts.push_back(item);
     }
 
     dmi_pack::PackBuilder builder(
@@ -220,119 +101,35 @@ int main() {
                                   : 1'000'000));
 
     auto meta_string = [&](const std::string& obj, const std::string& k) {
-      const std::string needle = "\"" + k + "\":";
-      const size_t at = obj.find(needle);
-      if (at == std::string::npos) return std::string();
-      size_t q = at + needle.size();
-      while (q < obj.size() && obj[q] == ' ') ++q;
-      if (q >= obj.size() || obj[q] != '"') return std::string();
-      ++q;
-      // The value is JSON-ESCAPED text. Unescape the short forms back to raw
-      // bytes (\n -> 0x0A etc.) and \uXXXX to UTF-8, so the writer re-encodes
-      // them through its own canonical escaper. Without this, the six-char
-      // escape sequence "\u0001" flows through as literal text and the JSON
-      // written into the footer diverges from the reference.
-      std::string raw;
-      while (q < obj.size() && obj[q] != '"') {
-        if (obj[q] == '\\' && q + 1 < obj.size()) {
-          ++q;
-          switch (obj[q]) {
-            case 'n': raw.push_back('\n'); ++q; break;
-            case 't': raw.push_back('\t'); ++q; break;
-            case 'r': raw.push_back('\r'); ++q; break;
-            case 'b': raw.push_back('\b'); ++q; break;
-            case 'f': raw.push_back('\f'); ++q; break;
-            case 'u': {
-              if (q + 4 < obj.size()) {
-                unsigned v = 0;
-                for (int k2 = 1; k2 <= 4; ++k2) {
-                  const char h = obj[q + k2];
-                  v = v * 16 + (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
-                }
-                q += 5;
-                // Encode as UTF-8 (BMP only; surrogates cannot appear here
-                // because json.dumps produced them from real code points and
-                // this driver receives exactly its output).
-                if (v < 0x80) {
-                  raw.push_back(static_cast<char>(v));
-                } else if (v < 0x800) {
-                  raw.push_back(static_cast<char>(0xC0 | (v >> 6)));
-                  raw.push_back(static_cast<char>(0x80 | (v & 0x3F)));
-                } else {
-                  raw.push_back(static_cast<char>(0xE0 | (v >> 12)));
-                  raw.push_back(static_cast<char>(0x80 | ((v >> 6) & 0x3F)));
-                  raw.push_back(static_cast<char>(0x80 | (v & 0x3F)));
-                }
-              }
-              break;
-            }
-            default: raw.push_back(obj[q]); ++q; break;  // \" \\ / etc.
-          }
-        } else {
-          raw.push_back(obj[q++]);
-        }
-      }
-      return raw;
+      // Shared FindString unescapes JSON escapes back to raw bytes, so the
+      // writer re-encodes them through its own canonical escaper.
+      return jc::FindString(obj, k);
     };
     auto meta_null = [&](const std::string& obj, const std::string& k) {
-      const std::string needle = "\"" + k + "\":";
-      const size_t at = obj.find(needle);
-      if (at == std::string::npos) return false;
-      size_t q = at + needle.size();
-      while (q < obj.size() && obj[q] == ' ') ++q;
-      return obj.compare(q, 4, "null") == 0;
+      return jc::FindNull(obj, k);
     };
     auto meta_int = [&](const std::string& obj, const std::string& k) -> int64_t {
-      const std::string needle = "\"" + k + "\":";
-      const size_t at = obj.find(needle);
-      if (at == std::string::npos) return 0;
-      size_t q = at + needle.size();
-      int64_t v = 0; bool neg = false;
-      while (q < obj.size() && obj[q] == ' ') ++q;
-      if (q < obj.size() && obj[q] == '-') { neg = true; ++q; }
-      while (q < obj.size() && obj[q] >= '0' && obj[q] <= '9') {
-        v = v * 10 + (obj[q] - '0'); ++q;
-      }
-      return neg ? -v : v;
+      return jc::FindInt(obj, k);
     };
     auto meta_shape = [&](const std::string& obj) {
       std::vector<uint32_t> shape;
-      // Either separator style after the key.
-      for (const char* sep : {": ", ":"}) {
-        const std::string needle = std::string("\"shape\"") + sep + "[";
-        const size_t at = obj.find(needle);
-        if (at == std::string::npos) continue;
-        size_t q = at + needle.size();
-        while (q < obj.size() && obj[q] != ']') {
-          if (obj[q] >= '0' && obj[q] <= '9') {
-            uint32_t v = 0;
-            while (q < obj.size() && obj[q] >= '0' && obj[q] <= '9') {
-              v = v * 10 + static_cast<uint32_t>(obj[q] - '0');
-              ++q;
-            }
-            shape.push_back(v);
-          } else {
-            ++q;
-          }
+      for (const auto& item : jc::SplitElements(jc::Unwrap(jc::FindArray(obj, "shape")))) {
+        size_t q = 0;
+        while (q < item.size() && item[q] == ' ') ++q;
+        uint32_t v = 0;
+        bool any = false;
+        while (q < item.size() && item[q] >= '0' && item[q] <= '9') {
+          v = v * 10 + static_cast<uint32_t>(item[q] - '0');
+          ++q;
+          any = true;
         }
-        return shape;
+        if (any) shape.push_back(v);
       }
       return shape;
     };
     auto meta_payload = [&](const std::string& obj) {
       std::vector<uint8_t> payload;
-      // Either separator style; a base64 value can be empty ("").
-      for (const char* sep : {": ", ":"}) {
-        const std::string needle =
-            std::string("\"payload_b64\"") + sep + "\"";
-        const size_t at = obj.find(needle);
-        if (at == std::string::npos) continue;
-        size_t q = at + needle.size();
-        const size_t end = obj.find('"', q);
-        if (end == std::string::npos) return payload;
-        DecodeBase64(obj.substr(q, end - q), &payload);
-        return payload;
-      }
+      jc::DecodeBase64(jc::FindString(obj, "payload_b64"), &payload);
       return payload;
     };
 
@@ -391,7 +188,7 @@ int main() {
     }
 
     std::string b64;
-    EncodeBase64(sealed.data, &b64);
+    jc::EncodeBase64(sealed.data, &b64);
     unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256(sealed.data.data(), sealed.data.size(), digest);
     char hex[SHA256_DIGEST_LENGTH * 2 + 1];
