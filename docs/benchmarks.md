@@ -322,3 +322,16 @@ profile confirms interpreter/GIL tax (~35% between threads), a 29%
 `asdict`+deepcopy metadata cost, and a 6.5× CRC kernel gap. Every modeled stage
 clears the target with margin; parallelism via scope-partitioned workers and
 pipelined seal→stage overlaps the SHA-256 bound across packs.
+
+### A1 writer throughput (2026-09-05, same host)
+
+Native `PackBuilder`: **0.63 GiB/s best-of-5** vs Python `PackWriter` 0.359
+(+75%). Split: append 0.64 s, seal 0.27 s per 640 MiB. Append-stage breakdown:
+custom slice-by-16 CRC32 at 4.6–5.1 GiB/s streaming, memcpy 2.6 GiB/s, JSON
+negligible; remainder is per-record metadata handling. Seal matches the
+2.09 GiB/s SHA-256 ceiling measured in T0.3.
+
+| Idea | Baseline → Result | Verdict | Why |
+|---|---|---|---|
+| Replace custom CRC with `-lz` | table 4.6–5.1 vs zlib 1.55–1.59 GiB/s | reverted | System zlib 1.2.11 has no PCLMUL path; custom slice-by-16 is 3× faster and conformance-pinned against zlib output |
+| gprof-guided micro-optimization | — | skipped for now | gprof (-pg) distorted the picture (claimed 93% CRC at 0.55 GiB/s vs 4.7 measured); wall-clock stage timing in the bench is the honest instrument |

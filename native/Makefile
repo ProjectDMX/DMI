@@ -15,7 +15,8 @@ SRCS := csrc/bindings.cpp \
         csrc/ring/p2p_thread.cpp \
         csrc/ring/record_consumer.cpp \
         csrc/ring/ring_torch_op.cpp
-HOST_SRCS := csrc/bindings.cpp csrc/clickhouse_client.cpp
+HOST_SRCS := csrc/bindings.cpp csrc/clickhouse_client.cpp \
+             csrc/pack/pack_builder.cpp
 HEADERS := csrc/dmx_host_utils.h \
            csrc/clickhouse_client.h csrc/clickhouse_record_sink.h \
            csrc/reference_python_capture_sink.h \
@@ -49,6 +50,10 @@ CUDA_CONFIG_STAMP := $(BUILD_DIR)/cuda-toolkit.config
 CUDA_RESOLVE_REQUIRED := 1
 ifneq ($(strip $(MAKECMDGOALS)),)
 ifeq ($(strip $(filter-out clean host,$(MAKECMDGOALS))),)
+CUDA_RESOLVE_REQUIRED := 0
+endif
+# The conformance driver is pure CPU; it must build without a CUDA toolkit.
+ifneq ($(strip $(filter build/conformance_main,$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
 endif
 endif
@@ -223,6 +228,22 @@ cuda-info:
 	@echo "PyTorch CUDA version: $(TORCH_CUDA_VERSION)"
 	@echo "CUDA include directory: $(CUDA_INCLUDE_DIR)"
 	@echo "CUDA library directory: $(CUDA_LIBRARY_DIR)"
+
+# A1 conformance driver: dependency-free stdin/stdout harness the Python suite
+# uses to drive the native pack builder and compare bytes against the
+# reference. No torch/pybind needed; runs in any shell or CI job.
+build/conformance_main: csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp csrc/pack/pack_builder.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
+	    -o $@ csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp \
+	    -Icsrc/pack -lcrypto
+
+# A1 throughput gate: PackBuilder on the bench corpus shape (10k x 64 KiB).
+build/bench_builder: csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp csrc/pack/pack_builder.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O3 -march=native -o $@ \
+	    csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp \
+	    -Icsrc/pack -lcrypto
 
 clean:
 	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET) \

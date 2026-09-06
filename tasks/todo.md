@@ -33,8 +33,13 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
 
 ## Phase A — Hot path
 
-- [ ] A1 Pack writer core (`native/csrc/pack/`) + golden byte-equality test
-      (`tests/test_native_pack_conformance.py`)
+- [x] A1 Pack writer core (`native/csrc/pack/`) + golden byte-equality test
+      (`tests/test_native_pack_conformance.py`).
+      Evidence: 7/7 conformance tests green (golden corpus, escaped text,
+      alignment, empty/multi-dim shapes, rejection parity, zlib CRC parity);
+      bench 0.63 GiB/s best-of-5 vs 0.359 Python (+75%).
+      Gates: `make -C native build/conformance_main`,
+      `make -C native build/bench_builder` (no CUDA needed).
 - [ ] A2a Object-store client core: PUT / GET-range / HEAD + SigV4 (`native/csrc/store/`)
 - [ ] A2b List + fault matrix (short read, mid-write failure, 5xx retry, timeout)
 - [ ] A3a Spool state machine + restart recovery; Python SpoolUploader drains native spool
