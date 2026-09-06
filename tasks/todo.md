@@ -81,8 +81,16 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
 
 ## Phase B — Cold write path
 
-- [ ] B1a Lease coordinator native (textual SQL port) + ported lease live tests
-- [ ] B1b Sole-claimant allocate_version + contention tests
+- [x] B1a Lease coordinator native (textual SQL port) + ported lease live tests.
+      Evidence: tests/test_native_catalog_lease_live.py 9/9 live (refusal names
+      holder, expired takeover, release tombstone at own term, contested claim,
+      fence on empty table, statement byte-identity vs the Python module);
+      `native/csrc/catalog/` speaks ClickHouse HTTP (libcurl, POST body).
+      Gate: `make -C native build/conformance_catalog`.
+- [x] B1b Sole-claimant allocate_version + contention tests.
+      Evidence: same suite — monotonic versions, allocator floor above an
+      external watermark head, 3 racing driver processes → distinct versions,
+      each returned version claimed exactly once.
 - [ ] B2a Descriptor batches + commit_packs/committed_pack_ids
 - [ ] B2b Fenced publish_snapshot; verify_replicated_quorum.py PASS vs C++ writer
 - [ ] B3 indexer-native (footer read → batch → publish) + e2e with Python CaptureReader oracle

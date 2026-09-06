@@ -71,6 +71,10 @@ jobs:
           CLICKHOUSE_SKIP_USER_SETUP: "1"
         ports:
           - 9000:9000
+          # The native catalog driver (B1 lease/allocator port) speaks
+          # ClickHouse's HTTP interface, not the native TCP protocol
+          # clickhouse-driver uses.
+          - 8123:8123
         options: >-
           --health-cmd "clickhouse-client --query 'SELECT 1'"
           --health-interval 10s
@@ -102,6 +106,18 @@ jobs:
           python -m pip install "torch>=2.8,<3" --index-url https://download.pytorch.org/whl/cpu
           python -m pip install pytest wheel numpy "clickhouse-driver>=0.2.0"
           python -m pip install --no-deps -e .
+
+      - name: Build the native catalog driver
+        # The ported lease/allocator suites drive the native coordinator
+        # over ClickHouse's HTTP interface. The runner ships the runtime
+        # libcurl.so.4 but not the dev headers; install those and build
+        # against the system paths.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libcurl4-openssl-dev
+          make -C native build/conformance_catalog \
+            CURL_INCDIR=/usr/include/x86_64-linux-gnu \
+            CURL_LIBDIR=/usr/lib/x86_64-linux-gnu
 
       - name: Run the ClickHouse live suites
         env:
