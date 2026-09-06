@@ -38,9 +38,16 @@ std::string substitute(std::string query, const Params& params) {
       rendered.push_back('\'');
     }
     const std::string needle = "%(" + name + ")s";
+    // The search advances PAST each replacement: a rendered value that
+    // itself contains the placeholder (a holder that literally says
+    // "%(holder)s" is a legal 11-byte string) must not be re-matched
+    // inside the inserted text — restarting at the top grew without
+    // bound and hung the driver.
+    size_t from = 0;
     size_t at;
-    while ((at = query.find(needle)) != std::string::npos) {
+    while ((at = query.find(needle, from)) != std::string::npos) {
       query.replace(at, needle.size(), rendered);
+      from = at + rendered.size();
     }
   }
   return query;
@@ -49,6 +56,11 @@ std::string substitute(std::string query, const Params& params) {
 std::string url_encode(const std::string& value) {
   char* escaped = curl_easy_escape(nullptr, value.c_str(),
                                    static_cast<int>(value.size()));
+  if (escaped == nullptr) {
+    // curl_easy_escape returns null on allocation failure; constructing
+    // a std::string from null is undefined behavior.
+    throw ClickHouseError("libcurl failed to escape a URL component");
+  }
   const std::string out(escaped);
   curl_free(escaped);
   return out;

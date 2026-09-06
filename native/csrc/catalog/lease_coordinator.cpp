@@ -172,11 +172,15 @@ std::string LeaseCoordinator::fence() const {
 bool LeaseCoordinator::fence_eval(const std::string& lease_id,
                                   uint64_t publish_timeout_ns,
                                   uint64_t clock_skew_ns) const {
+  // A deciding read: the answer decides whether the fence admits, and the
+  // fence's head subquery read from a replica behind on the lease table
+  // would admit or deny on stale state.
   const std::vector<Row> rows = client_->execute(
       "SELECT " + fence(),
       {{"lease_id", lease_id},
        {"publish_timeout_ns", publish_timeout_ns},
-       {"clock_skew_ns", clock_skew_ns}});
+       {"clock_skew_ns", clock_skew_ns}},
+      deciding_read());
   return !rows.empty() && rows[0][0] == "1";
 }
 

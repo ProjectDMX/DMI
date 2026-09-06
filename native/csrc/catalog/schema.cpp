@@ -199,6 +199,47 @@ void CatalogSchema::reject_wrong_kinds(
   }
 }
 
+void CatalogSchema::reject_legacy_objects_beside_this_build(
+    const std::vector<SchemaObject>& found) const {
+  // Refuse a catalog an EARLIER build has also been writing.
+  //
+  // A superseded object standing beside this build's own is not a cleanup
+  // that was never finished -- the leftovers-only refusal above covers
+  // that, where nothing of this build is there. It is two builds sharing
+  // one prefix, and the older one is the dangerous half: its ensure_schema
+  // is all CREATE ... IF NOT EXISTS, so it no-ops over these tables and
+  // recreates its own; its publish writes the pack inventory and an
+  // UNCONDITIONAL watermark row carrying no publish identity, and never a
+  // manifest row.
+  //
+  // Nothing else here notices. The stamp reads this version, no table is
+  // missing, and the inventory-without-membership check is per-pack, so it
+  // reports the older writer's packs only once they are already durable
+  // and invisible. Refusing costs a correct deployment nothing: the
+  // rebuild instruction lists these objects, so a catalog rebuilt by this
+  // build has none of them.
+  std::string leftovers;
+  for (const auto& [kind, name] : legacy_objects_) {
+    if (std::none_of(found.begin(), found.end(), [&](const SchemaObject& o) {
+          return o.name == name;
+        })) {
+      continue;
+    }
+    if (!leftovers.empty()) leftovers += ", ";
+    leftovers += "`" + name + "`";
+  }
+  if (leftovers.empty()) return;
+  refuse("catalog `" + database_ + "`.`" + prefix_ + "_*` is at schema "
+         "version " + std::to_string(kSchemaVersion) + " and " + leftovers +
+         " stands beside it: an object only an earlier build creates. "
+         "Either that build is still writing this prefix -- in which case "
+         "its packs are entering the pack inventory with no snapshot "
+         "membership, so they are already invisible to every reader and "
+         "already skipped by every indexing pass -- or a previous rebuild "
+         "left it behind. Stop every writer that is not this build. " +
+         rebuild_instruction());
+}
+
 void CatalogSchema::reject_wrong_sort_key(
     const std::vector<SchemaObject>& found, const std::string& stamp) const {
   // The layout, not just the inventory: the DDL's own IF NOT EXISTS could
@@ -316,8 +357,6 @@ CatalogSchema::State CatalogSchema::verify_compatibility_state(
       found.begin(), found.end(), [&](const SchemaObject& o) {
         return o.name == prefix_ + "_schema_version";
       });
-  const std::string stamp =
-      "is stamped schema version " + std::to_string(kSchemaVersion);
   if (!stamp_table_present) {
     refuse("catalog `" + database_ + "`.`" + prefix_ +
            "_*` holds catalog tables with no stamp table (an install that "
@@ -332,6 +371,38 @@ CatalogSchema::State CatalogSchema::verify_compatibility_state(
            ". A higher version means a newer writer owns this catalog: "
            "upgrade this build rather than writing to it. A lower one is "
            "not upgraded in place. " + rebuild_instruction());
+  }
+  // What the catalog IS, quoted by every refusal below. A stamp table
+  // holding no row is an install of this build that died before stamping,
+  // and calling that "stamped" sends the operator looking for a version
+  // conflict that is not there.
+  const std::string stamp =
+      recorded.has_value()
+          ? "is stamped schema version " + std::to_string(kSchemaVersion)
+          : "holds `" + prefix_ + "_schema_version` with no row in it (an "
+            "install of this build that died before stamping)";
+  reject_legacy_objects_beside_this_build(found);
+  // A superseded object standing beside this build's own is two builds
+  // sharing one prefix, and the OLDER one is the dangerous half: its
+  // publish writes the pack inventory and an unconditional watermark row
+  // carrying no publish identity, and never a manifest row. Nothing else
+  // here notices: the stamp reads this version, no table is missing, and
+  // the inventory-without-membership check is per-pack.
+  for (const auto& [kind, legacy] : legacy_objects_) {
+    if (std::none_of(found.begin(), found.end(), [&](const SchemaObject& o) {
+          return o.name == legacy;
+        })) {
+      continue;
+    }
+    refuse("catalog `" + database_ + "`.`" + prefix_ + "_*` " + stamp +
+           " and `" + legacy +
+           "` stands beside it: an object only an earlier build creates. "
+           "Either that build is still writing this prefix -- in which "
+           "case its packs are entering the pack inventory with no "
+           "snapshot membership, so they are already invisible to every "
+           "reader and already skipped by every indexing pass -- or a "
+           "previous rebuild left it behind. Stop every writer that is "
+           "not this build. " + rebuild_instruction());
   }
   std::vector<std::string> missing;
   for (const auto& [kind, name] : objects_) {

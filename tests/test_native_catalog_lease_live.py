@@ -326,10 +326,15 @@ def test_the_allocator_starts_above_an_externally_published_head():
 def test_concurrent_claimants_get_distinct_versions():
     """B1b: the sole-claimant protocol under real contention.
 
-    Three driver processes race allocate_version on the same claims table.
-    Every handed-out version is distinct and durably claimed exactly once;
-    contested versions (two claimants, one tie) are abandoned by everyone
-    who saw the tie and never returned to anyone.
+    Driver processes race allocate_version on the same claims table. Every
+    handed-out version is distinct and durably claimed; contested versions
+    are abandoned by everyone who saw the tie and never returned to anyone.
+
+    A version handed out may still carry MORE than one claim row -- the
+    loser of a tie abandons the version but its row stays, because claims
+    are append-only and collect_garbage reaps the spent ones (the Python
+    live suite says the same in `test_clickhouse_snapshot_live.py`: "the
+    claims table holds the spent claims a real pass leaves behind").
     """
     with _catalog() as (client, config, prefix):
         results: list[dict] = []
@@ -365,10 +370,27 @@ def test_concurrent_claimants_get_distinct_versions():
         assert len(set(versions)) == len(versions), versions
         claims = (f"`{config.database}`."
                   f"`{config.table_prefix}_capture_version_claims`")
+        # A claimant that loses a tie ABANDONS the version and leaves its
+        # claim row behind: claims are append-only, and collect_garbage is
+        # what reaps the spent ones. Standing in for the loser whose INSERT
+        # lands after the winner's read-back, deterministically.
+        client.execute(
+            f"INSERT INTO {claims} (version, claim_id, claimed_at_ns) "
+            f"VALUES ({versions[0]}, generateUUIDv4(), 1)")
         for v in versions:
+            # DURABLY CLAIMED, not solely claimed. "Exactly one row stands
+            # at this version" is not an invariant of the protocol and only
+            # held in the interleaving where both claimants saw the tie: a
+            # loser that inserts AFTER the winner's read-back leaves a
+            # second row at a version the winner legitimately owns, which
+            # made this assertion fail about once in seven suite runs while
+            # the allocator was behaving exactly as designed. What sole
+            # claimancy means here is decided at read-back time and cannot
+            # be re-read afterwards; what survives is that every handed-out
+            # version is distinct (asserted above) and durably recorded.
             assert client.execute(
                 f"SELECT count() FROM {claims} WHERE version = {v}"
-            ) == [(1,)]
+            ) >= [(1,)]
 
 
 # --- B2: descriptor batches, replay guard, fenced publish -------------------
@@ -1297,3 +1319,355 @@ def test_drop_schema_removes_every_object():
             assert remaining == [], remaining
         finally:
             driver.close()
+
+
+# --- B4: the schema compatibility refusals ------------------------------------
+#
+# `ensure_schema` refuses an incompatible catalog rather than repairing it,
+# and those refusals are most of the schema port. Driven through the
+# `verify_compatibility` op, which returns the verdict without running the
+# install that would otherwise follow it.
+
+def _legacy_table(client, config, prefix):
+    """Create the object only a pre-v4 build creates, beside this build's."""
+    client.execute(
+        f"CREATE TABLE IF NOT EXISTS `{config.database}`."
+        f"`{prefix}_pack_commit_log` (pack_id UUID, index_version UInt64) "
+        "ENGINE = MergeTree ORDER BY pack_id")
+
+
+def test_an_earlier_builds_object_beside_this_builds_is_refused():
+    """Two builds sharing one prefix is the dangerous case, so it refuses.
+
+    A superseded object standing beside this build's own is not an
+    unfinished cleanup -- the leftovers-only refusal covers that, where
+    nothing of this build is present. It means an EARLIER build may still
+    be writing this prefix, and that build's publish writes the pack
+    inventory plus an unconditional watermark row carrying no publish
+    identity, and never a manifest row: its packs land already invisible
+    to every reader and already skipped by every indexing pass.
+
+    Nothing else here notices. The stamp reads this version, no table is
+    missing, and the inventory-without-membership check is per-pack, so it
+    only reports those packs once they are already durable and invisible
+    (`_reject_legacy_objects_beside_this_build` in clickhouse_schema.py).
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            # Healthy to begin with.
+            assert driver.call(
+                op="verify_compatibility")["state"] == "complete"
+
+            _legacy_table(client, config, prefix)
+
+            refused = driver.call(op="verify_compatibility")
+            assert not refused["ok"], refused
+            assert refused["error"] == "CatalogSchemaVersionError", refused
+            assert "_pack_commit_log" in refused["message"], refused
+            assert "an object only an earlier build creates" in (
+                refused["message"]), refused
+            # And the install itself refuses, not just the verdict.
+            assert not driver.call(op="ensure_schema")["ok"]
+
+            # THE ORACLE: the Python writer refuses the same catalog.
+            from dmi.storage.capture.clickhouse_catalog import (
+                ClickHouseCatalogWriter,
+            )
+            from dmi.storage.capture.clickhouse_schema import (
+                CatalogSchemaVersionError,
+            )
+            with pytest.raises(CatalogSchemaVersionError) as oracle:
+                ClickHouseCatalogWriter(client, config).ensure_schema()
+            assert "_pack_commit_log" in str(oracle.value)
+            assert "an object only an earlier build creates" in str(
+                oracle.value)
+        finally:
+            driver.close()
+
+
+def test_an_unstamped_install_is_not_described_as_stamped():
+    """A stamp table with no row in it is an install that died before it.
+
+    The refusals below the version check quote what the catalog IS, and a
+    stamp table holding no row means this build's install died before
+    stamping -- not that the catalog is stamped. Saying it is stamped
+    sends the operator looking for a version conflict that is not there
+    (clickhouse_schema.py builds this clause from whether a row exists).
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            # An install that died before stamping: the layout is there and
+            # the stamp table exists, but it holds no row. The sort key is
+            # then broken so a refusal has to describe the catalog.
+            client.execute(
+                f"TRUNCATE TABLE `{config.database}`.`{prefix}_schema_version`")
+            client.execute(
+                f"DROP TABLE `{config.database}`.`{prefix}_pack_inventory_raw`")
+            client.execute(
+                f"CREATE TABLE `{config.database}`."
+                f"`{prefix}_pack_inventory_raw` (pack_id UUID, "
+                "store_id LowCardinality(String), object_key String, "
+                "object_bytes UInt64, pack_checksum FixedString(64), "
+                "record_count UInt32, index_version UInt64) "
+                "ENGINE = ReplacingMergeTree(index_version) ORDER BY pack_id")
+
+            refused = driver.call(op="verify_compatibility")
+            assert not refused["ok"], refused
+            assert refused["error"] == "CatalogSchemaVersionError", refused
+            assert "sorts by" in refused["message"], refused
+            assert "no row in it" in refused["message"], refused
+            assert "is stamped schema version" not in refused["message"], (
+                refused["message"])
+
+            # THE ORACLE: the Python writer describes it the same way.
+            from dmi.storage.capture.clickhouse_catalog import (
+                ClickHouseCatalogWriter,
+            )
+            from dmi.storage.capture.clickhouse_schema import (
+                CatalogSchemaVersionError,
+            )
+            with pytest.raises(CatalogSchemaVersionError) as oracle:
+                ClickHouseCatalogWriter(client, config).ensure_schema()
+            assert "no row in it" in str(oracle.value)
+            assert "is stamped schema version" not in str(oracle.value)
+        finally:
+            driver.close()
+
+
+def test_a_wrong_sort_key_is_refused_rather_than_stamped_over():
+    """`CREATE TABLE IF NOT EXISTS` no-ops over a pre-v4 sort key.
+
+    An ORDER BY cannot be altered in place, so a table another build
+    created with a different one would keep it while this build's stamp
+    went on over a layout it does not describe.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            client.execute(
+                f"DROP TABLE `{config.database}`.`{prefix}_pack_inventory_raw`")
+            client.execute(
+                f"CREATE TABLE `{config.database}`."
+                f"`{prefix}_pack_inventory_raw` (pack_id UUID, "
+                "store_id LowCardinality(String), object_key String, "
+                "object_bytes UInt64, pack_checksum FixedString(64), "
+                "record_count UInt32, index_version UInt64) "
+                "ENGINE = ReplacingMergeTree(index_version) ORDER BY pack_id")
+
+            refused = driver.call(op="verify_compatibility")
+            assert not refused["ok"], refused
+            assert refused["error"] == "CatalogSchemaVersionError", refused
+            assert "sorts by" in refused["message"], refused
+            assert "cannot be altered in place" in refused["message"], refused
+        finally:
+            driver.close()
+
+
+def test_an_engine_without_the_version_argument_is_refused():
+    """The PROPERTY, not the spelling: index_version must be the version.
+
+    Without it a merge that collapses a duplicate key keeps an arbitrary
+    row rather than the newest, which is the whole basis of supersession.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            client.execute(
+                f"DROP TABLE `{config.database}`.`{prefix}_pack_inventory_raw`")
+            # Right sort key, right kind -- no version argument.
+            client.execute(
+                f"CREATE TABLE `{config.database}`."
+                f"`{prefix}_pack_inventory_raw` (pack_id UUID, "
+                "store_id LowCardinality(String), object_key String, "
+                "object_bytes UInt64, pack_checksum FixedString(64), "
+                "record_count UInt32, index_version UInt64) "
+                "ENGINE = ReplacingMergeTree ORDER BY (store_id, pack_id)")
+
+            refused = driver.call(op="verify_compatibility")
+            assert not refused["ok"], refused
+            assert refused["error"] == "CatalogSchemaVersionError", refused
+            assert "ReplacingMergeTree(index_version)" in refused["message"]
+            assert "arbitrary row" in refused["message"], refused
+        finally:
+            driver.close()
+
+
+def test_a_healthy_replacingmergetree_is_not_refused_by_the_engine_check():
+    """The engine clause carries ORDER BY's parentheses too.
+
+    Reading the arguments to the LAST `)` sweeps the ORDER BY group in and
+    refuses every healthy catalog; only the group that closes the engine
+    call counts. This is the guard on that.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            engine_full = client.execute(
+                "SELECT engine_full FROM system.tables WHERE database = "
+                f"'{config.database}' AND name = '{prefix}_capture_raw'")[0][0]
+            # The precondition the guard is about: ORDER BY contributes its
+            # own parenthesised group after the engine call.
+            assert engine_full.count("(") > 1, engine_full
+
+            assert driver.call(
+                op="verify_compatibility")["state"] == "complete"
+        finally:
+            driver.close()
+
+
+def test_a_wrong_kind_is_refused():
+    """A VIEW where this build creates a TABLE, and the reverse."""
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            client.execute(
+                f"DROP TABLE `{config.database}`.`{prefix}_pack_inventory_raw`")
+            client.execute(
+                f"CREATE VIEW `{config.database}`."
+                f"`{prefix}_pack_inventory_raw` AS SELECT 1 AS pack_id")
+
+            refused = driver.call(op="verify_compatibility")
+            assert not refused["ok"], refused
+            assert refused["error"] == "CatalogSchemaVersionError", refused
+            assert "wrong kind" in refused["message"], refused
+            assert "_pack_inventory_raw" in refused["message"], refused
+        finally:
+            driver.close()
+
+
+def test_a_foreign_schema_version_is_refused():
+    """A higher stamp means a newer writer owns this catalog."""
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            client.execute(
+                f"TRUNCATE TABLE `{config.database}`.`{prefix}_schema_version`")
+            client.execute(
+                f"INSERT INTO `{config.database}`.`{prefix}_schema_version` "
+                "(version, applied_at_ns) VALUES (99, 1)")
+
+            refused = driver.call(op="verify_compatibility")
+            assert not refused["ok"], refused
+            assert refused["error"] == "CatalogSchemaVersionError", refused
+            assert "is at schema version 99" in refused["message"], refused
+            assert "upgrade this build" in refused["message"], refused
+        finally:
+            driver.close()
+
+
+def test_inventory_without_membership_is_refused():
+    """A pack marked indexed that no snapshot admits is not a fresh start.
+
+    Those packs are skipped by every later pass while their captures stay
+    invisible, so the catalog is refused rather than written into.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            client.execute(
+                f"INSERT INTO `{config.database}`."
+                f"`{prefix}_pack_inventory_raw` (pack_id, store_id, "
+                "object_key, object_bytes, pack_checksum, record_count, "
+                "index_version) VALUES (generateUUIDv4(), 'garage', "
+                f"'packs/orphan.dmi-pack', 1024, '{'0' * 64}', 1, 1)")
+
+            refused = driver.call(op="verify_compatibility")
+            assert not refused["ok"], refused
+            assert refused["error"] == "CatalogSchemaVersionError", refused
+            assert "without membership" in refused["message"], refused
+        finally:
+            driver.close()
+
+
+# --- review-thread regressions ------------------------------------------------
+
+def test_execute_returns_valid_json_for_non_empty_results():
+    """The execute op must emit parseable JSON when rows come back.
+
+    escape_into emits its own quotes (EscapeJson); wrapping the field in
+    another pair emitted ""value"" and every non-empty result failed to
+    parse on the test side.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            result = driver.call(
+                op="execute", query="SELECT 1 AS a, 'x,y' AS b")
+            assert result["ok"], result
+            assert result["rows"] == [["1", "x,y"]], result
+        finally:
+            driver.close()
+
+
+def test_a_placeholder_in_a_string_param_does_not_hang_the_substitution():
+    """String params containing their own placeholder must not loop.
+
+    The substitution restarted its search at the top of the statement
+    after every replacement, so a rendered value that contains
+    ``%(name)s`` re-matched inside the inserted text and grew without
+    bound. A holder that says ``%(holder)s`` is a legal 11-byte string.
+    """
+    with _catalog() as (client, config, prefix):
+        proc = subprocess.Popen(
+            [str(DRIVER)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        hung = False
+
+        def call(payload, timeout_s=10.0):
+            nonlocal hung
+            proc.stdin.write(payload + "\n")
+            proc.stdin.flush()
+            result = {}
+
+            def read():
+                result["line"] = proc.stdout.readline()
+
+            reader = threading.Thread(target=read, daemon=True)
+            reader.start()
+            reader.join(timeout_s)
+            if reader.is_alive():
+                hung = True
+                raise subprocess.TimeoutExpired(
+                    str(DRIVER), timeout_s,
+                    "the driver never answered; the substitution looped")
+            return json.loads(result["line"])
+
+        try:
+            response = call(json.dumps(
+                {"op": "open", "database": config.database,
+                 "table_prefix": prefix, **DEFAULTS}))
+            assert response["ok"], response
+            response = call(json.dumps(
+                {"op": "acquire", "holder": "%(holder)s"}))
+            assert response["ok"], response
+            assert response["lease"]["holder"] == "%(holder)s"
+            # The stored holder is the literal string, quoted once —
+            # scoped to THIS lease: the install's own claim row is in the
+            # table too, with its own holder.
+            rows = client.execute(
+                "SELECT DISTINCT holder FROM "
+                f"`{config.database}`.`{config.table_prefix}"
+                "_publisher_lease` WHERE lease_id = "
+                f"toUUID('{response['lease']['lease_id']}')")
+            assert [tuple(r) for r in rows] == [("%(holder)s",)], rows
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                "the substitution looped forever on a self-referential "
+                "parameter")
+        finally:
+            # A hung driver would block close(); kill it outright.
+            proc.kill()
+            proc.wait(timeout=10)

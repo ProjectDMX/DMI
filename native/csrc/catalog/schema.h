@@ -61,6 +61,8 @@ class CatalogSchema {
   State verify_compatibility_state(
       const std::vector<SchemaObject>& found) const;
   void reject_wrong_kinds(const std::vector<SchemaObject>& found) const;
+  void reject_legacy_objects_beside_this_build(
+      const std::vector<SchemaObject>& found) const;
   void reject_wrong_sort_key(const std::vector<SchemaObject>& found,
                              const std::string& stamp) const;
   void reject_wrong_engine(const std::vector<SchemaObject>& found,

@@ -293,6 +293,10 @@ std::string respond(const std::string& line, Session* session) {
       escape_into(writer.leases().fence(), &out);
     } else if (op == "allocate_version") {
       out = ",\"version\":" + std::to_string(writer.allocate_version());
+    } else if (op == "verify_compatibility") {
+      dmi_catalog::CatalogSchema schema(session->client, session->database,
+                                        session->table_prefix);
+      out = ",\"state\":\"" + schema.verify_compatibility() + "\"";
     } else if (op == "ensure_schema") {
       uint64_t retry_sleep_ns = 500'000'000ull;
       if (jc::HasKey(line, "retry_sleep_ns")) {
@@ -301,6 +305,14 @@ std::string respond(const std::string& line, Session* session) {
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);
       schema.ensure(&writer.leases(), retry_sleep_ns);
+    } else if (op == "verify_compatibility") {
+      // The verdict on its own, without the DDL that `ensure_schema` runs
+      // after it: the refusals are most of the schema port, and reaching
+      // them through `ensure_schema` alone means a test cannot tell a
+      // refusal from a failure of the install that follows one.
+      dmi_catalog::CatalogSchema schema(session->client, session->database,
+                                        session->table_prefix);
+      out = ",\"state\":\"" + schema.verify_compatibility() + "\"";
     } else if (op == "drop_schema") {
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);
