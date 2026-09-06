@@ -52,9 +52,14 @@ ifneq ($(strip $(MAKECMDGOALS)),)
 ifeq ($(strip $(filter-out clean host,$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
 endif
-# The conformance driver is pure CPU; it must build without a CUDA toolkit.
-ifneq ($(strip $(filter build/conformance_main,$(MAKECMDGOALS))),)
+# Pure-CPU drivers build without a CUDA toolkit (or torch): the test suite
+# drives them over stdin/stdout. When EVERY requested goal is CPU-only (or
+# clean/host), skip CUDA resolution entirely.
+CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/bench_builder
+ifneq ($(strip $(MAKECMDGOALS)),)
+ifeq ($(strip $(filter-out clean host $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
+endif
 endif
 endif
 
@@ -244,6 +249,29 @@ build/bench_builder: csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp csrc
 	$(CXX) -std=c++17 -O3 -march=native -o $@ \
 	    csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp \
 	    -Icsrc/pack -lcrypto
+
+# A2a SigV4 conformance driver: no torch/pybind/network; runs in any CI job.
+# libcurl headers come from CURL_INCDIR (dev .deb extract); the runtime
+# libcurl.so.4 ships with the OS. Override on machines with system curl-dev:
+#   make CURL_INCDIR=/usr/include/x86_64-linux-gnu ...
+CURL_INCDIR ?= /tmp/opencode/sysroot/usr/include/x86_64-linux-gnu
+build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/store/s3_sign.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp \
+	    -Icsrc/store -lcrypto
+
+# A2 store conformance driver + fault-matrix target. libcurl headers come from
+# the dev .deb extracted to a sysroot (no root needed):
+#   apt-get download libcurl4-openssl-dev && dpkg-deb -x <deb> <sysroot>
+# The link needs only -L; the runtime libcurl.so.4 ships with the OS. Override:
+#   make CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu ...
+CURL_LIBDIR ?= /tmp/opencode/sysroot/usr/lib/x86_64-linux-gnu
+build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/conformance_store.cpp \
+	    -Icsrc/store -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl
 
 clean:
 	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET) \

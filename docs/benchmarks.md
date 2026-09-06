@@ -335,3 +335,24 @@ negligible; remainder is per-record metadata handling. Seal matches the
 |---|---|---|---|
 | Replace custom CRC with `-lz` | table 4.6–5.1 vs zlib 1.55–1.59 GiB/s | reverted | System zlib 1.2.11 has no PCLMUL path; custom slice-by-16 is 3× faster and conformance-pinned against zlib output |
 | gprof-guided micro-optimization | — | skipped for now | gprof (-pg) distorted the picture (claimed 93% CRC at 0.55 GiB/s vs 4.7 measured); wall-clock stage timing in the bench is the honest instrument |
+
+### A2 object store client (2026-09-05)
+
+`native/csrc/store/`: SigV4 signer + libcurl client (PUT single/multipart,
+GET range, HEAD, DELETE, ListV2, botocore-standard retry taxonomy).
+
+- **Signing**: 11 differential tests vs botocore (methods, subresources,
+  nasty keys, session token, regions, whitespace) — identical Authorization
+  headers and canonical requests. Caught: a dropped `%` in hex encoding.
+- **Client**: 8 tests against a fake S3 that re-signs every request with
+  botocore server-side. Round trip, 3 MiB multipart, list pagination, retry
+  on 500 (attempts==2), no retry on 403 (attempts==1), give-up at
+  max_attempts, short-body refusal, timeout retry. Caught: fake stricter
+  than S3 (folded curl's unsigned Accept/Content-Length into the rebuilt
+  canonical — S3 only checks SignedHeaders subset); unquoted LIST values;
+  short-body framing that hung keep-alive.
+
+| Idea | Baseline → Result | Verdict | Why |
+|---|---|---|---|
+| Depend on system curl-dev | unavailable (no root, no headers) | reverted | dev .deb extracted to a local sysroot (`CURL_INCDIR`/`CURL_LIBDIR` make vars); runtime libcurl.so.4 ships with the OS |
+| Verify all received headers server-side | false 403s | reverted | S3 semantics: only SignedHeaders participate; verifier parses them from Authorization |

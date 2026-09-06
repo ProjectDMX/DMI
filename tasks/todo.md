@@ -40,8 +40,14 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       bench 0.63 GiB/s best-of-5 vs 0.359 Python (+75%).
       Gates: `make -C native build/conformance_main`,
       `make -C native build/bench_builder` (no CUDA needed).
-- [ ] A2a Object-store client core: PUT / GET-range / HEAD + SigV4 (`native/csrc/store/`)
-- [ ] A2b List + fault matrix (short read, mid-write failure, 5xx retry, timeout)
+- [x] A2a Object-store client core: PUT / GET-range / HEAD + SigV4 (`native/csrc/store/`).
+      Evidence: `tests/test_native_s3_sign.py` 11/11 differential vs botocore.
+- [x] A2b List + fault matrix (short read, mid-write failure, 5xx retry, timeout).
+      Evidence: `tests/test_native_s3_client.py` 8/8 vs fake S3 with
+      server-side botocore re-signing (PUT/GET/HEAD/DELETE round trip,
+      3 MiB multipart, pagination, retry taxonomy, short-body refusal).
+      Gates: `make -C native build/conformance_sign build/conformance_store`
+      (no CUDA; libcurl headers via CURL_INCDIR sysroot).
 - [ ] A3a Spool state machine + restart recovery; Python SpoolUploader drains native spool
 - [ ] A3b NativePackSink : RecordSink (single worker → spool), latched failure, counters
 - [ ] A4 Uploader: bounded workers, bytes-in-flight, checksum verify; e2e ring→Garage
