@@ -108,7 +108,7 @@ def _submit(session, record: CaptureRecord) -> str:
 def _meta(index: int, session_id: str = "session-0",
           tenant_id: str = "tenant", dtype: str = "uint8",
           shape=(64,)) -> CaptureMetadata:
-    width = {"uint8": 1, "int32": 4}[dtype]
+    width = {"bool": 1, "uint8": 1, "int32": 4, "float32": 4, "int64": 8}[dtype]
     return CaptureMetadata(
         capture_id=f"capture-{index:06d}",
         tenant_id=tenant_id,
@@ -136,7 +136,7 @@ def _meta(index: int, session_id: str = "session-0",
 
 def _record(index: int, **kwargs) -> CaptureRecord:
     meta = _meta(index, **kwargs)
-    width = {"uint8": 1, "int32": 4}[meta.dtype]
+    width = {"bool": 1, "uint8": 1, "int32": 4, "float32": 4, "int64": 8}[meta.dtype]
     size = 1
     for dim in meta.shape:
         size *= dim
@@ -340,3 +340,84 @@ def test_flush_covers_all_workers(sink, tmp_path):
     snapshot = sink.call(op="close", timeout=30)["snapshot"]
     assert snapshot["persisted_records"] == 64
     assert snapshot["failures"] == 0
+
+
+def _submit_row(session, metadata_json: str, payload: bytes, dtype: str,
+                shape: list) -> dict:
+    return session.call(
+        op="submit_row", metadata_json=metadata_json,
+        payload_b64=base64.b64encode(payload).decode(), dtype=dtype,
+        shape=shape,
+    )
+
+
+def _row_meta(index: int = 0, **overrides) -> dict:
+    import json as _json
+
+    meta = _meta(index)
+    mapping = meta.to_mapping()
+    mapping.update(overrides)
+    return _json.dumps(mapping)
+
+
+def test_submit_row_end_to_end(sink, tmp_path):
+    import json as _json
+
+    _open(sink, tmp_path / "spool")
+    for index, (dtype, width) in enumerate(
+        [("bool", 1), ("float32", 4), ("int64", 8)]
+    ):
+        payload = bytes((i % 251 for i in range(16 * width)))
+        mapping = _meta(index, dtype=dtype,
+                        shape=(16,)).to_mapping()
+        response = _submit_row(
+            sink, _json.dumps(mapping), payload, dtype, [16]
+        )
+        assert response["ok"], response
+    assert sink.call(op="flush", timeout=30)["ok"]
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == 3
+    assert snapshot["failures"] == 0
+    # One scope, one pack; dtypes survive the row path.
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=1 << 40)
+    recovered = spool.recover()
+    assert len(recovered) == 1
+    with recovered[0].open() as handle:
+        descriptors = PackReader.from_bytes(handle.read()).descriptors(
+            store_id="spool", object_key=recovered[0].object_key
+        )
+    assert [d.metadata.dtype for d in descriptors] == \
+        ["bool", "float32", "int64"]
+
+
+def test_submit_row_rejects_mismatches(sink, tmp_path):
+    import json as _json
+
+    _open(sink, tmp_path / "spool")
+    payload = bytes(64)
+    good = _row_meta(0, dtype="uint8", shape=[64])
+
+    response = _submit_row(sink, good, payload, "int32", [64])
+    assert not response["ok"] and "dtype" in response["status"].lower()
+
+    response = _submit_row(sink, good, payload, "uint8", [32, 2])
+    assert not response["ok"] and "shape" in response["status"].lower()
+
+    response = _submit_row(sink, good, payload, "uint8", [32])
+    assert not response["ok"] and "shape" in response["status"].lower()
+
+    response = _submit_row(sink, good, bytes(63), "uint8", [64])
+    assert not response["ok"] and "payload" in response["status"].lower()
+
+    response = _submit_row(sink, '{"capture_id":1,', payload, "uint8", [64])
+    assert not response["ok"]
+
+    response = _submit_row(sink, good, payload, "float999", [64])
+    assert not response["ok"] and "dtype" in response["status"].lower()
+
+    # layer_number == -1 is legal (logits-style captures), not "missing".
+    logits = _row_meta(1, layer_number=-1)
+    response = _submit_row(sink, logits, payload, "uint8", [64])
+    assert response["ok"], response
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == 1

@@ -70,9 +70,14 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       Variance ±20% (shared host) — gates clear with margin; re-measure
       quiet before published claims. Gate:
       `make -C native build/bench_sink` (single|interleaved, spooldir=).
-- [ ] A5b Sink-selection config (opt-in) + rollback demo
-- **Checkpoint A** (human review): byte-equality ✓, CPU suite green ✓, N=1 ≥ derived
-  target ✓, N=4 store-bound ✓, rollback ✓
+- [x] A5b Sink-selection config (opt-in) + rollback demo.
+      Evidence: `tests/test_native_adapter_torch.py` 19/19 (torch
+      envelopes, all dtypes, validation, lease guards);
+      `tests/test_native_rollback.py` 3/3 (shared layout, config
+      validation, native→Python catalog indexing). CPU suite 1187 green.
+- **Checkpoint A: PASS** (human review): byte-equality ✓, CPU suite green
+  ✓, N=1 ≥ derived target ✓ (worst reading +45%), N-scaling monotonic ✓,
+  rollback ✓. Follow-ups deferred: CRC fusion, Phase B, Phase C.
 
 ## Phase B — Cold write path
 
@@ -92,7 +97,10 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
 
 ## Checkpoints log
 
-(none yet)
+- Checkpoint A (2026-09-05): PASS. 74 native tests green, CPU suite 1187
+  green, N-scaling monotonic, rollback proven. Commits cdc774a..A5b.
+  Open follow-ups: CRC+memcpy fusion, Phase B (catalog-native),
+  Phase C (reader-native + default-switch).
 
 ## Escalations
 

@@ -17,7 +17,7 @@
 
 #include "pack_builder.h"
 
-#include "../conformance/json_scan.h"
+#include "../common/json.h"
 
 #include <openssl/sha.h>
 
@@ -26,7 +26,7 @@
 #include <sstream>
 #include <string>
 
-namespace jc = dmi_conformance;
+namespace jc = dmi_common;
 
 int main() {
   std::string line;

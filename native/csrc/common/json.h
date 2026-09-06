@@ -4,14 +4,14 @@
 // accept both compact and spaced separators (", "/": " vs ","/":") because
 // Python's json.dumps uses the latter by default. No external dependencies.
 
-#ifndef DMI_CONFORMANCE_JSON_SCAN_H_
-#define DMI_CONFORMANCE_JSON_SCAN_H_
+#ifndef DMI_COMMON_JSON_H_
+#define DMI_COMMON_JSON_H_
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace dmi_conformance {
+namespace dmi_common {
 
 // JSON string escape sequences back to raw bytes; \uXXXX to UTF-8 (BMP).
 // `q` must be positioned just after the opening quote; returns with `q` on
@@ -25,6 +25,11 @@ std::string FindString(const std::string& text, const std::string& key,
 // First non-negative integer value for `key` (either separator style).
 // Returns -1 when the key is absent.
 int64_t FindInt(const std::string& text, const std::string& key);
+
+// True when `key` is present with any value (either separator style).
+// Needed where -1 is a legal value (layer_number) and FindInt's missing
+// sentinel would collide with it.
+bool HasKey(const std::string& text, const std::string& key);
 
 // First boolean value for `key`.
 bool FindBool(const std::string& text, const std::string& key);
@@ -54,4 +59,4 @@ void EscapeJson(const std::string& value, std::string* out);
 
 }  // namespace dmi_conformance
 
-#endif  // DMI_CONFORMANCE_JSON_SCAN_H_
+#endif  // DMI_COMMON_JSON_H_

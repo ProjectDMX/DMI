@@ -427,3 +427,25 @@ Host variance note: this is a shared box (48 users, load 18–27); expect
 | Raw FNV `% workers` routing | all 8 scopes on worker 0 (flat "scaling") | fixed | fmix64 finalizer; low bits of FNV are weak for similar inputs. Verified distribution in the ledger review, then in code |
 | Spool mutex across file writes | serialized all stagers on fsync | fixed | Lock covers accounting decisions only; byte reservation keeps max_bytes exact. Also fixed a double-count on the EEXIST race path |
 | CRC+memcpy fusion, metadata moves | writer 0.63 → est. ~0.9 | deferred | Would move 3 instances → 2 for the 1.1 GiB/s host, but no gate demands it yet — Checkpoint A decision |
+
+### A5b adapter + selection + Checkpoint A (2026-09-05)
+
+`NativePackSink : ring::RecordSink` (torch-CPU module `_dmi_native_sink`):
+envelopes validate and submit with no Python on the path. 19 adapter tests
+(all ten dtypes, layout/cell/dtype/shape/slice validation, lease guards)
+plus row-path conformance through the CPU-only driver. Selection is a
+factory (`dmi.storage.capture.native_sink.create_native_pack_sink`) sharing
+the reference wire layout; rollback is proven by indexing native-staged
+packs with the Python CatalogIndexer (byte-identical descriptors).
+
+**Checkpoint A verdict: PASS.**
+- Byte-equality: 7/7 pack conformance (golden corpus included).
+- CPU suite green: 1187 passed (74 native), 0 failed.
+- N=1: 0.34–0.44 vs 0.235 baseline (+45–87%, worst reading clears).
+- N-scaling monotonic to N=8 on NVMe (+121%); disk fsync is the visible
+  ceiling, pack-side overlaps fully.
+- Rollback: native→Python indexing proven; spool contract both directions.
+
+Deferred to a follow-up initiative (Checkpoint A review): CRC+memcpy
+fusion (3 instances → 2 for the 1.1 GiB/s host), Phase B (catalog/indexer
+native), Phase C (reader native).

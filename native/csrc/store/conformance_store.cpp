@@ -19,7 +19,7 @@
 
 #include "s3_client.h"
 
-#include "../conformance/json_scan.h"
+#include "../common/json.h"
 #include "spool.h"
 #include "uploader.h"
 
@@ -30,7 +30,7 @@
 
 
 
-namespace jc = dmi_conformance;
+namespace jc = dmi_common;
 
 // metadata object: {"k":"v",...} — string values only.
 std::map<std::string, std::string> FindMetadata(const std::string& text) {

@@ -55,7 +55,7 @@ endif
 # Pure-CPU drivers build without a CUDA toolkit (or torch): the test suite
 # drives them over stdin/stdout. When EVERY requested goal is CPU-only (or
 # clean/host), skip CUDA resolution entirely.
-CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder
+CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/_dmi_native_sink
 ifneq ($(strip $(MAKECMDGOALS)),)
 ifeq ($(strip $(filter-out clean host $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
@@ -237,11 +237,11 @@ cuda-info:
 # A1 conformance driver: dependency-free stdin/stdout harness the Python suite
 # uses to drive the native pack builder and compare bytes against the
 # reference. No torch/pybind needed; runs in any shell or CI job.
-build/conformance_main: csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp csrc/pack/pack_builder.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h
+build/conformance_main: csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp csrc/pack/pack_builder.h csrc/common/json.cpp csrc/common/json.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
-	    -o $@ csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp csrc/conformance/json_scan.cpp \
-	    -Icsrc/pack -Icsrc/conformance -lcrypto
+	    -o $@ csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp csrc/common/json.cpp \
+	    -Icsrc/pack -Icsrc/common -lcrypto
 
 # A1 throughput gate: PackBuilder on the bench corpus shape (10k x 64 KiB).
 build/bench_builder: csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp csrc/pack/pack_builder.h
@@ -255,11 +255,11 @@ build/bench_builder: csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp csrc
 # libcurl.so.4 ships with the OS. Override on machines with system curl-dev:
 #   make CURL_INCDIR=/usr/include/x86_64-linux-gnu ...
 CURL_INCDIR ?= /tmp/opencode/sysroot/usr/include/x86_64-linux-gnu
-build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/store/s3_sign.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h
+build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/store/s3_sign.h csrc/common/json.cpp csrc/common/json.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
-	    csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/conformance/json_scan.cpp \
-	    -Icsrc/store -Icsrc/conformance -lcrypto
+	    csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/common/json.cpp \
+	    -Icsrc/store -Icsrc/common -lcrypto
 
 # A2 store conformance driver + fault-matrix target. libcurl headers come from
 # the dev .deb extracted to a sysroot (no root needed):
@@ -267,27 +267,47 @@ build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp c
 # The link needs only -L; the runtime libcurl.so.4 ships with the OS. Override:
 #   make CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu ...
 CURL_LIBDIR ?= /tmp/opencode/sysroot/usr/lib/x86_64-linux-gnu
-build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/store/spool.h csrc/store/uploader.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h
+build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/store/spool.h csrc/store/uploader.h csrc/common/json.cpp csrc/common/json.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
-	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/conformance/json_scan.cpp \
-	    -Icsrc/store -Icsrc/conformance -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
+	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/common/json.cpp \
+	    -Icsrc/store -Icsrc/common -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
 
 # A3a spool conformance driver: no network, no torch; runs in any CI job.
-build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h csrc/conformance/json_scan.cpp csrc/conformance/json_scan.h
+build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h csrc/common/json.cpp csrc/common/json.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
-	    csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/conformance/json_scan.cpp \
-	    -Icsrc/store -Icsrc/conformance -lcrypto
+	    csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/common/json.cpp \
+	    -Icsrc/store -Icsrc/common -lcrypto
 
+# A5b torch-CPU adapter module: NativePackSink as an importable extension
+# with a synthetic-envelope entry point for tests. No CUDA, no ClickHouse,
+# no ring engine — torch CPU + libcrypto + spool/pack sources only.
+# PYTHON must point at the venv interpreter:
+#   make build/_dmi_native_sink... PYTHON=/path/to/venv/bin/python
+SINK_EXT := _dmi_native_sink$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))" 2>/dev/null)
+build/_dmi_native_sink: csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -fPIC -shared -DTORCH_EXTENSION_NAME=_dmi_native_sink \
+	    $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join('-I'+p for p in include_paths()))") \
+	    $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); print('-I'+paths.get('include'))") \
+	    -Icsrc -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/common \
+	    -D_GLIBCXX_USE_CXX11_ABI=$(shell $(PYTHON) -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))") \
+	    -o $(BUILD_DIR)/$(SINK_EXT) \
+	    csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp \
+	    csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp \
+	    csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp \
+	    csrc/store/spool.cpp csrc/common/json.cpp \
+	    $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join('-L'+p for p in library_paths()))") \
+	    -ltorch_cpu -ltorch -lc10 -ltorch_python -lcrypto -lpthread
 # A3b sink conformance driver: queue + assembler + spool staging in one
 # process, driven over stdin/stdout. Needs only libcrypto + pthreads.
-build/conformance_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/conformance_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/conformance/json_scan.cpp csrc/sink/pack_sink.h csrc/sink/object_key.h
+build/conformance_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/conformance_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp csrc/sink/pack_sink.h csrc/sink/object_key.h csrc/sink/record_row.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
-	    csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/conformance_sink.cpp \
-	    csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/conformance/json_scan.cpp \
-	    -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/conformance -lcrypto -lpthread
+	    csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/conformance_sink.cpp \
+	    csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp \
+	    -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/common -lcrypto -lpthread
 
 clean:
 	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET) \

@@ -22,10 +22,11 @@
 #include <string>
 #include <vector>
 
-#include "../conformance/json_scan.h"
+#include "../common/json.h"
 #include "object_key.h"
+#include "record_row.h"
 
-namespace jc = dmi_conformance;
+namespace jc = dmi_common;
 
 namespace {
 
@@ -178,6 +179,46 @@ int main() {
       std::string out = "{\"ok\":true,\"admission\":\"";
       out += dmi_sink::AdmissionName(admission);
       std::cout << out << "\"}\n";
+      continue;
+    }
+    if (op == "submit_row") {
+      // Row path (metadata JSON string + declared envelope dtype/shape),
+      // exactly what the torch adapter feeds SubmitRow per envelope row.
+      dmi_sink::RowInput input;
+      input.metadata_json = jc::FindString(line, "metadata_json");
+      std::vector<uint8_t> payload;
+      jc::DecodeBase64(jc::FindString(line, "payload_b64"), &payload);
+      input.payload = payload.data();
+      input.payload_bytes = payload.size();
+      input.dtype_name = jc::FindString(line, "dtype");
+      for (const auto& item : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "shape")))) {
+        size_t q = 0;
+        while (q < item.size() && item[q] == ' ') ++q;
+        int64_t v = 0;
+        bool any = false;
+        while (q < item.size() && item[q] >= '0' && item[q] <= '9') {
+          v = v * 10 + (item[q] - '0');
+          ++q;
+          any = true;
+        }
+        if (any) input.shape.push_back(v);
+      }
+      std::string detail;
+      const dmi_sink::RowStatus status =
+          dmi_sink::SubmitRow(*sink, input, &detail);
+      std::string out = "{\"ok\":";
+      out += (status == dmi_sink::RowStatus::kOk) ? "true" : "false";
+      if (status == dmi_sink::RowStatus::kOk) {
+        out += "}";
+      } else {
+        out += ",\"status\":";
+        jc::EscapeJson(dmi_sink::RowStatusName(status), &out);
+        out += ",\"what\":";
+        jc::EscapeJson(detail, &out);
+        out += "}";
+      }
+      std::cout << out << "\n";
       continue;
     }
     if (op == "flush") {

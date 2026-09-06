@@ -350,6 +350,11 @@ SinkSnapshot PackSink::Snapshot() const {
   return SnapshotLocked();
 }
 
+std::string PackSink::LastError() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return latched_error_;
+}
+
 SinkSnapshot PackSink::SnapshotLocked() const {
   SinkSnapshot snapshot = counters_;
   snapshot.queue_records = queue_records_;

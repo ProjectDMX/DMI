@@ -15,7 +15,7 @@
 
 #include "spool.h"
 
-#include "../conformance/json_scan.h"
+#include "../common/json.h"
 
 #include <iostream>
 #include <map>
@@ -24,7 +24,7 @@
 
 
 
-namespace jc = dmi_conformance;
+namespace jc = dmi_common;
 
 void EmitStaged(const dmi_store::StagedPack& s, std::string* out) {
   out->append("{\"pack_id\":");

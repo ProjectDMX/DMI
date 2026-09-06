@@ -1,6 +1,6 @@
-#include "json_scan.h"
+#include "json.h"
 
-namespace dmi_conformance {
+namespace dmi_common {
 
 std::string Unescape(const std::string& text, size_t& q) {
   std::string raw;
@@ -79,8 +79,14 @@ int64_t FindInt(const std::string& text, const std::string& key) {
   return -1;
 }
 
-bool FindBool(const std::string& text, const std::string& key) {
+bool HasKey(const std::string& text, const std::string& key) {
   for (const char* sep : {": ", ":"}) {
+    if (text.find("\"" + key + "\"" + sep) != std::string::npos) return true;
+  }
+  return false;
+}
+
+bool FindBool(const std::string& text, const std::string& key) {  for (const char* sep : {": ", ":"}) {
     const std::string needle = "\"" + key + "\"" + sep;
     const size_t at = text.find(needle);
     if (at == std::string::npos) continue;

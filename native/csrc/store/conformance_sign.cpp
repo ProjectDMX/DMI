@@ -14,7 +14,7 @@
 
 #include "s3_sign.h"
 
-#include "../conformance/json_scan.h"
+#include "../common/json.h"
 
 #include <iostream>
 #include <map>
@@ -23,7 +23,7 @@
 
 
 
-namespace jc = dmi_conformance;
+namespace jc = dmi_common;
 
 int main() {
   std::string line;

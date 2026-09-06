@@ -150,6 +150,8 @@ class PackSink {
   // Terminal close: drains, joins, returns the final snapshot.
   SinkSnapshot Close(double timeout_s, std::string* error);
   SinkSnapshot Snapshot() const;
+  // Latched async failure, if any (for RecordSink::rethrow_if_failed).
+  std::string LastError() const;
 
  private:
   using Item = std::variant<SinkRecord, std::shared_ptr<FlushBarrier>>;
