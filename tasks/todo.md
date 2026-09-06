@@ -155,16 +155,22 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       concurrency tests (two concurrent publishes on one writer serialised;
       cross-process use refused; failed publish releases the writer) port
       alongside the SQL suites.
-      STATUS (2026-09-06, Checkpoint B review): the QUARANTINE half is
-      ported and tested (injected transport death, and a lapsed window that
-      reports itself over). The serialisation and process-binding halves are
-      NOT: the native writer relies on the driver being one process running
-      one op at a time instead of holding a lock or checking its pid, and
-      the three #125 concurrency tests are not ported. Sound for the shipped
-      path — pybind and the driver are single-threaded per writer — and a
-      real gap for any other embedding, so it is recorded as a deferred
-      follow-up at Checkpoint B rather than claimed. `catalog_writer.h`
-      names the assumption at the class it applies to.
+      STATUS (2026-09-06, Checkpoint B review): the QUARANTINE half was
+      ported and tested; the serialisation and process-binding halves were
+      not, and were recorded as a deferred follow-up.
+      CLOSED (2026-09-06, commit 3fd5b26): all three halves are now ported.
+      CatalogWriter serialises its public surface behind a recursive mutex
+      and refuses any call from a process other than the one that built it,
+      with the process check ahead of the lock (a fork copies the mutex as
+      it stood, so a check behind it would never run in the child). The
+      three #125 tests port with it, driven by two new driver ops — the
+      driver runs one op at a time, so `publish_concurrent` runs two
+      publishes on two of its own threads and `publish_from_forked_child`
+      forks. Removing the lock to check the test reproduced #125 itself:
+      the second publish finished inside the first one's wedge and the
+      first lost the race to the watermark written underneath it.
+      Still outside the guarantee, deliberately: `leases()` hands out the
+      bare coordinator for the B1 raw-protocol suite and bypasses the lock.
 - [x] B3 indexer-native (footer read → batch → publish) + e2e with Python CaptureReader oracle.
       Evidence: native sink → native uploader → native pack-index read → native
       publish, and the PYTHON CaptureReader resolves both captures with
@@ -203,10 +209,21 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
   before any published throughput claim: re-measure on a quiet host and
   re-baseline on the reference host (owns the A5a/plan obligation — STILL
   OPEN, and the only thing between these numbers and a published one).
-  Deferred follow-ups: the #125 serialisation + process-binding halves and
-  their three tests (see B2b STATUS); a byte-identity gate over the
-  parameterized statements, or a risk-table correction saying they are
-  semantically equivalent rather than textually identical.
+  Deferred follow-ups, as recorded at the review:
+  1. the #125 serialisation + process-binding halves and their three tests
+     — CLOSED 2026-09-06 in 3fd5b26, see B2b STATUS;
+  2. a byte-identity gate over the parameterized statements, or a
+     risk-table correction saying they are semantically equivalent rather
+     than textually identical — the correction landed in plan.md; the gate
+     itself is still open;
+  3. the quiet-host re-measure and reference-host re-baseline — STILL
+     OPEN, and still the only thing between these numbers and a published
+     one.
+  Found separately, during the CI work rather than at this review: the
+  CPU-only C++ is compiled nowhere in CI except the live job's build step
+  (`check-compile` is `python -m compileall`; the native build test runs
+  `make -n`, a dry run, on the CUDA target). That is how a `pack_sink.cpp`
+  which did not compile on the runner survived in-tree. Open.
 
 ## Phase C — Serving path
 
