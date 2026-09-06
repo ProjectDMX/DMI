@@ -208,13 +208,30 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
   parameterized statements, or a risk-table correction saying they are
   semantically equivalent rather than textually identical.
 
-## Phase C — Serving path (deferred follow-up)
+## Phase C — Serving path
 
-- [ ] C1 reader-native + read-parity suite
+- [x] C1 reader-native + read-parity suite.
+      Evidence: tests/test_native_reader_parity_live.py 5/5 live (×3
+      consecutive): search parity with and without filters (identical
+      32-field descriptors both readers), CURSORS CROSS THE
+      IMPLEMENTATIONS (the native codec is byte-compatible with
+      cursor.py — same envelope, unpadded url-safe base64, canonical
+      alphabet, filter_hash binding — so each side accepts and walks the
+      other's cursor and the union covers the corpus in order),
+      get_by_ids parity with the watermark bound refused by both, and
+      supersession (a later pack's locator wins on both sides). Native
+      bugs the parity suite caught: the projection's aggregate tuple
+      carried the sort-key columns (a mixed-row shape), the cursor keyed
+      on the row BEYOND the page, and the base64url encoder emitted a
+      phantom trailing byte in both remainder branches. 44/44 native
+      catalog tests; CPU gate 1202 passed.
 - [ ] C2 hydration/summary/extensions native
 - [ ] C3 default-switch + final docs
 
 ## Checkpoints log
+
+- Checkpoint B (2026-09-06): PASS (human review of #127 + #128). Phase C
+  authorized: C1 reader-native next.
 
 - Checkpoint B (2026-09-06): PASS with two recorded gaps, reviewed against
   PR #127 (Phase A → main, head 6473871) and PR #128 (Phase B stacked, head

@@ -18,6 +18,7 @@
 #include "catalog_writer.h"
 #include "clickhouse_client.h"
 #include "indexer.h"
+#include "reader.h"
 #include "schema.h"
 #include "lease_coordinator.h"
 #include "version_allocator.h"
@@ -284,6 +285,116 @@ std::string respond(const std::string& line, Session* session) {
       escape_into(writer.leases().fence(), &out);
     } else if (op == "allocate_version") {
       out = ",\"version\":" + std::to_string(writer.allocate_version());
+    } else if (op == "current_watermark") {
+      dmi_catalog::NativeCaptureCatalog reader(session->client, [&] {
+        dmi_catalog::ReaderConfig rc;
+        rc.database = session->database;
+        rc.table_prefix = session->table_prefix;
+        return rc;
+      }());
+      out = ",\"watermark\":";
+      escape_into(reader.current_watermark(), &out);
+    } else if (op == "search") {
+      dmi_catalog::ReaderConfig rc;
+      rc.database = session->database;
+      rc.table_prefix = session->table_prefix;
+      dmi_catalog::NativeCaptureCatalog reader(session->client, rc);
+      dmi_catalog::SearchFilters filters;
+      for (const char* key : {"tenant_id", "experiment_id", "run_id",
+                              "session_id", "model_id"}) {
+        if (jc::HasKey(line, key) && !jc::FindNull(line, key)) {
+          if (key == std::string("tenant_id")) {
+            filters.tenant_id = jc::FindString(line, key);
+          } else if (key == std::string("experiment_id")) {
+            filters.experiment_id = jc::FindString(line, key);
+          } else if (key == std::string("run_id")) {
+            filters.run_id = jc::FindString(line, key);
+          } else if (key == std::string("session_id")) {
+            filters.session_id = jc::FindString(line, key);
+          } else if (key == std::string("model_id")) {
+            filters.model_id = jc::FindString(line, key);
+          }
+        }
+      }
+      if (jc::HasKey(line, "hook_names") && !jc::FindNull(line, "hook_names")) {
+        for (const std::string& hook : jc::SplitElements(
+                 jc::Unwrap(jc::FindArray(line, "hook_names")))) {
+          filters.hook_names.push_back(jc::ParseLiteral(hook));
+        }
+      }
+      if (jc::HasKey(line, "layer_numbers") &&
+          !jc::FindNull(line, "layer_numbers")) {
+        for (const std::string& layer : jc::SplitElements(
+                 jc::Unwrap(jc::FindArray(line, "layer_numbers")))) {
+          filters.layer_numbers.push_back(
+              static_cast<int64_t>(std::atoll(layer.c_str())));
+        }
+      }
+      if (jc::HasKey(line, "captured_after_ns") &&
+          !jc::FindNull(line, "captured_after_ns")) {
+        filters.captured_after_ns = static_cast<uint64_t>(
+            jc::FindInt(line, "captured_after_ns"));
+      }
+      if (jc::HasKey(line, "captured_before_ns") &&
+          !jc::FindNull(line, "captured_before_ns")) {
+        filters.captured_before_ns = static_cast<uint64_t>(
+            jc::FindInt(line, "captured_before_ns"));
+      }
+      if (jc::HasKey(line, "cursor") && !jc::FindNull(line, "cursor")) {
+        filters.cursor = jc::FindString(line, "cursor");
+      }
+      filters.limit = static_cast<int>(jc::FindInt(line, "limit"));
+      const dmi_catalog::SearchPage page = reader.search(filters);
+      out = ",\"items\":[";
+      bool first_item = true;
+      for (const auto& item : page.items) {
+        if (!first_item) out += ",";
+        first_item = false;
+        out += "[";
+        bool first_field = true;
+        for (const auto& field : item) {
+          if (!first_field) out += ",";
+          first_field = false;
+          escape_into(field, &out);
+        }
+        out += "]";
+      }
+      out += "],\"next_cursor\":";
+      if (page.next_cursor.has_value()) {
+        escape_into(*page.next_cursor, &out);
+      } else {
+        out += "null";
+      }
+      out += ",\"watermark\":";
+      escape_into(page.watermark, &out);
+    } else if (op == "get_by_ids") {
+      dmi_catalog::ReaderConfig rc;
+      rc.database = session->database;
+      rc.table_prefix = session->table_prefix;
+      dmi_catalog::NativeCaptureCatalog reader(session->client, rc);
+      std::vector<std::string> capture_ids;
+      for (const std::string& id : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
+        capture_ids.push_back(jc::ParseLiteral(id));
+      }
+      const auto items = reader.get_by_ids(
+          capture_ids, jc::FindString(line, "tenant_id"),
+          jc::FindString(line, "watermark"));
+      out = ",\"items\":[";
+      bool first_item = true;
+      for (const auto& item : items) {
+        if (!first_item) out += ",";
+        first_item = false;
+        out += "[";
+        bool first_field = true;
+        for (const auto& field : item) {
+          if (!first_field) out += ",";
+          first_field = false;
+          escape_into(field, &out);
+        }
+        out += "]";
+      }
+      out += "]";
     } else if (op == "verify_compatibility") {
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);
@@ -296,6 +407,116 @@ std::string respond(const std::string& line, Session* session) {
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);
       schema.ensure(&writer.leases(), retry_sleep_ns);
+    } else if (op == "current_watermark") {
+      dmi_catalog::NativeCaptureCatalog reader(session->client, [&] {
+        dmi_catalog::ReaderConfig rc;
+        rc.database = session->database;
+        rc.table_prefix = session->table_prefix;
+        return rc;
+      }());
+      out = ",\"watermark\":";
+      escape_into(reader.current_watermark(), &out);
+    } else if (op == "search") {
+      dmi_catalog::ReaderConfig rc;
+      rc.database = session->database;
+      rc.table_prefix = session->table_prefix;
+      dmi_catalog::NativeCaptureCatalog reader(session->client, rc);
+      dmi_catalog::SearchFilters filters;
+      for (const char* key : {"tenant_id", "experiment_id", "run_id",
+                              "session_id", "model_id"}) {
+        if (jc::HasKey(line, key) && !jc::FindNull(line, key)) {
+          if (key == std::string("tenant_id")) {
+            filters.tenant_id = jc::FindString(line, key);
+          } else if (key == std::string("experiment_id")) {
+            filters.experiment_id = jc::FindString(line, key);
+          } else if (key == std::string("run_id")) {
+            filters.run_id = jc::FindString(line, key);
+          } else if (key == std::string("session_id")) {
+            filters.session_id = jc::FindString(line, key);
+          } else if (key == std::string("model_id")) {
+            filters.model_id = jc::FindString(line, key);
+          }
+        }
+      }
+      if (jc::HasKey(line, "hook_names") && !jc::FindNull(line, "hook_names")) {
+        for (const std::string& hook : jc::SplitElements(
+                 jc::Unwrap(jc::FindArray(line, "hook_names")))) {
+          filters.hook_names.push_back(jc::ParseLiteral(hook));
+        }
+      }
+      if (jc::HasKey(line, "layer_numbers") &&
+          !jc::FindNull(line, "layer_numbers")) {
+        for (const std::string& layer : jc::SplitElements(
+                 jc::Unwrap(jc::FindArray(line, "layer_numbers")))) {
+          filters.layer_numbers.push_back(
+              static_cast<int64_t>(std::atoll(layer.c_str())));
+        }
+      }
+      if (jc::HasKey(line, "captured_after_ns") &&
+          !jc::FindNull(line, "captured_after_ns")) {
+        filters.captured_after_ns = static_cast<uint64_t>(
+            jc::FindInt(line, "captured_after_ns"));
+      }
+      if (jc::HasKey(line, "captured_before_ns") &&
+          !jc::FindNull(line, "captured_before_ns")) {
+        filters.captured_before_ns = static_cast<uint64_t>(
+            jc::FindInt(line, "captured_before_ns"));
+      }
+      if (jc::HasKey(line, "cursor") && !jc::FindNull(line, "cursor")) {
+        filters.cursor = jc::FindString(line, "cursor");
+      }
+      filters.limit = static_cast<int>(jc::FindInt(line, "limit"));
+      const dmi_catalog::SearchPage page = reader.search(filters);
+      out = ",\"items\":[";
+      bool first_item = true;
+      for (const auto& item : page.items) {
+        if (!first_item) out += ",";
+        first_item = false;
+        out += "[";
+        bool first_field = true;
+        for (const auto& field : item) {
+          if (!first_field) out += ",";
+          first_field = false;
+          escape_into(field, &out);
+        }
+        out += "]";
+      }
+      out += "],\"next_cursor\":";
+      if (page.next_cursor.has_value()) {
+        escape_into(*page.next_cursor, &out);
+      } else {
+        out += "null";
+      }
+      out += ",\"watermark\":";
+      escape_into(page.watermark, &out);
+    } else if (op == "get_by_ids") {
+      dmi_catalog::ReaderConfig rc;
+      rc.database = session->database;
+      rc.table_prefix = session->table_prefix;
+      dmi_catalog::NativeCaptureCatalog reader(session->client, rc);
+      std::vector<std::string> capture_ids;
+      for (const std::string& id : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
+        capture_ids.push_back(jc::ParseLiteral(id));
+      }
+      const auto items = reader.get_by_ids(
+          capture_ids, jc::FindString(line, "tenant_id"),
+          jc::FindString(line, "watermark"));
+      out = ",\"items\":[";
+      bool first_item = true;
+      for (const auto& item : items) {
+        if (!first_item) out += ",";
+        first_item = false;
+        out += "[";
+        bool first_field = true;
+        for (const auto& field : item) {
+          if (!first_field) out += ",";
+          first_field = false;
+          escape_into(field, &out);
+        }
+        out += "]";
+      }
+      out += "]";
     } else if (op == "verify_compatibility") {
       // The verdict on its own, without the DDL that `ensure_schema` runs
       // after it: the refusals are most of the schema port, and reaching
