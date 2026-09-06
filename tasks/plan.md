@@ -1,6 +1,8 @@
 # Implementation Plan: End-to-end native capture storage pipeline
 
-Branch: `feat/native-capture-pipeline` (from `origin/main` @ `0543ea5`, post-#119).
+Branch: `feat/native-capture-pipeline` (rebased onto `origin/main` @ `9bf0db8`,
+post-#125; originally cut from `0543ea5`, post-#119). Phase B continues on
+`feat/native-catalog-b1`.
 
 ## Overview
 
@@ -18,7 +20,10 @@ re-measured number against the recorded baseline.
   protocols and query results; the reference suite must stay green in every task.
 - **SQL ports textually**: #119's lease/allocator/publish protocols ported as
   identical SQL sequences, verified by ported live suites + the replicated-quorum
-  verifier (`tests/tools/verify_replicated_quorum.py`).
+  verifier (`tests/tools/verify_replicated_quorum.py`). Post-#125 the publish
+  protocol also carries client-side semantics — per-writer publish
+  serialisation, process binding, outcome-unknown quarantine — which the native
+  writer must reproduce and the #125 concurrency tests verify (see B2b).
 - **D1**: S3 client = libcurl + hand-rolled SigV4 (no aws-sdk-cpp).
 - **D2**: durable spool mode only for native v1; direct mode stays Python reference.
 - **D3**: scope-hash worker partition; per-scope serialism is an inherent ceiling,
@@ -50,7 +55,7 @@ Full task detail with acceptance criteria and verification: `tasks/todo.md`.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Catalog protocol port re-opens #119 surface | High | Textual SQL identity; 1:1 test port; quorum verifier must PASS |
+| Catalog protocol port re-opens #119/#125 surface | High | Textual SQL identity; 1:1 test port incl. #125 concurrency trio; quorum verifier must PASS |
 | Profile indicts non-GIL bottleneck | High | Phase 0 gate before any port beyond T0.3 |
 | Two implementations drift | Med | Behavioral tests drive both; Python oracle-only after flip |
 | libcurl/SigV4 subtleties | Med | Garage conformance + fault matrix (A2b) |
