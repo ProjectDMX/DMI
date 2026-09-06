@@ -131,7 +131,16 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       boundaries); INSERT parity is behavioral (native-written rows read back
       identical through the Python client) since the Python driver ships row
       data in the native protocol, not statement text.
-- [x] B2b Fenced publish_snapshot (verify_replicated_quorum.py escalated below).
+- [x] B2b Fenced publish_snapshot; verify_replicated_quorum.py PASS vs the C++ writer.
+      Evidence: the verifier now runs BOTH legs — the Python writer and the
+      native writer through conformance_catalog — against two replicas of
+      each protocol table under one Keeper (tests/tools/quorum_harness,
+      ports 9181/9010/8110). All 12 checks PASS, verdict 0, two runs: the
+      native publish cycle with insert_quorum=2, the settings recorded in
+      the query log on every native deciding INSERT, native retention
+      admitted on ReplicatedMergeTree, the quorum-unset control, quorum-off
+      mid-life failing loudly, and the unsatisfiable quorum refused with
+      Code 285 promptly.
       Evidence: publish below the head loses the race; taken-over publisher
       writes NOTHING (error names the successor); takeover between the two
       statements leaves the documented inert orphan rows; injected transport

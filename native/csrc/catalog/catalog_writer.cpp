@@ -123,8 +123,20 @@ std::map<std::string, std::string> CatalogWriter::quorum_write() const {
            std::to_string(config_.publish_timeout_ns / 1'000'000)}};
 }
 
+bool CatalogWriter::quarantine_in_force() const {
+  if (!quarantined_) return false;
+  if (now_monotonic_ns() < quarantine_until_ns_) return true;
+  // The window has passed: the old statement has landed or been capped and
+  // the discarded lease row has expired too, so the writer is recovered and
+  // must stop saying otherwise. Cleared by the check that finds it lapsed,
+  // as `_require_not_quarantined_locked` does in clickhouse_catalog.py.
+  quarantined_ = false;
+  quarantine_until_ns_ = 0;
+  return false;
+}
+
 void CatalogWriter::require_not_quarantined() const {
-  if (quarantined_ && now_monotonic_ns() < quarantine_until_ns_) {
+  if (quarantine_in_force()) {
     throw CatalogError(
         CatalogError::Kind::kQuarantined,
         "this writer is quarantined: a previous publish failed with an "
@@ -145,8 +157,9 @@ void CatalogWriter::quarantine() {
 }
 
 bool CatalogWriter::quarantined(uint64_t* until_ns) const {
+  const bool in_force = quarantine_in_force();
   if (until_ns != nullptr) *until_ns = quarantine_until_ns_;
-  return quarantined_;
+  return in_force;
 }
 
 PublisherLease CatalogWriter::renew_for_publish() {

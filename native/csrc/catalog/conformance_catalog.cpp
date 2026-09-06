@@ -402,6 +402,33 @@ std::string respond(const std::string& line, Session* session) {
       if (jc::HasKey(line, "max_packs")) {
         index_config.max_packs = static_cast<int>(jc::FindInt(line, "max_packs"));
       }
+      if (jc::HasKey(line, "max_estimated_bytes")) {
+        index_config.max_estimated_bytes =
+            static_cast<uint64_t>(jc::FindInt(line, "max_estimated_bytes"));
+      }
+      if (jc::HasKey(line, "max_publish_attempts")) {
+        index_config.max_publish_attempts =
+            static_cast<int>(jc::FindInt(line, "max_publish_attempts"));
+      }
+      if (jc::FindBool(line, "foreign_watermark_after_allocate")) {
+        // A foreign writer publishing a HIGHER version between this pass's
+        // allocation and its publish — the "something else is writing this
+        // prefix" case the conflict error names. The barrier then refuses
+        // the pass's own watermark, which is a real version race rather
+        // than a simulated one.
+        const auto client = session->client;
+        const std::string watermark = "`" + session->database + "`.`" +
+                                      session->table_prefix +
+                                      "_index_watermark`";
+        index_config.after_allocate = [client, watermark](uint64_t version) {
+          client->execute(
+              "INSERT INTO " + watermark +
+                  " (index_version, publish_id, published_at_ns, "
+                  "indexed_rows, indexed_packs) VALUES (%(version)s, "
+                  "generateUUIDv4(), 1, 0, 0)",
+              {{"version", version + 1}});
+        };
+      }
       const dmi_catalog::IndexResultData result =
           dmi_catalog::NativeIndexer(&s3, s3_config.bucket, &writer,
                                      index_config)

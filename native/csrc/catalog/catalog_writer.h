@@ -95,6 +95,9 @@ class CatalogWriter {
   LeaseCoordinator& leases() { return *leases_; }
 
  private:
+  // Clears a quarantine whose window has passed; returns whether one is
+  // still in force. Every quarantine read goes through it.
+  bool quarantine_in_force() const;
   void require_not_quarantined() const;
   void quarantine();
   PublisherLease renew_for_publish();
@@ -111,8 +114,12 @@ class CatalogWriter {
   std::unique_ptr<VersionAllocator> allocator_;
   // Outcome-unknown quarantine: the lease is discarded WITHOUT the release
   // tombstone and every publish-path entry is refused until this instant.
-  bool quarantined_ = false;
-  uint64_t quarantine_until_ns_ = 0;
+  // Mutable because a lapsed quarantine is cleared by the CHECK that finds
+  // it lapsed, as the Python writer does: a writer that waited out its
+  // window must stop reporting itself quarantined, or a supervisor reading
+  // that answer never sees it recover.
+  mutable bool quarantined_ = false;
+  mutable uint64_t quarantine_until_ns_ = 0;
 };
 
 }  // namespace dmi_catalog

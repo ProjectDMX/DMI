@@ -702,6 +702,44 @@ def test_an_outcome_unknown_failure_quarantines_the_writer():
             driver.close()
 
 
+def test_a_lapsed_quarantine_reports_itself_as_over():
+    """The writer must stop calling itself quarantined once it is not.
+
+    Publishing is permitted again the moment the window lapses, but the
+    flag it is read off is only ever SET -- nothing clears it -- so the
+    writer answers "quarantined" for the rest of the process's life. A
+    supervisor polling that answer to decide when a writer has recovered
+    never sees the recovery, and takes a healthy writer out of service.
+    The Python writer clears the deadline and the lease id as soon as a
+    check finds the window has passed (`_require_not_quarantined_locked`
+    in clickhouse_catalog.py).
+    """
+    with _catalog(lease_ttl_ns=1_100_000_000,
+                  publish_timeout_ns=1_000_000_000) as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix, lease_ttl_ns=1_100_000_000,
+                  publish_timeout_ns=1_000_000_000)
+            driver.call(op="acquire", holder="writer")
+            refused = driver.call(
+                op="publish_snapshot", index_version=21, refs=(),
+                published_at_ns=21, indexed_rows=0, indexed_packs=0,
+                inject_transport_error=True)
+            assert not refused["ok"], refused
+            assert driver.call(op="quarantined")["quarantined"] is True
+
+            sleep(1.2)
+
+            # The window has lapsed, so the writer is no longer quarantined
+            # and must say so -- before anything else asks it to publish.
+            assert driver.call(op="quarantined")["quarantined"] is False
+            # And the recovery it reports is real.
+            assert driver.call(op="acquire", holder="after-window")["ok"]
+            assert driver.call(op="quarantined")["quarantined"] is False
+        finally:
+            driver.close()
+
+
 # --- B3: the native indexer, end-to-end with the Python reader oracle -------
 
 def _stage_via_sink(sink, root, index):
@@ -832,6 +870,216 @@ def test_index_without_a_lease_is_refused_before_any_writes(fake_s3):
             # Nothing was written: no version burned, no watermark moved.
             assert driver.call(
                 op="last_published_version")["version"] == before
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
+def test_one_unreadable_pack_does_not_disturb_the_packs_around_it(fake_s3):
+    """A failed read must remove ONLY its own pack from the batch.
+
+    The read loop iterates the pending batch and drops a pack that fails
+    to read. Dropping it while iterating that same sequence makes the
+    iteration skip the pack that shifts into the hole and revisit the
+    last one: the skipped pack is published and committed as indexed
+    while none of its descriptors were ever written -- the permanently
+    "committed but invisible" state the replay guard can never undo --
+    and the revisited pack is indexed twice. The Python indexer avoids
+    it by collecting successes into a separate list
+    (`catalog.py` `valid_refs`) rather than mutating what it walks.
+
+    The erase shifts every later pack one slot left while the walk keeps
+    going from the slot after the hole, so the damage needs TWO packs
+    behind the failure: the first of them shifts into a slot already
+    passed and is never read, the last is read a second time through the
+    slot the shift left behind. Three packs with the FIRST one
+    unreadable is therefore the smallest batch that shows it -- a
+    failure in the middle of three shifts the only remaining pack into
+    the slot just visited and comes out right by accident.
+    """
+    from tests.test_native_uploader import (
+        SINK_DRIVER, STORE_DRIVER, DriverSession, _stage, _store_base,
+    )
+
+    with _catalog() as (client, config, prefix):
+        sink = DriverSession(SINK_DRIVER)
+        store = DriverSession(STORE_DRIVER)
+        driver = CatalogDriver()
+        try:
+            import tempfile
+            spool_root = Path(tempfile.mkdtemp()) / "spool"
+            for i in range(3):
+                _stage(sink, spool_root, 60 + i)
+            uploaded = store.call(
+                op="upload_pending", **_store_base(fake_s3),
+                root=str(spool_root), spool_max_bytes=1 << 40, limit=-1,
+            )
+            assert uploaded["ok"], uploaded
+            # The batch is walked in (store_id, pack_id) order, so that --
+            # not the upload order -- decides which pack is read first.
+            refs = sorted(uploaded["refs"],
+                          key=lambda r: (r["store_id"], r["pack_id"]))
+            assert len(refs) == 3, refs
+            # The FIRST pack's object is not in the bucket, so its read
+            # fails while both packs behind it read fine.
+            refs[0] = dict(refs[0], object_key="packs/not-uploaded.dmi-pack")
+
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="indexer")
+            result = driver.call(
+                op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+            )
+            assert result["ok"], result
+            r = result["result"]
+
+            # Exactly one pack failed, and it is the unreadable one.
+            assert r["failed_packs"] == 1, r
+            assert [f["object_key"] for f in r["failures"]] == [
+                "packs/not-uploaded.dmi-pack"], r
+            # Both readable packs were indexed -- once each.
+            assert r["indexed_packs"] == 2, r
+            assert r["indexed_rows"] == 2, r
+
+            # And the descriptors prove it: two captures, one row each --
+            # never a capture missing (skipped) and never one written
+            # twice (revisited). Which two depends on the pack ids the
+            # sink minted, so the shape is what is asserted.
+            rows = client.execute(
+                "SELECT capture_id, count() FROM "
+                f"`{config.database}`.`{prefix}_capture_raw` "
+                "GROUP BY capture_id ORDER BY capture_id")
+            assert len(rows) == 2, rows
+            assert [count for _, count in rows] == [1, 1], rows
+            assert {capture_id for capture_id, _ in rows} < {
+                f"upload-{60 + i:04d}" for i in range(3)}, rows
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
+def test_an_oversized_batch_is_refused_rather_than_blamed_on_a_pack(fake_s3):
+    """The batch budget is the CALLER's error, so it must propagate.
+
+    Exceeding `max_estimated_bytes` is a property of how much the caller
+    asked for, not of the pack being read when the total crossed the
+    line. Raised from inside the per-pack `try`, it is caught by the
+    handler meant for unreadable packs: the pack that happened to cross
+    the budget is reported as individually failed, every pack behind it
+    is reported the same way, and the call returns a partial index and a
+    success status. The Python indexer checks the budget outside the try
+    (`catalog.py`) and raises.
+    """
+    from tests.test_native_uploader import (
+        SINK_DRIVER, STORE_DRIVER, DriverSession, _stage, _store_base,
+    )
+
+    with _catalog() as (client, config, prefix):
+        sink = DriverSession(SINK_DRIVER)
+        store = DriverSession(STORE_DRIVER)
+        driver = CatalogDriver()
+        try:
+            import tempfile
+            spool_root = Path(tempfile.mkdtemp()) / "spool"
+            for i in range(2):
+                _stage(sink, spool_root, 70 + i)
+            uploaded = store.call(
+                op="upload_pending", **_store_base(fake_s3),
+                root=str(spool_root), spool_max_bytes=1 << 40, limit=-1,
+            )
+            assert uploaded["ok"], uploaded
+            refs = uploaded["refs"]
+            assert len(refs) == 2, refs
+
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="indexer")
+            refused = driver.call(
+                op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+                # One byte: the first pack read already crosses it.
+                max_estimated_bytes=1,
+            )
+
+            assert not refused["ok"], refused
+            assert refused["error"] == "ValueError", refused
+            assert "max_estimated_bytes" in refused["message"], refused
+            # Refused, so nothing was published and no pack was blamed.
+            assert driver.call(op="last_published_version")["version"] == 0
+            assert client.execute(
+                "SELECT count() FROM "
+                f"`{config.database}`.`{prefix}_capture_raw`") == [(0,)]
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
+def test_a_batch_that_never_publishes_is_never_committed(fake_s3):
+    """Exhausting the publish attempts must raise, not commit the batch.
+
+    The inventory is the replay guard: a pack recorded there is skipped by
+    every later pass, so recording one whose watermark never published
+    makes its captures permanently invisible -- the one outcome the
+    publish-before-inventory order exists to prevent.
+
+    The retry loop breaks out of its own `for` on the final attempt, which
+    skips the loop's increment, so the exhaustion check that follows
+    (`attempts == max_publish_attempts`) can never be true and the error it
+    guards is dead code. Execution falls through to the inventory commit
+    and `index()` returns a success-shaped result. Python raises
+    SnapshotPublishExhaustedError here (`catalog.py`).
+
+    Driven with one attempt and a foreign publisher taking the version out
+    from under this pass, which is a real barrier refusal.
+    """
+    from tests.test_native_uploader import (
+        SINK_DRIVER, STORE_DRIVER, DriverSession, _stage, _store_base,
+    )
+
+    with _catalog() as (client, config, prefix):
+        sink = DriverSession(SINK_DRIVER)
+        store = DriverSession(STORE_DRIVER)
+        driver = CatalogDriver()
+        try:
+            import tempfile
+            spool_root = Path(tempfile.mkdtemp()) / "spool"
+            _stage(sink, spool_root, 80)
+            uploaded = store.call(
+                op="upload_pending", **_store_base(fake_s3),
+                root=str(spool_root), spool_max_bytes=1 << 40, limit=-1,
+            )
+            assert uploaded["ok"], uploaded
+            refs = uploaded["refs"]
+            assert len(refs) == 1, refs
+
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="indexer")
+            exhausted = driver.call(
+                op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+                max_publish_attempts=1,
+                foreign_watermark_after_allocate=True,
+            )
+
+            assert not exhausted["ok"], exhausted
+            assert exhausted["error"] == "SnapshotPublishRaceError", exhausted
+            assert "1 attempts" in exhausted["message"], exhausted
+            # NOTHING was committed, so the pack is still indexable.
+            assert client.execute(
+                "SELECT count() FROM "
+                f"`{config.database}`.`{prefix}_pack_inventory_raw`") == [(0,)]
+
+            # And the proof that it stayed indexable: a pass without the
+            # foreign publisher indexes it rather than skipping it.
+            again = driver.call(
+                op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+            )
+            assert again["ok"], again
+            assert again["result"]["skipped_packs"] == 0, again
+            assert again["result"]["indexed_packs"] == 1, again
         finally:
             sink.close()
             store.close()

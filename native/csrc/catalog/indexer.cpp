@@ -132,36 +132,47 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
   result.skipped_packs = unique.size() - pending.size();
 
   std::vector<std::string> all_rows;
+  // Successes are COLLECTED, never removed from the sequence being
+  // walked: erasing from `pending` mid-walk shifts every later pack one
+  // slot left while the walk carries on past the hole, so the pack behind
+  // a failure is never read yet still published and committed as indexed
+  // (committed and invisible, which no later pass can repair) and the last
+  // pack is read twice. `valid_refs` in catalog.py, for the same reason.
+  std::vector<const PackRefData*> indexed;
   for (const PackRefData* ref : pending) {
+    std::vector<std::string> rows;
     try {
-      const std::vector<std::string> rows =
-          read_pack_descriptor_rows(s3_, bucket_, *ref);
-      uint64_t pack_bytes = 0;
-      for (const std::string& row : rows) pack_bytes += row.size();
-      // The rendered-row length is this port's analog of the Python
-      // harness's JSON-encoding estimate — a bounded upper-bound proxy.
-      if (estimated_bytes + pack_bytes > config_.max_estimated_bytes) {
-        // A too-large batch is a caller error, not a property of the pack
-        // being read: blaming the pack would silently skip the rest.
-        throw CatalogError(
-            CatalogError::Kind::kValue,
-            "catalog batch exceeds max_estimated_bytes: " +
-                std::to_string(estimated_bytes + pack_bytes) + " > " +
-                std::to_string(config_.max_estimated_bytes));
-      }
-      estimated_bytes += pack_bytes;
-      all_rows.insert(all_rows.end(), rows.begin(), rows.end());
+      rows = read_pack_descriptor_rows(s3_, bucket_, *ref);
     } catch (const CatalogError& e) {
       std::string message = e.what();
       if (message.size() > 512) message.resize(512);
       result.failures.push_back(
           {ref->pack_id, ref->object_key, "CatalogError", message});
-      pending.erase(std::remove(pending.begin(), pending.end(), ref),
-                    pending.end());
+      continue;
     }
+    uint64_t pack_bytes = 0;
+    for (const std::string& row : rows) pack_bytes += row.size();
+    // The rendered-row length is this port's analog of the Python
+    // harness's JSON-encoding estimate — a bounded upper-bound proxy.
+    //
+    // Checked OUTSIDE the read's try: a too-large batch is a caller error,
+    // not a property of the pack being read, so it propagates. Thrown
+    // inside, the handler for unreadable packs caught it and blamed the
+    // pack that happened to cross the budget — then every pack behind it —
+    // and returned a partial index reporting success.
+    if (estimated_bytes + pack_bytes > config_.max_estimated_bytes) {
+      throw CatalogError(
+          CatalogError::Kind::kValue,
+          "catalog batch exceeds max_estimated_bytes: " +
+              std::to_string(estimated_bytes + pack_bytes) + " > " +
+              std::to_string(config_.max_estimated_bytes));
+    }
+    estimated_bytes += pack_bytes;
+    all_rows.insert(all_rows.end(), rows.begin(), rows.end());
+    indexed.push_back(ref);
   }
 
-  if (!all_rows.empty() || !pending.empty()) {
+  if (!all_rows.empty() || !indexed.empty()) {
     // Fail before the batch is written, not after it is wasted: a writer
     // without publishing authority discovers it last otherwise.
     if (writer_->held_lease() == nullptr) {
@@ -197,23 +208,31 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
     uint64_t attempts = 0;
     for (; attempts < static_cast<uint64_t>(config_.max_publish_attempts);
          ++attempts) {
+      if (config_.after_allocate) config_.after_allocate(version);
       try {
         writer_->publish_snapshot(
-            version, PackIdentitiesFrom(pending), NowWallClockNs(),
-            all_rows.size(), pending.size());
+            version, PackIdentitiesFrom(indexed), NowWallClockNs(),
+            all_rows.size(), indexed.size());
       } catch (const CatalogError& e) {
         if (e.kind() != CatalogError::Kind::kPublishRace) {
           if (e.kind() == CatalogError::Kind::kPublishConflict) {
             // Visible, so skippable: record the packs before propagating.
-            if (!pending.empty()) {
-              writer_->commit_packs(RenderPackRows(pending, version), version);
+            if (!indexed.empty()) {
+              writer_->commit_packs(RenderPackRows(indexed, version), version);
             }
           }
           throw;
         }
         if (attempts + 1 ==
             static_cast<uint64_t>(config_.max_publish_attempts)) {
-          break;
+          // `continue`, never `break`: breaking skips this loop's own
+          // increment, so `attempts` stayed one below the maximum and the
+          // exhaustion check below could never fire. Execution fell
+          // through to the inventory commit instead, recording packs at a
+          // version whose watermark never published -- skipped by every
+          // later pass and admitted by no snapshot -- and returned a
+          // success-shaped result.
+          continue;
         }
         // Drop the cached head before re-allocating: the race means a
         // competitor published, so the head read on the first allocation
@@ -232,13 +251,13 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
           "could not publish a catalog snapshot after " +
               std::to_string(config_.max_publish_attempts) + " attempts");
     }
-    if (!pending.empty()) {
-      writer_->commit_packs(RenderPackRows(pending, version), version);
+    if (!indexed.empty()) {
+      writer_->commit_packs(RenderPackRows(indexed, version), version);
     }
     result.descriptor_inserts = descriptor_inserts;
   }
 
-  result.indexed_packs = pending.size();
+  result.indexed_packs = indexed.size();
   result.indexed_rows = all_rows.size();
   result.failed_packs = result.failures.size();
   result.estimated_bytes = estimated_bytes;

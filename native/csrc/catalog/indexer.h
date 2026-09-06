@@ -11,6 +11,7 @@
 #define DMI_CATALOG_INDEXER_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -25,6 +26,12 @@ struct IndexerConfig {
   int max_rows_per_insert = 10'000;
   uint64_t max_estimated_bytes = 128ull * 1024 * 1024;
   int max_publish_attempts = 8;
+  // Test seam, unset in production, called with each allocated version
+  // just before the publish that carries it. The publish wedges in
+  // CatalogWriter exist for the same reason: a version race needs the
+  // published head to move between an allocation and its publish, which
+  // only something outside this call can do. Left empty, this is nothing.
+  std::function<void(uint64_t)> after_allocate;
 };
 
 struct IndexFailureData {
