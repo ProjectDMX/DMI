@@ -212,13 +212,25 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
   Deferred follow-ups, as recorded at the review:
   1. the #125 serialisation + process-binding halves and their three tests
      — CLOSED 2026-09-06 in 3fd5b26, see B2b STATUS;
-  2. a byte-identity gate over the parameterized statements, or a
-     risk-table correction saying they are semantically equivalent rather
-     than textually identical — the correction landed in plan.md; the gate
-     itself is still open;
-  3. the quiet-host re-measure and reference-host re-baseline — STILL
-     OPEN, and still the only thing between these numbers and a published
-     one.
+  2. a byte-identity gate over the parameterized statements — CLOSED
+     2026-09-06 in 7f3e7d1. The statements were NOT byte-identical: the
+     driver renders `[('a', 'b'), ('c', 'd')]` and the port emitted
+     `[('a','b'),('c','d')]` wrapped in an extra paren pair, which
+     ClickHouse accepts, which is why only a gate could have caught it.
+     The renderer now matches escape_params byte for byte and the gate
+     compares what the SERVER received, through system.query_log, since
+     the two implementations reach it over different protocols;
+  3. the quiet-host re-measure — STILL OPEN, and the only thing between
+     the recorded numbers and a published one. Two clarifications from
+     2026-09-06: the "reference host" is THIS machine (5955WX), so the
+     obligation is scheduling rather than hardware; and the noise is now
+     quantified rather than asserted — three consecutive bench_sink runs
+     of one binary at load 14.5 gave 0.259 / 0.492 / 0.519 GiB/s, a 2×
+     spread. The decision survives the worst reading (it still beats the
+     0.235 baseline and clears the 0.37 GiB/s per-instance requirement);
+     the figures do not. Protocol and quiet criterion are in
+     docs/benchmarks.md, "How noisy this host is, measured"; PR #127's
+     table now carries the caveat rather than reading as a result.
   Found separately, during the CI work rather than at this review: the
   CPU-only C++ is compiled nowhere in CI except the live job's build step
   (`check-compile` is `python -m compileall`; the native build test runs

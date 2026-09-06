@@ -242,6 +242,49 @@ quiet: pipeline 0.50 GiB/s at N=1 (single-scope) to 0.56 at N=8 vs the
 0.212 fresh Python baseline, writer-only 0.60 vs 0.359 — re-measure on a
 quiet host before publishing numbers.
 
+### How noisy this host is, measured (2026-09-06)
+
+The instruction above kept being restated without evidence, so here is
+the evidence. Three consecutive `native/build/bench_sink` runs, same
+binary, same minute, at a load average of 14.5 on 32 threads with a
+foreign process holding ~522% CPU:
+
+| trial | N=1 GiB/s |
+|---|---:|
+| 1 | 0.259 |
+| 2 | 0.492 |
+| 3 | 0.519 |
+
+A **2× spread on identical work**. The low reading barely clears the
+0.235 Python baseline; the high one is +121% over it. Both are the same
+build of the same code.
+
+Two conclusions, and they are different from each other:
+
+- The **decision** is robust. Even the worst reading beats the Python
+  baseline and clears the 0.37 GiB/s per-instance requirement for the
+  3×4090 shape, so nothing about the port's justification depends on
+  re-measuring.
+- The **figures** are not publishable from this host in this state. Any
+  single number drawn from a 2× spread says more about who else was on
+  the machine than about the code.
+
+**The re-measure protocol**, so it is executable rather than aspirational:
+
+1. Quiet means quiet — `uptime` load average below ~1 on this 32-thread
+   host and no foreign process above a few percent in `ps aux --sort=-%cpu`.
+   The reference host IS this machine (5955WX); "reference host" was never
+   a different box, so the whole obligation is a scheduling one.
+2. `python benchmarks/bench_capture_pipeline.py` for the Python baseline
+   (defaults: 10k × 64 KiB, median of 5) — the same harness the T0.1
+   baselines came from, writing its JSON under
+   `benchmarks/data/native-pipeline/`.
+3. `native/build/bench_sink` for the native side, at N=1 and N=8, median
+   of 5 rather than best-of, with the load average recorded beside each
+   number.
+4. Only then may a figure leave this document. Until then every published
+   claim carries the caveat, including the PR bodies.
+
 Working ledger for the end-to-end native capture pipeline (branch
 `feat/native-capture-pipeline`, plan in `tasks/plan.md`). Every attempt — kept
 or reverted — is logged here so dead ideas stay dead. Baselines are medians of
