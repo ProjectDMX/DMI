@@ -155,6 +155,16 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       concurrency tests (two concurrent publishes on one writer serialised;
       cross-process use refused; failed publish releases the writer) port
       alongside the SQL suites.
+      STATUS (2026-09-06, Checkpoint B review): the QUARANTINE half is
+      ported and tested (injected transport death, and a lapsed window that
+      reports itself over). The serialisation and process-binding halves are
+      NOT: the native writer relies on the driver being one process running
+      one op at a time instead of holding a lock or checking its pid, and
+      the three #125 concurrency tests are not ported. Sound for the shipped
+      path — pybind and the driver are single-threaded per writer — and a
+      real gap for any other embedding, so it is recorded as a deferred
+      follow-up at Checkpoint B rather than claimed. `catalog_writer.h`
+      names the assumption at the class it applies to.
 - [x] B3 indexer-native (footer read → batch → publish) + e2e with Python CaptureReader oracle.
       Evidence: native sink → native uploader → native pack-index read → native
       publish, and the PYTHON CaptureReader resolves both captures with
@@ -179,15 +189,24 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       completes by waiting; a forced-zero-stagger start can cascade
       contested terms past the ttl+margin budget, and the Python
       implementation fails identically there.
-- **Checkpoint B** (human review) — criteria (cold-path, defined 2026-09-06):
+- **Checkpoint B: PASS** (reviewed 2026-09-06 against PR #127 + #128) —
+  criteria (cold-path, defined 2026-09-06), each re-verified at `7c7f725`:
   ported live suites green next to their Python oracles ✓ (lease, allocator,
-  descriptors, publish incl. the #125 concurrency trio) · statement
-  byte-identity gates green ✓ · verify_replicated_quorum.py PASS against the
-  C++ writer ✓ · e2e indexer run read back identically by the Python
-  CaptureReader ✓ · CPU suite green ✓ · rollback (native→Python catalog path)
-  still proven ✓ · before any published throughput claim: re-measure on a
-  quiet host and re-baseline on the reference host (owns the A5a/plan
-  obligation).
+  descriptors, publish, indexer, schema, GC — 44/44 ×2; the #125 concurrency
+  trio is NOT among them, deferred below) · statement byte-identity gate
+  green ✓ (scope: `release` + `fence` only — the parameterized statements are
+  semantic-equivalence, not textual) · verify_replicated_quorum.py PASS
+  against the C++ writer ✓ (12/12 both legs, ×2, Keeper-backed two-replica
+  harness) · e2e indexer run read back identically by the Python
+  CaptureReader ✓ · CPU suite green ✓ (1202) · rollback (native→Python
+  catalog path) still proven ✓ · clean rebuild carries zero warnings ✓ ·
+  before any published throughput claim: re-measure on a quiet host and
+  re-baseline on the reference host (owns the A5a/plan obligation — STILL
+  OPEN, and the only thing between these numbers and a published one).
+  Deferred follow-ups: the #125 serialisation + process-binding halves and
+  their three tests (see B2b STATUS); a byte-identity gate over the
+  parameterized statements, or a risk-table correction saying they are
+  semantically equivalent rather than textually identical.
 
 ## Phase C — Serving path (deferred follow-up)
 
@@ -197,6 +216,22 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
 
 ## Checkpoints log
 
+- Checkpoint B (2026-09-06): PASS with two recorded gaps, reviewed against
+  PR #127 (Phase A → main, head 6473871) and PR #128 (Phase B stacked, head
+  7c7f725). Every criterion re-verified in one sitting rather than read off
+  earlier commits: 44/44 ported live ×2, CPU 1202, Python oracles 63,
+  clean rebuild 0 warnings, rollback and reader-oracle both green, and the
+  quorum verifier 12/12 on BOTH legs ×2 against a real Keeper-backed
+  two-replica cluster — the criterion PR #128's body still describes as
+  "not runnable in this environment" (it was: the harness keeper was live,
+  so only `quorum_harness/server.xml` needed starting).
+  Gaps recorded, neither blocking: (1) the #125 serialisation and
+  process-binding halves are argued from single-threaded embedding rather
+  than ported, and their three tests are absent — `catalog_writer.h` now
+  states that limit at the class; (2) the byte-identity gate covers only
+  `release` and `fence`, so "textual SQL identity" in the risk table
+  overstates what is checked for the parameterized statements.
+  Terminal condition of this loop reached; Phase C remains a separate loop.
 - Plan reconciliation (2026-09-06): merged the corrected T0.2 evidence and
   harness fix (PackCapacityError swallow) from the main-checkout snapshot into
   this controller; closed T0.4 against the ledger; re-grounded B2b on #125

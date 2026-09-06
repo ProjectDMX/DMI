@@ -45,9 +45,17 @@ class CatalogWriter {
   CatalogWriter(std::shared_ptr<const ClickHouseClient> client,
                 WriterConfig config);
 
-  // One process, one writer: the Python writer serialises publishes and
-  // claims behind a lock because threads share it; the driver executes
-  // ops one at a time, which is the same serialisation.
+  // SINGLE-THREADED EMBEDDING ASSUMED, and this is a real limit rather
+  // than a restatement of the Python design. #125 gave the Python writer
+  // two client-side guarantees: publishes are serialised per writer
+  // (`_serial`), and the writer is bound to the process that built it
+  // (`_owned_by_this_process`, which refuses use from a forked child).
+  // Neither is reproduced here. The conformance driver executes ops one
+  // at a time in one process, so the shipped path is safe; a host that
+  // calls publish_snapshot from two threads, or across a fork, has
+  // NOTHING holding it back. Port the lock and the process guard before
+  // embedding this class anywhere that can do either -- see the #125
+  // concurrency trio deferred at Checkpoint B in tasks/todo.md.
 
   void write_descriptors(const std::vector<std::string>& rendered_rows,
                          uint64_t index_version);
