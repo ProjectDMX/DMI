@@ -1,6 +1,7 @@
 #include "reader.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <set>
 
@@ -8,6 +9,7 @@
 
 #include "../common/json.h"
 #include "catalog_writer.h"
+#include "../pack/pack_builder.h"
 #include "lease_coordinator.h"
 
 namespace jc = dmi_common;
@@ -40,8 +42,13 @@ std::string quoted(const std::string& name) { return "`" + name + "`"; }
 // absent lists — identical bytes to json.dumps(..., sort_keys=True,
 // separators=(",", ":")).
 std::string filter_hash_impl(const SearchFilters& f) {
-  auto opt = [](const std::optional<std::string>& v) {
-    return v.has_value() ? "\"" + v.value() + "\"" : "null";
+  auto quoted_string = [](const std::string& value) {
+    std::string out;
+    dmi_pack::EncodeJsonString(value, &out);
+    return out;
+  };
+  auto opt = [&](const std::optional<std::string>& v) {
+    return v.has_value() ? quoted_string(*v) : "null";
   };
   auto opt_int = [](const std::optional<uint64_t>& v) {
     return v.has_value() ? std::to_string(*v) : "null";
@@ -49,7 +56,7 @@ std::string filter_hash_impl(const SearchFilters& f) {
   std::string hook_names = "[";
   for (size_t i = 0; i < f.hook_names.size(); ++i) {
     if (i) hook_names += ",";
-    hook_names += "\"" + f.hook_names[i] + "\"";
+    hook_names += quoted_string(f.hook_names[i]);
   }
   hook_names += "]";
   std::string layers = "[";
@@ -147,12 +154,32 @@ std::string base64url_decode(const std::string& encoded) {
       out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
     }
   }
-  // Reject non-canonical leftovers: Python's strict decode would too.
+  // Reject a trailing group that cannot be part of any encoding: a final
+  // lone character carries no whole byte. NOT a general non-canonical
+  // check, and deliberately so -- CPython's b64decode(validate=True)
+  // checks the alphabet rather than the unused trailing bits, so
+  // `eyJ2IjoxfQ` and `eyJ2IjoxfR` both decode to `{"v":1}` on the Python
+  // side. Rejecting them here would make the native reader STRICTER than
+  // the oracle it is judged against, which is a parity break rather than
+  // a hardening.
   if (bits >= 6 && (buffer & ((1 << bits) - 1)) != 0) {
     throw CatalogError(CatalogError::Kind::kValue,
                        "cursor is not canonical url-safe base64");
   }
   return out;
+}
+
+// cursor._CURSOR_VERSION / model._CURSOR_LIMIT.
+constexpr uint64_t kCursorVersion = 1;
+constexpr size_t kCursorLimitBytes = 2048;
+
+// How many members a JSON object declares at the top level. Used to refuse
+// a cursor carrying fields this version does not define, the way
+// decode_cursor's unexpected-fields check does.
+size_t top_level_member_count(const std::string& object) {
+  const std::string inside = jc::Unwrap(object);
+  if (inside.find_first_not_of(" \t\n") == std::string::npos) return 0;
+  return jc::SplitElements(inside).size();
 }
 
 std::string find_string_in(const std::string& object, const char* key) {
@@ -234,15 +261,21 @@ std::vector<std::string> parse_tsv_tuple(const std::string& text) {
           in_str = false;  // NULL renders as \N inside a quoted string
           continue;
         }
-        // Escapes are carried through as-is. Undoing them here is the
-        // right idea and the wrong layer: a tuple field and a plain text
-        // field do not arrive with the same number of escaping layers, so
-        // decoding at one place corrupts the other (measured: fixing the
-        // quote in a sort-key column turned `packs/a\b.dmi-pack` into a
-        // backspace). Left alone rather than half-fixed; see the review
-        // note on TSV escape layering.
-        current.push_back('\\');
-        current.push_back(next);
+        // ONE level of decoding, and exactly one, measured both ways. The
+        // tuple's rendered text carries its own escapes (`a\b` arrives as
+        // a\\b) and the TSV layer does not re-escape the rendered tuple,
+        // so carrying escapes through doubled every backslash, while
+        // adding a field-wide TSV unescape on top decoded twice and
+        // turned `packs/a\b.dmi-pack` into a backspace. Grouped columns
+        // are the opposite case -- plain TSV fields, unescaped where the
+        // row is flattened, never here.
+        switch (next) {
+          case 'n': current.push_back('\n'); break;
+          case 't': current.push_back('\t'); break;
+          case 'r': current.push_back('\r'); break;
+          case '0': current.push_back('\0'); break;
+          default: current.push_back(next); break;  // \' and \\ included
+        }
         continue;
       }
       if (c == '\'') {
@@ -346,9 +379,19 @@ std::string NativeCaptureCatalog::projection() const {
 }
 
 uint64_t NativeCaptureCatalog::published_head(bool deciding) const {
+  // The configured bounds FIRST, then the deciding setting on top -- the
+  // shape `_published_head` uses in clickhouse_reader.py. Sending the
+  // deciding setting alone (or nothing) left the one read every search
+  // takes as the only unbounded statement in the reader.
+  std::map<std::string, std::string> read_settings = settings();
+  if (deciding) {
+    for (const auto& [key, value] : deciding_read()) {
+      read_settings[key] = value;
+    }
+  }
   const std::vector<Row> rows = client_->execute(
       "SELECT max(index_version) FROM " + qualified("index_watermark"), {},
-      deciding ? deciding_read() : std::map<std::string, std::string>{});
+      read_settings);
   if (rows.empty() || rows[0].empty() || rows[0][0].empty()) return 0;
   return parse_u64_field(rows[0][0], "watermark");
 }
@@ -378,7 +421,33 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
       throw CatalogError(CatalogError::Kind::kValue,
                          "cursor is not canonical url-safe base64");
     }
+    if (canonical.size() > kCursorLimitBytes) {
+      throw CatalogError(
+          CatalogError::Kind::kValue,
+          "cursor exceeds the cursor limit of " +
+              std::to_string(kCursorLimitBytes) + " bytes");
+    }
     const std::string payload = base64url_decode(canonical);
+    // THE ENVELOPE, before anything is read out of it. decode_cursor
+    // requires version 1 and exactly {v,w,fh,k}; a reader that just picks
+    // out `k` and `w` pages a v2 cursor with v1 semantics and accepts
+    // fields it does not understand, which turns a format designed to
+    // evolve into one that silently cannot.
+    if (find_uint_in(payload, "v") != kCursorVersion) {
+      throw CatalogError(CatalogError::Kind::kValue,
+                         "cursor version must be " +
+                             std::to_string(kCursorVersion));
+    }
+    for (const char* field : {"v", "w", "fh", "k"}) {
+      if (!jc::HasKey(payload, field)) {
+        throw CatalogError(CatalogError::Kind::kValue,
+                           std::string("cursor is missing ") + field);
+      }
+    }
+    if (top_level_member_count(payload) != 4) {
+      throw CatalogError(CatalogError::Kind::kValue,
+                         "cursor has unexpected fields");
+    }
     if (jc::FindString(payload, "fh") != hash) {
       throw CatalogError(CatalogError::Kind::kValue,
                          "cursor does not match the filters that issued it");
@@ -497,14 +566,17 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
           "catalog returned a malformed resolved-column tuple, expected " +
               std::to_string(std::size(kProjection) - 5) + " columns");
     }
-    // Flatten: the sort-key columns, then the resolved ones — unescaping
-    // the TSV escapes ClickHouse carries inside quoted values, so a quote
-    // or backslash in a text column survives the round trip exactly as
-    // the Python driver delivers it.
+    // Flatten: the sort-key columns, then the resolved ones.
+    //
+    // The two halves arrive with DIFFERENT escaping, which is the whole
+    // subtlety here. A grouped column is its own TSV field, so ClickHouse
+    // escapes its quotes and backslashes and this is the only place that
+    // can undo them -- without it, `alan's run` came back `alan\'s run`.
+    // The aggregate is one field holding an already-quoted tuple, whose
+    // inner escapes parse_tsv_tuple handles; unescaping it here as well
+    // ate a real backslash (`packs/a\b.dmi-pack` became a backspace).
     std::vector<std::string> item;
-    // The client unescaped the TSV escapes field-wide already; a second
-    // pass would eat a backslash the value actually contains (the \b case).
-    for (int i = 0; i < 5; ++i) item.push_back(row[i]);
+    for (int i = 0; i < 5; ++i) item.push_back(unescape_tsv(row[i]));
     for (auto& field : resolved) item.push_back(field);
     items.push_back(std::move(item));
   }
@@ -521,9 +593,14 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
     for (int i = 0; i < 5; ++i) {
       if (i) key += ",";
       if (i == 3) {
-        key += last[i];
+        key += last[i];  // captured_at_ns: a JSON number, no TSV escapes
       } else {
-        key += "\"" + last[i] + "\"";
+        // The row value is raw TSV — unescape FIRST (the same values the
+        // items carry), THEN render as JSON (EncodeJsonString), or the
+        // envelope hashes and carries the TSV-escaped form, which is not
+        // the value Python's cursor would decode to.
+        std::string value = unescape_tsv(last[i]);
+        dmi_pack::EncodeJsonString(value, &key);
       }
     }
     key += "]";
@@ -551,7 +628,17 @@ std::vector<std::vector<std::string>> NativeCaptureCatalog::get_by_ids(
                        "tenant_id must be a non-empty string");
   }
   if (capture_ids.empty()) return {};
-  if (!std::all_of(watermark.begin(), watermark.end(), ::isdigit)) {
+  // NON-EMPTY and all digits. `all_of` over an empty range is true, so an
+  // empty watermark passed the check and parse_u64_field then answered 0
+  // ("empty renders as 0", by its own contract) -- the call resolved
+  // against a snapshot admitting nothing and returned no rows, where the
+  // caller's real fault was an unpopulated watermark. The predicate takes
+  // an unsigned char because ::isdigit is undefined for a negative char,
+  // which any byte above 0x7F is on this platform.
+  if (watermark.empty() ||
+      !std::all_of(watermark.begin(), watermark.end(), [](unsigned char c) {
+        return std::isdigit(c) != 0;
+      })) {
     throw CatalogError(CatalogError::Kind::kValue,
                        "watermark must be a decimal string");
   }
@@ -596,9 +683,19 @@ std::vector<std::vector<std::string>> NativeCaptureCatalog::get_by_ids(
                                " columns, expected 6");
       }
       std::vector<std::string> resolved = parse_tsv_tuple(row[5]);
+      // The same width check search makes: a short or long tuple is a
+      // malformed row either way, and letting it through here produced a
+      // silently truncated descriptor instead of the error the Python
+      // reader raises for both paths.
+      if (resolved.size() != std::size(kProjection) - 5) {
+        throw CatalogError(
+            CatalogError::Kind::kValue,
+            "catalog returned a malformed resolved-column tuple, expected " +
+                std::to_string(std::size(kProjection) - 5) + " columns");
+      }
       std::vector<std::string> item;
-      // The client unescaped already — see search.
-      for (int i = 0; i < 5; ++i) item.push_back(row[i]);
+      // Grouped columns carry their own TSV escaping — see search.
+      for (int i = 0; i < 5; ++i) item.push_back(unescape_tsv(row[i]));
       for (auto& field : resolved) item.push_back(field);
       out.push_back(std::move(item));
     }

@@ -85,6 +85,31 @@ std::string sql_string_or_null(const std::string& line, const char* key) {
   return render_sql_string(jc::FindString(line, key));
 }
 
+// The reader config every read op builds, in one place. The read bounds
+// are overridable so a test can set one low enough that the server
+// refuses -- which is how "the bounds actually ride on this statement"
+// becomes observable rather than asserted.
+dmi_catalog::ReaderConfig reader_config(const std::string& database,
+                                        const std::string& table_prefix,
+                                        const std::string& line) {
+  dmi_catalog::ReaderConfig rc;
+  rc.database = database;
+  rc.table_prefix = table_prefix;
+  if (jc::HasKey(line, "max_rows_to_read")) {
+    rc.max_rows_to_read =
+        static_cast<uint64_t>(jc::FindInt(line, "max_rows_to_read"));
+  }
+  if (jc::HasKey(line, "max_bytes_to_read")) {
+    rc.max_bytes_to_read =
+        static_cast<uint64_t>(jc::FindInt(line, "max_bytes_to_read"));
+  }
+  if (jc::HasKey(line, "max_execution_time_s")) {
+    rc.max_execution_time_s =
+        static_cast<uint64_t>(jc::FindInt(line, "max_execution_time_s"));
+  }
+  return rc;
+}
+
 // The elements of a JSON array, with an EMPTY array yielding none.
 // SplitElements("") answers one empty element -- correct for splitting,
 // wrong for "was anything listed" -- so an empty filter list became a
@@ -299,9 +324,8 @@ std::string respond(const std::string& line, Session* session) {
     } else if (op == "allocate_version") {
       out = ",\"version\":" + std::to_string(writer.allocate_version());
     } else if (op == "select") {
-      dmi_catalog::ReaderConfig rc;
-      rc.database = session->database;
-      rc.table_prefix = session->table_prefix;
+      dmi_catalog::ReaderConfig rc =
+          reader_config(session->database, session->table_prefix, line);
       dmi_store::S3Config s3_config;
       s3_config.endpoint = jc::FindString(line, "endpoint");
       s3_config.bucket = jc::FindString(line, "bucket");
@@ -332,9 +356,8 @@ std::string respond(const std::string& line, Session* session) {
       escape_into(selection.tenant_id, &out);
       out += "}";
     } else if (op == "hydrate") {
-      dmi_catalog::ReaderConfig rc;
-      rc.database = session->database;
-      rc.table_prefix = session->table_prefix;
+      dmi_catalog::ReaderConfig rc =
+          reader_config(session->database, session->table_prefix, line);
       dmi_store::S3Config s3_config;
       s3_config.endpoint = jc::FindString(line, "endpoint");
       s3_config.bucket = jc::FindString(line, "bucket");
@@ -369,9 +392,8 @@ std::string respond(const std::string& line, Session* session) {
       }
       out += "]";
     } else if (op == "summarize_core") {
-      dmi_catalog::ReaderConfig rc;
-      rc.database = session->database;
-      rc.table_prefix = session->table_prefix;
+      dmi_catalog::ReaderConfig rc =
+          reader_config(session->database, session->table_prefix, line);
       dmi_store::S3Config s3_config;
       s3_config.endpoint = jc::FindString(line, "endpoint");
       s3_config.bucket = jc::FindString(line, "bucket");
@@ -426,18 +448,14 @@ std::string respond(const std::string& line, Session* session) {
       }
       out += "]";
     } else if (op == "current_watermark") {
-      dmi_catalog::NativeCaptureCatalog reader(session->client, [&] {
-        dmi_catalog::ReaderConfig rc;
-        rc.database = session->database;
-        rc.table_prefix = session->table_prefix;
-        return rc;
-      }());
+      dmi_catalog::NativeCaptureCatalog reader(
+          session->client,
+          reader_config(session->database, session->table_prefix, line));
       out = ",\"watermark\":";
       escape_into(reader.current_watermark(), &out);
     } else if (op == "search") {
-      dmi_catalog::ReaderConfig rc;
-      rc.database = session->database;
-      rc.table_prefix = session->table_prefix;
+      dmi_catalog::ReaderConfig rc =
+          reader_config(session->database, session->table_prefix, line);
       dmi_catalog::NativeCaptureCatalog reader(session->client, rc);
       dmi_catalog::SearchFilters filters;
       for (const char* key : {"tenant_id", "experiment_id", "run_id",
@@ -506,9 +524,8 @@ std::string respond(const std::string& line, Session* session) {
       out += ",\"watermark\":";
       escape_into(page.watermark, &out);
     } else if (op == "get_by_ids") {
-      dmi_catalog::ReaderConfig rc;
-      rc.database = session->database;
-      rc.table_prefix = session->table_prefix;
+      dmi_catalog::ReaderConfig rc =
+          reader_config(session->database, session->table_prefix, line);
       dmi_catalog::NativeCaptureCatalog reader(session->client, rc);
       std::vector<std::string> capture_ids;
       for (const std::string& id : jc::SplitElements(

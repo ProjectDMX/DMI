@@ -68,8 +68,6 @@ uint32_t Crc32(const uint8_t* data, size_t n, uint32_t crc) {
 
 // --- canonical JSON ----------------------------------------------------------
 
-namespace {
-
 // Python json.dumps with ensure_ascii=True escapes exactly: ", \, and the
 // control range as \u00XX except the short forms \b \f \n \r \t; everything
 // >= 0x7F as \uXXXX (surrogate pair above 0xFFFF).
@@ -135,8 +133,6 @@ void EncodeJsonString(const std::string& value, std::string* out) {
     }
   }
   out->push_back('"');
-}
-
 }  // namespace
 
 void EncodeRecordRow(const RecordMetadata& m, uint64_t offset,

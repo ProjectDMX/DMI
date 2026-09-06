@@ -285,6 +285,80 @@ def test_search_parity_on_a_multi_dimensional_shape():
             driver.close()
 
 
+def test_search_parity_on_text_holding_quotes_and_backslashes():
+    """A quote or backslash must survive both halves of the row.
+
+    The grouped columns and the aggregate tuple arrive with different
+    escaping, so this is really two bugs in one shape: the grouped
+    columns needed their TSV escapes undone (`alan's run` came back
+    `alan\\'s run`), while the tuple's contents must NOT be unescaped a
+    second time (`packs/a\\b.dmi-pack` turned into a backspace when they
+    were). Both halves are asserted here because fixing either one alone
+    is what broke the other.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            descriptors = _descriptor_dicts(2)
+            for entry in descriptors:
+                entry["run_id"] = "alan's run"          # grouped column
+                entry["object_key"] = "packs/a\\b.dmi-pack"  # in the tuple
+            _publish_native(driver, prefix, descriptors, 7)
+
+            native = driver.call(op="search", limit=100)
+            assert native["ok"], native
+            page = _python_page_items(_python_reader(client, config))
+            assert {item.metadata.run_id for item in page.items} == {
+                "alan's run"}
+            assert {item.locator.object_key for item in page.items} == {
+                "packs/a\\b.dmi-pack"}
+            assert _normalize(native["items"]) == _normalize(page.items)
+        finally:
+            driver.close()
+
+
+def test_a_cursor_over_quote_bearing_values_crosses_implementations():
+    """The cursor's JSON must be JSON even when the data holds quotes.
+
+    Both the filter hash and the cursor key render values into JSON by
+    concatenation. Python's json.dumps escapes a quote or backslash; a
+    renderer that does not produces a different filter digest (so the
+    other side refuses the cursor as belonging to different filters) and,
+    in the key, a cursor that is not valid JSON at all.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            descriptors = _descriptor_dicts(3)
+            for entry in descriptors:
+                entry["run_id"] = 'alan "quoted\\" run'
+            _publish_native(driver, prefix, descriptors, 7)
+
+            # Native issues a cursor under a quote-bearing filter...
+            first = driver.call(op="search", limit=1,
+                                run_id='alan "quoted\\" run')
+            assert first["ok"] and first["next_cursor"], first
+
+            # ...and the PYTHON reader accepts it and serves page two.
+            reader = _python_reader(client, config)
+            page = _python_page_items(
+                reader, limit=1, run_id='alan "quoted\\" run',
+                cursor=first["next_cursor"])
+            assert len(page.items) == 1, page
+            assert page.items[0].metadata.capture_id == "capture-1"
+
+            # And the reverse: a Python cursor resumes natively.
+            third = driver.call(op="search", limit=1,
+                                run_id='alan "quoted\\" run',
+                                cursor=page.next_cursor)
+            assert third["ok"], third
+            assert third["items"][0][4] == "capture-2", third
+        finally:
+            driver.close()
+
+
 def _open_helper(driver, prefix, **overrides):
     from tests.test_native_catalog_lease_live import DEFAULTS
 
@@ -351,6 +425,92 @@ def test_an_empty_filter_list_is_absent_rather_than_impossible():
                 assert len(native["items"]) == 4, (native_fields, native)
                 assert _normalize(native["items"]) == _normalize(
                     unfiltered.items), native_fields
+        finally:
+            driver.close()
+
+
+def test_the_watermark_read_carries_the_configured_bounds():
+    """"Bounds on every catalog read" has to include the watermark read.
+
+    Every other read sends max_rows_to_read / max_bytes_to_read /
+    max_execution_time; the head read sent either the deciding setting
+    alone or nothing at all, so the one read taken on every search ran
+    unbounded. Python builds it the other way round -- it starts from the
+    config's settings and merely ADDS the deciding one.
+
+    Read off the SERVER rather than the client: a low row bound cannot be
+    made to bite here, because `max(index_version)` over a table ordered by
+    index_version is answered from the primary index without reading a row.
+    What the server records for the statement is the honest evidence, and
+    it is the same check the replicated-quorum verifier makes.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            _publish_native(driver, prefix, _descriptor_dicts(2), 7)
+
+            marker = 4242424
+            fine = driver.call(op="current_watermark",
+                               max_rows_to_read=marker)
+            assert fine["ok"] and fine["watermark"] == "7", fine
+
+            client.execute("SYSTEM FLUSH LOGS")
+            recorded = client.execute(
+                "SELECT Settings['max_rows_to_read'] FROM system.query_log "
+                f"WHERE query LIKE '%{prefix}_index_watermark%' "
+                "AND type = 'QueryFinish' "
+                "ORDER BY event_time_microseconds DESC LIMIT 1")
+            assert recorded and recorded[0][0] == str(marker), recorded
+        finally:
+            driver.close()
+
+
+def test_a_cursor_envelope_is_validated_the_way_python_validates_it():
+    """The envelope checks are the cursor's whole contract.
+
+    decode_cursor requires version 1, exactly the fields {v,w,fh,k}, and a
+    bounded size. A reader that reads `k` and `w` out of whatever JSON
+    arrives will happily page a v2 cursor with v1 semantics, or one
+    carrying fields it does not understand -- which is how a forward-
+    compatible format silently becomes an incompatible one.
+    """
+    import base64
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            descriptors = _descriptor_dicts(4)
+            _publish_native(driver, prefix, descriptors, 7)
+
+            # A real, accepted cursor first, so the rejections below are
+            # about the envelope rather than about the page.
+            first = driver.call(op="search", limit=1)
+            assert first["ok"] and first["next_cursor"], first
+            good = first["next_cursor"]
+            payload = json.loads(base64.urlsafe_b64decode(
+                good + "=" * (-len(good) % 4)))
+            assert set(payload) == {"v", "w", "fh", "k"}, payload
+
+            def encode(obj):
+                raw = json.dumps(obj, sort_keys=True,
+                                 separators=(",", ":")).encode()
+                return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+            from dmi.storage.capture.cursor import InvalidCursorError
+            from dmi.storage.capture.model import CaptureQuery
+            reader = _python_reader(client, config)
+
+            future = dict(payload, v=2)
+            extra = dict(payload, surprise=1)
+            for broken in (future, extra):
+                cursor = encode(broken)
+                refused = driver.call(op="search", limit=1, cursor=cursor)
+                assert not refused["ok"], (broken, refused)
+                # The oracle refuses the same cursor.
+                with pytest.raises(InvalidCursorError):
+                    reader.search(CaptureQuery(limit=1, cursor=cursor))
         finally:
             driver.close()
 
@@ -434,6 +594,22 @@ def test_get_by_ids_parity_and_watermark_validation():
             assert "exceeds the published watermark" in refused["message"]
             with pytest.raises(ValueError, match="exceeds the published"):
                 reader.get_by_ids(ids[:1], tenant_id="t", watermark="9")
+
+            # An EMPTY watermark is refused, not read as snapshot 0. The
+            # digit check passes vacuously on an empty string (all_of over
+            # an empty range is true) and the parse then answers 0, so the
+            # call silently resolved against a snapshot that admits
+            # nothing and returned no rows -- a caller passing a watermark
+            # it failed to populate gets "no such captures" instead of an
+            # error. Python raises on both empty and non-numeric.
+            for bad in ("", "  ", "seven", "-1"):
+                refused = driver.call(
+                    op="get_by_ids", capture_ids=ids[:1], tenant_id="t",
+                    watermark=bad)
+                assert not refused["ok"], (bad, refused)
+                assert refused["error"] == "ValueError", (bad, refused)
+                with pytest.raises(ValueError):
+                    reader.get_by_ids(ids[:1], tenant_id="t", watermark=bad)
         finally:
             driver.close()
 
@@ -657,4 +833,51 @@ def test_hydration_budget_refused_before_any_fetch(fake_s3):
         finally:
             sink.close()
             store.close()
+            driver.close()
+
+
+def test_filter_hash_escapes_like_python_json(fake_s3):
+    """The filter hash must hash the SAME bytes Python's json.dumps does.
+
+    Values are hashed raw today: a quote, backslash or non-ASCII character
+    in a human-named id produces a different byte sequence on each side,
+    and the cursor the native reader issues is refused by the Python
+    reader's decode_cursor (filter_hash mismatch) — and vice versa.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            descriptors = _descriptor_dicts(2)
+            for entry in descriptors:
+                entry["run_id"] = 'a"b\\c'
+                entry["tenant_id"] = "tény"
+            _publish_native(driver, prefix, descriptors, 7)
+
+            from dmi.storage.capture.model import CaptureQuery
+
+            reader = _python_reader(client, config)
+            native = driver.call(
+                op="search", limit=1, tenant_id="tény",
+                run_id='a"b\\c')
+            assert native["ok"], native
+            assert native["next_cursor"], "the page must owe a cursor"
+            # THE BINDING: the Python reader accepts the native cursor —
+            # its decode_cursor compares the embedded filter_hash against
+            # Python's own json.dumps-derived hash.
+            page = reader.search(
+                CaptureQuery(tenant_id="tény", run_id='a"b\\c',
+                             cursor=native["next_cursor"], limit=1))
+            assert len(page.items) == 1, page
+            assert page.items[0].metadata.run_id == 'a"b\\c'
+
+            # And the reverse: a Python-issued cursor accepted natively.
+            python_page = reader.search(
+                CaptureQuery(tenant_id="tény", run_id='a"b\\c', limit=1))
+            walked = driver.call(
+                op="search", limit=1, tenant_id="tény", run_id='a"b\\c',
+                cursor=python_page.next_cursor)
+            assert walked["ok"], walked
+            assert walked["items"], walked
+        finally:
             driver.close()
