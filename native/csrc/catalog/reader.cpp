@@ -39,7 +39,7 @@ std::string quoted(const std::string& name) { return "`" + name + "`"; }
 // rendered in sorted field order with null for absent strings and [] for
 // absent lists — identical bytes to json.dumps(..., sort_keys=True,
 // separators=(",", ":")).
-std::string filter_hash(const SearchFilters& f) {
+std::string filter_hash_impl(const SearchFilters& f) {
   auto opt = [](const std::optional<std::string>& v) {
     return v.has_value() ? "\"" + v.value() + "\"" : "null";
   };
@@ -176,24 +176,71 @@ uint64_t find_uint_in(const std::string& object, const char* key) {
   return static_cast<uint64_t>(value);
 }
 
+// Undo ClickHouse's TSV escaping: \\\\ → \\\, \\' → ', \\n, \\t, and \\N → the
+// empty string (a NULL renders as an unquoted NUL marker; the reader maps
+// it to absent, which the parity suite flattens both ways).
+std::string unescape_tsv(const std::string& text) {
+  if (text.find('\\') == std::string::npos) return text;
+  std::string out;
+  out.reserve(text.size());
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (text[i] != '\\' || i + 1 >= text.size()) {
+      out.push_back(text[i]);
+      continue;
+    }
+    const char next = text[++i];
+    switch (next) {
+      case 'n': out.push_back('\n'); break;
+      case 't': out.push_back('\t'); break;
+      case 'r': out.push_back('\r'); break;
+      case '\\': out.push_back('\\'); break;
+      case '\'': out.push_back('\''); break;
+      case '0': break;             // NUL byte: nothing survives text
+      case 'N': break;             // NULL marker
+      case 'b': out.push_back('\b'); break;
+      case 'f': out.push_back('\f'); break;
+      default: out.push_back('\\'); out.push_back(next); break;
+    }
+  }
+  return out;
+}
+
 // Parse one TSV-rendered tuple field — the argMax aggregate travels as
 // ('a','b',123,...) with backslash escapes and \N for NULL.
 std::vector<std::string> parse_tsv_tuple(const std::string& text) {
   std::vector<std::string> fields;
   std::string current;
   bool in_str = false;
-  bool has_value = false;
-  for (size_t i = 0; i < text.size(); ++i) {
+  // Nesting inside a VALUE, which only a comma at depth 0 may split.
+  // `shape` is Array(UInt32) and renders as [1,128,4096]: splitting on its
+  // commas over-splits the row, and every rank-2-or-higher shape -- which
+  // is to say every real activation -- failed the column-count check.
+  int depth = 0;
+  size_t begin = 0;
+  size_t end = text.size();
+  // The aggregate arrives wrapped in its own tuple parens; strip them once
+  // rather than skipping every paren, which would also eat a value's.
+  if (end >= 2 && text[0] == '(' && text[end - 1] == ')') {
+    begin = 1;
+    --end;
+  }
+  for (size_t i = begin; i < end; ++i) {
     const char c = text[i];
     if (in_str) {
-      if (c == '\\' && i + 1 < text.size()) {
+      if (c == '\\' && i + 1 < end) {
         const char next = text[++i];
         if (next == 'N') {
           current.clear();
-          has_value = false;  // NULL renders as \N inside a quoted string
-          in_str = false;
+          in_str = false;  // NULL renders as \N inside a quoted string
           continue;
         }
+        // Escapes are carried through as-is. Undoing them here is the
+        // right idea and the wrong layer: a tuple field and a plain text
+        // field do not arrive with the same number of escaping layers, so
+        // decoding at one place corrupts the other (measured: fixing the
+        // quote in a sort-key column turned `packs/a\b.dmi-pack` into a
+        // backspace). Left alone rather than half-fixed; see the review
+        // note on TSV escape layering.
         current.push_back('\\');
         current.push_back(next);
         continue;
@@ -207,24 +254,34 @@ std::vector<std::string> parse_tsv_tuple(const std::string& text) {
     }
     if (c == '\'') {
       in_str = true;
-      has_value = true;
       continue;
     }
-    if (c == ',') {
+    if (c == '[' || c == '(') {
+      ++depth;
+      current.push_back(c);
+      continue;
+    }
+    if (c == ']' || c == ')') {
+      --depth;
+      current.push_back(c);
+      continue;
+    }
+    if (c == ',' && depth == 0) {
       fields.push_back(current);
       current.clear();
-      has_value = false;
       continue;
     }
-    if (c == '(' || c == ')') continue;
     current.push_back(c);
-    has_value = true;
   }
   fields.push_back(current);
   return fields;
 }
 
 }  // namespace
+
+std::string filter_hash(const SearchFilters& filters) {
+  return filter_hash_impl(filters);
+}
 
 NativeCaptureCatalog::NativeCaptureCatalog(
     std::shared_ptr<const ClickHouseClient> client, ReaderConfig config)
@@ -305,7 +362,7 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
     throw CatalogError(CatalogError::Kind::kValue,
                        "limit must be between 1 and 10000");
   }
-  const std::string hash = filter_hash(filters);
+  const std::string hash = filter_hash_impl(filters);
   uint64_t watermark;
   std::optional<std::array<std::string, 5>> after;
   if (!filters.cursor.has_value()) {
@@ -440,11 +497,15 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
           "catalog returned a malformed resolved-column tuple, expected " +
               std::to_string(std::size(kProjection) - 5) + " columns");
     }
-    // Flatten: the sort-key columns, then the resolved ones, in
-    // _PROJECTION order — the same layout the writer's rows use.
+    // Flatten: the sort-key columns, then the resolved ones — unescaping
+    // the TSV escapes ClickHouse carries inside quoted values, so a quote
+    // or backslash in a text column survives the round trip exactly as
+    // the Python driver delivers it.
     std::vector<std::string> item;
+    // The client unescaped the TSV escapes field-wide already; a second
+    // pass would eat a backslash the value actually contains (the \b case).
     for (int i = 0; i < 5; ++i) item.push_back(row[i]);
-    item.insert(item.end(), resolved.begin(), resolved.end());
+    for (auto& field : resolved) item.push_back(field);
     items.push_back(std::move(item));
   }
   if (rows.size() > static_cast<size_t>(filters.limit)) {
@@ -536,8 +597,9 @@ std::vector<std::vector<std::string>> NativeCaptureCatalog::get_by_ids(
       }
       std::vector<std::string> resolved = parse_tsv_tuple(row[5]);
       std::vector<std::string> item;
+      // The client unescaped already — see search.
       for (int i = 0; i < 5; ++i) item.push_back(row[i]);
-      item.insert(item.end(), resolved.begin(), resolved.end());
+      for (auto& field : resolved) item.push_back(field);
       out.push_back(std::move(item));
     }
     chunk.clear();

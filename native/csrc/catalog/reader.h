@@ -53,6 +53,10 @@ struct SearchPage {
   std::string watermark;
 };
 
+// sha256 over the compact sorted-keys JSON of the filters — byte-compatible
+// with CaptureQuery.filter_hash, so cursors cross implementations.
+std::string filter_hash(const SearchFilters& filters);
+
 class NativeCaptureCatalog {
  public:
   NativeCaptureCatalog(std::shared_ptr<const ClickHouseClient> client,

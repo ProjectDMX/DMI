@@ -225,7 +225,7 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       on the row BEYOND the page, and the base64url encoder emitted a
       phantom trailing byte in both remainder branches. 44/44 native
       catalog tests; CPU gate 1202 passed.
-- [~] C2 hydration/summary/extensions native.
+- [x] C2 hydration/summary/extensions native.
       Scope (from reader.py, 445 lines): select (search → one bounded page
       → CaptureSelection), estimate, hydrate (plan per pack with coalesced
       ranges, footer-authoritative verification phase before any payload
@@ -236,7 +236,17 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       native vs Python hydrate, identical core summary numbers, budget
       refusals both sides. Native pieces already in place: pack_index
       (footer read + validation), S3Client GetRange, reader search/select
-      surface. NOT started.
+      surface. Evidence: tests/test_native_reader_parity_live.py 9/9 live
+      (×3 consecutive) — the hydration leg: IDENTICAL payload bytes native
+      vs Python hydrate over the full e2e (sink → uploader → index →
+      select → hydrate through the fake S3), byte-compatible selection_id
+      (the identity JSON in Python's sort_keys order), footer-authoritative
+      verification against the pack's own records (the two layouts —
+      sort-key-first catalog rows vs CAPTURE_COLUMNS footer rows — mapped
+      field-by-field), CRC-as-hex verify_payload, and EXACT core summary
+      stats (%.17g emission; float64 accumulators, scale-before-square L2,
+      raw-integer order stats). Budget refusals both sides. Extension
+      registry stays Python-side by scope.
 - [ ] C3 default-switch + final docs
 
 ## Checkpoints log

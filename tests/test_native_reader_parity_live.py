@@ -18,6 +18,12 @@ from pathlib import Path
 
 import pytest
 
+# Module-level so the fake-S3 fixture re-exports into this module's
+# namespace (function-local imports do not register fixtures).
+from tests.test_native_s3_client import (  # noqa: E402
+    ACCESS, BUCKET, REGION, SECRET, fake_s3,
+)
+
 REPO = Path(__file__).resolve().parents[1]
 DRIVER = REPO / "native" / "build" / "conformance_catalog"
 
@@ -202,7 +208,9 @@ def _descriptor_fields(item):
             "producer_rank": meta.producer_rank, "step_number": meta.step_number,
             "token_start": meta.token_start, "token_end": meta.token_end,
             "batch_position": meta.batch_position, "dtype": meta.dtype,
-            "shape": str(list(meta.shape)),
+            # The wire form, not Python's repr: TSV renders the array
+            # without the spaces `str(list(...))` inserts.
+            "shape": "[" + ",".join(str(dim) for dim in meta.shape) + "]",
             "captured_at_ns": meta.captured_at_ns, "pack_id": loc.pack_id,
             "store_id": loc.store_id, "object_key": loc.object_key,
             "object_bytes": loc.object_bytes,
@@ -243,6 +251,35 @@ def test_search_parity_no_filters():
             assert native["watermark"] == page.watermark == "7"
             assert native["next_cursor"] is None and page.next_cursor is None
             assert len(native["items"]) == 4 == len(page.items)
+            assert _normalize(native["items"]) == _normalize(page.items)
+        finally:
+            driver.close()
+
+
+def test_search_parity_on_a_multi_dimensional_shape():
+    """A rank-2 shape is the ordinary case, and it must survive the tuple.
+
+    `shape` is Array(UInt32), and the resolved columns travel back as one
+    TSV-rendered argMax tuple: `('a','b',[1,128,4096],...)`. A splitter
+    that tracks quoted strings but not brackets sees the array's own
+    commas as tuple separators, over-splits the row, and search fails
+    outright -- for every real activation, since the only shapes that
+    survive are rank 1. The synthetic corpus is rank 1, which is why
+    nothing noticed.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            descriptors = _descriptor_dicts(2)
+            for entry in descriptors:
+                entry["shape"] = [1, 128, 4096]
+            _publish_native(driver, prefix, descriptors, 7)
+
+            native = driver.call(op="search", limit=100)
+            assert native["ok"], native
+            assert len(native["items"]) == 2, native
+            page = _python_page_items(_python_reader(client, config))
             assert _normalize(native["items"]) == _normalize(page.items)
         finally:
             driver.close()
@@ -404,4 +441,188 @@ def test_supersession_resolves_the_newest_pack():
             for item in page.items:
                 assert item.locator.pack_id == new_pack
         finally:
+            driver.close()
+
+
+# --- C2: hydration and core summary at parity --------------------------------
+
+def _e2e_setup(fake_s3, prefix, record_count=3):
+    """sink → uploader → native index; returns (drivers, refs, descriptor ids)."""
+    from tests.test_native_uploader import (
+        SINK_DRIVER, STORE_DRIVER, DriverSession, _stage, _store_base,
+    )
+
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    driver = CatalogDriver()
+    try:
+        import tempfile
+        spool_root = Path(tempfile.mkdtemp()) / "spool"
+        staged = [_stage(sink, spool_root, 60 + i)
+                  for i in range(record_count)]
+        uploaded = store.call(
+            op="upload_pending", **_store_base(fake_s3),
+            root=str(spool_root), spool_max_bytes=1 << 40, limit=-1)
+        assert uploaded["ok"], uploaded
+        refs = uploaded["refs"]
+        _open_helper(driver, prefix)
+        driver.call(op="acquire", holder="indexer")
+        result = driver.call(
+            op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+            region=REGION, access=ACCESS, secret=SECRET, insecure=True)
+        assert result["ok"], result
+        assert result["result"]["indexed_packs"] == record_count, result
+        return sink, store, driver, refs
+    except Exception:
+        sink.close()
+        store.close()
+        driver.close()
+        raise
+
+
+def test_hydrate_parity_identical_payload_bytes(fake_s3):
+    from dmi.storage.capture import (
+        CaptureReader, S3PackStore, S3StoreConfig,
+    )
+    from dmi.storage.capture.clickhouse_reader import (
+        ClickHouseCaptureCatalog, ClickHouseReaderConfig,
+    )
+
+    with _catalog() as (client, config, prefix):
+        sink, store, driver, refs = None, None, None, None
+        try:
+            sink, store, driver, refs = _e2e_setup(fake_s3, prefix)
+            query_fields = {"tenant_id": "t", "limit": 10}
+
+            from dmi.storage.capture.model import CaptureQuery
+            python_catalog = ClickHouseCaptureCatalog(
+                client, ClickHouseReaderConfig.from_catalog(config))
+            python_store = S3PackStore.from_config(
+                S3StoreConfig(
+                    endpoint_url=fake_s3, bucket=BUCKET, region=REGION,
+                    access_key_id=ACCESS, secret_access_key=SECRET,
+                    store_id="native-test", allow_insecure_http=True))
+            python_reader = CaptureReader(
+                python_catalog, {"native-test": python_store})
+            selection = python_reader.select(CaptureQuery(**query_fields))
+
+            native_select = driver.call(
+                op="select", tenant_id="t", limit=10,
+                endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                secret=SECRET, insecure=True)
+            assert native_select["ok"], native_select
+            native_selection = native_select["selection"]
+            # The selection identity is byte-compatible: same id.
+            assert native_selection["selection_id"] == selection.selection_id
+
+            native = driver.call(
+                op="hydrate", selection_id=native_selection["selection_id"],
+                capture_ids=native_selection["capture_ids"],
+                catalog_watermark=native_selection["catalog_watermark"],
+                filter_hash=native_selection["filter_hash"],
+                tenant_id=native_selection["tenant_id"],
+                byte_limit=1 << 30, endpoint=fake_s3, bucket=BUCKET,
+                access=ACCESS, secret=SECRET, insecure=True)
+            assert native["ok"], native
+            import base64
+            native_payloads = [
+                base64.b64decode(payload) for payload in native["payloads"]]
+
+            hydrated = python_reader.hydrate(
+                selection, byte_limit=1 << 30)
+            assert len(native_payloads) == len(hydrated)
+            by_id = {item.capture_id: item.payload for item in hydrated}
+            for index, capture_id in enumerate(
+                    native_selection["capture_ids"]):
+                assert native_payloads[index] == by_id[capture_id], capture_id
+        finally:
+            for closer in (sink, store, driver):
+                if closer is not None:
+                    closer.close()
+
+
+def test_summary_core_stats_parity(fake_s3):
+    from dmi.storage.capture import (
+        CaptureReader, S3PackStore, S3StoreConfig,
+    )
+    from dmi.storage.capture.clickhouse_reader import (
+        ClickHouseCaptureCatalog, ClickHouseReaderConfig,
+    )
+
+    with _catalog() as (client, config, prefix):
+        try:
+            sink, store, driver, refs = _e2e_setup(fake_s3, prefix)
+            from dmi.storage.capture.model import CaptureQuery
+            python_catalog = ClickHouseCaptureCatalog(
+                client, ClickHouseReaderConfig.from_catalog(config))
+            python_store = S3PackStore.from_config(
+                S3StoreConfig(
+                    endpoint_url=fake_s3, bucket=BUCKET, region=REGION,
+                    access_key_id=ACCESS, secret_access_key=SECRET,
+                    store_id="native-test", allow_insecure_http=True))
+            python_reader = CaptureReader(
+                python_catalog, {"native-test": python_store})
+            selection = python_reader.select(
+                CaptureQuery(tenant_id="t", limit=10))
+
+            native_select = driver.call(
+                op="select", tenant_id="t", limit=10,
+                endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                secret=SECRET, insecure=True)
+            assert native_select["ok"], native_select
+            sel = native_select["selection"]
+            native = driver.call(
+                op="summarize_core", selection_id=sel["selection_id"],
+                capture_ids=sel["capture_ids"],
+                catalog_watermark=sel["catalog_watermark"],
+                filter_hash=sel["filter_hash"], tenant_id=sel["tenant_id"],
+                byte_limit=1 << 30, endpoint=fake_s3, bucket=BUCKET,
+                access=ACCESS, secret=SECRET, insecure=True)
+            assert native["ok"], native
+            python_summaries = python_reader.summarize(
+                selection, byte_limit=1 << 30)
+
+            by_id = {s.capture_id: s for s in python_summaries}
+            for summary in native["summaries"]:
+                expected = by_id[summary["capture_id"]]
+                assert summary["summary_version"] == expected.core.summary_version
+                assert summary["element_count"] == expected.core.element_count
+                assert summary["finite_count"] == expected.core.finite_count
+                assert summary["zero_fraction"] == expected.core.zero_fraction
+                assert summary["mean"] == expected.core.mean, summary["capture_id"]
+                assert summary["l2_norm"] == expected.core.l2_norm, (
+                    summary["capture_id"])
+                assert summary["minimum_int"] == expected.core.minimum, (
+                    summary["capture_id"])
+                assert summary["maximum_int"] == expected.core.maximum, (
+                    summary["capture_id"])
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
+def test_hydration_budget_refused_before_any_fetch(fake_s3):
+    with _catalog() as (client, config, prefix):
+        try:
+            sink, store, driver, refs = _e2e_setup(fake_s3, prefix)
+            native_select = driver.call(
+                op="select", tenant_id="t", limit=10,
+                endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                secret=SECRET, insecure=True)
+            assert native_select["ok"], native_select
+            sel = native_select["selection"]
+            refused = driver.call(
+                op="hydrate", selection_id=sel["selection_id"],
+                capture_ids=sel["capture_ids"],
+                catalog_watermark=sel["catalog_watermark"],
+                filter_hash=sel["filter_hash"], tenant_id=sel["tenant_id"],
+                byte_limit=0, endpoint=fake_s3, bucket=BUCKET,
+                access=ACCESS, secret=SECRET, insecure=True)
+            assert not refused["ok"]
+            assert "hydration byte limit exceeded" in refused["message"], (
+                refused)
+        finally:
+            sink.close()
+            store.close()
             driver.close()

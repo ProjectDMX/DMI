@@ -18,6 +18,7 @@
 #include "catalog_writer.h"
 #include "clickhouse_client.h"
 #include "indexer.h"
+#include "hydration.h"
 #include "reader.h"
 #include "schema.h"
 #include "lease_coordinator.h"
@@ -285,6 +286,133 @@ std::string respond(const std::string& line, Session* session) {
       escape_into(writer.leases().fence(), &out);
     } else if (op == "allocate_version") {
       out = ",\"version\":" + std::to_string(writer.allocate_version());
+    } else if (op == "select") {
+      dmi_catalog::ReaderConfig rc;
+      rc.database = session->database;
+      rc.table_prefix = session->table_prefix;
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      dmi_store::S3Client s3(s3_config);
+      dmi_catalog::NativeCaptureReader reader(
+          &s3, s3_config.bucket, session->client, rc);
+      dmi_catalog::SearchFilters filters;
+      if (jc::HasKey(line, "tenant_id") && !jc::FindNull(line, "tenant_id")) {
+        filters.tenant_id = jc::FindString(line, "tenant_id");
+      }
+      filters.limit = static_cast<int>(jc::FindInt(line, "limit"));
+      const dmi_catalog::Selection selection = reader.select(filters);
+      out = ",\"selection\":{\"selection_id\":";
+      escape_into(selection.selection_id, &out);
+      out += ",\"capture_ids\":[";
+      for (size_t i = 0; i < selection.capture_ids.size(); ++i) {
+        if (i) out += ",";
+        escape_into(selection.capture_ids[i], &out);
+      }
+      out += "],\"catalog_watermark\":";
+      escape_into(selection.catalog_watermark, &out);
+      out += ",\"filter_hash\":";
+      escape_into(selection.filter_hash, &out);
+      out += ",\"tenant_id\":";
+      escape_into(selection.tenant_id, &out);
+      out += "}";
+    } else if (op == "hydrate") {
+      dmi_catalog::ReaderConfig rc;
+      rc.database = session->database;
+      rc.table_prefix = session->table_prefix;
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      dmi_store::S3Client s3(s3_config);
+      dmi_catalog::NativeCaptureReader reader(
+          &s3, s3_config.bucket, session->client, rc);
+      dmi_catalog::Selection selection;
+      selection.selection_id = jc::FindString(line, "selection_id");
+      for (const std::string& id : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
+        selection.capture_ids.push_back(jc::ParseLiteral(id));
+      }
+      selection.catalog_watermark = jc::FindString(line, "catalog_watermark");
+      selection.filter_hash = jc::FindString(line, "filter_hash");
+      selection.tenant_id = jc::FindString(line, "tenant_id");
+      const auto payloads = reader.hydrate(
+          selection, jc::FindInt(line, "byte_limit"),
+          jc::HasKey(line, "request_limit")
+              ? jc::FindInt(line, "request_limit")
+              : 1024);
+      out = ",\"payloads\":[";
+      for (size_t i = 0; i < payloads.size(); ++i) {
+        if (i) out += ",";
+        std::string encoded;
+        jc::EncodeBase64(
+            reinterpret_cast<const uint8_t*>(payloads[i].data()),
+            payloads[i].size(), &encoded);
+        out += "\"" + encoded + "\"";
+      }
+      out += "]";
+    } else if (op == "summarize_core") {
+      dmi_catalog::ReaderConfig rc;
+      rc.database = session->database;
+      rc.table_prefix = session->table_prefix;
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      dmi_store::S3Client s3(s3_config);
+      dmi_catalog::NativeCaptureReader reader(
+          &s3, s3_config.bucket, session->client, rc);
+      dmi_catalog::Selection selection;
+      selection.selection_id = jc::FindString(line, "selection_id");
+      for (const std::string& id : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
+        selection.capture_ids.push_back(jc::ParseLiteral(id));
+      }
+      selection.catalog_watermark = jc::FindString(line, "catalog_watermark");
+      selection.filter_hash = jc::FindString(line, "filter_hash");
+      selection.tenant_id = jc::FindString(line, "tenant_id");
+      const auto summaries = reader.summarize_core(
+          selection, jc::FindInt(line, "byte_limit"),
+          jc::HasKey(line, "request_limit")
+              ? jc::FindInt(line, "request_limit")
+              : 1024,
+          1000, 64'000'000ull);
+      out = ",\"summaries\":[";
+      for (size_t i = 0; i < summaries.size(); ++i) {
+        if (i) out += ",";
+        const auto& [capture_id, s] = summaries[i];
+        out += "{\"capture_id\":";
+        escape_into(capture_id, &out);
+        // %.17g round-trips a double exactly; std::to_string would truncate
+        // to six places and the parity comparison would fail on precision.
+        const auto real = [](double value) {
+          char buffer[40];
+          std::snprintf(buffer, sizeof(buffer), "%.17g", value);
+          return std::string(buffer);
+        };
+        out += ",\"summary_version\":" + std::to_string(s.summary_version) +
+               ",\"element_count\":" + std::to_string(s.element_count) +
+               ",\"finite_count\":" + std::to_string(s.finite_count) +
+               ",\"nan_count\":" + std::to_string(s.nan_count) +
+               ",\"inf_count\":" + std::to_string(s.inf_count) +
+               ",\"zero_fraction\":" + real(s.zero_fraction) +
+               ",\"mean\":" + real(s.mean) +
+               ",\"minimum\":" + real(s.minimum) +
+               ",\"maximum\":" + real(s.maximum) +
+               ",\"abs_max\":" + real(s.abs_max) +
+               ",\"l2_norm\":" + real(s.l2_norm) +
+               ",\"minimum_int\":" + std::to_string(s.minimum_int) +
+               ",\"maximum_int\":" + std::to_string(s.maximum_int) +
+               ",\"abs_max_int\":" + std::to_string(s.abs_max_int) + "}";
+      }
+      out += "]";
     } else if (op == "current_watermark") {
       dmi_catalog::NativeCaptureCatalog reader(session->client, [&] {
         dmi_catalog::ReaderConfig rc;
@@ -407,6 +535,133 @@ std::string respond(const std::string& line, Session* session) {
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);
       schema.ensure(&writer.leases(), retry_sleep_ns);
+    } else if (op == "select") {
+      dmi_catalog::ReaderConfig rc;
+      rc.database = session->database;
+      rc.table_prefix = session->table_prefix;
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      dmi_store::S3Client s3(s3_config);
+      dmi_catalog::NativeCaptureReader reader(
+          &s3, s3_config.bucket, session->client, rc);
+      dmi_catalog::SearchFilters filters;
+      if (jc::HasKey(line, "tenant_id") && !jc::FindNull(line, "tenant_id")) {
+        filters.tenant_id = jc::FindString(line, "tenant_id");
+      }
+      filters.limit = static_cast<int>(jc::FindInt(line, "limit"));
+      const dmi_catalog::Selection selection = reader.select(filters);
+      out = ",\"selection\":{\"selection_id\":";
+      escape_into(selection.selection_id, &out);
+      out += ",\"capture_ids\":[";
+      for (size_t i = 0; i < selection.capture_ids.size(); ++i) {
+        if (i) out += ",";
+        escape_into(selection.capture_ids[i], &out);
+      }
+      out += "],\"catalog_watermark\":";
+      escape_into(selection.catalog_watermark, &out);
+      out += ",\"filter_hash\":";
+      escape_into(selection.filter_hash, &out);
+      out += ",\"tenant_id\":";
+      escape_into(selection.tenant_id, &out);
+      out += "}";
+    } else if (op == "hydrate") {
+      dmi_catalog::ReaderConfig rc;
+      rc.database = session->database;
+      rc.table_prefix = session->table_prefix;
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      dmi_store::S3Client s3(s3_config);
+      dmi_catalog::NativeCaptureReader reader(
+          &s3, s3_config.bucket, session->client, rc);
+      dmi_catalog::Selection selection;
+      selection.selection_id = jc::FindString(line, "selection_id");
+      for (const std::string& id : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
+        selection.capture_ids.push_back(jc::ParseLiteral(id));
+      }
+      selection.catalog_watermark = jc::FindString(line, "catalog_watermark");
+      selection.filter_hash = jc::FindString(line, "filter_hash");
+      selection.tenant_id = jc::FindString(line, "tenant_id");
+      const auto payloads = reader.hydrate(
+          selection, jc::FindInt(line, "byte_limit"),
+          jc::HasKey(line, "request_limit")
+              ? jc::FindInt(line, "request_limit")
+              : 1024);
+      out = ",\"payloads\":[";
+      for (size_t i = 0; i < payloads.size(); ++i) {
+        if (i) out += ",";
+        std::string encoded;
+        jc::EncodeBase64(
+            reinterpret_cast<const uint8_t*>(payloads[i].data()),
+            payloads[i].size(), &encoded);
+        out += "\"" + encoded + "\"";
+      }
+      out += "]";
+    } else if (op == "summarize_core") {
+      dmi_catalog::ReaderConfig rc;
+      rc.database = session->database;
+      rc.table_prefix = session->table_prefix;
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      dmi_store::S3Client s3(s3_config);
+      dmi_catalog::NativeCaptureReader reader(
+          &s3, s3_config.bucket, session->client, rc);
+      dmi_catalog::Selection selection;
+      selection.selection_id = jc::FindString(line, "selection_id");
+      for (const std::string& id : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
+        selection.capture_ids.push_back(jc::ParseLiteral(id));
+      }
+      selection.catalog_watermark = jc::FindString(line, "catalog_watermark");
+      selection.filter_hash = jc::FindString(line, "filter_hash");
+      selection.tenant_id = jc::FindString(line, "tenant_id");
+      const auto summaries = reader.summarize_core(
+          selection, jc::FindInt(line, "byte_limit"),
+          jc::HasKey(line, "request_limit")
+              ? jc::FindInt(line, "request_limit")
+              : 1024,
+          1000, 64'000'000ull);
+      out = ",\"summaries\":[";
+      for (size_t i = 0; i < summaries.size(); ++i) {
+        if (i) out += ",";
+        const auto& [capture_id, s] = summaries[i];
+        out += "{\"capture_id\":";
+        escape_into(capture_id, &out);
+        // %.17g round-trips a double exactly; std::to_string would truncate
+        // to six places and the parity comparison would fail on precision.
+        const auto real = [](double value) {
+          char buffer[40];
+          std::snprintf(buffer, sizeof(buffer), "%.17g", value);
+          return std::string(buffer);
+        };
+        out += ",\"summary_version\":" + std::to_string(s.summary_version) +
+               ",\"element_count\":" + std::to_string(s.element_count) +
+               ",\"finite_count\":" + std::to_string(s.finite_count) +
+               ",\"nan_count\":" + std::to_string(s.nan_count) +
+               ",\"inf_count\":" + std::to_string(s.inf_count) +
+               ",\"zero_fraction\":" + real(s.zero_fraction) +
+               ",\"mean\":" + real(s.mean) +
+               ",\"minimum\":" + real(s.minimum) +
+               ",\"maximum\":" + real(s.maximum) +
+               ",\"abs_max\":" + real(s.abs_max) +
+               ",\"l2_norm\":" + real(s.l2_norm) +
+               ",\"minimum_int\":" + std::to_string(s.minimum_int) +
+               ",\"maximum_int\":" + std::to_string(s.maximum_int) +
+               ",\"abs_max_int\":" + std::to_string(s.abs_max_int) + "}";
+      }
+      out += "]";
     } else if (op == "current_watermark") {
       dmi_catalog::NativeCaptureCatalog reader(session->client, [&] {
         dmi_catalog::ReaderConfig rc;
