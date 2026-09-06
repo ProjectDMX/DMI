@@ -36,6 +36,9 @@ struct WriterConfig {
 
 using PackIdentity = std::pair<std::string, std::string>;  // store_id, pack_id
 
+// SQL string literal, ClickHouse escaping — shared by the row renderers.
+std::string sql_quote(const std::string& value);
+
 class CatalogWriter {
  public:
   CatalogWriter(std::shared_ptr<const ClickHouseClient> client,

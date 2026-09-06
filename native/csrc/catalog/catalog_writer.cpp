@@ -86,6 +86,10 @@ uint64_t now_monotonic_ns() {
 
 }  // namespace
 
+std::string sql_quote(const std::string& value) {
+  return escape_sql_string(value);
+}
+
 CatalogWriter::CatalogWriter(std::shared_ptr<const ClickHouseClient> client,
                              WriterConfig config)
     : client_(std::move(client)), config_(std::move(config)) {
@@ -188,10 +192,12 @@ void CatalogWriter::write_descriptors(
     const std::vector<std::string>& rendered_rows, uint64_t index_version) {
   if (rendered_rows.empty()) return;
   require_not_quarantined();
+  // The batch's index_version is the final column; the rows carry the
+  // other 32 and are version-independent until written.
   std::string values;
   for (const auto& row : rendered_rows) {
     if (!values.empty()) values += ",";
-    values += "(" + row + ")";
+    values += "(" + row + "," + std::to_string(index_version) + ")";
   }
   try {
     client_->execute(
@@ -356,8 +362,16 @@ void CatalogWriter::publish_snapshot(
             settings);
         // A zero-row conditional INSERT cannot be followed by a visible
         // watermark: every chunk is read back before the renewal.
+        //
+        // Against the chunk's DISTINCT identities, not its length: the
+        // read-back counts distinct manifest members, so a caller that
+        // handed the same identity over twice would otherwise look like a
+        // half-written chunk and abort a publish that wrote everything it
+        // was asked to. `len(set(members))` in the Python oracle.
+        const std::set<PackIdentity> distinct_chunk(chunk.begin(),
+                                                    chunk.end());
         if (manifest_member_count(index_version, publish_id, &chunk) !=
-            static_cast<int>(chunk.size())) {
+            static_cast<int>(distinct_chunk.size())) {
           leases_->reject_if_gone();
           throw CatalogError(
               CatalogError::Kind::kPublishRace,

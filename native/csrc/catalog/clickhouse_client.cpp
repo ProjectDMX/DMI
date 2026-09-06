@@ -109,7 +109,7 @@ std::vector<Row> ClickHouseClient::execute(
   }
   if (status != 200) {
     throw ClickHouseError("clickhouse " + std::to_string(status) + ": " +
-                          body.substr(0, 1024));
+                          body.substr(0, 4096));
   }
 
   std::vector<Row> rows;

@@ -29,6 +29,12 @@ from time import sleep
 
 import pytest
 
+# Module-level so the fake-S3 fixture re-exports into this module's
+# namespace (function-local imports do not register fixtures).
+from tests.test_native_s3_client import (  # noqa: E402
+    ACCESS, BUCKET, REGION, SECRET, fake_s3,
+)
+
 REPO = Path(__file__).resolve().parents[1]
 DRIVER = REPO / "native" / "build" / "conformance_catalog"
 
@@ -503,6 +509,44 @@ def test_a_publish_below_the_published_head_loses_the_race():
             driver.close()
 
 
+def test_a_repeated_identity_in_one_chunk_still_publishes():
+    """The chunk read-back counts DISTINCT packs, so it must expect DISTINCT.
+
+    ``publish_snapshot`` takes whatever membership its caller hands it, and
+    the same ``(store_id, pack_id)`` may appear twice in one batch --
+    ``CatalogIndexer`` deduplicates upstream, but the writer contract does
+    not require it to, and the Python oracle compares the manifest's
+    DISTINCT count against ``len(set(members))`` for exactly this reason.
+    Comparing it against the chunk's LENGTH instead makes a duplicate look
+    like a half-written manifest: the publish aborts as a lost race, having
+    written a complete manifest chunk and no watermark, and the caller burns
+    a version re-publishing a batch that was never wrong.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="writer")
+            version = driver.call(op="allocate_version")["version"]
+            # One identity, handed over twice in a single chunk.
+            duplicated = _refs_of(1) * 2
+            published = driver.call(
+                op="publish_snapshot", index_version=version,
+                refs=duplicated, published_at_ns=version,
+                indexed_rows=2, indexed_packs=1)
+
+            assert published["ok"], published
+            assert driver.call(op="last_published_version")["version"] == version
+            # The duplicate collapses in the manifest rather than multiplying.
+            members = client.execute(
+                "SELECT DISTINCT store_id, toString(pack_id) FROM "
+                f"`{config.database}`.`{prefix}_snapshot_manifest` "
+                "WHERE index_version = %(version)s", {"version": version})
+            assert len(members) == 1, members
+        finally:
+            driver.close()
+
+
 def test_a_taken_over_publisher_writes_nothing_at_all():
     """The load-bearing fence: the check rides inside the write.
 
@@ -650,4 +694,140 @@ def test_an_outcome_unknown_failure_quarantines_the_writer():
             fresh = driver.call(op="acquire", holder="after-window")
             assert fresh["ok"], fresh
         finally:
+            driver.close()
+
+
+# --- B3: the native indexer, end-to-end with the Python reader oracle -------
+
+def _stage_via_sink(sink, root, index):
+    """Stage one pack through the native sink; return its staged JSON."""
+    from tests.test_native_uploader import _stage as uploader_stage
+    return uploader_stage(sink, root, index)
+
+
+def test_indexed_packs_become_visible_through_the_python_reader(fake_s3):
+    """B3 e2e: sink → uploader → native index → Python CaptureReader.
+
+    Two packs staged by the native sink, uploaded by the native uploader
+    to the fake S3, read back through the native pack-index path, and
+    published by the native writer — and the PYTHON reader must resolve
+    every capture with its metadata intact. The second pass must skip
+    everything through the replay guard and write nothing.
+    """
+    from tests.test_native_uploader import (
+        SINK_DRIVER, STORE_DRIVER, DriverSession, _stage, _store_base,
+    )
+
+    with _catalog() as (client, config, prefix):
+        sink = DriverSession(SINK_DRIVER)
+        store = DriverSession(STORE_DRIVER)
+        driver = CatalogDriver()
+        spool_root = None
+        try:
+            import tempfile
+            spool_root = Path(tempfile.mkdtemp()) / "spool"
+            staged = [_stage(sink, spool_root, 40 + i) for i in range(2)]
+            uploaded = store.call(
+                op="upload_pending", **_store_base(fake_s3),
+                root=str(spool_root), spool_max_bytes=1 << 40, limit=-1,
+            )
+            assert uploaded["ok"], uploaded
+            refs = uploaded["refs"]
+            assert len(refs) == 2, refs
+            for ref in refs:
+                assert ref["pack_id"], ref
+
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="indexer")
+            result = driver.call(
+                op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+            )
+            if not result["ok"]:
+                print("INDEX FAILED:", result["message"])
+                raise AssertionError(result)
+            r = result["result"]
+            assert r["indexed_packs"] == 2, r
+            assert r["indexed_rows"] == 2, r
+            assert r["failed_packs"] == 0, r
+            first_watermark = driver.call(
+                op="last_published_version")["version"]
+            assert first_watermark > 0
+
+            # THE ORACLE: the Python reader resolves both captures.
+            from dmi.storage.capture import CaptureQuery
+            from dmi.storage.capture.clickhouse_reader import (
+                ClickHouseCaptureCatalog,
+                ClickHouseReaderConfig,
+            )
+            reader = ClickHouseCaptureCatalog(
+                client, ClickHouseReaderConfig.from_catalog(config))
+            page = reader.search(CaptureQuery(limit=10))
+            assert len(page.items) == 2, page
+            capture_ids = {item.capture_id for item in page.items}
+            staged_ids = {f"upload-{40 + i:04d}" for i in range(2)}
+            assert capture_ids == staged_ids, capture_ids
+            for item in page.items:
+                assert item.metadata.tenant_id == "t"
+                assert item.metadata.dtype == "uint8"
+
+            # The replay guard: a second pass skips everything, allocates
+            # nothing, and moves no watermark.
+            again = driver.call(
+                op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+            )
+            assert again["ok"], again
+            assert again["result"]["skipped_packs"] == 2, again
+            assert again["result"]["indexed_packs"] == 0, again
+            assert driver.call(
+                op="last_published_version")["version"] == first_watermark
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
+def test_index_without_a_lease_is_refused_before_any_writes(fake_s3):
+    """Refused before allocating a version or writing descriptor rows.
+
+    A readable pack is required: an all-packs-failed batch returns
+    per-pack failures without reaching the lease check, exactly as the
+    Python indexer does.
+    """
+    from tests.test_native_uploader import (
+        SINK_DRIVER, STORE_DRIVER, DriverSession, _stage, _store_base,
+    )
+
+    with _catalog() as (client, config, prefix):
+        sink = DriverSession(SINK_DRIVER)
+        store = DriverSession(STORE_DRIVER)
+        driver = CatalogDriver()
+        try:
+            import tempfile
+            spool_root = Path(tempfile.mkdtemp()) / "spool"
+            staged = _stage(sink, spool_root, 50)
+            uploaded = store.call(
+                op="upload_pending", **_store_base(fake_s3),
+                root=str(spool_root), spool_max_bytes=1 << 40, limit=-1,
+            )
+            assert uploaded["ok"], uploaded
+            refs = uploaded["refs"]
+            assert len(refs) == 1, refs
+
+            _open(driver, prefix)
+            before = driver.call(op="last_published_version")["version"]
+            refused = driver.call(
+                op="index", refs=refs, endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+            )
+            assert not refused["ok"]
+            assert refused["error"] == "PublisherLeaseError", refused
+            assert "holds no publisher lease" in refused["message"]
+            # Nothing was written: no version burned, no watermark moved.
+            assert driver.call(
+                op="last_published_version")["version"] == before
+        finally:
+            sink.close()
+            store.close()
             driver.close()

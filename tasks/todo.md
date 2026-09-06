@@ -146,7 +146,13 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       concurrency tests (two concurrent publishes on one writer serialised;
       cross-process use refused; failed publish releases the writer) port
       alongside the SQL suites.
-- [ ] B3 indexer-native (footer read → batch → publish) + e2e with Python CaptureReader oracle
+- [x] B3 indexer-native (footer read → batch → publish) + e2e with Python CaptureReader oracle.
+      Evidence: native sink → native uploader → native pack-index read → native
+      publish, and the PYTHON CaptureReader resolves both captures with
+      metadata intact; second pass skips via the replay guard and moves no
+      watermark; no-lease refusal burns no version. Pack-index validation
+      ported from PackIndex.from_store (trailer/footer/ranges/dtype-size/
+      dup-ids), external data refused at the boundary. 18/18 live ×2 runs.
 - [ ] B4 schema-native + maintenance-native (GC)
 - **Checkpoint B** (human review) — criteria (cold-path, defined 2026-09-06):
   ported live suites green next to their Python oracles ✓ (lease, allocator,

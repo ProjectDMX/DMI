@@ -14,8 +14,10 @@
 #include <vector>
 
 #include "../common/json.h"
+#include "../store/s3_client.h"
 #include "catalog_writer.h"
 #include "clickhouse_client.h"
+#include "indexer.h"
 #include "lease_coordinator.h"
 #include "version_allocator.h"
 
@@ -103,8 +105,7 @@ std::vector<PackIdentity> read_identities(const std::string& line,
 
 // The 33 capture_raw columns in CAPTURE_COLUMNS order, rendered as one
 // VALUES row. Facet columns are MATERIALIZED — the server computes them.
-std::string render_descriptor_row(const std::string& descriptor,
-                                  uint64_t index_version) {
+std::string render_descriptor_row(const std::string& descriptor) {
   std::vector<std::string> fields;
   const auto text_field = [&](const char* key) {
     fields.push_back(render_sql_string(jc::FindString(descriptor, key)));
@@ -154,9 +155,6 @@ std::string render_descriptor_row(const std::string& descriptor,
   int_field("decoded_length");
   text_field("codec");
   text_field("payload_checksum");
-  // index_version is the op's parameter, not a descriptor field: the
-  // batch carries the version it belongs to.
-  fields.push_back(std::to_string(index_version));
   std::string row;
   for (size_t i = 0; i < fields.size(); ++i) {
     if (i > 0) row += ",";
@@ -300,13 +298,12 @@ std::string respond(const std::string& line, Session* session) {
             (writer.quarantined() ? "true" : "false");
     } else if (op == "write_descriptors") {
       std::vector<std::string> rows;
-      const uint64_t index_version =
-          static_cast<uint64_t>(jc::FindInt(line, "index_version"));
       for (const std::string& descriptor : jc::SplitElements(
                jc::Unwrap(jc::FindArray(line, "descriptors")))) {
-        rows.push_back(render_descriptor_row(descriptor, index_version));
+        rows.push_back(render_descriptor_row(descriptor));
       }
-      writer.write_descriptors(rows, index_version);
+      writer.write_descriptors(
+          rows, static_cast<uint64_t>(jc::FindInt(line, "index_version")));
     } else if (op == "commit_packs") {
       std::vector<std::string> rows;
       for (const std::string& ref : jc::SplitElements(
@@ -349,6 +346,59 @@ std::string respond(const std::string& line, Session* session) {
           static_cast<uint64_t>(jc::FindInt(line, "wedge_ns")),
           takeover_after_renew, takeover_after_chunks,
           jc::FindBool(line, "inject_transport_error"));
+    } else if (op == "index") {
+      // B3: read the packs through the store and run the indexer loop.
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.region = jc::FindString(line, "region");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      dmi_store::S3Client s3(s3_config);
+      std::vector<dmi_catalog::PackRefData> refs;
+      for (const std::string& element : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "refs")))) {
+        dmi_catalog::PackRefData ref;
+        ref.pack_id = jc::FindString(element, "pack_id");
+        ref.store_id = jc::FindString(element, "store_id");
+        ref.object_key = jc::FindString(element, "object_key");
+        ref.object_bytes = static_cast<uint64_t>(jc::FindInt(element, "object_bytes"));
+        ref.checksum = jc::FindString(element, "checksum");
+        ref.record_count = static_cast<uint64_t>(jc::FindInt(element, "record_count"));
+        refs.push_back(ref);
+      }
+      dmi_catalog::IndexerConfig index_config;
+      if (jc::HasKey(line, "max_packs")) {
+        index_config.max_packs = static_cast<int>(jc::FindInt(line, "max_packs"));
+      }
+      const dmi_catalog::IndexResultData result =
+          dmi_catalog::NativeIndexer(&s3, s3_config.bucket, &writer,
+                                     index_config)
+              .index(refs);
+      out = ",\"result\":{\"requested_packs\":" +
+            std::to_string(result.requested_packs) +
+            ",\"skipped_packs\":" + std::to_string(result.skipped_packs) +
+            ",\"indexed_packs\":" + std::to_string(result.indexed_packs) +
+            ",\"indexed_rows\":" + std::to_string(result.indexed_rows) +
+            ",\"failed_packs\":" + std::to_string(result.failed_packs) +
+            ",\"descriptor_inserts\":" +
+            std::to_string(result.descriptor_inserts) + ",\"failures\":[";
+      bool first_failure = true;
+      for (const auto& failure : result.failures) {
+        if (!first_failure) out += ",";
+        first_failure = false;
+        out += "{\"pack_id\":";
+        escape_into(failure.pack_id, &out);
+        out += ",\"object_key\":";
+        escape_into(failure.object_key, &out);
+        out += ",\"error_type\":";
+        escape_into(failure.error_type, &out);
+        out += ",\"message\":";
+        escape_into(failure.message, &out);
+        out += "}";
+      }
+      out += "]}";
     } else if (op == "fence_eval") {
       const bool admits = writer.leases().fence_eval(
           jc::FindString(line, "lease_id"),
