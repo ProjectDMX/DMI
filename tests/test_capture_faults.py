@@ -358,8 +358,27 @@ def test_a_transient_outage_is_survivable_by_retrying_the_batch(tmp_path: Path):
         "the outage must strike the watermark INSERT, not the setup path"
     )
 
-    # The pack was never committed, so the identical call re-reads it and
-    # converges -- indexing is replayable rather than requiring manual repair.
+    # The watermark INSERT is a fenced statement whose outcome is now unknown:
+    # it may still be running on the server past its fence evaluation, so the
+    # writer quarantines its lease rather than handing the same lease_id to a
+    # successor that could publish a higher watermark before it lands. The pass
+    # itself is refused before writing anything, and an immediate re-acquire
+    # is refused too -- it would reuse the same identity.
+    from dmi.storage.capture import PublisherLeaseError
+
+    with pytest.raises(PublisherLeaseError, match="quarantin"):
+        indexer._writer.acquire_publisher_lease("indexer-under-fault")
+    with pytest.raises(PublisherLeaseError):
+        indexer.index([ref])
+
+    # Past the lease window the old statement has landed or been capped and
+    # the server row has expired too, so a fresh lease lets the identical call
+    # re-read the uncommitted pack and converge -- indexing is replayable
+    # rather than requiring manual repair. Reached here by moving the fake
+    # clocks rather than by sleeping.
+    backing.lease.now_ns += ClickHouseCatalogConfig().lease_ttl_ns + 1
+    indexer._writer._quarantined_until_monotonic = time.monotonic() - 1
+    indexer._writer.acquire_publisher_lease("indexer-under-fault")
     result = indexer.index([ref])
 
     assert result.indexed_packs == 1

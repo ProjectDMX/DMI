@@ -110,6 +110,20 @@ class ClickHouseLeaseCoordinator:
         )
         self._lease = None
 
+    def discard_local_lease(self) -> PublisherLease | None:
+        """Drop the held lease WITHOUT writing the release tombstone.
+
+        The tombstone ends the lease at once, which is exactly what an
+        outcome-unknown publish must not do: its watermark statement may
+        still be running on the server past its fence evaluation, and a
+        successor that acquires a fresh term immediately can publish a higher
+        watermark before the old statement lands. Discarding keeps the server
+        row live until its TTL, so any successor's claim is refused until the
+        old operation's window has expired.
+        """
+        lease, self._lease = self._lease, None
+        return lease
+
     def release_statement(self) -> str:
         return (
             f"INSERT INTO {self._qualified_table} "
