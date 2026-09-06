@@ -55,7 +55,7 @@ endif
 # Pure-CPU drivers build without a CUDA toolkit (or torch): the test suite
 # drives them over stdin/stdout. When EVERY requested goal is CPU-only (or
 # clean/host), skip CUDA resolution entirely.
-CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/_dmi_native_sink
+CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/bench_sink build/_dmi_native_sink
 ifneq ($(strip $(MAKECMDGOALS)),)
 ifeq ($(strip $(filter-out clean host $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
@@ -249,6 +249,16 @@ build/bench_builder: csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp csrc
 	$(CXX) -std=c++17 -O3 -march=native -o $@ \
 	    csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp \
 	    -Icsrc/pack -lcrypto
+
+# A5a throughput gate: PackSink end-to-end (queue → packers → spool),
+# same corpus shape as bench_capture_pipeline. Usage:
+#   build/bench_sink [single|interleaved] [workers...] [spooldir=PREFIX]
+build/bench_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/bench_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp csrc/sink/pack_sink.h csrc/sink/object_key.h csrc/sink/record_row.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/bench_sink.cpp \
+	    csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp \
+	    -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/common -lcrypto -lpthread
 
 # A2a SigV4 conformance driver: no torch/pybind/network; runs in any CI job.
 # libcurl headers come from CURL_INCDIR (dev .deb extract); the runtime
