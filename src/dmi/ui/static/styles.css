@@ -338,17 +338,11 @@ input[type="number"] {
   color: var(--ink-soft);
 }
 
-.auth-banner {
+.notice#auth-banner {
   margin: 0 0 12px;
-  padding: 9px 11px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  border-left: 3px solid var(--warn);
-  font-size: 12px;
-  color: var(--ink-soft);
 }
 
-.auth-banner code {
+.notice#auth-banner code {
   font-size: 11px;
 }
 

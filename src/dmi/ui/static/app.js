@@ -459,15 +459,19 @@
   // changed away from.
   var outputRequestId = 0;
 
+  function serializeCurrentState() {
+    return api("/api/config/serialize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config: state })
+    });
+  }
+
   async function refreshOutput() {
     var requestId = (outputRequestId += 1);
     try {
       var results = await Promise.all([
-        api("/api/config/serialize", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ config: state })
-        }),
+        serializeCurrentState(),
         api("/api/validate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -734,11 +738,7 @@
         // the preview only after debounce + request latency, so a Copy made
         // right after a change would otherwise export the previous
         // configuration with a success toast.
-        var payload = await api("/api/config/serialize", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ config: state })
-        });
+        var payload = await serializeCurrentState();
         if (requestId !== copyRequestId) return;
         await navigator.clipboard.writeText(payload.yaml);
         toast("YAML copied to clipboard");

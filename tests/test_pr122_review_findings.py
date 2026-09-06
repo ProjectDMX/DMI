@@ -600,15 +600,18 @@ class TestSaveIsAtomic:
         original = target.read_text()
 
         import dmi.configuration.yaml as config_yaml
+        from pathlib import Path as _Path
 
-        real_dump = config_yaml.dump_config
+        real_write_text = _Path.write_text
 
-        def failing_dump(config):
-            data = real_dump(config)
-            # Simulate ENOSPC mid-write: full payload, then boom.
-            raise OSError(28, "No space left on device")
+        def failing_write(self, *args, **kwargs):
+            # Simulate ENOSPC on the save's own write only, not the setup:
+            # the atomic path writes a .tmp sibling, never the target.
+            if self.name.endswith(".tmp"):
+                raise OSError(28, "No space left on device")
+            return real_write_text(self, *args, **kwargs)
 
-        monkeypatch.setattr(config_yaml, "dump_config", failing_dump)
+        monkeypatch.setattr(_Path, "write_text", failing_write)
         config = parse_config({"version": 1, "observations": {"hooks": ["k"]}})
 
         with pytest.raises(config_yaml.ConfigurationError):

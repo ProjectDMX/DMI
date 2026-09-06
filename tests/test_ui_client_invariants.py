@@ -33,13 +33,15 @@ def _app_js() -> str:
 
 
 def _function_body(source: str, name: str) -> str:
-    """Return the text of one top-level ``async function`` in app.js.
+    """Return the text of one top-level function in app.js.
 
     Brace-matched rather than regex-terminated, so a nested block inside the
     function cannot truncate the body and hide a missing guard.
     """
-    start = source.index(f"async function {name}(")
-    open_brace = source.index("{", start)
+    start = re.search(rf"(?:async\s+)?function\s+{name}\s*\(", source)
+    if start is None:
+        raise AssertionError(f"no function {name} in app.js")
+    open_brace = source.index("{", start.end())
     depth = 0
     for index in range(open_brace, len(source)):
         if source[index] == "{":
@@ -149,27 +151,12 @@ def test_apply_state_preserves_policy_absence():
 
 def test_apply_state_sets_policy_from_next_only():
     source = _app_js()
-    body = _plain_function_body(source, "applyState")
+    body = _function_body(source, "applyState")
 
     assert re.search(r"state\.policy\s*=.*next\.policy", body), (
         "applyState must set policy from next explicitly (undefined stays "
         "undefined) rather than inheriting the default policy"
     )
-
-
-def _plain_function_body(source: str, name: str) -> str:
-    """Brace-matched body of one top-level (non-async) function."""
-    start = source.index(f"function {name}(")
-    open_brace = source.index("{", start)
-    depth = 0
-    for index in range(open_brace, len(source)):
-        if source[index] == "{":
-            depth += 1
-        elif source[index] == "}":
-            depth -= 1
-            if depth == 0:
-                return source[open_brace : index + 1]
-    raise AssertionError(f"unbalanced braces in {name}")
 
 
 def test_copy_serializes_the_current_state_not_the_preview():
@@ -179,13 +166,16 @@ def test_copy_serializes_the_current_state_not_the_preview():
     body = _function_body(source, "btnCopyHandler") if "btnCopyHandler" in source else None
 
     # The handler is inline in bindActions; find the copy listener.
-    bind_actions = _plain_function_body(source, "bindActions")
+    bind_actions = _function_body(source, "bindActions")
     copy_start = bind_actions.index('"btn-copy"')
     copy_slice = bind_actions[copy_start : copy_start + 900]
 
-    assert re.search(r"/api/config/serialize", copy_slice), (
+    assert re.search(r"serializeCurrentState\(\)", copy_slice), (
         "the Copy handler must serialize the current state server-side, not "
         "copy the possibly-stale preview text"
+    )
+    assert re.search(r"/api/config/serialize", source), (
+        "the shared serialize helper must hit the serialize endpoint"
     )
     assert not re.search(
         r"writeText\(dom\[.yaml-preview.\]", copy_slice
@@ -203,7 +193,7 @@ def test_input_handlers_guard_on_initialization():
     reads a null state and dies, silently eating the event (and a mid-
     applyState crash would discard a loaded file)."""
     source = _app_js()
-    body = _plain_function_body(source, "bindSchedule")
+    body = _function_body(source, "bindSchedule")
 
     assert "if (!uiReady) return;" in body
     assert re.search(r"var uiReady = false;", source)
@@ -212,7 +202,7 @@ def test_input_handlers_guard_on_initialization():
 
 def test_copy_carries_a_stale_response_stamp():
     source = _app_js()
-    bind_actions = _plain_function_body(source, "bindActions")
+    bind_actions = _function_body(source, "bindActions")
     copy_slice = bind_actions[bind_actions.index('"btn-copy"'):]
     copy_slice = copy_slice[:copy_slice.index("btn-open")]
 
@@ -225,7 +215,7 @@ def test_copy_carries_a_stale_response_stamp():
 
 def test_tabs_expose_selection_to_assistive_tech():
     source = _app_js()
-    bind_tabs = _plain_function_body(source, "bindTabs")
+    bind_tabs = _function_body(source, "bindTabs")
     assert 'setAttribute("aria-selected"' in bind_tabs
 
     from dmi.ui.app import STATIC_DIR as _STATIC_DIR
@@ -242,7 +232,7 @@ def test_tabs_expose_selection_to_assistive_tech():
 
 
 def _bind_actions_body():
-    return _plain_function_body(_app_js(), "bindActions")
+    return _function_body(_app_js(), "bindActions")
 
 
 def test_save_disables_itself_while_the_request_is_in_flight():

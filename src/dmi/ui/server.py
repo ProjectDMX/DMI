@@ -11,7 +11,7 @@ from typing import Optional
 
 from ..configuration.errors import ConfigurationError
 from .app import create_app
-from .errors import UIDependencyError
+from .errors import UI_DEPENDENCY_MESSAGE, UIDependencyError
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -122,10 +122,7 @@ def serve(
     try:
         import uvicorn
     except ImportError as exc:  # pragma: no cover - exercised by install state
-        raise UIDependencyError(
-            "DMI-configurator needs the optional UI dependencies. Install them "
-            'with:\n    pip install "DMI[ui]"'
-        ) from exc
+        raise UIDependencyError(UI_DEPENDENCY_MESSAGE) from exc
 
     # Port first: an unusable --port should fail before the descriptor is
     # read and a config file is opened.

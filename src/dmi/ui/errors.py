@@ -12,4 +12,10 @@ class UIDependencyError(RuntimeError):
     """
 
 
-__all__ = ["UIDependencyError"]
+UI_DEPENDENCY_MESSAGE = (
+    "DMI-configurator needs the optional UI dependencies. Install them with:\n"
+    '    pip install "DMI[ui]"'
+)
+
+
+__all__ = ["UIDependencyError", "UI_DEPENDENCY_MESSAGE"]

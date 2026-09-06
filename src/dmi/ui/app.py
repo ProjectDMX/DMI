@@ -37,7 +37,7 @@ from ..configuration import (
     validate_config,
 )
 from ..configuration.architecture import model_payload
-from .errors import UIDependencyError
+from .errors import UI_DEPENDENCY_MESSAGE, UIDependencyError
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -53,11 +53,6 @@ DESIGN_TIME_NOTE = (
     "model decides what can actually fire: compile_config() against the "
     "attached model is the runtime check, and it can still reject hooks the "
     "descriptor marks available."
-)
-
-_FASTAPI_MISSING = (
-    "DMI-configurator needs the optional UI dependencies. Install them with:\n"
-    '    pip install "DMI[ui]"'
 )
 
 
@@ -148,7 +143,7 @@ def create_app(
         from fastapi.staticfiles import StaticFiles
         from starlette.middleware.trustedhost import TrustedHostMiddleware
     except ImportError as exc:  # pragma: no cover - exercised by install state
-        raise UIDependencyError(_FASTAPI_MISSING) from exc
+        raise UIDependencyError(UI_DEPENDENCY_MESSAGE) from exc
 
     state = build_state(source, config_path)
 
