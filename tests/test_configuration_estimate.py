@@ -184,10 +184,11 @@ def test_prefill_dominates_the_peak_step():
 
 
 def test_disabling_prefill_drops_the_peak_to_decode():
+    # Batched (enforced): the HF driver gates on phase flags.
     estimate = estimate_config(
         _config(["resid_pre"], capture_prefill=False),
         _descriptor(),
-        _workload(prompt_tokens=2048, decode_tokens=128),
+        _workload(prompt_tokens=2048, decode_tokens=128, packed=False),
     )
 
     assert estimate.peak_step_bytes == estimate.decode_step_bytes
@@ -197,7 +198,7 @@ def test_capturing_nothing_is_reported_as_a_warning():
     estimate = estimate_config(
         _config(["resid_pre"], capture_prefill=False, capture_decode=False),
         _descriptor(),
-        _workload(),
+        _workload(packed=False),
     )
 
     assert estimate.peak_step_bytes == 0
@@ -583,7 +584,7 @@ def test_aggregate_peak_follows_the_enabled_phases():
     estimate = estimate_config(
         _config(["resid_pre"], capture_prefill=False),
         _descriptor(),
-        _workload(prompt_tokens=2048, decode_tokens=128),
+        _workload(prompt_tokens=2048, decode_tokens=128, packed=False),
     )
 
     assert estimate.aggregate_peak_step_bytes == estimate.decode_step_bytes

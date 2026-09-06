@@ -291,7 +291,11 @@ class TestPerRequestVolumeSumsAllRanks:
             single.peak_step_bytes, rel=0.01
         )
 
-    def test_disabled_phase_contributes_zero_volume(self):
+    def test_packed_volume_ignores_disabled_phases_but_stays_positive(self):
+        # Packed convention: the phase flag is authored but unenforced, so
+        # the volume is the FULL volume (not zero, not reduced) and a
+        # warning carries the gap. The phase-gating claim itself is pinned
+        # by the batched tests in test_estimate_runtime_fidelity.py.
         descriptor = _descriptor()
         config = DMIConfig(
             observations=ObservationConfig(hooks=["q"]),
@@ -304,6 +308,7 @@ class TestPerRequestVolumeSumsAllRanks:
         )
 
         assert estimate.bytes_per_request > 0
+        assert any("vLLM" in w or "packed" in w.lower() for w in estimate.warnings)
 
 
 # ---------------------------------------------------------------------------

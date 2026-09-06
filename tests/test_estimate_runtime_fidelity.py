@@ -150,10 +150,14 @@ def test_a_packed_stride_is_not_applied_and_says_so():
 
 def test_phase_toggles_remove_their_phase_from_volume():
     """capture_decode=false drops decode volume entirely -- and the runtime
-    does the same, via the adapter driver's schedule gate."""
-    both = estimate_config(_config(), _descriptor(), _workload())
+    does the same, via the adapter driver's schedule gate. Batched only:
+    the packed (vLLM) backend executes no schedule, so packed figures keep
+    both phases regardless of the flags."""
+    both = estimate_config(
+        _config(), _descriptor(), _workload(packed=False)
+    )
     prefill_only = estimate_config(
-        _config(capture_decode=False), _descriptor(), _workload()
+        _config(capture_decode=False), _descriptor(), _workload(packed=False)
     )
 
     assert prefill_only.bytes_per_request < both.bytes_per_request
@@ -170,10 +174,11 @@ def test_a_default_schedule_changes_nothing():
 
 
 def test_prefill_and_decode_toggles_keep_working():
-    """The phase toggles gate shapes: prefill-only shrinks the peak step."""
-    both = estimate_config(_config(), _descriptor(), _workload())
+    """The phase toggles gate shapes: prefill-only shrinks the peak step
+    (batched, where the driver enforces them)."""
+    both = estimate_config(_config(), _descriptor(), _workload(packed=False))
     decode_only = estimate_config(
-        _config(capture_prefill=False), _descriptor(), _workload()
+        _config(capture_prefill=False), _descriptor(), _workload(packed=False)
     )
 
     assert decode_only.peak_step_bytes < both.peak_step_bytes

@@ -97,6 +97,11 @@ class Workload:
     # means a dynamically grown cache (kv = current context length), which
     # is the smaller shape and is called out in the warnings.
     cache_max_len: Optional[int] = None
+    # Explicit per-stage layer counts for deployments that override vLLM's
+    # default partition via VLLM_PP_LAYER_PARTITION. Validated to cover the
+    # model exactly (len == pipeline_parallel_size, sum == num_layers);
+    # otherwise the estimator keeps the default rule.
+    pp_layer_counts: Optional[tuple[int, ...]] = None
 
     def __post_init__(self) -> None:
         # Exact types first, mirroring ModelTopology: a JSON `8192.0` passes
@@ -114,6 +119,34 @@ class Workload:
                 raise ValueError(
                     f"{name} must be an integer, got "
                     f"{type(value).__name__} ({value!r})."
+                )
+        # cache_max_len rides the same arithmetic as the other counts: a
+        # float explodes only when attention-weight hooks are selected, and
+        # a bool silently reads as a 1-token cache otherwise.
+        if self.cache_max_len is not None and (
+            isinstance(self.cache_max_len, bool)
+            or not isinstance(self.cache_max_len, int)
+        ):
+            raise ValueError(
+                f"cache_max_len must be an integer, got "
+                f"{type(self.cache_max_len).__name__} "
+                f"({self.cache_max_len!r})."
+            )
+        # An explicit partition must be well-formed here; the sum check
+        # needs the topology and happens where it is used.
+        if self.pp_layer_counts is not None:
+            if not isinstance(self.pp_layer_counts, (tuple, list)) or not all(
+                type(count) is int and count >= 0
+                for count in self.pp_layer_counts
+            ):
+                raise ValueError(
+                    "pp_layer_counts must be a tuple of non-negative integers, "
+                    f"got {self.pp_layer_counts!r}."
+                )
+            if len(self.pp_layer_counts) != self.pipeline_parallel_size:
+                raise ValueError(
+                    f"pp_layer_counts has {len(self.pp_layer_counts)} entries "
+                    f"but pipeline_parallel_size is {self.pipeline_parallel_size}."
                 )
         if self.dtype is not None and not isinstance(self.dtype, str):
             raise ValueError(f"dtype must be a string, got {type(self.dtype).__name__}.")
@@ -235,18 +268,41 @@ def _element_size(dtype_name: str) -> int:
     return torch._utils._element_size(_resolve_dtype(dtype_name))
 
 
-def _stage_layers(num_layers: int, pp_size: int, stage: int) -> range:
-    """Contiguous split of layers across pipeline stages.
+def _vllm_default_partitions(num_layers: int, pp_size: int) -> list[int]:
+    """Per-stage layer counts, exactly as vLLM 0.27.1's ``get_pp_indices``.
 
-    Matches vLLM's ``get_pp_indices``: the remainder layers go to the FIRST
-    stages (8 layers / 3 stages -> [3, 3, 2], not [2, 3, 3]). Per-rank peaks
-    move with the split, so this has to agree with the serving backend.
+    Remainder layers go BACKWARD from the second-to-last stage -- the last
+    stage is never padded (it already carries the output norm/logits) --
+    e.g. 4 layers / 3 stages -> [1, 2, 1], 10 / 4 -> [2, 3, 3, 2]. Per-rank
+    peaks move with the split, so the estimator uses this rule rather than
+    the first-stages-first convention it used to.
     """
     base = num_layers // pp_size
-    extra = num_layers % pp_size
-    start = stage * base + min(stage, extra)
-    end = start + base + (1 if stage < extra else 0)
-    return range(start, end)
+    partitions = [base] * pp_size
+    if remaining := num_layers % pp_size:
+        for i in range(2, remaining + 2):
+            partitions[-i] += 1
+    return partitions
+
+
+def _stage_layers(
+    num_layers: int,
+    pp_size: int,
+    stage: int,
+    explicit: Optional[tuple[int, ...]] = None,
+) -> range:
+    """Contiguous split of layers across pipeline stages.
+
+    ``explicit`` is a caller-supplied per-stage count (the
+    ``VLLM_PP_LAYER_PARTITION`` deployment override, via
+    ``Workload.pp_layer_counts``); otherwise the vLLM default rule above.
+    """
+    if explicit is not None:
+        partitions = list(explicit)
+    else:
+        partitions = _vllm_default_partitions(num_layers, pp_size)
+    start = sum(partitions[:stage])
+    return range(start, start + partitions[stage])
 
 
 def _hook_on_stage(short: str, stage: int, pp_size: int) -> bool:
@@ -320,7 +376,8 @@ def _step_bytes(
         _dtype_overrides = {"token_ids": "int64"}
 
     stage_layers = set(_stage_layers(
-        topology.num_layers, workload.pipeline_parallel_size, stage
+        topology.num_layers, workload.pipeline_parallel_size, stage,
+        explicit=workload.pp_layer_counts,
     ))
 
     total = 0
@@ -503,8 +560,17 @@ def estimate_config(
             ))
 
     schedule = config.schedule
-    capture_prefill = schedule.capture_prefill
-    capture_decode = schedule.capture_decode
+    # The pinned vLLM integration (the packed convention) constructs its
+    # engine with config=None and commits steps directly, bypassing the
+    # schedule gate entirely -- phases, strides, warmup, offsets all. The
+    # figures below must therefore describe what the runtime DOES, not what
+    # the document ASKS: for packed, the phase flags are forced on in the
+    # arithmetic (the authored intent stays visible in the warnings, which
+    # name the gap), exactly as the stride divisor already is below.
+    authored_prefill = schedule.capture_prefill
+    authored_decode = schedule.capture_decode
+    capture_prefill = authored_prefill or workload.packed
+    capture_decode = authored_decode or workload.packed
 
     def _peak(load: RankLoad) -> int:
         candidates = []
@@ -575,12 +641,14 @@ def estimate_config(
                 "bytes are the unsampled cost. (Gating vLLM needs graph-safe "
                 "producer gating, not only a host-side predicate.)"
             )
-        if not (capture_prefill and capture_decode):
+        if not (authored_prefill and authored_decode):
             warnings.append(
-                "capture_prefill/capture_decode are applied here as the "
-                "authored intent, but the pinned vLLM integration does not "
-                "consult the schedule -- verify the phase flags are honoured "
-                "by the integration revision you deploy."
+                "capture_prefill/capture_decode are IGNORED in these packed "
+                "figures: the pinned vLLM integration does not consult the "
+                "schedule, so production captures both phases regardless. "
+                "Target Batched (Hugging Face) to have the flags honored, or "
+                "verify the phase flags are honoured by the integration "
+                "revision you deploy."
             )
     if schedule_is_enforced and (
         sampling_divisor > 1 or not (capture_prefill and capture_decode)
@@ -602,6 +670,11 @@ def estimate_config(
             "request -- an accepted step costs the peak-step figure in full, "
             "and a request that lands on an accepted step pays it"
         )
+    if schedule_is_enforced:
+        # Offset/warmup disclosure stands on its own: it does not depend on
+        # a stride being set. With step_offset=99 and stride 1, the first 99
+        # steps capture nothing, and the full figure above still reports
+        # them -- the figure's time/window basis must be named either way.
         offsets = {
             "step_offset": schedule.step_offset,
             "warmup_steps": schedule.warmup_steps,
@@ -612,9 +685,13 @@ def estimate_config(
         if set_offsets:
             warnings.append(
                 f"{', '.join(set_offsets)} shift WHICH steps and requests are "
-                "captured, and this average does not model them: early "
+                "captured, and these figures do not model them: early "
                 "traffic inside the offset/warmup window captures nothing, "
-                "and the long-run average above is only reached after it."
+                + (
+                    "and the long-run average above is only reached after it."
+                    if sampling_divisor > 1
+                    else "while the bytes above describe steady-state steps."
+                )
             )
 
     per_request = total_volume // sampling_divisor
@@ -671,17 +748,30 @@ def estimate_config(
             "rank 0 is the busiest"
         )
     if pp_size > 1:
-        assumptions.append(
-            f"pipeline_parallel_size={pp_size}: layers split contiguously "
-            "across stages by vLLM's get_pp_indices rule (the remainder goes "
-            "to the FIRST stages)"
-        )
-        warnings.append(
-            "A serving host that sets VLLM_PP_LAYER_PARTITION overrides that "
-            "split, and this estimate cannot see it: per-stage peaks move "
-            "with the partition, so re-check the busiest rank against the "
-            "partition you deploy."
-        )
+        if workload.pp_layer_counts is not None:
+            if sum(workload.pp_layer_counts) != topology.num_layers:
+                raise ValueError(
+                    f"pp_layer_counts sums to {sum(workload.pp_layer_counts)} "
+                    f"but the model has {topology.num_layers} layers."
+                )
+            assumptions.append(
+                f"pipeline_parallel_size={pp_size}: layers split per the "
+                f"explicit pp_layer_counts={list(workload.pp_layer_counts)} "
+                "(e.g. a VLLM_PP_LAYER_PARTITION override)"
+            )
+        else:
+            assumptions.append(
+                f"pipeline_parallel_size={pp_size}: layers split contiguously "
+                "across stages by vLLM's get_pp_indices rule (the remainder "
+                "goes backward from the second-to-last stage, never the "
+                "last)"
+            )
+            warnings.append(
+                "A serving host that sets VLLM_PP_LAYER_PARTITION overrides "
+                "that split, and this estimate cannot see it: pass the "
+                "deployed counts as workload.pp_layer_counts, because "
+                "per-stage peaks move with the partition."
+            )
 
     return Estimate(
         peak_step_bytes=peak_step_bytes,
@@ -713,6 +803,8 @@ def check_ring_fit(
     """
     if payload_bytes < 1:
         raise ValueError(f"payload_bytes must be >= 1, got {payload_bytes}.")
+    if pinned_bytes < 0:
+        raise ValueError(f"pinned_bytes must be >= 0, got {pinned_bytes}.")
     effective = min(payload_bytes, pinned_bytes) if pinned_bytes else payload_bytes
     peak = estimate.peak_step_bytes
     fits = peak <= effective

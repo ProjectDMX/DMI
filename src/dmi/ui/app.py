@@ -326,12 +326,21 @@ def create_app(
                     f"'ring.payload_bytes' must be an integer, got "
                     f"{type(payload_bytes).__name__}.",
                 )
-            pinned_bytes = ring.get("pinned_bytes") or 0
-            if isinstance(pinned_bytes, bool) or not isinstance(pinned_bytes, int):
+            # Absent/None means "no pinned ring"; any EXPLICIT value --
+            # including falsy ones like false, 0.0, "" or [] -- is validated
+            # rather than coerced by `or`, which silently turned all of those
+            # into 0 and answered a fit question the caller did not ask.
+            pinned_raw = ring.get("pinned_bytes")
+            pinned_bytes = 0 if pinned_raw is None else pinned_raw
+            if (
+                isinstance(pinned_bytes, bool)
+                or not isinstance(pinned_bytes, int)
+                or pinned_bytes < 0
+            ):
                 raise HTTPException(
                     400,
-                    f"'ring.pinned_bytes' must be an integer, got "
-                    f"{type(pinned_bytes).__name__}.",
+                    f"'ring.pinned_bytes' must be a non-negative integer, got "
+                    f"{pinned_raw!r}.",
                 )
             try:
                 task_entries = ring.get("task_entries")

@@ -262,6 +262,23 @@ def attach_config(adapter, model, config: DMIConfig) -> None:
     ``apply_hook_selection`` walks the unselected specs to turn them off. A
     pre-filtered list would leave every deselected hook live.
     """
+    # One owner per model, checked BEFORE anything mutates: attachment
+    # reconfigures shared state (the engine schedule, the transport's model
+    # cfg, its active spec list, every HookPoint's enabled flag), so a second
+    # adapter attaching over the first leaves one caller's reservation paired
+    # with another caller's producers. The marker is set both by the base
+    # adapter path and here (for adapters that override attach_model without
+    # calling super()); a re-attach by the SAME adapter is a deliberate
+    # reconfiguration and is allowed.
+    current_owner = getattr(model, "_dmi_active_adapter", None)
+    if current_owner is not None and current_owner is not adapter:
+        raise ConfigurationError(
+            f"Model is already attached by {type(current_owner).__name__}: "
+            f"{type(adapter).__name__} cannot re-own it. Detach the current "
+            "owner first (owner.detach_model(model)), or drive generation "
+            "through the existing attachment -- attaching over it would pair "
+            "one caller's reservation with another caller's producers."
+        )
     # Pass `layers` only when there is a range to apply. Adapters are a public
     # extension point (see the v1 integration API), and an adapter that
     # overrides attach_model without the keyword would otherwise raise

@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 import yaml
 
-from .errors import DescriptorError, UnsupportedConfigVersion
+from .errors import ConfigurationError, DescriptorError, UnsupportedConfigVersion
 from .schema import (
     DESCRIPTOR_SCHEMA_VERSION,
     SUPPORTED_ARCHITECTURES,
@@ -147,10 +147,14 @@ def load_descriptor(path: str | Path) -> ModelDescriptor:
         raw = target.read_text(encoding="utf-8")
     except OSError as exc:
         raise DescriptorError(f"Cannot read descriptor {target}: {exc}") from exc
+    # Same strict loader as the configuration path: duplicate keys and
+    # unhashable keys are refused here, not later as a bare TypeError.
+    from .yaml import load_yaml_document
+
     try:
-        data = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
-        raise DescriptorError(f"Descriptor {target} is not valid YAML: {exc}") from exc
+        data = load_yaml_document(raw, f"Descriptor {target}")
+    except ConfigurationError as exc:
+        raise DescriptorError(str(exc)) from exc
     return parse_descriptor(data)
 
 

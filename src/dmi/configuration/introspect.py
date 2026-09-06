@@ -159,6 +159,12 @@ _DESCRIPTOR_ESCAPE_HATCH = (
 def _is_supported_decoder(model_type: str) -> bool:
     """Allowlist match, tolerating the usual family-variant separators."""
     normalized = model_type.lower().replace("-", "_")
+    # No causal decoder-only family carries "encoder" in its model_type;
+    # encoder subtypes of decoder families (qwen2_audio_encoder, whisper's
+    # encoder side, future *_encoder variants) fail closed here rather than
+    # riding a family prefix they do not share semantics with.
+    if "encoder" in normalized:
+        return False
     return any(
         normalized == family or normalized.startswith(family + "_")
         for family in _SUPPORTED_DECODER_MODEL_TYPES

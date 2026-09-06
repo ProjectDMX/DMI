@@ -332,7 +332,19 @@ def _no_duplicate_keys(loader: yaml.SafeLoader, node, deep: bool = False) -> dic
     mapping: dict = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
-        if key in mapping:
+        try:
+            duplicate = key in mapping
+        except TypeError:
+            # Unhashable mapping keys (a list or dict used as a key) can
+            # never name a configuration field; without this they escape as
+            # a raw TypeError past the YAMLError boundary below.
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"unhashable mapping key {key!r}: keys must be strings",
+                key_node.start_mark,
+            )
+        if duplicate:
             raise yaml.constructor.ConstructorError(
                 "while constructing a mapping",
                 node.start_mark,
