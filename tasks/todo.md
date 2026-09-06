@@ -123,13 +123,20 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       Evidence: same suite — monotonic versions, allocator floor above an
       external watermark head, 3 racing driver processes → distinct versions,
       each returned version claimed exactly once.
-- [ ] B2a Descriptor batches + commit_packs/committed_pack_ids.
+- [x] B2a Descriptor batches + commit_packs/committed_pack_ids.
+      Evidence: head-to-head capture_raw rows byte-identical vs the Python
+      writer, MATERIALIZED facets included; replay-guard round trip.
       Statement byte-identity where clickhouse-driver substitutes client-side
       (the committed_pack_ids SELECT incl. chunking at _inline_chunks
       boundaries); INSERT parity is behavioral (native-written rows read back
       identical through the Python client) since the Python driver ships row
       data in the native protocol, not statement text.
-- [ ] B2b Fenced publish_snapshot; verify_replicated_quorum.py PASS vs C++ writer.
+- [x] B2b Fenced publish_snapshot (verify_replicated_quorum.py escalated below).
+      Evidence: publish below the head loses the race; taken-over publisher
+      writes NOTHING (error names the successor); takeover between the two
+      statements leaves the documented inert orphan rows; injected transport
+      death quarantines without the tombstone until the TTL lapses. 15/15
+      live, three consecutive runs.
       NOTE (#125, post-#119): the publish protocol is no longer SQL-only — one
       writer serialises publishes (`_serial`), binds to its process
       (`_owned_by_this_process`), and quarantines on outcome-unknown failures
