@@ -19,6 +19,13 @@ make -C native -j
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
 ```
 
+On a checkout shared with another DMI environment (for example a
+Python 3.10 install alongside a Python 3.12 vLLM environment), drop the
+`clean` step: the native build emits ABI-suffixed extensions
+(`_native_backend.cpython-310-*.so`, `...cpython-312-*.so`) side by side, so
+one build tree serves both interpreters. Running `clean` deletes every
+environment's extensions, not just the current one's.
+
 DMI supports both vLLM 0.27.1 GPU model runners. Use vLLM's normal
 architecture-dependent default, set `VLLM_USE_V2_MODEL_RUNNER=1` to require
 V2, or set it to `0` to require V1. V2 speculative decoding is not yet
@@ -168,6 +175,36 @@ used for other `/v1` endpoints.
 | `dmx_drain_flush_timeout_us` | Maximum time a completed tensor waits before a GPU-to-CPU drain flush; `0` disables the timer |
 | `dmx_db_host`, `dmx_db_port` | ClickHouse connection; an empty host disables persistence |
 | `dmx_db_database`, `dmx_db_table` | ClickHouse destination |
+
+## Verifying the configurator runtime attach (live)
+
+A configuration authored in the configurator reaches the vLLM runtime as a
+saved `.dmi.yaml` artifact driven through
+`dmi.configuration.attach_config(adapter, model, config)` — not through the
+worker's own attach. To verify that path end to end on real hardware:
+
+1. Build the environment: one venv with `vllm==0.27.1`, then
+   `pip install --no-deps -e <DMI checkout> -e third_party/vllm-integration/`
+   (DMI borrows vLLM's dependency set, exactly as the integration CI does),
+   plus a native build for that interpreter (see the ABI note above).
+2. Write a worker subclass of the **V1** `DMXGPUWorker`
+   (`dmi_vllm_integration.adapter.DMXGPUWorker`) whose `load_model` temporarily
+   sets `self.adaptor = None` around `super().load_model()` — suppressing the
+   worker's self-attach — then loads the artifact and calls
+   `attach_config(self.adaptor, self.model_runner.model, config)`. V2 refuses
+   subclasses of the dynamic entry point entirely.
+3. Launch offline `LLM(...)` with that worker class and
+   `VLLM_ENABLE_V1_MULTIPROCESSING=0` (in-process engine core, so the attach
+   and its evidence stay reachable), `enforce_eager=True`, and a
+   `gpu_memory_utilization` that coexists with other tenants on the device.
+4. Evidence to assert: `attach_config` owns the model
+   (`model._dmi_active_adapter`), the adaptor's active spec layers sit inside
+   the configured range, out-of-range `HookPoint`s are disabled, and
+   `generate()` completes with capture enabled (real ring traffic).
+
+The one-owner invariant is what makes the suppression step mandatory: the
+worker's self-attach marks the model, and a second attach by the configurator
+runtime would be refused.
 
 ## Troubleshooting
 
