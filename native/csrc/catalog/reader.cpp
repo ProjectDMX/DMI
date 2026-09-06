@@ -182,14 +182,6 @@ size_t top_level_member_count(const std::string& object) {
   return jc::SplitElements(inside).size();
 }
 
-std::string find_string_in(const std::string& object, const char* key) {
-  if (!jc::HasKey(object, key)) {
-    throw CatalogError(CatalogError::Kind::kValue,
-                       std::string("cursor is missing ") + key);
-  }
-  return jc::FindString(object, key);
-}
-
 uint64_t find_uint_in(const std::string& object, const char* key) {
   if (!jc::HasKey(object, key)) {
     throw CatalogError(CatalogError::Kind::kValue,

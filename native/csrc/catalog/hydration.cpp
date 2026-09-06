@@ -52,11 +52,6 @@ bool is_float_dtype(const std::string& dtype) {
          dtype == "float64";
 }
 
-bool is_signed_dtype(const std::string& dtype) {
-  return dtype == "int8" || dtype == "int16" || dtype == "int32" ||
-         dtype == "int64";
-}
-
 // One element widened to double. bfloat16 is read as uint16 and widened to
 // float32 by a 16-bit left shift — exact for every bit pattern. float16 is
 // an IEEE half.
@@ -113,13 +108,15 @@ double decode_element(const std::string& dtype, const uint8_t* data,
     const uint32_t mantissa = bits & 0x3FF;
     uint32_t out;
     if (exponent == 0) {
-      out = sign | (mantissa ? 0 : 0);  // zero or subnormal → treat as zero
-      if (mantissa) {
-        // Subnormal half: normalize. Rare in this pipeline; keep exact.
-        double value = static_cast<double>(mantissa) * 6.103515625e-8f;
-        std::memcpy(&out, &value, 4);
-        out |= 0;
-      }
+      // Zero or subnormal. A subnormal half is ±mantissa × 2⁻²⁴ -- a
+      // perfectly NORMAL float32 -- so compute the value instead of
+      // assembling bits. The previous assembly copied the low four bytes
+      // of a DOUBLE into the bit field and dropped the sign: 0x0001
+      // (2⁻²⁴) summarized as ~-1.2e19 and pulled the whole mean with it.
+      const float value =
+          static_cast<float>(mantissa) * 5.9604644775390625e-08f;  // 2^-24
+      return (bits >> 15) != 0 ? -static_cast<double>(value)
+                               : static_cast<double>(value);
     } else if (exponent == 0x1F) {
       out = sign | 0x7F800000u | (mantissa ? 0x400000u : 0);
     } else {

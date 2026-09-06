@@ -851,6 +851,94 @@ def test_summary_core_stats_parity(fake_s3):
             driver.close()
 
 
+def test_summary_parity_on_float16_including_subnormals(fake_s3):
+    """Every float16 bit pattern must decode to the number Python decodes.
+
+    The subnormal branch built the float32 bits by copying the low four
+    bytes of a DOUBLE into the bit field and discarded the sign, so
+    0x0001 (2^-24) and 0x8001 (-2^-24) summarized as garbage while the
+    corpus every other test stages -- uint8 -- never touched the branch.
+    Normals, zeros, and both subnormal signs ride together here and the
+    Python summary is the oracle for all of them.
+    """
+    import struct
+    import tempfile
+
+    from tests.test_native_uploader import (
+        SINK_DRIVER, STORE_DRIVER, DriverSession, _stage, _store_base,
+    )
+    from dmi.storage.capture import CaptureReader, S3PackStore, S3StoreConfig
+    from dmi.storage.capture.clickhouse_reader import (
+        ClickHouseCaptureCatalog, ClickHouseReaderConfig,
+    )
+    from dmi.storage.capture.model import CaptureQuery
+
+    # 0x0001 = 2^-24 (smallest subnormal), 0x8001 = -2^-24, 0x3C00 = 1.0,
+    # 0xC000 = -2.0, 0x0000 = 0.0, 0x03FF = largest subnormal.
+    payload = struct.pack("<6H", 0x0001, 0x8001, 0x3C00, 0xC000, 0x0000,
+                          0x03FF)
+
+    with _catalog() as (client, config, prefix):
+        sink = DriverSession(SINK_DRIVER)
+        store = DriverSession(STORE_DRIVER)
+        driver = CatalogDriver()
+        try:
+            spool_root = Path(tempfile.mkdtemp()) / "spool"
+            _stage(sink, spool_root, 90, payload, dtype="float16", shape=(6,))
+            uploaded = store.call(
+                op="upload_pending", **_store_base(fake_s3),
+                root=str(spool_root), spool_max_bytes=1 << 40, limit=-1)
+            assert uploaded["ok"], uploaded
+
+            _open_helper(driver, prefix)
+            driver.call(op="acquire", holder="indexer")
+            indexed = driver.call(
+                op="index", refs=uploaded["refs"], endpoint=fake_s3,
+                bucket=BUCKET, region=REGION, access=ACCESS, secret=SECRET,
+                insecure=True)
+            assert indexed["ok"], indexed
+
+            native_select = driver.call(
+                op="select", tenant_id="t", limit=10,
+                endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                secret=SECRET, insecure=True)
+            assert native_select["ok"], native_select
+            sel = native_select["selection"]
+            native = driver.call(
+                op="summarize_core", selection_id=sel["selection_id"],
+                capture_ids=sel["capture_ids"],
+                catalog_watermark=sel["catalog_watermark"],
+                filter_hash=sel["filter_hash"], tenant_id=sel["tenant_id"],
+                byte_limit=1 << 30, endpoint=fake_s3, bucket=BUCKET,
+                access=ACCESS, secret=SECRET, insecure=True)
+            assert native["ok"], native
+
+            python_catalog = ClickHouseCaptureCatalog(
+                client, ClickHouseReaderConfig.from_catalog(config))
+            python_store = S3PackStore.from_config(
+                S3StoreConfig(
+                    endpoint_url=fake_s3, bucket=BUCKET, region=REGION,
+                    access_key_id=ACCESS, secret_access_key=SECRET,
+                    store_id="native-test", allow_insecure_http=True))
+            python_reader = CaptureReader(
+                python_catalog, {"native-test": python_store})
+            selection = python_reader.select(
+                CaptureQuery(tenant_id="t", limit=10))
+            (expected,) = python_reader.summarize(selection,
+                                                  byte_limit=1 << 30)
+
+            (summary,) = native["summaries"]
+            assert summary["element_count"] == expected.core.element_count
+            assert summary["finite_count"] == expected.core.finite_count
+            assert summary["zero_fraction"] == expected.core.zero_fraction
+            assert summary["mean"] == expected.core.mean, summary
+            assert summary["l2_norm"] == expected.core.l2_norm, summary
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
 def test_hydration_budget_refused_before_any_fetch(fake_s3):
     with _catalog() as (client, config, prefix):
         try:

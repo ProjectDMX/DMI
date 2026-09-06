@@ -47,8 +47,12 @@ struct SearchFilters {
 };
 
 struct SearchPage {
-  // Each item is one descriptor: 32 fields in CAPTURE_COLUMNS[:-1] order —
-  // the same layout the writer's rows use, so parity compares them 1:1.
+  // Each item is one descriptor: 32 fields, the five SORT-KEY columns
+  // first (tenant_id, experiment_id, run_id, captured_at_ns, capture_id)
+  // and then the resolved columns in projection-minus-sort-key order --
+  // NOT CAPTURE_COLUMNS order. The parity suite's normalizer and its
+  // hard-coded indices (capture_id at item[4]) depend on this layout; a
+  // caller indexing by the writer's column order reads the wrong fields.
   std::vector<std::vector<std::string>> items;
   std::optional<std::string> next_cursor;
   std::string watermark;
