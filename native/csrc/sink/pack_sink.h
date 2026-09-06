@@ -68,6 +68,15 @@ struct SinkConfig {
   double admission_timeout_s = -1.0;
   std::string spool_root;
   uint64_t spool_max_bytes = 1ull << 40;
+  // Pack assembler workers. Records route by scope hash
+  // (tenant, session, producer_rank), so one scope always lands on one
+  // worker: per-scope ordering and single-scope packs are preserved at any
+  // N, and N=1 is exactly the A3b behavior. 0 means 1.
+  int num_workers = 1;
+  // Sealed packs awaiting spool staging, per packer/stager pair. The stager
+  // overlaps disk I/O with the next pack's assembly; the bound caps
+  // in-memory packs (each up to max_pack_bytes).
+  int stage_queue_packs = 2;
 };
 
 struct SinkSnapshot {
@@ -93,6 +102,13 @@ struct SinkSnapshot {
   uint64_t queue_bytes = 0;
   uint64_t queue_peak_records = 0;
   uint64_t queue_peak_bytes = 0;
+  // Sealed packs handed to stagers but not yet durable. Not part of the
+  // Python snapshot (no stage queue exists there); native-only visibility
+  // into the second pipeline stage.
+  uint64_t stage_packs = 0;
+  uint64_t stage_bytes = 0;
+  uint64_t stage_peak_packs = 0;
+  uint64_t stage_peak_bytes = 0;
 };
 
 // One admitted record: metadata by value (26 strings — moved, not copied,
@@ -103,9 +119,11 @@ struct SinkRecord {
 };
 
 // Non-closing durability barrier: completes once every record admitted
-// before it has been persisted.
+// before it has been persisted. With N workers each queue carries one copy;
+// `remaining` counts the copies still outstanding.
 struct FlushBarrier {
   uint64_t target_admitted = 0;
+  int remaining = 1;
   bool completed = false;
   std::string error;
 };
@@ -136,25 +154,45 @@ class PackSink {
  private:
   using Item = std::variant<SinkRecord, std::shared_ptr<FlushBarrier>>;
 
-  void Run();
+  void Run(size_t worker);
   void FailWorker(const std::string& what);
-  // Seal the open pack for `reason`, stage it, count it. Throws on failure
-  // (latched by Run).
-  void PersistOpenPack(FlushReason reason);
+  // Seal worker `w`'s open pack for `reason` and hand it to its stager.
+  // Throws on seal failure (latched by Run); staging errors surface at the
+  // stager and complete the in-flight barrier with the error.
+  void SealForStager(size_t w, FlushReason reason);
+  // Stager thread for pair `w`: stages sealed packs, counts down barriers.
+  void RunStager(size_t w);
   // Snapshot body with mutex_ already held.
   SinkSnapshot SnapshotLocked() const;
+  // Worker index for a scope. FNV-1a over tenant\0session\0rank — stable
+  // across calls so one scope always lands on one worker.
+  size_t RouteWorker(const std::string& tenant, const std::string& session,
+                     uint64_t rank) const;
 
   SinkConfig config_;
   dmi_store::Spool spool_;
 
   mutable std::mutex mutex_;
   std::condition_variable cv_;
-  std::deque<Item> queue_;
+  // Per-worker wakeup channels. A broadcast notify_all on the shared cv
+  // wakes every worker on every submit/pop (~180k thundering-herd wakeups
+  // per 10k-record trial at N=8 — measured as the scaling inhibitor), so
+  // the producer signals ONLY the routed worker's cv. The shared cv stays
+  // for the few waiters that need broadcast: the BLOCK producer (space
+  // freed by any pop), the flush waiter (barrier completion), and close.
+  // deque: condition_variable is neither movable nor copyable, and deque
+  // emplace_back never moves existing elements.
+  std::deque<std::condition_variable> worker_cv_;
+  std::deque<std::condition_variable> stage_cv_;
+  // One FIFO per worker; admission bounds (queue_records_/bytes_) are global
+  // across them so single-scope throughput never depends on N.
+  std::vector<std::deque<Item>> queues_;
   uint64_t queue_records_ = 0;
   uint64_t queue_bytes_ = 0;
   bool closed_ = false;
   bool thread_started_ = false;
-  std::thread worker_;
+  std::vector<std::thread> workers_;
+  std::vector<std::thread> stagers_;
 
   std::mutex flush_mutex_;
   std::shared_ptr<FlushBarrier> pending_;
@@ -164,15 +202,42 @@ class PackSink {
   uint64_t queue_peak_records_ = 0;
   uint64_t queue_peak_bytes_ = 0;
 
-  // Assembler state (worker thread only).
-  std::unique_ptr<dmi_pack::PackBuilder> builder_;
-  dmi_pack::RecordMetadata first_metadata_;
-  bool has_first_ = false;
-  std::string scope_tenant_;
-  std::string scope_session_;
-  uint64_t scope_rank_ = 0;
-  int64_t opened_ns_ = -1;
-  std::string open_pack_id_;
+  // Stage queues: sealed packs (and forwarded barriers) awaiting the spool.
+  // One per packer/stager pair, so each pair is an independent ordered
+  // pipeline and barrier countdown needs no cross-ordering logic. Bounded
+  // by stage_queue_packs; the packer blocks when full (backpressure, still
+  // overlapped with staging).
+  struct StageItem {
+    // Exactly one of pack / barrier is set.
+    bool is_barrier = false;
+    dmi_pack::SealedPack pack;
+    std::string pack_id;
+    dmi_pack::RecordMetadata first_metadata;
+    uint64_t record_count = 0;
+    FlushReason reason = FlushReason::kManual;
+    std::shared_ptr<FlushBarrier> barrier;
+  };
+  std::vector<std::deque<StageItem>> stage_queues_;
+  std::vector<bool> stage_closed_;
+  // Packs currently held in stage queues (bytes), for the snapshot.
+  uint64_t stage_packs_ = 0;
+  uint64_t stage_bytes_ = 0;
+  uint64_t stage_peak_packs_ = 0;
+  uint64_t stage_peak_bytes_ = 0;
+
+  // Per-worker assembler state (touched by its worker thread only, except
+  // through PersistOpenPack which runs on the owning worker too).
+  struct Assembler {
+    std::unique_ptr<dmi_pack::PackBuilder> builder;
+    dmi_pack::RecordMetadata first_metadata;
+    bool has_first = false;
+    std::string scope_tenant;
+    std::string scope_session;
+    uint64_t scope_rank = 0;
+    int64_t opened_ns = -1;
+    std::string open_pack_id;
+  };
+  std::vector<Assembler> assemblers_;
 };
 
 }  // namespace dmi_sink

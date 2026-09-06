@@ -368,7 +368,7 @@ PackBuilder::PackBuilder(const std::string& pack_id, uint64_t created_at_ns,
 Status PackBuilder::Append(const PackRecord& record) {
   if (sealed_) return Status::kSealedState;
   if (record_count_ >= max_records_) return Status::kRecordLimit;
-  const Status meta = ValidateMetadata(record.metadata);
+  const Status meta = ValidateMetadata(*record.metadata);
   if (meta != Status::kOk) return meta;
 
   // Duplicate capture ids: linear scan over a sorted vector with binary
@@ -376,8 +376,8 @@ Status PackBuilder::Append(const PackRecord& record) {
   // reference's per-record cost is a set lookup — a sorted insert is the same
   // order with zero hashing.
   auto it = std::lower_bound(
-      capture_ids_.begin(), capture_ids_.end(), record.metadata.capture_id);
-  if (it != capture_ids_.end() && *it == record.metadata.capture_id) {
+      capture_ids_.begin(), capture_ids_.end(), record.metadata->capture_id);
+  if (it != capture_ids_.end() && *it == record.metadata->capture_id) {
     return Status::kDuplicateId;
   }
 
@@ -397,7 +397,7 @@ Status PackBuilder::Append(const PackRecord& record) {
       checksum[7 - i] = kHex[(crc >> (4 * i)) & 0xF];
     }
   }
-  EncodeRecordRow(record.metadata, offset, payload, payload, "none", checksum,
+  EncodeRecordRow(*record.metadata, offset, payload, payload, "none", checksum,
                   &row);
   const uint64_t footer_prefix_len = 96;  // computed below precisely instead
   (void)footer_prefix_len;
@@ -435,7 +435,7 @@ Status PackBuilder::Append(const PackRecord& record) {
   buffer_.resize(offset);
   buffer_.insert(buffer_.end(), record.payload, record.payload + payload);
   buffer_.resize(padded, 0);
-  capture_ids_.insert(it, record.metadata.capture_id);
+  capture_ids_.insert(it, record.metadata->capture_id);
   record_json_.push_back(std::move(row));
   record_json_bytes_ += record_json_.back().size();
   ++record_count_;

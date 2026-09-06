@@ -137,29 +137,31 @@ int main() {
     std::string fail_what;
     for (const auto& rt : record_texts) {
       dmi_pack::PackRecord rec;
-      rec.metadata.capture_id = meta_string(rt, "capture_id");
-      rec.metadata.tenant_id = meta_string(rt, "tenant_id");
-      rec.metadata.experiment_id = meta_string(rt, "experiment_id");
-      rec.metadata.run_id = meta_string(rt, "run_id");
-      rec.metadata.session_id = meta_string(rt, "session_id");
-      rec.metadata.request_id = meta_string(rt, "request_id");
-      rec.metadata.sequence_id = meta_string(rt, "sequence_id");
-      rec.metadata.model_id = meta_string(rt, "model_id");
-      rec.metadata.model_revision = meta_string(rt, "model_revision");
+      dmi_pack::RecordMetadata meta;
+      rec.metadata = &meta;
+      meta.capture_id = meta_string(rt, "capture_id");
+      meta.tenant_id = meta_string(rt, "tenant_id");
+      meta.experiment_id = meta_string(rt, "experiment_id");
+      meta.run_id = meta_string(rt, "run_id");
+      meta.session_id = meta_string(rt, "session_id");
+      meta.request_id = meta_string(rt, "request_id");
+      meta.sequence_id = meta_string(rt, "sequence_id");
+      meta.model_id = meta_string(rt, "model_id");
+      meta.model_revision = meta_string(rt, "model_revision");
       if (!meta_null(rt, "adapter_revision")) {
-        rec.metadata.adapter_revision = meta_string(rt, "adapter_revision");
+        meta.adapter_revision = meta_string(rt, "adapter_revision");
       }
-      rec.metadata.capture_policy_version = meta_string(rt, "capture_policy_version");
-      rec.metadata.hook_name = meta_string(rt, "hook_name");
-      rec.metadata.layer_number = meta_int(rt, "layer_number");
-      rec.metadata.producer_rank = static_cast<uint64_t>(meta_int(rt, "producer_rank"));
-      rec.metadata.step_number = static_cast<uint64_t>(meta_int(rt, "step_number"));
-      rec.metadata.token_start = static_cast<uint64_t>(meta_int(rt, "token_start"));
-      rec.metadata.token_end = static_cast<uint64_t>(meta_int(rt, "token_end"));
-      rec.metadata.batch_position = static_cast<uint64_t>(meta_int(rt, "batch_position"));
-      rec.metadata.dtype = meta_string(rt, "dtype");
-      rec.metadata.shape = meta_shape(rt);
-      rec.metadata.captured_at_ns = static_cast<uint64_t>(meta_int(rt, "captured_at_ns"));
+      meta.capture_policy_version = meta_string(rt, "capture_policy_version");
+      meta.hook_name = meta_string(rt, "hook_name");
+      meta.layer_number = meta_int(rt, "layer_number");
+      meta.producer_rank = static_cast<uint64_t>(meta_int(rt, "producer_rank"));
+      meta.step_number = static_cast<uint64_t>(meta_int(rt, "step_number"));
+      meta.token_start = static_cast<uint64_t>(meta_int(rt, "token_start"));
+      meta.token_end = static_cast<uint64_t>(meta_int(rt, "token_end"));
+      meta.batch_position = static_cast<uint64_t>(meta_int(rt, "batch_position"));
+      meta.dtype = meta_string(rt, "dtype");
+      meta.shape = meta_shape(rt);
+      meta.captured_at_ns = static_cast<uint64_t>(meta_int(rt, "captured_at_ns"));
       // payload
       static std::vector<std::vector<uint8_t>> payload_storage;
       payload_storage.push_back(meta_payload(rt));
@@ -168,7 +170,7 @@ int main() {
       const dmi_pack::Status st = builder.Append(rec);
       if (st != dmi_pack::Status::kOk) {
         fail_status = dmi_pack::StatusName(st);
-        fail_what = rec.metadata.capture_id;
+        fail_what = meta.capture_id;
         break;
       }
     }

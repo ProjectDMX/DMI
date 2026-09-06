@@ -63,7 +63,13 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       e2e with Python PackReader read-back, preflight idempotence with
       PUT-count proof, parallel batch by position, layered retry,
       corrupt refusal, byte gate). Native suite 48/48.
-- [ ] A5a Scope-hash worker pool via pipelined_engine; N-scaling curve
+- [x] A5a Scope-hash worker pool + N-scaling curve + throughput gate.
+      Evidence: `tests/test_native_pack_sink.py` 11/11 (incl. N=4 scope
+      isolation + cross-worker flush); `bench_sink` NVMe 0.42→0.52
+      monotonic to N=8 (+121% over Python 0.235); tmpfs to 0.65.
+      Variance ±20% (shared host) — gates clear with margin; re-measure
+      quiet before published claims. Gate:
+      `make -C native build/bench_sink` (single|interleaved, spooldir=).
 - [ ] A5b Sink-selection config (opt-in) + rollback demo
 - **Checkpoint A** (human review): byte-equality ✓, CPU suite green ✓, N=1 ≥ derived
   target ✓, N=4 store-bound ✓, rollback ✓

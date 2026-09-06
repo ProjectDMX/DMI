@@ -296,3 +296,47 @@ def test_object_key_parity_with_python():
             assert response["object_key"] == object_key_for(ready), tenant
     finally:
         session.close()
+
+
+def test_scopes_stay_separate_at_n4(sink, tmp_path):
+    # Four sessions share one worker pool: every staged pack must still
+    # hold a single scope, and every record must be accounted exactly once.
+    _open(sink, tmp_path / "spool", num_workers=4)
+    total = 0
+    for session in range(4):
+        for i in range(32):
+            assert _submit(sink, _record(session * 32 + i,
+                                         session_id=f"s{session}")) == "accepted"
+            total += 1
+    assert sink.call(op="flush", timeout=30)["ok"]
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == total
+    assert snapshot["failures"] == 0
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=1 << 40)
+    recovered = spool.recover()
+    seen = []
+    for entry in recovered:
+        with entry.open() as handle:
+            descriptors = PackReader.from_bytes(handle.read()).descriptors(
+                store_id="spool", object_key=entry.object_key
+            )
+        scopes = {(d.metadata.session_id, d.metadata.producer_rank)
+                  for d in descriptors}
+        assert len(scopes) == 1, scopes
+        seen.extend(d.metadata.capture_id for d in descriptors)
+    assert sorted(seen) == sorted(f"capture-{i:06d}" for i in range(total))
+
+
+def test_flush_covers_all_workers(sink, tmp_path):
+    # A flush with packs open on several workers must persist all of them:
+    # persisted == admitted afterwards, with nothing left unstaged.
+    _open(sink, tmp_path / "spool", num_workers=4)
+    for i in range(64):
+        assert _submit(sink, _record(i, session_id=f"s{i % 8}")) == "accepted"
+    assert sink.call(op="flush", timeout=30)["ok"]
+    snapshot = sink.call(op="snapshot")["snapshot"]
+    assert snapshot["persisted_records"] == 64
+    assert snapshot["stage_packs"] == 0
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == 64
+    assert snapshot["failures"] == 0

@@ -83,9 +83,10 @@ struct RecordMetadata {
   uint64_t captured_at_ns = 0;
 };
 
-// One record to append: metadata + payload bytes.
+// One record to append: metadata by const reference (Append only reads it)
+// plus a payload pointer the caller keeps alive for the call.
 struct PackRecord {
-  RecordMetadata metadata;
+  const RecordMetadata* metadata = nullptr;
   const uint8_t* payload = nullptr;
   size_t payload_bytes = 0;
 };

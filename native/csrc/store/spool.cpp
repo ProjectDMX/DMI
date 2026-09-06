@@ -264,23 +264,53 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
   const std::string upload_key =
       (parent.empty() ? "" : parent + "/") + pack_id + ".dmi-pack";
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::error_code ec;
-  if (fs::exists(ready, ec)) {
-    // Idempotent retry: validate the existing file before blessing it.
-    std::string id, sum;
-    uint64_t created = 0, records = 0;
-    const std::string name = fs::path(ready).filename().string();
-    if (!ParseReadyName(name, &id, &created, &records, &sum) ||
-        id != pack_id || created != created_at_ns ||
-        records != record_count || sum != checksum ||
-        fs::file_size(ready, ec) != n ||
-        Sha256HexFile(ready, error) != checksum) {
-      if (error && error->empty()) {
-        *error = "spool contains different content: " + object_key;
+  // Phase 1 (locked): decide retry vs fresh, reserve capacity. File I/O
+  // stays outside the lock so concurrent workers never serialize on disk.
+  bool retry = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::error_code ec;
+    if (fs::exists(ready, ec)) {
+      retry = true;
+    } else {
+      // A different pack intent under the same pack_id is a conflict.
+      for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        const std::string name = entry.path().filename().string();
+        if (name.compare(0, pack_id.size(), pack_id) == 0 &&
+            name.size() > pack_id.size() + 1 && name[pack_id.size()] == '.' &&
+            HasSuffix(name, kReadySuffix)) {
+          if (error) {
+            *error =
+                "spool already contains a different pack intent: " + pack_id;
+          }
+          return SpoolStatus::kConflict;
+        }
       }
-      return SpoolStatus::kConflict;
+      if (bytes_ + n > max_bytes_) {
+        if (error) {
+          *error = "spool byte limit exceeded: " +
+                   std::to_string(bytes_ + n) + " > " +
+                   std::to_string(max_bytes_);
+        }
+        return SpoolStatus::kFull;
+      }
+      // Reserve now: the link below is the atomic commit, and two workers
+      // racing fresh stages must not both pass the capacity check.
+      bytes_ += n;
+      ++entries_;
+      peak_bytes_ = std::max(peak_bytes_, bytes_);
+      ++generation_;
     }
+  }
+
+  auto unreserve = [&] {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (bytes_ >= n) bytes_ -= n;
+    if (entries_ > 0) --entries_;
+    ++generation_;
+  };
+  auto fill_out = [&] {
     out->pack_id = pack_id;
     out->created_at_ns = created_at_ns;
     out->record_count = record_count;
@@ -288,36 +318,46 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
     out->object_key = upload_key;
     out->path = ready;
     out->object_bytes = n;
-    if (!FsyncChain(root_, dir, error)) return SpoolStatus::kIo;
-    return SpoolStatus::kOk;
-  }
-  // A different pack intent under the same pack_id is a conflict.
-  for (const auto& entry : fs::directory_iterator(dir, ec)) {
-    if (ec) break;
-    const std::string name = entry.path().filename().string();
-    if (name.compare(0, pack_id.size(), pack_id) == 0 &&
-        name.size() > pack_id.size() + 1 && name[pack_id.size()] == '.' &&
-        HasSuffix(name, kReadySuffix)) {
-      if (error) {
-        *error = "spool already contains a different pack intent: " + pack_id;
-      }
+  };
+  // Validate a ready file that should hold this pack (retry path, or the
+  // EEXIST loser). Name, size, and full sha256 — the hash is the slow part
+  // and runs without the lock.
+  auto validate_ready = [&]() -> bool {
+    std::string id, sum;
+    uint64_t created = 0, records = 0;
+    const std::string name = fs::path(ready).filename().string();
+    std::error_code ec;
+    if (!ParseReadyName(name, &id, &created, &records, &sum) ||
+        id != pack_id || created != created_at_ns ||
+        records != record_count || sum != checksum ||
+        fs::file_size(ready, ec) != n ||
+        Sha256HexFile(ready, nullptr) != checksum) {
+      return false;
+    }
+    return true;
+  };
+
+  if (retry) {
+    if (!validate_ready()) {
+      if (error) *error = "spool contains different content: " + object_key;
       return SpoolStatus::kConflict;
     }
+    // A retry adds no accounting: the file was counted by the stage (or
+    // process start) that created it. Every successful retry still closes
+    // the durability window itself with a fresh fsync chain.
+    if (!FsyncChain(root_, dir, error)) return SpoolStatus::kIo;
+    fill_out();
+    return SpoolStatus::kOk;
   }
-  if (bytes_ + n > max_bytes_) {
-    if (error) {
-      *error = "spool byte limit exceeded: " +
-               std::to_string(bytes_ + n) + " > " +
-               std::to_string(max_bytes_);
-    }
-    return SpoolStatus::kFull;
-  }
+
+  std::error_code ec;
   fs::create_directories(dir, ec);
   if (ec) {
+    unreserve();
     if (error) *error = "cannot create spool directory: " + ec.message();
     return SpoolStatus::kIo;
   }
-  // Temp file in the same directory (rename/link atomicity needs it).
+  // Temp file in the same directory (link atomicity needs it).
   std::random_device rd;
   std::string temp = dir + "/." + pack_id + ".";
   for (int i = 0; i < 8; ++i) {
@@ -325,62 +365,45 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
     temp.push_back(kDigits[rd() & 0xF]);
   }
   temp += ".open";
-  bool temp_exists = true;
-  if (!WriteFileSynced(temp, data, n, error)) return SpoolStatus::kIo;
-  if (::link(temp.c_str(), ready.c_str()) != 0) {
-    if (errno == EEXIST) {
-      // Lost the race: validate the winner exactly like the retry path.
-      ::unlink(temp.c_str());
-      temp_exists = false;
-      std::string id, sum;
-      uint64_t created = 0, records = 0;
-      const std::string name = fs::path(ready).filename().string();
-      if (!ParseReadyName(name, &id, &created, &records, &sum) ||
-          id != pack_id || created != created_at_ns ||
-          records != record_count || sum != checksum ||
-          fs::file_size(ready, ec) != n ||
-          Sha256HexFile(ready, error) != checksum) {
-        if (error && error->empty()) {
-          *error = "spool contains different content: " + object_key;
-        }
-        return SpoolStatus::kConflict;
-      }
-      bytes_ += n;
-      ++entries_;
-      peak_bytes_ = std::max(peak_bytes_, bytes_);
-      ++generation_;
-      out->pack_id = pack_id;
-      out->created_at_ns = created_at_ns;
-      out->record_count = record_count;
-      out->checksum = checksum;
-      out->object_key = upload_key;
-      out->path = ready;
-      out->object_bytes = n;
-      if (!FsyncChain(root_, dir, error)) return SpoolStatus::kIo;
-      return SpoolStatus::kOk;
-    }
-    if (error) *error = "cannot link ready file: " + std::string(strerror(errno));
+  if (!WriteFileSynced(temp, data, n, error)) {
+    unreserve();
     ::unlink(temp.c_str());
     return SpoolStatus::kIo;
   }
-  // Account the moment the link exists, before anything else can fail.
-  bytes_ += n;
-  ++entries_;
-  peak_bytes_ = std::max(peak_bytes_, bytes_);
-  ++generation_;
+  if (::link(temp.c_str(), ready.c_str()) != 0) {
+    if (errno == EEXIST) {
+      // Lost the race: the winner's file is already counted (by its stage
+      // or by process start), so release this reservation, then validate
+      // the winner exactly like the retry path.
+      ::unlink(temp.c_str());
+      unreserve();
+      if (!validate_ready()) {
+        if (error) *error = "spool contains different content: " + object_key;
+        return SpoolStatus::kConflict;
+      }
+      // The winner may still be between link() and its own fsync: do not
+      // acknowledge its dirent before independently making the chain
+      // durable (mirrors the Python loser's fsync).
+      if (!FsyncChain(root_, dir, error)) return SpoolStatus::kIo;
+      fill_out();
+      return SpoolStatus::kOk;
+    }
+    unreserve();
+    if (error) {
+      *error =
+          "cannot link ready file: " + std::string(strerror(errno));
+    }
+    ::unlink(temp.c_str());
+    return SpoolStatus::kIo;
+  }
+  // Linked: the reservation stands, the temp name goes, and the directory
+  // chain is synced (outside the lock).
   ::unlink(temp.c_str());
-  temp_exists = false;
   if (!FsyncChain(root_, dir, error)) return SpoolStatus::kIo;
-  (void)temp_exists;
-  out->pack_id = pack_id;
-  out->created_at_ns = created_at_ns;
-  out->record_count = record_count;
-  out->checksum = checksum;
-  out->object_key = upload_key;
-  out->path = ready;
-  out->object_bytes = n;
+  fill_out();
   return SpoolStatus::kOk;
 }
+
 
 SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error) {
   out->clear();
@@ -446,29 +469,35 @@ SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error) {
 }
 
 SpoolStatus Spool::Remove(const StagedPack& staged, std::string* error) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::error_code ec;
-  if (!fs::exists(staged.path, ec)) {
+  std::string parent;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::error_code ec;
+    if (!fs::exists(staged.path, ec)) {
+      if (bytes_ >= staged.object_bytes) bytes_ -= staged.object_bytes;
+      if (entries_ > 0) --entries_;
+      ++generation_;
+      return SpoolStatus::kOk;
+    }
+    const std::string name = fs::path(staged.path).filename().string();
+    std::string id, sum;
+    uint64_t created = 0, records = 0;
+    if (!ParseReadyName(name, &id, &created, &records, &sum) ||
+        id != staged.pack_id || created != staged.created_at_ns ||
+        records != staged.record_count || sum != staged.checksum ||
+        fs::file_size(staged.path, ec) != staged.object_bytes) {
+      if (error) *error = "staged pack identity changed before removal";
+      return SpoolStatus::kIntegrity;
+    }
+    ::unlink(staged.path.c_str());
     if (bytes_ >= staged.object_bytes) bytes_ -= staged.object_bytes;
     if (entries_ > 0) --entries_;
     ++generation_;
-    return SpoolStatus::kOk;
+    parent = fs::path(staged.path).parent_path().string();
   }
-  const std::string name = fs::path(staged.path).filename().string();
-  std::string id, sum;
-  uint64_t created = 0, records = 0;
-  if (!ParseReadyName(name, &id, &created, &records, &sum) ||
-      id != staged.pack_id || created != staged.created_at_ns ||
-      records != staged.record_count || sum != staged.checksum ||
-      fs::file_size(staged.path, ec) != staged.object_bytes) {
-    if (error) *error = "staged pack identity changed before removal";
-    return SpoolStatus::kIntegrity;
-  }
-  ::unlink(staged.path.c_str());
-  if (bytes_ >= staged.object_bytes) bytes_ -= staged.object_bytes;
-  if (entries_ > 0) --entries_;
-  ++generation_;
-  FsyncDir(fs::path(staged.path).parent_path().string(), nullptr);
+  // Directory fsync outside the lock: durability without serializing
+  // concurrent stagers on it.
+  FsyncDir(parent, nullptr);
   return SpoolStatus::kOk;
 }
 

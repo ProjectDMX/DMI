@@ -80,7 +80,8 @@ void EmitSnapshot(const dmi_sink::SinkSnapshot& s, std::string* out) {
       &s.packed_bytes, &s.flush_size, &s.flush_records, &s.flush_linger,
       &s.flush_session, &s.flush_manual, &s.flush_shutdown, &s.failures,
       &s.queue_records, &s.queue_bytes, &s.queue_peak_records,
-      &s.queue_peak_bytes,
+      &s.queue_peak_bytes, &s.stage_packs, &s.stage_bytes,
+      &s.stage_peak_packs, &s.stage_peak_bytes,
   };
   static const char* names[] = {
       "admitted_records", "admitted_bytes", "dropped_records",
@@ -89,7 +90,8 @@ void EmitSnapshot(const dmi_sink::SinkSnapshot& s, std::string* out) {
       "packed_bytes", "flush_size", "flush_records", "flush_linger",
       "flush_session", "flush_manual", "flush_shutdown", "failures",
       "queue_records", "queue_bytes", "queue_peak_records",
-      "queue_peak_bytes",
+      "queue_peak_bytes", "stage_packs", "stage_bytes", "stage_peak_packs",
+      "stage_peak_bytes",
   };
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
     out->append(",\"");
@@ -126,6 +128,8 @@ int main() {
           jc::FindString(line, "overload") == "block"
               ? dmi_sink::Overload::kBlock
               : dmi_sink::Overload::kDropNewest;
+      const int64_t workers = jc::FindInt(line, "num_workers");
+      config.num_workers = static_cast<int>(workers > 0 ? workers : 1);
       // admission_timeout arrives as a JSON number (possibly -1 or 0.5);
       // parse the raw text to keep the fraction.
       {

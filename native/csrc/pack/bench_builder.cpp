@@ -31,9 +31,12 @@ int main() {
       for (auto& b : p) b = static_cast<uint8_t>(rng() >> 33);
     }
   }
+  // One metadata per record, built once: capture ids must be unique
+  // within a trial (per-pack duplicate detection), and building them in the
+  // timed loop would benchmark harness string formatting, not the writer.
   std::vector<dmi_pack::RecordMetadata> metas;
-  metas.reserve(kPool);
-  for (size_t i = 0; i < kPool; ++i) {
+  metas.reserve(kRecords);
+  for (size_t i = 0; i < kRecords; ++i) {
     dmi_pack::RecordMetadata m;
     m.capture_id = "capture-" + std::to_string(i);
     m.tenant_id = "benchmark";
@@ -71,9 +74,7 @@ int main() {
     int packs = 0;
     for (size_t i = 0; i < kRecords; ++i) {
       dmi_pack::PackRecord record;
-      record.metadata = metas[i % kPool];
-      record.metadata.capture_id =
-          "capture-" + std::to_string(trial * kRecords + i);  // unique per pack
+      record.metadata = &metas[i];
       record.payload = payloads[i % kPool].data();
       record.payload_bytes = kPayload;
       auto a0 = Clock::now();
@@ -93,8 +94,8 @@ int main() {
         builder = dmi_pack::PackBuilder(
             "018f0000-0000-7000-8000-000000000f01",
             1'700'000'000'000'000'000, kMaxPack);
-        record.metadata.capture_id =
-            "capture-" + std::to_string(trial * kRecords + i);
+        // record.metadata already points at the pool entry (unique ids were
+        // pre-generated); retry the same record as-is.
         if (builder.Append(record) != dmi_pack::Status::kOk) {
           std::fprintf(stderr, "append after rollover failed\n");
           return 1;

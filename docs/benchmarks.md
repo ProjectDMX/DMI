@@ -397,3 +397,33 @@ sink→spool→fake-S3 end to end.
 | upload_pending for the corrupt-bytes case | recover() quarantines first | fixed | Corrupt staged bytes must reach UploadOne directly (upload_one op); recover-time quarantine is separately pinned in the spool suite |
 | Oversized packs counted only in failures[] | failed_packs==0 with a failure present | fixed | Byte-gate refusal increments attempted+failed up front |
 | Fake verifies/signs the encoded path | 403 on every key with reserved chars | fixed | S3 decodes %XX once before routing/verifying; the fake now unquotes the path (unquote, never unquote_plus) before handing it to botocore |
+
+### A5a worker pool + two-stage pipeline (2026-09-05)
+
+`PackSink` is now N packer/stager pairs: records route by scope hash
+(FNV-1a + fmix64 finalizer), each pair seals into a bounded stage queue,
+stagers drain to the spool, and flush barriers travel packer→stager so
+durability still means staged-to-spool. 11 sink tests (incl. N=4 scope
+isolation and cross-worker flush coverage).
+
+| Workers (NVMe spool, 8 scopes) | Throughput | tmpfs |
+|---|---:|---:|
+| 1 | 0.39–0.44 | 0.57 |
+| 2 | 0.46 | — |
+| 4 | 0.46–0.48 | 0.52 |
+| 8 | 0.49–0.52 | 0.57–0.65 |
+
+Python baseline (spool): 0.235. Best native: +121% at N=8 NVMe.
+Single-scope: 0.34–0.44 (+45–87%).
+
+Host variance note: this is a shared box (48 users, load 18–27); expect
+±20% run-to-run. All gates clear with margin (worst native reading still
++45% over Python), but re-measure on a quiet host before published claims.
+
+| Idea | Baseline → Result | Verdict | Why |
+|---|---|---|---|
+| Serial append→seal→stage per worker | 0.29 → 0.44 single-scope | kept | Packer/stager pairs overlap disk with packing (+51%); barrier travel keeps flush=durable |
+| broadcast notify_all everywhere | flat-to-negative scaling | fixed | Per-worker + per-stage CVs; producer signals only the routed worker. ~180k thundering-herd wakeups per trial at N=8 were the inhibitor |
+| Raw FNV `% workers` routing | all 8 scopes on worker 0 (flat "scaling") | fixed | fmix64 finalizer; low bits of FNV are weak for similar inputs. Verified distribution in the ledger review, then in code |
+| Spool mutex across file writes | serialized all stagers on fsync | fixed | Lock covers accounting decisions only; byte reservation keeps max_bytes exact. Also fixed a double-count on the EEXIST race path |
+| CRC+memcpy fusion, metadata moves | writer 0.63 → est. ~0.9 | deferred | Would move 3 instances → 2 for the 1.1 GiB/s host, but no gate demands it yet — Checkpoint A decision |
