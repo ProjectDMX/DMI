@@ -106,7 +106,10 @@ class MonitoringEngine:
             raise ValueError("Provide either host_engine or db_config, not both")
 
         self._storage_backend = getattr(config, "storage_backend", "auto")
-        self._capture_sink_config = getattr(config, "capture_sink_config", None)
+        # A None config is the ctor's documented no-configuration mode;
+        # say so here rather than behind a getattr default.
+        self._capture_sink_config = (
+            config.capture_sink_config if config is not None else None)
         if self._capture_sink_config is not None:
             from .storage.capture.native_sink import NativeSinkConfig
 

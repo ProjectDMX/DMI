@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, get_args
+from typing import Literal, Optional, get_args
 
 
 StorageBackend = Literal["auto", "native", "capture", "none"]
@@ -93,11 +93,13 @@ class MonitoringConfig:
     # configured writes packs and leaves a ClickHouse insert pipeline running
     # that nothing feeds, and "auto" cannot tell that apart from intent.
     # The capture backend's default writer bounds, when ``storage_backend``
-    # is "capture" and the caller passes no ``record_sink``. The native pack
+    # is "capture" and the caller passes no ``record_sink``. Typed, not
+    # Any: the engine validates it at the boundary, and the type is the
+    # contract's documentation. The native pack
     # sink is the default writer (D4's flip, post-Checkpoint-B); passing a
     # ``record_sink`` explicitly — e.g. the reference sink — overrides it,
     # which is the documented rollback.
-    capture_sink_config: Any = None
+    capture_sink_config: Optional["NativeSinkConfig"] = None
 
     storage_backend: StorageBackend = "auto"
 
