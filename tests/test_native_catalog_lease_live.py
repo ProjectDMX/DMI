@@ -425,15 +425,27 @@ def test_the_parameterized_statements_are_byte_identical_too():
                 "the native claim reached the server as different SQL text "
                 "than the Python one")
 
-        # And the inline renderer, whose statement is not textually ported
-        # (native brackets the member list), so the LITERAL is the subject.
+        # And the inline renderer. This used to assert two DISTINCT texts
+        # both carrying the driver's literal, because native rendered the
+        # member list as `(a,b)` where the driver renders `(a, b)` -- the
+        # texts genuinely differed and only the literal could be compared.
+        # Both halves are fixed now (the ten-character escaper, and the
+        # comma-and-space spelling), so the two implementations send the
+        # SAME bytes and a DISTINCT query collapses to one row. Count the
+        # rows undistinct -- so both implementations must still have sent
+        # one -- and then require them equal, which is strictly stronger
+        # than the pair of literal checks it replaces.
         literal = escape_param(value, None)
         client.execute("SYSTEM FLUSH LOGS")
         inline = [row[0] for row in client.execute(
-            "SELECT DISTINCT query FROM system.query_log WHERE query LIKE "
+            "SELECT query FROM system.query_log WHERE query LIKE "
             f"'%{prefix}_pack_inventory%' AND query LIKE "
-            f"'%{pack_id}%'")]
+            f"'%{pack_id}%' AND type = 'QueryFinish' AND query NOT LIKE "
+            "'%system.query_log%'")]
         assert len(inline) == 2, inline
+        assert inline[0] == inline[1], (
+            "the two implementations sent different inline text:\n"
+            f"  {inline[0]}\n  {inline[1]}")
         for text in inline:
             assert literal in text, (
                 f"the inline renderer wrote {text!r}, which does not carry "
