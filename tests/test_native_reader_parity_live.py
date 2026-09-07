@@ -620,6 +620,64 @@ def test_search_refusal_parity_on_filter_bounds():
             driver.close()
 
 
+def test_search_refusal_parity_on_filter_text():
+    """CaptureQuery validates its text filters, and search() did not.
+
+    __post_init__ runs _validate_text over tenant_id/experiment_id/run_id/
+    session_id/model_id and over every hook_name: non-empty and at most 512
+    bytes. Native ported the cardinality and window bounds but not these, so
+    an empty tenant_id rendered ``AND `tenant_id` = ''`` and came back as a
+    successful empty page -- a caller error answered as data -- and a 10 KB
+    run_id was shipped to the server rather than refused.
+    """
+    from dmi.storage.capture.model import CaptureQuery
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            _publish_native(driver, prefix, _descriptor_dicts(4), 7)
+
+            oversized = "x" * 513
+            cases = (
+                {"tenant_id": ""},
+                {"experiment_id": ""},
+                {"run_id": ""},
+                {"session_id": ""},
+                {"model_id": ""},
+                {"hook_names": [""]},
+                {"hook_names": ["resid_pre", ""]},
+                {"run_id": oversized},
+                {"tenant_id": "x" * 10_000},
+                {"hook_names": [oversized]},
+            )
+            for fields in cases:
+                refused = driver.call(op="search", limit=100, **fields)
+                assert not refused["ok"], (fields.keys(), refused)
+                assert refused["error"] == "ValueError", (
+                    fields.keys(), refused)
+
+                # The oracle refuses the same filters.
+                python_fields = {
+                    name: tuple(value) if isinstance(value, list) else value
+                    for name, value in fields.items()
+                }
+                with pytest.raises(ValueError):
+                    CaptureQuery(limit=100, **python_fields)
+
+            # The bound bites only past the edge: 512 bytes is ACCEPTED, and
+            # both readers answer the same (empty) page for it.
+            edge = {"run_id": "x" * 512, "hook_names": ["y" * 512]}
+            native = driver.call(op="search", limit=100, **edge)
+            assert native["ok"], native
+            page = _python_page_items(
+                _python_reader(client, config), limit=100,
+                run_id=edge["run_id"], hook_names=tuple(edge["hook_names"]))
+            assert _normalize(native["items"]) == _normalize(page.items)
+        finally:
+            driver.close()
+
+
 def test_a_cursor_captured_at_ns_outside_uint64_is_refused():
     """The key's timestamp is a UInt64, and nothing checked it.
 

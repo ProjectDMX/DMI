@@ -169,9 +169,22 @@ std::string base64url_decode(const std::string& encoded) {
   return out;
 }
 
-// cursor._CURSOR_VERSION / model._CURSOR_LIMIT.
+// cursor._CURSOR_VERSION / model._CURSOR_LIMIT / model._TEXT_LIMIT.
 constexpr uint64_t kCursorVersion = 1;
 constexpr size_t kCursorLimitBytes = 2048;
+constexpr size_t kTextLimitBytes = 512;
+
+// model._validate_text, for a value the caller supplied non-null. The
+// oracle's "UTF-8" is a property Python's str already carries, so the two
+// refusals it can actually reach are the empty string and the byte bound --
+// and the bound is on ENCODED bytes, which a std::string already holds.
+void validate_text(const std::string& value, const char* name) {
+  if (value.empty() || value.size() > kTextLimitBytes) {
+    throw CatalogError(CatalogError::Kind::kValue,
+                       std::string(name) + " must be non-empty UTF-8 within " +
+                           std::to_string(kTextLimitBytes) + " bytes");
+  }
+}
 
 // How many members a JSON object declares at the top level. Used to refuse
 // a cursor carrying fields this version does not define, the way
@@ -470,6 +483,20 @@ std::string NativeCaptureCatalog::current_watermark() const {
 }
 
 SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
+  // The identity filters FIRST, as __post_init__ has them. An empty one is
+  // not a wildcard: it rendered `AND `tenant_id` = ''`, matched nothing,
+  // and came back as a successful empty page where the oracle refuses the
+  // query -- and an unbounded one was shipped to the server rather than
+  // refused here.
+  for (const auto& [value, name] :
+       std::vector<std::pair<const std::optional<std::string>*, const char*>>{
+           {&filters.tenant_id, "tenant_id"},
+           {&filters.experiment_id, "experiment_id"},
+           {&filters.run_id, "run_id"},
+           {&filters.session_id, "session_id"},
+           {&filters.model_id, "model_id"}}) {
+    if (value->has_value()) validate_text(**value, name);
+  }
   if (filters.limit < 1 || filters.limit > 10'000) {
     throw CatalogError(CatalogError::Kind::kValue,
                        "limit must be between 1 and 10000");
@@ -481,6 +508,11 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
   if (filters.hook_names.size() > 128 || filters.layer_numbers.size() > 1024) {
     throw CatalogError(CatalogError::Kind::kValue,
                        "query filters exceed their bounded cardinality");
+  }
+  // Each hook name is text too, and after the cardinality bound -- the
+  // oracle's order, so a query breaking both reports the same one.
+  for (const std::string& hook_name : filters.hook_names) {
+    validate_text(hook_name, "hook_name");
   }
   for (const int64_t layer : filters.layer_numbers) {
     // -1 is the "no layer" sentinel; below it names nothing.
