@@ -8,15 +8,23 @@ namespace dmi_sink {
 namespace jc = dmi_common;
 
 int DtypeWidth(const std::string& dtype_name) {
+  // The same set as model.py's _DTYPE_BYTES: the sink must accept every
+  // dtype the validation layer admits, or a capture fails at admission
+  // that the rest of the pipeline (catalog columns, hydration decoder)
+  // already handles.
   if (dtype_name == "bool" || dtype_name == "uint8" ||
-      dtype_name == "int8") {
+      dtype_name == "int8" || dtype_name == "float8_e4m3fn" ||
+      dtype_name == "float8_e5m2") {
     return 1;
   }
-  if (dtype_name == "int16" || dtype_name == "float16" ||
-      dtype_name == "bfloat16") {
+  if (dtype_name == "uint16" || dtype_name == "int16" ||
+      dtype_name == "float16" || dtype_name == "bfloat16") {
     return 2;
   }
-  if (dtype_name == "int32" || dtype_name == "float32") return 4;
+  if (dtype_name == "uint32" || dtype_name == "int32" ||
+      dtype_name == "float32") {
+    return 4;
+  }
   if (dtype_name == "int64" || dtype_name == "float64") return 8;
   return 0;
 }

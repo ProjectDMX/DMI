@@ -68,8 +68,6 @@ uint32_t Crc32(const uint8_t* data, size_t n, uint32_t crc) {
 
 // --- canonical JSON ----------------------------------------------------------
 
-namespace {
-
 // Python json.dumps with ensure_ascii=True escapes exactly: ", \, and the
 // control range as \u00XX except the short forms \b \f \n \r \t; everything
 // >= 0x7F as \uXXXX (surrogate pair above 0xFFFF).
@@ -135,8 +133,6 @@ void EncodeJsonString(const std::string& value, std::string* out) {
     }
   }
   out->push_back('"');
-}
-
 }  // namespace
 
 void EncodeRecordRow(const RecordMetadata& m, uint64_t offset,
@@ -224,9 +220,12 @@ void EncodeRecordRow(const RecordMetadata& m, uint64_t offset,
 
 namespace {
 
-const std::array<const char*, 10> kDtypes = {
-    "bool", "uint8", "int8", "int16", "float16",
-    "bfloat16", "int32", "float32", "int64", "float64"};
+// The same set as model.py's _DTYPE_BYTES — the pack builder must accept
+// every dtype the validation layer admits.
+const std::array<const char*, 14> kDtypes = {
+    "bool", "uint8", "int8", "uint16", "int16", "float16",
+    "bfloat16", "float8_e4m3fn", "float8_e5m2", "uint32",
+    "int32", "float32", "int64", "float64"};
 
 bool DtypeSupported(const std::string& dtype) {
   for (const char* name : kDtypes) {

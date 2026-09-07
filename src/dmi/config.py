@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, get_args
+from typing import Literal, Optional, get_args
 
 
 StorageBackend = Literal["auto", "native", "capture", "none"]
@@ -78,11 +78,12 @@ class MonitoringConfig:
     #                record with the tensor bytes inline, into its own table.
     #                Requires ``host_engine`` or ``db_config`` on the engine,
     #                and refuses an explicit ``record_sink``.
-    #   "capture" -- the Python capture path: immutable packs in object
-    #                storage with the ClickHouse catalog as an index over
-    #                them. Requires an explicit ``record_sink``, and refuses a
-    #                host engine, which would otherwise sit started, connected
-    #                and unused.
+    #   "capture" -- the capture path: immutable packs in object storage
+    #                with the catalog as an index over them. Defaults to the
+    #                native pack writer (built from ``capture_sink_config``);
+    #                an explicit ``record_sink`` overrides it — pass the
+    #                reference sink to roll back. Refuses a host engine,
+    #                which would otherwise sit started, connected and unused.
     #   "none"    -- capture and transport with no persistence at all.
     #   "auto"    -- infer from what was passed, which is what every caller
     #                did before this field existed and remains the default.
@@ -91,6 +92,15 @@ class MonitoringConfig:
     # a silent choice: passing a ``record_sink`` while a host engine is
     # configured writes packs and leaves a ClickHouse insert pipeline running
     # that nothing feeds, and "auto" cannot tell that apart from intent.
+    # The capture backend's default writer bounds, when ``storage_backend``
+    # is "capture" and the caller passes no ``record_sink``. Typed, not
+    # Any: the engine validates it at the boundary, and the type is the
+    # contract's documentation. The native pack
+    # sink is the default writer (D4's flip, post-Checkpoint-B); passing a
+    # ``record_sink`` explicitly — e.g. the reference sink — overrides it,
+    # which is the documented rollback.
+    capture_sink_config: Optional["NativeSinkConfig"] = None
+
     storage_backend: StorageBackend = "auto"
 
     def __post_init__(self) -> None:

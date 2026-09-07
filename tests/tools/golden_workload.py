@@ -59,9 +59,13 @@ _DTYPES = (
     ("bool", 1),
     ("uint8", 1),
     ("int8", 1),
+    ("uint16", 2),
     ("int16", 2),
     ("float16", 2),
     ("bfloat16", 2),
+    ("float8_e4m3fn", 1),
+    ("float8_e5m2", 1),
+    ("uint32", 4),
     ("int32", 4),
     ("float32", 4),
     ("int64", 8),
@@ -80,6 +84,14 @@ def _payload(dtype: str, width: int, index: int) -> bytes:
         # A bool payload must contain only 0 or 1, or numpy comparisons and the
         # format's own round trip stop agreeing.
         return bytes(1 if value & 1 else 0 for value in raw)
+    if dtype == "float8_e4m3fn":
+        # A deterministic mix: zeros, ±1, subnormals, NaN (no Inf — e4m3fn
+        # has none), so the summary's NaN counting is exercised by the gate.
+        patterns = [0x00, 0x80, 0x38, 0xB8, 0x7F, 0x01, 0x7E, 0x40]
+        return bytes(patterns[element % len(patterns)] for element in range(_ELEMENTS))
+    if dtype == "float8_e5m2":
+        patterns = [0x3C, 0xBC, 0x7C, 0x7E, 0x01, 0xC0, 0x00, 0x40]
+        return bytes(patterns[element % len(patterns)] for element in range(_ELEMENTS))
     return bytes(raw)
 
 

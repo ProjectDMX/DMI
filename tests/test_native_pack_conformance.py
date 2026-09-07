@@ -369,7 +369,15 @@ def test_native_pack_matches_recorded_golden_manifest():
     ) as handle:
         manifest = _json.load(handle)
     expected = manifest["pack"]["sha256"]
-    assert expected == "53a0873af5b5932ceb3e44223492aec11eadfb1d9298cb4cef81d8ca5337fd4e"
+    # The recorded manifest IS the reference build's own output (regenerate
+    # with golden_workload.py generate after a corpus change), so the
+    # digest to beat is whatever the manifest records — not a literal,
+    # which would fight every legitimate corpus extension.
+    from tests.tools.golden_workload import build_manifest
+
+    assert expected == build_manifest()["pack"]["sha256"], (
+        "the recorded manifest drifted from the reference build; "
+        "regenerate it with golden_workload.py generate")
 
     records = []
     for record in _corpus():

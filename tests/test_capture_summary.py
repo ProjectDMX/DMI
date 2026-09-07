@@ -196,10 +196,36 @@ def test_gate_bfloat16_round_trips_every_bit_pattern(tmp_path: Path):
 
 def test_every_supported_dtype_is_decodable():
     # A dtype accepted by CaptureMetadata but unknown to the decoder would only
-    # fail at analysis time, long after the capture was written.
+    # fail at analysis time, long after the capture was written. Decode one
+    # element of EVERY dtype rather than comparing sets: bfloat16 and the two
+    # float8 dtypes travel by bit math (no numpy dtype), the rest via
+    # _NUMPY_DTYPES.
     from dmi.storage.capture.summary import _NUMPY_DTYPES
 
-    assert set(_NUMPY_DTYPES) | {"bfloat16"} == set(_DTYPE_BYTES)
+    assert (
+        set(_NUMPY_DTYPES) | {"bfloat16", "float8_e4m3fn", "float8_e5m2"}
+        == set(_DTYPE_BYTES)
+    )
+    from dmi.storage.capture import PayloadLocator
+    from dmi.storage.capture.model import CaptureDescriptor
+
+    for dtype in _DTYPE_BYTES:
+        # Decode one element of every dtype through decode_tensor itself:
+        # a dtype CaptureMetadata accepts must never be refused at
+        # analysis time.
+        meta = _metadata(f"decode-{dtype}", dtype=dtype, shape=(1,))
+        width = _DTYPE_BYTES[dtype]
+        descriptor = CaptureDescriptor(
+            metadata=meta,
+            locator=PayloadLocator(
+                pack_id=UUID(int=0), store_id="s", object_key="k",
+                object_bytes=64, pack_checksum="0" * 64,
+                pack_record_count=1, offset=0, stored_length=width,
+                decoded_length=width, codec="none", checksum="00000000",
+            ),
+        )
+        decoded = decode_tensor(descriptor, bytes(width))
+        assert decoded.size == 1, dtype
 
 
 # --- gate B: no unrelated payload bytes --------------------------------------

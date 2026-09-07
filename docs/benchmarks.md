@@ -228,6 +228,63 @@ For local setup of this repo's native backend and ClickHouse sink, see
 [`huggingface.md`](huggingface.md) and [`vllm.md`](vllm.md).
 ## Native capture pipeline ledger
 
+### C3 — default switch (2026-09-06)
+
+`storage_backend="capture"` now defaults to the native pack writer, built
+from the config's `capture_sink_config`; an explicit `record_sink`
+overrides it (the reference sink is the documented rollback). Gates the
+flip rode on: Checkpoint A, Checkpoint B (human review of #127/#128),
+the quorum verifier against the C++ writer, the C1 read-parity suite,
+and the C2 hydration/summary parity — all green before the flip. The
+ClickHouse host record path (`storage_backend="native"`) and "auto" are
+untouched. Measured on this host earlier in the cycle, shared and NOT
+quiet: pipeline 0.50 GiB/s at N=1 (single-scope) to 0.56 at N=8 vs the
+0.212 fresh Python baseline, writer-only 0.60 vs 0.359 — re-measure on a
+quiet host before publishing numbers.
+
+### How noisy this host is, measured (2026-09-06)
+
+The instruction above kept being restated without evidence, so here is
+the evidence. Three consecutive `native/build/bench_sink` runs, same
+binary, same minute, at a load average of 14.5 on 32 threads with a
+foreign process holding ~522% CPU:
+
+| trial | N=1 GiB/s |
+|---|---:|
+| 1 | 0.259 |
+| 2 | 0.492 |
+| 3 | 0.519 |
+
+A **2× spread on identical work**. The low reading barely clears the
+0.235 Python baseline; the high one is +121% over it. Both are the same
+build of the same code.
+
+Two conclusions, and they are different from each other:
+
+- The **decision** is robust. Even the worst reading beats the Python
+  baseline and clears the 0.37 GiB/s per-instance requirement for the
+  3×4090 shape, so nothing about the port's justification depends on
+  re-measuring.
+- The **figures** are not publishable from this host in this state. Any
+  single number drawn from a 2× spread says more about who else was on
+  the machine than about the code.
+
+**The re-measure protocol**, so it is executable rather than aspirational:
+
+1. Quiet means quiet — `uptime` load average below ~1 on this 32-thread
+   host and no foreign process above a few percent in `ps aux --sort=-%cpu`.
+   The reference host IS this machine (5955WX); "reference host" was never
+   a different box, so the whole obligation is a scheduling one.
+2. `python benchmarks/bench_capture_pipeline.py` for the Python baseline
+   (defaults: 10k × 64 KiB, median of 5) — the same harness the T0.1
+   baselines came from, writing its JSON under
+   `benchmarks/data/native-pipeline/`.
+3. `native/build/bench_sink` for the native side, at N=1 and N=8, median
+   of 5 rather than best-of, with the load average recorded beside each
+   number.
+4. Only then may a figure leave this document. Until then every published
+   claim carries the caveat, including the PR bodies.
+
 Working ledger for the end-to-end native capture pipeline (branch
 `feat/native-capture-pipeline`, plan in `tasks/plan.md`). Every attempt — kept
 or reverted — is logged here so dead ideas stay dead. Baselines are medians of
@@ -246,9 +303,6 @@ Both sit at the design doc's adopted target (0.235 GiB/s) rather than its
 reported 0.282/0.291 — same harness, same host family; the gap to the pack
 writer alone (0.472 GiB/s) is the attribution target for T0.2.
 
-| Idea | Baseline → Result | Verdict | Why |
-|---|---|---|---|
-
 ### T0.2 attribution (2026-09-05, same host, 10k × 64 KiB, median of 3)
 
 | Stage (single-threaded unless noted) | Throughput | Share of writer time (cProfile) |
@@ -259,8 +313,8 @@ writer alone (0.472 GiB/s) is the attribution target for T0.2.
 | `sha256` at seal (per 128 MiB pack) | 2.1 GiB/s | 13% |
 | `PackWriter` append+seal alone | **0.359 GiB/s** | — |
 | `PackAssembler` loop | 0.335 GiB/s | — |
-| `FilesystemPackStore.put` (fsync-heavy) | 0.199 GiB/s | — |
-| Spool stage (`.open`+fsync+`.ready`, NVMe) | **1.148 GiB/s** | — |
+| `FilesystemPackStore.put` (fsync-heavy) | 0.84 GiB/s (re-measured) | — |
+| Spool stage (`.open`+fsync+`.ready`, NVMe) | **0.86 GiB/s** (re-measured) | — |
 | Full pipeline (producer+worker threads) | 0.211–0.225 GiB/s | — |
 
 **Findings.**
@@ -271,9 +325,26 @@ writer alone (0.472 GiB/s) is the attribution target for T0.2.
    metadata dict — pure-Python dict construction, not encoding.
 3. `zlib.crc32` (24%) runs at 1.17 GiB/s; hardware CRC32 is ~10x. `sha256`
    (SHA-NI) at 2.1 GiB/s is the fastest per-byte kernel.
-4. Durable spool staging is 1.15 GiB/s on NVMe — 5x the pipeline; NOT the
-   bottleneck. Direct mode's `FilesystemPackStore.put` (0.199) IS slow from
-   fsyncs, which is why spool mode is the production shape.
+4. Durable spool staging and the direct-mode put both run ~0.85 GiB/s on
+   NVMe — well above the pipeline rate; NOT the bottleneck, which is why
+   spool mode is the production shape.
+
+> Note (2026-09-06): the first publication of the two store rows was wrong
+> twice over. The stage harness swallowed `PackCapacityError` from
+> `PackWriter.append` (`max_pack_bytes` 512 MiB < the 640 MiB corpus) and
+> dropped ~19% of records while still dividing 640 MiB by the time — an
+> inflation the 0.199/1.148 figures carry even before drift. The harness
+> now sizes the writer at 1 GiB and asserts `pack.record_count == RECORDS`.
+> Re-measurement also shows the I/O-bound rows shift with machine state
+> (yesterday's 0.199 put ran under heavier disk contention than today's;
+> CPU-bound rows reproduce to within a few percent). Treat the store rows
+> as order-of-magnitude, not calibration. Within-process variance is small —
+> three consecutive full invocations on 2026-09-06 spread 1.1% (put:
+> 0.859/0.850/0.851) and 2.2% (spool: 0.914/0.905/0.894) — so per-run
+> medians are trustworthy; only across-day comparisons are not. A warmup-
+> before-timing protocol change was considered for the drift and rejected
+> without landing: within-run stability was already adequate, so the change
+> would have been neutral.
 
 | Idea | Baseline → Result | Verdict | Why |
 |---|---|---|---|
@@ -285,7 +356,7 @@ writer alone (0.472 GiB/s) is the attribution target for T0.2.
 | Kernel | Measured | Note |
 |---|---:|---|
 | CRC32C hw, 8 interleaved chains, streaming 640 MiB | **13.7 GiB/s** | latency-hidden; serial chain only 6–11 |
-| SHA-256 (OpenSSL 1.1.1f, no SHA-NI on this build) | 2.09 GiB/s | best-of-5; ≈ Python's hashlib — parity, not a win |
+| SHA-256 (OpenSSL 1.1.1f, SHA-NI) | 2.09 GiB/s | best-of-5; ≈ Python's hashlib — parity, not a win |
 | Payload append (memcpy + 32B header) | 2.59 GiB/s | memory-bandwidth bound |
 | Footer JSON build (10k records) | 247 GiB/s | negligible |
 | Spool write `.open`→fsync→`.ready` (NVMe, O_DIRECT ref) | 0.88–0.91 GiB/s | fsync-bound; 3.2 GiB/s without |
@@ -294,8 +365,11 @@ writer alone (0.472 GiB/s) is the attribution target for T0.2.
 **Discarded readings (logged to keep them dead):** two earlier harness versions
 reported CRC32 at 1.4–4.9 TiB/s and SHA at 325 GiB/s — a 64-payload corpus fit
 in cache and the timing window collapsed (640 MiB ÷ 0.14 ms). All numbers above
-use distinct/`volatile`-consumed results with corpora sized to defeat the
-optimizer. Lesson recorded for A1: benchmark with the production corpus shape.
+use distinct/`volatile`-consumed results; the CRC and spool rows stream a
+640 MiB corpus. The SHA row still cycles a 4 MiB corpus (cache-resident), but
+the same 2.09 GiB/s was confirmed by the standalone 640 MiB OpenSSL harness
+(`bench_sha256.cpp`), so the figure stands. Lesson recorded for A1: benchmark
+with the production corpus shape.
 
 ### T0.3 synthesis — modeled native ceiling
 
@@ -305,6 +379,16 @@ end-to-end native pipeline on this host: **~1.5–2.0 GiB/s per instance** vs
 0.235 GiB/s Python — an ~8× headroom, far beyond the 1.2× capacity gate. The
 measured sha256 ceiling (2.09) still bounds single-instance worst case well
 above the 3×4090 requirement of 0.37 GiB/s/instance.
+
+**Caveat on the CRC figure:** the 13.7 GiB/s kernel is CRC32C (Castagnoli
+polynomial, via `_mm_crc32_u64`). The pack format's per-record checksum is
+`zlib.crc32` — CRC-32/ISO-HDLC, a different polynomial — and A1's gate is
+byte-equality with the Python oracle, so the measured kernel cannot drop into
+the native writer as-is: its footer bytes would not match. The real options
+for A1 are a PCLMUL-folding CRC-32 (zlib polynomial) kernel with its own
+measured number, or keeping software CRC-32 and re-deriving the ceiling. The
+port decision below is unaffected (SHA-256 at 2.09 and memcpy at 2.6 dominate
+the per-byte cost); only the CRC row of the model carries this uncertainty.
 
 | Idea | Baseline → Result | Verdict | Why |
 |---|---|---|---|
@@ -319,9 +403,11 @@ Python delivers 0.235; native modeled ceiling ~1.5–2.0 GiB/s per instance
 (bounded below by SHA-256 seal at 2.09 and memcpy at 2.6, above by spool at
 0.9–3.2). **Decision: proceed with the full native port (Phases A+B)** — the
 profile confirms interpreter/GIL tax (~35% between threads), a 29%
-`asdict`+deepcopy metadata cost, and a 6.5× CRC kernel gap. Every modeled stage
-clears the target with margin; parallelism via scope-partitioned workers and
-pipelined seal→stage overlaps the SHA-256 bound across packs.
+`asdict`+deepcopy metadata cost, and a 6.5× CRC kernel gap (see the
+polynomial caveat above: the gap applies to CRC32C, not the pack format's
+`zlib.crc32`). Every modeled stage clears the target with margin;
+parallelism via scope-partitioned workers and pipelined seal→stage overlaps
+the SHA-256 bound across packs.
 
 ### A1 writer throughput (2026-09-05, same host)
 
@@ -426,7 +512,8 @@ Host variance note: this is a shared box (48 users, load 18–27); expect
 | broadcast notify_all everywhere | flat-to-negative scaling | fixed | Per-worker + per-stage CVs; producer signals only the routed worker. ~180k thundering-herd wakeups per trial at N=8 were the inhibitor |
 | Raw FNV `% workers` routing | all 8 scopes on worker 0 (flat "scaling") | fixed | fmix64 finalizer; low bits of FNV are weak for similar inputs. Verified distribution in the ledger review, then in code |
 | Spool mutex across file writes | serialized all stagers on fsync | fixed | Lock covers accounting decisions only; byte reservation keeps max_bytes exact. Also fixed a double-count on the EEXIST race path |
-| CRC+memcpy fusion, metadata moves | writer 0.63 → est. ~0.9 | deferred | Would move 3 instances → 2 for the 1.1 GiB/s host, but no gate demands it yet — Checkpoint A decision |
+| CRC+memcpy fusion (crc-from-destination during copy) | 0.606 → 0.590 best-of-5, interleaved A/B | **reverted** | Measured 2026-09-06: the store→load dependency makes the CRC walk with the copy, while the separate pass already overlaps across records under OOO. The upper-bound arm (CRC stubbed out entirely) measured 0.686 (+13%), so the CRC+its second read IS worth ~13% — but fusion is the wrong shape. Follow-up candidate: a hardware-accelerated CRC (PCLMULQDQ for the 0xEDB88320 polynomial), which attacks the 13% directly. Interleaved 5×3 trials; correctness gates re-run (conformance 8/8) after the revert |
+| Copy-first reorder (crc-from-destination as a separate pass) | 0.600-0.606 → 0.601 best-of-5, interleaved | **reverted** | Measured 2026-09-06, same discipline: the 64 KiB payload stays cache-resident across the row build, so the source re-read is NOT cache-cold — the +13% from the stub arm is the CRC ALU work itself, not a re-read. The reorder is inside noise; neutral is a revert. The PCLMULQDQ follow-up above stands: it attacks the ALU work, which is the confirmed 13% |
 
 ### A5b adapter + selection + Checkpoint A (2026-09-05)
 

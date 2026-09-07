@@ -55,7 +55,7 @@ endif
 # Pure-CPU drivers build without a CUDA toolkit (or torch): the test suite
 # drives them over stdin/stdout. When EVERY requested goal is CPU-only (or
 # clean/host), skip CUDA resolution entirely.
-CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/bench_sink build/_dmi_native_sink
+CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/bench_sink build/conformance_catalog build/_dmi_native_sink
 ifneq ($(strip $(MAKECMDGOALS)),)
 ifeq ($(strip $(filter-out clean host cpu-goals $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
@@ -195,9 +195,10 @@ all: $(FINAL_TARGET)
 
 # Every target that builds without CUDA, as ONE goal. CI's compile gate
 # asks for this rather than listing the binaries: a list in the workflow
-# goes stale the moment CPU_ONLY_GOALS gains a target, which is exactly
-# the drift a compile gate exists to prevent. Adding a target to
-# CPU_ONLY_GOALS now puts it under the gate automatically.
+# goes stale the moment CPU_ONLY_GOALS gains a target -- which it did,
+# when the catalog driver landed and the hardcoded list did not know --
+# and that is exactly the drift a compile gate exists to prevent. Adding
+# a target to CPU_ONLY_GOALS now puts it under the gate automatically.
 cpu-goals: $(CPU_ONLY_GOALS)
 
 host: $(HOST_FINAL_TARGET)
@@ -289,6 +290,20 @@ build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/st
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
 	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/common/json.cpp \
 	    -Icsrc/store -Icsrc/common -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
+
+# B1 catalog conformance driver: lease coordinator + version allocator over
+# ClickHouse's HTTP interface. No torch/pybind; needs libcurl like the store.
+build/conformance_catalog: csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp csrc/catalog/version_allocator.cpp csrc/catalog/catalog_writer.cpp csrc/catalog/pack_index.cpp csrc/catalog/indexer.cpp csrc/catalog/schema.cpp csrc/catalog/reader.cpp csrc/catalog/hydration.cpp csrc/catalog/conformance_catalog.cpp csrc/common/json.cpp csrc/pack/pack_builder.cpp csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/catalog/clickhouse_client.h csrc/catalog/lease_coordinator.h csrc/catalog/version_allocator.h csrc/catalog/catalog_writer.h csrc/catalog/pack_index.h csrc/catalog/indexer.h csrc/catalog/schema.h csrc/catalog/reader.h csrc/catalog/hydration.h csrc/common/json.h csrc/store/s3_client.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp \
+	    csrc/catalog/version_allocator.cpp csrc/catalog/catalog_writer.cpp \
+	    csrc/catalog/pack_index.cpp csrc/catalog/indexer.cpp csrc/catalog/schema.cpp csrc/catalog/reader.cpp csrc/catalog/hydration.cpp \
+	    csrc/catalog/conformance_catalog.cpp \
+	    csrc/common/json.cpp csrc/pack/pack_builder.cpp \
+	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp \
+	    -Icsrc/catalog -Icsrc/common -Icsrc/pack -Icsrc/store \
+	    -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
 
 # A3a spool conformance driver: no network, no torch; runs in any CI job.
 build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h csrc/common/json.cpp csrc/common/json.h

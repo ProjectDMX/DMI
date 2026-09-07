@@ -288,12 +288,44 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
         }
       }
       if (bytes_ + n > max_bytes_) {
-        if (error) {
-          *error = "spool byte limit exceeded: " +
-                   std::to_string(bytes_ + n) + " > " +
-                   std::to_string(max_bytes_);
+        // The in-process counter is only as fresh as the Remove calls THIS
+        // Spool object has seen. An uploader running through a second
+        // Spool object on the same root (or another process) removes
+        // ready files and its counter updates its OWN bytes_ — this
+        // object's counter never learns about the released capacity, so
+        // staging eventually refuses on a directory that is actually
+        // empty (reproduced: sink with a 1500-byte limit, serial
+        // upload-and-remove between two records). Reconcile from the
+        // directory — the durable truth — before refusing.
+        uint64_t actual = 0;
+        std::error_code walk_ec;
+        for (const auto& entry :
+             fs::recursive_directory_iterator(root_, walk_ec)) {
+          if (walk_ec) break;
+          if (!entry.is_regular_file()) continue;
+          const std::string name = entry.path().filename().string();
+          if (HasSuffix(name, kReadySuffix) || HasSuffix(name, kOpenSuffix)) {
+            actual += entry.file_size();
+          }
         }
-        return SpoolStatus::kFull;
+        uint64_t ready_count = 0;
+        for (const auto& entry :
+             fs::recursive_directory_iterator(root_, walk_ec)) {
+          if (walk_ec) break;
+          if (!entry.is_regular_file()) continue;
+          const std::string name = entry.path().filename().string();
+          if (HasSuffix(name, kReadySuffix)) ++ready_count;
+        }
+        bytes_ = actual;
+        entries_ = ready_count;
+        if (bytes_ + n > max_bytes_) {
+          if (error) {
+            *error = "spool byte limit exceeded: " +
+                     std::to_string(bytes_ + n) + " > " +
+                     std::to_string(max_bytes_);
+          }
+          return SpoolStatus::kFull;
+        }
       }
       // Reserve now: the link below is the atomic commit, and two workers
       // racing fresh stages must not both pass the capacity check.

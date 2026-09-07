@@ -77,11 +77,14 @@ class DriverSession:
 
 
 def _stage(session: DriverSession, root: Path, index: int,
-           payload: bytes = b"0123456789abcdef" * 64) -> dict:
+           payload: bytes = b"0123456789abcdef" * 64, *,
+           dtype: str = "uint8", shape: tuple | None = None) -> dict:
     """Stage one pack through the native sink; return its StagedPack JSON.
 
     The sink mints pack ids, so the new entry is identified by diffing the
-    ready set before and after.
+    ready set before and after. `dtype`/`shape` default to the uint8 byte
+    stream most suites use; a summary test that needs a real element type
+    (a float16 subnormal, say) passes its own.
     """
     before = set(root.rglob("*.dmi-pack.ready")) if root.exists() else set()
     meta = CaptureMetadata(
@@ -90,8 +93,9 @@ def _stage(session: DriverSession, root: Path, index: int,
         sequence_id=f"n{index}", model_id="m", model_revision="mr",
         adapter_revision=None, capture_policy_version="v", hook_name="h",
         layer_number=0, producer_rank=0, step_number=index, token_start=index,
-        token_end=index + 1, batch_position=0, dtype="uint8",
-        shape=(len(payload),), captured_at_ns=1_700_000_000_000_000_000 + index,
+        token_end=index + 1, batch_position=0, dtype=dtype,
+        shape=shape if shape is not None else (len(payload),),
+        captured_at_ns=1_700_000_000_000_000_000 + index,
     )
     assert session.call(
         op="open", root=str(root), max_bytes=1 << 40,

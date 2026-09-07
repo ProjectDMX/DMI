@@ -183,18 +183,20 @@ def stage_store_put(records):
     def run():
         with tempfile.TemporaryDirectory() as directory:
             store = FilesystemPackStore(Path(directory) / "objects", store_id="local")
+            # 1 GiB so one pack holds the whole 640 MiB corpus;
+            # PackWriter does not roll over on max_pack_bytes, it raises
+            # PackCapacityError, and swallowing that here dropped ~19% of
+            # records and inflated the ledger rate ~1.25x.
             writer = PackWriter(
                 pack_id=__import__("uuid").uuid4(),
                 created_at_ns=records[0].metadata.captured_at_ns,
-                max_pack_bytes=512 * 1024**2,
+                max_pack_bytes=1024 * 1024**2,
                 max_records=RECORDS,
             )
             for record in records:
-                try:
-                    writer.append(record)
-                except Exception:
-                    pass
+                writer.append(record)
             pack = writer.seal()
+            assert pack.record_count == RECORDS, "dropped records"
             ready = ReadyPack(pack, records[0].metadata, FlushReason.SESSION)
             started = time.perf_counter()
             store.put(pack, object_key_for(ready))
@@ -215,18 +217,17 @@ def stage_spool_stage(records):
                     max_bytes=2 * RECORDS * (PAYLOAD + 4096),
                 )
             )
+            # 1 GiB so one pack holds the corpus; see stage_store_put note.
             writer = PackWriter(
                 pack_id=__import__("uuid").uuid4(),
                 created_at_ns=records[0].metadata.captured_at_ns,
-                max_pack_bytes=512 * 1024**2,
+                max_pack_bytes=1024 * 1024**2,
                 max_records=RECORDS,
             )
             for record in records:
-                try:
-                    writer.append(record)
-                except Exception:
-                    pass
+                writer.append(record)
             pack = writer.seal()
+            assert pack.record_count == RECORDS, "dropped records"
             ready = ReadyPack(pack, records[0].metadata, FlushReason.SESSION)
             started = time.perf_counter()
             sink.persist(ready)
