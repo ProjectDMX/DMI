@@ -565,6 +565,82 @@ def test_commit_packs_and_the_committed_readback():
             driver.close()
 
 
+def test_a_pack_id_that_is_not_a_uuid_is_refused_before_it_reaches_the_sql():
+    """pack_id lands in `toUUID('...')`, so it must be VALIDATED, not escaped.
+
+    Every sibling column of the inventory row goes through the SQL string
+    escaper; pack_id alone was interpolated raw, because the column is a
+    UUID and the value "is a UUID". The oracle
+    (`clickhouse_catalog.py`'s `commit_packs`) passes the rows as BOUND
+    data, so the driver serialises pack_id into the UUID column: a quote
+    cannot break out, and a malformed UUID is refused by the driver.
+
+    So a quote must be refused at the boundary rather than escaped. An
+    escaped-but-malformed value would still die server-side inside
+    `toUUID`, which is a confusing error for a plain data fault; canonical
+    -UUID validation refuses it cleanly, exactly as the oracle's UUID
+    column does.
+
+    The decisive case is the second one: a crafted pack_id closes the
+    VALUES tuple and appends a whole inventory row -- store, key, byte
+    count, record count and index_version all attacker-chosen, none of
+    them supplied by the caller.
+    """
+    checksum = "ff" * 32
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            version = driver.call(op="allocate_version")["version"]
+            inventory = (f"`{config.database}`."
+                         f"`{prefix}_pack_inventory_raw`")
+
+            def ref(pack_id):
+                return [{"store_id": "legit-store", "pack_id": pack_id,
+                         "object_key": "legit-key", "object_bytes": 10,
+                         "pack_checksum": checksum, "record_count": 1}]
+
+            # A bare quote: it reaches the server as raw SQL today.
+            quoted = driver.call(
+                op="commit_packs", index_version=version,
+                refs=ref("00000000-0000-0000-0000-000000000001'"))
+            assert not quoted["ok"], quoted
+            assert quoted["error"] == "ValueError", quoted
+
+            # And the crafted payload that appends an attacker's row.
+            crafted = (
+                "11111111-1111-1111-1111-111111111111'),'EVIL-STORE',"
+                f"'EVIL-KEY',999,'{checksum}',7,42),(toUUID('"
+                "22222222-2222-2222-2222-222222222222")
+            injected = driver.call(
+                op="commit_packs", index_version=version, refs=ref(crafted))
+            assert not injected["ok"], injected
+            assert injected["error"] == "ValueError", injected
+            assert client.execute(
+                f"SELECT count() FROM {inventory}") == [(0,)], (
+                    "a refused commit must leave the inventory untouched")
+
+            # The descriptor row carries the same locator, through the same
+            # `toUUID('...')`, and must refuse the same way.
+            descriptors = _descriptor_dicts(1)
+            descriptors[0]["pack_id"] = (
+                "00000000-0000-0000-0000-000000000002'")
+            refused = driver.call(op="write_descriptors",
+                                  descriptors=descriptors, index_version=1)
+            assert not refused["ok"], refused
+            assert refused["error"] == "ValueError", refused
+
+            # A canonical UUID still commits, so the guard is a guard and
+            # not a wall.
+            good = str(uuid.uuid4())
+            assert driver.call(op="commit_packs", index_version=version,
+                               refs=ref(good))["ok"]
+            assert client.execute(
+                f"SELECT count() FROM {inventory}") == [(1,)]
+        finally:
+            driver.close()
+
+
 def test_a_publish_below_the_published_head_loses_the_race():
     with _catalog() as (client, config, prefix):
         driver = CatalogDriver()

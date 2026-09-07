@@ -181,7 +181,7 @@ std::string render_record_row(const std::string& raw, const PackRefData& ref,
   fields.push_back(shape);
   int_field("captured_at_ns");
   // Locator from the ref, record placement from the footer.
-  fields.push_back("toUUID('" + ref.pack_id + "')");
+  fields.push_back(sql_uuid(ref.pack_id));
   fields.push_back(quoted_string(ref.store_id));
   fields.push_back(quoted_string(ref.object_key));
   fields.push_back(std::to_string(ref.object_bytes));

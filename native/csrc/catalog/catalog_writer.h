@@ -43,6 +43,26 @@ using PackIdentity = std::pair<std::string, std::string>;  // store_id, pack_id
 // SQL string literal, ClickHouse escaping — shared by the row renderers.
 std::string sql_quote(const std::string& value);
 
+// `toUUID('<value>')` for a pack_id, VALIDATED rather than escaped, and
+// the only way the row renderers may render one.
+//
+// pack_id is the one inventory/descriptor column whose SQL type is UUID,
+// so escaping is not enough: an escaped-but-malformed value still dies
+// inside `toUUID` server-side, which reads as a server fault rather than
+// the caller's bad data. The oracle passes pack rows as BOUND data
+// (`clickhouse_catalog.py`'s commit_packs → `execute(sql, rows)`), so the
+// driver serialises pack_id into the UUID column: a quote can never reach
+// the SQL, and a malformed UUID is refused before the statement is sent.
+// This reproduces that boundary. Interpolating pack_id raw — every other
+// column already went through sql_quote — let a crafted value close the
+// VALUES tuple and append whole inventory rows of the attacker's choosing.
+//
+// Accepted: hex digits in either layout BOTH sides admit today, canonical
+// 8-4-4-12 and the bare 32 hex digits. `uuid.UUID` also takes braced and
+// `urn:uuid:` forms, but ClickHouse's `toUUID` refuses those, so they are
+// already refused here and this adds no divergence.
+std::string sql_uuid(const std::string& value);
+
 class CatalogWriter {
  public:
   CatalogWriter(std::shared_ptr<const ClickHouseClient> client,

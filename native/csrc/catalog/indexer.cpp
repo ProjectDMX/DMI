@@ -33,7 +33,7 @@ std::vector<std::string> RenderPackRows(
     const std::vector<const PackRefData*>& refs) {
   std::vector<std::string> rows;
   for (const PackRefData* ref : refs) {
-    rows.push_back("toUUID('" + ref->pack_id + "')," + sql_quote(ref->store_id) +
+    rows.push_back(sql_uuid(ref->pack_id) + "," + sql_quote(ref->store_id) +
                    "," + sql_quote(ref->object_key) + "," +
                    std::to_string(ref->object_bytes) + "," +
                    sql_quote(ref->checksum) + "," +

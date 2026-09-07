@@ -96,6 +96,31 @@ std::string sql_quote(const std::string& value) {
   return escape_sql_string(value);
 }
 
+std::string sql_uuid(const std::string& value) {
+  const auto hex = [](char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+  };
+  bool valid = false;
+  if (value.size() == 36) {
+    valid = true;
+    for (size_t i = 0; valid && i < value.size(); ++i) {
+      const bool dash = i == 8 || i == 13 || i == 18 || i == 23;
+      valid = dash ? value[i] == '-' : hex(value[i]);
+    }
+  } else if (value.size() == 32) {
+    valid = true;
+    for (size_t i = 0; valid && i < value.size(); ++i) {
+      valid = hex(value[i]);
+    }
+  }
+  if (!valid) {
+    throw CatalogError(CatalogError::Kind::kValue,
+                       "pack_id is not a UUID: '" + value + "'");
+  }
+  return "toUUID('" + value + "')";
+}
+
 namespace {
 
 // clickhouse_catalog.MINIMUM_FENCE_MARGIN_NS: what has to remain of the

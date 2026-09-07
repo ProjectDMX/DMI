@@ -180,7 +180,8 @@ std::string render_descriptor_row(const std::string& descriptor) {
   shape += "]";
   fields.push_back(shape);
   int_field("captured_at_ns");
-  fields.push_back("toUUID('" + jc::FindString(descriptor, "pack_id") + "')");
+  fields.push_back(
+      dmi_catalog::sql_uuid(jc::FindString(descriptor, "pack_id")));
   text_field("store_id");
   text_field("object_key");
   int_field("object_bytes");
@@ -203,7 +204,7 @@ std::string render_descriptor_row(const std::string& descriptor) {
 // batch's index_version itself, the same convention as write_descriptors.
 std::string render_pack_row(const std::string& ref) {
   std::vector<std::string> fields;
-  fields.push_back("toUUID('" + jc::FindString(ref, "pack_id") + "')");
+  fields.push_back(dmi_catalog::sql_uuid(jc::FindString(ref, "pack_id")));
   fields.push_back(render_sql_string(jc::FindString(ref, "store_id")));
   fields.push_back(render_sql_string(jc::FindString(ref, "object_key")));
   fields.push_back(std::to_string(jc::FindInt(ref, "object_bytes")));
