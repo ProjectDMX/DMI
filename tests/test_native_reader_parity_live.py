@@ -562,6 +562,64 @@ def test_a_cursor_key_with_an_empty_component_is_refused():
             driver.close()
 
 
+def test_search_refusal_parity_on_filter_bounds():
+    """CaptureQuery bounds SIX things; search() ported only the limit.
+
+    The oracle refuses a query whose filter lists exceed their bounded
+    cardinality, whose layer numbers fall below -1, or whose time window
+    runs backwards. Native rendered all three straight into SQL, so it
+    ACCEPTED queries the oracle refuses outright -- 1025 layer numbers came
+    back as a successful four-item page.
+    """
+    from dmi.storage.capture.model import CaptureQuery
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            _publish_native(driver, prefix, _descriptor_dicts(4), 7)
+
+            cases = (
+                # Bounded cardinality: 128 hook names, 1024 layer numbers.
+                {"hook_names": [f"hook-{i}" for i in range(10_000)]},
+                {"hook_names": [f"hook-{i}" for i in range(129)]},
+                {"layer_numbers": list(range(1025))},
+                # A window that runs backwards selects nothing, and asking
+                # for it is a caller error rather than an empty answer.
+                {"captured_after_ns": 2000, "captured_before_ns": 1000},
+                # -1 is the "no layer" sentinel; below it means nothing.
+                {"layer_numbers": [-5]},
+            )
+            for fields in cases:
+                refused = driver.call(op="search", limit=100, **fields)
+                assert not refused["ok"], (fields.keys(), refused)
+                assert refused["error"] == "ValueError", (
+                    fields.keys(), refused)
+
+                # The oracle refuses the same filters.
+                python_fields = {
+                    name: tuple(value) if isinstance(value, list) else value
+                    for name, value in fields.items()
+                }
+                with pytest.raises(ValueError):
+                    CaptureQuery(limit=100, **python_fields)
+
+            # The bounds bite only at the edge: the largest ACCEPTED lists
+            # and a forward window still serve the same page both sides.
+            accepted = {"hook_names": ["resid_pre"] + [
+                            f"hook-{i}" for i in range(127)],
+                        "layer_numbers": list(range(1024))}
+            native = driver.call(op="search", limit=100, **accepted)
+            assert native["ok"], native
+            page = _python_page_items(
+                _python_reader(client, config),
+                hook_names=tuple(accepted["hook_names"]),
+                layer_numbers=tuple(accepted["layer_numbers"]), limit=100)
+            assert _normalize(native["items"]) == _normalize(page.items)
+        finally:
+            driver.close()
+
+
 def test_a_cursor_captured_at_ns_outside_uint64_is_refused():
     """The key's timestamp is a UInt64, and nothing checked it.
 
