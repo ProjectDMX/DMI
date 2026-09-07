@@ -17,9 +17,23 @@ and not on a checksum. Each case is then driven through BOTH readers --
 native `op: "index"` and `PackIndex.from_store` -- over the same bytes, and
 the two refusals are compared.
 
-Every test in this module is a BUG PROOF: each one fails against the build
-before this change, where native accepted a footer the oracle refuses and
-wrote a catalog row the Python reader then refused on read-back.
+Which tests are bug proofs and which are regression guards:
+
+* `test_metadata_bounds_are_refused_at_the_footer_boundary`,
+  `test_a_poison_shape_that_clickhouse_stores_is_refused_by_the_reader`
+  and `test_footer_arithmetic_is_overflow_checked` are BUG PROOFS: they
+  failed against the build that admitted footers the oracle refuses, and
+  admitted catalog rows the Python reader then refused on read-back.
+* `test_the_trailer_and_footer_refusal_matrix_matches_the_oracle` is
+  mostly a REGRESSION GUARD -- twelve of its sixteen cases passed on
+  first write and are here to keep passing, because the sentence a
+  refusal comes out with is what an operator reads. Four did not:
+  `records-not-list`, `duplicate-capture-id`, `offset-0` and
+  `footer-not-json` each named the wrong refusal, and those four are bug
+  proofs for the message and ordering half of the parity.
+* `test_a_well_formed_pack_still_indexes_through_the_same_path` is the
+  control: without it a reader that refused everything would pass every
+  refusal case above.
 
 These need a live ClickHouse and the driver binary; they run in the
 clickhouse-live job beside the rest of the native catalog suite.
@@ -28,6 +42,7 @@ clickhouse-live job beside the rest of the native catalog suite.
 from __future__ import annotations
 
 import hashlib
+import struct
 
 import pytest
 
@@ -359,3 +374,156 @@ def test_footer_arithmetic_is_overflow_checked(fake_s3, case, mutate):
         assert client.execute(
             f"SELECT count() FROM `{config.database}`."
             f"`{prefix}_capture_raw`") == [(0,)]
+
+
+# --- the trailer and footer refusal matrix ---------------------------------
+
+
+def _patch(data: bytes, offset: int, value: bytes) -> bytes:
+    changed = bytearray(data)
+    changed[offset:offset + len(value)] = value
+    return bytes(changed)
+
+
+def _footer_set(key, value):
+    def mutate(decoded):
+        decoded[key] = value
+
+    return mutate
+
+
+def _duplicated(decoded):
+    decoded["records"] = [decoded["records"][0], decoded["records"][0]]
+
+
+def _reordered(decoded):
+    decoded["records"] = decoded["records"][::-1]
+
+
+def _offset_zero(decoded):
+    decoded["records"][0]["offset"] = 0
+
+
+def _trailer_at(data: bytes) -> int:
+    from dmi.storage.capture.pack import _TRAILER
+
+    return len(data) - _TRAILER.size
+
+
+def _flip_footer_crc(data: bytes) -> bytes:
+    """Invert the trailer's footer CRC, whatever it happens to be.
+
+    Writing a constant would be a no-op on the one pack whose footer CRC
+    already equalled it.
+    """
+    at = _trailer_at(data) + 28
+    (crc,) = struct.unpack_from("<I", data, at)
+    return _patch(data, at, struct.pack("<I", crc ^ 0xFFFFFFFF))
+
+
+# Each case yields the object bytes and the ref overrides, from a sealed
+# two-record pack. `reseal` re-signs the footer CRC and the body hash, so
+# a case that mutates the footer JSON is refused on its own merits.
+FOOTER_CASES = (
+    ("truncated", lambda d, r: (d, {"object_bytes": 16})),
+    ("invalid-trailer",
+     lambda d, r: (_patch(d, _trailer_at(d), b"NOTAFTRX"), {})),
+    ("unsupported-version",
+     lambda d, r: (_patch(d, _trailer_at(d) + 8, struct.pack("<H", 99)), {})),
+    ("footer-too-large",
+     lambda d, r: (_patch(d, _trailer_at(d) + 20,
+                          struct.pack("<Q", 64 * 1024 * 1024 + 1)), {})),
+    ("footer-range-invalid",
+     lambda d, r: (_patch(d, _trailer_at(d) + 12, struct.pack("<Q", 1)), {})),
+    ("footer-crc-mismatch", lambda d, r: (_flip_footer_crc(d), {})),
+    ("footer-not-json", lambda d, r: (r(d, footer=b"{broken"), {})),
+    ("footer-not-an-object", lambda d, r: (r(d, footer=b"[]"), {})),
+    ("format-marker",
+     lambda d, r: (r(d, mutate=_footer_set("format", "zip")), {})),
+    ("footer-version-mismatch",
+     lambda d, r: (r(d, mutate=_footer_set("major_version", 2)), {})),
+    ("foreign-pack-id",
+     lambda d, r: (r(d, mutate=_footer_set(
+         "pack_id", "018f0000-0000-7000-8000-00000000ffff")), {})),
+    ("records-not-list",
+     lambda d, r: (r(d, mutate=_footer_set("records", 5)), {})),
+    ("record-count-mismatch", lambda d, r: (d, {"record_count": 5})),
+    ("records-out-of-order", lambda d, r: (r(d, mutate=_reordered), {})),
+    ("duplicate-capture-id",
+     lambda d, r: (r(d, mutate=_duplicated), {})),
+    ("offset-0", lambda d, r: (r(d, mutate=_offset_zero), {})),
+)
+
+
+@pytest.mark.parametrize("case,build", FOOTER_CASES,
+                         ids=[name for name, _ in FOOTER_CASES])
+def test_the_trailer_and_footer_refusal_matrix_matches_the_oracle(
+        fake_s3, case, build):
+    """Mostly a REGRESSION GUARD; four cases are bug proofs.
+
+    Twelve of these sixteen passed on first write and are here to keep
+    passing -- they pin the sentence each refusal comes out with, which is
+    what an operator reads. The four that did not pass named the wrong
+    refusal: `records-not-list` blamed the record's metadata instead of
+    the record list, `duplicate-capture-id` and `offset-0` both came out
+    as "ranges overlap or are out of order" because the range ordering was
+    checked before the record was, and `footer-not-json` came out as an
+    invalid format marker.
+    """
+    sealed, reseal = _two_record_pack()
+    data, overrides = build(sealed.data, reseal)
+    _put(data)
+    ref = _native_ref(data, sealed.checksum, record_count=2)
+    ref.update(overrides)
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="indexer")
+            native = _native_refusal(driver, fake_s3, ref)
+        finally:
+            driver.close()
+        _assert_same_refusal(case, native, _oracle_refusal(data, ref))
+
+
+def test_a_well_formed_pack_still_indexes_through_the_same_path(fake_s3):
+    """The matrix above is a guard only if the unmutated pack still passes.
+
+    Same helpers, same injection, no mutation: two records read out of the
+    footer and rendered into two descriptor rows, which the Python reader
+    then resolves. Without this, every refusal case above would also pass
+    against a reader that refused everything.
+    """
+    from dmi.storage.capture import CaptureQuery
+    from dmi.storage.capture.clickhouse_reader import (
+        ClickHouseCaptureCatalog,
+        ClickHouseReaderConfig,
+    )
+
+    sealed, _ = _two_record_pack()
+    _put(sealed.data)
+    ref = _native_ref(sealed.data, sealed.checksum, record_count=2)
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="indexer")
+            result = driver.call(
+                op="index", refs=[ref], endpoint=fake_s3, bucket=BUCKET,
+                region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+            )
+            assert result["ok"], result
+            assert result["result"]["failures"] == [], result
+            assert result["result"]["indexed_rows"] == 2, result
+        finally:
+            driver.close()
+
+        reader = ClickHouseCaptureCatalog(
+            client, ClickHouseReaderConfig.from_catalog(config))
+        page = reader.search(CaptureQuery(limit=10))
+        assert {item.capture_id for item in page.items} == {
+            "capture-a", "capture-b"}, page
+        # And the oracle read the same two out of the same bytes.
+        assert _oracle_refusal(sealed.data, ref) == ""

@@ -217,12 +217,37 @@ bool logical_bytes(const std::vector<JsonInteger>& dims, size_t element_bytes,
   return true;
 }
 
+bool is_json_object(const std::string& text) {
+  return text.size() >= 2 && text.front() == '{' && text.back() == '}';
+}
+
+// Whether `text` is a well-formed JSON value of some shape OTHER than an
+// object — which is the difference between the oracle's "not valid JSON"
+// and its "invalid format marker". A number is recognised in its integer
+// form only; a float footer would be called malformed instead of
+// wrong-shaped, and both sides refuse it either way.
+bool looks_like_json_value(const std::string& text) {
+  if (text.empty()) return false;
+  if (text.front() == '[') return text.back() == ']';
+  if (text.front() == '"') return text.size() >= 2 && text.back() == '"';
+  if (text == "true" || text == "false" || text == "null") return true;
+  return parse_integer(text).ok;
+}
+
+// Where one record's bytes sit, handed back so the caller can check the
+// footer's range ORDERING after the record itself has been validated.
+struct RecordRange {
+  uint64_t offset = 0;
+  uint64_t end = 0;
+};
+
 // The footer record's metadata object, validated by consumption: every
 // column the catalog stores is read here, and a missing or ill-typed
 // field is a format error at the boundary.
 std::string render_record_row(const std::string& raw, const PackRefData& ref,
                               uint64_t footer_offset,
-                              std::set<std::string>* seen_ids) {
+                              std::set<std::string>* seen_ids,
+                              RecordRange* range) {
   const std::string metadata = jc::FindObject(raw, "metadata");
   if (metadata.empty()) format_error("pack record metadata must be an object");
   const JsonInteger offset = field_integer(raw, "offset");
@@ -260,9 +285,6 @@ std::string render_record_row(const std::string& raw, const PackRefData& ref,
   // the Python reader refuses for the whole page it lands on.
   const std::vector<JsonInteger> dims = parse_shape(metadata);
   const std::string capture_id = checked_text(metadata, "capture_id");
-  if (!seen_ids->insert(capture_id).second) {
-    format_error("duplicate capture ID: " + capture_id);
-  }
   const std::string tenant_id = checked_text(metadata, "tenant_id");
   const std::string experiment_id = checked_text(metadata, "experiment_id");
   const std::string run_id = checked_text(metadata, "run_id");
@@ -314,6 +336,13 @@ std::string render_record_row(const std::string& raw, const PackRefData& ref,
       logical != decoded.magnitude) {
     format_error("record length does not match metadata dtype and shape");
   }
+  // AFTER the record is otherwise valid, and before the caller's range
+  // ordering: _parse_records validates the record, then refuses a repeated
+  // capture id, then refuses an out-of-order range. Checked first, a
+  // duplicate came out as an overlap with the record it repeats.
+  if (!seen_ids->insert(capture_id).second) {
+    format_error("duplicate capture ID: " + capture_id);
+  }
 
   std::vector<std::string> fields;
   fields.push_back(sql_quote(capture_id));
@@ -352,6 +381,9 @@ std::string render_record_row(const std::string& raw, const PackRefData& ref,
   fields.push_back(std::to_string(decoded.magnitude));
   fields.push_back(sql_quote(codec));
   fields.push_back(sql_quote(checksum));
+
+  range->offset = offset.magnitude;
+  range->end = offset.magnitude + stored.magnitude;
 
   std::string row;
   for (size_t i = 0; i < fields.size(); ++i) {
@@ -426,6 +458,23 @@ std::vector<std::string> read_pack_descriptor_rows(
   }
   const std::string footer_text(reinterpret_cast<const char*>(footer.data()),
                                 footer.size());
+  // json.loads() refuses malformed text OUTRIGHT, and only text it decoded
+  // reaches the shape check — so "is not valid JSON" and "has an invalid
+  // format marker" are two different refusals on the oracle's side. This
+  // port has no JSON parser and separates them structurally instead: a JSON
+  // object opens with `{` and closes with `}`; a well-formed JSON value of
+  // any other shape opens with one of the remaining value starters and
+  // closes as that shape closes; anything else never decoded at all. The
+  // one case the split cannot reach is a malformed object BODY, which opens
+  // and closes like an object and falls through to the format-marker
+  // refusal — both sides refuse it, only the sentence differs.
+  const std::string footer_json = trimmed(footer_text);
+  if (!is_json_object(footer_json)) {
+    if (looks_like_json_value(footer_json)) {
+      format_error("pack footer has an invalid format marker");
+    }
+    format_error("pack footer is not valid JSON");
+  }
   if (jc::FindString(footer_text, "format") != "dmi-pack") {
     format_error("pack footer has an invalid format marker");
   }
@@ -437,8 +486,17 @@ std::vector<std::string> read_pack_descriptor_rows(
   if (footer_pack_id != ref.pack_id) {
     format_error("pack footer identity does not match its object key");
   }
-  const std::vector<std::string> records = jc::SplitElements(
-      jc::Unwrap(jc::FindArray(footer_text, "records")));
+  // A `records` value that is not an array at all is an invalid record
+  // list, which is what `isinstance(raw_records, list)` says. FindArray
+  // returns nothing for a non-array, and splitting that yields one empty
+  // "record" — blamed on the record's metadata, or on the ref's record
+  // count, rather than on the list.
+  const std::string records_array = jc::FindArray(footer_text, "records");
+  if (records_array.empty()) {
+    format_error("pack footer has an invalid record list");
+  }
+  const std::vector<std::string> records =
+      jc::SplitElements(jc::Unwrap(records_array));
   if (records.size() > kMaxRecords) {
     format_error("pack footer has an invalid record list");
   }
@@ -449,18 +507,16 @@ std::vector<std::string> read_pack_descriptor_rows(
   std::set<std::string> seen_ids;
   uint64_t previous_end = kHeaderSize;
   for (const std::string& raw : records) {
-    // The record's own range ordering is checked against the footer text;
-    // duplicate capture IDs are caught by the renderer. Unsigned addition,
-    // because `offset + stored` on int64 is undefined for a footer naming
-    // an offset near int64's maximum.
-    const int64_t offset = jc::FindInt(raw, "offset");
-    const int64_t stored = jc::FindInt(raw, "stored_length");
-    if (static_cast<uint64_t>(offset) < previous_end) {
+    // Range ordering is checked AFTER the record itself, because that is
+    // the order _parse_records refuses in: an offset of 0 in the first
+    // record is an invalid range, not an overlap with the header.
+    RecordRange range;
+    rows.push_back(
+        render_record_row(raw, ref, footer_offset, &seen_ids, &range));
+    if (range.offset < previous_end) {
       format_error("pack record ranges overlap or are out of order");
     }
-    previous_end =
-        static_cast<uint64_t>(offset) + static_cast<uint64_t>(stored);
-    rows.push_back(render_record_row(raw, ref, footer_offset, &seen_ids));
+    previous_end = range.end;
   }
   return rows;
 }
