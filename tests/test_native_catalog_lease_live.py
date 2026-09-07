@@ -1371,6 +1371,96 @@ def test_a_batch_that_never_publishes_is_never_committed(fake_s3):
             driver.close()
 
 
+def _oracle_partition(refs):
+    """The same refs through the Python indexer's own partitioner.
+
+    `_partition_refs` IS the oracle for identity conflicts, so the
+    expectations below are generated from it rather than restated.
+    """
+    from dmi.storage.capture.catalog import _partition_refs
+    from dmi.storage.capture.model import PackRef
+
+    return _partition_refs([PackRef(**ref) for ref in refs])
+
+
+def _conflict_only_index(driver, refs):
+    """Index a batch in which every ref is conflicted.
+
+    No pack survives the partition, so nothing is read from the store and
+    nothing is published: the endpoint is never contacted and no lease is
+    needed, exactly as in the Python indexer.
+    """
+    response = driver.call(
+        op="index", refs=refs, endpoint="http://127.0.0.1:1", bucket=BUCKET,
+        region=REGION, access=ACCESS, secret=SECRET, insecure=True,
+    )
+    assert response["ok"], response
+    return response["result"]
+
+
+def test_each_distinct_claimant_of_a_conflicted_identity_fails_once():
+    """One failure per distinct CLAIMANT, grouped by identity.
+
+    Two different refs claiming one (store_id, pack_id) fail every
+    claimant, and Python dedupes those claimants BY VALUE
+    (`if ref not in claimants`, over a frozen dataclass) and emits them
+    grouped by identity, in the order the identities first conflicted.
+    Emitting one failure per INPUT REF instead counts a ref listed twice
+    twice, and emitting in input order interleaves two conflicted
+    identities.
+
+    Neither is cosmetic: `IndexResult.merge` truncates with
+    `failures[:failure_limit]`, so the order decides WHICH failures
+    survive a rebuild, and `requested_packs`/`failed_packs` are the
+    numbers a reconcile pass reports.
+    """
+    same = str(uuid.uuid4())
+    a = {"pack_id": same, "store_id": "store-a", "object_key": "packs/a1",
+         "object_bytes": 10, "checksum": "c1", "record_count": 1}
+    a_other = {**a, "checksum": "c2"}
+    b1 = {**a, "object_key": "packs/b1", "store_id": "store-b"}
+    b2 = {**b1, "object_key": "packs/b2", "checksum": "c2"}
+    a2 = {**a, "object_key": "packs/a2", "checksum": "c2"}
+    # First conflict belongs to the identity that sorts LAST, so grouping
+    # by sorted identity and grouping by first conflict disagree.
+    z1 = {**a, "store_id": "store-z", "object_key": "packs/z1"}
+    z2 = {**z1, "object_key": "packs/z2", "checksum": "c2"}
+    w1 = {**a, "store_id": "store-a", "object_key": "packs/w1"}
+    w2 = {**w1, "object_key": "packs/w2", "checksum": "c2"}
+    # A store_id whose repr flips to double quotes and carries escapes:
+    # the message quotes the identity with Python's own `repr`.
+    odd = {**a, "store_id": "it's\todd\\", "object_key": "packs/odd1"}
+    odd_other = {**odd, "object_key": "packs/odd2", "checksum": "c2"}
+
+    batches = {
+        "a ref listed twice is one claimant": [a, a, a_other],
+        "two identities interleaved": [a, b1, a2, b2],
+        "grouped by first conflict, not by sorted identity": [z1, w1, z2, w2],
+        "the identity is quoted with Python's repr": [odd, odd_other],
+    }
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            for label, refs in batches.items():
+                unique, failures = _oracle_partition(refs)
+                assert not unique, (label, unique)
+                result = _conflict_only_index(driver, refs)
+                assert result["failed_packs"] == len(failures), (label, result)
+                assert result["requested_packs"] == len(unique) + len(
+                    failures), (label, result)
+                assert [
+                    (item["pack_id"], item["object_key"], item["error_type"],
+                     item["message"]) for item in result["failures"]
+                ] == [
+                    (item.pack_id, item.object_key, item.error_type,
+                     item.message) for item in failures
+                ], (label, result)
+        finally:
+            driver.close()
+
+
 # --- writer config validation --------------------------------------------------
 #
 # The Python config refuses at construction whatever would silently void a

@@ -27,6 +27,62 @@ std::vector<PackIdentity> PackIdentitiesFrom(
   return out;
 }
 
+// Structural equality over all six fields, which is what `ref not in
+// claimants` means on Python's side: PackRef is a frozen dataclass, so
+// `in` compares by value rather than by object.
+bool SameRef(const PackRefData& left, const PackRefData& right) {
+  return left.pack_id == right.pack_id && left.store_id == right.store_id &&
+         left.object_key == right.object_key &&
+         left.object_bytes == right.object_bytes &&
+         left.checksum == right.checksum &&
+         left.record_count == right.record_count;
+}
+
+// Python's `repr` of one string, because the conflict message quotes the
+// identity with `{identity!r}`: single quotes, flipping to double when the
+// value carries a single quote and no double one; backslash and the
+// chosen quote escaped; \n \r \t named; the remaining C0 controls and DEL
+// as \xNN. Bytes above 0x7f pass through, which is what CPython does for
+// every printable codepoint -- an unprintable non-ASCII codepoint would
+// render as itself here where CPython writes \uXXXX.
+std::string PythonRepr(const std::string& value) {
+  const char quote = (value.find('\'') != std::string::npos &&
+                      value.find('"') == std::string::npos)
+                         ? '"'
+                         : '\'';
+  static const char kHex[] = "0123456789abcdef";
+  std::string out(1, quote);
+  for (const char raw : value) {
+    const unsigned char c = static_cast<unsigned char>(raw);
+    if (raw == '\\' || raw == quote) {
+      out.push_back('\\');
+      out.push_back(raw);
+    } else if (raw == '\n') {
+      out += "\\n";
+    } else if (raw == '\r') {
+      out += "\\r";
+    } else if (raw == '\t') {
+      out += "\\t";
+    } else if (c < 0x20 || c == 0x7f) {
+      out += "\\x";
+      out.push_back(kHex[c >> 4]);
+      out.push_back(kHex[c & 0x0F]);
+    } else {
+      out.push_back(raw);
+    }
+  }
+  out.push_back(quote);
+  return out;
+}
+
+// `f"conflicting pack identity: {identity!r}"`, whose identity is Python's
+// (store_id, pack_id) tuple. The identity is what tells an operator WHICH
+// pack the claimants disagree about; the bare sentence named nothing.
+std::string ConflictMessage(const PackIdentity& identity) {
+  return "conflicting pack identity: (" + PythonRepr(identity.first) + ", " +
+         PythonRepr(identity.second) + ")";
+}
+
 // The six version-independent pack columns; commit_packs appends the
 // batch's index_version itself, the same convention as write_descriptors.
 std::vector<std::string> RenderPackRows(
@@ -82,7 +138,20 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
   // two different refs claiming one (store_id, pack_id) means at least one
   // is wrong, and raising here would abort every reconcile pass forever.
   std::map<PackIdentity, const PackRefData*> by_identity;
-  std::set<PackIdentity> conflicted;
+  // The CLAIMANTS of each conflicted identity, not just the identities:
+  // one failure per distinct claimant is what Python emits, deduped by
+  // value (`if ref not in claimants`), so a ref the batch lists twice is
+  // one claimant and one failure. Keeping identities alone and then
+  // failing every INPUT REF counted such a ref twice, in both
+  // `failed_packs` and `requested_packs`.
+  std::map<PackIdentity, std::vector<const PackRefData*>> conflicted;
+  // The order the identities first conflicted, which is the order
+  // Python's `conflicted` dict yields them. Emission order is
+  // load-bearing: IndexResult.merge truncates with
+  // `failures[:failure_limit]`, so it decides WHICH failures a rebuild
+  // reports. Failing in input order interleaved two conflicted
+  // identities instead of grouping each one's claimants together.
+  std::vector<PackIdentity> conflict_order;
   for (const PackRefData& ref : refs) {
     const PackIdentity identity{ref.store_id, ref.pack_id};
     const auto current = by_identity.find(identity);
@@ -94,7 +163,23 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
         current->second->object_bytes != ref.object_bytes ||
         current->second->checksum != ref.checksum ||
         current->second->record_count != ref.record_count) {
-      conflicted.insert(identity);
+      auto claimants = conflicted.find(identity);
+      if (claimants == conflicted.end()) {
+        // Seeded with the ref already held: it is a claimant too, and the
+        // conflict is only visible from the pair.
+        claimants =
+            conflicted
+                .emplace(identity, std::vector<const PackRefData*>{
+                                       current->second})
+                .first;
+        conflict_order.push_back(identity);
+      }
+      const bool known = std::any_of(
+          claimants->second.begin(), claimants->second.end(),
+          [&ref](const PackRefData* claimant) {
+            return SameRef(*claimant, ref);
+          });
+      if (!known) claimants->second.push_back(&ref);
     }
   }
 
@@ -102,11 +187,11 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
   for (const auto& [identity, ref] : by_identity) {
     if (!conflicted.count(identity)) unique.push_back(ref);
   }
-  for (const PackRefData& ref : refs) {
-    if (conflicted.count({ref.store_id, ref.pack_id})) {
-      result.failures.push_back({ref.pack_id, ref.object_key,
+  for (const PackIdentity& identity : conflict_order) {
+    for (const PackRefData* ref : conflicted.at(identity)) {
+      result.failures.push_back({ref->pack_id, ref->object_key,
                                  "PackConflictError",
-                                 "conflicting pack identity"});
+                                 ConflictMessage(identity)});
     }
   }
   result.requested_packs = unique.size() + result.failures.size();
