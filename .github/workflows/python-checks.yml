@@ -53,22 +53,17 @@ jobs:
         # on a dev box whose libstdc++ pulls it in transitively, and it only
         # surfaced when a later job happened to ask for the sink driver.
         #
-        # Every CPU_ONLY_GOALS target, because the set is what a developer
-        # can build without CUDA and therefore what CI can check. libcurl
-        # dev headers for the store client; the runner ships the runtime
-        # .so but not the headers.
+        # `cpu-goals` rather than a list of binaries: the set is what a
+        # developer can build without CUDA and therefore what CI can check,
+        # and the list this step used to carry went stale the moment
+        # CPU_ONLY_GOALS gained the catalog driver -- drift in the gate
+        # itself. Adding a target to CPU_ONLY_GOALS now puts it under the
+        # gate with no change here. libcurl dev headers for the store
+        # client; the runner ships the runtime .so but not the headers.
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libcurl4-openssl-dev
-          make -C native \
-            build/conformance_main \
-            build/conformance_sign \
-            build/conformance_store \
-            build/conformance_spool \
-            build/conformance_sink \
-            build/bench_builder \
-            build/bench_sink \
-            build/_dmi_native_sink \
+          make -C native cpu-goals \
             CURL_INCDIR=/usr/include/x86_64-linux-gnu \
             CURL_LIBDIR=/usr/lib/x86_64-linux-gnu
 
