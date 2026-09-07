@@ -135,7 +135,12 @@ def _decode_float8(numpy, payload: bytes, dtype: str) -> "np.ndarray":
         normal = numpy.ldexp(1.0 + mantissa / 8.0, exponent - 7)
         subnormal = numpy.ldexp(mantissa / 8.0, -6)
         value = numpy.where(exponent == 0, subnormal, normal)
-        value = numpy.where(exponent == 15, numpy.float32(numpy.nan), value)
+        # e4m3fn: exponent 15 is NaN ONLY for mantissa 7 — mantissas 0-6
+        # are the finite values 256..448 (verified against torch's
+        # float8_e4m3fn as the oracle).
+        value = numpy.where(
+            (exponent == 15) & (mantissa == 7),
+            numpy.float32(numpy.nan), value)
     else:
         exponent = (body >> 2).astype(numpy.int32)
         mantissa = (body & 0x3).astype(numpy.float32)

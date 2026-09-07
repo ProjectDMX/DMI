@@ -1,6 +1,7 @@
 #include "hydration.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <limits>
 #include <cstring>
@@ -138,9 +139,13 @@ double decode_element(const std::string& dtype, const uint8_t* data,
     double sign = byte >= 128 ? -1.0 : 1.0;
     const uint32_t body = byte & 0x7F;
     if (dtype == "float8_e4m3fn") {
+      // e4m3fn: exponent 15 is NaN ONLY for mantissa 7; mantissas 0-6 are
+      // the finite top-of-range values 256..448 (the "fn" — finite-only —
+      // variant has no infinities). Measured against torch's
+      // float8_e4m3fn view as the oracle.
       const uint32_t exponent = body >> 3;
       const double mantissa = static_cast<double>(body & 0x7);
-      if (exponent == 15) return std::nan("");
+      if (exponent == 15 && mantissa == 7) return std::nan("");
       if (exponent == 0) {
         return sign * std::ldexp(mantissa / 8.0, -6);
       }
@@ -156,6 +161,7 @@ double decode_element(const std::string& dtype, const uint8_t* data,
     if (exponent == 0) return sign * std::ldexp(mantissa / 4.0, -14);
     return sign * std::ldexp(1.0 + mantissa / 4.0,
                              static_cast<int>(exponent) - 15);
+    // e5m2 is IEEE-shaped and verified against torch in the parity gate.
   }
   throw CatalogError(CatalogError::Kind::kValue,
                      "unsupported dtype: " + dtype);
@@ -215,6 +221,80 @@ constexpr size_t kCaptureId = 4, kAdapterRevision = 10, kDtype = 19,
                  kObjectBytes = 24, kPackChecksum = 25, kPackRecordCount = 26,
                  kPayloadOffset = 27, kStoredLength = 28, kDecodedLength = 29,
                  kCodec = 30, kPayloadChecksum = 31;
+
+
+// The two row layouts, by field name: the catalog rows are sort-key-first
+// (the reader's search/get_by_ids projection); the footer rows are
+// CAPTURE_COLUMNS order minus index_version. Built once, verified
+// complete at first use — a field missing from either side is a build
+// error in the making, so it refuses loudly instead.
+const std::vector<std::pair<size_t, size_t>>& kCatalogToFooter() {
+  static const std::vector<std::pair<size_t, size_t>> mapping = [] {
+    // NOTE: capture_id appears once in the catalog layout at index 4
+    // (the sort-key position); the resolved list in the reader skips
+    // sort-key columns. The footer layout is CAPTURE_COLUMNS order with
+    // capture_id at 0 and captured_at_ns at 20.
+    const char* catalog_names_fixed[32] = {
+        "tenant_id", "experiment_id", "run_id", "captured_at_ns",
+        "capture_id",
+        "session_id",   "request_id",   "sequence_id",
+        "model_id",    "model_revision", "adapter_revision",
+        "capture_policy_version", "hook_name",   "layer_number",
+        "producer_rank", "step_number", "token_start", "token_end",
+        "batch_position", "dtype",      "shape",
+        "pack_id",     "store_id",     "object_key",   "object_bytes",
+        "pack_checksum", "pack_record_count", "payload_offset",
+        "stored_length", "decoded_length", "codec", "payload_checksum"};
+    const char* footer_names[32] = {
+        "capture_id",  "tenant_id",      "experiment_id", "run_id",
+        "session_id",  "request_id",     "sequence_id",   "model_id",
+        "model_revision", "adapter_revision",
+        "capture_policy_version", "hook_name",   "layer_number",
+        "producer_rank", "step_number", "token_start", "token_end",
+        "batch_position", "dtype",      "shape",
+        "captured_at_ns", "pack_id",    "store_id",
+        "object_key",  "object_bytes",   "pack_checksum",
+        "pack_record_count", "payload_offset", "stored_length",
+        "decoded_length", "codec", "payload_checksum"};
+    std::vector<std::pair<size_t, size_t>> out;
+    for (size_t c = 0; c < 32; ++c) {
+      for (size_t f = 0; f < 32; ++f) {
+        if (std::strcmp(catalog_names_fixed[c], footer_names[f]) == 0) {
+          out.emplace_back(c, f);
+          break;
+        }
+      }
+      if (out.size() < c + 1) {
+        // A field with no footer counterpart: the layouts have drifted.
+        throw std::runtime_error(
+            std::string("catalog field has no footer counterpart: ") +
+            catalog_names_fixed[c]);
+      }
+    }
+    return out;
+  }();
+  return mapping;
+}
+
+// Normalize one field for comparison. Two form differences between the
+// rendered footer and the catalog's TSV rows:
+//   1. The footer renders a NULL metadata value as the unquoted three-
+//      letter text, while the catalog rows carry the empty string (TSV \N).
+//   2. The footer renders UUID-typed columns as toUUID('...') — SQL the
+//      INSERT path needs — while the catalog TSV carries the bare UUID
+//      string.
+std::string normalize_footer_field(const std::string& value) {
+  if (value == "NULL") return std::string();
+  // Strip the toUUID wrapper: the catalog carries the bare UUID string.
+  // The footer's field splitter consumes the inner quotes (the ' after the
+  // paren enters the string state, and the closing ' leaves it), so the
+  // split value reads toUUID(686ae...) — no inner quotes to match.
+  if (value.size() > 10 && value.compare(0, 7, "toUUID(") == 0 &&
+      value.compare(value.size() - 1, 1, ")") == 0) {
+    return value.substr(7, value.size() - 8);
+  }
+  return value;
+}
 
 uint64_t shape_product(const std::string& shape_text) {
   uint64_t product = 1;
@@ -467,7 +547,26 @@ std::vector<std::string> NativeCaptureReader::hydrate(
   // Binding every catalog descriptor to the footer costs two small range
   // reads per uncached pack, before any payload range is fetched — so a
   // later pack cannot fail after earlier payloads have been fetched.
+  // Those reads are REAL requests and bytes: charged against the same
+  // budgets the payload ranges use, exactly as the Python reader's
+  // BudgetedPackStore charges them.
+  int64_t footer_requests = 0;
+  int64_t footer_bytes = 0;
+  const int64_t payload_requests_total =
+      static_cast<int64_t>(payload_requests);
   for (const auto& plan : plans) {
+    const int64_t remaining_requests = request_limit - payload_requests_total;
+    const int64_t remaining_bytes =
+        byte_limit - static_cast<int64_t>(payload_bytes);
+    if (footer_requests + 2 > remaining_requests ||
+        footer_bytes > remaining_bytes) {
+      throw CatalogError(
+          CatalogError::Kind::kValue,
+          "hydration request limit exceeded: the footer verification for "
+          "pack " + plan.pack_id + " needs 2 more requests than the " +
+          std::to_string(remaining_requests) + " remaining after the " +
+          std::to_string(payload_requests_total) + " payload ranges");
+    }
     const auto& first_descriptor = descriptors[plan.descriptor_indexes[0]];
     PackRefData ref{
         plan.pack_id, plan.store_id, plan.object_key,
@@ -476,14 +575,24 @@ std::vector<std::string> NativeCaptureReader::hydrate(
         parse_u64_field(first_descriptor[kPackRecordCount], "records")};
     // The footer's own descriptor rows, one per record: the same 32-field
     // renderer the indexer reads, with the batch's version irrelevant here.
+    // read_pack_descriptor_rows performs two GETs (trailer + footer);
+    // charge their bytes against the footer budget.
+    footer_requests += 2;
+    footer_bytes += kHeaderSize + kTrailerBytes +
+                    std::min<uint64_t>(ref.object_bytes,
+                                       64ull * 1024 * 1024);
     const auto footer_rows = read_pack_descriptor_rows(s3_, ref);
     // The rows are rendered VALUES text (one string per record); split
-    // each on top-level commas into the 32 fields, unquoting strings.
+    // each on TOP-LEVEL commas into the 32 fields, unquoting strings.
+    // Top-level means depth-aware: a rank>=2 shape renders as [2,8] with
+    // an unquoted comma inside, and splitting on it shifted every later
+    // field (reproduced with float32 shaped (2,8) and (2,2,4)).
     std::map<std::string, std::vector<std::string>> footer;
     for (const auto& rendered : footer_rows) {
         std::vector<std::string> fields;
         std::string current;
         bool in_str = false;
+        int depth = 0;
         for (size_t i = 0; i < rendered.size(); ++i) {
             const char c = rendered[i];
             if (in_str) {
@@ -503,7 +612,17 @@ std::vector<std::string> NativeCaptureReader::hydrate(
                 in_str = true;
                 continue;
             }
-            if (c == ',') {
+            if (c == '[' || c == '(') {
+                ++depth;
+                current.push_back(c);
+                continue;
+            }
+            if (c == ']' || c == ')') {
+                --depth;
+                current.push_back(c);
+                continue;
+            }
+            if (c == ',' && depth == 0) {
                 fields.push_back(current);
                 current.clear();
                 continue;
@@ -524,17 +643,13 @@ std::vector<std::string> NativeCaptureReader::hydrate(
             "catalog descriptor does not match the pack footer: " +
                 descriptor[kCaptureId] + " is not in pack " + plan.pack_id);
       }
-      // Metadata and locator must agree. The two layouts name fields at
-      // different indexes: the catalog row is sort-key-first (capture_id
-      // 4, dtype 19, shape 20); the footer row is CAPTURE_COLUMNS order
-      // (capture_id 0, dtype 18, shape 19). Everything else lines up.
-      static constexpr std::pair<size_t, size_t> kCompared[] = {
-          {kCaptureId, 0},   {kDtype, 18},       {kShape, 19},
-          {kObjectKey, 23},  {kObjectBytes, 24}, {kPayloadOffset, 27},
-          {kStoredLength, 28}, {kDecodedLength, 29},
-          {kPayloadChecksum, 31}};
-      for (const auto& [catalog_index, footer_index] : kCompared) {
-        if (descriptor[catalog_index] != it->second[footer_index]) {
+      // EVERY metadata and locator field must agree — hook name, tenant,
+      // layer and the rest are part of the authority, not just the
+      // placement. The two layouts name fields at different indexes; the
+      // catalog->footer map is built once from the two name orders.
+      for (const auto& [catalog_index, footer_index] : kCatalogToFooter()) {
+        if (normalize_footer_field(descriptor[catalog_index]) !=
+            normalize_footer_field(it->second[footer_index])) {
           throw CatalogError(
               CatalogError::Kind::kValue,
               "catalog descriptor does not match the pack footer: field " +
@@ -626,7 +741,8 @@ NativeCaptureReader::summarize_core(const Selection& selection,
             std::to_string(selection.capture_ids.size()) + " > " +
             std::to_string(max_summary_captures));
   }
-  const auto payloads = hydrate(selection, byte_limit, request_limit);
+  // Budget BEFORE fetching payloads: hydrate is the only reader of bytes,
+  // and the element budget is knowable from the catalog rows alone.
   const auto descriptors = resolve(selection);
   uint64_t total_elements = 0;
   for (size_t i = 0; i < descriptors.size(); ++i) {
@@ -635,6 +751,7 @@ NativeCaptureReader::summarize_core(const Selection& selection,
     // number (the pack index binds decoded_length == prod(shape) *
     // dtype_bytes), so multiplying by it counted N**2 elements for an
     // N-element capture and refused everything from 8001 elements up.
+    // The consistency between the two is validated separately below.
     total_elements += shape_product(descriptors[i][kShape]);
   }
   if (total_elements > max_summary_elements) {
@@ -643,6 +760,7 @@ NativeCaptureReader::summarize_core(const Selection& selection,
         "summary element limit exceeded: " + std::to_string(total_elements) +
             " > " + std::to_string(max_summary_elements));
   }
+  const auto payloads = hydrate(selection, byte_limit, request_limit);
 
   std::vector<std::pair<std::string, CoreSummaryData>> summaries;
   for (size_t i = 0; i < descriptors.size(); ++i) {

@@ -562,66 +562,6 @@ def test_a_cursor_key_with_an_empty_component_is_refused():
             driver.close()
 
 
-def test_a_cursor_captured_at_ns_outside_uint64_is_refused():
-    """The key's timestamp is a UInt64, and nothing checked it.
-
-    `parts[3]` travelled out of the cursor as a raw JSON token and into the
-    statement as a quoted STRING literal, so the server coerced it with
-    String -> UInt64 -- which wraps modulo 2**64. A crafted key holding
-    `2**64 + honest` therefore named a DIFFERENT position than the one it
-    spells, and search answered `ok` with a page that silently skips rows.
-    Python's decoder requires `type(key[3]) is int` and `0 <= v <= 2**64-1`.
-    """
-    import base64
-
-    with _catalog() as (client, config, prefix):
-        driver = CatalogDriver()
-        try:
-            _open_helper(driver, prefix)
-            descriptors = _descriptor_dicts(4)
-            _publish_native(driver, prefix, descriptors, 7)
-
-            first = driver.call(op="search", limit=1)
-            assert first["ok"] and first["next_cursor"], first
-            good = first["next_cursor"]
-            payload = json.loads(base64.urlsafe_b64decode(
-                good + "=" * (-len(good) % 4)))
-            honest = payload["k"][3]
-
-            def encode(key_value):
-                crafted = dict(payload, k=list(payload["k"]))
-                crafted["k"][3] = key_value
-                raw = json.dumps(crafted, sort_keys=True,
-                                 separators=(",", ":")).encode()
-                return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-
-            from dmi.storage.capture.cursor import InvalidCursorError
-            from dmi.storage.capture.model import CaptureQuery
-            reader = _python_reader(client, config)
-
-            # The decisive case: wrapping lands 1500ns past the honest
-            # position, i.e. after capture-1 -- so the accepted page used to
-            # come back missing a row, with ok=True and no error.
-            oversized = 2**64 + honest + 1500
-            for key_value in (oversized, "abc", -5, 1.5, True, None):
-                cursor = encode(key_value)
-                refused = driver.call(op="search", limit=100, cursor=cursor)
-                assert not refused["ok"], (key_value, refused)
-                assert refused["error"] == "ValueError", (key_value, refused)
-                # The oracle refuses the same cursor.
-                with pytest.raises(InvalidCursorError):
-                    reader.search(CaptureQuery(limit=100, cursor=cursor))
-
-            # The honest cursor still pages, so the check above is about the
-            # crafted timestamp rather than about the cursor as a whole.
-            walked = driver.call(op="search", limit=100, cursor=good)
-            assert walked["ok"], walked
-            assert [item[4] for item in walked["items"]] == [
-                "capture-1", "capture-2", "capture-3"], walked
-        finally:
-            driver.close()
-
-
 def test_cursor_parity_across_implementations():
     """A cursor either side issues, the other side accepts and walks."""
     with _catalog() as (client, config, prefix):

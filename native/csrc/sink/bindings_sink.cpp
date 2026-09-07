@@ -39,19 +39,28 @@ ring::PayloadSlice ParseSlice(const py::dict& row) {
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  // Both ring types are registered module-locally: the main _native_backend
+  // extension (bindings.cpp) registers them under different Python names in
+  // its own module, and pybind11's per-module type registry must not collide
+  // on the same C++ typeid. The Python engine imports BOTH extensions in
+  // every real runtime, so the isinstance check against the main module's
+  // RecordSink still resolves through the C++ inheritance chain.
   py::class_<ring::RecordSinkLease, std::shared_ptr<ring::RecordSinkLease>>(
-      m, "RecordSinkLease");
+      m, "RecordSinkLease", py::module_local());
+  py::class_<ring::RecordSink, std::shared_ptr<ring::RecordSink>>(
+      m, "RecordSink", py::module_local());
 
-  py::class_<dmi_sink::NativePackSink,
+  py::class_<dmi_sink::NativePackSink, ring::RecordSink,
              std::shared_ptr<dmi_sink::NativePackSink>>(
       m, "NativePackSink")
       .def(py::init([](const std::string& spool_root,
                        const std::string& layout, int num_workers,
                        uint64_t max_queue_records, uint64_t max_queue_bytes,
                        uint64_t max_pack_bytes, uint64_t max_pack_records,
-                       uint64_t max_linger_ns) {
+                       uint64_t max_linger_ns, uint64_t spool_max_bytes) {
              dmi_sink::SinkConfig config;
              config.spool_root = spool_root;
+             config.spool_max_bytes = spool_max_bytes;
              config.num_workers = num_workers;
              config.max_queue_records = max_queue_records;
              config.max_queue_bytes = max_queue_bytes;
@@ -68,7 +77,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("max_queue_bytes") = 16 * 1024 * 1024,
            py::arg("max_pack_bytes") = 128ull * 1024 * 1024,
            py::arg("max_pack_records") = 10'000,
-           py::arg("max_linger_ns") = 1'000'000'000)
+           py::arg("max_linger_ns") = 1'000'000'000,
+           py::arg("spool_max_bytes") = 1ull << 40)
       .def("attach",
            [](std::shared_ptr<dmi_sink::NativePackSink> self) {
              // Simulates engine ownership for tests (the real engine takes

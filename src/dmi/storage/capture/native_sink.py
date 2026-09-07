@@ -84,6 +84,7 @@ class NativePackSinkHandle:
             max_pack_bytes=config.max_pack_bytes,
             max_pack_records=config.max_pack_records,
             max_linger_ns=config.max_linger_ns,
+            spool_max_bytes=config.spool_max_bytes,
         )
         # Engine ownership is taken by create_record_runtime; holding no
         # lease here keeps the handle closable without an engine.
