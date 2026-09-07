@@ -17,22 +17,17 @@ import pytest
 
 from benchmarks.bench_capture_catalog import synthetic_descriptors
 from dmi.storage.capture import ClickHouseCatalogConfig, ClickHouseCatalogWriter
-from dmi.storage.capture.clickhouse_catalog import _CAPTURE_COLUMNS, _FACET_COLUMNS
+from dmi.storage.capture.clickhouse_schema import CAPTURE_COLUMNS as _CAPTURE_COLUMNS, FACET_COLUMNS as _FACET_COLUMNS
 
 
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
 
 
-def _publish(writer, index_version: int, *, rows: int = 0, packs: int = 0) -> None:
-    """Publishing is a separate step; CatalogIndexer does it, direct writes must."""
-    writer.publish_watermark(
-        index_version=index_version,
-        published_at_ns=index_version,
-        indexed_rows=rows,
-        indexed_packs=packs,
-    )
-
-
+# This suite never publishes, deliberately: the facet columns are MATERIALIZED
+# on the RAW descriptor table and are asserted there, so nothing here needs a
+# snapshot to be visible -- or the publisher lease a publish would require,
+# which is why the fixture does not acquire one. A test that needs published
+# rows belongs in test_clickhouse_reader_live.py, whose fixture holds a lease.
 @contextmanager
 def _writer():
     clickhouse_driver = pytest.importorskip("clickhouse_driver")
@@ -45,20 +40,15 @@ def _writer():
         database=environ.get("DMI_CLICKHOUSE_DATABASE", "default"),
         table_prefix=prefix,
     )
+    # Constructed BEFORE the try, so a construction failure surfaces as itself
+    # rather than as an UnboundLocalError raised by the teardown below.
+    writer = ClickHouseCatalogWriter(client, config)
     try:
-        yield ClickHouseCatalogWriter(client, config), client, config
+        yield writer, client, config
     finally:
-        database = config.database
-        for kind, suffix in (
-            ("VIEW", "capture"),
-            ("VIEW", "pack_inventory"),
-            ("TABLE", "capture_raw"),
-            ("TABLE", "pack_inventory_raw"),
-            ("TABLE", "capture_version_claims"),
-            ("TABLE", "index_watermark"),
-            ("TABLE", "pack_commit_log"),
-        ):
-            client.execute(f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`")
+        # The writer owns the object list, in drop order; hand-copied lists
+        # here drifted from it and leaked tables.
+        writer.drop_schema()
 
 
 def _facet_rows(client, config, prefix_table: str):
@@ -121,29 +111,34 @@ def test_facets_are_computed_from_the_descriptor():
             )
 
 
-def test_upgrade_adds_facets_to_a_table_created_without_them():
-    """The pre-facet Phase 4 schema must upgrade in place, rows intact."""
+def test_a_descriptor_table_missing_its_facets_is_repaired_in_place():
+    """Facet columns are added back to a populated table, rows intact.
+
+    This used to hand-build the pre-facet Phase 4 table -- old sort key, no
+    facet columns -- and prove ensure_schema upgraded it. That table is a
+    version 1 catalog, and this build now refuses those outright rather than
+    altering them, because the sort key it also carries cannot be altered at
+    all (see tests/test_clickhouse_schema_migration_live.py). So the missing
+    columns are produced by dropping them from a catalog this build created,
+    which reaches the same `ADD COLUMN IF NOT EXISTS` with the same question:
+    do rows written before the ALTER still resolve correct facet values?
+    """
     descriptors = synthetic_descriptors(4)
     with _writer() as (writer, client, config):
         table = f"`{config.database}`.`{config.table_prefix}_capture_raw`"
-        client.execute(f"CREATE DATABASE IF NOT EXISTS `{config.database}`")
-        # Exactly the Phase 4 table: every written column, no facets.
-        client.execute(
-            f"""CREATE TABLE {table} (
-capture_id String, tenant_id String, experiment_id String, run_id String,
-session_id String, request_id String, sequence_id String, model_id String,
-model_revision String, adapter_revision Nullable(String),
-capture_policy_version String, hook_name LowCardinality(String), layer_number Int32,
-producer_rank UInt32, step_number UInt64, token_start UInt64, token_end UInt64,
-batch_position UInt32, dtype LowCardinality(String), shape Array(UInt32),
-captured_at_ns UInt64, pack_id UUID, store_id LowCardinality(String), object_key String,
-object_bytes UInt64, pack_checksum FixedString(64), pack_record_count UInt32,
-payload_offset UInt64, stored_length UInt64, decoded_length UInt64,
-codec LowCardinality(String), payload_checksum FixedString(8), index_version UInt64
-) ENGINE = ReplacingMergeTree(index_version)
-ORDER BY (tenant_id, experiment_id, run_id, captured_at_ns, capture_id)"""
-        )
+        writer.ensure_schema()
         writer.write_descriptors(descriptors, index_version=1)
+        for name, _, _ in _FACET_COLUMNS:
+            client.execute(f"ALTER TABLE {table} DROP COLUMN {name}")
+        columns = {
+            row[0]
+            for row in client.execute(
+                "SELECT name FROM system.columns "
+                "WHERE database = %(db)s AND table = %(table)s",
+                {"db": config.database, "table": f"{config.table_prefix}_capture_raw"},
+            )
+        }
+        assert columns.isdisjoint({name for name, _, _ in _FACET_COLUMNS})
 
         # Rows exist and predate the facet columns entirely.
         writer.ensure_schema()

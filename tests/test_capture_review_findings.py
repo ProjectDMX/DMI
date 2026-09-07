@@ -7,12 +7,14 @@ outside a boundary the tests already exercised.
 
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 from urllib.parse import quote
 from uuid import UUID
 
 import pytest
 
+from tests._catalog_fakes import FakeLeaseTable
 from tests._faults import FaultInjected, FaultyClickHouseClient, fail_on
 
 from dmi.storage.capture import (
@@ -26,6 +28,8 @@ from dmi.storage.capture import (
     ClickHouseCatalogWriter,
     DirectPackSink,
     FilesystemPackStore,
+    PackIndex,
+    PackIntegrityError,
     HostCapturePipeline,
     PackRef,
     PackWriter,
@@ -110,9 +114,12 @@ def test_every_character_key_encoding_passes_through_is_accepted(character: str)
     """
     metadata = _metadata(tenant_id=f"acme{character}lab")
 
-    from dmi.storage.capture.pipeline import _key_component
+    # The encoder moved to `pack`, which is where the verifier that has to
+    # agree with it lives: `_descriptors` compares a pack's footer against
+    # the key it was found under.
+    from dmi.storage.capture.pack import key_component
 
-    encoded = _key_component(metadata.tenant_id)
+    encoded = key_component(metadata.tenant_id)
     validate_object_key(f"tenant={encoded}/x.dmi-pack")
 
 
@@ -156,16 +163,61 @@ def test_an_identifier_needing_no_escape_still_yields_a_usable_key(tmp_path: Pat
 class _Client:
     def __init__(self):
         self.statements: list[str] = []
-        self.published: list[tuple[str, list]] = []
+        self.published: list[tuple[str, object]] = []
         self.claims: list[tuple[int, str]] = []
+        self.watermarks: list[int] = []
+        self.publishes: list[tuple[int, str]] = []
+        self.manifest: list[tuple[int, str, str, str]] = []
+        self.lease = FakeLeaseTable()
 
     def execute(self, query, params=None, **kwargs):
         self.statements.append(query)
+        leased = self.lease.execute(query, params)
+        if leased is not None:
+            return leased
         if query.lstrip().upper().startswith("INSERT"):
-            self.published.append((query, list(params or [])))
+            self.published.append((query, params))
             if "version_claims" in query:
                 self.claims.extend((row[0], str(row[1])) for row in params)
+            elif "snapshot_manifest" in query:
+                if self.lease.fence_admits(query, params):
+                    self.manifest.extend(
+                        (
+                            params["index_version"],
+                            params["publish_id"],
+                            store_id,
+                            pack_id,
+                        )
+                        for store_id, pack_id in params["members"]
+                    )
+            elif "index_watermark" in query:
+                version = params["index_version"]
+                # The fence check runs UNCONDITIONALLY: short-circuited behind
+                # the barrier, a statement missing the fence would slip by
+                # whenever the barrier already refused it.
+                fenced = self.lease.fence_admits(query, params)
+                if fenced and version > max(self.watermarks, default=0):
+                    self.watermarks.append(version)
+                    self.publishes.append((version, params["publish_id"]))
             return []
+        if "publish_id" in query and "index_watermark" in query:
+            return [
+                (publish_id,)
+                for version, publish_id in self.publishes
+                if version == params["version"]
+            ]
+        if "snapshot_manifest" in query and "SELECT count()" in query:
+            # The chunk read-back names its members; the whole-publish check
+            # after the watermark lands does not.
+            wanted = set(params["members"]) if "members" in params else None
+            found = {
+                (store_id, pack_id)
+                for version, publish_id, store_id, pack_id in self.manifest
+                if version == params["index_version"]
+                and publish_id == params["publish_id"]
+                and (wanted is None or (store_id, pack_id) in wanted)
+            }
+            return [(len(found),)]
         # The version allocator's three queries need real state to answer.
         if "version_claims" in query:
             if "max(version)" in query:
@@ -173,44 +225,58 @@ class _Client:
             wanted = params["version"]
             return [(cid,) for v, cid in self.claims if v == wanted]
         if "index_watermark" in query:
-            versions = [
-                p[0][0] for q, p in self.published if "index_watermark" in q
-            ]
-            return [(max(versions, default=None),)]
+            return [(max(self.watermarks, default=None),)]
         return []
 
 
-def test_a_pack_is_never_both_skipped_on_replay_and_invisible_to_readers():
-    """The durability window between the two commit writes.
+def test_a_pack_is_never_both_skipped_on_replay_and_invisible_to_readers(
+    tmp_path: Path,
+):
+    """The durability window between publishing and recording the replay guard.
 
     `committed_pack_ids` reads the inventory to skip replays; readers bound the
-    snapshot by the commit log. If the inventory is written first and the
-    process dies before the log, the pack is skipped forever *and* never
-    visible -- silent, permanent data loss. Writing the log first makes the
-    same crash merely redundant work.
+    snapshot by the manifest a publish writes. If the inventory landed first
+    and the process died before the publish, the pack would be skipped forever
+    *and* never visible -- silent, permanent data loss. Publishing first makes
+    the same crash merely redundant work, which this proves by crashing there
+    and then running the next pass.
     """
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    ref = store.put(_sealed(_record(_metadata())), "packs/a.dmi-pack")
+
     backing = _Client()
-    # Fail the second of the two INSERTs that commit_packs performs.
-    client = FaultyClickHouseClient(backing, insert=fail_on(2))
+    # index() inserts: version claim, descriptors, lease renewal, manifest,
+    # another renewal, watermark, then the inventory. Fail the last one -- the
+    # crash this ordering exists for. The lease claim below is insert 1.
+    client = FaultyClickHouseClient(backing, insert=fail_on(8))
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
-    ref = PackRef(
-        pack_id=str(PACK_ID),
-        store_id="local",
-        object_key="packs/a.dmi-pack",
-        object_bytes=1024,
-        checksum="0" * 64,
-        record_count=1,
-    )
+    writer.acquire_publisher_lease("indexer-a")
 
     with pytest.raises(FaultInjected):
-        writer.commit_packs([ref], index_version=1)
+        CatalogIndexer(store, writer, clock_ns=lambda: 7).index([ref])
 
     written = [s for s in backing.statements if s.startswith("INSERT")]
-    assert len(written) == 1, "expected exactly one of the two writes to land"
-    assert "pack_commit_log" in written[0], (
-        "the surviving write was the inventory, so this pack is now skipped on "
-        "replay and invisible to readers; the commit log must be written first"
+    assert any("snapshot_manifest" in s for s in written), (
+        "the pack was never made a member of a snapshot"
     )
+    assert any("index_watermark" in s for s in written), (
+        "the version was never published, so the descriptors are invisible"
+    )
+    assert not any("pack_inventory_raw" in s for s in written), (
+        "the inventory landed despite the injected failure"
+    )
+
+    # The next pass sees no inventory row, so it re-indexes rather than
+    # skipping a pack it never made visible. It is a different publisher, so it
+    # waits out the crashed one's lease -- reached here by moving the fake
+    # server clock rather than by sleeping.
+    healthy = ClickHouseCatalogWriter(backing, ClickHouseCatalogConfig())
+    backing.lease.now_ns += ClickHouseCatalogConfig().lease_ttl_ns + 1
+    healthy.acquire_publisher_lease("indexer-b")
+    result = CatalogIndexer(store, healthy, clock_ns=lambda: 8).index([ref])
+
+    assert result.indexed_packs == 1, "the crashed pack was skipped on replay"
+    assert result.skipped_packs == 0
 
 
 # --- indexer robustness ------------------------------------------------------
@@ -255,8 +321,9 @@ def test_one_foreign_object_in_the_bucket_does_not_abort_reconciliation(
     store = FilesystemPackStore(tmp_path, store_id="local")
     good = store.put(_sealed(_record(_metadata())), "packs/good.dmi-pack")
     inventory = _Inventory(store, [good], bad_key="packs/README.txt")
-    indexer = CatalogIndexer(inventory, ClickHouseCatalogWriter(_Client(),
-                                                                ClickHouseCatalogConfig()),
+    writer = ClickHouseCatalogWriter(_Client(), ClickHouseCatalogConfig())
+    writer.acquire_publisher_lease("indexer-a")
+    indexer = CatalogIndexer(inventory, writer,
                              config=CatalogIndexerConfig(max_packs=8),
                              clock_ns=lambda: 7)
     reconciler = CatalogReconciler(inventory, indexer)
@@ -294,6 +361,7 @@ def test_a_clock_that_steps_backwards_cannot_publish_under_a_pinned_watermark(
 
     client = _Client()
     writer = ClickHouseCatalogWriter(client, ClickHouseCatalogConfig())
+    writer.acquire_publisher_lease("indexer-a")
     clock = iter([2_000, 1_000])  # second batch stamped *earlier*
     indexer = CatalogIndexer(store, writer, clock_ns=lambda: next(clock))
 
@@ -304,10 +372,288 @@ def test_a_clock_that_steps_backwards_cannot_publish_under_a_pinned_watermark(
     # clock correction -- but the second must not reuse or undercut a version a
     # reader may already have pinned.
     assert first_result.indexed_packs == 1 and second_result.indexed_packs == 1
-    published = [
-        params[0][0]
-        for query, params in client.published
-        if "index_watermark" in query
-    ]
+    published = client.watermarks
     assert published == sorted(published), f"versions went backwards: {published}"
     assert len(set(published)) == len(published), "a version was reused"
+
+
+# --- a pack's footer is not evidence of whose it is -------------------------
+
+
+def _pack_at(tmp_path: Path, object_key: str, *, tenant_id: str):
+    """Put a pack for ``tenant_id`` at ``object_key``, whoever that key belongs to."""
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed(_record(_metadata(tenant_id=tenant_id)))
+    return store, store.put(sealed, object_key)
+
+
+def test_a_pack_whose_footer_names_another_tenant_is_refused(tmp_path: Path):
+    """The forgery the object store cannot prevent, refused where it is visible.
+
+    Anyone able to PUT into the bucket can write a well-formed pack whose
+    footer carries another tenant's `tenant_id` and `capture_id`. Integrity
+    proves nothing about it -- the pack is perfectly well formed -- and until
+    the descriptors are built, nothing has ever compared what the pack CLAIMS
+    to be against where it was found. Indexed, it would be admitted under the
+    victim's tenant, and since the reader resolves a capture with `argMax` over
+    `(index_version, store_id, pack_id)` it can become the pack that capture
+    resolves to at every fresh watermark.
+    """
+    store, ref = _pack_at(
+        tmp_path,
+        "v1/tenant=victim/date=2026-09-01/session=s/rank=0/"
+        f"{PACK_ID}.dmi-pack",
+        tenant_id="attacker",
+    )
+
+    with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+        PackIndex.from_store(store, ref).descriptors()
+
+
+def test_a_pack_under_its_own_tenants_prefix_is_accepted(tmp_path: Path):
+    """The other side: the check must not refuse the ordinary case."""
+    store, ref = _pack_at(
+        tmp_path,
+        "v1/tenant=tenant-a/date=2026-09-01/session=s/rank=0/"
+        f"{PACK_ID}.dmi-pack",
+        tenant_id="tenant-a",
+    )
+
+    descriptors = PackIndex.from_store(store, ref).descriptors()
+
+    assert [item.metadata.tenant_id for item in descriptors] == ["tenant-a"]
+
+
+def test_a_pack_mixing_two_tenants_is_refused_on_the_one_that_does_not_match(
+    tmp_path: Path,
+):
+    """A pack is checked per tenant present, not per pack.
+
+    Nothing about a pack read back OUT of a bucket guarantees it holds one
+    tenant -- that is the writer's convention, and a forger is under no
+    obligation to follow it. So the comparison cannot be lifted to a single
+    tenant read off the first record: a pack whose first record matches the
+    key and whose second carries the victim's `tenant_id` would then be
+    admitted whole, which is the forgery this refuses with extra steps.
+    """
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _sealed(
+        _record(_metadata(tenant_id="tenant-a")),
+        _record(_metadata(tenant_id="attacker", capture_id="capture-b")),
+    )
+    ref = store.put(
+        sealed,
+        "v1/tenant=tenant-a/date=2026-09-01/session=s/rank=0/"
+        f"{PACK_ID}.dmi-pack",
+    )
+
+    with pytest.raises(PackIntegrityError, match="tenant 'attacker'"):
+        PackIndex.from_store(store, ref).descriptors()
+
+
+def test_a_tenant_too_long_for_a_key_segment_still_binds(tmp_path: Path):
+    """`key_component` digests an identifier too long for a segment.
+
+    That encoding is one-way, so a comparison that only knew how to unquote
+    would silently stop checking exactly the tenants whose names are least
+    guessable. The verifier re-encodes instead.
+    """
+    from dmi.storage.capture.pack import key_component
+
+    tenant = "t" * 300
+    encoded = key_component(tenant)
+    assert encoded.startswith("sha256-")
+
+    store, ref = _pack_at(
+        tmp_path,
+        f"v1/tenant={encoded}/date=2026-09-01/session=s/rank=0/{PACK_ID}.dmi-pack",
+        tenant_id=tenant,
+    )
+    assert PackIndex.from_store(store, ref).descriptors()
+
+    other, forged = _pack_at(
+        tmp_path / "other",
+        f"v1/tenant={encoded}/date=2026-09-01/session=s/rank=0/{PACK_ID}.dmi-pack",
+        tenant_id="somebody-else",
+    )
+    with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+        PackIndex.from_store(other, forged).descriptors()
+
+
+def test_engine_arguments_are_read_off_the_shape_the_server_renders():
+    """`engine_full` is the whole engine CLAUSE, not just the engine call.
+
+    The first version of this parser read to the LAST `)`, which is correct for
+    `ReplacingMergeTree(index_version)` and wrong for what a server actually
+    returns -- the arguments, then `ORDER BY (...)`, then `SETTINGS ...`. It
+    swept ORDER BY's own parenthesis into the argument list and so refused every
+    healthy catalog. The CPU fake had been answering the bare call, so nothing
+    here caught it and the live suite went red instead.
+
+    These are the shapes ClickHouse 25.12 renders, pinned so the parser is
+    tested against real text rather than against the fake's convenience.
+    """
+    from dmi.storage.capture.clickhouse_schema import _engine_arguments
+
+    rendered = (
+        "ReplacingMergeTree(index_version) ORDER BY (tenant_id, experiment_id, "
+        "run_id, captured_at_ns, capture_id, store_id, pack_id) "
+        "SETTINGS index_granularity = 8192"
+    )
+    assert _engine_arguments(rendered) == ("ReplacingMergeTree", ("index_version",))
+    # The bare call agrees with the rendered clause, so both are accepted.
+    assert _engine_arguments("ReplacingMergeTree(index_version)") == (
+        "ReplacingMergeTree",
+        ("index_version",),
+    )
+    # A dropped argument is what the check exists to catch, ORDER BY and all.
+    assert _engine_arguments(
+        "ReplacingMergeTree() ORDER BY (a, b) SETTINGS index_granularity = 8192"
+    ) == ("ReplacingMergeTree", ())
+    # An engine with no argument list at all parses rather than raising.
+    assert _engine_arguments("View") == ("View", ())
+
+
+def test_a_legacy_pack_for_a_sha256_prefixed_tenant_is_still_readable(
+    tmp_path: Path,
+):
+    """Reserving the digest prefix must not orphan data written before it.
+
+    `main` encoded any short identifier literally, so a tenant named
+    `sha256-team-a` wrote every pack under `tenant=sha256-team-a`. Reserving
+    the prefix makes `key_component` digest that name now -- and the location
+    check compares re-encoded values, so every one of those existing packs
+    failed `_reject_a_foreign_tenant` at indexing AND at hydration
+    (reader.py calls `PackIndex.from_store(...).descriptors()`): captures
+    already in the catalog became unreadable.
+
+    The check now also accepts the pre-reservation literal, but ONLY when the
+    identifier is not itself of the digest shape `sha256-<64 hex>`: that exact
+    shape is the collision the reservation closed, and accepting its literal
+    would reopen the forgery. A realistic legacy name like `sha256-team-a`
+    keeps its data; the pathological one never legitimately existed.
+    """
+    from dmi.storage.capture.pack import key_component
+
+    # Old layout: literal segment, as main wrote it.
+    store, ref = _pack_at(
+        tmp_path,
+        f"v1/tenant=sha256-team-a/date=2026-09-01/session=s/rank=0/{PACK_ID}.dmi-pack",
+        tenant_id="sha256-team-a",
+    )
+    assert PackIndex.from_store(store, ref).descriptors()
+
+    # New layout: the digest segment key_component now produces.
+    store2, ref2 = _pack_at(
+        tmp_path / "new",
+        f"v1/tenant={key_component('sha256-team-a')}/date=2026-09-01/session=s/"
+        f"rank=0/{PACK_ID}.dmi-pack",
+        tenant_id="sha256-team-a",
+    )
+    assert PackIndex.from_store(store2, ref2).descriptors()
+
+    # The forgery stays closed: a literal of digest shape is NOT grandfathered.
+    long_id = "t" * 300
+    literal = "sha256-" + sha256(long_id.encode()).hexdigest()
+    store3, ref3 = _pack_at(
+        tmp_path / "forged",
+        f"v1/tenant={literal}/date=2026-09-01/session=s/rank=0/{PACK_ID}.dmi-pack",
+        tenant_id=literal,
+    )
+    with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+        PackIndex.from_store(store3, ref3).descriptors()
+
+
+def test_the_two_key_component_forms_cannot_collide(tmp_path: Path):
+    """The direct and digest forms shared a namespace, so two ids named one key.
+
+    `key_component` passed an identifier through directly when it was short
+    enough and digested it as `sha256-<hex>` when it was not. Nothing stopped a
+    SHORT identifier from already reading as `sha256-<hex>` -- 71 bytes, well
+    inside the metadata limit -- and encoding directly to exactly the segment
+    some long identifier digests to. Both then named the same `tenant=`
+    segment, and `_reject_a_foreign_tenant` compares re-encoded values, so it
+    could not tell them apart: a pack for one was accepted under the other's
+    key, which is the forgery that check exists to refuse.
+
+    The prefix is now reserved -- anything that already looks like a digest is
+    digested -- so the forms are disjoint. Only identifiers literally beginning
+    with `sha256-` encode differently than before; the v1 layout is untouched
+    for everything else, which the last assertion pins.
+    """
+    from dmi.storage.capture.pack import key_component
+
+    long_id = "t" * 300
+    literal_id = "sha256-" + sha256(long_id.encode()).hexdigest()
+    assert len(literal_id) == 71
+
+    assert key_component(long_id) != key_component(literal_id)
+    # Both still land in the digest namespace, so neither is mistaken for a
+    # literal segment either.
+    assert key_component(long_id).startswith("sha256-")
+    assert key_component(literal_id).startswith("sha256-")
+    # And an ordinary identifier is encoded exactly as before.
+    assert key_component("tenant-a") == "tenant-a"
+
+
+def test_a_pack_under_a_colliding_digest_segment_is_refused(tmp_path: Path):
+    """The end of the same attack: the pack itself, not just the encoding."""
+    from dmi.storage.capture.pack import key_component
+
+    long_id = "t" * 300
+    literal_id = "sha256-" + sha256(long_id.encode()).hexdigest()
+    store, ref = _pack_at(
+        tmp_path,
+        f"v1/tenant={key_component(long_id)}/date=2026-09-01/session=s/rank=0/"
+        f"{PACK_ID}.dmi-pack",
+        tenant_id=literal_id,
+    )
+
+    with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+        PackIndex.from_store(store, ref).descriptors()
+
+
+def test_consistent_snapshot_reads_requires_a_real_boolean():
+    """`'false'` is truthy, so a truthiness test would turn the setting ON.
+
+    The flag decides whether a bounded read carries sequential consistency.
+    Read out of a config file or an environment variable it arrives as a
+    string, and every non-empty string is truthy -- so the value that most
+    plainly means "off" enabled it, visible only as latency on a replicated
+    deployment.
+    """
+    from dmi.storage.capture import ClickHouseReaderConfig
+
+    assert ClickHouseReaderConfig(consistent_snapshot_reads=False)
+    for value in ("false", "0", 0, 1, None):
+        with pytest.raises(ValueError, match="consistent_snapshot_reads"):
+            ClickHouseReaderConfig(consistent_snapshot_reads=value)
+
+
+def test_the_pre_rename_summary_type_is_still_importable():
+    """`CoreTensorSummaryV1` was exported through 1.2.0 and still is.
+
+    The serialized summary schema went from 1 to 2 on this branch, which is a
+    change to the STORED format rather than to the Python type. Dropping the
+    old name broke every existing `from dmi.storage.capture import
+    CoreTensorSummaryV1` while `pyproject.toml` still read 1.2.0 -- an
+    accidental breaking change. The alias makes the decision explicit and
+    pins it, so removing the name later has to be deliberate.
+    """
+    from dmi.storage.capture import CoreTensorSummary, CoreTensorSummaryV1
+    from dmi.storage.capture import summary as summary_module
+
+    assert CoreTensorSummaryV1 is CoreTensorSummary
+    assert "CoreTensorSummaryV1" in summary_module.__dict__
+    # The suffix names history; the schema version is its own constant.
+    assert summary_module.CORE_SUMMARY_VERSION == 2
+
+
+def test_a_key_that_names_no_tenant_is_left_alone(tmp_path: Path):
+    """A filesystem store, a fixture and a hand-placed object are all
+    legitimately laid out some other way, and a check that guessed at those
+    would refuse every one of them. What is enforced is that a key which DOES
+    name a tenant names the pack's own."""
+    store, ref = _pack_at(tmp_path, "packs/a.dmi-pack", tenant_id="tenant-a")
+
+    assert PackIndex.from_store(store, ref).descriptors()

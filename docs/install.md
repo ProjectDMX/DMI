@@ -49,6 +49,28 @@ cd DMI
 git submodule update --init --recursive
 ```
 
+`.gitmodules` pins HTTPS URLs deliberately: it is the read path every user and
+every piece of automation inherits, and an HTTPS clone of these repositories
+needs no key setup. To use SSH instead, rewrite the remotes on your own machine
+rather than editing `.gitmodules` -- the rewrite applies to the superproject and
+every submodule, including nested ones, and survives a re-clone:
+
+```bash
+git config --global url."git@github.com:".insteadOf https://github.com/
+```
+
+That config needs no follow-up in an existing checkout. Git applies an
+`insteadOf` rewrite when it RESOLVES a stored URL, so it takes effect
+immediately -- `git -c 'url.git@github.com:.insteadOf=https://github.com/'
+remote get-url origin` prints the SSH form against an origin stored as HTTPS.
+
+`git submodule sync --recursive` is for the other case only: when the URLs in
+`.gitmodules` themselves change. There it is needed, because `.git/config` and
+`.git/modules/*/config` keep whatever URL they were cloned with and a plain
+`git pull` will not adopt the new one. Do not run it just to pick up an
+`insteadOf` setting -- it would overwrite any submodule URL you had set
+deliberately in your own checkout, to no purpose.
+
 Expected submodule paths:
 
 - `third_party/transformers/` — modified HF Transformers (`gpt2_p`, `qwen3_p`, `llama_p`)
@@ -58,7 +80,13 @@ Expected submodule paths:
 
 ## 2. Install ClickHouse server
 
-DMI writes captured tensors into a ClickHouse table. Follow the
+DMI writes captured tensors into a ClickHouse table. **ClickHouse 24.11 or
+later is required**: the catalog's schema check asks `CHECK GRANT SHOW TABLES`
+about each object before it reaches a verdict, and that statement arrived in
+24.11. `system.tables` is grant-filtered per role, so without the probe an
+object this role cannot see is indistinguishable from one that was dropped,
+and there is nothing safe to fall back to. The suites and the published
+measurements run against 25.12. Follow the
 [ClickHouse installation guide](https://clickhouse.com/docs/install) for your
 platform.
 

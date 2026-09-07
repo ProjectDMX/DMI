@@ -28,24 +28,34 @@ from dmi.storage.capture import (
 pytestmark = [pytest.mark.manual, pytest.mark.clickhouse]
 
 
-def _commit(writer, descriptors, index_version: int) -> None:
-    """Snapshots are bounded by committed packs, so a direct write must commit."""
+def _refs(descriptors):
+    """The distinct packs a set of descriptors lives in."""
     seen, refs = set(), []
     for item in descriptors:
         ref = item.locator.pack_ref
         if (ref.store_id, ref.pack_id) not in seen:
             seen.add((ref.store_id, ref.pack_id))
             refs.append(ref)
-    writer.commit_packs(refs, index_version=index_version)
+    return refs
 
 
-def _publish(writer, index_version: int, *, rows: int = 0, packs: int = 0) -> None:
-    """Publishing is a separate step; CatalogIndexer does it, direct writes must."""
-    writer.publish_watermark(
+def _commit(writer, descriptors, index_version: int) -> None:
+    """Record the replay guard; visibility comes from _publish, not from here."""
+    writer.commit_packs(_refs(descriptors), index_version=index_version)
+
+
+def _publish(writer, index_version: int, *, refs=(), rows: int = 0) -> None:
+    """Publishing is a separate step; CatalogIndexer does it, direct writes must.
+
+    Membership rides on the publish now, so `refs` is what makes those packs
+    visible; commit_packs only records the replay guard.
+    """
+    writer.publish_snapshot(
         index_version=index_version,
+        refs=list(refs),
         published_at_ns=index_version,
         indexed_rows=rows,
-        indexed_packs=packs,
+        indexed_packs=len(refs),
     )
 
 
@@ -67,24 +77,20 @@ def _catalog():
     )
     created = False
     try:
-        writer.ensure_schema()
+        # Armed BEFORE ensure_schema: it issues many statements, and one that
+        # fails partway leaves every table created ahead of it behind. Arming
+        # afterwards skips teardown for exactly that case and the tables leak
+        # onto the shared server. Every drop below is IF EXISTS, so tearing
+        # down a partial or empty schema is safe.
         created = True
+        writer.ensure_schema()
+        writer.acquire_publisher_lease("reader-suite")
         yield writer, reader
     finally:
         if created:
-            database = config.database
-            for kind, suffix in (
-                ("VIEW", "capture"),
-                ("VIEW", "pack_inventory"),
-                ("TABLE", "capture_raw"),
-                ("TABLE", "pack_inventory_raw"),
-                ("TABLE", "capture_version_claims"),
-                ("TABLE", "index_watermark"),
-                ("TABLE", "pack_commit_log"),
-            ):
-                client.execute(
-                    f"DROP {kind} IF EXISTS `{database}`.`{prefix}_{suffix}`"
-                )
+            # The writer owns the object list, in drop order; hand-copied
+            # lists here drifted from it and leaked tables.
+            writer.drop_schema()
 
 
 def _walk(reader, query: CaptureQuery):
@@ -104,8 +110,8 @@ def test_a_full_walk_returns_the_corpus_exactly():
     corpus = synthetic_descriptors(250)
     with _catalog() as (writer, reader):
         writer.write_descriptors(corpus, index_version=1)
+        _publish(writer, 1, refs=_refs(corpus))
         _commit(writer, corpus, 1)
-        _publish(writer, 1)
 
         walked, pages, _ = _walk(reader, CaptureQuery(limit=40))
 
@@ -129,13 +135,13 @@ def test_watermark_isolates_rows_indexed_after_the_first_page():
     )
     with _catalog() as (writer, reader):
         writer.write_descriptors(corpus, index_version=1)
+        _publish(writer, 1, refs=_refs(corpus))
         _commit(writer, corpus, 1)
-        _publish(writer, 1)
 
         first = reader.search(CaptureQuery(limit=40))
         writer.write_descriptors(later, index_version=2)
+        _publish(writer, 2, refs=_refs(later))
         _commit(writer, later, 2)
-        _publish(writer, 2)
 
         rest, _, _ = _walk(reader, CaptureQuery(limit=40, cursor=first.next_cursor))
 
@@ -158,8 +164,8 @@ def test_replay_is_invisible_because_it_rewrites_identical_descriptors():
     corpus = synthetic_descriptors(5)
     with _catalog() as (writer, reader):
         writer.write_descriptors(corpus, index_version=1)
+        _publish(writer, 1, refs=_refs(corpus))
         _commit(writer, corpus, 1)
-        _publish(writer, 1)
         at_first = reader.get_by_ids(
             [corpus[0].capture_id],
             tenant_id=corpus[0].metadata.tenant_id,
@@ -167,8 +173,8 @@ def test_replay_is_invisible_because_it_rewrites_identical_descriptors():
         )
 
         writer.write_descriptors(corpus, index_version=2)
+        _publish(writer, 2, refs=_refs(corpus))
         _commit(writer, corpus, 2)
-        _publish(writer, 2)
         at_second = reader.get_by_ids(
             [corpus[0].capture_id],
             tenant_id=corpus[0].metadata.tenant_id,
@@ -183,8 +189,8 @@ def test_replayed_indexing_yields_one_logical_row():
     with _catalog() as (writer, reader):
         for version in (1, 2, 3):
             writer.write_descriptors(corpus, index_version=version)
+            _publish(writer, version, refs=_refs(corpus))
             _commit(writer, corpus, version)
-            _publish(writer, version)
 
         walked, _, _ = _walk(reader, CaptureQuery(limit=10))
 
@@ -195,8 +201,8 @@ def test_get_by_ids_resolves_a_selection_at_its_watermark():
     corpus = synthetic_descriptors(20)
     with _catalog() as (writer, reader):
         writer.write_descriptors(corpus, index_version=1)
+        _publish(writer, 1, refs=_refs(corpus))
         _commit(writer, corpus, 1)
-        _publish(writer, 1)
 
         page = reader.search(CaptureQuery(limit=20))
         wanted = [item.capture_id for item in page.items[:5]]
@@ -214,8 +220,8 @@ def test_filters_narrow_the_walk():
     corpus = synthetic_descriptors(30)
     with _catalog() as (writer, reader):
         writer.write_descriptors(corpus, index_version=1)
+        _publish(writer, 1, refs=_refs(corpus))
         _commit(writer, corpus, 1)
-        _publish(writer, 1)
 
         walked, _, _ = _walk(
             reader,

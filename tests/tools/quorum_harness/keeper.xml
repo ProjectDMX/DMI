@@ -1,0 +1,27 @@
+<clickhouse>
+    <logger>
+        <level>trace</level>
+        <log>/tmp/dmi-quorum-harness/keeper/keeper.log</log>
+        <errorlog>/tmp/dmi-quorum-harness/keeper/keeper-err.log</errorlog>
+        <size>100M</size>
+        <count>1</count>
+        <console>0</console>
+    </logger>
+    <keeper_server>
+    <tcp_port>9181</tcp_port>
+    <server_id>1</server_id>
+    <log_storage>/tmp/dmi-quorum-harness/keeper/logs</log_storage>
+    <snapshot_storage_path>/tmp/dmi-quorum-harness/keeper/snapshots</snapshot_storage_path>
+    <state_file_path>/tmp/dmi-quorum-harness/keeper/state</state_file_path>
+    <storage_path>/tmp/dmi-quorum-harness/keeper/storage</storage_path>
+    <auxiliary_znodes_folder>/tmp/dmi-quorum-harness/keeper/auxiliary</auxiliary_znodes_folder>
+    <standalone_keeper>true</standalone_keeper>
+    <raft_configuration>
+        <server>
+            <id>1</id>
+            <hostname>127.0.0.1</hostname>
+            <port>9234</port>
+        </server>
+    </raft_configuration>
+</keeper_server>
+</clickhouse>

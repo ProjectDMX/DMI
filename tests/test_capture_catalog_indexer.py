@@ -8,6 +8,11 @@ import pytest
 
 from dmi.storage.capture import (
     CatalogIndexer,
+    CatalogRebuildExhaustedError,
+    PublisherLeaseError,
+    SnapshotPublishConflictError,
+    SnapshotPublishExhaustedError,
+    SnapshotPublishRaceError,
     CatalogIndexerConfig,
     CatalogReconciler,
     CaptureMetadata,
@@ -84,12 +89,24 @@ class _Inventory:
 
 
 class _CatalogWriter:
+    publisher_lease = "held"
+
     def __init__(self):
         self.committed: set[tuple[str, str]] = set()
         self.descriptor_batches: list[tuple] = []
         self.pack_batches: list[tuple[PackRef, ...]] = []
+        # The version `commit_packs` was called with. Recorded because the
+        # replay guard has to carry the version that WON: discarded here, the
+        # claim that it is "recorded at the published version" was untestable
+        # and `commit_packs(index_version=0)` passed every test in this file.
+        self.pack_versions: list[int] = []
         self.watermarks: list[tuple[int, int, int, int]] = []
+        self.manifests: list[tuple[int, tuple]] = []
+        self.descriptor_versions: list[int] = []
         self.fail_commit_once = False
+        self.fail_publish_once = False
+        self.fail_publish_always = False
+        self.conflict_once = False
         self.allocations = 0
 
     def committed_pack_ids(self, identities):
@@ -97,20 +114,37 @@ class _CatalogWriter:
 
     def write_descriptors(self, descriptors, *, index_version):
         self.descriptor_batches.append(tuple(descriptors))
+        self.descriptor_versions.append(index_version)
 
     def commit_packs(self, refs, *, index_version):
         self.pack_batches.append(tuple(refs))
+        self.pack_versions.append(index_version)
         if self.fail_commit_once:
             self.fail_commit_once = False
             raise RuntimeError("ambiguous commit")
         self.committed.update((ref.store_id, ref.pack_id) for ref in refs)
 
-    def publish_watermark(
-        self, *, index_version, published_at_ns, indexed_rows, indexed_packs
+    def publish_snapshot(
+        self, *, index_version, refs, published_at_ns, indexed_rows, indexed_packs
     ):
+        if index_version <= self.last_published_version():
+            # The server-side barrier, modelled: a publish is only visible if
+            # it is strictly above the published head.
+            raise SnapshotPublishRaceError(f"{index_version} lost the race")
+        if self.fail_publish_once:
+            self.fail_publish_once = False
+            raise SnapshotPublishRaceError("scripted lost race")
+        if self.fail_publish_always:
+            raise SnapshotPublishRaceError("scripted lost race")
+        self.manifests.append((index_version, tuple(refs)))
         self.watermarks.append(
             (index_version, published_at_ns, indexed_rows, indexed_packs)
         )
+        if self.conflict_once:
+            # The conflict's contract: this publish IS visible (the rows above
+            # landed), and so is somebody else's at the same version.
+            self.conflict_once = False
+            raise SnapshotPublishConflictError(f"{index_version} was shared")
 
     def last_published_version(self):
         return self.watermarks[-1][0] if self.watermarks else 0
@@ -170,6 +204,123 @@ def test_indexer_reads_only_footers_and_batches_rows(tmp_path: Path):
     # The version is allocator-owned (first allocation on a fresh catalog is
     # 1); the clock stamps only published_at_ns.
     assert writer.watermarks == [(1, 42, 3, 2)]
+
+
+def test_a_lost_publish_is_retried_at_a_higher_version(tmp_path: Path):
+    """Losing the barrier costs a fresh version, not the batch.
+
+    A losing publish made nothing visible, so the recovery is another attempt
+    above the winner -- and the DESCRIPTORS ride along: they are rewritten at
+    the version that publishes. index_version leads the reader's supersession
+    order between two packs describing one capture, so rows left at the lost
+    version would rank below another pack's rows written between the lost and
+    the winning version, and the reader would resolve a capture to the OLDER
+    publish's pack -- and to its locator, the one field that may differ.
+    """
+    inventory, refs = _packs(tmp_path, (2,))
+    writer = _CatalogWriter()
+    writer.fail_publish_once = True
+    indexer = CatalogIndexer(inventory, writer, clock_ns=lambda: 42)
+
+    result = indexer.index(refs)
+
+    assert result.indexed_packs == 1
+    assert writer.allocations == 2, "the retry must take a fresh version"
+    published = writer.watermarks[-1][0]
+    assert len(writer.watermarks) == 1, "only the winning publish is visible"
+    assert writer.manifests == [(published, tuple(refs))]
+
+    # Written at the lost version, rewritten at the winning one -- and the
+    # extra insert is reported, so descriptor_inserts stays an honest count.
+    assert len(writer.descriptor_batches) == 2
+    assert writer.descriptor_versions == [published - 1, published]
+    assert writer.descriptor_batches[0] == writer.descriptor_batches[1], (
+        "the rewrite must be byte-identical rows at the new version"
+    )
+    assert result.descriptor_inserts == 2
+
+    # The replay guard is recorded at the published version, after the publish
+    # -- at the version that WON, not the one the descriptors were first
+    # written with.
+    assert writer.pack_batches == [tuple(refs)]
+    assert writer.pack_versions == [published]
+
+
+def test_publishing_gives_up_after_its_bounded_retries(tmp_path: Path):
+    inventory, refs = _packs(tmp_path, (1,))
+    writer = _CatalogWriter()
+    writer.fail_publish_always = True
+    indexer = CatalogIndexer(
+        inventory,
+        writer,
+        config=CatalogIndexerConfig(max_publish_attempts=3),
+        clock_ns=lambda: 42,
+    )
+
+    with pytest.raises(SnapshotPublishExhaustedError, match="after 3 attempts") as raised:
+        indexer.index(refs)
+
+    # Inside the module's own taxonomy (a supervisor catching
+    # CaptureStorageError must see retry exhaustion), and chained to the last
+    # race so the traceback still names the terminal cause.
+    assert isinstance(raised.value.__cause__, SnapshotPublishRaceError)
+
+    # Nothing was made visible, and the replay guard was never written -- so
+    # the next pass re-indexes rather than skipping a pack nobody can see.
+    assert writer.watermarks == []
+    assert writer.pack_batches == []
+
+
+def test_a_conflicted_publish_is_committed_before_it_propagates(tmp_path: Path):
+    """A conflict IS visible, so its packs must be skippable before it raises.
+
+    SnapshotPublishConflictError's contract is that this publish landed --
+    its watermark row stands and its packs are in the snapshot -- and that it
+    must NOT be retried. Propagating it before commit_packs would leave the
+    packs out of the replay inventory, so the next scheduled pass would
+    re-index and re-publish the very batch the error forbids retrying, burying
+    the operator-required anomaly under a later success.
+    """
+    inventory, refs = _packs(tmp_path, (2,))
+    writer = _CatalogWriter()
+    writer.conflict_once = True
+    indexer = CatalogIndexer(inventory, writer, clock_ns=lambda: 42)
+
+    with pytest.raises(SnapshotPublishConflictError):
+        indexer.index(refs)
+
+    published = writer.watermarks[-1][0]
+    assert writer.pack_batches == [tuple(refs)], (
+        "a visible publish's packs must enter the replay inventory"
+    )
+    assert writer.pack_versions == [published]
+    # And the anomaly still surfaced: the error propagated, it was not
+    # absorbed as a retry.
+    assert writer.allocations == 1
+
+
+def test_a_batch_with_nothing_to_do_publishes_nothing(tmp_path: Path):
+    """A complete no-op performs no catalog writes at all.
+
+    Publishing requires the exclusive publisher lease, so a sweep that merely
+    CONFIRMS a catalog -- a periodic CatalogReconciler.rebuild over packs the
+    live indexer already committed -- must not contend for it, burn a version,
+    or advance the watermark on every page it has nothing to say about.
+    """
+    inventory, refs = _packs(tmp_path, (2,))
+    writer = _CatalogWriter()
+    indexer = CatalogIndexer(inventory, writer, clock_ns=lambda: 42)
+
+    first = indexer.index(refs)
+    watermarks = list(writer.watermarks)
+    second = indexer.index(refs)
+
+    assert first.indexed_packs == 1
+    assert second.indexed_packs == 0
+    assert second.skipped_packs == 1
+    assert second.descriptor_inserts == 0
+    assert writer.watermarks == watermarks, "a no-op pass must not publish"
+    assert writer.allocations == 1, "a no-op pass must not burn a version"
 
 
 def test_duplicate_event_and_missed_event_converge_on_rebuild(tmp_path: Path):
@@ -348,7 +499,16 @@ def test_a_restarted_indexer_cannot_publish_under_the_durable_watermark(
 
 @pytest.mark.parametrize(
     "field",
-    ["max_packs", "max_rows_per_insert", "max_estimated_bytes", "max_failure_details"],
+    [
+        "max_packs",
+        "max_rows_per_insert",
+        "max_estimated_bytes",
+        "max_failure_details",
+        # Left off this list when it was added, and it is not decorative: at 0
+        # the publish retry loop's body never runs, so index() would return
+        # having published nothing and raised nothing.
+        "max_publish_attempts",
+    ],
 )
 @pytest.mark.parametrize("value", [0, -1, 1.5])
 def test_indexer_config_rejects_non_positive_fields(field: str, value):
@@ -441,5 +601,65 @@ def test_rebuild_raises_when_the_listing_never_terminates(tmp_path: Path):
         inventory, CatalogIndexer(inventory, _CatalogWriter(), clock_ns=lambda: 42)
     )
 
-    with pytest.raises(RuntimeError, match="max_pages"):
+    # Through this module's taxonomy: a rebuild that stopped short leaves a
+    # PARTIAL catalog, which a supervisor catching CaptureStorageError has to
+    # see rather than take as an unrelated crash.
+    with pytest.raises(CatalogRebuildExhaustedError, match="max_pages"):
         reconciler.rebuild(max_pages=3)
+
+
+def test_a_commit_failure_inside_the_conflict_handler_keeps_the_conflict(
+    tmp_path: Path,
+):
+    """The conflict is the finding; a transport error must not bury it.
+
+    `SnapshotPublishConflictError` means this publish IS visible and must not
+    be retried, so the handler records its packs in the replay inventory before
+    propagating. If that call throws, a bare `raise` never runs: the driver's
+    exception propagates and the conflict is demoted to `__context__`, where no
+    `except SnapshotPublishConflictError` supervisor sees it -- while the packs
+    are visible and absent from the inventory, so the next pass re-publishes
+    exactly the batch this error forbids retrying.
+    """
+    inventory, refs = _packs(tmp_path, (1,))
+    writer = _CatalogWriter()
+    writer.conflict_once = True
+    writer.fail_commit_once = True
+
+    with pytest.raises(SnapshotPublishConflictError) as raised:
+        CatalogIndexer(inventory, writer).index(refs)
+
+    # The commit failure is not lost either -- it is the cause.
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert "ambiguous commit" in str(raised.value.__cause__)
+
+
+def test_an_indexer_whose_writer_cannot_publish_writes_nothing(tmp_path: Path):
+    """Refused before the work, not after it.
+
+    Publishing is the last thing a pass does and the only thing that needs
+    authority, so a writer without it used to discover that after allocating a
+    version -- permanently consumed -- and writing the whole descriptor batch,
+    up to `max_estimated_bytes`. A supervisor that restarts an indexer without
+    re-acquiring pays that on every scheduled pass.
+    """
+    inventory, refs = _packs(tmp_path, (1,))
+    writer = _CatalogWriter()
+    writer.publisher_lease = None
+
+    with pytest.raises(PublisherLeaseError, match="no publisher lease"):
+        CatalogIndexer(inventory, writer).index(refs)
+
+    assert writer.allocations == 0, "a version was burned anyway"
+    assert writer.descriptor_batches == [], "the batch was written anyway"
+
+
+def test_a_writer_holding_a_lease_indexes_normally(tmp_path: Path):
+    """A writer that answers the authority question with a lease indexes."""
+    inventory, refs = _packs(tmp_path, (1,))
+    writer = _CatalogWriter()
+    assert writer.publisher_lease == "held"
+
+    result = CatalogIndexer(inventory, writer).index(refs)
+
+    assert result.indexed_packs == 1

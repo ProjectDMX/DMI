@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from dmi.storage.capture.summary import CORE_SUMMARY_VERSION
 from tests.tools.golden_workload import (
     MANIFEST_VERSION,
     build_manifest,
@@ -68,7 +69,7 @@ def test_the_manifest_records_what_phase_six_has_to_compare():
     for capture in manifest["captures"]:
         assert capture["payload_sha256"] and capture["payload_crc32"]
         assert capture["decoded_sha256"]
-        assert capture["summary"]["version"] == 1
+        assert capture["summary"]["version"] == CORE_SUMMARY_VERSION
 
 
 def test_a_changed_payload_is_caught_by_the_comparison():

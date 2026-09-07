@@ -4,12 +4,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from hashlib import sha256
 import math
 import threading
 import time
 from typing import Callable, Mapping, Protocol
-from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from .model import (
@@ -20,7 +18,7 @@ from .model import (
     PackSource,
     PackStore,
 )
-from .pack import PackCapacityError, PackWriter, SealedPack
+from .pack import PackCapacityError, PackWriter, SealedPack, key_component
 
 
 class AdmissionResult(str, Enum):
@@ -298,23 +296,12 @@ def object_key_for(ready: ReadyPack) -> str:
         metadata.captured_at_ns / 1_000_000_000, tz=timezone.utc
     )
     return (
-        f"v1/tenant={_key_component(metadata.tenant_id)}/"
+        f"v1/tenant={key_component(metadata.tenant_id)}/"
         f"date={captured:%Y-%m-%d}/"
-        f"session={_key_component(metadata.session_id)}/"
+        f"session={key_component(metadata.session_id)}/"
         f"rank={metadata.producer_rank}/"
         f"{ready.pack.pack_id}.dmi-pack"
     )
-
-
-def _key_component(value: str) -> str:
-    # quote() treats "~" as always-safe per RFC 3986 and ignores `safe` for it,
-    # but the object-key pattern does not allow it. Left alone, an identifier
-    # containing "~" produces a key every store rejects, and the sink failure
-    # is fatal to the whole pipeline.
-    encoded = quote(value, safe="-_.=").replace("~", "%7E")
-    if len(encoded.encode()) <= 160:
-        return encoded
-    return "sha256-" + sha256(value.encode()).hexdigest()
 
 
 class PackSink(Protocol):
