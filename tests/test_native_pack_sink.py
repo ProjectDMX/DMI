@@ -278,6 +278,10 @@ def test_object_key_parity_with_python():
             ("sha256-" + "ab" * 32, "s", 0, 2**63),
             ("x" * 200, "s", 0, 1_700_000_000_000_000_000),
             ("tenant=equals", "a/b?c", 2**32 - 1, 1_000_000_000),
+            # A double dot inside a component is legal for both key builders
+            # (quote() spares '.'), and so is a component that is only dots.
+            ("a..b", "s..t", 0, 1_700_000_000_000_000_000),
+            ("..", "s", 0, 1_700_000_000_000_000_000),
         ]
         pack_id = "018f0000-0000-7000-8000-000000000f01"
         from dmi.storage.capture.pack import PackWriter
@@ -303,6 +307,33 @@ def test_object_key_parity_with_python():
             assert response["object_key"] == object_key_for(ready), tenant
     finally:
         session.close()
+
+
+def test_dotted_tenant_stages_and_does_not_latch_the_sink(sink, tmp_path):
+    # A tenant whose name contains ".." yields the legal key segment
+    # "tenant=a..b" — Python's spool accepts it (only a whole component of
+    # "", "." or ".." is an escape), so the native spool must too. Getting
+    # this wrong is not merely a lost pack: the spool refusal fails the
+    # worker, which closes the sink for every later submit.
+    _open(sink, tmp_path / "spool")
+    assert _submit(sink, _record(0, tenant_id="a..b")) == "accepted"
+    assert sink.call(op="flush", timeout=30)["ok"]
+    snapshot = sink.call(op="snapshot")["snapshot"]
+    assert snapshot["persisted_records"] == 1
+    assert snapshot["failures"] == 0
+
+    # The sink is still open: a later submit is admitted, not "closed".
+    assert _submit(sink, _record(1, tenant_id="tenant-ok")) == "accepted"
+    assert sink.call(op="flush", timeout=30)["ok"]
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == 2
+    assert snapshot["failures"] == 0
+
+    # Python reads back the dotted-tenant pack from the native spool.
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=1 << 40)
+    keys = sorted(entry.object_key for entry in spool.recover())
+    assert len(keys) == 2
+    assert any(key.startswith("v1/tenant=a..b/") for key in keys), keys
 
 
 def test_scopes_stay_separate_at_n4(sink, tmp_path):

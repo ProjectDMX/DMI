@@ -173,6 +173,28 @@ bool WriteFileSynced(const std::string& path, const uint8_t* data, size_t n,
   return ok;
 }
 
+// One path component of an object key, as Python's _KEY_COMPONENT spells it:
+// ^[A-Za-z0-9][A-Za-z0-9._=%-]*$. Note '.' is legal after the first byte, so
+// "tenant=a..b" is a legal component -- only "", "." and ".." as *whole*
+// components traverse, and those cannot match the regex anyway.
+bool IsKeyComponent(const std::string& part) {
+  if (part.empty() || part == "." || part == "..") return false;
+  const unsigned char first = static_cast<unsigned char>(part[0]);
+  if (!((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') ||
+        (first >= '0' && first <= '9'))) {
+    return false;
+  }
+  for (size_t i = 1; i < part.size(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(part[i]);
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '=' ||
+          c == '%' || c == '-')) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // object_key must end in "<pack_id>.dmi-pack"; the upload key is what the
 // Python store derives: parent dirs + pack_id + ".dmi-pack".
 bool SplitKey(const std::string& object_key, const std::string& pack_id,
@@ -187,9 +209,21 @@ bool SplitKey(const std::string& object_key, const std::string& pack_id,
     if (error) *error = "spool object key must end with the pack ID";
     return false;
   }
-  if (object_key.find("..") != std::string::npos) {
-    if (error) *error = "object key escapes the spool root";
+  // Component-wise, exactly like Python's validate_object_key: a substring
+  // test would refuse the legal "tenant=a..b" and admit other traversals.
+  if (object_key.find('\\') != std::string::npos) {
+    if (error) *error = "object key is invalid";
     return false;
+  }
+  for (size_t begin = 0; begin <= object_key.size();) {
+    const size_t slash = object_key.find('/', begin);
+    const size_t end = (slash == std::string::npos) ? object_key.size() : slash;
+    if (!IsKeyComponent(object_key.substr(begin, end - begin))) {
+      if (error) *error = "object key is invalid";
+      return false;
+    }
+    if (slash == std::string::npos) break;
+    begin = slash + 1;
   }
   const size_t slash = object_key.rfind('/');
   *parent = (slash == std::string::npos) ? "" : object_key.substr(0, slash);
