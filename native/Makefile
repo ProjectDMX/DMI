@@ -57,7 +57,7 @@ endif
 # clean/host), skip CUDA resolution entirely.
 CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/bench_sink build/_dmi_native_sink
 ifneq ($(strip $(MAKECMDGOALS)),)
-ifeq ($(strip $(filter-out clean host $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
+ifeq ($(strip $(filter-out clean host cpu-goals $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
 endif
 endif
@@ -189,9 +189,16 @@ RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
 
 OBJS += $(RING_OBJS)
 
-.PHONY: all host clean cuda-info FORCE
+.PHONY: all host clean cuda-info cpu-goals FORCE
 
 all: $(FINAL_TARGET)
+
+# Every target that builds without CUDA, as ONE goal. CI's compile gate
+# asks for this rather than listing the binaries: a list in the workflow
+# goes stale the moment CPU_ONLY_GOALS gains a target, which is exactly
+# the drift a compile gate exists to prevent. Adding a target to
+# CPU_ONLY_GOALS now puts it under the gate automatically.
+cpu-goals: $(CPU_ONLY_GOALS)
 
 host: $(HOST_FINAL_TARGET)
 

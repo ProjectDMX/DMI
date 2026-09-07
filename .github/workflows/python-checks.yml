@@ -53,27 +53,77 @@ jobs:
         # on a dev box whose libstdc++ pulls it in transitively, and it only
         # surfaced when a later job happened to ask for the sink driver.
         #
-        # Every CPU_ONLY_GOALS target, because the set is what a developer
-        # can build without CUDA and therefore what CI can check. libcurl
-        # dev headers for the store client; the runner ships the runtime
-        # .so but not the headers.
+        # `cpu-goals` rather than a list of binaries: the set is what a
+        # developer can build without CUDA and therefore what CI can check,
+        # and a list written here goes stale the moment CPU_ONLY_GOALS
+        # gains a target -- drift in the gate itself. libcurl dev headers
+        # for the store client; the runner ships the runtime .so but not
+        # the headers.
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libcurl4-openssl-dev
-          make -C native \
-            build/conformance_main \
-            build/conformance_sign \
-            build/conformance_store \
-            build/conformance_spool \
-            build/conformance_sink \
-            build/bench_builder \
-            build/bench_sink \
-            build/_dmi_native_sink \
+          make -C native cpu-goals \
             CURL_INCDIR=/usr/include/x86_64-linux-gnu \
             CURL_LIBDIR=/usr/lib/x86_64-linux-gnu
 
       - name: Run compile, CPU, and package-layout checks
-        run: make check
+        run: make check PYTEST_ARGS="--junit-xml=cpu-results.xml"
+
+      - name: Fail if a cpu test skipped for anything but absent hardware
+        if: always()
+        # The same reasoning as the live job's gate, arriving late because
+        # nothing here built the native binaries until the step above: a
+        # test whose skipif looks for a driver that was never compiled
+        # SKIPS, and a skipped suite reports green. Measured on this
+        # branch: the cpu job was 1125 passed / 58 skipped where a machine
+        # with the binaries present runs 1197 -- seventy-two tests that
+        # nobody was running and nothing was saying so.
+        #
+        # Not "zero skips", unlike the live gate: a CPU runner genuinely
+        # has no GPU, so the one CUDA-shaped skip is legitimate and stays
+        # allowed BY REASON. Every other reason fails and names itself,
+        # which is what keeps this from being widened by habit -- a new
+        # skip has to be argued for here, not just added.
+        run: |
+          python - <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # A skip is allowed only if its reason says the runner lacks the
+          # HARDWARE. Anything else -- an unbuilt driver, a missing
+          # dependency, a lost fixture -- is coverage that silently is not
+          # there, which is the failure this gate exists for.
+          ALLOWED = ("no CUDA device", "requires CUDA", "no GPU")
+
+          try:
+              suites = ET.parse("cpu-results.xml").getroot().findall("testsuite")
+          except (OSError, ET.ParseError) as exc:
+              sys.exit(f"cannot read cpu-results.xml: {exc}. The gate is not "
+                       "running, which is indistinguishable from it passing.")
+          if not suites:
+              sys.exit("cpu-results.xml has no <testsuite>: the gate cannot read it")
+          ran = sum(int(s.get("tests", 0)) for s in suites)
+          if ran == 0:
+              sys.exit("no cpu tests ran: the marker selection matched nothing")
+
+          unexplained = []
+          allowed = 0
+          for suite in suites:
+              for case in suite.iter("testcase"):
+                  for mark in case.iter("skipped"):
+                      reason = mark.get("message") or ""
+                      if any(ok in reason for ok in ALLOWED):
+                          allowed += 1
+                      else:
+                          unexplained.append(f"{case.get('name')}: {reason}")
+          print(f"{ran} collected, {allowed} skipped for absent hardware, "
+                f"{len(unexplained)} unexplained")
+          if unexplained:
+              for line in unexplained:
+                  print(f"  skipped: {line}")
+              sys.exit(f"{len(unexplained)} cpu test(s) skipped for a reason "
+                       "that is not absent hardware; a skip is not a pass")
+          EOF
 
   clickhouse-live:
     # The `manual`-marked suites, which `make check` cannot run: `addopts` in
