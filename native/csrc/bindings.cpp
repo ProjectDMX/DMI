@@ -609,20 +609,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .value("PACKED_VERSION_COUNTER",
              ring::D2HWindowProgressKind::PACKED_VERSION_COUNTER);
   py::enum_<ring::D2HWindowGrantPolicyKind>(m, "D2HWindowGrantPolicyKind")
-      .value("LAST_K_ADAPTIVE",
-             ring::D2HWindowGrantPolicyKind::LAST_K_ADAPTIVE);
+      .value("BINARY_ADAPTIVE",
+             ring::D2HWindowGrantPolicyKind::BINARY_ADAPTIVE);
   py::class_<ring::RecurringD2HWindowConfig>(m, "RecurringD2HWindowConfig")
       .def(py::init<>())
       .def_readwrite("enabled", &ring::RecurringD2HWindowConfig::enabled)
       .def_readwrite("progress", &ring::RecurringD2HWindowConfig::progress)
       .def_readwrite("grant_policy",
                      &ring::RecurringD2HWindowConfig::grant_policy)
-      .def_readwrite("history_size",
-                     &ring::RecurringD2HWindowConfig::history_size)
       .def_readwrite(
           "minimum_record_probe_retry_interval_occurrences",
           &ring::RecurringD2HWindowConfig::
               minimum_record_probe_retry_interval_occurrences)
+      .def_readwrite(
+          "timing_revalidation_retry_interval_occurrences",
+          &ring::RecurringD2HWindowConfig::
+              timing_revalidation_retry_interval_occurrences)
       .def_readwrite(
           "capacity_flush_fallback_threshold",
           &ring::RecurringD2HWindowConfig::capacity_flush_fallback_threshold)

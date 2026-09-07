@@ -87,9 +87,9 @@ HookPointV1 encoded-record path. Construct `MonitoringEngine` with
 |-----------|------|---------|-------------|
 | `enabled` | `bool` | false | Enable recurring-window scheduling. |
 | `progress` | native enum | packed version/counter | Fixed progress backend for this version; leave unchanged. |
-| `grant_policy` | native enum | last-K adaptive | Fixed byte-grant policy for this version; leave unchanged. |
-| `history_size` | `uint64_t` | 0 | Recent attempts retained by the policy; must be at least 2 when enabled. |
+| `grant_policy` | native enum | binary adaptive | Fixed byte-grant policy for this version; leave unchanged. |
 | `minimum_record_probe_retry_interval_occurrences` | `uint64_t` | 0 | Window occurrences between minimum-record probes; must be positive when enabled. |
+| `timing_revalidation_retry_interval_occurrences` | `uint64_t` | 4 | Base window occurrences between failed timing-revalidation probes; must be positive when enabled. |
 | `capacity_flush_fallback_threshold` | `uint64_t` | 0 | Completed capacity-forced flushes before permanent batched fallback; must be positive when enabled. |
 | `debug_enabled` | `bool` | false | Log every real window-scheduled D2H issue and completion. |
 
@@ -104,8 +104,8 @@ from dmi.api import v1 as dmi
 
 windows = dmi.RecurringD2HWindowConfig()
 windows.enabled = True
-windows.history_size = 4
 windows.minimum_record_probe_retry_interval_occurrences = 4
+windows.timing_revalidation_retry_interval_occurrences = 4
 windows.capacity_flush_fallback_threshold = 3
 
 cfg = dmi.RingConfig()

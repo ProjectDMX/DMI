@@ -20,6 +20,7 @@ class D2HWindowPatternMatcher {
     D2HWindowPatternMatcher(uint64_t period, std::vector<D2HWindowOffset> windows);
 
     std::optional<D2HWindowOccurrence> match(uint64_t counter) const noexcept;
+    uint64_t next_window_begin(const D2HWindowOccurrence& window) const noexcept;
     uint64_t period() const noexcept { return period_; }
     uint64_t window_count() const noexcept { return windows_.size(); }
 

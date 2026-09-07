@@ -18,12 +18,13 @@ void check_cuda(cudaError_t error, const char* operation) {
 }
 
 void validate_configuration(const RecurringD2HWindowConfig& config) {
-    if (config.history_size < 2) {
-        throw std::invalid_argument("recurring D2H window history_size must be >= 2");
-    }
     if (config.minimum_record_probe_retry_interval_occurrences == 0) {
         throw std::invalid_argument(
             "recurring D2H window probe retry interval must be > 0");
+    }
+    if (config.timing_revalidation_retry_interval_occurrences == 0) {
+        throw std::invalid_argument(
+            "recurring D2H window timing revalidation retry interval must be > 0");
     }
     if (config.capacity_flush_fallback_threshold == 0) {
         throw std::invalid_argument(
@@ -40,7 +41,7 @@ void validate_configuration(const RecurringD2HWindowConfig& config) {
         throw std::invalid_argument("unknown D2H window progress kind");
     }
     switch (config.grant_policy) {
-    case D2HWindowGrantPolicyKind::LAST_K_ADAPTIVE:
+    case D2HWindowGrantPolicyKind::BINARY_ADAPTIVE:
         break;
     default:
         throw std::invalid_argument("unknown D2H window grant policy kind");

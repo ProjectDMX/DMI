@@ -190,21 +190,18 @@ public:
     explicit OneAdmissionController(uint64_t byte_limit)
         : byte_limit_(byte_limit) {}
 
-    void reconcile_progress() override { ++reconciliations; }
-
-    std::optional<ring::D2HWindowAdmission> consider(
+    std::optional<ring::D2HWindowAdmission> poll(
         ring::D2HWindowAvailability availability) override {
-        ++considerations;
+        ++polls;
         if (!enabled || committed ||
             !availability.first_record_bytes.has_value()) {
             return std::nullopt;
         }
+        ring::D2HWindowGrantDecision decision;
+        decision.byte_limit = byte_limit_;
+        decision.full_grant_bytes = availability.full_grant_bytes;
         return ring::D2HWindowAdmission{
-            1,
-            ring::D2HWindowOccurrence{0, 0, 0, 1000000},
-            byte_limit_,
-            false,
-        };
+            1, ring::D2HWindowOccurrence{0, 0, 0, 1000000}, decision};
     }
 
     bool commit(
@@ -228,8 +225,7 @@ public:
     bool committed{false};
     uint64_t committed_bytes{0};
     uint64_t completed_bytes{0};
-    std::atomic<uint64_t> reconciliations{0};
-    std::atomic<uint64_t> considerations{0};
+    std::atomic<uint64_t> polls{0};
     std::atomic<uint64_t> commits{0};
     std::atomic<uint64_t> completions{0};
 
@@ -809,7 +805,7 @@ static void test_active_window_mode_suppresses_batched_drain() {
     harness.drain->notify();
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-    EXPECT(controller.reconciliations.load(std::memory_order_acquire) > 0);
+    EXPECT(controller.polls.load(std::memory_order_acquire) > 0);
     EXPECT(harness.drain->cpu_task_tail_committed() == 0);
 
     harness.drain->force_flush_and_wait();
@@ -965,9 +961,10 @@ static void test_multiple_pending_window_definitions() {
     cfg.pinned_staging_bytes = 4096;
     cfg.drain_poll_timeout_us = 100;
     cfg.recurring_d2h_windows.enabled = true;
-    cfg.recurring_d2h_windows.history_size = 2;
     cfg.recurring_d2h_windows
         .minimum_record_probe_retry_interval_occurrences = 1;
+    cfg.recurring_d2h_windows
+        .timing_revalidation_retry_interval_occurrences = 1;
     cfg.recurring_d2h_windows.capacity_flush_fallback_threshold = 2;
 
     ring_py::RingEnginePy engine(cfg, std::shared_ptr<ring::RecordSink>{});
@@ -1016,8 +1013,8 @@ static void test_terminal_fallback_definition_returns_false() {
     CUDA_CHECK(cudaGetDevice(&device));
     ring::RecurringD2HWindowConfig cfg;
     cfg.enabled = true;
-    cfg.history_size = 2;
     cfg.minimum_record_probe_retry_interval_occurrences = 1;
+    cfg.timing_revalidation_retry_interval_occurrences = 1;
     cfg.capacity_flush_fallback_threshold = 1;
     ring::RecurringD2HWindowSubsystem subsystem(cfg, device);
     UnusedDrainPause drain_pause;
@@ -1026,7 +1023,7 @@ static void test_terminal_fallback_definition_returns_false() {
 
     EXPECT(subsystem.define_pattern(4, {{1, 3}}, 0, stream, drain_pause));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    subsystem.grant_controller().reconcile_progress();
+    subsystem.grant_controller().poll({0, std::nullopt});
     EXPECT(subsystem.snapshot().mode == ring::D2HWindowMode::ENABLED_ACTIVE);
 
     subsystem.record_capacity_forced_flush();
@@ -1048,9 +1045,10 @@ static void test_legacy_engine_rejects_recurring_window_configuration() {
     banner("legacy engine rejects recurring-window configuration");
     ring_py::RingConfig cfg;
     cfg.recurring_d2h_windows.enabled = true;
-    cfg.recurring_d2h_windows.history_size = 2;
     cfg.recurring_d2h_windows
         .minimum_record_probe_retry_interval_occurrences = 1;
+    cfg.recurring_d2h_windows
+        .timing_revalidation_retry_interval_occurrences = 1;
     cfg.recurring_d2h_windows.capacity_flush_fallback_threshold = 1;
     bool rejected = false;
     try {

@@ -9,7 +9,7 @@ enum class D2HWindowProgressKind : uint8_t {
 };
 
 enum class D2HWindowGrantPolicyKind : uint8_t {
-    LAST_K_ADAPTIVE = 0,
+    BINARY_ADAPTIVE = 0,
 };
 
 struct D2HWindowOffset {
@@ -20,9 +20,9 @@ struct D2HWindowOffset {
 struct RecurringD2HWindowConfig {
     bool enabled{false};
     D2HWindowProgressKind progress{D2HWindowProgressKind::PACKED_VERSION_COUNTER};
-    D2HWindowGrantPolicyKind grant_policy{D2HWindowGrantPolicyKind::LAST_K_ADAPTIVE};
-    uint64_t history_size{0};
+    D2HWindowGrantPolicyKind grant_policy{D2HWindowGrantPolicyKind::BINARY_ADAPTIVE};
     uint64_t minimum_record_probe_retry_interval_occurrences{0};
+    uint64_t timing_revalidation_retry_interval_occurrences{4};
     uint64_t capacity_flush_fallback_threshold{0};
     // Age out isolated fallback evidence after this many complete pattern
     // periods. The progress-distance threshold is this value times T.

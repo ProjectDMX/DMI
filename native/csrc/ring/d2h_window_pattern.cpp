@@ -51,4 +51,13 @@ D2HWindowPatternMatcher::match(uint64_t counter) const noexcept {
     return std::nullopt;
 }
 
+uint64_t D2HWindowPatternMatcher::next_window_begin(
+    const D2HWindowOccurrence& window) const noexcept {
+    if (window.window_index + 1 < windows_.size()) {
+        const uint64_t base = window.occurrence * period_;
+        return base + windows_[window.window_index + 1].begin;
+    }
+    return (window.occurrence + 1) * period_ + windows_.front().begin;
+}
+
 }  // namespace ring

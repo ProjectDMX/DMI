@@ -428,11 +428,8 @@ bool DrainThread::do_window_decision() {
     if (!grant_controller_ || !mode_controller_) return false;
 
     const D2HWindowMode before = mode_controller_->mode();
-    if (before == D2HWindowMode::ENABLED_NO_PATTERN ||
-        before == D2HWindowMode::ENABLED_ACTIVE) {
-        grant_controller_->reconcile_progress();
-    }
-    if (!mode_controller_->window_scheduling_in_effect()) return false;
+    if (before != D2HWindowMode::ENABLED_NO_PATTERN &&
+        before != D2HWindowMode::ENABLED_ACTIVE) return false;
 
     uint64_t flush_count = 0;
     uint64_t flush_bytes = 0;
@@ -462,13 +459,14 @@ bool DrainThread::do_window_decision() {
             availability.first_record_bytes =
                 align_up(scanned_.front(), PAYLOAD_ALIGN);
         }
-        admission = grant_controller_->consider(availability);
+        admission = grant_controller_->poll(availability);
+        if (!mode_controller_->window_scheduling_in_effect()) return false;
         if (!admission.has_value() || full_count == 0) return true;
 
-        if (admission->minimum_record_probe) {
+        if (admission->decision.minimum_record_probe()) {
             const uint64_t aligned =
                 align_up(scanned_.front(), PAYLOAD_ALIGN);
-            if (aligned <= admission->byte_limit) {
+            if (aligned <= admission->decision.byte_limit) {
                 flush_count = 1;
                 flush_bytes = aligned;
             }
@@ -476,7 +474,7 @@ bool DrainThread::do_window_decision() {
             for (uint64_t index = 0; index < full_count; ++index) {
                 const uint64_t aligned =
                     align_up(scanned_[index], PAYLOAD_ALIGN);
-                if (aligned > admission->byte_limit - flush_bytes) break;
+                if (aligned > admission->decision.byte_limit - flush_bytes) break;
                 flush_bytes += aligned;
                 ++flush_count;
             }

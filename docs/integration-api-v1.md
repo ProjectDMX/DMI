@@ -373,8 +373,8 @@ publishes one boundary at each ordered execution point:
 ```python
 windows = dmi.RecurringD2HWindowConfig()
 windows.enabled = True
-windows.history_size = 4
 windows.minimum_record_probe_retry_interval_occurrences = 4
+windows.timing_revalidation_retry_interval_occurrences = 4
 windows.capacity_flush_fallback_threshold = 3
 windows.capacity_flush_count_reset_interval_periods = 32
 windows.debug_enabled = False
@@ -413,8 +413,8 @@ window. While the feature is active, ordinary batch thresholds and timeout
 flushes do not initiate D2H. Full ring capacity can still force a flush; after
 `capacity_flush_fallback_threshold` such completed flushes, the engine
 permanently returns to existing batched draining. A too-small learned window
-periodically probes one complete record according to
-`minimum_record_probe_retry_interval_occurrences`.
+periodically probes one complete record. Repeated failures wait increasingly
+long multiples of `minimum_record_probe_retry_interval_occurrences`.
 
 When a hook uses a device gate, the integration must apply the same selection
 before host reservation and descriptor publication. A gated-off occurrence is
@@ -1031,9 +1031,9 @@ ring construction.
 | --- | --- | --- |
 | `enabled` | `False` | Enable recurring-window scheduling. |
 | `progress` | packed version/counter | Fixed progress backend for v1; leave unchanged. |
-| `grant_policy` | last-K adaptive | Fixed grant policy for v1; leave unchanged. |
-| `history_size` | `0` | Number of recent attempts used by the policy; must be at least two when enabled. |
+| `grant_policy` | binary adaptive | Fixed grant policy for v1; leave unchanged. |
 | `minimum_record_probe_retry_interval_occurrences` | `0` | Recurring-window occurrences between minimum-record probes; must be positive when enabled. |
+| `timing_revalidation_retry_interval_occurrences` | `4` | Base recurring-window occurrences between failed timing-revalidation probes; must be positive when enabled. |
 | `capacity_flush_fallback_threshold` | `0` | Completed capacity-forced flushes before permanent batched fallback; must be positive when enabled. |
 | `capacity_flush_count_reset_interval_periods` | `32` | Reset accumulated capacity-forced-flush evidence when consecutive events are separated by at least this many complete pattern periods; must be positive when enabled. |
 | `debug_enabled` | `False` | Log each real recurring-window D2H issue and completion. |
