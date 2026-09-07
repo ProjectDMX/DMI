@@ -57,7 +57,7 @@ endif
 # clean/host), skip CUDA resolution entirely.
 CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/bench_sink build/conformance_catalog build/_dmi_native_sink
 ifneq ($(strip $(MAKECMDGOALS)),)
-ifeq ($(strip $(filter-out clean host $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
+ifeq ($(strip $(filter-out clean host cpu-goals $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
 endif
 endif
@@ -189,9 +189,17 @@ RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
 
 OBJS += $(RING_OBJS)
 
-.PHONY: all host clean cuda-info FORCE
+.PHONY: all host clean cuda-info cpu-goals FORCE
 
 all: $(FINAL_TARGET)
+
+# Every target that builds without CUDA, as ONE goal. CI's compile gate
+# asks for this rather than listing the binaries: the list it used to
+# carry was written when there were eight and went stale the moment
+# CPU_ONLY_GOALS gained the catalog driver, which is exactly the drift a
+# compile gate exists to prevent. Adding a target to CPU_ONLY_GOALS now
+# puts it under the gate automatically.
+cpu-goals: $(CPU_ONLY_GOALS)
 
 host: $(HOST_FINAL_TARGET)
 
@@ -310,9 +318,15 @@ build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp c
 # PYTHON must point at the venv interpreter:
 #   make build/_dmi_native_sink... PYTHON=/path/to/venv/bin/python
 SINK_EXT := _dmi_native_sink$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))" 2>/dev/null)
+# C++20 for this target only, because ATen demands it and its floor MOVES:
+# torch 2.13 refuses below C++17, torch 2.14 below C++20, and the CI pin
+# `torch>=2.8,<3` resolves to whatever is newest on the day. C++20 satisfies
+# both, and our own sources here compile the same under either. Everything
+# else in this Makefile stays at C++17 -- this is the one target that links
+# against torch.
 build/_dmi_native_sink: csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp
 	mkdir -p $(BUILD_DIR)
-	$(CXX) -std=c++17 -O2 -fPIC -shared -DTORCH_EXTENSION_NAME=_dmi_native_sink \
+	$(CXX) -std=c++20 -O2 -fPIC -shared -DTORCH_EXTENSION_NAME=_dmi_native_sink \
 	    $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join('-I'+p for p in include_paths()))") \
 	    $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); print('-I'+paths.get('include'))") \
 	    -Icsrc -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/common \
