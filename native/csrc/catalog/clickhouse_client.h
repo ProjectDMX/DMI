@@ -31,6 +31,13 @@ class ClickHouseError : public std::runtime_error {
       : std::runtime_error(what) {}
 };
 
+// clickhouse-driver's client-side `%(name)s` substitution: one
+// left-to-right pass, as `query % escaped` is. Exposed (rather than kept
+// private to the client) so the conformance driver can gate it against
+// the driver on the CPU gate, the way `sql_quote` already is — the
+// escaper had that gate and the scanner did not.
+std::string substitute(const std::string& query, const Params& params);
+
 // Parse a TSV-rendered unsigned integer field; empty renders as 0.
 uint64_t parse_u64_field(const std::string& text, const char* what);
 

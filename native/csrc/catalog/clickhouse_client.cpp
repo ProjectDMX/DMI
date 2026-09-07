@@ -13,40 +13,6 @@ size_t write_body(char* ptr, size_t size, size_t nmemb, void* userp) {
   return size * nmemb;
 }
 
-// clickhouse-driver's client-side `%(name)s` substitution: the same
-// placeholders in the ported statements, the same server-side text.
-std::string substitute(std::string query, const Params& params) {
-  for (const auto& [name, value] : params) {
-    std::string rendered;
-    if (auto* i = std::get_if<int64_t>(&value)) {
-      rendered = std::to_string(*i);
-    } else if (auto* u = std::get_if<uint64_t>(&value)) {
-      rendered = std::to_string(*u);
-    } else {
-      rendered = sql_quote(std::get<std::string>(value));
-    }
-    const std::string needle = "%(" + name + ")s";
-    // The search advances PAST each replacement: a rendered value that
-    // itself contains the placeholder (a holder that literally says
-    // "%(holder)s" is a legal 11-byte string) must not be re-matched
-    // inside the inserted text — restarting at the top grew without
-    // bound and hung the driver.
-    // The scan restarts at position 0 for each parameter: `from` persisting
-    // across parameters would skip a real occurrence of this placeholder
-    // that sits BEFORE an earlier parameter's replacement. Within one
-    // parameter's loop, `from` advances past each replacement so a
-    // self-referential value (a rendered string containing its own
-    // placeholder) cannot loop.
-    size_t from = 0;
-    size_t at;
-    while ((at = query.find(needle, from)) != std::string::npos) {
-      query.replace(at, needle.size(), rendered);
-      from = at + rendered.size();
-    }
-  }
-  return query;
-}
-
 std::string url_encode(const std::string& value) {
   char* escaped = curl_easy_escape(nullptr, value.c_str(),
                                    static_cast<int>(value.size()));
@@ -61,6 +27,54 @@ std::string url_encode(const std::string& value) {
 }
 
 }  // namespace
+
+std::string substitute(const std::string& query, const Params& params) {
+  // ONE left-to-right pass, appending to an output buffer, because
+  // clickhouse-driver's substitution is `query % escaped`
+  // (`clickhouse_driver/client.py`) and `%` is a single pass: rendered
+  // text is never looked at again.
+  //
+  // Rendering one parameter at a time across the whole statement is NOT
+  // that, however carefully each pass advances past its own replacement:
+  // the next parameter's pass starts at the top again and reaches into
+  // text an earlier parameter already inserted. A lease holder that
+  // literally says "%(ttl_ns)s" is a legal 11-byte string — only its
+  // length is checked, on both sides — and was stored as the TTL, while
+  // the driver stored the holder.
+  std::string out;
+  out.reserve(query.size());
+  size_t at = 0;
+  while (at < query.size()) {
+    if (query.compare(at, 2, "%(") != 0) {
+      out.push_back(query[at++]);
+      continue;
+    }
+    const size_t close = query.find(")s", at + 2);
+    const auto found =
+        close == std::string::npos
+            ? params.end()
+            : params.find(query.substr(at + 2, close - at - 2));
+    if (found == params.end()) {
+      // Nothing this call can fill: an unknown name, or a `%(` with no
+      // `)s` after it. Both go through as the text they are, and the
+      // scan resumes just past the `%(` so that a well-formed
+      // placeholder further along is still found.
+      out += "%(";
+      at += 2;
+      continue;
+    }
+    const Param& value = found->second;
+    if (auto* i = std::get_if<int64_t>(&value)) {
+      out += std::to_string(*i);
+    } else if (auto* u = std::get_if<uint64_t>(&value)) {
+      out += std::to_string(*u);
+    } else {
+      out += sql_quote(std::get<std::string>(value));
+    }
+    at = close + 2;
+  }
+  return out;
+}
 
 uint64_t parse_u64_field(const std::string& text, const char* what) {
   if (text.empty()) return 0;

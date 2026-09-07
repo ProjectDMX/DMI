@@ -440,6 +440,79 @@ def test_the_parameterized_statements_are_byte_identical_too():
                 f"the driver's own rendering {literal!r}")
 
 
+def test_a_holder_that_spells_a_placeholder_is_stored_as_the_holder():
+    """A value must not be re-read as statement text after it is rendered.
+
+    The claim binds four parameters into one statement -- `term`,
+    `lease_id`, `holder`, `ttl_ns` -- and only the holder's LENGTH is
+    checked, on either side (`clickhouse_lease.py`'s `acquire` and
+    `lease_coordinator.cpp`'s), so `%(ttl_ns)s` is a legal 11-byte
+    holder. clickhouse-driver renders the statement as `query % escaped`,
+    one left-to-right pass, and stores it verbatim.
+
+    The port rendered one parameter at a time over the whole statement
+    and restarted each parameter's scan at the top, so every parameter
+    sorting after `holder` reached into the holder's already-rendered
+    text:
+
+      * `%(ttl_ns)s` and `%(term)s` are the dangerous shapes -- the
+        substitution leaves valid SQL that silently stores the TTL or
+        the term where the holder belongs;
+      * `%(lease_id)s` is a hard refusal instead, because a string
+        parameter renders WITH its quotes and the replacement lands
+        inside the holder's own quotes, doubling them (Code: 62).
+
+    The plain holder is the control: it agreed before and must still, so
+    a regression that breaks ordinary holders is distinguishable from
+    one that breaks these.
+    """
+    from dmi.storage.capture.clickhouse_catalog import ClickHouseCatalogWriter
+
+    holders = ["%(ttl_ns)s", "%(term)s", "%(lease_id)s", "plain-holder"]
+
+    with _catalog() as (client, config, prefix):
+        table = (f"`{config.database}`."
+                 f"`{config.table_prefix}_publisher_lease`")
+
+        def stored(term):
+            """Every distinct holder written at `term` -- claim and release.
+
+            A list rather than one value because the two rows can DISAGREE:
+            the release statement binds no `ttl_ns`, so before the repair
+            the tombstone kept the holder the claim had already lost.
+            """
+            return sorted(row[0] for row in client.execute(
+                f"SELECT DISTINCT holder FROM {table} WHERE term = {term}"))
+
+        python = ClickHouseCatalogWriter(client, config)
+        for holder in holders:
+            driver = CatalogDriver()
+            try:
+                _open(driver, prefix)
+                acquired = driver.call(op="acquire", holder=holder)
+                assert acquired["ok"], (
+                    f"the claim for holder {holder!r} was refused, and the "
+                    f"Python writer accepts it: {acquired}")
+                assert acquired["lease"]["holder"] == holder, acquired
+                native_term = acquired["lease"]["term"]
+                assert driver.call(op="release")["ok"]
+            finally:
+                driver.close()
+
+            python_term = python.acquire_publisher_lease(holder).term
+            python.release_publisher_lease()
+
+            native_stored, python_stored = stored(native_term), stored(
+                python_term)
+            assert native_stored == [holder], (
+                f"the native claim for holder {holder!r} left "
+                f"{native_stored!r} in the holder column")
+            assert native_stored == python_stored, (
+                "the two writers stored different holders for the same "
+                f"input {holder!r}: native {native_stored!r} vs Python "
+                f"{python_stored!r}")
+
+
 def test_an_embedded_nul_does_not_truncate_the_statement_on_the_wire():
     """The POST body is a length, not a C string.
 
