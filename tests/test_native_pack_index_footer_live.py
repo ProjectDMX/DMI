@@ -221,6 +221,10 @@ METADATA_CASES = (
     ("token_end-before-token_start", _metadata_set("token_start", 5)),
     ("shape-rank-40", _shape_and_length([1] * 40, 4)),
     ("capture_id-empty", _metadata_set("capture_id", "")),
+    # adapter_revision is the one optional identifier, and "optional" on
+    # the oracle's side means None -- a JSON null -- and nothing else. The
+    # empty STRING is refused like any other identifier.
+    ("adapter_revision-empty", _metadata_set("adapter_revision", "")),
 )
 
 

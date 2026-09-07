@@ -148,12 +148,15 @@ uint64_t bounded_field(const std::string& metadata, const char* key,
   return value.magnitude;
 }
 
-// One required identifier: non-empty and within the text limit, measured
-// in UTF-8 bytes exactly as `_validate_text` measures it.
-std::string checked_text(const std::string& metadata, const char* key,
-                         bool optional = false) {
+// One identifier: non-empty and within the text limit, measured in UTF-8
+// bytes exactly as `_validate_text` measures it. `optional` in
+// `_validate_text` covers a value of None and nothing else, so it has no
+// counterpart here: adapter_revision's absent form is a JSON null, read
+// before this is reached, and its empty-STRING form is refused like any
+// other.
+std::string checked_text(const std::string& metadata, const char* key) {
   const std::string value = field_text(metadata, key, key);
-  if (value.empty() ? !optional : value.size() > kTextLimit) {
+  if (value.empty() || value.size() > kTextLimit) {
     metadata_error(std::string(key) + " must be non-empty UTF-8 within " +
                    std::to_string(kTextLimit) + " bytes");
   }
@@ -299,7 +302,7 @@ std::string render_record_row(const std::string& raw, const PackRefData& ref,
   const bool no_adapter_revision = jc::FindNull(metadata, "adapter_revision");
   const std::string adapter_revision =
       no_adapter_revision ? std::string()
-                          : checked_text(metadata, "adapter_revision", true);
+                          : checked_text(metadata, "adapter_revision");
   const std::string dtype = field_text(metadata, "dtype", "dtype");
   const size_t element_bytes = dtype_bytes(dtype);
   if (dims.size() > kMaxRank) {
