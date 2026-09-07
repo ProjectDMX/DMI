@@ -1928,6 +1928,88 @@ def test_an_earlier_builds_object_beside_this_builds_is_refused():
             driver.close()
 
 
+def _recorded_grant_probes(client, prefix, expected):
+    """The `CHECK GRANT` statements the server recorded for `prefix`.
+
+    Polled until `expected` of them are visible, because the log flushes
+    asynchronously; whatever is there when the wait runs out is returned
+    so the assertion can show what was actually issued.
+    """
+    probes = []
+    for _ in range(25):
+        client.execute("SYSTEM FLUSH LOGS")
+        probes = [
+            row[0] for row in client.execute(
+                "SELECT query FROM system.query_log WHERE type = "
+                "'QueryFinish' AND query LIKE 'CHECK GRANT%' AND query LIKE "
+                f"'%{prefix}%' ORDER BY query_start_time_microseconds, "
+                "query_id")
+        ]
+        if len(probes) >= expected:
+            break
+        sleep(0.2)
+    return probes
+
+
+def test_the_grant_probe_covers_the_superseded_object_too():
+    """The object whose mere PRESENCE refuses must be grant-probed.
+
+    `system.tables` is grant-filtered per role, so an object this role
+    holds no privilege on reads there exactly like one that was dropped.
+    The refusal above (`_reject_legacy_objects_beside_this_build`) is
+    driven by that read, so a role that cannot SEE `_pack_commit_log`
+    is told the catalog is complete -- silent success in exactly the "two
+    builds share one prefix, and the older one's captures land already
+    invisible" case the refusal exists to catch.
+
+    Probing objects and refusing on objects have to be driven by the SAME
+    set, which is why Python's probe loops
+    `self.objects + self.legacy_objects` (`clickhouse_schema.py`, pinned
+    by `_past_the_visibility_checks` in
+    `tests/test_clickhouse_capture_catalog.py`) rather than its own
+    objects alone. `CHECK GRANT` names an object instead of resolving
+    one, so probing a superseded object that is absent costs nothing: the
+    server answers 1.
+
+    Read off `system.query_log` rather than from a restricted role,
+    because a role is what this server cannot make: it has no access
+    management, so `CREATE USER` fails outright. The probe SET is the
+    observable available here, and it is the whole difference between
+    the two behaviours.
+    """
+    from dmi.storage.capture.clickhouse_catalog import ClickHouseCatalogWriter
+
+    with _catalog_drop_only() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            assert driver.call(op="ensure_schema")["ok"]
+            native = _recorded_grant_probes(client, prefix, 10)
+            legacy = (f"CHECK GRANT SHOW TABLES ON `{config.database}`."
+                      f"`{prefix}_pack_commit_log`")
+            assert legacy in native, native
+        finally:
+            driver.call(op="drop_schema", database=config.database,
+                        table_prefix=prefix)
+            driver.close()
+
+    # THE ORACLE: the Python writer's probe set, on its own prefix, must
+    # be the same statements in the same order -- this build's objects
+    # first, superseded ones last.
+    with _catalog_drop_only() as (client, oracle_config, oracle_prefix):
+        writer = ClickHouseCatalogWriter(client, oracle_config)
+        writer.ensure_schema()
+        try:
+            oracle = _recorded_grant_probes(client, oracle_prefix, 10)
+        finally:
+            writer.drop_schema()
+
+    assert [text.replace(prefix, "PREFIX") for text in native] == [
+        text.replace(oracle_prefix, "PREFIX") for text in oracle], (
+            "the native grant probe covers a different set of objects than "
+            "the Python one")
+
+
 def test_an_unstamped_install_is_not_described_as_stamped():
     """A stamp table with no row in it is an install that died before it.
 

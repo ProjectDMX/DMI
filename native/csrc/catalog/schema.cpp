@@ -170,7 +170,20 @@ void CatalogSchema::require_catalog_visibility() const {
   // no privilege on is absent from the state, indistinguishable from one
   // that was dropped. `CHECK GRANT` names an object rather than resolving
   // one, so it needs neither the database nor the objects to exist.
-  for (const auto& [kind, name] : objects_) {
+  //
+  // Every object this build OWNS, current and superseded --
+  // `self.objects + self.legacy_objects`, this build's own first. Probe
+  // and refusal have to be driven by ONE set: the refusal for a
+  // superseded object standing beside this build's fires on that
+  // object's PRESENCE in the grant-filtered state, so probing only
+  // `objects_` left the single object whose presence refuses unprobed,
+  // and a role that cannot see it was told the catalog is complete --
+  // silently succeeding in exactly the two-builds-one-prefix case that
+  // refusal exists to catch. Probing an absent superseded object costs
+  // nothing, per the paragraph above.
+  std::vector<std::pair<std::string, std::string>> owned = objects_;
+  owned.insert(owned.end(), legacy_objects_.begin(), legacy_objects_.end());
+  for (const auto& [kind, name] : owned) {
     try {
       const std::vector<Row> rows = client_->execute(
           "CHECK GRANT SHOW TABLES ON " + qualified(name));
