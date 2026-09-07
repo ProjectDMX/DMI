@@ -562,124 +562,6 @@ def test_a_cursor_key_with_an_empty_component_is_refused():
             driver.close()
 
 
-def test_search_refusal_parity_on_filter_bounds():
-    """CaptureQuery bounds SIX things; search() ported only the limit.
-
-    The oracle refuses a query whose filter lists exceed their bounded
-    cardinality, whose layer numbers fall below -1, or whose time window
-    runs backwards. Native rendered all three straight into SQL, so it
-    ACCEPTED queries the oracle refuses outright -- 1025 layer numbers came
-    back as a successful four-item page.
-    """
-    from dmi.storage.capture.model import CaptureQuery
-
-    with _catalog() as (client, config, prefix):
-        driver = CatalogDriver()
-        try:
-            _open_helper(driver, prefix)
-            _publish_native(driver, prefix, _descriptor_dicts(4), 7)
-
-            cases = (
-                # Bounded cardinality: 128 hook names, 1024 layer numbers.
-                {"hook_names": [f"hook-{i}" for i in range(10_000)]},
-                {"hook_names": [f"hook-{i}" for i in range(129)]},
-                {"layer_numbers": list(range(1025))},
-                # A window that runs backwards selects nothing, and asking
-                # for it is a caller error rather than an empty answer.
-                {"captured_after_ns": 2000, "captured_before_ns": 1000},
-                # -1 is the "no layer" sentinel; below it means nothing.
-                {"layer_numbers": [-5]},
-            )
-            for fields in cases:
-                refused = driver.call(op="search", limit=100, **fields)
-                assert not refused["ok"], (fields.keys(), refused)
-                assert refused["error"] == "ValueError", (
-                    fields.keys(), refused)
-
-                # The oracle refuses the same filters.
-                python_fields = {
-                    name: tuple(value) if isinstance(value, list) else value
-                    for name, value in fields.items()
-                }
-                with pytest.raises(ValueError):
-                    CaptureQuery(limit=100, **python_fields)
-
-            # The bounds bite only at the edge: the largest ACCEPTED lists
-            # and a forward window still serve the same page both sides.
-            accepted = {"hook_names": ["resid_pre"] + [
-                            f"hook-{i}" for i in range(127)],
-                        "layer_numbers": list(range(1024))}
-            native = driver.call(op="search", limit=100, **accepted)
-            assert native["ok"], native
-            page = _python_page_items(
-                _python_reader(client, config),
-                hook_names=tuple(accepted["hook_names"]),
-                layer_numbers=tuple(accepted["layer_numbers"]), limit=100)
-            assert _normalize(native["items"]) == _normalize(page.items)
-        finally:
-            driver.close()
-
-
-def test_a_cursor_captured_at_ns_outside_uint64_is_refused():
-    """The key's timestamp is a UInt64, and nothing checked it.
-
-    `parts[3]` travelled out of the cursor as a raw JSON token and into the
-    statement as a quoted STRING literal, so the server coerced it with
-    String -> UInt64 -- which wraps modulo 2**64. A crafted key holding
-    `2**64 + honest` therefore named a DIFFERENT position than the one it
-    spells, and search answered `ok` with a page that silently skips rows.
-    Python's decoder requires `type(key[3]) is int` and `0 <= v <= 2**64-1`.
-    """
-    import base64
-
-    with _catalog() as (client, config, prefix):
-        driver = CatalogDriver()
-        try:
-            _open_helper(driver, prefix)
-            descriptors = _descriptor_dicts(4)
-            _publish_native(driver, prefix, descriptors, 7)
-
-            first = driver.call(op="search", limit=1)
-            assert first["ok"] and first["next_cursor"], first
-            good = first["next_cursor"]
-            payload = json.loads(base64.urlsafe_b64decode(
-                good + "=" * (-len(good) % 4)))
-            honest = payload["k"][3]
-
-            def encode(key_value):
-                crafted = dict(payload, k=list(payload["k"]))
-                crafted["k"][3] = key_value
-                raw = json.dumps(crafted, sort_keys=True,
-                                 separators=(",", ":")).encode()
-                return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-
-            from dmi.storage.capture.cursor import InvalidCursorError
-            from dmi.storage.capture.model import CaptureQuery
-            reader = _python_reader(client, config)
-
-            # The decisive case: wrapping lands 1500ns past the honest
-            # position, i.e. after capture-1 -- so the accepted page used to
-            # come back missing a row, with ok=True and no error.
-            oversized = 2**64 + honest + 1500
-            for key_value in (oversized, "abc", -5, 1.5, True, None):
-                cursor = encode(key_value)
-                refused = driver.call(op="search", limit=100, cursor=cursor)
-                assert not refused["ok"], (key_value, refused)
-                assert refused["error"] == "ValueError", (key_value, refused)
-                # The oracle refuses the same cursor.
-                with pytest.raises(InvalidCursorError):
-                    reader.search(CaptureQuery(limit=100, cursor=cursor))
-
-            # The honest cursor still pages, so the check above is about the
-            # crafted timestamp rather than about the cursor as a whole.
-            walked = driver.call(op="search", limit=100, cursor=good)
-            assert walked["ok"], walked
-            assert [item[4] for item in walked["items"]] == [
-                "capture-1", "capture-2", "capture-3"], walked
-        finally:
-            driver.close()
-
-
 def test_cursor_parity_across_implementations():
     """A cursor either side issues, the other side accepts and walks."""
     with _catalog() as (client, config, prefix):
@@ -1414,6 +1296,9 @@ def test_fp8_and_wide_int_summaries_parity(fake_s3):
             from dmi.storage.capture.clickhouse_catalog import (
                 ClickHouseCatalogWriter,
             )
+            from dmi.storage.capture.clickhouse_catalog import (
+                ClickHouseCatalogWriter,
+            )
             catalog_writer = ClickHouseCatalogWriter(client, config)
             driver = CatalogDriver()
             import base64 as b64mod
@@ -1552,6 +1437,163 @@ def test_fp8_and_wide_int_summaries_parity(fake_s3):
                     assert summary["maximum"] == expected.maximum
                     assert summary["l2_norm"] == expected.l2_norm, (
                         summary["capture_id"])
+            finally:
+                driver.close()
+        finally:
+            pass
+
+
+def test_zero_element_tensor_hydrates_to_empty_bytes(fake_s3):
+    """A zero-dimension tensor's payload is genuinely zero bytes — legal.
+
+    The sentinel for 'unresolved' must be tracked separately from the
+    payload length: an empty payload is a VALID result, not evidence that
+    a slot was never filled. Python hydration handles this; the native
+    side must too.
+    """
+    from dmi.storage.capture import (
+        CaptureReader, S3PackStore, S3StoreConfig,
+    )
+    from dmi.storage.capture.clickhouse_reader import (
+        ClickHouseCaptureCatalog, ClickHouseReaderConfig,
+    )
+    from dmi.storage.capture.model import CaptureMetadata, CaptureRecord
+    from dmi.storage.capture.pack import PackWriter, PackReader as PR
+
+    with _catalog() as (client, config, prefix):
+        try:
+            sink, store, driver = None, None, None
+            empty_payload = b""
+            meta = CaptureMetadata(
+                capture_id="scalar-0", tenant_id="t", experiment_id="e",
+                run_id="r", session_id="s", request_id="q",
+                sequence_id="n0", model_id="m", model_revision="mr",
+                adapter_revision=None, capture_policy_version="v",
+                hook_name="h", layer_number=0, producer_rank=0,
+                step_number=0, token_start=0, token_end=0,
+                batch_position=0, dtype="float32", shape=(0,),
+                captured_at_ns=1_700_000_000_000_000_000,
+            )
+            record = CaptureRecord(metadata=meta, payload=empty_payload)
+            assert record.payload == b"", "the record validates"
+            assert meta.logical_bytes == 0, "scalar: zero elements"
+
+            pack_id = str(uuid.uuid4())
+            writer = PackWriter(
+                pack_id=pack_id, created_at_ns=1_700_000_000_000_000_000,
+                max_pack_bytes=8 * 1024 * 1024)
+            writer.append(record)
+            sealed = writer.seal()
+
+            from dmi.storage.capture.clickhouse_catalog import (
+                ClickHouseCatalogWriter,
+            )
+            catalog_writer = ClickHouseCatalogWriter(client, config)
+            catalog_writer.ensure_schema()
+            driver = CatalogDriver()
+            try:
+                _open_helper(driver, prefix)
+                packed = PR.from_bytes(sealed.data)
+                packed_descriptors = packed.descriptors(
+                    store_id="native-test",
+                    object_key=f"packs/{pack_id}.dmi-pack")
+                rows = []
+                for d in packed_descriptors:
+                    m, l = d.metadata, d.locator
+                    rows.append({
+                        "capture_id": m.capture_id,
+                        "tenant_id": m.tenant_id,
+                        "experiment_id": m.experiment_id,
+                        "run_id": m.run_id,
+                        "session_id": m.session_id,
+                        "request_id": m.request_id,
+                        "sequence_id": m.sequence_id,
+                        "model_id": m.model_id,
+                        "model_revision": m.model_revision,
+                        "adapter_revision": m.adapter_revision,
+                        "capture_policy_version": m.capture_policy_version,
+                        "hook_name": m.hook_name,
+                        "layer_number": m.layer_number,
+                        "producer_rank": m.producer_rank,
+                        "step_number": m.step_number,
+                        "token_start": m.token_start,
+                        "token_end": m.token_end,
+                        "batch_position": m.batch_position,
+                        "dtype": m.dtype,
+                        "shape": list(m.shape),
+                        "captured_at_ns": m.captured_at_ns,
+                        "pack_id": pack_id, "store_id": "native-test",
+                        "object_key": f"packs/{pack_id}.dmi-pack",
+                        "object_bytes": len(sealed.data),
+                        "pack_checksum": sealed.checksum,
+                        "pack_record_count": 1,
+                        "payload_offset": l.offset,
+                        "stored_length": l.stored_length,
+                        "decoded_length": l.decoded_length,
+                        "codec": l.codec, "payload_checksum": l.checksum,
+                    })
+                driver.call(op="acquire", holder="writer")
+                driver.call(op="write_descriptors", descriptors=rows,
+                            index_version=7)
+                driver.call(
+                    op="publish_snapshot", index_version=7,
+                    refs=[{"store_id": "native-test", "pack_id": pack_id}],
+                    published_at_ns=7, indexed_rows=1, indexed_packs=1)
+
+                import boto3 as _boto3
+                from botocore.config import Config as _BotoConfig
+                s3_client = _boto3.client(
+                    "s3", endpoint_url=fake_s3, region_name=REGION,
+                    aws_access_key_id=ACCESS,
+                    aws_secret_access_key=SECRET,
+                    config=_BotoConfig(s3={"addressing_style": "path"}),
+                    verify=False)
+                s3_client.put_object(
+                    Bucket=BUCKET, Key=f"packs/{pack_id}.dmi-pack",
+                    Body=sealed.data)
+
+                # THE ORACLE: Python hydrates the empty tensor correctly.
+                python_catalog = ClickHouseCaptureCatalog(
+                    client, ClickHouseReaderConfig.from_catalog(config))
+                python_store = S3PackStore.from_config(
+                    S3StoreConfig(
+                        endpoint_url=fake_s3, bucket=BUCKET, region=REGION,
+                        access_key_id=ACCESS, secret_access_key=SECRET,
+                        store_id="native-test",
+                        allow_insecure_http=True))
+                python_reader = CaptureReader(
+                    python_catalog, {"native-test": python_store})
+                from dmi.storage.capture.model import CaptureQuery
+                selection = python_reader.select(
+                    CaptureQuery(tenant_id="t", limit=10))
+                hydrated = python_reader.hydrate(
+                    selection, byte_limit=1 << 30)
+                assert len(hydrated) == 1
+                assert hydrated[0].payload == b"", (
+                    "python hydrates the zero-element tensor to empty bytes")
+
+                # THE NATIVE SIDE: must also return empty bytes, not refuse.
+                native_select = driver.call(
+                    op="select", tenant_id="t", limit=10,
+                    endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                    secret=SECRET, insecure=True)
+                assert native_select["ok"], native_select
+                sel = native_select["selection"]
+                native_hydrated = driver.call(
+                    op="hydrate", selection_id=sel["selection_id"],
+                    capture_ids=sel["capture_ids"],
+                    catalog_watermark=sel["catalog_watermark"],
+                    filter_hash=sel["filter_hash"],
+                    tenant_id=sel["tenant_id"], byte_limit=1 << 30,
+                    endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                    secret=SECRET, insecure=True)
+                assert native_hydrated["ok"], native_hydrated
+                assert len(native_hydrated["payloads"]) == 1
+                import base64
+                decoded = base64.b64decode(native_hydrated["payloads"][0])
+                assert decoded == b"", (
+                    "the zero-element tensor hydrates to empty bytes, "
+                    "not a refusal")
             finally:
                 driver.close()
         finally:

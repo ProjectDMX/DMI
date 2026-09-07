@@ -660,8 +660,11 @@ std::vector<std::string> NativeCaptureReader::hydrate(
     }
   }
 
-  // Phase two: fetch and verify.
+  // Phase two: fetch and verify. Resolution is tracked separately from
+  // the payload bytes: a zero-dimension tensor's payload is genuinely
+  // empty, which cannot be the sentinel for an unfilled slot.
   std::vector<std::string> payloads(descriptors.size());
+  std::vector<char> resolved(descriptors.size(), 0);
   for (const auto& plan : plans) {
     const auto& first_descriptor = descriptors[plan.descriptor_indexes[0]];
     PackRefData ref{
@@ -711,13 +714,12 @@ std::vector<std::string> NativeCaptureReader::hydrate(
                                  descriptor[kCaptureId]);
         }
         payloads[index] = payload;
+        resolved[index] = 1;
       }
     }
   }
-  for (const auto& payload : payloads) {
-    if (payload.empty()) {
-      // (a zero-length payload is legal only if the locator said so; our
-      //  v1 packs never produce one, and resolve() guarantees every slot)
+  for (size_t i = 0; i < payloads.size(); ++i) {
+    if (!resolved[i]) {
       throw CatalogError(CatalogError::Kind::kValue,
                          "hydration plan did not resolve every capture");
     }

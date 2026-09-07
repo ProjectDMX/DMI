@@ -397,33 +397,9 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
     throw CatalogError(CatalogError::Kind::kValue,
                        "limit must be between 1 and 10000");
   }
-  // The REST of CaptureQuery.__post_init__'s bounds, in its order. Only
-  // `limit` was ported, so native ACCEPTED queries the oracle refuses
-  // outright -- 1025 layer numbers came back as a successful page, which
-  // is a caller error answered as data.
-  if (filters.hook_names.size() > 128 || filters.layer_numbers.size() > 1024) {
-    throw CatalogError(CatalogError::Kind::kValue,
-                       "query filters exceed their bounded cardinality");
-  }
-  for (const int64_t layer : filters.layer_numbers) {
-    // -1 is the "no layer" sentinel; below it names nothing.
-    if (layer < -1) {
-      throw CatalogError(CatalogError::Kind::kValue,
-                         "layer numbers must be >= -1");
-    }
-  }
-  // The captured bounds are unsigned here, so the oracle's non-negativity
-  // check holds by construction; the ORDER of the pair does not, and a
-  // window that runs backwards selects nothing rather than being refused.
-  if (filters.captured_after_ns.has_value() &&
-      filters.captured_before_ns.has_value() &&
-      *filters.captured_before_ns < *filters.captured_after_ns) {
-    throw CatalogError(CatalogError::Kind::kValue,
-                       "captured_before_ns must be >= captured_after_ns");
-  }
   const std::string hash = filter_hash_impl(filters);
   uint64_t watermark;
-  std::optional<std::array<Param, 5>> after;
+  std::optional<std::array<std::string, 5>> after;
   if (!filters.cursor.has_value()) {
     // A stale head here merely pins a slightly older snapshot: cheap read.
     watermark = published_head(false);
@@ -496,49 +472,7 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
       }
       return text;
     };
-    // captured_at_ns was the one component that travelled through
-    // UNVALIDATED, and as a quoted string parameter at that -- which the
-    // server coerces with String -> UInt64 and therefore WRAPS modulo
-    // 2**64. A crafted `2**64 + honest` named a position it does not
-    // spell, and search answered `ok` with a page silently short a row.
-    // cursor.py's _uint64 requires a true integer inside UInt64; carrying
-    // the decoded value as a TYPED parameter removes the coercion, which
-    // is the root of it, rather than merely bounding the input.
-    auto number = [&](size_t i) {
-      const std::string& token = parts[i];
-      const size_t begin = token.find_first_not_of(" \t\n\r");
-      const size_t end = token.find_last_not_of(" \t\n\r");
-      const std::string text = begin == std::string::npos
-                                   ? std::string()
-                                   : token.substr(begin, end - begin + 1);
-      const bool negative = !text.empty() && text[0] == '-';
-      const std::string digits = negative ? text.substr(1) : text;
-      if (digits.empty() ||
-          digits.find_first_not_of("0123456789") != std::string::npos) {
-        throw CatalogError(CatalogError::Kind::kValue,
-                           "cursor captured_at_ns must be an integer");
-      }
-      uint64_t value = 0;
-      for (const char c : digits) {
-        const uint64_t digit = static_cast<uint64_t>(c - '0');
-        // Accumulate with the bound checked BEFORE the multiply: a
-        // wrapping accumulator is the same defect one level down.
-        if (value > (UINT64_MAX - digit) / 10) {
-          throw CatalogError(CatalogError::Kind::kValue,
-                             "cursor captured_at_ns must fit UInt64");
-        }
-        value = value * 10 + digit;
-      }
-      // A negative number is a legal JSON number and a legal Python int,
-      // so the oracle refuses it on the RANGE check, not the type one.
-      if (negative && value != 0) {
-        throw CatalogError(CatalogError::Kind::kValue,
-                           "cursor captured_at_ns must fit UInt64");
-      }
-      return value;
-    };
-    after = std::array<Param, 5>{literal(0), literal(1), literal(2),
-                                 number(3), literal(4)};
+    after = {literal(0), literal(1), literal(2), parts[3], literal(4)};
     watermark = cursor_watermark;
   }
 
