@@ -30,14 +30,17 @@ dmi ui ./Qwen3-8B
 ```
 
 `dmi ui` takes the model however you have it — a model directory, a
-`config.json`, a Hugging Face model id (needs `transformers`), or a DMI
-descriptor YAML:
+`config.json`, a Hugging Face model id, or a DMI descriptor YAML:
 
 ```bash
 dmi ui ./Qwen3-8B/config.json
 dmi ui Qwen/Qwen3-8B
 dmi ui examples/model_descriptors/llama3-8b.yaml
 ```
+
+Resolving a model directory or a bare Hugging Face model id needs
+`transformers` (`pip install -e ".[hf]"`); pointing at a `config.json`
+directly does not.
 
 To start from an existing configuration and save back to it:
 

@@ -19,6 +19,13 @@ ui = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
 ]
+# Resolving a bare model directory or Hugging Face model id (`dmi ui
+# Qwen/Qwen3-8B`, `dmi describe-model ./Qwen3-8B`) reads its config via
+# `transformers.AutoConfig`. Pointing at a `config.json` directly needs none
+# of this -- see src/dmi/configuration/introspect.py.
+hf = [
+    "transformers>=4.40",
+]
 
 [project.scripts]
 dmi = "dmi.cli:main"

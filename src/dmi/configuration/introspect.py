@@ -320,8 +320,8 @@ def _load_hf_config_by_id(model_id: str) -> Any:
     except ImportError as exc:
         raise DescriptorError(
             f"Resolving the model id {model_id!r} needs `transformers` "
-            f"installed. Either install it, or point at the model's "
-            f"config.json directly."
+            f"installed (`pip install -e \".[hf]\"`). Either install it, or "
+            f"point at the model's config.json directly."
         ) from exc
     try:
         return AutoConfig.from_pretrained(model_id)
