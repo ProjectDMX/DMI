@@ -109,6 +109,26 @@ std::vector<std::string> read_array(const std::string& line,
   return jc::SplitElements(inside);
 }
 
+// `[{"name": ..., "str"|"uint"|"int": ...}, ...]` -> a Params map. One
+// key per element names the variant arm, because the three arms render
+// differently (a str is quoted, the integers are not).
+dmi_catalog::Params read_params(const std::string& line) {
+  dmi_catalog::Params params;
+  for (const std::string& element :
+       jc::SplitElements(jc::Unwrap(jc::FindArray(line, "params")))) {
+    const std::string name = jc::FindString(element, "name");
+    if (name.empty()) continue;
+    if (jc::HasKey(element, "uint")) {
+      params[name] = static_cast<uint64_t>(jc::FindInt(element, "uint"));
+    } else if (jc::HasKey(element, "int")) {
+      params[name] = static_cast<int64_t>(jc::FindInt(element, "int"));
+    } else {
+      params[name] = jc::FindString(element, "str");
+    }
+  }
+  return params;
+}
+
 std::vector<PackIdentity> read_identities(const std::string& line,
                                           const char* key) {
   std::vector<PackIdentity> out;
@@ -272,6 +292,17 @@ std::string respond(const std::string& line, Session* session) {
       // escape_chars_map parity gate can run on the CPU gate.
       out = ",\"escaped\":";
       escape_into(dmi_catalog::sql_quote(jc::FindString(line, "value")), &out);
+      return prefix + "true" + out + "}";
+    }
+    if (op == "substitute") {
+      // The escaper's sibling, and session-less for the same reason: the
+      // `%(name)s` SCANNER against clickhouse-driver's `query % escaped`.
+      // `escape` gated the rendering of one value and nothing gated the
+      // walk over the statement, which is where a parameter reaching into
+      // another parameter's already-rendered text hid.
+      out = ",\"statement\":";
+      escape_into(dmi_catalog::substitute(jc::FindString(line, "query"),
+                                          read_params(line)), &out);
       return prefix + "true" + out + "}";
     }
     if (session->writer == nullptr) {
