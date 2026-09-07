@@ -1737,6 +1737,25 @@ def test_drop_schema_removes_every_object():
 # `verify_compatibility` op, which returns the verdict without running the
 # install that would otherwise follow it.
 
+def _prescribed_drops(message):
+    """The object names the rebuild instruction tells the operator to drop.
+
+    The prescription is the list between "(views first) --" and
+    "-- then run"; the prose around it names objects in passing, so the
+    slice is the only part an operator can follow by name.
+    """
+    head, _, rest = message.partition("(views first) -- ")
+    assert head and rest, message
+    listed, sep, _ = rest.partition(" -- then run")
+    assert sep, message
+    names = []
+    for item in listed.split(", "):
+        qualified = item.strip().split(".")
+        assert len(qualified) == 2, item
+        names.append(qualified[1].strip("`"))
+    return names
+
+
 def _legacy_table(client, config, prefix):
     """Create the object only a pre-v4 build creates, beside this build's."""
     client.execute(
@@ -1792,6 +1811,29 @@ def test_an_earlier_builds_object_beside_this_builds_is_refused():
             assert "_pack_commit_log" in str(oracle.value)
             assert "an object only an earlier build creates" in str(
                 oracle.value)
+
+            # THE PRESCRIPTION, not the prose. The preamble names the
+            # legacy object in passing ("and `X` stands beside it"), so
+            # `"_pack_commit_log" in message` passes whether or not the
+            # drop list contains it -- and it did not. An operator who
+            # follows the list by name drops what it names, reruns
+            # ensure_schema, and is refused again for the object the list
+            # never mentioned.
+            native_drops = _prescribed_drops(refused["message"])
+            assert f"{prefix}_pack_commit_log" in native_drops, native_drops
+            assert native_drops == _prescribed_drops(str(oracle.value)), (
+                "the prescribed drop list diverges from the Python one")
+
+            # And the contract itself: dropping exactly what the message
+            # names must leave a prefix that installs.
+            for name in native_drops:
+                client.execute(
+                    f"DROP TABLE IF EXISTS `{config.database}`.`{name}`")
+            assert client.execute(
+                "SELECT name FROM system.tables WHERE database = "
+                f"'{config.database}' AND name LIKE '{prefix}%'") == []
+            assert driver.call(op="ensure_schema")["ok"], (
+                "following the rebuild instruction must escape the refusal")
         finally:
             driver.close()
 

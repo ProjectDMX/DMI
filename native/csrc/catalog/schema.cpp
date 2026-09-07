@@ -126,7 +126,18 @@ void CatalogSchema::refuse(const std::string& what) const {
 
 std::string CatalogSchema::rebuild_instruction() const {
   std::string objects;
+  // `self.objects + self.legacy_objects`, in that order: this build's own
+  // first, superseded ones last. Prescribing only objects_ left the
+  // legacy object out of the drop list, and an operator who follows the
+  // list by name drops what it names, reruns ensure_schema and is refused
+  // AGAIN -- by then the list prescribes nine objects that are all
+  // already gone, so it names nothing actionable at all. drop() has
+  // always looped both, so only the operator working from the message
+  // was trapped.
   for (const auto& [kind, name] : objects_) {
+    objects += (objects.empty() ? "" : ", ") + qualified(name);
+  }
+  for (const auto& [kind, name] : legacy_objects_) {
     objects += (objects.empty() ? "" : ", ") + qualified(name);
   }
   return (
