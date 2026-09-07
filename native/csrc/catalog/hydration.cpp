@@ -583,10 +583,12 @@ NativeCaptureReader::summarize_core(const Selection& selection,
   const auto descriptors = resolve(selection);
   uint64_t total_elements = 0;
   for (size_t i = 0; i < descriptors.size(); ++i) {
-    total_elements +=
-        shape_product(descriptors[i][kShape]) *
-        (parse_u64_field(descriptors[i][kDecodedLength], "decoded") /
-         dtype_bytes(descriptors[i][kDtype]));
+    // prod(shape) once per capture, matching reader.py's
+    // sum(math.prod(shape)). decoded_length / dtype_bytes is the SAME
+    // number (the pack index binds decoded_length == prod(shape) *
+    // dtype_bytes), so multiplying by it counted N**2 elements for an
+    // N-element capture and refused everything from 8001 elements up.
+    total_elements += shape_product(descriptors[i][kShape]);
   }
   if (total_elements > max_summary_elements) {
     throw CatalogError(
