@@ -22,8 +22,35 @@ std::string Unescape(const std::string& text, size_t& q);
 std::string FindString(const std::string& text, const std::string& key,
                        size_t from = 0);
 
-// First non-negative integer value for `key` (either separator style).
-// Returns -1 when the key is absent.
+// Outcome of a bounded integer scan.
+enum class IntFind {
+  kOk,          // found, and representable in 64 bits
+  kAbsent,      // no integer value for the key
+  kOutOfRange,  // the literal does not fit in 64 bits at all
+};
+
+// First integer value for `key` (either separator style), bounded before it
+// can overflow.
+//
+// Accepts the union of the signed and unsigned 64-bit ranges --
+// [-2^63, 2^64-1] -- and stores the two's-complement bit pattern, so callers
+// that read the result back as uint64_t recover values above INT64_MAX
+// exactly (step_number, token_start/end and captured_at_ns are UInt64 in the
+// catalog, and CaptureMetadata admits their whole range).
+//
+// A literal outside that union is kOutOfRange. It is not representable in 64
+// bits, so there is no int64_t this function could return that would be the
+// right answer: only the caller can decide how to refuse.
+IntFind FindIntChecked(const std::string& text, const std::string& key,
+                       int64_t* out);
+
+// First integer value for `key` (either separator style).
+//
+// Returns -1 when the key is absent -- and also when the literal is out of
+// range, because one int64_t cannot distinguish the two. That is a refusal,
+// never a wrapped value, but a caller for which -1 means "use the default"
+// will silently take the default. Use FindIntChecked wherever an out-of-range
+// literal has to be reported rather than defaulted.
 int64_t FindInt(const std::string& text, const std::string& key);
 
 // True when `key` is present with any value (either separator style).

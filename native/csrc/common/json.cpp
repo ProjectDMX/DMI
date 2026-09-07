@@ -55,28 +55,63 @@ std::string FindString(const std::string& text, const std::string& key,
   return "";
 }
 
-int64_t FindInt(const std::string& text, const std::string& key) {
+namespace {
+
+// One JSON integer literal starting at `q`. The magnitude accumulates in a
+// uint64_t so the bound can be tested *before* the multiply: a signed
+// accumulator has already overflowed -- undefined behaviour, in practice a
+// wrap modulo 2^64 -- by the time any check on its result could run, and the
+// literal's value is gone.
+IntFind ScanInt(const std::string& text, size_t q, int64_t* out) {
+  bool neg = false;
+  if (q < text.size() && text[q] == '-') {
+    neg = true;
+    ++q;
+  }
+  // A positive literal may use the whole unsigned range; a negative one stops
+  // at 2^63 == |INT64_MIN|, which is one larger than INT64_MAX.
+  const uint64_t limit = neg ? (uint64_t{1} << 63) : ~uint64_t{0};
+  uint64_t magnitude = 0;
+  bool any = false;
+  bool over = false;
+  while (q < text.size() && text[q] >= '0' && text[q] <= '9') {
+    const uint64_t digit = static_cast<uint64_t>(text[q] - '0');
+    // "magnitude * 10 + digit > limit", rearranged to not overflow itself.
+    if (magnitude > (limit - digit) / 10) over = true;
+    if (!over) magnitude = magnitude * 10 + digit;
+    ++q;
+    any = true;
+  }
+  if (!any) return IntFind::kAbsent;
+  if (over) return IntFind::kOutOfRange;
+  // Two's complement, negated as unsigned: exact at 2^63, where
+  // -static_cast<int64_t>(magnitude) would itself overflow. The narrowing
+  // cast is the same modular reinterpretation the uint64_t callers already
+  // rely on in the other direction.
+  *out = neg ? static_cast<int64_t>(~magnitude + 1)
+             : static_cast<int64_t>(magnitude);
+  return IntFind::kOk;
+}
+
+}  // namespace
+
+IntFind FindIntChecked(const std::string& text, const std::string& key,
+                       int64_t* out) {
   for (const char* sep : {": ", ":"}) {
     const std::string needle = "\"" + key + "\"" + sep;
     const size_t at = text.find(needle);
     if (at == std::string::npos) continue;
-    size_t q = at + needle.size();
-    int64_t v = 0;
-    bool neg = false;
-    if (q < text.size() && text[q] == '-') {
-      neg = true;
-      ++q;
-    }
-    bool any = false;
-    while (q < text.size() && text[q] >= '0' && text[q] <= '9') {
-      v = v * 10 + (text[q] - '0');
-      ++q;
-      any = true;
-    }
-    if (!any) continue;
-    return neg ? -v : v;
+    const IntFind found = ScanInt(text, at + needle.size(), out);
+    // No digits under this separator style: try the other one.
+    if (found == IntFind::kAbsent) continue;
+    return found;
   }
-  return -1;
+  return IntFind::kAbsent;
+}
+
+int64_t FindInt(const std::string& text, const std::string& key) {
+  int64_t value = 0;
+  return FindIntChecked(text, key, &value) == IntFind::kOk ? value : -1;
 }
 
 bool HasKey(const std::string& text, const std::string& key) {
