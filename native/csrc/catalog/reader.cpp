@@ -182,17 +182,81 @@ size_t top_level_member_count(const std::string& object) {
   return jc::SplitElements(inside).size();
 }
 
-uint64_t find_uint_in(const std::string& object, const char* key) {
+// The raw JSON token a key maps to, un-parsed. jc::FindInt has already
+// destroyed the spelling by the time it returns a value, and the spelling
+// is exactly what a bounded parse needs.
+std::string find_token_in(const std::string& object, const char* key) {
+  for (const char* sep : {": ", ":"}) {
+    const std::string needle = std::string("\"") + key + "\"" + sep;
+    const size_t at = object.find(needle);
+    if (at == std::string::npos) continue;
+    const size_t begin = at + needle.size();
+    size_t q = begin;
+    while (q < object.size() && object[q] != ',' && object[q] != '}' &&
+           object[q] != ']') {
+      ++q;
+    }
+    return object.substr(begin, q - begin);
+  }
+  return std::string();
+}
+
+enum class NumberError { kNone, kNotInteger, kOutOfRange };
+
+// The ONE parse every cursor integer goes through -- the envelope's `v` and
+// `w` and the key's captured_at_ns. jc::FindInt accumulates digits into an
+// int64_t with no bound check whatsoever, so a spelling above UInt64 did
+// not refuse, it WRAPPED: `2**64 + 1` on `w` pinned the snapshot at
+// watermark 1 (an `ok` answer with an empty page and watermark "1"), and on
+// `v` it walked through the version gate below and served a full page.
+// json.loads keeps the whole integer, so the oracle refuses both.
+NumberError parse_cursor_uint(const std::string& token, uint64_t* out) {
+  const size_t begin = token.find_first_not_of(" \t\n\r");
+  const size_t end = token.find_last_not_of(" \t\n\r");
+  const std::string text = begin == std::string::npos
+                               ? std::string()
+                               : token.substr(begin, end - begin + 1);
+  const bool negative = !text.empty() && text[0] == '-';
+  const std::string digits = negative ? text.substr(1) : text;
+  if (digits.empty() ||
+      digits.find_first_not_of("0123456789") != std::string::npos) {
+    return NumberError::kNotInteger;
+  }
+  uint64_t value = 0;
+  for (const char c : digits) {
+    const uint64_t digit = static_cast<uint64_t>(c - '0');
+    // Accumulate with the bound checked BEFORE the multiply: a wrapping
+    // accumulator is the same defect one level down.
+    if (value > (UINT64_MAX - digit) / 10) return NumberError::kOutOfRange;
+    value = value * 10 + digit;
+  }
+  // A negative number is a legal JSON number and a legal Python int, so
+  // the oracle refuses it on the RANGE check, not the type one.
+  if (negative && value != 0) return NumberError::kOutOfRange;
+  *out = value;
+  return NumberError::kNone;
+}
+
+// `label` names the field the way cursor.py's _uint64 call site does, so a
+// refusal reads with the oracle's wording.
+uint64_t find_uint_in(const std::string& object, const char* key,
+                      const char* label) {
   if (!jc::HasKey(object, key)) {
     throw CatalogError(CatalogError::Kind::kValue,
                        std::string("cursor is missing ") + key);
   }
-  const int64_t value = jc::FindInt(object, key);
-  if (value < 0) {
-    throw CatalogError(CatalogError::Kind::kValue,
-                       std::string("cursor ") + key + " must fit UInt64");
+  uint64_t value = 0;
+  switch (parse_cursor_uint(find_token_in(object, key), &value)) {
+    case NumberError::kNotInteger:
+      throw CatalogError(CatalogError::Kind::kValue,
+                         std::string(label) + " must be an integer");
+    case NumberError::kOutOfRange:
+      throw CatalogError(CatalogError::Kind::kValue,
+                         std::string(label) + " must fit UInt64");
+    case NumberError::kNone:
+      break;
   }
-  return static_cast<uint64_t>(value);
+  return value;
 }
 
 // Undo ClickHouse's TSV escaping: \\\\ → \\\, \\' → ', \\n, \\t, and \\N → the
@@ -449,10 +513,19 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
     // out `k` and `w` pages a v2 cursor with v1 semantics and accepts
     // fields it does not understand, which turns a format designed to
     // evolve into one that silently cannot.
-    if (find_uint_in(payload, "v") != kCursorVersion) {
+    // The version gate takes ANY non-1 spelling, in range or out of it, on
+    // the one message the oracle uses -- a `v` that does not fit UInt64 is
+    // an unsupported version, not a version this reader may bound and then
+    // compare.
+    if (!jc::HasKey(payload, "v")) {
+      throw CatalogError(CatalogError::Kind::kValue, "cursor is missing v");
+    }
+    const std::string version_token = find_token_in(payload, "v");
+    uint64_t version = 0;
+    if (parse_cursor_uint(version_token, &version) != NumberError::kNone ||
+        version != kCursorVersion) {
       throw CatalogError(CatalogError::Kind::kValue,
-                         "cursor version must be " +
-                             std::to_string(kCursorVersion));
+                         "unsupported cursor version: " + version_token);
     }
     for (const char* field : {"v", "w", "fh", "k"}) {
       if (!jc::HasKey(payload, field)) {
@@ -468,7 +541,8 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
       throw CatalogError(CatalogError::Kind::kValue,
                          "cursor does not match the filters that issued it");
     }
-    const uint64_t cursor_watermark = find_uint_in(payload, "w");
+    const uint64_t cursor_watermark =
+        find_uint_in(payload, "w", "cursor watermark");
     if (cursor_watermark > max_watermark) {
       throw CatalogError(
           CatalogError::Kind::kValue,
@@ -496,44 +570,27 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
       }
       return text;
     };
-    // captured_at_ns was the one component that travelled through
-    // UNVALIDATED, and as a quoted string parameter at that -- which the
-    // server coerces with String -> UInt64 and therefore WRAPS modulo
-    // 2**64. A crafted `2**64 + honest` named a position it does not
-    // spell, and search answered `ok` with a page silently short a row.
-    // cursor.py's _uint64 requires a true integer inside UInt64; carrying
-    // the decoded value as a TYPED parameter removes the coercion, which
-    // is the root of it, rather than merely bounding the input.
+    // captured_at_ns additionally travelled into the statement as a quoted
+    // STRING parameter -- which the server coerces with String -> UInt64
+    // and therefore WRAPS modulo 2**64. A crafted `2**64 + honest` named a
+    // position it does not spell, and search answered `ok` with a page
+    // silently short a row. Carrying the decoded value as a TYPED
+    // parameter removes the coercion, which is the root of that one.
+    // The bound itself is NOT special to this component: every cursor
+    // integer -- `v` and `w` above included -- goes through the one
+    // parse_cursor_uint above, because all three used to reach a digit
+    // accumulator with no bound check at all.
     auto number = [&](size_t i) {
-      const std::string& token = parts[i];
-      const size_t begin = token.find_first_not_of(" \t\n\r");
-      const size_t end = token.find_last_not_of(" \t\n\r");
-      const std::string text = begin == std::string::npos
-                                   ? std::string()
-                                   : token.substr(begin, end - begin + 1);
-      const bool negative = !text.empty() && text[0] == '-';
-      const std::string digits = negative ? text.substr(1) : text;
-      if (digits.empty() ||
-          digits.find_first_not_of("0123456789") != std::string::npos) {
-        throw CatalogError(CatalogError::Kind::kValue,
-                           "cursor captured_at_ns must be an integer");
-      }
       uint64_t value = 0;
-      for (const char c : digits) {
-        const uint64_t digit = static_cast<uint64_t>(c - '0');
-        // Accumulate with the bound checked BEFORE the multiply: a
-        // wrapping accumulator is the same defect one level down.
-        if (value > (UINT64_MAX - digit) / 10) {
+      switch (parse_cursor_uint(parts[i], &value)) {
+        case NumberError::kNotInteger:
+          throw CatalogError(CatalogError::Kind::kValue,
+                             "cursor captured_at_ns must be an integer");
+        case NumberError::kOutOfRange:
           throw CatalogError(CatalogError::Kind::kValue,
                              "cursor captured_at_ns must fit UInt64");
-        }
-        value = value * 10 + digit;
-      }
-      // A negative number is a legal JSON number and a legal Python int,
-      // so the oracle refuses it on the RANGE check, not the type one.
-      if (negative && value != 0) {
-        throw CatalogError(CatalogError::Kind::kValue,
-                           "cursor captured_at_ns must fit UInt64");
+        case NumberError::kNone:
+          break;
       }
       return value;
     };

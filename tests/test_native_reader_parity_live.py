@@ -680,6 +680,64 @@ def test_a_cursor_captured_at_ns_outside_uint64_is_refused():
             driver.close()
 
 
+def test_a_cursor_envelope_integer_outside_uint64_is_refused():
+    """`v` and `w` are UInt64s too, and nothing checked either.
+
+    The captured_at_ns fix bounded only the key's timestamp. The envelope's
+    version and watermark still went through jc::FindInt, whose accumulator
+    multiplies into an int64_t with no bound check, so `2**64 + 1` on either
+    field is a wrapping parse rather than a refusal. What the wrapped value
+    IS is signed-overflow UB and therefore build-dependent; what matters is
+    that the oracle refuses both spellings outright -- `w` on
+    _uint64(..., "cursor watermark") and `v` on the version equality -- so
+    native must refuse them too rather than serve any page at all.
+    """
+    import base64
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            _publish_native(driver, prefix, _descriptor_dicts(4), 7)
+
+            first = driver.call(op="search", limit=1)
+            assert first["ok"] and first["next_cursor"], first
+            good = first["next_cursor"]
+            payload = json.loads(base64.urlsafe_b64decode(
+                good + "=" * (-len(good) % 4)))
+
+            def encode(field, value):
+                crafted = dict(payload)
+                crafted[field] = value
+                raw = json.dumps(crafted, sort_keys=True,
+                                 separators=(",", ":")).encode()
+                return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+            from dmi.storage.capture.cursor import InvalidCursorError
+            from dmi.storage.capture.model import CaptureQuery
+            reader = _python_reader(client, config)
+
+            # 2**64 + 1 on each envelope integer. Neither fits UInt64, so
+            # neither names a snapshot or a version this reader can serve.
+            for field in ("w", "v"):
+                cursor = encode(field, 2**64 + 1)
+                refused = driver.call(op="search", limit=100, cursor=cursor)
+                assert not refused["ok"], (field, refused)
+                assert refused["error"] == "ValueError", (field, refused)
+                # The oracle refuses the same cursor bytes.
+                with pytest.raises(InvalidCursorError):
+                    reader.search(CaptureQuery(limit=100, cursor=cursor))
+
+            # The honest cursor still pages, so the refusals above are about
+            # the crafted envelope rather than about the cursor as a whole.
+            walked = driver.call(op="search", limit=100, cursor=good)
+            assert walked["ok"], walked
+            assert [item[4] for item in walked["items"]] == [
+                "capture-1", "capture-2", "capture-3"], walked
+        finally:
+            driver.close()
+
+
 def test_cursor_parity_across_implementations():
     """A cursor either side issues, the other side accepts and walks."""
     with _catalog() as (client, config, prefix):
