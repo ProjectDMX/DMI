@@ -851,6 +851,11 @@ def test_summary_core_stats_parity(fake_s3):
                     summary["capture_id"])
                 assert summary["maximum_int"] == expected.core.maximum, (
                     summary["capture_id"])
+                # abs_max was silently unasserted here, which is how a
+                # NEGATIVE abs_max_int survived: Python takes it in
+                # unbounded int space, so it is never negative.
+                assert summary["abs_max_int"] == expected.core.abs_max, (
+                    summary["capture_id"])
         finally:
             sink.close()
             store.close()
@@ -939,6 +944,122 @@ def test_summary_parity_on_float16_including_subnormals(fake_s3):
             assert summary["zero_fraction"] == expected.core.zero_fraction
             assert summary["mean"] == expected.core.mean, summary
             assert summary["l2_norm"] == expected.core.l2_norm, summary
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
+def test_summary_parity_on_int64_beyond_the_double_mantissa(fake_s3):
+    """Integer order statistics must never travel through a double.
+
+    Every integer extreme was derived by casting the float64-decoded value
+    back to int64_t, which is wrong twice over: `[2**63-2, 2**63-1]` -- a
+    strictly POSITIVE tensor -- rounded up to 2**63, and
+    `static_cast<int64_t>(9.22e18)` is undefined-turned-INT64_MIN on
+    x86-64, so both minimum_int and maximum_int came back maximally
+    NEGATIVE. `[2**53+1, 2**53+3]` merely rounded to the even neighbours.
+    The magnitude comparison had the same disease: for
+    `[INT64_MIN, INT64_MAX]` abs_max_int came out negative.
+
+    summary.py is the oracle -- int(flat.min()), int(flat.max()) and
+    max(abs(...)) in Python's unbounded int space, pinned as the
+    CORE_SUMMARY_VERSION 2 contract. The one value the oracle can name and
+    the wire cannot is abs_max == 2**63: `abs_max_int` is Int64 on the
+    wire, so it saturates at INT64_MAX there while `abs_max` (double)
+    carries the exact magnitude.
+    """
+    import struct
+    import tempfile
+
+    from tests.test_native_uploader import (
+        SINK_DRIVER, STORE_DRIVER, DriverSession, _stage, _store_base,
+    )
+    from dmi.storage.capture import CaptureReader, S3PackStore, S3StoreConfig
+    from dmi.storage.capture.clickhouse_reader import (
+        ClickHouseCaptureCatalog, ClickHouseReaderConfig,
+    )
+    from dmi.storage.capture.model import CaptureQuery
+
+    INT64_MAX = 2**63 - 1
+    payloads = {
+        # the widest possible span, whose abs_max is the unrepresentable 2**63
+        91: struct.pack("<2q", -(2**63), INT64_MAX),
+        # all-negative: the magnitude lives at the minimum end
+        92: struct.pack("<2q", -(2**63), -1),
+        # strictly positive, above the mantissa: nothing may turn negative
+        93: struct.pack("<2q", 2**63 - 2, INT64_MAX),
+        # just past 2**53, where a double starts skipping odd integers
+        94: struct.pack("<2q", 2**53 + 1, 2**53 + 3),
+    }
+
+    with _catalog() as (client, config, prefix):
+        sink = DriverSession(SINK_DRIVER)
+        store = DriverSession(STORE_DRIVER)
+        driver = CatalogDriver()
+        try:
+            spool_root = Path(tempfile.mkdtemp()) / "spool"
+            for index, payload in payloads.items():
+                _stage(sink, spool_root, index, payload, dtype="int64",
+                       shape=(2,))
+            uploaded = store.call(
+                op="upload_pending", **_store_base(fake_s3),
+                root=str(spool_root), spool_max_bytes=1 << 40, limit=-1)
+            assert uploaded["ok"], uploaded
+
+            _open_helper(driver, prefix)
+            driver.call(op="acquire", holder="indexer")
+            indexed = driver.call(
+                op="index", refs=uploaded["refs"], endpoint=fake_s3,
+                bucket=BUCKET, region=REGION, access=ACCESS, secret=SECRET,
+                insecure=True)
+            assert indexed["ok"], indexed
+
+            native_select = driver.call(
+                op="select", tenant_id="t", limit=10,
+                endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                secret=SECRET, insecure=True)
+            assert native_select["ok"], native_select
+            sel = native_select["selection"]
+            native = driver.call(
+                op="summarize_core", selection_id=sel["selection_id"],
+                capture_ids=sel["capture_ids"],
+                catalog_watermark=sel["catalog_watermark"],
+                filter_hash=sel["filter_hash"], tenant_id=sel["tenant_id"],
+                byte_limit=1 << 30, endpoint=fake_s3, bucket=BUCKET,
+                access=ACCESS, secret=SECRET, insecure=True)
+            assert native["ok"], native
+
+            python_catalog = ClickHouseCaptureCatalog(
+                client, ClickHouseReaderConfig.from_catalog(config))
+            python_store = S3PackStore.from_config(
+                S3StoreConfig(
+                    endpoint_url=fake_s3, bucket=BUCKET, region=REGION,
+                    access_key_id=ACCESS, secret_access_key=SECRET,
+                    store_id="native-test", allow_insecure_http=True))
+            python_reader = CaptureReader(
+                python_catalog, {"native-test": python_store})
+            selection = python_reader.select(
+                CaptureQuery(tenant_id="t", limit=10))
+            expected = {s.capture_id: s.core for s in python_reader.summarize(
+                selection, byte_limit=1 << 30)}
+            assert len(expected) == len(payloads), expected
+
+            for summary in native["summaries"]:
+                core = expected[summary["capture_id"]]
+                assert isinstance(core.minimum, int), core
+                assert summary["minimum_int"] == core.minimum, (
+                    summary["capture_id"], summary)
+                assert summary["maximum_int"] == core.maximum, (
+                    summary["capture_id"], summary)
+                # The exact magnitude rides the double, always.
+                assert summary["abs_max"] == float(core.abs_max), (
+                    summary["capture_id"], summary)
+                # ...and the Int64 wire field carries it whenever Int64 can,
+                # saturating only for the single value that has no Int64
+                # representation.
+                assert summary["abs_max_int"] == min(core.abs_max, INT64_MAX), (
+                    summary["capture_id"], summary)
         finally:
             sink.close()
             store.close()

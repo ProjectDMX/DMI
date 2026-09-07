@@ -161,6 +161,53 @@ double decode_element(const std::string& dtype, const uint8_t* data,
                      "unsupported dtype: " + dtype);
 }
 
+// One element as an EXACT int64, for the integer order statistics only.
+// Routing them through decode_element's double is wrong twice over above
+// 2**53: the value rounds, and static_cast<int64_t> of 2**63 is undefined
+// (INT64_MIN on x86-64), so the strictly positive [2**63-2, 2**63-1]
+// summarised maximally negative. summary.py takes int(flat.min()) off the
+// raw dtype, so this reads the raw bytes and sign- or zero-extends them.
+// The accumulating statistics (sum, scale, l2) keep decode_element: those
+// legitimately want float64.
+int64_t decode_element_int(const std::string& dtype, const uint8_t* data,
+                           size_t offset) {
+  auto u16 = [&] {
+    return static_cast<uint16_t>(data[offset]) |
+           (static_cast<uint16_t>(data[offset + 1]) << 8);
+  };
+  auto u32 = [&] {
+    uint32_t v = 0;
+    for (size_t i = 0; i < 4; ++i) {
+      v |= static_cast<uint32_t>(data[offset + i]) << (8 * i);
+    }
+    return v;
+  };
+  auto u64 = [&] {
+    uint64_t v = 0;
+    for (size_t i = 0; i < 8; ++i) {
+      v |= static_cast<uint64_t>(data[offset + i]) << (8 * i);
+    }
+    return v;
+  };
+  if (dtype == "uint8") return data[offset];
+  if (dtype == "int8") return static_cast<int8_t>(data[offset]);
+  if (dtype == "bool") return data[offset] != 0 ? 1 : 0;
+  if (dtype == "uint16") return u16();
+  if (dtype == "int16") return static_cast<int16_t>(u16());
+  if (dtype == "uint32") return u32();
+  if (dtype == "int32") return static_cast<int32_t>(u32());
+  if (dtype == "int64") return static_cast<int64_t>(u64());
+  // uint64 is refused rather than represented. It is not in the
+  // authoritative dtype set (model.py's _DTYPE_BYTES, mirrored by
+  // pack_builder.cpp's kDtypes), so Python's reader refuses such a
+  // descriptor outright when it builds CaptureMetadata — there is no
+  // oracle to match — and an int64 order statistic cannot name a uint64
+  // above 2**63-1 anyway. Failing closed is the parity answer.
+  throw CatalogError(
+      CatalogError::Kind::kValue,
+      "unsupported dtype for integer order statistics: " + dtype);
+}
+
 // Field positions in the 32-field layout the reader rows use:
 // [0..4] sort key (capture_id sits at 4), then the 27 resolved columns.
 constexpr size_t kCaptureId = 4, kAdapterRevision = 10, kDtype = 19,
@@ -645,7 +692,11 @@ NativeCaptureReader::summarize_core(const Selection& selection,
       if (first || value > max_f) max_f = value;
       scale = std::max(scale, std::fabs(value));
       if (summary.order_stats_are_integers) {
-        const int64_t as_int = static_cast<int64_t>(value);
+        // Off the raw bytes, not off `value`: the double round trip loses
+        // every integer above 2**53 and turns 2**63 into INT64_MIN.
+        const int64_t as_int = decode_element_int(
+            dtype, reinterpret_cast<const uint8_t*>(payload.data()),
+            e * dtype_bytes(dtype));
         if (first || as_int < min_i) min_i = as_int;
         if (first || as_int > max_i) max_i = as_int;
       }
@@ -682,21 +733,33 @@ NativeCaptureReader::summarize_core(const Selection& selection,
         summary.abs_max = scale;
       } else {
         // Order statistics off the raw integers: magnitudes above 2**53
-        // stay exact, and the abs is taken in a wider space.
+        // stay exact. The magnitudes are compared in UNSIGNED space, where
+        // |INT64_MIN| exists: comparing them as doubles (and negating in
+        // int64) reported abs_max NEGATIVE for [INT64_MIN, INT64_MAX].
+        // 0u - (uint64_t)min_i is well defined and yields exactly 2**63.
         summary.minimum = static_cast<double>(min_i);
         summary.maximum = static_cast<double>(max_i);
-        const int64_t abs_min =
-            min_i < 0 ? (min_i == std::numeric_limits<int64_t>::min()
-                             ? min_i
-                             : -min_i)
-                      : min_i;
-        const int64_t abs_max = max_i < 0 ? -max_i : max_i;
+        const uint64_t mag_min = min_i < 0
+                                     ? 0u - static_cast<uint64_t>(min_i)
+                                     : static_cast<uint64_t>(min_i);
+        const uint64_t mag_max = max_i < 0
+                                     ? 0u - static_cast<uint64_t>(max_i)
+                                     : static_cast<uint64_t>(max_i);
+        const uint64_t magnitude = std::max(mag_min, mag_max);
+        // abs_max (double) carries the exact magnitude — 2**63 is exactly
+        // representable in a double. abs_max_int is Int64 on the wire and
+        // genuinely cannot hold 2**63, the one magnitude an int64 tensor
+        // can produce (|INT64_MIN|) and an Int64 field cannot name, so the
+        // int field SATURATES at INT64_MAX for that single value. Python's
+        // unbounded int is the oracle and reports the exact
+        // 9223372036854775808; widening this wire field is a format change
+        // and is deliberately not made here.
+        summary.abs_max = static_cast<double>(magnitude);
+        constexpr uint64_t kInt64Max =
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
         summary.abs_max_int =
-            std::abs(static_cast<double>(abs_min)) >
-                    std::abs(static_cast<double>(abs_max))
-                ? abs_min
-                : abs_max;
-        summary.abs_max = static_cast<double>(summary.abs_max_int);
+            magnitude > kInt64Max ? std::numeric_limits<int64_t>::max()
+                                  : static_cast<int64_t>(magnitude);
         summary.minimum_int = min_i;
         summary.maximum_int = max_i;
       }
