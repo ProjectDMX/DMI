@@ -738,6 +738,72 @@ def test_a_cursor_envelope_integer_outside_uint64_is_refused():
             driver.close()
 
 
+def test_a_cursor_integer_with_leading_zeros_is_refused():
+    """`007` is not a JSON number, so it is not a cursor position.
+
+    The native digit scan asked only whether every character was a digit,
+    which `007` satisfies -- so a crafted key paged from position 7 (i.e.
+    from the very beginning, capture-0 included) while spelling the honest
+    1.7e18 position's neighbourhood. Python never gets that far: json.loads
+    rejects a leading-zero number outright and decode_cursor reports
+    "cursor does not contain valid JSON".
+    """
+    import base64
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            _publish_native(driver, prefix, _descriptor_dicts(4), 7)
+
+            first = driver.call(op="search", limit=1)
+            assert first["ok"] and first["next_cursor"], first
+            good = first["next_cursor"]
+            payload = json.loads(base64.urlsafe_b64decode(
+                good + "=" * (-len(good) % 4)))
+            canonical = json.dumps(payload, sort_keys=True,
+                                   separators=(",", ":"))
+
+            def encode(raw_json):
+                return base64.urlsafe_b64encode(
+                    raw_json.encode()).rstrip(b"=").decode()
+
+            # Textual crafting: json.dumps cannot emit a leading-zero
+            # number, which is the whole point of the spelling.
+            honest_ns = str(payload["k"][3])
+            crafted = {
+                # The decisive one: position 7 rather than 1.7e18, so the
+                # accepted page used to START at capture-0 -- a cursor that
+                # pages BACKWARDS over rows the caller already saw.
+                "k[3]": canonical.replace(f",{honest_ns},", ",007,", 1),
+                "w": canonical.replace('"w":7}', '"w":007}', 1),
+                "v": canonical.replace('"v":1,', '"v":01,', 1),
+            }
+            from dmi.storage.capture.cursor import InvalidCursorError
+            from dmi.storage.capture.model import CaptureQuery
+            reader = _python_reader(client, config)
+
+            for field, raw_json in crafted.items():
+                assert raw_json != canonical, field  # the craft landed
+                cursor = encode(raw_json)
+                refused = driver.call(op="search", limit=100, cursor=cursor)
+                assert not refused["ok"], (field, refused)
+                assert refused["error"] == "ValueError", (field, refused)
+                # The oracle refuses the same cursor bytes.
+                with pytest.raises(InvalidCursorError):
+                    reader.search(CaptureQuery(limit=100, cursor=cursor))
+
+            # A single `0` is a legal JSON number and must stay legal: it is
+            # the position before every row, so the whole table pages.
+            zero = encode(canonical.replace(f",{honest_ns},", ",0,", 1))
+            walked = driver.call(op="search", limit=100, cursor=zero)
+            assert walked["ok"], walked
+            assert [item[4] for item in walked["items"]] == [
+                "capture-0", "capture-1", "capture-2", "capture-3"], walked
+        finally:
+            driver.close()
+
+
 def test_cursor_parity_across_implementations():
     """A cursor either side issues, the other side accepts and walks."""
     with _catalog() as (client, config, prefix):

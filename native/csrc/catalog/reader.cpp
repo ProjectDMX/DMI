@@ -201,7 +201,12 @@ std::string find_token_in(const std::string& object, const char* key) {
   return std::string();
 }
 
-enum class NumberError { kNone, kNotInteger, kOutOfRange };
+// kNotJson is the JSON grammar itself, not the field's type or range: the
+// oracle's json.loads refuses the token before decode_cursor ever looks at
+// which field it belongs to, so all three fields report it the same way.
+enum class NumberError { kNone, kNotJson, kNotInteger, kOutOfRange };
+
+constexpr const char* kNotJsonMessage = "cursor does not contain valid JSON";
 
 // The ONE parse every cursor integer goes through -- the envelope's `v` and
 // `w` and the key's captured_at_ns. jc::FindInt accumulates digits into an
@@ -222,6 +227,12 @@ NumberError parse_cursor_uint(const std::string& token, uint64_t* out) {
       digits.find_first_not_of("0123456789") != std::string::npos) {
     return NumberError::kNotInteger;
   }
+  // A leading zero is not a JSON number at all -- `007` parses as `0`
+  // followed by extra data, which json.loads reports as a decode error.
+  // Scanning for digits alone accepted it, and `007` on the key's
+  // captured_at_ns paged from position 7: a cursor that walks BACKWARDS
+  // over rows the caller has already been served.
+  if (digits.size() > 1 && digits[0] == '0') return NumberError::kNotJson;
   uint64_t value = 0;
   for (const char c : digits) {
     const uint64_t digit = static_cast<uint64_t>(c - '0');
@@ -247,6 +258,8 @@ uint64_t find_uint_in(const std::string& object, const char* key,
   }
   uint64_t value = 0;
   switch (parse_cursor_uint(find_token_in(object, key), &value)) {
+    case NumberError::kNotJson:
+      throw CatalogError(CatalogError::Kind::kValue, kNotJsonMessage);
     case NumberError::kNotInteger:
       throw CatalogError(CatalogError::Kind::kValue,
                          std::string(label) + " must be an integer");
@@ -522,8 +535,12 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
     }
     const std::string version_token = find_token_in(payload, "v");
     uint64_t version = 0;
-    if (parse_cursor_uint(version_token, &version) != NumberError::kNone ||
-        version != kCursorVersion) {
+    const NumberError version_error = parse_cursor_uint(version_token,
+                                                        &version);
+    if (version_error == NumberError::kNotJson) {
+      throw CatalogError(CatalogError::Kind::kValue, kNotJsonMessage);
+    }
+    if (version_error != NumberError::kNone || version != kCursorVersion) {
       throw CatalogError(CatalogError::Kind::kValue,
                          "unsupported cursor version: " + version_token);
     }
@@ -583,6 +600,8 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
     auto number = [&](size_t i) {
       uint64_t value = 0;
       switch (parse_cursor_uint(parts[i], &value)) {
+        case NumberError::kNotJson:
+          throw CatalogError(CatalogError::Kind::kValue, kNotJsonMessage);
         case NumberError::kNotInteger:
           throw CatalogError(CatalogError::Kind::kValue,
                              "cursor captured_at_ns must be an integer");
