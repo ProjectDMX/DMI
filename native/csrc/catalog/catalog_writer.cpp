@@ -18,25 +18,6 @@ size_t inline_text_bytes(const std::string& value) {
   return 2 * value.size() + 2;
 }
 
-std::string escape_sql_string(const std::string& value) {
-  std::string out;
-  out.push_back('\'');
-  for (const char c : value) {
-    if (c == '\\' || c == '\'') out.push_back('\\');
-    if (c == '\n') {
-      out += "\\n";
-      continue;
-    }
-    if (c == '\t') {
-      out += "\\t";
-      continue;
-    }
-    out.push_back(c);
-  }
-  out.push_back('\'');
-  return out;
-}
-
 // Python's clickhouse-driver renders a list of (str, str) tuples as
 // `[('a', 'b'), ('c', 'd')]` -- a comma AND a space, both inside a tuple
 // and between tuples. Byte-for-byte, because every statement carrying
@@ -49,8 +30,7 @@ std::string render_members(const std::vector<PackIdentity>& members) {
   for (const auto& [store_id, pack_id] : members) {
     if (!first) out += ", ";
     first = false;
-    out += "(" + escape_sql_string(store_id) + ", " +
-           escape_sql_string(pack_id) + ")";
+    out += "(" + sql_quote(store_id) + ", " + sql_quote(pack_id) + ")";
   }
   out += "]";
   return out;
@@ -91,10 +71,6 @@ uint64_t now_monotonic_ns() {
 }
 
 }  // namespace
-
-std::string sql_quote(const std::string& value) {
-  return escape_sql_string(value);
-}
 
 std::string sql_uuid(const std::string& value) {
   const auto hex = [](char c) {

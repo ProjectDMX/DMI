@@ -39,24 +39,6 @@ int64_t field_int(const std::string& object, const char* key,
   return jc::FindInt(object, key);
 }
 
-std::string quoted_string(const std::string& value) {
-  std::string out = "'";
-  for (const char c : value) {
-    if (c == '\\' || c == '\'') out.push_back('\\');
-    if (c == '\n') {
-      out += "\\n";
-      continue;
-    }
-    if (c == '\t') {
-      out += "\\t";
-      continue;
-    }
-    out.push_back(c);
-  }
-  out.push_back('\'');
-  return out;
-}
-
 // Bytes per element for the v1 dtype set (the Python metadata model's
 // dtype table; the adapter's ATEN mapping pins the same ten).
 size_t dtype_bytes(const std::string& dtype) {
@@ -152,7 +134,7 @@ std::string render_record_row(const std::string& raw, const PackRefData& ref,
 
   std::vector<std::string> fields;
   const auto text_field = [&](const char* key) {
-    fields.push_back(quoted_string(field_text(metadata, key, key)));
+    fields.push_back(sql_quote(field_text(metadata, key, key)));
   };
   const auto int_field = [&](const char* key) {
     fields.push_back(std::to_string(field_int(metadata, key, key)));
@@ -168,7 +150,7 @@ std::string render_record_row(const std::string& raw, const PackRefData& ref,
   text_field("model_revision");
   fields.push_back(jc::FindNull(metadata, "adapter_revision")
                        ? "NULL"
-                       : quoted_string(jc::FindString(metadata, "adapter_revision")));
+                       : sql_quote(jc::FindString(metadata, "adapter_revision")));
   text_field("capture_policy_version");
   text_field("hook_name");
   fields.push_back(std::to_string(field_int(metadata, "layer_number", "layer_number")));
@@ -182,16 +164,16 @@ std::string render_record_row(const std::string& raw, const PackRefData& ref,
   int_field("captured_at_ns");
   // Locator from the ref, record placement from the footer.
   fields.push_back(sql_uuid(ref.pack_id));
-  fields.push_back(quoted_string(ref.store_id));
-  fields.push_back(quoted_string(ref.object_key));
+  fields.push_back(sql_quote(ref.store_id));
+  fields.push_back(sql_quote(ref.object_key));
   fields.push_back(std::to_string(ref.object_bytes));
-  fields.push_back(quoted_string(ref.checksum));
+  fields.push_back(sql_quote(ref.checksum));
   fields.push_back(std::to_string(ref.record_count));
   fields.push_back(std::to_string(offset));
   fields.push_back(std::to_string(stored));
   fields.push_back(std::to_string(decoded));
-  fields.push_back(quoted_string(codec));
-  fields.push_back(quoted_string(checksum));
+  fields.push_back(sql_quote(codec));
+  fields.push_back(sql_quote(checksum));
 
   std::string row;
   for (size_t i = 0; i < fields.size(); ++i) {

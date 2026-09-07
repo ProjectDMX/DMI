@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "lease_coordinator.h"
+#include "sql_escape.h"  // sql_quote, for every renderer that includes this
 #include "version_allocator.h"
 
 namespace dmi_catalog {
@@ -39,9 +40,6 @@ struct WriterConfig {
 };
 
 using PackIdentity = std::pair<std::string, std::string>;  // store_id, pack_id
-
-// SQL string literal, ClickHouse escaping — shared by the row renderers.
-std::string sql_quote(const std::string& value);
 
 // `toUUID('<value>')` for a pack_id, VALIDATED rather than escaped, and
 // the only way the row renderers may render one.

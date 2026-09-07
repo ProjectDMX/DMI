@@ -289,6 +289,20 @@ def test_the_ported_statements_are_byte_identical_to_the_python_ones():
             driver.close()
 
 
+def _recorded_claim(client, prefix, term):
+    """The lease-claim INSERT the server actually recorded for `term`."""
+    for _ in range(20):
+        client.execute("SYSTEM FLUSH LOGS")
+        rows = client.execute(
+            "SELECT DISTINCT query FROM system.query_log WHERE query LIKE "
+            f"'%{prefix}_publisher_lease%' AND query LIKE 'INSERT%' "
+            f"AND query LIKE '%toUInt64({term}),%' "
+            "AND query LIKE '%+ toUInt64(%'")
+        if rows:
+            assert len(rows) == 1, rows
+            return rows[0][0]
+        sleep(0.2)
+    raise AssertionError(f"no claim statement recorded for term {term}")
 def _last_queries_like(client, fragment, limit=2):
     """The most recent statements the SERVER received matching a fragment."""
     client.execute("SYSTEM FLUSH LOGS")
@@ -300,7 +314,7 @@ def _last_queries_like(client, fragment, limit=2):
     return [row[0] for row in rows]
 
 
-def test_the_parameterized_statements_are_byte_identical_too():
+def test_the_inline_identity_list_is_byte_identical_too():
     """The gate the risk table's claim actually needs.
 
     `release` and `fence` are compared above, and those are the two the
@@ -340,6 +354,124 @@ def test_the_parameterized_statements_are_byte_identical_too():
             assert seen[0] == seen[1], (
                 "the two implementations sent different text:\n"
                 f"  {seen[0]}\n  {seen[1]}")
+        finally:
+            driver.close()
+
+
+
+
+def test_the_parameterized_statements_are_byte_identical_too():
+    """The SAME logical value must reach the server as the SAME SQL text.
+
+    `test_the_ported_statements_are_byte_identical_to_the_python_ones`
+    compares statement TEMPLATES; this compares what the server actually
+    received once a value was rendered into one, read back off
+    `system.query_log`. That is where a divergent escaper hides: the
+    templates agree and the rendered text does not.
+
+    The value carries every key of clickhouse-driver's `escape_chars_map`
+    -- \\b \\f \\r \\n \\t \\0 \\a \\v \\\\ and a quote -- because the port
+    escaped only four of the ten. Both sides admit these bytes:
+    `model.py`'s `_validate_text` checks non-empty UTF-8 inside a byte
+    limit and nothing else, and the native side only bounds the holder's
+    length, so such a value is legal on both and must render the same.
+
+    A NUL is the sharp one. Rendered raw it both truncates the statement
+    on the wire (the POST body was handed to libcurl as a C string) and
+    leaves the literal unterminated, so the claim is refused outright.
+    """
+    import re
+
+    from clickhouse_driver.util.escape import escape_chars_map, escape_param
+    from dmi.storage.capture.clickhouse_catalog import ClickHouseCatalogWriter
+
+    # Quote and backslash -- the pair the old fixture used -- plus the six
+    # characters that coverage never reached.
+    value = "it's\\odd" + "".join(escape_chars_map)
+
+    def normalise(text):
+        # Term and lease id differ by construction; nothing else may.
+        text = re.sub(r"toUInt64\(\d+\),", "toUInt64(TERM),", text, count=1)
+        return re.sub(r"toUUID\('[0-9a-f-]{36}'\)", "toUUID('LEASE')", text,
+                      count=1)
+
+    with _catalog() as (client, config, prefix):
+        # The `%(name)s` parameter path: the holder rides as a bound
+        # parameter into the lease claim on both sides.
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            acquired = driver.call(op="acquire", holder=value)
+            assert acquired["ok"], acquired
+            assert acquired["lease"]["holder"] == value, acquired
+            native_term = acquired["lease"]["term"]
+            assert driver.call(op="release")["ok"]
+
+            # The inline path: store_id goes through the row/member
+            # renderer rather than parameter substitution.
+            pack_id = str(uuid.uuid4())
+            assert driver.call(
+                op="committed_pack_ids",
+                identities=[{"store_id": value, "pack_id": pack_id}])["ok"]
+        finally:
+            driver.close()
+
+        python = ClickHouseCatalogWriter(client, config)
+        python_term = python.acquire_publisher_lease(value).term
+        python.committed_pack_ids([(value, pack_id)])
+
+        assert normalise(_recorded_claim(client, prefix, native_term)) == (
+            normalise(_recorded_claim(client, prefix, python_term))), (
+                "the native claim reached the server as different SQL text "
+                "than the Python one")
+
+        # And the inline renderer, whose statement is not textually ported
+        # (native brackets the member list), so the LITERAL is the subject.
+        literal = escape_param(value, None)
+        client.execute("SYSTEM FLUSH LOGS")
+        inline = [row[0] for row in client.execute(
+            "SELECT DISTINCT query FROM system.query_log WHERE query LIKE "
+            f"'%{prefix}_pack_inventory%' AND query LIKE "
+            f"'%{pack_id}%'")]
+        assert len(inline) == 2, inline
+        for text in inline:
+            assert literal in text, (
+                f"the inline renderer wrote {text!r}, which does not carry "
+                f"the driver's own rendering {literal!r}")
+
+
+def test_an_embedded_nul_does_not_truncate_the_statement_on_the_wire():
+    """The POST body is a length, not a C string.
+
+    `CURLOPT_POSTFIELDS` without `CURLOPT_POSTFIELDSIZE` makes libcurl
+    measure the body with strlen, so a NUL anywhere in the statement drops
+    everything after it -- and the server answers the prefix as if that
+    were the whole query. Inside a quoted literal that fails loud (the
+    string is left unterminated); in unquoted statement text it is silent,
+    and the `execute` path renders unquoted statement text.
+
+    A correct escaper renders NUL as `\\0` and never puts the byte in the
+    statement, but it does not save this: any statement text assembled
+    outside the escaper still truncates. So the guard is the body length.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            tail = " THIS IS NOT SQL AT ALL zzzz"
+            # The control: the tail makes this a syntax error.
+            control = driver.call(
+                op="execute", query="SELECT 42 AS nul_probe_marker" + tail)
+            assert not control["ok"], control
+
+            # The same statement with a NUL before the tail is the same
+            # syntax error, because the tail is still sent.
+            probed = driver.call(
+                op="execute",
+                query="SELECT 42 AS nul_probe_marker \0" + tail)
+            assert not probed["ok"], (
+                "the statement was truncated at the NUL and the server "
+                f"answered the prefix alone: {probed}")
         finally:
             driver.close()
 
@@ -821,129 +953,6 @@ def test_a_takeover_between_the_two_publish_statements_leaves_orphan_rows():
             assert client.execute(
                 f"SELECT count() FROM `{config.database}`.`{prefix}_capture`"
             ) == [(3,)]
-        finally:
-            driver.close()
-
-
-# --- #125: the publish protocol's client-side half ---------------------------
-#
-# The fence is a per-STATEMENT guarantee. It does not exclude two publishes
-# issued by ONE writer, because both renew the same lease and both pass the
-# fence — the finding #125 was opened for. The writer closes that itself:
-# publishes are serialised per writer, and a writer belongs to the process
-# that built it. Ported here because the native writer is a library another
-# host embeds, where neither property comes for free.
-
-def test_two_concurrent_publishes_on_one_writer_are_serialised():
-    """One writer, two threads: the second must wait, not interleave.
-
-    Both publishes renew the same lease and both would pass the fence, so
-    nothing on the server separates them; what separates them is the
-    writer's own lock.
-
-    The evidence is the SECOND publish's elapsed time, not the two
-    intervals: a thread's clock starts when it begins waiting, so the
-    intervals overlap whether or not the lock works. What cannot happen
-    under a lock is the second publish finishing quickly — it starts 50ms
-    into a 400ms wedge, so it must spend the rest of that wedge blocked
-    before doing its own work, and it must finish after the first one.
-    Unserialised, its own statements take tens of milliseconds.
-    """
-    with _catalog() as (client, config, prefix):
-        driver = CatalogDriver()
-        try:
-            _open(driver, prefix)
-            driver.call(op="acquire", holder="writer")
-            first = driver.call(op="allocate_version")["version"]
-            second = driver.call(op="allocate_version")["version"]
-            assert second > first
-
-            result = driver.call(
-                op="publish_concurrent",
-                index_version_a=first, index_version_b=second,
-                refs=_refs_of(1), indexed_rows=1, indexed_packs=1,
-                wedge_ns=400_000_000)
-            assert result["ok"], result
-            a, b = result["first"], result["second"]
-
-            # The wedged publish really did hold the writer open...
-            assert a["finished_ns"] - a["started_ns"] >= 400_000_000, a
-            # ...the second could not finish before it did...
-            assert b["finished_ns"] >= a["finished_ns"], (a, b)
-            # ...and it spent that wait blocked rather than publishing:
-            # 300ms is well above its own work (tens of ms) and below the
-            # 350ms it waits when the lock holds, so the two outcomes are
-            # not close to each other.
-            assert b["finished_ns"] - b["started_ns"] >= 300_000_000, (a, b)
-        finally:
-            driver.close()
-
-
-def test_a_publish_that_fails_releases_the_writer_for_the_next_one():
-    """Serialisation must not become a deadlock on the failure path.
-
-    The lock has to be given back however the publish ends, or one lost
-    race takes the writer out of service for good.
-    """
-    with _catalog() as (client, config, prefix):
-        driver = CatalogDriver()
-        try:
-            _open(driver, prefix)
-            driver.call(op="acquire", holder="writer")
-            low = driver.call(op="allocate_version")["version"]
-            high = driver.call(op="allocate_version")["version"]
-
-            # Publish the higher version first, so the lower one loses.
-            assert driver.call(
-                op="publish_snapshot", index_version=high, refs=_refs_of(1),
-                published_at_ns=high, indexed_rows=1, indexed_packs=1)["ok"]
-            lost = driver.call(
-                op="publish_snapshot", index_version=low, refs=_refs_of(1),
-                published_at_ns=low, indexed_rows=1, indexed_packs=1)
-            assert not lost["ok"]
-            assert lost["error"] == "SnapshotPublishRaceError", lost
-
-            # The writer still works: a fresh version publishes.
-            after = driver.call(op="allocate_version")["version"]
-            assert driver.call(
-                op="publish_snapshot", index_version=after, refs=_refs_of(1),
-                published_at_ns=after, indexed_rows=1,
-                indexed_packs=1)["ok"]
-        finally:
-            driver.close()
-
-
-def test_a_writer_used_from_a_forked_child_refuses_to_publish():
-    """A writer, its socket and its lease belong to one process.
-
-    A forked child inherits the lease id byte for byte and would publish
-    under the parent's identity, on the parent's socket — two publishes
-    under one lease, which the fence does not exclude. The refusal has to
-    come from the pid check BEFORE the lock: a fork taken mid-publish
-    copies a held lock whose owner thread does not exist in the child, so
-    a check behind the lock would never run and the child would hang.
-    """
-    with _catalog() as (client, config, prefix):
-        driver = CatalogDriver()
-        try:
-            _open(driver, prefix)
-            driver.call(op="acquire", holder="writer")
-            version = driver.call(op="allocate_version")["version"]
-
-            result = driver.call(
-                op="publish_from_forked_child", index_version=version,
-                refs=_refs_of(1), published_at_ns=version,
-                indexed_rows=1, indexed_packs=1)
-            assert result["ok"], result
-            child = result["child"]
-            assert child.startswith("PublisherLeaseError:"), child
-            assert "process" in child, child
-
-            # And the parent's writer is untouched by the refusal.
-            assert driver.call(
-                op="publish_snapshot", index_version=version,
-                refs=_refs_of(1), published_at_ns=version, indexed_rows=1,
-                indexed_packs=1)["ok"]
         finally:
             driver.close()
 

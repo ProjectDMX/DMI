@@ -2,6 +2,8 @@
 
 #include <cstdio>
 
+#include "sql_escape.h"
+
 namespace dmi_catalog {
 
 namespace {
@@ -21,21 +23,7 @@ std::string substitute(std::string query, const Params& params) {
     } else if (auto* u = std::get_if<uint64_t>(&value)) {
       rendered = std::to_string(*u);
     } else {
-      const auto& s = std::get<std::string>(value);
-      rendered.push_back('\'');
-      for (const char c : s) {
-        if (c == '\\' || c == '\'') rendered.push_back('\\');
-        if (c == '\n') {
-          rendered += "\\n";
-          continue;
-        }
-        if (c == '\t') {
-          rendered += "\\t";
-          continue;
-        }
-        rendered.push_back(c);
-      }
-      rendered.push_back('\'');
+      rendered = sql_quote(std::get<std::string>(value));
     }
     const std::string needle = "%(" + name + ")s";
     // The search advances PAST each replacement: a rendered value that
@@ -114,7 +102,19 @@ std::vector<Row> ClickHouseClient::execute(
   if (curl == nullptr) throw ClickHouseError("libcurl init failed");
   std::string body;
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  // The body is a LENGTH, not a C string. Without an explicit size
+  // libcurl measures the POST body with strlen, so a NUL anywhere in the
+  // statement silently drops everything after it and the server answers
+  // the prefix as if that were the whole query. The escaper never emits a
+  // raw NUL, but statement text assembled outside it still can, so the
+  // length is its own guard rather than a consequence of the escaping.
+  //
+  // Order is free for CURLOPT_POSTFIELDS, which only borrows the buffer;
+  // anyone switching to CURLOPT_COPYPOSTFIELDS must set the size FIRST,
+  // because that option copies using the size known at the time.
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, statement.c_str());
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
+                   static_cast<curl_off_t>(statement.size()));
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
   const CURLcode code = curl_easy_perform(curl);

@@ -67,27 +67,9 @@ void emit_lease(const PublisherLease& lease, std::string* out) {
           ",\"expires_at_ns\":" + std::to_string(lease.expires_at_ns) + "}";
 }
 
-std::string render_sql_string(const std::string& value) {
-  std::string out = "'";
-  for (const char c : value) {
-    if (c == '\\' || c == '\'') out.push_back('\\');
-    if (c == '\n') {
-      out += "\\n";
-      continue;
-    }
-    if (c == '\t') {
-      out += "\\t";
-      continue;
-    }
-    out.push_back(c);
-  }
-  out.push_back('\'');
-  return out;
-}
-
 std::string sql_string_or_null(const std::string& line, const char* key) {
   if (jc::FindNull(line, key)) return "NULL";
-  return render_sql_string(jc::FindString(line, key));
+  return dmi_catalog::sql_quote(jc::FindString(line, key));
 }
 
 // The reader config every read op builds, in one place. The read bounds
@@ -144,7 +126,7 @@ std::vector<PackIdentity> read_identities(const std::string& line,
 std::string render_descriptor_row(const std::string& descriptor) {
   std::vector<std::string> fields;
   const auto text_field = [&](const char* key) {
-    fields.push_back(render_sql_string(jc::FindString(descriptor, key)));
+    fields.push_back(dmi_catalog::sql_quote(jc::FindString(descriptor, key)));
   };
   const auto int_field = [&](const char* key) {
     fields.push_back(std::to_string(jc::FindInt(descriptor, key)));
@@ -205,10 +187,10 @@ std::string render_descriptor_row(const std::string& descriptor) {
 std::string render_pack_row(const std::string& ref) {
   std::vector<std::string> fields;
   fields.push_back(dmi_catalog::sql_uuid(jc::FindString(ref, "pack_id")));
-  fields.push_back(render_sql_string(jc::FindString(ref, "store_id")));
-  fields.push_back(render_sql_string(jc::FindString(ref, "object_key")));
+  fields.push_back(dmi_catalog::sql_quote(jc::FindString(ref, "store_id")));
+  fields.push_back(dmi_catalog::sql_quote(jc::FindString(ref, "object_key")));
   fields.push_back(std::to_string(jc::FindInt(ref, "object_bytes")));
-  fields.push_back(render_sql_string(jc::FindString(ref, "pack_checksum")));
+  fields.push_back(dmi_catalog::sql_quote(jc::FindString(ref, "pack_checksum")));
   fields.push_back(std::to_string(jc::FindInt(ref, "record_count")));
   std::string row;
   for (size_t i = 0; i < fields.size(); ++i) {
@@ -284,6 +266,13 @@ std::string respond(const std::string& line, Session* session) {
     if (op == "open") {
       *session = make_session(line);
       return prefix + "true}";
+    }
+    if (op == "escape") {
+      // No session and no server: the SQL string escaper alone, so the
+      // escape_chars_map parity gate can run on the CPU gate.
+      out = ",\"escaped\":";
+      escape_into(dmi_catalog::sql_quote(jc::FindString(line, "value")), &out);
+      return prefix + "true" + out + "}";
     }
     if (session->writer == nullptr) {
       return prefix + "false,\"what\":\"call open first\"}";
