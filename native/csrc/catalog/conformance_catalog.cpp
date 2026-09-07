@@ -512,15 +512,59 @@ std::string respond(const std::string& line, Session* session) {
               static_cast<int64_t>(std::atoll(layer.c_str())));
         }
       }
+      // CaptureQuery requires each captured bound to be a NON-NEGATIVE
+      // INTEGER, and SearchFilters carries them as uint64_t -- which is
+      // what makes the reader itself safe, and what makes this decode the
+      // boundary that has to refuse a bad spelling.
+      // static_cast<uint64_t>(jc::FindInt(...)) turned -1 into
+      // 18446744073709551615, and a non-numeric value into the same
+      // UINT64_MAX by way of FindInt's -1 sentinel, so search answered an
+      // empty page where the oracle raises.
+      const auto captured_bound = [&line](const char* key) -> uint64_t {
+        std::string token;
+        for (const char* sep : {": ", ":"}) {
+          const std::string needle = std::string("\"") + key + "\"" + sep;
+          const size_t at = line.find(needle);
+          if (at == std::string::npos) continue;
+          const size_t begin = at + needle.size();
+          size_t q = begin;
+          while (q < line.size() && line[q] != ',' && line[q] != '}') ++q;
+          token = line.substr(begin, q - begin);
+          break;
+        }
+        const size_t first = token.find_first_not_of(" \t\n\r");
+        const size_t last = token.find_last_not_of(" \t\n\r");
+        const std::string digits =
+            first == std::string::npos
+                ? std::string()
+                : token.substr(first, last - first + 1);
+        if (digits.empty() ||
+            digits.find_first_not_of("0123456789") != std::string::npos) {
+          throw CatalogError(CatalogError::Kind::kValue,
+                             std::string(key) +
+                                 " must be a non-negative integer");
+        }
+        uint64_t value = 0;
+        for (const char c : digits) {
+          const uint64_t digit = static_cast<uint64_t>(c - '0');
+          // The oracle accepts an integer beyond UInt64 here and fails
+          // later, in its driver's parameter binding; this protocol's
+          // field cannot hold one, so refuse it rather than wrap it.
+          if (value > (UINT64_MAX - digit) / 10) {
+            throw CatalogError(CatalogError::Kind::kValue,
+                               std::string(key) + " does not fit UInt64");
+          }
+          value = value * 10 + digit;
+        }
+        return value;
+      };
       if (jc::HasKey(line, "captured_after_ns") &&
           !jc::FindNull(line, "captured_after_ns")) {
-        filters.captured_after_ns = static_cast<uint64_t>(
-            jc::FindInt(line, "captured_after_ns"));
+        filters.captured_after_ns = captured_bound("captured_after_ns");
       }
       if (jc::HasKey(line, "captured_before_ns") &&
           !jc::FindNull(line, "captured_before_ns")) {
-        filters.captured_before_ns = static_cast<uint64_t>(
-            jc::FindInt(line, "captured_before_ns"));
+        filters.captured_before_ns = captured_bound("captured_before_ns");
       }
       if (jc::HasKey(line, "cursor") && !jc::FindNull(line, "cursor")) {
         filters.cursor = jc::FindString(line, "cursor");

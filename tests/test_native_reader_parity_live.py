@@ -678,6 +678,51 @@ def test_search_refusal_parity_on_filter_text():
             driver.close()
 
 
+def test_a_negative_captured_bound_is_refused_rather_than_wrapped():
+    """A negative time bound is a caller error, not the far future.
+
+    The harness decoded the two captured bounds with
+    static_cast<uint64_t>(jc::FindInt(...)), so -1 arrived as
+    18446744073709551615 and `captured_after_ns: -1` -- which the oracle
+    refuses as "must be a non-negative integer" -- came back as a
+    successful EMPTY page. A non-numeric spelling was the same story by a
+    different route: HasKey passes, FindInt returns its -1 sentinel, and
+    the bound is UINT64_MAX again.
+    """
+    from dmi.storage.capture.model import CaptureQuery
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            _publish_native(driver, prefix, _descriptor_dicts(4), 7)
+
+            for name in ("captured_after_ns", "captured_before_ns"):
+                # -1 wraps; the rest are non-integers CaptureQuery rejects
+                # on `type(value) is not int` (True included: its type is
+                # bool, not int).
+                for value in (-1, -1700000000000000000, "abc", 1.5, True):
+                    fields = {name: value}
+                    refused = driver.call(op="search", limit=100, **fields)
+                    assert not refused["ok"], (fields, refused)
+                    assert refused["error"] == "ValueError", (fields, refused)
+
+                    # The oracle refuses the same bound.
+                    with pytest.raises(ValueError):
+                        CaptureQuery(limit=100, **fields)
+
+            # 0 is a legal bound and still selects the whole table, so the
+            # refusal above is about the sign rather than about the field.
+            native = driver.call(op="search", limit=100, captured_after_ns=0)
+            assert native["ok"], native
+            page = _python_page_items(
+                _python_reader(client, config), limit=100, captured_after_ns=0)
+            assert _normalize(native["items"]) == _normalize(page.items)
+            assert len(native["items"]) == 4, native
+        finally:
+            driver.close()
+
+
 def test_a_cursor_captured_at_ns_outside_uint64_is_refused():
     """The key's timestamp is a UInt64, and nothing checked it.
 
