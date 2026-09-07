@@ -5,10 +5,11 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
-// std::runtime_error is thrown below. g++ 11 on 20.04 happens to reach it
-// through another header and the omission stayed invisible; the newer
-// libstdc++ on the CI image does not, and the sink driver failed to
-// compile there the moment a job actually asked for it.
+// std::runtime_error is thrown below. g++ 11 on 20.04 reaches it through
+// another header, so the omission is invisible on a dev box and neither
+// g++ 11 nor clang 21 reproduces it; the newer libstdc++ on the CI image
+// does not, and this file failed to compile there the moment a job
+// actually asked for the sink driver.
 #include <stdexcept>
 
 #include "object_key.h"
