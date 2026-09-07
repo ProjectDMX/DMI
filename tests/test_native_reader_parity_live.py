@@ -996,6 +996,191 @@ def test_hydrate_parity_on_a_multi_dimensional_shape(fake_s3):
                     closer.close()
 
 
+def _footer_binding_case(fake_s3, client, config, driver, mutate):
+    """Stage one pack, publish a catalog row with `mutate` applied, hydrate.
+
+    The pack footer is written once and is the authority for what each
+    payload IS; the catalog row is the thing under test. `mutate` receives
+    the row dict built from the footer's own descriptor and edits one
+    field, so the row and the footer disagree by exactly that field.
+
+    Returns `(oracle_error, native_response)`: the PackFormatError message
+    the Python reader raises (or None if it accepted the row) and the raw
+    native `hydrate` response.
+    """
+    from dmi.storage.capture import (
+        CaptureReader, S3PackStore, S3StoreConfig,
+    )
+    from dmi.storage.capture.clickhouse_reader import (
+        ClickHouseCaptureCatalog, ClickHouseReaderConfig,
+    )
+    from dmi.storage.capture.model import (
+        CaptureMetadata, CaptureQuery, CaptureRecord,
+    )
+    from dmi.storage.capture.pack import PackReader as PR, PackWriter
+    from dmi.storage.capture.reader import PackFormatError
+
+    payload = b"\x00\x00\x80?" * 12  # float32, twelve 1.0f elements
+    meta = CaptureMetadata(
+        capture_id="bind-0", tenant_id="t", experiment_id="e", run_id="r",
+        session_id="s", request_id="q", sequence_id="n0", model_id="m",
+        model_revision="mr", adapter_revision=None,
+        capture_policy_version="v", hook_name="h", layer_number=3,
+        producer_rank=0, step_number=0, token_start=0, token_end=1,
+        batch_position=0, dtype="float32", shape=(12,),
+        captured_at_ns=1_700_000_000_000_000_000,
+    )
+    pack_id = str(uuid.uuid4())
+    object_key = f"packs/{pack_id}.dmi-pack"
+    writer = PackWriter(
+        pack_id=pack_id, created_at_ns=1_700_000_000_000_000_000,
+        max_pack_bytes=8 * 1024 * 1024)
+    writer.append(CaptureRecord(metadata=meta, payload=payload))
+    sealed = writer.seal()
+
+    import boto3 as _boto3
+    from botocore.config import Config as _BotoConfig
+    _boto3.client(
+        "s3", endpoint_url=fake_s3, region_name=REGION,
+        aws_access_key_id=ACCESS, aws_secret_access_key=SECRET,
+        config=_BotoConfig(s3={"addressing_style": "path"}),
+        verify=False,
+    ).put_object(Bucket=BUCKET, Key=object_key, Body=sealed.data)
+
+    _open_helper(driver, prefix=config.table_prefix)
+    rows = []
+    for d in PR.from_bytes(sealed.data).descriptors(
+            store_id="native-test", object_key=object_key):
+        m, l = d.metadata, d.locator
+        rows.append({
+            "capture_id": m.capture_id, "tenant_id": m.tenant_id,
+            "experiment_id": m.experiment_id, "run_id": m.run_id,
+            "session_id": m.session_id, "request_id": m.request_id,
+            "sequence_id": m.sequence_id, "model_id": m.model_id,
+            "model_revision": m.model_revision,
+            "adapter_revision": m.adapter_revision,
+            "capture_policy_version": m.capture_policy_version,
+            "hook_name": m.hook_name, "layer_number": m.layer_number,
+            "producer_rank": m.producer_rank, "step_number": m.step_number,
+            "token_start": m.token_start, "token_end": m.token_end,
+            "batch_position": m.batch_position, "dtype": m.dtype,
+            "shape": list(m.shape), "captured_at_ns": m.captured_at_ns,
+            "pack_id": pack_id, "store_id": "native-test",
+            "object_key": object_key, "object_bytes": len(sealed.data),
+            "pack_checksum": sealed.checksum, "pack_record_count": 1,
+            "payload_offset": l.offset, "stored_length": l.stored_length,
+            "decoded_length": l.decoded_length, "codec": l.codec,
+            "payload_checksum": l.checksum,
+        })
+    assert len(rows) == 1, rows
+    mutate(rows[0])
+    driver.call(op="acquire", holder="writer")
+    assert driver.call(
+        op="write_descriptors", descriptors=rows, index_version=7)["ok"]
+    assert driver.call(
+        op="publish_snapshot", index_version=7,
+        refs=[{"store_id": "native-test", "pack_id": pack_id}],
+        published_at_ns=7, indexed_rows=1, indexed_packs=1)["ok"]
+
+    python_reader = CaptureReader(
+        ClickHouseCaptureCatalog(
+            client, ClickHouseReaderConfig.from_catalog(config)),
+        {"native-test": S3PackStore.from_config(
+            S3StoreConfig(
+                endpoint_url=fake_s3, bucket=BUCKET, region=REGION,
+                access_key_id=ACCESS, secret_access_key=SECRET,
+                store_id="native-test", allow_insecure_http=True))})
+    selection = python_reader.select(CaptureQuery(tenant_id="t", limit=10))
+    oracle_error = None
+    try:
+        python_reader.hydrate(selection, byte_limit=1 << 30)
+    except PackFormatError as error:
+        oracle_error = str(error)
+
+    native_select = driver.call(
+        op="select", tenant_id="t", limit=10, endpoint=fake_s3,
+        bucket=BUCKET, access=ACCESS, secret=SECRET, insecure=True)
+    assert native_select["ok"], native_select
+    sel = native_select["selection"]
+    native = driver.call(
+        op="hydrate", selection_id=sel["selection_id"],
+        capture_ids=sel["capture_ids"],
+        catalog_watermark=sel["catalog_watermark"],
+        filter_hash=sel["filter_hash"], tenant_id=sel["tenant_id"],
+        byte_limit=1 << 30, endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+        secret=SECRET, insecure=True)
+    return oracle_error, native
+
+
+@pytest.mark.parametrize("field, value", [
+    ("layer_number", 99),
+    ("hook_name", "evil"),
+    ("step_number", 41),
+    ("request_id", "spoofed"),
+    ("captured_at_ns", 1_700_000_000_000_000_999),
+])
+def test_hydrate_refuses_a_metadata_field_the_footer_contradicts(
+        fake_s3, field, value):
+    """The whole metadata record is the footer's authority, not nine fields.
+
+    Python compares the entire CaptureMetadata dataclass plus the
+    five-field record locator (reader.py `_require_footer_match` /
+    `_record_locator`). A native binding that compares only the placement
+    fields and dtype/shape lets a rewritten `layer_number` or `hook_name`
+    through: the payload is handed back attributed to a capture the pack
+    itself says it is not. Each field here is one the narrow list missed.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            oracle_error, native = _footer_binding_case(
+                fake_s3, client, config, driver,
+                lambda row: row.__setitem__(field, value))
+            assert oracle_error is not None, (
+                f"the oracle must refuse a contradicted {field}")
+            assert "does not match the pack footer" in oracle_error
+            assert not native["ok"], native
+            assert "does not match the pack footer" in native["message"], (
+                native)
+        finally:
+            driver.close()
+
+
+@pytest.mark.parametrize("field, value", [
+    ("dtype", "float16"),
+    ("payload_offset", None),   # resolved below: the real offset + 4
+    ("payload_checksum", "deadbeef"),
+])
+def test_hydrate_refuses_a_locator_field_the_footer_contradicts(
+        fake_s3, field, value):
+    """REGRESSION GUARD, not a bug proof: these three already refused.
+
+    dtype, payload_offset and payload_checksum were inside the narrow
+    nine-field comparison, so this test passed on first write. It is the
+    native mirror of test_capture_storage.py's footer-mismatch cases and
+    exists so a future narrowing of the comparison cannot pass unnoticed;
+    it deliberately does NOT stand in for the metadata coverage above,
+    since a suite holding only these is exactly what let the wider gap
+    through.
+    """
+    def mutate(row):
+        row[field] = row["payload_offset"] + 4 if value is None else value
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            oracle_error, native = _footer_binding_case(
+                fake_s3, client, config, driver, mutate)
+            assert oracle_error is not None, (
+                f"the oracle must refuse a contradicted {field}")
+            assert "does not match the pack footer" in oracle_error
+            assert not native["ok"], native
+            assert "does not match the pack footer" in native["message"], (
+                native)
+        finally:
+            driver.close()
+
+
 def test_summary_core_stats_parity(fake_s3):
     from dmi.storage.capture import (
         CaptureReader, S3PackStore, S3StoreConfig,
