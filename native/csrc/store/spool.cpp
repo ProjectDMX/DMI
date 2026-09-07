@@ -293,6 +293,22 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
   }
   const std::string dir =
       parent.empty() ? root_ : root_ + "/" + parent;
+  // A well-formed key still escapes if one of its ancestors is a symlink out
+  // of the root, and no textual check can see that. Resolve it the way Python
+  // does (Path.resolve(strict=False) + is_relative_to): weakly_canonical
+  // follows the existing symlinked ancestors and tolerates a tail that does
+  // not exist yet. root_ is already a realpath, so this compares canonical to
+  // canonical -- and FsyncChain's textual walk then only ever sees a path
+  // genuinely contained by the root.
+  {
+    std::error_code ec;
+    const std::string resolved = fs::weakly_canonical(dir, ec).string();
+    if (ec || (resolved != root_ &&
+               resolved.compare(0, root_.size() + 1, root_ + "/") != 0)) {
+      if (error) *error = "object key escapes the spool root";
+      return SpoolStatus::kBadArgument;
+    }
+  }
   const std::string ready =
       dir + "/" + ReadyName(pack_id, created_at_ns, record_count, checksum);
   const std::string upload_key =

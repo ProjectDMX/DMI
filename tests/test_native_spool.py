@@ -168,6 +168,46 @@ def test_capacity_is_enforced(tmp_path):
         spool.stage(writer.seal(), OBJECT_KEY)
 
 
+def test_stage_rejects_a_key_escaping_through_a_symlinked_directory(tmp_path):
+    # Mirror of test_capture_spool.py's symlink test: a key whose parent is a
+    # symlink out of the root resolves outside it, so the write must be
+    # refused. Accepting it writes the pack outside the spool and reports it
+    # durably staged, while recursive_directory_iterator (which does not
+    # follow directory symlinks) can never find it again to upload -- the
+    # pack is lost and its bytes stay charged against the spool budget.
+    data, checksum, count = _golden_pack()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "spool"
+    root.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    response = _call(
+        op="stage", root=str(root), max_bytes=MAX_BYTES,
+        pack_id=str(PACK_ID), created_at_ns=1_700_000_000_000_000_000,
+        record_count=count, checksum=checksum,
+        object_key=f"link/{PACK_ID}.dmi-pack",
+        data_b64=base64.b64encode(data).decode(),
+    )
+    assert not response["ok"], response
+    assert response["status"] == "invalid argument", response
+    assert "escapes the spool root" in response["what"], response
+    assert list(outside.rglob("*")) == []
+    assert response["snapshot"] == {"entries": 0, "bytes": 0}
+
+    # The Python spool refuses the same key for the same reason.
+    spool = DurablePackSpool(root, max_bytes=MAX_BYTES)
+    writer = PackWriter(
+        pack_id=PACK_ID, created_at_ns=1_700_000_000_000_000_000,
+        max_pack_bytes=8 * 1024 * 1024,
+    )
+    for record in _corpus():
+        writer.append(record)
+    with pytest.raises(ValueError, match="escapes the spool root"):
+        spool.stage(writer.seal(), f"link/{PACK_ID}.dmi-pack")
+    assert list(outside.rglob("*")) == []
+
+
 def test_corrupt_ready_file_is_quarantined(tmp_path):
     data, checksum, count = _golden_pack()
     assert _call(
