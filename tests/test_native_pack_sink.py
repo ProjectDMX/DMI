@@ -461,6 +461,138 @@ def test_submit_row_rejects_mismatches(sink, tmp_path):
     assert snapshot["persisted_records"] == 1
 
 
+# --- integer bounds ------------------------------------------------------------
+#
+# CaptureMetadata refuses these values outright, so the row path must refuse
+# them too rather than accumulate them modulo 2**64 and admit whatever falls
+# out. The mapping is patched after construction to get past the reference
+# validator and put the literal on the wire.
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        # 2**64 + 1 wraps to 1: a wrapped timestamp is a plausible-looking
+        # answer, which is worse than a refusal.
+        ("captured_at_ns", 2**64 + 1),
+        ("step_number", 2**64),
+        ("token_end", 2**64 + 7),
+        # 2**64 + 5 wraps to 5, which then passes the UInt32 bound.
+        ("producer_rank", 2**64 + 5),
+        ("batch_position", 2**64 + 5),
+        # 2**64 + 3 wraps to 3, a legal layer index.
+        ("layer_number", 2**64 + 3),
+        # Below INT64_MIN by one; the negative branch has the wider limit.
+        ("token_start", -(2**63) - 1),
+        ("layer_number", -(2**63) - 1),
+        # A digit run far longer than any 64-bit value.
+        ("captured_at_ns", int("9" * 40)),
+        ("layer_number", -int("9" * 40)),
+    ],
+)
+def test_submit_row_refuses_out_of_range_integers(sink, tmp_path, field, value):
+    _open(sink, tmp_path / "spool")
+    payload = bytes(64)
+    overrides = {"dtype": "uint8", "shape": [64], "token_start": 0}
+    overrides[field] = value
+    metadata = _row_meta(0, **overrides)
+    response = _submit_row(sink, metadata, payload, "uint8", [64])
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == 0
+
+
+def test_submit_row_keeps_the_64_bit_boundaries_exact(sink, tmp_path):
+    """Everything a 64-bit field can legally hold must still parse exactly."""
+    _open(sink, tmp_path / "spool")
+    payload = bytes(64)
+    # The counters are UInt64 in the catalog, so the whole unsigned range is
+    # legal input and must survive the parse bit for bit -- not just the half
+    # of it that fits in an int64. captured_at_ns stays under 2**63 because
+    # the spool's ready-file name is what bounds it, not the parse.
+    metadata = _row_meta(0, dtype="uint8", shape=[64], layer_number=-1,
+                         step_number=2**64 - 1, token_start=2**63,
+                         token_end=2**64 - 1, captured_at_ns=2**63 - 1,
+                         producer_rank=2**32 - 1, batch_position=0)
+    response = _submit_row(sink, metadata, payload, "uint8", [64])
+    assert response["ok"], response
+    assert sink.call(op="flush", timeout=30)["ok"]
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == 1
+    spool = DurablePackSpool(tmp_path / "spool", max_bytes=1 << 40)
+    recovered = spool.recover()
+    with recovered[0].open() as handle:
+        descriptors = PackReader.from_bytes(handle.read()).descriptors(
+            store_id="spool", object_key=recovered[0].object_key
+        )
+    stored = descriptors[0].metadata
+    assert stored.layer_number == -1
+    assert stored.step_number == 2**64 - 1
+    assert stored.token_start == 2**63
+    assert stored.token_end == 2**64 - 1
+    assert stored.captured_at_ns == 2**63 - 1
+    assert stored.producer_rank == 2**32 - 1
+    assert stored.batch_position == 0
+
+
+@pytest.mark.parametrize(
+    "field", ("step_number", "token_start", "token_end", "captured_at_ns")
+)
+def test_submit_row_admits_the_whole_unsigned_range(sink, tmp_path, field):
+    """2**64 - 1 is what CaptureMetadata allows, so the row path must too."""
+    _open(sink, tmp_path / "spool")
+    overrides = {"dtype": "uint8", "shape": [64], "token_start": 0,
+                 "token_end": 2**64 - 1}
+    overrides[field] = 2**64 - 1
+    response = _submit_row(sink, _row_meta(0, **overrides), bytes(64),
+                           "uint8", [64])
+    assert response["ok"], response
+
+
+def test_submit_row_parses_the_int64_limits_before_validating_them(sink,
+                                                                   tmp_path):
+    """INT64_MAX/INT64_MIN/0/-0 parse exactly; only validation refuses them.
+
+    layer_number is the only signed field, so it is the one place where the
+    difference between "parsed, then out of the field's range" and "does not
+    fit in 64 bits at all" is observable. If the parser started refusing the
+    int64 limits themselves, these would report the wrong reason.
+    """
+    _open(sink, tmp_path / "spool")
+    payload = bytes(64)
+
+    for limit in (2**63 - 1, -(2**63)):
+        metadata = _row_meta(0, dtype="uint8", shape=[64], token_start=0,
+                             layer_number=limit)
+        response = _submit_row(sink, metadata, payload, "uint8", [64])
+        assert not response["ok"], response
+        assert "out of range" not in response["what"], (limit, response)
+        assert "validation" in response["what"], (limit, response)
+
+    # The negative limit is asymmetric: |INT64_MIN| is one larger than
+    # INT64_MAX, so the pair below is what pins it. One step past INT64_MIN
+    # flips the reason from validation to out-of-range, and nothing else does.
+    metadata = _row_meta(0, dtype="uint8", shape=[64], token_start=0,
+                         layer_number=-(2**63) - 1)
+    response = _submit_row(sink, metadata, payload, "uint8", [64])
+    assert not response["ok"] and "out of range" in response["what"], response
+
+    # 0, -0 and a plain small value are all accepted, -0 included: the raw
+    # literal never reaches Python's int, so it stays on the wire.
+    for index, literal in enumerate(("0", "-0", "3")):
+        metadata = _row_meta(index, dtype="uint8", shape=[64], token_start=0,
+                             token_end=1, layer_number=0)
+        metadata = metadata.replace('"layer_number": 0',
+                                    '"layer_number": ' + literal)
+        assert '"layer_number": ' + literal in metadata
+        response = _submit_row(sink, metadata, payload, "uint8", [64])
+        assert response["ok"], (literal, response)
+
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["submitted_records"] == 3
+
+
 def test_pipeline_head_to_head_with_python_reference(tmp_path):
     """Same corpus through both pipelines; descriptor-level equality.
 

@@ -62,13 +62,28 @@ bool ParseMetadataJson(const std::string& text,
       return fail("capture metadata is missing an integer field");
     }
   }
-  const int64_t layer = jc::FindInt(text, "layer_number");
-  const int64_t producer = jc::FindInt(text, "producer_rank");
-  const int64_t step = jc::FindInt(text, "step_number");
-  const int64_t token_start = jc::FindInt(text, "token_start");
-  const int64_t token_end = jc::FindInt(text, "token_end");
-  const int64_t batch = jc::FindInt(text, "batch_position");
-  const int64_t captured = jc::FindInt(text, "captured_at_ns");
+  // A literal wider than 64 bits has no representation to validate: the old
+  // scan wrapped it, so 2**64+1 arrived as captured_at_ns == 1 and was
+  // packed. CaptureMetadata raises on these, so refuse the row instead.
+  // kAbsent cannot mean "missing" here (HasKey already ran) -- it is a
+  // present-but-not-an-integer value, which keeps its historical -1.
+  bool out_of_range = false;
+  auto integer = [&](const char* name) -> int64_t {
+    int64_t value = 0;
+    const jc::IntFind found = jc::FindIntChecked(text, name, &value);
+    if (found == jc::IntFind::kOutOfRange) out_of_range = true;
+    return found == jc::IntFind::kOk ? value : -1;
+  };
+  const int64_t layer = integer("layer_number");
+  const int64_t producer = integer("producer_rank");
+  const int64_t step = integer("step_number");
+  const int64_t token_start = integer("token_start");
+  const int64_t token_end = integer("token_end");
+  const int64_t batch = integer("batch_position");
+  const int64_t captured = integer("captured_at_ns");
+  if (out_of_range) {
+    return fail("capture metadata integer is out of range");
+  }
   out->layer_number = layer;
   out->producer_rank = static_cast<uint64_t>(producer);
   out->step_number = static_cast<uint64_t>(step);
