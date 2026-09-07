@@ -163,18 +163,43 @@ std::string checked_text(const std::string& metadata, const char* key) {
   return value;
 }
 
-// Bytes per element for the v1 dtype set — the Python metadata model's
-// `_DTYPE_BYTES` table, which is the same ten the pack builder pins in
-// `kDtypes` and the adapter's ATEN mapping pins again. A dtype outside it
-// is refused here, not sized by a wider table: the Python reader rebuilds
-// `CaptureMetadata` from the row this renders and would refuse the dtype on
-// read-back.
+// Bytes per element for a dtype the format supports.
+//
+// MEMBERSHIP is not decided here. `dmi_pack::DtypeSupported` decides it,
+// against `kDtypes` — the native side's authoritative dtype list, which
+// tracks `_DTYPE_BYTES` in model.py. A reader carrying its own list of
+// names would be a second copy of that answer and could only drift from
+// it, in whichever direction the model happened to move; refusing a dtype
+// the builder admits is as wrong as admitting one it does not, because the
+// Python reader rebuilds `CaptureMetadata` from the row this renders and
+// answers the same membership question from the same table.
+//
+// What is left here is the WIDTH of a name already admitted. The table
+// below deliberately covers more names than a given version's list
+// admits: an unadmitted name is unreachable, and a name the list grows is
+// already sized.
 size_t dtype_bytes(const std::string& dtype) {
-  if (dtype == "bool" || dtype == "uint8" || dtype == "int8") return 1;
-  if (dtype == "int16" || dtype == "float16" || dtype == "bfloat16") return 2;
-  if (dtype == "int32" || dtype == "float32") return 4;
-  if (dtype == "int64" || dtype == "float64") return 8;
-  metadata_error("unsupported dtype: '" + dtype + "'");
+  if (!dmi_pack::DtypeSupported(dtype)) {
+    metadata_error("unsupported dtype: '" + dtype + "'");
+  }
+  if (dtype == "bool" || dtype == "uint8" || dtype == "int8" ||
+      dtype == "float8_e4m3fn" || dtype == "float8_e5m2") {
+    return 1;
+  }
+  if (dtype == "uint16" || dtype == "int16" || dtype == "bfloat16" ||
+      dtype == "float16") {
+    return 2;
+  }
+  if (dtype == "uint32" || dtype == "int32" || dtype == "float32") {
+    return 4;
+  }
+  if (dtype == "uint64" || dtype == "int64" || dtype == "float64") {
+    return 8;
+  }
+  // Reachable only if the builder's list grows a name this table has no
+  // width for, which is a drift between these two files and not anything
+  // the footer did. Said plainly rather than blamed on the pack.
+  format_error("no element width for supported dtype: '" + dtype + "'");
 }
 
 // The shape array as an integer list, which is all `from_mapping` checks

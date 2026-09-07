@@ -31,6 +31,10 @@ Which tests are bug proofs and which are regression guards:
   `records-not-list`, `duplicate-capture-id`, `offset-0` and
   `footer-not-json` each named the wrong refusal, and those four are bug
   proofs for the message and ordering half of the parity.
+* `test_the_admitted_dtype_set_agrees_with_the_oracle` is a DRIFT GUARD
+  in both directions -- it asserts the two readers agree on each dtype
+  name, not that any particular name is refused, because the contract's
+  dtype table grows.
 * `test_a_well_formed_pack_still_indexes_through_the_same_path` is the
   control: without it a reader that refused everything would pass every
   refusal case above.
@@ -330,6 +334,81 @@ def test_a_poison_shape_that_clickhouse_stores_is_refused_by_the_reader(
             driver.close()
         _assert_same_refusal("poison-shape", native,
                              _oracle_refusal(data, ref))
+
+
+# --- the admitted dtype set ------------------------------------------------
+
+
+def _dtype_and_length(dtype, decoded_length):
+    def mutate(decoded):
+        record = decoded["records"][0]
+        record["metadata"]["dtype"] = dtype
+        record["metadata"]["shape"] = [2]
+        record["stored_length"] = decoded_length
+        record["decoded_length"] = decoded_length
+
+    return mutate
+
+
+# Names spanning three groups: admitted by every version of the contract,
+# admitted by some (fp8 and the wide integers become first-class further up
+# this stack), and admitted by none.
+DTYPE_PROBES = ("float32", "bool", "int64", "uint16", "uint32",
+                "float8_e4m3fn", "float8_e5m2", "uint64", "float128",
+                "not-a-dtype")
+
+
+@pytest.mark.parametrize("dtype", DTYPE_PROBES)
+def test_the_admitted_dtype_set_agrees_with_the_oracle(fake_s3, dtype):
+    """Native admits a footer's dtype exactly when the oracle admits it.
+
+    Deliberately NOT a list of names this test expects to be refused.
+    `_DTYPE_BYTES` in model.py is the contract and it GROWS: a test that
+    pinned today's membership would fail the moment the oracle widened,
+    and a reader that pinned it would refuse dtypes the pipeline had
+    declared first-class -- which is why `dtype_bytes` asks
+    `dmi_pack::DtypeSupported` for membership rather than keeping a list.
+    What is asserted here is AGREEMENT, in whichever direction the
+    contract moves: for each name, both readers admit the footer or both
+    refuse it with the same sentence.
+
+    `uint64` earns its place: `dtype_bytes` knows a width for it, and no
+    version of the contract admits it. It is the case that would catch a
+    width table quietly widening what is admitted.
+    """
+    from dmi.storage.capture.model import _DTYPE_BYTES
+
+    # A length consistent with the oracle's OWN width where it has one.
+    # Where it has none the dtype is refused before any length is looked
+    # at, so the value cannot matter.
+    length = 2 * _DTYPE_BYTES.get(dtype, 4)
+    sealed, reseal = _one_record_pack()
+    data = reseal(sealed.data, mutate=_dtype_and_length(dtype, length))
+    _put(data)
+    ref = _native_ref(data, sealed.checksum, record_count=1)
+    oracle = _oracle_refusal(data, ref)
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open(driver, prefix)
+            driver.call(op="acquire", holder="indexer")
+            native = _native_refusal(driver, fake_s3, ref)
+        finally:
+            driver.close()
+        rows = client.execute(
+            f"SELECT count() FROM `{config.database}`."
+            f"`{prefix}_capture_raw`")
+        if oracle:
+            _assert_same_refusal(dtype, native, oracle)
+            assert rows == [(0,)], (dtype, rows)
+        else:
+            # The oracle admits it, so native must, and must have written
+            # the row rather than merely not complaining.
+            assert native == "", (
+                f"{dtype}: native refuses a footer the oracle admits: "
+                f"{native!r}")
+            assert rows == [(1,)], (dtype, rows)
 
 
 def _offset_beyond_int64(decoded):

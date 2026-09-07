@@ -108,6 +108,13 @@ struct SealedPack {
   std::string checksum;  // sha256 hex of data
 };
 
+// Whether `dtype` is one of the dtype names this format version supports.
+// `kDtypes` in the .cpp is the authoritative list for the native side and
+// tracks `_DTYPE_BYTES` in model.py; this is exported so that a READER
+// deciding whether to admit a footer's dtype can ask that list instead of
+// keeping a second copy, which could only drift from it.
+bool DtypeSupported(const std::string& dtype);
+
 // Validate one metadata against the same rules the reference enforces.
 Status ValidateMetadata(const RecordMetadata& m);
 

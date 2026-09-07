@@ -227,12 +227,16 @@ const std::array<const char*, 14> kDtypes = {
     "bfloat16", "float8_e4m3fn", "float8_e5m2", "uint32",
     "int32", "float32", "int64", "float64"};
 
+}  // namespace
+
 bool DtypeSupported(const std::string& dtype) {
   for (const char* name : kDtypes) {
     if (dtype == name) return true;
   }
   return false;
 }
+
+namespace {
 
 bool ValidText(const std::string& value, bool optional, size_t limit = 512) {
   if (value.empty()) return optional;
