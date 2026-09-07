@@ -143,7 +143,9 @@ dmi ui ./Qwen3-8B
 
 `dmi ui` accepts a model directory, a `config.json`, a Hugging Face model id,
 or a DMI descriptor YAML, and picks the descriptor out of the current directory
-when there is exactly one. See
+when there is exactly one. Resolving a model directory or a bare Hugging Face
+model id needs `transformers` (`pip install -e ".[hf]"`); pointing at a
+`config.json` directly does not. See
 [the configurator plan](docs/dmi-configurator-plan.md) for the design.
 
 ## Get started
