@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include <set>
 
@@ -48,8 +49,11 @@ size_t dtype_bytes(const std::string& dtype) {
 }
 
 bool is_float_dtype(const std::string& dtype) {
+  // float8 is a float: NaN (e4m3fn and e5m2) and Inf (e5m2) ride the
+  // NaN/Inf counting paths, and the order statistics stay float.
   return dtype == "float16" || dtype == "bfloat16" || dtype == "float32" ||
-         dtype == "float64";
+         dtype == "float64" || dtype == "float8_e4m3fn" ||
+         dtype == "float8_e5m2";
 }
 
 // One element widened to double. bfloat16 is read as uint16 and widened to
@@ -126,8 +130,32 @@ double decode_element(const std::string& dtype, const uint8_t* data,
     return static_cast<double>(f32);
   }
   if (dtype == "float8_e4m3fn" || dtype == "float8_e5m2") {
-    throw CatalogError(CatalogError::Kind::kValue,
-                       "float8 dtypes are not summary-decodable yet");
+    // OCP float8, widened to float32 by bit math — exact for every
+    // pattern, matching summary.py's _decode_float8 bit for bit.
+    // e4m3fn: 1/4/3, bias 7, no infinities (all-ones exponent is NaN).
+    // e5m2: IEEE-shaped 1/5/2, bias 15, with infinities.
+    const uint8_t byte = data[offset];
+    double sign = byte >= 128 ? -1.0 : 1.0;
+    const uint32_t body = byte & 0x7F;
+    if (dtype == "float8_e4m3fn") {
+      const uint32_t exponent = body >> 3;
+      const double mantissa = static_cast<double>(body & 0x7);
+      if (exponent == 15) return std::nan("");
+      if (exponent == 0) {
+        return sign * std::ldexp(mantissa / 8.0, -6);
+      }
+      return sign * std::ldexp(1.0 + mantissa / 8.0,
+                               static_cast<int>(exponent) - 7);
+    }
+    const uint32_t exponent = body >> 2;
+    const double mantissa = static_cast<double>(body & 0x3);
+    if (exponent == 31) {
+      if (mantissa == 0) return sign * std::numeric_limits<double>::infinity();
+      return std::nan("");
+    }
+    if (exponent == 0) return sign * std::ldexp(mantissa / 4.0, -14);
+    return sign * std::ldexp(1.0 + mantissa / 4.0,
+                             static_cast<int>(exponent) - 15);
   }
   throw CatalogError(CatalogError::Kind::kValue,
                      "unsupported dtype: " + dtype);

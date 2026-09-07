@@ -43,14 +43,21 @@ _NUMPY_DTYPES = {
     "bool": "|b1",
     "uint8": "|u1",
     "int8": "|i1",
+    "uint16": "<u2",
     "int16": "<i2",
     "float16": "<f2",
+    "uint32": "<u4",
     "int32": "<i4",
     "float32": "<f4",
     "int64": "<i8",
     "float64": "<f8",
 }
-_FLOAT_DTYPES = frozenset({"float16", "bfloat16", "float32", "float64"})
+# float8 has no numpy dtype and decodes by bit math in decode_tensor; it is
+# float for the NaN/Inf handling and widens exactly to float32.
+_FLOAT_DTYPES = frozenset({
+    "float16", "bfloat16", "float32", "float64",
+    "float8_e4m3fn", "float8_e5m2",
+})
 
 
 def _numpy():
@@ -113,6 +120,37 @@ class ArtifactRef:
     content_type: str
 
 
+def _decode_float8(numpy, payload: bytes, dtype: str) -> "np.ndarray":
+    """Widen OCP float8 to float32 by bit math — exact for every pattern.
+
+    ``e4m3fn``: 1/4/3, bias 7, no infinities (exponent all-ones is NaN).
+    ``e5m2``: IEEE-shaped 1/5/2, bias 15, with infinities.
+    """
+    raw = numpy.frombuffer(payload, dtype=numpy.uint8)
+    sign = numpy.where(raw >= 128, -1.0, 1.0).astype(numpy.float32)
+    body = (raw & 0x7F).astype(numpy.uint32)
+    if dtype == "float8_e4m3fn":
+        exponent = (body >> 3).astype(numpy.int32)
+        mantissa = (body & 0x7).astype(numpy.float32)
+        normal = numpy.ldexp(1.0 + mantissa / 8.0, exponent - 7)
+        subnormal = numpy.ldexp(mantissa / 8.0, -6)
+        value = numpy.where(exponent == 0, subnormal, normal)
+        value = numpy.where(exponent == 15, numpy.float32(numpy.nan), value)
+    else:
+        exponent = (body >> 2).astype(numpy.int32)
+        mantissa = (body & 0x3).astype(numpy.float32)
+        normal = numpy.ldexp(1.0 + mantissa / 4.0, exponent - 15)
+        subnormal = numpy.ldexp(mantissa / 4.0, -14)
+        value = numpy.where(exponent == 0, subnormal, normal)
+        value = numpy.where(
+            exponent == 31,
+            numpy.where(mantissa == 0,
+                        numpy.float32(numpy.inf),
+                        numpy.float32(numpy.nan)),
+            value)
+    return (sign * value).astype(numpy.float32)
+
+
 def decode_tensor(descriptor: CaptureDescriptor, payload: bytes) -> "np.ndarray":
     """Decode a hydrated payload into its tensor.
 
@@ -135,6 +173,8 @@ def decode_tensor(descriptor: CaptureDescriptor, payload: bytes) -> "np.ndarray"
     if metadata.dtype == "bfloat16":
         raw = numpy.frombuffer(payload, dtype="<u2")
         array = (raw.astype(numpy.uint32) << 16).view(numpy.float32)
+    elif metadata.dtype in ("float8_e4m3fn", "float8_e5m2"):
+        array = _decode_float8(numpy, payload, metadata.dtype)
     else:
         try:
             array = numpy.frombuffer(payload, dtype=_NUMPY_DTYPES[metadata.dtype])

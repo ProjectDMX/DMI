@@ -49,7 +49,13 @@ class CatalogDriver:
     def call(self, **fields) -> dict:
         self.proc.stdin.write(json.dumps(fields) + "\n")
         self.proc.stdin.flush()
-        return json.loads(self.proc.stdout.readline())
+        line = self.proc.stdout.readline()
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            raise AssertionError(
+                f"driver returned unparseable JSON for op="
+                f"{fields.get('op')!r}: {line[:400]}")
 
     def close(self):
         try:
@@ -1010,3 +1016,215 @@ def test_filter_hash_escapes_like_python_json(fake_s3):
             assert walked["items"], walked
         finally:
             driver.close()
+
+
+def test_fp8_and_wide_int_summaries_parity(fake_s3):
+    """fp8 and uint16/uint32 are first-class dtypes on both sides.
+
+    fp8 carries NaN and Inf (e4m3fn has no infinities — exponent all-ones
+    is NaN; e5m2 has both), so the NaN/Inf counting paths are part of what
+    parity means. The core summaries must agree exactly, and the payloads
+    must hydrate to the same bytes.
+    """
+    from dmi.storage.capture import (
+        CaptureReader, S3PackStore, S3StoreConfig,
+    )
+    from dmi.storage.capture.clickhouse_reader import (
+        ClickHouseCaptureCatalog, ClickHouseReaderConfig,
+    )
+    from dmi.storage.capture.model import CaptureMetadata, CaptureRecord
+
+    def meta_and_payload(dtype, payload, index, elements):
+        meta = CaptureMetadata(
+            capture_id=f"fp8-{index}", tenant_id="t", experiment_id="e",
+            run_id="r", session_id="s", request_id="q",
+            sequence_id=f"n{index}", model_id="m", model_revision="mr",
+            adapter_revision=None, capture_policy_version="v",
+            hook_name="h", layer_number=0, producer_rank=0, step_number=index,
+            token_start=0, token_end=1, batch_position=0, dtype=dtype,
+            shape=(elements,), captured_at_ns=1_700_000_000_000_000_000 + index,
+        )
+        return CaptureRecord(metadata=meta, payload=payload)
+
+    with _catalog() as (client, config, prefix):
+        try:
+            sink, store, driver, refs = None, None, None, None
+            # The fp8 payloads: e4m3fn (+0, -0, 1, -1, NaN, subnormal, NaN)
+            # and e5m2 (1, +inf, NaN, subnormal, -2, 0, 4).
+            e4m3_payload = bytes([0x00, 0x80, 0x38, 0xB8, 0x7F, 0x01, 0x7E])
+            e5m2_payload = bytes([0x3C, 0x7C, 0x7E, 0x01, 0xFC, 0x00, 0x40])
+            u32_payload = (1024).to_bytes(4, "little") + (0).to_bytes(
+                4, "little") + (2**32 - 1).to_bytes(4, "little")
+            u16_payload = (65535).to_bytes(2, "little") + (1).to_bytes(
+                2, "little")
+
+            # The native write path takes descriptor dicts; the pack round
+            # trip goes through the reference PackWriter (the bytes must be
+            # identical either way — the format is dtype-agnostic).
+            from benchmarks.bench_capture_catalog import synthetic_descriptors
+            base = synthetic_descriptors(1)[0]
+            loc = base.locator
+            corpus = [
+                meta_and_payload("float8_e4m3fn", e4m3_payload, 0, 7),
+                meta_and_payload("float8_e5m2", e5m2_payload, 1, 7),
+                meta_and_payload("uint32", u32_payload, 2, 3),
+                meta_and_payload("uint16", u16_payload, 3, 2),
+            ]
+
+            import tempfile
+            from dmi.storage.capture import PackWriter, PackReader
+            pack_id = str(uuid.uuid4())
+            writer = PackWriter(pack_id=pack_id,
+                                created_at_ns=1_700_000_000_000_000_000,
+                                max_pack_bytes=8 * 1024 * 1024)
+            for record in corpus:
+                writer.append(record)
+            sealed = writer.seal()
+
+            # The catalog + store: publish the pack, then read it back
+            # through BOTH readers.
+            from dmi.storage.capture.clickhouse_catalog import (
+                ClickHouseCatalogWriter,
+            )
+            catalog_writer = ClickHouseCatalogWriter(client, config)
+            driver = CatalogDriver()
+            import base64 as b64mod
+            try:
+                catalog_writer.ensure_schema()
+                _open_helper(driver, prefix)
+                # The locator fields (offset, checksum) exist only after
+                # packing — read the sealed pack back and take the real
+                # descriptors rather than inventing them.
+                from dmi.storage.capture.pack import PackReader
+                packed = PackReader.from_bytes(sealed.data)
+                packed_descriptors = packed.descriptors(
+                    store_id="native-test",
+                    object_key=f"packs/{pack_id}.dmi-pack")
+                rows = []
+                for d in packed_descriptors:
+                    m, l = d.metadata, d.locator
+                    rows.append({
+                        "capture_id": m.capture_id, "tenant_id": m.tenant_id,
+                        "experiment_id": m.experiment_id, "run_id": m.run_id,
+                        "session_id": m.session_id,
+                        "request_id": m.request_id,
+                        "sequence_id": m.sequence_id, "model_id": m.model_id,
+                        "model_revision": m.model_revision,
+                        "adapter_revision": m.adapter_revision,
+                        "capture_policy_version": m.capture_policy_version,
+                        "hook_name": m.hook_name,
+                        "layer_number": m.layer_number,
+                        "producer_rank": m.producer_rank,
+                        "step_number": m.step_number,
+                        "token_start": m.token_start, "token_end": m.token_end,
+                        "batch_position": m.batch_position, "dtype": m.dtype,
+                        "shape": list(m.shape),
+                        "captured_at_ns": m.captured_at_ns,
+                        "pack_id": pack_id, "store_id": "native-test",
+                        "object_key": f"packs/{pack_id}.dmi-pack",
+                        "object_bytes": len(sealed.data),
+                        "pack_checksum": sealed.checksum,
+                        "pack_record_count": len(corpus),
+                        "payload_offset": l.offset,
+                        "stored_length": l.stored_length,
+                        "decoded_length": l.decoded_length,
+                        "codec": l.codec, "payload_checksum": l.checksum,
+                    })
+                version = 7
+                driver.call(op="acquire", holder="writer")
+                driver.call(op="write_descriptors", descriptors=rows,
+                            index_version=version)
+                driver.call(
+                    op="publish_snapshot", index_version=version,
+                    refs=[{"store_id": "native-test", "pack_id": pack_id}],
+                    published_at_ns=version, indexed_rows=len(corpus),
+                    indexed_packs=1)
+
+                # The object bytes: upload the sealed pack via the fake S3.
+                import boto3
+                from botocore.config import Config as BotoConfig
+                s3 = boto3.client(
+                    "s3", endpoint_url=fake_s3, region_name=REGION,
+                    aws_access_key_id=ACCESS, aws_secret_access_key=SECRET,
+                    config=BotoConfig(s3={"addressing_style": "path"}),
+                    verify=False)
+                s3.put_object(
+                    Bucket=BUCKET, Key=f"packs/{pack_id}.dmi-pack",
+                    Body=sealed.data)
+
+                from dmi.storage.capture.model import CaptureQuery
+                python_catalog = ClickHouseCaptureCatalog(
+                    client, ClickHouseReaderConfig.from_catalog(config))
+                python_store = S3PackStore.from_config(
+                    S3StoreConfig(
+                        endpoint_url=fake_s3, bucket=BUCKET, region=REGION,
+                        access_key_id=ACCESS, secret_access_key=SECRET,
+                        store_id="native-test", allow_insecure_http=True))
+                python_reader = CaptureReader(
+                    python_catalog, {"native-test": python_store})
+                selection = python_reader.select(
+                    CaptureQuery(tenant_id="t", limit=10))
+                assert len(selection.capture_ids) == 4, selection
+
+                hydrated = python_reader.hydrate(
+                    selection, byte_limit=1 << 30)
+                by_id = {i.capture_id: i.payload for i in hydrated}
+                assert by_id["fp8-0"] == e4m3_payload
+                assert by_id["fp8-1"] == e5m2_payload
+                assert by_id["fp8-2"] == u32_payload
+                assert by_id["fp8-3"] == u16_payload
+
+                # The native side: same bytes.
+                native_select = driver.call(
+                    op="select", tenant_id="t", limit=10,
+                    endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                    secret=SECRET, insecure=True)
+                assert native_select["ok"], native_select
+                sel = native_select["selection"]
+                native_hydrated = driver.call(
+                    op="hydrate", selection_id=sel["selection_id"],
+                    capture_ids=sel["capture_ids"],
+                    catalog_watermark=sel["catalog_watermark"],
+                    filter_hash=sel["filter_hash"],
+                    tenant_id=sel["tenant_id"], byte_limit=1 << 30,
+                    endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                    secret=SECRET, insecure=True)
+                assert native_hydrated["ok"], native_hydrated
+                for i, payload in enumerate(native_hydrated["payloads"]):
+                    assert b64mod.b64decode(payload) == \
+                        corpus[i].payload, corpus[i].capture_id
+
+                # Core summaries: exact parity, NaN/Inf counting included.
+                python_summaries = python_reader.summarize(
+                    selection, byte_limit=1 << 30)
+                by_id = {s.capture_id: s.core for s in python_summaries}
+                native_summaries = driver.call(
+                    op="summarize_core",
+                    selection_id=sel["selection_id"],
+                    capture_ids=sel["capture_ids"],
+                    catalog_watermark=sel["catalog_watermark"],
+                    filter_hash=sel["filter_hash"],
+                    tenant_id=sel["tenant_id"], byte_limit=1 << 30,
+                    endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                    secret=SECRET, insecure=True)
+                assert native_summaries["ok"], native_summaries
+                for summary in native_summaries["summaries"]:
+                    expected = by_id[summary["capture_id"]]
+                    assert summary["element_count"] == expected.element_count
+                    assert summary["nan_count"] == expected.nan_count, (
+                        summary["capture_id"])
+                    assert summary["inf_count"] == expected.inf_count, (
+                        summary["capture_id"])
+                    assert summary["finite_count"] == expected.finite_count
+                    assert summary["zero_fraction"] == \
+                        expected.zero_fraction
+                    assert summary["mean"] == expected.mean, (
+                        summary["capture_id"])
+                    assert summary["minimum"] == expected.minimum
+                    assert summary["maximum"] == expected.maximum
+                    assert summary["l2_norm"] == expected.l2_norm, (
+                        summary["capture_id"])
+            finally:
+                driver.close()
+        finally:
+            pass

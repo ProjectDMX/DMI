@@ -149,14 +149,19 @@ def test_golden_corpus_end_to_end(sink, tmp_path):
         assert _submit(sink, record) == "accepted"
     assert sink.call(op="flush", timeout=30)["ok"]
     snapshot = sink.call(op="close", timeout=30)["snapshot"]
-    assert snapshot["submitted_records"] == 10
-    assert snapshot["admitted_records"] == 10
-    assert snapshot["persisted_records"] == 10
+    # The golden corpus is one capture per dtype the format accepts — the
+    # count tracks the dtype table, not a fixed number.
+    from tests.tools.golden_workload import _DTYPES
+    expected = len(_DTYPES)
+    assert snapshot["submitted_records"] == expected
+    assert snapshot["admitted_records"] == expected
+    assert snapshot["persisted_records"] == expected
     # Every golden record carries a distinct producer_rank, so each is its
-    # own scope: 10 packs via 9 session seals; the explicit flush sealed the
-    # last pack as MANUAL, so shutdown seals nothing (same as the reference).
-    assert snapshot["packs_persisted"] == 10
-    assert snapshot["flush_session"] == 9
+    # own scope: one pack per record via session seals; the explicit flush
+    # sealed the last pack as MANUAL, so shutdown seals nothing (same as
+    # the reference).
+    assert snapshot["packs_persisted"] == expected
+    assert snapshot["flush_session"] == expected - 1
     assert snapshot["flush_manual"] == 1
     assert snapshot["flush_shutdown"] == 0
     assert snapshot["failures"] == 0
@@ -165,7 +170,8 @@ def test_golden_corpus_end_to_end(sink, tmp_path):
     # Python reads the native-staged packs: ids, checksums, tenant binding.
     spool = DurablePackSpool(tmp_path / "spool", max_bytes=1 << 40)
     recovered = spool.recover()
-    assert len(recovered) == 10
+    from tests.tools.golden_workload import _DTYPES
+    assert len(recovered) == len(_DTYPES)
     seen = []
     for entry in recovered:
         with entry.open() as handle:
@@ -174,7 +180,8 @@ def test_golden_corpus_end_to_end(sink, tmp_path):
             )
         seen.extend(d.metadata.capture_id for d in descriptors)
         assert entry.object_key.startswith("v1/tenant=tenant-golden/")
-    assert sorted(seen) == [f"golden-{i:02d}" for i in range(10)]
+    assert sorted(seen) == [
+        f"golden-{i:02d}" for i in range(len(_DTYPES))]
 
 
 def test_session_change_seals_a_pack(sink, tmp_path):
