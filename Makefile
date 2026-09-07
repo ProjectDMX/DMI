@@ -4,6 +4,12 @@ PYTHON ?= python
 
 NATIVE_DIR ?= $(CURDIR)/native
 
+# Extra flags for the pytest invocations below. CI passes --junit-xml so a
+# later step can read what actually RAN, rather than trusting an exit code:
+# a suite whose tests all skipped exits 0 and reports green. Empty by
+# default, so a developer's `make check` is unchanged.
+PYTEST_ARGS ?=
+
 all: native
 
 native:
@@ -18,7 +24,7 @@ clean:
 test: test-cpu
 
 test-cpu:
-	$(PYTHON) -m pytest -m cpu -q
+	$(PYTHON) -m pytest -m cpu -q $(PYTEST_ARGS)
 
 test-host: host
 	$(PYTHON) -m pytest tests/test_cpu_native_build.py \

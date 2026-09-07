@@ -194,11 +194,11 @@ OBJS += $(RING_OBJS)
 all: $(FINAL_TARGET)
 
 # Every target that builds without CUDA, as ONE goal. CI's compile gate
-# asks for this rather than listing the binaries: the list it used to
-# carry was written when there were eight and went stale the moment
-# CPU_ONLY_GOALS gained the catalog driver, which is exactly the drift a
-# compile gate exists to prevent. Adding a target to CPU_ONLY_GOALS now
-# puts it under the gate automatically.
+# asks for this rather than listing the binaries: a list in the workflow
+# goes stale the moment CPU_ONLY_GOALS gains a target -- which it did,
+# when the catalog driver landed and the hardcoded list did not know --
+# and that is exactly the drift a compile gate exists to prevent. Adding
+# a target to CPU_ONLY_GOALS now puts it under the gate automatically.
 cpu-goals: $(CPU_ONLY_GOALS)
 
 host: $(HOST_FINAL_TARGET)
