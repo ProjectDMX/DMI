@@ -819,8 +819,13 @@ def test_supersession_resolves_the_newest_pack():
 
 # --- C2: hydration and core summary at parity --------------------------------
 
-def _e2e_setup(fake_s3, prefix, record_count=3):
-    """sink → uploader → native index; returns (drivers, refs, descriptor ids)."""
+def _e2e_setup(fake_s3, prefix, record_count=3, **stage_kwargs):
+    """sink → uploader → native index; returns (drivers, refs, descriptor ids).
+
+    `stage_kwargs` are forwarded verbatim to `_stage` (payload, dtype,
+    shape), so a test that needs a real element type or a rank>=2 shape
+    can stage one without duplicating the pipeline.
+    """
     from tests.test_native_uploader import (
         SINK_DRIVER, STORE_DRIVER, DriverSession, _stage, _store_base,
     )
@@ -831,7 +836,7 @@ def _e2e_setup(fake_s3, prefix, record_count=3):
     try:
         import tempfile
         spool_root = Path(tempfile.mkdtemp()) / "spool"
-        staged = [_stage(sink, spool_root, 60 + i)
+        staged = [_stage(sink, spool_root, 60 + i, **stage_kwargs)
                   for i in range(record_count)]
         uploaded = store.call(
             op="upload_pending", **_store_base(fake_s3),
@@ -907,6 +912,83 @@ def test_hydrate_parity_identical_payload_bytes(fake_s3):
             by_id = {item.capture_id: item.payload for item in hydrated}
             for index, capture_id in enumerate(
                     native_selection["capture_ids"]):
+                assert native_payloads[index] == by_id[capture_id], capture_id
+        finally:
+            for closer in (sink, store, driver):
+                if closer is not None:
+                    closer.close()
+
+
+def test_hydrate_parity_on_a_multi_dimensional_shape(fake_s3):
+    """A rank>=2 shape must survive hydration's footer binding.
+
+    The sibling of test_search_parity_on_a_multi_dimensional_shape, one
+    layer down. The pack footer row renders `shape` verbatim as a compact
+    JSON array, so a rank-2 tensor arrives as `[4,3]` inside the row's
+    own comma-separated field list. A footer splitter that tracks quoted
+    strings but not bracket depth splits `[4,3]` into `[4` and `3]`,
+    shifts every field from `shape` onward, and refuses the descriptor
+    with "does not match the pack footer: field 20" -- which is EVERY
+    real activation tensor, since only rank 1 survives.
+    """
+    from dmi.storage.capture import (
+        CaptureReader, S3PackStore, S3StoreConfig,
+    )
+    from dmi.storage.capture.clickhouse_reader import (
+        ClickHouseCaptureCatalog, ClickHouseReaderConfig,
+    )
+
+    # float32, 4x3: twelve elements of 1.0f, so the payload length agrees
+    # with dtype x prod(shape) and the pack index accepts the record.
+    payload = b"\x00\x00\x80?" * 12
+
+    with _catalog() as (client, config, prefix):
+        sink, store, driver, refs = None, None, None, None
+        try:
+            sink, store, driver, refs = _e2e_setup(
+                fake_s3, prefix, payload=payload, dtype="float32",
+                shape=(4, 3))
+
+            from dmi.storage.capture.model import CaptureQuery
+            python_catalog = ClickHouseCaptureCatalog(
+                client, ClickHouseReaderConfig.from_catalog(config))
+            python_store = S3PackStore.from_config(
+                S3StoreConfig(
+                    endpoint_url=fake_s3, bucket=BUCKET, region=REGION,
+                    access_key_id=ACCESS, secret_access_key=SECRET,
+                    store_id="native-test", allow_insecure_http=True))
+            python_reader = CaptureReader(
+                python_catalog, {"native-test": python_store})
+            selection = python_reader.select(
+                CaptureQuery(tenant_id="t", limit=10))
+
+            native_select = driver.call(
+                op="select", tenant_id="t", limit=10,
+                endpoint=fake_s3, bucket=BUCKET, access=ACCESS,
+                secret=SECRET, insecure=True)
+            assert native_select["ok"], native_select
+            sel = native_select["selection"]
+            assert sel["selection_id"] == selection.selection_id
+
+            # THE ORACLE: Python hydrates the rank-2 capture.
+            hydrated = python_reader.hydrate(selection, byte_limit=1 << 30)
+            by_id = {item.capture_id: item.payload for item in hydrated}
+            assert set(by_id.values()) == {payload}
+
+            native = driver.call(
+                op="hydrate", selection_id=sel["selection_id"],
+                capture_ids=sel["capture_ids"],
+                catalog_watermark=sel["catalog_watermark"],
+                filter_hash=sel["filter_hash"],
+                tenant_id=sel["tenant_id"],
+                byte_limit=1 << 30, endpoint=fake_s3, bucket=BUCKET,
+                access=ACCESS, secret=SECRET, insecure=True)
+            assert native["ok"], native
+            import base64
+            native_payloads = [
+                base64.b64decode(item) for item in native["payloads"]]
+            assert len(native_payloads) == len(hydrated)
+            for index, capture_id in enumerate(sel["capture_ids"]):
                 assert native_payloads[index] == by_id[capture_id], capture_id
         finally:
             for closer in (sink, store, driver):
