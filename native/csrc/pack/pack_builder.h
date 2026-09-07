@@ -58,6 +58,14 @@ inline const char* StatusName(Status s) {
 // CRC-32 (IEEE, reflected) — bit-identical to zlib.crc32.
 uint32_t Crc32(const uint8_t* data, size_t n, uint32_t crc = 0);
 
+// Python json.dumps with ensure_ascii=True, as one call: escapes the quote,
+// the backslash, and the control range (short forms where JSON allows
+// them, \u00XX otherwise), and everything >= 0x7F as \uXXXX with surrogate
+// pairs above 0xFFFF. The canonical escaping for every JSON string the
+// pipeline renders — the pack footer and the reader's filter hash hash the
+// same bytes Python's json.dumps would.
+void EncodeJsonString(const std::string& value, std::string* out);
+
 // The metadata one record carries. Field order matches CaptureMetadata.
 struct RecordMetadata {
   std::string capture_id;

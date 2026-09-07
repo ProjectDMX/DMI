@@ -79,6 +79,11 @@ size_t dtype_bytes(const std::string& dtype) {
 
 uint64_t shape_product(const std::string& shape_json) {
   uint64_t product = 1;
+  // An empty shape array renders as [] → Unwrap → "" → SplitElements
+  // yields ONE empty token, which parse would turn into 0 — turning every
+  // scalar capture's logical_bytes to 0 and refusing the footer match.
+  // A scalar is one element: no dimensions to multiply.
+  if (jc::Unwrap(shape_json).empty()) return 1;
   for (const std::string& dim :
        jc::SplitElements(jc::Unwrap(shape_json))) {
     // Dims are JSON numbers; parse the raw text.

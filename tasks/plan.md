@@ -55,7 +55,7 @@ Full task detail with acceptance criteria and verification: `tasks/todo.md`.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Catalog protocol port re-opens #119/#125 surface | High | Textual SQL identity where gated (`release`, `fence`); semantic equivalence elsewhere; 1:1 test port (#125 concurrency trio deferred — see Checkpoint B); quorum verifier PASS ✓ 12/12 both legs |
+| Catalog protocol port re-opens #119/#125 surface | High | Textual SQL identity, gated on the coordinator's own statements (`release`, `fence`) AND on the parameterized ones, compared as the SERVER received them via `system.query_log`; 1:1 test port incl. the #125 concurrency trio; quorum verifier PASS ✓ 12/12 both legs |
 | Profile indicts non-GIL bottleneck | High | Phase 0 gate before any port beyond T0.3 |
 | Two implementations drift | Med | Behavioral tests drive both; Python oracle-only after flip |
 | libcurl/SigV4 subtleties | Med | Garage conformance + fault matrix (A2b) |

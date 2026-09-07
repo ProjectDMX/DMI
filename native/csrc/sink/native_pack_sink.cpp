@@ -52,6 +52,14 @@ std::string AtenDtypeName(int32_t scalar_type) {
     case at::ScalarType::Float: return "float32";
     case at::ScalarType::Long: return "int64";
     case at::ScalarType::Double: return "float64";
+    // The dtypes the validation layer admits and the pack format carries:
+    // the adapter must accept every one of them, or a capture fails at the
+    // ring boundary that the rest of the pipeline already handles.
+    // torch.uint16/uint32 arrived in torch 2.3; float8 in 2.1.
+    case at::ScalarType::UInt16: return "uint16";
+    case at::ScalarType::UInt32: return "uint32";
+    case at::ScalarType::Float8_e4m3fn: return "float8_e4m3fn";
+    case at::ScalarType::Float8_e5m2: return "float8_e5m2";
     default: return "";
   }
 }

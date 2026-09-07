@@ -1880,3 +1880,51 @@ discovery and aggregation. ClickHouse supplies the rebuildable hot query layer.
 - [Garage release downloads](https://garagehq.deuxfleurs.fr/download/)
 - [Boto3 managed S3 transfers](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/s3.html#file-transfer-configuration)
 - [Amazon S3 multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html)
+
+## Format limits and portability
+
+The pack format and the catalog columns are model-agnostic: a record is
+described metadata (dtype, shape, hook, layer, step, token span) over
+opaque payload bytes, and every size knob (pack bytes, records per pack,
+linger, queue bounds) is configuration, not a constant. What is fixed,
+and how far it reaches:
+
+**Versioning.** Packs carry magic + `major.minor` in header and trailer,
+and the footer repeats them; readers refuse `major != 1` and
+`minor > current` and require the footer and trailer to agree, so a
+minor bump reads forward and a major bump refuses loudly rather than
+misreading bytes. The catalog schema is stamped (currently version 4);
+`ensure_schema` refuses a different stamp with an upgrade-or-rebuild
+verdict instead of writing blind.
+
+**Dtype set.** One authoritative table (`_DTYPE_BYTES` in
+`dmi/storage/capture/model.py`) names what the pipeline accepts: bool,
+u8/i8, u16/i16, u32/i32, u64/i64, f16, bf16, f32, f64, and OCP float8
+(`e4m3fn` — no infinities, all-ones exponent is NaN — and IEEE-shaped
+`e5m2`). fp8 and the wide integers decode by bit math in both the numpy
+summary path and the C++ hydration decoder, widened exactly to float32;
+the torch adapter (ring-side entry) carries its own ATEN mapping for the
+dtypes torch exposes. Adding a dtype means: the model table, the numpy
+map (or a bit-math branch), the C++ `decode_element`, and — if torch
+should submit it — the adapter's table.
+
+**Ceilings.** Shape dimensions are each ≤ 2³¹−1 with rank ≤ 32; the
+element product fits UInt64. `producer_rank`/`batch_position` are
+UInt32, counters and timestamps UInt64, `layer_number` Int32 — all
+validated at `CaptureMetadata` construction, so an out-of-range record
+is refused at the boundary rather than poisoning a pack. Records per
+pack are bounded by `max_pack_records` and by the footer limit
+(64 MiB); the footer carries one JSON row per record, so very large
+metadata × very many records fails the capacity check loudly at write,
+never silently at read.
+
+**Endianness.** Payloads are little-endian by definition: the format
+reads LE explicitly in the C++ decoders and the numpy summary map pins
+`<` byte order, so a summary cannot change meaning with the host. The
+supported deployment is x86-64 and ARM64 (both little-endian); a
+big-endian host is out of scope until a format major bump says
+otherwise.
+
+**Checksums.** Per-record CRC32 (zlib polynomial, rendered as 8-hex) in
+the locator and verified at hydration against the fetched bytes; the
+pack body carries a SHA-256 over header+records in the trailer.

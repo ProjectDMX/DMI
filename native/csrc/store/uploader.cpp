@@ -142,6 +142,21 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
           if (attempts_out) *attempts_out = attempts;
           return true;
         }
+        // The object exists but its size or checksum disagrees with the
+        // staged pack: a DIFFERENT pack already owns this key. The
+        // previous form fell through to the PUT below, which replaced the
+        // existing object, removed the local pack, and reported success —
+        // destroying someone else's immutable object and losing the local
+        // record in one step. HEAD already detected the conflict before
+        // this branch, so refusing is not a race: the conflict is with
+        // durable state, and retrying would PUT over it again.
+        last_error =
+            "pack conflict: the object store already holds a different "
+            "object at " + key + " (its size or dmi-sha256 disagrees with "
+            "the staged pack " + staged.pack_id + "). The staged pack is "
+            "retained in the spool for inspection; do not overwrite the "
+            "existing object.";
+        return false;  // NOT retryable
       }
     }
 

@@ -228,6 +228,63 @@ For local setup of this repo's native backend and ClickHouse sink, see
 [`huggingface.md`](huggingface.md) and [`vllm.md`](vllm.md).
 ## Native capture pipeline ledger
 
+### C3 — default switch (2026-09-06)
+
+`storage_backend="capture"` now defaults to the native pack writer, built
+from the config's `capture_sink_config`; an explicit `record_sink`
+overrides it (the reference sink is the documented rollback). Gates the
+flip rode on: Checkpoint A, Checkpoint B (human review of #127/#128),
+the quorum verifier against the C++ writer, the C1 read-parity suite,
+and the C2 hydration/summary parity — all green before the flip. The
+ClickHouse host record path (`storage_backend="native"`) and "auto" are
+untouched. Measured on this host earlier in the cycle, shared and NOT
+quiet: pipeline 0.50 GiB/s at N=1 (single-scope) to 0.56 at N=8 vs the
+0.212 fresh Python baseline, writer-only 0.60 vs 0.359 — re-measure on a
+quiet host before publishing numbers.
+
+### How noisy this host is, measured (2026-09-06)
+
+The instruction above kept being restated without evidence, so here is
+the evidence. Three consecutive `native/build/bench_sink` runs, same
+binary, same minute, at a load average of 14.5 on 32 threads with a
+foreign process holding ~522% CPU:
+
+| trial | N=1 GiB/s |
+|---|---:|
+| 1 | 0.259 |
+| 2 | 0.492 |
+| 3 | 0.519 |
+
+A **2× spread on identical work**. The low reading barely clears the
+0.235 Python baseline; the high one is +121% over it. Both are the same
+build of the same code.
+
+Two conclusions, and they are different from each other:
+
+- The **decision** is robust. Even the worst reading beats the Python
+  baseline and clears the 0.37 GiB/s per-instance requirement for the
+  3×4090 shape, so nothing about the port's justification depends on
+  re-measuring.
+- The **figures** are not publishable from this host in this state. Any
+  single number drawn from a 2× spread says more about who else was on
+  the machine than about the code.
+
+**The re-measure protocol**, so it is executable rather than aspirational:
+
+1. Quiet means quiet — `uptime` load average below ~1 on this 32-thread
+   host and no foreign process above a few percent in `ps aux --sort=-%cpu`.
+   The reference host IS this machine (5955WX); "reference host" was never
+   a different box, so the whole obligation is a scheduling one.
+2. `python benchmarks/bench_capture_pipeline.py` for the Python baseline
+   (defaults: 10k × 64 KiB, median of 5) — the same harness the T0.1
+   baselines came from, writing its JSON under
+   `benchmarks/data/native-pipeline/`.
+3. `native/build/bench_sink` for the native side, at N=1 and N=8, median
+   of 5 rather than best-of, with the load average recorded beside each
+   number.
+4. Only then may a figure leave this document. Until then every published
+   claim carries the caveat, including the PR bodies.
+
 Working ledger for the end-to-end native capture pipeline (branch
 `feat/native-capture-pipeline`, plan in `tasks/plan.md`). Every attempt — kept
 or reverted — is logged here so dead ideas stay dead. Baselines are medians of
@@ -455,7 +512,8 @@ Host variance note: this is a shared box (48 users, load 18–27); expect
 | broadcast notify_all everywhere | flat-to-negative scaling | fixed | Per-worker + per-stage CVs; producer signals only the routed worker. ~180k thundering-herd wakeups per trial at N=8 were the inhibitor |
 | Raw FNV `% workers` routing | all 8 scopes on worker 0 (flat "scaling") | fixed | fmix64 finalizer; low bits of FNV are weak for similar inputs. Verified distribution in the ledger review, then in code |
 | Spool mutex across file writes | serialized all stagers on fsync | fixed | Lock covers accounting decisions only; byte reservation keeps max_bytes exact. Also fixed a double-count on the EEXIST race path |
-| CRC+memcpy fusion, metadata moves | writer 0.63 → est. ~0.9 | deferred | Would move 3 instances → 2 for the 1.1 GiB/s host, but no gate demands it yet — Checkpoint A decision |
+| CRC+memcpy fusion (crc-from-destination during copy) | 0.606 → 0.590 best-of-5, interleaved A/B | **reverted** | Measured 2026-09-06: the store→load dependency makes the CRC walk with the copy, while the separate pass already overlaps across records under OOO. The upper-bound arm (CRC stubbed out entirely) measured 0.686 (+13%), so the CRC+its second read IS worth ~13% — but fusion is the wrong shape. Follow-up candidate: a hardware-accelerated CRC (PCLMULQDQ for the 0xEDB88320 polynomial), which attacks the 13% directly. Interleaved 5×3 trials; correctness gates re-run (conformance 8/8) after the revert |
+| Copy-first reorder (crc-from-destination as a separate pass) | 0.600-0.606 → 0.601 best-of-5, interleaved | **reverted** | Measured 2026-09-06, same discipline: the 64 KiB payload stays cache-resident across the row build, so the source re-read is NOT cache-cold — the +13% from the stub arm is the CRC ALU work itself, not a re-read. The reorder is inside noise; neutral is a revert. The PCLMULQDQ follow-up above stands: it attacks the ALU work, which is the confirmed 13% |
 
 ### A5b adapter + selection + Checkpoint A (2026-09-05)
 

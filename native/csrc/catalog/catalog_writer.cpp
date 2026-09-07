@@ -1,5 +1,7 @@
 #include "catalog_writer.h"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -36,14 +38,18 @@ std::string escape_sql_string(const std::string& value) {
 }
 
 // Python's clickhouse-driver renders a list of (str, str) tuples as
-// [('a','b'), ...]; the manifest INSERT arrayJoins exactly that.
+// `[('a', 'b'), ('c', 'd')]` -- a comma AND a space, both inside a tuple
+// and between tuples. Byte-for-byte, because every statement carrying
+// this list is one the port claims textual identity for, and the server
+// accepting a tighter spelling is not the same thing as sending the same
+// bytes. Measured against escape_params rather than assumed.
 std::string render_members(const std::vector<PackIdentity>& members) {
   std::string out = "[";
   bool first = true;
   for (const auto& [store_id, pack_id] : members) {
-    if (!first) out += ",";
+    if (!first) out += ", ";
     first = false;
-    out += "(" + escape_sql_string(store_id) + "," +
+    out += "(" + escape_sql_string(store_id) + ", " +
            escape_sql_string(pack_id) + ")";
   }
   out += "]";
@@ -184,7 +190,8 @@ void validate(const WriterConfig& config) {
 
 CatalogWriter::CatalogWriter(std::shared_ptr<const ClickHouseClient> client,
                              WriterConfig config)
-    : client_(std::move(client)), config_(std::move(config)) {
+    : client_(std::move(client)), config_(std::move(config)),
+      owner_pid_(::getpid()) {
   validate(config_);
   LeaseConfig leases;
   leases.database = config_.database;
@@ -214,6 +221,22 @@ std::map<std::string, std::string> CatalogWriter::quorum_write() const {
           {"insert_quorum_parallel", "0"},
           {"insert_quorum_timeout",
            std::to_string(config_.publish_timeout_ns / 1'000'000)}};
+}
+
+void CatalogWriter::require_owned_by_this_process() const {
+  if (::getpid() == owner_pid_) return;
+  throw CatalogError(
+      CatalogError::Kind::kLease,
+      "this catalog writer was created in process " +
+          std::to_string(static_cast<long>(owner_pid_)) +
+          " and is being used from process " +
+          std::to_string(static_cast<long>(::getpid())) +
+          ". A writer, its connection and the publisher lease it holds "
+          "belong to one process: a forked copy would publish under the "
+          "same lease_id as its parent, and two publishes under one lease "
+          "are not excluded by the fence; it would also write to the same "
+          "socket the parent is using. Create a writer, and acquire a "
+          "lease, in the process that publishes.");
 }
 
 bool CatalogWriter::quarantine_in_force() const {
@@ -250,6 +273,8 @@ void CatalogWriter::quarantine() {
 }
 
 bool CatalogWriter::quarantined(uint64_t* until_ns) const {
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
   const bool in_force = quarantine_in_force();
   if (until_ns != nullptr) *until_ns = quarantine_until_ns_;
   return in_force;
@@ -268,6 +293,10 @@ PublisherLease CatalogWriter::renew_for_publish() {
 }
 
 PublisherLease CatalogWriter::acquire_lease(const std::string& holder) {
+  // #125: the process check FIRST, the lock second -- see
+  // require_owned_by_this_process for why that order matters.
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
   require_not_quarantined();
   try {
     return leases_->acquire(holder);
@@ -279,7 +308,17 @@ PublisherLease CatalogWriter::acquire_lease(const std::string& holder) {
   }
 }
 
-PublisherLease CatalogWriter::renew_lease() { return renew_for_publish(); }
+PublisherLease CatalogWriter::renew_lease() {
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
+  return renew_for_publish();
+}
+
+void CatalogWriter::release_lease() {
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
+  leases_->release();
+}
 
 LeaseConfig CatalogWriter::leases_config_for_takeover() const {
   // A successor runs on the DEFAULT knobs (the Python live suites'
@@ -296,6 +335,10 @@ LeaseConfig CatalogWriter::leases_config_for_takeover() const {
 
 void CatalogWriter::write_descriptors(
     const std::vector<std::string>& rendered_rows, uint64_t index_version) {
+  // #125: the process check FIRST, the lock second -- see
+  // require_owned_by_this_process for why that order matters.
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
   if (rendered_rows.empty()) return;
   require_not_quarantined();
   // The batch's index_version is the final column; the rows carry the
@@ -329,6 +372,10 @@ void CatalogWriter::write_descriptors(
 
 std::set<PackIdentity> CatalogWriter::committed_pack_ids(
     const std::vector<PackIdentity>& identities) const {
+  // #125: the process check FIRST, the lock second -- see
+  // require_owned_by_this_process for why that order matters.
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
   if (identities.empty()) return {};
   if (static_cast<int>(identities.size()) > config_.query_pack_limit) {
     throw CatalogError(CatalogError::Kind::kValue,
@@ -341,7 +388,7 @@ std::set<PackIdentity> CatalogWriter::committed_pack_ids(
     const std::vector<Row> rows = client_->execute(
         "SELECT store_id, toString(pack_id) FROM " +
             qualified("pack_inventory") +
-            " WHERE (store_id, pack_id) IN (" + render_members(chunk) + ")",
+            " WHERE (store_id, pack_id) IN " + render_members(chunk),
         {},
         // A deciding read: this answer decides which packs the indexer
         // skips as already committed.
@@ -355,6 +402,10 @@ std::set<PackIdentity> CatalogWriter::committed_pack_ids(
 
 void CatalogWriter::commit_packs(
     const std::vector<std::string>& rendered_rows, uint64_t index_version) {
+  // #125: the process check FIRST, the lock second -- see
+  // require_owned_by_this_process for why that order matters.
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
   if (rendered_rows.empty()) return;
   require_not_quarantined();
   // The batch's index_version is the final column, appended here — the
@@ -387,7 +438,7 @@ int CatalogWriter::manifest_member_count(
     const std::vector<PackIdentity>* members) const {
   std::string bound;
   if (members != nullptr) {
-    bound = " AND (store_id, pack_id) IN (" + render_members(*members) + ")";
+    bound = " AND (store_id, pack_id) IN " + render_members(*members);
   }
   const std::vector<Row> rows = client_->execute(
       "SELECT count() FROM (SELECT DISTINCT store_id, pack_id FROM " +
@@ -400,16 +451,26 @@ int CatalogWriter::manifest_member_count(
 }
 
 uint64_t CatalogWriter::last_published_version() const {
+  // #125: the process check FIRST, the lock second -- see
+  // require_owned_by_this_process for why that order matters.
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
   return allocator_->max_version("index_watermark", "index_version");
 }
 
 uint64_t CatalogWriter::allocate_version() {
+  // #125: the process check FIRST, the lock second -- see
+  // require_owned_by_this_process for why that order matters.
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
   require_not_quarantined();
   return allocator_->allocate_version();
 }
 
 uint64_t CatalogWriter::max_version(const std::string& table,
                                     const std::string& column) const {
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
   return allocator_->max_version(table, column);
 }
 
@@ -418,12 +479,24 @@ void CatalogWriter::publish_snapshot(
     uint64_t published_at_ns, uint64_t indexed_rows, uint64_t indexed_packs,
     uint64_t wedge_ns, const std::string* takeover_after_renew,
     const std::string* takeover_after_chunks, bool inject_transport_error) {
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
   require_not_quarantined();
   try {
     // The lease is renewed before every fenced statement, and each fence
     // requires publish_timeout_ns of lease life remaining, which the
     // statement carries as its max_execution_time.
     PublisherLease lease = renew_for_publish();
+    if (takeover_after_renew == nullptr && takeover_after_chunks == nullptr &&
+        wedge_ns > 0) {
+      // A bare wedge: hold the publish open without staging a takeover, so
+      // a second caller's overlap (or the lack of it) is observable from
+      // outside. BOTH takeover wedges have to be excluded here, not just
+      // the first -- they carry their own sleep at their own point, and
+      // sleeping here as well spent the lease before the takeover test
+      // reached the window it was aiming at.
+      std::this_thread::sleep_for(std::chrono::nanoseconds(wedge_ns));
+    }
     if (takeover_after_renew != nullptr) {
       // Wedged between the renewal and the fenced statements.
       if (wedge_ns > 0) {
@@ -681,6 +754,8 @@ CatalogWriter::orphaned_manifest_publishes(uint64_t published) const {
 
 std::map<std::string, uint64_t> CatalogWriter::collect_garbage(
     uint64_t settle_sleep_ns) {
+  require_owned_by_this_process();
+  const std::lock_guard<std::recursive_mutex> serial(serial_);
   std::map<std::string, uint64_t> removed;
   const uint64_t published = last_published_version();
   const LeaseHead head = leases_->head();

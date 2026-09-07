@@ -43,6 +43,12 @@ std::string substitute(std::string query, const Params& params) {
     // "%(holder)s" is a legal 11-byte string) must not be re-matched
     // inside the inserted text — restarting at the top grew without
     // bound and hung the driver.
+    // The scan restarts at position 0 for each parameter: `from` persisting
+    // across parameters would skip a real occurrence of this placeholder
+    // that sits BEFORE an earlier parameter's replacement. Within one
+    // parameter's loop, `from` advances past each replacement so a
+    // self-referential value (a rendered string containing its own
+    // placeholder) cannot loop.
     size_t from = 0;
     size_t at;
     while ((at = query.find(needle, from)) != std::string::npos) {

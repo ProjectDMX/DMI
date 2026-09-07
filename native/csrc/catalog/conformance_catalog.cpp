@@ -6,11 +6,16 @@
 // the writer's coordinator, so B1 tests exercise the bare protocol and
 // B2 tests the writer's quarantine-wrapped surface.
 
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../common/json.h"
@@ -18,6 +23,8 @@
 #include "catalog_writer.h"
 #include "clickhouse_client.h"
 #include "indexer.h"
+#include "hydration.h"
+#include "reader.h"
 #include "schema.h"
 #include "lease_coordinator.h"
 #include "version_allocator.h"
@@ -81,6 +88,43 @@ std::string render_sql_string(const std::string& value) {
 std::string sql_string_or_null(const std::string& line, const char* key) {
   if (jc::FindNull(line, key)) return "NULL";
   return render_sql_string(jc::FindString(line, key));
+}
+
+// The reader config every read op builds, in one place. The read bounds
+// are overridable so a test can set one low enough that the server
+// refuses -- which is how "the bounds actually ride on this statement"
+// becomes observable rather than asserted.
+dmi_catalog::ReaderConfig reader_config(const std::string& database,
+                                        const std::string& table_prefix,
+                                        const std::string& line) {
+  dmi_catalog::ReaderConfig rc;
+  rc.database = database;
+  rc.table_prefix = table_prefix;
+  if (jc::HasKey(line, "max_rows_to_read")) {
+    rc.max_rows_to_read =
+        static_cast<uint64_t>(jc::FindInt(line, "max_rows_to_read"));
+  }
+  if (jc::HasKey(line, "max_bytes_to_read")) {
+    rc.max_bytes_to_read =
+        static_cast<uint64_t>(jc::FindInt(line, "max_bytes_to_read"));
+  }
+  if (jc::HasKey(line, "max_execution_time_s")) {
+    rc.max_execution_time_s =
+        static_cast<uint64_t>(jc::FindInt(line, "max_execution_time_s"));
+  }
+  return rc;
+}
+
+// The elements of a JSON array, with an EMPTY array yielding none.
+// SplitElements("") answers one empty element -- correct for splitting,
+// wrong for "was anything listed" -- so an empty filter list became a
+// filter on the empty string (matching nothing) rather than no filter at
+// all, where the Python query treats an empty tuple as absent.
+std::vector<std::string> read_array(const std::string& line,
+                                    const char* key) {
+  const std::string inside = jc::Unwrap(jc::FindArray(line, key));
+  if (inside.find_first_not_of(" \t\n") == std::string::npos) return {};
+  return jc::SplitElements(inside);
 }
 
 std::vector<PackIdentity> read_identities(const std::string& line,
@@ -284,7 +328,238 @@ std::string respond(const std::string& line, Session* session) {
       escape_into(writer.leases().fence(), &out);
     } else if (op == "allocate_version") {
       out = ",\"version\":" + std::to_string(writer.allocate_version());
+    } else if (op == "select") {
+      dmi_catalog::ReaderConfig rc =
+          reader_config(session->database, session->table_prefix, line);
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      dmi_store::S3Client s3(s3_config);
+      dmi_catalog::NativeCaptureReader reader(
+          &s3, s3_config.bucket, session->client, rc);
+      dmi_catalog::SearchFilters filters;
+      if (jc::HasKey(line, "tenant_id") && !jc::FindNull(line, "tenant_id")) {
+        filters.tenant_id = jc::FindString(line, "tenant_id");
+      }
+      filters.limit = static_cast<int>(jc::FindInt(line, "limit"));
+      const dmi_catalog::Selection selection = reader.select(filters);
+      out = ",\"selection\":{\"selection_id\":";
+      escape_into(selection.selection_id, &out);
+      out += ",\"capture_ids\":[";
+      for (size_t i = 0; i < selection.capture_ids.size(); ++i) {
+        if (i) out += ",";
+        escape_into(selection.capture_ids[i], &out);
+      }
+      out += "],\"catalog_watermark\":";
+      escape_into(selection.catalog_watermark, &out);
+      out += ",\"filter_hash\":";
+      escape_into(selection.filter_hash, &out);
+      out += ",\"tenant_id\":";
+      escape_into(selection.tenant_id, &out);
+      out += "}";
+    } else if (op == "hydrate") {
+      dmi_catalog::ReaderConfig rc =
+          reader_config(session->database, session->table_prefix, line);
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      dmi_store::S3Client s3(s3_config);
+      dmi_catalog::NativeCaptureReader reader(
+          &s3, s3_config.bucket, session->client, rc);
+      dmi_catalog::Selection selection;
+      selection.selection_id = jc::FindString(line, "selection_id");
+      for (const std::string& id : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
+        selection.capture_ids.push_back(jc::ParseLiteral(id));
+      }
+      selection.catalog_watermark = jc::FindString(line, "catalog_watermark");
+      selection.filter_hash = jc::FindString(line, "filter_hash");
+      selection.tenant_id = jc::FindString(line, "tenant_id");
+      const auto payloads = reader.hydrate(
+          selection, jc::FindInt(line, "byte_limit"),
+          jc::HasKey(line, "request_limit")
+              ? jc::FindInt(line, "request_limit")
+              : 1024);
+      out = ",\"payloads\":[";
+      for (size_t i = 0; i < payloads.size(); ++i) {
+        if (i) out += ",";
+        std::string encoded;
+        jc::EncodeBase64(
+            reinterpret_cast<const uint8_t*>(payloads[i].data()),
+            payloads[i].size(), &encoded);
+        out += "\"" + encoded + "\"";
+      }
+      out += "]";
+    } else if (op == "summarize_core") {
+      dmi_catalog::ReaderConfig rc =
+          reader_config(session->database, session->table_prefix, line);
+      dmi_store::S3Config s3_config;
+      s3_config.endpoint = jc::FindString(line, "endpoint");
+      s3_config.bucket = jc::FindString(line, "bucket");
+      s3_config.access_key = jc::FindString(line, "access");
+      s3_config.secret_key = jc::FindString(line, "secret");
+      s3_config.allow_insecure_http = jc::FindBool(line, "insecure");
+      dmi_store::S3Client s3(s3_config);
+      dmi_catalog::NativeCaptureReader reader(
+          &s3, s3_config.bucket, session->client, rc);
+      dmi_catalog::Selection selection;
+      selection.selection_id = jc::FindString(line, "selection_id");
+      for (const std::string& id : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
+        selection.capture_ids.push_back(jc::ParseLiteral(id));
+      }
+      selection.catalog_watermark = jc::FindString(line, "catalog_watermark");
+      selection.filter_hash = jc::FindString(line, "filter_hash");
+      selection.tenant_id = jc::FindString(line, "tenant_id");
+      const auto summaries = reader.summarize_core(
+          selection, jc::FindInt(line, "byte_limit"),
+          jc::HasKey(line, "request_limit")
+              ? jc::FindInt(line, "request_limit")
+              : 1024,
+          1000, 64'000'000ull);
+      out = ",\"summaries\":[";
+      for (size_t i = 0; i < summaries.size(); ++i) {
+        if (i) out += ",";
+        const auto& [capture_id, s] = summaries[i];
+        out += "{\"capture_id\":";
+        escape_into(capture_id, &out);
+        // %.17g round-trips a double exactly; std::to_string would truncate
+        // to six places and the parity comparison would fail on precision.
+        const auto real = [](double value) {
+          char buffer[40];
+          std::snprintf(buffer, sizeof(buffer), "%.17g", value);
+          return std::string(buffer);
+        };
+        out += ",\"summary_version\":" + std::to_string(s.summary_version) +
+               ",\"element_count\":" + std::to_string(s.element_count) +
+               ",\"finite_count\":" + std::to_string(s.finite_count) +
+               ",\"nan_count\":" + std::to_string(s.nan_count) +
+               ",\"inf_count\":" + std::to_string(s.inf_count) +
+               ",\"zero_fraction\":" + real(s.zero_fraction) +
+               ",\"mean\":" + real(s.mean) +
+               ",\"minimum\":" + real(s.minimum) +
+               ",\"maximum\":" + real(s.maximum) +
+               ",\"abs_max\":" + real(s.abs_max) +
+               ",\"l2_norm\":" + real(s.l2_norm) +
+               ",\"minimum_int\":" + std::to_string(s.minimum_int) +
+               ",\"maximum_int\":" + std::to_string(s.maximum_int) +
+               ",\"abs_max_int\":" + std::to_string(s.abs_max_int) + "}";
+      }
+      out += "]";
+    } else if (op == "current_watermark") {
+      dmi_catalog::NativeCaptureCatalog reader(
+          session->client,
+          reader_config(session->database, session->table_prefix, line));
+      out = ",\"watermark\":";
+      escape_into(reader.current_watermark(), &out);
+    } else if (op == "search") {
+      dmi_catalog::ReaderConfig rc =
+          reader_config(session->database, session->table_prefix, line);
+      dmi_catalog::NativeCaptureCatalog reader(session->client, rc);
+      dmi_catalog::SearchFilters filters;
+      for (const char* key : {"tenant_id", "experiment_id", "run_id",
+                              "session_id", "model_id"}) {
+        if (jc::HasKey(line, key) && !jc::FindNull(line, key)) {
+          if (key == std::string("tenant_id")) {
+            filters.tenant_id = jc::FindString(line, key);
+          } else if (key == std::string("experiment_id")) {
+            filters.experiment_id = jc::FindString(line, key);
+          } else if (key == std::string("run_id")) {
+            filters.run_id = jc::FindString(line, key);
+          } else if (key == std::string("session_id")) {
+            filters.session_id = jc::FindString(line, key);
+          } else if (key == std::string("model_id")) {
+            filters.model_id = jc::FindString(line, key);
+          }
+        }
+      }
+      if (jc::HasKey(line, "hook_names") && !jc::FindNull(line, "hook_names")) {
+        for (const std::string& hook : read_array(line, "hook_names")) {
+          filters.hook_names.push_back(jc::ParseLiteral(hook));
+        }
+      }
+      if (jc::HasKey(line, "layer_numbers") &&
+          !jc::FindNull(line, "layer_numbers")) {
+        for (const std::string& layer : read_array(line, "layer_numbers")) {
+          filters.layer_numbers.push_back(
+              static_cast<int64_t>(std::atoll(layer.c_str())));
+        }
+      }
+      if (jc::HasKey(line, "captured_after_ns") &&
+          !jc::FindNull(line, "captured_after_ns")) {
+        filters.captured_after_ns = static_cast<uint64_t>(
+            jc::FindInt(line, "captured_after_ns"));
+      }
+      if (jc::HasKey(line, "captured_before_ns") &&
+          !jc::FindNull(line, "captured_before_ns")) {
+        filters.captured_before_ns = static_cast<uint64_t>(
+            jc::FindInt(line, "captured_before_ns"));
+      }
+      if (jc::HasKey(line, "cursor") && !jc::FindNull(line, "cursor")) {
+        filters.cursor = jc::FindString(line, "cursor");
+      }
+      filters.limit = static_cast<int>(jc::FindInt(line, "limit"));
+      const dmi_catalog::SearchPage page = reader.search(filters);
+      out = ",\"items\":[";
+      bool first_item = true;
+      for (const auto& item : page.items) {
+        if (!first_item) out += ",";
+        first_item = false;
+        out += "[";
+        bool first_field = true;
+        for (const auto& field : item) {
+          if (!first_field) out += ",";
+          first_field = false;
+          escape_into(field, &out);
+        }
+        out += "]";
+      }
+      out += "],\"next_cursor\":";
+      if (page.next_cursor.has_value()) {
+        escape_into(*page.next_cursor, &out);
+      } else {
+        out += "null";
+      }
+      out += ",\"watermark\":";
+      escape_into(page.watermark, &out);
+    } else if (op == "get_by_ids") {
+      dmi_catalog::ReaderConfig rc =
+          reader_config(session->database, session->table_prefix, line);
+      dmi_catalog::NativeCaptureCatalog reader(session->client, rc);
+      std::vector<std::string> capture_ids;
+      for (const std::string& id : jc::SplitElements(
+               jc::Unwrap(jc::FindArray(line, "capture_ids")))) {
+        capture_ids.push_back(jc::ParseLiteral(id));
+      }
+      const auto items = reader.get_by_ids(
+          capture_ids, jc::FindString(line, "tenant_id"),
+          jc::FindString(line, "watermark"));
+      out = ",\"items\":[";
+      bool first_item = true;
+      for (const auto& item : items) {
+        if (!first_item) out += ",";
+        first_item = false;
+        out += "[";
+        bool first_field = true;
+        for (const auto& field : item) {
+          if (!first_field) out += ",";
+          first_field = false;
+          escape_into(field, &out);
+        }
+        out += "]";
+      }
+      out += "]";
     } else if (op == "verify_compatibility") {
+      // The verdict on its own, without the DDL that `ensure_schema` runs
+      // after it: the refusals are most of the schema port, and reaching
+      // them through `ensure_schema` alone means a test cannot tell a
+      // refusal from a failure of the install that follows one.
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);
       out = ",\"state\":\"" + schema.verify_compatibility() + "\"";
@@ -296,14 +571,6 @@ std::string respond(const std::string& line, Session* session) {
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);
       schema.ensure(&writer.leases(), retry_sleep_ns);
-    } else if (op == "verify_compatibility") {
-      // The verdict on its own, without the DDL that `ensure_schema` runs
-      // after it: the refusals are most of the schema port, and reaching
-      // them through `ensure_schema` alone means a test cannot tell a
-      // refusal from a failure of the install that follows one.
-      dmi_catalog::CatalogSchema schema(session->client, session->database,
-                                        session->table_prefix);
-      out = ",\"state\":\"" + schema.verify_compatibility() + "\"";
     } else if (op == "drop_schema") {
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);
@@ -378,6 +645,120 @@ std::string respond(const std::string& line, Session* session) {
           static_cast<uint64_t>(jc::FindInt(line, "wedge_ns")),
           takeover_after_renew, takeover_after_chunks,
           jc::FindBool(line, "inject_transport_error"));
+    } else if (op == "publish_concurrent") {
+      // #125, in the only shape that can test it: the driver runs one op at
+      // a time, so two publishes can only overlap if THIS process runs them
+      // on two threads. Each thread reports when it entered and left
+      // publish_snapshot, and the test reads the intervals -- serialised
+      // means they do not overlap, whatever the wedge asks for.
+      struct Attempt {
+        uint64_t started_ns = 0;
+        uint64_t finished_ns = 0;
+        bool ok = false;
+        std::string error;
+        std::string message;
+      };
+      const auto now_ns = [] {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+      };
+      const std::vector<PackIdentity> refs = read_identities(line, "refs");
+      const uint64_t rows =
+          static_cast<uint64_t>(jc::FindInt(line, "indexed_rows"));
+      const uint64_t packs =
+          static_cast<uint64_t>(jc::FindInt(line, "indexed_packs"));
+      const uint64_t wedge =
+          static_cast<uint64_t>(jc::FindInt(line, "wedge_ns"));
+      Attempt first, second;
+      const auto publish = [&](Attempt* attempt, uint64_t version,
+                               uint64_t wedge_ns) {
+        attempt->started_ns = now_ns();
+        try {
+          writer.publish_snapshot(version, refs, version, rows, packs,
+                                  wedge_ns);
+          attempt->ok = true;
+        } catch (const CatalogError& e) {
+          attempt->error = error_kind(e.kind());
+          attempt->message = e.what();
+        } catch (const std::exception& e) {
+          attempt->error = "DriverError";
+          attempt->message = e.what();
+        }
+        attempt->finished_ns = now_ns();
+      };
+      const uint64_t version_a =
+          static_cast<uint64_t>(jc::FindInt(line, "index_version_a"));
+      const uint64_t version_b =
+          static_cast<uint64_t>(jc::FindInt(line, "index_version_b"));
+      std::thread a(publish, &first, version_a, wedge);
+      // A short stagger so the wedged publish is demonstrably first; the
+      // point is whether the second WAITS, not who wins a start race.
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      std::thread b(publish, &second, version_b, 0ull);
+      a.join();
+      b.join();
+      const auto emit = [&](const char* name, const Attempt& attempt) {
+        std::string part = std::string(",\"") + name + "\":{\"ok\":" +
+                           (attempt.ok ? "true" : "false") +
+                           ",\"started_ns\":" +
+                           std::to_string(attempt.started_ns) +
+                           ",\"finished_ns\":" +
+                           std::to_string(attempt.finished_ns);
+        if (!attempt.ok) {
+          part += ",\"error\":\"" + attempt.error + "\",\"message\":";
+          std::string escaped;
+          escape_into(attempt.message, &escaped);
+          part += escaped;
+        }
+        return part + "}";
+      };
+      out = emit("first", first) + emit("second", second);
+    } else if (op == "publish_from_forked_child") {
+      // The other half of #125: a writer belongs to the process that built
+      // it. The child inherits the lease id and the socket, and the pid
+      // check must refuse it BEFORE any lock is taken -- a fork during a
+      // publish copies a held lock whose owner thread does not exist in the
+      // child, so a check behind the lock would hang there forever.
+      int fds[2];
+      if (pipe(fds) != 0) {
+        return prefix + "false,\"what\":\"pipe failed\"}";
+      }
+      const pid_t child = fork();
+      if (child == 0) {
+        close(fds[0]);
+        std::string report = "ok";
+        try {
+          writer.publish_snapshot(
+              static_cast<uint64_t>(jc::FindInt(line, "index_version")),
+              read_identities(line, "refs"),
+              static_cast<uint64_t>(jc::FindInt(line, "published_at_ns")),
+              static_cast<uint64_t>(jc::FindInt(line, "indexed_rows")),
+              static_cast<uint64_t>(jc::FindInt(line, "indexed_packs")));
+        } catch (const CatalogError& e) {
+          report = std::string(error_kind(e.kind())) + ":" + e.what();
+        } catch (const std::exception& e) {
+          report = std::string("DriverError:") + e.what();
+        }
+        const ssize_t written =
+            write(fds[1], report.data(), report.size());
+        (void)written;
+        close(fds[1]);
+        _exit(0);
+      }
+      close(fds[1]);
+      std::string report;
+      char buffer[4096];
+      ssize_t got;
+      while ((got = read(fds[0], buffer, sizeof(buffer))) > 0) {
+        report.append(buffer, static_cast<size_t>(got));
+      }
+      close(fds[0]);
+      int status = 0;
+      waitpid(child, &status, 0);
+      out = ",\"child\":";
+      escape_into(report, &out);
     } else if (op == "index") {
       // B3: read the packs through the store and run the indexer loop.
       dmi_store::S3Config s3_config;

@@ -155,16 +155,22 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
       concurrency tests (two concurrent publishes on one writer serialised;
       cross-process use refused; failed publish releases the writer) port
       alongside the SQL suites.
-      STATUS (2026-09-06, Checkpoint B review): the QUARANTINE half is
-      ported and tested (injected transport death, and a lapsed window that
-      reports itself over). The serialisation and process-binding halves are
-      NOT: the native writer relies on the driver being one process running
-      one op at a time instead of holding a lock or checking its pid, and
-      the three #125 concurrency tests are not ported. Sound for the shipped
-      path — pybind and the driver are single-threaded per writer — and a
-      real gap for any other embedding, so it is recorded as a deferred
-      follow-up at Checkpoint B rather than claimed. `catalog_writer.h`
-      names the assumption at the class it applies to.
+      STATUS (2026-09-06, Checkpoint B review): the QUARANTINE half was
+      ported and tested; the serialisation and process-binding halves were
+      not, and were recorded as a deferred follow-up.
+      CLOSED (2026-09-06, commit 3fd5b26): all three halves are now ported.
+      CatalogWriter serialises its public surface behind a recursive mutex
+      and refuses any call from a process other than the one that built it,
+      with the process check ahead of the lock (a fork copies the mutex as
+      it stood, so a check behind it would never run in the child). The
+      three #125 tests port with it, driven by two new driver ops — the
+      driver runs one op at a time, so `publish_concurrent` runs two
+      publishes on two of its own threads and `publish_from_forked_child`
+      forks. Removing the lock to check the test reproduced #125 itself:
+      the second publish finished inside the first one's wedge and the
+      first lost the race to the watermark written underneath it.
+      Still outside the guarantee, deliberately: `leases()` hands out the
+      bare coordinator for the B1 raw-protocol suite and bypasses the lock.
 - [x] B3 indexer-native (footer read → batch → publish) + e2e with Python CaptureReader oracle.
       Evidence: native sink → native uploader → native pack-index read → native
       publish, and the PYTHON CaptureReader resolves both captures with
@@ -203,18 +209,91 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done (with evidence) · `[!]
   before any published throughput claim: re-measure on a quiet host and
   re-baseline on the reference host (owns the A5a/plan obligation — STILL
   OPEN, and the only thing between these numbers and a published one).
-  Deferred follow-ups: the #125 serialisation + process-binding halves and
-  their three tests (see B2b STATUS); a byte-identity gate over the
-  parameterized statements, or a risk-table correction saying they are
-  semantically equivalent rather than textually identical.
+  Deferred follow-ups, as recorded at the review:
+  1. the #125 serialisation + process-binding halves and their three tests
+     — CLOSED 2026-09-06 in 3fd5b26, see B2b STATUS;
+  2. a byte-identity gate over the parameterized statements — CLOSED
+     2026-09-06 in 7f3e7d1. The statements were NOT byte-identical: the
+     driver renders `[('a', 'b'), ('c', 'd')]` and the port emitted
+     `[('a','b'),('c','d')]` wrapped in an extra paren pair, which
+     ClickHouse accepts, which is why only a gate could have caught it.
+     The renderer now matches escape_params byte for byte and the gate
+     compares what the SERVER received, through system.query_log, since
+     the two implementations reach it over different protocols;
+  3. the quiet-host re-measure — STILL OPEN, and the only thing between
+     the recorded numbers and a published one. Two clarifications from
+     2026-09-06: the "reference host" is THIS machine (5955WX), so the
+     obligation is scheduling rather than hardware; and the noise is now
+     quantified rather than asserted — three consecutive bench_sink runs
+     of one binary at load 14.5 gave 0.259 / 0.492 / 0.519 GiB/s, a 2×
+     spread. The decision survives the worst reading (it still beats the
+     0.235 baseline and clears the 0.37 GiB/s per-instance requirement);
+     the figures do not. Protocol and quiet criterion are in
+     docs/benchmarks.md, "How noisy this host is, measured"; PR #127's
+     table now carries the caveat rather than reading as a result.
+  Found separately, during the CI work rather than at this review: the
+  CPU-only C++ is compiled nowhere in CI except the live job's build step
+  (`check-compile` is `python -m compileall`; the native build test runs
+  `make -n`, a dry run, on the CUDA target). That is how a `pack_sink.cpp`
+  which did not compile on the runner survived in-tree. Open.
 
-## Phase C — Serving path (deferred follow-up)
+## Phase C — Serving path
 
-- [ ] C1 reader-native + read-parity suite
-- [ ] C2 hydration/summary/extensions native
-- [ ] C3 default-switch + final docs
+- [x] C1 reader-native + read-parity suite.
+      Evidence: tests/test_native_reader_parity_live.py 5/5 live (×3
+      consecutive): search parity with and without filters (identical
+      32-field descriptors both readers), CURSORS CROSS THE
+      IMPLEMENTATIONS (the native codec is byte-compatible with
+      cursor.py — same envelope, unpadded url-safe base64, canonical
+      alphabet, filter_hash binding — so each side accepts and walks the
+      other's cursor and the union covers the corpus in order),
+      get_by_ids parity with the watermark bound refused by both, and
+      supersession (a later pack's locator wins on both sides). Native
+      bugs the parity suite caught: the projection's aggregate tuple
+      carried the sort-key columns (a mixed-row shape), the cursor keyed
+      on the row BEYOND the page, and the base64url encoder emitted a
+      phantom trailing byte in both remainder branches. 44/44 native
+      catalog tests; CPU gate 1202 passed.
+- [x] C2 hydration/summary/extensions native.
+      Scope (from reader.py, 445 lines): select (search → one bounded page
+      → CaptureSelection), estimate, hydrate (plan per pack with coalesced
+      ranges, footer-authoritative verification phase before any payload
+      fetch, byte/request budgets, per-descriptor verify_payload), summarize
+      (decode_tensor + core tensor stats; the ExtensionRegistry stays
+      Python-side — extensions are Python pluggables, the native leg covers
+      hydrate + core stats). Parity tests must pin: identical payload bytes
+      native vs Python hydrate, identical core summary numbers, budget
+      refusals both sides. Native pieces already in place: pack_index
+      (footer read + validation), S3Client GetRange, reader search/select
+      surface. Evidence: tests/test_native_reader_parity_live.py 9/9 live
+      (×3 consecutive) — the hydration leg: IDENTICAL payload bytes native
+      vs Python hydrate over the full e2e (sink → uploader → index →
+      select → hydrate through the fake S3), byte-compatible selection_id
+      (the identity JSON in Python's sort_keys order), footer-authoritative
+      verification against the pack's own records (the two layouts —
+      sort-key-first catalog rows vs CAPTURE_COLUMNS footer rows — mapped
+      field-by-field), CRC-as-hex verify_payload, and EXACT core summary
+      stats (%.17g emission; float64 accumulators, scale-before-square L2,
+      raw-integer order stats). Budget refusals both sides. Extension
+      registry stays Python-side by scope.
+- [x] C3 default-switch + final docs.
+      Evidence: `storage_backend="capture"` defaults to the native pack
+      writer from `capture_sink_config`; explicit record_sink overrides
+      (the reference sink is the documented rollback); the host record
+      path and "auto" untouched. test_engine_runtime_api 22/22 (the new
+      default test + the updated refusal test); CPU gate 1203 passed.
+      Ledger entry added to docs/benchmarks.md with the quiet-host
+      re-measure obligation restated.
 
 ## Checkpoints log
+
+- Checkpoint C / Phase C complete (2026-09-06): C1 read-parity, C2
+  hydration/summary parity, C3 default-switch. PR #129. The plan's end
+  state: the native capture path is the production writer; the Python
+  path is the conformance oracle and the documented rollback.
+
+- Checkpoint B (2026-09-06): PASS (human review of #127 + #128). Phase C
+  authorized: C1 reader-native next.
 
 - Checkpoint B (2026-09-06): PASS with two recorded gaps, reviewed against
   PR #127 (Phase A → main, head 6473871) and PR #128 (Phase B stacked, head
