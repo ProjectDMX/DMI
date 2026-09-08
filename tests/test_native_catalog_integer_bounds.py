@@ -294,6 +294,81 @@ def test_a_signed_descriptor_column_keeps_the_signed_half(value):
     assert response["error"] == "ClickHouseError", response
 
 
+# --- the query limit -----------------------------------------------------------
+#
+# `limit` is decoded as a 64-bit integer and then TRUNCATED into the `int`
+# the reader bounds at [1, 10000], so a value above 2**32 that is not a
+# multiple of 2**32 lands back inside the band: 4294967297 became 1 and the
+# statement was executed at row_limit 2. 4294967296 and 2**64 - 1 truncate to
+# 0 and -1, which are refused -- which is exactly what hid this.
+#
+# The same line also destroys the default. CaptureQuery's `limit` defaults to
+# 1000 and SearchFilters.limit is initialised to 1000, but the assignment is
+# unconditional, so an ABSENT limit overwrote it with field_int's kAbsent -1
+# and every limit-less query was refused.
+
+
+def _read_op_with(op: str, **fields) -> dict:
+    """One read op against the dead server, carrying `fields` verbatim."""
+    session = _dead_server_session()
+    try:
+        session.stdin.write(json.dumps({
+            "op": "open", "database": "bounds_db", "table_prefix": "bounds",
+            "lease_ttl_ns": 30_000_000_000,
+            "publish_timeout_ns": 1_000_000_000, "clock_skew_ns": 1_000_000,
+            "allocation_attempts": 3,
+        }) + "\n")
+        session.stdin.flush()
+        assert json.loads(session.stdout.readline())["ok"]
+        request = {
+            "op": op, "endpoint": "http://127.0.0.1:1", "bucket": "b",
+            "access": "a", "secret": "s", "insecure": True,
+        }
+        request.update(fields)
+        session.stdin.write(json.dumps(request) + "\n")
+        session.stdin.flush()
+        return json.loads(session.stdout.readline())
+    finally:
+        session.stdin.close()
+        session.wait(timeout=30)
+
+
+@pytest.mark.parametrize("op", ("search", "select"))
+@pytest.mark.parametrize("value", [2**32 + 1, 2**32 + 1000, 2**33 + 5])
+def test_a_limit_above_the_int_width_is_refused_not_truncated(op, value):
+    """Truncation puts a limit nobody asked for on the executed statement."""
+    response = _read_op_with(op, limit=value)
+    assert not response["ok"], response
+    assert response["error"] == "ValueError", response
+    assert "limit must be between 1 and 10000" in response["message"], response
+
+
+@pytest.mark.parametrize("op", ("search", "select"))
+@pytest.mark.parametrize("value", [0, -1, 10_001, 2**32, 2**64 - 1])
+def test_a_limit_outside_the_band_is_still_refused(op, value):
+    """The refusals that already worked must keep working, same message."""
+    response = _read_op_with(op, limit=value)
+    assert not response["ok"], response
+    assert response["error"] == "ValueError", response
+    assert "limit must be between 1 and 10000" in response["message"], response
+
+
+@pytest.mark.parametrize("op", ("search", "select"))
+@pytest.mark.parametrize("value", [1, 1000, 10_000])
+def test_a_limit_inside_the_band_reaches_the_server(op, value):
+    response = _read_op_with(op, limit=value)
+    assert not response["ok"], response
+    assert response["error"] == "ClickHouseError", response
+
+
+@pytest.mark.parametrize("op", ("search", "select"))
+def test_an_absent_limit_keeps_the_default_of_1000(op):
+    """CaptureQuery defaults `limit` to 1000; absence is not a refusal."""
+    response = _read_op_with(op)
+    assert not response["ok"], response
+    assert response["error"] == "ClickHouseError", response
+
+
 @pytest.mark.parametrize("value", [2**63, 2**64 - 1])
 @pytest.mark.parametrize("field", READ_BOUNDS)
 def test_a_reader_bound_keeps_the_whole_union(field, value):

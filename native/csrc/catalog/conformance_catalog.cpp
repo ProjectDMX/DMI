@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
@@ -130,6 +131,37 @@ dmi_catalog::ReaderConfig reader_config(const std::string& database,
         static_cast<uint64_t>(field_int(line, "max_execution_time_s"));
   }
   return rc;
+}
+
+// The query `limit`, which is an `int` on SearchFilters and is bounded by
+// the reader at [1, 10000].
+//
+// Two things go wrong if this is written as one unconditional
+// `static_cast<int>(field_int(line, "limit"))`.
+//
+// The cast TRUNCATES: a value above 2**32 that is not a multiple of 2**32
+// lands back inside the band, so 4294967297 became 1 and the statement was
+// executed at row_limit 2 where CaptureQuery raises. 4294967296 and
+// 2**64 - 1 truncate to 0 and -1, which the band already refuses -- which is
+// what hid it. The width is therefore checked BEFORE the cast, and refused
+// with the bound's own message, because that is the message the oracle
+// raises for every value outside [1, 10000].
+//
+// And the assignment being unconditional destroys the DEFAULT: CaptureQuery
+// defaults limit to 1000, SearchFilters is initialised to 1000, but an
+// absent key was overwritten with field_int's kAbsent -1 and refused. The
+// key is presence-guarded here for the same reason reader_config guards its
+// three bounds.
+void read_limit(const std::string& line,
+                dmi_catalog::SearchFilters* filters) {
+  if (!jc::HasKey(line, "limit")) return;
+  const int64_t limit = field_int(line, "limit");
+  if (limit < std::numeric_limits<int>::min() ||
+      limit > std::numeric_limits<int>::max()) {
+    throw CatalogError(CatalogError::Kind::kValue,
+                       "limit must be between 1 and 10000");
+  }
+  filters->limit = static_cast<int>(limit);
 }
 
 // The elements of a JSON array, with an EMPTY array yielding none.
@@ -402,7 +434,7 @@ std::string respond(const std::string& line, Session* session) {
       if (jc::HasKey(line, "tenant_id") && !jc::FindNull(line, "tenant_id")) {
         filters.tenant_id = jc::FindString(line, "tenant_id");
       }
-      filters.limit = static_cast<int>(field_int(line, "limit"));
+      read_limit(line, &filters);
       const dmi_catalog::Selection selection = reader.select(filters);
       out = ",\"selection\":{\"selection_id\":";
       escape_into(selection.selection_id, &out);
@@ -606,7 +638,7 @@ std::string respond(const std::string& line, Session* session) {
       if (jc::HasKey(line, "cursor") && !jc::FindNull(line, "cursor")) {
         filters.cursor = jc::FindString(line, "cursor");
       }
-      filters.limit = static_cast<int>(field_int(line, "limit"));
+      read_limit(line, &filters);
       const dmi_catalog::SearchPage page = reader.search(filters);
       out = ",\"items\":[";
       bool first_item = true;
