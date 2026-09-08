@@ -32,6 +32,30 @@
 
 namespace jc = dmi_common;
 
+// The key of the first integer literal on this line that does not fit in the
+// 64-bit union, empty when there was none. One latch per line is enough: the
+// driver is single-threaded and handles one op per line.
+//
+// FindInt reported such a literal as -1, and -1 is a legal answer for none of
+// these fields. The timeouts, attempt counts and worker counts test "> 0" for
+// "was it given", so they silently fell back to 5s / 120s / 4 attempts / 4
+// workers; the multipart sizes and the spool's max_bytes kept their defaults;
+// and a range offset, a length or a StagedPack counter cast it to
+// 18446744073709551615. In every case the caller's own bound was replaced by
+// a different one and the op reported success.
+std::string g_out_of_range;
+
+int64_t Integer(const std::string& text, const char* key) {
+  int64_t value = 0;
+  const jc::IntFind found = jc::FindIntChecked(text, key, &value);
+  if (found == jc::IntFind::kOutOfRange && g_out_of_range.empty()) {
+    g_out_of_range = key;
+  }
+  // kAbsent keeps FindInt's -1: an absent timeout still means "default", and
+  // upload_pending's limit of -1 means "no limit".
+  return found == jc::IntFind::kOk ? value : -1;
+}
+
 // metadata object: {"k":"v",...} — string values only.
 std::map<std::string, std::string> FindMetadata(const std::string& text) {
   std::map<std::string, std::string> out;
@@ -66,20 +90,20 @@ dmi_store::S3Config ReadConfig(const std::string& line) {
     }
   }
   config.allow_insecure_http = jc::FindBool(line, "insecure");
-  const int64_t connect_timeout = jc::FindInt(line, "connect_timeout");
+  const int64_t connect_timeout = Integer(line, "connect_timeout");
   config.connect_timeout_s =
       static_cast<int>(connect_timeout > 0 ? connect_timeout : 5);
-  const int64_t read_timeout = jc::FindInt(line, "read_timeout");
+  const int64_t read_timeout = Integer(line, "read_timeout");
   config.read_timeout_s =
       static_cast<int>(read_timeout > 0 ? read_timeout : 120);
-  const int64_t max_attempts = jc::FindInt(line, "max_attempts");
+  const int64_t max_attempts = Integer(line, "max_attempts");
   config.max_attempts =
       static_cast<int>(max_attempts > 0 ? max_attempts : 4);
-  const int64_t threshold = jc::FindInt(line, "multipart_threshold");
+  const int64_t threshold = Integer(line, "multipart_threshold");
   if (threshold > 0) {
     config.multipart_threshold_bytes = static_cast<uint64_t>(threshold);
   }
-  const int64_t chunk = jc::FindInt(line, "multipart_chunk");
+  const int64_t chunk = Integer(line, "multipart_chunk");
   if (chunk > 0) config.multipart_chunk_bytes = static_cast<uint64_t>(chunk);
   return config;
 }
@@ -87,12 +111,12 @@ dmi_store::S3Config ReadConfig(const std::string& line) {
 dmi_store::StagedPack ParseStaged(const std::string& obj) {
   dmi_store::StagedPack s;
   s.pack_id = jc::FindString(obj, "pack_id");
-  s.created_at_ns = static_cast<uint64_t>(jc::FindInt(obj, "created_at_ns"));
-  s.record_count = static_cast<uint64_t>(jc::FindInt(obj, "record_count"));
+  s.created_at_ns = static_cast<uint64_t>(Integer(obj, "created_at_ns"));
+  s.record_count = static_cast<uint64_t>(Integer(obj, "record_count"));
   s.checksum = jc::FindString(obj, "checksum");
   s.object_key = jc::FindString(obj, "object_key");
   s.path = jc::FindString(obj, "path");
-  s.object_bytes = static_cast<uint64_t>(jc::FindInt(obj, "object_bytes"));
+  s.object_bytes = static_cast<uint64_t>(Integer(obj, "object_bytes"));
   return s;
 }
 
@@ -111,16 +135,16 @@ void EmitRef(const dmi_store::PackRef& ref, std::string* out) {
 
 dmi_store::UploaderConfig ReadUploaderConfig(const std::string& line) {
   dmi_store::UploaderConfig config;
-  const int64_t workers = jc::FindInt(line, "max_workers");
+  const int64_t workers = Integer(line, "max_workers");
   config.max_workers = static_cast<int>(workers > 0 ? workers : 4);
-  const int64_t in_flight = jc::FindInt(line, "max_in_flight_bytes");
+  const int64_t in_flight = Integer(line, "max_in_flight_bytes");
   if (in_flight > 0) {
     config.max_in_flight_bytes = static_cast<uint64_t>(in_flight);
   }
   // Uploader-level attempts are keyed separately from the transport's
   // "max_attempts": the transport absorbs single 5xx inside one upload
   // attempt (like botocore), and only its exhaustion surfaces here.
-  const int64_t attempts = jc::FindInt(line, "upload_max_attempts");
+  const int64_t attempts = Integer(line, "upload_max_attempts");
   if (attempts > 0) config.max_attempts = static_cast<int>(attempts);
   config.store_id = jc::FindString(line, "store_id");
   if (config.store_id.empty()) config.store_id = "s3";
@@ -130,10 +154,26 @@ dmi_store::UploaderConfig ReadUploaderConfig(const std::string& line) {
 int main() {
   std::string line;
   std::ios::sync_with_stdio(false);
+  // The refusal for an integer literal wider than 64 bits, in the ok:false /
+  // what shape this driver documents for every error. Emitted on its own,
+  // without the trailing "attempts", because nothing was ever attempted.
+  const auto refuse_out_of_range = [] {
+    std::string out = "{\"ok\":false,\"what\":";
+    jc::EscapeJson("integer field " + g_out_of_range + " is out of range",
+                   &out);
+    std::cout << out << "}\n";
+  };
   while (std::getline(std::cin, line)) {
+    g_out_of_range.clear();
     const std::string op = jc::FindString(line, "op");
     const std::string key = jc::FindString(line, "key");
     dmi_store::S3Client client(ReadConfig(line));
+    // Before any request goes out: a timeout or attempt count that cannot be
+    // represented must not be replaced by the default.
+    if (!g_out_of_range.empty()) {
+      refuse_out_of_range();
+      continue;
+    }
     std::string error;
     std::string out = "{\"ok\":";
     if (op == "put") {
@@ -153,9 +193,16 @@ int main() {
       }
     } else if (op == "get") {
       std::vector<uint8_t> data;
-      const bool ok = client.GetRange(
-          key, static_cast<uint64_t>(jc::FindInt(line, "offset")),
-          static_cast<uint64_t>(jc::FindInt(line, "length")), &data, &error);
+      // Parsed before the call, not inside its argument list: a range built
+      // from -1 asks the server for 18446744073709551615 bytes.
+      const uint64_t offset = static_cast<uint64_t>(Integer(line, "offset"));
+      const uint64_t length = static_cast<uint64_t>(Integer(line, "length"));
+      if (!g_out_of_range.empty()) {
+        refuse_out_of_range();
+        continue;
+      }
+      const bool ok =
+          client.GetRange(key, offset, length, &data, &error);
       out += ok ? "true" : "false";
       if (ok) {
         std::string b64;
@@ -199,10 +246,15 @@ int main() {
       }
     } else if (op == "list") {
       dmi_store::ListResult result;
+      const int64_t max_keys = Integer(line, "max_keys");
+      if (!g_out_of_range.empty()) {
+        refuse_out_of_range();
+        continue;
+      }
       const bool ok = client.ListObjects(
           jc::FindString(line, "prefix"), jc::FindString(line, "delimiter"),
-          static_cast<int>(jc::FindInt(line, "max_keys")),
-          jc::FindString(line, "continuation"), &result, &error);
+          static_cast<int>(max_keys), jc::FindString(line, "continuation"),
+          &result, &error);
       out += ok ? "true" : "false";
       if (ok) {
         out += ",\"truncated\":";
@@ -230,7 +282,11 @@ int main() {
       dmi_store::SpoolConfig spool_config;
       spool_config.root = jc::FindString(line, "root");
       spool_config.max_bytes =
-          static_cast<uint64_t>(jc::FindInt(line, "spool_max_bytes"));
+          static_cast<uint64_t>(Integer(line, "spool_max_bytes"));
+      if (!g_out_of_range.empty()) {
+        refuse_out_of_range();
+        continue;
+      }
       if (spool_config.max_bytes == 0) spool_config.max_bytes = 1ull << 40;
       dmi_store::Spool spool;
       std::string spool_error;
@@ -239,14 +295,22 @@ int main() {
         out += "false,\"what\":";
         jc::EscapeJson("spool open: " + spool_error, &out);
       } else {
-        dmi_store::SpoolUploader uploader(&spool, &client,
-                                          ReadUploaderConfig(line));
+        const dmi_store::UploaderConfig uploader_config =
+            ReadUploaderConfig(line);
+        const dmi_store::StagedPack staged =
+            ParseStaged(jc::FindObject(line, "staged"));
+        // Both parses land before the upload: a staged counter read as -1
+        // becomes 18446744073709551615 and fails the checksum gate for the
+        // wrong reason.
+        if (!g_out_of_range.empty()) {
+          refuse_out_of_range();
+          continue;
+        }
+        dmi_store::SpoolUploader uploader(&spool, &client, uploader_config);
         dmi_store::PackRef ref;
         int attempts = 0;
         std::string error;
-        const bool ok = uploader.UploadOne(
-            ParseStaged(jc::FindObject(line, "staged")), &ref, &attempts,
-            &error);
+        const bool ok = uploader.UploadOne(staged, &ref, &attempts, &error);
         out += ok ? "true" : "false";
         if (ok) {
           out += ",\"ref\":";
@@ -261,7 +325,11 @@ int main() {
       dmi_store::SpoolConfig spool_config;
       spool_config.root = jc::FindString(line, "root");
       spool_config.max_bytes =
-          static_cast<uint64_t>(jc::FindInt(line, "spool_max_bytes"));
+          static_cast<uint64_t>(Integer(line, "spool_max_bytes"));
+      if (!g_out_of_range.empty()) {
+        refuse_out_of_range();
+        continue;
+      }
       if (spool_config.max_bytes == 0) spool_config.max_bytes = 1ull << 40;
       dmi_store::Spool spool;
       std::string spool_error;
@@ -270,9 +338,16 @@ int main() {
         out += "false,\"what\":";
         jc::EscapeJson("spool open: " + spool_error, &out);
       } else {
-        dmi_store::SpoolUploader uploader(&spool, &client,
-                                          ReadUploaderConfig(line));
-        const int64_t limit = jc::FindInt(line, "limit");
+        const dmi_store::UploaderConfig uploader_config =
+            ReadUploaderConfig(line);
+        const int64_t limit = Integer(line, "limit");
+        // Before the batch runs: a worker count or a batch limit that cannot
+        // be represented must not become the default.
+        if (!g_out_of_range.empty()) {
+          refuse_out_of_range();
+          continue;
+        }
+        dmi_store::SpoolUploader uploader(&spool, &client, uploader_config);
         const dmi_store::UploadBatchResult result =
             uploader.UploadPending(limit < 0 ? -1 : static_cast<int>(limit));
         out += "true,\"refs\":[";

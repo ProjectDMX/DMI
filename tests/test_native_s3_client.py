@@ -519,3 +519,80 @@ def test_timeout_retries_then_fails(fake_s3):
                 content_type="application/octet-stream")
     assert not put["ok"]
     assert put["attempts"] == 2
+
+
+# --- integer bounds ------------------------------------------------------------
+#
+# The transport's integer fields are 64-bit on the wire, and FindInt reported
+# an unrepresentable literal as -1. Every site here reads -1 as something
+# legal: the timeouts and attempt counts treat "> 0" as "given" and silently
+# fall back to 5s/120s/4 attempts, the multipart sizes keep their defaults,
+# and a range offset or length casts it to 18446744073709551615 -- so the
+# caller's own bound is quietly replaced by a different one.
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("connect_timeout", "read_timeout", "max_attempts",
+     "multipart_threshold", "multipart_chunk"),
+)
+def test_transport_config_refuses_an_out_of_range_integer(field):
+    """No server needed: the refusal has to land before any request goes out."""
+    request = _base("http://127.0.0.1:1", **{field: 2**64 + 1})
+    response = _call("head", key="anything", **request)
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert field in response["what"], response
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("offset", 2**64 + 1),
+        ("length", 2**64 + 1),
+        ("offset", int("9" * 40)),
+        ("length", -(2**63) - 1),
+    ],
+)
+def test_get_refuses_an_out_of_range_range(fake_s3, field, value):
+    payload = b"0123456789abcdef"
+    assert _call("put", **_base(fake_s3), key="bounds/obj",
+                 data_b64=base64.b64encode(payload).decode(), metadata={},
+                 content_type="application/octet-stream")["ok"]
+    fields = {"offset": 0, "length": len(payload)}
+    fields[field] = value
+    get = _call("get", **_base(fake_s3), key="bounds/obj", **fields)
+    assert not get["ok"], get
+    assert "out of range" in get["what"], get
+    assert field in get["what"], get
+
+
+def test_list_refuses_an_out_of_range_max_keys(fake_s3):
+    response = _call("list", **_base(fake_s3), prefix="", delimiter="",
+                     max_keys=2**64 + 1, continuation="")
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert "max_keys" in response["what"], response
+
+
+def test_the_64_bit_boundaries_still_reach_the_transport(fake_s3):
+    """INT64_MAX and 2**64 - 1 parse; only wider literals are refused.
+
+    A length of 2**64 - 1 is a legal 64-bit value, so it must reach the
+    client and be refused (if at all) by the range check there -- not by the
+    JSON scan, and not by being turned into something else.
+    """
+    payload = b"0123456789abcdef"
+    assert _call("put", **_base(fake_s3), key="bounds/limits",
+                 data_b64=base64.b64encode(payload).decode(), metadata={},
+                 content_type="application/octet-stream")["ok"]
+    for length in (2**63 - 1, 2**64 - 1):
+        get = _call("get", **_base(fake_s3), key="bounds/limits",
+                    offset=0, length=length)
+        assert not get["ok"], (length, get)
+        assert "out of range" not in get["what"], (length, get)
+    # The ordinary read still works, byte for byte.
+    get = _call("get", **_base(fake_s3), key="bounds/limits", offset=0,
+                length=len(payload))
+    assert get["ok"], get
+    assert base64.b64decode(get["data_b64"]) == payload

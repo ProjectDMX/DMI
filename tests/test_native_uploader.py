@@ -453,3 +453,82 @@ def test_uploader_head_to_head_with_python_reference(fake_s3, tmp_path):
     assert metas[py_refs[0].object_key] == metas[native_ref["object_key"]]
     assert metas[native_ref["object_key"]]["dmi-sha256"] == sealed.checksum
     assert metas[native_ref["object_key"]]["dmi-format"] == "dmi-pack-v1"
+
+
+# --- integer bounds ------------------------------------------------------------
+#
+# The uploader's own integer fields read FindInt's -1 as "not given": the
+# spool's max_bytes fell back to 1 TiB, max_workers to four, and
+# upload_max_attempts kept the default -- so the caller's limit silently
+# became a different one. The nested StagedPack's counters cast -1 to
+# 18446744073709551615 instead.
+
+
+@pytest.mark.parametrize(
+    "field", ("spool_max_bytes", "max_workers", "max_in_flight_bytes",
+              "upload_max_attempts", "limit"),
+)
+def test_upload_pending_refuses_an_out_of_range_integer(fake_s3, tmp_path,
+                                                        field):
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        _stage(sink, tmp_path / "spool", 1)
+        fields = _store_base(fake_s3)
+        fields.update(
+            op="upload_pending", root=str(tmp_path / "spool"),
+            spool_max_bytes=1 << 40, limit=-1, max_workers=4,
+            max_in_flight_bytes=1 << 30, upload_max_attempts=3,
+        )
+        fields[field] = 2**64 + 1
+        response = store.call(**fields)
+        assert not response["ok"], response
+        assert "out of range" in response["what"], response
+        assert field in response["what"], response
+        # Nothing was uploaded: the staged entry is still on disk.
+        assert list((tmp_path / "spool").rglob("*.dmi-pack.ready"))
+    finally:
+        sink.close()
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "field", ("created_at_ns", "record_count", "object_bytes"),
+)
+def test_upload_one_refuses_an_out_of_range_staged_counter(fake_s3, tmp_path,
+                                                           field):
+    """The nested StagedPack is decoded by the same helper, so it refuses too."""
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        staged = _stage(sink, tmp_path / "spool", 3)
+        staged[field] = 2**64 + 1
+        fields = _store_base(fake_s3)
+        fields.update(
+            op="upload_one", root=str(tmp_path / "spool"),
+            spool_max_bytes=1 << 40, max_workers=1,
+            max_in_flight_bytes=1 << 30, staged=staged,
+        )
+        response = store.call(**fields)
+        assert not response["ok"], response
+        assert "out of range" in response["what"], response
+        assert field in response["what"], response
+    finally:
+        sink.close()
+        store.close()
+
+
+def test_upload_pending_keeps_the_64_bit_limits(fake_s3, tmp_path):
+    """INT64_MAX and 2**64 - 1 are legal spool limits and must still work."""
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        _stage(sink, tmp_path / "spool", 4)
+        result = _upload_pending(store, fake_s3, tmp_path / "spool",
+                                 spool_max_bytes=2**64 - 1,
+                                 max_in_flight_bytes=2**63 - 1)
+        assert result["ok"], result
+        assert result["snapshot"]["uploaded_packs"] == 1, result
+    finally:
+        sink.close()
+        store.close()
