@@ -30,6 +30,29 @@ namespace jc = dmi_common;
 
 namespace {
 
+// The key of the first integer literal on this line that does not fit in the
+// 64-bit union, empty when there was none. One latch per line is enough: the
+// driver is single-threaded and handles one op per line.
+//
+// FindInt reported such a literal as -1, and every site here read that as
+// something legal: the unsigned `open` limits cast it to
+// 18446744073709551615, `num_workers` fell back to 1, ObjectKeyFor rendered
+// rank=18446744073709551615, and a metadata counter wrapped modulo 2**64 and
+// was admitted. SubmitRow's own parse already refuses (record_row.cpp); these
+// are the driver's remaining decodes.
+std::string g_out_of_range;
+
+int64_t Integer(const std::string& text, const char* key) {
+  int64_t value = 0;
+  const jc::IntFind found = jc::FindIntChecked(text, key, &value);
+  if (found == jc::IntFind::kOutOfRange && g_out_of_range.empty()) {
+    g_out_of_range = key;
+  }
+  // kAbsent keeps FindInt's -1: layer_number == -1 is legal, and an absent
+  // num_workers still means "one".
+  return found == jc::IntFind::kOk ? value : -1;
+}
+
 dmi_pack::RecordMetadata ParseMetadata(const std::string& obj) {
   dmi_pack::RecordMetadata m;
   m.capture_id = jc::FindString(obj, "capture_id");
@@ -46,13 +69,13 @@ dmi_pack::RecordMetadata ParseMetadata(const std::string& obj) {
   }
   m.capture_policy_version = jc::FindString(obj, "capture_policy_version");
   m.hook_name = jc::FindString(obj, "hook_name");
-  m.layer_number = jc::FindInt(obj, "layer_number");
-  m.producer_rank = static_cast<uint64_t>(jc::FindInt(obj, "producer_rank"));
-  m.step_number = static_cast<uint64_t>(jc::FindInt(obj, "step_number"));
-  m.token_start = static_cast<uint64_t>(jc::FindInt(obj, "token_start"));
-  m.token_end = static_cast<uint64_t>(jc::FindInt(obj, "token_end"));
+  m.layer_number = Integer(obj, "layer_number");
+  m.producer_rank = static_cast<uint64_t>(Integer(obj, "producer_rank"));
+  m.step_number = static_cast<uint64_t>(Integer(obj, "step_number"));
+  m.token_start = static_cast<uint64_t>(Integer(obj, "token_start"));
+  m.token_end = static_cast<uint64_t>(Integer(obj, "token_end"));
   m.batch_position =
-      static_cast<uint64_t>(jc::FindInt(obj, "batch_position"));
+      static_cast<uint64_t>(Integer(obj, "batch_position"));
   m.dtype = jc::FindString(obj, "dtype");
   for (const auto& item : jc::SplitElements(
            jc::Unwrap(jc::FindArray(obj, "shape")))) {
@@ -68,7 +91,7 @@ dmi_pack::RecordMetadata ParseMetadata(const std::string& obj) {
     if (any) m.shape.push_back(v);
   }
   m.captured_at_ns =
-      static_cast<uint64_t>(jc::FindInt(obj, "captured_at_ns"));
+      static_cast<uint64_t>(Integer(obj, "captured_at_ns"));
   return m;
 }
 
@@ -108,29 +131,45 @@ int main() {
   std::string line;
   std::ios::sync_with_stdio(false);
   std::unique_ptr<dmi_sink::PackSink> sink;
+  // The refusal for an integer literal wider than 64 bits, in the same
+  // ok:false/what shape the driver already answers "unknown op" and
+  // "sink is not open" with.
+  const auto refuse_out_of_range = [] {
+    std::string out = "{\"ok\":false,\"what\":";
+    jc::EscapeJson("integer field " + g_out_of_range + " is out of range",
+                   &out);
+    std::cout << out << "}\n";
+  };
   while (std::getline(std::cin, line)) {
+    g_out_of_range.clear();
     const std::string op = jc::FindString(line, "op");
     if (op == "open") {
       dmi_sink::SinkConfig config;
       config.spool_root = jc::FindString(line, "root");
       config.spool_max_bytes =
-          static_cast<uint64_t>(jc::FindInt(line, "max_bytes"));
+          static_cast<uint64_t>(Integer(line, "max_bytes"));
       config.max_queue_records =
-          static_cast<uint64_t>(jc::FindInt(line, "max_queue_records"));
+          static_cast<uint64_t>(Integer(line, "max_queue_records"));
       config.max_queue_bytes =
-          static_cast<uint64_t>(jc::FindInt(line, "max_queue_bytes"));
+          static_cast<uint64_t>(Integer(line, "max_queue_bytes"));
       config.max_pack_bytes =
-          static_cast<uint64_t>(jc::FindInt(line, "max_pack_bytes"));
+          static_cast<uint64_t>(Integer(line, "max_pack_bytes"));
       config.max_pack_records =
-          static_cast<uint64_t>(jc::FindInt(line, "max_pack_records"));
+          static_cast<uint64_t>(Integer(line, "max_pack_records"));
       config.max_linger_ns =
-          static_cast<uint64_t>(jc::FindInt(line, "max_linger_ns"));
+          static_cast<uint64_t>(Integer(line, "max_linger_ns"));
       config.overload =
           jc::FindString(line, "overload") == "block"
               ? dmi_sink::Overload::kBlock
               : dmi_sink::Overload::kDropNewest;
-      const int64_t workers = jc::FindInt(line, "num_workers");
+      const int64_t workers = Integer(line, "num_workers");
       config.num_workers = static_cast<int>(workers > 0 ? workers : 1);
+      // Before the sink exists: a limit that cannot be represented must not
+      // be silently replaced by UINT64_MAX or by the one-worker fallback.
+      if (!g_out_of_range.empty()) {
+        refuse_out_of_range();
+        continue;
+      }
       // admission_timeout arrives as a JSON number (possibly -1 or 0.5);
       // parse the raw text to keep the fraction.
       {
@@ -154,11 +193,19 @@ int main() {
       continue;
     }
     if (op == "object_key") {
+      // Parsed before the call, not inside its argument list: a key built
+      // from a wrapped rank is a key Python's builder never mints.
+      const uint64_t producer_rank =
+          static_cast<uint64_t>(Integer(line, "producer_rank"));
+      const uint64_t captured_at_ns =
+          static_cast<uint64_t>(Integer(line, "captured_at_ns"));
+      if (!g_out_of_range.empty()) {
+        refuse_out_of_range();
+        continue;
+      }
       const std::string key = dmi_sink::ObjectKeyFor(
           jc::FindString(line, "tenant_id"),
-          jc::FindString(line, "session_id"),
-          static_cast<uint64_t>(jc::FindInt(line, "producer_rank")),
-          static_cast<uint64_t>(jc::FindInt(line, "captured_at_ns")),
+          jc::FindString(line, "session_id"), producer_rank, captured_at_ns,
           jc::FindString(line, "pack_id"));
       std::string out = "{\"ok\":true,\"object_key\":";
       jc::EscapeJson(key, &out);
@@ -172,6 +219,13 @@ int main() {
     if (op == "submit") {
       const dmi_pack::RecordMetadata metadata =
           ParseMetadata(jc::FindObject(line, "metadata"));
+      // CaptureMetadata raises on these, so the mapping path refuses them
+      // too rather than admit a counter that wrapped modulo 2**64. This is
+      // the same refusal SubmitRow already makes on the row path.
+      if (!g_out_of_range.empty()) {
+        refuse_out_of_range();
+        continue;
+      }
       std::vector<uint8_t> payload;
       jc::DecodeBase64(jc::FindString(line, "payload_b64"), &payload);
       const dmi_sink::Admission admission =

@@ -593,6 +593,131 @@ def test_submit_row_parses_the_int64_limits_before_validating_them(sink,
     assert snapshot["submitted_records"] == 3
 
 
+# --- the driver's own integer fields -------------------------------------------
+#
+# `submit_row` refuses these already, because SubmitRow's metadata parse is
+# checked. The driver's OTHER integer decodes -- the `open` config, the
+# `object_key` arguments and `submit`'s metadata mapping -- were not, and each
+# read FindInt's -1 as something legal: the unsigned config limits became
+# 18446744073709551615, `num_workers` fell back to 1, and a metadata counter
+# wrapped modulo 2**64 and was admitted.
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("max_bytes", "max_queue_records", "max_queue_bytes", "max_pack_bytes",
+     "max_pack_records", "max_linger_ns", "num_workers"),
+)
+def test_open_refuses_an_out_of_range_limit(sink, tmp_path, field):
+    """A limit that cannot be represented must not become UINT64_MAX."""
+    config = {
+        "op": "open", "root": str(tmp_path / "spool"), "max_bytes": 1 << 40,
+        "max_queue_records": 256, "max_queue_bytes": 16 * 1024 * 1024,
+        "max_pack_bytes": 128 * 1024 * 1024, "max_pack_records": 10_000,
+        "max_linger_ns": 1_000_000_000, "overload": "drop_newest",
+        "admission_timeout": -1, "num_workers": 1,
+    }
+    config[field] = 2**64 + 1
+    response = sink.call(**config)
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert field in response["what"], response
+    # The sink was never constructed, so the next op sees no open sink.
+    assert sink.call(op="snapshot")["what"] == "sink is not open"
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("producer_rank", 2**64 + 1),
+        ("captured_at_ns", 2**64 + 1),
+        ("producer_rank", int("9" * 40)),
+        ("captured_at_ns", -(2**63) - 1),
+    ],
+)
+def test_object_key_refuses_an_out_of_range_integer(sink, field, value):
+    """-1 rendered rank=18446744073709551615 into a key Python never mints."""
+    request = {
+        "op": "object_key", "tenant_id": "tenant", "session_id": "session",
+        "producer_rank": 0, "captured_at_ns": 1_700_000_000_000_000_000,
+        "pack_id": "018f0000-0000-7000-8000-000000000f01",
+    }
+    request[field] = value
+    response = sink.call(**request)
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert field in response["what"], response
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("captured_at_ns", 2**64 + 1),
+        ("step_number", 2**64),
+        ("token_end", 2**64 + 7),
+        ("producer_rank", 2**64 + 5),
+        ("batch_position", 2**64 + 5),
+        ("layer_number", 2**64 + 3),
+        ("token_start", -(2**63) - 1),
+        ("layer_number", -(2**63) - 1),
+        ("captured_at_ns", int("9" * 40)),
+    ],
+)
+def test_submit_refuses_out_of_range_metadata_integers(sink, tmp_path, field,
+                                                       value):
+    """The mapping path must refuse what the row path already refuses."""
+    _open(sink, tmp_path / "spool")
+    mapping = _meta(0).to_mapping()
+    mapping[field] = value
+    response = sink.call(
+        op="submit", metadata=mapping,
+        payload_b64=base64.b64encode(bytes(64)).decode(),
+    )
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert field in response["what"], response
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["submitted_records"] == 0, snapshot
+
+
+@pytest.mark.parametrize(
+    "field", ("step_number", "token_start", "token_end", "captured_at_ns")
+)
+def test_submit_admits_the_whole_unsigned_range(sink, tmp_path, field):
+    """2**64 - 1 is what CaptureMetadata allows, so `submit` must too.
+
+    captured_at_ns is the one exception in practice, not in the parse: the
+    spool's ready-file name bounds it, so the record is admitted here and
+    the staging refusal (if any) is a separate concern.
+    """
+    _open(sink, tmp_path / "spool")
+    mapping = _meta(0).to_mapping()
+    mapping["token_start"] = 0
+    mapping[field] = 2**64 - 1
+    response = sink.call(
+        op="submit", metadata=mapping,
+        payload_b64=base64.b64encode(bytes(64)).decode(),
+    )
+    assert response["ok"], response
+    assert response["admission"] == "accepted", response
+
+
+def test_object_key_keeps_the_64_bit_boundaries_exact():
+    """INT64_MAX, 2**64 - 1, 0 and -0 all still reach the key builder."""
+    session = SinkSession()
+    try:
+        for captured in (0, 2**63 - 1, 2**63, 2**64 - 1):
+            response = session.call(
+                op="object_key", tenant_id="tenant", session_id="session",
+                producer_rank=2**32 - 1, captured_at_ns=captured,
+                pack_id="018f0000-0000-7000-8000-000000000f01",
+            )
+            assert response["ok"], (captured, response)
+            assert "rank=4294967295" in response["object_key"], response
+    finally:
+        session.close()
+
+
 def test_pipeline_head_to_head_with_python_reference(tmp_path):
     """Same corpus through both pipelines; descriptor-level equality.
 
