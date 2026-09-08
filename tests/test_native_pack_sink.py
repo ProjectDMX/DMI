@@ -28,6 +28,7 @@ from dmi.storage.capture import (  # noqa: E402
     CaptureMetadata,
     CaptureRecord,
     DurablePackSpool,
+    PackFormatError,
     PackReader,
 )
 from dmi.storage.capture.pipeline import object_key_for  # noqa: E402
@@ -593,6 +594,47 @@ def test_submit_row_keeps_the_shape_dimension_boundary_exact(sink, tmp_path):
     # A legal dimension still packs.
     metadata = _row_meta(0, dtype="uint8", shape=[64], token_start=0)
     assert _submit_row(sink, metadata, bytes(64), "uint8", [64])["ok"]
+
+
+INTEGER_FIELDS = ("layer_number", "producer_rank", "step_number",
+                  "token_start", "token_end", "batch_position",
+                  "captured_at_ns")
+
+
+@pytest.mark.parametrize("literal", ("null", '"abc"', "true", '""', "[]"))
+@pytest.mark.parametrize("field", INTEGER_FIELDS)
+def test_submit_row_refuses_a_present_field_that_is_not_an_integer(
+        sink, tmp_path, field, literal):
+    """A key that is present with a non-integer value is not a -1.
+
+    The presence loop above these fields runs HasKey, so by the time the
+    scan reports kAbsent the key IS there and simply is not an integer. The
+    parse handed every such value the historical -1, which for layer_number
+    is that field's legal "no layer" sentinel: `"layer_number": null` and
+    `"layer_number": "abc"` were both admitted and packed as -1. The oracle
+    raises PackFormatError "invalid capture metadata: layer_number must be
+    an integer in [-1, 2^31 - 1]".
+
+    Deleting the FindInt wrapper made this -1 convention the only sentinel
+    left in the parse, which is why it is fixed here rather than deferred
+    again.
+    """
+    _open(sink, tmp_path / "spool")
+    mapping = _meta(0).to_mapping()
+    mapping.update(dtype="uint8", shape=[64], token_start=0)
+    metadata = json.dumps(mapping)
+    needle = f'"{field}": {mapping[field]}'
+    assert metadata.count(needle) == 1, (needle, metadata)
+    metadata = metadata.replace(needle, f'"{field}": {literal}')
+
+    response = _submit_row(sink, metadata, bytes(64), "uint8", [64])
+    assert not response["ok"], (field, literal, response)
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == 0, snapshot
+
+    mapping[field] = json.loads(literal)
+    with pytest.raises(PackFormatError):
+        CaptureMetadata.from_mapping(mapping)
 
 
 def test_submit_row_keeps_the_64_bit_boundaries_exact(sink, tmp_path):

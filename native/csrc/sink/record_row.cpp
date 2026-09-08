@@ -65,8 +65,15 @@ bool ParseMetadataJson(const std::string& text,
   // A literal wider than 64 bits has no representation to validate: the old
   // scan wrapped it, so 2**64+1 arrived as captured_at_ns == 1 and was
   // packed. CaptureMetadata raises on these, so refuse the row instead.
-  // kAbsent cannot mean "missing" here (HasKey already ran) -- it is a
-  // present-but-not-an-integer value, which keeps its historical -1.
+  //
+  // kAbsent cannot mean "missing" here (HasKey already ran) -- the key IS
+  // there and simply is not an integer, so it is refused too rather than
+  // taking the -1 it used to. -1 is layer_number's legal "no layer"
+  // sentinel, so `"layer_number": null` and `"layer_number": "abc"` were
+  // both admitted and packed as -1, where CaptureMetadata raises
+  // "layer_number must be an integer in [-1, 2^31 - 1]". There is no
+  // sentinel left in this parse: every one of the seven outcomes is now
+  // either a value or a refusal.
   //
   // layer_number is the one field here the oracle types as SIGNED (Int32),
   // and it reads the int64 straight, so it must not be handed the unsigned
@@ -75,12 +82,14 @@ bool ParseMetadataJson(const std::string& text,
   // only refuses < -1 or > 2**31 - 1 -- admits it. It is the SINGLE aliasing
   // input, since 2**64 - 2 lands on -2 and 2**63 on INT64_MIN, both refused.
   bool out_of_range = false;
+  bool not_an_integer = false;
   auto integer = [&](const char* name,
                      jc::IntDomain domain = jc::IntDomain::kUnion) -> int64_t {
     int64_t value = 0;
     const jc::IntFind found = jc::FindIntChecked(text, name, &value, domain);
     if (found == jc::IntFind::kOutOfRange) out_of_range = true;
-    return found == jc::IntFind::kOk ? value : -1;
+    if (found == jc::IntFind::kAbsent) not_an_integer = true;
+    return found == jc::IntFind::kOk ? value : 0;
   };
   const int64_t layer = integer("layer_number", jc::IntDomain::kSigned);
   const int64_t producer = integer("producer_rank");
@@ -89,8 +98,13 @@ bool ParseMetadataJson(const std::string& text,
   const int64_t token_end = integer("token_end");
   const int64_t batch = integer("batch_position");
   const int64_t captured = integer("captured_at_ns");
+  // Out of range first: it is the more specific answer for a value that IS
+  // an integer literal, and a row can only carry one refusal.
   if (out_of_range) {
     return fail("capture metadata integer is out of range");
+  }
+  if (not_an_integer) {
+    return fail("capture metadata field is not an integer");
   }
   out->layer_number = layer;
   out->producer_rank = static_cast<uint64_t>(producer);
