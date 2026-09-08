@@ -59,6 +59,32 @@ void escape_into(const std::string& value, std::string* out) {
   jc::EscapeJson(value, out);
 }
 
+// An integer field, refusing a literal that does not fit in the 64-bit union
+// instead of handing the caller `jc::FindInt`'s -1.
+//
+// -1 was legal-looking at every site in this driver: the unsigned config
+// fields (lease_ttl_ns, the reader's read bounds, the index versions and row
+// counts) cast it to 18446744073709551615, `HasKey`-guarded fields took it as
+// a value the caller had actually supplied, and a `uint`/`int` query parameter
+// rendered 18446744073709551615 or -1 straight into a statement -- valid SQL
+// carrying a value nobody asked for.
+//
+// The union itself is legal input and stays so: step_number, token_start/end
+// and captured_at_ns are UInt64 in the catalog, so anything in
+// [-2**63, 2**64 - 1] must round-trip through the two's-complement bit
+// pattern exactly. Only a wider literal has no 64-bit answer at all, and
+// ValueError is the shape `captured_bound` below already refuses one with.
+int64_t field_int(const std::string& text, const char* key) {
+  int64_t value = 0;
+  const jc::IntFind found = jc::FindIntChecked(text, key, &value);
+  if (found == jc::IntFind::kOutOfRange) {
+    throw CatalogError(CatalogError::Kind::kValue,
+                       std::string(key) + " does not fit a 64-bit integer");
+  }
+  // kAbsent keeps FindInt's -1: `limit` and `layer_number` both use it.
+  return found == jc::IntFind::kOk ? value : -1;
+}
+
 void emit_lease(const PublisherLease& lease, std::string* out) {
   *out += ",\"lease\":{\"term\":" + std::to_string(lease.term) +
           ",\"lease_id\":\"" + lease.lease_id + "\",\"holder\":";
@@ -84,15 +110,15 @@ dmi_catalog::ReaderConfig reader_config(const std::string& database,
   rc.table_prefix = table_prefix;
   if (jc::HasKey(line, "max_rows_to_read")) {
     rc.max_rows_to_read =
-        static_cast<uint64_t>(jc::FindInt(line, "max_rows_to_read"));
+        static_cast<uint64_t>(field_int(line, "max_rows_to_read"));
   }
   if (jc::HasKey(line, "max_bytes_to_read")) {
     rc.max_bytes_to_read =
-        static_cast<uint64_t>(jc::FindInt(line, "max_bytes_to_read"));
+        static_cast<uint64_t>(field_int(line, "max_bytes_to_read"));
   }
   if (jc::HasKey(line, "max_execution_time_s")) {
     rc.max_execution_time_s =
-        static_cast<uint64_t>(jc::FindInt(line, "max_execution_time_s"));
+        static_cast<uint64_t>(field_int(line, "max_execution_time_s"));
   }
   return rc;
 }
@@ -119,9 +145,9 @@ dmi_catalog::Params read_params(const std::string& line) {
     const std::string name = jc::FindString(element, "name");
     if (name.empty()) continue;
     if (jc::HasKey(element, "uint")) {
-      params[name] = static_cast<uint64_t>(jc::FindInt(element, "uint"));
+      params[name] = static_cast<uint64_t>(field_int(element, "uint"));
     } else if (jc::HasKey(element, "int")) {
-      params[name] = static_cast<int64_t>(jc::FindInt(element, "int"));
+      params[name] = static_cast<int64_t>(field_int(element, "int"));
     } else {
       params[name] = jc::FindString(element, "str");
     }
@@ -149,7 +175,7 @@ std::string render_descriptor_row(const std::string& descriptor) {
     fields.push_back(dmi_catalog::sql_quote(jc::FindString(descriptor, key)));
   };
   const auto int_field = [&](const char* key) {
-    fields.push_back(std::to_string(jc::FindInt(descriptor, key)));
+    fields.push_back(std::to_string(field_int(descriptor, key)));
   };
   text_field("capture_id");
   text_field("tenant_id");
@@ -163,7 +189,7 @@ std::string render_descriptor_row(const std::string& descriptor) {
   fields.push_back(sql_string_or_null(descriptor, "adapter_revision"));
   text_field("capture_policy_version");
   text_field("hook_name");
-  fields.push_back(std::to_string(jc::FindInt(descriptor, "layer_number")));
+  fields.push_back(std::to_string(field_int(descriptor, "layer_number")));
   int_field("producer_rank");
   int_field("step_number");
   int_field("token_start");
@@ -209,9 +235,9 @@ std::string render_pack_row(const std::string& ref) {
   fields.push_back(dmi_catalog::sql_uuid(jc::FindString(ref, "pack_id")));
   fields.push_back(dmi_catalog::sql_quote(jc::FindString(ref, "store_id")));
   fields.push_back(dmi_catalog::sql_quote(jc::FindString(ref, "object_key")));
-  fields.push_back(std::to_string(jc::FindInt(ref, "object_bytes")));
+  fields.push_back(std::to_string(field_int(ref, "object_bytes")));
   fields.push_back(dmi_catalog::sql_quote(jc::FindString(ref, "pack_checksum")));
-  fields.push_back(std::to_string(jc::FindInt(ref, "record_count")));
+  fields.push_back(std::to_string(field_int(ref, "record_count")));
   std::string row;
   for (size_t i = 0; i < fields.size(); ++i) {
     if (i > 0) row += ",";
@@ -250,19 +276,19 @@ Session make_session(const std::string& line) {
   dmi_catalog::WriterConfig config;
   config.database = jc::FindString(line, "database");
   config.table_prefix = jc::FindString(line, "table_prefix");
-  config.lease_ttl_ns = static_cast<uint64_t>(jc::FindInt(line, "lease_ttl_ns"));
+  config.lease_ttl_ns = static_cast<uint64_t>(field_int(line, "lease_ttl_ns"));
   config.publish_timeout_ns =
-      static_cast<uint64_t>(jc::FindInt(line, "publish_timeout_ns"));
-  config.clock_skew_ns = static_cast<uint64_t>(jc::FindInt(line, "clock_skew_ns"));
+      static_cast<uint64_t>(field_int(line, "publish_timeout_ns"));
+  config.clock_skew_ns = static_cast<uint64_t>(field_int(line, "clock_skew_ns"));
   config.allocation_attempts =
-      static_cast<int>(jc::FindInt(line, "allocation_attempts"));
+      static_cast<int>(field_int(line, "allocation_attempts"));
   if (jc::HasKey(line, "query_pack_limit")) {
-    config.query_pack_limit = static_cast<int>(jc::FindInt(line, "query_pack_limit"));
+    config.query_pack_limit = static_cast<int>(field_int(line, "query_pack_limit"));
   }
   if (jc::HasKey(line, "insert_quorum") &&
       !jc::FindNull(line, "insert_quorum")) {
     config.insert_quorum =
-        static_cast<uint64_t>(jc::FindInt(line, "insert_quorum"));
+        static_cast<uint64_t>(field_int(line, "insert_quorum"));
   }
   const char* host = getenv("DMI_CLICKHOUSE_HOST");
   const char* port = getenv("DMI_CLICKHOUSE_HTTP_PORT");
@@ -365,7 +391,7 @@ std::string respond(const std::string& line, Session* session) {
       if (jc::HasKey(line, "tenant_id") && !jc::FindNull(line, "tenant_id")) {
         filters.tenant_id = jc::FindString(line, "tenant_id");
       }
-      filters.limit = static_cast<int>(jc::FindInt(line, "limit"));
+      filters.limit = static_cast<int>(field_int(line, "limit"));
       const dmi_catalog::Selection selection = reader.select(filters);
       out = ",\"selection\":{\"selection_id\":";
       escape_into(selection.selection_id, &out);
@@ -403,9 +429,9 @@ std::string respond(const std::string& line, Session* session) {
       selection.filter_hash = jc::FindString(line, "filter_hash");
       selection.tenant_id = jc::FindString(line, "tenant_id");
       const auto payloads = reader.hydrate(
-          selection, jc::FindInt(line, "byte_limit"),
+          selection, field_int(line, "byte_limit"),
           jc::HasKey(line, "request_limit")
-              ? jc::FindInt(line, "request_limit")
+              ? field_int(line, "request_limit")
               : 1024);
       out = ",\"payloads\":[";
       for (size_t i = 0; i < payloads.size(); ++i) {
@@ -439,9 +465,9 @@ std::string respond(const std::string& line, Session* session) {
       selection.filter_hash = jc::FindString(line, "filter_hash");
       selection.tenant_id = jc::FindString(line, "tenant_id");
       const auto summaries = reader.summarize_core(
-          selection, jc::FindInt(line, "byte_limit"),
+          selection, field_int(line, "byte_limit"),
           jc::HasKey(line, "request_limit")
-              ? jc::FindInt(line, "request_limit")
+              ? field_int(line, "request_limit")
               : 1024,
           1000, 64'000'000ull);
       out = ",\"summaries\":[";
@@ -569,7 +595,7 @@ std::string respond(const std::string& line, Session* session) {
       if (jc::HasKey(line, "cursor") && !jc::FindNull(line, "cursor")) {
         filters.cursor = jc::FindString(line, "cursor");
       }
-      filters.limit = static_cast<int>(jc::FindInt(line, "limit"));
+      filters.limit = static_cast<int>(field_int(line, "limit"));
       const dmi_catalog::SearchPage page = reader.search(filters);
       out = ",\"items\":[";
       bool first_item = true;
@@ -631,7 +657,7 @@ std::string respond(const std::string& line, Session* session) {
     } else if (op == "ensure_schema") {
       uint64_t retry_sleep_ns = 500'000'000ull;
       if (jc::HasKey(line, "retry_sleep_ns")) {
-        retry_sleep_ns = static_cast<uint64_t>(jc::FindInt(line, "retry_sleep_ns"));
+        retry_sleep_ns = static_cast<uint64_t>(field_int(line, "retry_sleep_ns"));
       }
       dmi_catalog::CatalogSchema schema(session->client, session->database,
                                         session->table_prefix);
@@ -642,7 +668,7 @@ std::string respond(const std::string& line, Session* session) {
       schema.drop();
     } else if (op == "collect_garbage") {
       const auto removed = writer.collect_garbage(
-          static_cast<uint64_t>(jc::FindInt(line, "settle_sleep_ns")));
+          static_cast<uint64_t>(field_int(line, "settle_sleep_ns")));
       out = ",\"removed\":{";
       bool first_table = true;
       for (const auto& [table, count] : removed) {
@@ -668,7 +694,7 @@ std::string respond(const std::string& line, Session* session) {
         rows.push_back(render_descriptor_row(descriptor));
       }
       writer.write_descriptors(
-          rows, static_cast<uint64_t>(jc::FindInt(line, "index_version")));
+          rows, static_cast<uint64_t>(field_int(line, "index_version")));
     } else if (op == "commit_packs") {
       std::vector<std::string> rows;
       for (const std::string& ref : jc::SplitElements(
@@ -676,7 +702,7 @@ std::string respond(const std::string& line, Session* session) {
         rows.push_back(render_pack_row(ref));
       }
       writer.commit_packs(
-          rows, static_cast<uint64_t>(jc::FindInt(line, "index_version")));
+          rows, static_cast<uint64_t>(field_int(line, "index_version")));
     } else if (op == "committed_pack_ids") {
       const auto committed = writer.committed_pack_ids(
           read_identities(line, "identities"));
@@ -702,12 +728,12 @@ std::string respond(const std::string& line, Session* session) {
         takeover_after_chunks = &chunks_holder;
       }
       writer.publish_snapshot(
-          static_cast<uint64_t>(jc::FindInt(line, "index_version")),
+          static_cast<uint64_t>(field_int(line, "index_version")),
           read_identities(line, "refs"),
-          static_cast<uint64_t>(jc::FindInt(line, "published_at_ns")),
-          static_cast<uint64_t>(jc::FindInt(line, "indexed_rows")),
-          static_cast<uint64_t>(jc::FindInt(line, "indexed_packs")),
-          static_cast<uint64_t>(jc::FindInt(line, "wedge_ns")),
+          static_cast<uint64_t>(field_int(line, "published_at_ns")),
+          static_cast<uint64_t>(field_int(line, "indexed_rows")),
+          static_cast<uint64_t>(field_int(line, "indexed_packs")),
+          static_cast<uint64_t>(field_int(line, "wedge_ns")),
           takeover_after_renew, takeover_after_chunks,
           jc::FindBool(line, "inject_transport_error"));
     } else if (op == "publish_concurrent") {
@@ -731,11 +757,11 @@ std::string respond(const std::string& line, Session* session) {
       };
       const std::vector<PackIdentity> refs = read_identities(line, "refs");
       const uint64_t rows =
-          static_cast<uint64_t>(jc::FindInt(line, "indexed_rows"));
+          static_cast<uint64_t>(field_int(line, "indexed_rows"));
       const uint64_t packs =
-          static_cast<uint64_t>(jc::FindInt(line, "indexed_packs"));
+          static_cast<uint64_t>(field_int(line, "indexed_packs"));
       const uint64_t wedge =
-          static_cast<uint64_t>(jc::FindInt(line, "wedge_ns"));
+          static_cast<uint64_t>(field_int(line, "wedge_ns"));
       Attempt first, second;
       const auto publish = [&](Attempt* attempt, uint64_t version,
                                uint64_t wedge_ns) {
@@ -754,9 +780,9 @@ std::string respond(const std::string& line, Session* session) {
         attempt->finished_ns = now_ns();
       };
       const uint64_t version_a =
-          static_cast<uint64_t>(jc::FindInt(line, "index_version_a"));
+          static_cast<uint64_t>(field_int(line, "index_version_a"));
       const uint64_t version_b =
-          static_cast<uint64_t>(jc::FindInt(line, "index_version_b"));
+          static_cast<uint64_t>(field_int(line, "index_version_b"));
       std::thread a(publish, &first, version_a, wedge);
       // A short stagger so the wedged publish is demonstrably first; the
       // point is whether the second WAITS, not who wins a start race.
@@ -796,11 +822,11 @@ std::string respond(const std::string& line, Session* session) {
         std::string report = "ok";
         try {
           writer.publish_snapshot(
-              static_cast<uint64_t>(jc::FindInt(line, "index_version")),
+              static_cast<uint64_t>(field_int(line, "index_version")),
               read_identities(line, "refs"),
-              static_cast<uint64_t>(jc::FindInt(line, "published_at_ns")),
-              static_cast<uint64_t>(jc::FindInt(line, "indexed_rows")),
-              static_cast<uint64_t>(jc::FindInt(line, "indexed_packs")));
+              static_cast<uint64_t>(field_int(line, "published_at_ns")),
+              static_cast<uint64_t>(field_int(line, "indexed_rows")),
+              static_cast<uint64_t>(field_int(line, "indexed_packs")));
         } catch (const CatalogError& e) {
           report = std::string(error_kind(e.kind())) + ":" + e.what();
         } catch (const std::exception& e) {
@@ -841,22 +867,22 @@ std::string respond(const std::string& line, Session* session) {
         ref.pack_id = jc::FindString(element, "pack_id");
         ref.store_id = jc::FindString(element, "store_id");
         ref.object_key = jc::FindString(element, "object_key");
-        ref.object_bytes = static_cast<uint64_t>(jc::FindInt(element, "object_bytes"));
+        ref.object_bytes = static_cast<uint64_t>(field_int(element, "object_bytes"));
         ref.checksum = jc::FindString(element, "checksum");
-        ref.record_count = static_cast<uint64_t>(jc::FindInt(element, "record_count"));
+        ref.record_count = static_cast<uint64_t>(field_int(element, "record_count"));
         refs.push_back(ref);
       }
       dmi_catalog::IndexerConfig index_config;
       if (jc::HasKey(line, "max_packs")) {
-        index_config.max_packs = static_cast<int>(jc::FindInt(line, "max_packs"));
+        index_config.max_packs = static_cast<int>(field_int(line, "max_packs"));
       }
       if (jc::HasKey(line, "max_estimated_bytes")) {
         index_config.max_estimated_bytes =
-            static_cast<uint64_t>(jc::FindInt(line, "max_estimated_bytes"));
+            static_cast<uint64_t>(field_int(line, "max_estimated_bytes"));
       }
       if (jc::HasKey(line, "max_publish_attempts")) {
         index_config.max_publish_attempts =
-            static_cast<int>(jc::FindInt(line, "max_publish_attempts"));
+            static_cast<int>(field_int(line, "max_publish_attempts"));
       }
       if (jc::FindBool(line, "foreign_watermark_after_allocate")) {
         // A foreign writer publishing a HIGHER version between this pass's
@@ -906,8 +932,8 @@ std::string respond(const std::string& line, Session* session) {
     } else if (op == "fence_eval") {
       const bool admits = writer.leases().fence_eval(
           jc::FindString(line, "lease_id"),
-          static_cast<uint64_t>(jc::FindInt(line, "publish_timeout_ns")),
-          static_cast<uint64_t>(jc::FindInt(line, "clock_skew_ns")));
+          static_cast<uint64_t>(field_int(line, "publish_timeout_ns")),
+          static_cast<uint64_t>(field_int(line, "clock_skew_ns")));
       out = std::string(",\"admits\":") + (admits ? "1" : "0");
     } else if (op == "execute") {
       out = rows_to_json(session->client->execute(
