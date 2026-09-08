@@ -31,9 +31,12 @@ namespace jc = dmi_common;
 // is single-threaded and handles one op per line.
 //
 // FindInt reported such a literal as -1, which is a legal value here for
-// nothing at all -- `max_bytes` read it as "not given" and took the 1 TiB
-// default, and the StagedPack counters cast it to 18446744073709551615. So
-// the op has to refuse, which means knowing WHICH field did it.
+// nothing at all: every field is cast straight to uint64_t, so -1 became
+// 18446744073709551615 -- for `max_bytes` an effectively unlimited spool
+// rather than the capacity the caller asked for (the 1 TiB fallback is
+// keyed on ZERO, which -1 is not), and for the StagedPack counters a
+// timestamp and a record count out of any plausible range. So the op has to
+// refuse, which means knowing WHICH field did it.
 std::string g_out_of_range;
 
 int64_t Integer(const std::string& text, const char* key) {
@@ -42,7 +45,7 @@ int64_t Integer(const std::string& text, const char* key) {
   if (found == jc::IntFind::kOutOfRange && g_out_of_range.empty()) {
     g_out_of_range = key;
   }
-  // kAbsent keeps FindInt's -1: an absent max_bytes still means "default".
+  // kAbsent keeps FindInt's -1, which is what an absent key answered before.
   return found == jc::IntFind::kOk ? value : -1;
 }
 

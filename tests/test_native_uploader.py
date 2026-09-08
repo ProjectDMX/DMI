@@ -457,11 +457,12 @@ def test_uploader_head_to_head_with_python_reference(fake_s3, tmp_path):
 
 # --- integer bounds ------------------------------------------------------------
 #
-# The uploader's own integer fields read FindInt's -1 as "not given": the
-# spool's max_bytes fell back to 1 TiB, max_workers to four, and
-# upload_max_attempts kept the default -- so the caller's limit silently
-# became a different one. The nested StagedPack's counters cast -1 to
-# 18446744073709551615 instead.
+# The uploader's own integer fields read FindInt's -1 as "not given" wherever
+# they test "> 0": max_workers fell back to four, max_in_flight_bytes and
+# upload_max_attempts kept their defaults. The fields cast straight to
+# uint64_t became 18446744073709551615 instead -- the nested StagedPack's
+# counters, and the spool's max_bytes, whose 1 TiB fallback is keyed on zero
+# and so never fired. Either way the caller's limit became a different one.
 
 
 @pytest.mark.parametrize(

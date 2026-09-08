@@ -262,11 +262,12 @@ def test_remove_unaccounts(tmp_path):
 # --- integer bounds ------------------------------------------------------------
 #
 # Every integer field on this protocol is 64-bit, and a literal that does not
-# fit has no value it could carry. FindInt handed each site -1, which
-# `max_bytes` read as "not given, use the 1 TiB default" and the StagedPack
-# counters cast to 18446744073709551615 -- so a defaulted or wrapped value came
-# back reported as success. Refuse instead, in the ok:false shape the driver
-# already answers a bad argument with.
+# fit has no value it could carry. FindInt handed each site -1, and each site
+# cast it straight to uint64_t: 18446744073709551615, which for `max_bytes` is
+# an effectively unlimited spool rather than the capacity the caller asked for
+# (the 1 TiB fallback is keyed on zero, which -1 is not). So a wrapped value
+# came back reported as success. Refuse instead, in the ok:false shape the
+# driver already answers a bad argument with.
 
 
 @pytest.mark.parametrize(
@@ -280,8 +281,8 @@ def test_remove_unaccounts(tmp_path):
         ("created_at_ns", int("9" * 40)),
         # Below INT64_MIN by one; the negative branch has the wider limit.
         ("created_at_ns", -(2**63) - 1),
-        # max_bytes' -1 became the default, so a capacity limit the caller
-        # asked for was never applied.
+        # max_bytes' -1 became 18446744073709551615, so a capacity limit the
+        # caller asked for was replaced by no limit at all.
         ("max_bytes", 2**64 + 1),
         ("max_bytes", -(2**63) - 1),
     ],

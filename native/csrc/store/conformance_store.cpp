@@ -37,12 +37,13 @@ namespace jc = dmi_common;
 // driver is single-threaded and handles one op per line.
 //
 // FindInt reported such a literal as -1, and -1 is a legal answer for none of
-// these fields. The timeouts, attempt counts and worker counts test "> 0" for
-// "was it given", so they silently fell back to 5s / 120s / 4 attempts / 4
-// workers; the multipart sizes and the spool's max_bytes kept their defaults;
-// and a range offset, a length or a StagedPack counter cast it to
-// 18446744073709551615. In every case the caller's own bound was replaced by
-// a different one and the op reported success.
+// these fields. The fields tested for "> 0" as a stand-in for "was it given"
+// silently fell back to their defaults -- 5s, 120s, 4 attempts, 4 workers,
+// and the multipart sizes. The fields cast straight to uint64_t became
+// 18446744073709551615 instead: a range offset or length, a StagedPack
+// counter, and the spool's max_bytes (whose 1 TiB fallback is keyed on ZERO,
+// which -1 is not, so the limit became no limit). In every case the caller's
+// own bound was replaced by a different one and the op reported success.
 std::string g_out_of_range;
 
 int64_t Integer(const std::string& text, const char* key) {
