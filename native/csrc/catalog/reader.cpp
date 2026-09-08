@@ -816,6 +816,30 @@ std::vector<std::vector<std::string>> NativeCaptureCatalog::get_by_ids(
     throw CatalogError(CatalogError::Kind::kValue,
                        "watermark must be a decimal string");
   }
+  // WIDTH, next, and here rather than in parse_u64_field: this is the one
+  // caller-data call that function has, so the refusal belongs in the
+  // reader's own ValueError taxonomy with _parse_watermark's wording, not
+  // as a transport-layer ClickHouseError. The digit check above passes on
+  // an arbitrarily long run, and the parse then wrapped modulo 2**64 --
+  // 2**64 arrived as 0 and 2**64 + head as head, so both slid under the
+  // published-head guard below and resolved against a snapshot the caller
+  // never named. parse_u64_field is bounded too, so the wrap is gone
+  // either way; this check is what makes the ANSWER match the oracle's.
+  //
+  // Leading zeros are insignificant to `int()`, so they are stripped before
+  // the width is judged: "0" * 4 + str(2**64 - 1) is 24 digits and the
+  // oracle accepts it.
+  {
+    const size_t first = watermark.find_first_not_of('0');
+    const std::string digits = first == std::string::npos
+                                   ? std::string("0")
+                                   : watermark.substr(first);
+    if (digits.size() > 20 ||
+        (digits.size() == 20 && digits > "18446744073709551615")) {
+      throw CatalogError(CatalogError::Kind::kValue,
+                         "watermark must fit UInt64");
+    }
+  }
   const uint64_t requested = parse_u64_field(watermark, "watermark");
   // A selection is caller data: its watermark must be one the indexer
   // actually published. A deciding read — this answer refuses the call.

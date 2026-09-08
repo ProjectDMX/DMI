@@ -83,7 +83,22 @@ uint64_t parse_u64_field(const std::string& text, const char* what) {
     if (c < '0' || c > '9') {
       throw ClickHouseError(std::string("invalid ") + what + ": " + text);
     }
-    value = value * 10 + static_cast<uint64_t>(c - '0');
+    const uint64_t digit = static_cast<uint64_t>(c - '0');
+    // A field too wide for UInt64 is refused, through the same error a
+    // non-digit already raises: the accumulator had no bound, so it wrapped
+    // modulo 2**64 and answered a plausible-looking number for a field it
+    // could not represent. Every server-side caller reads a UInt64/UInt32
+    // column, which renders in at most 20 digits, so from a well-behaved
+    // ClickHouse this arm is unreachable and the bound is defence in depth
+    // -- but `get_by_ids` hands this function a CALLER's watermark string,
+    // gated only on "non-empty and all digits", and 2**64 wrapped to 0.
+    // The bound is checked BEFORE the multiply, as it is in json.cpp,
+    // record_row.cpp and reader.cpp: after it, the value is already gone.
+    if (value > (UINT64_MAX - digit) / 10) {
+      throw ClickHouseError(std::string(what) + " does not fit UInt64: " +
+                            text);
+    }
+    value = value * 10 + digit;
   }
   return value;
 }

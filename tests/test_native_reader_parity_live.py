@@ -1018,6 +1018,53 @@ def test_get_by_ids_parity_and_watermark_validation():
                 assert refused["error"] == "ValueError", (bad, refused)
                 with pytest.raises(ValueError):
                     reader.get_by_ids(ids[:1], tenant_id="t", watermark=bad)
+
+            # A watermark WIDER than UInt64 is caller data too, and the digit
+            # check above passes on it: `parse_u64_field` accumulated it into
+            # a uint64_t with no bound, so 2**64 wrapped to 0 and 2**64 + 7
+            # to 7 -- the published head. Both then slipped past the
+            # published-head guard and resolved against a snapshot the caller
+            # never named: 2**64 returned NO rows (snapshot 0) and 2**64 + 7
+            # returned the FULL result of snapshot 7. `_parse_watermark`
+            # raises "watermark must fit UInt64" on both, so the wrap value is
+            # chosen here to land at or below the head on purpose -- a wrap
+            # ABOVE it is masked by the head guard's own refusal.
+            for wide in (2**64, 2**64 + 7, int("9" * 40)):
+                refused = driver.call(
+                    op="get_by_ids", capture_ids=ids[:1], tenant_id="t",
+                    watermark=str(wide))
+                assert not refused["ok"], (wide, refused)
+                assert refused["error"] == "ValueError", (wide, refused)
+                assert "must fit UInt64" in refused["message"], (wide, refused)
+                with pytest.raises(ValueError, match="must fit UInt64"):
+                    reader.get_by_ids(ids[:1], tenant_id="t",
+                                      watermark=str(wide))
+
+            # 2**64 - 1 is the widest watermark UInt64 holds, so it must reach
+            # the published-head guard rather than be refused as unwidth --
+            # and leading zeros are insignificant to `int()`, so a 24-digit
+            # rendering of the same value must be judged the same way and not
+            # refused on its LENGTH.
+            for widest in (str(2**64 - 1), "0000" + str(2**64 - 1)):
+                refused = driver.call(
+                    op="get_by_ids", capture_ids=ids[:1], tenant_id="t",
+                    watermark=widest)
+                assert not refused["ok"], (widest, refused)
+                assert "exceeds the published watermark" in refused[
+                    "message"], (widest, refused)
+                with pytest.raises(ValueError, match="exceeds the published"):
+                    reader.get_by_ids(ids[:1], tenant_id="t",
+                                      watermark=widest)
+
+            # A leading-zero watermark AT the head still resolves, on both
+            # sides: the width check must not refuse what the oracle admits.
+            padded = driver.call(
+                op="get_by_ids", capture_ids=ids[:2], tenant_id="t",
+                watermark="0007")
+            assert padded["ok"], padded
+            assert len(padded["items"]) == 2, padded
+            assert _normalize(padded["items"]) == _normalize(
+                reader.get_by_ids(ids[:2], tenant_id="t", watermark="0007"))
         finally:
             driver.close()
 
