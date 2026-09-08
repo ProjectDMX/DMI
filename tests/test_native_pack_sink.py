@@ -57,10 +57,14 @@ class SinkSession:
             bufsize=1,
         )
 
-    def call(self, **fields) -> dict:
-        self.proc.stdin.write(json.dumps(fields) + "\n")
+    def call_line(self, line: str) -> dict:
+        """Send one request verbatim, for literals json.dumps would rewrite."""
+        self.proc.stdin.write(line + "\n")
         self.proc.stdin.flush()
         return json.loads(self.proc.stdout.readline())
+
+    def call(self, **fields) -> dict:
+        return self.call_line(json.dumps(fields))
 
     def close(self):
         try:
@@ -268,6 +272,25 @@ def test_small_packs_split_by_size(sink, tmp_path):
     assert snapshot["flush_size"] >= 1
 
 
+def _python_object_key(tenant, sess, rank, captured, pack_id) -> str:
+    """The oracle's key for these arguments, via `object_key_for`."""
+    from dmi.storage.capture.pack import SealedPack
+    from dmi.storage.capture.pipeline import ReadyPack
+
+    meta = _meta(0, session_id=sess, tenant_id=tenant)
+    object.__setattr__(meta, "producer_rank", rank)
+    object.__setattr__(meta, "captured_at_ns", captured)
+    ready = ReadyPack(
+        pack=SealedPack(
+            pack_id=pack_id, created_at_ns=captured, data=b"",
+            record_count=0, footer_offset=0, checksum="0" * 64,
+        ),
+        first_metadata=meta,
+        reason=None,
+    )
+    return object_key_for(ready)
+
+
 def test_object_key_parity_with_python():
     session = SinkSession()
     try:
@@ -284,27 +307,14 @@ def test_object_key_parity_with_python():
             ("..", "s", 0, 1_700_000_000_000_000_000),
         ]
         pack_id = "018f0000-0000-7000-8000-000000000f01"
-        from dmi.storage.capture.pack import PackWriter
-        from dmi.storage.capture.pipeline import ReadyPack
-        from dmi.storage.capture.pack import SealedPack
         for tenant, sess, rank, captured in cases:
             response = session.call(
                 op="object_key", tenant_id=tenant, session_id=sess,
                 producer_rank=rank, captured_at_ns=captured, pack_id=pack_id,
             )
             assert response["ok"], response
-            meta = _meta(0, session_id=sess, tenant_id=tenant)
-            object.__setattr__(meta, "producer_rank", rank)
-            object.__setattr__(meta, "captured_at_ns", captured)
-            ready = ReadyPack(
-                pack=SealedPack(
-                    pack_id=pack_id, created_at_ns=captured, data=b"",
-                    record_count=0, footer_offset=0, checksum="0" * 64,
-                ),
-                first_metadata=meta,
-                reason=None,
-            )
-            assert response["object_key"] == object_key_for(ready), tenant
+            assert response["object_key"] == _python_object_key(
+                tenant, sess, rank, captured, pack_id), tenant
     finally:
         session.close()
 
@@ -703,17 +713,45 @@ def test_submit_admits_the_whole_unsigned_range(sink, tmp_path, field):
 
 
 def test_object_key_keeps_the_64_bit_boundaries_exact():
-    """INT64_MAX, 2**64 - 1, 0 and -0 all still reach the key builder."""
+    """INT64_MAX, 2**64 - 1, 0 and -0 all still reach the key builder.
+
+    The value being parametrized is `captured_at_ns`, and it IS observable:
+    `object_key_for` derives the `date=` segment from it. So the whole key
+    is compared against the oracle, the way `test_object_key_parity_with_
+    python` does it -- pinning only "rank=4294967295" observed nothing but
+    `producer_rank`, which is fixed across the loop, so a clamp or a wrong
+    wide-value computation of `captured_at_ns` passed.
+
+    `-0` is sent as a raw literal: `json.dumps(-0)` emits `0`, so going
+    through `call` would not have exercised the JSON scan's negative arm at
+    all. This is the same trick `test_minus_zero_is_still_zero` and
+    `test_submit_row_parses_the_int64_limits_before_validating_them` use.
+    """
+    pack_id = "018f0000-0000-7000-8000-000000000f01"
     session = SinkSession()
     try:
         for captured in (0, 2**63 - 1, 2**63, 2**64 - 1):
             response = session.call(
                 op="object_key", tenant_id="tenant", session_id="session",
                 producer_rank=2**32 - 1, captured_at_ns=captured,
-                pack_id="018f0000-0000-7000-8000-000000000f01",
+                pack_id=pack_id,
             )
             assert response["ok"], (captured, response)
-            assert "rank=4294967295" in response["object_key"], response
+            assert response["object_key"] == _python_object_key(
+                "tenant", "session", 2**32 - 1, captured, pack_id), captured
+
+        # -0 on the wire, which json.dumps would have flattened to 0.
+        line = json.dumps({
+            "op": "object_key", "tenant_id": "tenant",
+            "session_id": "session", "producer_rank": 2**32 - 1,
+            "captured_at_ns": 0, "pack_id": pack_id,
+        })
+        line = line.replace('"captured_at_ns": 0', '"captured_at_ns": -0')
+        assert '"captured_at_ns": -0' in line
+        response = session.call_line(line)
+        assert response["ok"], response
+        assert response["object_key"] == _python_object_key(
+            "tenant", "session", 2**32 - 1, 0, pack_id), response
     finally:
         session.close()
 
