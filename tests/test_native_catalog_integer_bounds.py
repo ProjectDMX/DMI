@@ -220,6 +220,80 @@ def test_a_reader_bound_wider_than_64_bits_is_refused(field):
     assert field in response["message"], response
 
 
+def _write_descriptors_with(**overrides) -> dict:
+    """One `write_descriptors` against the dead server, one descriptor."""
+    descriptor = {
+        "capture_id": "cap-0", "tenant_id": "t", "experiment_id": "e",
+        "run_id": "r", "session_id": "s", "request_id": "q",
+        "sequence_id": "n", "model_id": "m", "model_revision": "mr",
+        "adapter_revision": None, "capture_policy_version": "v",
+        "hook_name": "h", "layer_number": 0, "producer_rank": 0,
+        "step_number": 0, "token_start": 0, "token_end": 1,
+        "batch_position": 0, "dtype": "uint8", "shape": [4],
+        "captured_at_ns": 1,
+        "pack_id": "018f0000-0000-7000-8000-00000000dead",
+        "store_id": "store", "object_key": "k", "object_bytes": 1,
+        "pack_checksum": "c", "pack_record_count": 1, "payload_offset": 0,
+        "stored_length": 4, "decoded_length": 4, "codec": "none",
+        "payload_checksum": "p",
+    }
+    descriptor.update(overrides)
+    session = _dead_server_session()
+    try:
+        session.stdin.write(json.dumps({
+            "op": "open", "database": "bounds_db", "table_prefix": "bounds",
+            "lease_ttl_ns": 30_000_000_000,
+            "publish_timeout_ns": 1_000_000_000, "clock_skew_ns": 1_000_000,
+            "allocation_attempts": 3,
+        }) + "\n")
+        session.stdin.flush()
+        assert json.loads(session.stdout.readline())["ok"]
+        session.stdin.write(json.dumps({
+            "op": "write_descriptors", "descriptors": [descriptor],
+            "index_version": 1,
+        }) + "\n")
+        session.stdin.flush()
+        return json.loads(session.stdout.readline())
+    finally:
+        session.stdin.close()
+        session.wait(timeout=30)
+
+
+# --- the descriptor row's signed column ----------------------------------------
+#
+# `layer_number` is the one capture column the catalog types as SIGNED
+# (Int32). The 64-bit union the scan accepts hands back a two's-complement
+# bit pattern, so 18446744073709551615 arrives as -1 -- which is that
+# column's legal "no layer" sentinel -- and renders straight into the Int32
+# column. Live, that wrote a row and `SELECT` read it back as -1, where
+# CaptureMetadata raises "layer_number must be an integer in [-1, 2^31 - 1]".
+# Here the dead server tells the two outcomes apart exactly as it does for
+# the read bounds above: a ValueError is the refusal landing BEFORE the
+# insert, a ClickHouseError is the row having been rendered and dispatched.
+
+
+@pytest.mark.parametrize("value", [2**64 - 1, 2**63, 2**64 - 2])
+def test_a_signed_descriptor_column_refuses_the_unsigned_half(value):
+    response = _write_descriptors_with(layer_number=value)
+    assert not response["ok"], response
+    assert response["error"] == "ValueError", response
+    assert "layer_number" in response["message"], response
+    assert "does not fit" in response["message"], response
+
+
+@pytest.mark.parametrize("value", [-1, 0, 1, 2**31 - 1, -(2**63), 2**63 - 1])
+def test_a_signed_descriptor_column_keeps_the_signed_half(value):
+    """The refusal must be the unsigned half, not "this column at all".
+
+    -1 is the legal "no layer" sentinel and 2**31 - 1 the column's top; the
+    int64 limits are outside the COLUMN's range but inside the parse's, and
+    the driver renders them for the server to refuse, as it always has.
+    """
+    response = _write_descriptors_with(layer_number=value)
+    assert not response["ok"], response
+    assert response["error"] == "ClickHouseError", response
+
+
 @pytest.mark.parametrize("value", [2**63, 2**64 - 1])
 @pytest.mark.parametrize("field", READ_BOUNDS)
 def test_a_reader_bound_keeps_the_whole_union(field, value):

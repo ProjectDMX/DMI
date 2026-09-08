@@ -42,9 +42,14 @@ namespace {
 // million".
 std::string g_out_of_range;
 
-int64_t Integer(const std::string& text, const std::string& key) {
+// A field the oracle types as SIGNED must pass IntDomain::kSigned: the
+// union's two's-complement bit pattern is a legal-looking negative to such a
+// field, and 18446744073709551615 arrived at layer_number as -1 -- its own
+// "no layer" sentinel -- and the build sealed a pack.
+int64_t Integer(const std::string& text, const std::string& key,
+                jc::IntDomain domain = jc::IntDomain::kUnion) {
   int64_t value = 0;
-  const jc::IntFind found = jc::FindIntChecked(text, key, &value);
+  const jc::IntFind found = jc::FindIntChecked(text, key, &value, domain);
   if (found == jc::IntFind::kOutOfRange && g_out_of_range.empty()) {
     g_out_of_range = key;
   }
@@ -151,9 +156,9 @@ int main() {
     auto meta_null = [&](const std::string& obj, const std::string& k) {
       return jc::FindNull(obj, k);
     };
-    auto meta_int = [&](const std::string& obj, const std::string& k) -> int64_t {
-      return Integer(obj, k);
-    };
+    auto meta_int = [&](const std::string& obj, const std::string& k,
+                        jc::IntDomain domain = jc::IntDomain::kUnion)
+        -> int64_t { return Integer(obj, k, domain); };
     auto meta_shape = [&](const std::string& obj) {
       std::vector<uint32_t> shape;
       for (const auto& item : jc::SplitElements(jc::Unwrap(jc::FindArray(obj, "shape")))) {
@@ -196,7 +201,7 @@ int main() {
       }
       meta.capture_policy_version = meta_string(rt, "capture_policy_version");
       meta.hook_name = meta_string(rt, "hook_name");
-      meta.layer_number = meta_int(rt, "layer_number");
+      meta.layer_number = meta_int(rt, "layer_number", jc::IntDomain::kSigned);
       meta.producer_rank = static_cast<uint64_t>(meta_int(rt, "producer_rank"));
       meta.step_number = static_cast<uint64_t>(meta_int(rt, "step_number"));
       meta.token_start = static_cast<uint64_t>(meta_int(rt, "token_start"));

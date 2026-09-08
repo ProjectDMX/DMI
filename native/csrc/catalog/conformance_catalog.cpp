@@ -74,12 +74,21 @@ void escape_into(const std::string& value, std::string* out) {
 // [-2**63, 2**64 - 1] must round-trip through the two's-complement bit
 // pattern exactly. Only a wider literal has no 64-bit answer at all, and
 // ValueError is the shape `captured_bound` below already refuses one with.
-int64_t field_int(const std::string& text, const char* key) {
+//
+// A field the catalog types as SIGNED must pass IntDomain::kSigned. The
+// union's bit pattern is a legal-looking negative to such a field:
+// layer_number is Int32, and 18446744073709551615 rendered as -1, its own
+// "no layer" sentinel, straight into the column.
+int64_t field_int(const std::string& text, const char* key,
+                  jc::IntDomain domain = jc::IntDomain::kUnion) {
   int64_t value = 0;
-  const jc::IntFind found = jc::FindIntChecked(text, key, &value);
+  const jc::IntFind found = jc::FindIntChecked(text, key, &value, domain);
   if (found == jc::IntFind::kOutOfRange) {
-    throw CatalogError(CatalogError::Kind::kValue,
-                       std::string(key) + " does not fit a 64-bit integer");
+    throw CatalogError(
+        CatalogError::Kind::kValue,
+        std::string(key) + " does not fit a " +
+            (domain == jc::IntDomain::kSigned ? "signed " : "") +
+            "64-bit integer");
   }
   // kAbsent keeps answering -1: `limit` and `layer_number` both use it.
   return found == jc::IntFind::kOk ? value : -1;
@@ -189,7 +198,9 @@ std::string render_descriptor_row(const std::string& descriptor) {
   fields.push_back(sql_string_or_null(descriptor, "adapter_revision"));
   text_field("capture_policy_version");
   text_field("hook_name");
-  fields.push_back(std::to_string(field_int(descriptor, "layer_number")));
+  // The one SIGNED capture column: Int32, with -1 as its legal sentinel.
+  fields.push_back(std::to_string(
+      field_int(descriptor, "layer_number", jc::IntDomain::kSigned)));
   int_field("producer_rank");
   int_field("step_number");
   int_field("token_start");

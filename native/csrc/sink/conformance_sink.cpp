@@ -43,9 +43,14 @@ namespace {
 // are the driver's remaining decodes.
 std::string g_out_of_range;
 
-int64_t Integer(const std::string& text, const char* key) {
+// A field the oracle types as SIGNED must pass IntDomain::kSigned: the
+// union's two's-complement bit pattern is a legal-looking negative to such a
+// field, and 18446744073709551615 arrived at layer_number as -1 -- its own
+// "no layer" sentinel -- and was admitted.
+int64_t Integer(const std::string& text, const char* key,
+                jc::IntDomain domain = jc::IntDomain::kUnion) {
   int64_t value = 0;
-  const jc::IntFind found = jc::FindIntChecked(text, key, &value);
+  const jc::IntFind found = jc::FindIntChecked(text, key, &value, domain);
   if (found == jc::IntFind::kOutOfRange && g_out_of_range.empty()) {
     g_out_of_range = key;
   }
@@ -70,7 +75,7 @@ dmi_pack::RecordMetadata ParseMetadata(const std::string& obj) {
   }
   m.capture_policy_version = jc::FindString(obj, "capture_policy_version");
   m.hook_name = jc::FindString(obj, "hook_name");
-  m.layer_number = Integer(obj, "layer_number");
+  m.layer_number = Integer(obj, "layer_number", jc::IntDomain::kSigned);
   m.producer_rank = static_cast<uint64_t>(Integer(obj, "producer_rank"));
   m.step_number = static_cast<uint64_t>(Integer(obj, "step_number"));
   m.token_start = static_cast<uint64_t>(Integer(obj, "token_start"));

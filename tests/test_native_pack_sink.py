@@ -750,6 +750,9 @@ def test_object_key_refuses_an_out_of_range_integer(sink, field, value):
         ("producer_rank", 2**64 + 5),
         ("batch_position", 2**64 + 5),
         ("layer_number", 2**64 + 3),
+        # Inside the union, aliasing onto the legal "no layer" sentinel --
+        # the same defect the row path carries, at the driver's own decode.
+        ("layer_number", 2**64 - 1),
         ("token_start", -(2**63) - 1),
         ("layer_number", -(2**63) - 1),
         ("captured_at_ns", int("9" * 40)),

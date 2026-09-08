@@ -427,6 +427,11 @@ def _one_record(**overrides) -> dict:
         ("producer_rank", 2**64 + 5),
         ("batch_position", 2**64 + 5),
         ("layer_number", 2**64 + 3),
+        # INSIDE the union, so none of the above catches it: the bit pattern
+        # is -1, which is layer_number's legal "no layer" sentinel, and the
+        # build sealed a pack. Only a SIGNED field refuses the unsigned half;
+        # the counters below keep the whole of it.
+        ("layer_number", 2**64 - 1),
         # Below INT64_MIN by one; the negative branch has the wider limit.
         ("token_start", -(2**63) - 1),
         ("layer_number", -(2**63) - 1),
