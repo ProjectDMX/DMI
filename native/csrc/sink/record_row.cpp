@@ -104,14 +104,28 @@ bool ParseMetadataJson(const std::string& text,
        jc::SplitElements(jc::Unwrap(jc::FindArray(text, "shape")))) {
     size_t q = 0;
     while (q < item.size() && item[q] == ' ') ++q;
+    // Bounded the way the scalars above are bounded, and for the same
+    // reason: an unbounded accumulator wrapped, so shape [4294967297]
+    // arrived as (1,) and was packed, where CaptureMetadata raises "shape
+    // dimensions must be integers in [0, 2^31 - 1]". [2**31] was already
+    // refused by ValidateMetadata, so only the WRAPPED dimensions slipped
+    // through. The bound here is the accumulator's own, exactly as
+    // FindIntChecked's is 64 bits: the field's narrower range stays with
+    // ValidateMetadata, so one past 2**31 - 1 still reports as validation
+    // and not as an unrepresentable literal.
     uint32_t v = 0;
     bool any = false;
+    bool over = false;
     while (q < item.size() && item[q] >= '0' && item[q] <= '9') {
-      v = v * 10 + static_cast<uint32_t>(item[q] - '0');
+      const uint32_t digit = static_cast<uint32_t>(item[q] - '0');
+      // "v * 10 + digit > UINT32_MAX", rearranged to not overflow itself.
+      if (v > (~uint32_t{0} - digit) / 10) over = true;
+      if (!over) v = v * 10 + digit;
       ++q;
       any = true;
     }
     if (!any) return fail("capture shape must be an integer list");
+    if (over) return fail("capture shape dimension is out of range");
     out->shape.push_back(v);
   }
   out->captured_at_ns = static_cast<uint64_t>(captured);

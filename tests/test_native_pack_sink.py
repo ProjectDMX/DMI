@@ -528,6 +528,73 @@ def test_submit_row_refuses_out_of_range_integers(sink, tmp_path, field, value):
         CaptureMetadata(**mapping)
 
 
+@pytest.mark.parametrize(
+    "dim",
+    [
+        # The seven scalars above go through the checked parse; the shape
+        # dimensions three lines below them in the same function accumulate
+        # into a bare uint32_t with no bound, so a dimension over 2**32 wraps
+        # into range and is PACKED instead of being refused. 2**31 itself is
+        # refused by ValidateMetadata -- only the WRAPPED values slip through,
+        # which is why no dimension bound test caught this.
+        2**32 + 1,
+        2**32 + 3,
+        2**64 + 5,
+        # A digit run far longer than any 64-bit value still wraps to 7.
+        2**32 * 10**25 + 7,
+    ],
+)
+def test_submit_row_refuses_a_shape_dimension_that_does_not_fit(sink, tmp_path,
+                                                                dim):
+    _open(sink, tmp_path / "spool")
+    # The envelope carries the value the metadata WRAPS to, which is what let
+    # the row past the envelope/metadata shape agreement check and into a pack.
+    envelope = [dim % 2**32]
+    assert 0 < envelope[0] <= 2**31 - 1, envelope
+    metadata = _row_meta(0, dtype="uint8", shape=[dim], token_start=0)
+    response = _submit_row(sink, metadata, bytes(envelope[0]), "uint8",
+                           envelope)
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == 0
+    mapping = _meta(0).to_mapping()
+    mapping.update(dtype="uint8", shape=(dim,), token_start=0)
+    with pytest.raises(ValueError):
+        CaptureMetadata(**mapping)
+
+
+def test_submit_row_keeps_the_shape_dimension_boundary_exact(sink, tmp_path):
+    """2**31 - 1 parses and is refused by validation, not by the bound.
+
+    The dimension bound is the accumulator's, exactly as it is for the
+    scalars: it refuses a literal with no uint32 to hold it, and leaves the
+    field's own narrower range (0 .. 2**31 - 1) to ValidateMetadata. If the
+    two were merged, the reason reported for 2**31 would be wrong.
+    """
+    _open(sink, tmp_path / "spool")
+    # 2**31 - 1 is the largest dimension CaptureMetadata admits: the parse
+    # must carry it through to the payload-size check, not refuse it.
+    metadata = _row_meta(0, dtype="uint8", shape=[2**31 - 1], token_start=0)
+    response = _submit_row(sink, metadata, b"", "uint8", [2**31 - 1])
+    assert not response["ok"], response
+    assert response["what"].startswith("payload length does not match"), response
+    assert str(2**31 - 1) in response["what"], response
+
+    # One past it, and the whole way to the accumulator's own ceiling, the
+    # reason is validation -- the field's range -- and not the bound.
+    for dim in (2**31, 2**32 - 1):
+        metadata = _row_meta(0, dtype="uint8", shape=[dim], token_start=0)
+        response = _submit_row(sink, metadata, b"", "uint8", [dim])
+        assert not response["ok"], (dim, response)
+        assert response["what"] == "capture metadata failed validation", (
+            dim, response)
+
+    # A legal dimension still packs.
+    metadata = _row_meta(0, dtype="uint8", shape=[64], token_start=0)
+    assert _submit_row(sink, metadata, bytes(64), "uint8", [64])["ok"]
+
+
 def test_submit_row_keeps_the_64_bit_boundaries_exact(sink, tmp_path):
     """Everything a 64-bit field can legally hold must still parse exactly."""
     _open(sink, tmp_path / "spool")
