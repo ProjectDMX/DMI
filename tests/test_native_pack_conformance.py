@@ -390,3 +390,87 @@ def test_native_pack_matches_recorded_golden_manifest():
     assert response["ok"], response
     assert response["data_sha256"] == expected
     assert hashlib.sha256(_unb64(response["data_b64"])).hexdigest() == expected
+
+
+# --- integer bounds ------------------------------------------------------------
+#
+# `test_native_matches_reference_with_null_and_escaped_text` pins the OTHER
+# side of this: step_number, token_end and captured_at_ns of 2**64 - 1 are
+# legal per model.py and must be packed exactly. Only a literal outside
+# [-2**63, 2**64 - 1] is unrepresentable, and FindInt reported it as -1 --
+# which the unsigned counters cast to 18446744073709551615 and max_records
+# read as "not given, use one million".
+
+
+def _one_record(**overrides) -> dict:
+    meta = dict(
+        capture_id="bounds-00", tenant_id="t", experiment_id="e", run_id="r",
+        session_id="s", request_id="q", sequence_id="n", model_id="m",
+        model_revision="mr", adapter_revision=None,
+        capture_policy_version="v", hook_name="h", layer_number=0,
+        producer_rank=0, step_number=0, token_start=0, token_end=1,
+        batch_position=0, dtype="uint8", shape=[4], captured_at_ns=1,
+    )
+    meta.update(overrides)
+    meta["payload_b64"] = _b64(b"\x00\x01\x02\x03")
+    return meta
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        # 2**64 + 1 wraps to 1: a plausible-looking counter is worse than a
+        # refusal, and CaptureMetadata raises on it.
+        ("captured_at_ns", 2**64 + 1),
+        ("step_number", 2**64),
+        ("token_end", 2**64 + 7),
+        ("producer_rank", 2**64 + 5),
+        ("batch_position", 2**64 + 5),
+        ("layer_number", 2**64 + 3),
+        # Below INT64_MIN by one; the negative branch has the wider limit.
+        ("token_start", -(2**63) - 1),
+        ("layer_number", -(2**63) - 1),
+        # A digit run far longer than any 64-bit value.
+        ("captured_at_ns", int("9" * 40)),
+        ("layer_number", -int("9" * 40)),
+    ],
+)
+def test_build_refuses_an_out_of_range_metadata_integer(field, value):
+    response = _native_build(
+        "018f0000-0000-7000-8000-00000000dead", 42, 8 * 1024 * 1024,
+        [_one_record(**{field: value})],
+    )
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert field in response["what"], response
+
+
+@pytest.mark.parametrize(
+    "field", ("created_at_ns", "max_pack_bytes", "max_records")
+)
+def test_build_refuses_an_out_of_range_request_integer(field):
+    request = {"created_at_ns": 42, "max_pack_bytes": 8 * 1024 * 1024,
+               "max_records": 16}
+    request[field] = 2**64 + 1
+    response = _native_build(
+        "018f0000-0000-7000-8000-00000000dead", request["created_at_ns"],
+        request["max_pack_bytes"], [_one_record()], request["max_records"],
+    )
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert field in response["what"], response
+
+
+def test_build_keeps_the_whole_unsigned_range_for_created_at_ns():
+    """2**64 - 1 is a legal created_at_ns, so the request field must hold it."""
+    from dmi.storage.capture import PackReader
+
+    for created in (0, 2**63 - 1, 2**63, 2**64 - 1):
+        response = _native_build(
+            "018f0000-0000-7000-8000-00000000dead", created, 8 * 1024 * 1024,
+            [_one_record()],
+        )
+        assert response["ok"], (created, response)
+        assert response["created_at_ns"] == created, response
+        reader = PackReader.from_bytes(_unb64(response["data_b64"]))
+        assert reader.created_at_ns == created, response

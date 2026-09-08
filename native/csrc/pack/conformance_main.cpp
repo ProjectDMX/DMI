@@ -28,10 +28,47 @@
 
 namespace jc = dmi_common;
 
+namespace {
+
+// The key of the first integer literal on this request that does not fit in
+// the 64-bit union, empty when there was none.
+//
+// The union itself is legal input and must stay so: step_number, token_start,
+// token_end and captured_at_ns are UInt64 in the catalog and CaptureMetadata
+// admits their whole range, so 2**64 - 1 has to be packed exactly. Only a
+// literal OUTSIDE [-2**63, 2**64 - 1] has no value at all, and FindInt
+// reported it as -1 -- which the unsigned counters cast to
+// 18446744073709551615 and `max_records` read as "not given, use one
+// million".
+std::string g_out_of_range;
+
+int64_t Integer(const std::string& text, const std::string& key) {
+  int64_t value = 0;
+  const jc::IntFind found = jc::FindIntChecked(text, key, &value);
+  if (found == jc::IntFind::kOutOfRange && g_out_of_range.empty()) {
+    g_out_of_range = key;
+  }
+  // kAbsent keeps FindInt's -1: layer_number == -1 is legal, and an absent
+  // max_records still means "one million".
+  return found == jc::IntFind::kOk ? value : -1;
+}
+
+}  // namespace
+
 int main() {
   std::string line;
   std::ios::sync_with_stdio(false);
+  // The refusal for an integer literal wider than 64 bits, in the same
+  // ok:false/what shape the driver already answers "bad base64",
+  // "missing records" and "unknown op" with.
+  const auto refuse_out_of_range = [] {
+    std::string escaped;
+    jc::EscapeJson("integer field " + g_out_of_range + " is out of range",
+                   &escaped);
+    std::cout << "{\"ok\":false,\"what\":" << escaped << "}\n";
+  };
   while (std::getline(std::cin, line)) {
+    g_out_of_range.clear();
     // Python json.dumps renders separators as ", " / ": "; accept both that
     // and the compact form when matching the op tag. The build request also
     // carries "crc32"-shaped text nowhere, so order is: ping, crc32, build.
@@ -72,7 +109,7 @@ int main() {
       return jc::FindString(line, k);
     };
     auto extract_int = [&](const std::string& k) -> int64_t {
-      return jc::FindInt(line, k);
+      return Integer(line, k);
     };
 
     // Parse the records array: "records": [ {...}, ... ] — with either
@@ -92,13 +129,19 @@ int main() {
       if (start != std::string::npos) record_texts.push_back(item);
     }
 
+    // Parsed before the builder exists: a size or a record cap that cannot
+    // be represented must not become UINT64_MAX or the default million.
+    const int64_t created_at_ns = extract_int("created_at_ns");
+    const int64_t max_pack_bytes = extract_int("max_pack_bytes");
+    const int64_t max_records = extract_int("max_records");
+    if (!g_out_of_range.empty()) {
+      refuse_out_of_range();
+      continue;
+    }
     dmi_pack::PackBuilder builder(
-        extract_string("pack_id"),
-        static_cast<uint64_t>(extract_int("created_at_ns")),
-        static_cast<uint64_t>(extract_int("max_pack_bytes")),
-        static_cast<uint64_t>(extract_int("max_records") > 0
-                                  ? extract_int("max_records")
-                                  : 1'000'000));
+        extract_string("pack_id"), static_cast<uint64_t>(created_at_ns),
+        static_cast<uint64_t>(max_pack_bytes),
+        static_cast<uint64_t>(max_records > 0 ? max_records : 1'000'000));
 
     auto meta_string = [&](const std::string& obj, const std::string& k) {
       // Shared FindString unescapes JSON escapes back to raw bytes, so the
@@ -109,7 +152,7 @@ int main() {
       return jc::FindNull(obj, k);
     };
     auto meta_int = [&](const std::string& obj, const std::string& k) -> int64_t {
-      return jc::FindInt(obj, k);
+      return Integer(obj, k);
     };
     auto meta_shape = [&](const std::string& obj) {
       std::vector<uint32_t> shape;
@@ -162,6 +205,9 @@ int main() {
       meta.dtype = meta_string(rt, "dtype");
       meta.shape = meta_shape(rt);
       meta.captured_at_ns = static_cast<uint64_t>(meta_int(rt, "captured_at_ns"));
+      // Nothing is appended once a counter has been read as unrepresentable:
+      // CaptureMetadata raises on these, so the pack must not exist either.
+      if (!g_out_of_range.empty()) break;
       // Append copies the payload into its buffer synchronously, so the
       // bytes only need to live through the call — a local per record.
       const std::vector<uint8_t> payload = meta_payload(rt);
@@ -175,6 +221,10 @@ int main() {
       }
     }
 
+    if (!g_out_of_range.empty()) {
+      refuse_out_of_range();
+      continue;
+    }
     if (!fail_status.empty()) {
       std::cout << "{\"ok\":false,\"status\":\"" << fail_status
                 << "\",\"what\":\"" << fail_what << "\"}\n";
