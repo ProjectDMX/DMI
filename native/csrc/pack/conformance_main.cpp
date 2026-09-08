@@ -164,13 +164,28 @@ int main() {
       for (const auto& item : jc::SplitElements(jc::Unwrap(jc::FindArray(obj, "shape")))) {
         size_t q = 0;
         while (q < item.size() && item[q] == ' ') ++q;
+        // Bounded like the scalars beside it, and for the same reason: this
+        // accumulator had none, so a dimension over 2**32 wrapped INTO range
+        // and the build SEALED a pack -- shape [4294967297] came out as (1,)
+        // and [4294967299] as (3,), where CaptureMetadata raises "shape
+        // dimensions must be integers in [0, 2^31 - 1]". The bound is the
+        // ACCUMULATOR's, not the field's: it refuses a literal with no
+        // uint32 to hold it and leaves 0 .. 2**31 - 1 to the builder's own
+        // validation, exactly as Integer bounds at 64 bits and leaves the
+        // field's range to ValidateMetadata. The report rides the existing
+        // out-of-range latch, which is already tested before Append.
         uint32_t v = 0;
         bool any = false;
+        bool over = false;
         while (q < item.size() && item[q] >= '0' && item[q] <= '9') {
-          v = v * 10 + static_cast<uint32_t>(item[q] - '0');
+          const uint32_t digit = static_cast<uint32_t>(item[q] - '0');
+          // "v * 10 + digit > UINT32_MAX", rearranged to not overflow itself.
+          if (v > (~uint32_t{0} - digit) / 10) over = true;
+          if (!over) v = v * 10 + digit;
           ++q;
           any = true;
         }
+        if (over && g_out_of_range.empty()) g_out_of_range = "shape";
         if (any) shape.push_back(v);
       }
       return shape;

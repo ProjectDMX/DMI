@@ -466,6 +466,83 @@ def test_build_refuses_an_out_of_range_request_integer(field):
     assert field in response["what"], response
 
 
+@pytest.mark.parametrize(
+    "dim",
+    [
+        # `meta_shape` accumulated the dimensions into a bare uint32_t while
+        # the scalars beside it went through the checked parse, so a
+        # dimension over 2**32 wrapped INTO range and the build SEALED a
+        # pack. CaptureMetadata raises "shape dimensions must be integers in
+        # [0, 2^31 - 1]" on all of these.
+        2**32 + 1,
+        2**32 + 3,
+        2**64 + 5,
+        # A digit run far longer than any 64-bit value still wraps to 7.
+        2**32 * 10**25 + 7,
+    ],
+)
+def test_build_refuses_a_shape_dimension_that_does_not_fit(dim):
+    wrapped = dim % 2**32
+    assert 0 < wrapped <= 2**31 - 1, wrapped
+    record = _one_record(shape=[dim])
+    record["payload_b64"] = _b64(bytes(wrapped))
+    response = _native_build(
+        "018f0000-0000-7000-8000-00000000dead", 42, 8 * 1024 * 1024, [record],
+    )
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert "shape" in response["what"], response
+    assert "data_b64" not in response, response
+    meta = dict(
+        capture_id="bounds-00", tenant_id="t", experiment_id="e", run_id="r",
+        session_id="s", request_id="q", sequence_id="n", model_id="m",
+        model_revision="mr", adapter_revision=None,
+        capture_policy_version="v", hook_name="h", layer_number=0,
+        producer_rank=0, step_number=0, token_start=0, token_end=1,
+        batch_position=0, dtype="uint8", shape=(dim,), captured_at_ns=1,
+    )
+    with pytest.raises(ValueError):
+        CaptureMetadata(**meta)
+
+
+def test_build_keeps_the_shape_dimension_boundary_exact():
+    """A legal wide dimension is refused by validation, not by the bound.
+
+    The bound is the accumulator's, exactly as it is for the scalars, so the
+    build cannot pass the test above by refusing every wide dimension: what
+    a uint32 holds must still reach the builder's own validation and be
+    reported as that.
+    """
+    for dim in (2**31, 2**32 - 1):
+        record = _one_record(shape=[dim])
+        response = _native_build(
+            "018f0000-0000-7000-8000-00000000dead", 42, 8 * 1024 * 1024,
+            [record],
+        )
+        assert not response["ok"], (dim, response)
+        assert "out of range" not in response.get("what", ""), (dim, response)
+        assert response.get("status"), (dim, response)
+
+    # 2**31 - 1 is the largest dimension CaptureMetadata admits, so the
+    # widest LEGAL dimension must still seal a pack. This is the accepting
+    # control: without it the op could pass the test above by refusing every
+    # wide dimension.
+    record = _one_record(shape=[2**31 - 1])
+    response = _native_build(
+        "018f0000-0000-7000-8000-00000000dead", 42, 8 * 1024 * 1024, [record],
+    )
+    assert response["ok"], response
+    assert response["record_count"] == 1, response
+
+    # A wholly ordinary record still seals a pack.
+    response = _native_build(
+        "018f0000-0000-7000-8000-00000000dead", 42, 8 * 1024 * 1024,
+        [_one_record()],
+    )
+    assert response["ok"], response
+    assert response["record_count"] == 1, response
+
+
 def test_build_keeps_the_whole_unsigned_range_for_created_at_ns():
     """2**64 - 1 is a legal created_at_ns, so the request field must hold it."""
     from dmi.storage.capture import PackReader
