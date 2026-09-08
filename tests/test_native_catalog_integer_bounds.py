@@ -94,9 +94,13 @@ def test_a_query_parameter_wider_than_64_bits_is_refused(arm, value):
     assert not response["ok"], response
     assert response["error"] == "ValueError", response
     # The refusal names the variant arm, which is the key the scan read --
-    # the parameter's own name never reaches the integer decode.
-    assert "does not fit" in response["message"], response
-    assert arm in response["message"], response
+    # the parameter's own name never reaches the integer decode. Pinned by
+    # equality, not `arm in message`: "int" is a substring of "uint", so the
+    # `int` arm's containment check passed against the `uint` message too,
+    # and a driver that read the wrong arm went unnoticed for half the
+    # parametrization.
+    assert response["message"] == f"{arm} does not fit a 64-bit integer", (
+        response)
 
 
 @pytest.mark.parametrize("value", IN_RANGE)
