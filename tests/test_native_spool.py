@@ -257,3 +257,87 @@ def test_remove_unaccounts(tmp_path):
     snap = _call(op="snapshot", root=str(tmp_path), max_bytes=MAX_BYTES)
     assert snap["snapshot"]["entries"] == 0
     assert not list(tmp_path.rglob("*.dmi-pack.ready"))
+
+
+# --- integer bounds ------------------------------------------------------------
+#
+# Every integer field on this protocol is 64-bit, and a literal that does not
+# fit has no value it could carry. FindInt handed each site -1, which
+# `max_bytes` read as "not given, use the 1 TiB default" and the StagedPack
+# counters cast to 18446744073709551615 -- so a defaulted or wrapped value came
+# back reported as success. Refuse instead, in the ok:false shape the driver
+# already answers a bad argument with.
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        # 2**64 + 1 wraps to 1: a plausible-looking timestamp is worse than a
+        # refusal.
+        ("created_at_ns", 2**64 + 1),
+        ("record_count", 2**64 + 1),
+        # A digit run far longer than any 64-bit value.
+        ("created_at_ns", int("9" * 40)),
+        # Below INT64_MIN by one; the negative branch has the wider limit.
+        ("created_at_ns", -(2**63) - 1),
+        # max_bytes' -1 became the default, so a capacity limit the caller
+        # asked for was never applied.
+        ("max_bytes", 2**64 + 1),
+        ("max_bytes", -(2**63) - 1),
+    ],
+)
+def test_stage_refuses_an_out_of_range_integer(tmp_path, field, value):
+    data, checksum, count = _golden_pack()
+    fields = dict(
+        op="stage", root=str(tmp_path), max_bytes=MAX_BYTES,
+        pack_id=str(PACK_ID), created_at_ns=1_700_000_000_000_000_000,
+        record_count=count, checksum=checksum, object_key=OBJECT_KEY,
+        data_b64=base64.b64encode(data).decode(),
+    )
+    fields[field] = value
+    response = _call(**fields)
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert field in response["what"], response
+    assert not list(tmp_path.rglob("*.dmi-pack.ready"))
+
+
+def test_remove_refuses_an_out_of_range_integer_in_the_staged_object(tmp_path):
+    """The nested StagedPack is decoded by the same helper, so it refuses too."""
+    data, checksum, count = _golden_pack()
+    staged = _call(
+        op="stage", root=str(tmp_path), max_bytes=MAX_BYTES,
+        pack_id=str(PACK_ID), created_at_ns=1_700_000_000_000_000_000,
+        record_count=count, checksum=checksum, object_key=OBJECT_KEY,
+        data_b64=base64.b64encode(data).decode(),
+    )["staged"]
+    staged["object_bytes"] = 2**64 + 1
+    response = _call(op="remove", root=str(tmp_path), max_bytes=MAX_BYTES,
+                     staged=staged)
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    # Nothing was removed on a refusal: the entry is still accounted for.
+    snap = _call(op="snapshot", root=str(tmp_path), max_bytes=MAX_BYTES)
+    assert snap["snapshot"]["entries"] == 1, snap
+
+
+@pytest.mark.parametrize("value", [2**64 - 1, 2**63, 2**63 - 1, 1, 0])
+def test_stage_keeps_a_created_at_ns_of_any_64_bit_width(tmp_path, value):
+    """The union range must survive the parse bit for bit, not int64's half.
+
+    `created_at_ns` rides the ready-file name, so staging a value above
+    INT64_MAX and recovering it is what proves the two's-complement bit
+    pattern is recovered exactly rather than clamped or refused.
+    """
+    data, checksum, count = _golden_pack()
+    response = _call(
+        op="stage", root=str(tmp_path), max_bytes=MAX_BYTES,
+        pack_id=str(PACK_ID), created_at_ns=value,
+        record_count=count, checksum=checksum, object_key=OBJECT_KEY,
+        data_b64=base64.b64encode(data).decode(),
+    )
+    assert response["ok"], response
+    assert response["staged"]["created_at_ns"] == value, response
+    recovered = _call(op="recover", root=str(tmp_path), max_bytes=MAX_BYTES)
+    assert recovered["ok"], recovered
+    assert recovered["staged"][0]["created_at_ns"] == value, recovered
