@@ -62,15 +62,22 @@ namespace {
 // accumulator has already overflowed -- undefined behaviour, in practice a
 // wrap modulo 2^64 -- by the time any check on its result could run, and the
 // literal's value is gone.
-IntFind ScanInt(const std::string& text, size_t q, int64_t* out) {
+IntFind ScanInt(const std::string& text, size_t q, int64_t* out,
+                IntDomain domain) {
   bool neg = false;
   if (q < text.size() && text[q] == '-') {
     neg = true;
     ++q;
   }
-  // A positive literal may use the whole unsigned range; a negative one stops
-  // at 2^63 == |INT64_MIN|, which is one larger than INT64_MAX.
-  const uint64_t limit = neg ? (uint64_t{1} << 63) : ~uint64_t{0};
+  // A negative literal stops at 2^63 == |INT64_MIN| in either domain, which
+  // is one larger than INT64_MAX. A positive one may use the whole unsigned
+  // range under kUnion, but only up to INT64_MAX under kSigned -- past that
+  // the bit pattern is negative, and a signed destination cannot tell that
+  // apart from a literal the caller really did write with a minus sign.
+  const uint64_t limit = neg ? (uint64_t{1} << 63)
+                             : (domain == IntDomain::kSigned
+                                    ? (uint64_t{1} << 63) - 1
+                                    : ~uint64_t{0});
   uint64_t magnitude = 0;
   bool any = false;
   bool over = false;
@@ -96,12 +103,12 @@ IntFind ScanInt(const std::string& text, size_t q, int64_t* out) {
 }  // namespace
 
 IntFind FindIntChecked(const std::string& text, const std::string& key,
-                       int64_t* out) {
+                       int64_t* out, IntDomain domain) {
   for (const char* sep : {": ", ":"}) {
     const std::string needle = "\"" + key + "\"" + sep;
     const size_t at = text.find(needle);
     if (at == std::string::npos) continue;
-    const IntFind found = ScanInt(text, at + needle.size(), out);
+    const IntFind found = ScanInt(text, at + needle.size(), out, domain);
     // No digits under this separator style: try the other one.
     if (found == IntFind::kAbsent) continue;
     return found;

@@ -29,6 +29,22 @@ enum class IntFind {
   kOutOfRange,  // the literal does not fit in 64 bits at all
 };
 
+// Which half of the 64-bit union a caller is willing to be handed.
+//
+// The union is the right default -- see FindIntChecked below -- but only for
+// a field whose destination type is unsigned. A field the oracle types as
+// SIGNED must say so, because the two's-complement bit pattern the union
+// returns is indistinguishable from a negative literal once the sign of the
+// input is gone: layer_number reads its int64 straight, so
+// 18446744073709551615 arrives as -1, which is that field's legal "no layer"
+// sentinel and is admitted. The sign is only knowable while the literal is
+// still text, so the domain has to be declared here rather than checked by
+// the caller afterwards.
+enum class IntDomain {
+  kUnion,   // [-2^63, 2^64-1] -- the default; unsigned destinations
+  kSigned,  // [-2^63, 2^63-1] -- destinations the oracle types as signed
+};
+
 // First integer value for `key` (either separator style), bounded before it
 // can overflow.
 //
@@ -36,13 +52,15 @@ enum class IntFind {
 // [-2^63, 2^64-1] -- and stores the two's-complement bit pattern, so callers
 // that read the result back as uint64_t recover values above INT64_MAX
 // exactly (step_number, token_start/end and captured_at_ns are UInt64 in the
-// catalog, and CaptureMetadata admits their whole range).
+// catalog, and CaptureMetadata admits their whole range). Pass
+// IntDomain::kSigned to accept only the signed half.
 //
-// A literal outside that union is kOutOfRange. It is not representable in 64
-// bits, so there is no int64_t this function could return that would be the
-// right answer: only the caller can decide how to refuse.
+// A literal outside the requested domain is kOutOfRange. It is not
+// representable in the type the caller asked for, so there is no int64_t this
+// function could return that would be the right answer: only the caller can
+// decide how to refuse.
 IntFind FindIntChecked(const std::string& text, const std::string& key,
-                       int64_t* out);
+                       int64_t* out, IntDomain domain = IntDomain::kUnion);
 
 // True when `key` is present with any value (either separator style).
 // Needed where -1 is a legal value (layer_number) and the -1 that

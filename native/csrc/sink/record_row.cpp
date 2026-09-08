@@ -67,14 +67,22 @@ bool ParseMetadataJson(const std::string& text,
   // packed. CaptureMetadata raises on these, so refuse the row instead.
   // kAbsent cannot mean "missing" here (HasKey already ran) -- it is a
   // present-but-not-an-integer value, which keeps its historical -1.
+  //
+  // layer_number is the one field here the oracle types as SIGNED (Int32),
+  // and it reads the int64 straight, so it must not be handed the unsigned
+  // half of the union: 18446744073709551615 is the bit pattern -1, which is
+  // this field's legal "no layer" sentinel, and ValidateMetadata -- which
+  // only refuses < -1 or > 2**31 - 1 -- admits it. It is the SINGLE aliasing
+  // input, since 2**64 - 2 lands on -2 and 2**63 on INT64_MIN, both refused.
   bool out_of_range = false;
-  auto integer = [&](const char* name) -> int64_t {
+  auto integer = [&](const char* name,
+                     jc::IntDomain domain = jc::IntDomain::kUnion) -> int64_t {
     int64_t value = 0;
-    const jc::IntFind found = jc::FindIntChecked(text, name, &value);
+    const jc::IntFind found = jc::FindIntChecked(text, name, &value, domain);
     if (found == jc::IntFind::kOutOfRange) out_of_range = true;
     return found == jc::IntFind::kOk ? value : -1;
   };
-  const int64_t layer = integer("layer_number");
+  const int64_t layer = integer("layer_number", jc::IntDomain::kSigned);
   const int64_t producer = integer("producer_rank");
   const int64_t step = integer("step_number");
   const int64_t token_start = integer("token_start");

@@ -492,6 +492,15 @@ def test_submit_row_rejects_mismatches(sink, tmp_path):
         ("batch_position", 2**64 + 5),
         # 2**64 + 3 wraps to 3, a legal layer index.
         ("layer_number", 2**64 + 3),
+        # 2**64 - 1 is INSIDE the 64-bit union the parse accepts, so it is not
+        # caught by any of the above: its two's-complement bit pattern is -1,
+        # which is layer_number's legal "no layer" sentinel, and the bound
+        # ValidateMetadata applies (>= -1) admits it. It is the single input
+        # that aliases -- 2**64 - 2 lands on -2 and 2**63 on INT64_MIN, both
+        # refused -- which is why the wider literals above all miss it. The
+        # union stays legal for the UInt64 counters; only a SIGNED field must
+        # refuse the unsigned half.
+        ("layer_number", 2**64 - 1),
         # Below INT64_MIN by one; the negative branch has the wider limit.
         ("token_start", -(2**63) - 1),
         ("layer_number", -(2**63) - 1),
@@ -511,6 +520,12 @@ def test_submit_row_refuses_out_of_range_integers(sink, tmp_path, field, value):
     assert "out of range" in response["what"], response
     snapshot = sink.call(op="close", timeout=30)["snapshot"]
     assert snapshot["persisted_records"] == 0
+    # The oracle is what makes this a parity bug rather than a taste call.
+    mapping = _meta(0).to_mapping()
+    mapping.update(overrides)
+    mapping["shape"] = tuple(mapping["shape"])
+    with pytest.raises(ValueError):
+        CaptureMetadata(**mapping)
 
 
 def test_submit_row_keeps_the_64_bit_boundaries_exact(sink, tmp_path):
