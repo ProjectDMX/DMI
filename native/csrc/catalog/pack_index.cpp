@@ -506,8 +506,20 @@ std::vector<std::string> read_pack_descriptor_rows(
   if (jc::FindString(footer_text, "format") != "dmi-pack") {
     format_error("pack footer has an invalid format marker");
   }
-  if (jc::FindInt(footer_text, "major_version") != major ||
-      jc::FindInt(footer_text, "minor_version") != minor) {
+  // `decoded.get(...) != major` refuses absent, wrongly-typed and simply
+  // wrong versions alike, so this port refuses on anything that is not the
+  // trailer's own number. A literal too wide for 64 bits is one of those:
+  // FindIntChecked reports it as such instead of leaning on FindInt's -1,
+  // which mismatched only because the trailer's version is a uint16 and can
+  // never BE -1. The verdict is unchanged; what it rests on is not.
+  const auto footer_version = [&footer_text](const char* key,
+                                             uint16_t expected) {
+    int64_t value = 0;
+    return jc::FindIntChecked(footer_text, key, &value) == jc::IntFind::kOk &&
+           value == static_cast<int64_t>(expected);
+  };
+  if (!footer_version("major_version", major) ||
+      !footer_version("minor_version", minor)) {
     format_error("pack footer version does not match the trailer");
   }
   const std::string footer_pack_id = jc::FindString(footer_text, "pack_id");
