@@ -109,11 +109,6 @@ IntFind FindIntChecked(const std::string& text, const std::string& key,
   return IntFind::kAbsent;
 }
 
-int64_t FindInt(const std::string& text, const std::string& key) {
-  int64_t value = 0;
-  return FindIntChecked(text, key, &value) == IntFind::kOk ? value : -1;
-}
-
 bool HasKey(const std::string& text, const std::string& key) {
   for (const char* sep : {": ", ":"}) {
     if (text.find("\"" + key + "\"" + sep) != std::string::npos) return true;

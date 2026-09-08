@@ -44,18 +44,9 @@ enum class IntFind {
 IntFind FindIntChecked(const std::string& text, const std::string& key,
                        int64_t* out);
 
-// First integer value for `key` (either separator style).
-//
-// Returns -1 when the key is absent -- and also when the literal is out of
-// range, because one int64_t cannot distinguish the two. That is a refusal,
-// never a wrapped value, but a caller for which -1 means "use the default"
-// will silently take the default. Use FindIntChecked wherever an out-of-range
-// literal has to be reported rather than defaulted.
-int64_t FindInt(const std::string& text, const std::string& key);
-
 // True when `key` is present with any value (either separator style).
-// Needed where -1 is a legal value (layer_number) and FindInt's missing
-// sentinel would collide with it.
+// Needed where -1 is a legal value (layer_number) and the -1 that
+// FindIntChecked's callers use for kAbsent would collide with it.
 bool HasKey(const std::string& text, const std::string& key);
 
 // First boolean value for `key`.
