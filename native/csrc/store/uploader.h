@@ -84,8 +84,11 @@ class SpoolUploader {
   SpoolUploader& operator=(const SpoolUploader&) = delete;
 
   // Recover the spool and upload every entry (or the first `limit`, which
-  // must be positive when set). Packs over max_in_flight_bytes are refused
-  // up front — a pack that can never be admitted must not stall the batch.
+  // must be positive when set). A pack over max_in_flight_bytes is recorded
+  // as a failure at its own position and the rest of the batch still
+  // uploads; the return carries no batch-level error. Note this DIVERGES
+  // from the Python uploader, which refuses the whole batch up front and
+  // uploads nothing — see the comment at the byte gate in uploader.cpp.
   UploadBatchResult UploadPending(int limit = -1);
 
   // Upload one staged entry with retry. Public for tests.

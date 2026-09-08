@@ -234,8 +234,23 @@ UploadBatchResult SpoolUploader::UploadPending(int limit) {
   result.failures.assign(pending.size(), UploadFailure{});
   for (size_t i = 0; i < pending.size(); ++i) {
     if (pending[i].object_bytes > config_.max_in_flight_bytes) {
-      // A pack that can never be admitted must fail the batch loudly, not
-      // stall it: same rule as the Python uploader's up-front refusal.
+      // A pack that can never be admitted is recorded at its own position
+      // and the rest of the batch still uploads.
+      //
+      // This is NOT the oracle's rule, and the comment here used to claim
+      // it was. `ParallelSpoolUploader.upload_pending` raises ValueError
+      // before it starts any work, so Python uploads nothing and leaves
+      // every pack staged. Measured on one batch of three small packs plus
+      // one oversized: Python raised with 0 objects uploaded and all 4
+      // still staged; this code returns ok with 3 uploaded and 1 staged.
+      //
+      // Which policy is right is an open question -- refusing the whole
+      // batch is the oracle's contract, while per-pack accounting lets a
+      // misconfigured limit make progress -- so the behaviour is left as
+      // it is and only the false parity claim is removed. Two tests pin
+      // the current shape (test_pack_over_the_byte_gate_fails_fast,
+      // test_mixed_batch_reports_oversized_pack_at_its_position), and
+      // docs/benchmarks.md records the accounting decision behind it.
       result.failures[i] = {pending[i].pack_id, pending[i].object_key, 0,
                             "pack exceeds the in-flight byte limit"};
       ++result.snapshot.attempted_packs;
