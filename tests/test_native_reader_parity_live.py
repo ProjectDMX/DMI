@@ -629,14 +629,26 @@ def test_search_refusal_parity_on_filter_text():
     an empty tenant_id rendered ``AND `tenant_id` = ''`` and came back as a
     successful empty page -- a caller error answered as data -- and a 10 KB
     run_id was shipped to the server rather than refused.
+
+    The staged rows carry the 512-byte run_id and, for half of them, the
+    512-byte hook_name, so the accepted-edge control at the bottom selects
+    real rows. It used to filter on 512-byte values nothing was staged with,
+    which made its parity assertion ``[] == []``.
     """
     from dmi.storage.capture.model import CaptureQuery
+
+    long_run = "x" * 512
+    long_hook = "y" * 512
 
     with _catalog() as (client, config, prefix):
         driver = CatalogDriver()
         try:
             _open_helper(driver, prefix)
-            _publish_native(driver, prefix, _descriptor_dicts(4), 7)
+            # hook= lands on the even rows; the odd ones stay "other_hook".
+            descriptors = _descriptor_dicts(4, hook=long_hook)
+            for entry in descriptors:
+                entry["run_id"] = long_run
+            _publish_native(driver, prefix, descriptors, 7)
 
             oversized = "x" * 513
             cases = (
@@ -666,13 +678,17 @@ def test_search_refusal_parity_on_filter_text():
                     CaptureQuery(limit=100, **python_fields)
 
             # The bound bites only past the edge: 512 bytes is ACCEPTED, and
-            # both readers answer the same (empty) page for it.
-            edge = {"run_id": "x" * 512, "hook_names": ["y" * 512]}
+            # both readers serve the same page for it. The page is non-empty
+            # and is a strict subset of the four staged rows, so the parity
+            # assertion compares selected rows rather than two empty lists.
+            edge = {"run_id": long_run, "hook_names": [long_hook]}
             native = driver.call(op="search", limit=100, **edge)
             assert native["ok"], native
             page = _python_page_items(
                 _python_reader(client, config), limit=100,
                 run_id=edge["run_id"], hook_names=tuple(edge["hook_names"]))
+            assert len(page.items) == 2, page.items
+            assert len(native["items"]) == 2, native
             assert _normalize(native["items"]) == _normalize(page.items)
         finally:
             driver.close()
