@@ -818,6 +818,131 @@ def test_submit_refuses_out_of_range_metadata_integers(sink, tmp_path, field,
 
 
 @pytest.mark.parametrize(
+    "dim",
+    [
+        # ParseMetadata puts the seven scalars above through the checked
+        # parse and then accumulates the shape dimensions into a bare
+        # uint32_t seven lines below them, with no bound -- the same defect
+        # the row path carried at record_row.cpp and the pack driver carries
+        # at meta_shape. A dimension over 2**32 wraps INTO range: [2**32 + 1]
+        # arrived as (1,) and was admitted and persisted, where
+        # CaptureMetadata raises "shape dimensions must be integers in
+        # [0, 2^31 - 1]".
+        2**32 + 1,
+        2**32 + 3,
+        2**64 + 5,
+        # A digit run far longer than any 64-bit value still wraps to 7.
+        2**32 * 10**25 + 7,
+    ],
+)
+def test_submit_refuses_a_shape_dimension_that_does_not_fit(sink, tmp_path,
+                                                            dim):
+    """The mapping path must refuse the dimension the row path refuses."""
+    _open(sink, tmp_path / "spool")
+    wrapped = dim % 2**32
+    assert 0 < wrapped <= 2**31 - 1, wrapped
+    mapping = _meta(0, dtype="uint8", shape=(64,)).to_mapping()
+    mapping["shape"] = [dim]
+    response = sink.call(
+        op="submit", metadata=mapping,
+        payload_b64=base64.b64encode(bytes(wrapped)).decode(),
+    )
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert "shape" in response["what"], response
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["submitted_records"] == 0, snapshot
+    assert snapshot["persisted_records"] == 0, snapshot
+    oracle = _meta(0).to_mapping()
+    oracle.update(dtype="uint8", shape=(dim,))
+    with pytest.raises(ValueError):
+        CaptureMetadata(**oracle)
+
+
+def test_submit_keeps_the_shape_dimension_boundary_exact(sink, tmp_path):
+    """A legal wide dimension still reaches the sink.
+
+    The bound is the accumulator's, exactly as it is for the scalars: it
+    refuses a literal with no uint32 to hold it and nothing narrower, so
+    this op cannot pass the test above by refusing every wide dimension.
+    """
+    _open(sink, tmp_path / "spool")
+    # A wholly ordinary row still packs, first: the wide dimensions below
+    # describe more bytes than they carry, which latches the sink on the
+    # packing thread -- a separate concern from this parse.
+    assert _submit(sink, CaptureRecord(_meta(1), bytes(64))) == "accepted"
+    for dim in (0, 1, 2**31 - 1, 2**32 - 1):
+        mapping = _meta(0, dtype="uint8", shape=(64,)).to_mapping()
+        mapping["shape"] = [dim]
+        response = sink.call(
+            op="submit", metadata=mapping,
+            payload_b64=base64.b64encode(b"").decode(),
+        )
+        assert response["ok"], (dim, response)
+        assert "admission" in response, (dim, response)
+
+
+@pytest.mark.parametrize(
+    "dim",
+    [
+        # The FOURTH accumulation of the same class: submit_row's ENVELOPE
+        # shape, an int64_t. It wraps modulo 2**64, not 2**32, so the 32-bit
+        # witnesses above do NOT wrap here -- 2**32 + 1 fits an int64 and
+        # correctly mismatches the metadata. Only a literal past the 64-bit
+        # accumulator aliases, and it aliases ONTO the metadata dimension,
+        # which is what carried it past the envelope/metadata agreement check
+        # and into a pack: 2**64 + 1 against metadata shape [1] returned
+        # {"ok": true} and persisted 1 record.
+        2**64 + 1,
+        2**64 + 3,
+        2**64 * 10**6 + 7,
+    ],
+)
+def test_submit_row_refuses_an_envelope_dimension_that_does_not_fit(
+        sink, tmp_path, dim):
+    _open(sink, tmp_path / "spool")
+    aliased = dim % 2**64
+    assert 0 < aliased <= 2**31 - 1, aliased
+    metadata = _row_meta(0, dtype="uint8", shape=[aliased], token_start=0)
+    response = _submit_row(sink, metadata, bytes(aliased), "uint8", [dim])
+    assert not response["ok"], response
+    assert "out of range" in response["what"], response
+    assert "shape" in response["what"], response
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == 0, snapshot
+    oracle = _meta(0).to_mapping()
+    oracle.update(dtype="uint8", shape=(dim,), token_start=0)
+    with pytest.raises(ValueError):
+        CaptureMetadata(**oracle)
+
+
+def test_submit_row_keeps_the_envelope_dimension_boundary_exact(sink,
+                                                                tmp_path):
+    """INT64_MAX is what the envelope accumulator holds, so it must parse.
+
+    Past the metadata's own range the answer must stay "envelope shape !=
+    metadata shape" -- the mismatch -- and not become an unrepresentable
+    literal, so this op cannot pass the test above by refusing every wide
+    envelope dimension.
+    """
+    _open(sink, tmp_path / "spool")
+    for dim in (2**31, 2**32 + 1, 2**63 - 1):
+        metadata = _row_meta(0, dtype="uint8", shape=[1], token_start=0)
+        response = _submit_row(sink, metadata, b"\x00", "uint8", [dim])
+        assert not response["ok"], (dim, response)
+        assert response["what"] == "envelope shape != metadata shape", (
+            dim, response)
+    # 2**63 wraps to INT64_MIN, which the negative check already catches --
+    # it must stay a mismatch too, not become an accepted dimension.
+    metadata = _row_meta(0, dtype="uint8", shape=[1], token_start=0)
+    response = _submit_row(sink, metadata, b"\x00", "uint8", [2**63])
+    assert not response["ok"], response
+    # A legal row still packs.
+    metadata = _row_meta(1, dtype="uint8", shape=[64], token_start=1)
+    assert _submit_row(sink, metadata, bytes(64), "uint8", [64])["ok"]
+
+
+@pytest.mark.parametrize(
     "field", ("step_number", "token_start", "token_end", "captured_at_ns")
 )
 def test_submit_admits_the_whole_unsigned_range(sink, tmp_path, field):

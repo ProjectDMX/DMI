@@ -17,6 +17,7 @@
 
 #include "pack_sink.h"
 
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -87,13 +88,27 @@ dmi_pack::RecordMetadata ParseMetadata(const std::string& obj) {
            jc::Unwrap(jc::FindArray(obj, "shape")))) {
     size_t q = 0;
     while (q < item.size() && item[q] == ' ') ++q;
+    // Bounded like the scalars above, and for the same reason: this
+    // accumulator had none, so a dimension over 2**32 wrapped INTO range and
+    // [2**32 + 1] was admitted and persisted as (1,) where CaptureMetadata
+    // raises "shape dimensions must be integers in [0, 2^31 - 1]". The bound
+    // is the ACCUMULATOR's, not the field's -- it refuses a literal with no
+    // uint32 to hold it and leaves 0 .. 2**31 - 1 to the pack layer, exactly
+    // as FindIntChecked bounds at 64 bits and leaves the field's range to
+    // ValidateMetadata. The report rides the existing out-of-range latch, so
+    // it lands before Submit the way every other refusal here does.
     uint32_t v = 0;
     bool any = false;
+    bool over = false;
     while (q < item.size() && item[q] >= '0' && item[q] <= '9') {
-      v = v * 10 + static_cast<uint32_t>(item[q] - '0');
+      const uint32_t digit = static_cast<uint32_t>(item[q] - '0');
+      // "v * 10 + digit > UINT32_MAX", rearranged to not overflow itself.
+      if (v > (~uint32_t{0} - digit) / 10) over = true;
+      if (!over) v = v * 10 + digit;
       ++q;
       any = true;
     }
+    if (over && g_out_of_range.empty()) g_out_of_range = "shape";
     if (any) m.shape.push_back(v);
   }
   m.captured_at_ns =
@@ -255,14 +270,36 @@ int main() {
                jc::Unwrap(jc::FindArray(line, "shape")))) {
         size_t q = 0;
         while (q < item.size() && item[q] == ' ') ++q;
+        // The fourth accumulation of this class, and the only one over a
+        // SIGNED accumulator: it wraps modulo 2**64, so the 32-bit witnesses
+        // that catch the three uint32 sites do not reach it -- 2**32 + 1
+        // fits an int64 and correctly mismatches the metadata. What aliases
+        // is a literal past 2**63 - 1, and it aliases ONTO the metadata's own
+        // dimension, which is exactly what carried it past the
+        // envelope/metadata agreement check in SubmitRow and into a pack:
+        // envelope [2**64 + 1] against metadata shape [1] answered ok and
+        // persisted the record. Signed overflow is undefined besides, so the
+        // bound has to be tested before the multiply rather than after.
         int64_t v = 0;
         bool any = false;
+        bool over = false;
         while (q < item.size() && item[q] >= '0' && item[q] <= '9') {
-          v = v * 10 + (item[q] - '0');
+          const int64_t digit = static_cast<int64_t>(item[q] - '0');
+          // "v * 10 + digit > INT64_MAX", rearranged to not overflow itself.
+          if (v > (INT64_MAX - digit) / 10) over = true;
+          if (!over) v = v * 10 + digit;
           ++q;
           any = true;
         }
+        if (over && g_out_of_range.empty()) g_out_of_range = "shape";
         if (any) input.shape.push_back(v);
+      }
+      // Before SubmitRow: an envelope dimension with no int64 to hold it is
+      // not a shape mismatch to report, it is a literal the protocol cannot
+      // carry, and nothing may be admitted on it.
+      if (!g_out_of_range.empty()) {
+        refuse_out_of_range();
+        continue;
       }
       std::string detail;
       const dmi_sink::RowStatus status =
