@@ -181,11 +181,11 @@ def _dead_server_session():
     )
 
 
-@pytest.mark.parametrize(
-    "field", ("max_rows_to_read", "max_bytes_to_read", "max_execution_time_s"),
-)
-def test_a_reader_bound_wider_than_64_bits_is_refused(field):
-    """-1 lifted a read bound to UINT64_MAX -- the opposite of a bound."""
+READ_BOUNDS = ("max_rows_to_read", "max_bytes_to_read", "max_execution_time_s")
+
+
+def _watermark_with(field, value) -> dict:
+    """One `current_watermark` against the dead server, carrying field=value."""
     session = _dead_server_session()
     try:
         session.stdin.write(json.dumps({
@@ -197,14 +197,41 @@ def test_a_reader_bound_wider_than_64_bits_is_refused(field):
         session.stdin.flush()
         assert json.loads(session.stdout.readline())["ok"]
         session.stdin.write(json.dumps({
-            "op": "current_watermark", field: 2**64 + 1,
+            "op": "current_watermark", field: value,
         }) + "\n")
         session.stdin.flush()
-        response = json.loads(session.stdout.readline())
+        return json.loads(session.stdout.readline())
     finally:
         session.stdin.close()
         session.wait(timeout=30)
+
+
+@pytest.mark.parametrize("field", READ_BOUNDS)
+def test_a_reader_bound_wider_than_64_bits_is_refused(field):
+    """-1 lifted a read bound to UINT64_MAX -- the opposite of a bound."""
+    response = _watermark_with(field, 2**64 + 1)
     assert not response["ok"], response
     assert response["error"] == "ValueError", response
     assert "does not fit" in response["message"], response
     assert field in response["message"], response
+
+
+@pytest.mark.parametrize("value", [2**63, 2**64 - 1])
+@pytest.mark.parametrize("field", READ_BOUNDS)
+def test_a_reader_bound_keeps_the_whole_union(field, value):
+    """The accepting half this file's docstring promises and never asserted.
+
+    Without the mirror, the refusal above cannot tell "refuses the literal
+    it cannot represent" from "refuses this key at all", and a driver
+    narrowed to INT64_MAX would pass the whole file. These three settings
+    are UInt64 on the server, so 2**63 and 2**64 - 1 have to travel.
+
+    `_dead_server_session` supplies the discriminator its own docstring
+    names: a ValueError is the refusal, a ClickHouseError is the connection
+    the driver went on to attempt with the bound accepted and attached.
+    Only `max_rows_to_read` had a positive test anywhere before this, and
+    only at 4242424 (`test_the_watermark_read_carries_the_configured_bounds`).
+    """
+    response = _watermark_with(field, value)
+    assert not response["ok"], response
+    assert response["error"] == "ClickHouseError", response
