@@ -30,7 +30,8 @@ namespace jc = dmi_common;
 // bits, empty when there was none. One latch per line is enough: the driver
 // is single-threaded and handles one op per line.
 //
-// FindInt reported such a literal as -1, which is a legal value here for
+// The since-removed FindInt wrapper reported such a literal as -1, which is
+// a legal value here for
 // nothing at all: every field is cast straight to uint64_t, so -1 became
 // 18446744073709551615 -- for `max_bytes` an effectively unlimited spool
 // rather than the capacity the caller asked for (the 1 TiB fallback is
@@ -45,7 +46,7 @@ int64_t Integer(const std::string& text, const char* key) {
   if (found == jc::IntFind::kOutOfRange && g_out_of_range.empty()) {
     g_out_of_range = key;
   }
-  // kAbsent keeps FindInt's -1, which is what an absent key answered before.
+  // kAbsent keeps answering -1, which is what an absent key answered before.
   return found == jc::IntFind::kOk ? value : -1;
 }
 

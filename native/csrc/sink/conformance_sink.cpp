@@ -34,7 +34,8 @@ namespace {
 // 64-bit union, empty when there was none. One latch per line is enough: the
 // driver is single-threaded and handles one op per line.
 //
-// FindInt reported such a literal as -1, and every site here read that as
+// The since-removed FindInt wrapper reported such a literal as -1, and every
+// site here read that as
 // something legal: the unsigned `open` limits cast it to
 // 18446744073709551615, `num_workers` fell back to 1, ObjectKeyFor rendered
 // rank=18446744073709551615, and a metadata counter wrapped modulo 2**64 and
@@ -48,7 +49,7 @@ int64_t Integer(const std::string& text, const char* key) {
   if (found == jc::IntFind::kOutOfRange && g_out_of_range.empty()) {
     g_out_of_range = key;
   }
-  // kAbsent keeps FindInt's -1: layer_number == -1 is legal, and an absent
+  // kAbsent keeps answering -1: layer_number == -1 is legal, and an absent
   // num_workers still means "one".
   return found == jc::IntFind::kOk ? value : -1;
 }

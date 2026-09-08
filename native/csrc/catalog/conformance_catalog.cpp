@@ -81,7 +81,7 @@ int64_t field_int(const std::string& text, const char* key) {
     throw CatalogError(CatalogError::Kind::kValue,
                        std::string(key) + " does not fit a 64-bit integer");
   }
-  // kAbsent keeps FindInt's -1: `limit` and `layer_number` both use it.
+  // kAbsent keeps answering -1: `limit` and `layer_number` both use it.
   return found == jc::IntFind::kOk ? value : -1;
 }
 

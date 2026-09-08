@@ -48,7 +48,7 @@ int64_t Integer(const std::string& text, const std::string& key) {
   if (found == jc::IntFind::kOutOfRange && g_out_of_range.empty()) {
     g_out_of_range = key;
   }
-  // kAbsent keeps FindInt's -1: layer_number == -1 is legal, and an absent
+  // kAbsent keeps answering -1: layer_number == -1 is legal, and an absent
   // max_records still means "one million".
   return found == jc::IntFind::kOk ? value : -1;
 }

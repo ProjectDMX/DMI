@@ -36,7 +36,8 @@ namespace jc = dmi_common;
 // 64-bit union, empty when there was none. One latch per line is enough: the
 // driver is single-threaded and handles one op per line.
 //
-// FindInt reported such a literal as -1, and -1 is a legal answer for none of
+// The since-removed FindInt wrapper reported such a literal as -1, and -1 is
+// a legal answer for none of
 // these fields. The fields tested for "> 0" as a stand-in for "was it given"
 // silently fell back to their defaults -- 5s, 120s, 4 attempts, 4 workers,
 // and the multipart sizes. The fields cast straight to uint64_t became
@@ -52,7 +53,7 @@ int64_t Integer(const std::string& text, const char* key) {
   if (found == jc::IntFind::kOutOfRange && g_out_of_range.empty()) {
     g_out_of_range = key;
   }
-  // kAbsent keeps FindInt's -1: an absent timeout still means "default", and
+  // kAbsent keeps answering -1: an absent timeout still means "default", and
   // upload_pending's limit of -1 means "no limit".
   return found == jc::IntFind::kOk ? value : -1;
 }
