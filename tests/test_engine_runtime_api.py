@@ -711,3 +711,73 @@ def test_capture_backend_defaults_to_the_native_pack_sink(monkeypatch, tmp_path)
     assert len(used_sinks) == 1
     assert used_sinks[0].kwargs["spool_root"] == sink_config.spool_root
     assert runtime is not None
+
+
+# --- the sink extension's RecordSink base is bound once, at import ------------
+#
+# _dmi_native_sink derives NativePackSink from the ring RecordSink the MAIN
+# backend registers, which is what makes the sink pass this engine's
+# isinstance check and inherit `_acquire_engine`. That binding is chosen when
+# the extension initialises and is final for the process: if the main backend
+# was unreachable then, the sink bound its own stand-in, and a main backend
+# arriving later does not re-parent it -- no registration collision, just an
+# isinstance that is quietly False and a refusal that blames the sink rather
+# than the import order. Measured against two extensions built from one
+# pybind11, in all three orders. The loader says so precisely instead.
+
+
+def _sink_loader_with(monkeypatch, *, main_backend, stand_ins):
+    """The sink loader against a stubbed transport module."""
+    import dmi.transport
+    from dmi.storage.capture import native_sink
+
+    fake = ModuleType("dmi.transport.native")
+
+    def _load_extension():
+        if not main_backend:
+            raise ImportError("no full native backend on this host")
+        return SimpleNamespace()
+
+    fake._load_extension = _load_extension
+    fake._load_named_extension = lambda name: SimpleNamespace(
+        RING_TYPES_ARE_STANDINS=stand_ins
+    )
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake)
+    monkeypatch.setattr(dmi.transport, "native", fake, raising=False)
+    return native_sink._load_native_sink_extension
+
+
+def test_a_stand_in_record_sink_beside_a_real_backend_is_refused(monkeypatch):
+    """The unattachable combination names the cause: import order."""
+    load = _sink_loader_with(monkeypatch, main_backend=True, stand_ins=True)
+    with pytest.raises(ImportError, match="before the main native backend"):
+        load()
+
+
+def test_stand_ins_alone_are_fine_and_a_real_base_is_fine(monkeypatch):
+    """The two legitimate states must both load.
+
+    Stand-ins WITHOUT a main backend is the torch-CPU host, where there is
+    no engine to attach to; a real base with the backend present is the
+    production case. Only the mismatch above is refused.
+    """
+    load = _sink_loader_with(monkeypatch, main_backend=False, stand_ins=True)
+    assert load().RING_TYPES_ARE_STANDINS is True
+
+    load = _sink_loader_with(monkeypatch, main_backend=True, stand_ins=False)
+    assert load().RING_TYPES_ARE_STANDINS is False
+
+
+def test_the_sink_loader_tolerates_a_transport_module_without_the_loader(
+        monkeypatch):
+    """A stub module need not carry _load_extension at all."""
+    import dmi.transport
+    from dmi.storage.capture import native_sink
+
+    fake = ModuleType("dmi.transport.native")
+    fake._load_named_extension = lambda name: SimpleNamespace(
+        RING_TYPES_ARE_STANDINS=True
+    )
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake)
+    monkeypatch.setattr(dmi.transport, "native", fake, raising=False)
+    assert native_sink._load_native_sink_extension() is not None

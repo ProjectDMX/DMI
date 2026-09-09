@@ -72,19 +72,44 @@ def _load_native_sink_extension() -> Any:
     # dmi.transport.native (it needs only RecordSink and the named loader),
     # and this is a best-effort ordering step rather than a requirement.
     load_main_backend = getattr(_native_transport, "_load_extension", None)
+    main_backend_available = False
     if callable(load_main_backend):
         try:
             load_main_backend()
+            main_backend_available = True
         except Exception:
             pass
     try:
-        return _native_transport._load_named_extension("_dmi_native_sink")
+        module = _native_transport._load_named_extension("_dmi_native_sink")
     except ImportError as exc:
         raise ImportError(
             "The native capture sink is unavailable. Build it with "
             "`make -C native build/_dmi_native_sink "
             "PYTHON=<venv>/bin/python`."
         ) from exc
+    # The sink binds its RecordSink base ONCE, when the extension
+    # initialises, and the choice is final for the process. If it initialised
+    # while the main backend was unreachable it bound its own stand-in, and a
+    # main backend that shows up afterwards does NOT re-parent it: there is no
+    # registration collision to notice, `isinstance(sink, RecordSink)` is
+    # simply False, and create_record_runtime refuses the sink with
+    # "record_sink must be a native RecordSink" -- which says nothing about
+    # import order, the actual cause. Measured, not assumed: two extensions
+    # built against one pybind11 behave exactly this way in all three orders.
+    #
+    # Reaching this state needs the sink imported before dmi is importable,
+    # so it does not happen through this loader. Saying so precisely here
+    # costs one comparison and turns a mystifying refusal into a fixable one.
+    if main_backend_available and getattr(
+        module, "RING_TYPES_ARE_STANDINS", False
+    ):
+        raise ImportError(
+            "The native capture sink was imported before the main native "
+            "backend and bound a stand-in RecordSink, so no engine can "
+            "attach it. The extension cannot be re-bound in this process: "
+            "import dmi (or dmi.transport.native) before _dmi_native_sink."
+        )
+    return module
 
 
 class NativePackSinkHandle:
