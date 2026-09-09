@@ -68,10 +68,15 @@ def _load_native_sink_extension() -> Any:
     # create_record_runtime requires. Without the main backend (torch-CPU
     # test hosts) the sink module falls back to module-local stand-ins,
     # and there is no engine to attach to anyway.
-    try:
-        _native_transport._load_extension()
-    except ImportError:
-        pass
+    # getattr, not a direct call: a test may stand a stub module in for
+    # dmi.transport.native (it needs only RecordSink and the named loader),
+    # and this is a best-effort ordering step rather than a requirement.
+    load_main_backend = getattr(_native_transport, "_load_extension", None)
+    if callable(load_main_backend):
+        try:
+            load_main_backend()
+        except Exception:
+            pass
     try:
         return _native_transport._load_named_extension("_dmi_native_sink")
     except ImportError as exc:

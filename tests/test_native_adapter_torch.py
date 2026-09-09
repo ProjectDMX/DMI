@@ -342,10 +342,23 @@ def test_the_sink_derives_from_the_engines_record_sink(tmp_path):
     (test_native_sink_ring_e2e.py) covers the real attachment.
     """
     sink = native_sink.NativePackSink(spool_root=str(tmp_path), layout=LAYOUT)
+    # True on every host: the lease method is inherited from whichever
+    # RecordSink registration this module bound to, never defined here.
     assert hasattr(sink, "_acquire_engine")
+    base = native_sink.NativePackSink.__mro__[1]
+    assert base.__name__ == "RecordSink", native_sink.NativePackSink.__mro__
+
     if native_sink.RING_TYPES_ARE_STANDINS:
-        pytest.skip("the full native backend is not built on this host")
+        # No main backend on this host, so the base is this module's own
+        # stand-in -- asserted rather than skipped, because the stand-in
+        # branch is itself a contract: it must still expose the lease
+        # method, and it must NOT be what a host WITH the backend gets.
+        assert base is native_sink.RecordSink
+        return
     from dmi.transport import native
 
     assert isinstance(sink, native.RecordSink)
-    assert native_sink.NativePackSink.__mro__[1] is native.RecordSink
+    assert base is native.RecordSink
+    assert not hasattr(native_sink, "RecordSink"), (
+        "the sink module must not register a second RecordSink when the "
+        "main backend's registration is available")

@@ -314,12 +314,33 @@ std::string unescape_tsv(const std::string& text) {
   return out;
 }
 
-// Parse one TSV-rendered tuple field — the argMax aggregate travels as
-// ('a','b',123,...) with backslash escapes and \N for NULL.
+}  // namespace
+
+// Declared in reader.h. The argMax aggregate travels as
+// ('a','b',123,...) with backslash escapes, and NULL as a bare token.
 std::vector<std::string> parse_tsv_tuple(const std::string& text) {
   std::vector<std::string> fields;
   std::string current;
   bool in_str = false;
+  // Whether the field being read was ever QUOTED. It is the only thing that
+  // tells a SQL NULL apart from the four-character string: ClickHouse
+  // renders the first as a bare NULL token inside the tuple and the second
+  // as 'NULL', and stripping the quotes makes them the same text. The
+  // distinction has to be kept HERE, where the quotes are still visible.
+  //
+  // A NULL is handed back as the empty string, which is an unambiguous
+  // sentinel: adapter_revision is the one Nullable column in the schema,
+  // and both validators require its text to be non-empty, so no legal
+  // value can collide with it. Python's reader already maps this column to
+  // None (which the parity suite flattens to ""), so this ALSO puts the two
+  // readers on the same representation instead of leaving native with a
+  // "NULL" that every consumer had to re-interpret.
+  bool quoted = false;
+  const auto flush = [&fields, &current, &quoted] {
+    fields.push_back(!quoted && current == "NULL" ? std::string() : current);
+    current.clear();
+    quoted = false;
+  };
   // Nesting inside a VALUE, which only a comma at depth 0 may split.
   // `shape` is Array(UInt32) and renders as [1,128,4096]: splitting on its
   // commas over-splits the row, and every rank-2-or-higher shape -- which
@@ -369,6 +390,7 @@ std::vector<std::string> parse_tsv_tuple(const std::string& text) {
     }
     if (c == '\'') {
       in_str = true;
+      quoted = true;
       continue;
     }
     if (c == '[' || c == '(') {
@@ -382,17 +404,14 @@ std::vector<std::string> parse_tsv_tuple(const std::string& text) {
       continue;
     }
     if (c == ',' && depth == 0) {
-      fields.push_back(current);
-      current.clear();
+      flush();
       continue;
     }
     current.push_back(c);
   }
-  fields.push_back(current);
+  flush();
   return fields;
 }
-
-}  // namespace
 
 std::string filter_hash(const SearchFilters& filters) {
   return filter_hash_impl(filters);

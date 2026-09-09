@@ -147,3 +147,59 @@ def test_a_mismatching_decoded_value_is_still_a_mismatch():
     assert field["matches"] is False
     (field,) = _fields(_quote("h"), ["evil"])
     assert field["matches"] is False
+
+
+# --- the catalog half of the same comparison ---------------------------------
+#
+# hydrate compares the footer fields above against the catalog descriptor
+# fields, which come out of the reader's resolved-tuple parser. That parser
+# is the only place that can still see whether a value was quoted, so it is
+# the only place that can tell a SQL NULL from the four-character string
+# "NULL" -- and it decides what "field 10" (adapter_revision, the schema's
+# one Nullable column) means on the catalog side.
+#
+# This was live-only, and it is exactly where the first attempt at the NULL
+# fix broke: making the footer side null-aware while the catalog side still
+# reported the text "NULL" refused every capture with adapter_revision=None.
+
+
+def _tuple_fields(rendered: str) -> list[str]:
+    response = _call(op="tuple_fields", tuple=rendered)
+    assert response["ok"], response
+    return response["fields"]
+
+
+def test_a_sql_null_in_the_resolved_tuple_is_not_the_string_null():
+    # ClickHouse renders a SQL NULL inside the tuple as a bare token and the
+    # string as a quoted literal. Unquoted -> "" (the sentinel; no legal
+    # adapter_revision is empty), quoted -> the four characters.
+    assert _tuple_fields("('a',NULL,'b')") == ["a", "", "b"]
+    assert _tuple_fields("('a','NULL','b')") == ["a", "NULL", "b"]
+    # Alone in the tuple, and unwrapped, both ways.
+    assert _tuple_fields("(NULL)") == [""]
+    assert _tuple_fields("('NULL')") == ["NULL"]
+
+
+def test_the_two_null_forms_bind_to_the_matching_footer_field_only():
+    """The catalog half and the footer half, compared as hydrate compares them."""
+    catalog_null, catalog_text = _tuple_fields("(NULL)")[0], _tuple_fields("('NULL')")[0]
+
+    # A footer NULL binds to a catalog NULL and not to the string.
+    assert _fields("NULL", [catalog_null])[0]["matches"] is True
+    assert _fields("NULL", [catalog_text])[0]["matches"] is False
+    # A footer 'NULL' binds to the string and not to a catalog NULL. This is
+    # the pair the reviewer's repro turns on.
+    assert _fields(_quote("NULL"), [catalog_text])[0]["matches"] is True
+    assert _fields(_quote("NULL"), [catalog_null])[0]["matches"] is False
+
+
+def test_the_resolved_tuple_keeps_values_the_footer_binding_compares():
+    """Escapes, arrays and numbers survive unchanged -- NULL is the only remap."""
+    assert _tuple_fields("('block\\\\resid')") == ["block\\resid"]
+    assert _tuple_fields("('block\\'quoted')") == ["block'quoted"]
+    assert _tuple_fields("('block\\tresid')") == ["block\tresid"]
+    # A rank>=2 shape's inner comma must not split the tuple, and a number
+    # is never mistaken for a null.
+    assert _tuple_fields("('h',[2,8],0,'none')") == ["h", "[2,8]", "0", "none"]
+    # A value that merely CONTAINS the token is untouched.
+    assert _tuple_fields("('NULLABLE','a NULL b')") == ["NULLABLE", "a NULL b"]

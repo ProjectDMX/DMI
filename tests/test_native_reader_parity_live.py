@@ -232,9 +232,12 @@ def _descriptor_fields(item):
         return [str(values[name]) if values[name] is not None else ""
                 for name in ordered]
     fields = [str(f) for f in item]
-    # The native TSV renders an unquoted NULL inside the resolved tuple;
-    # Python flattens the same column to None → "".
-    return ["" if f in ("None", "NULL") else f for f in fields]
+    # Python flattens a NULL column to None → "". The native reader now
+    # hands back "" for a SQL NULL directly (parse_tsv_tuple keeps nullness
+    # apart from the string "NULL"), so "NULL" is deliberately NOT tolerated
+    # here: seeing it would mean the two representations had drifted back
+    # together, which is what let a catalog NULL bind to a footer 'NULL'.
+    return ["" if f == "None" else f for f in fields]
 
 
 def _normalize(items):

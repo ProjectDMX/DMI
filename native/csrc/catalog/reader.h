@@ -62,6 +62,16 @@ struct SearchPage {
 // with CaptureQuery.filter_hash, so cursors cross implementations.
 std::string filter_hash(const SearchFilters& filters);
 
+// One TSV-rendered tuple field -- the argMax aggregate that carries the
+// resolved columns -- split into its values, quotes and escapes undone.
+//
+// Exposed for the conformance driver. A SQL NULL comes back as the empty
+// string and the four-character string 'NULL' comes back as "NULL": that
+// distinction only exists while the quotes are still in the text, it is
+// what hydration's footer binding compares against, and it was live-only
+// until this declaration put it on the CPU gate.
+std::vector<std::string> parse_tsv_tuple(const std::string& text);
+
 class NativeCaptureCatalog {
  public:
   NativeCaptureCatalog(std::shared_ptr<const ClickHouseClient> client,

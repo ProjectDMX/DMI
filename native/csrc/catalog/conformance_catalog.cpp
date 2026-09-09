@@ -408,6 +408,22 @@ std::string respond(const std::string& line, Session* session) {
       out += "]";
       return prefix + "true" + out + "}";
     }
+    if (op == "tuple_fields") {
+      // Session-less like `escape` and `footer_row_fields`: the resolved
+      // tuple parser alone. It decides what a catalog descriptor field IS
+      // -- in particular whether it was SQL NULL -- and the footer binding
+      // compares against exactly this, so it belongs on the CPU gate and
+      // not only behind a live catalog.
+      out = ",\"fields\":[";
+      const std::vector<std::string> fields =
+          dmi_catalog::parse_tsv_tuple(jc::FindString(line, "tuple"));
+      for (size_t i = 0; i < fields.size(); ++i) {
+        if (i) out += ",";
+        escape_into(fields[i], &out);
+      }
+      out += "]";
+      return prefix + "true" + out + "}";
+    }
     if (session->writer == nullptr) {
       return prefix + "false,\"what\":\"call open first\"}";
     }
