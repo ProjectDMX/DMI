@@ -16,8 +16,10 @@
 #define DMI_STORE_SPOOL_H_
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace dmi_store {
@@ -90,14 +92,36 @@ class Spool {
 
   SpoolSnapshot Snapshot() const;
 
+  // Test seam: called by Stage() after its capacity reservation is taken and
+  // before the temp file is written, outside the lock. Lets a test hold one
+  // stager at exactly the point where its reservation exists but nothing is
+  // on disk yet, which is the window a directory scan cannot see.
+  void SetStageHookForTesting(std::function<void()> hook);
+
  private:
   std::string root_;
   uint64_t max_bytes_ = 0;
   mutable std::mutex mutex_;
-  uint64_t bytes_ = 0;
-  uint64_t entries_ = 0;
+  // Two accounts, kept apart on purpose:
+  //   committed_bytes_/committed_entries_ -- ready files this object knows
+  //     are on disk. This is what a directory scan can re-derive, and what
+  //     Recover()/reconciliation overwrite.
+  //   reserved_bytes_/reserved_entries_ -- fresh stages between their
+  //     capacity check and their link(). Nothing on disk speaks for these
+  //     (the temp file, if it exists yet, is named in `inflight_temps_` so a
+  //     scan skips it), so no scan may ever overwrite them.
+  // Capacity is judged against the SUM. A single counter that a scan
+  // replaced wholesale erased the second account: with max 1500, A reserved
+  // 1000 and paused before its write, B's 1000 triggered the scan, the scan
+  // saw an empty directory, and both were admitted (2000 on disk).
+  uint64_t committed_bytes_ = 0;
+  uint64_t committed_entries_ = 0;
+  uint64_t reserved_bytes_ = 0;
+  uint64_t reserved_entries_ = 0;
+  std::unordered_set<std::string> inflight_temps_;
   uint64_t peak_bytes_ = 0;
   uint64_t generation_ = 0;
+  std::function<void()> stage_hook_for_testing_;
 };
 
 }  // namespace dmi_store

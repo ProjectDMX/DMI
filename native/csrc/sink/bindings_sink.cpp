@@ -38,18 +38,75 @@ ring::PayloadSlice ParseSlice(const py::dict& row) {
 
 }  // namespace
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  // Both ring types are registered module-locally: the main _native_backend
-  // extension (bindings.cpp) registers them under different Python names in
-  // its own module, and pybind11's per-module type registry must not collide
-  // on the same C++ typeid. The Python engine imports BOTH extensions in
-  // every real runtime, so the isinstance check against the main module's
-  // RecordSink still resolves through the C++ inheritance chain.
+namespace {
+
+// Whether the main _native_backend extension has registered ring::RecordSink
+// and ring::RecordSinkLease in pybind11's shared (cross-module) registry.
+//
+// Both extensions are built against the same pybind11 (torch's), so they
+// share one internals table, and a C++ type may be registered in it ONCE.
+// The engine's contract is with the MAIN module's types: create_record_runtime
+// checks `isinstance(record_sink, _native_backend.RecordSink)` and then
+// calls the inherited `_acquire_engine()`. So this module must not
+// register its own RecordSink -- neither globally (the "already registered"
+// ImportError when both load) nor module-locally (imports fine, but
+// NativePackSink then derives from a DIFFERENT Python class: isinstance is
+// False, `_acquire_engine` is absent, and the engine refuses the sink with
+// "record_sink must be a native RecordSink"). It has to derive from the
+// main module's registration, which pybind11 resolves through the shared
+// registry as long as the main module has been imported first.
+//
+// The Python loader (native_sink.py) imports the main backend before this
+// module wherever it is built. Here, the base registration is looked up
+// directly: if the main module has not been loaded yet, it is imported by
+// module name when importable, and only when it is not available at all
+// (the torch-CPU test hosts, which build this module without CUDA) does
+// this module fall back to module-local stand-ins. In that fallback there
+// is no engine to attach to, so the type relationship is moot.
+bool RingTypesRegistered() {
+  return py::detail::get_type_info(typeid(ring::RecordSink)) != nullptr &&
+         py::detail::get_type_info(typeid(ring::RecordSinkLease)) != nullptr;
+}
+
+void EnsureRingTypes(py::module_& m) {
+  if (RingTypesRegistered()) return;
+  // The main backend lives beside the dmi package and is loaded from its
+  // file path by dmi.transport.native, never by bare module name. Load it
+  // through that loader so that a plain `import _dmi_native_sink` (the
+  // pytest suites import the built .so directly, at collection, before any
+  // engine exists) still derives from the real RecordSink on a host that
+  // has the backend -- otherwise whichever module initialised first in the
+  // process would decide the type relationship for every later attachment.
+  try {
+    py::module_::import("dmi.transport.native").attr("_load_extension")();
+  } catch (const py::error_already_set&) {
+    // No dmi package on sys.path, or no full backend built: a host without
+    // an engine to attach to.
+  }
+  if (RingTypesRegistered()) return;
   py::class_<ring::RecordSinkLease, std::shared_ptr<ring::RecordSinkLease>>(
       m, "RecordSinkLease", py::module_local());
   py::class_<ring::RecordSink, std::shared_ptr<ring::RecordSink>>(
-      m, "RecordSink", py::module_local());
+      m, "RecordSink", py::module_local())
+      .def("_acquire_engine",
+           [](std::shared_ptr<ring::RecordSink> sink) {
+             return ring::RecordSinkLease::acquire(std::move(sink));
+           });
+  m.attr("RING_TYPES_ARE_STANDINS") = true;
+}
 
+}  // namespace
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.attr("RING_TYPES_ARE_STANDINS") = false;
+  EnsureRingTypes(m);
+
+  // Derives from ring::RecordSink AS REGISTERED BY THE MAIN MODULE (see
+  // EnsureRingTypes): NativePackSink is then a Python subclass of
+  // _native_backend.RecordSink, passes the engine's isinstance check and
+  // inherits its `_acquire_engine`. Dropping the base here, or registering
+  // a second RecordSink, breaks the attachment even though the module
+  // imports.
   py::class_<dmi_sink::NativePackSink, ring::RecordSink,
              std::shared_ptr<dmi_sink::NativePackSink>>(
       m, "NativePackSink")

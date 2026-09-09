@@ -92,12 +92,16 @@ bool ParseMetadataJson(const std::string& text,
     return found == jc::IntFind::kOk ? value : 0;
   };
   const int64_t layer = integer("layer_number", jc::IntDomain::kSigned);
-  const int64_t producer = integer("producer_rank");
-  const int64_t step = integer("step_number");
-  const int64_t token_start = integer("token_start");
-  const int64_t token_end = integer("token_end");
-  const int64_t batch = integer("batch_position");
-  const int64_t captured = integer("captured_at_ns");
+  // The six counters are UNSIGNED in the oracle (UInt32/UInt64 columns, and
+  // CaptureMetadata refuses anything below zero), so a negative literal is
+  // refused while its sign is still in the text: cast afterwards,
+  // step_number=-1 became 18446744073709551615 and was packed.
+  const int64_t producer = integer("producer_rank", jc::IntDomain::kUnsigned);
+  const int64_t step = integer("step_number", jc::IntDomain::kUnsigned);
+  const int64_t token_start = integer("token_start", jc::IntDomain::kUnsigned);
+  const int64_t token_end = integer("token_end", jc::IntDomain::kUnsigned);
+  const int64_t batch = integer("batch_position", jc::IntDomain::kUnsigned);
+  const int64_t captured = integer("captured_at_ns", jc::IntDomain::kUnsigned);
   // Out of range first: it is the more specific answer for a value that IS
   // an integer literal, and a row can only carry one refusal.
   if (out_of_range) {
@@ -114,8 +118,30 @@ bool ParseMetadataJson(const std::string& text,
   out->batch_position = static_cast<uint64_t>(batch);
   out->dtype = jc::FindString(text, "dtype");
   out->shape.clear();
-  for (const auto& item :
-       jc::SplitElements(jc::Unwrap(jc::FindArray(text, "shape")))) {
+  // Presence and array-ness first: FindArray answers "" for a missing key
+  // and for a non-array value alike, and Unwrap("") is also "" -- which is
+  // exactly what a legal EMPTY array unwraps to. The two have to be told
+  // apart before the split.
+  const std::string shape_array = jc::FindArray(text, "shape");
+  if (shape_array.empty()) {
+    return fail("capture shape must be an integer list");
+  }
+  std::string shape_inside = jc::Unwrap(shape_array);
+  {
+    size_t start = 0, end = shape_inside.size();
+    while (start < end && shape_inside[start] == ' ') ++start;
+    while (end > start && shape_inside[end - 1] == ' ') --end;
+    shape_inside = shape_inside.substr(start, end - start);
+  }
+  // `[]` is a legal shape: a rank-0 (scalar) capture of exactly one
+  // element, which CaptureMetadata admits and the pack index already reads.
+  // SplitElements yields ONE empty item for it, not zero dimensions, so the
+  // empty case is taken before the split -- it used to be refused here as
+  // "not an integer list" while the same record indexed fine.
+  const std::vector<std::string> shape_items =
+      shape_inside.empty() ? std::vector<std::string>()
+                           : jc::SplitElements(shape_inside);
+  for (const auto& item : shape_items) {
     size_t q = 0;
     while (q < item.size() && item[q] == ' ') ++q;
     // Bounded the way the scalars above are bounded, and for the same
@@ -138,7 +164,14 @@ bool ParseMetadataJson(const std::string& text,
       ++q;
       any = true;
     }
-    if (!any) return fail("capture shape must be an integer list");
+    // The whole item has to be the integer: `16.5` scanned as 16 and was
+    // packed as (16,), where `type(dim) is not int` refuses it upstream.
+    // Only trailing spaces may follow the digits.
+    size_t tail = q;
+    while (tail < item.size() && item[tail] == ' ') ++tail;
+    if (!any || tail != item.size()) {
+      return fail("capture shape must be an integer list");
+    }
     if (over) return fail("capture shape dimension is out of range");
     out->shape.push_back(v);
   }

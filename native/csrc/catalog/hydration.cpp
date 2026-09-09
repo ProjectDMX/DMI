@@ -19,7 +19,6 @@ namespace dmi_catalog {
 
 namespace {
 
-constexpr size_t kHeaderSize = 64;
 constexpr size_t kTrailerBytes = 64;
 
 
@@ -276,30 +275,134 @@ const std::vector<std::pair<size_t, size_t>>& kCatalogToFooter() {
   return mapping;
 }
 
-// Normalize one field for comparison. Two form differences between the
-// rendered footer and the catalog's TSV rows:
-//   1. The footer renders a NULL metadata value as the unquoted three-
-//      letter text, while the catalog rows carry the empty string (TSV \N).
-//   2. The footer renders UUID-typed columns as toUUID('...') — SQL the
-//      INSERT path needs — while the catalog TSV carries the bare UUID
-//      string.
-std::string normalize_footer_field(const std::string& value) {
-  if (value == "NULL") return std::string();
-  // Strip the toUUID wrapper: the catalog carries the bare UUID string.
-  // The footer's field splitter consumes the inner quotes (the ' after the
-  // paren enters the string state, and the closing ' leaves it), so the
-  // split value reads toUUID(686ae...) — no inner quotes to match.
-  if (value.size() > 10 && value.compare(0, 7, "toUUID(") == 0 &&
-      value.compare(value.size() - 1, 1, ")") == 0) {
-    return value.substr(7, value.size() - 8);
+// The body of one SQL string literal, decoded. `at` is on the opening
+// quote on entry and just past the closing quote on return. The escape
+// set is sql_quote's map, entry for entry.
+std::string unquote_sql(const std::string& row, size_t* at) {
+  std::string out;
+  size_t i = *at + 1;
+  while (i < row.size()) {
+    const char c = row[i];
+    if (c == '\\' && i + 1 < row.size()) {
+      const char next = row[i + 1];
+      switch (next) {
+        case 'b': out.push_back('\b'); break;
+        case 'f': out.push_back('\f'); break;
+        case 'r': out.push_back('\r'); break;
+        case 'n': out.push_back('\n'); break;
+        case 't': out.push_back('\t'); break;
+        case '0': out.push_back('\0'); break;
+        case 'a': out.push_back('\a'); break;
+        case 'v': out.push_back('\v'); break;
+        default: out.push_back(next); break;  // \\ and \' decode to themselves
+      }
+      i += 2;
+      continue;
+    }
+    if (c == '\'') {
+      *at = i + 1;
+      return out;
+    }
+    out.push_back(c);
+    ++i;
   }
-  return value;
+  throw CatalogError(CatalogError::Kind::kValue,
+                     "pack footer row has an unterminated string");
 }
+
+// Split one rendered footer row into its typed fields on TOP-LEVEL commas.
+// Top-level means depth-aware: a rank>=2 shape renders as [2,8] with an
+// unquoted comma inside, and splitting on it shifted every later field
+// (reproduced with float32 shaped (2,8) and (2,2,4)).
+//
+// Why typed, and why decoded: the catalog row this is compared against is
+// already DECODED text (the reader's TSV layer undid ClickHouse's escapes),
+// so the footer side has to reach the same representation. Comparing the
+// footer's escaped text against it refused three valid hook names --
+// block\resid, block'quoted and a tab-bearing one -- as "does not match
+// the pack footer". And NULL has to stay a kind rather than a spelling: a
+// normalisation that turned BOTH the unquoted NULL token and the quoted
+// string 'NULL' into the same value accepted a catalog row whose
+// adapter_revision was SQL NULL against a footer whose value was the
+// four-letter string.
+}  // namespace
+
+std::vector<FooterField> split_footer_row(const std::string& rendered) {
+  std::vector<FooterField> fields;
+  size_t i = 0;
+  for (;;) {
+    FooterField field;
+    while (i < rendered.size() && rendered[i] == ' ') ++i;
+    if (i < rendered.size() && rendered[i] == '\'') {
+      field.text = unquote_sql(rendered, &i);
+    } else if (rendered.compare(i, 8, "toUUID('") == 0) {
+      // UUID-typed columns render as toUUID('...') -- SQL the INSERT path
+      // needs -- while the catalog carries the bare UUID string.
+      i += 7;
+      field.text = unquote_sql(rendered, &i);
+      if (i >= rendered.size() || rendered[i] != ')') {
+        throw CatalogError(CatalogError::Kind::kValue,
+                           "pack footer row has a malformed UUID literal");
+      }
+      ++i;
+    } else {
+      // A bare token: NULL, a number, or a bracketed array. Spaces inside
+      // it carry no meaning (an array renders with or without them
+      // depending on the writer's JSON separators), so they are dropped.
+      int depth = 0;
+      for (; i < rendered.size() && !(rendered[i] == ',' && depth == 0);
+           ++i) {
+        const char c = rendered[i];
+        if (c == '[') ++depth;
+        if (c == ']') --depth;
+        if (c != ' ') field.text.push_back(c);
+      }
+      if (field.text == "NULL") {
+        field.is_null = true;
+        field.text.clear();
+      }
+    }
+    while (i < rendered.size() && rendered[i] == ' ') ++i;
+    fields.push_back(std::move(field));
+    if (i >= rendered.size()) break;
+    if (rendered[i] != ',') {
+      throw CatalogError(CatalogError::Kind::kValue,
+                         "pack footer row has an unexpected token");
+    }
+    ++i;
+  }
+  return fields;
+}
+
+// Whether one catalog field agrees with its footer counterpart. The catalog
+// rows carry a NULL as the empty string (the reader maps TSV's \N to
+// absent), and an empty string is not a value either side admits for any
+// text column, so nullness on the catalog side IS emptiness -- while on the
+// footer side it is the unquoted token and nothing else. A quoted 'NULL'
+// is the four-letter string, compared as such.
+bool footer_field_matches(const std::string& catalog_value,
+                          const FooterField& footer_value) {
+  if (footer_value.is_null) return catalog_value.empty();
+  if (catalog_value.empty()) return false;
+  return catalog_value == footer_value.text;
+}
+
+namespace {
 
 uint64_t shape_product(const std::string& shape_text) {
   uint64_t product = 1;
-  for (const std::string& dim :
-       jc::SplitElements(jc::Unwrap(shape_text))) {
+  // `[]` is the rank-0 shape: one element. SplitElements hands back ONE
+  // empty item for it, which parse_u64_field then refuses -- so a scalar
+  // that staged, uploaded, indexed and hydrated still failed to summarise
+  // with "payload length does not match dtype and shape". The empty case
+  // is the product's identity and is taken before the split.
+  std::string inside = jc::Unwrap(shape_text);
+  size_t start = 0, end = inside.size();
+  while (start < end && inside[start] == ' ') ++start;
+  while (end > start && inside[end - 1] == ' ') --end;
+  inside = inside.substr(start, end - start);
+  if (inside.empty()) return product;
+  for (const std::string& dim : jc::SplitElements(inside)) {
     product *= parse_u64_field(dim, "shape");
   }
   return product;
@@ -549,24 +652,42 @@ std::vector<std::string> NativeCaptureReader::hydrate(
   // later pack cannot fail after earlier payloads have been fetched.
   // Those reads are REAL requests and bytes: charged against the same
   // budgets the payload ranges use, exactly as the Python reader's
-  // BudgetedPackStore charges them.
-  int64_t footer_requests = 0;
-  int64_t footer_bytes = 0;
-  const int64_t payload_requests_total =
-      static_cast<int64_t>(payload_requests);
-  for (const auto& plan : plans) {
-    const int64_t remaining_requests = request_limit - payload_requests_total;
-    const int64_t remaining_bytes =
-        byte_limit - static_cast<int64_t>(payload_bytes);
-    if (footer_requests + 2 > remaining_requests ||
-        footer_bytes > remaining_bytes) {
-      throw CatalogError(
-          CatalogError::Kind::kValue,
-          "hydration request limit exceeded: the footer verification for "
-          "pack " + plan.pack_id + " needs 2 more requests than the " +
-          std::to_string(remaining_requests) + " remaining after the " +
-          std::to_string(payload_requests_total) + " payload ranges");
+  // _ReadBudget charges them -- each range at its ACTUAL length, checked
+  // before that range is fetched. The footer's length is only known once
+  // the trailer has been read, so the check cannot be hoisted ahead of the
+  // pack as one estimate: an estimate that checked the running total
+  // BEFORE charging the current pack let a one-pack selection fetch a
+  // footer the byte budget did not cover (byte_limit=16, request_limit=3:
+  // three GETs and the payload came back).
+  struct ReadBudget {
+    int64_t requests;
+    int64_t bytes;
+    const std::string* pack_id;
+    void consume(uint64_t length) {
+      if (requests < 1) {
+        throw CatalogError(
+            CatalogError::Kind::kValue,
+            "hydration request limit exceeded: the footer verification for "
+            "pack " + *pack_id + " needs a request the budget does not have "
+            "after the payload ranges");
+      }
+      if (static_cast<int64_t>(length) > bytes) {
+        throw CatalogError(
+            CatalogError::Kind::kValue,
+            "hydration byte limit exceeded: the footer verification for "
+            "pack " + *pack_id + " needs " + std::to_string(length) +
+            " more bytes than the " + std::to_string(bytes) +
+            " remaining after the payload ranges");
+      }
+      --requests;
+      bytes -= static_cast<int64_t>(length);
     }
+  };
+  ReadBudget budget{request_limit - static_cast<int64_t>(payload_requests),
+                    byte_limit - static_cast<int64_t>(payload_bytes),
+                    nullptr};
+  for (const auto& plan : plans) {
+    budget.pack_id = &plan.pack_id;
     const auto& first_descriptor = descriptors[plan.descriptor_indexes[0]];
     PackRefData ref{
         plan.pack_id, plan.store_id, plan.object_key,
@@ -575,64 +696,23 @@ std::vector<std::string> NativeCaptureReader::hydrate(
         parse_u64_field(first_descriptor[kPackRecordCount], "records")};
     // The footer's own descriptor rows, one per record: the same 32-field
     // renderer the indexer reads, with the batch's version irrelevant here.
-    // read_pack_descriptor_rows performs two GETs (trailer + footer);
-    // charge their bytes against the footer budget.
-    footer_requests += 2;
-    footer_bytes += kHeaderSize + kTrailerBytes +
-                    std::min<uint64_t>(ref.object_bytes,
-                                       64ull * 1024 * 1024);
-    const auto footer_rows = read_pack_descriptor_rows(s3_, ref);
-    // The rows are rendered VALUES text (one string per record); split
-    // each on TOP-LEVEL commas into the 32 fields, unquoting strings.
-    // Top-level means depth-aware: a rank>=2 shape renders as [2,8] with
-    // an unquoted comma inside, and splitting on it shifted every later
-    // field (reproduced with float32 shaped (2,8) and (2,2,4)).
-    std::map<std::string, std::vector<std::string>> footer;
+    // read_pack_descriptor_rows performs two GETs (trailer + footer) and
+    // charges each against the budget before issuing it.
+    const auto footer_rows = read_pack_descriptor_rows(
+        s3_, ref, [&budget](uint64_t length) { budget.consume(length); });
+    // The rows are rendered VALUES text (one string per record), split
+    // into 32 typed fields each.
+    std::map<std::string, std::vector<FooterField>> footer;
     for (const auto& rendered : footer_rows) {
-        std::vector<std::string> fields;
-        std::string current;
-        bool in_str = false;
-        int depth = 0;
-        for (size_t i = 0; i < rendered.size(); ++i) {
-            const char c = rendered[i];
-            if (in_str) {
-                if (c == '\\' && i + 1 < rendered.size()) {
-                    current.push_back('\\');
-                    current.push_back(rendered[++i]);
-                    continue;
-                }
-                if (c == '\'') {
-                    in_str = false;
-                    continue;
-                }
-                current.push_back(c);
-                continue;
-            }
-            if (c == '\'') {
-                in_str = true;
-                continue;
-            }
-            if (c == '[' || c == '(') {
-                ++depth;
-                current.push_back(c);
-                continue;
-            }
-            if (c == ']' || c == ')') {
-                --depth;
-                current.push_back(c);
-                continue;
-            }
-            if (c == ',' && depth == 0) {
-                fields.push_back(current);
-                current.clear();
-                continue;
-            }
-            current.push_back(c);
-        }
-        fields.push_back(current);
-        // The footer rows are in CAPTURE_COLUMNS order — capture_id at 0,
-        // dtype 18, shape 19 — not the reader's sort-key-first layout.
-        footer.emplace(fields[0], std::move(fields));
+      std::vector<FooterField> fields = split_footer_row(rendered);
+      if (fields.size() != 32 || fields[0].is_null) {
+        throw CatalogError(CatalogError::Kind::kValue,
+                           "pack footer row does not have 32 fields");
+      }
+      // The footer rows are in CAPTURE_COLUMNS order — capture_id at 0,
+      // dtype 18, shape 19 — not the reader's sort-key-first layout.
+      const std::string capture_id = fields[0].text;
+      footer.emplace(capture_id, std::move(fields));
     }
     for (const size_t index : plan.descriptor_indexes) {
       const auto& descriptor = descriptors[index];
@@ -648,8 +728,8 @@ std::vector<std::string> NativeCaptureReader::hydrate(
       // placement. The two layouts name fields at different indexes; the
       // catalog->footer map is built once from the two name orders.
       for (const auto& [catalog_index, footer_index] : kCatalogToFooter()) {
-        if (normalize_footer_field(descriptor[catalog_index]) !=
-            normalize_footer_field(it->second[footer_index])) {
+        if (!footer_field_matches(descriptor[catalog_index],
+                                  it->second[footer_index])) {
           throw CatalogError(
               CatalogError::Kind::kValue,
               "catalog descriptor does not match the pack footer: field " +

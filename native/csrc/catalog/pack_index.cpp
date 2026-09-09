@@ -424,13 +424,15 @@ std::string render_record_row(const std::string& raw, const PackRefData& ref,
 }  // namespace
 
 std::vector<std::string> read_pack_descriptor_rows(
-    dmi_store::S3Client* s3, const PackRefData& ref) {
+    dmi_store::S3Client* s3, const PackRefData& ref,
+    const std::function<void(uint64_t)>& charge) {
   if (ref.object_bytes < kHeaderSize + kTrailerSize + 2) {
     format_error("pack is truncated");
   }
   std::string error;
   std::vector<uint8_t> trailer;
   const uint64_t trailer_offset = ref.object_bytes - kTrailerSize;
+  if (charge) charge(kTrailerSize);
   if (!s3->GetRange(ref.object_key, trailer_offset, kTrailerSize, &trailer,
                    &error)) {
     throw CatalogError(CatalogError::Kind::kValue,
@@ -476,6 +478,9 @@ std::vector<std::string> read_pack_descriptor_rows(
     format_error("pack footer range is invalid");
   }
   std::vector<uint8_t> footer;
+  // Charged at the length the trailer DECLARES, which is the range that is
+  // about to be read -- not the object's size, which only bounds it.
+  if (charge) charge(footer_length);
   if (!s3->GetRange(ref.object_key, footer_offset, footer_length, &footer,
                    &error)) {
     throw CatalogError(CatalogError::Kind::kValue,

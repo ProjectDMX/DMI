@@ -58,6 +58,26 @@ struct CoreSummaryData {
   int64_t abs_max_int = 0;
 };
 
+// One field of a rendered footer VALUES row, typed the way the renderer
+// typed it: SQL NULL is a kind, not a spelling, and a quoted string is
+// DECODED (the inverse of sql_quote) rather than carried with its escapes.
+struct FooterField {
+  bool is_null = false;
+  std::string text;  // the decoded string, or the raw number/array token
+};
+
+// Split one rendered footer row (pack_index's VALUES renderer) into its
+// typed fields. Exposed for the conformance driver: the footer binding is
+// a comparison between two representations, and its decoder is pinned on
+// the CPU gate rather than only behind a live catalog.
+std::vector<FooterField> split_footer_row(const std::string& rendered);
+
+// Whether one DECODED catalog field (the reader's TSV layer already undid
+// ClickHouse's escapes; a NULL arrives as the empty string) agrees with its
+// footer counterpart.
+bool footer_field_matches(const std::string& catalog_value,
+                          const FooterField& footer_value);
+
 class NativeCaptureReader {
  public:
   NativeCaptureReader(dmi_store::S3Client* s3, std::string bucket,

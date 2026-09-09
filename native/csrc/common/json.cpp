@@ -14,19 +14,50 @@ std::string Unescape(const std::string& text, size_t& q) {
         case 'b': raw.push_back('\b'); ++q; break;
         case 'f': raw.push_back('\f'); ++q; break;
         case 'u': {
-          unsigned v = 0;
-          for (int k = 1; k <= 4 && q + k < text.size(); ++k) {
-            const char h = text[q + k];
-            v = v * 16 + (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
-          }
+          // Four hex digits at text[at+1..at+4], or -1 when they are not
+          // there (a truncated escape at the end of the text).
+          const auto hex4 = [&text](size_t at) -> long {
+            if (at + 4 >= text.size()) return -1;
+            unsigned v = 0;
+            for (int k = 1; k <= 4; ++k) {
+              const char h = text[at + k];
+              v = v * 16 + (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
+            }
+            return static_cast<long>(v);
+          };
+          const long first = hex4(q);
+          unsigned v = first < 0 ? 0u : static_cast<unsigned>(first);
           q += 5;
+          // json.dumps (ensure_ascii, the default) writes a code point
+          // outside the BMP as a UTF-16 surrogate PAIR: U+1F600 is
+          // \ud83d\ude00. The two halves are one character, so they have to
+          // be combined into one code point BEFORE encoding: encoding each
+          // half on its own produced six bytes (ED A0 BD ED B8 80) that are
+          // not UTF-8 at all, and the identifier reached the catalog
+          // corrupted (reproduced with hook_name "block" + U+1F600: Python's reader
+          // then failed to decode byte 0xED). A lone surrogate keeps the
+          // old three-byte form -- there is nothing to combine it with.
+          if (v >= 0xD800 && v <= 0xDBFF && q + 1 < text.size() &&
+              text[q] == '\\' && text[q + 1] == 'u') {
+            const long second = hex4(q + 1);
+            if (second >= 0xDC00 && second <= 0xDFFF) {
+              v = 0x10000 + ((v - 0xD800) << 10) +
+                  (static_cast<unsigned>(second) - 0xDC00);
+              q += 6;
+            }
+          }
           if (v < 0x80) {
             raw.push_back(static_cast<char>(v));
           } else if (v < 0x800) {
             raw.push_back(static_cast<char>(0xC0 | (v >> 6)));
             raw.push_back(static_cast<char>(0x80 | (v & 0x3F)));
-          } else {
+          } else if (v < 0x10000) {
             raw.push_back(static_cast<char>(0xE0 | (v >> 12)));
+            raw.push_back(static_cast<char>(0x80 | ((v >> 6) & 0x3F)));
+            raw.push_back(static_cast<char>(0x80 | (v & 0x3F)));
+          } else {
+            raw.push_back(static_cast<char>(0xF0 | (v >> 18)));
+            raw.push_back(static_cast<char>(0x80 | ((v >> 12) & 0x3F)));
             raw.push_back(static_cast<char>(0x80 | ((v >> 6) & 0x3F)));
             raw.push_back(static_cast<char>(0x80 | (v & 0x3F)));
           }
@@ -90,7 +121,30 @@ IntFind ScanInt(const std::string& text, size_t q, int64_t* out,
     any = true;
   }
   if (!any) return IntFind::kAbsent;
+  // The WHOLE token has to be the integer, not just its leading digits.
+  // A JSON number continues past the digits with '.', 'e', 'E' (a float),
+  // and the value ends at a delimiter: whitespace, ',', '}' or ']' (or the
+  // end of the text). Anything else after the digits means the token is
+  // not an integer -- `0.5` scanned as 0 and `123.5` as 123, and both were
+  // persisted where CaptureMetadata's `type(value) is not int` refuses
+  // them. That is the same refusal as no digits at all: the key is there,
+  // and its value is not an integer.
+  if (q < text.size()) {
+    const char next = text[q];
+    if (!(next == ',' || next == '}' || next == ']' || next == ' ' ||
+          next == '\n' || next == '\t' || next == '\r')) {
+      return IntFind::kAbsent;
+    }
+  }
   if (over) return IntFind::kOutOfRange;
+  // A negative literal for an unsigned destination is out of that
+  // destination's range, and only the sign in the TEXT can say so: cast to
+  // uint64_t, -1 is 18446744073709551615 -- in range for the column, and
+  // exactly what step_number=-1 was persisted as. (-0 is 0 and stays
+  // admitted, as json.loads reads it.)
+  if (neg && magnitude != 0 && domain == IntDomain::kUnsigned) {
+    return IntFind::kOutOfRange;
+  }
   // Two's complement, negated as unsigned: exact at 2^63, where
   // -static_cast<int64_t>(magnitude) would itself overflow. The narrowing
   // cast is the same modular reinterpretation the uint64_t callers already

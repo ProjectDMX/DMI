@@ -59,6 +59,19 @@ class NativeSinkConfig:
 def _load_native_sink_extension() -> Any:
     from ...transport import native as _native_transport
 
+    # The main backend FIRST, when it is built. The sink extension derives
+    # NativePackSink from the ring RecordSink the main backend registers
+    # (pybind11 shares one type registry across both extensions), so the
+    # main backend's registration has to exist before the sink module
+    # initialises: that is what makes the sink an instance of
+    # _native_backend.RecordSink with the inherited `_acquire_engine`, which
+    # create_record_runtime requires. Without the main backend (torch-CPU
+    # test hosts) the sink module falls back to module-local stand-ins,
+    # and there is no engine to attach to anyway.
+    try:
+        _native_transport._load_extension()
+    except ImportError:
+        pass
     try:
         return _native_transport._load_named_extension("_dmi_native_sink")
     except ImportError as exc:

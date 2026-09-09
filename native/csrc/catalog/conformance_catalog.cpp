@@ -374,6 +374,40 @@ std::string respond(const std::string& line, Session* session) {
                                           read_params(line)), &out);
       return prefix + "true" + out + "}";
     }
+    if (op == "footer_row_fields") {
+      // Session-less like `escape`: the footer-row decoder alone, so the
+      // footer binding's representation rules -- decoded strings, NULL as
+      // a kind rather than a spelling, toUUID unwrapped -- are pinned on
+      // the CPU gate. Optionally compares each field against a catalog
+      // value, the way hydrate does.
+      const std::vector<dmi_catalog::FooterField> fields =
+          dmi_catalog::split_footer_row(jc::FindString(line, "row"));
+      std::vector<std::string> catalog;
+      const std::string catalog_array = jc::FindArray(line, "catalog");
+      if (!catalog_array.empty()) {
+        for (const std::string& item :
+             jc::SplitElements(jc::Unwrap(catalog_array))) {
+          catalog.push_back(jc::ParseLiteral(item));
+        }
+      }
+      out = ",\"fields\":[";
+      for (size_t i = 0; i < fields.size(); ++i) {
+        if (i) out += ",";
+        out += "{\"null\":";
+        out += fields[i].is_null ? "true" : "false";
+        out += ",\"text\":";
+        escape_into(fields[i].text, &out);
+        if (i < catalog.size()) {
+          out += ",\"matches\":";
+          out += dmi_catalog::footer_field_matches(catalog[i], fields[i])
+                     ? "true"
+                     : "false";
+        }
+        out += "}";
+      }
+      out += "]";
+      return prefix + "true" + out + "}";
+    }
     if (session->writer == nullptr) {
       return prefix + "false,\"what\":\"call open first\"}";
     }

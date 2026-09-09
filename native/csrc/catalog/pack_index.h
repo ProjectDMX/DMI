@@ -9,6 +9,7 @@
 #define DMI_CATALOG_PACK_INDEX_H
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -32,8 +33,15 @@ struct PackRefData {
 // The bucket is the S3Client's own config; a bucket parameter here would
 // only invite a caller to believe passing a different one redirects the
 // read.
+//
+// `charge`, when given, is called with the exact length of each range
+// BEFORE that range is fetched -- the 64-byte trailer, then the footer at
+// the length the trailer declares. It is the reader's read budget
+// (Python's _ReadBudget.consume): it throws to refuse, and nothing has
+// been fetched when it does.
 std::vector<std::string> read_pack_descriptor_rows(
-    dmi_store::S3Client* s3, const PackRefData& ref);
+    dmi_store::S3Client* s3, const PackRefData& ref,
+    const std::function<void(uint64_t)>& charge = nullptr);
 
 }  // namespace dmi_catalog
 

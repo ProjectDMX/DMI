@@ -13,7 +13,8 @@
 
 namespace dmi_common {
 
-// JSON string escape sequences back to raw bytes; \uXXXX to UTF-8 (BMP).
+// JSON string escape sequences back to raw bytes; \uXXXX to UTF-8, with a
+// UTF-16 surrogate pair combined into its one non-BMP code point.
 // `q` must be positioned just after the opening quote; returns with `q` on
 // the closing quote.
 std::string Unescape(const std::string& text, size_t& q);
@@ -41,8 +42,11 @@ enum class IntFind {
 // still text, so the domain has to be declared here rather than checked by
 // the caller afterwards.
 enum class IntDomain {
-  kUnion,   // [-2^63, 2^64-1] -- the default; unsigned destinations
-  kSigned,  // [-2^63, 2^63-1] -- destinations the oracle types as signed
+  kUnion,     // [-2^63, 2^64-1] -- the default
+  kSigned,    // [-2^63, 2^63-1] -- destinations the oracle types as signed
+  kUnsigned,  // [0, 2^64-1] -- destinations the oracle types as UNSIGNED:
+              // a negative literal is refused here, while the text still
+              // carries its sign, instead of wrapping in the uint64_t cast
 };
 
 // First integer value for `key` (either separator style), bounded before it
@@ -59,6 +63,10 @@ enum class IntDomain {
 // representable in the type the caller asked for, so there is no int64_t this
 // function could return that would be the right answer: only the caller can
 // decide how to refuse.
+//
+// The value has to be a COMPLETE integer token: digits followed by a JSON
+// delimiter. `"layer_number": 0.5` is kAbsent (present, but not an integer),
+// not 0 -- the digit prefix is not the value.
 IntFind FindIntChecked(const std::string& text, const std::string& key,
                        int64_t* out, IntDomain domain = IntDomain::kUnion);
 

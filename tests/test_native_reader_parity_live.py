@@ -2273,3 +2273,329 @@ def test_zero_element_tensor_hydrates_to_empty_bytes(fake_s3):
                 driver.close()
         finally:
             pass
+
+
+# --- review findings on the hydrate/summary path (PR #127) --------------------
+#
+# Each of these reproduces one reviewer repro against the live catalog:
+# metadata the SQL escaper rewrites, SQL NULL versus the string "NULL", the
+# footer byte budget, a rank-0 capture, and a non-BMP identifier. Python is
+# the oracle in every case.
+
+
+def _stage_meta(sink, root, meta, payload):
+    """`_stage` with the caller's CaptureMetadata, for values `_stage` fixes."""
+    import base64 as _base64
+    import subprocess as _subprocess
+
+    from tests.test_native_uploader import STORE_DRIVER
+
+    before = set(root.rglob("*.dmi-pack.ready")) if root.exists() else set()
+    assert sink.call(
+        op="open", root=str(root), max_bytes=1 << 40,
+        max_queue_records=256, max_queue_bytes=1 << 20,
+        max_pack_bytes=8 * 1024 * 1024, max_pack_records=10_000,
+        max_linger_ns=1_000_000_000, overload="drop_newest",
+        admission_timeout=-1,
+    )["ok"]
+    response = sink.call(
+        op="submit", metadata=meta.to_mapping(),
+        payload_b64=_base64.b64encode(payload).decode(),
+    )
+    assert response["admission"] == "accepted", response
+    assert sink.call(op="flush", timeout=30)["ok"]
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["persisted_records"] == 1, snapshot
+    new = set(root.rglob("*.dmi-pack.ready")) - before
+    assert len(new) == 1, new
+    recover = _subprocess.run(
+        [str(STORE_DRIVER.parent / "conformance_spool")],
+        input=json.dumps({"op": "recover", "root": str(root),
+                          "max_bytes": 1 << 40}) + "\n",
+        capture_output=True, text=True, timeout=30,
+    )
+    entries = json.loads(recover.stdout.strip())["staged"]
+    match = [e for e in entries if Path(e["path"]) in new]
+    assert len(match) == 1, entries
+    return match[0]
+
+
+def _review_meta(index, **overrides):
+    from dmi.storage.capture.model import CaptureMetadata
+
+    fields = dict(
+        capture_id=f"upload-{index:04d}", tenant_id="t", experiment_id="e",
+        run_id="r", session_id="s", request_id=f"q{index}",
+        sequence_id=f"n{index}", model_id="m", model_revision="mr",
+        adapter_revision=None, capture_policy_version="v", hook_name="h",
+        layer_number=0, producer_rank=0, step_number=index,
+        token_start=index, token_end=index + 1, batch_position=0,
+        dtype="uint8", shape=(16,),
+        captured_at_ns=1_700_000_000_000_000_000 + index,
+    )
+    fields.update(overrides)
+    return CaptureMetadata(**fields)
+
+
+def _review_setup(fake_s3, prefix, records):
+    """sink -> uploader -> native index for `records` = [(meta, payload)]."""
+    import tempfile
+
+    from tests.test_native_uploader import (
+        SINK_DRIVER, STORE_DRIVER, DriverSession, _store_base,
+    )
+
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    driver = CatalogDriver()
+    try:
+        spool_root = Path(tempfile.mkdtemp()) / "spool"
+        for meta, payload in records:
+            _stage_meta(sink, spool_root, meta, payload)
+        uploaded = store.call(
+            op="upload_pending", **_store_base(fake_s3),
+            root=str(spool_root), spool_max_bytes=1 << 40, limit=-1)
+        assert uploaded["ok"], uploaded
+        _open_helper(driver, prefix)
+        driver.call(op="acquire", holder="indexer")
+        result = driver.call(
+            op="index", refs=uploaded["refs"], endpoint=fake_s3,
+            bucket=BUCKET, region=REGION, access=ACCESS, secret=SECRET,
+            insecure=True)
+        assert result["ok"], result
+        assert result["result"]["indexed_packs"] == len(records), result
+        return sink, store, driver
+    except Exception:
+        sink.close()
+        store.close()
+        driver.close()
+        raise
+
+
+def _python_reader_for(client, config, fake_s3):
+    from dmi.storage.capture import CaptureReader, S3PackStore, S3StoreConfig
+    from dmi.storage.capture.clickhouse_reader import (
+        ClickHouseCaptureCatalog, ClickHouseReaderConfig,
+    )
+
+    return CaptureReader(
+        ClickHouseCaptureCatalog(
+            client, ClickHouseReaderConfig.from_catalog(config)),
+        {"native-test": S3PackStore.from_config(
+            S3StoreConfig(
+                endpoint_url=fake_s3, bucket=BUCKET, region=REGION,
+                access_key_id=ACCESS, secret_access_key=SECRET,
+                store_id="native-test", allow_insecure_http=True))})
+
+
+def _native_selection(driver, fake_s3):
+    native_select = driver.call(
+        op="select", tenant_id="t", limit=10, endpoint=fake_s3,
+        bucket=BUCKET, access=ACCESS, secret=SECRET, insecure=True)
+    assert native_select["ok"], native_select
+    return native_select["selection"]
+
+
+def _native_read(driver, op, sel, fake_s3, **limits):
+    limits.setdefault("byte_limit", 1 << 30)
+    return driver.call(
+        op=op, selection_id=sel["selection_id"],
+        capture_ids=sel["capture_ids"],
+        catalog_watermark=sel["catalog_watermark"],
+        filter_hash=sel["filter_hash"], tenant_id=sel["tenant_id"],
+        endpoint=fake_s3, bucket=BUCKET, access=ACCESS, secret=SECRET,
+        insecure=True, **limits)
+
+
+@pytest.mark.parametrize("hook_name", [
+    "block\\resid", "block'quoted", "block\tresid",
+])
+def test_hydrate_accepts_metadata_the_sql_escaper_rewrites(fake_s3, hook_name):
+    """The footer binding compares DECODED values, not escaped footer text.
+
+    The footer row renders hook_name through sql_quote (backslash, quote and
+    tab all rewritten); the catalog row is already decoded. Comparing the
+    two representations refused these three valid captures with "catalog
+    descriptor does not match the pack footer: field 12". Python hydrates
+    them; native must too, and hand back the same 16 bytes.
+    """
+    import base64 as _base64
+
+    from dmi.storage.capture.model import CaptureQuery
+
+    payload = bytes(range(16))
+    with _catalog() as (client, config, prefix):
+        sink, store, driver = _review_setup(
+            fake_s3, prefix, [(_review_meta(1, hook_name=hook_name), payload)])
+        try:
+            python_reader = _python_reader_for(client, config, fake_s3)
+            selection = python_reader.select(CaptureQuery(tenant_id="t", limit=10))
+            (hydrated,) = python_reader.hydrate(selection, byte_limit=1 << 30)
+            assert hydrated.payload == payload
+            assert hydrated.descriptor.metadata.hook_name == hook_name
+
+            sel = _native_selection(driver, fake_s3)
+            native = _native_read(driver, "hydrate", sel, fake_s3)
+            assert native["ok"], native
+            assert [_base64.b64decode(p) for p in native["payloads"]] == [payload]
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
+def test_hydrate_keeps_sql_null_apart_from_the_string_null(fake_s3):
+    """A footer adapter_revision of "NULL" (the string) must not bind to a
+    catalog row whose adapter_revision is SQL NULL.
+
+    The pack is written and indexed with the four-letter string; the
+    catalog row alone is then altered to NULL. Python refuses the
+    descriptor/footer mismatch; native used to normalise both spellings to
+    the same value and return the payload.
+    """
+    from dmi.storage.capture.model import CaptureQuery
+    from dmi.storage.capture.reader import PackFormatError
+
+    payload = bytes(range(16))
+    with _catalog() as (client, config, prefix):
+        sink, store, driver = _review_setup(
+            fake_s3, prefix,
+            [(_review_meta(1, adapter_revision="NULL"), payload)])
+        try:
+            python_reader = _python_reader_for(client, config, fake_s3)
+            selection = python_reader.select(CaptureQuery(tenant_id="t", limit=10))
+            # Control: with the catalog agreeing, both sides hydrate.
+            (hydrated,) = python_reader.hydrate(selection, byte_limit=1 << 30)
+            assert hydrated.descriptor.metadata.adapter_revision == "NULL"
+            sel = _native_selection(driver, fake_s3)
+            assert _native_read(driver, "hydrate", sel, fake_s3)["ok"]
+
+            database = config.database
+            client.execute(
+                f"ALTER TABLE `{database}`.`{prefix}_capture_raw` "
+                "UPDATE adapter_revision = NULL WHERE 1 "
+                "SETTINGS mutations_sync = 2")
+
+            selection = python_reader.select(CaptureQuery(tenant_id="t", limit=10))
+            with pytest.raises(PackFormatError, match="does not match the pack footer"):
+                python_reader.hydrate(selection, byte_limit=1 << 30)
+
+            sel = _native_selection(driver, fake_s3)
+            native = _native_read(driver, "hydrate", sel, fake_s3)
+            assert not native["ok"], native
+            assert "does not match the pack footer" in native["message"], native
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
+def test_the_footer_byte_budget_is_charged_before_the_footer_is_fetched(fake_s3):
+    """byte_limit covers the footer reads too, checked BEFORE each fetch.
+
+    One 16-byte capture, byte_limit=16, request_limit=3: the payload alone
+    fits both limits, the trailer and footer do not fit the bytes. Python
+    refuses (HydrationLimitError). Native checked the running footer total
+    before charging the current pack, so for a one-pack selection there was
+    no later iteration to refuse and it made all three GETs.
+    """
+    from dmi.storage.capture.model import CaptureQuery
+    from dmi.storage.capture.reader import HydrationLimitError
+
+    payload = bytes(range(16))
+    with _catalog() as (client, config, prefix):
+        sink, store, driver = _review_setup(
+            fake_s3, prefix, [(_review_meta(1), payload)])
+        try:
+            python_reader = _python_reader_for(client, config, fake_s3)
+            selection = python_reader.select(CaptureQuery(tenant_id="t", limit=10))
+            with pytest.raises(HydrationLimitError, match="byte limit"):
+                python_reader.hydrate(selection, byte_limit=16, request_limit=3)
+
+            sel = _native_selection(driver, fake_s3)
+            refused = _native_read(driver, "hydrate", sel, fake_s3,
+                                   byte_limit=16, request_limit=3)
+            assert not refused["ok"], refused
+            assert "hydration byte limit exceeded" in refused["message"], refused
+
+            # Control: the same three requests with room for the bytes.
+            granted = _native_read(driver, "hydrate", sel, fake_s3,
+                                   byte_limit=1 << 30, request_limit=3)
+            assert granted["ok"], granted
+            # And the request half is still enforced with room for the bytes.
+            refused = _native_read(driver, "hydrate", sel, fake_s3,
+                                   byte_limit=1 << 30, request_limit=2)
+            assert not refused["ok"], refused
+            assert "hydration request limit exceeded" in refused["message"], refused
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
+def test_a_scalar_capture_hydrates_and_summarises(fake_s3):
+    """shape=() is one element: admitted by the sink, summarised natively."""
+    import base64 as _base64
+    import struct
+
+    from dmi.storage.capture.model import CaptureQuery
+
+    payload = struct.pack("<f", 3.5)
+    with _catalog() as (client, config, prefix):
+        sink, store, driver = _review_setup(
+            fake_s3, prefix,
+            [(_review_meta(1, dtype="float32", shape=()), payload)])
+        try:
+            python_reader = _python_reader_for(client, config, fake_s3)
+            selection = python_reader.select(CaptureQuery(tenant_id="t", limit=10))
+            (expected,) = python_reader.summarize(selection, byte_limit=1 << 30)
+            assert expected.core.element_count == 1
+
+            sel = _native_selection(driver, fake_s3)
+            hydrated = _native_read(driver, "hydrate", sel, fake_s3)
+            assert hydrated["ok"], hydrated
+            assert [_base64.b64decode(p) for p in hydrated["payloads"]] == [payload]
+            native = _native_read(driver, "summarize_core", sel, fake_s3)
+            assert native["ok"], native
+            (summary,) = native["summaries"]
+            assert summary["element_count"] == 1
+            assert summary["mean"] == expected.core.mean == 3.5
+        finally:
+            sink.close()
+            store.close()
+            driver.close()
+
+
+def test_a_non_bmp_hook_name_indexes_intact(fake_s3):
+    """A surrogate pair in the footer JSON is one code point in the catalog.
+
+    The canonical footer spells U+1F600 as \\ud83d\\ude00; the indexer used to
+    encode each half separately, so the catalog held six bytes that are not
+    UTF-8 and the Python reader's search raised UnicodeDecodeError.
+    """
+    from dmi.storage.capture.model import CaptureQuery
+
+    hook_name = "block\U0001F600"
+    payload = bytes(range(16))
+    with _catalog() as (client, config, prefix):
+        sink, store, driver = _review_setup(
+            fake_s3, prefix, [(_review_meta(1, hook_name=hook_name), payload)])
+        try:
+            (stored,) = client.execute(
+                f"SELECT hex(hook_name) FROM `{config.database}`."
+                f"`{prefix}_capture_raw`")
+            assert stored[0].lower() == hook_name.encode("utf-8").hex()
+
+            python_reader = _python_reader_for(client, config, fake_s3)
+            selection = python_reader.select(CaptureQuery(tenant_id="t", limit=10))
+            (hydrated,) = python_reader.hydrate(selection, byte_limit=1 << 30)
+            assert hydrated.descriptor.metadata.hook_name == hook_name
+
+            native = driver.call(op="search", limit=10, tenant_id="t",
+                                 hook_names=[hook_name])
+            assert native["ok"], native
+            assert len(native["items"]) == 1, native
+        finally:
+            sink.close()
+            store.close()
+            driver.close()

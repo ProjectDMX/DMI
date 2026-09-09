@@ -258,8 +258,11 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
   }
   out->root_ = resolved;
   out->max_bytes_ = config.max_bytes;
-  out->bytes_ = 0;
-  out->entries_ = 0;
+  out->committed_bytes_ = 0;
+  out->committed_entries_ = 0;
+  out->reserved_bytes_ = 0;
+  out->reserved_entries_ = 0;
+  out->inflight_temps_.clear();
   out->peak_bytes_ = 0;
   out->generation_ = 0;
   // Account pre-existing files exactly like the Python constructor: ready
@@ -272,11 +275,16 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
     const bool is_ready = HasSuffix(name, kReadySuffix);
     const bool is_open = HasSuffix(name, kOpenSuffix);
     if (!is_ready && !is_open) continue;
-    out->bytes_ += entry.file_size();
-    if (is_ready) ++out->entries_;
+    out->committed_bytes_ += entry.file_size();
+    if (is_ready) ++out->committed_entries_;
   }
-  out->peak_bytes_ = out->bytes_;
+  out->peak_bytes_ = out->committed_bytes_;
   return SpoolStatus::kOk;
+}
+
+void Spool::SetStageHookForTesting(std::function<void()> hook) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  stage_hook_for_testing_ = std::move(hook);
 }
 
 SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
@@ -313,12 +321,27 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
       dir + "/" + ReadyName(pack_id, created_at_ns, record_count, checksum);
   const std::string upload_key =
       (parent.empty() ? "" : parent + "/") + pack_id + ".dmi-pack";
+  // Temp file in the same directory (link atomicity needs it). Named
+  // before the reservation so the reservation can register it: a
+  // reconciling scan must skip THIS stage's own .open file, which its
+  // reservation already accounts for.
+  std::string temp = dir + "/." + pack_id + ".";
+  {
+    std::random_device rd;
+    for (int i = 0; i < 8; ++i) {
+      static const char* kDigits = "0123456789abcdef";
+      temp.push_back(kDigits[rd() & 0xF]);
+    }
+    temp += ".open";
+  }
 
   // Phase 1 (locked): decide retry vs fresh, reserve capacity. File I/O
   // stays outside the lock so concurrent workers never serialize on disk.
   bool retry = false;
+  std::function<void()> stage_hook;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    stage_hook = stage_hook_for_testing_;
     std::error_code ec;
     if (fs::exists(ready, ec)) {
       retry = true;
@@ -337,59 +360,80 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
           return SpoolStatus::kConflict;
         }
       }
-      if (bytes_ + n > max_bytes_) {
-        // The in-process counter is only as fresh as the Remove calls THIS
+      if (committed_bytes_ + reserved_bytes_ + n > max_bytes_) {
+        // The committed counter is only as fresh as the Remove calls THIS
         // Spool object has seen. An uploader running through a second
         // Spool object on the same root (or another process) removes
-        // ready files and its counter updates its OWN bytes_ — this
-        // object's counter never learns about the released capacity, so
-        // staging eventually refuses on a directory that is actually
-        // empty (reproduced: sink with a 1500-byte limit, serial
-        // upload-and-remove between two records). Reconcile from the
-        // directory — the durable truth — before refusing.
+        // ready files and updates its OWN counter — this object's never
+        // learns about the released capacity, so staging eventually
+        // refuses on a directory that is actually empty (reproduced: sink
+        // with a 1500-byte limit, serial upload-and-remove between two
+        // records). Reconcile the COMMITTED account from the directory —
+        // the durable truth for what is committed — before refusing.
+        //
+        // The scan is authoritative for committed files only. The
+        // reservations other stagers hold right now are not on disk (or
+        // are, as a temp file this object already accounts for), so they
+        // are kept as they are and added back on top: replacing a single
+        // combined counter with the scan admitted a concurrent stage the
+        // reservation should have refused.
         uint64_t actual = 0;
+        uint64_t ready_count = 0;
         std::error_code walk_ec;
         for (const auto& entry :
              fs::recursive_directory_iterator(root_, walk_ec)) {
           if (walk_ec) break;
           if (!entry.is_regular_file()) continue;
           const std::string name = entry.path().filename().string();
-          if (HasSuffix(name, kReadySuffix) || HasSuffix(name, kOpenSuffix)) {
+          if (HasSuffix(name, kReadySuffix)) {
+            actual += entry.file_size();
+            ++ready_count;
+          } else if (HasSuffix(name, kOpenSuffix) &&
+                     inflight_temps_.count(entry.path().string()) == 0) {
+            // Someone else's in-progress write (another process, or a
+            // stale leftover Recover() has not swept yet): counts, as it
+            // does at Open(). This object's own temps are reservations.
             actual += entry.file_size();
           }
         }
-        uint64_t ready_count = 0;
-        for (const auto& entry :
-             fs::recursive_directory_iterator(root_, walk_ec)) {
-          if (walk_ec) break;
-          if (!entry.is_regular_file()) continue;
-          const std::string name = entry.path().filename().string();
-          if (HasSuffix(name, kReadySuffix)) ++ready_count;
-        }
-        bytes_ = actual;
-        entries_ = ready_count;
-        if (bytes_ + n > max_bytes_) {
+        committed_bytes_ = actual;
+        committed_entries_ = ready_count;
+        if (committed_bytes_ + reserved_bytes_ + n > max_bytes_) {
           if (error) {
             *error = "spool byte limit exceeded: " +
-                     std::to_string(bytes_ + n) + " > " +
-                     std::to_string(max_bytes_);
+                     std::to_string(committed_bytes_ + reserved_bytes_ + n) +
+                     " > " + std::to_string(max_bytes_);
           }
           return SpoolStatus::kFull;
         }
       }
       // Reserve now: the link below is the atomic commit, and two workers
       // racing fresh stages must not both pass the capacity check.
-      bytes_ += n;
-      ++entries_;
-      peak_bytes_ = std::max(peak_bytes_, bytes_);
+      reserved_bytes_ += n;
+      ++reserved_entries_;
+      inflight_temps_.insert(temp);
+      peak_bytes_ = std::max(peak_bytes_, committed_bytes_ + reserved_bytes_);
       ++generation_;
     }
   }
 
+  // Release this stage's reservation without committing anything.
   auto unreserve = [&] {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (bytes_ >= n) bytes_ -= n;
-    if (entries_ > 0) --entries_;
+    if (reserved_bytes_ >= n) reserved_bytes_ -= n;
+    if (reserved_entries_ > 0) --reserved_entries_;
+    inflight_temps_.erase(temp);
+    ++generation_;
+  };
+  // Move this stage's reservation into the committed account: the ready
+  // file now exists, so a scan will see it from here on.
+  auto commit_reservation = [&] {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (reserved_bytes_ >= n) reserved_bytes_ -= n;
+    if (reserved_entries_ > 0) --reserved_entries_;
+    inflight_temps_.erase(temp);
+    committed_bytes_ += n;
+    ++committed_entries_;
     ++generation_;
   };
   auto fill_out = [&] {
@@ -432,6 +476,9 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
     return SpoolStatus::kOk;
   }
 
+  // Reservation held, nothing on disk yet: the window the test seam opens.
+  if (stage_hook) stage_hook();
+
   std::error_code ec;
   fs::create_directories(dir, ec);
   if (ec) {
@@ -439,14 +486,6 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
     if (error) *error = "cannot create spool directory: " + ec.message();
     return SpoolStatus::kIo;
   }
-  // Temp file in the same directory (link atomicity needs it).
-  std::random_device rd;
-  std::string temp = dir + "/." + pack_id + ".";
-  for (int i = 0; i < 8; ++i) {
-    static const char* kDigits = "0123456789abcdef";
-    temp.push_back(kDigits[rd() & 0xF]);
-  }
-  temp += ".open";
   if (!WriteFileSynced(temp, data, n, error)) {
     unreserve();
     ::unlink(temp.c_str());
@@ -478,9 +517,10 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
     ::unlink(temp.c_str());
     return SpoolStatus::kIo;
   }
-  // Linked: the reservation stands, the temp name goes, and the directory
-  // chain is synced (outside the lock).
+  // Linked: the reservation becomes a committed file, the temp name goes,
+  // and the directory chain is synced (outside the lock).
   ::unlink(temp.c_str());
+  commit_reservation();
   if (!FsyncChain(root_, dir, error)) return SpoolStatus::kIo;
   fill_out();
   return SpoolStatus::kOk;
@@ -542,9 +582,11 @@ SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error) {
     out->push_back(std::move(staged));
     bytes += size;
   }
-  bytes_ = bytes;
-  entries_ = out->size();
-  peak_bytes_ = std::max(peak_bytes_, bytes_);
+  // Recovery rebuilds the committed account only; a stage in flight on
+  // another thread keeps its reservation.
+  committed_bytes_ = bytes;
+  committed_entries_ = out->size();
+  peak_bytes_ = std::max(peak_bytes_, committed_bytes_ + reserved_bytes_);
   ++generation_;
   (void)error;
   return SpoolStatus::kOk;
@@ -556,8 +598,10 @@ SpoolStatus Spool::Remove(const StagedPack& staged, std::string* error) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::error_code ec;
     if (!fs::exists(staged.path, ec)) {
-      if (bytes_ >= staged.object_bytes) bytes_ -= staged.object_bytes;
-      if (entries_ > 0) --entries_;
+      if (committed_bytes_ >= staged.object_bytes) {
+        committed_bytes_ -= staged.object_bytes;
+      }
+      if (committed_entries_ > 0) --committed_entries_;
       ++generation_;
       return SpoolStatus::kOk;
     }
@@ -572,8 +616,10 @@ SpoolStatus Spool::Remove(const StagedPack& staged, std::string* error) {
       return SpoolStatus::kIntegrity;
     }
     ::unlink(staged.path.c_str());
-    if (bytes_ >= staged.object_bytes) bytes_ -= staged.object_bytes;
-    if (entries_ > 0) --entries_;
+    if (committed_bytes_ >= staged.object_bytes) {
+      committed_bytes_ -= staged.object_bytes;
+    }
+    if (committed_entries_ > 0) --committed_entries_;
     ++generation_;
     parent = fs::path(staged.path).parent_path().string();
   }
@@ -586,8 +632,10 @@ SpoolStatus Spool::Remove(const StagedPack& staged, std::string* error) {
 SpoolSnapshot Spool::Snapshot() const {
   std::lock_guard<std::mutex> lock(mutex_);
   SpoolSnapshot snapshot;
-  snapshot.entries = entries_;
-  snapshot.bytes = bytes_;
+  // The snapshot reports what capacity is judged against: committed plus
+  // reserved, exactly as the single counter did before the split.
+  snapshot.entries = committed_entries_ + reserved_entries_;
+  snapshot.bytes = committed_bytes_ + reserved_bytes_;
   snapshot.peak_bytes = peak_bytes_;
   snapshot.max_bytes = max_bytes_;
   return snapshot;

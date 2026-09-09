@@ -1095,3 +1095,110 @@ def test_pipeline_head_to_head_with_python_reference(tmp_path):
     assert set(native_union) == set(python_union) == \
         {f"capture-{i:06d}" for i in range(len(records))}
     assert native_union == python_union
+
+
+# --- metadata decoding at the sink boundary -----------------------------------
+#
+# The sink's metadata parser is the native side of CaptureMetadata.from_mapping:
+# everything the Python constructor refuses must be refused here, and
+# everything it admits must come out of the staged pack byte-identical.
+# Three gaps were reachable through submit_row with a valid envelope:
+#   * a JSON surrogate pair (json.dumps writes U+1F600 as 😀) was
+#     decoded as two three-byte sequences -- six bytes that are not UTF-8;
+#   * a digit prefix stood in for the whole number (0.5 -> 0, 123.5 -> 123,
+#     [16.5] -> [16]) and a negative counter wrapped to 2**64-1;
+#   * the scalar shape [] was refused as "not an integer list".
+
+
+def _read_staged_metadata(root):
+    spool = DurablePackSpool(root, max_bytes=1 << 40)
+    recovered = spool.recover()
+    assert len(recovered) == 1, recovered
+    with recovered[0].open() as handle:
+        descriptors = PackReader.from_bytes(handle.read()).descriptors(
+            store_id="spool", object_key=recovered[0].object_key
+        )
+    return [d.metadata for d in descriptors]
+
+
+@pytest.mark.parametrize("hook_name", ["block\U0001F600", "block中文"])
+def test_a_non_bmp_identifier_survives_the_metadata_decoder(sink, tmp_path,
+                                                             hook_name):
+    """A surrogate pair is ONE code point; the BMP name is the control."""
+    _open(sink, tmp_path / "spool")
+    metadata = _row_meta(0, dtype="uint8", shape=[64], hook_name=hook_name)
+    assert "\\ud83d\\ude00" in metadata or "\\u4e2d" in metadata, metadata
+    response = _submit_row(sink, metadata, bytes(64), "uint8", [64])
+    assert response["ok"], response
+    assert sink.call(op="flush", timeout=30)["ok"]
+    assert sink.call(op="close", timeout=30)["snapshot"]["persisted_records"] == 1
+    (staged,) = _read_staged_metadata(tmp_path / "spool")
+    assert staged.hook_name == hook_name
+    assert staged.hook_name.encode("utf-8") == hook_name.encode("utf-8")
+
+
+@pytest.mark.parametrize("field, value, reason", [
+    ("layer_number", 0.5, "not an integer"),
+    ("captured_at_ns", 123.5, "not an integer"),
+    ("step_number", -1, "out of range"),
+    ("producer_rank", -1, "out of range"),
+    ("token_start", -1, "out of range"),
+    ("batch_position", -1, "out of range"),
+])
+def test_invalid_numeric_metadata_is_refused_not_converted(sink, tmp_path,
+                                                            field, value,
+                                                            reason):
+    """The whole token must be an integer, and unsigned counters non-negative.
+
+    Python's CaptureMetadata refuses each of these (the oracle assertion
+    below); the sink used to persist 0, 123 and 18446744073709551615.
+    """
+    from dmi.storage.capture.model import CaptureStorageError
+
+    _open(sink, tmp_path / "spool")
+    metadata = _row_meta(0, dtype="uint8", shape=[64], **{field: value})
+    response = _submit_row(sink, metadata, bytes(64), "uint8", [64])
+    assert not response["ok"], (field, value, response)
+    assert reason in response["what"], (field, value, response)
+    with pytest.raises((CaptureStorageError, ValueError, TypeError)):
+        CaptureMetadata.from_mapping(json.loads(metadata))
+    assert sink.call(op="close", timeout=30)["snapshot"]["submitted_records"] == 0
+
+
+def test_a_fractional_shape_dimension_is_refused_not_truncated(sink, tmp_path):
+    from dmi.storage.capture.model import CaptureStorageError
+
+    _open(sink, tmp_path / "spool")
+    metadata = _row_meta(0, dtype="uint8", shape=[64])
+    metadata = metadata.replace('"shape": [64]', '"shape": [64.5]')
+    assert '"shape": [64.5]' in metadata
+    response = _submit_row(sink, metadata, bytes(64), "uint8", [64])
+    assert not response["ok"], response
+    assert "integer list" in response["what"], response
+    with pytest.raises((CaptureStorageError, ValueError, TypeError)):
+        CaptureMetadata.from_mapping(json.loads(metadata))
+
+
+def test_a_scalar_shape_is_admitted_as_one_element(sink, tmp_path):
+    """shape=[] is rank 0: one element, dtype-width bytes."""
+    _open(sink, tmp_path / "spool")
+    metadata = _row_meta(0, dtype="float32", shape=[])
+    assert CaptureMetadata.from_mapping(json.loads(metadata)).shape == ()
+    payload = b"\x00\x00\x60\x40"  # 3.5f
+    response = _submit_row(sink, metadata, payload, "float32", [])
+    assert response["ok"], response
+    assert sink.call(op="flush", timeout=30)["ok"]
+    assert sink.call(op="close", timeout=30)["snapshot"]["persisted_records"] == 1
+    (staged,) = _read_staged_metadata(tmp_path / "spool")
+    assert staged.shape == ()
+    assert staged.dtype == "float32"
+
+
+def test_a_missing_shape_is_still_refused(sink, tmp_path):
+    """The scalar fix must not turn an ABSENT shape into a scalar."""
+    _open(sink, tmp_path / "spool")
+    mapping = json.loads(_row_meta(0, dtype="uint8", shape=[64]))
+    del mapping["shape"]
+    response = _submit_row(sink, json.dumps(mapping), bytes(64), "uint8", [64])
+    assert not response["ok"], response
+    assert "integer list" in response["what"], response
