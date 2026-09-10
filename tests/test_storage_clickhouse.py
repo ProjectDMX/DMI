@@ -356,3 +356,45 @@ def test_property_getters():
     assert reader.primary_keys_columns == ("model_id", "request_id")
     assert reader.value_columns == ("dtype", "shape", "bytes")
     assert reader.columns == ("model_id", "request_id", "dtype", "shape", "bytes")
+
+
+# --- identifier quoting -------------------------------------------------------
+
+
+def test_a_database_name_cannot_break_out_of_its_backtick_quoting():
+    """`database` is interpolated into every prefilled statement, like `table`.
+
+    `table` has always been refused when it carries a backtick; `database` was
+    stored raw, so a name closing its own quoting rewrote the whole statement
+    -- `default`.`other` -- commented out the intended table, WHERE and ORDER
+    BY, and `prefix_get` silently read a different table.
+    """
+    with pytest.raises(ValueError, match="Invalid database identifier"):
+        CHClickhouseDriverReadOnly(database="default`.`other` -- ")
+
+    # The escape hatch a backslash would give in some dialects is refused too,
+    # so the check does not depend on which escaping ClickHouse honours.
+    with pytest.raises(ValueError, match="Invalid database identifier"):
+        CHClickhouseDriverReadOnly(database="bad\\`name")
+
+    for control in ("has\nnewline", "has\0nul"):
+        with pytest.raises(ValueError, match="Invalid database identifier"):
+            CHClickhouseDriverReadOnly(database=control)
+
+
+def test_a_legal_backquoted_database_name_still_works():
+    """The positive control, and the reason this is not `_validate_ident`.
+
+    ClickHouse accepts hyphens, digits-first and non-ASCII in a backquoted
+    database name, and this class backticks. Validating `database` with the
+    column rule (`[A-Za-z_][A-Za-z0-9_]*`) would reject every name below and
+    break deployments the documented `database: str` signature permits, so the
+    check refuses only what can escape the quoting.
+    """
+    for legal in ("my-analytics-db", "9lives", "défaut", "default"):
+        reader = CHClickhouseDriverReadOnly(
+            database=legal,
+            primary_key_column_names=("model_id",),
+        )
+        assert reader.database == legal
+        assert f"FROM `{legal}`.`offload`" in reader._prefix_select_sql_with_key[0]
