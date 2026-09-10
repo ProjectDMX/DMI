@@ -614,3 +614,200 @@ Still open, for the human:
 - six confirmed-but-`optional` findings, listed in the PR description's
   "deliberately not fixed" table
 - the quiet-host benchmark re-measure, unchanged from Checkpoint B
+
+---
+
+# Polish run 2 — Python source (`src/dmi`)
+
+Invoked with no target, so the scope is the project's main source directory,
+chosen by the orchestrator and stated to the human: the 48 tracked Python
+files under `src/dmi/` (16,427 lines). The previous run above covered
+`native/csrc/` (the C++ path), so this run takes the Python side.
+
+Not in scope: `src/dmi/configuration/` and `src/dmi/ui/` exist on disk but
+hold only stale `__pycache__` on this branch — PR #122 owns that source and
+it is under active review there. `native/csrc/` was run 1's scope.
+
+## Phase 0 — Preconditions
+
+Working tree clean. Baseline ref: `480e95b`, branch `pr-127`.
+
+Branch position worth recording, because it shapes how the final diff reads:
+`pr-127` is 72 commits ahead of `origin/main` and 1 behind. Its work already
+landed on `main` as the squash `dac94dc` (#127), so this branch is the
+unsquashed history plus later e2e commits. The polish diff must therefore be
+read against `480e95b`, not against `main`.
+
+## Phase 1 — Baseline numbers, measured at `480e95b`
+
+| Check | Command | Baseline |
+|---|---|---|
+| compile | `python -m compileall -q src/dmi tests benchmarks examples` | clean, exit 0 |
+| test (cpu) | `python -m pytest -m cpu -q` | **1461 passed, 0 failed, 0 skipped**, 295 deselected, 50.3s |
+| lint | — | **not measured**: no ruff/flake8/black config in `pyproject.toml` |
+| types | — | **not measured**: no mypy/pyright config in `pyproject.toml` |
+| coverage | — | **not measured**: project measures none |
+
+Lint/types/coverage are recorded as unmeasured rather than introduced. The
+run's brief is to polish existing code, not to add tooling the project has
+not adopted.
+
+Environment note that cost real time and belongs in the record: bare `python`
+on this box is a wrapper shim that exits non-zero with "real python binary not
+found on PATH", which silently empties any `$(shell $(PYTHON) ...)` probe in a
+Makefile. Every command in this run uses
+`/home/alan/git/DMI/.venv/bin/python` (3.10.17, torch 2.14.0+cu130) with
+`PYTHONPATH=$PWD/src`. `make test-package` cannot run here at all — the
+sandbox interpreter has no `ensurepip` — and is delegated to CI, where it
+passes.
+
+## Phase 2 — Review round 1
+
+Four `loop-reviewer` lenses dispatched in parallel with independent contexts:
+correctness, simplification, test-coverage, consistency. Findings below once
+they return and the verifiers have ruled.
+
+### Round 1 results
+
+39 findings reported by 4 lenses; 24 (every one with correctness/requirement
+impact) sent to independent adversarial verifiers. Verdicts:
+
+| # | Finding | Verdict | Impact | Disposition |
+|---|---|---|---|---|
+| T3 | records.py:444-476 `_validate_payload_slices` untested | CONFIRMED | correctness/high | QUEUED |
+| T1 | selection.py:113-228 PP/TP filter surface untested | CONFIRMED | requirement/high | QUEUED |
+| T6 | clickhouse_catalog.py:686-702 lease quarantine untested | CONFIRMED | requirement/high | QUEUED |
+| T2 | records.py:531 `_validate_cell` branches untested | CONFIRMED | correctness/med | QUEUED |
+| T5 | record_adapter.py:261-268,295-298 sink guards untested | CONFIRMED | requirement/med | QUEUED |
+| T7 | ring.py:422-443 CPU-direct branches untested | CONFIRMED | requirement/med | QUEUED |
+| T8 | specs.py:280 batched FINAL_LOGITS cap untested | CONFIRMED | requirement/med | QUEUED |
+| T9 | engine.py:271-272,341-361 guard+rollback untested | CONFIRMED | requirement/med | QUEUED |
+| T10 | reader.py:348-351 footer byte-budget eviction untested | CONFIRMED | requirement/med | QUEUED |
+| C1 | adapter.py:325 detach_model never disarms hooks | CONFIRMED | correctness/high | **HUMAN** |
+| C3 | generation.py:590 decode omits attention_mask | CONFIRMED | correctness/med | **HUMAN** |
+| X1 | generation.py:482-496 silent no-engine monitoring | CONFIRMED | requirement/med | **HUMAN** |
+| C8 | generation.py:295 short-circuit `or` strips one key | CONFIRMED | correctness/low | **HUMAN** |
+| C2 | base.py:280 dtype under-reservation | REFUTED | — | documented contract |
+| C4 | adapter.py:310 swallowed before_forward | REFUTED | — | no reachable raise |
+| C7 | selection.py:120 final_logits vocab_size==0 | REFUTED | — | zero-width tensor |
+| C9 | ring.py:456 ZeroDivisionError | REFUTED | — | `or` short-circuits |
+| X2 | internals.py:244-249 ctor skips bounds | REFUTED | — | documented contract |
+| T4 | pipeline.py:604-618 flush reuse branch | REFUTED | — | branch IS exercised |
+| C5 | reassembly.py:106 narrow uses wrong axis cap | CONFIRMED | optional | not queued |
+| C6 | internals.py:527 permanent AttributeError retried | CONFIRMED | optional | not queued |
+| S1 | api/v1/model_shape.py duplicates HF helper | CONFIRMED | optional | not queued |
+| X4 | point.py:328 `self.name` never initialised | CONFIRMED | optional | not queued |
+| X5 | native_sink.py:116 docstring names wrong member | CONFIRMED | optional | not queued |
+
+Four of the nine queued items had the reviewer's own reasoning corrected by
+the verifier, which is the argument for keeping the verify step: T7's
+PREFIX_STRIP `min()` is an EQUIVALENT MUTANT no test can kill (Python slicing
+already clamps; `max(0, ...)` carries the semantics); T9's state reset is
+redundant for create/init/start failures and observable only when
+`activate()` raises; T5's gap is four guards, not the two reported; T2's
+"straight to ClickHouse" claim is wrong because `bindings.cpp` re-checks
+INT32 range — the real residual is that the native throw happens AFTER
+`reserve_record`, leaving an unmatched reservation.
+
+Process failure worth recording: the verifiers were first dispatched against
+the ONE shared checkout, and several mutated source while others ran the full
+suite. Three of them independently reported impossible baselines (12 failed /
+8 failed / 18 collection errors) before being moved into isolated worktrees.
+Any mutation run must own its own worktree; that is now the standing
+instruction in every dispatch.
+
+### Round 1 fix results — ALL GREEN
+
+| Check | Baseline (480e95b) | After round 1 |
+|---|---|---|
+| test (cpu) | 1461 passed, 0 failed, 0 skipped | **1508 passed, 0 failed, 0 skipped** |
+| deselected | 295 | 295 (unchanged) |
+| compile | exit 0 | exit 0 |
+| collection errors | 0 | 0 |
+| non-hardware skips (CI gate) | 0 | 0 |
+
++41 new test functions, +47 collected items (three are parametrized). Every
+one of the 9 queued findings was closed by ADDED TESTS ONLY -- `git diff
+--stat -- src/` is empty across all eight commits. Nine findings, eight
+commits (T2 and T3 share tests/test_record_runtime.py).
+
+Each new test was mutation-checked against a throwaway copy of `src`, never
+the real tree. Two mechanical traps found and recorded, because both silently
+invalidate a mutation run:
+  1. `pyproject.toml` sets `pythonpath = ["src"]`, which pytest inserts AHEAD
+     of `PYTHONPATH` -- so exporting `PYTHONPATH=<copy>/src` does nothing and
+     the real source is imported. Use `-o pythonpath=<copy>`.
+  2. The editable install registers an `__editable__` meta-path finder that
+     beats both. One builder's first mutation run was invalid for this reason
+     and it had to strip that finder in a conftest.
+A mutation that appears to "survive" is indistinguishable from a mutation
+that never applied, so a run must prove at least one test flips before any
+survival is believed.
+
+## Round 2
+
+Four fresh lenses on the same scope. 34 findings; 11 dropped as already SEEN
+in round 1 (the dedup is against seen rather than confirmed, which is what
+stopped round 1's refuted `vocab_size==0` finding from resurfacing when the
+round-2 consistency lens re-discovered it). 15 queueable findings verified.
+
+| # | Finding | Verdict | Disposition |
+|---|---|---|---|
+| base.py:259 | `plan_step` body never entered | CONFIRMED high | FIXED (14 tests) |
+| base.py:167 | `attach_model` pipeline never executed | CONFIRMED med | FIXED (same file) |
+| records.py:308 | successful device-gated bind untested | CONFIRMED med | FIXED |
+| records.py:347 | replay arity guard never fires | CONFIRMED med | FIXED |
+| records.py:433,438 | producer dtype/shape drift refusals | CONFIRMED med | FIXED |
+| selection.py:101 | unknown-token / empty-selection refusals | CONFIRMED med | FIXED |
+| dispatch.py:41 | `install_ring_hooks` never invoked | CONFIRMED med | FIXED |
+| specs.py:121 | `hook_row_basis` never called | CONFIRMED med | FIXED |
+| reader.py:333 | footer-cache recency-on-hit | CONFIRMED med | FIXED |
+| engine.py:473 | `next_auto_group_id` untested | CONFIRMED med | FIXED |
+| point.py:297,301 | eager net ignores staging cap | CONFIRMED **high** | **HUMAN** |
+| generation.py:623 | list `eos_token_id` raises | CONFIRMED med | **HUMAN** |
+| internals.py:66 | `sorted()` compares tensors on tie | CONFIRMED med | **HUMAN** |
+| clickhouse.py:62 | `database` not validated | REFUTED | documented; fix would break legal names |
+| filesystem.py:285 | `stat` laxer than S3 | REFUTED | no production caller; hydration fails closed |
+| reader.py:341 | recency at :342 | REFUTED as filed | re-filed at :333, then fixed |
+
+### Round 2 fix results — ALL GREEN
+
+| Check | d5ac514 | After round 2 |
+|---|---|---|
+| test (cpu), fixed order | 1508 passed / 0 failed / 0 skipped | **1532 passed / 0 failed / 0 skipped** |
+| test (cpu), 3 shuffled seeds | not measured | 1532 passed each, identical name sets |
+| deselected | 295 | 295 |
+| compile | exit 0 | exit 0 |
+| CI skip gate | 0 unexplained | 0 unexplained |
+
+Nine findings, seven commits, +24 tests, `git diff --stat -- src/` empty.
+
+### Why this run stops at two rounds
+
+Round 2 was NOT a dry round, so the loop's own criterion says continue. I am
+stopping anyway and recording it as a deliberate deviation rather than a
+convergence claim. Round 2 found MORE queueable findings than round 1 (15 vs
+9), and both lenses that cap their output reported truncation: simplification
+"MORE BEYOND CAP: 18", test-coverage "MORE BEYOND CAP: 5". This scope has
+never been systematically covered, so a third round would find more again and
+the 3-round budget cannot converge it. A verified ledger plus an explicit
+statement of the unreported surface is worth more to the human than a third
+grind that still ends mid-queue.
+
+### Methodological corrections earned this run
+
+1. `pytest-randomly` is NOT installed in this venv, so every `-p no:randomly`
+   in this run was a NO-OP. Order-independence was established only when the
+   checker wrote its own shuffle plugin and ran three seeds. Do not cite that
+   flag as evidence of anything here.
+2. Four separate agents were fooled by the `pythonpath = ["src"]` /
+   `__editable__` precedence before catching themselves. A "surviving" mutant
+   and a mutant that never loaded are indistinguishable, so every mutation
+   session must first kill a known-covered mutant to prove its own harness.
+3. Verifiers corrected the reviewers on five confirmed findings and refuted
+   seven outright across both rounds. Two refutations turned on the SAME
+   cause: the asymmetry was documented design in `docs/integration-api-v1.md`.
+   Grep the published contract before filing an inconsistency.
+4. A builder corrected a verifier: two of three reader mutants it called
+   uncovered were already killed by existing tests, one of them by this run's
+   own round-1 commit. Trust nothing in the chain without re-deriving it.

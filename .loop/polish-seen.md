@@ -172,3 +172,80 @@ round cannot rediscover them as "fresh":
 - pack_sink.cpp | std::runtime_error thrown without <stdexcept>
 - reader.cpp/hydration.cpp | dead helpers (find_string_in, is_signed_dtype, unwired unescape_tsv)
 - pack_index.cpp | unused bucket parameter
+
+---
+# Run 2 — Python source (src/dmi), round 1. Baseline 480e95b.
+# Key: file:line|summary. Impact/verdict tracked in polish-state.md.
+
+src/dmi/adapters/huggingface/adapter.py:325|detach_model never disarms HookPoints or transport; later forward writes ring with no reservation
+src/dmi/adapters/base.py:280|plan_step sizes with model dtype while pre_push_all_metas substitutes token_ids_dtype
+src/dmi/adapters/huggingface/generation.py:590|decode kwargs omit attention_mask; left-pad KV attended, tokens diverge from HF generate
+src/dmi/adapters/huggingface/adapter.py:310|prepare wrapper swallows every before_forward exception
+src/dmi/storage/reassembly.py:106|read_and_merge narrows query axis to key-token cap
+src/dmi/storage/internals.py:527|_load_field_with_retry treats permanent AttributeError as transient; timeout_s=None spins
+src/dmi/hooks/selection.py:120|unavailable set omits final_logits on vocab_size==0
+src/dmi/adapters/huggingface/generation.py:295|short-circuit or between two kwargs.pop leaves one key unstripped
+src/dmi/transport/ring.py:456|modulo by physical_batch_bytes before batch>0 check -> ZeroDivisionError
+src/dmi/api/v1/model_shape.py:12-57|line-for-line reimplementation of the HF adapter model_shape helper
+src/dmi/hooks/point.py:201-204|three dead local nvtx re-imports shadowing module-level _nvtx
+src/dmi/storage/internals.py:123-128|ndim==1 special case duplicates _left_pad_stack
+src/dmi/storage/capture/clickhouse_catalog.py:466-470|same 5-line quarantine except-ladder repeated at three sites
+src/dmi/hooks/selection.py:119-127|apply_hook_selection recomputes the unavailable set select_hook_specs just built
+src/dmi/storage/capture/pipeline.py:89-92|optional-timeout guard copy-pasted three times
+src/dmi/adapters/base.py:273-285|per-spec byte-sizing loop duplicated in HF decode_step_bytes
+src/dmi/storage/capture/clickhouse_catalog.py:184-189|re-derives six table names the schema object already exposes
+src/dmi/records.py:484-486|_require_table_identifier is an exact special case of _require_identifier
+src/dmi/storage/capture/reader.py:77-78|_ObjectPlan.pack_id and object_key written but never read
+src/dmi/hooks/selection.py:195|entire PP/TP-rank and selection filtering surface has no behavioral test
+src/dmi/records.py:531|_validate_cell type/range branches and terminal TypeError never executed
+src/dmi/records.py:444-476|_validate_payload_slices reservation-bound guard has no negative test
+src/dmi/storage/capture/pipeline.py:604-618|flush timed-out-barrier reuse branch never executes; test name overstates
+src/dmi/storage/capture/record_adapter.py:265-268|reference sink metadata/payload agreement and durability checks untested
+src/dmi/storage/capture/clickhouse_catalog.py:686-702|lease acquire/renew quarantine-on-ambiguous-failure handlers untested
+src/dmi/transport/ring.py:426-443|_record_cpu_tensor PREFIX_STRIP/CHUNKED/IDENTITY branches never executed
+src/dmi/hooks/specs.py:280|batched FINAL_LOGITS cap and zero-config degenerate returns untested
+src/dmi/engine.py:272|create_record_runtime double-activation guard and ring-swap rollback never execute
+src/dmi/storage/capture/reader.py:348-351|footer cache byte-budget eviction untested
+src/dmi/adapters/huggingface/generation.py:482-496|no-engine condition raises in one HF entry point, silently ignored in the other
+src/dmi/storage/internals.py:244-249|InternalRequirement bounds enforced in require(), skipped on constructor path
+src/dmi/hooks/point.py:328|HookPoint reads self.name which its __init__ never creates
+src/dmi/storage/capture/native_sink.py:116-117|docstring promises record_format; class exposes record_format_layout
+src/dmi/storage/capture/spool.py:419-420|the two upload_pending siblings validate limit differently
+src/dmi/storage/capture/filesystem.py:176-177|filesystem and S3 PackStore disagree on max store_id length (128 vs 255)
+src/dmi/storage/capture/clickhouse_reader.py:438-441|docstring points at the wrong module for membership_predicate
+src/dmi/hooks/selection.py:167-183|unavailable condition silent in select_hook_specs, warns model-wide in apply_hook_selection
+src/dmi/hooks/specs.py:112-127|unknown hook type raises in hook_row_basis, returns [] in compute_hook_shape
+
+---
+# Run 2, round 2. Baseline d5ac514 (1508 passed).
+# Dropped as ALREADY SEEN in round 1 (dedup is against seen, not confirmed, so
+# refuted findings do not resurface): selection.py:120 vocab_size/final_logits
+# (refuted r1 as C7); native_sink.py:116 docstring (r1 X5); spool.py:419 limit
+# (r1 X6); generation.py:294 kwargs.pop (r1 C8); point.py:328 self.name (r1 X4);
+# clickhouse_catalog.py:466 quarantine ladder (r1 S4); pipeline.py:89 timeout
+# guard (r1 S6); base.py:273 sizing loop (r1 S7); selection.py:119 unavailable
+# set (r1 S5); point.py:201 nvtx imports (r1 S2); internals.py:123 ndim==1
+# (r1 S3).
+
+src/dmi/hooks/point.py:301|eager safety net tests payload_cap only, ignoring staging cap; tensor > staging can never drain
+src/dmi/storage/internals.py:66|sorted() on (start_token, tensor) pairs compares tensors when start tokens tie
+src/dmi/adapters/huggingface/generation.py:623|eos_token_id as list makes != return a bool; .long() raises AttributeError
+src/dmi/storage/clickhouse.py:62|database is the one interpolated SQL identifier not passed through _validate_ident
+src/dmi/storage/capture/filesystem.py:285-288|FS PackStore.stat returns mismatching info where S3 raises PackIntegrityError
+docs/integration-api-v1.md:137|v1 contract says MonitoringConfig has one field; the dataclass carries three
+src/dmi/records.py:332-334|emit_output publishes descriptors on OVERSIZED, prepare_replay does not
+src/dmi/engine.py:111-118|capture_sink_config silently discarded when storage_backend is not "capture"
+src/dmi/storage/reassembly.py:437-444|append/extend/size byte-identical in both OffloadedSegments subclasses
+src/dmi/storage/capture/s3.py:241-247|five-entry pack metadata dict written out twice (send and compare)
+src/dmi/hooks/record.py:187-191|_as_hook_output pre-check duplicates HookOutput.__post_init__ same message
+src/dmi/engine.py:119|_ring_engine never initialised in __init__, forcing five getattr spellings
+src/dmi/adapters/base.py:259|plan_step body has zero coverage; the only adapter stub overrides it
+src/dmi/adapters/base.py:167|attach_model's selection->PP->TP->install pipeline never executed
+src/dmi/records.py:308|successful device-gated bind_hook never exercised; reclaim marking unproven
+src/dmi/records.py:347|prepare_replay metadata/plan arity guard never triggered; zip truncation undetected
+src/dmi/records.py:433|_validate_entry_output dtype/shape drift refusals never fire
+src/dmi/hooks/selection.py:102|resolve_hook_selection unknown-token and empty-result refusals untested
+src/dmi/hooks/dispatch.py:41|install_ring_hooks never invoked by any cpu test; binding and refusal unprotected
+src/dmi/engine.py:473|next_auto_group_id has no test; a stuck counter collides request ids across generates
+src/dmi/hooks/specs.py:121|hook_row_basis body never runs; only facade identity is asserted
+src/dmi/storage/capture/reader.py:341|footer cache recency-on-hit (move_to_end) untested; LRU degrades to FIFO
