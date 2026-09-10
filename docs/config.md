@@ -91,7 +91,8 @@ HookPointV1 encoded-record path. Construct `MonitoringEngine` with
 | `minimum_record_probe_retry_interval_occurrences` | `uint64_t` | 0 | Window occurrences between minimum-record probes; must be positive when enabled. |
 | `timing_revalidation_retry_interval_occurrences` | `uint64_t` | 4 | Base window occurrences between failed timing-revalidation probes; must be positive when enabled. |
 | `capacity_flush_fallback_threshold` | `uint64_t` | 0 | Completed capacity-forced flushes before permanent batched fallback; must be positive when enabled. |
-| `debug_enabled` | `bool` | false | Log every real window-scheduled D2H issue and completion. |
+| `capacity_flush_count_reset_interval_periods` | `uint64_t` | 32 | Complete pattern periods of progress after which isolated capacity-forced-flush evidence ages out; must be positive when enabled. |
+| `debug_enabled` | `bool` | false | Log every real window-scheduled D2H issue and completion, plus each pattern-version activation. |
 
 The integration defines sorted, non-overlapping half-open window offsets
 within a positive period, then calls `RecordRuntime.advance_boundary()` at each

@@ -216,8 +216,15 @@ class RingTransport:
             ring_engine, "_recurring_d2h_windows_enabled", None
         )
         if window_enabled is not None and bool(window_enabled()):
+            # Keyed by the bound enum rather than its current numeric value:
+            # a reordered or extended D2HWindowProgressKind would otherwise
+            # bind the wrong kernel silently.  Imported here so a module-level
+            # attribute access does not force the extension load at import.
+            from . import native as _native
+
             marker_registry = {
-                0: torch.ops.ring.advance_boundary.default,
+                int(_native.D2HWindowProgressKind.PACKED_VERSION_COUNTER):
+                    torch.ops.ring.advance_boundary.default,
             }
             marker_kind = int(ring_engine._d2h_window_progress_kind())
             try:
