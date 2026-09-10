@@ -697,6 +697,57 @@ def test_the_footer_cache_evicts_its_least_recent_pack(tmp_path: Path):
     assert len(reader._footer_cache) == 1
 
 
+def test_the_footer_cache_evicts_to_stay_inside_its_byte_budget(tmp_path: Path):
+    """Eviction is driven by the byte budget, not only by the pack count.
+
+    The oversized-entry guard only rejects a footer bigger than the whole
+    budget; three individually admissible footers overflowing it cumulatively
+    is a separate case, and only the byte disjunct of the eviction loop
+    handles it.
+    """
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    descriptors = []
+    refs = []
+    sealed_packs = []
+    for index, capture_id in enumerate(
+        ("capture-a", "capture-b", "capture-c"), start=1
+    ):
+        writer = PackWriter(
+            pack_id=UUID(int=index),
+            created_at_ns=1_700_000_000_000_000_000,
+            max_pack_bytes=1024 * 1024,
+        )
+        writer.append(_record(capture_id, b"\x00" * 8, step=index))
+        sealed = writer.seal()
+        ref = store.put(sealed, f"packs/{index}.dmi-pack")
+        sealed_packs.append(sealed)
+        refs.append(ref)
+        descriptors.extend(
+            PackReader.from_bytes(sealed.data).descriptors(
+                store_id=ref.store_id, object_key=ref.object_key
+            )
+        )
+    footer_bytes = _footer_read_bytes(sealed_packs[0])
+    assert [_footer_read_bytes(item) for item in sealed_packs] == [footer_bytes] * 3
+
+    reader = CaptureReader(_Catalog(tuple(descriptors)), {"local": store})
+    # Leave the count limit alone: if it could not hold all three packs, this
+    # test would be re-testing count eviction instead of the byte budget.
+    assert reader._footer_cache_limit >= 3
+    reader._footer_cache_bytes_limit = 2 * footer_bytes
+    selection = reader.select(CaptureQuery(limit=10))
+
+    reader.hydrate(selection, byte_limit=1 << 20)
+
+    assert len(reader._footer_cache) == 2
+    assert reader._footer_cache_bytes == 2 * footer_bytes
+    assert reader._footer_cache_bytes <= reader._footer_cache_bytes_limit
+    # The oldest pack was evicted; the two most recent survive in LRU order.
+    assert list(reader._footer_cache) == [
+        (ref.store_id, ref.pack_id, ref.checksum) for ref in refs[1:]
+    ]
+
+
 def test_verify_pack_source_checks_the_stream_against_its_own_checksum():
     """The standalone utility: a full read-and-hash of a pack source.
 
