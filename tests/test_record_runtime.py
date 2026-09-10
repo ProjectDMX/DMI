@@ -10,6 +10,7 @@ from dmi.hooks.record import (
     HookOutput,
     HookPointV1,
     HookSpecV1,
+    OutputStorage,
     TransportSpec,
     TransportType,
 )
@@ -333,3 +334,321 @@ def test_binding_reuses_private_output_id_for_same_declared_name():
     runtime.bind_hook(second, hook_runtime=_HookRuntime())
 
     assert first._output_ids == second._output_ids == (1 << 16,)
+
+
+def _tensor_column(name):
+    return RecordColumn(
+        name,
+        RecordCellType.TENSOR,
+        f"{name}_dtype",
+        f"{name}_shape",
+        f"{name}_bytes",
+    )
+
+
+class _CellFormat:
+    """Emit one caller-supplied row against one caller-supplied layout.
+
+    ``cells`` receives the producer plan entry so a test can pin a cell to
+    the entry it is being validated against.  The first non-tensor column
+    becomes the layout key, which keeps each cell test to the cells it
+    actually exercises.
+    """
+
+    def __init__(self, columns, cells):
+        columns = tuple(columns)
+        key = next(
+            column.name
+            for column in columns
+            if column.type is not RecordCellType.TENSOR
+        )
+        self.schema = RecordSchema(
+            (
+                RecordLayout(
+                    "cell_rows",
+                    "cell_rows",
+                    columns,
+                    primary_key=(key,),
+                    order_by=(key,),
+                ),
+            )
+        )
+        self._cells = cells
+
+    def encode(self, metadata, entry):
+        return RecordDescriptor(
+            "cell_rows",
+            (tuple(self._cells(entry)),),
+            output_id=entry.output_id,
+        )
+
+
+def test_two_open_payload_slices_are_refused():
+    columns = (
+        RecordColumn("tag", RecordCellType.STRING),
+        _tensor_column("first"),
+        _tensor_column("second"),
+    )
+    runtime, transport, output, entry = _runtime_and_entry(
+        record_format=_CellFormat(
+            columns,
+            lambda entry: (
+                "two-open",
+                PayloadSlice(dtype=entry.dtype, shape=entry.output_shape),
+                PayloadSlice(dtype=entry.dtype, shape=entry.output_shape),
+            ),
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="at most one PayloadSlice may consume the remaining actual payload",
+    ):
+        runtime.emit_output(entry, "two-open", output)
+
+    assert transport.events == []
+
+    # One open slice plus one bounded slice is the accepted arrangement, so
+    # the refusal above cannot be met by rejecting every multi-slice row.
+    runtime, transport, output, entry = _runtime_and_entry(
+        record_format=_CellFormat(
+            columns,
+            lambda entry: (
+                "one-open",
+                PayloadSlice(dtype=entry.dtype, shape=entry.output_shape),
+                PayloadSlice(
+                    offset_bytes=0,
+                    nbytes=8,
+                    dtype=entry.dtype,
+                    shape=(-1,),
+                ),
+            ),
+        )
+    )
+
+    assert runtime.emit_output(entry, "one-open", output) is StepReservation.RESERVED
+    assert transport.events[0] == ("reserve", ((16, False),))
+
+
+def test_payload_slice_storage_must_match_producer_entry():
+    runtime, transport, output, entry = _runtime_and_entry(
+        record_format=_CellFormat(
+            (RecordColumn("count", RecordCellType.INT64),),
+            lambda entry: (
+                PayloadSlice(
+                    dtype=torch.int64,
+                    storage=OutputStorage.SCALAR_INT,
+                    nbytes=8,
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(
+        ValueError, match="storage does not match its producer plan entry"
+    ):
+        runtime.emit_output(entry, "scalar-int", output)
+
+    assert transport.events == []
+
+
+def test_payload_slice_dtype_drift_is_refused():
+    runtime, transport, output, entry = _runtime_and_entry(
+        record_format=_CellFormat(
+            (RecordColumn("tag", RecordCellType.STRING), _tensor_column("payload")),
+            lambda entry: (
+                "drift",
+                PayloadSlice(dtype=torch.float16, shape=entry.output_shape),
+            ),
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="PayloadSlice dtype changed: expected torch.float32, got torch.float16",
+    ):
+        runtime.emit_output(entry, "drift", output)
+
+    assert transport.events == []
+
+
+def test_bounded_payload_slice_may_not_exceed_the_reservation():
+    columns = (
+        RecordColumn("tag", RecordCellType.STRING),
+        _tensor_column("payload"),
+    )
+
+    def _emit(offset_bytes, nbytes):
+        runtime, transport, output, entry = _runtime_and_entry(
+            record_format=_CellFormat(
+                columns,
+                lambda entry: (
+                    "bounded",
+                    PayloadSlice(
+                        offset_bytes=offset_bytes,
+                        nbytes=nbytes,
+                        dtype=entry.dtype,
+                        shape=(-1,),
+                    ),
+                ),
+            )
+        )
+        assert entry.reservation_upper_bytes == 16
+        return runtime, transport, output, entry
+
+    runtime, transport, output, entry = _emit(8, 16)
+    with pytest.raises(ValueError, match="exceeds producer reservation bound"):
+        runtime.emit_output(entry, "bounded", output)
+    assert transport.events == []
+
+    runtime, transport, output, entry = _emit(17, None)
+    with pytest.raises(ValueError, match="exceeds producer reservation bound"):
+        runtime.emit_output(entry, "bounded", output)
+    assert transport.events == []
+
+    # The bound is inclusive: a slice covering the whole reservation exactly
+    # must still reach the ring.
+    runtime, transport, output, entry = _emit(0, 16)
+    assert runtime.emit_output(entry, "bounded", output) is StepReservation.RESERVED
+    assert transport.events[0] == ("reserve", ((16, False),))
+
+
+def _cell_runtime(column, value):
+    """Bind one non-tensor column carrying ``value`` ahead of the payload."""
+
+    return _runtime_and_entry(
+        record_format=_CellFormat(
+            (column, _tensor_column("payload")),
+            lambda entry: (
+                value,
+                PayloadSlice(dtype=entry.dtype, shape=entry.output_shape),
+            ),
+        )
+    )
+
+
+def test_int32_cell_over_range_is_refused_before_reservation():
+    runtime, transport, output, entry = _cell_runtime(
+        RecordColumn("n", RecordCellType.INT32), 2**31
+    )
+
+    with pytest.raises(TypeError, match="requires int32"):
+        runtime.emit_output(entry, "over-range", output)
+
+    assert transport.events == []
+
+
+def test_int32_cell_rejects_bool():
+    runtime, transport, output, entry = _cell_runtime(
+        RecordColumn("n", RecordCellType.INT32), True
+    )
+
+    with pytest.raises(TypeError, match="requires int32, got bool"):
+        runtime.emit_output(entry, "bool", output)
+
+    assert transport.events == []
+
+
+def test_int64_cell_rejects_non_integer():
+    runtime, transport, output, entry = _cell_runtime(
+        RecordColumn("n", RecordCellType.INT64), "not-an-int"
+    )
+
+    with pytest.raises(TypeError, match="requires int64, got str"):
+        runtime.emit_output(entry, "str", output)
+
+    assert transport.events == []
+
+
+def test_float64_cell_rejects_non_numeric():
+    runtime, transport, output, entry = _cell_runtime(
+        RecordColumn("value", RecordCellType.FLOAT64), "3.5"
+    )
+
+    with pytest.raises(TypeError, match="requires float64, got str"):
+        runtime.emit_output(entry, "str", output)
+
+    assert transport.events == []
+
+    # An int, a float, and a scalar-float slice are all accepted float64
+    # cells; the entry is a scalar-float producer so the slice matches it.
+    transport = _Transport()
+    runtime = RecordRuntime(
+        transport,
+        _CellFormat(
+            (
+                RecordColumn("whole", RecordCellType.FLOAT64),
+                RecordColumn("fraction", RecordCellType.FLOAT64),
+                RecordColumn("scalar", RecordCellType.FLOAT64),
+            ),
+            lambda entry: (
+                1,
+                2.5,
+                PayloadSlice(
+                    storage=OutputStorage.SCALAR_FLOAT,
+                    dtype=torch.float64,
+                    nbytes=8,
+                ),
+            ),
+        ),
+    )
+    spec = TransportSpec("out", storage=OutputStorage.SCALAR_FLOAT)
+    hook = HookPointV1(HookSpecV1("hook", (spec,)))
+    runtime.bind_hook(hook, hook_runtime=_HookRuntime())
+    output = HookOutput(torch.tensor([2.5], dtype=torch.float64))
+    entry = ProducerPlanBuilder().record_output(
+        output_id=hook._output_ids[0],
+        output_spec=spec,
+        output=output,
+    )
+
+    assert runtime.emit_output(entry, "numeric", output) is StepReservation.RESERVED
+    assert transport.events[0][0] == "reserve"
+
+
+def test_int64_array_cell_requires_a_tuple_of_in_range_ints():
+    runtime, transport, output, entry = _cell_runtime(
+        RecordColumn("dims", RecordCellType.INT64_ARRAY), [1, 2]
+    )
+
+    with pytest.raises(TypeError, match="requires int64_array, got list"):
+        runtime.emit_output(entry, "list", output)
+
+    assert transport.events == []
+
+    runtime, transport, output, entry = _cell_runtime(
+        RecordColumn("dims", RecordCellType.INT64_ARRAY), (1, 2**63)
+    )
+
+    with pytest.raises(TypeError, match="requires int64_array, got tuple"):
+        runtime.emit_output(entry, "out-of-range", output)
+
+    assert transport.events == []
+
+    runtime, transport, output, entry = _cell_runtime(
+        RecordColumn("dims", RecordCellType.INT64_ARRAY), (1, -2)
+    )
+
+    assert runtime.emit_output(entry, "in-range", output) is StepReservation.RESERVED
+    assert transport.events[0] == ("reserve", ((16, False),))
+
+
+def test_tensor_column_requires_tensor_storage_slice():
+    runtime, transport, output, entry = _runtime_and_entry(
+        record_format=_CellFormat(
+            (RecordColumn("tag", RecordCellType.STRING), _tensor_column("payload")),
+            lambda entry: (
+                "scalar-in-tensor-column",
+                PayloadSlice(
+                    storage=OutputStorage.SCALAR_INT,
+                    dtype=torch.int64,
+                    nbytes=8,
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(TypeError, match="requires tensor"):
+        runtime.emit_output(entry, "scalar-in-tensor-column", output)
+
+    assert transport.events == []
