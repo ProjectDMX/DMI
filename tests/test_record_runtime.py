@@ -652,3 +652,89 @@ def test_tensor_column_requires_tensor_storage_slice():
         runtime.emit_output(entry, "scalar-in-tensor-column", output)
 
     assert transport.events == []
+
+
+class _FakeDeviceGate(torch.Tensor):
+    """CPU stand-in for the single-element int32 CUDA gate bind_hook accepts."""
+
+    @property
+    def is_cuda(self) -> bool:
+        return True
+
+    @staticmethod
+    def make():
+        return torch.zeros(1, dtype=torch.int32).as_subclass(_FakeDeviceGate)
+
+
+def test_device_gated_identity_output_is_reserved_with_reclaim():
+    transport = _Transport()
+    runtime = RecordRuntime(transport, _Format())
+    hook = HookPointV1(HookSpecV1("hook", (TransportSpec("out"),)))
+    runtime.bind_hook(
+        hook,
+        hook_runtime=_HookRuntime(),
+        gate_tensor=_FakeDeviceGate.make(),
+        gate_value=1,
+    )
+    output = HookOutput(torch.arange(4, dtype=torch.float32))
+    entry = ProducerPlanBuilder().record_output(
+        output_id=hook._output_ids[0],
+        output_spec=hook.spec.outputs[0],
+        output=output,
+    )
+
+    result = runtime.emit_output(entry, "batch-7", output)
+
+    # The trailing flag is RecordReservationItem.needs_reclaim, and it is the
+    # ring's only handling of a blocked gate: the gated IDENTITY kernel returns
+    # before copying and before publishing, so unless the reservation asks for
+    # it the drain thread never registers the pending task reclaim.  An
+    # otherwise identical ungated output reserves (16, False) instead.
+    assert result is StepReservation.RESERVED
+    assert transport.events[0] == ("reserve", ((16, True),))
+
+
+def test_replay_metadata_count_must_match_plan_entries():
+    transport = _Transport()
+    runtime = RecordRuntime(transport, _Format())
+    hook = HookPointV1(HookSpecV1("hook", (TransportSpec("out"),)))
+    runtime.bind_hook(hook, hook_runtime=_HookRuntime())
+    output = HookOutput(torch.arange(4, dtype=torch.float32))
+    builder = ProducerPlanBuilder()
+    for _ in range(3):
+        builder.record_output(
+            output_id=hook._output_ids[0],
+            output_spec=hook.spec.outputs[0],
+            output=output,
+        )
+    plan = builder.build()
+
+    # Short metadata must be refused rather than zipped: the body would
+    # publish two descriptors while reserving three entries, breaking the
+    # one-descriptor-per-reserved-record ordering contract.
+    with pytest.raises(ValueError, match="expected 3, got 2"):
+        runtime.prepare_replay(plan, ("a", "b"))
+
+    assert transport.events == []
+
+
+def test_producer_dtype_drift_is_refused_before_reservation():
+    # A captured plan entry outlives the output it was derived from, so the
+    # entry is re-checked against every output emitted through it.
+    runtime, transport, _output, entry = _runtime_and_entry()
+    drifted = HookOutput(torch.arange(4, dtype=torch.float64))
+
+    with pytest.raises(ValueError, match="producer dtype changed"):
+        runtime.emit_output(entry, "batch-7", drifted)
+
+    assert transport.events == []
+
+
+def test_producer_input_shape_drift_is_refused_before_reservation():
+    runtime, transport, _output, entry = _runtime_and_entry()
+    drifted = HookOutput(torch.arange(8, dtype=torch.float32))
+
+    with pytest.raises(ValueError, match="producer input shape changed"):
+        runtime.emit_output(entry, "batch-7", drifted)
+
+    assert transport.events == []
