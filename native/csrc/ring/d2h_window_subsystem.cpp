@@ -1,5 +1,6 @@
 #include "d2h_window_subsystem.h"
 
+#include "cuda_check.h"
 #include "d2h_window_pattern.h"
 
 #include <cstdio>
@@ -9,13 +10,6 @@
 
 namespace ring {
 namespace {
-
-void check_cuda(cudaError_t error, const char* operation) {
-    if (error == cudaSuccess)
-        return;
-    throw std::runtime_error(std::string(operation) +
-                             " failed: " + cudaGetErrorString(error));
-}
 
 void validate_configuration(const RecurringD2HWindowConfig& config) {
     if (config.minimum_record_probe_retry_interval_occurrences == 0) {

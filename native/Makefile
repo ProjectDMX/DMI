@@ -29,6 +29,7 @@ HEADERS := csrc/dmx_host_utils.h \
            csrc/dmx_host_engine.h csrc/record_schema.h \
            csrc/ring/ring_config.h csrc/ring/ring_state.h csrc/ring/ring_alloc.h \
            csrc/ring/publication_word.h csrc/ring/drain_task.h csrc/ring/drain_thread.h \
+           csrc/ring/cuda_check.h \
            csrc/ring/d2h_window_config.h csrc/ring/d2h_window_debug.h \
            csrc/ring/d2h_window_grant_policy.h csrc/ring/d2h_window_marker.h \
            csrc/ring/d2h_window_mode.h csrc/ring/d2h_window_pattern.h \

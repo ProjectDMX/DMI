@@ -1,20 +1,11 @@
 #include "d2h_window_progress.h"
+#include "cuda_check.h"
 #include "d2h_window_marker.h"
 
 #include <stdexcept>
 #include <string>
 
 namespace ring {
-namespace {
-
-void check_cuda(cudaError_t error, const char* operation) {
-    if (error == cudaSuccess)
-        return;
-    throw std::runtime_error(std::string(operation) +
-                             " failed: " + cudaGetErrorString(error));
-}
-
-}  // namespace
 
 PackedVersionCounterProgressSource::PackedVersionCounterProgressSource(int owner_device)
     : owner_device_(owner_device) {
@@ -31,8 +22,18 @@ PackedVersionCounterProgressSource::PackedVersionCounterProgressSource(int owner
         check_cuda(
             cudaMemset(device_packed_progress_, 0, sizeof(*device_packed_progress_)),
             "initialize device D2H window progress");
-        const cudaMemLocation cpu_location = {cudaMemLocationTypeHost, 0};
-        const cudaMemLocation gpu_location = {cudaMemLocationTypeDevice, owner_device_};
+        // CUDA 13 dropped the device-ordinal overloads of these two calls in
+        // favour of cudaMemLocation, and offers no _v2 alias to spell the new
+        // form on older toolkits.  docs/install.md still supports CUDA 12.x,
+        // so select the signature the toolkit in use actually declares.
+#if CUDART_VERSION >= 13000
+        const cudaMemLocation cpu_location{cudaMemLocationTypeHost, 0};
+        const cudaMemLocation gpu_location{cudaMemLocationTypeDevice,
+                                           owner_device_};
+#else
+        const int cpu_location = cudaCpuDeviceId;
+        const int gpu_location = owner_device_;
+#endif
         check_cuda(cudaMemAdvise(cpu_visible_packed_progress_,
                                  sizeof(*cpu_visible_packed_progress_),
                                  cudaMemAdviseSetPreferredLocation, cpu_location),
@@ -41,10 +42,17 @@ PackedVersionCounterProgressSource::PackedVersionCounterProgressSource(int owner
                                  sizeof(*cpu_visible_packed_progress_),
                                  cudaMemAdviseSetAccessedBy, gpu_location),
                    "make CPU-visible D2H window progress GPU-accessible");
+#if CUDART_VERSION >= 13000
         check_cuda(cudaMemPrefetchAsync(cpu_visible_packed_progress_,
                                         sizeof(*cpu_visible_packed_progress_),
                                         cpu_location, 0, nullptr),
                    "prefetch CPU-visible D2H window progress");
+#else
+        check_cuda(cudaMemPrefetchAsync(cpu_visible_packed_progress_,
+                                        sizeof(*cpu_visible_packed_progress_),
+                                        cpu_location, nullptr),
+                   "prefetch CPU-visible D2H window progress");
+#endif
         check_cuda(cudaDeviceSynchronize(),
                    "initialize D2H window progress allocations");
 

@@ -1,5 +1,7 @@
 #include "d2h_window_marker.h"
 
+#include "cuda_check.h"
+
 #include <cuda/atomic>
 #include <stdexcept>
 #include <string>
@@ -29,14 +31,6 @@ __global__ void reset_d2h_window_progress_kernel(
     published.store(packed, cuda::memory_order_relaxed);
 }
 
-void check_launch(const char* operation) {
-    const cudaError_t error = cudaGetLastError();
-    if (error == cudaSuccess)
-        return;
-    throw std::runtime_error(std::string(operation) +
-                             " failed: " + cudaGetErrorString(error));
-}
-
 }  // namespace
 
 void launch_d2h_window_boundary(
@@ -45,7 +39,7 @@ void launch_d2h_window_boundary(
     cudaStream_t stream) {
     advance_d2h_window_boundary_kernel<<<1, 1, 0, stream>>>(
         device_packed_progress, cpu_visible_packed_progress);
-    check_launch("advance D2H window boundary kernel launch");
+    check_cuda_launch("advance D2H window boundary kernel launch");
 }
 
 void launch_d2h_window_progress_reset(
@@ -55,7 +49,7 @@ void launch_d2h_window_progress_reset(
     D2HWindowPackedProgressLayout::Counter counter, cudaStream_t stream) {
     reset_d2h_window_progress_kernel<<<1, 1, 0, stream>>>(
         device_packed_progress, cpu_visible_packed_progress, version, counter);
-    check_launch("reset D2H window progress kernel launch");
+    check_cuda_launch("reset D2H window progress kernel launch");
 }
 
 }  // namespace ring
