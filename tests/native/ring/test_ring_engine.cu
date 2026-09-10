@@ -221,6 +221,8 @@ public:
         completed_bytes = actual_bytes;
     }
 
+    void note_observation_gap() noexcept override { ++observation_gaps; }
+
     bool enabled{true};
     bool committed{false};
     uint64_t committed_bytes{0};
@@ -228,6 +230,7 @@ public:
     std::atomic<uint64_t> polls{0};
     std::atomic<uint64_t> commits{0};
     std::atomic<uint64_t> completions{0};
+    std::atomic<uint64_t> observation_gaps{0};
 
 private:
     uint64_t byte_limit_{0};
@@ -898,6 +901,72 @@ static void test_generic_pause_blocks_decisions_until_matching_resume() {
     CUDA_CHECK(cudaFree(device));
 }
 
+static void test_overlapping_pause_requests_serialise() {
+    banner("overlapping drain pauses serialise instead of deadlocking");
+    ring::RingConfig cfg = make_config();
+    cfg.drain_flush.entry_threshold = 1;
+    DrainHarness harness(cfg);
+
+    auto first = std::async(std::launch::async, [&harness] {
+        return harness.drain->pause_after_flush_and_wait();
+    });
+    EXPECT(first.wait_for(std::chrono::seconds(2)) ==
+           std::future_status::ready);
+    const ring::DrainPauseToken first_token = first.get();
+
+    // A second requester must wait for the first to resume.  Handing it a
+    // token of its own would leave the loop paused on a generation only the
+    // newer waiter could release, hanging every later flush.
+    auto second = std::async(std::launch::async, [&harness] {
+        return harness.drain->pause_after_flush_and_wait();
+    });
+    EXPECT(second.wait_for(std::chrono::milliseconds(200)) ==
+           std::future_status::timeout);
+
+    // A token the loop cannot act on is rejected rather than dropped: a silent
+    // return would leave the drain paused for good.
+    bool rejected = false;
+    try {
+        harness.drain->resume(ring::DrainPauseToken{first_token.generation + 7});
+    } catch (const std::logic_error&) {
+        rejected = true;
+    }
+    EXPECT(rejected);
+
+    harness.drain->resume(first_token);
+    EXPECT(second.wait_for(std::chrono::seconds(2)) ==
+           std::future_status::ready);
+    const ring::DrainPauseToken second_token = second.get();
+    EXPECT(second_token.generation == first_token.generation + 1);
+
+    // Resuming the same token twice is a mistake, not a no-op.
+    rejected = false;
+    try {
+        harness.drain->resume(first_token);
+    } catch (const std::logic_error&) {
+        rejected = true;
+    }
+    EXPECT(rejected);
+
+    harness.drain->resume(second_token);
+
+    const std::vector<uint8_t> source = pattern(32, 91);
+    uint8_t* device = upload(source, harness.stream);
+    harness.drain->reserve(32, 1);
+    ring::launch_producer_static(
+        harness.allocated.state(), device, source.size(), 0, harness.stream);
+    CUDA_CHECK(cudaStreamSynchronize(harness.stream));
+    harness.drain->notify();
+    const uint64_t count = harness.drain->wait_for_tasks();
+    EXPECT(count == 1);
+    std::vector<ring::DrainTask> tasks;
+    harness.drain->pop_tasks(count, tasks);
+    EXPECT(tasks.size() == 1);
+    EXPECT(task_bytes(tasks.front()) == source);
+    harness.release(tasks.front());
+    CUDA_CHECK(cudaFree(device));
+}
+
 static void test_packed_progress_reset_marker_and_graph_replay() {
     banner("packed progress reset and marker preserve stream order");
     int device = -1;
@@ -1082,6 +1151,7 @@ int main() {
     test_active_window_mode_suppresses_batched_drain();
     test_window_admission_rounds_to_complete_record_prefix();
     test_generic_pause_blocks_decisions_until_matching_resume();
+    test_overlapping_pause_requests_serialise();
     test_packed_progress_reset_marker_and_graph_replay();
     test_multiple_pending_window_definitions();
     test_terminal_fallback_definition_returns_false();

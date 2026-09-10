@@ -157,6 +157,11 @@ private:
     uint64_t                pause_requested_generation_{0};  // guarded by mu_
     uint64_t                pause_acknowledged_generation_{0}; // guarded by mu_
     uint64_t                pause_resumed_generation_{0};    // guarded by mu_
+    // At most one pause at a time: the loop acknowledges only the newest
+    // requested generation, so overlapping requesters must queue rather than
+    // each leave holding a token only one of them could resume.
+    bool                    pause_outstanding_{false};       // guarded by mu_
+    std::condition_variable pause_entry_cv_;
     std::exception_ptr      drain_failure_;                  // guarded by mu_
     std::condition_variable flush_done_cv_;
 

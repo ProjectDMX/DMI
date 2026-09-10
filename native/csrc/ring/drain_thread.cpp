@@ -182,8 +182,18 @@ bool DrainThread::force_flush_and_wait_until(
 DrainPauseToken DrainThread::pause_after_flush_and_wait() {
     uint64_t generation = 0;
     {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::mutex> lock(mu_);
         if (drain_failure_) std::rethrow_exception(drain_failure_);
+        // Only one pause may be outstanding.  The loop acknowledges just the
+        // newest requested generation, so two concurrent requesters would each
+        // leave with a token while only the newer one could ever resume; the
+        // loop would then wait forever and every later force_flush_and_wait()
+        // or reserve_record() would hang behind it.  Queue instead.
+        pause_entry_cv_.wait(lock, [this] {
+            return !pause_outstanding_ || static_cast<bool>(drain_failure_);
+        });
+        if (drain_failure_) std::rethrow_exception(drain_failure_);
+        pause_outstanding_ = true;
         generation = ++pause_requested_generation_;
         notified_ = true;
     }
@@ -194,21 +204,36 @@ DrainPauseToken DrainThread::pause_after_flush_and_wait() {
         return pause_acknowledged_generation_ >= generation ||
             static_cast<bool>(drain_failure_);
     });
-    if (drain_failure_) std::rethrow_exception(drain_failure_);
+    if (drain_failure_) {
+        // The loop will never acknowledge this request; release the slot so a
+        // later caller reports the failure instead of blocking on entry.
+        std::exception_ptr failure = drain_failure_;
+        pause_outstanding_ = false;
+        lock.unlock();
+        pause_entry_cv_.notify_one();
+        std::rethrow_exception(failure);
+    }
     return DrainPauseToken{generation};
 }
 
 void DrainThread::resume(DrainPauseToken token) {
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (token.generation == 0 ||
+        if (token.generation == 0 || !pause_outstanding_ ||
             token.generation != pause_acknowledged_generation_ ||
             token.generation <= pause_resumed_generation_) {
-            return;
+            // Silently ignoring a token the loop cannot act on leaves the drain
+            // paused for good, which surfaces later as an unrelated hang.  Fail
+            // where the mistake is.
+            throw std::logic_error(
+                "DrainThread::resume: token does not match the outstanding "
+                "pause");
         }
         pause_resumed_generation_ = token.generation;
+        pause_outstanding_ = false;
     }
     cv_.notify_one();
+    pause_entry_cv_.notify_one();
 }
 
 void DrainThread::record_drain_failure(std::exception_ptr failure) {
@@ -224,6 +249,7 @@ void DrainThread::record_drain_failure(std::exception_ptr failure) {
         flush_completed_generation_ = flush_requested_generation_;
     }
     flush_done_cv_.notify_all();
+    pause_entry_cv_.notify_all();
 
     if (!first_failure) return;
     try {

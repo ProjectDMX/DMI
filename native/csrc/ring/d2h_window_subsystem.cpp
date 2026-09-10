@@ -148,8 +148,15 @@ bool RecurringD2HWindowSubsystem::define_after_version_exhaustion(
             std::lock_guard<std::mutex> lock(control_mu_);
             version_reuse_in_progress_ = false;
         }
-        if (pause_token.has_value())
-            drain_pause.resume(*pause_token);
+        if (pause_token.has_value()) {
+            try {
+                drain_pause.resume(*pause_token);
+            } catch (...) {
+                // resume() rejects a token the drain loop cannot act on.  We
+                // are already unwinding, so that must not replace the failure
+                // the caller needs to see.
+            }
+        }
         throw;
     }
 }
