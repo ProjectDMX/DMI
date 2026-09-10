@@ -947,3 +947,21 @@ def test_activate_failure_rolls_back_the_half_installed_record_ring(monkeypatch)
     assert deactivated == [True, True]
     with pytest.raises(RuntimeError, match="Ring transport is not enabled"):
         engine.flush_and_wait(1.0)
+
+
+def test_next_auto_group_id_returns_distinct_increasing_group_prefixes():
+    """Every claim must hand back a fresh integer, starting at zero.
+
+    The HF adapter bumps the group on each prefill or batch-size change and
+    then mints per-request IDs as f"{group}:{i}"
+    (``adapters/huggingface/adapter.py:393-399``), so a counter that failed to
+    advance would make two successive ``generate()`` calls both emit
+    ``"0:0"``, ``"0:1"``, ... . The offload table is a ``MergeTree`` with no
+    dedup (``native/csrc/clickhouse_client.cpp:389``), so those rows would
+    collide inside one catalog namespace instead of being separable runs. The
+    documented contract is "engine-scoped integers starting at zero"
+    (``docs/integration-api-v1.md:242``).
+    """
+    engine = MonitoringEngine(enable_ring_transport=False)
+
+    assert [engine.next_auto_group_id() for _ in range(3)] == [0, 1, 2]
