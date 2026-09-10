@@ -178,6 +178,79 @@ def test_records_flow_from_the_ring_into_a_native_pack(tmp_path: Path):
     }
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_graph_replays_preserve_payloads_across_ring_wraps(tmp_path: Path, dtype):
+    from dmi.api.v1 import (
+        HookPointV1, HookSpecV1, MonitoringEngine, ProducerPlanBuilder,
+        TransportSpec,
+    )
+    from dmi.adapters.base import StepReservation
+    from dmi.storage.capture import CaptureRecordFormat
+    from dmi.storage.capture.native_sink import NativeSinkConfig, create_native_pack_sink
+
+    class GraphHookRuntime(_CaptureHookRuntime):
+        builder = None
+
+        def prepare_output(self, **kwargs):
+            if self.builder is None:
+                return super().prepare_output(**kwargs)
+            self.builder.record_output(
+                output_id=kwargs["output_id"], output_spec=kwargs["output_spec"],
+                output=kwargs["output"],
+            )
+            return None
+
+    spool_root = tmp_path / "spool"
+    handle = create_native_pack_sink(NativeSinkConfig(
+        spool_root=str(spool_root), max_pack_records=7,
+        max_linger_ns=60_000_000_000))
+    engine = MonitoringEngine(model_id="native-graph-e2e", ring_config=_ring_config())
+    expected = {}
+    try:
+        runtime = engine.create_record_runtime(
+            CaptureRecordFormat(), record_sink=handle.native_sink)
+        hook = HookPointV1(HookSpecV1("capture_tensor", (TransportSpec("payload"),)))
+        hook_runtime = GraphHookRuntime(runtime)
+        runtime.bind_hook(hook, hook_runtime=hook_runtime)
+        values = torch.arange(33 * 17).reshape(33, 17)
+        static_input = values.to(device="cuda", dtype=dtype)
+
+        def metadata_and_bytes(step):
+            tensor = (values + step).to(dtype).t().contiguous()
+            capture_id = f"graph-{step}"
+            expected[capture_id] = tensor.view(torch.uint8).numpy().tobytes()
+            return _metadata(capture_id, tensor, step=step)
+
+        # Warm up the normal producer first, then record only its physical
+        # plan during capture. Fresh FIFO metadata is published before replay.
+        hook_runtime.metadata = metadata_and_bytes(0)
+        hook(static_input.t())
+        engine.flush_and_wait(30.0)
+        hook_runtime.builder = ProducerPlanBuilder()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            hook(static_input.t())
+        plan = hook_runtime.builder.build()
+        for step in range(1, 97):
+            static_input.copy_((values + step).to(dtype))
+            reservation = runtime.prepare_replay(plan, (metadata_and_bytes(step),))
+            assert reservation in (StepReservation.RESERVED, StepReservation.FLUSHED)
+            graph.replay()
+
+        engine.flush_and_wait(30.0)
+        assert handle.native_sink.flush_and_wait(30.0)
+        handle.native_sink.rethrow_if_failed()
+        snapshot = handle.native_sink.snapshot()
+        assert snapshot["persisted_records"] == len(expected), snapshot
+        assert snapshot["failures"] == 0, snapshot
+    finally:
+        engine.close()
+
+    records = _staged_records(spool_root)
+    assert len(records) == len(expected)
+    assert dict(records) == expected
+
+
 def test_the_capture_backend_selects_the_native_sink_by_config(tmp_path: Path):
     """The automatic entry point: storage_backend="capture" + capture_sink_config."""
     from dmi.api.v1 import (

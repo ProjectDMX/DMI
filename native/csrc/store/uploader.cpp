@@ -220,7 +220,7 @@ UploadBatchResult SpoolUploader::UploadPending(int limit) {
   std::vector<StagedPack> pending;
   {
     std::string error;
-    if (spool_->Recover(&pending, &error) != SpoolStatus::kOk) {
+    if (spool_->ListPending(&pending, &error) != SpoolStatus::kOk) {
       return result;
     }
   }

@@ -83,9 +83,13 @@ class Spool {
                     const std::string& object_key, const uint8_t* data,
                     size_t n, StagedPack* out, std::string* error);
 
-  // Delete "*.open" leftovers, validate every "*.dmi-pack.ready" (name +
-  // sha256), quarantine failures, rebuild accounting. Returns survivors.
+  // Startup cleanup: delete abandoned "*.open" files, validate ready packs,
+  // quarantine failures, and rebuild accounting. Other writers on this root
+  // must be stopped; use ListPending() while they are running.
   SpoolStatus Recover(std::vector<StagedPack>* out, std::string* error);
+
+  // Validate and list ready packs without deleting in-progress writes.
+  SpoolStatus ListPending(std::vector<StagedPack>* out, std::string* error);
 
   // Remove one staged pack after upload (identity + size verified first).
   SpoolStatus Remove(const StagedPack& staged, std::string* error);
@@ -99,6 +103,8 @@ class Spool {
   void SetStageHookForTesting(std::function<void()> hook);
 
  private:
+  SpoolStatus Scan(std::vector<StagedPack>* out, bool discard_open_files,
+                  std::string* error);
   std::string root_;
   uint64_t max_bytes_ = 0;
   mutable std::mutex mutex_;

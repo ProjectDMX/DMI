@@ -215,12 +215,30 @@ void TestARefusedStageLeavesNoReservationBehind() {
   CHECK(spool.Snapshot().entries == 1);
 }
 
+void TestRepeatedRemovalDoesNotReleaseAnotherPacksCapacity() {
+  dmi_store::Spool spool;
+  std::string error;
+  const std::string root = FreshRoot("remove-retry");
+  CHECK(dmi_store::Spool::Open({root, 1500}, &spool, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  dmi_store::StagedPack first, second, third;
+  CHECK(StageBytes(spool, 1, 500, &first, &error) == dmi_store::SpoolStatus::kOk);
+  CHECK(StageBytes(spool, 2, 1000, &second, &error) == dmi_store::SpoolStatus::kOk);
+  CHECK(spool.Remove(first, &error) == dmi_store::SpoolStatus::kOk);
+  CHECK(spool.Remove(first, &error) == dmi_store::SpoolStatus::kOk);
+  CHECK(spool.Snapshot().bytes == 1000);
+  CHECK(spool.Snapshot().entries == 1);
+  CHECK(StageBytes(spool, 3, 1000, &third, &error) == dmi_store::SpoolStatus::kFull);
+  CHECK(BytesOnDisk(root) == 1000);
+}
+
 }  // namespace
 
 int main() {
   TestSerialRemoveThroughAnotherSpoolIsReconciled();
   TestReconciliationKeepsAnInflightReservation();
   TestARefusedStageLeavesNoReservationBehind();
+  TestRepeatedRemovalDoesNotReleaseAnotherPacksCapacity();
   if (g_failures != 0) {
     std::cerr << g_failures << " check(s) failed\n";
     return 1;

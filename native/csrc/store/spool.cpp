@@ -528,14 +528,20 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
 
 
 SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error) {
+  return Scan(out, true, error);
+}
+
+SpoolStatus Spool::ListPending(std::vector<StagedPack>* out, std::string* error) {
+  return Scan(out, false, error);
+}
+
+SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
+                        std::string* error) {
   out->clear();
-  // Single pass under the lock: this driver is test-scoped and the uploader
-  // runs recovery once at startup. (The Python optimistic multi-pass exists
-  // because its recovery re-hashes without the lock; the native re-hash is
-  // fast enough that stalling staging once per startup is the smaller cost.)
   std::lock_guard<std::mutex> lock(mutex_);
   std::error_code ec;
   std::vector<std::string> readies;
+  uint64_t bytes = 0;
   for (const auto& entry :
        fs::recursive_directory_iterator(root_, ec)) {
     if (ec) break;
@@ -543,8 +549,16 @@ SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error) {
     const std::string path = entry.path().string();
     const std::string name = entry.path().filename().string();
     if (HasSuffix(name, kOpenSuffix)) {
-      ::unlink(path.c_str());
-      FsyncDir(entry.path().parent_path().string(), nullptr);
+      // Our own writes are already accounted for by their reservations.
+      if (inflight_temps_.count(path) != 0) continue;
+      if (discard_open_files) {
+        ::unlink(path.c_str());
+        FsyncDir(entry.path().parent_path().string(), nullptr);
+      } else {
+        const uint64_t size = entry.file_size(ec);
+        if (!ec) bytes += size;
+        ec.clear();  // Another writer may have just committed its temp.
+      }
       continue;
     }
     if (HasSuffix(name, kReadySuffix)) {
@@ -552,7 +566,6 @@ SpoolStatus Spool::Recover(std::vector<StagedPack>* out, std::string* error) {
     }
   }
   std::sort(readies.begin(), readies.end());
-  uint64_t bytes = 0;
   for (const std::string& path : readies) {
     const std::string name = fs::path(path).filename().string();
     std::string id, sum;
@@ -598,11 +611,12 @@ SpoolStatus Spool::Remove(const StagedPack& staged, std::string* error) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::error_code ec;
     if (!fs::exists(staged.path, ec)) {
-      if (committed_bytes_ >= staged.object_bytes) {
-        committed_bytes_ -= staged.object_bytes;
+      if (ec) {
+        if (error) *error = "cannot inspect staged pack: " + ec.message();
+        return SpoolStatus::kIo;
       }
-      if (committed_entries_ > 0) --committed_entries_;
-      ++generation_;
+      // Removal retries must not release another pack's capacity. A stale
+      // count after an external removal is reconciled before refusing Stage.
       return SpoolStatus::kOk;
     }
     const std::string name = fs::path(staged.path).filename().string();
@@ -615,7 +629,11 @@ SpoolStatus Spool::Remove(const StagedPack& staged, std::string* error) {
       if (error) *error = "staged pack identity changed before removal";
       return SpoolStatus::kIntegrity;
     }
-    ::unlink(staged.path.c_str());
+    if (::unlink(staged.path.c_str()) != 0) {
+      if (errno == ENOENT) return SpoolStatus::kOk;
+      if (error) *error = "cannot remove staged pack: " + std::string(strerror(errno));
+      return SpoolStatus::kIo;
+    }
     if (committed_bytes_ >= staged.object_bytes) {
       committed_bytes_ -= staged.object_bytes;
     }
