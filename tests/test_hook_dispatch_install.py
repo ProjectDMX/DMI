@@ -17,7 +17,7 @@ import pytest
 import torch
 from torch import nn
 
-from dmi.hooks.dispatch import install_ring_hooks
+from dmi.hooks.dispatch import install_ring_hooks, uninstall_ring_hooks
 from dmi.hooks.specs import HOOK_TYPE_RESID_PRE, HookSpec
 
 pytestmark = pytest.mark.cpu
@@ -66,3 +66,38 @@ def test_install_ring_hooks_refuses_an_unbound_model_wide_spec() -> None:
 
     with pytest.raises(RuntimeError, match="unbound model-wide HookSpec"):
         install_ring_hooks([spec])
+
+
+def test_uninstall_ring_hooks_disarms_every_hook_point():
+    """The inverse of install: after it, HookPoint.forward's arming check fails.
+
+    `detach_model` runs in a `finally` after every monitored generate, so a
+    hook left armed here fires on the NEXT ordinary forward of the same model
+    -- outside any reservation and with an empty meta FIFO.
+    """
+    modules = [torch.nn.Identity() for _ in range(3)]
+    payload = torch.zeros(4, dtype=torch.uint8)
+    specs = [
+        HookSpec(hook_type=HOOK_TYPE_RESID_PRE, module=m, layer_no=i)
+        for i, m in enumerate(modules)
+    ]
+
+    install_ring_hooks(specs, payload)
+    assert all(m._ring_hook_type == HOOK_TYPE_RESID_PRE for m in modules)
+
+    uninstall_ring_hooks(specs)
+
+    # `_ring_hook_type is None` is the condition HookPoint.forward returns on.
+    assert all(m._ring_hook_type is None for m in modules)
+    # The ring buffer reference is dropped too, so detaching releases it.
+    assert all(m._ring_payload is None for m in modules)
+
+
+def test_uninstall_ring_hooks_tolerates_an_unbound_spec():
+    """Unlike install, uninstall must not raise on a model-wide spec.
+
+    It runs on a teardown path (`detach_model`'s cleanup), where raising would
+    replace whatever the caller was already handling.
+    """
+    uninstall_ring_hooks([HookSpec(hook_type=HOOK_TYPE_RESID_PRE, module=None,
+                                   layer_no=-1)])
