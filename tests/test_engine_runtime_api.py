@@ -781,3 +781,169 @@ def test_the_sink_loader_tolerates_a_transport_module_without_the_loader(
     monkeypatch.setitem(sys.modules, "dmi.transport.native", fake)
     monkeypatch.setattr(dmi.transport, "native", fake, raising=False)
     assert native_sink._load_native_sink_extension() is not None
+
+
+# --- the record switch is a transaction: one runtime, or none at all ----------
+#
+# create_record_runtime tears the plain ring down before it builds the record
+# one, so every failure between those two points leaves the engine with no
+# transport at all. The guard below refuses a second runtime instead of
+# stopping the live record ring, and the rollback arm has to put the engine
+# back into the honest "not enabled" state -- never a _record_mode that points
+# at a transport that was never activated.
+
+
+def _record_ring_fakes(monkeypatch, *, create_record, activate, deactivated):
+    """The two fake modules create_record_runtime imports lazily."""
+
+    class _FakeTransport:
+        def __init__(self, native_ring):
+            self._ring_payload = native_ring.payload_tensor()
+            self.null_offload = False
+            self.force_eager = False
+
+        def _record_payload_tensor(self):
+            return self._ring_payload
+
+        def configure_record_schema(self, schema):
+            self._record_schema = schema
+
+    fake_transport_module = ModuleType("dmi.transport.ring")
+    fake_transport_module.RingTransport = _FakeTransport
+    fake_transport_module.activate = activate
+    fake_transport_module.deactivate = lambda: deactivated.append(True)
+    fake_native_module = ModuleType("dmi.transport.native")
+    fake_native_module.RecordSink = object
+    fake_native_module.RingEngine = SimpleNamespace(create_record=create_record)
+    fake_native_module._load_extension = lambda: SimpleNamespace(
+        _validate_record_host_schema=lambda host, schema: None
+    )
+    monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
+
+
+def test_second_record_runtime_is_refused_while_one_is_active(monkeypatch):
+    """The refusal happens before the teardown, so the live ring survives."""
+    engine, _old_transport, _old_ring = _engine_with_fake_ring()
+    engine._ring_config = object()
+    engine._host_engine = object()
+    new_ring = _FakeRingEngine()
+    created = []
+    activated = []
+    deactivated = []
+
+    def create_record(config, target):
+        created.append((config, target))
+        return new_ring
+
+    _record_ring_fakes(
+        monkeypatch,
+        create_record=create_record,
+        activate=activated.append,
+        deactivated=deactivated,
+    )
+
+    engine.create_record_runtime(_explicit_sink_format())
+    live_transport = engine._ring_transport
+
+    with pytest.raises(RuntimeError, match="already active"):
+        engine.create_record_runtime(_explicit_sink_format())
+
+    assert len(created) == 1
+    assert engine._ring_transport is live_transport
+    assert engine._ring_engine is new_ring
+    assert engine._record_mode is True
+    assert new_ring.stop_calls == 0
+
+
+@pytest.mark.parametrize("failing_step", ["create_record", "init", "start"])
+def test_record_ring_construction_failure_rolls_the_engine_back(
+    monkeypatch, failing_step
+):
+    """The plain ring is already gone, so the engine must report "not enabled".
+
+    A half-built record engine is stopped on the way out -- its native lease
+    joins the record worker -- and no transport is ever activated.
+    """
+    engine, _old_transport, old_ring = _engine_with_fake_ring()
+    engine._ring_config = object()
+    engine._host_engine = object()
+    activated = []
+    deactivated = []
+
+    class _Boom(_FakeRingEngine):
+        def init(self):
+            if failing_step == "init":
+                raise RuntimeError("record ring init failed")
+            super().init()
+
+        def start(self):
+            if failing_step == "start":
+                raise RuntimeError("record ring start failed")
+            super().start()
+
+    new_ring = _Boom()
+
+    def create_record(config, target):
+        if failing_step == "create_record":
+            raise RuntimeError("record ring create failed")
+        return new_ring
+
+    _record_ring_fakes(
+        monkeypatch,
+        create_record=create_record,
+        activate=activated.append,
+        deactivated=deactivated,
+    )
+
+    with pytest.raises(RuntimeError, match="record ring .* failed"):
+        engine.create_record_runtime(_explicit_sink_format())
+
+    assert engine._record_mode is False
+    assert engine._ring_transport is None
+    assert engine._ring_engine is None
+    assert activated == []
+    assert old_ring.stop_calls == 1
+    if failing_step != "create_record":
+        assert new_ring.stop_calls == 1
+    with pytest.raises(RuntimeError, match="Ring transport is not enabled"):
+        engine.flush_and_wait(1.0)
+    with pytest.raises(RuntimeError, match="Ring transport is not enabled"):
+        engine.create_record_runtime(_explicit_sink_format())
+
+
+def test_activate_failure_rolls_back_the_half_installed_record_ring(monkeypatch):
+    """The one failure that reaches the rollback with the fields already set.
+
+    activate() is the last step, and by then _ring_transport, _ring_engine and
+    _record_mode all name the new record ring. Only here does the rollback's
+    state reset do observable work -- on the create/init/start paths the fields
+    are still the None the switch left behind. The second deactivate() is the
+    point: one during the switch, one undoing the activation attempt.
+    """
+    engine, _old_transport, _old_ring = _engine_with_fake_ring()
+    engine._ring_config = object()
+    engine._host_engine = object()
+    new_ring = _FakeRingEngine()
+    deactivated = []
+
+    def boom_activate(_transport):
+        raise RuntimeError("ring activation failed")
+
+    _record_ring_fakes(
+        monkeypatch,
+        create_record=lambda config, target: new_ring,
+        activate=boom_activate,
+        deactivated=deactivated,
+    )
+
+    with pytest.raises(RuntimeError, match="ring activation failed"):
+        engine.create_record_runtime(_explicit_sink_format())
+
+    assert engine._record_mode is False
+    assert engine._ring_transport is None
+    assert engine._ring_engine is None
+    assert new_ring.stop_calls == 1
+    assert deactivated == [True, True]
+    with pytest.raises(RuntimeError, match="Ring transport is not enabled"):
+        engine.flush_and_wait(1.0)
