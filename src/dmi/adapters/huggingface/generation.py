@@ -470,6 +470,11 @@ def generate_greedy_with_monitoring(
         logits_to_keep: 0 = all rows, 1 = last position only.
         cuda_graphs: if True, compile decode step with reduce-overhead +
             StaticCache.  If False, use HF default DynamicCache, no compile.
+            NOTE: the compiled decode step is not given an attention mask --
+            a per-step-growing mask would change shape every step and defeat
+            CUDA-graph capture -- so left-padded batches are only correct on
+            the eager path (``cuda_graphs=False``).  Right-padded or unpadded
+            batches are unaffected.
         monitoring: if True, install ring transport hooks via HuggingFaceAdapter and
             call before_forward_manual before each forward pass.
         hook_selection: hook selection preset (e.g. "hidden-states", "full").
@@ -610,8 +615,23 @@ def generate_greedy_with_monitoring(
                     torch.compiler.cudagraph_mark_step_begin()
                     out = compiled_decode(token, cache, cache_pos)
                 else:
+                    # The mask has to grow with the cache. Without it HF
+                    # builds an all-ones causal mask over the whole cache, so
+                    # a left-padded row attends to its own pad positions' K/V
+                    # and the greedy tokens diverge from model.generate().
+                    # Measured on a real model: supplying this restores exact
+                    # parity, and correcting position_ids alone does not.
+                    # All-ones on the right because every generated position
+                    # is real; the prompt columns keep the caller's padding.
+                    decode_mask = torch.cat(
+                        [attention_mask,
+                         torch.ones(B, step + 1, device=device,
+                                    dtype=attention_mask.dtype)],
+                        dim=1,
+                    )
                     decode_kwargs: Dict[str, Any] = {
                         "input_ids": token,
+                        "attention_mask": decode_mask,
                         "past_key_values": cache,
                         "use_cache": True,
                         "output_hidden_states": False,
