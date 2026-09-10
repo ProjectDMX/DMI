@@ -588,7 +588,7 @@ def test_capture_backend_requires_the_sink_that_selects_it(monkeypatch):
     engine._ring_config = object()
     engine._storage_backend = "capture"
 
-    with pytest.raises(ValueError, match="reached by passing its sink"):
+    with pytest.raises(ValueError, match="capture_sink_config"):
         engine.create_record_runtime(_explicit_sink_format())
 
 
@@ -623,3 +623,161 @@ def test_auto_keeps_the_inference_every_earlier_caller_relied_on():
     # host-path and explicit-sink tests above exercise.
     engine._reject_a_sink_the_config_did_not_ask_for(None)
     engine._reject_a_sink_the_config_did_not_ask_for(object())
+
+
+def test_capture_backend_defaults_to_the_native_pack_sink(monkeypatch, tmp_path):
+    """C3: the capture path's default writer is the native pack sink.
+
+    The gates the plan set for D4's flip have all passed (Checkpoint A,
+    Checkpoint B, the read-parity and hydration legs), so a caller who
+    selects the capture backend without naming a sink gets the native
+    writer — the reference sink stays available by passing it explicitly,
+    which is the documented rollback.
+    """
+    from dmi.config import MonitoringConfig
+    from dmi.storage.capture.native_sink import NativeSinkConfig
+
+    engine, _old_transport, old_ring = _engine_with_fake_ring()
+    ring_config = object()
+    engine._ring_config = ring_config
+    engine._storage_backend = "capture"
+
+    sink_config = NativeSinkConfig(spool_root=str(tmp_path / "spool"))
+
+    class _Lease:
+        def release(self):
+            pass
+
+    used_sinks = []
+
+    class _RecordSink:
+        def _acquire_engine(self):
+            return _Lease()
+
+    class _NativePackSink(_RecordSink):
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            used_sinks.append(self)
+
+        def _acquire_engine(self):
+            return _Lease()
+
+    fake_native_module = ModuleType("dmi.transport.native")
+    fake_native_module.RecordSink = _RecordSink
+    fake_native_module._load_named_extension = lambda name: SimpleNamespace(
+        NativePackSink=_NativePackSink
+    )
+
+    new_ring = _FakeRingEngine()
+    created, activated, deactivated = [], [], []
+
+    class _FakeTransport:
+        def __init__(self, native_ring):
+            self._ring_payload = native_ring.payload_tensor()
+            self.null_offload = False
+            self.force_eager = False
+
+        def _record_payload_tensor(self):
+            return self._ring_payload
+
+        def configure_record_schema(self, schema):
+            self._record_schema = schema
+
+    fake_transport_module = ModuleType("dmi.transport.ring")
+    fake_transport_module.RingTransport = _FakeTransport
+    fake_transport_module.activate = activated.append
+    fake_transport_module.deactivate = lambda: deactivated.append(True)
+    fake_native_module.RingEngine = type(
+        "RingEngine",
+        (),
+        {"create_record": staticmethod(
+            lambda config, target: new_ring)},
+    )
+    monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
+    # `from ...transport import native` reads the parent package's cached
+    # attribute — an earlier real import binds it, and the sink loader would
+    # then find the real extension instead of the fake.
+    import dmi.transport
+
+    monkeypatch.setattr(
+        dmi.transport, "native", fake_native_module, raising=False)
+
+    engine._capture_sink_config = sink_config
+    runtime = engine.create_record_runtime(_explicit_sink_format())
+
+    # The default resolved to the native pack sink, built from the config's
+    # bounds — not a refusal, and not the ClickHouse host path.
+    assert len(used_sinks) == 1
+    assert used_sinks[0].kwargs["spool_root"] == sink_config.spool_root
+    assert runtime is not None
+
+
+# --- the sink extension's RecordSink base is bound once, at import ------------
+#
+# _dmi_native_sink derives NativePackSink from the ring RecordSink the MAIN
+# backend registers, which is what makes the sink pass this engine's
+# isinstance check and inherit `_acquire_engine`. That binding is chosen when
+# the extension initialises and is final for the process: if the main backend
+# was unreachable then, the sink bound its own stand-in, and a main backend
+# arriving later does not re-parent it -- no registration collision, just an
+# isinstance that is quietly False and a refusal that blames the sink rather
+# than the import order. Measured against two extensions built from one
+# pybind11, in all three orders. The loader says so precisely instead.
+
+
+def _sink_loader_with(monkeypatch, *, main_backend, stand_ins):
+    """The sink loader against a stubbed transport module."""
+    import dmi.transport
+    from dmi.storage.capture import native_sink
+
+    fake = ModuleType("dmi.transport.native")
+
+    def _load_extension():
+        if not main_backend:
+            raise ImportError("no full native backend on this host")
+        return SimpleNamespace()
+
+    fake._load_extension = _load_extension
+    fake._load_named_extension = lambda name: SimpleNamespace(
+        RING_TYPES_ARE_STANDINS=stand_ins
+    )
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake)
+    monkeypatch.setattr(dmi.transport, "native", fake, raising=False)
+    return native_sink._load_native_sink_extension
+
+
+def test_a_stand_in_record_sink_beside_a_real_backend_is_refused(monkeypatch):
+    """The unattachable combination names the cause: import order."""
+    load = _sink_loader_with(monkeypatch, main_backend=True, stand_ins=True)
+    with pytest.raises(ImportError, match="before the main native backend"):
+        load()
+
+
+def test_stand_ins_alone_are_fine_and_a_real_base_is_fine(monkeypatch):
+    """The two legitimate states must both load.
+
+    Stand-ins WITHOUT a main backend is the torch-CPU host, where there is
+    no engine to attach to; a real base with the backend present is the
+    production case. Only the mismatch above is refused.
+    """
+    load = _sink_loader_with(monkeypatch, main_backend=False, stand_ins=True)
+    assert load().RING_TYPES_ARE_STANDINS is True
+
+    load = _sink_loader_with(monkeypatch, main_backend=True, stand_ins=False)
+    assert load().RING_TYPES_ARE_STANDINS is False
+
+
+def test_the_sink_loader_tolerates_a_transport_module_without_the_loader(
+        monkeypatch):
+    """A stub module need not carry _load_extension at all."""
+    import dmi.transport
+    from dmi.storage.capture import native_sink
+
+    fake = ModuleType("dmi.transport.native")
+    fake._load_named_extension = lambda name: SimpleNamespace(
+        RING_TYPES_ARE_STANDINS=True
+    )
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake)
+    monkeypatch.setattr(dmi.transport, "native", fake, raising=False)
+    assert native_sink._load_native_sink_extension() is not None

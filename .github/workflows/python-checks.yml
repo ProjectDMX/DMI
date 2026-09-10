@@ -28,10 +28,104 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "torch>=2.8,<3" --index-url https://download.pytorch.org/whl/cpu
           python -m pip install pytest wheel numpy "clickhouse-driver>=0.2.0"
+          # The native capture suites import botocore at collection (their
+          # missing-driver skip is a mark, evaluated after the import), and
+          # `--no-deps -e .` would otherwise leave them erroring here.
+          python -m pip install "botocore>=1.34"
+          # boto3 too, and it is a DIFFERENT dependency: the uploader's
+          # head-to-head test drives the Python reference SpoolUploader,
+          # which imports boto3. That test skipped here until the compile
+          # step below started building the drivers its skipif looks for,
+          # so the gap only became visible once the test could run at all.
+          # Pinned to the range pyproject's `s3` extra declares; a pip line
+          # rather than the extra because `--no-deps -e .` installs none.
+          python -m pip install "boto3>=1.40,<2"
           python -m pip install --no-deps -e .
 
+      - name: Compile every CPU-only native target
+        # The C++ was compiled NOWHERE in CI until this step. `make check`'s
+        # compile stage is `python -m compileall` -- Python only -- and the
+        # one native build test runs `make -C native -B -n host`, which is a
+        # DRY RUN (`-n`) of the CUDA target: it checks the command lines and
+        # compiles nothing. So a source file that did not build on this
+        # image could sit in the tree indefinitely, and one did: pack_sink.cpp
+        # threw std::runtime_error without including <stdexcept>, invisible
+        # on a dev box whose libstdc++ pulls it in transitively, and it only
+        # surfaced when a later job happened to ask for the sink driver.
+        #
+        # `cpu-goals` rather than a list of binaries: the set is what a
+        # developer can build without CUDA and therefore what CI can check,
+        # and a list written here goes stale the moment CPU_ONLY_GOALS
+        # gains a target -- which it did, when the catalog driver landed on
+        # the Phase B branch and the hardcoded list did not know. Adding a
+        # target to CPU_ONLY_GOALS now puts it under the gate with no
+        # change here. libcurl dev headers for the store client; the runner
+        # ships the runtime .so but not the headers.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libcurl4-openssl-dev
+          make -C native cpu-goals \
+            CURL_INCDIR=/usr/include/x86_64-linux-gnu \
+            CURL_LIBDIR=/usr/lib/x86_64-linux-gnu
+
       - name: Run compile, CPU, and package-layout checks
-        run: make check
+        run: make check PYTEST_ARGS="--junit-xml=cpu-results.xml"
+
+      - name: Fail if a cpu test skipped for anything but absent hardware
+        if: always()
+        # The same reasoning as the live job's gate, arriving late because
+        # nothing here built the native binaries until the step above: a
+        # test whose skipif looks for a driver that was never compiled
+        # SKIPS, and a skipped suite reports green. Measured on this
+        # branch: the cpu job was 1125 passed / 58 skipped where a machine
+        # with the binaries present runs 1197 -- seventy-two tests that
+        # nobody was running and nothing was saying so.
+        #
+        # Not "zero skips", unlike the live gate: a CPU runner genuinely
+        # has no GPU, so the one CUDA-shaped skip is legitimate and stays
+        # allowed BY REASON. Every other reason fails and names itself,
+        # which is what keeps this from being widened by habit -- a new
+        # skip has to be argued for here, not just added.
+        run: |
+          python - <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # A skip is allowed only if its reason says the runner lacks the
+          # HARDWARE. Anything else -- an unbuilt driver, a missing
+          # dependency, a lost fixture -- is coverage that silently is not
+          # there, which is the failure this gate exists for.
+          ALLOWED = ("no CUDA device", "requires CUDA", "no GPU")
+
+          try:
+              suites = ET.parse("cpu-results.xml").getroot().findall("testsuite")
+          except (OSError, ET.ParseError) as exc:
+              sys.exit(f"cannot read cpu-results.xml: {exc}. The gate is not "
+                       "running, which is indistinguishable from it passing.")
+          if not suites:
+              sys.exit("cpu-results.xml has no <testsuite>: the gate cannot read it")
+          ran = sum(int(s.get("tests", 0)) for s in suites)
+          if ran == 0:
+              sys.exit("no cpu tests ran: the marker selection matched nothing")
+
+          unexplained = []
+          allowed = 0
+          for suite in suites:
+              for case in suite.iter("testcase"):
+                  for mark in case.iter("skipped"):
+                      reason = mark.get("message") or ""
+                      if any(ok in reason for ok in ALLOWED):
+                          allowed += 1
+                      else:
+                          unexplained.append(f"{case.get('name')}: {reason}")
+          print(f"{ran} collected, {allowed} skipped for absent hardware, "
+                f"{len(unexplained)} unexplained")
+          if unexplained:
+              for line in unexplained:
+                  print(f"  skipped: {line}")
+              sys.exit(f"{len(unexplained)} cpu test(s) skipped for a reason "
+                       "that is not absent hardware; a skip is not a pass")
+          EOF
 
   clickhouse-live:
     # The `manual`-marked suites, which `make check` cannot run: `addopts` in
@@ -67,6 +161,10 @@ jobs:
           CLICKHOUSE_SKIP_USER_SETUP: "1"
         ports:
           - 9000:9000
+          # The native catalog driver (B1 lease/allocator port) speaks
+          # ClickHouse's HTTP interface, not the native TCP protocol
+          # clickhouse-driver uses.
+          - 8123:8123
         options: >-
           --health-cmd "clickhouse-client --query 'SELECT 1'"
           --health-interval 10s
@@ -97,7 +195,51 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "torch>=2.8,<3" --index-url https://download.pytorch.org/whl/cpu
           python -m pip install pytest wheel numpy "clickhouse-driver>=0.2.0"
+          # Same reason as the cpu job above, and it reaches this job through
+          # the ported catalog suite: it imports the fake-S3 fixture at MODULE
+          # level (a fixture imported inside a function does not register), and
+          # that module imports botocore at import time. Missing, it is not the
+          # S3-backed tests that skip -- collection of the whole module errors
+          # and the live job dies at exit code 2 with every other ported test
+          # uncollected.
+          python -m pip install "botocore>=1.34"
+          # boto3 as well, and note this is NOT the same dependency: the
+          # reader-parity suite compares the native reader against the
+          # PYTHON one, and the Python side hydrates through S3PackStore,
+          # which imports boto3 and raises "S3 support requires the optional
+          # 's3' dependencies" without it. The pip line rather than the `s3`
+          # extra because `--no-deps -e .` below installs no extras. Pinned
+          # to the range pyproject's `s3` extra declares.
+          python -m pip install "boto3>=1.40,<2"
           python -m pip install --no-deps -e .
+
+      - name: Build the native drivers the live suites drive
+        # The ported lease/allocator suites drive the native coordinator
+        # over ClickHouse's HTTP interface. The runner ships the runtime
+        # libcurl.so.4 but not the dev headers; install those and build
+        # against the system paths.
+        #
+        # ALL FOUR CPU-only conformance drivers, not just the catalog one:
+        # the ported catalog suite reaches the others through its indexer
+        # tests, which stage packs through the sink, recover the staged
+        # entry through the spool driver, upload through the store driver
+        # to the in-process fake S3, and then index what came back. A
+        # missing binary there is not a skip -- it is FileNotFoundError at
+        # Popen -- and the spool one is reached by a path built from
+        # STORE_DRIVER.parent rather than a module constant, so it does not
+        # show up by grepping for driver names. Build the set; the marginal
+        # cost is seconds and it ends a class of failure that was found one
+        # binary per CI round.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libcurl4-openssl-dev
+          make -C native \
+            build/conformance_catalog \
+            build/conformance_store \
+            build/conformance_sink \
+            build/conformance_spool \
+            CURL_INCDIR=/usr/include/x86_64-linux-gnu \
+            CURL_LIBDIR=/usr/lib/x86_64-linux-gnu
 
       - name: Run the ClickHouse live suites
         env:
@@ -107,7 +249,7 @@ jobs:
         # suite that also needs a Garage S3 endpoint; everything else under
         # these markers needs nothing but the server above.
         run: |
-          python -m pytest -m "clickhouse and manual and not garage" \
+          python -m pytest tests/*_live.py -m "clickhouse and manual and not garage" \
             -q --junit-xml=live-results.xml
 
       - name: Fail if any live test was skipped

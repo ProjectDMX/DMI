@@ -8,14 +8,22 @@ from typing import BinaryIO, Mapping, Protocol, Sequence, runtime_checkable
 
 
 
+# The authoritative dtype set: every consumer (the numpy summary map, the
+# C++ hydration decoder, the torch adapter) carries the same names, and
+# CaptureMetadata is where an unknown one is refused. float8 values are
+# OCP e4m3fn (no infinities; exponent all-ones is NaN) and IEEE-style e5m2.
 _DTYPE_BYTES = {
     "bool": 1,
     "uint8": 1,
     "int8": 1,
+    "uint16": 2,
     "int16": 2,
     "float16": 2,
     "bfloat16": 2,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
     "int32": 4,
+    "uint32": 4,
     "float32": 4,
     "int64": 8,
     "float64": 8,
