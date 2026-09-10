@@ -285,6 +285,16 @@ class HookPoint(nn.Module):
             if engine is not None:
                 nbytes = x_cont.nbytes
                 transport_bytes = align_up_py(nbytes, 16)
+                # The ring's real per-step ceiling is min(payload, staging),
+                # not payload alone. The drain assembles each flush batch per
+                # WHOLE entry and breaks when the entry does not fit staging
+                # (drain_thread.cpp), so a tensor larger than staging that is
+                # admitted here is never drained: the capture is lost and its
+                # payload reservation is never released, permanently shrinking
+                # ring capacity, while flush_and_wait() still returns success.
+                # Same ceiling the native prepare_step/reserve_record use, and
+                # the one RingCapacities.effective_bytes publishes.
+                effective_cap = min(engine.payload_cap(), engine.staging_cap())
                 if strip_t is not None:
                     # CPU-direct bypasses ring/staging accounting. Flush older
                     # ring tasks first so the shared metadata FIFO stays in
@@ -294,18 +304,19 @@ class HookPoint(nn.Module):
                     transport.submit_cpu_direct(
                         x_cont.cpu(),
                         self._ring_hook_type, self._ring_hook_id)
-                elif transport_bytes <= engine.available_capacity():
+                elif transport_bytes <= min(engine.available_capacity(),
+                                            effective_cap):
                     engine.reserve_one(nbytes)
                     dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
                                       self._ring_hook_type, self._ring_hook_id)
-                elif transport_bytes <= engine.payload_cap():
+                elif transport_bytes <= effective_cap:
                     engine.flush_and_wait()
                     engine.reserve_one(nbytes)
                     dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
                                       self._ring_hook_type, self._ring_hook_id)
                 else:
-                    # Single tensor larger than the whole ring -- bypass via
-                    # cpu_direct.  Flush first so submit_cpu_direct consumes
+                    # Larger than the ring's effective capacity (payload OR
+                    # staging) -- bypass via cpu_direct.  Flush first so submit_cpu_direct consumes
                     # the FIFO meta for THIS hook (prior ring entries finish
                     # first; this hook's pre-pushed meta becomes the head).
                     engine.flush_and_wait()

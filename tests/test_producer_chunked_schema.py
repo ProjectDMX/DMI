@@ -156,9 +156,13 @@ def test_hook_point_strip_attrs_settable_for_chunked_mode():
 
 
 class _FakeEagerRingEngine:
-    def __init__(self, available: int, capacity: int):
+    # `staging` defaults to `capacity` because that is what RingConfig does
+    # when pinned staging is left at 0 -- the two pre-existing tests below
+    # were written against that shape and are unaffected by its being named.
+    def __init__(self, available: int, capacity: int, staging: int = None):
         self.available = available
         self.capacity = capacity
+        self.staging = capacity if staging is None else staging
         self.reserved: list[int] = []
         self.flushes = 0
 
@@ -167,6 +171,9 @@ class _FakeEagerRingEngine:
 
     def payload_cap(self) -> int:
         return self.capacity
+
+    def staging_cap(self) -> int:
+        return self.staging
 
     def reserve_one(self, nbytes: int) -> None:
         self.reserved.append(nbytes)
@@ -247,3 +254,88 @@ def test_eager_stripped_v0_uses_cpu_direct_without_reservation(monkeypatch):
     assert dispatched == []
     assert len(transport.direct) == 1
     assert torch.equal(transport.direct[0], value.cpu())
+
+
+def _eager_hook(monkeypatch, engine, dispatched):
+    """A hook armed on the eager path, with dispatch_producer captured."""
+    from dmi.hooks.point import HookPoint
+    from dmi.transport import ring as ring_transport
+
+    transport = _FakeEagerTransport(engine)
+    monkeypatch.setattr(ring_transport, "_active_transport", transport)
+    monkeypatch.setattr(
+        "dmi.hooks.point.dispatch_producer",
+        lambda *args: dispatched.append(args),
+    )
+    hook = HookPoint()
+    hook._ring_hook_type = 1
+    hook._ring_hook_id = 2
+    hook._ring_payload = torch.empty(64, dtype=torch.uint8, device="cuda")
+    return hook, transport
+
+
+@pytest.mark.gpu
+def test_eager_ring_refuses_a_tensor_larger_than_pinned_staging(monkeypatch):
+    """The ceiling is min(payload, staging), not payload alone.
+
+    The drain assembles each flush batch per whole entry and breaks when the
+    entry does not fit staging, so a tensor larger than staging is accepted
+    into the ring and then never drained: the capture is lost and its payload
+    reservation is never released, permanently shrinking ring capacity while
+    flush_and_wait() still returns success.
+
+    Here the tensor fits available_capacity and payload_cap, so the first
+    eager branch used to take it.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    engine = _FakeEagerRingEngine(available=4096, capacity=4096, staging=64)
+    dispatched = []
+    hook, transport = _eager_hook(monkeypatch, engine, dispatched)
+
+    value = torch.arange(128, dtype=torch.uint8, device="cuda")
+    hook(value)
+
+    assert engine.reserved == [], "over-staging bytes must not be reserved"
+    assert dispatched == [], "over-staging bytes must not enter the ring"
+    assert len(transport.direct) == 1
+    assert torch.equal(transport.direct[0], value.cpu())
+
+
+@pytest.mark.gpu
+def test_eager_ring_refuses_over_staging_bytes_on_the_flush_branch_too(monkeypatch):
+    """The same ceiling on the second branch, reached when the ring is partly
+    full -- e.g. a later hook in the same step. Both branches shared the flaw,
+    so fixing only the first would leave this one live."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    engine = _FakeEagerRingEngine(available=16, capacity=4096, staging=64)
+    dispatched = []
+    hook, transport = _eager_hook(monkeypatch, engine, dispatched)
+
+    value = torch.arange(128, dtype=torch.uint8, device="cuda")
+    hook(value)
+
+    assert engine.reserved == []
+    assert dispatched == []
+    assert len(transport.direct) == 1
+
+
+@pytest.mark.gpu
+def test_eager_ring_still_uses_the_ring_when_staging_covers_the_tensor(monkeypatch):
+    """Positive control: the fix must not route everything to cpu_direct."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    engine = _FakeEagerRingEngine(available=4096, capacity=4096, staging=4096)
+    dispatched = []
+    hook, transport = _eager_hook(monkeypatch, engine, dispatched)
+
+    value = torch.arange(128, dtype=torch.uint8, device="cuda")
+    hook(value)
+
+    assert engine.reserved == [128]
+    assert len(dispatched) == 1
+    assert transport.direct == []
