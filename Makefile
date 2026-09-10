@@ -8,6 +8,12 @@ NATIVE_DIR ?= $(CURDIR)/native
 # Point it somewhere else with: make ui MODEL=./my-model
 MODEL ?= examples/model_descriptors/llama3-8b.yaml
 
+# Extra flags for the pytest invocations below. CI passes --junit-xml so a
+# later step can read what actually RAN, rather than trusting an exit code:
+# a suite whose tests all skipped exits 0 and reports green. Empty by
+# default, so a developer's `make check` is unchanged.
+PYTEST_ARGS ?=
+
 all: native
 
 native:
@@ -25,7 +31,7 @@ ui:
 test: test-cpu
 
 test-cpu:
-	$(PYTHON) -m pytest -m cpu -q
+	$(PYTHON) -m pytest -m cpu -q $(PYTEST_ARGS)
 
 test-host: host
 	$(PYTHON) -m pytest tests/test_cpu_native_build.py \

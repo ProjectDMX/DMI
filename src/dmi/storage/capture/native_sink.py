@@ -1,0 +1,162 @@
+"""Native capture sink selection: the production writer for capture packs.
+
+The reference path (:class:`CapturePackReferenceSink` in
+:mod:`dmi.storage.capture.record_adapter`) crosses the Python GIL once per
+envelope and exists to exercise the format end to end. This module selects
+the native writer instead: envelopes travel the ring's record worker
+straight into pack assembly with no Python on the capture path.
+
+Selection defaults to this writer under ``storage_backend="capture"``
+(built from the config's ``capture_sink_config``), since Checkpoint B and
+C1/C2 passed. An explicit ``record_sink`` at the call site overrides it —
+pass the reference sink to roll back. Packs staged by either writer are
+readable by the same Python reader, which the rollback test pins.
+
+The extension (``native/build/_dmi_native_sink*.so``) loads lazily so that
+importing :mod:`dmi.storage.capture` never requires torch.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+LAYOUT_NAME = "capture_pack_reference_v1"
+
+
+@dataclass(frozen=True, slots=True)
+class NativeSinkConfig:
+    """Pack-sink bounds for the native writer. Field-by-field the same
+    contract as the pipeline config the reference sink takes."""
+
+    spool_root: str
+    spool_max_bytes: int = 1 << 40
+    num_workers: int = 1
+    max_queue_records: int = 256
+    max_queue_bytes: int = 16 * 1024 * 1024
+    max_pack_bytes: int = 128 * 1024 * 1024
+    max_pack_records: int = 10_000
+    max_linger_ns: int = 1_000_000_000
+
+    def __post_init__(self) -> None:
+        if not self.spool_root:
+            raise ValueError("spool_root is required")
+        for name in (
+            "spool_max_bytes",
+            "num_workers",
+            "max_queue_records",
+            "max_queue_bytes",
+            "max_pack_bytes",
+            "max_pack_records",
+            "max_linger_ns",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be positive")
+
+
+def _load_native_sink_extension() -> Any:
+    from ...transport import native as _native_transport
+
+    # The main backend FIRST, when it is built. The sink extension derives
+    # NativePackSink from the ring RecordSink the main backend registers
+    # (pybind11 shares one type registry across both extensions), so the
+    # main backend's registration has to exist before the sink module
+    # initialises: that is what makes the sink an instance of
+    # _native_backend.RecordSink with the inherited `_acquire_engine`, which
+    # create_record_runtime requires. Without the main backend (torch-CPU
+    # test hosts) the sink module falls back to module-local stand-ins,
+    # and there is no engine to attach to anyway.
+    # getattr, not a direct call: a test may stand a stub module in for
+    # dmi.transport.native (it needs only RecordSink and the named loader),
+    # and this is a best-effort ordering step rather than a requirement.
+    load_main_backend = getattr(_native_transport, "_load_extension", None)
+    main_backend_available = False
+    if callable(load_main_backend):
+        try:
+            load_main_backend()
+            main_backend_available = True
+        except Exception:
+            pass
+    try:
+        module = _native_transport._load_named_extension("_dmi_native_sink")
+    except ImportError as exc:
+        raise ImportError(
+            "The native capture sink is unavailable. Build it with "
+            "`make -C native build/_dmi_native_sink "
+            "PYTHON=<venv>/bin/python`."
+        ) from exc
+    # The sink binds its RecordSink base ONCE, when the extension
+    # initialises, and the choice is final for the process. If it initialised
+    # while the main backend was unreachable it bound its own stand-in, and a
+    # main backend that shows up afterwards does NOT re-parent it: there is no
+    # registration collision to notice, `isinstance(sink, RecordSink)` is
+    # simply False, and create_record_runtime refuses the sink with
+    # "record_sink must be a native RecordSink" -- which says nothing about
+    # import order, the actual cause. Measured, not assumed: two extensions
+    # built against one pybind11 behave exactly this way in all three orders.
+    #
+    # Reaching this state needs the sink imported before dmi is importable,
+    # so it does not happen through this loader. Saying so precisely here
+    # costs one comparison and turns a mystifying refusal into a fixable one.
+    if main_backend_available and getattr(
+        module, "RING_TYPES_ARE_STANDINS", False
+    ):
+        raise ImportError(
+            "The native capture sink was imported before the main native "
+            "backend and bound a stand-in RecordSink, so no engine can "
+            "attach it. The extension cannot be re-bound in this process: "
+            "import dmi (or dmi.transport.native) before _dmi_native_sink."
+        )
+    return module
+
+
+class NativePackSinkHandle:
+    """Owns a native pack sink; mirrors CapturePackReferenceSink's surface
+    (``record_format`` + ``native_sink``) so call sites switch by factory."""
+
+    def __init__(self, config: NativeSinkConfig) -> None:
+        module = _load_native_sink_extension()
+        self._native_sink = module.NativePackSink(
+            spool_root=config.spool_root,
+            layout=LAYOUT_NAME,
+            num_workers=config.num_workers,
+            max_queue_records=config.max_queue_records,
+            max_queue_bytes=config.max_queue_bytes,
+            max_pack_bytes=config.max_pack_bytes,
+            max_pack_records=config.max_pack_records,
+            max_linger_ns=config.max_linger_ns,
+            spool_max_bytes=config.spool_max_bytes,
+        )
+        # Engine ownership is taken by create_record_runtime; holding no
+        # lease here keeps the handle closable without an engine.
+        self._record_format_layout = LAYOUT_NAME
+
+    @property
+    def record_format_layout(self) -> str:
+        """The wire layout this sink consumes (shared with the reference)."""
+
+        return self._record_format_layout
+
+    @property
+    def native_sink(self) -> Any:
+        """Native ``RecordSink`` passed explicitly to ``create_record_runtime``."""
+
+        return self._native_sink
+
+
+def create_native_pack_sink(config: NativeSinkConfig) -> NativePackSinkHandle:
+    """Select the native capture writer for one record runtime."""
+
+    if not isinstance(config, NativeSinkConfig):
+        raise TypeError("config must be a NativeSinkConfig")
+    return NativePackSinkHandle(config)
+
+
+__all__ = [
+    "LAYOUT_NAME",
+    "NativePackSinkHandle",
+    "NativeSinkConfig",
+    "create_native_pack_sink",
+]

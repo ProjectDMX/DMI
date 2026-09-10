@@ -58,6 +58,7 @@ What it establishes, all measured on 25.12:
 from __future__ import annotations
 
 from time import monotonic
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from clickhouse_driver import Client
@@ -217,12 +218,288 @@ def _query_log_settings(client, prefix: str, table: str) -> list[tuple]:
     )
 
 
+# --- the native leg: the same checks through the C++ writer ------------------
+#
+# The conformance_catalog driver exposes the writer's surface over
+# newline-JSON; this adapter maps it onto the interface `_main` drives, so
+# the publish protocol's replicated-server claims are checked against BOTH
+# implementations. The reader and the query log stay Python/server-side:
+# the oracle is the server, not the writer.
+
+
+class NativeServerError(Exception):
+    def __init__(self, message: str, code: int | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+class NativeAllocationError(Exception):
+    pass
+
+
+class _NativeLease:
+    def __init__(self, fields: dict):
+        self.term = fields["term"]
+        self.lease_id = fields["lease_id"]
+
+
+class NativeCatalogWriter:
+    def __init__(self, driver, prefix: str, *, insert_quorum: int | None,
+                 clock_skew_ns: int):
+        self._driver = driver
+        fields = {
+            "op": "open",
+            "database": "default",
+            "table_prefix": prefix,
+            "lease_ttl_ns": 30_000_000_000,
+            "publish_timeout_ns": 5_000_000_000,
+            "clock_skew_ns": clock_skew_ns,
+            "allocation_attempts": 16,
+        }
+        if insert_quorum is not None:
+            fields["insert_quorum"] = insert_quorum
+        response = driver.call(**fields)
+        assert response["ok"], response
+        self._prefix = prefix
+
+    def _call(self, **fields) -> dict:
+        response = self._driver.call(**fields)
+        if response.get("ok"):
+            return response
+        error = response.get("error", "DriverError")
+        message = response.get("message", "")
+        if error == "CatalogVersionAllocationError":
+            raise NativeAllocationError(message)
+        if error == "ClickHouseError":
+            code = None
+            marker = message.find("Code: ")
+            if marker != -1:
+                digits = message[marker + 6:].split(".", 1)[0].strip()
+                if digits.isdigit():
+                    code = int(digits)
+            raise NativeServerError(message, code)
+        raise NativeServerError(f"{error}: {message}")
+
+    def acquire_publisher_lease(self, holder: str) -> _NativeLease:
+        return _NativeLease(
+            self._call(op="acquire", holder=holder)["lease"])
+
+    def allocate_version(self) -> int:
+        return self._call(op="allocate_version")["version"]
+
+    def write_descriptors(self, descriptors, *, index_version: int) -> None:
+        from tests.test_native_catalog_lease_live import _descriptor_dicts
+        self._call(op="write_descriptors",
+                   descriptors=_descriptor_dicts_from(descriptors),
+                   index_version=index_version)
+
+    def publish_snapshot(self, *, index_version: int, refs,
+                         published_at_ns: int, indexed_rows: int,
+                         indexed_packs: int) -> None:
+        self._call(
+            op="publish_snapshot", index_version=index_version,
+            refs=[{"store_id": ref.store_id, "pack_id": ref.pack_id}
+                  for ref in refs],
+            published_at_ns=published_at_ns, indexed_rows=indexed_rows,
+            indexed_packs=indexed_packs)
+
+    def commit_packs(self, refs, *, index_version: int) -> None:
+        self._call(
+            op="commit_packs",
+            refs=[{"pack_id": ref.pack_id, "store_id": ref.store_id,
+                   "object_key": ref.object_key,
+                   "object_bytes": ref.object_bytes,
+                   "pack_checksum": ref.checksum,
+                   "record_count": ref.record_count} for ref in refs],
+            index_version=index_version)
+
+    def last_published_version(self) -> int:
+        return self._call(op="last_published_version")["version"]
+
+    def committed_pack_ids(self, identities) -> set:
+        response = self._call(
+            op="committed_pack_ids",
+            identities=[{"store_id": s, "pack_id": p} for s, p in identities])
+        return {(item["store_id"], item["pack_id"])
+                for item in response["committed"]}
+
+    def collect_garbage(self) -> dict:
+        # The settled orphan sweep waits one publish timeout between its
+        # two reads — the same interval the Python writer's default uses.
+        response = self._call(op="collect_garbage",
+                              settle_sleep_ns=5_000_000_000)
+        return response["removed"]
+
+
+def _descriptor_dicts_from(descriptors):
+    from tests.test_native_catalog_lease_live import _descriptor_dicts
+    from benchmarks.bench_capture_catalog import synthetic_descriptors
+    # The driver op takes the JSON form of CaptureDescriptor objects; the
+    # verifier's corpus is synthetic_descriptors(n), so the shared renderer
+    # is driven from the same objects rather than a parallel dict shape.
+    del descriptors
+    return _descriptor_dicts(len(synthetic_descriptors(6)))
+
+
+def _main_native(client, prefix: str, control_prefix: str, driver_path) -> None:
+    from tests.test_native_catalog_lease_live import CatalogDriver, _open
+
+    # The harness server serves HTTP on 8110 (server.xml), not the
+    # default 8123 the driver assumes; the driver processes inherit this.
+    import os
+    os.environ["DMI_CLICKHOUSE_HTTP_PORT"] = "8110"
+
+    create(client, prefix, "r1", "")
+    create(client, prefix, "r2", "_peer")
+    print(f"created two replicas of {len(TABLES)} tables under {prefix} (native)")
+
+    driver = CatalogDriver()
+    try:
+        _open(driver, prefix, insert_quorum=2, clock_skew_ns=100_000_000)
+        writer = NativeCatalogWriter(
+            driver, prefix, insert_quorum=2, clock_skew_ns=100_000_000)
+        reader = ClickHouseCaptureCatalog(
+            client,
+            ClickHouseReaderConfig.from_catalog(
+                ClickHouseCatalogConfig(
+                    database="default", table_prefix=prefix)))
+
+        # 1. The whole protocol, quorum-durable, over a real snapshot.
+        corpus = synthetic_descriptors(6)
+        refs = _refs(corpus)
+        assert refs, "the corpus must span at least one pack"
+        lease = writer.acquire_publisher_lease("quorum-check-native")
+        version = writer.allocate_version()
+        writer.write_descriptors(corpus, index_version=version)
+        writer.publish_snapshot(
+            index_version=version, refs=refs, published_at_ns=1,
+            indexed_rows=len(corpus), indexed_packs=len(refs),
+        )
+        writer.commit_packs(refs, index_version=version)
+        assert writer.last_published_version() == version
+        assert writer.committed_pack_ids(
+            [(ref.store_id, ref.pack_id) for ref in refs]
+        ) == {(ref.store_id, ref.pack_id) for ref in refs}
+        page = reader.search(CaptureQuery(limit=len(corpus) + 1))
+        assert len(page.items) == len(corpus), (
+            f"pinned read resolved {len(page.items)} of {len(corpus)} descriptors"
+        )
+        assert page.watermark == str(version)
+        print(f"PASS  native publish cycle with insert_quorum=2 (lease term "
+              f"{lease.term}, version {version}, {len(corpus)} descriptors "
+              f"in {len(refs)} packs)")
+
+        # 2. The settings really did ride on the native statements.
+        assert client.execute("EXISTS TABLE system.query_log")[0][0]
+        for fragment in ("index_watermark", "snapshot_manifest", "capture_raw",
+                         "publisher_lease", "capture_version_claims"):
+            rows = _query_log_settings(client, prefix, fragment)
+            assert rows, f"no finished INSERT into {prefix}_{fragment} in the query log"
+            quorum, parallel, timeout_ms = rows[0]
+            assert quorum == "2", f"{fragment}: insert_quorum was {quorum!r}"
+            assert parallel == "0", (
+                f"{fragment}: insert_quorum_parallel was {parallel!r}")
+            assert timeout_ms == "5000", (
+                f"{fragment}: insert_quorum_timeout was {timeout_ms!r}")
+        print("PASS  server recorded insert_quorum=2, parallel=0 and the "
+              "bounded timeout on every native deciding INSERT")
+
+        # 3. Retention on ReplicatedMergeTree, through the native sweep.
+        second = writer.allocate_version()
+        writer.write_descriptors(corpus, index_version=second)
+        writer.publish_snapshot(
+            index_version=second, refs=refs, published_at_ns=2,
+            indexed_rows=len(corpus), indexed_packs=len(refs),
+        )
+        orphan = uuid4()
+        client.execute(
+            f"INSERT INTO default.`{prefix}_snapshot_manifest` "
+            "(index_version, publish_id, store_id, pack_id) VALUES",
+            [(version, orphan, ref.store_id, UUID(ref.pack_id)) for ref in refs],
+            settings={"insert_quorum": 2, "insert_quorum_parallel": 0},
+        )
+        removed = writer.collect_garbage()
+        assert removed[f"{prefix}_snapshot_manifest"] == len(refs), removed
+        assert client.execute(
+            f"SELECT count() FROM default.`{prefix}_snapshot_manifest` "
+            "WHERE publish_id = %(id)s", {"id": orphan},
+            settings={"select_sequential_consistency": 1},
+        ) == [(0,)]
+        assert client.execute(
+            f"SELECT count() FROM default.`{prefix}_snapshot_manifest` "
+            "WHERE index_version IN (%(a)s, %(b)s)", {"a": version, "b": second},
+            settings={"select_sequential_consistency": 1},
+        ) == [(2 * len(refs),)]
+        assert len(reader.get_by_ids(
+            [corpus[0].capture_id], tenant_id=corpus[0].metadata.tenant_id,
+            watermark=str(version),
+        )) == 1, "a pinned older snapshot still resolves after retention"
+        assert not client.execute(
+            "SELECT count() FROM system.mutations WHERE database = 'default' "
+            "AND table LIKE %(like)s AND is_done = 0",
+            {"like": f"{prefix}_%"},
+        )[0][0], "a retention mutation is still pending or stuck"
+        print(f"PASS  native retention removed {removed} on replicated tables")
+
+        # 4. The control, on FRESH tables: quorum off works normally.
+        create(client, control_prefix, "r1", "")
+        create(client, control_prefix, "r2", "_peer")
+        control = NativeCatalogWriter(
+            driver, control_prefix, insert_quorum=None, clock_skew_ns=0)
+        allocated = control.allocate_version()
+        assert allocated == 1, allocated
+        print(f"PASS  quorum unset on fresh replicated tables allocates "
+              f"{allocated} (native)")
+
+        # 5. Quorum OFF mid-life fails loudly through the native read-backs:
+        #    a writer WITHOUT the quorum setting, on the catalog that took
+        #    quorum inserts — its non-quorum claim is invisible to its own
+        #    sequential read-back, so the protocol refuses to proceed blind.
+        mixed = NativeCatalogWriter(
+            driver, prefix, insert_quorum=None, clock_skew_ns=100_000_000)
+        failure = _expect(NativeAllocationError, mixed.allocate_version)
+        print(f"PASS  quorum turned off mid-life fails loudly (native): "
+              f"{failure}")
+
+        # 6. Unsatisfiable quorum: the server's own code, promptly. The
+        #    quorum-ON writer is re-opened first — opening REPLACES the
+        #    driver's session, and check 5's quorum-OFF open would
+        #    otherwise still be the session this adapter points at.
+        writer = NativeCatalogWriter(
+            driver, prefix, insert_quorum=2, clock_skew_ns=100_000_000)
+        for name in TABLES:
+            client.execute(f"DETACH TABLE default.`{prefix}_{name}_peer`")
+        print("detached the peer replica; a quorum of 2 is now unsatisfiable")
+        started = monotonic()
+        failure = _expect(NativeServerError, writer.allocate_version,
+                          code=TOO_FEW_LIVE_REPLICAS)
+        elapsed = monotonic() - started
+        assert elapsed < 30, f"the quorum write parked for {elapsed:.1f}s"
+        print(f"PASS  native quorum write refused after {elapsed:.1f}s with "
+              f"code {failure.code}")
+    finally:
+        driver.close()
+
+
 def main() -> None:
     client = Client(host="127.0.0.1", port=9010)
     prefix = f"qtest_{uuid4().hex[:8]}"
     control_prefix = f"{prefix}_ctl"
+    import sys as _sys
+
+    driver_path = _sys.path  # marker: the driver binary is located by the suite
     try:
         _main(client, prefix, control_prefix)
+        if (Path(__file__).resolve().parents[2] / "native" / "build" /
+                "conformance_catalog").exists():
+            native_prefix = f"qnative_{uuid4().hex[:8]}"
+            native_control = f"{native_prefix}_ctl"
+            try:
+                _main_native(client, native_prefix, native_control,
+                             driver_path)
+            finally:
+                for name in (native_prefix, native_control):
+                    drop(client, name)
     finally:
         for name in (prefix, control_prefix):
             drop(client, name)

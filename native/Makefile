@@ -15,7 +15,8 @@ SRCS := csrc/bindings.cpp \
         csrc/ring/p2p_thread.cpp \
         csrc/ring/record_consumer.cpp \
         csrc/ring/ring_torch_op.cpp
-HOST_SRCS := csrc/bindings.cpp csrc/clickhouse_client.cpp
+HOST_SRCS := csrc/bindings.cpp csrc/clickhouse_client.cpp \
+             csrc/pack/pack_builder.cpp
 HEADERS := csrc/dmx_host_utils.h \
            csrc/clickhouse_client.h csrc/clickhouse_record_sink.h \
            csrc/reference_python_capture_sink.h \
@@ -50,6 +51,15 @@ CUDA_RESOLVE_REQUIRED := 1
 ifneq ($(strip $(MAKECMDGOALS)),)
 ifeq ($(strip $(filter-out clean host,$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
+endif
+# Pure-CPU drivers build without a CUDA toolkit (or torch): the test suite
+# drives them over stdin/stdout. When EVERY requested goal is CPU-only (or
+# clean/host), skip CUDA resolution entirely.
+CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/bench_sink build/conformance_catalog build/_dmi_native_sink
+ifneq ($(strip $(MAKECMDGOALS)),)
+ifeq ($(strip $(filter-out clean host cpu-goals $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
+CUDA_RESOLVE_REQUIRED := 0
+endif
 endif
 endif
 
@@ -179,9 +189,17 @@ RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
 
 OBJS += $(RING_OBJS)
 
-.PHONY: all host clean cuda-info FORCE
+.PHONY: all host clean cuda-info cpu-goals FORCE
 
 all: $(FINAL_TARGET)
+
+# Every target that builds without CUDA, as ONE goal. CI's compile gate
+# asks for this rather than listing the binaries: a list in the workflow
+# goes stale the moment CPU_ONLY_GOALS gains a target -- which it did,
+# when the catalog driver landed and the hardcoded list did not know --
+# and that is exactly the drift a compile gate exists to prevent. Adding
+# a target to CPU_ONLY_GOALS now puts it under the gate automatically.
+cpu-goals: $(CPU_ONLY_GOALS)
 
 host: $(HOST_FINAL_TARGET)
 
@@ -223,6 +241,111 @@ cuda-info:
 	@echo "PyTorch CUDA version: $(TORCH_CUDA_VERSION)"
 	@echo "CUDA include directory: $(CUDA_INCLUDE_DIR)"
 	@echo "CUDA library directory: $(CUDA_LIBRARY_DIR)"
+
+# A1 conformance driver: dependency-free stdin/stdout harness the Python suite
+# uses to drive the native pack builder and compare bytes against the
+# reference. No torch/pybind needed; runs in any shell or CI job.
+build/conformance_main: csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp csrc/pack/pack_builder.h csrc/common/json.cpp csrc/common/json.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
+	    -o $@ csrc/pack/pack_builder.cpp csrc/pack/conformance_main.cpp csrc/common/json.cpp \
+	    -Icsrc/pack -Icsrc/common -lcrypto
+
+# A1 throughput gate: PackBuilder on the bench corpus shape (10k x 64 KiB).
+build/bench_builder: csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp csrc/pack/pack_builder.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O3 -march=native -o $@ \
+	    csrc/pack/pack_builder.cpp csrc/pack/bench_builder.cpp \
+	    -Icsrc/pack -lcrypto
+
+# A5a throughput gate: PackSink end-to-end (queue → packers → spool),
+# same corpus shape as bench_capture_pipeline. Usage:
+#   build/bench_sink [single|interleaved] [workers...] [spooldir=PREFIX]
+build/bench_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/bench_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp csrc/sink/pack_sink.h csrc/sink/object_key.h csrc/sink/record_row.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/bench_sink.cpp \
+	    csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp \
+	    -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/common -lcrypto -lpthread
+
+# A2a SigV4 conformance driver: no torch/pybind/network; runs in any CI job.
+# libcurl headers come from CURL_INCDIR (dev .deb extract); the runtime
+# libcurl.so.4 ships with the OS. Override on machines with system curl-dev:
+#   make CURL_INCDIR=/usr/include/x86_64-linux-gnu ...
+CURL_INCDIR ?= /tmp/opencode/sysroot/usr/include/x86_64-linux-gnu
+build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/store/s3_sign.h csrc/common/json.cpp csrc/common/json.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/common/json.cpp \
+	    -Icsrc/store -Icsrc/common -lcrypto
+
+# A2 store conformance driver + fault-matrix target. libcurl headers come from
+# the dev .deb extracted to a sysroot (no root needed):
+#   apt-get download libcurl4-openssl-dev && dpkg-deb -x <deb> <sysroot>
+# The link needs only -L; the runtime libcurl.so.4 ships with the OS. Override:
+#   make CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu ...
+CURL_LIBDIR ?= /tmp/opencode/sysroot/usr/lib/x86_64-linux-gnu
+build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/store/spool.h csrc/store/uploader.h csrc/common/json.cpp csrc/common/json.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/common/json.cpp \
+	    -Icsrc/store -Icsrc/common -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
+
+# B1 catalog conformance driver: lease coordinator + version allocator over
+# ClickHouse's HTTP interface. No torch/pybind; needs libcurl like the store.
+build/conformance_catalog: csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp csrc/catalog/version_allocator.cpp csrc/catalog/catalog_writer.cpp csrc/catalog/pack_index.cpp csrc/catalog/indexer.cpp csrc/catalog/schema.cpp csrc/catalog/reader.cpp csrc/catalog/hydration.cpp csrc/catalog/conformance_catalog.cpp csrc/common/json.cpp csrc/pack/pack_builder.cpp csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/catalog/clickhouse_client.h csrc/catalog/lease_coordinator.h csrc/catalog/version_allocator.h csrc/catalog/catalog_writer.h csrc/catalog/sql_escape.h csrc/catalog/pack_index.h csrc/catalog/indexer.h csrc/catalog/schema.h csrc/catalog/reader.h csrc/catalog/hydration.h csrc/common/json.h csrc/store/s3_client.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp \
+	    csrc/catalog/version_allocator.cpp csrc/catalog/catalog_writer.cpp \
+	    csrc/catalog/pack_index.cpp csrc/catalog/indexer.cpp csrc/catalog/schema.cpp csrc/catalog/reader.cpp csrc/catalog/hydration.cpp \
+	    csrc/catalog/conformance_catalog.cpp \
+	    csrc/common/json.cpp csrc/pack/pack_builder.cpp \
+	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp \
+	    -Icsrc/catalog -Icsrc/common -Icsrc/pack -Icsrc/store \
+	    -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
+
+# A3a spool conformance driver: no network, no torch; runs in any CI job.
+build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h csrc/common/json.cpp csrc/common/json.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/common/json.cpp \
+	    -Icsrc/store -Icsrc/common -lcrypto
+
+# A5b torch-CPU adapter module: NativePackSink as an importable extension
+# with a synthetic-envelope entry point for tests. No CUDA, no ClickHouse,
+# no ring engine — torch CPU + libcrypto + spool/pack sources only.
+# PYTHON must point at the venv interpreter:
+#   make build/_dmi_native_sink... PYTHON=/path/to/venv/bin/python
+SINK_EXT := _dmi_native_sink$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))" 2>/dev/null)
+# C++20 for this target only, because ATen demands it and its floor MOVES:
+# torch 2.13 refuses below C++17, torch 2.14 below C++20, and the CI pin
+# `torch>=2.8,<3` resolves to whatever is newest on the day. C++20 satisfies
+# both, and our own sources here compile the same under either. Everything
+# else in this Makefile stays at C++17 -- this is the one target that links
+# against torch.
+build/_dmi_native_sink: csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++20 -O2 -fPIC -shared -DTORCH_EXTENSION_NAME=_dmi_native_sink \
+	    $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join('-I'+p for p in include_paths()))") \
+	    $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); print('-I'+paths.get('include'))") \
+	    -Icsrc -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/common \
+	    -D_GLIBCXX_USE_CXX11_ABI=$(shell $(PYTHON) -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))") \
+	    -o $(BUILD_DIR)/$(SINK_EXT) \
+	    csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp \
+	    csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp \
+	    csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp \
+	    csrc/store/spool.cpp csrc/common/json.cpp \
+	    $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join('-L'+p for p in library_paths()))") \
+	    -ltorch_cpu -ltorch -lc10 -ltorch_python -lcrypto -lpthread
+# A3b sink conformance driver: queue + assembler + spool staging in one
+# process, driven over stdin/stdout. Needs only libcrypto + pthreads.
+build/conformance_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/conformance_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp csrc/sink/pack_sink.h csrc/sink/object_key.h csrc/sink/record_row.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
+	    csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/conformance_sink.cpp \
+	    csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp \
+	    -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/common -lcrypto -lpthread
 
 clean:
 	rm -rf $(BUILD_DIR) $(LOCAL_TARGET) $(FINAL_TARGET) \
