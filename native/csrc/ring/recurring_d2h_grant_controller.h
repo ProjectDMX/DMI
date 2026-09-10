@@ -38,6 +38,12 @@ class D2HGrantController {
                         uint64_t actual_bytes) = 0;
     virtual void complete(const D2HWindowAdmission& admission,
                           uint64_t actual_bytes) = 0;
+    // The drain reports here before it resumes polling after work that can
+    // block for far longer than a poll interval (a forced full flush, an
+    // ordinary batching flush).  Neither the counter nor the clock can show
+    // afterwards how much of the current window was consumed while the drain
+    // was away, so the observations that straddle the gap are unusable.
+    virtual void note_observation_gap() noexcept = 0;
 };
 
 class RecurringD2HGrantController final : public D2HGrantController {
@@ -62,6 +68,7 @@ class RecurringD2HGrantController final : public D2HGrantController {
                 uint64_t actual_bytes) override;
     void complete(const D2HWindowAdmission& admission,
                   uint64_t actual_bytes) override;
+    void note_observation_gap() noexcept override;
 
   private:
     struct TimingObservation {
@@ -112,6 +119,7 @@ class RecurringD2HGrantController final : public D2HGrantController {
     std::unique_ptr<VersionBundle> current_bundle_;
     std::deque<std::unique_ptr<VersionBundle>> pending_bundles_;
     std::optional<D2HWindowProgressSnapshot> cached_progress_;
+    bool observation_gap_pending_{false};
     bool warned_record_granularity_stall_{false};
     bool warned_cross_window_overrun_{false};
 };

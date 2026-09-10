@@ -22,6 +22,8 @@ class D2HWindowDebugLogger {
     void log_completion(D2HWindowPackedProgressLayout::Version version,
                         D2HWindowPackedProgressLayout::Counter counter,
                         D2HWindowCompletionResult result) const noexcept;
+    void log_version_activation(
+        D2HWindowPackedProgressLayout::Version version) const noexcept;
 };
 
 }  // namespace ring

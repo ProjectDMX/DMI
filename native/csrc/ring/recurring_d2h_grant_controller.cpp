@@ -103,6 +103,10 @@ bool RecurringD2HGrantController::record_capacity_forced_flush(
     return mode_.record_capacity_forced_flush(reset_accumulated_count);
 }
 
+void RecurringD2HGrantController::note_observation_gap() noexcept {
+    observation_gap_pending_ = true;
+}
+
 void RecurringD2HGrantController::reconcile_progress() {
     auto observed = progress_.load();
     if (current_bundle_ && observed.version == current_bundle_->version) {
@@ -128,9 +132,8 @@ void RecurringD2HGrantController::reconcile_progress() {
         pending_bundles_.pop_front();
         cached_progress_ = observed;
         mode_.record_pattern_version_activation();
-        std::fprintf(stderr, "[d2h_window] active version=%u\n",
-                     static_cast<unsigned>(current_bundle_->version));
-        std::fflush(stderr);
+        if (debug_logger_)
+            debug_logger_->log_version_activation(current_bundle_->version);
         return;
     }
     cached_progress_ = observed;
@@ -172,12 +175,35 @@ void RecurringD2HGrantController::observe_progress(
     if (!current_bundle_ || progress.version != current_bundle_->version)
         return;
 
+    // A stall since the previous poll leaves every observation in flight
+    // untrustworthy at both ends: this poll's clock reading is an unknown
+    // amount later than the boundary that produced the counter it reads.
+    const bool after_gap = observation_gap_pending_;
+    observation_gap_pending_ = false;
+    if (after_gap) {
+        for (auto& state : current_bundle_->windows) {
+            if (state.timing.has_value())
+                state.timing->clean_open = false;
+        }
+    }
+
     for (auto& state : current_bundle_->windows) {
         if (!state.timing.has_value() ||
             progress.counter < state.timing->absolute_close) {
             continue;
         }
-        const auto estimate = estimate_window_bytes(*state.timing, now);
+        // window_ns is measured as (this poll's clock) - (the clock when the
+        // window was first seen open).  That only measures the window if CLOSE
+        // is observed at the boundary where it happens: a counter already past
+        // absolute_close means later boundaries elapsed unseen while the drain
+        // was elsewhere, and charging that time to the window inflates the
+        // estimate without bound -- a 10 ms window observed 205 ms late yields
+        // a 20x grant that is a guaranteed overrun into the next region.
+        const bool close_observed_promptly =
+            progress.counter == state.timing->absolute_close;
+        const auto estimate = close_observed_promptly
+            ? estimate_window_bytes(*state.timing, now)
+            : std::nullopt;
         if (estimate.has_value()) {
             state.policy->observe_timing_estimate(state.timing->bytes, *estimate);
         }
@@ -193,7 +219,7 @@ void RecurringD2HGrantController::observe_progress(
         return;
     }
 
-    bool clean_open = true;
+    bool clean_open = !after_gap;
     if (state.missed_open_occurrence.has_value()) {
         if (*state.missed_open_occurrence == matched->occurrence)
             clean_open = false;
@@ -231,6 +257,15 @@ std::optional<D2HWindowAdmission> RecurringD2HGrantController::poll(
     auto decision = state.policy->choose(occurrence->occurrence, availability);
     if (!decision.has_value())
         return std::nullopt;
+    // observe_progress() has just opened or refreshed this occurrence's timing
+    // observation, so it carries whether the drain reached the window on time.
+    // Only a positively-known truncation clears the flag.  Suppressing overrun
+    // evidence is the dangerous direction -- it lets grants keep growing -- so
+    // an unexpectedly absent observation falls back to learning from it.
+    decision->clean_occurrence =
+        !state.timing.has_value() ||
+        state.timing->occurrence != occurrence->occurrence ||
+        state.timing->clean_open;
     return D2HWindowAdmission{
         current_bundle_->version,
         *occurrence,

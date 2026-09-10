@@ -27,6 +27,11 @@ struct D2HWindowGrantDecision {
     D2HWindowGrantKind kind{D2HWindowGrantKind::FULL_AVAILABLE};
     bool timing_revalidation{false};
     uint64_t full_grant_bytes{0};
+    // False when the drain reached this occurrence late -- it first polled the
+    // window after a blocking flush, or an earlier window's overrun had already
+    // crossed this window's begin.  Such a transfer runs against a truncated
+    // window, so an overrun says nothing about the window's real capacity.
+    bool clean_occurrence{true};
     std::optional<uint64_t> prior_max_safe;
     std::optional<uint64_t> prior_min_unsafe;
 

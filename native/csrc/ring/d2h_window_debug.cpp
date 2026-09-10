@@ -36,4 +36,11 @@ void D2HWindowDebugLogger::log_completion(
     std::fflush(stderr);
 }
 
+void D2HWindowDebugLogger::log_version_activation(
+    D2HWindowPackedProgressLayout::Version version) const noexcept {
+    std::fprintf(stderr, "[d2h_window] active version=%u\n",
+                 static_cast<unsigned>(version));
+    std::fflush(stderr);
+}
+
 }  // namespace ring

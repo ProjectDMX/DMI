@@ -171,15 +171,24 @@ D2HWindowPolicyObservation BinaryAdaptiveGrantPolicy::observe(
     const auto prior_unsafe = attempt.decision.prior_min_unsafe;
 
     if (attempt.overran) {
-        clear_stall();
-        if (prior_safe.has_value() && attempt.bytes <= *prior_safe) {
-            max_safe_.reset();
-            min_unsafe_ = attempt.bytes;
-            timing_estimate_.reset();
-            reset_timing_revalidation();
-        } else if (!min_unsafe_.has_value() || attempt.bytes < *min_unsafe_) {
-            min_unsafe_ = attempt.bytes;
-            reset_timing_revalidation();
+        // An overrun in a truncated occurrence is not evidence about capacity.
+        // Learning from it would erase a converged max_safe_ after every drain
+        // stall and restart the search from half the old bound, so the window
+        // under-fills for several occurrences and does it again on the next
+        // stall.  A success is still kept below: bytes that fit in less window
+        // time than a full occurrence certainly fit in a full one.
+        if (attempt.decision.clean_occurrence) {
+            clear_stall();
+            if (prior_safe.has_value() && attempt.bytes <= *prior_safe) {
+                max_safe_.reset();
+                min_unsafe_ = attempt.bytes;
+                timing_estimate_.reset();
+                reset_timing_revalidation();
+            } else if (!min_unsafe_.has_value() ||
+                       attempt.bytes < *min_unsafe_) {
+                min_unsafe_ = attempt.bytes;
+                reset_timing_revalidation();
+            }
         }
     } else if (prior_unsafe.has_value() && attempt.bytes >= *prior_unsafe) {
         max_safe_ = attempt.bytes;

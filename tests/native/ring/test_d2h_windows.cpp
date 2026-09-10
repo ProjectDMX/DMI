@@ -485,6 +485,182 @@ void test_cross_window_overrun_does_not_supply_timing_evidence() {
     EXPECT(logs[1]->timing_estimates.empty());
 }
 
+void test_truncated_occurrence_overrun_is_not_capacity_evidence() {
+    // A converged window whose occurrence was truncated must keep max_safe_:
+    // the transfer had less window time than a full occurrence, so overrunning
+    // says nothing about the window's capacity.
+    ring::BinaryAdaptiveGrantPolicy policy(3, 4);
+    auto decision = require_decision(policy.choose(0, available(100, 10)));
+    observe(policy, 0, 100, true, decision);
+    decision = require_decision(policy.choose(1, available(100, 10)));
+    observe(policy, 1, 50, false, decision);
+    decision = require_decision(policy.choose(2, available(100, 10)));
+    observe(policy, 2, 75, false, decision);
+
+    decision = require_decision(policy.choose(3, available(100, 10)));
+    EXPECT(decision.prior_max_safe.has_value() && *decision.prior_max_safe == 75);
+    decision.clean_occurrence = false;
+    observe(policy, 3, 75, true, decision);
+
+    // Both bounds survive, so the search resumes at the same midpoint rather
+    // than throwing away max_safe_ and halving from the overrunning size.
+    auto after = require_decision(policy.choose(4, available(100, 10)));
+    EXPECT(after.prior_max_safe.has_value() && *after.prior_max_safe == 75);
+    EXPECT(after.prior_min_unsafe.has_value() && *after.prior_min_unsafe == 100);
+    EXPECT(after.kind == ring::D2HWindowGrantKind::MIDPOINT);
+    EXPECT(after.byte_limit == 87);
+
+    // The same overrun in a clean occurrence is still a capacity shift.
+    ring::BinaryAdaptiveGrantPolicy clean(3, 4);
+    decision = require_decision(clean.choose(0, available(100, 10)));
+    observe(clean, 0, 100, true, decision);
+    decision = require_decision(clean.choose(1, available(100, 10)));
+    observe(clean, 1, 50, false, decision);
+    decision = require_decision(clean.choose(2, available(100, 10)));
+    observe(clean, 2, 75, false, decision);
+    decision = require_decision(clean.choose(3, available(100, 10)));
+    EXPECT(decision.clean_occurrence);
+    observe(clean, 3, 75, true, decision);
+    after = require_decision(clean.choose(4, available(100, 10)));
+    EXPECT(!after.prior_max_safe.has_value());
+    EXPECT(after.prior_min_unsafe.has_value() && *after.prior_min_unsafe == 75);
+    EXPECT(after.kind == ring::D2HWindowGrantKind::HALF_UNSAFE);
+    EXPECT(after.byte_limit == 37);
+
+    // A truncated occurrence's success is still valid evidence: bytes that fit
+    // in a shortened window certainly fit in a full one.
+    ring::BinaryAdaptiveGrantPolicy raising(3, 4);
+    decision = require_decision(raising.choose(0, available(100, 10)));
+    observe(raising, 0, 100, true, decision);
+    decision = require_decision(raising.choose(1, available(100, 10)));
+    decision.clean_occurrence = false;
+    observe(raising, 1, 50, false, decision);
+    after = require_decision(raising.choose(2, available(100, 10)));
+    EXPECT(after.prior_max_safe.has_value() && *after.prior_max_safe == 50);
+}
+
+void test_late_issue_overrun_keeps_learned_capacity() {
+    // period=10, window=[1,3).  The window converges to a 64 MiB grant; a
+    // blocking flush then delays the next occurrence's first poll past OPEN,
+    // the learned grant overruns the truncated window, and the controller must
+    // not erase max_safe_ and resume halving from 32 MiB.
+    constexpr uint64_t kMiB = 1024u * 1024u;
+    FakeProgress progress;
+    ring::D2HWindowModeController mode(3);
+    auto factory = []() -> std::unique_ptr<ring::D2HWindowGrantPolicy> {
+        return std::make_unique<ring::BinaryAdaptiveGrantPolicy>(4, 4);
+    };
+    auto clock = std::make_shared<ManualClock>();
+    ring::RecurringD2HGrantController controller(
+        progress, mode, factory, nullptr, [clock] { return clock->now; });
+    controller.install_pending(1, 10, {{1, 3}});
+
+    // Occurrence 0 proves 64 MiB safe.  Issue and completion share one clock
+    // instant so no timing estimate is produced.
+    progress.snapshot = {1, 1};
+    clock->set_nanoseconds(0);
+    auto first = controller.poll(available(64 * kMiB, 64 * kMiB));
+    EXPECT(first.has_value());
+    EXPECT(first->decision.clean_occurrence);
+    EXPECT(controller.commit(*first, 64 * kMiB));
+    progress.snapshot.counter = 2;
+    controller.complete(*first, 64 * kMiB);
+
+    // Occurrence 1: the drain reports a stall and first polls at counter 12,
+    // having missed OPEN at 11.  The learned grant still stands.
+    controller.note_observation_gap();
+    progress.snapshot.counter = 12;
+    auto late = controller.poll(available(64 * kMiB, 64 * kMiB));
+    EXPECT(late.has_value());
+    EXPECT(!late->decision.clean_occurrence);
+    EXPECT(late->decision.prior_max_safe.has_value() &&
+           *late->decision.prior_max_safe == 64 * kMiB);
+    EXPECT(late->decision.byte_limit == 64 * kMiB);
+    EXPECT(controller.commit(*late, 64 * kMiB));
+    progress.snapshot.counter = 13;  // CLOSE is 13, so this overran
+    controller.complete(*late, 64 * kMiB);
+
+    // Occurrence 2 still grants the learned 64 MiB.
+    progress.snapshot.counter = 21;
+    auto next = controller.poll(available(64 * kMiB, 64 * kMiB));
+    EXPECT(next.has_value());
+    EXPECT(next->decision.clean_occurrence);
+    EXPECT(next->decision.prior_max_safe.has_value() &&
+           *next->decision.prior_max_safe == 64 * kMiB);
+    EXPECT(!next->decision.prior_min_unsafe.has_value());
+    EXPECT(next->decision.kind == ring::D2HWindowGrantKind::MAX_SAFE);
+    EXPECT(next->decision.byte_limit == 64 * kMiB);
+}
+
+void test_late_close_observation_supplies_no_timing_estimate() {
+    // period=10, window=[1,3).  64 MiB is issued at counter 1 / t=0 and
+    // completes at counter 2 / t=5 ms; the next poll only lands at counter 9 /
+    // t=205 ms, having missed CLOSE at 3.  Charging that 205 ms to the window
+    // yielded a 64 * 205 / 5 = 2,624 MiB estimate and a guaranteed overrun.
+    constexpr uint64_t kMiB = 1024u * 1024u;
+    constexpr int64_t kMs = 1000 * 1000;
+    FakeProgress progress;
+    ring::D2HWindowModeController mode(3);
+    std::vector<std::shared_ptr<PolicyLog>> logs;
+    auto factory = [&logs]() -> std::unique_ptr<ring::D2HWindowGrantPolicy> {
+        auto log = std::make_shared<PolicyLog>();
+        logs.push_back(log);
+        return std::make_unique<TrackingPolicy>(std::move(log));
+    };
+    auto clock = std::make_shared<ManualClock>();
+    ring::RecurringD2HGrantController controller(
+        progress, mode, factory, nullptr, [clock] { return clock->now; });
+    controller.install_pending(1, 10, {{1, 3}});
+
+    progress.snapshot = {1, 1};
+    clock->set_nanoseconds(0);
+    auto admission = controller.poll(available(64 * kMiB, 64 * kMiB));
+    EXPECT(admission.has_value());
+    EXPECT(controller.commit(*admission, 64 * kMiB));
+
+    clock->set_nanoseconds(5 * kMs);
+    progress.snapshot.counter = 2;
+    controller.complete(*admission, 64 * kMiB);
+    EXPECT(logs[0]->timing_estimates.empty());
+
+    clock->set_nanoseconds(205 * kMs);
+    progress.snapshot.counter = 9;
+    EXPECT(!controller.poll(available(0, std::nullopt)).has_value());
+    EXPECT(logs[0]->timing_estimates.empty());
+
+    // A stall that leaves the counter at CLOSE is caught the same way: the
+    // counter alone cannot show how long the drain was away.
+    FakeProgress stalled_progress;
+    ring::D2HWindowModeController stalled_mode(3);
+    std::vector<std::shared_ptr<PolicyLog>> stalled_logs;
+    auto stalled_factory =
+        [&stalled_logs]() -> std::unique_ptr<ring::D2HWindowGrantPolicy> {
+        auto log = std::make_shared<PolicyLog>();
+        stalled_logs.push_back(log);
+        return std::make_unique<TrackingPolicy>(std::move(log));
+    };
+    auto stalled_clock = std::make_shared<ManualClock>();
+    ring::RecurringD2HGrantController stalled(
+        stalled_progress, stalled_mode, stalled_factory, nullptr,
+        [stalled_clock] { return stalled_clock->now; });
+    stalled.install_pending(1, 10, {{1, 3}});
+
+    stalled_progress.snapshot = {1, 1};
+    stalled_clock->set_nanoseconds(0);
+    admission = stalled.poll(available(64 * kMiB, 64 * kMiB));
+    EXPECT(admission.has_value());
+    EXPECT(stalled.commit(*admission, 64 * kMiB));
+    stalled_clock->set_nanoseconds(5 * kMs);
+    stalled_progress.snapshot.counter = 2;
+    stalled.complete(*admission, 64 * kMiB);
+
+    stalled.note_observation_gap();
+    stalled_clock->set_nanoseconds(205 * kMs);
+    stalled_progress.snapshot.counter = 3;  // exactly CLOSE, but 200 ms late
+    EXPECT(!stalled.poll(available(0, std::nullopt)).has_value());
+    EXPECT(stalled_logs[0]->timing_estimates.empty());
+}
+
 void test_grant_controller() {
     FakeProgress progress;
     ring::D2HWindowModeController mode(3);
@@ -696,6 +872,9 @@ int main() {
     test_runtime_modes();
     test_controller_timing_estimate_is_deterministic();
     test_cross_window_overrun_does_not_supply_timing_evidence();
+    test_truncated_occurrence_overrun_is_not_capacity_evidence();
+    test_late_issue_overrun_keeps_learned_capacity();
+    test_late_close_observation_supplies_no_timing_estimate();
     test_grant_controller();
     test_capacity_forced_flush_count_aging_uses_pattern_period();
     test_pending_pattern_queue_promotes_versions_in_order();

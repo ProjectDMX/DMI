@@ -444,13 +444,22 @@ bool DrainThread::do_window_decision() {
             staging_free = staging_.free_bytes();
         }
 
-        uint64_t full_count = 0;
-        uint64_t full_bytes = 0;
-        for (const uint64_t actual_bytes : scanned_) {
-            const uint64_t aligned = align_up(actual_bytes, PAYLOAD_ALIGN);
-            if (aligned > staging_free - full_bytes) break;
-            full_bytes += aligned;
-            ++full_count;
+        // pending_bytes_ is already the aligned sum of scanned_, so the prefix
+        // walk is only needed when the backlog cannot fit whole.  In ACTIVE
+        // mode data is deliberately held back and scanned_ grows toward
+        // task_ring_entries, and this runs every drain_poll_timeout_us while
+        // holding the lock prepare_step()/reserve_record() need.
+        uint64_t full_count = pending_entries_;
+        uint64_t full_bytes = pending_bytes_;
+        if (pending_bytes_ > staging_free) {
+            full_count = 0;
+            full_bytes = 0;
+            for (const uint64_t actual_bytes : scanned_) {
+                const uint64_t aligned = align_up(actual_bytes, PAYLOAD_ALIGN);
+                if (aligned > staging_free - full_bytes) break;
+                full_bytes += aligned;
+                ++full_count;
+            }
         }
 
         D2HWindowAvailability availability{};
@@ -548,6 +557,9 @@ void DrainThread::loop() {
         if (flush_generation != 0 || pause_generation != 0) {
             bool moved_data = false;
             try {
+                // A full flush can outlast a window entirely, so the next poll
+                // must not read its counter and clock as a fresh observation.
+                if (grant_controller_) grant_controller_->note_observation_gap();
                 moved_data = do_full_flush();
                 if (moved_data && counts_for_fallback &&
                     capacity_flush_callback_) {
@@ -629,6 +641,7 @@ void DrainThread::loop() {
 
         if (needs_flush) {
             try {
+                if (grant_controller_) grant_controller_->note_observation_gap();
                 {
                     std::unique_lock<std::mutex> lk(staging_mu_);
                     staging_cv_.wait(lk, [&] {
