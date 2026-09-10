@@ -207,6 +207,22 @@ class TestScheduleGatesRealCapture:
 
         assert len(adapter.transport.set_step_context_calls) == 1
 
+    @pytest.mark.parametrize("phase", [None, "decode"])
+    @pytest.mark.parametrize("schedule, expected", [
+        (CaptureSchedule(warmup_steps=1), [1, 2, 3]),
+        (CaptureSchedule(step_stride=2), [2]),
+    ])
+    def test_missing_context_still_advances_the_schedule(self, phase, schedule, expected):
+        adapter = self._adapter(schedule, phase)
+        captured = []
+        for step in range(4):
+            adapter._ctx = None if step == 0 else _make_ctx(phase=phase)
+            adapter.before_forward(None)
+            if adapter.transport.capture_step:
+                captured.append(step)
+        assert captured == expected
+        assert adapter._step_counter == 4
+
 
 # ---------------------------------------------------------------------------
 # Finding 3919326694: per-request volume must sum every rank, not read the

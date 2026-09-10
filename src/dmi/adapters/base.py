@@ -266,6 +266,7 @@ class BackendAdapter(abc.ABC):
         self.transport.capture_step = False
         ctx = self.build_step_context(*raw)
         if ctx is None:
+            self._step_counter += 1
             return
 
         if not self._schedule_allows(ctx):
