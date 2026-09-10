@@ -31,17 +31,19 @@ PackedVersionCounterProgressSource::PackedVersionCounterProgressSource(int owner
         check_cuda(
             cudaMemset(device_packed_progress_, 0, sizeof(*device_packed_progress_)),
             "initialize device D2H window progress");
+        const cudaMemLocation cpu_location = {cudaMemLocationTypeHost, 0};
+        const cudaMemLocation gpu_location = {cudaMemLocationTypeDevice, owner_device_};
         check_cuda(cudaMemAdvise(cpu_visible_packed_progress_,
                                  sizeof(*cpu_visible_packed_progress_),
-                                 cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId),
+                                 cudaMemAdviseSetPreferredLocation, cpu_location),
                    "set CPU-visible D2H window progress preferred location");
         check_cuda(cudaMemAdvise(cpu_visible_packed_progress_,
                                  sizeof(*cpu_visible_packed_progress_),
-                                 cudaMemAdviseSetAccessedBy, owner_device_),
+                                 cudaMemAdviseSetAccessedBy, gpu_location),
                    "make CPU-visible D2H window progress GPU-accessible");
         check_cuda(cudaMemPrefetchAsync(cpu_visible_packed_progress_,
                                         sizeof(*cpu_visible_packed_progress_),
-                                        cudaCpuDeviceId, nullptr),
+                                        cpu_location, 0, nullptr),
                    "prefetch CPU-visible D2H window progress");
         check_cuda(cudaDeviceSynchronize(),
                    "initialize D2H window progress allocations");

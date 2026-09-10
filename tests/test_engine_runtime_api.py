@@ -248,6 +248,19 @@ def test_record_mode_v1_defers_legacy_ring_construction():
     assert getattr(engine, "_ring_engine", None) is None
 
 
+@pytest.mark.parametrize("deferred", [False, True])
+def test_closed_engine_cannot_create_a_record_runtime(deferred):
+    if deferred:
+        engine = MonitoringEngine(record_mode_v1=True, ring_config=object())
+    else:
+        engine, _, _ = _engine_with_fake_ring()
+        engine._ring_config = object()
+    engine.close()
+
+    with pytest.raises(RuntimeError, match="Ring transport is not enabled"):
+        engine.create_record_runtime(object())
+
+
 def test_record_mode_v1_constructs_record_ring_directly(monkeypatch):
     from dmi.records import (
         RecordCellType,

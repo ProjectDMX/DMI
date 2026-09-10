@@ -497,6 +497,10 @@ class MonitoringEngine:
                 pass
             self._host_engine = None
 
+        # Closing also cancels deferred record-mode construction. A retained
+        # config would let create_record_runtime() restart a sink-less ring.
+        self._ring_config = None
+
 
 # ---------------------------------------------------------------------------
 # Backend loader
