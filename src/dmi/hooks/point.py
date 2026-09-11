@@ -259,6 +259,15 @@ class HookPoint(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if not self.enabled:
             return x
+
+        # Capture-schedule gate: the adapter driver disarms the transport for
+        # steps the schedule refused. Checking before the CUDA probe both
+        # skips the work and keeps the refusal testable without a GPU.
+        from ..transport import ring as _rt
+        transport = _rt._active_transport
+        if transport is not None and not transport.capture_step:
+            return x
+
         if self._ring_hook_type is None or not x.is_cuda:
             return x
 

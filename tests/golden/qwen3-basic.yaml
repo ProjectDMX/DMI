@@ -1,0 +1,10 @@
+version: 1
+observations:
+  hooks:
+  - resid_pre
+  - final_logits
+schedule:
+  step_stride: 1
+  request_stride: 1
+  capture_prefill: true
+  capture_decode: true
