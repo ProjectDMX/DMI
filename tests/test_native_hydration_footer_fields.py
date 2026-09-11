@@ -203,3 +203,39 @@ def test_the_resolved_tuple_keeps_values_the_footer_binding_compares():
     assert _tuple_fields("('h',[2,8],0,'none')") == ["h", "[2,8]", "0", "none"]
     # A value that merely CONTAINS the token is untouched.
     assert _tuple_fields("('NULLABLE','a NULL b')") == ["NULLABLE", "a NULL b"]
+
+
+# --- the two decoders have to agree, byte for byte ---------------------------
+#
+# hydrate compares the tuple decoder's output (above) against the footer
+# decoder's (unquote_sql, sql_quote's map entry for entry). Where the two
+# disagree on ONE byte the binding refuses a legal capture with "catalog
+# descriptor does not match the pack footer: field N", and nothing but a
+# live hydrate of a capture carrying that byte could see it.
+#
+# The rendering below is MEASURED, not assumed: `SELECT tuple(concat('block',
+# char(N), 'resid')) FORMAT TSV` was driven against the live server for the
+# whole 1..127 range (plus char(0)). ClickHouse escapes exactly eight bytes
+# inside a tuple -- \0 \b \t \n \f \r \' \\ -- and leaves every other one
+# RAW, including 0x07 (BEL) and 0x0B (VT), which sql_quote does rewrite (as
+# \a and \v). So the two escape SETS are deliberately different, and it is
+# the decoded bytes, not the spellings, that have to match.
+TUPLE_RENDERING = {
+    0x00: "\\0", 0x07: "\x07", 0x08: "\\b", 0x09: "\\t", 0x0A: "\\n",
+    0x0B: "\x0b", 0x0C: "\\f", 0x0D: "\\r", 0x27: "\\'", 0x5C: "\\\\",
+}
+
+
+@pytest.mark.parametrize("byte", sorted(TUPLE_RENDERING))
+def test_the_tuple_and_footer_decoders_agree_on_every_byte_clickhouse_rewrites(byte):
+    """Both halves of the footer binding decode to the same bytes.
+
+    \\b and \\f decoded to the letters "b" and "f" on the catalog side while
+    the footer side decoded them to 0x08 and 0x0C, so a hook_name carrying
+    either (legal: _validate_text only asks for non-empty UTF-8 under 512
+    bytes) staged, uploaded and indexed, and then failed to hydrate.
+    """
+    value = "block" + chr(byte) + "resid"
+    (catalog,) = _tuple_fields(f"('block{TUPLE_RENDERING[byte]}resid')")
+    assert catalog == value
+    assert _fields(_quote(value), [catalog])[0]["matches"] is True
