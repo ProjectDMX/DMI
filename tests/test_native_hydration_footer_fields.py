@@ -1,8 +1,9 @@
 """The footer-binding decoder: rendered footer rows against decoded catalog text.
 
 hydrate binds every catalog descriptor to the pack footer by comparing the
-32 fields of the footer's rendered VALUES row (pack_index's renderer, SQL
-escaping and all) against the catalog row the reader returns (TSV escapes
+fields of the footer's rendered VALUES row -- one per CAPTURE_COLUMNS entry
+bar index_version (pack_index's renderer, SQL
+escaping and all) -- against the catalog row the reader returns (TSV escapes
 already undone, a NULL arriving as the empty string). The two sides only
 compare correctly in ONE representation, so the decoder is pinned here on
 the CPU gate through the driver's session-less `footer_row_fields` op:
@@ -26,8 +27,14 @@ from pathlib import Path
 
 import pytest
 
+from dmi.storage.capture.clickhouse_schema import CAPTURE_COLUMNS
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DRIVER = REPO_ROOT / "native" / "build" / "conformance_catalog"
+
+# The footer's VALUES row is every capture column but the trailing
+# index_version, which the indexer supplies rather than the pack.
+FOOTER_COLUMNS = CAPTURE_COLUMNS[:-1]
 
 pytestmark = [
     pytest.mark.cpu,
@@ -122,24 +129,67 @@ def test_uuid_literals_arrays_and_numbers_split_at_top_level():
     assert all(f["matches"] for f in fields), fields
 
 
-def test_a_full_32_field_row_decodes_to_32_fields():
-    """A rank-2 shape's inner comma must not split the row."""
-    strings = ["capture-0", "t", "e", "r", "s", "q", "n", "m", "mr"]
-    row = ",".join(
-        [_quote(s) for s in strings]
-        + ["NULL", _quote("v"), _quote("block\\resid"), "3", "0", "0", "0",
-           "1", "0", _quote("float32"), "[2,8]", "1700000000000000000",
-           "toUUID('0190e8d0-4b2a-7c3e-9f00-0123456789ab')", _quote("local"),
-           _quote("packs/a\\b.dmi-pack"), "4096", _quote("c" * 64), "1", "64",
-           "64", "64", _quote("none"), _quote("deadbeef")]
+def test_a_full_footer_row_decodes_to_one_field_per_footer_column():
+    """A rank-2 shape's inner comma must not split the row.
+
+    Width and positions come from CAPTURE_COLUMNS, the oracle this decoder
+    is a port of, not from a hand-counted 32. The footer carries every
+    capture column except the trailing index_version, and
+    hydration.cpp:708 guards on that same width -- so with the count
+    hard-coded, adding a column left this row at 32 tokens, the test
+    passing, and the native guard silently out of date. The row is
+    assembled per column name for the same reason: a new column has no
+    rendering here and says so by name.
+    """
+    pack_id = "0190e8d0-4b2a-7c3e-9f00-0123456789ab"
+    rendered = {
+        "capture_id": _quote("capture-0"),
+        "tenant_id": _quote("t"),
+        "experiment_id": _quote("e"),
+        "run_id": _quote("r"),
+        "session_id": _quote("s"),
+        "request_id": _quote("q"),
+        "sequence_id": _quote("n"),
+        "model_id": _quote("m"),
+        "model_revision": _quote("mr"),
+        "adapter_revision": "NULL",
+        "capture_policy_version": _quote("v"),
+        "hook_name": _quote("block\\resid"),
+        "layer_number": "3",
+        "producer_rank": "0",
+        "step_number": "0",
+        "token_start": "0",
+        "token_end": "1",
+        "batch_position": "0",
+        "dtype": _quote("float32"),
+        "shape": "[2,8]",
+        "captured_at_ns": "1700000000000000000",
+        "pack_id": f"toUUID('{pack_id}')",
+        "store_id": _quote("local"),
+        "object_key": _quote("packs/a\\b.dmi-pack"),
+        "object_bytes": "4096",
+        "pack_checksum": _quote("c" * 64),
+        "pack_record_count": "1",
+        "payload_offset": "64",
+        "stored_length": "64",
+        "decoded_length": "64",
+        "codec": _quote("none"),
+        "payload_checksum": _quote("deadbeef"),
+    }
+    assert sorted(rendered) == sorted(FOOTER_COLUMNS), (
+        sorted(set(FOOTER_COLUMNS) - set(rendered)),
+        sorted(set(rendered) - set(FOOTER_COLUMNS)),
     )
+
+    row = ",".join(rendered[column] for column in FOOTER_COLUMNS)
     fields = _fields(row)
-    assert len(fields) == 32, fields
-    assert fields[11]["text"] == "block\\resid"
-    assert fields[19]["text"] == "[2,8]"
-    assert fields[21]["text"] == "0190e8d0-4b2a-7c3e-9f00-0123456789ab"
-    assert fields[23]["text"] == "packs/a\\b.dmi-pack"
-    assert fields[9]["null"] is True
+    assert len(fields) == len(FOOTER_COLUMNS), fields
+    by_column = dict(zip(FOOTER_COLUMNS, fields))
+    assert by_column["hook_name"]["text"] == "block\\resid"
+    assert by_column["shape"]["text"] == "[2,8]"
+    assert by_column["pack_id"]["text"] == pack_id
+    assert by_column["object_key"]["text"] == "packs/a\\b.dmi-pack"
+    assert by_column["adapter_revision"]["null"] is True
 
 
 def test_a_mismatching_decoded_value_is_still_a_mismatch():
