@@ -30,6 +30,7 @@ pytestmark = pytest.mark.cpu
 class _Transport:
     def __init__(self, result=StepReservation.RESERVED):
         self.result = result
+        self.d2h_pattern_result = True
         self.events = []
         self.payload = torch.empty(0, dtype=torch.uint8)
         self.null_offload = False
@@ -56,6 +57,13 @@ class _Transport:
         self.events.append(("flush", timeout_s))
         if self.pending_tasks:
             raise TimeoutError("unmatched reserved record tasks")
+
+    def define_d2h_window_pattern(self, **kwargs):
+        self.events.append(("define_d2h_window_pattern", kwargs))
+        return self.d2h_pattern_result
+
+    def advance_boundary(self):
+        self.events.append(("advance_boundary",))
 
 class _Format:
     def __init__(self, layout_name="tensor_rows"):
@@ -254,6 +262,43 @@ def test_dynamic_producer_is_individually_marked_for_reclaim():
     runtime.emit_output(entry, "dynamic", output)
 
     assert transport.events[0] == ("reserve", ((64, True),))
+
+
+def test_d2h_window_operations_delegate_without_exposing_transport_state():
+    runtime, transport, _output, _entry = _runtime_and_entry()
+
+    accepted = runtime.define_d2h_window_pattern(
+        period=12,
+        windows=((1, 3), (8, 10)),
+        initial_counter=7,
+    )
+    runtime.advance_boundary()
+
+    assert accepted is True
+    assert transport.events == [
+        (
+            "define_d2h_window_pattern",
+            {
+                "period": 12,
+                "windows": ((1, 3), (8, 10)),
+                "initial_counter": 7,
+            },
+        ),
+        ("advance_boundary",),
+    ]
+
+
+def test_d2h_window_definition_returns_terminal_fallback_state():
+    runtime, transport, _output, _entry = _runtime_and_entry()
+    transport.d2h_pattern_result = False
+
+    accepted = runtime.define_d2h_window_pattern(
+        period=12,
+        windows=((1, 3), (8, 10)),
+        initial_counter=7,
+    )
+
+    assert accepted is False
 
 
 def test_two_independent_formats_do_not_share_schema_or_output_registry():

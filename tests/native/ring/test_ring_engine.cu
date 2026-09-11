@@ -1,8 +1,13 @@
 // CUDA integration tests for producer -> drain -> pinned-staging delivery.
 
 #include "ring/drain_thread.h"
+#include "ring/d2h_window_marker.h"
+#include "ring/d2h_window_mode.h"
+#include "ring/d2h_window_progress.h"
+#include "ring/d2h_window_subsystem.h"
 #include "ring/pinned_staging.h"
 #include "ring/producer.cuh"
+#include "ring/recurring_d2h_grant_controller.h"
 #include "ring/ring_alloc.h"
 #include "ring/ring_engine_py.h"
 #include "ring/record_sink.h"
@@ -17,8 +22,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -42,6 +49,15 @@ public:
     std::atomic<int> flushes{0};
     mutable std::atomic<int> failure_checks{0};
     Duration observed_timeout{0};
+};
+
+class UnusedDrainPause final : public ring::DrainPauseControl {
+public:
+    ring::DrainPauseToken pause_after_flush_and_wait() override {
+        return ring::DrainPauseToken{1};
+    }
+
+    void resume(ring::DrainPauseToken) override {}
 };
 
 // RingEnginePy's diagnostic hooks are irrelevant to this focused native
@@ -122,12 +138,17 @@ static std::vector<uint8_t> task_bytes(const ring::DrainTask& task) {
 
 class DrainHarness {
 public:
-    explicit DrainHarness(const ring::RingConfig& config)
+    explicit DrainHarness(
+        const ring::RingConfig& config,
+        ring::D2HGrantController* grant_controller = nullptr,
+        ring::D2HWindowModeController* mode_controller = nullptr,
+        std::function<void()> capacity_flush_callback = {})
         : cfg(config), allocated(cfg) {
         allocated.init();
         staging.init(cfg.effective_staging_bytes());
         drain = std::make_unique<ring::DrainThread>(
-            allocated.state(), staging, cfg);
+            allocated.state(), staging, cfg, grant_controller, mode_controller,
+            std::move(capacity_flush_callback));
         CUDA_CHECK(cudaStreamCreate(&stream));
         drain->start();
     }
@@ -162,6 +183,57 @@ public:
     ring::PinnedStaging staging;
     std::unique_ptr<ring::DrainThread> drain;
     cudaStream_t stream{};
+};
+
+class OneAdmissionController final : public ring::D2HGrantController {
+public:
+    explicit OneAdmissionController(uint64_t byte_limit)
+        : byte_limit_(byte_limit) {}
+
+    std::optional<ring::D2HWindowAdmission> poll(
+        ring::D2HWindowAvailability availability) override {
+        ++polls;
+        if (!enabled || committed ||
+            !availability.first_record_bytes.has_value()) {
+            return std::nullopt;
+        }
+        ring::D2HWindowGrantDecision decision;
+        decision.byte_limit = byte_limit_;
+        decision.full_grant_bytes = availability.full_grant_bytes;
+        return ring::D2HWindowAdmission{
+            1, ring::D2HWindowOccurrence{0, 0, 0, 1000000}, decision};
+    }
+
+    bool commit(
+        const ring::D2HWindowAdmission&,
+        uint64_t actual_bytes) override {
+        ++commits;
+        if (committed || actual_bytes > byte_limit_) return false;
+        committed = true;
+        committed_bytes = actual_bytes;
+        return true;
+    }
+
+    void complete(
+        const ring::D2HWindowAdmission&,
+        uint64_t actual_bytes) override {
+        ++completions;
+        completed_bytes = actual_bytes;
+    }
+
+    void note_observation_gap() noexcept override { ++observation_gaps; }
+
+    bool enabled{true};
+    bool committed{false};
+    uint64_t committed_bytes{0};
+    uint64_t completed_bytes{0};
+    std::atomic<uint64_t> polls{0};
+    std::atomic<uint64_t> commits{0};
+    std::atomic<uint64_t> completions{0};
+    std::atomic<uint64_t> observation_gaps{0};
+
+private:
+    uint64_t byte_limit_{0};
 };
 
 static void test_ring_geometry_requires_payload_alignment() {
@@ -717,6 +789,345 @@ static void test_record_flush_reaches_sink_durability_boundary() {
     engine.stop();
 }
 
+static void test_active_window_mode_suppresses_batched_drain() {
+    banner("active window mode suppresses batched draining");
+    ring::RingConfig cfg = make_config();
+    cfg.drain_flush.entry_threshold = 1;
+    ring::D2HWindowModeController mode(3);
+    mode.record_pattern_version_activation();
+    OneAdmissionController controller(32);
+    controller.enabled = false;
+    DrainHarness harness(cfg, &controller, &mode);
+
+    const std::vector<uint8_t> source = pattern(32, 31);
+    uint8_t* device = upload(source, harness.stream);
+    harness.drain->reserve(32, 1);
+    ring::launch_producer_static(
+        harness.allocated.state(), device, source.size(), 0, harness.stream);
+    CUDA_CHECK(cudaStreamSynchronize(harness.stream));
+    harness.drain->notify();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    EXPECT(controller.polls.load(std::memory_order_acquire) > 0);
+    EXPECT(harness.drain->cpu_task_tail_committed() == 0);
+
+    harness.drain->force_flush_and_wait();
+    const uint64_t count = harness.drain->wait_for_tasks();
+    EXPECT(count == 1);
+    std::vector<ring::DrainTask> tasks;
+    harness.drain->pop_tasks(count, tasks);
+    EXPECT(tasks.size() == 1);
+    EXPECT(task_bytes(tasks.front()) == source);
+    harness.release(tasks.front());
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_window_admission_rounds_to_complete_record_prefix() {
+    banner("window admission transfers only its complete-record prefix");
+    ring::RingConfig cfg = make_config();
+    ring::D2HWindowModeController mode(3);
+    mode.record_pattern_version_activation();
+    OneAdmissionController controller(32);
+    DrainHarness harness(cfg, &controller, &mode);
+
+    const std::vector<uint8_t> first = pattern(32, 9);
+    const std::vector<uint8_t> second = pattern(32, 91);
+    uint8_t* first_device = upload(first, harness.stream);
+    uint8_t* second_device = upload(second, harness.stream);
+    harness.drain->reserve(64, 2);
+    ring::launch_producer_static(
+        harness.allocated.state(), first_device, first.size(), 0,
+        harness.stream);
+    ring::launch_producer_static(
+        harness.allocated.state(), second_device, second.size(), 0,
+        harness.stream);
+    CUDA_CHECK(cudaStreamSynchronize(harness.stream));
+    harness.drain->notify();
+
+    const uint64_t count = harness.drain->wait_for_tasks();
+    EXPECT(count == 1);
+    std::vector<ring::DrainTask> tasks;
+    harness.drain->pop_tasks(count, tasks);
+    EXPECT(tasks.size() == 1);
+    EXPECT(task_bytes(tasks.front()) == first);
+    EXPECT(controller.commits.load(std::memory_order_acquire) == 1);
+    EXPECT(controller.completions.load(std::memory_order_acquire) == 1);
+    EXPECT(controller.committed_bytes == 32);
+    EXPECT(controller.completed_bytes == 32);
+    harness.release(tasks.front());
+
+    harness.drain->force_flush_and_wait();
+    const uint64_t remaining_count = harness.drain->wait_for_tasks();
+    EXPECT(remaining_count == 1);
+    harness.drain->pop_tasks(remaining_count, tasks);
+    EXPECT(tasks.size() == 1);
+    EXPECT(task_bytes(tasks.front()) == second);
+    harness.release(tasks.front());
+    CUDA_CHECK(cudaFree(second_device));
+    CUDA_CHECK(cudaFree(first_device));
+}
+
+static void test_generic_pause_blocks_decisions_until_matching_resume() {
+    banner("generic drain pause blocks decisions until resume");
+    ring::RingConfig cfg = make_config();
+    cfg.drain_flush.entry_threshold = 1;
+    DrainHarness harness(cfg);
+
+    auto pause = std::async(std::launch::async, [&harness] {
+        return harness.drain->pause_after_flush_and_wait();
+    });
+    EXPECT(pause.wait_for(std::chrono::seconds(2)) ==
+           std::future_status::ready);
+    const ring::DrainPauseToken token = pause.get();
+
+    const std::vector<uint8_t> source = pattern(32, 55);
+    uint8_t* device = upload(source, harness.stream);
+    harness.drain->reserve(32, 1);
+    ring::launch_producer_static(
+        harness.allocated.state(), device, source.size(), 0, harness.stream);
+    CUDA_CHECK(cudaStreamSynchronize(harness.stream));
+    harness.drain->notify();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT(harness.drain->cpu_task_tail_committed() == 0);
+
+    harness.drain->resume(token);
+    const uint64_t count = harness.drain->wait_for_tasks();
+    EXPECT(count == 1);
+    std::vector<ring::DrainTask> tasks;
+    harness.drain->pop_tasks(count, tasks);
+    EXPECT(tasks.size() == 1);
+    EXPECT(task_bytes(tasks.front()) == source);
+    harness.release(tasks.front());
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_overlapping_pause_requests_serialise() {
+    banner("overlapping drain pauses serialise instead of deadlocking");
+    ring::RingConfig cfg = make_config();
+    cfg.drain_flush.entry_threshold = 1;
+    DrainHarness harness(cfg);
+
+    auto first = std::async(std::launch::async, [&harness] {
+        return harness.drain->pause_after_flush_and_wait();
+    });
+    EXPECT(first.wait_for(std::chrono::seconds(2)) ==
+           std::future_status::ready);
+    const ring::DrainPauseToken first_token = first.get();
+
+    // A second requester must wait for the first to resume.  Handing it a
+    // token of its own would leave the loop paused on a generation only the
+    // newer waiter could release, hanging every later flush.
+    auto second = std::async(std::launch::async, [&harness] {
+        return harness.drain->pause_after_flush_and_wait();
+    });
+    EXPECT(second.wait_for(std::chrono::milliseconds(200)) ==
+           std::future_status::timeout);
+
+    // A token the loop cannot act on is rejected rather than dropped: a silent
+    // return would leave the drain paused for good.
+    bool rejected = false;
+    try {
+        harness.drain->resume(ring::DrainPauseToken{first_token.generation + 7});
+    } catch (const std::logic_error&) {
+        rejected = true;
+    }
+    EXPECT(rejected);
+
+    harness.drain->resume(first_token);
+    EXPECT(second.wait_for(std::chrono::seconds(2)) ==
+           std::future_status::ready);
+    const ring::DrainPauseToken second_token = second.get();
+    EXPECT(second_token.generation == first_token.generation + 1);
+
+    // Resuming the same token twice is a mistake, not a no-op.
+    rejected = false;
+    try {
+        harness.drain->resume(first_token);
+    } catch (const std::logic_error&) {
+        rejected = true;
+    }
+    EXPECT(rejected);
+
+    harness.drain->resume(second_token);
+
+    const std::vector<uint8_t> source = pattern(32, 91);
+    uint8_t* device = upload(source, harness.stream);
+    harness.drain->reserve(32, 1);
+    ring::launch_producer_static(
+        harness.allocated.state(), device, source.size(), 0, harness.stream);
+    CUDA_CHECK(cudaStreamSynchronize(harness.stream));
+    harness.drain->notify();
+    const uint64_t count = harness.drain->wait_for_tasks();
+    EXPECT(count == 1);
+    std::vector<ring::DrainTask> tasks;
+    harness.drain->pop_tasks(count, tasks);
+    EXPECT(tasks.size() == 1);
+    EXPECT(task_bytes(tasks.front()) == source);
+    harness.release(tasks.front());
+    CUDA_CHECK(cudaFree(device));
+}
+
+static void test_packed_progress_reset_marker_and_graph_replay() {
+    banner("packed progress reset and marker preserve stream order");
+    int device = -1;
+    CUDA_CHECK(cudaGetDevice(&device));
+    ring::PackedVersionCounterProgressSource progress(device);
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    const auto initial = progress.load();
+    EXPECT(initial.version ==
+           ring::D2HWindowPackedProgressLayout::kNoPatternVersion);
+    EXPECT(initial.counter == 0);
+
+    progress.enqueue_reset(7, 4, stream);
+    const auto state = progress.state();
+    auto* device_word = reinterpret_cast<
+        ring::D2HWindowPackedProgressLayout::Word*>(
+            state.device_packed_progress.data_ptr<int64_t>());
+    auto* cpu_visible_word = reinterpret_cast<
+        ring::D2HWindowPackedProgressLayout::Word*>(
+            state.cpu_visible_packed_progress.data_ptr<int64_t>());
+    ring::launch_d2h_window_boundary(device_word, cpu_visible_word, stream);
+    ring::launch_d2h_window_boundary(device_word, cpu_visible_word, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    auto observed = progress.load();
+    EXPECT(observed.version == 7);
+    EXPECT(observed.counter == 6);
+
+    cudaGraph_t graph{};
+    cudaGraphExec_t executable{};
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    ring::launch_d2h_window_boundary(device_word, cpu_visible_word, stream);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    CUDA_CHECK(cudaGraphLaunch(executable, stream));
+    CUDA_CHECK(cudaGraphLaunch(executable, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    observed = progress.load();
+    EXPECT(observed.version == 7);
+    EXPECT(observed.counter == 8);
+
+    ring::D2HWindowPackedProgressLayout::Word authoritative = 0;
+    CUDA_CHECK(cudaMemcpy(
+        &authoritative,
+        device_word,
+        sizeof(authoritative),
+        cudaMemcpyDeviceToHost));
+    EXPECT(authoritative ==
+           ring::D2HWindowPackedProgressLayout::pack(7, 8));
+
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+static void test_multiple_pending_window_definitions() {
+    banner("multiple pending window definitions are queued");
+    ring_py::RingConfig cfg;
+    cfg.task_ring_entries = 16;
+    cfg.payload_ring_bytes = 4096;
+    cfg.pinned_staging_bytes = 4096;
+    cfg.drain_poll_timeout_us = 100;
+    cfg.recurring_d2h_windows.enabled = true;
+    cfg.recurring_d2h_windows
+        .minimum_record_probe_retry_interval_occurrences = 1;
+    cfg.recurring_d2h_windows
+        .timing_revalidation_retry_interval_occurrences = 1;
+    cfg.recurring_d2h_windows.capacity_flush_fallback_threshold = 2;
+
+    ring_py::RingEnginePy engine(cfg, std::shared_ptr<ring::RecordSink>{});
+    engine.init();
+    engine.start();
+
+    bool threw = false;
+    bool accepted_first = false;
+    bool accepted_second = false;
+    try {
+        accepted_first = engine.define_d2h_window_pattern(4, {{1, 3}}, 0);
+        accepted_second = engine.define_d2h_window_pattern(6, {{1, 4}}, 0);
+    } catch (...) {
+        threw = true;
+    }
+    EXPECT(!threw);
+    EXPECT(accepted_first);
+    EXPECT(accepted_second);
+
+    CUDA_CHECK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream().stream()));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (engine.d2h_window_runtime_snapshot().mode !=
+               ring::D2HWindowMode::ENABLED_ACTIVE &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT(engine.d2h_window_runtime_snapshot().mode ==
+           ring::D2HWindowMode::ENABLED_ACTIVE);
+
+    const at::Tensor progress = engine.d2h_window_cpu_visible_progress_tensor();
+    ring::D2HWindowPackedProgressLayout::Word packed = 0;
+    CUDA_CHECK(cudaMemcpy(
+        &packed,
+        progress.data_ptr<int64_t>(),
+        sizeof(packed),
+        cudaMemcpyDeviceToHost));
+    EXPECT(ring::D2HWindowPackedProgressLayout::version(packed) == 2);
+    EXPECT(ring::D2HWindowPackedProgressLayout::counter(packed) == 0);
+    engine.stop();
+}
+
+static void test_terminal_fallback_definition_returns_false() {
+    banner("terminal fallback ignores later pattern definitions");
+    int device = -1;
+    CUDA_CHECK(cudaGetDevice(&device));
+    ring::RecurringD2HWindowConfig cfg;
+    cfg.enabled = true;
+    cfg.minimum_record_probe_retry_interval_occurrences = 1;
+    cfg.timing_revalidation_retry_interval_occurrences = 1;
+    cfg.capacity_flush_fallback_threshold = 1;
+    ring::RecurringD2HWindowSubsystem subsystem(cfg, device);
+    UnusedDrainPause drain_pause;
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    EXPECT(subsystem.define_pattern(4, {{1, 3}}, 0, stream, drain_pause));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    subsystem.grant_controller().poll({0, std::nullopt});
+    EXPECT(subsystem.snapshot().mode == ring::D2HWindowMode::ENABLED_ACTIVE);
+
+    subsystem.record_capacity_forced_flush();
+    EXPECT(subsystem.snapshot().mode == ring::D2HWindowMode::ENABLED_FALLBACK);
+
+    bool threw = false;
+    bool accepted = true;
+    try {
+        accepted = subsystem.define_pattern(6, {{1, 4}}, 0, stream, drain_pause);
+    } catch (...) {
+        threw = true;
+    }
+    EXPECT(!threw);
+    EXPECT(!accepted);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+static void test_legacy_engine_rejects_recurring_window_configuration() {
+    banner("legacy engine rejects recurring-window configuration");
+    ring_py::RingConfig cfg;
+    cfg.recurring_d2h_windows.enabled = true;
+    cfg.recurring_d2h_windows
+        .minimum_record_probe_retry_interval_occurrences = 1;
+    cfg.recurring_d2h_windows
+        .timing_revalidation_retry_interval_occurrences = 1;
+    cfg.recurring_d2h_windows.capacity_flush_fallback_threshold = 1;
+    bool rejected = false;
+    try {
+        ring_py::RingEnginePy engine(cfg, ring_py::SubmitFn{});
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    EXPECT(rejected);
+}
+
 int main() {
     setbuf(stdout, nullptr);
     ring::set_ring_null_mode(false);
@@ -737,6 +1148,14 @@ int main() {
     test_drain_worker_binds_owner_device();
     test_record_flush_bounds_current_stream_prefix_wait();
     test_record_flush_reaches_sink_durability_boundary();
+    test_active_window_mode_suppresses_batched_drain();
+    test_window_admission_rounds_to_complete_record_prefix();
+    test_generic_pause_blocks_decisions_until_matching_resume();
+    test_overlapping_pause_requests_serialise();
+    test_packed_progress_reset_marker_and_graph_replay();
+    test_multiple_pending_window_definitions();
+    test_terminal_fallback_definition_returns_false();
+    test_legacy_engine_rejects_recurring_window_configuration();
 
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

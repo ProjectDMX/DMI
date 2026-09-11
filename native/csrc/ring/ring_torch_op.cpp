@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "ring_torch_op.h"
 #include "producer.cuh"
+#include "d2h_window_marker.h"
 
 #include <limits>
 
@@ -334,6 +335,36 @@ void ring_record_producer_segmented_pack_impl(
         reinterpret_cast<uint64_t>(stream.stream()));
 }
 
+void ring_advance_boundary_impl(
+    const at::Tensor& /*ring_payload*/,
+    const at::Tensor& device_packed_progress,
+    const at::Tensor& cpu_visible_packed_progress) {
+    TORCH_CHECK(device_packed_progress.is_cuda(),
+                "device D2H window progress must be a CUDA tensor");
+    TORCH_CHECK(cpu_visible_packed_progress.is_cuda(),
+                "CPU-visible D2H window progress must be exposed as a CUDA tensor");
+    TORCH_CHECK(device_packed_progress.is_contiguous() &&
+                    cpu_visible_packed_progress.is_contiguous(),
+                "D2H window progress tensors must be contiguous");
+    TORCH_CHECK(device_packed_progress.scalar_type() == at::kLong &&
+                    cpu_visible_packed_progress.scalar_type() == at::kLong,
+                "D2H window progress tensors must have dtype int64");
+    TORCH_CHECK(device_packed_progress.numel() == 1 &&
+                    cpu_visible_packed_progress.numel() == 1,
+                "D2H window progress tensors must each contain one element");
+    TORCH_CHECK(device_packed_progress.device() ==
+                    cpu_visible_packed_progress.device(),
+                "D2H window progress tensors must use the same CUDA device");
+    auto stream = at::cuda::getCurrentCUDAStream(
+        device_packed_progress.device().index());
+    ring::launch_d2h_window_boundary(
+        reinterpret_cast<ring::D2HWindowPackedProgressLayout::Word*>(
+            device_packed_progress.data_ptr<int64_t>()),
+        reinterpret_cast<ring::D2HWindowPackedProgressLayout::Word*>(
+            cpu_visible_packed_progress.data_ptr<int64_t>()),
+        stream.stream());
+}
+
 TORCH_LIBRARY(ring, m) {
     m.def("producer(Tensor(a!) ring_payload, Tensor x, "
           "int hook_type, int hook_id) -> ()");
@@ -355,6 +386,9 @@ TORCH_LIBRARY(ring, m) {
     m.def("record_producer_segmented_pack(Tensor(a!) ring_payload, Tensor x, "
           "Tensor segment_start, Tensor segment_end, int feature_bytes, "
           "Tensor? emit_gate=None, int emit_value=0) -> ()");
+    m.def("advance_boundary(Tensor(a!) ring_payload, "
+          "Tensor(b!) device_packed_progress, "
+          "Tensor(c!) cpu_visible_packed_progress) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(ring, CUDA, m) {
@@ -368,4 +402,5 @@ TORCH_LIBRARY_IMPL(ring, CUDA, m) {
            ring_record_producer_seq_prefix_pack_impl);
     m.impl("record_producer_segmented_pack",
            ring_record_producer_segmented_pack_impl);
+    m.impl("advance_boundary", ring_advance_boundary_impl);
 }
