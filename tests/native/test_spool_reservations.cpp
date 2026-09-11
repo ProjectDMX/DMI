@@ -199,9 +199,11 @@ void TestReconciliationKeepsAnInflightReservation() {
   CHECK(spool.Snapshot().bytes == 1500);
 }
 
-// A refused stage and a lost link() race both release their reservation
-// (the reserved account must return to zero, or the spool leaks capacity).
-void TestARefusedStageLeavesNoReservationBehind() {
+// A stage that the cap refuses, and a retry of a pack this object already
+// staged, both leave the accounts exactly where they were. The refusal is the
+// cheap half -- the capacity check returns before reserved_bytes_ moves, so
+// there is no reservation to give back.
+void TestARefusedStageAndARetryLeaveTheAccountsAlone() {
   const std::string root = FreshRoot("refused");
   dmi_store::SpoolConfig config{root, 1500};
   dmi_store::Spool spool;
@@ -219,6 +221,55 @@ void TestARefusedStageLeavesNoReservationBehind() {
         dmi_store::SpoolStatus::kOk);
   CHECK(spool.Snapshot().bytes == 1000);
   CHECK(spool.Snapshot().entries == 1);
+  // And the refusal really did leave room: the 500 bytes still under the cap
+  // are stageable.
+  CHECK(StageBytes(spool, 3, 500, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(spool.Snapshot().bytes == 1500);
+}
+
+// The one reachable path that TAKES a reservation and then has to give it
+// back: the EEXIST loser. It reserves, loses link() to a second Spool object
+// on the same root, releases its reservation and accounts the winner's file
+// instead. A release that leaked leaves the bytes on disk unchanged -- the
+// file is there either way -- and shows up only where the reservation is
+// still charged: the snapshot, and the room left under the cap. So the
+// observable that matters is that a stage which FITS is still admitted.
+void TestALostLinkRaceReleasesItsReservation() {
+  const std::string root = FreshRoot("lost-link-release");
+  dmi_store::SpoolConfig config{root, 1500};
+  dmi_store::Spool loser, winner;
+  std::string error;
+  CHECK(dmi_store::Spool::Open(config, &loser, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(dmi_store::Spool::Open(config, &winner, &error) ==
+        dmi_store::SpoolStatus::kOk);
+
+  dmi_store::StagedPack winner_out;
+  loser.SetStageHookForTesting([&] {
+    std::string inner;
+    CHECK(StageBytes(winner, 1, 1000, &winner_out, &inner) ==
+          dmi_store::SpoolStatus::kOk);
+  });
+  dmi_store::StagedPack out;
+  CHECK(StageBytes(loser, 1, 1000, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  loser.SetStageHookForTesting(nullptr);
+  CHECK(loser.Snapshot().bytes == 1000);
+  CHECK(loser.Snapshot().entries == 1);
+
+  // 1000 committed under a 1500 cap: 500 fits, and only fits if the loser's
+  // reservation went back.
+  const dmi_store::SpoolStatus status =
+      StageBytes(loser, 2, 500, &out, &error);
+  CHECK(status == dmi_store::SpoolStatus::kOk);
+  if (status != dmi_store::SpoolStatus::kOk) {
+    std::cerr << "a stage that fits was refused: "
+              << dmi_store::SpoolStatusName(status) << " " << error << "\n";
+  }
+  CHECK(BytesOnDisk(root) == 1500);
+  CHECK(loser.Snapshot().bytes == 1500);
+  CHECK(loser.Snapshot().entries == 2);
 }
 
 // (3) A ready file this object NEVER accounted for. The retry above is the
@@ -340,7 +391,8 @@ void TestRepeatedRemovalDoesNotReleaseAnotherPacksCapacity() {
 int main() {
   TestSerialRemoveThroughAnotherSpoolIsReconciled();
   TestReconciliationKeepsAnInflightReservation();
-  TestARefusedStageLeavesNoReservationBehind();
+  TestARefusedStageAndARetryLeaveTheAccountsAlone();
+  TestALostLinkRaceReleasesItsReservation();
   TestARetryOfAnotherObjectsReadyFileIsAccounted();
   TestAnEexistLoserAccountsForTheWinnersFile();
   TestRepeatedRemovalDoesNotReleaseAnotherPacksCapacity();
