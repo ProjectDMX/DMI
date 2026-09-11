@@ -306,6 +306,14 @@ def test_object_key_parity_with_python():
             # (quote() spares '.'), and so is a component that is only dots.
             ("a..b", "s..t", 0, 1_700_000_000_000_000_000),
             ("..", "s", 0, 1_700_000_000_000_000_000),
+            # The last nanoseconds before a UTC midnight. Both builders must
+            # name the day the capture actually happened on; a float divide
+            # rounds these up to the next second and so to the NEXT day. The
+            # two neighbours pin the boundary from either side, so the seam
+            # cannot be moved instead of removed.
+            ("tenant", "s", 0, 1_767_225_599_999_999_403),
+            ("tenant", "s", 0, 1_767_225_599_999_999_404),
+            ("tenant", "s", 0, 1_767_225_600_000_000_000),
         ]
         pack_id = "018f0000-0000-7000-8000-000000000f01"
         for tenant, sess, rank, captured in cases:

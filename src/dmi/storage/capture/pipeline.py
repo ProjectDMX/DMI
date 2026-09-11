@@ -293,7 +293,7 @@ class PackAssembler:
 def object_key_for(ready: ReadyPack) -> str:
     metadata = ready.first_metadata
     captured = datetime.fromtimestamp(
-        metadata.captured_at_ns / 1_000_000_000, tz=timezone.utc
+        metadata.captured_at_ns // 1_000_000_000, tz=timezone.utc
     )
     return (
         f"v1/tenant={key_component(metadata.tenant_id)}/"
