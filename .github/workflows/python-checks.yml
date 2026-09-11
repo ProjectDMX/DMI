@@ -127,6 +127,87 @@ jobs:
                        "that is not absent hardware; a skip is not a pass")
           EOF
 
+      - name: Fail if a live-marked test lives outside tests/*_live.py
+        # The live job runs `pytest tests/*_live.py -m "clickhouse and manual
+        # and not garage"`, which makes the FILENAME load-bearing: a new test
+        # under those markers written as `test_..._e2e.py` is never collected
+        # there, and that job's skip gate cannot catch it, because uncollected
+        # is not skipped. This step is that missing half -- it fails when a
+        # test the live job is meant to run is sitting where the glob cannot
+        # see it.
+        #
+        # It runs HERE, in the cpu job, and not in the live job, because it
+        # has to collect the WHOLE tree and only this job's environment can
+        # import the whole tree: `make -C native cpu-goals` above builds
+        # CPU_ONLY_GOALS, which includes build/_dmi_native_sink, while the
+        # live job builds only the four conformance drivers and so hits a
+        # module-level skip in the two suites that import that .so. Doing the
+        # tree walk in the live job is precisely the regression this replaces.
+        # This job already collects the same tree (`make check` -> `pytest -m
+        # cpu`, no path), so the walk costs seconds and adds no new imports.
+        #
+        # A module that cannot be imported contributes NO node ids and is
+        # therefore invisible here -- ignored by construction rather than by a
+        # special case on "collection skipped". That is deliberate: an
+        # unimportable module in THIS job is already a failure, caught by the
+        # skip gate above, so the two checks compose instead of overlapping.
+        run: |
+          python - <<'EOF'
+          import glob
+          import os
+          import subprocess
+          import sys
+
+          MARKERS = "clickhouse and manual and not garage"
+          LIVE_GLOB = "tests/*_live.py"
+
+          proc = subprocess.run(
+              [sys.executable, "-m", "pytest", "tests", "-m", MARKERS,
+               "--collect-only", "-q", "-p", "no:cacheprovider"],
+              capture_output=True, text=True,
+          )
+          # NOT `|| true`. `--collect-only` still exits non-zero on a
+          # collection ERROR (exit 2) and on an empty selection (exit 5), and
+          # swallowing either turns this gate into a no-op that reports green
+          # -- the same silent-green it exists to end. Both are failures, and
+          # both name themselves.
+          if proc.returncode != 0:
+              print(proc.stdout)
+              print(proc.stderr, file=sys.stderr)
+              sys.exit(f"collecting '{MARKERS}' over tests/ exited "
+                       f"{proc.returncode}; this gate cannot run, which is "
+                       "indistinguishable from it passing")
+
+          collected = set()
+          for line in proc.stdout.splitlines():
+              node = line.strip()
+              if "::" not in node:
+                  continue
+              path = node.split("::", 1)[0]
+              if path.endswith(".py") and os.path.exists(path):
+                  collected.add(os.path.normpath(path))
+
+          # Self-check: an expression that matches nothing would make every
+          # comparison below vacuously true.
+          if not collected:
+              sys.exit(f"'{MARKERS}' selected no tests at all; the live job "
+                       "would run nothing and this gate would pass vacuously")
+
+          covered = {os.path.normpath(p) for p in glob.glob(LIVE_GLOB)}
+          outside = sorted(collected - covered)
+          print(f"{len(collected)} file(s) hold '{MARKERS}' tests; "
+                f"{len(collected & covered)} matched by {LIVE_GLOB}")
+          if outside:
+              for path in outside:
+                  print(f"  outside the glob: {path}")
+              sys.exit(
+                  f"{len(outside)} file(s) hold '{MARKERS}' tests but do not "
+                  f"match {LIVE_GLOB}, so the clickhouse-live job never "
+                  "collects them and its skip gate cannot see the gap. Rename "
+                  "them to *_live.py."
+              )
+          EOF
+
   clickhouse-live:
     # The `manual`-marked suites, which `make check` cannot run: `addopts` in
     # pyproject.toml carries `-m 'not manual'`, so every test that needs a real
@@ -248,6 +329,27 @@ jobs:
         # `python -m pytest`, matching the Makefile. `not garage` drops the one
         # suite that also needs a Garage S3 endpoint; everything else under
         # these markers needs nothing but the server above.
+        #
+        # The GLOB, not the whole `tests` tree. Walking the tree here makes
+        # pytest IMPORT every test module, including ones this job never
+        # builds for: it builds the four conformance drivers above, NOT
+        # build/_dmi_native_sink, and tests/test_native_adapter_torch.py and
+        # tests/test_native_rollback.py take a module-level `pytest.skip`
+        # when that .so is absent (they import it at module scope, so they
+        # cannot convert to a per-test skipif -- tests/test_ci_guard_skips.py
+        # records exactly those two as the permanent exceptions). A
+        # collection skip lands in the JUnit as `<skipped/>`, and the gate
+        # below then fails the job -- correctly, by its own doctrine -- over
+        # two files this suite does not even want. Measured in CI: `201
+        # collected, 2 skipped`.
+        #
+        # So the RUN stays scoped to the files it needs to import. The hole
+        # a glob leaves -- a `manual`/`clickhouse` test named outside the
+        # convention is silently UNCOLLECTED, and this gate cannot catch it
+        # because uncollected is not skipped -- is closed instead by the
+        # "Fail if a live-marked test lives outside tests/*_live.py" step in
+        # the cpu job, which collects the whole tree in an environment that
+        # can actually import it.
         run: |
           python -m pytest tests/*_live.py -m "clickhouse and manual and not garage" \
             -q --junit-xml=live-results.xml

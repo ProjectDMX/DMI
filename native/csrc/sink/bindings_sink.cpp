@@ -32,7 +32,16 @@ ring::PayloadSlice ParseSlice(const py::dict& row) {
   slice.materialization = ring::PayloadMaterialization::TENSOR;
   slice.dtype = row["dtype"].cast<int32_t>();
   slice.logical_shape = row["shape"].cast<std::vector<int64_t>>();
+  // Optional, default -1 ("no dynamic dimension"). The production encoder
+  // (bindings.cpp) sets this from the -1 it finds in the Python slice's
+  // shape, so pinning it here to -1 left the whole dynamic-dim branch of
+  // the adapter unreachable from this driver. A caller drives it the way
+  // production presents it: `shape=[-1, 4], inferred_dynamic_dim=0`.
   slice.inferred_dynamic_dim = -1;
+  if (row.contains("inferred_dynamic_dim") &&
+      !row["inferred_dynamic_dim"].is_none()) {
+    slice.inferred_dynamic_dim = row["inferred_dynamic_dim"].cast<int32_t>();
+  }
   return slice;
 }
 

@@ -171,7 +171,23 @@ Admission PackSink::Submit(dmi_pack::RecordMetadata metadata,
     worker = RouteWorker(metadata.tenant_id, metadata.session_id,
                          metadata.producer_rank);
   }
+  // Both bounds screen before the wait loop, in the oracle's order:
+  // HostCapturePipeline.submit tests max_pack_bytes first and only then
+  // hands the record to _BoundedQueue.put, which tests its own byte cap
+  // before it ever waits. Both answer TOO_LARGE and both count the record
+  // as oversized.
   if (n > config_.max_pack_bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++counters_.oversized_records;
+    return Admission::kTooLarge;
+  }
+  // Without this, a record between the two bounds reached a loop whose
+  // condition (queue_bytes_ + n <= max_queue_bytes) cannot hold even on an
+  // empty queue: kDropNewest called it dropped, a timeout called it timed
+  // out, and kBlock with a negative timeout waited forever. With the
+  // shipped defaults (16 MiB queue, 128 MiB pack) that is every record
+  // over 16 MiB.
+  if (n > config_.max_queue_bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     ++counters_.oversized_records;
     return Admission::kTooLarge;
