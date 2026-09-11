@@ -7,6 +7,7 @@
 #include <ctime>
 #include <thread>
 
+#include "../common/curl_init.h"
 #include "s3_sign.h"
 
 namespace dmi_store {
@@ -111,6 +112,11 @@ std::string XmlTag(const std::string& xml, const std::string& tag) {
 }  // namespace
 
 S3Client::S3Client(S3Config config) : config_(std::move(config)) {
+  // Explicit, rather than leaning on the implicit init inside
+  // curl_easy_init: that implicit path carries libcurl's thread-safety
+  // caveat, and Exchange() runs on the uploader's worker threads. Once per
+  // process, and never torn down. See common/curl_init.h.
+  dmi_common::EnsureCurlGlobalInit();
   // endpoint := scheme://host[:port]; bucket and key are appended per call
   // (path style, matching the Python store's addressing_style="path").
   std::string rest = config_.endpoint;

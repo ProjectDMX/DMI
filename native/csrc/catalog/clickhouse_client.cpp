@@ -2,6 +2,7 @@
 
 #include <cstdio>
 
+#include "../common/curl_init.h"
 #include "sql_escape.h"
 
 namespace dmi_catalog {
@@ -109,10 +110,14 @@ std::map<std::string, std::string> deciding_read() {
 
 ClickHouseClient::ClickHouseClient(std::string host, uint16_t port)
     : host_(std::move(host)), port_(port) {
-  curl_global_init(CURL_GLOBAL_DEFAULT);
+  // Process-lifetime, not per-object: the matching curl_global_cleanup used
+  // to run in the destructor below, which tore libcurl down for the WHOLE
+  // process while the uploader's worker threads were inside
+  // curl_easy_perform. See common/curl_init.h.
+  dmi_common::EnsureCurlGlobalInit();
 }
 
-ClickHouseClient::~ClickHouseClient() { curl_global_cleanup(); }
+ClickHouseClient::~ClickHouseClient() = default;
 
 std::vector<Row> ClickHouseClient::execute(
     const std::string& query, const Params& params,
