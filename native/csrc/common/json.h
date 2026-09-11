@@ -17,11 +17,22 @@ namespace dmi_common {
 // UTF-16 surrogate pair combined into its one non-BMP code point.
 // `q` must be positioned just after the opening quote; returns with `q` on
 // the closing quote.
-std::string Unescape(const std::string& text, size_t& q);
+//
+// `ok`, when given, is CLEARED (never set) for an escape that has no code
+// point behind it: a \uXXXX whose digits are not hex, and a surrogate with
+// no partner. Both are things the oracle refuses -- json.loads raises
+// "Invalid \uXXXX escape" for the first, and _validate_text's
+// .encode("utf-8") raises UnicodeEncodeError for the second -- and this
+// decoder has no way to refuse on its own. The returned text stays valid
+// UTF-8 either way (U+FFFD stands in), so a caller that cannot check still
+// never receives the CESU-8 that reached a pack. Initialise it to true and
+// pass the same flag to every field of one object to latch the whole parse.
+std::string Unescape(const std::string& text, size_t& q, bool* ok = nullptr);
 
 // First string value for `key` anywhere in `text` (either separator style).
+// `ok` is as for Unescape; an absent key leaves it alone.
 std::string FindString(const std::string& text, const std::string& key,
-                       size_t from = 0);
+                       size_t from = 0, bool* ok = nullptr);
 
 // Outcome of a bounded integer scan.
 enum class IntFind {

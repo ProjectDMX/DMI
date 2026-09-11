@@ -1149,6 +1149,56 @@ def test_a_non_bmp_identifier_survives_the_metadata_decoder(sink, tmp_path,
     assert staged.hook_name == hook_name
 
 
+@pytest.mark.parametrize("hook_name", ["block\ud83d", "block\udcff"])
+def test_a_lone_surrogate_is_refused_not_persisted_as_cesu8(sink, tmp_path,
+                                                            hook_name):
+    """A surrogate with no partner has no UTF-8 encoding at all.
+
+    The oracle cannot even build the record: _validate_text calls
+    .encode("utf-8"), which raises UnicodeEncodeError. Native kept the
+    three-byte form -- \\ud83d became ED A0 BD -- which ValidText admits,
+    because it checks lead/continuation byte SHAPE and not the surrogate
+    range, so the record was packed and inserted as CESU-8.
+    """
+    mapping = _meta(0, dtype="uint8", shape=(64,)).to_mapping()
+    mapping["hook_name"] = hook_name
+    with pytest.raises(PackFormatError, match="surrogates not allowed"):
+        CaptureMetadata.from_mapping(mapping)
+
+    _open(sink, tmp_path / "spool")
+    metadata = _row_meta(0, dtype="uint8", shape=[64], hook_name=hook_name)
+    assert "\\ud83d" in metadata or "\\udcff" in metadata, metadata
+    assert sink.call(op="parse_metadata", metadata_json=metadata)["ok"] is False
+    assert _submit_row(sink, metadata, bytes(64), "uint8", [64])["ok"] is False
+    # The mapping path is the native side of CaptureMetadata.from_mapping and
+    # refuses it too, rather than admitting a name the oracle cannot hold.
+    refused = sink.call(op="submit", metadata=json.loads(metadata),
+                        payload_b64=base64.b64encode(bytes(64)).decode())
+    assert refused["ok"] is False, refused
+    assert sink.call(op="snapshot")["snapshot"]["submitted_records"] == 0
+
+
+def test_a_malformed_unicode_escape_is_refused_not_decoded(sink, tmp_path):
+    """\\uZZZZ has no code point; json.loads raises "Invalid \\uXXXX escape".
+
+    The four digits were never checked -- `h <= '9' ? h - '0' : (h | 0x20) -
+    'a' + 10` accepts anything -- so \\uZZZZ decoded to U+25553 and the field
+    was packed as F0 A5 95 93, a name nothing in the request ever spelled.
+    """
+    _open(sink, tmp_path / "spool")
+    valid = _row_meta(0, dtype="uint8", shape=[64])
+    assert '"hook_name": "h"' in valid, valid
+    # A single backslash in the metadata TEXT: json.dumps doubles it on the
+    # wire, and the driver's outer FindString undoes exactly that doubling.
+    metadata = valid.replace('"hook_name": "h"', '"hook_name": "block\\uZZZZ"')
+    with pytest.raises(ValueError):
+        json.loads(metadata)
+
+    assert sink.call(op="parse_metadata", metadata_json=metadata)["ok"] is False
+    assert _submit_row(sink, metadata, bytes(64), "uint8", [64])["ok"] is False
+    assert sink.call(op="snapshot")["snapshot"]["submitted_records"] == 0
+
+
 @pytest.mark.parametrize("field, value, reason", [
     ("layer_number", 0.5, "not an integer"),
     ("captured_at_ns", 123.5, "not an integer"),
