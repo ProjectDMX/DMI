@@ -2,8 +2,19 @@
 
 namespace dmi_common {
 
-std::string Unescape(const std::string& text, size_t& q) {
+std::string Unescape(const std::string& text, size_t& q, bool* ok) {
   std::string raw;
+  // An escape with no code point behind it. The decoder stays TOTAL -- it has
+  // to, since most callers read fields whose contents nothing validates -- so
+  // it emits U+FFFD and lets `ok` carry the refusal to the callers that have
+  // an error channel. U+FFFD matters on its own: whatever a caller does next,
+  // no sequence that is not valid UTF-8 leaves this function, which is what
+  // put CESU-8 in a pack. `ok` is only ever cleared, never set, so one flag
+  // can latch a whole object's worth of fields.
+  const auto reject = [&ok, &raw] {
+    if (ok != nullptr) *ok = false;
+    raw.append("\xEF\xBF\xBD");
+  };
   while (q < text.size() && text[q] != '"') {
     if (text[q] == '\\' && q + 1 < text.size()) {
       ++q;
@@ -15,19 +26,35 @@ std::string Unescape(const std::string& text, size_t& q) {
         case 'f': raw.push_back('\f'); ++q; break;
         case 'u': {
           // Four hex digits at text[at+1..at+4], or -1 when they are not
-          // there (a truncated escape at the end of the text).
+          // there: a truncated escape at the end of the text, or a character
+          // that is not a hex digit at all. The digits were NOT checked, so
+          // `h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10` turned \uZZZZ into
+          // U+25553 and the field decoded to F0 A5 95 93, where json.loads
+          // raises "Invalid \uXXXX escape" and the record never lands.
           const auto hex4 = [&text](size_t at) -> long {
             if (at + 4 >= text.size()) return -1;
             unsigned v = 0;
             for (int k = 1; k <= 4; ++k) {
               const char h = text[at + k];
-              v = v * 16 + (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
+              unsigned digit = 0;
+              if (h >= '0' && h <= '9') {
+                digit = static_cast<unsigned>(h - '0');
+              } else if ((h | 0x20) >= 'a' && (h | 0x20) <= 'f') {
+                digit = static_cast<unsigned>((h | 0x20) - 'a' + 10);
+              } else {
+                return -1;
+              }
+              v = v * 16 + digit;
             }
             return static_cast<long>(v);
           };
           const long first = hex4(q);
-          unsigned v = first < 0 ? 0u : static_cast<unsigned>(first);
           q += 5;
+          if (first < 0) {
+            reject();
+            break;
+          }
+          unsigned v = static_cast<unsigned>(first);
           // json.dumps (ensure_ascii, the default) writes a code point
           // outside the BMP as a UTF-16 surrogate PAIR: U+1F600 is
           // \ud83d\ude00. The two halves are one character, so they have to
@@ -35,16 +62,33 @@ std::string Unescape(const std::string& text, size_t& q) {
           // half on its own produced six bytes (ED A0 BD ED B8 80) that are
           // not UTF-8 at all, and the identifier reached the catalog
           // corrupted (reproduced with hook_name "block" + U+1F600: Python's reader
-          // then failed to decode byte 0xED). A lone surrogate keeps the
-          // old three-byte form -- there is nothing to combine it with.
-          if (v >= 0xD800 && v <= 0xDBFF && q + 1 < text.size() &&
-              text[q] == '\\' && text[q + 1] == 'u') {
-            const long second = hex4(q + 1);
-            if (second >= 0xDC00 && second <= 0xDFFF) {
-              v = 0x10000 + ((v - 0xD800) << 10) +
-                  (static_cast<unsigned>(second) - 0xDC00);
-              q += 6;
+          // then failed to decode byte 0xED).
+          //
+          // A surrogate with no partner has NOTHING to combine with, and
+          // keeping its three-byte form is the same corruption in the small:
+          // \ud83d decoded to ED A0 BD, which ValidText admits (it checks
+          // lead/continuation byte SHAPE, not the surrogate range) and the
+          // record was packed and inserted. The oracle refuses it --
+          // CaptureMetadata's _validate_text calls .encode("utf-8"), which
+          // raises UnicodeEncodeError on a lone surrogate -- so it is
+          // refused here rather than encoded.
+          if (v >= 0xD800 && v <= 0xDBFF) {
+            const long second =
+                (q + 1 < text.size() && text[q] == '\\' && text[q + 1] == 'u')
+                    ? hex4(q + 1)
+                    : -1;
+            if (second < 0xDC00 || second > 0xDFFF) {
+              reject();
+              break;
             }
+            v = 0x10000 + ((v - 0xD800) << 10) +
+                (static_cast<unsigned>(second) - 0xDC00);
+            q += 6;
+          } else if (v >= 0xDC00 && v <= 0xDFFF) {
+            // A trailing surrogate reached on its own: the leading half it
+            // belongs to is not there, so this one has no partner either.
+            reject();
+            break;
           }
           if (v < 0x80) {
             raw.push_back(static_cast<char>(v));
@@ -73,7 +117,7 @@ std::string Unescape(const std::string& text, size_t& q) {
 }
 
 std::string FindString(const std::string& text, const std::string& key,
-                       size_t from) {
+                       size_t from, bool* ok) {
   for (const char* sep : {": \"", ":\""}) {
     // NOTE: sep includes the opening quote; search for key+sep.
     const std::string needle = "\"" + key + "\"" + sep;
@@ -81,8 +125,11 @@ std::string FindString(const std::string& text, const std::string& key,
     if (at == std::string::npos) continue;
     size_t q = at + needle.size() - 1;  // back up onto the opening quote
     ++q;
-    return Unescape(text, q);
+    return Unescape(text, q, ok);
   }
+  // An ABSENT key is not a decode failure, so `ok` is left alone: a caller
+  // latching one flag over a whole object must not be told the field it did
+  // not send was malformed.
   return "";
 }
 

@@ -37,22 +37,38 @@ bool ParseMetadataJson(const std::string& text,
     return false;
   };
   // The object may carry surrounding whitespace; Find* scans for keys.
-  out->capture_id = jc::FindString(text, "capture_id");
-  out->tenant_id = jc::FindString(text, "tenant_id");
-  out->experiment_id = jc::FindString(text, "experiment_id");
-  out->run_id = jc::FindString(text, "run_id");
-  out->session_id = jc::FindString(text, "session_id");
-  out->request_id = jc::FindString(text, "request_id");
-  out->sequence_id = jc::FindString(text, "sequence_id");
-  out->model_id = jc::FindString(text, "model_id");
-  out->model_revision = jc::FindString(text, "model_revision");
+  //
+  // One latch across every identifier: an escape the decoder cannot turn into
+  // a code point (non-hex \uXXXX digits, or a surrogate with no partner) is a
+  // refusal, not a value. Both are things the oracle refuses -- json.loads
+  // raises "Invalid \uXXXX escape" for the first and _validate_text's
+  // .encode("utf-8") raises UnicodeEncodeError for the second -- while native
+  // encoded them as U+25553 and as three-byte CESU-8, which ValidText admits
+  // (it checks byte SHAPE, not the surrogate range) and the record was packed
+  // and inserted.
+  bool text_ok = true;
+  const auto text_field = [&text, &text_ok](const char* name) {
+    return jc::FindString(text, name, 0, &text_ok);
+  };
+  out->capture_id = text_field("capture_id");
+  out->tenant_id = text_field("tenant_id");
+  out->experiment_id = text_field("experiment_id");
+  out->run_id = text_field("run_id");
+  out->session_id = text_field("session_id");
+  out->request_id = text_field("request_id");
+  out->sequence_id = text_field("sequence_id");
+  out->model_id = text_field("model_id");
+  out->model_revision = text_field("model_revision");
   if (!jc::FindNull(text, "adapter_revision")) {
-    out->adapter_revision = jc::FindString(text, "adapter_revision");
+    out->adapter_revision = text_field("adapter_revision");
   } else {
     out->adapter_revision.reset();
   }
-  out->capture_policy_version = jc::FindString(text, "capture_policy_version");
-  out->hook_name = jc::FindString(text, "hook_name");
+  out->capture_policy_version = text_field("capture_policy_version");
+  out->hook_name = text_field("hook_name");
+  if (!text_ok) {
+    return fail("capture metadata text is not encodable UTF-8");
+  }
   // Presence first: layer_number == -1 is legal (logits-style captures),
   // so FindInt's missing sentinel cannot stand in for absence.
   for (const char* name :

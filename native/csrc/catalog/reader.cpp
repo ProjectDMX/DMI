@@ -372,10 +372,28 @@ std::vector<std::string> parse_tsv_tuple(const std::string& text) {
         // turned `packs/a\b.dmi-pack` into a backspace. Grouped columns
         // are the opposite case -- plain TSV fields, unescaped where the
         // row is flattened, never here.
+        //
+        // The cases below are the escapes ClickHouse actually EMITS when it
+        // renders a string inside a tuple, measured with
+        // `SELECT tuple(concat('block', char(N), 'resid')) FORMAT TSV` over
+        // the control range: \0 \b \t \n \f \r \' \\ and nothing else. In
+        // particular 0x07 and 0x0B travel RAW here, so they need no case --
+        // this set is deliberately NOT sql_quote's, which also writes \a and
+        // \v, and the footer decoder (unquote_sql) covers that one.
+        //
+        // Both sets have to DECODE to the same bytes even though they differ,
+        // because hydrate binds the two field by field. \b and \f were
+        // missing and fell to the default, so they decoded to the letters "b"
+        // and "f" while the footer side decoded them to 0x08 and 0x0C: a
+        // hook_name carrying either (legal -- _validate_text asks only for
+        // non-empty UTF-8 under 512 bytes) staged, uploaded and indexed and
+        // then failed with "does not match the pack footer: field 12".
         switch (next) {
           case 'n': current.push_back('\n'); break;
           case 't': current.push_back('\t'); break;
           case 'r': current.push_back('\r'); break;
+          case 'b': current.push_back('\b'); break;
+          case 'f': current.push_back('\f'); break;
           case '0': current.push_back('\0'); break;
           default: current.push_back(next); break;  // \' and \\ included
         }

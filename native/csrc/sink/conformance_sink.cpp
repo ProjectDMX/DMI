@@ -13,11 +13,14 @@
 //   {"op":"snapshot"} -> {"ok":true,"snapshot":{...}}
 //   {"op":"object_key","tenant_id":"...","session_id":"...","producer_rank":N,
 //    "captured_at_ns":N,"pack_id":"..."} -> {"ok":true,"object_key":"..."}
+//   {"op":"parse_metadata","metadata_json":"..."}
+//     -> {"ok":true,"hook_name_hex":"..."}
 // Errors: {"ok":false,"what":"..."}.
 
 #include "pack_sink.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -44,6 +47,14 @@ namespace {
 // are the driver's remaining decodes.
 std::string g_out_of_range;
 
+// Latched the same way, for a metadata string the JSON decoder could not turn
+// into code points: non-hex \uXXXX digits, or a surrogate with no partner.
+// The oracle refuses both (json.loads raises "Invalid \uXXXX escape";
+// _validate_text's .encode("utf-8") raises UnicodeEncodeError), and this op is
+// the native side of CaptureMetadata.from_mapping, so it has to as well --
+// SubmitRow's own parse already does (record_row.cpp).
+bool g_bad_text = false;
+
 // A field the oracle types as SIGNED must pass IntDomain::kSigned: the
 // union's two's-complement bit pattern is a legal-looking negative to such a
 // field, and 18446744073709551615 arrived at layer_number as -1 -- its own
@@ -62,20 +73,25 @@ int64_t Integer(const std::string& text, const char* key,
 
 dmi_pack::RecordMetadata ParseMetadata(const std::string& obj) {
   dmi_pack::RecordMetadata m;
-  m.capture_id = jc::FindString(obj, "capture_id");
-  m.tenant_id = jc::FindString(obj, "tenant_id");
-  m.experiment_id = jc::FindString(obj, "experiment_id");
-  m.run_id = jc::FindString(obj, "run_id");
-  m.session_id = jc::FindString(obj, "session_id");
-  m.request_id = jc::FindString(obj, "request_id");
-  m.sequence_id = jc::FindString(obj, "sequence_id");
-  m.model_id = jc::FindString(obj, "model_id");
-  m.model_revision = jc::FindString(obj, "model_revision");
+  bool text_ok = true;
+  const auto text_field = [&obj, &text_ok](const char* name) {
+    return jc::FindString(obj, name, 0, &text_ok);
+  };
+  m.capture_id = text_field("capture_id");
+  m.tenant_id = text_field("tenant_id");
+  m.experiment_id = text_field("experiment_id");
+  m.run_id = text_field("run_id");
+  m.session_id = text_field("session_id");
+  m.request_id = text_field("request_id");
+  m.sequence_id = text_field("sequence_id");
+  m.model_id = text_field("model_id");
+  m.model_revision = text_field("model_revision");
   if (!jc::FindNull(obj, "adapter_revision")) {
-    m.adapter_revision = jc::FindString(obj, "adapter_revision");
+    m.adapter_revision = text_field("adapter_revision");
   }
-  m.capture_policy_version = jc::FindString(obj, "capture_policy_version");
-  m.hook_name = jc::FindString(obj, "hook_name");
+  m.capture_policy_version = text_field("capture_policy_version");
+  m.hook_name = text_field("hook_name");
+  if (!text_ok) g_bad_text = true;
   m.layer_number = Integer(obj, "layer_number", jc::IntDomain::kSigned);
   m.producer_rank = static_cast<uint64_t>(Integer(obj, "producer_rank"));
   m.step_number = static_cast<uint64_t>(Integer(obj, "step_number"));
@@ -161,8 +177,14 @@ int main() {
                    &out);
     std::cout << out << "}\n";
   };
+  const auto refuse_bad_text = [] {
+    std::string out = "{\"ok\":false,\"what\":";
+    jc::EscapeJson("capture metadata text is not encodable UTF-8", &out);
+    std::cout << out << "}\n";
+  };
   while (std::getline(std::cin, line)) {
     g_out_of_range.clear();
+    g_bad_text = false;
     const std::string op = jc::FindString(line, "op");
     if (op == "open") {
       dmi_sink::SinkConfig config;
@@ -233,6 +255,38 @@ int main() {
       std::cout << out << "}\n";
       continue;
     }
+    if (op == "parse_metadata") {
+      // Sessionless like `object_key`: the row path's metadata decoder alone,
+      // handing hook_name back as RAW BYTES in hex.
+      //
+      // Why the bytes, and why not read them off a staged pack: the footer
+      // writer decodes each UTF-8 sequence and re-emits \uXXXX
+      // (pack_builder.cpp, EncodeJsonString), which is an exact inverse of
+      // this decoder. A broken CESU-8 surrogate pair written by the decoder
+      // comes back out of the footer as a correct 😀 that
+      // json.loads recombines, so every assertion made on a hook_name read
+      // back through the pack holds whether or not the decoder combines --
+      // the surrogate tests passed with the combine branch disabled. These
+      // bytes never meet that serializer, so they can tell the two apart.
+      dmi_pack::RecordMetadata metadata;
+      std::string error;
+      if (!dmi_sink::ParseMetadataJson(jc::FindString(line, "metadata_json"),
+                                       &metadata, &error)) {
+        std::string out = "{\"ok\":false,\"what\":";
+        jc::EscapeJson(error, &out);
+        std::cout << out << "}\n";
+        continue;
+      }
+      std::string hex;
+      for (const char byte : metadata.hook_name) {
+        char buf[3];
+        std::snprintf(buf, sizeof(buf), "%02x",
+                      static_cast<unsigned>(static_cast<unsigned char>(byte)));
+        hex.append(buf, 2);
+      }
+      std::cout << "{\"ok\":true,\"hook_name_hex\":\"" << hex << "\"}\n";
+      continue;
+    }
     if (!sink) {
       std::cout << "{\"ok\":false,\"what\":\"sink is not open\"}\n";
       continue;
@@ -245,6 +299,10 @@ int main() {
       // the same refusal SubmitRow already makes on the row path.
       if (!g_out_of_range.empty()) {
         refuse_out_of_range();
+        continue;
+      }
+      if (g_bad_text) {
+        refuse_bad_text();
         continue;
       }
       std::vector<uint8_t> payload;

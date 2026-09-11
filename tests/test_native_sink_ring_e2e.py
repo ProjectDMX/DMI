@@ -50,6 +50,13 @@ class _CaptureHookRuntime:
     def __init__(self, runtime) -> None:
         self._runtime = runtime
         self.metadata = None
+        # RecordRuntime.emit_output's return value is the ONLY observable
+        # that says which transport carried each record: it is OVERSIZED
+        # exactly on the CPU-direct branch (records.py:333) and a ring
+        # reservation otherwise. Persisted counts and payload bytes are
+        # identical either way, so without this the test cannot tell a
+        # record that went through the Ring from one that bypassed it.
+        self.reservations = []
 
     def should_emit(self, hook):
         return True
@@ -62,7 +69,9 @@ class _CaptureHookRuntime:
         entry = ProducerPlanBuilder().record_output(
             output_id=output_id, output_spec=output_spec, output=output,
         )
-        return self._runtime.emit_output(entry, self.metadata, output)
+        reservation = self._runtime.emit_output(entry, self.metadata, output)
+        self.reservations.append(reservation)
+        return reservation
 
 
 def _metadata(capture_id: str, tensor: torch.Tensor, *, step: int):
@@ -125,7 +134,14 @@ def test_native_pack_sink_is_the_engines_record_sink(tmp_path: Path):
 
 
 def test_records_flow_from_the_ring_into_a_native_pack(tmp_path: Path):
-    """The explicit entry point: record_sink=create_native_pack_sink(...)."""
+    """The explicit entry point: record_sink=create_native_pack_sink(...).
+
+    Three records, and the point is that they do NOT all take the same
+    route: two fit the 64 KiB payload ring and one does not. The persisted
+    count and the payload bytes are the same whichever transport ran, so
+    the per-record StepReservation is what pins the split.
+    """
+    from dmi.adapters.base import StepReservation
     from dmi.api.v1 import (
         HookPointV1, HookSpecV1, MonitoringEngine, TransportSpec,
     )
@@ -152,7 +168,8 @@ def test_records_flow_from_the_ring_into_a_native_pack(tmp_path: Path):
         hook_runtime.metadata = _metadata("capture-ring", first, step=0)
         hook(first.cuda())
 
-        # Above the 64 KiB Ring: the CPU-direct fallback, same sink.
+        # 128 KiB, above the 64 KiB Ring: the CPU-direct fallback, same
+        # sink. Asserted, not just asserted-in-a-comment, below.
         second = torch.arange(32 * 1024, dtype=torch.float32)
         hook_runtime.metadata = _metadata("capture-direct", second, step=1)
         hook(second.cuda())
@@ -167,6 +184,15 @@ def test_records_flow_from_the_ring_into_a_native_pack(tmp_path: Path):
         snapshot = handle.native_sink.snapshot()
         assert snapshot["persisted_records"] == 3, snapshot
         assert snapshot["failures"] == 0, snapshot
+        # 48 bytes, then 128 KiB, then 4 bytes against a 64 KiB payload
+        # ring: reserved in the ring, CPU-direct, reserved in the ring.
+        # RESERVED and not FLUSHED because neither ring record comes near
+        # filling the ring, so nothing forces a drain.
+        assert hook_runtime.reservations == [
+            StepReservation.RESERVED,
+            StepReservation.OVERSIZED,
+            StepReservation.RESERVED,
+        ], hook_runtime.reservations
     finally:
         engine.close()
 

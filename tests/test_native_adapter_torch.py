@@ -274,16 +274,25 @@ def test_a_scalar_envelope_is_admitted(tmp_path):
     assert payload == torch.tensor(3.5, dtype=torch.float32).numpy().tobytes()
 
 
-@pytest.mark.parametrize("field, value", [
-    ("layer_number", 0.5),
-    ("captured_at_ns", 123.5),
-    ("step_number", -1),
+@pytest.mark.parametrize("field, value, reason", [
+    ("layer_number", 0.5, "capture metadata field is not an integer"),
+    ("captured_at_ns", 123.5, "capture metadata field is not an integer"),
+    ("step_number", -1, "capture metadata integer is out of range"),
 ])
 def test_invalid_numeric_metadata_is_refused_not_converted(tmp_path, field,
-                                                            value):
+                                                            value, reason):
     """What CaptureMetadata refuses, the sink refuses -- nothing is persisted.
 
     These used to be persisted as 0, 123 and 18446744073709551615.
+
+    The exact `reason` is pinned, not just the word "metadata": every
+    metadata refusal carries RowStatusName(kBadMetadata) == "invalid capture
+    metadata", so matching on "metadata" alone would be satisfied by any
+    other refusal -- including the unrelated "descriptor requires metadata
+    JSON followed by one payload slice". The -1 case in particular has to
+    land on OUT OF RANGE, which is what the kUnsigned domain buys: without
+    it step_number=-1 parses fine and is packed as 18446744073709551615.
+    (Same style as tests/test_native_pack_sink.py's parametrised `reason`.)
     """
     from dmi.storage.capture.model import CaptureStorageError
 
@@ -292,11 +301,14 @@ def test_invalid_numeric_metadata_is_refused_not_converted(tmp_path, field,
     with pytest.raises((CaptureStorageError, ValueError, TypeError)):
         CaptureMetadata.from_mapping(meta)
     sink, lease = _make_sink(tmp_path)
-    with pytest.raises(RuntimeError, match="metadata"):
+    with pytest.raises(RuntimeError) as refusal:
         sink.submit_envelope(
             LAYOUT, [_row(meta, 0, 64, "float32")],
             torch.zeros(16, dtype=torch.float32),
         )
+    assert str(refusal.value) == (
+        f"NativePackSink: invalid capture metadata: {reason}"
+    ), (field, value, str(refusal.value))
     assert sink.snapshot()["submitted_records"] == 0
 
 
@@ -308,18 +320,41 @@ def test_a_fractional_shape_dimension_is_refused_not_truncated(tmp_path):
     with pytest.raises((CaptureStorageError, ValueError, TypeError)):
         CaptureMetadata.from_mapping(meta)
     sink, lease = _make_sink(tmp_path)
-    with pytest.raises(RuntimeError, match="metadata"):
+    # The specific refusal, not merely "metadata": a truncated 16.5 would
+    # have been admitted as (16,), matching the envelope shape, so the
+    # message that has to come back is the shape parser's own.
+    with pytest.raises(RuntimeError) as refusal:
         sink.submit_envelope(
             LAYOUT, [_row(meta, 0, 64, "float32", shape=(16,))],
             torch.zeros(16, dtype=torch.float32),
         )
+    assert str(refusal.value) == (
+        "NativePackSink: invalid capture metadata: "
+        "capture shape must be an integer list"
+    ), str(refusal.value)
     assert sink.snapshot()["submitted_records"] == 0
 
 
-def test_a_non_bmp_hook_name_round_trips(tmp_path):
+@pytest.mark.parametrize("hook_name", [
+    "block\U0001F600",
+    # Exactly 512 UTF-8 bytes -- the limit _validate_text and ValidText both
+    # apply. This is the case the round-trip above cannot see: reading the
+    # name back off the pack proves nothing, because the footer writer decodes
+    # each UTF-8 sequence and re-emits \uXXXX, so a decoder that left the
+    # surrogate pair as two three-byte CESU-8 sequences produced a footer
+    # holding exactly the same 😀 a correct decoder does, and
+    # json.loads recombined it either way (measured: this test passed with the
+    # combine branch compiled out). The BYTE COUNT does differ -- 514 against
+    # 512 -- so at the limit the broken decoder is refused outright as
+    # "invalid capture metadata" where Python admits the record.
+    "b" * 508 + "\U0001F600",
+])
+def test_a_non_bmp_hook_name_round_trips(tmp_path, hook_name):
     """json.dumps writes U+1F600 as a surrogate pair; the sink must combine it."""
     meta = _meta(0)
-    meta["hook_name"] = "block\U0001F600"
+    meta["hook_name"] = hook_name
+    # The oracle admits both, so native must too.
+    assert CaptureMetadata.from_mapping(meta).hook_name == hook_name
     row = _row(meta, 0, 64, "float32")
     assert "\\ud83d\\ude00" in row["metadata_json"]
     sink, lease = _make_sink(tmp_path)
@@ -327,7 +362,7 @@ def test_a_non_bmp_hook_name_round_trips(tmp_path):
     assert sink.flush_and_wait(30.0)
     sink.rethrow_if_failed()
     ((staged, _),) = _read_staged(tmp_path)
-    assert staged.hook_name == "block\U0001F600"
+    assert staged.hook_name == hook_name
 
 
 def test_the_sink_derives_from_the_engines_record_sink(tmp_path):

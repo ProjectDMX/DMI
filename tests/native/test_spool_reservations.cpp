@@ -1,5 +1,5 @@
-// Spool capacity accounting under the two access patterns the counters have
-// to survive at once:
+// Spool capacity accounting under the access patterns the counters have to
+// survive at once:
 //
 //   1. A SECOND Spool object (an uploader in another thread or process) on
 //      the same root removes a ready file. The first object's committed
@@ -8,12 +8,18 @@
 //   2. While one stager holds a reservation but has written NOTHING yet,
 //      another stager trips that reconciliation. The scan sees an empty
 //      directory; it must not erase the first stager's reservation.
+//   3. A ready file created by a SECOND Spool object after this one's
+//      Open() is reached by this one's retry or EEXIST-loser path. This
+//      object's committed account has never counted it, so it has to count
+//      it now -- but exactly once, however many times that path is met.
 //
-// A single counter cannot satisfy both: replacing it with the scan fixes
-// (1) and breaks (2) -- with max 1500, A reserved 1000, B's 1000 scanned an
-// empty root, and both were admitted (2000 bytes on disk against a 1500
-// limit). Keeping committed bytes and in-flight reservations as separate
-// accounts, and letting the scan overwrite only the first, satisfies both.
+// A single counter cannot satisfy (1) and (2) at once: replacing it with
+// the scan fixes (1) and breaks (2) -- with max 1500, A reserved 1000, B's
+// 1000 scanned an empty root, and both were admitted (2000 bytes on disk
+// against a 1500 limit). Keeping committed bytes and in-flight reservations
+// as separate accounts, and letting the scan overwrite only the first,
+// satisfies both. Neither aggregate can decide (3) on its own, so the
+// committed account also carries the set of ready PATHS it includes.
 //
 // Built and run by tests/test_native_spool_reservations.py.
 
@@ -193,9 +199,11 @@ void TestReconciliationKeepsAnInflightReservation() {
   CHECK(spool.Snapshot().bytes == 1500);
 }
 
-// A refused stage and a lost link() race both release their reservation
-// (the reserved account must return to zero, or the spool leaks capacity).
-void TestARefusedStageLeavesNoReservationBehind() {
+// A stage that the cap refuses, and a retry of a pack this object already
+// staged, both leave the accounts exactly where they were. The refusal is the
+// cheap half -- the capacity check returns before reserved_bytes_ moves, so
+// there is no reservation to give back.
+void TestARefusedStageAndARetryLeaveTheAccountsAlone() {
   const std::string root = FreshRoot("refused");
   dmi_store::SpoolConfig config{root, 1500};
   dmi_store::Spool spool;
@@ -213,6 +221,152 @@ void TestARefusedStageLeavesNoReservationBehind() {
         dmi_store::SpoolStatus::kOk);
   CHECK(spool.Snapshot().bytes == 1000);
   CHECK(spool.Snapshot().entries == 1);
+  // And the refusal really did leave room: the 500 bytes still under the cap
+  // are stageable.
+  CHECK(StageBytes(spool, 3, 500, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(spool.Snapshot().bytes == 1500);
+}
+
+// The one reachable path that TAKES a reservation and then has to give it
+// back: the EEXIST loser. It reserves, loses link() to a second Spool object
+// on the same root, releases its reservation and accounts the winner's file
+// instead. A release that leaked leaves the bytes on disk unchanged -- the
+// file is there either way -- and shows up only where the reservation is
+// still charged: the snapshot, and the room left under the cap. So the
+// observable that matters is that a stage which FITS is still admitted.
+void TestALostLinkRaceReleasesItsReservation() {
+  const std::string root = FreshRoot("lost-link-release");
+  dmi_store::SpoolConfig config{root, 1500};
+  dmi_store::Spool loser, winner;
+  std::string error;
+  CHECK(dmi_store::Spool::Open(config, &loser, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(dmi_store::Spool::Open(config, &winner, &error) ==
+        dmi_store::SpoolStatus::kOk);
+
+  dmi_store::StagedPack winner_out;
+  loser.SetStageHookForTesting([&] {
+    std::string inner;
+    CHECK(StageBytes(winner, 1, 1000, &winner_out, &inner) ==
+          dmi_store::SpoolStatus::kOk);
+  });
+  dmi_store::StagedPack out;
+  CHECK(StageBytes(loser, 1, 1000, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  loser.SetStageHookForTesting(nullptr);
+  CHECK(loser.Snapshot().bytes == 1000);
+  CHECK(loser.Snapshot().entries == 1);
+
+  // 1000 committed under a 1500 cap: 500 fits, and only fits if the loser's
+  // reservation went back.
+  const dmi_store::SpoolStatus status =
+      StageBytes(loser, 2, 500, &out, &error);
+  CHECK(status == dmi_store::SpoolStatus::kOk);
+  if (status != dmi_store::SpoolStatus::kOk) {
+    std::cerr << "a stage that fits was refused: "
+              << dmi_store::SpoolStatusName(status) << " " << error << "\n";
+  }
+  CHECK(BytesOnDisk(root) == 1500);
+  CHECK(loser.Snapshot().bytes == 1500);
+  CHECK(loser.Snapshot().entries == 2);
+}
+
+// (3) A ready file this object NEVER accounted for. The retry above is the
+// easy half: the object had already counted that file, so adding nothing is
+// right. When a SECOND Spool object on the same root creates the file after
+// this one's Open(), the retry path meets a file worth 1000 bytes that this
+// object's committed account has never seen -- and adding nothing there
+// leaves the cap judged against 0.
+//
+// Python takes the retry and the EEXIST-loser paths through
+// _account_ready_locked (spool.py:124 and :159), which is a no-op only when
+// the path is already in _accounted_ready. Its measured answer: the retry
+// snapshot reads 1000, and the next 1000-byte stage raises SpoolFullError
+// ("2000 > 1500") with 1000 bytes on disk.
+void TestARetryOfAnotherObjectsReadyFileIsAccounted() {
+  const std::string root = FreshRoot("foreign-retry");
+  dmi_store::SpoolConfig config{root, 1500};
+  dmi_store::Spool writer, other;
+  std::string error;
+  CHECK(dmi_store::Spool::Open(config, &writer, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(dmi_store::Spool::Open(config, &other, &error) ==
+        dmi_store::SpoolStatus::kOk);
+
+  // `other` writes the ready file; `writer` has never seen it.
+  dmi_store::StagedPack out;
+  CHECK(StageBytes(other, 1, 1000, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(writer.Snapshot().bytes == 0);
+
+  // The same pack through `writer`: the ready file is already there, so this
+  // is the retry path. It succeeds -- the content matches -- and it has to
+  // leave the 1000 bytes IN the writer's account.
+  CHECK(StageBytes(writer, 1, 1000, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(writer.Snapshot().bytes == 1000);
+  CHECK(writer.Snapshot().entries == 1);
+
+  // So a second, different pack of 1000 does not fit under the 1500 cap.
+  const dmi_store::SpoolStatus status =
+      StageBytes(writer, 2, 1000, &out, &error);
+  CHECK(status == dmi_store::SpoolStatus::kFull);
+  if (status != dmi_store::SpoolStatus::kFull) {
+    std::cerr << "second pack was admitted: "
+              << dmi_store::SpoolStatusName(status) << "\n";
+  }
+  CHECK(BytesOnDisk(root) == 1000);
+
+  // And a retry stays idempotent: running it twice more must not count the
+  // same path again.
+  CHECK(StageBytes(writer, 1, 1000, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(StageBytes(writer, 1, 1000, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(writer.Snapshot().bytes == 1000);
+  CHECK(writer.Snapshot().entries == 1);
+}
+
+// The EEXIST-loser path reaches the same file by a different route: both
+// objects write the same pack, and the one whose link() loses must still
+// end up with those bytes in its account.
+void TestAnEexistLoserAccountsForTheWinnersFile() {
+  const std::string root = FreshRoot("eexist-loser");
+  dmi_store::SpoolConfig config{root, 1500};
+  dmi_store::Spool loser, winner;
+  std::string error;
+  CHECK(dmi_store::Spool::Open(config, &loser, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(dmi_store::Spool::Open(config, &winner, &error) ==
+        dmi_store::SpoolStatus::kOk);
+
+  // The loser reserves, and while it is paused the winner links the ready
+  // file. The loser's own link() then fails with EEXIST -- the retry branch
+  // at the top of Stage ran before the file existed, so this is the only way
+  // to that code path.
+  dmi_store::StagedPack winner_out;
+  loser.SetStageHookForTesting([&] {
+    std::string inner;
+    CHECK(StageBytes(winner, 1, 1000, &winner_out, &inner) ==
+          dmi_store::SpoolStatus::kOk);
+  });
+  dmi_store::StagedPack out;
+  CHECK(StageBytes(loser, 1, 1000, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  loser.SetStageHookForTesting(nullptr);
+
+  CHECK(BytesOnDisk(root) == 1000);
+  CHECK(loser.Snapshot().bytes == 1000);
+  CHECK(loser.Snapshot().entries == 1);
+  const dmi_store::SpoolStatus status =
+      StageBytes(loser, 2, 1000, &out, &error);
+  CHECK(status == dmi_store::SpoolStatus::kFull);
+  if (status != dmi_store::SpoolStatus::kFull) {
+    std::cerr << "loser admitted a second pack: "
+              << dmi_store::SpoolStatusName(status) << "\n";
+  }
+  CHECK(BytesOnDisk(root) == 1000);
 }
 
 void TestRepeatedRemovalDoesNotReleaseAnotherPacksCapacity() {
@@ -237,7 +391,10 @@ void TestRepeatedRemovalDoesNotReleaseAnotherPacksCapacity() {
 int main() {
   TestSerialRemoveThroughAnotherSpoolIsReconciled();
   TestReconciliationKeepsAnInflightReservation();
-  TestARefusedStageLeavesNoReservationBehind();
+  TestARefusedStageAndARetryLeaveTheAccountsAlone();
+  TestALostLinkRaceReleasesItsReservation();
+  TestARetryOfAnotherObjectsReadyFileIsAccounted();
+  TestAnEexistLoserAccountsForTheWinnersFile();
   TestRepeatedRemovalDoesNotReleaseAnotherPacksCapacity();
   if (g_failures != 0) {
     std::cerr << g_failures << " check(s) failed\n";

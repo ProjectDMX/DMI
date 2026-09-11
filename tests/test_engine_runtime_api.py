@@ -780,4 +780,9 @@ def test_the_sink_loader_tolerates_a_transport_module_without_the_loader(
     )
     monkeypatch.setitem(sys.modules, "dmi.transport.native", fake)
     monkeypatch.setattr(dmi.transport, "native", fake, raising=False)
-    assert native_sink._load_native_sink_extension() is not None
+    # The module the loader returns, not merely "not None": the loader can
+    # only raise or hand back _load_named_extension's result, so `is not
+    # None` was satisfied by construction and would have held for any other
+    # object too. Same assertion style as the two tests above.
+    assert native_sink._load_native_sink_extension().RING_TYPES_ARE_STANDINS \
+        is True
