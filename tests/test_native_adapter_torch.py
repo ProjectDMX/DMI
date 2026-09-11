@@ -274,16 +274,25 @@ def test_a_scalar_envelope_is_admitted(tmp_path):
     assert payload == torch.tensor(3.5, dtype=torch.float32).numpy().tobytes()
 
 
-@pytest.mark.parametrize("field, value", [
-    ("layer_number", 0.5),
-    ("captured_at_ns", 123.5),
-    ("step_number", -1),
+@pytest.mark.parametrize("field, value, reason", [
+    ("layer_number", 0.5, "capture metadata field is not an integer"),
+    ("captured_at_ns", 123.5, "capture metadata field is not an integer"),
+    ("step_number", -1, "capture metadata integer is out of range"),
 ])
 def test_invalid_numeric_metadata_is_refused_not_converted(tmp_path, field,
-                                                            value):
+                                                            value, reason):
     """What CaptureMetadata refuses, the sink refuses -- nothing is persisted.
 
     These used to be persisted as 0, 123 and 18446744073709551615.
+
+    The exact `reason` is pinned, not just the word "metadata": every
+    metadata refusal carries RowStatusName(kBadMetadata) == "invalid capture
+    metadata", so matching on "metadata" alone would be satisfied by any
+    other refusal -- including the unrelated "descriptor requires metadata
+    JSON followed by one payload slice". The -1 case in particular has to
+    land on OUT OF RANGE, which is what the kUnsigned domain buys: without
+    it step_number=-1 parses fine and is packed as 18446744073709551615.
+    (Same style as tests/test_native_pack_sink.py's parametrised `reason`.)
     """
     from dmi.storage.capture.model import CaptureStorageError
 
@@ -292,11 +301,14 @@ def test_invalid_numeric_metadata_is_refused_not_converted(tmp_path, field,
     with pytest.raises((CaptureStorageError, ValueError, TypeError)):
         CaptureMetadata.from_mapping(meta)
     sink, lease = _make_sink(tmp_path)
-    with pytest.raises(RuntimeError, match="metadata"):
+    with pytest.raises(RuntimeError) as refusal:
         sink.submit_envelope(
             LAYOUT, [_row(meta, 0, 64, "float32")],
             torch.zeros(16, dtype=torch.float32),
         )
+    assert str(refusal.value) == (
+        f"NativePackSink: invalid capture metadata: {reason}"
+    ), (field, value, str(refusal.value))
     assert sink.snapshot()["submitted_records"] == 0
 
 
@@ -308,11 +320,18 @@ def test_a_fractional_shape_dimension_is_refused_not_truncated(tmp_path):
     with pytest.raises((CaptureStorageError, ValueError, TypeError)):
         CaptureMetadata.from_mapping(meta)
     sink, lease = _make_sink(tmp_path)
-    with pytest.raises(RuntimeError, match="metadata"):
+    # The specific refusal, not merely "metadata": a truncated 16.5 would
+    # have been admitted as (16,), matching the envelope shape, so the
+    # message that has to come back is the shape parser's own.
+    with pytest.raises(RuntimeError) as refusal:
         sink.submit_envelope(
             LAYOUT, [_row(meta, 0, 64, "float32", shape=(16,))],
             torch.zeros(16, dtype=torch.float32),
         )
+    assert str(refusal.value) == (
+        "NativePackSink: invalid capture metadata: "
+        "capture shape must be an integer list"
+    ), str(refusal.value)
     assert sink.snapshot()["submitted_records"] == 0
 
 
