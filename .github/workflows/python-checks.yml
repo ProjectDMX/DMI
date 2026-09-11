@@ -249,19 +249,26 @@ jobs:
         # suite that also needs a Garage S3 endpoint; everything else under
         # these markers needs nothing but the server above.
         #
-        # The whole `tests` tree, selected BY MARKER -- not `tests/*_live.py`.
-        # A filename glob makes the naming convention load-bearing: a new
-        # `manual`/`clickhouse` test written as `test_..._e2e.py` is not
-        # collected, and the skip gate below cannot catch it, because
-        # uncollected is not skipped -- it is the exact silent-green this job
-        # exists to end. Measured before widening: the marker expression alone
-        # over `tests/` selects 199 tests in 9 files, which is byte for byte
-        # what the glob selected, so nothing expensive or needing another
-        # service is pulled in. Collecting the tree costs ~2s and is what the
-        # cpu job above already does (`pytest -m cpu`, no path), on the same
-        # image and the same dependency set, so the imports are proven.
+        # The GLOB, not the whole `tests` tree. Walking the tree here makes
+        # pytest IMPORT every test module, including ones this job never
+        # builds for: it builds the four conformance drivers above, NOT
+        # build/_dmi_native_sink, and tests/test_native_adapter_torch.py and
+        # tests/test_native_rollback.py take a module-level `pytest.skip`
+        # when that .so is absent (they import it at module scope, so they
+        # cannot convert to a per-test skipif -- tests/test_ci_guard_skips.py
+        # records exactly those two as the permanent exceptions). A
+        # collection skip lands in the JUnit as `<skipped/>`, and the gate
+        # below then fails the job -- correctly, by its own doctrine -- over
+        # two files this suite does not even want. Measured in CI: `201
+        # collected, 2 skipped`.
+        #
+        # The hole a glob leaves -- a `manual`/`clickhouse` test named
+        # outside the convention is silently UNCOLLECTED, and this gate
+        # cannot catch it because uncollected is not skipped -- is closed by
+        # a separate check rather than by widening the run. See the next
+        # commit.
         run: |
-          python -m pytest tests -m "clickhouse and manual and not garage" \
+          python -m pytest tests/*_live.py -m "clickhouse and manual and not garage" \
             -q --junit-xml=live-results.xml
 
       - name: Fail if any live test was skipped
