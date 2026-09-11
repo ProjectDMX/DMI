@@ -229,15 +229,33 @@ def test_drop_newest_counts_drops(sink, tmp_path):
     assert outcomes.count("accepted") == snapshot["admitted_records"]
 
 
-def test_block_with_timeout_counts_timeouts(sink, tmp_path):
-    # A queue that can never fit a 64-byte payload (63-byte cap): BLOCK
-    # waits, then times out. Deterministic — no thread timing involved.
+def test_block_with_timeout_admits_a_record_that_exactly_fits(sink, tmp_path):
+    """A 64-byte payload under a 64-byte cap is admitted, not refused.
+
+    This test used to submit the same 64-byte payload under a 63-byte cap
+    and assert "timed_out": with no screening of max_queue_bytes at
+    admission, a record the queue could never hold entered the wait loop
+    and aged out of it. The oracle (_BoundedQueue.put) answers TOO_LARGE
+    for that record before it ever waits, so the refusal moved to
+    test_a_record_the_queue_can_never_hold_is_too_large and what is left
+    here is the boundary the new screen must not overshoot: the bound is
+    `n <= max_queue_bytes`, so a record of exactly the cap still fits.
+
+    The timeout path itself needs a queue that is full of records a
+    consumer has not drained yet. The oracle pins it by stalling its sink
+    (tests/_faults.BlockingPackSink, test_capture_pipeline.py); this
+    driver has no equivalent stall, and every alternative here would be a
+    race against the packer thread.
+    """
     _open(sink, tmp_path / "spool", max_queue_records=256,
-          max_queue_bytes=63, overload="block", admission_timeout=0.05)
-    assert _submit(sink, _record(0)) == "timed_out"
+          max_queue_bytes=64, overload="block", admission_timeout=0.05)
+    assert _submit(sink, _record(0)) == "accepted"
+    assert sink.call(op="flush", timeout=30)["ok"]
     snapshot = sink.call(op="close", timeout=30)["snapshot"]
-    assert snapshot["timed_out_records"] == 1
-    assert snapshot["persisted_records"] == 0
+    assert snapshot["admitted_records"] == 1
+    assert snapshot["oversized_records"] == 0
+    assert snapshot["timed_out_records"] == 0
+    assert snapshot["persisted_records"] == 1
 
 
 def test_duplicate_capture_is_dropped_not_failed(sink, tmp_path):
@@ -259,6 +277,43 @@ def test_oversized_record_is_rejected_up_front(sink, tmp_path):
     assert _submit(sink, big) == "too_large"
     snapshot = sink.call(op="close", timeout=30)["snapshot"]
     assert snapshot["oversized_records"] == 1
+    assert snapshot["packs_persisted"] == 0
+
+
+@pytest.mark.parametrize("overload, timeout", [
+    ("drop_newest", -1),
+    # A timeout, so a regression cannot hang the suite: under BLOCK with
+    # admission_timeout=-1 this record waits for room that can never exist.
+    ("block", 0.05),
+])
+def test_a_record_the_queue_can_never_hold_is_too_large(sink, tmp_path,
+                                                        overload, timeout):
+    """max_queue_bytes is an admission bound, not just a wait condition.
+
+    The oracle (_BoundedQueue.put, pipeline.py) answers TOO_LARGE for a
+    record bigger than the queue's byte cap BEFORE it enters the wait loop,
+    and HostCapturePipeline.submit counts it as oversized -- exactly as it
+    does for a record past max_pack_bytes, which it checks first. The native
+    sink screened only max_pack_bytes, so a record between the two bounds
+    passed admission and reached a loop whose condition
+    (queue_bytes_ + n <= max_queue_bytes) is unsatisfiable even on an empty
+    queue: DROP_NEWEST called it dropped, BLOCK with a timeout called it
+    timed out, and BLOCK without one waited forever. With the shipped
+    defaults (16 MiB queue, 128 MiB pack) that is every record over 16 MiB.
+    """
+    _open(sink, tmp_path / "spool", max_queue_records=256,
+          max_queue_bytes=1024, max_pack_bytes=1 << 20,
+          overload=overload, admission_timeout=timeout)
+    big = CaptureRecord(
+        metadata=_meta(0, dtype="uint8", shape=(2048,)), payload=bytes(2048)
+    )
+    assert _submit(sink, big) == "too_large"
+    snapshot = sink.call(op="close", timeout=30)["snapshot"]
+    assert snapshot["oversized_records"] == 1
+    assert snapshot["dropped_records"] == 0
+    assert snapshot["timed_out_records"] == 0
+    assert snapshot["admitted_records"] == 0
+    assert snapshot["persisted_records"] == 0
     assert snapshot["packs_persisted"] == 0
 
 
