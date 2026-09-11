@@ -26,7 +26,7 @@ from .extensions import (
     ExtensionFailure,
     ExtensionRegistry,
 )
-from .pack import PackIndex, verify_payload
+from .pack import PackIndex, reject_a_foreign_tenant, verify_payload
 from .summary import ArtifactRef, CoreTensorSummary, decode_tensor, summarize_tensor
 
 
@@ -331,7 +331,7 @@ class CaptureReader:
             cached = self._footer_cache.get(key)
             if cached is not None:
                 self._footer_cache.move_to_end(key)
-                return cached.descriptors
+                return self._bind_to_its_key(ref, cached)
 
         index = PackIndex.from_store(_BudgetedPackStore(store, budget), ref)
         footer = {item.capture_id: item for item in index.descriptors()}
@@ -340,7 +340,7 @@ class CaptureReader:
             cached = self._footer_cache.get(key)
             if cached is not None:
                 self._footer_cache.move_to_end(key)
-                return cached.descriptors
+                return self._bind_to_its_key(ref, cached)
             if (
                 self._footer_cache_limit > 0
                 and entry.wire_bytes <= self._footer_cache_bytes_limit
@@ -355,6 +355,32 @@ class CaptureReader:
                 self._footer_cache[key] = entry
                 self._footer_cache_bytes += entry.wire_bytes
         return footer
+
+    @staticmethod
+    def _bind_to_its_key(
+        ref: PackRef, cached: _FooterCacheEntry
+    ) -> Mapping[str, CaptureDescriptor]:
+        """Re-run, on a cache hit, the location bind the hit skipped past.
+
+        ``PackIndex.from_store`` is the only place the tenant/key bind runs on
+        the read path, so a hit returned descriptors nobody had checked
+        against the key this read actually used: the same pack was refused
+        under a foreign key when cold and served when warm, and inside a
+        single ``hydrate()`` which of the two happened came down to the order
+        of the selection's capture ids.
+
+        The cache stays keyed on pack identity rather than gaining the object
+        key, because an entry keyed by identity plainly holds only what the
+        footer says. Add the key and the entry silently carries a verdict
+        derived from a LOCATION as well, so the next location-dependent check
+        added beside this one is bypassed here exactly as this one was. The
+        verdict is recomputed instead; what the cache still saves is the
+        footer read, which is what it is for.
+        """
+        reject_a_foreign_tenant(
+            ref, (item.metadata.tenant_id for item in cached.descriptors.values())
+        )
+        return cached.descriptors
 
     @staticmethod
     def _require_footer_match(
