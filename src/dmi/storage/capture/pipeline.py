@@ -632,6 +632,18 @@ class HostCapturePipeline:
                     raise PipelineFailedError("capture pipeline failed") from error
                 return False
 
+            # The barrier is queued, but the failure handler may have snapshotted
+            # `_pending_flush` before the publish above and then found the queue
+            # still open, leaving this barrier with nobody to complete it.  The
+            # publish happens-before this re-read, so seeing no error here proves
+            # the snapshot has not run yet and will see the barrier.
+            with self._lock:
+                error = self._error
+                if error is not None and self._pending_flush is pending:
+                    self._pending_flush = None
+            if error is not None:
+                raise PipelineFailedError("capture pipeline failed") from error
+
             remaining = (
                 None
                 if deadline is None

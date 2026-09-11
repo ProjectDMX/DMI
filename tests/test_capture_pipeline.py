@@ -716,3 +716,102 @@ def test_manual_flush_surfaces_worker_failure_without_hanging():
 
     with pytest.raises(PipelineFailedError, match="pipeline failed"):
         pipeline.close(timeout=2)
+
+
+def test_manual_flush_does_not_orphan_its_barrier_at_the_failure_seam(monkeypatch):
+    """The worker must not decide "no waiter" before flush() has published one.
+
+    ``flush`` reads ``_error``, then publishes its barrier, then enqueues it.
+    The failure handler snapshots ``_pending_flush``, then closes the queue.
+    Interleave the snapshot between flush's read and its publish and the
+    barrier is published to nobody: the handler has already concluded there is
+    no waiter, and the queue is still open, so the barrier is accepted onto a
+    queue whose only consumer has stopped draining it.
+
+    The window is a few bytecodes wide and unreachable unforced, so every step
+    here is gated on an event rather than on timing, and the flush timeout is
+    finite -- a regression must fail this assertion, never hang the suite.
+    """
+    from dmi.storage.capture import pipeline as pipeline_module
+
+    persist_entered = threading.Event()
+    persist_release = threading.Event()
+    barrier_parked = threading.Event()
+    barrier_resume = threading.Event()
+    barrier_enqueued = threading.Event()
+    close_entered = threading.Event()
+    close_release = threading.Event()
+
+    class _BlockingFailingSink:
+        def persist(self, ready):
+            persist_entered.set()
+            assert persist_release.wait(timeout=10)
+            raise OSError("sink unavailable")
+
+    class _ParkedBarrier(pipeline_module._FlushBarrier):
+        """Parks flush() between its ``_error`` read and the publish."""
+
+        def __init__(self, *args, **kwargs):
+            barrier_parked.set()
+            assert barrier_resume.wait(timeout=10)
+            super().__init__(*args, **kwargs)
+
+    pipeline = HostCapturePipeline(
+        _config(max_pack_records=1),
+        _BlockingFailingSink(),
+        pack_id_factory=_ids(),
+    )
+    queue = pipeline._queue
+    put_barrier = queue.put_barrier
+    close = queue.close
+
+    def announcing_put_barrier(barrier):
+        result = put_barrier(barrier)
+        barrier_enqueued.set()
+        return result
+
+    def parked_close():
+        # Parks the failure handler between its `_pending_flush` snapshot and
+        # the close that would have turned a later put_barrier into CLOSED.
+        close_entered.set()
+        assert close_release.wait(timeout=10)
+        close()
+
+    monkeypatch.setattr(pipeline_module, "_FlushBarrier", _ParkedBarrier)
+    monkeypatch.setattr(queue, "put_barrier", announcing_put_barrier)
+    monkeypatch.setattr(queue, "close", parked_close)
+
+    pipeline.start()
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+    assert persist_entered.wait(timeout=10)
+
+    outcome: list[object] = []
+
+    def flush_once():
+        try:
+            outcome.append(pipeline.flush(timeout=2))
+        except BaseException as exc:  # recorded, then asserted on below
+            outcome.append(exc)
+
+    flusher = threading.Thread(target=flush_once, name="orphan-flush")
+    flusher.start()
+    try:
+        # flush() has read `_error` (None) and is parked before the publish.
+        assert barrier_parked.wait(timeout=10)
+        # Fail the worker: it latches `_error` and snapshots no waiter.
+        persist_release.set()
+        assert close_entered.wait(timeout=10)
+        # Only now let flush() publish and enqueue onto the still-open queue.
+        barrier_resume.set()
+        assert barrier_enqueued.wait(timeout=10)
+    finally:
+        close_release.set()
+        flusher.join(timeout=10)
+
+    assert not flusher.is_alive()
+    # The barrier will never be drained, so flush must report the failure it
+    # can now observe instead of waiting out its timeout on a dead worker.
+    assert isinstance(outcome[0], PipelineFailedError), outcome
+
+    with pytest.raises(PipelineFailedError, match="pipeline failed"):
+        pipeline.close(timeout=10)
