@@ -111,3 +111,29 @@ class MonitoringConfig:
                 + ", ".join(repr(name) for name in backends)
                 + f"; got {self.storage_backend!r}"
             )
+        # ``capture_sink_config`` is read in exactly one place -- the
+        # engine's default-writer branch, which tests ``storage_backend ==
+        # "capture"`` literally. Nothing RESOLVES "auto" into "capture":
+        # "auto" is the pre-field behaviour, and it reaches that branch as
+        # "auto" and falls straight through. So under any other backend a
+        # configured sink is not merely unused, it is unreachable, and the
+        # engine's type check at the boundary passes a config that then
+        # writes no packs at all -- the silent no-op this field's own design
+        # note ("a mismatch becomes an error instead of a silent choice")
+        # exists to prevent.
+        #
+        # Deliberate behaviour change: a caller who passes the sink config
+        # with a non-capture backend gets a startup error where they used to
+        # get silence. That is the trade the note asks for -- the alternative
+        # is a run that captures nothing and says so nowhere.
+        if self.capture_sink_config is not None and (
+            self.storage_backend != "capture"
+        ):
+            raise ValueError(
+                "capture_sink_config configures the capture backend's "
+                "default pack writer and is read only when "
+                "storage_backend='capture'; got storage_backend="
+                f"{self.storage_backend!r}, under which it would be silently "
+                "ignored and nothing would be written. Set "
+                "storage_backend='capture', or drop capture_sink_config"
+            )
