@@ -262,11 +262,14 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
   out->committed_entries_ = 0;
   out->reserved_bytes_ = 0;
   out->reserved_entries_ = 0;
+  out->accounted_ready_.clear();
   out->inflight_temps_.clear();
   out->peak_bytes_ = 0;
   out->generation_ = 0;
   // Account pre-existing files exactly like the Python constructor: ready
-  // files plus stale .open files both count until Recover() runs.
+  // files plus stale .open files both count until Recover() runs, and only
+  // the ready PATHS are remembered (_accounted_ready = ready_bytes), so a
+  // later retry of one of them is recognised as already counted.
   for (const auto& entry :
        fs::recursive_directory_iterator(out->root_, ec)) {
     if (ec) break;
@@ -276,10 +279,34 @@ SpoolStatus Spool::Open(SpoolConfig config, Spool* out, std::string* error) {
     const bool is_open = HasSuffix(name, kOpenSuffix);
     if (!is_ready && !is_open) continue;
     out->committed_bytes_ += entry.file_size();
-    if (is_ready) ++out->committed_entries_;
+    if (is_ready) {
+      ++out->committed_entries_;
+      out->accounted_ready_.emplace(entry.path().string(), entry.file_size());
+    }
   }
   out->peak_bytes_ = out->committed_bytes_;
   return SpoolStatus::kOk;
+}
+
+bool Spool::AccountReadyLocked(const std::string& path,
+                               uint64_t object_bytes) {
+  if (accounted_ready_.count(path) != 0) return false;
+  accounted_ready_.emplace(path, object_bytes);
+  committed_bytes_ += object_bytes;
+  ++committed_entries_;
+  peak_bytes_ = std::max(peak_bytes_, committed_bytes_ + reserved_bytes_);
+  return true;
+}
+
+bool Spool::UnaccountReadyLocked(const std::string& path) {
+  const auto found = accounted_ready_.find(path);
+  if (found == accounted_ready_.end()) return false;
+  // Subtract what was RECORDED for this path, not what the caller believes it
+  // to be: the recorded value is the one that went into the aggregate.
+  if (committed_bytes_ >= found->second) committed_bytes_ -= found->second;
+  if (committed_entries_ > 0) --committed_entries_;
+  accounted_ready_.erase(found);
+  return true;
 }
 
 void Spool::SetStageHookForTesting(std::function<void()> hook) {
@@ -379,6 +406,7 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
         // reservation should have refused.
         uint64_t actual = 0;
         uint64_t ready_count = 0;
+        std::unordered_map<std::string, uint64_t> seen_ready;
         std::error_code walk_ec;
         for (const auto& entry :
              fs::recursive_directory_iterator(root_, walk_ec)) {
@@ -388,6 +416,7 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
           if (HasSuffix(name, kReadySuffix)) {
             actual += entry.file_size();
             ++ready_count;
+            seen_ready.emplace(entry.path().string(), entry.file_size());
           } else if (HasSuffix(name, kOpenSuffix) &&
                      inflight_temps_.count(entry.path().string()) == 0) {
             // Someone else's in-progress write (another process, or a
@@ -398,6 +427,9 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
         }
         committed_bytes_ = actual;
         committed_entries_ = ready_count;
+        // The path ledger is rebuilt with the aggregate it describes, so the
+        // two never disagree about which files the committed account holds.
+        accounted_ready_ = std::move(seen_ready);
         if (committed_bytes_ + reserved_bytes_ + n > max_bytes_) {
           if (error) {
             *error = "spool byte limit exceeded: " +
@@ -432,9 +464,15 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
     if (reserved_bytes_ >= n) reserved_bytes_ -= n;
     if (reserved_entries_ > 0) --reserved_entries_;
     inflight_temps_.erase(temp);
-    committed_bytes_ += n;
-    ++committed_entries_;
+    AccountReadyLocked(ready, n);
     ++generation_;
+  };
+  // The retry and EEXIST-loser paths both end on a ready file that already
+  // exists. Whether it costs anything depends on whether THIS object has
+  // counted that path before, which only the path ledger can answer.
+  auto account_existing = [&] {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (AccountReadyLocked(ready, n)) ++generation_;
   };
   auto fill_out = [&] {
     out->pack_id = pack_id;
@@ -468,9 +506,18 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
       if (error) *error = "spool contains different content: " + object_key;
       return SpoolStatus::kConflict;
     }
-    // A retry adds no accounting: the file was counted by the stage (or
-    // process start) that created it. Every successful retry still closes
-    // the durability window itself with a fresh fsync chain.
+    // A retry of a file THIS object created adds no accounting; a retry of
+    // one created by a second Spool object on the same root after this
+    // one's Open() adds its full size, because nothing here has counted it.
+    // Python makes exactly that distinction -- spool.py:124 runs the retry
+    // through _account_ready_locked, which is a no-op only for a path
+    // already in _accounted_ready. Adding nothing unconditionally judged the
+    // cap against 0: with max 1500, a 1000-byte file staged through another
+    // object and retried here still admitted another 1000.
+    //
+    // Every successful retry still closes the durability window itself with
+    // a fresh fsync chain.
+    account_existing();
     if (!FsyncChain(root_, dir, error)) return SpoolStatus::kIo;
     fill_out();
     return SpoolStatus::kOk;
@@ -493,15 +540,18 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
   }
   if (::link(temp.c_str(), ready.c_str()) != 0) {
     if (errno == EEXIST) {
-      // Lost the race: the winner's file is already counted (by its stage
-      // or by process start), so release this reservation, then validate
-      // the winner exactly like the retry path.
+      // Lost the race: release this reservation, then validate the winner
+      // exactly like the retry path. The winner's file is counted here only
+      // if this object has not counted that path already -- the winner may
+      // be another Spool object entirely, whose stage touched nothing in
+      // this account. Python does the same (spool.py:159).
       ::unlink(temp.c_str());
       unreserve();
       if (!validate_ready()) {
         if (error) *error = "spool contains different content: " + object_key;
         return SpoolStatus::kConflict;
       }
+      account_existing();
       // The winner may still be between link() and its own fsync: do not
       // acknowledge its dirent before independently making the chain
       // durable (mirrors the Python loser's fsync).
@@ -542,6 +592,7 @@ SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
   std::error_code ec;
   std::vector<std::string> readies;
   uint64_t bytes = 0;
+  std::unordered_map<std::string, uint64_t> seen_ready;
   for (const auto& entry :
        fs::recursive_directory_iterator(root_, ec)) {
     if (ec) break;
@@ -594,11 +645,16 @@ SpoolStatus Spool::Scan(std::vector<StagedPack>* out, bool discard_open_files,
     staged.object_bytes = size;
     out->push_back(std::move(staged));
     bytes += size;
+    seen_ready.emplace(path, size);
   }
   // Recovery rebuilds the committed account only; a stage in flight on
-  // another thread keeps its reservation.
+  // another thread keeps its reservation. The path ledger is rebuilt with
+  // it (_commit_recovery_locked does the same), so the surviving entries are
+  // exactly the ones a later retry will recognise as already counted, and
+  // the quarantined ones are simply absent.
   committed_bytes_ = bytes;
   committed_entries_ = out->size();
+  accounted_ready_ = std::move(seen_ready);
   peak_bytes_ = std::max(peak_bytes_, committed_bytes_ + reserved_bytes_);
   ++generation_;
   (void)error;
@@ -615,8 +671,12 @@ SpoolStatus Spool::Remove(const StagedPack& staged, std::string* error) {
         if (error) *error = "cannot inspect staged pack: " + ec.message();
         return SpoolStatus::kIo;
       }
-      // Removal retries must not release another pack's capacity. A stale
-      // count after an external removal is reconciled before refusing Stage.
+      // The file is already gone -- removed through another Spool object, or
+      // by an earlier call here. Drop it from this object's account only if
+      // this object was counting that PATH: a removal RETRY finds nothing
+      // recorded and costs nothing, so it cannot release another pack's
+      // capacity (which a blind subtraction did).
+      if (UnaccountReadyLocked(staged.path)) ++generation_;
       return SpoolStatus::kOk;
     }
     const std::string name = fs::path(staged.path).filename().string();
@@ -634,10 +694,13 @@ SpoolStatus Spool::Remove(const StagedPack& staged, std::string* error) {
       if (error) *error = "cannot remove staged pack: " + std::string(strerror(errno));
       return SpoolStatus::kIo;
     }
-    if (committed_bytes_ >= staged.object_bytes) {
-      committed_bytes_ -= staged.object_bytes;
-    }
-    if (committed_entries_ > 0) --committed_entries_;
+    // Uncount by PATH: the bytes that leave the aggregate are the ones this
+    // object recorded for it, and a path this object never counted (removed
+    // on behalf of another Spool object) costs nothing, exactly as
+    // _unaccount_ready_locked does. Uncounting by anything else would let a
+    // path stay in the ledger after its file is gone, and the next stage of
+    // the same pack would then be treated as already accounted.
+    UnaccountReadyLocked(staged.path);
     ++generation_;
     parent = fs::path(staged.path).parent_path().string();
   }

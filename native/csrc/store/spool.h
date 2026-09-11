@@ -19,6 +19,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -105,6 +106,19 @@ class Spool {
  private:
   SpoolStatus Scan(std::vector<StagedPack>* out, bool discard_open_files,
                   std::string* error);
+  // Count/uncount one ready path in the committed account, at most once each
+  // -- Python's _account_ready_locked / _unaccount_ready_locked. `mutex_`
+  // must be held. Both return whether they actually changed the account.
+  //
+  // The aggregate alone cannot decide this. A ready file reached by the retry
+  // or EEXIST-loser path may have been created by THIS object (already
+  // counted, so adding would double it) or by a second Spool object on the
+  // same root after this one's Open() (never counted, so adding nothing
+  // leaves the cap judged against 0 -- with max 1500, one 1000-byte file
+  // staged elsewhere then retried here left room for another 1000).
+  bool AccountReadyLocked(const std::string& path, uint64_t object_bytes);
+  bool UnaccountReadyLocked(const std::string& path);
+
   std::string root_;
   uint64_t max_bytes_ = 0;
   mutable std::mutex mutex_;
@@ -124,6 +138,15 @@ class Spool {
   uint64_t committed_entries_ = 0;
   uint64_t reserved_bytes_ = 0;
   uint64_t reserved_entries_ = 0;
+  // Which ready paths the committed account currently includes, and for how
+  // many bytes -- Python's _accounted_ready. It is what makes the accounting
+  // idempotent per PATH rather than per call, so the same ready file can be
+  // met more than once (retry, EEXIST loser, a scan) and be counted exactly
+  // once. Rebuilt wholesale wherever committed_* is. Stale .open bytes are
+  // in committed_bytes_ without being here, exactly as in Python's
+  // constructor, so this map is a ledger of ready paths, not a second copy
+  // of the aggregate.
+  std::unordered_map<std::string, uint64_t> accounted_ready_;
   std::unordered_set<std::string> inflight_temps_;
   uint64_t peak_bytes_ = 0;
   uint64_t generation_ = 0;
