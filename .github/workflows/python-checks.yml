@@ -248,8 +248,20 @@ jobs:
         # `python -m pytest`, matching the Makefile. `not garage` drops the one
         # suite that also needs a Garage S3 endpoint; everything else under
         # these markers needs nothing but the server above.
+        #
+        # The whole `tests` tree, selected BY MARKER -- not `tests/*_live.py`.
+        # A filename glob makes the naming convention load-bearing: a new
+        # `manual`/`clickhouse` test written as `test_..._e2e.py` is not
+        # collected, and the skip gate below cannot catch it, because
+        # uncollected is not skipped -- it is the exact silent-green this job
+        # exists to end. Measured before widening: the marker expression alone
+        # over `tests/` selects 199 tests in 9 files, which is byte for byte
+        # what the glob selected, so nothing expensive or needing another
+        # service is pulled in. Collecting the tree costs ~2s and is what the
+        # cpu job above already does (`pytest -m cpu`, no path), on the same
+        # image and the same dependency set, so the imports are proven.
         run: |
-          python -m pytest tests/*_live.py -m "clickhouse and manual and not garage" \
+          python -m pytest tests -m "clickhouse and manual and not garage" \
             -q --junit-xml=live-results.xml
 
       - name: Fail if any live test was skipped
