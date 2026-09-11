@@ -370,6 +370,65 @@ def test_mixed_batch_reports_oversized_pack_at_its_position(fake_s3, tmp_path):
         store.close()
 
 
+def test_a_pack_conflict_reports_why_it_will_not_overwrite(fake_s3, tmp_path):
+    """The one non-retryable failure must reach the caller as WORDS.
+
+    A different object already at the key is the only outcome that means
+    "someone else's immutable object is here, do not overwrite". UploadOne
+    composed that diagnostic into `last_error` and then returned straight
+    out of the loop, skipping the `*error = last_error` at the end of the
+    function -- so UploadPending recorded the failure with an empty error
+    string and an attempt count of zero, and an operator saw a pack that
+    had simply stopped uploading for no stated reason.
+    """
+    sink = DriverSession(SINK_DRIVER)
+    store = DriverSession(STORE_DRIVER)
+    try:
+        spool_root = tmp_path / "spool"
+        staged = _stage(sink, spool_root, 7)
+        # A DIFFERENT object at this key: neither its size nor its
+        # dmi-sha256 agrees with the staged pack.
+        squatter = b"someone else's pack" * 7
+        assert squatter != Path(staged["path"]).read_bytes()
+        put = _store_call(
+            "put", **_client_base(fake_s3), key=staged["object_key"],
+            data_b64=base64.b64encode(squatter).decode(),
+            metadata={"dmi-format": "dmi-pack-v1", "dmi-sha256": "ab" * 32},
+            content_type="application/vnd.dmi.pack",
+        )
+        assert put["ok"], put
+        puts_before = sum(
+            1 for c in STATE.calls
+            if c["method"] == "PUT" and staged["object_key"] in c["path"]
+        )
+
+        result = _upload_pending(store, fake_s3, spool_root)
+        assert result["ok"], result
+        assert result["snapshot"]["failed_packs"] == 1
+        assert result["snapshot"]["uploaded_packs"] == 0
+        failure = result["failures"][0]
+        assert failure["pack_id"] == staged["pack_id"], failure
+        assert failure["object_key"] == staged["object_key"], failure
+        assert "pack conflict" in failure["error"], failure
+        assert staged["object_key"] in failure["error"], failure
+        assert "do not overwrite" in failure["error"], failure
+        # Counted like every other attempted failure: the HEAD that found
+        # the conflict was an attempt, and it is not retried.
+        assert failure["attempts"] == 1, failure
+
+        # The refusal is real: nothing was written over the existing object,
+        # and the staged pack is still there to inspect.
+        puts_after = sum(
+            1 for c in STATE.calls
+            if c["method"] == "PUT" and staged["object_key"] in c["path"]
+        )
+        assert puts_after == puts_before
+        assert Path(staged["path"]).exists()
+    finally:
+        sink.close()
+        store.close()
+
+
 def test_uploader_head_to_head_with_python_reference(fake_s3, tmp_path):
     """Same staged bytes through both uploaders; identical objects land.
 
