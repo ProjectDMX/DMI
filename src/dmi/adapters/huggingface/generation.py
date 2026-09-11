@@ -409,6 +409,23 @@ def generate_with_monitoring_dict(
 # generate_greedy_with_monitoring (manual prefill + decode loop)
 # ---------------------------------------------------------------------------
 
+def _eos_id_tensor(eos_token_id: Any, *, device: Any, dtype: Any) -> Any:
+    """Normalise every documented ``eos_token_id`` spelling to a 1-D tensor.
+
+    The adapter this module forwards into accepts ``int``, ``list[int]`` or
+    ``torch.Tensor`` (see ``HuggingFaceAdapter``), and a list is what
+    ``generation_config.eos_token_id`` holds for Qwen and Llama-3. Comparing a
+    token against the raw value with ``!=``/``==`` only works for the scalar
+    case: torch returns a plain Python ``bool`` for ``tensor != list`` -- no
+    broadcast, no error -- so the ``.long()`` and ``.nonzero()`` that follow
+    were called on a ``bool``. Normalising once here lets both sites use
+    ``torch.isin``, which is elementwise over the batch for every spelling.
+    """
+    if eos_token_id is None:
+        return None
+    return torch.as_tensor(eos_token_id, dtype=dtype, device=device).reshape(-1)
+
+
 def generate_greedy_with_monitoring(
     model: Any,
     input_ids: Any,
@@ -444,11 +461,20 @@ def generate_greedy_with_monitoring(
         attention_mask: [B, seq_len] attention mask on CUDA.
         max_new_tokens: maximum tokens to generate.
         min_new_tokens: minimum tokens before EOS can stop generation.
-        eos_token_id: EOS token ID.  None = never stop early.
+        eos_token_id: EOS token ID(s).  Accepts ``int``, ``list[int]`` or
+            ``torch.Tensor``, matching the ``HuggingFaceAdapter``
+            argument this is forwarded to and the list form
+            ``generation_config.eos_token_id`` holds for Qwen and
+            Llama-3.  None = never stop early.
         pad_token_id: pad token ID (unused, kept for compat).
         logits_to_keep: 0 = all rows, 1 = last position only.
         cuda_graphs: if True, compile decode step with reduce-overhead +
             StaticCache.  If False, use HF default DynamicCache, no compile.
+            NOTE: the compiled decode step is not given an attention mask --
+            a per-step-growing mask would change shape every step and defeat
+            CUDA-graph capture -- so left-padded batches are only correct on
+            the eager path (``cuda_graphs=False``).  Right-padded or unpadded
+            batches are unaffected.
         monitoring: if True, install ring transport hooks via HuggingFaceAdapter and
             call before_forward_manual before each forward pass.
         hook_selection: hook selection preset (e.g. "hidden-states", "full").
@@ -468,6 +494,8 @@ def generate_greedy_with_monitoring(
     """
     device = input_ids.device
     B, Pmax = input_ids.shape
+    # argmax yields int64, so the ids are compared as int64 on both sides.
+    eos_ids = _eos_id_tensor(eos_token_id, device=device, dtype=torch.long)
 
     _wants_position_ids = (
         "position_ids" in inspect.signature(model.forward).parameters
@@ -587,8 +615,23 @@ def generate_greedy_with_monitoring(
                     torch.compiler.cudagraph_mark_step_begin()
                     out = compiled_decode(token, cache, cache_pos)
                 else:
+                    # The mask has to grow with the cache. Without it HF
+                    # builds an all-ones causal mask over the whole cache, so
+                    # a left-padded row attends to its own pad positions' K/V
+                    # and the greedy tokens diverge from model.generate().
+                    # Measured on a real model: supplying this restores exact
+                    # parity, and correcting position_ids alone does not.
+                    # All-ones on the right because every generated position
+                    # is real; the prompt columns keep the caller's padding.
+                    decode_mask = torch.cat(
+                        [attention_mask,
+                         torch.ones(B, step + 1, device=device,
+                                    dtype=attention_mask.dtype)],
+                        dim=1,
+                    )
                     decode_kwargs: Dict[str, Any] = {
                         "input_ids": token,
+                        "attention_mask": decode_mask,
                         "past_key_values": cache,
                         "use_cache": True,
                         "output_hidden_states": False,
@@ -617,10 +660,10 @@ def generate_greedy_with_monitoring(
                 all_generated.append(token.squeeze(-1))
 
                 tokens_generated = step + 2
-                if (eos_token_id is not None
+                if (eos_ids is not None
                         and tokens_generated > min_new_tokens):
                     unfinished_sequences = unfinished_sequences & (
-                        token.squeeze(-1) != eos_token_id).long()
+                        ~torch.isin(token.squeeze(-1), eos_ids)).long()
                 this_peer_finished = unfinished_sequences.max() == 0  # GPU->CPU sync
 
                 if do_timing:
@@ -643,11 +686,12 @@ def generate_greedy_with_monitoring(
             timings.prefill_tokens = Pmax
 
         generated_ids = torch.stack(all_generated, dim=1).cpu()
+        eos_ids_cpu = None if eos_ids is None else eos_ids.cpu()
         results: List[Any] = []
         for b in range(B):
             seq = generated_ids[b]
-            if eos_token_id is not None:
-                eos_positions = (seq == eos_token_id).nonzero(as_tuple=False)
+            if eos_ids_cpu is not None:
+                eos_positions = torch.isin(seq, eos_ids_cpu).nonzero(as_tuple=False)
                 if len(eos_positions) > 0:
                     seq = seq[:int(eos_positions[0].item()) + 1]
             results.append(seq)

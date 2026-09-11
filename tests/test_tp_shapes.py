@@ -1,5 +1,7 @@
 """Unit tests for tensor-parallel hook shape computation."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -20,7 +22,11 @@ from dmi.hooks.specs import (
     HOOK_TYPE_RESID_FINAL,
     HOOK_TYPE_RESID_MID,
     HOOK_TYPE_RESID_PRE,
+    HOOK_TYPE_ROUTER_LOGITS,
+    HOOK_TYPE_TO_SHORT_NAME,
     HOOK_TYPE_TOKEN_IDS,
+    HOOK_TYPE_TOPK_IDS,
+    HOOK_TYPE_TOPK_WEIGHTS,
     HOOK_TYPE_V,
     HOOK_TYPE_Z,
     ModelShapeConfig,
@@ -217,3 +223,81 @@ class TestCapacityReduction:
         b1 = self._bytes_for_hook(HOOK_TYPE_ATTN_OUT, 1)
         b2 = self._bytes_for_hook(HOOK_TYPE_ATTN_OUT, 2)
         assert b2 == b1  # not sharded
+
+
+# --------------------------------------------------------------------------
+# final_logits row count and the zero-config degenerate returns
+#
+# The batched (batch > 0) final_logits branch caps logits_to_keep at q_len,
+# while the packed branch (batch == 0) treats logits_to_keep as the request
+# count and never clamps it against q_len.  The "unknown dimension" configs
+# (vocab_size / intermediate_dim / num_experts / top_k == 0) must yield an
+# empty shape so the caller skips pushing meta for that hook.
+# --------------------------------------------------------------------------
+
+_VOCAB = _cfg(1).vocab_size  # 151936 for the Qwen3-0.6B-like config above
+
+
+class TestFinalLogitsRows:
+    """Row count of the final_logits shape in both batch conventions."""
+
+    def test_final_logits_batched_caps_logits_to_keep_at_q_len(self):
+        """logits_to_keep > q_len must clamp to q_len, not overrun the step."""
+        assert compute_hook_shape(
+            HOOK_TYPE_FINAL_LOGITS, _cfg(1), 2, 1, 0, logits_to_keep=4
+        ) == [2, 1, _VOCAB]
+
+    def test_final_logits_batched_below_q_len_and_zero(self):
+        """Below the cap logits_to_keep wins; 0 means "all q_len rows"."""
+        assert compute_hook_shape(
+            HOOK_TYPE_FINAL_LOGITS, _cfg(1), 2, 8, 0, logits_to_keep=1
+        ) == [2, 1, _VOCAB]
+        assert compute_hook_shape(
+            HOOK_TYPE_FINAL_LOGITS, _cfg(1), 2, 8, 0, logits_to_keep=0
+        ) == [2, 8, _VOCAB]
+
+    def test_final_logits_packed_uses_request_count(self):
+        """Packed layout: dim 0 is the request count, with no batch dim."""
+        assert compute_hook_shape(
+            HOOK_TYPE_FINAL_LOGITS, _cfg(1), 0, 10, 0, logits_to_keep=3
+        ) == [3, _VOCAB]
+        assert compute_hook_shape(
+            HOOK_TYPE_FINAL_LOGITS, _cfg(1), 0, 10, 0, logits_to_keep=0
+        ) == [10, _VOCAB]
+
+    def test_final_logits_empty_without_vocab_size(self):
+        """vocab_size unknown -> empty shape in both batch conventions."""
+        cfg = replace(_cfg(1), vocab_size=0)
+        assert compute_hook_shape(
+            HOOK_TYPE_FINAL_LOGITS, cfg, 0, 10, 0, logits_to_keep=3
+        ) == []
+        assert compute_hook_shape(
+            HOOK_TYPE_FINAL_LOGITS, cfg, 2, 4, 0, logits_to_keep=1
+        ) == []
+
+
+class TestUnknownDimensionsGiveEmptyShape:
+    """Hooks whose trailing dim is not in the config are skipped."""
+
+    def test_mlp_post_empty_when_intermediate_dim_unknown(self):
+        cfg = replace(_cfg(1), intermediate_dim=0)
+        assert compute_hook_shape(HOOK_TYPE_MLP_POST, cfg, 0, 10, 0) == []
+
+    def test_routing_shapes_empty_when_moe_config_missing(self):
+        moe = replace(_cfg(1), num_experts=8, top_k=2)
+        # Positive batched cases (plain-CPU coverage; the MoE routing-hook
+        # suite that also covers these needs the Transformers fork).
+        assert compute_hook_shape(HOOK_TYPE_ROUTER_LOGITS, moe, 2, 5, 0) == [2, 5, 8]
+        assert compute_hook_shape(HOOK_TYPE_TOPK_IDS, moe, 2, 5, 0) == [2, 5, 2]
+        assert compute_hook_shape(HOOK_TYPE_TOPK_WEIGHTS, moe, 2, 5, 0) == [2, 5, 2]
+        # Degenerate configs.
+        no_experts = replace(moe, num_experts=0)
+        assert compute_hook_shape(HOOK_TYPE_ROUTER_LOGITS, no_experts, 2, 5, 0) == []
+        no_top_k = replace(moe, top_k=0)
+        assert compute_hook_shape(HOOK_TYPE_TOPK_IDS, no_top_k, 2, 5, 0) == []
+        assert compute_hook_shape(HOOK_TYPE_TOPK_WEIGHTS, no_top_k, 2, 5, 0) == []
+
+    def test_unknown_hook_type_returns_empty_shape(self):
+        """An unregistered hook type falls through to the empty shape."""
+        unknown = max(HOOK_TYPE_TO_SHORT_NAME) + 1
+        assert compute_hook_shape(unknown, _cfg(1), 0, 4, 0) == []

@@ -296,9 +296,13 @@ class _RecordingStore(FilesystemPackStore):
     def __init__(self, root: Path, *, store_id: str):
         super().__init__(root, store_id=store_id)
         self.ranges = []
+        # Same reads as ``ranges``, but tagged with the pack they hit, so a
+        # test spanning several packs can attribute a range to one of them.
+        self.reads = []
 
     def read_range(self, ref, offset, length):
         self.ranges.append((offset, length))
+        self.reads.append((ref.pack_id, offset, length))
         return super().read_range(ref, offset, length)
 
 
@@ -695,6 +699,57 @@ def test_the_footer_cache_evicts_its_least_recent_pack(tmp_path: Path):
     reader.hydrate(selection, byte_limit=1 << 20)
 
     assert len(reader._footer_cache) == 1
+
+
+def test_the_footer_cache_evicts_to_stay_inside_its_byte_budget(tmp_path: Path):
+    """Eviction is driven by the byte budget, not only by the pack count.
+
+    The oversized-entry guard only rejects a footer bigger than the whole
+    budget; three individually admissible footers overflowing it cumulatively
+    is a separate case, and only the byte disjunct of the eviction loop
+    handles it.
+    """
+    store = FilesystemPackStore(tmp_path, store_id="local")
+    descriptors = []
+    refs = []
+    sealed_packs = []
+    for index, capture_id in enumerate(
+        ("capture-a", "capture-b", "capture-c"), start=1
+    ):
+        writer = PackWriter(
+            pack_id=UUID(int=index),
+            created_at_ns=1_700_000_000_000_000_000,
+            max_pack_bytes=1024 * 1024,
+        )
+        writer.append(_record(capture_id, b"\x00" * 8, step=index))
+        sealed = writer.seal()
+        ref = store.put(sealed, f"packs/{index}.dmi-pack")
+        sealed_packs.append(sealed)
+        refs.append(ref)
+        descriptors.extend(
+            PackReader.from_bytes(sealed.data).descriptors(
+                store_id=ref.store_id, object_key=ref.object_key
+            )
+        )
+    footer_bytes = _footer_read_bytes(sealed_packs[0])
+    assert [_footer_read_bytes(item) for item in sealed_packs] == [footer_bytes] * 3
+
+    reader = CaptureReader(_Catalog(tuple(descriptors)), {"local": store})
+    # Leave the count limit alone: if it could not hold all three packs, this
+    # test would be re-testing count eviction instead of the byte budget.
+    assert reader._footer_cache_limit >= 3
+    reader._footer_cache_bytes_limit = 2 * footer_bytes
+    selection = reader.select(CaptureQuery(limit=10))
+
+    reader.hydrate(selection, byte_limit=1 << 20)
+
+    assert len(reader._footer_cache) == 2
+    assert reader._footer_cache_bytes == 2 * footer_bytes
+    assert reader._footer_cache_bytes <= reader._footer_cache_bytes_limit
+    # The oldest pack was evicted; the two most recent survive in LRU order.
+    assert list(reader._footer_cache) == [
+        (ref.store_id, ref.pack_id, ref.checksum) for ref in refs[1:]
+    ]
 
 
 def test_verify_pack_source_checks_the_stream_against_its_own_checksum():
@@ -1319,3 +1374,94 @@ def test_verify_pack_source_still_hashes_a_verified_source():
 
     with pytest.raises(PackIntegrityError, match="checksum"):
         verify_pack_source(tampered)
+
+
+def test_a_footer_cache_hit_refreshes_recency_so_the_cold_pack_is_evicted(
+    tmp_path: Path,
+):
+    """A cache *hit* must promote its entry, or the LRU degrades to FIFO.
+
+    ``test_the_footer_cache_evicts_to_stay_inside_its_byte_budget`` only ever
+    hydrates each pack once, so insertion order and recency order coincide
+    there and the hit path is never exercised. Here pack ``a`` is re-read
+    while resident: recency must then rank it above ``b``, so admitting ``c``
+    evicts ``b`` and leaves ``a`` cached. Without the promotion on the hit,
+    ``a`` would be the eviction victim and the next hydration of ``a`` would
+    pay the trailer+footer round trip again -- a cache that discards the
+    entries it just proved hot.
+    """
+    store = _RecordingStore(tmp_path, store_id="local")
+    descriptors = []
+    keys: dict[str, tuple[str, str, str]] = {}
+    trailer_ranges: dict[str, tuple[str, int, int]] = {}
+    footer_sizes = []
+    for index, name in enumerate(("a", "b", "c"), start=1):
+        writer = PackWriter(
+            pack_id=UUID(int=index),
+            created_at_ns=1_700_000_000_000_000_000,
+            max_pack_bytes=1024 * 1024,
+        )
+        # A distinct model_id per pack lets CaptureQuery(model_id=...) select
+        # exactly one pack, so each hydration touches one footer.
+        writer.append(
+            CaptureRecord(
+                metadata=replace(
+                    _metadata(f"capture-{name}", step=index),
+                    model_id=f"model-{name}",
+                ),
+                payload=b"\x00" * 8,
+            )
+        )
+        sealed = writer.seal()
+        ref = store.put(sealed, f"packs/{name}.dmi-pack")
+        keys[name] = (ref.store_id, ref.pack_id, ref.checksum)
+        trailer_ranges[name] = (
+            ref.pack_id,
+            len(sealed.data) - PackIndex.trailer_size(),
+            PackIndex.trailer_size(),
+        )
+        footer_sizes.append(_footer_read_bytes(sealed))
+        descriptors.extend(
+            PackReader.from_bytes(sealed.data).descriptors(
+                store_id=ref.store_id, object_key=ref.object_key
+            )
+        )
+
+    reader = CaptureReader(_Catalog(tuple(descriptors)), {"local": store})
+    reader._footer_cache_limit = 2
+    # The count limit must be the binding constraint: if the byte budget bit
+    # first this would be re-testing byte eviction instead of hit recency.
+    assert reader._footer_cache_bytes_limit >= sum(footer_sizes)
+
+    def hydrate(name: str) -> None:
+        selection = reader.select(CaptureQuery(model_id=f"model-{name}", limit=10))
+        assert selection.capture_ids == (f"capture-{name}",)
+        reader.hydrate(selection, byte_limit=1 << 20)
+
+    def trailer_reads(name: str) -> int:
+        return store.reads.count(trailer_ranges[name])
+
+    hydrate("a")
+    hydrate("b")
+    assert list(reader._footer_cache) == [keys["a"], keys["b"]]
+    assert trailer_reads("a") == 1
+
+    hydrate("a")
+
+    # The second hydration of "a" was served from the cache ...
+    assert trailer_reads("a") == 1
+    # ... and the hit moved "a" to the most-recent end, ahead of "b".
+    assert list(reader._footer_cache) == [keys["b"], keys["a"]]
+
+    hydrate("c")
+
+    # Admitting "c" evicts the now-coldest pack "b", not the freshly hit "a".
+    assert list(reader._footer_cache) == [keys["a"], keys["c"]]
+    assert trailer_reads("b") == 1
+    assert trailer_reads("c") == 1
+
+    hydrate("a")
+
+    # "a" survived, so it still costs no metadata round trip.
+    assert trailer_reads("a") == 1
+    assert list(reader._footer_cache) == [keys["c"], keys["a"]]

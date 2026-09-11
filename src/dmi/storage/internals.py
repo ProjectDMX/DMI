@@ -50,6 +50,37 @@ def _request_sort_key(request_id: str) -> tuple:
     return tuple(key)
 
 
+def _ordered_chunks(chunks: list, *, act_name: str, request_id: str) -> list:
+    """One request's chunks in token order, refusing a duplicate start token.
+
+    Sorting ``(start_token, tensor)`` pairs without an explicit key makes
+    Python fall through to comparing the TENSORS whenever two starts tie --
+    which raises "Boolean value of Tensor with more than one value is
+    ambiguous" for a normal payload, and, worse, compares fine for a
+    one-element payload and silently concatenates the two colliding captures.
+
+    A tie means the same (request, layer, start) arrived twice, which in
+    practice means two TP shards: ``filter_by_tp_rank`` deliberately keeps
+    sharded hooks on every rank, and all ranks write one table with
+    ``shard_rank`` telling the rows apart. Reassembling along the token axis
+    cannot merge shards -- they are the same tokens, not more of them -- so
+    refusing is the only correct answer. The caller picks a ``shard_rank``,
+    exactly as the repo's own comparison tooling does.
+    """
+    starts = [start for start, _ in chunks]
+    if len(set(starts)) != len(starts):
+        duplicated = sorted({s for s in starts if starts.count(s) > 1})
+        raise RuntimeError(
+            f"{act_name}: duplicate capture chunks for request {request_id!r} "
+            f"at start token(s) {duplicated} -- the same tokens were captured "
+            "more than once, which usually means rows from several TP ranks "
+            "(distinguished by shard_rank) or from separate runs sharing one "
+            "model_id. Reassembly cannot merge them along the token axis; "
+            "select a single shard_rank before reading."
+        )
+    return [tensor for _, tensor in sorted(chunks, key=lambda chunk: chunk[0])]
+
+
 def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
     """Reassemble a per-layer hook (residual stream, mlp, ...).
 
@@ -58,13 +89,18 @@ def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
     Group by layer, concatenate each request's chunks along the token axis, then
     left-pad-stack the requests. Returns a tuple ordered by layer."""
     layers: dict[int, dict[str, list]] = {}
+    # key[2] is the act_name; every row here belongs to one act by construction.
+    act_name = rows[0][0][2] if rows else "<unknown act>"
     for key, tensor in rows:
         layers.setdefault(key[3], {}).setdefault(key[1], []).append((key[5], tensor))
     out = []
     for layer in sorted(layers):
         per_request = [
-            torch.cat([t for _, t in sorted(chunks)], dim=0)
-            for _, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
+            torch.cat(
+                _ordered_chunks(chunks, act_name=act_name, request_id=request_id),
+                dim=0,
+            )
+            for request_id, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
         ]
         out.append(_left_pad_stack(per_request))
     return tuple(out)
@@ -96,10 +132,10 @@ def _reassemble_attention_per_layer(rows: list, act_name: str) -> tuple[torch.Te
     for layer in sorted(layers):
         per_request = [
             merge_segments(
-                [t for _, t in sorted(chunks)],
+                _ordered_chunks(chunks, act_name=act_name, request_id=request_id),
                 act_name,
             )
-            for _, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
+            for request_id, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
         ]
         out.append(_left_pad_stack_attention(per_request))
     return tuple(out)
@@ -114,11 +150,15 @@ def _attention_reassembler(act_name: str):
 def _reassemble_global(rows: list) -> torch.Tensor:
     """Reassemble a non-layered field into [batch, seq, ...]."""
     requests: dict[str, list] = {}
+    act_name = rows[0][0][2] if rows else "<unknown act>"
     for key, tensor in rows:
         requests.setdefault(key[1], []).append((key[5], tensor))
     per_request = [
-        torch.cat([t for _, t in sorted(chunks)], dim=0)
-        for _, chunks in sorted(requests.items(), key=lambda item: _request_sort_key(item[0]))
+        torch.cat(
+            _ordered_chunks(chunks, act_name=act_name, request_id=request_id),
+            dim=0,
+        )
+        for request_id, chunks in sorted(requests.items(), key=lambda item: _request_sort_key(item[0]))
     ]
     if per_request[0].ndim == 1:
         seq = max(t.shape[0] for t in per_request)

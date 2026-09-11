@@ -15,6 +15,7 @@ import torch
 
 from ..base import BackendAdapter
 from ..types import StepContext
+from ...hooks.dispatch import uninstall_ring_hooks
 from ...hooks.specs import (
     HookSpec,
     ModelShapeConfig,
@@ -329,6 +330,16 @@ class HuggingFaceAdapter(BackendAdapter):
             model._monitoring_orig_prepare = None
         if self._orig_prepare is not None:
             self._orig_prepare = None
+        # Disarm before dropping the spec list, or the hooks stay armed with
+        # nothing left pointing at them. HookPoints are structural members of
+        # the model, so they outlive this call: without this, the next
+        # ordinary forward on the same model launches producer kernels with no
+        # prepare_step reservation and an empty meta FIFO, and those strays
+        # then consume the NEXT monitored step's metas. This method runs from
+        # a `finally` after every monitored generate, so that next forward is
+        # an ordinary part of the workflow, not an edge case.
+        uninstall_ring_hooks(self.active_specs)
+        self.active_specs = []
         if self.transport is not None:
             self.transport._using_forward_hooks = False
             self.transport._active_specs = []

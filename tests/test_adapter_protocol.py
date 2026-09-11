@@ -386,3 +386,35 @@ def test_register_preset_adds_new_name():
     finally:
         # Clean up so the test doesn't pollute the global preset table.
         selection._HOOK_SELECTIONS.pop(name, None)
+
+
+def test_resolve_hook_selection_refuses_an_unknown_token_and_an_empty_selection():
+    """A typo'd or empty hook_selection= must refuse, never select silently.
+
+    resolve_hook_selection sits on the attach line (adapters/base.py ->
+    selection.select_hook_specs -> resolve_hook_selection), so a token that
+    resolves to a default instead of raising would silently enable hooks the
+    caller never asked for.
+    """
+    from dmi.hooks import selection
+
+    # An unknown token refuses even when another token in the same string
+    # resolved fine -- no partial-union fallback.
+    with pytest.raises(
+        ValueError, match="Unknown hook selection 'hidden_statez'"
+    ) as unknown:
+        selection.resolve_hook_selection("hidden-states,hidden_statez")
+    message = str(unknown.value)
+    assert "Available:" in message
+    # The refusal must name the legal choices so a typo is fixable.
+    assert "'hidden-states'" in message
+    assert "'full'" in message
+
+    # Only separators/whitespace: every token is skipped, so the union is
+    # empty and that must refuse rather than return an empty frozenset.
+    with pytest.raises(ValueError, match="Empty hook selection"):
+        selection.resolve_hook_selection(" , ")
+
+    # The refusal propagates through the attach-path entry point.
+    with pytest.raises(ValueError, match="Unknown hook selection"):
+        selection.select_hook_specs([], "nope")
