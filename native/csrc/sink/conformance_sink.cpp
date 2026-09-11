@@ -13,11 +13,14 @@
 //   {"op":"snapshot"} -> {"ok":true,"snapshot":{...}}
 //   {"op":"object_key","tenant_id":"...","session_id":"...","producer_rank":N,
 //    "captured_at_ns":N,"pack_id":"..."} -> {"ok":true,"object_key":"..."}
+//   {"op":"parse_metadata","metadata_json":"..."}
+//     -> {"ok":true,"hook_name_hex":"..."}
 // Errors: {"ok":false,"what":"..."}.
 
 #include "pack_sink.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -231,6 +234,38 @@ int main() {
       std::string out = "{\"ok\":true,\"object_key\":";
       jc::EscapeJson(key, &out);
       std::cout << out << "}\n";
+      continue;
+    }
+    if (op == "parse_metadata") {
+      // Sessionless like `object_key`: the row path's metadata decoder alone,
+      // handing hook_name back as RAW BYTES in hex.
+      //
+      // Why the bytes, and why not read them off a staged pack: the footer
+      // writer decodes each UTF-8 sequence and re-emits \uXXXX
+      // (pack_builder.cpp, EncodeJsonString), which is an exact inverse of
+      // this decoder. A broken CESU-8 surrogate pair written by the decoder
+      // comes back out of the footer as a correct 😀 that
+      // json.loads recombines, so every assertion made on a hook_name read
+      // back through the pack holds whether or not the decoder combines --
+      // the surrogate tests passed with the combine branch disabled. These
+      // bytes never meet that serializer, so they can tell the two apart.
+      dmi_pack::RecordMetadata metadata;
+      std::string error;
+      if (!dmi_sink::ParseMetadataJson(jc::FindString(line, "metadata_json"),
+                                       &metadata, &error)) {
+        std::string out = "{\"ok\":false,\"what\":";
+        jc::EscapeJson(error, &out);
+        std::cout << out << "}\n";
+        continue;
+      }
+      std::string hex;
+      for (const char byte : metadata.hook_name) {
+        char buf[3];
+        std::snprintf(buf, sizeof(buf), "%02x",
+                      static_cast<unsigned>(static_cast<unsigned char>(byte)));
+        hex.append(buf, 2);
+      }
+      std::cout << "{\"ok\":true,\"hook_name_hex\":\"" << hex << "\"}\n";
       continue;
     }
     if (!sink) {

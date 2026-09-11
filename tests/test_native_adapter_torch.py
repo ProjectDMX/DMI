@@ -316,10 +316,26 @@ def test_a_fractional_shape_dimension_is_refused_not_truncated(tmp_path):
     assert sink.snapshot()["submitted_records"] == 0
 
 
-def test_a_non_bmp_hook_name_round_trips(tmp_path):
+@pytest.mark.parametrize("hook_name", [
+    "block\U0001F600",
+    # Exactly 512 UTF-8 bytes -- the limit _validate_text and ValidText both
+    # apply. This is the case the round-trip above cannot see: reading the
+    # name back off the pack proves nothing, because the footer writer decodes
+    # each UTF-8 sequence and re-emits \uXXXX, so a decoder that left the
+    # surrogate pair as two three-byte CESU-8 sequences produced a footer
+    # holding exactly the same 😀 a correct decoder does, and
+    # json.loads recombined it either way (measured: this test passed with the
+    # combine branch compiled out). The BYTE COUNT does differ -- 514 against
+    # 512 -- so at the limit the broken decoder is refused outright as
+    # "invalid capture metadata" where Python admits the record.
+    "b" * 508 + "\U0001F600",
+])
+def test_a_non_bmp_hook_name_round_trips(tmp_path, hook_name):
     """json.dumps writes U+1F600 as a surrogate pair; the sink must combine it."""
     meta = _meta(0)
-    meta["hook_name"] = "block\U0001F600"
+    meta["hook_name"] = hook_name
+    # The oracle admits both, so native must too.
+    assert CaptureMetadata.from_mapping(meta).hook_name == hook_name
     row = _row(meta, 0, 64, "float32")
     assert "\\ud83d\\ude00" in row["metadata_json"]
     sink, lease = _make_sink(tmp_path)
@@ -327,7 +343,7 @@ def test_a_non_bmp_hook_name_round_trips(tmp_path):
     assert sink.flush_and_wait(30.0)
     sink.rethrow_if_failed()
     ((staged, _),) = _read_staged(tmp_path)
-    assert staged.hook_name == "block\U0001F600"
+    assert staged.hook_name == hook_name
 
 
 def test_the_sink_derives_from_the_engines_record_sink(tmp_path):

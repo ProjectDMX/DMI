@@ -1124,17 +1124,29 @@ def _read_staged_metadata(root):
 @pytest.mark.parametrize("hook_name", ["block\U0001F600", "block中文"])
 def test_a_non_bmp_identifier_survives_the_metadata_decoder(sink, tmp_path,
                                                              hook_name):
-    """A surrogate pair is ONE code point; the BMP name is the control."""
+    """A surrogate pair is ONE code point; the BMP name is the control.
+
+    The assertion that matters is on the DECODER's bytes, taken straight out
+    of `parse_metadata` before anything re-serializes them. Reading hook_name
+    back off the staged pack cannot see this bug at all: the footer writer
+    decodes each UTF-8 sequence and re-emits \\uXXXX, so the decoder's broken
+    CESU-8 (ED A0 BD ED B8 80) is written back out as a correct \\ud83d\\ude00
+    pair that json.loads recombines into 😀. Measured -- both this test and
+    test_native_adapter_torch's round-trip passed with the surrogate combine
+    branch compiled out.
+    """
     _open(sink, tmp_path / "spool")
     metadata = _row_meta(0, dtype="uint8", shape=[64], hook_name=hook_name)
     assert "\\ud83d\\ude00" in metadata or "\\u4e2d" in metadata, metadata
+    decoded = sink.call(op="parse_metadata", metadata_json=metadata)
+    assert decoded["ok"], decoded
+    assert decoded["hook_name_hex"] == hook_name.encode("utf-8").hex()
     response = _submit_row(sink, metadata, bytes(64), "uint8", [64])
     assert response["ok"], response
     assert sink.call(op="flush", timeout=30)["ok"]
     assert sink.call(op="close", timeout=30)["snapshot"]["persisted_records"] == 1
     (staged,) = _read_staged_metadata(tmp_path / "spool")
     assert staged.hook_name == hook_name
-    assert staged.hook_name.encode("utf-8") == hook_name.encode("utf-8")
 
 
 @pytest.mark.parametrize("field, value, reason", [
