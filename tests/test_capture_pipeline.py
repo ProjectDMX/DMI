@@ -778,6 +778,124 @@ def test_manual_flush_surfaces_worker_failure_without_hanging():
         pipeline.close(timeout=2)
 
 
+def test_manual_flush_raises_on_an_already_failed_pipeline():
+    """A flush issued after the worker died must refuse, not report an outcome.
+
+    Nothing about ``flush``'s signature tells a caller the pipeline has since
+    failed -- ``is_running`` is advisory and racy -- so the latched failure has
+    to surface here, exactly as ``submit`` and ``close`` surface it.
+
+    The ``pipeline_failed`` event is emitted after the failure handler latches
+    ``_error``, so gating on it makes the "already failed" state deterministic
+    without polling.
+    """
+    failed = threading.Event()
+
+    def on_event(event):
+        if event.event == "pipeline_failed":
+            failed.set()
+
+    pipeline = HostCapturePipeline(
+        _config(max_pack_records=1),
+        _FailingSink(),
+        pack_id_factory=_ids(),
+        event_callback=on_event,
+    )
+    pipeline.start()
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+    assert failed.wait(timeout=10)
+    assert not pipeline.is_running
+
+    with pytest.raises(PipelineFailedError, match="pipeline failed"):
+        pipeline.flush(timeout=2)
+
+    with pytest.raises(PipelineFailedError, match="pipeline failed"):
+        pipeline.close(timeout=2)
+
+
+def test_manual_flush_reusing_a_failed_barrier_raises_instead_of_claiming_success(
+    monkeypatch,
+):
+    """A reused barrier that errored must raise, never report a flush.
+
+    A timed-out flush leaves its barrier as ``_pending_flush``, and the next
+    flush waits on that same barrier instead of queueing another. If the worker
+    then fails while persisting for that barrier, the waiter is woken by the
+    error the barrier carries -- and with no records submitted since, the
+    barrier's target already covers the second flush's target. Reporting that
+    as success would tell the caller records are durable that never landed.
+
+    Every step is gated on an event and both flush timeouts are finite, so a
+    regression fails the outcome assertion instead of hanging the suite.
+    """
+    from dmi.storage.capture import pipeline as pipeline_module
+
+    persist_entered = threading.Event()
+    persist_release = threading.Event()
+    wait_entered = threading.Semaphore(0)
+
+    class _BlockingFailingSink:
+        def persist(self, ready):
+            persist_entered.set()
+            assert persist_release.wait(timeout=10)
+            raise OSError("sink unavailable")
+
+    class _AnnouncingEvent(threading.Event):
+        """Announces each entry into a barrier wait."""
+
+        def wait(self, timeout=None):
+            wait_entered.release()
+            return super().wait(timeout)
+
+    class _AnnouncingBarrier(pipeline_module._FlushBarrier):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("completed", _AnnouncingEvent())
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "_FlushBarrier", _AnnouncingBarrier)
+
+    pipeline = HostCapturePipeline(
+        _config(max_linger_ns=60_000_000_000),
+        _BlockingFailingSink(),
+        pack_id_factory=_ids(),
+    )
+    pipeline.start()
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+
+    # The worker parks inside persist for this barrier's pack, so the flush
+    # times out and leaves the barrier behind as `_pending_flush`.
+    assert pipeline.flush(timeout=0.01) is False
+    assert persist_entered.wait(timeout=10)
+    assert wait_entered.acquire(timeout=10)  # the timed-out flush's own wait
+
+    outcome: list[object] = []
+
+    def flush_again():
+        try:
+            # No submit since, so this flush reuses the barrier above.
+            outcome.append(("returned", pipeline.flush(timeout=2)))
+        except BaseException as exc:  # recorded, then asserted on below
+            outcome.append(exc)
+
+    flusher = threading.Thread(target=flush_again, name="reusing-flush")
+    flusher.start()
+    try:
+        # The second flush is now asleep on the barrier it inherited.
+        assert wait_entered.acquire(timeout=10)
+        # Fail the worker inside the barrier's own persist, which records the
+        # error on the barrier and wakes its waiter.
+        persist_release.set()
+    finally:
+        persist_release.set()
+        flusher.join(timeout=10)
+
+    assert not flusher.is_alive()
+    assert isinstance(outcome[0], PipelineFailedError), outcome
+
+    with pytest.raises(PipelineFailedError, match="pipeline failed"):
+        pipeline.close(timeout=10)
+
+
 def test_manual_flush_does_not_orphan_its_barrier_at_the_failure_seam(monkeypatch):
     """The worker must not decide "no waiter" before flush() has published one.
 
