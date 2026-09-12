@@ -489,6 +489,95 @@ def test_explicit_record_sink_lease_is_owned_by_native_ring(monkeypatch):
     assert deactivated == [True, True]
 
 
+def test_record_runtime_rollback_stops_the_new_ring_before_dropping_it(monkeypatch):
+    """The post-switch rollback must stop the new ring before releasing it.
+
+    Dropping the Python owners alone would still release the lease, because
+    ``~RingEngine`` releases the record sink -- but that destructor path joins
+    the record worker with the GIL held, and a Python sink's worker re-enters
+    Python, so a drop without the GIL-releasing ``stop()`` first can deadlock.
+    Stop-before-drop is the ordering ``docs/integration-api-v1.md`` promises, so
+    this pins the order, not merely the absence of a leak.
+
+    The old ring is already stopped and deactivated by the time the new one
+    fails, so the rollback also owes the caller a clean "no ring" state rather
+    than a half-switched engine.
+    """
+    engine, _old_transport, old_ring = _engine_with_fake_ring()
+    ring_config = object()
+    engine._ring_config = ring_config
+    engine._host_engine = object()
+    new_ring = _FakeRingEngine()
+    activated = []
+    deactivated = []
+    order = []
+
+    class _Lease:
+        def release(self):
+            order.append(("release", new_ring.stop_calls))
+
+    class _RecordSink:
+        def __init__(self):
+            self.lease = _Lease()
+
+        def _acquire_engine(self):
+            return self.lease
+
+    sink = _RecordSink()
+
+    original_stop = new_ring.stop
+
+    def stop_and_release():
+        # Stands in for the native ``stop()``: the GIL-releasing join that must
+        # happen before anything drops the last reference to the ring.
+        order.append(("stop", None))
+        original_stop()
+        sink.lease.release()
+
+    def failing_start():
+        raise RuntimeError("record ring could not start")
+
+    new_ring.stop = stop_and_release
+    new_ring.start = failing_start
+
+    class _Factory:
+        @staticmethod
+        def create_record(config, target):
+            return new_ring
+
+    class _FakeTransport:
+        def __init__(self, native_ring):
+            pytest.fail("the transport must not be built after start fails")
+
+    fake_transport_module = ModuleType("dmi.transport.ring")
+    fake_transport_module.RingTransport = _FakeTransport
+    fake_transport_module.activate = activated.append
+    fake_transport_module.deactivate = lambda: deactivated.append(True)
+    fake_native_module = ModuleType("dmi.transport.native")
+    fake_native_module.RecordSink = _RecordSink
+    fake_native_module.RingEngine = _Factory
+
+    def reject_host_validation():
+        pytest.fail("an explicit sink must not validate or use the ClickHouse host")
+
+    fake_native_module._load_extension = reject_host_validation
+    monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
+
+    with pytest.raises(RuntimeError, match="could not start"):
+        engine.create_record_runtime(_explicit_sink_format(), record_sink=sink)
+
+    assert order == [("stop", None), ("release", 1)]
+    assert new_ring.stop_calls == 1
+    assert activated == []
+    # One deactivate for the switch away from the old ring, one for the rollback.
+    assert deactivated == [True, True]
+    assert engine._ring_engine is None
+    assert engine._ring_transport is None
+    assert engine._record_mode is False
+    assert old_ring.stop_calls == 1
+
+
 def test_explicit_sink_preflight_failure_preserves_the_active_ring(monkeypatch):
     engine, old_transport, old_ring = _engine_with_fake_ring()
     engine._ring_config = object()
