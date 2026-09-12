@@ -113,6 +113,27 @@ def test_bounded_queue_reports_oversized_timeout_and_close():
         is AdmissionResult.CLOSED
 
 
+def test_bounded_queue_refuses_a_flush_barrier_once_closed():
+    """A closed queue must refuse control items, not just records.
+
+    Nothing drains a closed queue, so a barrier accepted onto one would never
+    complete and its waiter would sleep for its whole timeout -- forever, for
+    the ``timeout=None`` callers ``flush`` still allows.
+    """
+    from dmi.storage.capture import pipeline as pipeline_module
+
+    queue = BoundedRecordQueue(max_records=1, max_bytes=8)
+    assert queue.put_barrier(
+        pipeline_module._FlushBarrier(target_admitted=0)
+    ) is AdmissionResult.ACCEPTED
+
+    queue.close()
+
+    assert queue.put_barrier(
+        pipeline_module._FlushBarrier(target_admitted=0)
+    ) is AdmissionResult.CLOSED
+
+
 def test_bounded_queue_stays_within_limits_under_sustained_overload():
     queue = BoundedRecordQueue(max_records=3, max_bytes=24)
 
@@ -700,6 +721,45 @@ def test_manual_flush_timeout_reuses_prefix_then_flushes_later_records(
     assert snapshot.persisted_records == 2
     assert snapshot.flush_manual == 2
     pipeline.close(timeout=2)
+
+
+def test_manual_flush_after_close_returns_false_without_waiting(tmp_path: Path):
+    """Flushing a closed pipeline must report False, never wait on a barrier.
+
+    ``HostCapturePipeline`` is public API, and flush-after-close is an ordinary
+    caller mistake -- ``record_adapter._flush_capture`` has no ``_closed`` guard
+    of its own. The closed queue refuses the barrier, and nothing will ever
+    drain it, so returning False is the only non-hanging answer.
+
+    The barrier's wait is replaced rather than timed, so a regression fails
+    this assertion immediately instead of depending on wall-clock time.
+    """
+    from dmi.storage.capture import pipeline as pipeline_module
+
+    class _NeverWaitedEvent(threading.Event):
+        def wait(self, timeout=None):
+            pytest.fail("flush waited on a barrier the closed queue never accepted")
+
+    class _NeverWaitedBarrier(pipeline_module._FlushBarrier):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("completed", _NeverWaitedEvent())
+            super().__init__(*args, **kwargs)
+
+    pipeline = HostCapturePipeline(
+        _config(max_linger_ns=60_000_000_000),
+        DirectPackSink(FilesystemPackStore(tmp_path, store_id="local")),
+        pack_id_factory=_ids(),
+    )
+    pipeline.start()
+    assert pipeline.submit(_record("capture-a")) is AdmissionResult.ACCEPTED
+    snapshot = pipeline.close(timeout=2)
+    assert snapshot.persisted_records == 1
+
+    # Installed only now: the barrier this flush builds is the one that must
+    # never be waited on.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(pipeline_module, "_FlushBarrier", _NeverWaitedBarrier)
+        assert pipeline.flush(timeout=2) is False
 
 
 def test_manual_flush_surfaces_worker_failure_without_hanging():
