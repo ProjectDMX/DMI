@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import sys
 from typing import Literal, get_args
 
 
-StorageBackend = Literal["auto", "native", "capture", "none"]
+StorageBackend = Literal["auto", "native", "capture", "none", "drop"]
+
+
+@dataclass
+class DropConfig:
+    """Rank-local metadata-only evaluation output; measurements are opt-in."""
+
+    base_folder: str = ""
+    rank: int = 0
+    timing_enabled: bool = False
+    ring_metrics_enabled: bool = False
 
 
 @dataclass
@@ -84,6 +95,7 @@ class MonitoringConfig:
     #                host engine, which would otherwise sit started, connected
     #                and unused.
     #   "none"    -- capture and transport with no persistence at all.
+    #   "drop"    -- native metadata-only JSONL sink after real host handoff.
     #   "auto"    -- infer from what was passed, which is what every caller
     #                did before this field existed and remains the default.
     #
@@ -92,6 +104,7 @@ class MonitoringConfig:
     # configured writes packs and leaves a ClickHouse insert pipeline running
     # that nothing feeds, and "auto" cannot tell that apart from intent.
     storage_backend: StorageBackend = "auto"
+    drop: DropConfig = field(default_factory=DropConfig)
 
     def __post_init__(self) -> None:
         backends = get_args(StorageBackend)
@@ -100,4 +113,23 @@ class MonitoringConfig:
                 "storage_backend must be one of "
                 + ", ".join(repr(name) for name in backends)
                 + f"; got {self.storage_backend!r}"
+            )
+        if self.storage_backend == "drop":
+            if not isinstance(self.drop, DropConfig):
+                raise TypeError("drop must be a DropConfig")
+            if not self.drop.base_folder or self.drop.rank < 0:
+                raise ValueError("drop requires base_folder and a nonnegative global rank")
+        elif isinstance(self.drop, DropConfig) and (
+            self.drop.timing_enabled or self.drop.ring_metrics_enabled
+        ):
+            enabled = ", ".join(
+                name for name in ("timing_enabled", "ring_metrics_enabled")
+                if getattr(self.drop, name)
+            )
+            print(
+                f"[DMI] WARNING: ignoring enabled measurement flags ({enabled}) "
+                f"for storage_backend={self.storage_backend!r}; "
+                "recording requires storage_backend='drop'.",
+                file=sys.stderr,
+                flush=True,
             )

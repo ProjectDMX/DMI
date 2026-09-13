@@ -4,7 +4,7 @@ The top-level package deliberately avoids loading the CUDA extension. Native
 resources are imported lazily when an engine or transport is constructed.
 """
 
-from .config import CaptureSchedule, MonitoringConfig
+from .config import CaptureSchedule, DropConfig, MonitoringConfig
 from .engine import HostEngineConfig, MonitoringEngine, RingCapacities
 
 _NATIVE_EXPORTS = (
@@ -32,5 +32,6 @@ __all__ = [
     "RingCapacities",
     "CaptureSchedule",
     "MonitoringConfig",
+    "DropConfig",
     *_NATIVE_EXPORTS,
 ]

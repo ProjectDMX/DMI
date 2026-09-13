@@ -26,6 +26,7 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -93,6 +94,7 @@ public:
     uint64_t cpu_payload_tail_committed() const;
     uint64_t cpu_task_head() const;
     uint64_t cpu_task_tail_committed() const;
+    std::map<std::string, uint64_t> ring_metrics(bool reset_high_water);
 
     // Pre-allocate ring space for the next step's producer kernels.
     // Advances cpu_payload_head_ and cpu_task_head_ under mgmt_mu_.
@@ -128,6 +130,8 @@ private:
     uint64_t                visible_head_{0};
     uint64_t                pending_entries_{0};
     uint64_t                pending_bytes_{0};
+    uint64_t                payload_high_water_{0};
+    uint64_t                task_high_water_{0};
     std::deque<uint64_t>    scanned_;
 
     uint64_t                cpu_task_head_{0};
@@ -179,6 +183,7 @@ private:
 
     // Called under mgmt_mu_:
     void scan_ready();
+    void update_ring_high_water();  // mgmt_mu_ held, enabled only by config.
     void account_record_task(uint64_t sequence, uint64_t actual_bytes);
     bool should_flush() const;
     void flush_state_update(uint64_t flush_count, uint64_t flush_bytes);

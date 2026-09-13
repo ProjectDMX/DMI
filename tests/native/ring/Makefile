@@ -75,11 +75,12 @@ TARGETS := $(BUILD)/test_rings $(BUILD)/test_producer \
 	       $(BUILD)/test_ring_engine $(BUILD)/test_null_mode \
 	       $(BUILD)/test_record_consumer \
 	       $(BUILD)/test_clickhouse_record_sink \
+	       $(BUILD)/test_drop_record_sink \
 	       $(BUILD)/test_d2h_windows
 
 .PHONY: all test_rings test_producer test_ring_engine test_null_mode \
 		test_record_consumer test_clickhouse_record_sink test_d2h_windows \
-		run clean FORCE
+		test_drop_record_sink run clean FORCE
 
 all: $(TARGETS)
 
@@ -124,6 +125,14 @@ $(BUILD)/test_d2h_windows: test_d2h_windows.cpp $(D2H_WINDOW_CPU_SRCS) \
 		$(filter-out $(CUDA_CONFIG_STAMP),$^) $(TORCH_RPATH_FLAGS) \
 		-ltorch -ltorch_cpu -lc10 -lpthread -o $@
 
+$(BUILD)/test_drop_record_sink: test_drop_record_sink.cpp ../../../native/csrc/drop_record_sink.cpp $(CUDA_CONFIG_STAMP) | $(BUILD)
+	$(CUDA_NVCC) $(NVCC_FLAGS) $(TORCH_INCLUDE_FLAGS) $(TORCH_LIB_FLAGS) \
+		$(filter-out $(CUDA_CONFIG_STAMP),$^) $(TORCH_RPATH_FLAGS) \
+		-ltorch -ltorch_cpu -lc10 -lpthread -o $@
+
+test_drop_record_sink: $(BUILD)/test_drop_record_sink
+	$(BUILD)/test_drop_record_sink
+
 test_rings: $(BUILD)/test_rings
 	$(BUILD)/test_rings
 
@@ -153,6 +162,7 @@ run: all
 	$(BUILD)/test_record_consumer
 	$(BUILD)/test_clickhouse_record_sink
 	$(BUILD)/test_d2h_windows
+	$(BUILD)/test_drop_record_sink
 
 clean:
 	rm -rf $(BUILD)

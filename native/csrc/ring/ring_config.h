@@ -73,6 +73,9 @@ struct RingConfig {
 
     RecurringD2HWindowConfig recurring_d2h_windows;
 
+    // Evaluation accounting only; no high-water updates when disabled.
+    bool ring_metrics_enabled = false;
+
     // Effective staging capacity (resolved at init time).
     // If pinned_staging_bytes == 0, defaults to payload_ring_bytes.
     uint64_t effective_staging_bytes() const {

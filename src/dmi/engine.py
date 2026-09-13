@@ -105,6 +105,7 @@ class MonitoringEngine:
         self._ring_config: Optional[Any] = None
         self._record_mode = False
         self._record_mode_v1 = bool(record_mode_v1)
+        self._drop_sink = None
 
         if host_engine is not None and db_config is not None:
             raise ValueError("Provide either host_engine or db_config, not both")
@@ -117,7 +118,7 @@ class MonitoringEngine:
                 "ClickHouseRecordSink, which needs a host engine: pass "
                 "host_engine= or db_config="
             )
-        if self._storage_backend in ("capture", "none") and host_configured:
+        if self._storage_backend in ("capture", "none", "drop") and host_configured:
             raise ValueError(
                 f"config.storage_backend={self._storage_backend!r} does not "
                 "use the C++ ClickHouse host, but host_engine/db_config was "
@@ -239,7 +240,7 @@ class MonitoringEngine:
                 "path, which is reached by passing its sink: "
                 "create_record_runtime(fmt, record_sink=reference.native_sink)"
             )
-        if backend in ("native", "none") and record_sink is not None:
+        if backend in ("native", "none", "drop") and record_sink is not None:
             raise ValueError(
                 f"config.storage_backend={backend!r} does not use an explicit "
                 "record_sink; passing one would send records to a backend the "
@@ -280,6 +281,13 @@ class MonitoringEngine:
         ):
             raise TypeError("record_sink must be a native RecordSink")
         self._reject_a_sink_the_config_did_not_ask_for(record_sink)
+        if getattr(self, "_storage_backend", "auto") == "drop":
+            drop = self.config.drop
+            record_sink = _native_engine.DropRecordSink(
+                record_schema, str(drop.base_folder), int(drop.rank),
+                bool(drop.timing_enabled), bool(drop.ring_metrics_enabled),
+            )
+            ring_config.ring_metrics_enabled = bool(drop.ring_metrics_enabled)
         if record_sink is None and self._host_engine is not None:
             _native_engine._load_extension()._validate_record_host_schema(
                 self._host_engine,
@@ -318,6 +326,8 @@ class MonitoringEngine:
             self._ring_transport = record_transport
             self._record_mode = True
             _rt.activate(record_transport)
+            if getattr(self, "_storage_backend", "auto") == "drop":
+                self._drop_sink = record_sink
             return runtime
         except BaseException:
             if switched:
@@ -339,7 +349,52 @@ class MonitoringEngine:
             runtime = None
             record_transport = None
             record_engine = None
+            if getattr(self, "_storage_backend", "auto") == "drop" and record_sink is not None:
+                record_sink.close()
             raise
+
+    def record_iteration_start(self, iteration: int) -> None:
+        """Optional drop measurements at the full training-step boundary."""
+        sink = self._drop_sink
+        if sink is None:
+            return
+        if sink.timing_enabled:
+            sink.iteration_start(iteration)
+        if sink.ring_metrics_enabled:
+            self._ring_engine.ring_metrics(reset_high_water=True)
+
+    def record_iteration_end(self, iteration: int) -> None:
+        sink = self._drop_sink
+        if sink is None:
+            return
+        if sink.timing_enabled:
+            sink.iteration_end(iteration)
+        if sink.ring_metrics_enabled:
+            metrics = self._ring_engine.ring_metrics(reset_high_water=True)
+            state = self._ring_engine.d2h_window_runtime_snapshot()
+            metrics["capacity_forced_flush_count"] = int(state.capacity_forced_flush_count)
+            metrics["window_mode"] = int(state.mode)
+            sink.ring_metrics(iteration, metrics)
+
+    def _close_drop_runtime(self) -> None:
+        # Keep the sink accepting records until the GPU-to-host path has drained.
+        failure = None
+        try:
+            self.flush_and_wait()
+        except Exception as exc:
+            failure = exc
+        self._ring_engine.stop()
+        try:
+            self._drop_sink.close()
+        except Exception as exc:
+            failure = failure or exc
+        _ring_module().deactivate()
+        self._ring_transport = None
+        self._ring_engine = None
+        self._record_mode = False
+        self._drop_sink = None
+        if failure is not None:
+            raise RuntimeError(f"drop sink shutdown failed: {failure}") from failure
 
     def flush_and_wait(self, timeout_s: float = 600.0) -> None:
         """Complete the record ring and its configured sink durability boundary."""
@@ -457,6 +512,10 @@ class MonitoringEngine:
 
     def close(self) -> None:
         """Tear down backend resources."""
+
+        if getattr(self, "_drop_sink", None) is not None:
+            self._close_drop_runtime()
+            return
 
         if self._ring_transport is not None:
             record_mode = self._record_mode

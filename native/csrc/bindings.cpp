@@ -18,6 +18,7 @@ namespace py = pybind11;
 #include "dmx_host_engine.h"
 #ifndef DMI_HOST_ONLY
 #include "clickhouse_record_sink.h"
+#include "drop_record_sink.h"
 #include "reference_python_capture_sink.h"
 #include "ring/ring_engine_py.h"
 #include "ring/ring_torch_op.h"
@@ -662,6 +663,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("clone_slices",              &ring_py::RingConfig::clone_slices)
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
       .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items)
+      .def_readwrite("ring_metrics_enabled", &ring_py::RingConfig::ring_metrics_enabled)
       .def_readwrite("recurring_d2h_windows",
                      &ring_py::RingConfig::recurring_d2h_windows);
 
@@ -683,6 +685,44 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              return MakeClickHouseRecordSink(std::move(host));
            }),
            py::arg("host_engine"));
+  py::class_<dmx_host::DropRecordSink, ring::RecordSink,
+             std::shared_ptr<dmx_host::DropRecordSink>>(m, "DropRecordSink")
+      .def(py::init([](py::object schema, std::string base_folder, int64_t rank,
+                       bool timing_enabled, bool ring_metrics_enabled) {
+          auto copied = CopyRecordSchema(schema);
+          py::gil_scoped_release release;
+          return std::make_shared<dmx_host::DropRecordSink>(
+              std::move(copied), std::move(base_folder), rank,
+              timing_enabled, ring_metrics_enabled);
+      }), py::arg("schema"), py::arg("base_folder"), py::arg("rank"),
+          py::arg("timing_enabled") = false, py::arg("ring_metrics_enabled") = false)
+      .def("submit", [](dmx_host::DropRecordSink& self, py::object descriptor, at::Tensor payload) {
+          auto copied = CopyRecordDescriptor(descriptor, self.schema());
+          py::gil_scoped_release release;
+          self.submit({std::move(copied), std::move(payload)});
+      }, py::arg("descriptor"), py::arg("payload"))
+      .def("iteration_start", &dmx_host::DropRecordSink::iteration_start,
+           py::call_guard<py::gil_scoped_release>())
+      .def("iteration_end", &dmx_host::DropRecordSink::iteration_end,
+           py::call_guard<py::gil_scoped_release>())
+      .def("ring_metrics", &dmx_host::DropRecordSink::ring_metrics,
+           py::call_guard<py::gil_scoped_release>())
+      .def("flush_and_wait", [](dmx_host::DropRecordSink& self, double timeout_s) {
+          if (!std::isfinite(timeout_s) || timeout_s < 0.0)
+              throw std::invalid_argument("timeout_s must be finite and non-negative");
+          const double milliseconds = std::ceil(timeout_s * 1000.0);
+          if (milliseconds >= static_cast<double>(std::numeric_limits<int64_t>::max()))
+              throw std::invalid_argument("timeout_s exceeds the representable duration");
+          return self.flush_and_wait(ring::RecordSink::Duration(
+              static_cast<int64_t>(milliseconds)));
+      }, py::arg("timeout_s") = 600.0,
+           py::call_guard<py::gil_scoped_release>())
+      .def("close", &dmx_host::DropRecordSink::close,
+           py::call_guard<py::gil_scoped_release>())
+      .def("rethrow_if_failed", &dmx_host::DropRecordSink::rethrow_if_failed)
+      .def_property_readonly("path", &dmx_host::DropRecordSink::path)
+      .def_property_readonly("timing_enabled", &dmx_host::DropRecordSink::timing_enabled)
+      .def_property_readonly("ring_metrics_enabled", &dmx_host::DropRecordSink::ring_metrics_enabled);
   py::class_<dmi_capture::ReferencePythonCaptureSink, ring::RecordSink,
              std::shared_ptr<dmi_capture::ReferencePythonCaptureSink>>(
       m, "ReferencePythonCaptureSink")
@@ -808,6 +848,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("payload_cap", &ring_py::RingEnginePy::payload_cap)
       .def("staging_cap", &ring_py::RingEnginePy::staging_cap)
       .def("task_cap",    &ring_py::RingEnginePy::task_cap)
+      .def("ring_metrics", &ring_py::RingEnginePy::ring_metrics,
+           py::arg("reset_high_water") = false,
+           py::call_guard<py::gil_scoped_release>())
       .def("payload_tensor", &ring_py::RingEnginePy::payload_tensor)
       .def("define_d2h_window_pattern",
            [](ring_py::RingEnginePy& self,

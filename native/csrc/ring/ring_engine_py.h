@@ -7,6 +7,7 @@
 
 #pragma once
 #include <cstdint>
+#include <map>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -47,6 +48,7 @@ struct RingConfig {
     uint64_t insert_queue_max_bytes     = 4096ULL * 1024 * 1024;
     uint64_t insert_queue_max_items     = 65536;
     ring::RecurringD2HWindowConfig recurring_d2h_windows;
+    bool ring_metrics_enabled = false;
 };
 
 // Called by the p2p thread for each per-request tensor slice.
@@ -192,6 +194,7 @@ public:
     uint64_t payload_cap() const;
     uint64_t staging_cap() const;
     uint64_t task_cap() const;
+    std::map<std::string, uint64_t> ring_metrics(bool reset_high_water = false);
 
     // Return a torch.Tensor view of the GPU payload buffer (uint8,
     // length = payload_cap()).  No copy, no ownership transfer -- the

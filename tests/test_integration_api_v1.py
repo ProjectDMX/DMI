@@ -49,6 +49,7 @@ _NON_HOOK_EXPORTS = {
     "MonitoringEngine",
     "RingCapacities",
     "MonitoringConfig",
+    "DropConfig",
     "CaptureSchedule",
     "HostEngineConfig",
     "deactivate_ring_transport",

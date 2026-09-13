@@ -306,6 +306,7 @@ void DrainThread::reserve(uint64_t payload_bytes, uint32_t num_tasks) {
     std::lock_guard<std::mutex> lk(mgmt_mu_);
     cpu_payload_head_ += payload_bytes;
     cpu_task_head_    += num_tasks;
+    if (cfg_.ring_metrics_enabled) update_ring_high_water();
 }
 
 void DrainThread::reserve_record(
@@ -331,6 +332,36 @@ void DrainThread::reserve_record(
     }
     cpu_payload_head_ += payload_bytes;
     cpu_task_head_ += items.size();
+    if (cfg_.ring_metrics_enabled) update_ring_high_water();
+}
+
+void DrainThread::update_ring_high_water() {
+    const uint64_t reserved = cpu_payload_head_ - cpu_payload_tail_committed_;
+    payload_high_water_ = std::max(payload_high_water_, reserved);
+    task_high_water_ = std::max(task_high_water_, cpu_task_head_ - cpu_task_tail_);
+}
+
+std::map<std::string, uint64_t> DrainThread::ring_metrics(bool reset_high_water) {
+    if (!cfg_.ring_metrics_enabled) return {};
+    std::lock_guard<std::mutex> lock(mgmt_mu_);
+    update_ring_high_water();
+    const uint64_t reserved = cpu_payload_head_ - cpu_payload_tail_committed_;
+    const uint64_t tasks = cpu_task_head_ - cpu_task_tail_;
+    std::map<std::string, uint64_t> result{
+        {"payload_capacity_bytes", ring_.payload_cap},
+        {"payload_reserved_bytes", reserved},
+        {"payload_pending_bytes", pending_bytes_},
+        {"payload_high_water_bytes", payload_high_water_},
+        {"task_capacity", ring_.task_cap},
+        {"task_used", tasks},
+        {"task_pending", pending_entries_},
+        {"task_high_water", task_high_water_},
+    };
+    if (reset_high_water) {
+        payload_high_water_ = reserved;
+        task_high_water_ = tasks;
+    }
+    return result;
 }
 
 void DrainThread::apply_pending_record_reclaims() {

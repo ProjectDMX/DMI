@@ -9,6 +9,7 @@ TARGET := _native_backend
 HOST_TARGET := _host_backend
 SRCS := csrc/bindings.cpp \
         csrc/clickhouse_record_sink.cpp \
+        csrc/drop_record_sink.cpp \
         csrc/reference_python_capture_sink.cpp \
         csrc/clickhouse_client.cpp \
         csrc/ring/drain_thread.cpp \
@@ -25,6 +26,7 @@ SRCS := csrc/bindings.cpp \
 HOST_SRCS := csrc/bindings.cpp csrc/clickhouse_client.cpp
 HEADERS := csrc/dmx_host_utils.h \
            csrc/clickhouse_client.h csrc/clickhouse_record_sink.h \
+           csrc/drop_record_sink.h \
            csrc/reference_python_capture_sink.h \
            csrc/dmx_host_engine.h csrc/record_schema.h \
            csrc/ring/ring_config.h csrc/ring/ring_state.h csrc/ring/ring_alloc.h \

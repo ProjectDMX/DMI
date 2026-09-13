@@ -134,10 +134,73 @@ schedule.should_capture_step(
 
 The predicates apply warmup, then offset, then stride. Step selection also
 honors `capture_prefill`/`capture_decode`; an unknown phase raises `ValueError`.
-`MonitoringConfig` currently contains only this schedule. Its default factory
+`MonitoringConfig` also selects `storage_backend`. Its default factory
 creates a distinct `CaptureSchedule` for each config instance.
 `MonitoringEngine` stores the config, while concrete adaptors decide whether
 and how to apply it; the engine does not enforce the schedule by itself.
+
+### `DropConfig`: metadata-only evaluation output
+
+```python
+MonitoringConfig(
+    storage_backend="drop",
+    drop=DropConfig(
+        base_folder="/path/to/run",
+        rank=global_rank,
+        timing_enabled=False,
+        ring_metrics_enabled=False,
+    ),
+)
+```
+
+The drop backend uses real capture, D2H, and the normal owned-CPU handoff.
+It retains every schema column except tensor bytes, including resolved
+shape/dtype and scalar values. One native writer per global rank appends to
+`<base_folder>/rank_XXXXX/events.jsonl` from an unbounded **metadata-only**
+queue. Tensor payloads are released before enqueueing; JSON encoding and file
+writes run on the writer thread. A file lock prevents concurrent writers for
+the same rank. Use a separate base folder per run. Reopening a file appends a
+new schema header and starts a new event sequence; it never truncates old data.
+
+The file contains typed `schema`, `record`, `iteration_start`, `iteration_end`,
+and `ring_metrics` events. A record event retains its ordered `rows` together,
+with one arrival timestamp for the whole envelope. Non-finite scalar values
+use the strings `NaN`, `Infinity`, and `-Infinity` to keep valid JSON.
+
+Timing and ring recording are independent of each other and of debug mode.
+With timing enabled, call `MonitoringEngine.record_iteration_start(iteration)`
+and `record_iteration_end(iteration)` around the full optimizer iteration.
+Megatron wires these calls automatically. All event times are nanoseconds from
+the **first executed training iteration's start on that rank**, including
+warmup; the origin never resets between iterations or attempts. A resumed run
+uses its first executed iteration, regardless of its iteration number. Setup
+records before that origin have no timestamp. These are rank-local monotonic
+times, not synchronized timestamps across nodes. Iteration duration is also
+stored separately. No measurement clock is read when timing is disabled.
+
+Ring metrics sample CPU accounting at iteration end and reset interval
+high-water marks at iteration start/end, without a device synchronization.
+`payload_reserved_bytes` includes reservations not yet reclaimed after D2H;
+`payload_pending_bytes` is the aligned ready-byte count observed by the drain
+thread, including its in-flight batch until completion accounting. Task fields
+likewise report CPU-accounted used and ready entries. Disabled ring recording
+does not sample or maintain high-water marks.
+
+`flush_and_wait()` flushes the GPU-to-host prefix and then the writer queue.
+`close()` drains remaining records, joins the writer, flushes/closes the file,
+and surfaces failures. No per-iteration file flush or database connection is
+required. Nsight profiling remains separate from this recorder.
+
+Megatron CLI:
+
+```bash
+--dmi-enable --dmi-storage-backend drop --dmi-drop-base-folder /path/to/run \
+--dmi-timing-enabled --dmi-ring-metrics-enabled
+```
+
+Omit either measurement flag to disable it (both default off). Corresponding
+environment settings are `DMI_STORAGE_BACKEND`, `DMI_DROP_BASE_FOLDER`,
+`DMI_TIMING_ENABLED`, and `DMI_RING_METRICS_ENABLED`.
 
 ### `HostEngineConfig`
 

@@ -18,7 +18,7 @@ from ...adapters.base import (
     StepReservation,
 )
 from ...storage.clickhouse import CHClickhouseDriverReadOnly
-from ...config import CaptureSchedule, MonitoringConfig
+from ...config import CaptureSchedule, DropConfig, MonitoringConfig
 from ...engine import HostEngineConfig, MonitoringEngine, RingCapacities
 from ...hooks.dispatch import install_ring_hooks
 from ...hooks.point import HookPoint
@@ -208,6 +208,7 @@ __all__ = [
     "MonitoringEngine",
     "RingCapacities",
     "MonitoringConfig",
+    "DropConfig",
     "CaptureSchedule",
     "HostEngineConfig",
     "deactivate_ring_transport",

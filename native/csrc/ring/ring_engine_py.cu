@@ -163,6 +163,7 @@ static ring::RingConfig convert(const RingConfig& c) {
     r.insert_queue_max_bytes      = c.insert_queue_max_bytes;
     r.insert_queue_max_items      = c.insert_queue_max_items;
     r.recurring_d2h_windows       = c.recurring_d2h_windows;
+    r.ring_metrics_enabled        = c.ring_metrics_enabled;
     return r;
 }
 
@@ -595,6 +596,10 @@ uint64_t RingEnginePy::staging_cap() const {
 
 uint64_t RingEnginePy::task_cap() const {
     return impl_->engine.task_cap();
+}
+
+std::map<std::string, uint64_t> RingEnginePy::ring_metrics(bool reset_high_water) {
+    return impl_->engine.drain_thread().ring_metrics(reset_high_water);
 }
 
 at::Tensor RingEnginePy::payload_tensor() const {

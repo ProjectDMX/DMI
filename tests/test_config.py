@@ -13,9 +13,31 @@ argument on ``generate_with_monitoring`` or an external adapter.
 
 import pytest
 
-from dmi.config import CaptureSchedule, MonitoringConfig
+from dmi.config import CaptureSchedule, DropConfig, MonitoringConfig
 
 pytestmark = pytest.mark.cpu
+
+
+@pytest.mark.parametrize("backend", ["auto", "native", "capture", "none", "drop"])
+@pytest.mark.parametrize("timing,ring", [(False, False), (True, False), (False, True), (True, True)])
+def test_measurement_sink_conflict_warns_on_stderr(backend, timing, ring, capsys):
+    config = MonitoringConfig(
+        storage_backend=backend,
+        drop=DropConfig(base_folder="/unused", timing_enabled=timing, ring_metrics_enabled=ring),
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    if backend != "drop" and (timing or ring):
+        assert captured.err.count("[DMI] WARNING:") == 1
+        assert f"storage_backend={backend!r}" in captured.err
+        assert "recording requires storage_backend='drop'" in captured.err
+        assert ("timing_enabled" in captured.err) == timing
+        assert ("ring_metrics_enabled" in captured.err) == ring
+    else:
+        assert captured.err == ""
+    assert config.storage_backend == backend
+    assert config.drop.timing_enabled == timing
+    assert config.drop.ring_metrics_enabled == ring
 
 
 # =============================================================================
