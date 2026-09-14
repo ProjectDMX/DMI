@@ -27,6 +27,7 @@ _HOST_EXPORTS = frozenset(
 )
 _RING_EXPORTS = frozenset(
     {
+        "PAYLOAD_ALIGN",
         "ClickHouseRecordSink",
         "DropRecordSink",
         "D2HWindowGrantPolicyKind",

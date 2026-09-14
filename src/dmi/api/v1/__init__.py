@@ -31,6 +31,7 @@ from ...hooks.record import (
     RecordType,
     TransportSpec,
     TransportType,
+    OutputSizingMode,
 )
 from ...hooks.producer_plan import (
     ProducerPlan,
@@ -219,6 +220,7 @@ __all__ = [
     "HookRuntime",
     "TransportSpec",
     "TransportType",
+    "OutputSizingMode",
     "OutputStorage",
     "RecordType",
     "ProducerPlanEntry",

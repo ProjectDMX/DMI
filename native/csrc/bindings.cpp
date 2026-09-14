@@ -20,6 +20,7 @@ namespace py = pybind11;
 #include "clickhouse_record_sink.h"
 #include "drop_record_sink.h"
 #include "reference_python_capture_sink.h"
+#include "ring/ring_config.h"
 #include "ring/ring_engine_py.h"
 #include "ring/ring_torch_op.h"
 #include "ring/tensor_meta.h"
@@ -103,6 +104,15 @@ dmx_host::RecordValue CopyLiteralRecordValue(
 }
 
 #ifndef DMI_HOST_ONLY
+// Each configured transport owns its validated schema. Descriptors copy their
+// actual cells; no queued record borrows from this handle or a Python schema.
+struct CompiledRecordSchema {
+  explicit CompiledRecordSchema(const py::handle& schema_py)
+      : schema(CopyRecordSchema(schema_py)) {}
+
+  const dmx_host::RecordSchema schema;
+};
+
 ring::PayloadMaterialization ParsePayloadMaterialization(
     const py::handle& slice_py, dmx_host::RecordCellType column_type) {
   const int storage = py::cast<int>(slice_py.attr("storage"));
@@ -226,8 +236,7 @@ ring::RecordDescriptor CopyRecordDescriptor(
 
 std::vector<ring::RecordDescriptor> CopyRecordDescriptors(
     const py::handle& descriptors_py,
-    const py::handle& schema_py) {
-  const auto schema = CopyRecordSchema(schema_py);
+    const dmx_host::RecordSchema& schema) {
   std::vector<ring::RecordDescriptor> descriptors;
   for (const py::handle descriptor_py : descriptors_py) {
     descriptors.push_back(CopyRecordDescriptor(descriptor_py, schema));
@@ -240,6 +249,12 @@ std::vector<ring::RecordDescriptor> CopyRecordDescriptors(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #ifndef DMI_HOST_ONLY
+  m.attr("PAYLOAD_ALIGN") = ring::PAYLOAD_ALIGN;
+  py::class_<CompiledRecordSchema>(m, "_CompiledRecordSchema");
+  m.def("_compile_record_schema", [](py::object schema) {
+    return std::make_unique<CompiledRecordSchema>(schema);
+  }, py::arg("schema"));
+
   // ---- Hook definitions (native ABI table; mirrored by dmi/hooks/catalog.py) ----
   // Expose as list of (id, act_name, short_name, per_layer, group, tp_sharded,
   //                     shape_class, pp_stage) tuples — all ints except act_name/short_name.
@@ -799,7 +814,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("push_record_descriptors",
            [](ring_py::RingEnginePy& self, py::sequence descriptors,
               py::object schema) {
-             auto encoded = CopyRecordDescriptors(descriptors, schema);
+             auto encoded = py::isinstance<CompiledRecordSchema>(schema)
+                 ? CopyRecordDescriptors(
+                       descriptors, schema.cast<const CompiledRecordSchema&>().schema)
+                 : CopyRecordDescriptors(descriptors, CopyRecordSchema(schema));
              py::gil_scoped_release release;
              self.push_record_descriptors(std::move(encoded));
            },

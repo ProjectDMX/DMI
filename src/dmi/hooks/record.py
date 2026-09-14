@@ -29,6 +29,13 @@ class TransportType(str, Enum):
     SEGMENTED_PACK = "segmented_pack"
 
 
+class OutputSizingMode(str, Enum):
+    """When the post-preprocessing physical output can be sized."""
+
+    KNOWN_BEFORE_EXECUTION = "known_before_execution"
+    RUNTIME_SIZED = "runtime_sized"
+
+
 class OutputStorage(IntEnum):
     """Host materialization requested for a producer output."""
 
@@ -78,6 +85,7 @@ class TransportSpec:
     output_shape: tuple[int, ...] | None = None
     row_bytes: int | None = None
     feature_bytes: int | None = None
+    sizing_mode: OutputSizingMode = OutputSizingMode.KNOWN_BEFORE_EXECUTION
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -88,6 +96,8 @@ class TransportSpec:
             raise TypeError("storage must be an OutputStorage")
         if not isinstance(self.record_type, RecordType):
             raise TypeError("record_type must be a RecordType")
+        if not isinstance(self.sizing_mode, OutputSizingMode):
+            raise TypeError("sizing_mode must be an OutputSizingMode")
         if self.output_shape is not None:
             object.__setattr__(
                 self, "output_shape", tuple(int(dim) for dim in self.output_shape)
@@ -417,6 +427,7 @@ class HookPointV1(nn.Module):
 
 
 __all__ = [
+    "OutputSizingMode",
     "HookOutput",
     "HookPointV1",
     "HookRuntime",

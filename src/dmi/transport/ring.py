@@ -414,7 +414,14 @@ class RingTransport:
 
         if hasattr(self, "_record_schema"):
             raise RuntimeError("record schema is already configured")
+        from .native import _load_extension
+
+        compiled = _load_extension()._compile_record_schema(schema)
+        from ..hooks.producer_plan import _payload_alignment
+
+        _payload_alignment()
         self._record_schema = schema
+        self._compiled_record_schema = compiled
 
     def define_d2h_window_pattern(
         self,
@@ -460,7 +467,7 @@ class RingTransport:
         """Publish descriptors in the exact order of their producer tasks."""
 
         self._ring_engine.push_record_descriptors(
-            tuple(descriptors), self._record_schema
+            tuple(descriptors), self._compiled_record_schema
         )
 
     def submit_record_cpu_direct(self, output: Any, entry: Any) -> None:

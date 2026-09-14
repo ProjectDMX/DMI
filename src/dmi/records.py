@@ -19,7 +19,7 @@ from .hooks.record import (
     OutputStorage,
     TransportType,
 )
-from .hooks.producer_plan import ProducerPlan, ProducerPlanEntry
+from .hooks.producer_plan import ProducerPlan, ProducerPlanEntry, _align_up
 
 
 MetadataT = TypeVar("MetadataT")
@@ -335,6 +335,8 @@ class RecordRuntime(Generic[MetadataT]):
         entry: ProducerPlanEntry,
         metadata: MetadataT,
         output: HookOutput,
+        *,
+        reservation_bytes: int | None = None,
     ) -> StepReservation:
         """Reserve, publish a descriptor, and prepare one eager producer.
 
@@ -346,9 +348,36 @@ class RecordRuntime(Generic[MetadataT]):
         if self._transport.null_offload:
             return StepReservation.SKIPPED
         self._validate_entry_output(entry, output)
+        return self._emit_output_impl(entry, metadata, output, reservation_bytes)
+
+    def _emit_prepared_output(
+        self,
+        entry: ProducerPlanEntry,
+        metadata: MetadataT,
+        output: HookOutput,
+        *,
+        reservation_bytes: int,
+    ) -> StepReservation:
+        """Integration-owned eager entry built from this same output tensor."""
+
+        if self._transport.null_offload:
+            return StepReservation.SKIPPED
+        if _hook_point._MONITORING_DEBUG:
+            self._validate_entry_output(entry, output)
+        return self._emit_output_impl(entry, metadata, output, reservation_bytes)
+
+    def _emit_output_impl(
+        self,
+        entry: ProducerPlanEntry,
+        metadata: MetadataT,
+        output: HookOutput,
+        reservation_bytes: int | None,
+    ) -> StepReservation:
         descriptor = self._encode(metadata, entry)
         reservation = StepReservation(
-            self._transport.reserve_record(self._reservation_items((entry,)))
+            self._transport.reserve_record(self._reservation_items(
+                (entry,), None if reservation_bytes is None else (reservation_bytes,),
+            ))
         )
         self._transport.push_record_descriptors((descriptor,))
         if reservation is StepReservation.OVERSIZED:
@@ -359,6 +388,8 @@ class RecordRuntime(Generic[MetadataT]):
         self,
         plan: ProducerPlan,
         metadata: Sequence[MetadataT],
+        *,
+        reservation_bytes: Sequence[int] | None = None,
     ) -> StepReservation:
         """Bind fresh descriptors to a captured physical plan and reserve it."""
 
@@ -379,7 +410,9 @@ class RecordRuntime(Generic[MetadataT]):
             for item, entry in zip(metadata_items, plan.entries)
         )
         reservation = StepReservation(
-            self._transport.reserve_record(self._reservation_items(plan.entries))
+            self._transport.reserve_record(self._reservation_items(
+                plan.entries, reservation_bytes,
+            ))
         )
         if reservation is not StepReservation.OVERSIZED:
             self._transport.push_record_descriptors(descriptors)
@@ -388,22 +421,41 @@ class RecordRuntime(Generic[MetadataT]):
     def _reservation_items(
         self,
         entries: Sequence[ProducerPlanEntry],
+        reservation_bytes: Sequence[int] | None = None,
     ) -> tuple[tuple[int, bool], ...]:
+        if reservation_bytes is not None:
+            if len(entries) != len(reservation_bytes):
+                raise ValueError("resolved reservation count must match producer entries")
+            for entry, size in zip(entries, reservation_bytes):
+                if not isinstance(size, int) or isinstance(size, bool):
+                    raise TypeError("resolved reservation bytes must be Python integers")
+                if size < 0 or size != _align_up(size):
+                    raise ValueError("resolved reservation bytes must be non-negative and aligned")
+                if size > entry.aligned_reservation_bytes:
+                    raise ValueError("resolved reservation exceeds producer input bound")
+                if entry.transport_type is TransportType.IDENTITY and size < _align_up(
+                    prod(entry.input_shape) * entry.element_size
+                ):
+                    raise ValueError("IDENTITY reservation cannot be smaller than actual bytes")
+            return tuple(
+                (size, self._needs_reclaim(entry, size))
+                for entry, size in zip(entries, reservation_bytes)
+            )
         return tuple(
             (entry.aligned_reservation_bytes, self._needs_reclaim(entry))
             for entry in entries
         )
 
-    def _needs_reclaim(self, entry: ProducerPlanEntry) -> bool:
-        tensor_bytes = (
-            prod(entry.input_shape)
-            * torch.empty((), dtype=entry.dtype).element_size()
-        )
-        tensor_aligned_bytes = (tensor_bytes + 15) & ~15
+    def _needs_reclaim(
+        self, entry: ProducerPlanEntry, reservation_bytes: int | None = None,
+    ) -> bool:
+        tensor_bytes = prod(entry.input_shape) * entry.element_size
+        tensor_aligned_bytes = _align_up(tensor_bytes)
         return not (
             entry.transport_type is TransportType.IDENTITY
             and entry.output_id not in self._device_gated_output_ids
-            and entry.aligned_reservation_bytes == tensor_aligned_bytes
+            and (entry.aligned_reservation_bytes if reservation_bytes is None
+                 else reservation_bytes) == tensor_aligned_bytes
         )
 
     def _encode(

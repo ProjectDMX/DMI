@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import pytest
 import torch
+from dataclasses import replace
 
-from dmi.hooks.record import HookOutput, TransportSpec, TransportType
-from dmi.hooks.producer_plan import ProducerPlanBuilder
+from dmi.hooks.record import HookOutput, OutputSizingMode, TransportSpec, TransportType
+from dmi.hooks.producer_plan import (
+    ProducerPlanBuilder, ProducerPlanEntry, _align_up, _dtype_element_size,
+)
 
 pytestmark = pytest.mark.cpu
 
@@ -88,3 +91,64 @@ def test_plan_contains_no_framework_semantic_coordinates():
         "invocation_id",
     }
     assert forbidden.isdisjoint(entry.__dataclass_fields__)
+
+
+@pytest.mark.parametrize("dtype", [
+    torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
+    torch.float16, torch.bfloat16, torch.float32, torch.float64,
+    torch.complex64, torch.complex128,
+])
+def test_dtype_size_is_cached_without_caching_tensor_size(dtype, monkeypatch):
+    entry = ProducerPlanBuilder().record_output(
+        output_id=100, output_spec=TransportSpec("x"),
+        output=HookOutput(torch.empty(3, dtype=dtype)),
+    )
+    expected = torch.empty((), dtype=dtype).element_size()
+    _dtype_element_size.cache_clear()
+    real_empty = torch.empty
+    calls = []
+
+    def counted_empty(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", counted_empty)
+    for _ in range(5):
+        assert entry.element_size == expected
+    assert len(calls) == 1
+    assert calls[0][1]["device"] == "cpu"
+    changed = replace(entry, dtype=torch.float64)
+    assert changed.element_size == 8
+    assert len(calls) == (1 if dtype is torch.float64 else 2)
+
+
+def test_explicit_alignment_does_not_require_native_backend(monkeypatch):
+    import dmi.hooks.producer_plan as plans
+
+    def forbidden():
+        raise AssertionError("explicit arithmetic must not load native")
+
+    monkeypatch.setattr(plans, "_payload_alignment", forbidden)
+    assert _align_up(33, 16) == 48
+    assert _align_up(0, 16) == 0
+
+
+def test_runtime_sized_eager_entries_are_always_fresh_and_graphs_reject_them():
+    spec = TransportSpec("ep_output", sizing_mode=OutputSizingMode.RUNTIME_SIZED)
+    entries = []
+    for count in (128, 128, 32, 128):
+        output = HookOutput(torch.empty(count, 512, dtype=torch.bfloat16))
+        entries.append(ProducerPlanEntry.from_output(
+            output_id=100, output_spec=spec, output=output,
+        ))
+        with pytest.raises(ValueError, match="ep_output.*RUNTIME_SIZED.*eager"):
+            ProducerPlanBuilder().record_output(output_id=100, output_spec=spec, output=output)
+    assert len({id(entry) for entry in entries}) == 4
+    assert [entry.aligned_reservation_bytes for entry in entries] == [
+        131072, 131072, 32768, 131072]
+    assert entries[0].input_shape == (128, 512)
+
+
+def test_sizing_mode_requires_the_enum():
+    with pytest.raises(TypeError, match="OutputSizingMode"):
+        TransportSpec("bad", sizing_mode="runtime_sized")

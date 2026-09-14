@@ -114,6 +114,68 @@ class _EmptyFormat(_Format):
         )
 
 
+def test_reclaim_dtype_size_does_not_allocate_after_warmup(monkeypatch):
+    runtime = RecordRuntime(_Transport(), _Format())
+    entry = ProducerPlanBuilder().record_output(
+        output_id=1 << 16, output_spec=TransportSpec("x"),
+        output=HookOutput(torch.empty(3, dtype=torch.float32)),
+    )
+    assert not runtime._needs_reclaim(entry)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("reclaim allocated a scalar tensor after warmup")
+
+    monkeypatch.setattr(torch, "empty", forbidden)
+    for count in (3, 16, 2):
+        assert not runtime._needs_reclaim(replace(
+            entry, input_shape=(count,), output_shape=(count,),
+            reservation_upper_bytes=count * entry.element_size))
+
+
+def test_resolved_packed_reservations_do_not_mutate_the_entry(monitoring_debug):
+    monitoring_debug(False)
+    transport = _Transport()
+    runtime = RecordRuntime(transport, _Format())
+    output = HookOutput(torch.empty(1024, 2, 512, dtype=torch.bfloat16))
+    entry = ProducerPlanBuilder().record_output(
+        output_id=1 << 16,
+        output_spec=TransportSpec("packed", transport_type=TransportType.SEQ_PREFIX_PACK,
+                                  feature_bytes=1024, output_shape=(-1, 512)),
+        output=output,
+    )
+    original = entry.reservation_upper_bytes
+    for size in (393216, 786432, 0):
+        runtime._emit_prepared_output(entry, str(size), output, reservation_bytes=size)
+    assert [event[1] for event in transport.events if event[0] == "reserve"] == [
+        ((393216, True),), ((786432, True),), ((0, True),)]
+    assert entry.reservation_upper_bytes == original == 2097152
+    assert [event[1][0].rows[0][0] for event in transport.events
+            if event[0] == "descriptors"] == ["393216", "786432", "0"]
+    with pytest.raises(ValueError, match="exceeds producer"):
+        runtime._emit_prepared_output(entry, "bad", output, reservation_bytes=original + 16)
+    with pytest.raises(ValueError, match="aligned"):
+        runtime._emit_prepared_output(entry, "bad", output, reservation_bytes=1)
+
+
+def test_only_owned_prepared_entry_skips_duplicate_validation(monkeypatch, monitoring_debug):
+    runtime = RecordRuntime(_Transport(), _Format())
+    output = HookOutput(torch.ones(4))
+    entry = ProducerPlanBuilder().record_output(
+        output_id=1 << 16, output_spec=TransportSpec("x"), output=output)
+
+    def forbidden(*args):
+        raise AssertionError("entry check")
+
+    monkeypatch.setattr(runtime, "_validate_entry_output", forbidden)
+    monitoring_debug(False)
+    runtime._emit_prepared_output(entry, "ok", output, reservation_bytes=16)
+    with pytest.raises(AssertionError, match="entry check"):
+        runtime.emit_output(entry, "public", output)
+    monitoring_debug(True)
+    with pytest.raises(AssertionError, match="entry check"):
+        runtime._emit_prepared_output(entry, "debug", output, reservation_bytes=16)
+
+
 class _PayloadFreeProducerFormat:
     schema = RecordSchema(
         (
