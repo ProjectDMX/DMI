@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
 from dmi.adapters.base import StepReservation
+from dmi.hooks import point as _hook_point, set_monitoring_debug
 from dmi.hooks.record import (
     HookOutput,
     HookPointV1,
@@ -25,6 +28,12 @@ from dmi.records import (
 )
 
 pytestmark = pytest.mark.cpu
+
+
+@pytest.fixture
+def monitoring_debug(monkeypatch):
+    monkeypatch.setattr(_hook_point, "_MONITORING_DEBUG", False)
+    return set_monitoring_debug
 
 
 class _Transport:
@@ -227,7 +236,8 @@ def test_replay_publishes_one_empty_descriptor_per_producer_occurrence():
     assert all(descriptor.rows == () for descriptor in descriptors)
 
 
-def test_nonempty_producer_descriptor_requires_payload_slice():
+def test_nonempty_producer_descriptor_requires_payload_slice(monitoring_debug):
+    monitoring_debug(True)
     runtime, transport, output, entry = _runtime_and_entry(
         record_format=_PayloadFreeProducerFormat()
     )
@@ -235,6 +245,71 @@ def test_nonempty_producer_descriptor_requires_payload_slice():
     with pytest.raises(ValueError, match="must contain a PayloadSlice"):
         runtime.emit_output(entry, "batch-7", output)
 
+    assert transport.events == []
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_descriptor_checks_are_skipped_without_debug(
+    monitoring_debug, monkeypatch, replay,
+):
+    runtime, transport, output, entry = _runtime_and_entry()
+
+    def unexpected_validation(*args, **kwargs):
+        pytest.fail("descriptor validation ran with monitoring debug disabled")
+
+    monkeypatch.setattr(runtime, "_validate_descriptor", unexpected_validation)
+    monkeypatch.setattr(runtime, "_validate_payload_slices", unexpected_validation)
+    monkeypatch.setattr(RecordDescriptor, "has_payload", property(unexpected_validation))
+
+    if replay:
+        result = runtime.prepare_replay(ProducerPlan((entry,)), ("batch-7",))
+    else:
+        result = runtime.emit_output(entry, "batch-7", output)
+
+    assert result is StepReservation.RESERVED
+    assert transport.events == [
+        ("reserve", ((16, False),)),
+        ("descriptors", (_Format().encode("batch-7", entry),)),
+    ]
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_debug_toggle_preserves_valid_descriptors_and_reservations(monitoring_debug, replay):
+    runtime, transport, output, entry = _runtime_and_entry()
+    events = []
+    for enabled in (False, True, False):
+        monitoring_debug(enabled)
+        transport.events.clear()
+        if replay:
+            runtime.prepare_replay(ProducerPlan((entry,)), ("batch-7",))
+        else:
+            runtime.emit_output(entry, "batch-7", output)
+        events.append(list(transport.events))
+    assert events[0] == events[1] == events[2]
+
+
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("override, error, match", [
+    ({"output_id": 0}, ValueError, "output_id does not match"),
+    ({"rows": (("tag",),)}, ValueError, "requires 2"),
+    ({"rows": ((0, PayloadSlice(dtype=torch.float32)),)}, TypeError, "requires string"),
+    ({"rows": (("tag", PayloadSlice(dtype=torch.float64)),)}, ValueError, "dtype changed"),
+    ({"rows": (("tag", PayloadSlice(dtype=torch.float32, nbytes=32)),)},
+     ValueError, "exceeds producer reservation bound"),
+])
+def test_debug_rejects_invalid_descriptors_before_reservation(
+    monitoring_debug, monkeypatch, replay, override, error, match,
+):
+    runtime, transport, output, entry = _runtime_and_entry()
+    descriptor = replace(_Format().encode("batch-7", entry), **override)
+    monkeypatch.setattr(runtime._format, "encode", lambda metadata, plan: descriptor)
+    monitoring_debug(True)
+
+    with pytest.raises(error, match=match):
+        if replay:
+            runtime.prepare_replay(ProducerPlan((entry,)), ("batch-7",))
+        else:
+            runtime.emit_output(entry, "batch-7", output)
     assert transport.events == []
 
 

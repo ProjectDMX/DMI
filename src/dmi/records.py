@@ -11,6 +11,7 @@ from typing import Any, Generic, Protocol, Sequence, TypeVar, runtime_checkable
 import torch
 
 from .adapters.base import StepReservation
+from .hooks import point as _hook_point
 from .hooks.record import (
     HookOutput,
     HookPointV1,
@@ -410,15 +411,18 @@ class RecordRuntime(Generic[MetadataT]):
         metadata: MetadataT,
         entry: ProducerPlanEntry,
     ) -> RecordDescriptor:
-        if entry.output_id not in self._bound_output_ids:
+        if _hook_point._MONITORING_DEBUG and entry.output_id not in self._bound_output_ids:
             raise ValueError(
                 f"producer output_id {entry.output_id} is not bound to this runtime"
             )
         descriptor = self._format.encode(metadata, entry)
-        self._validate_descriptor(descriptor, expected_output_id=entry.output_id)
-        if descriptor.rows and not descriptor.has_payload:
-            raise ValueError("producer RecordDescriptor must contain a PayloadSlice")
-        self._validate_payload_slices(descriptor, entry)
+        # Repeated descriptor scans belong to the existing monitoring debug
+        # mode, not the eager/replay submission hot path.
+        if _hook_point._MONITORING_DEBUG:
+            self._validate_descriptor(descriptor, expected_output_id=entry.output_id)
+            if descriptor.rows and not descriptor.has_payload:
+                raise ValueError("producer RecordDescriptor must contain a PayloadSlice")
+            self._validate_payload_slices(descriptor, entry)
         return descriptor
 
     def _validate_descriptor(
