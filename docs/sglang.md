@@ -1,6 +1,6 @@
 # SGLang usage
 
-DMI supports official SGLang 0.5.19 through the version-matched integration
+DMI provides experimental support for official SGLang 0.5.19 through the version-matched integration
 checkout pinned at `third_party/sglang-integration/`. It does not contain an
 SGLang fork: the integration is an out-of-tree package that registers through
 SGLang's general-plugin entry point (`sglang.srt.plugins`) and its external
@@ -32,16 +32,18 @@ The integration checkout's
 records the exact dependency resolution used for qualification (uv, pinned
 torch constraints, no Rust extensions).
 
-The integration fails before device initialization when it detects an
-unsupported SGLang version, architecture, or execution mode (TP/PP/DP,
-speculative decoding, LoRA, torch.compile, PD disaggregation, and others). See
+The integration rejects unsupported versions and checks architecture/execution
+modes before DMI allocation and weight loading. Upstream device/distributed
+initialization may already have happened. Rejected modes include TP/PP/DP,
+speculative decoding, LoRA, torch.compile, PD disaggregation, and others. See
 the integration's
 [port audit](https://github.com/ProjectDMX/DMI-SGLang-Integration/blob/main/docs/v0519-port.md)
 for the qualified compatibility cells.
 
 ## Offline API
 
-`DMIEngine` is a drop-in replacement for `sglang.Engine`. It forwards every
+For the qualified offline, non-streaming generation API, use `DMIEngine`
+instead of `sglang.Engine`. It forwards every
 `ServerArgs` keyword unchanged, carries DMI settings to the spawned worker
 processes, and tags each output with a lazy `dmi_internal` readback handle:
 
@@ -75,6 +77,8 @@ Call `dmi_stop_monitoring()` before `shutdown()`: SGLang terminates its worker
 processes without a graceful path, so the explicit RPC is the only durable
 flush point. Monitoring is terminal for the engine; create a new `DMIEngine`
 for another capture.
+If flush fails, repeated stop calls continue to report failure; shutdown is not
+proof of successful persistence. Construct engines sequentially in one process.
 
 Plain `sglang.Engine` also works when the integration package is installed:
 set the `DMX_*` environment variables before constructing it. Set
@@ -91,6 +95,10 @@ baseline in the same environment.
 | GPU payload ring / pinned staging | `DMX_RING_PAYLOAD_MB`, `DMX_RING_PINNED_MB` | `1024`, `1024` |
 | Device-side padding strip | `DMX_GPU_PADDING_STRIP` | `1` |
 | System `libstdc++` preload for conda interpreters | `DMX_SGLANG_PRELOAD_LIBSTDCXX` | `auto` |
+
+The table describes plain-plugin environment defaults. `DMIEngine` instead
+defaults to a unique capture ID and ClickHouse on localhost, exports its
+overrides only during worker startup, and restores the parent's environment.
 
 ## Troubleshooting
 
