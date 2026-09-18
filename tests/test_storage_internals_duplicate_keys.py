@@ -99,3 +99,37 @@ def test_one_shard_alone_is_still_readable():
     hs = get_internal("m", _FakeReader(rows)).hidden_states
 
     assert tuple(hs[0].shape) == (1, 3, 4)
+
+
+def test_selecting_a_shard_rank_reads_that_shard_alone():
+    """The refusal's prescribed remedy -- 'select a single shard_rank before
+    reading' -- must be an actual parameter, and must return exactly that
+    shard's tensors."""
+    rows = [
+        _row("0:0", 0, 0, torch.ones(3, 4), shard_rank=0),
+        _row("0:0", 0, 0, torch.ones(3, 4) * 2, shard_rank=1),
+    ]
+
+    hs0 = get_internal("m", _FakeReader(rows), shard_rank=0).hidden_states
+    hs1 = get_internal("m", _FakeReader(rows), shard_rank=1).hidden_states
+
+    assert torch.equal(hs0[0][0], torch.ones(3, 4))
+    assert torch.equal(hs1[0][0], torch.ones(3, 4) * 2)
+
+    # Without a rank the collision is still refused by name.
+    with pytest.raises(RuntimeError, match="shard_rank"):
+        get_internal("m", _FakeReader(rows)).hidden_states
+
+
+def test_lazy_internal_accepts_a_shard_rank_too():
+    """The lazy counterpart takes the same selector."""
+    from dmi.storage.internals import make_lazy_internal
+
+    rows = [
+        _row("0:0", 0, 0, torch.ones(3, 4), shard_rank=0),
+        _row("0:0", 0, 0, torch.ones(3, 4) * 2, shard_rank=1),
+    ]
+
+    lazy = make_lazy_internal("m", _FakeReader(rows), shard_rank=1)
+
+    assert torch.equal(lazy.hidden_states[0][0], torch.ones(3, 4) * 2)

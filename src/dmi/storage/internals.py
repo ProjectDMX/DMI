@@ -324,9 +324,11 @@ class LazyInternal:
         requirements: InternalRequirements | None = None,
         request_ids: tuple[str, ...] | list[str] | None = None,
         token_ranges: dict[str, tuple[tuple[int, int], ...] | list[tuple[int, int]]] | None = None,
+        shard_rank: int | None = None,
     ) -> None:
         self._model_id = model_id
         self._reader = reader
+        self._shard_rank = shard_rank
         self._requirements = (
             requirements.copy() if requirements is not None else InternalRequirements()
         )
@@ -442,12 +444,16 @@ class LazyInternal:
             rows = []
             for request_id in self._request_ids:
                 rows.extend(reader.prefix_get((self._model_id, request_id, act)))
-            return rows
-        return [
-            (key, tensor)
-            for key, tensor in reader.prefix_get((self._model_id,))
-            if key[2] == act
-        ]
+        else:
+            rows = [
+                (key, tensor)
+                for key, tensor in reader.prefix_get((self._model_id,))
+                if key[2] == act
+            ]
+        if self._shard_rank is not None:
+            rows = [(key, tensor) for key, tensor in rows
+                    if key[4] == self._shard_rank]
+        return rows
 
     def _expected_non_empty_ranges(self, request_id: str) -> tuple[tuple[int, int], ...]:
         return tuple(
@@ -596,7 +602,9 @@ class LazyInternal:
     @property
     def available(self) -> list[str]:
         if not self._request_ids:
-            return get_internal(self._model_id, self._reader).available
+            return get_internal(
+                self._model_id, self._reader, shard_rank=self._shard_rank
+            ).available
         fields = []
         for field in sorted(_FIELDS):
             if self._read_rows_for_field(field):
@@ -623,6 +631,7 @@ def make_lazy_internal(
     requirements: InternalRequirements | None = None,
     request_ids: tuple[str, ...] | list[str] | None = None,
     token_ranges: dict[str, tuple[tuple[int, int], ...] | list[tuple[int, int]]] | None = None,
+    shard_rank: int | None = None,
 ) -> LazyInternal:
     return LazyInternal(
         model_id,
@@ -630,19 +639,28 @@ def make_lazy_internal(
         requirements=requirements,
         request_ids=request_ids,
         token_ranges=token_ranges,
+        shard_rank=shard_rank,
     )
 
 
-def get_internal(model_id: str, reader: CHClickhouseDriverReadOnly | None = None) -> Internal:
+def get_internal(
+    model_id: str,
+    reader: CHClickhouseDriverReadOnly | None = None,
+    shard_rank: int | None = None,
+) -> Internal:
     """Retrieve a run's captured internals.
 
     ``model_id`` identifies the captured run. ``reader`` defaults to a local
     ClickHouse connection (``DMX_DB_HOST`` / ``DMX_DB_PORT``); pass one to read
-    a run from another process or host.
+    a run from another process or host. ``shard_rank`` selects one TP rank's
+    rows from a run where several ranks wrote the same tokens (the collision
+    reassembly otherwise refuses by name); None keeps every row.
     """
     reader = reader or _default_reader()
     rows_by_act: dict[str, list] = {}
     for key, tensor in reader.prefix_get((model_id,)):
+        if shard_rank is not None and key[4] != shard_rank:
+            continue
         rows_by_act.setdefault(key[2], []).append((key, tensor))
     fields = {
         field: reassemble(rows_by_act[act])
