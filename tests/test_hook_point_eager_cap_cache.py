@@ -5,11 +5,13 @@ engine.staging_cap())`` on every eager invocation -- two pybind crossings per
 hook forward on a path the native header documents as "not called per-step"
 (native/csrc/ring/ring_engine_py.h), and it did so even on the cpu-direct
 strip branch that never uses the value. The caps are fixed for the life of an
-engine, so the min is computed once per hook arming and cached.
+engine, so the min is computed once per transport arming, cached on the
+transport, and shared by every hook.
 
 These mirror the eager-routing fakes of tests/test_producer_chunked_schema.py
 but need no native extension: ``dispatch_producer`` is monkeypatched and the
-fake transport supplies the engine.
+counting engine stands in for the native one behind a real ``RingTransport``,
+so the cache under test is the production one.
 """
 from __future__ import annotations
 
@@ -29,6 +31,9 @@ class _CountingEagerRingEngine:
         self.payload_cap_calls = 0
         self.staging_cap_calls = 0
 
+    def payload_tensor(self) -> torch.Tensor:
+        return torch.empty(64, dtype=torch.uint8, device="cuda")
+
     def available_capacity(self) -> int:
         return self.available
 
@@ -47,12 +52,18 @@ class _CountingEagerRingEngine:
         self.flushes += 1
 
 
-class _FakeEagerTransport:
-    force_eager = True
+class _DirectRecordingTransport:
+    """RingTransport with submit_cpu_direct recording instead of dispatching."""
 
     def __init__(self, engine: _CountingEagerRingEngine):
-        self._ring_engine = engine
+        from dmi.transport.ring import RingTransport
+
+        self._transport = RingTransport(engine)
+        self._transport.force_eager = True
         self.direct: list[torch.Tensor] = []
+
+    def __getattr__(self, name):
+        return getattr(self._transport, name)
 
     def submit_cpu_direct(self, tensor, hook_type, hook_id) -> None:
         self.direct.append(tensor)
@@ -62,7 +73,7 @@ def _eager_hook(monkeypatch, engine, dispatched):
     from dmi.hooks.point import HookPoint
     from dmi.transport import ring as ring_transport
 
-    transport = _FakeEagerTransport(engine)
+    transport = _DirectRecordingTransport(engine)
     monkeypatch.setattr(ring_transport, "_active_transport", transport)
     monkeypatch.setattr(
         "dmi.hooks.point.dispatch_producer",
@@ -71,7 +82,7 @@ def _eager_hook(monkeypatch, engine, dispatched):
     hook = HookPoint()
     hook._ring_hook_type = 1
     hook._ring_hook_id = 2
-    hook._ring_payload = torch.empty(64, dtype=torch.uint8, device="cuda")
+    hook._ring_payload = transport._ring_payload
     return hook, transport
 
 
@@ -134,27 +145,26 @@ def test_the_cached_ceiling_still_routes_over_staging_bytes_to_cpu_direct(monkey
     assert engine.reserved == [32]
 
 
-def test_rearming_the_hook_forgets_the_cached_ceiling(monkeypatch):
-    """A re-attach may bind a different engine; the cache must not outlive
-    the arming that produced it."""
+def test_a_new_arming_queries_the_new_engines_caps(monkeypatch):
+    """A re-attach arms a fresh transport over a possibly different engine;
+    the cache is per-transport, so the new caps are read, not the old min."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
-    from dmi.hooks.dispatch import install_ring_hooks, uninstall_ring_hooks
+    engine_one = _CountingEagerRingEngine(available=4096, capacity=4096)
+    hook_one, transport_one = _eager_hook(monkeypatch, engine_one, [])
+    hook_one(torch.arange(17, dtype=torch.uint8, device="cuda"))
+    assert transport_one.effective_cap == 4096
+    assert engine_one.payload_cap_calls == 1
+    assert engine_one.staging_cap_calls == 1
 
-    engine = _CountingEagerRingEngine(available=4096, capacity=4096)
-    dispatched = []
-    hook, transport = _eager_hook(monkeypatch, engine, dispatched)
-
-    hook(torch.arange(17, dtype=torch.uint8, device="cuda"))
-
-    class _Spec:
-        module = hook
-        hook_type = 1
-        layer_no = 2
-
-    uninstall_ring_hooks([_Spec()])
-    assert getattr(hook, "_ring_effective_cap", None) is None
-
-    install_ring_hooks([_Spec()], ring_payload=hook._ring_payload)
-    assert getattr(hook, "_ring_effective_cap", None) is None
+    # Re-arming over an engine whose staging is smaller: the new transport
+    # must publish the new ceiling, and the old engine is never consulted.
+    engine_two = _CountingEagerRingEngine(
+        available=4096, capacity=4096, staging=64)
+    hook_two, transport_two = _eager_hook(monkeypatch, engine_two, [])
+    hook_two(torch.arange(17, dtype=torch.uint8, device="cuda"))
+    assert transport_two.effective_cap == 64
+    assert engine_two.payload_cap_calls == 1
+    assert engine_two.staging_cap_calls == 1
+    assert engine_one.payload_cap_calls == 1, "old engine must not be re-read"
