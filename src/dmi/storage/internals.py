@@ -67,9 +67,14 @@ def _ordered_chunks(chunks: list, *, act_name: str, request_id: str) -> list:
     refusing is the only correct answer. The caller picks a ``shard_rank``,
     exactly as the repo's own comparison tooling does.
     """
-    starts = [start for start, _ in chunks]
-    if len(set(starts)) != len(starts):
-        duplicated = sorted({s for s in starts if starts.count(s) > 1})
+    # One pass over the starts, not ``starts.count(s)`` per start: a long
+    # chunked capture (hundreds of rows per request/layer) otherwise paid
+    # O(n^2) to build a diagnostic that only names the repeats.
+    counts: dict[int, int] = {}
+    for start, _ in chunks:
+        counts[start] = counts.get(start, 0) + 1
+    duplicated = sorted(start for start, count in counts.items() if count > 1)
+    if duplicated:
         raise RuntimeError(
             f"{act_name}: duplicate capture chunks for request {request_id!r} "
             f"at start token(s) {duplicated} -- the same tokens were captured "

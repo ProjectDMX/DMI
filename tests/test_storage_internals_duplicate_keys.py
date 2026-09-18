@@ -66,6 +66,25 @@ def test_single_element_chunks_are_refused_rather_than_silently_merged():
         get_internal("m", _FakeReader(rows)).hidden_states
 
 
+def test_only_the_colliding_start_tokens_are_named_sorted():
+    """With several chunks where only some starts collide, the diagnostic
+    must name exactly the duplicated starts, sorted -- not every start."""
+    rows = [
+        _row("0:0", 0, 4, torch.ones(2, 4), shard_rank=0),
+        _row("0:0", 0, 4, torch.ones(2, 4) * 2, shard_rank=1),
+        _row("0:0", 0, 0, torch.ones(2, 4), shard_rank=0),
+        _row("0:0", 0, 0, torch.ones(2, 4) * 3, shard_rank=1),
+        _row("0:0", 0, 2, torch.ones(2, 4), shard_rank=0),
+    ]
+
+    with pytest.raises(RuntimeError, match="duplicate") as excinfo:
+        get_internal("m", _FakeReader(rows)).hidden_states
+
+    message = str(excinfo.value)
+    assert "[0, 4]" in message, "must list the duplicated starts, sorted"
+    assert "[0, 2, 4]" not in message, "must not name the unique start"
+
+
 def test_a_non_layered_field_refuses_the_same_collision():
     """_reassemble_global carries its own copy of the sort."""
     rows = [
