@@ -11,14 +11,17 @@ SRCS := csrc/bindings.cpp \
         csrc/clickhouse_record_sink.cpp \
         csrc/reference_python_capture_sink.cpp \
         csrc/clickhouse_client.cpp \
+        csrc/common/curl_init.cpp \
         csrc/ring/drain_thread.cpp \
         csrc/ring/p2p_thread.cpp \
         csrc/ring/record_consumer.cpp \
         csrc/ring/ring_torch_op.cpp
 HOST_SRCS := csrc/bindings.cpp csrc/clickhouse_client.cpp \
+             csrc/common/curl_init.cpp \
              csrc/pack/pack_builder.cpp
 HEADERS := csrc/dmx_host_utils.h \
            csrc/clickhouse_client.h csrc/clickhouse_record_sink.h \
+           csrc/common/curl_init.h \
            csrc/reference_python_capture_sink.h \
            csrc/dmx_host_engine.h csrc/record_schema.h \
            csrc/ring/ring_config.h csrc/ring/ring_state.h csrc/ring/ring_alloc.h \
@@ -122,6 +125,16 @@ PYTHON_INCLUDE_FLAGS := $(shell $(PYTHON) -c "import sysconfig; paths = sysconfi
 # Pybind11 ABI flags
 PYBIND_FLAGS := $(shell $(PYTHON) -c "import pybind11; print(' '.join([f'-DPYBIND11_COMPILER_TYPE=\\\"{pybind11.get_compiler_type()}\\\"', f'-DPYBIND11_STDLIB=\\\"{pybind11.get_stdlib()}\\\"', f'-DPYBIND11_BUILD_ABI=\\\"{pybind11.get_build_abi()}\\\"']))" 2>/dev/null || echo "")
 
+# libcurl headers/dev symlink for the extension builds: the shared
+# process-lifetime init (common/curl_init.cpp) is compiled into both. The
+# runtime libcurl.so.4 ships with the OS; the dev symlink comes from
+# CURL_INCDIR/CURL_LIBDIR (a dev .deb extract by default, no root needed):
+#   apt-get download libcurl4-openssl-dev && dpkg-deb -x <deb> <sysroot>
+# Override on machines with system curl-dev:
+#   make CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu ...
+CURL_INCDIR ?= /tmp/opencode/sysroot/usr/include/x86_64-linux-gnu
+CURL_LIBDIR ?= /tmp/opencode/sysroot/usr/lib/x86_64-linux-gnu
+
 CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
             -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=$(TARGET) \
             $(ABI_FLAG) $(PYBIND_FLAGS) \
@@ -167,6 +180,20 @@ HOST_LDFLAGS += -L$(CLICKHOUSE_CONTRIB)/lz4/lz4 -llz4 \
                 -L$(CLICKHOUSE_CONTRIB)/cityhash/cityhash -lcityhash \
                 -L$(CLICKHOUSE_CONTRIB)/absl/absl -labsl_int128 \
                 -L$(CLICKHOUSE_CONTRIB)/zstd/zstd -lzstdstatic
+
+# ---- libcurl (common/curl_init.cpp is in both extension source lists) ------
+# The include/link dirs are only added when the configured dev tree exists:
+# a system with curl-dev in the default search path needs neither.
+ifneq ($(wildcard $(CURL_INCDIR)/curl/curl.h),)
+CXXFLAGS += -I$(CURL_INCDIR)
+HOST_CXXFLAGS += -I$(CURL_INCDIR)
+endif
+ifneq ($(wildcard $(CURL_LIBDIR)/libcurl.so),)
+LDFLAGS += -L$(CURL_LIBDIR)
+HOST_LDFLAGS += -L$(CURL_LIBDIR)
+endif
+LDFLAGS += -lcurl
+HOST_LDFLAGS += -lcurl
 
 # ---- CUDA kernel compilation (nvcc) ----------------------------------------
 SM_ARCH ?= native
@@ -269,22 +296,17 @@ build/bench_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/rec
 	    -Icsrc/sink -Icsrc/pack -Icsrc/store -Icsrc/common -lcrypto -lpthread
 
 # A2a SigV4 conformance driver: no torch/pybind/network; runs in any CI job.
-# libcurl headers come from CURL_INCDIR (dev .deb extract); the runtime
-# libcurl.so.4 ships with the OS. Override on machines with system curl-dev:
-#   make CURL_INCDIR=/usr/include/x86_64-linux-gnu ...
-CURL_INCDIR ?= /tmp/opencode/sysroot/usr/include/x86_64-linux-gnu
+# libcurl headers come from CURL_INCDIR (defined with the extension flags
+# above); the runtime libcurl.so.4 ships with the OS.
 build/conformance_sign: csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/store/s3_sign.h csrc/common/json.cpp csrc/common/json.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
 	    csrc/store/s3_sign.cpp csrc/store/conformance_sign.cpp csrc/common/json.cpp \
 	    -Icsrc/store -Icsrc/common -lcrypto
 
-# A2 store conformance driver + fault-matrix target. libcurl headers come from
-# the dev .deb extracted to a sysroot (no root needed):
-#   apt-get download libcurl4-openssl-dev && dpkg-deb -x <deb> <sysroot>
-# The link needs only -L; the runtime libcurl.so.4 ships with the OS. Override:
-#   make CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu ...
-CURL_LIBDIR ?= /tmp/opencode/sysroot/usr/lib/x86_64-linux-gnu
+# A2 store conformance driver + fault-matrix target. libcurl headers/libs come
+# from CURL_INCDIR/CURL_LIBDIR (defined with the extension flags above); the
+# link needs only -L; the runtime libcurl.so.4 ships with the OS.
 build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/store/s3_sign.h csrc/store/s3_client.h csrc/store/spool.h csrc/store/uploader.h csrc/common/json.cpp csrc/common/json.h csrc/common/curl_init.cpp csrc/common/curl_init.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
