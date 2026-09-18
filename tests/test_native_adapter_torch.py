@@ -335,6 +335,28 @@ def test_a_fixed_dimension_product_that_overflows_is_refused(tmp_path):
     assert sink.snapshot()["submitted_records"] == 0
 
 
+def test_a_fixed_shape_whose_product_overflows_is_refused(tmp_path):
+    """No dynamic dim: the fixed product must still be checked.
+
+    ResolveShape returned early when nothing had to be inferred, and
+    SubmitRow's own element-count multiply is unchecked, so three 2^30 dims
+    wrapped to 0 and matched an empty payload -- admitted with a shape whose
+    product never fit. The reference's checked_product refuses it.
+    """
+    dim = 2**30
+    meta = _meta(0)
+    meta["shape"] = [dim, dim, dim]
+    CaptureMetadata.from_mapping(meta)
+    sink, lease = _make_sink(tmp_path)
+    with pytest.raises(RuntimeError, match="overflows uint64"):
+        sink.submit_envelope(
+            LAYOUT,
+            [_row(meta, 0, 0, "float32", shape=(dim, dim, dim))],
+            torch.zeros(0, dtype=torch.float32),
+        )
+    assert sink.snapshot()["submitted_records"] == 0
+
+
 def test_a_slice_that_is_not_a_whole_number_of_elements_is_refused(tmp_path):
     """30 bytes is not a whole number of float32s: the reference's guard.
 

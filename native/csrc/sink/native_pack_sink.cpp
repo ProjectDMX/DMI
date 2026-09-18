@@ -29,22 +29,18 @@ bool ResolveShape(const ring::PayloadSlice& slice, uint64_t length_bytes,
                   uint64_t element_bytes, std::vector<int64_t>* shape_out,
                   std::string* error) {
   *shape_out = slice.logical_shape;
-  if (slice.inferred_dynamic_dim < 0) return true;
   const int dim = slice.inferred_dynamic_dim;
   if (dim >= static_cast<int>(shape_out->size())) {
     if (error) *error = "inferred dynamic dim exceeds shape rank";
     return false;
   }
-  if (element_bytes == 0 || length_bytes % element_bytes != 0) {
-    if (error) *error = "payload-slice bytes are not divisible by dtype size";
-    return false;
-  }
-  const uint64_t elements = length_bytes / element_bytes;
   // Checked like the reference's checked_product: a negative fixed dim has no
   // uint64 meaning, and an unchecked multiply can wrap before the modulo
   // below -- a wrapped fixed can divide elements evenly, admitting a shape
   // whose fixed product never fit (a zero inferred dim made `elements % fixed`
-  // pass on an overflowed fixed).
+  // pass on an overflowed fixed). With no dynamic dim the walk covers the
+  // whole shape, so SubmitRow's own unchecked multiply never sees a product
+  // that wrapped to match an empty payload.
   uint64_t fixed = 1;
   for (size_t i = 0; i < shape_out->size(); ++i) {
     if (static_cast<int>(i) == dim) continue;
@@ -61,6 +57,12 @@ bool ResolveShape(const ring::PayloadSlice& slice, uint64_t length_bytes,
     }
     fixed *= dimension;
   }
+  if (dim < 0) return true;
+  if (element_bytes == 0 || length_bytes % element_bytes != 0) {
+    if (error) *error = "payload-slice bytes are not divisible by dtype size";
+    return false;
+  }
+  const uint64_t elements = length_bytes / element_bytes;
   if (fixed == 0 || elements % fixed != 0) {
     if (error) *error = "payload bytes do not factor over the fixed dims";
     return false;
