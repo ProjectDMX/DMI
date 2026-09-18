@@ -49,11 +49,22 @@ std::string Unescape(const std::string& text, size_t& q, bool* ok) {
             return static_cast<long>(v);
           };
           const long first = hex4(q);
-          q += 5;
+          // Advance past the four digits only when they ARE four hex
+          // digits. On failure the "digits" can include the field's real
+          // closing quote -- `"x\u12"` -- and stepping over them stepped
+          // over that quote too, so the loop kept copying the FOLLOWING
+          // JSON text (comma, separator, the next field's key) into this
+          // field's value until the next quote; a truncated escape at the
+          // end of the buffer left q strictly past text.size(). Consuming
+          // only the `u` keeps the decoder on the string: whatever failed
+          // hex4 is copied as literal text, the real closing quote
+          // terminates the value, and the latch still carries the refusal.
           if (first < 0) {
+            ++q;
             reject();
             break;
           }
+          q += 5;
           unsigned v = static_cast<unsigned>(first);
           // json.dumps (ensure_ascii, the default) writes a code point
           // outside the BMP as a UTF-16 surrogate PAIR: U+1F600 is

@@ -1178,19 +1178,26 @@ def test_a_lone_surrogate_is_refused_not_persisted_as_cesu8(sink, tmp_path,
     assert sink.call(op="snapshot")["snapshot"]["submitted_records"] == 0
 
 
-def test_a_malformed_unicode_escape_is_refused_not_decoded(sink, tmp_path):
+@pytest.mark.parametrize("bad_name", ["block\\uZZZZ", "block\\u12"])
+def test_a_malformed_unicode_escape_is_refused_not_decoded(sink, tmp_path,
+                                                           bad_name):
     """\\uZZZZ has no code point; json.loads raises "Invalid \\uXXXX escape".
 
     The four digits were never checked -- `h <= '9' ? h - '0' : (h | 0x20) -
     'a' + 10` accepts anything -- so \\uZZZZ decoded to U+25553 and the field
     was packed as F0 A5 95 93, a name nothing in the request ever spelled.
+    \\u12 is the SHORT variant: its "digits" run into the field's closing
+    quote, which the decoder's unconditional `q += 5` used to step past, so
+    the value swallowed the following JSON text up to the next quote
+    (tests/native/test_json_unescape.cpp pins the alignment itself); the
+    refusal here must hold with the quote intact.
     """
     _open(sink, tmp_path / "spool")
     valid = _row_meta(0, dtype="uint8", shape=[64])
     assert '"hook_name": "h"' in valid, valid
     # A single backslash in the metadata TEXT: json.dumps doubles it on the
     # wire, and the driver's outer FindString undoes exactly that doubling.
-    metadata = valid.replace('"hook_name": "h"', '"hook_name": "block\\uZZZZ"')
+    metadata = valid.replace('"hook_name": "h"', f'"hook_name": "{bad_name}"')
     with pytest.raises(ValueError):
         json.loads(metadata)
 

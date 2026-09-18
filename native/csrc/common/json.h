@@ -16,7 +16,8 @@ namespace dmi_common {
 // JSON string escape sequences back to raw bytes; \uXXXX to UTF-8, with a
 // UTF-16 surrogate pair combined into its one non-BMP code point.
 // `q` must be positioned just after the opening quote; returns with `q` on
-// the closing quote.
+// the closing quote (at text.size() for an unterminated text, never past
+// it -- a malformed escape does not advance over the quote or the end).
 //
 // `ok`, when given, is CLEARED (never set) for an escape that has no code
 // point behind it: a \uXXXX whose digits are not hex, and a surrogate with
