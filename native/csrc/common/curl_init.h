@@ -26,7 +26,9 @@
 namespace dmi_common {
 
 // Runs curl_global_init(CURL_GLOBAL_DEFAULT) exactly once per process.
-// Safe to call from any thread, any number of times.
+// Safe to call from any thread, any number of times; throws std::runtime_error
+// if libcurl's process-global initialization failed, so the constructing
+// client does not proceed on a library that was never initialized.
 void EnsureCurlGlobalInit();
 
 }  // namespace dmi_common
