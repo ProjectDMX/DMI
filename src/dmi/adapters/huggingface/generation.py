@@ -472,11 +472,13 @@ def generate_greedy_with_monitoring(
         logits_to_keep: 0 = all rows, 1 = last position only.
         cuda_graphs: if True, compile decode step with reduce-overhead +
             StaticCache.  If False, use HF default DynamicCache, no compile.
-            NOTE: the compiled decode step is not given an attention mask --
-            a per-step-growing mask would change shape every step and defeat
-            CUDA-graph capture -- so left-padded batches are only correct on
-            the eager path (``cuda_graphs=False``).  Right-padded or unpadded
-            batches are unaffected.
+            NOTE: this loop selects the last prompt position's logits, and
+            the compiled decode step is not given an attention mask -- a
+            per-step-growing mask would change shape every step and defeat
+            CUDA-graph capture.  Right-padded prompts are unsupported on
+            either path (the selected logit is a pad), and left-padded
+            batches are only correct on the eager path
+            (``cuda_graphs=False``).  Unpadded batches are unaffected.
         monitoring: if True, install ring transport hooks via HuggingFaceAdapter and
             call before_forward_manual before each forward pass.
         hook_selection: hook selection preset (e.g. "hidden-states", "full").
