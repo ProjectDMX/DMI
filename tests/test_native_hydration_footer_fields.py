@@ -2,7 +2,7 @@
 
 hydrate binds every catalog descriptor to the pack footer by comparing the
 fields of the footer's rendered VALUES row -- one per CAPTURE_COLUMNS entry
-bar index_version (pack_index's renderer, SQL
+barring index_version (pack_index's renderer, SQL
 escaping and all) -- against the catalog row the reader returns (TSV escapes
 already undone, a NULL arriving as the empty string). The two sides only
 compare correctly in ONE representation, so the decoder is pinned here on

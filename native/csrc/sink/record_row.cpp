@@ -67,7 +67,11 @@ bool ParseMetadataJson(const std::string& text,
   out->capture_policy_version = text_field("capture_policy_version");
   out->hook_name = text_field("hook_name");
   if (!text_ok) {
-    return fail("capture metadata text is not encodable UTF-8");
+    // The decoder replaces a malformed \uXXXX (non-hex or truncated digits)
+    // and an unpaired surrogate with U+FFFD, which IS valid UTF-8, so "not
+    // encodable UTF-8" named the wrong failure. These are the only two ways
+    // `ok` is cleared; name them.
+    return fail("capture metadata text has an invalid or unpaired Unicode escape");
   }
   // Presence first: layer_number == -1 is legal (logits-style captures),
   // so FindInt's missing sentinel cannot stand in for absence.

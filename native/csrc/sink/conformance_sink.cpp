@@ -179,7 +179,11 @@ int main() {
   };
   const auto refuse_bad_text = [] {
     std::string out = "{\"ok\":false,\"what\":";
-    jc::EscapeJson("capture metadata text is not encodable UTF-8", &out);
+    // Same wording as ParseMetadataJson's refusal: the decoder replaces a
+    // malformed \uXXXX or an unpaired surrogate with U+FFFD (valid UTF-8),
+    // so the failure is the escape, not the encoding.
+    jc::EscapeJson("capture metadata text has an invalid or unpaired Unicode escape",
+                   &out);
     std::cout << out << "}\n";
   };
   while (std::getline(std::cin, line)) {
