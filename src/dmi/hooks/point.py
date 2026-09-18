@@ -18,7 +18,7 @@ import torch.utils.hooks as hooks
 from torch import Tensor
 
 
-from ..engine import MonitoringEngine
+from ..engine import MonitoringEngine, effective_ring_bytes
 from .dispatch import dispatch_producer
 from .specs import HOOK_TYPE_TO_SHORT_NAME, align_up_py
 
@@ -107,6 +107,14 @@ class HookPoint(nn.Module):
         # bakes them directly into the captured CUDA graph.
         self._ring_hook_type: Optional[int] = None
         self._ring_hook_id: Optional[int] = None
+
+        # Cached effective ring ceiling (engine.effective_ring_bytes) for the
+        # eager safety-net path. The payload/staging caps are fixed for the
+        # life of an engine and the native getters are documented as not to
+        # be called per-step (ring_engine_py.h), so the min is computed once
+        # on the first eager forward after arming and cleared whenever the
+        # hook is (un)installed, since a re-attach may bind another engine.
+        self._ring_effective_cap: Optional[int] = None
 
         # Shared GPU payload-view tensor used as the Tensor(a!) mutation
         # alias for every producer op call from this HookPoint's
@@ -285,16 +293,6 @@ class HookPoint(nn.Module):
             if engine is not None:
                 nbytes = x_cont.nbytes
                 transport_bytes = align_up_py(nbytes, 16)
-                # The ring's real per-step ceiling is min(payload, staging),
-                # not payload alone. The drain assembles each flush batch per
-                # WHOLE entry and breaks when the entry does not fit staging
-                # (drain_thread.cpp), so a tensor larger than staging that is
-                # admitted here is never drained: the capture is lost and its
-                # payload reservation is never released, permanently shrinking
-                # ring capacity, while flush_and_wait() still returns success.
-                # Same ceiling the native prepare_step/reserve_record use, and
-                # the one RingCapacities.effective_bytes publishes.
-                effective_cap = min(engine.payload_cap(), engine.staging_cap())
                 if strip_t is not None:
                     # CPU-direct bypasses ring/staging accounting. Flush older
                     # ring tasks first so the shared metadata FIFO stays in
@@ -304,8 +302,25 @@ class HookPoint(nn.Module):
                     transport.submit_cpu_direct(
                         x_cont.cpu(),
                         self._ring_hook_type, self._ring_hook_id)
-                elif transport_bytes <= min(engine.available_capacity(),
-                                            effective_cap):
+                    return x_cont
+                # The ring's real per-step ceiling is min(payload, staging),
+                # not payload alone. The drain assembles each flush batch per
+                # WHOLE entry and breaks when the entry does not fit staging
+                # (drain_thread.cpp), so a tensor larger than staging that is
+                # admitted here is never drained: the capture is lost and its
+                # payload reservation is never released, permanently shrinking
+                # ring capacity, while flush_and_wait() still returns success.
+                # Same ceiling the native prepare_step/reserve_record use, and
+                # the one RingCapacities.effective_bytes publishes. Both caps
+                # are engine-lifetime constants queried over pybind, so the
+                # min is cached on the hook (cleared on re-arming).
+                effective_cap = self._ring_effective_cap
+                if effective_cap is None:
+                    effective_cap = effective_ring_bytes(
+                        engine.payload_cap(), engine.staging_cap())
+                    self._ring_effective_cap = effective_cap
+                if transport_bytes <= min(engine.available_capacity(),
+                                          effective_cap):
                     engine.reserve_one(nbytes)
                     dispatch_producer(ring_payload, x_cont, strip_t, strip_rb,
                                       self._ring_hook_type, self._ring_hook_id)

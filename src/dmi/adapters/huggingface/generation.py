@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from ...engine import effective_ring_bytes
 from .adapter import (
     HuggingFaceAdapter,
     _prepare_profile_times,
@@ -252,7 +253,8 @@ def _generate_with_monitoring_impl(
         if input_ids is not None and hasattr(input_ids, "shape") and len(input_ids.shape) >= 2:
             batch = int(input_ids.shape[0])
             re = adaptor.ring_engine
-            effective_cap = min(re.payload_cap(), re.staging_cap())
+            effective_cap = effective_ring_bytes(
+                re.payload_cap(), re.staging_cap())
 
             input_len = int(input_ids.shape[1])
             try:

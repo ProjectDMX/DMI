@@ -47,6 +47,9 @@ def install_ring_hooks(
         hook_point._ring_hook_type = spec.hook_type
         hook_point._ring_hook_id = spec.layer_no
         hook_point._ring_payload = ring_payload
+        # A fresh install may bind a different engine; drop any ceiling
+        # cached from a previous arming so forward re-reads the caps once.
+        hook_point._ring_effective_cap = None
 
 
 def uninstall_ring_hooks(specs: Sequence[HookSpec]) -> None:
@@ -77,6 +80,7 @@ def uninstall_ring_hooks(specs: Sequence[HookSpec]) -> None:
             continue
         hook_point._ring_hook_type = None
         hook_point._ring_payload = None
+        hook_point._ring_effective_cap = None
 
 
 __all__ = ["dispatch_producer", "install_ring_hooks", "uninstall_ring_hooks"]
