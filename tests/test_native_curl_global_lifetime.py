@@ -50,9 +50,20 @@ pytestmark = pytest.mark.cpu
 
 
 # Comments are stripped before scanning: these files DOCUMENT why the global
-# calls are absent, and a prose mention is not a call site. Crude but exact
-# enough for this -- no string literal in the tree contains "//" or "/*".
-_COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+# calls are absent, and a prose mention is not a call site. Strings and
+# comments are matched in one alternation so a `//` INSIDE a string literal
+# (s3_client.cpp's "http://") does not open a comment that hides the rest of
+# the line -- a forbidden call placed after such a literal must still be
+# seen. Strings are kept: their contents are not call sites, but dropping
+# them would silently swallow whatever follows, and a false positive fails
+# closed.
+_TOKEN = re.compile(
+    r'"(?:\\.|[^"\\])*"'       # "..." string literal
+    r"|'(?:\\.|[^'\\])*'"      # '...' char literal
+    r"|//[^\n]*"               # // line comment
+    r"|/\*.*?\*/",             # /* block comment */
+    re.DOTALL,
+)
 
 
 def _native_sources() -> list[Path]:
@@ -64,7 +75,10 @@ def _native_sources() -> list[Path]:
 
 
 def _code_of(path: Path) -> str:
-    return _COMMENT.sub("", path.read_text(encoding="utf-8"))
+    return _TOKEN.sub(
+        lambda match: "" if match.group(0)[0] == "/" else match.group(0),
+        path.read_text(encoding="utf-8"),
+    )
 
 
 def test_no_native_source_tears_down_libcurl_globally():
