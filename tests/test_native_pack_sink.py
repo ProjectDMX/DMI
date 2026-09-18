@@ -244,8 +244,11 @@ def test_block_with_timeout_admits_a_record_that_exactly_fits(sink, tmp_path):
     The timeout path itself needs a queue that is full of records a
     consumer has not drained yet. The oracle pins it by stalling its sink
     (tests/_faults.BlockingPackSink, test_capture_pipeline.py); this
-    driver has no equivalent stall, and every alternative here would be a
-    race against the packer thread.
+    driver has no equivalent stall, so the native tier pins it in C++
+    instead: tests/native/test_pack_sink_timeout.cpp (run by
+    test_native_pack_sink_timeout.py) parks a stager inside Spool::Stage
+    through Spool::SetStageHookForTesting and wedges the whole pipeline,
+    so the kBlock wait deterministically times out and counts.
     """
     _open(sink, tmp_path / "spool", max_queue_records=256,
           max_queue_bytes=64, overload="block", admission_timeout=0.05)
