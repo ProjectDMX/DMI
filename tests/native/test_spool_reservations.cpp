@@ -12,6 +12,9 @@
 //      Open() is reached by this one's retry or EEXIST-loser path. This
 //      object's committed account has never counted it, so it has to count
 //      it now -- but exactly once, however many times that path is met.
+//   4. That same retry charge arrives while this object holds an in-flight
+//      reservation. It is a charge like any other and must pass the
+//      capacity decision, not be added on top of the reservation.
 //
 // A single counter cannot satisfy (1) and (2) at once: replacing it with
 // the scan fixes (1) and breaks (2) -- with max 1500, A reserved 1000, B's
@@ -328,6 +331,58 @@ void TestARetryOfAnotherObjectsReadyFileIsAccounted() {
   CHECK(writer.Snapshot().entries == 1);
 }
 
+// (4) A retry while THIS object holds an in-flight reservation. The retry
+// path used to charge a foreign ready file without passing the capacity
+// decision, so a paused reservation and a retry could both be admitted past
+// max_bytes_ (with a 1000-byte reservation and a 1000-byte foreign file
+// under a 1500 cap, both completed at 2000). The retry must now be refused
+// like any other charge that does not fit.
+void TestARetryCannotOversubscribeAnInflightReservation() {
+  const std::string root = FreshRoot("retry-vs-reservation");
+  dmi_store::SpoolConfig config{root, 1500};
+  dmi_store::Spool spool, other;
+  std::string error;
+  CHECK(dmi_store::Spool::Open(config, &spool, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(dmi_store::Spool::Open(config, &other, &error) ==
+        dmi_store::SpoolStatus::kOk);
+
+  dmi_store::SpoolStatus retry_status = dmi_store::SpoolStatus::kIo;
+  std::string retry_error;
+  spool.SetStageHookForTesting([&] {
+    // A's 1000-byte reservation is held and nothing of A's is on disk. A
+    // second Spool object stages a 1000-byte pack; the retry of that pack
+    // must be refused: committed + reserved + 1000 = 2000 > 1500.
+    dmi_store::StagedPack foreign;
+    std::string inner;
+    CHECK(StageBytes(other, 2, 1000, &foreign, &inner) ==
+          dmi_store::SpoolStatus::kOk);
+    dmi_store::StagedPack retried;
+    retry_status = StageBytes(spool, 2, 1000, &retried, &retry_error);
+  });
+  dmi_store::StagedPack out;
+  CHECK(StageBytes(spool, 1, 1000, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  spool.SetStageHookForTesting(nullptr);
+
+  CHECK(retry_status == dmi_store::SpoolStatus::kFull);
+  if (retry_status != dmi_store::SpoolStatus::kFull) {
+    std::cerr << "a concurrent retry was admitted: "
+              << dmi_store::SpoolStatusName(retry_status) << " "
+              << retry_error << "\n";
+  }
+  // What is refused is acknowledging the foreign pack ON TOP of the
+  // outstanding reservation. The capacity decision's reconciliation scan
+  // then records the foreign file anyway -- it IS on disk, and no object can
+  // stop the second writer -- so once A commits the account holds both, at
+  // the physical truth. 2000 bytes on disk against a 1500 cap is the second
+  // writer's doing, not this object admitting a stage it should have
+  // refused.
+  CHECK(spool.Snapshot().bytes == 2000);
+  CHECK(spool.Snapshot().entries == 2);
+  CHECK(BytesOnDisk(root) == 2000);
+}
+
 // The EEXIST-loser path reaches the same file by a different route: both
 // objects write the same pack, and the one whose link() loses must still
 // end up with those bytes in its account.
@@ -394,6 +449,7 @@ int main() {
   TestARefusedStageAndARetryLeaveTheAccountsAlone();
   TestALostLinkRaceReleasesItsReservation();
   TestARetryOfAnotherObjectsReadyFileIsAccounted();
+  TestARetryCannotOversubscribeAnInflightReservation();
   TestAnEexistLoserAccountsForTheWinnersFile();
   TestRepeatedRemovalDoesNotReleaseAnotherPacksCapacity();
   if (g_failures != 0) {

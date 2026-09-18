@@ -118,6 +118,13 @@ class Spool {
   // staged elsewhere then retried here left room for another 1000).
   bool AccountReadyLocked(const std::string& path, uint64_t object_bytes);
   bool UnaccountReadyLocked(const std::string& path);
+  // Rebuild the COMMITTED account (bytes, entries, path ledger) from the
+  // directory, leaving in-flight reservations alone. Run under `mutex_`
+  // before refusing a stage: this object's counter is only as fresh as the
+  // Remove calls it has seen, so a second Spool object's removals make it
+  // stale-high. The retry/EEXIST-loser paths run it too, so a charge that
+  // would exceed the cap is judged against the same durable truth.
+  void ReconcileCommittedLocked();
 
   std::string root_;
   uint64_t max_bytes_ = 0;
