@@ -57,6 +57,10 @@ pytestmark = pytest.mark.cpu
 # seen. Strings are kept: their contents are not call sites, but dropping
 # them would silently swallow whatever follows, and a false positive fails
 # closed.
+#
+# This is a regression guard against a teardown being reintroduced, not an
+# obfuscation boundary: preprocessor line splicing or token pasting can
+# still spell an identifier across lines, which a textual scan cannot see.
 _TOKEN = re.compile(
     r'"(?:\\.|[^"\\])*"'       # "..." string literal
     r"|'(?:\\.|[^'\\])*'"      # '...' char literal
