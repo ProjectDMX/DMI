@@ -41,6 +41,7 @@ class _RecordingCausalLM(torch.nn.Module):
         self.calls.append({
             "input_ids": input_ids,
             "attention_mask": None if attention_mask is None else attention_mask.clone(),
+            "position_ids": None if position_ids is None else position_ids.clone(),
         })
         batch, seq_len = input_ids.shape
         token = self._script[min(len(self.calls) - 1, len(self._script) - 1)]
@@ -108,3 +109,53 @@ def test_the_decode_mask_keeps_the_prompt_padding_and_admits_new_tokens():
         assert torch.equal(grown[:, :prompt_width], mask)
         # Every generated column is attended by both rows.
         assert bool(grown[:, prompt_width:].all())
+
+
+@pytest.mark.gpu
+def test_decode_position_ids_are_pad_aware_per_row():
+    """Prefill uses ``mask.cumsum(-1) - 1``, so a row with k left pads ends
+    prefill at RoPE position (real_tokens - 1) and its decode token at step s
+    belongs at position real_tokens + s. A batch-uniform ``Pmax + step + 1``
+    overshoots by k+1 for a k-padded row and by 1 even for an unpadded one."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    model = _RecordingCausalLM([3, 4, 5, 6]).cuda()
+    ids, mask = _left_padded_batch()
+
+    generate_greedy_with_monitoring(model, ids, mask, max_new_tokens=4)
+
+    real_tokens = mask.long().sum(dim=-1, keepdim=True)  # [[2], [4]]
+    decode_calls = model.calls[1:]
+    assert len(decode_calls) == 3
+    for step, call in enumerate(decode_calls):
+        assert call["position_ids"] is not None, "decode ran without position_ids"
+        expected = real_tokens + step
+        assert torch.equal(call["position_ids"], expected), (
+            f"step {step}: position_ids {call['position_ids'].tolist()} "
+            f"!= pad-aware {expected.tolist()}"
+        )
+
+
+@pytest.mark.gpu
+def test_decode_position_ids_match_hf_cumsum_over_the_decode_mask():
+    """HF's own convention on the grown decode mask is
+    ``decode_mask.cumsum(-1)[:, -1] - 1``; the decode step must agree with the
+    mask it is handed, and the first decode position must continue exactly
+    where the prefill cumsum convention left off (== the row's real-token
+    count)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    model = _RecordingCausalLM([3, 4, 5, 6]).cuda()
+    ids, mask = _left_padded_batch()
+
+    generate_greedy_with_monitoring(model, ids, mask, max_new_tokens=4)
+
+    first = model.calls[1]
+    assert torch.equal(
+        first["position_ids"], mask.long().sum(dim=-1, keepdim=True)
+    ), "first decode position must equal the row's real-token count"
+    for call in model.calls[1:]:
+        hf_positions = call["attention_mask"].long().cumsum(dim=-1)[:, -1:] - 1
+        assert torch.equal(call["position_ids"], hf_positions)

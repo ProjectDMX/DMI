@@ -603,6 +603,25 @@ def generate_greedy_with_monitoring(
 
         _prev_step_t = t_decode_start if do_timing else 0.0
         all_generated: List[Any] = [token.squeeze(-1)]
+        if not cuda_graphs:
+            # Decode-mask columns are append-only, so build the widest mask
+            # once and slice per step instead of a per-step torch.cat (which
+            # is O(T^2) over the whole decode). All-ones on the right because
+            # every generated position is real; the prompt columns keep the
+            # caller's padding.
+            full_mask = torch.cat(
+                [attention_mask,
+                 torch.ones(B, max_new_tokens, device=device,
+                            dtype=attention_mask.dtype)],
+                dim=1,
+            )
+            # Prefill positions are the pad-aware cumsum, so a row with k
+            # left pads ends prefill at RoPE position (real_tokens - 1) and
+            # its decode token at step s belongs at real_tokens + s -- the
+            # same value HF derives from the grown decode mask via
+            # decode_mask.cumsum(-1)[:, -1] - 1. A batch-uniform position
+            # would overshoot every k-padded row by k.
+            next_pos = attention_mask.long().sum(dim=-1, keepdim=True)
         with torch.no_grad():
             for step in range(max_new_tokens - 1):
                 if compiled_decode is not None:
@@ -621,14 +640,7 @@ def generate_greedy_with_monitoring(
                     # and the greedy tokens diverge from model.generate().
                     # Measured on a real model: supplying this restores exact
                     # parity, and correcting position_ids alone does not.
-                    # All-ones on the right because every generated position
-                    # is real; the prompt columns keep the caller's padding.
-                    decode_mask = torch.cat(
-                        [attention_mask,
-                         torch.ones(B, step + 1, device=device,
-                                    dtype=attention_mask.dtype)],
-                        dim=1,
-                    )
+                    decode_mask = full_mask[:, :Pmax + step + 1]
                     decode_kwargs: Dict[str, Any] = {
                         "input_ids": token,
                         "attention_mask": decode_mask,
@@ -640,9 +652,7 @@ def generate_greedy_with_monitoring(
                         "logits_to_keep": logits_to_keep,
                     }
                     if _wants_position_ids:
-                        seq_pos = Pmax + step + 1
-                        decode_kwargs["position_ids"] = torch.full(
-                            (B, 1), seq_pos, device=device, dtype=torch.long)
+                        decode_kwargs["position_ids"] = next_pos + step
                     if adaptor is not None:
                         adaptor.before_forward_manual(
                             token, attention_mask,
