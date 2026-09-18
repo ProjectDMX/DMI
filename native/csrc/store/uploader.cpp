@@ -156,6 +156,14 @@ bool SpoolUploader::UploadOne(const StagedPack& staged, PackRef* ref,
             "the staged pack " + staged.pack_id + "). The staged pack is "
             "retained in the spool for inspection; do not overwrite the "
             "existing object.";
+        // Reported the way every other exit reports: the diagnostic is the
+        // whole point of this branch, and returning straight out of the
+        // loop skipped the `*error = last_error` below, so the caller was
+        // handed an empty string for the ONE failure that means "do not
+        // overwrite". The attempt count goes with it, for the same reason
+        // the retry-exhausted exit carries one.
+        if (attempts_out) *attempts_out = attempts;
+        if (error) *error = last_error;
         return false;  // NOT retryable
       }
     }

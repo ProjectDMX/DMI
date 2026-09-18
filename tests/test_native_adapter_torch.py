@@ -93,13 +93,14 @@ def _meta(index: int, dtype: str = "float32", session: str = "s") -> dict:
 
 
 def _row(meta_json: dict, offset: int, length: int | None, dtype: str,
-         shape=(16,)) -> dict:
+         shape=(16,), inferred_dynamic_dim: int | None = None) -> dict:
     return {
         "metadata_json": json.dumps(meta_json),
         "offset": offset,
         "length": length,
         "dtype": ATEN[dtype],
         "shape": list(shape),
+        "inferred_dynamic_dim": inferred_dynamic_dim,
     }
 
 
@@ -272,6 +273,108 @@ def test_a_scalar_envelope_is_admitted(tmp_path):
     ((staged, payload),) = _read_staged(tmp_path)
     assert staged.shape == ()
     assert payload == torch.tensor(3.5, dtype=torch.float32).numpy().tobytes()
+
+
+@pytest.mark.parametrize("dtype, resolved", [("float32", 2), ("uint8", 8)])
+def test_a_dynamic_dimension_is_inferred_in_elements_not_bytes(
+    tmp_path, dtype, resolved
+):
+    """shape=[-1, 4] over 32 payload bytes resolves in ELEMENTS, not bytes.
+
+    The production encoder (bindings.cpp) sets `inferred_dynamic_dim` from
+    the -1 it finds in a PayloadSlice's shape, and the reference sink
+    (clickhouse_record_sink.cpp, resolve_shape) divides the slice length by
+    the dtype's element size before factoring it over the fixed dims. The
+    adapter factored the raw BYTE count instead, so a float32 [-1, 4] slice
+    of 32 bytes resolved to [8, 4] where the reference says [2, 4]; SubmitRow
+    then refused it against its own metadata and `submit()` threw. Every
+    capture with a dynamic dim and a dtype wider than one byte failed.
+
+    uint8 is the control: element size 1, so bytes and elements agree and it
+    resolved correctly before this fix as well.
+    """
+    meta = _meta(0, dtype=dtype)
+    meta["shape"] = [resolved, 4]
+    CaptureMetadata.from_mapping(meta)  # the shape the reference infers
+    sink, lease = _make_sink(tmp_path)
+    payload = torch.zeros(32 // WIDTH[dtype], dtype=TORCH_DTYPE[dtype])
+    sink.submit_envelope(
+        LAYOUT,
+        [_row(meta, 0, 32, dtype, shape=(-1, 4), inferred_dynamic_dim=0)],
+        payload,
+    )
+    assert sink.flush_and_wait(30.0)
+    sink.rethrow_if_failed()
+    assert sink.snapshot()["persisted_records"] == 1
+    ((staged, staged_payload),) = _read_staged(tmp_path)
+    assert staged.shape == (resolved, 4)
+    assert len(staged_payload) == 32
+
+
+def test_a_fixed_dimension_product_that_overflows_is_refused(tmp_path):
+    """The fixed dims are multiplied in uint64 before the divide.
+
+    Unchecked, three 2^31-1 dims (the largest CaptureMetadata admits) wrap to
+    a nonzero product, and an empty payload (elements == 0) divided evenly by
+    it -- so the row was admitted with an inferred dimension whose fixed
+    product never fit. The reference's checked_product refuses exactly this;
+    the adapter must too.
+    """
+    dim = 2**31 - 1
+    meta = _meta(0)
+    meta["shape"] = [0, dim, dim, dim]
+    CaptureMetadata.from_mapping(meta)  # the shape the unfixed sink resolved to
+    sink, lease = _make_sink(tmp_path)
+    with pytest.raises(RuntimeError, match="overflows uint64"):
+        sink.submit_envelope(
+            LAYOUT,
+            [_row(meta, 0, 0, "float32", shape=(-1, dim, dim, dim),
+                  inferred_dynamic_dim=0)],
+            torch.zeros(0, dtype=torch.float32),
+        )
+    assert sink.snapshot()["submitted_records"] == 0
+
+
+def test_a_fixed_shape_whose_product_overflows_is_refused(tmp_path):
+    """No dynamic dim: the fixed product must still be checked.
+
+    ResolveShape returned early when nothing had to be inferred, and
+    SubmitRow's own element-count multiply is unchecked, so three 2^30 dims
+    wrapped to 0 and matched an empty payload -- admitted with a shape whose
+    product never fit. The reference's checked_product refuses it.
+    """
+    dim = 2**30
+    meta = _meta(0)
+    meta["shape"] = [dim, dim, dim]
+    CaptureMetadata.from_mapping(meta)
+    sink, lease = _make_sink(tmp_path)
+    with pytest.raises(RuntimeError, match="overflows uint64"):
+        sink.submit_envelope(
+            LAYOUT,
+            [_row(meta, 0, 0, "float32", shape=(dim, dim, dim))],
+            torch.zeros(0, dtype=torch.float32),
+        )
+    assert sink.snapshot()["submitted_records"] == 0
+
+
+def test_a_slice_that_is_not_a_whole_number_of_elements_is_refused(tmp_path):
+    """30 bytes is not a whole number of float32s: the reference's guard.
+
+    resolve_shape divides by the element size and refuses a remainder before
+    it ever factors over the fixed dims, so the refusal names the dtype size
+    rather than the fixed dims it never reached.
+    """
+    meta = _meta(0)
+    meta["shape"] = [2, 4]
+    sink, lease = _make_sink(tmp_path)
+    with pytest.raises(RuntimeError, match="divisible"):
+        sink.submit_envelope(
+            LAYOUT,
+            [_row(meta, 0, 30, "float32", shape=(-1, 4),
+                  inferred_dynamic_dim=0)],
+            torch.zeros(8, dtype=torch.float32),
+        )
+    assert sink.snapshot()["submitted_records"] == 0
 
 
 @pytest.mark.parametrize("field, value", [
