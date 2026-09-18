@@ -52,28 +52,16 @@ class _CountingEagerRingEngine:
         self.flushes += 1
 
 
-class _DirectRecordingTransport:
-    """RingTransport with submit_cpu_direct recording instead of dispatching."""
-
-    def __init__(self, engine: _CountingEagerRingEngine):
-        from dmi.transport.ring import RingTransport
-
-        self._transport = RingTransport(engine)
-        self._transport.force_eager = True
-        self.direct: list[torch.Tensor] = []
-
-    def __getattr__(self, name):
-        return getattr(self._transport, name)
-
-    def submit_cpu_direct(self, tensor, hook_type, hook_id) -> None:
-        self.direct.append(tensor)
-
-
 def _eager_hook(monkeypatch, engine, dispatched):
     from dmi.hooks.point import HookPoint
     from dmi.transport import ring as ring_transport
+    from dmi.transport.ring import RingTransport
 
-    transport = _DirectRecordingTransport(engine)
+    transport = RingTransport(engine)
+    transport.force_eager = True
+    transport.direct = []
+    transport.submit_cpu_direct = (
+        lambda tensor, hook_type, hook_id: transport.direct.append(tensor))
     monkeypatch.setattr(ring_transport, "_active_transport", transport)
     monkeypatch.setattr(
         "dmi.hooks.point.dispatch_producer",

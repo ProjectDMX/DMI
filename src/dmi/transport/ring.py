@@ -12,6 +12,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.library
 
+from ..engine import effective_ring_bytes
 from ..hooks.dispatch import install_ring_hooks
 from ..hooks.specs import *  # noqa: F401,F403 - compatibility re-exports
 from ..hooks.specs import (
@@ -255,7 +256,6 @@ class RingTransport:
         caps are engine-lifetime constants) and shared by every hook.
         """
         if self._effective_cap is None:
-            from ..engine import effective_ring_bytes
             self._effective_cap = effective_ring_bytes(
                 self._ring_engine.payload_cap(),
                 self._ring_engine.staging_cap())

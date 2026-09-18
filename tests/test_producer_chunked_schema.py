@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from dmi.engine import effective_ring_bytes
 from dmi.transport.native import _load_extension
 
 pytestmark = pytest.mark.native_backend
@@ -188,14 +189,8 @@ class _FakeEagerTransport:
     def __init__(self, engine: _FakeEagerRingEngine):
         self._ring_engine = engine
         self.direct: list[torch.Tensor] = []
-
-    @property
-    def effective_cap(self) -> int:
-        # The ceiling the real transport caches; computed per read here, which
-        # is all these routing tests need.
-        from dmi.engine import effective_ring_bytes
-        return effective_ring_bytes(self._ring_engine.payload_cap(),
-                                    self._ring_engine.staging_cap())
+        self.effective_cap = effective_ring_bytes(
+            engine.payload_cap(), engine.staging_cap())
 
     def submit_cpu_direct(self, tensor, hook_type, hook_id) -> None:
         self.direct.append(tensor)
