@@ -311,6 +311,30 @@ def test_a_dynamic_dimension_is_inferred_in_elements_not_bytes(
     assert len(staged_payload) == 32
 
 
+def test_a_fixed_dimension_product_that_overflows_is_refused(tmp_path):
+    """The fixed dims are multiplied in uint64 before the divide.
+
+    Unchecked, three 2^31-1 dims (the largest CaptureMetadata admits) wrap to
+    a nonzero product, and an empty payload (elements == 0) divided evenly by
+    it -- so the row was admitted with an inferred dimension whose fixed
+    product never fit. The reference's checked_product refuses exactly this;
+    the adapter must too.
+    """
+    dim = 2**31 - 1
+    meta = _meta(0)
+    meta["shape"] = [0, dim, dim, dim]
+    CaptureMetadata.from_mapping(meta)  # the shape the unfixed sink resolved to
+    sink, lease = _make_sink(tmp_path)
+    with pytest.raises(RuntimeError, match="overflows uint64"):
+        sink.submit_envelope(
+            LAYOUT,
+            [_row(meta, 0, 0, "float32", shape=(-1, dim, dim, dim),
+                  inferred_dynamic_dim=0)],
+            torch.zeros(0, dtype=torch.float32),
+        )
+    assert sink.snapshot()["submitted_records"] == 0
+
+
 def test_a_slice_that_is_not_a_whole_number_of_elements_is_refused(tmp_path):
     """30 bytes is not a whole number of float32s: the reference's guard.
 

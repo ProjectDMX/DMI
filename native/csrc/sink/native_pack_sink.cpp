@@ -40,10 +40,26 @@ bool ResolveShape(const ring::PayloadSlice& slice, uint64_t length_bytes,
     return false;
   }
   const uint64_t elements = length_bytes / element_bytes;
+  // Checked like the reference's checked_product: a negative fixed dim has no
+  // uint64 meaning, and an unchecked multiply can wrap before the modulo
+  // below -- a wrapped fixed can divide elements evenly, admitting a shape
+  // whose fixed product never fit (a zero inferred dim made `elements % fixed`
+  // pass on an overflowed fixed).
   uint64_t fixed = 1;
   for (size_t i = 0; i < shape_out->size(); ++i) {
     if (static_cast<int>(i) == dim) continue;
-    fixed *= static_cast<uint64_t>((*shape_out)[i]);
+    const int64_t dim_value = (*shape_out)[i];
+    if (dim_value < 0) {
+      if (error) *error = "negative logical tensor dimension";
+      return false;
+    }
+    const uint64_t dimension = static_cast<uint64_t>(dim_value);
+    if (dimension != 0 &&
+        fixed > std::numeric_limits<uint64_t>::max() / dimension) {
+      if (error) *error = "logical tensor shape overflows uint64";
+      return false;
+    }
+    fixed *= dimension;
   }
   if (fixed == 0 || elements % fixed != 0) {
     if (error) *error = "payload bytes do not factor over the fixed dims";
