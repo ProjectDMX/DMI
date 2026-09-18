@@ -28,6 +28,17 @@ def _ring_module() -> Any:
     return importlib.import_module("dmi.transport.ring")
 
 
+def effective_ring_bytes(payload_bytes: int, staging_bytes: int) -> int:
+    """Usable per-step byte capacity across payload and staging rings.
+
+    The single spelling of the ceiling the native prepare_step/reserve_record
+    enforce: the drain assembles each flush batch per whole entry and breaks
+    when the entry does not fit staging, so the real limit is the smaller of
+    the two rings, never payload alone.
+    """
+    return min(int(payload_bytes), int(staging_bytes))
+
+
 @dataclass(frozen=True, slots=True)
 class RingCapacities:
     """Immutable snapshot of the active ring transport's capacities."""
@@ -39,7 +50,7 @@ class RingCapacities:
     @property
     def effective_bytes(self) -> int:
         """Usable per-step byte capacity across payload and staging rings."""
-        return min(self.payload_bytes, self.staging_bytes)
+        return effective_ring_bytes(self.payload_bytes, self.staging_bytes)
 
 
 @dataclass

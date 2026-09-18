@@ -72,3 +72,21 @@ def test_pre_push_all_metas_passes_flags_list():
     call = transport._ring_engine.push_all_metas.call_args
     flags = call.args[4] if len(call.args) > 4 else call.kwargs["flags"]
     assert flags == [0, 1]
+
+
+def test_hook_row_basis_reports_logits_request_scaled_and_refuses_unknown_types():
+    """Logit-shaped payloads are request-scaled; every other registered shape
+    class is token-scaled.  An unregistered hook type is a configuration
+    error."""
+    from dmi.hooks.specs import (
+        HOOK_TYPE_FINAL_LOGITS,
+        HOOK_TYPE_RESID_PRE,
+        HookRowBasis,
+        hook_row_basis,
+    )
+
+    assert hook_row_basis(HOOK_TYPE_FINAL_LOGITS) is HookRowBasis.REQUEST_ROWS
+    assert hook_row_basis(HOOK_TYPE_RESID_PRE) is HookRowBasis.TOKEN_ROWS
+
+    with pytest.raises(ValueError, match="Unknown hook type"):
+        hook_row_basis(9999)

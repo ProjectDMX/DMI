@@ -63,7 +63,7 @@ class CHClickhouseDriverReadOnly:
         self._port = port
         self._username = username
         self._password = password
-        self._database = database
+        self._database = self._validate_db_ident(database)
         self._table = self._validate_ident(table)
 
         self._primary_key_column_names = tuple(self._validate_ident(c) for c in primary_key_column_names)
@@ -118,6 +118,40 @@ class CHClickhouseDriverReadOnly:
     def _validate_ident(name: str) -> str:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError(f"Invalid identifier: {name!r}")
+        return name
+
+    @staticmethod
+    def _validate_db_ident(name: str) -> str:
+        """Refuse a database name that could escape its backtick quoting.
+
+        Deliberately NOT ``_validate_ident``. That rule is the column rule,
+        ``[A-Za-z_][A-Za-z0-9_]*``, and ``database`` is not a column: this
+        class backticks it, and ClickHouse accepts hyphens, a leading digit
+        and non-ASCII inside a backquoted name. Applying the column rule here
+        would reject ``my-analytics-db`` -- a name the documented
+        ``database: str`` signature permits and which works today -- so the
+        check refuses only what can break OUT of the quoting.
+
+        Refusing rather than escaping is also deliberate. ClickHouse honours
+        more than one escape convention inside backquoted identifiers, and
+        picking the wrong one would silently address a DIFFERENT database
+        instead of failing -- which is the very class of bug this guards
+        against. ``table`` and every column name have always been refused on
+        the same principle; ``database`` was the one identifier stored raw and
+        then interpolated the same way, so a name like ``default`.`other` --``
+        rewrote the whole statement and ``prefix_get`` read another table.
+        """
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"Invalid database identifier: {name!r}")
+        if "`" in name or "\\" in name:
+            raise ValueError(
+                f"Invalid database identifier: {name!r} (may not contain a "
+                "backtick or backslash, which would escape its quoting)"
+            )
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+            raise ValueError(
+                f"Invalid database identifier: {name!r} (control characters)"
+            )
         return name
 
     @staticmethod
