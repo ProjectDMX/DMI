@@ -348,6 +348,7 @@ void TestARetryCannotOversubscribeAnInflightReservation() {
         dmi_store::SpoolStatus::kOk);
 
   dmi_store::SpoolStatus retry_status = dmi_store::SpoolStatus::kIo;
+  dmi_store::SpoolStatus second_retry_status = dmi_store::SpoolStatus::kIo;
   std::string retry_error;
   spool.SetStageHookForTesting([&] {
     // A's 1000-byte reservation is held and nothing of A's is on disk. A
@@ -359,6 +360,10 @@ void TestARetryCannotOversubscribeAnInflightReservation() {
           dmi_store::SpoolStatus::kOk);
     dmi_store::StagedPack retried;
     retry_status = StageBytes(spool, 2, 1000, &retried, &retry_error);
+    // And the SAME call must answer the same way after its own
+    // reconciliation scan ledgered the foreign path: an identical retry
+    // cannot flip from kFull to kOk without any state change but its own.
+    second_retry_status = StageBytes(spool, 2, 1000, &retried, &retry_error);
   });
   dmi_store::StagedPack out;
   CHECK(StageBytes(spool, 1, 1000, &out, &error) ==
@@ -369,6 +374,12 @@ void TestARetryCannotOversubscribeAnInflightReservation() {
   if (retry_status != dmi_store::SpoolStatus::kFull) {
     std::cerr << "a concurrent retry was admitted: "
               << dmi_store::SpoolStatusName(retry_status) << " "
+              << retry_error << "\n";
+  }
+  CHECK(second_retry_status == dmi_store::SpoolStatus::kFull);
+  if (second_retry_status != dmi_store::SpoolStatus::kFull) {
+    std::cerr << "an identical retry flipped to "
+              << dmi_store::SpoolStatusName(second_retry_status) << " "
               << retry_error << "\n";
   }
   // What is refused is acknowledging the foreign pack ON TOP of the

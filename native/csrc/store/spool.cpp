@@ -350,6 +350,9 @@ void Spool::ReconcileCommittedLocked() {
   // The path ledger is rebuilt with the aggregate it describes, so the two
   // never disagree about which files the committed account holds.
   accounted_ready_ = std::move(seen_ready);
+  // The scan can raise the committed total (files another object wrote), and
+  // peak_bytes_ must never read below what the account holds right now.
+  peak_bytes_ = std::max(peak_bytes_, committed_bytes_ + reserved_bytes_);
 }
 
 void Spool::SetStageHookForTesting(std::function<void()> hook) {
@@ -472,28 +475,30 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
   // The retry and EEXIST-loser paths both end on a ready file that already
   // exists. Whether it costs anything depends on whether THIS object has
   // counted that path before, which only the path ledger can answer. A path
-  // it has NOT counted is a charge like any other stage and must pass the
-  // same capacity decision -- including the reconciliation scan -- rather
-  // than being added on top of an in-flight reservation: with a 1000-byte
-  // reservation paused and a 1000-byte ready file created by a second Spool
-  // object, admitting the retry put committed + reserved at 2000 under a
-  // 1500 cap and both stages completed.
+  // it has NOT counted is judged against the durable truth plus in-flight
+  // reservations -- the same capacity decision a fresh stage makes, except
+  // that the reconciliation scan counts the file's bytes rather than
+  // charging them on top of the committed total. Without the decision, a
+  // retry could be added on top of an in-flight reservation: with a
+  // 1000-byte reservation paused and a 1000-byte ready file created by a
+  // second Spool object, admitting the retry put committed + reserved at
+  // 2000 under a 1500 cap and both stages completed.
+  //
+  // The verdict must not depend on which call ran the scan. An
+  // already-counted path skips the scan, so it re-checks the same sum
+  // instead of returning kOk unconditionally: otherwise the first retry
+  // (which reconciles, sees the overage and refuses) and the second (which
+  // finds the path ledgered) would disagree about identical state.
   auto account_existing = [&]() -> SpoolStatus {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (accounted_ready_.count(ready) != 0) return SpoolStatus::kOk;
-    if (committed_bytes_ + reserved_bytes_ + n > max_bytes_) {
-      ReconcileCommittedLocked();
-      // The scan may have just counted `ready` itself; its bytes are then
-      // already inside committed and charging n again would double-count.
-      const uint64_t charge = accounted_ready_.count(ready) != 0 ? 0 : n;
-      const uint64_t after = committed_bytes_ + reserved_bytes_ + charge;
-      if (after > max_bytes_) {
-        if (error) {
-          *error = "spool byte limit exceeded: " + std::to_string(after) +
-                   " > " + std::to_string(max_bytes_);
-        }
-        return SpoolStatus::kFull;
+    if (accounted_ready_.count(ready) == 0) ReconcileCommittedLocked();
+    if (committed_bytes_ + reserved_bytes_ > max_bytes_) {
+      if (error) {
+        *error = "spool byte limit exceeded: " +
+                 std::to_string(committed_bytes_ + reserved_bytes_) + " > " +
+                 std::to_string(max_bytes_);
       }
+      return SpoolStatus::kFull;
     }
     if (AccountReadyLocked(ready, n)) ++generation_;
     return SpoolStatus::kOk;
