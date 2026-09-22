@@ -134,8 +134,16 @@ schedule.should_capture_step(
 
 The predicates apply warmup, then offset, then stride. Step selection also
 honors `capture_prefill`/`capture_decode`; an unknown phase raises `ValueError`.
-`MonitoringConfig` currently contains only this schedule. Its default factory
-creates a distinct `CaptureSchedule` for each config instance.
+`MonitoringConfig` carries this schedule plus two storage fields:
+`storage_backend` (`"auto" | "native" | "capture" | "none"`) and
+`capture_sink_config` (a `NativeSinkConfig`, or `None`). Both are acted on by
+`MonitoringEngine`, and some combinations are refused at construction --
+`storage_backend="native"` without a host engine, or `"capture"`/`"none"` with
+one -- so a caller setting them should expect `ValueError` rather than a
+silent choice. `capture_sink_config` is read only when `storage_backend` is
+`"capture"`; see `docs/capture-storage-design.md` for the writer it selects.
+The schedule's default factory creates a distinct `CaptureSchedule` for each
+config instance.
 `MonitoringEngine` stores the config, while concrete adaptors decide whether
 and how to apply it; the engine does not enforce the schedule by itself.
 
@@ -1398,6 +1406,13 @@ Current v1 reassembly does not reconstruct TP-sharded fields across
 integration needing distributed reassembly or duplicate detection must handle
 that explicitly rather than treating the lazy view as an authoritative
 cross-rank oracle.
+
+Reading a TP run therefore **raises** rather than returning a wrong tensor:
+where two ranks wrote the same tokens, reassembly names the collision instead
+of concatenating slices that are not sequential tokens. `get_internal()`
+accepts `shard_rank=N` to read one rank's slice, but the `dmi.api.v1` facade's
+`make_lazy_internal()` does not forward it, so that remedy is not reachable
+from the v1 surface yet.
 
 Example:
 

@@ -49,4 +49,34 @@ def install_ring_hooks(
         hook_point._ring_payload = ring_payload
 
 
-__all__ = ["dispatch_producer", "install_ring_hooks"]
+def uninstall_ring_hooks(specs: Sequence[HookSpec]) -> None:
+    """Disarm hook points previously bound by :func:`install_ring_hooks`.
+
+    ``HookPoint.forward`` gates the producer on ``_ring_hook_type is not
+    None``, so clearing it is what actually stops the kernel launching; the
+    payload is dropped with it so a detached model stops pinning the ring
+    buffer. ``enabled`` is deliberately left alone -- it carries the hook
+    SELECTION, which ``apply_hook_selection`` owns and a later re-attach
+    reuses.
+
+    Unlike ``install_ring_hooks`` this tolerates an unbound spec instead of
+    raising: it runs from ``detach_model``'s teardown, often inside a
+    ``finally``, where raising would displace whatever the caller was already
+    handling.
+
+    Cost, so it is not a surprise: ``_ring_hook_type`` is a plain int
+    precisely so torch.compile bakes it as a compile-time constant, so
+    flipping it to None invalidates a traced decode graph. Re-attaching costs
+    a recompile. That is the price of not corrupting the ring on the next
+    ordinary forward, and ``attach_model`` re-runs ``install_ring_hooks``
+    anyway, so the pair stays symmetric.
+    """
+    for spec in specs:
+        hook_point = spec.module
+        if hook_point is None:
+            continue
+        hook_point._ring_hook_type = None
+        hook_point._ring_payload = None
+
+
+__all__ = ["dispatch_producer", "install_ring_hooks", "uninstall_ring_hooks"]
