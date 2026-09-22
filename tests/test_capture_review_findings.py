@@ -7,6 +7,7 @@ outside a boundary the tests already exercised.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import quote
@@ -20,7 +21,11 @@ from tests._faults import FaultInjected, FaultyClickHouseClient, fail_on
 from dmi.storage.capture import (
     AdmissionResult,
     CaptureMetadata,
+    CapturePage,
+    CaptureQuery,
+    CaptureReader,
     CaptureRecord,
+    CaptureSelection,
     CatalogIndexer,
     CatalogIndexerConfig,
     CatalogReconciler,
@@ -30,6 +35,7 @@ from dmi.storage.capture import (
     FilesystemPackStore,
     PackIndex,
     PackIntegrityError,
+    PackReader,
     HostCapturePipeline,
     PackRef,
     PackWriter,
@@ -523,7 +529,7 @@ def test_a_legacy_pack_for_a_sha256_prefixed_tenant_is_still_readable(
     `sha256-team-a` wrote every pack under `tenant=sha256-team-a`. Reserving
     the prefix makes `key_component` digest that name now -- and the location
     check compares re-encoded values, so every one of those existing packs
-    failed `_reject_a_foreign_tenant` at indexing AND at hydration
+    failed `reject_a_foreign_tenant` at indexing AND at hydration
     (reader.py calls `PackIndex.from_store(...).descriptors()`): captures
     already in the catalog became unreadable.
 
@@ -572,7 +578,7 @@ def test_the_two_key_component_forms_cannot_collide(tmp_path: Path):
     SHORT identifier from already reading as `sha256-<hex>` -- 71 bytes, well
     inside the metadata limit -- and encoding directly to exactly the segment
     some long identifier digests to. Both then named the same `tenant=`
-    segment, and `_reject_a_foreign_tenant` compares re-encoded values, so it
+    segment, and `reject_a_foreign_tenant` compares re-encoded values, so it
     could not tell them apart: a pack for one was accepted under the other's
     key, which is the forgery that check exists to refuse.
 
@@ -611,6 +617,175 @@ def test_a_pack_under_a_colliding_digest_segment_is_refused(tmp_path: Path):
 
     with pytest.raises(PackIntegrityError, match="not the tenant that key"):
         PackIndex.from_store(store, ref).descriptors()
+
+
+# --- ... and the reader's footer cache must not skip past that bind ---------
+#
+# Gap: the footer cache is keyed on pack IDENTITY (store, pack id, checksum),
+# and a hit returns the cached descriptors without going through
+# `PackIndex.from_store` -- the only place the tenant/key bind runs on the read
+# path. The three cache tests in `test_capture_storage.py` all use keys like
+# `packs/a.dmi-pack`, which carry no `tenant=` segment, so the warm path was
+# only ever exercised with this check vacuous. The keys below carry one.
+
+
+class _RowCatalog:
+    """A catalog that answers with exactly the rows it was handed.
+
+    The poisoned row these tests need cannot be produced by any current
+    writer -- every descriptor-producing path runs the bind first -- so it is
+    forged here, which is what a catalog written before the bind existed, a
+    mixed-version indexer fleet or direct DB access would leave behind.
+    """
+
+    def __init__(self, descriptors):
+        self._by_id = {item.capture_id: item for item in descriptors}
+
+    def search(self, query: CaptureQuery) -> CapturePage:
+        return CapturePage(
+            items=tuple(self._by_id.values())[: query.limit],
+            next_cursor=None,
+            watermark="catalog-1",
+        )
+
+    def get_by_ids(self, capture_ids, *, tenant_id, watermark):
+        return tuple(
+            self._by_id[capture_id]
+            for capture_id in capture_ids
+            if self._by_id[capture_id].metadata.tenant_id == tenant_id
+        )
+
+
+class _RangeRecordingStore(FilesystemPackStore):
+    def __init__(self, root: Path, *, store_id: str):
+        super().__init__(root, store_id=store_id)
+        self.ranges: list[tuple[int, int]] = []
+
+    def read_range(self, ref, offset, length):
+        self.ranges.append((offset, length))
+        return super().read_range(ref, offset, length)
+
+
+def _tenant_key(tenant: str, *, rank: int = 0) -> str:
+    return (
+        f"v1/tenant={tenant}/date=2026-09-01/session=s/rank={rank}/"
+        f"{PACK_ID}.dmi-pack"
+    )
+
+
+def _two_capture_pack():
+    """One pack for `tenant-a`, two captures, payloads told apart by eye."""
+    return _sealed(
+        CaptureRecord(
+            metadata=_metadata(capture_id="capture-ok"), payload=b"AAAABBBB"
+        ),
+        CaptureRecord(
+            metadata=_metadata(capture_id="capture-foreign", step_number=1),
+            payload=b"CCCCDDDD",
+        ),
+    )
+
+
+def _selection(*descriptors) -> CaptureSelection:
+    return CaptureSelection.create(
+        descriptors, catalog_watermark="catalog-1", filter_hash="filter-1"
+    )
+
+
+def _pack_at_two_keys(tmp_path: Path, own: str, other: str, *, store=None):
+    """The same pack PUT at two keys, with a catalog row pointing at each."""
+    store = store or FilesystemPackStore(tmp_path, store_id="local")
+    sealed = _two_capture_pack()
+    own_ref = store.put(sealed, own)
+    other_ref = store.put(sealed, other)
+    # One pack identity at two locations: `(store_id, pack_id, checksum)` is
+    # the same for both, so the second read is a cache HIT. Without this the
+    # tests below would pass on a cold miss and prove nothing.
+    assert own_ref.checksum == other_ref.checksum
+    ok, second = PackReader.from_bytes(sealed.data).descriptors(
+        store_id="local", object_key=own
+    )
+    second = replace(second, locator=replace(second.locator, object_key=other))
+    return store, sealed, ok, second
+
+
+def test_a_warm_footer_cache_still_refuses_a_pack_under_a_foreign_key(
+    tmp_path: Path,
+):
+    """Cold refused it; warm served it. The cache decided which.
+
+    The cached entry is the footer of a pack read from a key that WAS its
+    own. Handing it back for a read of another key answers a question nobody
+    asked: the footer is the same object, but the location -- the only
+    evidence of whose pack it is -- is not, and it is the location that was
+    never checked.
+    """
+    own, foreign = _tenant_key("tenant-a"), _tenant_key("victim")
+    store, _, ok, poisoned = _pack_at_two_keys(tmp_path, own, foreign)
+
+    # Cold, on a reader that has never seen this pack, it is refused.
+    cold = CaptureReader(_RowCatalog((poisoned,)), {"local": store})
+    with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+        cold.hydrate(_selection(poisoned), byte_limit=1 << 20)
+
+    # Warm, after a legitimate read of the very same pack, so must it be.
+    warm = CaptureReader(_RowCatalog((ok, poisoned)), {"local": store})
+    assert warm.hydrate(_selection(ok), byte_limit=1 << 20)[0].payload == b"AAAABBBB"
+    with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+        warm.hydrate(_selection(poisoned), byte_limit=1 << 20)
+
+
+def test_one_hydration_refuses_a_foreign_key_whichever_order_it_is_asked_in(
+    tmp_path: Path,
+):
+    """A single call is enough, and the order of the selection decided it.
+
+    `_plan` groups by `(store_id, pack_id, object_key)` and walks the groups
+    in selection order, so the legitimate key first warms the cache the
+    foreign key then hits. Whether a forgery was refused came down to the
+    order of `capture_ids` -- which the caller chooses.
+    """
+    own, foreign = _tenant_key("tenant-a"), _tenant_key("victim")
+    store, _, ok, poisoned = _pack_at_two_keys(tmp_path, own, foreign)
+
+    for order in ((ok, poisoned), (poisoned, ok)):
+        reader = CaptureReader(_RowCatalog((ok, poisoned)), {"local": store})
+        with pytest.raises(PackIntegrityError, match="not the tenant that key"):
+            reader.hydrate(_selection(*order), byte_limit=1 << 20)
+
+
+def test_one_pack_at_two_of_its_own_keys_still_costs_one_footer_read(
+    tmp_path: Path,
+):
+    """The control: re-checking the bind must not cost the cache its point.
+
+    A pack legitimately sits under more than one key -- a rank suffix here --
+    and both are its own tenant's. The bind is recomputed for each, but the
+    footer is read once, which is what the cache exists for. Without this a
+    fix that simply refused every hit, or one that dropped the cache, would
+    look just as good as the real one.
+    """
+    first, second = _tenant_key("tenant-a"), _tenant_key("tenant-a", rank=1)
+    store = _RangeRecordingStore(tmp_path, store_id="local")
+    sealed = _two_capture_pack()
+    store.put(sealed, first)
+    store.put(sealed, second)
+    (ok, _) = PackReader.from_bytes(sealed.data).descriptors(
+        store_id="local", object_key=first
+    )
+    (_, also_ok) = PackReader.from_bytes(sealed.data).descriptors(
+        store_id="local", object_key=second
+    )
+    reader = CaptureReader(_RowCatalog((ok, also_ok)), {"local": store})
+
+    hydrated = reader.hydrate(_selection(ok, also_ok), byte_limit=1 << 20)
+    reader.hydrate(_selection(ok, also_ok), byte_limit=1 << 20)
+
+    assert [item.payload for item in hydrated] == [b"AAAABBBB", b"CCCCDDDD"]
+    trailer_offset = len(sealed.data) - PackIndex.trailer_size()
+    trailer_reads = sum(offset == trailer_offset for offset, _ in store.ranges)
+    assert trailer_reads == 1, "both keys and both hydrations share one footer"
+    assert len(reader._footer_cache) == 1
 
 
 def test_consistent_snapshot_reads_requires_a_real_boolean():

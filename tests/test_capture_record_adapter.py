@@ -270,6 +270,64 @@ def test_reference_sink_surfaces_any_non_durable_admission(
     assert snapshot.persisted_records == 0
 
 
+def test_reference_sink_rejects_an_equal_width_dtype_swap(
+    fake_native_reference_sink,
+):
+    """The dtype bind is the only thing tying the payload to the footer.
+
+    ``int32 (3, 4)`` and ``float32 (3, 4)`` are both 48 bytes, so every
+    byte-count check downstream is satisfied by either: the pack model
+    compares total bytes only and ``verify_payload`` is length + CRC32. Admit
+    this pair and the pack's footer says ``int32`` over bytes that are a
+    float32 tensor, and a reader decodes exactly what the footer describes --
+    silently wrong numbers, no error anywhere.
+    """
+    pipeline = _pipeline(_CollectingSink(), queue_bytes=256)
+    sink = CapturePackReferenceSink(pipeline)
+    callback = sink.native_sink.target
+    callback._attach()
+
+    payload = torch.zeros((3, 4), dtype=torch.float32)
+    metadata = _metadata("capture-a", dtype="int32", shape=(3, 4))
+    assert metadata.logical_bytes == payload.nbytes == 48
+
+    with pytest.raises(ValueError, match="metadata dtype does not match payload"):
+        callback._submit_capture(json.dumps(metadata.to_mapping()), payload)
+
+    callback._detach()
+    snapshot = sink.close(timeout=2)
+    assert snapshot.submitted_records == 0
+    assert snapshot.persisted_records == 0
+
+
+def test_reference_sink_rejects_a_permuted_payload_shape(
+    fake_native_reference_sink,
+):
+    """The shape bind, likewise: a transpose is byte-count invariant.
+
+    ``float32 (3, 4)`` against a ``(4, 3)`` payload agrees on dtype and on all
+    48 bytes, so nothing downstream can notice. The footer would describe rows
+    the payload does not have, and a reader would reshape the bytes into the
+    declared -- wrong -- layout.
+    """
+    pipeline = _pipeline(_CollectingSink(), queue_bytes=256)
+    sink = CapturePackReferenceSink(pipeline)
+    callback = sink.native_sink.target
+    callback._attach()
+
+    payload = torch.zeros((4, 3), dtype=torch.float32)
+    metadata = _metadata("capture-a", dtype="float32", shape=(3, 4))
+    assert metadata.logical_bytes == payload.nbytes == 48
+
+    with pytest.raises(ValueError, match="metadata shape does not match payload"):
+        callback._submit_capture(json.dumps(metadata.to_mapping()), payload)
+
+    callback._detach()
+    snapshot = sink.close(timeout=2)
+    assert snapshot.submitted_records == 0
+    assert snapshot.persisted_records == 0
+
+
 def test_capture_package_keeps_reference_adapter_and_native_backend_lazy():
     repo_root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
