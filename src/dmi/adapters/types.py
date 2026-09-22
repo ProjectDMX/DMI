@@ -51,6 +51,11 @@ class StepContext:
     # describes the unpadded data and reservation is sized to actual.
     # None means today's behavior (use q_len everywhere).
     actual_q_len:    Optional[int] = None
+    # "prefill" or "decode" when the adapter knows which one this forward is;
+    # None when it does not. Drives the capture-schedule phase gate in the
+    # adapter driver: a schedule with capture_prefill=False drops prefill
+    # steps, capture_decode=False drops decode steps. None captures as before.
+    phase:           Optional[str] = None
 
     def transport_kwargs(self) -> dict:
         """Return kwargs accepted by ``RingTransport.set_step_context``."""
