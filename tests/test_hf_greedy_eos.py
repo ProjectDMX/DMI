@@ -17,6 +17,7 @@ from dmi.adapters.huggingface.generation import (
     _eos_id_tensor,
     generate_greedy_with_monitoring,
 )
+from tests._requirements import require_cuda
 
 
 # --- the normalisation itself: pure CPU ---------------------------------------
@@ -101,6 +102,7 @@ def _run(script, eos_token_id, max_new_tokens=5):
 
 
 @pytest.mark.gpu
+@require_cuda()
 def test_a_list_eos_token_id_stops_exactly_where_the_scalar_form_does():
     """The regression: the list form used to raise on the first decode step.
 
@@ -117,6 +119,7 @@ def test_a_list_eos_token_id_stops_exactly_where_the_scalar_form_does():
 
 
 @pytest.mark.gpu
+@require_cuda()
 def test_an_unreachable_eos_in_the_list_runs_to_max_new_tokens():
     """A list whose ids never appear must not stop early."""
     generated = _run([3, 4, 4, 4, 4], [7], max_new_tokens=5)
@@ -125,6 +128,7 @@ def test_an_unreachable_eos_in_the_list_runs_to_max_new_tokens():
 
 
 @pytest.mark.gpu
+@require_cuda()
 def test_a_multi_element_tensor_eos_matches_the_list_form():
     """The tensor spelling the adapter documents, on the same script."""
     script = [3, 9, 4, 4, 4]
