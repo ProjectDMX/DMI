@@ -169,3 +169,103 @@ def test_the_default_still_refuses_the_collision():
 
     with pytest.raises(RuntimeError, match="duplicate"):
         get_internal("m", _FakeReader(rows)).attention_values
+
+
+# --- the shard axis is the one AFTER tokens, not always the trailing one -----
+#
+# ``compute_hook_shape`` (dmi/hooks/specs.py) stores q/k/v as
+# [tokens, heads_on_this_rank, head_dim] -- THREE dims, with TP splitting
+# HEADS. Joining on the trailing axis glues head_dim together instead and
+# returns a plausible, wrong tensor with no error raised.
+
+Q_ACT = "blocks.attn.hook_q"
+K_ACT = "blocks.attn.hook_k"
+V_ACT = "blocks.attn.hook_v"
+MLP_ACT = "blocks.hook_mlp_post"
+
+
+def test_a_head_split_q_joins_on_the_head_axis_not_the_trailing_one():
+    """4 heads x head_dim 3 over TP=2: rank r holds 2 heads of width 3.
+
+    The model's tensor is [tokens, 4, 3]. Joining on the trailing axis gives
+    [tokens, 2, 6] -- the same element count, so nothing raises, but every
+    head is now a splice of two different heads.
+    """
+    rank0 = torch.arange(2 * 2 * 3, dtype=torch.float32).reshape(2, 2, 3)
+    rank1 = rank0 + 100
+    rows = [
+        _row("0:0", 0, 0, rank0, shard_rank=0, act=Q_ACT, token_len=2),
+        _row("0:0", 0, 0, rank1, shard_rank=1, act=Q_ACT, token_len=2),
+    ]
+
+    merged = get_internal("m", _FakeReader(rows), merge_shards=True).q[0]
+
+    assert merged.shape == (1, 2, 4, 3), "heads must join, head_dim must not"
+    assert torch.equal(merged[0, :, :2, :], rank0)
+    assert torch.equal(merged[0, :, 2:, :], rank1)
+
+
+def test_a_three_dim_z_joins_on_the_head_axis():
+    """z is [tokens, heads, head_dim] on the batched (HF) path, and is only
+    flattened to [tokens, heads*head_dim] on the packed path."""
+    rank0 = torch.arange(2 * 2 * 3, dtype=torch.float32).reshape(2, 2, 3)
+    rank1 = rank0 + 100
+    rows = [
+        _row("0:0", 0, 0, rank0, shard_rank=0, act=Z_ACT, token_len=2),
+        _row("0:0", 0, 0, rank1, shard_rank=1, act=Z_ACT, token_len=2),
+    ]
+
+    merged = get_internal(
+        "m", _FakeReader(rows), merge_shards=True).attention_values[0]
+
+    assert merged.shape == (1, 2, 4, 3)
+    assert torch.equal(merged[0, :, 2:, :], rank1)
+
+
+def test_a_two_dim_mlp_activation_still_joins_on_its_only_feature_axis():
+    """Regression guard: [tokens, intermediate] has no head axis, so the join
+    stays the axis right after tokens -- which is also the trailing one."""
+    rank0 = torch.ones(2, 4)
+    rank1 = torch.ones(2, 4) * 2
+    rows = [
+        _row("0:0", 0, 0, rank0, shard_rank=0, act=MLP_ACT),
+        _row("0:0", 0, 0, rank1, shard_rank=1, act=MLP_ACT),
+    ]
+
+    merged = get_internal(
+        "m", _FakeReader(rows), merge_shards=True).mlp_activation[0]
+
+    assert merged.shape == (1, 2, 8)
+    assert torch.equal(merged[0, :, 4:], rank1)
+
+
+# --- GQA: k/v may be REPLICATED across ranks rather than split --------------
+
+
+def test_k_is_refused_because_gqa_may_replicate_it_across_ranks():
+    """``kv_heads = max(1, num_kv_heads // tp)`` means a model with fewer KV
+    heads than ranks gives every rank the SAME kv head. Nothing in the stored
+    row distinguishes that from a genuine split -- the per-rank shapes are
+    identical either way -- so merging would silently duplicate heads.
+    Refusing is the only answer that cannot return a wrong tensor."""
+    rank0 = torch.ones(2, 1, 3)
+    rows = [
+        _row("0:0", 0, 0, rank0, shard_rank=0, act=K_ACT, token_len=2),
+        _row("0:0", 0, 0, rank0.clone(), shard_rank=1, act=K_ACT, token_len=2),
+    ]
+
+    with pytest.raises(RuntimeError, match="replicate") as excinfo:
+        get_internal("m", _FakeReader(rows), merge_shards=True).k
+
+    assert "shard_rank" in str(excinfo.value), "must name the way forward"
+
+
+def test_v_is_refused_for_the_same_reason_as_k():
+    rank0 = torch.ones(2, 1, 3)
+    rows = [
+        _row("0:0", 0, 0, rank0, shard_rank=0, act=V_ACT, token_len=2),
+        _row("0:0", 0, 0, rank0.clone(), shard_rank=1, act=V_ACT, token_len=2),
+    ]
+
+    with pytest.raises(RuntimeError, match="replicate"):
+        get_internal("m", _FakeReader(rows), merge_shards=True).v

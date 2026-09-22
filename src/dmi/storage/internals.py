@@ -50,20 +50,36 @@ def _request_sort_key(request_id: str) -> tuple:
     return tuple(key)
 
 
+# k and v are the one sharded class whose TP split cannot be identified from
+# the stored rows -- see the refusal in `_merged_shard_chunks`.
+_KV_ACTS = ("attn.hook_k", "attn.hook_v")
+
+
 def _shard_axis(act_name: str) -> int:
     """The axis a TP shard of ``act_name`` was cut along.
 
-    Mirrors the layout ``reassembly.segment_manager`` already encodes, so the
-    two stay one decision rather than two: an attention matrix row is
-    ``[heads, q_tokens, kv_tokens]`` (that manager treats dim 1 as the
-    incremental token axis and dim 2 as the summed one), and TP splits it over
-    HEADS, which is dim 0. Every other sharded class -- q, k, v, z, mlp_post --
-    is stored ``[tokens, features]`` with TP splitting the trailing feature
-    axis, so the join is dim -1.
+    Derived from where the TOKEN axis sits, which is what
+    ``reassembly.segment_manager`` already encodes -- so the two stay one
+    decision rather than two that can drift apart:
+
+    * An attention matrix row is ``[heads, q_tokens, kv_tokens]``: that manager
+      uses ``token_dim_incremental=2-dim_diff`` and
+      ``token_dim_sum_to_now=3-dim_diff``, i.e. dims 1 and 2 once the batch dim
+      is absent. TP splits HEADS, so the join is dim 0.
+    * Every other row is token-major (``token_dim=1-dim_diff`` = dim 0), and TP
+      splits the axis immediately after tokens -- dim 1.
+
+    Dim 1 is deliberately NOT spelled ``-1``. ``compute_hook_shape``
+    (``dmi/hooks/specs.py``) stores q, k, v and batched z as
+    ``[tokens, heads, head_dim]``, where the split axis is heads in the MIDDLE.
+    Only packed z and mlp_post are two-dimensional, and there dim 1 already IS
+    the trailing axis. Spelling it -1 joins head_dim on the three-dimensional
+    layouts, producing a tensor with the right element count, the wrong shape
+    and spliced heads -- and raising nothing.
     """
     if act_name.endswith(("attn.hook_attn_scores", "attn.hook_pattern")):
         return 0
-    return -1
+    return 1
 
 
 def _ordered_chunks(
@@ -124,6 +140,24 @@ def _merged_shard_chunks(
     row arrival order is whatever the reader returned, so the sort is load
     bearing rather than tidiness.
     """
+    if act_name.endswith(_KV_ACTS):
+        # K and V are the one class where "one row per rank" does not imply a
+        # split. `compute_hook_shape` computes
+        # `kv_heads = max(1, cfg.num_kv_heads // tp)`, so a GQA model with
+        # fewer KV heads than ranks gives EVERY rank the same kv head. The
+        # stored rows are identical in shape either way, and the row key
+        # carries neither `num_kv_heads` nor `tp_size`, so nothing here can
+        # tell a genuine split from replication. Joining a replicated K would
+        # return a tensor with duplicated heads that the model never produced,
+        # which is worse than refusing.
+        raise RuntimeError(
+            f"{act_name}: request {request_id!r} cannot be merged across TP "
+            "ranks -- GQA may replicate the KV heads rather than split them "
+            "(kv_heads = max(1, num_kv_heads // tp_size)), and the stored rows "
+            "do not record num_kv_heads or tp_size, so a replicated K/V is "
+            "indistinguishable from a split one. Merging would duplicate "
+            "heads. Select a single shard_rank instead."
+        )
     axis = _shard_axis(act_name)
     out = []
     rank_tuples = set()
@@ -763,8 +797,12 @@ def get_internal(
 
     ``merge_shards=True`` joins every rank's slices back into the full tensor,
     concatenating in ascending ``shard_rank`` order along the axis TP split:
-    dim 0 (heads) for an attention matrix, the trailing feature axis for q, k,
-    v, z and mlp_post. Unsharded fields are unaffected, since they have no
+    dim 0 (heads) for an attention matrix, and otherwise the axis right after
+    tokens -- heads for the three-dimensional q and batched z, the feature axis
+    for two-dimensional packed z and mlp_post. ``k`` and ``v`` are refused,
+    because GQA may replicate KV heads across ranks rather than split them and
+    the stored rows cannot tell the two apart. Unsharded fields are
+    unaffected, since they have no
     collision to join.
     """
     reader = reader or _default_reader()

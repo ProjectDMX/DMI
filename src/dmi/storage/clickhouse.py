@@ -152,6 +152,24 @@ class CHClickhouseDriverReadOnly:
             raise ValueError(
                 f"Invalid database identifier: {name!r} (control characters)"
             )
+        if "%" in name:
+            # The other way out of the quoting, and it never needs a backtick
+            # in the NAME. clickhouse-driver substitutes parameters as
+            # ``query % escape_params(params)``, and `escape_params` wraps a
+            # string in single quotes escaping only ``'`` and ``\`` -- never a
+            # backtick. So a ``%(model_id)s`` here is replaced, after this
+            # guard has run, by the parameter VALUE in identifier position:
+            #     FROM `analytics'x`.`secret_db`.`other_table` -- '`.`offload`
+            # reads a different database with the remainder commented out,
+            # driven by an ordinary `prefix_get` key. A bare ``%`` is refused
+            # from the other direction: it would survive construction and then
+            # raise "unsupported format character" on every query, far from
+            # the name that caused it.
+            raise ValueError(
+                f"Invalid database identifier: {name!r} (may not contain '%', "
+                "which the driver would treat as a parameter placeholder and "
+                "substitute into the identifier)"
+            )
         return name
 
     @staticmethod

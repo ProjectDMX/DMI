@@ -1410,8 +1410,19 @@ There are two ways to read one of those runs, and they are mutually exclusive:
   tensor narrower than the model's on the split axis.
 - `merge_shards=True` joins every rank's slices back into the full tensor,
   concatenating in ascending `shard_rank` order along the axis TP split: dim 0
-  (heads) for an attention matrix, the trailing feature axis for `q`, `k`,
-  `v`, `z` and `mlp_post`.
+  (heads) for an attention matrix, and otherwise the axis immediately after
+  tokens -- heads for the three-dimensional `q` and batched `z`, the feature
+  axis for two-dimensional packed `z` and `mlp_post`. `k` and `v` are
+  **refused**: GQA computes `kv_heads = max(1, num_kv_heads // tp_size)`, so a
+  model with fewer KV heads than ranks replicates them instead of splitting,
+  and the stored rows record neither `num_kv_heads` nor `tp_size` — a
+  replicated K is indistinguishable from a split one, so merging could
+  duplicate heads. Select a `shard_rank` for those.
+
+Both arguments are on `get_internal()`. They are **not** currently forwarded by
+the `dmi.api.v1` facade's `make_lazy_internal()`, so a TP run read through the
+v1 surface hits the refusal with no remedy available; that gap is tracked
+separately.
 
 ClickHouse MergeTree keys do not enforce uniqueness, so a duplicate capture is
 still possible -- two rows from the *same* rank. That is not a TP split, and

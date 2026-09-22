@@ -382,6 +382,31 @@ def test_a_database_name_cannot_break_out_of_its_backtick_quoting():
             CHClickhouseDriverReadOnly(database=control)
 
 
+def test_a_database_name_cannot_smuggle_a_parameter_placeholder():
+    """A backtick is not the only way out of the quoting -- `%` is the other.
+
+    clickhouse-driver substitutes parameters with ``query % escape_params(...)``
+    and `escape_params` quotes strings with `'`, escaping only `'` and `\\` --
+    never a backtick. So a `%(model_id)s` inside the DATABASE name is replaced
+    by the parameter VALUE, in identifier position, after the guard has run:
+
+        FROM `analytics'x`.`secret_db`.`other_table` -- '`.`offload`
+
+    which reads a different database entirely with the rest commented out.
+    The backtick never appears in the database name, so the backtick check
+    cannot see it; the payload arrives through an ordinary `prefix_get` key.
+
+    A bare `%` is refused for the same reason from the other direction: it
+    would otherwise survive construction and raise `unsupported format
+    character` on every query, far from the name that caused it.
+    """
+    with pytest.raises(ValueError, match="Invalid database identifier"):
+        CHClickhouseDriverReadOnly(database="analytics%(model_id)s")
+
+    with pytest.raises(ValueError, match="Invalid database identifier"):
+        CHClickhouseDriverReadOnly(database="my%db")
+
+
 def test_a_legal_backquoted_database_name_still_works():
     """The positive control, and the reason this is not `_validate_ident`.
 
