@@ -1361,10 +1361,23 @@ Per-layer values are tuples ordered by layer, with tensors left-padded into
 batch form. Global fields are left-padded batched tensors. Attention matrices
 are left-padded on query and key axes. Outputs are CPU tensors.
 
-Current v1 reassembly does not reconstruct TP-sharded fields across
-`shard_rank`, and ClickHouse MergeTree keys do not enforce uniqueness. An
-integration needing distributed reassembly or duplicate detection must handle
-that explicitly rather than treating the lazy view as an authoritative
+Under tensor parallelism a sharded field is written once per rank, each rank
+holding a different slice of the same tokens. Reassembly joins along the token
+axis, so by default it refuses such a collision by name rather than guessing.
+There are two ways to read one of those runs, and they are mutually exclusive:
+
+- `shard_rank=N` keeps one rank's rows and returns **that rank's slice** -- a
+  tensor narrower than the model's on the split axis.
+- `merge_shards=True` joins every rank's slices back into the full tensor,
+  concatenating in ascending `shard_rank` order along the axis TP split: dim 0
+  (heads) for an attention matrix, the trailing feature axis for `q`, `k`,
+  `v`, `z` and `mlp_post`.
+
+ClickHouse MergeTree keys do not enforce uniqueness, so a duplicate capture is
+still possible -- two rows from the *same* rank. That is not a TP split, and
+`merge_shards` refuses it rather than fabricating a tensor wider than the
+model produced. An integration needing duplicate detection beyond that must
+handle it explicitly rather than treating the lazy view as an authoritative
 cross-rank oracle.
 
 Example:
