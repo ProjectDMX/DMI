@@ -76,11 +76,14 @@ from ...storage.internals import (
 )
 from ...hooks import selection as _selection
 from ...hooks.selection import (
+    filter_by_layers,
+    hook_belongs_to_layers,
     hook_belongs_to_pp_rank,
     hook_belongs_to_tp_rank,
     register_preset,
     select_hook_specs,
 )
+from ...configuration.schema import LayerSelection
 from ...adapters.types import StepContext
 from ...records import (
     PayloadSlice,
@@ -268,8 +271,11 @@ __all__ = [
     "register_preset",
     "is_preset_registered",
     "select_hook_specs",
+    "filter_by_layers",
+    "hook_belongs_to_layers",
     "hook_belongs_to_pp_rank",
     "hook_belongs_to_tp_rank",
+    "LayerSelection",
     "RingConfig",
     "ClickHouseClientConfig",
     "StageConfig",
