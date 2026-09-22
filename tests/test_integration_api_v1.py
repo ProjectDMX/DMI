@@ -93,6 +93,7 @@ _NON_HOOK_EXPORTS = {
     "hook_belongs_to_pp_rank",
     "hook_belongs_to_tp_rank",
     "RingConfig",
+    "RecurringD2HWindowConfig",
     "ClickHouseClientConfig",
     "StageConfig",
     "QueueConfig",
@@ -215,6 +216,7 @@ def test_v1_native_exports_reexport_compiled_objects() -> None:
 
     for name in {
         "RingConfig",
+        "RecurringD2HWindowConfig",
         "ClickHouseClientConfig",
         "StageConfig",
         "QueueConfig",
@@ -241,11 +243,13 @@ def test_v1_public_surface_is_documented() -> None:
         "capture_enabled",
         "commit_step",
         "create_record_runtime",
+        "define_d2h_window_pattern",
         "emit_output",
         "flush_and_wait",
         "model_shape",
         "plan_step",
         "prepare_replay",
+        "advance_boundary",
         "ring_capacities",
         "set_capture_enabled",
     }

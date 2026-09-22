@@ -28,7 +28,12 @@ _HOST_EXPORTS = frozenset(
 _RING_EXPORTS = frozenset(
     {
         "ClickHouseRecordSink",
+        "D2HWindowGrantPolicyKind",
+        "D2HWindowMode",
+        "D2HWindowProgressKind",
+        "D2HWindowRuntimeSnapshot",
         "RecordSink",
+        "RecurringD2HWindowConfig",
         "ReferencePythonCaptureSink",
         "RingConfig",
         "RingEngine",
