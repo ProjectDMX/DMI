@@ -118,7 +118,19 @@ std::string Unescape(const std::string& text, size_t& q, bool* ok) {
           }
           break;
         }
-        default: raw.push_back(text[q]); ++q; break;
+        // The three remaining escapes JSON defines, none of which changes the
+        // character it carries: \" \\ \/. json.dumps emits the first two for
+        // any identifier containing a quote or a backslash.
+        case '"':
+        case '\\':
+        case '/': raw.push_back(text[q]); ++q; break;
+        // Anything else is not an escape at all, and json.loads refuses the
+        // whole document ("Invalid \escape"). Copying the character verbatim
+        // with `ok` still set decoded "block\qresid" to "blockqresid" -- a
+        // hook_name the producer never sent, packed onto a record the
+        // reference sink refuses outright. Same latch as the other refusals,
+        // and U+FFFD keeps the decoder total.
+        default: reject(); ++q; break;
       }
     } else {
       raw.push_back(text[q++]);

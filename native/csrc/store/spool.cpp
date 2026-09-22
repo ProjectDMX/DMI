@@ -492,7 +492,18 @@ SpoolStatus Spool::Stage(const std::string& pack_id, uint64_t created_at_ns,
   auto account_existing = [&]() -> SpoolStatus {
     std::lock_guard<std::mutex> lock(mutex_);
     if (accounted_ready_.count(ready) == 0) ReconcileCommittedLocked();
-    if (committed_bytes_ + reserved_bytes_ > max_bytes_) {
+    // Only an IN-FLIGHT reservation justifies refusing a file that is already
+    // durably on disk. With reserved_bytes_ == 0 there is nothing the refusal
+    // protects: the bytes are written, so kFull reclaims none of them and
+    // merely withholds the acknowledgement of a pack that is present. The
+    // oracle is the contract here and it agrees -- spool.py:116-130 takes
+    // `if ready.exists(): _existing -> _account_ready_locked -> return staged`
+    // and never consults max_bytes. Gating on reserved_bytes_ keeps the case
+    // below refused exactly as before (a paused reservation plus a foreign
+    // ready file -- a state Python cannot reach at all, since it holds its
+    // lock across the whole of stage()), while a serial retry under a lowered
+    // cap is admitted the way the reference admits it.
+    if (reserved_bytes_ > 0 && committed_bytes_ + reserved_bytes_ > max_bytes_) {
       if (error) {
         *error = "spool byte limit exceeded: " +
                  std::to_string(committed_bytes_ + reserved_bytes_) + " > " +

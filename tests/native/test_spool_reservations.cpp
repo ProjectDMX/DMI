@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -452,6 +453,169 @@ void TestRepeatedRemovalDoesNotReleaseAnotherPacksCapacity() {
   CHECK(BytesOnDisk(root) == 1000);
 }
 
+// (9) The SERIAL retry -- no reservation in flight -- must be admitted even
+// when the spool is already over its cap, because that is what the oracle
+// does. `spool.py:116-130` takes `if ready.exists(): _existing ->
+// _account_ready_locked -> return staged` and never consults `max_bytes`: a
+// retry adds no bytes, so refusing it reclaims nothing and only loses the
+// acknowledgement of a file that is already durably on disk.
+//
+// The overage here comes from a crashed writer's leftover `.open`, which the
+// reconciliation scan counts. Before this was narrowed, the capacity check on
+// the already-on-disk path fired for this case too, and the native spool
+// answered kFull where Python returns the StagedPack. Case (4) above is the
+// state that DOES justify refusing, and it is distinguished by an in-flight
+// reservation -- something Python cannot reach at all, since it holds its
+// lock across the whole of stage().
+void TestASerialRetryIsAdmittedEvenWhenAlreadyOverCap() {
+  const std::string root = FreshRoot("serial-retry-over-cap");
+  dmi_store::SpoolConfig config{root, 1200};
+  dmi_store::Spool spool;
+  std::string error;
+  CHECK(dmi_store::Spool::Open(config, &spool, &error) ==
+        dmi_store::SpoolStatus::kOk);
+
+  dmi_store::StagedPack out;
+  CHECK(StageBytes(spool, 1, 1000, &out, &error) ==
+        dmi_store::SpoolStatus::kOk);
+
+  // Reopen the same root under a cap the existing ready file already exceeds
+  // -- an operator lowering max_bytes, or a restart onto a fuller spool. The
+  // retry now goes through a Spool that has NOT ledgered this path, so it
+  // reconciles, sees 1000 > 900, and takes the capacity decision.
+  dmi_store::Spool reopened;
+  dmi_store::SpoolConfig lowered{root, 900};
+  CHECK(dmi_store::Spool::Open(lowered, &reopened, &error) ==
+        dmi_store::SpoolStatus::kOk);
+
+  const dmi_store::SpoolStatus retry =
+      StageBytes(reopened, 1, 1000, &out, &error);
+  CHECK(retry == dmi_store::SpoolStatus::kOk);
+  if (retry != dmi_store::SpoolStatus::kOk) {
+    std::cerr << "a serial retry of an on-disk pack was refused: "
+              << dmi_store::SpoolStatusName(retry) << " " << error << "\n";
+  }
+  // Counted once, not once per retry.
+  CHECK(reopened.Snapshot().entries == 1);
+
+  // And a genuinely NEW pack is still refused -- narrowing the retry path
+  // must not open the cap for fresh bytes.
+  dmi_store::StagedPack fresh;
+  CHECK(StageBytes(reopened, 2, 1000, &fresh, &error) ==
+        dmi_store::SpoolStatus::kFull);
+}
+
+// (10) Recover() must leave the recovered paths in the ledger, or the bytes
+// it counted can never be released. This is the production uploader
+// lifecycle: SpoolUploader::UploadPending calls Recover() and then Remove()
+// on what it uploaded. Nothing asserted the ACCOUNT afterwards -- the
+// existing serial-remove test reads BytesOnDisk and the writer's next stage,
+// both of which stay correct while the uploader's own totals drift -- so
+// deleting the ledger rebuild in Scan() left the whole cpu suite green.
+// Python rebuilds the same ledger (spool.py:245) and releases by path
+// (spool.py:322).
+void TestRecoverThenRemoveReleasesTheAccount() {
+  const std::string root = FreshRoot("recover-remove-account");
+  dmi_store::SpoolConfig config{root, 4000};
+  std::string error;
+
+  // The uploader opens on an EMPTY root, so its constructor ledgers nothing.
+  // Only Recover()'s own scan can account what the writer stages next -- which
+  // is what makes this a test of the rebuild in Scan() rather than of the one
+  // in Open().
+  dmi_store::Spool uploader;
+  CHECK(dmi_store::Spool::Open(config, &uploader, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(uploader.Snapshot().bytes == 0);
+
+  {
+    dmi_store::Spool writer;
+    CHECK(dmi_store::Spool::Open(config, &writer, &error) ==
+          dmi_store::SpoolStatus::kOk);
+    dmi_store::StagedPack out;
+    CHECK(StageBytes(writer, 1, 1000, &out, &error) ==
+          dmi_store::SpoolStatus::kOk);
+  }
+
+  std::vector<dmi_store::StagedPack> recovered;
+  CHECK(uploader.Recover(&recovered, &error) == dmi_store::SpoolStatus::kOk);
+  CHECK(recovered.size() == 1);
+  if (recovered.size() != 1) return;
+  CHECK(uploader.Remove(recovered[0], &error) == dmi_store::SpoolStatus::kOk);
+
+  CHECK(uploader.Snapshot().bytes == 0);
+  CHECK(uploader.Snapshot().entries == 0);
+  if (uploader.Snapshot().bytes != 0) {
+    std::cerr << "uploader leaked capacity after Recover+Remove: "
+              << uploader.Snapshot().bytes << " bytes, "
+              << uploader.Snapshot().entries << " entries\n";
+  }
+}
+
+// (11) The same for Open()'s own ledger population: a ready file that was
+// already on disk at construction must be releasable. Every existing test
+// opens a FRESH Spool per operation, so each one reads an object that never
+// counted the file it is removing, and the gap was invisible.
+void TestRemoveOfAPreExistingReadyFileReleasesTheAccount() {
+  const std::string root = FreshRoot("restart-remove-account");
+  dmi_store::SpoolConfig config{root, 4000};
+  std::string error;
+  dmi_store::StagedPack staged;
+
+  {
+    dmi_store::Spool writer;
+    CHECK(dmi_store::Spool::Open(config, &writer, &error) ==
+          dmi_store::SpoolStatus::kOk);
+    CHECK(StageBytes(writer, 1, 1000, &staged, &error) ==
+          dmi_store::SpoolStatus::kOk);
+  }
+
+  dmi_store::Spool restarted;
+  CHECK(dmi_store::Spool::Open(config, &restarted, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(restarted.Snapshot().bytes == 1000);
+  CHECK(restarted.Remove(staged, &error) == dmi_store::SpoolStatus::kOk);
+  CHECK(restarted.Snapshot().bytes == 0);
+  CHECK(restarted.Snapshot().entries == 0);
+  if (restarted.Snapshot().bytes != 0) {
+    std::cerr << "restart leaked capacity after Remove: "
+              << restarted.Snapshot().bytes << " bytes\n";
+  }
+}
+
+// (12) Remove()'s already-missing branch must still uncount. Another Spool
+// object deleting the file first is the ordinary uploader/writer overlap, and
+// Python releases by path whether or not the file is still there
+// (spool.py:313-315). The existing repeated-removal test only checks this
+// branch does not OVER-release, which holds either way once the first Remove
+// has taken the path out of the ledger.
+void TestRemoveOfAnAlreadyDeletedFileStillUncounts() {
+  const std::string root = FreshRoot("remove-race-account");
+  dmi_store::SpoolConfig config{root, 4000};
+  dmi_store::Spool writer, other;
+  std::string error;
+  CHECK(dmi_store::Spool::Open(config, &writer, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(dmi_store::Spool::Open(config, &other, &error) ==
+        dmi_store::SpoolStatus::kOk);
+
+  dmi_store::StagedPack staged;
+  CHECK(StageBytes(writer, 1, 1000, &staged, &error) ==
+        dmi_store::SpoolStatus::kOk);
+  CHECK(writer.Snapshot().bytes == 1000);
+
+  // `other` deletes it first; the writer's Remove then finds nothing on disk.
+  CHECK(other.Remove(staged, &error) == dmi_store::SpoolStatus::kOk);
+  CHECK(writer.Remove(staged, &error) == dmi_store::SpoolStatus::kOk);
+
+  CHECK(writer.Snapshot().bytes == 0);
+  CHECK(writer.Snapshot().entries == 0);
+  if (writer.Snapshot().bytes != 0) {
+    std::cerr << "writer kept capacity for a file another object removed: "
+              << writer.Snapshot().bytes << " bytes\n";
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -463,6 +627,10 @@ int main() {
   TestARetryCannotOversubscribeAnInflightReservation();
   TestAnEexistLoserAccountsForTheWinnersFile();
   TestRepeatedRemovalDoesNotReleaseAnotherPacksCapacity();
+  TestASerialRetryIsAdmittedEvenWhenAlreadyOverCap();
+  TestRecoverThenRemoveReleasesTheAccount();
+  TestRemoveOfAPreExistingReadyFileReleasesTheAccount();
+  TestRemoveOfAnAlreadyDeletedFileStillUncounts();
   if (g_failures != 0) {
     std::cerr << g_failures << " check(s) failed\n";
     return 1;

@@ -154,6 +154,41 @@ void ValidEscapesAreUnchanged() {
   CHECK(jc::FindString(text, "m", q) == "v");
 }
 
+// JSON defines exactly nine escapes: " \ / b f n r t and uXXXX. Anything else
+// is not an escape, and json.loads REFUSES the document -- `json.loads(r'"a\qb"')`
+// raises "Invalid \escape". The decoder used to copy the unknown character
+// verbatim with `ok` still set, so "block\qresid" decoded to "blockqresid" and
+// was packed as a hook_name the producer never sent, on a record the reference
+// sink refuses outright. json.h documents `ok` as the channel for "an escape
+// that has no code point behind it"; an escape that is not an escape at all
+// belongs on it too.
+void UnknownEscapeIsRefusedNotCopied() {
+  const std::string text = "{\"k\": \"block\\qresid\", \"m\": \"v\"}";
+  size_t q = text.find("block");
+  bool ok = true;
+  const std::string value = jc::Unescape(text, q, &ok);
+  CHECK(!ok);
+  // Total, like every other refusal here: U+FFFD stands in for the escape, so
+  // nothing that is not valid UTF-8 ever leaves the decoder.
+  CHECK(value == "block\xEF\xBF\xBD" "resid");
+  // And the decoder stays on its own string, so the next field still reads.
+  CHECK(q < text.size() && text[q] == '"');
+  CHECK(jc::FindString(text, "m", q) == "v");
+}
+
+// The three legal escapes with no dedicated case label must keep working:
+// json.dumps emits \" and \\ for any identifier carrying a quote or backslash,
+// and \/ is legal though it is never emitted.
+void QuoteBackslashAndSlashStillDecode() {
+  const std::string text = "{\"k\": \"a\\\"b\\\\c\\/d\", \"m\": \"v\"}";
+  size_t q = text.find("a\\\"");
+  bool ok = true;
+  const std::string value = jc::Unescape(text, q, &ok);
+  CHECK(ok);
+  CHECK(value == "a\"b\\c/d");
+  CHECK(jc::FindString(text, "m", q) == "v");
+}
+
 }  // namespace
 
 int main() {
@@ -163,6 +198,8 @@ int main() {
   TruncatedEscapeAtEndOfBufferKeepsQInBounds();
   LeadSurrogateWithMalformedPartnerStaysAligned();
   ValidEscapesAreUnchanged();
+  UnknownEscapeIsRefusedNotCopied();
+  QuoteBackslashAndSlashStillDecode();
   if (g_failures != 0) {
     std::cerr << g_failures << " check(s) failed\n";
     return 1;

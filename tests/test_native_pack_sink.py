@@ -1168,8 +1168,16 @@ def test_a_lone_surrogate_is_refused_not_persisted_as_cesu8(sink, tmp_path,
     _open(sink, tmp_path / "spool")
     metadata = _row_meta(0, dtype="uint8", shape=[64], hook_name=hook_name)
     assert "\\ud83d" in metadata or "\\udcff" in metadata, metadata
-    assert sink.call(op="parse_metadata", metadata_json=metadata)["ok"] is False
-    assert _submit_row(sink, metadata, bytes(64), "uint8", [64])["ok"] is False
+    # The REASON, not merely the refusal: a decoder that rejected this for any
+    # other cause would satisfy `ok is False` while telling an operator
+    # something untrue. The wording is shared with conformance_sink.cpp, so
+    # asserting it here is also what detects those two drifting apart.
+    parsed = sink.call(op="parse_metadata", metadata_json=metadata)
+    assert parsed["ok"] is False, parsed
+    assert "invalid or unpaired Unicode escape" in parsed["what"], parsed
+    submitted = _submit_row(sink, metadata, bytes(64), "uint8", [64])
+    assert submitted["ok"] is False, submitted
+    assert "invalid or unpaired Unicode escape" in submitted["what"], submitted
     # The mapping path is the native side of CaptureMetadata.from_mapping and
     # refuses it too, rather than admitting a name the oracle cannot hold.
     refused = sink.call(op="submit", metadata=json.loads(metadata),
@@ -1201,8 +1209,14 @@ def test_a_malformed_unicode_escape_is_refused_not_decoded(sink, tmp_path,
     with pytest.raises(ValueError):
         json.loads(metadata)
 
-    assert sink.call(op="parse_metadata", metadata_json=metadata)["ok"] is False
-    assert _submit_row(sink, metadata, bytes(64), "uint8", [64])["ok"] is False
+    # As above, the reason and not just the refusal -- commit 9823a61 exists
+    # solely to make this wording name the escape rather than the encoding.
+    parsed = sink.call(op="parse_metadata", metadata_json=metadata)
+    assert parsed["ok"] is False, parsed
+    assert "invalid or unpaired Unicode escape" in parsed["what"], parsed
+    submitted = _submit_row(sink, metadata, bytes(64), "uint8", [64])
+    assert submitted["ok"] is False, submitted
+    assert "invalid or unpaired Unicode escape" in submitted["what"], submitted
     assert sink.call(op="snapshot")["snapshot"]["submitted_records"] == 0
 
 
