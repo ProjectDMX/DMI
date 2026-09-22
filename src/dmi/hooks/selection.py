@@ -228,6 +228,39 @@ def filter_by_tp_rank(specs: list, tp_rank: int) -> list:
     return filtered
 
 
+def hook_belongs_to_layers(spec: "HookSpec", start: int, end: int) -> bool:
+    """Return whether a hook falls inside an inclusive layer range.
+
+    Global hooks carry ``layer_no < 0`` and are never layer-restricted, so a
+    layer range never drops ``final_logits``, ``token_ids``, or the other
+    model-wide observations.
+    """
+    if spec.layer_no < 0:
+        return True
+    return start <= spec.layer_no <= end
+
+
+def filter_by_layers(specs: list, start: int, end: int) -> list:
+    """Keep only per-layer hooks inside the inclusive range ``[start, end]``.
+
+    Applied after ``apply_hook_selection``: selection decides *which kinds* of
+    observation to capture, this decides *where*. Global hooks are unaffected.
+    """
+    if start > end:
+        raise ValueError(f"Layer range start ({start}) exceeds end ({end}).")
+    filtered = []
+    for s in specs:
+        if not hook_belongs_to_layers(s, start, end):
+            if s.module is None:
+                raise RuntimeError(
+                    "filter_by_layers requires bound executable HookSpecs"
+                )
+            s.module.enabled = False
+            continue
+        filtered.append(s)
+    return filtered
+
+
 __all__ = [
     "register_preset",
     "resolve_hook_selection",
@@ -237,4 +270,6 @@ __all__ = [
     "hook_belongs_to_tp_rank",
     "filter_by_pp_rank",
     "filter_by_tp_rank",
+    "hook_belongs_to_layers",
+    "filter_by_layers",
 ]

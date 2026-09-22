@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from ...engine import effective_ring_bytes
 from .adapter import (
     HuggingFaceAdapter,
     _prepare_profile_times,
@@ -205,6 +206,25 @@ def _generate_with_monitoring_impl(
             "generate_with_monitoring() requires model.monitoring_engine to "
             "be set to a MonitoringEngine instance."
         )
+    # One owner per model. This helper builds its OWN adapter and reconfigures
+    # the shared transport (model cfg, active specs, every HookPoint's enabled
+    # flag), and its `finally` detaches. Run on a model somebody else already
+    # attached -- dmi.configuration.attach_config, or a bare
+    # adapter.attach_model -- and the forward ends up with one caller's
+    # reservation and this call's producers, then loses the first attachment
+    # entirely. Refuse instead of silently re-owning it.
+    _owner = getattr(target, "_dmi_active_adapter", None)
+    if _owner is not None:
+        raise RuntimeError(
+            "generate_with_monitoring() was called on a model that is already "
+            f"attached by {type(_owner).__name__}. This entry point installs "
+            "its own hooks and replaces the transport's selection, which "
+            "would desynchronize the ring against the existing reservation. "
+            "Either drive generation through the existing attachment "
+            "(model.generate(...) directly -- the installed hooks already "
+            "capture), or detach it first "
+            "(adapter.detach_model(model)) and let this call own the model."
+        )
     if engine._ring_transport is None:
         raise RuntimeError(
             "generate_with_monitoring() found model.monitoring_engine, but "
@@ -252,7 +272,8 @@ def _generate_with_monitoring_impl(
         if input_ids is not None and hasattr(input_ids, "shape") and len(input_ids.shape) >= 2:
             batch = int(input_ids.shape[0])
             re = adaptor.ring_engine
-            effective_cap = min(re.payload_cap(), re.staging_cap())
+            effective_cap = effective_ring_bytes(
+                re.payload_cap(), re.staging_cap())
 
             input_len = int(input_ids.shape[1])
             try:
@@ -286,7 +307,23 @@ def _generate_with_monitoring_impl(
 
             decode_bytes = adaptor.decode_step_bytes(batch, kv_dim_estimate)
 
-            if decode_bytes > effective_cap:
+            # The capture-schedule gate is a PYTHON branch in HookPoint.forward.
+            # Under torch.compile + CUDA graphs, replay never runs Python: the
+            # flag is baked at the first decode trace, so a refusal (or a
+            # capture) at step one would apply to EVERY later step. The
+            # capacity path below has the same problem and already disables
+            # compilation; a non-default schedule takes the same fail-safe.
+            schedule = getattr(
+                getattr(getattr(adaptor.engine, "config", None), "schedule", None),
+                "__dataclass_fields__",
+                None,
+            )
+            non_default_schedule = schedule is not None and (
+                adaptor.engine.config.schedule
+                != __import__("dmi.config", fromlist=["CaptureSchedule"]).CaptureSchedule()
+            )
+
+            if decode_bytes > effective_cap or non_default_schedule:
                 # Decode steps will overflow.  Force eager dispatch so
                 # before_forward's per-batch capacity check + HookPoint's
                 # safety net (ring D2D where it fits, submit_cpu_direct
@@ -296,11 +333,20 @@ def _generate_with_monitoring_impl(
                     or kwargs.pop("cache_implementation", None) is not None
                 )
                 kwargs["disable_compile"] = True
-                msg = (
-                    f"[ring_transport] Decode step ({decode_bytes / 1e6:.1f} MB) "
-                    f"exceeds ring capacity ({effective_cap / 1e6:.0f} MB). "
-                    f"Using eager dispatch + per-hook safety net."
-                )
+                if decode_bytes > effective_cap:
+                    msg = (
+                        f"[ring_transport] Decode step ({decode_bytes / 1e6:.1f} MB) "
+                        f"exceeds ring capacity ({effective_cap / 1e6:.0f} MB). "
+                        f"Using eager dispatch + per-hook safety net."
+                    )
+                else:
+                    msg = (
+                        "[ring_transport] The capture schedule is not the "
+                        "default (phase flags / strides / warmup). The gate is "
+                        "a Python branch that CUDA-graph replay would bake at "
+                        "the first decode trace, so compilation is disabled "
+                        "for this generate() call."
+                    )
                 if had_compile:
                     msg += " Disabled CUDA graph compilation for this generate() call."
                 warnings.warn(msg, stacklevel=2)
@@ -409,6 +455,23 @@ def generate_with_monitoring_dict(
 # generate_greedy_with_monitoring (manual prefill + decode loop)
 # ---------------------------------------------------------------------------
 
+def _eos_id_tensor(eos_token_id: Any, *, device: Any, dtype: Any) -> Any:
+    """Normalise every documented ``eos_token_id`` spelling to a 1-D tensor.
+
+    The adapter this module forwards into accepts ``int``, ``list[int]`` or
+    ``torch.Tensor`` (see ``HuggingFaceAdapter``), and a list is what
+    ``generation_config.eos_token_id`` holds for Qwen and Llama-3. Comparing a
+    token against the raw value with ``!=``/``==`` only works for the scalar
+    case: torch returns a plain Python ``bool`` for ``tensor != list`` -- no
+    broadcast, no error -- so the ``.long()`` and ``.nonzero()`` that follow
+    were called on a ``bool``. Normalising once here lets both sites use
+    ``torch.isin``, which is elementwise over the batch for every spelling.
+    """
+    if eos_token_id is None:
+        return None
+    return torch.as_tensor(eos_token_id, dtype=dtype, device=device).reshape(-1)
+
+
 def generate_greedy_with_monitoring(
     model: Any,
     input_ids: Any,
@@ -444,11 +507,22 @@ def generate_greedy_with_monitoring(
         attention_mask: [B, seq_len] attention mask on CUDA.
         max_new_tokens: maximum tokens to generate.
         min_new_tokens: minimum tokens before EOS can stop generation.
-        eos_token_id: EOS token ID.  None = never stop early.
+        eos_token_id: EOS token ID(s).  Accepts ``int``, ``list[int]`` or
+            ``torch.Tensor``, matching the ``HuggingFaceAdapter``
+            argument this is forwarded to and the list form
+            ``generation_config.eos_token_id`` holds for Qwen and
+            Llama-3.  None = never stop early.
         pad_token_id: pad token ID (unused, kept for compat).
         logits_to_keep: 0 = all rows, 1 = last position only.
         cuda_graphs: if True, compile decode step with reduce-overhead +
             StaticCache.  If False, use HF default DynamicCache, no compile.
+            NOTE: this loop selects the last prompt position's logits, and
+            the compiled decode step is not given an attention mask -- a
+            per-step-growing mask would change shape every step and defeat
+            CUDA-graph capture.  Right-padded prompts are unsupported on
+            either path (the selected logit is a pad), and left-padded
+            batches are only correct on the eager path
+            (``cuda_graphs=False``).  Unpadded batches are unaffected.
         monitoring: if True, install ring transport hooks via HuggingFaceAdapter and
             call before_forward_manual before each forward pass.
         hook_selection: hook selection preset (e.g. "hidden-states", "full").
@@ -468,6 +542,8 @@ def generate_greedy_with_monitoring(
     """
     device = input_ids.device
     B, Pmax = input_ids.shape
+    # argmax yields int64, so the ids are compared as int64 on both sides.
+    eos_ids = _eos_id_tensor(eos_token_id, device=device, dtype=torch.long)
 
     _wants_position_ids = (
         "position_ids" in inspect.signature(model.forward).parameters
@@ -480,6 +556,18 @@ def generate_greedy_with_monitoring(
 
     adaptor: Optional[HuggingFaceAdapter] = None
     if monitoring:
+        # One owner, as in generate_with_monitoring: this loop builds its own
+        # adapter and detaches on the way out, so running it over somebody
+        # else's attachment would reconfigure the shared transport and then
+        # take their hooks down with it.
+        _owner = getattr(model, "_dmi_active_adapter", None)
+        if _owner is not None:
+            raise RuntimeError(
+                "generate_greedy_with_monitoring() was called on a model that "
+                f"is already attached by {type(_owner).__name__}. Detach it "
+                "first (adapter.detach_model(model)), or run the loop with "
+                "monitoring=False and let the existing attachment capture."
+            )
         engine = getattr(model, "monitoring_engine", None)
         if engine is not None and engine._ring_transport is not None:
             adaptor = HuggingFaceAdapter(
@@ -575,6 +663,25 @@ def generate_greedy_with_monitoring(
 
         _prev_step_t = t_decode_start if do_timing else 0.0
         all_generated: List[Any] = [token.squeeze(-1)]
+        if not cuda_graphs:
+            # Decode-mask columns are append-only, so build the widest mask
+            # once and slice per step instead of a per-step torch.cat (which
+            # is O(T^2) over the whole decode). All-ones on the right because
+            # every generated position is real; the prompt columns keep the
+            # caller's padding.
+            full_mask = torch.cat(
+                [attention_mask,
+                 torch.ones(B, max_new_tokens, device=device,
+                            dtype=attention_mask.dtype)],
+                dim=1,
+            )
+            # Prefill positions are the pad-aware cumsum, so a row with k
+            # left pads ends prefill at RoPE position (real_tokens - 1) and
+            # its decode token at step s belongs at real_tokens + s -- the
+            # same value HF derives from the grown decode mask via
+            # decode_mask.cumsum(-1)[:, -1] - 1. A batch-uniform position
+            # would overshoot every k-padded row by k.
+            next_pos = attention_mask.long().sum(dim=-1, keepdim=True)
         with torch.no_grad():
             for step in range(max_new_tokens - 1):
                 if compiled_decode is not None:
@@ -587,8 +694,16 @@ def generate_greedy_with_monitoring(
                     torch.compiler.cudagraph_mark_step_begin()
                     out = compiled_decode(token, cache, cache_pos)
                 else:
+                    # The mask has to grow with the cache. Without it HF
+                    # builds an all-ones causal mask over the whole cache, so
+                    # a left-padded row attends to its own pad positions' K/V
+                    # and the greedy tokens diverge from model.generate().
+                    # Measured on a real model: supplying this restores exact
+                    # parity, and correcting position_ids alone does not.
+                    decode_mask = full_mask[:, :Pmax + step + 1]
                     decode_kwargs: Dict[str, Any] = {
                         "input_ids": token,
+                        "attention_mask": decode_mask,
                         "past_key_values": cache,
                         "use_cache": True,
                         "output_hidden_states": False,
@@ -597,9 +712,7 @@ def generate_greedy_with_monitoring(
                         "logits_to_keep": logits_to_keep,
                     }
                     if _wants_position_ids:
-                        seq_pos = Pmax + step + 1
-                        decode_kwargs["position_ids"] = torch.full(
-                            (B, 1), seq_pos, device=device, dtype=torch.long)
+                        decode_kwargs["position_ids"] = next_pos + step
                     if adaptor is not None:
                         adaptor.before_forward_manual(
                             token, attention_mask,
@@ -617,10 +730,10 @@ def generate_greedy_with_monitoring(
                 all_generated.append(token.squeeze(-1))
 
                 tokens_generated = step + 2
-                if (eos_token_id is not None
+                if (eos_ids is not None
                         and tokens_generated > min_new_tokens):
                     unfinished_sequences = unfinished_sequences & (
-                        token.squeeze(-1) != eos_token_id).long()
+                        ~torch.isin(token.squeeze(-1), eos_ids)).long()
                 this_peer_finished = unfinished_sequences.max() == 0  # GPU->CPU sync
 
                 if do_timing:
@@ -643,11 +756,12 @@ def generate_greedy_with_monitoring(
             timings.prefill_tokens = Pmax
 
         generated_ids = torch.stack(all_generated, dim=1).cpu()
+        eos_ids_cpu = None if eos_ids is None else eos_ids.cpu()
         results: List[Any] = []
         for b in range(B):
             seq = generated_ids[b]
-            if eos_token_id is not None:
-                eos_positions = (seq == eos_token_id).nonzero(as_tuple=False)
+            if eos_ids_cpu is not None:
+                eos_positions = torch.isin(seq, eos_ids_cpu).nonzero(as_tuple=False)
                 if len(eos_positions) > 0:
                     seq = seq[:int(eos_positions[0].item()) + 1]
             results.append(seq)

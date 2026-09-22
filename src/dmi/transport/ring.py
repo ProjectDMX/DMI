@@ -12,6 +12,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.library
 
+from ..engine import effective_ring_bytes
 from ..hooks.dispatch import install_ring_hooks
 from ..hooks.specs import *  # noqa: F401,F403 - compatibility re-exports
 from ..hooks.specs import (
@@ -200,6 +201,13 @@ class RingTransport:
         # the data_ptr is stable across cudagraph replays.
         self._ring_payload: torch.Tensor = ring_engine.payload_tensor()
 
+        # Effective per-step byte ceiling, min(payload, staging), for the
+        # eager safety net.  Both caps are engine-lifetime constants and the
+        # native getters are documented startup-only (ring_engine_py.h), so
+        # the min is computed once per transport and every HookPoint reuses
+        # it instead of answering the same pybind pair per active hook.
+        self._effective_cap: Optional[int] = None
+
         # Current step context -- set before each forward pass
         self._current_model_id: Optional[str] = None
         self._current_tp_rank: int = 0
@@ -226,6 +234,15 @@ class RingTransport:
         # wrappers and HookPoint.forward read only.
         self.force_eager: bool = False
 
+        # When False, the capture schedule refused the CURRENT step and
+        # HookPoint.forward must not dispatch a producer: the driver skipped
+        # plan/commit, so nothing reserved ring space and no meta was pushed
+        # -- an unrefused producer here would write unreserved bytes and
+        # desync the task/meta FIFO. Owned by adaptor_base.before_forward,
+        # re-set every step it drives; HookPoint.forward reads only. Steps
+        # committed directly (bypassing before_forward) never see False.
+        self.capture_step: bool = True
+
         # New-path state
         self._model_cfg: Optional[ModelShapeConfig] = None
         self._active_specs: List[HookSpec] = []
@@ -237,6 +254,21 @@ class RingTransport:
 
         # warn_once tracking for Case B fallback
         self._warned_shapes: set = set()
+
+    @property
+    def effective_cap(self) -> int:
+        """min(payload, staging): the drain's real per-flush-entry ceiling.
+
+        The drain assembles each flush batch per WHOLE entry and breaks when
+        the entry does not fit staging, so a tensor larger than staging that
+        the safety net admits is never drained.  Computed on first use (the
+        caps are engine-lifetime constants) and shared by every hook.
+        """
+        if self._effective_cap is None:
+            self._effective_cap = effective_ring_bytes(
+                self._ring_engine.payload_cap(),
+                self._ring_engine.staging_cap())
+        return self._effective_cap
 
     def set_step_context(
         self,

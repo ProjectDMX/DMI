@@ -995,6 +995,177 @@ def test_an_outcome_unknown_publish_quarantines_the_lease_until_its_window_expir
     assert client.watermarks == [1, 2]
 
 
+# The claim UUID a competitor uses: the HIGHEST in ClickHouse's UUID order, so
+# a contested head resolves to it rather than to this writer's own lease -- the
+# same value `tests/test_capture_version_allocation.py` contests a claim with.
+_COMPETING_CLAIM = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+
+
+def _land_the_lease_claim_then_lose_the_connection(client):
+    """Wrap ``client.execute`` so a lease CLAIM lands and then raises.
+
+    The row reaches the server -- a new term now stands in the lease table --
+    and the Python call raises anyway, which is the outcome-unknown failure the
+    quarantine exists for: the writer cannot tell whether its claim was
+    recorded, so it must not keep publishing under the identity it had.
+    """
+    real_execute = client.execute
+
+    def land_then_lose_the_connection(query, params=None, **kwargs):
+        if query.lstrip().startswith("INSERT INTO") and "publisher_lease" in query:
+            try:
+                return real_execute(query, params, **kwargs)
+            finally:
+                raise RuntimeError(
+                    "transport lost while the claim was still running"
+                )
+        return real_execute(query, params, **kwargs)
+
+    client.execute = land_then_lose_the_connection
+    return real_execute
+
+
+def test_an_outcome_unknown_lease_claim_quarantines_the_writer():
+    """A claim whose outcome is unknown must not leave the old identity usable.
+
+    ``acquire_publisher_lease`` on a writer that already holds a lease reuses
+    its ``lease_id`` at a HIGHER term, and the claim INSERT is not fenced --
+    nothing about it is conditional. So when the row lands and ``execute()``
+    raises anyway, the table's head has moved to a term this writer never
+    learned about while the writer still carries its stale term. Publishing
+    from there is the split brain: the fence resolves the head lease by
+    ``lease_id``, this writer's ``lease_id`` is exactly what landed at the new
+    term, and the stale-term publisher passes a fence it should have lost.
+    Hence the quarantine -- the identity is discarded WITHOUT the release
+    tombstone, and nothing publishes until the lease window has expired.
+    """
+    from dmi.storage.capture import PublisherLeaseError
+
+    client = _Client()
+    writer = _leased(client)
+    original_lease_id = writer.publisher_lease.lease_id
+    real_execute = _land_the_lease_claim_then_lose_the_connection(client)
+
+    with pytest.raises(RuntimeError, match="transport lost"):
+        writer.acquire_publisher_lease("indexer-a")
+
+    # The claim DID land: term 1 from `_leased`, term 2 from the claim whose
+    # outcome the caller never learned. The server knows; the caller does not.
+    assert {row[0] for row in client.lease.rows} == {1, 2}
+    # The identity is gone, and no tombstone ended either server row -- every
+    # lease row is still a live claim, so a successor is refused there too
+    # until the TTL expires.
+    assert writer.publisher_lease is None
+    assert all(
+        expires > acquired for _, _, _, acquired, expires in client.lease.rows
+    ), "quarantine must not write the release tombstone"
+    assert writer._quarantined_until_monotonic is not None
+
+    # The load-bearing assertion. Without the quarantine the writer keeps its
+    # term-1 lease and publishes through the fence -- the term-2 row carries
+    # this same lease_id, so the head resolves to it and the stale publisher is
+    # admitted. A quarantined writer issues nothing at all.
+    with pytest.raises(PublisherLeaseError, match="quarantin"):
+        _publish(writer, 1)
+    assert client.watermarks == [], "a quarantined writer must publish nothing"
+
+    # A healthy connection does not lift it either: what is unknown is whether
+    # the old statement is still running on the server, and reconnecting says
+    # nothing about that.
+    client.execute = real_execute
+    with pytest.raises(PublisherLeaseError, match="quarantin"):
+        _publish(writer, 1)
+    assert client.watermarks == []
+
+    # Past the window, a FRESH identity -- not the reused one -- publishes
+    # normally: by then the old claim has landed and its row has expired.
+    writer._quarantined_until_monotonic = time.monotonic() - 1
+    client.lease.now_ns += ClickHouseCatalogConfig().lease_ttl_ns + 1
+    fresh = writer.acquire_publisher_lease("indexer-a")
+    assert fresh.lease_id != original_lease_id
+    _publish(writer, 1)
+    assert client.watermarks == [1]
+
+
+def test_an_outcome_unknown_lease_renewal_quarantines_the_writer():
+    """The renewal path needs its own quarantine, and its own test.
+
+    ``renew_publisher_lease`` is a claim at a higher term like an acquire, and
+    it fails the same way: the row lands, ``execute()`` raises, and the writer
+    is left holding a term the head has already moved past.
+
+    Driven DIRECTLY rather than through ``publish_snapshot``, which renews as
+    its first act. ``_serial`` is an ``RLock``, so that inner renewal runs
+    re-entrantly inside the publish's own ``except BaseException:
+    self._quarantine_locked()`` -- the outer handler would quarantine the
+    writer even if this one did not, and the test would pass over a renewal
+    that quarantines nothing. Every caller that renews outside a publish --
+    the indexer between batches, ``ensure_schema``'s install lease -- depends
+    on the handler tested here.
+    """
+    from dmi.storage.capture import PublisherLeaseError
+
+    client = _Client()
+    writer = _leased(client)
+    _land_the_lease_claim_then_lose_the_connection(client)
+
+    with pytest.raises(RuntimeError, match="transport lost"):
+        writer.renew_publisher_lease()
+
+    assert {row[0] for row in client.lease.rows} == {1, 2}
+    assert writer.publisher_lease is None
+    assert all(
+        expires > acquired for _, _, _, acquired, expires in client.lease.rows
+    ), "quarantine must not write the release tombstone"
+    assert writer._quarantined_until_monotonic is not None
+
+    with pytest.raises(PublisherLeaseError, match="quarantin"):
+        _publish(writer, 1)
+    assert client.watermarks == [], "a quarantined writer must publish nothing"
+
+
+def test_a_taxonomy_failure_on_a_lease_claim_does_not_quarantine():
+    """A claim refused by the protocol is known-complete, so it must not.
+
+    The negative control on the two tests above: quarantining on EVERY claim
+    failure would satisfy them and cost every publisher a full lease window
+    after an ordinary contested or held claim, which the read-back has already
+    proved wrote nothing this writer can act on. So a claim that raises this
+    module's taxonomy -- here ``PublisherLeaseHeldError``, from a competing row
+    landing between the INSERT and its ownership read-back -- leaves the
+    writer free to claim again the moment the contested term expires.
+    """
+    client = _Client()
+    writer = _leased(client)
+    contested: list[int] = []
+
+    def contest(term: int) -> None:
+        contested.append(term)
+        client.lease.rows.append(
+            (term, _COMPETING_CLAIM, "competitor", 0, client.lease.now_ns + 10**12)
+        )
+        client.lease.on_claim_read = None  # contest the first attempt only
+
+    client.lease.on_claim_read = contest
+    with pytest.raises(PublisherLeaseHeldError, match="contested"):
+        writer.acquire_publisher_lease("indexer-a")
+
+    assert contested == [2], "the claim above the held term should be contested"
+    # The identity is dropped here too -- that is not the difference. The
+    # difference is the quarantine: this outcome is KNOWN, so no window is
+    # imposed on top of the contested term's own expiry.
+    assert writer.publisher_lease is None
+    assert writer._quarantined_until_monotonic is None
+
+    # Once the contested rows expire, the next claim is granted at once rather
+    # than refused for a further lease window.
+    client.lease.now_ns += 10**12 + 1
+    lease = writer.acquire_publisher_lease("indexer-a")
+    assert lease.term > contested[0]
+    _publish(writer, 1)
+    assert client.watermarks == [1]
+
+
 def test_a_writer_used_from_another_process_refuses_to_publish(monkeypatch):
     """A writer and its lease belong to the process that created them.
 

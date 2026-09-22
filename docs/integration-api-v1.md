@@ -134,8 +134,16 @@ schedule.should_capture_step(
 
 The predicates apply warmup, then offset, then stride. Step selection also
 honors `capture_prefill`/`capture_decode`; an unknown phase raises `ValueError`.
-`MonitoringConfig` currently contains only this schedule. Its default factory
-creates a distinct `CaptureSchedule` for each config instance.
+`MonitoringConfig` carries this schedule plus two storage fields:
+`storage_backend` (`"auto" | "native" | "capture" | "none"`) and
+`capture_sink_config` (a `NativeSinkConfig`, or `None`). Both are acted on by
+`MonitoringEngine`, and some combinations are refused at construction --
+`storage_backend="native"` without a host engine, or `"capture"`/`"none"` with
+one -- so a caller setting them should expect `ValueError` rather than a
+silent choice. `capture_sink_config` is read only when `storage_backend` is
+`"capture"`; see `docs/capture-storage-design.md` for the writer it selects.
+The schedule's default factory creates a distinct `CaptureSchedule` for each
+config instance.
 `MonitoringEngine` stores the config, while concrete adaptors decide whether
 and how to apply it; the engine does not enforce the schedule by itself.
 
@@ -866,6 +874,46 @@ specs must already correspond to layers owned by the local PP stage.
 The TP function keeps all hooks on rank 0 and only TP-sharded hooks on nonzero
 ranks. Neither function validates rank bounds or mutates the spec.
 
+### `filter_by_layers` and `hook_belongs_to_layers`
+
+```python
+filter_by_layers(
+    hook_points: Sequence[HookPoint],
+    start: int,
+    end: int,
+) -> None
+
+hook_belongs_to_layers(spec: HookSpec, start: int, end: int) -> bool
+```
+
+An inclusive layer range restricting per-layer specs and HookPoints, as
+forwarded by DMI-configurator's `attach_config`. `filter_by_layers` drops and
+disables out-of-range per-layer HookPoints in place (it owns the enabled flag
+for the range, like `apply_hook_selection` owns it for selection).
+`hook_belongs_to_layers` is the pure predicate: global hooks (`layer_no < 0`)
+always belong, per-layer hooks must fall inside `start..end` inclusive.
+Neither validates that the range exists in the model; layer bounds are the
+caller's responsibility. `compile_config` does check: a range that removes
+every spec of a selected hook raises `ConfigValidationError` naming the live
+layer span, so a stale descriptor cannot compile to a silently empty capture.
+
+`attach_config` is the single runtime-apply path, and it applies the whole
+configuration: it installs the `CaptureSchedule` on `adapter.engine.config`
+(where `_schedule_allows` reads it) and then attaches hooks with the layer
+range. It also records the owning adapter on the model, and an entry point
+that would build its own adapter over an attached model -- notably
+`generate_with_monitoring` -- refuses instead of re-owning it.
+
+### `LayerSelection`
+
+```python
+LayerSelection(start: int, end: int)
+```
+
+An inclusive range of layer indices (`LayerSelection(8, 15)` selects eight
+layers). End is inclusive so a UI label like "Layers 8-15" does not lie.
+Carries `contains(layer_no)` and `count`.
+
 `ALL_HOOK_TYPES` is the frozen set of all native hook IDs.
 `ATTENTION_WEIGHT_HOOK_TYPES` is the frozen subset containing only attention
 scores and attention patterns; it is not every hook in the attention group.
@@ -1358,6 +1406,13 @@ Current v1 reassembly does not reconstruct TP-sharded fields across
 integration needing distributed reassembly or duplicate detection must handle
 that explicitly rather than treating the lazy view as an authoritative
 cross-rank oracle.
+
+Reading a TP run therefore **raises** rather than returning a wrong tensor:
+where two ranks wrote the same tokens, reassembly names the collision instead
+of concatenating slices that are not sequential tokens. `get_internal()`
+accepts `shard_rank=N` to read one rank's slice, but the `dmi.api.v1` facade's
+`make_lazy_internal()` does not forward it, so that remedy is not reachable
+from the v1 surface yet.
 
 Example:
 
