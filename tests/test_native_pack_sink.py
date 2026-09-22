@@ -1132,17 +1132,100 @@ def _read_staged_metadata(root):
 @pytest.mark.parametrize("hook_name", ["block\U0001F600", "block中文"])
 def test_a_non_bmp_identifier_survives_the_metadata_decoder(sink, tmp_path,
                                                              hook_name):
-    """A surrogate pair is ONE code point; the BMP name is the control."""
+    """A surrogate pair is ONE code point; the BMP name is the control.
+
+    The assertion that matters is on the DECODER's bytes, taken straight out
+    of `parse_metadata` before anything re-serializes them. Reading hook_name
+    back off the staged pack cannot see this bug at all: the footer writer
+    decodes each UTF-8 sequence and re-emits \\uXXXX, so the decoder's broken
+    CESU-8 (ED A0 BD ED B8 80) is written back out as a correct \\ud83d\\ude00
+    pair that json.loads recombines into 😀. Measured -- both this test and
+    test_native_adapter_torch's round-trip passed with the surrogate combine
+    branch compiled out.
+    """
     _open(sink, tmp_path / "spool")
     metadata = _row_meta(0, dtype="uint8", shape=[64], hook_name=hook_name)
     assert "\\ud83d\\ude00" in metadata or "\\u4e2d" in metadata, metadata
+    decoded = sink.call(op="parse_metadata", metadata_json=metadata)
+    assert decoded["ok"], decoded
+    assert decoded["hook_name_hex"] == hook_name.encode("utf-8").hex()
     response = _submit_row(sink, metadata, bytes(64), "uint8", [64])
     assert response["ok"], response
     assert sink.call(op="flush", timeout=30)["ok"]
     assert sink.call(op="close", timeout=30)["snapshot"]["persisted_records"] == 1
     (staged,) = _read_staged_metadata(tmp_path / "spool")
     assert staged.hook_name == hook_name
-    assert staged.hook_name.encode("utf-8") == hook_name.encode("utf-8")
+
+
+@pytest.mark.parametrize("hook_name", ["block\ud83d", "block\udcff"])
+def test_a_lone_surrogate_is_refused_not_persisted_as_cesu8(sink, tmp_path,
+                                                            hook_name):
+    """A surrogate with no partner has no UTF-8 encoding at all.
+
+    The oracle cannot even build the record: _validate_text calls
+    .encode("utf-8"), which raises UnicodeEncodeError. Native kept the
+    three-byte form -- \\ud83d became ED A0 BD -- which ValidText admits,
+    because it checks lead/continuation byte SHAPE and not the surrogate
+    range, so the record was packed and inserted as CESU-8.
+    """
+    mapping = _meta(0, dtype="uint8", shape=(64,)).to_mapping()
+    mapping["hook_name"] = hook_name
+    with pytest.raises(PackFormatError, match="surrogates not allowed"):
+        CaptureMetadata.from_mapping(mapping)
+
+    _open(sink, tmp_path / "spool")
+    metadata = _row_meta(0, dtype="uint8", shape=[64], hook_name=hook_name)
+    assert "\\ud83d" in metadata or "\\udcff" in metadata, metadata
+    # The REASON, not merely the refusal: a decoder that rejected this for any
+    # other cause would satisfy `ok is False` while telling an operator
+    # something untrue. The wording is shared with conformance_sink.cpp, so
+    # asserting it here is also what detects those two drifting apart.
+    parsed = sink.call(op="parse_metadata", metadata_json=metadata)
+    assert parsed["ok"] is False, parsed
+    assert "invalid or unpaired Unicode escape" in parsed["what"], parsed
+    submitted = _submit_row(sink, metadata, bytes(64), "uint8", [64])
+    assert submitted["ok"] is False, submitted
+    assert "invalid or unpaired Unicode escape" in submitted["what"], submitted
+    # The mapping path is the native side of CaptureMetadata.from_mapping and
+    # refuses it too, rather than admitting a name the oracle cannot hold.
+    refused = sink.call(op="submit", metadata=json.loads(metadata),
+                        payload_b64=base64.b64encode(bytes(64)).decode())
+    assert refused["ok"] is False, refused
+    assert sink.call(op="snapshot")["snapshot"]["submitted_records"] == 0
+
+
+@pytest.mark.parametrize("bad_name", ["block\\uZZZZ", "block\\u12"])
+def test_a_malformed_unicode_escape_is_refused_not_decoded(sink, tmp_path,
+                                                           bad_name):
+    """\\uZZZZ has no code point; json.loads raises "Invalid \\uXXXX escape".
+
+    The four digits were never checked -- `h <= '9' ? h - '0' : (h | 0x20) -
+    'a' + 10` accepts anything -- so \\uZZZZ decoded to U+25553 and the field
+    was packed as F0 A5 95 93, a name nothing in the request ever spelled.
+    \\u12 is the SHORT variant: its "digits" run into the field's closing
+    quote, which the decoder's unconditional `q += 5` used to step past, so
+    the value swallowed the following JSON text up to the next quote
+    (tests/native/test_json_unescape.cpp pins the alignment itself); the
+    refusal here must hold with the quote intact.
+    """
+    _open(sink, tmp_path / "spool")
+    valid = _row_meta(0, dtype="uint8", shape=[64])
+    assert '"hook_name": "h"' in valid, valid
+    # A single backslash in the metadata TEXT: json.dumps doubles it on the
+    # wire, and the driver's outer FindString undoes exactly that doubling.
+    metadata = valid.replace('"hook_name": "h"', f'"hook_name": "{bad_name}"')
+    with pytest.raises(ValueError):
+        json.loads(metadata)
+
+    # As above, the reason and not just the refusal -- commit 9823a61 exists
+    # solely to make this wording name the escape rather than the encoding.
+    parsed = sink.call(op="parse_metadata", metadata_json=metadata)
+    assert parsed["ok"] is False, parsed
+    assert "invalid or unpaired Unicode escape" in parsed["what"], parsed
+    submitted = _submit_row(sink, metadata, bytes(64), "uint8", [64])
+    assert submitted["ok"] is False, submitted
+    assert "invalid or unpaired Unicode escape" in submitted["what"], submitted
+    assert sink.call(op="snapshot")["snapshot"]["submitted_records"] == 0
 
 
 @pytest.mark.parametrize("field, value, reason", [

@@ -2410,8 +2410,14 @@ def _native_read(driver, op, sel, fake_s3, **limits):
         insecure=True, **limits)
 
 
+# The list is the set of bytes ClickHouse actually escapes when it renders a
+# tuple, measured against this server with `SELECT tuple(concat('block',
+# char(N), 'resid')) FORMAT TSV` across the control range: \b \t \n \f \r \'
+# and \\ (plus \0, left out here because a NUL in an object key is a separate
+# question). 0x07 and 0x0B travel RAW inside a tuple and so need no entry.
 @pytest.mark.parametrize("hook_name", [
     "block\\resid", "block'quoted", "block\tresid",
+    "block\nresid", "block\rresid", "block\bresid", "block\fresid",
 ])
 def test_hydrate_accepts_metadata_the_sql_escaper_rewrites(fake_s3, hook_name):
     """The footer binding compares DECODED values, not escaped footer text.
@@ -2421,6 +2427,12 @@ def test_hydrate_accepts_metadata_the_sql_escaper_rewrites(fake_s3, hook_name):
     two representations refused these three valid captures with "catalog
     descriptor does not match the pack footer: field 12". Python hydrates
     them; native must too, and hand back the same 16 bytes.
+
+    Decoding is not enough on its own: the two decoders have to reach the
+    same BYTE. \\b and \\f decoded to the letters "b" and "f" on the catalog
+    side while the footer side decoded them to 0x08 and 0x0C, so a hook_name
+    carrying either staged, uploaded and indexed and then failed that same
+    field-12 binding.
     """
     import base64 as _base64
 
