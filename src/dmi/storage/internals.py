@@ -50,45 +50,7 @@ def _request_sort_key(request_id: str) -> tuple:
     return tuple(key)
 
 
-# k and v are the one sharded class whose TP split cannot be identified from
-# the stored rows -- see the refusal in `_merged_shard_chunks`.
-_KV_ACTS = ("attn.hook_k", "attn.hook_v")
-
-
-def _shard_axis(act_name: str) -> int:
-    """The axis a TP shard of ``act_name`` was cut along.
-
-    Derived from where the TOKEN axis sits, which is what
-    ``reassembly.segment_manager`` already encodes -- so the two stay one
-    decision rather than two that can drift apart:
-
-    * An attention matrix row is ``[heads, q_tokens, kv_tokens]``: that manager
-      uses ``token_dim_incremental=2-dim_diff`` and
-      ``token_dim_sum_to_now=3-dim_diff``, i.e. dims 1 and 2 once the batch dim
-      is absent. TP splits HEADS, so the join is dim 0.
-    * Every other row is token-major (``token_dim=1-dim_diff`` = dim 0), and TP
-      splits the axis immediately after tokens -- dim 1.
-
-    Dim 1 is deliberately NOT spelled ``-1``. ``compute_hook_shape``
-    (``dmi/hooks/specs.py``) stores q, k, v and batched z as
-    ``[tokens, heads, head_dim]``, where the split axis is heads in the MIDDLE.
-    Only packed z and mlp_post are two-dimensional, and there dim 1 already IS
-    the trailing axis. Spelling it -1 joins head_dim on the three-dimensional
-    layouts, producing a tensor with the right element count, the wrong shape
-    and spliced heads -- and raising nothing.
-    """
-    if act_name.endswith(("attn.hook_attn_scores", "attn.hook_pattern")):
-        return 0
-    return 1
-
-
-def _ordered_chunks(
-    chunks: list,
-    *,
-    act_name: str,
-    request_id: str,
-    merge_shards: bool = False,
-) -> list:
+def _ordered_chunks(chunks: list, *, act_name: str, request_id: str) -> list:
     """One request's chunks in token order, refusing a duplicate start token.
 
     Sorting ``(start_token, tensor)`` pairs without an explicit key makes
@@ -102,20 +64,16 @@ def _ordered_chunks(
     sharded hooks on every rank, and all ranks write one table with
     ``shard_rank`` telling the rows apart. Reassembling along the token axis
     cannot merge shards -- they are the same tokens, not more of them -- so
-    refusing is the default answer. The caller picks a ``shard_rank``, exactly
-    as the repo's own comparison tooling does, or opts in to ``merge_shards``
-    to join the slices back along their own axis (see ``_shard_axis``).
+    refusing is the only correct answer. The caller picks a ``shard_rank``,
+    exactly as the repo's own comparison tooling does.
     """
     # One pass over the starts, not ``starts.count(s)`` per start: a long
     # chunked capture (hundreds of rows per request/layer) otherwise paid
     # O(n^2) to build a diagnostic that only names the repeats.
-    by_start: dict[int, list] = {}
-    for start, rank, tensor in chunks:
-        by_start.setdefault(start, []).append((rank, tensor))
-    duplicated = sorted(start for start, group in by_start.items() if len(group) > 1)
-    if duplicated and merge_shards:
-        return _merged_shard_chunks(
-            by_start, act_name=act_name, request_id=request_id)
+    counts: dict[int, int] = {}
+    for start, _ in chunks:
+        counts[start] = counts.get(start, 0) + 1
+    duplicated = sorted(start for start, count in counts.items() if count > 1)
     if duplicated:
         raise RuntimeError(
             f"{act_name}: duplicate capture chunks for request {request_id!r} "
@@ -123,76 +81,12 @@ def _ordered_chunks(
             "more than once, which usually means rows from several TP ranks "
             "(distinguished by shard_rank) or from separate runs sharing one "
             "model_id. Reassembly cannot merge them along the token axis; "
-            "select a single shard_rank before reading, or pass "
-            "merge_shards=True to join TP shards along their own axis."
+            "select a single shard_rank before reading."
         )
-    return [group[0][1] for _, group in sorted(by_start.items())]
+    return [tensor for _, tensor in sorted(chunks, key=lambda chunk: chunk[0])]
 
 
-def _merged_shard_chunks(
-    by_start: dict, *, act_name: str, request_id: str
-) -> list:
-    """Join each start token's TP shards into one tensor, in rank order.
-
-    Ordering by ``shard_rank`` is what makes the result match the unsharded
-    tensor: rank r holds the r-th slice of the split axis, so concatenating in
-    rank order is the inverse of the split. A dict is not ordered by rank, and
-    row arrival order is whatever the reader returned, so the sort is load
-    bearing rather than tidiness.
-    """
-    if act_name.endswith(_KV_ACTS):
-        # K and V are the one class where "one row per rank" does not imply a
-        # split. `compute_hook_shape` computes
-        # `kv_heads = max(1, cfg.num_kv_heads // tp)`, so a GQA model with
-        # fewer KV heads than ranks gives EVERY rank the same kv head. The
-        # stored rows are identical in shape either way, and the row key
-        # carries neither `num_kv_heads` nor `tp_size`, so nothing here can
-        # tell a genuine split from replication. Joining a replicated K would
-        # return a tensor with duplicated heads that the model never produced,
-        # which is worse than refusing.
-        raise RuntimeError(
-            f"{act_name}: request {request_id!r} cannot be merged across TP "
-            "ranks -- GQA may replicate the KV heads rather than split them "
-            "(kv_heads = max(1, num_kv_heads // tp_size)), and the stored rows "
-            "do not record num_kv_heads or tp_size, so a replicated K/V is "
-            "indistinguishable from a split one. Merging would duplicate "
-            "heads. Select a single shard_rank instead."
-        )
-    axis = _shard_axis(act_name)
-    out = []
-    rank_tuples = set()
-    for start in sorted(by_start):
-        group = sorted(by_start[start], key=lambda rank_tensor: rank_tensor[0])
-        ranks = tuple(rank for rank, _ in group)
-        if len(set(ranks)) != len(ranks):
-            # Two rows from the SAME rank are not shards of one tensor --
-            # that is the "separate runs sharing one model_id" case, and
-            # concatenating them would fabricate a wider tensor than the
-            # model ever produced. Refuse it even under merge_shards.
-            raise RuntimeError(
-                f"{act_name}: request {request_id!r} has repeated shard_rank "
-                f"{sorted(r for r in ranks if ranks.count(r) > 1)} at start "
-                f"token {start} -- merge_shards joins one row per rank, so "
-                "this is a duplicate capture (separate runs sharing one "
-                "model_id), not a TP split. Select a single shard_rank."
-            )
-        rank_tuples.add(ranks)
-        out.append(group[0][1] if len(group) == 1
-                   else torch.cat([tensor for _, tensor in group], dim=axis))
-    if len(rank_tuples) > 1:
-        # Every start token must carry the same rank set, or the merged
-        # tensors disagree on width and the token-axis concatenation that
-        # follows would either throw or silently ragged-join.
-        raise RuntimeError(
-            f"{act_name}: request {request_id!r} has inconsistent shard_rank "
-            f"sets across start tokens ({sorted(rank_tuples)}) -- some tokens "
-            "are missing a rank's rows, so the shards cannot be joined into "
-            "one tensor. Select a single shard_rank."
-        )
-    return out
-
-
-def _reassemble_per_layer(rows: list, *, merge_shards: bool = False) -> tuple[torch.Tensor, ...]:
+def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
     """Reassemble a per-layer hook (residual stream, mlp, ...).
 
     rows: (key, tensor) pairs for one act_name, where
@@ -203,14 +97,12 @@ def _reassemble_per_layer(rows: list, *, merge_shards: bool = False) -> tuple[to
     # key[2] is the act_name; every row here belongs to one act by construction.
     act_name = rows[0][0][2] if rows else "<unknown act>"
     for key, tensor in rows:
-        layers.setdefault(key[3], {}).setdefault(key[1], []).append(
-            (key[5], key[4], tensor))
+        layers.setdefault(key[3], {}).setdefault(key[1], []).append((key[5], tensor))
     out = []
     for layer in sorted(layers):
         per_request = [
             torch.cat(
-                _ordered_chunks(chunks, act_name=act_name, request_id=request_id,
-                                merge_shards=merge_shards),
+                _ordered_chunks(chunks, act_name=act_name, request_id=request_id),
                 dim=0,
             )
             for request_id, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
@@ -236,20 +128,16 @@ def _left_pad_stack_attention(per_request: list[torch.Tensor]) -> torch.Tensor:
     return batched
 
 
-def _reassemble_attention_per_layer(
-    rows: list, act_name: str, *, merge_shards: bool = False
-) -> tuple[torch.Tensor, ...]:
+def _reassemble_attention_per_layer(rows: list, act_name: str) -> tuple[torch.Tensor, ...]:
     """Reassemble attention-matrix rows as a tuple ordered by layer."""
     layers: dict[int, dict[str, list]] = {}
     for key, tensor in rows:
-        layers.setdefault(key[3], {}).setdefault(key[1], []).append(
-            (key[5], key[4], tensor))
+        layers.setdefault(key[3], {}).setdefault(key[1], []).append((key[5], tensor))
     out = []
     for layer in sorted(layers):
         per_request = [
             merge_segments(
-                _ordered_chunks(chunks, act_name=act_name, request_id=request_id,
-                                merge_shards=merge_shards),
+                _ordered_chunks(chunks, act_name=act_name, request_id=request_id),
                 act_name,
             )
             for request_id, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
@@ -259,22 +147,20 @@ def _reassemble_attention_per_layer(
 
 
 def _attention_reassembler(act_name: str):
-    def _reassemble(rows: list, *, merge_shards: bool = False) -> tuple[torch.Tensor, ...]:
-        return _reassemble_attention_per_layer(
-            rows, act_name, merge_shards=merge_shards)
+    def _reassemble(rows: list) -> tuple[torch.Tensor, ...]:
+        return _reassemble_attention_per_layer(rows, act_name)
     return _reassemble
 
 
-def _reassemble_global(rows: list, *, merge_shards: bool = False) -> torch.Tensor:
+def _reassemble_global(rows: list) -> torch.Tensor:
     """Reassemble a non-layered field into [batch, seq, ...]."""
     requests: dict[str, list] = {}
     act_name = rows[0][0][2] if rows else "<unknown act>"
     for key, tensor in rows:
-        requests.setdefault(key[1], []).append((key[5], key[4], tensor))
+        requests.setdefault(key[1], []).append((key[5], tensor))
     per_request = [
         torch.cat(
-            _ordered_chunks(chunks, act_name=act_name, request_id=request_id,
-                            merge_shards=merge_shards),
+            _ordered_chunks(chunks, act_name=act_name, request_id=request_id),
             dim=0,
         )
         for request_id, chunks in sorted(requests.items(), key=lambda item: _request_sort_key(item[0]))
@@ -444,18 +330,10 @@ class LazyInternal:
         request_ids: tuple[str, ...] | list[str] | None = None,
         token_ranges: dict[str, tuple[tuple[int, int], ...] | list[tuple[int, int]]] | None = None,
         shard_rank: int | None = None,
-        merge_shards: bool = False,
     ) -> None:
-        if shard_rank is not None and merge_shards:
-            raise ValueError(
-                "shard_rank and merge_shards are mutually exclusive: "
-                "shard_rank selects one TP rank's slice, merge_shards joins "
-                "every rank's slices into the full tensor."
-            )
         self._model_id = model_id
         self._reader = reader
         self._shard_rank = shard_rank
-        self._merge_shards = merge_shards
         self._requirements = (
             requirements.copy() if requirements is not None else InternalRequirements()
         )
@@ -651,7 +529,7 @@ class LazyInternal:
                 f"Pass the corresponding hook via hook_selection= when generating."
             )
         self._validate_token_ranges(field, rows, requirement)
-        return reassemble(rows, merge_shards=self._merge_shards)
+        return reassemble(rows)
 
     def _build_token_mask(self) -> torch.Tensor:
         if not self._request_ids or not self._token_ranges:
@@ -730,8 +608,7 @@ class LazyInternal:
     def available(self) -> list[str]:
         if not self._request_ids:
             return get_internal(
-                self._model_id, self._reader, shard_rank=self._shard_rank,
-                merge_shards=self._merge_shards,
+                self._model_id, self._reader, shard_rank=self._shard_rank
             ).available
         fields = []
         for field in sorted(_FIELDS):
@@ -760,7 +637,6 @@ def make_lazy_internal(
     request_ids: tuple[str, ...] | list[str] | None = None,
     token_ranges: dict[str, tuple[tuple[int, int], ...] | list[tuple[int, int]]] | None = None,
     shard_rank: int | None = None,
-    merge_shards: bool = False,
 ) -> LazyInternal:
     return LazyInternal(
         model_id,
@@ -769,7 +645,6 @@ def make_lazy_internal(
         request_ids=request_ids,
         token_ranges=token_ranges,
         shard_rank=shard_rank,
-        merge_shards=merge_shards,
     )
 
 
@@ -777,48 +652,23 @@ def get_internal(
     model_id: str,
     reader: CHClickhouseDriverReadOnly | None = None,
     shard_rank: int | None = None,
-    merge_shards: bool = False,
 ) -> Internal:
     """Retrieve a run's captured internals.
 
     ``model_id`` identifies the captured run. ``reader`` defaults to a local
     ClickHouse connection (``DMX_DB_HOST`` / ``DMX_DB_PORT``); pass one to read
-    a run from another process or host.
-
-    Under tensor parallelism a sharded activation is written once per rank,
-    every rank holding a different slice of the same tokens. The two arguments
-    below are the two ways to read such a run, and they are mutually
-    exclusive:
-
-    ``shard_rank`` keeps one rank's rows and returns THAT RANK'S SLICE -- a
-    tensor narrower than the model's, on the split axis. None keeps every row,
-    in which case reassembly refuses the collision by name rather than
-    guessing.
-
-    ``merge_shards=True`` joins every rank's slices back into the full tensor,
-    concatenating in ascending ``shard_rank`` order along the axis TP split:
-    dim 0 (heads) for an attention matrix, and otherwise the axis right after
-    tokens -- heads for the three-dimensional q and batched z, the feature axis
-    for two-dimensional packed z and mlp_post. ``k`` and ``v`` are refused,
-    because GQA may replicate KV heads across ranks rather than split them and
-    the stored rows cannot tell the two apart. Unsharded fields are
-    unaffected, since they have no
-    collision to join.
+    a run from another process or host. ``shard_rank`` selects one TP rank's
+    rows from a run where several ranks wrote the same tokens (the collision
+    reassembly otherwise refuses by name); None keeps every row.
     """
     reader = reader or _default_reader()
-    if shard_rank is not None and merge_shards:
-        raise ValueError(
-            "shard_rank and merge_shards are mutually exclusive: "
-            "shard_rank selects one TP rank's slice, merge_shards joins "
-            "every rank's slices into the full tensor."
-        )
     rows_by_act: dict[str, list] = {}
     for key, tensor in reader.prefix_get((model_id,)):
         if shard_rank is not None and key[4] != shard_rank:
             continue
         rows_by_act.setdefault(key[2], []).append((key, tensor))
     fields = {
-        field: reassemble(rows_by_act[act], merge_shards=merge_shards)
+        field: reassemble(rows_by_act[act])
         for field, (act, reassemble) in _FIELDS.items()
         if act in rows_by_act
     }

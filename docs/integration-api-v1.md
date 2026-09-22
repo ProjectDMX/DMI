@@ -1401,35 +1401,18 @@ Per-layer values are tuples ordered by layer, with tensors left-padded into
 batch form. Global fields are left-padded batched tensors. Attention matrices
 are left-padded on query and key axes. Outputs are CPU tensors.
 
-Under tensor parallelism a sharded field is written once per rank, each rank
-holding a different slice of the same tokens. Reassembly joins along the token
-axis, so by default it refuses such a collision by name rather than guessing.
-There are two ways to read one of those runs, and they are mutually exclusive:
-
-- `shard_rank=N` keeps one rank's rows and returns **that rank's slice** -- a
-  tensor narrower than the model's on the split axis.
-- `merge_shards=True` joins every rank's slices back into the full tensor,
-  concatenating in ascending `shard_rank` order along the axis TP split: dim 0
-  (heads) for an attention matrix, and otherwise the axis immediately after
-  tokens -- heads for the three-dimensional `q` and batched `z`, the feature
-  axis for two-dimensional packed `z` and `mlp_post`. `k` and `v` are
-  **refused**: GQA computes `kv_heads = max(1, num_kv_heads // tp_size)`, so a
-  model with fewer KV heads than ranks replicates them instead of splitting,
-  and the stored rows record neither `num_kv_heads` nor `tp_size` — a
-  replicated K is indistinguishable from a split one, so merging could
-  duplicate heads. Select a `shard_rank` for those.
-
-Both arguments are on `get_internal()`. They are **not** currently forwarded by
-the `dmi.api.v1` facade's `make_lazy_internal()`, so a TP run read through the
-v1 surface hits the refusal with no remedy available; that gap is tracked
-separately.
-
-ClickHouse MergeTree keys do not enforce uniqueness, so a duplicate capture is
-still possible -- two rows from the *same* rank. That is not a TP split, and
-`merge_shards` refuses it rather than fabricating a tensor wider than the
-model produced. An integration needing duplicate detection beyond that must
-handle it explicitly rather than treating the lazy view as an authoritative
+Current v1 reassembly does not reconstruct TP-sharded fields across
+`shard_rank`, and ClickHouse MergeTree keys do not enforce uniqueness. An
+integration needing distributed reassembly or duplicate detection must handle
+that explicitly rather than treating the lazy view as an authoritative
 cross-rank oracle.
+
+Reading a TP run therefore **raises** rather than returning a wrong tensor:
+where two ranks wrote the same tokens, reassembly names the collision instead
+of concatenating slices that are not sequential tokens. `get_internal()`
+accepts `shard_rank=N` to read one rank's slice, but the `dmi.api.v1` facade's
+`make_lazy_internal()` does not forward it, so that remedy is not reachable
+from the v1 surface yet.
 
 Example:
 
