@@ -334,35 +334,6 @@ def test_search_groups_and_orders_by_the_sort_key():
     assert f"ORDER BY {key}" in sql
 
 
-def test_search_resolves_argmax_only_for_the_pages_own_keys():
-    """The 27-column argMax runs over the page's keys, not every row past the cursor.
-
-    A single GROUP BY ... ORDER BY ... LIMIT resolved the argMax tuple for EVERY
-    group past the cursor before LIMIT kept (limit + 1) of them. The keyset
-    tuple comparison is not usable by the primary-key index, so a 38-row page
-    over a 198k-row catalog read all 198k rows and built all their tuples:
-    ~150 ms per page whatever the page size, and a full scan paged at 10k read
-    the table 20 times. About three quarters of each page was that aggregate.
-
-    The page's keys are chosen first by an inner query that groups only the five
-    key columns and carries the same filters and LIMIT; the argMax is then
-    computed for those keys alone. Groups and per-group resolution are
-    unchanged -- the outer query keeps every filter -- which the live parity
-    suites pin; this pins the shape that makes the cost track the page.
-    """
-    catalog, client = _catalog(descriptors=synthetic_descriptors(1))
-
-    catalog.search(CaptureQuery(limit=10))
-
-    sql = client.selects[0]
-    key = "`tenant_id`, `experiment_id`, `run_id`, `captured_at_ns`, `capture_id`"
-    assert f"({key}) IN (SELECT {key} FROM" in sql, sql
-    inner = sql.split(f"({key}) IN (SELECT {key} FROM", 1)[1]
-    assert "argMax(" not in inner.split(")", 1)[0], "the key subquery must not aggregate the tuple"
-    assert "LIMIT %(row_limit)s)" in inner, "the key subquery must carry the page LIMIT"
-    assert sql.count("LIMIT %(row_limit)s") == 2, sql
-
-
 # --- pagination -------------------------------------------------------------
 
 

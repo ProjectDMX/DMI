@@ -319,23 +319,11 @@ class ClickHouseCaptureCatalog:
         # One row beyond the page tells us whether a cursor is owed, without a
         # second counting query.
         params["row_limit"] = query.limit + 1
-        # Choose the page's keys first, then resolve the argMax tuple for those
-        # keys alone. One GROUP BY ... LIMIT built the full resolution tuple for
-        # EVERY group past the cursor before LIMIT kept limit + 1 of them, and
-        # the keyset comparison above is not usable by the primary-key index,
-        # so each page cost about the whole catalog whatever its size. The inner
-        # query groups only the key columns under the same filters and LIMIT;
-        # the outer keeps every filter too, so groups and their resolution are
-        # unchanged.
-        key = ", ".join(quoted(name) for name in _SORT_KEY)
-        where = " AND ".join(clauses)
         sql = (
             f"SELECT {self._projection()} FROM {self._qualified()} "
-            f"WHERE {where} AND ({key}) IN ("
-            f"SELECT {key} FROM {self._qualified()} WHERE {where} "
-            f"GROUP BY {key} ORDER BY {key} LIMIT %(row_limit)s) "
-            f"GROUP BY {key} "
-            f"ORDER BY {key} "
+            f"WHERE {' AND '.join(clauses)} "
+            f"GROUP BY {', '.join(quoted(name) for name in _SORT_KEY)} "
+            f"ORDER BY {', '.join(quoted(name) for name in _SORT_KEY)} "
             "LIMIT %(row_limit)s"
         )
         rows = self._client.execute(

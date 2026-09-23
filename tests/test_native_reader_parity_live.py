@@ -2614,3 +2614,78 @@ def test_a_non_bmp_hook_name_indexes_intact(fake_s3):
             sink.close()
             store.close()
             driver.close()
+
+
+def test_native_pages_resolve_argmax_for_their_own_keys_and_match_python():
+    """The native page query resolves the argMax tuple for the page's keys only.
+
+    A single GROUP BY ... LIMIT built the full 27-column resolution tuple for
+    every group past the cursor before LIMIT kept limit + 1 of them, and the
+    keyset tuple comparison is not usable by the primary-key index -- so each
+    page cost about the whole catalog whatever its size (~150 ms for a 38-row
+    page over 198k rows). The native reader now selects the page's keys in an
+    inner, key-only query under the same filters and LIMIT.
+
+    Two things are pinned. The SHAPE, from the query ClickHouse actually
+    received: native reads arrive over HTTP (interface 2), and every argMax
+    query must carry the key subquery. And the RESULT across a superseded
+    version, walked in pages small enough to cross several cursors, against
+    the Python reader, which still uses the single-phase shape -- so the
+    parity suite checks the new shape against the old one.
+    """
+    from dmi.storage.capture.clickhouse_reader import _RESOLVED
+
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            first = _descriptor_dicts(10)
+            _publish_native(driver, prefix, first, 7)
+            # Re-describe four captures from a different pack at a later
+            # version: resolution must pick version 8's locator for those.
+            newer_pack = "018f0000-0000-7000-8000-00000000beef"
+            second = [dict(first[i], pack_id=newer_pack) for i in (0, 3, 6, 9)]
+            _publish_native(driver, prefix, second, 8)
+
+            native, cursor = [], None
+            while True:
+                page = driver.call(op="search", limit=3,
+                                   **({"cursor": cursor} if cursor else {}))
+                assert page["ok"], page
+                native += page["items"]
+                cursor = page["next_cursor"]
+                if cursor is None:
+                    break
+            reader = _python_reader(client, config)
+            python, cursor = [], None
+            while True:
+                page = _python_page_items(reader, limit=3, cursor=cursor)
+                python += page.items
+                cursor = page.next_cursor
+                if cursor is None:
+                    break
+
+            assert len(native) == 10 == len(python)
+            assert _normalize(native) == _normalize(python)
+            pack_at = 5 + list(_RESOLVED).index("pack_id")
+            moved = {row[4] for row in native if row[pack_at] == newer_pack}
+            assert moved == {"capture-0", "capture-3", "capture-6", "capture-9"}
+
+            client.execute("SYSTEM FLUSH LOGS")
+            sent = [row[0] for row in client.execute(
+                "SELECT query FROM system.query_log WHERE type = 'QueryFinish' "
+                "AND interface = 2 AND query LIKE %(raw)s AND query LIKE '%%argMax%%' "
+                "AND event_time > now() - 600",
+                {"raw": f"%{prefix}_capture_raw%"})]
+            assert sent, "no native page query reached ClickHouse over HTTP"
+            # The KEY tuple feeds the subquery. A bare ") IN (SELECT " would also
+            # match the snapshot-membership filter `(store_id, pack_id) IN
+            # (SELECT ...)` that the old single-phase query already carried.
+            keys = "`tenant_id`,`experiment_id`,`run_id`,`captured_at_ns`,`capture_id`"
+            for query in sent:
+                assert f"({keys}) IN (SELECT {keys} FROM" in query, query
+                inner = query.split(f"({keys}) IN (SELECT {keys} FROM", 1)[1]
+                assert "argMax" not in inner.split(" GROUP BY ", 1)[0], query
+                assert query.count(" LIMIT ") == 2, query
+        finally:
+            driver.close()

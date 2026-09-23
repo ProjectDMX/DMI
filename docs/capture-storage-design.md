@@ -1566,7 +1566,7 @@ removed:
   because ClickHouse compares a tuple ordering argument through a generic
   `Field` once per row per aggregate.
 
-A search page resolves that aggregate for **its own keys only**. An inner query
+The native reader resolves that aggregate for **its own keys only**. An inner query
 groups just the five sort-key columns under the page's filters and `LIMIT`, and
 the outer query computes the `argMax` tuple for those keys. With a single
 `GROUP BY ... LIMIT`, ClickHouse built the full 27-column tuple for every group
@@ -1576,8 +1576,10 @@ usable by the primary-key index, so each page cost about the whole catalog
 whatever its size. Measured on 25.12 over a 198k-row catalog, a 38-row page
 took ~150 ms, three quarters of it that tuple. Both queries carry every filter,
 so the groups and their resolution are unchanged: that is the same immutability
-rule, below, that makes the pre-aggregation filters safe. Each page still scans
-the rows past the cursor. Removing that needs index-usable cursor bounds.
+rule, below, that makes the pre-aggregation filters safe. The Python reference
+reader keeps the single-phase shape, so the parity suite compares the two
+shapes directly. Each page still scans the rows past the cursor. Removing that
+needs index-usable cursor bounds.
 
 Every descriptor field except the locator is immutable for a
 `(tenant_id, capture_id)`, which is what makes the pre-aggregation `WHERE`
