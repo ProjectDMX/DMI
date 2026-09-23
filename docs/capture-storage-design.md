@@ -1536,6 +1536,13 @@ inside a selected extent, and with the 4 KiB default the unrelated bytes stay
 within `gap x joins`. `HydrationEstimate.request_bytes` additionally includes
 a conservative cold-cache bound for footer verification.
 
+`CaptureQuery`'s time bounds select a **closed** interval:
+`captured_after_ns <= captured_at_ns <= captured_before_ns`. Both are inclusive
+despite their names, in the Python and native readers alike, and equal bounds
+select a single instant. Windows that share an endpoint therefore both contain a
+capture recorded exactly at it; to partition a timeline, start each window at
+the previous window's `captured_before_ns + 1`.
+
 Reads are pinned to a watermark. `CaptureQuery.filter_hash` identifies a query
 independently of its page, keyset cursors carry that hash and the pinned
 watermark, and `ClickHouseCaptureCatalog` resolves a capture out of

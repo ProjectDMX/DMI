@@ -289,6 +289,11 @@ class CaptureQuery:
     model_id: str | None = None
     hook_names: tuple[str, ...] = ()
     layer_numbers: tuple[int, ...] = ()
+    # A CLOSED interval: captured_after_ns <= captured_at_ns <= captured_before_ns.
+    # Both bounds are inclusive despite the names, and equal bounds select one
+    # instant. Tiling a timeline with windows that share an endpoint therefore
+    # counts a capture AT that endpoint in both -- step each window's
+    # captured_after_ns to the previous captured_before_ns + 1 to partition it.
     captured_after_ns: int | None = None
     captured_before_ns: int | None = None
     cursor: str | None = None
