@@ -258,6 +258,33 @@ def test_v1_public_surface_is_documented() -> None:
     assert missing_members == []
 
 
+def _document_section(document: str, heading: str) -> str:
+    start = document.index(heading)
+    end = document.find("\n#", start + len(heading))
+    return document[start:] if end < 0 else document[start:end]
+
+
+@pytest.mark.cpu
+def test_v1_documents_the_capture_and_record_mode_refusals() -> None:
+    """The adapter refusals are part of the extension contract: an
+    integration that follows the document must know what to catch."""
+    root = Path(__file__).resolve().parents[1]
+    document = (root / "docs" / "integration-api-v1.md").read_text()
+
+    attach = _document_section(document, "#### `attach_model(")
+    assert 'storage_backend="capture"' in attach
+    assert "`dmi.configuration.ConfigurationError`" in attach
+    for entry in ("generate_with_monitoring", "generate_greedy_with_monitoring"):
+        assert f"`{entry}()`" in attach
+
+    storage = _document_section(document, "The predicates apply warmup")
+    assert "`ConfigurationError`" in storage
+
+    commit = _document_section(document, "### `StepPlan`, `StepReservation`")
+    assert "record mode" in commit
+    assert "`RuntimeError`" in commit
+
+
 @pytest.mark.cpu
 def test_v1_public_names_preserve_existing_shape_and_selection_behavior() -> None:
     from dmi.hooks import selection

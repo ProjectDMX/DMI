@@ -344,7 +344,7 @@ class HuggingFaceAdapter(BackendAdapter):
         the user's generation. On the legacy ring that is not worth it:
         capture is best-effort there, a failed step disarms its own hooks
         (``before_forward`` clears ``capture_step`` first), and generation
-        goes on. So the failure is logged, once per attachment, and the
+        goes on. So the failure is logged, once per adapter, and the
         step is lost.
 
         In capture or record mode the same failure means the hooks cannot
@@ -361,8 +361,8 @@ class HuggingFaceAdapter(BackendAdapter):
         self._warned_driver_failure = True
         _LOG.warning(
             "DMI capture step failed and was skipped; generation continues, "
-            "but this step's internals are not captured. Later failures in "
-            "this attachment are not logged: %s", exc, exc_info=exc)
+            "but this step's internals are not captured. Later failures from "
+            "this adapter are not logged: %s", exc, exc_info=exc)
 
     def detach_model(self, model: Any) -> None:
         # Release ownership first, and only our own: a nested caller that
