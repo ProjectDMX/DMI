@@ -647,3 +647,36 @@ def test_sysroot_fallback_applies_only_when_the_sysroot_exists(tmp_path):
         f"-L{tmp_path}/usr/lib/x86_64-linux-gnu",
     ]
 
+
+@pytest.mark.cpu
+def test_capture_extensions_relink_when_torch_changes(tmp_path):
+    # Named after their files, the extensions are up to date whenever their
+    # sources are -- including after a torch upgrade in the venv, which
+    # changes the libtorch and pybind11 they were built against. A stamp
+    # recording the torch and Python build they need is their prerequisite,
+    # rewritten only when that record changes.
+    database = _make("-p", "-n", "clean")
+    assert database.returncode == 0, database.stdout + database.stderr
+    stamp = "build/torch-extension.config"
+    for name in ("_dmi_native_sink", "_dmi_native_store"):
+        assert stamp in _prerequisites(database.stdout,
+                                       f"build/{name}{_EXT_SUFFIX}")
+
+    import torch
+
+    build_dir = tmp_path / "build"
+    written = build_dir / "torch-extension.config"
+    goal = (f"BUILD_DIR={build_dir}", str(written))
+    result = _make(*goal)
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = written.read_text()
+    assert torch.__version__ in record
+    assert _EXT_SUFFIX in record
+
+    before = written.stat().st_mtime_ns
+    assert _make(*goal).returncode == 0
+    assert written.stat().st_mtime_ns == before, "an unchanged record rewrote the stamp"
+
+    written.write_text(record.replace(torch.__version__, "0.0.0"))
+    assert _make(*goal).returncode == 0
+    assert written.read_text() == record

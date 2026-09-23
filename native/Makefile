@@ -47,6 +47,7 @@ HOST_FINAL_TARGET := $(PROJECT_ROOT)/src/dmi/$(HOST_TARGET_SO)
 # against multiple libcudart major versions.
 CUDA_RESOLVER := $(CURDIR)/cuda_toolkit.py
 CUDA_CONFIG_STAMP := $(BUILD_DIR)/cuda-toolkit.config
+TORCH_EXT_STAMP := $(BUILD_DIR)/torch-extension.config
 CUDA_RESOLVE_REQUIRED := 1
 ifneq ($(strip $(MAKECMDGOALS)),)
 ifeq ($(strip $(filter-out clean host,$(MAKECMDGOALS))),)
@@ -57,7 +58,7 @@ endif
 # clean/host), skip CUDA resolution entirely.
 CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/bench_sink build/conformance_catalog build/_dmi_native_sink build/_dmi_native_store
 ifneq ($(strip $(MAKECMDGOALS)),)
-ifeq ($(strip $(filter-out clean host cpu-goals capture check-libcurl $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
+ifeq ($(strip $(filter-out clean host cpu-goals capture check-libcurl $(TORCH_EXT_STAMP) $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
 endif
 endif
@@ -406,6 +407,23 @@ STORE_FINAL_TARGET := $(PROJECT_ROOT)/src/dmi/$(STORE_EXT)
 SINK_HEADERS := $(wildcard csrc/sink/*.h csrc/pack/*.h csrc/store/*.h csrc/common/*.h csrc/ring/*.h)
 STORE_HEADERS := $(wildcard csrc/catalog/*.h csrc/store/*.h csrc/pack/*.h csrc/common/*.h)
 
+# What the extensions are built against beyond their sources: torch
+# (libtorch for the sink, pybind11's headers for both), the C++ ABI it
+# expects and the Python it runs in. A torch upgrade in the venv changes no
+# source file, so without this record a file-named target stays "up to date"
+# and keeps the old build. Rewritten only when the record changes, like
+# $(CUDA_CONFIG_STAMP), so an unchanged venv relinks nothing.
+TORCH_EXT_RECORD_PY := import sys, sysconfig, torch; \
+    from torch.utils.cpp_extension import include_paths, library_paths; \
+    print("|".join([torch.__version__, str(torch.version.git_version), \
+        str(int(torch._C._GLIBCXX_USE_CXX11_ABI)), ";".join(include_paths()), \
+        ";".join(library_paths()), sysconfig.get_paths()["include"], \
+        sysconfig.get_config_var("EXT_SUFFIX")]))
+
+$(TORCH_EXT_STAMP): FORCE | $(BUILD_DIR)
+	record=$$($(PYTHON) -c '$(TORCH_EXT_RECORD_PY)') && \
+	    $(PYTHON) $(CUDA_RESOLVER) write-stamp --output $@ --record "$$record"
+
 .PHONY: build/_dmi_native_sink build/_dmi_native_store
 capture: $(SINK_FINAL_TARGET) $(STORE_FINAL_TARGET)
 build/_dmi_native_sink: $(SINK_FINAL_TARGET)
@@ -426,7 +444,7 @@ $(STORE_FINAL_TARGET): $(STORE_BUILT)
 # target that includes torch's headers -- this sink, the backend and host
 # objects (CXXFLAGS, HOST_CXXFLAGS) and the ring's nvcc compiles (NVCCFLAGS).
 # C++17 stays only on the torch-free drivers.
-$(SINK_BUILT): csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp $(SINK_HEADERS)
+$(SINK_BUILT): csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp $(SINK_HEADERS) $(TORCH_EXT_STAMP)
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++20 -O2 -fPIC -shared -DTORCH_EXTENSION_NAME=_dmi_native_sink \
 	    $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join('-I'+p for p in include_paths()))") \
@@ -453,7 +471,7 @@ STORE_SOURCES := csrc/catalog/storage_service.cpp csrc/catalog/bindings_store.cp
     csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/uploader.cpp \
     csrc/store/spool.cpp csrc/pack/pack_builder.cpp \
     csrc/common/json.cpp csrc/common/curl_init.cpp
-$(STORE_BUILT): $(STORE_SOURCES) $(STORE_HEADERS) | check-libcurl
+$(STORE_BUILT): $(STORE_SOURCES) $(STORE_HEADERS) $(TORCH_EXT_STAMP) | check-libcurl
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -fPIC -shared -Wall -Wextra \
 	    -I$(shell $(PYTHON) -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'include'))") \
