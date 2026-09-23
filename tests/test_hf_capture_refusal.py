@@ -14,7 +14,10 @@ Two reproductions from the capture-path audit, both of which "succeeded":
   nothing captured, while ``generate_greedy_with_monitoring`` (which has no
   wrapper) propagated it. The wrapper now re-raises in capture or record
   mode and, on the legacy path where swallowing is deliberate, logs the
-  first failure at WARNING instead of passing silently.
+  first failure at WARNING instead of passing silently. ``commit_step``
+  itself refuses record mode, because an adapter attached before
+  ``create_record_runtime`` still holds the stopped legacy ring, which
+  accepts the step without any error.
 
 The forked ``HookedLlama`` classes live in the transformers submodule, which
 the CPU job does not install, so the model here is the smallest stand-in the
@@ -47,6 +50,7 @@ pytestmark = pytest.mark.cpu
 
 ADAPTER_LOGGER = "dmi.adapters.huggingface.adapter"
 RECORD_RING_ERROR = "legacy metadata cannot be pushed to a record ring"
+RECORD_MODE_REFUSAL = r"commit_step\(\): the engine is in record mode"
 
 
 # ---------------------------------------------------------------------------
@@ -279,17 +283,19 @@ def test_other_storage_backends_still_attach(backend):
 
 def test_record_ring_failure_propagates_out_of_generate_with_monitoring():
     """The audit's exact path: the engine is on a record ring, so the legacy
-    metadata push throws inside HF's prepare step. It used to be swallowed
-    and generate() returned as if it had captured."""
+    metadata push threw inside HF's prepare step. It used to be swallowed
+    and generate() returned as if it had captured. commit_step now refuses
+    record mode before reserving or pushing anything."""
     engine = _SpyEngine("auto", record_mode=True)
     model = _TinyHookedLM(engine)
     input_ids, attention_mask = _inputs()
 
-    with pytest.raises(RuntimeError, match=RECORD_RING_ERROR):
+    with pytest.raises(RuntimeError, match=RECORD_MODE_REFUSAL):
         generate_with_monitoring(model, input_ids,
                                  attention_mask=attention_mask)
 
-    assert engine._ring_engine.push_all_metas_calls == 1
+    assert engine._ring_engine.prepare_step_calls == []
+    assert engine._ring_engine.push_all_metas_calls == 0
     # The finally still detaches: the wrapper is gone and the hooks disarmed.
     assert model._monitoring_orig_prepare is None
     assert not hasattr(model.prepare_inputs_for_generation, "__wrapped__")
@@ -333,3 +339,37 @@ def test_legacy_driver_failure_is_logged_once_not_swallowed(caplog):
                 if r.name == ADAPTER_LOGGER and r.levelno == logging.WARNING]
     assert len(warnings) == 1, [r.getMessage() for r in warnings]
     assert "ring hiccup" in warnings[0].getMessage()
+
+
+def _switch_to_record_ring(engine):
+    """What ``create_record_runtime`` does to an engine an adapter is
+    already attached to: it stops the legacy ring and replaces the engine's
+    ring and transport. The adapter keeps the references it took at attach."""
+    engine._ring_engine = _SpyRingEngine(record_ring=True)
+    engine._ring_transport = RingTransport(engine._ring_engine)
+    engine._record_mode = True
+
+
+def test_adapter_attached_before_create_record_runtime_refuses_the_step():
+    """attach, then create_record_runtime: the adapter's ring reference is
+    the stopped legacy ring, which accepts the step without complaint, so no
+    record-ring refusal fires and the step would pass silently. commit_step
+    refuses record mode itself, before touching either ring."""
+    engine = _SpyEngine("auto")
+    model = _TinyHookedLM(engine)
+    adapter = HuggingFaceAdapter(engine, "tiny")
+    adapter.attach_model(model)
+    stale_ring = engine._ring_engine
+    _switch_to_record_ring(engine)
+    input_ids, attention_mask = _inputs()
+
+    try:
+        with pytest.raises(RuntimeError, match=RECORD_MODE_REFUSAL):
+            model.prepare_inputs_for_generation(
+                input_ids, attention_mask=attention_mask)
+    finally:
+        adapter.detach_model(model)
+
+    for ring in (stale_ring, engine._ring_engine):
+        assert ring.prepare_step_calls == []
+        assert ring.push_all_metas_calls == 0

@@ -324,6 +324,18 @@ class BackendAdapter(abc.ABC):
         """
         if self.transport is None or self.transport.null_offload:
             return StepReservation.SKIPPED
+        if getattr(self.engine, "_record_mode", False):
+            # A record ring refuses the legacy step protocol natively, but an
+            # adapter attached before create_record_runtime still holds the
+            # stopped legacy ring, which accepts it: the step would reserve
+            # and publish into a ring nobody drains. Refuse either way.
+            raise RuntimeError(
+                "commit_step(): the engine is in record mode "
+                "(create_record_runtime replaced its legacy ring), and "
+                f"{type(self).__name__} drives the legacy step protocol, "
+                "which a record ring cannot store. Capture records through "
+                "the RecordRuntime, or monitor on an engine without one."
+            )
         if plan is None:
             plan = self.plan_step(ctx)
 

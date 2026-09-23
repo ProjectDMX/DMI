@@ -348,8 +348,8 @@ class HuggingFaceAdapter(BackendAdapter):
         step is lost.
 
         In capture or record mode the same failure means the hooks cannot
-        reach the storage the config chose -- a record ring refuses legacy
-        metadata outright -- so every step would fail the same way and the
+        reach the storage the config chose -- ``commit_step`` refuses record
+        mode outright -- so every step would fail the same way and the
         generate() would "succeed" with nothing stored. There it propagates.
         """
         engine = self.engine

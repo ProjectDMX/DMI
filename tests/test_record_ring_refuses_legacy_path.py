@@ -15,9 +15,13 @@ the reservation and producer entries did not:
   descriptor, or failed the ring when none was queued.
 * ``submit_cpu_direct`` (the safety net's bypass) did the same from the host.
 
-Each now throws before touching the ring. The CPU contract for the HF side is
-tests/test_hf_capture_refusal.py; the native unit test is
-test_record_ring_refuses_every_legacy_producer_entry in
+Each now throws before touching the ring. Above them, ``commit_step`` refuses
+record mode, which also covers an adapter attached before
+``create_record_runtime``: it still holds the stopped legacy ring, where the
+step went through without any error.
+
+The CPU contract for the HF side is tests/test_hf_capture_refusal.py; the
+native unit test is test_record_ring_refuses_every_legacy_producer_entry in
 tests/native/ring/test_ring_engine.cu.
 
 Needs CUDA and the full native backend. No sink: the record ring is created
@@ -38,6 +42,7 @@ pytestmark = [
 ]
 
 REFUSED = "cannot be used on a record ring"
+RECORD_MODE_REFUSAL = r"commit_step\(\): the engine is in record mode"
 
 
 def _ring_config():
@@ -141,9 +146,44 @@ def test_hf_generation_after_create_record_runtime_raises(record_engine):
     model = _TinyHookedLM(record_engine)
     input_ids = torch.tensor([[1, 2, 3]])
 
-    with pytest.raises(RuntimeError,
-                       match=f"legacy step reservation {REFUSED}"):
+    with pytest.raises(RuntimeError, match=RECORD_MODE_REFUSAL):
         generate_with_monitoring(model, input_ids,
                                  attention_mask=torch.ones_like(input_ids))
 
     assert ring.available_capacity() == before
+
+
+def test_an_adapter_attached_before_create_record_runtime_raises():
+    """The attach_config-then-create_record_runtime order. The adapter keeps
+    the legacy ring and transport it took at attach, and create_record_runtime
+    has stopped that ring. Its prepare_step and metadata push went there and
+    succeeded, so the step raised nothing until a HookPoint fired eagerly on
+    the record ring; a replayed graph would not have fired at all."""
+    from dmi.adapters.huggingface.adapter import HuggingFaceAdapter
+    from dmi.engine import MonitoringEngine
+    from dmi.storage.capture import CaptureRecordFormat
+    from tests.test_hf_capture_refusal import _TinyHookedLM
+
+    engine = MonitoringEngine(model_id="record-ring-refusal-stale",
+                              ring_config=_ring_config())
+    try:
+        model = _TinyHookedLM(engine)
+        adapter = HuggingFaceAdapter(engine, "record-ring-refusal-stale")
+        adapter.attach_model(model)
+        runtime = engine.create_record_runtime(CaptureRecordFormat())
+        ring = engine._ring_engine
+        assert adapter.ring_engine is not ring
+        before = ring.available_capacity()
+        input_ids = torch.tensor([[1, 2, 3]], device="cuda")
+
+        try:
+            with pytest.raises(RuntimeError, match=RECORD_MODE_REFUSAL):
+                model.prepare_inputs_for_generation(
+                    input_ids, attention_mask=torch.ones_like(input_ids))
+        finally:
+            adapter.detach_model(model)
+
+        assert ring.available_capacity() == before
+        del runtime
+    finally:
+        engine.close()
