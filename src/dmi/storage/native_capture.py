@@ -83,6 +83,10 @@ class NativeCaptureStorageConfig:
 
     clickhouse_host: str = "127.0.0.1"
     clickhouse_port: int = 8123  # the HTTP interface
+    # Every catalog request is bounded, so a server that stops answering
+    # cannot hold a flush, a publish or the lease renewal indefinitely.
+    clickhouse_connect_timeout_s: float = 10.0
+    clickhouse_request_timeout_s: float = 60.0
     database: str = "default"
     table_prefix: str = "dmi"
 
@@ -116,6 +120,10 @@ class NativeCaptureStorageConfig:
         if type(self.clickhouse_port) is not int or not 0 < self.clickhouse_port < 65536:
             raise ValueError("clickhouse_port must be in 1..65535")
         _positive("poll_interval_s", self.poll_interval_s, float)
+        _positive("clickhouse_connect_timeout_s",
+                  self.clickhouse_connect_timeout_s, float)
+        _positive("clickhouse_request_timeout_s",
+                  self.clickhouse_request_timeout_s, float)
         _positive("close_flush_timeout_s", self.close_flush_timeout_s, float)
         if self.reconcile_interval_s < 0:
             raise ValueError("reconcile_interval_s must be non-negative")
@@ -132,6 +140,8 @@ class NativeCaptureStorageConfig:
             "store_id": self.store_id,
             "clickhouse_host": self.clickhouse_host,
             "clickhouse_port": self.clickhouse_port,
+            "clickhouse_connect_timeout_s": float(self.clickhouse_connect_timeout_s),
+            "clickhouse_request_timeout_s": float(self.clickhouse_request_timeout_s),
             "database": self.database,
             "table_prefix": self.table_prefix,
         }

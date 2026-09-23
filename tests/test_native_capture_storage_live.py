@@ -25,6 +25,7 @@ import json
 import socket
 import subprocess
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from os import environ
@@ -265,13 +266,15 @@ def test_the_reference_reader_sees_the_same_captures(fake_s3, tmp_path):
 
 
 class _Switch:
-    """A TCP forwarder in front of ClickHouse's HTTP port that can be cut."""
+    """A TCP forwarder in front of ClickHouse's HTTP port that can be cut
+    (connections refused) or stalled (connections accepted, never answered)."""
 
     def __init__(self, host: str, port: int):
         self._target = (host, port)
         self._listener = socket.create_server(("127.0.0.1", 0))
         self.port = self._listener.getsockname()[1]
         self._up = True
+        self._stalled = False
         self._lock = threading.Lock()
         self._sockets: set[socket.socket] = set()
         threading.Thread(target=self._accept, daemon=True).start()
@@ -282,6 +285,10 @@ class _Switch:
                 client, _ = self._listener.accept()
             except OSError:
                 return
+            if self._stalled:
+                with self._lock:
+                    self._sockets.add(client)  # held open, never read
+                continue
             if not self._up:
                 client.close()
                 continue
@@ -320,8 +327,16 @@ class _Switch:
             except OSError:
                 pass
 
+    def stall(self):
+        """Accept new connections and never answer them. Live ones are
+        dropped, so a keep-alive client has to reconnect into the stall."""
+        self.cut()
+        self._up = True
+        self._stalled = True
+
     def restore(self):
         self._up = True
+        self._stalled = False
 
     def close(self):
         self.cut()
@@ -459,3 +474,124 @@ def test_the_loop_backs_off_while_the_object_store_is_down(tmp_path):
     # poll would have run ~150.
     assert snapshot["cycles"] <= 15, snapshot
     assert len(_ready(spool_root)) == 1  # still staged, not lost
+
+
+def test_a_pack_too_big_to_index_is_set_aside_and_the_rest_still_index(
+        fake_s3, tmp_path):
+    """A pack that can never fit the indexer's batch budget used to stall the
+    whole queue: it was retried first on every cycle, and everything queued
+    behind it was parked with it. It is now rejected once, flush says so,
+    and later packs index normally."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    _stage(spool_root, range(40), records_per_pack=40)  # ~40 descriptors
+    with _catalog() as (_client, catalog):
+        config = _storage_config(fake_s3, catalog.table_prefix)
+        native = config._native_dict()
+        native.update(
+            spool_root=str(spool_root), holder="poison-test",
+            poll_interval_ns=50_000_000, reconcile_on_start=False,
+            # One descriptor fits, forty do not.
+            indexer_max_estimated_bytes=4000)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            with pytest.raises(RuntimeError, match="cannot be indexed"):
+                service.flush(3.0)
+            small = _stage(spool_root, range(100, 101))
+            assert service.flush(10.0)
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+
+        assert snapshot["rejected_packs"] == 1, snapshot
+        assert snapshot["indexed_packs"] == 1, snapshot
+        assert snapshot["pending_index"] == 0, snapshot
+        assert sorted(_read_all(config)) == sorted(small)
+
+
+def test_flush_returns_on_time_when_the_catalog_stops_answering(
+        fake_s3, tmp_path):
+    """flush(timeout) waited for the cycle lock with no deadline, and the
+    catalog client had no timeouts, so one ClickHouse connection that never
+    answered held flush -- and flush_and_wait and close -- indefinitely."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        native = _storage_config(
+            fake_s3, catalog.table_prefix,
+            clickhouse_port=switch.port)._native_dict()
+        native.update(spool_root=str(spool_root), holder="stall-test",
+                      poll_interval_ns=20_000_000, reconcile_on_start=False,
+                      clickhouse_request_timeout_s=5.0)
+        service = _load_native_store_extension().StorageService(native)
+        service.start()
+        try:
+            switch.stall()
+            _stage(spool_root, range(2))
+            time.sleep(0.5)  # the background cycle is now waiting on ClickHouse
+
+            outcome = {}
+
+            def _flush():
+                started = time.monotonic()
+                outcome["drained"] = service.flush(1.0)
+                outcome["elapsed"] = time.monotonic() - started
+
+            waiter = threading.Thread(target=_flush, daemon=True)
+            waiter.start()
+            waiter.join(timeout=10.0)
+            assert not waiter.is_alive(), "flush(1.0) still blocked after 10 s"
+            assert outcome["drained"] is False
+            assert outcome["elapsed"] < 3.0, outcome
+        finally:
+            switch.close()  # releases the stalled connections
+            service.stop()
+
+
+def test_the_lease_holds_through_an_object_store_outage(tmp_path):
+    """The lease was renewed only inside a cycle, and failed cycles back off
+    up to max_backoff -- past the lease TTL. With the object store down and
+    ClickHouse healthy, a second publisher could take the catalog."""
+    from dmi.storage.native_capture import _load_native_store_extension
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        dead = f"http://127.0.0.1:{probe.getsockname()[1]}"
+    _stage(tmp_path / "first", range(1))  # a pack whose upload keeps failing
+    module = _load_native_store_extension()
+    with _catalog() as (_client, catalog):
+        def _native(spool, holder):
+            native = _storage_config(dead, catalog.table_prefix)._native_dict()
+            native.update(
+                spool_root=str(spool), holder=holder,
+                poll_interval_ns=20_000_000, max_backoff_ns=10_000_000_000,
+                lease_ttl_ns=3_000_000_000, publish_timeout_ns=1_000_000_000,
+                clock_skew_ns=0, reconcile_on_start=False,
+                s3_max_attempts=1, uploader_max_attempts=1)
+            return native
+
+        first = module.StorageService(_native(tmp_path / "first", "first"))
+        rival = module.StorageService(_native(tmp_path / "rival", "rival"))
+        first.start()
+        try:
+            deadline = time.monotonic() + 12.0
+            while time.monotonic() < deadline:
+                try:
+                    rival.start()
+                except RuntimeError as refused:
+                    assert "held" in str(refused)
+                else:
+                    rival.stop()
+                    pytest.fail("a second publisher took the lease")
+                time.sleep(0.5)
+            snapshot = first.snapshot()
+            first.rethrow_if_failed()
+        finally:
+            first.stop()
+
+    assert snapshot["upload_failures"] >= 1, snapshot
+    assert snapshot["lease_renewals"] >= 3, snapshot

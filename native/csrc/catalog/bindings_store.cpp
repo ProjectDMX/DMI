@@ -45,6 +45,13 @@ dmi_store::S3Config s3_config(const py::dict& d) {
   return c;
 }
 
+dc::ClickHouseTimeouts clickhouse_timeouts(const py::dict& d) {
+  dc::ClickHouseTimeouts t;
+  t.connect_s = get<double>(d, "clickhouse_connect_timeout_s", t.connect_s);
+  t.request_s = get<double>(d, "clickhouse_request_timeout_s", t.request_s);
+  return t;
+}
+
 dc::StorageServiceConfig service_config(const py::dict& d) {
   dc::StorageServiceConfig c;
   c.spool_root = get<std::string>(d, "spool_root", "");
@@ -57,6 +64,8 @@ dc::StorageServiceConfig service_config(const py::dict& d) {
   c.uploader.max_attempts = get<int>(d, "uploader_max_attempts", c.uploader.max_attempts);
   c.clickhouse_host = get<std::string>(d, "clickhouse_host", c.clickhouse_host);
   c.clickhouse_port = get<uint16_t>(d, "clickhouse_port", c.clickhouse_port);
+  c.clickhouse_timeouts = clickhouse_timeouts(d);
+  c.max_index_attempts = get<int>(d, "max_index_attempts", c.max_index_attempts);
   c.writer.database = get<std::string>(d, "database", "default");
   c.writer.table_prefix = get<std::string>(d, "table_prefix", "dmi");
   c.writer.lease_ttl_ns = get<uint64_t>(d, "lease_ttl_ns", c.writer.lease_ttl_ns);
@@ -94,6 +103,7 @@ py::dict snapshot_dict(const dc::StorageServiceSnapshot& s) {
   out["lease_renewals"] = s.lease_renewals;
   out["swept_on_start"] = s.swept_on_start;
   out["pending_index"] = s.pending_index;
+  out["rejected_packs"] = s.rejected_packs;
   out["last_error"] = s.last_error;
   return out;
 }
@@ -143,7 +153,8 @@ class CaptureReader {
       : s3_(s3_config(d)),
         client_(std::make_shared<const dc::ClickHouseClient>(
             get<std::string>(d, "clickhouse_host", "127.0.0.1"),
-            get<uint16_t>(d, "clickhouse_port", 8123))),
+            get<uint16_t>(d, "clickhouse_port", 8123),
+            clickhouse_timeouts(d))),
         config_{get<std::string>(d, "database", "default"),
                 get<std::string>(d, "table_prefix", "dmi")},
         catalog_(client_, config_),

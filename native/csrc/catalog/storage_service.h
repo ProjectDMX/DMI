@@ -28,6 +28,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -55,6 +56,7 @@ struct StorageServiceConfig {
 
   std::string clickhouse_host = "127.0.0.1";
   uint16_t clickhouse_port = 8123;
+  ClickHouseTimeouts clickhouse_timeouts;
   WriterConfig writer;  // database, table_prefix, lease TTLs
   IndexerConfig indexer;
   std::string holder;   // the publisher lease holder id
@@ -71,6 +73,11 @@ struct StorageServiceConfig {
   uint64_t max_backoff_ns = 30'000'000'000ull;
   // 0 disables the periodic pass; the start() pass is reconcile_on_start.
   uint64_t reconcile_interval_ns = 0;
+  // A pack the indexer refuses on its own (not a whole-batch outage) is
+  // retried this many times, then set aside: left in the object store, out
+  // of the flush boundary, and reported by the next flush(). A pack too big
+  // for the indexer's batch budget is set aside at once.
+  int max_index_attempts = 5;
   uint64_t schema_retry_sleep_ns = 500'000'000ull;
 
   // Sweep a crashed sink's stale .open files before anything writes to the
@@ -97,6 +104,7 @@ struct StorageServiceSnapshot {
   uint64_t lease_renewals = 0;
   uint64_t swept_on_start = 0;  // ready packs Recover() found at start
   uint64_t pending_index = 0;   // uploaded packs awaiting a retried index
+  uint64_t rejected_packs = 0;  // set aside: cannot be indexed (see flush)
   std::string last_error;
 };
 
@@ -114,7 +122,11 @@ class CaptureStorageService {
 
   // Run cycles until one finds the spool empty with every uploaded pack
   // indexed, or the timeout passes. Call after the sink's own flush, so
-  // everything it will stage is already staged. Returns false on timeout.
+  // everything it will stage is already staged. Returns false on timeout,
+  // including while a cycle already in flight outlives the deadline; it can
+  // overrun only by its own last cycle, whose requests are all bounded.
+  // Throws, once, if packs were set aside since the last flush: they are in
+  // the object store but can never reach the catalog.
   bool flush(double timeout_s);
 
   // Stop the background cycle and release the lease. Does not flush.
@@ -139,7 +151,10 @@ class CaptureStorageService {
   void index_bounded(std::vector<PackRefData> refs,
                      std::vector<PackRefData>* unindexed);
   void reconcile();
-  void renew_lease_if_due();
+  void keep_lease();          // the lease thread's body
+  void renew_lease_if_due();  // requires lease_mutex_
+  // Sets a pack aside for good; flush() reports it. Requires cycle_mutex_.
+  void reject(const PackRefData& ref, const std::string& reason);
   void record_error(const std::string& message);
   void latch_failure(std::exception_ptr failure, const std::string& message);
 
@@ -152,15 +167,24 @@ class CaptureStorageService {
   std::unique_ptr<dmi_store::SpoolUploader> uploader_;
 
   // Serialises cycles: the loop and flush() both run them, and NativeIndexer
-  // is not thread-safe.
-  std::mutex cycle_mutex_;
-  uint64_t last_renew_ns_ = 0;
+  // is not thread-safe. Timed, so flush() can give up at its deadline while
+  // a cycle is still in flight.
+  std::timed_mutex cycle_mutex_;
+  // Serialises every use of writer_'s lease: the lease thread renews it
+  // while cycles publish. Taken inside cycle_mutex_, never the other way.
+  std::mutex lease_mutex_;
+  uint64_t last_renew_ns_ = 0;  // guarded by lease_mutex_
   uint64_t last_reconcile_ns_ = 0;
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff
   // Uploaded, so gone from the spool, but not yet in the catalog.
   std::vector<PackRefData> pending_index_;
+  std::map<std::string, int> index_attempts_;  // by pack id
+  std::vector<std::string> rejected_unreported_;  // for the next flush()
 
   std::thread thread_;
+  // Renews on its own schedule, so neither the cycle backoff nor a slow
+  // upload can let the lease lapse while the service still runs.
+  std::thread lease_thread_;
   std::mutex wake_mutex_;
   std::condition_variable wake_;
   bool stop_requested_ = false;

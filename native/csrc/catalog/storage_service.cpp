@@ -58,7 +58,8 @@ CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
     : config_(std::move(config)),
       s3_(config_.s3),
       clickhouse_(std::make_shared<const ClickHouseClient>(
-          config_.clickhouse_host, config_.clickhouse_port)),
+          config_.clickhouse_host, config_.clickhouse_port,
+          config_.clickhouse_timeouts)),
       writer_(clickhouse_, config_.writer),
       indexer_(&s3_, &writer_, config_.indexer) {
   if (config_.spool_root.empty()) {
@@ -87,7 +88,7 @@ CaptureStorageService::~CaptureStorageService() {
 }
 
 void CaptureStorageService::start() {
-  std::lock_guard<std::mutex> cycle(cycle_mutex_);
+  std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
   if (started_) throw std::logic_error("storage service: already started");
 
   if (config_.sweep_spool_on_start) {
@@ -103,8 +104,11 @@ void CaptureStorageService::start() {
 
   CatalogSchema(clickhouse_, config_.writer.database, config_.writer.table_prefix)
       .ensure(&writer_.leases(), config_.schema_retry_sleep_ns);
-  writer_.acquire_lease(config_.holder);  // throws kHeld if another publisher holds it
-  last_renew_ns_ = steady_ns();
+  {
+    std::lock_guard<std::mutex> lease(lease_mutex_);
+    writer_.acquire_lease(config_.holder);  // throws kHeld if another publisher holds it
+    last_renew_ns_ = steady_ns();
+  }
 
   // A failed pass is not fatal -- the bucket is still there next time -- but a
   // lost lease is, and start() must not return holding a lease stop() will
@@ -116,6 +120,7 @@ void CaptureStorageService::start() {
       if (exc.kind() == CatalogError::Kind::kHeld ||
           exc.kind() == CatalogError::Kind::kLease) {
         try {
+          std::lock_guard<std::mutex> lease(lease_mutex_);
           if (writer_.held_lease() != nullptr) writer_.release_lease();
         } catch (...) {
         }
@@ -137,6 +142,7 @@ void CaptureStorageService::start() {
     state_.running = true;
   }
   started_ = true;
+  lease_thread_ = std::thread([this] { keep_lease(); });
   thread_ = std::thread([this] { loop(); });
 }
 
@@ -147,10 +153,12 @@ void CaptureStorageService::stop() {
   }
   wake_.notify_all();
   if (thread_.joinable()) thread_.join();
-  std::lock_guard<std::mutex> cycle(cycle_mutex_);
+  if (lease_thread_.joinable()) lease_thread_.join();
+  std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
   if (started_) {
     started_ = false;
     try {
+      std::lock_guard<std::mutex> lease(lease_mutex_);
       if (writer_.held_lease() != nullptr) writer_.release_lease();
     } catch (const std::exception& exc) {
       record_error(std::string("lease release failed: ") + exc.what());
@@ -166,10 +174,26 @@ bool CaptureStorageService::flush(double timeout_s) {
                             std::chrono::duration<double>(timeout_s));
   while (true) {
     {
-      std::lock_guard<std::mutex> cycle(cycle_mutex_);
+      // A cycle in flight -- the loop's, stuck on a slow catalog -- must not
+      // hold this call past its deadline.
+      std::unique_lock<std::timed_mutex> cycle(cycle_mutex_, std::defer_lock);
+      if (!cycle.try_lock_until(deadline)) return false;
       if (!started_) throw std::logic_error("storage service: not started");
       rethrow_if_failed();
-      if (run_cycle().drained) return true;
+      const bool drained = run_cycle().drained;
+      if (!rejected_unreported_.empty()) {
+        std::string message = "storage service: " +
+                              std::to_string(rejected_unreported_.size()) +
+                              " pack(s) cannot be indexed and were set aside "
+                              "(still in the object store): ";
+        for (size_t i = 0; i < rejected_unreported_.size(); ++i) {
+          if (i) message += "; ";
+          message += rejected_unreported_[i];
+        }
+        rejected_unreported_.clear();
+        throw std::runtime_error(message.substr(0, 4096));
+      }
+      if (drained) return true;
     }
     if (std::chrono::steady_clock::now() >= deadline) return false;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -199,7 +223,7 @@ void CaptureStorageService::loop() {
       std::lock_guard<std::mutex> lock(state_mutex_);
       if (failure_) return;  // the lease is gone; nothing more can publish
     }
-    std::lock_guard<std::mutex> cycle(cycle_mutex_);
+    std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
     run_cycle();
     // poll_interval * 2^streak, capped: flush() shares the streak, so an
     // outage it saw also slows the loop, and a success from either resets it.
@@ -260,8 +284,7 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
       state_.pending_index = pending_index_.size();
     }
 
-    // 3. Keep the lease alive while idle, and reconcile on its interval.
-    renew_lease_if_due();
+    // 3. Reconcile on its interval. The lease thread keeps the lease alive.
     if (config_.reconcile_interval_ns > 0 &&
         steady_ns() - last_reconcile_ns_ >= config_.reconcile_interval_ns) {
       reconcile();
@@ -336,7 +359,11 @@ void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
     work.pop_back();
     IndexResultData result;
     try {
+      std::lock_guard<std::mutex> lease(lease_mutex_);
       result = indexer_.index(batch);
+      if (result.indexed_packs > 0 || result.skipped_packs > 0) {
+        last_renew_ns_ = steady_ns();  // a publish renews the lease
+      }
     } catch (const CatalogError& exc) {
       if (exc.kind() == CatalogError::Kind::kBatchTooLarge && batch.size() > 1) {
         const size_t middle = batch.size() / 2;
@@ -344,6 +371,13 @@ void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
         work.emplace_back(batch.begin(), batch.begin() + middle);
         std::lock_guard<std::mutex> lock(state_mutex_);
         ++state_.batch_splits;
+        continue;
+      }
+      if (exc.kind() == CatalogError::Kind::kBatchTooLarge) {
+        // One pack alone exceeds the budget, so no retry can ever index it.
+        // Set it aside and keep draining: parking the queue behind it would
+        // stop every later pack reaching the catalog.
+        reject(batch.front(), exc.what());
         continue;
       }
       const bool lease_lost = exc.kind() == CatalogError::Kind::kHeld ||
@@ -355,23 +389,42 @@ void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
       give_up(batch, std::string("index failed: ") + exc.what());
       return;
     }
-    std::set<std::string> failed_ids;
+    // A failure the indexer reports for one pack is that pack's own (it was
+    // read and refused), unlike a batch that threw, which an outage explains.
+    // So only these count towards setting it aside.
+    std::map<std::string, std::string> failed;
     for (const IndexFailureData& failure : result.failures) {
-      failed_ids.insert(failure.pack_id);
+      failed[failure.pack_id] = failure.message;
       record_error("index failed for " + failure.object_key + ": " +
                    failure.message);
     }
     for (const PackRefData& ref : batch) {
-      if (failed_ids.count(ref.pack_id) != 0) unindexed->push_back(ref);
+      const auto it = failed.find(ref.pack_id);
+      if (it == failed.end()) {
+        index_attempts_.erase(ref.pack_id);
+      } else if (++index_attempts_[ref.pack_id] >= config_.max_index_attempts) {
+        reject(ref, "failed " + std::to_string(config_.max_index_attempts) +
+                        " times: " + it->second);
+      } else {
+        unindexed->push_back(ref);
+      }
     }
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.indexed_packs += result.indexed_packs;
     state_.indexed_rows += result.indexed_rows;
     state_.index_failures += result.failed_packs;
-    if (result.indexed_packs > 0 || result.skipped_packs > 0) {
-      last_renew_ns_ = steady_ns();  // a publish renews the lease
-    }
   }
+}
+
+void CaptureStorageService::reject(const PackRefData& ref,
+                                   const std::string& reason) {
+  index_attempts_.erase(ref.pack_id);
+  rejected_unreported_.push_back(ref.object_key + ": " + reason.substr(0, 300));
+  record_error("pack set aside, cannot be indexed: " + ref.object_key + ": " +
+               reason);
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  ++state_.rejected_packs;
+  ++state_.index_failures;
 }
 
 void CaptureStorageService::reconcile() {
@@ -404,7 +457,11 @@ void CaptureStorageService::reconcile() {
       packs.push_back(&object);
     }
     if (packs.empty()) continue;
-    const std::set<PackIdentity> committed = writer_.committed_pack_ids(identities);
+    std::set<PackIdentity> committed;
+    {
+      std::lock_guard<std::mutex> lease(lease_mutex_);
+      committed = writer_.committed_pack_ids(identities);
+    }
 
     std::vector<PackRefData> missing;
     for (size_t i = 0; i < packs.size(); ++i) {
@@ -447,10 +504,44 @@ void CaptureStorageService::reconcile() {
   state_.reconcile_skipped_objects += skipped;
 }
 
+void CaptureStorageService::keep_lease() {
+  // The lease renews only inside a publish, and the cycle loop backs off up
+  // to max_backoff_ns while the object store is down -- past the lease TTL.
+  // Renewing from the cycle let the lease lapse during an outage and a rival
+  // take the catalog. This thread renews on its own schedule instead.
+  const uint64_t ttl = config_.writer.lease_ttl_ns;
+  const auto tick = std::chrono::nanoseconds(
+      std::max<uint64_t>(ttl / 6, 10'000'000ull));
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(wake_mutex_);
+      wake_.wait_for(lock, tick, [this] { return stop_requested_; });
+      if (stop_requested_) return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (failure_) return;
+    }
+    try {
+      std::lock_guard<std::mutex> lease(lease_mutex_);
+      renew_lease_if_due();
+    } catch (const CatalogError& exc) {
+      if (exc.kind() == CatalogError::Kind::kHeld ||
+          exc.kind() == CatalogError::Kind::kLease) {
+        latch_failure(std::current_exception(),
+                      std::string("publisher lease lost: ") + exc.what());
+        return;
+      }
+      record_error(std::string("lease renewal failed: ") + exc.what());
+    } catch (const std::exception& exc) {
+      record_error(std::string("lease renewal failed: ") + exc.what());
+    }
+  }
+}
+
 void CaptureStorageService::renew_lease_if_due() {
-  // The lease renews only inside a publish. An idle service would lose it after
-  // lease_ttl_ns, and a rival could take the catalog over; renew once a third
-  // of the TTL has passed without a publish.
+  // Renew once a third of the TTL has passed without a publish, which leaves
+  // two more tries before a rival could claim it.
   const uint64_t ttl = config_.writer.lease_ttl_ns;
   if (ttl == 0 || steady_ns() - last_renew_ns_ < ttl / 3) return;
   writer_.renew_lease();
