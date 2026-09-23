@@ -46,6 +46,23 @@ jobs:
           python -m pip install "boto3>=1.40,<2"
           python -m pip install --no-deps -e .
 
+      - name: Fail on an undefined name in src/dmi
+        # An undefined name is a NameError that waits for its line to run,
+        # and nothing here would see it first: `make check`'s compile stage
+        # is `python -m compileall`, which accepts any name, and a branch
+        # the tests do not reach never raises. ruff's F821 finds it
+        # statically. That one rule only, not a style gate.
+        #
+        # Enabling it found 14, none of them a NameError today, and each is
+        # handled in the source where a reviewer sees it rather than
+        # excluded here: config.py's string annotations now import their
+        # types under TYPE_CHECKING, and hooks/specs.py's HOOK_TYPE_* names,
+        # bound by a globals() loop no linter can follow, carry a per-line
+        # noqa saying so. Pinned, so a ruff release cannot move the gate.
+        run: |
+          python -m pip install "ruff==0.16.5"
+          ruff check --select F821 --no-cache --output-format=github src/dmi
+
       - name: Compile every CPU-only native target
         # The C++ was compiled NOWHERE in CI until this step. `make check`'s
         # compile stage is `python -m compileall` -- Python only -- and the
