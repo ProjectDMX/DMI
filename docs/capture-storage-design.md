@@ -1566,6 +1566,19 @@ removed:
   because ClickHouse compares a tuple ordering argument through a generic
   `Field` once per row per aggregate.
 
+A search page resolves that aggregate for **its own keys only**. An inner query
+groups just the five sort-key columns under the page's filters and `LIMIT`, and
+the outer query computes the `argMax` tuple for those keys. With a single
+`GROUP BY ... LIMIT`, ClickHouse built the full 27-column tuple for every group
+past the cursor before `LIMIT` kept `limit + 1` of them. The keyset comparison
+`(tenant_id, experiment_id, run_id, captured_at_ns, capture_id) > (...)` is not
+usable by the primary-key index, so each page cost about the whole catalog
+whatever its size. Measured on 25.12 over a 198k-row catalog, a 38-row page
+took ~150 ms, three quarters of it that tuple. Both queries carry every filter,
+so the groups and their resolution are unchanged: that is the same immutability
+rule, below, that makes the pre-aggregation filters safe. Each page still scans
+the rows past the cursor. Removing that needs index-usable cursor bounds.
+
 Every descriptor field except the locator is immutable for a
 `(tenant_id, capture_id)`, which is what makes the pre-aggregation `WHERE`
 filters safe; the rule is written out in `clickhouse_reader`'s module
