@@ -94,6 +94,16 @@ class CatalogVersionAllocationError(CaptureStorageError):
     """
 
 
+class CatalogBatchTooLargeError(ValueError):
+    """An index() batch whose estimated descriptor bytes exceed the bound.
+
+    A ValueError, as it always was, so existing handlers keep working. It has
+    its own type so a caller that CAN split a batch -- the reconciler -- can
+    tell this refusal from every other ValueError without matching message
+    text.
+    """
+
+
 class CatalogRebuildExhaustedError(CaptureStorageError):
     """A rebuild hit ``max_pages`` before it finished the object store.
 
@@ -387,7 +397,7 @@ class CatalogIndexer:
             # innocent pack and, because the loop continues, silently skip every
             # remaining pack while index() still returned normally.
             if estimated_bytes + pack_bytes > self._config.max_estimated_bytes:
-                raise ValueError(
+                raise CatalogBatchTooLargeError(
                     "catalog batch exceeds max_estimated_bytes: "
                     f"{estimated_bytes + pack_bytes} > "
                     f"{self._config.max_estimated_bytes}"
@@ -656,7 +666,7 @@ class CatalogReconciler:
                         message=str(exc)[:512],
                     )
                 )
-        result = self._indexer.index(refs)
+        result = self._index_within_bound(refs)
         if not failures:
             return result
         rejected = IndexResult(
@@ -673,6 +683,27 @@ class CatalogReconciler:
         return result.merge(
             rejected, failure_limit=self._indexer.max_failure_details
         )
+
+    def _index_within_bound(self, refs: Sequence[PackRef]) -> IndexResult:
+        """Index `refs`, halving the batch until each part fits the bound.
+
+        The listing page size and the indexer's max_estimated_bytes are
+        independent settings, so a page of packs that each fit can still exceed
+        the bound together -- at the defaults, rebuilding a 57-pack, 437 MiB
+        bucket into an empty catalog failed outright. index() raises before
+        writing anything, so retrying the halves is safe; each half becomes its
+        own publication, exactly as successive pages already do. A single pack
+        over the bound cannot be split, and still raises.
+        """
+        try:
+            return self._indexer.index(refs)
+        except CatalogBatchTooLargeError:
+            if len(refs) <= 1:
+                raise
+        middle = len(refs) // 2
+        first = self._index_within_bound(refs[:middle])
+        second = self._index_within_bound(refs[middle:])
+        return first.merge(second, failure_limit=self._indexer.max_failure_details)
 
     def reconcile_page(
         self, *, prefix: str = "", cursor: str | None = None, limit: int = 64

@@ -477,6 +477,58 @@ def test_an_oversized_batch_raises_instead_of_blaming_a_pack(tmp_path: Path):
     assert writer.pack_batches == []
 
 
+def _largest_pack_estimate(inventory, refs) -> int:
+    from dmi.storage.capture.catalog import _estimated_bytes
+    from dmi.storage.capture.pack import PackIndex
+
+    return max(
+        sum(_estimated_bytes(d) for d in PackIndex.from_store(inventory, ref).descriptors())
+        for ref in refs
+    )
+
+
+def test_a_default_rebuild_splits_a_page_that_exceeds_the_batch_bound(tmp_path: Path):
+    """rebuild() must complete when every pack fits the bound but a page does not.
+
+    The reconciler's default page_size (64) and the indexer's max_estimated_bytes
+    (128 MiB) were independent defaults: rebuilding a 57-pack, 437 MiB bucket into
+    an empty catalog handed the indexer one 64-pack page, the indexer refused it
+    ("catalog batch exceeds max_estimated_bytes: 134736576 > 134217728") and the
+    rebuild failed with nothing indexed -- the disaster-recovery path, broken at
+    its defaults. The indexer's refusal is right and index() stays atomic; a
+    page that does not fit is now split and each half indexed on its own.
+    """
+    inventory, refs = _packs(tmp_path, (2, 2, 2, 2))
+    writer = _CatalogWriter()
+    bound = _largest_pack_estimate(inventory, refs)   # any ONE pack fits, no two do
+    reconciler = CatalogReconciler(inventory, CatalogIndexer(
+        inventory, writer, config=CatalogIndexerConfig(max_estimated_bytes=bound),
+        clock_ns=lambda: 42))
+
+    result = reconciler.rebuild(prefix="packs/")      # default page_size
+
+    assert result.indexed_packs == 4 and result.failed_packs == 0
+    assert result.indexed_rows == 8
+    assert writer.committed == {(ref.store_id, ref.pack_id) for ref in refs}
+    assert sum(len(batch) for batch in writer.descriptor_batches) == 8
+
+
+def test_a_single_pack_over_the_batch_bound_still_raises(tmp_path: Path):
+    """Splitting stops at one pack: a pack alone over the bound is a genuine
+    configuration error, and bisecting cannot make it fit."""
+    from dmi.storage.capture.catalog import CatalogBatchTooLargeError
+
+    inventory, refs = _packs(tmp_path, (2, 2))
+    writer = _CatalogWriter()
+    reconciler = CatalogReconciler(inventory, CatalogIndexer(
+        inventory, writer, config=CatalogIndexerConfig(max_estimated_bytes=1),
+        clock_ns=lambda: 42))
+
+    with pytest.raises(CatalogBatchTooLargeError, match="max_estimated_bytes"):
+        reconciler.rebuild(prefix="packs/")
+    assert writer.descriptor_batches == [] and writer.pack_batches == []
+
+
 def test_a_restarted_indexer_cannot_publish_under_the_durable_watermark(
     tmp_path: Path,
 ):
