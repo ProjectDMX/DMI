@@ -598,3 +598,52 @@ def test_missing_libcurl_names_the_package(tmp_path):
     assert result.returncode != 0, output
     assert "libcurl4-openssl-dev" in output
     assert "-o build/_dmi_native_store" not in output
+
+
+@pytest.mark.cpu
+def test_libcurl_dev_package_without_its_runtime_names_the_runtime_package(
+    tmp_path,
+):
+    # libcurl4-openssl-dev ships libcurl.so as a link to libcurl.so.4.x, and
+    # the file it names is in the runtime package, libcurl4. A sysroot with
+    # the dev package alone has a dangling link, which ld skips in favour of
+    # libcurl.a -- a static libcurl that fails to link, or links and fails at
+    # import. The generic "install libcurl4-openssl-dev" would send the user
+    # back to the package they just extracted.
+    (tmp_path / "libcurl.so").symlink_to("libcurl.so.4.6.0")
+    result = _make("check-libcurl", f"CURL_INCDIR={tmp_path}",
+                   f"CURL_LIBDIR={tmp_path}")
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert f"{tmp_path}/libcurl.so" in output
+    assert "runtime package libcurl4" in output
+
+
+def _curl_flags(result: subprocess.CompletedProcess[str]) -> list[str]:
+    link = next(argv for argv in _commands(result.stdout) if "-o" in argv
+                and argv[argv.index("-o") + 1] == "build/conformance_store")
+    return [arg for arg in link
+            if arg.startswith("-L") or (arg.startswith("-I")
+                                        and not arg.startswith("-Icsrc"))]
+
+
+@pytest.mark.cpu
+def test_sysroot_fallback_applies_only_when_the_sysroot_exists(tmp_path):
+    # With neither pkg-config nor explicit directories, the build falls back
+    # to the default sysroot only if it is there (and the user's own).
+    # Otherwise it adds no -I/-L at all, so the compiler's default paths --
+    # where a system-wide dev package lives -- apply, and a /tmp path that
+    # means nothing on this host is never searched ahead of them.
+    absent = _make("-B", "-n", "build/conformance_store", "PKG_CONFIG=false",
+                   f"CURL_SYSROOT_DEFAULT={tmp_path / 'absent'}")
+    assert absent.returncode == 0, absent.stdout + absent.stderr
+    assert _curl_flags(absent) == []
+
+    present = _make("-B", "-n", "build/conformance_store", "PKG_CONFIG=false",
+                    f"CURL_SYSROOT_DEFAULT={tmp_path}")
+    assert present.returncode == 0, present.stdout + present.stderr
+    assert _curl_flags(present) == [
+        f"-I{tmp_path}/usr/include/x86_64-linux-gnu",
+        f"-L{tmp_path}/usr/lib/x86_64-linux-gnu",
+    ]
+

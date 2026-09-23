@@ -227,16 +227,20 @@ make -C native -j CAPTURE=0        # the full backend without them
 ```
 
 They link libcurl. The build takes its directories from `pkg-config libcurl`
-when the `libcurl4-openssl-dev` package is installed. Without root, extract
-that package and point the build at it:
+when the `libcurl4-openssl-dev` package is installed, and otherwise uses the
+compiler's default paths. Without root, extract that package together with
+the runtime package `libcurl4` (the dev package's `libcurl.so` links to a
+file that ships in `libcurl4`), and point the build at them:
 
 ```bash
-apt-get download libcurl4-openssl-dev
-dpkg-deb -x libcurl4-openssl-dev_*.deb "$HOME/curl-sysroot"
+apt-get download libcurl4-openssl-dev libcurl4
+for deb in libcurl4*.deb; do dpkg-deb -x "$deb" "$HOME/curl-sysroot"; done
 make -C native -j CURL_SYSROOT="$HOME/curl-sysroot"
 ```
 
-`CURL_INCDIR` and `CURL_LIBDIR` override both, for example
+The extensions load the system's `libcurl.so.4` at runtime, so the sysroot is
+needed only to build. `CURL_INCDIR` and `CURL_LIBDIR` override all of these,
+for example
 `CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu`.
 
 Smoke check the package and host backend:
@@ -250,7 +254,7 @@ After a full build, smoke check the ring backend and the capture extensions:
 
 ```bash
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
-python -c "from dmi.transport import native; [print(native._load_named_extension(name).__file__) for name in ('_native_backend', '_dmi_native_sink', '_dmi_native_store')]"
+python -c "import torch; from dmi.transport import native; [print(native._load_named_extension(name).__file__) for name in ('_native_backend', '_dmi_native_sink', '_dmi_native_store')]"
 ```
 
 Run the dependency-free CPU gate without CUDA, ClickHouse, native artifacts,
@@ -295,6 +299,8 @@ checkout.
   `libcurl4-openssl-dev` (`libcurl-devel` on Fedora/RHEL), or pass
   `CURL_SYSROOT`, or `CURL_INCDIR` and `CURL_LIBDIR`, as in step 5. To build
   without the capture extensions, pass `CAPTURE=0`.
+- **`native/Makefile: .../libcurl.so links to a missing file`** — the sysroot
+  has `libcurl4-openssl-dev` without `libcurl4`; extract both, as in step 5.
 - **`ImportError` on `_dmi_native_sink` or `_dmi_native_store`** — rebuild
   with `make -C native capture -j`; `make -C native clean` removes them along
   with the full backend.

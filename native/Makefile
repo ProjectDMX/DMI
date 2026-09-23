@@ -288,9 +288,16 @@ build/bench_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/rec
 #      paths, and this always wins;
 #   2. `pkg-config libcurl`, which knows them wherever the dev package
 #      (libcurl4-openssl-dev on Debian/Ubuntu) is installed;
-#   3. the dev package extracted under CURL_SYSROOT, for a host without root:
-#        apt-get download libcurl4-openssl-dev && dpkg-deb -x <deb> <sysroot>
-# The link needs only -L; the runtime libcurl.so.4 ships with the OS.
+#   3. the packages extracted under CURL_SYSROOT, for a host without root.
+#      The dev package's libcurl.so links to a file in the runtime package,
+#      so both go in:
+#        apt-get download libcurl4-openssl-dev libcurl4
+#        for deb in libcurl4*.deb; do dpkg-deb -x "$deb" <sysroot>; done
+#   4. none at all: no -I/-L, and the compiler's default paths apply.
+# CURL_SYSROOT defaults to CURL_SYSROOT_DEFAULT only when that directory
+# exists and belongs to the user running make: an unowned directory under
+# /tmp must not supply headers and a library to the build ahead of the
+# system's. At runtime the store loads the OS's libcurl.so.4.
 PKG_CONFIG ?= pkg-config
 ifneq ($(filter undefined,$(origin CURL_INCDIR) $(origin CURL_LIBDIR)),)
 CURL_PKG_CONFIG_FOUND := $(shell $(PKG_CONFIG) --exists libcurl 2>/dev/null && echo yes)
@@ -303,19 +310,35 @@ ifeq ($(origin CURL_LIBDIR),undefined)
 CURL_LIBDIR := $(shell $(PKG_CONFIG) --variable=libdir libcurl)
 endif
 endif
-CURL_SYSROOT ?= /tmp/opencode/sysroot
+CURL_SYSROOT_DEFAULT ?= /tmp/opencode/sysroot
+ifeq ($(origin CURL_SYSROOT),undefined)
+CURL_SYSROOT := $(shell test -d '$(CURL_SYSROOT_DEFAULT)' && test -O '$(CURL_SYSROOT_DEFAULT)' && echo '$(CURL_SYSROOT_DEFAULT)')
+endif
+ifneq ($(CURL_SYSROOT),)
 CURL_INCDIR ?= $(CURL_SYSROOT)/usr/include/x86_64-linux-gnu
 CURL_LIBDIR ?= $(CURL_SYSROOT)/usr/lib/x86_64-linux-gnu
+endif
+CURL_CPPFLAGS = $(if $(CURL_INCDIR),-I$(CURL_INCDIR))
+CURL_LDFLAGS = $(if $(CURL_LIBDIR),-L$(CURL_LIBDIR))
+CURL_SEARCHED = $(if $(CURL_INCDIR)$(CURL_LIBDIR),CURL_INCDIR=$(CURL_INCDIR)$(comma) CURL_LIBDIR=$(CURL_LIBDIR),the compiler's default paths)
 
 # Compile and link one libcurl call before any target that needs it, so a
 # missing dev package is one line naming it rather than a page of compiler
 # output from whichever source includes <curl/curl.h> first. An order-only
 # prerequisite of those targets: it runs, but never makes them out of date.
+# A dangling libcurl.so is named separately: it is the dev package extracted
+# without its runtime package, and ld would skip it for libcurl.a.
 check-libcurl:
+	@if [ -n "$(CURL_LIBDIR)" ] && [ -L "$(CURL_LIBDIR)/libcurl.so" ] && [ ! -e "$(CURL_LIBDIR)/libcurl.so" ]; then \
+	    echo "native/Makefile: $(CURL_LIBDIR)/libcurl.so links to a missing file." \
+	         "Extract the runtime package libcurl4 into the same sysroot as" \
+	         "libcurl4-openssl-dev -- see docs/install.md." >&2; \
+	    exit 1; \
+	fi
 	@printf '#include <curl/curl.h>\nint main() { return curl_global_init(CURL_GLOBAL_DEFAULT); }\n' \
-	    | $(CXX) -x c++ - -o /dev/null -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcurl 2>/dev/null \
+	    | $(CXX) -x c++ - -o /dev/null $(CURL_CPPFLAGS) $(CURL_LDFLAGS) -lcurl 2>/dev/null \
 	    || { echo "native/Makefile: cannot build against libcurl" \
-	              "(CURL_INCDIR=$(CURL_INCDIR), CURL_LIBDIR=$(CURL_LIBDIR))." \
+	              "($(CURL_SEARCHED))." \
 	              "Install libcurl4-openssl-dev (Debian/Ubuntu; libcurl-devel on" \
 	              "Fedora/RHEL), or pass CURL_INCDIR/CURL_LIBDIR -- see docs/install.md." >&2; \
 	         exit 1; }
@@ -332,7 +355,7 @@ build/conformance_store: csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/st
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -o $@ \
 	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/spool.cpp csrc/store/uploader.cpp csrc/store/conformance_store.cpp csrc/common/json.cpp csrc/common/curl_init.cpp \
-	    -Icsrc/store -Icsrc/common -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
+	    -Icsrc/store -Icsrc/common $(CURL_CPPFLAGS) $(CURL_LDFLAGS) -lcrypto -lcurl -lpthread
 
 # B1 catalog conformance driver: lease coordinator + version allocator over
 # ClickHouse's HTTP interface. No torch/pybind; needs libcurl like the store.
@@ -346,7 +369,7 @@ build/conformance_catalog: csrc/catalog/clickhouse_client.cpp csrc/catalog/lease
 	    csrc/common/json.cpp csrc/common/curl_init.cpp csrc/pack/pack_builder.cpp \
 	    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp \
 	    -Icsrc/catalog -Icsrc/common -Icsrc/pack -Icsrc/store \
-	    -I$(CURL_INCDIR) -L$(CURL_LIBDIR) -lcrypto -lcurl -lpthread
+	    $(CURL_CPPFLAGS) $(CURL_LDFLAGS) -lcrypto -lcurl -lpthread
 
 # A3a spool conformance driver: no network, no torch; runs in any CI job.
 build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp csrc/store/spool.h csrc/common/json.cpp csrc/common/json.h
@@ -435,9 +458,9 @@ $(STORE_BUILT): $(STORE_SOURCES) $(STORE_HEADERS) | check-libcurl
 	$(CXX) -std=c++17 -O2 -fPIC -shared -Wall -Wextra \
 	    -I$(shell $(PYTHON) -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'include'))") \
 	    $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); print('-I'+paths.get('include'))") \
-	    -Icsrc -Icsrc/catalog -Icsrc/common -Icsrc/pack -Icsrc/store -I$(CURL_INCDIR) \
+	    -Icsrc -Icsrc/catalog -Icsrc/common -Icsrc/pack -Icsrc/store $(CURL_CPPFLAGS) \
 	    -o $@ $(STORE_SOURCES) \
-	    -L$(CURL_LIBDIR) -lcurl -lcrypto -lpthread
+	    $(CURL_LDFLAGS) -lcurl -lcrypto -lpthread
 # A3b sink conformance driver: queue + assembler + spool staging in one
 # process, driven over stdin/stdout. Needs only libcrypto + pthreads.
 build/conformance_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/conformance_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp csrc/sink/pack_sink.h csrc/sink/object_key.h csrc/sink/record_row.h
