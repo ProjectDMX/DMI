@@ -46,8 +46,14 @@ def _torch_compile_lines(target: str) -> list[str]:
             if "-DTORCH_EXTENSION_NAME=" in line and " -c " in f" {line} "]
 
 
-@pytest.mark.cpu
-@pytest.mark.parametrize("target", ["host", "all"])
+@pytest.mark.parametrize("target", [
+    # host plans on any machine, so CI's cpu job checks it.
+    pytest.param("host", marks=pytest.mark.cpu),
+    # The full backend needs the CUDA toolchain even to be PLANNED, which a
+    # cpu runner does not have. It is a gpu test, not a cpu test that skips:
+    # the cpu gate rightly fails any skip that is not absent hardware.
+    pytest.param("all", marks=pytest.mark.gpu),
+])
 def test_every_torch_including_compile_requests_cxx20(target):
     """PyTorch's headers refuse anything older than C++20.
 
@@ -58,6 +64,9 @@ def test_every_torch_including_compile_requests_cxx20(target):
     noticed, because it only dry-runs `host` and the torch-free drivers never
     reach ATen. This pins the flag on the plan actually executed rather than on
     the Makefile's text, so it holds however the flags are assembled.
+
+    Only ``host`` is marked cpu. Planning ``all`` resolves the CUDA toolkit and
+    fails without one, so it runs under the gpu marker instead.
     """
     lines = _torch_compile_lines(target)
     assert lines, f"no torch-including compile found in the `{target}` plan"
