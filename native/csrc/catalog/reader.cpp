@@ -755,9 +755,19 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
     grouped += quoted(column);
     order += quoted(column);
   }
+  // Choose the page's keys first, then resolve the argMax tuple for those keys
+  // alone -- the same shape as the Python reader. One GROUP BY ... LIMIT built
+  // the full resolution tuple for EVERY group past the cursor before LIMIT kept
+  // limit + 1 of them, and the keyset tuple comparison is not usable by the
+  // primary-key index, so a page cost about the whole catalog whatever its
+  // size. Both queries carry every filter, so groups and resolution are
+  // unchanged.
   const std::vector<Row> rows = client_->execute(
       "SELECT " + projection() + " FROM " + qualified("capture_raw") +
-          " WHERE " + clauses + " GROUP BY " + grouped + " ORDER BY " + order +
+          " WHERE " + clauses + " AND (" + grouped + ") IN (SELECT " +
+          grouped + " FROM " + qualified("capture_raw") + " WHERE " +
+          clauses + " GROUP BY " + grouped + " ORDER BY " + order +
+          " LIMIT %(row_limit)s) GROUP BY " + grouped + " ORDER BY " + order +
           " LIMIT %(row_limit)s",
       params, bounded_read_settings());
 
