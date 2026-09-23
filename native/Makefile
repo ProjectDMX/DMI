@@ -341,7 +341,9 @@ check-libcurl:
 	    || { echo "native/Makefile: cannot build against libcurl" \
 	              "($(CURL_SEARCHED))." \
 	              "Install libcurl4-openssl-dev (Debian/Ubuntu; libcurl-devel on" \
-	              "Fedora/RHEL), or pass CURL_INCDIR/CURL_LIBDIR -- see docs/install.md." >&2; \
+	              "Fedora/RHEL), or pass CURL_INCDIR/CURL_LIBDIR -- see docs/install.md." \
+	              "To build without the capture storage extensions, which the" \
+	              "in-memory path does not need, pass CAPTURE=0." >&2; \
 	         exit 1; }
 
 # A2a SigV4 conformance driver: no torch/pybind/network; runs in any CI job.

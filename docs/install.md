@@ -207,6 +207,7 @@ For GPU capture and ring transport, build the full backend:
 ```bash
 make -C native -j
 # or simply: make
+# no libcurl dev package? add CAPTURE=0 to skip the capture extensions below
 ```
 
 Artifacts are emitted as `_native_backend.<EXT_SUFFIX>.so` inside `native/`

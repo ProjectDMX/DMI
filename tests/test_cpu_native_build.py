@@ -592,12 +592,21 @@ def test_missing_libcurl_names_the_package(tmp_path):
         "exit 1\n"
     )
     compiler.chmod(0o755)
-    result = _make("build/_dmi_native_store", f"CXX={compiler}",
+    # BUILD_DIR keeps the run, and the torch stamp it writes, out of the
+    # checkout's native/build.
+    build_dir = tmp_path / "build"
+    result = _make("build/_dmi_native_store", f"BUILD_DIR={build_dir}",
+                   f"CXX={compiler}",
                    f"CURL_INCDIR={tmp_path}", f"CURL_LIBDIR={tmp_path}")
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
     assert "libcurl4-openssl-dev" in output
-    assert "-o build/_dmi_native_store" not in output
+    # The default build includes the capture extensions, so this failure is
+    # also what a host without libcurl gets from a plain `make`, which then
+    # builds no _native_backend either. The in-memory path does not need
+    # them: the message has to name the opt-out.
+    assert "CAPTURE=0" in output
+    assert f"-o {build_dir}/_dmi_native_store" not in output
 
 
 @pytest.mark.cpu
