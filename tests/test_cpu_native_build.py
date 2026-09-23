@@ -427,3 +427,174 @@ def test_v1_model_shape_contract_does_not_load_ring_backend():
     assert hints["return"] == api.ModelShapeConfig | None
     assert isinstance(shape, api.ModelShapeConfig)
     assert sys.modules.get("dmi.transport.ring") is ring_before
+
+
+# --- the capture extensions are part of the documented build -----------------
+#
+# `make -C native clean && make -C native` is what install.md and the backend
+# guides tell a user to run. `clean` removes the whole build directory, so a
+# capture extension that `all` does not rebuild is deleted by the documented
+# command and comes back only when someone remembers its separate target.
+# These pin the default build to the capture extensions, install them where
+# the loader looks, and keep the libcurl lookup honest. Dry runs (`-n`), so
+# nothing is compiled; the default goal is read from make's rule database
+# (`-p`) under a `clean` goal, because a dry run of `all` itself resolves the
+# CUDA toolkit, which a CPU host does not have.
+
+_NATIVE_DIR = Path(__file__).resolve().parents[1] / "native"
+_EXT_SUFFIX = __import__("sysconfig").get_config_var("EXT_SUFFIX")
+
+
+def _make(*args: str) -> subprocess.CompletedProcess[str]:
+    # The caller's make state must not leak in: MAKEFLAGS carries command-line
+    # overrides such as CURL_INCDIR from an enclosing `make test-cpu ...`.
+    env = {
+        key: value
+        for key, value in __import__("os").environ.items()
+        if key not in {"MAKEFLAGS", "MFLAGS", "MAKELEVEL", "CAPTURE",
+                       "CURL_INCDIR", "CURL_LIBDIR", "CURL_SYSROOT",
+                       "PKG_CONFIG"}
+    }
+    return subprocess.run(
+        ["make", "-C", str(_NATIVE_DIR), f"PYTHON={sys.executable}", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+
+def _commands(stdout: str) -> list[list[str]]:
+    """The dry run's commands, backslash continuations joined, as argv."""
+    return [command.split() for command in
+            stdout.replace("\\\n", " ").splitlines() if command.strip()]
+
+
+def _prerequisites(database: str, target: str) -> list[str]:
+    for line in database.splitlines():
+        if line.startswith(f"{target}:") and not line.startswith(f"{target}::"):
+            return line.split(":", 1)[1].split()
+    raise AssertionError(f"make has no rule for {target!r}")
+
+
+def _installed(name: str) -> Path:
+    from dmi.transport import native
+
+    return Path(native.__file__).resolve().parents[1] / f"{name}{_EXT_SUFFIX}"
+
+
+@pytest.mark.cpu
+def test_default_build_includes_the_capture_extensions():
+    from dmi.transport import native
+
+    result = _make("-p", "-n", "clean")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    assert "capture" in _prerequisites(result.stdout, "all")
+    capture = _prerequisites(result.stdout, "capture")
+    for name in ("_dmi_native_sink", "_dmi_native_store"):
+        installed = _installed(name)
+        assert str(installed) in capture
+        # Installed beside _native_backend, which the loader searches first.
+        assert installed.parent == native._search_dirs()[0]
+        # The documented target names stay: CI and the loaders' error
+        # messages ask for them.
+        assert str(installed) in _prerequisites(result.stdout, f"build/{name}")
+
+
+@pytest.mark.cpu
+def test_capture_opt_out_leaves_the_default_build_to_the_backend():
+    result = _make("-p", "-n", "clean", "CAPTURE=0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "capture" not in _prerequisites(result.stdout, "all")
+
+
+@pytest.mark.cpu
+def test_clean_then_capture_build_recreates_what_clean_removed():
+    result = _make("-B", "-n", "clean", "capture")
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+
+    commands = _commands(result.stdout)
+    removal = next(i for i, argv in enumerate(commands) if argv[:2] == ["rm", "-rf"])
+    rebuilt = commands[removal + 1:]
+    for name in ("_dmi_native_sink", "_dmi_native_store"):
+        built, installed = f"build/{name}{_EXT_SUFFIX}", str(_installed(name))
+        assert installed in commands[removal]
+        assert any(argv[argv.index("-o") + 1] == built
+                   for argv in rebuilt if "-o" in argv)
+        assert any(argv[-1] == installed for argv in rebuilt)
+
+
+@pytest.mark.cpu
+def test_capture_targets_are_named_after_the_files_they_produce():
+    # A target whose recipe writes some other path is never up to date, so
+    # every `make` relinked both extensions. Named after the file, a second
+    # run has nothing to do.
+    result = _make("-p", "-n", "clean")
+    assert result.returncode == 0, result.stdout + result.stderr
+    for name in ("_dmi_native_sink", "_dmi_native_store"):
+        built = f"build/{name}{_EXT_SUFFIX}"
+        assert built in _prerequisites(result.stdout, str(_installed(name)))
+        assert _prerequisites(result.stdout, built)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("overrides", "include", "library"),
+    [
+        # CI's invocation: explicit directories win over pkg-config.
+        (("CURL_INCDIR=/explicit/include", "CURL_LIBDIR=/explicit/lib"),
+         "/explicit/include", "/explicit/lib"),
+        # A host with the dev package: pkg-config names the directories.
+        ((), "/pkgconfig/include", "/pkgconfig/lib"),
+        # No pkg-config entry: the extracted dev package under CURL_SYSROOT.
+        (("PKG_CONFIG=false", "CURL_SYSROOT=/sysroot"),
+         "/sysroot/usr/include/x86_64-linux-gnu",
+         "/sysroot/usr/lib/x86_64-linux-gnu"),
+    ],
+    ids=["explicit", "pkg-config", "sysroot-fallback"],
+)
+def test_libcurl_directories_resolve_in_documented_order(
+    tmp_path, overrides, include, library
+):
+    fake = tmp_path / "pkg-config"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *--exists*) exit 0 ;;\n"
+        "  *includedir*) echo /pkgconfig/include ;;\n"
+        "  *libdir*) echo /pkgconfig/lib ;;\n"
+        "esac\n"
+    )
+    fake.chmod(0o755)
+    result = _make("-B", "-n", "build/conformance_store",
+                   f"PKG_CONFIG={fake}", *overrides)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    link = next(argv for argv in _commands(result.stdout) if "-o" in argv
+                and argv[argv.index("-o") + 1] == "build/conformance_store")
+    assert f"-I{include}" in link
+    assert f"-L{library}" in link
+
+
+@pytest.mark.cpu
+def test_missing_libcurl_names_the_package(tmp_path):
+    # A real run, not a dry run: the check has to fail before the store's
+    # compile starts. Empty directories are not enough to make libcurl
+    # missing where its dev package is installed system-wide (CI installs
+    # it), since the compiler's default paths still find it; a compiler that
+    # cannot find <curl/curl.h> is what a host without the package has.
+    compiler = tmp_path / "c++"
+    compiler.write_text(
+        "#!/bin/sh\n"
+        "echo 'fatal error: curl/curl.h: No such file or directory' >&2\n"
+        "exit 1\n"
+    )
+    compiler.chmod(0o755)
+    result = _make("build/_dmi_native_store", f"CXX={compiler}",
+                   f"CURL_INCDIR={tmp_path}", f"CURL_LIBDIR={tmp_path}")
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "libcurl4-openssl-dev" in output
+    assert "-o build/_dmi_native_store" not in output
