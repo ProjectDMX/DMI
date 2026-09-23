@@ -166,7 +166,7 @@ def _capture_engine(monkeypatch, tmp_path, *, fail_ring=False):
             pass
 
         def stop(self):
-            pass
+            events.append(("ring", "stop"))
 
     class _FakeTransport:
         def __init__(self, native_ring):
@@ -271,15 +271,41 @@ def test_flush_reports_packs_that_did_not_reach_the_catalog(monkeypatch, tmp_pat
         engine.flush_and_wait(1.0)
 
 
-def test_close_drains_then_releases_the_lease(monkeypatch, tmp_path):
+def test_close_flushes_the_sink_before_the_ring_stops(monkeypatch, tmp_path):
+    """The sink's open pack is in memory until a flush seals it, and stopping
+    the ring releases the sink without one. So close() flushes the sink
+    first; only then can draining the service reach the tail."""
     engine, events, _services = _capture_engine(monkeypatch, tmp_path)
     engine.create_record_runtime(_record_format())
     events.clear()
 
     engine.close()
 
-    assert events == [("service", "flush", 60.0), ("service", "stop")]
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop")]
+    # One budget for the whole drain: the service gets what the sink left.
+    assert 59.0 <= events[0][2] <= 60.0
+    assert 0.0 <= events[2][2] <= 60.0
     assert engine._capture_storage is None
+
+
+def test_close_still_stops_when_the_sink_flush_fails(monkeypatch, tmp_path):
+    engine, events, _services = _capture_engine(monkeypatch, tmp_path)
+    engine.create_record_runtime(_record_format())
+
+    def _failing_flush(timeout_s):
+        events.append(("sink", "flush", timeout_s))
+        raise TimeoutError("timed out waiting for durable record completion")
+
+    engine._ring_transport.flush_records_and_wait = _failing_flush
+    events.clear()
+
+    engine.close()
+
+    assert [event[:2] for event in events] == [
+        ("sink", "flush"), ("ring", "stop"),
+        ("service", "flush"), ("service", "stop")]
 
 
 def test_close_releases_the_lease_even_when_the_drain_fails(monkeypatch, tmp_path):

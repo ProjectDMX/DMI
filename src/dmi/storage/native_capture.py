@@ -98,7 +98,8 @@ class NativeCaptureStorageConfig:
     # 0 disables the periodic pass; in-process index failures are retried
     # regardless.
     reconcile_interval_s: float = 0.0
-    # How long engine.close() waits for staged packs to reach the catalog.
+    # engine.close()'s total budget for draining capture: sealing the sink's
+    # open pack, then getting every staged pack into the catalog.
     close_flush_timeout_s: float = 60.0
 
     def __post_init__(self) -> None:

@@ -550,6 +550,11 @@ class MonitoringEngine:
     def close(self) -> None:
         """Tear down backend resources."""
 
+        storage = self._capture_storage
+        # One budget for the whole capture drain: sealing the sink's open
+        # pack, then getting everything staged into the catalog.
+        drain_deadline = None if storage is None else (
+            time.monotonic() + self._capture_storage_config.close_flush_timeout_s)
         if self._ring_transport is not None:
             record_mode = self._record_mode
             stopped = False
@@ -561,6 +566,15 @@ class MonitoringEngine:
                     self.set_capture_enabled(True)
                 except Exception:
                     pass
+            # Stopping the ring releases the sink WITHOUT flushing it, so the
+            # records of its open pack would still be in memory while the
+            # service drains a spool that does not hold them yet. Seal first.
+            if record_mode and storage is not None:
+                try:
+                    self._ring_transport.flush_records_and_wait(
+                        max(0.0, drain_deadline - time.monotonic()))
+                except Exception as exc:
+                    _LOG.warning("capture sink did not flush at close: %s", exc)
             try:
                 ring_engine = getattr(self, "_ring_engine", None)
                 if ring_engine is not None:
@@ -581,15 +595,14 @@ class MonitoringEngine:
             self._ring_engine = None
             self._record_mode = False
 
-        storage = self._capture_storage
-        if storage is not None:
+        if storage is not None and self._capture_storage is storage:
             self._capture_storage = None
-            # Best effort, like the rest of close: a pack that does not reach
-            # the catalog here is still in the spool or the bucket, and the
-            # next start uploads or reconciles it. flush_and_wait is the
-            # boundary that reports.
+            # Best effort, like the rest of close: once the sink is sealed, a
+            # pack that does not reach the catalog here is still in the spool
+            # or the bucket, and the next start uploads or reconciles it.
+            # flush_and_wait is the boundary that reports.
             try:
-                storage.flush(self._capture_storage_config.close_flush_timeout_s)
+                storage.flush(max(0.0, drain_deadline - time.monotonic()))
             except Exception as exc:
                 _LOG.warning("capture storage did not drain at close: %s", exc)
             finally:

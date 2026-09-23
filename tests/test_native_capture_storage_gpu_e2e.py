@@ -172,3 +172,73 @@ def test_flush_and_wait_means_queryable_and_byte_identical(fake_s3, tmp_path):
                                     table_prefix=storage.table_prefix),
         ).drop_schema()
     assert not sorted((tmp_path / "spool").rglob("*.dmi-pack.ready"))
+
+
+def test_close_alone_delivers_the_tail_to_the_catalog(fake_s3, tmp_path):
+    """No flush_and_wait: close() must still seal the sink's open pack and
+    drain it into the catalog. The 60 s linger means nothing but a flush can
+    seal it, and 3 records against max_pack_records=2 leave one record in the
+    open pack when close() runs."""
+    from dmi.api.v1 import HookPointV1, HookSpecV1, MonitoringEngine, TransportSpec
+    from dmi.config import MonitoringConfig
+    from dmi.storage.capture import CaptureRecordFormat
+    from dmi.storage.capture.clickhouse_catalog import (
+        ClickHouseCatalogConfig, ClickHouseCatalogWriter,
+    )
+    from dmi.storage.capture.native_sink import NativeSinkConfig
+    from dmi.storage.native_capture import (
+        NativeCaptureReader, NativeCaptureStorageConfig,
+    )
+
+    database = environ.get("DMI_CLICKHOUSE_DATABASE", "default")
+    storage = NativeCaptureStorageConfig(
+        s3_endpoint=fake_s3, s3_bucket=BUCKET, s3_region=REGION,
+        s3_access_key=ACCESS, s3_secret_key=SECRET,
+        s3_allow_insecure_http=True,
+        clickhouse_host=environ.get("DMI_CLICKHOUSE_HOST", "127.0.0.1"),
+        clickhouse_port=int(environ.get("DMI_CLICKHOUSE_HTTP_PORT", "8123")),
+        database=database, table_prefix=f"dmi_gpu_{uuid.uuid4().hex}",
+        poll_interval_s=0.05,
+    )
+    config = MonitoringConfig(
+        storage_backend="capture",
+        capture_sink_config=NativeSinkConfig(
+            spool_root=str(tmp_path / "spool"), max_pack_records=2,
+            max_linger_ns=60_000_000_000),
+        capture_storage_config=storage,
+    )
+    tensors = {f"tail-{i}": torch.arange(8, dtype=torch.float32) + i
+               for i in range(3)}
+    engine = MonitoringEngine(config=config, model_id="native-storage-gpu",
+                              ring_config=_ring_config())
+    try:
+        runtime = engine.create_record_runtime(CaptureRecordFormat())
+        hook = HookPointV1(
+            HookSpecV1("capture_tensor", (TransportSpec("payload"),)))
+        hook_runtime = _CaptureHookRuntime(runtime)
+        runtime.bind_hook(hook, hook_runtime=hook_runtime)
+        for step, (capture_id, tensor) in enumerate(tensors.items()):
+            hook_runtime.metadata = _metadata(capture_id, tensor, step=step)
+            hook(tensor.cuda())
+        torch.cuda.synchronize()
+
+        engine.close()  # no flush_and_wait
+
+        reader = NativeCaptureReader(storage)
+        selection = reader.select(tenant_id="tenant-gpu")
+        captures = {capture.descriptor["capture_id"]: capture
+                    for capture in reader.read(selection, byte_limit=1 << 26)}
+        assert sorted(captures) == sorted(tensors)
+        for capture_id, tensor in tensors.items():
+            assert torch.equal(captures[capture_id].tensor(), tensor), capture_id
+    finally:
+        engine.close()
+        import clickhouse_driver
+
+        ClickHouseCatalogWriter(
+            clickhouse_driver.Client(
+                host=environ.get("DMI_CLICKHOUSE_HOST", "127.0.0.1"),
+                port=int(environ.get("DMI_CLICKHOUSE_PORT", "9000"))),
+            ClickHouseCatalogConfig(database=database,
+                                    table_prefix=storage.table_prefix),
+        ).drop_schema()
