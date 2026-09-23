@@ -14,6 +14,7 @@
 #ifndef DMI_STORE_S3_CLIENT_H_
 #define DMI_STORE_S3_CLIENT_H_
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -79,7 +80,7 @@ class S3Client {
 
   const S3Config& config() const { return config_; }
   // Attempts actually made by the last call (1 + retries), for tests.
-  int last_attempts() const { return last_attempts_; }
+  int last_attempts() const { return last_attempts_.load(std::memory_order_relaxed); }
 
   // HEAD /bucket/key. 404 → {found=false}, no error.
   ObjectHead HeadObject(const std::string& key, std::string* error);
@@ -118,7 +119,9 @@ class S3Client {
   std::string host_;    // endpoint host (with :port when non-default)
   std::string scheme_;
   bool is_https_ = false;
-  int last_attempts_ = 0;
+  // Atomic because SpoolUploader shares one client across its worker
+  // threads, and every request writes this; a plain int was a data race.
+  std::atomic<int> last_attempts_{0};
 
   // Multipart primitives (single PUT when under threshold).
   bool PutSingle(const std::string& key, const uint8_t* data, size_t n,
