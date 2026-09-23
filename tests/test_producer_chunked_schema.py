@@ -185,6 +185,9 @@ class _FakeEagerRingEngine:
 
 class _FakeEagerTransport:
     force_eager = True
+    # HookPoint.forward reads the capture-schedule gate before anything else
+    # (hooks/point.py); the real RingTransport arms it by default.
+    capture_step = True
 
     def __init__(self, engine: _FakeEagerRingEngine):
         self._ring_engine = engine
