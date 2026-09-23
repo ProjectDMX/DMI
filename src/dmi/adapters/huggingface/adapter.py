@@ -6,6 +6,7 @@ step protocol. Monitored generation entry points live in :mod:`.generation`.
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import time
 import warnings
@@ -27,6 +28,8 @@ from ...hooks.specs import (
 )
 from ...transport.ring import _get_kv_dim
 from .model_shape import _make_model_shape_from_hf_config
+
+_LOG = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +123,8 @@ class HuggingFaceAdapter(BackendAdapter):
         # attach_model call passes an explicit value.
         self._eos_token_id_arg: Any = eos_token_id
         self._eos_token_ids: frozenset = frozenset()
+        # Latches after the first driver failure the prepare wrapper logs.
+        self._warned_driver_failure: bool = False
 
     # --- abstract overrides ---------------------------------------------
     def detect_model_shape(self, model: Any) -> ModelShapeConfig:
@@ -314,12 +319,13 @@ class HuggingFaceAdapter(BackendAdapter):
                     _t_orig = time.perf_counter()
                 # Drive the per-step protocol through the adapter.  The
                 # base driver picks up RING_PROFILE_PREPARE and emits
-                # detailed timing entries when enabled (best-effort: if
-                # the driver throws we still return the inputs).
+                # detailed timing entries when enabled.  A driver failure
+                # propagates when it means nothing is being stored; on the
+                # legacy ring it is logged and the inputs returned.
                 try:
                     adaptor_self.before_forward(model_inputs)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    adaptor_self._handle_driver_failure(exc)
                 if _profile:
                     _t_end = time.perf_counter()
                     _prepare_profile_times.append({
@@ -330,6 +336,33 @@ class HuggingFaceAdapter(BackendAdapter):
 
             model._monitoring_orig_prepare = orig_prepare
             model.prepare_inputs_for_generation = _prepare_wrapper
+
+    def _handle_driver_failure(self, exc: Exception) -> None:
+        """Decide what a failed ``before_forward`` in the prepare wrapper does.
+
+        HF calls the wrapper from inside ``generate()``, so raising aborts
+        the user's generation. On the legacy ring that is not worth it:
+        capture is best-effort there, a failed step disarms its own hooks
+        (``before_forward`` clears ``capture_step`` first), and generation
+        goes on. So the failure is logged, once per attachment, and the
+        step is lost.
+
+        In capture or record mode the same failure means the hooks cannot
+        reach the storage the config chose -- a record ring refuses legacy
+        metadata outright -- so every step would fail the same way and the
+        generate() would "succeed" with nothing stored. There it propagates.
+        """
+        engine = self.engine
+        if (getattr(engine, "_record_mode", False)
+                or getattr(engine, "_storage_backend", None) == "capture"):
+            raise exc
+        if self._warned_driver_failure:
+            return
+        self._warned_driver_failure = True
+        _LOG.warning(
+            "DMI capture step failed and was skipped; generation continues, "
+            "but this step's internals are not captured. Later failures in "
+            "this attachment are not logged: %s", exc, exc_info=exc)
 
     def detach_model(self, model: Any) -> None:
         # Release ownership first, and only our own: a nested caller that

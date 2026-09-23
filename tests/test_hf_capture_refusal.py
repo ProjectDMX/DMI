@@ -270,3 +270,66 @@ def test_other_storage_backends_still_attach(backend):
         assert model._dmi_active_adapter is adapter
     finally:
         adapter.detach_model(model)
+
+
+# ---------------------------------------------------------------------------
+# Link 7: a failed step is not swallowed where it means nothing is stored
+# ---------------------------------------------------------------------------
+
+
+def test_record_ring_failure_propagates_out_of_generate_with_monitoring():
+    """The audit's exact path: the engine is on a record ring, so the legacy
+    metadata push throws inside HF's prepare step. It used to be swallowed
+    and generate() returned as if it had captured."""
+    engine = _SpyEngine("auto", record_mode=True)
+    model = _TinyHookedLM(engine)
+    input_ids, attention_mask = _inputs()
+
+    with pytest.raises(RuntimeError, match=RECORD_RING_ERROR):
+        generate_with_monitoring(model, input_ids,
+                                 attention_mask=attention_mask)
+
+    assert engine._ring_engine.push_all_metas_calls == 1
+    # The finally still detaches: the wrapper is gone and the hooks disarmed.
+    assert model._monitoring_orig_prepare is None
+    assert not hasattr(model.prepare_inputs_for_generation, "__wrapped__")
+    assert model.hook_resid_pre._ring_hook_type is None
+
+
+def test_capture_mode_failure_propagates_out_of_the_prepare_wrapper():
+    """Capture mode re-raises too, even for an adapter attached earlier."""
+    engine = _SpyEngine("auto", ring_engine=_SpyRingEngine(
+        prepare_step_error=RuntimeError("reservation failed")))
+    model = _TinyHookedLM(engine)
+    adapter = HuggingFaceAdapter(engine, "tiny")
+    adapter.attach_model(model)
+    engine._storage_backend = "capture"
+    input_ids, attention_mask = _inputs()
+
+    try:
+        with pytest.raises(RuntimeError, match="reservation failed"):
+            model.prepare_inputs_for_generation(
+                input_ids, attention_mask=attention_mask)
+    finally:
+        adapter.detach_model(model)
+
+
+def test_legacy_driver_failure_is_logged_once_not_swallowed(caplog):
+    """On the legacy ring, swallowing stays: capture is best-effort there and
+    must not abort the user's generate(). It is no longer silent."""
+    engine = _SpyEngine("auto", ring_engine=_SpyRingEngine(
+        prepare_step_error=RuntimeError("ring hiccup")))
+    model = _TinyHookedLM(engine)
+    input_ids, attention_mask = _inputs()
+
+    with caplog.at_level(logging.WARNING, logger=ADAPTER_LOGGER):
+        out = generate_with_monitoring(model, input_ids,
+                                       attention_mask=attention_mask,
+                                       max_new_tokens=3)
+
+    assert out is input_ids
+    assert len(engine._ring_engine.prepare_step_calls) == 3
+    warnings = [r for r in caplog.records
+                if r.name == ADAPTER_LOGGER and r.levelno == logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "ring hiccup" in warnings[0].getMessage()
