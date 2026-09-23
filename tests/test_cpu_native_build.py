@@ -29,6 +29,46 @@ def test_host_build_plan_has_no_cuda_toolchain_or_libraries():
         assert forbidden not in output
 
 
+def _torch_compile_lines(target: str) -> list[str]:
+    """The compile commands a dry run of ``target`` would execute that pull in
+    torch's headers -- the ones carrying TORCH_EXTENSION_NAME."""
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        # PYTHON is the interpreter running this test: its torch is the one
+        # the build would target, and the Makefile's default `python` need
+        # not exist.
+        ["make", "-C", "native", "-B", "-n", target, f"PYTHON={sys.executable}"],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"cannot plan `{target}` here: {result.stderr[-300:]}")
+    return [line for line in result.stdout.splitlines()
+            if "-DTORCH_EXTENSION_NAME=" in line and " -c " in f" {line} "]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("target", ["host", "all"])
+def test_every_torch_including_compile_requests_cxx20(target):
+    """PyTorch's headers refuse anything older than C++20.
+
+    ATen.h opens with ``#error C++20 or later compatible compiler is required``,
+    and the pinned range here (torch>=2.8,<3) resolves to a release that
+    enforces it. The backend and host targets were still compiled with
+    -std=c++17, so a fresh install could not build either one -- and CI never
+    noticed, because it only dry-runs `host` and the torch-free drivers never
+    reach ATen. This pins the flag on the plan actually executed rather than on
+    the Makefile's text, so it holds however the flags are assembled.
+    """
+    lines = _torch_compile_lines(target)
+    assert lines, f"no torch-including compile found in the `{target}` plan"
+    stale = [line for line in lines
+             if not any(f"-std={std}" in line
+                        for std in ("c++20", "c++23", "c++26", "gnu++20", "gnu++23"))]
+    assert not stale, (
+        f"{len(stale)} torch-including compile(s) below C++20 in `{target}`:\n"
+        + stale[0][:300])
+
+
 @pytest.mark.cpu
 def test_host_export_falls_back_to_cpu_backend(monkeypatch):
     from dmi.transport import native

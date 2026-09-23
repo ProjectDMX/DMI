@@ -122,12 +122,12 @@ PYTHON_INCLUDE_FLAGS := $(shell $(PYTHON) -c "import sysconfig; paths = sysconfi
 # Pybind11 ABI flags
 PYBIND_FLAGS := $(shell $(PYTHON) -c "import pybind11; print(' '.join([f'-DPYBIND11_COMPILER_TYPE=\\\"{pybind11.get_compiler_type()}\\\"', f'-DPYBIND11_STDLIB=\\\"{pybind11.get_stdlib()}\\\"', f'-DPYBIND11_BUILD_ABI=\\\"{pybind11.get_build_abi()}\\\"']))" 2>/dev/null || echo "")
 
-CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
+CXXFLAGS := -std=c++20 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
             -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=$(TARGET) \
             $(ABI_FLAG) $(PYBIND_FLAGS) \
             $(TORCH_INCLUDE_FLAGS) $(PYTHON_INCLUDE_FLAGS) $(CUDA_INCLUDE_FLAGS) -Icsrc \
             -MMD -MP
-HOST_CXXFLAGS := -std=c++17 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
+HOST_CXXFLAGS := -std=c++20 -O3 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
                  -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=$(HOST_TARGET) \
                  -DDMI_HOST_ONLY=1 $(ABI_FLAG) $(PYBIND_FLAGS) \
                  $(TORCH_INCLUDE_FLAGS) $(PYTHON_INCLUDE_FLAGS) -Icsrc \
@@ -172,7 +172,7 @@ HOST_LDFLAGS += -L$(CLICKHOUSE_CONTRIB)/lz4/lz4 -llz4 \
 SM_ARCH ?= native
 
 NVCCFLAGS := \
-    -std=c++17 \
+    -std=c++20 \
     -arch=$(SM_ARCH) \
     -O2 \
     -Xcompiler -fPIC \
