@@ -574,7 +574,7 @@ def key_component(value: str) -> str:
     # Without this an identifier whose own text is `sha256-<64 hex>` -- short
     # enough to pass directly, and well under the metadata length limit --
     # encoded to exactly the segment some longer identifier digests to. Both
-    # then named the same `tenant=` segment, and `_reject_a_foreign_tenant`
+    # then named the same `tenant=` segment, and `reject_a_foreign_tenant`
     # compares re-encoded values, so it could not tell the two apart: a pack
     # for one was accepted under a key belonging to the other. Digesting any
     # identifier that already looks like a digest keeps the mapping one-to-one.
@@ -619,7 +619,7 @@ def _segment_belongs_to(segment: str, tenant: str) -> bool:
     )
 
 
-def _reject_a_foreign_tenant(ref: PackRef, records: tuple[_IndexedRecord, ...]) -> None:
+def reject_a_foreign_tenant(ref: PackRef, tenants: Iterable[str]) -> None:
     """Bind what a pack CLAIMS to be to where it was actually found.
 
     The footer names the tenant; the key prefix names where a writer with
@@ -637,6 +637,12 @@ def _reject_a_foreign_tenant(ref: PackRef, records: tuple[_IndexedRecord, ...]) 
     test fixture and a hand-placed object are all legitimately laid out some
     other way, and a check that guessed would refuse them all. What this
     enforces is that a key which DOES name a tenant names the pack's own.
+
+    Takes the tenants rather than the records because the reader has to run
+    it a second time, against a footer served from its cache, where only
+    descriptors exist. That cache is keyed on pack identity and one identity
+    can be read from more than one key, so this verdict -- which depends
+    entirely on the key -- can never be cached alongside the footer.
     """
     encoded = _tenant_segment(ref.object_key)
     if encoded is None:
@@ -646,7 +652,7 @@ def _reject_a_foreign_tenant(ref: PackRef, records: tuple[_IndexedRecord, ...]) 
     # loop altogether, because a pack holding two tenants is precisely what
     # this refuses -- every tenant present is still compared, in the order
     # they appear so the refusal names the same one every time.
-    for tenant in dict.fromkeys(item.metadata.tenant_id for item in records):
+    for tenant in dict.fromkeys(tenants):
         if not _segment_belongs_to(encoded, tenant):
             raise PackIntegrityError(
                 f"pack {ref.pack_id} at {ref.object_key!r} carries a record "
@@ -661,7 +667,7 @@ def _descriptors(
     ref: PackRef, records: Iterable[_IndexedRecord]
 ) -> tuple[CaptureDescriptor, ...]:
     records = tuple(records)
-    _reject_a_foreign_tenant(ref, records)
+    reject_a_foreign_tenant(ref, (item.metadata.tenant_id for item in records))
     return tuple(
         CaptureDescriptor(
             metadata=item.metadata,

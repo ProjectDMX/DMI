@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -269,6 +270,64 @@ def test_reference_sink_surfaces_any_non_durable_admission(
     assert snapshot.persisted_records == 0
 
 
+def test_reference_sink_rejects_an_equal_width_dtype_swap(
+    fake_native_reference_sink,
+):
+    """The dtype bind is the only thing tying the payload to the footer.
+
+    ``int32 (3, 4)`` and ``float32 (3, 4)`` are both 48 bytes, so every
+    byte-count check downstream is satisfied by either: the pack model
+    compares total bytes only and ``verify_payload`` is length + CRC32. Admit
+    this pair and the pack's footer says ``int32`` over bytes that are a
+    float32 tensor, and a reader decodes exactly what the footer describes --
+    silently wrong numbers, no error anywhere.
+    """
+    pipeline = _pipeline(_CollectingSink(), queue_bytes=256)
+    sink = CapturePackReferenceSink(pipeline)
+    callback = sink.native_sink.target
+    callback._attach()
+
+    payload = torch.zeros((3, 4), dtype=torch.float32)
+    metadata = _metadata("capture-a", dtype="int32", shape=(3, 4))
+    assert metadata.logical_bytes == payload.nbytes == 48
+
+    with pytest.raises(ValueError, match="metadata dtype does not match payload"):
+        callback._submit_capture(json.dumps(metadata.to_mapping()), payload)
+
+    callback._detach()
+    snapshot = sink.close(timeout=2)
+    assert snapshot.submitted_records == 0
+    assert snapshot.persisted_records == 0
+
+
+def test_reference_sink_rejects_a_permuted_payload_shape(
+    fake_native_reference_sink,
+):
+    """The shape bind, likewise: a transpose is byte-count invariant.
+
+    ``float32 (3, 4)`` against a ``(4, 3)`` payload agrees on dtype and on all
+    48 bytes, so nothing downstream can notice. The footer would describe rows
+    the payload does not have, and a reader would reshape the bytes into the
+    declared -- wrong -- layout.
+    """
+    pipeline = _pipeline(_CollectingSink(), queue_bytes=256)
+    sink = CapturePackReferenceSink(pipeline)
+    callback = sink.native_sink.target
+    callback._attach()
+
+    payload = torch.zeros((4, 3), dtype=torch.float32)
+    metadata = _metadata("capture-a", dtype="float32", shape=(3, 4))
+    assert metadata.logical_bytes == payload.nbytes == 48
+
+    with pytest.raises(ValueError, match="metadata shape does not match payload"):
+        callback._submit_capture(json.dumps(metadata.to_mapping()), payload)
+
+    callback._detach()
+    snapshot = sink.close(timeout=2)
+    assert snapshot.submitted_records == 0
+    assert snapshot.persisted_records == 0
+
+
 def test_capture_package_keeps_reference_adapter_and_native_backend_lazy():
     repo_root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
@@ -288,3 +347,138 @@ def test_capture_package_keeps_reference_adapter_and_native_backend_lazy():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _attached_reference_callback(pipeline):
+    """Attach a reference sink to ``pipeline`` and hand back the callback target.
+
+    The native reference sink is faked in these CPU tests, so the Python
+    callback (``_CapturePackTarget``) is what the C++ layer would drive.
+    """
+
+    sink = CapturePackReferenceSink(pipeline)
+    callback = sink.native_sink.target
+    callback._attach()
+    return sink, callback
+
+
+# The four payload guards below cannot be tripped by this repository's own
+# producer: CaptureRecordFormat.encode builds the metadata JSON cell and the
+# PayloadSlice cell from one CaptureMetadata and already rejects dtype drift
+# against the producer plan, so reference-encoded rows agree by construction.
+# The guards exist for a *foreign* producer that writes the same layout name
+# ("capture_pack_reference_v1") or for an encoder bug. Nothing else in the
+# stack performs this cross-check: the native sink
+# (native/csrc/reference_python_capture_sink.cpp) validates only slice-internal
+# consistency and never compares the metadata JSON against the slice it hands
+# over. So these tests are the only proof that a disagreeing pair is refused
+# before bytes reach the durable queue.
+def test_reference_sink_rejects_metadata_dtype_disagreement(
+    fake_native_reference_sink,
+):
+    pipeline = _pipeline(_CollectingSink())
+    sink, callback = _attached_reference_callback(pipeline)
+
+    with pytest.raises(ValueError, match="dtype does not match payload"):
+        callback._submit_capture(
+            json.dumps(_metadata("capture-a", dtype="float64").to_mapping()),
+            torch.tensor([1.0, 2.0], dtype=torch.float32),
+        )
+
+    callback._detach()
+    assert sink.close(timeout=2).persisted_records == 0
+
+
+def test_reference_sink_rejects_metadata_shape_disagreement(
+    fake_native_reference_sink,
+):
+    # A shape disagreement is the more dangerous half of the cross-check: the
+    # payload is reinterpreted as raw bytes, so an unchecked mismatch would
+    # persist a record whose declared shape cannot describe its own bytes.
+    pipeline = _pipeline(_CollectingSink())
+    sink, callback = _attached_reference_callback(pipeline)
+
+    with pytest.raises(ValueError, match="shape does not match payload"):
+        callback._submit_capture(
+            json.dumps(_metadata("capture-a", shape=(4,)).to_mapping()),
+            torch.tensor([1.0, 2.0], dtype=torch.float32),
+        )
+
+    callback._detach()
+    assert sink.close(timeout=2).persisted_records == 0
+
+
+def test_reference_sink_rejects_a_noncontiguous_payload(
+    fake_native_reference_sink,
+):
+    # ``.view(torch.uint8)`` on the flattened payload is only a faithful byte
+    # copy when the source is contiguous; a strided view would silently copy
+    # the wrong elements, so the guard must reject rather than repack.
+    pipeline = _pipeline(_CollectingSink())
+    sink, callback = _attached_reference_callback(pipeline)
+    strided = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)[::2]
+    assert not strided.is_contiguous()
+
+    with pytest.raises(ValueError, match="must be contiguous"):
+        callback._submit_capture(
+            json.dumps(_metadata("capture-a").to_mapping()),
+            strided,
+        )
+
+    callback._detach()
+    assert sink.close(timeout=2).persisted_records == 0
+
+
+def test_reference_sink_rejects_a_non_tensor_payload(fake_native_reference_sink):
+    # The callback is invoked from C++, where a target mismatch or a foreign
+    # caller can hand over any Python object; the CPU-tensor guard is what
+    # keeps that from reaching ``.reshape``/``.view`` as an attribute error
+    # (or, worse, a device tensor being read as host bytes).
+    pipeline = _pipeline(_CollectingSink())
+    sink, callback = _attached_reference_callback(pipeline)
+
+    with pytest.raises(TypeError, match="must be a CPU tensor"):
+        callback._submit_capture(
+            json.dumps(_metadata("capture-a").to_mapping()),
+            [1.0, 2.0],
+        )
+
+    callback._detach()
+    assert sink.close(timeout=2).persisted_records == 0
+
+
+def test_reference_sink_rejects_a_durability_shortfall(
+    fake_native_reference_sink, monkeypatch
+):
+    # Loss counters catch records the pipeline knows it lost. This asserts the
+    # independent accounting check: accepted admissions must equal the
+    # persisted delta even when every loss counter stays at zero, which is the
+    # only signal available if a record is dropped without being counted.
+    pipeline = _pipeline(_CollectingSink())
+    # Construct and attach before patching: both the all-zero baseline check
+    # in _CapturePackTarget.__init__ and the baseline comparison in _attach
+    # read snapshot(), and a shifted snapshot would fail there instead.
+    sink, callback = _attached_reference_callback(pipeline)
+    callback._submit_capture(
+        json.dumps(_metadata("capture-a").to_mapping()),
+        torch.tensor([1.0, 2.0], dtype=torch.float32),
+    )
+
+    original_snapshot = HostCapturePipeline.snapshot
+
+    def losing_snapshot(self):
+        snapshot = original_snapshot(self)
+        return dataclasses.replace(
+            snapshot, persisted_records=snapshot.persisted_records - 1
+        )
+
+    monkeypatch.setattr(HostCapturePipeline, "snapshot", losing_snapshot)
+
+    with pytest.raises(
+        PipelineFailedError,
+        match="durability mismatch: accepted=1, persisted=0",
+    ):
+        callback._flush_capture(2.0)
+
+    callback._detach()
+    pipeline.close(timeout=2)

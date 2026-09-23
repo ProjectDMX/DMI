@@ -9,12 +9,16 @@ import functools
 import os
 import time
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 
 from ..base import BackendAdapter
 from ..types import StepContext
+from ...hooks.dispatch import uninstall_ring_hooks
+
+if TYPE_CHECKING:
+    from ...configuration.schema import LayerSelection
 from ...hooks.specs import (
     HookSpec,
     ModelShapeConfig,
@@ -231,6 +235,8 @@ class HuggingFaceAdapter(BackendAdapter):
         no_strip_left_pad: Optional[bool] = None,
         no_strip_right_pad: Optional[bool] = None,
         eos_token_id: Any = None,
+        *,
+        layers: Optional["LayerSelection"] = None,
     ) -> None:
         """Resolve shape, install ring hooks, and (optionally) wrap
         ``prepare_inputs_for_generation`` so each forward pass triggers
@@ -253,13 +259,16 @@ class HuggingFaceAdapter(BackendAdapter):
         set is empty and the post-EOS strip never latches.  Accepts
         ``int``, ``list[int]``, or ``torch.Tensor``; normalised to
         ``frozenset[int]``.
+
+        ``layers``: inclusive layer range restricting per-layer hooks, as in
+        :meth:`BackendAdapter.attach_model`.  ``None`` keeps every layer.
         """
         if no_strip_left_pad is not None:
             self._no_strip_left_pad = bool(no_strip_left_pad)
         if no_strip_right_pad is not None:
             self._no_strip_right_pad = bool(no_strip_right_pad)
         self._eos_token_ids = self._resolve_eos_token_ids(model, eos_token_id)
-        super().attach_model(model, hook_selection)
+        super().attach_model(model, hook_selection, layers=layers)
 
         # Startup validation: warn if pinned staging < GPU ring.
         try:
@@ -323,12 +332,29 @@ class HuggingFaceAdapter(BackendAdapter):
             model.prepare_inputs_for_generation = _prepare_wrapper
 
     def detach_model(self, model: Any) -> None:
+        # Release ownership first, and only our own: a nested caller that
+        # detaches someone else's attachment must not clear their marker.
+        if getattr(model, "_dmi_active_adapter", None) is self:
+            try:
+                model._dmi_active_adapter = None
+            except AttributeError:  # pragma: no cover - exotic read-only model
+                pass
         orig = getattr(model, "_monitoring_orig_prepare", None)
         if orig is not None:
             model.prepare_inputs_for_generation = orig
             model._monitoring_orig_prepare = None
         if self._orig_prepare is not None:
             self._orig_prepare = None
+        # Disarm before dropping the spec list, or the hooks stay armed with
+        # nothing left pointing at them. HookPoints are structural members of
+        # the model, so they outlive this call: without this, the next
+        # ordinary forward on the same model launches producer kernels with no
+        # prepare_step reservation and an empty meta FIFO, and those strays
+        # then consume the NEXT monitored step's metas. This method runs from
+        # a `finally` after every monitored generate, so that next forward is
+        # an ordinary part of the workflow, not an edge case.
+        uninstall_ring_hooks(self.active_specs)
+        self.active_specs = []
         if self.transport is not None:
             self.transport._using_forward_hooks = False
             self.transport._active_specs = []
@@ -541,6 +567,13 @@ class HuggingFaceAdapter(BackendAdapter):
             )
 
         for rid, token_range in zip(req_ids, token_ranges):
+            # The per-request capture index, recorded for every driven step
+            # INCLUDING schedule-refused ones: the driver gates plan/commit
+            # downstream of here and cannot un-record. Consumers must treat
+            # this as the attempted-traffic index, not the captured-traffic
+            # index -- a refused step's ranges describe tokens the ring never
+            # received. (Known ceiling: moving the recording below the gate
+            # would couple this adapter to the driver's refusal internals.)
             self.token_ranges_in_this_generate.setdefault(rid, []).append(
                 (int(token_range[0]), int(token_range[1]))
             )
@@ -580,6 +613,7 @@ class HuggingFaceAdapter(BackendAdapter):
             kv_dim=kv_dim,
             logits_to_keep=logits_to_keep,
             token_ids_dtype=token_ids_dtype,
+            phase="prefill" if is_prefill else "decode",
         )
 
     # --- manual entry for generate_greedy --------------------------------

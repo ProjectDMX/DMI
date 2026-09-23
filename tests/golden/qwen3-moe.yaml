@@ -1,0 +1,18 @@
+version: 1
+observations:
+  layers:
+    start: 0
+    end: 47
+  hooks:
+  - mlp_out
+  - router_logits
+  - topk_ids
+  - topk_weights
+schedule:
+  step_stride: 8
+  request_stride: 2
+  capture_prefill: true
+  capture_decode: false
+  warmup_steps: 16
+policy:
+  objective: performance

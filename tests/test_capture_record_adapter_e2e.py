@@ -283,48 +283,95 @@ def test_reference_callback_failure_is_stable_across_repeated_flushes(
     assert "oversized_records" in str(close_error)
 
 
-class _NativeValidationTarget:
-    def _attach(self):
+class _DiscardingPackSink:
+    """Pack sink for targets whose payloads are never meant to be admitted."""
+
+    def persist(self, ready) -> None:
         pass
+
+
+class _NativeValidationTarget:
+    """Native-facing target that *delegates* to the real capture target.
+
+    It deliberately does not reimplement any of the semantic checks. A stub
+    that re-derives them can pass while the product's own checks are gone --
+    and it did: the dtype check here used to raise its own message, which the
+    product never emits, so removing the product's dtype and shape binds left
+    the whole suite green.
+    """
+
+    def __init__(self) -> None:
+        from dmi.storage.capture import (
+            HostCapturePipeline,
+            PipelineConfig,
+            record_adapter,
+        )
+
+        self._pipeline = HostCapturePipeline(
+            PipelineConfig(
+                max_queue_records=8,
+                max_queue_bytes=4096,
+                max_pack_bytes=4096,
+                max_pack_records=8,
+                max_linger_ns=60_000_000_000,
+            ),
+            _DiscardingPackSink(),
+        )
+        self._pipeline.start()
+        self._delegate = record_adapter._CapturePackTarget(self._pipeline)
+
+    def close(self):
+        return self._delegate.close(timeout=5.0)
+
+    def _attach(self):
+        self._delegate._attach()
 
     def _detach(self):
-        pass
+        self._delegate._detach()
 
     def _submit_capture(self, metadata_json, payload):
-        expected = getattr(torch, json.loads(metadata_json)["dtype"])
-        if payload.dtype != expected:
-            raise ValueError(f"semantic dtype mismatch: {payload.dtype} != {expected}")
+        self._delegate._submit_capture(metadata_json, payload)
 
-    def _flush_capture(self, _timeout_s):
-        return True
+    def _flush_capture(self, timeout_s):
+        return self._delegate._flush_capture(timeout_s)
 
     def _rethrow_capture(self):
-        pass
+        self._delegate._rethrow_capture()
 
 
 def test_record_sink_lease_rejects_reuse_without_detaching_owner():
     from dmi.storage.capture import CaptureRecordFormat
     from dmi.transport import native
 
+    target = _NativeValidationTarget()
     sink = native.ReferencePythonCaptureSink(
-        _NativeValidationTarget(), CaptureRecordFormat.LAYOUT_NAME
+        target, CaptureRecordFormat.LAYOUT_NAME
     )
-    lease = sink._acquire_engine()
-    config = native.RingConfig()
-    config.task_ring_entries = 8
-    config.payload_ring_bytes = 256
-    config.pinned_staging_bytes = 256
-    owner = native.RingEngine.create_record(config, lease)
-    assert sink.attached is True
+    try:
+        lease = sink._acquire_engine()
+        config = native.RingConfig()
+        config.task_ring_entries = 8
+        config.payload_ring_bytes = 256
+        config.pinned_staging_bytes = 256
+        owner = native.RingEngine.create_record(config, lease)
+        assert sink.attached is True
 
-    with pytest.raises(RuntimeError, match="lease has already been claimed"):
-        native.RingEngine.create_record(config, lease)
-    assert sink.attached is True
+        with pytest.raises(RuntimeError, match="lease has already been claimed"):
+            native.RingEngine.create_record(config, lease)
+        assert sink.attached is True
 
-    owner.stop()
-    assert sink.attached is False
-    with pytest.raises(RuntimeError, match="cannot restart after stop"):
-        owner.start()
+        owner.stop()
+        assert sink.attached is False
+        with pytest.raises(RuntimeError, match="cannot restart after stop"):
+            owner.start()
+    finally:
+        target.close()
+
+
+def _full_metadata_json(tensor: torch.Tensor) -> str:
+    """Metadata the *real* target can parse, so its binds are what reject."""
+
+    return json.dumps(_metadata("capture-wire-drift", tensor, step=0).to_mapping())
 
 
 @pytest.mark.parametrize(
@@ -353,10 +400,22 @@ def test_record_sink_lease_rejects_reuse_without_detaching_owner():
             "dtype and shape do not match declared bytes",
         ),
         (
+            # Past every native wire check, so the product's own dtype bind is
+            # the only thing left to reject it. Asserting the real message is
+            # what keeps this case honest.
             PayloadSlice(offset_bytes=0, nbytes=8, dtype=torch.float64, shape=(1,)),
-            '{"dtype":"float32"}',
-            "semantic dtype mismatch",
+            _full_metadata_json(torch.zeros(1, dtype=torch.float32)),
+            "capture metadata dtype does not match payload",
         ),
+    ),
+    # Named explicitly: the last case carries a full metadata document, which
+    # pytest would otherwise splice into the test id verbatim.
+    ids=(
+        "unaligned-offset",
+        "offset-past-payload",
+        "shape-over-declared-bytes",
+        "dtype-and-shape-over-declared-bytes",
+        "semantic-dtype-drift",
     ),
 )
 def test_reference_native_sink_rejects_wire_drift_stably(
@@ -400,6 +459,7 @@ def test_reference_native_sink_rejects_wire_drift_stably(
     finally:
         engine.stop()
         assert sink.attached is False
+        target.close()
 
 
 def _run_reference_gc_probe(root: Path) -> None:

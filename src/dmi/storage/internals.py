@@ -50,6 +50,42 @@ def _request_sort_key(request_id: str) -> tuple:
     return tuple(key)
 
 
+def _ordered_chunks(chunks: list, *, act_name: str, request_id: str) -> list:
+    """One request's chunks in token order, refusing a duplicate start token.
+
+    Sorting ``(start_token, tensor)`` pairs without an explicit key makes
+    Python fall through to comparing the TENSORS whenever two starts tie --
+    which raises "Boolean value of Tensor with more than one value is
+    ambiguous" for a normal payload, and, worse, compares fine for a
+    one-element payload and silently concatenates the two colliding captures.
+
+    A tie means the same (request, layer, start) arrived twice, which in
+    practice means two TP shards: ``filter_by_tp_rank`` deliberately keeps
+    sharded hooks on every rank, and all ranks write one table with
+    ``shard_rank`` telling the rows apart. Reassembling along the token axis
+    cannot merge shards -- they are the same tokens, not more of them -- so
+    refusing is the only correct answer. The caller picks a ``shard_rank``,
+    exactly as the repo's own comparison tooling does.
+    """
+    # One pass over the starts, not ``starts.count(s)`` per start: a long
+    # chunked capture (hundreds of rows per request/layer) otherwise paid
+    # O(n^2) to build a diagnostic that only names the repeats.
+    counts: dict[int, int] = {}
+    for start, _ in chunks:
+        counts[start] = counts.get(start, 0) + 1
+    duplicated = sorted(start for start, count in counts.items() if count > 1)
+    if duplicated:
+        raise RuntimeError(
+            f"{act_name}: duplicate capture chunks for request {request_id!r} "
+            f"at start token(s) {duplicated} -- the same tokens were captured "
+            "more than once, which usually means rows from several TP ranks "
+            "(distinguished by shard_rank) or from separate runs sharing one "
+            "model_id. Reassembly cannot merge them along the token axis; "
+            "select a single shard_rank before reading."
+        )
+    return [tensor for _, tensor in sorted(chunks, key=lambda chunk: chunk[0])]
+
+
 def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
     """Reassemble a per-layer hook (residual stream, mlp, ...).
 
@@ -58,13 +94,18 @@ def _reassemble_per_layer(rows: list) -> tuple[torch.Tensor, ...]:
     Group by layer, concatenate each request's chunks along the token axis, then
     left-pad-stack the requests. Returns a tuple ordered by layer."""
     layers: dict[int, dict[str, list]] = {}
+    # key[2] is the act_name; every row here belongs to one act by construction.
+    act_name = rows[0][0][2] if rows else "<unknown act>"
     for key, tensor in rows:
         layers.setdefault(key[3], {}).setdefault(key[1], []).append((key[5], tensor))
     out = []
     for layer in sorted(layers):
         per_request = [
-            torch.cat([t for _, t in sorted(chunks)], dim=0)
-            for _, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
+            torch.cat(
+                _ordered_chunks(chunks, act_name=act_name, request_id=request_id),
+                dim=0,
+            )
+            for request_id, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
         ]
         out.append(_left_pad_stack(per_request))
     return tuple(out)
@@ -96,10 +137,10 @@ def _reassemble_attention_per_layer(rows: list, act_name: str) -> tuple[torch.Te
     for layer in sorted(layers):
         per_request = [
             merge_segments(
-                [t for _, t in sorted(chunks)],
+                _ordered_chunks(chunks, act_name=act_name, request_id=request_id),
                 act_name,
             )
-            for _, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
+            for request_id, chunks in sorted(layers[layer].items(), key=lambda item: _request_sort_key(item[0]))
         ]
         out.append(_left_pad_stack_attention(per_request))
     return tuple(out)
@@ -114,11 +155,15 @@ def _attention_reassembler(act_name: str):
 def _reassemble_global(rows: list) -> torch.Tensor:
     """Reassemble a non-layered field into [batch, seq, ...]."""
     requests: dict[str, list] = {}
+    act_name = rows[0][0][2] if rows else "<unknown act>"
     for key, tensor in rows:
         requests.setdefault(key[1], []).append((key[5], tensor))
     per_request = [
-        torch.cat([t for _, t in sorted(chunks)], dim=0)
-        for _, chunks in sorted(requests.items(), key=lambda item: _request_sort_key(item[0]))
+        torch.cat(
+            _ordered_chunks(chunks, act_name=act_name, request_id=request_id),
+            dim=0,
+        )
+        for request_id, chunks in sorted(requests.items(), key=lambda item: _request_sort_key(item[0]))
     ]
     if per_request[0].ndim == 1:
         seq = max(t.shape[0] for t in per_request)
@@ -284,9 +329,11 @@ class LazyInternal:
         requirements: InternalRequirements | None = None,
         request_ids: tuple[str, ...] | list[str] | None = None,
         token_ranges: dict[str, tuple[tuple[int, int], ...] | list[tuple[int, int]]] | None = None,
+        shard_rank: int | None = None,
     ) -> None:
         self._model_id = model_id
         self._reader = reader
+        self._shard_rank = shard_rank
         self._requirements = (
             requirements.copy() if requirements is not None else InternalRequirements()
         )
@@ -402,12 +449,16 @@ class LazyInternal:
             rows = []
             for request_id in self._request_ids:
                 rows.extend(reader.prefix_get((self._model_id, request_id, act)))
-            return rows
-        return [
-            (key, tensor)
-            for key, tensor in reader.prefix_get((self._model_id,))
-            if key[2] == act
-        ]
+        else:
+            rows = [
+                (key, tensor)
+                for key, tensor in reader.prefix_get((self._model_id,))
+                if key[2] == act
+            ]
+        if self._shard_rank is not None:
+            rows = [(key, tensor) for key, tensor in rows
+                    if key[4] == self._shard_rank]
+        return rows
 
     def _expected_non_empty_ranges(self, request_id: str) -> tuple[tuple[int, int], ...]:
         return tuple(
@@ -556,7 +607,9 @@ class LazyInternal:
     @property
     def available(self) -> list[str]:
         if not self._request_ids:
-            return get_internal(self._model_id, self._reader).available
+            return get_internal(
+                self._model_id, self._reader, shard_rank=self._shard_rank
+            ).available
         fields = []
         for field in sorted(_FIELDS):
             if self._read_rows_for_field(field):
@@ -583,6 +636,7 @@ def make_lazy_internal(
     requirements: InternalRequirements | None = None,
     request_ids: tuple[str, ...] | list[str] | None = None,
     token_ranges: dict[str, tuple[tuple[int, int], ...] | list[tuple[int, int]]] | None = None,
+    shard_rank: int | None = None,
 ) -> LazyInternal:
     return LazyInternal(
         model_id,
@@ -590,19 +644,28 @@ def make_lazy_internal(
         requirements=requirements,
         request_ids=request_ids,
         token_ranges=token_ranges,
+        shard_rank=shard_rank,
     )
 
 
-def get_internal(model_id: str, reader: CHClickhouseDriverReadOnly | None = None) -> Internal:
+def get_internal(
+    model_id: str,
+    reader: CHClickhouseDriverReadOnly | None = None,
+    shard_rank: int | None = None,
+) -> Internal:
     """Retrieve a run's captured internals.
 
     ``model_id`` identifies the captured run. ``reader`` defaults to a local
     ClickHouse connection (``DMX_DB_HOST`` / ``DMX_DB_PORT``); pass one to read
-    a run from another process or host.
+    a run from another process or host. ``shard_rank`` selects one TP rank's
+    rows from a run where several ranks wrote the same tokens (the collision
+    reassembly otherwise refuses by name); None keeps every row.
     """
     reader = reader or _default_reader()
     rows_by_act: dict[str, list] = {}
     for key, tensor in reader.prefix_get((model_id,)):
+        if shard_rank is not None and key[4] != shard_rank:
+            continue
         rows_by_act.setdefault(key[2], []).append((key, tensor))
     fields = {
         field: reassemble(rows_by_act[act])

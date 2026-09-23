@@ -489,6 +489,95 @@ def test_explicit_record_sink_lease_is_owned_by_native_ring(monkeypatch):
     assert deactivated == [True, True]
 
 
+def test_record_runtime_rollback_stops_the_new_ring_before_dropping_it(monkeypatch):
+    """The post-switch rollback must stop the new ring before releasing it.
+
+    Dropping the Python owners alone would still release the lease, because
+    ``~RingEngine`` releases the record sink -- but that destructor path joins
+    the record worker with the GIL held, and a Python sink's worker re-enters
+    Python, so a drop without the GIL-releasing ``stop()`` first can deadlock.
+    Stop-before-drop is the ordering ``docs/integration-api-v1.md`` promises, so
+    this pins the order, not merely the absence of a leak.
+
+    The old ring is already stopped and deactivated by the time the new one
+    fails, so the rollback also owes the caller a clean "no ring" state rather
+    than a half-switched engine.
+    """
+    engine, _old_transport, old_ring = _engine_with_fake_ring()
+    ring_config = object()
+    engine._ring_config = ring_config
+    engine._host_engine = object()
+    new_ring = _FakeRingEngine()
+    activated = []
+    deactivated = []
+    order = []
+
+    class _Lease:
+        def release(self):
+            order.append(("release", new_ring.stop_calls))
+
+    class _RecordSink:
+        def __init__(self):
+            self.lease = _Lease()
+
+        def _acquire_engine(self):
+            return self.lease
+
+    sink = _RecordSink()
+
+    original_stop = new_ring.stop
+
+    def stop_and_release():
+        # Stands in for the native ``stop()``: the GIL-releasing join that must
+        # happen before anything drops the last reference to the ring.
+        order.append(("stop", None))
+        original_stop()
+        sink.lease.release()
+
+    def failing_start():
+        raise RuntimeError("record ring could not start")
+
+    new_ring.stop = stop_and_release
+    new_ring.start = failing_start
+
+    class _Factory:
+        @staticmethod
+        def create_record(config, target):
+            return new_ring
+
+    class _FakeTransport:
+        def __init__(self, native_ring):
+            pytest.fail("the transport must not be built after start fails")
+
+    fake_transport_module = ModuleType("dmi.transport.ring")
+    fake_transport_module.RingTransport = _FakeTransport
+    fake_transport_module.activate = activated.append
+    fake_transport_module.deactivate = lambda: deactivated.append(True)
+    fake_native_module = ModuleType("dmi.transport.native")
+    fake_native_module.RecordSink = _RecordSink
+    fake_native_module.RingEngine = _Factory
+
+    def reject_host_validation():
+        pytest.fail("an explicit sink must not validate or use the ClickHouse host")
+
+    fake_native_module._load_extension = reject_host_validation
+    monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
+
+    with pytest.raises(RuntimeError, match="could not start"):
+        engine.create_record_runtime(_explicit_sink_format(), record_sink=sink)
+
+    assert order == [("stop", None), ("release", 1)]
+    assert new_ring.stop_calls == 1
+    assert activated == []
+    # One deactivate for the switch away from the old ring, one for the rollback.
+    assert deactivated == [True, True]
+    assert engine._ring_engine is None
+    assert engine._ring_transport is None
+    assert engine._record_mode is False
+    assert old_ring.stop_calls == 1
+
+
 def test_explicit_sink_preflight_failure_preserves_the_active_ring(monkeypatch):
     engine, old_transport, old_ring = _engine_with_fake_ring()
     engine._ring_config = object()
@@ -822,4 +911,193 @@ def test_the_sink_loader_tolerates_a_transport_module_without_the_loader(
     )
     monkeypatch.setitem(sys.modules, "dmi.transport.native", fake)
     monkeypatch.setattr(dmi.transport, "native", fake, raising=False)
-    assert native_sink._load_native_sink_extension() is not None
+    # The module the loader returns, not merely "not None": the loader can
+    # only raise or hand back _load_named_extension's result, so `is not
+    # None` was satisfied by construction and would have held for any other
+    # object too. Same assertion style as the two tests above.
+    assert native_sink._load_native_sink_extension().RING_TYPES_ARE_STANDINS \
+        is True
+
+
+# --- the record switch is a transaction: one runtime, or none at all ----------
+#
+# create_record_runtime tears the plain ring down before it builds the record
+# one, so every failure between those two points leaves the engine with no
+# transport at all. The guard below refuses a second runtime instead of
+# stopping the live record ring, and the rollback arm has to put the engine
+# back into the honest "not enabled" state -- never a _record_mode that points
+# at a transport that was never activated.
+
+
+def _record_ring_fakes(monkeypatch, *, create_record, activate, deactivated):
+    """The two fake modules create_record_runtime imports lazily."""
+
+    class _FakeTransport:
+        def __init__(self, native_ring):
+            self._ring_payload = native_ring.payload_tensor()
+            self.null_offload = False
+            self.force_eager = False
+
+        def _record_payload_tensor(self):
+            return self._ring_payload
+
+        def configure_record_schema(self, schema):
+            self._record_schema = schema
+
+    fake_transport_module = ModuleType("dmi.transport.ring")
+    fake_transport_module.RingTransport = _FakeTransport
+    fake_transport_module.activate = activate
+    fake_transport_module.deactivate = lambda: deactivated.append(True)
+    fake_native_module = ModuleType("dmi.transport.native")
+    fake_native_module.RecordSink = object
+    fake_native_module.RingEngine = SimpleNamespace(create_record=create_record)
+    fake_native_module._load_extension = lambda: SimpleNamespace(
+        _validate_record_host_schema=lambda host, schema: None
+    )
+    monkeypatch.setitem(sys.modules, "dmi.transport.ring", fake_transport_module)
+    monkeypatch.setitem(sys.modules, "dmi.transport.native", fake_native_module)
+
+
+def test_second_record_runtime_is_refused_while_one_is_active(monkeypatch):
+    """The refusal happens before the teardown, so the live ring survives."""
+    engine, _old_transport, _old_ring = _engine_with_fake_ring()
+    engine._ring_config = object()
+    engine._host_engine = object()
+    new_ring = _FakeRingEngine()
+    created = []
+    activated = []
+    deactivated = []
+
+    def create_record(config, target):
+        created.append((config, target))
+        return new_ring
+
+    _record_ring_fakes(
+        monkeypatch,
+        create_record=create_record,
+        activate=activated.append,
+        deactivated=deactivated,
+    )
+
+    engine.create_record_runtime(_explicit_sink_format())
+    live_transport = engine._ring_transport
+
+    with pytest.raises(RuntimeError, match="already active"):
+        engine.create_record_runtime(_explicit_sink_format())
+
+    assert len(created) == 1
+    assert engine._ring_transport is live_transport
+    assert engine._ring_engine is new_ring
+    assert engine._record_mode is True
+    assert new_ring.stop_calls == 0
+
+
+@pytest.mark.parametrize("failing_step", ["create_record", "init", "start"])
+def test_record_ring_construction_failure_rolls_the_engine_back(
+    monkeypatch, failing_step
+):
+    """The plain ring is already gone, so the engine must report "not enabled".
+
+    A half-built record engine is stopped on the way out -- its native lease
+    joins the record worker -- and no transport is ever activated.
+    """
+    engine, _old_transport, old_ring = _engine_with_fake_ring()
+    engine._ring_config = object()
+    engine._host_engine = object()
+    activated = []
+    deactivated = []
+
+    class _Boom(_FakeRingEngine):
+        def init(self):
+            if failing_step == "init":
+                raise RuntimeError("record ring init failed")
+            super().init()
+
+        def start(self):
+            if failing_step == "start":
+                raise RuntimeError("record ring start failed")
+            super().start()
+
+    new_ring = _Boom()
+
+    def create_record(config, target):
+        if failing_step == "create_record":
+            raise RuntimeError("record ring create failed")
+        return new_ring
+
+    _record_ring_fakes(
+        monkeypatch,
+        create_record=create_record,
+        activate=activated.append,
+        deactivated=deactivated,
+    )
+
+    with pytest.raises(RuntimeError, match="record ring .* failed"):
+        engine.create_record_runtime(_explicit_sink_format())
+
+    assert engine._record_mode is False
+    assert engine._ring_transport is None
+    assert engine._ring_engine is None
+    assert activated == []
+    assert old_ring.stop_calls == 1
+    if failing_step != "create_record":
+        assert new_ring.stop_calls == 1
+    with pytest.raises(RuntimeError, match="Ring transport is not enabled"):
+        engine.flush_and_wait(1.0)
+    with pytest.raises(RuntimeError, match="Ring transport is not enabled"):
+        engine.create_record_runtime(_explicit_sink_format())
+
+
+def test_activate_failure_rolls_back_the_half_installed_record_ring(monkeypatch):
+    """The one failure that reaches the rollback with the fields already set.
+
+    activate() is the last step, and by then _ring_transport, _ring_engine and
+    _record_mode all name the new record ring. Only here does the rollback's
+    state reset do observable work -- on the create/init/start paths the fields
+    are still the None the switch left behind. The second deactivate() is the
+    point: one during the switch, one undoing the activation attempt.
+    """
+    engine, _old_transport, _old_ring = _engine_with_fake_ring()
+    engine._ring_config = object()
+    engine._host_engine = object()
+    new_ring = _FakeRingEngine()
+    deactivated = []
+
+    def boom_activate(_transport):
+        raise RuntimeError("ring activation failed")
+
+    _record_ring_fakes(
+        monkeypatch,
+        create_record=lambda config, target: new_ring,
+        activate=boom_activate,
+        deactivated=deactivated,
+    )
+
+    with pytest.raises(RuntimeError, match="ring activation failed"):
+        engine.create_record_runtime(_explicit_sink_format())
+
+    assert engine._record_mode is False
+    assert engine._ring_transport is None
+    assert engine._ring_engine is None
+    assert new_ring.stop_calls == 1
+    assert deactivated == [True, True]
+    with pytest.raises(RuntimeError, match="Ring transport is not enabled"):
+        engine.flush_and_wait(1.0)
+
+
+def test_next_auto_group_id_returns_distinct_increasing_group_prefixes():
+    """Every claim must hand back a fresh integer, starting at zero.
+
+    The HF adapter bumps the group on each prefill or batch-size change and
+    then mints per-request IDs as f"{group}:{i}"
+    (``adapters/huggingface/adapter.py:393-399``), so a counter that failed to
+    advance would make two successive ``generate()`` calls both emit
+    ``"0:0"``, ``"0:1"``, ... . The offload table is a ``MergeTree`` with no
+    dedup (``native/csrc/clickhouse_client.cpp:389``), so those rows would
+    collide inside one catalog namespace instead of being separable runs. The
+    documented contract is "engine-scoped integers starting at zero"
+    (``docs/integration-api-v1.md:242``).
+    """
+    engine = MonitoringEngine(enable_ring_transport=False)
+
+    assert [engine.next_auto_group_id() for _ in range(3)] == [0, 1, 2]
