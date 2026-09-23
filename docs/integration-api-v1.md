@@ -150,7 +150,11 @@ in-process: from `create_record_runtime` until `close`, a C++ thread uploads
 each pack the sink stages to the object store and indexes it into the
 ClickHouse catalog, and `flush_and_wait` returns only once every record
 captured before it is queryable there (`TimeoutError` otherwise, naming the
-last upload or index error). `NativeCaptureReader` reads it back. The catalog
+last upload or index error). `NativeCaptureReader` reads it back. No adapter
+drives this path yet: the HF, vLLM and Megatron integrations never create a
+capture record runtime, so it is reached only by a caller that builds the
+record runtime and its hook points itself, as
+`tests/test_native_capture_storage_gpu_e2e.py` does. The catalog
 takes one publisher per `(database, table_prefix)`, so a second engine on the
 same catalog is refused at `create_record_runtime`.
 The schedule's default factory creates a distinct `CaptureSchedule` for each
