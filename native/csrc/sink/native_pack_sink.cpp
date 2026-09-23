@@ -3,6 +3,7 @@
 #include <ATen/ATen.h>
 
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 
 namespace dmi_sink {
@@ -14,27 +15,65 @@ namespace {
 }
 
 // Logical shape of the slice, with the dynamic dim resolved from the byte
-// count exactly like the reference checked_payload_view does.
+// count exactly like the reference resolve_shape does.
+//
+// `element_bytes` is the slice dtype's width (DtypeWidth of the mapped name,
+// which the caller has already proved non-zero). A dynamic dim counts
+// ELEMENTS, not bytes: the reference divides the slice length by the element
+// size first and only then factors it over the fixed dims. Dividing the raw
+// byte count resolved every dtype wider than one byte too large by exactly
+// that width -- a float32 [-1, 4] slice of 32 bytes came out [8, 4] where the
+// reference says [2, 4] -- and SubmitRow refused the row against its own
+// metadata, so every capture with a dynamic dim failed hard.
 bool ResolveShape(const ring::PayloadSlice& slice, uint64_t length_bytes,
-                  std::vector<int64_t>* shape_out, std::string* error) {
+                  uint64_t element_bytes, std::vector<int64_t>* shape_out,
+                  std::string* error) {
   *shape_out = slice.logical_shape;
-  if (slice.inferred_dynamic_dim < 0) return true;
   const int dim = slice.inferred_dynamic_dim;
   if (dim >= static_cast<int>(shape_out->size())) {
     if (error) *error = "inferred dynamic dim exceeds shape rank";
     return false;
   }
+  // Checked like the reference's checked_product: a negative fixed dim has no
+  // uint64 meaning, and an unchecked multiply can wrap before the modulo
+  // below -- a wrapped fixed can divide elements evenly, admitting a shape
+  // whose fixed product never fit (a zero inferred dim made `elements % fixed`
+  // pass on an overflowed fixed). With no dynamic dim the walk covers the
+  // whole shape, so SubmitRow's own unchecked multiply never sees a product
+  // that wrapped to match an empty payload.
   uint64_t fixed = 1;
   for (size_t i = 0; i < shape_out->size(); ++i) {
     if (static_cast<int>(i) == dim) continue;
-    fixed *= static_cast<uint64_t>((*shape_out)[i]);
+    const int64_t dim_value = (*shape_out)[i];
+    if (dim_value < 0) {
+      if (error) *error = "negative logical tensor dimension";
+      return false;
+    }
+    const uint64_t dimension = static_cast<uint64_t>(dim_value);
+    if (dimension != 0 &&
+        fixed > std::numeric_limits<uint64_t>::max() / dimension) {
+      if (error) *error = "logical tensor shape overflows uint64";
+      return false;
+    }
+    fixed *= dimension;
   }
-  if (fixed == 0 || length_bytes % fixed != 0) {
+  if (dim < 0) return true;
+  if (element_bytes == 0 || length_bytes % element_bytes != 0) {
+    if (error) *error = "payload-slice bytes are not divisible by dtype size";
+    return false;
+  }
+  const uint64_t elements = length_bytes / element_bytes;
+  if (fixed == 0 || elements % fixed != 0) {
     if (error) *error = "payload bytes do not factor over the fixed dims";
     return false;
   }
-  (*shape_out)[dim] =
-      static_cast<int64_t>(length_bytes / fixed);
+  const uint64_t inferred = elements / fixed;
+  if (inferred >
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    if (error) *error = "inferred tensor dimension exceeds int64";
+    return false;
+  }
+  (*shape_out)[dim] = static_cast<int64_t>(inferred);
   return true;
 }
 
@@ -125,7 +164,8 @@ void NativePackSink::submit(ring::RecordEnvelope envelope) {
     }
     std::vector<int64_t> shape;
     std::string shape_error;
-    if (!ResolveShape(*slice, length, &shape, &shape_error)) {
+    if (!ResolveShape(*slice, length, static_cast<uint64_t>(width), &shape,
+                      &shape_error)) {
       invalid(shape_error);
     }
     RowInput input;
