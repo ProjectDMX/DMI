@@ -47,9 +47,19 @@ uint64_t parse_u64_field(const std::string& text, const char* what);
 // clickhouse_sql.py for the derivation.
 std::map<std::string, std::string> deciding_read();
 
+// Every request is bounded: a server that accepts the connection and never
+// answers must not hold a caller -- a lease renewal, a publish, a flush --
+// indefinitely. The defaults bound the drivers too; the storage service and
+// its reader pass their configured values.
+struct ClickHouseTimeouts {
+  double connect_s = 10.0;
+  double request_s = 60.0;  // the whole request, connect included
+};
+
 class ClickHouseClient {
  public:
-  ClickHouseClient(std::string host, uint16_t port);
+  ClickHouseClient(std::string host, uint16_t port,
+                   ClickHouseTimeouts timeouts = {});
   ~ClickHouseClient();
 
   ClickHouseClient(const ClickHouseClient&) = delete;
@@ -65,6 +75,7 @@ class ClickHouseClient {
  private:
   std::string host_;
   uint16_t port_;
+  ClickHouseTimeouts timeouts_;
 };
 
 }  // namespace dmi_catalog
