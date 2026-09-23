@@ -452,3 +452,151 @@ jobs:
                           print(f"  skipped: {case.get('name')}: {mark.get('message')}")
               sys.exit(f"{skipped} live test(s) skipped; a skip is not a pass")
           EOF
+
+  native-backend-compile:
+    # The full ring backend, _native_backend, which nothing in CI compiled:
+    # the cpu job builds CPU_ONLY_GOALS, and the one build test there
+    # (tests/test_cpu_native_build.py) dry-runs `host`. So the .cu sources,
+    # bindings.cpp and the torch/CUDA link could break on any PR and stay
+    # broken until someone built on a GPU host -- which is how the C++20
+    # floor torch 2.14 imposes went unnoticed (#138). This job compiles and
+    # links `make -C native all`, imports the result, and builds the ring
+    # test binaries, running the two that need no device.
+    #
+    # No GPU is needed to COMPILE, only the toolkit, and this runner has
+    # none: everything that needs a device stays with the GPU job (D0).
+    #
+    # On the runner, not in an nvidia/cuda:*-devel container. A container
+    # job pulls its image before the first step runs, so nothing can free
+    # disk first, and the image is 3.68 GiB COMPRESSED
+    # (nvidia/cuda:13.0.1-devel-ubuntu24.04, amd64, per its registry
+    # manifest) -- several times that unpacked -- before the ~4.4 GB that
+    # torch 2.14+cu130 and its nvidia-* wheels take installed (measured in a
+    # cu130 venv). That does not reliably fit the ~14 GB a hosted runner
+    # guarantees. Installing only the packages the build reads is ~2.7 GB:
+    # the header set comes from the -MMD dependency files of a real build,
+    # mapped to packages with dpkg -S on a host whose toolkit came from the
+    # same apt repository, and the sizes are those packages' Installed-Size.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Explicit, so the Makefile's resolver takes this toolkit rather than
+      # searching; it still checks the major against torch.version.cuda.
+      CUDA_HOME: /usr/local/cuda-13.0
+      # Explicit because `native`, the default, asks the GPU this runner does
+      # not have. Ada, the architecture the GPU hosts build for.
+      SM_ARCH: sm_89
+
+    steps:
+      - name: Free runner disk
+        # The two largest preinstalled trees this job never uses (the
+        # Android SDK and .NET); `df` either side so a disk failure is
+        # readable from the log.
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Fetch the clickhouse-cpp submodule
+        # Only this one. `make all` links clickhouse-cpp and needs none of the
+        # framework submodules, and `recursive` would also clone
+        # DMI-Megatron-Integration's nested Megatron-LM onto a disk this job
+        # is rationing. clickhouse-cpp has no submodules of its own.
+        run: git submodule update --init third_party/clickhouse-cpp
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # No pip cache: the torch CUDA wheel set is gigabytes, and caching
+          # it would spend the repository's cache quota to save a download.
+
+      - name: Install the CUDA 13.0 compiler and the headers torch includes
+        # NVIDIA's apt repository, and only what the build reads: nvcc
+        # (pulling cccl, crt and nvvm), cudart-dev (pulling driver-dev, whose
+        # stubs/libcuda.so satisfies the backend's -lcuda with no driver
+        # installed), and cublas, cusparse and cusolver for their headers,
+        # which ATen's CUDA context includes. 13.0 because torch 2.14's CUDA
+        # build here is cu130 and the resolver requires the same major.
+        run: |
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            cuda-nvcc-13-0 cuda-cudart-dev-13-0 \
+            libcublas-dev-13-0 libcusparse-dev-13-0 libcusolver-dev-13-0
+          "$CUDA_HOME/bin/nvcc" --version
+          df -h /
+
+      - name: Install the CUDA build of torch
+        # 2.14, the release the GPU hosts run (the plan's pin), from the cu130
+        # index. A CUDA build is required, not the CPU wheel the other jobs
+        # use: the Makefile reads torch.version.cuda to pick the toolkit and
+        # links libtorch_cuda and libc10_cuda.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir "torch==2.14.*" \
+            --index-url https://download.pytorch.org/whl/cu130
+          python -c "import torch; print(torch.__version__, torch.version.cuda)"
+          df -h /
+
+      - name: Build the ClickHouse C++ client
+        # docs/install.md step 5, verbatim.
+        run: |
+          cmake -S third_party/clickhouse-cpp -B third_party/clickhouse-cpp/build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          cmake --build third_party/clickhouse-cpp/build -j"$(nproc)"
+
+      - name: "Compile the torch-including targets as C++20 until #138 lands"
+        # torch 2.14's headers open with `#error C++20 or later compatible
+        # compiler is required` (reproduced: the stock flags stop at
+        # bindings.cpp with exactly that). #138 moves CXXFLAGS, HOST_CXXFLAGS
+        # and NVCCFLAGS to -std=c++20; until it merges, this makes the same
+        # three edits to the checkout -- they are the lines #138 changes and
+        # nothing else. Once it has merged, the sed matches nothing, the diff
+        # below is empty, and this step should be deleted. The Makefile's
+        # variables are `:=` assignments, so a command-line override would
+        # replace the whole flag set rather than the standard; hence sed.
+        run: |
+          sed -i \
+            -e '/^CXXFLAGS :=/s/-std=c++17/-std=c++20/' \
+            -e '/^HOST_CXXFLAGS :=/s/-std=c++17/-std=c++20/' \
+            -e '/^NVCCFLAGS :=/,/-std=/s/-std=c++17/-std=c++20/' \
+            native/Makefile
+          git diff native/Makefile
+          test "$(grep -cE '^(HOST_)?CXXFLAGS := -std=c\+\+20|^    -std=c\+\+20 \\$' native/Makefile)" = 3
+
+      - name: Compile the full native backend
+        # LIBRARY_PATH puts the toolkit's libcuda stub where the linker finds
+        # -lcuda; the result does not end up NEEDing libcuda (checked with
+        # readelf on a local build: the link is --as-needed and nothing calls
+        # the driver API), so check-link's ldd has no driver to find either.
+        env:
+          LIBRARY_PATH: /usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs
+        run: make -C native -j"$(nproc)" all PYTHON=python
+
+      - name: Import the backend
+        # A shared library links with undefined symbols; only loading it
+        # proves the link. No device is needed to load it.
+        run: |
+          PYTHONPATH=src python -c "
+          from dmi.transport import native
+          module = native._load_extension()
+          print(module.__file__)
+          assert hasattr(module, 'RecordSink'), 'no RecordSink in the backend'
+          "
+
+      - name: Build the ring tests and run the host-only ones
+        # All six binaries are compiled, so a .cu test that no longer builds
+        # fails here. Only test_record_consumer and
+        # test_clickhouse_record_sink RUN: they use ATen CPU tensors and no
+        # CUDA call, and pass with no device visible (14 and 21 checks,
+        # measured with CUDA_VISIBLE_DEVICES empty). The other four launch
+        # kernels and belong to the GPU job. CXX_STD because this Makefile's
+        # default is c++17, which torch 2.14's headers refuse.
+        run: |
+          make -C tests/native/ring -j"$(nproc)" all CXX_STD=c++20 PYTHON=python
+          tests/native/ring/build/test_record_consumer
+          tests/native/ring/build/test_clickhouse_record_sink
