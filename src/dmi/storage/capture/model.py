@@ -180,7 +180,11 @@ class CaptureMetadata:
         return math.prod(self.shape) * _DTYPE_BYTES[self.dtype]
 
     def to_mapping(self) -> dict[str, object]:
-        result = asdict(self)
+        # A plain field copy, not dataclasses.asdict: this runs once per captured
+        # record on the emit path, and asdict deep-copies every field. Every
+        # field is a str, int, None or tuple of ints, so the deep copy protected
+        # nothing and cost 13x the copy -- ~19 us of each record's ~127 us.
+        result = {name: getattr(self, name) for name in self.__dataclass_fields__}
         result["shape"] = list(self.shape)
         return result
 

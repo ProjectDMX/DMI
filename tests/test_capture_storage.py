@@ -1465,3 +1465,52 @@ def test_a_footer_cache_hit_refreshes_recency_so_the_cold_pack_is_evicted(
     # "a" survived, so it still costs no metadata round trip.
     assert trailer_reads("a") == 1
     assert list(reader._footer_cache) == [keys["c"], keys["a"]]
+
+
+def _capture_metadata(**overrides):
+    fields = dict(
+        capture_id="c-1", tenant_id="t", experiment_id="e", run_id="r", session_id="s",
+        request_id="req-1", sequence_id="seq-1", model_id="m", model_revision="main",
+        adapter_revision=None, capture_policy_version="p", hook_name="resid_post",
+        layer_number=12, producer_rank=0, step_number=5, token_start=40, token_end=41,
+        batch_position=1, dtype="float16", shape=(1, 896),
+        captured_at_ns=1_790_000_000_000_000_000)
+    fields.update(overrides)
+    return CaptureMetadata(**fields)
+
+
+@pytest.mark.parametrize("overrides", [{}, {"adapter_revision": "lora-7"}, {"shape": ()},
+                                       {"shape": (2, 3, 4)}])
+def test_to_mapping_equals_the_asdict_form(overrides):
+    """The shallow mapping is value-identical to what dataclasses.asdict gave."""
+    from dataclasses import asdict
+
+    metadata = _capture_metadata(**overrides)
+    reference = asdict(metadata)
+    reference["shape"] = list(metadata.shape)
+
+    mapping = metadata.to_mapping()
+
+    assert mapping == reference
+    assert list(mapping) == list(reference), "key order feeds json.dumps"
+    assert type(mapping["shape"]) is list
+    mapping["shape"].append(99)
+    assert 99 not in metadata.shape, "the returned shape must not alias the field"
+
+
+def test_to_mapping_does_not_deep_copy(monkeypatch):
+    """to_mapping() runs once per captured record, on the emit path.
+
+    dataclasses.asdict recursed into every field and deep-copied it: 18.8 us of
+    the ~127 us each record cost on the HF capture path, 3.7 s over a
+    196,608-record run. Every field is a str, int, None or tuple of ints, so a
+    deep copy protected nothing; a plain field copy is 13x cheaper and
+    byte-identical once serialised.
+    """
+    import copy
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("to_mapping() must not deep-copy immutable fields")
+
+    monkeypatch.setattr(copy, "deepcopy", refuse)
+    assert _capture_metadata().to_mapping()["layer_number"] == 12
