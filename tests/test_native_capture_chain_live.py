@@ -37,6 +37,7 @@ import uuid
 from contextlib import contextmanager
 from os import environ
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -97,6 +98,11 @@ def _native_sink():
 
 
 def _metadata(index: int, dtype: str, shape: tuple[int, ...]) -> dict:
+    """The capture's metadata. The integer fields differ from one another
+    across the records, so a parser that wires one field into another's
+    slot reads back wrong rather than coincidentally right. producer_rank
+    alone stays fixed: the sink seals a pack when the rank changes, and the
+    pack counts below assume one rank."""
     from dmi.storage.capture import CaptureMetadata
 
     return CaptureMetadata(
@@ -104,9 +110,10 @@ def _metadata(index: int, dtype: str, shape: tuple[int, ...]) -> dict:
         run_id="r", session_id="s", request_id=f"q{index}",
         sequence_id=f"n{index}", model_id="m", model_revision="mr",
         adapter_revision=None, capture_policy_version="v",
-        hook_name="resid_post", layer_number=index % 2, producer_rank=0,
-        step_number=index, token_start=index, token_end=index + 1,
-        batch_position=0, dtype=dtype, shape=shape,
+        hook_name="resid_post", layer_number=index % 2,
+        producer_rank=1, step_number=index, token_start=100 + index,
+        token_end=102 + index, batch_position=index % 5, dtype=dtype,
+        shape=shape,
         captured_at_ns=1_700_000_000_000_000_000 + index,
     ).to_mapping()
 
@@ -130,6 +137,7 @@ class _Envelope:
         self.parts = []
         self.offset = 0
         self.expected: dict[str, object] = {}
+        self.metadata: dict[str, dict] = {}
 
     def add(self, index: int, tensor):
         import torch
@@ -142,15 +150,16 @@ class _Envelope:
             self.offset += pad
         dtype = _dtype_name(tensor)
         length = tensor.numel() * tensor.element_size()
+        metadata = _metadata(index, dtype, tuple(tensor.shape))
         self.rows.append({
-            "metadata_json": json.dumps(
-                _metadata(index, dtype, tuple(tensor.shape))),
+            "metadata_json": json.dumps(metadata),
             "offset": self.offset, "length": length,
             "dtype": ATEN[dtype], "shape": list(tensor.shape),
         })
         self.parts.append(_raw(tensor))
         self.offset += length
-        self.expected[f"chain-{index:04d}"] = tensor
+        self.expected[metadata["capture_id"]] = tensor
+        self.metadata[metadata["capture_id"]] = metadata
 
     def payload(self):
         import torch
@@ -229,16 +238,38 @@ def _run_chain(config, spool_root: Path, envelopes, *, sink_overrides=None):
     return sink_snapshot, service_snapshot, captures
 
 
-def _assert_bytes_equal(captures, envelopes):
-    expected = {}
+def _catalog_form(name: str, value):
+    """A submitted metadata value as NativeCaptureReader returns it: shape
+    as a tuple, and the Nullable adapter_revision's NULL as the empty
+    string (the native reader's sentinel for it; see parse_tsv_tuple)."""
+    if name == "shape":
+        return tuple(value)
+    if name == "adapter_revision" and value is None:
+        return ""
+    return value
+
+
+def _assert_read_back_exactly(captures, envelopes):
+    """Every capture reads back with its bytes AND every metadata field it
+    was submitted with. This chain is the only CI test that drives the torch
+    sink's metadata parser (native/csrc/sink/record_row.cpp), so a field it
+    mangles has to show up here."""
+    expected, metadata = {}, {}
     for envelope in envelopes:
         expected.update(envelope.expected)
+        metadata.update(envelope.metadata)
     assert sorted(captures) == sorted(expected)
     for capture_id, tensor in expected.items():
         capture = captures[capture_id]
         assert capture.payload == _raw(tensor).numpy().tobytes(), capture_id
         assert capture.descriptor["shape"] == tuple(tensor.shape)
         assert capture.descriptor["dtype"] == _dtype_name(tensor)
+        # Every submitted field, not a chosen few: a field the reader stops
+        # returning is a KeyError here rather than a silent pass.
+        submitted = metadata[capture_id]
+        read_back = {name: capture.descriptor[name] for name in submitted}
+        assert read_back == {name: _catalog_form(name, value)
+                             for name, value in submitted.items()}, capture_id
 
 
 def _large_envelopes(count: int, elements: int):
@@ -288,7 +319,7 @@ def test_the_real_sink_reaches_the_catalog_and_reads_back_exactly(
     assert snapshot["indexed_rows"] == 12, snapshot
     assert snapshot["pending_index"] == 0, snapshot
     assert list(spool_root.rglob("*.dmi-pack.ready")) == []
-    _assert_bytes_equal(captures, envelopes)
+    _assert_read_back_exactly(captures, envelopes)
     for capture_id, capture in captures.items():
         expected = next(e.expected[capture_id] for e in envelopes
                         if capture_id in e.expected)
@@ -330,14 +361,21 @@ def test_a_multipart_pack_through_the_fake_s3(fake_s3, tmp_path):
     # checked here, on what the client actually sent.
     with STATE.lock:
         calls = list(STATE.calls)
-    parts = [call["body_len"] for call in calls
-             if call["method"] == "PUT" and "partNumber=" in call["path"]]
+    # By part number, the last attempt at each winning: the log holds every
+    # HTTP attempt, and a retried part would otherwise count twice.
+    by_number = {}
+    for call in calls:
+        query = parse_qs(urlsplit(call["path"]).query)
+        if call["method"] == "PUT" and "partNumber" in query:
+            by_number[int(query["partNumber"][0])] = call["body_len"]
+    assert sorted(by_number) == list(range(1, len(by_number) + 1)), by_number
+    parts = [by_number[number] for number in sorted(by_number)]
     assert len(parts) == math.ceil(object_bytes / MULTIPART_CHUNK), parts
     assert sum(parts) == object_bytes
     assert all(size == MULTIPART_CHUNK for size in parts[:-1]), parts
     assert all(size >= S3_MIN_PART for size in parts[:-1]), parts
     assert STATE.objects[key]["etag"].endswith('-multipart"')
-    _assert_bytes_equal(captures, envelopes)
+    _assert_read_back_exactly(captures, envelopes)
 
 
 @contextmanager
@@ -390,4 +428,4 @@ def test_a_multipart_pack_through_minio(tmp_path):
         assert head["ContentLength"] == object_bytes
         parts = math.ceil(object_bytes / MULTIPART_CHUNK)
         assert head["ETag"].strip('"').endswith(f"-{parts}"), head["ETag"]
-        _assert_bytes_equal(captures, envelopes)
+        _assert_read_back_exactly(captures, envelopes)
