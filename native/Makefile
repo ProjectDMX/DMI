@@ -55,7 +55,7 @@ endif
 # Pure-CPU drivers build without a CUDA toolkit (or torch): the test suite
 # drives them over stdin/stdout. When EVERY requested goal is CPU-only (or
 # clean/host), skip CUDA resolution entirely.
-CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/bench_sink build/conformance_catalog build/_dmi_native_sink
+CPU_ONLY_GOALS := build/conformance_main build/conformance_sign build/conformance_store build/conformance_spool build/conformance_sink build/bench_builder build/bench_sink build/conformance_catalog build/_dmi_native_sink build/_dmi_native_store
 ifneq ($(strip $(MAKECMDGOALS)),)
 ifeq ($(strip $(filter-out clean host cpu-goals $(CPU_ONLY_GOALS),$(MAKECMDGOALS))),)
 CUDA_RESOLVE_REQUIRED := 0
@@ -318,6 +318,7 @@ build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp c
 # PYTHON must point at the venv interpreter:
 #   make build/_dmi_native_sink... PYTHON=/path/to/venv/bin/python
 SINK_EXT := _dmi_native_sink$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))" 2>/dev/null)
+STORE_EXT := _dmi_native_store$(EXT_SUFFIX)
 # C++20 because ATen demands it and its floor MOVES: torch 2.13 refuses
 # below C++17, torch 2.14 below C++20, and the CI pin `torch>=2.8,<3`
 # resolves to whatever is newest on the day. C++20 is the floor for every
@@ -338,6 +339,27 @@ build/_dmi_native_sink: csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp 
 	    csrc/store/spool.cpp csrc/common/json.cpp \
 	    $(shell $(PYTHON) -c "from torch.utils.cpp_extension import library_paths; print(' '.join('-L'+p for p in library_paths()))") \
 	    -ltorch_cpu -ltorch -lc10 -ltorch_python -lcrypto -lpthread
+# The native capture storage path's Python module: StorageService (spool ->
+# object store -> catalog) and CaptureReader. Pure C++ + libcurl + libcrypto.
+# pybind11 is header-only; its headers come from torch's include dir, but
+# nothing from torch is linked, and no ring types are registered, so this
+# loads beside _native_backend and _dmi_native_sink.
+STORE_SOURCES := csrc/catalog/storage_service.cpp csrc/catalog/bindings_store.cpp \
+    csrc/catalog/clickhouse_client.cpp csrc/catalog/lease_coordinator.cpp \
+    csrc/catalog/version_allocator.cpp csrc/catalog/catalog_writer.cpp \
+    csrc/catalog/pack_index.cpp csrc/catalog/indexer.cpp csrc/catalog/schema.cpp \
+    csrc/catalog/reader.cpp csrc/catalog/hydration.cpp \
+    csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/uploader.cpp \
+    csrc/store/spool.cpp csrc/pack/pack_builder.cpp \
+    csrc/common/json.cpp csrc/common/curl_init.cpp
+build/_dmi_native_store: $(STORE_SOURCES) csrc/catalog/storage_service.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -fPIC -shared -Wall -Wextra \
+	    -I$(shell $(PYTHON) -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'include'))") \
+	    $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); print('-I'+paths.get('include'))") \
+	    -Icsrc -Icsrc/catalog -Icsrc/common -Icsrc/pack -Icsrc/store -I$(CURL_INCDIR) \
+	    -o $(BUILD_DIR)/$(STORE_EXT) $(STORE_SOURCES) \
+	    -L$(CURL_LIBDIR) -lcurl -lcrypto -lpthread
 # A3b sink conformance driver: queue + assembler + spool staging in one
 # process, driven over stdin/stdout. Needs only libcrypto + pthreads.
 build/conformance_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/record_row.cpp csrc/sink/conformance_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp csrc/sink/pack_sink.h csrc/sink/object_key.h csrc/sink/record_row.h

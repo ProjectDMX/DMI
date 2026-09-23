@@ -1,0 +1,474 @@
+#include "catalog/storage_service.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <set>
+#include <stdexcept>
+#include <utility>
+
+#include "catalog/schema.h"
+#include "pack/pack_builder.h"
+
+namespace dmi_catalog {
+namespace {
+
+uint64_t steady_ns() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+constexpr const char* kPackSuffix = ".dmi-pack";
+
+bool ends_with(const std::string& value, const std::string& suffix) {
+  return value.size() >= suffix.size() &&
+         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool is_hex64(const std::string& value) {
+  if (value.size() != 64) return false;
+  for (char c : value) {
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+  }
+  return true;
+}
+
+// "<prefix>/<pack_id>.dmi-pack" -> pack_id, or "" if the key is not a pack.
+std::string pack_id_of(const std::string& key) {
+  if (!ends_with(key, kPackSuffix)) return "";
+  const size_t slash = key.rfind('/');
+  const size_t start = slash == std::string::npos ? 0 : slash + 1;
+  return key.substr(start, key.size() - start - std::string(kPackSuffix).size());
+}
+
+// The uploader only ever writes canonical lowercase UUID pack ids, and the
+// catalog's pack_id column is a UUID: anything else would fail the whole
+// committed-ids query for its page, not just itself.
+bool is_pack_id(const std::string& value) {
+  std::array<uint8_t, 16> bytes{};
+  std::string canonical;
+  return dmi_pack::ParseUuid(value, &bytes, &canonical) && canonical == value;
+}
+
+}  // namespace
+
+CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
+    : config_(std::move(config)),
+      s3_(config_.s3),
+      clickhouse_(std::make_shared<const ClickHouseClient>(
+          config_.clickhouse_host, config_.clickhouse_port)),
+      writer_(clickhouse_, config_.writer),
+      indexer_(&s3_, &writer_, config_.indexer) {
+  if (config_.spool_root.empty()) {
+    throw std::invalid_argument("storage service: spool_root is required");
+  }
+  if (config_.holder.empty()) {
+    throw std::invalid_argument("storage service: holder is required");
+  }
+  if (config_.uploader.store_id.empty()) {
+    throw std::invalid_argument("storage service: uploader.store_id is required");
+  }
+  std::string error;
+  if (dmi_store::Spool::Open({config_.spool_root, config_.spool_max_bytes},
+                             &spool_, &error) != dmi_store::SpoolStatus::kOk) {
+    throw std::runtime_error("storage service: cannot open spool: " + error);
+  }
+  uploader_ = std::make_unique<dmi_store::SpoolUploader>(&spool_, &s3_,
+                                                          config_.uploader);
+}
+
+CaptureStorageService::~CaptureStorageService() {
+  try {
+    stop();
+  } catch (...) {
+  }
+}
+
+void CaptureStorageService::start() {
+  std::lock_guard<std::mutex> cycle(cycle_mutex_);
+  if (started_) throw std::logic_error("storage service: already started");
+
+  if (config_.sweep_spool_on_start) {
+    std::vector<dmi_store::StagedPack> recovered;
+    std::string error;
+    if (spool_.Recover(&recovered, &error) != dmi_store::SpoolStatus::kOk) {
+      throw std::runtime_error("storage service: spool recovery failed: " +
+                               error);
+    }
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.swept_on_start = recovered.size();
+  }
+
+  CatalogSchema(clickhouse_, config_.writer.database, config_.writer.table_prefix)
+      .ensure(&writer_.leases(), config_.schema_retry_sleep_ns);
+  writer_.acquire_lease(config_.holder);  // throws kHeld if another publisher holds it
+  last_renew_ns_ = steady_ns();
+
+  // A failed pass is not fatal -- the bucket is still there next time -- but a
+  // lost lease is, and start() must not return holding a lease stop() will
+  // never release.
+  if (config_.reconcile_on_start) {
+    try {
+      reconcile();
+    } catch (const CatalogError& exc) {
+      if (exc.kind() == CatalogError::Kind::kHeld ||
+          exc.kind() == CatalogError::Kind::kLease) {
+        try {
+          if (writer_.held_lease() != nullptr) writer_.release_lease();
+        } catch (...) {
+        }
+        throw;
+      }
+      record_error(std::string("reconcile at start failed: ") + exc.what());
+    } catch (const std::exception& exc) {
+      record_error(std::string("reconcile at start failed: ") + exc.what());
+    }
+  }
+  last_reconcile_ns_ = steady_ns();
+
+  {
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    stop_requested_ = false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.running = true;
+  }
+  started_ = true;
+  thread_ = std::thread([this] { loop(); });
+}
+
+void CaptureStorageService::stop() {
+  {
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    stop_requested_ = true;
+  }
+  wake_.notify_all();
+  if (thread_.joinable()) thread_.join();
+  std::lock_guard<std::mutex> cycle(cycle_mutex_);
+  if (started_) {
+    started_ = false;
+    try {
+      if (writer_.held_lease() != nullptr) writer_.release_lease();
+    } catch (const std::exception& exc) {
+      record_error(std::string("lease release failed: ") + exc.what());
+    }
+  }
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  state_.running = false;
+}
+
+bool CaptureStorageService::flush(double timeout_s) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::duration<double>(timeout_s));
+  while (true) {
+    {
+      std::lock_guard<std::mutex> cycle(cycle_mutex_);
+      if (!started_) throw std::logic_error("storage service: not started");
+      rethrow_if_failed();
+      if (run_cycle().drained) return true;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
+StorageServiceSnapshot CaptureStorageService::snapshot() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  return state_;
+}
+
+void CaptureStorageService::rethrow_if_failed() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (failure_) std::rethrow_exception(failure_);
+}
+
+void CaptureStorageService::loop() {
+  uint64_t wait_ns = config_.poll_interval_ns;
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(wake_mutex_);
+      wake_.wait_for(lock, std::chrono::nanoseconds(wait_ns),
+                     [this] { return stop_requested_; });
+      if (stop_requested_) return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (failure_) return;  // the lease is gone; nothing more can publish
+    }
+    std::lock_guard<std::mutex> cycle(cycle_mutex_);
+    run_cycle();
+    // poll_interval * 2^streak, capped: flush() shares the streak, so an
+    // outage it saw also slows the loop, and a success from either resets it.
+    wait_ns = config_.poll_interval_ns;
+    for (int i = 0; i < failure_streak_ && wait_ns < config_.max_backoff_ns; ++i) {
+      wait_ns *= 2;
+    }
+    wait_ns = std::min(std::max(wait_ns, config_.poll_interval_ns),
+                       std::max(config_.max_backoff_ns, config_.poll_interval_ns));
+  }
+}
+
+CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
+  CycleOutcome outcome;
+  try {
+    // 1. Upload everything the sink has staged.
+    const dmi_store::UploadBatchResult batch = uploader_->UploadPending(-1);
+    std::vector<PackRefData> to_index;
+    to_index.swap(pending_index_);  // earlier packs whose indexing failed
+    uint64_t uploaded_packs = 0;
+    uint64_t uploaded_bytes = 0;
+    size_t upload_failures = 0;
+    for (size_t i = 0; i < batch.refs.size(); ++i) {
+      const dmi_store::PackRef& ref = batch.refs[i];
+      if (!ref.pack_id.empty()) {
+        to_index.push_back({ref.pack_id, ref.store_id, ref.object_key,
+                            ref.object_bytes, ref.checksum, ref.record_count});
+        ++uploaded_packs;
+        uploaded_bytes += ref.object_bytes;
+      } else {
+        // A failed upload stays in the spool, so the next cycle retries it.
+        ++upload_failures;
+        if (i < batch.failures.size()) {
+          record_error("upload failed for " + batch.failures[i].object_key +
+                       ": " + batch.failures[i].error);
+        }
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      state_.uploaded_packs += uploaded_packs;
+      state_.uploaded_bytes += uploaded_bytes;
+      state_.upload_failures += upload_failures;
+    }
+
+    // 2. Index them. Whatever does not index stays owed: it is already gone
+    //    from the spool, so this list is the only record of it in-process.
+    std::vector<PackRefData> unindexed;
+    try {
+      if (!to_index.empty()) index_bounded(std::move(to_index), &unindexed);
+    } catch (...) {
+      pending_index_ = std::move(unindexed);
+      throw;
+    }
+    pending_index_ = std::move(unindexed);
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      state_.pending_index = pending_index_.size();
+    }
+
+    // 3. Keep the lease alive while idle, and reconcile on its interval.
+    renew_lease_if_due();
+    if (config_.reconcile_interval_ns > 0 &&
+        steady_ns() - last_reconcile_ns_ >= config_.reconcile_interval_ns) {
+      reconcile();
+      last_reconcile_ns_ = steady_ns();
+    }
+
+    // Drained: nothing failed to upload, every uploaded pack is in the
+    // catalog, and nothing is pending. A batch that uploaded everything it
+    // listed is drained as far as flush() is concerned -- its listing came
+    // after the sink's flush -- so the spool is re-listed only when the batch
+    // was empty, which UploadPending also returns when its listing FAILED.
+    // An empty spool lists for free; a backlog would be re-hashed.
+    outcome.failed = upload_failures != 0 || !pending_index_.empty();
+    bool nothing_pending = !batch.refs.empty();
+    if (batch.refs.empty()) {
+      std::vector<dmi_store::StagedPack> pending;
+      std::string error;
+      const bool listed =
+          spool_.ListPending(&pending, &error) == dmi_store::SpoolStatus::kOk;
+      if (!listed) {
+        record_error("spool listing failed: " + error);
+        outcome.failed = true;
+      }
+      nothing_pending = listed && pending.empty();
+    }
+    outcome.drained = nothing_pending && !outcome.failed;
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    ++state_.cycles;
+  } catch (const CatalogError& exc) {
+    if (exc.kind() == CatalogError::Kind::kHeld ||
+        exc.kind() == CatalogError::Kind::kLease) {
+      latch_failure(std::current_exception(),
+                    std::string("publisher lease lost: ") + exc.what());
+    } else {
+      record_error(exc.what());
+    }
+  } catch (const std::exception& exc) {
+    record_error(exc.what());
+  }
+  failure_streak_ = outcome.failed ? std::min(failure_streak_ + 1, 32) : 0;
+  return outcome;
+}
+
+void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
+                                          std::vector<PackRefData>* unindexed) {
+  // Batches the indexer can take: at most max_packs, and halved again when the
+  // rendered descriptors exceed max_estimated_bytes. The two bounds are
+  // independent, so packs that each fit can still overflow together.
+  const size_t max_packs =
+      static_cast<size_t>(std::max(1, config_.indexer.max_packs));
+  std::vector<std::vector<PackRefData>> work;
+  for (size_t i = 0; i < refs.size(); i += max_packs) {
+    work.emplace_back(refs.begin() + i,
+                      refs.begin() + std::min(refs.size(), i + max_packs));
+  }
+  // A batch that threw indexed nothing, and neither did anything still queued.
+  const auto give_up = [&](std::vector<PackRefData>& failed,
+                           const std::string& message) {
+    uint64_t count = failed.size();
+    unindexed->insert(unindexed->end(), failed.begin(), failed.end());
+    for (std::vector<PackRefData>& queued : work) {
+      count += queued.size();
+      unindexed->insert(unindexed->end(), queued.begin(), queued.end());
+    }
+    work.clear();
+    record_error(message);
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.index_failures += count;
+  };
+  while (!work.empty()) {
+    std::vector<PackRefData> batch = std::move(work.back());
+    work.pop_back();
+    IndexResultData result;
+    try {
+      result = indexer_.index(batch);
+    } catch (const CatalogError& exc) {
+      if (exc.kind() == CatalogError::Kind::kBatchTooLarge && batch.size() > 1) {
+        const size_t middle = batch.size() / 2;
+        work.emplace_back(batch.begin() + middle, batch.end());
+        work.emplace_back(batch.begin(), batch.begin() + middle);
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        ++state_.batch_splits;
+        continue;
+      }
+      const bool lease_lost = exc.kind() == CatalogError::Kind::kHeld ||
+                              exc.kind() == CatalogError::Kind::kLease;
+      give_up(batch, std::string("index failed: ") + exc.what());
+      if (lease_lost) throw;
+      return;
+    } catch (const std::exception& exc) {
+      give_up(batch, std::string("index failed: ") + exc.what());
+      return;
+    }
+    std::set<std::string> failed_ids;
+    for (const IndexFailureData& failure : result.failures) {
+      failed_ids.insert(failure.pack_id);
+      record_error("index failed for " + failure.object_key + ": " +
+                   failure.message);
+    }
+    for (const PackRefData& ref : batch) {
+      if (failed_ids.count(ref.pack_id) != 0) unindexed->push_back(ref);
+    }
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.indexed_packs += result.indexed_packs;
+    state_.indexed_rows += result.indexed_rows;
+    state_.index_failures += result.failed_packs;
+    if (result.indexed_packs > 0 || result.skipped_packs > 0) {
+      last_renew_ns_ = steady_ns();  // a publish renews the lease
+    }
+  }
+}
+
+void CaptureStorageService::reconcile() {
+  // List every pack under the prefix, ask the catalog which it already
+  // committed, and HEAD only the rest -- so a steady-state pass over a large
+  // bucket costs listing pages and one catalog query per page, not a HEAD per
+  // object.
+  std::string token;
+  uint64_t found = 0;
+  uint64_t skipped = 0;
+  do {
+    dmi_store::ListResult page;
+    std::string error;
+    if (!s3_.ListObjects(config_.reconcile_prefix, "", 1000, token, &page,
+                         &error)) {
+      throw std::runtime_error("reconcile: listing failed: " + error);
+    }
+    token = page.truncated ? page.next_token : "";
+
+    std::vector<PackIdentity> identities;
+    std::vector<const dmi_store::ListedObject*> packs;
+    for (const dmi_store::ListedObject& object : page.objects) {
+      const std::string pack_id = pack_id_of(object.key);
+      if (pack_id.empty()) continue;  // not a pack key at all
+      if (!is_pack_id(pack_id)) {
+        ++skipped;
+        continue;
+      }
+      identities.emplace_back(config_.uploader.store_id, pack_id);
+      packs.push_back(&object);
+    }
+    if (packs.empty()) continue;
+    const std::set<PackIdentity> committed = writer_.committed_pack_ids(identities);
+
+    std::vector<PackRefData> missing;
+    for (size_t i = 0; i < packs.size(); ++i) {
+      if (committed.count(identities[i]) != 0) continue;
+      const dmi_store::ListedObject& object = *packs[i];
+      std::string head_error;
+      const dmi_store::ObjectHead head = s3_.HeadObject(object.key, &head_error);
+      const auto meta = [&head](const char* name) -> std::string {
+        const auto it = head.metadata.find(name);
+        return it == head.metadata.end() ? "" : it->second;
+      };
+      // The uploader's metadata, validated as the Python oracle's inspect()
+      // does: a foreign object in the bucket is skipped, never indexed.
+      uint64_t records = 0;
+      try {
+        records = std::stoull(meta("dmi-record-count"));
+      } catch (...) {
+        records = 0;
+      }
+      const std::string checksum = meta("dmi-sha256");
+      if (!head.found || meta("dmi-format") != "dmi-pack-v1" ||
+          meta("dmi-pack-id") != identities[i].second || !is_hex64(checksum) ||
+          records < 1 || records > 1'000'000) {
+        ++skipped;
+        continue;
+      }
+      missing.push_back({identities[i].second, config_.uploader.store_id,
+                         object.key, head.size, checksum, records});
+    }
+    found += missing.size();
+    // A pack that fails here is still uncommitted in the bucket, so the next
+    // pass retries it; it is not added to the flush boundary.
+    std::vector<PackRefData> unindexed;
+    if (!missing.empty()) index_bounded(std::move(missing), &unindexed);
+  } while (!token.empty());
+
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  ++state_.reconcile_passes;
+  state_.reconciled_packs += found;
+  state_.reconcile_skipped_objects += skipped;
+}
+
+void CaptureStorageService::renew_lease_if_due() {
+  // The lease renews only inside a publish. An idle service would lose it after
+  // lease_ttl_ns, and a rival could take the catalog over; renew once a third
+  // of the TTL has passed without a publish.
+  const uint64_t ttl = config_.writer.lease_ttl_ns;
+  if (ttl == 0 || steady_ns() - last_renew_ns_ < ttl / 3) return;
+  writer_.renew_lease();
+  last_renew_ns_ = steady_ns();
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  ++state_.lease_renewals;
+}
+
+void CaptureStorageService::record_error(const std::string& message) {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  state_.last_error = message.substr(0, 512);
+}
+
+void CaptureStorageService::latch_failure(std::exception_ptr failure,
+                                          const std::string& message) {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (!failure_) failure_ = std::move(failure);
+  state_.last_error = message.substr(0, 512);
+}
+
+}  // namespace dmi_catalog

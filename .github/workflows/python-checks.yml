@@ -318,6 +318,11 @@ jobs:
         # show up by grepping for driver names. Build the set; the marginal
         # cost is seconds and it ends a class of failure that was found one
         # binary per CI round.
+        #
+        # And _dmi_native_store, the storage service and reader that
+        # test_native_capture_storage_live.py drives in-process. It takes
+        # only pybind11's headers from the torch this job installs and links
+        # nothing from it.
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libcurl4-openssl-dev
@@ -326,6 +331,7 @@ jobs:
             build/conformance_store \
             build/conformance_sink \
             build/conformance_spool \
+            build/_dmi_native_store \
             CURL_INCDIR=/usr/include/x86_64-linux-gnu \
             CURL_LIBDIR=/usr/lib/x86_64-linux-gnu
 

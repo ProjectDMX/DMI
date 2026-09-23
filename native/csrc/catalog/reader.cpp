@@ -316,6 +316,17 @@ std::string unescape_tsv(const std::string& text) {
 
 }  // namespace
 
+// Declared in reader.h.
+std::vector<std::string> search_item_columns() {
+  const std::set<std::string> sort_key_set(std::begin(kSortKey),
+                                           std::end(kSortKey));
+  std::vector<std::string> columns(std::begin(kSortKey), std::end(kSortKey));
+  for (const char* column : kProjection) {
+    if (!sort_key_set.count(column)) columns.push_back(column);
+  }
+  return columns;
+}
+
 // Declared in reader.h. The argMax aggregate travels as
 // ('a','b',123,...) with backslash escapes, and NULL as a bare token.
 std::vector<std::string> parse_tsv_tuple(const std::string& text) {
