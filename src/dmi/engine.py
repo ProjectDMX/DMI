@@ -120,10 +120,12 @@ class MonitoringEngine:
             raise ValueError("Provide either host_engine or db_config, not both")
 
         # The canonical name: a deprecated one ("native", "capture") is
-        # replaced here, so everything below reads only the current three
-        # choices and "auto".
-        self._storage_backend = getattr(
-            config, "canonical_storage_backend",
+        # replaced here, for a MonitoringConfig and any config-like object
+        # alike, so everything below reads only the current three choices
+        # and "auto".
+        from .config import canonical_storage_backend
+
+        self._storage_backend = canonical_storage_backend(
             getattr(config, "storage_backend", "auto"))
         # A None config is the ctor's documented no-configuration mode;
         # say so here rather than behind a getattr default.
@@ -489,6 +491,8 @@ class MonitoringEngine:
     ) -> Any:
         """Switch to ring-based D2H transport.
 
+        Refused under ``storage_backend="none"``, which turns capture off.
+
         Creates a RingEngine with the C++ host engine as the submit target so
         tensor reconstruction, slicing, and DB submission all happen in C++
         without the GIL.
@@ -505,6 +509,11 @@ class MonitoringEngine:
             ``self._ring_transport``).  Returned so adapters can hold a
             direct reference instead of reaching through the engine.
         """
+        if getattr(self, "_storage_backend", "auto") == "none":
+            raise RuntimeError(
+                "config.storage_backend='none' turns capture off: this engine "
+                "allocates no ring. Pick 'in-memory' or 'persistent' to capture"
+            )
         _rt = _ring_module()
         _native_engine = _native_module()
 

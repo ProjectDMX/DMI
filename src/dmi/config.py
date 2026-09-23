@@ -17,6 +17,21 @@ USER_STORAGE_CHOICES = ("in-memory", "persistent", "none")
 _DEPRECATED_STORAGE_BACKENDS = {"native": "in-memory", "capture": "persistent"}
 
 
+def canonical_storage_backend(name: str) -> str:
+    """``name`` with a deprecated storage backend replaced by its new one.
+
+    Unknown names are refused here as well as in ``MonitoringConfig``, so an
+    engine handed any config-like object acts only on the current names.
+    """
+    if name not in get_args(StorageBackend):
+        raise ValueError(
+            "storage_backend must be one of "
+            + ", ".join(repr(choice) for choice in USER_STORAGE_CHOICES)
+            + f" (or left unset); got {name!r}"
+        )
+    return _DEPRECATED_STORAGE_BACKENDS.get(name, name)
+
+
 @dataclass
 class CaptureSchedule:
     """Schedule for step-level and request-level capture."""
@@ -130,17 +145,10 @@ class MonitoringConfig:
     @property
     def canonical_storage_backend(self) -> str:
         """``storage_backend`` with a deprecated name replaced by its new one."""
-        return _DEPRECATED_STORAGE_BACKENDS.get(
-            self.storage_backend, self.storage_backend)
+        return canonical_storage_backend(self.storage_backend)
 
     def __post_init__(self) -> None:
-        if self.storage_backend not in get_args(StorageBackend):
-            raise ValueError(
-                "storage_backend must be one of "
-                + ", ".join(repr(name) for name in USER_STORAGE_CHOICES)
-                + " (or left unset); got "
-                + repr(self.storage_backend)
-            )
+        canonical_storage_backend(self.storage_backend)  # refuses unknowns
         replacement = _DEPRECATED_STORAGE_BACKENDS.get(self.storage_backend)
         if replacement is not None:
             warnings.warn(

@@ -125,3 +125,49 @@ def test_an_adapter_refuses_persistent_by_its_new_name():
 
     with pytest.raises(ConfigurationError, match="storage_backend='persistent'"):
         _refuse_unwired_capture_storage(engine, "attach_model()", "SomeAdapter")
+
+
+def test_none_refuses_a_ring_enabled_after_construction():
+    """The constructor skipping the ring is not enough: the public
+    enable_ring_transport() would still allocate one and make it active."""
+    engine = MonitoringEngine(config=MonitoringConfig(storage_backend="none"))
+
+    with pytest.raises(RuntimeError, match="storage_backend='none' turns capture off"):
+        engine.enable_ring_transport(object())
+    assert engine._ring_transport is None
+
+
+# --- the old names reach the engine, not only the config ---------------------
+
+
+def test_the_engine_acts_on_native_as_in_memory():
+    with pytest.warns(DeprecationWarning):
+        config = MonitoringConfig(storage_backend="native")
+    with pytest.raises(ValueError, match="needs a host engine"):
+        MonitoringEngine(config=config, enable_ring_transport=False)
+
+
+def test_the_engine_acts_on_capture_as_persistent(tmp_path):
+    from dmi.storage.capture.native_sink import NativeSinkConfig
+
+    with pytest.warns(DeprecationWarning):
+        refused = MonitoringConfig(storage_backend="capture")
+    with pytest.raises(ValueError, match="does not use the C\\+\\+ ClickHouse host"):
+        MonitoringEngine(config=refused, model_id="m", host_engine=object(),
+                         enable_ring_transport=False)
+
+    with pytest.warns(DeprecationWarning):
+        config = MonitoringConfig(
+            storage_backend="capture",
+            capture_sink_config=NativeSinkConfig(spool_root=str(tmp_path)))
+    engine = MonitoringEngine(config=config, enable_ring_transport=False)
+    assert engine._storage_backend == "persistent"
+
+
+def test_a_duck_typed_config_with_an_old_name_is_still_checked():
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(storage_backend="native", capture_sink_config=None,
+                             capture_storage_config=None)
+    with pytest.raises(ValueError, match="needs a host engine"):
+        MonitoringEngine(config=config, enable_ring_transport=False)
