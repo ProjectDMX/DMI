@@ -101,6 +101,15 @@ class MonitoringConfig:
     # which is the documented rollback.
     capture_sink_config: Optional["NativeSinkConfig"] = None
 
+    # The rest of the native capture storage path, after the spool: set it
+    # and the engine runs an in-process C++ service that uploads every pack
+    # the sink stages to the object store and indexes it into the ClickHouse
+    # catalog, and ``flush_and_wait`` returns only once they are queryable.
+    # Unset, packs stay in the spool for something else to drain. Needs
+    # ``storage_backend="capture"`` and ``capture_sink_config``, whose spool
+    # it drains.
+    capture_storage_config: Optional["NativeCaptureStorageConfig"] = None
+
     storage_backend: StorageBackend = "auto"
 
     def __post_init__(self) -> None:
@@ -136,4 +145,12 @@ class MonitoringConfig:
                 f"{self.storage_backend!r}, under which it would be silently "
                 "ignored and nothing would be written. Set "
                 "storage_backend='capture', or drop capture_sink_config"
+            )
+        if self.capture_storage_config is not None and (
+            self.capture_sink_config is None
+        ):
+            raise ValueError(
+                "capture_storage_config drains the spool capture_sink_config "
+                "stages into; set storage_backend='capture' and "
+                "capture_sink_config=NativeSinkConfig(...) with it"
             )
