@@ -318,12 +318,12 @@ build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp c
 # PYTHON must point at the venv interpreter:
 #   make build/_dmi_native_sink... PYTHON=/path/to/venv/bin/python
 SINK_EXT := _dmi_native_sink$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))" 2>/dev/null)
-# C++20 for this target only, because ATen demands it and its floor MOVES:
-# torch 2.13 refuses below C++17, torch 2.14 below C++20, and the CI pin
-# `torch>=2.8,<3` resolves to whatever is newest on the day. C++20 satisfies
-# both, and our own sources here compile the same under either. Everything
-# else in this Makefile stays at C++17 -- this is the one target that links
-# against torch.
+# C++20 because ATen demands it and its floor MOVES: torch 2.13 refuses
+# below C++17, torch 2.14 below C++20, and the CI pin `torch>=2.8,<3`
+# resolves to whatever is newest on the day. C++20 is the floor for every
+# target that includes torch's headers -- this sink, the backend and host
+# objects (CXXFLAGS, HOST_CXXFLAGS) and the ring's nvcc compiles (NVCCFLAGS).
+# C++17 stays only on the torch-free drivers.
 build/_dmi_native_sink: csrc/sink/native_pack_sink.cpp csrc/sink/record_row.cpp csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/bindings_sink.cpp csrc/pack/pack_builder.cpp csrc/store/spool.cpp csrc/common/json.cpp
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++20 -O2 -fPIC -shared -DTORCH_EXTENSION_NAME=_dmi_native_sink \

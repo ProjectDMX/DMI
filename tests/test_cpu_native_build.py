@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -29,32 +30,52 @@ def test_host_build_plan_has_no_cuda_toolchain_or_libraries():
         assert forbidden not in output
 
 
-def _torch_compile_lines(target: str) -> list[str]:
-    """The compile commands a dry run of ``target`` would execute that pull in
-    torch's headers -- the ones carrying TORCH_EXTENSION_NAME."""
+def _torch_include_flags() -> set[str]:
+    """The ``-I`` flags that put torch's headers on a compile's search path."""
+    from torch.utils.cpp_extension import include_paths
+
+    flags = set()
+    for path in include_paths():
+        flags.add(f"-I{path}")
+        flags.add(f"-I{os.path.realpath(path)}")
+    return flags
+
+
+def _torch_compile_lines(makefile_dir: str, target: str) -> list[str]:
+    """The compiler commands a dry run of ``target`` would execute that pull
+    in torch's headers.
+
+    A command is selected by the torch include path on its command line, not
+    by a macro only some recipes define: nvcc's flags never set
+    TORCH_EXTENSION_NAME, so keying on it left every .cu compile unchecked.
+    The flag is matched as a whole token, so the CUDA resolver's stamp
+    record, which carries the same directories inside one quoted string, is
+    not mistaken for a compile.
+    """
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
         # PYTHON is the interpreter running this test: its torch is the one
         # the build would target, and the Makefile's default `python` need
         # not exist.
-        ["make", "-C", "native", "-B", "-n", target, f"PYTHON={sys.executable}"],
+        ["make", "-C", makefile_dir, "-B", "-n", target, f"PYTHON={sys.executable}"],
         cwd=root, capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
         pytest.skip(f"cannot plan `{target}` here: {result.stderr[-300:]}")
+    torch_flags = _torch_include_flags()
     return [line for line in result.stdout.splitlines()
-            if "-DTORCH_EXTENSION_NAME=" in line and " -c " in f" {line} "]
+            if torch_flags.intersection(line.split())]
 
 
-@pytest.mark.parametrize("target", [
+@pytest.mark.parametrize(("makefile_dir", "target"), [
     # host plans on any machine, so CI's cpu job checks it.
-    pytest.param("host", marks=pytest.mark.cpu),
+    pytest.param("native", "host", marks=pytest.mark.cpu, id="host"),
     # The full backend needs the CUDA toolchain even to be PLANNED, which a
     # cpu runner does not have. It is a gpu test, not a cpu test that skips:
     # the cpu gate rightly fails any skip that is not absent hardware.
-    pytest.param("all", marks=pytest.mark.gpu),
+    pytest.param("native", "all", marks=pytest.mark.gpu, id="all"),
 ])
-def test_every_torch_including_compile_requests_cxx20(target):
+def test_every_torch_including_compile_requests_cxx20(makefile_dir, target):
     """PyTorch's headers refuse anything older than C++20.
 
     ATen.h opens with ``#error C++20 or later compatible compiler is required``,
@@ -63,19 +84,20 @@ def test_every_torch_including_compile_requests_cxx20(target):
     -std=c++17, so a fresh install could not build either one -- and CI never
     noticed, because it only dry-runs `host` and the torch-free drivers never
     reach ATen. This pins the flag on the plan actually executed rather than on
-    the Makefile's text, so it holds however the flags are assembled.
+    the Makefile's text, so it holds however the flags are assembled, and it
+    covers g++ and nvcc compiles alike.
 
     Only ``host`` is marked cpu. Planning ``all`` resolves the CUDA toolkit and
     fails without one, so it runs under the gpu marker instead.
     """
-    lines = _torch_compile_lines(target)
+    lines = _torch_compile_lines(makefile_dir, target)
     assert lines, f"no torch-including compile found in the `{target}` plan"
     stale = [line for line in lines
              if not any(f"-std={std}" in line
                         for std in ("c++20", "c++23", "c++26", "gnu++20", "gnu++23"))]
     assert not stale, (
-        f"{len(stale)} torch-including compile(s) below C++20 in `{target}`:\n"
-        + stale[0][:300])
+        f"{len(stale)} of {len(lines)} torch-including compile(s) below C++20 "
+        f"in `{makefile_dir}` `{target}`:\n" + stale[0][:300])
 
 
 @pytest.mark.cpu
