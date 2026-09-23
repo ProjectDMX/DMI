@@ -1,0 +1,272 @@
+"""HF under ``storage_backend="capture"`` must fail loudly, never store nothing.
+
+Two reproductions from the capture-path audit, both of which "succeeded":
+
+* Link 6. The HF adapter drives legacy HookPoints. Under the capture config
+  those run on the engine's legacy ring, which has no host (the capture
+  backend refuses one), so its P2P thread drops every capture. Generation
+  returns normally and the catalog stays empty. Capture storage is not wired
+  to the HF adapter yet, so every HF entry point refuses the config instead.
+* Link 7. Once ``create_record_runtime`` has run, the engine's ring is a
+  record ring, and ``commit_step`` -> ``push_all_metas`` throws "legacy
+  metadata cannot be pushed to a record ring". ``generate_with_monitoring``
+  swallowed that in its prepare wrapper, so generation "succeeded" with
+  nothing captured, while ``generate_greedy_with_monitoring`` (which has no
+  wrapper) propagated it. The wrapper now re-raises in capture or record
+  mode and, on the legacy path where swallowing is deliberate, logs the
+  first failure at WARNING instead of passing silently.
+
+The forked ``HookedLlama`` classes live in the transformers submodule, which
+the CPU job does not install, so the model here is the smallest stand-in the
+adapter accepts: a real HookPoint, an HF-shaped config, and HF's
+``prepare_inputs_for_generation`` / ``generate`` protocol. The ring is a spy
+that behaves like the native engine it replaces.
+"""
+from __future__ import annotations
+
+import logging
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from dmi.adapters.base import BackendAdapter
+from dmi.adapters.huggingface.adapter import HuggingFaceAdapter
+from dmi.adapters.huggingface.generation import (
+    generate_greedy_with_monitoring,
+    generate_with_monitoring,
+)
+from dmi.configuration import DMIConfig, ObservationConfig
+from dmi.configuration.compiler import attach_config
+from dmi.configuration.errors import ConfigurationError
+from dmi.hooks.point import HookPoint
+from dmi.hooks.specs import HOOK_TYPE_RESID_PRE, HookSpec, ModelShapeConfig
+from dmi.transport.ring import RingTransport
+
+pytestmark = pytest.mark.cpu
+
+ADAPTER_LOGGER = "dmi.adapters.huggingface.adapter"
+RECORD_RING_ERROR = "legacy metadata cannot be pushed to a record ring"
+
+
+# ---------------------------------------------------------------------------
+# Test doubles
+# ---------------------------------------------------------------------------
+
+
+class _SpyRingEngine:
+    """The native RingEngine surface the legacy HF path touches.
+
+    ``record_ring=True`` behaves like a ring made by ``create_record``: the
+    legacy metadata push throws, exactly as ``RingEnginePy::push_step`` does.
+    ``prepare_step_error`` makes the reservation itself fail.
+    """
+
+    def __init__(self, *, record_ring=False, prepare_step_error=None):
+        self.record_ring = record_ring
+        self.prepare_step_error = prepare_step_error
+        self.prepare_step_calls: list = []
+        self.push_all_metas_calls = 0
+
+    def payload_tensor(self):
+        return torch.zeros(16, dtype=torch.uint8)
+
+    def payload_cap(self):
+        return 1 << 20
+
+    def staging_cap(self):
+        return 1 << 20
+
+    def prepare_step(self, total_bytes, num_hooks):
+        self.prepare_step_calls.append((total_bytes, num_hooks))
+        if self.prepare_step_error is not None:
+            raise self.prepare_step_error
+        return 0
+
+    def push_all_metas(self, *args):
+        self.push_all_metas_calls += 1
+        if self.record_ring:
+            raise RuntimeError(RECORD_RING_ERROR)
+
+
+class _SpyEngine:
+    """The MonitoringEngine attributes the HF adapter and entry points read."""
+
+    def __init__(self, storage_backend="auto", *, record_mode=False,
+                 ring_engine=None):
+        self._storage_backend = storage_backend
+        self._record_mode = record_mode
+        self._ring_engine = ring_engine or _SpyRingEngine(
+            record_ring=record_mode)
+        self._ring_transport = RingTransport(self._ring_engine)
+        self._model_id = "tiny"
+        self.config = None
+        self._group = 0
+
+    def next_auto_group_id(self):
+        self._group += 1
+        return self._group
+
+
+class _TinyHookedLM(torch.nn.Module):
+    """One real HookPoint behind HF's generation protocol."""
+
+    def __init__(self, engine):
+        super().__init__()
+        self.hook_resid_pre = HookPoint()
+        self.config = SimpleNamespace(
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            vocab_size=16,
+            intermediate_size=16,
+        )
+        self.monitoring_engine = engine
+        self.generate_calls = 0
+        self.forward_calls = 0
+
+    def get_hook_specs(self):
+        return [HookSpec(hook_type=HOOK_TYPE_RESID_PRE,
+                         module=self.hook_resid_pre, layer_no=0)]
+
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None,
+                                      **kwargs):
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    def forward(self, input_ids=None, **kwargs):
+        self.forward_calls += 1
+        raise AssertionError("a refused entry point must not run the model")
+
+    def generate(self, input_ids, attention_mask=None, max_new_tokens=2,
+                 **kwargs):
+        """HF's loop, reduced to what DMI hooks: one prepare call per step."""
+        self.generate_calls += 1
+        for _ in range(max_new_tokens):
+            self.prepare_inputs_for_generation(
+                input_ids, attention_mask=attention_mask)
+        return input_ids
+
+
+class _StubAdapter(BackendAdapter):
+    """A non-HF adapter: the refusal lives in the shared base attach."""
+
+    def detect_model_shape(self, model):
+        return ModelShapeConfig(
+            hidden_dim=8, num_heads=2, num_kv_heads=2, head_dim=4,
+            dtype=torch.float16, vocab_size=16, intermediate_dim=16)
+
+    def detect_parallel_ranks(self):
+        return (0, 0, 0, 0)
+
+    def is_pp_first(self):
+        return True
+
+    def is_pp_last(self):
+        return True
+
+    def build_step_context(self, *raw):
+        return None
+
+    def on_capacity_exceeded(self, ctx):
+        return None
+
+
+def _inputs():
+    input_ids = torch.tensor([[1, 2, 3]])
+    return input_ids, torch.ones_like(input_ids)
+
+
+def _assert_untouched(model, engine):
+    """A refusal happens before anything is armed, wrapped or reserved."""
+    assert model.hook_resid_pre._ring_hook_type is None
+    assert getattr(model, "_dmi_active_adapter", None) is None
+    assert getattr(model, "_monitoring_orig_prepare", None) is None
+    assert "prepare_inputs_for_generation" not in vars(model)
+    assert engine._ring_engine.prepare_step_calls == []
+    assert engine._ring_engine.push_all_metas_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Link 6: the capture config is refused at every HF entry point
+# ---------------------------------------------------------------------------
+
+
+def test_hf_attach_model_refuses_capture_storage():
+    engine = _SpyEngine("capture")
+    model = _TinyHookedLM(engine)
+
+    with pytest.raises(ConfigurationError,
+                       match="capture storage is not wired to "
+                             "HuggingFaceAdapter yet"):
+        HuggingFaceAdapter(engine, "tiny").attach_model(model)
+
+    _assert_untouched(model, engine)
+
+
+@pytest.mark.parametrize("via_attach_config", [False, True],
+                         ids=["attach_model", "attach_config"])
+def test_base_attach_model_refuses_capture_storage_for_any_adapter(
+        via_attach_config):
+    """The legacy HookPoint path is what every adapter's attach installs, so
+    the refusal is in the base class, not only in the HF override."""
+    engine = _SpyEngine("capture")
+    model = _TinyHookedLM(engine)
+    adapter = _StubAdapter(engine, "tiny")
+
+    with pytest.raises(ConfigurationError,
+                       match="capture storage is not wired to _StubAdapter"):
+        if via_attach_config:
+            attach_config(adapter, model, DMIConfig(
+                observations=ObservationConfig(hooks=["resid_pre"])))
+        else:
+            adapter.attach_model(model)
+
+    _assert_untouched(model, engine)
+
+
+def test_generate_with_monitoring_refuses_capture_storage():
+    engine = _SpyEngine("capture")
+    model = _TinyHookedLM(engine)
+    input_ids, attention_mask = _inputs()
+
+    with pytest.raises(ConfigurationError,
+                       match=r"generate_with_monitoring\(\).*capture storage "
+                             "is not wired"):
+        generate_with_monitoring(model, input_ids,
+                                 attention_mask=attention_mask)
+
+    assert model.generate_calls == 0
+    assert not hasattr(engine, "_hf_adaptor")
+    _assert_untouched(model, engine)
+
+
+def test_generate_greedy_with_monitoring_refuses_capture_storage():
+    engine = _SpyEngine("capture")
+    model = _TinyHookedLM(engine)
+    input_ids, attention_mask = _inputs()
+
+    with pytest.raises(ConfigurationError,
+                       match=r"generate_greedy_with_monitoring\(\).*capture "
+                             "storage is not wired"):
+        generate_greedy_with_monitoring(
+            model, input_ids, attention_mask,
+            max_new_tokens=2, monitoring=True)
+
+    assert model.forward_calls == 0
+    assert not hasattr(engine, "_hf_adaptor")
+    _assert_untouched(model, engine)
+
+
+@pytest.mark.parametrize("backend", ["auto", "native", "none"])
+def test_other_storage_backends_still_attach(backend):
+    """Only 'capture' is refused; the legacy backends are unchanged."""
+    engine = _SpyEngine(backend)
+    model = _TinyHookedLM(engine)
+    adapter = HuggingFaceAdapter(engine, "tiny")
+
+    adapter.attach_model(model)
+    try:
+        assert model.hook_resid_pre._ring_hook_type == HOOK_TYPE_RESID_PRE
+        assert model._dmi_active_adapter is adapter
+    finally:
+        adapter.detach_model(model)

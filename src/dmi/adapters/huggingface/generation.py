@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ...engine import effective_ring_bytes
+from ..base import _refuse_unwired_capture_storage
 from .adapter import (
     HuggingFaceAdapter,
     _prepare_profile_times,
@@ -108,8 +109,18 @@ def _generate_with_monitoring_impl(
     or its forward) AND static cache is used, this function strips the
     external compilation and injects an equivalent ``CompileConfig`` so
     HF compiles only the decode path (prefill stays uncompiled).
+
+    Raises ``ConfigurationError`` under ``storage_backend="capture"``, which
+    this adapter is not wired to yet.
     """
     import types
+
+    # Before Phase 1, which rewrites the model's compilation outside the
+    # try/finally that would restore it.
+    for _holder in (model, getattr(model, "_orig_mod", model)):
+        _refuse_unwired_capture_storage(
+            getattr(_holder, "monitoring_engine", None),
+            "generate_with_monitoring()", HuggingFaceAdapter.__name__)
 
     # ------------------------------------------------------------------
     # Phase 1: Strip external compilation when static cache is active.
@@ -524,7 +535,9 @@ def generate_greedy_with_monitoring(
             batches are only correct on the eager path
             (``cuda_graphs=False``).  Unpadded batches are unaffected.
         monitoring: if True, install ring transport hooks via HuggingFaceAdapter and
-            call before_forward_manual before each forward pass.
+            call before_forward_manual before each forward pass.  Refused
+            with ``ConfigurationError`` under ``storage_backend="capture"``,
+            which this adapter is not wired to yet.
         hook_selection: hook selection preset (e.g. "hidden-states", "full").
             Only used when monitoring=True.
         no_strip_left_pad: forwarded to ``HuggingFaceAdapter`` when monitoring=True.  If
@@ -569,6 +582,9 @@ def generate_greedy_with_monitoring(
                 "monitoring=False and let the existing attachment capture."
             )
         engine = getattr(model, "monitoring_engine", None)
+        _refuse_unwired_capture_storage(
+            engine, "generate_greedy_with_monitoring()",
+            HuggingFaceAdapter.__name__)
         if engine is not None and engine._ring_transport is not None:
             adaptor = HuggingFaceAdapter(
                 engine, engine._model_id,

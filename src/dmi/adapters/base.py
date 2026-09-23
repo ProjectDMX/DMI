@@ -51,6 +51,34 @@ if TYPE_CHECKING:
     from ..engine import MonitoringEngine
 
 
+def _refuse_unwired_capture_storage(
+    engine: object, entry_point: str, adapter_name: str
+) -> None:
+    """Refuse ``storage_backend="capture"`` at an adapter entry point.
+
+    Adapters drive legacy HookPoints, and nothing connects those to the
+    capture path yet. Under the capture config they run on the engine's
+    legacy ring, which has no host (the backend refuses one), so its P2P
+    thread drops every capture: generation "succeeds" and the catalog stays
+    empty. After ``create_record_runtime`` the same hooks meet a record ring,
+    which refuses their metadata. Neither stores what the config asked for,
+    so the refusal comes here, before anything is armed.
+    """
+    if getattr(engine, "_storage_backend", None) != "capture":
+        return
+    from ..configuration.errors import ConfigurationError
+
+    raise ConfigurationError(
+        f"{entry_point}: config.storage_backend='capture' selects the native "
+        f"capture storage path, but capture storage is not wired to "
+        f"{adapter_name} yet. Its hooks write to the legacy ring, which "
+        "under this config has no host and drops every capture, so "
+        "generation would succeed and store nothing. Capture records through "
+        "engine.create_record_runtime(...), or use storage_backend='native' "
+        "with a host engine for monitored generation."
+    )
+
+
 class StepPlan(NamedTuple):
     """Immutable, tuple-compatible reservation inputs for one model step."""
 
@@ -178,7 +206,13 @@ class BackendAdapter(abc.ABC):
         PP/TP filters.  Order matters: ``apply_hook_selection`` is what
         establishes the enabled/disabled state across every spec, and each
         later filter only ever disables further.
+
+        Raises ``ConfigurationError`` under ``storage_backend="capture"``,
+        which no adapter's hooks are wired to yet.
         """
+        _refuse_unwired_capture_storage(
+            self.engine, f"{type(self).__name__}.attach_model()",
+            type(self).__name__)
         if self.transport is None:
             raise RuntimeError(
                 "BackendAdapter.attach_model called before "
