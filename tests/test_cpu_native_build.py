@@ -74,6 +74,11 @@ def _torch_compile_lines(makefile_dir: str, target: str) -> list[str]:
     # cpu runner does not have. It is a gpu test, not a cpu test that skips:
     # the cpu gate rightly fails any skip that is not absent hardware.
     pytest.param("native", "all", marks=pytest.mark.gpu, id="all"),
+    # The ring test binaries that link torch compile against the same
+    # headers, from their own Makefile and its own CXX_STD default. They
+    # need the CUDA resolver to be planned, so they are gpu as well.
+    pytest.param("tests/native/ring", "all", marks=pytest.mark.gpu,
+                 id="ring-tests"),
 ])
 def test_every_torch_including_compile_requests_cxx20(makefile_dir, target):
     """PyTorch's headers refuse anything older than C++20.
