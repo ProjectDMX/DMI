@@ -143,10 +143,11 @@ jobs:
         # It runs HERE, in the cpu job, and not in the live job, because it
         # has to collect the WHOLE tree and only this job's environment can
         # import the whole tree: `make -C native cpu-goals` above builds
-        # CPU_ONLY_GOALS, which includes build/_dmi_native_sink, while the
-        # live job builds only the four conformance drivers and so hits a
-        # module-level skip in the two suites that import that .so. Doing the
-        # tree walk in the live job is precisely the regression this replaces.
+        # CPU_ONLY_GOALS, while the live job builds only what its suites
+        # drive; when this step was written that was the four conformance
+        # drivers, and the tree walk there hit a module-level skip in the two
+        # suites that import build/_dmi_native_sink. Doing the tree walk in
+        # the live job is precisely the regression this replaces.
         # This job already collects the same tree (`make check` -> `pytest -m
         # cpu`, no path), so the walk costs seconds and adds no new imports.
         #
@@ -323,6 +324,15 @@ jobs:
         # test_native_capture_storage_live.py drives in-process. It takes
         # only pybind11's headers from the torch this job installs and links
         # nothing from it.
+        #
+        # And _dmi_native_sink, the torch-facing NativePackSink the ring
+        # hands envelopes to. Every other suite here stages packs through
+        # the conformance_sink DRIVER, JSON and base64 in, so the real
+        # adapter never reached a catalog in CI;
+        # test_native_capture_chain_live.py drives it with torch CPU tensors
+        # through the service into ClickHouse and reads the bytes back. It
+        # links torch_cpu from the wheel this job installs (C++20, which the
+        # Makefile already passes for this one target).
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libcurl4-openssl-dev
@@ -332,13 +342,51 @@ jobs:
             build/conformance_sink \
             build/conformance_spool \
             build/_dmi_native_store \
+            build/_dmi_native_sink \
             CURL_INCDIR=/usr/include/x86_64-linux-gnu \
             CURL_LIBDIR=/usr/lib/x86_64-linux-gnu
+
+      - name: Start MinIO for the multipart capture case
+        # A real S3 implementation for the one case the in-repo fake cannot
+        # judge: a pack of 64 MiB or more goes up as a multipart upload, and
+        # the fake assembles parts of any size, where S3 refuses every part
+        # but the last under 5 MiB (EntityTooSmall at CompleteMultipartUpload).
+        # Verified locally with the minio binary from this image: with the
+        # client's part shrunk to 4 MiB, the fake-S3 case fails only on its
+        # own part-size assertion, and the MinIO case on exactly that error.
+        #
+        # A `docker run` step, not a `services:` entry: a service container
+        # takes no command, and this image does nothing without `server
+        # <dir>`. quay.io because the Docker Hub repository is gone; pinned
+        # by digest, the last release published as an image. Plain HTTP, on
+        # 9100 because ClickHouse holds 9000. B7a moves it to HTTPS with a CA
+        # generated at job start.
+        run: |
+          docker run -d --name minio -p 9100:9000 \
+            -e MINIO_ROOT_USER=dmi-ci-access \
+            -e MINIO_ROOT_PASSWORD=dmi-ci-secret-key \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+          for attempt in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9100/minio/health/live; then
+              echo "MinIO is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs minio
+          echo "MinIO did not become healthy" >&2
+          exit 1
 
       - name: Run the ClickHouse live suites
         env:
           DMI_CLICKHOUSE_HOST: 127.0.0.1
           DMI_CLICKHOUSE_PORT: "9000"
+          # Unset, the MinIO multipart case skips, and the gate below turns
+          # that skip into a failure: the variable is load-bearing.
+          DMI_MINIO_ENDPOINT: http://127.0.0.1:9100
+          DMI_MINIO_ACCESS_KEY: dmi-ci-access
+          DMI_MINIO_SECRET_KEY: dmi-ci-secret-key
         # `python -m pytest`, matching the Makefile. `not garage` drops the one
         # suite that also needs a Garage S3 endpoint; everything else under
         # these markers needs nothing but the server above.
@@ -354,7 +402,10 @@ jobs:
         # collection skip lands in the JUnit as `<skipped/>`, and the gate
         # below then fails the job -- correctly, by its own doctrine -- over
         # two files this suite does not even want. Measured in CI: `201
-        # collected, 2 skipped`.
+        # collected, 2 skipped`. (This job has since started building the
+        # sink, for the capture-chain suite, so those two import here now.
+        # The glob stays: the argument is about any module that imports an
+        # artifact this job does not build, not about those two.)
         #
         # So the RUN stays scoped to the files it needs to import. The hole
         # a glob leaves -- a `manual`/`clickhouse` test named outside the
