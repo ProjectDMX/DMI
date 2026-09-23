@@ -272,7 +272,7 @@ def test_v1_documents_the_capture_and_record_mode_refusals() -> None:
     document = (root / "docs" / "integration-api-v1.md").read_text()
 
     attach = _document_section(document, "#### `attach_model(")
-    assert 'storage_backend="capture"' in attach
+    assert 'storage_backend="persistent"' in attach
     assert "`dmi.configuration.ConfigurationError`" in attach
     for entry in ("generate_with_monitoring", "generate_greedy_with_monitoring"):
         assert f"`{entry}()`" in attach

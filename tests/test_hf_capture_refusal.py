@@ -1,4 +1,4 @@
-"""HF under ``storage_backend="capture"`` must fail loudly, never store nothing.
+"""HF under ``storage_backend="persistent"`` must fail loudly, never store nothing.
 
 Two reproductions from the capture-path audit, both of which "succeeded":
 
@@ -194,12 +194,12 @@ def _assert_untouched(model, engine):
 
 
 # ---------------------------------------------------------------------------
-# Link 6: the capture config is refused at every HF entry point
+# Link 6: the persistent config is refused at every HF entry point
 # ---------------------------------------------------------------------------
 
 
 def test_hf_attach_model_refuses_capture_storage():
-    engine = _SpyEngine("capture")
+    engine = _SpyEngine("persistent")
     model = _TinyHookedLM(engine)
 
     with pytest.raises(ConfigurationError,
@@ -216,7 +216,7 @@ def test_base_attach_model_refuses_capture_storage_for_any_adapter(
         via_attach_config):
     """The legacy HookPoint path is what every adapter's attach installs, so
     the refusal is in the base class, not only in the HF override."""
-    engine = _SpyEngine("capture")
+    engine = _SpyEngine("persistent")
     model = _TinyHookedLM(engine)
     adapter = _StubAdapter(engine, "tiny")
 
@@ -232,7 +232,7 @@ def test_base_attach_model_refuses_capture_storage_for_any_adapter(
 
 
 def test_generate_with_monitoring_refuses_capture_storage():
-    engine = _SpyEngine("capture")
+    engine = _SpyEngine("persistent")
     model = _TinyHookedLM(engine)
     input_ids, attention_mask = _inputs()
 
@@ -248,7 +248,7 @@ def test_generate_with_monitoring_refuses_capture_storage():
 
 
 def test_generate_greedy_with_monitoring_refuses_capture_storage():
-    engine = _SpyEngine("capture")
+    engine = _SpyEngine("persistent")
     model = _TinyHookedLM(engine)
     input_ids, attention_mask = _inputs()
 
@@ -264,9 +264,9 @@ def test_generate_greedy_with_monitoring_refuses_capture_storage():
     _assert_untouched(model, engine)
 
 
-@pytest.mark.parametrize("backend", ["auto", "native", "none"])
+@pytest.mark.parametrize("backend", ["auto", "in-memory"])
 def test_other_storage_backends_still_attach(backend):
-    """Only 'capture' is refused; the legacy backends are unchanged."""
+    """Only 'persistent' and 'none' are refused; the rest attach as before."""
     engine = _SpyEngine(backend)
     model = _TinyHookedLM(engine)
     adapter = HuggingFaceAdapter(engine, "tiny")
@@ -313,7 +313,7 @@ def test_capture_mode_failure_propagates_out_of_the_prepare_wrapper():
     model = _TinyHookedLM(engine)
     adapter = HuggingFaceAdapter(engine, "tiny")
     adapter.attach_model(model)
-    engine._storage_backend = "capture"
+    engine._storage_backend = "persistent"
     input_ids, attention_mask = _inputs()
 
     try:

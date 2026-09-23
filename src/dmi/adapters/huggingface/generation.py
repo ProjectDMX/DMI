@@ -110,8 +110,9 @@ def _generate_with_monitoring_impl(
     external compilation and injects an equivalent ``CompileConfig`` so
     HF compiles only the decode path (prefill stays uncompiled).
 
-    Raises ``ConfigurationError`` under ``storage_backend="capture"``, which
-    this adapter is not wired to yet.
+    Raises ``ConfigurationError`` under ``storage_backend="persistent"``,
+    which this adapter is not wired to yet, and under ``"none"``, which turns
+    capture off.
     """
     import types
 
@@ -536,8 +537,9 @@ def generate_greedy_with_monitoring(
             (``cuda_graphs=False``).  Unpadded batches are unaffected.
         monitoring: if True, install ring transport hooks via HuggingFaceAdapter and
             call before_forward_manual before each forward pass.  Refused
-            with ``ConfigurationError`` under ``storage_backend="capture"``,
-            which this adapter is not wired to yet.
+            with ``ConfigurationError`` under ``storage_backend="persistent"``,
+            which this adapter is not wired to yet, and under ``"none"``,
+            which turns capture off.
         hook_selection: hook selection preset (e.g. "hidden-states", "full").
             Only used when monitoring=True.
         no_strip_left_pad: forwarded to ``HuggingFaceAdapter`` when monitoring=True.  If

@@ -372,7 +372,7 @@ class HuggingFaceAdapter(BackendAdapter):
         """
         engine = self.engine
         if (getattr(engine, "_record_mode", False)
-                or getattr(engine, "_storage_backend", None) == "capture"):
+                or getattr(engine, "_storage_backend", None) == "persistent"):
             raise exc
         if self._warned_driver_failure:
             return

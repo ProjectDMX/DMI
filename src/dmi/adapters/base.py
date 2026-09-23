@@ -54,28 +54,40 @@ if TYPE_CHECKING:
 def _refuse_unwired_capture_storage(
     engine: object, entry_point: str, adapter_name: str
 ) -> None:
-    """Refuse ``storage_backend="capture"`` at an adapter entry point.
+    """Refuse a storage choice an adapter cannot serve, before anything arms.
 
-    Adapters drive legacy HookPoints, and nothing connects those to the
-    capture path yet. Under the capture config they run on the engine's
-    legacy ring, which has no host (the backend refuses one), so its P2P
-    thread drops every capture: generation "succeeds" and the catalog stays
-    empty. After ``create_record_runtime`` the same hooks meet a record ring,
-    which refuses their metadata. Neither stores what the config asked for,
-    so the refusal comes here, before anything is armed.
+    ``storage_backend="none"`` turns capture off, so the engine has no ring
+    and there is nothing to attach hooks to.
+
+    ``storage_backend="persistent"``: adapters drive legacy HookPoints, and
+    nothing connects those to the native capture storage path yet. Under
+    that config they run on the engine's legacy ring, which has no host (the
+    backend refuses one), so its P2P thread drops every capture: generation
+    "succeeds" and the catalog stays empty. After ``create_record_runtime``
+    the same hooks meet a record ring, which refuses their metadata. Neither
+    stores what the config asked for.
     """
-    if getattr(engine, "_storage_backend", None) != "capture":
+    backend = getattr(engine, "_storage_backend", None)
+    if backend not in ("persistent", "none"):
         return
     from ..configuration.errors import ConfigurationError
 
+    if backend == "none":
+        raise ConfigurationError(
+            f"{entry_point}: config.storage_backend='none' means capture is "
+            f"off, so the engine has no ring and {adapter_name} has nothing "
+            "to attach its hooks to. Pick 'in-memory' or 'persistent' to "
+            "capture, or run the model without a monitoring adapter."
+        )
     raise ConfigurationError(
-        f"{entry_point}: config.storage_backend='capture' selects the native "
-        f"capture storage path, but capture storage is not wired to "
-        f"{adapter_name} yet. Its hooks write to the legacy ring, which "
-        "under this config has no host and drops every capture, so "
-        "generation would succeed and store nothing. Capture records through "
-        "engine.create_record_runtime(...), or use storage_backend='native' "
-        "with a host engine for monitored generation."
+        f"{entry_point}: config.storage_backend='persistent' selects the "
+        f"native capture storage path, but capture storage is not wired to "
+        f"{adapter_name} yet. Its hooks write to the legacy ring, which under this config has "
+        "no host and drops every capture, so generation would succeed and "
+        "store nothing. Capture records through "
+        "engine.create_record_runtime(...), or use "
+        "storage_backend='in-memory' with a host engine for monitored "
+        "generation."
     )
 
 
@@ -207,8 +219,9 @@ class BackendAdapter(abc.ABC):
         establishes the enabled/disabled state across every spec, and each
         later filter only ever disables further.
 
-        Raises ``ConfigurationError`` under ``storage_backend="capture"``,
-        which no adapter's hooks are wired to yet.
+        Raises ``ConfigurationError`` under ``storage_backend="persistent"``,
+        which no adapter's hooks are wired to yet, and under ``"none"``, which
+        turns capture off.
         """
         _refuse_unwired_capture_storage(
             self.engine, f"{type(self).__name__}.attach_model()",

@@ -106,7 +106,7 @@ exclusive per record runtime:
 | ClickHouse role | the store itself | a rebuildable index over the packs |
 | ClickHouse footprint | one configured table (`offload` by default) | `{prefix}_*` (`dmi_*` by default) |
 | Selected by | `create_record_runtime(fmt)` with no `record_sink`, plus a `host_engine`/`db_config` on the engine | `create_record_runtime(fmt, record_sink=reference.native_sink)` |
-| Declared by | `MonitoringConfig(storage_backend="native")` | `MonitoringConfig(storage_backend="capture")` |
+| Declared by | `MonitoringConfig(storage_backend="in-memory")` (formerly `"native"`) | `MonitoringConfig(storage_backend="persistent")` (formerly `"capture"`) |
 | Status | production | explicitly reference-only; production sinks remain native-only |
 
 Both are `ring::RecordSink` implementations and the record engine takes exactly
@@ -128,7 +128,7 @@ ClickHouse insert pipeline started, connected and never fed.
 
 ```python
 engine = MonitoringEngine(
-    config=MonitoringConfig(storage_backend="capture"),
+    config=MonitoringConfig(storage_backend="persistent"),
     model_id="...",
     ring_config=ring_config,
 )                                    # a host_engine here is now refused
@@ -138,11 +138,12 @@ runtime = engine.create_record_runtime(
 )
 ```
 
-`"native"` is the mirror image: it requires a host engine and refuses an
-explicit sink. `"none"` is capture and transport with no persistence at all.
-The default is `"auto"`, which infers the backend from what was passed -- what
-every caller did before the field existed, so nothing that predates it
-changes.
+`"in-memory"` is the mirror image: it requires a host engine and refuses an
+explicit sink. `"none"` turns capture off entirely: no ring is allocated, and
+nothing that would capture can be attached. The default is `"auto"`, which
+infers the backend from what was passed -- what every caller did before the
+field existed, so nothing that predates it changes. The earlier names
+`"native"` and `"capture"` still work, with a `DeprecationWarning`.
 
 Their ClickHouse footprints are disjoint, so the two can share one server: the
 catalog's schema guard only ever names `{prefix}_*` objects, and `drop_schema`
