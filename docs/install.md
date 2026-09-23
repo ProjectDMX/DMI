@@ -15,8 +15,12 @@ system toolchains. On Debian/Ubuntu:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake git
+sudo apt-get install -y build-essential cmake git libcurl4-openssl-dev pkg-config
 ```
+
+`libcurl4-openssl-dev` is for the native capture storage path's extensions,
+which the default native build includes (step 5); `pkg-config` lets the build
+find it.
 
 Plus a complete CUDA toolkit whose major version matches the CUDA version used
 to build PyTorch (`torch.version.cuda`) and is supported by your driver. Install
@@ -210,6 +214,31 @@ and as the importable `src/dmi/_native_backend.<EXT_SUFFIX>.so`. Host exports
 prefer the full backend and fall back to `_host_backend`; ring exports always
 require the full backend.
 
+The same build also produces the two extensions of the native capture storage
+path (`storage_backend="capture"`), as `native/build/` copies and as the
+importable `src/dmi/_dmi_native_sink.<EXT_SUFFIX>.so` (the pack writer) and
+`src/dmi/_dmi_native_store.<EXT_SUFFIX>.so` (the storage service and reader).
+Their make target is `capture`, which needs no CUDA and can be built on its
+own; `build/_dmi_native_sink` and `build/_dmi_native_store` build one each.
+
+```bash
+make -C native capture -j          # the capture extensions only, no CUDA
+make -C native -j CAPTURE=0        # the full backend without them
+```
+
+They link libcurl. The build takes its directories from `pkg-config libcurl`
+when the `libcurl4-openssl-dev` package is installed. Without root, extract
+that package and point the build at it:
+
+```bash
+apt-get download libcurl4-openssl-dev
+dpkg-deb -x libcurl4-openssl-dev_*.deb "$HOME/curl-sysroot"
+make -C native -j CURL_SYSROOT="$HOME/curl-sysroot"
+```
+
+`CURL_INCDIR` and `CURL_LIBDIR` override both, for example
+`CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu`.
+
 Smoke check the package and host backend:
 
 ```bash
@@ -217,10 +246,11 @@ python -c "import dmi; print(dmi.__file__)"
 python -c "from dmi.api.v1 import DMXHostEngine; print(DMXHostEngine.__module__)"
 ```
 
-After a full build, smoke check the ring backend:
+After a full build, smoke check the ring backend and the capture extensions:
 
 ```bash
 python -c "from dmi.transport.native import RingConfig; print(RingConfig())"
+python -c "from dmi.transport import native; [print(native._load_named_extension(name).__file__) for name in ('_native_backend', '_dmi_native_sink', '_dmi_native_store')]"
 ```
 
 Run the dependency-free CPU gate without CUDA, ClickHouse, native artifacts,
@@ -261,6 +291,13 @@ checkout.
   used the active conda env.
 - **`ImportError` on `_host_backend`** — build with
   `make -C native host -j`; this target does not require CUDA or `nvcc`.
+- **`native/Makefile: cannot build against libcurl`** — install
+  `libcurl4-openssl-dev` (`libcurl-devel` on Fedora/RHEL), or pass
+  `CURL_SYSROOT`, or `CURL_INCDIR` and `CURL_LIBDIR`, as in step 5. To build
+  without the capture extensions, pass `CAPTURE=0`.
+- **`ImportError` on `_dmi_native_sink` or `_dmi_native_store`** — rebuild
+  with `make -C native capture -j`; `make -C native clean` removes them along
+  with the full backend.
 - **Linker errors against `libclickhouse-cpp-lib`** — rerun step 5 and confirm
   `third_party/clickhouse-cpp/build/clickhouse/` exists.
 - **`Connection refused` to ClickHouse** — check
