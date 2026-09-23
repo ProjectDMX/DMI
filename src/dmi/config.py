@@ -5,7 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import sys
 import warnings
-from typing import Literal, Optional, get_args
+from typing import TYPE_CHECKING, Literal, Optional, get_args
+
+if TYPE_CHECKING:
+    # For the string annotations on MonitoringConfig only. Importing them at
+    # runtime would make this dependency-free module load the storage
+    # packages; the engine imports them where it validates the values.
+    from .storage.capture.native_sink import NativeSinkConfig
+    from .storage.native_capture import NativeCaptureStorageConfig
 
 
 StorageBackend = Literal[
