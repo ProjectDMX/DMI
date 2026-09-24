@@ -367,6 +367,12 @@ Session make_session(const std::string& line) {
         static_cast<double>(field_int(line, "clickhouse_request_timeout_ms")) /
         1000.0;
   }
+  // Microseconds, for the sub-millisecond bound libcurl cannot express.
+  if (jc::HasKey(line, "clickhouse_request_timeout_us")) {
+    connection.timeouts.request_s =
+        static_cast<double>(field_int(line, "clickhouse_request_timeout_us")) /
+        1e6;
+  }
   if (jc::HasKey(line, "clickhouse_max_attempts")) {
     connection.max_attempts =
         static_cast<int>(field_int(line, "clickhouse_max_attempts"));
@@ -1061,8 +1067,10 @@ std::string respond(const std::string& line, Session* session) {
           static_cast<uint64_t>(field_int(line, "clock_skew_ns")));
       out = std::string(",\"admits\":") + (admits ? "1" : "0");
     } else if (op == "execute") {
+      int attempts = 0;
       out = rows_to_json(session->client->execute(
-          jc::FindString(line, "query")));
+          jc::FindString(line, "query"), {}, {}, &attempts));
+      out += ",\"attempts\":" + std::to_string(attempts);
     } else {
       return prefix + "false,\"what\":\"unknown op\"}";
     }

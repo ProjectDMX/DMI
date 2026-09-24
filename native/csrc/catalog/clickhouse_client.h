@@ -71,9 +71,15 @@ struct ClickHouseConnection {
   // headers, which the server reads as its `default` user.
   std::string user;
   std::string password;
-  // https always verifies the peer and its name; these add a private CA
-  // (CURLOPT_CAINFO / CURLOPT_CAPATH) to libcurl's default roots. Refused
-  // with http, where they would silently do nothing.
+  // https always verifies the peer and its name, against libcurl's built-in
+  // CA bundle and/or directory unless these name a private CA
+  // (CURLOPT_CAINFO / CURLOPT_CAPATH). Each REPLACES that option's built-in
+  // default rather than adding to it, so whether the system roots are still
+  // trusted depends on the libcurl build: one configured with both a bundle
+  // and a directory (Debian, Ubuntu) keeps the other; a bundle-only build
+  // (RHEL, Fedora) trusts only ca_file once it is set. To trust both, pass a
+  // bundle holding the system roots and the private CA. Refused with http,
+  // where they would silently do nothing.
   std::string ca_file;
   std::string ca_path;
   // A password over plain http must be opted into. Refused with https:
@@ -90,10 +96,11 @@ struct ClickHouseConnection {
 void validate(const ClickHouseConnection& connection);
 
 // Whether a statement only reads, judged by its first keyword: SELECT,
-// WITH, SHOW, DESCRIBE/DESC, EXISTS, CHECK. Anything else -- including a
-// statement that opens with a parenthesis or a comment -- counts as a
-// write, the safe default, since a write is never repeated once it may have
-// reached the server.
+// SHOW, DESCRIBE/DESC, EXISTS, CHECK, or WITH when the word INSERT appears
+// nowhere in the statement (ClickHouse reads `WITH ... INSERT INTO ...` as
+// an INSERT). Anything else -- including a statement that opens with a
+// parenthesis or a comment -- counts as a write, the safe default, since a
+// write is never repeated once it may have reached the server.
 bool is_read_statement(const std::string& statement);
 
 class ClickHouseClient {
@@ -117,19 +124,29 @@ class ClickHouseClient {
   //   * a transport error after connecting (reset, empty reply, short read)
   //     or a 5xx -- for reads only. A write that may have reached the
   //     server has an unknown outcome, and repeating it is the caller's
-  //     decision (the fenced publish quarantines instead).
+  //     decision (the fenced publish quarantines instead). ClickHouse
+  //     answers 500 for permanent errors too (a row limit, a denied grant),
+  //     so a 5xx that names a ClickHouse error (X-ClickHouse-Exception-Code,
+  //     or a "Code: N." body) is retried only for the few transient codes
+  //     listed in the .cpp; a 5xx naming none (a proxy's 502/503/504) is.
   // A timeout is never retried, so each attempt's bound is the whole
   // call's: at most max_attempts request timeouts plus the backoff, and a
   // single request timeout for anything that timed out. TLS failures (an
   // untrusted or misnamed certificate) and 4xx answers are not retried.
+  // Timeouts go to libcurl in whole milliseconds, rounded up, so a positive
+  // timeout below 1 ms bounds the request at 1 ms rather than not at all.
   //
   // Reads also carry wait_end_of_query=1, so the server buffers the result
   // and an exception part-way through it arrives as an error status rather
   // than as a 200 whose truncated body would parse as rows. A URL setting:
   // the statement bytes are unchanged.
+  //
+  // `attempts`, when given, receives the number of requests the statement
+  // took (1 without a retry); it is set only when execute() returns.
   std::vector<Row> execute(
       const std::string& query, const Params& params = {},
-      const std::map<std::string, std::string>& settings = {}) const;
+      const std::map<std::string, std::string>& settings = {},
+      int* attempts = nullptr) const;
 
  private:
   ClickHouseConnection connection_;

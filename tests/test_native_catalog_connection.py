@@ -8,10 +8,12 @@ ClickHouse that records every request (no server needed):
 * credentials travel as ``X-ClickHouse-User`` / ``X-ClickHouse-Key`` headers
   and never in the URL, and a password is refused over plain HTTP unless the
   caller opts in;
-* ``https`` always verifies the peer and its name, against the system roots
-  or a private CA given as a file or a hashed directory;
+* ``https`` always verifies the peer and its name, against libcurl's
+  built-in roots or a private CA given as a file or a hashed directory;
 * a statement that never reached the server (connection refused) is retried
-  whatever it is; a read is retried on a transport error or a 5xx; a write is
+  whatever it is; a read is retried on a transport error or a 5xx, unless the
+  5xx names a ClickHouse error a repeat cannot cure (ClickHouse answers 500
+  for a row limit or a denied grant too); a write is
   never retried once it may have reached the server, since its outcome is
   unknown; and a timeout is not retried at all, so one request timeout stays
   the bound it claims to be;
@@ -234,6 +236,9 @@ def test_a_read_waits_for_the_end_of_the_query_and_a_write_does_not(driver):
 @pytest.mark.parametrize("statement", [
     "SELECT 1", "  select 1", "\nWITH 1 AS x SELECT x", "SHOW TABLES",
     "DESCRIBE TABLE t", "EXISTS TABLE t", "CHECK GRANT SHOW TABLES ON t",
+    # INSERT is matched as a whole word: a name that merely contains it
+    # leaves a WITH statement a read.
+    "WITH 1 AS inserted SELECT inserted",
 ])
 def test_statements_that_only_read_are_classified_as_reads(driver, statement):
     with FakeClickHouse() as fake:
@@ -246,6 +251,10 @@ def test_statements_that_only_read_are_classified_as_reads(driver, statement):
     "INSERT INTO t SELECT 1", "CREATE TABLE t (x UInt8) ENGINE = Memory",
     "ALTER TABLE t DELETE WHERE 1", "DROP TABLE t", "TRUNCATE TABLE t",
     "SELECTED", "(SELECT 1)", "SYSTEM FLUSH LOGS",
+    # ClickHouse parses a WITH clause in front of an INSERT as the INSERT's:
+    # the first keyword alone would call this a read, and retry it.
+    "WITH 1 AS x INSERT INTO t SELECT x",
+    "with 1 as x\ninsert into t select x",
 ])
 def test_everything_else_is_treated_as_a_write(driver, statement):
     with FakeClickHouse() as fake:
@@ -285,12 +294,78 @@ def test_a_read_gives_up_after_its_attempts(driver):
     assert len(fake.requests) == 4
 
 
+TOO_MANY_ROWS = (b"Code: 158. DB::Exception: Limit for rows (controlled by "
+                 b"'max_rows_to_read' setting) exceeded, max rows: 10.00. "
+                 b"(TOO_MANY_ROWS) (version 25.12.2.54 (official build))\n")
+
+
+def test_a_read_that_failed_for_good_is_not_retried(driver):
+    """ClickHouse answers 500 for errors a repeat cannot cure -- a row limit,
+    a denied grant, throwIf -- and names the error in a response header. A
+    repeat would only run the query again (a row limit rescans up to it)."""
+    with FakeClickHouse(lambda r: (
+            500, TOO_MANY_ROWS, {"X-ClickHouse-Exception-Code": "158"})) as fake:
+        _opened(driver, clickhouse_port=fake.port,
+                clickhouse_user="catalog_reader", clickhouse_password=PASSWORD,
+                clickhouse_allow_insecure_http=True)
+        response = driver.execute(READ)
+    assert not response["ok"]
+    assert len(fake.requests) == 1
+    assert "500" in response["message"]
+    assert "TOO_MANY_ROWS" in response["message"], response
+    assert "attempts" not in response["message"], response
+    assert PASSWORD not in response["message"]
+
+
+def test_the_error_code_is_read_from_the_body_without_the_header(driver):
+    with FakeClickHouse(lambda r: (500, TOO_MANY_ROWS)) as fake:
+        _opened(driver, clickhouse_port=fake.port)
+        response = driver.execute(READ)
+    assert not response["ok"]
+    assert len(fake.requests) == 1
+    assert "TOO_MANY_ROWS" in response["message"], response
+
+
+@pytest.mark.parametrize("code, name", [
+    ("210", "NETWORK_ERROR"), ("202", "TOO_MANY_SIMULTANEOUS_QUERIES"),
+    ("999", "KEEPER_EXCEPTION"),
+])
+def test_a_read_that_failed_transiently_is_retried(driver, code, name):
+    answer = (500, f"Code: {code}. DB::Exception: x. ({name})".encode(),
+              {"X-ClickHouse-Exception-Code": code})
+    with FakeClickHouse(_failing(2, answer)) as fake:
+        _opened(driver, clickhouse_port=fake.port)
+        response = driver.execute(READ)
+    assert response["ok"], response
+    assert response["rows"] == [["1"]]
+    assert len(fake.requests) == 3
+
+
+def test_a_server_error_without_a_clickhouse_code_is_retried_for_a_read(driver):
+    """A 502/503/504 from a proxy or load balancer in front of ClickHouse
+    names no ClickHouse error, and is what a restart looks like from here."""
+    with FakeClickHouse(_failing(1, (503, b"<html>Service Unavailable</html>"))
+                        ) as fake:
+        _opened(driver, clickhouse_port=fake.port)
+        response = driver.execute(READ)
+    assert response["ok"], response
+    assert len(fake.requests) == 2
+
+
 def test_a_write_is_not_retried_after_a_server_error(driver):
     with FakeClickHouse(_failing(1, (503, b"overloaded"))) as fake:
         _opened(driver, clickhouse_port=fake.port)
         response = driver.execute(WRITE)
     assert not response["ok"]
     assert "503" in response["message"]
+    assert len(fake.requests) == 1
+    # Nor after a transient ClickHouse error: the write may have been applied.
+    with FakeClickHouse(_failing(1, (500, b"Code: 210. (NETWORK_ERROR)",
+                                     {"X-ClickHouse-Exception-Code": "210"}))
+                        ) as fake:
+        _opened(driver, clickhouse_port=fake.port)
+        response = driver.execute(WRITE)
+    assert not response["ok"]
     assert len(fake.requests) == 1
 
 
@@ -338,11 +413,36 @@ def test_a_timed_out_read_is_not_retried(driver):
     assert elapsed < 2.0, elapsed
 
 
+def test_a_sub_millisecond_timeout_still_bounds_the_request(driver):
+    """libcurl takes whole milliseconds, and 0 means its default -- no bound
+    at all for the whole request. A positive timeout below 1 ms rounds up."""
+    release = threading.Event()
+
+    def stall(request):
+        release.wait(5)
+        return (200, b"1\n")
+
+    with FakeClickHouse(stall) as fake:
+        _opened(driver, clickhouse_port=fake.port,
+                clickhouse_request_timeout_us=400)
+        started = time.monotonic()
+        response = driver.execute(READ)
+        elapsed = time.monotonic() - started
+        release.set()
+    assert not response["ok"], response
+    assert "timeout" in response["message"].lower() or \
+        "timed out" in response["message"].lower(), response
+    assert elapsed < 2.0, elapsed
+
+
 def test_a_refused_connection_is_retried_even_for_a_write(driver):
     """Nothing reached the server, so even a write is safe to send again.
 
     The port refuses the first attempt and starts listening while the client
-    backs off: the write lands exactly once, on a later attempt.
+    backs off: the write lands exactly once, on a later attempt. The driver
+    reports how many attempts the statement took, so a first attempt that
+    happened to land after listen() fails the test instead of passing it
+    without a retry.
     """
     port_holder = socket.socket()
     port_holder.bind(("127.0.0.1", 0))  # bound, not listening: refused
@@ -352,7 +452,8 @@ def test_a_refused_connection_is_retried_even_for_a_write(driver):
     received = []
 
     def serve():
-        time.sleep(0.05)
+        # Past the first attempt, well inside the 100+200+400+800 ms backoff.
+        time.sleep(0.15)
         port_holder.listen(1)
         conn, _ = port_holder.accept()
         with conn:
@@ -375,6 +476,7 @@ def test_a_refused_connection_is_retried_even_for_a_write(driver):
     server.join(timeout=10)
     port_holder.close()
     assert response["ok"], response
+    assert response["attempts"] >= 2, response
     assert received == [WRITE.encode()]
 
 

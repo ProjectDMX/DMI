@@ -24,7 +24,7 @@ import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 _CA_CONFIG = """\
 [req]
@@ -126,9 +126,13 @@ class Request:
     body: bytes
 
 
-# A responder returns (status, body), or None to close the connection
-# without answering (the client sees an empty reply: a transport error).
-Responder = Callable[[Request], Optional[tuple[int, bytes]]]
+# A responder returns (status, body) or (status, body, headers) -- headers a
+# dict of extra response headers, such as the X-ClickHouse-Exception-Code a
+# real server sends with an error -- or None to close the connection without
+# answering (the client sees an empty reply: a transport error).
+Responder = Callable[
+    [Request],
+    Optional[Union[tuple[int, bytes], tuple[int, bytes, dict[str, str]]]]]
 
 
 class FakeClickHouse:
@@ -164,8 +168,10 @@ class FakeClickHouse:
                     except OSError:
                         pass
                     return
-                status, body = answer
+                status, body, *extra = answer
                 self.send_response(status)
+                for name, value in (extra[0] if extra else {}).items():
+                    self.send_header(name, value)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)

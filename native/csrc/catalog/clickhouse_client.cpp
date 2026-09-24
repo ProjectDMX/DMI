@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <thread>
@@ -17,6 +19,93 @@ namespace {
 size_t write_body(char* ptr, size_t size, size_t nmemb, void* userp) {
   static_cast<std::string*>(userp)->append(ptr, size * nmemb);
   return size * nmemb;
+}
+
+// Leading decimal digits of `text` from `at`, as long as they fit an int;
+// -1 when there are none.
+int leading_int(const std::string& text, size_t at) {
+  int value = -1;
+  while (at < text.size() && text[at] >= '0' && text[at] <= '9') {
+    const int digit = text[at] - '0';
+    if (value > (INT_MAX - digit) / 10) return -1;
+    value = (value < 0 ? 0 : value * 10) + digit;
+    ++at;
+  }
+  return value;
+}
+
+// Keeps the X-ClickHouse-Exception-Code of the LAST response: libcurl hands
+// the header callback every response's headers, a 100 Continue's included,
+// and each status line starts a new response.
+size_t read_header(char* ptr, size_t size, size_t nmemb, void* userp) {
+  const size_t length = size * nmemb;
+  const std::string line(ptr, length);
+  int* code = static_cast<int*>(userp);
+  static const std::string name = "x-clickhouse-exception-code:";
+  if (line.compare(0, 5, "HTTP/") == 0) {
+    *code = -1;
+  } else if (line.size() > name.size() &&
+             std::equal(name.begin(), name.end(), line.begin(),
+                        [](char a, char b) {
+                          return a == std::tolower(static_cast<unsigned char>(b));
+                        })) {
+    size_t at = name.size();
+    while (at < line.size() && (line[at] == ' ' || line[at] == '\t')) ++at;
+    *code = leading_int(line, at);
+  }
+  return length;
+}
+
+// A ClickHouse error body starts "Code: <n>. DB::Exception: ...": the
+// fallback when no X-ClickHouse-Exception-Code header came with it.
+int body_exception_code(const std::string& body) {
+  static const std::string prefix = "Code: ";
+  if (body.compare(0, prefix.size(), prefix) != 0) return -1;
+  const int code = leading_int(body, prefix.size());
+  size_t end = prefix.size();
+  while (end < body.size() && body[end] >= '0' && body[end] <= '9') ++end;
+  return end < body.size() && body[end] == '.' ? code : -1;
+}
+
+// The ClickHouse errors (src/Common/ErrorCodes.cpp; the names checked with
+// errorCodeToName on 25.12) that a repeat of a READ can plausibly cure: the
+// server, or something it depends on, was briefly unable to answer. Every
+// other code arriving with a 5xx names a failure of the statement itself --
+// TOO_MANY_ROWS (158), ACCESS_DENIED (497), READONLY (164),
+// FUNCTION_THROW_IF_VALUE_IS_NON_ZERO (395), ILLEGAL_TYPE_OF_ARGUMENT (43)
+// all come back as 500 -- and a repeat would only run it again.
+//
+// Deliberately absent: TIMEOUT_EXCEEDED (159), since timeouts are never
+// retried (see execute()); MEMORY_LIMIT_EXCEEDED (241), which is as often the
+// query's own max_memory_usage as a busy server, and repeating it adds to the
+// pressure; QUERY_WAS_CANCELLED (394), which is usually a KILL QUERY; and the
+// write-side codes (TABLE_IS_READ_ONLY 242, TOO_MANY_PARTS 252), since a
+// write is never retried once it reached the server anyway.
+bool transient_clickhouse_error(int code) {
+  switch (code) {
+    case 3:     // UNEXPECTED_END_OF_FILE
+    case 202:   // TOO_MANY_SIMULTANEOUS_QUERIES
+    case 209:   // SOCKET_TIMEOUT (the server's own socket, not this request)
+    case 210:   // NETWORK_ERROR
+    case 236:   // ABORTED
+    case 279:   // ALL_CONNECTION_TRIES_FAILED
+    case 425:   // SYSTEM_ERROR
+    case 999:   // KEEPER_EXCEPTION (select_sequential_consistency asks Keeper)
+    case 1000:  // POCO_EXCEPTION
+      return true;
+    default:
+      return false;
+  }
+}
+
+// libcurl takes whole milliseconds, and 0 means "its default" -- no bound at
+// all for the whole request. A positive timeout therefore rounds UP, so one
+// below a millisecond still bounds the request (at 1 ms); validate() has
+// already refused anything that is not positive.
+long timeout_ms(double seconds) {
+  const double ms = std::ceil(seconds * 1000.0);
+  if (!(ms < static_cast<double>(LONG_MAX))) return LONG_MAX;
+  return std::max(1L, static_cast<long>(ms));
 }
 
 std::string url_encode(const std::string& value) {
@@ -88,6 +177,7 @@ bool transient_transport(CURLcode code) {
 struct Attempt {
   CURLcode code = CURLE_OK;
   long status = 0;
+  int exception_code = -1;  // X-ClickHouse-Exception-Code; -1: none sent
   std::string body;
   std::string detail;  // libcurl's error buffer: says WHICH certificate check
 };
@@ -183,9 +273,27 @@ bool is_read_statement(const std::string& statement) {
         std::toupper(static_cast<unsigned char>(statement[at]))));
     ++at;
   }
-  return keyword == "SELECT" || keyword == "WITH" || keyword == "SHOW" ||
-         keyword == "DESCRIBE" || keyword == "DESC" || keyword == "EXISTS" ||
-         keyword == "CHECK";
+  if (keyword == "WITH") {
+    // ClickHouse parses `WITH 1 AS x INSERT INTO t SELECT x` as an INSERT
+    // whose WITH clause comes first, so a WITH statement is a read only if
+    // INSERT appears nowhere in it as a word. Conservative on purpose: an
+    // INSERT inside a string literal or a quoted name also makes it a
+    // write, and a read misjudged as a write only loses its retries.
+    std::string word;
+    for (size_t i = at; i <= statement.size(); ++i) {
+      const unsigned char c =
+          i < statement.size() ? static_cast<unsigned char>(statement[i]) : 0;
+      if (std::isalnum(c) || c == '_') {
+        word.push_back(static_cast<char>(std::toupper(c)));
+        continue;
+      }
+      if (word == "INSERT") return false;
+      word.clear();
+    }
+    return true;
+  }
+  return keyword == "SELECT" || keyword == "SHOW" || keyword == "DESCRIBE" ||
+         keyword == "DESC" || keyword == "EXISTS" || keyword == "CHECK";
 }
 
 std::string substitute(const std::string& query, const Params& params) {
@@ -291,7 +399,7 @@ ClickHouseClient::~ClickHouseClient() = default;
 
 std::vector<Row> ClickHouseClient::execute(
     const std::string& query, const Params& params,
-    const std::map<std::string, std::string>& settings) const {
+    const std::map<std::string, std::string>& settings, int* attempts) const {
   const std::string statement = substitute(query, params);
   const bool read = is_read_statement(statement);
 
@@ -308,9 +416,13 @@ std::vector<Row> ClickHouseClient::execute(
   url.pop_back();
 
   // Credentials as headers: ClickHouse reads X-ClickHouse-User/-Key, and
-  // unlike URL parameters or userinfo they do not end up in access logs,
-  // proxies or the error text below. libcurl follows no redirect (no
-  // CURLOPT_FOLLOWLOCATION), so they go to this host and nowhere else.
+  // unlike URL parameters or userinfo they do not end up in access logs or
+  // the error text below. libcurl follows no redirect (no
+  // CURLOPT_FOLLOWLOCATION), so no other server is sent them -- but libcurl
+  // does honor the http_proxy/https_proxy/all_proxy/no_proxy environment.
+  // Over https a proxy only sees the CONNECT, which carries none of these
+  // headers; over plain http (allow_insecure_http) a configured proxy
+  // receives the whole request, credentials included.
   Headers headers;
   if (!connection_.user.empty()) {
     append_header(&headers, "X-ClickHouse-User: " + connection_.user);
@@ -340,6 +452,8 @@ std::vector<Row> ClickHouseClient::execute(
                      static_cast<curl_off_t>(statement.size()));
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &attempt.body);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, read_header);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &attempt.exception_code);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
     if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
     if (connection_.scheme == "https") {
@@ -357,9 +471,9 @@ std::vector<Row> ClickHouseClient::execute(
     // NOSIGNAL: timeouts must not use SIGALRM in a multi-threaded process.
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
-                     static_cast<long>(connection_.timeouts.connect_s * 1000));
+                     timeout_ms(connection_.timeouts.connect_s));
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
-                     static_cast<long>(connection_.timeouts.request_s * 1000));
+                     timeout_ms(connection_.timeouts.request_s));
     attempt.code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &attempt.status);
     curl_easy_cleanup(curl);
@@ -370,6 +484,7 @@ std::vector<Row> ClickHouseClient::execute(
   for (int number = 1;; ++number) {
     const Attempt attempt = perform();
     if (attempt.code == CURLE_OK && attempt.status == 200) {
+      if (attempts != nullptr) *attempts = number;
       return parse_tsv(attempt.body);
     }
     std::string error;
@@ -382,7 +497,14 @@ std::vector<Row> ClickHouseClient::execute(
     } else {
       error = "clickhouse " + std::to_string(attempt.status) + ": " +
               attempt.body.substr(0, 4096);
-      retry = read && attempt.status >= 500 && attempt.status < 600;
+      // A 5xx that names a ClickHouse error is retried only when that error
+      // is transient; one that names none came from something in front of
+      // the server (a proxy's 502/503/504) or from a server too broken to
+      // say, and is retried as before. Reads only, either way.
+      int code = attempt.exception_code;
+      if (code < 0) code = body_exception_code(attempt.body);
+      retry = read && attempt.status >= 500 && attempt.status < 600 &&
+              (code < 0 || transient_clickhouse_error(code));
     }
     if (!retry || number >= connection_.max_attempts) {
       if (number > 1) {
