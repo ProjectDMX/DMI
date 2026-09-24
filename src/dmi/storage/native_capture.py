@@ -29,7 +29,7 @@ import math
 import os
 import socket
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, Optional, Sequence
 
 
@@ -114,6 +114,29 @@ class NativeSinkConfig:
                 f"got {self.overload!r}")
         if self.admission_timeout_s is not None:
             _positive("admission_timeout_s", self.admission_timeout_s, float)
+
+
+def _native_sink_config_setstate(self: NativeSinkConfig, state: Any) -> None:
+    # A frozen slots dataclass pickles its field values as a list, and the
+    # generated __setstate__ zips them with the current fields, leaving any
+    # the pickle predates unset. A config pickled before the admission
+    # fields existed (the old class, at the path that now re-exports this
+    # one) gets their defaults instead.
+    names = fields(NativeSinkConfig)
+    if len(state) > len(names):
+        raise TypeError(
+            f"NativeSinkConfig state has {len(state)} values, expected at "
+            f"most {len(names)}")
+    for item, value in zip(names, state):
+        object.__setattr__(self, item.name, value)
+    for item in names[len(state):]:
+        if item.default is MISSING:
+            raise TypeError(
+                f"NativeSinkConfig state is missing {item.name!r}")
+        object.__setattr__(self, item.name, item.default)
+
+
+NativeSinkConfig.__setstate__ = _native_sink_config_setstate  # type: ignore[method-assign]
 
 
 def _positive(name: str, value: Any, kind: type) -> None:

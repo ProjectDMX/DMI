@@ -105,6 +105,39 @@ def test_the_config_type_does_not_load_the_backup_capture_package():
     assert result.stdout.strip() == "[]", result.stdout
 
 
+# A NativeSinkConfig pickled before the move and the admission fields: the
+# old class at the old path (whose name now re-exports the new class), with
+# spool_root="/spool/old" and max_queue_bytes=32 MiB, protocol 2. Its state
+# is the eight fields the old class had.
+_OLD_FORMAT_PICKLE = (
+    b"\x80\x02cdmi.storage.capture.native_sink\nNativeSinkConfig\nq\x00)"
+    b"\x81q\x01]q\x02(X\n\x00\x00\x00/spool/oldq\x03\x8a\x06\x00\x00\x00"
+    b"\x00\x00\x01K\x01M\x00\x01J\x00\x00\x00\x02J\x00\x00\x00\x08M\x10'J"
+    b"\x00\xca\x9a;eb.")
+
+
+def test_an_old_format_pickle_loads_with_the_new_defaults():
+    import pickle
+
+    from dmi.storage.native_capture import NativeSinkConfig
+
+    config = pickle.loads(_OLD_FORMAT_PICKLE)
+    assert type(config) is NativeSinkConfig
+    assert config == NativeSinkConfig(spool_root="/spool/old",
+                                      max_queue_bytes=32 * MiB)
+    assert (config.overload, config.admission_timeout_s) == ("block", 2.0)
+
+
+def test_a_new_pickle_round_trips(tmp_path):
+    import pickle
+
+    from dmi.storage.native_capture import NativeSinkConfig
+
+    config = NativeSinkConfig(spool_root=str(tmp_path),
+                              overload="drop_newest")
+    assert pickle.loads(pickle.dumps(config)) == config
+
+
 # --- the native binding ------------------------------------------------------
 
 
