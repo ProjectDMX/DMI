@@ -372,23 +372,29 @@ jobs:
         # client's part shrunk to 4 MiB, the fake-S3 case fails only on its
         # own part-size assertion, and the MinIO case on exactly that error.
         #
-        # A `docker run` step, not a `services:` entry: a service container
-        # takes no command, and this image does nothing without `server
-        # <dir>`. quay.io because the Docker Hub repository is gone; pinned
-        # by tag and digest, so a retag upstream cannot change what this
-        # job tests against. Plain HTTP, on 9100 because ClickHouse holds
-        # 9000. B7a moves it to HTTPS with a CA generated at job start.
+        # Bitnami's archived MinIO build. The MinIO project no longer
+        # publishes public images: quay.io/minio/minio and docker.io/
+        # minio/minio both answer anonymous pulls with 401 (seen 2026-09-24,
+        # after this job had pulled the quay image fine). bitnamilegacy is a
+        # frozen archive, which suits a test fixture -- the S3 multipart
+        # rules it checks do not change -- and it is pinned by tag and
+        # digest, so nothing upstream can change what this job tests
+        # against. If it too disappears, Garage is the fallback. The image
+        # starts its own server from MINIO_ROOT_USER/_PASSWORD, so this is a
+        # `docker run` step only for the port map and the logs on failure.
+        # Plain HTTP, on 9100 because ClickHouse holds 9000. B7a moves it to
+        # HTTPS with a CA generated at job start.
         #
         # Each health probe is capped at 2 s: a socket that accepts and never
-        # answers would otherwise hold one curl until the job timeout, and
-        # the loop's 30 attempts would never get past the first.
+        # answers would otherwise hold one curl until the job timeout. The
+        # Bitnami entrypoint runs its setup before the server listens, so the
+        # loop allows about two minutes.
         run: |
           docker run -d --name minio -p 9100:9000 \
             -e MINIO_ROOT_USER=dmi-ci-access \
             -e MINIO_ROOT_PASSWORD=dmi-ci-secret-key \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
-            server /data
-          for attempt in $(seq 1 30); do
+            docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
+          for attempt in $(seq 1 60); do
             if curl -sf --max-time 2 http://127.0.0.1:9100/minio/health/live; then
               echo "MinIO is up"
               exit 0
@@ -673,7 +679,10 @@ jobs:
             "tests/test_native_adapter_torch.py::test_the_sink_derives_from_the_engines_record_sink" \
             > sink-test.out || { cat sink-test.out; exit 1; }
           cat sink-test.out
-          grep -Eq '^1 passed in ' sink-test.out
+          # "1 passed in ..." or "1 passed, N warnings in ..." -- a warning
+          # (torch's NumPy one appears here) is not a failure; a skip is.
+          grep -Eq '^1 passed(,| in )' sink-test.out
+          ! grep -Eq '[0-9]+ skipped' sink-test.out
 
       - name: Build the ring tests and run the host-only ones
         # All six binaries are compiled, so a .cu test that no longer builds
