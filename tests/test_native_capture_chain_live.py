@@ -15,14 +15,14 @@ NativeCaptureReader reads them back; the payload bytes must equal the tensors
 that went in. No CUDA, no ring engine, no conformance driver, no Python on
 the data path.
 
-The object store is the in-repo signature-verifying fake S3, and, when
-DMI_MINIO_ENDPOINT names one, a real MinIO as well. The multipart case needs
-both: a pack of 64 MiB or more crosses the client's multipart threshold, and
-the fake S3 enforces NOTHING about part sizes -- it accepts a part of any
-length, takes the part list on trust, and never checks the ETags in the
-completion body -- so against it the test checks the parts the client sent
-itself. MinIO holds the client to S3's rules: every part but the last is at
-least 5 MiB, or CompleteMultipartUpload fails with EntityTooSmall.
+The object store is the in-repo signature-verifying fake S3. For the
+multipart case -- a pack of 64 MiB or more crosses the client's multipart
+threshold -- note that the fake enforces NOTHING about part sizes: it accepts
+a part of any length, takes the part list on trust, and never checks the
+ETags in the completion body. So the test checks the parts the client sent
+itself against S3's rule: every part but the last is at least 5 MiB, or a
+real store refuses CompleteMultipartUpload with EntityTooSmall. The real
+object store DMI runs against, Garage, is exercised by the Garage suites.
 
 Build: make -C native build/_dmi_native_sink build/_dmi_native_store \\
            PYTHON=<venv>/bin/python
@@ -71,9 +71,6 @@ CLICKHOUSE_HOST = environ.get("DMI_CLICKHOUSE_HOST", "127.0.0.1")
 CLICKHOUSE_HTTP_PORT = int(environ.get("DMI_CLICKHOUSE_HTTP_PORT", "8123"))
 DATABASE = environ.get("DMI_CLICKHOUSE_DATABASE", "default")
 
-MINIO_ENDPOINT = environ.get("DMI_MINIO_ENDPOINT", "")
-MINIO_ACCESS = environ.get("DMI_MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET = environ.get("DMI_MINIO_SECRET_KEY", "minioadmin")
 
 LAYOUT = "capture_pack_reference_v1"
 # at::ScalarType numeric values (c10/core/ScalarType.h -- stable ABI).
@@ -376,56 +373,3 @@ def test_a_multipart_pack_through_the_fake_s3(fake_s3, tmp_path):
     assert all(size >= S3_MIN_PART for size in parts[:-1]), parts
     assert STATE.objects[key]["etag"].endswith('-multipart"')
     _assert_read_back_exactly(captures, envelopes)
-
-
-@contextmanager
-def _minio_bucket():
-    """A fresh bucket on the MinIO endpoint, emptied and removed afterwards."""
-    import botocore.session
-
-    client = botocore.session.get_session().create_client(
-        "s3", endpoint_url=MINIO_ENDPOINT, region_name=REGION,
-        aws_access_key_id=MINIO_ACCESS, aws_secret_access_key=MINIO_SECRET)
-    bucket = f"dmi-chain-{uuid.uuid4().hex[:16]}"
-    client.create_bucket(Bucket=bucket)
-    try:
-        yield client, bucket
-    finally:
-        for page in client.get_paginator("list_objects_v2").paginate(
-                Bucket=bucket):
-            for item in page.get("Contents", []):
-                client.delete_object(Bucket=bucket, Key=item["Key"])
-        for upload in client.list_multipart_uploads(Bucket=bucket).get(
-                "Uploads", []):
-            client.abort_multipart_upload(
-                Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"])
-        client.delete_bucket(Bucket=bucket)
-
-
-# A skip allowed ONLY for the endpoint being unset: CI's live job starts a
-# MinIO and sets it, and that job's gate fails any skip, so a lost variable
-# there is a red job rather than a silent gap.
-@pytest.mark.skipif(
-    not MINIO_ENDPOINT,
-    reason="DMI_MINIO_ENDPOINT is unset; the live CI job starts MinIO and "
-    "sets it")
-def test_a_multipart_pack_through_minio(tmp_path):
-    envelopes = _large_envelopes(LARGE_COUNT, LARGE_ELEMENTS)
-    with _minio_bucket() as (client, bucket), _catalog() as prefix:
-        config = _storage_config(MINIO_ENDPOINT, bucket, MINIO_ACCESS,
-                                 MINIO_SECRET, prefix)
-        sink_snapshot, snapshot, captures = _run_chain(
-            config, tmp_path / "spool", envelopes, sink_overrides=LARGE_SINK)
-
-        assert sink_snapshot["persisted_records"] == LARGE_COUNT, sink_snapshot
-        assert snapshot["uploaded_packs"] == 1, snapshot
-        assert snapshot["indexed_rows"] == LARGE_COUNT, snapshot
-        key, object_bytes = _one_large_pack(captures, LARGE_COUNT)
-
-        # A multipart object's ETag is "<md5 of part md5s>-<part count>": the
-        # pack really went up in parts, and MinIO accepted every one of them.
-        head = client.head_object(Bucket=bucket, Key=key)
-        assert head["ContentLength"] == object_bytes
-        parts = math.ceil(object_bytes / MULTIPART_CHUNK)
-        assert head["ETag"].strip('"').endswith(f"-{parts}"), head["ETag"]
-        _assert_read_back_exactly(captures, envelopes)
