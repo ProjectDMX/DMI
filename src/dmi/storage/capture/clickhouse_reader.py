@@ -34,11 +34,17 @@ it neither forces a merge nor involves two packs.
 
 Rows describing one capture in DIFFERENT packs survive side by side, and the
 ``argMax`` projection grouped on capture identity picks between them:
-newest-wins. A reader pinned before the second pack was committed never sees
-its rows at all, because the membership clause excludes that pack, so the pin
-still resolves to the pack it was taken over. Two packs indexed in one batch
-share an ``index_version``, so version alone does not order those rows; what
-does is described at :meth:`ClickHouseCaptureCatalog._projection`.
+newest-wins, where "newest" is the version at which each pack's publish
+reached the watermark -- read from the manifest, at or below the pin -- and
+never the version a descriptor row happens to carry. A reader pinned before
+the second pack was committed never sees its rows at all, because the
+membership clause excludes that pack. And a pass that re-indexes a pack which
+is already a member rewrites its rows at a HIGHER version without changing
+when that pack was published, so the pin still resolves to the pack it was
+taken over; :meth:`ClickHouseCaptureCatalog._snapshot` has the routes that
+do that. Two packs published in one batch share a version, so version alone
+does not order their rows; what does is described at
+:meth:`ClickHouseCaptureCatalog._projection`.
 
 The identity rule
 -----------------
@@ -91,11 +97,12 @@ from .clickhouse_catalog import ClickHouseCatalogConfig
 from .clickhouse_schema import CAPTURE_COLUMNS
 from .clickhouse_sql import (
     DECIDING_READ,
+    MEMBER_VERSION,
     ClickHouseClient,
     identifier,
     inline_chunks,
     inline_text_bytes,
-    membership_predicate,
+    member_versions,
     quoted,
 )
 from .cursor import CursorKey, decode_cursor, encode_cursor
@@ -142,7 +149,7 @@ _EQUALITY_FILTERS = ("tenant_id", "experiment_id", "run_id", "session_id", "mode
 # The ordering argument the projection's argMax resolves on. It is a tuple, not
 # ``index_version``, because it has to be a TOTAL order over the rows in one
 # group; ``_projection`` explains why, and what breaks without it.
-_RESOLUTION_ORDER = "(index_version, store_id, pack_id)"
+_RESOLUTION_ORDER = f"({MEMBER_VERSION}, store_id, pack_id, index_version)"
 
 @dataclass(frozen=True, slots=True)
 class ClickHouseReaderConfig:
@@ -319,9 +326,9 @@ class ClickHouseCaptureCatalog:
         # One row beyond the page tells us whether a cursor is owed, without a
         # second counting query.
         params["row_limit"] = query.limit + 1
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
         sql = (
-            f"SELECT {self._projection()} FROM {self._qualified()} "
-            f"WHERE {' AND '.join(clauses)} "
+            f"SELECT {self._projection()} FROM {self._snapshot()} {where}"
             f"GROUP BY {', '.join(quoted(name) for name in _SORT_KEY)} "
             f"ORDER BY {', '.join(quoted(name) for name in _SORT_KEY)} "
             "LIMIT %(row_limit)s"
@@ -380,9 +387,8 @@ class ClickHouseCaptureCatalog:
         # the primary index narrows the read to one tenant's range, and the
         # capture_id bloom-filter skip index prunes granules inside it.
         sql = (
-            f"SELECT {self._projection()} FROM {self._qualified()} "
-            "WHERE tenant_id = %(tenant_id)s AND "
-            f"capture_id IN %(capture_ids)s AND {self._membership()} "
+            f"SELECT {self._projection()} FROM {self._snapshot()} "
+            "WHERE tenant_id = %(tenant_id)s AND capture_id IN %(capture_ids)s "
             f"GROUP BY {', '.join(quoted(name) for name in _SORT_KEY)}"
         )
         # Chunked by rendered bytes, because the ids land in the statement TEXT
@@ -414,14 +420,30 @@ class ClickHouseCaptureCatalog:
             f"{quoted(table or self._capture_raw)}"
         )
 
-    def _membership(self) -> str:
-        """The packs inside the snapshot, as a subquery on (store_id, pack_id).
+    def _snapshot(self) -> str:
+        """The descriptor rows of the packs inside the snapshot, each carrying
+        the version its pack became a member at.
 
-        Two conditions, and the second is the whole point. A manifest row is
-        written before its watermark row, so requiring the publish to appear in
-        the watermark table is what stops a publish that lost the race -- which
-        never wrote one -- from leaking its packs into a snapshot that was
-        pinned before it ran.
+        An INNER JOIN on ``(store_id, pack_id)`` against
+        ``clickhouse_sql.member_versions`` rather than an ``IN``, because the
+        reader needs more than whether a pack is inside the snapshot: it ranks
+        a capture's packs by WHEN each was published (``_RESOLUTION_ORDER``),
+        and only the manifest knows that. A descriptor row's own
+        ``index_version`` does not. It is the version the row was WRITTEN at,
+        and a pass that re-indexes an already-published pack -- after a crash
+        between publishing and ``commit_packs``, after an outcome-unknown
+        publish that landed, or as a rebuild running beside the live indexer
+        -- writes that pack's rows again at a fresh, higher version before it
+        publishes anything, and may never publish it. Ranked on the row's
+        version, those rows outranked a newer pack's inside every snapshot the
+        old pack was already a member of, pinned ones included, and a merge
+        then makes the higher version the only one left.
+
+        The membership subquery has two conditions, and the second is the
+        whole point. A manifest row is written before its watermark row, so
+        requiring the publish to appear in the watermark table is what stops
+        a publish that lost the race -- which never wrote one -- from leaking
+        its packs into a snapshot that was pinned before it ran.
 
         That second test pairs ``(index_version, publish_id)`` rather than
         matching the version alone, so a manifest row counts only when the SAME
@@ -435,15 +457,18 @@ class ClickHouseCaptureCatalog:
         UUID published by a second store at a later version slip inside a
         pinned snapshot.
 
-        The predicate itself has ONE definition,
-        ``clickhouse_catalog.membership_predicate``, shared with the public
-        view's DDL so the two cannot drift apart about what exists; this
-        method only supplies the reader's snapshot bound.
+        Which manifest rows count has ONE definition in ``clickhouse_sql``,
+        shared by ``member_versions`` here and ``membership_predicate`` in the
+        public view's DDL, so the two cannot drift apart about what exists;
+        this method only supplies the reader's snapshot bound.
         """
-        return membership_predicate(
+        members = member_versions(
             self._qualified(self._manifest),
             self._qualified(self._watermark_table),
-            bounded=True,
+        )
+        return (
+            f"{self._qualified()} INNER JOIN ({members}) AS `members` "
+            "USING (store_id, pack_id)"
         )
 
     @staticmethod
@@ -474,10 +499,10 @@ class ClickHouseCaptureCatalog:
         is not a reason to unpick the tuple back into per-column aggregates.
 
         **A total ordering argument, so the row that wins cannot move.** This is
-        the failure that reproduces. Ordering on ``index_version`` alone ties
+        the failure that reproduces. Ordering on a version alone ties
         routinely: every pack indexed in one ``CatalogIndexer.index`` call is
-        written at one version, so two packs describing the same capture in one
-        batch produce rows whose ``index_version`` is equal. The engine breaks
+        published at one version, so two packs describing the same capture in
+        one batch produce rows whose version is equal. The engine breaks
         those ties consistently within a query but not across physical layouts:
         one pinned corpus resolved to a different pack at ``max_threads=1`` than
         it did above it, and to a different one again once a merge had put both
@@ -485,19 +510,30 @@ class ClickHouseCaptureCatalog:
         controls, so a selection resolved before one and hydrated after it
         resolves to different bytes with nothing reporting a change.
 
-        ``(index_version, store_id, pack_id)`` is a total order over the rows in
-        a group. They differ by pack identity -- that is exactly why it is in
-        the table's physical sort key -- so the tuple is unique per distinct row
-        and the maximum is one row. Rows that still tie on the whole tuple are
-        one pack re-indexed at one version, which rewrites byte-identical rows,
-        so which of those wins cannot be observed.
+        ``(member_version, store_id, pack_id, index_version)`` is a total order
+        over the rows in a group. Different packs differ by pack identity --
+        that is exactly why it is in the table's physical sort key. Rows of ONE
+        pack share its ``member_version`` and differ only by the version they
+        were written at, which is last: the highest wins, which is the row a
+        merge keeps (``ReplacingMergeTree(index_version)``), so a read resolves
+        the same row before a merge and after it. Under the identity rule those
+        rows are byte identical anyway; the tiebreak is for a row that breaks
+        the rule, which then fails hydration against the pack footer rather
+        than winning or losing depending on the physical layout. Rows that tie
+        on the whole tuple are one pack re-indexed at one version, which
+        rewrites byte-identical rows, so which of those wins cannot be observed.
 
-        Across versions this is unchanged newest-wins: ``index_version`` leads
-        the tuple, so a later pack still supersedes an earlier one. Within a
-        version the winner is the highest ``(store_id, pack_id)`` -- there is no
-        version ordering left to honour, and an arbitrary but FIXED choice is
-        what a reader needs, so that a selection resolved twice resolves to the
-        same bytes.
+        Across versions this is newest-wins: ``member_version`` leads the
+        tuple, so a pack published later supersedes an earlier one. It is the
+        version the pack's publish reached the watermark at, at or below the
+        pin (``_snapshot``), and deliberately NOT the descriptor row's own
+        ``index_version``: a replayed pack's rows sit at a version above that
+        publish -- above the pin, or at a version never published at all -- and
+        leading with it let those rows outrank the pack that really is newest,
+        flipping a pinned read. Within a version the winner is the highest
+        ``(store_id, pack_id)`` -- there is no version ordering left to honour,
+        and an arbitrary but FIXED choice is what a reader needs, so that a
+        selection resolved twice resolves to the same bytes.
 
         The shape is also what keeps determinism affordable, which is why the
         two halves arrived together. ClickHouse compares a tuple ordering
@@ -509,6 +545,15 @@ class ClickHouseCaptureCatalog:
         and 171.7 ms ordering one -- +22.6% for determinism where the per-column
         form cost +291%. Across page sizes, pagination depth and the selectivity
         cases this shape runs +17% to +43%.
+
+        Ranking on ``member_version`` put a join where the membership ``IN``
+        was. Both build one hash table over the snapshot's packs and probe it
+        once per row. Measured against the ``IN`` form on the same data, with
+        the two interleaved, on embedded ClickHouse 26.7 (chdb), from 100k
+        rows in 10 packs up to 1M rows in 100k packs: 100- and 1000-row pages
+        and a 100-id lookup ran from 39% faster to 9% slower, so no cost
+        stood out above the noise. Primary-key pruning survives the join
+        (``test_selection_resolve_prunes_to_the_tenant_range``).
         """
         # Deliberately unaliased: naming an aggregate after a source column
         # shadows that column everywhere else in the statement, and ClickHouse
@@ -529,8 +574,9 @@ class ClickHouseCaptureCatalog:
         # descriptor rows is not durable, because ReplacingMergeTree deletes
         # rows sharing a sort key at a time nobody controls. Bounding on packs
         # is also what makes a pin resolve to the pack it was taken over when a
-        # later pack re-describes the same capture.
-        clauses = [self._membership()]
+        # later pack re-describes the same capture. That bound is the join
+        # `_snapshot` puts in the FROM clause, so it is not among these filters.
+        clauses: list[str] = []
         params: dict[str, object] = {"watermark": watermark}
 
         # Equality and range filters apply to raw rows before grouping. That is

@@ -36,7 +36,12 @@ _WATERMARK = 1_756_142_093_000_000_000
 # The ordering argument the projection's argMax must carry. Spelled out here
 # rather than imported so that a change to it fails these tests instead of
 # silently travelling through them.
-_ORDER = "(index_version, store_id, pack_id)"
+_ORDER = "(member_version, store_id, pack_id, index_version)"
+
+
+# The published-head read, told apart from the descriptor reads -- whose
+# membership join also takes a `max(index_version)`, per pack -- by its shape.
+_HEAD_READ = "SELECT max(index_version) FROM"
 
 
 def _source(descriptor: CaptureDescriptor) -> dict:
@@ -89,7 +94,7 @@ class _Client:
 
     def execute(self, query, params=None, **kwargs):
         self.calls.append((" ".join(query.split()), params, kwargs))
-        if "max(index_version)" in query:
+        if _HEAD_READ in query:
             # The watermark now comes from the published log, not the
             # descriptor table.
             assert "_index_watermark" in query, query
@@ -99,7 +104,7 @@ class _Client:
 
     @property
     def selects(self) -> list[str]:
-        return [call[0] for call in self.calls if "max(index_version)" not in call[0]]
+        return [call[0] for call in self.calls if _HEAD_READ not in call[0]]
 
 
 def _catalog(**kwargs) -> tuple[ClickHouseCaptureCatalog, _Client]:
@@ -220,7 +225,8 @@ def test_pack_identity_is_resolved_by_argmax_not_grouped_on():
     catalog.search(CaptureQuery(limit=10))
 
     sql = client.selects[0]
-    group_by = sql.split("GROUP BY")[1].split("ORDER BY")[0]
+    # The outer GROUP BY: the membership join groups its own subquery by pack.
+    group_by = sql.rsplit("GROUP BY", 1)[1].split("ORDER BY")[0]
     resolved = _resolved_tuple(sql)
     for name in ("store_id", "pack_id"):
         assert f"`{name}`" in resolved
@@ -261,19 +267,67 @@ def test_one_aggregate_on_a_total_order_resolves_both_query_sites():
         # every resolved column, in _RESOLVED order so the row maps positionally.
         assert _resolved_tuple(sql) == ", ".join(f"`{n}`" for n in _RESOLVED)
         assert f"argMax(tuple({_resolved_tuple(sql)}), {_ORDER})" in sql
-        # And nothing is left resolving on the version alone.
-        assert ", index_version)" not in sql
+        # And nothing is left resolving on a version alone.
+        assert "`, index_version)" not in sql
         # The grouping columns still project directly, not through the tuple.
         for name in _SORT_KEY:
             assert f"`{name}`" in sql.split("argMax(")[0]
-    # The ordering key is exactly (index_version, store_id, pack_id): version
-    # first, so a later pack still supersedes an earlier one, then the columns
-    # the table is physically ordered on beyond capture identity -- the only
-    # ones a capture's rows can differ in, and therefore the only ones that can
-    # break the tie a shared version leaves.
+    # The ordering key is exactly (member_version, store_id, pack_id,
+    # index_version): the pack's publish version first, so a pack published
+    # later still supersedes an earlier one, then the columns the table is
+    # physically ordered on beyond capture identity -- the only ones two packs'
+    # rows can differ in, and therefore the only ones that can break the tie a
+    # shared version leaves -- and last the version a row was written at, which
+    # is all that separates one pack's rows from each other.
     assert _RESOLUTION_ORDER == _ORDER
     tail = _CAPTURE_TABLE_ORDER[len(_SORT_KEY) :]
-    assert _ORDER == "(" + ", ".join(("index_version",) + tail) + ")"
+    assert _ORDER == (
+        "(" + ", ".join(("member_version",) + tail + ("index_version",)) + ")"
+    )
+
+
+def test_a_replayed_pack_ranks_by_its_publish_not_by_its_rewritten_rows():
+    """A pass that re-indexes a published pack must not flip a pinned read.
+
+    The scenario, found by model checking the publish protocol: pass A
+    publishes pack P1 at v1 and dies before ``commit_packs``; pass B publishes
+    P2, a second pack describing the same capture, at v2, and a reader pins
+    W=2 and resolves the capture to P2. A later pass does not find P1 in the
+    inventory, re-indexes it and writes P1's descriptor rows at v3 -- before it
+    publishes anything, and perhaps never. P1 is still a member at W=2, so if
+    the ranking led with the descriptor row's own ``index_version``, (3, P1)
+    would outrank (2, P2) and the pinned read would now resolve to P1.
+
+    So the rank has to be the version the pack's publish reached the
+    watermark at, at or below the pin -- which only the manifest paired with
+    the watermark log knows -- and it has to lead the ordering at both query
+    sites. The live suite runs the scenario itself
+    (``test_a_replayed_pack_does_not_flip_a_pinned_read``).
+    """
+    expected = synthetic_descriptors(1)
+    catalog, client = _catalog(pages=[expected, expected])
+
+    catalog.search(CaptureQuery(limit=10))
+    catalog.get_by_ids(
+        [expected[0].capture_id], tenant_id="tenant-a", watermark=str(_WATERMARK)
+    )
+
+    manifest = "`default`.`dmi_snapshot_manifest`"
+    watermark = "`default`.`dmi_index_watermark`"
+    members = (
+        "INNER JOIN (SELECT store_id, pack_id, max(index_version) AS member_version "
+        f"FROM {manifest} WHERE index_version <= %(watermark)s AND "
+        "(index_version, publish_id) IN (SELECT index_version, publish_id "
+        f"FROM {watermark} WHERE index_version <= %(watermark)s) "
+        "GROUP BY store_id, pack_id) AS `members` USING (store_id, pack_id)"
+    )
+    assert len(client.selects) == 2
+    for sql in client.selects:
+        assert f"FROM `default`.`dmi_capture_raw` {members}" in sql
+        # The pack's publish version leads, not the row's written version.
+        order = sql.split(f"argMax(tuple({_resolved_tuple(sql)}), ")[1]
+        assert order.startswith("(member_version, ")
+        assert not order.startswith("(index_version")
 
 
 def test_only_the_locator_may_differ_between_a_captures_rows():
@@ -440,7 +494,7 @@ def test_only_a_cursor_bearing_search_reads_the_head_as_deciding():
     heads = [
         kwargs["settings"]
         for sql, _, kwargs in client.calls
-        if "max(index_version)" in sql
+        if _HEAD_READ in sql
     ]
     assert heads == [config.settings, {**config.settings, **_DECIDING_READ}]
 
@@ -459,7 +513,7 @@ def test_a_cursor_at_a_published_watermark_survives_replica_lag():
 
     class _LaggingClient(_Client):
         def execute(self, query, params=None, **kwargs):
-            if "max(index_version)" in query:
+            if _HEAD_READ in query:
                 self.calls.append((" ".join(query.split()), params, kwargs))
                 settings = kwargs.get("settings") or {}
                 if settings.get("select_sequential_consistency"):
@@ -642,7 +696,7 @@ def test_get_by_ids_chunks_the_inlined_id_list():
     # bound, same membership subquery.
     assert len(set(client.selects)) == 1
     # And the published-head check runs once, not once per chunk.
-    heads = [sql for sql, _, _ in client.calls if "max(index_version)" in sql]
+    heads = [sql for sql, _, _ in client.calls if _HEAD_READ in sql]
     assert len(heads) == 1
 
 
@@ -838,7 +892,7 @@ def test_get_by_ids_matches_commit_membership_on_store_and_pack():
     sql = client.selects[0]
     # Pack identity is (store_id, pack_id); matching pack_id alone would let
     # the same UUID committed by a second store slip inside a pinned snapshot.
-    assert "(store_id, pack_id) IN (SELECT store_id, pack_id FROM" in sql
+    assert "USING (store_id, pack_id)" in sql
 
 
 def test_search_matches_commit_membership_on_store_and_pack():
@@ -847,7 +901,7 @@ def test_search_matches_commit_membership_on_store_and_pack():
     catalog.search(CaptureQuery(limit=10))
 
     sql = client.selects[0]
-    assert "(store_id, pack_id) IN (SELECT store_id, pack_id FROM" in sql
+    assert "USING (store_id, pack_id)" in sql
 
 
 def test_get_by_ids_rejects_an_unpublished_watermark():
@@ -875,7 +929,7 @@ def _raw_row_catalog(row: tuple) -> ClickHouseCaptureCatalog:
     original = client.execute
 
     def execute(query, params=None, **kwargs):
-        if "max(index_version)" in query:
+        if _HEAD_READ in query:
             return original(query, params, **kwargs)
         client.calls.append((" ".join(query.split()), params, kwargs))
         return [row]
