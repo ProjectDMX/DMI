@@ -37,6 +37,9 @@ class _CountingEagerRingEngine:
     def available_capacity(self) -> int:
         return self.available
 
+    def available_task_slots(self) -> int:
+        return 1  # task capacity is not under test here
+
     def payload_cap(self) -> int:
         self.payload_cap_calls += 1
         return self.capacity
