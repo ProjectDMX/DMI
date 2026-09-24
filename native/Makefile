@@ -396,9 +396,14 @@ build/conformance_spool: csrc/store/spool.cpp csrc/store/conformance_spool.cpp c
 # _dmi_native_sink (the pack writer) and _dmi_native_store (the storage
 # service and reader). Each is linked in build/ and installed next to
 # _native_backend in src/dmi/, the first directory the loader
-# (dmi/transport/native.py) searches, so `clean` removes both copies and the
-# default build puts both back. The build/ copy stays because the torch
-# adapter suites import it from there directly. The targets are the files
+# (dmi/transport/native.py) searches, so `clean` removes both names and the
+# default build puts both back. The build/ file stays because the torch
+# adapter suites import it from there directly. The src/dmi/ name is a
+# relative symlink to it, not a copy: the loader prefers src/dmi/, so a copy
+# went stale -- and shadowed the fresh build -- whenever something rebuilt
+# build/ alone, such as a branch whose `make build/_dmi_native_sink` writes
+# only there. A copy left by an earlier build is replaced even when it is
+# newer than build/. The targets are the files
 # themselves, so an up-to-date extension is not relinked on every `make`;
 # build/_dmi_native_sink and build/_dmi_native_store remain as the names CI
 # and the loaders' error messages use. PYTHON must be the venv interpreter:
@@ -442,11 +447,17 @@ capture: $(SINK_FINAL_TARGET) $(STORE_FINAL_TARGET)
 build/_dmi_native_sink: $(SINK_FINAL_TARGET)
 build/_dmi_native_store: $(STORE_FINAL_TARGET)
 
-$(SINK_FINAL_TARGET): $(SINK_BUILT)
-	cp $< $@
+# FORCE when the installed name is a regular file, i.e. a copy.
+installed_copy = $(if $(shell test -e '$(1)' && ! test -L '$(1)' && echo copy),FORCE)
+define install_link
+ln -sfn "$$($(PYTHON) -c 'import os, sys; print(os.path.relpath(*map(os.path.realpath, sys.argv[1:])))' '$(abspath $<)' '$(@D)')" $@
+endef
 
-$(STORE_FINAL_TARGET): $(STORE_BUILT)
-	cp $< $@
+$(SINK_FINAL_TARGET): $(SINK_BUILT) $(call installed_copy,$(SINK_FINAL_TARGET))
+	$(install_link)
+
+$(STORE_FINAL_TARGET): $(STORE_BUILT) $(call installed_copy,$(STORE_FINAL_TARGET))
+	$(install_link)
 
 # A5b torch-CPU adapter module: NativePackSink as an importable extension
 # with a synthetic-envelope entry point for tests. No CUDA, no ClickHouse,

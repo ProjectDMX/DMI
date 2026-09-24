@@ -560,6 +560,51 @@ def test_clean_then_capture_build_recreates_what_clean_removed():
 
 
 @pytest.mark.cpu
+def test_capture_extensions_install_as_links_to_the_build(tmp_path):
+    # The loader searches src/dmi before native/build. Installed as copies,
+    # the src/dmi file went stale the moment anything rebuilt native/build
+    # alone -- another branch's `make build/_dmi_native_sink`, which writes
+    # only there -- and shadowed the fresh build. A relative link is one
+    # file under two names. A real run, in a stand-in checkout; `-o` holds
+    # the (fake) built files as they are, so nothing is compiled.
+    import os
+
+    names = ("_dmi_native_sink", "_dmi_native_store")
+    checkout = tmp_path / "checkout"
+    (checkout / "src" / "dmi").mkdir(parents=True)
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    built = {name: build_dir / f"{name}{_EXT_SUFFIX}" for name in names}
+    installed = {name: checkout / "src" / "dmi" / f"{name}{_EXT_SUFFIX}"
+                 for name in names}
+    for name in names:
+        built[name].write_bytes(b"built " + name.encode())
+        # What this branch installed before: a copy, newer than the build,
+        # so the file-named target alone would call it up to date.
+        installed[name].write_bytes(b"stale copy")
+    goal = (f"PROJECT_ROOT={checkout}", f"BUILD_DIR={build_dir}",
+            *(f"-o{path}" for path in built.values()), "capture")
+
+    result = _make(*goal)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for name in names:
+        link = installed[name]
+        assert link.is_symlink(), f"{link} was installed as a copy"
+        assert not os.path.isabs(os.readlink(link)), os.readlink(link)
+        assert os.path.samefile(link, built[name])
+
+        # Rebuilt in native/build alone, the way ld writes a new file.
+        fresh = build_dir / "fresh"
+        fresh.write_bytes(b"rebuilt " + name.encode())
+        os.replace(fresh, built[name])
+        assert link.read_bytes() == b"rebuilt " + name.encode()
+
+    again = _make(*goal)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "ln " not in again.stdout, "an installed link was redone"
+
+
+@pytest.mark.cpu
 def test_capture_targets_are_named_after_the_files_they_produce():
     # A target whose recipe writes some other path is never up to date, so
     # every `make` relinked both extensions. Named after the file, a second

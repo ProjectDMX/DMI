@@ -216,10 +216,11 @@ prefer the full backend and fall back to `_host_backend`; ring exports always
 require the full backend.
 
 The same build also produces the two extensions of the native capture storage
-path (`storage_backend="capture"`), as `native/build/` copies and as the
-importable `src/dmi/_dmi_native_sink.<EXT_SUFFIX>.so` (the pack writer) and
-`src/dmi/_dmi_native_store.<EXT_SUFFIX>.so` (the storage service and reader).
-Their make target is `capture`, which needs no CUDA and can be built on its
+path (`storage_backend="capture"`): `_dmi_native_sink.<EXT_SUFFIX>.so` (the
+pack writer) and `_dmi_native_store.<EXT_SUFFIX>.so` (the storage service and
+reader). Each is linked in `native/build/` and made importable as a symlink of
+the same name in `src/dmi/`, so the file the loader finds first is always the
+latest build. Their make target is `capture`, which needs no CUDA and can be built on its
 own; `build/_dmi_native_sink` and `build/_dmi_native_store` build one each.
 
 ```bash
