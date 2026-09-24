@@ -422,7 +422,7 @@ class ClickHouseCaptureCatalog:
 
     def _snapshot(self) -> str:
         """The descriptor rows of the packs inside the snapshot, each carrying
-        the version its pack became a member at.
+        the version its pack first became a member at.
 
         An INNER JOIN on ``(store_id, pack_id)`` against
         ``clickhouse_sql.member_versions`` rather than an ``IN``, because the
@@ -437,7 +437,10 @@ class ClickHouseCaptureCatalog:
         publishes anything, and may never publish it. Ranked on the row's
         version, those rows outranked a newer pack's inside every snapshot the
         old pack was already a member of, pinned ones included, and a merge
-        then makes the higher version the only one left.
+        then makes the higher version the only one left. The rank is the
+        pack's FIRST publish for the same reason: a replay that does publish
+        makes the pack a member again at a fresh version, and ranked on its
+        newest publish a superseded pack would win every head from then on.
 
         The membership subquery has two conditions, and the second is the
         whole point. A manifest row is written before its watermark row, so
@@ -524,13 +527,15 @@ class ClickHouseCaptureCatalog:
         rewrites byte-identical rows, so which of those wins cannot be observed.
 
         Across versions this is newest-wins: ``member_version`` leads the
-        tuple, so a pack published later supersedes an earlier one. It is the
-        version the pack's publish reached the watermark at, at or below the
-        pin (``_snapshot``), and deliberately NOT the descriptor row's own
-        ``index_version``: a replayed pack's rows sit at a version above that
-        publish -- above the pin, or at a version never published at all -- and
-        leading with it let those rows outrank the pack that really is newest,
-        flipping a pinned read. Within a version the winner is the highest
+        tuple, so a pack first published later supersedes an earlier one. It
+        is the version the pack's first publish reached the watermark at, at
+        or below the pin (``_snapshot``), and deliberately NOT the descriptor
+        row's own ``index_version``: a replayed pack's rows sit at a version
+        above that publish -- above the pin, or at a version never published at
+        all -- and leading with it let those rows outrank the pack that really
+        is newest, flipping a pinned read. Nor is it the pack's newest publish,
+        for the same reason one step later: a replay that publishes would
+        re-promote the superseded pack at every head after it. Within a version the winner is the highest
         ``(store_id, pack_id)`` -- there is no version ordering left to honour,
         and an arbitrary but FIXED choice is what a reader needs, so that a
         selection resolved twice resolves to the same bytes.

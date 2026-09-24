@@ -628,7 +628,7 @@ def reject_a_foreign_tenant(ref: PackRef, tenants: Iterable[str]) -> None:
     whose footer carried another tenant's ``tenant_id`` and ``capture_id``,
     have it indexed under the victim's tenant, and -- because the reader
     resolves a capture with ``argMax`` over ``(member_version, store_id,
-    pack_id, index_version)``, newest publish first -- become the pack that
+    pack_id, index_version)``, newest pack first -- become the pack that
     capture resolves to for every fresh watermark. Integrity of the pack proves nothing here: the attacker's pack
     is perfectly well-formed. Only its LOCATION is evidence, and this is where
     the two meet.

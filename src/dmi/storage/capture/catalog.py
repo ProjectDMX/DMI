@@ -529,7 +529,7 @@ class CatalogIndexer:
         version, not only the manifest rows. Neither visibility nor
         supersession depends on that rewrite any more. Membership decides
         visibility, and it is rewritten at the version that wins. Supersession
-        ranks a pack by the version its publish reached the watermark at
+        ranks a pack by the version its first publish reached the watermark at
         (``member_version`` in ``clickhouse_reader._RESOLUTION_ORDER``), read
         from the manifest, and not by the ``index_version`` its rows were
         written at. It used to rank on the rows' version, and that is what

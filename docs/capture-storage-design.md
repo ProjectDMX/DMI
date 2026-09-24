@@ -383,7 +383,7 @@ forged pack is perfectly well formed. Anyone able to PUT into the bucket could
 therefore write a pack whose footer carried another tenant's `tenant_id` and
 `capture_id`, have it indexed under the victim's tenant, and -- since the
 reader resolves a capture with `argMax` over `(member_version, store_id,
-pack_id, index_version)`, newest publish first -- become the pack that capture
+pack_id, index_version)`, newest pack first -- become the pack that capture
 resolves to at every fresh watermark.
 
 `_descriptors` now refuses a pack whose records name a tenant other than the
@@ -1568,8 +1568,9 @@ removed:
   background merge. `(member_version, store_id, pack_id, index_version)` is a
   total order over the rows in a group.
 - **The ranking version.** `member_version` is the version at which a pack's
-  publish reached the watermark, at or below the pin: the manifest rows paired
-  with the watermark log, joined in on `(store_id, pack_id)`. It is NOT a
+  FIRST publish reached the watermark, at or below the pin: `min(index_version)`
+  over the manifest rows paired with the watermark log, joined in on
+  `(store_id, pack_id)`. It is NOT a
   descriptor row's own `index_version`, which is only the version the row was
   written at. A pass that re-indexes an already-published pack -- after a crash
   between publishing and `commit_packs`, an outcome-unknown publish that
@@ -1577,8 +1578,15 @@ removed:
   higher version before publishing anything. Ranked on the rows' version, a
   superseded pack then outranked the newer pack inside snapshots already
   pinned, and kept doing so if that pass never published. Found by model
-  checking the publish protocol. `index_version` is kept as the last component,
-  so within one pack the row a merge keeps is also the row a read resolves.
+  checking the publish protocol. It is the first publish rather than the
+  newest because a replay that DOES publish makes the pack a member again at a
+  fresh version: ranked on that, the superseded pack would win every head from
+  the replay on, on the ordinary crash-recovery path. A replay adds nothing to
+  the catalog, so it does not move a pack's rank; a genuine re-capture is a new
+  pack and a mirror is another store, so both still get a fresh first publish.
+  Pins are stable either way, since every later publish lands above the pin.
+  `index_version` is kept as the last component, so within one pack the row a
+  merge keeps is also the row a read resolves.
 - **One aggregate, not one per column.** Twenty-seven separate `argMax` calls
   leave nothing forbidding `store_id` from one row and `object_key` from
   another -- a descriptor describing no pack that exists. It could not be
