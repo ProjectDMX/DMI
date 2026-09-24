@@ -104,10 +104,13 @@ struct StorageServiceConfig {
   // is only safe while no writer is live: start() must run before the sink
   // opens the spool. It runs after the lease is taken, so a start refused
   // the catalog never touches the spool. That keeps a second process off a
-  // live spool only usually: a holder that is quarantined lets its row lapse,
-  // and a second process can take the lease and sweep while the first is
-  // still writing. The spool itself is not locked; one process per spool is
-  // the caller's job.
+  // live spool only usually: a holder that stops renewing for a TTL
+  // (quarantined, or stalled) lets its row lapse, and a second process can
+  // take the lease and sweep while the first is still writing; one on
+  // another (database, table_prefix) never meets the lease at all. Its
+  // Recover() also lists the first's sealed packs, so both then upload the
+  // one spool. The spool itself is not locked; one process per spool is the
+  // caller's job.
   bool sweep_spool_on_start = true;
   bool reconcile_on_start = true;
 };

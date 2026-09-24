@@ -629,12 +629,15 @@ void CaptureStorageService::keep_lease() {
 
 void CaptureStorageService::renew_lease_if_due() {
   // Renew once a third of the TTL has passed without a publish. The lease
-  // thread wakes every ttl/6, so four wakes fall between the renewal coming
-  // due and the row expiring: room for a renewal that runs late, not for one
-  // that fails. A failed renewal costs the lease at once whatever the cause.
-  // A refusal drops it in the coordinator, and a transport error or timeout
-  // takes renew_for_publish()'s catch, which quarantines the writer on the
-  // first one.
+  // thread wakes every ttl/6, so the renewal fires about a tick after it
+  // falls due (later if an index() call holds lease_mutex_), leaving roughly
+  // half the TTL for it to land before the row expires. That slack covers a
+  // renewal that runs late, not one that fails. A failed renewal costs the
+  // lease at once whatever the cause. A refusal drops it in the coordinator,
+  // and any ClickHouse error (transport, timeout, or a server error) takes
+  // renew_for_publish()'s catch, which quarantines the writer on the first
+  // error that survives the client's retries (reads only; a write that may
+  // have reached the server is never retried).
   const uint64_t ttl = config_.writer.lease_ttl_ns;
   if (ttl == 0 || steady_ns() - last_renew_ns_ < ttl / 3) return;
   writer_.renew_lease();
