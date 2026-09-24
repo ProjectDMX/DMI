@@ -1,0 +1,10 @@
+# TLC output. Keep state out of the repo (run.sh passes -metadir outside it).
+*_TTrace_*
+states/
+*.st
+*.fp
+*.out
+*.log
+# TLC metadirs: <Model>/<yy-MM-dd-HH-mm-ss>/ and the Toolbox's *.toolbox/
+[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*/
+*.toolbox/
