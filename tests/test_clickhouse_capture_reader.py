@@ -40,7 +40,7 @@ _ORDER = "(member_version, store_id, pack_id, index_version)"
 
 
 # The published-head read, told apart from the descriptor reads -- whose
-# membership join also takes a `max(index_version)`, per pack -- by its shape.
+# membership join also aggregates `index_version`, per pack -- by its shape.
 _HEAD_READ = "SELECT max(index_version) FROM"
 
 
@@ -301,7 +301,10 @@ def test_a_replayed_pack_ranks_by_its_publish_not_by_its_rewritten_rows():
     So the rank has to be the version the pack's publish reached the
     watermark at, at or below the pin -- which only the manifest paired with
     the watermark log knows -- and it has to lead the ordering at both query
-    sites. The live suite runs the scenario itself
+    sites. It is the pack's FIRST such publish, ``min(index_version)``: if the
+    replay does publish P1 at v3, the newest publish would rank P1 at 3 and
+    resolve every head from v3 on back to the superseded pack, while the
+    first keeps P1 at 1, below P2. The live suite runs the scenario itself
     (``test_a_replayed_pack_does_not_flip_a_pinned_read``).
     """
     expected = synthetic_descriptors(1)
@@ -315,7 +318,7 @@ def test_a_replayed_pack_ranks_by_its_publish_not_by_its_rewritten_rows():
     manifest = "`default`.`dmi_snapshot_manifest`"
     watermark = "`default`.`dmi_index_watermark`"
     members = (
-        "INNER JOIN (SELECT store_id, pack_id, max(index_version) AS member_version "
+        "INNER JOIN (SELECT store_id, pack_id, min(index_version) AS member_version "
         f"FROM {manifest} WHERE index_version <= %(watermark)s AND "
         "(index_version, publish_id) IN (SELECT index_version, publish_id "
         f"FROM {watermark} WHERE index_version <= %(watermark)s) "

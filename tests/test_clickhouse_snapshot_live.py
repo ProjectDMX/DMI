@@ -954,6 +954,12 @@ def test_a_replayed_pack_does_not_flip_a_pinned_read(second_description):
     landed; a conflict whose ``commit_packs`` failed; a rebuild running beside
     the live indexer), so the reader has to rank a pack by when its PUBLISH
     reached the watermark, not by when its rows were written.
+
+    And by its FIRST publish, not its newest: if the replay does publish, P1
+    becomes a member again at a version above P2's, and ranked on that it
+    would win every head from then on -- the older pack superseding the newer
+    one on the ordinary crash-recovery path. A replay adds nothing new to the
+    catalog, so it must not move a pack's rank.
     """
     original = synthetic_descriptors(3)
     newer = second_description(original)
@@ -999,12 +1005,20 @@ def test_a_replayed_pack_does_not_flip_a_pinned_read(second_description):
         _merge(client, config)
         assert resolved(pinned) == at_pin, "a merge flipped the pinned read"
 
-        # Once the replay DOES publish P1, that is the newest publish and
-        # wins at the new head -- while the old pin still resolves to P2.
+        # Once the replay DOES publish P1, P1 is a member again at a version
+        # above P2's -- but it was first published below it, and that is its
+        # rank. P2 still wins at the new head, and the old pin is unmoved.
         _publish(writer, replay, refs=_refs(original))
-        assert resolved(str(replay)) == {
-            item.capture_id: item.locator for item in original
-        }
+        head = reader.current_watermark()
+        assert head == str(replay)
+        assert resolved(head) == at_pin, "the replay's publish re-promoted P1"
+        page = reader.search(CaptureQuery(limit=10, tenant_id=tenant))
+        assert page.watermark == head
+        assert page.items == newer
+        assert resolved(pinned) == at_pin
+
+        _merge(client, config)
+        assert resolved(head) == at_pin, "a merge re-promoted P1"
         assert resolved(pinned) == at_pin
 
 

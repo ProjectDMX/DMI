@@ -1076,7 +1076,7 @@ def test_supersession_resolves_the_newest_pack():
     """The same capture re-described by a later pack: newest wins, both sides.
 
     The resolution order is (member_version, store_id, pack_id,
-    index_version) — a pack published at a later version supersedes; within
+    index_version) — a pack first published at a later version supersedes; within
     one version the highest (store_id, pack_id) wins, a fixed choice so a
     selection resolved twice resolves to the same bytes.
     """
@@ -1117,7 +1117,10 @@ def test_a_replayed_pack_does_not_flip_a_pinned_read_on_either_side():
     describing the same captures is published at 8. A later pass re-indexes
     the old pack and writes its rows at 9 without publishing (it crashed).
     Both readers must still resolve snapshot 8 to the NEW pack: the old
-    pack's publish is 7, whatever version its rows were written at. See
+    pack's publish is 7, whatever version its rows were written at. And when
+    a replay does publish the old pack at 9, both must resolve head 9 to the
+    new pack too: a pack ranks by its FIRST publish, so replaying it cannot
+    move it above a pack published after it. See
     test_clickhouse_snapshot_live.test_a_replayed_pack_does_not_flip_a_pinned_read.
     """
     with _catalog() as (client, config, prefix):
@@ -1148,6 +1151,30 @@ def test_a_replayed_pack_does_not_flip_a_pinned_read_on_either_side():
                 assert item[21] == new_pack, item  # pack_id column
             for item in page.items + python_ids:
                 assert item.locator.pack_id == new_pack
+
+            # The replay publishes: the old pack is a member again, at 9.
+            published = driver.call(
+                op="publish_snapshot", index_version=9,
+                refs=[{"store_id": first[0]["store_id"], "pack_id": old_pack}],
+                published_at_ns=9, indexed_rows=len(first), indexed_packs=1)
+            assert published["ok"], published
+            assert driver.call(op="current_watermark")["watermark"] == "9"
+            for watermark in ("9", "8"):
+                native_ids = driver.call(op="get_by_ids", capture_ids=ids,
+                                         tenant_id="t", watermark=watermark)
+                python_ids = reader.get_by_ids(ids, tenant_id="t",
+                                               watermark=watermark)
+                assert _normalize(native_ids["items"]) == _normalize(python_ids)
+                assert [item[21] for item in native_ids["items"]] == (
+                    [new_pack] * len(ids)), (watermark, native_ids["items"])
+                assert [item.locator.pack_id for item in python_ids] == (
+                    [new_pack] * len(ids)), watermark
+            native_search = driver.call(op="search", limit=100)
+            page = _python_page_items(reader)
+            assert page.watermark == "9"
+            assert _normalize(native_search["items"]) == _normalize(page.items)
+            for item in native_search["items"]:
+                assert item[21] == new_pack, item
         finally:
             driver.close()
 

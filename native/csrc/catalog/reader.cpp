@@ -33,10 +33,10 @@ constexpr const char* kProjection[] = {
     "payload_offset", "stored_length", "decoded_length", "codec",
     "payload_checksum"};
 // clickhouse_reader._RESOLUTION_ORDER: a pack ranks by the version its
-// publish reached the watermark at (member_version, from snapshot()), never
-// by the version a descriptor row was written at -- a replayed pack's rows
-// sit above that. index_version last picks, within one pack, the row a
-// merge keeps.
+// FIRST publish reached the watermark at (member_version, from snapshot()),
+// never by the version a descriptor row was written at -- a replayed pack's
+// rows sit above that -- nor by its newest publish, which a replay also
+// moves. index_version last picks, within one pack, the row a merge keeps.
 constexpr const char* kResolutionOrder =
     "(member_version, store_id, pack_id, index_version)";
 
@@ -481,13 +481,14 @@ NativeCaptureCatalog::bounded_read_settings() const {
 std::string NativeCaptureCatalog::snapshot() const {
   // clickhouse_reader._snapshot over clickhouse_sql.member_versions: the
   // descriptor rows of the packs whose publish reached the watermark at or
-  // before the bound, each joined to the version its pack became a member
-  // at, which is what kResolutionOrder ranks on.
+  // before the bound, each joined to the version its pack FIRST became a
+  // member at (min, so a replay's publish cannot re-promote a superseded
+  // pack), which is what kResolutionOrder ranks on.
   const std::string manifest = qualified("snapshot_manifest");
   const std::string watermark = qualified("index_watermark");
   return (
       qualified("capture_raw") +
-      " INNER JOIN (SELECT store_id, pack_id, max(index_version) AS "
+      " INNER JOIN (SELECT store_id, pack_id, min(index_version) AS "
       "member_version FROM " + manifest + " "
       "WHERE index_version <= %(watermark)s AND (index_version, publish_id) IN "
       "(SELECT index_version, publish_id FROM " + watermark +
