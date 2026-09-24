@@ -483,6 +483,40 @@ def fake_s3_tls(private_ca):
     server.shutdown()
 
 
+@pytest.fixture()
+def fake_s3_tls_wrong_name(private_ca):
+    """https://127.0.0.1:<port> served with a certificate the private CA
+    issued for ANOTHER name: trusted chain, mismatched host."""
+    _reset_state()
+    ca_file, _ca_path, _cert, _key = private_ca
+    root = Path(ca_file).parent
+    (root / "other.ext").write_text(
+        "basicConstraints=CA:FALSE\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\n"
+        "subjectAltName=DNS:other.example\n"
+        "authorityKeyIdentifier=keyid\n")
+    (root / "other.cnf").write_text(
+        "[req]\nprompt=no\ndistinguished_name=dn\n[dn]\nCN=other.example\n")
+    if not (root / "other.pem").exists():
+        _openssl("req", "-config", "other.cnf", "-new", "-newkey", "rsa:2048",
+                 "-nodes", "-keyout", "other.key", "-out", "other.csr",
+                 cwd=root)
+        _openssl("x509", "-req", "-in", "other.csr", "-CA", "ca.pem",
+                 "-CAkey", "ca.key", "-CAcreateserial", "-out", "other.pem",
+                 "-days", "2", "-extfile", "other.ext", cwd=root)
+        _openssl("verify", "-CAfile", "ca.pem", "other.pem", cwd=root)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(root / "other.pem"), str(root / "other.key"))
+    server = _QuietTLSServer(("127.0.0.1", 0), FakeS3Handler)
+    server.socket = context.wrap_socket(server.socket, server_side=True,
+                                        do_handshake_on_connect=False)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"https://127.0.0.1:{server.server_port}"
+    server.shutdown()
+
+
 def _base(endpoint: str, **overrides) -> dict:
     request = {
         "endpoint": endpoint,
@@ -801,6 +835,19 @@ def test_https_without_the_private_ca_is_refused(fake_s3_tls):
     assert "certificate" in put["what"].lower(), put
     assert put["attempts"] == 1, put
     assert STATE.calls == [] and STATE.objects == {}
+
+
+def test_https_refuses_a_certificate_for_another_host(
+        fake_s3_tls_wrong_name, private_ca):
+    """The chain is trusted (the private CA issued it), but it names
+    other.example, not 127.0.0.1: host-name verification must refuse it
+    before any request, with no retry."""
+    ca_file, _ca_path, _cert, _key = private_ca
+    head = _call("head", **_tls(fake_s3_tls_wrong_name, ca_file=ca_file),
+                 key="tls/wrong-name")
+    assert not head["ok"], head
+    assert head["attempts"] == 1, head
+    assert STATE.calls == []
 
 
 def test_ca_options_on_plain_http_are_refused(fake_s3, private_ca):
