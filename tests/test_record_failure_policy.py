@@ -34,6 +34,7 @@ class _StatusRing(_FakeRingEngine):
             "failure_policy": "raise", "failed": False, "failure": "",
             "discarded_descriptors": 0, "discarded_payloads": 0,
             "step_stall_budget_ms": 0, "stall_budget_exhaustions": 0,
+            "skipped_steps": 0,
             "reserve_wait_ns": 0, "max_step_wait_ns": 0,
         }
         self.steps = 0
@@ -43,6 +44,23 @@ class _StatusRing(_FakeRingEngine):
 
     def begin_record_step(self):
         self.steps += 1
+
+
+class _Sink:
+    """An explicit native sink, as far as create_record_runtime looks."""
+
+    def __init__(self, admission_bound_s=0.5):
+        self.admission_bound_s = admission_bound_s
+
+    def _acquire_engine(self):
+        return object()
+
+
+class _SinkWithoutABound:
+    """A native sink that cannot say how long its admission takes."""
+
+    def _acquire_engine(self):
+        return object()
 
 
 def _record_engine(monkeypatch, ring, **runtime_options):
@@ -63,6 +81,21 @@ def _record_engine(monkeypatch, ring, **runtime_options):
     return engine, runtime, created
 
 
+def _refused_before_the_live_ring(monkeypatch, match, **runtime_options):
+    engine, _old_transport, old_ring = _engine_with_fake_ring()
+    engine._ring_config = object()
+    engine._host_engine = object()
+    _record_ring_fakes(
+        monkeypatch,
+        create_record=lambda *a, **k: pytest.fail("ring must not be built"),
+        activate=lambda transport: None, deactivated=[])
+    with pytest.raises(ValueError, match=match):
+        engine.create_record_runtime(
+            _explicit_sink_format(), **runtime_options)
+    assert old_ring.stop_calls == 0
+    assert engine._record_mode is False
+
+
 # --- create_record_runtime ----------------------------------------------------
 
 
@@ -73,10 +106,46 @@ def test_the_default_policy_is_raise_with_no_stall_budget(monkeypatch):
 
 def test_disable_capture_and_a_budget_reach_the_native_ring(monkeypatch):
     _engine, _runtime, created = _record_engine(
-        monkeypatch, _StatusRing(), failure_policy="disable_capture",
-        step_stall_budget_ms=2000)
+        monkeypatch, _StatusRing(), record_sink=_Sink(),
+        failure_policy="disable_capture", step_stall_budget_ms=2000)
     assert created == [{"failure_policy": "disable_capture",
                         "step_stall_budget_ms": 2000}]
+
+
+# A budget's promise -- a step stalls at most the budget plus one admission
+# -- holds only when the sink bounds its admission: past the budget the
+# forward still waits for the envelope the sink is admitting. Under both
+# policies, since both skip the rest of the step the same way.
+
+
+@pytest.mark.parametrize("policy", ["raise", "disable_capture"])
+def test_a_budget_is_refused_on_the_clickhouse_host_path(monkeypatch, policy):
+    """record_sink=None: ClickHouseRecordSink enqueues row by row, with
+    whatever wait the host engine's ingress policy has (by default, none)
+    and no bound per envelope."""
+    _refused_before_the_live_ring(
+        monkeypatch, "ClickHouse host path", failure_policy=policy,
+        step_stall_budget_ms=50)
+
+
+@pytest.mark.parametrize("sink", [_Sink(admission_bound_s=None),
+                                  _SinkWithoutABound()])
+@pytest.mark.parametrize("policy", ["raise", "disable_capture"])
+def test_a_budget_is_refused_for_a_sink_without_an_admission_bound(
+        monkeypatch, sink, policy):
+    """A NativePackSink that blocks with no admission timeout, the
+    reference bridge, or any sink that cannot say."""
+    _refused_before_the_live_ring(
+        monkeypatch, "admission bound", record_sink=sink,
+        failure_policy=policy, step_stall_budget_ms=50)
+
+
+def test_without_a_budget_nothing_is_promised_or_refused(monkeypatch):
+    _engine, _runtime, created = _record_engine(
+        monkeypatch, _StatusRing(), record_sink=_SinkWithoutABound(),
+        failure_policy="disable_capture")
+    assert created == [{"failure_policy": "disable_capture",
+                        "step_stall_budget_ms": 0}]
 
 
 @pytest.mark.parametrize("options, match", [
@@ -102,10 +171,10 @@ def test_bad_options_are_refused_before_the_live_ring_is_touched(
     assert engine._record_mode is False
 
 
-def test_disable_capture_needs_a_bounded_sink_admission(tmp_path):
-    """Once the budget latches, the forward still waits for the one sink
-    admission in progress; unbounded, that wait is the stall the policy
-    exists to prevent."""
+@pytest.mark.parametrize("policy", ["raise", "disable_capture"])
+def test_a_budget_needs_a_bounded_persistent_sink(tmp_path, policy):
+    """The persistent path builds its NativePackSink from
+    capture_sink_config; block with no timeout has no admission bound."""
     from dmi.config import MonitoringConfig
     from dmi.storage.native_capture import NativeSinkConfig
 
@@ -117,7 +186,33 @@ def test_disable_capture_needs_a_bounded_sink_admission(tmp_path):
                               enable_ring_transport=False)
     with pytest.raises(ValueError, match="admission_timeout_s"):
         engine.create_record_runtime(
-            _explicit_sink_format(), failure_policy="disable_capture")
+            _explicit_sink_format(), failure_policy=policy,
+            step_stall_budget_ms=50)
+    # Without a budget the same sink is accepted: past validation, this
+    # engine only lacks a ring.
+    with pytest.raises(RuntimeError, match="Ring transport"):
+        engine.create_record_runtime(
+            _explicit_sink_format(), failure_policy=policy)
+
+
+@pytest.mark.parametrize("fields", [
+    {},  # block with the 2 s default
+    {"overload": "drop_newest"},
+])
+def test_a_bounded_persistent_sink_passes_the_budget_check(tmp_path, fields):
+    from dmi.config import MonitoringConfig
+    from dmi.storage.native_capture import NativeSinkConfig
+
+    config = MonitoringConfig(
+        storage_backend="persistent",
+        capture_sink_config=NativeSinkConfig(
+            spool_root=str(tmp_path), **fields))
+    engine = MonitoringEngine(config=config, model_id="policy",
+                              enable_ring_transport=False)
+    with pytest.raises(RuntimeError, match="Ring transport"):
+        engine.create_record_runtime(
+            _explicit_sink_format(), failure_policy="disable_capture",
+            step_stall_budget_ms=50)
 
 
 # --- steps -----------------------------------------------------------------------
@@ -142,6 +237,7 @@ def test_capture_status_without_a_record_runtime():
         "failure_policy": None, "failure": None,
         "discarded_descriptors": 0, "discarded_payloads": 0,
         "step_stall_budget_ms": None, "stall_budget_exhaustions": 0,
+        "skipped_steps": 0,
         "reserve_wait_s": 0.0, "max_step_wait_s": 0.0,
         "sink": None, "storage": None,
     }
@@ -153,11 +249,12 @@ def test_capture_status_reports_a_disabled_capture(monkeypatch):
         "failure": "NativePackSink: sink refused durable admission: timed_out",
         "discarded_descriptors": 7, "discarded_payloads": 9,
         "step_stall_budget_ms": 2000, "stall_budget_exhaustions": 1,
+        "skipped_steps": 1,
         "reserve_wait_ns": 2_500_000_000, "max_step_wait_ns": 2_100_000_000,
     })
     engine, _runtime, _created = _record_engine(
-        monkeypatch, ring, failure_policy="disable_capture",
-        step_stall_budget_ms=2000)
+        monkeypatch, ring, record_sink=_Sink(),
+        failure_policy="disable_capture", step_stall_budget_ms=2000)
     status = engine.capture_status()
     assert status == {
         "record_mode": True, "capture_active": False,
@@ -165,9 +262,31 @@ def test_capture_status_reports_a_disabled_capture(monkeypatch):
         "failure": "NativePackSink: sink refused durable admission: timed_out",
         "discarded_descriptors": 7, "discarded_payloads": 9,
         "step_stall_budget_ms": 2000, "stall_budget_exhaustions": 1,
+        "skipped_steps": 1,
         "reserve_wait_s": 2.5, "max_step_wait_s": 2.1,
         "sink": None, "storage": None,
     }
+
+
+def test_capture_status_reports_skipped_steps_with_capture_active(
+        monkeypatch):
+    """A spent budget under disable_capture skips that step and capture
+    goes on: active, nothing failed, the skip counted."""
+    ring = _StatusRing({
+        "failure_policy": "disable_capture", "failed": False, "failure": "",
+        "discarded_descriptors": 8, "discarded_payloads": 8,
+        "step_stall_budget_ms": 50, "stall_budget_exhaustions": 2,
+        "skipped_steps": 2,
+        "reserve_wait_ns": 900_000_000, "max_step_wait_ns": 450_000_000,
+    })
+    engine, _runtime, _created = _record_engine(
+        monkeypatch, ring, record_sink=_Sink(),
+        failure_policy="disable_capture", step_stall_budget_ms=50)
+    status = engine.capture_status()
+    assert status["capture_active"] is True
+    assert status["failure"] is None
+    assert status["skipped_steps"] == 2
+    assert status["stall_budget_exhaustions"] == 2
 
 
 def test_capture_status_includes_the_sink_and_storage_snapshots(monkeypatch):
@@ -194,17 +313,36 @@ def test_capture_status_includes_the_sink_and_storage_snapshots(monkeypatch):
 def test_close_reports_a_capture_that_stopped(monkeypatch, caplog):
     ring = _StatusRing({
         "failure_policy": "disable_capture", "failed": True,
-        "failure": "record capture stall budget exhausted",
+        "failure": "NativePackSink: sink refused durable admission: dropped",
         "discarded_descriptors": 4, "discarded_payloads": 5,
-        "step_stall_budget_ms": 50, "stall_budget_exhaustions": 1,
+        "step_stall_budget_ms": 50, "stall_budget_exhaustions": 0,
+        "skipped_steps": 0,
         "reserve_wait_ns": 0, "max_step_wait_ns": 0,
     })
     engine, _runtime, _created = _record_engine(
-        monkeypatch, ring, failure_policy="disable_capture",
-        step_stall_budget_ms=50)
+        monkeypatch, ring, record_sink=_Sink(),
+        failure_policy="disable_capture", step_stall_budget_ms=50)
     with caplog.at_level(logging.WARNING, logger="dmi.engine"):
         engine.close()
     assert ring.stop_calls == 1
     messages = [record.getMessage() for record in caplog.records]
-    assert any("stall budget exhausted" in message and "5 payloads" in message
+    assert any("durable admission" in message and "5 payloads" in message
+               for message in messages), messages
+
+
+def test_close_reports_skipped_steps(monkeypatch, caplog):
+    ring = _StatusRing({
+        "failure_policy": "disable_capture", "failed": False, "failure": "",
+        "discarded_descriptors": 8, "discarded_payloads": 8,
+        "step_stall_budget_ms": 50, "stall_budget_exhaustions": 3,
+        "skipped_steps": 3,
+        "reserve_wait_ns": 0, "max_step_wait_ns": 0,
+    })
+    engine, _runtime, _created = _record_engine(
+        monkeypatch, ring, record_sink=_Sink(),
+        failure_policy="disable_capture", step_stall_budget_ms=50)
+    with caplog.at_level(logging.WARNING, logger="dmi.engine"):
+        engine.close()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("3 steps" in message and "stall budget" in message
                for message in messages), messages

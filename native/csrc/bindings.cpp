@@ -770,6 +770,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              out["discarded_payloads"] = status.discarded_payloads;
              out["step_stall_budget_ms"] = status.step_stall_budget_ms;
              out["stall_budget_exhaustions"] = status.stall_budget_exhaustions;
+             out["skipped_steps"] = status.skipped_steps;
              out["reserve_wait_ns"] = status.reserve_wait_ns;
              out["max_step_wait_ns"] = status.max_step_wait_ns;
              return out;

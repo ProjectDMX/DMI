@@ -51,11 +51,19 @@ struct RingConfig {
 struct RecordRuntimeOptions {
     ring::RecordFailurePolicy failure_policy =
         ring::RecordFailurePolicy::kRaiseAtProducer;
-    // Cap on the time the record reservations of one step (see
-    // begin_record_step) may wait for the drain to free ring space.  Past
-    // it the policy applies: kRaiseAtProducer raises from the reservation,
-    // kDisableCapture latches the failure and stops capture.  0 waits
-    // without bound, as before the budget existed.
+    // Cap on the time the record reservations of one step may wait for the
+    // drain to free ring space.  A step starts at begin_record_step(), which
+    // the integration calls once per model step: the record ring sees no
+    // step boundary of its own (see begin_record_step), so with a budget a
+    // reservation before the first begin_record_step() is refused.  Past
+    // the budget the rest of that step's records are skipped (discarded and
+    // counted in skipped_steps) and capture resumes at the next step; under
+    // kRaiseAtProducer the exhaustion is then raised at the next
+    // begin_record_step() and at flush.  The skip still waits for the one
+    // envelope the sink is admitting, so a budget needs a sink with an
+    // admission bound (RecordSink::admission_bound) and construction
+    // refuses one without.  0 waits without bound, as before the budget
+    // existed.
     uint64_t step_stall_budget_ms = 0;
 };
 
@@ -69,6 +77,8 @@ struct RecordCaptureStatus {
     uint64_t discarded_payloads = 0;
     uint64_t step_stall_budget_ms = 0;
     uint64_t stall_budget_exhaustions = 0;
+    // Steps whose remaining records were skipped because the budget ran out.
+    uint64_t skipped_steps = 0;
     // Time record reservations spent waiting for the drain, in total and
     // for the worst step.  The producer-stream synchronisation before each
     // wait is not included: that is the forward's own GPU work.
@@ -210,7 +220,13 @@ public:
         const std::vector<std::pair<uint64_t, bool>>& reservation_items);
 
     // Start a new step for the stall budget: the reservations after this
-    // call share one fresh budget.
+    // call share one fresh budget, and a step skipped for a spent budget
+    // ends.  Under kRaiseAtProducer it first raises a failure latched
+    // during the previous step, including a spent budget, so the error
+    // surfaces here, outside the forward.  Explicit because the ring has no
+    // reliable step boundary of its own: eager hooks reserve per output
+    // (and output ids repeat within a step), and a CUDA-graph step replays
+    // one plan, or several with piecewise graphs.
     void begin_record_step();
 
     RecordCaptureStatus record_capture_status() const;

@@ -15,6 +15,8 @@
 #include <atomic>
 #include <chrono>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -29,6 +31,16 @@ namespace ring_py {
 namespace {
 
 using FlushClock = std::chrono::steady_clock;
+
+std::string describe(const std::exception_ptr& failure) {
+    try {
+        std::rethrow_exception(failure);
+    } catch (const std::exception& error) {
+        return error.what();
+    } catch (...) {
+        return "unknown record failure";
+    }
+}
 
 void check_flush_cuda(cudaError_t error, const char* operation) {
     if (error == cudaSuccess) return;
@@ -139,13 +151,24 @@ struct RingEnginePy::Impl {
     at::Tensor       payload_view;
     bool             record_mode{false};
 
-    // Record rings only.  The step counter is written by the reserving
+    // Record rings only.  The step state is written by the reserving
     // thread; the atomics let record_capture_status read from any thread.
     RecordRuntimeOptions         record_options;
+    // The sink's admission bound, when a budget needs one (see the ctor).
+    FlushClock::duration         sink_admission_bound{};
     std::atomic<uint64_t>        step_wait_ns{0};
     std::atomic<uint64_t>        reserve_wait_ns{0};
     std::atomic<uint64_t>        max_step_wait_ns{0};
     std::atomic<uint64_t>        stall_budget_exhaustions{0};
+    std::atomic<uint64_t>        skipped_steps{0};
+    // begin_record_step() has run at least once.
+    std::atomic<bool>            step_started{false};
+    // This step's budget ran out: its remaining records are being skipped.
+    std::atomic<bool>            skipping_step{false};
+    // kRaiseAtProducer: the spent budget, raised at the next step boundary
+    // and at flush rather than inside the forward that ran out of it.
+    mutable std::mutex           step_failure_mu;
+    std::exception_ptr           step_failure;
 
     Impl(ring::RingConfig cfg, SubmitFn sf)
         : engine(std::move(cfg), fifo, std::move(sf))
@@ -164,6 +187,23 @@ struct RingEnginePy::Impl {
         : engine(std::move(cfg), std::move(lease), options.failure_policy),
           record_mode(true), record_options(options)
     {
+        if (options.step_stall_budget_ms != 0) {
+            // Past the budget the forward still waits for the one envelope
+            // the sink is admitting; only a sink that bounds its admission
+            // makes that wait, and so the step's stall, bounded.
+            const auto sink = engine.record_sink();
+            const auto bound = sink ? sink->admission_bound() : std::nullopt;
+            if (!bound) {
+                throw std::invalid_argument(
+                    "step_stall_budget_ms needs a record sink with an "
+                    "admission bound (a NativePackSink with overload "
+                    "'drop_newest', or 'block' with an admission_timeout_s); "
+                    "this sink's admission has no bound, so a stall past the "
+                    "budget would not be bounded either");
+            }
+            sink_admission_bound =
+                std::chrono::duration_cast<FlushClock::duration>(*bound);
+        }
         const auto& state = engine.ring_state();
         int dev_idx = 0;
         cudaGetDevice(&dev_idx);
@@ -190,8 +230,10 @@ struct RingEnginePy::Impl {
     // producers already queued, then drain the ring.  The drain is held back
     // by the record worker, and the worker by the sink, so this is where a
     // slow or stuck sink reaches the forward.  The wait is bounded by what
-    // is left of this step's stall budget; past it the failure policy
-    // applies.
+    // is left of this step's stall budget.  Past it the rest of the step is
+    // skipped: the records queued for the sink and every record the step
+    // still reserves are discarded, which leaves the drain waiting only for
+    // the envelope the sink is admitting.
     void wait_for_record_space() {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
         cudaStreamSynchronize(stream);
@@ -200,13 +242,16 @@ struct RingEnginePy::Impl {
         const bool disable = record_options.failure_policy ==
             ring::RecordFailurePolicy::kDisableCapture;
         const auto started = FlushClock::now();
-        // Once capture is off the worker discards instead of submitting, so
-        // the sink is out of the path and only the device-to-host copy of
-        // what the ring already holds is left to wait for.
-        if (record_options.step_stall_budget_ms == 0 ||
-            (disable && consumer.failed())) {
+        if (record_options.step_stall_budget_ms == 0) {
             drain.force_flush_and_wait_until(FlushClock::time_point::max());
             account_record_wait(started);
+            return;
+        }
+        // Already skipping this step, or capture is off: the worker discards
+        // instead of submitting, so the sink is out of the path.
+        if (skipping_step.load(std::memory_order_relaxed) ||
+            (disable && consumer.failed())) {
+            wait_past_the_budget(started);
             return;
         }
         const auto budget = std::chrono::duration_cast<FlushClock::duration>(
@@ -221,25 +266,60 @@ struct RingEnginePy::Impl {
         if (drained) return;
 
         stall_budget_exhaustions.fetch_add(1, std::memory_order_relaxed);
-        const auto step_ms =
-            step_wait_ns.load(std::memory_order_relaxed) / 1'000'000ull;
+        skipped_steps.fetch_add(1, std::memory_order_relaxed);
+        skipping_step.store(true, std::memory_order_relaxed);
+        consumer.begin_discard_window();
+        if (!disable) {
+            const auto step_ms =
+                step_wait_ns.load(std::memory_order_relaxed) / 1'000'000ull;
+            std::lock_guard<std::mutex> lock(step_failure_mu);
+            if (!step_failure) {
+                step_failure = std::make_exception_ptr(std::runtime_error(
+                    "record capture stall budget exhausted: reservations "
+                    "waited " + std::to_string(step_ms) + " ms in one step "
+                    "for the sink to free ring space (step_stall_budget_ms=" +
+                    std::to_string(record_options.step_stall_budget_ms) +
+                    "); the rest of that step was not captured"));
+            }
+        }
+        // The reservation must still complete: under CUDA-graph replay the
+        // producers launch whatever the host decides.
+        wait_past_the_budget(FlushClock::now());
+    }
+
+    // With the sink out of the path, what is left is the envelope it is
+    // admitting (at most its admission bound) and copying out what the ring
+    // holds.  A sink that holds the worker past its own bound is a ring
+    // failure under either policy: the alternative is a forward that never
+    // returns.
+    void wait_past_the_budget(FlushClock::time_point started) {
+        auto& drain = engine.drain_thread();
+        const auto deadline = started + sink_admission_bound + kDrainGrace;
+        const bool drained = drain.force_flush_and_wait_until(deadline);
+        account_record_wait(started);
+        if (drained) return;
         const std::exception_ptr failure =
             std::make_exception_ptr(std::runtime_error(
-                "record capture stall budget exhausted: reservations waited " +
-                std::to_string(step_ms) + " ms this step for the sink to "
-                "free ring space (step_stall_budget_ms=" +
-                std::to_string(record_options.step_stall_budget_ms) + ")"));
-        // Latched in the consumer either way, so the checked flush, the
-        // capture status and close report it.
-        consumer.record_failure(failure);
-        if (!disable) std::rethrow_exception(failure);
-        // Capture is off now, so the drain is held back only by the one sink
-        // admission already in progress (bounded by the sink's own admission
-        // timeout).  The reservation must still complete: under CUDA-graph
-        // replay the producers launch whatever the host decides.
-        const auto resumed = FlushClock::now();
-        drain.force_flush_and_wait_until(FlushClock::time_point::max());
-        account_record_wait(resumed);
+                "record sink held the ring past its admission bound (" +
+                std::to_string(std::chrono::duration_cast<
+                    std::chrono::milliseconds>(sink_admission_bound).count()) +
+                " ms, plus " +
+                std::to_string(std::chrono::duration_cast<
+                    std::chrono::milliseconds>(kDrainGrace).count()) +
+                " ms to drain the ring)"));
+        engine.record_consumer().record_failure(failure);
+        std::rethrow_exception(failure);
+    }
+
+    // What the drain may take, once the sink is out of the path, to copy out
+    // and discard everything the ring holds.
+    static constexpr FlushClock::duration kDrainGrace =
+        std::chrono::seconds(2);
+
+    // kRaiseAtProducer: the spent budget of an earlier step, if any.
+    std::exception_ptr pending_step_failure() const {
+        std::lock_guard<std::mutex> lock(step_failure_mu);
+        return step_failure;
     }
 };
 
@@ -590,6 +670,15 @@ int RingEnginePy::reserve_record(
         ring::RecordFailurePolicy::kRaiseAtProducer) {
         impl_->engine.record_consumer().rethrow_if_failed();
     }
+    if (impl_->record_options.step_stall_budget_ms != 0 &&
+        !impl_->step_started.load(std::memory_order_relaxed)) {
+        // Without step boundaries the budget would span the runtime's whole
+        // life, and once spent every later wait would skip at once.
+        throw std::logic_error(
+            "step_stall_budget_ms is set, but no record step has begun: call "
+            "RecordRuntime.begin_step() once per model step, before its "
+            "first reservation");
+    }
 
     if (reservation_bytes > effective_cap || num_tasks > task_cap) {
         impl_->wait_for_record_space();
@@ -629,7 +718,21 @@ void RingEnginePy::begin_record_step() {
     if (!impl_->record_mode) {
         throw std::logic_error("record steps require a record ring");
     }
+    auto& consumer = impl_->engine.record_consumer();
+    if (impl_->record_options.failure_policy ==
+        ring::RecordFailurePolicy::kRaiseAtProducer) {
+        // A spent budget latches here, at the step boundary: from now on
+        // the runtime is failed like after any other refusal.
+        if (const std::exception_ptr failure = impl_->pending_step_failure()) {
+            consumer.record_failure(failure);
+        }
+        consumer.rethrow_if_failed();
+    }
     impl_->step_wait_ns.store(0, std::memory_order_relaxed);
+    impl_->step_started.store(true, std::memory_order_relaxed);
+    if (impl_->skipping_step.exchange(false, std::memory_order_relaxed)) {
+        consumer.end_discard_window();
+    }
 }
 
 RecordCaptureStatus RingEnginePy::record_capture_status() const {
@@ -647,6 +750,14 @@ RecordCaptureStatus RingEnginePy::record_capture_status() const {
     status.step_stall_budget_ms = impl_->record_options.step_stall_budget_ms;
     status.stall_budget_exhaustions =
         impl_->stall_budget_exhaustions.load(std::memory_order_relaxed);
+    status.skipped_steps =
+        impl_->skipped_steps.load(std::memory_order_relaxed);
+    if (!status.failed) {
+        if (const std::exception_ptr failure = impl_->pending_step_failure()) {
+            status.failed = true;
+            status.failure = describe(failure);
+        }
+    }
     status.reserve_wait_ns =
         impl_->reserve_wait_ns.load(std::memory_order_relaxed);
     status.max_step_wait_ns =
@@ -681,6 +792,9 @@ bool RingEnginePy::flush_records_and_wait(uint64_t timeout_ms) {
     drain.rethrow_drain_failure();
     drain.rethrow_record_reclaim_failure();
     consumer.rethrow_if_failed();
+    if (const std::exception_ptr failure = impl_->pending_step_failure()) {
+        std::rethrow_exception(failure);
+    }
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     if (!wait_for_stream_prefix_until(stream, deadline)) return false;
@@ -702,14 +816,22 @@ bool RingEnginePy::flush_records_and_wait(uint64_t timeout_ms) {
 
     const auto sink = impl_->engine.record_sink();
     if (sink) {
-        sink->rethrow_if_failed();
-        const auto before_sink = FlushClock::now();
-        if (before_sink >= deadline) return false;
-        const auto sink_timeout =
-            std::chrono::duration_cast<ring::RecordSink::Duration>(
-                deadline - before_sink);
-        if (!sink->flush_and_wait(sink_timeout)) return false;
-        sink->rethrow_if_failed();
+        try {
+            sink->rethrow_if_failed();
+            const auto before_sink = FlushClock::now();
+            if (before_sink >= deadline) return false;
+            const auto sink_timeout =
+                std::chrono::duration_cast<ring::RecordSink::Duration>(
+                    deadline - before_sink);
+            if (!sink->flush_and_wait(sink_timeout)) return false;
+            sink->rethrow_if_failed();
+        } catch (...) {
+            // A sink failure found at the barrier (a pipeline failure, a
+            // record lost after admission) is as much a refusal as one at
+            // submit: it latches, so capture stops and says why.
+            consumer.record_failure(std::current_exception());
+            throw;
+        }
     }
     if (FlushClock::now() > deadline) return false;
     return true;

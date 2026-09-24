@@ -359,17 +359,37 @@ class MonitoringEngine:
         runtime; the two paths are never active at the same time.
 
         ``failure_policy`` decides what a sink refusal (a dropped, timed-out
-        or oversized record, or a sink failure) does to the forward:
-        ``"raise"`` raises from the next record reservation or descriptor
+        or oversized record, a record lost after admission, or a sink
+        failure) does to the forward: ``"raise"`` raises it from the next
+        ``RecordRuntime.begin_step``, record reservation or descriptor
         push; ``"disable_capture"`` stops capture, discards what follows
         and keeps the forward running. Either way ``flush_and_wait`` raises
         the failure, ``capture_status()`` reports it and ``close`` logs it.
 
         ``step_stall_budget_ms`` caps how long the record reservations of
-        one step (see ``RecordRuntime.begin_step``) may wait for the sink to
-        free ring space; past it the policy applies. ``None`` waits without
-        bound. Under ``"disable_capture"`` the forward's stall per step is
-        then at most the budget plus one sink admission timeout.
+        one step may wait for the sink to free ring space. A step is what
+        lies between two ``RecordRuntime.begin_step()`` calls; with a budget
+        the integration must call it once per model step, and a reservation
+        before the first call is refused. Past the budget the rest of that
+        step is skipped -- the records still queued for the sink and the
+        ones the step reserves afterwards are discarded and counted in
+        ``skipped_steps`` -- and capture resumes at the next step. Under
+        ``"raise"`` the exhaustion is then raised at the next ``begin_step``
+        and at ``flush_and_wait``, outside the forward. ``None`` waits
+        without bound.
+
+        The skip still waits for the one envelope the sink is admitting,
+        so a budget requires a sink that bounds its admission, and is
+        refused otherwise: the ClickHouse host path (``record_sink=None``
+        without the persistent backend), a sink whose ``admission_bound_s``
+        is None (a ``NativePackSink`` with ``overload="block"`` and no
+        ``admission_timeout_s``, the reference bridge), or a persistent
+        ``capture_sink_config`` with block and no timeout. With a bounded
+        sink a step stalls the forward for at most the budget plus the
+        sink's admission bound (``admission_timeout_s`` under block, zero
+        under drop_newest), plus the time to copy out what the ring holds;
+        a sink that holds the ring past its bound plus a 2 s drain grace
+        raises from the reservation under either policy.
         """
 
         if getattr(self, "_storage_backend", "auto") == "none":
@@ -379,7 +399,7 @@ class MonitoringEngine:
                 "or 'persistent' to capture"
             )
         self._validate_record_failure_options(
-            failure_policy, step_stall_budget_ms)
+            failure_policy, step_stall_budget_ms, record_sink)
         transport = self._ring_transport
         ring_config = self._ring_config
         if transport is None or ring_config is None:
@@ -413,7 +433,8 @@ class MonitoringEngine:
         return runtime
 
     def _validate_record_failure_options(
-        self, failure_policy: Any, step_stall_budget_ms: Any
+        self, failure_policy: Any, step_stall_budget_ms: Any,
+        record_sink: Optional[Any],
     ) -> None:
         if failure_policy not in RECORD_FAILURE_POLICIES:
             raise ValueError(
@@ -425,20 +446,42 @@ class MonitoringEngine:
             raise ValueError(
                 "step_stall_budget_ms must be a positive int, or None to wait "
                 "without bound")
+        if step_stall_budget_ms is not None:
+            # Past the budget the forward still waits for the envelope the
+            # sink is admitting; only a bounded admission bounds that wait.
+            # The native ring refuses the same, later; this refuses before
+            # the live ring is torn down.
+            self._refuse_an_unbounded_sink_admission(record_sink)
+
+    def _refuse_an_unbounded_sink_admission(
+        self, record_sink: Optional[Any]
+    ) -> None:
+        needs = ("step_stall_budget_ms needs a record sink whose admission "
+                 "is bounded, because past the budget the forward still "
+                 "waits for the envelope the sink is admitting")
+        if record_sink is not None:
+            if getattr(record_sink, "admission_bound_s", None) is None:
+                raise ValueError(
+                    f"{needs}; this {type(record_sink).__name__} has no "
+                    "admission bound (admission_bound_s is None). Use a "
+                    "NativePackSink with overload='drop_newest', or 'block' "
+                    "with an admission_timeout_s")
+            return
         sink_config = self._capture_sink_config
-        if (
-            failure_policy == "disable_capture"
-            and self._storage_backend == "persistent"
-            and sink_config is not None
-            and sink_config.overload == "block"
-            and sink_config.admission_timeout_s is None
-        ):
-            # Once capture latches, the forward still waits for the one sink
-            # admission in progress. Without a timeout that wait has no bound.
-            raise ValueError(
-                "failure_policy='disable_capture' needs a bounded sink "
-                "admission: set capture_sink_config.admission_timeout_s, or "
-                "overload='drop_newest'")
+        if (getattr(self, "_storage_backend", "auto") == "persistent"
+                and sink_config is not None):
+            if (sink_config.overload == "block"
+                    and sink_config.admission_timeout_s is None):
+                raise ValueError(
+                    f"{needs}; set capture_sink_config.admission_timeout_s, "
+                    "or overload='drop_newest'")
+            return
+        raise ValueError(
+            f"{needs}; the ClickHouse host path (record_sink=None) has "
+            "none: it enqueues row by row under the host engine's ingress "
+            "policy, with no bound per envelope. Capture through a "
+            "NativePackSink (storage_backend='persistent', or record_sink=) "
+            "to use a budget")
 
     def _start_capture_storage(self, *, sweep_spool: bool) -> Optional[Any]:
         config = self._capture_storage_config
@@ -575,10 +618,14 @@ class MonitoringEngine:
     def capture_status(self) -> dict[str, Any]:
         """The record runtime's capture state, for monitoring and RPCs.
 
-        ``capture_active`` is False once a failure latched: under
-        ``"disable_capture"`` the forward keeps running and ``failure``
-        says why capture stopped; ``discarded_*`` count what was dropped
-        after it. ``reserve_wait_s`` and ``max_step_wait_s`` are the time
+        ``capture_active`` is False once a failure latched (under
+        ``"raise"``, also once a spent stall budget is waiting to be raised
+        at the next step): under ``"disable_capture"`` the forward keeps
+        running and ``failure`` says why capture stopped. ``skipped_steps``
+        counts steps whose rest was skipped because the stall budget ran
+        out; under ``"disable_capture"`` capture stays active through them.
+        ``discarded_*`` count the records dropped by a skip or after a
+        latch. ``reserve_wait_s`` and ``max_step_wait_s`` are the time
         record reservations waited for the sink (in total, and in the
         worst step). ``sink`` and ``storage`` are the native pack sink's
         and storage service's snapshots, when the engine holds them.
@@ -589,6 +636,7 @@ class MonitoringEngine:
             "failure_policy": None, "failure": None,
             "discarded_descriptors": 0, "discarded_payloads": 0,
             "step_stall_budget_ms": None, "stall_budget_exhaustions": 0,
+            "skipped_steps": 0,
             "reserve_wait_s": 0.0, "max_step_wait_s": 0.0,
             "sink": None, "storage": None,
         }
@@ -605,6 +653,7 @@ class MonitoringEngine:
             discarded_payloads=int(native["discarded_payloads"]),
             step_stall_budget_ms=int(native["step_stall_budget_ms"]) or None,
             stall_budget_exhaustions=int(native["stall_budget_exhaustions"]),
+            skipped_steps=int(native["skipped_steps"]),
             reserve_wait_s=int(native["reserve_wait_ns"]) / 1e9,
             max_step_wait_s=int(native["max_step_wait_ns"]) / 1e9,
         )
@@ -616,13 +665,23 @@ class MonitoringEngine:
         return status
 
     def _report_capture_failure(self) -> None:
-        """Log, once, why capture stopped, as a record ring is retired."""
+        """Log, once, why capture stopped or skipped steps, as a record
+        ring is retired."""
         try:
             status = self.capture_status()
         except Exception as exc:
             _LOG.warning("capture status unavailable at close: %s", exc)
             return
-        if not status["record_mode"] or status["capture_active"]:
+        if not status["record_mode"]:
+            return
+        if status["skipped_steps"]:
+            _LOG.warning(
+                "record capture skipped the rest of %d steps whose stall "
+                "budget (%s ms) ran out; %d descriptors and %d payloads "
+                "discarded", status["skipped_steps"],
+                status["step_stall_budget_ms"],
+                status["discarded_descriptors"], status["discarded_payloads"])
+        if status["capture_active"]:
             return
         _LOG.warning(
             "record capture stopped before close (failure_policy=%s): %s; "

@@ -8,8 +8,10 @@ the slowest step took.
 
 The stalling sink is a Python target behind the native reference bridge:
 its admission sleeps, like a block-mode sink waiting for queue room, or
-refuses, like one that dropped a record. The burst case uses the real
-NativePackSink with its default config.
+refuses, like one that dropped a record. The bridge is told the target's
+admission time as its admission bound, standing in for a block-mode
+NativePackSink's admission_timeout_s (a budget is refused for a sink with
+no bound). The burst and lost-record cases use the real NativePackSink.
 
 Build: make -C native SM_ARCH=... PYTHON=... (and cpu-goals for the sink)
 """
@@ -127,7 +129,8 @@ def _run_steps(record_sink, *, policy, budget_ms, payload_bytes=4096,
 
     engine = MonitoringEngine(model_id="policy-gpu",
                               ring_config=_ring_config(payload_bytes))
-    outcome = {"step_s": [], "errors": [], "flush_error": None}
+    outcome = {"step_s": [], "errors": [], "begin_errors": [],
+               "flush_error": None}
     try:
         runtime = engine.create_record_runtime(
             CaptureRecordFormat(), record_sink=record_sink,
@@ -139,7 +142,10 @@ def _run_steps(record_sink, *, policy, budget_ms, payload_bytes=4096,
         tensor = torch.arange(elements, dtype=torch.float32, device="cuda")
         for step in range(steps):
             hook_runtime.metadata = _metadata(step, tensor)
-            runtime.begin_step()
+            try:
+                runtime.begin_step()
+            except RuntimeError as exc:
+                outcome["begin_errors"].append((step, str(exc)))
             started = time.monotonic()
             try:
                 hook(tensor + step)
@@ -164,54 +170,113 @@ def _slow_sink(target):
     from dmi.transport import native
 
     return native.ReferencePythonCaptureSink(
-        target, CaptureRecordFormat.LAYOUT_NAME)
+        target, CaptureRecordFormat.LAYOUT_NAME,
+        admission_bound_s=target.admission_s)
 
 
-def test_disable_capture_keeps_the_forward_running_through_a_stalled_sink(
-        caplog):
-    """A 4 KiB ring against a sink that takes 400 ms per record: the ninth
-    record's reservation waits for the sink. With a 50 ms budget every step
-    returns, none waits longer than the budget plus one admission, and
-    capture reports why it stopped."""
+def test_disable_capture_skips_stalled_steps_and_keeps_capturing(caplog):
+    """A 4 KiB ring against a sink that takes 400 ms per record: every few
+    steps a reservation waits for the sink and the 50 ms budget runs out.
+    That step is skipped (its record, and those still queued for the sink,
+    are discarded), no step waits longer than the budget plus one
+    admission, and the next step captures again."""
     target = _Target(admission_s=ADMISSION_S)
     with caplog.at_level(logging.WARNING, logger="dmi.engine"):
         outcome = _run_steps(_slow_sink(target), policy="disable_capture",
                              budget_ms=BUDGET_MS)
 
     assert outcome["errors"] == []
+    assert outcome["begin_errors"] == []
     worst = max(outcome["step_s"])
     assert worst < BUDGET_MS / 1000 + ADMISSION_S + 0.3, outcome["step_s"]
-    status = outcome["status"]
-    assert status["capture_active"] is False
-    assert "stall budget" in status["failure"]
+    status = outcome["flushed_status"]
+    assert status["capture_active"] is True, status
+    assert status["failure"] is None
     assert status["failure_policy"] == "disable_capture"
-    assert status["stall_budget_exhaustions"] == 1
+    assert status["skipped_steps"] >= 1
+    assert status["stall_budget_exhaustions"] == status["skipped_steps"]
     assert status["step_stall_budget_ms"] == BUDGET_MS
     assert status["max_step_wait_s"] >= BUDGET_MS / 1000
-    # Only the record the sink was already admitting reached it; everything
-    # after the latch was dropped on the worker, not submitted.
-    assert target.submitted == 1
-    assert outcome["flushed_status"]["discarded_payloads"] == STEPS - 1
-    assert "stall budget" in outcome["flush_error"]
+    # Capture resumed after a skip, and every record was either stored or
+    # discarded by one.
+    assert target.submitted >= 2
+    assert target.submitted + status["discarded_payloads"] == STEPS
+    assert status["discarded_descriptors"] == status["discarded_payloads"]
+    # A skipped step is not a failure: the flush succeeds.
+    assert outcome["flush_error"] is None
     assert any("stall budget" in r.getMessage() for r in caplog.records)
 
 
-def test_raise_fails_fast_when_the_stall_budget_is_spent():
+def test_raise_skips_the_spent_step_and_raises_at_the_next_begin_step():
     target = _Target(admission_s=ADMISSION_S)
     outcome = _run_steps(_slow_sink(target), policy="raise",
                          budget_ms=BUDGET_MS)
 
-    assert outcome["errors"], "the stalled step must raise under 'raise'"
-    first_step, message = outcome["errors"][0]
+    assert outcome["begin_errors"], "the next step must raise under 'raise'"
+    first_step, message = outcome["begin_errors"][0]
     assert "stall budget" in message
-    # Raised at the budget, not after the sink's 400 ms admission.
-    assert outcome["step_s"][first_step] < 0.3, outcome["step_s"]
-    # Latched: every later step raises at once.
-    assert [step for step, _ in outcome["errors"]] == list(
+    # The step that ran out of budget did not raise inside its forward, and
+    # was bounded by the budget plus one admission.
+    assert all(step >= first_step for step, _ in outcome["errors"])
+    spent = first_step - 1
+    assert outcome["step_s"][spent] >= BUDGET_MS / 1000
+    assert outcome["step_s"][spent] < BUDGET_MS / 1000 + ADMISSION_S + 0.3
+    # Failed from then on: every later step boundary raises.
+    assert [step for step, _ in outcome["begin_errors"]] == list(
         range(first_step, STEPS))
-    assert max(outcome["step_s"][first_step + 1:]) < 0.1
     assert outcome["status"]["capture_active"] is False
     assert "stall budget" in outcome["flush_error"]
+
+
+def test_a_budget_is_refused_until_a_step_has_begun():
+    """Without begin_step the budget would span the runtime's life; the
+    first reservation says so instead of silently spending it."""
+    from dmi.api.v1 import (
+        HookPointV1, HookSpecV1, MonitoringEngine, TransportSpec,
+    )
+    from dmi.storage.capture import CaptureRecordFormat
+
+    engine = MonitoringEngine(model_id="policy-gpu",
+                              ring_config=_ring_config(4096))
+    try:
+        runtime = engine.create_record_runtime(
+            CaptureRecordFormat(), record_sink=_slow_sink(_Target()),
+            failure_policy="disable_capture", step_stall_budget_ms=BUDGET_MS)
+        hook = HookPointV1(
+            HookSpecV1("capture_tensor", (TransportSpec("payload"),)))
+        hook_runtime = _HookRuntime(runtime)
+        runtime.bind_hook(hook, hook_runtime=hook_runtime)
+        tensor = torch.arange(RECORD_ELEMENTS, dtype=torch.float32,
+                              device="cuda")
+        hook_runtime.metadata = _metadata(0, tensor)
+        with pytest.raises(RuntimeError, match="begin_step"):
+            hook(tensor)
+        runtime.begin_step()
+        hook_runtime.metadata = _metadata(1, tensor)
+        hook(tensor)
+        engine.flush_and_wait(30.0)
+    finally:
+        engine.close()
+
+
+def test_a_budget_is_refused_for_a_sink_with_no_admission_bound():
+    from dmi.api.v1 import MonitoringEngine
+    from dmi.storage.capture import CaptureRecordFormat
+    from dmi.transport import native
+
+    engine = MonitoringEngine(model_id="policy-gpu",
+                              ring_config=_ring_config(4096))
+    try:
+        unbounded = native.ReferencePythonCaptureSink(
+            _Target(), CaptureRecordFormat.LAYOUT_NAME)
+        assert unbounded.admission_bound_s is None
+        with pytest.raises(ValueError, match="admission bound"):
+            engine.create_record_runtime(
+                CaptureRecordFormat(), record_sink=unbounded,
+                failure_policy="disable_capture",
+                step_stall_budget_ms=BUDGET_MS)
+    finally:
+        engine.close()
 
 
 def test_disable_capture_turns_a_sink_refusal_into_stopped_capture():
@@ -245,6 +310,10 @@ def test_raise_surfaces_a_sink_refusal_in_a_later_forward():
         range(first_step, STEPS))
     assert all("sink refused durable admission" in message
                for _, message in outcome["errors"])
+    # A step boundary after the latch raises it too, before any forward.
+    assert outcome["begin_errors"]
+    assert all("sink refused durable admission" in message
+               for _, message in outcome["begin_errors"])
     assert outcome["status"]["capture_active"] is False
 
 
@@ -276,3 +345,31 @@ def test_a_burst_four_times_the_sink_queue_is_stored_on_a_record_ring(
     assert status["sink"]["persisted_records"] == 64, status["sink"]
     assert status["sink"]["dropped_records"] == 0
     assert status["sink"]["timed_out_records"] == 0
+
+
+@pytest.mark.skipif(
+    not SINK_BUILT,
+    reason="native/build/_dmi_native_sink*.so is not built; run "
+    "`make -C native cpu-goals PYTHON=<venv>/bin/python`")
+def test_a_record_lost_after_admission_stops_capture_and_says_why(tmp_path):
+    """A 1 MiB record into 1 MiB packs: admitted, then dropped as oversized
+    on the pack worker. The sink reports it at its next submit and at the
+    flush, so under disable_capture capture stops with the reason, nothing
+    raises in a forward, and the flush raises."""
+    from dmi.storage.capture.native_sink import create_native_pack_sink
+    from dmi.storage.native_capture import NativeSinkConfig
+
+    handle = create_native_pack_sink(NativeSinkConfig(
+        spool_root=str(tmp_path / "spool"), max_pack_bytes=1 << 20,
+        max_queue_bytes=4 << 20))
+    outcome = _run_steps(handle.native_sink, policy="disable_capture",
+                         budget_ms=None, payload_bytes=8 << 20, steps=3,
+                         elements=(1 << 20) // 4, pace_s=0.05)
+
+    assert outcome["errors"] == []
+    assert outcome["flush_error"] is not None
+    assert "oversized_records" in outcome["flush_error"]
+    status = outcome["flushed_status"]
+    assert status["capture_active"] is False
+    assert "oversized_records" in status["failure"]
+    assert status["sink"]["persisted_records"] == 0

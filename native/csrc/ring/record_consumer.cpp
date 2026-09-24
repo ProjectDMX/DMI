@@ -36,6 +36,8 @@ void RecordConsumer::latch_locked(std::exception_ptr failure) {
     // at the latch can ever be paired again.
     discarded_descriptors_ += descriptors_.size();
     descriptors_.clear();
+    // Every later payload is discarded by the latch itself.
+    payloads_to_discard_ = 0;
 }
 
 void RecordConsumer::push_descriptor(RecordDescriptor descriptor) {
@@ -45,6 +47,11 @@ void RecordConsumer::push_descriptor(RecordDescriptor descriptor) {
             std::rethrow_exception(failure_);
         }
         ++discarded_descriptors_;
+        return;
+    }
+    if (discarding_) {
+        ++discarded_descriptors_;
+        ++payloads_to_discard_;
         return;
     }
     descriptors_.push_back(std::move(descriptor));
@@ -58,6 +65,11 @@ void RecordConsumer::push_descriptors(
             std::rethrow_exception(failure_);
         }
         discarded_descriptors_ += descriptors.size();
+        return;
+    }
+    if (discarding_) {
+        discarded_descriptors_ += descriptors.size();
+        payloads_to_discard_ += descriptors.size();
         return;
     }
     for (auto& descriptor : descriptors) {
@@ -75,6 +87,14 @@ void RecordConsumer::consume_payload(at::Tensor payload) {
             // Capture is off: the drain still delivers what the forward
             // produced, and the payload is dropped here, never submitted.
             ++discarded_payloads_;
+            return;
+        }
+        if (payloads_to_discard_ != 0) {
+            // A skipped step's record: its descriptor was dropped by a
+            // discard window.
+            --payloads_to_discard_;
+            ++discarded_payloads_;
+            if (payloads_to_discard_ == 0) idle_cv_.notify_all();
             return;
         }
         if (descriptors_.empty()) {
@@ -145,7 +165,8 @@ bool RecordConsumer::wait_until_idle(
     }
     std::unique_lock<std::mutex> lock(mu_);
     const bool ready = idle_cv_.wait_for(lock, timeout, [this] {
-        return failure_ || (descriptors_.empty() && active_payloads_ == 0);
+        return failure_ || (descriptors_.empty() && active_payloads_ == 0 &&
+                            payloads_to_discard_ == 0);
     });
     if (failure_) std::rethrow_exception(failure_);
     return ready;
@@ -163,7 +184,7 @@ void RecordConsumer::rethrow_if_failed() const {
 void RecordConsumer::finish() const {
     std::lock_guard<std::mutex> lock(mu_);
     if (failure_) std::rethrow_exception(failure_);
-    if (!descriptors_.empty()) {
+    if (!descriptors_.empty() || payloads_to_discard_ != 0) {
         invalid("durable completion found leftover encoded descriptors");
     }
     if (active_payloads_ != 0) {
@@ -190,6 +211,19 @@ RecordConsumerSnapshot RecordConsumer::snapshot() const {
     snapshot.discarded_descriptors = discarded_descriptors_;
     snapshot.discarded_payloads = discarded_payloads_;
     return snapshot;
+}
+
+void RecordConsumer::begin_discard_window() {
+    std::lock_guard<std::mutex> lock(mu_);
+    discarding_ = true;
+    discarded_descriptors_ += descriptors_.size();
+    payloads_to_discard_ += descriptors_.size();
+    descriptors_.clear();
+}
+
+void RecordConsumer::end_discard_window() {
+    std::lock_guard<std::mutex> lock(mu_);
+    discarding_ = false;
 }
 
 }  // namespace ring

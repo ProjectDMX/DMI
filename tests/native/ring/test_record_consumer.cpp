@@ -296,6 +296,59 @@ static void test_disable_capture_latches_association_and_worker_failures() {
     EXPECT(throws_runtime_error([&] { worker.rethrow_if_failed(); }));
 }
 
+// A step whose stall budget ran out: the records still queued for the sink
+// and the rest of the step's records are skipped, and the next step is
+// stored again.  Payloads keep pairing with their own descriptors across
+// the window, under either policy, and nothing latches.
+static void test_a_discard_window_skips_one_steps_records(
+        ring::RecordFailurePolicy policy) {
+    std::printf("[ TEST ] a discard window skips one step's records (%s)\n",
+                policy == ring::RecordFailurePolicy::kDisableCapture
+                    ? "disable_capture" : "raise");
+    auto sink = std::make_shared<CapturingSink>();
+    ring::RecordConsumer consumer(sink, policy);
+
+    consumer.push_descriptors({descriptor("step", "queued-1"),
+                               descriptor("step", "queued-2")});
+    consumer.begin_discard_window();
+    EXPECT(!throws_runtime_error([&] {
+        consumer.push_descriptors({descriptor("step", "rest-1"),
+                                   descriptor("step", "rest-2")});
+    }));
+    consumer.end_discard_window();
+    consumer.push_descriptor(descriptor("step", "next-step"));
+
+    // Nothing is idle until every skipped payload has arrived.
+    EXPECT(!consumer.wait_until_idle(std::chrono::milliseconds(5)));
+    EXPECT(throws_runtime_error([&] { consumer.finish(); }));
+    for (float value = 1; value <= 5; ++value) {
+        EXPECT(!throws_runtime_error(
+            [&] { consumer.consume_payload(byte_payload({value})); }));
+    }
+
+    EXPECT(sink->submitted.size() == 1);
+    if (sink->submitted.size() == 1) {
+        EXPECT(std::get<std::string>(
+                   sink->submitted[0].descriptor.rows[0].cells[0]) ==
+               "next-step");
+        EXPECT(at::equal(sink->submitted[0].payload.view(at::kFloat),
+                         at::tensor({5.f})));
+    }
+    const ring::RecordConsumerSnapshot snapshot = consumer.snapshot();
+    EXPECT(!snapshot.failed);
+    EXPECT(snapshot.discarded_descriptors == 4);
+    EXPECT(snapshot.discarded_payloads == 4);
+    EXPECT(consumer.wait_until_idle(std::chrono::milliseconds(5)));
+    EXPECT(!throws_runtime_error([&] { consumer.finish(); }));
+
+    // An empty window skips nothing.
+    consumer.begin_discard_window();
+    consumer.end_discard_window();
+    consumer.push_descriptor(descriptor("step", "after-empty"));
+    consumer.consume_payload(byte_payload({6}));
+    EXPECT(sink->submitted.size() == 2);
+}
+
 int main() {
     setbuf(stdout, nullptr);
     std::printf("test_record_consumer\n");
@@ -306,6 +359,10 @@ int main() {
     test_raise_policy_is_the_default_and_raises_at_the_producer();
     test_disable_capture_discards_after_a_latch_and_still_fails_flush();
     test_disable_capture_latches_association_and_worker_failures();
+    test_a_discard_window_skips_one_steps_records(
+        ring::RecordFailurePolicy::kRaiseAtProducer);
+    test_a_discard_window_skips_one_steps_records(
+        ring::RecordFailurePolicy::kDisableCapture);
     std::printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
