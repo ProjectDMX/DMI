@@ -228,11 +228,9 @@ make -C native capture -j          # the capture extensions only, no CUDA
 make -C native -j CAPTURE=0        # the full backend without them
 ```
 
-They link libcurl. The build takes its directories from `pkg-config libcurl`
-when the `libcurl4-openssl-dev` package is installed, and otherwise uses the
-compiler's default paths. Without root, extract that package together with
-the runtime package `libcurl4` (the dev package's `libcurl.so` links to a
-file that ships in `libcurl4`), and point the build at them:
+They link libcurl. Without root, extract the `libcurl4-openssl-dev` package
+together with the runtime package `libcurl4` (the dev package's `libcurl.so`
+links to a file that ships in `libcurl4`), and point the build at them:
 
 ```bash
 apt-get download libcurl4-openssl-dev libcurl4
@@ -240,10 +238,29 @@ for deb in libcurl4*.deb; do dpkg-deb -x "$deb" "$HOME/curl-sysroot"; done
 make -C native -j CURL_SYSROOT="$HOME/curl-sysroot"
 ```
 
-The extensions load the system's `libcurl.so.4` at runtime, so the sysroot is
-needed only to build. `CURL_INCDIR` and `CURL_LIBDIR` override all of these,
-for example
-`CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu`.
+The build picks libcurl's header directory (`CURL_INCDIR`) and library
+directory (`CURL_LIBDIR`) in this order, each of the two on its own; the first
+that applies wins:
+
+1. `CURL_INCDIR` / `CURL_LIBDIR` set on the command line or in the environment,
+   for example
+   `CURL_INCDIR=/usr/include/x86_64-linux-gnu CURL_LIBDIR=/usr/lib/x86_64-linux-gnu`
+   (what CI passes).
+2. A non-empty `CURL_SYSROOT` set on the command line or in the environment:
+   `$CURL_SYSROOT/usr/include/x86_64-linux-gnu` and
+   `$CURL_SYSROOT/usr/lib/x86_64-linux-gnu`, the layout the extraction above
+   produces. `pkg-config` is not consulted.
+3. `pkg-config libcurl` (the binary named by `PKG_CONFIG`), which knows both
+   wherever `libcurl4-openssl-dev` is installed.
+4. The default sysroot `CURL_SYSROOT_DEFAULT`, laid out as in 2. It defaults to
+   `/tmp/opencode/sysroot`, where one development host keeps its extracted
+   packages, and is used only if that directory exists and is owned by the
+   user running `make`; on any other host it is skipped. Pass
+   `CURL_SYSROOT_DEFAULT=<dir>` to move it.
+5. Neither: no `-I`/`-L` is added, and the compiler's default paths apply.
+
+The extensions load the system's `libcurl.so.4` at runtime, so a sysroot is
+needed only to build.
 
 Smoke check the package and host backend:
 

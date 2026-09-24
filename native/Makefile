@@ -304,7 +304,9 @@ build/bench_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/rec
 #   4. the default sysroot, CURL_SYSROOT_DEFAULT, laid out as in 2 -- only
 #      when that directory exists and belongs to the user running make: an
 #      unowned directory under /tmp must not supply headers and a library to
-#      the build ahead of the system's;
+#      the build ahead of the system's. Its default, /tmp/opencode/sysroot,
+#      is where one development host keeps its extracted packages; anywhere
+#      else it does not exist and is skipped (docs/install.md says so);
 #   5. none at all: no -I/-L, and the compiler's default paths apply.
 # At runtime the store loads the OS's libcurl.so.4.
 PKG_CONFIG ?= pkg-config
