@@ -1150,6 +1150,14 @@ static void test_a_failed_sink_flush_latches_the_runtime() {
     } catch (const std::runtime_error&) {
     }
     EXPECT(sink->submissions.load(std::memory_order_acquire) == 1);
+    // The record worker discards the payload as the drain delivers it, so
+    // the count can trail the flush by a moment.
+    const auto discard_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (engine.record_capture_status().discarded_payloads == 0 &&
+           std::chrono::steady_clock::now() < discard_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
     EXPECT(engine.record_capture_status().discarded_payloads == 1);
     engine.stop();
     CUDA_CHECK(cudaFree(device));

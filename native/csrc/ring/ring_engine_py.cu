@@ -801,6 +801,18 @@ bool RingEnginePy::flush_records_and_wait(uint64_t timeout_ms) {
     auto& consumer = impl_->engine.record_consumer();
     drain.rethrow_drain_failure();
     drain.rethrow_record_reclaim_failure();
+    // Under kDisableCapture a latched failure is reported only once the
+    // drain has delivered what the forward already emitted: the consumer
+    // discards it, so ring and staging space come back and the discard
+    // counters are complete when the caller hears why capture stopped.
+    if (consumer.failed() &&
+        impl_->record_options.failure_policy ==
+            ring::RecordFailurePolicy::kDisableCapture) {
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+        if (wait_for_stream_prefix_until(stream, deadline)) {
+            drain.force_flush_and_wait_until(deadline);
+        }
+    }
     consumer.rethrow_if_failed();
     if (const std::exception_ptr failure = impl_->pending_step_failure()) {
         std::rethrow_exception(failure);
