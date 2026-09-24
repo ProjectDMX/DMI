@@ -284,24 +284,31 @@ build/bench_sink: csrc/sink/pack_sink.cpp csrc/sink/object_key.cpp csrc/sink/rec
 
 # ---- libcurl (the S3 client, the catalog's HTTP client) --------------------
 # Needed by build/conformance_store, build/conformance_catalog and
-# _dmi_native_store. CURL_INCDIR/CURL_LIBDIR resolve in this order:
+# _dmi_native_store. CURL_INCDIR/CURL_LIBDIR resolve in this order (each
+# of the two on its own):
 #   1. set on the command line or in the environment -- CI passes the system
 #      paths, and this always wins;
-#   2. `pkg-config libcurl`, which knows them wherever the dev package
-#      (libcurl4-openssl-dev on Debian/Ubuntu) is installed;
-#   3. the packages extracted under CURL_SYSROOT, for a host without root.
-#      The dev package's libcurl.so links to a file in the runtime package,
-#      so both go in:
+#   2. a CURL_SYSROOT set on the command line or in the environment: the
+#      packages extracted there, for a host without root. The dev package's
+#      libcurl.so links to a file in the runtime package, so both go in:
 #        apt-get download libcurl4-openssl-dev libcurl4
 #        for deb in libcurl4*.deb; do dpkg-deb -x "$deb" <sysroot>; done
-#   4. none at all: no -I/-L, and the compiler's default paths apply.
-# CURL_SYSROOT defaults to CURL_SYSROOT_DEFAULT only when that directory
-# exists and belongs to the user running make: an unowned directory under
-# /tmp must not supply headers and a library to the build ahead of the
-# system's. At runtime the store loads the OS's libcurl.so.4.
+#      Ahead of pkg-config, because naming a sysroot is asking for it: behind
+#      it, a host that also has a libcurl.pc ignored the sysroot silently;
+#   3. `pkg-config libcurl`, which knows them wherever the dev package
+#      (libcurl4-openssl-dev on Debian/Ubuntu) is installed;
+#   4. the default sysroot, CURL_SYSROOT_DEFAULT, laid out as in 2 -- only
+#      when that directory exists and belongs to the user running make: an
+#      unowned directory under /tmp must not supply headers and a library to
+#      the build ahead of the system's;
+#   5. none at all: no -I/-L, and the compiler's default paths apply.
+# At runtime the store loads the OS's libcurl.so.4.
 PKG_CONFIG ?= pkg-config
+CURL_SYSROOT_EXPLICIT := $(if $(filter command line environment,$(origin CURL_SYSROOT)),$(strip $(CURL_SYSROOT)))
 ifneq ($(filter undefined,$(origin CURL_INCDIR) $(origin CURL_LIBDIR)),)
+ifeq ($(CURL_SYSROOT_EXPLICIT),)
 CURL_PKG_CONFIG_FOUND := $(shell $(PKG_CONFIG) --exists libcurl 2>/dev/null && echo yes)
+endif
 endif
 ifeq ($(CURL_PKG_CONFIG_FOUND),yes)
 ifeq ($(origin CURL_INCDIR),undefined)

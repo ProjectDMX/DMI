@@ -445,9 +445,11 @@ _NATIVE_DIR = Path(__file__).resolve().parents[1] / "native"
 _EXT_SUFFIX = __import__("sysconfig").get_config_var("EXT_SUFFIX")
 
 
-def _make(*args: str) -> subprocess.CompletedProcess[str]:
+def _make(*args: str, environment: dict[str, str] | None = None
+          ) -> subprocess.CompletedProcess[str]:
     # The caller's make state must not leak in: MAKEFLAGS carries command-line
     # overrides such as CURL_INCDIR from an enclosing `make test-cpu ...`.
+    # `environment` is what a test sets there on purpose instead.
     env = {
         key: value
         for key, value in __import__("os").environ.items()
@@ -455,6 +457,7 @@ def _make(*args: str) -> subprocess.CompletedProcess[str]:
                        "CURL_INCDIR", "CURL_LIBDIR", "CURL_SYSROOT",
                        "PKG_CONFIG"}
     }
+    env.update(environment or {})
     return subprocess.run(
         ["make", "-C", str(_NATIVE_DIR), f"PYTHON={sys.executable}", *args],
         capture_output=True,
@@ -541,22 +544,33 @@ def test_capture_targets_are_named_after_the_files_they_produce():
 
 @pytest.mark.cpu
 @pytest.mark.parametrize(
-    ("overrides", "include", "library"),
+    ("overrides", "environment", "include", "library"),
     [
         # CI's invocation: explicit directories win over pkg-config.
-        (("CURL_INCDIR=/explicit/include", "CURL_LIBDIR=/explicit/lib"),
+        (("CURL_INCDIR=/explicit/include", "CURL_LIBDIR=/explicit/lib"), {},
          "/explicit/include", "/explicit/lib"),
+        # A sysroot the user names wins over pkg-config too: asking for it
+        # is the only reason to pass it. On the command line...
+        (("CURL_SYSROOT=/sysroot",), {},
+         "/sysroot/usr/include/x86_64-linux-gnu",
+         "/sysroot/usr/lib/x86_64-linux-gnu"),
+        # ...or exported.
+        ((), {"CURL_SYSROOT": "/sysroot"},
+         "/sysroot/usr/include/x86_64-linux-gnu",
+         "/sysroot/usr/lib/x86_64-linux-gnu"),
         # A host with the dev package: pkg-config names the directories.
-        ((), "/pkgconfig/include", "/pkgconfig/lib"),
+        ((), {}, "/pkgconfig/include", "/pkgconfig/lib"),
         # No pkg-config entry: the extracted dev package under CURL_SYSROOT.
-        (("PKG_CONFIG=false", "CURL_SYSROOT=/sysroot"),
+        (("PKG_CONFIG=false", "CURL_SYSROOT=/sysroot"), {},
          "/sysroot/usr/include/x86_64-linux-gnu",
          "/sysroot/usr/lib/x86_64-linux-gnu"),
     ],
-    ids=["explicit", "pkg-config", "sysroot-fallback"],
+    ids=["explicit", "sysroot-over-pkg-config",
+         "sysroot-from-environment-over-pkg-config", "pkg-config",
+         "sysroot-fallback"],
 )
 def test_libcurl_directories_resolve_in_documented_order(
-    tmp_path, overrides, include, library
+    tmp_path, overrides, environment, include, library
 ):
     fake = tmp_path / "pkg-config"
     fake.write_text(
@@ -569,7 +583,7 @@ def test_libcurl_directories_resolve_in_documented_order(
     )
     fake.chmod(0o755)
     result = _make("-B", "-n", "build/conformance_store",
-                   f"PKG_CONFIG={fake}", *overrides)
+                   f"PKG_CONFIG={fake}", *overrides, environment=environment)
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     link = next(argv for argv in _commands(result.stdout) if "-o" in argv
