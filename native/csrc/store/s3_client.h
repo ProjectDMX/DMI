@@ -32,6 +32,12 @@ struct S3Config {
   std::string secret_key;
   std::string session_token;  // empty when unused
   bool allow_insecure_http = false;
+  // https only: trust a private CA. ca_file is a PEM bundle
+  // (CURLOPT_CAINFO), ca_path an OpenSSL-hashed certificate directory
+  // (CURLOPT_CAPATH). Both empty uses libcurl's default trust store. Either
+  // way https always verifies the peer and the host name.
+  std::string ca_file;
+  std::string ca_path;
   int connect_timeout_s = 5;
   int read_timeout_s = 120;
   int max_attempts = 4;

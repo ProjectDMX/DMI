@@ -1,6 +1,8 @@
 #include "s3_client.h"
 
 #include <curl/curl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstring>
@@ -109,6 +111,20 @@ std::string XmlTag(const std::string& xml, const std::string& tag) {
   return xml.substr(start, end - start);
 }
 
+// Checked when the client is built, so a mistyped path fails with its name
+// rather than as libcurl's "problem with the SSL CA cert" at the first
+// request.
+bool IsReadableFile(const std::string& path) {
+  struct stat st {};
+  return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
+         ::access(path.c_str(), R_OK) == 0;
+}
+
+bool IsDirectory(const std::string& path) {
+  struct stat st {};
+  return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 }  // namespace
 
 std::string S3Client::ValidateConfig(const S3Config& config) {
@@ -117,6 +133,17 @@ std::string S3Client::ValidateConfig(const S3Config& config) {
     // Silently downgrading TLS was never the intent of the flag -- it gates
     // plain http:// endpoints for local Garage.
     return "https endpoint with allow_insecure_http is refused";
+  }
+  if (!https && (!config.ca_file.empty() || !config.ca_path.empty())) {
+    // A CA on a plain-http endpoint would read as "this is TLS" while every
+    // byte, credentials included, goes in the clear.
+    return "ca_file and ca_path apply only to an https endpoint";
+  }
+  if (!config.ca_file.empty() && !IsReadableFile(config.ca_file)) {
+    return "ca_file is not a readable file: " + config.ca_file;
+  }
+  if (!config.ca_path.empty() && !IsDirectory(config.ca_path)) {
+    return "ca_path is not a directory: " + config.ca_path;
   }
   if (config.multipart_chunk_bytes < kMinMultipartPartBytes) {
     // The Python store refuses the same (s3.py _MIN_MULTIPART_BYTES). Left
@@ -235,15 +262,24 @@ S3Response S3Client::Exchange(
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, config_.connect_timeout_s);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, config_.read_timeout_s);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    if (!is_https_) {
-      // Plain http only by explicit opt-in (local Garage); https always
-      // verifies (no CURLOPT_SSL_VERIFYPEER toggle exists anywhere here).
-      if (!config_.allow_insecure_http) {
-        response.error = "plain http endpoint requires allow_insecure_http";
-        curl_slist_free_all(chunk);
-        curl_easy_cleanup(curl);
-        return response;
+    if (is_https_) {
+      // https always verifies: peer and host name, stated explicitly rather
+      // than left to libcurl's defaults, and never switched off. A private
+      // CA adds trust; it does not relax the check.
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+      if (!config_.ca_file.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, config_.ca_file.c_str());
       }
+      if (!config_.ca_path.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAPATH, config_.ca_path.c_str());
+      }
+    } else if (!config_.allow_insecure_http) {
+      // Plain http only by explicit opt-in (local Garage).
+      response.error = "plain http endpoint requires allow_insecure_http";
+      curl_slist_free_all(chunk);
+      curl_easy_cleanup(curl);
+      return response;
     }
     std::string response_body;
     std::map<std::string, std::string> response_headers;
