@@ -375,9 +375,13 @@ jobs:
         # A `docker run` step, not a `services:` entry: a service container
         # takes no command, and this image does nothing without `server
         # <dir>`. quay.io because the Docker Hub repository is gone; pinned
-        # by digest, the last release published as an image. Plain HTTP, on
-        # 9100 because ClickHouse holds 9000. B7a moves it to HTTPS with a CA
-        # generated at job start.
+        # by tag and digest, so a retag upstream cannot change what this
+        # job tests against. Plain HTTP, on 9100 because ClickHouse holds
+        # 9000. B7a moves it to HTTPS with a CA generated at job start.
+        #
+        # Each health probe is capped at 2 s: a socket that accepts and never
+        # answers would otherwise hold one curl until the job timeout, and
+        # the loop's 30 attempts would never get past the first.
         run: |
           docker run -d --name minio -p 9100:9000 \
             -e MINIO_ROOT_USER=dmi-ci-access \
@@ -385,7 +389,7 @@ jobs:
             quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
           for attempt in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:9100/minio/health/live; then
+            if curl -sf --max-time 2 http://127.0.0.1:9100/minio/health/live; then
               echo "MinIO is up"
               exit 0
             fi
