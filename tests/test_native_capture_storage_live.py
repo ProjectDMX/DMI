@@ -768,3 +768,98 @@ def test_the_lease_holds_through_an_object_store_outage(tmp_path):
 
     assert snapshot["upload_failures"] >= 1, snapshot
     assert snapshot["lease_renewals"] >= 3, snapshot
+
+
+# --- the publisher lease through ClickHouse errors and restarts ---------------
+
+
+_HOLD_LEASE = """
+import json, sys, time
+from dmi.storage.native_capture import (
+    NativeCaptureStorage, NativeCaptureStorageConfig)
+
+service = NativeCaptureStorage(
+    NativeCaptureStorageConfig(**json.loads(sys.argv[1])),
+    spool_root=sys.argv[2], spool_max_bytes=1 << 40, sweep_spool=True)
+service.start()
+print("started", flush=True)
+time.sleep(600)
+"""
+
+
+def test_a_restart_within_the_ttl_of_a_killed_predecessor_succeeds(
+        fake_s3, tmp_path):
+    """A SIGKILLed publisher leaves its lease live for up to a TTL, and a
+    restart in that window failed at once with the lease held. start() now
+    waits, within start_lease_wait_s, for the lease to expire."""
+    import os
+    import signal
+    import sys
+
+    with _catalog() as (_client, catalog):
+        knobs = dict(
+            s3_endpoint=fake_s3, s3_bucket=BUCKET, s3_region=REGION,
+            s3_access_key=ACCESS, s3_secret_key=SECRET,
+            s3_allow_insecure_http=True, clickhouse_host=CLICKHOUSE_HOST,
+            clickhouse_port=CLICKHOUSE_HTTP_PORT, database=DATABASE,
+            table_prefix=catalog.table_prefix, reconcile_on_start=False,
+            lease_ttl_s=5.0, publish_timeout_s=1)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(REPO / "src")] + ([env["PYTHONPATH"]]
+                                   if env.get("PYTHONPATH") else []))
+        predecessor = subprocess.Popen(
+            [sys.executable, "-c", _HOLD_LEASE,
+             json.dumps(dict(knobs, holder="crashed-publisher")),
+             str(tmp_path / "predecessor")],
+            stdout=subprocess.PIPE, text=True, env=env)
+        try:
+            assert predecessor.stdout.readline().strip() == "started"
+        finally:
+            predecessor.send_signal(signal.SIGKILL)
+            predecessor.wait(timeout=30)
+        assert predecessor.returncode == -signal.SIGKILL
+
+        from dmi.storage.native_capture import NativeCaptureStorageConfig
+
+        successor = _service(NativeCaptureStorageConfig(
+            **knobs, holder="restarted-publisher", start_lease_wait_s=8.0),
+            tmp_path / "successor")
+        started = time.monotonic()
+        successor.start()
+        elapsed = time.monotonic() - started
+        try:
+            snapshot = successor.snapshot()
+        finally:
+            successor.stop()
+
+    assert snapshot["running"] is True, snapshot
+    # It really waited on the dead holder's lease, and no longer than it.
+    assert 1.0 < elapsed < 8.0, elapsed
+
+
+def test_a_start_refused_the_lease_leaves_the_spool_unswept(fake_s3, tmp_path):
+    """start() swept the spool before taking the lease, so a second process
+    pointed at a live process's spool deleted its in-progress .open files
+    and only then found the catalog held. The lease now comes first."""
+    with _catalog() as (_client, catalog):
+        first = _service(_storage_config(
+            fake_s3, catalog.table_prefix, reconcile_on_start=False),
+            tmp_path / "first")
+        spool_root = tmp_path / "second"
+        spool_root.mkdir()
+        in_progress = spool_root / f".{uuid.uuid4()}.1234.open"
+        in_progress.write_bytes(b"a pack being written")
+        second = _service(_storage_config(
+            fake_s3, catalog.table_prefix, reconcile_on_start=False,
+            start_lease_wait_s=0.0), spool_root)
+        first.start()
+        try:
+            with pytest.raises(RuntimeError, match="held"):
+                second.start()
+            assert in_progress.exists()
+        finally:
+            first.stop()
+        second.start()  # the lease is free now, and the sweep runs
+        second.stop()
+        assert not in_progress.exists()

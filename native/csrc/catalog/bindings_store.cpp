@@ -72,6 +72,8 @@ dc::StorageServiceConfig service_config(const py::dict& d) {
   c.writer.publish_timeout_ns =
       get<uint64_t>(d, "publish_timeout_ns", c.writer.publish_timeout_ns);
   c.writer.clock_skew_ns = get<uint64_t>(d, "clock_skew_ns", c.writer.clock_skew_ns);
+  c.start_lease_wait_ns =
+      get<uint64_t>(d, "start_lease_wait_ns", c.start_lease_wait_ns);
   c.indexer.max_packs = get<int>(d, "indexer_max_packs", c.indexer.max_packs);
   c.indexer.max_estimated_bytes =
       get<uint64_t>(d, "indexer_max_estimated_bytes", c.indexer.max_estimated_bytes);

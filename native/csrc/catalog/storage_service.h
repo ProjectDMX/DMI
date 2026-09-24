@@ -21,9 +21,10 @@
 //     periodically when reconcile_interval_ns is non-zero.
 //
 // Deployment shape: the service holds the catalog's single publisher lease, so
-// run ONE service per (database, table_prefix). A second one fails to acquire
-// the lease at start(). That is the in-process mode; a standalone daemon can
-// reuse this class unchanged.
+// run ONE service per (database, table_prefix). A second one waits up to
+// start_lease_wait_ns for the lease at start(), then fails naming the holder.
+// That is the in-process mode; a standalone daemon can reuse this class
+// unchanged.
 #pragma once
 
 #include <atomic>
@@ -82,10 +83,16 @@ struct StorageServiceConfig {
   int max_index_attempts = 5;
   uint64_t schema_retry_sleep_ns = 500'000'000ull;
 
+  // How long start() waits for another holder's lease to expire before it
+  // fails with the lease held. A crashed predecessor's lease stays live for
+  // up to its TTL; 0 fails at once.
+  uint64_t start_lease_wait_ns = 0;
+
   // Sweep a crashed sink's stale .open files before anything writes to the
   // spool. Recover() deletes every .open file this object does not own, so it
   // is only safe while no writer is live: start() must run before the sink
-  // opens the spool.
+  // opens the spool. It runs after the lease is taken, so a start refused
+  // the catalog never touches the spool.
   bool sweep_spool_on_start = true;
   bool reconcile_on_start = true;
 };
@@ -118,9 +125,10 @@ class CaptureStorageService {
   CaptureStorageService(const CaptureStorageService&) = delete;
   CaptureStorageService& operator=(const CaptureStorageService&) = delete;
 
-  // Sweep the spool, ensure the catalog schema, take the publisher lease,
+  // Ensure the catalog schema, take the publisher lease (waiting up to
+  // start_lease_wait_ns for another holder's to expire), sweep the spool,
   // reconcile once, then start the background cycle. Throws if the lease is
-  // held by another publisher.
+  // still held by another publisher when the wait ends.
   void start();
 
   // Run cycles until one finds the spool empty with every uploaded pack
@@ -156,6 +164,8 @@ class CaptureStorageService {
   void reconcile();
   void keep_lease();          // the lease thread's body
   void renew_lease_if_due();  // requires lease_mutex_
+  // Takes the lease at start(), waiting for an expiring predecessor.
+  void acquire_lease_at_start();  // requires lease_mutex_
   // Sets a pack aside for good; flush() reports it. Requires cycle_mutex_.
   void reject(const PackRefData& ref, const std::string& reason);
   void record_error(const std::string& message);

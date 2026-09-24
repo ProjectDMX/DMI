@@ -5,6 +5,7 @@
 #include <chrono>
 #include <set>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include "catalog/schema.h"
@@ -52,6 +53,11 @@ bool is_pack_id(const std::string& value) {
   return dmi_pack::ParseUuid(value, &bytes, &canonical) && canonical == value;
 }
 
+bool is_lease_refusal(const CatalogError& exc) {
+  return exc.kind() == CatalogError::Kind::kHeld ||
+         exc.kind() == CatalogError::Kind::kLease;
+}
+
 }  // namespace
 
 CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
@@ -91,23 +97,30 @@ void CaptureStorageService::start() {
   std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
   if (started_) throw std::logic_error("storage service: already started");
 
+  CatalogSchema(clickhouse_, config_.writer.database, config_.writer.table_prefix)
+      .ensure(&writer_.leases(), config_.schema_retry_sleep_ns);
+  {
+    std::lock_guard<std::mutex> lease(lease_mutex_);
+    acquire_lease_at_start();  // throws kHeld if another publisher keeps it
+  }
+
+  // After the lease, never before: a second process pointed at this spool
+  // would otherwise delete a live sink's .open files and only then learn
+  // that the catalog is held.
   if (config_.sweep_spool_on_start) {
     std::vector<dmi_store::StagedPack> recovered;
     std::string error;
     if (spool_.Recover(&recovered, &error) != dmi_store::SpoolStatus::kOk) {
+      try {
+        std::lock_guard<std::mutex> lease(lease_mutex_);
+        if (writer_.held_lease() != nullptr) writer_.release_lease();
+      } catch (...) {
+      }
       throw std::runtime_error("storage service: spool recovery failed: " +
                                error);
     }
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.swept_on_start = recovered.size();
-  }
-
-  CatalogSchema(clickhouse_, config_.writer.database, config_.writer.table_prefix)
-      .ensure(&writer_.leases(), config_.schema_retry_sleep_ns);
-  {
-    std::lock_guard<std::mutex> lease(lease_mutex_);
-    writer_.acquire_lease(config_.holder);  // throws kHeld if another publisher holds it
-    last_renew_ns_ = steady_ns();
   }
 
   // A failed pass is not fatal -- the bucket is still there next time -- but a
@@ -577,6 +590,36 @@ void CaptureStorageService::renew_lease_if_due() {
   last_renew_ns_ = steady_ns();
   std::lock_guard<std::mutex> lock(state_mutex_);
   ++state_.lease_renewals;
+}
+
+void CaptureStorageService::acquire_lease_at_start() {
+  // A crashed predecessor's lease stays live for up to its TTL. Waiting it
+  // out here turns a restart inside that window into a short delay instead
+  // of a failed start; a live publisher keeps renewing, so the wait ends in
+  // the same refusal as before, naming the holder.
+  const uint64_t deadline = steady_ns() + config_.start_lease_wait_ns;
+  const uint64_t poll = std::clamp<uint64_t>(
+      config_.writer.lease_ttl_ns / 10, 50'000'000ull, 500'000'000ull);
+  while (true) {
+    try {
+      writer_.acquire_lease(config_.holder);
+      last_renew_ns_ = steady_ns();
+      return;
+    } catch (const CatalogError& exc) {
+      if (!is_lease_refusal(exc) || config_.start_lease_wait_ns == 0) throw;
+      const uint64_t now = steady_ns();
+      if (now >= deadline) {
+        throw CatalogError(
+            exc.kind(),
+            "storage service: waited " +
+                std::to_string(config_.start_lease_wait_ns / 1'000'000) +
+                " ms for the publisher lease and it is still held: " +
+                exc.what());
+      }
+      std::this_thread::sleep_for(
+          std::chrono::nanoseconds(std::min(poll, deadline - now)));
+    }
+  }
 }
 
 void CaptureStorageService::record_error(const std::string& message) {
