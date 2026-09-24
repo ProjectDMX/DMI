@@ -155,11 +155,15 @@ caller did before the field existed. The earlier names `"native"` and
 `"persistent"`. `MonitoringConfig.canonical_storage_backend` gives the current
 name.
 
-All three fields are acted on by `MonitoringEngine`, and some combinations are
-refused at construction -- `"in-memory"` without a host engine,
-`"persistent"`/`"none"` with one, or `capture_storage_config` without
-`capture_sink_config` -- so a caller setting them should expect `ValueError`
-rather than a silent choice.
+All three fields are acted on by `MonitoringEngine`, and a mismatch is an error
+rather than a silent choice:
+
+- At construction, `ValueError`: `"in-memory"` without a host engine,
+  `"persistent"` or `"none"` with one, `"none"` with a `ring_config`, or
+  `capture_storage_config` without `capture_sink_config`.
+- Under `"none"`, `RuntimeError` from `create_record_runtime()` and
+  `enable_ring_transport()`, and `ConfigurationError` from an adaptor's
+  `attach_model()`.
 `capture_sink_config` is read only when `storage_backend` is `"persistent"`; see
 `docs/capture-storage-design.md` for the writer it selects. With
 `capture_storage_config` as well, the engine runs the native storage service

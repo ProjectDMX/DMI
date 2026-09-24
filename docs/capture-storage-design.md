@@ -99,15 +99,15 @@ upload-only role with a single publisher, which is planned but not built.
 This document describes ONE of two storage paths, and they are mutually
 exclusive per record runtime:
 
-| | native path | capture path (this document) |
+| | in-memory path | persistent path (this document) |
 |---|---|---|
-| Sink | `ClickHouseRecordSink` (C++) | `ReferencePythonCaptureSink` (C++ bridge) → `CapturePackReferenceSink` (Python) |
+| Sink | `ClickHouseRecordSink` (C++), until the in-memory consumer interface exists | `NativePackSink` (C++), the default writer; the Python `CapturePackReferenceSink` remains as the reference and rollback, passed explicitly as `record_sink` |
 | Durable form | one ClickHouse row per record, tensor bytes inline | immutable packs in object storage |
 | ClickHouse role | the store itself | a rebuildable index over the packs |
 | ClickHouse footprint | one configured table (`offload` by default) | `{prefix}_*` (`dmi_*` by default) |
-| Selected by | `create_record_runtime(fmt)` with no `record_sink`, plus a `host_engine`/`db_config` on the engine | `create_record_runtime(fmt, record_sink=reference.native_sink)` |
+| Selected by | `create_record_runtime(fmt)` with no `record_sink`, plus a `host_engine`/`db_config` on the engine | `create_record_runtime(fmt)` with `capture_sink_config` in the config (the native writer), plus `capture_storage_config` to upload and index in-process |
 | Declared by | `MonitoringConfig(storage_backend="in-memory")` (formerly `"native"`) | `MonitoringConfig(storage_backend="persistent")` (formerly `"capture"`) |
-| Status | production | explicitly reference-only; production sinks remain native-only |
+| Status | production | production native writer and storage service; the Python sink is reference-only |
 
 Both are `ring::RecordSink` implementations and the record engine takes exactly
 one of them: `RingEngine.create_record` is handed either the host engine or a
