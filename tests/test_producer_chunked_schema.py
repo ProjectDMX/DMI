@@ -172,6 +172,9 @@ class _FakeEagerRingEngine:
     def available_capacity(self) -> int:
         return self.available
 
+    def available_task_slots(self) -> int:
+        return 1  # task capacity is not under test here
+
     def payload_cap(self) -> int:
         return self.capacity
 
