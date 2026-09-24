@@ -1,6 +1,9 @@
 PYTHON   ?= python
 SM_ARCH  ?= native
-CXX_STD  ?= c++17
+# C++20: test_ring_engine, test_record_consumer and
+# test_clickhouse_record_sink include torch's headers, and ATen refuses
+# anything older (torch 2.14's `#error C++20 or later`).
+CXX_STD  ?= c++20
 BUILD    := build
 INCLUDES := -I../../.. -I../../../native/csrc
 
