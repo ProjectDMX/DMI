@@ -387,6 +387,13 @@ runtime = engine.create_record_runtime(
     record_sink=explicit_native_sink,
 )
 
+# Keep the forward running when the sink refuses or stalls.
+runtime = engine.create_record_runtime(
+    record_format,
+    failure_policy="disable_capture",
+    step_stall_budget_ms=2000,
+)
+
 runtime.bind_hook(
     hook,
     hook_runtime=hook_runtime,
@@ -394,14 +401,17 @@ runtime.bind_hook(
     gate_value=0,
 )
 
+runtime.begin_step()
 runtime.emit_output(entry, metadata, output)
 runtime.prepare_replay(plan, metadata)
 
 engine.flush_and_wait(timeout_s=600.0)
+engine.capture_status()
 ```
 
 The public operations are `create_record_runtime()`, `bind_hook()`,
-`emit_output()`, `prepare_replay()`, and `flush_and_wait()`.
+`begin_step()`, `emit_output()`, `prepare_replay()`, `flush_and_wait()`,
+`capture_status()`, and `validate_capture_bounds()`.
 
 `RecordRuntime.bind_hook()` assigns stable output IDs and binds the hook to the
 record ring. `RecordRuntime.emit_output()` reserves and publishes one eager
@@ -434,6 +444,49 @@ operation. Success means the ring, descriptor consumer, and configured record
 sink reached that sink's durability boundary within one timeout. The current
 ClickHouse adapter waits for acknowledged inserts. A timeout raises
 `TimeoutError`; asynchronous failures propagate unchanged.
+
+A sink can refuse a record (dropped, timed out, too large) or fail, and it
+does so on the record worker, after the forward that produced the record has
+moved on. The refusal latches the runtime, and `failure_policy` decides what
+the forward sees next:
+
+| `failure_policy` | After a latch |
+| --- | --- |
+| `"raise"` (default) | The next record reservation or descriptor push raises it, inside the forward that publishes the record. |
+| `"disable_capture"` | Capture stops; the forward keeps running. Descriptors and payloads that follow are discarded and counted. |
+
+Under both, `flush_and_wait()` raises the failure, `capture_status()` reports
+it, and `close()` logs it at WARNING. A slow sink reaches the forward as a
+stall instead: a reservation that does not fit waits for the drain, which
+waits for the sink. `step_stall_budget_ms` caps the time the reservations of
+one step may wait. `RecordRuntime.begin_step()` starts a step; call it once
+per model step, before the step's first reservation, or the budget spans the
+runtime's whole life. Past the budget the policy applies: `"raise"` raises
+from the reservation with nothing reserved, and `"disable_capture"` latches
+and completes the reservation after at most the one sink admission already
+in progress. Under `"disable_capture"` the forward's stall per step is
+therefore at most the budget plus one `admission_timeout_s`, and
+`create_record_runtime()` refuses it with a `NativeSinkConfig` whose `block`
+admission has no timeout. `None`, the default, waits without bound. Ring
+failures that are not sink refusals, such as a CUDA error in the drain, raise
+under both policies.
+
+`MonitoringEngine.capture_status()` returns a plain dict: `record_mode`,
+`capture_active` (False once a failure latched), `failure_policy`,
+`failure`, `discarded_descriptors`, `discarded_payloads`,
+`step_stall_budget_ms`, `stall_budget_exhaustions`, `reserve_wait_s` and
+`max_step_wait_s` (time reservations waited for the sink, in total and in
+the worst step), and the `sink` and `storage` snapshots when the engine holds
+a native pack sink or storage service. Without a record runtime every field
+is empty.
+
+`MonitoringEngine.validate_capture_bounds(max_record_bytes)` refuses, with
+`ConfigurationError`, capture bounds under which the largest record an
+integration emits could not be stored: a `max_queue_bytes` below it, a
+`max_pack_bytes` below it plus 64 KiB of pack framing, or a `max_pack_bytes`
+above the storage service's `uploader_max_in_flight_bytes`. Integrations call
+it at attach, so these refusals never reach the forward. Without a
+`capture_sink_config` there is nothing to check.
 
 ### `deactivate_ring_transport`
 

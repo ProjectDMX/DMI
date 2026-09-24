@@ -157,6 +157,22 @@ std::shared_ptr<ring_py::RingEnginePy> MakeRingEngine(Args&&... args) {
       });
 }
 
+ring::RecordFailurePolicy ParseRecordFailurePolicy(const std::string& name) {
+  if (name == "raise") return ring::RecordFailurePolicy::kRaiseAtProducer;
+  if (name == "disable_capture") {
+    return ring::RecordFailurePolicy::kDisableCapture;
+  }
+  throw py::value_error(
+      "failure_policy must be 'raise' or 'disable_capture', got '" + name +
+      "'");
+}
+
+const char* RecordFailurePolicyName(ring::RecordFailurePolicy policy) {
+  return policy == ring::RecordFailurePolicy::kDisableCapture
+             ? "disable_capture"
+             : "raise";
+}
+
 ring::RecordDescriptor CopyRecordDescriptor(
     const py::handle& descriptor_py,
     const dmx_host::RecordSchema& schema) {
@@ -678,7 +694,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("config"), py::arg("host_engine") = py::none())
       .def_static(
           "create_record",
-          [](ring_py::RingConfig cfg, py::object sink_or_host) {
+          [](ring_py::RingConfig cfg, py::object sink_or_host,
+             const std::string& failure_policy,
+             uint64_t step_stall_budget_ms) {
+            ring_py::RecordRuntimeOptions options;
+            options.failure_policy = ParseRecordFailurePolicy(failure_policy);
+            options.step_stall_budget_ms = step_stall_budget_ms;
             std::shared_ptr<ring::RecordSinkLease> lease;
             if (!sink_or_host.is_none()) {
               if (py::isinstance<ring::RecordSinkLease>(sink_or_host)) {
@@ -694,9 +715,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                     MakeClickHouseRecordSink(std::move(host)));
               }
             }
-            return MakeRingEngine(std::move(cfg), std::move(lease));
+            return MakeRingEngine(std::move(cfg), std::move(lease), options);
           },
-          py::arg("config"), py::arg("sink_or_host") = py::none())
+          py::arg("config"), py::arg("sink_or_host") = py::none(),
+          py::arg("failure_policy") = "raise",
+          py::arg("step_stall_budget_ms") = uint64_t{0})
       .def("init",  &ring_py::RingEnginePy::init,
            py::arg("stream_handle") = uint64_t{0})
       .def("start", &ring_py::RingEnginePy::start)
@@ -711,6 +734,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ring_py::RingEnginePy::reserve_record,
            py::arg("reservation_items"),
            py::call_guard<py::gil_scoped_release>())
+      .def("begin_record_step", &ring_py::RingEnginePy::begin_record_step)
+      .def("capture_status",
+           [](const ring_py::RingEnginePy& self) {
+             const ring_py::RecordCaptureStatus status =
+                 self.record_capture_status();
+             py::dict out;
+             out["failure_policy"] =
+                 RecordFailurePolicyName(status.failure_policy);
+             out["failed"] = status.failed;
+             out["failure"] = status.failure;
+             out["discarded_descriptors"] = status.discarded_descriptors;
+             out["discarded_payloads"] = status.discarded_payloads;
+             out["step_stall_budget_ms"] = status.step_stall_budget_ms;
+             out["stall_budget_exhaustions"] = status.stall_budget_exhaustions;
+             out["reserve_wait_ns"] = status.reserve_wait_ns;
+             out["max_step_wait_ns"] = status.max_step_wait_ns;
+             return out;
+           })
       .def("push_record_descriptors",
            [](ring_py::RingEnginePy& self, py::sequence descriptors,
               py::object schema) {

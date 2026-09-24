@@ -309,6 +309,17 @@ class RecordRuntime(Generic[MetadataT]):
             self._device_gated_output_ids.update(output_ids)
         self._bound_hooks.add(id(hook))
 
+    def begin_step(self) -> None:
+        """Mark the start of one model step for the stall budget.
+
+        The record reservations after this call share one fresh
+        ``step_stall_budget_ms`` (see ``create_record_runtime``). Call it
+        once per step, before the step's first ``emit_output`` or
+        ``prepare_replay``; without it the budget spans the runtime's life.
+        """
+
+        self._transport.begin_record_step()
+
     def emit_output(
         self,
         entry: ProducerPlanEntry,

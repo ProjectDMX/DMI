@@ -420,6 +420,11 @@ class RingTransport:
 
         return int(self._ring_engine.reserve_record(tuple(reservation_items)))
 
+    def begin_record_step(self) -> None:
+        """Start a fresh stall budget for the next reservations."""
+
+        self._ring_engine.begin_record_step()
+
     def push_record_descriptors(self, descriptors: Any) -> None:
         """Publish descriptors in the exact order of their producer tasks."""
 
