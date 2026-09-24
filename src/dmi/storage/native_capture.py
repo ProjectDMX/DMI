@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import socket
 import uuid
 from dataclasses import dataclass, field
@@ -53,6 +54,24 @@ def _load_native_store_extension() -> Any:
             "`make -C native build/_dmi_native_store "
             "PYTHON=<venv>/bin/python`."
         ) from exc
+
+
+# A bare host name or IPv4 address, or a bracketed IPv6 address. Anything
+# else would change what the URL the native client builds means.
+_BARE_HOST = re.compile(r"[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\]")
+
+# The native catalog writer's publish timeout (WriterConfig
+# publish_timeout_ns), which this config does not expose: a publish may run
+# that long server-side before the server gives up on it.
+_PUBLISH_TIMEOUT_S = 5.0
+
+
+def _text(name: str, value: Any) -> None:
+    if type(value) is not str:
+        raise TypeError(f"{name} must be str")
+    # Credentials travel as HTTP headers; a line break would end the header.
+    if any(c in value for c in "\r\n\x00"):
+        raise ValueError(f"{name} must not contain CR, LF or NUL")
 
 
 def _positive(name: str, value: Any, kind: type) -> None:
@@ -84,8 +103,24 @@ class NativeCaptureStorageConfig:
     # The name packs are indexed under; readers resolve it to this store.
     store_id: str = "s3"
 
-    clickhouse_host: str = "127.0.0.1"
-    clickhouse_port: int = 8123  # the HTTP interface
+    clickhouse_host: str = "127.0.0.1"  # a bare host: no scheme, port or user
+    clickhouse_port: int = 8123  # the HTTP interface (8443 for its TLS port)
+    # "https" always verifies the server's certificate and name, against the
+    # system roots plus clickhouse_ca_file (a PEM bundle) or
+    # clickhouse_ca_path (an OpenSSL hashed directory) for a private CA.
+    clickhouse_scheme: str = "http"
+    # Sent as X-ClickHouse-User / X-ClickHouse-Key headers, never in a URL.
+    # Empty: no credentials, which ClickHouse reads as its `default` user.
+    clickhouse_user: str = ""
+    clickhouse_password: str = field(default="", repr=False)
+    clickhouse_ca_file: str = ""
+    clickhouse_ca_path: str = ""
+    # A password over plain http must be opted into, as for s3.
+    clickhouse_allow_insecure_http: bool = False
+    # An optional separate account for NativeCaptureReader, typically one
+    # granted SELECT only. Empty: the reader uses clickhouse_user.
+    clickhouse_reader_user: str = ""
+    clickhouse_reader_password: str = field(default="", repr=False)
     # Every catalog request is bounded, so a server that stops answering
     # cannot hold a flush, a publish or the lease renewal indefinitely.
     clickhouse_connect_timeout_s: float = 10.0
@@ -141,6 +176,16 @@ class NativeCaptureStorageConfig:
                   self.clickhouse_connect_timeout_s, float)
         _positive("clickhouse_request_timeout_s",
                   self.clickhouse_request_timeout_s, float)
+        # A publish runs server-side for up to the publish timeout. A client
+        # that gives up first reports an outcome it does not know, and the
+        # writer quarantines itself over a statement that may have committed.
+        if self.clickhouse_request_timeout_s < 2 * _PUBLISH_TIMEOUT_S:
+            raise ValueError(
+                "clickhouse_request_timeout_s must be at least "
+                f"{2 * _PUBLISH_TIMEOUT_S:g} s: twice the catalog's "
+                f"{_PUBLISH_TIMEOUT_S:g} s publish timeout, so a publish is "
+                "never abandoned while the server may still commit it")
+        self._validate_clickhouse_connection()
         _positive("close_flush_timeout_s", self.close_flush_timeout_s, float)
         if type(self.reconcile_interval_s) not in (int, float):
             raise TypeError("reconcile_interval_s must be float")
@@ -148,6 +193,50 @@ class NativeCaptureStorageConfig:
             raise ValueError("reconcile_interval_s must be finite")
         if self.reconcile_interval_s < 0:
             raise ValueError("reconcile_interval_s must be non-negative")
+
+    def _validate_clickhouse_connection(self) -> None:
+        """What the native client refuses, refused here with field names."""
+        for name in ("clickhouse_scheme", "clickhouse_host", "clickhouse_user",
+                     "clickhouse_password", "clickhouse_ca_file",
+                     "clickhouse_ca_path", "clickhouse_reader_user",
+                     "clickhouse_reader_password"):
+            _text(name, getattr(self, name))
+        if type(self.clickhouse_allow_insecure_http) is not bool:
+            raise TypeError("clickhouse_allow_insecure_http must be bool")
+        if self.clickhouse_scheme not in ("http", "https"):
+            raise ValueError('clickhouse_scheme must be "http" or "https"')
+        # The value is never repeated: the likeliest mistake here is a URL
+        # with a password in it.
+        if "@" in self.clickhouse_host:
+            raise ValueError(
+                "clickhouse_host must not carry userinfo (user:password@); "
+                "set clickhouse_user and clickhouse_password instead")
+        if _BARE_HOST.fullmatch(self.clickhouse_host) is None:
+            raise ValueError(
+                "clickhouse_host must be a bare host name or address; the "
+                "scheme and port have their own fields")
+        for user, password in (
+                ("clickhouse_user", "clickhouse_password"),
+                ("clickhouse_reader_user", "clickhouse_reader_password")):
+            if getattr(self, password) and not getattr(self, user):
+                raise ValueError(f"{password} needs {user}: name the account "
+                                 "it belongs to")
+        if self.clickhouse_scheme == "http":
+            for name in ("clickhouse_ca_file", "clickhouse_ca_path"):
+                if getattr(self, name):
+                    raise ValueError(
+                        f"{name} needs clickhouse_scheme='https'; over http "
+                        "it would verify nothing")
+            if ((self.clickhouse_password or self.clickhouse_reader_password)
+                    and not self.clickhouse_allow_insecure_http):
+                raise ValueError(
+                    "a ClickHouse password over plain http is refused: set "
+                    "clickhouse_scheme='https', or clickhouse_allow_insecure_http"
+                    "=True to send it in the clear")
+        elif self.clickhouse_allow_insecure_http:
+            raise ValueError(
+                "clickhouse_allow_insecure_http admits plain http and never "
+                "downgrades TLS; leave it False for https")
 
     def _native_dict(self) -> dict[str, Any]:
         return {
@@ -159,13 +248,27 @@ class NativeCaptureStorageConfig:
             "s3_session_token": self.s3_session_token,
             "s3_allow_insecure_http": self.s3_allow_insecure_http,
             "store_id": self.store_id,
+            "clickhouse_scheme": self.clickhouse_scheme,
             "clickhouse_host": self.clickhouse_host,
             "clickhouse_port": self.clickhouse_port,
+            "clickhouse_user": self.clickhouse_user,
+            "clickhouse_password": self.clickhouse_password,
+            "clickhouse_ca_file": self.clickhouse_ca_file,
+            "clickhouse_ca_path": self.clickhouse_ca_path,
+            "clickhouse_allow_insecure_http": self.clickhouse_allow_insecure_http,
             "clickhouse_connect_timeout_s": float(self.clickhouse_connect_timeout_s),
             "clickhouse_request_timeout_s": float(self.clickhouse_request_timeout_s),
             "database": self.database,
             "table_prefix": self.table_prefix,
         }
+
+    def _native_reader_dict(self) -> dict[str, Any]:
+        """The reader's native config: the reader account, when one is set."""
+        native = self._native_dict()
+        if self.clickhouse_reader_user:
+            native["clickhouse_user"] = self.clickhouse_reader_user
+            native["clickhouse_password"] = self.clickhouse_reader_password
+        return native
 
 
 class NativeCaptureStorage:
@@ -282,7 +385,7 @@ class NativeCaptureReader:
         if not isinstance(config, NativeCaptureStorageConfig):
             raise TypeError("config must be a NativeCaptureStorageConfig")
         module = _load_native_store_extension()
-        native = config._native_dict()
+        native = config._native_reader_dict()
         native["max_coalesce_gap_bytes"] = max_coalesce_gap_bytes
         self._columns: tuple[str, ...] = tuple(module.SEARCH_ITEM_COLUMNS)
         self._reader = module.CaptureReader(native)

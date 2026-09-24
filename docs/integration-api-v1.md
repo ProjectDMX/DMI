@@ -181,6 +181,21 @@ refuses the persistent backend with `ConfigurationError` rather than generating
 with nothing stored. The catalog
 takes one publisher per `(database, table_prefix)`, so a second engine on the
 same catalog is refused at `create_record_runtime`.
+To reach a secured catalog, set `clickhouse_scheme="https"` (and the server's
+TLS HTTP port, usually 8443) on `NativeCaptureStorageConfig`. The client always
+verifies the server's certificate and name, against the system roots plus
+`clickhouse_ca_file` (a PEM bundle) or `clickhouse_ca_path` (a hashed
+directory) for a private CA. `clickhouse_user`/`clickhouse_password` travel as
+`X-ClickHouse-User`/`X-ClickHouse-Key` headers, never in a URL, and the
+password is left out of the config's repr. A password over plain http is
+refused unless `clickhouse_allow_insecure_http=True`, and `clickhouse_host`
+must be a bare host (no scheme, port or `user:password@`).
+`clickhouse_reader_user`/`clickhouse_reader_password` give
+`NativeCaptureReader` a separate account, for example one granted `SELECT`
+only; the storage service always uses `clickhouse_user`. Every catalog
+request is bounded by `clickhouse_request_timeout_s`, which must be at least
+10 s (twice the catalog's publish timeout). A refused connection is retried
+for any statement, a reset or 5xx for reads only, and a timeout never.
 The schedule's default factory creates a distinct `CaptureSchedule` for each
 config instance.
 `MonitoringEngine` stores the config, while concrete adaptors decide whether

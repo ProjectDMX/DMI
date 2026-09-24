@@ -518,3 +518,56 @@ def test_the_bindings_refuse_a_password_over_plain_http(ca):
     native.pop("clickhouse_ca_file")
     with pytest.raises(RuntimeError, match="allow_insecure_http"):
         module.CaptureReader(native)
+
+
+def _storage_config(ca, port, **overrides):
+    from dmi.storage.native_capture import NativeCaptureStorageConfig
+
+    fields = dict(
+        s3_endpoint="http://127.0.0.1:1", s3_bucket="bucket",
+        s3_access_key="AKIA-test", s3_secret_key="secret-test",
+        s3_allow_insecure_http=True, clickhouse_scheme="https",
+        clickhouse_port=port, clickhouse_ca_file=str(ca.ca_file),
+        clickhouse_user="catalog_writer", clickhouse_password=PASSWORD,
+        table_prefix="connection_test")
+    fields.update(overrides)
+    return NativeCaptureStorageConfig(**fields)
+
+
+@needs_store
+def test_the_reader_uses_its_own_account_and_the_service_the_writer(ca, tmp_path):
+    from dmi.storage.native_capture import (
+        NativeCaptureReader, NativeCaptureStorage,
+    )
+
+    with FakeClickHouse(lambda r: (400, b"Code: 62. refused"), tls=ca) as fake:
+        config = _storage_config(ca, fake.port,
+                                 clickhouse_reader_user="catalog_reader",
+                                 clickhouse_reader_password="reader-pw",
+                                 reconcile_on_start=False)
+        with pytest.raises(RuntimeError, match="400"):
+            NativeCaptureReader(config).search(tenant_id="t")
+        reader_request = fake.requests[-1]
+        service = NativeCaptureStorage(config, spool_root=str(tmp_path / "s"),
+                                       spool_max_bytes=1 << 30,
+                                       sweep_spool=False)
+        with pytest.raises(Exception, match="400"):
+            service.start()
+        service.stop()
+        writer_request = fake.requests[-1]
+    assert reader_request.headers["x-clickhouse-user"] == "catalog_reader"
+    assert reader_request.headers["x-clickhouse-key"] == "reader-pw"
+    assert writer_request.headers["x-clickhouse-user"] == "catalog_writer"
+    assert writer_request.headers["x-clickhouse-key"] == PASSWORD
+
+
+@needs_store
+def test_without_a_reader_account_the_reader_uses_the_writer_account(ca):
+    from dmi.storage.native_capture import NativeCaptureReader
+
+    with FakeClickHouse(lambda r: (400, b"Code: 62. refused"), tls=ca) as fake:
+        with pytest.raises(RuntimeError, match="400"):
+            NativeCaptureReader(_storage_config(ca, fake.port)).search(
+                tenant_id="t")
+    assert fake.requests[-1].headers["x-clickhouse-user"] == "catalog_writer"
+    assert fake.requests[-1].headers["x-clickhouse-key"] == PASSWORD
