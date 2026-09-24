@@ -56,8 +56,50 @@ struct ClickHouseTimeouts {
   double request_s = 60.0;  // the whole request, connect included
 };
 
+// Where the catalog lives and how to reach it: the HTTP interface, plain or
+// TLS, with optional credentials. Validated when a client is built from it
+// (validate() below), so an inconsistent connection is refused before any
+// request rather than at the first statement.
+struct ClickHouseConnection {
+  std::string scheme = "http";  // "http" or "https", lower case
+  // A bare host name, IPv4 address or bracketed IPv6 address -- never a
+  // URL: no scheme, port, path or userinfo ("user:pw@host").
+  std::string host = "127.0.0.1";
+  uint16_t port = 8123;
+  // Sent as X-ClickHouse-User / X-ClickHouse-Key headers, never in the URL
+  // (a URL lands in proxy, server and error logs). Empty user: no auth
+  // headers, which the server reads as its `default` user.
+  std::string user;
+  std::string password;
+  // https always verifies the peer and its name; these add a private CA
+  // (CURLOPT_CAINFO / CURLOPT_CAPATH) to libcurl's default roots. Refused
+  // with http, where they would silently do nothing.
+  std::string ca_file;
+  std::string ca_path;
+  // A password over plain http must be opted into. Refused with https:
+  // the flag admits plain http, it never downgrades TLS.
+  bool allow_insecure_http = false;
+  ClickHouseTimeouts timeouts;
+  // Attempts per statement, first included, for the failures it is safe to
+  // repeat (see execute()). 1 disables retries.
+  int max_attempts = 3;
+};
+
+// Throws ClickHouseError naming the first inconsistent field. Messages never
+// contain the password.
+void validate(const ClickHouseConnection& connection);
+
+// Whether a statement only reads, judged by its first keyword: SELECT,
+// WITH, SHOW, DESCRIBE/DESC, EXISTS, CHECK. Anything else -- including a
+// statement that opens with a parenthesis or a comment -- counts as a
+// write, the safe default, since a write is never repeated once it may have
+// reached the server.
+bool is_read_statement(const std::string& statement);
+
 class ClickHouseClient {
  public:
+  explicit ClickHouseClient(ClickHouseConnection connection);
+  // Plain http, no credentials: the conformance drivers and local servers.
   ClickHouseClient(std::string host, uint16_t port,
                    ClickHouseTimeouts timeouts = {});
   ~ClickHouseClient();
@@ -68,14 +110,29 @@ class ClickHouseClient {
   // Runs one statement with `%(name)s` parameters substituted client-side
   // and `settings` appended as URL parameters. Returns the parsed
   // FORMAT TSV rows (empty for writes).
+  //
+  // Retries, up to connection.max_attempts, with a short backoff:
+  //   * a connection that was never made (refused, or the name did not
+  //     resolve) -- for ANY statement, since nothing reached the server;
+  //   * a transport error after connecting (reset, empty reply, short read)
+  //     or a 5xx -- for reads only. A write that may have reached the
+  //     server has an unknown outcome, and repeating it is the caller's
+  //     decision (the fenced publish quarantines instead).
+  // A timeout is never retried, so each attempt's bound is the whole
+  // call's: at most max_attempts request timeouts plus the backoff, and a
+  // single request timeout for anything that timed out. TLS failures (an
+  // untrusted or misnamed certificate) and 4xx answers are not retried.
+  //
+  // Reads also carry wait_end_of_query=1, so the server buffers the result
+  // and an exception part-way through it arrives as an error status rather
+  // than as a 200 whose truncated body would parse as rows. A URL setting:
+  // the statement bytes are unchanged.
   std::vector<Row> execute(
       const std::string& query, const Params& params = {},
       const std::map<std::string, std::string>& settings = {}) const;
 
  private:
-  std::string host_;
-  uint16_t port_;
-  ClickHouseTimeouts timeouts_;
+  ClickHouseConnection connection_;
 };
 
 }  // namespace dmi_catalog

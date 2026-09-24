@@ -57,9 +57,7 @@ bool is_pack_id(const std::string& value) {
 CaptureStorageService::CaptureStorageService(StorageServiceConfig config)
     : config_(std::move(config)),
       s3_(config_.s3),
-      clickhouse_(std::make_shared<const ClickHouseClient>(
-          config_.clickhouse_host, config_.clickhouse_port,
-          config_.clickhouse_timeouts)),
+      clickhouse_(std::make_shared<const ClickHouseClient>(config_.clickhouse)),
       writer_(clickhouse_, config_.writer),
       indexer_(&s3_, &writer_, config_.indexer) {
   if (config_.spool_root.empty()) {

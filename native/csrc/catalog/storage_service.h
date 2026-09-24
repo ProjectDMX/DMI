@@ -56,9 +56,9 @@ struct StorageServiceConfig {
   dmi_store::S3Config s3;
   dmi_store::UploaderConfig uploader;  // uploader.store_id names the store
 
-  std::string clickhouse_host = "127.0.0.1";
-  uint16_t clickhouse_port = 8123;
-  ClickHouseTimeouts clickhouse_timeouts;
+  // The catalog's HTTP interface: scheme, host, port, credentials, TLS
+  // trust, timeouts and retry attempts.
+  ClickHouseConnection clickhouse;
   WriterConfig writer;  // database, table_prefix, lease TTLs
   IndexerConfig indexer;
   std::string holder;   // the publisher lease holder id

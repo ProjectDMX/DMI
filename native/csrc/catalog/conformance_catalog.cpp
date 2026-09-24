@@ -340,9 +340,39 @@ Session make_session(const std::string& line) {
   // HTTP interface: the driver speaks HTTP (libcurl), not the native TCP
   // protocol clickhouse-driver uses, so the port differs from the
   // Python-side suites' DMI_CLICKHOUSE_PORT. 8123 is ClickHouse's default.
-  session.client = std::make_shared<const dmi_catalog::ClickHouseClient>(
-      host != nullptr ? host : "127.0.0.1",
-      static_cast<uint16_t>(port != nullptr ? std::atoi(port) : 8123));
+  dmi_catalog::ClickHouseConnection connection;
+  connection.host = host != nullptr ? host : "127.0.0.1";
+  connection.port =
+      static_cast<uint16_t>(port != nullptr ? std::atoi(port) : 8123);
+  // Optional per-session overrides of the connection, for the suites that
+  // pin what the client sends (tests/test_native_catalog_connection.py).
+  // Absent keys keep the environment's plain-http defaults above.
+  if (jc::HasKey(line, "clickhouse_scheme")) {
+    connection.scheme = jc::FindString(line, "clickhouse_scheme");
+  }
+  if (jc::HasKey(line, "clickhouse_host")) {
+    connection.host = jc::FindString(line, "clickhouse_host");
+  }
+  if (jc::HasKey(line, "clickhouse_port")) {
+    connection.port = static_cast<uint16_t>(field_int(line, "clickhouse_port"));
+  }
+  connection.user = jc::FindString(line, "clickhouse_user");
+  connection.password = jc::FindString(line, "clickhouse_password");
+  connection.ca_file = jc::FindString(line, "clickhouse_ca_file");
+  connection.ca_path = jc::FindString(line, "clickhouse_ca_path");
+  connection.allow_insecure_http =
+      jc::FindBool(line, "clickhouse_allow_insecure_http");
+  if (jc::HasKey(line, "clickhouse_request_timeout_ms")) {
+    connection.timeouts.request_s =
+        static_cast<double>(field_int(line, "clickhouse_request_timeout_ms")) /
+        1000.0;
+  }
+  if (jc::HasKey(line, "clickhouse_max_attempts")) {
+    connection.max_attempts =
+        static_cast<int>(field_int(line, "clickhouse_max_attempts"));
+  }
+  session.client =
+      std::make_shared<const dmi_catalog::ClickHouseClient>(connection);
   session.writer = std::make_unique<CatalogWriter>(session.client, config);
   session.database = config.database;
   session.table_prefix = config.table_prefix;

@@ -45,11 +45,27 @@ dmi_store::S3Config s3_config(const py::dict& d) {
   return c;
 }
 
-dc::ClickHouseTimeouts clickhouse_timeouts(const py::dict& d) {
-  dc::ClickHouseTimeouts t;
-  t.connect_s = get<double>(d, "clickhouse_connect_timeout_s", t.connect_s);
-  t.request_s = get<double>(d, "clickhouse_request_timeout_s", t.request_s);
-  return t;
+// The catalog connection, for the service and the reader alike: both read
+// the same keys, so a reader is pointed at a secured catalog exactly as the
+// service is (NativeCaptureReader passes its own account, when configured,
+// under the same key names). The client validates it on construction.
+dc::ClickHouseConnection clickhouse_connection(const py::dict& d) {
+  dc::ClickHouseConnection c;
+  c.scheme = get<std::string>(d, "clickhouse_scheme", c.scheme);
+  c.host = get<std::string>(d, "clickhouse_host", c.host);
+  c.port = get<uint16_t>(d, "clickhouse_port", c.port);
+  c.user = get<std::string>(d, "clickhouse_user", c.user);
+  c.password = get<std::string>(d, "clickhouse_password", c.password);
+  c.ca_file = get<std::string>(d, "clickhouse_ca_file", c.ca_file);
+  c.ca_path = get<std::string>(d, "clickhouse_ca_path", c.ca_path);
+  c.allow_insecure_http =
+      get<bool>(d, "clickhouse_allow_insecure_http", c.allow_insecure_http);
+  c.timeouts.connect_s =
+      get<double>(d, "clickhouse_connect_timeout_s", c.timeouts.connect_s);
+  c.timeouts.request_s =
+      get<double>(d, "clickhouse_request_timeout_s", c.timeouts.request_s);
+  c.max_attempts = get<int>(d, "clickhouse_max_attempts", c.max_attempts);
+  return c;
 }
 
 dc::StorageServiceConfig service_config(const py::dict& d) {
@@ -62,9 +78,7 @@ dc::StorageServiceConfig service_config(const py::dict& d) {
   c.uploader.max_in_flight_bytes =
       get<uint64_t>(d, "uploader_max_in_flight_bytes", c.uploader.max_in_flight_bytes);
   c.uploader.max_attempts = get<int>(d, "uploader_max_attempts", c.uploader.max_attempts);
-  c.clickhouse_host = get<std::string>(d, "clickhouse_host", c.clickhouse_host);
-  c.clickhouse_port = get<uint16_t>(d, "clickhouse_port", c.clickhouse_port);
-  c.clickhouse_timeouts = clickhouse_timeouts(d);
+  c.clickhouse = clickhouse_connection(d);
   c.max_index_attempts = get<int>(d, "max_index_attempts", c.max_index_attempts);
   c.writer.database = get<std::string>(d, "database", "default");
   c.writer.table_prefix = get<std::string>(d, "table_prefix", "dmi");
@@ -169,9 +183,7 @@ class CaptureReader {
   explicit CaptureReader(const py::dict& d)
       : s3_(s3_config(d)),
         client_(std::make_shared<const dc::ClickHouseClient>(
-            get<std::string>(d, "clickhouse_host", "127.0.0.1"),
-            get<uint16_t>(d, "clickhouse_port", 8123),
-            clickhouse_timeouts(d))),
+            clickhouse_connection(d))),
         config_{get<std::string>(d, "database", "default"),
                 get<std::string>(d, "table_prefix", "dmi")},
         catalog_(client_, config_),
