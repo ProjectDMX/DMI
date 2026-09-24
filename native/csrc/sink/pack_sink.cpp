@@ -642,6 +642,20 @@ void PackSink::Run(size_t w) {
         ++counters_.duplicate_records;
         continue;
       }
+      if (st == dmi_pack::Status::kCapacity &&
+          assembler.builder->record_count() == 0) {
+        // The pack was opened for this record and it fits no empty pack:
+        // admission screened the payload, not the header, footer row and
+        // trailer around it. The reference's OversizedRecordError: drop the
+        // record, keep the pipeline. Sealing the empty pack instead failed
+        // the whole sink ("cannot seal an empty pack").
+        assembler.builder.reset();
+        assembler.has_first = false;
+        assembler.opened_ns = -1;
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++counters_.oversized_records;
+        continue;
+      }
       if (st == dmi_pack::Status::kCapacity) {
         // Full pack: seal with the reason the reference uses (records bound
         // hit → RECORDS, else SIZE), then retry into a fresh builder. A
