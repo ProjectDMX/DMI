@@ -63,8 +63,12 @@ def _torch_compile_lines(makefile_dir: str, target: str) -> list[str]:
     if result.returncode != 0:
         pytest.skip(f"cannot plan `{target}` here: {result.stderr[-300:]}")
     torch_flags = _torch_include_flags()
-    return [line for line in result.stdout.splitlines()
-            if torch_flags.intersection(line.split())]
+    # A recipe continued with backslashes is one command: judged line by
+    # line, its `-std=` and its torch `-I` flags land on different lines, and
+    # the continuation reads as a compile with no standard at all.
+    commands = result.stdout.replace("\\\n", " ").splitlines()
+    return [command for command in commands
+            if torch_flags.intersection(command.split())]
 
 
 @pytest.mark.parametrize(("makefile_dir", "target"), [

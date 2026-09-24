@@ -502,9 +502,12 @@ STORE_SOURCES := csrc/catalog/storage_service.cpp csrc/catalog/bindings_store.cp
     csrc/store/s3_sign.cpp csrc/store/s3_client.cpp csrc/store/uploader.cpp \
     csrc/store/spool.cpp csrc/pack/pack_builder.cpp \
     csrc/common/json.cpp csrc/common/curl_init.cpp
+# C++20 like every compile that reads torch's include directory: pybind11's
+# headers come from there, and the guard in tests/test_cpu_native_build.py
+# holds every such compile to the ATen floor.
 $(STORE_BUILT): $(STORE_SOURCES) $(STORE_HEADERS) $(TORCH_EXT_STAMP) | check-libcurl
 	mkdir -p $(BUILD_DIR)
-	$(CXX) -std=c++17 -O2 -fPIC -shared -Wall -Wextra \
+	$(CXX) -std=c++20 -O2 -fPIC -shared -Wall -Wextra \
 	    -I$(shell $(PYTHON) -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'include'))") \
 	    $(shell $(PYTHON) -c "import sysconfig; paths = sysconfig.get_paths(); print('-I'+paths.get('include'))") \
 	    -Icsrc -Icsrc/catalog -Icsrc/common -Icsrc/pack -Icsrc/store $(CURL_CPPFLAGS) \
