@@ -105,9 +105,12 @@ class NativeCaptureStorageConfig:
 
     clickhouse_host: str = "127.0.0.1"  # a bare host: no scheme, port or user
     clickhouse_port: int = 8123  # the HTTP interface (8443 for its TLS port)
-    # "https" always verifies the server's certificate and name, against the
-    # system roots plus clickhouse_ca_file (a PEM bundle) or
-    # clickhouse_ca_path (an OpenSSL hashed directory) for a private CA.
+    # "https" always verifies the server's certificate and name, against
+    # libcurl's built-in CA bundle/directory, or a private CA given as
+    # clickhouse_ca_file (a PEM bundle) or clickhouse_ca_path (an OpenSSL
+    # hashed directory). Each REPLACES libcurl's default for that option:
+    # whether the system roots still count depends on the libcurl build
+    # (kept on Debian/Ubuntu, dropped by bundle-only builds such as RHEL).
     clickhouse_scheme: str = "http"
     # Sent as X-ClickHouse-User / X-ClickHouse-Key headers, never in a URL.
     # Empty: no credentials, which ClickHouse reads as its `default` user.
@@ -118,7 +121,9 @@ class NativeCaptureStorageConfig:
     # A password over plain http must be opted into, as for s3.
     clickhouse_allow_insecure_http: bool = False
     # An optional separate account for NativeCaptureReader, typically one
-    # granted SELECT only. Empty: the reader uses clickhouse_user.
+    # limited with GRANT SELECT (or a readonly=2 profile) -- not readonly=1,
+    # which refuses the query-limit settings every read sends (Code 164).
+    # Empty: the reader uses clickhouse_user.
     clickhouse_reader_user: str = ""
     clickhouse_reader_password: str = field(default="", repr=False)
     # Every catalog request is bounded, so a server that stops answering

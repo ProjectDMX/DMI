@@ -183,19 +183,29 @@ takes one publisher per `(database, table_prefix)`, so a second engine on the
 same catalog is refused at `create_record_runtime`.
 To reach a secured catalog, set `clickhouse_scheme="https"` (and the server's
 TLS HTTP port, usually 8443) on `NativeCaptureStorageConfig`. The client always
-verifies the server's certificate and name, against the system roots plus
-`clickhouse_ca_file` (a PEM bundle) or `clickhouse_ca_path` (a hashed
-directory) for a private CA. `clickhouse_user`/`clickhouse_password` travel as
+verifies the server's certificate and name, against libcurl's built-in CA
+bundle/directory, or a private CA given as `clickhouse_ca_file` (a PEM bundle)
+or `clickhouse_ca_path` (a hashed directory). Each replaces libcurl's built-in
+default for that option rather than adding to it: a libcurl built with both a
+bundle and a directory (Debian, Ubuntu) keeps trusting the system roots
+through the other, a bundle-only build (RHEL, Fedora) does not, so to trust
+both there, pass a bundle holding the system roots and the private CA.
+`clickhouse_user`/`clickhouse_password` travel as
 `X-ClickHouse-User`/`X-ClickHouse-Key` headers, never in a URL, and the
 password is left out of the config's repr. A password over plain http is
 refused unless `clickhouse_allow_insecure_http=True`, and `clickhouse_host`
 must be a bare host (no scheme, port or `user:password@`).
 `clickhouse_reader_user`/`clickhouse_reader_password` give
-`NativeCaptureReader` a separate account, for example one granted `SELECT`
-only; the storage service always uses `clickhouse_user`. Every catalog
-request is bounded by `clickhouse_request_timeout_s`, which must be at least
-10 s (twice the catalog's publish timeout). A refused connection is retried
-for any statement, a reset or 5xx for reads only, and a timeout never.
+`NativeCaptureReader` a separate account, for example one limited with
+`GRANT SELECT` on the catalog tables (or a `readonly=2` settings profile). Do
+not use a `readonly=1` profile: the reader sends its query limits
+(`max_rows_to_read`, `max_execution_time`, ...) as settings, which
+`readonly=1` refuses (Code 164, READONLY). The storage service always uses
+`clickhouse_user`. Every catalog request is bounded by
+`clickhouse_request_timeout_s`, which must be at least 10 s (twice the
+catalog's publish timeout). A refused connection is retried for any
+statement; a reset, or a 5xx that is not a permanent ClickHouse error (such
+as a row limit or a denied grant), for reads only; and a timeout never.
 The schedule's default factory creates a distinct `CaptureSchedule` for each
 config instance.
 `MonitoringEngine` stores the config, while concrete adaptors decide whether
