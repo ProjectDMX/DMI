@@ -576,12 +576,21 @@ jobs:
         # below is empty, and this step should be deleted. The Makefile's
         # variables are `:=` assignments, so a command-line override would
         # replace the whole flag set rather than the standard; hence sed.
+        #
+        # The count check alone cannot say that: with #138 merged the three
+        # lines already read c++20, so it still counts 3 and the step passes
+        # having done nothing. An unchanged Makefile is that state and only
+        # that state -- before #138 the sed always rewrites all three -- so
+        # it raises a warning on the run summary rather than failing the job.
         run: |
           sed -i \
             -e '/^CXXFLAGS :=/s/-std=c++17/-std=c++20/' \
             -e '/^HOST_CXXFLAGS :=/s/-std=c++17/-std=c++20/' \
             -e '/^NVCCFLAGS :=/,/-std=/s/-std=c++17/-std=c++20/' \
             native/Makefile
+          if git diff --quiet native/Makefile; then
+            echo "::warning title=Delete the C++20 sed step::native/Makefile already compiles as C++20, so #138 has landed and this step changed nothing. Delete it from python-checks.yml."
+          fi
           git diff native/Makefile
           test "$(grep -cE '^(HOST_)?CXXFLAGS := -std=c\+\+20|^    -std=c\+\+20 \\$' native/Makefile)" = 3
 
