@@ -514,7 +514,10 @@ def test_a_failed_head_is_an_error_not_a_foreign_object(fake_s3, tmp_path):
 
 def test_one_publisher_per_catalog(fake_s3, tmp_path):
     with _catalog() as (_client, catalog):
-        config = _storage_config(fake_s3, catalog.table_prefix)
+        # No start wait: the refusal is the point here, and waiting out the
+        # holder is covered by the restart tests.
+        config = _storage_config(fake_s3, catalog.table_prefix,
+                                 start_lease_wait_s=0.0)
         first = _service(config, tmp_path / "first")
         second = _service(config, tmp_path / "second")
         first.start()

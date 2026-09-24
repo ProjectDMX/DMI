@@ -137,8 +137,12 @@ class NativeCaptureStorageConfig:
     # The bound on host clock disagreement across a replicated catalog.
     clock_skew_s: float = 0.0
     # How long start() waits for a predecessor's lease to expire before
-    # failing with it held. None waits lease_ttl_s + publish_timeout_s,
-    # enough to outlast a crashed predecessor; 0 fails at once.
+    # failing with it held. None waits lease_ttl_s + publish_timeout_s +
+    # clock_skew_s, enough to outlast a crashed predecessor that ran with the
+    # same knobs; 0 fails at once. A predecessor with a longer TTL (the
+    # native default is 30 s, which processes predating these knobs used)
+    # can outlast it: set this explicitly for the first restart after such
+    # a process.
     start_lease_wait_s: Optional[float] = None
 
     def __post_init__(self) -> None:
@@ -211,7 +215,8 @@ class NativeCaptureStorageConfig:
     def _lease_native(self) -> dict[str, int]:
         wait = self.start_lease_wait_s
         if wait is None:
-            wait = self.lease_ttl_s + self.publish_timeout_s
+            wait = (self.lease_ttl_s + self.publish_timeout_s
+                    + self.clock_skew_s)
         return {
             "lease_ttl_ns": _ns(self.lease_ttl_s),
             "publish_timeout_ns": _ns(self.publish_timeout_s),

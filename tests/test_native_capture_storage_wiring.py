@@ -509,6 +509,18 @@ def test_the_service_gets_the_lease_knobs_in_nanoseconds(monkeypatch, tmp_path):
     assert config["start_lease_wait_ns"] == 20_000_000_000
 
 
+def test_the_default_start_wait_outlasts_a_skewed_predecessor(monkeypatch,
+                                                              tmp_path):
+    # A replica whose clock lags by clock_skew_s still sees the crashed
+    # predecessor's row as live for that long after lease_ttl_s.
+    engine, _events, services = _capture_engine(monkeypatch, tmp_path)
+    engine._capture_storage_config = _storage_config(clock_skew_s=2.0)
+
+    engine.create_record_runtime(_record_format())
+
+    assert services[0].config["start_lease_wait_ns"] == 22_000_000_000
+
+
 def test_explicit_lease_knobs_reach_the_service(monkeypatch, tmp_path):
     engine, _events, services = _capture_engine(monkeypatch, tmp_path)
     engine._capture_storage_config = _storage_config(

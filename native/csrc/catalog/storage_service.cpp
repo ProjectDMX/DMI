@@ -112,9 +112,12 @@ void CaptureStorageService::start() {
     acquire_lease_at_start();  // throws kHeld if another publisher keeps it
   }
 
-  // After the lease, never before: a second process pointed at this spool
-  // would otherwise delete a live sink's .open files and only then learn
-  // that the catalog is held.
+  // After the lease, never before, so a second process pointed at this spool
+  // usually learns that the catalog is held before it can delete a live
+  // sink's .open files. Only usually: a holder that is quarantined has let
+  // its row lapse, and a second process can take the lease in that gap. The
+  // spool itself is not locked; one process per spool is the caller's job
+  // until the spool gets an owner lock.
   if (config_.sweep_spool_on_start) {
     std::vector<dmi_store::StagedPack> recovered;
     std::string error;
