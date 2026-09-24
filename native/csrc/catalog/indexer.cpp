@@ -287,7 +287,8 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
     // the inventory, so a pack recorded there but never made visible is
     // skipped forever AND invisible. Only a lost VERSION race is retried
     // here, repaired by allocating higher and rewriting the descriptors at
-    // the winning version (supersession ranks by index_version).
+    // the winning version (supersession ranks by the pack's membership
+    // version, not by the rows' index_version; see catalog.py _publish).
     uint64_t attempts = 0;
     for (; attempts < static_cast<uint64_t>(config_.max_publish_attempts);
          ++attempts) {
@@ -298,10 +299,30 @@ IndexResultData NativeIndexer::index(const std::vector<PackRefData>& refs) {
             all_rows.size(), indexed.size());
       } catch (const CatalogError& e) {
         if (e.kind() != CatalogError::Kind::kPublishRace) {
-          if (e.kind() == CatalogError::Kind::kPublishConflict) {
+          if (e.kind() == CatalogError::Kind::kPublishConflict &&
+              !indexed.empty()) {
             // Visible, so skippable: record the packs before propagating.
-            if (!indexed.empty()) {
+            try {
               writer_->commit_packs(RenderPackRows(indexed), version);
+            } catch (const std::exception& commit_failure) {
+              // The conflict is the finding (catalog.py's `raise conflict
+              // from commit_failure`). Left to propagate, the commit's
+              // transport error replaced kPublishConflict, so a supervisor
+              // matching on it never saw the second writer, and the visible
+              // packs stayed out of the inventory for the next pass to
+              // re-publish.
+              throw CatalogError(
+                  CatalogError::Kind::kPublishConflict,
+                  std::string(e.what()) +
+                      " (recording its packs in the inventory then failed "
+                      "too: " +
+                      commit_failure.what() + ")");
+            } catch (...) {
+              throw CatalogError(
+                  CatalogError::Kind::kPublishConflict,
+                  std::string(e.what()) +
+                      " (recording its packs in the inventory then failed "
+                      "too)");
             }
           }
           throw;

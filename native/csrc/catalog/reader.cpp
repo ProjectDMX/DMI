@@ -32,7 +32,13 @@ constexpr const char* kProjection[] = {
     "object_key",  "object_bytes",   "pack_checksum", "pack_record_count",
     "payload_offset", "stored_length", "decoded_length", "codec",
     "payload_checksum"};
-constexpr const char* kResolutionOrder = "(index_version, store_id, pack_id)";
+// clickhouse_reader._RESOLUTION_ORDER: a pack ranks by the version its
+// publish reached the watermark at (member_version, from snapshot()), never
+// by the version a descriptor row was written at -- a replayed pack's rows
+// sit above that. index_version last picks, within one pack, the row a
+// merge keeps.
+constexpr const char* kResolutionOrder =
+    "(member_version, store_id, pack_id, index_version)";
 
 std::string quoted(const std::string& name) { return "`" + name + "`"; }
 
@@ -472,17 +478,21 @@ NativeCaptureCatalog::bounded_read_settings() const {
   return out;
 }
 
-std::string NativeCaptureCatalog::membership() const {
-  // clickhouse_sql.membership_predicate, bounded: the snapshot is the set
-  // of packs whose publish reached the watermark at or before the bound.
+std::string NativeCaptureCatalog::snapshot() const {
+  // clickhouse_reader._snapshot over clickhouse_sql.member_versions: the
+  // descriptor rows of the packs whose publish reached the watermark at or
+  // before the bound, each joined to the version its pack became a member
+  // at, which is what kResolutionOrder ranks on.
   const std::string manifest = qualified("snapshot_manifest");
   const std::string watermark = qualified("index_watermark");
   return (
-      "(store_id, pack_id) IN ("
-      "SELECT store_id, pack_id FROM " + manifest + " "
+      qualified("capture_raw") +
+      " INNER JOIN (SELECT store_id, pack_id, max(index_version) AS "
+      "member_version FROM " + manifest + " "
       "WHERE index_version <= %(watermark)s AND (index_version, publish_id) IN "
       "(SELECT index_version, publish_id FROM " + watermark +
-      " WHERE index_version <= %(watermark)s))");
+      " WHERE index_version <= %(watermark)s) GROUP BY store_id, pack_id) "
+      "AS `members` USING (store_id, pack_id)");
 }
 
 std::string NativeCaptureCatalog::projection() const {
@@ -699,7 +709,12 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
   }
 
   Params params{{"watermark", watermark}};
-  std::string clauses = membership();
+  // The snapshot bound is the join in the FROM clause, so these are only
+  // the caller's filters, and there may be none.
+  std::string clauses;
+  auto add = [&clauses](const std::string& clause) {
+    clauses += (clauses.empty() ? "" : " AND ") + clause;
+  };
   for (const auto& [value, name] :
        std::vector<std::pair<const std::optional<std::string>*, const char*>>{
            {&filters.tenant_id, "tenant_id"},
@@ -708,7 +723,7 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
            {&filters.session_id, "session_id"},
            {&filters.model_id, "model_id"}}) {
     if (value->has_value()) {
-      clauses += " AND " + quoted(name) + " = %(" + name + ")s";
+      add(quoted(name) + " = %(" + name + ")s");
       params.emplace(name, **value);
     }
   }
@@ -719,7 +734,7 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
       rendered += sql_quote(filters.hook_names[i]);
     }
     rendered += ")";
-    clauses += " AND hook_name IN " + rendered;
+    add("hook_name IN " + rendered);
   }
   if (!filters.layer_numbers.empty()) {
     std::string rendered = "(";
@@ -728,14 +743,14 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
       rendered += std::to_string(filters.layer_numbers[i]);
     }
     rendered += ")";
-    clauses += " AND layer_number IN " + rendered;
+    add("layer_number IN " + rendered);
   }
   if (filters.captured_after_ns.has_value()) {
-    clauses += " AND captured_at_ns >= %(captured_after_ns)s";
+    add("captured_at_ns >= %(captured_after_ns)s");
     params.emplace("captured_after_ns", *filters.captured_after_ns);
   }
   if (filters.captured_before_ns.has_value()) {
-    clauses += " AND captured_at_ns <= %(captured_before_ns)s";
+    add("captured_at_ns <= %(captured_before_ns)s");
     params.emplace("captured_before_ns", *filters.captured_before_ns);
   }
   if (after.has_value()) {
@@ -751,7 +766,7 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
       placeholders += "%(after_" + std::string(names[i]) + ")s";
       params.emplace("after_" + std::string(names[i]), (*after)[i]);
     }
-    clauses += " AND (" + columns + ") > (" + placeholders + ")";
+    add("(" + columns + ") > (" + placeholders + ")");
   }
 
   // One row beyond the page tells whether a cursor is owed, without a
@@ -767,8 +782,9 @@ SearchPage NativeCaptureCatalog::search(const SearchFilters& filters) const {
     order += quoted(column);
   }
   const std::vector<Row> rows = client_->execute(
-      "SELECT " + projection() + " FROM " + qualified("capture_raw") +
-          " WHERE " + clauses + " GROUP BY " + grouped + " ORDER BY " + order +
+      "SELECT " + projection() + " FROM " + snapshot() +
+          (clauses.empty() ? "" : " WHERE " + clauses) + " GROUP BY " +
+          grouped + " ORDER BY " + order +
           " LIMIT %(row_limit)s",
       params, bounded_read_settings());
 
@@ -899,7 +915,7 @@ std::vector<std::vector<std::string>> NativeCaptureCatalog::get_by_ids(
   // primary index narrows the read to one tenant's range and the bloom
   // filter prunes granules inside it.
   const std::string head =
-      "SELECT " + projection() + " FROM " + qualified("capture_raw") +
+      "SELECT " + projection() + " FROM " + snapshot() +
       " WHERE tenant_id = %(tenant_id)s AND capture_id IN ";
   // Chunked by rendered bytes: the ids land in the statement TEXT, and a
   // full-size lookup can breach max_query_size. Ids are sent once each.
@@ -915,9 +931,9 @@ std::vector<std::vector<std::string>> NativeCaptureCatalog::get_by_ids(
       ids += sql_quote(chunk[i]);
     }
     // The ids land in the statement TEXT (chunked inline, like the
-    // writer's members); the membership + snapshot bound ride as params.
+    // writer's members); the snapshot bound rides as a param.
     const std::vector<Row> rows = client_->execute(
-        head + "(" + ids + ") AND " + membership() +
+        head + "(" + ids + ")" +
             " GROUP BY `tenant_id`,`experiment_id`,`run_id`,"
             "`captured_at_ns`,`capture_id`",
         {{"tenant_id", tenant_id}, {"watermark", requested}},

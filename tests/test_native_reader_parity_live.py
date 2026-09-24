@@ -1075,10 +1075,10 @@ def test_get_by_ids_parity_and_watermark_validation():
 def test_supersession_resolves_the_newest_pack():
     """The same capture re-described by a later pack: newest wins, both sides.
 
-    The resolution order is (index_version, store_id, pack_id) — a later
-    version supersedes; within one version the highest (store_id, pack_id)
-    wins, a fixed choice so a selection resolved twice resolves to the
-    same bytes.
+    The resolution order is (member_version, store_id, pack_id,
+    index_version) — a pack published at a later version supersedes; within
+    one version the highest (store_id, pack_id) wins, a fixed choice so a
+    selection resolved twice resolves to the same bytes.
     """
     with _catalog() as (client, config, prefix):
         driver = CatalogDriver()
@@ -1105,6 +1105,48 @@ def test_supersession_resolves_the_newest_pack():
             for item in native["items"]:
                 assert item[21] == new_pack, item  # pack_id column
             for item in page.items:
+                assert item.locator.pack_id == new_pack
+        finally:
+            driver.close()
+
+
+def test_a_replayed_pack_does_not_flip_a_pinned_read_on_either_side():
+    """Re-indexing a published pack must not re-promote it, native or Python.
+
+    The old pack is published at 7 and never committed; a newer pack
+    describing the same captures is published at 8. A later pass re-indexes
+    the old pack and writes its rows at 9 without publishing (it crashed).
+    Both readers must still resolve snapshot 8 to the NEW pack: the old
+    pack's publish is 7, whatever version its rows were written at. See
+    test_clickhouse_snapshot_live.test_a_replayed_pack_does_not_flip_a_pinned_read.
+    """
+    with _catalog() as (client, config, prefix):
+        driver = CatalogDriver()
+        try:
+            _open_helper(driver, prefix)
+            old_pack = str(uuid.uuid4())
+            new_pack = str(uuid.uuid4())
+            first = _descriptor_dicts(2, pack_id=old_pack)
+            second = _descriptor_dicts(2, pack_id=new_pack)
+            _publish_native(driver, prefix, first, 7)
+            _publish_native(driver, prefix, second, 8)
+            replayed = driver.call(op="write_descriptors", descriptors=first,
+                                   index_version=9)
+            assert replayed["ok"], replayed
+            assert driver.call(op="current_watermark")["watermark"] == "8"
+
+            reader = _python_reader(client, config)
+            ids = [d["capture_id"] for d in first]
+            native_search = driver.call(op="search", limit=100)
+            native_ids = driver.call(op="get_by_ids", capture_ids=ids,
+                                     tenant_id="t", watermark="8")
+            page = _python_page_items(reader)
+            python_ids = reader.get_by_ids(ids, tenant_id="t", watermark="8")
+            assert _normalize(native_search["items"]) == _normalize(page.items)
+            assert _normalize(native_ids["items"]) == _normalize(python_ids)
+            for item in native_search["items"] + native_ids["items"]:
+                assert item[21] == new_pack, item  # pack_id column
+            for item in page.items + python_ids:
                 assert item.locator.pack_id == new_pack
         finally:
             driver.close()

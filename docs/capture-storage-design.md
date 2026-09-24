@@ -382,8 +382,9 @@ built, nothing compares them -- and integrity proves nothing here, because a
 forged pack is perfectly well formed. Anyone able to PUT into the bucket could
 therefore write a pack whose footer carried another tenant's `tenant_id` and
 `capture_id`, have it indexed under the victim's tenant, and -- since the
-reader resolves a capture with `argMax` over `(index_version, store_id,
-pack_id)` -- become the pack that capture resolves to at every fresh watermark.
+reader resolves a capture with `argMax` over `(member_version, store_id,
+pack_id, index_version)`, newest publish first -- become the pack that capture
+resolves to at every fresh watermark.
 
 `_descriptors` now refuses a pack whose records name a tenant other than the
 one its key belongs to, comparing against the same `key_component` encoding
@@ -446,7 +447,7 @@ capture described by two packs -- a pack mirrored to a second store, or a
 producer retrying a `capture_id` after the first pack was sealed -- is two
 published rows and appears twice. Choosing between them is supersession, which
 belongs to the reader (one `argMax` grouped on capture identity, ordered on
-`(index_version, store_id, pack_id)` -- see *Phase 5*); a second copy of those
+`(member_version, store_id, pack_id, index_version)` -- see *Phase 5*); a second copy of those
 semantics in the view's SQL could drift away from the reader's without either
 side failing.
 
@@ -1551,7 +1552,7 @@ Reads are pinned to a watermark. `CaptureQuery.filter_hash` identifies a query
 independently of its page, keyset cursors carry that hash and the pinned
 watermark, and `ClickHouseCaptureCatalog` resolves a capture out of
 `*_capture_raw` with **one** `argMax` over a tuple of every non-grouped column,
-ordered on the tuple `(index_version, store_id, pack_id)`.
+ordered on the tuple `(member_version, store_id, pack_id, index_version)`.
 
 Both halves of that shape are load-bearing, and the per-column
 `argMax(<column>, index_version)` this document used to describe has been
@@ -1564,9 +1565,20 @@ removed:
   watermark resolved to a different pack at `max_threads = 1` than above it, and
   to a different one again once a merge had put both rows in one part -- a
   pinned selection silently reading different bytes before and after a
-  background merge. `(index_version, store_id, pack_id)` is a total order over
-  the rows in a group, and `index_version` still leads, so supersession is
-  unchanged.
+  background merge. `(member_version, store_id, pack_id, index_version)` is a
+  total order over the rows in a group.
+- **The ranking version.** `member_version` is the version at which a pack's
+  publish reached the watermark, at or below the pin: the manifest rows paired
+  with the watermark log, joined in on `(store_id, pack_id)`. It is NOT a
+  descriptor row's own `index_version`, which is only the version the row was
+  written at. A pass that re-indexes an already-published pack -- after a crash
+  between publishing and `commit_packs`, an outcome-unknown publish that
+  landed, or a rebuild beside the live indexer -- rewrites the pack's rows at a
+  higher version before publishing anything. Ranked on the rows' version, a
+  superseded pack then outranked the newer pack inside snapshots already
+  pinned, and kept doing so if that pass never published. Found by model
+  checking the publish protocol. `index_version` is kept as the last component,
+  so within one pack the row a merge keeps is also the row a read resolves.
 - **One aggregate, not one per column.** Twenty-seven separate `argMax` calls
   leave nothing forbidding `store_id` from one row and `object_key` from
   another -- a descriptor describing no pack that exists. It could not be

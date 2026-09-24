@@ -90,7 +90,7 @@ class NativeCaptureCatalog {
       const std::string& tenant_id, const std::string& watermark) const;
 
  private:
-  std::string membership() const;
+  std::string snapshot() const;
   std::string projection() const;
   std::string qualified(const std::string& table) const;
   std::map<std::string, std::string> settings() const;

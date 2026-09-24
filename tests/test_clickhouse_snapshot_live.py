@@ -934,6 +934,80 @@ def test_two_packs_describing_one_capture_both_survive_a_merge(second_descriptio
         assert at_fresh[0].locator == copied[0].locator
 
 
+@pytest.mark.parametrize(
+    "second_description", (_copied_to_another_store, _retried_into_a_new_pack)
+)
+def test_a_replayed_pack_does_not_flip_a_pinned_read(second_description):
+    """Re-indexing a published pack must not re-promote it over a newer one.
+
+    Found by model checking the publish protocol. Pass A publishes P1 and dies
+    before ``commit_packs`` -- the "redundant work next pass" the indexer
+    accepts. Pass B publishes P2, a second pack describing the same capture,
+    and a reader pins that watermark and resolves the capture to P2. A later
+    pass does not find P1 in the inventory, re-indexes it and writes P1's rows
+    at a fresh, higher version, then dies before publishing. P1 is still a
+    member of the pinned snapshot, and ranked on its rows' own version it
+    outranked P2 there -- permanently, since nothing ever rewrites those rows,
+    and a merge then leaves only the higher version.
+
+    The same rows arrive by other routes (an outcome-unknown publish that
+    landed; a conflict whose ``commit_packs`` failed; a rebuild running beside
+    the live indexer), so the reader has to rank a pack by when its PUBLISH
+    reached the watermark, not by when its rows were written.
+    """
+    original = synthetic_descriptors(3)
+    newer = second_description(original)
+    tenant = original[0].metadata.tenant_id
+    ids = [item.capture_id for item in original]
+    with _catalog() as (writer, reader, client, config):
+        # Pass A: published, never committed to the inventory.
+        version = writer.allocate_version()
+        writer.write_descriptors(original, index_version=version)
+        _publish(writer, version, refs=_refs(original))
+        # Pass B: the newer pack, published and committed.
+        version = writer.allocate_version()
+        writer.write_descriptors(newer, index_version=version)
+        _publish(writer, version, refs=_refs(newer))
+        _commit(writer, newer, version)
+        pinned = reader.current_watermark()
+        assert pinned == str(version)
+
+        def resolved(watermark):
+            by_id = reader.get_by_ids(ids, tenant_id=tenant, watermark=watermark)
+            return {item.capture_id: item.locator for item in by_id}
+
+        at_pin = resolved(pinned)
+        assert at_pin == {item.capture_id: item.locator for item in newer}
+        first = reader.search(CaptureQuery(limit=2, tenant_id=tenant))
+        assert first.next_cursor is not None
+
+        # The replay: P1's rows again, at a version above the pin, with no
+        # publish behind them.
+        replay = writer.allocate_version()
+        writer.write_descriptors(original, index_version=replay)
+
+        assert resolved(pinned) == at_pin, "the replay flipped the pinned read"
+        page = reader.search(CaptureQuery(limit=10, tenant_id=tenant))
+        assert page.watermark == pinned
+        assert page.items == newer
+        rest = reader.search(
+            CaptureQuery(limit=2, tenant_id=tenant, cursor=first.next_cursor)
+        )
+        assert first.items + rest.items == newer
+
+        # A merge leaves P1 only at the replay's version; still not a rank.
+        _merge(client, config)
+        assert resolved(pinned) == at_pin, "a merge flipped the pinned read"
+
+        # Once the replay DOES publish P1, that is the newest publish and
+        # wins at the new head -- while the old pin still resolves to P2.
+        _publish(writer, replay, refs=_refs(original))
+        assert resolved(str(replay)) == {
+            item.capture_id: item.locator for item in original
+        }
+        assert resolved(pinned) == at_pin
+
+
 def test_a_pin_ignores_a_second_store_holding_the_same_pack_id():
     """Pack identity is the PAIR, proven by behaviour rather than by SQL text.
 
