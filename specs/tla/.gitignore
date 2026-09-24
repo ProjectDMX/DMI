@@ -1,0 +1,4 @@
+# TLC writes a replayable trace module next to the spec on every violation
+*_TTrace_*.tla
+*_TTrace_*.bin
+states/
