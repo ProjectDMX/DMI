@@ -25,6 +25,17 @@
 // start_lease_wait_ns for the lease at start(), then fails naming the holder.
 // That is the in-process mode; a standalone daemon can reuse this class
 // unchanged.
+//
+// The lease through ClickHouse errors. A catalog statement whose outcome is
+// unknown (a transport error or timeout on a renewal or a publish)
+// quarantines the writer: it drops its lease without a tombstone and refuses
+// to publish for one TTL (catalog_writer.cpp). That is recoverable, not
+// fatal: while the writer is quarantined or holds no lease the cycle skips
+// the catalog phase and keeps pending_index_, and once the window passes the
+// service acquires a FRESH lease_id, as the Python oracle's writer documents
+// (clickhouse_catalog.py, publish_snapshot). Only a foreign lease that stays
+// live for 2 x TTL is fatal: the service stops (snapshot().failed), writes
+// one line to stderr, and flush() rethrows the refusal naming the holder.
 #pragma once
 
 #include <atomic>
@@ -115,6 +126,15 @@ struct StorageServiceSnapshot {
   uint64_t swept_on_start = 0;  // ready packs Recover() found at start
   uint64_t pending_index = 0;   // uploaded packs awaiting a retried index
   uint64_t rejected_packs = 0;  // set aside: cannot be indexed (see flush)
+  // A foreign lease outlived 2 x TTL: the service stopped for good.
+  bool failed = false;
+  // "none" before start, "held", "quarantined" (an unknown outcome set the
+  // lease aside), "reacquiring" (no lease, trying for a fresh one),
+  // "failed", or "released" (stop() wrote the tombstone).
+  std::string lease_state = "none";
+  // steady_clock ns at which the quarantine ends; 0 when not quarantined.
+  uint64_t quarantined_until_ns = 0;
+  uint64_t lease_reacquisitions = 0;  // fresh leases taken after a loss
   std::string last_error;
 };
 
@@ -145,8 +165,8 @@ class CaptureStorageService {
 
   StorageServiceSnapshot snapshot() const;
 
-  // Rethrows a fatal failure latched by the background cycle: losing the
-  // publisher lease to another holder.
+  // Rethrows a fatal failure latched by the background cycle: another
+  // publisher holding the lease for longer than 2 x TTL.
   void rethrow_if_failed() const;
 
  private:
@@ -166,6 +186,13 @@ class CaptureStorageService {
   void renew_lease_if_due();  // requires lease_mutex_
   // Takes the lease at start(), waiting for an expiring predecessor.
   void acquire_lease_at_start();  // requires lease_mutex_
+  // Whether the writer holds a lease, taking a fresh one when it has none
+  // and is no longer quarantined. Never throws. Requires lease_mutex_.
+  bool ensure_publisher_lease();
+  // Another holder refused a claim or renewal; latches once that has lasted
+  // 2 x TTL. Call from the catch block. Requires lease_mutex_.
+  void lease_held_elsewhere(const CatalogError& refusal);
+  void publish_lease_state();  // requires lease_mutex_
   // Sets a pack aside for good; flush() reports it. Requires cycle_mutex_.
   void reject(const PackRefData& ref, const std::string& reason);
   void record_error(const std::string& message);
@@ -187,6 +214,12 @@ class CaptureStorageService {
   // while cycles publish. Taken inside cycle_mutex_, never the other way.
   std::mutex lease_mutex_;
   uint64_t last_renew_ns_ = 0;  // guarded by lease_mutex_
+  // When a claim or renewal was first refused by another holder since the
+  // lease was last held; 0 while none has been. Guarded by lease_mutex_.
+  uint64_t held_elsewhere_since_ns_ = 0;
+  // Earliest next claim after a refusal, so flush()'s fast cycles do not
+  // hammer the lease table. Guarded by lease_mutex_.
+  uint64_t next_claim_ns_ = 0;
   uint64_t last_reconcile_ns_ = 0;
   int failure_streak_ = 0;  // consecutive failed cycles, for the backoff
   // Uploaded, so gone from the spool, but not yet in the catalog.
@@ -201,6 +234,9 @@ class CaptureStorageService {
   std::mutex wake_mutex_;
   std::condition_variable wake_;
   bool stop_requested_ = false;
+  // Set when a lease is re-acquired, so a loop in a long backoff indexes
+  // what is owed now rather than after its wait. Guarded by wake_mutex_.
+  bool kick_ = false;
   bool started_ = false;
 
   mutable std::mutex state_mutex_;

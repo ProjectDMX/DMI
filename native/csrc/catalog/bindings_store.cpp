@@ -107,6 +107,12 @@ py::dict snapshot_dict(const dc::StorageServiceSnapshot& s) {
   out["swept_on_start"] = s.swept_on_start;
   out["pending_index"] = s.pending_index;
   out["rejected_packs"] = s.rejected_packs;
+  out["failed"] = s.failed;
+  out["lease_state"] = s.lease_state;
+  // Seconds on the monotonic clock, comparable with time.monotonic() (both
+  // CLOCK_MONOTONIC on Linux); 0.0 when not quarantined.
+  out["quarantined_until"] = static_cast<double>(s.quarantined_until_ns) / 1e9;
+  out["lease_reacquisitions"] = s.lease_reacquisitions;
   out["last_error"] = s.last_error;
   return out;
 }

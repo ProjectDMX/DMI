@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -56,6 +57,13 @@ bool is_pack_id(const std::string& value) {
 bool is_lease_refusal(const CatalogError& exc) {
   return exc.kind() == CatalogError::Kind::kHeld ||
          exc.kind() == CatalogError::Kind::kLease;
+}
+
+// The lease thread's tick, which is also the retry interval for a claim
+// another holder refused: a sixth of the TTL, so a renewal due at ttl/3 is
+// never more than a tick late.
+uint64_t lease_tick_ns(uint64_t ttl_ns) {
+  return std::max<uint64_t>(ttl_ns / 6, 10'000'000ull);
 }
 
 }  // namespace
@@ -130,8 +138,7 @@ void CaptureStorageService::start() {
     try {
       reconcile();
     } catch (const CatalogError& exc) {
-      if (exc.kind() == CatalogError::Kind::kHeld ||
-          exc.kind() == CatalogError::Kind::kLease) {
+      if (is_lease_refusal(exc)) {
         try {
           std::lock_guard<std::mutex> lease(lease_mutex_);
           if (writer_.held_lease() != nullptr) writer_.release_lease();
@@ -149,6 +156,11 @@ void CaptureStorageService::start() {
   {
     std::lock_guard<std::mutex> lock(wake_mutex_);
     stop_requested_ = false;
+    kick_ = false;
+  }
+  {
+    std::lock_guard<std::mutex> lease(lease_mutex_);
+    publish_lease_state();
   }
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -170,12 +182,22 @@ void CaptureStorageService::stop() {
   std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
   if (started_) {
     started_ = false;
+    // A quarantined writer holds no lease, so it writes no tombstone: the
+    // outcome-unknown statement may still be running, and its row must stay
+    // live until the TTL keeps a successor out of that window.
+    bool released = false;
     try {
       std::lock_guard<std::mutex> lease(lease_mutex_);
-      if (writer_.held_lease() != nullptr) writer_.release_lease();
+      if (writer_.held_lease() != nullptr) {
+        writer_.release_lease();
+        released = true;
+      }
     } catch (const std::exception& exc) {
       record_error(std::string("lease release failed: ") + exc.what());
     }
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!state_.failed) state_.lease_state = released ? "released" : "none";
+    state_.quarantined_until_ns = 0;
   }
   std::lock_guard<std::mutex> lock(state_mutex_);
   state_.running = false;
@@ -229,12 +251,13 @@ void CaptureStorageService::loop() {
     {
       std::unique_lock<std::mutex> lock(wake_mutex_);
       wake_.wait_for(lock, std::chrono::nanoseconds(wait_ns),
-                     [this] { return stop_requested_; });
+                     [this] { return stop_requested_ || kick_; });
       if (stop_requested_) return;
+      kick_ = false;
     }
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
-      if (failure_) return;  // the lease is gone; nothing more can publish
+      if (failure_) return;  // another publisher holds the catalog
     }
     std::lock_guard<std::timed_mutex> cycle(cycle_mutex_);
     run_cycle();
@@ -251,9 +274,21 @@ void CaptureStorageService::loop() {
 
 CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
   CycleOutcome outcome;
+  // The catalog phase needs the lease. Without one -- quarantined after an
+  // unknown outcome, or refused by another holder -- the cycle still
+  // uploads as far as the owed-pack rule below allows, and owes the rest.
+  bool catalog = false;
+  {
+    std::lock_guard<std::mutex> lease(lease_mutex_);
+    catalog = ensure_publisher_lease();
+  }
   // Indexes refs, keeping whatever does not index owed: it is already gone
   // from the spool, so pending_index_ is the only record of it in-process.
-  const auto index_or_owe = [this](std::vector<PackRefData> refs) {
+  const auto index_or_owe = [this, catalog](std::vector<PackRefData> refs) {
+    if (!catalog) {
+      pending_index_.insert(pending_index_.end(), refs.begin(), refs.end());
+      return;
+    }
     std::vector<PackRefData> unindexed;
     try {
       if (!refs.empty()) index_bounded(std::move(refs), &unindexed);
@@ -270,7 +305,7 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
     //    of it is still owed, the catalog is down or refusing: upload
     //    nothing new, so new packs stay in the durable spool rather than
     //    joining a list that only this process remembers.
-    if (!pending_index_.empty()) {
+    if (catalog && !pending_index_.empty()) {
       std::vector<PackRefData> owed;
       owed.swap(pending_index_);
       index_or_owe(std::move(owed));
@@ -310,7 +345,7 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
     index_or_owe(std::move(to_index));
 
     // 4. Reconcile on its interval. The lease thread keeps the lease alive.
-    if (config_.reconcile_interval_ns > 0 &&
+    if (catalog && config_.reconcile_interval_ns > 0 &&
         steady_ns() - last_reconcile_ns_ >= config_.reconcile_interval_ns) {
       reconcile();
       last_reconcile_ns_ = steady_ns();
@@ -324,7 +359,10 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
     // A cycle that already failed is not drained whatever the spool holds,
     // so it skips the listing: an empty spool lists for free, but a backlog
     // would be re-hashed on every cycle of an outage.
-    outcome.failed = upload_failures != 0 || !pending_index_.empty();
+    // Without the lease nothing can be confirmed in the catalog, so the
+    // cycle is not drained, and it counts towards the backoff.
+    outcome.failed =
+        !catalog || upload_failures != 0 || !pending_index_.empty();
     bool nothing_pending = !batch.refs.empty();
     if (batch.refs.empty() && !outcome.failed) {
       std::vector<dmi_store::StagedPack> pending;
@@ -341,13 +379,12 @@ CaptureStorageService::CycleOutcome CaptureStorageService::run_cycle() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     ++state_.cycles;
   } catch (const CatalogError& exc) {
-    if (exc.kind() == CatalogError::Kind::kHeld ||
-        exc.kind() == CatalogError::Kind::kLease) {
-      latch_failure(std::current_exception(),
-                    std::string("publisher lease lost: ") + exc.what());
-    } else {
-      record_error(exc.what());
-    }
+    // A lease refusal here is not fatal either: the writer has dropped or
+    // been fenced out of its lease, and the next ensure_publisher_lease()
+    // decides between a fresh lease and a latch.
+    record_error(is_lease_refusal(exc)
+                     ? std::string("publisher lease lost: ") + exc.what()
+                     : std::string(exc.what()));
   } catch (const std::exception& exc) {
     record_error(exc.what());
   }
@@ -411,8 +448,7 @@ void CaptureStorageService::index_bounded(std::vector<PackRefData> refs,
         reject(batch.front(), exc.what());
         continue;
       }
-      const bool lease_lost = exc.kind() == CatalogError::Kind::kHeld ||
-                              exc.kind() == CatalogError::Kind::kLease;
+      const bool lease_lost = is_lease_refusal(exc);
       give_up(batch, std::string("index failed: ") + exc.what());
       if (lease_lost) throw;
       return;
@@ -550,10 +586,10 @@ void CaptureStorageService::keep_lease() {
   // The lease renews only inside a publish, and the cycle loop backs off up
   // to max_backoff_ns while the object store is down -- past the lease TTL.
   // Renewing from the cycle let the lease lapse during an outage and a rival
-  // take the catalog. This thread renews on its own schedule instead.
-  const uint64_t ttl = config_.writer.lease_ttl_ns;
-  const auto tick = std::chrono::nanoseconds(
-      std::max<uint64_t>(ttl / 6, 10'000'000ull));
+  // take the catalog. This thread renews on its own schedule instead, and
+  // takes a fresh lease once a lost one can be replaced.
+  const auto tick =
+      std::chrono::nanoseconds(lease_tick_ns(config_.writer.lease_ttl_ns));
   while (true) {
     {
       std::unique_lock<std::mutex> lock(wake_mutex_);
@@ -564,20 +600,27 @@ void CaptureStorageService::keep_lease() {
       std::lock_guard<std::mutex> lock(state_mutex_);
       if (failure_) return;
     }
+    std::lock_guard<std::mutex> lease(lease_mutex_);
+    if (writer_.held_lease() == nullptr) {
+      ensure_publisher_lease();
+      continue;
+    }
     try {
-      std::lock_guard<std::mutex> lease(lease_mutex_);
       renew_lease_if_due();
     } catch (const CatalogError& exc) {
-      if (exc.kind() == CatalogError::Kind::kHeld ||
-          exc.kind() == CatalogError::Kind::kLease) {
-        latch_failure(std::current_exception(),
-                      std::string("publisher lease lost: ") + exc.what());
-        return;
+      if (is_lease_refusal(exc)) {
+        // The coordinator dropped the lease: a live foreign head refused
+        // the renewal claim, or the claim was contested.
+        lease_held_elsewhere(exc);
+      } else {
+        record_error(std::string("lease renewal failed: ") + exc.what());
       }
-      record_error(std::string("lease renewal failed: ") + exc.what());
     } catch (const std::exception& exc) {
+      // An unknown outcome: the writer quarantined itself and dropped the
+      // lease. ensure_publisher_lease() replaces it after the window.
       record_error(std::string("lease renewal failed: ") + exc.what());
     }
+    publish_lease_state();
   }
 }
 
@@ -588,6 +631,7 @@ void CaptureStorageService::renew_lease_if_due() {
   if (ttl == 0 || steady_ns() - last_renew_ns_ < ttl / 3) return;
   writer_.renew_lease();
   last_renew_ns_ = steady_ns();
+  held_elsewhere_since_ns_ = 0;
   std::lock_guard<std::mutex> lock(state_mutex_);
   ++state_.lease_renewals;
 }
@@ -622,6 +666,91 @@ void CaptureStorageService::acquire_lease_at_start() {
   }
 }
 
+bool CaptureStorageService::ensure_publisher_lease() {
+  if (writer_.held_lease() != nullptr) return true;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (failure_) return false;
+  }
+  if (writer_.quarantined()) {
+    // The unknown-outcome statement may still be running under the lease
+    // it dropped; no claim, not even a fresh lease_id, until the window
+    // (one TTL) has passed and that lease's row has expired with it.
+    publish_lease_state();
+    return false;
+  }
+  const uint64_t now = steady_ns();
+  if (now < next_claim_ns_) return false;
+  try {
+    // A fresh lease_id: the coordinator mints one because the quarantine
+    // or refusal already dropped the old lease.
+    writer_.acquire_lease(config_.holder);
+  } catch (const CatalogError& exc) {
+    if (is_lease_refusal(exc)) {
+      lease_held_elsewhere(exc);
+    } else {
+      record_error(std::string("publisher lease acquisition failed: ") +
+                   exc.what());
+    }
+    publish_lease_state();
+    return false;
+  } catch (const std::exception& exc) {
+    // Unknown outcome again: the writer quarantined itself for a TTL.
+    record_error(std::string("publisher lease acquisition failed: ") +
+                 exc.what());
+    publish_lease_state();
+    return false;
+  }
+  last_renew_ns_ = steady_ns();
+  held_elsewhere_since_ns_ = 0;
+  next_claim_ns_ = 0;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    ++state_.lease_reacquisitions;
+  }
+  publish_lease_state();
+  {
+    std::lock_guard<std::mutex> lock(wake_mutex_);
+    kick_ = true;
+  }
+  wake_.notify_all();
+  return true;
+}
+
+void CaptureStorageService::lease_held_elsewhere(const CatalogError& refusal) {
+  const uint64_t now = steady_ns();
+  const uint64_t ttl = config_.writer.lease_ttl_ns;
+  if (held_elsewhere_since_ns_ == 0) held_elsewhere_since_ns_ = now;
+  next_claim_ns_ = now + lease_tick_ns(ttl);
+  // Our own dropped row is dead within one TTL of the loss, and a handover
+  // (a rival that stops, releasing with a tombstone) ends sooner still. A
+  // refusal that has lasted 2 x TTL is a publisher that means to stay.
+  if (now - held_elsewhere_since_ns_ >= 2 * ttl) {
+    latch_failure(std::make_exception_ptr(refusal),
+                  std::string("publisher lease held by another publisher "
+                              "for over 2 x TTL: ") + refusal.what());
+  } else {
+    record_error(std::string("publisher lease held elsewhere: ") +
+                 refusal.what());
+  }
+}
+
+void CaptureStorageService::publish_lease_state() {
+  uint64_t until = 0;
+  const char* lease_state = "reacquiring";
+  if (writer_.held_lease() != nullptr) {
+    lease_state = "held";
+  } else if (writer_.quarantined(&until)) {
+    lease_state = "quarantined";
+  } else {
+    until = 0;
+  }
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (state_.failed) return;
+  state_.lease_state = lease_state;
+  state_.quarantined_until_ns = until;
+}
+
 void CaptureStorageService::record_error(const std::string& message) {
   std::lock_guard<std::mutex> lock(state_mutex_);
   state_.last_error = message.substr(0, 512);
@@ -629,9 +758,23 @@ void CaptureStorageService::record_error(const std::string& message) {
 
 void CaptureStorageService::latch_failure(std::exception_ptr failure,
                                           const std::string& message) {
-  std::lock_guard<std::mutex> lock(state_mutex_);
-  if (!failure_) failure_ = std::move(failure);
-  state_.last_error = message.substr(0, 512);
+  std::string line = message.substr(0, 512);
+  std::replace(line.begin(), line.end(), '\n', ' ');
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (failure_) return;
+    failure_ = std::move(failure);
+    state_.last_error = line;
+    state_.failed = true;
+    state_.running = false;
+    state_.lease_state = "failed";
+    state_.quarantined_until_ns = 0;
+  }
+  // Once, and on one line: the loop and the lease thread both stop here,
+  // and nothing else will say why indexing did.
+  std::fprintf(stderr, "dmi capture storage: indexing stopped: %s\n",
+               line.c_str());
+  std::fflush(stderr);
 }
 
 }  // namespace dmi_catalog

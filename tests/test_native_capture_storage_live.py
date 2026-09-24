@@ -773,6 +773,170 @@ def test_the_lease_holds_through_an_object_store_outage(tmp_path):
 # --- the publisher lease through ClickHouse errors and restarts ---------------
 
 
+def test_a_catalog_cut_spanning_a_renewal_and_a_publish_recovers(
+        fake_s3, tmp_path):
+    """A ClickHouse error of unknown outcome -- a renewal or a publish that
+    cannot reach the server -- quarantines the catalog writer and drops its
+    lease without a tombstone. When the quarantine ended the service found
+    no lease, latched "publisher lease lost", and indexing stopped for good,
+    although ClickHouse was back and nobody else held the catalog. It now
+    waits the quarantine out and takes a fresh lease."""
+    spool_root = tmp_path / "spool"
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            reconcile_on_start=False, lease_ttl_s=3.0, publish_timeout_s=1)
+        service = _service(config, spool_root)
+        service.start()
+        try:
+            tensors = _stage(spool_root, range(2))
+            service.flush(30.0)
+            snapshot = service.snapshot()
+            assert snapshot["lease_state"] == "held", snapshot
+            assert snapshot["failed"] is False, snapshot
+            assert snapshot["lease_reacquisitions"] == 0, snapshot
+            assert snapshot["quarantined_until"] == 0.0, snapshot
+
+            switch.cut()
+            cut_at = time.monotonic()
+            # Staged during the cut: uploaded, then owed, since the index
+            # (and its publish) cannot reach the catalog.
+            tensors.update(_stage(spool_root, range(2, 4)))
+            # The renewal due every ttl/3 fails and quarantines the lease.
+            _wait_for(lambda: service.snapshot()["lease_state"] == "quarantined",
+                      timeout_s=5.0)
+            snapshot = service.snapshot()
+            assert snapshot["quarantined_until"] > time.monotonic(), snapshot
+            assert snapshot["running"] is True, snapshot
+            assert snapshot["index_failures"] >= 1, snapshot  # it tried
+            assert snapshot["pending_index"] == 1, snapshot
+            with pytest.raises(TimeoutError, match="1 uploaded but unindexed"):
+                service.flush(0.5)
+            # Longer than ttl/3, so the cut spans a renewal and a publish.
+            time.sleep(max(0.0, cut_at + 2.5 - time.monotonic()))
+            switch.restore()
+
+            # The background loop recovers on its own, without a flush.
+            _wait_for(lambda: service.snapshot()["indexed_packs"] == 2,
+                      timeout_s=15.0)
+            snapshot = service.snapshot()
+            assert snapshot["failed"] is False, snapshot
+            assert snapshot["running"] is True, snapshot
+            assert snapshot["lease_state"] == "held", snapshot
+            assert snapshot["lease_reacquisitions"] >= 1, snapshot
+            assert snapshot["quarantined_until"] == 0.0, snapshot
+
+            tensors.update(_stage(spool_root, range(4, 6)))
+            service.flush(30.0)
+            service.rethrow_if_failed()
+            snapshot = service.snapshot()
+        finally:
+            service.stop()
+            switch.close()
+
+        assert snapshot["indexed_packs"] == 3, snapshot
+        assert snapshot["pending_index"] == 0, snapshot
+        direct = _storage_config(fake_s3, catalog.table_prefix)
+        captures = _read_all(direct)
+        assert sorted(captures) == sorted(tensors)
+        for capture_id, tensor in tensors.items():
+            assert captures[capture_id].payload == tensor.numpy().tobytes()
+
+
+def _latch_lines(err: str) -> list[str]:
+    return [line for line in err.splitlines() if "indexing stopped" in line]
+
+
+def test_a_rival_that_takes_over_during_a_cut_still_latches(
+        fake_s3, tmp_path, capfd):
+    """Recovery must not paper over a real takeover: when another publisher
+    holds the catalog for longer than two lease TTLs, the service stops,
+    says so once on stderr, and flush raises naming the holder."""
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    with _catalog() as (_client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1)
+        first = _service(_storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            holder="first-publisher", **knobs), tmp_path / "first")
+        rival = _service(_storage_config(
+            fake_s3, catalog.table_prefix, holder="rival-publisher",
+            start_lease_wait_s=10.0, **knobs), tmp_path / "rival")
+        first.start()
+        try:
+            switch.cut()
+            rival.start()  # waits out the lease the cut first cannot renew
+            rival_started = time.monotonic()
+            switch.restore()
+
+            _wait_for(lambda: first.snapshot()["failed"], timeout_s=20.0)
+            latched_at = time.monotonic()
+            snapshot = first.snapshot()
+            assert snapshot["running"] is False, snapshot
+            assert snapshot["lease_state"] == "failed", snapshot
+            assert "rival-publisher" in snapshot["last_error"], snapshot
+            # Only a foreign lease that outlives two TTLs latches.
+            assert latched_at - rival_started >= 2 * 3.0 - 0.5
+            with pytest.raises(RuntimeError, match="rival-publisher"):
+                first.flush(1.0)
+            with pytest.raises(RuntimeError, match="rival-publisher"):
+                first.rethrow_if_failed()
+
+            rival.flush(10.0)
+            rival_snapshot = rival.snapshot()
+            assert rival_snapshot["lease_state"] == "held", rival_snapshot
+            assert rival_snapshot["failed"] is False, rival_snapshot
+        finally:
+            first.stop()
+            rival.stop()
+            switch.close()
+
+    lines = _latch_lines(capfd.readouterr().err)
+    assert len(lines) == 1, lines
+    assert "rival-publisher" in lines[0]
+
+
+def test_a_rival_that_stops_within_two_ttls_does_not_latch(
+        fake_s3, tmp_path, capfd):
+    """A foreign lease that is gone again before two TTLs pass is a
+    handover, not a takeover: the service takes the lease back."""
+    switch = _Switch(CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT)
+    spool_root = tmp_path / "first"
+    with _catalog() as (_client, catalog):
+        knobs = dict(reconcile_on_start=False, lease_ttl_s=3.0,
+                     publish_timeout_s=1)
+        config = _storage_config(
+            fake_s3, catalog.table_prefix, clickhouse_port=switch.port,
+            holder="first-publisher", **knobs)
+        first = _service(config, spool_root)
+        rival = _service(_storage_config(
+            fake_s3, catalog.table_prefix, holder="rival-publisher",
+            start_lease_wait_s=10.0, **knobs), tmp_path / "rival")
+        first.start()
+        try:
+            switch.cut()
+            rival.start()
+            switch.restore()
+            time.sleep(2.0)
+            rival.stop()  # releases with a tombstone
+
+            tensors = _stage(spool_root, range(2))
+            first.flush(20.0)
+            snapshot = first.snapshot()
+        finally:
+            first.stop()
+            rival.stop()
+            switch.close()
+
+        assert snapshot["failed"] is False, snapshot
+        assert snapshot["lease_state"] == "held", snapshot
+        assert snapshot["lease_reacquisitions"] >= 1, snapshot
+        assert sorted(_read_all(_storage_config(
+            fake_s3, catalog.table_prefix))) == sorted(tensors)
+    assert _latch_lines(capfd.readouterr().err) == []
+
+
 _HOLD_LEASE = """
 import json, sys, time
 from dmi.storage.native_capture import (
@@ -834,6 +998,7 @@ def test_a_restart_within_the_ttl_of_a_killed_predecessor_succeeds(
             successor.stop()
 
     assert snapshot["running"] is True, snapshot
+    assert snapshot["lease_state"] == "held", snapshot
     # It really waited on the dead holder's lease, and no longer than it.
     assert 1.0 < elapsed < 8.0, elapsed
 
