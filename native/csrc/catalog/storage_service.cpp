@@ -628,8 +628,13 @@ void CaptureStorageService::keep_lease() {
 }
 
 void CaptureStorageService::renew_lease_if_due() {
-  // Renew once a third of the TTL has passed without a publish, which leaves
-  // two more tries before a rival could claim it.
+  // Renew once a third of the TTL has passed without a publish. The lease
+  // thread wakes every ttl/6, so four wakes fall between the renewal coming
+  // due and the row expiring: room for a renewal that runs late, not for one
+  // that fails. A failed renewal costs the lease at once whatever the cause.
+  // A refusal drops it in the coordinator, and a transport error or timeout
+  // takes renew_for_publish()'s catch, which quarantines the writer on the
+  // first one.
   const uint64_t ttl = config_.writer.lease_ttl_ns;
   if (ttl == 0 || steady_ns() - last_renew_ns_ < ttl / 3) return;
   writer_.renew_lease();
