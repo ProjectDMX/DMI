@@ -42,7 +42,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 # Module-level so the fake-S3 fixture registers in this module.
-from tests.test_native_s3_client import (  # noqa: E402
+from tests.test_native_s3_client import (
     ACCESS, BUCKET, REGION, SECRET, STATE, fake_s3,
 )
 
