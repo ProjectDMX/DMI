@@ -171,3 +171,34 @@ def test_a_duck_typed_config_with_an_old_name_is_still_checked():
                              capture_storage_config=None)
     with pytest.raises(ValueError, match="needs a host engine"):
         MonitoringEngine(config=config, enable_ring_transport=False)
+
+
+# --- the details the old names carry ------------------------------------------
+
+
+def test_the_canonical_name_has_its_own_type():
+    from typing import get_args
+
+    from dmi.config import CanonicalStorageBackend
+
+    assert set(get_args(CanonicalStorageBackend)) == {
+        "in-memory", "persistent", "none", "auto"}
+
+
+def test_the_warning_names_the_callers_line_even_through_replace():
+    import dataclasses
+
+    with pytest.warns(DeprecationWarning) as direct:
+        config = MonitoringConfig(storage_backend="native")
+    assert direct[0].filename == __file__
+
+    with pytest.warns(DeprecationWarning) as replaced:
+        dataclasses.replace(config)
+    assert replaced[0].filename == __file__
+
+
+def test_a_refusal_quotes_the_name_the_caller_wrote():
+    with pytest.warns(DeprecationWarning):
+        config = MonitoringConfig(storage_backend="native")
+    with pytest.raises(ValueError, match=r"'native' \(now 'in-memory'\)"):
+        MonitoringEngine(config=config, enable_ring_transport=False)

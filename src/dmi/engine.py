@@ -125,8 +125,11 @@ class MonitoringEngine:
         # and "auto".
         from .config import canonical_storage_backend
 
-        self._storage_backend = canonical_storage_backend(
-            getattr(config, "storage_backend", "auto"))
+        # What the caller wrote, kept only to quote it back in a refusal.
+        self._storage_backend_requested = getattr(
+            config, "storage_backend", "auto")
+        self._storage_backend: str = canonical_storage_backend(
+            self._storage_backend_requested)
         # A None config is the ctor's documented no-configuration mode;
         # say so here rather than behind a getattr default.
         self._capture_sink_config = (
@@ -152,7 +155,8 @@ class MonitoringEngine:
         host_configured = host_engine is not None or db_config is not None
         if self._storage_backend == "in-memory" and not host_configured:
             raise ValueError(
-                "config.storage_backend='in-memory' delivers records through "
+                f"config.storage_backend={self._backend_label()} delivers "
+                "records through "
                 "the C++ ClickHouseRecordSink until its consumer interface "
                 "exists, which needs a host engine: pass host_engine= or "
                 "db_config="
@@ -165,7 +169,7 @@ class MonitoringEngine:
             )
         if self._storage_backend in ("persistent", "none") and host_configured:
             raise ValueError(
-                f"config.storage_backend={self._storage_backend!r} does not "
+                f"config.storage_backend={self._backend_label()} does not "
                 "use the C++ ClickHouse host, but host_engine/db_config was "
                 "given. Configured together, the host engine starts, connects "
                 "and is then never fed, because a record runtime is handed "
@@ -262,6 +266,15 @@ class MonitoringEngine:
         # lifecycle toggle; the next committed step recomputes it.
         transport.force_eager = False
 
+    def _backend_label(self) -> str:
+        """The storage backend as the caller wrote it, with its current name
+        when that was a deprecated one: ``'native' (now 'in-memory')``."""
+        requested = getattr(self, "_storage_backend_requested",
+                            self._storage_backend)
+        if requested == self._storage_backend:
+            return repr(self._storage_backend)
+        return f"{requested!r} (now {self._storage_backend!r})"
+
     def _reject_a_sink_the_config_did_not_ask_for(
         self, record_sink: Optional[Any]
     ) -> None:
@@ -282,7 +295,8 @@ class MonitoringEngine:
             return
         if backend == "persistent" and record_sink is None:
             raise ValueError(
-                "config.storage_backend='persistent' selects the object-store "
+                f"config.storage_backend={self._backend_label()} selects the "
+                "object-store "
                 "path, whose default writer is the native pack sink — pass "
                 "capture_sink_config=NativeSinkConfig(...) in the config, or "
                 "a record_sink explicitly (the reference sink is the "
@@ -290,7 +304,8 @@ class MonitoringEngine:
             )
         if backend in ("in-memory", "none") and record_sink is not None:
             raise ValueError(
-                f"config.storage_backend={backend!r} does not use an explicit "
+                f"config.storage_backend={self._backend_label()} does not use "
+                "an explicit "
                 "record_sink; passing one would send records to a backend the "
                 "configuration did not select"
             )

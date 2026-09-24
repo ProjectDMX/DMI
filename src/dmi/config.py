@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import sys
 import warnings
 from typing import Literal, Optional, get_args
 
 
 StorageBackend = Literal[
     "in-memory", "persistent", "none", "auto", "native", "capture"]
+
+# The names the engine acts on: a deprecated name is replaced before anything
+# compares against these.
+CanonicalStorageBackend = Literal["in-memory", "persistent", "none", "auto"]
 
 # What a user chooses; the configurator emits exactly one of these. "auto" is
 # the unset default, and "native"/"capture" are the deprecated earlier names.
@@ -17,7 +22,7 @@ USER_STORAGE_CHOICES = ("in-memory", "persistent", "none")
 _DEPRECATED_STORAGE_BACKENDS = {"native": "in-memory", "capture": "persistent"}
 
 
-def canonical_storage_backend(name: str) -> str:
+def canonical_storage_backend(name: str) -> CanonicalStorageBackend:
     """``name`` with a deprecated storage backend replaced by its new one.
 
     Unknown names are refused here as well as in ``MonitoringConfig``, so an
@@ -29,7 +34,22 @@ def canonical_storage_backend(name: str) -> str:
             + ", ".join(repr(choice) for choice in USER_STORAGE_CHOICES)
             + f" (or left unset); got {name!r}"
         )
-    return _DEPRECATED_STORAGE_BACKENDS.get(name, name)
+    return _DEPRECATED_STORAGE_BACKENDS.get(name, name)  # type: ignore[return-value]
+
+
+def _caller_stacklevel() -> int:
+    """The ``stacklevel`` that points a warning raised in ``__post_init__``
+    at user code: past the dataclass-generated ``__init__`` and, for a copy,
+    past ``dataclasses.replace``."""
+    frame = sys._getframe(1)  # __post_init__
+    level = 1
+    while frame is not None and (
+        frame.f_code.co_filename in (__file__, "<string>")
+        or frame.f_code.co_filename.endswith("dataclasses.py")
+    ):
+        frame = frame.f_back
+        level += 1
+    return level
 
 
 @dataclass
@@ -143,7 +163,7 @@ class MonitoringConfig:
     storage_backend: StorageBackend = "auto"
 
     @property
-    def canonical_storage_backend(self) -> str:
+    def canonical_storage_backend(self) -> CanonicalStorageBackend:
         """``storage_backend`` with a deprecated name replaced by its new one."""
         return canonical_storage_backend(self.storage_backend)
 
@@ -155,7 +175,7 @@ class MonitoringConfig:
                 f"storage_backend={self.storage_backend!r} is deprecated; use "
                 f"{replacement!r}, which means the same",
                 DeprecationWarning,
-                stacklevel=3,
+                stacklevel=_caller_stacklevel(),
             )
         backend = self.canonical_storage_backend
         # ``capture_sink_config`` is read in exactly one place -- the
