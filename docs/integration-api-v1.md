@@ -136,8 +136,12 @@ The predicates apply warmup, then offset, then stride. Step selection also
 honors `capture_prefill`/`capture_decode`; an unknown phase raises `ValueError`.
 `MonitoringConfig` carries this schedule plus three storage fields:
 `storage_backend`, `capture_sink_config` (a `NativeSinkConfig`, or `None`) and
-`capture_storage_config` (a `NativeCaptureStorageConfig` from
-`dmi.storage.native_capture`, or `None`).
+`capture_storage_config` (a `NativeCaptureStorageConfig`, or `None`), both
+from `dmi.storage.native_capture`. `NativeSinkConfig` bounds the native pack
+sink's queue and packs, and sets its admission policy: `overload="block"`
+(the default) waits up to `admission_timeout_s` (2 s; `None` waits without
+bound) for queue room before refusing a record, and `"drop_newest"` refuses
+it at once.
 
 `storage_backend` is the user's storage choice, one of
 `dmi.config.USER_STORAGE_CHOICES`:

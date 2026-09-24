@@ -55,6 +55,67 @@ def _load_native_store_extension() -> Any:
         ) from exc
 
 
+# The sink's admission policies (native/csrc/sink/pack_sink.h Overload).
+SINK_OVERLOAD_POLICIES = ("block", "drop_newest")
+
+
+@dataclass(frozen=True, slots=True)
+class NativeSinkConfig:
+    """Bounds and admission policy for the native pack sink.
+
+    The sink runs on the ring's record worker: every record the forward
+    captures is admitted here, into a bounded queue ahead of pack assembly.
+    ``overload`` decides what a full queue does. ``"block"`` waits for room
+    for up to ``admission_timeout_s`` (``None`` waits without bound) and
+    then refuses the record as timed out; ``"drop_newest"`` refuses it at
+    once, and ``admission_timeout_s`` is not used. Either refusal latches
+    the record runtime (see ``create_record_runtime``'s failure policy).
+
+    The default, block with 2 s, absorbs a burst larger than the queue at
+    the cost of stalling the record worker, and so the ring, while the sink
+    catches up. The C++ ``SinkConfig`` keeps drop_newest with no timeout,
+    the reference pipeline's default; this config is what the ring-fed sink
+    is built from.
+
+    A record larger than ``max_queue_bytes`` or ``max_pack_bytes`` can
+    never be admitted; ``validate_capture_bounds`` refuses such a bound at
+    attach, before any forward runs.
+    """
+
+    spool_root: str
+    spool_max_bytes: int = 1 << 40
+    num_workers: int = 1
+    max_queue_records: int = 256
+    max_queue_bytes: int = 16 * 1024 * 1024
+    max_pack_bytes: int = 128 * 1024 * 1024
+    max_pack_records: int = 10_000
+    max_linger_ns: int = 1_000_000_000
+    overload: str = "block"
+    admission_timeout_s: Optional[float] = 2.0
+
+    def __post_init__(self) -> None:
+        if not self.spool_root:
+            raise ValueError("spool_root is required")
+        for name in (
+            "spool_max_bytes",
+            "num_workers",
+            "max_queue_records",
+            "max_queue_bytes",
+            "max_pack_bytes",
+            "max_pack_records",
+            "max_linger_ns",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.overload not in SINK_OVERLOAD_POLICIES:
+            raise ValueError(
+                f"overload must be one of {SINK_OVERLOAD_POLICIES}, "
+                f"got {self.overload!r}")
+        if self.admission_timeout_s is not None:
+            _positive("admission_timeout_s", self.admission_timeout_s, float)
+
+
 def _positive(name: str, value: Any, kind: type) -> None:
     if type(value) is not kind and not (kind is float and type(value) is int):
         raise TypeError(f"{name} must be {kind.__name__}")
@@ -415,6 +476,8 @@ class NativeCaptureReader:
 
 
 __all__ = [
+    "SINK_OVERLOAD_POLICIES",
+    "NativeSinkConfig",
     "NativeCapture",
     "NativeCapturePage",
     "NativeCaptureReader",

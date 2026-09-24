@@ -152,6 +152,8 @@ class PackSink {
   SinkSnapshot Snapshot() const;
   // Latched async failure, if any (for RecordSink::rethrow_if_failed).
   std::string LastError() const;
+  // The configuration the sink was built with (num_workers normalised).
+  const SinkConfig& config() const { return config_; }
 
   // Test seam: the sink's spool, so a test can park a stager inside
   // Spool::Stage through Spool::SetStageHookForTesting and wedge the

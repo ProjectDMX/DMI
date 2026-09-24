@@ -135,7 +135,7 @@ class MonitoringEngine:
         self._capture_sink_config = (
             config.capture_sink_config if config is not None else None)
         if self._capture_sink_config is not None:
-            from .storage.capture.native_sink import NativeSinkConfig
+            from .storage.native_capture import NativeSinkConfig
 
             if not isinstance(self._capture_sink_config, NativeSinkConfig):
                 raise TypeError(
